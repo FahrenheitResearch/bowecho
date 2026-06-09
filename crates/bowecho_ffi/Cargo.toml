@@ -1,0 +1,18 @@
+[package]
+name = "bowecho_ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Static library for linking into the iOS app (and any other C/Swift consumer).
+[lib]
+name = "bowecho_ffi"
+crate-type = ["staticlib"]
+
+[dependencies]
+radar_core = { path = "../radar_core" }
+nexrad_io = { path = "../nexrad_io" }
+data_source = { path = "../data_source" }
+render2d = { path = "../render2d" }
+color_tables = { path = "../color_tables" }
