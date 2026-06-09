@@ -1085,9 +1085,11 @@ struct AsyncRenderResult {
 struct RotationMarker {
     lon: f32,
     lat: f32,
-    /// Peak azimuthal shear (s⁻¹), positive = cyclonic.
-    shear_s: f32,
-    tvs: bool,
+    /// Best rotational velocity across the column (m/s).
+    vrot_mps: f32,
+    /// 3D strength rank (Stumpf et al. 1998 scale).
+    rank: u8,
+    strength: render2d::RotationStrength,
 }
 
 /// An extra synchronized view pane in the multi-pane grid. Pane 0 is the
@@ -5105,7 +5107,7 @@ impl ViewerApp {
         if ui
             .checkbox(&mut self.show_rotation_markers, "Rotation markers")
             .on_hover_text(
-                "Meso / TVS candidates from LLSD azimuthal shear on the lowest velocity tilt (Stumpf et al. 1998; Mitchell et al. 1998 thresholds), detected on a background thread. Gold ring = cyclonic, blue ring = anticyclonic, red triangle = TVS-strength shear. Zoom in for the shear value (10⁻³ s⁻¹).",
+                "NSSL MDA/TDA-style detection (Stumpf et al. 1998; Mitchell et al. 1998): QC-masked, vertically-continuous circulations only, on a background thread. Pale ring = weak, orange = moderate, double gold = mesocyclone (rank ≥ 5), red triangle = TVS. Zoom in for rank + Vrot.",
             )
             .changed()
         {
@@ -6974,37 +6976,46 @@ impl ViewerApp {
             if !rect.expand(16.0).contains(position) {
                 continue;
             }
-            if marker.tvs {
-                let size = 9.0;
-                let points = vec![
-                    position + egui::vec2(-size, -size),
-                    position + egui::vec2(size, -size),
-                    position + egui::vec2(0.0, size * 1.1),
-                ];
-                painter.add(egui::Shape::convex_polygon(
-                    points,
-                    egui::Color32::from_rgb(225, 32, 38),
-                    egui::Stroke::new(1.5, egui::Color32::WHITE),
-                ));
-            } else {
-                let color = if marker.shear_s >= 0.0 {
-                    egui::Color32::from_rgb(250, 200, 60)
-                } else {
-                    egui::Color32::from_rgb(140, 200, 250)
-                };
-                painter.circle_stroke(position, 8.0, egui::Stroke::new(2.4, color));
-                painter.circle_stroke(
-                    position,
-                    8.0,
-                    egui::Stroke::new(0.8, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160)),
-                );
+            match marker.strength {
+                render2d::RotationStrength::Tvs => {
+                    let size = 9.0;
+                    let points = vec![
+                        position + egui::vec2(-size, -size),
+                        position + egui::vec2(size, -size),
+                        position + egui::vec2(0.0, size * 1.1),
+                    ];
+                    painter.add(egui::Shape::convex_polygon(
+                        points,
+                        egui::Color32::from_rgb(225, 32, 38),
+                        egui::Stroke::new(1.5, egui::Color32::WHITE),
+                    ));
+                }
+                render2d::RotationStrength::Mesocyclone => {
+                    let color = egui::Color32::from_rgb(250, 200, 60);
+                    painter.circle_stroke(position, 9.0, egui::Stroke::new(2.6, color));
+                    painter.circle_stroke(position, 5.0, egui::Stroke::new(1.6, color));
+                }
+                render2d::RotationStrength::ModerateCirculation => {
+                    painter.circle_stroke(
+                        position,
+                        8.0,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 170, 50)),
+                    );
+                }
+                render2d::RotationStrength::WeakCirculation => {
+                    painter.circle_stroke(
+                        position,
+                        7.0,
+                        egui::Stroke::new(1.4, egui::Color32::from_rgb(200, 180, 120)),
+                    );
+                }
             }
             if self.map_scale >= 120.0 {
                 draw_halo_text(
                     painter,
                     position + egui::vec2(0.0, -14.0),
                     egui::Align2::CENTER_BOTTOM,
-                    &format!("{:.0}", marker.shear_s * 1000.0),
+                    &format!("R{} {:.0} m/s", marker.rank, marker.vrot_mps),
                     egui::FontId::proportional(10.0),
                     egui::Color32::from_rgb(245, 240, 220),
                     egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
@@ -9225,20 +9236,8 @@ fn detect_rotation_markers_for_volume(
     radar_lat: f32,
     radar_lon: f32,
 ) -> Vec<RotationMarker> {
-    let Some((_, cut)) = volume
-        .cuts
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.moments.contains_key(&MomentType::Velocity))
-        .min_by(|a, b| a.1.elevation_deg.total_cmp(&b.1.elevation_deg))
-    else {
-        return Vec::new();
-    };
-    let Some(velocity) = cut.moments.get(&MomentType::Velocity) else {
-        return Vec::new();
-    };
     let cos_lat = radar_lat.to_radians().cos().max(0.05);
-    detect_rotation_sites(cut, velocity)
+    detect_rotation_sites(volume)
         .into_iter()
         .map(|site| {
             let az = (site.azimuth_deg as f64).to_radians();
@@ -9248,8 +9247,9 @@ fn detect_rotation_markers_for_volume(
             RotationMarker {
                 lon: radar_lon + (east_km as f32) / (111.32 * cos_lat),
                 lat: radar_lat + (north_km as f32) / 111.32,
-                shear_s: site.peak_shear_s,
-                tvs: site.tvs,
+                vrot_mps: site.vrot_mps,
+                rank: site.rank,
+                strength: site.strength,
             }
         })
         .collect()

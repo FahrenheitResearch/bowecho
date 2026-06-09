@@ -11,7 +11,9 @@ pub use color_tables::{ColorSampler, ColorTable, ColorTableFamily, ColorTableSet
 mod detect;
 mod shear;
 mod volumetric;
-pub use detect::{MESO_SHEAR_THRESHOLD, RotationSite, TVS_SHEAR_THRESHOLD, detect_rotation_sites};
+pub use detect::{
+    RotationSite, RotationStrength, detect_rotation_sites, rotation_features_per_tilt,
+};
 use image::{ImageBuffer, ImageError, Rgba};
 use radar_core::{
     ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, ProductId, RadarVolume,
