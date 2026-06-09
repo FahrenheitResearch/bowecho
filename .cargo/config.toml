@@ -1,0 +1,7 @@
+# Statically link the MSVC C runtime on Windows so the release exe is a true
+# single-file download — no VC++ Redistributable install required.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

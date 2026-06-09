@@ -1,0 +1,32 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/FahrenheitResearch/bowecho"
+
+[workspace.dependencies]
+byteorder = "1.5"
+bzip2 = { version = "0.6", default-features = false, features = ["bzip2-sys"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+eframe = "0.34.3"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+libdeflate-sys = "1.25.2"
+quick-xml = { version = "0.39", features = ["serialize"] }
+rayon = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+# panic = "abort" is intentionally NOT set: app_ui isolates worker panics
+# with catch_unwind / thread joins, and abort would turn those contained
+# failures into full app crashes.

@@ -1,0 +1,8 @@
+[package]
+name = "product_engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+radar_core = { path = "../radar_core" }

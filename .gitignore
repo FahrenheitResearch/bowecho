@@ -1,0 +1,12 @@
+/target/
+/work/
+/dist/
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.exe
+*.zip
+*.download
+.DS_Store
+Thumbs.db

@@ -1,0 +1,15 @@
+[package]
+name = "nexrad_io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+byteorder.workspace = true
+bzip2.workspace = true
+chrono.workspace = true
+flate2.workspace = true
+libdeflate-sys.workspace = true
+radar_core = { path = "../radar_core" }
+rayon.workspace = true
+thiserror.workspace = true

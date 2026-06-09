@@ -1,0 +1,164 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: bowecho
+
+jobs:
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists."
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "BowEcho ${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi
+
+  build:
+    needs: create-release
+    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: bowecho-windows-x64
+            package: windows
+          - os: windows-11-arm
+            artifact_name: bowecho-windows-arm64
+            package: windows
+          - os: ubuntu-24.04
+            artifact_name: bowecho-linux-x64
+            package: linux
+          - os: ubuntu-24.04-arm
+            artifact_name: bowecho-linux-arm64
+            package: linux
+          - os: macos-15-intel
+            artifact_name: bowecho-macos-intel
+            package: macos
+          - os: macos-15
+            artifact_name: bowecho-macos-apple-silicon
+            package: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux desktop build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgl1-mesa-dev \
+            libx11-dev \
+            libxi-dev \
+            libxkbcommon-dev
+
+      - name: Use stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build release binary
+        run: cargo build --release -p app_ui --bin bowecho
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item target\release\bowecho.exe package\bowecho.exe
+          Copy-Item README.md package\README.md
+          Copy-Item LICENSE-MIT package\LICENSE-MIT
+          Copy-Item LICENSE-APACHE package\LICENSE-APACHE
+          Compress-Archive -Path package\* -DestinationPath "dist\${{ matrix.artifact_name }}.zip" -Force
+
+      - name: Package macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          app="BowEcho.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp "target/release/${BIN_NAME}" "$app/Contents/MacOS/${BIN_NAME}"
+          cp README.md "$app/Contents/Resources/README.md"
+          cp LICENSE-MIT "$app/Contents/Resources/LICENSE-MIT"
+          cp LICENSE-APACHE "$app/Contents/Resources/LICENSE-APACHE"
+          chmod +x "$app/Contents/MacOS/${BIN_NAME}"
+          cat > "$app/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key>
+            <string>en</string>
+            <key>CFBundleDisplayName</key>
+            <string>BowEcho</string>
+            <key>CFBundleExecutable</key>
+            <string>bowecho</string>
+            <key>CFBundleIdentifier</key>
+            <string>research.fahrenheit.bowecho</string>
+            <key>CFBundleInfoDictionaryVersion</key>
+            <string>6.0</string>
+            <key>CFBundleName</key>
+            <string>BowEcho</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>0.1.0</string>
+            <key>CFBundleVersion</key>
+            <string>0.1.0</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>12.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+          ditto -c -k --sequesterRsrc --keepParent "$app" "dist/${{ matrix.artifact_name }}.zip"
+
+      - name: Package Linux binary
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "dist" "package/${BIN_NAME}"
+          cp "target/release/${BIN_NAME}" "package/${BIN_NAME}/${BIN_NAME}"
+          cp README.md "package/${BIN_NAME}/README.md"
+          cp LICENSE-MIT "package/${BIN_NAME}/LICENSE-MIT"
+          cp LICENSE-APACHE "package/${BIN_NAME}/LICENSE-APACHE"
+          tar -C package -czf "dist/${{ matrix.artifact_name }}.tar.gz" "${BIN_NAME}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"

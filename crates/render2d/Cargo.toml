@@ -1,0 +1,16 @@
+[package]
+name = "render2d"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+color_tables = { path = "../color_tables" }
+image.workspace = true
+radar_core = { path = "../radar_core" }
+rayon.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+nexrad_io = { path = "../nexrad_io" }
