@@ -339,6 +339,75 @@ pub fn vil_grid(volume: &RadarVolume) -> Option<MomentGrid> {
     Some(f32_grid_like(base_grid, MomentType::Reflectivity, out))
 }
 
+/// Maximum Expected Hail Size (mm) from the Severe Hail Index — the WSR-88D
+/// Hail Detection Algorithm of Witt et al. 1998 (WAF 13(2), 286-303):
+/// hail kinetic-energy flux  E = 5e-6 * 10^(0.084*Z) * W(Z)  with W(Z) a
+/// linear ramp over 40-50 dBZ, height-weighted by a thermal ramp W_T(H)
+/// between the melting level H0 and the -20C level, integrated upward:
+/// SHI = 0.1 * sum W_T(H) * E * dH ;  MEHS = 2.54 * sqrt(SHI) (mm).
+/// `freezing_level_m` / `minus20c_level_m` are heights above the RADAR (set
+/// them from a sounding for best results; mid-latitude warm-season defaults
+/// are roughly 3200 m / 6400 m).
+pub fn mehs_grid(
+    volume: &RadarVolume,
+    freezing_level_m: f32,
+    minus20c_level_m: f32,
+) -> Option<MomentGrid> {
+    let (base_idx, base_grid) = base_reflectivity_cut(volume)?;
+    let base = CutColumn::new(volume, base_idx, base_grid)?;
+    let cols = reflectivity_columns(volume);
+    let rows = base_grid.radial_indices.len();
+    let gates = base_grid.gate_range.gate_count;
+    let mut out = vec![f32::NAN; rows * gates];
+    let row_az = base.row_azimuths(rows);
+    let h0 = freezing_level_m.max(0.0) as f64;
+    let hm20 = (minus20c_level_m.max(freezing_level_m + 1.0)) as f64;
+    // Hail KE flux with the 40-50 dBZ reflectivity ramp (Witt eq. 4-5).
+    let ke_flux = |dbz: f64| -> f64 {
+        let w = ((dbz - 40.0) / 10.0).clamp(0.0, 1.0);
+        if w <= 0.0 {
+            0.0
+        } else {
+            5.0e-6 * 10f64.powf(0.084 * dbz) * w
+        }
+    };
+    // Thermal weight between the melting level and -20C (Witt eq. 7).
+    let wt = |h: f64| ((h - h0) / (hm20 - h0)).clamp(0.0, 1.0);
+    out.par_chunks_mut(gates)
+        .enumerate()
+        .for_each(|(row, out_row)| {
+            let az = row_az[row];
+            if !az.is_finite() {
+                return;
+            }
+            for (gate, cell) in out_row.iter_mut().enumerate() {
+                let s = base.ground_range_m[gate];
+                let prof = column_profile(&cols, az, s);
+                if prof.len() < 2 {
+                    continue;
+                }
+                let mut shi = 0.0f64;
+                for w in prof.windows(2) {
+                    let (ha, za) = w[0];
+                    let (hb, zb) = w[1];
+                    let dh = (hb - ha).max(0.0);
+                    if hb <= h0 || dh <= 0.0 {
+                        continue;
+                    }
+                    let mid_h = 0.5 * (ha + hb);
+                    let mid_e = 0.5 * (ke_flux(za as f64) + ke_flux(zb as f64));
+                    shi += wt(mid_h) * mid_e * dh;
+                }
+                shi *= 0.1;
+                if shi > 1.0 {
+                    // MEHS in mm (Witt eq. 11).
+                    *cell = (2.54 * shi.sqrt()) as f32;
+                }
+            }
+        });
+    Some(f32_grid_like(base_grid, MomentType::Reflectivity, out))
+}
+
 /// VIL Density (g m^-3) = VIL / echo-top depth — a depth-normalized large-hail
 /// discriminator (values ≳ 3.5 g/m³ flag large hail far better than raw VIL;
 /// Amburn & Wolf 1997, WAF 12(3)). Reuses the VIL and echo-top grids (same base
@@ -445,17 +514,64 @@ pub fn velocity_cross_section(
     height: usize,
     top_m: f32,
 ) -> Option<CrossSection> {
-    // Own the dealiased grids so the borrowing CutColumns can reference them.
-    let owned: Vec<(usize, MomentGrid)> = volume
-        .cuts
-        .iter()
-        .enumerate()
-        .filter_map(|(i, c)| {
-            let v = c.moments.get(&MomentType::Velocity)?;
-            Some((i, crate::dealias_velocity_grid(c, v)))
-        })
-        .collect();
-    let mut cols: Vec<CutColumn<'_>> = owned
+    let mut cache = VolumeDealiasCache::new();
+    velocity_cross_section_cached(volume, &mut cache, start_km, end_km, width, height, top_m)
+}
+
+/// Per-volume memo of every tilt's dealiased velocity. Dealiasing all tilts
+/// costs ~100+ ms; an interactive endpoint drag recomputes the section every
+/// frame, so the dealias must be paid ONCE per volume, not per frame.
+pub struct VolumeDealiasCache {
+    volume_ptr: usize,
+    grids: Vec<(usize, MomentGrid)>,
+}
+
+impl VolumeDealiasCache {
+    pub fn new() -> Self {
+        Self {
+            volume_ptr: 0,
+            grids: Vec::new(),
+        }
+    }
+
+    fn ensure(&mut self, volume: &RadarVolume) {
+        let ptr = volume as *const RadarVolume as usize;
+        if ptr == self.volume_ptr && !self.grids.is_empty() {
+            return;
+        }
+        self.volume_ptr = ptr;
+        self.grids = volume
+            .cuts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                let v = c.moments.get(&MomentType::Velocity)?;
+                Some((i, crate::dealias_velocity_grid(c, v)))
+            })
+            .collect();
+    }
+}
+
+impl Default for VolumeDealiasCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `velocity_cross_section` with a caller-held dealias memo — the fast path
+/// for interactive section drags.
+pub fn velocity_cross_section_cached(
+    volume: &RadarVolume,
+    cache: &mut VolumeDealiasCache,
+    start_km: (f32, f32),
+    end_km: (f32, f32),
+    width: usize,
+    height: usize,
+    top_m: f32,
+) -> Option<CrossSection> {
+    cache.ensure(volume);
+    let mut cols: Vec<CutColumn<'_>> = cache
+        .grids
         .iter()
         .filter_map(|(i, g)| CutColumn::new(volume, *i, g))
         .collect();
@@ -812,6 +928,32 @@ mod tests {
         let vil = vil_grid(&v).expect("vil");
         let val = vil.scaled_value(0, 30).expect("vil val");
         assert!(val > 0.0 && val < 80.0, "vil was {val} kg/m2");
+    }
+
+    #[test]
+    fn mehs_flags_deep_intense_cores_only() {
+        // A deep 60 dBZ column well above the melting level -> large hail
+        // (MEHS comfortably over 25 mm / 1 inch); a 35 dBZ column -> nothing
+        // (below the 40 dBZ KE-flux ramp).
+        let hot = volume_with(vec![
+            cut_with_ref(0.5, 360, 120, 60.0),
+            cut_with_ref(4.0, 360, 120, 60.0),
+            cut_with_ref(10.0, 360, 120, 60.0),
+            cut_with_ref(19.5, 360, 120, 60.0),
+        ]);
+        let mehs = mehs_grid(&hot, 3200.0, 6400.0).expect("mehs");
+        let v = mehs.scaled_value(0, 40).expect("value");
+        assert!(v > 25.0 && v < 200.0, "MEHS was {v} mm");
+
+        let weak = volume_with(vec![
+            cut_with_ref(0.5, 360, 120, 35.0),
+            cut_with_ref(4.0, 360, 120, 35.0),
+        ]);
+        let none = mehs_grid(&weak, 3200.0, 6400.0).expect("grid");
+        assert!(
+            none.scaled_value(0, 40).is_none_or(|v| v.is_nan()),
+            "35 dBZ should produce no hail signal"
+        );
     }
 
     #[test]

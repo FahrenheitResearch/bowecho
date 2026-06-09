@@ -12,15 +12,17 @@ use eframe::egui;
 use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType, RadarVolume};
 use render2d::{
     ECHO_TOP_THRESHOLD_DBZ, StormMotion, StormRelativePaletteCache, ViewportMomentCache,
-    ViewportRasterOptions, ViewportSampleCache, azimuthal_shear_grid, color_family_for_moment,
-    composite_reflectivity_grid, dealias_velocity_grid, echo_top_grid, radial_divergence_grid,
-    reflectivity_cross_section, storm_relative_velocity_mps, velocity_cross_section,
+    ViewportRasterOptions, ViewportSampleCache, VolumeDealiasCache, azimuthal_shear_grid,
+    color_family_for_moment, composite_reflectivity_grid, dealias_velocity_grid,
+    detect_rotation_sites, echo_top_grid, mehs_grid, radial_divergence_grid,
+    reflectivity_cross_section, storm_relative_velocity_mps, velocity_cross_section_cached,
     viewport_rgba_buffer_len, viewport_sample_cache_storage_upper_bound, vil_density_grid,
     vil_grid,
 };
 use serde::Deserialize;
 
 mod basemap_data;
+mod placefiles;
 
 const MIN_DISPLAYABLE_RADIALS: usize = 180;
 const DEFAULT_MAP_SCALE: f32 = 115.0;
@@ -354,6 +356,22 @@ struct ViewerApp {
     hazard_receiver: Option<mpsc::Receiver<AsyncHazardResult>>,
     pending_site_id: Option<String>,
     cursor_readout: Option<CursorReadout>,
+    /// Placefile overlays (GRLevelX-style community feeds).
+    placefile_slots: Vec<PlacefileSlot>,
+    placefile_url_input: String,
+    placefile_shape_cache: std::cell::RefCell<ShapeCache<PlacefileDrawList>>,
+    /// Rotation (meso/TVS) markers from the lowest velocity tilt (Stumpf et
+    /// al. 1998 / Mitchell et al. 1998 thresholds on LLSD azimuthal shear).
+    /// Detection runs on a BACKGROUND thread once per volume — the UI thread
+    /// only spawns, polls, and draws (speed doctrine: zero hot-path cost).
+    rotation_markers: Vec<RotationMarker>,
+    rotation_markers_volume_ptr: usize,
+    rotation_receiver: Option<mpsc::Receiver<(usize, Vec<RotationMarker>)>>,
+    show_rotation_markers: bool,
+    /// Hail environment for the Witt et al. 1998 MEHS product: melting-level
+    /// and -20C heights above the radar, in km (set from a sounding).
+    hail_freezing_level_km: f32,
+    hail_minus20_level_km: f32,
     /// Render-time display thresholds per color-family label: values below
     /// (|values| below, for diverging families) draw transparent. Data is
     /// untouched — the inspector/readout still reports it.
@@ -391,6 +409,9 @@ struct ViewerApp {
     /// resetting it to a single-beam ribbon on every chunk.
     cross_section_user_signature: Option<u64>,
     cross_section_volume_cuts: usize,
+    /// Per-volume dealias memo for velocity sections: endpoint drags pay the
+    /// all-tilt dealias once per volume instead of every frame.
+    cross_section_dealias_cache: VolumeDealiasCache,
     hazard_overlay: Option<HazardOverlay>,
     hazard_path_text: String,
     hazard_status: String,
@@ -1059,6 +1080,16 @@ struct AsyncRenderResult {
     result: Result<RenderedTexture, String>,
 }
 
+/// A rotation site detected on the lowest velocity tilt, geolocated.
+#[derive(Clone, Copy, Debug)]
+struct RotationMarker {
+    lon: f32,
+    lat: f32,
+    /// Peak azimuthal shear (s⁻¹), positive = cyclonic.
+    shear_s: f32,
+    tvs: bool,
+}
+
 /// An extra synchronized view pane in the multi-pane grid. Pane 0 is the
 /// primary view (ViewerApp's own product/texture state, untouched); extra
 /// panes are 1-based. All panes share the loaded volume, the geo transform
@@ -1102,6 +1133,7 @@ struct RenderRequest {
     plain_velocity_render_dealiased: bool,
     color_tables: ColorTableSet,
     storm_motion: StormMotion,
+    hail_levels_m: (f32, f32),
     viewport_options: ViewportRasterOptions,
     radar_range_km: f32,
 }
@@ -1478,6 +1510,7 @@ struct RenderWorkerViewportSignature {
     dealiased_velocity: bool,
     color_table_signature: u64,
     storm_motion_key: (i16, i16),
+    hail_levels_key: (i16, i16),
     viewport: ViewportKey,
 }
 
@@ -1491,6 +1524,7 @@ impl RenderWorkerViewportSignature {
         dealiased_velocity: bool,
         color_table_signature: u64,
         storm_motion_key: (i16, i16),
+        hail_levels_key: (i16, i16),
         viewport: ViewportKey,
     ) -> Self {
         Self {
@@ -1501,6 +1535,7 @@ impl RenderWorkerViewportSignature {
             dealiased_velocity,
             color_table_signature,
             storm_motion_key,
+            hail_levels_key,
             viewport,
         }
     }
@@ -1595,6 +1630,7 @@ fn spawn_render_worker_with_mode(
                 request.render_dealiased_velocity,
                 request.key.color_table_signature,
                 request.key.storm_motion_key,
+                request.key.hail_levels_key,
                 request.key.viewport,
             );
             while let Ok(recycled) = recycle_receiver.try_recv() {
@@ -1702,6 +1738,7 @@ enum DerivedProduct {
     EchoTops,
     Vil,
     VilDensity,
+    Mehs,
     AzimuthalShear,
     Divergence,
 }
@@ -1713,6 +1750,7 @@ impl DerivedProduct {
             Self::EchoTops => "ET",
             Self::Vil => "VIL",
             Self::VilDensity => "VILD",
+            Self::Mehs => "MEHS",
             Self::AzimuthalShear => "AzShr",
             Self::Divergence => "Div",
         }
@@ -1724,6 +1762,7 @@ impl DerivedProduct {
             Self::EchoTops => ColorTableFamily::EchoTops,
             Self::Vil => ColorTableFamily::Vil,
             Self::VilDensity => ColorTableFamily::VilDensity,
+            Self::Mehs => ColorTableFamily::HailSize,
             // Divergence shares the diverging shear palette (convergence cool,
             // divergence warm).
             Self::AzimuthalShear | Self::Divergence => ColorTableFamily::AzimuthalShear,
@@ -1736,6 +1775,7 @@ impl DerivedProduct {
             Self::EchoTops => "m",
             Self::Vil => "kg/m²",
             Self::VilDensity => "g/m³",
+            Self::Mehs => "mm",
             Self::AzimuthalShear | Self::Divergence => "×10⁻³/s",
         }
     }
@@ -1754,11 +1794,12 @@ impl DerivedProduct {
         !matches!(self, Self::AzimuthalShear | Self::Divergence)
     }
 
-    const ALL: [DerivedProduct; 6] = [
+    const ALL: [DerivedProduct; 7] = [
         Self::CompositeReflectivity,
         Self::EchoTops,
         Self::Vil,
         Self::VilDensity,
+        Self::Mehs,
         Self::AzimuthalShear,
         Self::Divergence,
     ];
@@ -1910,6 +1951,11 @@ impl ViewerApp {
             4 => PanelLayout::FourGrid,
             _ => PanelLayout::One,
         };
+        let restored_placefile_slots: Vec<PlacefileSlot> = app_settings
+            .placefiles
+            .iter()
+            .map(|entry| PlacefileSlot::new(entry.url.clone(), entry.enabled))
+            .collect();
         let sites = data_source::fallback_sites();
         let selected_site_index = app_settings
             .startup_site
@@ -1976,6 +2022,15 @@ impl ViewerApp {
             hazard_receiver: None,
             pending_site_id: None,
             cursor_readout: None,
+            placefile_slots: restored_placefile_slots,
+            placefile_url_input: String::new(),
+            placefile_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
+            rotation_markers: Vec::new(),
+            rotation_markers_volume_ptr: 0,
+            rotation_receiver: None,
+            show_rotation_markers: true,
+            hail_freezing_level_km: 3.2,
+            hail_minus20_level_km: 6.4,
             display_thresholds: BTreeMap::new(),
             show_inspector_card: true,
             pinned_inspector_lonlat: None,
@@ -1994,6 +2049,7 @@ impl ViewerApp {
             cross_section_top_m: CROSS_SECTION_TOP_M,
             cross_section_user_signature: None,
             cross_section_volume_cuts: 0,
+            cross_section_dealias_cache: VolumeDealiasCache::new(),
             hazard_overlay: None,
             hazard_path_text,
             hazard_status: "No hazard polygons loaded".to_owned(),
@@ -3360,6 +3416,7 @@ impl ViewerApp {
             render_dealiased_velocity,
             color_table_signature,
             storm_motion_key: self.storm_motion_key(),
+            hail_levels_key: self.hail_levels_key(),
             viewport: viewport_key,
         };
         if self.texture_key.as_ref() == Some(&key) {
@@ -3381,6 +3438,7 @@ impl ViewerApp {
                 plain_velocity_render_dealiased: self.unfold_velocity_display,
                 color_tables,
                 storm_motion: self.current_storm_motion(),
+                hail_levels_m: self.hail_levels_m(),
                 viewport_options,
                 radar_range_km: self
                     .selected_grid_range_km()
@@ -3392,6 +3450,21 @@ impl ViewerApp {
 
     fn product_render_uses_dealiased_velocity(&self, product: &DisplayProduct) -> bool {
         product.render_uses_dealiased_velocity(self.unfold_velocity_display)
+    }
+
+    fn hail_levels_m(&self) -> (f32, f32) {
+        (
+            self.hail_freezing_level_km * 1000.0,
+            self.hail_minus20_level_km * 1000.0,
+        )
+    }
+
+    /// Quantized hail-level key (0.1 km steps) for render/texture keys.
+    fn hail_levels_key(&self) -> (i16, i16) {
+        (
+            (self.hail_freezing_level_km * 10.0).round() as i16,
+            (self.hail_minus20_level_km * 10.0).round() as i16,
+        )
     }
 
     fn render_color_tables_for_product(&self, product: &DisplayProduct) -> ColorTableSet {
@@ -3451,6 +3524,7 @@ impl ViewerApp {
                 render_dealiased_velocity,
                 color_table_signature,
                 storm_motion_key: self.storm_motion_key(),
+                hail_levels_key: self.hail_levels_key(),
                 viewport: viewport_key,
             };
             if layer.texture_key.as_ref() == Some(&key)
@@ -3472,6 +3546,7 @@ impl ViewerApp {
                     plain_velocity_render_dealiased: self.unfold_velocity_display,
                     color_tables,
                     storm_motion: self.current_storm_motion(),
+                    hail_levels_m: self.hail_levels_m(),
                     viewport_options,
                     radar_range_km,
                 },
@@ -3588,6 +3663,7 @@ impl ViewerApp {
                     d,
                     request.cut,
                     &request.color_tables,
+                    request.hail_levels_m,
                 )
             } else if dealiased_velocity {
                 ViewportMomentCache::new_dealiased_velocity_with_color_tables(
@@ -3632,6 +3708,7 @@ impl ViewerApp {
             dealiased_velocity,
             color_table_signature,
             request.key.storm_motion_key,
+            request.key.hail_levels_key,
             request.key.viewport,
         );
         let sample_cache_signature = RenderWorkerSampleCacheSignature::new(
@@ -3838,6 +3915,7 @@ impl ViewerApp {
             request.render_dealiased_velocity,
             request.key.color_table_signature,
             request.key.storm_motion_key,
+            request.key.hail_levels_key,
             request.key.viewport,
         );
         let sample_cache_signature = RenderWorkerSampleCacheSignature::new(
@@ -4323,6 +4401,7 @@ impl ViewerApp {
             render_dealiased_velocity,
             color_table_signature,
             storm_motion_key: self.storm_motion_key(),
+            hail_levels_key: self.hail_levels_key(),
             viewport: viewport_key,
         };
         {
@@ -4347,6 +4426,7 @@ impl ViewerApp {
             plain_velocity_render_dealiased: self.unfold_velocity_display,
             color_tables,
             storm_motion: self.current_storm_motion(),
+            hail_levels_m: self.hail_levels_m(),
             viewport_options,
             radar_range_km,
         };
@@ -4662,6 +4742,8 @@ impl eframe::App for ViewerApp {
         self.maybe_refresh_live_hazards(&ctx);
         self.maybe_advance_history_loop(&ctx);
         self.sanitize_selection();
+        self.poll_rotation_markers(&ctx);
+        self.poll_placefiles(&ctx);
         self.handle_keyboard_navigation(&ctx);
 
         egui::Panel::top("top_bar")
@@ -5020,6 +5102,80 @@ impl ViewerApp {
         }
 
         ui.separator();
+        if ui
+            .checkbox(&mut self.show_rotation_markers, "Rotation markers")
+            .on_hover_text(
+                "Meso / TVS candidates from LLSD azimuthal shear on the lowest velocity tilt (Stumpf et al. 1998; Mitchell et al. 1998 thresholds), detected on a background thread. Gold ring = cyclonic, blue ring = anticyclonic, red triangle = TVS-strength shear. Zoom in for the shear value (10⁻³ s⁻¹).",
+            )
+            .changed()
+        {
+            self.rotation_markers_volume_ptr = 0;
+            if !self.show_rotation_markers {
+                self.rotation_markers.clear();
+            }
+            ctx.request_repaint();
+        }
+
+        ui.separator();
+        egui::CollapsingHeader::new("Placefiles")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.placefile_url_input)
+                            .hint_text("https://… placefile URL")
+                            .desired_width(190.0),
+                    );
+                    if ui.button("Add").clicked() {
+                        let url = self.placefile_url_input.trim().to_owned();
+                        if url.starts_with("http")
+                            && !self.placefile_slots.iter().any(|slot| slot.url == url)
+                        {
+                            self.placefile_slots.push(PlacefileSlot::new(url, true));
+                            self.placefile_url_input.clear();
+                            self.save_placefile_settings();
+                            ctx.request_repaint();
+                        }
+                    }
+                });
+                let mut remove: Option<usize> = None;
+                let mut changed = false;
+                for (index, slot) in self.placefile_slots.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.checkbox(&mut slot.enabled, "").changed() {
+                            changed = true;
+                        }
+                        let title = slot
+                            .data
+                            .as_ref()
+                            .map(|p| p.title.clone())
+                            .filter(|t| !t.is_empty())
+                            .unwrap_or_else(|| slot.url.clone());
+                        ui.label(egui::RichText::new(title).small())
+                            .on_hover_text(format!(
+                                "{}
+{}",
+                                slot.url, slot.status
+                            ));
+                        if ui.small_button("↻").on_hover_text("Refresh now").clicked() {
+                            slot.next_refresh = Some(Instant::now());
+                        }
+                        if ui.small_button("✕").on_hover_text("Remove").clicked() {
+                            remove = Some(index);
+                        }
+                    });
+                }
+                if let Some(index) = remove {
+                    self.placefile_slots.remove(index);
+                    changed = true;
+                }
+                if changed {
+                    self.save_placefile_settings();
+                    ctx.request_repaint();
+                }
+            });
+
+        ui.separator();
         egui::CollapsingHeader::new("Hotkeys")
             .default_open(false)
             .show(ui, |ui| {
@@ -5073,6 +5229,40 @@ impl ViewerApp {
                 self.cross_section_status = "Cross-section: arm, then click endpoint A then B".to_owned();
             }
         });
+
+        if editing_product == DisplayProduct::Derived(DerivedProduct::Mehs) {
+            ui.add_space(8.0);
+            ui.label("Hail environment (above radar)");
+            ui.horizontal(|ui| {
+                ui.label("0°C");
+                let f_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut self.hail_freezing_level_km)
+                            .range(0.5..=8.0)
+                            .speed(0.1)
+                            .suffix(" km"),
+                    )
+                    .on_hover_text(
+                        "Melting-level height above the radar (from a sounding). MEHS follows Witt et al. 1998.",
+                    )
+                    .changed();
+                ui.label("−20°C");
+                let m_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut self.hail_minus20_level_km)
+                            .range(1.0..=14.0)
+                            .speed(0.1)
+                            .suffix(" km"),
+                    )
+                    .changed();
+                if f_changed || m_changed {
+                    self.hail_minus20_level_km = self
+                        .hail_minus20_level_km
+                        .max(self.hail_freezing_level_km + 0.1);
+                    ctx.request_repaint();
+                }
+            });
+        }
 
         if self.selected_product.is_storm_relative_velocity() {
             ui.add_space(8.0);
@@ -6061,6 +6251,8 @@ impl ViewerApp {
         let overlay_start = Instant::now();
         self.draw_basemap_overlay(painter, rect);
         self.draw_hazard_overlays(painter, rect, &self.selected_product.clone());
+        self.draw_rotation_markers(painter, rect);
+        self.draw_placefiles(painter, rect);
         self.basemap_ms = Some(underlay_ms + overlay_start.elapsed().as_secs_f32() * 1000.0);
 
         let site_points = self
@@ -6367,6 +6559,8 @@ impl ViewerApp {
                 self.extra_panes[cell_index - 1].product.clone()
             };
             self.draw_hazard_overlays(&cell_painter, cell, &fill_product);
+            self.draw_rotation_markers(&cell_painter, cell);
+            self.draw_placefiles(&cell_painter, cell);
             self.draw_site_markers(&cell_painter, &site_points);
             self.draw_radar_layer_markers(&cell_painter, cell);
             self.draw_loaded_volume_marker(&cell_painter, cell);
@@ -6471,6 +6665,351 @@ impl ViewerApp {
             // key's product differs.
             pane.product = products[next].clone();
             pane.render_ms = None;
+        }
+    }
+
+    /// Fetch/refresh placefiles on background threads and install results.
+    /// The UI thread never blocks on the network.
+    fn poll_placefiles(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        for slot in &mut self.placefile_slots {
+            if let Some(receiver) = &slot.receiver {
+                match receiver.try_recv() {
+                    Ok(Ok(placefile)) => {
+                        slot.receiver = None;
+                        slot.next_refresh = Some(
+                            now + Duration::from_secs(
+                                u64::from(placefile.refresh_minutes.clamp(1, 60)) * 60,
+                            ),
+                        );
+                        slot.status = format!(
+                            "{} object(s){}",
+                            placefile.objects.len(),
+                            if placefile.skipped > 0 {
+                                format!(" · {} skipped", placefile.skipped)
+                            } else {
+                                String::new()
+                            }
+                        );
+                        slot.data = Some(placefile);
+                        slot.generation = slot.generation.wrapping_add(1);
+                        ctx.request_repaint();
+                    }
+                    Ok(Err(error)) => {
+                        slot.receiver = None;
+                        slot.next_refresh = Some(now + Duration::from_secs(120));
+                        slot.status = format!("fetch failed: {error}");
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        slot.receiver = None;
+                        slot.next_refresh = Some(now + Duration::from_secs(120));
+                    }
+                }
+                continue;
+            }
+            if !slot.enabled {
+                continue;
+            }
+            let due = slot
+                .next_refresh
+                .map(|at| now >= at)
+                .unwrap_or(slot.data.is_none());
+            if !due {
+                continue;
+            }
+            let (sender, receiver) = mpsc::channel();
+            slot.receiver = Some(receiver);
+            slot.status = "fetching…".to_owned();
+            slot.next_refresh = Some(now + Duration::from_secs(120));
+            let url = slot.url.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                let result = data_source::fetch_text(&url)
+                    .map(|text| placefiles::parse_placefile(&text))
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(result);
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    /// Persist the current placefile list into settings.
+    fn save_placefile_settings(&mut self) {
+        self.app_settings.placefiles = self
+            .placefile_slots
+            .iter()
+            .map(|slot| settings::PlacefileEntry {
+                url: slot.url.clone(),
+                enabled: slot.enabled,
+            })
+            .collect();
+        let _ = self.app_settings.save();
+    }
+
+    /// Draw placefile overlays. Geometry is cached per (slot, generation,
+    /// view); text labels draw live. Thresholds follow the GR convention:
+    /// an object shows when the viewport spans fewer nautical miles than its
+    /// threshold (999 = always).
+    fn draw_placefiles(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if self.placefile_slots.is_empty() {
+            return;
+        }
+        let viewport_nm = (rect.width() / self.map_scale).max(0.01) * 60.0 * 0.868_976; // deg -> nm
+        for (index, slot) in self.placefile_slots.iter().enumerate() {
+            let (true, Some(placefile)) = (slot.enabled, slot.data.as_ref()) else {
+                continue;
+            };
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            self.view_shape_key(4, rect).hash(&mut hasher);
+            index.hash(&mut hasher);
+            slot.generation.hash(&mut hasher);
+            let key = hasher.finish();
+            let mut cache = self.placefile_shape_cache.borrow_mut();
+            let built = cache.get_or_insert_with(key, || {
+                self.build_placefile_draw_list(placefile, rect, viewport_nm)
+            });
+            painter.extend(built.shapes.iter().cloned());
+            for (position, text, size, color) in &built.labels {
+                draw_halo_text(
+                    painter,
+                    *position,
+                    egui::Align2::CENTER_BOTTOM,
+                    text,
+                    egui::FontId::proportional(*size),
+                    *color,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190),
+                );
+            }
+        }
+    }
+
+    fn build_placefile_draw_list(
+        &self,
+        placefile: &placefiles::Placefile,
+        rect: egui::Rect,
+        viewport_nm: f32,
+    ) -> PlacefileDrawList {
+        let mut out = PlacefileDrawList {
+            shapes: Vec::new(),
+            labels: Vec::new(),
+        };
+        let visible = rect.expand(24.0);
+        for object in &placefile.objects {
+            if viewport_nm > object.threshold_nm() {
+                continue;
+            }
+            match object {
+                placefiles::PlacefileObject::Icon {
+                    lat,
+                    lon,
+                    heading_deg,
+                    label,
+                    color,
+                    ..
+                } => {
+                    let position = self.lon_lat_to_screen(rect, *lon, *lat);
+                    if !visible.contains(position) {
+                        continue;
+                    }
+                    let fill = egui::Color32::from_rgb(color[0], color[1], color[2]);
+                    out.shapes
+                        .push(egui::Shape::circle_filled(position, 4.5, fill));
+                    out.shapes.push(egui::Shape::circle_stroke(
+                        position,
+                        4.5,
+                        egui::Stroke::new(1.0, egui::Color32::BLACK),
+                    ));
+                    // Heading tick (0 = north, clockwise).
+                    let angle = heading_deg.to_radians();
+                    let direction = egui::vec2(angle.sin(), -angle.cos());
+                    out.shapes.push(egui::Shape::line_segment(
+                        [position + direction * 5.0, position + direction * 11.0],
+                        egui::Stroke::new(2.0, fill),
+                    ));
+                    if let Some(label) = label
+                        && self.map_scale >= 150.0
+                    {
+                        out.labels.push((
+                            position + egui::vec2(0.0, -8.0),
+                            label.clone(),
+                            10.0,
+                            egui::Color32::from_rgb(230, 235, 240),
+                        ));
+                    }
+                }
+                placefiles::PlacefileObject::Text {
+                    lat,
+                    lon,
+                    size_px,
+                    text,
+                    color,
+                    ..
+                } => {
+                    let position = self.lon_lat_to_screen(rect, *lon, *lat);
+                    if !visible.contains(position) {
+                        continue;
+                    }
+                    out.labels.push((
+                        position,
+                        text.clone(),
+                        *size_px,
+                        egui::Color32::from_rgb(color[0], color[1], color[2]),
+                    ));
+                }
+                placefiles::PlacefileObject::Line {
+                    width,
+                    points,
+                    color,
+                    ..
+                } => {
+                    let screen: Vec<egui::Pos2> = points
+                        .iter()
+                        .map(|(lat, lon)| self.lon_lat_to_screen(rect, *lon, *lat))
+                        .collect();
+                    if screen.iter().any(|p| visible.contains(*p)) {
+                        out.shapes.push(egui::Shape::line(
+                            screen,
+                            egui::Stroke::new(
+                                *width,
+                                egui::Color32::from_rgb(color[0], color[1], color[2]),
+                            ),
+                        ));
+                    }
+                }
+                placefiles::PlacefileObject::Polygon { points, color, .. } => {
+                    let screen: Vec<egui::Pos2> = points
+                        .iter()
+                        .map(|(lat, lon)| self.lon_lat_to_screen(rect, *lon, *lat))
+                        .collect();
+                    if !screen.iter().any(|p| visible.contains(*p)) {
+                        continue;
+                    }
+                    let fill =
+                        egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], 60);
+                    let stroke = egui::Stroke::new(
+                        1.5,
+                        egui::Color32::from_rgb(color[0], color[1], color[2]),
+                    );
+                    if is_convex_screen_polygon(&screen) {
+                        out.shapes
+                            .push(egui::Shape::convex_polygon(screen, fill, stroke));
+                    } else {
+                        if let Some(mesh) = filled_polygon_mesh(&screen, fill) {
+                            out.shapes.push(egui::Shape::mesh(mesh));
+                        }
+                        out.shapes.push(egui::Shape::closed_line(screen, stroke));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Kick background rotation detection when the displayed volume changes
+    /// and install finished results. Stale results (a newer volume arrived
+    /// while detecting) are dropped by pointer check. The detection itself
+    /// (dealias + LLSD + clustering, ~tens of ms) never touches the UI thread.
+    fn poll_rotation_markers(&mut self, ctx: &egui::Context) {
+        // Install any finished detection for the CURRENT volume.
+        if let Some(receiver) = &self.rotation_receiver {
+            match receiver.try_recv() {
+                Ok((volume_ptr, markers)) => {
+                    self.rotation_receiver = None;
+                    let current = self
+                        .volume
+                        .as_ref()
+                        .map(|v| Arc::as_ptr(v) as usize)
+                        .unwrap_or(0);
+                    if volume_ptr == current {
+                        self.rotation_markers = markers;
+                        ctx.request_repaint();
+                    } else {
+                        // Stale — re-kick below for the new volume.
+                        self.rotation_markers_volume_ptr = 0;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.rotation_receiver = None,
+            }
+        }
+        if !self.show_rotation_markers {
+            return;
+        }
+        let Some(volume) = self.volume.clone() else {
+            if !self.rotation_markers.is_empty() {
+                self.rotation_markers.clear();
+                self.rotation_markers_volume_ptr = 0;
+            }
+            return;
+        };
+        let volume_ptr = Arc::as_ptr(&volume) as usize;
+        if volume_ptr == self.rotation_markers_volume_ptr || self.rotation_receiver.is_some() {
+            return;
+        }
+        let Some((radar_lat, radar_lon)) = self.radar_location() else {
+            return;
+        };
+        self.rotation_markers_volume_ptr = volume_ptr;
+        let (sender, receiver) = mpsc::channel();
+        self.rotation_receiver = Some(receiver);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let markers = detect_rotation_markers_for_volume(&volume, radar_lat, radar_lon);
+            let _ = sender.send((volume_ptr, markers));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Draw rotation markers: meso = gold ring (blue when anticyclonic),
+    /// TVS = filled red triangle (NWS convention). Labels show shear in
+    /// 10⁻³ s⁻¹ when zoomed in.
+    fn draw_rotation_markers(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if !self.show_rotation_markers || self.rotation_markers.is_empty() {
+            return;
+        }
+        for marker in &self.rotation_markers {
+            let position = self.lon_lat_to_screen(rect, marker.lon, marker.lat);
+            if !rect.expand(16.0).contains(position) {
+                continue;
+            }
+            if marker.tvs {
+                let size = 9.0;
+                let points = vec![
+                    position + egui::vec2(-size, -size),
+                    position + egui::vec2(size, -size),
+                    position + egui::vec2(0.0, size * 1.1),
+                ];
+                painter.add(egui::Shape::convex_polygon(
+                    points,
+                    egui::Color32::from_rgb(225, 32, 38),
+                    egui::Stroke::new(1.5, egui::Color32::WHITE),
+                ));
+            } else {
+                let color = if marker.shear_s >= 0.0 {
+                    egui::Color32::from_rgb(250, 200, 60)
+                } else {
+                    egui::Color32::from_rgb(140, 200, 250)
+                };
+                painter.circle_stroke(position, 8.0, egui::Stroke::new(2.4, color));
+                painter.circle_stroke(
+                    position,
+                    8.0,
+                    egui::Stroke::new(0.8, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160)),
+                );
+            }
+            if self.map_scale >= 120.0 {
+                draw_halo_text(
+                    painter,
+                    position + egui::vec2(0.0, -14.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    &format!("{:.0}", marker.shear_s * 1000.0),
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::from_rgb(245, 240, 220),
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+                );
+            }
         }
     }
 
@@ -6939,7 +7478,15 @@ impl ViewerApp {
         }
 
         let section = if velocity {
-            velocity_cross_section(&volume, start, end, w, h, top_m)
+            velocity_cross_section_cached(
+                &volume,
+                &mut self.cross_section_dealias_cache,
+                start,
+                end,
+                w,
+                h,
+                top_m,
+            )
         } else {
             reflectivity_cross_section(&volume, start, end, w, h, top_m)
         };
@@ -8039,6 +8586,40 @@ impl<V> ShapeCache<V> {
     }
 }
 
+/// A loaded placefile overlay: URL + parsed content + refresh bookkeeping.
+/// Fetch + parse run on background threads; the UI polls a channel.
+struct PlacefileSlot {
+    url: String,
+    enabled: bool,
+    data: Option<placefiles::Placefile>,
+    /// Bumped on every successful install — exact shape-cache invalidation.
+    generation: u64,
+    next_refresh: Option<Instant>,
+    status: String,
+    receiver: Option<mpsc::Receiver<std::result::Result<placefiles::Placefile, String>>>,
+}
+
+impl PlacefileSlot {
+    fn new(url: String, enabled: bool) -> Self {
+        Self {
+            url,
+            enabled,
+            data: None,
+            generation: 0,
+            next_refresh: None,
+            status: "queued".to_owned(),
+            receiver: None,
+        }
+    }
+}
+
+/// Cached placefile draw geometry: shapes plus live-drawn text labels
+/// (position, text, size px, color).
+struct PlacefileDrawList {
+    shapes: Vec<egui::Shape>,
+    labels: Vec<(egui::Pos2, String, f32, egui::Color32)>,
+}
+
 /// Cached hazard-overlay geometry: the (possibly ear-clipped) polygon shapes
 /// plus label anchors (centroid, text, selected) drawn live each frame.
 struct HazardOverlayShapes {
@@ -8054,6 +8635,7 @@ struct TextureKey {
     render_dealiased_velocity: bool,
     color_table_signature: u64,
     storm_motion_key: (i16, i16),
+    hail_levels_key: (i16, i16),
     viewport: ViewportKey,
 }
 
@@ -8365,6 +8947,7 @@ fn parse_color_table_for_family(
         | ColorTableFamily::EchoTops
         | ColorTableFamily::Vil
         | ColorTableFamily::VilDensity
+        | ColorTableFamily::HailSize
         | ColorTableFamily::AzimuthalShear
         | ColorTableFamily::DifferentialPhase
         | ColorTableFamily::SpecificDifferentialPhase
@@ -8635,11 +9218,49 @@ fn pane_cell_rects(layout: PanelLayout, outer: egui::Rect, gap: f32) -> Vec<egui
 
 /// Compute a volume-derived product and wrap it in a render cache on the
 /// lowest reflectivity tilt's geometry. Used by the render worker.
+/// Background worker: detect rotation sites on the lowest velocity tilt and
+/// geolocate them relative to the radar.
+fn detect_rotation_markers_for_volume(
+    volume: &RadarVolume,
+    radar_lat: f32,
+    radar_lon: f32,
+) -> Vec<RotationMarker> {
+    let Some((_, cut)) = volume
+        .cuts
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.moments.contains_key(&MomentType::Velocity))
+        .min_by(|a, b| a.1.elevation_deg.total_cmp(&b.1.elevation_deg))
+    else {
+        return Vec::new();
+    };
+    let Some(velocity) = cut.moments.get(&MomentType::Velocity) else {
+        return Vec::new();
+    };
+    let cos_lat = radar_lat.to_radians().cos().max(0.05);
+    detect_rotation_sites(cut, velocity)
+        .into_iter()
+        .map(|site| {
+            let az = (site.azimuth_deg as f64).to_radians();
+            let range_km = site.ground_range_m / 1000.0;
+            let east_km = range_km * az.sin();
+            let north_km = range_km * az.cos();
+            RotationMarker {
+                lon: radar_lon + (east_km as f32) / (111.32 * cos_lat),
+                lat: radar_lat + (north_km as f32) / 111.32,
+                shear_s: site.peak_shear_s,
+                tvs: site.tvs,
+            }
+        })
+        .collect()
+}
+
 fn build_derived_moment_cache(
     volume: &RadarVolume,
     derived: DerivedProduct,
     selected_cut: usize,
     color_tables: &ColorTableSet,
+    hail_levels_m: (f32, f32),
 ) -> std::result::Result<ViewportMomentCache, String> {
     let (geometry_cut, grid) = if derived.is_volume_wide() {
         // Volume products render on the lowest reflectivity tilt.
@@ -8656,6 +9277,7 @@ fn build_derived_moment_cache(
             DerivedProduct::EchoTops => echo_top_grid(volume, ECHO_TOP_THRESHOLD_DBZ),
             DerivedProduct::Vil => vil_grid(volume),
             DerivedProduct::VilDensity => vil_density_grid(volume),
+            DerivedProduct::Mehs => mehs_grid(volume, hail_levels_m.0, hail_levels_m.1),
             DerivedProduct::AzimuthalShear | DerivedProduct::Divergence => {
                 unreachable!("velocity derivatives are per-cut")
             }
@@ -11728,6 +12350,7 @@ mod tests {
             false,
             123,
             (0, 0),
+            (32, 64),
             viewport,
         );
         let second_pixels = RenderWorkerViewportSignature::new(
@@ -11738,6 +12361,7 @@ mod tests {
             false,
             456,
             (0, 0),
+            (32, 64),
             viewport,
         );
         assert_ne!(first_pixels, second_pixels);
@@ -11936,6 +12560,7 @@ mod tests {
                 render_dealiased_velocity: false,
                 color_table_signature,
                 storm_motion_key: (450, 350),
+                hail_levels_key: (32, 64),
                 viewport: test_viewport_key(1320, 820),
             },
             pane: 0,
@@ -11945,6 +12570,7 @@ mod tests {
             render_dealiased_velocity: false,
             plain_velocity_render_dealiased: true,
             color_tables,
+            hail_levels_m: (3200.0, 6400.0),
             storm_motion: StormMotion {
                 direction_deg: 45.0,
                 speed_mps: 35.0 * KNOT_TO_MPS,
@@ -13446,6 +14072,15 @@ mod tests {
             hazard_receiver: None,
             pending_site_id: None,
             cursor_readout: None,
+            placefile_slots: Vec::new(),
+            placefile_url_input: String::new(),
+            placefile_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
+            rotation_markers: Vec::new(),
+            rotation_markers_volume_ptr: 0,
+            rotation_receiver: None,
+            show_rotation_markers: true,
+            hail_freezing_level_km: 3.2,
+            hail_minus20_level_km: 6.4,
             display_thresholds: BTreeMap::new(),
             show_inspector_card: true,
             pinned_inspector_lonlat: None,
@@ -13464,6 +14099,7 @@ mod tests {
             cross_section_top_m: CROSS_SECTION_TOP_M,
             cross_section_user_signature: None,
             cross_section_volume_cuts: 0,
+            cross_section_dealias_cache: VolumeDealiasCache::new(),
             hazard_overlay: Some(test_hazard_overlay(records)),
             hazard_path_text: String::new(),
             hazard_status: String::new(),
@@ -13768,6 +14404,7 @@ mod tests {
             false,
             0,
             (0, 0),
+            (32, 64),
             test_viewport_key(width, 100),
         )
     }
@@ -13839,6 +14476,7 @@ mod tests {
                 false,
                 0,
                 (0, 0),
+                (32, 64),
                 test_viewport_key(width, height),
             ),
             render_ms,

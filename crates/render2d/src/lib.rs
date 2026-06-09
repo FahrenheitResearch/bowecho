@@ -8,8 +8,10 @@ use std::ops::Range;
 use std::path::Path;
 
 pub use color_tables::{ColorSampler, ColorTable, ColorTableFamily, ColorTableSet};
+mod detect;
 mod shear;
 mod volumetric;
+pub use detect::{MESO_SHEAR_THRESHOLD, RotationSite, TVS_SHEAR_THRESHOLD, detect_rotation_sites};
 use image::{ImageBuffer, ImageError, Rgba};
 use radar_core::{
     ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, ProductId, RadarVolume,
@@ -18,8 +20,9 @@ use rayon::prelude::*;
 pub use shear::{azimuthal_shear_grid, radial_divergence_grid};
 use thiserror::Error;
 pub use volumetric::{
-    CrossSection, ECHO_TOP_THRESHOLD_DBZ, composite_reflectivity_grid, echo_top_grid,
-    reflectivity_cross_section, velocity_cross_section, vil_density_grid, vil_grid,
+    CrossSection, ECHO_TOP_THRESHOLD_DBZ, VolumeDealiasCache, composite_reflectivity_grid,
+    echo_top_grid, mehs_grid, reflectivity_cross_section, velocity_cross_section,
+    velocity_cross_section_cached, vil_density_grid, vil_grid,
 };
 
 const AZIMUTH_BINS: usize = 3600;

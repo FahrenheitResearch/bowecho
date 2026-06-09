@@ -22,10 +22,20 @@ pub struct AppSettings {
     pub palette_by_family: BTreeMap<String, String>,
     /// Multi-pane grid layout pane count from the last session (1, 2 or 4).
     pub grid_pane_count: usize,
+    /// Placefile URLs (GRLevelX-style overlays) with per-file enable flags.
+    pub placefiles: Vec<PlacefileEntry>,
     /// Product hotkeys: number-row key ("0"-"9") -> product label (e.g.
     /// "REF", "VEL", "SRV", "RHO", "ZDR", "SW", "CREF", "ET", "VIL", "VILD",
     /// "PHI", "KDP", "AzShr", "Div"). Edit in config.json to customize.
     pub product_hotkeys: BTreeMap<String, String>,
+}
+
+/// A persisted placefile reference.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlacefileEntry {
+    pub url: String,
+    pub enabled: bool,
 }
 
 /// Default number-row bindings (the classic analyst loadout).
@@ -56,6 +66,7 @@ impl Default for AppSettings {
             saved_layout_slots: 8,
             palette_by_family: BTreeMap::new(),
             grid_pane_count: 1,
+            placefiles: Vec::new(),
             product_hotkeys: default_product_hotkeys(),
         }
     }

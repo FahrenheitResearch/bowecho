@@ -10,8 +10,8 @@ use image::{ImageBuffer, Rgba};
 use radar_core::{MomentType, RadarVolume};
 use render2d::{
     ECHO_TOP_THRESHOLD_DBZ, ViewportMomentCache, ViewportRasterOptions, azimuthal_shear_grid,
-    composite_reflectivity_grid, echo_top_grid, radial_divergence_grid, reflectivity_cross_section,
-    viewport_rgba_buffer_len, vil_density_grid, vil_grid,
+    composite_reflectivity_grid, echo_top_grid, mehs_grid, radial_divergence_grid,
+    reflectivity_cross_section, viewport_rgba_buffer_len, vil_density_grid, vil_grid,
 };
 
 fn lowest_cut_with(volume: &RadarVolume, moment: &MomentType) -> Option<usize> {
@@ -128,6 +128,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "VILDensity",
                 vil_density_grid(&volume),
                 ColorTableFamily::VilDensity,
+            ),
+            (
+                "MEHS",
+                mehs_grid(&volume, 3200.0, 6400.0),
+                ColorTableFamily::HailSize,
             ),
         ];
         for (name, grid, family) in derived {

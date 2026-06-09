@@ -56,6 +56,7 @@ pub enum ColorTableFamily {
     EchoTops,
     Vil,
     VilDensity,
+    HailSize,
     AzimuthalShear,
     DifferentialPhase,
     SpecificDifferentialPhase,
@@ -73,6 +74,7 @@ impl ColorTableFamily {
             Self::EchoTops => "Echo Tops",
             Self::Vil => "VIL",
             Self::VilDensity => "VIL Density",
+            Self::HailSize => "Hail Size (MEHS)",
             Self::AzimuthalShear => "Azimuthal Shear",
             Self::DifferentialPhase => "Differential Phase (PHI)",
             Self::SpecificDifferentialPhase => "Specific Diff Phase (KDP)",
@@ -638,6 +640,7 @@ pub struct ColorTableSet {
     echo_tops: ColorTable,
     vil: ColorTable,
     vil_density: ColorTable,
+    hail_size: ColorTable,
     azimuthal_shear: ColorTable,
     differential_phase: ColorTable,
     specific_differential_phase: ColorTable,
@@ -655,6 +658,7 @@ impl ColorTableSet {
             ColorTableFamily::EchoTops => &self.echo_tops,
             ColorTableFamily::Vil => &self.vil,
             ColorTableFamily::VilDensity => &self.vil_density,
+            ColorTableFamily::HailSize => &self.hail_size,
             ColorTableFamily::AzimuthalShear => &self.azimuthal_shear,
             ColorTableFamily::DifferentialPhase => &self.differential_phase,
             ColorTableFamily::SpecificDifferentialPhase => &self.specific_differential_phase,
@@ -672,6 +676,7 @@ impl ColorTableSet {
             ColorTableFamily::EchoTops => self.echo_tops = table,
             ColorTableFamily::Vil => self.vil = table,
             ColorTableFamily::VilDensity => self.vil_density = table,
+            ColorTableFamily::HailSize => self.hail_size = table,
             ColorTableFamily::AzimuthalShear => self.azimuthal_shear = table,
             ColorTableFamily::DifferentialPhase => self.differential_phase = table,
             ColorTableFamily::SpecificDifferentialPhase => self.specific_differential_phase = table,
@@ -695,6 +700,7 @@ impl Default for ColorTableSet {
             echo_tops: builtin_echo_tops_table(),
             vil: builtin_vil_table(),
             vil_density: builtin_vil_density_table(),
+            hail_size: builtin_hail_size_table(),
             azimuthal_shear: builtin_azimuthal_shear_table(),
             differential_phase: builtin_differential_phase_table(),
             specific_differential_phase: builtin_specific_differential_phase_table(),
@@ -800,6 +806,7 @@ pub fn builtin_tables_for_family(family: ColorTableFamily) -> Vec<ColorTable> {
         ColorTableFamily::EchoTops => vec![builtin_echo_tops_table()],
         ColorTableFamily::Vil => vec![builtin_vil_table()],
         ColorTableFamily::VilDensity => vec![builtin_vil_density_table()],
+        ColorTableFamily::HailSize => vec![builtin_hail_size_table()],
         ColorTableFamily::AzimuthalShear => vec![builtin_azimuthal_shear_table()],
         ColorTableFamily::DifferentialPhase => vec![builtin_differential_phase_table()],
         ColorTableFamily::SpecificDifferentialPhase => {
@@ -875,6 +882,27 @@ pub fn builtin_vil_density_table() -> ColorTable {
         ],
     )
     .expect("built-in VIL density color table is valid")
+}
+
+/// MEHS palette (mm). Breaks at report thresholds: 19 mm (3/4"), the 25 mm
+/// (1") severe criterion, 44 mm (1.75" golf ball) and 50 mm (2") — sub-severe
+/// sizes stay cool, severe goes warm, giant hail goes magenta->white.
+pub fn builtin_hail_size_table() -> ColorTable {
+    ColorTable::new(
+        "Analyst MEHS",
+        vec![
+            stop(5.0, 60, 110, 170),
+            stop(15.0, 70, 160, 200),
+            stop(19.0, 90, 190, 120),
+            stop(25.0, 235, 215, 60),
+            stop(38.0, 245, 150, 40),
+            stop(44.0, 230, 70, 45),
+            stop(50.0, 200, 35, 100),
+            stop(70.0, 240, 160, 235),
+            stop(100.0, 250, 245, 250),
+        ],
+    )
+    .expect("built-in hail size color table is valid")
 }
 
 /// Azimuthal-shear palette (×10^-3 s^-1), diverging about zero: near-zero is
