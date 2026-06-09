@@ -8,9 +8,11 @@ use std::ops::Range;
 use std::path::Path;
 
 pub use color_tables::{ColorSampler, ColorTable, ColorTableFamily, ColorTableSet};
+mod cells;
 mod detect;
 mod shear;
 mod volumetric;
+pub use cells::{StormCell, identify_storm_cells};
 pub use detect::{
     RotationSite, RotationStrength, detect_rotation_sites, rotation_features_per_tilt,
 };

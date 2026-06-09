@@ -11,10 +11,10 @@ use data_source::{LEVEL2_ARCHIVE_BUCKET, RadarSite, RealtimeChunkType};
 use eframe::egui;
 use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType, RadarVolume};
 use render2d::{
-    ECHO_TOP_THRESHOLD_DBZ, StormMotion, StormRelativePaletteCache, ViewportMomentCache,
+    ECHO_TOP_THRESHOLD_DBZ, StormCell, StormMotion, StormRelativePaletteCache, ViewportMomentCache,
     ViewportRasterOptions, ViewportSampleCache, VolumeDealiasCache, azimuthal_shear_grid,
     color_family_for_moment, composite_reflectivity_grid, dealias_velocity_grid,
-    detect_rotation_sites, echo_top_grid, mehs_grid, radial_divergence_grid,
+    detect_rotation_sites, echo_top_grid, identify_storm_cells, mehs_grid, radial_divergence_grid,
     reflectivity_cross_section, storm_relative_velocity_mps, velocity_cross_section_cached,
     viewport_rgba_buffer_len, viewport_sample_cache_storage_upper_bound, vil_density_grid,
     vil_grid,
@@ -360,6 +360,14 @@ struct ViewerApp {
     placefile_slots: Vec<PlacefileSlot>,
     placefile_url_input: String,
     placefile_shape_cache: std::cell::RefCell<ShapeCache<PlacefileDrawList>>,
+    /// SCIT-style storm tracks: identification runs per volume on a
+    /// background thread; association + motion fits are O(cells) on install.
+    storm_tracks: Vec<StormTrack>,
+    storm_tracks_site: String,
+    next_storm_track_id: u32,
+    storm_cells_volume_ptr: usize,
+    storm_cells_receiver: Option<mpsc::Receiver<StormCellsResult>>,
+    show_storm_tracks: bool,
     /// Rotation (meso/TVS) markers from the lowest velocity tilt (Stumpf et
     /// al. 1998 / Mitchell et al. 1998 thresholds on LLSD azimuthal shear).
     /// Detection runs on a BACKGROUND thread once per volume — the UI thread
@@ -1078,6 +1086,65 @@ struct AsyncRenderResult {
     /// Which view pane requested this render (0 = the primary view).
     pane: usize,
     result: Result<RenderedTexture, String>,
+}
+
+/// Background cell-identification result: (volume ptr, volume time, cells).
+type StormCellsResult = (usize, DateTime<Utc>, Vec<StormCell>);
+
+/// One tracked storm cell across volumes — the cross-volume half of SCIT
+/// (Johnson et al. 1998, WAF 13(2)): nearest-to-prediction association and a
+/// least-squares motion fit over the recent history.
+struct StormTrack {
+    id: u32,
+    /// (volume time, east km, north km), most recent last; capped length.
+    history: Vec<(DateTime<Utc>, f64, f64)>,
+    max_dbz: f32,
+    /// Fitted motion in m/s (east, north); None until two distinct times.
+    motion_mps: Option<(f32, f32)>,
+    /// Consecutive volumes without a match (track drops at 2).
+    missed: u8,
+}
+
+impl StormTrack {
+    /// Least-squares linear fit of position vs time over the last points.
+    fn refit_motion(&mut self) {
+        let n = self.history.len();
+        if n < 2 {
+            self.motion_mps = None;
+            return;
+        }
+        let window = &self.history[n.saturating_sub(6)..];
+        let t0 = window[0].0;
+        let mut st = 0.0f64;
+        let mut stt = 0.0f64;
+        let mut se = 0.0f64;
+        let mut sn = 0.0f64;
+        let mut ste = 0.0f64;
+        let mut stn = 0.0f64;
+        let m = window.len() as f64;
+        for (time, east, north) in window {
+            let t = (*time - t0).num_milliseconds() as f64 / 1000.0;
+            st += t;
+            stt += t * t;
+            se += east;
+            sn += north;
+            ste += t * east;
+            stn += t * north;
+        }
+        let denom = m * stt - st * st;
+        if denom.abs() < 1.0 {
+            self.motion_mps = None;
+            return;
+        }
+        let u = (m * ste - st * se) / denom * 1000.0; // km/s -> m/s
+        let v = (m * stn - st * sn) / denom * 1000.0;
+        // Reject unphysical fits (storms top out well under 50 m/s).
+        if u.hypot(v) > 60.0 {
+            self.motion_mps = None;
+        } else {
+            self.motion_mps = Some((u as f32, v as f32));
+        }
+    }
 }
 
 /// A rotation site detected on the lowest velocity tilt, geolocated.
@@ -2027,6 +2094,12 @@ impl ViewerApp {
             placefile_slots: restored_placefile_slots,
             placefile_url_input: String::new(),
             placefile_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
+            storm_tracks: Vec::new(),
+            storm_tracks_site: String::new(),
+            next_storm_track_id: 1,
+            storm_cells_volume_ptr: 0,
+            storm_cells_receiver: None,
+            show_storm_tracks: true,
             rotation_markers: Vec::new(),
             rotation_markers_volume_ptr: 0,
             rotation_receiver: None,
@@ -4745,6 +4818,7 @@ impl eframe::App for ViewerApp {
         self.maybe_advance_history_loop(&ctx);
         self.sanitize_selection();
         self.poll_rotation_markers(&ctx);
+        self.poll_storm_tracks(&ctx);
         self.poll_placefiles(&ctx);
         self.handle_keyboard_navigation(&ctx);
 
@@ -5117,6 +5191,36 @@ impl ViewerApp {
             }
             ctx.request_repaint();
         }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut self.show_storm_tracks, "Storm tracks")
+                .on_hover_text(
+                    "SCIT-style cell tracking (Johnson et al. 1998): composite-reflectivity cells identified per volume on a background thread, tracked across volumes with a least-squares motion fit; dots extrapolate +15/+30/+45 min.",
+                )
+                .changed()
+            {
+                if !self.show_storm_tracks {
+                    self.storm_tracks.clear();
+                }
+                self.storm_cells_volume_ptr = 0;
+                ctx.request_repaint();
+            }
+            if let Some((direction, speed_kt)) = self.storm_motion_from_tracks()
+                && ui
+                    .small_button("SRV←tracks")
+                    .on_hover_text(format!(
+                        "Set storm motion from the mean track motion ({direction:03.0}° / {speed_kt:.0} kt)"
+                    ))
+                    .clicked()
+            {
+                self.storm_motion_direction_deg = direction;
+                self.storm_motion_speed_kt = speed_kt;
+                self.clear_texture();
+                ctx.request_repaint();
+            }
+        });
 
         ui.separator();
         egui::CollapsingHeader::new("Placefiles")
@@ -6254,6 +6358,7 @@ impl ViewerApp {
         self.draw_basemap_overlay(painter, rect);
         self.draw_hazard_overlays(painter, rect, &self.selected_product.clone());
         self.draw_rotation_markers(painter, rect);
+        self.draw_storm_tracks(painter, rect);
         self.draw_placefiles(painter, rect);
         self.basemap_ms = Some(underlay_ms + overlay_start.elapsed().as_secs_f32() * 1000.0);
 
@@ -6562,6 +6667,7 @@ impl ViewerApp {
             };
             self.draw_hazard_overlays(&cell_painter, cell, &fill_product);
             self.draw_rotation_markers(&cell_painter, cell);
+            self.draw_storm_tracks(&cell_painter, cell);
             self.draw_placefiles(&cell_painter, cell);
             self.draw_site_markers(&cell_painter, &site_points);
             self.draw_radar_layer_markers(&cell_painter, cell);
@@ -6907,6 +7013,225 @@ impl ViewerApp {
             }
         }
         out
+    }
+
+    /// Kick background storm-cell identification per volume and fold results
+    /// into the track history (SCIT association: nearest cell to each
+    /// track's predicted position, then unmatched cells start new tracks).
+    fn poll_storm_tracks(&mut self, ctx: &egui::Context) {
+        if let Some(receiver) = &self.storm_cells_receiver {
+            match receiver.try_recv() {
+                Ok((volume_ptr, time, cells)) => {
+                    self.storm_cells_receiver = None;
+                    let current = self
+                        .volume
+                        .as_ref()
+                        .map(|v| Arc::as_ptr(v) as usize)
+                        .unwrap_or(0);
+                    if volume_ptr == current {
+                        self.associate_storm_cells(time, cells);
+                        ctx.request_repaint();
+                    } else {
+                        self.storm_cells_volume_ptr = 0;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.storm_cells_receiver = None,
+            }
+        }
+        if !self.show_storm_tracks {
+            return;
+        }
+        let Some(volume) = self.volume.clone() else {
+            return;
+        };
+        // Site change resets the history (tracks are radar-relative).
+        if self.storm_tracks_site != volume.site.id {
+            self.storm_tracks.clear();
+            self.storm_tracks_site = volume.site.id.clone();
+        }
+        let volume_ptr = Arc::as_ptr(&volume) as usize;
+        if volume_ptr == self.storm_cells_volume_ptr || self.storm_cells_receiver.is_some() {
+            return;
+        }
+        self.storm_cells_volume_ptr = volume_ptr;
+        let (sender, receiver) = mpsc::channel();
+        self.storm_cells_receiver = Some(receiver);
+        let time = volume.volume_time.with_timezone(&Utc);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let cells = identify_storm_cells(&volume);
+            let _ = sender.send((volume_ptr, time, cells));
+            ctx.request_repaint();
+        });
+    }
+
+    fn associate_storm_cells(&mut self, time: DateTime<Utc>, cells: Vec<StormCell>) {
+        const MATCH_LIMIT_KM: f64 = 16.0;
+        let mut taken = vec![false; cells.len()];
+        for track in &mut self.storm_tracks {
+            let Some(&(last_time, last_east, last_north)) = track.history.last() else {
+                continue;
+            };
+            // Same volume time (live chunk refinement): replace the last fix.
+            let dt_s = (time - last_time).num_milliseconds() as f64 / 1000.0;
+            let (predicted_east, predicted_north) = match (dt_s > 0.0, track.motion_mps) {
+                (true, Some((u, v))) => (
+                    last_east + u as f64 * dt_s / 1000.0,
+                    last_north + v as f64 * dt_s / 1000.0,
+                ),
+                _ => (last_east, last_north),
+            };
+            let mut best: Option<(usize, f64)> = None;
+            for (index, cell) in cells.iter().enumerate() {
+                if taken[index] {
+                    continue;
+                }
+                let distance = ((cell.east_km - predicted_east).powi(2)
+                    + (cell.north_km - predicted_north).powi(2))
+                .sqrt();
+                if distance <= MATCH_LIMIT_KM && best.is_none_or(|(_, d)| distance < d) {
+                    best = Some((index, distance));
+                }
+            }
+            if let Some((index, _)) = best {
+                taken[index] = true;
+                let cell = &cells[index];
+                if dt_s <= 0.0 {
+                    if let Some(last) = track.history.last_mut() {
+                        *last = (time, cell.east_km, cell.north_km);
+                    }
+                } else {
+                    track.history.push((time, cell.east_km, cell.north_km));
+                    if track.history.len() > 12 {
+                        track.history.remove(0);
+                    }
+                }
+                track.max_dbz = track.max_dbz.max(cell.max_dbz);
+                track.missed = 0;
+                track.refit_motion();
+            } else if dt_s > 0.0 {
+                track.missed = track.missed.saturating_add(1);
+            }
+        }
+        self.storm_tracks.retain(|track| track.missed < 2);
+        for (index, cell) in cells.iter().enumerate() {
+            if taken[index] {
+                continue;
+            }
+            self.storm_tracks.push(StormTrack {
+                id: self.next_storm_track_id,
+                history: vec![(time, cell.east_km, cell.north_km)],
+                max_dbz: cell.max_dbz,
+                motion_mps: None,
+                missed: 0,
+            });
+            self.next_storm_track_id = self.next_storm_track_id.wrapping_add(1).max(1);
+        }
+    }
+
+    /// Mean motion of established tracks → the SRV storm-motion fields.
+    fn storm_motion_from_tracks(&self) -> Option<(f32, f32)> {
+        let motions: Vec<(f32, f32)> = self
+            .storm_tracks
+            .iter()
+            .filter(|t| t.history.len() >= 3)
+            .filter_map(|t| t.motion_mps)
+            .collect();
+        if motions.is_empty() {
+            return None;
+        }
+        let n = motions.len() as f32;
+        let u = motions.iter().map(|(u, _)| u).sum::<f32>() / n;
+        let v = motions.iter().map(|(_, v)| v).sum::<f32>() / n;
+        let speed_mps = u.hypot(v);
+        if speed_mps < 1.0 {
+            return None;
+        }
+        // StormMotion.direction_deg = direction the storm moves TOWARD
+        // (motion_component_away peaks looking down-motion).
+        let direction = (u.atan2(v)).to_degrees().rem_euclid(360.0);
+        Some((direction, speed_mps / KNOT_TO_MPS))
+    }
+
+    /// Draw track histories, current positions, and SCIT-style extrapolated
+    /// positions at +15/+30/+45 min along the fitted motion.
+    fn draw_storm_tracks(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if !self.show_storm_tracks || self.storm_tracks.is_empty() {
+            return;
+        }
+        let Some((radar_lat, radar_lon)) = self.radar_location() else {
+            return;
+        };
+        let cos_lat = radar_lat.to_radians().cos().max(0.05);
+        let to_screen = |east_km: f64, north_km: f64| -> egui::Pos2 {
+            let lon = radar_lon + (east_km as f32) / (111.32 * cos_lat);
+            let lat = radar_lat + (north_km as f32) / 111.32;
+            self.lon_lat_to_screen(rect, lon, lat)
+        };
+        let line_color = egui::Color32::from_rgb(235, 240, 245);
+        for track in &self.storm_tracks {
+            if track.history.is_empty() {
+                continue;
+            }
+            let points: Vec<egui::Pos2> = track
+                .history
+                .iter()
+                .map(|&(_, e, n)| to_screen(e, n))
+                .collect();
+            let current = *points.last().expect("non-empty");
+            if !rect.expand(40.0).contains(current) {
+                continue;
+            }
+            if points.len() >= 2 {
+                painter.add(egui::Shape::line(
+                    points.clone(),
+                    egui::Stroke::new(1.6, line_color),
+                ));
+            }
+            painter.circle_filled(current, 3.5, line_color);
+            painter.circle_stroke(current, 3.5, egui::Stroke::new(1.0, egui::Color32::BLACK));
+            if let Some((u, v)) = track.motion_mps {
+                let &(_, east, north) = track.history.last().expect("non-empty");
+                let mut previous = current;
+                for minutes in [15.0f64, 30.0, 45.0] {
+                    let t = minutes * 60.0;
+                    let position =
+                        to_screen(east + u as f64 * t / 1000.0, north + v as f64 * t / 1000.0);
+                    painter.line_segment(
+                        [previous, position],
+                        egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgba_unmultiplied(235, 240, 245, 110),
+                        ),
+                    );
+                    painter.circle_stroke(position, 2.5, egui::Stroke::new(1.2, line_color));
+                    previous = position;
+                }
+            }
+            if self.map_scale >= 90.0 {
+                let label = match track.motion_mps {
+                    Some((u, v)) => {
+                        let dir = (u.atan2(v)).to_degrees().rem_euclid(360.0);
+                        let kt = u.hypot(v) / KNOT_TO_MPS;
+                        format!(
+                            "#{} {:.0}dBZ {:03.0}°/{:.0}kt",
+                            track.id, track.max_dbz, dir, kt
+                        )
+                    }
+                    None => format!("#{} {:.0}dBZ", track.id, track.max_dbz),
+                };
+                draw_halo_text(
+                    painter,
+                    current + egui::vec2(8.0, -8.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    &label,
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::from_rgb(235, 240, 245),
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+                );
+            }
+        }
     }
 
     /// Kick background rotation detection when the displayed volume changes
@@ -14075,6 +14400,12 @@ mod tests {
             placefile_slots: Vec::new(),
             placefile_url_input: String::new(),
             placefile_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
+            storm_tracks: Vec::new(),
+            storm_tracks_site: String::new(),
+            next_storm_track_id: 1,
+            storm_cells_volume_ptr: 0,
+            storm_cells_receiver: None,
+            show_storm_tracks: true,
             rotation_markers: Vec::new(),
             rotation_markers_volume_ptr: 0,
             rotation_receiver: None,
