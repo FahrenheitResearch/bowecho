@@ -135,7 +135,67 @@ jobs:
           </dict>
           </plist>
           PLIST
+
+      - name: Sign and notarize macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          ASC_API_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          SIGN_IDENTITY: "Developer ID Application: Andrew Snyder (X65S282G57)"
+        run: |
+          set -euo pipefail
+          app="BowEcho.app"
+          mkdir -p dist
+
+          # Without signing secrets (e.g. PRs from forks) ship an unsigned zip rather than fail.
+          if [ -z "${MACOS_CERTIFICATE_BASE64:-}" ]; then
+            echo "::warning::No signing secrets configured — shipping UNSIGNED ${{ matrix.artifact_name }}; Gatekeeper will block downloads."
+            ditto -c -k --sequesterRsrc --keepParent "$app" "dist/${{ matrix.artifact_name }}.zip"
+            exit 0
+          fi
+
+          # --- Import the Developer ID cert into an ephemeral keychain ---
+          KEYCHAIN="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PWD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          echo "$MACOS_CERTIFICATE_BASE64" | base64 -d > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERTIFICATE_PWD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security list-keychain -d user -s "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN" >/dev/null
+
+          # --- Sign: hardened runtime + secure timestamp ---
+          codesign --force --timestamp --options runtime \
+            --identifier research.fahrenheit.bowecho \
+            --keychain "$KEYCHAIN" \
+            --sign "$SIGN_IDENTITY" \
+            "$app"
+          codesign --verify --strict --verbose=2 "$app"
+
+          # --- Notarize with App Store Connect API key, then staple ---
+          echo "$ASC_API_KEY_BASE64" | base64 -d > "$RUNNER_TEMP/asc_key.p8"
+          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/asc_key.p8" \
+            --key-id "$ASC_KEY_ID" \
+            --issuer "$ASC_ISSUER_ID" \
+            --wait
+          xcrun stapler staple "$app"
+          xcrun stapler validate "$app"
+          spctl -a -vvv --type exec "$app" || true
+
+          # --- Package the signed, stapled app ---
           ditto -c -k --sequesterRsrc --keepParent "$app" "dist/${{ matrix.artifact_name }}.zip"
+
+          # --- Scrub secrets from disk and keychain ---
+          security delete-keychain "$KEYCHAIN" || true
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/asc_key.p8" "$RUNNER_TEMP/notarize.zip"
 
       - name: Package Linux binary
         if: runner.os == 'Linux'
