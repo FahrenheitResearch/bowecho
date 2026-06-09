@@ -188,7 +188,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app_ui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "color_tables",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "calloop"
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "color_tables"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "combine"
@@ -807,7 +807,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "data_source"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "quick-xml",
@@ -2123,7 +2123,7 @@ dependencies = [
 
 [[package]]
 name = "nexrad_io"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "byteorder",
  "bzip2",
@@ -2777,7 +2777,7 @@ dependencies = [
 
 [[package]]
 name = "product_engine"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "radar_core",
 ]
@@ -2888,7 +2888,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radar_core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "serde",
@@ -3006,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "render2d"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "color_tables",
@@ -3294,7 +3294,7 @@ dependencies = [
 
 [[package]]
 name = "settings"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -3599,7 +3599,7 @@ dependencies = [
 
 [[package]]
 name = "timeline"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
 ]

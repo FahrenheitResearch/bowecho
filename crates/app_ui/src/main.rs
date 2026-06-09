@@ -385,6 +385,12 @@ struct ViewerApp {
     /// Height-axis ceiling of the current section (m); auto-scaled to the
     /// beam coverage along the drawn path so storms fill the panel.
     cross_section_top_m: f32,
+    /// Signature of the user-controlled section inputs (endpoints, product,
+    /// palette) and tilt count of the last volume sectioned — used to HOLD
+    /// the section while a live volume streams in tilt-by-tilt instead of
+    /// resetting it to a single-beam ribbon on every chunk.
+    cross_section_user_signature: Option<u64>,
+    cross_section_volume_cuts: usize,
     hazard_overlay: Option<HazardOverlay>,
     hazard_path_text: String,
     hazard_status: String,
@@ -1986,6 +1992,8 @@ impl ViewerApp {
             cross_section_signature: None,
             cross_section_status: "Cross-section: arm, then click endpoint A then B".to_owned(),
             cross_section_top_m: CROSS_SECTION_TOP_M,
+            cross_section_user_signature: None,
+            cross_section_volume_cuts: 0,
             hazard_overlay: None,
             hazard_path_text,
             hazard_status: "No hazard polygons loaded".to_owned(),
@@ -6146,6 +6154,8 @@ impl ViewerApp {
             }
         }
 
+        self.cross_section_handle_interactions(ui, rect, 0);
+
         self.draw_site_markers(painter, &site_points);
         self.draw_radar_layer_markers(painter, rect);
         self.draw_loaded_volume_marker(painter, rect);
@@ -6317,6 +6327,7 @@ impl ViewerApp {
                 }
             }
 
+            self.cross_section_handle_interactions(ui, cell, cell_index + 1);
             hovers.push(response.hover_pos());
         }
 
@@ -6780,6 +6791,48 @@ impl ViewerApp {
         }
     }
 
+    /// Draggable A/B endpoint handles for the section line: registered after
+    /// the canvas response so they win the hit test; dragging one sweeps the
+    /// section live (the signature recompute follows the endpoint).
+    fn cross_section_handle_interactions(
+        &mut self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        id_salt: usize,
+    ) {
+        for (which, endpoint) in [
+            (0usize, self.cross_section_a_lonlat),
+            (1usize, self.cross_section_b_lonlat),
+        ] {
+            let Some((lon, lat)) = endpoint else {
+                continue;
+            };
+            let position = self.lon_lat_to_screen(rect, lon, lat);
+            if !rect.expand(12.0).contains(position) {
+                continue;
+            }
+            let handle = egui::Rect::from_center_size(position, egui::vec2(20.0, 20.0));
+            let response = ui
+                .interact(
+                    handle,
+                    ui.id().with(("xs-handle", id_salt, which)),
+                    egui::Sense::drag(),
+                )
+                .on_hover_cursor(egui::CursorIcon::Grab)
+                .on_hover_text("Drag to sweep the cross-section");
+            if response.dragged()
+                && let Some(pointer) = response.interact_pointer_pos()
+            {
+                let next = self.screen_to_lon_lat(rect, pointer);
+                if which == 0 {
+                    self.cross_section_a_lonlat = Some(next);
+                } else {
+                    self.cross_section_b_lonlat = Some(next);
+                }
+            }
+        }
+    }
+
     /// Recompute the cross-section texture if its inputs changed (signature
     /// guard avoids per-frame work).
     fn update_cross_section_texture(&mut self, ctx: &egui::Context) {
@@ -6855,6 +6908,35 @@ impl ViewerApp {
         if self.cross_section_signature == Some(sig) && self.cross_section_texture.is_some() {
             return;
         }
+        // User-input-only signature (no volume identity): if the only thing
+        // that changed is the volume AND it is a live partial still streaming
+        // in with fewer tilts than the last full section, HOLD the current
+        // section — recomputing per chunk collapses it to a one-beam ribbon.
+        let mut user_hasher = std::collections::hash_map::DefaultHasher::new();
+        a.0.to_bits().hash(&mut user_hasher);
+        a.1.to_bits().hash(&mut user_hasher);
+        b.0.to_bits().hash(&mut user_hasher);
+        b.1.to_bits().hash(&mut user_hasher);
+        velocity.hash(&mut user_hasher);
+        self.color_tables
+            .signature_for_family(family)
+            .hash(&mut user_hasher);
+        let user_sig = user_hasher.finish();
+        let live_partial = self
+            .selected_frame()
+            .is_some_and(|frame| frame.status == FrameStatus::LivePartial);
+        if live_partial
+            && self.cross_section_texture.is_some()
+            && self.cross_section_user_signature == Some(user_sig)
+            && volume.cuts.len() < self.cross_section_volume_cuts
+        {
+            self.cross_section_status = format!(
+                "holding last full section — live volume building ({}/{} tilts)",
+                volume.cuts.len(),
+                self.cross_section_volume_cuts
+            );
+            return;
+        }
 
         let section = if velocity {
             velocity_cross_section(&volume, start, end, w, h, top_m)
@@ -6887,6 +6969,8 @@ impl ViewerApp {
             }
         }
         self.cross_section_signature = Some(sig);
+        self.cross_section_user_signature = Some(user_sig);
+        self.cross_section_volume_cuts = volume.cuts.len();
         self.cross_section_top_m = top_m;
         self.cross_section_status = format!(
             "{} · {:.0} km long · top {:.0} km",
@@ -13378,6 +13462,8 @@ mod tests {
             cross_section_signature: None,
             cross_section_status: "Cross-section: arm, then click endpoint A then B".to_owned(),
             cross_section_top_m: CROSS_SECTION_TOP_M,
+            cross_section_user_signature: None,
+            cross_section_volume_cuts: 0,
             hazard_overlay: Some(test_hazard_overlay(records)),
             hazard_path_text: String::new(),
             hazard_status: String::new(),

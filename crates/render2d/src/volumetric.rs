@@ -477,22 +477,34 @@ fn cross_section_from_columns(
         return None;
     }
     let length_m = ((end_km.0 - start_km.0).hypot(end_km.1 - start_km.1) * 1000.0).max(0.0);
-    let mut values = vec![f32::NAN; width * height];
-    for x in 0..width {
-        let f = x as f32 / (width - 1) as f32;
-        let east = start_km.0 + (end_km.0 - start_km.0) * f;
-        let north = start_km.1 + (end_km.1 - start_km.1) * f;
-        let s = east.hypot(north) as f64 * 1000.0;
-        let az = east.atan2(north).to_degrees().rem_euclid(360.0);
-        let prof = column_profile(cols, az, s);
-        if prof.is_empty() {
-            continue;
-        }
-        for y in 0..height {
-            let z = top_m * (1.0 - y as f32 / (height - 1) as f32);
-            if let Some(v) = interp_profile(&prof, z as f64) {
-                values[y * width + x] = v;
+    // Columns are independent — compute them in parallel (keeps endpoint
+    // drags fluid), then transpose into the row-major grid.
+    let columns: Vec<Vec<f32>> = (0..width)
+        .into_par_iter()
+        .map(|x| {
+            let f = x as f32 / (width - 1) as f32;
+            let east = start_km.0 + (end_km.0 - start_km.0) * f;
+            let north = start_km.1 + (end_km.1 - start_km.1) * f;
+            let s = east.hypot(north) as f64 * 1000.0;
+            let az = east.atan2(north).to_degrees().rem_euclid(360.0);
+            let prof = column_profile(cols, az, s);
+            let mut column = vec![f32::NAN; height];
+            if prof.is_empty() {
+                return column;
             }
+            for (y, cell) in column.iter_mut().enumerate() {
+                let z = top_m * (1.0 - y as f32 / (height - 1) as f32);
+                if let Some(v) = interp_profile(&prof, z as f64) {
+                    *cell = v;
+                }
+            }
+            column
+        })
+        .collect();
+    let mut values = vec![f32::NAN; width * height];
+    for (x, column) in columns.iter().enumerate() {
+        for (y, v) in column.iter().enumerate() {
+            values[y * width + x] = *v;
         }
     }
     // Path-sampling cleanup. Each column samples ONE nearest radial/gate, so
