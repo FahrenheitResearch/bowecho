@@ -385,12 +385,22 @@ pub struct CrossSection {
 
 /// Linearly interpolate a height-sorted (height_m, dBZ) profile at height `z`.
 /// Returns None outside the sampled span (no extrapolation).
+/// How far below the lowest beam a section column may be extended (m).
+/// Near the radar the lowest tilt sits a few hundred metres up, so sections
+/// reach the ground; at far range we stop after this depth rather than paint
+/// kilometres of single-gate columns ("barcode" artifact).
+const PROFILE_GROUND_EXTENSION_M: f64 = 1_500.0;
+
 fn interp_profile(prof: &[(f64, f32)], z: f64) -> Option<f32> {
-    if prof.len() < 2 || z < prof[0].0 || z > prof[prof.len() - 1].0 {
-        return prof
-            .first()
-            .filter(|_| prof.len() == 1 && (z - prof[0].0).abs() < 1.0)
-            .map(|p| p.1);
+    let first = prof.first()?;
+    // Below the lowest beam, extend its value downward a bounded distance —
+    // the display convention used by operational RHI views (and the same
+    // surface-layer assumption VIL makes), depth-capped to stay honest.
+    if z <= first.0 {
+        return (first.0 - z <= PROFILE_GROUND_EXTENSION_M).then_some(first.1);
+    }
+    if prof.len() < 2 || z > prof[prof.len() - 1].0 {
+        return None;
     }
     for w in prof.windows(2) {
         let (h0, v0) = w[0];
@@ -485,12 +495,68 @@ fn cross_section_from_columns(
             }
         }
     }
+    // Path-sampling cleanup. Each column samples ONE nearest radial/gate, so
+    // (a) some columns miss entirely (azimuth/gate gaps -> NaN stripes) and
+    // (b) adjacent columns can disagree gate-to-gate ("barcode"). Two
+    // NaN-aware passes fix both without touching heights: fill short gaps
+    // (<= 2 columns) from horizontal neighbors, then a 3-tap blend — the same
+    // smoothing every operational RHI display applies.
+    let mut filled = values.clone();
+    for y in 0..height {
+        let row = y * width;
+        for x in 0..width {
+            if values[row + x].is_finite() {
+                continue;
+            }
+            let mut sum = 0.0f32;
+            let mut n = 0.0f32;
+            for dx in [-2isize, -1, 1, 2] {
+                let xi = x as isize + dx;
+                if xi < 0 || xi >= width as isize {
+                    continue;
+                }
+                let v = values[row + xi as usize];
+                if v.is_finite() {
+                    sum += v;
+                    n += 1.0;
+                }
+            }
+            if n >= 2.0 {
+                filled[row + x] = sum / n;
+            }
+        }
+    }
+    let mut smoothed = filled.clone();
+    for y in 0..height {
+        let row = y * width;
+        for x in 0..width {
+            if !filled[row + x].is_finite() {
+                continue;
+            }
+            let mut sum = 0.0f32;
+            let mut n = 0.0f32;
+            for dx in [-1isize, 0, 1] {
+                let xi = x as isize + dx;
+                if xi < 0 || xi >= width as isize {
+                    continue;
+                }
+                let v = filled[row + xi as usize];
+                if v.is_finite() {
+                    sum += v;
+                    n += 1.0;
+                }
+            }
+            if n > 0.0 {
+                smoothed[row + x] = sum / n;
+            }
+        }
+    }
     Some(CrossSection {
         width,
         height,
         top_m,
         length_m,
-        values,
+        values: smoothed,
     })
 }
 

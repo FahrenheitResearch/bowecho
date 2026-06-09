@@ -382,6 +382,9 @@ struct ViewerApp {
     cross_section_texture: Option<egui::TextureHandle>,
     cross_section_signature: Option<u64>,
     cross_section_status: String,
+    /// Height-axis ceiling of the current section (m); auto-scaled to the
+    /// beam coverage along the drawn path so storms fill the panel.
+    cross_section_top_m: f32,
     hazard_overlay: Option<HazardOverlay>,
     hazard_path_text: String,
     hazard_status: String,
@@ -1982,6 +1985,7 @@ impl ViewerApp {
             cross_section_texture: None,
             cross_section_signature: None,
             cross_section_status: "Cross-section: arm, then click endpoint A then B".to_owned(),
+            cross_section_top_m: CROSS_SECTION_TOP_M,
             hazard_overlay: None,
             hazard_path_text,
             hazard_status: "No hazard polygons loaded".to_owned(),
@@ -2945,6 +2949,11 @@ impl ViewerApp {
             return;
         }
 
+        if self.handle_product_hotkeys(ctx) {
+            ctx.request_repaint();
+            return;
+        }
+
         let product_delta = ctx.input_mut(|input| {
             if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
                 1
@@ -2983,6 +2992,62 @@ impl ViewerApp {
                 ctx.request_repaint();
             }
         }
+    }
+
+    /// Number-row product hotkeys (customizable in config.json). Routes to
+    /// the focused pane, like the arrow keys.
+    fn handle_product_hotkeys(&mut self, ctx: &egui::Context) -> bool {
+        const KEYS: [(egui::Key, &str); 10] = [
+            (egui::Key::Num1, "1"),
+            (egui::Key::Num2, "2"),
+            (egui::Key::Num3, "3"),
+            (egui::Key::Num4, "4"),
+            (egui::Key::Num5, "5"),
+            (egui::Key::Num6, "6"),
+            (egui::Key::Num7, "7"),
+            (egui::Key::Num8, "8"),
+            (egui::Key::Num9, "9"),
+            (egui::Key::Num0, "0"),
+        ];
+        let Some(volume) = self.volume.clone() else {
+            return false;
+        };
+        for (key, name) in KEYS {
+            if !ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key)) {
+                continue;
+            }
+            let Some(label) = self.app_settings.product_hotkeys.get(name).cloned() else {
+                return false;
+            };
+            let Some(product) = global_displayable_products(&volume)
+                .into_iter()
+                .find(|product| product.label().eq_ignore_ascii_case(&label))
+            else {
+                return false;
+            };
+            match self.focused_extra_pane() {
+                Some(slot) => {
+                    if self.extra_panes[slot].product != product {
+                        self.extra_panes[slot].product = product;
+                        self.extra_panes[slot].render_ms = None;
+                    }
+                }
+                None => {
+                    if self.selected_product != product {
+                        if let Some(cut) =
+                            best_cut_for_product(volume.as_ref(), self.selected_cut, &product)
+                        {
+                            self.selected_cut = cut;
+                        }
+                        self.selected_product = product;
+                        self.sanitize_selection();
+                        self.clear_texture();
+                    }
+                }
+            }
+            return true;
+        }
+        false
     }
 
     /// The extra-pane slot the sidebar/keyboard edits, when an extra pane is
@@ -4947,6 +5012,31 @@ impl ViewerApp {
         }
 
         ui.separator();
+        egui::CollapsingHeader::new("Hotkeys")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.weak("←/→ product · ↑/↓ tilt (focused pane)");
+                let mut bindings: Vec<(&String, &String)> =
+                    self.app_settings.product_hotkeys.iter().collect();
+                bindings.sort_by(|a, b| {
+                    let order = |k: &str| {
+                        if k == "0" {
+                            10
+                        } else {
+                            k.parse::<u8>().unwrap_or(99)
+                        }
+                    };
+                    order(a.0).cmp(&order(b.0))
+                });
+                for (key, label) in bindings {
+                    ui.monospace(format!("{key}  →  {label}"));
+                }
+                if let Some(path) = settings::AppSettings::config_path() {
+                    ui.weak(format!("customize in {}", path.display()));
+                }
+            });
+
+        ui.separator();
         ui.checkbox(&mut self.show_inspector_card, "Inspector card")
             .on_hover_text(
                 "Floating data card at the cursor (value, range/azimuth, beam height, Vrot; velocity products add a radial in/outbound arrow). Shift+click the map to pin it to a spot — it tracks pan/zoom and live updates; Shift+click it again to release.",
@@ -5853,27 +5943,36 @@ impl ViewerApp {
 
     fn status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(&self.status);
+            // The loader status ("Rendering", "Refreshing", download progress)
+            // changes width constantly — give it a FIXED slot so it never
+            // shoves the rest of the bar around.
+            let height = ui.available_height();
+            ui.add_sized([230.0, height], egui::Label::new(&self.status).truncate());
             ui.separator();
-            if let Some(readout) = &self.cursor_readout {
-                ui.label(format_cursor_readout(readout));
-            } else {
-                ui.label(format!(
-                    "{} cut {}",
-                    self.selected_product.label(),
-                    self.selected_cut
-                ));
-            }
-            ui.separator();
-            ui.label(format!("map {:.0} px/deg", self.map_scale));
-            ui.separator();
-            ui.label(format!("{:.0} km range", self.radar_range_km));
-            if !self.radar_layers.is_empty() {
+            // Stable metrics anchor to the right edge; the variable-width
+            // hover readout absorbs the leftover middle and truncates.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(self.selected_frame_status_text());
                 ui.separator();
-                ui.label(format!("{} overlays", self.radar_layers.len()));
-            }
-            ui.separator();
-            ui.label(self.selected_frame_status_text());
+                if !self.radar_layers.is_empty() {
+                    ui.label(format!("{} overlays", self.radar_layers.len()));
+                    ui.separator();
+                }
+                ui.label(format!("{:.0} km range", self.radar_range_km));
+                ui.separator();
+                ui.label(format!("map {:.0} px/deg", self.map_scale));
+                ui.separator();
+                let readout = if let Some(readout) = &self.cursor_readout {
+                    format_cursor_readout(readout)
+                } else {
+                    format!(
+                        "{} cut {}",
+                        self.selected_product.label(),
+                        self.selected_cut
+                    )
+                };
+                ui.add(egui::Label::new(readout).truncate());
+            });
         });
     }
 
@@ -6720,9 +6819,27 @@ impl ViewerApp {
         } else {
             ColorTableFamily::Reflectivity
         };
-        let (w, h, top_m) = (640usize, 256usize, CROSS_SECTION_TOP_M);
+        let to_en = |(lon, lat): (f32, f32)| {
+            let north = (lat - radar_lat) * 111.32;
+            let east = (lon - radar_lon) * 111.32 * radar_lat.to_radians().cos();
+            (east, north)
+        };
+        let (start, end) = (to_en(a), to_en(b));
+        // Auto-scale the ceiling to the beam coverage at the section's far
+        // end (highest tilt's beam height there, plus headroom) so a nearby
+        // storm fills the panel instead of hugging the bottom of an 18 km box.
+        let max_range_m = (start.0.hypot(start.1).max(end.0.hypot(end.1)) as f64) * 1000.0;
+        let max_elevation = volume
+            .cuts
+            .iter()
+            .map(|cut| cut.elevation_deg)
+            .fold(0.5f32, f32::max);
+        let coverage_top =
+            radar_core::beam_height_above_radar_m(max_range_m, max_elevation as f64) as f32;
+        let top_m = (coverage_top * 1.08).clamp(4_000.0, CROSS_SECTION_TOP_M);
+        let (w, h) = (640usize, 256usize);
 
-        // recompute guard
+        // recompute guard (top_m derives from endpoints+volume, both hashed)
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         use std::hash::{Hash, Hasher};
         a.0.to_bits().hash(&mut hasher);
@@ -6739,12 +6856,6 @@ impl ViewerApp {
             return;
         }
 
-        let to_en = |(lon, lat): (f32, f32)| {
-            let north = (lat - radar_lat) * 111.32;
-            let east = (lon - radar_lon) * 111.32 * radar_lat.to_radians().cos();
-            (east, north)
-        };
-        let (start, end) = (to_en(a), to_en(b));
         let section = if velocity {
             velocity_cross_section(&volume, start, end, w, h, top_m)
         } else {
@@ -6776,6 +6887,7 @@ impl ViewerApp {
             }
         }
         self.cross_section_signature = Some(sig);
+        self.cross_section_top_m = top_m;
         self.cross_section_status = format!(
             "{} · {:.0} km long · top {:.0} km",
             if velocity { "Velocity" } else { "Reflectivity" },
@@ -6823,7 +6935,7 @@ impl ViewerApp {
         );
         let label = egui::Color32::from_rgb(190, 196, 204);
         let font = egui::FontId::proportional(10.0);
-        let top_km = CROSS_SECTION_TOP_M / 1000.0;
+        let top_km = self.cross_section_top_m / 1000.0;
         for k in 0..=3 {
             let frac = k as f32 / 3.0;
             let y = plot.top() + plot.height() * frac;
@@ -13265,6 +13377,7 @@ mod tests {
             cross_section_texture: None,
             cross_section_signature: None,
             cross_section_status: "Cross-section: arm, then click endpoint A then B".to_owned(),
+            cross_section_top_m: CROSS_SECTION_TOP_M,
             hazard_overlay: Some(test_hazard_overlay(records)),
             hazard_path_text: String::new(),
             hazard_status: String::new(),

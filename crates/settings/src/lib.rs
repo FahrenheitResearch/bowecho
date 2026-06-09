@@ -22,6 +22,29 @@ pub struct AppSettings {
     pub palette_by_family: BTreeMap<String, String>,
     /// Multi-pane grid layout pane count from the last session (1, 2 or 4).
     pub grid_pane_count: usize,
+    /// Product hotkeys: number-row key ("0"-"9") -> product label (e.g.
+    /// "REF", "VEL", "SRV", "RHO", "ZDR", "SW", "CREF", "ET", "VIL", "VILD",
+    /// "PHI", "KDP", "AzShr", "Div"). Edit in config.json to customize.
+    pub product_hotkeys: BTreeMap<String, String>,
+}
+
+/// Default number-row bindings (the classic analyst loadout).
+pub fn default_product_hotkeys() -> BTreeMap<String, String> {
+    [
+        ("1", "REF"),
+        ("2", "VEL"),
+        ("3", "SRV"),
+        ("4", "RHO"),
+        ("5", "ZDR"),
+        ("6", "SW"),
+        ("7", "CREF"),
+        ("8", "ET"),
+        ("9", "VIL"),
+        ("0", "VILD"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect()
 }
 
 impl Default for AppSettings {
@@ -33,6 +56,7 @@ impl Default for AppSettings {
             saved_layout_slots: 8,
             palette_by_family: BTreeMap::new(),
             grid_pane_count: 1,
+            product_hotkeys: default_product_hotkeys(),
         }
     }
 }
