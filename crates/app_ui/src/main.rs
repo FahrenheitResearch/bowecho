@@ -15,9 +15,9 @@ use render2d::{
     ViewportRasterOptions, ViewportSampleCache, VolumeDealiasCache, azimuthal_shear_grid,
     color_family_for_moment, composite_reflectivity_grid, dealias_velocity_grid,
     detect_rotation_sites, echo_top_grid, identify_storm_cells, mehs_grid, radial_divergence_grid,
-    reflectivity_cross_section, storm_relative_velocity_mps, velocity_cross_section_cached,
-    viewport_rgba_buffer_len, viewport_sample_cache_storage_upper_bound, vil_density_grid,
-    vil_grid,
+    reflectivity_cross_section, smooth_moment_grid, storm_relative_velocity_mps,
+    velocity_cross_section_cached, viewport_rgba_buffer_len,
+    viewport_sample_cache_storage_upper_bound, vil_density_grid, vil_grid,
 };
 use serde::Deserialize;
 
@@ -376,6 +376,9 @@ struct ViewerApp {
     rotation_markers_volume_ptr: usize,
     rotation_receiver: Option<mpsc::Receiver<(usize, Vec<RotationMarker>)>>,
     show_rotation_markers: bool,
+    /// GR2-style display smoothing (polar-grid binomial kernel, worker-side,
+    /// cached). Off by default — native super-res is the app's identity.
+    display_smoothing: bool,
     /// Hail environment for the Witt et al. 1998 MEHS product: melting-level
     /// and -20C heights above the radar, in km (set from a sounding).
     hail_freezing_level_km: f32,
@@ -1203,6 +1206,9 @@ struct RenderRequest {
     color_tables: ColorTableSet,
     storm_motion: StormMotion,
     hail_levels_m: (f32, f32),
+    /// Display smoothing: the worker smooths the polar grid once (cached) and
+    /// renders it through the unchanged fast path.
+    smoothed: bool,
     viewport_options: ViewportRasterOptions,
     radar_range_km: f32,
 }
@@ -1403,6 +1409,7 @@ struct RenderWorkerMomentCache {
     moment: MomentType,
     dealiased_velocity: bool,
     derived: Option<DerivedProduct>,
+    smoothed: bool,
     color_table_signature: u64,
     cache: ViewportMomentCache,
     storm_palette_cache: Option<RenderWorkerStormPaletteCache>,
@@ -1580,6 +1587,7 @@ struct RenderWorkerViewportSignature {
     color_table_signature: u64,
     storm_motion_key: (i16, i16),
     hail_levels_key: (i16, i16),
+    smoothed: bool,
     viewport: ViewportKey,
 }
 
@@ -1594,6 +1602,7 @@ impl RenderWorkerViewportSignature {
         color_table_signature: u64,
         storm_motion_key: (i16, i16),
         hail_levels_key: (i16, i16),
+        smoothed: bool,
         viewport: ViewportKey,
     ) -> Self {
         Self {
@@ -1605,6 +1614,7 @@ impl RenderWorkerViewportSignature {
             color_table_signature,
             storm_motion_key,
             hail_levels_key,
+            smoothed,
             viewport,
         }
     }
@@ -1700,6 +1710,7 @@ fn spawn_render_worker_with_mode(
                 request.key.color_table_signature,
                 request.key.storm_motion_key,
                 request.key.hail_levels_key,
+                request.key.smoothed,
                 request.key.viewport,
             );
             while let Ok(recycled) = recycle_receiver.try_recv() {
@@ -2104,6 +2115,7 @@ impl ViewerApp {
             rotation_markers_volume_ptr: 0,
             rotation_receiver: None,
             show_rotation_markers: true,
+            display_smoothing: false,
             hail_freezing_level_km: 3.2,
             hail_minus20_level_km: 6.4,
             display_thresholds: BTreeMap::new(),
@@ -3484,6 +3496,7 @@ impl ViewerApp {
             color_tables.signature_for_family(self.selected_product.color_family());
         let render_dealiased_velocity =
             self.product_render_uses_dealiased_velocity(&self.selected_product);
+        let smoothed = self.smoothing_for_product(&self.selected_product);
         let key = TextureKey {
             volume_ptr: Arc::as_ptr(&volume) as usize,
             cut: self.selected_cut,
@@ -3492,6 +3505,7 @@ impl ViewerApp {
             color_table_signature,
             storm_motion_key: self.storm_motion_key(),
             hail_levels_key: self.hail_levels_key(),
+            smoothed,
             viewport: viewport_key,
         };
         if self.texture_key.as_ref() == Some(&key) {
@@ -3514,6 +3528,7 @@ impl ViewerApp {
                 color_tables,
                 storm_motion: self.current_storm_motion(),
                 hail_levels_m: self.hail_levels_m(),
+                smoothed,
                 viewport_options,
                 radar_range_km: self
                     .selected_grid_range_km()
@@ -3540,6 +3555,12 @@ impl ViewerApp {
             (self.hail_freezing_level_km * 10.0).round() as i16,
             (self.hail_minus20_level_km * 10.0).round() as i16,
         )
+    }
+
+    /// Smoothing applies to everything except storm-relative products (their
+    /// per-row palette path bypasses the grid-smoothing seam).
+    fn smoothing_for_product(&self, product: &DisplayProduct) -> bool {
+        self.display_smoothing && !product.is_storm_relative_velocity()
     }
 
     fn render_color_tables_for_product(&self, product: &DisplayProduct) -> ColorTableSet {
@@ -3592,6 +3613,7 @@ impl ViewerApp {
             let color_tables = self.render_color_tables_for_product(&product);
             let color_table_signature = color_tables.signature_for_family(product.color_family());
             let render_dealiased_velocity = self.product_render_uses_dealiased_velocity(&product);
+            let smoothed = self.smoothing_for_product(&product);
             let key = TextureKey {
                 volume_ptr: Arc::as_ptr(&volume) as usize,
                 cut,
@@ -3600,6 +3622,7 @@ impl ViewerApp {
                 color_table_signature,
                 storm_motion_key: self.storm_motion_key(),
                 hail_levels_key: self.hail_levels_key(),
+                smoothed,
                 viewport: viewport_key,
             };
             if layer.texture_key.as_ref() == Some(&key)
@@ -3622,6 +3645,7 @@ impl ViewerApp {
                     color_tables,
                     storm_motion: self.current_storm_motion(),
                     hail_levels_m: self.hail_levels_m(),
+                    smoothed,
                     viewport_options,
                     radar_range_km,
                 },
@@ -3728,6 +3752,7 @@ impl ViewerApp {
             &base_moment,
             dealiased_velocity,
             derived,
+            request.smoothed,
             color_table_signature,
         )
         .is_none()
@@ -3739,6 +3764,18 @@ impl ViewerApp {
                     request.cut,
                     &request.color_tables,
                     request.hail_levels_m,
+                    request.smoothed,
+                )
+            } else if request.smoothed {
+                // Smoothed display: smooth the polar grid ONCE (cached by
+                // this very moment cache) and render it through the existing
+                // fast path — pans stay full speed.
+                build_smoothed_plain_cache(
+                    request.volume.as_ref(),
+                    request.cut,
+                    &base_moment,
+                    dealiased_velocity,
+                    &request.color_tables,
                 )
             } else if dealiased_velocity {
                 ViewportMomentCache::new_dealiased_velocity_with_color_tables(
@@ -3765,6 +3802,7 @@ impl ViewerApp {
                     moment: base_moment.clone(),
                     dealiased_velocity,
                     derived,
+                    smoothed: request.smoothed,
                     color_table_signature,
                     cache,
                     storm_palette_cache: None,
@@ -3784,6 +3822,7 @@ impl ViewerApp {
             color_table_signature,
             request.key.storm_motion_key,
             request.key.hail_levels_key,
+            request.key.smoothed,
             request.key.viewport,
         );
         let sample_cache_signature = RenderWorkerSampleCacheSignature::new(
@@ -3991,6 +4030,7 @@ impl ViewerApp {
             request.key.color_table_signature,
             request.key.storm_motion_key,
             request.key.hail_levels_key,
+            request.key.smoothed,
             request.key.viewport,
         );
         let sample_cache_signature = RenderWorkerSampleCacheSignature::new(
@@ -4011,6 +4051,7 @@ impl ViewerApp {
             &viewport_signature.moment,
             request.render_dealiased_velocity,
             request.product.derived(),
+            request.key.smoothed,
             viewport_signature.color_table_signature,
         ) else {
             return;
@@ -4073,6 +4114,7 @@ impl ViewerApp {
             &MomentType::Velocity,
             velocity_render_dealiased,
             None,
+            false,
             velocity_color_table_signature,
         )
         .is_none()
@@ -4103,6 +4145,7 @@ impl ViewerApp {
                     moment: MomentType::Velocity,
                     dealiased_velocity: velocity_render_dealiased,
                     derived: None,
+                    smoothed: false,
                     color_table_signature: velocity_color_table_signature,
                     cache,
                     storm_palette_cache: None,
@@ -4131,6 +4174,7 @@ impl ViewerApp {
             &MomentType::Velocity,
             velocity_render_dealiased,
             None,
+            false,
             velocity_color_table_signature,
         ) else {
             return;
@@ -4158,6 +4202,7 @@ impl ViewerApp {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn touch_moment_cache(
         moment_caches: &mut Vec<RenderWorkerMomentCache>,
         volume_ptr: usize,
@@ -4165,6 +4210,7 @@ impl ViewerApp {
         moment: &MomentType,
         dealiased_velocity: bool,
         derived: Option<DerivedProduct>,
+        smoothed: bool,
         color_table_signature: u64,
     ) -> Option<usize> {
         let index = moment_caches.iter().position(|cached| {
@@ -4173,6 +4219,7 @@ impl ViewerApp {
                 && cached.moment == *moment
                 && cached.dealiased_velocity == dealiased_velocity
                 && cached.derived == derived
+                && cached.smoothed == smoothed
                 && cached.color_table_signature == color_table_signature
         })?;
         let cached = moment_caches.remove(index);
@@ -4191,6 +4238,7 @@ impl ViewerApp {
                 || cached.moment != cache.moment
                 || cached.dealiased_velocity != cache.dealiased_velocity
                 || cached.derived != cache.derived
+                || cached.smoothed != cache.smoothed
         });
         moment_caches.push(cache);
         while moment_caches.len() > cache_policy.moment_cache_capacity() {
@@ -4469,6 +4517,7 @@ impl ViewerApp {
         let color_tables = self.render_color_tables_for_product(&product);
         let color_table_signature = color_tables.signature_for_family(product.color_family());
         let render_dealiased_velocity = self.product_render_uses_dealiased_velocity(&product);
+        let smoothed = self.smoothing_for_product(&product);
         let key = TextureKey {
             volume_ptr: Arc::as_ptr(&volume) as usize,
             cut,
@@ -4477,6 +4526,7 @@ impl ViewerApp {
             color_table_signature,
             storm_motion_key: self.storm_motion_key(),
             hail_levels_key: self.hail_levels_key(),
+            smoothed,
             viewport: viewport_key,
         };
         {
@@ -4502,6 +4552,7 @@ impl ViewerApp {
             color_tables,
             storm_motion: self.current_storm_motion(),
             hail_levels_m: self.hail_levels_m(),
+            smoothed,
             viewport_options,
             radar_range_km,
         };
@@ -5305,6 +5356,17 @@ impl ViewerApp {
                     ui.weak(format!("customize in {}", path.display()));
                 }
             });
+
+        ui.separator();
+        if ui
+            .checkbox(&mut self.display_smoothing, "Smooth display")
+            .on_hover_text(
+                "GR2-style smoothing: a binomial kernel over the polar grid, computed once per product on the render worker and drawn through the regular fast path (pans stay fast). Native super-res detail is the default; note RF gates render transparent while smoothing.",
+            )
+            .changed()
+        {
+            ctx.request_repaint();
+        }
 
         ui.separator();
         ui.checkbox(&mut self.show_inspector_card, "Inspector card")
@@ -8972,6 +9034,7 @@ struct TextureKey {
     color_table_signature: u64,
     storm_motion_key: (i16, i16),
     hail_levels_key: (i16, i16),
+    smoothed: bool,
     viewport: ViewportKey,
 }
 
@@ -9580,12 +9643,45 @@ fn detect_rotation_markers_for_volume(
         .collect()
 }
 
+/// Smoothed plain/dealiased moment: smooth the grid, render via new_derived.
+fn build_smoothed_plain_cache(
+    volume: &RadarVolume,
+    cut_index: usize,
+    moment: &MomentType,
+    dealiased_velocity: bool,
+    color_tables: &ColorTableSet,
+) -> std::result::Result<ViewportMomentCache, String> {
+    let cut = volume
+        .cuts
+        .get(cut_index)
+        .ok_or_else(|| "cut missing".to_owned())?;
+    let grid = cut
+        .moments
+        .get(moment)
+        .ok_or_else(|| format!("moment {moment:?} missing"))?;
+    let source = if dealiased_velocity {
+        dealias_velocity_grid(cut, grid)
+    } else {
+        grid.clone()
+    };
+    let smoothed = smooth_moment_grid(&source);
+    ViewportMomentCache::new_derived(
+        volume,
+        cut_index,
+        smoothed,
+        color_family_for_moment(moment),
+        color_tables,
+    )
+    .map_err(|err| err.to_string())
+}
+
 fn build_derived_moment_cache(
     volume: &RadarVolume,
     derived: DerivedProduct,
     selected_cut: usize,
     color_tables: &ColorTableSet,
     hail_levels_m: (f32, f32),
+    smoothed: bool,
 ) -> std::result::Result<ViewportMomentCache, String> {
     let (geometry_cut, grid) = if derived.is_volume_wide() {
         // Volume products render on the lowest reflectivity tilt.
@@ -9629,7 +9725,11 @@ fn build_derived_moment_cache(
     ViewportMomentCache::new_derived(
         volume,
         geometry_cut,
-        grid,
+        if smoothed {
+            smooth_moment_grid(&grid)
+        } else {
+            grid
+        },
         derived.color_family(),
         color_tables,
     )
@@ -12676,6 +12776,7 @@ mod tests {
             123,
             (0, 0),
             (32, 64),
+            false,
             viewport,
         );
         let second_pixels = RenderWorkerViewportSignature::new(
@@ -12687,6 +12788,7 @@ mod tests {
             456,
             (0, 0),
             (32, 64),
+            false,
             viewport,
         );
         assert_ne!(first_pixels, second_pixels);
@@ -12886,6 +12988,7 @@ mod tests {
                 color_table_signature,
                 storm_motion_key: (450, 350),
                 hail_levels_key: (32, 64),
+                smoothed: false,
                 viewport: test_viewport_key(1320, 820),
             },
             pane: 0,
@@ -12896,6 +12999,7 @@ mod tests {
             plain_velocity_render_dealiased: true,
             color_tables,
             hail_levels_m: (3200.0, 6400.0),
+            smoothed: false,
             storm_motion: StormMotion {
                 direction_deg: 45.0,
                 speed_mps: 35.0 * KNOT_TO_MPS,
@@ -14410,6 +14514,7 @@ mod tests {
             rotation_markers_volume_ptr: 0,
             rotation_receiver: None,
             show_rotation_markers: true,
+            display_smoothing: false,
             hail_freezing_level_km: 3.2,
             hail_minus20_level_km: 6.4,
             display_thresholds: BTreeMap::new(),
@@ -14736,6 +14841,7 @@ mod tests {
             0,
             (0, 0),
             (32, 64),
+            false,
             test_viewport_key(width, 100),
         )
     }
@@ -14808,6 +14914,7 @@ mod tests {
                 0,
                 (0, 0),
                 (32, 64),
+                false,
                 test_viewport_key(width, height),
             ),
             render_ms,

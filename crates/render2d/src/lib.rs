@@ -11,6 +11,7 @@ pub use color_tables::{ColorSampler, ColorTable, ColorTableFamily, ColorTableSet
 mod cells;
 mod detect;
 mod shear;
+mod smooth;
 mod volumetric;
 pub use cells::{StormCell, identify_storm_cells};
 pub use detect::{
@@ -22,6 +23,7 @@ use radar_core::{
 };
 use rayon::prelude::*;
 pub use shear::{azimuthal_shear_grid, radial_divergence_grid};
+pub use smooth::smooth_moment_grid;
 use thiserror::Error;
 pub use volumetric::{
     CrossSection, ECHO_TOP_THRESHOLD_DBZ, VolumeDealiasCache, composite_reflectivity_grid,
