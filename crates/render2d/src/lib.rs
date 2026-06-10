@@ -80,6 +80,12 @@ pub struct ViewportRasterOptions {
     pub radar_y_px: f32,
     pub km_per_px_x: f32,
     pub km_per_px_y: f32,
+    /// Clockwise screen rotation of local north at the radar (radians) —
+    /// the AEQD meridian-convergence angle. Baked into the per-pixel
+    /// azimuth so the raster fills the whole rect with no draw-time
+    /// rotation cutoff; range is rotation-invariant so the row-pruning
+    /// optimizations are unaffected.
+    pub rotation_rad: f32,
 }
 
 pub fn viewport_rgba_buffer_len(options: ViewportRasterOptions) -> usize {
@@ -1557,6 +1563,8 @@ struct ViewportGeometry {
     km_per_px_x: f32,
     km_per_px_y: f32,
     max_range_km_sq: f32,
+    rot_sin: f32,
+    rot_cos: f32,
 }
 
 fn viewport_dimensions(options: ViewportRasterOptions) -> (u32, u32) {
@@ -1566,6 +1574,7 @@ fn viewport_dimensions(options: ViewportRasterOptions) -> (u32, u32) {
 fn viewport_geometry(grid: &MomentGrid, options: ViewportRasterOptions) -> ViewportGeometry {
     let (width, _) = viewport_dimensions(options);
     let max_range_km = max_range_m(grid).max(1.0) / 1000.0;
+    let (rot_sin, rot_cos) = options.rotation_rad.sin_cos();
     ViewportGeometry {
         width,
         radar_x_px: options.radar_x_px,
@@ -1573,6 +1582,8 @@ fn viewport_geometry(grid: &MomentGrid, options: ViewportRasterOptions) -> Viewp
         km_per_px_x: options.km_per_px_x.max(f32::EPSILON),
         km_per_px_y: options.km_per_px_y.max(f32::EPSILON),
         max_range_km_sq: max_range_km * max_range_km,
+        rot_sin,
+        rot_cos,
     }
 }
 
@@ -2858,12 +2869,54 @@ fn viewport_lookup(
         return None;
     }
 
-    let azimuth_deg = azimuth_from_xy(dx_km, dy_km);
+    // Rotate screen-frame ENU into the radar's true ENU (verified by the
+    // rotated-north unit test below): e = dx·cosγ − dy·sinγ,
+    // n = dx·sinγ + dy·cosγ. Range is rotation-invariant.
+    let east_km = dx_km * geometry.rot_cos - dy_km * geometry.rot_sin;
+    let north_km = dx_km * geometry.rot_sin + dy_km * geometry.rot_cos;
+    let azimuth_deg = azimuth_from_xy(east_km, north_km);
     let azimuth_bin = row_lookup.filled_bin_for_azimuth(azimuth_deg)?;
     Some(SampleLookup {
         azimuth_bin,
         gate: gate as usize,
     })
+}
+
+#[cfg(test)]
+mod rotation_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn rotated_north_pixel_resolves_to_azimuth_zero() {
+        // A gate due NORTH of the radar appears on screen rotated clockwise
+        // by the convergence angle. With the same angle baked into the
+        // lookup, that pixel must map back to azimuth 0.
+        let gamma: f32 = 0.1;
+        let geometry = ViewportGeometry {
+            width: 512,
+            radar_x_px: 256.0,
+            radar_y_px: 256.0,
+            km_per_px_x: 1.0,
+            km_per_px_y: 1.0,
+            max_range_km_sq: 1.0e9,
+            rot_sin: gamma.sin(),
+            rot_cos: gamma.cos(),
+        };
+        // Screen position of the north gate (visual clockwise rotation,
+        // y-down): x' = r·sin γ right, y' = r·cos γ up.
+        let r = 100.0f32;
+        let dx_km = r * gamma.sin();
+        let dy_km = r * gamma.cos();
+        let east = dx_km * geometry.rot_cos - dy_km * geometry.rot_sin;
+        let north = dx_km * geometry.rot_sin + dy_km * geometry.rot_cos;
+        assert!(east.abs() < 1e-3, "east {east}");
+        assert!((north - r).abs() < 1e-3, "north {north}");
+        let azimuth = azimuth_from_xy(east, north);
+        assert!(
+            azimuth.abs() < 0.01 || (azimuth - 360.0).abs() < 0.01,
+            "{azimuth}"
+        );
+    }
 }
 
 fn build_u8_palette(grid: &MomentGrid, color_table: &ColorTable) -> [[u8; 4]; 256] {
@@ -4255,6 +4308,7 @@ mod tests {
             radar_y_px: 540.0,
             km_per_px_x: 1.0,
             km_per_px_y: 1.0,
+            rotation_rad: 0.0,
         };
 
         assert_eq!(
@@ -4278,6 +4332,7 @@ mod tests {
             radar_y_px: 540.0,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
 
         let full_viewport = viewport_sample_cache_storage_upper_bound(options);
@@ -4333,6 +4388,7 @@ mod tests {
                 radar_y_px: 108.5,
                 km_per_px_x: 0.5,
                 km_per_px_y: 0.5,
+                rotation_rad: 0.0,
             },
         );
         let lookup_table = ViewportLookupTable::new(grid, geometry);
@@ -4532,6 +4588,7 @@ mod tests {
             radar_y_px: 108.5,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
 
         let reflectivity =
@@ -4621,6 +4678,7 @@ mod tests {
             radar_y_px: 108.5,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
         let cache = ViewportMomentCache::new(&volume, 0, MomentType::Reflectivity)
             .expect("viewport reflectivity cache");
@@ -4664,6 +4722,7 @@ mod tests {
             radar_y_px: 108.5,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
         let reflectivity_cache = ViewportMomentCache::new(&volume, 0, MomentType::Reflectivity)
             .expect("reflectivity cache");
@@ -4707,6 +4766,7 @@ mod tests {
             radar_y_px: 108.5,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
         let storm_motion = StormMotion {
             direction_deg: 45.0,
@@ -4776,6 +4836,7 @@ mod tests {
             radar_y_px: 32.0,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
         let reflectivity_cache = ViewportMomentCache::new(&volume, 0, MomentType::Reflectivity)
             .expect("reflectivity cache");
@@ -4809,6 +4870,7 @@ mod tests {
             radar_y_px: 108.5,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
 
         let mut pixels = vec![0; viewport_rgba_buffer_len(options) - 4];
@@ -4835,6 +4897,7 @@ mod tests {
             radar_y_px: 32.0,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
         let cache = ViewportMomentCache::new(&volume, 0, MomentType::Reflectivity)
             .expect("viewport reflectivity cache");
@@ -4857,6 +4920,7 @@ mod tests {
             radar_y_px: 48.0,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
         let cache = ViewportMomentCache::new(&volume, 0, MomentType::Reflectivity)
             .expect("viewport u16 reflectivity cache");

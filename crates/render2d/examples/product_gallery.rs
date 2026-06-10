@@ -75,6 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         radar_y_px: 450.0,
         km_per_px_x: 0.56,
         km_per_px_y: 0.56,
+        rotation_rad: 0.0,
     };
 
     let ref_cut = lowest_cut_with(&volume, &MomentType::Reflectivity);

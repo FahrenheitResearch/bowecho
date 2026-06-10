@@ -22,7 +22,9 @@ use render2d::{
 use serde::Deserialize;
 
 mod basemap_data;
+mod basemap_towns;
 mod placefiles;
+mod tiles;
 
 const MIN_DISPLAYABLE_RADIALS: usize = 180;
 const DEFAULT_MAP_SCALE: f32 = 115.0;
@@ -316,6 +318,10 @@ struct ViewerApp {
     selected_product: DisplayProduct,
     frame_history: Vec<FrameHistoryEntry>,
     selected_frame_index: usize,
+    /// Raster tile basemap (satellite/streets/topo) under the radar.
+    tile_layer: std::cell::RefCell<tiles::TileLayer>,
+    basemap_style: tiles::TileStyle,
+    bold_labels: bool,
     /// Latched while the user is examining an OLDER frame: live loads keep
     /// backfilling but never steal the selection back to the newest frame.
     /// Cleared by clicking the newest frame, looping, or loading a new site.
@@ -1526,6 +1532,7 @@ impl RenderWorkerCachePolicy {
             radar_y_px: 0.0,
             km_per_px_x: 1.0,
             km_per_px_y: 1.0,
+            rotation_rad: 0.0,
         });
         self.can_store_sample_cache_bytes(upper_bound)
     }
@@ -1539,6 +1546,7 @@ impl RenderWorkerCachePolicy {
             radar_y_px: 0.0,
             km_per_px_x: 1.0,
             km_per_px_y: 1.0,
+            rotation_rad: 0.0,
         });
         upper_bound <= self.sample_cache_build_bytes()
     }
@@ -2050,6 +2058,8 @@ impl ViewerApp {
             4 => PanelLayout::FourGrid,
             _ => PanelLayout::One,
         };
+        let restored_basemap_style = tiles::TileStyle::from_key(&app_settings.basemap_style);
+        let restored_bold_labels = app_settings.bold_labels;
         let restored_placefile_slots: Vec<PlacefileSlot> = app_settings
             .placefiles
             .iter()
@@ -2080,6 +2090,9 @@ impl ViewerApp {
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
             frame_history: Vec::new(),
             selected_frame_index: 0,
+            tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(settings::tile_cache_dir())),
+            basemap_style: tiles::TileStyle::DarkVector,
+            bold_labels: true,
             browsing_history: false,
             history_frame_limit: DEFAULT_HISTORY_FRAME_LIMIT,
             history_playing: false,
@@ -2178,6 +2191,8 @@ impl ViewerApp {
             storm_motion_speed_kt: DEFAULT_STORM_MOTION_SPEED_KT,
             dealiased_readout_cache: None,
         };
+        app.basemap_style = restored_basemap_style;
+        app.bold_labels = restored_bold_labels;
         app.start_site_catalog_load(&cc.egui_ctx);
         app.load_volume(&cc.egui_ctx);
         app.load_live_hazards(&cc.egui_ctx);
@@ -4654,12 +4669,13 @@ impl ViewerApp {
                 .as_ref()
                 .map(|key| self.radar_texture_rect(ctx, rect, latitude_deg, longitude_deg, key))
                 .unwrap_or(rect);
+            let baked = pane_or_key_rotation_rad(&pane.texture_key);
             paint_rotated_image(
                 painter,
                 texture.id(),
                 image_rect,
                 self.lon_lat_to_screen(rect, longitude_deg, latitude_deg),
-                self.aeqd_north_angle(rect, latitude_deg, longitude_deg),
+                self.aeqd_north_angle(rect, latitude_deg, longitude_deg) - baked,
                 egui::Color32::WHITE,
             );
         }
@@ -4691,6 +4707,12 @@ impl ViewerApp {
         // both axes (the old equirect frame needed a cos-latitude ratio).
         let km_per_px_y = 111.32 / (self.map_scale * pixels_per_point);
         let km_per_px_x = km_per_px_y;
+        // AEQD meridian convergence at the radar, quantized to 5 mrad steps:
+        // the raster bakes the quantized angle (full-rect coverage, no
+        // draw-time rotation cutoff) and the draw quad applies only the tiny
+        // residual, so pans stay smooth between re-renders.
+        let rotation_full = self.aeqd_north_angle(rect, radar_lat, radar_lon);
+        let rotation_q = (rotation_full / 0.005).round() * 0.005;
         let options = ViewportRasterOptions {
             width,
             height,
@@ -4698,6 +4720,7 @@ impl ViewerApp {
             radar_y_px,
             km_per_px_x,
             km_per_px_y,
+            rotation_rad: rotation_q,
         };
         let key = ViewportKey {
             width,
@@ -4706,6 +4729,7 @@ impl ViewerApp {
             radar_y_px: (radar_y_px * 8.0).round() as i32,
             km_per_px_x: (km_per_px_x * 1_000_000.0).round() as i32,
             km_per_px_y: (km_per_px_y * 1_000_000.0).round() as i32,
+            rotation_mrad: (rotation_q * 1000.0).round() as i16,
         };
         Some((options, key))
     }
@@ -4934,6 +4958,9 @@ impl eframe::App for ViewerApp {
         self.poll_rotation_markers(&ctx);
         self.poll_storm_tracks(&ctx);
         self.poll_placefiles(&ctx);
+        if self.tile_layer.borrow_mut().poll(&ctx) {
+            ctx.request_repaint();
+        }
         self.handle_keyboard_navigation(&ctx);
 
         egui::Panel::top("top_bar")
@@ -5461,6 +5488,43 @@ impl ViewerApp {
             ctx.request_repaint();
         }
 
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Basemap");
+            let mut changed_style = None;
+            egui::ComboBox::from_id_salt("basemap_style")
+                .selected_text(self.basemap_style.label())
+                .width(118.0)
+                .show_ui(ui, |ui| {
+                    for style in tiles::TileStyle::ALL {
+                        if ui
+                            .selectable_label(self.basemap_style == style, style.label())
+                            .clicked()
+                        {
+                            changed_style = Some(style);
+                        }
+                    }
+                });
+            if let Some(style) = changed_style
+                && style != self.basemap_style
+            {
+                self.basemap_style = style;
+                self.app_settings.basemap_style = style.key().to_owned();
+                let _ = self.app_settings.save();
+                ctx.request_repaint();
+            }
+        });
+        if ui
+            .checkbox(&mut self.bold_labels, "Bold town labels")
+            .on_hover_text(
+                "GR2-style callout labels: bold white with a heavy outline, readable over storm cores",
+            )
+            .changed()
+        {
+            self.app_settings.bold_labels = self.bold_labels;
+            let _ = self.app_settings.save();
+            ctx.request_repaint();
+        }
         ui.separator();
         ui.checkbox(&mut self.show_inspector_card, "Inspector card")
             .on_hover_text(
@@ -8298,12 +8362,13 @@ impl ViewerApp {
                 .map(|key| self.radar_texture_rect(ctx, rect, latitude_deg, longitude_deg, key))
                 .unwrap_or(rect);
 
+            let baked = pane_or_key_rotation_rad(&self.texture_key);
             paint_rotated_image(
                 painter,
                 texture.id(),
                 image_rect,
                 self.lon_lat_to_screen(rect, longitude_deg, latitude_deg),
-                self.aeqd_north_angle(rect, latitude_deg, longitude_deg),
+                self.aeqd_north_angle(rect, latitude_deg, longitude_deg) - baked,
                 egui::Color32::WHITE,
             );
         }
@@ -8342,12 +8407,13 @@ impl ViewerApp {
                     .as_ref()
                     .map(|key| self.radar_texture_rect(ctx, rect, latitude_deg, longitude_deg, key))
                     .unwrap_or(rect);
+                let baked = pane_or_key_rotation_rad(&layer.texture_key);
                 paint_rotated_image(
                     painter,
                     texture.id(),
                     image_rect,
                     self.lon_lat_to_screen(rect, longitude_deg, latitude_deg),
-                    self.aeqd_north_angle(rect, latitude_deg, longitude_deg),
+                    self.aeqd_north_angle(rect, latitude_deg, longitude_deg) - baked,
                     egui::Color32::from_white_alpha(layer.opacity),
                 );
             }
@@ -8508,12 +8574,105 @@ impl ViewerApp {
     }
 
     fn draw_basemap(&self, painter: &egui::Painter, rect: egui::Rect) {
+        self.draw_tile_basemap(painter, rect);
         // Polyline reprojection is cached per view key (pure in rect + geo
         // transform); idle repaints reuse the projected shapes.
         let key = self.view_shape_key(0, rect);
         let mut cache = self.basemap_shape_cache.borrow_mut();
         let shapes = cache.get_or_insert_with(key, || self.build_basemap_shapes(rect));
         painter.extend(shapes.iter().cloned());
+    }
+
+    /// Raster tile basemap: Web-Mercator tiles drawn as AEQD-warped textured
+    /// quads beneath everything else. Missing tiles are queued for the
+    /// background fetch pool and simply leave the dark background until they
+    /// arrive — the UI thread never blocks.
+    fn draw_tile_basemap(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let style = self.basemap_style;
+        let tile_debug = std::env::var_os("BOWECHO_TILE_DEBUG").is_some();
+        if style == tiles::TileStyle::DarkVector {
+            if tile_debug {
+                eprintln!("TILES: style is DarkVector, skipping");
+            }
+            return;
+        }
+        let pixels_per_point = painter.ctx().pixels_per_point().max(0.5);
+        let km_per_px = 111.32 / self.map_scale;
+        let zoom = tiles::zoom_for_km_per_px(km_per_px, self.map_center_lat, pixels_per_point);
+        let bounds = self.visible_geo_bounds(rect);
+        let (x0, y0) = tiles::tile_coords(bounds.west as f64, bounds.north as f64, zoom);
+        let (x1, y1) = tiles::tile_coords(bounds.east as f64, bounds.south as f64, zoom);
+        let n = 1u32 << zoom;
+        let clamp_tile = |v: f64| (v.floor().max(0.0) as u32).min(n - 1);
+        let (tx0, tx1) = (clamp_tile(x0), clamp_tile(x1));
+        let (ty0, ty1) = (clamp_tile(y0), clamp_tile(y1));
+        if tile_debug {
+            eprintln!(
+                "TILES: style {} zoom {zoom} x {tx0}..{tx1} y {ty0}..{ty1} bounds W{:.2} E{:.2} S{:.2} N{:.2}",
+                style.key(),
+                bounds.west,
+                bounds.east,
+                bounds.south,
+                bounds.north
+            );
+        }
+        // Hard cap so degenerate bounds never flood the queue.
+        if (tx1.saturating_sub(tx0) + 1) as u64 * (ty1.saturating_sub(ty0) + 1) as u64 > 120 {
+            if tile_debug {
+                eprintln!("TILES: over tile cap, skipping");
+            }
+            return;
+        }
+        let mut layer = self.tile_layer.borrow_mut();
+        for ty in ty0..=ty1 {
+            for tx in tx0..=tx1 {
+                let tile = tiles::TileId { zoom, x: tx, y: ty };
+                // Project the four tile corners through the AEQD transform.
+                let corners_geo = [
+                    tiles::tile_corner_lon_lat(tx as f64, ty as f64, zoom),
+                    tiles::tile_corner_lon_lat((tx + 1) as f64, ty as f64, zoom),
+                    tiles::tile_corner_lon_lat((tx + 1) as f64, (ty + 1) as f64, zoom),
+                    tiles::tile_corner_lon_lat(tx as f64, (ty + 1) as f64, zoom),
+                ];
+                let corners: Vec<egui::Pos2> = corners_geo
+                    .iter()
+                    .map(|(lon, lat)| self.lon_lat_to_screen(rect, *lon as f32, *lat as f32))
+                    .collect();
+                let quad_bounds = egui::Rect::from_points(&corners);
+                if !rect.intersects(quad_bounds) {
+                    continue;
+                }
+                if let Some(texture) = layer.texture(style, tile) {
+                    let uvs = [
+                        egui::pos2(0.0, 0.0),
+                        egui::pos2(1.0, 0.0),
+                        egui::pos2(1.0, 1.0),
+                        egui::pos2(0.0, 1.0),
+                    ];
+                    let mut mesh = egui::epaint::Mesh::with_texture(texture.id());
+                    for (corner, uv) in corners.iter().zip(uvs.iter()) {
+                        mesh.vertices.push(egui::epaint::Vertex {
+                            pos: *corner,
+                            uv: *uv,
+                            color: egui::Color32::WHITE,
+                        });
+                    }
+                    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                    painter.add(egui::Shape::mesh(mesh));
+                } else {
+                    layer.request(style, tile);
+                }
+            }
+        }
+        if let Some(attribution) = style.attribution() {
+            painter.text(
+                egui::pos2(rect.left() + 6.0, rect.bottom() - 4.0),
+                egui::Align2::LEFT_BOTTOM,
+                attribution,
+                egui::FontId::proportional(9.0),
+                egui::Color32::from_rgba_unmultiplied(230, 234, 238, 150),
+            );
+        }
     }
 
     fn build_basemap_shapes(&self, rect: egui::Rect) -> Vec<egui::Shape> {
@@ -8730,6 +8889,22 @@ impl ViewerApp {
                 },
                 occupied,
             );
+            // Dense Census small-town layer (32k places) at storm zoom — the
+            // towns a warning forecaster calls out on stream. Drawn AFTER the
+            // city set so the occupied list keeps city names dominant.
+            if let Some(town_rank) = town_label_rank(self.map_scale) {
+                self.draw_place_label_set(
+                    painter,
+                    rect,
+                    bounds,
+                    PlaceLabelSet {
+                        labels: basemap_towns::BASEMAP_US_TOWN_LABELS,
+                        max_rank: town_rank,
+                        max_labels: 70,
+                    },
+                    occupied,
+                );
+            }
         }
         for layer in REGIONAL_BASEMAP_LAYERS {
             if bounds.intersects_bbox(layer.bounds) {
@@ -8756,16 +8931,42 @@ impl ViewerApp {
         place_labels: PlaceLabelSet,
         occupied: &mut Vec<egui::Rect>,
     ) {
-        let font = egui::FontId::proportional(if self.map_scale >= 190.0 { 12.0 } else { 11.0 });
-        let text_color = egui::Color32::from_rgb(198, 207, 214);
-        let halo_color = egui::Color32::from_rgba_unmultiplied(3, 5, 8, 210);
-        let dot_color = egui::Color32::from_rgb(118, 143, 158);
+        let bold = self.bold_labels;
+        // GR2-style callouts: bold white with a heavy dark outline so a
+        // meteorologist can read town names over a red core on stream.
+        let (text_color, halo_color, dot_color) = if bold {
+            (
+                egui::Color32::WHITE,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 235),
+                egui::Color32::from_rgb(235, 238, 242),
+            )
+        } else {
+            (
+                egui::Color32::from_rgb(198, 207, 214),
+                egui::Color32::from_rgba_unmultiplied(3, 5, 8, 210),
+                egui::Color32::from_rgb(118, 143, 158),
+            )
+        };
+        let zoomed = self.map_scale >= 190.0;
         let mut drawn = 0usize;
 
         for label in place_labels.labels {
             if label.rank > place_labels.max_rank || !bounds.contains(label.lon, label.lat) {
                 continue;
             }
+            // Size tiers: bigger towns get bigger type (callout hierarchy).
+            let size = if bold {
+                match label.rank {
+                    0..=3 => 18.0,
+                    4..=6 => 16.0,
+                    _ => 15.0,
+                }
+            } else if zoomed {
+                12.0
+            } else {
+                11.0
+            };
+            let font = egui::FontId::proportional(size);
             let position = self.lon_lat_to_screen(rect, label.lon, label.lat);
             if !rect.expand(32.0).contains(position) {
                 continue;
@@ -8775,16 +8976,28 @@ impl ViewerApp {
             if !rect.expand(80.0).intersects(label_rect) || overlaps_any(occupied, label_rect) {
                 continue;
             }
-            painter.circle_filled(position, 1.5, dot_color);
-            draw_halo_text(
-                painter,
-                text_position,
-                egui::Align2::LEFT_CENTER,
-                label.name,
-                font.clone(),
-                text_color,
-                halo_color,
-            );
+            painter.circle_filled(position, if bold { 2.2 } else { 1.5 }, dot_color);
+            if bold {
+                draw_heavy_halo_text(
+                    painter,
+                    text_position,
+                    egui::Align2::LEFT_CENTER,
+                    label.name,
+                    font,
+                    text_color,
+                    halo_color,
+                );
+            } else {
+                draw_halo_text(
+                    painter,
+                    text_position,
+                    egui::Align2::LEFT_CENTER,
+                    label.name,
+                    font,
+                    text_color,
+                    halo_color,
+                );
+            }
             occupied.push(label_rect);
             drawn += 1;
             if drawn >= place_labels.max_labels {
@@ -9453,6 +9666,8 @@ struct ViewportKey {
     radar_y_px: i32,
     km_per_px_x: i32,
     km_per_px_y: i32,
+    /// Quantized AEQD convergence baked into the raster (millradians).
+    rotation_mrad: i16,
 }
 
 impl ViewportKey {
@@ -9464,6 +9679,13 @@ impl ViewportKey {
 /// Paint a texture as a quad rotated by `angle` about `pivot` — used to
 /// align the planar-ENU radar raster with the AEQD screen frame at draw time
 /// (zero per-pixel cost; the raster itself is rotation-agnostic).
+/// Rotation baked into a rendered texture, from its viewport key.
+fn pane_or_key_rotation_rad(key: &Option<TextureKey>) -> f32 {
+    key.as_ref()
+        .map(|key| key.viewport.rotation_mrad as f32 / 1000.0)
+        .unwrap_or(0.0)
+}
+
 fn paint_rotated_image(
     painter: &egui::Painter,
     texture_id: egui::TextureId,
@@ -10396,6 +10618,20 @@ fn place_label_rank(map_scale: f32) -> Option<u8> {
     }
 }
 
+/// Census town tier visible at a given zoom (rank 7 small cities through
+/// rank 9 villages); None below storm zoom.
+fn town_label_rank(map_scale: f32) -> Option<u8> {
+    if map_scale < 260.0 {
+        None
+    } else if map_scale < 520.0 {
+        Some(7)
+    } else if map_scale < 900.0 {
+        Some(8)
+    } else {
+        Some(9)
+    }
+}
+
 fn label_budget(map_scale: f32) -> usize {
     if map_scale < 72.0 {
         28
@@ -10429,6 +10665,33 @@ fn estimated_label_width(text: &str, font_size: f32) -> f32 {
 
 fn overlaps_any(existing: &[egui::Rect], candidate: egui::Rect) -> bool {
     existing.iter().any(|rect| rect.intersects(candidate))
+}
+
+/// Heavy 8-direction outline for storm-readable callout labels.
+fn draw_heavy_halo_text(
+    painter: &egui::Painter,
+    position: egui::Pos2,
+    align: egui::Align2,
+    text: &str,
+    font: egui::FontId,
+    text_color: egui::Color32,
+    halo_color: egui::Color32,
+) {
+    const R: f32 = 2.0;
+    const D: f32 = 1.4;
+    for offset in [
+        egui::vec2(-R, 0.0),
+        egui::vec2(R, 0.0),
+        egui::vec2(0.0, -R),
+        egui::vec2(0.0, R),
+        egui::vec2(-D, -D),
+        egui::vec2(D, -D),
+        egui::vec2(-D, D),
+        egui::vec2(D, D),
+    ] {
+        painter.text(position + offset, align, text, font.clone(), halo_color);
+    }
+    painter.text(position, align, text, font, text_color);
 }
 
 fn draw_halo_text(
@@ -13537,6 +13800,7 @@ mod tests {
             radar_y_px: 540.0,
             km_per_px_x: 1.0,
             km_per_px_y: 1.0,
+            rotation_rad: 0.0,
         };
 
         assert!(!low.should_build_sample_cache_for_viewport(test_viewport_key(1920, 1080)));
@@ -14875,6 +15139,7 @@ mod tests {
             radar_y_px: 45.0,
             km_per_px_x: 1.0,
             km_per_px_y: 1.0,
+            rotation_rad: 0.0,
         };
 
         let image_rect = anchored_radar_texture_rect(rect, 1.0, rendered, current);
@@ -15063,6 +15328,9 @@ mod tests {
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
             frame_history: Vec::new(),
             selected_frame_index: 0,
+            tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(settings::tile_cache_dir())),
+            basemap_style: tiles::TileStyle::DarkVector,
+            bold_labels: true,
             browsing_history: false,
             history_frame_limit: DEFAULT_HISTORY_FRAME_LIMIT,
             history_playing: false,

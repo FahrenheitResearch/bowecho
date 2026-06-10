@@ -170,6 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         radar_y_px: 410.0,
         km_per_px_x: 0.16,
         km_per_px_y: 0.16,
+        rotation_rad: 0.0,
     };
     for (cut, moment) in [(1, MomentType::Velocity), (6, MomentType::Reflectivity)] {
         let mut timings = Vec::new();

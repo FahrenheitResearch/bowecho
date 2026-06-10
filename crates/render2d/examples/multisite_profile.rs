@@ -224,6 +224,7 @@ fn parse_args() -> Result<Config, String> {
             radar_y_px: viewport_height as f32 * 0.5,
             km_per_px_x: km_per_px,
             km_per_px_y: km_per_px,
+            rotation_rad: 0.0,
         },
     })
 }

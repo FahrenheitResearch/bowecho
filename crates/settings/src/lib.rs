@@ -24,6 +24,12 @@ pub struct AppSettings {
     pub grid_pane_count: usize,
     /// Placefile URLs (GRLevelX-style overlays) with per-file enable flags.
     pub placefiles: Vec<PlacefileEntry>,
+    /// Basemap style key: "dark" (vector), "satellite", "streets", "topo".
+    #[serde(default = "default_basemap_style")]
+    pub basemap_style: String,
+    /// GR2-style bold town labels (white, heavy halo) readable over echoes.
+    #[serde(default = "default_bold_labels")]
+    pub bold_labels: bool,
     /// Product hotkeys: number-row key ("0"-"9") -> product label (e.g.
     /// "REF", "VEL", "SRV", "RHO", "ZDR", "SW", "CREF", "ET", "VIL", "VILD",
     /// "PHI", "KDP", "AzShr", "Div"). Edit in config.json to customize.
@@ -67,6 +73,8 @@ impl Default for AppSettings {
             palette_by_family: BTreeMap::new(),
             grid_pane_count: 1,
             placefiles: Vec::new(),
+            basemap_style: default_basemap_style(),
+            bold_labels: default_bold_labels(),
             product_hotkeys: default_product_hotkeys(),
         }
     }
@@ -113,6 +121,19 @@ impl AppSettings {
             self.favorites.push(site.to_ascii_uppercase());
         }
     }
+}
+
+fn default_basemap_style() -> String {
+    "dark".to_owned()
+}
+
+fn default_bold_labels() -> bool {
+    true
+}
+
+/// Directory for the on-disk raster tile cache.
+pub fn tile_cache_dir() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("bowecho").join("tiles"))
 }
 
 fn config_dir() -> Option<PathBuf> {

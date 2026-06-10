@@ -286,6 +286,7 @@ fn parse_viewport(value: &str) -> Result<ViewportRasterOptions, String> {
         radar_y_px: height as f32 * 0.5,
         km_per_px_x: DEFAULT_KM_PER_PX,
         km_per_px_y: DEFAULT_KM_PER_PX,
+        rotation_rad: 0.0,
     })
 }
 
