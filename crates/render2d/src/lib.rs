@@ -4093,10 +4093,10 @@ mod tests {
         }
 
         let corrected = dealias_velocity_grid(&cut, &grid);
-        for g in 0..coherent.len() {
+        for (g, value) in coherent.iter().enumerate() {
             assert_eq!(
                 corrected.scaled_value(5, g),
-                Some(coherent[g]),
+                Some(*value),
                 "coherent gate {g} should be untouched"
             );
         }
@@ -4359,6 +4359,8 @@ mod tests {
             radar_y_px: 108.5,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rot_sin: 0.0,
+            rot_cos: 1.0,
             max_range_km_sq: max_range_km * max_range_km,
         };
 
@@ -4427,6 +4429,8 @@ mod tests {
             radar_y_px: 48.0,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rot_sin: 0.0,
+            rot_cos: 1.0,
             max_range_km_sq: max_range_km * max_range_km,
         };
 

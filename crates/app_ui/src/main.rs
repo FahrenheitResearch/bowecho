@@ -13735,6 +13735,7 @@ mod tests {
             radar_y_px: 3_000,
             km_per_px_x: 160_000,
             km_per_px_y: 160_000,
+            rotation_mrad: 0,
         };
 
         let first_pixels = RenderWorkerViewportSignature::new(
@@ -13986,6 +13987,7 @@ mod tests {
                 radar_y_px: 410.0,
                 km_per_px_x: 0.16,
                 km_per_px_y: 0.16,
+                rotation_rad: 0.0,
             },
             radar_range_km: DEFAULT_RADAR_RANGE_KM,
         };
@@ -15240,6 +15242,7 @@ mod tests {
             radar_y_px: 50 * 8,
             km_per_px_x: 1_000_000,
             km_per_px_y: 1_000_000,
+            rotation_mrad: 0,
         };
         let current = ViewportRasterOptions {
             width: 100,
@@ -15269,6 +15272,7 @@ mod tests {
             radar_y_px: 50 * 8,
             km_per_px_x: 1_000_000,
             km_per_px_y: 1_000_000,
+            rotation_mrad: 0,
         };
         let current = ViewportRasterOptions {
             width: 100,
@@ -15277,6 +15281,7 @@ mod tests {
             radar_y_px: 50.0,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
 
         let image_rect = anchored_radar_texture_rect(rect, 1.0, rendered, current);
@@ -15837,6 +15842,7 @@ mod tests {
             radar_y_px: 0,
             km_per_px_x: 1,
             km_per_px_y: 1,
+            rotation_mrad: 0,
         }
     }
 
