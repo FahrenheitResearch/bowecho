@@ -494,18 +494,13 @@ impl ColorSampler {
         if !value.is_finite() {
             return Rgba8::TRANSPARENT;
         }
-        match self.display_threshold {
-            Some(threshold) if self.threshold_is_symmetric => {
-                if value.abs() < threshold {
-                    return Rgba8::TRANSPARENT;
-                }
-            }
-            Some(threshold) => {
-                if value < threshold {
-                    return Rgba8::TRANSPARENT;
-                }
-            }
-            None => {}
+        let below_threshold = match self.display_threshold {
+            Some(threshold) if self.threshold_is_symmetric => value.abs() < threshold,
+            Some(threshold) => value < threshold,
+            None => false,
+        };
+        if below_threshold {
+            return Rgba8::TRANSPARENT;
         }
         match self.sample_mode {
             SampleMode::Interpolated => self.sample_accelerated(value, true),
