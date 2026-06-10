@@ -1,0 +1,114 @@
+274 VOLUME 13WEATHER AND FORECASTING
+Furthermore, the rapid evolution of storm cells pre-
+sents some challenges in separating out individual cell
+elements from multicell and supercell severe storms.
+These kinds of storms exhibit series of developing, ma-
+ture, and decaying cells, sometimes in close proximity
+to each other, and with some degree of vertical tilt. Their
+isolation by a cell-based algorithm remains a challenge.
+Finally, users should be cognizant that any cell cen-
+troid identi®cation and tracking algorithm does exactly
+what it is designed to do, namely, detect and track the
+cell centroid or center. The center of a storm does not
+always denote the areas of threatening weather with that
+cell. It is more appropriate for users to be aware that
+the onset of a storm (its leading edge) is a better dis-
+criminator of the beginning of any severe weather warn-
+ing. We recommend that a future SCIT algorithm con-
+tain cell detection and tracking, area tracking (for squall
+lines), and a leading-edge detector to facilitate the warn-
+ing process.
+Acknowledgments. Thanks to Mike Francis, Steve
+McIntosh, and Robert Harron for their contributions to-
+ward the performance evaluation, and to Rodger Brown
+for his guidance through the completion of this project.
+Additional thanks to Irv Watson for reviewing this
+manuscript and many insights into the development of
+the algorithm. Funding for this work was partially pro-
+vided by the National Weather Service Operational Sup-
+port Facility and the Federal Aviation Administration.
+APPENDIX A
+SCIT Algorithm Adaptable Parameter Settings
+Below are the parameter settings for the SCIT al-
+gorithm as implemented by the Operational Support Fa-
+cility in the WSR-88D Build 9.0 software. Note that
+this does not constitute all the adaptable parameters in
+the algorithm.
+1) AZIMUTHAL SEPARATION
+De®nition: Maximum azimuthal separation al-
+lowed for grouping segments into 2D components.
+Algorithmic response to change: In general, there
+is little effect in increasing the maximum azimuthal
+separation except where storms are ``affected'' by
+blockage. The value of the parameter should never
+go below the azimuthal separation of the radar data
+or no storms will be identi®ed.
+Values: Default 1.5 8, range (1.5 8±3.58)
+2) COMPONENT AREA 1±7
+De®nition:Area threshold for features to be con-
+sidered as storm components for each of the seven
+re¯ectivity thresholds (60±30 dB Z).
+Algorithmic response to change: Lowering this
+parameter will cause the detection of smaller storms
+and raising this parameter will decrease the number
+of detections.
+Values: Default 10.0 km
+2, range (10.0±30.0
+km2)
+3) DEPTH DELETE
+De®nition:Threshold depth used, when two cells
+are in close proximity, to determine that the weaker
+cell should be deleted in order to avoid cell crowd-
+ing.
+Algorithmic response to change: A larger (small-
+er) value will result in fewer (more) small, weak
+storms being detected in close proximity to other
+stronger storms.
+Values: Default 4.0 km, range (0.0±10.0 km)
+4) DIRECTION
+De®nition: Default direction assigned to storm
+cell when DIRECTION is not available.
+Algorithmic response to change: Changing this
+value will assign a new default storm direction.
+Values: Default 225 8, range (0 8±3608)
+5) DROPOUT COUNT
+De®nition: Maximum number of contiguous
+sample volumes with a re¯ectivity below the
+threshold REFLECTIVITY by less than or equal to
+DROPOUT REF DIFF that may be included in a
+segment identi®ed with that REFLECTIVITY .
+Algorithmic response to change: Setting this
+threshold lower will cause more strict adherence to
+the threshold REFLECTIVITY when building seg-
+ments (i.e., small changes in re¯ectivity just below
+the threshold REFLECTIVITY will not be allowed
+in the segment). Setting this threshold higher will
+cause less strict adherence to the threshold RE-
+FLECTIVITY when building segments (i.e., larger
+changes in re¯ectivity below the threshold RE-
+FLECTIVITY will be allowed in the segment).
+Values: Default 2, range (0±5)
+6) DROPOUT REF DIFF
+De®nition:The difference in effective re¯ectivity
+of sample volumes below REFELECTIVITY that
+may still be included in a segment identi®ed with
+REFLECTIVITY .
+Algorithmic response to change: Setting this
+threshold higher will allow more departure from
+REFLECTIVIIY when building a segment. Setting
+this threshold lower will allow less departure from
+REFLECTIVITY when building a segment.
+Values: Default 5 dB Z, range (0±10 dB Z)
+7) ELEVATION MERGE
+De®nition: Threshold elevation angle difference
+(vertical gap) for merging cells that are in close
+proximity.
+Algorithmic response to change: Setting this
+threshold lower will permit more cells, in close
+proximity, to maintain their identity. Setting the
+threshold higher will cause fewer detections of
+closely spaced cells. The more cells that are allowed
+to be declared within close proximity (i.e., the lower
+the threshold), the more dif®cult time association
+becomes for the tracking process.
+Unauthenticated | Downloaded 06/10/26 03:59 AM UTC

@@ -1,0 +1,68 @@
+266 VOLUME 13WEATHER AND FORECASTING
+FIG. 5. The highlighted segments and their corresponding circles
+represent 2D components.
+FIG. 6. Similar to Fig. 5 except with a vertical gap in the detected
+2D components.
+the ®nal product is actually a 3D storm cell centroid.
+These storm cells are then ranked by their cell-based
+vertically integrated liquid (VIL) value (see appendix
+B).
+The SCIT implementation in the WSR-88D system
+does not utilize the 2D centroid information from the
+nonassociated components. After all possible 3D as-
+sociations are completed, the remaining nonassociated
+lowest-elevation 2D centroids located beyond a site-
+adaptable range threshold could be classi®ed as 2D
+storm cells. This new classi®cation would identify storm
+cells as undersampled by the radar due to their range
+from the radar. A similar procedure is implemented in
+the National Severe Storms Laboratory (NSSL) Me-
+socyclone Detection Algorithm (Stumpf et al. 1998).
+Occasionally, when several cells are clustered closely
+together, the algorithm may have dif®culty identifying
+distinct 2D components for each cell at all of the ele-
+vation angles. When this happens, a single storm cell
+may actually be detected as two (or more) 3D cells,
+each at roughly the same horizontal location but sepa-
+rated by a vertical gap. As shown in Fig. 6, under certain
+circumstances, the collocated 3D cells may be combined
+to form a single cell. This is done when the following
+three conditions are met: 1) the two cells do not have
+2D storm components at the same elevation angle (i.e.,
+there is a vertical gap), 2) the horizontal distance be-
+tween the two centroids is less than a preset threshold
+(HORIZONTAL MERGE; default 5 10.0 km) and 3)
+if the vertical separation between the top of one cell
+and the base of the other is less than both of the fol-
+lowing parameters: HEIGHT MERGE; default 5 4.0
+km, and ELEVATION MERGE; default 5 3.08.
+Since the new algorithm detects many more storm
+cells than the WSR-88D storm series algorithms, there
+can be situations where numerous cells are identi®ed in
+close proximity to one another. This may result in un-
+desirable crowding of displayed output and poor track-
+ing performance. In such situations, it is preferable to
+retain only the stronger, taller storm cells. Thus, if the
+distance between the centroids of two cells is less than
+a preset threshold (HORIZONTAL DELETE; default 5
+5.0 km), the weaker or shorter cell is discarded if a
+difference in depth greater than DEPTH DELETE (de-
+fault 5 4 km) exists between the two cells.
+c. Tracking methodology
+Storm cells identi®ed in two consecutive volume
+scans are associated temporally to determine the cell
+track. The initial step is to check the time difference
+between volume scans. If this time difference is greater
+than TIME (default 5 20 min), time association is not
+attempted. This is done to handle data discontinuities
+due to malfunctions in the radar or interrupted com-
+munications.
+Using the centroid locations from the previous vol-
+ume scan, a ®rst guess at location for the current volume
+scan is generated. The ®rst guess uses either the cell's
+previous motion vector or a default motion vector (if
+the cell was ®rst detected in the previous volume scan).
+The default motion vector is either an average of all the
+motion vectors from storm cells in the previous volume
+scan or from user input (SPEED, DIRECTION). The
+Unauthenticated | Downloaded 06/10/26 03:59 AM UTC

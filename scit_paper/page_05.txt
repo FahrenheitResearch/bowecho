@@ -1,0 +1,95 @@
+JUNE 1998 267JOHNSON ET AL.
+FIG. 7. An example of the time association process. The 3 rep-
+resents the current volume scan cells' ®rst-guess position and the
+short arrows show the forecast error between the previous volume
+scan cells' position and their associated ®rst-guess positions.
+T
+ABLE 1. Parameters for which the SCIT algorithm produces a
+time series. An asterisk denotes those parameters not available to the
+end user of the WSR-88D implementation of the SCIT algorithm.
+Maximum re¯ectivity
+Height of maximum re¯ectivity
+Base (height of lowest 2D feature)
+Top (height of highest 2D feature)
+Mass
+Cell-based VIL [vs the traditional grid-based VIL (Greene and Clark
+1972)]
+Height of center of mass
+*Volume
+*Core aspect ratio (ratio of the depth of the identi®ed storm cell's
+core to its width)
+*Ratio of maximum re¯ectivity to re¯ectivity at the lowest elevation
+angle
+latter is used only if no average motion vector could be
+determined from the previous volume scan. Future en-
+hancements to the algorithm should include accepting
+input from a sounding in the form of the mean 0±6-km
+wind vector (Davies and Johns 1993) or some other
+mean wind.
+Next, the distance between the centroid of each cell
+detected in the current volume scan and each of the
+®rst-guess locations is calculated. If the distance is less
+than a threshold value, the old cell associated with that
+®rst-guess position is saved as a possible match with
+the current cell. Then, the distance between the new cell
+and all possible matches is determined. The match with
+the smallest distance is considered to be the time as-
+sociation of the detected cell. The last step involves
+calculating a new motion vector for each storm cell that
+has been identi®ed for at least two volume scans. The
+motion vector is computed using a linear least squares
+®t of the storm cell's current and up to 10 previous
+locations. Equal weight is given to all previous posi-
+tions.
+An example of the time association process is shown
+in Fig. 7. The initial detection of two storm cells is
+depicted in Fig. 7a. Figure 7b illustrates the second de-
+tection of two storm cells, their ®rst guess positions
+(denoted by an `` 3''), and the distance between the old
+and current storm cell position (denoted by double ar-
+rowed line). Assuming that the computed distance meets
+threshold requirements, both cells are time-associated
+with their previous detections.
+Once the tracking process is completed, attributes of
+the storm cells are calculated and stored as a time series
+for up to the previous 10 volume scans. See Table 1 for
+a list of relevant attributes.
+3. Performance evaluation
+The SCIT algorithm's performance was evaluated for
+1) cell identi®cation, 2) cell tracking, and 3) position
+forecasting. A discussion of the evaluation procedure is
+presented, followed by the results. The identi®cation
+results are strati®ed by storm type and are compared to
+the performance of the WSR-88D storm series algo-
+rithms. The tracking evaluation demonstrates how well
+the detected storms are correctly associated in time and
+the forecasting evaluation provides the average error
+associated with multiple forecast periods.
+a. Identi®cation evaluation
+The following procedure was followed to determine
+SCIT algorithm identi®cation performance for each case
+in the dataset:
+1) veri®cation dataset was determined,
+2) algorithm was run on each case,
+3) the output was scored versus veri®cation, and
+4) characteristics of algorithm failures were identi®ed.
+To determine the performance of the algorithm for var-
+ious different environments, cases were subjectively
+strati®ed into the following categories:
+1) ``isolated nonsevere'': storms were predominantly
+isolated and no severe weather reports were record-
+ed,
+2) ``isolated severe'': storms were predominantly iso-
+lated and more than one severe weather report was
+recorded,
+3) ``MCS (mesoscale convective system)/Line'': indi-
+vidual storms were in a large cluster or line,
+4) ``minisupercell'': storms took on the structure of
+classic supercell storms, but the horizontal and ver-
+tical scale was much less than classic (Burgess et al.
+1995), and
+5) ``stratiform precipitation'': a large area of light to
+moderate re¯ectivity with few if any re¯ectivity val-
+ues above 40 dB Z.
+These categories were chosen because they represent
+Unauthenticated | Downloaded 06/10/26 03:59 AM UTC

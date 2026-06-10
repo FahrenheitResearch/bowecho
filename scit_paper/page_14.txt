@@ -1,0 +1,94 @@
+276 VOLUME 13WEATHER AND FORECASTING
+calculated within 3 3 5 km horizontal ``bins'' (Stewart
+1991). However, in SCIT we calculate VIL by using a
+three-gate-averaged maximum re¯ectivity at each level
+and then vertically integrate through the depth of the
+storm. This method, hereafter known as cell-based VIL,
+was chosen to account for any tilt that may be present
+within the core of the storm. Cell-based VIL is, in no
+way, meant to imply that a downdraft would fall along
+a slanted vertical path. It is simply a measure of the
+liquid water content of the re¯ectivity core that may not
+be entirely captured by a grid-based VIL calculation. In
+addition, cell-based VIL unlike grid-based VIL, can eas-
+ily be displayed along with other storm cell character-
+istics in alphanumeric tables and trend plots.
+REFERENCES
+Boak, T . I. S., III, A. J. Jagodnik Jr., R. B. Marshall, D. Riceman,
+and M. J. Young, 1977: Tracking and signi®cance estimator.
+R&D Equipment Information Rep., Contract AFGL-TR-77-
+0259, Raytheon, Wayland, MA, 118 pp. [Available from Ray-
+theon Company, 141 Spring St., Lexington, MA 02173.]
+Brady, P . J., M. J. Schroeder, and M. R. Poellot, 1978: Automatic
+identi®cation and tracking of radar echoes in HIPLEX. Preprints,
+18th Conf. on Radar Meteorology, Atlanta, GA, Amer. Meteor.
+Soc., 139±143.
+Burgess, D. W ., R. Lee, S. Parker, L. Floyd, and D. L. Andra, 1995:
+A study of minisupercells observed by WSR-88D radars. Pre-
+prints, 27th Int. Conf. on Radar Meteorology, Vail, CO, Amer.
+Meteor. Soc., 4±6.
+Crane, R. K., 1979: Automatic cell detection and tracking. IEEE
+Trans. Geosci. Electron., GE-17, 250±262.
+Crum, T . D., and R. L. Alberty, 1993: The WSR-88D and the WSR-
+88D Operational Support Facility. Bull. Amer. Meteor. Soc., 74,
+1669±1687.
+Davies, J. M., and R. H. Johns, 1993: Some wind and instability
+parameters associated with strong and violent tornadoes, 1, Wind
+shear and helicity. The Tornado: Its Structure, Dynamics, Pre-
+diction, and Hazards, Geophys. Monogr., No. 79, Amer. Geo-
+phys. Union, 573±582.
+Dixon, M., and G. Wiener, 1993: TITAN: Thunderstorm identi®ca-
+tion, tracking, analysis and nowcastingÐA radar-based meth-
+odology. J. Atmos. Oceanic Technol., 10, 785±797.
+Forsyth, D. E., 1979: Real time forecasting of echo±centroid motion.
+M.S. thesis, Dept. of Meteorology, University of Oklahoma, 79
+pp. [Available from University of Oklahoma, Norman, OK
+73019.]
+Greene, D. R., and R. A. Clark, 1972: Vertically integrated liquid:
+A new analysis tool. Mon. Wea. Rev., 100, 548±552.
+Jackson, M. E., 1993: An echo motion algorithm for air traf®c man-
+agement using a national radar mosaic. Preprints, Fifth Int. Conf.
+on Aviation Weather Systems, Vienna, VA, Amer. Meteor. Soc.,
+299±303.
+, and R. T . Jesuroga, 1995: The ATMS convective area guidance
+product. Preprints, Sixth Conf. on Aviation Weather Systems,
+Dallas, TX, Amer. Meteor. Soc., 78±82.
+Klazura, G. E., and D. A. Imy, 1993: A description of the initial set
+of analysis products available from the NEXRAD WSR-88D
+system. Bull. Amer. Meteor. Soc., 74, 1293±1311.
+Klingle-Wilson, D., E. Mann, and A. Denneno, 1993: The Integrated
+Terminal Weather System (ITWS) Storm Cell Information and
+Weather Impacted Airspace Detection Algorithm. Preprints,
+Fifth Int. Conf. on Aviation Weather Systems, Vienna, VA, Amer.
+Meteor. Soc., 40±44.
+NSSL, cited 1995: Fort Worth±WDSS Proof-of-Concept test follow-
+up survey results. [Available online from http://www.nssl.noaa.gov/
+srad/swat/ftw.survey.html.]
+Rosenfeld, D., 1987: Objective method for analysis and tracking of
+convective cells as seen by radar. J. Atmos. Oceanic Technol.,
+4, 422±434.
+Sanger, S. S., R. M. Steadham, J. M. Jarboe, R. E. Schlegel, and A.
+Sellakannu, 1995: Human factors contributions to the evolution
+of an interactive Doppler radar and weather detection algorithm
+display system. Preprints, 11th Int. Conf. on Interactive Infor-
+mation and Processing Systems for Meteorology, Oceanography,
+and Hydrology, Dallas, TX, Amer. Meteor. Soc., 1±6.
+Stewart, S. R., 1991: The prediction of pulse-type thunderstorm gusts
+using vertically integrated liquid water content (VIL) and the
+cloud top penetrative downdraft mechanism. NOAA Tech.
+Memo. NWR SR-136, 20 pp. [Available from National Technical
+Information Service, U.S. Dept. of Commerce, 5285 Port Royal
+Rd., Spring®eld, VA 22161.]
+Stumpf, G. J., A. Witt, E. D. Mitchell, P . L. Spencer, J. T . Johnson,
+M. D. Eilts, K. W . Thomas, and D. W . Burgess, 1998: The Na-
+tional Severe Storms Laboratory Mesocyclone Detection Al-
+gorithm for the WSR-88D. Wea. Forecasting, 13, 304±326.
+Wilk, K. E., and K. C. Gray, 1970: Processing and analysis techniques
+used with the NSSL weather radar system. Preprints, 14th Radar
+Meteorology Conf., Tucson, AZ, Amer. Meteor. Soc., 369±374.
+Wilks, D. S., 1995: Statistical Methods in the Atmospheric Sciences.
+Academic Press, 467 pp.
+Zittel, W . D., 1976: Computer applications and techniques for storm
+tracking and warning. Preprints, 17th Conf. on Radar Meteor-
+ology, Seattle, WA, Amer. Meteor. Soc., 514±521.
+Unauthenticated | Downloaded 06/10/26 03:59 AM UTC

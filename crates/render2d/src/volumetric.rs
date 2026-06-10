@@ -725,10 +725,9 @@ mod tests {
     }
 
     fn volume_with(cuts: Vec<ElevationCut>) -> RadarVolume {
-        RadarVolume {
-            cuts,
-            ..RadarVolume::default()
-        }
+        let mut v = RadarVolume::default();
+        v.cuts = cuts;
+        v
     }
 
     #[test]

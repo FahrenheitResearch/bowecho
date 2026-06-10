@@ -89,24 +89,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("SW", MomentType::SpectrumWidth),
     ];
     for (name, moment) in base {
-        if let Some(cut) = lowest_cut_with(&volume, &moment)
-            && let Ok(c) = ViewportMomentCache::new_with_color_tables(&volume, cut, moment, &tables)
-        {
-            save_cache(&volume, &c, opts, &format!("{dir}/gallery_{name}.png"));
+        if let Some(cut) = lowest_cut_with(&volume, &moment) {
+            if let Ok(c) = ViewportMomentCache::new_with_color_tables(&volume, cut, moment, &tables)
+            {
+                save_cache(&volume, &c, opts, &format!("{dir}/gallery_{name}.png"));
+            }
         }
     }
 
     // Dealiased velocity.
-    if let Some(cut) = vel_cut
-        && let Ok(c) =
+    if let Some(cut) = vel_cut {
+        if let Ok(c) =
             ViewportMomentCache::new_dealiased_velocity_with_color_tables(&volume, cut, &tables)
-    {
-        save_cache(
-            &volume,
-            &c,
-            opts,
-            &format!("{dir}/gallery_VEL_dealiased.png"),
-        );
+        {
+            save_cache(
+                &volume,
+                &c,
+                opts,
+                &format!("{dir}/gallery_VEL_dealiased.png"),
+            );
+        }
     }
 
     // Derived volume products on the base reflectivity tilt.
@@ -135,11 +137,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
         ];
         for (name, grid, family) in derived {
-            if let Some(grid) = grid
-                && let Ok(c) =
+            if let Some(grid) = grid {
+                if let Ok(c) =
                     ViewportMomentCache::new_derived(&volume, base_idx, grid, family, &tables)
-            {
-                save_cache(&volume, &c, opts, &format!("{dir}/gallery_{name}.png"));
+                {
+                    save_cache(&volume, &c, opts, &format!("{dir}/gallery_{name}.png"));
+                }
             }
         }
     }
@@ -167,48 +170,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // A cross-section through the strongest composite cell, colorized REF.
-    if let Some(comp) = composite_reflectivity_grid(&volume)
-        && let Some(base_idx) = ref_cut
-    {
-        let bc = &volume.cuts[base_idx];
-        let bg = bc.moments.get(&MomentType::Reflectivity).unwrap();
-        let (mut best, mut rg) = (f32::NEG_INFINITY, (0usize, 0usize));
-        for r in 0..comp.radial_count() {
-            for g in 0..comp.gate_range.gate_count {
-                if let Some(v) = comp
-                    .scaled_value(r, g)
-                    .filter(|v| v.is_finite() && *v > best)
-                {
-                    best = v;
-                    rg = (r, g);
-                }
-            }
-        }
-        let az = bc.radials[bg.radial_indices[rg.0]].azimuth_deg.to_radians();
-        let rkm = (bg.gate_range.first_gate_m as f32
-            + rg.1 as f32 * bg.gate_range.gate_spacing_m as f32)
-            / 1000.0;
-        let (e, n) = (rkm * az.sin(), rkm * az.cos());
-        if let Some(xs) =
-            reflectivity_cross_section(&volume, (e - 30.0, n), (e + 30.0, n), 700, 320, 18_000.0)
-        {
-            let table = tables.for_family(ColorTableFamily::Reflectivity);
-            let mut img =
-                ImageBuffer::<Rgba<u8>, Vec<u8>>::from_pixel(700, 320, Rgba([15, 17, 20, 255]));
-            for y in 0..320 {
-                for x in 0..700 {
-                    let v = xs.values[y * 700 + x];
-                    if v.is_finite() {
-                        let c = table.color_for_value(v);
-                        if c[3] > 0 {
-                            img.put_pixel(x as u32, y as u32, Rgba([c[0], c[1], c[2], 255]));
-                        }
+    if let Some(comp) = composite_reflectivity_grid(&volume) {
+        if let Some(base_idx) = ref_cut {
+            let bc = &volume.cuts[base_idx];
+            let bg = bc.moments.get(&MomentType::Reflectivity).unwrap();
+            let (mut best, mut rg) = (f32::NEG_INFINITY, (0usize, 0usize));
+            for r in 0..comp.radial_count() {
+                for g in 0..comp.gate_range.gate_count {
+                    if let Some(v) = comp
+                        .scaled_value(r, g)
+                        .filter(|v| v.is_finite() && *v > best)
+                    {
+                        best = v;
+                        rg = (r, g);
                     }
                 }
             }
-            let path = format!("{dir}/gallery_CrossSection.png");
-            img.save(&path)?;
-            println!("wrote {path}");
+            let az = bc.radials[bg.radial_indices[rg.0]].azimuth_deg.to_radians();
+            let rkm = (bg.gate_range.first_gate_m as f32
+                + rg.1 as f32 * bg.gate_range.gate_spacing_m as f32)
+                / 1000.0;
+            let (e, n) = (rkm * az.sin(), rkm * az.cos());
+            if let Some(xs) = reflectivity_cross_section(
+                &volume,
+                (e - 30.0, n),
+                (e + 30.0, n),
+                700,
+                320,
+                18_000.0,
+            ) {
+                let table = tables.for_family(ColorTableFamily::Reflectivity);
+                let mut img =
+                    ImageBuffer::<Rgba<u8>, Vec<u8>>::from_pixel(700, 320, Rgba([15, 17, 20, 255]));
+                for y in 0..320 {
+                    for x in 0..700 {
+                        let v = xs.values[y * 700 + x];
+                        if v.is_finite() {
+                            let c = table.color_for_value(v);
+                            if c[3] > 0 {
+                                img.put_pixel(x as u32, y as u32, Rgba([c[0], c[1], c[2], 255]));
+                            }
+                        }
+                    }
+                }
+                let path = format!("{dir}/gallery_CrossSection.png");
+                img.save(&path)?;
+                println!("wrote {path}");
+            }
         }
     }
     Ok(())

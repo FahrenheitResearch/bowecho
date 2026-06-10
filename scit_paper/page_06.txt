@@ -1,0 +1,150 @@
+268 VOLUME 13WEATHER AND FORECASTING
+TABLE 2. Cases chosen for the SCIT algorithm evaluation and their storm type.
+Radar and city Date
+Total # human-
+veri®ed cells Storm type
+KFDR, Frederick, OK
+KOUN, Norman, OK
+KMLB, Melborne, FL
+KMLB, Melborne, FL
+KMLB, Melborne, FL
+20 April 1992
+2 September 1992
+25 March 1992
+9 June 1992
+12 June 1992
+368
+473
+734
+591
+580
+Isolated severe
+Isolated severe
+MCS
+Isolated nonsevere
+Isolated nonsevere
+KLSX, St. Louis, MO
+KLSX, St. Louis, MO
+KTLX, Oklahoma City, OK
+8 June 1993
+2 July 1993
+18 June 1992
+512
+325
+147
+MCS/Line
+Line
+Isolated severe
+KTLX, Oklahoma City, OK
+KIWA, Phoenix, AZ
+KIWA, Phoenix, AZ
+KLWX, Sterling, VA
+KLWX, Sterling, VA
+21 February 1994
+6 August 1993
+20 August 1993
+14 April 1993
+1 May 1994
+116
+867
+832
+282
+218
+Stratiform
+Isolated severe
+Isolated severe
+Minisupercell
+Minisupercell
+KLWX, Sterling, VA
+KCBX, Boise, ID
+KBIS, Bismark, ND
+KBIS, Bismark, ND
+Total
+6 October 1995
+1 May 1995
+21 May 1995
+7 June 1995
+237
+129
+152
+235
+6561
+Minisupercell
+Isolated severe
+Isolated nonsevere
+MCS/Line
+the scenarios that the algorithm must successfully han-
+dle for deployment in the nationwide WSR-88D net-
+work. Isolated storms were subdivided into severe and
+nonsevere because severe storms tend to be much larger
+and have a multicellular structure. MCSs and lines were
+combined into one category because they represent the
+same problem to the algorithm: closely spaced cells that
+often evolve quickly with motion typically different
+from that of the entire complex. Minisupercells were
+made a separate category to demonstrate algorithm per-
+formance on ``nonclassic'' type of isolated severe
+storms. Stratiform cases were used in the evaluation
+simply to demonstrate the algorithm's limitation for this
+type of scenario.
+Table 2 lists the cases and their classi®cations. Each
+case is comprised of about 1 h of data.
+The veri®cation set for each case was determined
+through visual inspection of the radar data. After dis-
+cussions with many operational and research meteor-
+ologists, a set of veri®cation rules was developed. An
+area of re¯ectivity was considered a storm cell if:
+1) it had a maximum re¯ectivity of at least 30 dB Z,
+2) it had a horizontal 30-dB Z area of at least 5 km
+2 on
+at least one elevation scan,
+3) its estimated 3D mass-weighted centroid was sepa-
+rated from other centroids by at least 5 km, and
+4) the area was separated from other areas by a local
+minimum at least 10 dB Z lower than the maximum
+within the area.
+Note that these rules do not include a criterion for depth.
+Thus, if an area of re¯ectivity meets all of the above
+criteria on at least one elevation scan, the area is con-
+sidered a storm cell for veri®cation purposes. The SCIT
+algorithm requires that an area of re¯ectivity meet size
+and intensity criteria on at least two consecutive ele-
+vation scans to be declared a storm cell. This algorithm
+requirement is to avoid identi®cation of ground clutter
+as storm cells; however, this can also cause shallow cells
+to be missed. We will discuss the impact this has on the
+performance results later.
+Using NSSL 's Radar Algorithm and Display Software
+(Sanger et al. 1995), radar meteorologists examined re-
+¯ectivity data in accordance with the veri®cation rules.
+Both composite re¯ectivity data and individual eleva-
+tion scans were used to verify which areas of re¯ectivity
+were cells. The 30-dB Z area and the horizontal location
+of the 3D mass weighted centroid for each veri®cation
+cell were estimated using the composite re¯ectivity
+®eld. The 30-dB Z area was estimated using a circular
+approximation with the radius of the estimated circle
+being recorded for veri®cation. The maximum re¯ec-
+tivity value, azimuth, and range were also recorded for
+each storm cell. These characteristics constitute the ver-
+i®cation set for each case. Both the SCIT algorithm and
+the WSR-88D storm series algorithm were run using
+the default algorithm settings (see appendix A for SCIT
+settings). The horizontal location (azimuth and range)
+of each algorithm-identi®ed storm cell was then com-
+pared to the veri®cation dataset.
+Figure 8 shows the method to determine hits, false
+alarms, and misses. If an algorithm detection exists
+within the radius of a human-veri®ed cell, the detection
+is declared a ``hit.'' Conversely, if a veri®ed cell does
+not have an associated algorithm detection, the algo-
+rithm is assessed a ``miss.'' If an algorithm detection
+exists outside of all veri®ed cells' radii, the detection
+is declared a ``false alarm.''
+The algorithm's output as compared to the veri®cation
+dataset, and the probability of detection and false alarm
+rate (Wilks 1995) was calculated for each storm type
+and in total. Table 3 presents the results of the SCIT
+performance evaluation. The results show that cells
+above 40 dBZ have a 68% chance of being detected and
+Unauthenticated | Downloaded 06/10/26 03:59 AM UTC

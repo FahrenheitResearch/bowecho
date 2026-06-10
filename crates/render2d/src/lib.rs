@@ -11,14 +11,17 @@ pub use color_tables::{ColorSampler, ColorTable, ColorTableFamily, ColorTableSet
 mod cascade;
 mod cells;
 mod detect;
+mod gate_filter;
 mod shear;
 mod smooth;
+mod tracking;
 mod volumetric;
 pub use cascade::{dealias_velocity_grid_cascade, fit_range_band_reference};
 pub use cells::{StormCell, identify_storm_cells};
 pub use detect::{
     RotationSite, RotationStrength, detect_rotation_sites, rotation_features_per_tilt,
 };
+pub use gate_filter::apply_reflectivity_gate_filter;
 use image::{ImageBuffer, ImageError, Rgba};
 use radar_core::{
     ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, ProductId, RadarVolume,
@@ -27,6 +30,7 @@ use rayon::prelude::*;
 pub use shear::{azimuthal_shear_grid, radial_divergence_grid};
 pub use smooth::smooth_moment_grid;
 use thiserror::Error;
+pub use tracking::{StormTrack, StormTracker, TIME_GATE_S};
 pub use volumetric::{
     CrossSection, ECHO_TOP_THRESHOLD_DBZ, VolumeDealiasCache, composite_reflectivity_grid,
     echo_top_grid, mehs_grid, reflectivity_cross_section, velocity_cross_section,
@@ -2951,18 +2955,41 @@ fn color_for_raw(grid: &MomentGrid, sampler: &ColorSampler, raw: u16) -> [u8; 4]
     sampler.color_for_value((raw as f32 - grid.offset) / grid.scale)
 }
 
-/// Per-range-band zeroth-harmonic wind reference (Browning & Wexler 1968),
-/// re-exported from the standalone [`bowecho_dealias`] crate — see its docs
-/// for how to fit one or seed it from external data (e.g. model winds).
-pub use bowecho_dealias::RangeBandReference;
-
 /// Dealias (unfold) a base velocity moment.
 ///
-/// Grid adapter over the standalone [`bowecho_dealias`] crate, which holds
-/// the region-based engine (flood-fill regions, boundary fold votes,
-/// weighted union-find resolution, largest-region anchoring, despeckle) and
-/// the literature trail (Jing & Wiener 1993; Helmus & Collis 2016;
-/// Feldmann et al. 2020 *R2D2*; Louf et al. 2020 *UNRAVEL*).
+/// This is a **region-based** unfolder, not a gate-by-gate radial walk. A
+/// radial/gate-sequential continuity scheme (the previous implementation)
+/// propagates a single bad fold down an entire ray, producing the radial
+/// "spokes" that plague high-shear convection (derechos, mesocyclones). The
+/// region-based approach decides whole coherent regions at once and lets
+/// genuine discontinuities remain at region boundaries, so an error cannot
+/// run down a radial. See Feldmann et al. (2020, *R2D2*, JTECH-D-20-0054.1),
+/// Jing & Wiener (1993), and Py-ART's `dealias_region_based`
+/// (Helmus & Collis 2016).
+///
+/// Steps: (1) flood-fill connected regions whose neighbouring gates differ by
+/// less than half a Nyquist (so no fold occurs *within* a region); (2) build a
+/// region-adjacency graph whose edges carry the integer Nyquist fold between
+/// the two regions (the consensus over all shared boundary gate-pairs);
+/// (3) resolve folds strongest-boundary-first via a union-find with per-node
+/// fold offset; (4) anchor each connected group so its largest region is
+/// unfolded (fold 0); (5) apply and despeckle.
+/// Per-range-band zeroth-harmonic wind reference (Browning & Wexler 1968):
+/// v̂(az) = a·cos(az) + b·sin(az), fitted per band of gates. Supplied to the
+/// fold resolver as EXTERNAL evidence by the tilt-cascade engine.
+pub struct RangeBandReference {
+    pub band_gates: usize,
+    pub fits: Vec<Option<(f32, f32)>>,
+}
+
+impl RangeBandReference {
+    #[inline]
+    fn eval(&self, sin_az: f32, cos_az: f32, gate: usize) -> Option<f32> {
+        let (a, b) = (*self.fits.get(gate / self.band_gates.max(1))?)?;
+        Some(a * cos_az + b * sin_az)
+    }
+}
+
 pub fn dealias_velocity_grid(cut: &ElevationCut, source: &MomentGrid) -> MomentGrid {
     dealias_velocity_grid_with_reference(cut, source, None)
 }
@@ -2976,29 +3003,20 @@ pub fn dealias_velocity_grid_with_reference(
     source: &MomentGrid,
     reference: Option<&RangeBandReference>,
 ) -> MomentGrid {
-    let (observed, nyquist, azimuths) = velocity_sweep_buffers(cut, source);
-    let dealiased = bowecho_dealias::dealias_with_reference(
-        &bowecho_dealias::Sweep {
-            velocity: &observed,
-            gates: source.gate_range.gate_count,
-            nyquist: &nyquist,
-            azimuths_deg: &azimuths,
-        },
-        reference,
-    );
-    encode_dealiased_grid(source, &dealiased.velocity)
-}
-
-/// Convert a velocity moment into the slice form the dealias engine takes:
-/// (velocities with NaN for no-data / range-folded gates, per-row Nyquist
-/// with NaN where unknown, per-row azimuths).
-pub(crate) fn velocity_sweep_buffers(
-    cut: &ElevationCut,
-    source: &MomentGrid,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let rows = source.radial_count();
     let gate_count = source.gate_range.gate_count;
     let total = rows.saturating_mul(gate_count);
+    let fallback_nyquist = median_nyquist_mps(cut, source);
+
+    // Per-row Nyquist (NaN where unknown) and observed velocities (NaN for
+    // no-data / range-folded gates, which never join a region).
+    let mut nyq = vec![f32::NAN; rows.max(1)];
+    for (row, slot) in nyq.iter_mut().enumerate().take(rows) {
+        *slot = row_nyquist_mps(cut, source, row)
+            .or(fallback_nyquist)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(f32::NAN);
+    }
 
     let mut observed = vec![f32::NAN; total];
     if total > 0 {
@@ -3009,26 +3027,30 @@ pub(crate) fn velocity_sweep_buffers(
         }
     }
 
-    let mut nyquist = vec![f32::NAN; rows];
-    for (row, slot) in nyquist.iter_mut().enumerate() {
-        if let Some(value) =
-            row_nyquist_mps(cut, source, row).filter(|value| value.is_finite() && *value > 0.0)
-        {
-            *slot = value;
+    let azimuths = radial_azimuths(cut, source);
+    let folds = region_based_dealias_folds(&observed, &nyq, rows, gate_count, &azimuths, reference);
+
+    let mut corrected = vec![DEALIASED_VELOCITY_NODATA; total];
+    #[allow(clippy::needless_range_loop)]
+    for row in 0..rows {
+        let n = nyq[row];
+        for gate in 0..gate_count {
+            let idx = row * gate_count + gate;
+            let v = observed[idx];
+            if !v.is_finite() {
+                continue;
+            }
+            let value = if n.is_finite() {
+                v + 2.0 * n * folds[idx] as f32
+            } else {
+                v
+            };
+            corrected[idx] = encode_dealiased_velocity(value);
         }
     }
 
-    (observed, nyquist, radial_azimuths(cut, source))
-}
+    despeckle_dealiased_velocity(&mut corrected, &nyq, rows, gate_count);
 
-/// Pack a corrected f32 velocity field into the dealiased-velocity grid
-/// encoding (0.1 m/s steps biased at 32 768, 0 = no data), copying gate
-/// geometry and radial order from `source`.
-pub(crate) fn encode_dealiased_grid(source: &MomentGrid, velocity: &[f32]) -> MomentGrid {
-    let mut corrected = vec![DEALIASED_VELOCITY_NODATA; velocity.len()];
-    for (slot, value) in corrected.iter_mut().zip(velocity.iter()) {
-        *slot = encode_dealiased_velocity(*value);
-    }
     MomentGrid {
         moment: MomentType::Velocity,
         gate_range: source.gate_range.clone(),
@@ -3038,6 +3060,110 @@ pub(crate) fn encode_dealiased_grid(source: &MomentGrid, velocity: &[f32]) -> Mo
         range_folded: None,
         radial_indices: source.radial_indices.clone(),
         storage: MomentStorage::U16(corrected),
+    }
+}
+
+/// Fraction of the Nyquist interval below which two adjacent gates are assumed
+/// to belong to the same (unfolded) region. Comfortably below 1.0 so a true
+/// fold (a jump of ~2·Nyquist) always lands on a region boundary.
+const REGION_JOIN_FRAC: f32 = 0.5;
+/// Hard cap on the integer fold count applied to any region.
+const REGION_MAX_FOLD: i32 = 5;
+/// Minimum shared-boundary support for an inter-region fold to be trusted.
+/// One is enough: region interiors are already coherent, so a single boundary
+/// pair is a valid estimate, and because edges resolve strongest-first a lone
+/// spurious contact only ever resolves last (as a no-op cycle).
+const REGION_EDGE_MIN_SUPPORT: u32 = 1;
+
+/// Plain union-find for connected-component region labelling.
+struct UnionFind {
+    parent: Vec<u32>,
+    rank: Vec<u8>,
+}
+
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n as u32).collect(),
+            rank: vec![0; n],
+        }
+    }
+
+    fn find(&mut self, mut x: u32) -> u32 {
+        while self.parent[x as usize] != x {
+            let parent = self.parent[x as usize];
+            self.parent[x as usize] = self.parent[parent as usize]; // path halving
+            x = self.parent[x as usize];
+        }
+        x
+    }
+
+    fn union(&mut self, a: u32, b: u32) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra == rb {
+            return;
+        }
+        let (ra, rb) = if self.rank[ra as usize] < self.rank[rb as usize] {
+            (rb, ra)
+        } else {
+            (ra, rb)
+        };
+        self.parent[rb as usize] = ra;
+        if self.rank[ra as usize] == self.rank[rb as usize] {
+            self.rank[ra as usize] += 1;
+        }
+    }
+}
+
+/// Union-find that also tracks an integer fold offset to the group root, so we
+/// can accumulate "region B is k Nyquist intervals above region A" relations
+/// and solve them all consistently (a weighted/potential DSU).
+struct FoldUnionFind {
+    parent: Vec<u32>,
+    rank: Vec<u8>,
+    /// fold[x] = k[x] - k[parent[x]]
+    offset: Vec<i32>,
+}
+
+impl FoldUnionFind {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n as u32).collect(),
+            rank: vec![0; n],
+            offset: vec![0; n],
+        }
+    }
+
+    /// Returns (root, k[x] - k[root]).
+    fn find(&mut self, x: u32) -> (u32, i32) {
+        let mut node = x;
+        let mut total = 0;
+        while self.parent[node as usize] != node {
+            total += self.offset[node as usize];
+            node = self.parent[node as usize];
+        }
+        (node, total)
+    }
+
+    /// Enforce k[b] - k[a] = rel by merging the two groups.
+    fn union(&mut self, a: u32, b: u32, rel: i32) {
+        let (ra, oa) = self.find(a);
+        let (rb, ob) = self.find(b);
+        if ra == rb {
+            return;
+        }
+        // k[rb] - k[ra] = rel + oa - ob
+        let delta = rel + oa - ob;
+        if self.rank[ra as usize] < self.rank[rb as usize] {
+            self.parent[ra as usize] = rb;
+            self.offset[ra as usize] = -delta;
+        } else {
+            self.parent[rb as usize] = ra;
+            self.offset[rb as usize] = delta;
+            if self.rank[ra as usize] == self.rank[rb as usize] {
+                self.rank[ra as usize] += 1;
+            }
+        }
     }
 }
 
@@ -3053,6 +3179,385 @@ fn radial_azimuths(cut: &ElevationCut, grid: &MomentGrid) -> Vec<f32> {
         .collect()
 }
 
+/// Whether row order closes a full 360° sweep (so the last radial is azimuthally
+/// adjacent to the first). True for any normal NEXRAD PPI.
+fn sweep_wraps(azimuths: &[f32]) -> bool {
+    let rows = azimuths.len();
+    if rows < 8 {
+        return false;
+    }
+    let (Some(first), Some(last)) = (azimuths.first(), azimuths.last()) else {
+        return false;
+    };
+    if !first.is_finite() || !last.is_finite() {
+        return false;
+    }
+    let gap = (first - last)
+        .rem_euclid(360.0)
+        .min((last - first).rem_euclid(360.0));
+    let typical = 360.0 / rows as f32;
+    gap <= 3.0 * typical
+}
+
+/// Core region-based fold solver. Returns the integer Nyquist fold for every
+/// gate (0 where unknown / no data).
+fn region_based_dealias_folds(
+    observed: &[f32],
+    nyq: &[f32],
+    rows: usize,
+    gates: usize,
+    azimuths: &[f32],
+    reference: Option<&RangeBandReference>,
+) -> Vec<i32> {
+    let total = rows.saturating_mul(gates);
+    let mut folds = vec![0i32; total];
+    // Union-find nodes are indexed by `idx as u32`; bail (no unfolding) rather
+    // than truncate if a grid were ever absurdly large. Real sweeps are ~1.3M
+    // gates, far under u32::MAX.
+    if total == 0 || observed.len() != total || total > u32::MAX as usize {
+        return folds;
+    }
+
+    let same_region = |a: usize, b: usize, n: f32| -> bool {
+        n.is_finite()
+            && observed[a].is_finite()
+            && observed[b].is_finite()
+            && (observed[a] - observed[b]).abs() <= REGION_JOIN_FRAC * n
+    };
+
+    // ---- 1. label connected regions ----
+    let mut labels = UnionFind::new(total);
+    let wrap = sweep_wraps(azimuths);
+    for row in 0..rows {
+        let row_n = nyq[row];
+        for gate in 0..gates {
+            let idx = row * gates + gate;
+            if !observed[idx].is_finite() {
+                continue;
+            }
+            if gate + 1 < gates && same_region(idx, idx + 1, row_n) {
+                labels.union(idx as u32, (idx + 1) as u32);
+            }
+            if row + 1 < rows {
+                let down = (row + 1) * gates + gate;
+                let n = row_n.min(nyq[row + 1]);
+                if same_region(idx, down, n) {
+                    labels.union(idx as u32, down as u32);
+                }
+            }
+        }
+    }
+    if wrap {
+        let n = nyq[rows - 1].min(nyq[0]);
+        for gate in 0..gates {
+            let a = (rows - 1) * gates + gate;
+            let b = gate;
+            if same_region(a, b, n) {
+                labels.union(a as u32, b as u32);
+            }
+        }
+    }
+
+    // Compact region ids + sizes.
+    let mut region_of = vec![u32::MAX; total];
+    let mut region_size: Vec<u32> = Vec::new();
+    for idx in 0..total {
+        if !observed[idx].is_finite() {
+            continue;
+        }
+        let root = labels.find(idx as u32);
+        let rid = &mut region_of[root as usize];
+        if *rid == u32::MAX {
+            *rid = region_size.len() as u32;
+            region_size.push(0);
+        }
+        let rid = *rid;
+        region_of[idx] = rid;
+        region_size[rid as usize] += 1;
+    }
+    let region_count = region_size.len();
+    if region_count == 0 {
+        return folds;
+    }
+
+    // ---- 2. accumulate inter-region fold votes over shared boundaries ----
+    // key: (lo_region, hi_region) -> map fold -> count, where fold f means
+    // k[hi] = k[lo] + f, f = round((v_lo - v_hi) / (2·Nyquist)).
+    let mut edges: std::collections::HashMap<(u32, u32), std::collections::HashMap<i32, u32>> =
+        std::collections::HashMap::new();
+    let mut vote = |ra: u32, va: f32, rb: u32, vb: f32, n: f32| {
+        if ra == rb || !n.is_finite() {
+            return;
+        }
+        let (lo, vlo, hi, vhi) = if ra < rb {
+            (ra, va, rb, vb)
+        } else {
+            (rb, vb, ra, va)
+        };
+        let f = ((vlo - vhi) / (2.0 * n)).round() as i32;
+        if f.abs() > 2 * REGION_MAX_FOLD {
+            return;
+        }
+        *edges.entry((lo, hi)).or_default().entry(f).or_insert(0) += 1;
+    };
+    for row in 0..rows {
+        let row_n = nyq[row];
+        for gate in 0..gates {
+            let idx = row * gates + gate;
+            let ra = region_of[idx];
+            if ra == u32::MAX {
+                continue;
+            }
+            if gate + 1 < gates {
+                let rb = region_of[idx + 1];
+                if rb != u32::MAX {
+                    vote(ra, observed[idx], rb, observed[idx + 1], row_n);
+                }
+            }
+            if row + 1 < rows {
+                let down = (row + 1) * gates + gate;
+                let rb = region_of[down];
+                if rb != u32::MAX {
+                    vote(
+                        ra,
+                        observed[idx],
+                        rb,
+                        observed[down],
+                        row_n.min(nyq[row + 1]),
+                    );
+                }
+            }
+        }
+    }
+    if wrap {
+        let n = nyq[rows - 1].min(nyq[0]);
+        for gate in 0..gates {
+            let a = (rows - 1) * gates + gate;
+            let b = gate;
+            let (ra, rb) = (region_of[a], region_of[b]);
+            if ra != u32::MAX && rb != u32::MAX {
+                vote(ra, observed[a], rb, observed[b], n);
+            }
+        }
+    }
+
+    // ---- 3. resolve folds, strongest shared boundary first ----
+    let mut resolved: Vec<((u32, u32), i32, u32)> = edges
+        .into_iter()
+        .filter_map(|(key, votes)| {
+            let total_support: u32 = votes.values().sum();
+            // Tied vote counts must resolve deterministically (HashMap
+            // iteration order varies per instance): prefer the smaller
+            // |fold|, then the smaller fold.
+            let (fold, support) = votes.into_iter().max_by_key(|(fold, count)| {
+                (
+                    *count,
+                    std::cmp::Reverse(fold.abs()),
+                    std::cmp::Reverse(*fold),
+                )
+            })?;
+            (support >= REGION_EDGE_MIN_SUPPORT).then_some((key, fold, total_support))
+        })
+        .collect();
+    // Strongest boundary first; tie-break on the (unique) region pair so the
+    // union order — and therefore the unfolded field — is reproducible.
+    resolved.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+
+    let mut dsu = FoldUnionFind::new(region_count);
+    for ((lo, hi), fold, _) in resolved {
+        dsu.union(lo, hi, fold);
+    }
+
+    // ---- 4. anchor each connected group so its largest region is unfolded ----
+    // For every group root, remember the offset of the biggest region in it.
+    let mut anchor_offset: std::collections::HashMap<u32, (u32, i32)> =
+        std::collections::HashMap::new();
+    for rid in 0..region_count as u32 {
+        let (root, off) = dsu.find(rid);
+        let size = region_size[rid as usize];
+        anchor_offset
+            .entry(root)
+            .and_modify(|(best_size, best_off)| {
+                if size > *best_size {
+                    *best_size = size;
+                    *best_off = off;
+                }
+            })
+            .or_insert((size, off));
+    }
+
+    // ---- 5. per-gate fold = (region offset) - (anchor offset of its group) ----
+    let mut region_fold = vec![0i32; region_count];
+    for rid in 0..region_count as u32 {
+        let (root, off) = dsu.find(rid);
+        let anchor = anchor_offset.get(&root).map(|(_, o)| *o).unwrap_or(0);
+        region_fold[rid as usize] = (off - anchor).clamp(-REGION_MAX_FOLD, REGION_MAX_FOLD);
+    }
+
+    // ---- 5b. external-reference checks (tilt-cascade engine only) ----
+    // Boundary votes lock RELATIVE folds, but each connected group's absolute
+    // branch — and any vote-graph misbranch — needs independent evidence.
+    // A clean reference from the (less aliased, higher Nyquist) tilt above
+    // supplies it: choose each group's branch against the reference, then
+    // re-test each region individually and override only when decisive.
+    if let Some(reference) = reference {
+        let mut row_trig = vec![(0.0f32, 0.0f32); rows];
+        for row in 0..rows {
+            let az = azimuths[row].to_radians();
+            row_trig[row] = (az.sin(), az.cos());
+        }
+        // Group branch: cost per (root, g) for g ∈ −2..=+2.
+        let mut group_cost: std::collections::HashMap<u32, ([f64; 5], u64, u64)> =
+            std::collections::HashMap::new();
+        for row in 0..rows {
+            let n = nyq[row];
+            if !n.is_finite() || n <= 0.0 {
+                continue;
+            }
+            let (sin_az, cos_az) = row_trig[row];
+            for gate in 0..gates {
+                let idx = row * gates + gate;
+                let rid = region_of[idx];
+                if rid == u32::MAX {
+                    continue;
+                }
+                let (root, off) = dsu.find(rid);
+                let entry = group_cost.entry(root).or_insert(([0.0; 5], 0, 0));
+                entry.2 += 1;
+                let Some(predicted) = reference.eval(sin_az, cos_az, gate) else {
+                    continue;
+                };
+                entry.1 += 1;
+                let v = observed[idx];
+                for (slot, g) in (-2i32..=2).enumerate() {
+                    let unfolded = v + (off + g) as f32 * 2.0 * n;
+                    entry.0[slot] += (unfolded - predicted).abs() as f64;
+                }
+            }
+        }
+        for (root, (costs, covered, total_gates)) in &group_cost {
+            if *total_gates == 0 || (*covered as f64) < 0.5 * *total_gates as f64 {
+                continue;
+            }
+            let (best_slot, _) = costs
+                .iter()
+                .enumerate()
+                .min_by(|a, b| a.1.total_cmp(b.1))
+                .expect("five branches");
+            let branch = best_slot as i32 - 2;
+            for rid in 0..region_count as u32 {
+                let (r, off) = dsu.find(rid);
+                if r == *root {
+                    region_fold[rid as usize] =
+                        (off + branch).clamp(-REGION_MAX_FOLD, REGION_MAX_FOLD);
+                }
+            }
+        }
+        // Per-region override: repairs vote-graph misbranches that survive
+        // group selection (a subgraph can be internally consistent yet wrong).
+        let mut cost = vec![[0.0f64; 3]; region_count];
+        let mut covered = vec![0u32; region_count];
+        for row in 0..rows {
+            let n = nyq[row];
+            if !n.is_finite() || n <= 0.0 {
+                continue;
+            }
+            let (sin_az, cos_az) = row_trig[row];
+            for gate in 0..gates {
+                let idx = row * gates + gate;
+                let rid = region_of[idx];
+                if rid == u32::MAX {
+                    continue;
+                }
+                let Some(predicted) = reference.eval(sin_az, cos_az, gate) else {
+                    continue;
+                };
+                let v = observed[idx];
+                let fold = region_fold[rid as usize];
+                covered[rid as usize] += 1;
+                for (slot, dg) in (-1i32..=1).enumerate() {
+                    let unfolded = v + (fold + dg) as f32 * 2.0 * n;
+                    cost[rid as usize][slot] += (unfolded - predicted).abs() as f64;
+                }
+            }
+        }
+        for rid in 0..region_count {
+            if (covered[rid] as f64) < 0.6 * region_size[rid] as f64 {
+                continue;
+            }
+            let current = cost[rid][1];
+            let (best_slot, best_cost) = cost[rid]
+                .iter()
+                .enumerate()
+                .min_by(|a, b| a.1.total_cmp(b.1))
+                .expect("three slots");
+            if best_slot != 1 && *best_cost < 0.6 * current {
+                let dg = best_slot as i32 - 1;
+                region_fold[rid] = (region_fold[rid] + dg).clamp(-REGION_MAX_FOLD, REGION_MAX_FOLD);
+            }
+        }
+    }
+
+    for idx in 0..total {
+        let rid = region_of[idx];
+        if rid != u32::MAX {
+            folds[idx] = region_fold[rid as usize];
+        }
+    }
+    folds
+}
+
+/// Remove isolated single-gate outliers from the unfolded field: a gate whose
+/// decoded velocity differs from the median of its finite 4-neighbours by more
+/// than a Nyquist is snapped toward that median (dual-PRF/processor speckle;
+/// Holleman & Beekhuis 2003, Altube et al. 2017).
+fn despeckle_dealiased_velocity(corrected: &mut [u16], nyq: &[f32], rows: usize, gates: usize) {
+    if rows < 3 || gates < 3 || corrected.len() != rows.saturating_mul(gates) {
+        return;
+    }
+    let snapshot = corrected.to_vec();
+    let decode = |raw: u16| decode_dealiased_velocity(raw);
+    #[allow(clippy::needless_range_loop)]
+    for row in 0..rows {
+        let n = nyq[row];
+        if !n.is_finite() {
+            continue;
+        }
+        for gate in 0..gates {
+            let idx = row * gates + gate;
+            let Some(v) = decode(snapshot[idx]) else {
+                continue;
+            };
+            let mut neigh = [0.0f32; 4];
+            let mut count = 0;
+            for (nr, ng) in [
+                (row.wrapping_sub(1), gate),
+                (row + 1, gate),
+                (row, gate.wrapping_sub(1)),
+                (row, gate + 1),
+            ] {
+                if nr >= rows || ng >= gates {
+                    continue;
+                }
+                if let Some(nv) = decode(snapshot[nr * gates + ng]) {
+                    neigh[count] = nv;
+                    count += 1;
+                }
+            }
+            if count < 3 {
+                continue;
+            }
+            let median = median_small_f32(&mut neigh, count);
+            if (v - median).abs() > n {
+                // collapse the outlier onto the nearest Nyquist multiple of the
+                // local consensus.
+                let fold = ((median - v) / (2.0 * n)).round();
+                corrected[idx] = encode_dealiased_velocity(v + 2.0 * n * fold);
+            }
+        }
+    }
+}
+
 const DEALIASED_VELOCITY_SCALE: f32 = 10.0;
 const DEALIASED_VELOCITY_OFFSET: f32 = 32_768.0;
 const DEALIASED_VELOCITY_NODATA: u16 = 0;
@@ -3064,6 +3569,13 @@ fn encode_dealiased_velocity(value: f32) -> u16 {
     (value * DEALIASED_VELOCITY_SCALE + DEALIASED_VELOCITY_OFFSET)
         .round()
         .clamp(1.0, u16::MAX as f32) as u16
+}
+
+fn decode_dealiased_velocity(raw: u16) -> Option<f32> {
+    if raw == DEALIASED_VELOCITY_NODATA {
+        return None;
+    }
+    Some((raw as f32 - DEALIASED_VELOCITY_OFFSET) / DEALIASED_VELOCITY_SCALE)
 }
 
 fn copy_scaled_velocity_row(source: &MomentGrid, row: usize, row_values: &mut [f32]) {
@@ -3109,9 +3621,29 @@ fn copy_scaled_velocity_row(source: &MomentGrid, row: usize, row_values: &mut [f
     }
 }
 
+fn median_nyquist_mps(cut: &ElevationCut, grid: &MomentGrid) -> Option<f32> {
+    let mut values = grid
+        .radial_indices
+        .iter()
+        .filter_map(|radial_index| cut.radials.get(*radial_index)?.nyquist_velocity_mps)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f32::total_cmp);
+    Some(values[values.len() / 2])
+}
+
 fn row_nyquist_mps(cut: &ElevationCut, grid: &MomentGrid, row: usize) -> Option<f32> {
     let radial_index = *grid.radial_indices.get(row)?;
     cut.radials.get(radial_index)?.nyquist_velocity_mps
+}
+
+fn median_small_f32(values: &mut [f32], count: usize) -> f32 {
+    debug_assert!(count > 0 && count <= values.len());
+    values[..count].sort_by(f32::total_cmp);
+    values[count / 2]
 }
 
 fn max_range_m(grid: &MomentGrid) -> f32 {
@@ -3565,10 +4097,10 @@ mod tests {
         }
 
         let corrected = dealias_velocity_grid(&cut, &grid);
-        for (g, value) in coherent.iter().enumerate() {
+        for g in 0..coherent.len() {
             assert_eq!(
                 corrected.scaled_value(5, g),
-                Some(*value),
+                Some(coherent[g]),
                 "coherent gate {g} should be untouched"
             );
         }
@@ -3831,9 +4363,9 @@ mod tests {
             radar_y_px: 108.5,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            max_range_km_sq: max_range_km * max_range_km,
             rot_sin: 0.0,
             rot_cos: 1.0,
-            max_range_km_sq: max_range_km * max_range_km,
         };
 
         for (x, y) in [(0, 0), (166, 108), (180, 110), (220, 70), (332, 216)] {
@@ -3901,9 +4433,9 @@ mod tests {
             radar_y_px: 48.0,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            max_range_km_sq: max_range_km * max_range_km,
             rot_sin: 0.0,
             rot_cos: 1.0,
-            max_range_km_sq: max_range_km * max_range_km,
         };
 
         for y in 0..96 {
