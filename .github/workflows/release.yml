@@ -80,6 +80,29 @@ jobs:
       - name: Build release binary
         run: cargo build --release -p app_ui --bin bowecho
 
+      # Signs bowecho.exe via Azure Trusted Signing when the secrets exist
+      # (docs/SIGNING.md) — silently skipped until then, so adding the
+      # secrets is the ONLY step needed to start shipping signed builds.
+      - name: Sign Windows binary (Azure Trusted Signing)
+        if: runner.os == 'Windows' && env.AZURE_TENANT_ID != ''
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
+          files-folder: target/release
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
       - name: Package Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
@@ -125,9 +148,9 @@ jobs:
             <key>CFBundlePackageType</key>
             <string>APPL</string>
             <key>CFBundleShortVersionString</key>
-            <string>0.3.1</string>
+            <string>0.4.0</string>
             <key>CFBundleVersion</key>
-            <string>0.3.1</string>
+            <string>0.4.0</string>
             <key>LSMinimumSystemVersion</key>
             <string>12.0</string>
             <key>NSHighResolutionCapable</key>

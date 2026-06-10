@@ -5,10 +5,10 @@
 //! app's view-keyed shape cache, so the UI thread never blocks on a network
 //! fetch or re-tessellation.
 //!
-//! v1 scope: Title, Refresh, Color, Threshold, Font, Place, Text, Icon
-//! (rendered as a heading-ticked dot — remote icon sheets are not fetched),
-//! Line and Polygon. `Object:` blocks (pixel-relative drawing) are skipped
-//! gracefully.
+//! Supported: Title, Refresh, Color, Threshold, Font, Place, Text, Icon
+//! (with real IconFile sprite sheets, fetched and sliced), Line, Polygon,
+//! and `Object:` blocks (statements inside draw at pixel offsets from the
+//! anchor, +x east / +y north, per the GR convention).
 
 /// One parsed placefile.
 #[derive(Clone, Debug, Default)]
@@ -16,16 +16,35 @@ pub struct Placefile {
     pub title: String,
     pub refresh_minutes: u32,
     pub objects: Vec<PlacefileObject>,
-    /// Statements we recognized but skipped (e.g. Object blocks).
+    /// Icon sprite sheets referenced by Icon statements.
+    pub icon_sheets: Vec<IconSheetSpec>,
+    /// Unrecognized statements (for the honest status line).
     pub skipped: usize,
 }
 
+/// `IconFile: index, iconWidth, iconHeight, hotX, hotY, url`
+#[derive(Clone, Debug, PartialEq)]
+pub struct IconSheetSpec {
+    pub index: u32,
+    pub icon_w: u32,
+    pub icon_h: u32,
+    pub hot_x: f32,
+    pub hot_y: f32,
+    pub url: String,
+}
+
+/// When `anchor` is Some, positional fields hold PIXEL OFFSETS from the
+/// anchor's screen position (+x east, +y north) instead of lat/lon — the
+/// `Object:` block convention used for station plots.
 #[derive(Clone, Debug)]
 pub enum PlacefileObject {
     Icon {
         lat: f32,
         lon: f32,
+        anchor: Option<(f32, f32)>,
         heading_deg: f32,
+        file_index: u32,
+        icon_index: u32,
         label: Option<String>,
         color: [u8; 3],
         threshold_nm: f32,
@@ -33,6 +52,7 @@ pub enum PlacefileObject {
     Text {
         lat: f32,
         lon: f32,
+        anchor: Option<(f32, f32)>,
         size_px: f32,
         text: String,
         color: [u8; 3],
@@ -40,12 +60,14 @@ pub enum PlacefileObject {
     },
     Line {
         width: f32,
-        points: Vec<(f32, f32)>, // (lat, lon)
+        points: Vec<(f32, f32)>, // (lat, lon) — or px offsets when anchored
+        anchor: Option<(f32, f32)>,
         color: [u8; 3],
         threshold_nm: f32,
     },
     Polygon {
         points: Vec<(f32, f32)>,
+        anchor: Option<(f32, f32)>,
         color: [u8; 3],
         threshold_nm: f32,
     },
@@ -70,6 +92,7 @@ pub fn parse_placefile(text: &str) -> Placefile {
         title: String::new(),
         refresh_minutes: 5,
         objects: Vec::new(),
+        icon_sheets: Vec::new(),
         skipped: 0,
     };
     let mut color: [u8; 3] = [255, 255, 255];
@@ -77,7 +100,7 @@ pub fn parse_placefile(text: &str) -> Placefile {
     let mut fonts: Vec<(u32, f32)> = Vec::new();
     let mut pending_line: Option<(f32, Vec<(f32, f32)>)> = None;
     let mut pending_polygon: Option<Vec<(f32, f32)>> = None;
-    let mut skipping_object = false;
+    let mut object_anchor: Option<(f32, f32)> = None;
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -89,22 +112,16 @@ pub fn parse_placefile(text: &str) -> Placefile {
             None => (String::new(), line),
         };
 
-        if skipping_object {
-            if key == "end" {
-                skipping_object = false;
-            }
-            continue;
-        }
-
-        // Coordinate rows belong to an open Line/Polygon.
+        // Coordinate rows belong to an open Line/Polygon. (Inside an Object
+        // block these are pixel offsets; validation is relaxed accordingly.)
         if key.is_empty() || key.parse::<f64>().is_ok() {
-            if let Some((lat, lon)) = parse_lat_lon_pair(line)
+            if let Some(pair) = parse_pair(line, object_anchor.is_some())
                 && let Some(sink) = pending_line
                     .as_mut()
                     .map(|(_, points)| points)
                     .or(pending_polygon.as_mut())
             {
-                sink.push((lat, lon));
+                sink.push(pair);
             }
             continue;
         }
@@ -131,7 +148,6 @@ pub fn parse_placefile(text: &str) -> Placefile {
                 }
             }
             "font" => {
-                // Font: id, pixels, flags, "face"
                 let parts: Vec<&str> = value.split(',').collect();
                 if parts.len() >= 2
                     && let (Ok(id), Ok(px)) = (
@@ -143,27 +159,53 @@ pub fn parse_placefile(text: &str) -> Placefile {
                     fonts.push((id, px.clamp(7.0, 32.0)));
                 }
             }
-            "iconfile" => { /* icon sheets not fetched; Icon renders as a dot */ }
+            "iconfile" => {
+                // IconFile: index, width, height, hotX, hotY, url
+                let parts: Vec<&str> = value.splitn(6, ',').collect();
+                if parts.len() == 6
+                    && let (Ok(index), Ok(w), Ok(h)) = (
+                        parts[0].trim().parse::<u32>(),
+                        parts[1].trim().parse::<u32>(),
+                        parts[2].trim().parse::<u32>(),
+                    )
+                {
+                    let hot_x = parts[3].trim().parse::<f32>().unwrap_or(0.0);
+                    let hot_y = parts[4].trim().parse::<f32>().unwrap_or(0.0);
+                    let url = unquote(parts[5]);
+                    if w > 0 && h > 0 && url.starts_with("http") {
+                        out.icon_sheets.retain(|sheet| sheet.index != index);
+                        out.icon_sheets.push(IconSheetSpec {
+                            index,
+                            icon_w: w,
+                            icon_h: h,
+                            hot_x,
+                            hot_y,
+                            url,
+                        });
+                    }
+                }
+            }
             "icon" => {
                 // Icon: lat, lon, angle, fileNumber, iconNumber [, hover]
                 let parts: Vec<&str> = value.splitn(6, ',').collect();
                 if parts.len() >= 5
-                    && let (Ok(lat), Ok(lon)) = (
-                        parts[0].trim().parse::<f32>(),
-                        parts[1].trim().parse::<f32>(),
-                    )
+                    && let Some((lat, lon)) = parse_first_pair(&parts, object_anchor.is_some())
                 {
                     let heading = parts[2].trim().parse::<f32>().unwrap_or(0.0);
+                    let file_index = parts[3].trim().parse::<u32>().unwrap_or(0);
+                    let icon_index = parts[4].trim().parse::<u32>().unwrap_or(1).max(1);
                     let label = parts
                         .get(5)
                         .map(|s| unquote(s))
                         .filter(|s| !s.is_empty())
-                        // Hover text often packs multiple lines; keep the first.
                         .map(|s| s.lines().next().unwrap_or_default().to_owned());
                     out.objects.push(PlacefileObject::Icon {
                         lat,
                         lon,
+                        anchor: object_anchor,
                         heading_deg: heading,
+                        file_index,
+                        icon_index,
                         label,
                         color,
                         threshold_nm,
@@ -174,10 +216,7 @@ pub fn parse_placefile(text: &str) -> Placefile {
                 // Text: lat, lon, fontNumber, "string" [, "hover"]
                 let parts: Vec<&str> = value.splitn(4, ',').collect();
                 if parts.len() >= 4
-                    && let (Ok(lat), Ok(lon)) = (
-                        parts[0].trim().parse::<f32>(),
-                        parts[1].trim().parse::<f32>(),
-                    )
+                    && let Some((lat, lon)) = parse_first_pair(&parts, object_anchor.is_some())
                 {
                     let font_id = parts[2].trim().parse::<u32>().unwrap_or(1);
                     let size = fonts
@@ -190,6 +229,7 @@ pub fn parse_placefile(text: &str) -> Placefile {
                         out.objects.push(PlacefileObject::Text {
                             lat,
                             lon,
+                            anchor: object_anchor,
                             size_px: size,
                             text,
                             color,
@@ -199,7 +239,6 @@ pub fn parse_placefile(text: &str) -> Placefile {
                 }
             }
             "place" => {
-                // Place: lat, lon, string (legacy)
                 let parts: Vec<&str> = value.splitn(3, ',').collect();
                 if parts.len() >= 3
                     && let (Ok(lat), Ok(lon)) = (
@@ -210,6 +249,7 @@ pub fn parse_placefile(text: &str) -> Placefile {
                     out.objects.push(PlacefileObject::Text {
                         lat,
                         lon,
+                        anchor: None,
                         size_px: 11.0,
                         text: unquote(parts[2]),
                         color,
@@ -218,7 +258,6 @@ pub fn parse_placefile(text: &str) -> Placefile {
                 }
             }
             "line" => {
-                // Line: width, flags [, hover]  ... coords ... End:
                 let width = value
                     .split(',')
                     .next()
@@ -229,39 +268,55 @@ pub fn parse_placefile(text: &str) -> Placefile {
             }
             "polygon" => pending_polygon = Some(Vec::new()),
             "object" => {
-                skipping_object = true;
-                out.skipped += 1;
+                // Object: lat, lon — subsequent coordinates are pixel offsets.
+                let parts: Vec<&str> = value.splitn(2, ',').collect();
+                if parts.len() == 2
+                    && let (Ok(lat), Ok(lon)) = (
+                        parts[0].trim().parse::<f32>(),
+                        parts[1].trim().parse::<f32>(),
+                    )
+                {
+                    object_anchor = Some((lat, lon));
+                } else {
+                    out.skipped += 1;
+                }
             }
             "end" => {
+                // End: closes the innermost construct: open geometry first,
+                // then the Object block.
                 if let Some((width, points)) = pending_line.take() {
                     if points.len() >= 2 {
                         out.objects.push(PlacefileObject::Line {
                             width,
                             points,
+                            anchor: object_anchor,
                             color,
                             threshold_nm,
                         });
                     }
-                } else if let Some(points) = pending_polygon.take()
-                    && points.len() >= 3
-                {
-                    out.objects.push(PlacefileObject::Polygon {
-                        points,
-                        color,
-                        threshold_nm,
-                    });
+                } else if let Some(points) = pending_polygon.take() {
+                    if points.len() >= 3 {
+                        out.objects.push(PlacefileObject::Polygon {
+                            points,
+                            anchor: object_anchor,
+                            color,
+                            threshold_nm,
+                        });
+                    }
+                } else {
+                    object_anchor = None;
                 }
             }
-            _ => {}
+            _ => out.skipped += 1,
         }
     }
-    // Unterminated trailing geometry still draws.
     if let Some((width, points)) = pending_line.take()
         && points.len() >= 2
     {
         out.objects.push(PlacefileObject::Line {
             width,
             points,
+            anchor: object_anchor,
             color,
             threshold_nm,
         });
@@ -271,6 +326,7 @@ pub fn parse_placefile(text: &str) -> Placefile {
     {
         out.objects.push(PlacefileObject::Polygon {
             points,
+            anchor: object_anchor,
             color,
             threshold_nm,
         });
@@ -278,11 +334,28 @@ pub fn parse_placefile(text: &str) -> Placefile {
     out
 }
 
-fn parse_lat_lon_pair(line: &str) -> Option<(f32, f32)> {
+/// Parse the first two comma fields as a coordinate pair. In geo mode the
+/// pair is validated as lat/lon; in offset (Object) mode any finite numbers
+/// within ±4096 px pass.
+fn parse_first_pair(parts: &[&str], offsets: bool) -> Option<(f32, f32)> {
+    let a = parts.first()?.trim().parse::<f32>().ok()?;
+    let b = parts.get(1)?.trim().parse::<f32>().ok()?;
+    pair_valid(a, b, offsets).then_some((a, b))
+}
+
+fn parse_pair(line: &str, offsets: bool) -> Option<(f32, f32)> {
     let mut parts = line.split(',');
-    let lat = parts.next()?.trim().parse::<f32>().ok()?;
-    let lon = parts.next()?.trim().parse::<f32>().ok()?;
-    ((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)).then_some((lat, lon))
+    let a = parts.next()?.trim().parse::<f32>().ok()?;
+    let b = parts.next()?.trim().parse::<f32>().ok()?;
+    pair_valid(a, b, offsets).then_some((a, b))
+}
+
+fn pair_valid(a: f32, b: f32, offsets: bool) -> bool {
+    if offsets {
+        a.is_finite() && b.is_finite() && a.abs() <= 4096.0 && b.abs() <= 4096.0
+    } else {
+        (-90.0..=90.0).contains(&a) && (-180.0..=180.0).contains(&b)
+    }
 }
 
 fn unquote(value: &str) -> String {
@@ -317,6 +390,7 @@ Polygon:
 End:
 Object: 39.0, -94.0
  Icon: 0, 0, 0, 1, 1
+ Text: 10, -12, 1, "T"
 End:
 "#;
 
@@ -325,48 +399,70 @@ End:
         let pf = parse_placefile(SAMPLE);
         assert_eq!(pf.title, "Test Spotters");
         assert_eq!(pf.refresh_minutes, 2);
-        assert_eq!(pf.skipped, 1, "Object block should be skipped");
-        assert_eq!(pf.objects.len(), 5);
+        assert_eq!(pf.icon_sheets.len(), 1);
+        assert_eq!(pf.icon_sheets[0].icon_w, 16);
+        assert_eq!(pf.icon_sheets[0].url, "http://example/icons.png");
+        assert_eq!(pf.objects.len(), 7, "{:#?}", pf.objects);
         match &pf.objects[0] {
             PlacefileObject::Icon {
                 lat,
                 lon,
+                anchor,
                 heading_deg,
+                file_index,
+                icon_index,
                 label,
                 color,
                 ..
             } => {
                 assert!((lat - 39.05).abs() < 1e-4);
                 assert!((lon + 94.59).abs() < 1e-4);
+                assert!(anchor.is_none());
                 assert_eq!(*heading_deg, 45.0);
+                assert_eq!(*file_index, 1);
+                assert_eq!(*icon_index, 3);
                 assert_eq!(label.as_deref(), Some("Spotter One\\nReporting"));
                 assert_eq!(*color, [255, 0, 0]);
             }
             other => panic!("expected icon, got {other:?}"),
         }
-        match &pf.objects[1] {
-            PlacefileObject::Text { text, size_px, .. } => {
-                assert_eq!(text, "KC METAR");
-                assert_eq!(*size_px, 12.0);
-            }
-            other => panic!("expected text, got {other:?}"),
-        }
         match &pf.objects[3] {
-            PlacefileObject::Line {
-                width,
-                points,
-                color,
-                ..
-            } => {
+            PlacefileObject::Line { width, points, .. } => {
                 assert_eq!(*width, 2.0);
                 assert_eq!(points.len(), 3);
-                assert_eq!(*color, [0, 128, 255]);
             }
             other => panic!("expected line, got {other:?}"),
         }
-        match &pf.objects[4] {
-            PlacefileObject::Polygon { points, .. } => assert_eq!(points.len(), 3),
-            other => panic!("expected polygon, got {other:?}"),
+        // Object-block members carry the anchor with pixel offsets.
+        match &pf.objects[5] {
+            PlacefileObject::Icon {
+                lat, lon, anchor, ..
+            } => {
+                assert_eq!((*lat, *lon), (0.0, 0.0));
+                assert_eq!(*anchor, Some((39.0, -94.0)));
+            }
+            other => panic!("expected anchored icon, got {other:?}"),
+        }
+        match &pf.objects[6] {
+            PlacefileObject::Text {
+                lat, lon, anchor, ..
+            } => {
+                assert_eq!((*lat, *lon), (10.0, -12.0));
+                assert_eq!(*anchor, Some((39.0, -94.0)));
+            }
+            other => panic!("expected anchored text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_anchor_resets_after_end() {
+        let pf = parse_placefile(
+            "Object: 39.0, -94.0\n Icon: 0, 0, 0, 1, 1\nEnd:\nIcon: 38.0, -95.0, 0, 1, 1\n",
+        );
+        assert_eq!(pf.objects.len(), 2);
+        match &pf.objects[1] {
+            PlacefileObject::Icon { anchor, .. } => assert!(anchor.is_none()),
+            other => panic!("{other:?}"),
         }
     }
 

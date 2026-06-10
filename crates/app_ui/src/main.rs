@@ -14,9 +14,9 @@ use render2d::{
     ECHO_TOP_THRESHOLD_DBZ, StormCell, StormMotion, StormRelativePaletteCache, ViewportMomentCache,
     ViewportRasterOptions, ViewportSampleCache, VolumeDealiasCache, azimuthal_shear_grid,
     color_family_for_moment, composite_reflectivity_grid, dealias_velocity_grid,
-    detect_rotation_sites, echo_top_grid, identify_storm_cells, mehs_grid, radial_divergence_grid,
-    reflectivity_cross_section, smooth_moment_grid, storm_relative_velocity_mps,
-    velocity_cross_section_cached, viewport_rgba_buffer_len,
+    dealias_velocity_grid_cascade, detect_rotation_sites, echo_top_grid, identify_storm_cells,
+    mehs_grid, radial_divergence_grid, reflectivity_cross_section, smooth_moment_grid,
+    storm_relative_velocity_mps, velocity_cross_section_cached, viewport_rgba_buffer_len,
     viewport_sample_cache_storage_upper_bound, vil_density_grid, vil_grid,
 };
 use serde::Deserialize;
@@ -316,6 +316,10 @@ struct ViewerApp {
     selected_product: DisplayProduct,
     frame_history: Vec<FrameHistoryEntry>,
     selected_frame_index: usize,
+    /// Latched while the user is examining an OLDER frame: live loads keep
+    /// backfilling but never steal the selection back to the newest frame.
+    /// Cleared by clicking the newest frame, looping, or loading a new site.
+    browsing_history: bool,
     history_frame_limit: usize,
     history_playing: bool,
     last_history_step: Option<Instant>,
@@ -376,6 +380,10 @@ struct ViewerApp {
     rotation_markers_volume_ptr: usize,
     rotation_receiver: Option<mpsc::Receiver<(usize, Vec<RotationMarker>)>>,
     show_rotation_markers: bool,
+    /// Velocity dealias engine: false = region (default, proven), true =
+    /// tilt-cascade (vertical-reference branch selection; helps on VCPs whose
+    /// upper tilts are unaliased — see docs/dealias-fold-branch-analysis.md).
+    dealias_cascade: bool,
     /// GR2-style display smoothing (polar-grid binomial kernel, worker-side,
     /// cached). Off by default — native super-res is the app's identity.
     display_smoothing: bool,
@@ -1160,6 +1168,10 @@ struct RotationMarker {
     /// 3D strength rank (Stumpf et al. 1998 scale).
     rank: u8,
     strength: render2d::RotationStrength,
+    /// Volumes in a row this circulation has been detected (time association,
+    /// Stumpf 1998 §3d): a first-seen meso-strength couplet displays as CPLT
+    /// and is promoted to MESO once seen on consecutive volumes.
+    persistence: u8,
 }
 
 /// An extra synchronized view pane in the multi-pane grid. Pane 0 is the
@@ -1209,6 +1221,8 @@ struct RenderRequest {
     /// Display smoothing: the worker smooths the polar grid once (cached) and
     /// renders it through the unchanged fast path.
     smoothed: bool,
+    /// Velocity dealias engine (false = region, true = tilt-cascade).
+    dealias_cascade: bool,
     viewport_options: ViewportRasterOptions,
     radar_range_km: f32,
 }
@@ -1410,6 +1424,7 @@ struct RenderWorkerMomentCache {
     dealiased_velocity: bool,
     derived: Option<DerivedProduct>,
     smoothed: bool,
+    dealias_cascade: bool,
     color_table_signature: u64,
     cache: ViewportMomentCache,
     storm_palette_cache: Option<RenderWorkerStormPaletteCache>,
@@ -1588,6 +1603,7 @@ struct RenderWorkerViewportSignature {
     storm_motion_key: (i16, i16),
     hail_levels_key: (i16, i16),
     smoothed: bool,
+    dealias_cascade: bool,
     viewport: ViewportKey,
 }
 
@@ -1603,6 +1619,7 @@ impl RenderWorkerViewportSignature {
         storm_motion_key: (i16, i16),
         hail_levels_key: (i16, i16),
         smoothed: bool,
+        dealias_cascade: bool,
         viewport: ViewportKey,
     ) -> Self {
         Self {
@@ -1615,6 +1632,7 @@ impl RenderWorkerViewportSignature {
             storm_motion_key,
             hail_levels_key,
             smoothed,
+            dealias_cascade,
             viewport,
         }
     }
@@ -1711,6 +1729,7 @@ fn spawn_render_worker_with_mode(
                 request.key.storm_motion_key,
                 request.key.hail_levels_key,
                 request.key.smoothed,
+                request.key.dealias_cascade,
                 request.key.viewport,
             );
             while let Ok(recycled) = recycle_receiver.try_recv() {
@@ -2061,6 +2080,7 @@ impl ViewerApp {
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
             frame_history: Vec::new(),
             selected_frame_index: 0,
+            browsing_history: false,
             history_frame_limit: DEFAULT_HISTORY_FRAME_LIMIT,
             history_playing: false,
             last_history_step: None,
@@ -2115,6 +2135,7 @@ impl ViewerApp {
             rotation_markers_volume_ptr: 0,
             rotation_receiver: None,
             show_rotation_markers: true,
+            dealias_cascade: false,
             display_smoothing: false,
             hail_freezing_level_km: 3.2,
             hail_minus20_level_km: 6.4,
@@ -2459,6 +2480,7 @@ impl ViewerApp {
         self.frame_history.clear();
         self.selected_frame_index = 0;
         self.history_playing = false;
+        self.browsing_history = false;
         self.last_history_step = None;
     }
 
@@ -2509,7 +2531,8 @@ impl ViewerApp {
             .sort_by(|left, right| left.identity.cmp(&right.identity));
         self.trim_frame_history();
 
-        let should_select_loaded_frame = select_loaded_frame && !self.history_playing;
+        let should_select_loaded_frame =
+            select_loaded_frame && !self.history_playing && !self.browsing_history;
         if should_select_loaded_frame {
             let next_index = self
                 .frame_history
@@ -3506,6 +3529,7 @@ impl ViewerApp {
             storm_motion_key: self.storm_motion_key(),
             hail_levels_key: self.hail_levels_key(),
             smoothed,
+            dealias_cascade: self.dealias_cascade,
             viewport: viewport_key,
         };
         if self.texture_key.as_ref() == Some(&key) {
@@ -3529,6 +3553,7 @@ impl ViewerApp {
                 storm_motion: self.current_storm_motion(),
                 hail_levels_m: self.hail_levels_m(),
                 smoothed,
+                dealias_cascade: self.dealias_cascade,
                 viewport_options,
                 radar_range_km: self
                     .selected_grid_range_km()
@@ -3623,6 +3648,7 @@ impl ViewerApp {
                 storm_motion_key: self.storm_motion_key(),
                 hail_levels_key: self.hail_levels_key(),
                 smoothed,
+                dealias_cascade: self.dealias_cascade,
                 viewport: viewport_key,
             };
             if layer.texture_key.as_ref() == Some(&key)
@@ -3646,6 +3672,7 @@ impl ViewerApp {
                     storm_motion: self.current_storm_motion(),
                     hail_levels_m: self.hail_levels_m(),
                     smoothed,
+                    dealias_cascade: self.dealias_cascade,
                     viewport_options,
                     radar_range_km,
                 },
@@ -3753,6 +3780,7 @@ impl ViewerApp {
             dealiased_velocity,
             derived,
             request.smoothed,
+            request.dealias_cascade,
             color_table_signature,
         )
         .is_none()
@@ -3777,6 +3805,26 @@ impl ViewerApp {
                     dealiased_velocity,
                     &request.color_tables,
                 )
+            } else if dealiased_velocity && request.dealias_cascade {
+                // Tilt-cascade engine: dealias top-down with the upper tilt's
+                // wind fit as the branch reference, then render the grid via
+                // the derived-cache entry (Velocity palette).
+                dealias_velocity_grid_cascade(request.volume.as_ref(), request.cut)
+                    .ok_or_else(|| "cascade dealias failed".to_owned())
+                    .and_then(|grid| {
+                        ViewportMomentCache::new_derived(
+                            request.volume.as_ref(),
+                            request.cut,
+                            if request.smoothed {
+                                smooth_moment_grid(&grid)
+                            } else {
+                                grid
+                            },
+                            ColorTableFamily::Velocity,
+                            &request.color_tables,
+                        )
+                        .map_err(|err| err.to_string())
+                    })
             } else if dealiased_velocity {
                 ViewportMomentCache::new_dealiased_velocity_with_color_tables(
                     request.volume.as_ref(),
@@ -3803,6 +3851,7 @@ impl ViewerApp {
                     dealiased_velocity,
                     derived,
                     smoothed: request.smoothed,
+                    dealias_cascade: request.dealias_cascade,
                     color_table_signature,
                     cache,
                     storm_palette_cache: None,
@@ -3823,6 +3872,7 @@ impl ViewerApp {
             request.key.storm_motion_key,
             request.key.hail_levels_key,
             request.key.smoothed,
+            request.key.dealias_cascade,
             request.key.viewport,
         );
         let sample_cache_signature = RenderWorkerSampleCacheSignature::new(
@@ -4031,6 +4081,7 @@ impl ViewerApp {
             request.key.storm_motion_key,
             request.key.hail_levels_key,
             request.key.smoothed,
+            request.key.dealias_cascade,
             request.key.viewport,
         );
         let sample_cache_signature = RenderWorkerSampleCacheSignature::new(
@@ -4052,6 +4103,7 @@ impl ViewerApp {
             request.render_dealiased_velocity,
             request.product.derived(),
             request.key.smoothed,
+            request.key.dealias_cascade,
             viewport_signature.color_table_signature,
         ) else {
             return;
@@ -4115,6 +4167,7 @@ impl ViewerApp {
             velocity_render_dealiased,
             None,
             false,
+            false,
             velocity_color_table_signature,
         )
         .is_none()
@@ -4146,6 +4199,7 @@ impl ViewerApp {
                     dealiased_velocity: velocity_render_dealiased,
                     derived: None,
                     smoothed: false,
+                    dealias_cascade: false,
                     color_table_signature: velocity_color_table_signature,
                     cache,
                     storm_palette_cache: None,
@@ -4174,6 +4228,7 @@ impl ViewerApp {
             &MomentType::Velocity,
             velocity_render_dealiased,
             None,
+            false,
             false,
             velocity_color_table_signature,
         ) else {
@@ -4211,6 +4266,7 @@ impl ViewerApp {
         dealiased_velocity: bool,
         derived: Option<DerivedProduct>,
         smoothed: bool,
+        dealias_cascade: bool,
         color_table_signature: u64,
     ) -> Option<usize> {
         let index = moment_caches.iter().position(|cached| {
@@ -4220,6 +4276,7 @@ impl ViewerApp {
                 && cached.dealiased_velocity == dealiased_velocity
                 && cached.derived == derived
                 && cached.smoothed == smoothed
+                && cached.dealias_cascade == dealias_cascade
                 && cached.color_table_signature == color_table_signature
         })?;
         let cached = moment_caches.remove(index);
@@ -4239,6 +4296,7 @@ impl ViewerApp {
                 || cached.dealiased_velocity != cache.dealiased_velocity
                 || cached.derived != cache.derived
                 || cached.smoothed != cache.smoothed
+                || cached.dealias_cascade != cache.dealias_cascade
         });
         moment_caches.push(cache);
         while moment_caches.len() > cache_policy.moment_cache_capacity() {
@@ -4527,6 +4585,7 @@ impl ViewerApp {
             storm_motion_key: self.storm_motion_key(),
             hail_levels_key: self.hail_levels_key(),
             smoothed,
+            dealias_cascade: self.dealias_cascade,
             viewport: viewport_key,
         };
         {
@@ -4553,6 +4612,7 @@ impl ViewerApp {
             storm_motion: self.current_storm_motion(),
             hail_levels_m: self.hail_levels_m(),
             smoothed,
+            dealias_cascade: self.dealias_cascade,
             viewport_options,
             radar_range_km,
         };
@@ -4594,10 +4654,12 @@ impl ViewerApp {
                 .as_ref()
                 .map(|key| self.radar_texture_rect(ctx, rect, latitude_deg, longitude_deg, key))
                 .unwrap_or(rect);
-            painter.image(
+            paint_rotated_image(
+                painter,
                 texture.id(),
                 image_rect,
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                self.lon_lat_to_screen(rect, longitude_deg, latitude_deg),
+                self.aeqd_north_angle(rect, latitude_deg, longitude_deg),
                 egui::Color32::WHITE,
             );
         }
@@ -4625,9 +4687,10 @@ impl ViewerApp {
         let radar_position = self.lon_lat_to_screen(rect, radar_lon, radar_lat);
         let radar_x_px = (radar_position.x - rect.left()) * pixels_per_point;
         let radar_y_px = (radar_position.y - rect.top()) * pixels_per_point;
+        // The AEQD screen frame is isotropic: true kilometres per pixel on
+        // both axes (the old equirect frame needed a cos-latitude ratio).
         let km_per_px_y = 111.32 / (self.map_scale * pixels_per_point);
-        let km_per_px_x = 111.32 * radar_lat.to_radians().cos().abs().max(0.02)
-            / (self.map_scale * self.lon_screen_scale() * pixels_per_point);
+        let km_per_px_x = km_per_px_y;
         let options = ViewportRasterOptions {
             width,
             height,
@@ -5207,6 +5270,36 @@ impl ViewerApp {
                 self.selected_product,
                 DisplayProduct::Moment(MomentType::Velocity)
             ) {
+                let mut engine_changed = false;
+                if self.unfold_velocity_display {
+                    egui::ComboBox::from_id_salt("dealias_engine")
+                        .selected_text(if self.dealias_cascade {
+                            "Cascade (beta)"
+                        } else {
+                            "Region"
+                        })
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            engine_changed |= ui
+                                .selectable_value(&mut self.dealias_cascade, false, "Region")
+                                .on_hover_text("Region-based unfolding (default, proven)")
+                                .changed();
+                            engine_changed |= ui
+                                .selectable_value(
+                                    &mut self.dealias_cascade,
+                                    true,
+                                    "Cascade (beta)",
+                                )
+                                .on_hover_text(
+                                    "Tilt-cascade: dealias top-down, each tilt branch-checked against the wind fit from the (less aliased) tilt above. Helps on VCPs with high-Nyquist upper tilts; see docs/dealias-fold-branch-analysis.md.",
+                                )
+                                .changed();
+                        });
+                }
+                if engine_changed {
+                    self.clear_texture();
+                    ctx.request_repaint();
+                }
                 let changed = ui
                     .checkbox(&mut self.unfold_velocity_display, "Unfold VEL")
                     .on_hover_text(
@@ -5583,6 +5676,12 @@ impl ViewerApp {
                 .clicked()
             {
                 self.history_playing = !self.history_playing;
+                if self.history_playing {
+                    self.browsing_history = false;
+                } else {
+                    self.browsing_history =
+                        self.selected_frame_index + 1 < self.frame_history.len();
+                }
                 self.last_history_step = Some(Instant::now());
                 ctx.request_repaint_after(Duration::from_millis(HISTORY_LOOP_FRAME_MS));
             }
@@ -5638,6 +5737,9 @@ impl ViewerApp {
         if let Some(index) = next_frame_index {
             self.history_playing = false;
             self.select_history_frame(index, false, ctx);
+            // Clicking an older frame latches browse mode (live loads no
+            // longer steal the selection); clicking the newest releases it.
+            self.browsing_history = index + 1 < self.frame_history.len();
         }
     }
 
@@ -6522,6 +6624,7 @@ impl ViewerApp {
         self.draw_loaded_volume_marker(painter, rect);
         self.draw_colorbar(painter, rect);
         self.draw_mode_chip(painter, rect);
+        self.draw_raw_velocity_tag(painter, rect);
         self.draw_cross_section_line(painter, rect, response.hover_pos());
         self.draw_cursor_inspector(painter, rect, response.hover_pos());
 
@@ -6551,6 +6654,7 @@ impl ViewerApp {
         let ctx = ui.ctx().clone();
         let frame_start = Instant::now();
         let mut hovered_readout = None;
+        let mut hovered_cell: Option<usize> = None;
         let mut hovers: Vec<Option<egui::Pos2>> = Vec::with_capacity(cells.len());
 
         // Interaction pass: settle pan/zoom/clicks for EVERY cell first, so
@@ -6593,12 +6697,22 @@ impl ViewerApp {
                     }
                     self.clamp_map_center();
                 }
-                // The hover readout samples the PRIMARY product's data, so it
-                // is only honest over the primary pane.
-                if cell_index == 0 {
-                    hovered_readout = ui
-                        .input(|input| input.pointer.hover_pos())
-                        .and_then(|position| self.cursor_readout_at(cell, position));
+                // Each pane reports ITS OWN product/tilt under the cursor.
+                if let Some(position) = ui.input(|input| input.pointer.hover_pos()) {
+                    hovered_readout = if cell_index == 0 {
+                        self.cursor_readout_at(cell, position)
+                    } else if let Some(pane) = self.extra_panes.get(cell_index - 1) {
+                        let product = pane.product.clone();
+                        let preferred = pane.cut.unwrap_or(self.selected_cut);
+                        let cut = self
+                            .volume
+                            .as_deref()
+                            .and_then(|v| best_cut_for_product(v, preferred, &product));
+                        cut.and_then(|cut| self.cursor_readout_for(cell, position, &product, cut))
+                    } else {
+                        None
+                    };
+                    hovered_cell = Some(cell_index);
                 }
             }
 
@@ -6737,6 +6851,7 @@ impl ViewerApp {
             if cell_index == 0 {
                 self.draw_colorbar(&cell_painter, cell);
                 self.draw_mode_chip(&cell_painter, cell);
+                self.draw_raw_velocity_tag(&cell_painter, cell);
             } else if self.extra_panes[cell_index - 1].texture.is_some() {
                 // Each pane gets a legend for ITS product.
                 self.draw_colorbar_for_product(&cell_painter, cell, &fill_product);
@@ -6748,8 +6863,16 @@ impl ViewerApp {
             );
             if cell_index > 0 {
                 self.pane_product_chip(ui, &cell_painter, cell, cell_index);
-            } else {
-                self.draw_cursor_inspector(&cell_painter, cell, hovers.first().copied().flatten());
+            }
+            // The inspector card follows the hovered pane (its readout now
+            // reflects that pane's product); the pinned card stays geo-true.
+            let inspector_cell = hovered_cell.unwrap_or(0);
+            if cell_index == inspector_cell {
+                self.draw_cursor_inspector(
+                    &cell_painter,
+                    cell,
+                    hovers.get(cell_index).copied().flatten(),
+                );
             }
 
             // Cell separator border (four segments — avoids StrokeKind churn);
@@ -6852,6 +6975,39 @@ impl ViewerApp {
                                 u64::from(placefile.refresh_minutes.clamp(1, 60)) * 60,
                             ),
                         );
+                        // Fetch any icon sheets we don't already have (cap 4).
+                        let missing: Vec<placefiles::IconSheetSpec> = placefile
+                            .icon_sheets
+                            .iter()
+                            .filter(|spec| !slot.sheets.iter().any(|s| s.spec == **spec))
+                            .take(4)
+                            .cloned()
+                            .collect();
+                        if !missing.is_empty() && slot.sheets_receiver.is_none() {
+                            let (tx, rx) = mpsc::channel();
+                            slot.sheets_receiver = Some(rx);
+                            let ctx_clone = ctx.clone();
+                            thread::spawn(move || {
+                                let mut decoded = Vec::new();
+                                for spec in missing {
+                                    let Ok(bytes) = data_source::fetch_bytes(&spec.url) else {
+                                        continue;
+                                    };
+                                    let Ok(img) = image::load_from_memory(&bytes) else {
+                                        continue;
+                                    };
+                                    let rgba = img.to_rgba8();
+                                    decoded.push((
+                                        spec.index,
+                                        rgba.width(),
+                                        rgba.height(),
+                                        rgba.into_raw(),
+                                    ));
+                                }
+                                let _ = tx.send(decoded);
+                                ctx_clone.request_repaint();
+                            });
+                        }
                         slot.status = format!(
                             "{} object(s){}",
                             placefile.objects.len(),
@@ -6877,6 +7033,44 @@ impl ViewerApp {
                     }
                 }
                 continue;
+            }
+            if let Some(rx) = &slot.sheets_receiver {
+                match rx.try_recv() {
+                    Ok(decoded) => {
+                        slot.sheets_receiver = None;
+                        if let Some(placefile) = &slot.data {
+                            for (index, w, h, rgba) in decoded {
+                                let Some(spec) = placefile
+                                    .icon_sheets
+                                    .iter()
+                                    .find(|s| s.index == index)
+                                    .cloned()
+                                else {
+                                    continue;
+                                };
+                                let image = egui::ColorImage::from_rgba_unmultiplied(
+                                    [w as usize, h as usize],
+                                    &rgba,
+                                );
+                                let texture = ctx.load_texture(
+                                    format!("placefile-sheet-{index}"),
+                                    image,
+                                    egui::TextureOptions::LINEAR,
+                                );
+                                slot.sheets.retain(|s| s.spec.index != index);
+                                slot.sheets.push(PlacefileSheet {
+                                    spec,
+                                    size: (w, h),
+                                    texture,
+                                });
+                            }
+                            slot.generation = slot.generation.wrapping_add(1);
+                            ctx.request_repaint();
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => slot.sheets_receiver = None,
+                }
             }
             if !slot.enabled {
                 continue;
@@ -6938,7 +7132,7 @@ impl ViewerApp {
             let key = hasher.finish();
             let mut cache = self.placefile_shape_cache.borrow_mut();
             let built = cache.get_or_insert_with(key, || {
-                self.build_placefile_draw_list(placefile, rect, viewport_nm)
+                self.build_placefile_draw_list(placefile, &slot.sheets, rect, viewport_nm)
             });
             painter.extend(built.shapes.iter().cloned());
             for (position, text, size, color) in &built.labels {
@@ -6958,6 +7152,7 @@ impl ViewerApp {
     fn build_placefile_draw_list(
         &self,
         placefile: &placefiles::Placefile,
+        sheets: &[PlacefileSheet],
         rect: egui::Rect,
         viewport_nm: f32,
     ) -> PlacefileDrawList {
@@ -6966,6 +7161,17 @@ impl ViewerApp {
             labels: Vec::new(),
         };
         let visible = rect.expand(24.0);
+        // Resolve a (lat, lon) or — inside an Object block — a pixel offset
+        // from the anchor (+x east, +y north per the GR convention).
+        let resolve = |lat: f32, lon: f32, anchor: Option<(f32, f32)>| -> egui::Pos2 {
+            match anchor {
+                Some((alat, alon)) => {
+                    let base = self.lon_lat_to_screen(rect, alon, alat);
+                    base + egui::vec2(lat, -lon) // fields hold (x, y) offsets
+                }
+                None => self.lon_lat_to_screen(rect, lon, lat),
+            }
+        };
         for object in &placefile.objects {
             if viewport_nm > object.threshold_nm() {
                 continue;
@@ -6974,35 +7180,46 @@ impl ViewerApp {
                 placefiles::PlacefileObject::Icon {
                     lat,
                     lon,
+                    anchor,
                     heading_deg,
+                    file_index,
+                    icon_index,
                     label,
                     color,
                     ..
                 } => {
-                    let position = self.lon_lat_to_screen(rect, *lon, *lat);
+                    let position = resolve(*lat, *lon, *anchor);
                     if !visible.contains(position) {
                         continue;
                     }
-                    let fill = egui::Color32::from_rgb(color[0], color[1], color[2]);
-                    out.shapes
-                        .push(egui::Shape::circle_filled(position, 4.5, fill));
-                    out.shapes.push(egui::Shape::circle_stroke(
-                        position,
-                        4.5,
-                        egui::Stroke::new(1.0, egui::Color32::BLACK),
-                    ));
-                    // Heading tick (0 = north, clockwise).
-                    let angle = heading_deg.to_radians();
-                    let direction = egui::vec2(angle.sin(), -angle.cos());
-                    out.shapes.push(egui::Shape::line_segment(
-                        [position + direction * 5.0, position + direction * 11.0],
-                        egui::Stroke::new(2.0, fill),
-                    ));
+                    let sheet = sheets.iter().find(|s| s.spec.index == *file_index);
+                    if let Some(sheet) = sheet
+                        && let Some(shape) =
+                            icon_sprite_shape(sheet, *icon_index, position, *heading_deg)
+                    {
+                        out.shapes.push(shape);
+                    } else {
+                        // Fallback: colored dot + heading tick.
+                        let fill = egui::Color32::from_rgb(color[0], color[1], color[2]);
+                        out.shapes
+                            .push(egui::Shape::circle_filled(position, 4.5, fill));
+                        out.shapes.push(egui::Shape::circle_stroke(
+                            position,
+                            4.5,
+                            egui::Stroke::new(1.0, egui::Color32::BLACK),
+                        ));
+                        let angle = heading_deg.to_radians();
+                        let direction = egui::vec2(angle.sin(), -angle.cos());
+                        out.shapes.push(egui::Shape::line_segment(
+                            [position + direction * 5.0, position + direction * 11.0],
+                            egui::Stroke::new(2.0, fill),
+                        ));
+                    }
                     if let Some(label) = label
                         && self.map_scale >= 150.0
                     {
                         out.labels.push((
-                            position + egui::vec2(0.0, -8.0),
+                            position + egui::vec2(0.0, -10.0),
                             label.clone(),
                             10.0,
                             egui::Color32::from_rgb(230, 235, 240),
@@ -7012,12 +7229,13 @@ impl ViewerApp {
                 placefiles::PlacefileObject::Text {
                     lat,
                     lon,
+                    anchor,
                     size_px,
                     text,
                     color,
                     ..
                 } => {
-                    let position = self.lon_lat_to_screen(rect, *lon, *lat);
+                    let position = resolve(*lat, *lon, *anchor);
                     if !visible.contains(position) {
                         continue;
                     }
@@ -7031,12 +7249,13 @@ impl ViewerApp {
                 placefiles::PlacefileObject::Line {
                     width,
                     points,
+                    anchor,
                     color,
                     ..
                 } => {
                     let screen: Vec<egui::Pos2> = points
                         .iter()
-                        .map(|(lat, lon)| self.lon_lat_to_screen(rect, *lon, *lat))
+                        .map(|(lat, lon)| resolve(*lat, *lon, *anchor))
                         .collect();
                     if screen.iter().any(|p| visible.contains(*p)) {
                         out.shapes.push(egui::Shape::line(
@@ -7048,10 +7267,15 @@ impl ViewerApp {
                         ));
                     }
                 }
-                placefiles::PlacefileObject::Polygon { points, color, .. } => {
+                placefiles::PlacefileObject::Polygon {
+                    points,
+                    anchor,
+                    color,
+                    ..
+                } => {
                     let screen: Vec<egui::Pos2> = points
                         .iter()
-                        .map(|(lat, lon)| self.lon_lat_to_screen(rect, *lon, *lat))
+                        .map(|(lat, lon)| resolve(*lat, *lon, *anchor))
                         .collect();
                     if !screen.iter().any(|p| visible.contains(*p)) {
                         continue;
@@ -7304,7 +7528,7 @@ impl ViewerApp {
         // Install any finished detection for the CURRENT volume.
         if let Some(receiver) = &self.rotation_receiver {
             match receiver.try_recv() {
-                Ok((volume_ptr, markers)) => {
+                Ok((volume_ptr, mut markers)) => {
                     self.rotation_receiver = None;
                     let current = self
                         .volume
@@ -7312,6 +7536,23 @@ impl ViewerApp {
                         .map(|v| Arc::as_ptr(v) as usize)
                         .unwrap_or(0);
                     if volume_ptr == current {
+                        // Time association (Stumpf 1998 §3d): a circulation
+                        // seen near a previous-volume site inherits and
+                        // increments its persistence count.
+                        const ASSOC_DEG: f32 = 0.05; // ≈ 5 km
+                        for marker in &mut markers {
+                            if let Some(previous) = self
+                                .rotation_markers
+                                .iter()
+                                .filter(|p| {
+                                    (p.lon - marker.lon).abs() < ASSOC_DEG
+                                        && (p.lat - marker.lat).abs() < ASSOC_DEG
+                                })
+                                .max_by_key(|p| p.persistence)
+                            {
+                                marker.persistence = previous.persistence.saturating_add(1);
+                            }
+                        }
                         self.rotation_markers = markers;
                         ctx.request_repaint();
                     } else {
@@ -7380,7 +7621,11 @@ impl ViewerApp {
                 render2d::RotationStrength::Mesocyclone => {
                     let color = egui::Color32::from_rgb(250, 200, 60);
                     painter.circle_stroke(position, 9.0, egui::Stroke::new(2.6, color));
-                    painter.circle_stroke(position, 5.0, egui::Stroke::new(1.6, color));
+                    // The inner ring marks time-associated (persistent)
+                    // mesocyclones; a first-seen couplet shows one ring + CPLT.
+                    if marker.persistence >= 2 {
+                        painter.circle_stroke(position, 5.0, egui::Stroke::new(1.6, color));
+                    }
                 }
                 render2d::RotationStrength::ModerateCirculation => {
                     painter.circle_stroke(
@@ -7402,13 +7647,49 @@ impl ViewerApp {
                     painter,
                     position + egui::vec2(0.0, -14.0),
                     egui::Align2::CENTER_BOTTOM,
-                    &format!("R{} {:.0} m/s", marker.rank, marker.vrot_mps),
+                    &format!(
+                        "{}R{} {:.0} m/s",
+                        if marker.strength == render2d::RotationStrength::Mesocyclone
+                            && marker.persistence < 2
+                        {
+                            "CPLT "
+                        } else {
+                            ""
+                        },
+                        marker.rank,
+                        marker.vrot_mps
+                    ),
                     egui::FontId::proportional(10.0),
                     egui::Color32::from_rgb(245, 240, 220),
                     egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
                 );
             }
         }
+    }
+
+    /// "RAW VEL" tag under the mode chip whenever a velocity product renders
+    /// WITHOUT dealiasing — folded gates read as opposite-direction flow, so
+    /// raw mode must never be silent (operational safety).
+    fn draw_raw_velocity_tag(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let velocity_family = self.selected_product.color_family() == ColorTableFamily::Velocity;
+        if !velocity_family
+            || self.product_render_uses_dealiased_velocity(&self.selected_product)
+            || self.volume.is_none()
+        {
+            return;
+        }
+        let pos = egui::pos2(rect.left() + 10.0, rect.top() + 34.0);
+        let label = "RAW VEL — folds possible";
+        let width = 16.0 + label.chars().count() as f32 * 7.2;
+        let chip = egui::Rect::from_min_size(pos, egui::vec2(width, 20.0));
+        painter.rect_filled(chip, 4.0, egui::Color32::from_rgb(120, 70, 20));
+        painter.text(
+            chip.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_rgb(248, 238, 220),
+        );
     }
 
     /// Paint a LIVE / ARCHIVE / STALE mode chip top-left so a stale frame is
@@ -7611,6 +7892,17 @@ impl ViewerApp {
                 .map(|n| format!(" · Nyq {n:.0}"))
                 .unwrap_or_default();
             lines.push(format!("raw VEL {base:.1} m/s{nyquist}"));
+        } else if readout.product.base_moment() == MomentType::Velocity
+            && let Some(nyquist) = readout.nyquist_velocity_mps
+            && readout.value.abs() >= nyquist * 0.75
+        {
+            // RAW velocity near the Nyquist can be folded — a folded gate
+            // reads as opposite-direction flow (a fake couplet). Same field
+            // failure that motivated this: blue at +23.5 m/s that was really
+            // −33 with Nyq 28.
+            lines.push(format!(
+                "⚠ near Nyquist ({nyquist:.0}) — may be folded; enable Unfold VEL"
+            ));
         }
         lines.push(format!(
             "{:.1} km @ {:03.0}° · tilt {:.1}°",
@@ -8006,10 +8298,12 @@ impl ViewerApp {
                 .map(|key| self.radar_texture_rect(ctx, rect, latitude_deg, longitude_deg, key))
                 .unwrap_or(rect);
 
-            painter.image(
+            paint_rotated_image(
+                painter,
                 texture.id(),
                 image_rect,
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                self.lon_lat_to_screen(rect, longitude_deg, latitude_deg),
+                self.aeqd_north_angle(rect, latitude_deg, longitude_deg),
                 egui::Color32::WHITE,
             );
         }
@@ -8048,10 +8342,12 @@ impl ViewerApp {
                     .as_ref()
                     .map(|key| self.radar_texture_rect(ctx, rect, latitude_deg, longitude_deg, key))
                     .unwrap_or(rect);
-                painter.image(
+                paint_rotated_image(
+                    painter,
                     texture.id(),
                     image_rect,
-                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    self.lon_lat_to_screen(rect, longitude_deg, latitude_deg),
+                    self.aeqd_north_angle(rect, latitude_deg, longitude_deg),
                     egui::Color32::from_white_alpha(layer.opacity),
                 );
             }
@@ -8576,21 +8872,28 @@ impl ViewerApp {
     }
 
     fn draw_graticule(&self, painter: &egui::Painter, rect: egui::Rect) {
-        let (west, north) = self.screen_to_lon_lat(rect, rect.left_top());
-        let (east, south) = self.screen_to_lon_lat(rect, rect.right_bottom());
-        let lon_min = west.min(east);
-        let lon_max = west.max(east);
-        let lat_min = south.min(north).clamp(-85.0, 85.0);
-        let lat_max = south.max(north).clamp(-85.0, 85.0);
+        let bounds = self.visible_geo_bounds(rect);
+        let lon_min = bounds.west;
+        let lon_max = bounds.east;
+        let lat_min = bounds.south;
+        let lat_max = bounds.north;
         let step = graticule_step(rect.width() / self.lon_pixels_per_degree());
         let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(28, 38, 50));
         let label_color = egui::Color32::from_rgb(92, 108, 124);
 
+        // Meridians and parallels are ARCS under AEQD — sample as polylines
+        // (review finding F4).
+        const GRATICULE_SEGMENTS: usize = 32;
         let mut lon = (lon_min / step).floor() * step;
         while lon <= lon_max {
-            let top = self.lon_lat_to_screen(rect, lon, lat_max);
-            let bottom = self.lon_lat_to_screen(rect, lon, lat_min);
-            painter.line_segment([top, bottom], stroke);
+            let points: Vec<egui::Pos2> = (0..=GRATICULE_SEGMENTS)
+                .map(|i| {
+                    let lat = lat_min + (lat_max - lat_min) * i as f32 / GRATICULE_SEGMENTS as f32;
+                    self.lon_lat_to_screen(rect, lon, lat)
+                })
+                .collect();
+            let top = points[GRATICULE_SEGMENTS];
+            painter.add(egui::Shape::line(points, stroke));
             painter.text(
                 egui::pos2(top.x + 4.0, rect.top() + 6.0),
                 egui::Align2::LEFT_TOP,
@@ -8603,9 +8906,14 @@ impl ViewerApp {
 
         let mut lat = (lat_min / step).floor() * step;
         while lat <= lat_max {
-            let left = self.lon_lat_to_screen(rect, lon_min, lat);
-            let right = self.lon_lat_to_screen(rect, lon_max, lat);
-            painter.line_segment([left, right], stroke);
+            let points: Vec<egui::Pos2> = (0..=GRATICULE_SEGMENTS)
+                .map(|i| {
+                    let lon = lon_min + (lon_max - lon_min) * i as f32 / GRATICULE_SEGMENTS as f32;
+                    self.lon_lat_to_screen(rect, lon, lat)
+                })
+                .collect();
+            let left = points[0];
+            painter.add(egui::Shape::line(points, stroke));
             painter.text(
                 egui::pos2(rect.left() + 6.0, left.y - 2.0),
                 egui::Align2::LEFT_CENTER,
@@ -8735,9 +9043,23 @@ impl ViewerApp {
         rect: egui::Rect,
         position: egui::Pos2,
     ) -> Option<CursorReadout> {
+        let product = self.selected_product.clone();
+        let cut = self.selected_cut;
+        self.cursor_readout_for(rect, position, &product, cut)
+    }
+
+    /// Readout for an arbitrary product/tilt — lets every grid pane report
+    /// ITS OWN data under the cursor instead of the primary pane's.
+    fn cursor_readout_for(
+        &mut self,
+        rect: egui::Rect,
+        position: egui::Pos2,
+        product: &DisplayProduct,
+        cut_index: usize,
+    ) -> Option<CursorReadout> {
         let volume = self.volume.clone()?;
-        let selected_cut = self.selected_cut;
-        let selected_product = self.selected_product.clone();
+        let selected_cut = cut_index;
+        let selected_product = product.clone();
         // Derived products are not read from a raw cut moment grid here: volume
         // products (CREF/ET/VIL) are tilt-independent, and per-cut derivatives
         // (shear/divergence) would need a costly per-hover recompute. Skip the
@@ -8754,9 +9076,19 @@ impl ViewerApp {
             .flatten();
         let grid = dealiased_grid.as_deref().unwrap_or(source_grid);
         let (radar_lat, radar_lon) = self.loaded_volume_location()?;
-        let (target_lon, target_lat) = self.screen_to_lon_lat(rect, position);
-        let lat_km = (target_lat - radar_lat) * 111.32;
-        let lon_km = (target_lon - radar_lon) * 111.32 * radar_lat.to_radians().cos();
+        // Probe the gate ACTUALLY RENDERED under the cursor: invert the
+        // raster's screen mapping (planar ENU about the radar, rotated by
+        // the AEQD convergence angle at draw time) instead of re-deriving
+        // ENU from lat/lon (review finding F3).
+        let radar_pos = self.lon_lat_to_screen(rect, radar_lon, radar_lat);
+        let angle = self.aeqd_north_angle(rect, radar_lat, radar_lon);
+        let offset = position - radar_pos;
+        let (sin, cos) = (-angle).sin_cos();
+        let east_px = offset.x * cos - offset.y * sin;
+        let north_px = -(offset.x * sin + offset.y * cos);
+        let km_per_px = 111.32 / self.map_scale;
+        let lon_km = east_px * km_per_px;
+        let lat_km = north_px * km_per_px;
         let range_km = lat_km.hypot(lon_km);
         let max_range_km = grid_range_km(grid)?;
         if range_km > max_range_km {
@@ -8815,38 +9147,97 @@ impl ViewerApp {
         })
     }
 
+    /// Azimuthal-equidistant projection about the map center (north up):
+    /// screen offsets are true great-circle kilometres, so range and azimuth
+    /// are exact at the center and the frame matches the radar raster's
+    /// planar ENU geometry (the equirectangular mapping it replaces skewed
+    /// east-west distances away from the center latitude).
     fn lon_lat_to_screen(
         &self,
         rect: egui::Rect,
         longitude_deg: f32,
         latitude_deg: f32,
     ) -> egui::Pos2 {
+        let (east_km, north_km) = aeqd_forward_km(
+            self.map_center_lat as f64,
+            self.map_center_lon as f64,
+            latitude_deg as f64,
+            longitude_deg as f64,
+        );
+        let px_per_km = self.map_scale / 111.32;
         egui::pos2(
-            rect.center().x
-                + longitude_delta_deg(longitude_deg, self.map_center_lon)
-                    * self.lon_pixels_per_degree(),
-            rect.center().y - (latitude_deg - self.map_center_lat) * self.map_scale,
+            rect.center().x + east_km as f32 * px_per_km,
+            rect.center().y - north_km as f32 * px_per_km,
         )
     }
 
     fn screen_to_lon_lat(&self, rect: egui::Rect, position: egui::Pos2) -> (f32, f32) {
-        (
-            normalize_lon(
-                self.map_center_lon + (position.x - rect.center().x) / self.lon_pixels_per_degree(),
-            ),
-            self.map_center_lat - (position.y - rect.center().y) / self.map_scale,
-        )
+        let km_per_px = 111.32 / self.map_scale;
+        let east_km = (position.x - rect.center().x) * km_per_px;
+        let north_km = (rect.center().y - position.y) * km_per_px;
+        let (lat, lon) = aeqd_inverse_km(
+            self.map_center_lat as f64,
+            self.map_center_lon as f64,
+            east_km as f64,
+            north_km as f64,
+        );
+        (normalize_lon(lon as f32), lat as f32)
     }
 
     fn visible_geo_bounds(&self, rect: egui::Rect) -> GeoBounds {
-        let (west, north) = self.screen_to_lon_lat(rect, rect.left_top());
-        let (east, south) = self.screen_to_lon_lat(rect, rect.right_bottom());
-        GeoBounds {
-            west: west.min(east),
-            east: west.max(east),
-            south: south.min(north).clamp(-85.0, 85.0),
-            north: south.max(north).clamp(-85.0, 85.0),
+        // Under AEQD the lat/lon extremes of the view sit on the EDGES, not
+        // two corners (parallels bow poleward, meridians converge) — sample
+        // four corners plus four edge midpoints (review finding F1).
+        let samples = [
+            rect.left_top(),
+            rect.right_top(),
+            rect.left_bottom(),
+            rect.right_bottom(),
+            egui::pos2(rect.center().x, rect.top()),
+            egui::pos2(rect.center().x, rect.bottom()),
+            egui::pos2(rect.left(), rect.center().y),
+            egui::pos2(rect.right(), rect.center().y),
+        ];
+        let mut bounds = GeoBounds {
+            west: f32::INFINITY,
+            east: f32::NEG_INFINITY,
+            south: f32::INFINITY,
+            north: f32::NEG_INFINITY,
+        };
+        for sample in samples {
+            let (lon, lat) = self.screen_to_lon_lat(rect, sample);
+            bounds.west = bounds.west.min(lon);
+            bounds.east = bounds.east.max(lon);
+            bounds.south = bounds.south.min(lat);
+            bounds.north = bounds.north.max(lat);
         }
+        // If a pole is inside the view radius every longitude is visible.
+        let km_per_px = 111.32 / self.map_scale;
+        let view_radius_km = (rect.width().hypot(rect.height()) * 0.5 * km_per_px) as f64;
+        const KM_PER_DEG: f64 = 111.32;
+        let north_pole_km = (90.0 - self.map_center_lat as f64) * KM_PER_DEG;
+        let south_pole_km = (90.0 + self.map_center_lat as f64) * KM_PER_DEG;
+        if north_pole_km < view_radius_km || south_pole_km < view_radius_km {
+            bounds.west = -180.0;
+            bounds.east = 180.0;
+        }
+        bounds.south = bounds.south.clamp(-85.0, 85.0);
+        bounds.north = bounds.north.clamp(-85.0, 85.0);
+        bounds
+    }
+
+    /// Deviation of local "screen north" from straight up at a geo point —
+    /// the AEQD meridian-convergence angle (radians, clockwise positive).
+    /// The radar raster is planar ENU about the radar, so its quad is
+    /// rotated by this angle to sit correctly in the AEQD frame (F2).
+    fn aeqd_north_angle(&self, rect: egui::Rect, latitude_deg: f32, longitude_deg: f32) -> f32 {
+        let base = self.lon_lat_to_screen(rect, longitude_deg, latitude_deg);
+        let north = self.lon_lat_to_screen(rect, longitude_deg, latitude_deg + 0.05);
+        let v = north - base;
+        if v.length_sq() < 1e-12 {
+            return 0.0;
+        }
+        v.x.atan2(-v.y)
     }
 
     fn clamp_map_center(&mut self) {
@@ -8995,6 +9386,19 @@ struct PlacefileSlot {
     next_refresh: Option<Instant>,
     status: String,
     receiver: Option<mpsc::Receiver<std::result::Result<placefiles::Placefile, String>>>,
+    /// Loaded icon sprite sheets (fetched + decoded off-thread, texture
+    /// created on install).
+    sheets: Vec<PlacefileSheet>,
+    sheets_receiver: Option<mpsc::Receiver<Vec<DecodedSheet>>>,
+}
+
+/// (sheet index, width, height, rgba) from the fetch/decode thread.
+type DecodedSheet = (u32, u32, u32, Vec<u8>);
+
+struct PlacefileSheet {
+    spec: placefiles::IconSheetSpec,
+    size: (u32, u32),
+    texture: egui::TextureHandle,
 }
 
 impl PlacefileSlot {
@@ -9007,6 +9411,8 @@ impl PlacefileSlot {
             next_refresh: None,
             status: "queued".to_owned(),
             receiver: None,
+            sheets: Vec::new(),
+            sheets_receiver: None,
         }
     }
 }
@@ -9035,6 +9441,7 @@ struct TextureKey {
     storm_motion_key: (i16, i16),
     hail_levels_key: (i16, i16),
     smoothed: bool,
+    dealias_cascade: bool,
     viewport: ViewportKey,
 }
 
@@ -9052,6 +9459,51 @@ impl ViewportKey {
     fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
     }
+}
+
+/// Paint a texture as a quad rotated by `angle` about `pivot` — used to
+/// align the planar-ENU radar raster with the AEQD screen frame at draw time
+/// (zero per-pixel cost; the raster itself is rotation-agnostic).
+fn paint_rotated_image(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    rect: egui::Rect,
+    pivot: egui::Pos2,
+    angle: f32,
+    tint: egui::Color32,
+) {
+    let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+    if angle.abs() < 1e-4 {
+        painter.image(texture_id, rect, uv, tint);
+        return;
+    }
+    let (sin, cos) = angle.sin_cos();
+    let rotate = |p: egui::Pos2| -> egui::Pos2 {
+        let d = p - pivot;
+        pivot + egui::vec2(d.x * cos - d.y * sin, d.x * sin + d.y * cos)
+    };
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+    ];
+    let uvs = [
+        uv.left_top(),
+        uv.right_top(),
+        uv.right_bottom(),
+        uv.left_bottom(),
+    ];
+    let mut mesh = egui::epaint::Mesh::with_texture(texture_id);
+    for (corner, uv) in corners.iter().zip(uvs.iter()) {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: rotate(*corner),
+            uv: *uv,
+            color: tint,
+        });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 fn anchored_radar_texture_rect(
@@ -9638,6 +10090,7 @@ fn detect_rotation_markers_for_volume(
                 vrot_mps: site.vrot_mps,
                 rank: site.rank,
                 strength: site.strength,
+                persistence: 1,
             }
         })
         .collect()
@@ -9734,6 +10187,60 @@ fn build_derived_moment_cache(
         color_tables,
     )
     .map_err(|err| err.to_string())
+}
+
+/// Build a textured quad for one sprite of an icon sheet, rotated by the
+/// icon heading (0 = north, clockwise), positioned so the sheet's hot point
+/// lands on the target position.
+fn icon_sprite_shape(
+    sheet: &PlacefileSheet,
+    icon_index: u32,
+    position: egui::Pos2,
+    heading_deg: f32,
+) -> Option<egui::Shape> {
+    let (sheet_w, sheet_h) = sheet.size;
+    let (icon_w, icon_h) = (sheet.spec.icon_w, sheet.spec.icon_h);
+    if icon_w == 0 || icon_h == 0 || sheet_w < icon_w || sheet_h < icon_h {
+        return None;
+    }
+    let cols = (sheet_w / icon_w).max(1);
+    let rows = (sheet_h / icon_h).max(1);
+    let slot = icon_index.saturating_sub(1);
+    if slot >= cols * rows {
+        return None;
+    }
+    let (cx, cy) = (slot % cols, slot / cols);
+    let uv0 = egui::pos2(
+        (cx * icon_w) as f32 / sheet_w as f32,
+        (cy * icon_h) as f32 / sheet_h as f32,
+    );
+    let uv1 = egui::pos2(
+        ((cx + 1) * icon_w) as f32 / sheet_w as f32,
+        ((cy + 1) * icon_h) as f32 / sheet_h as f32,
+    );
+    // Quad corners relative to the hot point, rotated about it.
+    let hot = egui::vec2(sheet.spec.hot_x, sheet.spec.hot_y);
+    let angle = heading_deg.to_radians();
+    let (sin, cos) = angle.sin_cos();
+    let rotate = |v: egui::Vec2| egui::vec2(v.x * cos - v.y * sin, v.x * sin + v.y * cos);
+    let corners = [
+        egui::vec2(0.0, 0.0),
+        egui::vec2(icon_w as f32, 0.0),
+        egui::vec2(icon_w as f32, icon_h as f32),
+        egui::vec2(0.0, icon_h as f32),
+    ];
+    let uvs = [uv0, egui::pos2(uv1.x, uv0.y), uv1, egui::pos2(uv0.x, uv1.y)];
+    let mut mesh = egui::epaint::Mesh::with_texture(sheet.texture.id());
+    for (corner, uv) in corners.iter().zip(uvs.iter()) {
+        let local = *corner - hot;
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: position + rotate(local),
+            uv: *uv,
+            color: egui::Color32::WHITE,
+        });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    Some(egui::Shape::mesh(mesh))
 }
 
 /// A sensible starting threshold per family when the user first enables the
@@ -9944,6 +10451,101 @@ fn draw_halo_text(
     painter.text(position, align, text, font, text_color);
 }
 
+/// Forward azimuthal-equidistant: (lat, lon) → (east, north) km from center.
+/// Spherical earth, R chosen so 1° latitude = 111.32 km (matches the radar
+/// raster's planar convention).
+fn aeqd_forward_km(center_lat: f64, center_lon: f64, lat: f64, lon: f64) -> (f64, f64) {
+    const R_KM: f64 = 111.32 * 180.0 / std::f64::consts::PI;
+    let (phi0, lam0) = (center_lat.to_radians(), center_lon.to_radians());
+    let (phi, lam) = (lat.to_radians(), lon.to_radians());
+    let dlam = lam - lam0;
+    let cos_c = (phi0.sin() * phi.sin() + phi0.cos() * phi.cos() * dlam.cos()).clamp(-1.0, 1.0);
+    let c = cos_c.acos();
+    if c.abs() < 1e-12 {
+        return (0.0, 0.0);
+    }
+    let k = R_KM * c / c.sin();
+    let east = k * phi.cos() * dlam.sin();
+    let north = k * (phi0.cos() * phi.sin() - phi0.sin() * phi.cos() * dlam.cos());
+    (east, north)
+}
+
+/// Inverse azimuthal-equidistant: (east, north) km from center → (lat, lon).
+fn aeqd_inverse_km(center_lat: f64, center_lon: f64, east_km: f64, north_km: f64) -> (f64, f64) {
+    const R_KM: f64 = 111.32 * 180.0 / std::f64::consts::PI;
+    let rho = east_km.hypot(north_km);
+    if rho < 1e-9 {
+        return (center_lat, center_lon);
+    }
+    // Clamp just short of the antipode: beyond ρ = πR the inverse wraps to
+    // garbage on the far side of the globe (review finding F1/F6).
+    let c = (rho / R_KM).min(std::f64::consts::PI - 1e-6);
+    let (phi0, lam0) = (center_lat.to_radians(), center_lon.to_radians());
+    let (sin_c, cos_c) = c.sin_cos();
+    let phi = (cos_c * phi0.sin() + north_km * sin_c * phi0.cos() / rho)
+        .clamp(-1.0, 1.0)
+        .asin();
+    let lam =
+        lam0 + (east_km * sin_c).atan2(rho * phi0.cos() * cos_c - north_km * phi0.sin() * sin_c);
+    (phi.to_degrees(), lam.to_degrees())
+}
+
+#[cfg(test)]
+mod aeqd_tests {
+    use super::{aeqd_forward_km, aeqd_inverse_km};
+
+    #[test]
+    fn round_trips_everywhere() {
+        for &(clat, clon) in &[
+            (39.0f64, -94.6f64),
+            (48.4, -100.9),
+            (64.5, -165.4),
+            (21.0, -157.0),
+        ] {
+            for dlat in [-3.0f64, -1.0, 0.0, 0.5, 2.5] {
+                for dlon in [-4.0f64, -1.5, 0.0, 1.0, 3.5] {
+                    let (e, n) = aeqd_forward_km(clat, clon, clat + dlat, clon + dlon);
+                    let (lat, lon) = aeqd_inverse_km(clat, clon, e, n);
+                    assert!(
+                        (lat - (clat + dlat)).abs() < 1e-6 && (lon - (clon + dlon)).abs() < 1e-6,
+                        "round trip failed at center ({clat},{clon}) offset ({dlat},{dlon})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_degree_latitude_is_111_32_km() {
+        let (e, n) = aeqd_forward_km(45.0, -100.0, 46.0, -100.0);
+        assert!(e.abs() < 1e-9);
+        assert!((n - 111.32).abs() < 0.01, "{n}");
+    }
+
+    #[test]
+    fn east_west_distance_shrinks_with_latitude() {
+        // 1° of longitude at 60°N ≈ 55.66 km (cos 60 = 0.5) — the error class
+        // the equirectangular mapping got wrong away from the center latitude.
+        let (e, n) = aeqd_forward_km(60.0, -100.0, 60.0, -99.0);
+        assert!(
+            (e - 111.32 * 60.0f64.to_radians().cos()).abs() < 0.05,
+            "{e}"
+        );
+        assert!(n.abs() < 0.6, "{n}"); // tiny great-circle northing
+    }
+
+    #[test]
+    fn matches_planar_enu_near_the_center() {
+        // Within radar display ranges the AEQD frame and the raster's planar
+        // ENU about a centered radar agree to small fractions of a km.
+        let (e, n) = aeqd_forward_km(39.0, -94.6, 39.9, -93.5);
+        let planar_n = 0.9 * 111.32;
+        let planar_e = 1.1 * 111.32 * 39.45f64.to_radians().cos(); // mid-lat scale
+        assert!((n - planar_n).abs() < 1.0, "{n} vs {planar_n}");
+        assert!((e - planar_e).abs() < 1.0, "{e} vs {planar_e}");
+    }
+}
+
 fn normalize_lon(longitude_deg: f32) -> f32 {
     let mut longitude_deg = longitude_deg;
     while longitude_deg > 180.0 {
@@ -9953,10 +10555,6 @@ fn normalize_lon(longitude_deg: f32) -> f32 {
         longitude_deg += 360.0;
     }
     longitude_deg
-}
-
-fn longitude_delta_deg(longitude_deg: f32, reference_longitude_deg: f32) -> f32 {
-    normalize_lon(longitude_deg - reference_longitude_deg)
 }
 
 fn haversine_km(lat_a: f32, lon_a: f32, lat_b: f32, lon_b: f32) -> f32 {
@@ -12777,6 +13375,7 @@ mod tests {
             (0, 0),
             (32, 64),
             false,
+            false,
             viewport,
         );
         let second_pixels = RenderWorkerViewportSignature::new(
@@ -12788,6 +13387,7 @@ mod tests {
             456,
             (0, 0),
             (32, 64),
+            false,
             false,
             viewport,
         );
@@ -12989,6 +13589,7 @@ mod tests {
                 storm_motion_key: (450, 350),
                 hail_levels_key: (32, 64),
                 smoothed: false,
+                dealias_cascade: false,
                 viewport: test_viewport_key(1320, 820),
             },
             pane: 0,
@@ -13000,6 +13601,7 @@ mod tests {
             color_tables,
             hail_levels_m: (3200.0, 6400.0),
             smoothed: false,
+            dealias_cascade: false,
             storm_motion: StormMotion {
                 direction_deg: 45.0,
                 speed_mps: 35.0 * KNOT_TO_MPS,
@@ -14461,6 +15063,7 @@ mod tests {
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
             frame_history: Vec::new(),
             selected_frame_index: 0,
+            browsing_history: false,
             history_frame_limit: DEFAULT_HISTORY_FRAME_LIMIT,
             history_playing: false,
             last_history_step: None,
@@ -14514,6 +15117,7 @@ mod tests {
             rotation_markers_volume_ptr: 0,
             rotation_receiver: None,
             show_rotation_markers: true,
+            dealias_cascade: false,
             display_smoothing: false,
             hail_freezing_level_km: 3.2,
             hail_minus20_level_km: 6.4,
@@ -14842,6 +15446,7 @@ mod tests {
             (0, 0),
             (32, 64),
             false,
+            false,
             test_viewport_key(width, 100),
         )
     }
@@ -14914,6 +15519,7 @@ mod tests {
                 0,
                 (0, 0),
                 (32, 64),
+                false,
                 false,
                 test_viewport_key(width, height),
             ),

@@ -8,11 +8,13 @@ use std::ops::Range;
 use std::path::Path;
 
 pub use color_tables::{ColorSampler, ColorTable, ColorTableFamily, ColorTableSet};
+mod cascade;
 mod cells;
 mod detect;
 mod shear;
 mod smooth;
 mod volumetric;
+pub use cascade::{dealias_velocity_grid_cascade, fit_range_band_reference};
 pub use cells::{StormCell, identify_storm_cells};
 pub use detect::{
     RotationSite, RotationStrength, detect_rotation_sites, rotation_features_per_tilt,
@@ -2915,7 +2917,35 @@ fn color_for_raw(grid: &MomentGrid, sampler: &ColorSampler, raw: u16) -> [u8; 4]
 /// (3) resolve folds strongest-boundary-first via a union-find with per-node
 /// fold offset; (4) anchor each connected group so its largest region is
 /// unfolded (fold 0); (5) apply and despeckle.
+/// Per-range-band zeroth-harmonic wind reference (Browning & Wexler 1968):
+/// v̂(az) = a·cos(az) + b·sin(az), fitted per band of gates. Supplied to the
+/// fold resolver as EXTERNAL evidence by the tilt-cascade engine.
+pub struct RangeBandReference {
+    pub band_gates: usize,
+    pub fits: Vec<Option<(f32, f32)>>,
+}
+
+impl RangeBandReference {
+    #[inline]
+    fn eval(&self, sin_az: f32, cos_az: f32, gate: usize) -> Option<f32> {
+        let (a, b) = (*self.fits.get(gate / self.band_gates.max(1))?)?;
+        Some(a * cos_az + b * sin_az)
+    }
+}
+
 pub fn dealias_velocity_grid(cut: &ElevationCut, source: &MomentGrid) -> MomentGrid {
+    dealias_velocity_grid_with_reference(cut, source, None)
+}
+
+/// `dealias_velocity_grid` with an optional external wind reference: the
+/// resolver uses it for connected-group BRANCH selection and per-region
+/// verification (UNRAVEL-style checks, Louf et al. 2020). With `None` the
+/// behavior is identical to the plain region engine.
+pub fn dealias_velocity_grid_with_reference(
+    cut: &ElevationCut,
+    source: &MomentGrid,
+    reference: Option<&RangeBandReference>,
+) -> MomentGrid {
     let rows = source.radial_count();
     let gate_count = source.gate_range.gate_count;
     let total = rows.saturating_mul(gate_count);
@@ -2941,7 +2971,7 @@ pub fn dealias_velocity_grid(cut: &ElevationCut, source: &MomentGrid) -> MomentG
     }
 
     let azimuths = radial_azimuths(cut, source);
-    let folds = region_based_dealias_folds(&observed, &nyq, rows, gate_count, &azimuths);
+    let folds = region_based_dealias_folds(&observed, &nyq, rows, gate_count, &azimuths, reference);
 
     let mut corrected = vec![DEALIASED_VELOCITY_NODATA; total];
     #[allow(clippy::needless_range_loop)]
@@ -3120,6 +3150,7 @@ fn region_based_dealias_folds(
     rows: usize,
     gates: usize,
     azimuths: &[f32],
+    reference: Option<&RangeBandReference>,
 ) -> Vec<i32> {
     let total = rows.saturating_mul(gates);
     let mut folds = vec![0i32; total];
@@ -3305,6 +3336,111 @@ fn region_based_dealias_folds(
         let anchor = anchor_offset.get(&root).map(|(_, o)| *o).unwrap_or(0);
         region_fold[rid as usize] = (off - anchor).clamp(-REGION_MAX_FOLD, REGION_MAX_FOLD);
     }
+
+    // ---- 5b. external-reference checks (tilt-cascade engine only) ----
+    // Boundary votes lock RELATIVE folds, but each connected group's absolute
+    // branch — and any vote-graph misbranch — needs independent evidence.
+    // A clean reference from the (less aliased, higher Nyquist) tilt above
+    // supplies it: choose each group's branch against the reference, then
+    // re-test each region individually and override only when decisive.
+    if let Some(reference) = reference {
+        let mut row_trig = vec![(0.0f32, 0.0f32); rows];
+        for row in 0..rows {
+            let az = azimuths[row].to_radians();
+            row_trig[row] = (az.sin(), az.cos());
+        }
+        // Group branch: cost per (root, g) for g ∈ −2..=+2.
+        let mut group_cost: std::collections::HashMap<u32, ([f64; 5], u64, u64)> =
+            std::collections::HashMap::new();
+        for row in 0..rows {
+            let n = nyq[row];
+            if !n.is_finite() || n <= 0.0 {
+                continue;
+            }
+            let (sin_az, cos_az) = row_trig[row];
+            for gate in 0..gates {
+                let idx = row * gates + gate;
+                let rid = region_of[idx];
+                if rid == u32::MAX {
+                    continue;
+                }
+                let (root, off) = dsu.find(rid);
+                let entry = group_cost.entry(root).or_insert(([0.0; 5], 0, 0));
+                entry.2 += 1;
+                let Some(predicted) = reference.eval(sin_az, cos_az, gate) else {
+                    continue;
+                };
+                entry.1 += 1;
+                let v = observed[idx];
+                for (slot, g) in (-2i32..=2).enumerate() {
+                    let unfolded = v + (off + g) as f32 * 2.0 * n;
+                    entry.0[slot] += (unfolded - predicted).abs() as f64;
+                }
+            }
+        }
+        for (root, (costs, covered, total_gates)) in &group_cost {
+            if *total_gates == 0 || (*covered as f64) < 0.5 * *total_gates as f64 {
+                continue;
+            }
+            let (best_slot, _) = costs
+                .iter()
+                .enumerate()
+                .min_by(|a, b| a.1.total_cmp(b.1))
+                .expect("five branches");
+            let branch = best_slot as i32 - 2;
+            for rid in 0..region_count as u32 {
+                let (r, off) = dsu.find(rid);
+                if r == *root {
+                    region_fold[rid as usize] =
+                        (off + branch).clamp(-REGION_MAX_FOLD, REGION_MAX_FOLD);
+                }
+            }
+        }
+        // Per-region override: repairs vote-graph misbranches that survive
+        // group selection (a subgraph can be internally consistent yet wrong).
+        let mut cost = vec![[0.0f64; 3]; region_count];
+        let mut covered = vec![0u32; region_count];
+        for row in 0..rows {
+            let n = nyq[row];
+            if !n.is_finite() || n <= 0.0 {
+                continue;
+            }
+            let (sin_az, cos_az) = row_trig[row];
+            for gate in 0..gates {
+                let idx = row * gates + gate;
+                let rid = region_of[idx];
+                if rid == u32::MAX {
+                    continue;
+                }
+                let Some(predicted) = reference.eval(sin_az, cos_az, gate) else {
+                    continue;
+                };
+                let v = observed[idx];
+                let fold = region_fold[rid as usize];
+                covered[rid as usize] += 1;
+                for (slot, dg) in (-1i32..=1).enumerate() {
+                    let unfolded = v + (fold + dg) as f32 * 2.0 * n;
+                    cost[rid as usize][slot] += (unfolded - predicted).abs() as f64;
+                }
+            }
+        }
+        for rid in 0..region_count {
+            if (covered[rid] as f64) < 0.6 * region_size[rid] as f64 {
+                continue;
+            }
+            let current = cost[rid][1];
+            let (best_slot, best_cost) = cost[rid]
+                .iter()
+                .enumerate()
+                .min_by(|a, b| a.1.total_cmp(b.1))
+                .expect("three slots");
+            if best_slot != 1 && *best_cost < 0.6 * current {
+                let dg = best_slot as i32 - 1;
+                region_fold[rid] = (region_fold[rid] + dg).clamp(-REGION_MAX_FOLD, REGION_MAX_FOLD);
+            }
+        }
+    }
+
     for idx in 0..total {
         let rid = region_of[idx];
         if rid != u32::MAX {

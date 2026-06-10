@@ -75,10 +75,25 @@ tables, and a colorblind-safe velocity option).
 Shear (LLSD rotation), Radial Divergence — computed volume-locally in tens of
 milliseconds and selectable like any product.
 
-**Velocity dealiasing** uses region-based unfolding (Jing & Wiener 1993;
-Feldmann et al. 2020) rather than spoke-prone radial continuity — validated on
-real derecho data at 99% residual-fold reduction. The algorithms and their
-references are documented in [docs/products-guide.md](docs/products-guide.md).
+**Storm analysis:** NSSL-style mesocyclone/TVS detection (Stumpf et al.
+1998; Mitchell et al. 1998) with time-association (CPLT → MESO), SCIT storm
+cell tracks with motion extrapolation (Johnson et al. 1998), maximum expected
+hail size (Witt et al. 1998), live draggable cross-sections, and GRLevelX
+placefiles (icon sheets, Object blocks, auto-refresh).
+
+**Velocity dealiasing** offers two engines: region-based unfolding
+(Jing & Wiener 1993; Feldmann et al. 2020) — validated on real derecho data
+at 99% residual-fold reduction — and an experimental tilt-cascade engine that
+branch-checks each tilt against the wind fit from the tilt above
+(Browning & Wexler 1968; Louf et al. 2020). Raw-velocity mode always carries
+a "folds possible" tag plus near-Nyquist warnings in the inspector. The
+algorithms and their references are documented in
+[docs/products-guide.md](docs/products-guide.md).
+
+**Display:** 1/2/4-pane synced grids with per-pane products and honest
+per-pane readouts, optional GR2-style smoothing (zero panning cost), and an
+azimuthal-equidistant projection so range and azimuth are true at every
+latitude.
 
 ## Why it's fast
 

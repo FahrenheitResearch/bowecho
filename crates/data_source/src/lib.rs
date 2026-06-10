@@ -277,6 +277,24 @@ pub fn fetch_text(url: &str) -> Result<String> {
         .text()?)
 }
 
+/// Fetch a small binary resource (e.g. a placefile icon sheet). Capped at
+/// 4 MiB — these are sprite sheets, not data files.
+pub fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
+    let bytes = metadata_http_client()
+        .get(url)
+        .send()?
+        .error_for_status()?
+        .bytes()?;
+    const MAX: usize = 4 * 1024 * 1024;
+    if bytes.len() > MAX {
+        return Err(DataSourceError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("resource too large: {} bytes", bytes.len()),
+        )));
+    }
+    Ok(bytes.to_vec())
+}
+
 pub fn fetch_level2_radar_sites(days_back: i64) -> Result<Vec<RadarSite>> {
     let weather_sites = fetch_weather_gov_radar_sites().unwrap_or_default();
     let weather_by_id = weather_sites
