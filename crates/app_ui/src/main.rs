@@ -11,12 +11,13 @@ use data_source::{LEVEL2_ARCHIVE_BUCKET, RadarSite, RealtimeChunkType};
 use eframe::egui;
 use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType, RadarVolume};
 use render2d::{
-    ECHO_TOP_THRESHOLD_DBZ, StormCell, StormMotion, StormRelativePaletteCache, ViewportMomentCache,
-    ViewportRasterOptions, ViewportSampleCache, VolumeDealiasCache, azimuthal_shear_grid,
-    color_family_for_moment, composite_reflectivity_grid, dealias_velocity_grid,
-    dealias_velocity_grid_cascade, detect_rotation_sites, echo_top_grid, identify_storm_cells,
-    mehs_grid, radial_divergence_grid, reflectivity_cross_section, smooth_moment_grid,
-    storm_relative_velocity_mps, velocity_cross_section_cached, viewport_rgba_buffer_len,
+    ECHO_TOP_THRESHOLD_DBZ, StormCell, StormMotion, StormRelativePaletteCache, StormTracker,
+    ViewportMomentCache, ViewportRasterOptions, ViewportSampleCache, VolumeDealiasCache,
+    apply_reflectivity_gate_filter, azimuthal_shear_grid, color_family_for_moment,
+    composite_reflectivity_grid, dealias_velocity_grid, dealias_velocity_grid_cascade,
+    detect_rotation_sites, echo_top_grid, identify_storm_cells, mehs_grid, radial_divergence_grid,
+    reflectivity_cross_section, smooth_moment_grid, storm_relative_velocity_mps,
+    velocity_cross_section_cached, viewport_rgba_buffer_len,
     viewport_sample_cache_storage_upper_bound, vil_density_grid, vil_grid,
 };
 use serde::Deserialize;
@@ -373,9 +374,8 @@ struct ViewerApp {
     placefile_shape_cache: std::cell::RefCell<ShapeCache<PlacefileDrawList>>,
     /// SCIT-style storm tracks: identification runs per volume on a
     /// background thread; association + motion fits are O(cells) on install.
-    storm_tracks: Vec<StormTrack>,
+    storm_tracker: StormTracker,
     storm_tracks_site: String,
-    next_storm_track_id: u32,
     storm_cells_volume_ptr: usize,
     storm_cells_receiver: Option<mpsc::Receiver<StormCellsResult>>,
     show_storm_tracks: bool,
@@ -387,6 +387,8 @@ struct ViewerApp {
     rotation_markers_volume_ptr: usize,
     rotation_receiver: Option<mpsc::Receiver<(usize, Vec<RotationMarker>)>>,
     show_rotation_markers: bool,
+    /// Reflectivity gate filter threshold (dBZ); None = off.
+    gate_filter_dbz: Option<f32>,
     /// Velocity dealias engine: false = region (default, proven), true =
     /// tilt-cascade (vertical-reference branch selection; helps on VCPs whose
     /// upper tilts are unaliased — see docs/dealias-fold-branch-analysis.md).
@@ -421,6 +423,25 @@ struct ViewerApp {
     hazard_shape_cache: std::cell::RefCell<ShapeCache<HazardOverlayShapes>>,
     // Cross-section (RHI) draw mode + rendered section.
     cross_section_armed: bool,
+    /// Last right-click location (for the context menu's best-radar list).
+    context_menu_lonlat: Option<(f32, f32)>,
+    /// SPC storm reports for the archive date (tornado events browser).
+    spc_reports: Option<Vec<SpcReport>>,
+    spc_receiver: Option<mpsc::Receiver<std::result::Result<Vec<SpcReport>, String>>>,
+    /// One-shot: after an event click, auto-load the volume nearest this
+    /// time once the archive listing lands.
+    archive_pending_event: Option<DateTime<Utc>>,
+    /// Archive click mode: true = loop ending at the chosen scan.
+    archive_load_loop: bool,
+    /// Archive browser: date input + listed volumes for the selected site.
+    archive_date_input: String,
+    archive_volumes: Option<Vec<(data_source::S3Object, String)>>,
+    archive_list_receiver:
+        Option<mpsc::Receiver<std::result::Result<Vec<data_source::S3Object>, String>>>,
+    /// GR2-style two-click Vrot tool: armed -> click max inbound, then max
+    /// outbound; the card shows Vrot, couplet diameter, and beam height.
+    vrot_tool_armed: bool,
+    vrot_points: Vec<(f32, f32, f32, f32)>, // (lon, lat, value_mps, height_m)
     cross_section_a_lonlat: Option<(f32, f32)>,
     cross_section_b_lonlat: Option<(f32, f32)>,
     cross_section_texture: Option<egui::TextureHandle>,
@@ -1109,60 +1130,62 @@ struct AsyncRenderResult {
 /// Background cell-identification result: (volume ptr, volume time, cells).
 type StormCellsResult = (usize, DateTime<Utc>, Vec<StormCell>);
 
-/// One tracked storm cell across volumes — the cross-volume half of SCIT
-/// (Johnson et al. 1998, WAF 13(2)): nearest-to-prediction association and a
-/// least-squares motion fit over the recent history.
-struct StormTrack {
-    id: u32,
-    /// (volume time, east km, north km), most recent last; capped length.
-    history: Vec<(DateTime<Utc>, f64, f64)>,
-    max_dbz: f32,
-    /// Fitted motion in m/s (east, north); None until two distinct times.
-    motion_mps: Option<(f32, f32)>,
-    /// Consecutive volumes without a match (track drops at 2).
-    missed: u8,
+/// One SPC storm report (tornado) — the archive events browser entry.
+#[derive(Clone, Debug)]
+struct SpcReport {
+    time_utc: DateTime<Utc>,
+    f_scale: String,
+    location: String,
+    state: String,
+    lat: f32,
+    lon: f32,
 }
 
-impl StormTrack {
-    /// Least-squares linear fit of position vs time over the last points.
-    fn refit_motion(&mut self) {
-        let n = self.history.len();
-        if n < 2 {
-            self.motion_mps = None;
-            return;
+/// Parse SPC's filtered tornado-report CSV
+/// (Time,F_Scale,Location,County,State,Lat,Lon,Comments; times UTC; the
+/// report "day" runs 12Z -> 12Z next day, so HHMM < 1200 belongs to the
+/// following calendar date).
+fn parse_spc_tornado_csv(date: chrono::NaiveDate, text: &str) -> Vec<SpcReport> {
+    let mut reports = Vec::new();
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.splitn(8, ',').collect();
+        if fields.len() < 7 {
+            continue;
         }
-        let window = &self.history[n.saturating_sub(6)..];
-        let t0 = window[0].0;
-        let mut st = 0.0f64;
-        let mut stt = 0.0f64;
-        let mut se = 0.0f64;
-        let mut sn = 0.0f64;
-        let mut ste = 0.0f64;
-        let mut stn = 0.0f64;
-        let m = window.len() as f64;
-        for (time, east, north) in window {
-            let t = (*time - t0).num_milliseconds() as f64 / 1000.0;
-            st += t;
-            stt += t * t;
-            se += east;
-            sn += north;
-            ste += t * east;
-            stn += t * north;
+        let Ok(hhmm) = fields[0].trim().parse::<u32>() else {
+            continue;
+        };
+        let (hour, minute) = (hhmm / 100, hhmm % 100);
+        if hour > 23 || minute > 59 {
+            continue;
         }
-        let denom = m * stt - st * st;
-        if denom.abs() < 1.0 {
-            self.motion_mps = None;
-            return;
-        }
-        let u = (m * ste - st * se) / denom * 1000.0; // km/s -> m/s
-        let v = (m * stn - st * sn) / denom * 1000.0;
-        // Reject unphysical fits (storms top out well under 50 m/s).
-        if u.hypot(v) > 60.0 {
-            self.motion_mps = None;
+        let report_date = if hour < 12 {
+            date + chrono::Duration::days(1)
         } else {
-            self.motion_mps = Some((u as f32, v as f32));
-        }
+            date
+        };
+        let Some(time_utc) = report_date
+            .and_hms_opt(hour, minute, 0)
+            .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+        else {
+            continue;
+        };
+        let (Ok(lat), Ok(lon)) = (
+            fields[5].trim().parse::<f32>(),
+            fields[6].trim().parse::<f32>(),
+        ) else {
+            continue;
+        };
+        reports.push(SpcReport {
+            time_utc,
+            f_scale: fields[1].trim().to_owned(),
+            location: fields[2].trim().to_owned(),
+            state: fields[4].trim().to_owned(),
+            lat,
+            lon,
+        });
     }
+    reports
 }
 
 /// A rotation site detected on the lowest velocity tilt, geolocated.
@@ -1230,6 +1253,8 @@ struct RenderRequest {
     smoothed: bool,
     /// Velocity dealias engine (false = region, true = tilt-cascade).
     dealias_cascade: bool,
+    /// Gate filter threshold in deci-dBZ; i16::MIN = off.
+    gate_filter_decidbz: i16,
     viewport_options: ViewportRasterOptions,
     radar_range_km: f32,
 }
@@ -1432,6 +1457,7 @@ struct RenderWorkerMomentCache {
     derived: Option<DerivedProduct>,
     smoothed: bool,
     dealias_cascade: bool,
+    gate_filter_decidbz: i16,
     color_table_signature: u64,
     cache: ViewportMomentCache,
     storm_palette_cache: Option<RenderWorkerStormPaletteCache>,
@@ -1613,6 +1639,7 @@ struct RenderWorkerViewportSignature {
     hail_levels_key: (i16, i16),
     smoothed: bool,
     dealias_cascade: bool,
+    gate_filter_decidbz: i16,
     viewport: ViewportKey,
 }
 
@@ -1629,6 +1656,7 @@ impl RenderWorkerViewportSignature {
         hail_levels_key: (i16, i16),
         smoothed: bool,
         dealias_cascade: bool,
+        gate_filter_decidbz: i16,
         viewport: ViewportKey,
     ) -> Self {
         Self {
@@ -1642,6 +1670,7 @@ impl RenderWorkerViewportSignature {
             hail_levels_key,
             smoothed,
             dealias_cascade,
+            gate_filter_decidbz,
             viewport,
         }
     }
@@ -1739,6 +1768,7 @@ fn spawn_render_worker_with_mode(
                 request.key.hail_levels_key,
                 request.key.smoothed,
                 request.key.dealias_cascade,
+                request.key.gate_filter_decidbz,
                 request.key.viewport,
             );
             while let Ok(recycled) = recycle_receiver.try_recv() {
@@ -2058,6 +2088,7 @@ impl ViewerApp {
         };
         let restored_basemap_style = tiles::TileStyle::from_key(&app_settings.basemap_style);
         let restored_bold_labels = app_settings.bold_labels;
+        let restored_gate_filter_dbz = app_settings.gate_filter_decidbz.map(|d| d as f32 / 10.0);
         let restored_placefile_slots: Vec<PlacefileSlot> = app_settings
             .placefiles
             .iter()
@@ -2137,9 +2168,8 @@ impl ViewerApp {
             placefile_slots: restored_placefile_slots,
             placefile_url_input: String::new(),
             placefile_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
-            storm_tracks: Vec::new(),
+            storm_tracker: StormTracker::default(),
             storm_tracks_site: String::new(),
-            next_storm_track_id: 1,
             storm_cells_volume_ptr: 0,
             storm_cells_receiver: None,
             show_storm_tracks: true,
@@ -2147,6 +2177,7 @@ impl ViewerApp {
             rotation_markers_volume_ptr: 0,
             rotation_receiver: None,
             show_rotation_markers: true,
+            gate_filter_dbz: None,
             dealias_cascade: false,
             display_smoothing: false,
             hail_freezing_level_km: 3.2,
@@ -2161,6 +2192,16 @@ impl ViewerApp {
             basemap_shape_cache: std::cell::RefCell::new(ShapeCache::new(16)),
             hazard_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
             cross_section_armed: false,
+            context_menu_lonlat: None,
+            spc_reports: None,
+            spc_receiver: None,
+            archive_pending_event: None,
+            archive_load_loop: true,
+            archive_date_input: String::new(),
+            archive_volumes: None,
+            archive_list_receiver: None,
+            vrot_tool_armed: false,
+            vrot_points: Vec::new(),
             cross_section_a_lonlat: None,
             cross_section_b_lonlat: None,
             cross_section_texture: None,
@@ -2192,6 +2233,7 @@ impl ViewerApp {
         };
         app.basemap_style = restored_basemap_style;
         app.bold_labels = restored_bold_labels;
+        app.gate_filter_dbz = restored_gate_filter_dbz;
         app.start_site_catalog_load(&cc.egui_ctx);
         app.load_volume(&cc.egui_ctx);
         app.load_live_hazards(&cc.egui_ctx);
@@ -3544,6 +3586,7 @@ impl ViewerApp {
             hail_levels_key: self.hail_levels_key(),
             smoothed,
             dealias_cascade: self.dealias_cascade,
+            gate_filter_decidbz: self.gate_filter_key(),
             viewport: viewport_key,
         };
         if self.texture_key.as_ref() == Some(&key) {
@@ -3568,6 +3611,7 @@ impl ViewerApp {
                 hail_levels_m: self.hail_levels_m(),
                 smoothed,
                 dealias_cascade: self.dealias_cascade,
+                gate_filter_decidbz: self.gate_filter_key(),
                 viewport_options,
                 radar_range_km: self
                     .selected_grid_range_km()
@@ -3594,6 +3638,18 @@ impl ViewerApp {
             (self.hail_freezing_level_km * 10.0).round() as i16,
             (self.hail_minus20_level_km * 10.0).round() as i16,
         )
+    }
+
+    /// Persisted form of the gate filter (deci-dBZ; None = off).
+    fn gate_filter_key_setting(&self) -> Option<i16> {
+        self.gate_filter_dbz.map(|dbz| (dbz * 10.0).round() as i16)
+    }
+
+    /// Gate filter key for render requests (deci-dBZ; i16::MIN = off).
+    fn gate_filter_key(&self) -> i16 {
+        self.gate_filter_dbz
+            .map(|dbz| (dbz * 10.0).round() as i16)
+            .unwrap_or(i16::MIN)
     }
 
     /// Smoothing applies to everything except storm-relative products (their
@@ -3663,6 +3719,7 @@ impl ViewerApp {
                 hail_levels_key: self.hail_levels_key(),
                 smoothed,
                 dealias_cascade: self.dealias_cascade,
+                gate_filter_decidbz: self.gate_filter_key(),
                 viewport: viewport_key,
             };
             if layer.texture_key.as_ref() == Some(&key)
@@ -3687,6 +3744,7 @@ impl ViewerApp {
                     hail_levels_m: self.hail_levels_m(),
                     smoothed,
                     dealias_cascade: self.dealias_cascade,
+                    gate_filter_decidbz: self.gate_filter_key(),
                     viewport_options,
                     radar_range_km,
                 },
@@ -3795,10 +3853,17 @@ impl ViewerApp {
             derived,
             request.smoothed,
             request.dealias_cascade,
+            request.gate_filter_decidbz,
             color_table_signature,
         )
         .is_none()
         {
+            // The gate filter applies to every non-reflectivity base moment
+            // (GR2-style GateFilter); it composes BEFORE smoothing.
+            let gate_filter = (request.gate_filter_decidbz != i16::MIN
+                && base_moment != MomentType::Reflectivity
+                && derived.is_none())
+            .then(|| request.gate_filter_decidbz as f32 / 10.0);
             let cache = if let Some(d) = derived {
                 build_derived_moment_cache(
                     request.volume.as_ref(),
@@ -3808,37 +3873,24 @@ impl ViewerApp {
                     request.hail_levels_m,
                     request.smoothed,
                 )
-            } else if request.smoothed {
-                // Smoothed display: smooth the polar grid ONCE (cached by
-                // this very moment cache) and render it through the existing
-                // fast path — pans stay full speed.
-                build_smoothed_plain_cache(
+            } else if request.smoothed
+                || gate_filter.is_some()
+                || (dealiased_velocity && request.dealias_cascade)
+            {
+                // Preprocessed display (gate filter / smoothing / cascade
+                // dealias): build the grid ONCE (cached by this very moment
+                // cache) and render it through the existing fast path —
+                // pans stay full speed.
+                build_preprocessed_plain_cache(
                     request.volume.as_ref(),
                     request.cut,
                     &base_moment,
                     dealiased_velocity,
+                    request.dealias_cascade,
+                    gate_filter,
+                    request.smoothed,
                     &request.color_tables,
                 )
-            } else if dealiased_velocity && request.dealias_cascade {
-                // Tilt-cascade engine: dealias top-down with the upper tilt's
-                // wind fit as the branch reference, then render the grid via
-                // the derived-cache entry (Velocity palette).
-                dealias_velocity_grid_cascade(request.volume.as_ref(), request.cut)
-                    .ok_or_else(|| "cascade dealias failed".to_owned())
-                    .and_then(|grid| {
-                        ViewportMomentCache::new_derived(
-                            request.volume.as_ref(),
-                            request.cut,
-                            if request.smoothed {
-                                smooth_moment_grid(&grid)
-                            } else {
-                                grid
-                            },
-                            ColorTableFamily::Velocity,
-                            &request.color_tables,
-                        )
-                        .map_err(|err| err.to_string())
-                    })
             } else if dealiased_velocity {
                 ViewportMomentCache::new_dealiased_velocity_with_color_tables(
                     request.volume.as_ref(),
@@ -3866,6 +3918,7 @@ impl ViewerApp {
                     derived,
                     smoothed: request.smoothed,
                     dealias_cascade: request.dealias_cascade,
+                    gate_filter_decidbz: request.gate_filter_decidbz,
                     color_table_signature,
                     cache,
                     storm_palette_cache: None,
@@ -3887,6 +3940,7 @@ impl ViewerApp {
             request.key.hail_levels_key,
             request.key.smoothed,
             request.key.dealias_cascade,
+            request.key.gate_filter_decidbz,
             request.key.viewport,
         );
         let sample_cache_signature = RenderWorkerSampleCacheSignature::new(
@@ -4096,6 +4150,7 @@ impl ViewerApp {
             request.key.hail_levels_key,
             request.key.smoothed,
             request.key.dealias_cascade,
+            request.key.gate_filter_decidbz,
             request.key.viewport,
         );
         let sample_cache_signature = RenderWorkerSampleCacheSignature::new(
@@ -4118,6 +4173,7 @@ impl ViewerApp {
             request.product.derived(),
             request.key.smoothed,
             request.key.dealias_cascade,
+            request.key.gate_filter_decidbz,
             viewport_signature.color_table_signature,
         ) else {
             return;
@@ -4182,6 +4238,7 @@ impl ViewerApp {
             None,
             false,
             false,
+            i16::MIN,
             velocity_color_table_signature,
         )
         .is_none()
@@ -4214,6 +4271,7 @@ impl ViewerApp {
                     derived: None,
                     smoothed: false,
                     dealias_cascade: false,
+                    gate_filter_decidbz: i16::MIN,
                     color_table_signature: velocity_color_table_signature,
                     cache,
                     storm_palette_cache: None,
@@ -4244,6 +4302,7 @@ impl ViewerApp {
             None,
             false,
             false,
+            i16::MIN,
             velocity_color_table_signature,
         ) else {
             return;
@@ -4281,6 +4340,7 @@ impl ViewerApp {
         derived: Option<DerivedProduct>,
         smoothed: bool,
         dealias_cascade: bool,
+        gate_filter_decidbz: i16,
         color_table_signature: u64,
     ) -> Option<usize> {
         let index = moment_caches.iter().position(|cached| {
@@ -4291,6 +4351,7 @@ impl ViewerApp {
                 && cached.derived == derived
                 && cached.smoothed == smoothed
                 && cached.dealias_cascade == dealias_cascade
+                && cached.gate_filter_decidbz == gate_filter_decidbz
                 && cached.color_table_signature == color_table_signature
         })?;
         let cached = moment_caches.remove(index);
@@ -4311,6 +4372,7 @@ impl ViewerApp {
                 || cached.derived != cache.derived
                 || cached.smoothed != cache.smoothed
                 || cached.dealias_cascade != cache.dealias_cascade
+                || cached.gate_filter_decidbz != cache.gate_filter_decidbz
         });
         moment_caches.push(cache);
         while moment_caches.len() > cache_policy.moment_cache_capacity() {
@@ -4600,6 +4662,7 @@ impl ViewerApp {
             hail_levels_key: self.hail_levels_key(),
             smoothed,
             dealias_cascade: self.dealias_cascade,
+            gate_filter_decidbz: self.gate_filter_key(),
             viewport: viewport_key,
         };
         {
@@ -4627,6 +4690,7 @@ impl ViewerApp {
             hail_levels_m: self.hail_levels_m(),
             smoothed,
             dealias_cascade: self.dealias_cascade,
+            gate_filter_decidbz: self.gate_filter_key(),
             viewport_options,
             radar_range_km,
         };
@@ -4877,6 +4941,251 @@ impl ViewerApp {
         self.start_latest_level2_load_with_mode(site, ctx, LatestLoadMode::Loop);
     }
 
+    /// Fetch SPC tornado reports for the archive date (background).
+    fn start_spc_fetch(&mut self, ctx: &egui::Context) {
+        let Ok(date) =
+            chrono::NaiveDate::parse_from_str(self.archive_date_input.trim(), "%Y-%m-%d")
+        else {
+            self.status = "Archive date must be YYYY-MM-DD".to_owned();
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.spc_receiver = Some(receiver);
+        self.spc_reports = None;
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let url = format!(
+                "https://www.spc.noaa.gov/climo/reports/{}_rpts_filtered_torn.csv",
+                date.format("%y%m%d")
+            );
+            let result = data_source::fetch_text(&url)
+                .map(|text| parse_spc_tornado_csv(date, &text))
+                .map_err(|err| err.to_string());
+            let _ = sender.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_spc_reports(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.spc_receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(reports)) => {
+                self.spc_receiver = None;
+                self.status = format!("SPC: {} tornado reports", reports.len());
+                self.spc_reports = Some(reports);
+                ctx.request_repaint();
+            }
+            Ok(Err(err)) => {
+                self.spc_receiver = None;
+                self.status = format!("SPC fetch failed: {err}");
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.spc_receiver = None,
+        }
+    }
+
+    /// Event click: switch to the lowest-beam radar over the report, center
+    /// the map there, and queue an archive load of the volume nearest the
+    /// report time (fires when the listing lands).
+    fn jump_to_spc_report(&mut self, report: &SpcReport, ctx: &egui::Context) {
+        // Lowest beam over the report location (same rule as the
+        // right-click menu).
+        let best = self
+            .sites
+            .iter()
+            .enumerate()
+            .filter_map(|(index, site)| {
+                let (site_lat, site_lon) = site_location(site)?;
+                let distance_km = haversine_km(report.lat, report.lon, site_lat, site_lon);
+                (distance_km <= 460.0).then_some((index, distance_km))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        let Some((site_index, _)) = best else {
+            self.status = "No radar within 460 km of that report".to_owned();
+            return;
+        };
+        self.selected_site_index = site_index;
+        self.map_center_lat = report.lat;
+        self.map_center_lon = report.lon;
+        self.map_scale = self.map_scale.max(220.0);
+        // The report time's RADAR date can differ from the SPC file date
+        // (12Z convention) — list the report's own calendar date.
+        self.archive_date_input = report.time_utc.format("%Y-%m-%d").to_string();
+        self.archive_pending_event = Some(report.time_utc);
+        self.start_archive_listing(ctx);
+    }
+
+    /// Kick a background listing of the archive date's volumes.
+    fn start_archive_listing(&mut self, ctx: &egui::Context) {
+        let Some(site) = self.selected_site().cloned() else {
+            self.status = "No site selected".to_owned();
+            return;
+        };
+        let Ok(date) =
+            chrono::NaiveDate::parse_from_str(self.archive_date_input.trim(), "%Y-%m-%d")
+        else {
+            self.status = "Archive date must be YYYY-MM-DD".to_owned();
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.archive_list_receiver = Some(receiver);
+        self.archive_volumes = None;
+        let site_id = site.level2_id.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let result =
+                data_source::level2_objects_for_date(&site_id, date).map_err(|err| err.to_string());
+            let _ = sender.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_archive_listing(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.archive_list_receiver else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(objects)) => {
+                self.archive_list_receiver = None;
+                let volumes: Vec<(data_source::S3Object, String)> = objects
+                    .into_iter()
+                    .map(|object| {
+                        // KXXX20260609_235423_V06 -> 23:54:23
+                        let label = object
+                            .key
+                            .rsplit('/')
+                            .next()
+                            .and_then(|name| name.split('_').nth(1))
+                            .filter(|t| t.len() == 6)
+                            .map(|t| format!("{}:{}:{}", &t[0..2], &t[2..4], &t[4..6]))
+                            .unwrap_or_else(|| "??".to_owned());
+                        (object, label)
+                    })
+                    .collect();
+                self.status = format!("Archive: {} volumes listed", volumes.len());
+                self.archive_volumes = Some(volumes);
+                // Event jump: load the volume nearest the report time.
+                if let Some(target) = self.archive_pending_event.take()
+                    && let Some(volumes) = &self.archive_volumes
+                    && !volumes.is_empty()
+                {
+                    let target_label = target.format("%H:%M:%S").to_string();
+                    let index = volumes
+                        .iter()
+                        .position(|(_, label)| label.as_str() > target_label.as_str())
+                        .unwrap_or(volumes.len())
+                        .saturating_sub(1);
+                    self.start_archive_loop_load(index, ctx);
+                }
+                ctx.request_repaint();
+            }
+            Ok(Err(err)) => {
+                self.archive_list_receiver = None;
+                self.status = format!("Archive listing failed: {err}");
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.archive_list_receiver = None,
+        }
+    }
+
+    /// Load a loop of archive volumes ending at the chosen index (the
+    /// chosen scan plus the preceding history-limit-1 scans), through the
+    /// normal decode/install pipeline. Disables live auto-refresh so the
+    /// next poll doesn't snap back to the present.
+    fn start_archive_loop_load(&mut self, chosen: usize, ctx: &egui::Context) {
+        let Some(site) = self.selected_site().cloned() else {
+            return;
+        };
+        let Some(volumes) = &self.archive_volumes else {
+            return;
+        };
+        if chosen >= volumes.len() || self.load_receiver.is_some() {
+            return;
+        }
+        let limit = if self.archive_load_loop {
+            self.history_frame_limit.max(1)
+        } else {
+            1
+        };
+        let start = chosen.saturating_sub(limit - 1);
+        let objects: Vec<data_source::S3Object> = volumes[start..=chosen]
+            .iter()
+            .map(|(object, _)| object.clone())
+            .collect();
+        let site_id = site.level2_id.clone();
+        if history_contains_other_site(&self.frame_history, &site_id) {
+            self.clear_frame_history();
+        }
+        self.realtime_level2_auto_refresh = false;
+        self.begin_primary_load_telemetry();
+        let (sender, receiver) = mpsc::channel();
+        self.load_receiver = Some(receiver);
+        self.pending_site_id = Some(site_id.clone());
+        self.status = format!("Loading {} archive volumes for {site_id}", objects.len());
+        let site_cache = cache_dir(&site.level2_id);
+        let known_frame_paths = self.current_history_paths();
+        thread::spawn(move || {
+            let total_start = Instant::now();
+            let mut decoded_frames = Vec::new();
+            let count = objects.len();
+            for (index, object) in objects.into_iter().enumerate() {
+                let is_last = index + 1 == count;
+                match decode_archive_history_object(
+                    &site_id,
+                    object,
+                    &site_cache,
+                    &known_frame_paths,
+                    None,
+                    total_start,
+                    &sender,
+                    false,
+                ) {
+                    Ok(Some(decoded)) => {
+                        let _ = sender.send(AsyncLoadResult {
+                            label: format!("L2 {site_id} archive"),
+                            update: AsyncLoadUpdate::History(
+                                DecodedLoadBatch {
+                                    frames: vec![decoded.clone()],
+                                    selected_index: 0,
+                                },
+                                is_last,
+                            ),
+                        });
+                        decoded_frames.push(decoded);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        let _ = sender.send(AsyncLoadResult {
+                            label: format!("L2 {site_id} archive"),
+                            update: AsyncLoadUpdate::Final(Err(err)),
+                        });
+                        return;
+                    }
+                }
+            }
+            if decoded_frames.is_empty() {
+                let _ = sender.send(AsyncLoadResult {
+                    label: format!("L2 {site_id} archive"),
+                    update: AsyncLoadUpdate::Final(Err("no archive volumes decoded".to_owned())),
+                });
+            } else {
+                let selected_index = decoded_frames.len() - 1;
+                let _ = sender.send(AsyncLoadResult {
+                    label: format!("L2 {site_id} archive"),
+                    update: AsyncLoadUpdate::Final(Ok(DecodedLoadBatch {
+                        frames: decoded_frames,
+                        selected_index,
+                    })),
+                });
+            }
+        });
+        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+    }
+
     fn start_latest_level2_load(&mut self, site: RadarSite, ctx: &egui::Context) {
         self.start_latest_level2_load_with_mode(site, ctx, LatestLoadMode::User);
     }
@@ -4957,6 +5266,8 @@ impl eframe::App for ViewerApp {
         self.poll_rotation_markers(&ctx);
         self.poll_storm_tracks(&ctx);
         self.poll_placefiles(&ctx);
+        self.poll_archive_listing(&ctx);
+        self.poll_spc_reports(&ctx);
         if self.tile_layer.borrow_mut().poll(&ctx) {
             ctx.request_repaint();
         }
@@ -5327,6 +5638,167 @@ impl ViewerApp {
             ui.label(&self.status);
         }
 
+        // Archive browser: list any UTC date's volumes for the selected site
+        // and load a loop ending at the chosen scan.
+        egui::CollapsingHeader::new("Archive")
+            .default_open(false)
+            .show(ui, |ui| {
+                if self.archive_date_input.is_empty() {
+                    self.archive_date_input = Utc::now().format("%Y-%m-%d").to_string();
+                }
+                ui.horizontal(|ui| {
+                    // Day navigation: step the date and re-list immediately.
+                    let mut step_days: i64 = 0;
+                    if ui.small_button("◀").on_hover_text("Previous day").clicked() {
+                        step_days = -1;
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.archive_date_input)
+                            .hint_text("YYYY-MM-DD")
+                            .desired_width(88.0),
+                    );
+                    if ui.small_button("▶").on_hover_text("Next day").clicked() {
+                        step_days = 1;
+                    }
+                    if ui.small_button("Today").clicked() {
+                        self.archive_date_input = Utc::now().format("%Y-%m-%d").to_string();
+                        self.start_archive_listing(ctx);
+                    }
+                    if step_days != 0
+                        && let Ok(date) = chrono::NaiveDate::parse_from_str(
+                            self.archive_date_input.trim(),
+                            "%Y-%m-%d",
+                        )
+                    {
+                        let stepped = date + chrono::Duration::days(step_days);
+                        self.archive_date_input = stepped.format("%Y-%m-%d").to_string();
+                        self.start_archive_listing(ctx);
+                    }
+                    let listing = self.archive_list_receiver.is_some();
+                    if ui
+                        .add_enabled(!listing, egui::Button::new("List"))
+                        .on_hover_text("List this UTC date's volumes for the selected site")
+                        .clicked()
+                    {
+                        self.start_archive_listing(ctx);
+                    }
+                    if listing {
+                        ui.spinner();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("On click:");
+                    ui.selectable_value(&mut self.archive_load_loop, true, "Loop")
+                        .on_hover_text("Load a loop ending at the chosen scan");
+                    ui.selectable_value(&mut self.archive_load_loop, false, "Single")
+                        .on_hover_text("Load only the chosen scan");
+                });
+                if let Some(volumes) = &self.archive_volumes {
+                    if volumes.is_empty() {
+                        ui.weak("No volumes for that date");
+                    } else {
+                        ui.weak(format!("{} volumes (UTC)", volumes.len()));
+                        let mut load_object: Option<usize> = None;
+                        egui::ScrollArea::vertical()
+                            .id_salt("archive_volume_list")
+                            .max_height(190.0)
+                            .show(ui, |ui| {
+                                // Hour headers + wrapped minute chips.
+                                let mut index = 0usize;
+                                while index < volumes.len() {
+                                    let hour = volumes[index].1.get(0..2).unwrap_or("??");
+                                    ui.weak(format!("{hour} UTC"));
+                                    ui.horizontal_wrapped(|ui| {
+                                        while index < volumes.len()
+                                            && volumes[index].1.get(0..2).unwrap_or("??") == hour
+                                        {
+                                            let minute_label = volumes[index]
+                                                .1
+                                                .get(3..8)
+                                                .unwrap_or(&volumes[index].1);
+                                            if ui
+                                                .add_sized(
+                                                    egui::vec2(52.0, PANEL_BUTTON_HEIGHT),
+                                                    egui::Button::new(minute_label),
+                                                )
+                                                .on_hover_text(&volumes[index].1)
+                                                .clicked()
+                                            {
+                                                load_object = Some(index);
+                                            }
+                                            index += 1;
+                                        }
+                                    });
+                                }
+                            });
+                        if let Some(index) = load_object {
+                            self.start_archive_loop_load(index, ctx);
+                        }
+                    }
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Tornadoes (SPC)");
+                    let fetching = self.spc_receiver.is_some();
+                    if ui
+                        .add_enabled(!fetching, egui::Button::new("Fetch"))
+                        .on_hover_text(
+                            "SPC storm reports for this date (12Z–12Z). Click a report to jump to the lowest-beam radar and load the loop at that time.",
+                        )
+                        .clicked()
+                    {
+                        self.start_spc_fetch(ctx);
+                    }
+                    if fetching {
+                        ui.spinner();
+                    }
+                });
+                let mut jump: Option<SpcReport> = None;
+                if let Some(reports) = &self.spc_reports {
+                    if reports.is_empty() {
+                        ui.weak("No tornado reports for that date");
+                    } else {
+                        ui.weak(format!("{} tornado reports", reports.len()));
+                        egui::ScrollArea::vertical()
+                            .id_salt("spc_report_list")
+                            .max_height(170.0)
+                            .show(ui, |ui| {
+                                for report in reports {
+                                    let scale = if report.f_scale.is_empty()
+                                        || report.f_scale == "UNK"
+                                    {
+                                        String::new()
+                                    } else {
+                                        format!("EF{} ", report.f_scale)
+                                    };
+                                    let label = format!(
+                                        "{}Z {}{}, {}",
+                                        report.time_utc.format("%H:%M"),
+                                        scale,
+                                        report.location,
+                                        report.state
+                                    );
+                                    if ui
+                                        .add_sized(
+                                            egui::vec2(ui.available_width(), PANEL_BUTTON_HEIGHT),
+                                            egui::Button::new(label),
+                                        )
+                                        .on_hover_text(
+                                            "Jump: lowest-beam radar + loop at this time",
+                                        )
+                                        .clicked()
+                                    {
+                                        jump = Some(report.clone());
+                                    }
+                                }
+                            });
+                    }
+                }
+                if let Some(report) = jump {
+                    self.jump_to_spc_report(&report, ctx);
+                }
+            });
+
         // R2: LAYERS — radar overlays + placefiles together, available with or
         // without a loaded volume.
         let layer_count =
@@ -5644,6 +6116,42 @@ impl ViewerApp {
             });
         }
 
+        // Gate filter (GR2-style GateFilter): hide non-REF gates whose
+        // co-located reflectivity is weak — the standard VEL declutter.
+        ui.horizontal(|ui| {
+            let mut on = self.gate_filter_dbz.is_some();
+            if ui
+                .checkbox(&mut on, "Gate filter")
+                .on_hover_text(
+                    "Hide velocity/dual-pol gates where the same-tilt reflectivity is below the threshold (declutters clear-air noise). Reflectivity itself is never filtered.",
+                )
+                .changed()
+            {
+                self.gate_filter_dbz = on.then_some(5.0);
+                self.app_settings.gate_filter_decidbz = self.gate_filter_key_setting();
+                let _ = self.app_settings.save();
+                self.clear_texture();
+                ctx.request_repaint();
+            }
+            ui.add_enabled_ui(self.gate_filter_dbz.is_some(), |ui| {
+                if let Some(threshold) = self.gate_filter_dbz.as_mut()
+                    && ui
+                        .add(
+                            egui::DragValue::new(threshold)
+                                .range(-15.0..=40.0)
+                                .speed(0.5)
+                                .suffix(" dBZ"),
+                        )
+                        .changed()
+                {
+                    self.app_settings.gate_filter_decidbz = self.gate_filter_key_setting();
+                    let _ = self.app_settings.save();
+                    self.clear_texture();
+                    ctx.request_repaint();
+                }
+            });
+        });
+
         // R4: TILT — stable position, at most one contextual block above it.
         Self::section_header(ui, "TILT");
         ui.horizontal(|ui| {
@@ -5738,7 +6246,7 @@ impl ViewerApp {
                 .changed()
             {
                 if !self.show_storm_tracks {
-                    self.storm_tracks.clear();
+                    self.storm_tracker.clear();
                 }
                 self.storm_cells_volume_ptr = 0;
                 ctx.request_repaint();
@@ -5764,6 +6272,19 @@ impl ViewerApp {
             .on_hover_text(
                 "Floating data card at the cursor (value, range/azimuth, beam height, Vrot; velocity products add a radial in/outbound arrow). Shift+click the map to pin it to a spot — it tracks pan/zoom and live updates; Shift+click it again to release.",
             );
+        ui.horizontal(|ui| {
+            let was_vrot = self.vrot_tool_armed;
+            ui.checkbox(&mut self.vrot_tool_armed, "Vrot tool")
+                .on_hover_text(
+                    "GR2-style rotational velocity: arm, then click the max INBOUND gate and the max OUTBOUND gate of a couplet (velocity product). The card shows Vrot = (|Vin|+|Vout|)/2, couplet diameter, and beam height. Right-click clears.",
+                );
+            if was_vrot != self.vrot_tool_armed {
+                self.vrot_points.clear();
+            }
+            if !self.vrot_points.is_empty() && fixed_action_button(ui, "Clear", 50.0).clicked() {
+                self.vrot_points.clear();
+            }
+        });
         ui.horizontal(|ui| {
             let was_armed = self.cross_section_armed;
             ui.checkbox(&mut self.cross_section_armed, "Cross-section")
@@ -6120,6 +6641,15 @@ impl ViewerApp {
                 .hint_text("Color table path"),
         );
         ui.horizontal(|ui| {
+            if fixed_action_button(ui, "Browse…", 70.0).clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Color tables", &["pal", "txt"])
+                    .set_title("Open color table")
+                    .pick_file()
+            {
+                self.color_table_path_text = path.display().to_string();
+                self.load_color_table_path(ctx);
+            }
             let has_path = !self.color_table_path_text.trim().is_empty();
             if fixed_disabled_action_button(ui, has_path, "Load Table", 84.0).clicked() {
                 self.load_color_table_path(ctx);
@@ -6683,6 +7213,18 @@ impl ViewerApp {
             .and_then(|position| self.cursor_readout_at(rect, position));
         self.cursor_readout = cursor_readout;
 
+        // Right-click context menu: the lowest-beam radars for this spot
+        // (4/3-Earth geometry at the 0.5° base tilt — community idea from
+        // wxKobold's lowest-unblocked-beam map). Armed tools own right-click.
+        if !self.cross_section_armed && !self.vrot_tool_armed {
+            if response.secondary_clicked()
+                && let Some(pointer) = response.interact_pointer_pos()
+            {
+                self.context_menu_lonlat = Some(self.screen_to_lon_lat(rect, pointer));
+            }
+            response.context_menu(|ui| self.best_radar_context_menu(ui));
+        }
+
         let basemap_start = Instant::now();
         self.draw_basemap(painter, rect);
         self.draw_graticule(painter, rect);
@@ -6696,6 +7238,7 @@ impl ViewerApp {
         self.draw_hazard_overlays(painter, rect, &self.selected_product.clone());
         self.draw_rotation_markers(painter, rect);
         self.draw_storm_tracks(painter, rect);
+        self.draw_vrot_tool(painter, rect);
         self.draw_placefiles(painter, rect);
         self.basemap_ms = Some(underlay_ms + overlay_start.elapsed().as_secs_f32() * 1000.0);
 
@@ -6787,6 +7330,21 @@ impl ViewerApp {
                 self.cross_section_texture = None;
                 self.cross_section_signature = None;
                 self.cross_section_status = "Cross-section: click endpoint A then B".to_owned();
+            }
+        } else if self.vrot_tool_armed {
+            if response.clicked()
+                && let Some(pointer) = response.interact_pointer_pos()
+                && let Some(readout) = self.cursor_readout_at(rect, pointer)
+            {
+                let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
+                if self.vrot_points.len() >= 2 {
+                    self.vrot_points.clear();
+                }
+                self.vrot_points
+                    .push((lon, lat, readout.value, readout.height_above_radar_m));
+            }
+            if response.secondary_clicked() {
+                self.vrot_points.clear();
             }
         }
 
@@ -7488,7 +8046,22 @@ impl ViewerApp {
                         .map(|v| Arc::as_ptr(v) as usize)
                         .unwrap_or(0);
                     if volume_ptr == current {
-                        self.associate_storm_cells(time, cells);
+                        // Live-partial policy: track only COMPLETE volumes —
+                        // partial composites bias centroids and poison the
+                        // motion fit (the old replace-last-fix is abolished).
+                        // Partial volumes still draw advected tracks.
+                        let complete = self
+                            .selected_frame()
+                            .map(|frame| frame.status != FrameStatus::LivePartial)
+                            .unwrap_or(true);
+                        if complete {
+                            let user_motion = {
+                                let dir = (self.storm_motion_direction_deg as f64).to_radians();
+                                let speed = self.storm_motion_speed_kt as f64 * KNOT_TO_MPS as f64;
+                                (speed > 1.0).then(|| (speed * dir.sin(), speed * dir.cos()))
+                            };
+                            self.storm_tracker.associate(time, &cells, user_motion);
+                        }
                         ctx.request_repaint();
                     } else {
                         self.storm_cells_volume_ptr = 0;
@@ -7506,7 +8079,7 @@ impl ViewerApp {
         };
         // Site change resets the history (tracks are radar-relative).
         if self.storm_tracks_site != volume.site.id {
-            self.storm_tracks.clear();
+            self.storm_tracker.clear();
             self.storm_tracks_site = volume.site.id.clone();
         }
         let volume_ptr = Arc::as_ptr(&volume) as usize;
@@ -7525,98 +8098,143 @@ impl ViewerApp {
         });
     }
 
-    fn associate_storm_cells(&mut self, time: DateTime<Utc>, cells: Vec<StormCell>) {
-        const MATCH_LIMIT_KM: f64 = 16.0;
-        let mut taken = vec![false; cells.len()];
-        for track in &mut self.storm_tracks {
-            let Some(&(last_time, last_east, last_north)) = track.history.last() else {
-                continue;
-            };
-            // Same volume time (live chunk refinement): replace the last fix.
-            let dt_s = (time - last_time).num_milliseconds() as f64 / 1000.0;
-            let (predicted_east, predicted_north) = match (dt_s > 0.0, track.motion_mps) {
-                (true, Some((u, v))) => (
-                    last_east + u as f64 * dt_s / 1000.0,
-                    last_north + v as f64 * dt_s / 1000.0,
-                ),
-                _ => (last_east, last_north),
-            };
-            let mut best: Option<(usize, f64)> = None;
-            for (index, cell) in cells.iter().enumerate() {
-                if taken[index] {
-                    continue;
+    /// Context menu: the three lowest-beam radars over the clicked point
+    /// (slant range → 4/3-Earth beam height at 0.5°). Geometry only — the
+    /// terrain-blockage version needs a coverage dataset (wxKobold's
+    /// boundary placefile draws those regions as an overlay today).
+    fn best_radar_context_menu(&mut self, ui: &mut egui::Ui) {
+        let Some((lon, lat)) = self.context_menu_lonlat else {
+            ui.close();
+            return;
+        };
+        let mut candidates: Vec<(usize, String, f32, f32)> = self
+            .sites
+            .iter()
+            .enumerate()
+            .filter_map(|(index, site)| {
+                let (site_lat, site_lon) = site_location(site)?;
+                let distance_km = haversine_km(lat, lon, site_lat, site_lon);
+                if distance_km > 460.0 {
+                    return None;
                 }
-                let distance = ((cell.east_km - predicted_east).powi(2)
-                    + (cell.north_km - predicted_north).powi(2))
-                .sqrt();
-                if distance <= MATCH_LIMIT_KM && best.is_none_or(|(_, d)| distance < d) {
-                    best = Some((index, distance));
-                }
-            }
-            if let Some((index, _)) = best {
-                taken[index] = true;
-                let cell = &cells[index];
-                if dt_s <= 0.0 {
-                    if let Some(last) = track.history.last_mut() {
-                        *last = (time, cell.east_km, cell.north_km);
-                    }
-                } else {
-                    track.history.push((time, cell.east_km, cell.north_km));
-                    if track.history.len() > 12 {
-                        track.history.remove(0);
-                    }
-                }
-                track.max_dbz = track.max_dbz.max(cell.max_dbz);
-                track.missed = 0;
-                track.refit_motion();
-            } else if dt_s > 0.0 {
-                track.missed = track.missed.saturating_add(1);
+                let beam_m =
+                    radar_core::beam_height_above_radar_m(distance_km as f64 * 1000.0, 0.5) as f32;
+                Some((index, site.level2_id.clone(), beam_m, distance_km))
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
+        ui.label(format!("{lat:.3}, {lon:.3}"));
+        ui.separator();
+        if candidates.is_empty() {
+            ui.weak("No radar within 460 km");
+            return;
+        }
+        ui.label("Lowest beam here:");
+        let mut load: Option<usize> = None;
+        for (index, id, beam_m, distance_km) in candidates.into_iter().take(3) {
+            let beam_kft = beam_m * 3.280_84 / 1000.0;
+            if ui
+                .button(format!("{id} · {beam_kft:.1} kft · {distance_km:.0} km"))
+                .on_hover_text("Switch to this site and load the latest volume")
+                .clicked()
+            {
+                load = Some(index);
+                ui.close();
             }
         }
-        self.storm_tracks.retain(|track| track.missed < 2);
-        for (index, cell) in cells.iter().enumerate() {
-            if taken[index] {
-                continue;
+        if let Some(index) = load {
+            self.selected_site_index = index;
+            if self.load_receiver.is_none() {
+                let site = self.sites[index].clone();
+                let ctx = ui.ctx().clone();
+                self.start_latest_level2_load(site, &ctx);
             }
-            self.storm_tracks.push(StormTrack {
-                id: self.next_storm_track_id,
-                history: vec![(time, cell.east_km, cell.north_km)],
-                max_dbz: cell.max_dbz,
-                motion_mps: None,
-                missed: 0,
-            });
-            self.next_storm_track_id = self.next_storm_track_id.wrapping_add(1).max(1);
         }
     }
 
-    /// Mean motion of established tracks → the SRV storm-motion fields.
+    /// Mean fitted track motion → the SRV storm-motion fields
+    /// (SCIT's default-motion source, Johnson et al. 1998 §2c).
     fn storm_motion_from_tracks(&self) -> Option<(f32, f32)> {
-        let motions: Vec<(f32, f32)> = self
-            .storm_tracks
-            .iter()
-            .filter(|t| t.history.len() >= 3)
-            .filter_map(|t| t.motion_mps)
-            .collect();
-        if motions.is_empty() {
-            return None;
-        }
-        let n = motions.len() as f32;
-        let u = motions.iter().map(|(u, _)| u).sum::<f32>() / n;
-        let v = motions.iter().map(|(_, v)| v).sum::<f32>() / n;
+        let (u, v) = self.storm_tracker.mean_fitted_motion()?;
         let speed_mps = u.hypot(v);
         if speed_mps < 1.0 {
             return None;
         }
         // StormMotion.direction_deg = direction the storm moves TOWARD
         // (motion_component_away peaks looking down-motion).
-        let direction = (u.atan2(v)).to_degrees().rem_euclid(360.0);
-        Some((direction, speed_mps / KNOT_TO_MPS))
+        let direction = (u.atan2(v)).to_degrees().rem_euclid(360.0) as f32;
+        Some((direction, (speed_mps / KNOT_TO_MPS as f64) as f32))
+    }
+
+    /// GR2-style Vrot measurement overlay: two clicked gates (max inbound +
+    /// max outbound), connecting line, and a card with
+    /// Vrot = (|Vin| + |Vout|) / 2, couplet diameter, and beam height.
+    fn draw_vrot_tool(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if self.vrot_points.is_empty() {
+            return;
+        }
+        let positions: Vec<egui::Pos2> = self
+            .vrot_points
+            .iter()
+            .map(|&(lon, lat, ..)| self.lon_lat_to_screen(rect, lon, lat))
+            .collect();
+        for (index, position) in positions.iter().enumerate() {
+            let value = self.vrot_points[index].2;
+            let color = if value < 0.0 {
+                egui::Color32::from_rgb(80, 220, 120)
+            } else {
+                egui::Color32::from_rgb(240, 90, 80)
+            };
+            painter.circle_filled(*position, 4.0, color);
+            painter.circle_stroke(*position, 4.0, egui::Stroke::new(1.2, egui::Color32::BLACK));
+        }
+        if self.vrot_points.len() == 2 {
+            painter.line_segment(
+                [positions[0], positions[1]],
+                egui::Stroke::new(1.6, egui::Color32::from_rgb(245, 230, 120)),
+            );
+            let (lon_a, lat_a, v_a, h_a) = self.vrot_points[0];
+            let (lon_b, lat_b, v_b, h_b) = self.vrot_points[1];
+            let vrot_mps = (v_a.abs() + v_b.abs()) / 2.0;
+            let diameter_km = haversine_km(lat_a, lon_a, lat_b, lon_b);
+            let diameter_nm = diameter_km * 0.539_957;
+            let height_kft = ((h_a + h_b) / 2.0) * 3.280_84 / 1000.0;
+            let mid = egui::pos2(
+                (positions[0].x + positions[1].x) / 2.0,
+                (positions[0].y + positions[1].y) / 2.0,
+            );
+            let label = format!(
+                "Vrot {:.0} kt · dia {:.1} nm · {:.1} kft",
+                vrot_mps / KNOT_TO_MPS,
+                diameter_nm,
+                height_kft
+            );
+            draw_heavy_halo_text(
+                painter,
+                mid + egui::vec2(0.0, -14.0),
+                egui::Align2::CENTER_BOTTOM,
+                &label,
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_rgb(250, 240, 180),
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 230),
+            );
+        } else {
+            draw_halo_text(
+                painter,
+                positions[0] + egui::vec2(8.0, -8.0),
+                egui::Align2::LEFT_BOTTOM,
+                "click max outbound",
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_rgb(245, 230, 120),
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
+            );
+        }
     }
 
     /// Draw track histories, current positions, and SCIT-style extrapolated
     /// positions at +15/+30/+45 min along the fitted motion.
     fn draw_storm_tracks(&self, painter: &egui::Painter, rect: egui::Rect) {
-        if !self.show_storm_tracks || self.storm_tracks.is_empty() {
+        if !self.show_storm_tracks || self.storm_tracker.tracks.is_empty() {
             return;
         }
         let Some((radar_lat, radar_lon)) = self.radar_location() else {
@@ -7629,8 +8247,8 @@ impl ViewerApp {
             self.lon_lat_to_screen(rect, lon, lat)
         };
         let line_color = egui::Color32::from_rgb(235, 240, 245);
-        for track in &self.storm_tracks {
-            if track.history.is_empty() {
+        for track in &self.storm_tracker.tracks {
+            if track.history.is_empty() || track.merged_into.is_some() {
                 continue;
             }
             let points: Vec<egui::Pos2> = track
@@ -7650,13 +8268,12 @@ impl ViewerApp {
             }
             painter.circle_filled(current, 3.5, line_color);
             painter.circle_stroke(current, 3.5, egui::Stroke::new(1.0, egui::Color32::BLACK));
-            if let Some((u, v)) = track.motion_mps {
-                let &(_, east, north) = track.history.last().expect("non-empty");
+            if let Some((u, v)) = track.fitted_motion {
+                let (_, east, north) = track.last_fix().expect("non-empty");
                 let mut previous = current;
                 for minutes in [15.0f64, 30.0, 45.0] {
                     let t = minutes * 60.0;
-                    let position =
-                        to_screen(east + u as f64 * t / 1000.0, north + v as f64 * t / 1000.0);
+                    let position = to_screen(east + u * t / 1000.0, north + v * t / 1000.0);
                     painter.line_segment(
                         [previous, position],
                         egui::Stroke::new(
@@ -7669,10 +8286,10 @@ impl ViewerApp {
                 }
             }
             if self.map_scale >= 90.0 {
-                let label = match track.motion_mps {
+                let label = match track.fitted_motion {
                     Some((u, v)) => {
                         let dir = (u.atan2(v)).to_degrees().rem_euclid(360.0);
-                        let kt = u.hypot(v) / KNOT_TO_MPS;
+                        let kt = u.hypot(v) / KNOT_TO_MPS as f64;
                         format!(
                             "#{} {:.0}dBZ {:03.0}°/{:.0}kt",
                             track.id, track.max_dbz, dir, kt
@@ -9764,6 +10381,7 @@ struct TextureKey {
     hail_levels_key: (i16, i16),
     smoothed: bool,
     dealias_cascade: bool,
+    gate_filter_decidbz: i16,
     viewport: ViewportKey,
 }
 
@@ -10120,21 +10738,11 @@ fn parse_color_table_for_family(
     name: &str,
     text: &str,
 ) -> Result<ColorTable, color_tables::ColorTableError> {
-    match family {
-        ColorTableFamily::Reflectivity
-        | ColorTableFamily::Velocity
-        | ColorTableFamily::SpectrumWidth => ColorTable::parse_stepped(name, text),
-        ColorTableFamily::CorrelationCoefficient
-        | ColorTableFamily::DifferentialReflectivity
-        | ColorTableFamily::EchoTops
-        | ColorTableFamily::Vil
-        | ColorTableFamily::VilDensity
-        | ColorTableFamily::HailSize
-        | ColorTableFamily::AzimuthalShear
-        | ColorTableFamily::DifferentialPhase
-        | ColorTableFamily::SpecificDifferentialPhase
-        | ColorTableFamily::Generic => ColorTable::parse(name, text),
-    }
+    // User .pal files get faithful GR2Analyst semantics for every family:
+    // solid/gradient intervals, color4 alpha, Step: as legend ticks only —
+    // a community-loaded table must look exactly like it does in GR2A.
+    let _ = family;
+    ColorTable::parse_gr_pal(name, text)
 }
 
 fn color_table_summary(table: &ColorTable) -> String {
@@ -10427,12 +11035,19 @@ fn detect_rotation_markers_for_volume(
         .collect()
 }
 
-/// Smoothed plain/dealiased moment: smooth the grid, render via new_derived.
-fn build_smoothed_plain_cache(
+/// Preprocessed plain/dealiased moment: optional cascade dealias, optional
+/// reflectivity gate filter (GR2-style GateFilter), optional smoothing —
+/// in that order — rendered via the derived-cache entry. Each combination
+/// is keyed separately, so the per-frame fast path is untouched.
+#[allow(clippy::too_many_arguments)]
+fn build_preprocessed_plain_cache(
     volume: &RadarVolume,
     cut_index: usize,
     moment: &MomentType,
     dealiased_velocity: bool,
+    dealias_cascade: bool,
+    gate_filter_dbz: Option<f32>,
+    smoothed: bool,
     color_tables: &ColorTableSet,
 ) -> std::result::Result<ViewportMomentCache, String> {
     let cut = volume
@@ -10443,16 +11058,24 @@ fn build_smoothed_plain_cache(
         .moments
         .get(moment)
         .ok_or_else(|| format!("moment {moment:?} missing"))?;
-    let source = if dealiased_velocity {
+    let mut source = if dealiased_velocity && dealias_cascade {
+        dealias_velocity_grid_cascade(volume, cut_index)
+            .ok_or_else(|| "cascade dealias failed".to_owned())?
+    } else if dealiased_velocity {
         dealias_velocity_grid(cut, grid)
     } else {
         grid.clone()
     };
-    let smoothed = smooth_moment_grid(&source);
+    if let Some(threshold) = gate_filter_dbz {
+        source = apply_reflectivity_gate_filter(cut, &source, threshold);
+    }
+    if smoothed {
+        source = smooth_moment_grid(&source);
+    }
     ViewportMomentCache::new_derived(
         volume,
         cut_index,
-        smoothed,
+        source,
         color_family_for_moment(moment),
         color_tables,
     )
@@ -13735,6 +14358,7 @@ mod tests {
             radar_y_px: 3_000,
             km_per_px_x: 160_000,
             km_per_px_y: 160_000,
+            rotation_mrad: 0,
         };
 
         let first_pixels = RenderWorkerViewportSignature::new(
@@ -13748,6 +14372,7 @@ mod tests {
             (32, 64),
             false,
             false,
+            i16::MIN,
             viewport,
         );
         let second_pixels = RenderWorkerViewportSignature::new(
@@ -13761,6 +14386,7 @@ mod tests {
             (32, 64),
             false,
             false,
+            i16::MIN,
             viewport,
         );
         assert_ne!(first_pixels, second_pixels);
@@ -13963,6 +14589,7 @@ mod tests {
                 hail_levels_key: (32, 64),
                 smoothed: false,
                 dealias_cascade: false,
+                gate_filter_decidbz: i16::MIN,
                 viewport: test_viewport_key(1320, 820),
             },
             pane: 0,
@@ -13975,6 +14602,7 @@ mod tests {
             hail_levels_m: (3200.0, 6400.0),
             smoothed: false,
             dealias_cascade: false,
+            gate_filter_decidbz: i16::MIN,
             storm_motion: StormMotion {
                 direction_deg: 45.0,
                 speed_mps: 35.0 * KNOT_TO_MPS,
@@ -13986,6 +14614,7 @@ mod tests {
                 radar_y_px: 410.0,
                 km_per_px_x: 0.16,
                 km_per_px_y: 0.16,
+                rotation_rad: 0.0,
             },
             radar_range_km: DEFAULT_RADAR_RANGE_KM,
         };
@@ -15240,6 +15869,7 @@ mod tests {
             radar_y_px: 50 * 8,
             km_per_px_x: 1_000_000,
             km_per_px_y: 1_000_000,
+            rotation_mrad: 0,
         };
         let current = ViewportRasterOptions {
             width: 100,
@@ -15269,6 +15899,7 @@ mod tests {
             radar_y_px: 50 * 8,
             km_per_px_x: 1_000_000,
             km_per_px_y: 1_000_000,
+            rotation_mrad: 0,
         };
         let current = ViewportRasterOptions {
             width: 100,
@@ -15277,6 +15908,7 @@ mod tests {
             radar_y_px: 50.0,
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
+            rotation_rad: 0.0,
         };
 
         let image_rect = anchored_radar_texture_rect(rect, 1.0, rendered, current);
@@ -15485,9 +16117,8 @@ mod tests {
             placefile_slots: Vec::new(),
             placefile_url_input: String::new(),
             placefile_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
-            storm_tracks: Vec::new(),
+            storm_tracker: StormTracker::default(),
             storm_tracks_site: String::new(),
-            next_storm_track_id: 1,
             storm_cells_volume_ptr: 0,
             storm_cells_receiver: None,
             show_storm_tracks: true,
@@ -15495,6 +16126,7 @@ mod tests {
             rotation_markers_volume_ptr: 0,
             rotation_receiver: None,
             show_rotation_markers: true,
+            gate_filter_dbz: None,
             dealias_cascade: false,
             display_smoothing: false,
             hail_freezing_level_km: 3.2,
@@ -15509,6 +16141,16 @@ mod tests {
             basemap_shape_cache: std::cell::RefCell::new(ShapeCache::new(16)),
             hazard_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
             cross_section_armed: false,
+            context_menu_lonlat: None,
+            spc_reports: None,
+            spc_receiver: None,
+            archive_pending_event: None,
+            archive_load_loop: true,
+            archive_date_input: String::new(),
+            archive_volumes: None,
+            archive_list_receiver: None,
+            vrot_tool_armed: false,
+            vrot_points: Vec::new(),
             cross_section_a_lonlat: None,
             cross_section_b_lonlat: None,
             cross_section_texture: None,
@@ -15825,6 +16467,7 @@ mod tests {
             (32, 64),
             false,
             false,
+            i16::MIN,
             test_viewport_key(width, 100),
         )
     }
@@ -15835,6 +16478,7 @@ mod tests {
             height,
             radar_x_px: 0,
             radar_y_px: 0,
+            rotation_mrad: 0,
             km_per_px_x: 1,
             km_per_px_y: 1,
         }
@@ -15899,6 +16543,7 @@ mod tests {
                 (32, 64),
                 false,
                 false,
+                i16::MIN,
                 test_viewport_key(width, height),
             ),
             render_ms,

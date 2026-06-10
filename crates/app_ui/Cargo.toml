@@ -11,6 +11,7 @@ color_tables = { path = "../color_tables" }
 data_source = { path = "../data_source" }
 eframe.workspace = true
 image.workspace = true
+rfd.workspace = true
 nexrad_io = { path = "../nexrad_io" }
 radar_core = { path = "../radar_core" }
 render2d = { path = "../render2d" }

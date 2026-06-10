@@ -30,6 +30,11 @@ pub struct AppSettings {
     /// GR2-style bold town labels (white, heavy halo) readable over echoes.
     #[serde(default = "default_bold_labels")]
     pub bold_labels: bool,
+    /// Reflectivity gate filter threshold in deci-dBZ; None = off. Hides
+    /// non-REF gates whose co-located reflectivity is weaker (GR2-style
+    /// GateFilter).
+    #[serde(default)]
+    pub gate_filter_decidbz: Option<i16>,
     /// Product hotkeys: number-row key ("0"-"9") -> product label (e.g.
     /// "REF", "VEL", "SRV", "RHO", "ZDR", "SW", "CREF", "ET", "VIL", "VILD",
     /// "PHI", "KDP", "AzShr", "Div"). Edit in config.json to customize.
@@ -75,6 +80,7 @@ impl Default for AppSettings {
             placefiles: Vec::new(),
             basemap_style: default_basemap_style(),
             bold_labels: default_bold_labels(),
+            gate_filter_decidbz: None,
             product_hotkeys: default_product_hotkeys(),
         }
     }
@@ -165,11 +171,13 @@ mod tests {
 
     #[test]
     fn json_round_trips_all_fields() {
-        let mut s = AppSettings::default();
-        s.startup_site = Some("KEAX".to_owned());
+        let mut s = AppSettings {
+            startup_site: Some("KEAX".to_owned()),
+            polling_interval_seconds: 30,
+            ..Default::default()
+        };
         s.add_favorite("ktwx");
         s.add_favorite("KTWX"); // dedup, case-insensitive
-        s.polling_interval_seconds = 30;
         s.palette_by_family.insert(
             "Velocity / SRV".to_owned(),
             "Analyst Velocity HD".to_owned(),

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono.workspace = true
 color_tables = { path = "../color_tables" }
 image.workspace = true
 radar_core = { path = "../radar_core" }

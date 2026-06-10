@@ -11,14 +11,17 @@ pub use color_tables::{ColorSampler, ColorTable, ColorTableFamily, ColorTableSet
 mod cascade;
 mod cells;
 mod detect;
+mod gate_filter;
 mod shear;
 mod smooth;
+mod tracking;
 mod volumetric;
 pub use cascade::{dealias_velocity_grid_cascade, fit_range_band_reference};
 pub use cells::{StormCell, identify_storm_cells};
 pub use detect::{
     RotationSite, RotationStrength, detect_rotation_sites, rotation_features_per_tilt,
 };
+pub use gate_filter::apply_reflectivity_gate_filter;
 use image::{ImageBuffer, ImageError, Rgba};
 use radar_core::{
     ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, ProductId, RadarVolume,
@@ -27,6 +30,7 @@ use rayon::prelude::*;
 pub use shear::{azimuthal_shear_grid, radial_divergence_grid};
 pub use smooth::smooth_moment_grid;
 use thiserror::Error;
+pub use tracking::{StormTrack, StormTracker, TIME_GATE_S};
 pub use volumetric::{
     CrossSection, ECHO_TOP_THRESHOLD_DBZ, VolumeDealiasCache, composite_reflectivity_grid,
     echo_top_grid, mehs_grid, reflectivity_cross_section, velocity_cross_section,
@@ -4093,10 +4097,10 @@ mod tests {
         }
 
         let corrected = dealias_velocity_grid(&cut, &grid);
-        for g in 0..coherent.len() {
+        for (g, value) in coherent.iter().enumerate() {
             assert_eq!(
                 corrected.scaled_value(5, g),
-                Some(coherent[g]),
+                Some(*value),
                 "coherent gate {g} should be untouched"
             );
         }
@@ -4360,6 +4364,8 @@ mod tests {
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
             max_range_km_sq: max_range_km * max_range_km,
+            rot_sin: 0.0,
+            rot_cos: 1.0,
         };
 
         for (x, y) in [(0, 0), (166, 108), (180, 110), (220, 70), (332, 216)] {
@@ -4428,6 +4434,8 @@ mod tests {
             km_per_px_x: 0.5,
             km_per_px_y: 0.5,
             max_range_km_sq: max_range_km * max_range_km,
+            rot_sin: 0.0,
+            rot_cos: 1.0,
         };
 
         for y in 0..96 {

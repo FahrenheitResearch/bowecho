@@ -325,6 +325,26 @@ pub fn latest_level2_object(site: &str, days_back: i64) -> Result<S3Object> {
         })
 }
 
+/// All Level 2 volumes for one site on one UTC date, oldest first — the
+/// archive-browser listing.
+pub fn level2_objects_for_date(site: &str, date: NaiveDate) -> Result<Vec<S3Object>> {
+    let site = site.to_ascii_uppercase();
+    let prefix = format!(
+        "{:04}/{:02}/{:02}/{}/",
+        date.year(),
+        date.month(),
+        date.day(),
+        site
+    );
+    let mut objects = list_s3(LEVEL2_ARCHIVE_BUCKET, &prefix, None, None)?
+        .contents
+        .into_iter()
+        .filter(|object| object.size > 0 && !object.key.ends_with("_MDM"))
+        .collect::<Vec<_>>();
+    objects.sort_by(|left, right| left.key.cmp(&right.key));
+    Ok(objects)
+}
+
 pub fn recent_level2_objects(
     site: &str,
     days_back: i64,
