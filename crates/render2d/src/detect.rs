@@ -254,7 +254,7 @@ fn associate_vertically(per_tilt: &[Vec<Feature2D>]) -> Vec<RotationSite> {
             seeds.push((tilt, index, feature.rank));
         }
     }
-    seeds.sort_by(|a, b| b.2.cmp(&a.2));
+    seeds.sort_by_key(|seed| std::cmp::Reverse(seed.2));
 
     let mut sites = Vec::new();
     for (seed_tilt, seed_index, _) in seeds {
@@ -597,7 +597,7 @@ fn tilt_features(volume: &RadarVolume, cut_index: usize) -> Vec<Feature2D> {
                 (cells.len(), rows_seen.len(), gmax.saturating_sub(gmin) + 1)
             })
             .collect();
-        sizes.sort_by(|a, b| b.0.cmp(&a.0));
+        sizes.sort_by_key(|size| std::cmp::Reverse(size.0));
         for (n, r, g) in sizes.iter().take(5) {
             eprintln!("  comp: {n} cells, {r} rows, {g} gate-span");
         }

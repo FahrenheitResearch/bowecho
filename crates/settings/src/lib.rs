@@ -171,11 +171,13 @@ mod tests {
 
     #[test]
     fn json_round_trips_all_fields() {
-        let mut s = AppSettings::default();
-        s.startup_site = Some("KEAX".to_owned());
+        let mut s = AppSettings {
+            startup_site: Some("KEAX".to_owned()),
+            polling_interval_seconds: 30,
+            ..Default::default()
+        };
         s.add_favorite("ktwx");
         s.add_favorite("KTWX"); // dedup, case-insensitive
-        s.polling_interval_seconds = 30;
         s.palette_by_family.insert(
             "Velocity / SRV".to_owned(),
             "Analyst Velocity HD".to_owned(),

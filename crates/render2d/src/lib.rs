@@ -4097,10 +4097,10 @@ mod tests {
         }
 
         let corrected = dealias_velocity_grid(&cut, &grid);
-        for g in 0..coherent.len() {
+        for (g, value) in coherent.iter().enumerate() {
             assert_eq!(
                 corrected.scaled_value(5, g),
-                Some(coherent[g]),
+                Some(*value),
                 "coherent gate {g} should be untouched"
             );
         }

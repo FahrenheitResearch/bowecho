@@ -545,18 +545,13 @@ impl ColorSampler {
         if !value.is_finite() {
             return Rgba8::TRANSPARENT;
         }
-        match self.display_threshold {
-            Some(threshold) if self.threshold_is_symmetric => {
-                if value.abs() < threshold {
-                    return Rgba8::TRANSPARENT;
-                }
-            }
-            Some(threshold) => {
-                if value < threshold {
-                    return Rgba8::TRANSPARENT;
-                }
-            }
-            None => {}
+        let below_threshold = match self.display_threshold {
+            Some(threshold) if self.threshold_is_symmetric => value.abs() < threshold,
+            Some(threshold) => value < threshold,
+            None => false,
+        };
+        if below_threshold {
+            return Rgba8::TRANSPARENT;
         }
         match self.sample_mode {
             SampleMode::Interpolated => self.sample_accelerated(value, true),
@@ -1495,7 +1490,7 @@ fn unit_value_to_mps_scale(units: &str) -> f32 {
 const ANALYST_REFLECTIVITY_HD_TABLE: &str = r#"
 product: BR
 units: dBZ
-step: 5
+step: 1
 color4: -30 0 0 0 0
 color4: 7.5 0 0 0 0
 color: 10 110 120 150
@@ -1518,7 +1513,7 @@ color: 80 255 255 255
 const GR2_REFLECTIVITY_TABLE: &str = r#"
 product: BR
 units: dBZ
-step: 5
+step: 1
 color4: -10 0 0 0 0
 color4: 7.5 0 0 0 0
 color: 10 4 233 231
@@ -1541,7 +1536,7 @@ color: 92.5 255 255 255
 const NWS_CLASSIC_REFLECTIVITY_TABLE: &str = r#"
 product: BR
 units: dBZ
-step: 5
+step: 1
 color4: -10 0 0 0 0
 color4: 7.5 0 0 0 0
 color: 10 4 233 231
@@ -1564,7 +1559,7 @@ color: 92.5 255 255 255
 const ANALYST_CLASSIC_REFLECTIVITY_TABLE: &str = r#"
 product: BR
 units: dBZ
-step: 5
+step: 1
 color4: -10 0 0 0 0
 color4: 7.5 0 0 0 0
 color: 10 0 204 220
@@ -1587,7 +1582,7 @@ color: 92.5 246 246 246
 const STORM_DETAIL_REFLECTIVITY_TABLE: &str = r#"
 product: BR
 units: dBZ
-step: 2.5
+step: 1
 color4: -10 0 0 0 0
 color4: 0 0 0 0 0
 color: 5 18 42 86
@@ -1610,7 +1605,7 @@ color: 80 255 255 255
 const HAIL_CORE_REFLECTIVITY_TABLE: &str = r#"
 product: BR
 units: dBZ
-step: 5
+step: 1
 color4: -10 0 0 0 0
 color4: 7.5 0 0 0 0
 color: 10 35 98 164
@@ -1634,7 +1629,7 @@ color: 95 255 255 255
 const LOW_PRECIP_REFLECTIVITY_TABLE: &str = r#"
 product: BR
 units: dBZ
-step: 2.5
+step: 1
 color4: -15 0 0 0 0
 color4: 7.5 0 0 0 0
 color: 10 38 116 174
@@ -1656,7 +1651,7 @@ color: 90 238 238 244
 const DARK_SCOPE_REFLECTIVITY_TABLE: &str = r#"
 product: BR
 units: dBZ
-step: 5
+step: 1
 color4: -10 0 0 0 0
 color4: 7.5 0 0 0 0
 color: 10 38 86 128
@@ -1679,7 +1674,7 @@ color: 95 255 255 255
 const TORNADO_DEBRIS_REFLECTIVITY_TABLE: &str = r#"
 product: BR
 units: dBZ
-step: 5
+step: 1
 color4: -10 0 0 0 0
 color4: 7.5 0 0 0 0
 color: 10 30 96 152
@@ -1702,7 +1697,7 @@ color: 95 255 255 255
 const CLEAN_LIGHT_REFLECTIVITY_TABLE: &str = r#"
 product: BR
 units: dBZ
-step: 2.5
+step: 1
 color4: -15 0 0 0 0
 color4: 7.5 0 0 0 0
 color: 10 30 114 160
@@ -2422,10 +2417,13 @@ mod tests {
         assert_eq!(table.name(), "Analyst Reflectivity HD");
         assert!(!table.interpolates());
         assert_eq!(table.sample_mode_label(), "quantized stepped");
-        assert_eq!(table.step_size(), Some(5.0));
+        assert_eq!(table.step_size(), Some(1.0));
         // clear-air junk below ~10 dBZ is filtered out
         assert_eq!(table.sample(5.0), Rgba8::TRANSPARENT);
         assert_ne!(table.sample(10.0), Rgba8::TRANSPARENT);
+        // The display ladder should use the full REF palette, not collapse
+        // 10..15 dBZ into one 5 dBZ bucket.
+        assert_ne!(table.sample(10.0), table.sample(11.0));
         // purple/magenta reserved for the 65+ dBZ hail core, not light precip
         for stop in table.stops() {
             let [r, g, b, a] = stop.color.to_array();
@@ -2697,16 +2695,18 @@ mod tests {
             low_precip_reflectivity_table(),
         ] {
             assert_eq!(table.sample_mode_label(), "quantized stepped");
-            assert!(
-                table.step_size().is_some(),
-                "{} has step size",
-                table.name()
-            );
+            assert_eq!(table.step_size(), Some(1.0), "{} step size", table.name());
             assert_eq!(table.sample(5.0), Rgba8::TRANSPARENT);
             assert_ne!(
                 table.sample(10.0),
                 Rgba8::TRANSPARENT,
                 "{} should show 10 dBZ and higher",
+                table.name()
+            );
+            assert_ne!(
+                table.sample(10.0),
+                table.sample(11.0),
+                "{} should preserve one-dBZ REF detail",
                 table.name()
             );
             for stop in table.stops() {
