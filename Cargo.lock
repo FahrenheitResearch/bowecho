@@ -496,6 +496,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bowecho-dealias"
+version = "0.6.0"
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3011,6 +3015,7 @@ dependencies = [
 name = "render2d"
 version = "0.6.0"
 dependencies = [
+ "bowecho-dealias",
  "chrono",
  "color_tables",
  "image",

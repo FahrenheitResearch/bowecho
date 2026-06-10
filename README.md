@@ -88,7 +88,10 @@ branch-checks each tilt against the wind fit from the tilt above
 (Browning & Wexler 1968; Louf et al. 2020). Raw-velocity mode always carries
 a "folds possible" tag plus near-Nyquist warnings in the inspector. The
 algorithms and their references are documented in
-[docs/products-guide.md](docs/products-guide.md).
+[docs/products-guide.md](docs/products-guide.md). Both engines live in
+[`bowecho-dealias`](crates/dealias), a standalone zero-dependency crate that
+works on plain `f32` slices, so any radar project can reuse them behind its
+own Level II decoder.
 
 **Display:** 1/2/4-pane synced grids with per-pane products and honest
 per-pane readouts, optional GR2-style smoothing (zero panning cost), and an

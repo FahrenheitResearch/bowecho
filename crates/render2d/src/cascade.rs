@@ -1,144 +1,72 @@
 //! Tilt-cascade dealiasing — the second dealias engine.
 //!
-//! The region-based unfolder resolves folds from boundary evidence alone,
-//! which leaves each connected group's absolute BRANCH under-determined; on
-//! sweeps with widespread aliasing a same-sweep VAD reference is circular
-//! (wrapped gates poison the fit — see docs/dealias-fold-branch-analysis.md).
-//!
-//! The cascade breaks the circularity vertically: higher tilts carry higher
-//! Nyquist velocities and little aliasing, so the volume is dealiased from
-//! the TOP tilt down. Each tilt's corrected field yields a Browning & Wexler
-//! 1968 zeroth-harmonic fit per range band, which serves as the EXTERNAL
-//! reference (in the spirit of UNRAVEL's reference checks, Louf et al. 2020)
-//! for branch selection and per-region verification on the next tilt below.
+//! Grid adapter over [`bowecho_dealias::dealias_cascade`]: the region-based
+//! unfolder resolves folds from boundary evidence alone, which leaves each
+//! connected group's absolute BRANCH under-determined, and on sweeps with
+//! widespread aliasing a same-sweep VAD reference is circular (wrapped gates
+//! poison the fit — see docs/dealias-fold-branch-analysis.md). The cascade
+//! breaks the circularity vertically: higher tilts carry higher Nyquist
+//! velocities and little aliasing, so the volume is dealiased from the TOP
+//! tilt down, each tilt's Browning & Wexler 1968 zeroth-harmonic fit serving
+//! as the EXTERNAL reference (in the spirit of UNRAVEL's reference checks,
+//! Louf et al. 2020) for branch selection and per-region verification on the
+//! next tilt below.
 
 use radar_core::{ElevationCut, MomentGrid, MomentType, RadarVolume};
 
-use crate::{RangeBandReference, dealias_velocity_grid_with_reference};
-
-/// Gates per range band for the reference fit.
-pub(crate) const REFERENCE_BAND_GATES: usize = 16;
-const FIT_MIN_SAMPLES: u32 = 48;
-const FIT_MIN_SECTORS: u32 = 5; // of 12 × 30° azimuth sectors
-/// Outlier trim for the second fit pass (m/s).
-const FIT_TRIM_MPS: f32 = 12.0;
+use crate::{RangeBandReference, encode_dealiased_grid, velocity_sweep_buffers};
 
 /// Fit the per-range-band zeroth harmonic v(az) = a·cos(az) + b·sin(az) on a
 /// (dealiased) velocity grid. Two passes: fit, then refit excluding outliers.
 pub fn fit_range_band_reference(cut: &ElevationCut, grid: &MomentGrid) -> RangeBandReference {
-    let rows = grid.radial_count();
-    let gates = grid.gate_range.gate_count;
-    let bands = gates.div_ceil(REFERENCE_BAND_GATES).max(1);
-    let azimuth = |row: usize| -> Option<f32> {
-        grid.radial_indices
-            .get(row)
-            .and_then(|&i| cut.radials.get(i))
-            .map(|r| r.azimuth_deg)
-    };
-
-    let mut fits: Vec<Option<(f32, f32)>> = vec![None; bands];
-    for pass in 0..2 {
-        let mut acc = vec![[0.0f64; 6]; bands]; // cc, cs, ss, cv, sv, n
-        let mut sectors = vec![0u16; bands];
-        for row in 0..rows {
-            let Some(az_deg) = azimuth(row) else {
-                continue;
-            };
-            let az = (az_deg as f64).to_radians();
-            let (sin_az, cos_az) = (az.sin(), az.cos());
-            let sector_bit = 1u16 << ((az_deg.rem_euclid(360.0) / 30.0) as u32 % 12);
-            for gate in 0..gates {
-                let Some(v) = grid.scaled_value(row, gate).filter(|v| v.is_finite()) else {
-                    continue;
-                };
-                let band = gate / REFERENCE_BAND_GATES;
-                if pass == 1
-                    && let Some((a, b)) = fits[band]
-                {
-                    let predicted = a * cos_az as f32 + b * sin_az as f32;
-                    if (v - predicted).abs() > FIT_TRIM_MPS {
-                        continue;
-                    }
-                }
-                let entry = &mut acc[band];
-                entry[0] += cos_az * cos_az;
-                entry[1] += cos_az * sin_az;
-                entry[2] += sin_az * sin_az;
-                entry[3] += cos_az * v as f64;
-                entry[4] += sin_az * v as f64;
-                entry[5] += 1.0;
-                sectors[band] |= sector_bit;
-            }
-        }
-        for band in 0..bands {
-            let entry = &acc[band];
-            if (entry[5] as u32) < FIT_MIN_SAMPLES || sectors[band].count_ones() < FIT_MIN_SECTORS {
-                fits[band] = None;
-                continue;
-            }
-            let det = entry[0] * entry[2] - entry[1] * entry[1];
-            if det.abs() < 1e-6 {
-                fits[band] = None;
-                continue;
-            }
-            let a = (entry[3] * entry[2] - entry[4] * entry[1]) / det;
-            let b = (entry[4] * entry[0] - entry[3] * entry[1]) / det;
-            fits[band] = Some((a as f32, b as f32));
-        }
-    }
-    RangeBandReference {
-        band_gates: REFERENCE_BAND_GATES,
-        fits,
-    }
+    let (velocity, _nyquist, azimuths) = velocity_sweep_buffers(cut, grid);
+    bowecho_dealias::fit_range_band_reference(&velocity, grid.gate_range.gate_count, &azimuths)
 }
 
 /// Dealias one velocity tilt using the tilt-cascade engine: every velocity
 /// tilt ABOVE the target is dealiased first (top-down), each feeding its
 /// reference fit to the tilt below. Falls back to the plain region engine
 /// when the volume has no higher velocity tilt (single-tilt volumes,
-/// topmost tilt).
+/// topmost tilt). SAILS revisits at the same elevation are de-duplicated by
+/// the engine (first per 0.1° bucket).
 pub fn dealias_velocity_grid_cascade(volume: &RadarVolume, cut_index: usize) -> Option<MomentGrid> {
-    let target_cut = volume.cuts.get(cut_index)?;
-    target_cut.moments.get(&MomentType::Velocity)?;
-
-    // Velocity tilts sorted by elevation DESCENDING (top first). De-dupe
-    // SAILS revisits at the same elevation: keep the first per 0.1° bucket.
-    let mut order: Vec<usize> = volume
+    let target_grid = volume
         .cuts
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.moments.contains_key(&MomentType::Velocity))
-        .map(|(i, _)| i)
-        .collect();
-    order.sort_by(|a, b| {
-        volume.cuts[*b]
-            .elevation_deg
-            .total_cmp(&volume.cuts[*a].elevation_deg)
-    });
-    let mut cascade: Vec<usize> = Vec::new();
-    for index in order {
-        let elevation = volume.cuts[index].elevation_deg;
-        let duplicate = cascade
-            .iter()
-            .any(|&c| (volume.cuts[c].elevation_deg - elevation).abs() < 0.1);
-        if !duplicate || index == cut_index {
-            cascade.push(index);
-        }
-    }
+        .get(cut_index)?
+        .moments
+        .get(&MomentType::Velocity)?;
 
-    let mut reference: Option<RangeBandReference> = None;
-    for &index in &cascade {
-        let cut = &volume.cuts[index];
+    // (velocities, per-row Nyquist, azimuths, gate count) per velocity tilt.
+    type SweepBuffers = (Vec<f32>, Vec<f32>, Vec<f32>, usize);
+    let mut cut_indices: Vec<usize> = Vec::new();
+    let mut buffers: Vec<SweepBuffers> = Vec::new();
+    for (index, cut) in volume.cuts.iter().enumerate() {
         let Some(grid) = cut.moments.get(&MomentType::Velocity) else {
             continue;
         };
-        let dealiased = dealias_velocity_grid_with_reference(cut, grid, reference.as_ref());
-        if index == cut_index {
-            return Some(dealiased);
-        }
-        reference = Some(fit_range_band_reference(cut, &dealiased));
+        let (velocity, nyquist, azimuths) = velocity_sweep_buffers(cut, grid);
+        cut_indices.push(index);
+        buffers.push((velocity, nyquist, azimuths, grid.gate_range.gate_count));
     }
-    None
+    let target = cut_indices.iter().position(|&index| index == cut_index)?;
+    let tilts: Vec<bowecho_dealias::Tilt> = cut_indices
+        .iter()
+        .zip(&buffers)
+        .map(
+            |(&index, (velocity, nyquist, azimuths, gates))| bowecho_dealias::Tilt {
+                sweep: bowecho_dealias::Sweep {
+                    velocity,
+                    gates: *gates,
+                    nyquist,
+                    azimuths_deg: azimuths,
+                },
+                elevation_deg: volume.cuts[index].elevation_deg,
+            },
+        )
+        .collect();
+
+    let dealiased = bowecho_dealias::dealias_cascade(&tilts, target)?;
+    Some(encode_dealiased_grid(target_grid, &dealiased.velocity))
 }
 
 #[cfg(test)]

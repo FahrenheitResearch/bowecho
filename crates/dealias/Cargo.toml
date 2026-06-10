@@ -1,0 +1,15 @@
+[package]
+name = "bowecho-dealias"
+description = "Region-based Doppler velocity dealiasing (unfolding) for weather radar, extracted from the BowEcho NEXRAD viewer"
+keywords = ["radar", "dealias", "doppler", "nexrad", "meteorology"]
+categories = ["science", "algorithms"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "bowecho_dealias"
+
+[dependencies]
