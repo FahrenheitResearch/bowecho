@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         clusters.push((size, peak_cell, clusters.len()));
     }
-    clusters.sort_by(|a, b| b.0.cmp(&a.0));
+    clusters.sort_by_key(|cluster| std::cmp::Reverse(cluster.0));
     for (size, peak_cell, _) in clusters.iter().take(5) {
         let (row, gate) = (peak_cell / gates, peak_cell % gates);
         let az = dealiased
