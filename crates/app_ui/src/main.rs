@@ -431,6 +431,11 @@ struct ViewerApp {
     /// One-shot: after an event click, auto-load the volume nearest this
     /// time once the archive listing lands.
     archive_pending_event: Option<DateTime<Utc>>,
+    /// Volumes fetched per archive loop load.
+    archive_frame_count: usize,
+    /// Indices into archive_volumes covered by the last loop load
+    /// (start..=chosen) — drives the "+N earlier" extension.
+    archive_loaded_range: Option<(usize, usize)>,
     /// Archive click mode: true = loop ending at the chosen scan.
     archive_load_loop: bool,
     /// Archive browser: date input + listed volumes for the selected site.
@@ -2059,12 +2064,14 @@ struct VrotGate {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SidebarTab {
     Radar,
+    Archive,
     Warnings,
     Settings,
 }
 
 const SIDEBAR_TABS: &[(SidebarTab, &str)] = &[
     (SidebarTab::Radar, "Radar"),
+    (SidebarTab::Archive, "Archive"),
     (SidebarTab::Warnings, "Warnings"),
     (SidebarTab::Settings, "Settings"),
 ];
@@ -2072,6 +2079,7 @@ const SIDEBAR_TABS: &[(SidebarTab, &str)] = &[
 fn sidebar_tab_tooltip(tab: SidebarTab) -> &'static str {
     match tab {
         SidebarTab::Radar => "Site, products, tilt, loop, algorithms — live operations",
+        SidebarTab::Archive => "Any date in history: volumes, loops, SPC tornado events",
         SidebarTab::Warnings => "Warnings, watches, MDs, and alert filters",
         SidebarTab::Settings => "Basemap, color tables, hotkeys, diagnostics — always available",
     }
@@ -2196,6 +2204,8 @@ impl ViewerApp {
             spc_reports: None,
             spc_receiver: None,
             archive_pending_event: None,
+            archive_frame_count: 10,
+            archive_loaded_range: None,
             archive_load_loop: true,
             archive_date_input: String::new(),
             archive_volumes: None,
@@ -4941,6 +4951,181 @@ impl ViewerApp {
         self.start_latest_level2_load_with_mode(site, ctx, LatestLoadMode::Loop);
     }
 
+    /// Archive tab: date navigation, the day's volumes, SPC tornado
+    /// events, and loop-size controls.
+    fn archive_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.label("Frames");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.archive_frame_count)
+                        .range(1..=30)
+                        .speed(0.2),
+                )
+                .on_hover_text(
+                    "How many volumes an archive loop load fetches (ending at the chosen scan)",
+                )
+                .changed()
+            {
+                ctx.request_repaint();
+            }
+            if self.archive_loaded_range.is_some()
+                && ui
+                    .button("+5 earlier")
+                    .on_hover_text("Extend the loaded loop five volumes further back")
+                    .clicked()
+            {
+                self.extend_archive_loop_earlier(5, ctx);
+            }
+        });
+        if self.archive_date_input.is_empty() {
+            self.archive_date_input = Utc::now().format("%Y-%m-%d").to_string();
+        }
+        ui.horizontal(|ui| {
+            // Day navigation: step the date and re-list immediately.
+            let mut step_days: i64 = 0;
+            if ui.small_button("◀").on_hover_text("Previous day").clicked() {
+                step_days = -1;
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut self.archive_date_input)
+                    .hint_text("YYYY-MM-DD")
+                    .desired_width(88.0),
+            );
+            if ui.small_button("▶").on_hover_text("Next day").clicked() {
+                step_days = 1;
+            }
+            if ui.small_button("Today").clicked() {
+                self.archive_date_input = Utc::now().format("%Y-%m-%d").to_string();
+                self.start_archive_listing(ctx);
+            }
+            if step_days != 0
+                && let Ok(date) =
+                    chrono::NaiveDate::parse_from_str(self.archive_date_input.trim(), "%Y-%m-%d")
+            {
+                let stepped = date + chrono::Duration::days(step_days);
+                self.archive_date_input = stepped.format("%Y-%m-%d").to_string();
+                self.start_archive_listing(ctx);
+            }
+            let listing = self.archive_list_receiver.is_some();
+            if ui
+                .add_enabled(!listing, egui::Button::new("List"))
+                .on_hover_text("List this UTC date's volumes for the selected site")
+                .clicked()
+            {
+                self.start_archive_listing(ctx);
+            }
+            if listing {
+                ui.spinner();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("On click:");
+            ui.selectable_value(&mut self.archive_load_loop, true, "Loop")
+                .on_hover_text("Load a loop ending at the chosen scan");
+            ui.selectable_value(&mut self.archive_load_loop, false, "Single")
+                .on_hover_text("Load only the chosen scan");
+        });
+        if let Some(volumes) = &self.archive_volumes {
+            if volumes.is_empty() {
+                ui.weak("No volumes for that date");
+            } else {
+                ui.weak(format!("{} volumes (UTC)", volumes.len()));
+                let mut load_object: Option<usize> = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("archive_volume_list")
+                    .max_height(190.0)
+                    .show(ui, |ui| {
+                        // Hour headers + wrapped minute chips.
+                        let mut index = 0usize;
+                        while index < volumes.len() {
+                            let hour = volumes[index].1.get(0..2).unwrap_or("??");
+                            ui.weak(format!("{hour} UTC"));
+                            ui.horizontal_wrapped(|ui| {
+                                while index < volumes.len()
+                                    && volumes[index].1.get(0..2).unwrap_or("??") == hour
+                                {
+                                    let minute_label =
+                                        volumes[index].1.get(3..8).unwrap_or(&volumes[index].1);
+                                    if ui
+                                        .add_sized(
+                                            egui::vec2(52.0, PANEL_BUTTON_HEIGHT),
+                                            egui::Button::new(minute_label),
+                                        )
+                                        .on_hover_text(&volumes[index].1)
+                                        .clicked()
+                                    {
+                                        load_object = Some(index);
+                                    }
+                                    index += 1;
+                                }
+                            });
+                        }
+                    });
+                if let Some(index) = load_object {
+                    self.start_archive_loop_load(index, ctx);
+                }
+            }
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Tornadoes (SPC)");
+            let fetching = self.spc_receiver.is_some();
+            if ui
+                .add_enabled(!fetching, egui::Button::new("Fetch"))
+                .on_hover_text(
+                    "SPC storm reports for this date (12Z–12Z). Click a report to jump to the lowest-beam radar and load the loop at that time.",
+                )
+                .clicked()
+            {
+                self.start_spc_fetch(ctx);
+            }
+            if fetching {
+                ui.spinner();
+            }
+        });
+        let mut jump: Option<SpcReport> = None;
+        if let Some(reports) = &self.spc_reports {
+            if reports.is_empty() {
+                ui.weak("No tornado reports for that date");
+            } else {
+                ui.weak(format!("{} tornado reports", reports.len()));
+                egui::ScrollArea::vertical()
+                    .id_salt("spc_report_list")
+                    .max_height(170.0)
+                    .show(ui, |ui| {
+                        for report in reports {
+                            let scale = if report.f_scale.is_empty() || report.f_scale == "UNK" {
+                                String::new()
+                            } else {
+                                format!("EF{} ", report.f_scale)
+                            };
+                            let label = format!(
+                                "{}Z {}{}, {}",
+                                report.time_utc.format("%H:%M"),
+                                scale,
+                                report.location,
+                                report.state
+                            );
+                            if ui
+                                .add_sized(
+                                    egui::vec2(ui.available_width(), PANEL_BUTTON_HEIGHT),
+                                    egui::Button::new(label),
+                                )
+                                .on_hover_text("Jump: lowest-beam radar + loop at this time")
+                                .clicked()
+                            {
+                                jump = Some(report.clone());
+                            }
+                        }
+                    });
+            }
+        }
+        if let Some(report) = jump {
+            self.jump_to_spc_report(&report, ctx);
+        }
+    }
+
     /// Fetch SPC tornado reports for the archive date (background).
     fn start_spc_fetch(&mut self, ctx: &egui::Context) {
         let Ok(date) =
@@ -5020,6 +5205,91 @@ impl ViewerApp {
         self.archive_date_input = report.time_utc.format("%Y-%m-%d").to_string();
         self.archive_pending_event = Some(report.time_utc);
         self.start_archive_listing(ctx);
+    }
+
+    /// Extend the loaded archive loop further back in time: decode `count`
+    /// volumes preceding the loaded range and let the (identity-sorted)
+    /// frame history slot them in order.
+    fn extend_archive_loop_earlier(&mut self, count: usize, ctx: &egui::Context) {
+        let Some(site) = self.selected_site().cloned() else {
+            return;
+        };
+        let Some(volumes) = &self.archive_volumes else {
+            return;
+        };
+        let Some((start, chosen)) = self.archive_loaded_range else {
+            return;
+        };
+        if start == 0 || self.load_receiver.is_some() {
+            return;
+        }
+        let new_start = start.saturating_sub(count);
+        let objects: Vec<data_source::S3Object> = volumes[new_start..start]
+            .iter()
+            .map(|(object, _)| object.clone())
+            .collect();
+        if objects.is_empty() {
+            return;
+        }
+        let total_frames = chosen - new_start + 1;
+        if total_frames > self.history_frame_limit {
+            self.history_frame_limit = total_frames;
+        }
+        self.archive_loaded_range = Some((new_start, chosen));
+        let site_id = site.level2_id.clone();
+        self.begin_primary_load_telemetry();
+        let (sender, receiver) = mpsc::channel();
+        self.load_receiver = Some(receiver);
+        self.pending_site_id = Some(site_id.clone());
+        self.status = format!("Extending loop {} volumes earlier", objects.len());
+        let site_cache = cache_dir(&site.level2_id);
+        let known_frame_paths = self.current_history_paths();
+        thread::spawn(move || {
+            let total_start = Instant::now();
+            let mut decoded_frames = Vec::new();
+            for object in objects {
+                match decode_archive_history_object(
+                    &site_id,
+                    object,
+                    &site_cache,
+                    &known_frame_paths,
+                    None,
+                    total_start,
+                    &sender,
+                    false,
+                ) {
+                    Ok(Some(decoded)) => {
+                        let _ = sender.send(AsyncLoadResult {
+                            label: format!("L2 {site_id} archive extend"),
+                            update: AsyncLoadUpdate::History(
+                                DecodedLoadBatch {
+                                    frames: vec![decoded.clone()],
+                                    selected_index: 0,
+                                },
+                                false,
+                            ),
+                        });
+                        decoded_frames.push(decoded);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        let _ = sender.send(AsyncLoadResult {
+                            label: format!("L2 {site_id} archive extend"),
+                            update: AsyncLoadUpdate::Final(Err(err)),
+                        });
+                        return;
+                    }
+                }
+            }
+            let _ = sender.send(AsyncLoadResult {
+                label: format!("L2 {site_id} archive extend"),
+                update: AsyncLoadUpdate::Unchanged {
+                    timings: None,
+                    reason: format!("loop extended {} volumes earlier", decoded_frames.len()),
+                },
+            });
+        });
+        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
     }
 
     /// Kick a background listing of the archive date's volumes.
@@ -5111,11 +5381,17 @@ impl ViewerApp {
             return;
         }
         let limit = if self.archive_load_loop {
-            self.history_frame_limit.max(1)
+            self.archive_frame_count.max(1)
         } else {
             1
         };
+        // The frame-history cap must hold every requested frame (it trims
+        // oldest-first, which would silently eat the loop's tail).
+        if limit > self.history_frame_limit {
+            self.history_frame_limit = limit;
+        }
         let start = chosen.saturating_sub(limit - 1);
+        self.archive_loaded_range = Some((start, chosen));
         let objects: Vec<data_source::S3Object> = volumes[start..=chosen]
             .iter()
             .map(|(object, _)| object.clone())
@@ -5332,6 +5608,15 @@ impl ViewerApp {
                         self.radar_controls_panel(ui, ctx);
                     });
             }
+            SidebarTab::Archive => {
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar_archive_tab")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        self.archive_panel(ui, ctx);
+                    });
+            }
             SidebarTab::Warnings => {
                 egui::ScrollArea::vertical()
                     .id_salt("sidebar_hazards_tab")
@@ -5486,8 +5771,10 @@ impl ViewerApp {
                 let response = ui
                     .add_sized(
                         egui::vec2(
-                            (ui.available_width() - 2.0 * ui.spacing().item_spacing.x).max(60.0)
-                                / 3.0,
+                            (ui.available_width()
+                                - (SIDEBAR_TABS.len() as f32 - 1.0) * ui.spacing().item_spacing.x)
+                                .max(60.0)
+                                / SIDEBAR_TABS.len() as f32,
                             PANEL_BUTTON_HEIGHT,
                         ),
                         egui::Button::selectable(selected, *label),
@@ -5641,167 +5928,6 @@ impl ViewerApp {
         } else {
             ui.label(&self.status);
         }
-
-        // Archive browser: list any UTC date's volumes for the selected site
-        // and load a loop ending at the chosen scan.
-        egui::CollapsingHeader::new("Archive")
-            .default_open(false)
-            .show(ui, |ui| {
-                if self.archive_date_input.is_empty() {
-                    self.archive_date_input = Utc::now().format("%Y-%m-%d").to_string();
-                }
-                ui.horizontal(|ui| {
-                    // Day navigation: step the date and re-list immediately.
-                    let mut step_days: i64 = 0;
-                    if ui.small_button("◀").on_hover_text("Previous day").clicked() {
-                        step_days = -1;
-                    }
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.archive_date_input)
-                            .hint_text("YYYY-MM-DD")
-                            .desired_width(88.0),
-                    );
-                    if ui.small_button("▶").on_hover_text("Next day").clicked() {
-                        step_days = 1;
-                    }
-                    if ui.small_button("Today").clicked() {
-                        self.archive_date_input = Utc::now().format("%Y-%m-%d").to_string();
-                        self.start_archive_listing(ctx);
-                    }
-                    if step_days != 0
-                        && let Ok(date) = chrono::NaiveDate::parse_from_str(
-                            self.archive_date_input.trim(),
-                            "%Y-%m-%d",
-                        )
-                    {
-                        let stepped = date + chrono::Duration::days(step_days);
-                        self.archive_date_input = stepped.format("%Y-%m-%d").to_string();
-                        self.start_archive_listing(ctx);
-                    }
-                    let listing = self.archive_list_receiver.is_some();
-                    if ui
-                        .add_enabled(!listing, egui::Button::new("List"))
-                        .on_hover_text("List this UTC date's volumes for the selected site")
-                        .clicked()
-                    {
-                        self.start_archive_listing(ctx);
-                    }
-                    if listing {
-                        ui.spinner();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("On click:");
-                    ui.selectable_value(&mut self.archive_load_loop, true, "Loop")
-                        .on_hover_text("Load a loop ending at the chosen scan");
-                    ui.selectable_value(&mut self.archive_load_loop, false, "Single")
-                        .on_hover_text("Load only the chosen scan");
-                });
-                if let Some(volumes) = &self.archive_volumes {
-                    if volumes.is_empty() {
-                        ui.weak("No volumes for that date");
-                    } else {
-                        ui.weak(format!("{} volumes (UTC)", volumes.len()));
-                        let mut load_object: Option<usize> = None;
-                        egui::ScrollArea::vertical()
-                            .id_salt("archive_volume_list")
-                            .max_height(190.0)
-                            .show(ui, |ui| {
-                                // Hour headers + wrapped minute chips.
-                                let mut index = 0usize;
-                                while index < volumes.len() {
-                                    let hour = volumes[index].1.get(0..2).unwrap_or("??");
-                                    ui.weak(format!("{hour} UTC"));
-                                    ui.horizontal_wrapped(|ui| {
-                                        while index < volumes.len()
-                                            && volumes[index].1.get(0..2).unwrap_or("??") == hour
-                                        {
-                                            let minute_label = volumes[index]
-                                                .1
-                                                .get(3..8)
-                                                .unwrap_or(&volumes[index].1);
-                                            if ui
-                                                .add_sized(
-                                                    egui::vec2(52.0, PANEL_BUTTON_HEIGHT),
-                                                    egui::Button::new(minute_label),
-                                                )
-                                                .on_hover_text(&volumes[index].1)
-                                                .clicked()
-                                            {
-                                                load_object = Some(index);
-                                            }
-                                            index += 1;
-                                        }
-                                    });
-                                }
-                            });
-                        if let Some(index) = load_object {
-                            self.start_archive_loop_load(index, ctx);
-                        }
-                    }
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Tornadoes (SPC)");
-                    let fetching = self.spc_receiver.is_some();
-                    if ui
-                        .add_enabled(!fetching, egui::Button::new("Fetch"))
-                        .on_hover_text(
-                            "SPC storm reports for this date (12Z–12Z). Click a report to jump to the lowest-beam radar and load the loop at that time.",
-                        )
-                        .clicked()
-                    {
-                        self.start_spc_fetch(ctx);
-                    }
-                    if fetching {
-                        ui.spinner();
-                    }
-                });
-                let mut jump: Option<SpcReport> = None;
-                if let Some(reports) = &self.spc_reports {
-                    if reports.is_empty() {
-                        ui.weak("No tornado reports for that date");
-                    } else {
-                        ui.weak(format!("{} tornado reports", reports.len()));
-                        egui::ScrollArea::vertical()
-                            .id_salt("spc_report_list")
-                            .max_height(170.0)
-                            .show(ui, |ui| {
-                                for report in reports {
-                                    let scale = if report.f_scale.is_empty()
-                                        || report.f_scale == "UNK"
-                                    {
-                                        String::new()
-                                    } else {
-                                        format!("EF{} ", report.f_scale)
-                                    };
-                                    let label = format!(
-                                        "{}Z {}{}, {}",
-                                        report.time_utc.format("%H:%M"),
-                                        scale,
-                                        report.location,
-                                        report.state
-                                    );
-                                    if ui
-                                        .add_sized(
-                                            egui::vec2(ui.available_width(), PANEL_BUTTON_HEIGHT),
-                                            egui::Button::new(label),
-                                        )
-                                        .on_hover_text(
-                                            "Jump: lowest-beam radar + loop at this time",
-                                        )
-                                        .clicked()
-                                    {
-                                        jump = Some(report.clone());
-                                    }
-                                }
-                            });
-                    }
-                }
-                if let Some(report) = jump {
-                    self.jump_to_spc_report(&report, ctx);
-                }
-            });
 
         // R2: LAYERS — radar overlays + placefiles together, available with or
         // without a loaded volume.
@@ -6645,6 +6771,9 @@ impl ViewerApp {
                 .hint_text("Color table path"),
         );
         ui.horizontal(|ui| {
+            // Native file dialog (Windows/macOS; Linux needs GTK dev libs
+            // rfd's portal backends pull in, so Linux keeps the path box).
+            #[cfg(any(windows, target_os = "macos"))]
             if fixed_action_button(ui, "Browse…", 70.0).clicked()
                 && let Some(path) = rfd::FileDialog::new()
                     .add_filter("Color tables", &["pal", "txt"])
@@ -16155,6 +16284,8 @@ mod tests {
             spc_reports: None,
             spc_receiver: None,
             archive_pending_event: None,
+            archive_frame_count: 10,
+            archive_loaded_range: None,
             archive_load_loop: true,
             archive_date_input: String::new(),
             archive_volumes: None,
