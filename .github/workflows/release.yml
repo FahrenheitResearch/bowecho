@@ -148,9 +148,9 @@ jobs:
             <key>CFBundlePackageType</key>
             <string>APPL</string>
             <key>CFBundleShortVersionString</key>
-            <string>0.5.0</string>
+            <string>0.6.0</string>
             <key>CFBundleVersion</key>
-            <string>0.5.0</string>
+            <string>0.6.0</string>
             <key>LSMinimumSystemVersion</key>
             <string>12.0</string>
             <key>NSHighResolutionCapable</key>
@@ -158,7 +158,60 @@ jobs:
           </dict>
           </plist>
           PLIST
-          ditto -c -k --sequesterRsrc --keepParent "$app" "dist/${{ matrix.artifact_name }}.zip"
+
+      # Signs + notarizes BowEcho.app when the Apple secrets exist
+      # (docs/SIGNING.md) — silently skipped until then, so adding the
+      # secrets is the ONLY step needed to ship Gatekeeper-clean builds.
+      # Signs + notarizes BowEcho.app with the repo's Developer ID
+      # certificate and App Store Connect API key (docs/SIGNING.md).
+      - name: Sign and notarize macOS app
+        if: runner.os == 'macOS' && env.MACOS_CERTIFICATE_BASE64 != ''
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          ASC_API_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          app="BowEcho.app"
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -base64 24)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 1800 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          echo "$MACOS_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | awk -F '"' '/Developer ID Application/ {print $2; exit}')"
+          if [ -z "$identity" ]; then
+            echo "No Developer ID Application identity found in certificate" >&2
+            exit 1
+          fi
+          echo "Signing with: $identity"
+          codesign --force --deep --options runtime --timestamp \
+            --sign "$identity" "$app"
+          codesign --verify --deep --strict "$app"
+          echo "$ASC_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$ASC_KEY_ID" \
+            --issuer "$ASC_ISSUER_ID" --wait
+          xcrun stapler staple "$app"
+          spctl --assess --type execute --verbose "$app" || true
+          security delete-keychain "$keychain"
+
+      - name: Zip macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ditto -c -k --sequesterRsrc --keepParent "BowEcho.app" "dist/${{ matrix.artifact_name }}.zip"
 
       - name: Package Linux binary
         if: runner.os == 'Linux'

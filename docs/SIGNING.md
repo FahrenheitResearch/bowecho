@@ -34,10 +34,24 @@ which does NOT work in CI), or choose a vendor offering **cloud signing**
 Reputation with OV builds slowly (downloads accumulate); EV grants instant
 reputation but costs more.
 
-## macOS (later)
-Gatekeeper needs an Apple Developer ID ($99/yr): `codesign` + `notarytool`
-steps slot into the same workflow gate. Until then the README's
-right-click → Open instructions stand.
+## macOS — Apple Developer ID ($99/yr)
+The workflow step is already scaffolded (sign + notarize + staple), gated on
+secrets — add them and the next tag ships Gatekeeper-clean .apps:
+
+1. Join the Apple Developer Program (developer.apple.com, $99/yr).
+2. In Xcode or developer.apple.com → Certificates, create a
+   **Developer ID Application** certificate; export it (with its private
+   key) from Keychain Access as a `.p12` with a password.
+3. Create an **app-specific password** for your Apple ID
+   (account.apple.com → Sign-In and Security → App-Specific Passwords).
+4. Repo secrets on `FahrenheitResearch/bowecho` (CONFIGURED 2026-06-09):
+   - `MACOS_CERTIFICATE_BASE64` — Developer ID Application .p12, base64
+   - `MACOS_CERTIFICATE_PWD` — the .p12 export password
+   - `ASC_API_KEY_BASE64` — App Store Connect API key (.p8), base64
+   - `ASC_KEY_ID` / `ASC_ISSUER_ID` — the key's ID and issuer
+   The signing identity is discovered from the certificate automatically.
+5. Active since v0.6.0: both macOS matrix builds sign, notarize
+   (notarytool --wait via the ASC API key), and staple.
 
 ## Verifying a signed release
 ```powershell

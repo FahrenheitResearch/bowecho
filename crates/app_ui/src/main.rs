@@ -89,8 +89,6 @@ const COLOR_STATUS_SCROLL_HEIGHT: f32 = 34.0;
 const HAZARD_SUMMARY_SCROLL_HEIGHT: f32 = 86.0;
 const HAZARD_DETAIL_SCROLL_HEIGHT: f32 = 150.0;
 const TILT_LIST_SCROLL_HEIGHT: f32 = 168.0;
-const HISTORY_STATUS_SCROLL_HEIGHT: f32 = 42.0;
-const HISTORY_FRAME_BUTTONS_SCROLL_HEIGHT: f32 = 58.0;
 const PANEL_BUTTON_HEIGHT: f32 = 24.0;
 const SIDEBAR_DEFAULT_WIDTH: f32 = 380.0;
 const SIDEBAR_MIN_WIDTH: f32 = 300.0;
@@ -322,6 +320,9 @@ struct ViewerApp {
     tile_layer: std::cell::RefCell<tiles::TileLayer>,
     basemap_style: tiles::TileStyle,
     bold_labels: bool,
+    /// One-shot: force the Settings color-tables fold open (set by the
+    /// product color row's "Edit…" jump).
+    open_color_tables_request: bool,
     /// Latched while the user is examining an OLDER frame: live loads keep
     /// backfilling but never steal the selection back to the newest frame.
     /// Cleared by clicking the newest frame, looping, or loading a new site.
@@ -2028,24 +2029,21 @@ struct VrotGate {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SidebarTab {
     Radar,
-    Hazards,
-    Colors,
-    Stats,
+    Warnings,
+    Settings,
 }
 
 const SIDEBAR_TABS: &[(SidebarTab, &str)] = &[
     (SidebarTab::Radar, "Radar"),
-    (SidebarTab::Hazards, "Hazards"),
-    (SidebarTab::Colors, "Colors"),
-    (SidebarTab::Stats, "Stats"),
+    (SidebarTab::Warnings, "Warnings"),
+    (SidebarTab::Settings, "Settings"),
 ];
 
 fn sidebar_tab_tooltip(tab: SidebarTab) -> &'static str {
     match tab {
-        SidebarTab::Radar => "Radar site, overlays, product, and tilt controls",
-        SidebarTab::Hazards => "Warnings, watches, mesoscale discussions, and alert filters",
-        SidebarTab::Colors => "Built-in and custom radar color tables",
-        SidebarTab::Stats => "Performance timings and render/load diagnostics",
+        SidebarTab::Radar => "Site, products, tilt, loop, algorithms — live operations",
+        SidebarTab::Warnings => "Warnings, watches, MDs, and alert filters",
+        SidebarTab::Settings => "Basemap, color tables, hotkeys, diagnostics — always available",
     }
 }
 
@@ -2092,6 +2090,7 @@ impl ViewerApp {
             selected_frame_index: 0,
             tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(settings::tile_cache_dir())),
             basemap_style: tiles::TileStyle::DarkVector,
+            open_color_tables_request: false,
             bold_labels: true,
             browsing_history: false,
             history_frame_limit: DEFAULT_HISTORY_FRAME_LIMIT,
@@ -5004,8 +5003,7 @@ impl ViewerApp {
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Controls");
-        ui.add_space(6.0);
+        ui.add_space(2.0);
         self.sidebar_tab_bar(ui);
         ui.separator();
 
@@ -5019,7 +5017,7 @@ impl ViewerApp {
                         self.radar_controls_panel(ui, ctx);
                     });
             }
-            SidebarTab::Hazards => {
+            SidebarTab::Warnings => {
                 egui::ScrollArea::vertical()
                     .id_salt("sidebar_hazards_tab")
                     .auto_shrink([false, false])
@@ -5028,25 +5026,141 @@ impl ViewerApp {
                         self.hazard_panel(ui);
                     });
             }
-            SidebarTab::Colors => {
+            SidebarTab::Settings => {
                 egui::ScrollArea::vertical()
-                    .id_salt("sidebar_colors_tab")
+                    .id_salt("sidebar_settings_tab")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        self.color_table_panel(ui, ctx);
-                    });
-            }
-            SidebarTab::Stats => {
-                egui::ScrollArea::vertical()
-                    .id_salt("sidebar_stats_tab")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        self.stats_panel(ui);
+                        self.settings_panel(ui, ctx);
                     });
             }
         }
+    }
+
+    /// Small uppercase section header — visual rhythm for the Radar tab.
+    fn section_header(ui: &mut egui::Ui, label: &str) {
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(
+            egui::RichText::new(label)
+                .small()
+                .strong()
+                .color(egui::Color32::from_rgb(148, 160, 172)),
+        );
+    }
+
+    /// Display preferences (Settings ▸ Display).
+    fn display_settings_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if ui
+            .checkbox(&mut self.display_smoothing, "Smooth display")
+            .on_hover_text(
+                "GR2-style smoothing: a binomial kernel over the polar grid, computed once per product on the render worker and drawn through the regular fast path (pans stay fast). Native super-res detail is the default; note RF gates render transparent while smoothing.",
+            )
+            .changed()
+        {
+            ctx.request_repaint();
+        }
+        ui.horizontal(|ui| {
+            ui.label("Basemap");
+            let mut changed_style = None;
+            egui::ComboBox::from_id_salt("basemap_style")
+                .selected_text(self.basemap_style.label())
+                .width(118.0)
+                .show_ui(ui, |ui| {
+                    for style in tiles::TileStyle::ALL {
+                        if ui
+                            .selectable_label(self.basemap_style == style, style.label())
+                            .clicked()
+                        {
+                            changed_style = Some(style);
+                        }
+                    }
+                });
+            if let Some(style) = changed_style
+                && style != self.basemap_style
+            {
+                self.basemap_style = style;
+                self.app_settings.basemap_style = style.key().to_owned();
+                let _ = self.app_settings.save();
+                ctx.request_repaint();
+            }
+        });
+        if ui
+            .checkbox(&mut self.bold_labels, "Bold town labels")
+            .on_hover_text(
+                "GR2-style callout labels: bold white with a heavy outline, readable over storm cores",
+            )
+            .changed()
+        {
+            self.app_settings.bold_labels = self.bold_labels;
+            let _ = self.app_settings.save();
+            ctx.request_repaint();
+        }
+    }
+
+    /// Hotkey reference (Settings ▸ Hotkeys).
+    fn hotkeys_section(&mut self, ui: &mut egui::Ui) {
+        ui.weak("←/→ product · ↑/↓ tilt (focused pane)");
+        let mut bindings: Vec<(&String, &String)> =
+            self.app_settings.product_hotkeys.iter().collect();
+        bindings.sort_by(|a, b| {
+            let order = |k: &str| {
+                if k == "0" {
+                    10
+                } else {
+                    k.parse::<u8>().unwrap_or(99)
+                }
+            };
+            order(a.0).cmp(&order(b.0))
+        });
+        for (key, label) in bindings {
+            ui.monospace(format!("{key}  →  {label}"));
+        }
+        if let Some(path) = settings::AppSettings::config_path() {
+            ui.weak(format!("customize in {}", path.display()));
+        }
+    }
+
+    /// Settings tab: everything volume-independent, set once per session.
+    fn settings_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        egui::CollapsingHeader::new("Display")
+            .default_open(true)
+            .show(ui, |ui| {
+                self.display_settings_section(ui, ctx);
+            });
+        let color_tables_id = ui.make_persistent_id("settings_color_tables");
+        if self.open_color_tables_request {
+            self.open_color_tables_request = false;
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ctx,
+                color_tables_id,
+                false,
+            );
+            state.set_open(true);
+            state.store(ctx);
+        }
+        egui::collapsing_header::CollapsingState::load_with_default_open(
+            ctx,
+            color_tables_id,
+            false,
+        )
+        .show_header(ui, |ui| {
+            ui.label("Color tables");
+        })
+        .body(|ui| {
+            self.color_table_panel(ui, ctx);
+        });
+        egui::CollapsingHeader::new("Hotkeys")
+            .default_open(false)
+            .show(ui, |ui| {
+                self.hotkeys_section(ui);
+            });
+        egui::CollapsingHeader::new("Performance")
+            .default_open(false)
+            .show(ui, |ui| {
+                self.stats_panel(ui);
+            });
     }
 
     fn sidebar_tab_bar(&mut self, ui: &mut egui::Ui) {
@@ -5056,7 +5170,11 @@ impl ViewerApp {
                 let selected = self.sidebar_tab == *tab;
                 let response = ui
                     .add_sized(
-                        egui::vec2(67.0, PANEL_BUTTON_HEIGHT),
+                        egui::vec2(
+                            (ui.available_width() - 2.0 * ui.spacing().item_spacing.x).max(60.0)
+                                / 3.0,
+                            PANEL_BUTTON_HEIGHT,
+                        ),
                         egui::Button::selectable(selected, *label),
                     )
                     .on_hover_text(sidebar_tab_tooltip(*tab));
@@ -5068,8 +5186,23 @@ impl ViewerApp {
     }
 
     fn radar_controls_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // The sidebar edits the FOCUSED pane: the main pane (or 1x1) edits the
+        // shared state everyone follows; a focused extra pane edits itself.
+        // (Volume-free — hoisted above the volume gate.)
+        let editing_pane: Option<usize> = (self.grid_layout != PanelLayout::One
+            && self.active_pane >= 1
+            && self.active_pane - 1 < self.extra_panes.len())
+        .then(|| self.active_pane - 1);
+        let editing_product = editing_pane
+            .map(|slot| self.extra_panes[slot].product.clone())
+            .unwrap_or_else(|| self.selected_product.clone());
+        let editing_cut = editing_pane
+            .and_then(|slot| self.extra_panes[slot].cut)
+            .unwrap_or(self.selected_cut);
+
+        // R0: panes row + editing-pane context, above everything it affects.
         ui.horizontal(|ui| {
-            ui.label("Layout");
+            ui.label("Panes");
             for (layout, label, hover) in [
                 (PanelLayout::One, "1", "Single pane"),
                 (
@@ -5097,29 +5230,45 @@ impl ViewerApp {
                 }
             }
         });
-        ui.add_space(6.0);
-        ui.label("Level 2");
-        ui.add_space(8.0);
-        ui.label("Site");
-        let selected_site_label = self
-            .selected_site()
-            .map(format_site_label)
-            .unwrap_or_else(|| "None".to_owned());
-        let mut selected_site_index = self.selected_site_index;
-        egui::ComboBox::from_id_salt("site_combo")
-            .selected_text(selected_site_label)
-            .width(220.0)
-            .show_ui(ui, |ui| {
-                for (index, site) in self.sites.iter().enumerate() {
-                    ui.selectable_value(&mut selected_site_index, index, format_site_label(site));
-                }
-            });
-        if selected_site_index != self.selected_site_index {
-            self.selected_site_index = selected_site_index;
+        if let Some(slot) = editing_pane {
+            ui.colored_label(
+                egui::Color32::from_rgb(120, 168, 220),
+                format!(
+                    "Editing pane {} — click the main (top-left) pane to edit all",
+                    slot + 2
+                ),
+            );
         }
 
+        // R1: SITE — pick, load, live state, one-line status.
+        Self::section_header(ui, "SITE");
         ui.horizontal(|ui| {
-            if fixed_action_button(ui, "Load Selected", 100.0).clicked()
+            let selected_site_label = self
+                .selected_site()
+                .map(format_site_label)
+                .unwrap_or_else(|| "None".to_owned());
+            let mut selected_site_index = self.selected_site_index;
+            egui::ComboBox::from_id_salt("site_combo")
+                .selected_text(selected_site_label)
+                .width((ui.available_width() - 70.0).max(160.0))
+                .show_ui(ui, |ui| {
+                    for (index, site) in self.sites.iter().enumerate() {
+                        ui.selectable_value(
+                            &mut selected_site_index,
+                            index,
+                            format_site_label(site),
+                        );
+                    }
+                });
+            if selected_site_index != self.selected_site_index {
+                self.selected_site_index = selected_site_index;
+            }
+            if fixed_action_button(ui, "Center", 58.0).clicked() {
+                self.center_selected_site();
+            }
+        });
+        ui.horizontal(|ui| {
+            if fixed_action_button(ui, "Load Latest", 88.0).clicked()
                 && self.load_receiver.is_none()
             {
                 self.load_latest_level2_for_selected_site(ui.ctx());
@@ -5130,273 +5279,67 @@ impl ViewerApp {
                 self.load_loop_history_for_selected_site(ui.ctx());
                 self.remember_startup_site();
             }
-            if fixed_action_button(ui, "Center", 58.0).clicked() {
-                self.center_selected_site();
-            }
             ui.checkbox(&mut self.realtime_level2_auto_refresh, "Live");
             ui.checkbox(&mut self.display_live_chunk_updates, "Chunks")
                 .on_hover_text(
                     "Display incomplete live chunk tilts before a full low-level tilt is available",
                 );
         });
-
-        self.radar_layers_panel(ui, ctx);
-
-        ui.add_space(12.0);
-        let Some(volume) = &self.volume else {
-            ui.label(&self.status);
-            return;
-        };
-
-        let site = volume.site.id.clone();
-        let volume_time = volume
-            .volume_time
-            .format("%Y-%m-%d %H:%M:%S UTC")
-            .to_string();
-        let vcp = volume
-            .vcp
-            .as_ref()
-            .map(|vcp| vcp.pattern.to_string())
-            .unwrap_or_else(|| "unknown".to_owned());
-        let cut_count = volume.cuts.len();
-        let decoded_radials = volume.metadata.decoded_radial_count;
-        // The sidebar edits the FOCUSED pane: the main pane (or 1x1) edits the
-        // shared state everyone follows; a focused extra pane edits itself.
-        let editing_pane: Option<usize> = (self.grid_layout != PanelLayout::One
-            && self.active_pane >= 1
-            && self.active_pane - 1 < self.extra_panes.len())
-        .then(|| self.active_pane - 1);
-        let editing_product = editing_pane
-            .map(|slot| self.extra_panes[slot].product.clone())
-            .unwrap_or_else(|| self.selected_product.clone());
-        let editing_cut = editing_pane
-            .and_then(|slot| self.extra_panes[slot].cut)
-            .unwrap_or(self.selected_cut);
-        let product_buttons = global_displayable_products(volume)
-            .into_iter()
-            .map(|product| {
-                let target_cut = if is_displayable_on_cut(volume, editing_cut, &product) {
-                    Some(editing_cut)
-                } else {
-                    best_cut_for_product(volume, editing_cut, &product)
-                };
-                (product, target_cut)
-            })
-            .collect::<Vec<_>>();
-        let cut_rows = volume
-            .cuts
-            .iter()
-            .enumerate()
-            .map(|(index, cut)| {
-                (
-                    index,
-                    cut.elevation_deg,
-                    cut.radials.len(),
-                    cut_start_time_utc(volume, index),
-                    index == editing_cut,
-                    is_displayable_on_cut(volume, index, &editing_product),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        ui.label("Level 2 Volume");
-        ui.label(format!("Site {site}"));
-        ui.label(format!("Start {volume_time}"));
-        if let Some(frame) = self.selected_frame()
-            && frame.identity.site_id == site
-        {
-            ui.label(format!("Status {}", frame.status.label()));
-            if let Some(readout) = live_chunk_readout(frame, Utc::now()) {
-                ui.label(readout);
+        // One-line status — always rendered, hover carries the details.
+        if let Some(volume) = &self.volume {
+            let site = volume.site.id.clone();
+            let volume_time = volume
+                .volume_time
+                .format("%Y-%m-%d %H:%M:%S UTC")
+                .to_string();
+            let vcp = volume
+                .vcp
+                .as_ref()
+                .map(|vcp| vcp.pattern.to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let cut_count = volume.cuts.len();
+            let decoded_radials = volume.metadata.decoded_radial_count;
+            let clock = volume.volume_time.format("%H:%M:%S").to_string();
+            ui.weak(format!("{site} · VCP {vcp} · {clock}Z · {cut_count} cuts"))
+                .on_hover_text(format!(
+                    "Site {site}\nStart {volume_time}\nVCP {vcp}\n{cut_count} cuts, {decoded_radials} radials"
+                ));
+            if let Some(frame) = self.selected_frame()
+                && frame.identity.site_id == site
+                && let Some(readout) = live_chunk_readout(frame, Utc::now())
+            {
+                ui.weak(readout);
             }
-        }
-        ui.label(format!("VCP {vcp}"));
-        ui.label(format!("{cut_count} cuts, {decoded_radials} radials"));
-
-        self.frame_history_panel(ui, ctx);
-
-        ui.add_space(12.0);
-        ui.label("Product");
-        if let Some(slot) = editing_pane {
-            ui.colored_label(
-                egui::Color32::from_rgb(120, 168, 220),
-                format!(
-                    "Editing pane {} — click the main (top-left) pane to edit all",
-                    slot + 2
-                ),
-            );
-        }
-        ui.horizontal_wrapped(|ui| {
-            for (product, target_cut) in &product_buttons {
-                let selected = editing_product == *product;
-                let response = ui.selectable_label(selected, product.label());
-                if response.clicked() {
-                    if let Some(slot) = editing_pane {
-                        // Keep the old texture anchored while the new product
-                        // renders (the key's product change re-requests).
-                        self.extra_panes[slot].product = product.clone();
-                        self.extra_panes[slot].render_ms = None;
-                        ctx.request_repaint();
-                    } else {
-                        self.selected_product = product.clone();
-                        if let Some(cut_index) = target_cut {
-                            self.selected_cut = *cut_index;
-                        }
-                        self.clear_texture();
-                        ctx.request_repaint();
-                    }
-                }
-            }
-        });
-        self.active_product_color_picker(ui, ctx);
-
-        // Display threshold ("hide below"): declutters weak returns at render
-        // time; diverging families (VEL, shear) hide |v| < threshold instead.
-        {
-            let family = editing_product.color_family();
-            let family_label = family.label().to_owned();
-            let mut enabled = self.display_thresholds.contains_key(&family_label);
-            let symmetric = family_threshold_is_symmetric(family);
-            ui.horizontal(|ui| {
-                if ui
-                    .checkbox(
-                        &mut enabled,
-                        if symmetric { "Hide |val| below" } else { "Hide below" },
-                    )
-                    .on_hover_text(
-                        "Render-time threshold for this product family: weaker returns draw transparent. The data is untouched — the inspector still reads it, and the colorbar shows the cut.",
-                    )
-                    .changed()
-                {
-                    if enabled {
-                        let default = default_display_threshold(family);
-                        self.display_thresholds.insert(family_label.clone(), default);
-                    } else {
-                        self.display_thresholds.remove(&family_label);
-                    }
-                    ctx.request_repaint();
-                }
-                if let Some(threshold) = self.display_thresholds.get_mut(&family_label) {
-                    let units = product_units(&editing_product);
-                    if ui
-                        .add(
-                            egui::DragValue::new(threshold)
-                                .speed(0.5)
-                                .suffix(format!(" {units}")),
-                        )
-                        .changed()
+            egui::CollapsingHeader::new("Volume details")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label(format!("Site {site}"));
+                    ui.label(format!("Start {volume_time}"));
+                    if let Some(frame) = self.selected_frame()
+                        && frame.identity.site_id == site
                     {
-                        ctx.request_repaint();
+                        ui.label(format!("Status {}", frame.status.label()));
                     }
-                }
-            });
+                    ui.label(format!("VCP {vcp}"));
+                    ui.label(format!("{cut_count} cuts, {decoded_radials} radials"));
+                });
+        } else {
+            ui.label(&self.status);
         }
 
-        if self.selected_product.color_family() == ColorTableFamily::Velocity {
-            if matches!(
-                self.selected_product,
-                DisplayProduct::Moment(MomentType::Velocity)
-            ) {
-                let mut engine_changed = false;
-                if self.unfold_velocity_display {
-                    egui::ComboBox::from_id_salt("dealias_engine")
-                        .selected_text(if self.dealias_cascade {
-                            "Cascade (beta)"
-                        } else {
-                            "Region"
-                        })
-                        .width(120.0)
-                        .show_ui(ui, |ui| {
-                            engine_changed |= ui
-                                .selectable_value(&mut self.dealias_cascade, false, "Region")
-                                .on_hover_text("Region-based unfolding (default, proven)")
-                                .changed();
-                            engine_changed |= ui
-                                .selectable_value(
-                                    &mut self.dealias_cascade,
-                                    true,
-                                    "Cascade (beta)",
-                                )
-                                .on_hover_text(
-                                    "Tilt-cascade: dealias top-down, each tilt branch-checked against the wind fit from the (less aliased) tilt above. Helps on VCPs with high-Nyquist upper tilts; see docs/dealias-fold-branch-analysis.md.",
-                                )
-                                .changed();
-                        });
-                }
-                if engine_changed {
-                    self.clear_texture();
-                    ctx.request_repaint();
-                }
-                let changed = ui
-                    .checkbox(&mut self.unfold_velocity_display, "Unfold VEL")
-                    .on_hover_text(
-                        "Use the dealiased continuity grid for base velocity display colors",
-                    )
-                    .changed();
-                if changed {
-                    self.clear_texture();
-                    ctx.request_repaint();
-                }
-            }
-            let changed = ui
-                .checkbox(&mut self.flip_velocity_color_polarity, "Flip VEL colors")
-                .on_hover_text("Diagnostic: color positive velocity values with the negative side of the active velocity table, and vice versa")
-                .changed();
-            if changed {
-                self.clear_texture();
-                ctx.request_repaint();
-            }
-        }
-
+        // R2: LAYERS — radar overlays + placefiles together, available with or
+        // without a loaded volume.
+        let layer_count =
+            self.radar_layers.len() + self.placefile_slots.iter().filter(|s| s.enabled).count();
+        ui.add_space(8.0);
         ui.separator();
-        if ui
-            .checkbox(&mut self.show_rotation_markers, "Rotation markers")
-            .on_hover_text(
-                "NSSL MDA/TDA-style detection (Stumpf et al. 1998; Mitchell et al. 1998): QC-masked, vertically-continuous circulations only, on a background thread. Pale ring = weak, orange = moderate, double gold = mesocyclone (rank ≥ 5), red triangle = TVS. Zoom in for rank + Vrot.",
-            )
-            .changed()
-        {
-            self.rotation_markers_volume_ptr = 0;
-            if !self.show_rotation_markers {
-                self.rotation_markers.clear();
-            }
-            ctx.request_repaint();
-        }
-
-        ui.separator();
-        ui.horizontal(|ui| {
-            if ui
-                .checkbox(&mut self.show_storm_tracks, "Storm tracks")
-                .on_hover_text(
-                    "SCIT-style cell tracking (Johnson et al. 1998): composite-reflectivity cells identified per volume on a background thread, tracked across volumes with a least-squares motion fit; dots extrapolate +15/+30/+45 min.",
-                )
-                .changed()
-            {
-                if !self.show_storm_tracks {
-                    self.storm_tracks.clear();
-                }
-                self.storm_cells_volume_ptr = 0;
-                ctx.request_repaint();
-            }
-            if let Some((direction, speed_kt)) = self.storm_motion_from_tracks()
-                && ui
-                    .small_button("SRV←tracks")
-                    .on_hover_text(format!(
-                        "Set storm motion from the mean track motion ({direction:03.0}° / {speed_kt:.0} kt)"
-                    ))
-                    .clicked()
-            {
-                self.storm_motion_direction_deg = direction;
-                self.storm_motion_speed_kt = speed_kt;
-                self.clear_texture();
-                ctx.request_repaint();
-            }
-        });
-
-        ui.separator();
-        egui::CollapsingHeader::new("Placefiles")
-            .default_open(false)
+        egui::CollapsingHeader::new(format!("Layers ({layer_count})"))
+            .id_salt("layers_fold")
+            .default_open(layer_count > 0)
             .show(ui, |ui| {
+                self.radar_layers_panel(ui, ctx);
+                ui.separator();
+                ui.label("Placefiles");
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.placefile_url_input)
@@ -5437,7 +5380,11 @@ impl ViewerApp {
                         if ui.small_button("↻").on_hover_text("Refresh now").clicked() {
                             slot.next_refresh = Some(Instant::now());
                         }
-                        if ui.small_button("✕").on_hover_text("Remove").clicked() {
+                        if ui
+                            .small_button("✕")
+                            .on_hover_text("Remove placefile")
+                            .clicked()
+                        {
                             remove = Some(index);
                         }
                     });
@@ -5452,114 +5399,178 @@ impl ViewerApp {
                 }
             });
 
-        ui.separator();
-        egui::CollapsingHeader::new("Hotkeys")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.weak("←/→ product · ↑/↓ tilt (focused pane)");
-                let mut bindings: Vec<(&String, &String)> =
-                    self.app_settings.product_hotkeys.iter().collect();
-                bindings.sort_by(|a, b| {
-                    let order = |k: &str| {
-                        if k == "0" {
-                            10
-                        } else {
-                            k.parse::<u8>().unwrap_or(99)
-                        }
-                    };
-                    order(a.0).cmp(&order(b.0))
-                });
-                for (key, label) in bindings {
-                    ui.monospace(format!("{key}  →  {label}"));
+        // Everything below genuinely needs a loaded volume (the status line
+        // above already explains the empty state).
+        let Some(volume) = &self.volume else {
+            return;
+        };
+
+        let product_buttons = global_displayable_products(volume)
+            .into_iter()
+            .map(|product| {
+                let target_cut = if is_displayable_on_cut(volume, editing_cut, &product) {
+                    Some(editing_cut)
+                } else {
+                    best_cut_for_product(volume, editing_cut, &product)
+                };
+                (product, target_cut)
+            })
+            .collect::<Vec<_>>();
+        let cut_rows = volume
+            .cuts
+            .iter()
+            .enumerate()
+            .map(|(index, cut)| {
+                (
+                    index,
+                    cut.elevation_deg,
+                    cut.radials.len(),
+                    cut_start_time_utc(volume, index),
+                    index == editing_cut,
+                    is_displayable_on_cut(volume, index, &editing_product),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // R3: PRODUCTS — hotkey-prefixed grid, contextual rows, color, threshold.
+        Self::section_header(ui, "PRODUCTS");
+        // Invert the hotkey map so each product button can show its key.
+        let hotkey_for_label: std::collections::HashMap<String, String> = self
+            .app_settings
+            .product_hotkeys
+            .iter()
+            .map(|(key, label)| (label.clone(), key.clone()))
+            .collect();
+        ui.horizontal_wrapped(|ui| {
+            for (product, target_cut) in &product_buttons {
+                let selected = editing_product == *product;
+                let label = product.label();
+                let button_text = match hotkey_for_label.get(label) {
+                    Some(key) => format!("{key}·{label}"),
+                    None => label.to_owned(),
+                };
+                let mut response = ui.selectable_label(selected, button_text);
+                if let Some(key) = hotkey_for_label.get(label) {
+                    response = response.on_hover_text(format!("hotkey {key}"));
                 }
-                if let Some(path) = settings::AppSettings::config_path() {
-                    ui.weak(format!("customize in {}", path.display()));
+                if response.clicked() {
+                    if let Some(slot) = editing_pane {
+                        // Keep the old texture anchored while the new product
+                        // renders (the key's product change re-requests).
+                        self.extra_panes[slot].product = product.clone();
+                        self.extra_panes[slot].render_ms = None;
+                        ctx.request_repaint();
+                    } else {
+                        self.selected_product = product.clone();
+                        if let Some(cut_index) = target_cut {
+                            self.selected_cut = *cut_index;
+                        }
+                        self.clear_texture();
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        });
+
+        // Contextual rows: exactly one family block at a time, gated on the
+        // FOCUSED pane's product, so the tilt list below barely shifts.
+        if editing_product.color_family() == ColorTableFamily::Velocity {
+            ui.horizontal(|ui| {
+                if matches!(editing_product, DisplayProduct::Moment(MomentType::Velocity)) {
+                    let unfold_changed = ui
+                        .checkbox(&mut self.unfold_velocity_display, "Unfold VEL")
+                        .on_hover_text(
+                            "Use the dealiased continuity grid for base velocity display colors (all panes)",
+                        )
+                        .changed();
+                    if unfold_changed {
+                        self.clear_texture();
+                        ctx.request_repaint();
+                    }
+                    let mut engine_changed = false;
+                    ui.add_enabled_ui(self.unfold_velocity_display, |ui| {
+                        egui::ComboBox::from_id_salt("dealias_engine")
+                            .selected_text(if self.dealias_cascade {
+                                "Cascade (beta)"
+                            } else {
+                                "Region"
+                            })
+                            .width(110.0)
+                            .show_ui(ui, |ui| {
+                                engine_changed |= ui
+                                    .selectable_value(&mut self.dealias_cascade, false, "Region")
+                                    .on_hover_text("Region-based unfolding (default, proven)")
+                                    .changed();
+                                engine_changed |= ui
+                                    .selectable_value(
+                                        &mut self.dealias_cascade,
+                                        true,
+                                        "Cascade (beta)",
+                                    )
+                                    .on_hover_text(
+                                        "Tilt-cascade: dealias top-down, each tilt branch-checked against the wind fit from the (less aliased) tilt above. Helps on VCPs with high-Nyquist upper tilts; see docs/dealias-fold-branch-analysis.md.",
+                                    )
+                                    .changed();
+                            });
+                    });
+                    if engine_changed {
+                        self.clear_texture();
+                        ctx.request_repaint();
+                    }
+                }
+                let changed = ui
+                    .checkbox(&mut self.flip_velocity_color_polarity, "Flip")
+                    .on_hover_text("Diagnostic: color positive velocity values with the negative side of the active velocity table, and vice versa (all panes)")
+                    .changed();
+                if changed {
+                    self.clear_texture();
+                    ctx.request_repaint();
                 }
             });
-
-        ui.separator();
-        if ui
-            .checkbox(&mut self.display_smoothing, "Smooth display")
-            .on_hover_text(
-                "GR2-style smoothing: a binomial kernel over the polar grid, computed once per product on the render worker and drawn through the regular fast path (pans stay fast). Native super-res detail is the default; note RF gates render transparent while smoothing.",
-            )
-            .changed()
-        {
-            ctx.request_repaint();
         }
-
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("Basemap");
-            let mut changed_style = None;
-            egui::ComboBox::from_id_salt("basemap_style")
-                .selected_text(self.basemap_style.label())
-                .width(118.0)
-                .show_ui(ui, |ui| {
-                    for style in tiles::TileStyle::ALL {
-                        if ui
-                            .selectable_label(self.basemap_style == style, style.label())
-                            .clicked()
-                        {
-                            changed_style = Some(style);
-                        }
-                    }
-                });
-            if let Some(style) = changed_style
-                && style != self.basemap_style
-            {
-                self.basemap_style = style;
-                self.app_settings.basemap_style = style.key().to_owned();
-                let _ = self.app_settings.save();
-                ctx.request_repaint();
-            }
-        });
-        if ui
-            .checkbox(&mut self.bold_labels, "Bold town labels")
-            .on_hover_text(
-                "GR2-style callout labels: bold white with a heavy outline, readable over storm cores",
-            )
-            .changed()
-        {
-            self.app_settings.bold_labels = self.bold_labels;
-            let _ = self.app_settings.save();
-            ctx.request_repaint();
-        }
-        ui.separator();
-        ui.checkbox(&mut self.show_inspector_card, "Inspector card")
-            .on_hover_text(
-                "Floating data card at the cursor (value, range/azimuth, beam height, Vrot; velocity products add a radial in/outbound arrow). Shift+click the map to pin it to a spot — it tracks pan/zoom and live updates; Shift+click it again to release.",
-            );
-        ui.horizontal(|ui| {
-            let was_armed = self.cross_section_armed;
-            ui.checkbox(&mut self.cross_section_armed, "Cross-section")
-                .on_hover_text(
-                    "Arm, then left-click two points on the map to draw a vertical cross-section below (right-click clears). Uses velocity when a velocity product is selected, else reflectivity.",
-                );
-            // Disarming with only endpoint A placed drops the dangling point so
-            // the rubber band + panel don't linger; a completed A→B section stays.
-            if was_armed
-                && !self.cross_section_armed
-                && self.cross_section_a_lonlat.is_some()
-                && self.cross_section_b_lonlat.is_none()
-            {
-                self.cross_section_a_lonlat = None;
-                self.cross_section_signature = None;
-            }
-            if fixed_action_button(ui, "Clear XS", 64.0).clicked() {
-                self.cross_section_a_lonlat = None;
-                self.cross_section_b_lonlat = None;
-                self.cross_section_texture = None;
-                self.cross_section_signature = None;
-                self.cross_section_status = "Cross-section: arm, then click endpoint A then B".to_owned();
-            }
-        });
-
-        if editing_product == DisplayProduct::Derived(DerivedProduct::Mehs) {
-            ui.add_space(8.0);
-            ui.label("Hail environment (above radar)");
+        if editing_product.is_storm_relative_velocity() {
             ui.horizontal(|ui| {
-                ui.label("0°C");
+                ui.label("Motion");
+                let direction_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut self.storm_motion_direction_deg)
+                            .range(0.0..=359.0)
+                            .speed(1.0)
+                            .suffix(" deg"),
+                    )
+                    .changed();
+                let speed_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut self.storm_motion_speed_kt)
+                            .range(0.0..=120.0)
+                            .speed(1.0)
+                            .suffix(" kt"),
+                    )
+                    .changed();
+                if direction_changed || speed_changed {
+                    self.storm_motion_direction_deg =
+                        self.storm_motion_direction_deg.rem_euclid(360.0);
+                    self.clear_texture();
+                    ctx.request_repaint();
+                }
+                if let Some((direction, speed_kt)) = self.storm_motion_from_tracks()
+                    && ui
+                        .small_button("←tracks")
+                        .on_hover_text(format!(
+                            "Set storm motion from the mean track motion ({direction:03.0}° / {speed_kt:.0} kt)"
+                        ))
+                        .clicked()
+                {
+                    self.storm_motion_direction_deg = direction;
+                    self.storm_motion_speed_kt = speed_kt;
+                    self.clear_texture();
+                    ctx.request_repaint();
+                }
+            });
+        }
+        if editing_product == DisplayProduct::Derived(DerivedProduct::Mehs) {
+            ui.horizontal(|ui| {
+                ui.label("Hail 0°C/−20°C");
                 let f_changed = ui
                     .add(
                         egui::DragValue::new(&mut self.hail_freezing_level_km)
@@ -5571,7 +5582,6 @@ impl ViewerApp {
                         "Melting-level height above the radar (from a sounding). MEHS follows Witt et al. 1998.",
                     )
                     .changed();
-                ui.label("−20°C");
                 let m_changed = ui
                     .add(
                         egui::DragValue::new(&mut self.hail_minus20_level_km)
@@ -5589,35 +5599,55 @@ impl ViewerApp {
             });
         }
 
-        if self.selected_product.is_storm_relative_velocity() {
-            ui.add_space(8.0);
-            ui.label("Storm Motion");
-            let direction_changed = ui
-                .add(
-                    egui::DragValue::new(&mut self.storm_motion_direction_deg)
-                        .range(0.0..=359.0)
-                        .speed(1.0)
-                        .suffix(" deg"),
-                )
-                .changed();
-            let speed_changed = ui
-                .add(
-                    egui::DragValue::new(&mut self.storm_motion_speed_kt)
-                        .range(0.0..=120.0)
-                        .speed(1.0)
-                        .suffix(" kt"),
-                )
-                .changed();
-            if direction_changed || speed_changed {
-                self.storm_motion_direction_deg = self.storm_motion_direction_deg.rem_euclid(360.0);
-                self.clear_texture();
-                ctx.request_repaint();
-            }
+        let editing_family = editing_product.color_family();
+        self.active_product_color_picker(ui, ctx, editing_family);
+
+        // Display threshold ("hide below"): declutters weak returns at render
+        // time; diverging families (VEL, shear) hide |v| < threshold instead.
+        {
+            let family = editing_family;
+            let family_label = family.label().to_owned();
+            let mut enabled = self.display_thresholds.contains_key(&family_label);
+            let symmetric = family_threshold_is_symmetric(family);
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(
+                        &mut enabled,
+                        if symmetric { "Hide |val| below" } else { "Hide below" },
+                    )
+                    .on_hover_text(
+                        "Render-time threshold for this product family: weaker returns draw transparent. The data is untouched — the inspector still reads it, and the colorbar shows the cut.",
+                    )
+                    .changed()
+                {
+                    if enabled {
+                        let default = default_display_threshold(family);
+                        self.display_thresholds.insert(family_label.clone(), default);
+                    } else {
+                        self.display_thresholds.remove(&family_label);
+                    }
+                    ctx.request_repaint();
+                }
+                if let Some(threshold) = self.display_thresholds.get_mut(&family_label) {
+                    let units = product_units(&editing_product);
+                    if ui
+                        .add(
+                            egui::DragValue::new(threshold)
+                                .speed(0.5)
+                                .suffix(format!(" {units}")),
+                        )
+                        .changed()
+                    {
+                        ctx.request_repaint();
+                    }
+                }
+            });
         }
 
-        ui.add_space(12.0);
+        // R4: TILT — stable position, at most one contextual block above it.
+        Self::section_header(ui, "TILT");
         ui.horizontal(|ui| {
-            ui.label("Tilt");
+            ui.weak("↑/↓");
             if let Some(slot) = editing_pane {
                 if self.extra_panes[slot].cut.is_some() {
                     if ui
@@ -5679,40 +5709,92 @@ impl ViewerApp {
                     }
                 }
             });
-    }
 
-    fn frame_history_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.add_space(12.0);
+        // R5: LOOP.
+        Self::section_header(ui, "LOOP");
+        self.frame_history_panel(ui, ctx);
+
+        // R6: ALGORITHMS.
+        Self::section_header(ui, "ALGORITHMS");
+        if ui
+            .checkbox(&mut self.show_rotation_markers, "Rotation markers")
+            .on_hover_text(
+                "NSSL MDA/TDA-style detection (Stumpf et al. 1998; Mitchell et al. 1998): QC-masked, vertically-continuous circulations only, on a background thread. Pale ring = weak, orange = moderate, double gold = mesocyclone (rank ≥ 5), red triangle = TVS. Zoom in for rank + Vrot.",
+            )
+            .changed()
+        {
+            self.rotation_markers_volume_ptr = 0;
+            if !self.show_rotation_markers {
+                self.rotation_markers.clear();
+            }
+            ctx.request_repaint();
+        }
         ui.horizontal(|ui| {
-            ui.label("History");
-            let mut selected_limit = self.history_frame_limit;
-            egui::ComboBox::from_id_salt("history_frame_limit")
-                .selected_text(format!("{} frames", self.history_frame_limit))
-                .width(92.0)
-                .show_ui(ui, |ui| {
-                    for limit in HISTORY_SIZE_OPTIONS {
-                        ui.selectable_value(&mut selected_limit, *limit, format!("{limit} frames"));
-                    }
-                });
-            if selected_limit != self.history_frame_limit {
-                self.set_history_frame_limit(selected_limit, ctx);
+            if ui
+                .checkbox(&mut self.show_storm_tracks, "Storm tracks")
+                .on_hover_text(
+                    "SCIT-style cell tracking (Johnson et al. 1998): composite-reflectivity cells identified per volume on a background thread, tracked across volumes with a least-squares motion fit; dots extrapolate +15/+30/+45 min.",
+                )
+                .changed()
+            {
+                if !self.show_storm_tracks {
+                    self.storm_tracks.clear();
+                }
+                self.storm_cells_volume_ptr = 0;
+                ctx.request_repaint();
+            }
+            if let Some((direction, speed_kt)) = self.storm_motion_from_tracks()
+                && ui
+                    .small_button("SRV←tracks")
+                    .on_hover_text(format!(
+                        "Set storm motion from the mean track motion ({direction:03.0}° / {speed_kt:.0} kt)"
+                    ))
+                    .clicked()
+            {
+                self.storm_motion_direction_deg = direction;
+                self.storm_motion_speed_kt = speed_kt;
+                self.clear_texture();
+                ctx.request_repaint();
             }
         });
 
+        // R7: TOOLS.
+        Self::section_header(ui, "TOOLS");
+        ui.checkbox(&mut self.show_inspector_card, "Inspector card")
+            .on_hover_text(
+                "Floating data card at the cursor (value, range/azimuth, beam height, Vrot; velocity products add a radial in/outbound arrow). Shift+click the map to pin it to a spot — it tracks pan/zoom and live updates; Shift+click it again to release.",
+            );
+        ui.horizontal(|ui| {
+            let was_armed = self.cross_section_armed;
+            ui.checkbox(&mut self.cross_section_armed, "Cross-section")
+                .on_hover_text(
+                    "Arm, then left-click two points on the map to draw a vertical cross-section below (right-click clears). Uses velocity when a velocity product is selected, else reflectivity.",
+                );
+            // Disarming with only endpoint A placed drops the dangling point so
+            // the rubber band + panel don't linger; a completed A→B section stays.
+            if was_armed
+                && !self.cross_section_armed
+                && self.cross_section_a_lonlat.is_some()
+                && self.cross_section_b_lonlat.is_none()
+            {
+                self.cross_section_a_lonlat = None;
+                self.cross_section_signature = None;
+            }
+            if fixed_action_button(ui, "Clear XS", 64.0).clicked() {
+                self.cross_section_a_lonlat = None;
+                self.cross_section_b_lonlat = None;
+                self.cross_section_texture = None;
+                self.cross_section_signature = None;
+                self.cross_section_status = "Cross-section: arm, then click endpoint A then B".to_owned();
+            }
+        });
+    }
+
+    fn frame_history_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if self.frame_history.is_empty() {
-            ui.label("No history frames loaded");
+            ui.weak("No loop — use Load Loop");
             return;
         }
-
-        let selected_status_text = self.selected_frame_status_text();
-        fixed_height_scroll(
-            ui,
-            "history_selected_frame_status",
-            HISTORY_STATUS_SCROLL_HEIGHT,
-            |ui| {
-                wrapped_label(ui, &selected_status_text);
-            },
-        );
 
         let frame_count = self.frame_history.len();
         let mut next_frame_index = None;
@@ -5757,6 +5839,19 @@ impl ViewerApp {
             {
                 next_frame_index = Some((self.selected_frame_index + 1) % frame_count);
             }
+            ui.weak(format!("{}/{}", self.selected_frame_index + 1, frame_count));
+            let mut selected_limit = self.history_frame_limit;
+            egui::ComboBox::from_id_salt("history_frame_limit")
+                .selected_text(format!("{}", self.history_frame_limit))
+                .width(52.0)
+                .show_ui(ui, |ui| {
+                    for limit in HISTORY_SIZE_OPTIONS {
+                        ui.selectable_value(&mut selected_limit, *limit, format!("{limit} frames"));
+                    }
+                });
+            if selected_limit != self.history_frame_limit {
+                self.set_history_frame_limit(selected_limit, ctx);
+            }
         });
 
         let mut slider_index = self.selected_frame_index.min(frame_count - 1);
@@ -5774,11 +5869,14 @@ impl ViewerApp {
             next_frame_index = Some(slider_index);
         }
 
-        fixed_height_scroll(
-            ui,
-            "history_frame_buttons",
-            HISTORY_FRAME_BUTTONS_SCROLL_HEIGHT,
-            |ui| {
+        let selected_status_text = self.selected_frame_status_text();
+        ui.add(egui::Label::new(egui::RichText::new(&selected_status_text).weak()).truncate())
+            .on_hover_text(&selected_status_text);
+
+        egui::CollapsingHeader::new(format!("Frames ({frame_count})"))
+            .id_salt("loop_frames")
+            .default_open(false)
+            .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for (index, frame) in self.frame_history.iter().enumerate() {
                         let label = compact_frame_label(frame, Utc::now());
@@ -5795,8 +5893,7 @@ impl ViewerApp {
                         }
                     }
                 });
-            },
-        );
+            });
 
         if let Some(index) = next_frame_index {
             self.history_playing = false;
@@ -5807,13 +5904,28 @@ impl ViewerApp {
         }
     }
 
-    fn active_product_color_picker(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let family = self.selected_product.color_family();
+    fn active_product_color_picker(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        family: ColorTableFamily,
+    ) {
         let current_table = self.color_tables.for_family(family);
         let current_name = current_table.name().to_owned();
         let current_summary = color_table_summary(current_table);
         ui.add_space(6.0);
-        ui.label("Color");
+        ui.horizontal(|ui| {
+            ui.label("Color");
+            if ui
+                .small_button("Edit…")
+                .on_hover_text("Open the full color-table manager (Settings tab)")
+                .clicked()
+            {
+                self.sidebar_tab = SidebarTab::Settings;
+                self.color_table_target = family;
+                self.open_color_tables_request = true;
+            }
+        });
         egui::ComboBox::from_id_salt("active_product_color_preset")
             .selected_text(&current_name)
             .width(220.0)
@@ -5956,7 +6068,6 @@ impl ViewerApp {
     }
 
     fn color_table_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.label("Colors");
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("color_table_target")
                 .selected_text(self.color_table_target.label())
@@ -6074,7 +6185,6 @@ impl ViewerApp {
     }
 
     fn hazard_panel(&mut self, ui: &mut egui::Ui) {
-        ui.label("Hazards");
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.hazards_visible, "Show");
             ui.checkbox(&mut self.hazards_active_only, "Active");
@@ -6164,7 +6274,6 @@ impl ViewerApp {
     }
 
     fn stats_panel(&mut self, ui: &mut egui::Ui) {
-        ui.label("Performance");
         ui.checkbox(&mut self.show_performance_stats, "Details");
         if let Some(render_ms) = self.render_ms {
             ui.label(format!("Render {render_ms:.1} ms"));
@@ -15330,6 +15439,7 @@ mod tests {
             selected_frame_index: 0,
             tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(settings::tile_cache_dir())),
             basemap_style: tiles::TileStyle::DarkVector,
+            open_color_tables_request: false,
             bold_labels: true,
             browsing_history: false,
             history_frame_limit: DEFAULT_HISTORY_FRAME_LIMIT,
