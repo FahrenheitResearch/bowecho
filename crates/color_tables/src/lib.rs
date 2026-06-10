@@ -192,7 +192,12 @@ impl ColorTable {
                     range_folded = parse_color_only(value, line_number)?;
                 }
                 "color" | "color4" | "solidcolor" | "solidcolor4" => {
-                    stops.push(parse_color_stop(value, key.ends_with('4'), line_number)?);
+                    stops.push(parse_color_stop(
+                        value,
+                        key.ends_with('4'),
+                        key.starts_with("solid"),
+                        line_number,
+                    )?);
                 }
                 _ => {}
             }
@@ -298,9 +303,9 @@ impl ColorTable {
         left.color.lerp(right.color, (value - left.value) / span)
     }
 
-    /// GR .pal interval semantics: solid for single-color stops, a linear
-    /// ramp from `color` to `end_color` across the interval for two-color
-    /// stops (GR2Analyst behavior; `step:` never quantizes).
+    /// GR .pal interval semantics: linear ramps between `color:` rows, optional
+    /// per-row `end_color` ramps, and `SolidColor:` hard cuts. `Step:` never
+    /// quantizes the display.
     fn sample_gr_pal(&self, value: f32) -> Rgba8 {
         let Some(first) = self.stops.first() else {
             return Rgba8::TRANSPARENT;
@@ -310,14 +315,17 @@ impl ColorTable {
         }
         let index = self.stops.partition_point(|stop| stop.value <= value);
         let stop = self.stops[index.saturating_sub(1)];
-        let Some(end_color) = stop.end_color else {
+        let Some(next_stop) = self.stops.get(index) else {
             return stop.color;
         };
-        let interval_end = self
-            .stops
-            .get(index)
-            .map(|next| next.value)
-            .unwrap_or(stop.value + 1.0);
+        let end_color = stop.end_color.unwrap_or({
+            if stop.color.a == 0 {
+                stop.color
+            } else {
+                next_stop.color
+            }
+        });
+        let interval_end = next_stop.value;
         let span = (interval_end - stop.value).max(f32::EPSILON);
         let t = ((value - stop.value) / span).clamp(0.0, 1.0);
         stop.color.lerp(end_color, t)
@@ -405,6 +413,7 @@ impl ColorTable {
         for stop in &self.stops {
             stop.value.to_bits().hash(&mut hasher);
             stop.color.hash(&mut hasher);
+            stop.end_color.hash(&mut hasher);
         }
         self.display_threshold.map(f32::to_bits).hash(&mut hasher);
         self.threshold_is_symmetric.hash(&mut hasher);
@@ -567,8 +576,8 @@ impl ColorSampler {
         self.range_folded.to_array()
     }
 
-    /// GR .pal interval semantics on the bucketed stop index (solid or
-    /// per-interval ramp; see ColorTable::sample_gr_pal).
+    /// GR .pal interval semantics on the bucketed stop index; see
+    /// ColorTable::sample_gr_pal.
     fn sample_gr_pal_accelerated(&self, value: f32) -> Rgba8 {
         let Some(first) = self.stops.first() else {
             return Rgba8::TRANSPARENT;
@@ -587,14 +596,17 @@ impl ColorSampler {
             index += 1;
         }
         let stop = self.stops[index.saturating_sub(1)];
-        let Some(end_color) = stop.end_color else {
+        let Some(next_stop) = self.stops.get(index) else {
             return stop.color;
         };
-        let interval_end = self
-            .stops
-            .get(index)
-            .map(|next| next.value)
-            .unwrap_or(stop.value + 1.0);
+        let end_color = stop.end_color.unwrap_or({
+            if stop.color.a == 0 {
+                stop.color
+            } else {
+                next_stop.color
+            }
+        });
+        let interval_end = next_stop.value;
         let span = (interval_end - stop.value).max(f32::EPSILON);
         let t = ((value - stop.value) / span).clamp(0.0, 1.0);
         stop.color.lerp(end_color, t)
@@ -1364,6 +1376,7 @@ fn non_empty(value: &str) -> Option<String> {
 fn parse_color_stop(
     value: &str,
     expects_alpha: bool,
+    solid: bool,
     line: usize,
 ) -> Result<ColorStop, ColorTableError> {
     let numbers = parse_numbers(value);
@@ -1387,11 +1400,15 @@ fn parse_color_stop(
         ))
     };
     let color = read_color(1)?;
-    // GR .pal two-color entries ramp color -> end_color across the
-    // entry's own interval.
-    let end_color = (numbers.len() > 2 * components)
-        .then(|| read_color(1 + components))
-        .transpose()?;
+    // `Color:` rows interpolate to the next color unless they provide a
+    // second interval-end color. `SolidColor:` rows hold a hard band.
+    let end_color = if solid {
+        Some(color)
+    } else {
+        (numbers.len() > 2 * components)
+            .then(|| read_color(1 + components))
+            .transpose()?
+    };
     Ok(ColorStop {
         value: numbers[0],
         color,
@@ -2056,8 +2073,8 @@ mod gr_pal_tests {
     use super::*;
 
     /// The community .pal that exposed the GR-semantics gaps (RadarOmega
-    /// reflectivity): color4 alpha stop, a two-color gray ramp, solid
-    /// single-color bands, and a Step: header that must NOT quantize.
+    /// reflectivity): color4 alpha stop, a two-color gray ramp, interpolated
+    /// single-color levels, and a Step: header that must NOT quantize.
     const RADAR_OMEGA: &str = "units: dBZ
 step: 10
 product: BR
@@ -2079,15 +2096,17 @@ color: 85 255 231 188
         let table = ColorTable::parse_gr_pal("RadarOmega", RADAR_OMEGA).expect("parse");
         // Step: is legend-only — no quantization mode.
         assert_eq!(table.sample_mode_label(), "GR pal");
-        // color4 alpha stop: the [-10, 0) interval is SOLID transparent teal.
+        // color4 alpha threshold stop: the [-10, 0) interval remains hidden.
         assert_eq!(table.sample(-5.0).a, 0);
         // Two-color ramp 0..20: midpoint is halfway gray.
         let mid = table.sample(10.0);
         assert!((mid.r as i32 - 126).abs() <= 2, "{mid:?}");
         assert!((mid.g as i32 - 131).abs() <= 2, "{mid:?}");
-        // Single-color band 20..30 is SOLID green everywhere (GR steps it).
-        assert_eq!(table.sample(21.0), table.sample(29.0));
-        assert_eq!(table.sample(25.0).r, 135);
+        // Single-color levels interpolate between the full table stops.
+        assert_ne!(table.sample(21.0), table.sample(29.0));
+        let green = table.sample(25.0);
+        assert!((green.r as i32 - 92).abs() <= 2, "{green:?}");
+        assert!((green.g as i32 - 166).abs() <= 2, "{green:?}");
         // Two-color red ramp 50..60: midpoint between (254,26,0)-(181,0,52).
         let red = table.sample(55.0);
         assert!((red.r as i32 - 217).abs() <= 3, "{red:?}");
@@ -2097,6 +2116,19 @@ color: 85 255 231 188
         for value in [-5.0f32, 10.0, 25.0, 40.0, 55.0, 72.0, 86.0] {
             assert_eq!(sampler.sample(value), table.sample(value), "at {value}");
         }
+    }
+
+    #[test]
+    fn gr_pal_solidcolor_keeps_explicit_hard_cut() {
+        let table = ColorTable::parse_gr_pal(
+            "solid",
+            "color: 0 0 0 0\nsolidcolor: 10 100 0 0\ncolor: 20 200 0 0",
+        )
+        .expect("parse");
+
+        assert_eq!(table.sample(5.0), Rgba8::opaque(50, 0, 0));
+        assert_eq!(table.sample(11.0), Rgba8::opaque(100, 0, 0));
+        assert_eq!(table.sample(19.0), Rgba8::opaque(100, 0, 0));
     }
 }
 
@@ -2596,6 +2628,18 @@ mod tests {
             ColorTable::parse("a", "color: 0 0 0 0\ncolor: 1 255 255 255").expect("table parses");
         let right =
             ColorTable::parse("a", "color: 0 0 0 0\ncolor: 1 255 255 254").expect("table parses");
+
+        assert_ne!(left.signature(), right.signature());
+    }
+
+    #[test]
+    fn signatures_change_when_gr_interval_end_colors_change() {
+        let left =
+            ColorTable::parse_gr_pal("a", "color: 0 0 0 0 100 100 100\ncolor: 10 255 255 255")
+                .expect("table parses");
+        let right =
+            ColorTable::parse_gr_pal("a", "color: 0 0 0 0 101 100 100\ncolor: 10 255 255 255")
+                .expect("table parses");
 
         assert_ne!(left.signature(), right.signature());
     }
