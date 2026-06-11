@@ -7,6 +7,7 @@ build = "build.rs"
 
 [dependencies]
 chrono.workspace = true
+rayon.workspace = true
 color_tables = { path = "../color_tables" }
 data_source = { path = "../data_source" }
 eframe.workspace = true
@@ -27,7 +28,6 @@ winresource = "0.1"
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 rfd.workspace = true
-rayon.workspace = true
 
 # Model-data dock (rusty-weather rw-ui). Branch-only path dep.
 [dependencies.rw-ui]
