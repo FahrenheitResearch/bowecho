@@ -35,6 +35,9 @@ pub struct SurfaceOb {
     /// Source network ("METAR", "KS_RWIS", "TX_DCP", …) — feeds
     /// per-network observation-error weighting in the analysis.
     pub network: String,
+    /// Station elevation, m MSL (METAR cache only; mesonets fall back
+    /// to model terrain at their cell in the analysis).
+    pub elevation_m: Option<f32>,
 }
 
 /// Fetch + decode the full METAR cache. Blocking — call on a worker
@@ -124,6 +127,7 @@ fn parse_row(columns: &[&str], line: &str) -> Option<SurfaceOb> {
         .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
         .map(|t| t.with_timezone(&Utc));
     Some(SurfaceOb {
+        elevation_m: f32_of("elevation_m").filter(|e| (-430.0..=4500.0).contains(e)),
         network: "METAR".to_owned(),
         station_id: get("station_id").unwrap_or("?").to_owned(),
         time_utc,
@@ -233,6 +237,7 @@ fn fetch_network(network: &str) -> Result<Vec<SurfaceOb>, String> {
             })
             .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
         obs.push(SurfaceOb {
+            elevation_m: None,
             network: network.to_owned(),
             station_id: station,
             time_utc,
@@ -314,6 +319,7 @@ impl ObPool {
     /// How many reports this station has in the pool — ≥3 over the
     /// retention window means a sub-hourly updater (loops filter to
     /// these so scrubbing animates instead of freezing slow stations).
+    #[allow(dead_code)] // superseded by frame-freshness loop filter; kept for diagnostics
     pub fn report_count(&self, station: &str) -> usize {
         self.by_station
             .get(station)
@@ -350,6 +356,7 @@ mod tests {
         use chrono::TimeZone;
         let t0 = Utc.with_ymd_and_hms(2100, 1, 1, 12, 0, 0).unwrap();
         let make = |minutes: i64, temp: f32| SurfaceOb {
+            elevation_m: None,
             network: "METAR".into(),
             station_id: "KTST".into(),
             time_utc: Some(t0 + chrono::Duration::minutes(minutes)),

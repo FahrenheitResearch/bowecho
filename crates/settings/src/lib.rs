@@ -2,6 +2,10 @@
 //! config directory. Loading is best-effort — a missing or unreadable file
 //! yields defaults so the app always starts.
 
+fn default_true() -> bool {
+    true
+}
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -24,6 +28,21 @@ pub struct AppSettings {
     pub grid_pane_count: usize,
     /// Placefile URLs (GRLevelX-style overlays) with per-file enable flags.
     pub placefiles: Vec<PlacefileEntry>,
+    /// Default overlay toggles, restored at startup (user request: "let
+    /// people save what overlays they want default").
+    #[serde(default)]
+    pub overlay_obs: bool,
+    #[serde(default = "default_true")]
+    pub overlay_obs_metar: bool,
+    #[serde(default = "default_true")]
+    pub overlay_obs_mesonet: bool,
+    #[serde(default)]
+    pub overlay_glm: bool,
+    /// Enabled SPC outlook kinds ("cat", "torn", "wind", "hail").
+    #[serde(default)]
+    pub overlay_spc_outlooks: Vec<String>,
+    #[serde(default)]
+    pub overlay_spc_reports: bool,
     /// Basemap style key: "dark" (vector), "satellite", "streets", "topo".
     #[serde(default = "default_basemap_style")]
     pub basemap_style: String,
@@ -39,6 +58,11 @@ pub struct AppSettings {
     /// Default 2 so lightweight users never accumulate SSD bloat.
     #[serde(default = "default_model_keep_runs")]
     pub model_keep_runs: u8,
+    /// Perf HUD: floating per-frame timing overlay on the map (decode /
+    /// render / layer raster / FPS / time-to-first-pixels). Debug aid,
+    /// default off.
+    #[serde(default)]
+    pub perf_hud: bool,
     /// Product hotkeys: number-row key ("0"-"9") -> product label (e.g.
     /// "REF", "VEL", "SRV", "RHO", "ZDR", "SW", "CREF", "ET", "VIL", "VILD",
     /// "PHI", "KDP", "AzShr", "Div"). Edit in config.json to customize.
@@ -51,6 +75,10 @@ pub struct AppSettings {
 pub struct PlacefileEntry {
     pub url: String,
     pub enabled: bool,
+    /// Draw the file's Text/Place statements (names above icons). Off =
+    /// dots only (the SpotterNetwork preference).
+    #[serde(default = "default_true")]
+    pub show_text: bool,
 }
 
 /// Default number-row bindings (the classic analyst loadout).
@@ -79,6 +107,12 @@ fn default_model_keep_runs() -> u8 {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            overlay_obs: false,
+            overlay_obs_metar: true,
+            overlay_obs_mesonet: true,
+            overlay_glm: false,
+            overlay_spc_outlooks: Vec::new(),
+            overlay_spc_reports: false,
             startup_site: None,
             favorites: Vec::new(),
             polling_interval_seconds: 60,
@@ -90,6 +124,7 @@ impl Default for AppSettings {
             bold_labels: default_bold_labels(),
             gate_filter_decidbz: None,
             model_keep_runs: default_model_keep_runs(),
+            perf_hud: false,
             product_hotkeys: default_product_hotkeys(),
         }
     }
@@ -201,6 +236,12 @@ pub fn sat_store_dir() -> PathBuf {
     bowecho_dir("sat-store")
 }
 
+/// BowEcho-owned GLM lightning store (own dir per app — writer locks make
+/// sharing safe, but separate stores avoid pruning-policy fights).
+pub fn glm_store_dir() -> PathBuf {
+    bowecho_dir("glm-store")
+}
+
 fn config_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
@@ -233,6 +274,7 @@ mod tests {
         let mut s = AppSettings {
             startup_site: Some("KEAX".to_owned()),
             polling_interval_seconds: 30,
+            perf_hud: true,
             ..Default::default()
         };
         s.add_favorite("ktwx");

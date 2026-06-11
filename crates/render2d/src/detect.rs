@@ -348,16 +348,23 @@ fn associate_vertically(per_tilt: &[Vec<Feature2D>]) -> Vec<RotationSite> {
         let base_gtg = base.gtg_dv_mps;
 
         // TVS (Mitchell 1998): GTGVD ≥ 25 with ≥ 1.5 km depth inside 150 km;
-        // ≥ 36 m/s at the lowest tilt is the classic alarm.
+        // ≥ 36 m/s at the lowest tilt is the classic alarm. QLCS guard
+        // (KMKX 2026-06-11 field report — 9 rank-0 "TVS" chained along a
+        // squall line's leading edge): the moderate-GTG path must be
+        // ANCHORED to a real detected circulation (3-D rank ≥ 5, the
+        // TDA's meso association), because gust-front shear and residual
+        // dealias spikes produce 25-35 m/s gate pairs along the whole
+        // line. A standalone TVS without a meso needs the classic strong
+        // low-level value (≥ 36 m/s) on TWO tilts, not one noisy pair.
         let tvs = base.ground_range_m <= TVS_MAX_RANGE_M
             && depth_m >= TVS_MIN_DEPTH_M
+            && rank3d >= ASSOC_STRONG_RANK
             && (base_gtg >= TVS_STRONG_GTG_DV_MPS
-                || (base_gtg >= TVS_GTG_DV_MPS
-                    && column
-                        .iter()
-                        .filter(|f| f.gtg_dv_mps >= TVS_GTG_DV_MPS)
-                        .count()
-                        >= 2));
+                || column
+                    .iter()
+                    .filter(|f| f.gtg_dv_mps >= TVS_GTG_DV_MPS)
+                    .count()
+                    >= 2);
 
         // Display rule (Mitchell 1998): ≥ 3 associated features, unless the
         // column is meso-strength or TVS.

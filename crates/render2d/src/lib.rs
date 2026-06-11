@@ -33,10 +33,10 @@ pub use smooth::smooth_moment_grid;
 use thiserror::Error;
 pub use tracking::{StormTrack, StormTracker, TIME_GATE_S};
 pub use volumetric::{
-    CrossSection, ECHO_TOP_THRESHOLD_DBZ, HailGrids, MeshCalibration, VolumeDealiasCache,
-    composite_reflectivity_grid, echo_top_grid, hail_grids, mehs_grid, poh_grid,
-    reflectivity_cross_section, velocity_cross_section, velocity_cross_section_cached,
-    vil_density_grid, vil_grid,
+    CrossSection, ECHO_TOP_THRESHOLD_DBZ, HailGrids, InterpPolicy, MeshCalibration,
+    VolumeDealiasCache, composite_reflectivity_grid, echo_top_grid, hail_grids, mehs_grid,
+    moment_cross_section, poh_grid, reflectivity_cross_section, velocity_cross_section,
+    velocity_cross_section_cached, vil_density_grid, vil_grid, volume_box_resample,
 };
 pub use wind::{gust_proxy_grid, marc_grid};
 

@@ -25,17 +25,22 @@ use serde::Deserialize;
 
 mod basemap_data;
 mod basemap_towns;
+mod glm_layer;
 mod guide;
 mod ingest_worker;
 mod mesoanalysis;
 mod model_data;
 mod model_layer;
+mod oa_derived;
 mod obs;
+mod obs_soundings;
 mod placefiles;
 mod sat_worker;
 mod skewt_native;
 mod sounding_panels;
+mod spc_layers;
 mod tiles;
+mod vol3d;
 
 const MIN_DISPLAYABLE_RADIALS: usize = 180;
 const DEFAULT_MAP_SCALE: f32 = 115.0;
@@ -101,6 +106,8 @@ const HAZARD_SUMMARY_SCROLL_HEIGHT: f32 = 86.0;
 const HAZARD_DETAIL_SCROLL_HEIGHT: f32 = 150.0;
 const TILT_LIST_SCROLL_HEIGHT: f32 = 168.0;
 const PANEL_BUTTON_HEIGHT: f32 = 24.0;
+/// Shared opacity-slider width for the unified layer rows (Layers fold).
+const LAYER_ROW_SLIDER_WIDTH: f32 = 56.0;
 const SIDEBAR_DEFAULT_WIDTH: f32 = 380.0;
 const SIDEBAR_MIN_WIDTH: f32 = 300.0;
 const SIDEBAR_MAX_WIDTH: f32 = 560.0;
@@ -408,6 +415,9 @@ struct ViewerApp {
     /// Placefile overlays (GRLevelX-style community feeds).
     placefile_slots: Vec<PlacefileSlot>,
     placefile_url_input: String,
+    /// One-shot focus request for the placefile URL box (the
+    /// "+ Add layer ▾" menu's Placefile item points here).
+    placefile_input_focus: bool,
     placefile_shape_cache: std::cell::RefCell<ShapeCache<PlacefileDrawList>>,
     /// SCIT-style storm tracks: identification runs per volume on a
     /// background thread; association + motion fits are O(cells) on install.
@@ -520,6 +530,30 @@ struct ViewerApp {
     oa_rx: Option<mpsc::Receiver<OaResult>>,
     /// Last analysis result, shown inline under the button.
     oa_last_summary: Option<String>,
+    /// SPC-style derived mesoanalysis in flight (SBCAPE on the OA).
+    oa_cape_rx:
+        Option<mpsc::Receiver<std::result::Result<(Arc<rw_ui::FieldData>, String), String>>>,
+    /// 3D Volume Explorer (GPU direct volume rendering).
+    vol3d: vol3d::Vol3d,
+    /// GR2A-style custom URL polling: a served directory with dir.list
+    /// (the convention mobile radars/DOWs use in the field).
+    poll_url: String,
+    poll_active: bool,
+    poll_last_file: Option<String>,
+    poll_next: Option<Instant>,
+    poll_rx: Option<mpsc::Receiver<std::result::Result<(String, Arc<RadarVolume>), String>>>,
+    /// SPC outlooks + live storm reports.
+    spc_data: spc_layers::SpcData,
+    spc_outlooks_enabled: Vec<String>,
+    spc_reports_enabled: bool,
+    spc_day: u8,
+    spc_last_key: Option<(u8, Option<(i32, u32, u32)>)>,
+    spc_rx: Option<mpsc::Receiver<spc_layers::SpcData>>,
+    /// GLM lightning layer (in-process rw-glm follow + time-synced draw).
+    glm: Option<glm_layer::GlmWorker>,
+    glm_enabled: bool,
+    /// RAOB site list (lazy-fetched once) for observed soundings.
+    raob_sites: Option<Vec<obs_soundings::RaobSite>>,
     /// Surface observations layer (METAR station plots).
     obs_enabled: bool,
     /// Source-class QC toggles: METAR = airport-grade; mesonet = IEM
@@ -598,6 +632,10 @@ struct ViewerApp {
     /// resetting it to a single-beam ribbon on every chunk.
     cross_section_user_signature: Option<u64>,
     cross_section_volume_cuts: usize,
+    /// Top REF elevation of the volume the last section was built from —
+    /// the HOLD criterion (vertical completeness; cut COUNT is fooled by
+    /// SAILS re-visits inflating it before the upper tilts arrive).
+    cross_section_volume_top_deg: f32,
     /// Per-volume dealias memo for velocity sections: endpoint drags pay the
     /// all-tilt dealias once per volume instead of every frame.
     cross_section_dealias_cache: VolumeDealiasCache,
@@ -2296,7 +2334,20 @@ fn sidebar_tab_tooltip(tab: SidebarTab) -> &'static str {
 impl ViewerApp {
     fn new(cc: &eframe::CreationContext<'_>, source_path: Option<PathBuf>) -> Self {
         configure_style(&cc.egui_ctx);
+        // Volume Explorer GPU resources (pipeline + textures) — once,
+        // the eframe custom-3D pattern.
+        if let Some(render_state) = cc.wgpu_render_state.as_ref() {
+            vol3d::init_gpu(render_state);
+        }
         let app_settings = settings::AppSettings::load();
+        let restored_overlays = (
+            app_settings.overlay_obs,
+            app_settings.overlay_obs_metar,
+            app_settings.overlay_obs_mesonet,
+            app_settings.overlay_glm,
+            app_settings.overlay_spc_outlooks.clone(),
+            app_settings.overlay_spc_reports,
+        );
         let restored_grid_layout = match app_settings.grid_pane_count {
             2 => PanelLayout::TwoVertical,
             4 => PanelLayout::FourGrid,
@@ -2308,7 +2359,11 @@ impl ViewerApp {
         let restored_placefile_slots: Vec<PlacefileSlot> = app_settings
             .placefiles
             .iter()
-            .map(|entry| PlacefileSlot::new(entry.url.clone(), entry.enabled))
+            .map(|entry| {
+                let mut slot = PlacefileSlot::new(entry.url.clone(), entry.enabled);
+                slot.show_text = entry.show_text;
+                slot
+            })
             .collect();
         let sites = data_source::fallback_sites();
         let selected_site_index = app_settings
@@ -2384,6 +2439,7 @@ impl ViewerApp {
             cursor_readout: None,
             placefile_slots: restored_placefile_slots,
             placefile_url_input: String::new(),
+            placefile_input_focus: false,
             placefile_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
             storm_tracker: StormTracker::default(),
             storm_tracks_site: String::new(),
@@ -2441,11 +2497,27 @@ impl ViewerApp {
             download_cycle: 0,
             download_hours: "0-3".to_owned(),
             download_profile: 0,
+            vol3d: vol3d::Vol3d::default(),
+            poll_url: String::new(),
+            poll_active: false,
+            poll_last_file: None,
+            poll_next: None,
+            poll_rx: None,
+            spc_data: spc_layers::SpcData::default(),
+            spc_outlooks_enabled: restored_overlays.4,
+            spc_reports_enabled: restored_overlays.5,
+            spc_day: 1,
+            spc_last_key: None,
+            glm: None,
+            spc_rx: None,
+            glm_enabled: restored_overlays.3,
             oa_rx: None,
             oa_last_summary: None,
-            obs_enabled: false,
-            obs_show_metar: true,
-            obs_show_mesonet: true,
+            oa_cape_rx: None,
+            raob_sites: None,
+            obs_enabled: restored_overlays.0,
+            obs_show_metar: restored_overlays.1,
+            obs_show_mesonet: restored_overlays.2,
             obs_adjust_soundings: false,
             surface_obs: obs::ObPool::new(),
             obs_fetched_at: None,
@@ -2485,6 +2557,7 @@ impl ViewerApp {
             cross_section_top_m: CROSS_SECTION_TOP_M,
             cross_section_user_signature: None,
             cross_section_volume_cuts: 0,
+            cross_section_volume_top_deg: 0.0,
             cross_section_dealias_cache: VolumeDealiasCache::new(),
             hazard_overlay: None,
             hazard_path_text,
@@ -5877,8 +5950,29 @@ impl eframe::App for ViewerApp {
         self.poll_model_layer(&ctx);
         self.poll_sat_layer(&ctx);
         self.poll_model_ingest(&ctx);
+        // Drain the flexible-download worker every frame, not just while its
+        // UI is visible — closing the Model window mid-download used to
+        // stall progress reporting until reopened.
+        self.pump_ingest_responses();
         self.poll_surface_obs(&ctx);
+        if self.glm_enabled {
+            if self.glm.is_none() {
+                self.glm = Some(glm_layer::GlmWorker::spawn(
+                    &ctx,
+                    "goes19",
+                    settings::glm_store_dir(),
+                ));
+            }
+            if let Some(glm) = &mut self.glm {
+                glm.pump();
+            }
+        } else if self.glm.is_some() {
+            self.glm = None; // Drop cancels the follow thread.
+        }
         self.poll_mesoanalysis(&ctx);
+        self.poll_oa_cape(&ctx);
+        self.poll_spc(&ctx);
+        self.poll_custom_url(&ctx);
         self.poll_native_sounding(&ctx);
         if self.tile_layer.borrow_mut().poll(&ctx) {
             ctx.request_repaint();
@@ -5909,27 +6003,13 @@ impl eframe::App for ViewerApp {
 
         egui::CentralPanel::default().show_inside(ui, |ui| self.map_canvas(ui));
 
-        if self.model_dock_open {
-            if self.model_dock.is_none() {
-                let store_root = settings::model_store_dir();
-                self.model_dock = Some(model_data::ModelDataDock::new(&ctx, store_root));
-            }
-            let mut open = self.model_dock_open;
-            egui::Window::new("Model data")
-                .open(&mut open)
-                .default_size([1080.0, 660.0])
-                .min_size([720.0, 420.0])
-                .resizable(true)
-                .show(&ctx, |ui| {
-                    if let Some(dock) = &mut self.model_dock {
-                        dock.ui(ui);
-                    }
-                });
-            self.model_dock_open = open;
+        if self.app_settings.perf_hud {
+            self.perf_hud_overlay(&ctx);
         }
 
-        self.model_download_window(&ctx);
+        self.model_data_window(&ctx);
         self.satellite_window(&ctx);
+        self.vol3d_window(&ctx);
         guide::guide_window(&ctx, &mut self.show_guide);
 
         if self.native_skewt_open && self.native_sounding.is_some() {
@@ -5972,10 +6052,28 @@ impl ViewerApp {
             }
             if ui
                 .selectable_label(self.model_dock_open, "Model")
-                .on_hover_text("NWP model fields + skew-T soundings (rusty-weather store)")
+                .on_hover_text(
+                    "NWP model fields + skew-T soundings (rusty-weather store) — turns the model master switch on if needed",
+                )
                 .clicked()
             {
                 self.model_dock_open = !self.model_dock_open;
+                // Opening the window states intent (ui-refresh proposal
+                // §1.3.7): with the master switch off, poll_model_layer
+                // would tear the dock down next frame and the window
+                // flashed for one frame and died. Flip the switch on.
+                if self.model_dock_open && !self.model_enabled {
+                    self.model_enabled = true;
+                }
+            }
+            if ui
+                .selectable_label(self.vol3d.open, "3D")
+                .on_hover_text(
+                    "Volume Explorer: GPU direct volume rendering of the reflectivity volume (drag to rotate, scroll to zoom)",
+                )
+                .clicked()
+            {
+                self.vol3d.open = !self.vol3d.open;
             }
             if ui
                 .selectable_label(self.show_guide, "Guide")
@@ -6208,6 +6306,53 @@ impl ViewerApp {
             .show(ui, |ui| {
                 self.stats_panel(ui);
             });
+        egui::CollapsingHeader::new("Model")
+            .default_open(false)
+            .show(ui, |ui| {
+                self.model_settings_section(ui, ctx);
+            });
+    }
+
+    /// Settings ▸ Model — the settings-class controls evicted from the
+    /// Layers fold (ui-refresh proposal section 4 step 4): the app-wide
+    /// master switch, the disk-retention policy, and a store-path readout.
+    fn model_settings_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if ui
+            .checkbox(&mut self.model_enabled, "Model data")
+            .on_hover_text(
+                "Master switch: off = pure radar app (no model dock, layer, hover value, or Alt-click soundings)",
+            )
+            .changed()
+        {
+            if self.model_enabled {
+                let store = settings::model_store_dir();
+                if store
+                    .read_dir()
+                    .map(|mut entries| entries.next().is_some())
+                    .unwrap_or(false)
+                {
+                    self.model_dock = Some(model_data::ModelDataDock::new(ctx, store));
+                }
+            }
+            ctx.request_repaint();
+        }
+        ui.horizontal(|ui| {
+            ui.label("Keep runs");
+            let mut keep = self.model_keep_runs;
+            if ui
+                .add(egui::DragValue::new(&mut keep).range(0..=24).speed(0.1))
+                .on_hover_text(
+                    "Model store retention: newest N runs auto-kept, older deleted after each fetch and at startup (0 = unlimited). Default 2 keeps SSD use ~1.5 GB.",
+                )
+                .changed()
+            {
+                self.model_keep_runs = keep;
+                self.app_settings.model_keep_runs = keep;
+                let _ = self.app_settings.save();
+            }
+        });
+        ui.weak(format!("Store: {}", settings::model_store_dir().display()))
+            .on_hover_text("Model store location (rusty-weather rw-store layout)");
     }
 
     fn sidebar_tab_bar(&mut self, ui: &mut egui::Ui) {
@@ -6380,199 +6525,320 @@ impl ViewerApp {
 
         // R2: LAYERS — radar overlays + placefiles together, available with or
         // without a loaded volume.
-        let layer_count =
-            self.radar_layers.len() + self.placefile_slots.iter().filter(|s| s.enabled).count();
+        // Honest layer count (ui-refresh proposal §1.3.3): everything the
+        // fold shows as a row — primary radar (when loaded), overlay radars,
+        // GOES, model layers, surface obs, enabled placefiles.
+        let layer_count = usize::from(self.volume.is_some())
+            + self.radar_layers.len()
+            + usize::from(self.sat_layer.is_some())
+            + self.model_layers.len()
+            + usize::from(self.obs_enabled)
+            + self.placefile_slots.iter().filter(|s| s.enabled).count();
         ui.add_space(8.0);
         ui.separator();
         egui::CollapsingHeader::new(format!("Layers ({layer_count})"))
             .id_salt("layers_fold")
             .default_open(layer_count > 0)
             .show(ui, |ui| {
+                // PRIMARY RADAR as a layer row (proposal §3-A): the old bare
+                // "Radar" opacity slider, wearing the same row grammar as
+                // everything else. No vis toggle / no ✕ — the primary IS the
+                // app (badge ◉ instead); site/products live in the sections
+                // above.
+                let primary_name = match &self.volume {
+                    Some(volume) => {
+                        format!("{} {}", volume.site.id, self.selected_product.label())
+                    }
+                    None => "Radar".to_owned(),
+                };
+                let primary_state = if self.load_receiver.is_some() {
+                    "loading"
+                } else if self.volume.is_none() {
+                    "idle"
+                } else if self.realtime_level2_auto_refresh {
+                    "live"
+                } else {
+                    "loaded"
+                };
+                if layer_row(
+                    ui,
+                    LayerRowSpec {
+                        vis: LayerRowVis::Badge {
+                            glyph: "◉",
+                            hover: "Primary radar — always drawn; site and products in the sections above",
+                        },
+                        name: &primary_name,
+                        name_width: 96.0,
+                        name_hover: "Primary radar (site/products in SITE and PRODUCTS above)",
+                        state: Some(primary_state),
+                        opacity: Some(LayerRowOpacity::F32 {
+                            value: &mut self.radar_opacity,
+                            min: 0.15,
+                            hover: "Primary radar opacity (model layer shows through)",
+                        }),
+                    },
+                    |_ui| {},
+                ) {
+                    ctx.request_repaint();
+                }
                 self.radar_layers_panel(ui, ctx);
-                ui.horizontal(|ui| {
-                    if ui
-                        .checkbox(&mut self.model_enabled, "Model data")
-                        .on_hover_text(
-                            "Master switch: off = pure radar app (no model dock, layer, hover value, or Alt-click soundings)",
-                        )
-                        .changed()
-                    {
-                        if self.model_enabled {
-                            let store =
-                                settings::model_store_dir();
-                            if store
-                                .read_dir()
-                                .map(|mut entries| entries.next().is_some())
-                                .unwrap_or(false)
-                            {
-                                self.model_dock =
-                                    Some(model_data::ModelDataDock::new(ctx, store));
-                            }
-                        }
-                        ctx.request_repaint();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Keep runs");
-                    let mut keep = self.model_keep_runs;
-                    if ui
-                        .add(egui::DragValue::new(&mut keep).range(0..=24).speed(0.1))
-                        .on_hover_text(
-                            "Model store retention: newest N runs auto-kept, older deleted after each fetch and at startup (0 = unlimited). Default 2 keeps SSD use ~1.5 GB.",
-                        )
-                        .changed()
-                    {
-                        self.model_keep_runs = keep;
-                        self.app_settings.model_keep_runs = keep;
-                        let _ = self.app_settings.save();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Radar");
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut self.radar_opacity, 0.15..=1.0)
-                                .show_value(false),
-                        )
-                        .on_hover_text("Primary radar opacity (model layer shows through)")
-                        .changed()
-                    {
-                        ctx.request_repaint();
-                    }
-                });
+                // (The model master switch + "Keep runs" retention policy
+                // moved to Settings ▸ Model — proposal step 4: the fold holds
+                // layers, not app policy.)
                 let mut remove_sat_layer = false;
+                let mut open_sat_window = false;
                 if let Some(layer) = &mut self.sat_layer {
                     ui.separator();
-                    ui.horizontal(|ui| {
-                        let mut visible = layer.visible;
-                        if ui
-                            .checkbox(&mut visible, "")
-                            .on_hover_text("Show GOES on map")
-                            .changed()
-                        {
-                            layer.visible = visible;
-                            ctx.request_repaint();
-                        }
-                        ui.label("GOES");
-                        let mut opacity = layer.opacity;
-                        if ui
-                            .add(egui::Slider::new(&mut opacity, 0.1..=1.0).show_value(false))
-                            .changed()
-                        {
-                            layer.opacity = opacity;
-                            ctx.request_repaint();
-                        }
-                        if ui
-                            .small_button("✕")
-                            .on_hover_text("Remove satellite layer")
-                            .clicked()
-                        {
-                            remove_sat_layer = true;
-                        }
-                    });
+                    if layer_row(
+                        ui,
+                        LayerRowSpec {
+                            vis: LayerRowVis::Toggle {
+                                value: &mut layer.visible,
+                                hover: "Show GOES on map",
+                            },
+                            name: "GOES",
+                            name_width: 96.0,
+                            name_hover: "GOES satellite frame (configure in the Sat window)",
+                            state: None,
+                            opacity: Some(LayerRowOpacity::F32 {
+                                value: &mut layer.opacity,
+                                min: 0.1,
+                                hover: "Satellite layer opacity",
+                            }),
+                        },
+                        |ui| {
+                            if ui
+                                .small_button("⚙")
+                                .on_hover_text(
+                                    "Open the Satellite window (band · sector · cadence · playback)",
+                                )
+                                .clicked()
+                            {
+                                open_sat_window = true;
+                            }
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text("Remove satellite layer")
+                                .clicked()
+                            {
+                                remove_sat_layer = true;
+                            }
+                        },
+                    ) {
+                        ctx.request_repaint();
+                    }
+                }
+                if open_sat_window {
+                    self.show_satellite = true;
                 }
                 if remove_sat_layer {
                     self.sat_layer = None;
                     self.sat_layer_texture = None;
                     ctx.request_repaint();
                 }
+                {
+                    // Surface obs as a layer row; the network sub-toggles ride
+                    // in the row's trailing slot. `obs_on` is a copy so the
+                    // trailing closure can gate on it while the row holds the
+                    // &mut (a fresh toggle shows its sub-toggles next frame —
+                    // the repaint below makes that instant).
+                    let obs_on = self.obs_enabled;
+                    let obs_show_metar = &mut self.obs_show_metar;
+                    let obs_show_mesonet = &mut self.obs_show_mesonet;
+                    let obs_adjust_soundings = &mut self.obs_adjust_soundings;
+                    let obs_fetched_at = self.obs_fetched_at;
+                    let obs_station_count = self.surface_obs.station_count;
+                    let obs_fetching = self.obs_rx.is_some();
+                    if layer_row(
+                        ui,
+                        LayerRowSpec {
+                            vis: LayerRowVis::Toggle {
+                                value: &mut self.obs_enabled,
+                                hover: "METAR station plots: temperature/dewpoint (°F), wind barbs, gusts — every reporting station, refreshed ~5 min",
+                            },
+                            name: "Surface obs",
+                            name_width: 96.0,
+                            name_hover: "METAR station plots: temperature/dewpoint (°F), wind barbs, gusts — every reporting station, refreshed ~5 min",
+                            state: None,
+                            opacity: None,
+                        },
+                        |ui| {
+                            if !obs_on {
+                                return;
+                            }
+                            ui.checkbox(obs_show_metar, "METAR")
+                                .on_hover_text("Airport-grade ASOS/AWOS stations");
+                            ui.checkbox(obs_show_mesonet, "Mesonet")
+                                .on_hover_text(
+                                    "IEM RWIS road sensors + DCP/RAWS networks — denser but lower siting quality (road sensors read hot in sun); uncheck for strict-QC METAR-only",
+                                );
+                            if ui
+                                .checkbox(obs_adjust_soundings, "adj snd")
+                                .on_hover_text(
+                                    "Obs-adjusted soundings: the skew-T's surface T/Td/wind come from the nearest station (within 30 km, fresher than 60 min) instead of the model — parcels recompute from the REAL surface. The title shows which station adjusted it.",
+                                )
+                                .changed()
+                            {
+                                ui.ctx().request_repaint();
+                            }
+                            if let Some(at) = obs_fetched_at {
+                                ui.weak(format!(
+                                    "{} stn · {}m ago",
+                                    obs_station_count,
+                                    at.elapsed().as_secs() / 60
+                                ));
+                            }
+                            if obs_fetching {
+                                ui.spinner();
+                            }
+                        },
+                    ) {
+                        ctx.request_repaint();
+                    }
+                }
                 ui.horizontal(|ui| {
                     if ui
-                        .checkbox(&mut self.obs_enabled, "Surface obs")
+                        .checkbox(&mut self.glm_enabled, "Lightning (GLM)")
                         .on_hover_text(
-                            "METAR station plots: temperature/dewpoint (°F), wind barbs, gusts — every reporting station, refreshed ~5 min",
+                            "GOES GLM flashes, free via AWS (no key): trailing 10-minute window, age-faded, time-synced to the radar loop. First data ~1 min after enabling (S3 poll + granule decode).",
                         )
                         .changed()
                     {
+                        self.save_overlay_defaults();
                         ctx.request_repaint();
                     }
-                    if self.obs_enabled {
-                        ui.checkbox(&mut self.obs_show_metar, "METAR")
-                            .on_hover_text("Airport-grade ASOS/AWOS stations");
-                        ui.checkbox(&mut self.obs_show_mesonet, "Mesonet")
-                            .on_hover_text(
-                                "IEM RWIS road sensors + DCP/RAWS networks — denser but lower siting quality (road sensors read hot in sun); uncheck for strict-QC METAR-only",
-                            );
-                    }
-                    if self.obs_enabled
-                        && ui
-                            .checkbox(&mut self.obs_adjust_soundings, "adj snd")
-                            .on_hover_text(
-                                "Obs-adjusted soundings: the skew-T's surface T/Td/wind come from the nearest station (within 30 km, fresher than 60 min) instead of the model — parcels recompute from the REAL surface. The title shows which station adjusted it.",
-                            )
-                            .changed()
+                    if self.glm_enabled
+                        && let Some(glm) = &self.glm
                     {
+                        let frame_ms = chrono::Utc::now().timestamp_millis();
+                        let count = glm.frame_flashes(frame_ms).count();
+                        ui.weak(format!("{count} flashes/10m"));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("SPC:").on_hover_text(
+                        "Convective outlooks (SPC's own colors, archive-aware: shows the displayed day's outlook) + today's filtered storm reports",
+                    );
+                    egui::ComboBox::from_id_salt("spc_day")
+                        .selected_text(format!("D{}", self.spc_day))
+                        .width(48.0)
+                        .show_ui(ui, |ui| {
+                            for d in 1..=3u8 {
+                                if ui
+                                    .selectable_value(&mut self.spc_day, d, format!("Day {d}"))
+                                    .changed()
+                                {
+                                    self.spc_data.fetched_at = None;
+                                }
+                            }
+                        });
+                    let mut changed = false;
+                    for (slug, label) in spc_layers::OUTLOOK_KINDS {
+                        let mut on = self.spc_outlooks_enabled.iter().any(|k| k == slug);
+                        if ui.checkbox(&mut on, label).changed() {
+                            if on {
+                                self.spc_outlooks_enabled.push(slug.to_owned());
+                            } else {
+                                self.spc_outlooks_enabled.retain(|k| k != slug);
+                            }
+                            self.spc_data.fetched_at = None; // force refetch
+                            changed = true;
+                        }
+                    }
+                    if ui.checkbox(&mut self.spc_reports_enabled, "Reports").changed() {
+                        self.spc_data.fetched_at = None;
+                        changed = true;
+                    }
+                    if changed {
+                        self.save_overlay_defaults();
                         ctx.request_repaint();
                     }
-                    if self.obs_enabled {
-                        if let Some(at) = self.obs_fetched_at {
-                            ui.weak(format!(
-                                "{} stn · {}m ago",
-                                self.surface_obs.station_count,
-                                at.elapsed().as_secs() / 60
-                            ));
-                        }
-                        if self.obs_rx.is_some() {
-                            ui.spinner();
-                        }
+                    if self.spc_rx.is_some() {
+                        ui.spinner();
                     }
                 });
                 let mut remove_layer: Option<u64> = None;
                 let mut move_layer: Option<(u64, i64)> = None;
+                let mut open_model_window = false;
                 let mut step_hour: i64 = 0;
                 if !self.model_layers.is_empty() {
                     ui.separator();
                 }
-                let layer_count = self.model_layers.len();
+                // Freshness rides in the row hover now (proposal step 4) —
+                // the fold's standalone freshness/ingest row is gone; deep
+                // acquisition lives in the Model window's Download section.
+                let newest_run_text = self
+                    .model_dock
+                    .as_ref()
+                    .and_then(|dock| dock.newest_run())
+                    .map(|(model, run, hours)| format!("{model} {run} · {hours} hrs in store"))
+                    .unwrap_or_else(|| "no runs in store".to_owned());
+                let model_row_count = self.model_layers.len();
                 for slot in &mut self.model_layers {
                     let id = slot.id;
                     let layer = &mut slot.layer;
-                    ui.horizontal(|ui| {
-                        let mut visible = layer.visible;
-                        if ui
-                            .checkbox(&mut visible, "")
-                            .on_hover_text(
-                                "Show on map (unchecked: hidden but still feeds the inspector + Alt+click soundings)",
-                            )
-                            .changed()
-                        {
-                            layer.visible = visible;
-                            ctx.request_repaint();
-                        }
-                        ui.label(format!(
-                            "{} f{:02}",
-                            layer.field.key.var, layer.field.key.hour.hour
-                        ))
-                        .on_hover_text(format!(
-                            "{} ({}) — layers draw bottom-to-top in list order",
-                            layer.field.key.var, layer.field.units
-                        ));
-                        let mut opacity = layer.opacity;
-                        if ui
-                            .add(egui::Slider::new(&mut opacity, 0.1..=1.0).show_value(false))
-                            .changed()
-                        {
-                            layer.opacity = opacity;
-                            ctx.request_repaint();
-                        }
-                        if layer_count > 1 {
-                            if ui.small_button("↑").on_hover_text("Draw later (higher)").clicked()
-                            {
-                                move_layer = Some((id, 1));
+                    let name = format!("{} f{:02}", layer.field.key.var, layer.field.key.hour.hour);
+                    let name_hover = format!(
+                        "{} ({}) — layers draw bottom-to-top in list order\nNewest: {}",
+                        layer.field.key.var, layer.field.units, newest_run_text
+                    );
+                    if layer_row(
+                        ui,
+                        LayerRowSpec {
+                            vis: LayerRowVis::Toggle {
+                                value: &mut layer.visible,
+                                hover: "Show on map (unchecked: hidden but still feeds the inspector + Alt+click soundings)",
+                            },
+                            name: &name,
+                            name_width: 96.0,
+                            name_hover: &name_hover,
+                            state: None,
+                            opacity: Some(LayerRowOpacity::F32 {
+                                value: &mut layer.opacity,
+                                min: 0.1,
+                                hover: "Model layer opacity",
+                            }),
+                        },
+                        |ui| {
+                            if model_row_count > 1 {
+                                if ui
+                                    .small_button("↑")
+                                    .on_hover_text("Draw later (higher)")
+                                    .clicked()
+                                {
+                                    move_layer = Some((id, 1));
+                                }
+                                if ui
+                                    .small_button("↓")
+                                    .on_hover_text("Draw earlier (lower)")
+                                    .clicked()
+                                {
+                                    move_layer = Some((id, -1));
+                                }
                             }
-                            if ui.small_button("↓").on_hover_text("Draw earlier (lower)").clicked()
+                            if ui
+                                .small_button("⚙")
+                                .on_hover_text(
+                                    "Open the Model data window (runs · fields · soundings · download)",
+                                )
+                                .clicked()
                             {
-                                move_layer = Some((id, -1));
+                                open_model_window = true;
                             }
-                        }
-                        if ui
-                            .small_button("✕")
-                            .on_hover_text("Remove this layer")
-                            .clicked()
-                        {
-                            remove_layer = Some(id);
-                        }
-                    });
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text("Remove this layer")
+                                .clicked()
+                            {
+                                remove_layer = Some(id);
+                            }
+                        },
+                    ) {
+                        ctx.request_repaint();
+                    }
+                }
+                if open_model_window {
+                    self.model_dock_open = true;
                 }
                 if !self.model_layers.is_empty() {
                     ui.horizontal(|ui| {
@@ -6605,15 +6871,26 @@ impl ViewerApp {
                 }
                 // MESOANALYSIS: Bratseth obs-correction of the dock's
                 // current surface field, stacked as its own "(OA)" layer.
+                // OA tools render whenever a model hour exists — gating the
+                // whole section on the DISPLAYED variable made the buttons
+                // vanish after restarts (field report). Disabled states
+                // explain themselves instead.
                 let oa_var = self
                     .model_dock
                     .as_ref()
                     .and_then(|dock| dock.latest_field())
                     .map(|field| field.key.var.clone())
                     .filter(|var| mesoanalysis::config_for(var).is_some());
-                if let Some(var) = oa_var {
+                let dock_has_field = self
+                    .model_dock
+                    .as_ref()
+                    .and_then(|dock| dock.latest_field())
+                    .is_some();
+                if dock_has_field {
+                    let var = oa_var.clone().unwrap_or_default();
                     ui.horizontal(|ui| {
-                        let ready = self.obs_enabled
+                        let ready = oa_var.is_some()
+                            && self.obs_enabled
                             && !self.surface_obs.is_empty()
                             && self.model_lut.is_some()
                             && self.oa_rx.is_none();
@@ -6635,60 +6912,95 @@ impl ViewerApp {
                             ui.weak("waiting for obs fetch…");
                         } else if self.model_lut.is_none() {
                             ui.weak("← \"Show on radar map\" first (Model window)");
+                        } else if oa_var.is_none() {
+                            ui.weak("show T2m / Td2m / 10m wind to analyze");
                         }
                     });
                     if let Some(summary) = &self.oa_last_summary {
                         ui.weak(summary);
                     }
-                }
-                // Freshness: newest run in the store + one-click ingest.
-                ui.horizontal(|ui| {
-                    let newest = self
-                        .model_dock
-                        .as_ref()
-                        .and_then(|dock| dock.newest_run());
-                    match newest {
-                        Some((model, run, hours)) => {
-                            ui.weak(format!("{model} {run} · {hours} hrs"));
-                        }
-                        None => {
-                            ui.weak("No model data (open Model once)");
-                        }
-                    }
-                    let fetching = self.model_ingest_rx.is_some();
-                    if ui
-                        .add_enabled(!fetching, egui::Button::new("Fetch latest"))
-                        .on_hover_text(
-                            "Ingest the freshest HRRR init (next 3 hours, sounding-grade) and prune to the two newest runs (~1 min)",
-                        )
-                        .clicked()
-                    {
-                        self.start_model_ingest(ctx);
-                    }
-                    if ui
-                        .button("Download…")
-                        .on_hover_text("Any init, specific hours, any profile — with size estimate")
-                        .clicked()
-                    {
-                        self.model_download_open = !self.model_download_open;
-                    }
-                    if fetching {
-                        ui.spinner();
-                        if ui.small_button("✕").on_hover_text("Cancel ingest").clicked()
-                            && let Some(cancel) = &self.model_ingest_cancel
+                    // OBSERVED sounding: nearest RAOB launch, rendered by
+                    // the same native skew-T (full sharprs suite on real
+                    // radiosonde data). Archive-aware: uses the displayed
+                    // frame's time.
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("Obs sounding (RAOB)")
+                            .on_hover_text(
+                                "Nearest radiosonde launch to the map center, at the synoptic time before the displayed frame (IEM archive, no key). Renders in the native skew-T with the full parameter suite.",
+                            )
+                            .clicked()
                         {
-                            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                            self.start_raob_sounding(ctx);
                         }
+                    });
+                    // SPC-style derived product: analyze the surface, then
+                    // recompute CAPE from the corrected surface + profiles.
+                    ui.horizontal(|ui| {
+                        let ready = self.obs_enabled
+                            && !self.surface_obs.is_empty()
+                            && self.model_lut.is_some()
+                            && self.oa_cape_rx.is_none();
+                        ui.add_enabled_ui(ready, |ui| {
+                            ui.menu_button("Derive (OA) ▾", |ui| {
+                                for product in oa_derived::OaProduct::ALL {
+                                    if ui.button(product.label()).clicked() {
+                                        self.start_oa_derive(product, ctx);
+                                        ui.close();
+                                    }
+                                }
+                                ui.separator();
+                                ui.weak("Surface-driven thermo only — obs can't\ncorrect winds aloft (SRH/shear stay model).");
+                            })
+                            .response
+                            .on_hover_text(
+                                "SPC-mesoanalysis-style derived fields: Bratseth-correct the surface with live obs, then recompute the parameter from the corrected surface + model profiles (analyze-then-derive, Bothwell et al. 2002).",
+                            );
+                        });
+                        if self.oa_cape_rx.is_some() {
+                            ui.spinner();
+                        }
+                    });
+                }
+                // (The freshness/ingest row left the fold — proposal step 4:
+                // freshness is the model rows' hover, one-click + flexible
+                // acquisition live in the Model window's Download section.)
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Poll URL").on_hover_text(
+                        "GR2A-style polling: a served directory containing dir.list (the convention DOW/mobile radar crews use). Newest file loads automatically every 15 s.",
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.poll_url)
+                            .hint_text("http://host:port/path")
+                            .desired_width(170.0),
+                    );
+                    let label = if self.poll_active { "Stop" } else { "Start" };
+                    if ui.button(label).clicked() {
+                        self.poll_active = !self.poll_active;
+                        self.poll_last_file = None;
+                        self.poll_next = None;
+                    }
+                    if self.poll_active {
+                        ui.weak(
+                            self.poll_last_file
+                                .as_deref()
+                                .unwrap_or("waiting for dir.list…"),
+                        );
                     }
                 });
                 ui.separator();
                 ui.label("Placefiles");
                 ui.horizontal(|ui| {
-                    ui.add(
+                    let url_response = ui.add(
                         egui::TextEdit::singleline(&mut self.placefile_url_input)
                             .hint_text("https://… placefile URL")
                             .desired_width(190.0),
                     );
+                    if self.placefile_input_focus {
+                        self.placefile_input_focus = false;
+                        url_response.request_focus();
+                    }
                     if ui.button("Add").clicked() {
                         let url = self.placefile_url_input.trim().to_owned();
                         if url.starts_with("http")
@@ -6703,42 +7015,174 @@ impl ViewerApp {
                 });
                 let mut remove: Option<usize> = None;
                 let mut changed = false;
+                let mut placefiles_dirty = false;
                 for (index, slot) in self.placefile_slots.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        if ui.checkbox(&mut slot.enabled, "").changed() {
-                            changed = true;
-                        }
-                        let title = slot
-                            .data
-                            .as_ref()
-                            .map(|p| p.title.clone())
-                            .filter(|t| !t.is_empty())
-                            .unwrap_or_else(|| slot.url.clone());
-                        ui.label(egui::RichText::new(title).small())
-                            .on_hover_text(format!(
-                                "{}
+                    let title = slot
+                        .data
+                        .as_ref()
+                        .map(|p| p.title.clone())
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or_else(|| slot.url.clone());
+                    let hover = format!(
+                        "{}
 {}",
-                                slot.url, slot.status
-                            ));
-                        if ui.small_button("↻").on_hover_text("Refresh now").clicked() {
-                            slot.next_refresh = Some(Instant::now());
-                        }
-                        if ui
-                            .small_button("✕")
-                            .on_hover_text("Remove placefile")
+                        slot.url, slot.status
+                    );
+                    // Field-split the slot so the row's vis toggle and the
+                    // trailing refresh button can borrow disjoint fields.
+                    let enabled = &mut slot.enabled;
+                    let next_refresh = &mut slot.next_refresh;
+                    if layer_row(
+                        ui,
+                        LayerRowSpec {
+                            vis: LayerRowVis::Toggle {
+                                value: enabled,
+                                hover: "Show this placefile on the map",
+                            },
+                            name: &title,
+                            name_width: 150.0,
+                            name_hover: &hover,
+                            state: None,
+                            opacity: None,
+                        },
+                        |ui| {
+                            if ui
+                            .selectable_label(slot.show_text, "T")
+                            .on_hover_text("Draw the file's text labels (off = icons only)")
                             .clicked()
                         {
-                            remove = Some(index);
+                            slot.show_text = !slot.show_text;
+                            placefiles_dirty = true;
                         }
-                    });
+                        if ui.small_button("↻").on_hover_text("Refresh now").clicked() {
+                                *next_refresh = Some(Instant::now());
+                            }
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text("Remove placefile")
+                                .clicked()
+                            {
+                                remove = Some(index);
+                            }
+                        },
+                    ) {
+                        changed = true;
+                    }
                 }
                 if let Some(index) = remove {
                     self.placefile_slots.remove(index);
                     changed = true;
                 }
-                if changed {
+                if changed || placefiles_dirty {
                     self.save_placefile_settings();
                     ctx.request_repaint();
+                }
+                // THE single front door for every map data type (proposal
+                // section 4 step 5 / discoverability fix 1.4): you no longer
+                // need to know that layers are born inside the Model/Sat
+                // windows' "Show on radar map" buttons.
+                ui.add_space(4.0);
+                let mut add_site: Option<RadarSite> = None;
+                ui.menu_button("+ Add layer ▾", |ui| {
+                    ui.menu_button("Radar overlay", |ui| {
+                        ui.set_min_width(220.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("add_layer_site_list")
+                            .max_height(300.0)
+                            .show(ui, |ui| {
+                                for site in &self.sites {
+                                    if ui.button(format_site_label(site)).clicked() {
+                                        add_site = Some(site.clone());
+                                        ui.close();
+                                    }
+                                }
+                            });
+                    })
+                    .response
+                    .on_hover_text(
+                        "Another radar drawn over the map (tip: right-click the map → \"lowest beam here\" does this too)",
+                    );
+                    if ui
+                        .button("Model field…")
+                        .on_hover_text(
+                            "Open the Model window: pick a run + field, then \"Show on radar map\"",
+                        )
+                        .clicked()
+                    {
+                        // Same intent rule as the top-bar Model button.
+                        self.model_enabled = true;
+                        self.model_dock_open = true;
+                        // No data yet? Land the user on the Download section.
+                        if self
+                            .model_dock
+                            .as_ref()
+                            .and_then(|dock| dock.newest_run())
+                            .is_none()
+                        {
+                            self.model_download_open = true;
+                        }
+                        ui.close();
+                    }
+                    if ui
+                        .button("SpotterNetwork (placefile)")
+                        .on_hover_text(
+                            "Add the public SpotterNetwork positions placefile (spotter icons, 1-min refresh)",
+                        )
+                        .clicked()
+                    {
+                        let url = "https://www.spotternetwork.org/feeds/gr.txt".to_owned();
+                        if !self.placefile_slots.iter().any(|slot| slot.url == url) {
+                            let mut slot = PlacefileSlot::new(url, true);
+                            slot.show_text = false; // dots only; hover has the card
+                            self.placefile_slots.push(slot);
+                            self.save_placefile_settings();
+                        }
+                        ui.close();
+                    }
+                    if ui
+                        .button("Get model data… (download)")
+                        .on_hover_text(
+                            "Open the Model window's Download section: Fetch latest one-click ingest, or any run/hours with size + compute estimates",
+                        )
+                        .clicked()
+                    {
+                        self.model_enabled = true;
+                        self.model_dock_open = true;
+                        self.model_download_open = true;
+                        ui.close();
+                    }
+                    if ui
+                        .button("Satellite (GOES)…")
+                        .on_hover_text(
+                            "Open the Satellite window: configure the follow, then \"Show on radar map\"",
+                        )
+                        .clicked()
+                    {
+                        self.show_satellite = true;
+                        ui.close();
+                    }
+                    if ui
+                        .button("Surface obs")
+                        .on_hover_text(
+                            "METAR/mesonet station plots: temperature/dewpoint, wind barbs, gusts",
+                        )
+                        .clicked()
+                    {
+                        self.obs_enabled = true;
+                        ctx.request_repaint();
+                        ui.close();
+                    }
+                    if ui
+                        .button("Placefile URL…")
+                        .on_hover_text("Paste a GR-style placefile URL (box above)")
+                        .clicked()
+                    {
+                        self.placefile_input_focus = true;
+                        ui.close();
+                    }
+                });
+                if let Some(site) = add_site {
+                    self.add_or_refresh_radar_layer(site, ctx);
                 }
             });
 
@@ -7411,51 +7855,59 @@ impl ViewerApp {
                 ));
             }
 
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 3.0;
-                if ui.checkbox(&mut layer.visible, "").changed() {
-                    ctx.request_repaint();
-                }
-                fixed_status_label(ui, &layer.site.level2_id, 42.0)
-                    .on_hover_text(details.join("\n"));
-                fixed_state_dot(ui, layer_state_color(state), state);
-                if ui
-                    .add_sized(
-                        egui::vec2(48.0, PANEL_BUTTON_HEIGHT),
-                        egui::Slider::new(&mut layer.opacity, MIN_RADAR_OVERLAY_ALPHA..=u8::MAX)
-                            .show_value(false),
-                    )
-                    .on_hover_text(format!("Opacity {}", layer.opacity))
-                    .changed()
-                {
-                    ctx.request_repaint();
-                }
-                if fixed_action_button(ui, "Go", 28.0)
-                    .on_hover_text("Center map on this overlay radar")
-                    .clicked()
-                {
-                    center_site = Some(layer.site.clone());
-                }
-                if fixed_action_button(ui, "Ref", 32.0)
-                    .on_hover_text("Refresh this overlay radar")
-                    .clicked()
-                    && layer.load_receiver.is_none()
-                {
-                    refresh_index = Some(index);
-                }
-                if fixed_action_button(ui, "Pri", 30.0)
-                    .on_hover_text("Make this radar the primary radar")
-                    .clicked()
-                {
-                    promote_site = Some(layer.site.clone());
-                }
-                if fixed_action_button(ui, "x", 20.0)
-                    .on_hover_text(details.join("\n"))
-                    .clicked()
-                {
-                    remove_index = Some(index);
-                }
-            });
+            let details_text = details.join("\n");
+            let site = layer.site.clone();
+            let load_idle = layer.load_receiver.is_none();
+            let center_site = &mut center_site;
+            let refresh_index = &mut refresh_index;
+            let promote_site = &mut promote_site;
+            let remove_index = &mut remove_index;
+            if layer_row(
+                ui,
+                LayerRowSpec {
+                    vis: LayerRowVis::Toggle {
+                        value: &mut layer.visible,
+                        hover: "Show this overlay radar on the map",
+                    },
+                    name: &site.level2_id,
+                    name_width: 42.0,
+                    name_hover: &details_text,
+                    state: Some(state),
+                    opacity: Some(LayerRowOpacity::U8 {
+                        value: &mut layer.opacity,
+                        min: MIN_RADAR_OVERLAY_ALPHA,
+                    }),
+                },
+                |ui| {
+                    if fixed_action_button(ui, "Go", 28.0)
+                        .on_hover_text("Center map on this overlay radar")
+                        .clicked()
+                    {
+                        *center_site = Some(site.clone());
+                    }
+                    if fixed_action_button(ui, "Ref", 32.0)
+                        .on_hover_text("Refresh this overlay radar")
+                        .clicked()
+                        && load_idle
+                    {
+                        *refresh_index = Some(index);
+                    }
+                    if fixed_action_button(ui, "Pri", 30.0)
+                        .on_hover_text("Make this radar the primary radar")
+                        .clicked()
+                    {
+                        *promote_site = Some(site.clone());
+                    }
+                    if fixed_action_button(ui, "x", 20.0)
+                        .on_hover_text(&details_text)
+                        .clicked()
+                    {
+                        *remove_index = Some(index);
+                    }
+                },
+            ) {
+                ctx.request_repaint();
+            }
         }
 
         if let Some(index) = refresh_index
@@ -7703,6 +8155,17 @@ impl ViewerApp {
     }
 
     fn stats_panel(&mut self, ui: &mut egui::Ui) {
+        let mut perf_hud = self.app_settings.perf_hud;
+        if ui
+            .checkbox(&mut perf_hud, "HUD overlay")
+            .on_hover_text(
+                "Floating per-frame timing overlay on the map: FPS, volume decode, product render, layer raster, and time to first pixels for the last load. Persists across sessions.",
+            )
+            .changed()
+        {
+            self.app_settings.perf_hud = perf_hud;
+            let _ = self.app_settings.save();
+        }
         ui.checkbox(&mut self.show_performance_stats, "Details");
         if let Some(render_ms) = self.render_ms {
             ui.label(format!("Render {render_ms:.1} ms"));
@@ -8018,6 +8481,132 @@ impl ViewerApp {
         }
     }
 
+    /// Perf certification HUD (Settings ▸ Performance ▸ "HUD overlay"):
+    /// a compact always-on-top readout of the engine's vitals, drawn over
+    /// the top-left of the map. Every number is surfaced from telemetry
+    /// the app already records (PerfTelemetry series, LoadTimings, the
+    /// frame-time EMA) — the HUD adds no instrumentation cost beyond
+    /// painting its labels, and it never forces extra repaints.
+    fn perf_hud_overlay(&self, ctx: &egui::Context) {
+        const HUD_TEXT: egui::Color32 = egui::Color32::from_rgb(218, 226, 236);
+        const HUD_DIM: egui::Color32 = egui::Color32::from_rgb(148, 158, 172);
+        const FPS_GOOD: egui::Color32 = egui::Color32::from_rgb(118, 218, 132);
+        const FPS_OK: egui::Color32 = egui::Color32::from_rgb(234, 198, 92);
+        const FPS_BAD: egui::Color32 = egui::Color32::from_rgb(240, 110, 100);
+
+        let mono =
+            |text: String, color: egui::Color32| egui::RichText::new(text).monospace().color(color);
+
+        egui::Area::new(egui::Id::new("perf_hud_overlay"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 50.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_unmultiplied(8, 12, 18, 222))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 70, 86)))
+                    .corner_radius(4)
+                    .inner_margin(egui::Margin::symmetric(8, 6))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+
+                        // Frame cadence (EMA of painted frames — egui is
+                        // event-driven, so this is the cost of frames that
+                        // actually ran, not a synthetic vsync rate).
+                        let fps = if self.frame_ms_avg > 0.0 {
+                            1000.0 / self.frame_ms_avg
+                        } else {
+                            0.0
+                        };
+                        let fps_color = if fps >= 55.0 {
+                            FPS_GOOD
+                        } else if fps >= 30.0 {
+                            FPS_OK
+                        } else {
+                            FPS_BAD
+                        };
+                        ui.label(mono(
+                            format!("{fps:5.1} fps   {:5.1} ms/frame", self.frame_ms_avg),
+                            fps_color,
+                        ));
+
+                        // Volume decode: last volume + recent distribution.
+                        if let Some(summary) = self.perf.decode.summary() {
+                            ui.label(mono(
+                                format!(
+                                    "decode {:6.1} ms  p50 {:5.1}  p95 {:5.1}",
+                                    summary.latest, summary.p50, summary.p95
+                                ),
+                                HUD_TEXT,
+                            ));
+                        } else if let Some(timing) = &self.load_timing {
+                            ui.label(mono(
+                                format!("decode {:6.1} ms", timing.decode_ms),
+                                HUD_TEXT,
+                            ));
+                        }
+
+                        // Product raster on the render worker (latest
+                        // completed render; direct = full raster, cached =
+                        // sample-cache hit).
+                        if let Some(render_ms) = self.render_ms {
+                            let mut line = format!("render {render_ms:6.1} ms");
+                            if let Some(direct) = self.perf.direct_render.summary() {
+                                line.push_str(&format!("  p50 {:5.1}", direct.p50));
+                            }
+                            if let Some(cached) = self.perf.cached_render.summary() {
+                                line.push_str(&format!("  hit {:4.1}", cached.p50));
+                            }
+                            ui.label(mono(line, HUD_TEXT));
+                        }
+
+                        // Layer raster: basemap+overlay paint pass, model
+                        // field raster, and the slowest extra radar overlay.
+                        let mut layer_line = String::new();
+                        if let Some(basemap_ms) = self.basemap_ms {
+                            layer_line.push_str(&format!("map {basemap_ms:5.1}"));
+                        }
+                        if let Some(model_ms) = self.model_layer_render_ms {
+                            if !layer_line.is_empty() {
+                                layer_line.push_str("  ");
+                            }
+                            layer_line.push_str(&format!("model {model_ms:5.1}"));
+                        }
+                        let radar_overlay_ms = self
+                            .radar_layers
+                            .iter()
+                            .filter_map(|layer| layer.render_ms)
+                            .fold(None::<f32>, |acc, ms| Some(acc.map_or(ms, |a| a.max(ms))));
+                        if let Some(overlay_ms) = radar_overlay_ms {
+                            if !layer_line.is_empty() {
+                                layer_line.push_str("  ");
+                            }
+                            layer_line.push_str(&format!(
+                                "ovl x{} {overlay_ms:5.1}",
+                                self.radar_layers.len()
+                            ));
+                        }
+                        if !layer_line.is_empty() {
+                            layer_line.push_str(" ms");
+                            ui.label(mono(layer_line, HUD_TEXT));
+                        }
+
+                        // Time-to-first-pixels for the LAST load (reset when
+                        // a load starts; data = first decoded volume back,
+                        // px = first texture on screen).
+                        if let Some(first_texture_ms) = self.first_texture_ms {
+                            let mut line = format!("first px {first_texture_ms:6.1} ms");
+                            if let Some(first_data_ms) = self.first_data_ms {
+                                line.push_str(&format!("  data {first_data_ms:5.1}"));
+                            }
+                            ui.label(mono(line, HUD_DIM));
+                        } else if self.active_load_started_at.is_some() {
+                            ui.label(mono("first px      … loading".to_owned(), HUD_DIM));
+                        }
+                    });
+            });
+    }
+
     fn status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             // The loader status ("Rendering", "Refreshing", download progress)
@@ -8134,6 +8723,7 @@ impl ViewerApp {
         let basemap_start = Instant::now();
         self.draw_basemap(painter, rect);
         self.draw_sat_layer(painter, rect);
+        self.draw_spc_outlooks(painter, rect);
         self.draw_model_layers(painter, rect);
         self.draw_graticule(painter, rect);
         let underlay_ms = basemap_start.elapsed().as_secs_f32() * 1000.0;
@@ -8146,6 +8736,8 @@ impl ViewerApp {
         self.draw_hazard_overlays(painter, rect, &self.selected_product.clone());
         self.draw_rotation_markers(painter, rect);
         self.draw_storm_tracks(painter, rect);
+        self.draw_spc_reports(painter, rect);
+        self.draw_glm(painter, rect);
         self.draw_surface_obs(painter, rect);
         self.draw_vrot_tool(painter, rect);
         self.draw_placefiles(painter, rect);
@@ -8797,6 +9389,7 @@ impl ViewerApp {
             .map(|slot| settings::PlacefileEntry {
                 url: slot.url.clone(),
                 enabled: slot.enabled,
+                show_text: slot.show_text,
             })
             .collect();
         let _ = self.app_settings.save();
@@ -8820,10 +9413,17 @@ impl ViewerApp {
             self.view_shape_key(4, rect).hash(&mut hasher);
             index.hash(&mut hasher);
             slot.generation.hash(&mut hasher);
+            slot.show_text.hash(&mut hasher);
             let key = hasher.finish();
             let mut cache = self.placefile_shape_cache.borrow_mut();
             let built = cache.get_or_insert_with(key, || {
-                self.build_placefile_draw_list(placefile, &slot.sheets, rect, viewport_nm)
+                self.build_placefile_draw_list(
+                    placefile,
+                    slot.show_text,
+                    &slot.sheets,
+                    rect,
+                    viewport_nm,
+                )
             });
             painter.extend(built.shapes.iter().cloned());
             for (position, text, size, color) in &built.labels {
@@ -8837,12 +9437,44 @@ impl ViewerApp {
                     egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190),
                 );
             }
+            // Hover card: every icon within 12 px of the pointer, stacked
+            // (spotters cluster on one dot; list them all, GR-style).
+            if let Some(pointer) = painter.ctx().pointer_hover_pos()
+                && rect.contains(pointer)
+            {
+                let mut texts: Vec<&str> = Vec::new();
+                for (position, text) in &built.hovers {
+                    if position.distance(pointer) <= 12.0 {
+                        texts.push(text.as_str());
+                    }
+                    if texts.len() >= 6 {
+                        break;
+                    }
+                }
+                if !texts.is_empty() {
+                    let joined = texts.join(
+                        "
+――――――
+",
+                    );
+                    egui::show_tooltip_at_pointer(
+                        painter.ctx(),
+                        egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("pf_hover")),
+                        egui::Id::new("pf_hover_tip"),
+                        |ui| {
+                            ui.set_max_width(340.0);
+                            ui.label(joined);
+                        },
+                    );
+                }
+            }
         }
     }
 
     fn build_placefile_draw_list(
         &self,
         placefile: &placefiles::Placefile,
+        show_text: bool,
         sheets: &[PlacefileSheet],
         rect: egui::Rect,
         viewport_nm: f32,
@@ -8850,6 +9482,7 @@ impl ViewerApp {
         let mut out = PlacefileDrawList {
             shapes: Vec::new(),
             labels: Vec::new(),
+            hovers: Vec::new(),
         };
         let visible = rect.expand(24.0);
         // Resolve a (lat, lon) or — inside an Object block — a pixel offset
@@ -8906,15 +9539,8 @@ impl ViewerApp {
                             egui::Stroke::new(2.0, fill),
                         ));
                     }
-                    if let Some(label) = label
-                        && self.map_scale >= 150.0
-                    {
-                        out.labels.push((
-                            position + egui::vec2(0.0, -10.0),
-                            label.clone(),
-                            10.0,
-                            egui::Color32::from_rgb(230, 235, 240),
-                        ));
+                    if let Some(label) = label {
+                        out.hovers.push((position, label.replace("\\n", "\n")));
                     }
                 }
                 placefiles::PlacefileObject::Text {
@@ -8926,6 +9552,9 @@ impl ViewerApp {
                     color,
                     ..
                 } => {
+                    if !show_text {
+                        continue;
+                    }
                     let position = resolve(*lat, *lon, *anchor);
                     if !visible.contains(position) {
                         continue;
@@ -9370,50 +9999,137 @@ impl ViewerApp {
     /// Flexible download window: any date/cycle, an hours spec ("0-3",
     /// "2,4,6", "12"), and a profile — with a live calibrated size
     /// estimate, mirroring rusty-weather's download workflow.
-    fn model_download_window(&mut self, ctx: &egui::Context) {
-        if !self.model_download_open {
+    /// The "Model data" window: run browser + field viewer + soundings
+    /// (ModelDataDock), with the flexible download panel merged in as a
+    /// collapsible Download section (ui-refresh proposal section 4 step 8 —
+    /// the separate "Model download" window class is gone; acquisition
+    /// lives WITH browsing). `model_download_open` is now a one-shot
+    /// "expand the Download section" request.
+    fn model_data_window(&mut self, ctx: &egui::Context) {
+        if !self.model_dock_open {
             return;
         }
-        if self.download_date.is_empty() {
-            self.download_date = Utc::now().format("%Y%m%d").to_string();
-            self.download_cycle = (Utc::now() - chrono::Duration::minutes(55))
-                .format("%H")
-                .to_string()
-                .parse()
-                .unwrap_or(0);
+        if self.model_dock.is_none() {
+            let store_root = settings::model_store_dir();
+            self.model_dock = Some(model_data::ModelDataDock::new(ctx, store_root));
         }
-        if self.ingest.is_none() {
-            let store = settings::model_store_dir();
-            let notify = ctx.clone();
-            let worker = ingest_worker::IngestWorker::spawn(store, move || {
-                notify.request_repaint();
-            });
-            self.download_panel
-                .set_model_options(ingest_worker_model_options());
-            let mut spec = self.download_panel.spec().clone();
-            // Never open empty (field bug): seed today's UTC date, then
-            // probe the newest ACTUALLY-AVAILABLE run, which corrects both
-            // date and cycle when it lands.
-            if spec.date.is_empty() {
-                spec.date = Utc::now().format("%Y%m%d").to_string();
-            }
-            sync_run_pickers(&mut self.download_panel, &spec);
-            worker.send(ingest_worker::IngestRequest::Estimate(spec.clone()));
-            worker.send(ingest_worker::IngestRequest::Latest(spec));
-            self.ingest = Some(worker);
-        }
-        self.pump_ingest_responses();
-        let mut open = self.model_download_open;
+        let mut open = self.model_dock_open;
         let mut events = Vec::new();
-        egui::Window::new("Model download")
+        egui::Window::new("Model data")
             .open(&mut open)
-            .default_size([560.0, 560.0])
-            .min_size([420.0, 360.0])
+            .default_size([1080.0, 660.0])
+            .min_size([720.0, 420.0])
             .resizable(true)
             .show(ctx, |ui| {
-                events = self.download_panel.ui(ui);
+                let download_id = ui.make_persistent_id("model_window_download_fold");
+                if self.model_download_open {
+                    // One-shot expand request (the sidebar's Download… path).
+                    self.model_download_open = false;
+                    let mut state =
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ctx,
+                            download_id,
+                            false,
+                        );
+                    state.set_open(true);
+                    state.store(ctx);
+                }
+                // First-run nudge: with an empty store the Download section
+                // starts open — acquisition IS the next step.
+                let store_empty = self
+                    .model_dock
+                    .as_ref()
+                    .is_none_or(|dock| dock.newest_run().is_none());
+                egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ctx,
+                    download_id,
+                    store_empty,
+                )
+                .show_header(ui, |ui| {
+                    ui.strong("Download");
+                    ui.weak("any init · specific hours · any profile — with size estimate");
+                })
+                .body(|ui| {
+                    self.ensure_ingest_worker(ctx);
+                    // Store freshness + the one-click ingest that used to
+                    // live in the sidebar's Layers fold (proposal step 4).
+                    ui.horizontal(|ui| {
+                        let newest = self
+                            .model_dock
+                            .as_ref()
+                            .and_then(|dock| dock.newest_run());
+                        match newest {
+                            Some((model, run, hours)) => {
+                                ui.weak(format!("Newest in store: {model} {run} · {hours} hrs"));
+                            }
+                            None => {
+                                ui.weak("Store empty");
+                            }
+                        }
+                        let fetching = self.model_ingest_rx.is_some();
+                        if ui
+                            .add_enabled(!fetching, egui::Button::new("Fetch latest"))
+                            .on_hover_text(
+                                "Ingest the freshest HRRR init (next 3 hours, sounding-grade) and prune to the two newest runs (~1 min)",
+                            )
+                            .clicked()
+                        {
+                            self.start_model_ingest(ctx);
+                        }
+                        if fetching {
+                            ui.spinner();
+                            if ui.small_button("✕").on_hover_text("Cancel ingest").clicked()
+                                && let Some(cancel) = &self.model_ingest_cancel
+                            {
+                                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("model_window_download_scroll")
+                        .max_height(380.0)
+                        .show(ui, |ui| {
+                            events = self.download_panel.ui(ui);
+                        });
+                });
+                ui.separator();
+                if let Some(dock) = &mut self.model_dock {
+                    dock.ui(ui);
+                }
             });
-        self.model_download_open = open;
+        self.model_dock_open = open;
+        self.dispatch_download_events(events);
+    }
+
+    /// Spawn the flexible-download worker on first use (the Download
+    /// section's body rendering — NOT window open, so no network probes
+    /// fire until the user actually looks at acquisition).
+    fn ensure_ingest_worker(&mut self, ctx: &egui::Context) {
+        if self.ingest.is_some() {
+            return;
+        }
+        let store = settings::model_store_dir();
+        let notify = ctx.clone();
+        let worker = ingest_worker::IngestWorker::spawn(store, move || {
+            notify.request_repaint();
+        });
+        self.download_panel
+            .set_model_options(ingest_worker_model_options());
+        let mut spec = self.download_panel.spec().clone();
+        // Never open empty (field bug): seed today's UTC date, then
+        // probe the newest ACTUALLY-AVAILABLE run, which corrects both
+        // date and cycle when it lands.
+        if spec.date.is_empty() {
+            spec.date = Utc::now().format("%Y%m%d").to_string();
+        }
+        sync_run_pickers(&mut self.download_panel, &spec);
+        worker.send(ingest_worker::IngestRequest::Estimate(spec.clone()));
+        worker.send(ingest_worker::IngestRequest::Latest(spec));
+        self.ingest = Some(worker);
+    }
+
+    fn dispatch_download_events(&mut self, events: Vec<rw_ui::DownloadEvent>) {
         let Some(ingest) = &self.ingest else {
             return;
         };
@@ -9805,6 +10521,191 @@ impl ViewerApp {
         }
     }
 
+    /// SPC-style derived mesoanalysis: Bratseth-correct T2m AND Td2m,
+    /// then recompute surface-based CAPE from the corrected surface
+    /// lifted through the store's isobaric profiles (analyze-then-derive).
+    fn start_oa_derive(&mut self, product: oa_derived::OaProduct, ctx: &egui::Context) {
+        let Some(template) = self
+            .model_dock
+            .as_ref()
+            .and_then(|dock| dock.latest_field())
+            .cloned()
+        else {
+            self.status = "SBCAPE (OA): open Model and show a field first".to_owned();
+            return;
+        };
+        let Some((_, lut)) = self.model_lut.clone() else {
+            return;
+        };
+        let now = Utc::now();
+        let obs: Vec<obs::SurfaceOb> = self
+            .surface_obs
+            .frame_obs(now)
+            .filter(|ob| {
+                let is_metar = ob.network == "METAR";
+                (is_metar && self.obs_show_metar) || (!is_metar && self.obs_show_mesonet)
+            })
+            .cloned()
+            .collect();
+        if obs.is_empty() {
+            self.status = "SBCAPE (OA): no observations".to_owned();
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.oa_cape_rx = Some(receiver);
+        self.status = format!("{} (OA): analyzing + deriving…", product.label());
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            rw_ingest::throttle::set_current_thread_background_priority();
+            let result = (|| -> std::result::Result<(Arc<rw_ui::FieldData>, String), String> {
+                let hour = &template.key.hour;
+                let reader = rw_ui::StoreView::new(settings::model_store_dir())
+                    .open_hour(&hour.model, &hour.run, hour.hour)
+                    .map_err(|e| format!("open hour: {e}"))?;
+                let read2 = |name: &str| -> std::result::Result<Vec<f32>, String> {
+                    reader
+                        .read_full_2d(name)
+                        .map_err(|e| format!("{name}: {e}"))
+                };
+                let read3 = |name: &str| -> std::result::Result<Vec<f32>, String> {
+                    reader
+                        .read_full_3d(name)
+                        .map_err(|e| format!("{name}: {e}"))
+                };
+                let t2m_raw = read2("temperature_2m")?;
+                let td2m_raw = read2("dewpoint_2m")?;
+                let psfc = read2("surface_pressure")?;
+                let orography = read2("orography")?;
+                let t_iso = read3("temperature_iso")?;
+                let td_iso = read3("dewpoint_iso")?;
+                let h_iso = read3("height_iso")?;
+                let levels_hpa = reader
+                    .variable("temperature_iso")
+                    .map(|v| v.levels_hpa.clone())
+                    .ok_or("temperature_iso meta missing")?;
+                let (nx, ny) = (template.nx, template.ny);
+                if t2m_raw.len() != nx * ny {
+                    return Err("grid mismatch".to_owned());
+                }
+                // Bratseth-correct the surface (terrain-aware).
+                let make_field = |var: &str, values: Vec<f32>| -> Arc<rw_ui::FieldData> {
+                    let mut f = (*template).clone();
+                    f.key.var = var.to_owned();
+                    f.units = "K".to_owned();
+                    f.values = values;
+                    f.range = None;
+                    f.style = None;
+                    Arc::new(f)
+                };
+                let lut_t = Arc::clone(&lut);
+                let locate = move |ob: &obs::SurfaceOb| {
+                    lut_t
+                        .lookup(ob.lat, ob.lon)
+                        .map(|index| ((index % nx) as f64, (index / nx) as f64))
+                };
+                let mut t2m = t2m_raw.clone();
+                let mut td2m = td2m_raw.clone();
+                let mut used = (0usize, 0usize);
+                if let Some(a) = mesoanalysis::analyze(
+                    "temperature_2m",
+                    &make_field("temperature_2m", t2m_raw),
+                    &obs,
+                    3.0,
+                    Some(&orography),
+                    &locate,
+                ) {
+                    for (v, d) in t2m.iter_mut().zip(&a.increment) {
+                        if v.is_finite() {
+                            *v += d;
+                        }
+                    }
+                    used.0 = a.obs_used;
+                }
+                if let Some(a) = mesoanalysis::analyze(
+                    "dewpoint_2m",
+                    &make_field("dewpoint_2m", td2m_raw),
+                    &obs,
+                    3.0,
+                    Some(&orography),
+                    &locate,
+                ) {
+                    for (v, d) in td2m.iter_mut().zip(&a.increment) {
+                        if v.is_finite() {
+                            *v += d;
+                        }
+                    }
+                    used.1 = a.obs_used;
+                }
+                // Derive: lift the corrected parcel (SPC ordering).
+                let inputs = oa_derived::OaCapeInputs {
+                    nx,
+                    ny,
+                    psfc,
+                    orography,
+                    t2m,
+                    td2m,
+                    kelvin: true,
+                    t_iso,
+                    td_iso,
+                    h_iso,
+                    levels_hpa,
+                };
+                let values = oa_derived::product_grid(&inputs, product, 4);
+                let max = values
+                    .iter()
+                    .copied()
+                    .filter(|v| v.is_finite())
+                    .fold(f32::MIN, f32::max);
+                let mut field = (*template).clone();
+                field.key.var = format!("{} (OA)", product.label());
+                field.units = product.units().to_owned();
+                field.values = values;
+                field.range = Some(product.fallback_range(max));
+                field.style = product.style_slug().and_then(|slug| {
+                    rustwx_products::viewer::operational_style_for_store_variable(
+                        slug,
+                        &serde_json::json!({ "derived": slug }),
+                        product.units(),
+                        rustwx_core::ModelId::Hrrr,
+                    )
+                });
+                let summary = format!(
+                    "{} (OA): {} T / {} Td obs · max {:.0} {}",
+                    product.label(),
+                    used.0,
+                    used.1,
+                    max,
+                    product.units()
+                );
+                Ok((Arc::new(field), summary))
+            })();
+            let _ = sender.send(result);
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn poll_oa_cape(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.oa_cape_rx else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok((field, summary))) => {
+                self.oa_cape_rx = None;
+                self.status = summary.clone();
+                self.oa_last_summary = Some(summary);
+                self.start_model_layer_build(field, ctx);
+            }
+            Ok(Err(message)) => {
+                self.oa_cape_rx = None;
+                let message = format!("SBCAPE (OA) failed: {message}");
+                self.status = message.clone();
+                self.oa_last_summary = Some(message);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.oa_cape_rx = None,
+        }
+    }
+
     /// Run the Bratseth mesoanalysis on a background thread: QC'd
     /// innovations vs the dock's current field, station-space iteration,
     /// one gridding pass; the corrected field comes back as a new layer.
@@ -9840,10 +10741,29 @@ impl ViewerApp {
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
             let nx = field.nx;
-            let result = mesoanalysis::analyze(&field.key.var, &field, &obs, 3.0, |ob| {
-                lut.lookup(ob.lat, ob.lon)
-                    .map(|index| ((index % nx) as f64, (index / nx) as f64))
-            })
+            // Terrain for the elevation/ridge-blocking terms: read the
+            // orography 2-D var straight from the store (the dock's viewer
+            // channel stays untouched).
+            let orography = rw_ui::StoreView::new(settings::model_store_dir())
+                .open_hour(
+                    &field.key.hour.model,
+                    &field.key.hour.run,
+                    field.key.hour.hour,
+                )
+                .ok()
+                .and_then(|hour| hour.read_full_2d("orography").ok())
+                .filter(|oro| oro.len() == field.values.len());
+            let result = mesoanalysis::analyze(
+                &field.key.var,
+                &field,
+                &obs,
+                3.0,
+                orography.as_deref(),
+                |ob| {
+                    lut.lookup(ob.lat, ob.lon)
+                        .map(|index| ((index % nx) as f64, (index / nx) as f64))
+                },
+            )
             .map(|analysis| {
                 let mut corrected = (*field).clone();
                 for (value, delta) in corrected.values.iter_mut().zip(&analysis.increment) {
@@ -9881,6 +10801,215 @@ impl ViewerApp {
             let _ = sender.send(result);
             ctx_clone.request_repaint();
         });
+    }
+
+    /// Install a volume fetched by the URL poller (live-equivalent frame).
+    fn install_polled_volume(&mut self, volume: Arc<RadarVolume>, ctx: &egui::Context) {
+        self.install_volume_arc(volume, None, true, None, FrameStatus::Complete, ctx);
+    }
+
+    /// GR2A-style polling: fetch <url>/dir.list, newest entry wins; when
+    /// it changes, download + decode + install as the live volume.
+    fn poll_custom_url(&mut self, ctx: &egui::Context) {
+        if !self.poll_active || self.poll_url.is_empty() {
+            return;
+        }
+        let due = self
+            .poll_next
+            .map(|at| Instant::now() >= at)
+            .unwrap_or(true);
+        if due && self.poll_rx.is_none() {
+            self.poll_next = Some(Instant::now() + Duration::from_secs(15));
+            let base = self.poll_url.trim_end_matches('/').to_owned();
+            let last = self.poll_last_file.clone();
+            let (sender, receiver) = mpsc::channel();
+            self.poll_rx = Some(receiver);
+            let ctx_clone = ctx.clone();
+            thread::spawn(move || {
+                let result =
+                    (|| -> std::result::Result<Option<(String, Arc<RadarVolume>)>, String> {
+                        let listing = data_source::fetch_text(&format!("{base}/dir.list"))
+                            .map_err(|e| format!("dir.list: {e}"))?;
+                        // dir.list lines: "<size> <filename>" or bare filenames;
+                        // newest = last lexicographic (GR convention: names sort
+                        // by time).
+                        let newest = listing
+                            .lines()
+                            .filter_map(|line| line.split_whitespace().last())
+                            .filter(|name| !name.is_empty())
+                            .max_by(|a, b| a.cmp(b))
+                            .ok_or("empty dir.list")?
+                            .to_owned();
+                        if last.as_deref() == Some(newest.as_str()) {
+                            return Ok(None);
+                        }
+                        let raw = data_source::fetch_bytes(&format!("{base}/{newest}"))
+                            .map_err(|e| format!("{newest}: {e}"))?;
+                        let volume = nexrad_io::decode_volume_from_bytes(&raw)
+                            .map_err(|e| format!("decode {newest}: {e}"))?;
+                        Ok(Some((newest, Arc::new(volume))))
+                    })();
+                let _ = sender.send(match result {
+                    Ok(Some(pair)) => Ok(pair),
+                    Ok(None) => Err(String::new()), // no-change marker
+                    Err(e) => Err(e),
+                });
+                ctx_clone.request_repaint();
+            });
+        }
+        if let Some(receiver) = &self.poll_rx {
+            match receiver.try_recv() {
+                Ok(Ok((name, volume))) => {
+                    self.poll_rx = None;
+                    self.poll_last_file = Some(name.clone());
+                    self.status = format!("Polled: {name}");
+                    self.install_polled_volume(volume, ctx);
+                }
+                Ok(Err(message)) => {
+                    self.poll_rx = None;
+                    if !message.is_empty() {
+                        self.status = format!("Poll: {message}");
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.poll_rx = None,
+            }
+        }
+    }
+
+    /// Fetch + render the nearest RAOB launch through the native skew-T
+    /// channel (the poll installs it and opens the window).
+    fn start_raob_sounding(&mut self, ctx: &egui::Context) {
+        if self.native_sounding_rx.is_some() {
+            return;
+        }
+        let when = self
+            .volume
+            .as_ref()
+            .map(|volume| volume.volume_time.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+        let (center_lat, center_lon) = (self.map_center_lat, self.map_center_lon);
+        let sites_cache = self.raob_sites.take();
+        let (sender, receiver) = mpsc::channel();
+        self.native_sounding_rx = Some(receiver);
+        self.native_skewt_open = true;
+        self.status = "Fetching RAOB…".to_owned();
+        let ctx_clone = ctx.clone();
+        let (site_tx, site_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let compute_start = Instant::now();
+            let result =
+                (|| -> std::result::Result<(rustwx_sounding::NativeSounding, f32), String> {
+                    let sites = match sites_cache {
+                        Some(sites) => sites,
+                        None => obs_soundings::fetch_sites()?,
+                    };
+                    let nearest = sites
+                        .iter()
+                        .min_by(|a, b| {
+                            haversine_km(center_lat, center_lon, a.lat, a.lon)
+                                .total_cmp(&haversine_km(center_lat, center_lon, b.lat, b.lon))
+                        })
+                        .ok_or("no RAOB sites")?;
+                    let station = nearest.id.clone();
+                    let distance = haversine_km(center_lat, center_lon, nearest.lat, nearest.lon);
+                    let _ = site_tx.send(sites);
+                    let mut last_err = String::new();
+                    for launch in obs_soundings::launch_times_before(when) {
+                        match obs_soundings::fetch_raob(&station, launch) {
+                            Ok(column) => {
+                                let mut native =
+                                    rustwx_sounding::NativeSounding::from_column(&column)
+                                        .map_err(|e| e.to_string())?;
+                                native.metadata.station_id = format!(
+                                    "{station} RAOB {} ({distance:.0} km)",
+                                    launch.format("%m-%d %Hz")
+                                );
+                                return Ok((
+                                    native,
+                                    compute_start.elapsed().as_secs_f32() * 1000.0,
+                                ));
+                            }
+                            Err(e) => last_err = e,
+                        }
+                    }
+                    Err(format!("no recent launch for {station}: {last_err}"))
+                })();
+            let _ = sender.send(result);
+            ctx_clone.request_repaint();
+        });
+        // Restore the site cache when the worker forwarded it back.
+        if let Ok(sites) = site_rx.try_recv() {
+            self.raob_sites = Some(sites);
+        }
+    }
+
+    /// Persist the current overlay toggles as the startup defaults.
+    fn save_overlay_defaults(&mut self) {
+        self.app_settings.overlay_obs = self.obs_enabled;
+        self.app_settings.overlay_obs_metar = self.obs_show_metar;
+        self.app_settings.overlay_obs_mesonet = self.obs_show_mesonet;
+        self.app_settings.overlay_glm = self.glm_enabled;
+        self.app_settings.overlay_spc_outlooks = self.spc_outlooks_enabled.clone();
+        self.app_settings.overlay_spc_reports = self.spc_reports_enabled;
+        let _ = self.app_settings.save();
+    }
+
+    /// SPC outlooks + reports: fetch when enabled, refresh every 5 min.
+    fn poll_spc(&mut self, ctx: &egui::Context) {
+        let wants = !self.spc_outlooks_enabled.is_empty() || self.spc_reports_enabled;
+        let current_key = {
+            let archive_date = self.volume.as_ref().and_then(|volume| {
+                let when = volume.volume_time.date_naive();
+                let today = Utc::now().date_naive();
+                use chrono::Datelike;
+                (when != today).then(|| (when.year(), when.month(), when.day()))
+            });
+            Some((self.spc_day, archive_date))
+        };
+        let key_changed = wants && self.spc_last_key != current_key;
+        if wants
+            && self.spc_rx.is_none()
+            && (key_changed
+                || self
+                    .spc_data
+                    .fetched_at
+                    .map(|at| at.elapsed() > Duration::from_secs(300))
+                    .unwrap_or(true))
+        {
+            let (sender, receiver) = mpsc::channel();
+            self.spc_rx = Some(receiver);
+            let kinds: Vec<String> = self.spc_outlooks_enabled.clone();
+            let want_reports = self.spc_reports_enabled;
+            let day = self.spc_day;
+            // Archive-aware: when the displayed volume is from another
+            // day, show THAT day's outlook (latest issuance).
+            let archive_date = self.volume.as_ref().and_then(|volume| {
+                let when = volume.volume_time.date_naive();
+                let today = Utc::now().date_naive();
+                use chrono::Datelike;
+                (when != today).then(|| (when.year(), when.month(), when.day()))
+            });
+            self.spc_last_key = Some((day, archive_date));
+            let ctx_clone = ctx.clone();
+            thread::spawn(move || {
+                let kind_refs: Vec<&str> = kinds.iter().map(String::as_str).collect();
+                let data = spc_layers::fetch_spc(&kind_refs, want_reports, day, archive_date);
+                let _ = sender.send(data);
+                ctx_clone.request_repaint();
+            });
+        }
+        if let Some(receiver) = &self.spc_rx {
+            match receiver.try_recv() {
+                Ok(data) => {
+                    self.spc_rx = None;
+                    self.spc_data = data;
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.spc_rx = None,
+            }
+        }
     }
 
     fn poll_mesoanalysis(&mut self, ctx: &egui::Context) {
@@ -10497,6 +11626,405 @@ impl ViewerApp {
         }
     }
 
+    /// 3D Volume Explorer window: background box resample of the current
+    /// volume around the view center, GPU raymarched via a glow paint
+    /// callback (docs/xsection-3d-spec.md: GR2A-style direct volume
+    /// rendering with an alpha transfer function - not marching cubes).
+    fn vol3d_window(&mut self, ctx: &egui::Context) {
+        if !self.vol3d.open {
+            return;
+        }
+        if let Some(volume) = self.volume.clone()
+            && let Some((radar_lat, radar_lon)) = self.radar_location()
+        {
+            let center_east =
+                (self.map_center_lon - radar_lon) * 111.32 * radar_lat.to_radians().cos();
+            let center_north = (self.map_center_lat - radar_lat) * 111.32;
+            // Vertical completeness gate: a live volume whose first chunks
+            // cover one sector of one tilt must NOT bake a fragment box
+            // (field report: corner-blob render mid-SAILS). Hold until the
+            // top tilt reaches the previous volume's top; the key includes
+            // the top so completion re-triggers.
+            let volume_top_deg = volume
+                .cuts
+                .iter()
+                .filter(|c| c.moments.contains_key(&MomentType::Reflectivity))
+                .map(|c| c.elevation_deg)
+                .fold(0.0f32, f32::max);
+            let vertically_ready = volume_top_deg + 0.3 >= self.vol3d.last_top_deg;
+            let key = (
+                volume.volume_time.timestamp_millis(),
+                (volume_top_deg * 10.0) as i32,
+                (center_east / 10.0) as i32,
+                (center_north / 10.0) as i32,
+                self.vol3d.box_half_km as i32,
+            );
+            if self.vol3d.volume_key != Some(key) && self.vol3d.resample_rx.is_none() {
+                if !vertically_ready {
+                    self.vol3d.status = format!(
+                        "live volume building (top {volume_top_deg:.1}° / {:.1}°)…",
+                        self.vol3d.last_top_deg
+                    );
+                } else {
+                    self.vol3d.volume_key = Some(key);
+                    self.vol3d.last_top_deg = volume_top_deg.max(self.vol3d.last_top_deg.min(20.0));
+                    let (sender, receiver) = mpsc::channel();
+                    self.vol3d.resample_rx = Some(receiver);
+                    self.vol3d.status = "resampling volume…".to_owned();
+                    let half_km = self.vol3d.box_half_km;
+                    let ctx_clone = ctx.clone();
+                    thread::spawn(move || {
+                        let result = render2d::volume_box_resample(
+                            &volume,
+                            center_east,
+                            center_north,
+                            half_km,
+                            vol3d::BOX_N,
+                            vol3d::BOX_NZ,
+                            vol3d::BOX_TOP_M,
+                        )
+                        .map(|values| vol3d::normalize_box(&values, vol3d::BOX_N, vol3d::BOX_NZ));
+                        let _ = sender.send(result);
+                        ctx_clone.request_repaint();
+                    });
+                }
+            }
+        }
+        if let Some(receiver) = &self.vol3d.resample_rx {
+            match receiver.try_recv() {
+                Ok(Some(volume_box)) => {
+                    self.vol3d.resample_rx = None;
+                    // >=20 dBZ cell count: zero means the box is centered
+                    // off-storm (pan the map there + Re-center), nonzero
+                    // with a black canvas means a GPU-side problem.
+                    let echo_cells = volume_box.data.iter().filter(|&&b| b >= 64).count();
+                    self.vol3d.status = format!(
+                        "{} km box · {} cells ≥20 dBZ",
+                        (self.vol3d.box_half_km * 2.0) as i32,
+                        echo_cells
+                    );
+                    let table = self.color_tables.for_family(ColorTableFamily::Reflectivity);
+                    let mut lut = [0u8; 256 * 4];
+                    for (i, px) in lut.chunks_exact_mut(4).enumerate() {
+                        let dbz = i as f32 / 255.0 * 80.0;
+                        let c = table.color_for_value(dbz);
+                        px.copy_from_slice(&c);
+                    }
+                    if let Ok(mut pending) = self.vol3d.pending.lock() {
+                        pending.volume = Some(volume_box);
+                        pending.lut = Some(lut.to_vec());
+                    }
+                    ctx.request_repaint();
+                }
+                Ok(None) => {
+                    self.vol3d.resample_rx = None;
+                    self.vol3d.status = "no volume data in the box".to_owned();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.vol3d.resample_rx = None,
+            }
+        }
+        let mut open = self.vol3d.open;
+        egui::Window::new("Volume Explorer (3D)")
+            .open(&mut open)
+            .default_size([760.0, 620.0])
+            .min_size([420.0, 360.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Threshold");
+                    ui.add(
+                        egui::Slider::new(&mut self.vol3d.threshold_dbz, 0.0..=70.0).suffix(" dBZ"),
+                    );
+                    ui.label("Opacity");
+                    ui.add(egui::Slider::new(&mut self.vol3d.opacity, 0.05..=1.0));
+                    let mut size_km = (self.vol3d.box_half_km * 2.0) as i32;
+                    egui::ComboBox::from_id_salt("vol3d_size")
+                        .selected_text(format!("{size_km} km"))
+                        .width(74.0)
+                        .show_ui(ui, |ui| {
+                            for option in [120, 240, 360] {
+                                ui.selectable_value(&mut size_km, option, format!("{option} km"));
+                            }
+                        });
+                    if (size_km as f32 / 2.0 - self.vol3d.box_half_km).abs() > 0.5 {
+                        self.vol3d.box_half_km = size_km as f32 / 2.0;
+                        self.vol3d.volume_key = None; // re-resample at the new size
+                    }
+                    if ui
+                        .small_button("Re-center")
+                        .on_hover_text("Rebuild the box around the current view center")
+                        .clicked()
+                    {
+                        self.vol3d.volume_key = None;
+                    }
+                    ui.weak(&self.vol3d.status);
+                });
+                let size = ui.available_size();
+                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                if response.dragged() {
+                    let delta = response.drag_delta();
+                    self.vol3d.yaw -= delta.x * 0.01;
+                    self.vol3d.pitch = (self.vol3d.pitch + delta.y * 0.01).clamp(0.05, 1.45);
+                }
+                let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+                if response.hovered() && scroll != 0.0 {
+                    self.vol3d.dist = (self.vol3d.dist * (1.0 - scroll * 0.001)).clamp(1.2, 6.0);
+                }
+                ui.painter()
+                    .add(eframe::egui_wgpu::Callback::new_paint_callback(
+                        rect,
+                        vol3d::Vol3dCallback {
+                            yaw: self.vol3d.yaw,
+                            pitch: self.vol3d.pitch,
+                            dist: self.vol3d.dist,
+                            threshold01: self.vol3d.threshold_dbz / 80.0,
+                            opacity: self.vol3d.opacity,
+                            aspect: (rect.width() / rect.height().max(1.0)).max(0.1),
+                            pending: Arc::clone(&self.vol3d.pending),
+                        },
+                    ));
+                // Wireframe box (same camera math as the shader): always
+                // visible, shows orientation even before data arrives.
+                let project = |p: [f32; 3]| -> egui::Pos2 {
+                    let (yaw, pitch, dist) = (self.vol3d.yaw, self.vol3d.pitch, self.vol3d.dist);
+                    let (cy, sy) = (yaw.cos(), yaw.sin());
+                    let (cp, sp) = (pitch.cos(), pitch.sin());
+                    let zspan = 0.6f32;
+                    let center = [0.0, 0.0, zspan * 0.35];
+                    let eye = [
+                        center[0] + dist * cy * cp,
+                        center[1] + dist * sy * cp,
+                        center[2] + dist * sp,
+                    ];
+                    let fwd = {
+                        let v = [center[0] - eye[0], center[1] - eye[1], center[2] - eye[2]];
+                        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                        [v[0] / l, v[1] / l, v[2] / l]
+                    };
+                    let right = {
+                        let v = [fwd[1], -fwd[0], 0.0];
+                        let l = (v[0] * v[0] + v[1] * v[1]).sqrt().max(1e-6);
+                        [v[0] / l, v[1] / l, 0.0]
+                    };
+                    let up = [
+                        right[1] * fwd[2] - right[2] * fwd[1],
+                        right[2] * fwd[0] - right[0] * fwd[2],
+                        right[0] * fwd[1] - right[1] * fwd[0],
+                    ];
+                    let d = [p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]];
+                    let z = d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2];
+                    let x = (d[0] * right[0] + d[1] * right[1] + d[2] * right[2]) / z / 0.7;
+                    let y = (d[0] * up[0] + d[1] * up[1] + d[2] * up[2]) / z / 0.7;
+                    let aspect = (rect.width() / rect.height().max(1.0)).max(0.1);
+                    rect.center() + egui::vec2(x / aspect, -y) * (rect.width() * 0.5)
+                };
+                let zs = 0.6f32;
+                let corners = [
+                    [-1.0, -1.0, 0.0],
+                    [1.0, -1.0, 0.0],
+                    [1.0, 1.0, 0.0],
+                    [-1.0, 1.0, 0.0],
+                    [-1.0, -1.0, zs],
+                    [1.0, -1.0, zs],
+                    [1.0, 1.0, zs],
+                    [-1.0, 1.0, zs],
+                ];
+                let edges = [
+                    (0, 1),
+                    (1, 2),
+                    (2, 3),
+                    (3, 0),
+                    (4, 5),
+                    (5, 6),
+                    (6, 7),
+                    (7, 4),
+                    (0, 4),
+                    (1, 5),
+                    (2, 6),
+                    (3, 7),
+                ];
+                let stroke = egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(140, 150, 165, 110),
+                );
+                for (a, b) in edges {
+                    ui.painter()
+                        .line_segment([project(corners[a]), project(corners[b])], stroke);
+                }
+                // Floor grid every 20 km + height ticks: spatial reference.
+                let faint = egui::Stroke::new(
+                    0.7,
+                    egui::Color32::from_rgba_unmultiplied(120, 128, 142, 60),
+                );
+                let step = 20.0 / self.vol3d.box_half_km;
+                let mut g = -1.0 + step;
+                while g < 0.999 {
+                    ui.painter()
+                        .line_segment([project([g, -1.0, 0.0]), project([g, 1.0, 0.0])], faint);
+                    ui.painter()
+                        .line_segment([project([-1.0, g, 0.0]), project([1.0, g, 0.0])], faint);
+                    g += step;
+                }
+                for km in [5.0f32, 10.0, 15.0] {
+                    let z = km * 1000.0 / vol3d::BOX_TOP_M * zs;
+                    ui.painter().line_segment(
+                        [project([-1.0, -1.0, z]), project([-0.93, -1.0, z])],
+                        stroke,
+                    );
+                    ui.painter().text(
+                        project([-1.12, -1.0, z]),
+                        egui::Align2::CENTER_CENTER,
+                        format!("{km:.0} km"),
+                        egui::FontId::proportional(10.0),
+                        egui::Color32::from_rgb(170, 178, 190),
+                    );
+                }
+                ui.painter().text(
+                    project([0.0, 1.05, 0.0]),
+                    egui::Align2::CENTER_CENTER,
+                    "N",
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::from_rgb(200, 205, 215),
+                );
+            });
+        self.vol3d.open = open;
+    }
+
+    /// SPC Day-1 outlook polygons: SPC's own published fill/stroke colors,
+    /// translucent fill + outline, label at the first ring's centroid.
+    fn draw_spc_outlooks(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if self.spc_outlooks_enabled.is_empty() {
+            return;
+        }
+        for (kind, features) in &self.spc_data.outlooks {
+            if !self.spc_outlooks_enabled.iter().any(|k| k == kind) {
+                continue;
+            }
+            for feature in features {
+                for ring in &feature.rings {
+                    let screen: Vec<egui::Pos2> = ring
+                        .iter()
+                        .map(|(lon, lat)| self.lon_lat_to_screen(rect, *lon, *lat))
+                        .collect();
+                    // Bounding-box overlap, NOT vertex containment: a
+                    // CONUS-scale ring covers the view while every vertex
+                    // sits far off-screen (field report: outlooks never
+                    // drew at storm zoom).
+                    let (mut min_x, mut min_y, mut max_x, mut max_y) =
+                        (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                    for p in &screen {
+                        min_x = min_x.min(p.x);
+                        min_y = min_y.min(p.y);
+                        max_x = max_x.max(p.x);
+                        max_y = max_y.max(p.y);
+                    }
+                    let bbox = egui::Rect::from_min_max(
+                        egui::pos2(min_x, min_y),
+                        egui::pos2(max_x, max_y),
+                    );
+                    if !bbox.intersects(rect) {
+                        continue;
+                    }
+                    painter.add(egui::Shape::closed_line(
+                        screen.clone(),
+                        egui::Stroke::new(2.0, feature.stroke),
+                    ));
+                    // Translucent interior wash: PROPER ear-clip tessellation
+                    // (the warning-polygon path's own) — outlook rings are
+                    // deeply concave, and a centroid fan sprays triangles
+                    // across the map ("spokes" field report). The cleaner
+                    // also absorbs SPC's unclosed/degenerate ring edge cases.
+                    if let Some(mesh) = filled_polygon_mesh(&screen, feature.fill) {
+                        painter.add(egui::Shape::mesh(mesh));
+                    }
+                    if let Some(first) = screen.first() {
+                        painter.text(
+                            *first + egui::vec2(6.0, 6.0),
+                            egui::Align2::LEFT_TOP,
+                            &feature.label,
+                            egui::FontId::proportional(11.0),
+                            feature.stroke,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Today's filtered storm reports: T/W/H markers with hover detail.
+    fn draw_spc_reports(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if !self.spc_reports_enabled {
+            return;
+        }
+        for report in &self.spc_data.reports {
+            let pos = self.lon_lat_to_screen(rect, report.lon, report.lat);
+            if !rect.contains(pos) {
+                continue;
+            }
+            let color = report.kind.color();
+            match report.kind {
+                spc_layers::ReportKind::Tornado => {
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![
+                            pos + egui::vec2(0.0, -5.0),
+                            pos + egui::vec2(4.5, 3.5),
+                            pos + egui::vec2(-4.5, 3.5),
+                        ],
+                        color,
+                        egui::Stroke::new(1.0, egui::Color32::BLACK),
+                    ));
+                }
+                spc_layers::ReportKind::Wind => {
+                    painter.rect_filled(
+                        egui::Rect::from_center_size(pos, egui::vec2(7.0, 7.0)),
+                        1.0,
+                        color,
+                    );
+                }
+                spc_layers::ReportKind::Hail => {
+                    painter.circle_filled(pos, 3.5, color);
+                }
+            }
+        }
+    }
+
+    /// GLM lightning flashes, time-synced: each frame draws the trailing
+    /// 10-minute window BEFORE ITS OWN TIME (loops replay lightning
+    /// history), age-faded, sized by log-energy, degraded QC'd out.
+    fn draw_glm(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if !self.glm_enabled {
+            return;
+        }
+        let Some(glm) = &self.glm else {
+            return;
+        };
+        let frame_ms = self
+            .volume
+            .as_ref()
+            .map(|volume| volume.volume_time.timestamp_millis())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        for (flash, age) in glm.frame_flashes(frame_ms) {
+            let pos = self.lon_lat_to_screen(rect, flash.lon, flash.lat);
+            if !rect.contains(pos) {
+                continue;
+            }
+            let color = glm_layer::flash_color(age);
+            // Size by log-energy: GLM energies span orders of magnitude.
+            let energy_femto = (f64::from(flash.energy) * 1e15).max(1.0);
+            let size = (1.6 + 0.55 * energy_femto.log10() as f32).clamp(1.6, 5.0);
+            let stroke = egui::Stroke::new(1.2, color);
+            painter.line_segment(
+                [pos - egui::vec2(size, 0.0), pos + egui::vec2(size, 0.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [pos - egui::vec2(0.0, size), pos + egui::vec2(0.0, size)],
+                stroke,
+            );
+        }
+    }
+
     /// Surface-obs station plots: GR2A-style T/Td (°F) + wind barb +
     /// gust, screen-grid decluttered (fuller reports win the cell), ids
     /// at street zoom. Pure vector — no raster, no worker.
@@ -10520,16 +12048,21 @@ impl ViewerApp {
         // Fuller reports first so they win declutter cells.
         let mut order: Vec<&obs::SurfaceOb> = self.surface_obs.frame_obs(frame_time).collect();
         order.sort_by(|a, b| b.completeness.cmp(&a.completeness));
-        // During loop playback/scrubbing, only frequently-updating
-        // stations draw — slow reporters freeze mid-loop and read as
-        // stale clutter (field request: "looks cleaner").
+        // During loop playback/scrubbing, stations draw only when their
+        // report is FRESH relative to the frame (45 min) — stale reporters
+        // freeze mid-loop and read as clutter. (A report-count rule here
+        // previously hid hourly METARs for hours after launch — the
+        // dedup'd pool accumulates them slowly. Field report fixed.)
         let looping = self.history_playing || self.browsing_history;
         for ob in order {
             let is_metar = ob.network == "METAR";
             if (is_metar && !self.obs_show_metar) || (!is_metar && !self.obs_show_mesonet) {
                 continue;
             }
-            if looping && self.surface_obs.report_count(&ob.station_id) < 3 {
+            if looping
+                && let Some(t) = ob.time_utc
+                && (frame_time - t).num_minutes() > 45
+            {
                 continue;
             }
             let pos = self.lon_lat_to_screen(rect, ob.lon, ob.lat);
@@ -11382,11 +12915,13 @@ impl ViewerApp {
             return;
         };
         // Only reflectivity and (dealiased) velocity sections are supported.
-        // Velocity-family products → velocity section; plain REF and the
-        // reflectivity-derived volume products (CREF/ET/VIL/VILD) → REF section;
-        // everything else (SW/ZDR/CC/PHI/KDP) has no section — show a hint
-        // rather than a mislabeled reflectivity slice.
+        // Velocity-family products → velocity section (dealiased, shear
+        // guard); CC → melting-layer-safe CC section; ZDR → linear-in-dB
+        // section; plain REF and the reflectivity-derived volume products
+        // (CREF/ET/VIL/VILD) → REF section; SW/PHI/KDP → hint.
         let velocity = self.selected_product.base_moment() == MomentType::Velocity;
+        let cc = self.selected_product.base_moment() == MomentType::CorrelationCoefficient;
+        let zdr = self.selected_product.base_moment() == MomentType::DifferentialReflectivity;
         let reflectivity = matches!(
             self.selected_product,
             DisplayProduct::Moment(MomentType::Reflectivity)
@@ -11394,14 +12929,18 @@ impl ViewerApp {
             .selected_product
             .derived()
             .is_some_and(|d| d.is_volume_wide());
-        if !velocity && !reflectivity {
+        if !velocity && !reflectivity && !cc && !zdr {
             self.cross_section_status =
-                "Cross-section supports reflectivity & velocity products".to_owned();
+                "Cross-section supports REF, velocity, CC and ZDR products".to_owned();
             self.cross_section_texture = None;
             return;
         }
         let family = if velocity {
             ColorTableFamily::Velocity
+        } else if cc {
+            ColorTableFamily::CorrelationCoefficient
+        } else if zdr {
+            ColorTableFamily::DifferentialReflectivity
         } else {
             ColorTableFamily::Reflectivity
         };
@@ -11458,20 +12997,49 @@ impl ViewerApp {
         let live_partial = self
             .selected_frame()
             .is_some_and(|frame| frame.status == FrameStatus::LivePartial);
+        let volume_top_deg = volume
+            .cuts
+            .iter()
+            .filter(|c| c.moments.contains_key(&MomentType::Reflectivity))
+            .map(|c| c.elevation_deg)
+            .fold(0.0f32, f32::max);
         if live_partial
             && self.cross_section_texture.is_some()
             && self.cross_section_user_signature == Some(user_sig)
-            && volume.cuts.len() < self.cross_section_volume_cuts
+            && volume_top_deg + 0.3 < self.cross_section_volume_top_deg
         {
             self.cross_section_status = format!(
-                "holding last full section — live volume building ({}/{} tilts)",
-                volume.cuts.len(),
-                self.cross_section_volume_cuts
+                "holding last full section — live volume building (top {:.1}°/{:.1}°)",
+                volume_top_deg, self.cross_section_volume_top_deg
             );
             return;
         }
 
-        let section = if velocity {
+        let section = if cc {
+            // CC slices never blend through the melting layer (the rho_hv
+            // minimum IS the signature): nearest-gate below 0.97.
+            render2d::moment_cross_section(
+                &volume,
+                MomentType::CorrelationCoefficient,
+                render2d::InterpPolicy::CcGuard,
+                start,
+                end,
+                w,
+                h,
+                top_m,
+            )
+        } else if zdr {
+            render2d::moment_cross_section(
+                &volume,
+                MomentType::DifferentialReflectivity,
+                render2d::InterpPolicy::LinearAngle,
+                start,
+                end,
+                w,
+                h,
+                top_m,
+            )
+        } else if velocity {
             velocity_cross_section_cached(
                 &volume,
                 &mut self.cross_section_dealias_cache,
@@ -11512,10 +13080,20 @@ impl ViewerApp {
         self.cross_section_signature = Some(sig);
         self.cross_section_user_signature = Some(user_sig);
         self.cross_section_volume_cuts = volume.cuts.len();
+        self.cross_section_volume_top_deg =
+            volume_top_deg.max(self.cross_section_volume_top_deg * 0.0);
         self.cross_section_top_m = top_m;
         self.cross_section_status = format!(
             "{} · {:.0} km long · top {:.0} km",
-            if velocity { "Velocity" } else { "Reflectivity" },
+            if velocity {
+                "Velocity"
+            } else if cc {
+                "CC"
+            } else if zdr {
+                "ZDR"
+            } else {
+                "Reflectivity"
+            },
             section.length_m / 1000.0,
             top_m / 1000.0,
         );
@@ -12984,6 +14562,8 @@ impl<V> ShapeCache<V> {
 struct PlacefileSlot {
     url: String,
     enabled: bool,
+    /// Draw Text/Place statements (off = icons/lines only).
+    show_text: bool,
     data: Option<placefiles::Placefile>,
     /// Bumped on every successful install — exact shape-cache invalidation.
     generation: u64,
@@ -13010,6 +14590,7 @@ impl PlacefileSlot {
         Self {
             url,
             enabled,
+            show_text: true,
             data: None,
             generation: 0,
             next_refresh: None,
@@ -13026,6 +14607,10 @@ impl PlacefileSlot {
 struct PlacefileDrawList {
     shapes: Vec<egui::Shape>,
     labels: Vec<(egui::Pos2, String, f32, egui::Color32)>,
+    /// Icon HOVER texts (position, decoded text) — GR semantics: the
+    /// Icon statement's trailing string shows on hover only, never as
+    /// map text (SpotterNetwork hover cards are paragraphs).
+    hovers: Vec<(egui::Pos2, String)>,
 }
 
 /// Cached hazard-overlay geometry: the (possibly ear-clipped) polygon shapes
@@ -13560,6 +15145,124 @@ fn layer_state_color(state: &str) -> egui::Color32 {
         "live" => egui::Color32::from_rgb(65, 238, 104),
         _ => egui::Color32::from_rgb(106, 132, 154),
     }
+}
+
+/// Visibility slot of a unified layer row: a toggle for ordinary layers, a
+/// fixed badge for the always-on primary radar (no vis toggle, no ✕).
+enum LayerRowVis<'a> {
+    Toggle { value: &'a mut bool, hover: &'a str },
+    Badge { glyph: &'a str, hover: &'a str },
+}
+
+/// Opacity slot of a unified layer row: overlay radars store u8 alpha,
+/// GOES/model layers and the primary radar store f32 (max is always 1.0/255).
+enum LayerRowOpacity<'a> {
+    F32 {
+        value: &'a mut f32,
+        min: f32,
+        hover: &'a str,
+    },
+    U8 {
+        value: &'a mut u8,
+        min: u8,
+    },
+}
+
+/// The fixed slots of one unified layer row (see `layer_row`).
+struct LayerRowSpec<'a> {
+    vis: LayerRowVis<'a>,
+    name: &'a str,
+    name_width: f32,
+    name_hover: &'a str,
+    state: Option<&'a str>,
+    opacity: Option<LayerRowOpacity<'a>>,
+}
+
+/// One unified layer row — the row grammar from docs/ui-refresh-proposal.md
+/// §3 direction A ("everything is a layer"):
+///
+///   [vis] [name (hover = details)] [state dot] [opacity ───] [row-specific]
+///
+/// Every layer type in the Layers fold (primary radar, overlay radars, GOES,
+/// model fields, surface obs, placefiles) renders through this one shape;
+/// row-specific controls (Go/Ref/Pri, reorder, refresh, remove, sub-toggles)
+/// come in through `trailing`. Rows opt out of slots they don't have (None).
+/// Returns true when visibility or opacity changed (callers repaint).
+fn layer_row(
+    ui: &mut egui::Ui,
+    spec: LayerRowSpec<'_>,
+    trailing: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let LayerRowSpec {
+        vis,
+        name,
+        name_width,
+        name_hover,
+        state,
+        opacity,
+    } = spec;
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        match vis {
+            LayerRowVis::Toggle { value, hover } => {
+                let response = ui.checkbox(value, "");
+                let response = if hover.is_empty() {
+                    response
+                } else {
+                    response.on_hover_text(hover)
+                };
+                if response.changed() {
+                    changed = true;
+                }
+            }
+            LayerRowVis::Badge { glyph, hover } => {
+                let (rect, response) = ui.allocate_exact_size(
+                    egui::vec2(18.0, PANEL_BUTTON_HEIGHT),
+                    egui::Sense::hover(),
+                );
+                ui.put(rect, egui::Label::new(glyph));
+                response.on_hover_text(hover);
+            }
+        }
+        let name_response = fixed_status_label(ui, name, name_width);
+        if !name_hover.is_empty() {
+            name_response.on_hover_text(name_hover.to_owned());
+        }
+        if let Some(state) = state {
+            fixed_state_dot(ui, layer_state_color(state), state);
+        }
+        match opacity {
+            Some(LayerRowOpacity::F32 { value, min, hover }) => {
+                if ui
+                    .add_sized(
+                        egui::vec2(LAYER_ROW_SLIDER_WIDTH, PANEL_BUTTON_HEIGHT),
+                        egui::Slider::new(value, min..=1.0).show_value(false),
+                    )
+                    .on_hover_text(hover)
+                    .changed()
+                {
+                    changed = true;
+                }
+            }
+            Some(LayerRowOpacity::U8 { value, min }) => {
+                let hover = format!("Opacity {}", *value);
+                if ui
+                    .add_sized(
+                        egui::vec2(LAYER_ROW_SLIDER_WIDTH, PANEL_BUTTON_HEIGHT),
+                        egui::Slider::new(value, min..=u8::MAX).show_value(false),
+                    )
+                    .on_hover_text(hover)
+                    .changed()
+                {
+                    changed = true;
+                }
+            }
+            None => {}
+        }
+        trailing(ui);
+    });
+    changed
 }
 
 fn hazard_record_detail_lines(record: &HazardRecord) -> Vec<String> {
@@ -19259,6 +20962,7 @@ mod tests {
             cursor_readout: None,
             placefile_slots: Vec::new(),
             placefile_url_input: String::new(),
+            placefile_input_focus: false,
             placefile_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
             storm_tracker: StormTracker::default(),
             storm_tracks_site: String::new(),
@@ -19316,8 +21020,24 @@ mod tests {
             download_cycle: 0,
             download_hours: "0-3".to_owned(),
             download_profile: 0,
+            vol3d: vol3d::Vol3d::default(),
+            poll_url: String::new(),
+            poll_active: false,
+            poll_last_file: None,
+            poll_next: None,
+            poll_rx: None,
+            spc_data: spc_layers::SpcData::default(),
+            spc_outlooks_enabled: Vec::new(),
+            spc_reports_enabled: false,
+            spc_day: 1,
+            spc_last_key: None,
+            glm: None,
+            spc_rx: None,
+            glm_enabled: false,
             oa_rx: None,
             oa_last_summary: None,
+            oa_cape_rx: None,
+            raob_sites: None,
             obs_enabled: false,
             obs_show_metar: true,
             obs_show_mesonet: true,
@@ -19360,6 +21080,7 @@ mod tests {
             cross_section_top_m: CROSS_SECTION_TOP_M,
             cross_section_user_signature: None,
             cross_section_volume_cuts: 0,
+            cross_section_volume_top_deg: 0.0,
             cross_section_dealias_cache: VolumeDealiasCache::new(),
             hazard_overlay: Some(test_hazard_overlay(records)),
             hazard_path_text: String::new(),

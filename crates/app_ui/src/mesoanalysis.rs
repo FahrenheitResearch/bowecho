@@ -43,6 +43,13 @@ const MAX_ITER: usize = 12;
 const TOL_FRAC: f64 = 0.05;
 /// Innovation gross check multiplier (Tyndall Eq. 5).
 const EPS_M: f64 = 10.0;
+/// Vertical decorrelation scale, m (Tyndall, Horel & De Pondeca 2010).
+const RZ_M: f64 = 200.0;
+/// Intervening-terrain blockage scale, m (Myrick, Horel & Lazarus 2005,
+/// Eqs. 3-4: rho *= exp(-a^2/RB^2), a = max(0, z_ridge - max(z_i, z_j))).
+const RB_M: f64 = 2000.0;
+// Wind components skip the vertical term (RTMA keeps wind anisotropy
+// very weak); flagged per VarConfig::terrain_aware below.
 
 /// Per-variable analysis configuration (spec §7 table).
 #[derive(Clone, Copy)]
@@ -54,6 +61,8 @@ pub struct VarConfig {
     pub eps2_mesonet: f64,
     /// Gross-check floor (same units as the variable).
     pub qc_floor: f64,
+    /// Apply elevation/terrain decorrelation (off for wind, per RTMA).
+    pub terrain_aware: bool,
 }
 
 /// T2m (Kelvin-equivalent °C units) — spec §7 row 1.
@@ -62,6 +71,7 @@ pub const T2M: VarConfig = VarConfig {
     eps2_metar: 0.35,
     eps2_mesonet: 0.5,
     qc_floor: 3.0,
+    terrain_aware: true,
 };
 /// Td2m — spec §7 row 2 (derived* anchors).
 pub const TD2M: VarConfig = VarConfig {
@@ -69,6 +79,16 @@ pub const TD2M: VarConfig = VarConfig {
     eps2_metar: 0.6,
     eps2_mesonet: 1.5,
     qc_floor: 4.0,
+    terrain_aware: true,
+};
+/// 10-m wind components, analyzed separately/univariately (spec §7 row 3;
+/// sigma_o mesonet ratio 2.0 per Tyndall — RAWS wind). No vertical term.
+pub const WIND10: VarConfig = VarConfig {
+    sigma_b: 1.8,
+    eps2_metar: 1.0,
+    eps2_mesonet: 2.0,
+    qc_floor: 7.5,
+    terrain_aware: false,
 };
 
 /// One quality-controlled, background-matched observation ready for the
@@ -79,6 +99,8 @@ struct AnalysisOb {
     /// Innovation: ob − background at the station.
     d: f64,
     eps2: f64,
+    /// Station elevation m MSL (reported, else model terrain at cell).
+    elev: f64,
 }
 
 /// Result: the analyzed increment on the background grid + diagnostics.
@@ -95,9 +117,21 @@ pub struct Analysis {
 
 /// Which observation value feeds the analysis for a store variable.
 pub fn ob_value_for(var: &str, ob: &SurfaceOb) -> Option<f64> {
+    let component = |east: bool| -> Option<f64> {
+        let (dir, spd) = (ob.wind_dir_deg?, ob.wind_speed_kt?);
+        let speed_ms = f64::from(spd) * 0.514_444;
+        let rad = f64::from(dir).to_radians();
+        Some(if east {
+            -speed_ms * rad.sin()
+        } else {
+            -speed_ms * rad.cos()
+        })
+    };
     match var {
         "temperature_2m" => ob.temp_c.map(f64::from),
         "dewpoint_2m" => ob.dewpoint_c.map(f64::from),
+        "u_10m" => component(true),
+        "v_10m" => component(false),
         _ => None,
     }
 }
@@ -106,6 +140,7 @@ pub fn config_for(var: &str) -> Option<VarConfig> {
     match var {
         "temperature_2m" => Some(T2M),
         "dewpoint_2m" => Some(TD2M),
+        "u_10m" | "v_10m" => Some(WIND10),
         _ => None,
     }
 }
@@ -185,6 +220,7 @@ pub fn analyze(
     field: &Arc<FieldData>,
     obs: &[SurfaceOb],
     grid_cell_km: f64,
+    orography: Option<&[f32]>,
     locate: impl Fn(&SurfaceOb) -> Option<(f64, f64)>,
 ) -> Option<Analysis> {
     let config = config_for(var)?;
@@ -217,7 +253,24 @@ pub fn analyze(
         } else {
             config.eps2_mesonet
         };
-        accepted.push(AnalysisOb { col, row, d, eps2 });
+        let terrain_at = |c: f64, r: f64| -> f64 {
+            orography
+                .and_then(|oro| oro.get(r.round() as usize * field.nx + c.round() as usize))
+                .copied()
+                .map(f64::from)
+                .unwrap_or(0.0)
+        };
+        let elev = ob
+            .elevation_m
+            .map(f64::from)
+            .unwrap_or_else(|| terrain_at(col, row));
+        accepted.push(AnalysisOb {
+            col,
+            row,
+            d,
+            eps2,
+            elev,
+        });
     }
     if accepted.is_empty() {
         return None;
@@ -228,6 +281,47 @@ pub fn analyze(
     // ρ'_ij with compact support (dense-in-cutoff sparse rows).
     let mut rho_rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
     let mut row_sum = vec![0.0f64; n];
+    // Decimated terrain for the intervening-terrain term: max-pool 8x —
+    // ITT only cares about km-scale barriers (Myrick et al. 2005).
+    let terrain = config
+        .terrain_aware
+        .then(|| {
+            orography.map(|oro| {
+                let factor = 8usize;
+                let tnx = field.nx.div_ceil(factor);
+                let tny = field.ny.div_ceil(factor);
+                let mut pooled = vec![f32::MIN; tnx * tny];
+                for r in 0..field.ny {
+                    for c in 0..field.nx {
+                        let v = oro[r * field.nx + c];
+                        let cell = (r / factor) * tnx + c / factor;
+                        if v > pooled[cell] {
+                            pooled[cell] = v;
+                        }
+                    }
+                }
+                (pooled, tnx, factor)
+            })
+        })
+        .flatten();
+    let ridge_between = |a: &AnalysisOb, b: &AnalysisOb| -> f64 {
+        let Some((pooled, tnx, factor)) = &terrain else {
+            return f64::MIN;
+        };
+        let steps = ((a.col - b.col).abs().max((a.row - b.row).abs()) / *factor as f64)
+            .ceil()
+            .max(1.0) as usize;
+        let mut z_max = f64::MIN;
+        for k in 0..=steps {
+            let t = k as f64 / steps as f64;
+            let c = (a.col + (b.col - a.col) * t) / *factor as f64;
+            let r = (a.row + (b.row - a.row) * t) / *factor as f64;
+            if let Some(z) = pooled.get(r as usize * tnx + c as usize) {
+                z_max = z_max.max(f64::from(*z));
+            }
+        }
+        z_max
+    };
     for i in 0..n {
         for j in 0..n {
             let dx = accepted[i].col - accepted[j].col;
@@ -236,7 +330,22 @@ pub fn analyze(
             if r2 > cutoff_cells * cutoff_cells {
                 continue;
             }
-            let rho = (-r2 / (r_cells * r_cells)).exp();
+            let mut rho = (-r2 / (r_cells * r_cells)).exp();
+            if config.terrain_aware {
+                // Vertical decorrelation (Lazarus Eq. 10 family).
+                let dz = accepted[i].elev - accepted[j].elev;
+                rho *= (-(dz * dz) / (RZ_M * RZ_M)).exp();
+                // Intervening-terrain blockage (Myrick Eqs. 3-4):
+                // symmetric, so C stays symmetric.
+                if i != j {
+                    let blockage = (ridge_between(&accepted[i], &accepted[j])
+                        - accepted[i].elev.max(accepted[j].elev))
+                    .max(0.0);
+                    if blockage > 0.0 {
+                        rho *= (-(blockage * blockage) / (RB_M * RB_M)).exp();
+                    }
+                }
+            }
             rho_rows[i].push((j, rho));
             row_sum[i] += rho;
         }
@@ -296,7 +405,13 @@ pub fn analyze(
                 if r2 > cut * cut {
                     continue;
                 }
-                let rho = (-r2 / (r_cells * r_cells)).exp();
+                let mut rho = (-r2 / (r_cells * r_cells)).exp();
+                if config.terrain_aware
+                    && let Some(oro) = orography
+                {
+                    let dz = ob.elev - f64::from(oro[r * nx + c]);
+                    rho *= (-(dz * dz) / (RZ_M * RZ_M)).exp();
+                }
                 increment[r * nx + c] += (rho * weight_base) as f32;
             }
         }
@@ -340,6 +455,7 @@ mod tests {
 
     fn ob_at(lat: f32, lon: f32, temp_c: f32, network: &str) -> SurfaceOb {
         SurfaceOb {
+            elevation_m: None,
             network: network.into(),
             station_id: "TEST".into(),
             time_utc: None,
@@ -362,7 +478,7 @@ mod tests {
         let field = flat_field(200, 200, 273.15); // 0 °C everywhere
         // One METAR reading +2 °C at grid center (locate maps it there).
         let obs = vec![ob_at(40.0, -95.0, 2.0, "METAR")];
-        let analysis = analyze("temperature_2m", &field, &obs, 3.0, |_| {
+        let analysis = analyze("temperature_2m", &field, &obs, 3.0, None, |_| {
             Some((100.0, 100.0))
         })
         .expect("analysis");
@@ -395,7 +511,7 @@ mod tests {
             ob_at(40.0, -95.0, 2.0, "METAR"),
             ob_at(40.0, -95.0, 2.0, "METAR"),
         ];
-        let analysis = analyze("temperature_2m", &field, &obs, 3.0, |_| {
+        let analysis = analyze("temperature_2m", &field, &obs, 3.0, None, |_| {
             Some((100.0, 100.0))
         })
         .expect("analysis");
@@ -415,7 +531,7 @@ mod tests {
     fn gross_check_rejects() {
         let field = flat_field(200, 200, 273.15);
         let obs = vec![ob_at(40.0, -95.0, 40.0, "METAR")]; // +40 °C vs flat 0 °C bg
-        let analysis = analyze("temperature_2m", &field, &obs, 3.0, |_| {
+        let analysis = analyze("temperature_2m", &field, &obs, 3.0, None, |_| {
             Some((100.0, 100.0))
         });
         assert!(analysis.is_none(), "lone absurd ob -> no analysis");

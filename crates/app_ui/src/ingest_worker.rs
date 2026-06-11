@@ -247,7 +247,8 @@ fn compute_estimate(
     let calibration = if paths.is_empty() {
         Calibration::builtin_default()
     } else {
-        Calibration::from_hour_files(&paths).unwrap_or_else(|_| Calibration::builtin_default())
+        Calibration::from_hour_files(&paths, model)
+            .unwrap_or_else(|_| Calibration::builtin_default())
     };
     let hour_count = hours.len() as u16;
     let estimate = estimate(&profile, model, hour_count, &calibration);
@@ -570,10 +571,15 @@ mod tests {
                 .contains("--hours")
         );
 
+        // GFS became ingest-supported at rusty-weather d853afa (multi-model
+        // phase A) — it must now RESOLVE; a bogus slug still errors.
+        let mut good = spec();
+        good.model = "gfs".to_string();
+        good.hours = "6".to_string(); // GFS cadence
+        assert!(resolve_spec(&good).is_ok(), "gfs is ingest-supported now");
         let mut bad = spec();
-        bad.model = "gfs".to_string();
-        let message = resolve_spec(&bad).expect_err("unsupported model");
-        assert!(message.contains("not ingest-supported"), "got: {message}");
+        bad.model = "definitely-not-a-model".to_string();
+        assert!(resolve_spec(&bad).is_err());
 
         let mut bad = spec();
         bad.date = "not-a-date".to_string();

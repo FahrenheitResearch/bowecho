@@ -321,23 +321,15 @@ mod tests {
         // Outbound +20 near, inbound -15 far — 3 gates wide each (the
         // median QC by design suppresses single-gate spikes).
         let mut v = vec![f32::NAN; 40];
-        for g in 8..=10 {
-            v[g] = 20.0;
-        }
-        for g in 14..=16 {
-            v[g] = -15.0;
-        }
+        v[8..=10].fill(20.0);
+        v[14..=16].fill(-15.0);
         let conv = radial_convergence_row(&v, 12);
         // Between the pair the windowed ΔV sees both: 35 m/s.
         assert!((conv[12] - 35.0).abs() < 1e-3, "{}", conv[12]);
         // Divergent orientation (inbound near, outbound far) must NOT fire.
         let mut d = vec![f32::NAN; 40];
-        for g in 8..=10 {
-            d[g] = -15.0;
-        }
-        for g in 14..=16 {
-            d[g] = 20.0;
-        }
+        d[8..=10].fill(-15.0);
+        d[14..=16].fill(20.0);
         let div = radial_convergence_row(&d, 12);
         assert!(div[12].is_nan() || div[12] <= 0.0);
     }

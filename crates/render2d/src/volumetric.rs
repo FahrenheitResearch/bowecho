@@ -215,6 +215,111 @@ fn f32_grid_like(base: &MomentGrid, moment: MomentType, values: Vec<f32>) -> Mom
     }
 }
 
+/// 4/3-effective-earth radius, m (Doviak & Zrnic 1993 Eq. 2.28 model).
+const AE_M: f64 = 4.0 / 3.0 * 6_371_000.0;
+/// WSR-88D half-power half-beamwidth, rad (0.95 deg aperture / 2).
+const HALF_BW_RAD: f64 = 0.475 * std::f64::consts::PI / 180.0;
+
+/// One cross-section profile sample: beam-center height, tilt elevation,
+/// recovered slant range (for the beamwidth rules), value.
+#[derive(Clone, Copy)]
+struct ProfileSample {
+    h: f64,
+    theta_deg: f64,
+    r_m: f64,
+    v: f32,
+}
+
+/// Interpolation policy per moment family (docs/xsection-3d-spec.md):
+/// reflectivity/ZDR blend linearly; CC must not blend through the melting
+/// layer (Giangrande, Krause & Ryzhkov 2008: the rho_hv minimum is the
+/// signature — blending fabricates intermediate values), so any bracket
+/// below 0.97 falls back to nearest-gate; velocity guards against blending
+/// across strong shear or residual aliasing.
+#[derive(Clone, Copy, PartialEq)]
+pub enum InterpPolicy {
+    LinearAngle,
+    CcGuard,
+    VelocityGuard,
+}
+
+/// Slant range + elevation angle at (ground distance s, height h) — the
+/// exact closed-form inverse of the 4/3-earth height equation (law of
+/// cosines on the effective sphere; unit-tested to round-trip).
+fn invert_beam(s: f64, h: f64) -> (f64, f64) {
+    let sigma = s / AE_M;
+    let r = (AE_M * AE_M + (AE_M + h) * (AE_M + h) - 2.0 * AE_M * (AE_M + h) * sigma.cos())
+        .max(0.0)
+        .sqrt();
+    if r < 1.0 {
+        return (0.0, 90.0);
+    }
+    let sin_theta =
+        (((AE_M + h) * (AE_M + h) - AE_M * AE_M - r * r) / (2.0 * AE_M * r)).clamp(-1.0, 1.0);
+    (r, sin_theta.asin().to_degrees())
+}
+
+/// Cross-section column: rich samples across all cuts, ascending height.
+fn column_profile_xs(cols: &[CutColumn<'_>], az: f32, s: f64) -> Vec<ProfileSample> {
+    let mut prof: Vec<ProfileSample> = cols
+        .iter()
+        .filter_map(|c| {
+            c.sample(az, s).map(|(v, h)| {
+                let (r_m, _) = invert_beam(s, h);
+                ProfileSample {
+                    h,
+                    theta_deg: f64::from(c.elevation_deg),
+                    r_m,
+                    v,
+                }
+            })
+        })
+        .collect();
+    prof.sort_by(|a, b| a.h.total_cmp(&b.h));
+    prof
+}
+
+/// MRMS-style vertical interpolation at height z, ground distance s
+/// (Zhang, Howard & Gourley 2005, Eqs. 5-7): linear IN ELEVATION ANGLE
+/// between the bracketing tilts — not in height. Edge rule (Zhang et al.
+/// 2011): values extend past the top/bottom tilt only within half a
+/// beamwidth (range-dependent), never further; below the lowest beam we
+/// keep a 300 m display floor so near-radar sections still reach ground
+/// (operational RHI convention, documented divergence).
+fn interp_profile_xs(prof: &[ProfileSample], z: f64, s: f64, policy: InterpPolicy) -> Option<f32> {
+    let first = prof.first()?;
+    let last = prof[prof.len() - 1];
+    if z <= first.h {
+        let extend = (first.r_m * HALF_BW_RAD).max(300.0);
+        return (first.h - z <= extend).then_some(first.v);
+    }
+    if z >= last.h {
+        let extend = last.r_m * HALF_BW_RAD;
+        return (z - last.h <= extend).then_some(last.v);
+    }
+    let (_, theta_i) = invert_beam(s, z);
+    for w in prof.windows(2) {
+        let (lo, hi) = (w[0], w[1]);
+        if z >= lo.h && z <= hi.h {
+            let nearest = if (z - lo.h) <= (hi.h - z) { lo.v } else { hi.v };
+            match policy {
+                InterpPolicy::CcGuard if lo.v.min(hi.v) < 0.97 => return Some(nearest),
+                InterpPolicy::VelocityGuard if (hi.v - lo.v).abs() > 30.0 => {
+                    return Some(nearest);
+                }
+                _ => {}
+            }
+            let span = hi.theta_deg - lo.theta_deg;
+            if span.abs() < 1e-6 {
+                return Some(lo.v);
+            }
+            let w2 = ((theta_i - lo.theta_deg) / span).clamp(0.0, 1.0) as f32;
+            return Some(lo.v + (hi.v - lo.v) * w2);
+        }
+    }
+    Some(last.v)
+}
+
 /// Per-output-gate column at ground range `s`, azimuth `az`: (height_m, dbz)
 /// pairs across all cuts, sorted ascending by height. Reused by all products.
 fn column_profile(cols: &[CutColumn<'_>], az: f32, s: f64) -> Vec<(f64, f32)> {
@@ -636,39 +741,6 @@ pub struct CrossSection {
     pub values: Vec<f32>,
 }
 
-/// Linearly interpolate a height-sorted (height_m, dBZ) profile at height `z`.
-/// Returns None outside the sampled span (no extrapolation).
-/// How far below the lowest beam a section column may be extended (m).
-/// Near the radar the lowest tilt sits a few hundred metres up, so sections
-/// reach the ground; at far range we stop after this depth rather than paint
-/// kilometres of single-gate columns ("barcode" artifact).
-const PROFILE_GROUND_EXTENSION_M: f64 = 1_500.0;
-
-fn interp_profile(prof: &[(f64, f32)], z: f64) -> Option<f32> {
-    let first = prof.first()?;
-    // Below the lowest beam, extend its value downward a bounded distance —
-    // the display convention used by operational RHI views (and the same
-    // surface-layer assumption VIL makes), depth-capped to stay honest.
-    if z <= first.0 {
-        return (first.0 - z <= PROFILE_GROUND_EXTENSION_M).then_some(first.1);
-    }
-    if prof.len() < 2 || z > prof[prof.len() - 1].0 {
-        return None;
-    }
-    for w in prof.windows(2) {
-        let (h0, v0) = w[0];
-        let (h1, v1) = w[1];
-        if z >= h0 && z <= h1 {
-            if (h1 - h0).abs() < 1e-6 {
-                return Some(v0);
-            }
-            let t = ((z - h0) / (h1 - h0)) as f32;
-            return Some(v0 + (v1 - v0) * t);
-        }
-    }
-    Some(prof[prof.len() - 1].1)
-}
-
 /// Reflectivity vertical cross-section between two ground points given as
 /// (east_km, north_km) from the radar. Resamples every reflectivity tilt along
 /// the path with 4/3-Earth beam geometry (Doviak & Zrnić 1993) and linearly
@@ -683,7 +755,96 @@ pub fn reflectivity_cross_section(
     top_m: f32,
 ) -> Option<CrossSection> {
     let cols = reflectivity_columns(volume);
-    cross_section_from_columns(&cols, start_km, end_km, width, height, top_m)
+    cross_section_from_columns(
+        &cols,
+        start_km,
+        end_km,
+        width,
+        height,
+        top_m,
+        InterpPolicy::LinearAngle,
+    )
+}
+
+/// Cartesian box resample of the reflectivity volume for 3D direct
+/// volume rendering: `n` cells per horizontal side over `±half_km` about
+/// (center_east_km, center_north_km), `nz` levels 0..top_m. Returns
+/// row-major \[z]\[y]\[x] values (NaN = no data), same MRMS-style
+/// per-column reconstruction as the cross-sections.
+pub fn volume_box_resample(
+    volume: &RadarVolume,
+    center_east_km: f32,
+    center_north_km: f32,
+    half_km: f32,
+    n: usize,
+    nz: usize,
+    top_m: f32,
+) -> Option<Vec<f32>> {
+    if n < 8 || nz < 4 || half_km <= 1.0 {
+        return None;
+    }
+    let cols = reflectivity_columns(volume);
+    if cols.is_empty() {
+        return None;
+    }
+    let mut out = vec![f32::NAN; n * n * nz];
+    let slabs: Vec<Vec<f32>> = (0..n)
+        .into_par_iter()
+        .map(|yi| {
+            let mut slab = vec![f32::NAN; n * nz];
+            let north = center_north_km - half_km + 2.0 * half_km * yi as f32 / (n - 1) as f32;
+            for xi in 0..n {
+                let east = center_east_km - half_km + 2.0 * half_km * xi as f32 / (n - 1) as f32;
+                let s = f64::from(east.hypot(north)) * 1000.0;
+                let az = east.atan2(north).to_degrees().rem_euclid(360.0);
+                let prof = column_profile_xs(&cols, az, s);
+                if prof.is_empty() {
+                    continue;
+                }
+                for zi in 0..nz {
+                    let z = f64::from(top_m) * zi as f64 / (nz - 1) as f64;
+                    if let Some(v) = interp_profile_xs(&prof, z, s, InterpPolicy::LinearAngle) {
+                        slab[zi * n + xi] = v;
+                    }
+                }
+            }
+            slab
+        })
+        .collect();
+    for (yi, slab) in slabs.iter().enumerate() {
+        for zi in 0..nz {
+            for xi in 0..n {
+                out[zi * n * n + yi * n + xi] = slab[zi * n + xi];
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Generic single-moment cross-section (CC, ZDR, …): same MRMS-style
+/// reconstruction with the moment's interpolation policy.
+#[allow(clippy::too_many_arguments)] // section geometry is irreducibly 6 values
+pub fn moment_cross_section(
+    volume: &RadarVolume,
+    moment: MomentType,
+    policy: InterpPolicy,
+    start_km: (f32, f32),
+    end_km: (f32, f32),
+    width: usize,
+    height: usize,
+    top_m: f32,
+) -> Option<CrossSection> {
+    let mut cols: Vec<CutColumn<'_>> = volume
+        .cuts
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let g = c.moments.get(&moment)?;
+            CutColumn::new(volume, i, g)
+        })
+        .collect();
+    cols.sort_by(|a, b| a.elevation_deg.total_cmp(&b.elevation_deg));
+    cross_section_from_columns(&cols, start_km, end_km, width, height, top_m, policy)
 }
 
 /// Dealiased-velocity vertical cross-section (m/s) — shows the RIJ descent /
@@ -760,7 +921,15 @@ pub fn velocity_cross_section_cached(
         .filter_map(|(i, g)| CutColumn::new(volume, *i, g))
         .collect();
     cols.sort_by(|a, b| a.elevation_deg.total_cmp(&b.elevation_deg));
-    cross_section_from_columns(&cols, start_km, end_km, width, height, top_m)
+    cross_section_from_columns(
+        &cols,
+        start_km,
+        end_km,
+        width,
+        height,
+        top_m,
+        InterpPolicy::VelocityGuard,
+    )
 }
 
 /// Shared RHI reconstruction: walk along the ground path, sample each column,
@@ -772,6 +941,7 @@ fn cross_section_from_columns(
     width: usize,
     height: usize,
     top_m: f32,
+    policy: InterpPolicy,
 ) -> Option<CrossSection> {
     if width < 2 || height < 2 || top_m <= 0.0 || cols.is_empty() {
         return None;
@@ -787,14 +957,14 @@ fn cross_section_from_columns(
             let north = start_km.1 + (end_km.1 - start_km.1) * f;
             let s = east.hypot(north) as f64 * 1000.0;
             let az = east.atan2(north).to_degrees().rem_euclid(360.0);
-            let prof = column_profile(cols, az, s);
+            let prof = column_profile_xs(cols, az, s);
             let mut column = vec![f32::NAN; height];
             if prof.is_empty() {
                 return column;
             }
             for (y, cell) in column.iter_mut().enumerate() {
                 let z = top_m * (1.0 - y as f32 / (height - 1) as f32);
-                if let Some(v) = interp_profile(&prof, z as f64) {
+                if let Some(v) = interp_profile_xs(&prof, z as f64, s, policy) {
                     *cell = v;
                 }
             }

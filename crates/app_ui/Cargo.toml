@@ -33,40 +33,48 @@ rfd.workspace = true
 # Model-data dock (rusty-weather rw-ui). Branch-only path dep.
 [dependencies.rw-ui]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "eb5d2b2"
+rev = "d853afa"
 
 [dependencies.rustwx-render]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "eb5d2b2"
+rev = "d853afa"
 
 [dependencies.rustwx-sounding]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "eb5d2b2"
+rev = "d853afa"
 
 [dependencies.sharprs]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "eb5d2b2"
+rev = "d853afa"
 
 [dependencies.rw-ingest]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "eb5d2b2"
+rev = "d853afa"
+
+[dependencies.rw-glm]
+git = "https://github.com/FahrenheitResearch/rusty-weather"
+rev = "d853afa"
+
+[dependencies.rustwx-products]
+git = "https://github.com/FahrenheitResearch/rusty-weather"
+rev = "d853afa"
 
 [dependencies.rustwx-core]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "eb5d2b2"
+rev = "d853afa"
 
 [dependencies.rustwx-io]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "eb5d2b2"
+rev = "d853afa"
 
 [dependencies.rustwx-models]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "eb5d2b2"
+rev = "d853afa"
 
 [dependencies.rw-sat]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "eb5d2b2"
+rev = "d853afa"
 
 [dependencies.rw-store]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "eb5d2b2"
+rev = "d853afa"

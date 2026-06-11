@@ -9,7 +9,6 @@ const DEFAULT_DECODE_RUNS: usize = 5;
 const DEFAULT_KM_PER_PX: f32 = 0.16;
 const MIN_DISPLAYABLE_RADIALS: usize = 180;
 const KNOT_TO_MPS: f32 = 0.514_444;
-const LOW_CORE_PREVIEW_THREADS: usize = 4;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = parse_args().map_err(|err| format!("{err}\n\n{}", usage()))?;
@@ -110,8 +109,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn should_preview_block_bzip_loads_for_threads(threads: usize) -> bool {
-    threads <= LOW_CORE_PREVIEW_THREADS
+fn should_preview_block_bzip_loads_for_threads(_threads: usize) -> bool {
+    // Mirrors app_ui's policy: the block-bzip preview shares the full
+    // decode's pipeline (engine fast-path), so it's effectively free and
+    // enabled on every machine. Keep this in sync with app_ui/src/main.rs —
+    // a stale gate here makes the probe measure a path the app never takes.
+    true
 }
 
 fn probe_dealiased_velocity(

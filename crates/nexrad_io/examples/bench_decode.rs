@@ -2,8 +2,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-const LOW_CORE_PREVIEW_THREADS: usize = 4;
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(input) = std::env::args_os().nth(1).map(PathBuf::from) else {
         eprintln!("usage: cargo run -p nexrad_io --example bench_decode -- <level2-file>");
@@ -178,6 +176,10 @@ fn elapsed_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
-fn should_preview_block_bzip_loads_for_threads(threads: usize) -> bool {
-    threads <= LOW_CORE_PREVIEW_THREADS
+fn should_preview_block_bzip_loads_for_threads(_threads: usize) -> bool {
+    // Mirrors app_ui's policy: the block-bzip preview shares the full
+    // decode's pipeline (engine fast-path), so it's effectively free and
+    // enabled on every machine. Keep this in sync with app_ui/src/main.rs —
+    // a stale gate here makes the bench measure a path the app never takes.
+    true
 }
