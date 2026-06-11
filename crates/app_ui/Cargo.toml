@@ -10,6 +10,7 @@ chrono.workspace = true
 rayon.workspace = true
 color_tables = { path = "../color_tables" }
 data_source = { path = "../data_source" }
+flate2.workspace = true
 eframe.workspace = true
 image.workspace = true
 nexrad_io = { path = "../nexrad_io" }
@@ -32,40 +33,40 @@ rfd.workspace = true
 # Model-data dock (rusty-weather rw-ui). Branch-only path dep.
 [dependencies.rw-ui]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "e749c2a2b0d3bc0872ba66c904f7ff5726421fa6"
+rev = "666a1e0"
 
 [dependencies.rustwx-render]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "e749c2a2b0d3bc0872ba66c904f7ff5726421fa6"
+rev = "666a1e0"
 
 [dependencies.rustwx-sounding]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "e749c2a2b0d3bc0872ba66c904f7ff5726421fa6"
+rev = "666a1e0"
 
 [dependencies.sharprs]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "e749c2a2b0d3bc0872ba66c904f7ff5726421fa6"
+rev = "666a1e0"
 
 [dependencies.rw-ingest]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "e749c2a2b0d3bc0872ba66c904f7ff5726421fa6"
+rev = "666a1e0"
 
 [dependencies.rustwx-core]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "e749c2a2b0d3bc0872ba66c904f7ff5726421fa6"
+rev = "666a1e0"
 
 [dependencies.rustwx-io]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "e749c2a2b0d3bc0872ba66c904f7ff5726421fa6"
+rev = "666a1e0"
 
 [dependencies.rustwx-models]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "e749c2a2b0d3bc0872ba66c904f7ff5726421fa6"
+rev = "666a1e0"
 
 [dependencies.rw-sat]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "e749c2a2b0d3bc0872ba66c904f7ff5726421fa6"
+rev = "666a1e0"
 
 [dependencies.rw-store]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "e749c2a2b0d3bc0872ba66c904f7ff5726421fa6"
+rev = "666a1e0"

@@ -18,6 +18,7 @@ const METAR_CACHE_URL: &str = "https://aviationweather.gov/data/cache/metars.cac
 
 /// One decoded surface observation (units as plotted).
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // time/altimeter feed the upcoming inspector ob readout
 pub struct SurfaceOb {
     pub station_id: String,
     pub time_utc: Option<DateTime<Utc>>,
@@ -134,6 +135,75 @@ fn parse_row(columns: &[&str], line: &str) -> Option<SurfaceOb> {
     })
 }
 
+/// Time-keyed observation pool: every fetch merges in (METARs are hourly
+/// plus specials, so 5-minute fetches accumulate the in-between reports).
+/// Radar frames then draw the ob valid AT THE FRAME'S TIME — obs scrub
+/// in sync with the radar loop. Pruned beyond `RETAIN`.
+pub struct ObPool {
+    /// Per station, obs sorted ascending by time.
+    by_station: std::collections::HashMap<String, Vec<SurfaceOb>>,
+    pub station_count: usize,
+}
+
+/// Keep ~3 h of history (a dozen live-loop frames plus slack).
+const RETAIN: chrono::Duration = chrono::Duration::hours(3);
+/// A station with no ob within this window of the frame time is HIDDEN —
+/// honest absence beats stale data masquerading as current.
+const MATCH_WINDOW: chrono::Duration = chrono::Duration::minutes(90);
+
+impl ObPool {
+    pub fn new() -> Self {
+        Self {
+            by_station: std::collections::HashMap::new(),
+            station_count: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_station.is_empty()
+    }
+
+    /// Merge a fetch (dedup by station+time), prune old, re-sort.
+    pub fn merge(&mut self, fetched: Vec<SurfaceOb>) {
+        let cutoff = Utc::now() - RETAIN;
+        for ob in fetched {
+            let entry = self.by_station.entry(ob.station_id.clone()).or_default();
+            if !entry.iter().any(|have| have.time_utc == ob.time_utc) {
+                entry.push(ob);
+            }
+        }
+        for entry in self.by_station.values_mut() {
+            entry.retain(|ob| ob.time_utc.map(|t| t > cutoff).unwrap_or(false));
+            entry.sort_by_key(|ob| ob.time_utc);
+        }
+        self.by_station.retain(|_, list| !list.is_empty());
+        self.station_count = self.by_station.len();
+    }
+
+    /// The ob to draw for `frame_time`: the newest report at-or-before
+    /// (falling back to the nearest after, e.g. a special that just
+    /// landed), within the match window. None = hide the station.
+    pub fn ob_at<'a>(&'a self, station: &str, frame_time: DateTime<Utc>) -> Option<&'a SurfaceOb> {
+        let list = self.by_station.get(station)?;
+        let best = list
+            .iter()
+            .rfind(|ob| ob.time_utc.map(|t| t <= frame_time).unwrap_or(false))
+            .or_else(|| list.first());
+        best.filter(|ob| {
+            ob.time_utc
+                .map(|t| (frame_time - t).num_minutes().abs() <= MATCH_WINDOW.num_minutes())
+                .unwrap_or(false)
+        })
+    }
+
+    /// Iterate one representative ob per station for `frame_time`.
+    pub fn frame_obs(&self, frame_time: DateTime<Utc>) -> impl Iterator<Item = &SurfaceOb> {
+        self.by_station
+            .keys()
+            .filter_map(move |station| self.ob_at(station, frame_time))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +218,41 @@ mod tests {
         assert_eq!(ob.temp_c, Some(25.0));
         assert_eq!(ob.wind_gust_kt, Some(13.0));
         assert!(ob.completeness >= 4);
+    }
+
+    #[test]
+    fn pool_serves_time_matched_obs() {
+        use chrono::TimeZone;
+        let t0 = Utc.with_ymd_and_hms(2100, 1, 1, 12, 0, 0).unwrap();
+        let make = |minutes: i64, temp: f32| SurfaceOb {
+            station_id: "KTST".into(),
+            time_utc: Some(t0 + chrono::Duration::minutes(minutes)),
+            lat: 39.0,
+            lon: -94.0,
+            temp_c: Some(temp),
+            dewpoint_c: None,
+            wind_dir_deg: None,
+            wind_speed_kt: None,
+            wind_gust_kt: None,
+            altim_in_hg: None,
+            completeness: 1,
+        };
+        let mut pool = ObPool::new();
+        // NOTE: merge prunes vs wall clock; use raw insert semantics by
+        // checking ob_at directly on a hand-built pool.
+        pool.by_station.insert(
+            "KTST".into(),
+            vec![make(0, 10.0), make(30, 12.0), make(60, 14.0)],
+        );
+        // Frame at +35 min -> the +30 ob (newest at-or-before).
+        let ob = pool
+            .ob_at("KTST", t0 + chrono::Duration::minutes(35))
+            .unwrap();
+        assert_eq!(ob.temp_c, Some(12.0));
+        // Frame 4 hours later -> outside the window, hidden.
+        assert!(
+            pool.ob_at("KTST", t0 + chrono::Duration::hours(4))
+                .is_none()
+        );
     }
 }

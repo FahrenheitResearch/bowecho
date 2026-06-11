@@ -29,6 +29,7 @@ mod guide;
 mod ingest_worker;
 mod model_data;
 mod model_layer;
+mod obs;
 mod placefiles;
 mod sat_worker;
 mod skewt_native;
@@ -514,6 +515,15 @@ struct ViewerApp {
     /// A sounding was requested to set the hail environment (H0/H-20):
     /// extract the levels when it arrives and DON'T open the window.
     hail_env_pending: bool,
+    /// Surface observations layer (METAR station plots).
+    obs_enabled: bool,
+    /// Obs-adjusted soundings: replace the model surface with the nearest
+    /// CLOSE (<=30 km) and FRESH (<=60 min) observation before the parcel
+    /// math — SB CAPE from the real surface.
+    obs_adjust_soundings: bool,
+    surface_obs: obs::ObPool,
+    obs_fetched_at: Option<Instant>,
+    obs_rx: Option<mpsc::Receiver<std::result::Result<Vec<obs::SurfaceOb>, String>>>,
     /// Inspector card customization: which sections render.
     inspector_show_raw_vel: bool,
     inspector_show_range_az: bool,
@@ -2418,6 +2428,11 @@ impl ViewerApp {
             download_cycle: 0,
             download_hours: "0-3".to_owned(),
             download_profile: 0,
+            obs_enabled: false,
+            obs_adjust_soundings: false,
+            surface_obs: obs::ObPool::new(),
+            obs_fetched_at: None,
+            obs_rx: None,
             last_sounding_request: None,
             hail_env_pending: false,
             inspector_show_raw_vel: true,
@@ -5843,6 +5858,7 @@ impl eframe::App for ViewerApp {
         self.poll_model_layer(&ctx);
         self.poll_sat_layer(&ctx);
         self.poll_model_ingest(&ctx);
+        self.poll_surface_obs(&ctx);
         self.poll_native_sounding(&ctx);
         if self.tile_layer.borrow_mut().poll(&ctx) {
             ctx.request_repaint();
@@ -6440,6 +6456,39 @@ impl ViewerApp {
                     self.sat_layer_texture = None;
                     ctx.request_repaint();
                 }
+                ui.horizontal(|ui| {
+                    if ui
+                        .checkbox(&mut self.obs_enabled, "Surface obs")
+                        .on_hover_text(
+                            "METAR station plots: temperature/dewpoint (°F), wind barbs, gusts — every reporting station, refreshed ~5 min",
+                        )
+                        .changed()
+                    {
+                        ctx.request_repaint();
+                    }
+                    if self.obs_enabled
+                        && ui
+                            .checkbox(&mut self.obs_adjust_soundings, "adj snd")
+                            .on_hover_text(
+                                "Obs-adjusted soundings: the skew-T's surface T/Td/wind come from the nearest station (within 30 km, fresher than 60 min) instead of the model — parcels recompute from the REAL surface. The title shows which station adjusted it.",
+                            )
+                            .changed()
+                    {
+                        ctx.request_repaint();
+                    }
+                    if self.obs_enabled {
+                        if let Some(at) = self.obs_fetched_at {
+                            ui.weak(format!(
+                                "{} stn · {}m ago",
+                                self.surface_obs.station_count,
+                                at.elapsed().as_secs() / 60
+                            ));
+                        }
+                        if self.obs_rx.is_some() {
+                            ui.spinner();
+                        }
+                    }
+                });
                 let mut remove_layer: Option<u64> = None;
                 let mut move_layer: Option<(u64, i64)> = None;
                 let mut step_hour: i64 = 0;
@@ -8031,6 +8080,7 @@ impl ViewerApp {
         self.draw_hazard_overlays(painter, rect, &self.selected_product.clone());
         self.draw_rotation_markers(painter, rect);
         self.draw_storm_tracks(painter, rect);
+        self.draw_surface_obs(painter, rect);
         self.draw_vrot_tool(painter, rect);
         self.draw_placefiles(painter, rect);
         self.basemap_ms = Some(underlay_ms + overlay_start.elapsed().as_secs_f32() * 1000.0);
@@ -9170,9 +9220,28 @@ impl ViewerApp {
             let (sender, receiver) = mpsc::channel();
             self.native_sounding_rx = Some(receiver);
             let ctx_clone = ctx.clone();
+            // Obs adjustment (close + fresh gates) resolved BEFORE the
+            // spawn so the thread carries plain data.
+            let adjust_ob = (self.obs_adjust_soundings && self.obs_enabled)
+                .then(|| {
+                    let (lat, lon) = (data.lat?, data.lon?);
+                    let now = Utc::now();
+                    self.surface_obs
+                        .frame_obs(now)
+                        .filter(|ob| ob.temp_c.is_some() && ob.dewpoint_c.is_some())
+                        .filter(|ob| {
+                            ob.time_utc
+                                .map(|t| (now - t).num_minutes() <= 60)
+                                .unwrap_or(false)
+                        })
+                        .map(|ob| (haversine_km(lat, lon, ob.lat, ob.lon), ob.clone()))
+                        .filter(|(d, _)| *d <= 30.0)
+                        .min_by(|a, b| a.0.total_cmp(&b.0))
+                })
+                .flatten();
             thread::spawn(move || {
                 let compute_start = Instant::now();
-                let result = rw_ui::skewt::build_native_sounding(&data)
+                let result = build_native_sounding_adjusted(&data, adjust_ob)
                     .map(|native| (native, compute_start.elapsed().as_secs_f32() * 1000.0));
                 let _ = sender.send(result);
                 ctx_clone.request_repaint();
@@ -9656,6 +9725,46 @@ impl ViewerApp {
                         self.sat_panel.apply_note(format!("frame load: {message}"));
                     }
                 },
+            }
+        }
+    }
+
+    /// Surface-obs refresh: fetch the METAR cache on enable and every
+    /// 5 minutes after (background thread; one in flight).
+    fn poll_surface_obs(&mut self, ctx: &egui::Context) {
+        if self.obs_enabled
+            && self.obs_rx.is_none()
+            && self
+                .obs_fetched_at
+                .map(|at| at.elapsed() > Duration::from_secs(300))
+                .unwrap_or(true)
+        {
+            let (sender, receiver) = mpsc::channel();
+            self.obs_rx = Some(receiver);
+            let ctx_clone = ctx.clone();
+            thread::spawn(move || {
+                let result = obs::fetch_surface_obs();
+                let _ = sender.send(result);
+                ctx_clone.request_repaint();
+            });
+        }
+        if let Some(receiver) = &self.obs_rx {
+            match receiver.try_recv() {
+                Ok(Ok(observations)) => {
+                    self.obs_rx = None;
+                    self.obs_fetched_at = Some(Instant::now());
+                    self.surface_obs.merge(observations);
+                    self.status =
+                        format!("Surface obs: {} stations", self.surface_obs.station_count);
+                    ctx.request_repaint();
+                }
+                Ok(Err(err)) => {
+                    self.obs_rx = None;
+                    self.obs_fetched_at = Some(Instant::now());
+                    self.status = format!("Surface obs fetch failed: {err}");
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.obs_rx = None,
             }
         }
     }
@@ -10178,6 +10287,87 @@ impl ViewerApp {
                     image_rect,
                     egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                     egui::Color32::from_white_alpha(opacity),
+                );
+            }
+        }
+    }
+
+    /// Surface-obs station plots: GR2A-style T/Td (°F) + wind barb +
+    /// gust, screen-grid decluttered (fuller reports win the cell), ids
+    /// at street zoom. Pure vector — no raster, no worker.
+    fn draw_surface_obs(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if !self.obs_enabled || self.surface_obs.is_empty() {
+            return;
+        }
+        // TIME SYNC: obs scrub with the radar loop — each frame draws the
+        // reports valid at ITS time, not "latest".
+        let frame_time = self
+            .volume
+            .as_ref()
+            .map(|volume| volume.volume_time.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+        let cell = 88.0_f32;
+        let cols = (rect.width() / cell).ceil() as i32 + 1;
+        let mut taken: std::collections::HashMap<i32, u8> = std::collections::HashMap::new();
+        let show_ids = self.map_scale > 28.0;
+        let font_v = egui::FontId::proportional(11.0);
+        let font_id = egui::FontId::proportional(9.0);
+        // Fuller reports first so they win declutter cells.
+        let mut order: Vec<&obs::SurfaceOb> = self.surface_obs.frame_obs(frame_time).collect();
+        order.sort_by(|a, b| b.completeness.cmp(&a.completeness));
+        for ob in order {
+            let pos = self.lon_lat_to_screen(rect, ob.lon, ob.lat);
+            if !rect.expand(-10.0).contains(pos) {
+                continue;
+            }
+            let key =
+                ((pos.y - rect.top()) / cell) as i32 * cols + ((pos.x - rect.left()) / cell) as i32;
+            let slot = taken.entry(key).or_insert(0);
+            if *slot >= 1 {
+                continue;
+            }
+            *slot += 1;
+            // Station dot.
+            painter.circle_filled(pos, 2.0, egui::Color32::from_rgb(210, 214, 220));
+            // Wind barb (meteorological: barb points INTO the wind).
+            if let (Some(dir), Some(spd)) = (ob.wind_dir_deg, ob.wind_speed_kt) {
+                draw_station_barb(painter, pos, dir, spd);
+            }
+            // T upper-left (red), Td lower-left (green), °F.
+            if let Some(t) = ob.temp_c {
+                painter.text(
+                    pos + egui::vec2(-6.0, -12.0),
+                    egui::Align2::RIGHT_CENTER,
+                    format!("{:.0}", t * 9.0 / 5.0 + 32.0),
+                    font_v.clone(),
+                    egui::Color32::from_rgb(255, 120, 110),
+                );
+            }
+            if let Some(td) = ob.dewpoint_c {
+                painter.text(
+                    pos + egui::vec2(-6.0, 12.0),
+                    egui::Align2::RIGHT_CENTER,
+                    format!("{:.0}", td * 9.0 / 5.0 + 32.0),
+                    font_v.clone(),
+                    egui::Color32::from_rgb(120, 235, 130),
+                );
+            }
+            if let Some(gust) = ob.wind_gust_kt {
+                painter.text(
+                    pos + egui::vec2(8.0, 12.0),
+                    egui::Align2::LEFT_CENTER,
+                    format!("G{gust:.0}"),
+                    font_id.clone(),
+                    egui::Color32::from_rgb(255, 196, 110),
+                );
+            }
+            if show_ids {
+                painter.text(
+                    pos + egui::vec2(0.0, 24.0),
+                    egui::Align2::CENTER_CENTER,
+                    &ob.station_id,
+                    font_id.clone(),
+                    egui::Color32::from_rgba_unmultiplied(190, 196, 204, 180),
                 );
             }
         }
@@ -10731,6 +10921,48 @@ impl ViewerApp {
                     readout.height_above_radar_m,
                     readout.height_above_radar_m * 0.003_280_84
                 ));
+            }
+        }
+        // Nearest surface ob under the cursor (within ~28 px) — the full
+        // decoded report, with age.
+        if self.obs_enabled && !self.surface_obs.is_empty() {
+            let frame_time = self
+                .volume
+                .as_ref()
+                .map(|volume| volume.volume_time.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now);
+            let mut best: Option<(f32, &obs::SurfaceOb)> = None;
+            for ob in self.surface_obs.frame_obs(frame_time) {
+                let pos = self.lon_lat_to_screen(rect, ob.lon, ob.lat);
+                let d = pos.distance(anchor);
+                if d < 28.0 && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                    best = Some((d, ob));
+                }
+            }
+            if let Some((_, ob)) = best {
+                let mut line = ob.station_id.clone();
+                if let (Some(t), Some(td)) = (ob.temp_c, ob.dewpoint_c) {
+                    line.push_str(&format!(
+                        " {:.0}/{:.0}°F",
+                        t * 9.0 / 5.0 + 32.0,
+                        td * 9.0 / 5.0 + 32.0
+                    ));
+                }
+                if let (Some(dir), Some(spd)) = (ob.wind_dir_deg, ob.wind_speed_kt) {
+                    line.push_str(&format!(" {dir:03.0}°/{spd:.0}"));
+                    if let Some(gust) = ob.wind_gust_kt {
+                        line.push_str(&format!("G{gust:.0}"));
+                    }
+                    line.push_str("kt");
+                }
+                if let Some(altim) = ob.altim_in_hg {
+                    line.push_str(&format!(" {altim:.2}\""));
+                }
+                if let Some(time) = ob.time_utc {
+                    let age_min = (Utc::now() - time).num_minutes();
+                    line.push_str(&format!(" · {age_min}m"));
+                }
+                lines.push(line);
             }
         }
         // Model value under the cursor (decoupled LUT — works with or
@@ -13997,6 +14229,97 @@ fn sync_run_pickers(download: &mut rw_ui::DownloadPanel, spec: &rw_ui::DownloadS
         }
         _ => download.set_hours_hint("no supported hours for this cycle".to_string()),
     }
+}
+
+/// Station-plot wind barb (meteorological convention: shaft extends
+/// upwind; 50-kt flags, 10-kt full barbs, 5-kt halves, calm = ring).
+fn draw_station_barb(painter: &egui::Painter, tip: egui::Pos2, dir_deg: f32, spd_kt: f32) {
+    let color = egui::Color32::from_rgb(205, 212, 222);
+    let stroke = egui::Stroke::new(1.2, color);
+    if spd_kt < 2.5 {
+        painter.circle_stroke(tip, 4.0, stroke);
+        return;
+    }
+    let dir = dir_deg.to_radians();
+    // Screen y-down; wind FROM dir: upwind unit vector points toward dir.
+    let tail = egui::vec2(-dir.sin(), dir.cos());
+    let perp = egui::vec2(-tail.y, tail.x);
+    let shaft = 22.0;
+    let spacing = 3.6;
+    let full_h = 8.5;
+    let full_w = 5.2;
+    painter.line_segment([tip, tip + tail * shaft], stroke);
+    let mut remaining = ((spd_kt + 2.5) / 5.0).floor() * 5.0;
+    let mut offset = shaft;
+    let mut drew_any = false;
+    while remaining >= 50.0 {
+        let base = tip + tail * offset;
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                base,
+                base + perp * full_h - tail * (full_w * 0.5),
+                base - tail * full_w,
+            ],
+            color,
+            stroke,
+        ));
+        offset -= full_w + spacing;
+        remaining -= 50.0;
+        drew_any = true;
+    }
+    while remaining >= 10.0 {
+        let base = tip + tail * offset;
+        painter.line_segment([base, base + perp * full_h + tail * (full_w * 0.5)], stroke);
+        offset -= spacing;
+        remaining -= 10.0;
+        drew_any = true;
+    }
+    if remaining >= 5.0 {
+        if !drew_any {
+            offset -= 1.5 * spacing;
+        }
+        let base = tip + tail * offset;
+        painter.line_segment(
+            [base, base + perp * (full_h * 0.5) + tail * (full_w * 0.25)],
+            stroke,
+        );
+    }
+}
+
+/// Build the native sounding, optionally swapping the model surface for
+/// a nearby fresh observation (T/Td clamped sane, wind kt -> m/s) before
+/// the sharprs parcel math runs — "obs-adjusted sounding". The title
+/// metadata records the adjusting station + distance.
+fn build_native_sounding_adjusted(
+    data: &rw_ui::SoundingData,
+    adjust: Option<(f32, obs::SurfaceOb)>,
+) -> std::result::Result<rustwx_sounding::NativeSounding, String> {
+    let mut column = rw_ui::skewt::build_sounding_column(data)?;
+    let mut tag = None;
+    if let Some((distance_km, ob)) = adjust
+        && let (Some(t), Some(td)) = (ob.temp_c, ob.dewpoint_c)
+        && !column.temperature_c.is_empty()
+    {
+        column.temperature_c[0] = t as f64;
+        column.dewpoint_c[0] = (td.min(t)) as f64;
+        if let (Some(dir), Some(spd)) = (ob.wind_dir_deg, ob.wind_speed_kt) {
+            let speed_ms = spd as f64 * 0.514_444;
+            let dir_rad = (dir as f64).to_radians();
+            column.u_ms[0] = -speed_ms * dir_rad.sin();
+            column.v_ms[0] = -speed_ms * dir_rad.cos();
+        }
+        tag = Some(format!("{} obs-adj {:.0}km", ob.station_id, distance_km));
+    }
+    let mut native =
+        rustwx_sounding::NativeSounding::from_column(&column).map_err(|err| err.to_string())?;
+    if let Some(tag) = tag {
+        if native.metadata.station_id.is_empty() {
+            native.metadata.station_id = tag;
+        } else {
+            native.metadata.station_id = format!("{} · {tag}", native.metadata.station_id);
+        }
+    }
+    Ok(native)
 }
 
 fn normalize_lon(longitude_deg: f32) -> f32 {
@@ -18746,6 +19069,11 @@ mod tests {
             download_cycle: 0,
             download_hours: "0-3".to_owned(),
             download_profile: 0,
+            obs_enabled: false,
+            obs_adjust_soundings: false,
+            surface_obs: obs::ObPool::new(),
+            obs_fetched_at: None,
+            obs_rx: None,
             last_sounding_request: None,
             hail_env_pending: false,
             inspector_show_raw_vel: true,
