@@ -452,6 +452,11 @@ struct ViewerApp {
     /// list drive this pane: the main pane edits the whole bunch, an extra
     /// pane edits itself independently.
     active_pane: usize,
+    /// Layout change requested mid-frame — applied at the START of the
+    /// next frame. Dropping pane TextureHandles in the same frame that
+    /// already painted them aborts on Metal (freed-texture validation);
+    /// macOS field crash on 1↔4 pane switches.
+    pending_grid_layout: Option<PanelLayout>,
     // Frame-cost caches (RefCell: draw fns take &self on the UI thread).
     basemap_shape_cache: std::cell::RefCell<ShapeCache<Vec<egui::Shape>>>,
     hazard_shape_cache: std::cell::RefCell<ShapeCache<HazardOverlayShapes>>,
@@ -2361,6 +2366,7 @@ impl ViewerApp {
             grid_layout: restored_grid_layout,
             extra_panes: Vec::new(),
             active_pane: 0,
+            pending_grid_layout: None,
             basemap_shape_cache: std::cell::RefCell::new(ShapeCache::new(16)),
             hazard_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
             cross_section_armed: false,
@@ -5803,6 +5809,11 @@ impl eframe::App for ViewerApp {
         self.poll_placefiles(&ctx);
         self.poll_archive_listing(&ctx);
         self.poll_spc_reports(&ctx);
+        // Apply deferred layout changes FIRST — before anything paints.
+        if let Some(layout) = self.pending_grid_layout.take() {
+            self.grid_layout = layout;
+            self.sync_extra_panes();
+        }
         // Frame-time EMA (perf strip).
         let dt_ms = ctx.input(|i| i.unstable_dt) * 1000.0;
         self.frame_ms_avg = if self.frame_ms_avg == 0.0 {
@@ -6143,8 +6154,10 @@ impl ViewerApp {
                     .clicked()
                     && self.grid_layout != layout
                 {
-                    self.grid_layout = layout;
-                    self.sync_extra_panes();
+                    // Defer: textures from the outgoing layout may already
+                    // be in this frame's paint list (Metal aborts on
+                    // freed-texture references).
+                    self.pending_grid_layout = Some(layout);
                     self.app_settings.grid_pane_count = layout.panel_count();
                     let _ = self.app_settings.save();
                     ctx.request_repaint();
@@ -18392,6 +18405,7 @@ mod tests {
             grid_layout: PanelLayout::One,
             extra_panes: Vec::new(),
             active_pane: 0,
+            pending_grid_layout: None,
             basemap_shape_cache: std::cell::RefCell::new(ShapeCache::new(16)),
             hazard_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
             cross_section_armed: false,
