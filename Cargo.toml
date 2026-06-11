@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FahrenheitResearch/bowecho"
@@ -31,3 +31,9 @@ strip = true
 # panic = "abort" is intentionally NOT set: app_ui isolates worker panics
 # with catch_unwind / thread joins, and abort would turn those contained
 # failures into full app crashes.
+
+# rw-sat's hdf5-reader must be the VENDORED tree (their fixes, incl. the
+# GOES-19 parse), not crates.io 0.3 — [patch] only applies from the
+# workspace root, so every consumer of their crates must repeat it.
+[patch.crates-io]
+hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "e749c2a2b0d3bc0872ba66c904f7ff5726421fa6" }

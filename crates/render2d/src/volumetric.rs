@@ -193,6 +193,15 @@ fn reflectivity_columns(volume: &RadarVolume) -> Vec<CutColumn<'_>> {
 }
 
 /// Build an F32 output grid on the base tilt's geometry (NaN = no data).
+/// Public alias for sibling modules building products on a base geometry.
+pub(crate) fn f32_grid_like_pub(
+    base: &MomentGrid,
+    moment: MomentType,
+    values: Vec<f32>,
+) -> MomentGrid {
+    f32_grid_like(base, moment, values)
+}
+
 fn f32_grid_like(base: &MomentGrid, moment: MomentType, values: Vec<f32>) -> MomentGrid {
     MomentGrid {
         moment,
@@ -348,6 +357,181 @@ pub fn vil_grid(volume: &RadarVolume) -> Option<MomentGrid> {
 /// `freezing_level_m` / `minus20c_level_m` are heights above the RADAR (set
 /// them from a sounding for best results; mid-latitude warm-season defaults
 /// are roughly 3200 m / 6400 m).
+/// MESH calibration: which SHI->size fit to apply.
+///
+/// References (constants adversarially verified against the corrigendum and
+/// the pyhail reference implementation — see docs/hail-wind-algo-spec.md):
+/// - Witt et al. 1998, Wea. Forecasting 13, 286-303
+///   (doi:10.1175/1520-0434(1998)013<0286:AEHDAF>2.0.CO;2): MESH = 2.54*SHI^0.5.
+///   Still what operational MRMS ships (Smith et al. 2016, BAMS 97).
+/// - Murillo & Homeyer 2019, J. Appl. Meteor. Climatol. 58, 947-970
+///   (doi:10.1175/JAMC-D-18-0247.1) refit on ~5,954 reports — WITH THE 2021
+///   CORRIGENDUM COEFFICIENTS (doi:10.1175/JAMC-D-20-0271.1; the 2019 paper
+///   text printed wrong values): P75 = 15.096*SHI^0.206, P95 = 22.157*SHI^0.212.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MeshCalibration {
+    Witt1998,
+    MurilloHomeyer2019P75,
+    MurilloHomeyer2019P95,
+}
+
+impl MeshCalibration {
+    #[inline]
+    pub fn mesh_mm(self, shi: f64) -> f64 {
+        match self {
+            Self::Witt1998 => 2.54 * shi.sqrt(),
+            Self::MurilloHomeyer2019P75 => 15.096 * shi.powf(0.206),
+            Self::MurilloHomeyer2019P95 => 22.157 * shi.powf(0.212),
+        }
+    }
+}
+
+/// SHI + MESH + POSH in one column walk (Witt et al. 1998 Hail Detection
+/// Algorithm). `mehs_grid` remains as the Witt-calibrated MESH wrapper.
+pub struct HailGrids {
+    /// Severe Hail Index, J m^-1 s^-1.
+    pub shi: MomentGrid,
+    /// Maximum Estimated Size of Hail, mm (per `MeshCalibration`).
+    pub mesh_mm: MomentGrid,
+    /// Probability of Severe Hail, percent (continuous 0-100; Witt's
+    /// warning threshold WT = max(57.5*H0_km - 121, 20), POSH =
+    /// 29*ln(SHI/WT) + 50 — SHI == WT gives exactly 50%).
+    pub posh_pct: MomentGrid,
+}
+
+pub fn hail_grids(
+    volume: &RadarVolume,
+    freezing_level_m: f32,
+    minus20c_level_m: f32,
+    calibration: MeshCalibration,
+) -> Option<HailGrids> {
+    let (base_idx, base_grid) = base_reflectivity_cut(volume)?;
+    let base = CutColumn::new(volume, base_idx, base_grid)?;
+    let cols = reflectivity_columns(volume);
+    let rows = base_grid.radial_indices.len();
+    let gates = base_grid.gate_range.gate_count;
+    let mut shi_out = vec![f32::NAN; rows * gates];
+    let mut mesh_out = vec![f32::NAN; rows * gates];
+    let mut posh_out = vec![f32::NAN; rows * gates];
+    let row_az = base.row_azimuths(rows);
+    let h0 = freezing_level_m.max(0.0) as f64;
+    let hm20 = (minus20c_level_m.max(freezing_level_m + 1.0)) as f64;
+    // POSH warning threshold (Witt 1998; floor of 20 per the operational
+    // WSR-88D documentation).
+    let wt_thresh = (57.5 * h0 / 1000.0 - 121.0).max(20.0);
+    let ke_flux = |dbz: f64| -> f64 {
+        let w = ((dbz - 40.0) / 10.0).clamp(0.0, 1.0);
+        if w <= 0.0 {
+            0.0
+        } else {
+            5.0e-6 * 10f64.powf(0.084 * dbz) * w
+        }
+    };
+    let wt = |h: f64| ((h - h0) / (hm20 - h0)).clamp(0.0, 1.0);
+    shi_out
+        .par_chunks_mut(gates)
+        .zip(mesh_out.par_chunks_mut(gates))
+        .zip(posh_out.par_chunks_mut(gates))
+        .enumerate()
+        .for_each(|(row, ((shi_row, mesh_row), posh_row))| {
+            let az = row_az[row];
+            if !az.is_finite() {
+                return;
+            }
+            for gate in 0..gates {
+                let s = base.ground_range_m[gate];
+                let prof = column_profile(&cols, az, s);
+                if prof.len() < 2 {
+                    continue;
+                }
+                let mut shi = 0.0f64;
+                for w in prof.windows(2) {
+                    let (ha, za) = w[0];
+                    let (hb, zb) = w[1];
+                    let dh = (hb - ha).max(0.0);
+                    if hb <= h0 || dh <= 0.0 {
+                        continue;
+                    }
+                    let mid_h = 0.5 * (ha + hb);
+                    let mid_e = 0.5 * (ke_flux(za as f64) + ke_flux(zb as f64));
+                    shi += wt(mid_h) * mid_e * dh;
+                }
+                shi *= 0.1;
+                if shi > 1.0 {
+                    shi_row[gate] = shi as f32;
+                    mesh_row[gate] = calibration.mesh_mm(shi) as f32;
+                    let posh = (29.0 * (shi / wt_thresh).ln() + 50.0).clamp(0.0, 100.0);
+                    if posh > 0.0 {
+                        posh_row[gate] = posh as f32;
+                    }
+                }
+            }
+        });
+    Some(HailGrids {
+        shi: f32_grid_like(base_grid, MomentType::Reflectivity, shi_out),
+        mesh_mm: f32_grid_like(base_grid, MomentType::Reflectivity, mesh_out),
+        posh_pct: f32_grid_like(base_grid, MomentType::Reflectivity, posh_out),
+    })
+}
+
+/// POH — Probability of Hail (any size): the Waldvogel, Federer & Grimm
+/// (1979, J. Appl. Meteor. 18, 1521-1525) hailpad-validated curve on the
+/// height of the 45 dBZ echo top above the melting level. Linear
+/// interpolation between the published table rows.
+pub fn poh_grid(volume: &RadarVolume, freezing_level_m: f32) -> Option<MomentGrid> {
+    const TABLE: [(f64, f64); 11] = [
+        (1.65, 0.0),
+        (1.80, 10.0),
+        (1.97, 20.0),
+        (2.17, 30.0),
+        (2.40, 40.0),
+        (2.70, 50.0),
+        (3.07, 60.0),
+        (3.55, 70.0),
+        (4.20, 80.0),
+        (5.00, 90.0),
+        (5.80, 100.0),
+    ];
+    let et45 = echo_top_grid(volume, 45.0)?;
+    let rows = et45.radial_count();
+    let gates = et45.gate_range.gate_count;
+    let mut out = vec![f32::NAN; rows * gates];
+    let h0_km = freezing_level_m.max(0.0) as f64 / 1000.0;
+    for row in 0..rows {
+        for gate in 0..gates {
+            let cell = &mut out[row * gates + gate];
+            let Some(top_m) = et45.scaled_value(row, gate) else {
+                continue;
+            };
+            if !top_m.is_finite() {
+                continue;
+            }
+            let delta_km = top_m as f64 / 1000.0 - h0_km;
+            if delta_km <= TABLE[0].0 {
+                continue;
+            }
+            let poh = if delta_km >= TABLE[10].0 {
+                100.0
+            } else {
+                let mut value = 0.0;
+                for pair in TABLE.windows(2) {
+                    let (d0, p0) = pair[0];
+                    let (d1, p1) = pair[1];
+                    if delta_km >= d0 && delta_km <= d1 {
+                        value = p0 + (p1 - p0) * (delta_km - d0) / (d1 - d0);
+                        break;
+                    }
+                }
+                value
+            };
+            if poh > 0.0 {
+                *cell = poh as f32;
+            }
+        }
+    }
+    Some(f32_grid_like(&et45, MomentType::Reflectivity, out))
+}
+
 pub fn mehs_grid(
     volume: &RadarVolume,
     freezing_level_m: f32,

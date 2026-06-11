@@ -35,6 +35,10 @@ pub struct AppSettings {
     /// GateFilter).
     #[serde(default)]
     pub gate_filter_decidbz: Option<i16>,
+    /// Model store retention: keep the newest N runs (0 = unlimited).
+    /// Default 2 so lightweight users never accumulate SSD bloat.
+    #[serde(default = "default_model_keep_runs")]
+    pub model_keep_runs: u8,
     /// Product hotkeys: number-row key ("0"-"9") -> product label (e.g.
     /// "REF", "VEL", "SRV", "RHO", "ZDR", "SW", "CREF", "ET", "VIL", "VILD",
     /// "PHI", "KDP", "AzShr", "Div"). Edit in config.json to customize.
@@ -68,6 +72,10 @@ pub fn default_product_hotkeys() -> BTreeMap<String, String> {
     .collect()
 }
 
+fn default_model_keep_runs() -> u8 {
+    2
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -81,6 +89,7 @@ impl Default for AppSettings {
             basemap_style: default_basemap_style(),
             bold_labels: default_bold_labels(),
             gate_filter_decidbz: None,
+            model_keep_runs: default_model_keep_runs(),
             product_hotkeys: default_product_hotkeys(),
         }
     }

@@ -16,6 +16,7 @@ mod shear;
 mod smooth;
 mod tracking;
 mod volumetric;
+pub mod wind;
 pub use cascade::{dealias_velocity_grid_cascade, fit_range_band_reference};
 pub use cells::{StormCell, identify_storm_cells};
 pub use detect::{
@@ -32,10 +33,12 @@ pub use smooth::smooth_moment_grid;
 use thiserror::Error;
 pub use tracking::{StormTrack, StormTracker, TIME_GATE_S};
 pub use volumetric::{
-    CrossSection, ECHO_TOP_THRESHOLD_DBZ, VolumeDealiasCache, composite_reflectivity_grid,
-    echo_top_grid, mehs_grid, reflectivity_cross_section, velocity_cross_section,
-    velocity_cross_section_cached, vil_density_grid, vil_grid,
+    CrossSection, ECHO_TOP_THRESHOLD_DBZ, HailGrids, MeshCalibration, VolumeDealiasCache,
+    composite_reflectivity_grid, echo_top_grid, hail_grids, mehs_grid, poh_grid,
+    reflectivity_cross_section, velocity_cross_section, velocity_cross_section_cached,
+    vil_density_grid, vil_grid,
 };
+pub use wind::{gust_proxy_grid, marc_grid};
 
 const AZIMUTH_BINS: usize = 3600;
 const AZIMUTH_BIN_WIDTH_DEG: f32 = 0.1;

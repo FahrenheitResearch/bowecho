@@ -15,16 +15,23 @@ use render2d::{
     ViewportMomentCache, ViewportRasterOptions, ViewportSampleCache, VolumeDealiasCache,
     apply_reflectivity_gate_filter, azimuthal_shear_grid, color_family_for_moment,
     composite_reflectivity_grid, dealias_velocity_grid, dealias_velocity_grid_cascade,
-    detect_rotation_sites, echo_top_grid, identify_storm_cells, mehs_grid, radial_divergence_grid,
-    reflectivity_cross_section, smooth_moment_grid, storm_relative_velocity_mps,
-    velocity_cross_section_cached, viewport_rgba_buffer_len,
-    viewport_sample_cache_storage_upper_bound, vil_density_grid, vil_grid,
+    detect_rotation_sites, echo_top_grid, gust_proxy_grid, hail_grids, identify_storm_cells,
+    marc_grid, mehs_grid, poh_grid, radial_divergence_grid, reflectivity_cross_section,
+    smooth_moment_grid, storm_relative_velocity_mps, velocity_cross_section_cached,
+    viewport_rgba_buffer_len, viewport_sample_cache_storage_upper_bound, vil_density_grid,
+    vil_grid,
 };
 use serde::Deserialize;
 
 mod basemap_data;
 mod basemap_towns;
+mod ingest_worker;
+mod model_data;
+mod model_layer;
 mod placefiles;
+mod sat_worker;
+mod skewt_native;
+mod sounding_panels;
 mod tiles;
 
 const MIN_DISPLAYABLE_RADIALS: usize = 180;
@@ -431,6 +438,80 @@ struct ViewerApp {
     /// One-shot: after an event click, auto-load the volume nearest this
     /// time once the archive listing lands.
     archive_pending_event: Option<DateTime<Utc>>,
+    /// Production model download: rw-ui DownloadPanel + the ported
+    /// IngestWorker harness (live estimates, per-hour stage chips, probe,
+    /// cancel — the full rusty-weather download workflow).
+    ingest: Option<ingest_worker::IngestWorker>,
+    download_panel: rw_ui::DownloadPanel,
+    /// GOES satellite: rw-sat follow engine + panels (worker spawned on
+    /// first open; store shares rusty-weather's rolling sat store).
+    sat: Option<sat_worker::SatWorker>,
+    sat_panel: rw_ui::SatellitePanel,
+    sat_player: rw_ui::SatPlayerPanel,
+    show_satellite: bool,
+    /// Model-data dock (rusty-weather rw-ui panels), created on first open.
+    model_dock: Option<model_data::ModelDataDock>,
+    model_dock_open: bool,
+    /// GOES satellite frame as a map layer (under everything weather).
+    sat_layer: Option<SatMapLayer>,
+    sat_layer_build_rx: Option<mpsc::Receiver<Option<SatMapLayer>>>,
+    sat_layer_texture: Option<(egui::TextureHandle, u64, ModelLayerView)>,
+    sat_layer_render_rx: Option<mpsc::Receiver<ModelLayerRender>>,
+    sat_layer_generation: u64,
+    /// Last frame shown in the sat player (the "Show on map" source).
+    sat_last_frame: Option<(rw_ui::SatRunKey, u16)>,
+    /// Model field rendered as a radar-map layer (under the radar).
+    model_layer: Option<model_layer::ModelMapLayer>,
+    model_layer_build_rx: Option<mpsc::Receiver<Option<model_layer::ModelMapLayer>>>,
+    /// Rendered layer raster: (texture, generation, view key).
+    model_layer_texture: Option<(egui::TextureHandle, u64, ModelLayerView)>,
+    model_layer_render_rx: Option<mpsc::Receiver<ModelLayerRender>>,
+    model_layer_generation: u64,
+    /// Primary radar layer opacity (draw-time tint; no re-render).
+    radar_opacity: f32,
+    /// Background HRRR ingest (rw-ingest library) in flight.
+    model_ingest_rx: Option<mpsc::Receiver<std::result::Result<String, String>>>,
+    /// Live per-stage progress lines from the ingest worker.
+    model_ingest_progress_rx: Option<mpsc::Receiver<String>>,
+    /// Cooperative cancel — checked at every ingest stage boundary.
+    model_ingest_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Grid index of the last sounding request (dedupe for follow mode).
+    last_sounding_request: Option<usize>,
+    /// A sounding was requested to set the hail environment (H0/H-20):
+    /// extract the levels when it arrives and DON'T open the window.
+    hail_env_pending: bool,
+    /// Inspector card customization: which sections render.
+    inspector_show_raw_vel: bool,
+    inspector_show_range_az: bool,
+    inspector_show_beam: bool,
+    inspector_show_model: bool,
+    /// Inverse geolocation for the latest model grid, INDEPENDENT of any
+    /// map layer — powers Alt+click soundings and the model hover readout
+    /// without requiring "Show on radar map" first. Keyed by grid hash.
+    model_lut: Option<(String, Arc<model_layer::InverseLut>)>,
+    model_lut_rx: Option<mpsc::Receiver<Option<ModelLutEntry>>>,
+    /// Master switch: model data entirely off (no dock, no LUT, no hover
+    /// line, no Alt-soundings) for users who want a pure radar app.
+    model_enabled: bool,
+    /// Model store retention (newest N runs; 0 = unlimited).
+    model_keep_runs: u8,
+    /// Flexible model download window (any init / specific hours).
+    model_download_open: bool,
+    download_date: String,
+    download_cycle: u8,
+    download_hours: String,
+    /// 0 = sounding, 1 = full, 2 = view.
+    download_profile: u8,
+    /// Perf meters for the model/sounding subsystems + frame time.
+    model_layer_render_ms: Option<f32>,
+    sounding_compute_ms: Option<f32>,
+    frame_ms_avg: f32,
+    /// Native skew-T: sharprs-verified compute (background) + window.
+    native_sounding: Option<Arc<rustwx_sounding::NativeSounding>>,
+    native_sounding_rx: Option<NativeSoundingReceiver>,
+    /// Which SoundingData the current/in-flight native build came from.
+    native_sounding_src: Option<Arc<rw_ui::SoundingData>>,
+    native_skewt_open: bool,
     /// Volumes fetched per archive loop load.
     archive_frame_count: usize,
     /// Indices into archive_volumes covered by the last loop load
@@ -482,6 +563,10 @@ struct ViewerApp {
     selected_hazard_index: Option<usize>,
     storm_motion_direction_deg: f32,
     storm_motion_speed_kt: f32,
+    /// One-shot derived-grid readout cache: (product, volume ptr, cut for
+    /// per-cut derivatives, base cut index, grid). Computed on first hover
+    /// over a derived product, reused until product/volume changes.
+    derived_readout_cache: Option<(DerivedProduct, usize, usize, usize, Arc<MomentGrid>)>,
     dealiased_readout_cache: Option<DealiasedReadoutCache>,
 }
 
@@ -1134,6 +1219,33 @@ struct AsyncRenderResult {
 
 /// Background cell-identification result: (volume ptr, volume time, cells).
 type StormCellsResult = (usize, DateTime<Utc>, Vec<StormCell>);
+/// (grid hash, inverse LUT) for the decoupled model geolocation.
+type ModelLutEntry = (String, Arc<model_layer::InverseLut>);
+type NativeSoundingReceiver =
+    mpsc::Receiver<std::result::Result<(rustwx_sounding::NativeSounding, f32), String>>;
+/// (generation, view key, raster, render ms) from the model-layer render thread.
+/// GOES frame as a radar-map layer: palette-colored image + inverse
+/// geolocation (same world-anchored draw as the model layer; sat sits
+/// UNDER the model layer and radar).
+struct SatMapLayer {
+    image: Arc<egui::ColorImage>,
+    lut: Arc<model_layer::InverseLut>,
+    nx: usize,
+    ny: usize,
+    flip_rows: bool,
+    opacity: f32,
+    visible: bool,
+    generation: u64,
+}
+
+/// The map view a model-layer raster was rendered for.
+#[derive(Clone, Copy, PartialEq)]
+struct ModelLayerView {
+    center_lat: f32,
+    center_lon: f32,
+    map_scale: f32,
+}
+type ModelLayerRender = (u64, ModelLayerView, egui::ColorImage, f32);
 
 /// One SPC storm report (tornado) — the archive events browser entry.
 #[derive(Clone, Debug)]
@@ -1882,6 +1994,14 @@ enum DerivedProduct {
     Vil,
     VilDensity,
     Mehs,
+    /// Probability of Severe Hail (Witt et al. 1998), percent.
+    Posh,
+    /// Probability of Hail, any size (Waldvogel et al. 1979), percent.
+    Poh,
+    /// Mid-Altitude Radial Convergence ΔV (Schmocker et al. 1996), m/s.
+    Marc,
+    /// Low-level gust proxy: |Vr| with beam < 1 km (Smith et al. 2004), m/s.
+    GustProxy,
     AzimuthalShear,
     Divergence,
 }
@@ -1894,6 +2014,10 @@ impl DerivedProduct {
             Self::Vil => "VIL",
             Self::VilDensity => "VILD",
             Self::Mehs => "MEHS",
+            Self::Posh => "POSH",
+            Self::Poh => "POH",
+            Self::Marc => "MARC",
+            Self::GustProxy => "Gust",
             Self::AzimuthalShear => "AzShr",
             Self::Divergence => "Div",
         }
@@ -1906,6 +2030,10 @@ impl DerivedProduct {
             Self::Vil => ColorTableFamily::Vil,
             Self::VilDensity => ColorTableFamily::VilDensity,
             Self::Mehs => ColorTableFamily::HailSize,
+            // Probabilities ride the echo-tops ramp (monotonic 0..max).
+            Self::Posh | Self::Poh => ColorTableFamily::EchoTops,
+            // Wind magnitudes ride the VIL ramp (monotonic, hot = strong).
+            Self::Marc | Self::GustProxy => ColorTableFamily::Vil,
             // Divergence shares the diverging shear palette (convergence cool,
             // divergence warm).
             Self::AzimuthalShear | Self::Divergence => ColorTableFamily::AzimuthalShear,
@@ -1919,6 +2047,8 @@ impl DerivedProduct {
             Self::Vil => "kg/m²",
             Self::VilDensity => "g/m³",
             Self::Mehs => "mm",
+            Self::Posh | Self::Poh => "%",
+            Self::Marc | Self::GustProxy => "m/s",
             Self::AzimuthalShear | Self::Divergence => "×10⁻³/s",
         }
     }
@@ -1926,7 +2056,9 @@ impl DerivedProduct {
     /// Source moment the product is derived from.
     fn base_moment(self) -> MomentType {
         match self {
-            Self::AzimuthalShear | Self::Divergence => MomentType::Velocity,
+            Self::AzimuthalShear | Self::Divergence | Self::Marc | Self::GustProxy => {
+                MomentType::Velocity
+            }
             _ => MomentType::Reflectivity,
         }
     }
@@ -1937,12 +2069,16 @@ impl DerivedProduct {
         !matches!(self, Self::AzimuthalShear | Self::Divergence)
     }
 
-    const ALL: [DerivedProduct; 7] = [
+    const ALL: [DerivedProduct; 11] = [
         Self::CompositeReflectivity,
         Self::EchoTops,
         Self::Vil,
         Self::VilDensity,
         Self::Mehs,
+        Self::Posh,
+        Self::Poh,
+        Self::Marc,
+        Self::GustProxy,
         Self::AzimuthalShear,
         Self::Divergence,
     ];
@@ -2120,6 +2256,7 @@ impl ViewerApp {
         let (render_sender, render_receiver, render_recycle_sender) = spawn_render_worker();
         let hazard_path_text = String::new();
 
+        let restored_model_keep_runs = app_settings.model_keep_runs;
         let mut app = Self {
             source_path,
             volume: None,
@@ -2204,6 +2341,51 @@ impl ViewerApp {
             spc_reports: None,
             spc_receiver: None,
             archive_pending_event: None,
+            ingest: None,
+            download_panel: rw_ui::DownloadPanel::new(rw_ui::DownloadSpec::default()),
+            sat: None,
+            sat_panel: rw_ui::SatellitePanel::new(rw_ui::SatFollowSpec::default()),
+            sat_player: rw_ui::SatPlayerPanel::new(),
+            show_satellite: false,
+            model_dock: None,
+            model_dock_open: false,
+            sat_layer: None,
+            sat_layer_build_rx: None,
+            sat_layer_texture: None,
+            sat_layer_render_rx: None,
+            sat_layer_generation: 0,
+            sat_last_frame: None,
+            model_layer: None,
+            model_layer_build_rx: None,
+            model_layer_texture: None,
+            model_layer_render_rx: None,
+            model_layer_generation: 0,
+            radar_opacity: 1.0,
+            model_ingest_rx: None,
+            model_ingest_progress_rx: None,
+            model_ingest_cancel: None,
+            model_download_open: false,
+            download_date: String::new(),
+            download_cycle: 0,
+            download_hours: "0-3".to_owned(),
+            download_profile: 0,
+            last_sounding_request: None,
+            hail_env_pending: false,
+            inspector_show_raw_vel: true,
+            inspector_show_range_az: true,
+            inspector_show_beam: true,
+            inspector_show_model: true,
+            model_lut: None,
+            model_lut_rx: None,
+            model_enabled: true,
+            model_keep_runs: restored_model_keep_runs,
+            model_layer_render_ms: None,
+            sounding_compute_ms: None,
+            frame_ms_avg: 0.0,
+            native_sounding: None,
+            native_sounding_rx: None,
+            native_sounding_src: None,
+            native_skewt_open: false,
             archive_frame_count: 10,
             archive_loaded_range: None,
             archive_load_loop: true,
@@ -2239,6 +2421,7 @@ impl ViewerApp {
             selected_hazard_index: None,
             storm_motion_direction_deg: DEFAULT_STORM_MOTION_DIRECTION_DEG,
             storm_motion_speed_kt: DEFAULT_STORM_MOTION_SPEED_KT,
+            derived_readout_cache: None,
             dealiased_readout_cache: None,
         };
         app.basemap_style = restored_basemap_style;
@@ -2247,6 +2430,20 @@ impl ViewerApp {
         app.start_site_catalog_load(&cc.egui_ctx);
         app.load_volume(&cc.egui_ctx);
         app.load_live_hazards(&cc.egui_ctx);
+        // Model store: enforce retention at startup (other tools may have
+        // left extra runs) and auto-create the dock when data exists, so
+        // Alt+click soundings work cold — no "Show on map" required.
+        let model_store = std::path::PathBuf::from("C:/Users/drew/rusty-weather/store");
+        if app.model_keep_runs > 0 {
+            prune_model_store(&model_store.to_string_lossy(), app.model_keep_runs as usize);
+        }
+        if model_store
+            .read_dir()
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false)
+        {
+            app.model_dock = Some(model_data::ModelDataDock::new(&cc.egui_ctx, model_store));
+        }
         app
     }
 
@@ -3574,9 +3771,30 @@ impl ViewerApp {
     }
 
     fn request_texture_render(&mut self, ctx: &egui::Context, rect: egui::Rect) {
-        let Some(volume) = self.volume.clone() else {
+        let Some(mut volume) = self.volume.clone() else {
             return;
         };
+        // Volume-wide derived products (CREF/ET/VIL/MEHS/POSH/POH/MARC/...)
+        // need a COMPLETE volume: on a live-partial frame the column walk
+        // tops out at whatever tilts have arrived, painting range rings at
+        // the coverage steps (field report: MEHS/CREF rings). Substitute the
+        // newest complete frame's volume until this one finishes.
+        if self
+            .selected_product
+            .derived()
+            .map(|d| d.is_volume_wide())
+            .unwrap_or(false)
+            && self
+                .selected_frame()
+                .is_some_and(|frame| frame.status == FrameStatus::LivePartial)
+            && let Some(complete) = self
+                .frame_history
+                .iter()
+                .rev()
+                .find(|frame| frame.status != FrameStatus::LivePartial)
+        {
+            volume = Arc::clone(&complete.volume);
+        }
         let Some((viewport_options, viewport_key)) = self.viewport_raster_options(ctx, rect) else {
             return;
         };
@@ -4749,7 +4967,7 @@ impl ViewerApp {
                 image_rect,
                 self.lon_lat_to_screen(rect, longitude_deg, latitude_deg),
                 self.aeqd_north_angle(rect, latitude_deg, longitude_deg) - baked,
-                egui::Color32::WHITE,
+                egui::Color32::from_white_alpha((self.radar_opacity * 255.0) as u8),
             );
         }
     }
@@ -4954,6 +5172,10 @@ impl ViewerApp {
     /// Archive tab: date navigation, the day's volumes, SPC tornado
     /// events, and loop-size controls.
     fn archive_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // The loop transport lives here too — archive browsing shouldn't
+        // need a tab switch to play what it just loaded.
+        self.frame_history_panel(ui, ctx);
+        ui.separator();
         ui.horizontal(|ui| {
             ui.label("Frames");
             if ui
@@ -5548,6 +5770,17 @@ impl eframe::App for ViewerApp {
         self.poll_placefiles(&ctx);
         self.poll_archive_listing(&ctx);
         self.poll_spc_reports(&ctx);
+        // Frame-time EMA (perf strip).
+        let dt_ms = ctx.input(|i| i.unstable_dt) * 1000.0;
+        self.frame_ms_avg = if self.frame_ms_avg == 0.0 {
+            dt_ms
+        } else {
+            self.frame_ms_avg * 0.95 + dt_ms * 0.05
+        };
+        self.poll_model_layer(&ctx);
+        self.poll_sat_layer(&ctx);
+        self.poll_model_ingest(&ctx);
+        self.poll_native_sounding(&ctx);
         if self.tile_layer.borrow_mut().poll(&ctx) {
             ctx.request_repaint();
         }
@@ -5576,6 +5809,45 @@ impl eframe::App for ViewerApp {
         }
 
         egui::CentralPanel::default().show_inside(ui, |ui| self.map_canvas(ui));
+
+        if self.model_dock_open {
+            if self.model_dock.is_none() {
+                let store_root = std::path::PathBuf::from(r"C:\Users\drew\rusty-weather\store");
+                self.model_dock = Some(model_data::ModelDataDock::new(&ctx, store_root));
+            }
+            let mut open = self.model_dock_open;
+            egui::Window::new("Model data")
+                .open(&mut open)
+                .default_size([1080.0, 660.0])
+                .min_size([720.0, 420.0])
+                .resizable(true)
+                .show(&ctx, |ui| {
+                    if let Some(dock) = &mut self.model_dock {
+                        dock.ui(ui);
+                    }
+                });
+            self.model_dock_open = open;
+        }
+
+        self.model_download_window(&ctx);
+        self.satellite_window(&ctx);
+
+        if self.native_skewt_open && self.native_sounding.is_some() {
+            let mut open = self.native_skewt_open;
+            egui::Window::new("Sounding (native)")
+                .open(&mut open)
+                .default_size([1265.0, 950.0])
+                .min_size([480.0, 360.0])
+                .resizable(true)
+                .show(&ctx, |ui| {
+                    if let Some(sounding) = self.native_sounding.clone() {
+                        let size = ui.available_size();
+                        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                        sounding_panels::draw_full(ui, rect, &sounding);
+                    }
+                });
+            self.native_skewt_open = open;
+        }
     }
 }
 
@@ -5589,6 +5861,20 @@ impl ViewerApp {
             }
             if fixed_action_button(ui, "Reload", 62.0).clicked() {
                 self.load_volume(ui.ctx());
+            }
+            if ui
+                .selectable_label(self.show_satellite, "Sat")
+                .on_hover_text("GOES satellite: live follow + frame playback (rw-sat)")
+                .clicked()
+            {
+                self.show_satellite = !self.show_satellite;
+            }
+            if ui
+                .selectable_label(self.model_dock_open, "Model")
+                .on_hover_text("NWP model fields + skew-T soundings (rusty-weather store)")
+                .clicked()
+            {
+                self.model_dock_open = !self.model_dock_open;
             }
         });
     }
@@ -5940,6 +6226,186 @@ impl ViewerApp {
             .default_open(layer_count > 0)
             .show(ui, |ui| {
                 self.radar_layers_panel(ui, ctx);
+                ui.horizontal(|ui| {
+                    if ui
+                        .checkbox(&mut self.model_enabled, "Model data")
+                        .on_hover_text(
+                            "Master switch: off = pure radar app (no model dock, layer, hover value, or Alt-click soundings)",
+                        )
+                        .changed()
+                    {
+                        if self.model_enabled {
+                            let store =
+                                std::path::PathBuf::from("C:/Users/drew/rusty-weather/store");
+                            if store
+                                .read_dir()
+                                .map(|mut entries| entries.next().is_some())
+                                .unwrap_or(false)
+                            {
+                                self.model_dock =
+                                    Some(model_data::ModelDataDock::new(ctx, store));
+                            }
+                        }
+                        ctx.request_repaint();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Keep runs");
+                    let mut keep = self.model_keep_runs;
+                    if ui
+                        .add(egui::DragValue::new(&mut keep).range(0..=24).speed(0.1))
+                        .on_hover_text(
+                            "Model store retention: newest N runs auto-kept, older deleted after each fetch and at startup (0 = unlimited). Default 2 keeps SSD use ~1.5 GB.",
+                        )
+                        .changed()
+                    {
+                        self.model_keep_runs = keep;
+                        self.app_settings.model_keep_runs = keep;
+                        let _ = self.app_settings.save();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Radar");
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut self.radar_opacity, 0.15..=1.0)
+                                .show_value(false),
+                        )
+                        .on_hover_text("Primary radar opacity (model layer shows through)")
+                        .changed()
+                    {
+                        ctx.request_repaint();
+                    }
+                });
+                let mut remove_sat_layer = false;
+                if let Some(layer) = &mut self.sat_layer {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let mut visible = layer.visible;
+                        if ui
+                            .checkbox(&mut visible, "")
+                            .on_hover_text("Show GOES on map")
+                            .changed()
+                        {
+                            layer.visible = visible;
+                            ctx.request_repaint();
+                        }
+                        ui.label("GOES");
+                        let mut opacity = layer.opacity;
+                        if ui
+                            .add(egui::Slider::new(&mut opacity, 0.1..=1.0).show_value(false))
+                            .changed()
+                        {
+                            layer.opacity = opacity;
+                            ctx.request_repaint();
+                        }
+                        if ui
+                            .small_button("✕")
+                            .on_hover_text("Remove satellite layer")
+                            .clicked()
+                        {
+                            remove_sat_layer = true;
+                        }
+                    });
+                }
+                if remove_sat_layer {
+                    self.sat_layer = None;
+                    self.sat_layer_texture = None;
+                    ctx.request_repaint();
+                }
+                let mut remove_model_layer = false;
+                let mut step_hour: i64 = 0;
+                if let Some(layer) = &mut self.model_layer {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let mut visible = layer.visible;
+                        if ui
+                            .checkbox(&mut visible, "")
+                            .on_hover_text(
+                                "Show on map (unchecked: hidden but still feeds the inspector + Alt+click soundings)",
+                            )
+                            .changed()
+                        {
+                            layer.visible = visible;
+                            ctx.request_repaint();
+                        }
+                        if ui.small_button("◀").on_hover_text("Previous forecast hour").clicked() {
+                            step_hour = -1;
+                        }
+                        ui.label(format!(
+                            "Model: {} ({})",
+                            layer.field.key.var, layer.field.units
+                        ));
+                        if ui.small_button("▶").on_hover_text("Next forecast hour").clicked() {
+                            step_hour = 1;
+                        }
+                        let mut opacity = layer.opacity;
+                        if ui
+                            .add(egui::Slider::new(&mut opacity, 0.1..=1.0).show_value(false))
+                            .changed()
+                        {
+                            layer.opacity = opacity;
+                            ctx.request_repaint();
+                        }
+                        if ui
+                            .small_button("✕")
+                            .on_hover_text("Remove model layer")
+                            .clicked()
+                        {
+                            remove_model_layer = true;
+                        }
+                    });
+                }
+                if remove_model_layer {
+                    self.model_layer = None;
+                    self.model_layer_texture = None;
+                    ctx.request_repaint();
+                }
+                if step_hour != 0
+                    && let Some(dock) = &mut self.model_dock
+                {
+                    dock.step_hour(step_hour);
+                }
+                // Freshness: newest run in the store + one-click ingest.
+                ui.horizontal(|ui| {
+                    let newest = self
+                        .model_dock
+                        .as_ref()
+                        .and_then(|dock| dock.newest_run());
+                    match newest {
+                        Some((model, run, hours)) => {
+                            ui.weak(format!("{model} {run} · {hours} hrs"));
+                        }
+                        None => {
+                            ui.weak("No model data (open Model once)");
+                        }
+                    }
+                    let fetching = self.model_ingest_rx.is_some();
+                    if ui
+                        .add_enabled(!fetching, egui::Button::new("Fetch latest"))
+                        .on_hover_text(
+                            "Ingest the freshest HRRR init (next 3 hours, sounding-grade) and prune to the two newest runs (~1 min)",
+                        )
+                        .clicked()
+                    {
+                        self.start_model_ingest(ctx);
+                    }
+                    if ui
+                        .button("Download…")
+                        .on_hover_text("Any init, specific hours, any profile — with size estimate")
+                        .clicked()
+                    {
+                        self.model_download_open = !self.model_download_open;
+                    }
+                    if fetching {
+                        ui.spinner();
+                        if ui.small_button("✕").on_hover_text("Cancel ingest").clicked()
+                            && let Some(cancel) = &self.model_ingest_cancel
+                        {
+                            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
                 ui.separator();
                 ui.label("Placefiles");
                 ui.horizontal(|ui| {
@@ -6170,7 +6636,12 @@ impl ViewerApp {
                 }
             });
         }
-        if editing_product == DisplayProduct::Derived(DerivedProduct::Mehs) {
+        if matches!(
+            editing_product,
+            DisplayProduct::Derived(
+                DerivedProduct::Mehs | DerivedProduct::Posh | DerivedProduct::Poh
+            )
+        ) {
             ui.horizontal(|ui| {
                 ui.label("Hail 0°C/−20°C");
                 let f_changed = ui
@@ -6197,6 +6668,17 @@ impl ViewerApp {
                         .hail_minus20_level_km
                         .max(self.hail_freezing_level_km + 0.1);
                     ctx.request_repaint();
+                }
+                if self.model_enabled
+                    && self.model_lut.is_some()
+                    && ui
+                        .small_button("From HRRR")
+                        .on_hover_text(
+                            "Set both heights from the HRRR temperature profile at the radar site (0°C and −20°C crossings)",
+                        )
+                        .clicked()
+                {
+                    self.request_hail_env_from_model(ctx);
                 }
             });
         }
@@ -6398,6 +6880,15 @@ impl ViewerApp {
 
         // R7: TOOLS.
         Self::section_header(ui, "TOOLS");
+        ui.menu_button("Inspector…", |ui| {
+            ui.checkbox(
+                &mut self.inspector_show_raw_vel,
+                "Raw velocity / fold warning",
+            );
+            ui.checkbox(&mut self.inspector_show_range_az, "Range / azimuth / tilt");
+            ui.checkbox(&mut self.inspector_show_beam, "Beam height");
+            ui.checkbox(&mut self.inspector_show_model, "Model value");
+        });
         ui.checkbox(&mut self.show_inspector_card, "Inspector card")
             .on_hover_text(
                 "Floating data card at the cursor (value, range/azimuth, beam height, Vrot; velocity products add a radial in/outbound arrow). Shift+click the map to pin it to a spot — it tracks pan/zoom and live updates; Shift+click it again to release.",
@@ -6951,6 +7442,13 @@ impl ViewerApp {
             ui.label(format!("Decode {:.1} ms", load_timing.decode_ms));
             ui.label(format!("Load {:.1} ms", load_timing.total_ms));
         }
+        ui.label(format!("Frame {:.1} ms", self.frame_ms_avg));
+        if let Some(layer_ms) = self.model_layer_render_ms {
+            ui.label(format!("MdlLayer {layer_ms:.0} ms"));
+        }
+        if let Some(snd_ms) = self.sounding_compute_ms {
+            ui.label(format!("SkewT {snd_ms:.0} ms"));
+        }
         ui.label(format!("{} overlays", self.radar_layers.len()));
         ui.label(format!("{:.0} km range", self.radar_range_km));
         if self.show_performance_stats {
@@ -7360,6 +7858,8 @@ impl ViewerApp {
 
         let basemap_start = Instant::now();
         self.draw_basemap(painter, rect);
+        self.draw_sat_layer(painter, rect);
+        self.draw_model_layer(painter, rect);
         self.draw_graticule(painter, rect);
         let underlay_ms = basemap_start.elapsed().as_secs_f32() * 1000.0;
         self.request_radar_layer_renders(ui.ctx(), rect);
@@ -7463,6 +7963,41 @@ impl ViewerApp {
                 self.cross_section_texture = None;
                 self.cross_section_signature = None;
                 self.cross_section_status = "Cross-section: click endpoint A then B".to_owned();
+            }
+        } else if self.model_enabled && ui.input(|i| i.modifiers.alt) && self.model_lut.is_some() {
+            // Alt+click = one-shot sounding. Ctrl+Alt = FOLLOW THE MOUSE:
+            // no buttons involved, so the map never pans, and the store
+            // worker coalesces requests (latest wins) while the ~100 ms
+            // native compute streams the skew-T live under the cursor.
+            let follow = ui.input(|i| i.modifiers.ctrl);
+            let pointer = if follow {
+                response.hover_pos()
+            } else if response.clicked() {
+                response.interact_pointer_pos()
+            } else {
+                None
+            };
+            if let Some(pointer) = pointer {
+                let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
+                let lookup = self.model_lut.as_ref().and_then(|(_, lut)| {
+                    let nx = self
+                        .model_dock
+                        .as_ref()
+                        .and_then(|dock| dock.latest_field())
+                        .map(|field| field.nx)?;
+                    lut.lookup(lat, lon).map(|index| (index, nx))
+                });
+                if let Some((index, nx)) = lookup
+                    && self.last_sounding_request != Some(index)
+                    && let Some(dock) = &mut self.model_dock
+                {
+                    let fx = (index % nx) as f64;
+                    let fy = (index / nx) as f64;
+                    dock.request_sounding_at(fx, fy);
+                    self.last_sounding_request = Some(index);
+                    // The Sounding window opens via poll_native_sounding;
+                    // the Model window only opens from the top-bar button.
+                }
             }
         } else if self.vrot_tool_armed {
             if response.clicked()
@@ -8305,6 +8840,1113 @@ impl ViewerApp {
         Some((direction, (speed_mps / KNOT_TO_MPS as f64) as f32))
     }
 
+    /// Kick a background HRRR ingest for the freshest plausible init
+    /// (next 3 forecast hours, sounding-grade --no-heavy), then prune the
+    /// store to the two newest runs and re-scan.
+    fn start_model_ingest(&mut self, ctx: &egui::Context) {
+        if self.model_ingest_rx.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        let (progress_tx, progress_rx) = mpsc::channel();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.model_ingest_rx = Some(receiver);
+        self.model_ingest_progress_rx = Some(progress_rx);
+        self.model_ingest_cancel = Some(Arc::clone(&cancel));
+        self.status = "Fetching latest HRRR…".to_owned();
+        let ctx = ctx.clone();
+        let keep_runs = self.model_keep_runs as usize;
+        thread::spawn(move || {
+            // Polite-by-default (rw-ingest throttle): fetch thread + compute
+            // pool run below-normal so the UI never lags (their verified
+            // result: 0.2 ms frames at 99.8% system CPU).
+            rw_ingest::throttle::set_current_thread_background_priority();
+            let pool = rw_ingest::throttle::build_background_pool(None);
+            let result = pool.install(|| run_model_ingest(&cancel, &progress_tx, &ctx, keep_runs));
+            let _ = sender.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Request the HRRR profile at the radar site to auto-set the hail
+    /// environment (H0 / H−20). The reply is intercepted by
+    /// poll_native_sounding (hail_env_pending) without opening the window.
+    fn request_hail_env_from_model(&mut self, ctx: &egui::Context) {
+        let Some((radar_lat, radar_lon)) = self.radar_location() else {
+            self.status = "No radar location for hail environment".to_owned();
+            return;
+        };
+        let lookup = self.model_lut.as_ref().and_then(|(_, lut)| {
+            let nx = self
+                .model_dock
+                .as_ref()
+                .and_then(|dock| dock.latest_field())
+                .map(|field| field.nx)?;
+            lut.lookup(radar_lat, radar_lon).map(|index| (index, nx))
+        });
+        let Some((index, nx)) = lookup else {
+            self.status = "Radar site is outside the model grid".to_owned();
+            return;
+        };
+        // Use the radar display's time as the validity target (falls back
+        // to wall clock), the NEWEST run in the store, and the forecast
+        // hour valid closest to it — never the browser's stale selection.
+        let target = self
+            .volume
+            .as_ref()
+            .map(|volume| volume.volume_time.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+        if let Some(dock) = &mut self.model_dock {
+            let Some((key, valid, run_age)) = dock.newest_hour_valid_near(target) else {
+                self.status = "No model runs in the store (Fetch latest first)".to_owned();
+                return;
+            };
+            let stale_note = if run_age > chrono::Duration::hours(3) {
+                format!(
+                    " — run is {}h old, consider Fetch latest",
+                    run_age.num_hours()
+                )
+            } else {
+                String::new()
+            };
+            self.status = format!(
+                "Hail levels from {} f{:02} (valid {}){stale_note}",
+                key.run,
+                key.hour,
+                valid.format("%H:%MZ")
+            );
+            dock.request_sounding_for(key, (index % nx) as f64, (index / nx) as f64);
+            self.hail_env_pending = true;
+            self.last_sounding_request = Some(index);
+            ctx.request_repaint();
+        }
+    }
+
+    /// Heights (km above surface) where the profile crosses `target_c`,
+    /// walking upward with linear interpolation.
+    fn profile_crossing_km(
+        profile: &rustwx_sounding::SharprsProfile,
+        target_c: f64,
+    ) -> Option<f32> {
+        let sfc_h = profile.sfc_height();
+        for pair in profile
+            .tmpc
+            .iter()
+            .zip(profile.hght.iter())
+            .collect::<Vec<_>>()
+            .windows(2)
+        {
+            let (&t0, &h0) = pair[0];
+            let (&t1, &h1) = pair[1];
+            if !(t0.is_finite() && t1.is_finite() && h0.is_finite() && h1.is_finite()) {
+                continue;
+            }
+            if (t0 >= target_c && t1 <= target_c) && t0 != t1 {
+                let frac = (t0 - target_c) / (t0 - t1);
+                let h = h0 + frac * (h1 - h0);
+                return Some(((h - sfc_h) / 1000.0) as f32);
+            }
+        }
+        None
+    }
+
+    /// When the dock receives new sounding data, run the sharprs-verified
+    /// compute on a background thread and open the native skew-T window.
+    fn poll_native_sounding(&mut self, ctx: &egui::Context) {
+        let fresh = self
+            .model_dock
+            .as_ref()
+            .and_then(|dock| dock.latest_sounding())
+            .filter(|latest| {
+                self.native_sounding_src
+                    .as_ref()
+                    .map(|src| !Arc::ptr_eq(src, latest))
+                    .unwrap_or(true)
+            })
+            .cloned();
+        if let Some(data) = fresh
+            && self.native_sounding_rx.is_none()
+        {
+            self.native_sounding_src = Some(Arc::clone(&data));
+            let (sender, receiver) = mpsc::channel();
+            self.native_sounding_rx = Some(receiver);
+            let ctx_clone = ctx.clone();
+            thread::spawn(move || {
+                let compute_start = Instant::now();
+                let result = rw_ui::skewt::build_native_sounding(&data)
+                    .map(|native| (native, compute_start.elapsed().as_secs_f32() * 1000.0));
+                let _ = sender.send(result);
+                ctx_clone.request_repaint();
+            });
+        }
+        if let Some(receiver) = &self.native_sounding_rx {
+            match receiver.try_recv() {
+                Ok(Ok((native, compute_ms))) => {
+                    self.native_sounding_rx = None;
+                    self.sounding_compute_ms = Some(compute_ms);
+                    if self.hail_env_pending {
+                        // Hail-environment request: extract H0/H−20 and keep
+                        // the window closed.
+                        self.hail_env_pending = false;
+                        let h0 = Self::profile_crossing_km(&native.profile, 0.0);
+                        let hm20 = Self::profile_crossing_km(&native.profile, -20.0);
+                        match (h0, hm20) {
+                            (Some(h0), Some(hm20)) => {
+                                self.hail_freezing_level_km = h0;
+                                self.hail_minus20_level_km = hm20.max(h0 + 0.1);
+                                self.clear_texture();
+                                self.derived_readout_cache = None;
+                                self.status = format!(
+                                    "Hail env from HRRR: 0°C {h0:.1} km · −20°C {hm20:.1} km"
+                                );
+                            }
+                            _ => {
+                                self.status = "HRRR profile lacks a 0°C/−20°C crossing".to_owned();
+                            }
+                        }
+                        self.native_sounding = Some(Arc::new(native));
+                        ctx.request_repaint();
+                        return;
+                    }
+                    self.native_sounding = Some(Arc::new(native));
+                    self.native_skewt_open = true;
+                    ctx.request_repaint();
+                }
+                Ok(Err(err)) => {
+                    self.native_sounding_rx = None;
+                    self.status = format!("Sounding compute failed: {err}");
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.native_sounding_rx = None,
+            }
+        }
+    }
+
+    /// Flexible download window: any date/cycle, an hours spec ("0-3",
+    /// "2,4,6", "12"), and a profile — with a live calibrated size
+    /// estimate, mirroring rusty-weather's download workflow.
+    fn model_download_window(&mut self, ctx: &egui::Context) {
+        if !self.model_download_open {
+            return;
+        }
+        if self.download_date.is_empty() {
+            self.download_date = Utc::now().format("%Y%m%d").to_string();
+            self.download_cycle = (Utc::now() - chrono::Duration::minutes(55))
+                .format("%H")
+                .to_string()
+                .parse()
+                .unwrap_or(0);
+        }
+        if self.ingest.is_none() {
+            let store = std::path::PathBuf::from("C:/Users/drew/rusty-weather/store");
+            let notify = ctx.clone();
+            let worker = ingest_worker::IngestWorker::spawn(store, move || {
+                notify.request_repaint();
+            });
+            self.download_panel
+                .set_model_options(ingest_worker_model_options());
+            let spec = self.download_panel.spec().clone();
+            sync_run_pickers(&mut self.download_panel, &spec);
+            worker.send(ingest_worker::IngestRequest::Estimate(spec));
+            self.ingest = Some(worker);
+        }
+        self.pump_ingest_responses();
+        let mut open = self.model_download_open;
+        let mut events = Vec::new();
+        egui::Window::new("Model download")
+            .open(&mut open)
+            .default_size([560.0, 560.0])
+            .min_size([420.0, 360.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                events = self.download_panel.ui(ui);
+            });
+        self.model_download_open = open;
+        let Some(ingest) = &self.ingest else {
+            return;
+        };
+        for event in events {
+            match event {
+                rw_ui::DownloadEvent::SpecChanged(spec) => {
+                    sync_run_pickers(&mut self.download_panel, &spec);
+                    ingest.send(ingest_worker::IngestRequest::Estimate(spec));
+                }
+                rw_ui::DownloadEvent::CheckAvailability(spec) => {
+                    ingest.send(ingest_worker::IngestRequest::Probe(spec));
+                }
+                rw_ui::DownloadEvent::LatestRequested(spec) => {
+                    ingest.send(ingest_worker::IngestRequest::Latest(spec));
+                }
+                rw_ui::DownloadEvent::StartRequested(spec) => {
+                    ingest.send(ingest_worker::IngestRequest::Start(spec));
+                }
+                rw_ui::DownloadEvent::CancelRequested => {
+                    ingest.cancel();
+                }
+            }
+        }
+    }
+
+    fn pump_ingest_responses(&mut self) {
+        let mut rescan = false;
+        if let Some(ingest) = &self.ingest {
+            while let Some(response) = ingest.try_recv() {
+                match response {
+                    ingest_worker::IngestResponse::Estimate(result) => match *result {
+                        Ok(view) => self.download_panel.set_estimate(view),
+                        Err(message) => self.download_panel.set_spec_error(message),
+                    },
+                    ingest_worker::IngestResponse::Availability(view) => {
+                        self.download_panel.set_availability(view)
+                    }
+                    ingest_worker::IngestResponse::Latest { date, cycle } => {
+                        self.download_panel.set_latest(date, cycle);
+                        let spec = self.download_panel.spec().clone();
+                        sync_run_pickers(&mut self.download_panel, &spec);
+                        ingest.send(ingest_worker::IngestRequest::Estimate(spec));
+                    }
+                    ingest_worker::IngestResponse::LatestFailed(message) => {
+                        self.download_panel.set_probing_failed(message);
+                    }
+                    ingest_worker::IngestResponse::Started { hours } => {
+                        self.download_panel.begin_run(&hours);
+                    }
+                    ingest_worker::IngestResponse::StageStarted { hour, stage } => {
+                        self.download_panel.apply_stage_started(hour, stage);
+                    }
+                    ingest_worker::IngestResponse::StageDone { hour, stage, ms } => {
+                        self.download_panel.apply_stage_done(hour, stage, ms);
+                    }
+                    ingest_worker::IngestResponse::Note(message) => {
+                        self.download_panel.apply_note(message);
+                    }
+                    ingest_worker::IngestResponse::HourDone(done) => {
+                        self.download_panel.apply_hour_done(done);
+                        rescan = true;
+                    }
+                    ingest_worker::IngestResponse::Finished => {
+                        self.download_panel.finish_run(Ok(()));
+                        rescan = true;
+                    }
+                    ingest_worker::IngestResponse::Cancelled => {
+                        self.download_panel.finish_cancelled();
+                        rescan = true;
+                    }
+                    ingest_worker::IngestResponse::Failed(message) => {
+                        if self.download_panel.is_running() {
+                            self.download_panel.finish_run(Err(message));
+                        } else {
+                            self.download_panel.set_spec_error(message);
+                        }
+                    }
+                }
+            }
+        }
+        if rescan {
+            // New hours on disk: refresh the model dock + retention pass.
+            if let Some(dock) = &mut self.model_dock {
+                dock.rescan();
+            }
+            if self.model_keep_runs > 0 {
+                prune_model_store(
+                    "C:/Users/drew/rusty-weather/store",
+                    self.model_keep_runs as usize,
+                );
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn spartan_download_window_retired(&mut self, ctx: &egui::Context) {
+        let mut open = false;
+        let mut start_request = false;
+        egui::Window::new("Model download (retired)")
+            .open(&mut open)
+            .default_size([340.0, 210.0])
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Date");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.download_date)
+                            .hint_text("YYYYMMDD")
+                            .desired_width(86.0),
+                    );
+                    ui.label("Cycle");
+                    ui.add(
+                        egui::DragValue::new(&mut self.download_cycle)
+                            .range(0..=23)
+                            .speed(0.1)
+                            .suffix("z"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Hours");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.download_hours)
+                            .hint_text("0-3 or 2,4,6")
+                            .desired_width(86.0),
+                    )
+                    .on_hover_text("Forecast hours: N, N-M, or a comma list");
+                    ui.label("Profile");
+                    egui::ComboBox::from_id_salt("dl_profile")
+                        .selected_text(match self.download_profile {
+                            1 => "full",
+                            2 => "view",
+                            _ => "sounding",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.download_profile, 0, "sounding");
+                            ui.selectable_value(&mut self.download_profile, 1, "full");
+                            ui.selectable_value(&mut self.download_profile, 2, "view");
+                        });
+                });
+                // Live size estimate (calibrated).
+                match rw_ingest::ingest_hour::parse_hours(&self.download_hours) {
+                    Ok(hours) if !hours.is_empty() => {
+                        let profile = download_profile_for(self.download_profile);
+                        let estimate = rw_ingest::size_estimate::estimate(
+                            &profile,
+                            rustwx_core::ModelId::Hrrr,
+                            hours.len() as u16,
+                            &rw_ingest::size_estimate::Calibration::builtin_default(),
+                        );
+                        ui.weak(format!(
+                            "{} hours · store ~{:.0} MB · download ~{:.0} MB",
+                            hours.len(),
+                            estimate.store_bytes as f64 / 1.0e6,
+                            estimate.download_bytes as f64 / 1.0e6,
+                        ));
+                    }
+                    _ => {
+                        ui.weak("Hours: N, N-M, or comma list");
+                    }
+                }
+                if self.model_keep_runs > 0 {
+                    ui.weak(format!(
+                        "Retention keeps the newest {} runs — older downloads are cleaned at next launch (Keep runs 0 disables).",
+                        self.model_keep_runs
+                    ));
+                }
+                ui.horizontal(|ui| {
+                    let busy = self.model_ingest_rx.is_some();
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Download"))
+                        .clicked()
+                    {
+                        start_request = true;
+                    }
+                    if busy {
+                        ui.spinner();
+                        ui.label(&self.status);
+                    }
+                });
+            });
+        self.model_download_open = open;
+        if start_request {
+            self.start_model_download(ctx);
+        }
+    }
+
+    /// Kick the flexible download (manual path: NO auto-prune here — the
+    /// startup retention pass owns cleanup, so a deliberately fetched old
+    /// init survives the session).
+    fn start_model_download(&mut self, ctx: &egui::Context) {
+        if self.model_ingest_rx.is_some() {
+            return;
+        }
+        let Ok(hours) = rw_ingest::ingest_hour::parse_hours(&self.download_hours) else {
+            self.status = "Bad hours spec (use N, N-M, or a comma list)".to_owned();
+            return;
+        };
+        if hours.is_empty() || self.download_date.len() != 8 {
+            self.status = "Need YYYYMMDD date and at least one hour".to_owned();
+            return;
+        }
+        let date = self.download_date.clone();
+        let cycle = self.download_cycle;
+        let profile_kind = self.download_profile;
+        let (sender, receiver) = mpsc::channel();
+        let (progress_tx, progress_rx) = mpsc::channel();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.model_ingest_rx = Some(receiver);
+        self.model_ingest_progress_rx = Some(progress_rx);
+        self.model_ingest_cancel = Some(Arc::clone(&cancel));
+        self.status = format!("Downloading HRRR {date} {cycle:02}z…");
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            rw_ingest::throttle::set_current_thread_background_priority();
+            let pool = rw_ingest::throttle::build_background_pool(None);
+            let result = pool.install(|| {
+                run_model_download(
+                    &date,
+                    cycle,
+                    &hours,
+                    profile_kind,
+                    &cancel,
+                    &progress_tx,
+                    &ctx,
+                )
+            });
+            let _ = sender.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    /// GOES satellite window: follow-engine control panel + frame player,
+    /// wired to the ported rw-sat worker (host pattern mirrors
+    /// rusty-weather-ui; the rolling store is shared with it on disk).
+    fn satellite_window(&mut self, ctx: &egui::Context) {
+        if !self.show_satellite {
+            return;
+        }
+        if self.sat.is_none() {
+            // BowEcho's OWN sat store: rw-sat's download cache + rolling store
+            // have no cross-process locking, so sharing rusty-weather's
+            // store/sat corrupts reads when both apps follow at once
+            // (field failure: checksum mismatch on files rusty-weather
+            // was mid-writing).
+            let store = std::path::PathBuf::from("C:/Users/drew/bowecho-sat-store");
+            let notify = ctx.clone();
+            let worker = sat_worker::SatWorker::spawn(store, move || {
+                notify.request_repaint();
+            });
+            self.sat_panel
+                .set_satellite_options(sat_worker::satellite_options());
+            self.sat_panel
+                .set_sector_options(sat_worker::sector_options());
+            self.sat_panel
+                .set_layer_options(sat_worker::layer_options());
+            worker.send(sat_worker::SatRequest::Validate(
+                self.sat_panel.spec().clone(),
+            ));
+            worker.send(sat_worker::SatRequest::Scan);
+            self.sat = Some(worker);
+        }
+        self.pump_sat_responses();
+        let mut open = self.show_satellite;
+        let mut panel_events = Vec::new();
+        let mut player_events = Vec::new();
+        egui::Window::new("Satellite (GOES)")
+            .open(&mut open)
+            .default_size([900.0, 700.0])
+            .min_size([520.0, 400.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                egui::CollapsingHeader::new("Live follow")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        panel_events = self.sat_panel.ui(ui);
+                    });
+                ui.separator();
+                if self.sat_last_frame.is_some()
+                    && ui
+                        .button("Show on radar map")
+                        .on_hover_text(
+                            "Render the current frame as a layer under the radar (opacity in Layers)",
+                        )
+                        .clicked()
+                    && let (Some(sat), Some((key, hhmm))) = (&self.sat, &self.sat_last_frame)
+                {
+                    sat.send(sat_worker::SatRequest::LoadFrameForMap {
+                        key: key.clone(),
+                        hhmm: *hhmm,
+                    });
+                }
+                player_events = self.sat_player.ui(ui);
+            });
+        self.show_satellite = open;
+        let Some(sat) = &self.sat else {
+            return;
+        };
+        for event in panel_events {
+            match event {
+                rw_ui::SatelliteEvent::SpecChanged(spec) => {
+                    sat.send(sat_worker::SatRequest::Validate(spec));
+                }
+                rw_ui::SatelliteEvent::StartRequested(spec) => {
+                    sat.send(sat_worker::SatRequest::Follow(spec));
+                }
+                rw_ui::SatelliteEvent::StopRequested => {
+                    sat.stop_follow();
+                }
+            }
+        }
+        for event in player_events {
+            match event {
+                rw_ui::SatPlayerEvent::FrameWanted { key, hhmm } => {
+                    sat.send(sat_worker::SatRequest::LoadFrame { key, hhmm });
+                }
+                rw_ui::SatPlayerEvent::RefreshRequested => {
+                    sat.send(sat_worker::SatRequest::Scan);
+                }
+            }
+        }
+    }
+
+    fn pump_sat_responses(&mut self) {
+        // Transient borrow per message so handlers can take &mut self.
+        while let Some(response) = self.sat.as_ref().and_then(|sat| sat.try_recv()) {
+            match response {
+                sat_worker::SatResponse::SpecStatus(status) => {
+                    self.sat_panel.set_spec_status(status)
+                }
+                sat_worker::SatResponse::Runs(runs) => self.sat_player.set_runs(runs),
+                sat_worker::SatResponse::FollowStarted => self.sat_panel.begin_follow(),
+                sat_worker::SatResponse::FollowFinished(result) => {
+                    if self.sat_panel.is_running() {
+                        self.sat_panel.finish_follow(result);
+                    } else if let Err(message) = result {
+                        self.sat_panel.set_spec_status(Err(message));
+                    }
+                }
+                sat_worker::SatResponse::PollDone { band, new_keys, ms } => {
+                    self.sat_panel.apply_poll_done(band, new_keys, ms);
+                }
+                sat_worker::SatResponse::DownloadStarted { id, label, bytes } => {
+                    self.sat_panel.apply_download_started(id, label, bytes);
+                }
+                sat_worker::SatResponse::DownloadDone { id, ms, cache_hit } => {
+                    self.sat_panel.apply_download_done(&id, ms, cache_hit);
+                }
+                sat_worker::SatResponse::FrameWritten {
+                    id,
+                    run,
+                    hhmm,
+                    bytes,
+                    encode_ms,
+                } => {
+                    self.sat_panel
+                        .apply_frame_written(&id, run, hhmm, bytes, encode_ms);
+                    if let Some(sat) = &self.sat {
+                        sat.send(sat_worker::SatRequest::Scan);
+                    }
+                }
+                sat_worker::SatResponse::Evicted { frames, bytes } => {
+                    self.sat_panel.apply_evicted(frames, bytes);
+                    if let Some(sat) = &self.sat {
+                        sat.send(sat_worker::SatRequest::Scan);
+                    }
+                }
+                sat_worker::SatResponse::Sleeping { ms } => self.sat_panel.apply_sleeping(ms),
+                sat_worker::SatResponse::Note(message) => self.sat_panel.apply_note(message),
+                sat_worker::SatResponse::DiskUsage(usage) => self.sat_panel.set_disk_usage(usage),
+                sat_worker::SatResponse::MapFrame(result) => match *result {
+                    Ok(frame) => self.install_sat_layer(frame),
+                    Err(message) => {
+                        self.status = format!("Sat layer: {message}");
+                    }
+                },
+                sat_worker::SatResponse::Frame { key, hhmm, result } => match *result {
+                    Ok(frame) => {
+                        self.sat_last_frame = Some((key.clone(), hhmm));
+                        self.sat_player.set_frame(frame);
+                    }
+                    Err(message) => {
+                        if self.sat_player.selected_run() == Some(&key) {
+                            self.sat_player.frame_failed(hhmm);
+                        }
+                        self.sat_panel.apply_note(format!("frame load: {message}"));
+                    }
+                },
+            }
+        }
+    }
+
+    fn poll_model_ingest(&mut self, ctx: &egui::Context) {
+        if let Some(progress) = &self.model_ingest_progress_rx {
+            while let Ok(line) = progress.try_recv() {
+                self.status = line;
+            }
+        }
+        let Some(receiver) = &self.model_ingest_rx else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(message)) => {
+                self.model_ingest_rx = None;
+                self.model_ingest_progress_rx = None;
+                self.model_ingest_cancel = None;
+                self.status = message;
+                if let Some(dock) = &mut self.model_dock {
+                    dock.rescan();
+                }
+                ctx.request_repaint();
+            }
+            Ok(Err(err)) => {
+                self.model_ingest_rx = None;
+                self.model_ingest_progress_rx = None;
+                self.model_ingest_cancel = None;
+                self.status = format!("HRRR ingest failed: {err}");
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.model_ingest_rx = None,
+        }
+    }
+
+    /// Drain dock map requests, LUT builds, and raster renders for the
+    /// model map layer (all heavy work on background threads).
+    fn poll_model_layer(&mut self, ctx: &egui::Context) {
+        if !self.model_enabled {
+            if self.model_dock.is_some() {
+                // Tear down: drop the dock/layer/LUT so nothing model-side
+                // runs until re-enabled.
+                self.model_dock = None;
+                self.model_layer = None;
+                self.model_layer_texture = None;
+                self.model_lut = None;
+                self.model_dock_open = false;
+            }
+            return;
+        }
+        // Keep the dock's worker drained even when its window is closed.
+        if let Some(dock) = &mut self.model_dock {
+            dock.pump();
+        }
+        // Decoupled inverse LUT: build for the latest grid (hash-keyed)
+        // regardless of whether a map layer exists — Alt+click soundings
+        // and the model hover readout work without "Show on map".
+        if self.model_lut_rx.is_none()
+            && let Some(latest) = self
+                .model_dock
+                .as_ref()
+                .and_then(|dock| dock.latest_field())
+            && let Some(grid) = latest.grid.as_ref()
+            && self
+                .model_lut
+                .as_ref()
+                .map(|(hash, _)| hash != &grid.hash)
+                .unwrap_or(true)
+        {
+            let (sender, receiver) = mpsc::channel();
+            self.model_lut_rx = Some(receiver);
+            let grid = Arc::clone(grid);
+            let ctx_clone = ctx.clone();
+            thread::spawn(move || {
+                let lut = model_layer::InverseLut::build(&grid.lat, &grid.lon)
+                    .map(|lut| (grid.hash.clone(), Arc::new(lut)));
+                let _ = sender.send(lut);
+                ctx_clone.request_repaint();
+            });
+        }
+        if let Some(receiver) = &self.model_lut_rx {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    self.model_lut_rx = None;
+                    if let Some(lut) = result {
+                        self.model_lut = Some(lut);
+                    }
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.model_lut_rx = None,
+            }
+        }
+        // Layer auto-refresh: when the dock loads a new field (hour step,
+        // var change) and a layer is active, swap it in. Same grid hash →
+        // reuse the LUT (instant hour scrubbing); different grid → rebuild.
+        let mut swap: Option<Arc<rw_ui::FieldData>> = None;
+        if let (Some(layer), Some(dock)) = (&self.model_layer, &self.model_dock)
+            && let Some(latest) = dock.latest_field()
+            && !Arc::ptr_eq(latest, &layer.field)
+        {
+            swap = Some(Arc::clone(latest));
+        }
+        if let Some(latest) = swap {
+            let same_grid = match (
+                self.model_layer
+                    .as_ref()
+                    .and_then(|l| l.field.grid.as_ref()),
+                latest.grid.as_ref(),
+            ) {
+                (Some(a), Some(b)) => a.hash == b.hash,
+                _ => false,
+            };
+            if same_grid {
+                if let Some(layer) = &mut self.model_layer {
+                    layer.production = latest.style.as_ref().map(|style| {
+                        Arc::new(rustwx_render::build_colormap(
+                            &style.scale,
+                            style.colormap_options,
+                        ))
+                    });
+                    layer.field = latest;
+                    layer.generation = layer.generation.wrapping_add(1);
+                    self.model_layer_generation = layer.generation;
+                    self.model_layer_texture = None;
+                    ctx.request_repaint();
+                }
+            } else if self.model_layer_build_rx.is_none()
+                && let Some(dock) = &mut self.model_dock
+            {
+                // Different grid: route through the normal build path.
+                let _ = dock;
+                self.start_model_layer_build(latest, ctx);
+            }
+        }
+
+        let map_request = self
+            .model_dock
+            .as_mut()
+            .and_then(|dock| dock.take_map_request());
+        if let Some(field) = map_request {
+            self.start_model_layer_build(field, ctx);
+        }
+        if let Some(receiver) = &self.model_layer_build_rx {
+            match receiver.try_recv() {
+                Ok(layer) => {
+                    self.model_layer_build_rx = None;
+                    if let Some(layer) = layer {
+                        self.model_layer_generation = layer.generation;
+                        self.status = format!(
+                            "Model layer: {} ({})",
+                            layer.field.key.var, layer.field.units
+                        );
+                        self.model_layer = Some(layer);
+                        self.model_layer_texture = None;
+                    } else {
+                        self.status = "Model layer: grid has no geolocation".to_owned();
+                    }
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.model_layer_build_rx = None,
+            }
+        }
+        if let Some(receiver) = &self.model_layer_render_rx {
+            match receiver.try_recv() {
+                Ok((generation, key, image, render_ms)) => {
+                    self.model_layer_render_rx = None;
+                    self.model_layer_render_ms = Some(render_ms);
+                    if self
+                        .model_layer
+                        .as_ref()
+                        .map(|l| l.generation == generation)
+                        .unwrap_or(false)
+                    {
+                        let texture =
+                            ctx.load_texture("model-layer", image, egui::TextureOptions::LINEAR);
+                        self.model_layer_texture = Some((texture, generation, key));
+                    }
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.model_layer_render_rx = None,
+            }
+        }
+    }
+
+    /// Install a GOES frame as the sat map layer (LUT built on a
+    /// background thread; same machinery as the model layer).
+    fn install_sat_layer(&mut self, frame: sat_worker::SatMapFrame) {
+        if self.sat_layer_build_rx.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.sat_layer_build_rx = Some(receiver);
+        let generation = self.sat_layer_generation + 1;
+        let nx = frame.grid.nx;
+        let ny = frame.grid.ny;
+        thread::spawn(move || {
+            let layer =
+                model_layer::InverseLut::build(&frame.grid.lat, &frame.grid.lon).map(|lut| {
+                    SatMapLayer {
+                        image: Arc::new(frame.image),
+                        lut: Arc::new(lut),
+                        nx,
+                        ny,
+                        flip_rows: frame.flip_rows,
+                        opacity: 0.85,
+                        visible: true,
+                        generation,
+                    }
+                });
+            let _ = sender.send(layer);
+        });
+        self.status = "Building satellite layer…".to_owned();
+    }
+
+    fn poll_sat_layer(&mut self, ctx: &egui::Context) {
+        if let Some(receiver) = &self.sat_layer_build_rx {
+            match receiver.try_recv() {
+                Ok(layer) => {
+                    self.sat_layer_build_rx = None;
+                    if let Some(layer) = layer {
+                        self.sat_layer_generation = layer.generation;
+                        self.sat_layer = Some(layer);
+                        self.sat_layer_texture = None;
+                        self.status = "Satellite layer active".to_owned();
+                    } else {
+                        self.status = "Satellite grid has no geolocation".to_owned();
+                    }
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.sat_layer_build_rx = None,
+            }
+        }
+        if let Some(receiver) = &self.sat_layer_render_rx {
+            match receiver.try_recv() {
+                Ok((generation, key, image, _ms)) => {
+                    self.sat_layer_render_rx = None;
+                    if self
+                        .sat_layer
+                        .as_ref()
+                        .map(|l| l.generation == generation)
+                        .unwrap_or(false)
+                    {
+                        let texture =
+                            ctx.load_texture("sat-layer", image, egui::TextureOptions::LINEAR);
+                        self.sat_layer_texture = Some((texture, generation, key));
+                    }
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.sat_layer_render_rx = None,
+            }
+        }
+    }
+
+    /// Draw the satellite layer (world-anchored; renders at half res on a
+    /// background thread, exactly like the model layer).
+    fn draw_sat_layer(&mut self, painter: &egui::Painter, rect: egui::Rect) {
+        let Some(layer) = &self.sat_layer else {
+            return;
+        };
+        if !layer.visible {
+            return;
+        }
+        let view = self.model_layer_current_view();
+        let current = self
+            .sat_layer_texture
+            .as_ref()
+            .filter(|(_, generation, _)| *generation == layer.generation);
+        let needs_render = current
+            .map(|(_, _, have)| {
+                (have.center_lat - view.center_lat).abs() > 1e-4
+                    || (have.center_lon - view.center_lon).abs() > 1e-4
+                    || (have.map_scale - view.map_scale).abs() > 0.01
+            })
+            .unwrap_or(true);
+        if needs_render && self.sat_layer_render_rx.is_none() {
+            let (sender, receiver) = mpsc::channel();
+            self.sat_layer_render_rx = Some(receiver);
+            let generation = layer.generation;
+            let image_src = Arc::clone(&layer.image);
+            let lut = Arc::clone(&layer.lut);
+            let (nx, ny, flip) = (layer.nx, layer.ny, layer.flip_rows);
+            let render_view = view;
+            let center_lat = view.center_lat as f64;
+            let center_lon = view.center_lon as f64;
+            let km_per_pt = 111.32 / view.map_scale as f64;
+            let (w_pts, h_pts) = (rect.width() as f64, rect.height() as f64);
+            thread::spawn(move || {
+                let render_start = Instant::now();
+                let w = (w_pts / 2.0).max(8.0) as usize;
+                let h = (h_pts / 2.0).max(8.0) as usize;
+                let mut pixels = vec![egui::Color32::TRANSPARENT; w * h];
+                for (i, px) in pixels.iter_mut().enumerate() {
+                    let x = (i % w) as f64;
+                    let y = (i / w) as f64;
+                    let east_km = (x - w as f64 / 2.0) * 2.0 * km_per_pt;
+                    let north_km = (h as f64 / 2.0 - y) * 2.0 * km_per_pt;
+                    let (lat, lon) = aeqd_inverse_km(center_lat, center_lon, east_km, north_km);
+                    let Some(index) = lut.lookup(lat as f32, lon as f32) else {
+                        continue;
+                    };
+                    let (row, col) = (index / nx, index % nx);
+                    if row >= ny {
+                        continue;
+                    }
+                    let image_row = if flip { ny - 1 - row } else { row };
+                    let color = image_src.pixels[image_row * nx + col];
+                    if color.a() > 0 {
+                        *px = color;
+                    }
+                }
+                let image = egui::ColorImage {
+                    size: [w, h],
+                    source_size: egui::vec2(w as f32, h as f32),
+                    pixels,
+                };
+                let _ = sender.send((
+                    generation,
+                    render_view,
+                    image,
+                    render_start.elapsed().as_secs_f32() * 1000.0,
+                ));
+            });
+        }
+        if let Some((texture, _, rendered)) = &self.sat_layer_texture {
+            let rendered_center =
+                self.lon_lat_to_screen(rect, rendered.center_lon, rendered.center_lat);
+            let zoom_ratio = self.map_scale / rendered.map_scale.max(0.001);
+            let half = egui::vec2(
+                rect.width() * 0.5 * zoom_ratio,
+                rect.height() * 0.5 * zoom_ratio,
+            );
+            let image_rect =
+                egui::Rect::from_min_max(rendered_center - half, rendered_center + half);
+            let opacity = (layer.opacity * 255.0) as u8;
+            painter.image(
+                texture.id(),
+                image_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::from_white_alpha(opacity),
+            );
+        }
+    }
+
+    /// Build (or rebuild) the map layer for a field on a background thread.
+    fn start_model_layer_build(&mut self, field: Arc<rw_ui::FieldData>, ctx: &egui::Context) {
+        if self.model_layer_build_rx.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.model_layer_build_rx = Some(receiver);
+        let generation = self.model_layer_generation + 1;
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            let layer = field.grid.as_ref().and_then(|grid| {
+                model_layer::InverseLut::build(&grid.lat, &grid.lon).map(|lut| {
+                    // Production per-product colortable when the field
+                    // ships a style (rusty-weather operational styling).
+                    let production = field.style.as_ref().map(|style| {
+                        Arc::new(rustwx_render::build_colormap(
+                            &style.scale,
+                            style.colormap_options,
+                        ))
+                    });
+                    model_layer::ModelMapLayer {
+                        field: Arc::clone(&field),
+                        lut: Arc::new(lut),
+                        production,
+                        colormap: rw_ui::colormap::VIRIDIS,
+                        opacity: 0.65,
+                        visible: true,
+                        generation,
+                    }
+                })
+            });
+            let _ = sender.send(layer);
+            ctx_clone.request_repaint();
+        });
+        self.status = "Building model layer…".to_owned();
+    }
+
+    /// Quantized view key for the model-layer raster.
+    fn model_layer_current_view(&self) -> ModelLayerView {
+        ModelLayerView {
+            center_lat: self.map_center_lat,
+            center_lon: self.map_center_lon,
+            map_scale: self.map_scale,
+        }
+    }
+
+    /// Draw the model layer (and kick a background re-render when the view
+    /// moved). The raster renders at HALF resolution — model fields are
+    /// smooth, linear texture filtering upscales invisibly — so a full
+    /// re-render lands in tens of ms without touching the radar fast path.
+    fn draw_model_layer(&mut self, painter: &egui::Painter, rect: egui::Rect) {
+        let Some(layer) = &self.model_layer else {
+            return;
+        };
+        if !layer.visible {
+            return;
+        }
+        let view = self.model_layer_current_view();
+        let current = self
+            .model_layer_texture
+            .as_ref()
+            .filter(|(_, generation, _)| *generation == layer.generation);
+        let needs_render = current
+            .map(|(_, _, have)| {
+                (have.center_lat - view.center_lat).abs() > 1e-4
+                    || (have.center_lon - view.center_lon).abs() > 1e-4
+                    || (have.map_scale - view.map_scale).abs() > 0.01
+            })
+            .unwrap_or(true);
+        if needs_render && self.model_layer_render_rx.is_none() {
+            let (sender, receiver) = mpsc::channel();
+            self.model_layer_render_rx = Some(receiver);
+            let generation = layer.generation;
+            let field = Arc::clone(&layer.field);
+            let lut = Arc::clone(&layer.lut);
+            let colormap = layer.colormap;
+            let production = layer.production.clone();
+            let render_view = view;
+            let center_lat = view.center_lat as f64;
+            let center_lon = view.center_lon as f64;
+            let km_per_pt = 111.32 / view.map_scale as f64;
+            let (w_pts, h_pts) = (rect.width() as f64, rect.height() as f64);
+            thread::spawn(move || {
+                let render_start = Instant::now();
+                let w = (w_pts / 2.0).max(8.0) as usize;
+                let h = (h_pts / 2.0).max(8.0) as usize;
+                let mut pixels = vec![egui::Color32::TRANSPARENT; w * h];
+                let range = field.range;
+                for (i, px) in pixels.iter_mut().enumerate() {
+                    let x = (i % w) as f64;
+                    let y = (i / w) as f64;
+                    let east_km = (x - w as f64 / 2.0) * 2.0 * km_per_pt;
+                    let north_km = (h as f64 / 2.0 - y) * 2.0 * km_per_pt;
+                    let (lat, lon) = aeqd_inverse_km(center_lat, center_lon, east_km, north_km);
+                    let Some(index) = lut.lookup(lat as f32, lon as f32) else {
+                        continue;
+                    };
+                    let Some(value) = field.values.get(index).copied() else {
+                        continue;
+                    };
+                    if !value.is_finite() {
+                        continue;
+                    }
+                    if let Some(cmap) = &production {
+                        let rgba = cmap.map(f64::from(value));
+                        *px = egui::Color32::from_rgba_unmultiplied(rgba.r, rgba.g, rgba.b, rgba.a);
+                    } else if let Some((vmin, vmax)) = range {
+                        let t = rw_ui::colormap::normalize(value, vmin, vmax);
+                        *px = colormap.sample(t);
+                    }
+                }
+                let image = egui::ColorImage {
+                    size: [w, h],
+                    source_size: egui::vec2(w as f32, h as f32),
+                    pixels,
+                };
+                let _ = sender.send((
+                    generation,
+                    render_view,
+                    image,
+                    render_start.elapsed().as_secs_f32() * 1000.0,
+                ));
+            });
+        }
+        if let Some((texture, _, rendered)) = &self.model_layer_texture {
+            // Anchor the (possibly stale) raster to the WORLD, not the
+            // screen: place the rendered view's center at its current screen
+            // position and scale by the zoom ratio — the layer pans/zooms in
+            // lockstep with the radar until the fresh raster lands.
+            let rendered_center =
+                self.lon_lat_to_screen(rect, rendered.center_lon, rendered.center_lat);
+            let zoom_ratio = self.map_scale / rendered.map_scale.max(0.001);
+            let half = egui::vec2(
+                rect.width() * 0.5 * zoom_ratio,
+                rect.height() * 0.5 * zoom_ratio,
+            );
+            let image_rect =
+                egui::Rect::from_min_max(rendered_center - half, rendered_center + half);
+            let opacity = (layer.opacity * 255.0) as u8;
+            painter.image(
+                texture.id(),
+                image_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::from_white_alpha(opacity),
+            );
+        }
+    }
+
     /// GR2-style Vrot measurement overlay: two clicked gates (max inbound +
     /// max outbound), connecting line, and a card with
     /// Vrot = (|Vin| + |Vout|) / 2, couplet diameter, and beam height.
@@ -8766,24 +10408,24 @@ impl ViewerApp {
         if !self.show_inspector_card {
             return;
         }
+        // The card works with OR without radar data under the cursor —
+        // a clear-air site (KDDC with no echoes) still reads coordinates
+        // and the model value.
         let (anchor, readout, pinned) = if let Some((lon, lat)) = self.pinned_inspector_lonlat {
             let position = self.lon_lat_to_screen(rect, lon, lat);
             if !rect.contains(position) {
                 return;
             }
-            let Some(readout) = self.cursor_readout_at(rect, position) else {
-                return;
-            };
-            (position, readout, true)
+            (position, self.cursor_readout_at(rect, position), true)
+        } else if let Some(position) = hover {
+            (position, self.cursor_readout.clone(), false)
         } else {
-            let (Some(position), Some(readout)) = (hover, self.cursor_readout.clone()) else {
-                return;
-            };
-            (position, readout, false)
+            return;
         };
 
         // Velocity radial arrow at the probed gate.
-        if readout.product.color_family() == ColorTableFamily::Velocity
+        if let Some(readout) = &readout
+            && readout.product.color_family() == ColorTableFamily::Velocity
             && readout.value.is_finite()
             && let Some((radar_lat, radar_lon)) = self.radar_location()
         {
@@ -8806,43 +10448,76 @@ impl ViewerApp {
             painter.circle_stroke(anchor, 5.0, egui::Stroke::new(1.2, egui::Color32::BLACK));
         }
 
-        // Card lines.
-        let units = product_units(&readout.product);
-        let mut lines = vec![format!(
-            "{} {:.1}{}{}",
-            readout.product.label(),
-            readout.value,
-            if units.is_empty() { "" } else { " " },
-            units
-        )];
-        if let Some(base) = readout.base_value {
-            let nyquist = readout
-                .nyquist_velocity_mps
-                .map(|n| format!(" · Nyq {n:.0}"))
-                .unwrap_or_default();
-            lines.push(format!("raw VEL {base:.1} m/s{nyquist}"));
-        } else if readout.product.base_moment() == MomentType::Velocity
-            && let Some(nyquist) = readout.nyquist_velocity_mps
-            && readout.value.abs() >= nyquist * 0.75
-        {
-            // RAW velocity near the Nyquist can be folded — a folded gate
-            // reads as opposite-direction flow (a fake couplet). Same field
-            // failure that motivated this: blue at +23.5 m/s that was really
-            // −33 with Nyq 28.
-            lines.push(format!(
-                "⚠ near Nyquist ({nyquist:.0}) — may be folded; enable Unfold VEL"
-            ));
+        // Card lines (radar block only when a gate resolves).
+        let mut lines = Vec::new();
+        if readout.is_none() {
+            let (lon, lat) = self.screen_to_lon_lat(rect, anchor);
+            lines.push(format!("{lat:.3}, {lon:.3}"));
         }
-        lines.push(format!(
-            "{:.1} km @ {:03.0}° · tilt {:.1}°",
-            readout.range_km, readout.azimuth_deg, readout.elevation_deg
-        ));
-        lines.push(format!(
-            "beam ↑ {:.0} m ({:.1} kft)",
-            readout.height_above_radar_m,
-            readout.height_above_radar_m * 0.003_280_84
-        ));
-        if let Some(probe) = readout.vrot {
+        if let Some(readout) = &readout {
+            let units = product_units(&readout.product);
+            lines.push(format!(
+                "{} {:.1}{}{}",
+                readout.product.label(),
+                readout.value,
+                if units.is_empty() { "" } else { " " },
+                units
+            ));
+            if !self.inspector_show_raw_vel {
+            } else if let Some(base) = readout.base_value {
+                let nyquist = readout
+                    .nyquist_velocity_mps
+                    .map(|n| format!(" · Nyq {n:.0}"))
+                    .unwrap_or_default();
+                lines.push(format!("raw VEL {base:.1} m/s{nyquist}"));
+            } else if readout.product.base_moment() == MomentType::Velocity
+                && let Some(nyquist) = readout.nyquist_velocity_mps
+                && readout.value.abs() >= nyquist * 0.75
+            {
+                // RAW velocity near the Nyquist can be folded — a folded gate
+                // reads as opposite-direction flow (a fake couplet). Same field
+                // failure that motivated this: blue at +23.5 m/s that was really
+                // −33 with Nyq 28.
+                lines.push(format!(
+                    "⚠ near Nyquist ({nyquist:.0}) — may be folded; enable Unfold VEL"
+                ));
+            }
+            if self.inspector_show_range_az {
+                lines.push(format!(
+                    "{:.1} km @ {:03.0}° · tilt {:.1}°",
+                    readout.range_km, readout.azimuth_deg, readout.elevation_deg
+                ));
+            }
+            if self.inspector_show_beam {
+                lines.push(format!(
+                    "beam ↑ {:.0} m ({:.1} kft)",
+                    readout.height_above_radar_m,
+                    readout.height_above_radar_m * 0.003_280_84
+                ));
+            }
+        }
+        // Model value under the cursor (decoupled LUT — works with or
+        // without the map layer showing).
+        if self.model_enabled
+            && self.inspector_show_model
+            && let Some((_, lut)) = &self.model_lut
+            && let Some(field) = self
+                .model_dock
+                .as_ref()
+                .and_then(|dock| dock.latest_field())
+        {
+            let (lon, lat) = self.screen_to_lon_lat(rect, anchor);
+            if let Some(index) = lut.lookup(lat, lon)
+                && let Some(value) = field.values.get(index).copied()
+                && value.is_finite()
+            {
+                lines.push(format!(
+                    "HRRR {} {:.1} {}",
+                    field.key.var, value, field.units
+                ));
+            }
+        }
+        if let Some(probe) = readout.as_ref().and_then(|readout| readout.vrot) {
             lines.push(format!(
                 "Vrot {:.1} m/s · ΔV {:.1} · sep {:.2} km",
                 probe.vrot_mps, probe.delta_v_mps, probe.separation_km
@@ -9234,7 +10909,7 @@ impl ViewerApp {
                 image_rect,
                 self.lon_lat_to_screen(rect, longitude_deg, latitude_deg),
                 self.aeqd_north_angle(rect, latitude_deg, longitude_deg) - baked,
-                egui::Color32::WHITE,
+                egui::Color32::from_white_alpha((self.radar_opacity * 255.0) as u8),
             );
         }
         self.draw_range_ring(
@@ -10116,6 +11791,158 @@ impl ViewerApp {
         nearest_site_index(&self.sites, target_lat, target_lon)
     }
 
+    /// Hover readout for derived products via a one-shot grid cache.
+    fn derived_cursor_readout(
+        &mut self,
+        rect: egui::Rect,
+        position: egui::Pos2,
+        derived: DerivedProduct,
+        volume: &Arc<RadarVolume>,
+        selected_cut: usize,
+    ) -> Option<CursorReadout> {
+        let volume_ptr = Arc::as_ptr(volume) as usize;
+        let cut_key = if derived.is_volume_wide() {
+            usize::MAX
+        } else {
+            selected_cut
+        };
+        let cached = self
+            .derived_readout_cache
+            .as_ref()
+            .filter(|(d, vp, ck, _, _)| *d == derived && *vp == volume_ptr && *ck == cut_key)
+            .map(|(_, _, _, base_idx, grid)| (*base_idx, Arc::clone(grid)));
+        let (base_idx, grid) = match cached {
+            Some(hit) => hit,
+            None => {
+                let hail = (
+                    self.hail_freezing_level_km * 1000.0,
+                    self.hail_minus20_level_km * 1000.0,
+                );
+                let (base_idx, grid) = if derived.is_volume_wide() {
+                    let base_moment = derived.base_moment();
+                    let base_idx = volume
+                        .cuts
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.moments.contains_key(&base_moment))
+                        .min_by(|a, b| a.1.elevation_deg.total_cmp(&b.1.elevation_deg))
+                        .map(|(i, _)| i)?;
+                    let grid = match derived {
+                        DerivedProduct::CompositeReflectivity => {
+                            composite_reflectivity_grid(volume)
+                        }
+                        DerivedProduct::EchoTops => echo_top_grid(volume, ECHO_TOP_THRESHOLD_DBZ),
+                        DerivedProduct::Vil => vil_grid(volume),
+                        DerivedProduct::VilDensity => vil_density_grid(volume),
+                        DerivedProduct::Mehs => mehs_grid(volume, hail.0, hail.1),
+                        DerivedProduct::Posh => {
+                            hail_grids(volume, hail.0, hail.1, render2d::MeshCalibration::Witt1998)
+                                .map(|grids| grids.posh_pct)
+                        }
+                        DerivedProduct::Poh => poh_grid(volume, hail.0),
+                        DerivedProduct::Marc => marc_grid(volume),
+                        DerivedProduct::GustProxy => gust_proxy_grid(volume),
+                        DerivedProduct::AzimuthalShear | DerivedProduct::Divergence => None,
+                    }?;
+                    (base_idx, grid)
+                } else {
+                    let cut = volume.cuts.get(selected_cut)?;
+                    let velocity = cut.moments.get(&MomentType::Velocity)?;
+                    let grid = match derived {
+                        DerivedProduct::AzimuthalShear => {
+                            render2d::azimuthal_shear_grid(cut, velocity)
+                        }
+                        DerivedProduct::Divergence => {
+                            render2d::radial_divergence_grid(cut, velocity)
+                        }
+                        _ => return None,
+                    };
+                    (selected_cut, grid)
+                };
+                let grid = Arc::new(grid);
+                self.derived_readout_cache =
+                    Some((derived, volume_ptr, cut_key, base_idx, Arc::clone(&grid)));
+                (base_idx, grid)
+            }
+        };
+        let cut = volume.cuts.get(base_idx)?;
+        let (row, gate, radial_index, azimuth_deg, range_km, slant_range_m) =
+            self.sample_grid_geometry(rect, position, cut, &grid)?;
+        let value = grid.scaled_value(row, gate)?;
+        let source_azimuth_deg = cut
+            .radials
+            .get(radial_index)
+            .map(|radial| radial.azimuth_deg)
+            .unwrap_or(azimuth_deg);
+        let height_above_radar_m =
+            radar_core::beam_height_above_radar_m(slant_range_m, cut.elevation_deg as f64) as f32;
+        Some(CursorReadout {
+            site_id: volume.site.id.clone(),
+            volume_time_utc: volume.volume_time.with_timezone(&Utc),
+            product: DisplayProduct::Derived(derived),
+            cut: base_idx,
+            value,
+            base_value: None,
+            vrot: None,
+            raw: None,
+            row,
+            gate,
+            gate_spacing_m: grid.gate_range.gate_spacing_m,
+            range_km,
+            azimuth_deg,
+            source_azimuth_deg,
+            elevation_deg: cut.elevation_deg,
+            height_above_radar_m,
+            nyquist_velocity_mps: None,
+            realtime_volume_id: None,
+            realtime_last_chunk_id: None,
+            realtime_last_chunk_type: None,
+        })
+    }
+
+    /// Invert the raster's screen mapping to (row, gate, azimuth, range,
+    /// slant range) on a cut/grid — shared by the moment and derived
+    /// readout paths.
+    fn sample_grid_geometry(
+        &self,
+        rect: egui::Rect,
+        position: egui::Pos2,
+        cut: &ElevationCut,
+        grid: &MomentGrid,
+    ) -> Option<(usize, usize, usize, f32, f32, f64)> {
+        let (radar_lat, radar_lon) = self.loaded_volume_location()?;
+        let radar_pos = self.lon_lat_to_screen(rect, radar_lon, radar_lat);
+        let angle = self.aeqd_north_angle(rect, radar_lat, radar_lon);
+        let offset = position - radar_pos;
+        let (sin, cos) = (-angle).sin_cos();
+        let east_px = offset.x * cos - offset.y * sin;
+        let north_px = -(offset.x * sin + offset.y * cos);
+        let km_per_px = 111.32 / self.map_scale;
+        let lon_km = east_px * km_per_px;
+        let lat_km = north_px * km_per_px;
+        let range_km = lat_km.hypot(lon_km);
+        let max_range_km = grid_range_km(grid)?;
+        if range_km > max_range_km {
+            return None;
+        }
+        let mut azimuth_deg = lon_km.atan2(lat_km).to_degrees();
+        if azimuth_deg < 0.0 {
+            azimuth_deg += 360.0;
+        }
+        let (row, radial_index) = nearest_grid_row(cut, grid, azimuth_deg)?;
+        let gate = gate_for_range(grid, range_km)?;
+        let slant_range_m = grid.gate_range.first_gate_m as f64
+            + gate as f64 * grid.gate_range.gate_spacing_m as f64;
+        Some((
+            row,
+            gate,
+            radial_index,
+            azimuth_deg,
+            range_km,
+            slant_range_m,
+        ))
+    }
+
     fn cursor_readout_at(
         &mut self,
         rect: egui::Rect,
@@ -10138,12 +11965,11 @@ impl ViewerApp {
         let volume = self.volume.clone()?;
         let selected_cut = cut_index;
         let selected_product = product.clone();
-        // Derived products are not read from a raw cut moment grid here: volume
-        // products (CREF/ET/VIL) are tilt-independent, and per-cut derivatives
-        // (shear/divergence) would need a costly per-hover recompute. Skip the
-        // hover readout for all of them (the colorbar conveys the scale).
-        if selected_product.derived().is_some() {
-            return None;
+        // Derived products sample a cached one-shot grid (computed on the
+        // first hover, reused until the product or volume changes) — the
+        // inspector works on EVERY product, not just raw moments.
+        if let Some(derived) = selected_product.derived() {
+            return self.derived_cursor_readout(rect, position, derived, &volume, selected_cut);
         }
         let cut = volume.cuts.get(selected_cut)?;
         let base_moment = selected_product.base_moment();
@@ -11231,20 +13057,34 @@ fn build_derived_moment_cache(
 ) -> std::result::Result<ViewportMomentCache, String> {
     let (geometry_cut, grid) = if derived.is_volume_wide() {
         // Volume products render on the lowest reflectivity tilt.
+        // Velocity-based composites render on the lowest VELOCITY cut's
+        // geometry (split cuts: the Doppler sweep's radials differ from the
+        // surveillance sweep's).
+        let base_moment = derived.base_moment();
         let base_idx = volume
             .cuts
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.moments.contains_key(&MomentType::Reflectivity))
+            .filter(|(_, c)| c.moments.contains_key(&base_moment))
             .min_by(|a, b| a.1.elevation_deg.total_cmp(&b.1.elevation_deg))
             .map(|(i, _)| i)
-            .ok_or_else(|| "no reflectivity for derived product".to_owned())?;
+            .ok_or_else(|| "no base moment for derived product".to_owned())?;
         let grid = match derived {
             DerivedProduct::CompositeReflectivity => composite_reflectivity_grid(volume),
             DerivedProduct::EchoTops => echo_top_grid(volume, ECHO_TOP_THRESHOLD_DBZ),
             DerivedProduct::Vil => vil_grid(volume),
             DerivedProduct::VilDensity => vil_density_grid(volume),
             DerivedProduct::Mehs => mehs_grid(volume, hail_levels_m.0, hail_levels_m.1),
+            DerivedProduct::Posh => hail_grids(
+                volume,
+                hail_levels_m.0,
+                hail_levels_m.1,
+                render2d::MeshCalibration::Witt1998,
+            )
+            .map(|grids| grids.posh_pct),
+            DerivedProduct::Poh => poh_grid(volume, hail_levels_m.0),
+            DerivedProduct::Marc => marc_grid(volume),
+            DerivedProduct::GustProxy => gust_proxy_grid(volume),
             DerivedProduct::AzimuthalShear | DerivedProduct::Divergence => {
                 unreachable!("velocity derivatives are per-cut")
             }
@@ -11677,6 +13517,236 @@ mod aeqd_tests {
         let planar_e = 1.1 * 111.32 * 39.45f64.to_radians().cos(); // mid-lat scale
         assert!((n - planar_n).abs() < 1.0, "{n} vs {planar_n}");
         assert!((e - planar_e).abs() < 1.0, "{e} vs {planar_e}");
+    }
+}
+
+/// Profile selector for the download window (0 sounding / 1 full / 2 view).
+fn download_profile_for(kind: u8) -> rw_ingest::ingest_profile::IngestProfile {
+    match kind {
+        1 => rw_ingest::ingest_profile::IngestProfile::full(),
+        2 => rw_ingest::ingest_profile::IngestProfile::view(),
+        _ => rw_ingest::ingest_profile::IngestProfile::sounding(),
+    }
+}
+
+/// Manual download: explicit date/cycle/hours/profile. No pruning here —
+/// retention runs at startup/Fetch-latest so a deliberately fetched old
+/// init stays available for the session.
+fn run_model_download(
+    date: &str,
+    cycle_hour: u8,
+    hours: &[u16],
+    profile_kind: u8,
+    cancel: &std::sync::atomic::AtomicBool,
+    progress: &mpsc::Sender<String>,
+    ctx: &egui::Context,
+) -> std::result::Result<String, String> {
+    const STORE: &str = "C:/Users/drew/rusty-weather/store";
+    const CACHE: &str = "C:/Users/drew/rusty-weather/out/rw_batch/cache";
+    let cycle = rustwx_core::CycleSpec::new(date, cycle_hour).map_err(|err| err.to_string())?;
+    let profile = download_profile_for(profile_kind);
+    let run_slug = format!("{date}_{cycle_hour:02}z");
+    let progress_sink = std::sync::Mutex::new(progress.clone());
+    let ctx_sink = ctx.clone();
+    let on_event = move |event: rw_ingest::IngestEvent| {
+        if let rw_ingest::IngestEvent::StageStarted { hour, stage } = event
+            && let Ok(sender) = progress_sink.lock()
+        {
+            let _ = sender.send(format!("HRRR f{hour:02}: {stage:?}…"));
+            ctx_sink.request_repaint();
+        }
+    };
+    let config = rw_ingest::IngestConfig {
+        model: rustwx_core::ModelId::Hrrr,
+        cycle: &cycle,
+        source_override: None,
+        cache_root: std::path::Path::new(CACHE),
+        use_cache: true,
+        store_root: std::path::Path::new(STORE),
+        model_slug: "hrrr",
+        run_slug: &run_slug,
+        profile: &profile,
+        verify: false,
+        progress: &on_event,
+        cancel,
+    };
+    let mut stored = 0usize;
+    for &hour in hours {
+        match rw_ingest::ingest_hour_serial(&config, hour) {
+            Ok(_) => {
+                stored += 1;
+                let _ = progress.send(format!("HRRR {date} {cycle_hour:02}z f{hour:02} stored"));
+                ctx.request_repaint();
+            }
+            Err(rw_ingest::IngestError::Cancelled) => {
+                return Err(format!("cancelled ({stored} hours stored)"));
+            }
+            Err(err) => {
+                if stored == 0 {
+                    return Err(err.to_string());
+                }
+                return Ok(format!(
+                    "HRRR {date} {cycle_hour:02}z: {stored} hours stored (f{hour:02} failed: {err})"
+                ));
+            }
+        }
+    }
+    Ok(format!(
+        "HRRR {date} {cycle_hour:02}z: {stored} hours ingested"
+    ))
+}
+
+/// In-process HRRR ingest via the rw-ingest LIBRARY (typed per-stage
+/// progress + cooperative cancel; atomic writes mean cancel never leaves a
+/// partial hour). Freshest plausible init first (publication lag ~55 min),
+/// fall back one cycle; then prune the store to the two newest runs.
+fn run_model_ingest(
+    cancel: &std::sync::atomic::AtomicBool,
+    progress: &mpsc::Sender<String>,
+    ctx: &egui::Context,
+    keep_runs: usize,
+) -> std::result::Result<String, String> {
+    const STORE: &str = r"C:\Users\drew\rusty-weather\store";
+    const CACHE: &str = r"C:\Users\drew\rusty-weather\out\rw_batch\cache";
+    let now = Utc::now();
+    let candidates = [
+        now - chrono::Duration::minutes(55),
+        now - chrono::Duration::minutes(115),
+    ];
+    let report = |line: String| {
+        let _ = progress.send(line);
+        ctx.request_repaint();
+    };
+    let mut last_error = String::new();
+    'candidates: for candidate in candidates {
+        let date = candidate.format("%Y%m%d").to_string();
+        let cycle_hour: u8 = candidate.format("%H").to_string().parse().unwrap_or(0);
+        let Ok(cycle) = rustwx_core::CycleSpec::new(&date, cycle_hour) else {
+            continue;
+        };
+        let profile = rw_ingest::ingest_profile::IngestProfile::sounding();
+        let run_slug = format!("{date}_{cycle_hour:02}z");
+        let progress_sink = std::sync::Mutex::new(progress.clone());
+        let ctx_sink = ctx.clone();
+        let on_event = move |event: rw_ingest::IngestEvent| {
+            if let rw_ingest::IngestEvent::StageStarted { hour, stage } = event
+                && let Ok(sender) = progress_sink.lock()
+            {
+                let _ = sender.send(format!("HRRR f{hour:02}: {stage:?}…"));
+                ctx_sink.request_repaint();
+            }
+        };
+        let config = rw_ingest::IngestConfig {
+            model: rustwx_core::ModelId::Hrrr,
+            cycle: &cycle,
+            source_override: None,
+            cache_root: std::path::Path::new(CACHE),
+            use_cache: true,
+            store_root: std::path::Path::new(STORE),
+            model_slug: "hrrr",
+            run_slug: &run_slug,
+            profile: &profile,
+            verify: false,
+            progress: &on_event,
+            cancel,
+        };
+        for hour in 0..=3u16 {
+            match rw_ingest::ingest_hour_serial(&config, hour) {
+                Ok(_) => {
+                    report(format!("HRRR {date} {cycle_hour:02}z f{hour:02} stored"));
+                }
+                Err(rw_ingest::IngestError::Cancelled) => {
+                    return Err("cancelled".to_owned());
+                }
+                Err(err) => {
+                    last_error = err.to_string();
+                    // This cycle likely isn't published yet — try the
+                    // previous one (unless some hours already landed, in
+                    // which case report the partial truthfully).
+                    if hour == 0 {
+                        continue 'candidates;
+                    }
+                    prune_model_store(STORE, keep_runs);
+                    return Ok(format!(
+                        "HRRR {date} {cycle_hour:02}z: f00–f{:02} stored (f{hour:02} failed: {last_error})",
+                        hour - 1
+                    ));
+                }
+            }
+        }
+        prune_model_store(STORE, keep_runs);
+        return Ok(format!("HRRR {date} {cycle_hour:02}z ingested (f00–f03)"));
+    }
+    Err(last_error)
+}
+
+/// Keep only the newest `keep` run directories under store/<model>/
+/// (`keep == 0` = unlimited, never deletes).
+fn prune_model_store(store_root: &str, keep: usize) {
+    if keep == 0 {
+        return;
+    }
+    let Ok(models) = std::fs::read_dir(store_root) else {
+        return;
+    };
+    for model in models.flatten() {
+        if !model.path().is_dir() {
+            continue;
+        }
+        let Ok(runs) = std::fs::read_dir(model.path()) else {
+            continue;
+        };
+        let mut run_dirs: Vec<std::path::PathBuf> = runs
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        run_dirs.sort();
+        while run_dirs.len() > keep {
+            let oldest = run_dirs.remove(0);
+            let _ = std::fs::remove_dir_all(oldest);
+        }
+    }
+}
+
+/// Model picker options for the download panel (multi-model entries show
+/// disabled until rw-ingest supports them — "coming soon").
+fn ingest_worker_model_options() -> Vec<rw_ui::ModelOption> {
+    rustwx_models::supported_models()
+        .iter()
+        .map(|&model| {
+            let enabled = rw_ingest::ingest_supported(model);
+            rw_ui::ModelOption {
+                slug: model.as_str().to_string(),
+                label: model.as_str().to_uppercase(),
+                enabled,
+                note: if enabled {
+                    String::new()
+                } else {
+                    "ingest not yet supported — multi-model coming soon".to_string()
+                },
+            }
+        })
+        .collect()
+}
+
+/// Keep the download panel's cycle/source pickers + hours hint in sync
+/// with the spec's model (port of rusty-weather-ui's sync_run_pickers).
+fn sync_run_pickers(download: &mut rw_ui::DownloadPanel, spec: &rw_ui::DownloadSpec) {
+    let Ok(model) = spec.model.parse::<rustwx_core::ModelId>() else {
+        return;
+    };
+    let summary = rustwx_models::model_summary(model);
+    download.set_cycle_options(summary.cycle_hours_utc.to_vec());
+    let mut sources = vec!["auto".to_string()];
+    sources.extend(summary.sources.iter().map(|source| source.id.to_string()));
+    download.set_source_options(sources);
+    let supported = rustwx_models::supported_forecast_hours(model, spec.cycle);
+    match (supported.first(), supported.last()) {
+        (Some(first), Some(last)) => {
+            download.set_hours_hint(format!("supported: {first}-{last} ({:02}z)", spec.cycle));
+        }
+        _ => download.set_hours_hint("no supported hours for this cycle".to_string()),
     }
 }
 
@@ -16284,6 +18354,51 @@ mod tests {
             spc_reports: None,
             spc_receiver: None,
             archive_pending_event: None,
+            ingest: None,
+            download_panel: rw_ui::DownloadPanel::new(rw_ui::DownloadSpec::default()),
+            sat: None,
+            sat_panel: rw_ui::SatellitePanel::new(rw_ui::SatFollowSpec::default()),
+            sat_player: rw_ui::SatPlayerPanel::new(),
+            show_satellite: false,
+            model_dock: None,
+            model_dock_open: false,
+            sat_layer: None,
+            sat_layer_build_rx: None,
+            sat_layer_texture: None,
+            sat_layer_render_rx: None,
+            sat_layer_generation: 0,
+            sat_last_frame: None,
+            model_layer: None,
+            model_layer_build_rx: None,
+            model_layer_texture: None,
+            model_layer_render_rx: None,
+            model_layer_generation: 0,
+            radar_opacity: 1.0,
+            model_ingest_rx: None,
+            model_ingest_progress_rx: None,
+            model_ingest_cancel: None,
+            model_download_open: false,
+            download_date: String::new(),
+            download_cycle: 0,
+            download_hours: "0-3".to_owned(),
+            download_profile: 0,
+            last_sounding_request: None,
+            hail_env_pending: false,
+            inspector_show_raw_vel: true,
+            inspector_show_range_az: true,
+            inspector_show_beam: true,
+            inspector_show_model: true,
+            model_lut: None,
+            model_lut_rx: None,
+            model_enabled: true,
+            model_keep_runs: 2,
+            model_layer_render_ms: None,
+            sounding_compute_ms: None,
+            frame_ms_avg: 0.0,
+            native_sounding: None,
+            native_sounding_rx: None,
+            native_sounding_src: None,
+            native_skewt_open: false,
             archive_frame_count: 10,
             archive_loaded_range: None,
             archive_load_loop: true,
@@ -16319,6 +18434,7 @@ mod tests {
             selected_hazard_index: None,
             storm_motion_direction_deg: DEFAULT_STORM_MOTION_DIRECTION_DEG,
             storm_motion_speed_kt: DEFAULT_STORM_MOTION_SPEED_KT,
+            derived_readout_cache: None,
             dealiased_readout_cache: None,
         }
     }
