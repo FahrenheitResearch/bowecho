@@ -122,6 +122,33 @@ const BASEMAP_US_DETAIL_BOUNDS: &[[f32; 4]] = &[
 const RAYON_NUM_THREADS_ENV: &str = "RAYON_NUM_THREADS";
 
 fn main() -> eframe::Result {
+    // Crash forensics: panics land in a log next to the settings so field
+    // reports from other machines carry a backtrace ("crashes a lot when
+    // switching pane views" needs a line number, not a guess).
+    let panic_log = settings::panic_log_path();
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let report = format!(
+            "==== {} ====
+{info}
+{backtrace}
+",
+            chrono::Utc::now().to_rfc3339()
+        );
+        if let Some(path) = &panic_log {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = file.write_all(report.as_bytes());
+            }
+        }
+        eprintln!("{report}");
+        default_hook(info);
+    }));
     let input_path = std::env::args_os().nth(1).map(PathBuf::from);
 
     let native_options = eframe::NativeOptions {
@@ -2433,7 +2460,7 @@ impl ViewerApp {
         // Model store: enforce retention at startup (other tools may have
         // left extra runs) and auto-create the dock when data exists, so
         // Alt+click soundings work cold — no "Show on map" required.
-        let model_store = std::path::PathBuf::from("C:/Users/drew/rusty-weather/store");
+        let model_store = settings::model_store_dir();
         if app.model_keep_runs > 0 {
             prune_model_store(&model_store.to_string_lossy(), app.model_keep_runs as usize);
         }
@@ -2784,6 +2811,12 @@ impl ViewerApp {
             .is_some_and(|volume| volume.site.id != selected_site_id)
             || history_contains_other_site(&self.frame_history, &selected_site_id)
         {
+            // Diagnostic: a surprise clear here is the "every frame
+            // replaces the previous" failure mode — make it visible.
+            self.status = format!(
+                "history reset (site change to {selected_site_id}, had {} frames)",
+                self.frame_history.len()
+            );
             self.clear_frame_history();
         }
 
@@ -5812,7 +5845,7 @@ impl eframe::App for ViewerApp {
 
         if self.model_dock_open {
             if self.model_dock.is_none() {
-                let store_root = std::path::PathBuf::from(r"C:\Users\drew\rusty-weather\store");
+                let store_root = settings::model_store_dir();
                 self.model_dock = Some(model_data::ModelDataDock::new(&ctx, store_root));
             }
             let mut open = self.model_dock_open;
@@ -6236,7 +6269,7 @@ impl ViewerApp {
                     {
                         if self.model_enabled {
                             let store =
-                                std::path::PathBuf::from("C:/Users/drew/rusty-weather/store");
+                                settings::model_store_dir();
                             if store
                                 .read_dir()
                                 .map(|mut entries| entries.next().is_some())
@@ -9039,7 +9072,7 @@ impl ViewerApp {
                 .unwrap_or(0);
         }
         if self.ingest.is_none() {
-            let store = std::path::PathBuf::from("C:/Users/drew/rusty-weather/store");
+            let store = settings::model_store_dir();
             let notify = ctx.clone();
             let worker = ingest_worker::IngestWorker::spawn(store, move || {
                 notify.request_repaint();
@@ -9150,7 +9183,7 @@ impl ViewerApp {
             }
             if self.model_keep_runs > 0 {
                 prune_model_store(
-                    "C:/Users/drew/rusty-weather/store",
+                    &settings::model_store_dir().to_string_lossy(),
                     self.model_keep_runs as usize,
                 );
             }
@@ -9307,7 +9340,7 @@ impl ViewerApp {
             // store/sat corrupts reads when both apps follow at once
             // (field failure: checksum mismatch on files rusty-weather
             // was mid-writing).
-            let store = std::path::PathBuf::from("C:/Users/drew/bowecho-sat-store");
+            let store = settings::sat_store_dir();
             let notify = ctx.clone();
             let worker = sat_worker::SatWorker::spawn(store, move || {
                 notify.request_repaint();
@@ -13541,8 +13574,14 @@ fn run_model_download(
     progress: &mpsc::Sender<String>,
     ctx: &egui::Context,
 ) -> std::result::Result<String, String> {
-    const STORE: &str = "C:/Users/drew/rusty-weather/store";
-    const CACHE: &str = "C:/Users/drew/rusty-weather/out/rw_batch/cache";
+    let store_dir = settings::model_store_dir();
+    let cache_dir = settings::model_cache_dir();
+    let store_str = store_dir.to_string_lossy();
+    let cache_str = cache_dir.to_string_lossy();
+    #[allow(non_snake_case)]
+    let STORE: &str = &store_str;
+    #[allow(non_snake_case)]
+    let CACHE: &str = &cache_str;
     let cycle = rustwx_core::CycleSpec::new(date, cycle_hour).map_err(|err| err.to_string())?;
     let profile = download_profile_for(profile_kind);
     let run_slug = format!("{date}_{cycle_hour:02}z");
@@ -13606,8 +13645,14 @@ fn run_model_ingest(
     ctx: &egui::Context,
     keep_runs: usize,
 ) -> std::result::Result<String, String> {
-    const STORE: &str = r"C:\Users\drew\rusty-weather\store";
-    const CACHE: &str = r"C:\Users\drew\rusty-weather\out\rw_batch\cache";
+    let store_dir = settings::model_store_dir();
+    let cache_dir = settings::model_cache_dir();
+    let store_str = store_dir.to_string_lossy();
+    let cache_str = cache_dir.to_string_lossy();
+    #[allow(non_snake_case)]
+    let STORE: &str = &store_str;
+    #[allow(non_snake_case)]
+    let CACHE: &str = &cache_str;
     let now = Utc::now();
     let candidates = [
         now - chrono::Duration::minutes(55),

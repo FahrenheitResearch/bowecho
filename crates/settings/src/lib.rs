@@ -151,6 +151,56 @@ pub fn tile_cache_dir() -> Option<PathBuf> {
     config_dir().map(|dir| dir.join("bowecho").join("tiles"))
 }
 
+/// Platform-correct bowecho data root (config dir scoped). Created on use.
+fn bowecho_dir(leaf: &str) -> PathBuf {
+    let dir = config_dir()
+        .map(|dir| dir.join("bowecho").join(leaf))
+        .unwrap_or_else(|| PathBuf::from("bowecho-data").join(leaf));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Model (rw-store) root. Dev convenience: when the local rusty-weather
+/// checkout's store exists (the dev machine), share it; everyone else gets
+/// a per-user app-data store — NEVER a hardcoded path that resolves
+/// read-only on other systems (v0.8.0 macOS "os error 30").
+pub fn model_store_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let dev = PathBuf::from("C:/Users/drew/rusty-weather/store");
+        if dev.is_dir() {
+            return dev;
+        }
+    }
+    bowecho_dir("model-store")
+}
+
+/// Raw GRIB download cache for in-app ingest.
+pub fn model_cache_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let dev = PathBuf::from("C:/Users/drew/rusty-weather/out/rw_batch/cache");
+        if dev.is_dir() {
+            return dev;
+        }
+    }
+    bowecho_dir("model-cache")
+}
+
+/// Crash log destination (config dir; None when no config dir resolves).
+pub fn panic_log_path() -> Option<PathBuf> {
+    config_dir().map(|dir| {
+        let root = dir.join("bowecho");
+        let _ = std::fs::create_dir_all(&root);
+        root.join("panic.log")
+    })
+}
+
+/// GOES rolling store (always bowecho's own — no cross-process sharing).
+pub fn sat_store_dir() -> PathBuf {
+    bowecho_dir("sat-store")
+}
+
 fn config_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
