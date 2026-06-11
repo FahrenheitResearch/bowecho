@@ -41,6 +41,7 @@ mod sounding_panels;
 mod spc_layers;
 mod tiles;
 mod vol3d;
+mod wofs;
 
 const MIN_DISPLAYABLE_RADIALS: usize = 180;
 const DEFAULT_MAP_SCALE: f32 = 115.0;
@@ -535,6 +536,8 @@ struct ViewerApp {
         Option<mpsc::Receiver<std::result::Result<(Arc<rw_ui::FieldData>, String), String>>>,
     /// 3D Volume Explorer (GPU direct volume rendering).
     vol3d: vol3d::Vol3d,
+    /// WoFS viewer window state.
+    wofs: wofs::WofsState,
     /// GR2A-style custom URL polling: a served directory with dir.list
     /// (the convention mobile radars/DOWs use in the field).
     poll_url: String,
@@ -2498,6 +2501,7 @@ impl ViewerApp {
             download_hours: "0-3".to_owned(),
             download_profile: 0,
             vol3d: vol3d::Vol3d::default(),
+            wofs: wofs::WofsState::default(),
             poll_url: String::new(),
             poll_active: false,
             poll_last_file: None,
@@ -6010,6 +6014,7 @@ impl eframe::App for ViewerApp {
         self.model_data_window(&ctx);
         self.satellite_window(&ctx);
         self.vol3d_window(&ctx);
+        self.wofs_window(&ctx);
         guide::guide_window(&ctx, &mut self.show_guide);
 
         if self.native_skewt_open && self.native_sounding.is_some() {
@@ -6065,6 +6070,15 @@ impl ViewerApp {
                 if self.model_dock_open && !self.model_enabled {
                     self.model_enabled = true;
                 }
+            }
+            if ui
+                .selectable_label(self.wofs.open, "WoFS")
+                .on_hover_text(
+                    "NSSL Warn-on-Forecast System: rapid-cycling ensemble guidance (paintballs, probabilities, ensemble means), radar-time-synced",
+                )
+                .clicked()
+            {
+                self.wofs.open = !self.wofs.open;
             }
             if ui
                 .selectable_label(self.vol3d.open, "3D")
@@ -11626,6 +11640,183 @@ impl ViewerApp {
         }
     }
 
+    /// WoFS viewer window: run/product/minute browser over the public
+    /// CB-WoFS imagery, with sync-to-radar-frame.
+    fn wofs_window(&mut self, ctx: &egui::Context) {
+        if !self.wofs.open {
+            return;
+        }
+        if self.wofs.catalog.is_none() && self.wofs.catalog_rx.is_none() {
+            self.wofs.start_catalog(ctx);
+        }
+        // Radar-time sync: pick the forecast minute nearest the displayed
+        // frame (init + minute ≈ frame time).
+        if self.wofs.sync_to_radar
+            && let Some(volume) = &self.volume
+            && let Some(catalog) = &self.wofs.catalog
+            && let Some(run) = catalog.runs.get(self.wofs.run_index)
+            && !self.wofs.init.is_empty()
+        {
+            let frame = volume.volume_time.with_timezone(&Utc);
+            if let (Ok(rd), Ok(init_h), Ok(init_m)) = (
+                chrono::NaiveDate::parse_from_str(&run.rundate, "%Y%m%d"),
+                self.wofs.init[..2].parse::<u32>(),
+                self.wofs.init[2..].parse::<u32>(),
+            ) {
+                let mut init_time = rd.and_hms_opt(init_h, init_m, 0).unwrap().and_utc();
+                // Inits 00z-03z belong to the NEXT calendar day.
+                if init_h < 12 {
+                    init_time += chrono::Duration::days(1);
+                }
+                let delta_min = (frame - init_time).num_minutes();
+                if delta_min >= 0 {
+                    let snapped = self.wofs.snap_minute(delta_min.min(600) as u32);
+                    if snapped != self.wofs.minute {
+                        self.wofs.minute = snapped;
+                    }
+                }
+            }
+        }
+        self.wofs.pump(ctx);
+        let mut open = self.wofs.open;
+        egui::Window::new("WoFS (Warn-on-Forecast)")
+            .open(&mut open)
+            .default_size([760.0, 740.0])
+            .min_size([460.0, 420.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                let Some(catalog) = self.wofs.catalog.clone() else {
+                    ui.spinner();
+                    ui.label(&self.wofs.status);
+                    ui.weak(wofs::CREDIT);
+                    return;
+                };
+                ui.horizontal_wrapped(|ui| {
+                    let run_label = catalog
+                        .runs
+                        .get(self.wofs.run_index)
+                        .map(|r| format!("{} {}", r.rundate, r.name))
+                        .unwrap_or_default();
+                    egui::ComboBox::from_id_salt("wofs_run")
+                        .selected_text(run_label)
+                        .width(220.0)
+                        .show_ui(ui, |ui| {
+                            for (i, run) in catalog.runs.iter().enumerate().take(20) {
+                                if ui
+                                    .selectable_value(
+                                        &mut self.wofs.run_index,
+                                        i,
+                                        format!("{} {}", run.rundate, run.name),
+                                    )
+                                    .changed()
+                                {
+                                    self.wofs.init = run
+                                        .inits
+                                        .first()
+                                        .cloned()
+                                        .unwrap_or_default();
+                                }
+                            }
+                        });
+                    if let Some(run) = catalog.runs.get(self.wofs.run_index) {
+                        egui::ComboBox::from_id_salt("wofs_init")
+                            .selected_text(format!("{}z", self.wofs.init))
+                            .width(76.0)
+                            .show_ui(ui, |ui| {
+                                for init in run.inits.iter().rev() {
+                                    ui.selectable_value(
+                                        &mut self.wofs.init,
+                                        init.clone(),
+                                        format!("{init}z"),
+                                    );
+                                }
+                            });
+                    }
+                    egui::ComboBox::from_id_salt("wofs_product")
+                        .selected_text(self.wofs.product.clone())
+                        .width(240.0)
+                        .show_ui(ui, |ui| {
+                            for (group, slugs) in &catalog.groups {
+                                ui.weak(group);
+                                for slug in slugs.iter().take(40) {
+                                    ui.selectable_value(
+                                        &mut self.wofs.product,
+                                        slug.clone(),
+                                        slug,
+                                    );
+                                }
+                                ui.separator();
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("f+min");
+                    let mut minute = self.wofs.minute as i32;
+                    if ui
+                        .add(egui::Slider::new(&mut minute, 0..=360).step_by(5.0))
+                        .changed()
+                    {
+                        self.wofs.minute = self.wofs.snap_minute(minute as u32);
+                        self.wofs.sync_to_radar = false;
+                    }
+                    ui.checkbox(&mut self.wofs.sync_to_radar, "Sync to radar")
+                        .on_hover_text(
+                            "Follow the displayed radar frame: the forecast minute tracks init→frame offset (the WoFS image steps as you scrub the loop — map draping is a future upgrade)",
+                        );
+                    if self.wofs.sync_to_radar {
+                        ui.weak(format!(
+                            "→ {}z + {} min",
+                            self.wofs.init, self.wofs.minute
+                        ));
+                    }
+                    if self.wofs.image_rx.is_some() {
+                        ui.spinner();
+                    }
+                    ui.weak(&self.wofs.status);
+                });
+                if let Some(run) = catalog.runs.get(self.wofs.run_index) {
+                    let base_url =
+                        wofs::image_url(run, &self.wofs.init, &self.wofs.product, self.wofs.minute);
+                    let size = ui.available_size();
+                    let side = (size.x.min(size.y * 900.0 / 800.0)).max(200.0);
+                    let rect_size = egui::vec2(side, side * 800.0 / 900.0);
+                    let (rect, _) =
+                        ui.allocate_exact_size(rect_size, egui::Sense::hover());
+                    if let Some(texture) = self.wofs.textures.get(&base_url) {
+                        ui.painter().image(
+                            texture.id(),
+                            rect,
+                            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    } else {
+                        ui.painter().rect_filled(
+                            rect,
+                            4.0,
+                            egui::Color32::from_rgb(14, 16, 20),
+                        );
+                    }
+                    for overlay in self.wofs.overlays.clone() {
+                        let url =
+                            wofs::image_url(run, &self.wofs.init, &overlay, self.wofs.minute);
+                        if let Some(texture) = self.wofs.textures.get(&url) {
+                            ui.painter().image(
+                                texture.id(),
+                                rect,
+                                egui::Rect::from_min_max(
+                                    egui::Pos2::ZERO,
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                    }
+                }
+                ui.weak(wofs::CREDIT);
+            });
+        self.wofs.open = open;
+    }
+
     /// 3D Volume Explorer window: background box resample of the current
     /// volume around the view center, GPU raymarched via a glow paint
     /// callback (docs/xsection-3d-spec.md: GR2A-style direct volume
@@ -12728,19 +12919,37 @@ impl ViewerApp {
         } else {
             false
         };
-        // Model value under the cursor (decoupled LUT — works with or
-        // without the map layer showing).
+        // Model value under the cursor: read the TOPMOST VISIBLE layer
+        // (each slot carries its own field + LUT), so the inspector
+        // matches what's on screen — derived OA layers included (field
+        // report: hovering an SBCAPE (OA) layer read HRRR T2m). Falls
+        // back to the dock's field when no layer is shown.
         let _ = ob_owns_card;
-        if self.model_enabled
-            && self.inspector_show_model
-            && let Some((_, lut)) = &self.model_lut
-            && let Some(field) = self
-                .model_dock
-                .as_ref()
-                .and_then(|dock| dock.latest_field())
-        {
+        if self.model_enabled && self.inspector_show_model {
             let (lon, lat) = self.screen_to_lon_lat(rect, anchor);
-            if let Some(index) = lut.lookup(lat, lon)
+            let mut shown = false;
+            if let Some(slot) = self
+                .model_layers
+                .iter()
+                .rev()
+                .find(|slot| slot.layer.visible)
+            {
+                let field = &slot.layer.field;
+                if let Some(index) = slot.layer.lut.lookup(lat, lon)
+                    && let Some(value) = field.values.get(index).copied()
+                    && value.is_finite()
+                {
+                    lines.push(format!("{} {:.1} {}", field.key.var, value, field.units));
+                    shown = true;
+                }
+            }
+            if !shown
+                && let Some((_, lut)) = &self.model_lut
+                && let Some(field) = self
+                    .model_dock
+                    .as_ref()
+                    .and_then(|dock| dock.latest_field())
+                && let Some(index) = lut.lookup(lat, lon)
                 && let Some(value) = field.values.get(index).copied()
                 && value.is_finite()
             {
@@ -21021,6 +21230,7 @@ mod tests {
             download_hours: "0-3".to_owned(),
             download_profile: 0,
             vol3d: vol3d::Vol3d::default(),
+            wofs: wofs::WofsState::default(),
             poll_url: String::new(),
             poll_active: false,
             poll_last_file: None,

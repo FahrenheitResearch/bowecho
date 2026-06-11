@@ -231,6 +231,11 @@ fn fetch_network(network: &str) -> Result<Vec<SurfaceOb>, String> {
             .get("utc_valid")
             .and_then(|v| v.as_str())
             .and_then(|t| {
+                // IEM emits a trailing Z ("2026-06-11T19:19:00Z") — the
+                // missing-Z parse made time None, and the pool DROPS
+                // timeless obs on merge (field report: mesonets-alone
+                // showed nothing).
+                let t = t.trim_end_matches('Z');
                 chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S")
                     .or_else(|_| chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M"))
                     .ok()
