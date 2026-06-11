@@ -191,10 +191,16 @@ fn main() -> eframe::Result {
     }));
     let input_path = std::env::args_os().nth(1).map(PathBuf::from);
 
+    // The icon: the first Tornado Emergency displayed in BowEcho — the
+    // Toluca IL supercell of 2026-06-11 (KILX TO.W 0088), as captured
+    // live by a user. Real data is the brand.
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/bowecho.png"))
+        .unwrap_or_default();
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1500.0, 950.0])
-            .with_min_inner_size([1120.0, 700.0]),
+            .with_min_inner_size([1120.0, 700.0])
+            .with_icon(icon),
         ..Default::default()
     };
 
@@ -2847,6 +2853,20 @@ impl ViewerApp {
 
     fn maybe_refresh_realtime_level2(&mut self, ctx: &egui::Context) {
         if !self.realtime_level2_auto_refresh {
+            return;
+        }
+        // An active custom-URL poll owns the primary view: a catalog-site
+        // refresh here would wipe the polled frames from frame_history
+        // (history_contains_other_site) every tick and, when it installs,
+        // overwrite the polled volume. Overlay layers keep refreshing via
+        // maybe_refresh_radar_layers — they never touch primary state.
+        if self.poll_active && !self.poll_url.is_empty() {
+            self.live_refresh_skip_reason =
+                Some("custom URL poll owns the primary view".to_owned());
+            // Keep a heartbeat: with hazards/layers/playback all off, no
+            // other path schedules repaints, and the poller's 15 s
+            // due-check would stall until mouse input.
+            ctx.request_repaint_after(Duration::from_secs(1));
             return;
         }
         if self.load_receiver.is_some() {
@@ -6062,6 +6082,12 @@ impl ViewerApp {
         mode: LatestLoadMode,
     ) {
         let site_id = site.level2_id.clone();
+        let paused_poll = latest_load_pauses_poll(mode, self.poll_active);
+        if paused_poll {
+            // Explicit primary intent takes the view from the custom-URL
+            // poll; keep poll_url/poll_last_file so Start resumes it.
+            self.poll_active = false;
+        }
         if history_contains_other_site(&self.frame_history, &site_id) {
             self.clear_frame_history();
         }
@@ -6077,6 +6103,9 @@ impl ViewerApp {
             LatestLoadMode::Loop => format!("Loading L2 loop {site_id}"),
             LatestLoadMode::User => format!("Loading latest L2 {site_id}"),
         };
+        if paused_poll {
+            self.status.push_str(" — URL poll paused");
+        }
         let current_source_path = (mode == LatestLoadMode::AutoRefresh)
             .then(|| self.source_path.clone())
             .flatten();
@@ -7295,6 +7324,10 @@ impl ViewerApp {
                                 self.poll_active = true;
                                 self.poll_last_file = None;
                                 self.poll_next = None;
+                                // An auto-refresh load already in flight
+                                // would land AFTER the first poll install
+                                // and wipe the polled frames — drop it.
+                                self.load_receiver = None;
                                 self.app_settings.poll_url = self.poll_url.clone();
                                 let _ = self.app_settings.save();
                             }
@@ -7309,6 +7342,12 @@ impl ViewerApp {
                         self.poll_active = !self.poll_active;
                         self.poll_last_file = None;
                         self.poll_next = None;
+                        if self.poll_active {
+                            // Drop any in-flight auto-refresh load: it
+                            // would land after the first poll install and
+                            // wipe the polled frames.
+                            self.load_receiver = None;
+                        }
                         if self.poll_active && self.app_settings.poll_url != self.poll_url {
                             self.app_settings.poll_url = self.poll_url.clone();
                             let _ = self.app_settings.save();
@@ -9120,10 +9159,11 @@ impl ViewerApp {
             && let Some(index) = self.nearest_site_to_position(rect, pointer)
             && let Some(site) = self.sites.get(index).cloned()
         {
-            self.selected_site_index = index;
             if ui.input(|input| input.modifiers.ctrl) {
+                // Layer add must not retarget the primary auto-refresh.
                 self.add_or_refresh_radar_layer(site, ui.ctx());
             } else {
+                self.selected_site_index = index;
                 self.start_latest_level2_load(site, ui.ctx());
             }
         }
@@ -9377,10 +9417,11 @@ impl ViewerApp {
                 && let Some(index) = self.nearest_site_to_position(cell, pointer)
                 && let Some(site) = self.sites.get(index).cloned()
             {
-                self.selected_site_index = index;
                 if ui.input(|input| input.modifiers.ctrl) {
+                    // Layer add must not retarget the primary auto-refresh.
                     self.add_or_refresh_radar_layer(site, ui.ctx());
                 } else {
+                    self.selected_site_index = index;
                     self.start_latest_level2_load(site, ui.ctx());
                 }
             }
@@ -18244,7 +18285,8 @@ fn parse_weather_alert_tags(parameters: &BTreeMap<String, Vec<String>>) -> Parse
             .as_deref()
             .and_then(parse_leading_u16),
         damage_threat: weather_alert_parameter(parameters, "tornadoDamageThreat")
-            .or_else(|| weather_alert_parameter(parameters, "thunderstormDamageThreat")),
+            .or_else(|| weather_alert_parameter(parameters, "thunderstormDamageThreat"))
+            .or_else(|| weather_alert_parameter(parameters, "flashFloodDamageThreat")),
     }
 }
 
@@ -18608,6 +18650,7 @@ fn parse_warning_tags(lines: &[&str]) -> ParsedWarningTags {
             .strip_prefix("TORNADO DAMAGE THREAT...")
             .or_else(|| trimmed.strip_prefix("THUNDERSTORM DAMAGE THREAT..."))
             .or_else(|| trimmed.strip_prefix("TSTM DAMAGE THREAT..."))
+            .or_else(|| trimmed.strip_prefix("FLASH FLOOD DAMAGE THREAT..."))
         {
             tags.damage_threat = Some(value.trim().to_owned());
         }
@@ -18801,10 +18844,27 @@ fn hazard_label(
     event_tracking_number: &str,
     tags: &ParsedWarningTags,
 ) -> String {
+    // IBW damage-threat escalations get said OUT LOUD: catastrophic
+    // tornado = Tornado Emergency, considerable = PDS.
+    let threat = tags
+        .damage_threat
+        .as_deref()
+        .map(str::to_ascii_uppercase)
+        .unwrap_or_default();
     let prefix = match event_family {
-        "tornado" => "TOR",
-        "severe thunderstorm" => "SVR",
-        "flash flood" => "FFW",
+        "tornado" => match threat.as_str() {
+            "CATASTROPHIC" => "TOR EMERGENCY",
+            "CONSIDERABLE" => "PDS TOR",
+            _ => "TOR",
+        },
+        "severe thunderstorm" => match threat.as_str() {
+            "DESTRUCTIVE" => "SVR DESTRUCTIVE",
+            _ => "SVR",
+        },
+        "flash flood" => match threat.as_str() {
+            "CATASTROPHIC" => "FF EMERGENCY",
+            _ => "FFW",
+        },
         "flood" => "FLW",
         "special marine" => "SMW",
         "snow squall" => "SQW",
@@ -18818,9 +18878,24 @@ fn hazard_label(
 }
 
 fn hazard_color(record: &HazardRecord) -> egui::Color32 {
+    let threat = record
+        .damage_threat
+        .as_deref()
+        .map(str::to_ascii_uppercase)
+        .unwrap_or_default();
     match record.event_family.as_str() {
-        "tornado" => egui::Color32::from_rgb(248, 62, 82),
-        "severe thunderstorm" => egui::Color32::from_rgb(246, 183, 57),
+        // Damage-threat escalation follows the operational color
+        // language: Tornado Emergency purple, PDS tornado magenta,
+        // destructive SVR deep orange.
+        "tornado" => match threat.as_str() {
+            "CATASTROPHIC" => egui::Color32::from_rgb(150, 50, 250),
+            "CONSIDERABLE" => egui::Color32::from_rgb(255, 64, 175),
+            _ => egui::Color32::from_rgb(248, 62, 82),
+        },
+        "severe thunderstorm" => match threat.as_str() {
+            "DESTRUCTIVE" => egui::Color32::from_rgb(252, 122, 28),
+            _ => egui::Color32::from_rgb(246, 183, 57),
+        },
         "flash flood" => egui::Color32::from_rgb(78, 218, 108),
         "flood" => egui::Color32::from_rgb(76, 190, 124),
         "special marine" => egui::Color32::from_rgb(70, 190, 238),
@@ -19497,6 +19572,13 @@ fn should_clear_display_before_latest_load(
 ) -> bool {
     mode != LatestLoadMode::AutoRefresh
         && should_clear_display_for_latest_load(volume, site_id, now_utc)
+}
+
+/// Explicit primary loads (User/Loop) take the view from an active
+/// custom-URL poll; background AutoRefresh is not intent and must never
+/// stop the poller.
+fn latest_load_pauses_poll(mode: LatestLoadMode, poll_active: bool) -> bool {
+    poll_active && mode != LatestLoadMode::AutoRefresh
 }
 
 fn normalized_history_limit(limit: usize) -> usize {
@@ -20833,6 +20915,52 @@ mod tests {
     }
 
     #[test]
+    fn active_url_poll_blocks_primary_auto_refresh() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.realtime_level2_auto_refresh = true;
+        app.poll_active = true;
+        app.poll_url = "http://example.com/wilu".to_owned();
+        app.sites = vec![RadarSite::new("KTLX")];
+        app.selected_site_index = 0;
+        // A polled non-catalog frame: the old behavior cleared it every
+        // tick (history_contains_other_site) and started a catalog load.
+        let volume = Arc::new(test_aliased_velocity_volume());
+        app.frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(&volume),
+            path: PathBuf::from("poll://wilu"),
+            volume,
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "polled wilu".to_owned(),
+        });
+
+        let ctx = egui::Context::default();
+        app.maybe_refresh_realtime_level2(&ctx);
+
+        assert!(app.load_receiver.is_none());
+        assert_eq!(app.frame_history.len(), 1);
+        assert_eq!(
+            app.live_refresh_skip_reason.as_deref(),
+            Some("custom URL poll owns the primary view")
+        );
+
+        // Stopping the poll releases the guard (the next tick may load).
+        app.poll_active = false;
+        app.live_refresh_skip_reason = None;
+        app.last_realtime_level2_refresh = Some(Instant::now());
+        app.maybe_refresh_realtime_level2(&ctx);
+        assert_eq!(app.live_refresh_skip_reason, None);
+    }
+
+    #[test]
+    fn explicit_loads_pause_url_poll_auto_refresh_does_not() {
+        assert!(latest_load_pauses_poll(LatestLoadMode::User, true));
+        assert!(latest_load_pauses_poll(LatestLoadMode::Loop, true));
+        assert!(!latest_load_pauses_poll(LatestLoadMode::AutoRefresh, true));
+        assert!(!latest_load_pauses_poll(LatestLoadMode::User, false));
+    }
+
+    #[test]
     fn latest_load_clears_different_or_stale_display() {
         let now = Utc.with_ymd_and_hms(2026, 6, 7, 23, 0, 0).unwrap();
         let mut fresh = RadarVolume::new(
@@ -21238,6 +21366,38 @@ mod tests {
                 lat: 37.33
             }
         ));
+    }
+
+    #[test]
+    fn damage_threat_escalates_label() {
+        let emergency = ParsedWarningTags {
+            tornado: Some("OBSERVED".into()),
+            damage_threat: Some("CATASTROPHIC".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            hazard_label("tornado", "0088", &emergency),
+            "TOR EMERGENCY 0088 OBSERVED"
+        );
+        // Case-insensitive: text products and CAP parameters both feed this.
+        let pds = ParsedWarningTags {
+            damage_threat: Some("considerable".into()),
+            ..Default::default()
+        };
+        assert_eq!(hazard_label("tornado", "0001", &pds), "PDS TOR 0001");
+        let plain = ParsedWarningTags::default();
+        assert_eq!(hazard_label("tornado", "0002", &plain), "TOR 0002");
+        assert_eq!(
+            hazard_label(
+                "severe thunderstorm",
+                "0300",
+                &ParsedWarningTags {
+                    damage_threat: Some("DESTRUCTIVE".into()),
+                    ..Default::default()
+                }
+            ),
+            "SVR DESTRUCTIVE 0300"
+        );
     }
 
     #[test]

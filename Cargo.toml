@@ -1,9 +1,9 @@
-[workspace]
+﻿[workspace]
 members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.14.0"
+version = "0.14.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FahrenheitResearch/bowecho"
@@ -34,7 +34,7 @@ strip = true
 # failures into full app crashes.
 
 # rw-sat's hdf5-reader must be the VENDORED tree (their fixes, incl. the
-# GOES-19 parse), not crates.io 0.3 — [patch] only applies from the
+# GOES-19 parse), not crates.io 0.3 â€” [patch] only applies from the
 # workspace root, so every consumer of their crates must repeat it.
 [patch.crates-io]
 hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "d853afa" }

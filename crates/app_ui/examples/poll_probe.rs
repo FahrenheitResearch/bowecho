@@ -5,10 +5,22 @@
 
 fn main() {
     let feeds = [
-        ("WILU", "https://mesonet-nexrad.agron.iastate.edu/level2/raw/WILU"),
-        ("FWLX", "https://mesonet-nexrad.agron.iastate.edu/level2/raw/FWLX"),
-        ("FUSA", "https://mesonet-nexrad.agron.iastate.edu/level2/raw/FUSA"),
-        ("MZZU", "https://mesonet-nexrad.agron.iastate.edu/level2/raw/MZZU"),
+        (
+            "WILU",
+            "https://mesonet-nexrad.agron.iastate.edu/level2/raw/WILU",
+        ),
+        (
+            "FWLX",
+            "https://mesonet-nexrad.agron.iastate.edu/level2/raw/FWLX",
+        ),
+        (
+            "FUSA",
+            "https://mesonet-nexrad.agron.iastate.edu/level2/raw/FUSA",
+        ),
+        (
+            "MZZU",
+            "https://mesonet-nexrad.agron.iastate.edu/level2/raw/MZZU",
+        ),
     ];
     for (name, base) in feeds {
         let listing = match data_source::fetch_text(&format!("{base}/dir.list")) {
