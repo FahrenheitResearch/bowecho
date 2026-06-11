@@ -564,7 +564,7 @@ fn draw_hodograph(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
     }
 
     // Storm motion markers.
-    let (rm_dir, rm_spd) = comp2vec(params.rstu, params.rstv);
+    let (_rm_dir, _rm_spd) = comp2vec(params.rstu, params.rstv);
     let rm_point = at(params.rstu, params.rstv);
     if params.rstu.is_finite() {
         painter.circle_filled(rm_point, 6.0 * g.s, H_RM);
@@ -573,13 +573,7 @@ fn draw_hodograph(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
             6.0 * g.s,
             g.stroke(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 200)),
         );
-        painter.text(
-            rm_point + vec2(11.0 * g.s, -7.0 * g.s),
-            Align2::LEFT_TOP,
-            format!("{rm_dir:03.0}/{rm_spd:.0} RM"),
-            g.font(22.0),
-            H_TEXT,
-        );
+        // Label lives in the motions legend (left column), not on-plot.
     }
     if params.lstu.is_finite() {
         let (lm_dir, lm_spd) = comp2vec(params.lstu, params.lstv);
@@ -590,13 +584,7 @@ fn draw_hodograph(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
             lm + vec2(7.0 * g.s, 7.0 * g.s),
         ];
         painter.add(Shape::convex_polygon(tri, H_LM, Stroke::NONE));
-        painter.text(
-            lm + vec2(11.0 * g.s, -7.0 * g.s),
-            Align2::LEFT_TOP,
-            format!("{lm_dir:03.0}/{lm_spd:.0} LM"),
-            g.font(22.0),
-            H_TEXT,
-        );
+        let _ = (lm_dir, lm_spd);
     }
     // Mean wind (0–6 km npw, spec quirk 5).
     let p_sfc = profile.sfc_pressure();
@@ -605,13 +593,7 @@ fn draw_hodograph(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
         let (mw_dir, mw_spd) = comp2vec(mu, mv);
         let mw = at(mu, mv);
         painter.circle_stroke(mw, 5.0 * g.s, g.stroke(1.5, H_MEAN));
-        painter.text(
-            mw + vec2(9.0 * g.s, -7.0 * g.s),
-            Align2::LEFT_TOP,
-            format!("MW={mw_dir:03.0}/{mw_spd:.0}"),
-            g.font(22.0),
-            H_TEXT_DIM,
-        );
+        let _ = (mw_dir, mw_spd, mw);
     }
     // Corfidi vectors: X = upshear, + = downshear.
     if params.corfidi_up_u.is_finite() {
@@ -626,13 +608,7 @@ fn draw_hodograph(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
             [cu + vec2(-r, r), cu + vec2(r, -r)],
             g.stroke(2.0, H_CORFIDI_UP),
         );
-        painter.text(
-            cu + vec2(8.0 * g.s, -7.0 * g.s),
-            Align2::LEFT_TOP,
-            format!("UP={cu_dir:03.0}/{cu_spd:.0}"),
-            g.font(22.0),
-            H_TEXT_DIM,
-        );
+        let _ = (cu_dir, cu_spd);
     }
     if params.corfidi_dn_u.is_finite() {
         let (cd_dir, cd_spd) = comp2vec(params.corfidi_dn_u, params.corfidi_dn_v);
@@ -646,13 +622,7 @@ fn draw_hodograph(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
             [cd + vec2(0.0, -r), cd + vec2(0.0, r)],
             g.stroke(2.0, H_CORFIDI_DN),
         );
-        painter.text(
-            cd + vec2(8.0 * g.s, -7.0 * g.s),
-            Align2::LEFT_TOP,
-            format!("DN={cd_dir:03.0}/{cd_spd:.0}"),
-            g.font(22.0),
-            H_TEXT_DIM,
-        );
+        let _ = (cd_dir, cd_spd);
     }
     // SR wind vectors from the RM point (0-2 / 4-6 / 8-10 km, npw − RM).
     if params.rstu.is_finite() {
@@ -692,6 +662,45 @@ fn draw_hodograph(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
             );
         }
     }
+    // Motions legend (top-left): the values that used to label markers
+    // on-plot — they always collided because storm motions cluster.
+    {
+        let (rm_d, rm_s) = comp2vec(params.rstu, params.rstv);
+        let (lm_d, lm_s) = comp2vec(params.lstu, params.lstv);
+        let mw_text = winds::mean_wind_npw(profile, p_sfc, p6km, -1.0, 0.0, 0.0)
+            .map(|(u, v)| {
+                let (d, sp) = comp2vec(u, v);
+                dir_spd(d, sp)
+            })
+            .unwrap_or_else(|_| "--".to_owned());
+        let (cu_d, cu_s) = comp2vec(params.corfidi_up_u, params.corfidi_up_v);
+        let (cd_d, cd_s) = comp2vec(params.corfidi_dn_u, params.corfidi_dn_v);
+        let rows: [(&str, String, Color32); 5] = [
+            ("RM", dir_spd(rm_d, rm_s), H_RM),
+            ("LM", dir_spd(lm_d, lm_s), H_LM),
+            ("MW", mw_text, H_MEAN),
+            ("UP", dir_spd(cu_d, cu_s), H_CORFIDI_UP),
+            ("DN", dir_spd(cd_d, cd_s), H_CORFIDI_DN),
+        ];
+        for (i, (tag, value, color)) in rows.iter().enumerate() {
+            let y = ry + 36.0 + i as f32 * 22.0;
+            painter.text(
+                g.pos(rx + 8.0, y),
+                Align2::LEFT_TOP,
+                *tag,
+                g.font(22.0),
+                *color,
+            );
+            painter.text(
+                g.pos(rx + 44.0, y),
+                Align2::LEFT_TOP,
+                value,
+                g.font(22.0),
+                H_TEXT,
+            );
+        }
+    }
+
     // Critical angle + temperature advection lines.
     let ca = params.critical_angle;
     let ca_color = if (80.0..=120.0).contains(&ca) {
@@ -953,9 +962,9 @@ fn draw_table(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
         g.stroke(1.0, LINE_DIM),
     );
     let parcels = [
-        ("Surface", &e.surface_based, &p.sfcpcl),
-        ("Mixed-Layer", &e.mixed_layer, &p.mlpcl),
-        ("Most-Unstbl", &e.most_unstable, &p.mupcl),
+        ("SFC", &e.surface_based, &p.sfcpcl),
+        ("ML", &e.mixed_layer, &p.mlpcl),
+        ("MU", &e.most_unstable, &p.mupcl),
     ];
     for (i, (label, ecape, parcel)) in parcels.iter().enumerate() {
         let y = header_y + 58.0 + i as f32 * 48.0;
@@ -1228,7 +1237,7 @@ fn draw_table(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
             g,
             tx,
             ty + 56.0 + i as f32 * 34.0,
-            245.0,
+            230.0,
             label,
             value,
             *color,
@@ -1238,9 +1247,9 @@ fn draw_table(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
         key_value_row(
             painter,
             g,
-            tx + 310.0,
+            tx + 330.0,
             ty + 56.0 + i as f32 * 34.0,
-            275.0,
+            265.0,
             label,
             value,
             *color,

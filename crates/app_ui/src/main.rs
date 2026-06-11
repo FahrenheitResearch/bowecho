@@ -25,6 +25,7 @@ use serde::Deserialize;
 
 mod basemap_data;
 mod basemap_towns;
+mod guide;
 mod ingest_worker;
 mod model_data;
 mod model_layer;
@@ -481,6 +482,8 @@ struct ViewerApp {
     sat_panel: rw_ui::SatellitePanel,
     sat_player: rw_ui::SatPlayerPanel,
     show_satellite: bool,
+    /// In-app Guide window (reference docs, opened on demand — never forced).
+    show_guide: bool,
     /// Model-data dock (rusty-weather rw-ui panels), created on first open.
     model_dock: Option<model_data::ModelDataDock>,
     model_dock_open: bool,
@@ -492,12 +495,11 @@ struct ViewerApp {
     sat_layer_generation: u64,
     /// Last frame shown in the sat player (the "Show on map" source).
     sat_last_frame: Option<(rw_ui::SatRunKey, u16)>,
-    /// Model field rendered as a radar-map layer (under the radar).
-    model_layer: Option<model_layer::ModelMapLayer>,
+    /// Model fields rendered as radar-map layers (under the radar), in
+    /// draw order. Multiple fields stack (e.g. CAPE under wind under
+    /// radar); each slot owns its texture + render channel.
+    model_layers: Vec<MapLayerSlot>,
     model_layer_build_rx: Option<mpsc::Receiver<Option<model_layer::ModelMapLayer>>>,
-    /// Rendered layer raster: (texture, generation, view key).
-    model_layer_texture: Option<(egui::TextureHandle, u64, ModelLayerView)>,
-    model_layer_render_rx: Option<mpsc::Receiver<ModelLayerRender>>,
     model_layer_generation: u64,
     /// Primary radar layer opacity (draw-time tint; no re-render).
     radar_opacity: f32,
@@ -600,6 +602,11 @@ struct ViewerApp {
     /// over a derived product, reused until product/volume changes.
     derived_readout_cache: Option<(DerivedProduct, usize, usize, usize, Arc<MomentGrid>)>,
     dealiased_readout_cache: Option<DealiasedReadoutCache>,
+    /// One-shot startup release check (background thread, fails silently):
+    /// the receiver delivers `Some(tag)` when GitHub has a newer release.
+    update_check_rx: Option<mpsc::Receiver<Option<String>>>,
+    /// Newer release tag (e.g. "v0.9.0") — shown as a top-bar link.
+    update_available: Option<String>,
 }
 
 struct RadarOverlayLayer {
@@ -1268,6 +1275,16 @@ struct SatMapLayer {
     opacity: f32,
     visible: bool,
     generation: u64,
+}
+
+/// One stacked model map layer: the layer data + its private texture and
+/// render channel (renders are independent; a slow layer never blocks the
+/// others). `id` is stable for UI rows; draw order = vec order.
+struct MapLayerSlot {
+    id: u64,
+    layer: model_layer::ModelMapLayer,
+    texture: Option<(egui::TextureHandle, u64, ModelLayerView)>,
+    render_rx: Option<mpsc::Receiver<ModelLayerRender>>,
 }
 
 /// The map view a model-layer raster was rendered for.
@@ -2380,6 +2397,7 @@ impl ViewerApp {
             sat_panel: rw_ui::SatellitePanel::new(rw_ui::SatFollowSpec::default()),
             sat_player: rw_ui::SatPlayerPanel::new(),
             show_satellite: false,
+            show_guide: false,
             model_dock: None,
             model_dock_open: false,
             sat_layer: None,
@@ -2388,10 +2406,8 @@ impl ViewerApp {
             sat_layer_render_rx: None,
             sat_layer_generation: 0,
             sat_last_frame: None,
-            model_layer: None,
+            model_layers: Vec::new(),
             model_layer_build_rx: None,
-            model_layer_texture: None,
-            model_layer_render_rx: None,
             model_layer_generation: 0,
             radar_opacity: 1.0,
             model_ingest_rx: None,
@@ -2456,6 +2472,8 @@ impl ViewerApp {
             storm_motion_speed_kt: DEFAULT_STORM_MOTION_SPEED_KT,
             derived_readout_cache: None,
             dealiased_readout_cache: None,
+            update_check_rx: None,
+            update_available: None,
         };
         app.basemap_style = restored_basemap_style;
         app.bold_labels = restored_bold_labels;
@@ -2463,6 +2481,7 @@ impl ViewerApp {
         app.start_site_catalog_load(&cc.egui_ctx);
         app.load_volume(&cc.egui_ctx);
         app.load_live_hazards(&cc.egui_ctx);
+        app.start_update_check(&cc.egui_ctx);
         // Model store: enforce retention at startup (other tools may have
         // left extra runs) and auto-create the dock when data exists, so
         // Alt+click soundings work cold — no "Show on map" required.
@@ -5875,6 +5894,7 @@ impl eframe::App for ViewerApp {
 
         self.model_download_window(&ctx);
         self.satellite_window(&ctx);
+        guide::guide_window(&ctx, &mut self.show_guide);
 
         if self.native_skewt_open && self.native_sounding.is_some() {
             let mut open = self.native_skewt_open;
@@ -5897,6 +5917,7 @@ impl eframe::App for ViewerApp {
 
 impl ViewerApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
+        self.poll_update_check();
         ui.horizontal_centered(|ui| {
             ui.heading("BowEcho");
             ui.separator();
@@ -5920,7 +5941,67 @@ impl ViewerApp {
             {
                 self.model_dock_open = !self.model_dock_open;
             }
+            if ui
+                .selectable_label(self.show_guide, "Guide")
+                .on_hover_text("How to read every product + where every feature lives")
+                .clicked()
+            {
+                self.show_guide = !self.show_guide;
+            }
+            if let Some(tag) = &self.update_available {
+                let tag = tag.clone();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let text = egui::RichText::new(format!("{tag} available"))
+                        .small()
+                        .color(egui::Color32::from_rgb(255, 196, 110));
+                    if ui
+                        .add(egui::Label::new(text).sense(egui::Sense::click()))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(
+                            "A newer BowEcho release is available — open the releases page",
+                        )
+                        .clicked()
+                    {
+                        ui.ctx()
+                            .open_url(egui::OpenUrl::new_tab(BOWECHO_RELEASES_PAGE_URL));
+                    }
+                });
+            }
         });
+    }
+
+    /// One release-version check per launch, on a background thread: never
+    /// blocks the UI, and every failure (offline, rate-limited, bad JSON) is
+    /// silent — offline users must see nothing.
+    fn start_update_check(&mut self, ctx: &egui::Context) {
+        if self.update_check_rx.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.update_check_rx = Some(receiver);
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let newer = fetch_newer_release_tag();
+            let repaint = newer.is_some();
+            let _ = sender.send(newer);
+            if repaint {
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn poll_update_check(&mut self) {
+        let Some(receiver) = &self.update_check_rx else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(newer) => {
+                self.update_available = newer;
+                self.update_check_rx = None;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => self.update_check_rx = None,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -6359,10 +6440,16 @@ impl ViewerApp {
                     self.sat_layer_texture = None;
                     ctx.request_repaint();
                 }
-                let mut remove_model_layer = false;
+                let mut remove_layer: Option<u64> = None;
+                let mut move_layer: Option<(u64, i64)> = None;
                 let mut step_hour: i64 = 0;
-                if let Some(layer) = &mut self.model_layer {
+                if !self.model_layers.is_empty() {
                     ui.separator();
+                }
+                let layer_count = self.model_layers.len();
+                for slot in &mut self.model_layers {
+                    let id = slot.id;
+                    let layer = &mut slot.layer;
                     ui.horizontal(|ui| {
                         let mut visible = layer.visible;
                         if ui
@@ -6375,16 +6462,14 @@ impl ViewerApp {
                             layer.visible = visible;
                             ctx.request_repaint();
                         }
-                        if ui.small_button("◀").on_hover_text("Previous forecast hour").clicked() {
-                            step_hour = -1;
-                        }
                         ui.label(format!(
-                            "Model: {} ({})",
+                            "{} f{:02}",
+                            layer.field.key.var, layer.field.key.hour.hour
+                        ))
+                        .on_hover_text(format!(
+                            "{} ({}) — layers draw bottom-to-top in list order",
                             layer.field.key.var, layer.field.units
                         ));
-                        if ui.small_button("▶").on_hover_text("Next forecast hour").clicked() {
-                            step_hour = 1;
-                        }
                         let mut opacity = layer.opacity;
                         if ui
                             .add(egui::Slider::new(&mut opacity, 0.1..=1.0).show_value(false))
@@ -6393,19 +6478,48 @@ impl ViewerApp {
                             layer.opacity = opacity;
                             ctx.request_repaint();
                         }
+                        if layer_count > 1 {
+                            if ui.small_button("↑").on_hover_text("Draw later (higher)").clicked()
+                            {
+                                move_layer = Some((id, 1));
+                            }
+                            if ui.small_button("↓").on_hover_text("Draw earlier (lower)").clicked()
+                            {
+                                move_layer = Some((id, -1));
+                            }
+                        }
                         if ui
                             .small_button("✕")
-                            .on_hover_text("Remove model layer")
+                            .on_hover_text("Remove this layer")
                             .clicked()
                         {
-                            remove_model_layer = true;
+                            remove_layer = Some(id);
                         }
                     });
                 }
-                if remove_model_layer {
-                    self.model_layer = None;
-                    self.model_layer_texture = None;
+                if !self.model_layers.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.weak("Hour");
+                        if ui.small_button("◀").on_hover_text("Previous forecast hour (layers showing the dock's variable follow)").clicked() {
+                            step_hour = -1;
+                        }
+                        if ui.small_button("▶").on_hover_text("Next forecast hour").clicked() {
+                            step_hour = 1;
+                        }
+                    });
+                }
+                if let Some(id) = remove_layer {
+                    self.model_layers.retain(|slot| slot.id != id);
                     ctx.request_repaint();
+                }
+                if let Some((id, delta)) = move_layer
+                    && let Some(index) = self.model_layers.iter().position(|slot| slot.id == id)
+                {
+                    let target = index as i64 + delta;
+                    if target >= 0 && (target as usize) < self.model_layers.len() {
+                        self.model_layers.swap(index, target as usize);
+                        ctx.request_repaint();
+                    }
                 }
                 if step_hour != 0
                     && let Some(dock) = &mut self.model_dock
@@ -7905,7 +8019,7 @@ impl ViewerApp {
         let basemap_start = Instant::now();
         self.draw_basemap(painter, rect);
         self.draw_sat_layer(painter, rect);
-        self.draw_model_layer(painter, rect);
+        self.draw_model_layers(painter, rect);
         self.draw_graticule(painter, rect);
         let underlay_ms = basemap_start.elapsed().as_secs_f32() * 1000.0;
         self.request_radar_layer_renders(ui.ctx(), rect);
@@ -8060,6 +8174,17 @@ impl ViewerApp {
             if response.secondary_clicked() {
                 self.vrot_points.clear();
             }
+        } else if response.clicked()
+            && ui.input(|i| i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift)
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            // Ctrl+click = instant switch to the lowest-beam radar for this
+            // point (the right-click menu's #1 pick). Chain position matters:
+            // armed tools own clicks (cross-section / VROT branches above
+            // win), and Alt is excluded so Alt+click one-shot soundings and
+            // Ctrl+Alt follow-the-mouse soundings keep working untouched.
+            let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
+            self.switch_to_best_radar_at(lon, lat, ui.ctx());
         }
 
         self.cross_section_handle_interactions(ui, rect, 0);
@@ -8812,23 +8937,19 @@ impl ViewerApp {
         });
     }
 
-    /// Context menu: the three lowest-beam radars over the clicked point
-    /// (slant range → 4/3-Earth beam height at 0.5°). Geometry only — the
+    /// Lowest-beam radar candidates for a geo point, sorted by 0.5° beam
+    /// height ascending (slant range → 4/3-Earth beam height):
+    /// (site index, id, beam height m, distance km). Geometry only — the
     /// terrain-blockage version needs a coverage dataset (wxKobold's
     /// boundary placefile draws those regions as an overlay today).
-    fn best_radar_context_menu(&mut self, ui: &mut egui::Ui) {
-        let Some((lon, lat)) = self.context_menu_lonlat else {
-            ui.close();
-            return;
-        };
+    /// WSR-88Ds only (K/P prefixes): TDWRs (Txxx) have short range and a
+    /// separate archive — never the right answer for "best radar here".
+    fn best_radar_candidates(&self, lat: f32, lon: f32) -> Vec<(usize, String, f32, f32)> {
         let mut candidates: Vec<(usize, String, f32, f32)> = self
             .sites
             .iter()
             .enumerate()
             .filter_map(|(index, site)| {
-                // WSR-88Ds only (K/P prefixes): TDWRs (Txxx) have short
-                // range and a separate archive — never the right answer
-                // for "best radar here".
                 if site.level2_id.starts_with('T') {
                     return None;
                 }
@@ -8843,6 +8964,38 @@ impl ViewerApp {
             })
             .collect();
         candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
+        candidates
+    }
+
+    /// Ctrl+click: jump straight to the context menu's #1 pick — the
+    /// lowest-beam WSR-88D for the clicked point — and load its latest
+    /// volume (broadcast-meteorologist request: GR2-style ctrl+click to
+    /// the nearest/best radar, no menu round-trip).
+    fn switch_to_best_radar_at(&mut self, lon: f32, lat: f32, ctx: &egui::Context) {
+        let Some((index, id, beam_m, _)) = self.best_radar_candidates(lat, lon).into_iter().next()
+        else {
+            self.status = "No radar within 460 km of your click".to_owned();
+            return;
+        };
+        // Same switch action as the context menu buttons: select the site
+        // and load it unless a load is already in flight.
+        self.selected_site_index = index;
+        if self.load_receiver.is_none() {
+            let site = self.sites[index].clone();
+            self.start_latest_level2_load(site, ctx);
+        }
+        // Set AFTER the load kick so the user sees what happened (the load
+        // start overwrites self.status with "Loading latest L2 …").
+        self.status = format!("Switched to {id} — lowest beam {beam_m:.0} m at your click");
+    }
+
+    /// Context menu: the three lowest-beam radars over the clicked point.
+    fn best_radar_context_menu(&mut self, ui: &mut egui::Ui) {
+        let Some((lon, lat)) = self.context_menu_lonlat else {
+            ui.close();
+            return;
+        };
+        let candidates = self.best_radar_candidates(lat, lon);
         ui.label(format!("{lat:.3}, {lon:.3}"));
         ui.separator();
         if candidates.is_empty() {
@@ -9092,9 +9245,16 @@ impl ViewerApp {
             });
             self.download_panel
                 .set_model_options(ingest_worker_model_options());
-            let spec = self.download_panel.spec().clone();
+            let mut spec = self.download_panel.spec().clone();
+            // Never open empty (field bug): seed today's UTC date, then
+            // probe the newest ACTUALLY-AVAILABLE run, which corrects both
+            // date and cycle when it lands.
+            if spec.date.is_empty() {
+                spec.date = Utc::now().format("%Y%m%d").to_string();
+            }
             sync_run_pickers(&mut self.download_panel, &spec);
-            worker.send(ingest_worker::IngestRequest::Estimate(spec));
+            worker.send(ingest_worker::IngestRequest::Estimate(spec.clone()));
+            worker.send(ingest_worker::IngestRequest::Latest(spec));
             self.ingest = Some(worker);
         }
         self.pump_ingest_responses();
@@ -9540,8 +9700,7 @@ impl ViewerApp {
                 // Tear down: drop the dock/layer/LUT so nothing model-side
                 // runs until re-enabled.
                 self.model_dock = None;
-                self.model_layer = None;
-                self.model_layer_texture = None;
+                self.model_layers.clear();
                 self.model_lut = None;
                 self.model_dock_open = false;
             }
@@ -9590,45 +9749,48 @@ impl ViewerApp {
                 Err(mpsc::TryRecvError::Disconnected) => self.model_lut_rx = None,
             }
         }
-        // Layer auto-refresh: when the dock loads a new field (hour step,
-        // var change) and a layer is active, swap it in. Same grid hash →
-        // reuse the LUT (instant hour scrubbing); different grid → rebuild.
+        // Layer auto-refresh (hour stepping): the slot showing the SAME
+        // VARIABLE as the dock's latest field swaps to the new hour. Same
+        // grid hash reuses the LUT (instant scrubbing); a different grid
+        // rebuilds through the normal path.
         let mut swap: Option<Arc<rw_ui::FieldData>> = None;
-        if let (Some(layer), Some(dock)) = (&self.model_layer, &self.model_dock)
-            && let Some(latest) = dock.latest_field()
-            && !Arc::ptr_eq(latest, &layer.field)
+        if let Some(latest) = self
+            .model_dock
+            .as_ref()
+            .and_then(|dock| dock.latest_field())
+            && self.model_layers.iter().any(|slot| {
+                slot.layer.field.key.var == latest.key.var
+                    && !Arc::ptr_eq(&slot.layer.field, latest)
+            })
         {
             swap = Some(Arc::clone(latest));
         }
         if let Some(latest) = swap {
-            let same_grid = match (
-                self.model_layer
-                    .as_ref()
-                    .and_then(|l| l.field.grid.as_ref()),
-                latest.grid.as_ref(),
-            ) {
-                (Some(a), Some(b)) => a.hash == b.hash,
-                _ => false,
-            };
-            if same_grid {
-                if let Some(layer) = &mut self.model_layer {
-                    layer.production = latest.style.as_ref().map(|style| {
+            let mut needs_rebuild = false;
+            for slot in &mut self.model_layers {
+                if slot.layer.field.key.var != latest.key.var {
+                    continue;
+                }
+                let same_grid = match (slot.layer.field.grid.as_ref(), latest.grid.as_ref()) {
+                    (Some(a), Some(b)) => a.hash == b.hash,
+                    _ => false,
+                };
+                if same_grid {
+                    slot.layer.production = latest.style.as_ref().map(|style| {
                         Arc::new(rustwx_render::build_colormap(
                             &style.scale,
                             style.colormap_options,
                         ))
                     });
-                    layer.field = latest;
-                    layer.generation = layer.generation.wrapping_add(1);
-                    self.model_layer_generation = layer.generation;
-                    self.model_layer_texture = None;
+                    slot.layer.field = Arc::clone(&latest);
+                    slot.layer.generation = slot.layer.generation.wrapping_add(1);
+                    slot.texture = None;
                     ctx.request_repaint();
+                } else {
+                    needs_rebuild = true;
                 }
-            } else if self.model_layer_build_rx.is_none()
-                && let Some(dock) = &mut self.model_dock
-            {
-                // Different grid: route through the normal build path.
-                let _ = dock;
+            }
+            if needs_rebuild && self.model_layer_build_rx.is_none() {
                 self.start_model_layer_build(latest, ctx);
             }
         }
@@ -9650,8 +9812,28 @@ impl ViewerApp {
                             "Model layer: {} ({})",
                             layer.field.key.var, layer.field.units
                         );
-                        self.model_layer = Some(layer);
-                        self.model_layer_texture = None;
+                        // Same variable replaces its slot (keeps stacking
+                        // order/opacity); a new variable stacks on top.
+                        if let Some(slot) = self
+                            .model_layers
+                            .iter_mut()
+                            .find(|slot| slot.layer.field.key.var == layer.field.key.var)
+                        {
+                            let opacity = slot.layer.opacity;
+                            let visible = slot.layer.visible;
+                            slot.layer = layer;
+                            slot.layer.opacity = opacity;
+                            slot.layer.visible = visible;
+                            slot.texture = None;
+                        } else {
+                            let id = self.model_layer_generation;
+                            self.model_layers.push(MapLayerSlot {
+                                id,
+                                layer,
+                                texture: None,
+                                render_rx: None,
+                            });
+                        }
                     } else {
                         self.status = "Model layer: grid has no geolocation".to_owned();
                     }
@@ -9661,25 +9843,24 @@ impl ViewerApp {
                 Err(mpsc::TryRecvError::Disconnected) => self.model_layer_build_rx = None,
             }
         }
-        if let Some(receiver) = &self.model_layer_render_rx {
+        // Drain per-slot render results.
+        for slot in &mut self.model_layers {
+            let Some(receiver) = &slot.render_rx else {
+                continue;
+            };
             match receiver.try_recv() {
                 Ok((generation, key, image, render_ms)) => {
-                    self.model_layer_render_rx = None;
+                    slot.render_rx = None;
                     self.model_layer_render_ms = Some(render_ms);
-                    if self
-                        .model_layer
-                        .as_ref()
-                        .map(|l| l.generation == generation)
-                        .unwrap_or(false)
-                    {
+                    if slot.layer.generation == generation {
                         let texture =
                             ctx.load_texture("model-layer", image, egui::TextureOptions::LINEAR);
-                        self.model_layer_texture = Some((texture, generation, key));
+                        slot.texture = Some((texture, generation, key));
                     }
                     ctx.request_repaint();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => self.model_layer_render_rx = None,
+                Err(mpsc::TryRecvError::Disconnected) => slot.render_rx = None,
             }
         }
     }
@@ -9891,105 +10072,114 @@ impl ViewerApp {
         }
     }
 
-    /// Draw the model layer (and kick a background re-render when the view
-    /// moved). The raster renders at HALF resolution — model fields are
-    /// smooth, linear texture filtering upscales invisibly — so a full
-    /// re-render lands in tens of ms without touching the radar fast path.
-    fn draw_model_layer(&mut self, painter: &egui::Painter, rect: egui::Rect) {
-        let Some(layer) = &self.model_layer else {
-            return;
-        };
-        if !layer.visible {
-            return;
-        }
+    /// Draw every model layer in stack order (each slot renders at HALF
+    /// resolution on its own background thread and re-anchors its stale
+    /// raster to the world during pans — the radar fast path is untouched).
+    fn draw_model_layers(&mut self, painter: &egui::Painter, rect: egui::Rect) {
         let view = self.model_layer_current_view();
-        let current = self
-            .model_layer_texture
-            .as_ref()
-            .filter(|(_, generation, _)| *generation == layer.generation);
-        let needs_render = current
-            .map(|(_, _, have)| {
-                (have.center_lat - view.center_lat).abs() > 1e-4
-                    || (have.center_lon - view.center_lon).abs() > 1e-4
-                    || (have.map_scale - view.map_scale).abs() > 0.01
-            })
-            .unwrap_or(true);
-        if needs_render && self.model_layer_render_rx.is_none() {
-            let (sender, receiver) = mpsc::channel();
-            self.model_layer_render_rx = Some(receiver);
-            let generation = layer.generation;
-            let field = Arc::clone(&layer.field);
-            let lut = Arc::clone(&layer.lut);
-            let colormap = layer.colormap;
-            let production = layer.production.clone();
-            let render_view = view;
-            let center_lat = view.center_lat as f64;
-            let center_lon = view.center_lon as f64;
-            let km_per_pt = 111.32 / view.map_scale as f64;
-            let (w_pts, h_pts) = (rect.width() as f64, rect.height() as f64);
-            thread::spawn(move || {
-                let render_start = Instant::now();
-                let w = (w_pts / 2.0).max(8.0) as usize;
-                let h = (h_pts / 2.0).max(8.0) as usize;
-                let mut pixels = vec![egui::Color32::TRANSPARENT; w * h];
-                let range = field.range;
-                for (i, px) in pixels.iter_mut().enumerate() {
-                    let x = (i % w) as f64;
-                    let y = (i / w) as f64;
-                    let east_km = (x - w as f64 / 2.0) * 2.0 * km_per_pt;
-                    let north_km = (h as f64 / 2.0 - y) * 2.0 * km_per_pt;
-                    let (lat, lon) = aeqd_inverse_km(center_lat, center_lon, east_km, north_km);
-                    let Some(index) = lut.lookup(lat as f32, lon as f32) else {
-                        continue;
-                    };
-                    let Some(value) = field.values.get(index).copied() else {
-                        continue;
-                    };
-                    if !value.is_finite() {
-                        continue;
+        let (map_center_lat, map_center_lon, map_scale) =
+            (self.map_center_lat, self.map_center_lon, self.map_scale);
+        for slot in &mut self.model_layers {
+            if !slot.layer.visible {
+                continue;
+            }
+            let current = slot
+                .texture
+                .as_ref()
+                .filter(|(_, generation, _)| *generation == slot.layer.generation);
+            let needs_render = current
+                .map(|(_, _, have)| {
+                    (have.center_lat - view.center_lat).abs() > 1e-4
+                        || (have.center_lon - view.center_lon).abs() > 1e-4
+                        || (have.map_scale - view.map_scale).abs() > 0.01
+                })
+                .unwrap_or(true);
+            if needs_render && slot.render_rx.is_none() {
+                let (sender, receiver) = mpsc::channel();
+                slot.render_rx = Some(receiver);
+                let generation = slot.layer.generation;
+                let field = Arc::clone(&slot.layer.field);
+                let lut = Arc::clone(&slot.layer.lut);
+                let colormap = slot.layer.colormap;
+                let production = slot.layer.production.clone();
+                let render_view = view;
+                let center_lat = view.center_lat as f64;
+                let center_lon = view.center_lon as f64;
+                let km_per_pt = 111.32 / view.map_scale as f64;
+                let (w_pts, h_pts) = (rect.width() as f64, rect.height() as f64);
+                thread::spawn(move || {
+                    let render_start = Instant::now();
+                    let w = (w_pts / 2.0).max(8.0) as usize;
+                    let h = (h_pts / 2.0).max(8.0) as usize;
+                    let mut pixels = vec![egui::Color32::TRANSPARENT; w * h];
+                    let range = field.range;
+                    for (i, px) in pixels.iter_mut().enumerate() {
+                        let x = (i % w) as f64;
+                        let y = (i / w) as f64;
+                        let east_km = (x - w as f64 / 2.0) * 2.0 * km_per_pt;
+                        let north_km = (h as f64 / 2.0 - y) * 2.0 * km_per_pt;
+                        let (lat, lon) = aeqd_inverse_km(center_lat, center_lon, east_km, north_km);
+                        let Some(index) = lut.lookup(lat as f32, lon as f32) else {
+                            continue;
+                        };
+                        let Some(value) = field.values.get(index).copied() else {
+                            continue;
+                        };
+                        if !value.is_finite() {
+                            continue;
+                        }
+                        if let Some(cmap) = &production {
+                            let rgba = cmap.map(f64::from(value));
+                            *px = egui::Color32::from_rgba_unmultiplied(
+                                rgba.r, rgba.g, rgba.b, rgba.a,
+                            );
+                        } else if let Some((vmin, vmax)) = range {
+                            let t = rw_ui::colormap::normalize(value, vmin, vmax);
+                            *px = colormap.sample(t);
+                        }
                     }
-                    if let Some(cmap) = &production {
-                        let rgba = cmap.map(f64::from(value));
-                        *px = egui::Color32::from_rgba_unmultiplied(rgba.r, rgba.g, rgba.b, rgba.a);
-                    } else if let Some((vmin, vmax)) = range {
-                        let t = rw_ui::colormap::normalize(value, vmin, vmax);
-                        *px = colormap.sample(t);
-                    }
-                }
-                let image = egui::ColorImage {
-                    size: [w, h],
-                    source_size: egui::vec2(w as f32, h as f32),
-                    pixels,
-                };
-                let _ = sender.send((
-                    generation,
-                    render_view,
-                    image,
-                    render_start.elapsed().as_secs_f32() * 1000.0,
-                ));
-            });
-        }
-        if let Some((texture, _, rendered)) = &self.model_layer_texture {
-            // Anchor the (possibly stale) raster to the WORLD, not the
-            // screen: place the rendered view's center at its current screen
-            // position and scale by the zoom ratio — the layer pans/zooms in
-            // lockstep with the radar until the fresh raster lands.
-            let rendered_center =
-                self.lon_lat_to_screen(rect, rendered.center_lon, rendered.center_lat);
-            let zoom_ratio = self.map_scale / rendered.map_scale.max(0.001);
-            let half = egui::vec2(
-                rect.width() * 0.5 * zoom_ratio,
-                rect.height() * 0.5 * zoom_ratio,
-            );
-            let image_rect =
-                egui::Rect::from_min_max(rendered_center - half, rendered_center + half);
-            let opacity = (layer.opacity * 255.0) as u8;
-            painter.image(
-                texture.id(),
-                image_rect,
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                egui::Color32::from_white_alpha(opacity),
-            );
+                    let image = egui::ColorImage {
+                        size: [w, h],
+                        source_size: egui::vec2(w as f32, h as f32),
+                        pixels,
+                    };
+                    let _ = sender.send((
+                        generation,
+                        render_view,
+                        image,
+                        render_start.elapsed().as_secs_f32() * 1000.0,
+                    ));
+                });
+            }
+            if let Some((texture, _, rendered)) = &slot.texture {
+                // World-anchor without &self (slot is mutably borrowed):
+                // same math as lon_lat_to_screen, inlined.
+                let (east_km, north_km) = aeqd_forward_km(
+                    map_center_lat as f64,
+                    map_center_lon as f64,
+                    rendered.center_lat as f64,
+                    rendered.center_lon as f64,
+                );
+                let px_per_km = map_scale / 111.32;
+                let rendered_center = egui::pos2(
+                    rect.center().x + east_km as f32 * px_per_km,
+                    rect.center().y - north_km as f32 * px_per_km,
+                );
+                let zoom_ratio = map_scale / rendered.map_scale.max(0.001);
+                let half = egui::vec2(
+                    rect.width() * 0.5 * zoom_ratio,
+                    rect.height() * 0.5 * zoom_ratio,
+                );
+                let image_rect =
+                    egui::Rect::from_min_max(rendered_center - half, rendered_center + half);
+                let opacity = (slot.layer.opacity * 255.0) as u8;
+                painter.image(
+                    texture.id(),
+                    image_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::from_white_alpha(opacity),
+                );
+            }
         }
     }
 
@@ -10377,7 +10567,8 @@ impl ViewerApp {
 
         // backing panel (semi-transparent) behind labels + bar
         let panel = egui::Rect::from_min_max(
-            egui::pos2(x0 - 56.0, top - 20.0),
+            // 34 = label gap (5) + widest tick text ("-30" ~24px) + pad.
+            egui::pos2(x0 - 34.0, top - 20.0),
             egui::pos2(rect.right() - margin + 3.0, bottom + 6.0),
         );
         painter.rect_filled(
@@ -13829,6 +14020,55 @@ fn haversine_km(lat_a: f32, lon_a: f32, lat_b: f32, lon_b: f32) -> f32 {
     2.0 * earth_radius_km * a.sqrt().atan2((1.0 - a).max(0.0).sqrt())
 }
 
+const BOWECHO_LATEST_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/FahrenheitResearch/bowecho/releases/latest";
+const BOWECHO_RELEASES_PAGE_URL: &str = "https://github.com/FahrenheitResearch/bowecho/releases";
+
+/// Fetch the latest GitHub release tag and return it iff it is newer than
+/// the running build. `data_source::fetch_text` sets a User-Agent (GitHub
+/// rejects UA-less requests) and metadata timeouts; any network or parse
+/// error returns None so the caller stays silent.
+fn fetch_newer_release_tag() -> Option<String> {
+    let body = data_source::fetch_text(BOWECHO_LATEST_RELEASE_API_URL).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let tag = value.get("tag_name")?.as_str()?;
+    newer_release_tag(tag, env!("CARGO_PKG_VERSION"))
+}
+
+/// Some(trimmed tag) iff the release tag is strictly newer than the
+/// current version; None on equal, older, or unparseable input.
+fn newer_release_tag(tag_name: &str, current_version: &str) -> Option<String> {
+    let remote = parse_semver_triple(tag_name)?;
+    let current = parse_semver_triple(current_version)?;
+    (remote > current).then(|| tag_name.trim().to_owned())
+}
+
+/// Parse "v1.2.3" / "1.2.3" into (major, minor, patch). Tolerates the
+/// release-tag leading 'v'/'V', missing components ("v0.9" → (0, 9, 0)),
+/// and a pre-release/build suffix ("v0.9.0-rc1" parses as (0, 9, 0) —
+/// numeric triple only, good enough for "is there a newer release").
+/// Anything non-numeric is None: the update check then stays silent.
+fn parse_semver_triple(version: &str) -> Option<(u64, u64, u64)> {
+    let trimmed = version.trim().trim_start_matches(['v', 'V']);
+    let core = trimmed.split(['-', '+']).next()?;
+    if core.is_empty() {
+        return None;
+    }
+    let mut parts = core.split('.');
+    let mut triple = [0_u64; 3];
+    for slot in &mut triple {
+        match parts.next() {
+            Some(part) => *slot = part.parse().ok()?,
+            None => break,
+        }
+    }
+    if parts.next().is_some() {
+        // Four or more dotted components — not a semver triple.
+        return None;
+    }
+    Some((triple[0], triple[1], triple[2]))
+}
+
 fn nearest_site_index(sites: &[RadarSite], target_lat: f32, target_lon: f32) -> Option<usize> {
     sites
         .iter()
@@ -16389,6 +16629,72 @@ mod tests {
     }
 
     #[test]
+    fn best_radar_candidates_sorts_by_beam_and_skips_tdwrs() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![
+            // Colocated TDWR: would win on beam height, must be excluded.
+            RadarSite::new("TTLX").with_location(
+                Some("TDWR right here".to_owned()),
+                Some(35.40),
+                Some(-97.20),
+            ),
+            RadarSite::new("KFWS").with_location(
+                Some("Fort Worth".to_owned()),
+                Some(32.573),
+                Some(-97.303),
+            ),
+            RadarSite::new("KTLX").with_location(
+                Some("Norman".to_owned()),
+                Some(35.333),
+                Some(-97.278),
+            ),
+            // Far beyond the 460 km fence.
+            RadarSite::new("KLOT").with_location(
+                Some("Chicago".to_owned()),
+                Some(41.604),
+                Some(-88.085),
+            ),
+        ];
+
+        let candidates = app.best_radar_candidates(35.4, -97.2);
+        let ids: Vec<&str> = candidates.iter().map(|(_, id, _, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["KTLX", "KFWS"]);
+        // Sorted by 0.5° beam height ascending.
+        assert!(candidates[0].2 < candidates[1].2);
+    }
+
+    #[test]
+    fn parse_semver_triple_handles_release_tags() {
+        assert_eq!(parse_semver_triple("v0.8.2"), Some((0, 8, 2)));
+        assert_eq!(parse_semver_triple("V1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_semver_triple("0.8.2"), Some((0, 8, 2)));
+        assert_eq!(parse_semver_triple(" v0.9 "), Some((0, 9, 0)));
+        assert_eq!(parse_semver_triple("v2"), Some((2, 0, 0)));
+        assert_eq!(parse_semver_triple("v0.9.0-rc1"), Some((0, 9, 0)));
+        assert_eq!(parse_semver_triple("v0.9.0+build5"), Some((0, 9, 0)));
+        assert_eq!(parse_semver_triple(""), None);
+        assert_eq!(parse_semver_triple("v"), None);
+        assert_eq!(parse_semver_triple("latest"), None);
+        assert_eq!(parse_semver_triple("v0.8.2.1"), None);
+        assert_eq!(parse_semver_triple("v0..2"), None);
+    }
+
+    #[test]
+    fn newer_release_tag_compares_numerically() {
+        let some = |tag: &str| Some(tag.to_owned());
+        assert_eq!(newer_release_tag("v0.9.0", "0.8.2"), some("v0.9.0"));
+        // Numeric compare, not lexicographic: "10" > "2".
+        assert_eq!(newer_release_tag("v0.8.10", "0.8.2"), some("v0.8.10"));
+        assert_eq!(newer_release_tag("v1.0.0", "0.9.9"), some("v1.0.0"));
+        // Same version, older remote, prerelease of the current version,
+        // and junk tags all stay silent.
+        assert_eq!(newer_release_tag("v0.8.2", "0.8.2"), None);
+        assert_eq!(newer_release_tag("v0.8.1", "0.8.2"), None);
+        assert_eq!(newer_release_tag("v0.8.2-rc1", "0.8.2"), None);
+        assert_eq!(newer_release_tag("latest", "0.8.2"), None);
+    }
+
+    #[test]
     fn gate_for_range_uses_selected_gate_spacing() {
         let grid = MomentGrid::new_u8(
             MomentType::Reflectivity,
@@ -18419,6 +18725,7 @@ mod tests {
             sat_panel: rw_ui::SatellitePanel::new(rw_ui::SatFollowSpec::default()),
             sat_player: rw_ui::SatPlayerPanel::new(),
             show_satellite: false,
+            show_guide: false,
             model_dock: None,
             model_dock_open: false,
             sat_layer: None,
@@ -18427,10 +18734,8 @@ mod tests {
             sat_layer_render_rx: None,
             sat_layer_generation: 0,
             sat_last_frame: None,
-            model_layer: None,
+            model_layers: Vec::new(),
             model_layer_build_rx: None,
-            model_layer_texture: None,
-            model_layer_render_rx: None,
             model_layer_generation: 0,
             radar_opacity: 1.0,
             model_ingest_rx: None,
@@ -18495,6 +18800,8 @@ mod tests {
             storm_motion_speed_kt: DEFAULT_STORM_MOTION_SPEED_KT,
             derived_readout_cache: None,
             dealiased_readout_cache: None,
+            update_check_rx: None,
+            update_available: None,
         }
     }
 

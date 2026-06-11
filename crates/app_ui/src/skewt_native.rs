@@ -338,19 +338,19 @@ fn draw_labels(painter: &egui::Painter, g: &Geom, sounding: &NativeSounding) {
     if let (Some(&t), Some(&td)) = (profile.tmpc.get(sfc), profile.dwpc.get(sfc)) {
         if t.is_finite() {
             painter.text(
-                g.pos(g.sx(t, P_BOT), PLOT_B + 4.0),
+                g.pos(g.sx(t, P_BOT), PLOT_B + 34.0),
                 egui::Align2::CENTER_TOP,
                 format!("{:.0}F", t * 9.0 / 5.0 + 32.0),
-                g.font(42.0),
+                g.font(30.0),
                 COL_TEMP,
             );
         }
         if td.is_finite() {
             painter.text(
-                g.pos(g.sx(td, P_BOT), PLOT_B + 4.0),
+                g.pos(g.sx(td, P_BOT), PLOT_B + 34.0),
                 egui::Align2::CENTER_TOP,
                 format!("{:.0}F", td * 9.0 / 5.0 + 32.0),
-                g.font(42.0),
+                g.font(30.0),
                 COL_DEWP,
             );
         }
@@ -492,10 +492,10 @@ fn draw_markers(painter: &egui::Painter, g: &Geom, sounding: &NativeSounding) {
             g.stroke(2.0, COL_HEIGHT_MARK),
         );
         painter.text(
-            g.pos(PLOT_L - 4.0, y - 10.0),
+            g.pos(PLOT_L - 4.0, y + 3.0),
             egui::Align2::RIGHT_TOP,
-            format!("{km:.0}KM"),
-            g.font(42.0),
+            format!("{km:.0} km"),
+            g.font(26.0),
             COL_HEIGHT_MARK,
         );
     }
