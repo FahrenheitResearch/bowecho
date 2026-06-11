@@ -25,6 +25,7 @@ use serde::Deserialize;
 
 mod basemap_data;
 mod basemap_towns;
+mod farm_live;
 mod glm_layer;
 mod guide;
 mod ingest_worker;
@@ -355,6 +356,119 @@ fn decode_load_path_with_optional_preview(
     })
 }
 
+/// What a local path holds, decided by magic bytes with the name as a
+/// fallback (mobile-radar sweepfiles have no extension at all).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalRadarKind {
+    /// Zip archive of DORADE sweeps and/or GR2 msg31 members.
+    MobileArchive,
+    /// Loose DORADE sweepfile (swp.*).
+    DoradeSweep,
+    /// Anything Archive II-shaped (AR2V, gzip, bzip2, msg31).
+    NexradLevel2,
+}
+
+fn sniff_local_radar_kind(path: &Path) -> LocalRadarKind {
+    let mut head = [0u8; 8];
+    let filled = std::fs::File::open(path)
+        .and_then(|mut file| {
+            use std::io::Read;
+            let mut total = 0usize;
+            while total < head.len() {
+                let count = file.read(&mut head[total..])?;
+                if count == 0 {
+                    break;
+                }
+                total += count;
+            }
+            Ok(total)
+        })
+        .unwrap_or(0);
+    let head = &head[..filled];
+    if nexrad_io::mobile_archive::looks_like_zip_bytes(head) {
+        return LocalRadarKind::MobileArchive;
+    }
+    if nexrad_io::dorade::looks_like_dorade_bytes(head)
+        || (filled < 8 && nexrad_io::dorade::looks_like_dorade_path(path))
+    {
+        return LocalRadarKind::DoradeSweep;
+    }
+    // Sniff failed entirely (unreadable file): fall back to names so the
+    // error surfaces from the matching decoder.
+    if filled == 0 && nexrad_io::mobile_archive::looks_like_zip_path(path) {
+        return LocalRadarKind::MobileArchive;
+    }
+    LocalRadarKind::NexradLevel2
+}
+
+/// Decode a mobile-radar source (zip deployment archive or loose DORADE
+/// sweepfile) into a frame batch for the history strip.
+///
+/// Multi-radar archives (e.g. Goodland DOW7+COW2) keep only the radar with
+/// the most volumes: the frame history is single-site and would otherwise
+/// thrash between instruments.
+fn decode_mobile_radar_batch(
+    path: &Path,
+    kind: LocalRadarKind,
+    total_start: Instant,
+) -> Result<DecodedLoadBatch, String> {
+    let mut timings = LoadTimings::default();
+    let decode_start = Instant::now();
+    let mut frames: Vec<DecodedLoad> = Vec::new();
+    match kind {
+        LocalRadarKind::MobileArchive => {
+            let mut volumes = nexrad_io::mobile_archive::decode_mobile_archive_from_path(path)
+                .map_err(|err| err.to_string())?;
+            let dominant_site = dominant_site_id(volumes.iter().map(|entry| &entry.volume));
+            if let Some(site_id) = dominant_site {
+                volumes.retain(|entry| entry.volume.site.id == site_id);
+            }
+            timings.decode_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
+            for entry in volumes {
+                frames.push(DecodedLoad {
+                    path: path.to_path_buf(),
+                    volume: entry.volume,
+                    timings: timings.finish(total_start),
+                    status: FrameStatus::Local,
+                    source_label: entry.member_label,
+                });
+            }
+        }
+        LocalRadarKind::DoradeSweep => {
+            let volume = nexrad_io::mobile_archive::decode_dorade_volume_for_path(path)
+                .map_err(|err| err.to_string())?;
+            timings.decode_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
+            frames.push(DecodedLoad {
+                path: path.to_path_buf(),
+                volume,
+                timings: timings.finish(total_start),
+                status: FrameStatus::Local,
+                source_label: format!("DORADE {}", path.display()),
+            });
+        }
+        LocalRadarKind::NexradLevel2 => unreachable!("routed to the Level II loader"),
+    }
+    if frames.is_empty() {
+        return Err("no radar volumes decoded".to_owned());
+    }
+    let selected_index = frames.len() - 1;
+    Ok(DecodedLoadBatch {
+        frames,
+        selected_index,
+    })
+}
+
+fn dominant_site_id<'a>(volumes: impl Iterator<Item = &'a RadarVolume>) -> Option<String> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for volume in volumes {
+        *counts.entry(volume.site.id.as_str()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(site_id, _)| site_id.to_owned())
+}
+
 struct ViewerApp {
     source_path: Option<PathBuf>,
     volume: Option<Arc<RadarVolume>>,
@@ -532,12 +646,10 @@ struct ViewerApp {
     /// Last analysis result, shown inline under the button.
     oa_last_summary: Option<String>,
     /// SPC-style derived mesoanalysis in flight (SBCAPE on the OA).
-    oa_cape_rx:
-        Option<mpsc::Receiver<std::result::Result<(Arc<rw_ui::FieldData>, String), String>>>,
+    oa_cape_rx: Option<mpsc::Receiver<OaDeriveResult>>,
     /// Full composite pass: cached fields (compute once, display many).
     oa_composites: Option<Vec<oa_derived::CompositeField>>,
-    oa_comp_rx:
-        Option<mpsc::Receiver<std::result::Result<Vec<oa_derived::CompositeField>, String>>>,
+    oa_comp_rx: Option<mpsc::Receiver<OaCompositesResult>>,
     oa_comp_progress: Arc<std::sync::atomic::AtomicUsize>,
     oa_comp_total: usize,
     oa_comp_pick: Option<usize>,
@@ -545,19 +657,21 @@ struct ViewerApp {
     vol3d: vol3d::Vol3d,
     /// WoFS viewer window state.
     wofs: wofs::WofsState,
+    /// FARM mobile-radar live quicklooks (DOW/COW via svr.guru).
+    farm: farm_live::FarmState,
     /// GR2A-style custom URL polling: a served directory with dir.list
     /// (the convention mobile radars/DOWs use in the field).
     poll_url: String,
     poll_active: bool,
     poll_last_file: Option<String>,
     poll_next: Option<Instant>,
-    poll_rx: Option<mpsc::Receiver<std::result::Result<(String, Arc<RadarVolume>), String>>>,
+    poll_rx: Option<mpsc::Receiver<PolledVolumeResult>>,
     /// SPC outlooks + live storm reports.
     spc_data: spc_layers::SpcData,
     spc_outlooks_enabled: Vec<String>,
     spc_reports_enabled: bool,
     spc_day: u8,
-    spc_last_key: Option<(u8, Option<(i32, u32, u32)>)>,
+    spc_last_key: Option<SpcFetchKey>,
     spc_rx: Option<mpsc::Receiver<spc_layers::SpcData>>,
     /// GLM lightning layer (in-process rw-glm follow + time-synced draw).
     glm: Option<glm_layer::GlmWorker>,
@@ -1365,6 +1479,13 @@ struct ModelLayerView {
     map_scale: f32,
 }
 type OaResult = std::result::Result<(Arc<rw_ui::FieldData>, Arc<rw_ui::FieldData>, String), String>;
+/// Background derive/composite build: (field, status line) or error.
+type OaDeriveResult = std::result::Result<(Arc<rw_ui::FieldData>, String), String>;
+type OaCompositesResult = std::result::Result<Vec<oa_derived::CompositeField>, String>;
+/// URL-poll download: (file name, decoded volume) or error.
+type PolledVolumeResult = std::result::Result<(String, Arc<RadarVolume>), String>;
+/// SPC fetch identity: (day, archive date) — refetch when it changes.
+type SpcFetchKey = (u8, Option<(i32, u32, u32)>);
 type ModelLayerRender = (u64, ModelLayerView, egui::ColorImage, f32);
 
 /// One SPC storm report (tornado) — the archive events browser entry.
@@ -2509,6 +2630,7 @@ impl ViewerApp {
             download_profile: 0,
             vol3d: vol3d::Vol3d::default(),
             wofs: wofs::WofsState::default(),
+            farm: farm_live::FarmState::default(),
             poll_url: String::new(),
             poll_active: false,
             poll_last_file: None,
@@ -3109,12 +3231,35 @@ impl ViewerApp {
             self.display_live_chunk_updates,
             require_complete_live_cut,
         );
-        if let Some(index) = self
+        let catalog_index = self
             .sites
             .iter()
-            .position(|site| site.level2_id == volume.site.id)
-        {
+            .position(|site| site.level2_id == volume.site.id);
+        if let Some(index) = catalog_index {
             self.selected_site_index = index;
+        }
+        // Mobile radars (DOW/COW/RaXPol) are not in the site catalog and
+        // carry their deployment coordinates in the volume itself: jump the
+        // map there when such a site first loads or moves deployments
+        // (same truck, new parking spot).
+        if catalog_index.is_none()
+            && let (Some(latitude_deg), Some(longitude_deg)) =
+                (volume.site.latitude_deg, volume.site.longitude_deg)
+        {
+            let same_deployment = self.volume.as_ref().is_some_and(|previous| {
+                previous.site.id == volume.site.id
+                    && previous
+                        .site
+                        .latitude_deg
+                        .zip(previous.site.longitude_deg)
+                        .is_some_and(|(previous_lat, previous_lon)| {
+                            (previous_lat - latitude_deg).abs() < 0.02
+                                && (previous_lon - longitude_deg).abs() < 0.02
+                        })
+            });
+            if !same_deployment {
+                self.center_map_on(latitude_deg, longitude_deg);
+            }
         }
         if record_final_decode && let Some(load_timing) = load_timing {
             self.perf.record_decode(load_timing.decode_ms);
@@ -5313,17 +5458,25 @@ impl ViewerApp {
 
         thread::spawn(move || {
             let total_start = Instant::now();
-            let result = decode_load_path_with_optional_preview(
-                path,
-                &label,
-                total_start,
-                LoadTimings::default(),
-                &sender,
-                should_preview_loads(),
-                FrameStatus::Local,
-                format!("local {label}"),
-            )
-            .map(DecodedLoadBatch::single);
+            // Route by content: mobile-radar sources (zip deployment
+            // archives, DORADE sweepfiles) decode into multi-frame batches;
+            // everything else takes the Level II path with previews.
+            let result = match sniff_local_radar_kind(&path) {
+                kind @ (LocalRadarKind::MobileArchive | LocalRadarKind::DoradeSweep) => {
+                    decode_mobile_radar_batch(&path, kind, total_start)
+                }
+                LocalRadarKind::NexradLevel2 => decode_load_path_with_optional_preview(
+                    path,
+                    &label,
+                    total_start,
+                    LoadTimings::default(),
+                    &sender,
+                    should_preview_loads(),
+                    FrameStatus::Local,
+                    format!("local {label}"),
+                )
+                .map(DecodedLoadBatch::single),
+            };
             let _ = sender.send(AsyncLoadResult {
                 label,
                 update: AsyncLoadUpdate::Final(result),
@@ -5986,6 +6139,9 @@ impl eframe::App for ViewerApp {
             self.glm = None; // Drop cancels the follow thread.
         }
         self.poll_mesoanalysis(&ctx);
+        // FARM index probe runs even with the window closed — the LIVE
+        // chip must appear the moment a mobile radar starts plotting.
+        self.farm.pump_index(&ctx);
         self.poll_oa_cape(&ctx);
         self.poll_oa_composites(&ctx);
         self.poll_spc(&ctx);
@@ -6028,6 +6184,7 @@ impl eframe::App for ViewerApp {
         self.satellite_window(&ctx);
         self.vol3d_window(&ctx);
         self.wofs_window(&ctx);
+        self.farm_window(&ctx);
         guide::guide_window(&ctx, &mut self.show_guide);
 
         if self.native_skewt_open && self.native_sounding.is_some() {
@@ -6092,6 +6249,29 @@ impl ViewerApp {
                 .clicked()
             {
                 self.wofs.open = !self.wofs.open;
+            }
+            {
+                let live = self.farm.live_sensor().map(|s| (s.id, s.name.clone()));
+                let label = match &live {
+                    Some((_, name)) => egui::RichText::new(format!("{name} LIVE"))
+                        .color(egui::Color32::from_rgb(110, 245, 130))
+                        .strong(),
+                    None => egui::RichText::new("FARM"),
+                };
+                if ui
+                    .selectable_label(self.farm.open, label)
+                    .on_hover_text(
+                        "FARM mobile radars (DOW/COW): live PPI quicklooks during field deployments — the chip lights up the moment a sensor starts plotting",
+                    )
+                    .clicked()
+                {
+                    self.farm.open = !self.farm.open;
+                    if self.farm.open
+                        && let Some((id, _)) = live
+                    {
+                        self.farm.select_sensor(id);
+                    }
+                }
             }
             if ui
                 .selectable_label(self.vol3d.open, "3D")
@@ -6507,6 +6687,28 @@ impl ViewerApp {
                 .on_hover_text(
                     "Display incomplete live chunk tilts before a full low-level tilt is available",
                 );
+            // Native file dialog (Windows/macOS; Linux needs the GTK dev
+            // libs rfd's portal backends pull in — same gating as the
+            // color-table browser).
+            #[cfg(any(windows, target_os = "macos"))]
+            if fixed_action_button(ui, "Open…", 52.0)
+                .on_hover_text(
+                    "Open a local radar file: NEXRAD Level II (.ar2v/.gz/.msg31), a DORADE \
+                     sweepfile (swp.*), or a DOW/COW/RaXPol deployment .zip",
+                )
+                .clicked()
+                && self.load_receiver.is_none()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter(
+                        "Radar data",
+                        &["zip", "ar2v", "gz", "bz2", "raw", "msg31", "v06", "v08"],
+                    )
+                    .add_filter("All files (swp.* sweepfiles)", &["*"])
+                    .set_title("Open radar data")
+                    .pick_file()
+            {
+                self.start_local_volume_load(path, ui.ctx());
+            }
         });
         // One-line status — always rendered, hover carries the details.
         if let Some(volume) = &self.volume {
@@ -9538,15 +9740,17 @@ impl ViewerApp {
 ――――――
 ",
                     );
-                    egui::show_tooltip_at_pointer(
-                        painter.ctx(),
+                    egui::Tooltip::always_open(
+                        painter.ctx().clone(),
                         egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("pf_hover")),
                         egui::Id::new("pf_hover_tip"),
-                        |ui| {
-                            ui.set_max_width(340.0);
-                            ui.label(joined);
-                        },
-                    );
+                        egui::PopupAnchor::Pointer,
+                    )
+                    .gap(12.0)
+                    .show(|ui| {
+                        ui.set_max_width(340.0);
+                        ui.label(joined);
+                    });
                 }
             }
         }
@@ -10687,11 +10891,12 @@ impl ViewerApp {
                 let mut t2m = t2m_raw.clone();
                 let mut td2m = td2m_raw.clone();
                 let mut used = (0usize, 0usize);
+                let cell_km = mesoanalysis::estimate_cell_km(&template);
                 if let Some(a) = mesoanalysis::analyze(
                     "temperature_2m",
                     &make_field("temperature_2m", t2m_raw),
                     &obs,
-                    3.0,
+                    cell_km,
                     Some(&orography),
                     &locate,
                 ) {
@@ -10706,7 +10911,7 @@ impl ViewerApp {
                     "dewpoint_2m",
                     &make_field("dewpoint_2m", td2m_raw),
                     &obs,
-                    3.0,
+                    cell_km,
                     Some(&orography),
                     &locate,
                 ) {
@@ -10829,7 +11034,11 @@ impl ViewerApp {
         self.oa_comp_rx = Some(receiver);
         let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         self.oa_comp_progress = Arc::clone(&progress);
-        let stride = 6usize;
+        // The lattice targets ~18 km — the spacing the suite was tuned at
+        // on HRRR (stride 6 × 3 km); coarser grids (RAP 13 km, GFS 25 km)
+        // run full-res, still finer than SPC's own 40 km mesoanalysis.
+        let cell_km = mesoanalysis::estimate_cell_km(&template);
+        let stride = (18.0 / cell_km).round().clamp(1.0, 6.0) as usize;
         self.oa_comp_total = (template.nx / stride + 1) * (template.ny / stride + 1);
         self.status = "Composites: analyzing + computing the full suite…".to_owned();
         let ctx_clone = ctx.clone();
@@ -10891,7 +11100,7 @@ impl ViewerApp {
                             var,
                             &make_field(var, target.clone()),
                             &obs,
-                            3.0,
+                            cell_km,
                             Some(&orography),
                             &locate,
                         ) {
@@ -11024,7 +11233,7 @@ impl ViewerApp {
                 &field.key.var,
                 &field,
                 &obs,
-                3.0,
+                mesoanalysis::estimate_cell_km(&field),
                 orography.as_deref(),
                 |ob| {
                     lut.lookup(ob.lat, ob.lon)
@@ -12095,6 +12304,116 @@ impl ViewerApp {
                 ui.weak(wofs::CREDIT);
             });
         self.wofs.open = open;
+    }
+
+    /// FARM mobile-radar live quicklooks: sensor chips (live = green),
+    /// product picker, frame loop with follow-live.
+    fn farm_window(&mut self, ctx: &egui::Context) {
+        if !self.farm.open {
+            return;
+        }
+        self.farm.pump_window(ctx);
+        let mut open = self.farm.open;
+        egui::Window::new("Mobile Radar — FARM live")
+            .open(&mut open)
+            .default_size([760.0, 740.0])
+            .min_size([420.0, 380.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let sensors = self.farm.sensors.clone();
+                    for sensor in &sensors {
+                        let live = sensor.is_live();
+                        let mut text = egui::RichText::new(&sensor.name);
+                        if live {
+                            text = text.color(egui::Color32::from_rgb(110, 245, 130)).strong();
+                        }
+                        let selected = self.farm.sensor_id == Some(sensor.id);
+                        let mut response = ui.selectable_label(selected, text);
+                        if let Some(at) = sensor.last_plot {
+                            response = response.on_hover_text(format!(
+                                "last plot {} UTC{}",
+                                at.format("%Y-%m-%d %H:%M:%S"),
+                                if live { " — LIVE" } else { "" }
+                            ));
+                        }
+                        if response.clicked() {
+                            self.farm.select_sensor(sensor.id);
+                        }
+                    }
+                    if self.farm.sensors.is_empty() {
+                        ui.spinner();
+                        ui.weak("probing svr.guru…");
+                    }
+                });
+                if !self.farm.products.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        let products = self.farm.products.clone();
+                        for product in &products {
+                            let selected = self.farm.product == *product;
+                            if ui
+                                .selectable_label(selected, farm_live::product_label(product))
+                                .clicked()
+                            {
+                                self.farm.select_product(product);
+                            }
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    let frame_count = self.farm.frames.len();
+                    if ui
+                        .button(if self.farm.playing { "⏸" } else { "▶" })
+                        .clicked()
+                    {
+                        self.farm.playing = !self.farm.playing;
+                    }
+                    if frame_count > 0 {
+                        let mut index = self.farm.frame_index;
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut index, 0..=frame_count - 1)
+                                    .show_value(false),
+                            )
+                            .changed()
+                        {
+                            self.farm.playing = false;
+                            self.farm.follow_live = false;
+                            self.farm.frame_index = index;
+                        }
+                        ui.monospace(farm_live::frame_label(
+                            &self.farm.frames[self.farm.frame_index],
+                        ));
+                    }
+                    ui.checkbox(&mut self.farm.follow_live, "Follow live")
+                        .on_hover_text("Jump to the newest plot as it lands (~20 s cadence)");
+                    if !self.farm.status.is_empty() {
+                        ui.weak(&self.farm.status);
+                    }
+                });
+                if let Some(url) = self.farm.frames.get(self.farm.frame_index) {
+                    if let Some(texture) = self.farm.textures.get(url) {
+                        let size = texture.size_vec2();
+                        let avail = ui.available_size() - egui::vec2(0.0, 24.0);
+                        let scale = (avail.x / size.x).min(avail.y / size.y).clamp(0.05, 3.0);
+                        ui.add(egui::Image::new((texture.id(), size * scale)));
+                    } else {
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.weak("fetching frame…");
+                        });
+                    }
+                } else {
+                    ui.add_space(12.0);
+                    ui.weak("waiting for frames…");
+                }
+                ui.horizontal(|ui| {
+                    ui.small(farm_live::CREDIT);
+                    ui.hyperlink_to("svr.guru", "https://svr.guru");
+                });
+            });
+        self.farm.open = open;
     }
 
     /// 3D Volume Explorer window: background box resample of the current
@@ -13199,20 +13518,20 @@ impl ViewerApp {
         } else {
             false
         };
-        // Model value under the cursor: read the TOPMOST VISIBLE layer
-        // (each slot carries its own field + LUT), so the inspector
-        // matches what's on screen — derived OA layers included (field
-        // report: hovering an SBCAPE (OA) layer read HRRR T2m). Falls
-        // back to the dock's field when no layer is shown.
+        // Model values under the cursor: read EVERY visible layer,
+        // topmost first to match the visual stack (each slot carries its
+        // own field + LUT), so a base field and its OA/derived siblings
+        // read out together (field request). Falls back to the dock's
+        // field when no layer produced a value.
         let _ = ob_owns_card;
         if self.model_enabled && self.inspector_show_model {
             let (lon, lat) = self.screen_to_lon_lat(rect, anchor);
             let mut shown = false;
-            if let Some(slot) = self
+            for slot in self
                 .model_layers
                 .iter()
                 .rev()
-                .find(|slot| slot.layer.visible)
+                .filter(|slot| slot.layer.visible)
             {
                 let field = &slot.layer.field;
                 if let Some(index) = slot.layer.lut.lookup(lat, lon)
@@ -21515,6 +21834,7 @@ mod tests {
             download_profile: 0,
             vol3d: vol3d::Vol3d::default(),
             wofs: wofs::WofsState::default(),
+            farm: farm_live::FarmState::default(),
             poll_url: String::new(),
             poll_active: false,
             poll_last_file: None,

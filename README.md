@@ -115,6 +115,12 @@ latitude.
   clickable polygons with product-aware fills.
 - Multi-radar overlays: load neighboring sites on the same map with
   independent refresh, opacity, and visibility.
+- Mobile/research radars: open DOW, COW, and RaXPol data natively — DORADE
+  sweepfiles and deployment zips decode straight to the map (transition-ray
+  filtering, staggered-PRT Nyquist, CFAC corrections), and a GR2A-style
+  polling URL follows field feeds live. When a FARM facility radar is
+  deployed and plotting, BowEcho lights a LIVE chip and plays the quicklook
+  loop (quicklooks courtesy of the FARM facility).
 
 ## Build from source
 

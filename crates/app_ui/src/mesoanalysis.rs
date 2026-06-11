@@ -51,6 +51,34 @@ const RB_M: f64 = 2000.0;
 // Wind components skip the vertical term (RTMA keeps wind anisotropy
 // very weak); flagged per VarConfig::terrain_aware below.
 
+/// Measured grid cell size, km: one equirectangular step between
+/// x-neighbors at mid-grid (exact at single-cell scale). R/CUTOFF above
+/// are km but `analyze` works in CELL units, so a wrong cell size scales
+/// the correlation radius — 3 km assumed on a 25 km GFS grid would smear
+/// corrections ~8× too far. Falls back to 3 km (HRRR-class) when the
+/// grid file is missing or degenerate.
+pub fn estimate_cell_km(field: &FieldData) -> f64 {
+    const FALLBACK: f64 = 3.0;
+    let Some(grid) = field.grid.as_ref() else {
+        return FALLBACK;
+    };
+    if grid.lat.len() != field.nx * field.ny || field.nx < 2 {
+        return FALLBACK;
+    }
+    let mid = (field.ny / 2) * field.nx + field.nx / 2 - 1;
+    let (lat0, lon0) = (f64::from(grid.lat[mid]), f64::from(grid.lon[mid]));
+    let (lat1, lon1) = (f64::from(grid.lat[mid + 1]), f64::from(grid.lon[mid + 1]));
+    let dlat = (lat1 - lat0).to_radians();
+    let dlon = (lon1 - lon0).to_radians() * lat0.to_radians().cos();
+    let km = dlat.hypot(dlon) * 6371.0;
+    // Range check also rejects NaN grids and antimeridian-straddling cells.
+    if (0.25..=200.0).contains(&km) {
+        km
+    } else {
+        FALLBACK
+    }
+}
+
 /// Per-variable analysis configuration (spec §7 table).
 #[derive(Clone, Copy)]
 pub struct VarConfig {
@@ -451,6 +479,35 @@ mod tests {
             lat_descending: false,
             style: None,
         })
+    }
+
+    #[test]
+    fn cell_km_measured_from_grid() {
+        // No grid file -> HRRR-class fallback.
+        assert_eq!(estimate_cell_km(&flat_field(8, 8, 280.0)), 3.0);
+        // A 0.25° grid at 40°N: zonal step ≈ 21.3 km.
+        let (nx, ny) = (8usize, 8usize);
+        let mut lat = vec![0.0f32; nx * ny];
+        let mut lon = vec![0.0f32; nx * ny];
+        for y in 0..ny {
+            for x in 0..nx {
+                lat[y * nx + x] = 40.0 + y as f32 * 0.25;
+                lon[y * nx + x] = -100.0 + x as f32 * 0.25;
+            }
+        }
+        let mut field = (*flat_field(nx, ny, 280.0)).clone();
+        field.grid = Some(Arc::new(rw_store::grid::GridFile {
+            nx,
+            ny,
+            lat,
+            lon,
+            projection: None,
+            hash: String::new(),
+        }));
+        // The estimator samples mid-grid: row ny/2 sits at 41°N here.
+        let expected = 0.25f64.to_radians() * 41.0f64.to_radians().cos() * 6371.0;
+        let km = estimate_cell_km(&field);
+        assert!((km - expected).abs() < 0.2, "got {km}, want ~{expected}");
     }
 
     fn ob_at(lat: f32, lon: f32, temp_c: f32, network: &str) -> SurfaceOb {

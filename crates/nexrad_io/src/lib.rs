@@ -4,6 +4,9 @@
 //! keeps unsupported records non-fatal so an app can inspect partially decoded
 //! volumes while the edge-case corpus grows.
 
+pub mod dorade;
+pub mod mobile_archive;
+
 use std::cell::UnsafeCell;
 use std::collections::btree_map::Entry;
 use std::fs;
@@ -437,6 +440,11 @@ pub fn decode_normalized_volume_bytes(
 
     let mut cursor = VOLUME_HEADER_LEN;
     let mut record_index = 0usize;
+    // GR2-style ".msg31" exports keep the AR2V header but carry only a few
+    // metadata records before variable-framed message 31s — well before the
+    // standard 134 fixed records. Detected once at the first early message
+    // 31 and latched for the rest of the file.
+    let mut early_variable_msg31 = false;
     while cursor + CONTROL_WORD_LEN + MESSAGE_HEADER_LEN <= bytes.len() {
         let header_offset = cursor + CONTROL_WORD_LEN;
         let header =
@@ -490,16 +498,41 @@ pub fn decode_normalized_volume_bytes(
             _ => volume.metadata.skipped_message_count += 1,
         }
 
-        let record_len = if record_index < 134 || header.message_type != 31 {
+        let record_len = if header.message_type != 31 {
             RECORD_BYTES
-        } else {
+        } else if record_index >= 134 || early_variable_msg31 {
             message_total_len + CONTROL_WORD_LEN
+        } else if message31_uses_variable_framing(bytes, cursor, message_total_len) {
+            early_variable_msg31 = true;
+            message_total_len + CONTROL_WORD_LEN
+        } else {
+            RECORD_BYTES
         };
         cursor = cursor.saturating_add(record_len);
         record_index += 1;
     }
 
     Ok(volume)
+}
+
+/// Decide the framing of a message 31 seen before the standard 134 metadata
+/// records. Real Archive II volumes never place message 31 that early, but
+/// GR2-style ".msg31" exports (DOW/COW/RaXPol Level II twins) do, packing
+/// them back to back with no fixed-record padding. Returns `true` when the
+/// bytes directly after this message hold another message 31 (or the file
+/// ends exactly there), which fixed 2432-byte framing cannot produce.
+fn message31_uses_variable_framing(bytes: &[u8], cursor: usize, message_total_len: usize) -> bool {
+    let variable_next = cursor + CONTROL_WORD_LEN + message_total_len;
+    if variable_next == bytes.len() {
+        return true;
+    }
+    let header_offset = variable_next + CONTROL_WORD_LEN;
+    let Some(header_bytes) = bytes.get(header_offset..header_offset + MESSAGE_HEADER_LEN) else {
+        return false;
+    };
+    let header = parse_message_header_bytes(header_bytes);
+    header.message_type == 31
+        && usize::from(header.size_halfwords) * 2 >= MESSAGE_HEADER_LEN + MSG_31_HEADER_LEN
 }
 
 struct StreamDecodeResult {
@@ -1308,6 +1341,14 @@ fn parse_message_31(
     let header = parse_message_31_header(body, 0)?;
     let expected_radials = expected_radials_for_azimuth_resolution(header.azimuth_resolution);
 
+    // GR2-style ".msg31" exports write a nonstandard volume-header date, so
+    // the volume time parses as the epoch; recover it from the first
+    // radial's collection time instead.
+    if volume.volume_time == DateTime::<Utc>::UNIX_EPOCH && header.collect_date > 0 {
+        volume.volume_time =
+            nexrad_date_ms_to_datetime(u32::from(header.collect_date), header.collect_ms);
+    }
+
     let mut nyquist_velocity_mps = None;
     let mut moments: [Option<MomentBlock<'_>>; MAX_MESSAGE_31_MOMENTS] =
         std::array::from_fn(|_| None);
@@ -2004,6 +2045,45 @@ mod tests {
             expected_radials_for_azimuth_resolution(0),
             FALLBACK_RADIALS_PER_CUT
         );
+    }
+
+    #[test]
+    fn decodes_gr2_style_variable_framed_msg31_records() {
+        // GR2 ".msg31" exports: AR2V header, then message 31 records packed
+        // back to back (no 2432-byte fixed-record padding, no 134 metadata
+        // records).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"AR2V00000");
+        bytes.extend_from_slice(b"1  ");
+        bytes.extend_from_slice(&19_724u32.to_be_bytes());
+        bytes.extend_from_slice(&1_000u32.to_be_bytes());
+        bytes.extend_from_slice(b"COW2");
+        for (azimuth_number, status) in [
+            (1u16, RadialStatus::StartVolume),
+            (2, RadialStatus::Intermediate),
+            (3, RadialStatus::EndVolume),
+        ] {
+            bytes.extend_from_slice(&[0u8; CONTROL_WORD_LEN]);
+            let mut body = synthetic_message_31_body(false);
+            body[10..12].copy_from_slice(&azimuth_number.to_be_bytes());
+            body[21] = radial_status_code(status);
+            let message_size = u16::try_from((MESSAGE_HEADER_LEN + body.len()) / 2).unwrap();
+            bytes.extend_from_slice(&message_size.to_be_bytes());
+            bytes.push(0);
+            bytes.push(31);
+            bytes.extend_from_slice(&7u16.to_be_bytes());
+            bytes.extend_from_slice(&19_724u16.to_be_bytes());
+            bytes.extend_from_slice(&1_000u32.to_be_bytes());
+            bytes.extend_from_slice(&1u16.to_be_bytes());
+            bytes.extend_from_slice(&1u16.to_be_bytes());
+            bytes.extend_from_slice(&body);
+        }
+
+        let volume = decode_volume_from_bytes(&bytes).unwrap();
+
+        assert_eq!(volume.site.id, "COW2");
+        assert_eq!(volume.metadata.decoded_radial_count, 3);
+        assert_eq!(volume.cuts[0].radials.len(), 3);
     }
 
     #[ignore = "set NEXRAD_LEVEL2_SAMPLE to a public Archive II file path to run manually"]

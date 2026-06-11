@@ -10,3 +10,8 @@
 *.download
 .DS_Store
 Thumbs.db
+
+# agent scratch probes at repo root
+/*.html
+/*.json
+/probe.out

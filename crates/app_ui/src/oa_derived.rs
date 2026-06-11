@@ -113,11 +113,6 @@ pub fn product_grid(inputs: &OaCapeInputs, product: OaProduct, stride: usize) ->
     grid_impl(inputs, product, stride)
 }
 
-/// Back-compat: SBCAPE.
-pub fn sbcape_grid(inputs: &OaCapeInputs, stride: usize) -> Vec<f32> {
-    grid_impl(inputs, OaProduct::Sbcape, stride)
-}
-
 fn grid_impl(inputs: &OaCapeInputs, product: OaProduct, stride: usize) -> Vec<f32> {
     let (nx, ny) = (inputs.nx, inputs.ny);
     let stride = stride.max(1);
@@ -423,8 +418,12 @@ mod tests {
             td_iso,
             h_iso,
             levels_hpa: levels,
+            u10: Vec::new(),
+            v10: Vec::new(),
+            u_iso: Vec::new(),
+            v_iso: Vec::new(),
         };
-        let juicy = sbcape_grid(&base, 1);
+        let juicy = product_grid(&base, OaProduct::Sbcape, 1);
         assert!(
             juicy[0] > 500.0,
             "moist surface must have CAPE, got {}",
@@ -432,7 +431,7 @@ mod tests {
         );
         let mut dry = base;
         dry.td2m = vec![263.15; 16]; // -10 °C dewpoint
-        let none = sbcape_grid(&dry, 1);
+        let none = product_grid(&dry, OaProduct::Sbcape, 1);
         assert!(
             none[0] < 100.0,
             "dry surface must be near-zero, got {}",

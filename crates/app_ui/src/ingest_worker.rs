@@ -28,7 +28,6 @@ use rw_ingest::ingest_profile::IngestProfile;
 use rw_ingest::size_estimate::{Calibration, default_calibration_paths, estimate};
 use rw_ingest::{IngestConfig, IngestError, IngestEvent, IngestStage, parse_hours, throttle};
 use rw_ui::{AvailabilityView, DownloadSpec, DownloadStage, EstimateView, HourDoneView};
-use settings;
 
 /// Requests from the UI thread.
 #[derive(Debug, Clone)]
