@@ -27,6 +27,7 @@ mod basemap_data;
 mod basemap_towns;
 mod guide;
 mod ingest_worker;
+mod mesoanalysis;
 mod model_data;
 mod model_layer;
 mod obs;
@@ -515,8 +516,17 @@ struct ViewerApp {
     /// A sounding was requested to set the hail environment (H0/H-20):
     /// extract the levels when it arrives and DON'T open the window.
     hail_env_pending: bool,
+    /// Mesoanalysis run in flight (Bratseth obs-corrected background).
+    oa_rx: Option<mpsc::Receiver<OaResult>>,
+    /// Last analysis result, shown inline under the button.
+    oa_last_summary: Option<String>,
     /// Surface observations layer (METAR station plots).
     obs_enabled: bool,
+    /// Source-class QC toggles: METAR = airport-grade; mesonet = IEM
+    /// RWIS/DCP (road sensors run hot, RAWS siting varies — let users
+    /// hide them with one click).
+    obs_show_metar: bool,
+    obs_show_mesonet: bool,
     /// Obs-adjusted soundings: replace the model surface with the nearest
     /// CLOSE (<=30 km) and FRESH (<=60 min) observation before the parcel
     /// math — SB CAPE from the real surface.
@@ -524,6 +534,8 @@ struct ViewerApp {
     surface_obs: obs::ObPool,
     obs_fetched_at: Option<Instant>,
     obs_rx: Option<mpsc::Receiver<std::result::Result<Vec<obs::SurfaceOb>, String>>>,
+    mesonet_fetched_at: Option<Instant>,
+    mesonet_rx: Option<mpsc::Receiver<Vec<obs::SurfaceOb>>>,
     /// Inspector card customization: which sections render.
     inspector_show_raw_vel: bool,
     inspector_show_range_az: bool,
@@ -1304,6 +1316,7 @@ struct ModelLayerView {
     center_lon: f32,
     map_scale: f32,
 }
+type OaResult = std::result::Result<(Arc<rw_ui::FieldData>, Arc<rw_ui::FieldData>, String), String>;
 type ModelLayerRender = (u64, ModelLayerView, egui::ColorImage, f32);
 
 /// One SPC storm report (tornado) — the archive events browser entry.
@@ -2402,7 +2415,7 @@ impl ViewerApp {
             spc_receiver: None,
             archive_pending_event: None,
             ingest: None,
-            download_panel: rw_ui::DownloadPanel::new(rw_ui::DownloadSpec::default()),
+            download_panel: rw_ui::DownloadPanel::new(default_download_spec()),
             sat: None,
             sat_panel: rw_ui::SatellitePanel::new(rw_ui::SatFollowSpec::default()),
             sat_player: rw_ui::SatPlayerPanel::new(),
@@ -2428,11 +2441,17 @@ impl ViewerApp {
             download_cycle: 0,
             download_hours: "0-3".to_owned(),
             download_profile: 0,
+            oa_rx: None,
+            oa_last_summary: None,
             obs_enabled: false,
+            obs_show_metar: true,
+            obs_show_mesonet: true,
             obs_adjust_soundings: false,
             surface_obs: obs::ObPool::new(),
             obs_fetched_at: None,
             obs_rx: None,
+            mesonet_fetched_at: None,
+            mesonet_rx: None,
             last_sounding_request: None,
             hail_env_pending: false,
             inspector_show_raw_vel: true,
@@ -5859,6 +5878,7 @@ impl eframe::App for ViewerApp {
         self.poll_sat_layer(&ctx);
         self.poll_model_ingest(&ctx);
         self.poll_surface_obs(&ctx);
+        self.poll_mesoanalysis(&ctx);
         self.poll_native_sounding(&ctx);
         if self.tile_layer.borrow_mut().poll(&ctx) {
             ctx.request_repaint();
@@ -6466,6 +6486,14 @@ impl ViewerApp {
                     {
                         ctx.request_repaint();
                     }
+                    if self.obs_enabled {
+                        ui.checkbox(&mut self.obs_show_metar, "METAR")
+                            .on_hover_text("Airport-grade ASOS/AWOS stations");
+                        ui.checkbox(&mut self.obs_show_mesonet, "Mesonet")
+                            .on_hover_text(
+                                "IEM RWIS road sensors + DCP/RAWS networks — denser but lower siting quality (road sensors read hot in sun); uncheck for strict-QC METAR-only",
+                            );
+                    }
                     if self.obs_enabled
                         && ui
                             .checkbox(&mut self.obs_adjust_soundings, "adj snd")
@@ -6574,6 +6602,44 @@ impl ViewerApp {
                     && let Some(dock) = &mut self.model_dock
                 {
                     dock.step_hour(step_hour);
+                }
+                // MESOANALYSIS: Bratseth obs-correction of the dock's
+                // current surface field, stacked as its own "(OA)" layer.
+                let oa_var = self
+                    .model_dock
+                    .as_ref()
+                    .and_then(|dock| dock.latest_field())
+                    .map(|field| field.key.var.clone())
+                    .filter(|var| mesoanalysis::config_for(var).is_some());
+                if let Some(var) = oa_var {
+                    ui.horizontal(|ui| {
+                        let ready = self.obs_enabled
+                            && !self.surface_obs.is_empty()
+                            && self.model_lut.is_some()
+                            && self.oa_rx.is_none();
+                        if ui
+                            .add_enabled(ready, egui::Button::new("Analyze obs"))
+                            .on_hover_text(format!(
+                                "Bratseth objective analysis: correct {var} with the live surface obs (converges to Optimal Interpolation; Bratseth 1986, ADAS weights, RTMA-style QC). Adds a \"{var} (OA)\" layer.",
+                            ))
+                            .clicked()
+                        {
+                            self.start_mesoanalysis(ctx);
+                        }
+                        if self.oa_rx.is_some() {
+                            ui.spinner();
+                        }
+                        if !self.obs_enabled {
+                            ui.weak("← turn on Surface obs above");
+                        } else if self.surface_obs.is_empty() {
+                            ui.weak("waiting for obs fetch…");
+                        } else if self.model_lut.is_none() {
+                            ui.weak("← \"Show on radar map\" first (Model window)");
+                        }
+                    });
+                    if let Some(summary) = &self.oa_last_summary {
+                        ui.weak(summary);
+                    }
                 }
                 // Freshness: newest run in the store + one-click ingest.
                 ui.horizontal(|ui| {
@@ -8709,8 +8775,13 @@ impl ViewerApp {
             let url = slot.url.clone();
             let ctx = ctx.clone();
             thread::spawn(move || {
-                let result = data_source::fetch_text(&url)
-                    .map(|text| placefiles::parse_placefile(&text))
+                // GR clients append these; some placefile servers require
+                // them (and scale icon hints by dpi).
+                let sep = if url.contains('?') { '&' } else { '?' };
+                let fetch_url = format!("{url}{sep}version=1.5&dpi=96");
+                let result = data_source::fetch_text(&fetch_url)
+                    .or_else(|_| data_source::fetch_text(&url))
+                    .map(|text| placefiles::parse_placefile(&text, &url))
                     .map_err(|error| error.to_string());
                 let _ = sender.send(result);
                 ctx.request_repaint();
@@ -9228,6 +9299,11 @@ impl ViewerApp {
                     let now = Utc::now();
                     self.surface_obs
                         .frame_obs(now)
+                        .filter(|ob| {
+                            let is_metar = ob.network == "METAR";
+                            (is_metar && self.obs_show_metar)
+                                || (!is_metar && self.obs_show_mesonet)
+                        })
                         .filter(|ob| ob.temp_c.is_some() && ob.dewpoint_c.is_some())
                         .filter(|ob| {
                             ob.time_utc
@@ -9729,6 +9805,106 @@ impl ViewerApp {
         }
     }
 
+    /// Run the Bratseth mesoanalysis on a background thread: QC'd
+    /// innovations vs the dock's current field, station-space iteration,
+    /// one gridding pass; the corrected field comes back as a new layer.
+    fn start_mesoanalysis(&mut self, ctx: &egui::Context) {
+        let Some(field) = self
+            .model_dock
+            .as_ref()
+            .and_then(|dock| dock.latest_field())
+            .cloned()
+        else {
+            return;
+        };
+        let Some((_, lut)) = self.model_lut.clone() else {
+            return;
+        };
+        let frame_time = Utc::now();
+        let obs: Vec<obs::SurfaceOb> = self
+            .surface_obs
+            .frame_obs(frame_time)
+            .filter(|ob| {
+                let is_metar = ob.network == "METAR";
+                (is_metar && self.obs_show_metar) || (!is_metar && self.obs_show_mesonet)
+            })
+            .cloned()
+            .collect();
+        if obs.is_empty() {
+            self.status = "Mesoanalysis: no observations available".to_owned();
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.oa_rx = Some(receiver);
+        self.status = format!("Analyzing {} obs (Bratseth)…", obs.len());
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            let nx = field.nx;
+            let result = mesoanalysis::analyze(&field.key.var, &field, &obs, 3.0, |ob| {
+                lut.lookup(ob.lat, ob.lon)
+                    .map(|index| ((index % nx) as f64, (index / nx) as f64))
+            })
+            .map(|analysis| {
+                let mut corrected = (*field).clone();
+                for (value, delta) in corrected.values.iter_mut().zip(&analysis.increment) {
+                    if value.is_finite() {
+                        *value += delta;
+                    }
+                }
+                corrected.key.var = format!("{} (OA)", field.key.var);
+                // The increment as its own layer — a correct analysis is
+                // ±1-3 K on a ~90 K colormap (invisible); the delta view is
+                // where you SEE what the obs changed. Transparent outside
+                // the corrected blobs.
+                let mut delta_field = (*field).clone();
+                let mut max_abs = 0.0f32;
+                for (value, delta) in delta_field.values.iter_mut().zip(&analysis.increment) {
+                    *value = if delta.abs() > 0.05 { *delta } else { f32::NAN };
+                    max_abs = max_abs.max(delta.abs());
+                }
+                delta_field.key.var = format!("{} (OA Δ)", field.key.var);
+                delta_field.units = field.units.clone();
+                delta_field.style = None;
+                let span = max_abs.clamp(1.0, 8.0);
+                delta_field.range = Some((-span, span));
+                let summary = format!(
+                    "OA: {} obs ({} rejected), fit {:.2}→{:.2}, {} iters",
+                    analysis.obs_used,
+                    analysis.obs_rejected,
+                    analysis.rms_before,
+                    analysis.rms_after,
+                    analysis.iterations
+                );
+                (Arc::new(corrected), Arc::new(delta_field), summary)
+            })
+            .ok_or_else(|| "Mesoanalysis: no usable observations after QC".to_owned());
+            let _ = sender.send(result);
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn poll_mesoanalysis(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.oa_rx else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok((corrected, delta, summary))) => {
+                self.oa_rx = None;
+                self.status = summary.clone();
+                self.oa_last_summary = Some(summary);
+                self.start_model_layer_build(corrected, ctx);
+                self.start_model_layer_build(delta, ctx);
+            }
+            Ok(Err(message)) => {
+                self.oa_rx = None;
+                self.status = message.clone();
+                self.oa_last_summary = Some(message);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.oa_rx = None,
+        }
+    }
+
     /// Surface-obs refresh: fetch the METAR cache on enable and every
     /// 5 minutes after (background thread; one in flight).
     fn poll_surface_obs(&mut self, ctx: &egui::Context) {
@@ -9747,6 +9923,35 @@ impl ViewerApp {
                 let _ = sender.send(result);
                 ctx_clone.request_repaint();
             });
+        }
+        // Mesonet density (IEM RWIS+DCP): 10-minute cadence, same pool.
+        if self.obs_enabled
+            && self.mesonet_rx.is_none()
+            && self
+                .mesonet_fetched_at
+                .map(|at| at.elapsed() > Duration::from_secs(600))
+                .unwrap_or(true)
+        {
+            let (sender, receiver) = mpsc::channel();
+            self.mesonet_rx = Some(receiver);
+            let ctx_clone = ctx.clone();
+            thread::spawn(move || {
+                let obs = obs::fetch_mesonet_obs();
+                let _ = sender.send(obs);
+                ctx_clone.request_repaint();
+            });
+        }
+        if let Some(receiver) = &self.mesonet_rx {
+            match receiver.try_recv() {
+                Ok(observations) => {
+                    self.mesonet_rx = None;
+                    self.mesonet_fetched_at = Some(Instant::now());
+                    self.surface_obs.merge(observations);
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.mesonet_rx = None,
+            }
         }
         if let Some(receiver) = &self.obs_rx {
             match receiver.try_recv() {
@@ -10315,7 +10520,18 @@ impl ViewerApp {
         // Fuller reports first so they win declutter cells.
         let mut order: Vec<&obs::SurfaceOb> = self.surface_obs.frame_obs(frame_time).collect();
         order.sort_by(|a, b| b.completeness.cmp(&a.completeness));
+        // During loop playback/scrubbing, only frequently-updating
+        // stations draw — slow reporters freeze mid-loop and read as
+        // stale clutter (field request: "looks cleaner").
+        let looping = self.history_playing || self.browsing_history;
         for ob in order {
+            let is_metar = ob.network == "METAR";
+            if (is_metar && !self.obs_show_metar) || (!is_metar && !self.obs_show_mesonet) {
+                continue;
+            }
+            if looping && self.surface_obs.report_count(&ob.station_id) < 3 {
+                continue;
+            }
             let pos = self.lon_lat_to_screen(rect, ob.lon, ob.lat);
             if !rect.expand(-10.0).contains(pos) {
                 continue;
@@ -10327,8 +10543,14 @@ impl ViewerApp {
                 continue;
             }
             *slot += 1;
-            // Station dot.
-            painter.circle_filled(pos, 2.0, egui::Color32::from_rgb(210, 214, 220));
+            // Station dot: white = METAR, amber = mesonet (source visible
+            // at a glance).
+            let dot = if is_metar {
+                egui::Color32::from_rgb(210, 214, 220)
+            } else {
+                egui::Color32::from_rgb(214, 176, 96)
+            };
+            painter.circle_filled(pos, 2.0, dot);
             // Wind barb (meteorological: barb points INTO the wind).
             if let (Some(dir), Some(spd)) = (ob.wind_dir_deg, ob.wind_speed_kt) {
                 draw_station_barb(painter, pos, dir, spd);
@@ -10925,7 +11147,7 @@ impl ViewerApp {
         }
         // Nearest surface ob under the cursor (within ~28 px) — the full
         // decoded report, with age.
-        if self.obs_enabled && !self.surface_obs.is_empty() {
+        let ob_owns_card = if self.obs_enabled && !self.surface_obs.is_empty() {
             let frame_time = self
                 .volume
                 .as_ref()
@@ -10935,10 +11157,11 @@ impl ViewerApp {
             for ob in self.surface_obs.frame_obs(frame_time) {
                 let pos = self.lon_lat_to_screen(rect, ob.lon, ob.lat);
                 let d = pos.distance(anchor);
-                if d < 28.0 && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                if d < 40.0 && best.map(|(bd, _)| d < bd).unwrap_or(true) {
                     best = Some((d, ob));
                 }
             }
+            let ob_matched = best.is_some();
             if let Some((_, ob)) = best {
                 let mut line = ob.station_id.clone();
                 if let (Some(t), Some(td)) = (ob.temp_c, ob.dewpoint_c) {
@@ -10962,11 +11185,19 @@ impl ViewerApp {
                     let age_min = (Utc::now() - time).num_minutes();
                     line.push_str(&format!(" · {age_min}m"));
                 }
-                lines.push(line);
+                // The ob owns the card near a station: float it to the
+                // top of the data lines (field critique: the model line
+                // was smothering it).
+                let at = lines.len().min(1);
+                lines.insert(at, line);
             }
-        }
+            ob_matched
+        } else {
+            false
+        };
         // Model value under the cursor (decoupled LUT — works with or
         // without the map layer showing).
+        let _ = ob_owns_card;
         if self.model_enabled
             && self.inspector_show_model
             && let Some((_, lut)) = &self.model_lut
@@ -14181,6 +14412,9 @@ fn prune_model_store(store_root: &str, keep: usize) {
             .flatten()
             .map(|entry| entry.path())
             .filter(|path| path.is_dir())
+            // Honor the rw-store writer-lock protocol (Wave 1): a run dir
+            // holding .rw-lock has an active writer — never prune it.
+            .filter(|path| !path.join(".rw-lock").exists())
             .collect();
         run_dirs.sort();
         while run_dirs.len() > keep {
@@ -14320,6 +14554,19 @@ fn build_native_sounding_adjusted(
         }
     }
     Ok(native)
+}
+
+/// Light-by-default download spec: sounding profile, NO heavy ECAPE.
+/// Heavy is ~5x the compute (all cores, minutes per hour on laptops) —
+/// it must be an informed opt-in, never the default a new user trips on
+/// (field report: "model data downloading is slow" = heavy by accident).
+fn default_download_spec() -> rw_ui::DownloadSpec {
+    rw_ui::DownloadSpec {
+        profile: "sounding".to_owned(),
+        heavy: false,
+        hours: "0-3".to_owned(),
+        ..rw_ui::DownloadSpec::default()
+    }
 }
 
 fn normalize_lon(longitude_deg: f32) -> f32 {
@@ -19043,7 +19290,7 @@ mod tests {
             spc_receiver: None,
             archive_pending_event: None,
             ingest: None,
-            download_panel: rw_ui::DownloadPanel::new(rw_ui::DownloadSpec::default()),
+            download_panel: rw_ui::DownloadPanel::new(default_download_spec()),
             sat: None,
             sat_panel: rw_ui::SatellitePanel::new(rw_ui::SatFollowSpec::default()),
             sat_player: rw_ui::SatPlayerPanel::new(),
@@ -19069,11 +19316,17 @@ mod tests {
             download_cycle: 0,
             download_hours: "0-3".to_owned(),
             download_profile: 0,
+            oa_rx: None,
+            oa_last_summary: None,
             obs_enabled: false,
+            obs_show_metar: true,
+            obs_show_mesonet: true,
             obs_adjust_soundings: false,
             surface_obs: obs::ObPool::new(),
             obs_fetched_at: None,
             obs_rx: None,
+            mesonet_fetched_at: None,
+            mesonet_rx: None,
             last_sounding_request: None,
             hail_env_pending: false,
             inspector_show_raw_vel: true,

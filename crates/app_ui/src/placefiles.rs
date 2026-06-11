@@ -87,7 +87,7 @@ impl PlacefileObject {
 /// Parse placefile text. Tolerant: unknown statements are ignored, malformed
 /// lines are skipped, and a file with no recognized objects still returns
 /// (with `objects` empty) so the UI can show an honest status.
-pub fn parse_placefile(text: &str) -> Placefile {
+pub fn parse_placefile(text: &str, base_url: &str) -> Placefile {
     let mut out = Placefile {
         title: String::new(),
         refresh_minutes: 5,
@@ -97,6 +97,11 @@ pub fn parse_placefile(text: &str) -> Placefile {
     };
     let mut color: [u8; 3] = [255, 255, 255];
     let mut threshold_nm: f32 = 999.0;
+    // TimeRange gating (parse-time approximation: the file refreshes on
+    // its cadence, so out-of-window items reappear within one refresh of
+    // entering their window — matches GR semantics to that bound).
+    let mut in_time_window = true;
+    let mut hsluv_mode = false;
     let mut fonts: Vec<(u32, f32)> = Vec::new();
     let mut pending_line: Option<(f32, Vec<(f32, f32)>)> = None;
     let mut pending_polygon: Option<Vec<(f32, f32)>> = None;
@@ -133,13 +138,48 @@ pub fn parse_placefile(text: &str) -> Placefile {
                     out.refresh_minutes = minutes.max(1);
                 }
             }
+            "refreshseconds" => {
+                // Seconds-granularity refresh (Supercell-Wx parity); our
+                // scheduler is minute-based, so round up.
+                if let Ok(seconds) = value.parse::<u32>() {
+                    out.refresh_minutes = seconds.div_ceil(60).max(1);
+                }
+            }
+            "timerange" => {
+                // TimeRange: YYYY-MM-DDThh:mm:ss YYYY-MM-DDThh:mm:ss (UTC)
+                let mut parts = value.split_whitespace();
+                let parse_t =
+                    |t: &str| chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S").ok();
+                if let (Some(start), Some(end)) = (
+                    parts.next().and_then(parse_t),
+                    parts.next().and_then(parse_t),
+                ) {
+                    let now = chrono::Utc::now().naive_utc();
+                    in_time_window = now >= start && now <= end;
+                } else {
+                    in_time_window = true;
+                }
+            }
+            "hsluv" => {
+                hsluv_mode = value.eq_ignore_ascii_case("true");
+            }
             "color" => {
-                let parts: Vec<u8> = value
-                    .split_whitespace()
-                    .filter_map(|p| p.parse::<u8>().ok())
-                    .collect();
-                if parts.len() >= 3 {
-                    color = [parts[0], parts[1], parts[2]];
+                if hsluv_mode {
+                    let parts: Vec<f64> = value
+                        .split_whitespace()
+                        .filter_map(|p| p.parse::<f64>().ok())
+                        .collect();
+                    if parts.len() >= 3 {
+                        color = hsluv_to_rgb(parts[0], parts[1], parts[2]);
+                    }
+                } else {
+                    let parts: Vec<u8> = value
+                        .split_whitespace()
+                        .filter_map(|p| p.parse::<u8>().ok())
+                        .collect();
+                    if parts.len() >= 3 {
+                        color = [parts[0], parts[1], parts[2]];
+                    }
                 }
             }
             "threshold" => {
@@ -171,7 +211,7 @@ pub fn parse_placefile(text: &str) -> Placefile {
                 {
                     let hot_x = parts[3].trim().parse::<f32>().unwrap_or(0.0);
                     let hot_y = parts[4].trim().parse::<f32>().unwrap_or(0.0);
-                    let url = unquote(parts[5]);
+                    let url = resolve_url(base_url, &unquote(parts[5]));
                     if w > 0 && h > 0 && url.starts_with("http") {
                         out.icon_sheets.retain(|sheet| sheet.index != index);
                         out.icon_sheets.push(IconSheetSpec {
@@ -193,23 +233,27 @@ pub fn parse_placefile(text: &str) -> Placefile {
                 {
                     let heading = parts[2].trim().parse::<f32>().unwrap_or(0.0);
                     let file_index = parts[3].trim().parse::<u32>().unwrap_or(0);
-                    let icon_index = parts[4].trim().parse::<u32>().unwrap_or(1).max(1);
+                    let icon_index = parts[4].trim().parse::<u32>().unwrap_or(1);
                     let label = parts
                         .get(5)
                         .map(|s| unquote(s))
                         .filter(|s| !s.is_empty())
                         .map(|s| s.lines().next().unwrap_or_default().to_owned());
-                    out.objects.push(PlacefileObject::Icon {
-                        lat,
-                        lon,
-                        anchor: object_anchor,
-                        heading_deg: heading,
-                        file_index,
-                        icon_index,
-                        label,
-                        color,
-                        threshold_nm,
-                    });
+                    push_item(
+                        &mut out,
+                        in_time_window,
+                        PlacefileObject::Icon {
+                            lat,
+                            lon,
+                            anchor: object_anchor,
+                            heading_deg: heading,
+                            file_index,
+                            icon_index,
+                            label,
+                            color,
+                            threshold_nm,
+                        },
+                    );
                 }
             }
             "text" => {
@@ -226,15 +270,19 @@ pub fn parse_placefile(text: &str) -> Placefile {
                         .unwrap_or(11.0);
                     let text = unquote(parts[3].split(',').next().unwrap_or(parts[3]));
                     if !text.is_empty() {
-                        out.objects.push(PlacefileObject::Text {
-                            lat,
-                            lon,
-                            anchor: object_anchor,
-                            size_px: size,
-                            text,
-                            color,
-                            threshold_nm,
-                        });
+                        push_item(
+                            &mut out,
+                            in_time_window,
+                            PlacefileObject::Text {
+                                lat,
+                                lon,
+                                anchor: object_anchor,
+                                size_px: size,
+                                text,
+                                color,
+                                threshold_nm,
+                            },
+                        );
                     }
                 }
             }
@@ -246,15 +294,19 @@ pub fn parse_placefile(text: &str) -> Placefile {
                         parts[1].trim().parse::<f32>(),
                     )
                 {
-                    out.objects.push(PlacefileObject::Text {
-                        lat,
-                        lon,
-                        anchor: None,
-                        size_px: 11.0,
-                        text: unquote(parts[2]),
-                        color,
-                        threshold_nm,
-                    });
+                    push_item(
+                        &mut out,
+                        in_time_window,
+                        PlacefileObject::Text {
+                            lat,
+                            lon,
+                            anchor: None,
+                            size_px: 11.0,
+                            text: unquote(parts[2]),
+                            color,
+                            threshold_nm,
+                        },
+                    );
                 }
             }
             "line" => {
@@ -286,22 +338,30 @@ pub fn parse_placefile(text: &str) -> Placefile {
                 // then the Object block.
                 if let Some((width, points)) = pending_line.take() {
                     if points.len() >= 2 {
-                        out.objects.push(PlacefileObject::Line {
-                            width,
-                            points,
-                            anchor: object_anchor,
-                            color,
-                            threshold_nm,
-                        });
+                        push_item(
+                            &mut out,
+                            in_time_window,
+                            PlacefileObject::Line {
+                                width,
+                                points,
+                                anchor: object_anchor,
+                                color,
+                                threshold_nm,
+                            },
+                        );
                     }
                 } else if let Some(points) = pending_polygon.take() {
                     if points.len() >= 3 {
-                        out.objects.push(PlacefileObject::Polygon {
-                            points,
-                            anchor: object_anchor,
-                            color,
-                            threshold_nm,
-                        });
+                        push_item(
+                            &mut out,
+                            in_time_window,
+                            PlacefileObject::Polygon {
+                                points,
+                                anchor: object_anchor,
+                                color,
+                                threshold_nm,
+                            },
+                        );
                     }
                 } else {
                     object_anchor = None;
@@ -313,23 +373,31 @@ pub fn parse_placefile(text: &str) -> Placefile {
     if let Some((width, points)) = pending_line.take()
         && points.len() >= 2
     {
-        out.objects.push(PlacefileObject::Line {
-            width,
-            points,
-            anchor: object_anchor,
-            color,
-            threshold_nm,
-        });
+        push_item(
+            &mut out,
+            in_time_window,
+            PlacefileObject::Line {
+                width,
+                points,
+                anchor: object_anchor,
+                color,
+                threshold_nm,
+            },
+        );
     }
     if let Some(points) = pending_polygon.take()
         && points.len() >= 3
     {
-        out.objects.push(PlacefileObject::Polygon {
-            points,
-            anchor: object_anchor,
-            color,
-            threshold_nm,
-        });
+        push_item(
+            &mut out,
+            in_time_window,
+            PlacefileObject::Polygon {
+                points,
+                anchor: object_anchor,
+                color,
+                threshold_nm,
+            },
+        );
     }
     out
 }
@@ -360,6 +428,131 @@ fn pair_valid(a: f32, b: f32, offsets: bool) -> bool {
 
 fn unquote(value: &str) -> String {
     value.trim().trim_matches('"').trim().to_owned()
+}
+
+/// Push an item unless the active TimeRange excludes the current moment.
+fn push_item(out: &mut Placefile, in_time_window: bool, object: PlacefileObject) {
+    if in_time_window {
+        out.objects.push(object);
+    } else {
+        out.skipped += 1;
+    }
+}
+
+/// Resolve a possibly-relative IconFile URL against the placefile URL
+/// (Supercell-Wx parity: "icons/x.png" loads from the placefile's host).
+fn resolve_url(base_url: &str, raw: &str) -> String {
+    if raw.starts_with("http://") || raw.starts_with("https://") || base_url.is_empty() {
+        return raw.to_owned();
+    }
+    if let Some(scheme_end) = base_url.find("://") {
+        let host_start = scheme_end + 3;
+        if raw.starts_with('/') {
+            // Host-absolute path.
+            let host_end = base_url[host_start..]
+                .find('/')
+                .map(|i| host_start + i)
+                .unwrap_or(base_url.len());
+            return format!("{}{}", &base_url[..host_end], raw);
+        }
+        // Relative to the placefile's directory.
+        let dir_end = base_url.rfind('/').filter(|&i| i > host_start);
+        if let Some(end) = dir_end {
+            return format!("{}/{}", &base_url[..end], raw);
+        }
+        return format!("{base_url}/{raw}");
+    }
+    raw.to_owned()
+}
+
+// ---- HSLuv -> sRGB (reference implementation; www.hsluv.org) ----
+// H in [0,360], S and L in [0,100]. Needed because GR placefiles can
+// switch Color: into HSLuv space via the "HSLuv: true" directive.
+
+const HSLUV_M: [[f64; 3]; 3] = [
+    [3.240969941904521, -1.537383177570093, -0.498610760293],
+    [-0.96924363628087, 1.87596750150772, 0.041555057407175],
+    [0.055630079696993, -0.20397695888897, 1.056971514242878],
+];
+const HSLUV_REF_U: f64 = 0.19783000664283;
+const HSLUV_REF_V: f64 = 0.46831999493879;
+const HSLUV_KAPPA: f64 = 903.2962962;
+const HSLUV_EPS: f64 = 0.0088564516;
+
+fn hsluv_max_chroma(l: f64, h_deg: f64) -> f64 {
+    let hrad = h_deg.to_radians();
+    let sub1 = (l + 16.0).powi(3) / 1_560_896.0;
+    let sub2 = if sub1 > HSLUV_EPS {
+        sub1
+    } else {
+        l / HSLUV_KAPPA
+    };
+    let mut min_len = f64::MAX;
+    for m in &HSLUV_M {
+        for t in 0..2 {
+            let t = t as f64;
+            let top1 = (284_517.0 * m[0] - 94_839.0 * m[2]) * sub2;
+            let top2 = (838_422.0 * m[2] + 769_860.0 * m[1] + 731_718.0 * m[0]) * l * sub2
+                - 769_860.0 * t * l;
+            let bottom = (632_260.0 * m[2] - 126_452.0 * m[1]) * sub2 + 126_452.0 * t;
+            if bottom.abs() < 1e-12 {
+                continue;
+            }
+            let slope = top1 / bottom;
+            let intercept = top2 / bottom;
+            let denom = hrad.sin() - slope * hrad.cos();
+            if denom.abs() < 1e-12 {
+                continue;
+            }
+            let len = intercept / denom;
+            if len >= 0.0 {
+                min_len = min_len.min(len);
+            }
+        }
+    }
+    min_len
+}
+
+fn hsluv_to_rgb(h: f64, s: f64, l: f64) -> [u8; 3] {
+    let l = l.clamp(0.0, 100.0);
+    let s = s.clamp(0.0, 100.0);
+    if l > 99.999 {
+        return [255, 255, 255];
+    }
+    if l < 0.001 {
+        return [0, 0, 0];
+    }
+    // LCh
+    let c = hsluv_max_chroma(l, h) / 100.0 * s;
+    let hrad = h.to_radians();
+    let (u, v) = (c * hrad.cos(), c * hrad.sin());
+    // Luv -> XYZ
+    let var_y = if l > 8.0 {
+        ((l + 16.0) / 116.0).powi(3)
+    } else {
+        l / HSLUV_KAPPA
+    };
+    let var_u = u / (13.0 * l) + HSLUV_REF_U;
+    let var_v = v / (13.0 * l) + HSLUV_REF_V;
+    let y = var_y;
+    let x = -(9.0 * y * var_u) / ((var_u - 4.0) * var_v - var_u * var_v);
+    let z = (9.0 * y - 15.0 * var_v * y - var_v * x) / (3.0 * var_v);
+    // XYZ -> sRGB
+    let gamma = |c: f64| -> f64 {
+        if c <= 0.0031308 {
+            12.92 * c
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        }
+    };
+    let channel = |m: &[f64; 3]| -> u8 {
+        (gamma(m[0] * x + m[1] * y + m[2] * z).clamp(0.0, 1.0) * 255.0).round() as u8
+    };
+    [
+        channel(&HSLUV_M[0]),
+        channel(&HSLUV_M[1]),
+        channel(&HSLUV_M[2]),
+    ]
 }
 
 #[cfg(test)]
@@ -396,7 +589,7 @@ End:
 
     #[test]
     fn parses_the_core_statements() {
-        let pf = parse_placefile(SAMPLE);
+        let pf = parse_placefile(SAMPLE, "");
         assert_eq!(pf.title, "Test Spotters");
         assert_eq!(pf.refresh_minutes, 2);
         assert_eq!(pf.icon_sheets.len(), 1);
@@ -458,6 +651,7 @@ End:
     fn object_anchor_resets_after_end() {
         let pf = parse_placefile(
             "Object: 39.0, -94.0\n Icon: 0, 0, 0, 1, 1\nEnd:\nIcon: 38.0, -95.0, 0, 1, 1\n",
+            "",
         );
         assert_eq!(pf.objects.len(), 2);
         match &pf.objects[1] {
@@ -468,7 +662,10 @@ End:
 
     #[test]
     fn malformed_lines_are_skipped_not_fatal() {
-        let pf = parse_placefile("Title: x\nIcon: not, numbers\nText: 1,2\nLine: zz\nEnd:\n");
+        let pf = parse_placefile(
+            "Title: x\nIcon: not, numbers\nText: 1,2\nLine: zz\nEnd:\n",
+            "",
+        );
         assert_eq!(pf.title, "x");
         assert!(pf.objects.is_empty());
     }

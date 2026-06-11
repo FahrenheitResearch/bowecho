@@ -32,6 +32,9 @@ pub struct SurfaceOb {
     pub altim_in_hg: Option<f32>,
     /// Field count — declutter priority (fuller reports win a cell).
     pub completeness: u8,
+    /// Source network ("METAR", "KS_RWIS", "TX_DCP", …) — feeds
+    /// per-network observation-error weighting in the analysis.
+    pub network: String,
 }
 
 /// Fetch + decode the full METAR cache. Blocking — call on a worker
@@ -121,6 +124,7 @@ fn parse_row(columns: &[&str], line: &str) -> Option<SurfaceOb> {
         .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
         .map(|t| t.with_timezone(&Utc));
     Some(SurfaceOb {
+        network: "METAR".to_owned(),
         station_id: get("station_id").unwrap_or("?").to_owned(),
         time_utc,
         lat,
@@ -133,6 +137,117 @@ fn parse_row(columns: &[&str], line: &str) -> Option<SurfaceOb> {
         altim_in_hg,
         completeness,
     })
+}
+
+// ---- IEM multi-network mesonet density (v1.5 source) ----
+//
+// Iowa Environmental Mesonet currents.json per network — RWIS road
+// sensors + DCP (RAWS/ALERT/state networks via GOES). COOP skipped
+// (rarely real-time, per the hrrr-mesoanalysis source notes). Fields
+// are imperial (tmpf/dwpf °F, sknt kt).
+
+const IEM_CURRENTS_URL: &str = "https://mesonet.agron.iastate.edu/api/1/currents.json";
+const CONUS_STATES: [&str; 49] = [
+    "AL", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "ID", "IL", "IN", "IA", "KS", "KY", "LA",
+    "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND",
+    "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+    "DC",
+];
+
+/// Fetch RWIS + DCP networks for every CONUS state (98 small requests,
+/// bounded concurrency). Blocking — worker thread only. Failures are
+/// per-network and silent: a missing state never blocks the rest.
+pub fn fetch_mesonet_obs() -> Vec<SurfaceOb> {
+    let networks: Vec<String> = CONUS_STATES
+        .iter()
+        .flat_map(|st| ["RWIS", "DCP"].iter().map(move |sfx| format!("{st}_{sfx}")))
+        .collect();
+    let results = std::sync::Mutex::new(Vec::new());
+    let queue = std::sync::Mutex::new(networks.into_iter());
+    std::thread::scope(|scope| {
+        for _ in 0..10 {
+            scope.spawn(|| {
+                loop {
+                    let Some(network) = queue.lock().ok().and_then(|mut q| q.next()) else {
+                        return;
+                    };
+                    if let Ok(obs) = fetch_network(&network)
+                        && let Ok(mut all) = results.lock()
+                    {
+                        all.extend(obs);
+                    }
+                }
+            });
+        }
+    });
+    results.into_inner().unwrap_or_default()
+}
+
+fn fetch_network(network: &str) -> Result<Vec<SurfaceOb>, String> {
+    let url = format!("{IEM_CURRENTS_URL}?network={network}");
+    let body = data_source::fetch_text(&url).map_err(|err| err.to_string())?;
+    let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|err| err.to_string())?;
+    let mut obs = Vec::new();
+    let Some(rows) = parsed.get("data").and_then(|d| d.as_array()) else {
+        return Ok(obs);
+    };
+    for row in rows {
+        let f = |key: &str| row.get(key).and_then(|v| v.as_f64()).map(|v| v as f32);
+        let Some(lat) = f("lat").filter(|v| (-90.0..=90.0).contains(v)) else {
+            continue;
+        };
+        let Some(lon) = f("lon").filter(|v| (-180.0..=180.0).contains(v)) else {
+            continue;
+        };
+        let station = row
+            .get("station")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        if station.is_empty() {
+            continue;
+        }
+        let f_to_c = |deg_f: f32| (deg_f - 32.0) * 5.0 / 9.0;
+        let temp_c = f("tmpf").map(f_to_c).filter(|t| (-60.0..=55.0).contains(t));
+        let dewpoint_c = f("dwpf").map(f_to_c).filter(|t| (-60.0..=40.0).contains(t));
+        let wind_speed_kt = f("sknt").filter(|w| (0.0..250.0).contains(w));
+        let wind_dir_deg = f("drct").filter(|d| (0.0..=360.0).contains(d));
+        let wind_gust_kt = f("gust").filter(|w| (0.0..250.0).contains(w));
+        let altim_in_hg = f("alti").filter(|a| (25.0..=33.0).contains(a));
+        let completeness = temp_c.is_some() as u8
+            + dewpoint_c.is_some() as u8
+            + wind_speed_kt.is_some() as u8
+            + altim_in_hg.is_some() as u8
+            + wind_gust_kt.is_some() as u8;
+        if completeness == 0 {
+            continue;
+        }
+        let time_utc = row
+            .get("utc_valid")
+            .and_then(|v| v.as_str())
+            .and_then(|t| {
+                chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%dT%H:%M:%S")
+                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M"))
+                    .ok()
+            })
+            .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
+        obs.push(SurfaceOb {
+            network: network.to_owned(),
+            station_id: station,
+            time_utc,
+            lat,
+            lon,
+            temp_c,
+            dewpoint_c,
+            wind_dir_deg,
+            wind_speed_kt,
+            wind_gust_kt,
+            altim_in_hg,
+            completeness,
+        });
+    }
+    Ok(obs)
 }
 
 /// Time-keyed observation pool: every fetch merges in (METARs are hourly
@@ -196,6 +311,16 @@ impl ObPool {
         })
     }
 
+    /// How many reports this station has in the pool — ≥3 over the
+    /// retention window means a sub-hourly updater (loops filter to
+    /// these so scrubbing animates instead of freezing slow stations).
+    pub fn report_count(&self, station: &str) -> usize {
+        self.by_station
+            .get(station)
+            .map(|list| list.len())
+            .unwrap_or(0)
+    }
+
     /// Iterate one representative ob per station for `frame_time`.
     pub fn frame_obs(&self, frame_time: DateTime<Utc>) -> impl Iterator<Item = &SurfaceOb> {
         self.by_station
@@ -225,6 +350,7 @@ mod tests {
         use chrono::TimeZone;
         let t0 = Utc.with_ymd_and_hms(2100, 1, 1, 12, 0, 0).unwrap();
         let make = |minutes: i64, temp: f32| SurfaceOb {
+            network: "METAR".into(),
             station_id: "KTST".into(),
             time_utc: Some(t0 + chrono::Duration::minutes(minutes)),
             lat: 39.0,

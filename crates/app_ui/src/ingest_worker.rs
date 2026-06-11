@@ -259,17 +259,21 @@ fn compute_estimate(
         per_hour_store_bytes: estimate.per_hour_store_bytes,
         per_hour_download_bytes: estimate.per_hour_download_bytes,
         calibration: calibration.source.clone(),
-        time_hint: format_time_hint(estimate.download_bytes),
+        time_hint: format_time_hint(estimate.download_bytes, &profile, hour_count),
         breakdown: estimate.breakdown,
     })
 }
 
 /// Rough cache-cold download wall-clock at an assumed 40 MB/s — labeled as
 /// such; a warm raw-byte cache makes the fetch a disk read.
-pub fn format_time_hint(download_bytes: u64) -> String {
+pub fn format_time_hint(
+    download_bytes: u64,
+    profile: &rw_ingest::ingest_profile::IngestProfile,
+    hour_count: u16,
+) -> String {
     const ASSUMED_BYTES_PER_SEC: f64 = 40.0 * 1024.0 * 1024.0;
     let secs = download_bytes as f64 / ASSUMED_BYTES_PER_SEC;
-    if secs < 90.0 {
+    let download = if secs < 90.0 {
         format!("≈{secs:.0} s download @ 40 MB/s (cache-cold)")
     } else {
         format!(
@@ -277,6 +281,19 @@ pub fn format_time_hint(download_bytes: u64) -> String {
             (secs / 60.0).floor(),
             secs % 60.0
         )
+    };
+    // Compute is the part the download number hides — heavy's full ECAPE
+    // stage is ~5x and dominates (field report: "downloading is slow" was
+    // heavy compute, not the network).
+    if profile.heavy {
+        let low = hour_count as f64 * 1.5;
+        let high = hour_count as f64 * 4.0;
+        format!(
+            "{download} · ⚠ HEAVY: full ECAPE pins EVERY core at ~100% for ≈{low:.0}–{high:.0} min (fast desktop → laptop). Other profiles barely load the machine."
+        )
+    } else {
+        let est = (hour_count as f64 * 0.5).max(0.5);
+        format!("{download} · +≈{est:.0} min compute")
     }
 }
 
@@ -603,12 +620,20 @@ mod tests {
 
     #[test]
     fn time_hint_formats_seconds_and_minutes() {
-        assert_eq!(format_time_hint(0), "≈0 s download @ 40 MB/s (cache-cold)");
-        // 1.6 GB at 40 MB/s ≈ 41 s.
-        let hint = format_time_hint(1_677_721_600);
-        assert_eq!(hint, "≈40 s download @ 40 MB/s (cache-cold)");
-        let hint = format_time_hint(40 * 1024 * 1024 * 150);
+        let light = rw_ingest::ingest_profile::IngestProfile::sounding();
+        let hint = format_time_hint(0, &light, 1);
+        assert!(hint.starts_with("≈0 s download"), "got: {hint}");
+        // 1.6 GB at 40 MB/s ≈ 41 s; light profile adds a small compute note.
+        let hint = format_time_hint(1_677_721_600, &light, 3);
+        assert!(hint.starts_with("≈40 s download"), "got: {hint}");
+        assert!(hint.contains("compute"), "got: {hint}");
+        let hint = format_time_hint(40 * 1024 * 1024 * 150, &light, 3);
         assert!(hint.starts_with("≈2 m 30 s"), "got: {hint}");
+        // Heavy gets the saturation warning.
+        let mut heavy = rw_ingest::ingest_profile::IngestProfile::full();
+        heavy.heavy = true;
+        let hint = format_time_hint(0, &heavy, 3);
+        assert!(hint.contains("HEAVY"), "got: {hint}");
     }
 
     /// A Start over an invalid spec responds Failed without spawning any
