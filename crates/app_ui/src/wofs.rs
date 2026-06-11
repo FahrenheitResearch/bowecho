@@ -17,6 +17,7 @@ use eframe::egui;
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Instant;
 
 const API: &str = "https://cbwofs.vlab.noaa.gov/Forecast";
 const CDN: &str = "https://ep-wofs-postv2-dndma2fqexfhexfs.a01.azurefd.net/primary";
@@ -78,6 +79,22 @@ pub fn fetch_catalog() -> Result<WofsCatalog, String> {
     runs.sort_by(|a, b| b.rundate.cmp(&a.rundate).then(b.id.cmp(&a.id)));
     if runs.is_empty() {
         return Err("no WoFS runs".to_owned());
+    }
+    // Live runs appear in the catalog BEFORE their imagery posts (field
+    // report: newest init 404'd). Demote inits whose f000 isn't up yet.
+    if let Some(newest) = runs.first_mut() {
+        let mut keep = newest.inits.clone();
+        while keep.len() > 1 {
+            let probe = format!(
+                "{CDN}/{}/{}/{}/img/comp_dz__paintballs_thresh_40_f000.png",
+                newest.id, newest.rundate, keep[0]
+            );
+            if data_source::fetch_bytes(&probe).is_ok() {
+                break;
+            }
+            keep.remove(0);
+        }
+        newest.inits = keep;
     }
     // Menu tree + per-product time grids for the newest run.
     let newest = &runs[0];
@@ -187,6 +204,9 @@ pub struct WofsState {
     pub textures: HashMap<String, egui::TextureHandle>,
     pub image_rx: Option<mpsc::Receiver<(String, Result<egui::ColorImage, String>)>>,
     pub pending_urls: Vec<String>,
+    /// URLs that 404'd (imagery not posted yet for a live run) — retried
+    /// only after the backoff so the fetcher never spams.
+    pub missing: HashMap<String, Instant>,
     pub status: String,
 }
 
@@ -205,6 +225,7 @@ impl Default for WofsState {
             textures: HashMap::new(),
             image_rx: None,
             pending_urls: Vec::new(),
+            missing: HashMap::new(),
             status: String::new(),
         }
     }
@@ -239,6 +260,12 @@ impl WofsState {
         }
         urls.into_iter()
             .filter(|u| !self.textures.contains_key(u))
+            .filter(|u| {
+                self.missing
+                    .get(u)
+                    .map(|at| at.elapsed().as_secs() > 60)
+                    .unwrap_or(true)
+            })
             .collect()
     }
 
@@ -286,7 +313,17 @@ impl WofsState {
                 Ok((url, Err(e))) => {
                     self.image_rx = None;
                     self.pending_urls.retain(|u| u != &url);
-                    self.status = format!("WoFS: {e} ({url})");
+                    // Short, layout-safe status: live runs post imagery a
+                    // few minutes behind the catalog — a 404 just means
+                    // "not yet".
+                    self.status = if e.contains("404") {
+                        "frame not posted yet (live run) — retrying shortly".to_owned()
+                    } else {
+                        let mut msg = e;
+                        msg.truncate(90);
+                        format!("WoFS: {msg}")
+                    };
+                    self.missing.insert(url, Instant::now());
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => self.image_rx = None,

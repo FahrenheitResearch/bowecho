@@ -161,6 +161,37 @@ pub fn fetch_raob(
 mod tests {
     use super::*;
 
+    /// Live repro for the field report "sounding compute failed" —
+    /// network test, run with --ignored.
+    #[test]
+    #[ignore]
+    fn live_raob_roundtrip() {
+        let when = Utc::now();
+        for station in ["GRB", "DVN", "ILX", "OAX"] {
+            for launch in launch_times_before(when) {
+                match fetch_raob(station, launch) {
+                    Ok(column) => {
+                        println!(
+                            "{station} {launch}: {} levels, p {:.0}..{:.0}, h {:.0}..{:.0}",
+                            column.pressure_hpa.len(),
+                            column.pressure_hpa.first().unwrap(),
+                            column.pressure_hpa.last().unwrap(),
+                            column.height_m_msl.first().unwrap(),
+                            column.height_m_msl.last().unwrap()
+                        );
+                        match rustwx_sounding::NativeSounding::from_column(&column) {
+                            Ok(_) => println!("  from_column OK"),
+                            Err(e) => println!("  from_column ERR: {e}"),
+                        }
+                        return;
+                    }
+                    Err(e) => println!("{station} {launch}: fetch {e}"),
+                }
+            }
+        }
+        panic!("no station produced a column");
+    }
+
     #[test]
     fn launch_times_walk_synoptic_hours() {
         use chrono::TimeZone;

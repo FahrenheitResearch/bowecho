@@ -28,6 +28,7 @@ use rw_ingest::ingest_profile::IngestProfile;
 use rw_ingest::size_estimate::{Calibration, default_calibration_paths, estimate};
 use rw_ingest::{IngestConfig, IngestError, IngestEvent, IngestStage, parse_hours, throttle};
 use rw_ui::{AvailabilityView, DownloadSpec, DownloadStage, EstimateView, HourDoneView};
+use settings;
 
 /// Requests from the UI thread.
 #[derive(Debug, Clone)]
@@ -420,7 +421,17 @@ fn run_download(
             return;
         }
     };
-    let cache_root = PathBuf::from(&spec.cache_dir);
+    // Relative cache paths (the crate default, or persisted old specs)
+    // resolve inside the read-only bundle on macOS — force them under the
+    // app's config-scoped cache instead.
+    let cache_root = {
+        let p = PathBuf::from(&spec.cache_dir);
+        if p.is_absolute() {
+            p
+        } else {
+            settings::model_cache_dir()
+        }
+    };
     if let Err(err) = std::fs::create_dir_all(&cache_root) {
         send(IngestResponse::Failed(format!(
             "cache dir {}: {err}",

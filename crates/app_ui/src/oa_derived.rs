@@ -30,6 +30,11 @@ pub struct OaCapeInputs {
     pub td_iso: Vec<f32>,
     pub h_iso: Vec<f32>,
     pub levels_hpa: Vec<u16>,
+    /// Winds (m/s) — empty when the caller only needs thermo products.
+    pub u10: Vec<f32>,
+    pub v10: Vec<f32>,
+    pub u_iso: Vec<f32>,
+    pub v_iso: Vec<f32>,
 }
 
 /// The surface-driven thermodynamic suite — every product the surface
@@ -204,6 +209,176 @@ fn grid_impl(inputs: &OaCapeInputs, product: OaProduct, stride: usize) -> Vec<f3
                 let (yy, xx) = (y + dy, x + dx);
                 if yy < ny && xx < nx {
                     out[yy * nx + xx] = value;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One computed composite field, ready to become a map layer.
+pub struct CompositeField {
+    pub name: &'static str,
+    pub units: &'static str,
+    pub values: Vec<f32>,
+    pub range: (f32, f32),
+}
+
+/// THE SPC-mesoanalysis pass: per strided cell, build the full sharprs
+/// profile (OA-corrected surface + model column, winds included) and run
+/// `compute_all_params` — SHARPpy's entire parameter suite in one call —
+/// then expose the headline composites as map fields. Compute once,
+/// display many.
+pub fn composite_pass(
+    inputs: &OaCapeInputs,
+    stride: usize,
+    progress: &std::sync::atomic::AtomicUsize,
+) -> Vec<CompositeField> {
+    use rayon::prelude::*;
+    let (nx, ny) = (inputs.nx, inputs.ny);
+    let stride = stride.max(1);
+    let plane = nx * ny;
+    let to_c = |v: f32| -> f64 {
+        if inputs.kelvin {
+            f64::from(v) - 273.15
+        } else {
+            f64::from(v)
+        }
+    };
+    const FIELDS: &[(&str, &str, (f32, f32))] = &[
+        ("SCP", "", (0.0, 20.0)),
+        ("STP (CIN)", "", (0.0, 8.0)),
+        ("STP (fixed)", "", (0.0, 8.0)),
+        ("SHIP", "", (0.0, 4.0)),
+        ("EHI 0-1km", "", (0.0, 8.0)),
+        ("EHI 0-3km", "", (0.0, 8.0)),
+        ("Eff SRH", "m²/s²", (0.0, 600.0)),
+        ("Eff shear", "kt", (0.0, 80.0)),
+        ("SRH 0-1km", "m²/s²", (0.0, 500.0)),
+        ("SRH 0-3km", "m²/s²", (0.0, 700.0)),
+        ("MUCAPE", "J/kg", (0.0, 6000.0)),
+        ("PWAT", "in", (0.0, 2.5)),
+        ("K-index", "", (15.0, 45.0)),
+        ("Freezing lvl", "m", (0.0, 6000.0)),
+    ];
+    let cells: Vec<(usize, usize)> = (0..ny)
+        .step_by(stride)
+        .flat_map(|y| (0..nx).step_by(stride).map(move |x| (y, x)))
+        .collect();
+    let results: Vec<((usize, usize), [f32; 14])> = cells
+        .par_iter()
+        .map(|&(y, x)| {
+            progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let i = y * nx + x;
+            let vals = (|| -> Option<[f32; 14]> {
+                let psfc_hpa = f64::from(*inputs.psfc.get(i)?) / 100.0;
+                let t_sfc = to_c(*inputs.t2m.get(i)?);
+                let td_sfc = to_c(*inputs.td2m.get(i)?).min(t_sfc);
+                if !psfc_hpa.is_finite() || !t_sfc.is_finite() {
+                    return None;
+                }
+                let z_sfc = f64::from(inputs.orography.get(i).copied().unwrap_or(0.0));
+                let (u_s, v_s) = (
+                    f64::from(*inputs.u10.get(i)?),
+                    f64::from(*inputs.v10.get(i)?),
+                );
+                let uv_to_dirspd = |u: f64, v: f64| -> (f64, f64) {
+                    let spd = (u * u + v * v).sqrt() * 1.943_84; // m/s -> kt
+                    let dir = (270.0 - v.atan2(u).to_degrees()).rem_euclid(360.0);
+                    (dir, spd)
+                };
+                let (d0, s0) = uv_to_dirspd(u_s, v_s);
+                let mut pres = vec![psfc_hpa];
+                let mut hght = vec![z_sfc];
+                let mut tmpc = vec![t_sfc];
+                let mut dwpc = vec![td_sfc];
+                let mut wdir = vec![d0];
+                let mut wspd = vec![s0];
+                for (li, &level) in inputs.levels_hpa.iter().enumerate() {
+                    let p = f64::from(level);
+                    if p >= psfc_hpa - 1.0 {
+                        continue;
+                    }
+                    let idx = li * plane + i;
+                    let (t, td, h, u, v) = (
+                        *inputs.t_iso.get(idx)?,
+                        *inputs.td_iso.get(idx)?,
+                        *inputs.h_iso.get(idx)?,
+                        *inputs.u_iso.get(idx)?,
+                        *inputs.v_iso.get(idx)?,
+                    );
+                    if !t.is_finite() || !h.is_finite() {
+                        continue;
+                    }
+                    let (d, s) = uv_to_dirspd(f64::from(u), f64::from(v));
+                    pres.push(p);
+                    hght.push(f64::from(h));
+                    tmpc.push(to_c(t));
+                    dwpc.push(to_c(td).min(to_c(t)));
+                    wdir.push(d);
+                    wspd.push(s);
+                }
+                if pres.len() < 10 {
+                    return None;
+                }
+                let n = pres.len();
+                let station = sharprs::profile::StationInfo {
+                    station_id: "OA".to_owned(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    elevation: z_sfc,
+                    ..Default::default()
+                };
+                let profile = sharprs::profile::Profile::new(
+                    &pres,
+                    &hght,
+                    &tmpc,
+                    &dwpc,
+                    &wdir,
+                    &wspd,
+                    &vec![0.0; n],
+                    station,
+                )
+                .ok()?;
+                let p = sharprs::render::compositor::compute_all_params(&profile);
+                let f = |o: Option<f64>| o.map(|v| v as f32).unwrap_or(f32::NAN);
+                Some([
+                    f(p.scp),
+                    f(p.stp_cin),
+                    f(p.stp_fixed),
+                    f(p.ship),
+                    f(p.ehi01),
+                    f(p.ehi03),
+                    f(p.effective_srh),
+                    f(p.effective_bwd),
+                    p.srh01.0 as f32,
+                    p.srh03.0 as f32,
+                    p.mupcl.bplus as f32,
+                    f(p.precip_water),
+                    f(p.k_index),
+                    f(p.frz_lvl),
+                ])
+            })();
+            ((y, x), vals.unwrap_or([f32::NAN; 14]))
+        })
+        .collect();
+    let mut out: Vec<CompositeField> = FIELDS
+        .iter()
+        .map(|(name, units, range)| CompositeField {
+            name,
+            units,
+            values: vec![f32::NAN; plane],
+            range: *range,
+        })
+        .collect();
+    for ((y, x), vals) in results {
+        for dy in 0..stride {
+            for dx in 0..stride {
+                let (yy, xx) = (y + dy, x + dx);
+                if yy < ny && xx < nx {
+                    for (k, field) in out.iter_mut().enumerate() {
+                        field.values[yy * nx + xx] = vals[k];
+                    }
                 }
             }
         }

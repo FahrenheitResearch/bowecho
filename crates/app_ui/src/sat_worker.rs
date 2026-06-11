@@ -345,7 +345,17 @@ fn follow_config(spec: &SatFollowSpec, store_root: &Path) -> Result<FollowConfig
     let resolved = resolve_spec(spec)?;
     let mut config = FollowConfig::new(&spec.satellite, resolved.sector, resolved.bands);
     config.store_root = store_root.to_path_buf();
-    config.cache_dir = PathBuf::from(&spec.cache_dir);
+    // Relative cache dirs resolve inside the sealed read-only bundle on
+    // macOS (field report: os error 30 on sat downloads) — force them
+    // under the store root.
+    config.cache_dir = {
+        let p = PathBuf::from(&spec.cache_dir);
+        if p.is_absolute() {
+            p
+        } else {
+            store_root.join("cache")
+        }
+    };
     config.poll_interval = spec.interval().map(std::time::Duration::from_secs);
     config.downsample = spec.downsample;
     config.window = WindowConfig {

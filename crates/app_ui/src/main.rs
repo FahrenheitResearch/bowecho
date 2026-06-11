@@ -534,6 +534,13 @@ struct ViewerApp {
     /// SPC-style derived mesoanalysis in flight (SBCAPE on the OA).
     oa_cape_rx:
         Option<mpsc::Receiver<std::result::Result<(Arc<rw_ui::FieldData>, String), String>>>,
+    /// Full composite pass: cached fields (compute once, display many).
+    oa_composites: Option<Vec<oa_derived::CompositeField>>,
+    oa_comp_rx:
+        Option<mpsc::Receiver<std::result::Result<Vec<oa_derived::CompositeField>, String>>>,
+    oa_comp_progress: Arc<std::sync::atomic::AtomicUsize>,
+    oa_comp_total: usize,
+    oa_comp_pick: Option<usize>,
     /// 3D Volume Explorer (GPU direct volume rendering).
     vol3d: vol3d::Vol3d,
     /// WoFS viewer window state.
@@ -2518,6 +2525,11 @@ impl ViewerApp {
             oa_rx: None,
             oa_last_summary: None,
             oa_cape_rx: None,
+            oa_composites: None,
+            oa_comp_rx: None,
+            oa_comp_progress: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            oa_comp_total: 0,
+            oa_comp_pick: None,
             raob_sites: None,
             obs_enabled: restored_overlays.0,
             obs_show_metar: restored_overlays.1,
@@ -5975,6 +5987,7 @@ impl eframe::App for ViewerApp {
         }
         self.poll_mesoanalysis(&ctx);
         self.poll_oa_cape(&ctx);
+        self.poll_oa_composites(&ctx);
         self.poll_spc(&ctx);
         self.poll_custom_url(&ctx);
         self.poll_native_sounding(&ctx);
@@ -6948,6 +6961,60 @@ impl ViewerApp {
                             self.start_raob_sounding(ctx);
                         }
                     });
+                    // FULL SPC-mesoanalysis composites: one heavy pass
+                    // (sharprs compute_all_params per cell, OA-corrected
+                    // surface incl winds) caches 14 fields; each is then an
+                    // instant layer.
+                    ui.horizontal(|ui| {
+                        let busy = self.oa_comp_rx.is_some();
+                        let ready = self.obs_enabled
+                            && !self.surface_obs.is_empty()
+                            && self.model_lut.is_some()
+                            && !busy;
+                        if self.oa_composites.is_none() {
+                            if ui
+                                .add_enabled(ready, egui::Button::new("Compute composites (SCP/STP/…)"))
+                                .on_hover_text(
+                                    "One pass computes the full SPC suite (SCP, STP, SHIP, EHI, effective SRH/shear, K-index, PW, …) from the obs-corrected surface + model profiles — then every field is an instant layer. ~30-90 s background.",
+                                )
+                                .clicked()
+                            {
+                                self.start_oa_composites(ctx);
+                            }
+                        } else {
+                            ui.menu_button("Composites ▾", |ui| {
+                                let mut pick: Option<usize> = None;
+                                let _ = &mut pick;
+                                if let Some(fields) = &self.oa_composites {
+                                    for (i, field) in fields.iter().enumerate() {
+                                        if ui.button(field.name).clicked() {
+                                            pick = Some(i);
+                                            ui.close();
+                                        }
+                                    }
+                                }
+                                if let Some(p) = pick {
+                                    self.oa_comp_pick = Some(p);
+                                }
+                                ui.separator();
+                                if ui.button("Recompute").clicked() {
+                                    self.oa_composites = None;
+                                    self.start_oa_composites(ctx);
+                                    ui.close();
+                                }
+                            });
+                        }
+                        if busy {
+                            ui.spinner();
+                            let done = self
+                                .oa_comp_progress
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            ui.weak(format!("{done}/{} cells", self.oa_comp_total));
+                        }
+                    });
+                    if let Some(pick) = self.take_composite_pick() {
+                        self.push_composite_layer(pick, ctx);
+                    }
                     // SPC-style derived product: analyze the surface, then
                     // recompute CAPE from the corrected surface + profiles.
                     ui.horizontal(|ui| {
@@ -10663,6 +10730,10 @@ impl ViewerApp {
                     td_iso,
                     h_iso,
                     levels_hpa,
+                    u10: Vec::new(),
+                    v10: Vec::new(),
+                    u_iso: Vec::new(),
+                    v_iso: Vec::new(),
                 };
                 let values = oa_derived::product_grid(&inputs, product, 4);
                 let max = values
@@ -10696,6 +10767,188 @@ impl ViewerApp {
             let _ = sender.send(result);
             ctx_clone.request_repaint();
         });
+    }
+
+    fn take_composite_pick(&mut self) -> Option<usize> {
+        self.oa_comp_pick.take()
+    }
+
+    /// Push one cached composite field as a map layer.
+    fn push_composite_layer(&mut self, index: usize, ctx: &egui::Context) {
+        let Some(template) = self
+            .model_dock
+            .as_ref()
+            .and_then(|dock| dock.latest_field())
+            .cloned()
+        else {
+            return;
+        };
+        let Some((name, units, values, range)) = self.oa_composites.as_ref().and_then(|fields| {
+            fields
+                .get(index)
+                .map(|f| (f.name, f.units, f.values.clone(), f.range))
+        }) else {
+            return;
+        };
+        let mut layer_field = (*template).clone();
+        layer_field.key.var = format!("{name} (OA)");
+        layer_field.units = units.to_owned();
+        layer_field.values = values;
+        layer_field.range = Some(range);
+        layer_field.style = None;
+        self.start_model_layer_build(Arc::new(layer_field), ctx);
+        self.status = format!("{name} (OA) layer added");
+    }
+
+    /// The composite pass: correct ALL FOUR surface fields with the live
+    /// obs, then run sharprs' full parameter suite per strided cell.
+    fn start_oa_composites(&mut self, ctx: &egui::Context) {
+        let Some(template) = self
+            .model_dock
+            .as_ref()
+            .and_then(|dock| dock.latest_field())
+            .cloned()
+        else {
+            self.status = "Composites: open Model and show a field first".to_owned();
+            return;
+        };
+        let Some((_, lut)) = self.model_lut.clone() else {
+            return;
+        };
+        let now = Utc::now();
+        let obs: Vec<obs::SurfaceOb> = self
+            .surface_obs
+            .frame_obs(now)
+            .filter(|ob| {
+                let is_metar = ob.network == "METAR";
+                (is_metar && self.obs_show_metar) || (!is_metar && self.obs_show_mesonet)
+            })
+            .cloned()
+            .collect();
+        let (sender, receiver) = mpsc::channel();
+        self.oa_comp_rx = Some(receiver);
+        let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        self.oa_comp_progress = Arc::clone(&progress);
+        let stride = 6usize;
+        self.oa_comp_total = (template.nx / stride + 1) * (template.ny / stride + 1);
+        self.status = "Composites: analyzing + computing the full suite…".to_owned();
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            rw_ingest::throttle::set_current_thread_background_priority();
+            let result = (|| -> std::result::Result<Vec<oa_derived::CompositeField>, String> {
+                let hour = &template.key.hour;
+                let reader = rw_ui::StoreView::new(settings::model_store_dir())
+                    .open_hour(&hour.model, &hour.run, hour.hour)
+                    .map_err(|e| format!("open hour: {e}"))?;
+                let read2 = |name: &str| -> std::result::Result<Vec<f32>, String> {
+                    reader
+                        .read_full_2d(name)
+                        .map_err(|e| format!("{name}: {e}"))
+                };
+                let read3 = |name: &str| -> std::result::Result<Vec<f32>, String> {
+                    reader
+                        .read_full_3d(name)
+                        .map_err(|e| format!("{name}: {e}"))
+                };
+                let mut t2m = read2("temperature_2m")?;
+                let mut td2m = read2("dewpoint_2m")?;
+                let mut u10 = read2("u_10m")?;
+                let mut v10 = read2("v_10m")?;
+                let psfc = read2("surface_pressure")?;
+                let orography = read2("orography")?;
+                let t_iso = read3("temperature_iso")?;
+                let td_iso = read3("dewpoint_iso")?;
+                let h_iso = read3("height_iso")?;
+                let u_iso = read3("u_iso")?;
+                let v_iso = read3("v_iso")?;
+                let levels_hpa = reader
+                    .variable("temperature_iso")
+                    .map(|v| v.levels_hpa.clone())
+                    .ok_or("temperature_iso meta missing")?;
+                let (nx, ny) = (template.nx, template.ny);
+                let lut_t = Arc::clone(&lut);
+                let locate = move |ob: &obs::SurfaceOb| {
+                    lut_t
+                        .lookup(ob.lat, ob.lon)
+                        .map(|index| ((index % nx) as f64, (index / nx) as f64))
+                };
+                let make_field = |var: &str, values: Vec<f32>| -> Arc<rw_ui::FieldData> {
+                    let mut f = (*template).clone();
+                    f.key.var = var.to_owned();
+                    f.values = values;
+                    f.range = None;
+                    f.style = None;
+                    Arc::new(f)
+                };
+                if !obs.is_empty() {
+                    for (var, target) in [
+                        ("temperature_2m", &mut t2m),
+                        ("dewpoint_2m", &mut td2m),
+                        ("u_10m", &mut u10),
+                        ("v_10m", &mut v10),
+                    ] {
+                        if let Some(a) = mesoanalysis::analyze(
+                            var,
+                            &make_field(var, target.clone()),
+                            &obs,
+                            3.0,
+                            Some(&orography),
+                            &locate,
+                        ) {
+                            for (v, d) in target.iter_mut().zip(&a.increment) {
+                                if v.is_finite() {
+                                    *v += d;
+                                }
+                            }
+                        }
+                    }
+                }
+                let inputs = oa_derived::OaCapeInputs {
+                    nx,
+                    ny,
+                    psfc,
+                    orography,
+                    t2m,
+                    td2m,
+                    kelvin: true,
+                    t_iso,
+                    td_iso,
+                    h_iso,
+                    levels_hpa,
+                    u10,
+                    v10,
+                    u_iso,
+                    v_iso,
+                };
+                Ok(oa_derived::composite_pass(&inputs, stride, &progress))
+            })();
+            let _ = sender.send(result);
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn poll_oa_composites(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.oa_comp_rx else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(fields)) => {
+                self.oa_comp_rx = None;
+                self.status = format!(
+                    "Composites ready: {} fields — pick from the menu",
+                    fields.len()
+                );
+                self.oa_composites = Some(fields);
+                self.oa_comp_pick = Some(0); // auto-show SCP
+                ctx.request_repaint();
+            }
+            Ok(Err(message)) => {
+                self.oa_comp_rx = None;
+                self.status = format!("Composites failed: {message}");
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.oa_comp_rx = None,
+        }
     }
 
     fn poll_oa_cape(&mut self, ctx: &egui::Context) {
@@ -11732,6 +11985,30 @@ impl ViewerApp {
                                 }
                             });
                     }
+                    ui.menu_button("Overlays ▾", |ui| {
+                        let overlay_slugs: Vec<String> = catalog
+                            .times
+                            .keys()
+                            .filter(|slug| slug.contains("_overlay_"))
+                            .cloned()
+                            .collect();
+                        let mut sorted = overlay_slugs;
+                        sorted.sort();
+                        for slug in sorted {
+                            let mut on = self.wofs.overlays.contains(&slug);
+                            if ui.checkbox(&mut on, &slug).changed() {
+                                if on {
+                                    self.wofs.overlays.push(slug.clone());
+                                } else {
+                                    self.wofs.overlays.retain(|s| s != &slug);
+                                }
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Transparent stackables (dBZ/UH paintballs) drawn over the base product — like the official viewer's WoFS Overlays",
+                    );
                     egui::ComboBox::from_id_salt("wofs_product")
                         .selected_text(self.wofs.product.clone())
                         .width(240.0)
@@ -11772,7 +12049,10 @@ impl ViewerApp {
                     if self.wofs.image_rx.is_some() {
                         ui.spinner();
                     }
-                    ui.weak(&self.wofs.status);
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&self.wofs.status).weak())
+                            .truncate(),
+                    );
                 });
                 if let Some(run) = catalog.runs.get(self.wofs.run_index) {
                     let base_url =
@@ -16477,6 +16757,10 @@ fn default_download_spec() -> rw_ui::DownloadSpec {
         profile: "sounding".to_owned(),
         heavy: false,
         hours: "0-3".to_owned(),
+        // ABSOLUTE cache dir: the crate default ("out/cache") is relative,
+        // which resolves inside the sealed read-only bundle on macOS
+        // (field report: os error 30 on model downloads).
+        cache_dir: settings::model_cache_dir().to_string_lossy().into_owned(),
         ..rw_ui::DownloadSpec::default()
     }
 }
@@ -21247,6 +21531,11 @@ mod tests {
             oa_rx: None,
             oa_last_summary: None,
             oa_cape_rx: None,
+            oa_composites: None,
+            oa_comp_rx: None,
+            oa_comp_progress: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            oa_comp_total: 0,
+            oa_comp_pick: None,
             raob_sites: None,
             obs_enabled: false,
             obs_show_metar: true,
