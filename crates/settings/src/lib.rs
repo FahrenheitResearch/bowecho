@@ -67,6 +67,10 @@ pub struct AppSettings {
     /// "REF", "VEL", "SRV", "RHO", "ZDR", "SW", "CREF", "ET", "VIL", "VILD",
     /// "PHI", "KDP", "AzShr", "Div"). Edit in config.json to customize.
     pub product_hotkeys: BTreeMap<String, String>,
+    /// Last GR2A-style poll URL (mobile/research radar feeds) — typing it
+    /// once per deployment is fine, once per session is not.
+    #[serde(default)]
+    pub poll_url: String,
 }
 
 /// A persisted placefile reference.
@@ -126,6 +130,7 @@ impl Default for AppSettings {
             model_keep_runs: default_model_keep_runs(),
             perf_hud: false,
             product_hotkeys: default_product_hotkeys(),
+            poll_url: String::new(),
         }
     }
 }

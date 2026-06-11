@@ -87,6 +87,34 @@ const LIVE_COMPLETE_LOW_LEVEL_TILT_MIN_RADIALS: usize = 720;
 const LIVE_COMPLETE_TILT_MIN_RADIALS: usize = 360;
 const LIVE_COMPLETE_TILT_MIN_AZIMUTH_COVERAGE_DEG: f32 = 350.0;
 const HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM: usize = 6;
+
+/// Research-radar GR2A poll roots serving raw Level II (msg31) — the
+/// radars that DON'T exist in the NEXRAD site list. Iowa Environmental
+/// Mesonet's community Level II host + self-hosted university radars;
+/// all verified live 2026-06-11. NEXRAD itself loads natively from S3,
+/// so these presets cover only what S3 can't.
+const KNOWN_POLL_FEEDS: &[(&str, &str)] = &[
+    (
+        "WILU — Western Illinois Univ.",
+        "https://mesonet-nexrad.agron.iastate.edu/level2/raw/WILU",
+    ),
+    (
+        "FWLX — Furuno (Lawrenceburg TN)",
+        "https://mesonet-nexrad.agron.iastate.edu/level2/raw/FWLX",
+    ),
+    (
+        "FUSA — Furuno (Delmarva, 1-min)",
+        "https://mesonet-nexrad.agron.iastate.edu/level2/raw/FUSA",
+    ),
+    (
+        "MZZU — Univ. of Missouri",
+        "https://mesonet-nexrad.agron.iastate.edu/level2/raw/MZZU",
+    ),
+    (
+        "GAWX — Georgia (intermittent)",
+        "https://mesonet-nexrad.agron.iastate.edu/level2/raw/GAWX",
+    ),
+];
 const ACTIVE_ALERTS_URL: &str = "https://api.weather.gov/alerts/active?status=actual";
 const SPC_MD_INDEX_URL: &str = "https://www.spc.noaa.gov/products/md/";
 const SPC_PRODUCT_BASE_URL: &str = "https://www.spc.noaa.gov";
@@ -2471,6 +2499,7 @@ impl ViewerApp {
             vol3d::init_gpu(render_state);
         }
         let app_settings = settings::AppSettings::load();
+        let restored_poll_url = app_settings.poll_url.clone();
         let restored_overlays = (
             app_settings.overlay_obs,
             app_settings.overlay_obs_metar,
@@ -2631,7 +2660,7 @@ impl ViewerApp {
             vol3d: vol3d::Vol3d::default(),
             wofs: wofs::WofsState::default(),
             farm: farm_live::FarmState::default(),
-            poll_url: String::new(),
+            poll_url: restored_poll_url,
             poll_active: false,
             poll_last_file: None,
             poll_next: None,
@@ -7251,18 +7280,39 @@ impl ViewerApp {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Poll URL").on_hover_text(
-                        "GR2A-style polling: a served directory containing dir.list (the convention DOW/mobile radar crews use). Newest file loads automatically every 15 s.",
+                        "GR2A-style polling: a served directory containing dir.list (the convention DOW/mobile radar crews use). Newest file loads automatically every 15 s, decoded natively (Level II or DORADE), and joins the frame loop.",
                     );
                     ui.add(
                         egui::TextEdit::singleline(&mut self.poll_url)
                             .hint_text("http://host:port/path")
-                            .desired_width(170.0),
+                            .desired_width(150.0),
+                    );
+                    ui.menu_button("Feeds ▾", |ui| {
+                        ui.weak("research radars serving raw Level II");
+                        for (label, url) in KNOWN_POLL_FEEDS {
+                            if ui.button(*label).clicked() {
+                                self.poll_url = (*url).to_owned();
+                                self.poll_active = true;
+                                self.poll_last_file = None;
+                                self.poll_next = None;
+                                self.app_settings.poll_url = self.poll_url.clone();
+                                let _ = self.app_settings.save();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Community research-radar poll roots (IEM Level II host + self-hosted university radars) — radars that aren't NEXRAD sites",
                     );
                     let label = if self.poll_active { "Stop" } else { "Start" };
                     if ui.button(label).clicked() {
                         self.poll_active = !self.poll_active;
                         self.poll_last_file = None;
                         self.poll_next = None;
+                        if self.poll_active && self.app_settings.poll_url != self.poll_url {
+                            self.app_settings.poll_url = self.poll_url.clone();
+                            let _ = self.app_settings.save();
+                        }
                     }
                     if self.poll_active {
                         ui.weak(
@@ -11279,8 +11329,33 @@ impl ViewerApp {
         });
     }
 
-    /// Install a volume fetched by the URL poller (live-equivalent frame).
-    fn install_polled_volume(&mut self, volume: Arc<RadarVolume>, ctx: &egui::Context) {
+    /// Install a volume fetched by the URL poller: into the frame strip
+    /// first (so polled feeds LOOP like any live site — a 1-min Furuno or
+    /// 12 s COW sequence is useless as single frames), then onto the map.
+    fn install_polled_volume(&mut self, name: &str, volume: Arc<RadarVolume>, ctx: &egui::Context) {
+        let identity = frame_identity_for_volume(&volume);
+        let frame = FrameHistoryEntry {
+            identity: identity.clone(),
+            path: PathBuf::from(format!("poll://{name}")),
+            volume: Arc::clone(&volume),
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: format!("polled {name}"),
+        };
+        if let Some(existing) = self
+            .frame_history
+            .iter_mut()
+            .find(|candidate| candidate.identity == identity)
+        {
+            *existing = frame;
+        } else {
+            self.frame_history.push(frame);
+        }
+        self.trim_frame_history();
+        // Follow the feed unless the user is looping history.
+        if !self.history_playing {
+            self.selected_frame_index = self.frame_history.len().saturating_sub(1);
+        }
         self.install_volume_arc(volume, None, true, None, FrameStatus::Complete, ctx);
     }
 
@@ -11319,10 +11394,21 @@ impl ViewerApp {
                         if last.as_deref() == Some(newest.as_str()) {
                             return Ok(None);
                         }
-                        let raw = data_source::fetch_bytes(&format!("{base}/{newest}"))
+                        // Volume client: real Level II runs 5-25 MB —
+                        // fetch_bytes' 4 MiB sprite-sheet cap and 8 s
+                        // metadata timeout both fail on field links.
+                        let raw = data_source::fetch_volume_bytes(&format!("{base}/{newest}"))
                             .map_err(|e| format!("{newest}: {e}"))?;
-                        let volume = nexrad_io::decode_volume_from_bytes(&raw)
-                            .map_err(|e| format!("decode {newest}: {e}"))?;
+                        // Field feeds serve Level-II conversions (the GR2A
+                        // msg31 convention) or native DORADE sweepfiles;
+                        // route by magic bytes like the file-open path.
+                        let volume = if nexrad_io::dorade::looks_like_dorade_bytes(&raw) {
+                            nexrad_io::dorade::decode_dorade_sweep_volume(&raw)
+                                .map_err(|e| format!("decode {newest}: {e}"))?
+                        } else {
+                            nexrad_io::decode_volume_from_bytes(&raw)
+                                .map_err(|e| format!("decode {newest}: {e}"))?
+                        };
                         Ok(Some((newest, Arc::new(volume))))
                     })();
                 let _ = sender.send(match result {
@@ -11339,7 +11425,7 @@ impl ViewerApp {
                     self.poll_rx = None;
                     self.poll_last_file = Some(name.clone());
                     self.status = format!("Polled: {name}");
-                    self.install_polled_volume(volume, ctx);
+                    self.install_polled_volume(&name, volume, ctx);
                 }
                 Ok(Err(message)) => {
                     self.poll_rx = None;

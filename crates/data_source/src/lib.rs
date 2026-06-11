@@ -295,6 +295,27 @@ pub fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
+/// Fetch a radar volume from a polled feed. Volumes run 5–25 MB
+/// (compressed NEXRAD or uncompressed msg31 conversions), so this uses
+/// the download client (long timeout) with a generous cap — unlike
+/// `fetch_bytes`, which is sized for sprite sheets on the metadata
+/// client and rejects anything over 4 MiB.
+pub fn fetch_volume_bytes(url: &str) -> Result<Vec<u8>> {
+    let bytes = download_http_client()
+        .get(url)
+        .send()?
+        .error_for_status()?
+        .bytes()?;
+    const MAX: usize = 256 * 1024 * 1024;
+    if bytes.len() > MAX {
+        return Err(DataSourceError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("volume too large: {} bytes", bytes.len()),
+        )));
+    }
+    Ok(bytes.to_vec())
+}
+
 pub fn fetch_level2_radar_sites(days_back: i64) -> Result<Vec<RadarSite>> {
     let weather_sites = fetch_weather_gov_radar_sites().unwrap_or_default();
     let weather_by_id = weather_sites
