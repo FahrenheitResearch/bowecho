@@ -26,6 +26,7 @@ use serde::Deserialize;
 mod annotate;
 mod basemap_data;
 mod basemap_towns;
+mod dock;
 mod farm_live;
 mod glm_layer;
 mod guide;
@@ -44,6 +45,7 @@ mod skewt_native;
 mod sounding_panels;
 mod spc_layers;
 mod tiles;
+mod tor_tracks;
 mod vol3d;
 mod wofs;
 mod wofs_georef;
@@ -76,14 +78,13 @@ const PRIMARY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 1;
 const OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 5;
 const MAX_RADAR_OVERLAY_LAYERS: usize = 10;
 const DEFAULT_RADAR_OVERLAY_ALPHA: u8 = 210;
-const MIN_RADAR_OVERLAY_ALPHA: u8 = 48;
-const FRESH_RING_GREEN_SECONDS: i64 = 6 * 60;
-const FRESH_RING_YELLOW_SECONDS: i64 = 10 * 60;
-const FRESH_RING_RED_SECONDS: i64 = 15 * 60;
 const PERF_SAMPLE_CAPACITY: usize = 96;
 const STALE_LATEST_DISPLAY_CLEAR_SECONDS: i64 = 15 * 60;
 const HISTORY_SIZE_OPTIONS: &[usize] = &[3, 5, 7, 10, 15, 20, 25, 30];
 const DEFAULT_HISTORY_FRAME_LIMIT: usize = 7;
+/// Hard ceiling for the frame strip — deployment folders legitimately
+/// load 100+ volumes.
+const MAX_HISTORY_FRAME_LIMIT: usize = 200;
 const HISTORY_LOOP_FRAME_MS: u64 = 700;
 const LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG: f32 = 1.0;
 const LIVE_LOW_LEVEL_AUTO_ADVANCE_MIN_SECONDS: i64 = 90;
@@ -134,7 +135,6 @@ const HAZARD_MAX_RENDER_LON_SPAN_DEG: f32 = 45.0;
 const HAZARD_MAX_RENDER_LAT_SPAN_DEG: f32 = 30.0;
 const HAZARD_MAX_RENDER_EDGE_KM: f32 = 2_500.0;
 const MAP_DRAG_DEAD_ZONE_PX: f32 = 3.0;
-const DEFAULT_HAZARD_FILL_ALPHA: u8 = 24;
 const COLOR_STATUS_SCROLL_HEIGHT: f32 = 34.0;
 const HAZARD_SUMMARY_SCROLL_HEIGHT: f32 = 86.0;
 const HAZARD_DETAIL_SCROLL_HEIGHT: f32 = 150.0;
@@ -226,6 +226,10 @@ fn app_cache_root() -> PathBuf {
         && !path.trim().is_empty()
     {
         return PathBuf::from(path);
+    }
+    // User data-folder override (Settings ▸ Display ▸ Data folder).
+    if let Some(root) = settings::data_dir_override() {
+        return root.join("cache");
     }
 
     #[cfg(windows)]
@@ -411,6 +415,12 @@ enum LocalRadarKind {
 }
 
 fn sniff_local_radar_kind(path: &Path) -> LocalRadarKind {
+    // A FOLDER is a deployment: research data ships as directories of
+    // per-sweep DORADE files (one file per tilt), so the directory is
+    // the natural open unit. Routed through the archive batch path.
+    if path.is_dir() {
+        return LocalRadarKind::MobileArchive;
+    }
     let mut head = [0u8; 8];
     let filled = std::fs::File::open(path)
         .and_then(|mut file| {
@@ -465,8 +475,12 @@ fn decode_mobile_radar_batch(
     let mut frames: Vec<DecodedLoad> = Vec::new();
     match kind {
         LocalRadarKind::MobileArchive => {
-            let mut volumes = nexrad_io::mobile_archive::decode_mobile_archive_from_path(path)
-                .map_err(|err| err.to_string())?;
+            let mut volumes = if path.is_dir() {
+                nexrad_io::mobile_archive::decode_mobile_dir_from_path(path)
+            } else {
+                nexrad_io::mobile_archive::decode_mobile_archive_from_path(path)
+            }
+            .map_err(|err| err.to_string())?;
             let dominant_site = dominant_site_id(volumes.iter().map(|entry| &entry.volume));
             if let Some(site_id) = dominant_site {
                 volumes.retain(|entry| entry.volume.site.id == site_id);
@@ -521,8 +535,16 @@ fn decode_mobile_radar_batch(
         }
         LocalRadarKind::NexradLevel2 => unreachable!("routed to the Level II loader"),
     }
+    // Generic compression magics (gzip, BZh) match non-radar files in a
+    // deployment folder, and garbage can "decode" to a volume with zero
+    // cuts — which then panics the renderer (field report: "cut index 0
+    // is out of range for 0 cuts"). Empty volumes never install.
+    frames.retain(|frame| !frame.volume.cuts.is_empty());
     if frames.is_empty() {
-        return Err("no radar volumes decoded".to_owned());
+        return Err(
+            "no displayable radar volumes (files decoded empty — wrong folder or format?)"
+                .to_owned(),
+        );
     }
     let selected_index = frames.len() - 1;
     Ok(DecodedLoadBatch {
@@ -564,6 +586,16 @@ struct ViewerApp {
     history_playing: bool,
     last_history_step: Option<Instant>,
     color_tables: ColorTableSet,
+    /// User .pal tables scanned from `settings::color_tables_dir()` ("My
+    /// tables"): (family from the `Product:` header, parsed table).
+    user_color_tables: Vec<(ColorTableFamily, ColorTable)>,
+    /// Resolved per-product palette overrides (product label -> table),
+    /// injected in `render_color_tables_for_product`. Rebuilt from
+    /// `AppSettings.palette_by_product` at startup and on edit.
+    palette_product_overrides: BTreeMap<String, ColorTable>,
+    /// Quick-picker binding scope: false = whole family (the default
+    /// mental model — REF/CREF share), true = this product only.
+    bind_palette_to_product: bool,
     flip_velocity_color_polarity: bool,
     unfold_velocity_display: bool,
     color_table_target: ColorTableFamily,
@@ -622,6 +654,9 @@ struct ViewerApp {
     rotation_markers_volume_ptr: usize,
     rotation_receiver: Option<mpsc::Receiver<(usize, Vec<RotationMarker>)>>,
     show_rotation_markers: bool,
+    /// TOR TRACKS: rotation-tracks accumulation + TDS flag layers (state,
+    /// background jobs, and paint live in `tor_tracks.rs`).
+    tor_tracks: tor_tracks::TorTracksState,
     /// Reflectivity gate filter threshold (dBZ); None = off.
     gate_filter_dbz: Option<f32>,
     /// Velocity dealias engine: false = region (default, proven), true =
@@ -687,6 +722,12 @@ struct ViewerApp {
     /// Clean-screen mode: hide ALL chrome (top bar, sidebar, status) so
     /// captures are pure radar. Tab toggles, Esc restores.
     chrome_hidden: bool,
+    /// One-shot: the next multi-frame batch install came from a local
+    /// folder/zip open — fit the whole sequence in history and roll it.
+    pending_local_autoplay: bool,
+    /// Dockable workspace: the tile tree hosting the map pane + any docked
+    /// viewer panes (src/dock.rs, docs/docking-spike.md).
+    workspace: dock::Workspace,
     /// Model-data dock (rusty-weather rw-ui panels), created on first open.
     model_dock: Option<model_data::ModelDataDock>,
     model_dock_open: bool,
@@ -846,7 +887,14 @@ struct ViewerApp {
     hazard_status: String,
     hazards_visible: bool,
     hazards_active_only: bool,
-    hazard_fill_alpha: u8,
+    /// User style overrides (styles.json document) and the resolved
+    /// registry draw code reads. Rebuild the registry after editing the
+    /// document (`rebuild_style_registry`).
+    style_settings: styles::StyleSettings,
+    style_registry: styles::StyleRegistry,
+    /// styles.json was written by a newer BowEcho — loaded read-only,
+    /// saving disabled to protect it.
+    styles_newer_schema: bool,
     hidden_hazard_families: BTreeSet<String>,
     realtime_level2_auto_refresh: bool,
     display_live_chunk_updates: bool,
@@ -2553,6 +2601,11 @@ impl ViewerApp {
             vol3d::init_gpu(render_state);
         }
         let app_settings = settings::AppSettings::load();
+        // Data-folder override (field request: limited LOCALAPPDATA
+        // space): root every cache/store at the user's chosen folder.
+        // Set once, before any worker resolves a directory.
+        let data_dir = app_settings.data_dir.trim();
+        settings::set_data_dir_override((!data_dir.is_empty()).then(|| PathBuf::from(data_dir)));
         let restored_poll_url = app_settings.poll_url.clone();
         let restored_farm = farm_live::FarmState::with_saved(&app_settings.farm_georefs);
         let restored_overlays = (
@@ -2597,6 +2650,9 @@ impl ViewerApp {
             .unwrap_or((35.33305, -97.27775));
         let (render_sender, render_receiver, render_recycle_sender) = spawn_render_worker();
         let hazard_path_text = String::new();
+        let loaded_styles = styles::load();
+        let style_registry = styles::StyleRegistry::from_settings(&loaded_styles.settings);
+        let initial_radar_opacity = style_registry.drapes().radar_opacity;
 
         let restored_model_keep_runs = app_settings.model_keep_runs;
         let mut app = Self {
@@ -2615,6 +2671,9 @@ impl ViewerApp {
             history_playing: false,
             last_history_step: None,
             color_tables: ColorTableSet::default(),
+            user_color_tables: Vec::new(),
+            palette_product_overrides: BTreeMap::new(),
+            bind_palette_to_product: false,
             flip_velocity_color_polarity: false,
             unfold_velocity_display: true,
             color_table_target: ColorTableFamily::Velocity,
@@ -2665,6 +2724,7 @@ impl ViewerApp {
             rotation_markers_volume_ptr: 0,
             rotation_receiver: None,
             show_rotation_markers: true,
+            tor_tracks: tor_tracks::TorTracksState::default(),
             gate_filter_dbz: None,
             dealias_cascade: false,
             display_smoothing: false,
@@ -2693,6 +2753,8 @@ impl ViewerApp {
             show_satellite: false,
             show_guide: false,
             chrome_hidden: false,
+            pending_local_autoplay: false,
+            workspace: dock::Workspace::default(),
             model_dock: None,
             model_dock_open: false,
             sat_layer: None,
@@ -2704,7 +2766,7 @@ impl ViewerApp {
             model_layers: Vec::new(),
             model_layer_build_rx: None,
             model_layer_generation: 0,
-            radar_opacity: 1.0,
+            radar_opacity: initial_radar_opacity,
             model_ingest_rx: None,
             model_ingest_progress_rx: None,
             model_ingest_cancel: None,
@@ -2788,7 +2850,9 @@ impl ViewerApp {
             hazard_status: "No hazard polygons loaded".to_owned(),
             hazards_visible: true,
             hazards_active_only: true,
-            hazard_fill_alpha: DEFAULT_HAZARD_FILL_ALPHA,
+            style_settings: loaded_styles.settings,
+            style_registry,
+            styles_newer_schema: loaded_styles.newer_schema,
             hidden_hazard_families: default_hidden_hazard_families(),
             realtime_level2_auto_refresh: true,
             display_live_chunk_updates: false,
@@ -2811,6 +2875,26 @@ impl ViewerApp {
         app.basemap_style = restored_basemap_style;
         app.bold_labels = restored_bold_labels;
         app.gate_filter_dbz = restored_gate_filter_dbz;
+        app.restore_workspace_layout();
+        // Palette persistence: scan My tables (user .pal files copied into
+        // the config dir), then resolve the saved family bindings and
+        // per-product overrides against built-ins ∪ user tables. Missing
+        // names (deleted files) fall back to defaults and say so.
+        app.user_color_tables = scan_user_color_tables(&settings::color_tables_dir());
+        let mut palette_misses = restore_palette_bindings(
+            &mut app.color_tables,
+            &app.app_settings.palette_by_family,
+            &app.user_color_tables,
+        );
+        let (overrides, product_misses) = resolve_product_palette_overrides(
+            &app.app_settings.palette_by_product,
+            &app.user_color_tables,
+        );
+        app.palette_product_overrides = overrides;
+        palette_misses.extend(product_misses);
+        if !palette_misses.is_empty() {
+            app.color_table_status = palette_misses.join("\n");
+        }
         app.start_site_catalog_load(&cc.egui_ctx);
         app.load_volume(&cc.egui_ctx);
         app.load_live_hazards(&cc.egui_ctx);
@@ -3169,6 +3253,21 @@ impl ViewerApp {
     ) -> bool {
         if batch.frames.is_empty() {
             return false;
+        }
+        // Folder/zip deployment loads auto-play: grow the history limit to
+        // fit the whole sequence (the 7-frame default silently dropped
+        // most of a deployment — field report) and roll the loop.
+        let local_autoplay = batch.frames.len() > 1
+            && batch
+                .frames
+                .iter()
+                .all(|frame| frame.status == FrameStatus::Local)
+            && std::mem::take(&mut self.pending_local_autoplay);
+        if local_autoplay {
+            self.history_frame_limit = self
+                .history_frame_limit
+                .max(batch.frames.len())
+                .min(MAX_HISTORY_FRAME_LIMIT);
         }
         let selected_index = batch.selected_index.min(batch.frames.len() - 1);
         let selected_identity = frame_identity_for_volume(&batch.frames[selected_index].volume);
@@ -4316,6 +4415,13 @@ impl ViewerApp {
 
     fn render_color_tables_for_product(&self, product: &DisplayProduct) -> ColorTableSet {
         let mut color_tables = self.color_tables.clone();
+        // Per-product palette override (palette_by_product, resolved at
+        // edit/startup time): swap this product's family slot before the
+        // flip/threshold passes so they compose. The table signature flows
+        // into render keys and the colorbar follows automatically.
+        if let Some(table) = self.palette_product_overrides.get(product.label()) {
+            color_tables.set_family(product.color_family(), table.clone());
+        }
         if self.flip_velocity_color_polarity && product.color_family() == ColorTableFamily::Velocity
         {
             let current = color_tables.for_family(ColorTableFamily::Velocity);
@@ -5552,6 +5658,9 @@ impl ViewerApp {
             .and_then(|name| name.to_str())
             .unwrap_or("local L2")
             .to_owned();
+        // Deployments are opened to be WATCHED: when this load lands as a
+        // multi-frame batch, grow history to fit it and start the loop.
+        self.pending_local_autoplay = true;
         // Opening a file is explicit intent: take the view from an active
         // URL poll (same contract as explicit site loads) — otherwise the
         // next poll tick stomps the opened volume within 15 s.
@@ -6229,6 +6338,7 @@ impl eframe::App for ViewerApp {
         self.maybe_advance_history_loop(&ctx);
         self.sanitize_selection();
         self.poll_rotation_markers(&ctx);
+        self.poll_tor_tracks(&ctx);
         self.poll_storm_tracks(&ctx);
         self.poll_placefiles(&ctx);
         self.poll_archive_listing(&ctx);
@@ -6286,7 +6396,15 @@ impl eframe::App for ViewerApp {
         // pure radar (data panels — cross-section, RHI — stay). Esc or Tab
         // restores; a hover hint near the top edge keeps it discoverable
         // without ever appearing in a pointer-away screenshot.
-        if !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
+        // Tab is consumed UNCONDITIONALLY: egui hands click-focus to any
+        // widget, wants_keyboard_input is true whenever anything is
+        // focused, and an unconsumed Tab drives focus navigation — so any
+        // typing-style guard re-creates the "spam Tab to restore" failure
+        // the moment the user clicks something (two field reports). Every
+        // text field in the app is single-line, and single-line TextEdits
+        // never accept Tab as input, so claiming the key globally costs
+        // nothing.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
             self.chrome_hidden = !self.chrome_hidden;
         }
         if self.chrome_hidden && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -6296,6 +6414,14 @@ impl eframe::App for ViewerApp {
             egui::Panel::top("top_bar")
                 .exact_size(42.0)
                 .show_inside(ui, |ui| self.top_bar(ui));
+
+            // Annotate's compact tool row (fronts/lines/boxes/icons) lives
+            // in its own strip under the top bar while draw mode is active.
+            if self.annotations.active_tool.is_some() {
+                egui::Panel::top("annotate_tool_row")
+                    .exact_size(34.0)
+                    .show_inside(ui, |ui| self.annotate_tool_row_ui(ui));
+            }
 
             egui::Panel::right("product_tilt_panel")
                 .resizable(true)
@@ -6389,7 +6515,10 @@ impl eframe::App for ViewerApp {
                 });
         }
 
-        egui::CentralPanel::default().show_inside(ui, |ui| self.map_canvas(ui));
+        // The workspace tile tree (map pane + docked viewer panes) IS the
+        // central content. In clean-screen mode the chrome panels above are
+        // skipped but the tree stays — docked panes are data, not chrome.
+        egui::CentralPanel::default().show_inside(ui, |ui| self.workspace_ui(ui));
 
         if self.app_settings.perf_hud {
             self.perf_hud_overlay(&ctx);
@@ -6402,21 +6531,15 @@ impl eframe::App for ViewerApp {
         self.farm_window(&ctx);
         guide::guide_window(&ctx, &mut self.show_guide);
 
-        if self.native_skewt_open && self.native_sounding.is_some() {
-            let mut open = self.native_skewt_open;
-            egui::Window::new("Sounding (native)")
-                .open(&mut open)
-                .default_size([1265.0, 950.0])
-                .min_size([480.0, 360.0])
-                .resizable(true)
-                .show(&ctx, |ui| {
-                    if let Some(sounding) = self.native_sounding.clone() {
-                        let size = ui.available_size();
-                        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                        sounding_panels::draw_full(ui, rect, &sounding);
-                    }
-                });
-            self.native_skewt_open = open;
+        self.sounding_window(&ctx);
+
+        // Workspace layout persistence (debounced; on_exit flushes).
+        self.maybe_persist_workspace_layout();
+    }
+
+    fn on_exit(&mut self) {
+        if self.workspace.dirty {
+            self.persist_workspace_layout();
         }
     }
 }
@@ -6440,7 +6563,7 @@ impl ViewerApp {
                 .on_hover_text("GOES satellite: live follow + frame playback (rw-sat)")
                 .clicked()
             {
-                self.show_satellite = !self.show_satellite;
+                self.toggle_viewer(dock::WorkspacePane::Satellite);
             }
             if ui
                 .selectable_label(self.model_dock_open, "Model")
@@ -6449,7 +6572,7 @@ impl ViewerApp {
                 )
                 .clicked()
             {
-                self.model_dock_open = !self.model_dock_open;
+                self.toggle_viewer(dock::WorkspacePane::Model);
                 // Opening the window states intent (ui-refresh proposal
                 // §1.3.7): with the master switch off, poll_model_layer
                 // would tear the dock down next frame and the window
@@ -6465,7 +6588,7 @@ impl ViewerApp {
                 )
                 .clicked()
             {
-                self.wofs.open = !self.wofs.open;
+                self.toggle_viewer(dock::WorkspacePane::Wofs);
             }
             {
                 let live = self.farm.live_sensor().map(|s| (s.id, s.name.clone()));
@@ -6482,7 +6605,7 @@ impl ViewerApp {
                     )
                     .clicked()
                 {
-                    self.farm.open = !self.farm.open;
+                    self.toggle_viewer(dock::WorkspacePane::Farm);
                     if self.farm.open
                         && let Some((id, _)) = live
                     {
@@ -6497,7 +6620,7 @@ impl ViewerApp {
                 )
                 .clicked()
             {
-                self.vol3d.open = !self.vol3d.open;
+                self.toggle_viewer(dock::WorkspacePane::Vol3d);
             }
             if ui
                 .selectable_label(self.show_guide, "Guide")
@@ -6666,6 +6789,70 @@ impl ViewerApp {
             let _ = self.app_settings.save();
             ctx.request_repaint();
         }
+        ui.horizontal(|ui| {
+            ui.label("Workspace");
+            if ui
+                .button("Reset layout")
+                .on_hover_text(
+                    "Undock every viewer pane and return the map to the full \
+                     workspace (docked viewers reopen as floating windows)",
+                )
+                .clicked()
+            {
+                // Docked viewers keep showing, just floating again.
+                let docked: Vec<dock::WorkspacePane> = dock::WorkspacePane::VIEWERS
+                    .into_iter()
+                    .filter(|pane| self.workspace.is_docked(*pane))
+                    .collect();
+                self.workspace.reset();
+                for pane in docked {
+                    self.set_viewer_open(pane, true);
+                }
+                ctx.request_repaint();
+            }
+        });
+        // Data-folder override (field request: limited LOCALAPPDATA
+        // space). Restart-applied so live stores never move mid-session.
+        ui.horizontal(|ui| {
+            ui.label("Data folder").on_hover_text(
+                "Where caches and stores live: Level II cache, model / satellite / \
+                 lightning stores, map tiles. Default is your platform's app-data \
+                 location. Changes apply on restart; existing data is not moved.",
+            );
+            let current = settings::data_dir_override()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "platform default".to_owned());
+            let pending = self.app_settings.data_dir.trim();
+            if !pending.is_empty()
+                && Some(pending)
+                    != settings::data_dir_override()
+                        .map(|p| p.display().to_string())
+                        .as_deref()
+            {
+                ui.weak(format!("{pending} (restart to apply)"));
+            } else {
+                ui.weak(current);
+            }
+            #[cfg(any(windows, target_os = "macos"))]
+            if ui.button("Change…").clicked()
+                && let Some(dir) = rfd::FileDialog::new()
+                    .set_title("Choose the BowEcho data folder")
+                    .pick_folder()
+            {
+                self.app_settings.data_dir = dir.display().to_string();
+                let _ = self.app_settings.save();
+                self.status = "Data folder saved — restart BowEcho to apply".to_owned();
+            }
+            if ui
+                .button("Default")
+                .on_hover_text("Return to the platform app-data location (restart to apply)")
+                .clicked()
+            {
+                self.app_settings.data_dir.clear();
+                let _ = self.app_settings.save();
+                self.status = "Data folder reset — restart BowEcho to apply".to_owned();
+            }
+        });
     }
 
     /// Hotkey reference (Settings ▸ Hotkeys).
@@ -6916,15 +7103,34 @@ impl ViewerApp {
                 .clicked()
                 && self.load_receiver.is_none()
                 && let Some(path) = rfd::FileDialog::new()
+                    // "All files" FIRST: DORADE sweepfiles (swp.*) have no
+                    // extension and were invisible under a typed default
+                    // filter (field report: "I can't see anything").
+                    .add_filter("All radar files (swp.* sweepfiles)", &["*"])
                     .add_filter(
-                        "Radar data",
-                        &["zip", "ar2v", "gz", "bz2", "raw", "msg31", "v06", "v08"],
+                        "Level II / archives",
+                        &[
+                            "zip", "ar2v", "gz", "bz2", "raw", "msg31", "v06", "v08", "h5", "nc",
+                        ],
                     )
-                    .add_filter("All files (swp.* sweepfiles)", &["*"])
                     .set_title("Open radar data")
                     .pick_file()
             {
                 self.start_local_volume_load(path, ui.ctx());
+            }
+            #[cfg(any(windows, target_os = "macos"))]
+            if fixed_action_button(ui, "Open Folder…", 96.0)
+                .on_hover_text(
+                    "Open a whole deployment folder: per-sweep DORADE files \
+                     (one file per tilt) group into volumes automatically; \
+                     Level II files inside load too",
+                )
+                .clicked()
+                && let Some(dir) = rfd::FileDialog::new()
+                    .set_title("Open a radar deployment folder")
+                    .pick_folder()
+            {
+                self.start_local_volume_load(dir, ui.ctx());
             }
         });
         // One-line status — always rendered, hover carries the details.
@@ -7075,7 +7281,7 @@ impl ViewerApp {
                     }
                 }
                 if open_sat_window {
-                    self.show_satellite = true;
+                    self.open_viewer(dock::WorkspacePane::Satellite);
                 }
                 if remove_sat_layer {
                     self.sat_layer = None;
@@ -7157,8 +7363,9 @@ impl ViewerApp {
                         && let Some(glm) = &self.glm
                     {
                         let frame_ms = chrono::Utc::now().timestamp_millis();
-                        let count = glm.frame_flashes(frame_ms).count();
-                        ui.weak(format!("{count} flashes/10m"));
+                        let window_min = self.style_registry.glm().window_minutes;
+                        let count = glm.frame_flashes(frame_ms, window_min).count();
+                        ui.weak(format!("{count} flashes/{window_min}m"));
                     }
                 });
                 ui.horizontal(|ui| {
@@ -7284,7 +7491,7 @@ impl ViewerApp {
                     }
                 }
                 if open_model_window {
-                    self.model_dock_open = true;
+                    self.open_viewer(dock::WorkspacePane::Model);
                 }
                 if !self.model_layers.is_empty() {
                     ui.horizontal(|ui| {
@@ -7551,7 +7758,10 @@ impl ViewerApp {
                         if url.starts_with("http")
                             && !self.placefile_slots.iter().any(|slot| slot.url == url)
                         {
-                            self.placefile_slots.push(PlacefileSlot::new(url, true));
+                            let mut slot = PlacefileSlot::new(url, true);
+                            slot.show_text =
+                                self.style_registry.placefiles().default_show_text;
+                            self.placefile_slots.push(slot);
                             self.placefile_url_input.clear();
                             self.save_placefile_settings();
                             ctx.request_repaint();
@@ -7656,7 +7866,7 @@ impl ViewerApp {
                     {
                         // Same intent rule as the top-bar Model button.
                         self.model_enabled = true;
-                        self.model_dock_open = true;
+                        self.open_viewer(dock::WorkspacePane::Model);
                         // No data yet? Land the user on the Download section.
                         if self
                             .model_dock
@@ -7692,7 +7902,7 @@ impl ViewerApp {
                         .clicked()
                     {
                         self.model_enabled = true;
-                        self.model_dock_open = true;
+                        self.open_viewer(dock::WorkspacePane::Model);
                         self.model_download_open = true;
                         ui.close();
                     }
@@ -7703,7 +7913,7 @@ impl ViewerApp {
                         )
                         .clicked()
                     {
-                        self.show_satellite = true;
+                        self.open_viewer(dock::WorkspacePane::Satellite);
                         ui.close();
                     }
                     if ui
@@ -7948,7 +8158,8 @@ impl ViewerApp {
         }
 
         let editing_family = editing_product.color_family();
-        self.active_product_color_picker(ui, ctx, editing_family);
+        let picker_product = editing_product.clone();
+        self.active_product_color_picker(ui, ctx, &picker_product);
 
         // Display threshold ("hide below"): declutters weak returns at render
         // time; diverging families (VEL, shear) hide |v| < threshold instead.
@@ -8113,6 +8324,7 @@ impl ViewerApp {
             }
             ctx.request_repaint();
         }
+        self.tor_tracks_ui(ui, ctx);
         ui.horizontal(|ui| {
             if ui
                 .checkbox(&mut self.show_storm_tracks, "Storm tracks")
@@ -8314,15 +8526,74 @@ impl ViewerApp {
         }
     }
 
+    /// Apply a table to a family slot AND persist the binding
+    /// (`palette_by_family`) — palette choices survive restarts.
+    fn apply_family_table(
+        &mut self,
+        ctx: &egui::Context,
+        family: ColorTableFamily,
+        table: ColorTable,
+    ) {
+        let table_name = table.name().to_owned();
+        let summary = color_table_summary(&table);
+        self.color_tables.set_family(family, table);
+        self.app_settings
+            .palette_by_family
+            .insert(family.label().to_owned(), table_name.clone());
+        let _ = self.app_settings.save();
+        self.clear_texture();
+        self.color_table_status =
+            format!("Loaded {table_name} into {} ({summary})", family.label());
+        ctx.request_repaint();
+    }
+
+    /// Bind a table to ONE product (beats the family binding for it) and
+    /// persist (`palette_by_product`).
+    fn apply_product_table(&mut self, ctx: &egui::Context, product_label: &str, table: ColorTable) {
+        let table_name = table.name().to_owned();
+        let summary = color_table_summary(&table);
+        self.palette_product_overrides
+            .insert(product_label.to_owned(), table);
+        self.app_settings
+            .palette_by_product
+            .insert(product_label.to_owned(), table_name.clone());
+        let _ = self.app_settings.save();
+        self.clear_texture();
+        self.color_table_status = format!("Bound {table_name} to {product_label} ({summary})");
+        ctx.request_repaint();
+    }
+
+    /// Remove a product's palette override (back to the family binding).
+    fn clear_product_table(&mut self, ctx: &egui::Context, product_label: &str) {
+        self.palette_product_overrides.remove(product_label);
+        self.app_settings.palette_by_product.remove(product_label);
+        let _ = self.app_settings.save();
+        self.clear_texture();
+        self.color_table_status = format!("{product_label} follows its family table again");
+        ctx.request_repaint();
+    }
+
     fn active_product_color_picker(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
-        family: ColorTableFamily,
+        product: &DisplayProduct,
     ) {
-        let current_table = self.color_tables.for_family(family);
-        let current_name = current_table.name().to_owned();
-        let current_summary = color_table_summary(current_table);
+        let family = product.color_family();
+        let product_label = product.label().to_owned();
+        let product_override = self
+            .palette_product_overrides
+            .get(&product_label)
+            .map(|table| table.name().to_owned());
+        // Show the table this product actually renders with.
+        let current_name = product_override
+            .clone()
+            .unwrap_or_else(|| self.color_tables.for_family(family).name().to_owned());
+        let current_summary = self
+            .palette_product_overrides
+            .get(&product_label)
+            .map(color_table_summary)
+            .unwrap_or_else(|| color_table_summary(self.color_tables.for_family(family)));
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label("Color");
@@ -8335,27 +8606,71 @@ impl ViewerApp {
                 self.color_table_target = family;
                 self.open_color_tables_request = true;
             }
+            // Binding scope: family is the default mental model (REF/CREF
+            // share); per-product gives e.g. SRV its own table vs VEL.
+            ui.label("bind:");
+            ui.selectable_value(&mut self.bind_palette_to_product, false, "family")
+                .on_hover_text(format!(
+                    "Apply to every {} product (persists)",
+                    family.label()
+                ));
+            ui.selectable_value(&mut self.bind_palette_to_product, true, "product")
+                .on_hover_text(format!("Apply to {product_label} only (persists)"));
         });
+        let mut chosen: Option<ColorTable> = None;
         egui::ComboBox::from_id_salt("active_product_color_preset")
             .selected_text(&current_name)
             .width(220.0)
             .show_ui(ui, |ui| {
                 for table in builtin_tables_for_family(family) {
-                    let table_name = table.name().to_owned();
                     if ui
-                        .selectable_label(table_name == current_name, &table_name)
+                        .selectable_label(table.name() == current_name, table.name())
                         .clicked()
                     {
-                        let summary = color_table_summary(&table);
-                        self.color_table_target = family;
-                        self.color_tables.set_family(family, table);
-                        self.clear_texture();
-                        self.color_table_status =
-                            format!("Loaded {table_name} into {} ({summary})", family.label());
-                        ctx.request_repaint();
+                        chosen = Some(table);
+                    }
+                }
+                let user_tables: Vec<ColorTable> = self
+                    .user_color_tables
+                    .iter()
+                    .filter(|(table_family, _)| {
+                        *table_family == family || *table_family == ColorTableFamily::Generic
+                    })
+                    .map(|(_, table)| table.clone())
+                    .collect();
+                if !user_tables.is_empty() {
+                    ui.separator();
+                    ui.weak("My tables");
+                    for table in user_tables {
+                        if ui
+                            .selectable_label(table.name() == current_name, table.name())
+                            .clicked()
+                        {
+                            chosen = Some(table);
+                        }
                     }
                 }
             });
+        if let Some(table) = chosen {
+            self.color_table_target = family;
+            if self.bind_palette_to_product {
+                self.apply_product_table(ctx, &product_label, table);
+            } else {
+                self.apply_family_table(ctx, family, table);
+            }
+        }
+        if let Some(override_name) = product_override {
+            ui.horizontal(|ui| {
+                ui.weak(format!("{product_label} ⇒ {override_name}"));
+                if ui
+                    .small_button("✕")
+                    .on_hover_text("Remove this product's table binding (back to the family table)")
+                    .clicked()
+                {
+                    self.clear_product_table(ctx, &product_label);
+                }
+            });
+        }
         ui.label(current_summary);
     }
 
@@ -8385,6 +8700,7 @@ impl ViewerApp {
         let mut center_site = None;
         let mut refresh_index = None;
         let mut promote_site = None;
+        let min_overlay_alpha = self.style_registry.drapes().min_overlay_alpha;
         for (index, layer) in self.radar_layers.iter_mut().enumerate() {
             let state = if layer.volume.is_some() {
                 "live"
@@ -8424,7 +8740,7 @@ impl ViewerApp {
                     state: Some(state),
                     opacity: Some(LayerRowOpacity::U8 {
                         value: &mut layer.opacity,
-                        min: MIN_RADAR_OVERLAY_ALPHA,
+                        min: min_overlay_alpha,
                     }),
                 },
                 |ui| {
@@ -8514,24 +8830,57 @@ impl ViewerApp {
             table.name()
         ));
         ui.label(color_table_summary(table));
+        let mut chosen: Option<ColorTable> = None;
         egui::ComboBox::from_id_salt("color_table_builtin_preset")
             .selected_text("Built-ins")
             .width(220.0)
             .show_ui(ui, |ui| {
                 for table in builtin_tables_for_family(self.color_table_target) {
                     if ui.selectable_label(false, table.name()).clicked() {
-                        let table_name = table.name().to_owned();
-                        let summary = color_table_summary(&table);
-                        self.color_tables.set_family(self.color_table_target, table);
-                        self.clear_texture();
-                        self.color_table_status = format!(
-                            "Loaded {table_name} into {} ({summary})",
-                            self.color_table_target.label()
-                        );
-                        ctx.request_repaint();
+                        chosen = Some(table);
                     }
                 }
             });
+        // My tables: user .pal files living in the config dir (Import…
+        // copies them there). The current family's tables list first;
+        // everything else follows — community files often mislabel
+        // Product:, and a table is loadable into any slot.
+        if !self.user_color_tables.is_empty() {
+            let current_family = self.color_table_target;
+            let mut ordered: Vec<(ColorTableFamily, ColorTable)> = self
+                .user_color_tables
+                .iter()
+                .filter(|(family, _)| *family == current_family)
+                .cloned()
+                .collect();
+            ordered.extend(
+                self.user_color_tables
+                    .iter()
+                    .filter(|(family, _)| *family != current_family)
+                    .cloned(),
+            );
+            egui::ComboBox::from_id_salt("color_table_user_tables")
+                .selected_text(format!("My tables ({})", ordered.len()))
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for (family, table) in ordered {
+                        let tag = if family == current_family {
+                            String::new()
+                        } else {
+                            format!("  [{}]", family.label())
+                        };
+                        if ui
+                            .selectable_label(false, format!("{}{tag}", table.name()))
+                            .clicked()
+                        {
+                            chosen = Some(table);
+                        }
+                    }
+                });
+        }
+        if let Some(table) = chosen {
+            self.apply_family_table(ctx, self.color_table_target, table);
+        }
         ui.add(
             egui::TextEdit::singleline(&mut self.color_table_path_text)
                 .desired_width(220.0)
@@ -8563,6 +8912,10 @@ impl ViewerApp {
         });
     }
 
+    /// Import a .pal: parse, COPY it into `color_tables_dir()` ("My
+    /// tables") so the choice survives the original file moving, apply +
+    /// persist the binding. (The old behavior loaded by path and lost the
+    /// table on restart — the dead-state bug this fixes.)
     fn load_color_table_path(&mut self, ctx: &egui::Context) {
         let path_text = self.color_table_path_text.trim().trim_matches('"');
         if path_text.is_empty() {
@@ -8589,15 +8942,24 @@ impl ViewerApp {
                 return;
             }
         };
-        let table_name = table.name().to_owned();
-        let summary = color_table_summary(&table);
-        self.color_tables.set_family(self.color_table_target, table);
-        self.clear_texture();
-        self.color_table_status = format!(
-            "Loaded {table_name} into {} ({summary})",
-            self.color_table_target.label()
-        );
-        ctx.request_repaint();
+        let mut import_note = String::new();
+        let user_dir = settings::color_tables_dir();
+        let file_name = path
+            .file_name()
+            .map(|f| f.to_os_string())
+            .unwrap_or_else(|| std::ffi::OsString::from(format!("{name}.pal")));
+        let destination = user_dir.join(file_name);
+        if destination != path {
+            match std::fs::copy(&path, &destination) {
+                Ok(_) => {
+                    self.user_color_tables = scan_user_color_tables(&user_dir);
+                    import_note = " — copied to My tables".to_owned();
+                }
+                Err(err) => import_note = format!(" — copy to My tables failed: {err}"),
+            }
+        }
+        self.apply_family_table(ctx, self.color_table_target, table);
+        self.color_table_status.push_str(&import_note);
     }
 
     fn reset_color_table_slot(&mut self, ctx: &egui::Context) {
@@ -8606,12 +8968,36 @@ impl ViewerApp {
         let table_name = table.name().to_owned();
         let summary = color_table_summary(&table);
         self.color_tables.set_family(self.color_table_target, table);
+        // Reset = delete the persisted binding (sparse-override semantics:
+        // future default improvements flow to this slot again).
+        self.app_settings
+            .palette_by_family
+            .remove(self.color_table_target.label());
+        let _ = self.app_settings.save();
         self.clear_texture();
         self.color_table_status = format!(
             "Reset {} to {table_name} ({summary})",
             self.color_table_target.label()
         );
         ctx.request_repaint();
+    }
+
+    /// Re-resolve the style registry after editing the override document.
+    /// Cheap (flat struct rebuild); shape caches keyed on the registry
+    /// signature repaint on the next frame.
+    fn rebuild_style_registry(&mut self) {
+        self.style_registry = styles::StyleRegistry::from_settings(&self.style_settings);
+    }
+
+    /// Persist styles.json (best-effort; disabled when the file came from
+    /// a newer BowEcho so we never clobber a schema we don't understand).
+    fn save_styles(&mut self) {
+        if self.styles_newer_schema {
+            return;
+        }
+        if let Err(error) = styles::save(&self.style_settings) {
+            self.status = format!("Style save failed: {error}");
+        }
     }
 
     fn hazard_panel(&mut self, ui: &mut egui::Ui) {
@@ -8639,13 +9025,17 @@ impl ViewerApp {
                 }
             }
         });
-        let mut fill_alpha = self.hazard_fill_alpha as f32;
-        if ui
-            .add(egui::Slider::new(&mut fill_alpha, 0.0..=80.0).text("Fill"))
-            .changed()
-        {
-            self.hazard_fill_alpha = fill_alpha.round() as u8;
+        // The fill slider reads/writes the style registry (override on the
+        // styles.json document) so it persists across launches.
+        let mut fill_alpha = self.style_registry.hazard_global().fill_alpha as f32;
+        let fill_response = ui.add(egui::Slider::new(&mut fill_alpha, 0.0..=80.0).text("Fill"));
+        if fill_response.changed() {
+            self.style_settings.hazard_global.fill_alpha = Some(fill_alpha.round() as u8);
+            self.rebuild_style_registry();
             ui.ctx().request_repaint();
+        }
+        if fill_response.drag_stopped() || (fill_response.changed() && !fill_response.dragged()) {
+            self.save_styles();
         }
         ui.horizontal(|ui| {
             let loading = self.hazard_receiver.is_some();
@@ -9191,6 +9581,223 @@ impl ViewerApp {
         });
     }
 
+    /// Render the workspace tile tree (map pane + docked viewer panes).
+    /// Borrow split (docs/docking-spike.md §3.2, the Rerun pattern): the
+    /// tree is mem::replaced off `self` for the pass so the behavior can
+    /// borrow `&mut ViewerApp`; in-pass mutations arrive as DockRequests.
+    fn workspace_ui(&mut self, ui: &mut egui::Ui) {
+        self.workspace.ensure_map_pane();
+        let mut tree = std::mem::replace(&mut self.workspace.tree, dock::placeholder_tree());
+        tree.ui(&mut dock::WorkspaceBehavior { app: self }, ui);
+        self.workspace.tree = tree;
+        self.apply_dock_requests();
+    }
+
+    /// Apply dock mutations requested during the tree pass (tab close
+    /// button, tab context menu) now that the live tree is back on `self`.
+    fn apply_dock_requests(&mut self) {
+        for request in std::mem::take(&mut self.workspace.requests) {
+            match request {
+                dock::DockRequest::Float(pane) => {
+                    // Tab-close already removed the tile; undock is then a
+                    // no-op. The viewer reopens as a floating window.
+                    self.workspace.undock(pane);
+                    self.workspace.prefer_docked.remove(&pane);
+                    self.set_viewer_open(pane, true);
+                    self.workspace.mark_dirty();
+                }
+                dock::DockRequest::Hide(pane) => {
+                    self.workspace.undock(pane);
+                    self.set_viewer_open(pane, false);
+                    self.workspace.mark_dirty();
+                }
+            }
+        }
+    }
+
+    /// Open/close flag for a dockable viewer (the pre-docking booleans —
+    /// they stay the single source of truth for Hidden vs not).
+    fn set_viewer_open(&mut self, pane: dock::WorkspacePane, open: bool) {
+        if pane != dock::WorkspacePane::Map && self.viewer_open(pane) != open {
+            // Tri-states persist with the layout (debounced).
+            self.workspace.mark_dirty();
+        }
+        match pane {
+            dock::WorkspacePane::Map => {}
+            dock::WorkspacePane::Sounding => self.native_skewt_open = open,
+            dock::WorkspacePane::Wofs => self.wofs.open = open,
+            dock::WorkspacePane::Farm => self.farm.open = open,
+            dock::WorkspacePane::Satellite => self.show_satellite = open,
+            dock::WorkspacePane::Model => self.model_dock_open = open,
+            dock::WorkspacePane::Vol3d => self.vol3d.open = open,
+        }
+    }
+
+    /// True when the viewer is open at all (floating OR docked).
+    fn viewer_open(&self, pane: dock::WorkspacePane) -> bool {
+        match pane {
+            dock::WorkspacePane::Map => true,
+            dock::WorkspacePane::Sounding => self.native_skewt_open,
+            dock::WorkspacePane::Wofs => self.wofs.open,
+            dock::WorkspacePane::Farm => self.farm.open,
+            dock::WorkspacePane::Satellite => self.show_satellite,
+            dock::WorkspacePane::Model => self.model_dock_open,
+            dock::WorkspacePane::Vol3d => self.vol3d.open,
+        }
+    }
+
+    /// Top-bar toggle semantics across the tri-state: open→hidden also
+    /// undocks (keeping `prefer_docked`, so reopening returns it to the
+    /// dock); hidden→open restores docked or floating per that memory.
+    fn toggle_viewer(&mut self, pane: dock::WorkspacePane) {
+        if self.viewer_open(pane) {
+            if self.workspace.is_docked(pane) {
+                self.workspace.undock(pane);
+            }
+            self.set_viewer_open(pane, false);
+        } else {
+            self.open_viewer(pane);
+        }
+    }
+
+    /// Open a viewer, honoring its docked-vs-floating preference.
+    fn open_viewer(&mut self, pane: dock::WorkspacePane) {
+        self.set_viewer_open(pane, true);
+        if self.workspace.prefer_docked.contains(&pane) {
+            self.workspace.dock(pane);
+        }
+    }
+
+    /// Current tri-state of a dockable viewer (tile presence wins).
+    fn viewer_mode(&self, pane: dock::WorkspacePane) -> dock::ViewerMode {
+        if self.workspace.is_docked(pane) {
+            dock::ViewerMode::Docked
+        } else if self.viewer_open(pane) {
+            dock::ViewerMode::Floating
+        } else {
+            dock::ViewerMode::Hidden
+        }
+    }
+
+    /// Write the workspace layout (tree + tri-states + preferences) into
+    /// config.json — only when the snapshot actually changed.
+    fn persist_workspace_layout(&mut self) {
+        self.workspace.dirty = false;
+        let viewers: BTreeMap<dock::WorkspacePane, dock::ViewerMode> = dock::WorkspacePane::VIEWERS
+            .into_iter()
+            .map(|pane| (pane, self.viewer_mode(pane)))
+            .collect();
+        let value = self.workspace.to_persisted(viewers);
+        if self.app_settings.workspace_layout.as_ref() != Some(&value) {
+            self.app_settings.workspace_layout = Some(value);
+            let _ = self.app_settings.save();
+        }
+    }
+
+    /// Debounced layout persist: a split-drag marks dirty every frame, so
+    /// write only once the edits go quiet (on_exit flushes the rest).
+    fn maybe_persist_workspace_layout(&mut self) {
+        const QUIET: Duration = Duration::from_millis(750);
+        if self.workspace.dirty
+            && self
+                .workspace
+                .last_edit
+                .is_none_or(|at| at.elapsed() >= QUIET)
+        {
+            self.persist_workspace_layout();
+        }
+    }
+
+    /// Restore the persisted workspace layout at startup. Best-effort:
+    /// parse failures and future versions leave the default map-only
+    /// layout.
+    fn restore_workspace_layout(&mut self) {
+        let Some(value) = self.app_settings.workspace_layout.clone() else {
+            return;
+        };
+        let Some(viewers) = self.workspace.restore_persisted(&value) else {
+            return;
+        };
+        for pane in dock::WorkspacePane::VIEWERS {
+            let mode = viewers.get(&pane).copied().unwrap_or_default();
+            match mode {
+                dock::ViewerMode::Hidden => {
+                    self.set_viewer_open(pane, false);
+                    // A hidden viewer owns no tile (defensive vs hand edits).
+                    self.workspace.undock(pane);
+                }
+                dock::ViewerMode::Floating => {
+                    self.set_viewer_open(pane, true);
+                    self.workspace.undock(pane);
+                }
+                dock::ViewerMode::Docked => {
+                    self.set_viewer_open(pane, true);
+                    if !self.workspace.is_docked(pane) {
+                        self.workspace.dock(pane);
+                    }
+                }
+            }
+        }
+        // A restored Model viewer implies the master switch (the top-bar
+        // intent rule) — otherwise poll_model_layer tears it down at the
+        // first frame.
+        if self.model_dock_open && !self.model_enabled {
+            self.model_enabled = true;
+        }
+        // Restoring is not an edit; nothing to write back.
+        self.workspace.dirty = false;
+        self.workspace.last_edit = None;
+    }
+
+    /// The window-side dock toggle (docking-spike memo: "snap to its own
+    /// thing" is a Float/Dock toggle, not a drag gesture). First row of
+    /// every dockable window body; the docked pane's way back is its tab
+    /// (✕ floats it, right-click for float/hide).
+    fn dock_toggle_row(&mut self, ui: &mut egui::Ui, pane: dock::WorkspacePane) {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("Dock ⊞")
+                .on_hover_text(
+                    "Snap this viewer into the workspace as a tile next to the map. \
+                     Drag its tab to rearrange or split; the tab's ✕ floats it back out.",
+                )
+                .clicked()
+            {
+                // Safe direct mutation: windows render OUTSIDE the tree
+                // pass, so the live tree is on `self` here.
+                self.workspace.dock(pane);
+            }
+        });
+    }
+
+    /// Body of a docked viewer pane: the SAME draw fns the floating
+    /// windows call, rendered into a tile pane `Ui`. Runs inside the tree
+    /// pass — bodies must not touch `workspace.tree` (they don't; dock
+    /// state changes from in-tree UI travel as DockRequests).
+    fn docked_viewer_body(&mut self, ui: &mut egui::Ui, pane: dock::WorkspacePane) {
+        if !self.viewer_open(pane) {
+            // Unreachable through the UI (hide undocks), but a hand-edited
+            // layout in config.json could get here — never draw stale state.
+            ui.weak(format!("{} is hidden", pane.tab_title()));
+            return;
+        }
+        match pane {
+            dock::WorkspacePane::Map => {}
+            dock::WorkspacePane::Sounding => self.sounding_pane_body(ui),
+            dock::WorkspacePane::Wofs => self.wofs_pane_body(ui),
+            dock::WorkspacePane::Farm => self.farm_pane_body(ui),
+            dock::WorkspacePane::Satellite => {
+                let (panel_events, player_events) = self.satellite_pane_body(ui);
+                self.handle_satellite_events(panel_events, player_events);
+            }
+            dock::WorkspacePane::Model => {
+                let events = self.model_pane_body(ui);
+                self.dispatch_download_events(events);
+            }
+            dock::WorkspacePane::Vol3d => self.vol3d_pane_body(ui),
+        }
+    }
+
     fn map_canvas(&mut self, ui: &mut egui::Ui) {
         let available = ui.available_size();
         // In grid mode the per-cell ui.interact widgets are the ONLY
@@ -9308,6 +9915,7 @@ impl ViewerApp {
         self.draw_radar_layer(ui.ctx(), painter, rect);
         let overlay_start = Instant::now();
         self.draw_basemap_overlay(painter, rect);
+        self.draw_tor_tracks(painter, rect);
         self.draw_hazard_overlays(painter, rect, &self.selected_product.clone());
         self.draw_rotation_markers(painter, rect);
         self.draw_storm_tracks(painter, rect);
@@ -9702,6 +10310,7 @@ impl ViewerApp {
             } else {
                 self.extra_panes[cell_index - 1].product.clone()
             };
+            self.draw_tor_tracks(&cell_painter, cell);
             self.draw_hazard_overlays(&cell_painter, cell, &fill_product);
             self.draw_rotation_markers(&cell_painter, cell);
             self.draw_storm_tracks(&cell_painter, cell);
@@ -9997,6 +10606,8 @@ impl ViewerApp {
             index.hash(&mut hasher);
             slot.generation.hash(&mut hasher);
             slot.show_text.hash(&mut hasher);
+            // Style multipliers bake into the shapes — edits must rebuild.
+            self.style_registry.signature().hash(&mut hasher);
             let key = hasher.finish();
             let mut cache = self.placefile_shape_cache.borrow_mut();
             let built = cache.get_or_insert_with(key, || {
@@ -10069,6 +10680,9 @@ impl ViewerApp {
             labels: Vec::new(),
             hovers: Vec::new(),
         };
+        // Multipliers, not absolute overrides: placefiles carry their own
+        // colors/sizes and overriding them outright breaks the format.
+        let pf_style = self.style_registry.placefiles();
         let visible = rect.expand(24.0);
         // Resolve a (lat, lon) or — inside an Object block — a pixel offset
         // from the anchor (+x east, +y north per the GR convention).
@@ -10103,24 +10717,33 @@ impl ViewerApp {
                     }
                     let sheet = sheets.iter().find(|s| s.spec.index == *file_index);
                     if let Some(sheet) = sheet
-                        && let Some(shape) =
-                            icon_sprite_shape(sheet, *icon_index, position, *heading_deg)
+                        && let Some(shape) = icon_sprite_shape(
+                            sheet,
+                            *icon_index,
+                            position,
+                            *heading_deg,
+                            pf_style.icon_scale,
+                        )
                     {
                         out.shapes.push(shape);
                     } else {
                         // Fallback: colored dot + heading tick.
+                        let scale = pf_style.icon_scale;
                         let fill = egui::Color32::from_rgb(color[0], color[1], color[2]);
                         out.shapes
-                            .push(egui::Shape::circle_filled(position, 4.5, fill));
+                            .push(egui::Shape::circle_filled(position, 4.5 * scale, fill));
                         out.shapes.push(egui::Shape::circle_stroke(
                             position,
-                            4.5,
+                            4.5 * scale,
                             egui::Stroke::new(1.0, egui::Color32::BLACK),
                         ));
                         let angle = heading_deg.to_radians();
                         let direction = egui::vec2(angle.sin(), -angle.cos());
                         out.shapes.push(egui::Shape::line_segment(
-                            [position + direction * 5.0, position + direction * 11.0],
+                            [
+                                position + direction * 5.0 * scale,
+                                position + direction * 11.0 * scale,
+                            ],
                             egui::Stroke::new(2.0, fill),
                         ));
                     }
@@ -10147,7 +10770,7 @@ impl ViewerApp {
                     out.labels.push((
                         position,
                         text.clone(),
-                        *size_px,
+                        *size_px * pf_style.text_size_scale,
                         egui::Color32::from_rgb(color[0], color[1], color[2]),
                     ));
                 }
@@ -10166,7 +10789,7 @@ impl ViewerApp {
                         out.shapes.push(egui::Shape::line(
                             screen,
                             egui::Stroke::new(
-                                *width,
+                                *width * pf_style.line_width_scale,
                                 egui::Color32::from_rgb(color[0], color[1], color[2]),
                             ),
                         ));
@@ -10188,7 +10811,7 @@ impl ViewerApp {
                     let fill =
                         egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], 60);
                     let stroke = egui::Stroke::new(
-                        1.5,
+                        1.5 * pf_style.line_width_scale,
                         egui::Color32::from_rgb(color[0], color[1], color[2]),
                     );
                     if is_convex_screen_polygon(&screen) {
@@ -10567,7 +11190,7 @@ impl ViewerApp {
                         return;
                     }
                     self.native_sounding = Some(Arc::new(native));
-                    self.native_skewt_open = true;
+                    self.open_viewer(dock::WorkspacePane::Sounding);
                     ctx.request_repaint();
                 }
                 Ok(Err(err)) => {
@@ -10590,6 +11213,41 @@ impl ViewerApp {
     /// the separate "Model download" window class is gone; acquisition
     /// lives WITH browsing). `model_download_open` is now a one-shot
     /// "expand the Download section" request.
+    /// Native skew-T window (floating). The body is `sounding_pane_body`,
+    /// shared with the docked Sounding pane — the overhaul's headline ask
+    /// ("size soundings how I want and snap to its own thing").
+    fn sounding_window(&mut self, ctx: &egui::Context) {
+        if !self.native_skewt_open
+            || self.native_sounding.is_none()
+            || self.workspace.is_docked(dock::WorkspacePane::Sounding)
+        {
+            return;
+        }
+        let mut open = self.native_skewt_open;
+        egui::Window::new("Sounding (native)")
+            .open(&mut open)
+            .default_size([1265.0, 950.0])
+            .min_size([480.0, 360.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                self.dock_toggle_row(ui, dock::WorkspacePane::Sounding);
+                self.sounding_pane_body(ui);
+            });
+        self.set_viewer_open(dock::WorkspacePane::Sounding, open);
+    }
+
+    /// Sounding body, window and pane alike. The docked pane outlives any
+    /// single sounding, so it placeholder-prompts until one arrives.
+    fn sounding_pane_body(&mut self, ui: &mut egui::Ui) {
+        if let Some(sounding) = self.native_sounding.clone() {
+            let size = ui.available_size();
+            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+            sounding_panels::draw_full(ui, rect, &sounding);
+        } else {
+            ui.weak("No sounding yet — Alt-click the map (with model data) to launch one.");
+        }
+    }
+
     fn model_data_window(&mut self, ctx: &egui::Context) {
         if !self.model_dock_open {
             return;
@@ -10597,6 +11255,9 @@ impl ViewerApp {
         if self.model_dock.is_none() {
             let store_root = settings::model_store_dir();
             self.model_dock = Some(model_data::ModelDataDock::new(ctx, store_root));
+        }
+        if self.workspace.is_docked(dock::WorkspacePane::Model) {
+            return; // body renders as a workspace pane
         }
         let mut open = self.model_dock_open;
         let mut events = Vec::new();
@@ -10606,27 +11267,39 @@ impl ViewerApp {
             .min_size([720.0, 420.0])
             .resizable(true)
             .show(ctx, |ui| {
-                let download_id = ui.make_persistent_id("model_window_download_fold");
-                if self.model_download_open {
-                    // One-shot expand request (the sidebar's Download… path).
-                    self.model_download_open = false;
-                    let mut state =
-                        egui::collapsing_header::CollapsingState::load_with_default_open(
-                            ctx,
-                            download_id,
-                            false,
-                        );
-                    state.set_open(true);
-                    state.store(ctx);
-                }
-                // First-run nudge: with an empty store the Download section
-                // starts open — acquisition IS the next step.
-                let store_empty = self
-                    .model_dock
-                    .as_ref()
-                    .is_none_or(|dock| dock.newest_run().is_none());
-                egui::collapsing_header::CollapsingState::load_with_default_open(
-                    ctx,
+                self.dock_toggle_row(ui, dock::WorkspacePane::Model);
+                events = self.model_pane_body(ui);
+            });
+        self.set_viewer_open(dock::WorkspacePane::Model, open);
+        self.dispatch_download_events(events);
+    }
+
+    /// Model data body (Download fold + store dock), window and pane
+    /// alike. Returns download-panel events for `dispatch_download_events`.
+    fn model_pane_body(&mut self, ui: &mut egui::Ui) -> Vec<rw_ui::DownloadEvent> {
+        let ctx = ui.ctx().clone();
+        let mut events = Vec::new();
+        {
+            let download_id = ui.make_persistent_id("model_window_download_fold");
+            if self.model_download_open {
+                // One-shot expand request (the sidebar's Download… path).
+                self.model_download_open = false;
+                let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                    &ctx,
+                    download_id,
+                    false,
+                );
+                state.set_open(true);
+                state.store(&ctx);
+            }
+            // First-run nudge: with an empty store the Download section
+            // starts open — acquisition IS the next step.
+            let store_empty = self
+                .model_dock
+                .as_ref()
+                .is_none_or(|dock| dock.newest_run().is_none());
+            egui::collapsing_header::CollapsingState::load_with_default_open(
+                    &ctx,
                     download_id,
                     store_empty,
                 )
@@ -10635,7 +11308,7 @@ impl ViewerApp {
                     ui.weak("any init · specific hours · any profile — with size estimate");
                 })
                 .body(|ui| {
-                    self.ensure_ingest_worker(ctx);
+                    self.ensure_ingest_worker(&ctx);
                     // Store freshness + the one-click ingest that used to
                     // live in the sidebar's Layers fold (proposal step 4).
                     ui.horizontal(|ui| {
@@ -10659,7 +11332,7 @@ impl ViewerApp {
                             )
                             .clicked()
                         {
-                            self.start_model_ingest(ctx);
+                            self.start_model_ingest(&ctx);
                         }
                         if fetching {
                             ui.spinner();
@@ -10678,13 +11351,12 @@ impl ViewerApp {
                             events = self.download_panel.ui(ui);
                         });
                 });
-                ui.separator();
-                if let Some(dock) = &mut self.model_dock {
-                    dock.ui(ui);
-                }
-            });
-        self.model_dock_open = open;
-        self.dispatch_download_events(events);
+            ui.separator();
+            if let Some(dock) = &mut self.model_dock {
+                dock.ui(ui);
+            }
+        }
+        events
     }
 
     /// Spawn the flexible-download worker on first use (the Download
@@ -10977,38 +11649,61 @@ impl ViewerApp {
             self.sat = Some(worker);
         }
         self.pump_sat_responses();
+        if self.workspace.is_docked(dock::WorkspacePane::Satellite) {
+            return; // body renders as a workspace pane
+        }
         let mut open = self.show_satellite;
-        let mut panel_events = Vec::new();
-        let mut player_events = Vec::new();
+        let mut events = (Vec::new(), Vec::new());
         egui::Window::new("Satellite (GOES)")
             .open(&mut open)
             .default_size([900.0, 700.0])
             .min_size([520.0, 400.0])
             .resizable(true)
             .show(ctx, |ui| {
-                egui::CollapsingHeader::new("Live follow")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        panel_events = self.sat_panel.ui(ui);
-                    });
-                ui.separator();
-                if self.sat_last_frame.is_some()
-                    && ui
-                        .button("Show on radar map")
-                        .on_hover_text(
-                            "Render the current frame as a layer under the radar (opacity in Layers)",
-                        )
-                        .clicked()
-                    && let (Some(sat), Some((key, hhmm))) = (&self.sat, &self.sat_last_frame)
-                {
-                    sat.send(sat_worker::SatRequest::LoadFrameForMap {
-                        key: key.clone(),
-                        hhmm: *hhmm,
-                    });
-                }
-                player_events = self.sat_player.ui(ui);
+                self.dock_toggle_row(ui, dock::WorkspacePane::Satellite);
+                events = self.satellite_pane_body(ui);
             });
-        self.show_satellite = open;
+        self.set_viewer_open(dock::WorkspacePane::Satellite, open);
+        let (panel_events, player_events) = events;
+        self.handle_satellite_events(panel_events, player_events);
+    }
+
+    /// Satellite body (follow config + frame player), window and pane
+    /// alike. Returned events feed `handle_satellite_events`.
+    fn satellite_pane_body(
+        &mut self,
+        ui: &mut egui::Ui,
+    ) -> (Vec<rw_ui::SatelliteEvent>, Vec<rw_ui::SatPlayerEvent>) {
+        let mut panel_events = Vec::new();
+        egui::CollapsingHeader::new("Live follow")
+            .default_open(true)
+            .show(ui, |ui| {
+                panel_events = self.sat_panel.ui(ui);
+            });
+        ui.separator();
+        if self.sat_last_frame.is_some()
+            && ui
+                .button("Show on radar map")
+                .on_hover_text(
+                    "Render the current frame as a layer under the radar (opacity in Layers)",
+                )
+                .clicked()
+            && let (Some(sat), Some((key, hhmm))) = (&self.sat, &self.sat_last_frame)
+        {
+            sat.send(sat_worker::SatRequest::LoadFrameForMap {
+                key: key.clone(),
+                hhmm: *hhmm,
+            });
+        }
+        let player_events = self.sat_player.ui(ui);
+        (panel_events, player_events)
+    }
+
+    fn handle_satellite_events(
+        &mut self,
+        panel_events: Vec<rw_ui::SatelliteEvent>,
+        player_events: Vec<rw_ui::SatPlayerEvent>,
+    ) {
         let Some(sat) = &self.sat else {
             return;
         };
@@ -11721,7 +12416,7 @@ impl ViewerApp {
         let sites_cache = self.raob_sites.take();
         let (sender, receiver) = mpsc::channel();
         self.native_sounding_rx = Some(receiver);
-        self.native_skewt_open = true;
+        self.open_viewer(dock::WorkspacePane::Sounding);
         self.status = "Fetching RAOB…".to_owned();
         let ctx_clone = ctx.clone();
         let (site_tx, site_rx) = mpsc::channel();
@@ -11970,11 +12665,13 @@ impl ViewerApp {
         if !self.model_enabled {
             if self.model_dock.is_some() {
                 // Tear down: drop the dock/layer/LUT so nothing model-side
-                // runs until re-enabled.
+                // runs until re-enabled. A docked Model pane leaves the
+                // workspace too (prefer_docked keeps the comeback).
                 self.model_dock = None;
                 self.model_layers.clear();
                 self.model_lut = None;
                 self.model_dock_open = false;
+                self.workspace.undock(dock::WorkspacePane::Model);
             }
             return;
         }
@@ -12148,6 +12845,7 @@ impl ViewerApp {
         let generation = self.sat_layer_generation + 1;
         let nx = frame.grid.nx;
         let ny = frame.grid.ny;
+        let initial_opacity = self.style_registry.drapes().goes_opacity;
         thread::spawn(move || {
             let layer =
                 model_layer::InverseLut::build(&frame.grid.lat, &frame.grid.lon).map(|lut| {
@@ -12157,7 +12855,7 @@ impl ViewerApp {
                         nx,
                         ny,
                         flip_rows: frame.flip_rows,
-                        opacity: 0.85,
+                        opacity: initial_opacity,
                         visible: true,
                         generation,
                     }
@@ -12306,6 +13004,7 @@ impl ViewerApp {
         let (sender, receiver) = mpsc::channel();
         self.model_layer_build_rx = Some(receiver);
         let generation = self.model_layer_generation + 1;
+        let initial_opacity = self.style_registry.drapes().model_opacity;
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
             let layer = field.grid.as_ref().and_then(|grid| {
@@ -12323,7 +13022,7 @@ impl ViewerApp {
                         lut: Arc::new(lut),
                         production,
                         colormap: rw_ui::colormap::VIRIDIS,
-                        opacity: 0.65,
+                        opacity: initial_opacity,
                         visible: true,
                         generation,
                     }
@@ -12493,6 +13192,12 @@ impl ViewerApp {
             }
         }
         self.wofs.pump(ctx);
+        if self.workspace.is_docked(dock::WorkspacePane::Wofs) {
+            // Body renders as a workspace pane; the WoFS sounding picker
+            // stays its own floating sub-window either way.
+            self.wofs.sounding_window(ctx);
+            return;
+        }
         let mut open = self.wofs.open;
         egui::Window::new("WoFS (Warn-on-Forecast)")
             .open(&mut open)
@@ -12500,13 +13205,24 @@ impl ViewerApp {
             .min_size([460.0, 420.0])
             .resizable(true)
             .show(ctx, |ui| {
-                let Some(catalog) = self.wofs.catalog.clone() else {
-                    ui.spinner();
-                    ui.label(&self.wofs.status);
-                    ui.weak(wofs::CREDIT);
-                    return;
-                };
-                ui.horizontal_wrapped(|ui| {
+                self.dock_toggle_row(ui, dock::WorkspacePane::Wofs);
+                self.wofs_pane_body(ui);
+            });
+        self.wofs.sounding_window(ctx);
+        self.set_viewer_open(dock::WorkspacePane::Wofs, open);
+    }
+
+    /// WoFS body (run/init/overlay/product pickers, minute slider, image
+    /// stack, station overlay), window and pane alike.
+    fn wofs_pane_body(&mut self, ui: &mut egui::Ui) {
+        {
+            let Some(catalog) = self.wofs.catalog.clone() else {
+                ui.spinner();
+                ui.label(&self.wofs.status);
+                ui.weak(wofs::CREDIT);
+                return;
+            };
+            ui.horizontal_wrapped(|ui| {
                     let run_label = catalog
                         .runs
                         .get(self.wofs.run_index)
@@ -12588,7 +13304,7 @@ impl ViewerApp {
                             }
                         });
                 });
-                ui.horizontal(|ui| {
+            ui.horizontal(|ui| {
                     ui.label("f+min");
                     let mut minute = self.wofs.minute as i32;
                     if ui
@@ -12617,58 +13333,45 @@ impl ViewerApp {
                             .truncate(),
                     );
                 });
-                self.wofs.drape_controls_ui(ui);
-                if let Some(run) = catalog.runs.get(self.wofs.run_index) {
-                    let base_url =
-                        wofs::image_url(run, &self.wofs.init, &self.wofs.product, self.wofs.minute);
-                    let size = ui.available_size();
-                    let side = (size.x.min(size.y * 900.0 / 800.0)).max(200.0);
-                    let rect_size = egui::vec2(side, side * 800.0 / 900.0);
-                    let (rect, _) =
-                        ui.allocate_exact_size(rect_size, egui::Sense::hover());
-                    if let Some(texture) = self.wofs.textures.get(&base_url) {
-                        // WoFS PNGs assume a white page: transparent
-                        // overlay-style products have BLACK legend text,
-                        // invisible over the dark UI without a backing.
-                        ui.painter().rect_filled(
-                            rect,
-                            4.0,
-                            egui::Color32::from_rgb(247, 247, 247),
-                        );
+            self.wofs.drape_controls_ui(ui);
+            if let Some(run) = catalog.runs.get(self.wofs.run_index) {
+                let base_url =
+                    wofs::image_url(run, &self.wofs.init, &self.wofs.product, self.wofs.minute);
+                let size = ui.available_size();
+                let side = (size.x.min(size.y * 900.0 / 800.0)).max(200.0);
+                let rect_size = egui::vec2(side, side * 800.0 / 900.0);
+                let (rect, _) = ui.allocate_exact_size(rect_size, egui::Sense::hover());
+                if let Some(texture) = self.wofs.textures.get(&base_url) {
+                    // WoFS PNGs assume a white page: transparent
+                    // overlay-style products have BLACK legend text,
+                    // invisible over the dark UI without a backing.
+                    ui.painter()
+                        .rect_filled(rect, 4.0, egui::Color32::from_rgb(247, 247, 247));
+                    ui.painter().image(
+                        texture.id(),
+                        rect,
+                        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                } else {
+                    ui.painter()
+                        .rect_filled(rect, 4.0, egui::Color32::from_rgb(14, 16, 20));
+                }
+                for overlay in self.wofs.overlays.clone() {
+                    let url = wofs::image_url(run, &self.wofs.init, &overlay, self.wofs.minute);
+                    if let Some(texture) = self.wofs.textures.get(&url) {
                         ui.painter().image(
                             texture.id(),
                             rect,
                             egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                             egui::Color32::WHITE,
                         );
-                    } else {
-                        ui.painter().rect_filled(
-                            rect,
-                            4.0,
-                            egui::Color32::from_rgb(14, 16, 20),
-                        );
                     }
-                    for overlay in self.wofs.overlays.clone() {
-                        let url =
-                            wofs::image_url(run, &self.wofs.init, &overlay, self.wofs.minute);
-                        if let Some(texture) = self.wofs.textures.get(&url) {
-                            ui.painter().image(
-                                texture.id(),
-                                rect,
-                                egui::Rect::from_min_max(
-                                    egui::Pos2::ZERO,
-                                    egui::pos2(1.0, 1.0),
-                                ),
-                                egui::Color32::WHITE,
-                            );
-                        }
-                    }
-                    self.wofs.stations_overlay_ui(ui, rect);
                 }
-                ui.weak(wofs::CREDIT);
-            });
-        self.wofs.sounding_window(ctx);
-        self.wofs.open = open;
+                self.wofs.stations_overlay_ui(ui, rect);
+            }
+            ui.weak(wofs::CREDIT);
+        }
     }
 
     /// FARM mobile-radar live quicklooks: sensor chips (live = green),
@@ -12688,6 +13391,9 @@ impl ViewerApp {
         if !self.farm.open {
             return;
         }
+        if self.workspace.is_docked(dock::WorkspacePane::Farm) {
+            return; // body renders as a workspace pane
+        }
         let mut open = self.farm.open;
         egui::Window::new("Mobile Radar — FARM live")
             .open(&mut open)
@@ -12695,181 +13401,187 @@ impl ViewerApp {
             .min_size([420.0, 380.0])
             .resizable(true)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let sensors = self.farm.sensors.clone();
-                    for sensor in &sensors {
-                        let live = sensor.is_live();
-                        let mut text = egui::RichText::new(&sensor.name);
-                        if live {
-                            text = text.color(egui::Color32::from_rgb(110, 245, 130)).strong();
-                        }
-                        let selected = self.farm.sensor_id == Some(sensor.id);
-                        let mut response = ui.selectable_label(selected, text);
-                        if let Some(at) = sensor.last_plot {
-                            response = response.on_hover_text(format!(
-                                "last plot {} UTC{}",
-                                at.format("%Y-%m-%d %H:%M:%S"),
-                                if live { " — LIVE" } else { "" }
-                            ));
-                        }
-                        if response.clicked() {
-                            self.farm.select_sensor(sensor.id);
-                        }
+                self.dock_toggle_row(ui, dock::WorkspacePane::Farm);
+                self.farm_pane_body(ui);
+            });
+        self.set_viewer_open(dock::WorkspacePane::Farm, open);
+    }
+
+    /// FARM body (sensor chips, product picker, frame loop, drape
+    /// controls), window and pane alike.
+    fn farm_pane_body(&mut self, ui: &mut egui::Ui) {
+        {
+            ui.horizontal(|ui| {
+                let sensors = self.farm.sensors.clone();
+                for sensor in &sensors {
+                    let live = sensor.is_live();
+                    let mut text = egui::RichText::new(&sensor.name);
+                    if live {
+                        text = text.color(egui::Color32::from_rgb(110, 245, 130)).strong();
                     }
-                    if self.farm.sensors.is_empty() {
-                        ui.spinner();
-                        ui.weak("probing svr.guru…");
-                    }
-                });
-                if !self.farm.products.is_empty() {
-                    ui.horizontal_wrapped(|ui| {
-                        let products = self.farm.products.clone();
-                        for product in &products {
-                            let selected = self.farm.product == *product;
-                            if ui
-                                .selectable_label(selected, farm_live::product_label(product))
-                                .clicked()
-                            {
-                                self.farm.select_product(product);
-                            }
-                        }
-                    });
-                }
-                ui.horizontal(|ui| {
-                    let frame_count = self.farm.frames.len();
-                    if ui
-                        .button(if self.farm.playing { "⏸" } else { "▶" })
-                        .clicked()
-                    {
-                        self.farm.playing = !self.farm.playing;
-                    }
-                    if frame_count > 0 {
-                        let mut index = self.farm.frame_index;
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut index, 0..=frame_count - 1)
-                                    .show_value(false),
-                            )
-                            .changed()
-                        {
-                            self.farm.playing = false;
-                            self.farm.follow_live = false;
-                            self.farm.frame_index = index;
-                        }
-                        ui.monospace(farm_live::frame_label(
-                            &self.farm.frames[self.farm.frame_index],
+                    let selected = self.farm.sensor_id == Some(sensor.id);
+                    let mut response = ui.selectable_label(selected, text);
+                    if let Some(at) = sensor.last_plot {
+                        response = response.on_hover_text(format!(
+                            "last plot {} UTC{}",
+                            at.format("%Y-%m-%d %H:%M:%S"),
+                            if live { " — LIVE" } else { "" }
                         ));
                     }
-                    ui.checkbox(&mut self.farm.follow_live, "Follow live")
-                        .on_hover_text("Jump to the newest plot as it lands (~20 s cadence)");
-                    if !self.farm.status.is_empty() {
-                        ui.weak(&self.farm.status);
+                    if response.clicked() {
+                        self.farm.select_sensor(sensor.id);
                     }
-                });
-                if let Some(url) = self.farm.frames.get(self.farm.frame_index) {
-                    if let Some(texture) = self.farm.textures.get(url) {
-                        let size = texture.size_vec2();
-                        let avail = ui.available_size() - egui::vec2(0.0, 24.0);
-                        let scale = (avail.x / size.x).min(avail.y / size.y).clamp(0.05, 3.0);
-                        ui.add(egui::Image::new((texture.id(), size * scale)));
-                    } else {
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.weak("fetching frame…");
-                        });
-                    }
-                } else {
-                    ui.add_space(12.0);
-                    ui.weak("waiting for frames…");
                 }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    let toggled = ui
-                        .checkbox(&mut self.farm.drape.enabled, "Show on map")
-                        .on_hover_text(
-                            "Drape the quicklook over the radar map. Position + scale are read \
-                             from the plot itself (tick lattice + town markers); right-click \
-                             placement covers deployments the auto-locator can't pin",
-                        )
-                        .changed();
-                    if toggled && self.farm.drape.enabled {
-                        // Stale loops never refetch — push the displayed
-                        // frame's pixels through the drape pipeline now.
-                        self.farm.kickstart_drape();
-                    }
-                    if self.farm.drape.enabled {
-                        ui.add(
-                            egui::Slider::new(&mut self.farm.drape.opacity, 0.15..=1.0)
-                                .show_value(false)
-                                .text("opacity"),
-                        );
-                        ui.checkbox(&mut self.farm.drape.echoes_only, "echoes only")
-                            .on_hover_text(
-                                "Hide the quicklook's own basemap and keep the colored echo \
-                                 pixels (near-zero velocity bins are muted by the same mask)",
-                            );
-                    }
-                });
-                if self.farm.drape.enabled {
-                    ui.horizontal_wrapped(|ui| {
-                        match &self.farm.drape.georef {
-                            Some(_) => {
-                                if ui
-                                    .small_button("Re-locate")
-                                    .on_hover_text(
-                                        "Re-run the auto-locator on the next frame (use after \
-                                         the deployment moves)",
-                                    )
-                                    .clicked()
-                                {
-                                    self.farm.drape.force_relocate();
-                                }
-                            }
-                            None => {
-                                ui.weak("no position fix yet");
-                            }
-                        }
-                        let armed = self.farm.drape.place_armed;
+                if self.farm.sensors.is_empty() {
+                    ui.spinner();
+                    ui.weak("probing svr.guru…");
+                }
+            });
+            if !self.farm.products.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    let products = self.farm.products.clone();
+                    for product in &products {
+                        let selected = self.farm.product == *product;
                         if ui
-                            .selectable_label(armed, "Place radar (right-click map)")
-                            .on_hover_text(
-                                "Arm, then right-click the radar map at the deployment spot; \
-                                 scale comes from the plot's tick lattice",
-                            )
+                            .selectable_label(selected, farm_live::product_label(product))
                             .clicked()
                         {
-                            self.farm.drape.place_armed = !armed;
+                            self.farm.select_product(product);
                         }
-                        if self.farm.drape.place_armed {
-                            let mut tick = self.farm.drape.manual_tick_km;
-                            egui::ComboBox::from_id_salt("farm-drape-tick")
-                                .selected_text(format!("{tick:.0} km ticks"))
-                                .width(110.0)
-                                .show_ui(ui, |ui| {
-                                    for &choice in farm_live::TICK_CHOICES {
-                                        ui.selectable_value(
-                                            &mut tick,
-                                            choice,
-                                            format!("{choice:.0} km ticks"),
-                                        );
-                                    }
-                                });
-                            if tick != self.farm.drape.manual_tick_km {
-                                self.farm.drape.manual_tick_km = tick;
-                            }
-                        }
-                        if !self.farm.drape.status.is_empty() {
-                            ui.weak(&self.farm.drape.status);
-                        }
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                let frame_count = self.farm.frames.len();
+                if ui
+                    .button(if self.farm.playing { "⏸" } else { "▶" })
+                    .clicked()
+                {
+                    self.farm.playing = !self.farm.playing;
+                }
+                if frame_count > 0 {
+                    let mut index = self.farm.frame_index;
+                    if ui
+                        .add(egui::Slider::new(&mut index, 0..=frame_count - 1).show_value(false))
+                        .changed()
+                    {
+                        self.farm.playing = false;
+                        self.farm.follow_live = false;
+                        self.farm.frame_index = index;
+                    }
+                    ui.monospace(farm_live::frame_label(
+                        &self.farm.frames[self.farm.frame_index],
+                    ));
+                }
+                ui.checkbox(&mut self.farm.follow_live, "Follow live")
+                    .on_hover_text("Jump to the newest plot as it lands (~20 s cadence)");
+                if !self.farm.status.is_empty() {
+                    ui.weak(&self.farm.status);
+                }
+            });
+            if let Some(url) = self.farm.frames.get(self.farm.frame_index) {
+                if let Some(texture) = self.farm.textures.get(url) {
+                    let size = texture.size_vec2();
+                    let avail = ui.available_size() - egui::vec2(0.0, 24.0);
+                    let scale = (avail.x / size.x).min(avail.y / size.y).clamp(0.05, 3.0);
+                    ui.add(egui::Image::new((texture.id(), size * scale)));
+                } else {
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("fetching frame…");
                     });
                 }
-                ui.horizontal(|ui| {
-                    ui.small(farm_live::CREDIT);
-                    ui.hyperlink_to("svr.guru", "https://svr.guru");
-                });
+            } else {
+                ui.add_space(12.0);
+                ui.weak("waiting for frames…");
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                let toggled = ui
+                    .checkbox(&mut self.farm.drape.enabled, "Show on map")
+                    .on_hover_text(
+                        "Drape the quicklook over the radar map. Position + scale are read \
+                             from the plot itself (tick lattice + town markers); right-click \
+                             placement covers deployments the auto-locator can't pin",
+                    )
+                    .changed();
+                if toggled && self.farm.drape.enabled {
+                    // Stale loops never refetch — push the displayed
+                    // frame's pixels through the drape pipeline now.
+                    self.farm.kickstart_drape();
+                }
+                if self.farm.drape.enabled {
+                    ui.add(
+                        egui::Slider::new(&mut self.farm.drape.opacity, 0.15..=1.0)
+                            .show_value(false)
+                            .text("opacity"),
+                    );
+                    ui.checkbox(&mut self.farm.drape.echoes_only, "echoes only")
+                        .on_hover_text(
+                            "Hide the quicklook's own basemap and keep the colored echo \
+                                 pixels (near-zero velocity bins are muted by the same mask)",
+                        );
+                }
             });
-        self.farm.open = open;
+            if self.farm.drape.enabled {
+                ui.horizontal_wrapped(|ui| {
+                    match &self.farm.drape.georef {
+                        Some(_) => {
+                            if ui
+                                .small_button("Re-locate")
+                                .on_hover_text(
+                                    "Re-run the auto-locator on the next frame (use after \
+                                         the deployment moves)",
+                                )
+                                .clicked()
+                            {
+                                self.farm.drape.force_relocate();
+                            }
+                        }
+                        None => {
+                            ui.weak("no position fix yet");
+                        }
+                    }
+                    let armed = self.farm.drape.place_armed;
+                    if ui
+                        .selectable_label(armed, "Place radar (right-click map)")
+                        .on_hover_text(
+                            "Arm, then right-click the radar map at the deployment spot; \
+                                 scale comes from the plot's tick lattice",
+                        )
+                        .clicked()
+                    {
+                        self.farm.drape.place_armed = !armed;
+                    }
+                    if self.farm.drape.place_armed {
+                        let mut tick = self.farm.drape.manual_tick_km;
+                        egui::ComboBox::from_id_salt("farm-drape-tick")
+                            .selected_text(format!("{tick:.0} km ticks"))
+                            .width(110.0)
+                            .show_ui(ui, |ui| {
+                                for &choice in farm_live::TICK_CHOICES {
+                                    ui.selectable_value(
+                                        &mut tick,
+                                        choice,
+                                        format!("{choice:.0} km ticks"),
+                                    );
+                                }
+                            });
+                        if tick != self.farm.drape.manual_tick_km {
+                            self.farm.drape.manual_tick_km = tick;
+                        }
+                    }
+                    if !self.farm.drape.status.is_empty() {
+                        ui.weak(&self.farm.drape.status);
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.small(farm_live::CREDIT);
+                ui.hyperlink_to("svr.guru", "https://svr.guru");
+            });
+        }
     }
 
     /// 3D Volume Explorer window: background box resample of the current
@@ -12970,6 +13682,9 @@ impl ViewerApp {
                 Err(mpsc::TryRecvError::Disconnected) => self.vol3d.resample_rx = None,
             }
         }
+        if self.workspace.is_docked(dock::WorkspacePane::Vol3d) {
+            return; // body renders as a workspace pane
+        }
         let mut open = self.vol3d.open;
         egui::Window::new("Volume Explorer (3D)")
             .open(&mut open)
@@ -12977,164 +13692,173 @@ impl ViewerApp {
             .min_size([420.0, 360.0])
             .resizable(true)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Threshold");
-                    ui.add(
-                        egui::Slider::new(&mut self.vol3d.threshold_dbz, 0.0..=70.0).suffix(" dBZ"),
-                    );
-                    ui.label("Opacity");
-                    ui.add(egui::Slider::new(&mut self.vol3d.opacity, 0.05..=1.0));
-                    let mut size_km = (self.vol3d.box_half_km * 2.0) as i32;
-                    egui::ComboBox::from_id_salt("vol3d_size")
-                        .selected_text(format!("{size_km} km"))
-                        .width(74.0)
-                        .show_ui(ui, |ui| {
-                            for option in [120, 240, 360] {
-                                ui.selectable_value(&mut size_km, option, format!("{option} km"));
-                            }
-                        });
-                    if (size_km as f32 / 2.0 - self.vol3d.box_half_km).abs() > 0.5 {
-                        self.vol3d.box_half_km = size_km as f32 / 2.0;
-                        self.vol3d.volume_key = None; // re-resample at the new size
-                    }
-                    if ui
-                        .small_button("Re-center")
-                        .on_hover_text("Rebuild the box around the current view center")
-                        .clicked()
-                    {
-                        self.vol3d.volume_key = None;
-                    }
-                    ui.weak(&self.vol3d.status);
-                });
-                let size = ui.available_size();
-                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-                if response.dragged() {
-                    let delta = response.drag_delta();
-                    self.vol3d.yaw -= delta.x * 0.01;
-                    self.vol3d.pitch = (self.vol3d.pitch + delta.y * 0.01).clamp(0.05, 1.45);
-                }
-                let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-                if response.hovered() && scroll != 0.0 {
-                    self.vol3d.dist = (self.vol3d.dist * (1.0 - scroll * 0.001)).clamp(1.2, 6.0);
-                }
-                ui.painter()
-                    .add(eframe::egui_wgpu::Callback::new_paint_callback(
-                        rect,
-                        vol3d::Vol3dCallback {
-                            yaw: self.vol3d.yaw,
-                            pitch: self.vol3d.pitch,
-                            dist: self.vol3d.dist,
-                            threshold01: self.vol3d.threshold_dbz / 80.0,
-                            opacity: self.vol3d.opacity,
-                            aspect: (rect.width() / rect.height().max(1.0)).max(0.1),
-                            pending: Arc::clone(&self.vol3d.pending),
-                        },
-                    ));
-                // Wireframe box (same camera math as the shader): always
-                // visible, shows orientation even before data arrives.
-                let project = |p: [f32; 3]| -> egui::Pos2 {
-                    let (yaw, pitch, dist) = (self.vol3d.yaw, self.vol3d.pitch, self.vol3d.dist);
-                    let (cy, sy) = (yaw.cos(), yaw.sin());
-                    let (cp, sp) = (pitch.cos(), pitch.sin());
-                    let zspan = 0.6f32;
-                    let center = [0.0, 0.0, zspan * 0.35];
-                    let eye = [
-                        center[0] + dist * cy * cp,
-                        center[1] + dist * sy * cp,
-                        center[2] + dist * sp,
-                    ];
-                    let fwd = {
-                        let v = [center[0] - eye[0], center[1] - eye[1], center[2] - eye[2]];
-                        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-                        [v[0] / l, v[1] / l, v[2] / l]
-                    };
-                    let right = {
-                        let v = [fwd[1], -fwd[0], 0.0];
-                        let l = (v[0] * v[0] + v[1] * v[1]).sqrt().max(1e-6);
-                        [v[0] / l, v[1] / l, 0.0]
-                    };
-                    let up = [
-                        right[1] * fwd[2] - right[2] * fwd[1],
-                        right[2] * fwd[0] - right[0] * fwd[2],
-                        right[0] * fwd[1] - right[1] * fwd[0],
-                    ];
-                    let d = [p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]];
-                    let z = d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2];
-                    let x = (d[0] * right[0] + d[1] * right[1] + d[2] * right[2]) / z / 0.7;
-                    let y = (d[0] * up[0] + d[1] * up[1] + d[2] * up[2]) / z / 0.7;
-                    let aspect = (rect.width() / rect.height().max(1.0)).max(0.1);
-                    rect.center() + egui::vec2(x / aspect, -y) * (rect.width() * 0.5)
-                };
-                let zs = 0.6f32;
-                let corners = [
-                    [-1.0, -1.0, 0.0],
-                    [1.0, -1.0, 0.0],
-                    [1.0, 1.0, 0.0],
-                    [-1.0, 1.0, 0.0],
-                    [-1.0, -1.0, zs],
-                    [1.0, -1.0, zs],
-                    [1.0, 1.0, zs],
-                    [-1.0, 1.0, zs],
-                ];
-                let edges = [
-                    (0, 1),
-                    (1, 2),
-                    (2, 3),
-                    (3, 0),
-                    (4, 5),
-                    (5, 6),
-                    (6, 7),
-                    (7, 4),
-                    (0, 4),
-                    (1, 5),
-                    (2, 6),
-                    (3, 7),
-                ];
-                let stroke = egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(140, 150, 165, 110),
-                );
-                for (a, b) in edges {
-                    ui.painter()
-                        .line_segment([project(corners[a]), project(corners[b])], stroke);
-                }
-                // Floor grid every 20 km + height ticks: spatial reference.
-                let faint = egui::Stroke::new(
-                    0.7,
-                    egui::Color32::from_rgba_unmultiplied(120, 128, 142, 60),
-                );
-                let step = 20.0 / self.vol3d.box_half_km;
-                let mut g = -1.0 + step;
-                while g < 0.999 {
-                    ui.painter()
-                        .line_segment([project([g, -1.0, 0.0]), project([g, 1.0, 0.0])], faint);
-                    ui.painter()
-                        .line_segment([project([-1.0, g, 0.0]), project([1.0, g, 0.0])], faint);
-                    g += step;
-                }
-                for km in [5.0f32, 10.0, 15.0] {
-                    let z = km * 1000.0 / vol3d::BOX_TOP_M * zs;
-                    ui.painter().line_segment(
-                        [project([-1.0, -1.0, z]), project([-0.93, -1.0, z])],
-                        stroke,
-                    );
-                    ui.painter().text(
-                        project([-1.12, -1.0, z]),
-                        egui::Align2::CENTER_CENTER,
-                        format!("{km:.0} km"),
-                        egui::FontId::proportional(10.0),
-                        egui::Color32::from_rgb(170, 178, 190),
-                    );
-                }
-                ui.painter().text(
-                    project([0.0, 1.05, 0.0]),
-                    egui::Align2::CENTER_CENTER,
-                    "N",
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::from_rgb(200, 205, 215),
-                );
+                self.dock_toggle_row(ui, dock::WorkspacePane::Vol3d);
+                self.vol3d_pane_body(ui);
             });
-        self.vol3d.open = open;
+        self.set_viewer_open(dock::WorkspacePane::Vol3d, open);
+    }
+
+    /// 3D Volume Explorer body (slider strip + wgpu raymarch paint
+    /// callback + wireframe box), window and pane alike — the callback
+    /// takes an explicit rect, so a pane `Ui` supplies it the same way
+    /// the window did (memo §2 item 6, Rerun precedent).
+    fn vol3d_pane_body(&mut self, ui: &mut egui::Ui) {
+        {
+            ui.horizontal(|ui| {
+                ui.label("Threshold");
+                ui.add(egui::Slider::new(&mut self.vol3d.threshold_dbz, 0.0..=70.0).suffix(" dBZ"));
+                ui.label("Opacity");
+                ui.add(egui::Slider::new(&mut self.vol3d.opacity, 0.05..=1.0));
+                let mut size_km = (self.vol3d.box_half_km * 2.0) as i32;
+                egui::ComboBox::from_id_salt("vol3d_size")
+                    .selected_text(format!("{size_km} km"))
+                    .width(74.0)
+                    .show_ui(ui, |ui| {
+                        for option in [120, 240, 360] {
+                            ui.selectable_value(&mut size_km, option, format!("{option} km"));
+                        }
+                    });
+                if (size_km as f32 / 2.0 - self.vol3d.box_half_km).abs() > 0.5 {
+                    self.vol3d.box_half_km = size_km as f32 / 2.0;
+                    self.vol3d.volume_key = None; // re-resample at the new size
+                }
+                if ui
+                    .small_button("Re-center")
+                    .on_hover_text("Rebuild the box around the current view center")
+                    .clicked()
+                {
+                    self.vol3d.volume_key = None;
+                }
+                ui.weak(&self.vol3d.status);
+            });
+            let size = ui.available_size();
+            let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+            if response.dragged() {
+                let delta = response.drag_delta();
+                self.vol3d.yaw -= delta.x * 0.01;
+                self.vol3d.pitch = (self.vol3d.pitch + delta.y * 0.01).clamp(0.05, 1.45);
+            }
+            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+            if response.hovered() && scroll != 0.0 {
+                self.vol3d.dist = (self.vol3d.dist * (1.0 - scroll * 0.001)).clamp(1.2, 6.0);
+            }
+            ui.painter()
+                .add(eframe::egui_wgpu::Callback::new_paint_callback(
+                    rect,
+                    vol3d::Vol3dCallback {
+                        yaw: self.vol3d.yaw,
+                        pitch: self.vol3d.pitch,
+                        dist: self.vol3d.dist,
+                        threshold01: self.vol3d.threshold_dbz / 80.0,
+                        opacity: self.vol3d.opacity,
+                        aspect: (rect.width() / rect.height().max(1.0)).max(0.1),
+                        pending: Arc::clone(&self.vol3d.pending),
+                    },
+                ));
+            // Wireframe box (same camera math as the shader): always
+            // visible, shows orientation even before data arrives.
+            let project = |p: [f32; 3]| -> egui::Pos2 {
+                let (yaw, pitch, dist) = (self.vol3d.yaw, self.vol3d.pitch, self.vol3d.dist);
+                let (cy, sy) = (yaw.cos(), yaw.sin());
+                let (cp, sp) = (pitch.cos(), pitch.sin());
+                let zspan = 0.6f32;
+                let center = [0.0, 0.0, zspan * 0.35];
+                let eye = [
+                    center[0] + dist * cy * cp,
+                    center[1] + dist * sy * cp,
+                    center[2] + dist * sp,
+                ];
+                let fwd = {
+                    let v = [center[0] - eye[0], center[1] - eye[1], center[2] - eye[2]];
+                    let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                    [v[0] / l, v[1] / l, v[2] / l]
+                };
+                let right = {
+                    let v = [fwd[1], -fwd[0], 0.0];
+                    let l = (v[0] * v[0] + v[1] * v[1]).sqrt().max(1e-6);
+                    [v[0] / l, v[1] / l, 0.0]
+                };
+                let up = [
+                    right[1] * fwd[2] - right[2] * fwd[1],
+                    right[2] * fwd[0] - right[0] * fwd[2],
+                    right[0] * fwd[1] - right[1] * fwd[0],
+                ];
+                let d = [p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]];
+                let z = d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2];
+                let x = (d[0] * right[0] + d[1] * right[1] + d[2] * right[2]) / z / 0.7;
+                let y = (d[0] * up[0] + d[1] * up[1] + d[2] * up[2]) / z / 0.7;
+                let aspect = (rect.width() / rect.height().max(1.0)).max(0.1);
+                rect.center() + egui::vec2(x / aspect, -y) * (rect.width() * 0.5)
+            };
+            let zs = 0.6f32;
+            let corners = [
+                [-1.0, -1.0, 0.0],
+                [1.0, -1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [-1.0, 1.0, 0.0],
+                [-1.0, -1.0, zs],
+                [1.0, -1.0, zs],
+                [1.0, 1.0, zs],
+                [-1.0, 1.0, zs],
+            ];
+            let edges = [
+                (0, 1),
+                (1, 2),
+                (2, 3),
+                (3, 0),
+                (4, 5),
+                (5, 6),
+                (6, 7),
+                (7, 4),
+                (0, 4),
+                (1, 5),
+                (2, 6),
+                (3, 7),
+            ];
+            let stroke = egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(140, 150, 165, 110),
+            );
+            for (a, b) in edges {
+                ui.painter()
+                    .line_segment([project(corners[a]), project(corners[b])], stroke);
+            }
+            // Floor grid every 20 km + height ticks: spatial reference.
+            let faint = egui::Stroke::new(
+                0.7,
+                egui::Color32::from_rgba_unmultiplied(120, 128, 142, 60),
+            );
+            let step = 20.0 / self.vol3d.box_half_km;
+            let mut g = -1.0 + step;
+            while g < 0.999 {
+                ui.painter()
+                    .line_segment([project([g, -1.0, 0.0]), project([g, 1.0, 0.0])], faint);
+                ui.painter()
+                    .line_segment([project([-1.0, g, 0.0]), project([1.0, g, 0.0])], faint);
+                g += step;
+            }
+            for km in [5.0f32, 10.0, 15.0] {
+                let z = km * 1000.0 / vol3d::BOX_TOP_M * zs;
+                ui.painter().line_segment(
+                    [project([-1.0, -1.0, z]), project([-0.93, -1.0, z])],
+                    stroke,
+                );
+                ui.painter().text(
+                    project([-1.12, -1.0, z]),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{km:.0} km"),
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::from_rgb(170, 178, 190),
+                );
+            }
+            ui.painter().text(
+                project([0.0, 1.05, 0.0]),
+                egui::Align2::CENTER_CENTER,
+                "N",
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_rgb(200, 205, 215),
+            );
+        }
     }
 
     /// SPC Day-1 outlook polygons: SPC's own published fill/stroke colors,
@@ -13143,11 +13867,35 @@ impl ViewerApp {
         if self.spc_outlooks_enabled.is_empty() {
             return;
         }
+        // Alphas/width come from the style registry at draw time (features
+        // carry SPC's base colors) so style edits never refetch.
+        let spc_style = self.style_registry.spc();
         for (kind, features) in &self.spc_data.outlooks {
             if !self.spc_outlooks_enabled.iter().any(|k| k == kind) {
                 continue;
             }
             for feature in features {
+                let fill_base = if spc_style.use_spc_published_colors {
+                    feature.fill
+                } else {
+                    spc_style
+                        .outlook_colors
+                        .get(&feature.label)
+                        .map(|rgba| egui::Color32::from_rgb(rgba[0], rgba[1], rgba[2]))
+                        .unwrap_or(feature.fill)
+                };
+                let fill = egui::Color32::from_rgba_unmultiplied(
+                    fill_base.r(),
+                    fill_base.g(),
+                    fill_base.b(),
+                    spc_style.outlook_fill_alpha,
+                );
+                let stroke_color = egui::Color32::from_rgba_unmultiplied(
+                    feature.stroke.r(),
+                    feature.stroke.g(),
+                    feature.stroke.b(),
+                    spc_style.outlook_stroke_alpha,
+                );
                 for ring in &feature.rings {
                     let screen: Vec<egui::Pos2> = ring
                         .iter()
@@ -13174,14 +13922,14 @@ impl ViewerApp {
                     }
                     painter.add(egui::Shape::closed_line(
                         screen.clone(),
-                        egui::Stroke::new(2.0, feature.stroke),
+                        egui::Stroke::new(spc_style.outlook_stroke_width, stroke_color),
                     ));
                     // Translucent interior wash: PROPER ear-clip tessellation
                     // (the warning-polygon path's own) — outlook rings are
                     // deeply concave, and a centroid fan sprays triangles
                     // across the map ("spokes" field report). The cleaner
                     // also absorbs SPC's unclosed/degenerate ring edge cases.
-                    if let Some(mesh) = filled_polygon_mesh(&screen, feature.fill) {
+                    if let Some(mesh) = filled_polygon_mesh(&screen, fill) {
                         painter.add(egui::Shape::mesh(mesh));
                     }
                     if let Some(first) = screen.first() {
@@ -13190,7 +13938,7 @@ impl ViewerApp {
                             egui::Align2::LEFT_TOP,
                             &feature.label,
                             egui::FontId::proportional(11.0),
-                            feature.stroke,
+                            stroke_color,
                         );
                     }
                 }
@@ -13203,34 +13951,95 @@ impl ViewerApp {
         if !self.spc_reports_enabled {
             return;
         }
-        for report in &self.spc_data.reports {
-            let pos = self.lon_lat_to_screen(rect, report.lon, report.lat);
-            if !rect.contains(pos) {
-                continue;
-            }
-            let color = report.kind.color();
+        // Magnitude labels (wind speed, hail size) draw when the visible
+        // set is small enough to stay readable — a CONUS view on a big
+        // day has hundreds of reports and the numbers become noise.
+        let visible: Vec<(&spc_layers::StormReport, egui::Pos2)> = self
+            .spc_data
+            .reports
+            .iter()
+            .filter_map(|report| {
+                let pos = self.lon_lat_to_screen(rect, report.lon, report.lat);
+                rect.contains(pos).then_some((report, pos))
+            })
+            .collect();
+        let label_magnitudes = visible.len() <= 80;
+        for (report, pos) in &visible {
+            let (report, pos) = (*report, *pos);
+            let marker = self.style_registry.report_marker(report.kind.style_key());
+            let color = style_color32(marker.color);
+            let outline =
+                egui::Stroke::new(marker.outline_width, style_color32(marker.outline_color));
             match report.kind {
                 spc_layers::ReportKind::Tornado => {
+                    // Triangle proportions scale with the configured size
+                    // (5 px tall at the default).
+                    let scale = marker.size_px / 5.0;
                     painter.add(egui::Shape::convex_polygon(
                         vec![
-                            pos + egui::vec2(0.0, -5.0),
-                            pos + egui::vec2(4.5, 3.5),
-                            pos + egui::vec2(-4.5, 3.5),
+                            pos + egui::vec2(0.0, -5.0 * scale),
+                            pos + egui::vec2(4.5 * scale, 3.5 * scale),
+                            pos + egui::vec2(-4.5 * scale, 3.5 * scale),
                         ],
                         color,
-                        egui::Stroke::new(1.0, egui::Color32::BLACK),
+                        outline,
                     ));
                 }
                 spc_layers::ReportKind::Wind => {
-                    painter.rect_filled(
-                        egui::Rect::from_center_size(pos, egui::vec2(7.0, 7.0)),
-                        1.0,
-                        color,
-                    );
+                    let half = marker.size_px;
+                    let rect =
+                        egui::Rect::from_center_size(pos, egui::vec2(half * 2.0, half * 2.0));
+                    painter.rect_filled(rect, 1.0, color);
+                    if marker.outline_width > 0.0 {
+                        painter.rect_stroke(rect, 1.0, outline, egui::StrokeKind::Outside);
+                    }
                 }
                 spc_layers::ReportKind::Hail => {
-                    painter.circle_filled(pos, 3.5, color);
+                    painter.circle_filled(pos, marker.size_px, color);
+                    if marker.outline_width > 0.0 {
+                        painter.circle_stroke(pos, marker.size_px, outline);
+                    }
                 }
+            }
+            if label_magnitudes && let Some(magnitude) = report.magnitude_label() {
+                draw_halo_text(
+                    painter,
+                    pos + egui::vec2(6.0, -5.0),
+                    egui::Align2::LEFT_CENTER,
+                    &magnitude,
+                    egui::FontId::proportional(10.0),
+                    color,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 210),
+                );
+            }
+        }
+        // Hover card: the report dots carry their full story (field
+        // request: "people like to see the wind reports and the speeds").
+        if let Some(pointer) = painter.ctx().pointer_hover_pos()
+            && rect.contains(pointer)
+        {
+            let mut texts: Vec<String> = Vec::new();
+            for (report, pos) in &visible {
+                if pos.distance(pointer) <= 10.0 {
+                    texts.push(report.hover_text());
+                }
+                if texts.len() >= 5 {
+                    break;
+                }
+            }
+            if !texts.is_empty() {
+                let joined = texts.join("\n――――――\n");
+                egui::Tooltip::always_open(
+                    painter.ctx().clone(),
+                    egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("spc_rpt_hover")),
+                    egui::Id::new("spc_rpt_tip"),
+                    egui::PopupAnchor::Pointer,
+                )
+                .gap(12.0)
+                .show(|ui| {
+                    ui.set_max_width(340.0);
+                    ui.label(joined);
+                });
             }
         }
     }
@@ -13250,15 +14059,17 @@ impl ViewerApp {
             .as_ref()
             .map(|volume| volume.volume_time.timestamp_millis())
             .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-        for (flash, age) in glm.frame_flashes(frame_ms) {
+        let glm_style = self.style_registry.glm();
+        for (flash, age) in glm.frame_flashes(frame_ms, glm_style.window_minutes) {
             let pos = self.lon_lat_to_screen(rect, flash.lon, flash.lat);
             if !rect.contains(pos) {
                 continue;
             }
-            let color = glm_layer::flash_color(age);
+            let color = glm_layer::flash_color(age, glm_style);
             // Size by log-energy: GLM energies span orders of magnitude.
             let energy_femto = (f64::from(flash.energy) * 1e15).max(1.0);
-            let size = (1.6 + 0.55 * energy_femto.log10() as f32).clamp(1.6, 5.0);
+            let size =
+                (1.6 + 0.55 * energy_femto.log10() as f32).clamp(1.6, 5.0) * glm_style.size_scale;
             let stroke = egui::Stroke::new(1.2, color);
             painter.line_segment(
                 [pos - egui::vec2(size, 0.0), pos + egui::vec2(size, 0.0)],
@@ -13285,12 +14096,13 @@ impl ViewerApp {
             .as_ref()
             .map(|volume| volume.volume_time.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
-        let cell = 88.0_f32;
+        let obs_style = self.style_registry.obs();
+        let cell = obs_style.declutter_cell_px.max(8.0);
         let cols = (rect.width() / cell).ceil() as i32 + 1;
         let mut taken: std::collections::HashMap<i32, u8> = std::collections::HashMap::new();
         let show_ids = self.map_scale > 28.0;
-        let font_v = egui::FontId::proportional(11.0);
-        let font_id = egui::FontId::proportional(9.0);
+        let font_v = egui::FontId::proportional(obs_style.value_font_px);
+        let font_id = egui::FontId::proportional(obs_style.small_font_px);
         // Fuller reports first so they win declutter cells.
         let mut order: Vec<&obs::SurfaceOb> = self.surface_obs.frame_obs(frame_time).collect();
         order.sort_by(|a, b| b.completeness.cmp(&a.completeness));
@@ -13324,15 +14136,15 @@ impl ViewerApp {
             *slot += 1;
             // Station dot: white = METAR, amber = mesonet (source visible
             // at a glance).
-            let dot = if is_metar {
-                egui::Color32::from_rgb(210, 214, 220)
+            let dot = style_color32(if is_metar {
+                obs_style.metar_dot
             } else {
-                egui::Color32::from_rgb(214, 176, 96)
-            };
+                obs_style.mesonet_dot
+            });
             painter.circle_filled(pos, 2.0, dot);
             // Wind barb (meteorological: barb points INTO the wind).
             if let (Some(dir), Some(spd)) = (ob.wind_dir_deg, ob.wind_speed_kt) {
-                draw_station_barb(painter, pos, dir, spd);
+                draw_station_barb(painter, pos, dir, spd, obs_style);
             }
             // T upper-left (red), Td lower-left (green), °F.
             if let Some(t) = ob.temp_c {
@@ -13341,7 +14153,7 @@ impl ViewerApp {
                     egui::Align2::RIGHT_CENTER,
                     format!("{:.0}", t * 9.0 / 5.0 + 32.0),
                     font_v.clone(),
-                    egui::Color32::from_rgb(255, 120, 110),
+                    style_color32(obs_style.temp_color),
                 );
             }
             if let Some(td) = ob.dewpoint_c {
@@ -13350,7 +14162,7 @@ impl ViewerApp {
                     egui::Align2::RIGHT_CENTER,
                     format!("{:.0}", td * 9.0 / 5.0 + 32.0),
                     font_v.clone(),
-                    egui::Color32::from_rgb(120, 235, 130),
+                    style_color32(obs_style.dewpoint_color),
                 );
             }
             if let Some(gust) = ob.wind_gust_kt {
@@ -13359,7 +14171,7 @@ impl ViewerApp {
                     egui::Align2::LEFT_CENTER,
                     format!("G{gust:.0}"),
                     font_id.clone(),
-                    egui::Color32::from_rgb(255, 196, 110),
+                    style_color32(obs_style.gust_color),
                 );
             }
             if show_ids {
@@ -13368,7 +14180,7 @@ impl ViewerApp {
                     egui::Align2::CENTER_CENTER,
                     &ob.station_id,
                     font_id.clone(),
-                    egui::Color32::from_rgba_unmultiplied(190, 196, 204, 180),
+                    style_color32(obs_style.station_id_color),
                 );
             }
         }
@@ -13739,7 +14551,10 @@ impl ViewerApp {
         rect: egui::Rect,
         product: &DisplayProduct,
     ) {
-        let table = self.color_tables.for_family(product.color_family());
+        let table = self
+            .palette_product_overrides
+            .get(product.label())
+            .unwrap_or_else(|| self.color_tables.for_family(product.color_family()));
         let stops = table.stops();
         let (Some(first), Some(last)) = (stops.first(), stops.last()) else {
             return;
@@ -14454,17 +15269,36 @@ impl ViewerApp {
                 egui::Color32::from_white_alpha((self.radar_opacity * 255.0) as u8),
             );
         }
-        self.draw_range_ring(
-            painter,
-            rect,
-            latitude_deg,
-            longitude_deg,
-            self.radar_range_km,
-            egui::Stroke::new(
-                1.8,
-                freshness_ring_color(volume.volume_time.with_timezone(&Utc), Utc::now(), 230),
+        let rings = self.style_registry.range_rings();
+        if self.style_registry.radar_age().ring_enabled {
+            self.draw_range_ring(
+                painter,
+                rect,
+                latitude_deg,
+                longitude_deg,
+                self.radar_range_km,
+                egui::Stroke::new(
+                    rings.primary_width,
+                    self.data_edge_ring_color(volume.volume_time.with_timezone(&Utc), 230),
+                ),
+            );
+        }
+    }
+
+    /// Data-edge ring color per the range-ring style: scan-age gradient
+    /// (default) or a fixed color, both at the caller's alpha.
+    fn data_edge_ring_color(&self, volume_time_utc: DateTime<Utc>, alpha: u8) -> egui::Color32 {
+        match self.style_registry.range_rings().color_mode {
+            styles::RingColorMode::Age => freshness_ring_color(
+                volume_time_utc,
+                Utc::now(),
+                alpha,
+                self.style_registry.radar_age(),
             ),
-        );
+            styles::RingColorMode::Fixed { color } => {
+                egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], alpha)
+            }
+        }
     }
 
     fn draw_radar_overlay_layers(
@@ -14499,21 +15333,22 @@ impl ViewerApp {
                     egui::Color32::from_white_alpha(layer.opacity),
                 );
             }
-            self.draw_range_ring(
-                painter,
-                rect,
-                latitude_deg,
-                longitude_deg,
-                layer.radar_range_km,
-                egui::Stroke::new(
-                    1.5,
-                    freshness_ring_color(
-                        volume.volume_time.with_timezone(&Utc),
-                        Utc::now(),
-                        layer.opacity,
+            if self.style_registry.radar_age().ring_enabled {
+                self.draw_range_ring(
+                    painter,
+                    rect,
+                    latitude_deg,
+                    longitude_deg,
+                    layer.radar_range_km,
+                    egui::Stroke::new(
+                        self.style_registry.range_rings().overlay_width,
+                        self.data_edge_ring_color(
+                            volume.volume_time.with_timezone(&Utc),
+                            layer.opacity,
+                        ),
                     ),
-                ),
-            );
+                );
+            }
         }
     }
 
@@ -14554,7 +15389,9 @@ impl ViewerApp {
         self.view_shape_key(2, rect).hash(&mut hasher);
         self.hazard_overlay_generation.hash(&mut hasher);
         self.selected_hazard_index.hash(&mut hasher);
-        self.hazard_fill_alpha.hash(&mut hasher);
+        // Style edits must repaint: the registry signature covers every
+        // styled property (it subsumes the old hazard_fill_alpha hash).
+        self.style_registry.signature().hash(&mut hasher);
         fill_product.label().hash(&mut hasher);
         self.hazards_active_only.hash(&mut hasher);
         for family in &self.hidden_hazard_families {
@@ -14565,15 +15402,21 @@ impl ViewerApp {
         let built =
             cache.get_or_insert_with(key, || self.build_hazard_overlay_shapes(rect, fill_product));
         painter.extend(built.shapes.iter().cloned());
+        let global = self.style_registry.hazard_global();
+        let halo = style_color32(self.style_registry.labels().warning_halo_color);
         for (center, label, selected) in &built.labels {
             draw_halo_text(
                 painter,
                 *center,
                 egui::Align2::CENTER_CENTER,
                 label,
-                egui::FontId::proportional(if *selected { 12.0 } else { 11.0 }),
+                egui::FontId::proportional(if *selected {
+                    global.label_font_selected_px
+                } else {
+                    global.label_font_px
+                }),
                 egui::Color32::from_rgb(245, 248, 250),
-                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 210),
+                halo,
             );
         }
     }
@@ -14607,29 +15450,65 @@ impl ViewerApp {
                 continue;
             }
             let selected = self.selected_hazard_index == Some(index);
-            let color = hazard_color(record);
-            let fill_alpha =
-                hazard_fill_alpha_for_product(self.hazard_fill_alpha, selected, fill_product);
-            let fill =
-                egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), fill_alpha);
+            let style = self
+                .style_registry
+                .hazard_polygon(&record.event_family, record.damage_threat.as_deref());
+            let global = self.style_registry.hazard_global();
+            let color = style_color32(style.stroke_color);
+            let base_alpha = style.fill_alpha.unwrap_or(global.fill_alpha);
+            let fill_alpha = hazard_fill_alpha_for_product(base_alpha, selected, fill_product);
+            let fill_rgb = style.fill_color;
+            let fill = egui::Color32::from_rgba_unmultiplied(
+                fill_rgb[0],
+                fill_rgb[1],
+                fill_rgb[2],
+                fill_alpha,
+            );
+            let stroke_width = style.stroke_width * global.stroke_width_scale
+                + if selected {
+                    global.selected_width_boost
+                } else {
+                    0.0
+                };
             let stroke = egui::Stroke::new(
-                if selected { 2.4 } else { 1.5 },
+                stroke_width,
                 egui::Color32::from_rgba_unmultiplied(
                     color.r(),
                     color.g(),
                     color.b(),
-                    if selected { 245 } else { 205 },
+                    if selected {
+                        global.stroke_alpha_selected
+                    } else {
+                        global.stroke_alpha
+                    },
                 ),
             );
-            if is_convex_screen_polygon(&points) {
+            let solid = matches!(style.dash, styles::DashPattern::Solid);
+            if solid && is_convex_screen_polygon(&points) {
                 out.shapes
                     .push(egui::Shape::convex_polygon(points.clone(), fill, stroke));
             } else {
-                if let Some(mesh) = filled_polygon_mesh(&points, fill) {
+                if is_convex_screen_polygon(&points) {
+                    out.shapes.push(egui::Shape::convex_polygon(
+                        points.clone(),
+                        fill,
+                        egui::Stroke::NONE,
+                    ));
+                } else if let Some(mesh) = filled_polygon_mesh(&points, fill) {
                     out.shapes.push(egui::Shape::mesh(mesh));
                 }
-                out.shapes
-                    .push(egui::Shape::closed_line(points.clone(), stroke));
+                match style.dash {
+                    styles::DashPattern::Solid => out
+                        .shapes
+                        .push(egui::Shape::closed_line(points.clone(), stroke)),
+                    styles::DashPattern::Dashed { dash, gap } => {
+                        push_dashed_closed_line(&mut out.shapes, &points, stroke, dash, gap);
+                    }
+                    styles::DashPattern::Dotted => {
+                        let dot = stroke.width.max(1.0);
+                        push_dashed_closed_line(&mut out.shapes, &points, stroke, dot, dot * 2.0);
+                    }
+                }
             }
             let center = polygon_screen_centroid(&points);
             if rect.expand(24.0).contains(center) && self.map_scale >= 62.0 {
@@ -15036,7 +15915,8 @@ impl ViewerApp {
             if label.rank > place_labels.max_rank || !bounds.contains(label.lon, label.lat) {
                 continue;
             }
-            // Size tiers: bigger towns get bigger type (callout hierarchy).
+            // Size tiers: bigger towns get bigger type (callout hierarchy);
+            // the style registry's town scale multiplies every tier.
             let size = if bold {
                 match label.rank {
                     0..=3 => 18.0,
@@ -15047,7 +15927,7 @@ impl ViewerApp {
                 12.0
             } else {
                 11.0
-            };
+            } * self.style_registry.labels().town_font_scale;
             let font = egui::FontId::proportional(size);
             let position = self.lon_lat_to_screen(rect, label.lon, label.lat);
             if !rect.expand(32.0).contains(position) {
@@ -15241,13 +16121,14 @@ impl ViewerApp {
     }
 
     fn draw_site_markers(&self, painter: &egui::Painter, site_points: &[(usize, egui::Pos2)]) {
+        let rings = self.style_registry.range_rings();
         for (index, position) in site_points {
             let selected = *index == self.selected_site_index;
-            let fill = if selected {
-                egui::Color32::from_rgb(88, 210, 245)
+            let fill = style_color32(if selected {
+                rings.site_selected_color
             } else {
-                egui::Color32::from_rgb(106, 132, 154)
-            };
+                rings.site_idle_color
+            });
             let radius = if selected { 5.5 } else { 3.0 };
             painter.circle_filled(*position, radius, fill);
             if selected {
@@ -16004,39 +16885,60 @@ fn positive_ratio(numerator: f32, denominator: f32) -> f32 {
     }
 }
 
+/// Scan-age ring color: green → yellow → red → dark-red across the style's
+/// thresholds (defaults 6/10/15 min). Thresholds AND colors come from the
+/// radar-age style group so the gradient is one customization shared by
+/// every age-coloring surface.
 fn freshness_ring_color(
     volume_time_utc: DateTime<Utc>,
     now_utc: DateTime<Utc>,
     alpha: u8,
+    age_style: &styles::RadarAgeStyle,
 ) -> egui::Color32 {
     let age_seconds = now_utc
         .signed_duration_since(volume_time_utc)
         .num_seconds()
         .max(0);
-    let (start, end, t) = if age_seconds <= FRESH_RING_GREEN_SECONDS {
-        ((65, 238, 104), (65, 238, 104), 0.0)
-    } else if age_seconds <= FRESH_RING_YELLOW_SECONDS {
+    let fresh = (
+        age_style.fresh_color[0],
+        age_style.fresh_color[1],
+        age_style.fresh_color[2],
+    );
+    let aging = (
+        age_style.aging_color[0],
+        age_style.aging_color[1],
+        age_style.aging_color[2],
+    );
+    let stale = (
+        age_style.stale_color[0],
+        age_style.stale_color[1],
+        age_style.stale_color[2],
+    );
+    let expired = (
+        age_style.expired_color[0],
+        age_style.expired_color[1],
+        age_style.expired_color[2],
+    );
+    let (start, end, t) = if age_seconds <= age_style.green_seconds {
+        (fresh, fresh, 0.0)
+    } else if age_seconds <= age_style.yellow_seconds {
         (
-            (65, 238, 104),
-            (238, 218, 62),
+            fresh,
+            aging,
             ratio_between(
                 age_seconds,
-                FRESH_RING_GREEN_SECONDS,
-                FRESH_RING_YELLOW_SECONDS,
+                age_style.green_seconds,
+                age_style.yellow_seconds,
             ),
         )
-    } else if age_seconds <= FRESH_RING_RED_SECONDS {
+    } else if age_seconds <= age_style.red_seconds {
         (
-            (238, 218, 62),
-            (246, 76, 48),
-            ratio_between(
-                age_seconds,
-                FRESH_RING_YELLOW_SECONDS,
-                FRESH_RING_RED_SECONDS,
-            ),
+            aging,
+            stale,
+            ratio_between(age_seconds, age_style.yellow_seconds, age_style.red_seconds),
         )
     } else {
-        ((246, 76, 48), (205, 34, 48), 1.0)
+        (stale, expired, 1.0)
     };
     let (r, g, b) = lerp_rgb(start, end, t);
     egui::Color32::from_rgba_unmultiplied(r, g, b, alpha)
@@ -16257,6 +17159,130 @@ fn parse_color_table_for_family(
     // a community-loaded table must look exactly like it does in GR2A.
     let _ = family;
     ColorTable::parse_gr_pal(name, text)
+}
+
+/// Scan `settings::color_tables_dir()` for user `.pal` files ("My tables").
+/// Family comes from the file's `Product:` header (unknown/missing →
+/// Generic; the picker offers user tables across families anyway, since
+/// community files often omit or mislabel it). Unparseable files are
+/// skipped — a broken download must never block startup.
+fn scan_user_color_tables(dir: &Path) -> Vec<(ColorTableFamily, ColorTable)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("pal"))
+        })
+        .collect();
+    paths.sort();
+    for path in paths {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or("User table");
+        if let Ok(table) = ColorTable::parse_gr_pal(name, &text) {
+            let family = table
+                .product()
+                .map(color_tables::family_for_product_code)
+                .unwrap_or(ColorTableFamily::Generic);
+            out.push((family, table));
+        }
+    }
+    out
+}
+
+/// Resolve a persisted table name for a family: built-ins first, then user
+/// tables by name regardless of their declared family (the user picked it).
+fn resolve_palette_binding(
+    family: ColorTableFamily,
+    name: &str,
+    user_tables: &[(ColorTableFamily, ColorTable)],
+) -> Option<ColorTable> {
+    builtin_tables_for_family(family)
+        .into_iter()
+        .find(|table| table.name() == name)
+        .or_else(|| {
+            user_tables
+                .iter()
+                .find(|(_, table)| table.name() == name)
+                .map(|(_, table)| table.clone())
+        })
+}
+
+/// Resolve a table name with no family hint (per-product bindings):
+/// every family's built-ins ∪ user tables.
+fn resolve_table_by_name(
+    name: &str,
+    user_tables: &[(ColorTableFamily, ColorTable)],
+) -> Option<ColorTable> {
+    ColorTableFamily::ALL
+        .into_iter()
+        .find_map(|family| {
+            builtin_tables_for_family(family)
+                .into_iter()
+                .find(|table| table.name() == name)
+        })
+        .or_else(|| {
+            user_tables
+                .iter()
+                .find(|(_, table)| table.name() == name)
+                .map(|(_, table)| table.clone())
+        })
+}
+
+/// Apply saved family bindings to the live set. Misses (deleted tables,
+/// unknown labels) leave the default in place and return a status line —
+/// the boot path logs them to `color_table_status`.
+fn restore_palette_bindings(
+    color_tables: &mut ColorTableSet,
+    bindings: &BTreeMap<String, String>,
+    user_tables: &[(ColorTableFamily, ColorTable)],
+) -> Vec<String> {
+    let mut misses = Vec::new();
+    for (label, name) in bindings {
+        let Some(family) = ColorTableFamily::from_label(label) else {
+            misses.push(format!("Unknown color family \"{label}\" in config.json"));
+            continue;
+        };
+        match resolve_palette_binding(family, name, user_tables) {
+            Some(table) => color_tables.set_family(family, table),
+            None => misses.push(format!(
+                "Saved table \"{name}\" for {label} not found; using the default"
+            )),
+        }
+    }
+    misses
+}
+
+/// Resolve `palette_by_product` names to concrete tables for render-time
+/// injection; misses are reported and skipped.
+fn resolve_product_palette_overrides(
+    bindings: &BTreeMap<String, String>,
+    user_tables: &[(ColorTableFamily, ColorTable)],
+) -> (BTreeMap<String, ColorTable>, Vec<String>) {
+    let mut overrides = BTreeMap::new();
+    let mut misses = Vec::new();
+    for (product_label, name) in bindings {
+        match resolve_table_by_name(name, user_tables) {
+            Some(table) => {
+                overrides.insert(product_label.clone(), table);
+            }
+            None => misses.push(format!(
+                "Saved table \"{name}\" for product {product_label} not found; using the family table"
+            )),
+        }
+    }
+    (overrides, misses)
 }
 
 fn color_table_summary(table: &ColorTable) -> String {
@@ -16797,6 +17823,7 @@ fn icon_sprite_shape(
     icon_index: u32,
     position: egui::Pos2,
     heading_deg: f32,
+    scale: f32,
 ) -> Option<egui::Shape> {
     let (sheet_w, sheet_h) = sheet.size;
     let (icon_w, icon_h) = (sheet.spec.icon_w, sheet.spec.icon_h);
@@ -16832,7 +17859,9 @@ fn icon_sprite_shape(
     let uvs = [uv0, egui::pos2(uv1.x, uv0.y), uv1, egui::pos2(uv0.x, uv1.y)];
     let mut mesh = egui::epaint::Mesh::with_texture(sheet.texture.id());
     for (corner, uv) in corners.iter().zip(uvs.iter()) {
-        let local = *corner - hot;
+        // Style icon scale applies about the hot point (scale 1.0 = the
+        // file's native pixel size).
+        let local = (*corner - hot) * scale.max(0.05);
         mesh.vertices.push(egui::epaint::Vertex {
             pos: position + rotate(local),
             uv: *uv,
@@ -17434,9 +18463,15 @@ fn sync_run_pickers(download: &mut rw_ui::DownloadPanel, spec: &rw_ui::DownloadS
 
 /// Station-plot wind barb (meteorological convention: shaft extends
 /// upwind; 50-kt flags, 10-kt full barbs, 5-kt halves, calm = ring).
-fn draw_station_barb(painter: &egui::Painter, tip: egui::Pos2, dir_deg: f32, spd_kt: f32) {
-    let color = egui::Color32::from_rgb(205, 212, 222);
-    let stroke = egui::Stroke::new(1.2, color);
+fn draw_station_barb(
+    painter: &egui::Painter,
+    tip: egui::Pos2,
+    dir_deg: f32,
+    spd_kt: f32,
+    obs_style: &styles::ObsStyle,
+) {
+    let color = style_color32(obs_style.barb_color);
+    let stroke = egui::Stroke::new(obs_style.barb_width, color);
     if spd_kt < 2.5 {
         painter.circle_stroke(tip, 4.0, stroke);
         return;
@@ -19206,36 +20241,45 @@ fn hazard_label(
     }
 }
 
-fn hazard_color(record: &HazardRecord) -> egui::Color32 {
-    let threat = record
-        .damage_threat
-        .as_deref()
-        .map(str::to_ascii_uppercase)
-        .unwrap_or_default();
-    match record.event_family.as_str() {
-        // Damage-threat escalation follows the operational color
-        // language: Tornado Emergency purple, PDS tornado magenta,
-        // destructive SVR deep orange.
-        "tornado" => match threat.as_str() {
-            "CATASTROPHIC" => egui::Color32::from_rgb(150, 50, 250),
-            "CONSIDERABLE" => egui::Color32::from_rgb(255, 64, 175),
-            _ => egui::Color32::from_rgb(248, 62, 82),
-        },
-        "severe thunderstorm" => match threat.as_str() {
-            "DESTRUCTIVE" => egui::Color32::from_rgb(252, 122, 28),
-            _ => egui::Color32::from_rgb(246, 183, 57),
-        },
-        "flash flood" => egui::Color32::from_rgb(78, 218, 108),
-        "flood" => egui::Color32::from_rgb(76, 190, 124),
-        "special marine" => egui::Color32::from_rgb(70, 190, 238),
-        "snow squall" => egui::Color32::from_rgb(170, 210, 255),
-        "watch" => egui::Color32::from_rgb(235, 92, 245),
-        "mesoscale discussion" => egui::Color32::from_rgb(95, 174, 255),
-        "local storm report" => egui::Color32::from_rgb(245, 245, 245),
-        "special weather" => egui::Color32::from_rgb(245, 220, 72),
-        "text polygon" => egui::Color32::from_rgb(190, 178, 255),
-        _ => egui::Color32::from_rgb(232, 232, 96),
+/// [r,g,b,a] style color (toolkit-agnostic `styles` crate) → egui.
+fn style_color32(rgba: styles::Rgba) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3])
+}
+
+/// Hazard stroke color from the style registry (built-in defaults are the
+/// operational color language — Tornado Emergency purple, PDS tornado
+/// magenta, destructive SVR deep orange; see styles crate defaults).
+/// Free-function wrapper kept so tests pin colors mechanically.
+#[cfg(test)]
+fn hazard_color(registry: &styles::StyleRegistry, record: &HazardRecord) -> egui::Color32 {
+    style_color32(
+        registry
+            .hazard_polygon(&record.event_family, record.damage_threat.as_deref())
+            .stroke_color,
+    )
+}
+
+/// Dashed outline over a CLOSED polyline: `Shape::dashed_line` over the
+/// ring with the first point appended (egui's dashed line is open-ended).
+fn push_dashed_closed_line(
+    shapes: &mut Vec<egui::Shape>,
+    points: &[egui::Pos2],
+    stroke: egui::Stroke,
+    dash: f32,
+    gap: f32,
+) {
+    if points.len() < 2 {
+        return;
     }
+    let mut closed = Vec::with_capacity(points.len() + 1);
+    closed.extend_from_slice(points);
+    closed.push(points[0]);
+    shapes.extend(egui::Shape::dashed_line(
+        &closed,
+        stroke,
+        dash.max(0.5),
+        gap.max(0.5),
+    ));
 }
 
 fn hazard_fill_alpha_for_product(base_alpha: u8, selected: bool, product: &DisplayProduct) -> u8 {
@@ -19911,10 +20955,12 @@ fn latest_load_pauses_poll(mode: LatestLoadMode, poll_active: bool) -> bool {
 }
 
 fn normalized_history_limit(limit: usize) -> usize {
-    if HISTORY_SIZE_OPTIONS.contains(&limit) {
-        limit
-    } else {
+    // Clamp, don't snap to presets: deployment loads raise the limit past
+    // the combo options, and trims must not collapse it back to 7.
+    if limit == 0 {
         DEFAULT_HISTORY_FRAME_LIMIT
+    } else {
+        limit.clamp(HISTORY_SIZE_OPTIONS[0], MAX_HISTORY_FRAME_LIMIT)
     }
 }
 
@@ -20333,6 +21379,165 @@ mod tests {
             ),
             70
         );
+    }
+
+    /// Golden parity net for the style-registry refactor: an EMPTY style
+    /// document must resolve every legacy hard-coded hazard constant
+    /// exactly — colors, widths, alphas. If a styles-crate default drifts,
+    /// this is the test that catches it.
+    #[test]
+    fn default_styles_pin_legacy_hazard_constants() {
+        let registry = styles::StyleRegistry::default();
+        let record = |family: &str, threat: Option<&str>| {
+            let mut record = test_hazard_record(
+                "id",
+                "label",
+                family,
+                square_hazard_points(-98.0, 34.0, -97.0, 35.0),
+            );
+            record.damage_threat = threat.map(str::to_owned);
+            record
+        };
+        type GoldenRow = (&'static str, Option<&'static str>, (u8, u8, u8));
+        let expected: &[GoldenRow] = &[
+            // Damage-threat escalation ladder.
+            ("tornado", Some("CATASTROPHIC"), (150, 50, 250)), // TOR EMERGENCY purple
+            ("tornado", Some("CONSIDERABLE"), (255, 64, 175)), // PDS magenta
+            ("tornado", None, (248, 62, 82)),
+            ("severe thunderstorm", Some("DESTRUCTIVE"), (252, 122, 28)),
+            ("severe thunderstorm", None, (246, 183, 57)),
+            // Base family table.
+            ("flash flood", None, (78, 218, 108)),
+            ("flash flood", Some("CATASTROPHIC"), (78, 218, 108)),
+            ("flood", None, (76, 190, 124)),
+            ("special marine", None, (70, 190, 238)),
+            ("snow squall", None, (170, 210, 255)),
+            ("watch", None, (235, 92, 245)),
+            ("mesoscale discussion", None, (95, 174, 255)),
+            ("local storm report", None, (245, 245, 245)),
+            ("special weather", None, (245, 220, 72)),
+            ("text polygon", None, (190, 178, 255)),
+            ("anything else", None, (232, 232, 96)),
+        ];
+        for (family, threat, (r, g, b)) in expected {
+            assert_eq!(
+                hazard_color(&registry, &record(family, *threat)),
+                egui::Color32::from_rgb(*r, *g, *b),
+                "stroke color for {family} / {threat:?}"
+            );
+        }
+
+        // Stroke geometry: width 1.5 unselected, 2.4 selected (1.5 + 0.9
+        // boost); stroke alphas 205 / 245; default fill alpha 24.
+        let style = registry.hazard_polygon("tornado", None);
+        let global = registry.hazard_global();
+        let unselected_width = style.stroke_width * global.stroke_width_scale;
+        let selected_width = unselected_width + global.selected_width_boost;
+        assert_eq!(unselected_width, 1.5);
+        assert_eq!(selected_width, 2.4);
+        assert_eq!(global.stroke_alpha, 205);
+        assert_eq!(global.stroke_alpha_selected, 245);
+        assert_eq!(global.fill_alpha, 24);
+        // Fill defaults to the stroke color until overridden.
+        assert_eq!(style.fill_color, style.stroke_color);
+        assert_eq!(style.fill_alpha, None);
+    }
+
+    /// Palette persistence: saved family bindings restore on boot; a
+    /// missing table name (deleted .pal) falls back to the default and is
+    /// reported instead of breaking the slot.
+    #[test]
+    fn palette_binding_restore_falls_back_on_missing_table() {
+        let mut set = ColorTableSet::default();
+        let default_ref_name = set
+            .for_family(ColorTableFamily::Reflectivity)
+            .name()
+            .to_owned();
+        let mut bindings = BTreeMap::new();
+        bindings.insert(
+            ColorTableFamily::Velocity.label().to_owned(),
+            "Balance VEL (CVD-safe)".to_owned(),
+        );
+        bindings.insert(
+            ColorTableFamily::Reflectivity.label().to_owned(),
+            "Deleted Table".to_owned(),
+        );
+        let misses = restore_palette_bindings(&mut set, &bindings, &[]);
+        assert_eq!(
+            set.for_family(ColorTableFamily::Velocity).name(),
+            "Balance VEL (CVD-safe)"
+        );
+        assert_eq!(
+            set.for_family(ColorTableFamily::Reflectivity).name(),
+            default_ref_name,
+            "missing binding must leave the default in place"
+        );
+        assert_eq!(misses.len(), 1);
+        assert!(misses[0].contains("Deleted Table"), "{}", misses[0]);
+    }
+
+    /// User tables resolve by name even when their Product: header put
+    /// them in another family (community files often mislabel it).
+    #[test]
+    fn palette_binding_resolves_user_tables_across_families() {
+        let user_table = ColorTable::parse_gr_pal(
+            "My Custom REF",
+            "Product: BOGUS\nColor: 0 10 20 30\nColor: 50 200 210 220\n",
+        )
+        .expect("user table parses");
+        let user_tables = vec![(ColorTableFamily::Generic, user_table)];
+        let resolved = resolve_palette_binding(
+            ColorTableFamily::Reflectivity,
+            "My Custom REF",
+            &user_tables,
+        )
+        .expect("user table resolves for another family");
+        assert_eq!(resolved.name(), "My Custom REF");
+        // And with no family hint at all (per-product bindings).
+        assert!(resolve_table_by_name("My Custom REF", &user_tables).is_some());
+        assert!(resolve_table_by_name("Nope", &user_tables).is_none());
+    }
+
+    /// Per-product overrides reach the render set's color table signature
+    /// (so render keys + the colorbar follow) without touching sibling
+    /// products of the same family.
+    #[test]
+    fn per_product_palette_override_changes_render_signature() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let srv = DisplayProduct::StormRelativeVelocity;
+        let vel = DisplayProduct::Moment(MomentType::Velocity);
+        assert_eq!(srv.color_family(), vel.color_family(), "same family");
+        let base = app
+            .render_color_tables_for_product(&srv)
+            .signature_for_family(srv.color_family());
+        app.palette_product_overrides.insert(
+            srv.label().to_owned(),
+            color_tables::balance_velocity_table(),
+        );
+        let with_override = app
+            .render_color_tables_for_product(&srv)
+            .signature_for_family(srv.color_family());
+        assert_ne!(base, with_override, "override must change the signature");
+        let vel_signature = app
+            .render_color_tables_for_product(&vel)
+            .signature_for_family(vel.color_family());
+        assert_eq!(
+            vel_signature, base,
+            "sibling product keeps the family table"
+        );
+    }
+
+    /// resolve_product_palette_overrides: hits resolve, misses report.
+    #[test]
+    fn product_palette_overrides_resolve_and_report_misses() {
+        let mut bindings = BTreeMap::new();
+        bindings.insert("SRV".to_owned(), "Balance VEL (CVD-safe)".to_owned());
+        bindings.insert("REF".to_owned(), "Gone Table".to_owned());
+        let (overrides, misses) = resolve_product_palette_overrides(&bindings, &[]);
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides["SRV"].name(), "Balance VEL (CVD-safe)");
+        assert_eq!(misses.len(), 1);
+        assert!(misses[0].contains("Gone Table"));
     }
 
     #[test]
@@ -21388,10 +22593,11 @@ mod tests {
     #[test]
     fn freshness_ring_color_tracks_scan_age() {
         let now = Utc.with_ymd_and_hms(2026, 6, 7, 23, 0, 0).unwrap();
+        let style = styles::RadarAgeStyle::default();
 
-        let fresh = freshness_ring_color(now - chrono::Duration::minutes(2), now, 210);
-        let yellow = freshness_ring_color(now - chrono::Duration::minutes(10), now, 210);
-        let red = freshness_ring_color(now - chrono::Duration::minutes(15), now, 210);
+        let fresh = freshness_ring_color(now - chrono::Duration::minutes(2), now, 210, &style);
+        let yellow = freshness_ring_color(now - chrono::Duration::minutes(10), now, 210, &style);
+        let red = freshness_ring_color(now - chrono::Duration::minutes(15), now, 210, &style);
 
         assert_eq!(
             fresh,
@@ -21407,10 +22613,225 @@ mod tests {
     #[test]
     fn freshness_ring_color_preserves_overlay_alpha() {
         let now = Utc.with_ymd_and_hms(2026, 6, 7, 23, 0, 0).unwrap();
-        let color = freshness_ring_color(now - chrono::Duration::minutes(20), now, 123);
+        let style = styles::RadarAgeStyle::default();
+        let color = freshness_ring_color(now - chrono::Duration::minutes(20), now, 123, &style);
 
         assert_eq!(color.a(), 123);
         assert!(color.r() > color.g());
+    }
+
+    #[test]
+    fn freshness_ring_color_honors_custom_style() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 23, 0, 0).unwrap();
+        // Custom thresholds shift the boundaries; custom colors come through.
+        let style = styles::RadarAgeStyle {
+            green_seconds: 60,
+            yellow_seconds: 120,
+            red_seconds: 180,
+            fresh_color: [0, 0, 255, 255],
+            aging_color: [10, 20, 30, 255],
+            stale_color: [40, 50, 60, 255],
+            ..styles::RadarAgeStyle::default()
+        };
+        assert_eq!(
+            freshness_ring_color(now - chrono::Duration::seconds(30), now, 200, &style),
+            egui::Color32::from_rgba_unmultiplied(0, 0, 255, 200)
+        );
+        assert_eq!(
+            freshness_ring_color(now - chrono::Duration::seconds(120), now, 200, &style),
+            egui::Color32::from_rgba_unmultiplied(10, 20, 30, 200)
+        );
+        assert_eq!(
+            freshness_ring_color(now - chrono::Duration::seconds(180), now, 200, &style),
+            egui::Color32::from_rgba_unmultiplied(40, 50, 60, 200)
+        );
+        // With default 6-min green, 30 s would still be solid green — the
+        // custom 60 s threshold is what moved the boundary.
+        assert_eq!(
+            freshness_ring_color(
+                now - chrono::Duration::seconds(90),
+                now,
+                200,
+                &styles::RadarAgeStyle::default()
+            ),
+            egui::Color32::from_rgba_unmultiplied(65, 238, 104, 200)
+        );
+    }
+
+    /// Golden parity: the GLM ramp through the style registry is
+    /// bit-identical to the legacy hard-coded `flash_color`.
+    #[test]
+    fn glm_flash_color_pins_legacy_ramp() {
+        let style = styles::GlmStyle::default();
+        assert_eq!(
+            glm_layer::flash_color(0.0, &style),
+            egui::Color32::from_rgba_unmultiplied(255, 235, 120, 235)
+        );
+        assert_eq!(
+            glm_layer::flash_color(1.0, &style),
+            egui::Color32::from_rgba_unmultiplied(255, 75, 10, 85)
+        );
+        // Mid-ramp matches the legacy formula (truncating casts).
+        for age in [0.1_f32, 0.25, 0.5, 0.75, 0.9] {
+            let legacy = egui::Color32::from_rgba_unmultiplied(
+                255,
+                (235.0 - 160.0 * age) as u8,
+                (120.0 - 110.0 * age) as u8,
+                (235.0 - 150.0 * age) as u8,
+            );
+            assert_eq!(glm_layer::flash_color(age, &style), legacy, "age {age}");
+        }
+    }
+
+    /// Golden parity: default SPC outlook styling (fill 36, stroke 230,
+    /// width 2.0, published colors) and report markers (tornado red 5 px
+    /// w/ black outline, wind blue 3.5, hail green 3.5, no outline).
+    #[test]
+    fn default_styles_pin_spc_constants() {
+        let registry = styles::StyleRegistry::default();
+        let spc = registry.spc();
+        assert_eq!(spc.outlook_fill_alpha, 36);
+        assert_eq!(spc.outlook_stroke_alpha, 230);
+        assert_eq!(spc.outlook_stroke_width, 2.0);
+        assert!(spc.use_spc_published_colors);
+
+        let tornado = registry.report_marker(spc_layers::ReportKind::Tornado.style_key());
+        assert_eq!(
+            style_color32(tornado.color),
+            egui::Color32::from_rgb(235, 60, 60)
+        );
+        assert_eq!(tornado.size_px, 5.0);
+        assert_eq!(tornado.outline_width, 1.0);
+        let wind = registry.report_marker(spc_layers::ReportKind::Wind.style_key());
+        assert_eq!(
+            style_color32(wind.color),
+            egui::Color32::from_rgb(90, 140, 245)
+        );
+        assert_eq!(wind.size_px, 3.5);
+        assert_eq!(wind.outline_width, 0.0);
+        let hail = registry.report_marker(spc_layers::ReportKind::Hail.style_key());
+        assert_eq!(
+            style_color32(hail.color),
+            egui::Color32::from_rgb(80, 200, 100)
+        );
+        assert_eq!(hail.size_px, 3.5);
+        assert_eq!(hail.outline_width, 0.0);
+    }
+
+    /// Golden parity: obs plot, range ring, site marker, label, placefile
+    /// and drape defaults all pin the legacy hard-coded constants.
+    #[test]
+    fn default_styles_pin_obs_ring_label_constants() {
+        let registry = styles::StyleRegistry::default();
+        let obs = registry.obs();
+        assert_eq!(
+            style_color32(obs.metar_dot),
+            egui::Color32::from_rgb(210, 214, 220)
+        );
+        assert_eq!(
+            style_color32(obs.mesonet_dot),
+            egui::Color32::from_rgb(214, 176, 96)
+        );
+        assert_eq!(
+            style_color32(obs.temp_color),
+            egui::Color32::from_rgb(255, 120, 110)
+        );
+        assert_eq!(
+            style_color32(obs.dewpoint_color),
+            egui::Color32::from_rgb(120, 235, 130)
+        );
+        assert_eq!(
+            style_color32(obs.gust_color),
+            egui::Color32::from_rgb(255, 196, 110)
+        );
+        assert_eq!(
+            style_color32(obs.station_id_color),
+            egui::Color32::from_rgba_unmultiplied(190, 196, 204, 180)
+        );
+        assert_eq!(
+            style_color32(obs.barb_color),
+            egui::Color32::from_rgb(205, 212, 222)
+        );
+        assert_eq!(obs.barb_width, 1.2);
+        assert_eq!(obs.value_font_px, 11.0);
+        assert_eq!(obs.small_font_px, 9.0);
+        assert_eq!(obs.declutter_cell_px, 88.0);
+
+        let rings = registry.range_rings();
+        assert_eq!(rings.primary_width, 1.8);
+        assert_eq!(rings.overlay_width, 1.5);
+        assert_eq!(rings.color_mode, styles::RingColorMode::Age);
+        assert_eq!(
+            style_color32(rings.site_selected_color),
+            egui::Color32::from_rgb(88, 210, 245)
+        );
+        assert_eq!(
+            style_color32(rings.site_idle_color),
+            egui::Color32::from_rgb(106, 132, 154)
+        );
+
+        let labels = registry.labels();
+        assert_eq!(labels.town_font_scale, 1.0);
+        assert_eq!(
+            style_color32(labels.warning_halo_color),
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 210)
+        );
+        let global = registry.hazard_global();
+        assert_eq!(global.label_font_px, 11.0);
+        assert_eq!(global.label_font_selected_px, 12.0);
+
+        let placefiles = registry.placefiles();
+        assert_eq!(placefiles.line_width_scale, 1.0);
+        assert_eq!(placefiles.icon_scale, 1.0);
+        assert_eq!(placefiles.text_size_scale, 1.0);
+        assert!(placefiles.default_show_text);
+
+        let drapes = registry.drapes();
+        assert_eq!(drapes.radar_opacity, 1.0);
+        assert_eq!(drapes.goes_opacity, 0.85);
+        assert_eq!(drapes.model_opacity, 0.65);
+        assert_eq!(drapes.min_overlay_alpha, 48);
+
+        let age = registry.radar_age();
+        assert_eq!(
+            (age.green_seconds, age.yellow_seconds, age.red_seconds),
+            (360, 600, 900)
+        );
+        assert!(age.ring_enabled);
+    }
+
+    /// Dashed hazard outlines emit multiple segment shapes where the solid
+    /// default emits one closed line / convex polygon.
+    #[test]
+    fn dashed_hazard_outline_changes_shape_count() {
+        let mut app = test_viewer_app_with_hazards(vec![test_hazard_record(
+            "TOR-1",
+            "TOR 1",
+            "tornado",
+            square_hazard_points(-0.5, -0.5, 0.5, 0.5),
+        )]);
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let solid = app.build_hazard_overlay_shapes(rect, &product);
+        assert_eq!(solid.shapes.len(), 1, "solid convex = one polygon shape");
+
+        app.style_settings.hazards.insert(
+            "tornado".to_owned(),
+            styles::PolygonStyleOverride {
+                dash: Some(styles::DashPattern::Dashed {
+                    dash: 6.0,
+                    gap: 4.0,
+                }),
+                ..Default::default()
+            },
+        );
+        app.style_registry = styles::StyleRegistry::from_settings(&app.style_settings);
+        let dashed = app.build_hazard_overlay_shapes(rect, &product);
+        assert!(
+            dashed.shapes.len() > solid.shapes.len() + 1,
+            "dashed outline must emit fill + many dash segments, got {}",
+            dashed.shapes.len()
+        );
     }
 
     #[test]
@@ -22367,6 +23788,9 @@ mod tests {
             history_playing: false,
             last_history_step: None,
             color_tables: ColorTableSet::default(),
+            user_color_tables: Vec::new(),
+            palette_product_overrides: BTreeMap::new(),
+            bind_palette_to_product: false,
             flip_velocity_color_polarity: false,
             unfold_velocity_display: true,
             color_table_target: ColorTableFamily::Velocity,
@@ -22416,6 +23840,7 @@ mod tests {
             rotation_markers_volume_ptr: 0,
             rotation_receiver: None,
             show_rotation_markers: true,
+            tor_tracks: tor_tracks::TorTracksState::default(),
             gate_filter_dbz: None,
             dealias_cascade: false,
             display_smoothing: false,
@@ -22444,6 +23869,8 @@ mod tests {
             show_satellite: false,
             show_guide: false,
             chrome_hidden: false,
+            pending_local_autoplay: false,
+            workspace: dock::Workspace::default(),
             model_dock: None,
             model_dock_open: false,
             sat_layer: None,
@@ -22539,7 +23966,9 @@ mod tests {
             hazard_status: String::new(),
             hazards_visible: true,
             hazards_active_only: true,
-            hazard_fill_alpha: DEFAULT_HAZARD_FILL_ALPHA,
+            style_settings: styles::StyleSettings::default(),
+            style_registry: styles::StyleRegistry::default(),
+            styles_newer_schema: false,
             hidden_hazard_families: default_hidden_hazard_families(),
             realtime_level2_auto_refresh: false,
             display_live_chunk_updates: false,

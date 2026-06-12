@@ -5,7 +5,9 @@
 //! we draw exactly the colors SPC publishes. Polygons render as stroked
 //! outlines with a translucent fill pass on the closed ring (outlook
 //! rings are large; outline-first matches how radar workstations draw
-//! them). Reports are the live filtered CSVs (the same parser family the
+//! them). Features store the BASE colors; fill/stroke alphas come from
+//! the style registry at draw time so style edits never refetch.
+//! Reports are the live filtered CSVs (the same parser family the
 //! archive's tornado events use), drawn as age-aware markers.
 
 use eframe::egui;
@@ -22,6 +24,8 @@ pub struct OutlookFeature {
     pub label: String,
     #[allow(dead_code)] // long name for the hover card
     pub label2: String,
+    /// Base colors as SPC publishes them (opaque); draw code applies the
+    /// style registry's outlook alphas.
     pub fill: egui::Color32,
     pub stroke: egui::Color32,
     /// Outer rings, (lon, lat).
@@ -55,22 +59,74 @@ pub enum ReportKind {
 }
 
 impl ReportKind {
-    pub fn color(self) -> egui::Color32 {
+    /// Style-registry key ("tornado" | "wind" | "hail").
+    pub fn style_key(self) -> &'static str {
         match self {
-            ReportKind::Tornado => egui::Color32::from_rgb(235, 60, 60),
-            ReportKind::Wind => egui::Color32::from_rgb(90, 140, 245),
-            ReportKind::Hail => egui::Color32::from_rgb(80, 200, 100),
+            ReportKind::Tornado => "tornado",
+            ReportKind::Wind => "wind",
+            ReportKind::Hail => "hail",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ReportKind::Tornado => "TORNADO",
+            ReportKind::Wind => "WIND",
+            ReportKind::Hail => "HAIL",
         }
     }
 }
 
-fn hex_color(value: &str, alpha: u8) -> egui::Color32 {
+impl StormReport {
+    /// Display magnitude per the SPC filtered-CSV conventions
+    /// (spc.noaa.gov/climo/reports): wind speed in mph, hail size in
+    /// hundredths of an inch, tornado F_Scale as given ("EF2"). None for
+    /// UNK/empty.
+    pub fn magnitude_label(&self) -> Option<String> {
+        let m = self.magnitude.trim();
+        if m.is_empty() || m.eq_ignore_ascii_case("UNK") {
+            return None;
+        }
+        Some(match self.kind {
+            ReportKind::Wind => format!("{m} mph"),
+            ReportKind::Hail => m
+                .parse::<f32>()
+                .map(|h| format!("{:.2}\"", h / 100.0))
+                .unwrap_or_else(|_| m.to_owned()),
+            ReportKind::Tornado => m.to_owned(),
+        })
+    }
+
+    /// Hover-card text: kind + magnitude + time, location, remark.
+    pub fn hover_text(&self) -> String {
+        let mut head = self.kind.label().to_owned();
+        if let Some(mag) = self.magnitude_label() {
+            head.push_str(&format!(" {mag}"));
+        }
+        head.push_str(&format!(" · {}Z", self.time_hhmm));
+        let mut out = format!("{head}\n{}", self.location);
+        if !self.remark.is_empty() {
+            let remark: String = self.remark.chars().take(160).collect();
+            out.push_str(&format!(
+                "\n{remark}{}",
+                if self.remark.chars().count() > 160 {
+                    "…"
+                } else {
+                    ""
+                }
+            ));
+        }
+        out
+    }
+}
+
+fn hex_color(value: &str) -> egui::Color32 {
     let v = value.trim_start_matches('#');
     if v.len() != 6 {
-        return egui::Color32::from_rgba_unmultiplied(128, 128, 128, alpha);
+        return egui::Color32::from_rgb(128, 128, 128);
     }
     let p = |i: usize| u8::from_str_radix(&v[i..i + 2], 16).unwrap_or(128);
-    egui::Color32::from_rgba_unmultiplied(p(0), p(2), p(4), alpha)
+    egui::Color32::from_rgb(p(0), p(2), p(4))
 }
 
 /// Parse one SPC outlook GeoJSON (Polygon/MultiPolygon features with
@@ -89,8 +145,8 @@ pub fn parse_outlook(text: &str) -> Vec<OutlookFeature> {
         let props = &feature["properties"];
         let label = props["LABEL"].as_str().unwrap_or("").to_owned();
         let label2 = props["LABEL2"].as_str().unwrap_or("").to_owned();
-        let fill = hex_color(props["fill"].as_str().unwrap_or(""), 36);
-        let stroke = hex_color(props["stroke"].as_str().unwrap_or(""), 230);
+        let fill = hex_color(props["fill"].as_str().unwrap_or(""));
+        let stroke = hex_color(props["stroke"].as_str().unwrap_or(""));
         let geom = &feature["geometry"];
         let mut rings: Vec<Vec<(f32, f32)>> = Vec::new();
         let parse_ring = |ring: &serde_json::Value| -> Vec<(f32, f32)> {
@@ -226,6 +282,9 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].label, "SLGT");
         assert_eq!(parsed[0].rings[0].len(), 4);
+        // Base colors, fully opaque — alphas are a draw-time style concern.
+        assert_eq!(parsed[0].fill, egui::Color32::from_rgb(0xFF, 0xE0, 0x66));
+        assert_eq!(parsed[0].stroke, egui::Color32::from_rgb(0xDD, 0xAA, 0x00));
     }
 
     #[test]

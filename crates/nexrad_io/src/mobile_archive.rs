@@ -92,6 +92,72 @@ pub fn decode_mobile_archive_from_path(path: &Path) -> Result<Vec<MobileVolume>>
     decode_members(path, members)
 }
 
+/// Decode every radar volume under a deployment FOLDER (recursive, a few
+/// levels). Research data ships as directories of per-sweep DORADE files
+/// — one file per tilt — so the folder, not the file, is the natural
+/// open unit (field report). Same sniffing and volume grouping as zips.
+pub fn decode_mobile_dir_from_path(dir: &Path) -> Result<Vec<MobileVolume>> {
+    let mut members = Vec::new();
+    collect_dir_members(dir, dir, &mut members, 0)?;
+    if members.is_empty() {
+        return Err(NexradError::InvalidMessage {
+            offset: 0,
+            reason: format!(
+                "folder {} contains no radar files (swp.* sweepfiles or .msg31/AR2V)",
+                dir.display()
+            ),
+        });
+    }
+    members.sort_by(|left, right| left.name.cmp(&right.name));
+    decode_members(dir, members)
+}
+
+/// Deployment trees are shallow (day/instrument levels); the cap only
+/// guards against scanning an accidentally-chosen huge root.
+const MAX_DIR_DEPTH: usize = 4;
+
+fn collect_dir_members(
+    root: &Path,
+    dir: &Path,
+    members: &mut Vec<RadarMember>,
+    depth: usize,
+) -> Result<()> {
+    if depth > MAX_DIR_DEPTH {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(dir).map_err(|source| NexradError::Io {
+        path: dir.display().to_string(),
+        source,
+    })?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_dir_members(root, &path, members, depth + 1)?;
+            continue;
+        }
+        let name = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !plausible_radar_member_name(&name) {
+            continue;
+        }
+        let bytes = std::fs::read(&path).map_err(|source| NexradError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if looks_like_dorade_bytes(&bytes)
+            || bytes.starts_with(VOLUME_HEADER_MAGIC)
+            || bytes.starts_with(&[0x1f, 0x8b])
+            || bytes.starts_with(b"BZh")
+        {
+            members.push(RadarMember { name, bytes });
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct RadarMember {
     name: String,

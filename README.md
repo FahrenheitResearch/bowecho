@@ -139,6 +139,13 @@ BowEcho is an enthusiast/analyst tool, **not a warning service**. Never use it
 as a substitute for official National Weather Service warnings and guidance.
 During severe weather, follow your local NWS office and emergency management.
 
+## Credits
+
+- Annotation graphics vocabulary contributed by GBW Overlay —
+  grayskieswx (YouTube). The map annotation tools' front glyphs, hatch
+  fills, warning-polygon styling, and icon designs reimplement his
+  renderer's geometry in Rust, shared by the author for this purpose.
+
 ## License
 
 Dual-licensed under MIT or Apache-2.0, at your option.

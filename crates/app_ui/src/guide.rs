@@ -726,6 +726,34 @@ fn tools(ui: &mut egui::Ui) {
     );
     action(
         ui,
+        "Rotation tracks",
+        "— per-pixel MAXIMUM low-level (0\u{2013}2 km) cyclonic azimuthal shear accumulated \
+         across the loaded loop: the swath a translating mesocyclone paints. Transparent \
+         below 0.003 s\u{207b}\u{00b9}, magenta at 0.02 s\u{207b}\u{00b9}; scrubbing shows \
+         the accumulation up to the viewed frame; Reset restarts at the newest frame.",
+    );
+    cite(
+        ui,
+        "Mahalik et al. 2019, Wea. Forecasting 34, 1423\u{2013}1447 (LLSD azimuthal shear); \
+         Miller et al. 2013, 28th Conf. IIPS (rotation tracks); Smith et al. 2016, BAMS 97, \
+         1617\u{2013}1630 (MRMS).",
+    );
+    action(
+        ui,
+        "TDS flag",
+        "— tornado debris signature, a deterministic dual-pol physics flag (never a \
+         probability): \u{03c1}hv < 0.82 inside > 30 dBZ echo within 5 km of a rank \u{2265} 3 \
+         circulation at the lowest tilt. White/magenta gates at the viewed frame; the magenta \
+         trail is the debris track across the loop.",
+    );
+    cite(
+        ui,
+        "Ryzhkov et al. 2005, J. Appl. Meteor. 44, 557\u{2013}570; Van Den Broeke & Jauernic \
+         2014, J. Appl. Meteor. Climatol. 53, 2217\u{2013}2231; Snyder & Ryzhkov 2015, \
+         J. Appl. Meteor. Climatol. 54, 1861\u{2013}1870.",
+    );
+    action(
+        ui,
         "Storm tracks",
         "— SCIT-style cell identification and tracking with a least-squares motion fit; dots \
          extrapolate +15/+30/+45 min. SRV\u{2190}tracks feeds the fitted motion into the \

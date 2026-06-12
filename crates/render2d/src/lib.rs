@@ -16,6 +16,7 @@ mod rhi;
 mod shear;
 mod smooth;
 mod tracking;
+pub mod tracks;
 mod volumetric;
 pub mod wind;
 pub use cascade::{dealias_velocity_grid_cascade, fit_range_band_reference};

@@ -21,8 +21,6 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Trailing window drawn at each frame, minutes.
-pub const DISPLAY_WINDOW_MIN: i64 = 10;
 /// Rolling store window (the follow engine prunes beyond this).
 const STORE_WINDOW: Duration = Duration::from_secs(3 * 3600);
 
@@ -102,10 +100,15 @@ impl GlmWorker {
         }
     }
 
-    /// Flashes valid for a frame at `frame_ms`: trailing display window,
+    /// Flashes valid for a frame at `frame_ms`: trailing display window
+    /// (`window_min` minutes, the style registry's `glm.window_minutes`),
     /// QC-filtered. Age returned as 0..1 (0 = newest).
-    pub fn frame_flashes(&self, frame_ms: i64) -> impl Iterator<Item = (&rw_glm::Flash, f32)> {
-        let window_ms = DISPLAY_WINDOW_MIN * 60_000;
+    pub fn frame_flashes(
+        &self,
+        frame_ms: i64,
+        window_min: i64,
+    ) -> impl Iterator<Item = (&rw_glm::Flash, f32)> {
+        let window_ms = window_min.max(1) * 60_000;
         self.flashes.iter().filter_map(move |flash| {
             if flash.is_degraded() {
                 return None;
@@ -123,13 +126,17 @@ impl Drop for GlmWorker {
     }
 }
 
-/// Age-faded flash color: fresh = near-white yellow, old = dim red-orange
-/// (the convention every lightning display uses).
-pub fn flash_color(age01: f32) -> egui::Color32 {
+/// Age-faded flash color: a per-channel ramp from the style's fresh color
+/// (default near-white yellow) to its aged color (default dim red-orange —
+/// the convention every lightning display uses). Truncating `as u8` casts
+/// kept bit-identical to the original hard-coded ramp.
+pub fn flash_color(age01: f32, style: &styles::GlmStyle) -> egui::Color32 {
     let a = age01.clamp(0.0, 1.0);
-    let r = 255.0;
-    let g = 235.0 - 160.0 * a;
-    let b = 120.0 - 110.0 * a;
-    let alpha = 235.0 - 150.0 * a;
-    egui::Color32::from_rgba_unmultiplied(r as u8, g as u8, b as u8, alpha as u8)
+    let channel = |fresh: u8, aged: u8| (fresh as f32 + (aged as f32 - fresh as f32) * a) as u8;
+    egui::Color32::from_rgba_unmultiplied(
+        channel(style.fresh_color[0], style.aged_color[0]),
+        channel(style.fresh_color[1], style.aged_color[1]),
+        channel(style.fresh_color[2], style.aged_color[2]),
+        channel(style.fresh_color[3], style.aged_color[3]),
+    )
 }

@@ -24,6 +24,8 @@ version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5351dcebb14b579ccab05f288596b2ae097005be7ee50a7c3d4ca9d0d5a66f6a"
 dependencies = [
+ "enumn",
+ "serde",
  "uuid",
 ]
 
@@ -171,6 +173,7 @@ dependencies = [
  "cfg-if",
  "getrandom 0.3.4",
  "once_cell",
+ "serde",
  "version_check",
  "zerocopy",
 ]
@@ -291,12 +294,13 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app_ui"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "chrono",
  "color_tables",
  "data_source",
  "eframe",
+ "egui_tiles",
  "flate2",
  "image",
  "nexrad_io",
@@ -319,6 +323,7 @@ dependencies = [
  "serde_json",
  "settings",
  "sharprs",
+ "styles",
  "winresource",
 ]
 
@@ -807,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "0.15.1"
+version = "0.16.0"
 
 [[package]]
 name = "calloop"
@@ -1019,7 +1024,7 @@ checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
 
 [[package]]
 name = "color_tables"
-version = "0.15.1"
+version = "0.16.0"
 
 [[package]]
 name = "colorchoice"
@@ -1217,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "data_source"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "chrono",
  "quick-xml",
@@ -1360,6 +1365,7 @@ checksum = "a05fbfa222ffb51989d5ccf33e5f7aebfcf96c5023413856b0c3618a7f79896e"
 dependencies = [
  "bytemuck",
  "emath",
+ "serde",
 ]
 
 [[package]]
@@ -1436,6 +1442,7 @@ dependencies = [
  "log",
  "nohash-hasher",
  "profiling",
+ "serde",
  "smallvec",
  "unicode-segmentation",
 ]
@@ -1500,6 +1507,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui_tiles"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08e570b77f6cce3292eba4aee9b9c08cf11dfc68430f4dc9613d939628498647"
+dependencies = [
+ "ahash",
+ "egui",
+ "itertools",
+ "log",
+ "serde",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1533,6 +1553,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b53f0d33a479321da6b0caa71366c9f67e8a2c149762d90bdc0d16e601ee8ecb"
 dependencies = [
  "bytemuck",
+ "serde",
 ]
 
 [[package]]
@@ -1563,6 +1584,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "enumn"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f9ed6b3789237c8a0c1c505af1c7eb2c560df6186f01b098c3a1064ea532f38"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "epaint"
 version = "0.34.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1579,6 +1611,7 @@ dependencies = [
  "parking_lot",
  "profiling",
  "self_cell",
+ "serde",
  "skrifa",
  "smallvec",
  "vello_cpu",
@@ -1759,6 +1792,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b38ad915f6dadd993ced50848a8291a543bd41ca62bc10740d5e64e2ab4cfd7"
 dependencies = [
  "bytemuck",
+ "serde",
 ]
 
 [[package]]
@@ -2993,7 +3027,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nexrad_io"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "byteorder",
  "bzip2 0.6.1",
@@ -3919,7 +3953,7 @@ dependencies = [
 
 [[package]]
 name = "product_engine"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "radar_core",
 ]
@@ -4052,7 +4086,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radar_core"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "chrono",
  "serde",
@@ -4255,7 +4289,7 @@ dependencies = [
 
 [[package]]
 name = "render2d"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "chrono",
  "color_tables",
@@ -4857,7 +4891,7 @@ dependencies = [
 
 [[package]]
 name = "settings"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4987,6 +5021,9 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "smithay-client-toolkit"
@@ -5126,6 +5163,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
+name = "styles"
+version = "0.16.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "settings",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5259,7 +5305,7 @@ checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
 
 [[package]]
 name = "timeline"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "chrono",
 ]

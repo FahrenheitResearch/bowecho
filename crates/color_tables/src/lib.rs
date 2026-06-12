@@ -81,6 +81,50 @@ impl ColorTableFamily {
             Self::Generic => "Other",
         }
     }
+
+    /// Every family, in picker order.
+    pub const ALL: [ColorTableFamily; 13] = [
+        Self::Reflectivity,
+        Self::Velocity,
+        Self::SpectrumWidth,
+        Self::CorrelationCoefficient,
+        Self::DifferentialReflectivity,
+        Self::EchoTops,
+        Self::Vil,
+        Self::VilDensity,
+        Self::HailSize,
+        Self::AzimuthalShear,
+        Self::DifferentialPhase,
+        Self::SpecificDifferentialPhase,
+        Self::Generic,
+    ];
+
+    /// Inverse of `label()` (persisted palette bindings are keyed on it).
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|family| family.label() == label)
+    }
+}
+
+/// Map a GR-style `Product:` header code to the table family it colors.
+/// Community .pal files use the GRLevelX product codes (BR/BV/SW/CC/ZDR/
+/// PHI/KDP/ET/VIL…); unknown or missing codes land in Generic — and the
+/// picker additionally offers user tables across families, since community
+/// files often omit or mislabel `Product:`.
+pub fn family_for_product_code(code: &str) -> ColorTableFamily {
+    match code.trim().to_ascii_uppercase().as_str() {
+        "BR" | "REF" | "CREF" | "DR" | "SDR" => ColorTableFamily::Reflectivity,
+        "BV" | "VEL" | "SRV" | "SRM" | "V" => ColorTableFamily::Velocity,
+        "SW" => ColorTableFamily::SpectrumWidth,
+        "CC" | "RHO" | "RHOHV" => ColorTableFamily::CorrelationCoefficient,
+        "ZDR" => ColorTableFamily::DifferentialReflectivity,
+        "ET" | "EET" => ColorTableFamily::EchoTops,
+        "VIL" | "DVL" => ColorTableFamily::Vil,
+        "VILD" => ColorTableFamily::VilDensity,
+        "MEHS" | "HAIL" => ColorTableFamily::HailSize,
+        "PHI" | "PHIDP" => ColorTableFamily::DifferentialPhase,
+        "KDP" => ColorTableFamily::SpecificDifferentialPhase,
+        _ => ColorTableFamily::Generic,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2790,5 +2834,52 @@ mod tests {
         ] {
             assert!(!table.interpolates(), "{} should be stepped", table.name());
         }
+    }
+
+    #[test]
+    fn product_codes_map_to_families() {
+        assert_eq!(
+            family_for_product_code("BR"),
+            ColorTableFamily::Reflectivity
+        );
+        assert_eq!(
+            family_for_product_code("br"),
+            ColorTableFamily::Reflectivity
+        );
+        assert_eq!(family_for_product_code(" BV "), ColorTableFamily::Velocity);
+        assert_eq!(family_for_product_code("SRV"), ColorTableFamily::Velocity);
+        assert_eq!(
+            family_for_product_code("SW"),
+            ColorTableFamily::SpectrumWidth
+        );
+        assert_eq!(
+            family_for_product_code("CC"),
+            ColorTableFamily::CorrelationCoefficient
+        );
+        assert_eq!(
+            family_for_product_code("ZDR"),
+            ColorTableFamily::DifferentialReflectivity
+        );
+        assert_eq!(family_for_product_code("ET"), ColorTableFamily::EchoTops);
+        assert_eq!(family_for_product_code("VIL"), ColorTableFamily::Vil);
+        assert_eq!(
+            family_for_product_code("PHI"),
+            ColorTableFamily::DifferentialPhase
+        );
+        assert_eq!(
+            family_for_product_code("KDP"),
+            ColorTableFamily::SpecificDifferentialPhase
+        );
+        // Unknown/missing codes (mislabeled community files) -> Generic.
+        assert_eq!(family_for_product_code("BOGUS"), ColorTableFamily::Generic);
+        assert_eq!(family_for_product_code(""), ColorTableFamily::Generic);
+    }
+
+    #[test]
+    fn family_labels_round_trip() {
+        for family in ColorTableFamily::ALL {
+            assert_eq!(ColorTableFamily::from_label(family.label()), Some(family));
+        }
+        assert_eq!(ColorTableFamily::from_label("nope"), None);
     }
 }

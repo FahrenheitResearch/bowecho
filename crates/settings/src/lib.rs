@@ -23,7 +23,14 @@ pub struct AppSettings {
     /// Number of saved pane-layout slots.
     pub saved_layout_slots: usize,
     /// Selected color table per family label (family.label() -> table name).
+    /// Resolved on startup against built-ins ∪ user tables; a missing name
+    /// (deleted .pal) falls back to the family default.
     pub palette_by_family: BTreeMap<String, String>,
+    /// Per-product overrides (product label -> table name), beating the
+    /// family binding for just that product (e.g. SRV vs VEL — both the
+    /// Velocity family).
+    #[serde(default)]
+    pub palette_by_product: BTreeMap<String, String>,
     /// Multi-pane grid layout pane count from the last session (1, 2 or 4).
     pub grid_pane_count: usize,
     /// Placefile URLs (GRLevelX-style overlays) with per-file enable flags.
@@ -76,6 +83,18 @@ pub struct AppSettings {
     /// restarts (re-located automatically when the scan id changes).
     #[serde(default)]
     pub farm_georefs: Vec<FarmGeorefEntry>,
+    /// Dockable-workspace layout: versioned JSON ({"version", "tree",
+    /// "viewers", "prefer_docked"}) built and parsed by app_ui/src/dock.rs
+    /// — opaque here so settings stays UI-crate-free. None = the default
+    /// map-only layout; parse failures fall back to it (best-effort, like
+    /// everything else in this file).
+    #[serde(default)]
+    pub workspace_layout: Option<serde_json::Value>,
+    /// Data-folder override: where caches and stores live (Level II
+    /// cache, model/sat/GLM stores, tiles, georefs). Empty = platform
+    /// default. Read once at startup; Settings says "restart to apply".
+    #[serde(default)]
+    pub data_dir: String,
 }
 
 /// A persisted FARM drape georeference. Coordinates are stored as scaled
@@ -149,6 +168,7 @@ impl Default for AppSettings {
             polling_interval_seconds: 60,
             saved_layout_slots: 8,
             palette_by_family: BTreeMap::new(),
+            palette_by_product: BTreeMap::new(),
             grid_pane_count: 1,
             placefiles: Vec::new(),
             basemap_style: default_basemap_style(),
@@ -159,6 +179,8 @@ impl Default for AppSettings {
             product_hotkeys: default_product_hotkeys(),
             poll_url: String::new(),
             farm_georefs: Vec::new(),
+            workspace_layout: None,
+            data_dir: String::new(),
         }
     }
 }
@@ -168,8 +190,7 @@ impl AppSettings {
     /// Windows, `$XDG_CONFIG_HOME`/`~/.config/...` on Linux,
     /// `~/Library/Application Support/...` on macOS.
     pub fn config_path() -> Option<PathBuf> {
-        let dir = config_dir()?;
-        Some(dir.join("bowecho").join("config.json"))
+        Some(bowecho_config_dir()?.join("config.json"))
     }
 
     /// Load settings from `config_path()`, falling back to defaults on any
@@ -214,15 +235,56 @@ fn default_bold_labels() -> bool {
     true
 }
 
-/// Directory for the on-disk raster tile cache.
-pub fn tile_cache_dir() -> Option<PathBuf> {
-    config_dir().map(|dir| dir.join("bowecho").join("tiles"))
+/// Platform bowecho config root (`%APPDATA%\bowecho` on Windows, the
+/// XDG/Library equivalents elsewhere). NOT created here — callers that
+/// write under it create what they need. Shared with the `styles` crate
+/// so styles.json/color_tables/ sit beside config.json.
+pub fn bowecho_config_dir() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("bowecho"))
 }
 
-/// Platform-correct bowecho data root (config dir scoped). Created on use.
+/// Directory for the on-disk raster tile cache.
+pub fn tile_cache_dir() -> Option<PathBuf> {
+    if let Some(root) = data_dir_override() {
+        return Some(root.join("tiles"));
+    }
+    bowecho_config_dir().map(|dir| dir.join("tiles"))
+}
+
+/// User-chosen data root override (field report: "not so wealthy in
+/// terms of localappdata storage"). Set ONCE at startup from
+/// `AppSettings.data_dir` / `BOWECHO_DATA_DIR`; changes apply on
+/// restart so live stores never move under their workers. config.json
+/// and styles.json deliberately stay at the default config path — they
+/// are where the override itself is read from.
+static DATA_DIR_OVERRIDE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+pub fn set_data_dir_override(dir: Option<PathBuf>) {
+    let _ = DATA_DIR_OVERRIDE.set(dir);
+}
+
+pub fn data_dir_override() -> Option<PathBuf> {
+    if let Ok(env) = std::env::var("BOWECHO_DATA_DIR")
+        && !env.trim().is_empty()
+    {
+        return Some(PathBuf::from(env));
+    }
+    DATA_DIR_OVERRIDE.get().cloned().flatten()
+}
+
+/// User color tables ("My tables"): `%APPDATA%\bowecho\color_tables\*.pal`.
+/// Imported .pal files are COPIED here so a palette choice survives the
+/// original file moving. Created on use.
+pub fn color_tables_dir() -> PathBuf {
+    bowecho_dir("color_tables")
+}
+
+/// Platform-correct bowecho data root (config dir scoped, or the user's
+/// data-folder override). Created on use.
 fn bowecho_dir(leaf: &str) -> PathBuf {
-    let dir = config_dir()
-        .map(|dir| dir.join("bowecho").join(leaf))
+    let dir = data_dir_override()
+        .map(|root| root.join(leaf))
+        .or_else(|| bowecho_config_dir().map(|dir| dir.join(leaf)))
         .unwrap_or_else(|| PathBuf::from("bowecho-data").join(leaf));
     let _ = std::fs::create_dir_all(&dir);
     dir
@@ -257,8 +319,7 @@ pub fn model_cache_dir() -> PathBuf {
 
 /// Crash log destination (config dir; None when no config dir resolves).
 pub fn panic_log_path() -> Option<PathBuf> {
-    config_dir().map(|dir| {
-        let root = dir.join("bowecho");
+    bowecho_config_dir().map(|root| {
         let _ = std::fs::create_dir_all(&root);
         root.join("panic.log")
     })
@@ -280,6 +341,12 @@ pub fn glm_store_dir() -> PathBuf {
 /// restarts.
 pub fn wofs_georef_dir() -> PathBuf {
     bowecho_dir("wofs-georef")
+}
+
+/// Saved map-annotation sets: named, geo-anchored JSON documents (one file
+/// per set) written by the annotate toolbar's Save/Load.
+pub fn annotations_dir() -> PathBuf {
+    bowecho_dir("annotations")
 }
 
 /// Where screenshots and loop recordings land: a user-visible media folder
@@ -374,9 +441,28 @@ mod tests {
             "Velocity / SRV".to_owned(),
             "Analyst Velocity HD".to_owned(),
         );
+        s.palette_by_product
+            .insert("SRV".to_owned(), "Balance VEL (CVD-safe)".to_owned());
         let back = AppSettings::from_json(&s.to_json());
         assert_eq!(back, s);
         assert_eq!(back.favorites, vec!["KTWX".to_owned()]);
+    }
+
+    #[test]
+    fn workspace_layout_round_trips_as_opaque_json() {
+        let s = AppSettings {
+            workspace_layout: Some(serde_json::json!({
+                "version": 1,
+                "tree": {"root": 0},
+                "viewers": {"Wofs": "docked"},
+                "prefer_docked": ["Wofs"],
+            })),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&s.to_json());
+        assert_eq!(back, s);
+        // Absent → None (older configs).
+        assert_eq!(AppSettings::from_json("{}").workspace_layout, None);
     }
 
     #[test]

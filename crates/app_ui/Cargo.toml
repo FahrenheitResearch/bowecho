@@ -12,11 +12,15 @@ color_tables = { path = "../color_tables" }
 data_source = { path = "../data_source" }
 flate2.workspace = true
 eframe.workspace = true
+# Dockable workspace tile tree (docs/docking-spike.md: egui_tiles 0.15.0
+# verified compatible with egui 0.34; rerun-io maintained, serde layouts).
+egui_tiles = { version = "0.15", features = ["serde"] }
 image = { workspace = true, features = ["gif"] }
 nexrad_io = { path = "../nexrad_io" }
 radar_core = { path = "../radar_core" }
 render2d = { path = "../render2d" }
 settings = { path = "../settings" }
+styles = { path = "../styles" }
 serde.workspace = true
 serde_json.workspace = true
 
