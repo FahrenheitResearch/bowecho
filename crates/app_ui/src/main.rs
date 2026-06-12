@@ -58,7 +58,11 @@ mod wofs_georef;
 
 const MIN_DISPLAYABLE_RADIALS: usize = 180;
 const DEFAULT_MAP_SCALE: f32 = 115.0;
-const MIN_MAP_SCALE: f32 = 2.0;
+/// AEQD cannot represent the far hemisphere cleanly — 7 px/deg still
+/// shows the whole near hemisphere (~1260 px across) but stops short of
+/// the antipode smear that turned the basemap into sheared slabs at the
+/// old floor of 2 (field screenshot, 2026-06-13).
+const MIN_MAP_SCALE: f32 = 7.0;
 const MAX_MAP_SCALE: f32 = 3_200.0;
 const DEFAULT_RADAR_RANGE_KM: f32 = 460.0;
 /// Top of the vertical cross-section (m above the radar) — shared by the
@@ -10201,9 +10205,11 @@ impl ViewerApp {
         if !armed && !annotating && response.dragged() {
             let delta = response.drag_delta();
             if delta.length_sq() >= MAP_DRAG_DEAD_ZONE_PX * MAP_DRAG_DEAD_ZONE_PX {
-                self.map_center_lon -= delta.x / self.lon_pixels_per_degree();
-                self.map_center_lat += delta.y / self.map_scale;
-                self.clamp_map_center();
+                // Pan through the projection's own inverse: linear degree
+                // math is only locally correct under AEQD and drifted at
+                // distance/zoom-out (field QOL report).
+                let (lon, lat) = self.screen_to_lon_lat(rect, rect.center() - delta);
+                self.center_map_on(lat, lon);
             }
         }
 
@@ -10575,9 +10581,9 @@ impl ViewerApp {
             if !armed && response.dragged() {
                 let delta = response.drag_delta();
                 if delta.length_sq() >= MAP_DRAG_DEAD_ZONE_PX * MAP_DRAG_DEAD_ZONE_PX {
-                    self.map_center_lon -= delta.x / self.lon_pixels_per_degree();
-                    self.map_center_lat += delta.y / self.map_scale;
-                    self.clamp_map_center();
+                    // Projection-true pan — see the single-pane handler.
+                    let (lon, lat) = self.screen_to_lon_lat(cell, cell.center() - delta);
+                    self.center_map_on(lat, lon);
                 }
             }
             // Shared zoom, anchored at the cursor inside this cell.
@@ -16738,41 +16744,108 @@ impl ViewerApp {
             }
             return;
         }
+        // Great-circle central angle, for dropping tiles near the AEQD
+        // antipode where the projection smears them across the rim.
+        fn central_angle_deg(lat_a: f32, lon_a: f32, lat_b: f32, lon_b: f32) -> f32 {
+            let (la, lb) = (lat_a.to_radians(), lat_b.to_radians());
+            let dlon = (lon_b - lon_a).to_radians();
+            (la.sin() * lb.sin() + la.cos() * lb.cos() * dlon.cos())
+                .clamp(-1.0, 1.0)
+                .acos()
+                .to_degrees()
+        }
         let mut layer = self.tile_layer.borrow_mut();
         for ty in ty0..=ty1 {
             for tx in tx0..=tx1 {
                 let tile = tiles::TileId { zoom, x: tx, y: ty };
-                // Project the four tile corners through the AEQD transform.
-                let corners_geo = [
-                    tiles::tile_corner_lon_lat(tx as f64, ty as f64, zoom),
-                    tiles::tile_corner_lon_lat((tx + 1) as f64, ty as f64, zoom),
-                    tiles::tile_corner_lon_lat((tx + 1) as f64, (ty + 1) as f64, zoom),
-                    tiles::tile_corner_lon_lat(tx as f64, (ty + 1) as f64, zoom),
-                ];
-                let corners: Vec<egui::Pos2> = corners_geo
+                // Far-hemisphere guard: a tile near the antipode projects
+                // to an enormous smeared ring — the vector basemap keeps
+                // drawing there, raster just bows out (field screenshot:
+                // planet-zoom slabs and giant Antarctica).
+                let (center_lon, center_lat) =
+                    tiles::tile_corner_lon_lat(tx as f64 + 0.5, ty as f64 + 0.5, zoom);
+                if central_angle_deg(
+                    self.map_center_lat,
+                    self.map_center_lon,
+                    center_lat as f32,
+                    center_lon as f32,
+                ) > 140.0
+                {
+                    continue;
+                }
+                // Coarse 4-corner probe sizes the tile on screen and picks
+                // the mesh density: more cells the bigger the tile, so
+                // AEQD curvature bends the texture instead of shearing a
+                // single quad (same trick as the FARM/WoFS 8x8 drapes).
+                let probe: Vec<egui::Pos2> = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
                     .iter()
-                    .map(|(lon, lat)| self.lon_lat_to_screen(rect, *lon as f32, *lat as f32))
+                    .map(|&(fx, fy)| {
+                        let (lon, lat) =
+                            tiles::tile_corner_lon_lat(tx as f64 + fx, ty as f64 + fy, zoom);
+                        self.lon_lat_to_screen(rect, lon as f32, lat as f32)
+                    })
                     .collect();
-                let quad_bounds = egui::Rect::from_points(&corners);
-                if !rect.intersects(quad_bounds) {
+                let span_px = {
+                    let probe_bounds = egui::Rect::from_points(&probe);
+                    probe_bounds.width().max(probe_bounds.height())
+                };
+                let grid: u32 = if span_px > 512.0 {
+                    16
+                } else if span_px > 160.0 {
+                    8
+                } else {
+                    4
+                };
+                let mut vertices = Vec::with_capacity(((grid + 1) * (grid + 1)) as usize);
+                for gy in 0..=grid {
+                    for gx in 0..=grid {
+                        let (fx, fy) = (
+                            f64::from(gx) / f64::from(grid),
+                            f64::from(gy) / f64::from(grid),
+                        );
+                        let (lon, lat) =
+                            tiles::tile_corner_lon_lat(tx as f64 + fx, ty as f64 + fy, zoom);
+                        vertices.push((
+                            self.lon_lat_to_screen(rect, lon as f32, lat as f32),
+                            egui::pos2(fx as f32, fy as f32),
+                        ));
+                    }
+                }
+                if vertices
+                    .iter()
+                    .any(|(pos, _)| !pos.x.is_finite() || !pos.y.is_finite())
+                {
+                    continue; // beyond the projection's validity
+                }
+                // Cull on the FULL mesh bounds — curved edges bow outside
+                // the corner hull, so 4-corner culling drops live tiles.
+                let positions: Vec<egui::Pos2> = vertices.iter().map(|(pos, _)| *pos).collect();
+                if !rect.intersects(egui::Rect::from_points(&positions)) {
                     continue;
                 }
                 if let Some(texture) = layer.texture(style, tile) {
-                    let uvs = [
-                        egui::pos2(0.0, 0.0),
-                        egui::pos2(1.0, 0.0),
-                        egui::pos2(1.0, 1.0),
-                        egui::pos2(0.0, 1.0),
-                    ];
                     let mut mesh = egui::epaint::Mesh::with_texture(texture.id());
-                    for (corner, uv) in corners.iter().zip(uvs.iter()) {
+                    for (pos, uv) in &vertices {
                         mesh.vertices.push(egui::epaint::Vertex {
-                            pos: *corner,
+                            pos: *pos,
                             uv: *uv,
                             color: egui::Color32::WHITE,
                         });
                     }
-                    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                    let stride = grid + 1;
+                    for gy in 0..grid {
+                        for gx in 0..grid {
+                            let i = gy * stride + gx;
+                            mesh.indices.extend_from_slice(&[
+                                i,
+                                i + 1,
+                                i + stride,
+                                i + 1,
+                                i + stride + 1,
+                                i + stride,
+                            ]);
+                        }
+                    }
                     painter.add(egui::Shape::mesh(mesh));
                 } else {
                     layer.request(style, tile);
