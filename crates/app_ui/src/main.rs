@@ -809,6 +809,9 @@ struct ViewerApp {
     /// through the same `install_polled_volume` history path the poll
     /// uses. While set, the regular intl poll tick defers.
     intl_loop_rx: Option<mpsc::Receiver<IntlLoopFrameResult>>,
+    /// Frames landed by the current/last Load Loop stream — drives the
+    /// "this catalog only lists the newest frame" hint on completion.
+    intl_loop_frames: usize,
     /// What the poller follows when `poll_active`: the custom URL
     /// (default) or an international provider/site from data_source's
     /// registry. One poll, two sources — see [`PollSource`].
@@ -2966,6 +2969,7 @@ impl ViewerApp {
             poll_next: None,
             poll_rx: None,
             intl_loop_rx: None,
+            intl_loop_frames: 0,
             spc_data: spc_layers::SpcData::default(),
             spc_kinds_memory: restored_overlays.4.clone(),
             spc_outlooks_enabled: restored_overlays.4,
@@ -7906,7 +7910,13 @@ impl ViewerApp {
                     self.remember_startup_site();
                 }
             }
-            if fixed_action_button(ui, "Load Loop", 82.0).clicked() && self.load_receiver.is_none()
+            if fixed_action_button(ui, "Load Loop", 82.0)
+                .on_hover_text(
+                    "Loop of recent scans. International feeds: Sweden (SMHI) and Finland (FMI) \
+                     list full loops; other countries start at the newest scan and grow live",
+                )
+                .clicked()
+                && self.load_receiver.is_none()
             {
                 if self.intl_poll_owns_primary() {
                     self.start_intl_loop_load(ui.ctx());
@@ -13184,6 +13194,7 @@ impl ViewerApp {
         let count = self.history_frame_limit.max(2);
         let (sender, receiver) = mpsc::channel();
         self.intl_loop_rx = Some(receiver);
+        self.intl_loop_frames = 0;
         self.status = format!("Loading {provider_id}/{site_id} loop…");
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
@@ -13218,6 +13229,7 @@ impl ViewerApp {
             }
         }
         let landed = !frames.is_empty();
+        self.intl_loop_frames += frames.len();
         for (identity, volume) in frames {
             self.poll_last_file = Some(identity.clone());
             self.install_polled_volume(&identity, Arc::new(volume), ctx);
@@ -13226,7 +13238,19 @@ impl ViewerApp {
             self.status = format!("Intl loop: {message}");
         } else if done {
             self.intl_loop_rx = None;
-            self.status = "International loop loaded".to_owned();
+            // One frame back = this provider's catalog only lists the
+            // newest scan — say so instead of leaving a "loop" of one
+            // frame unexplained (full loops: SMHI Sweden, FMI Finland).
+            self.status = if self.intl_loop_frames <= 1 {
+                "This feed lists only its newest scan — the loop grows as new scans arrive \
+                 (full loops: Sweden SMHI, Finland FMI)"
+                    .to_owned()
+            } else {
+                format!(
+                    "International loop loaded ({} frames)",
+                    self.intl_loop_frames
+                )
+            };
         } else if landed && let Some(name) = &self.poll_last_file {
             self.status = format!("Intl loop: {name}");
         }
@@ -13328,6 +13352,22 @@ impl ViewerApp {
     /// Start (or resume) the shared poller on an international feed. Same
     /// ownership contract as the custom-URL Start.
     pub(crate) fn start_intl_poll(&mut self, provider_id: String, site_id: String) {
+        // Cross-site switch: a history loop must never mix radars (field
+        // report: Load Loop "switched between the 4 radars" after browsing
+        // several intl sites) — any change of site, or arriving from a
+        // non-intl source, starts a fresh frame history, exactly like a
+        // cross-site US load. An in-flight loop stream belongs to the old
+        // site and is dropped with it.
+        let same_site = self.poll_active
+            && matches!(
+                &self.poll_source,
+                PollSource::Intl { provider_id: p, site_id: s }
+                    if *p == provider_id && *s == site_id
+            );
+        if !same_site {
+            self.clear_frame_history();
+            self.intl_loop_rx = None;
+        }
         self.poll_source = PollSource::Intl {
             provider_id,
             site_id,
@@ -26713,6 +26753,7 @@ mod tests {
             poll_next: None,
             poll_rx: None,
             intl_loop_rx: None,
+            intl_loop_frames: 0,
             poll_source: PollSource::CustomUrl(String::new()),
             intl_picker_provider: String::new(),
             intl_sites: None,
