@@ -585,6 +585,26 @@ pub struct VcpInfo {
     pub pattern: u16,
 }
 
+/// Antenna scanning strategy declared by the data source.
+///
+/// NEXRAD Archive II is always PPI surveillance, but mobile/research formats
+/// (DORADE, CfRadial, ODIM_H5) carry explicit scan modes: RHI sweeps hold a
+/// fixed azimuth and sweep the antenna in elevation, so a plan-view (PPI)
+/// renderer shows them as a single spoke — displays must branch on this.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScanMode {
+    /// Plan-position indicator: fixed elevation, azimuth sweep (includes
+    /// 360° surveillance and sector scans).
+    Ppi,
+    /// Range-height indicator: fixed azimuth, elevation sweep.
+    Rhi,
+    /// Vertically pointing (birdbath calibration / profiling).
+    VerticalPointing,
+    /// Declared by the source but not one of the modes above (coplane,
+    /// manual, idle, calibration, airborne, ...).
+    Other,
+}
+
 /// Provenance and decode statistics.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VolumeMetadata {
@@ -594,6 +614,10 @@ pub struct VolumeMetadata {
     pub message_count: usize,
     pub decoded_radial_count: usize,
     pub skipped_message_count: usize,
+    /// Scan strategy declared by the source format, when it carries one
+    /// (`None` for formats that do not declare it, e.g. Archive II).
+    #[serde(default)]
+    pub scan_mode: Option<ScanMode>,
 }
 
 /// Earth's mean radius (m).

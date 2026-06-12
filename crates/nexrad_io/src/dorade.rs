@@ -51,14 +51,18 @@
 //! - Per-ray platform georeferencing (`ASIB`) is ignored: DOW/COW/RaXPol
 //!   deployments are parked, so the RADD site position applies to the whole
 //!   sweep. Airborne tail radars would need ASIB handling.
-//! - RHI sweeps decode as cuts ordered by their fixed angle; the viewer's
-//!   PPI-oriented model carries per-radial elevations but renders plan view.
+//! - RHI sweeps decode as cuts ordered by their fixed angle (the AZIMUTH for
+//!   an RHI — `ElevationCut::elevation_deg` holds it); the RADD `scan_mode`
+//!   is surfaced as [`radar_core::ScanMode`] in the volume metadata so
+//!   displays can render a range-height panel instead of a plan view.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
-use radar_core::{GateRange, MomentGrid, MomentRow, MomentType, RadarSite, RadarVolume, Radial};
+use radar_core::{
+    GateRange, MomentGrid, MomentRow, MomentType, RadarSite, RadarVolume, Radial, ScanMode,
+};
 
 use crate::{NexradError, Result};
 
@@ -829,6 +833,7 @@ impl SweepParse {
                 }
                 .to_owned(),
             );
+            volume.metadata.scan_mode = Some(scan_mode_from_radd(self.scan_mode));
         } else if volume.site.id != self.instrument {
             return Err(invalid(
                 0,
@@ -958,8 +963,9 @@ fn i32_to_u16_sentinel(bad_data: i32) -> Option<u16> {
 /// (DZ/VE/SW), RaXPol long names (DBZ/VEL/WIDTH/RHOHV), and Radx `_F`
 /// (filtered) / polarization suffixed names (DBZHC_F/VEL_F/ZDR_F/RHOHV_F).
 /// Suffixes are stripped iteratively until a stem matches or no suffix
-/// remains, so `DBZHC_F` → `DBZHC` → `DBZ`.
-fn canonical_moment(name: &str) -> Option<MomentType> {
+/// remains, so `DBZHC_F` → `DBZHC` → `DBZ`. CfRadial field names follow the
+/// same lineage (Radx writes both), so the CfRadial decoder shares this map.
+pub(crate) fn canonical_moment(name: &str) -> Option<MomentType> {
     let normalized = name.trim().to_ascii_uppercase();
     let mut stem = normalized.as_str();
     loop {
@@ -986,6 +992,23 @@ fn match_moment_stem(stem: &str) -> Option<MomentType> {
         "PHIDP" | "PHI" | "PH" | "UPHIDP" => Some(MomentType::DifferentialPhase),
         "KDP" | "KD" => Some(MomentType::SpecificDifferentialPhase),
         _ => None,
+    }
+}
+
+/// Map the DORADE RADD `scan_mode` code onto the shared scan-mode enum.
+///
+/// Code values per the DORADE format document (R. Oye and M. Case, "DORADE
+/// Data Format", NCAR/ATD 1995; revised by W.-C. Lee, NCAR/EOL) and the
+/// authoritative lrose-core `DoradeData.hh` enum: 0 = CAL (calibration),
+/// 1 = PPI (sector), 2 = COP (coplane), 3 = RHI, 4 = VER (vertical
+/// pointing), 5 = TAR (target/stationary), 6 = MAN (manual), 7 = IDL (idle),
+/// 8 = SUR (360° surveillance), 9 = AIR (airborne), 10 = HOR (horizontal).
+fn scan_mode_from_radd(code: i16) -> ScanMode {
+    match code {
+        1 | 8 => ScanMode::Ppi,
+        3 => ScanMode::Rhi,
+        4 => ScanMode::VerticalPointing,
+        _ => ScanMode::Other,
     }
 }
 
@@ -1213,6 +1236,8 @@ mod tests {
 
         let volume = decode_dorade_sweep_volume(&bytes).expect("decode");
         assert_eq!(volume.site.id, "TST1");
+        // RADD scan mode 8 (SUR) maps to the shared PPI mode.
+        assert_eq!(volume.metadata.scan_mode, Some(ScanMode::Ppi));
         assert_eq!(volume.site.latitude_deg, Some(39.74));
         assert_eq!(volume.site.longitude_deg, Some(-103.2927));
         assert!((volume.site.elevation_m.unwrap() - 1519.0).abs() < 0.5);
@@ -1323,6 +1348,43 @@ mod tests {
         second[radd_pos + 8..radd_pos + 12].copy_from_slice(b"TST2");
         let err = decode_dorade_volume_from_slices(&[first, second]).unwrap_err();
         assert!(err.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn rhi_scan_mode_is_detected_from_radd() {
+        // An RHI sweep: RADD scan mode 3, fixed azimuth, elevation-swept rays.
+        let rays: Vec<(f32, f32, i32, &[i16])> = vec![
+            (271.0, 0.5, 0, &[1000, 2000, 1500, 500][..]),
+            (271.0, 1.5, 0, &[1500, 1200, 700, 800][..]),
+            (271.0, 2.5, 0, &[900, 1100, 600, 400][..]),
+        ];
+        let mut bytes = Synth {
+            endian: Endian::Big,
+            compressed: false,
+        }
+        .build(&rays);
+        let radd_pos = find_block(&bytes, b"RADD");
+        put_i16(&mut bytes[radd_pos..], 50, 3, Endian::Big); // RHI per DORADE doc
+        let volume = decode_dorade_sweep_volume(&bytes).expect("decode");
+        assert_eq!(volume.metadata.scan_mode, Some(ScanMode::Rhi));
+        // Per-radial elevations carry the sweep; azimuth is fixed.
+        let cut = &volume.cuts[0];
+        assert_eq!(cut.radials.len(), 3);
+        assert!(cut.radials.iter().all(|r| r.azimuth_deg == 271.0));
+        assert_eq!(cut.radials[0].elevation_deg, 0.5);
+        assert_eq!(cut.radials[2].elevation_deg, 2.5);
+    }
+
+    #[test]
+    fn radd_scan_mode_codes_map_to_shared_enum() {
+        // Codes per Oye & Case 1995 / lrose DoradeData.hh.
+        assert_eq!(scan_mode_from_radd(1), ScanMode::Ppi); // PPI sector
+        assert_eq!(scan_mode_from_radd(8), ScanMode::Ppi); // SUR
+        assert_eq!(scan_mode_from_radd(3), ScanMode::Rhi);
+        assert_eq!(scan_mode_from_radd(4), ScanMode::VerticalPointing);
+        for other in [0i16, 2, 5, 6, 7, 9, 10, 99] {
+            assert_eq!(scan_mode_from_radd(other), ScanMode::Other);
+        }
     }
 
     #[test]

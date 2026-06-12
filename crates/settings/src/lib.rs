@@ -71,6 +71,33 @@ pub struct AppSettings {
     /// once per deployment is fine, once per session is not.
     #[serde(default)]
     pub poll_url: String,
+    /// FARM quicklook map-drape georeferences, one per sensor id —
+    /// auto-located or manually pinned deployment positions survive
+    /// restarts (re-located automatically when the scan id changes).
+    #[serde(default)]
+    pub farm_georefs: Vec<FarmGeorefEntry>,
+}
+
+/// A persisted FARM drape georeference. Coordinates are stored as scaled
+/// integers (microdegrees etc.) so `AppSettings` stays `Eq`-derivable.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FarmGeorefEntry {
+    pub sensor_id: u32,
+    /// Radar deployment latitude/longitude in microdegrees.
+    pub lat_e6: i64,
+    pub lon_e6: i64,
+    /// Quicklook image scale in millipixels per km.
+    pub px_per_km_e3: i64,
+    /// Radar pixel in the quicklook, tenths of a pixel.
+    pub radar_px_x_e1: i64,
+    pub radar_px_y_e1: i64,
+    /// Tick-lattice spacing in meters (the plot's "Nkm ticks").
+    pub tick_m: u32,
+    /// Scan id the fix belongs to (deployment moves get a new id).
+    pub scan_id: String,
+    /// True when the user pinned the position by hand.
+    pub manual: bool,
 }
 
 /// A persisted placefile reference.
@@ -131,6 +158,7 @@ impl Default for AppSettings {
             perf_hud: false,
             product_hotkeys: default_product_hotkeys(),
             poll_url: String::new(),
+            farm_georefs: Vec::new(),
         }
     }
 }
@@ -247,6 +275,42 @@ pub fn glm_store_dir() -> PathBuf {
     bowecho_dir("glm-store")
 }
 
+/// WoFS drape georeference cache: calibration OCRs ~20 sounding PNGs
+/// (8–18 s); the result is per-run and stable, so it persists across
+/// restarts.
+pub fn wofs_georef_dir() -> PathBuf {
+    bowecho_dir("wofs-georef")
+}
+
+/// Where screenshots and loop recordings land: a user-visible media folder
+/// (`~/Pictures/BowEcho`), NOT the config dir — these files exist to be
+/// shared. `BOWECHO_SCREENSHOT_DIR` overrides. Created on demand by callers.
+pub fn screenshots_dir() -> PathBuf {
+    screenshots_dir_from(
+        std::env::var("BOWECHO_SCREENSHOT_DIR").ok(),
+        std::env::var("USERPROFILE").ok(),
+        std::env::var("HOME").ok(),
+    )
+}
+
+fn screenshots_dir_from(
+    override_dir: Option<String>,
+    userprofile: Option<String>,
+    home: Option<String>,
+) -> PathBuf {
+    if let Some(dir) = override_dir
+        && !dir.trim().is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    let base = userprofile
+        .filter(|value| !value.trim().is_empty())
+        .or(home.filter(|value| !value.trim().is_empty()))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("Pictures").join("BowEcho")
+}
+
 fn config_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
@@ -272,6 +336,28 @@ mod tests {
     #[test]
     fn default_has_eight_layout_slots() {
         assert_eq!(AppSettings::default().saved_layout_slots, 8);
+    }
+
+    #[test]
+    fn screenshots_dir_prefers_override_then_pictures() {
+        assert_eq!(
+            screenshots_dir_from(
+                Some("D:\\captures".to_owned()),
+                Some("C:\\Users\\test".to_owned()),
+                None,
+            ),
+            PathBuf::from("D:\\captures")
+        );
+        assert_eq!(
+            screenshots_dir_from(None, Some("C:\\Users\\test".to_owned()), None),
+            PathBuf::from("C:\\Users\\test")
+                .join("Pictures")
+                .join("BowEcho")
+        );
+        assert_eq!(
+            screenshots_dir_from(None, None, Some("/home/test".to_owned())),
+            PathBuf::from("/home/test").join("Pictures").join("BowEcho")
+        );
     }
 
     #[test]

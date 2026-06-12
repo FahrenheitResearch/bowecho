@@ -12,6 +12,7 @@ mod cascade;
 mod cells;
 mod detect;
 mod gate_filter;
+mod rhi;
 mod shear;
 mod smooth;
 mod tracking;
@@ -28,6 +29,10 @@ use radar_core::{
     ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, ProductId, RadarVolume,
 };
 use rayon::prelude::*;
+pub use rhi::{
+    cut_looks_like_rhi, rhi_coverage_range_m, rhi_coverage_top_m, rhi_fixed_azimuth_deg,
+    rhi_section,
+};
 pub use shear::{azimuthal_shear_grid, radial_divergence_grid};
 pub use smooth::smooth_moment_grid;
 use thiserror::Error;

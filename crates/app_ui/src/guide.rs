@@ -757,6 +757,12 @@ fn shortcuts(ui: &mut egui::Ui) {
         "product hotkeys — defaults: 1 REF · 2 VEL · 3 SRV · 4 RHO · 5 ZDR · 6 SW · \
          7 CREF · 8 ET · 9 VIL · 0 VILD",
     );
+    key_row(
+        ui,
+        "F12",
+        "screenshot — full window to the clipboard + a PNG in Pictures/BowEcho",
+    );
+    key_row(ui, "Shift+F12", "screenshot cropped to the map only");
     para(
         ui,
         "Rebind the number row in config.json — Settings \u{25b8} Hotkeys shows the current \
@@ -792,6 +798,13 @@ fn shortcuts(ui: &mut egui::Ui) {
         ui,
         "armed tools",
         "cross-section / Vrot own the clicks: left places points, right clears",
+    );
+    key_row(
+        ui,
+        "Annotate mode",
+        "click drops a crosshair; box/arrow/freehand are drags; Esc exits, \
+         Clear wipes — annotations are geo-anchored and show up in \
+         screenshots and recordings",
     );
 }
 

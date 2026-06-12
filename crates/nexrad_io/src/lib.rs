@@ -4,8 +4,12 @@
 //! keeps unsupported records non-fatal so an app can inspect partially decoded
 //! volumes while the edge-case corpus grows.
 
+pub mod cfradial;
 pub mod dorade;
+pub mod hdf5lite;
 pub mod mobile_archive;
+pub mod netcdf3;
+pub mod odim;
 
 use std::cell::UnsafeCell;
 use std::collections::btree_map::Entry;

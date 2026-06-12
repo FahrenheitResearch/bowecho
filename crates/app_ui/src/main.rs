@@ -23,12 +23,14 @@ use render2d::{
 };
 use serde::Deserialize;
 
+mod annotate;
 mod basemap_data;
 mod basemap_towns;
 mod farm_live;
 mod glm_layer;
 mod guide;
 mod ingest_worker;
+mod media;
 mod mesoanalysis;
 mod model_data;
 mod model_layer;
@@ -36,6 +38,7 @@ mod oa_derived;
 mod obs;
 mod obs_soundings;
 mod placefiles;
+mod rhi;
 mod sat_worker;
 mod skewt_native;
 mod sounding_panels;
@@ -43,6 +46,7 @@ mod spc_layers;
 mod tiles;
 mod vol3d;
 mod wofs;
+mod wofs_georef;
 
 const MIN_DISPLAYABLE_RADIALS: usize = 180;
 const DEFAULT_MAP_SCALE: f32 = 115.0;
@@ -398,6 +402,10 @@ enum LocalRadarKind {
     MobileArchive,
     /// Loose DORADE sweepfile (swp.*).
     DoradeSweep,
+    /// ODIM_H5 polar volume (HDF5 magic).
+    OdimH5,
+    /// CfRadial 1.x classic netCDF (CDF magic).
+    CfRadial,
     /// Anything Archive II-shaped (AR2V, gzip, bzip2, msg31).
     NexradLevel2,
 }
@@ -426,6 +434,12 @@ fn sniff_local_radar_kind(path: &Path) -> LocalRadarKind {
         || (filled < 8 && nexrad_io::dorade::looks_like_dorade_path(path))
     {
         return LocalRadarKind::DoradeSweep;
+    }
+    if nexrad_io::odim::looks_like_hdf5_bytes(head) {
+        return LocalRadarKind::OdimH5;
+    }
+    if nexrad_io::cfradial::looks_like_netcdf3_bytes(head) {
+        return LocalRadarKind::CfRadial;
     }
     // Sniff failed entirely (unreadable file): fall back to names so the
     // error surfaces from the matching decoder.
@@ -478,6 +492,31 @@ fn decode_mobile_radar_batch(
                 timings: timings.finish(total_start),
                 status: FrameStatus::Local,
                 source_label: format!("DORADE {}", path.display()),
+            });
+        }
+        LocalRadarKind::OdimH5 | LocalRadarKind::CfRadial => {
+            let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
+            let (mut volume, format_label) = if kind == LocalRadarKind::OdimH5 {
+                (
+                    nexrad_io::odim::decode_odim_h5_volume(&bytes)
+                        .map_err(|err| err.to_string())?,
+                    "ODIM_H5",
+                )
+            } else {
+                (
+                    nexrad_io::cfradial::decode_cfradial1_volume(&bytes)
+                        .map_err(|err| err.to_string())?,
+                    "CfRadial",
+                )
+            };
+            volume.metadata.source_path = Some(path.display().to_string());
+            timings.decode_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
+            frames.push(DecodedLoad {
+                path: path.to_path_buf(),
+                volume,
+                timings: timings.finish(total_start),
+                status: FrameStatus::Local,
+                source_label: format!("{format_label} {}", path.display()),
             });
         }
         LocalRadarKind::NexradLevel2 => unreachable!("routed to the Level II loader"),
@@ -797,6 +836,8 @@ struct ViewerApp {
     /// Per-volume dealias memo for velocity sections: endpoint drags pay the
     /// all-tilt dealias once per volume instead of every frame.
     cross_section_dealias_cache: VolumeDealiasCache,
+    /// Native RHI range-height panel (mobile-radar elevation sweeps).
+    rhi_panel: rhi::RhiPanel,
     hazard_overlay: Option<HazardOverlay>,
     hazard_path_text: String,
     hazard_status: String,
@@ -825,6 +866,10 @@ struct ViewerApp {
     update_check_rx: Option<mpsc::Receiver<Option<String>>>,
     /// Newer release tag (e.g. "v0.9.0") — shown as a top-bar link.
     update_available: Option<String>,
+    /// Media sharing: screenshot capture + loop recording state.
+    media: media::MediaShare,
+    /// Geo-anchored map annotations (crosshair/box/arrow/freehand).
+    annotations: annotate::AnnotationState,
 }
 
 struct RadarOverlayLayer {
@@ -2506,6 +2551,7 @@ impl ViewerApp {
         }
         let app_settings = settings::AppSettings::load();
         let restored_poll_url = app_settings.poll_url.clone();
+        let restored_farm = farm_live::FarmState::with_saved(&app_settings.farm_georefs);
         let restored_overlays = (
             app_settings.overlay_obs,
             app_settings.overlay_obs_metar,
@@ -2665,7 +2711,7 @@ impl ViewerApp {
             download_profile: 0,
             vol3d: vol3d::Vol3d::default(),
             wofs: wofs::WofsState::default(),
-            farm: farm_live::FarmState::default(),
+            farm: restored_farm,
             poll_url: restored_poll_url,
             poll_active: false,
             poll_last_file: None,
@@ -2732,6 +2778,7 @@ impl ViewerApp {
             cross_section_volume_cuts: 0,
             cross_section_volume_top_deg: 0.0,
             cross_section_dealias_cache: VolumeDealiasCache::new(),
+            rhi_panel: rhi::RhiPanel::new(),
             hazard_overlay: None,
             hazard_path_text,
             hazard_status: "No hazard polygons loaded".to_owned(),
@@ -2754,6 +2801,8 @@ impl ViewerApp {
             dealiased_readout_cache: None,
             update_check_rx: None,
             update_available: None,
+            media: media::MediaShare::default(),
+            annotations: annotate::AnnotationState::default(),
         };
         app.basemap_style = restored_basemap_style;
         app.bold_labels = restored_bold_labels;
@@ -5499,11 +5548,19 @@ impl ViewerApp {
             .and_then(|name| name.to_str())
             .unwrap_or("local L2")
             .to_owned();
+        // Opening a file is explicit intent: take the view from an active
+        // URL poll (same contract as explicit site loads) — otherwise the
+        // next poll tick stomps the opened volume within 15 s.
+        let paused_poll = self.poll_active;
+        self.poll_active = false;
         self.begin_primary_load_telemetry();
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
         self.pending_site_id = Some(label.clone());
         self.status = format!("Loading {label}");
+        if paused_poll {
+            self.status.push_str(" — URL poll paused");
+        }
 
         thread::spawn(move || {
             let total_start = Instant::now();
@@ -5511,9 +5568,10 @@ impl ViewerApp {
             // archives, DORADE sweepfiles) decode into multi-frame batches;
             // everything else takes the Level II path with previews.
             let result = match sniff_local_radar_kind(&path) {
-                kind @ (LocalRadarKind::MobileArchive | LocalRadarKind::DoradeSweep) => {
-                    decode_mobile_radar_batch(&path, kind, total_start)
-                }
+                kind @ (LocalRadarKind::MobileArchive
+                | LocalRadarKind::DoradeSweep
+                | LocalRadarKind::OdimH5
+                | LocalRadarKind::CfRadial) => decode_mobile_radar_batch(&path, kind, total_start),
                 LocalRadarKind::NexradLevel2 => decode_load_path_with_optional_preview(
                     path,
                     &label,
@@ -5903,6 +5961,12 @@ impl ViewerApp {
             self.status = "No site selected".to_owned();
             return;
         };
+        // Browsing the archive is explicit intent — same contract as
+        // explicit site loads: the URL poll must not stomp archive frames.
+        if self.poll_active {
+            self.poll_active = false;
+            self.status = "URL poll paused (archive browse)".to_owned();
+        }
         let Ok(date) =
             chrono::NaiveDate::parse_from_str(self.archive_date_input.trim(), "%Y-%m-%d")
         else {
@@ -6152,8 +6216,11 @@ impl eframe::App for ViewerApp {
         self.poll_async_render(&ctx);
         self.poll_radar_layer_renders(&ctx);
         self.poll_async_hazards(&ctx);
-        self.maybe_refresh_realtime_level2(&ctx);
-        self.maybe_refresh_radar_layers(&ctx);
+        if !self.media.is_recording() {
+            // Frozen while recording so history indices stay deterministic.
+            self.maybe_refresh_realtime_level2(&ctx);
+            self.maybe_refresh_radar_layers(&ctx);
+        }
         self.maybe_refresh_live_hazards(&ctx);
         self.maybe_advance_history_loop(&ctx);
         self.sanitize_selection();
@@ -6209,6 +6276,7 @@ impl eframe::App for ViewerApp {
             ctx.request_repaint();
         }
         self.handle_keyboard_navigation(&ctx);
+        self.handle_media(&ctx);
 
         egui::Panel::top("top_bar")
             .exact_size(42.0)
@@ -6230,6 +6298,27 @@ impl eframe::App for ViewerApp {
                 .default_size(240.0)
                 .size_range(120.0..=520.0)
                 .show_inside(ui, |ui| self.cross_section_panel(ui));
+        }
+
+        // Mobile-radar RHI sweeps (fixed azimuth, elevation sweep) get a
+        // native range-height panel — the plan view above shows only a spoke.
+        if let Some(volume) = self.volume.clone()
+            && rhi::volume_is_rhi(&volume)
+        {
+            let moment = self.selected_product.base_moment();
+            egui::Panel::bottom("rhi_panel")
+                .resizable(true)
+                .default_size(260.0)
+                .size_range(140.0..=520.0)
+                .show_inside(ui, |ui| {
+                    self.rhi_panel.panel(
+                        ui,
+                        &volume,
+                        self.selected_cut,
+                        &moment,
+                        &self.color_tables,
+                    )
+                });
         }
 
         egui::CentralPanel::default().show_inside(ui, |ui| self.map_canvas(ui));
@@ -6276,6 +6365,8 @@ impl ViewerApp {
             if fixed_action_button(ui, "Reload", 62.0).clicked() {
                 self.load_volume(ui.ctx());
             }
+            self.media_top_bar_ui(ui);
+            self.annotate_top_bar_ui(ui);
             if ui
                 .selectable_label(self.show_satellite, "Sat")
                 .on_hover_text("GOES satellite: live follow + frame playback (rw-sat)")
@@ -7223,7 +7314,8 @@ impl ViewerApp {
                     });
                     // FULL SPC-mesoanalysis composites: one heavy pass
                     // (sharprs compute_all_params per cell, OA-corrected
-                    // surface incl winds) caches 14 fields; each is then an
+                    // surface incl winds) caches the 64-field catalog
+                    // suite (docs/spc-catalog.md); each is then an
                     // instant layer.
                     ui.horizontal(|ui| {
                         let busy = self.oa_comp_rx.is_some();
@@ -7245,12 +7337,25 @@ impl ViewerApp {
                             ui.menu_button("Composites ▾", |ui| {
                                 let mut pick: Option<usize> = None;
                                 let _ = &mut pick;
+                                // Grouped like the SPC Mesoscale Analysis
+                                // page sections (docs/spc-catalog.md).
                                 if let Some(fields) = &self.oa_composites {
-                                    for (i, field) in fields.iter().enumerate() {
-                                        if ui.button(field.name).clicked() {
-                                            pick = Some(i);
-                                            ui.close();
+                                    for group in oa_derived::GROUPS {
+                                        if !fields.iter().any(|f| f.group == group) {
+                                            continue;
                                         }
+                                        ui.menu_button(group, |ui| {
+                                            for (i, field) in fields
+                                                .iter()
+                                                .enumerate()
+                                                .filter(|(_, f)| f.group == group)
+                                            {
+                                                if ui.button(field.name).clicked() {
+                                                    pick = Some(i);
+                                                    ui.close();
+                                                }
+                                            }
+                                        });
                                     }
                                 }
                                 if let Some(p) = pick {
@@ -8085,6 +8190,10 @@ impl ViewerApp {
             if selected_limit != self.history_frame_limit {
                 self.set_history_frame_limit(selected_limit, ctx);
             }
+        });
+
+        ui.horizontal(|ui| {
+            self.record_controls_ui(ui);
         });
 
         let mut slider_index = self.selected_frame_index.min(frame_count - 1);
@@ -9027,6 +9136,7 @@ impl ViewerApp {
         let (rect, response) = ui.allocate_exact_size(available, sense);
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(7, 10, 14));
+        self.media.last_map_rect = Some(rect);
 
         // Hard guard: the 1×1 layout runs the original single-pane path
         // verbatim (byte-identical behavior); grids take the per-cell path.
@@ -9048,8 +9158,10 @@ impl ViewerApp {
         // instead of panning / selecting (zoom stays live; endpoints are lon/lat
         // so they don't drift). All four mutating interactions are gated.
         let armed = self.cross_section_armed;
+        // Annotate mode owns the pointer the same way (zoom stays live).
+        let annotating = self.handle_annotation_input(rect, response, ui);
 
-        if !armed && response.dragged() {
+        if !armed && !annotating && response.dragged() {
             let delta = response.drag_delta();
             if delta.length_sq() >= MAP_DRAG_DEAD_ZONE_PX * MAP_DRAG_DEAD_ZONE_PX {
                 self.map_center_lon -= delta.x / self.lon_pixels_per_degree();
@@ -9083,7 +9195,18 @@ impl ViewerApp {
         // Right-click context menu: the lowest-beam radars for this spot
         // (4/3-Earth geometry at the 0.5° base tilt — community idea from
         // wxKobold's lowest-unblocked-beam map). Armed tools own right-click.
-        if !self.cross_section_armed && !self.vrot_tool_armed {
+        if self.farm.drape.place_armed {
+            // FARM manual placement: right-click pins the deployment.
+            if response.secondary_clicked()
+                && let Some(pointer) = response.interact_pointer_pos()
+            {
+                let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
+                let scan = self.farm.current_scan_id();
+                self.farm
+                    .drape
+                    .place_radar(self.farm.sensor_id, lat as f64, lon as f64, scan);
+            }
+        } else if !self.cross_section_armed && !self.vrot_tool_armed {
             if response.secondary_clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
@@ -9097,6 +9220,18 @@ impl ViewerApp {
         self.draw_sat_layer(painter, rect);
         self.draw_spc_outlooks(painter, rect);
         self.draw_model_layers(painter, rect);
+        self.wofs.draw_drape(painter, rect, &|lon, lat| {
+            self.lon_lat_to_screen(rect, lon, lat)
+        });
+        // FARM quicklooks are observed radar — above the WoFS guidance
+        // drape, below the app's own radar layer.
+        self.farm.draw_on_map(
+            painter,
+            rect,
+            self.map_center_lat,
+            self.map_center_lon,
+            self.map_scale,
+        );
         self.draw_graticule(painter, rect);
         let underlay_ms = basemap_start.elapsed().as_secs_f32() * 1000.0;
         self.request_radar_layer_renders(ui.ctx(), rect);
@@ -9113,6 +9248,7 @@ impl ViewerApp {
         self.draw_surface_obs(painter, rect);
         self.draw_vrot_tool(painter, rect);
         self.draw_placefiles(painter, rect);
+        self.draw_map_annotations(painter, rect);
         self.basemap_ms = Some(underlay_ms + overlay_start.elapsed().as_secs_f32() * 1000.0);
 
         let site_points = self
@@ -9130,6 +9266,7 @@ impl ViewerApp {
 
         let shift_held = ui.input(|input| input.modifiers.shift);
         if !armed
+            && !annotating
             && shift_held
             && response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
@@ -9139,6 +9276,7 @@ impl ViewerApp {
         }
 
         if !armed
+            && !annotating
             && !shift_held
             && response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
@@ -9169,6 +9307,7 @@ impl ViewerApp {
         }
 
         if !armed
+            && !annotating
             && !shift_held
             && response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
@@ -9179,7 +9318,9 @@ impl ViewerApp {
 
         // Armed: left-click places endpoint A then B (restart after both set);
         // right-click clears.
-        if armed {
+        if annotating {
+            // Annotations already consumed the pointer above.
+        } else if armed {
             if response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
@@ -11079,11 +11220,13 @@ impl ViewerApp {
         else {
             return;
         };
-        let Some((name, units, values, range)) = self.oa_composites.as_ref().and_then(|fields| {
-            fields
-                .get(index)
-                .map(|f| (f.name, f.units, f.values.clone(), f.range))
-        }) else {
+        let Some((name, units, values, range, slug)) =
+            self.oa_composites.as_ref().and_then(|fields| {
+                fields
+                    .get(index)
+                    .map(|f| (f.name, f.units, f.expand_full(), f.range, f.style_slug))
+            })
+        else {
             return;
         };
         let mut layer_field = (*template).clone();
@@ -11091,7 +11234,16 @@ impl ViewerApp {
         layer_field.units = units.to_owned();
         layer_field.values = values;
         layer_field.range = Some(range);
-        layer_field.style = None;
+        // Operational color scale when a production recipe slug exists
+        // (rustwx-products derived lanes; generic ramp otherwise).
+        layer_field.style = slug.and_then(|slug| {
+            rustwx_products::viewer::operational_style_for_store_variable(
+                slug,
+                &serde_json::json!({ "derived": slug }),
+                units,
+                rustwx_core::ModelId::Hrrr,
+            )
+        });
         self.start_model_layer_build(Arc::new(layer_field), ctx);
         self.status = format!("{name} (OA) layer added");
     }
@@ -11445,6 +11597,12 @@ impl ViewerApp {
                         // route by magic bytes like the file-open path.
                         let volume = if nexrad_io::dorade::looks_like_dorade_bytes(&raw) {
                             nexrad_io::dorade::decode_dorade_sweep_volume(&raw)
+                                .map_err(|e| format!("decode {newest}: {e}"))?
+                        } else if nexrad_io::odim::looks_like_hdf5_bytes(&raw) {
+                            nexrad_io::odim::decode_odim_h5_volume(&raw)
+                                .map_err(|e| format!("decode {newest}: {e}"))?
+                        } else if nexrad_io::cfradial::looks_like_netcdf3_bytes(&raw) {
+                            nexrad_io::cfradial::decode_cfradial1_volume(&raw)
                                 .map_err(|e| format!("decode {newest}: {e}"))?
                         } else {
                             nexrad_io::decode_volume_from_bytes(&raw)
@@ -12374,7 +12532,7 @@ impl ViewerApp {
                     }
                     ui.checkbox(&mut self.wofs.sync_to_radar, "Sync to radar")
                         .on_hover_text(
-                            "Follow the displayed radar frame: the forecast minute tracks init→frame offset (the WoFS image steps as you scrub the loop — map draping is a future upgrade)",
+                            "Follow the displayed radar frame: the forecast minute tracks init→frame offset (the WoFS image steps as you scrub the loop)",
                         );
                     if self.wofs.sync_to_radar {
                         ui.weak(format!(
@@ -12382,6 +12540,7 @@ impl ViewerApp {
                             self.wofs.init, self.wofs.minute
                         ));
                     }
+                    self.wofs.soundings_toggle_ui(ui);
                     if self.wofs.image_rx.is_some() {
                         ui.spinner();
                     }
@@ -12390,6 +12549,7 @@ impl ViewerApp {
                             .truncate(),
                     );
                 });
+                self.wofs.drape_controls_ui(ui);
                 if let Some(run) = catalog.runs.get(self.wofs.run_index) {
                     let base_url =
                         wofs::image_url(run, &self.wofs.init, &self.wofs.product, self.wofs.minute);
@@ -12399,6 +12559,14 @@ impl ViewerApp {
                     let (rect, _) =
                         ui.allocate_exact_size(rect_size, egui::Sense::hover());
                     if let Some(texture) = self.wofs.textures.get(&base_url) {
+                        // WoFS PNGs assume a white page: transparent
+                        // overlay-style products have BLACK legend text,
+                        // invisible over the dark UI without a backing.
+                        ui.painter().rect_filled(
+                            rect,
+                            4.0,
+                            egui::Color32::from_rgb(247, 247, 247),
+                        );
                         ui.painter().image(
                             texture.id(),
                             rect,
@@ -12427,19 +12595,31 @@ impl ViewerApp {
                             );
                         }
                     }
+                    self.wofs.stations_overlay_ui(ui, rect);
                 }
                 ui.weak(wofs::CREDIT);
             });
+        self.wofs.sounding_window(ctx);
         self.wofs.open = open;
     }
 
     /// FARM mobile-radar live quicklooks: sensor chips (live = green),
-    /// product picker, frame loop with follow-live.
+    /// product picker, frame loop with follow-live, map-drape controls.
     fn farm_window(&mut self, ctx: &egui::Context) {
+        // The frame loop keeps pumping while the map drape is on, even
+        // with the window closed (the drape follows the live loop).
+        if self.farm.open || self.farm.drape.enabled {
+            self.farm.pump_window(ctx);
+        }
+        // Persist georeferences the moment they land (auto fix or manual
+        // pin — placement happens on the map, outside this window).
+        if self.farm.drape.take_dirty() {
+            self.app_settings.farm_georefs = self.farm.drape.to_entries();
+            let _ = self.app_settings.save();
+        }
         if !self.farm.open {
             return;
         }
-        self.farm.pump_window(ctx);
         let mut open = self.farm.open;
         egui::Window::new("Mobile Radar — FARM live")
             .open(&mut open)
@@ -12534,6 +12714,87 @@ impl ViewerApp {
                 } else {
                     ui.add_space(12.0);
                     ui.weak("waiting for frames…");
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let toggled = ui
+                        .checkbox(&mut self.farm.drape.enabled, "Show on map")
+                        .on_hover_text(
+                            "Drape the quicklook over the radar map. Position + scale are read \
+                             from the plot itself (tick lattice + town markers); right-click \
+                             placement covers deployments the auto-locator can't pin",
+                        )
+                        .changed();
+                    if toggled && self.farm.drape.enabled {
+                        // Stale loops never refetch — push the displayed
+                        // frame's pixels through the drape pipeline now.
+                        self.farm.kickstart_drape();
+                    }
+                    if self.farm.drape.enabled {
+                        ui.add(
+                            egui::Slider::new(&mut self.farm.drape.opacity, 0.15..=1.0)
+                                .show_value(false)
+                                .text("opacity"),
+                        );
+                        ui.checkbox(&mut self.farm.drape.echoes_only, "echoes only")
+                            .on_hover_text(
+                                "Hide the quicklook's own basemap and keep the colored echo \
+                                 pixels (near-zero velocity bins are muted by the same mask)",
+                            );
+                    }
+                });
+                if self.farm.drape.enabled {
+                    ui.horizontal_wrapped(|ui| {
+                        match &self.farm.drape.georef {
+                            Some(_) => {
+                                if ui
+                                    .small_button("Re-locate")
+                                    .on_hover_text(
+                                        "Re-run the auto-locator on the next frame (use after \
+                                         the deployment moves)",
+                                    )
+                                    .clicked()
+                                {
+                                    self.farm.drape.force_relocate();
+                                }
+                            }
+                            None => {
+                                ui.weak("no position fix yet");
+                            }
+                        }
+                        let armed = self.farm.drape.place_armed;
+                        if ui
+                            .selectable_label(armed, "Place radar (right-click map)")
+                            .on_hover_text(
+                                "Arm, then right-click the radar map at the deployment spot; \
+                                 scale comes from the plot's tick lattice",
+                            )
+                            .clicked()
+                        {
+                            self.farm.drape.place_armed = !armed;
+                        }
+                        if self.farm.drape.place_armed {
+                            let mut tick = self.farm.drape.manual_tick_km;
+                            egui::ComboBox::from_id_salt("farm-drape-tick")
+                                .selected_text(format!("{tick:.0} km ticks"))
+                                .width(110.0)
+                                .show_ui(ui, |ui| {
+                                    for &choice in farm_live::TICK_CHOICES {
+                                        ui.selectable_value(
+                                            &mut tick,
+                                            choice,
+                                            format!("{choice:.0} km ticks"),
+                                        );
+                                    }
+                                });
+                            if tick != self.farm.drape.manual_tick_km {
+                                self.farm.drape.manual_tick_km = tick;
+                            }
+                        }
+                        if !self.farm.drape.status.is_empty() {
+                            ui.weak(&self.farm.drape.status);
+                        }
+                    });
                 }
                 ui.horizontal(|ui| {
                     ui.small(farm_live::CREDIT);
@@ -20915,6 +21176,62 @@ mod tests {
     }
 
     #[test]
+    fn annotation_anchor_roundtrips_and_tracks_pan() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.map_center_lon = -97.5;
+        app.map_center_lat = 35.4;
+        app.map_scale = 240.0;
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 800.0));
+        let anchor = annotate::GeoPoint {
+            lon: -97.21,
+            lat: 35.63,
+        };
+
+        // Geo -> screen -> geo roundtrip stays on the anchor (AEQD forward
+        // and inverse are exact inverses).
+        let before = app.lon_lat_to_screen(rect, anchor.lon, anchor.lat);
+        let (lon, lat) = app.screen_to_lon_lat(rect, before);
+        assert!((lon - anchor.lon).abs() < 5e-4);
+        assert!((lat - anchor.lat).abs() < 5e-4);
+
+        // AEQD invariant the annotations rely on: the projected anchor sits
+        // at its true great-circle distance from the view center, before and
+        // after a pan — geo-anchored shapes stay glued to the weather.
+        let km_per_px = 111.32 / app.map_scale;
+        let expected_km = haversine_km(
+            app.map_center_lat,
+            app.map_center_lon,
+            anchor.lat,
+            anchor.lon,
+        );
+        let screen_km = before.distance(rect.center()) * km_per_px;
+        assert!(
+            (screen_km - expected_km).abs() < 0.2,
+            "{screen_km} vs {expected_km}"
+        );
+        // North up: the anchor (north of center) projects above center.
+        assert!(before.y < rect.center().y);
+
+        app.map_center_lon += 0.25;
+        app.map_center_lat += 0.5;
+        let after = app.lon_lat_to_screen(rect, anchor.lon, anchor.lat);
+        let expected_km = haversine_km(
+            app.map_center_lat,
+            app.map_center_lon,
+            anchor.lat,
+            anchor.lon,
+        );
+        let screen_km = after.distance(rect.center()) * km_per_px;
+        assert!(
+            (screen_km - expected_km).abs() < 0.2,
+            "{screen_km} vs {expected_km}"
+        );
+        let (lon, lat) = app.screen_to_lon_lat(rect, after);
+        assert!((lon - anchor.lon).abs() < 5e-4);
+        assert!((lat - anchor.lat).abs() < 5e-4);
+    }
+
+    #[test]
     fn active_url_poll_blocks_primary_auto_refresh() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.realtime_level2_auto_refresh = true;
@@ -22147,6 +22464,7 @@ mod tests {
             cross_section_volume_cuts: 0,
             cross_section_volume_top_deg: 0.0,
             cross_section_dealias_cache: VolumeDealiasCache::new(),
+            rhi_panel: rhi::RhiPanel::new(),
             hazard_overlay: Some(test_hazard_overlay(records)),
             hazard_path_text: String::new(),
             hazard_status: String::new(),
@@ -22169,6 +22487,8 @@ mod tests {
             dealiased_readout_cache: None,
             update_check_rx: None,
             update_available: None,
+            media: media::MediaShare::default(),
+            annotations: annotate::AnnotationState::default(),
         }
     }
 
