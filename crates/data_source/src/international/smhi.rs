@@ -24,21 +24,29 @@ const API_BASE: &str = "https://opendata-download-radar.smhi.se/api/version/late
 /// polar volume), so it is not a selectable radar site.
 const COMPOSITE_AREA: &str = "sweden";
 
-/// Proper Swedish site names (with diacritics) for the ASCII-folded area
-/// keys the API uses. Unknown keys fall back to a capitalized key.
-const AREA_LABELS: &[(&str, &str)] = &[
-    ("angelholm", "Ängelholm"),
-    ("atvidaberg", "Åtvidaberg"),
-    ("balsta", "Bålsta"),
-    ("hemse", "Hemse"),
-    ("hudiksvall", "Hudiksvall"),
-    ("karlskrona", "Karlskrona"),
-    ("kiruna", "Kiruna"),
-    ("leksand", "Leksand"),
-    ("lulea", "Luleå"),
-    ("ornskoldsvik", "Örnsköldsvik"),
-    ("ostersund", "Östersund"),
-    ("vara", "Vara"),
+/// Proper Swedish site names (with diacritics) and radar coordinates for
+/// the ASCII-folded area keys the API uses (the SMHI catalog itself
+/// carries no coordinates). Unknown keys fall back to a capitalized key
+/// without coordinates.
+///
+/// Coordinates: EUMETNET OPERA radar database, `OPERA_RADARS_DB.json`
+/// (fetched 2026-06-12) from
+/// <https://eumetnet.eu/activities/observations-programme/current-activities/opera/>,
+/// matched by location name; the OPERA ODIM code is in each trailing
+/// comment. All twelve Swedish radars are listed operational (status 1).
+const SMHI_SITES: &[(&str, &str, f32, f32)] = &[
+    ("angelholm", "Ängelholm", 56.3675, 12.8517),   // seang
+    ("atvidaberg", "Åtvidaberg", 58.1059, 15.9365), // seatv (Vilebo)
+    ("balsta", "Bålsta", 59.6110, 17.5833),         // sebaa
+    ("hemse", "Hemse", 57.3035, 18.4001),           // sehem (Ase)
+    ("hudiksvall", "Hudiksvall", 61.5771, 16.7144), // sehuv
+    ("karlskrona", "Karlskrona", 56.2955, 15.6102), // sekaa
+    ("kiruna", "Kiruna", 67.7088, 20.6178),         // sekrn
+    ("leksand", "Leksand", 60.7230, 14.8776),       // selek
+    ("lulea", "Luleå", 65.4309, 21.8650),           // sella (Rosvik)
+    ("ornskoldsvik", "Örnsköldsvik", 63.6395, 18.4019), // seoer
+    ("ostersund", "Östersund", 63.2951, 14.7591),   // seosd
+    ("vara", "Vara", 58.2556, 12.8260),             // sevax
 ];
 
 /// SMHI Sweden: single-file ODIM PVOL frames from the `qcvol` product.
@@ -88,6 +96,20 @@ impl IntlProvider for SmhiProvider {
             .map_err(|err| format!("SMHI qcvol catalog for '{site_id}' ({url}): {err}"))?;
         plan_from_qcvol_catalog(site_id, &json)
     }
+
+    fn static_sites(&self) -> Vec<IntlSite> {
+        SMHI_SITES
+            .iter()
+            .map(|&(key, label, latitude_deg, longitude_deg)| IntlSite {
+                provider_id: self.id(),
+                site_id: key.to_owned(),
+                label: label.to_owned(),
+                country: self.country(),
+                latitude_deg: Some(latitude_deg),
+                longitude_deg: Some(longitude_deg),
+            })
+            .collect()
+    }
 }
 
 /// Area keys are path segments of the URLs we build; reject anything that
@@ -112,13 +134,16 @@ fn sites_from_area_catalog(json: &str) -> Result<Vec<IntlSite>, String> {
         .areas
         .into_iter()
         .filter(|area| area.key != COMPOSITE_AREA)
-        .map(|area| IntlSite {
-            provider_id: "smhi",
-            site_id: area.key.clone(),
-            label: area_label(&area.key),
-            country: "Sweden",
-            latitude_deg: None,
-            longitude_deg: None,
+        .map(|area| {
+            let known = SMHI_SITES.iter().find(|(key, ..)| *key == area.key);
+            IntlSite {
+                provider_id: "smhi",
+                site_id: area.key.clone(),
+                label: area_label(&area.key),
+                country: "Sweden",
+                latitude_deg: known.map(|&(_, _, latitude_deg, _)| latitude_deg),
+                longitude_deg: known.map(|&(_, _, _, longitude_deg)| longitude_deg),
+            }
         })
         .collect::<Vec<_>>();
     if sites.is_empty() {
@@ -128,7 +153,7 @@ fn sites_from_area_catalog(json: &str) -> Result<Vec<IntlSite>, String> {
 }
 
 fn area_label(key: &str) -> String {
-    if let Some((_, label)) = AREA_LABELS.iter().find(|(known, _)| *known == key) {
+    if let Some((_, label, _, _)) = SMHI_SITES.iter().find(|(known, ..)| *known == key) {
         return (*label).to_owned();
     }
     let mut chars = key.chars();
@@ -238,6 +263,15 @@ mod tests {
             .find(|site| site.site_id == "angelholm")
             .expect("angelholm present");
         assert_eq!(angelholm.label, "Ängelholm");
+        assert_eq!(angelholm.latitude_deg, Some(56.3675));
+        assert_eq!(angelholm.longitude_deg, Some(12.8517));
+        // Every live-listed area is in the static table -> all have coords.
+        assert!(
+            sites
+                .iter()
+                .all(|site| site.latitude_deg.is_some() && site.longitude_deg.is_some()),
+            "live catalog should carry static coordinates for every area"
+        );
     }
 
     #[test]

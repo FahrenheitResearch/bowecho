@@ -9816,6 +9816,7 @@ impl ViewerApp {
                     .then_some((index, position))
             })
             .collect::<Vec<_>>();
+        let intl_points = self.intl_site_points(rect);
 
         let shift_held = ui.input(|input| input.modifiers.shift);
         if !armed
@@ -9833,15 +9834,8 @@ impl ViewerApp {
             && !shift_held
             && response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
-            && let Some((index, _)) = site_points
-                .iter()
-                .filter_map(|(index, position)| {
-                    let distance = position.distance(pointer);
-                    (distance <= 12.0).then_some((*index, distance))
-                })
-                .min_by(|left, right| left.1.total_cmp(&right.1))
         {
-            self.selected_site_index = index;
+            self.handle_marker_click(&site_points, &intl_points, pointer);
         }
 
         if !armed
@@ -9999,6 +9993,11 @@ impl ViewerApp {
         self.cross_section_handle_interactions(ui, rect, 0);
 
         self.draw_site_markers(painter, &site_points);
+        let hovered_intl = response
+            .hover_pos()
+            .and_then(|pointer| nearest_marker_within(&intl_points, pointer))
+            .map(|(index, _)| index);
+        self.draw_intl_site_markers(painter, &intl_points, hovered_intl);
         self.draw_radar_layer_markers(painter, rect);
         self.draw_loaded_volume_marker(painter, rect);
         self.draw_colorbar(painter, rect);
@@ -10107,6 +10106,7 @@ impl ViewerApp {
                         .then_some((index, position))
                 })
                 .collect::<Vec<_>>();
+            let intl_points = self.intl_site_points(cell);
 
             let shift_held = ui.input(|input| input.modifiers.shift);
             if !armed
@@ -10124,16 +10124,7 @@ impl ViewerApp {
                 && response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
-                if let Some((index, _)) = site_points
-                    .iter()
-                    .filter_map(|(index, position)| {
-                        let distance = position.distance(pointer);
-                        (distance <= 12.0).then_some((*index, distance))
-                    })
-                    .min_by(|left, right| left.1.total_cmp(&right.1))
-                {
-                    self.selected_site_index = index;
-                }
+                self.handle_marker_click(&site_points, &intl_points, pointer);
                 if let Some(index) = self.hazard_at_position(cell, pointer) {
                     self.selected_hazard_index = Some(index);
                 }
@@ -10211,6 +10202,7 @@ impl ViewerApp {
                         .then_some((index, position))
                 })
                 .collect::<Vec<_>>();
+            let intl_points = self.intl_site_points(cell);
             let cell_painter = ui.painter_at(cell);
             self.draw_basemap(&cell_painter, cell);
             self.draw_graticule(&cell_painter, cell);
@@ -10237,6 +10229,13 @@ impl ViewerApp {
             self.draw_storm_tracks(&cell_painter, cell);
             self.draw_placefiles(&cell_painter, cell);
             self.draw_site_markers(&cell_painter, &site_points);
+            let hovered_intl = hovers
+                .get(cell_index)
+                .copied()
+                .flatten()
+                .and_then(|pointer| nearest_marker_within(&intl_points, pointer))
+                .map(|(index, _)| index);
+            self.draw_intl_site_markers(&cell_painter, &intl_points, hovered_intl);
             self.draw_radar_layer_markers(&cell_painter, cell);
             self.draw_loaded_volume_marker(&cell_painter, cell);
             if cell_index == 0 {
@@ -16415,6 +16414,146 @@ impl ViewerApp {
         }
     }
 
+    /// Screen positions of the international static-catalog markers inside
+    /// `rect` — the same viewport culling as the CONUS `site_points` pass,
+    /// so a CONUS view never pays for (or shows) markers a continent away.
+    /// Indices key into [`data_source::international::intl_static_sites`],
+    /// the providers' embedded tables: pure data, never the network, safe
+    /// to walk on the UI thread every frame.
+    fn intl_site_points(&self, rect: egui::Rect) -> Vec<(usize, egui::Pos2)> {
+        data_source::international::intl_static_sites()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, site)| {
+                let (Some(latitude_deg), Some(longitude_deg)) =
+                    (site.latitude_deg, site.longitude_deg)
+                else {
+                    return None;
+                };
+                let position = self.lon_lat_to_screen(rect, longitude_deg, latitude_deg);
+                rect.expand(18.0)
+                    .contains(position)
+                    .then_some((index, position))
+            })
+            .collect()
+    }
+
+    /// Left-click on map markers: the nearest hit inside the shared 12 px
+    /// halo wins across BOTH catalogs. A CONUS hit selects the site (the
+    /// existing behavior); an international hit starts that site's live
+    /// poll through [`Self::start_intl_poll`] — the exact path the
+    /// DATA-tab picker uses.
+    fn handle_marker_click(
+        &mut self,
+        site_points: &[(usize, egui::Pos2)],
+        intl_points: &[(usize, egui::Pos2)],
+        pointer: egui::Pos2,
+    ) {
+        let conus = nearest_marker_within(site_points, pointer);
+        let intl = nearest_marker_within(intl_points, pointer);
+        match (conus, intl) {
+            (Some((index, conus_distance)), intl)
+                if intl.is_none_or(|(_, intl_distance)| conus_distance <= intl_distance) =>
+            {
+                self.selected_site_index = index;
+            }
+            (_, Some((index, _))) => {
+                let Some(site) = data_source::international::intl_static_sites().get(index) else {
+                    return;
+                };
+                self.status = format!(
+                    "Polling {} · {}",
+                    site.label,
+                    intl_provider_label(site.provider_id)
+                );
+                self.start_intl_poll(site.provider_id.to_owned(), site.site_id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// International site markers: the same visual grammar as
+    /// [`Self::draw_site_markers`] (dot + selected halo + label, identical
+    /// culling and label restraint) but hollow and warm-hued so the two
+    /// catalogs read apart at a glance. The actively polled international
+    /// site gets the selected treatment; hovering any other marker shows a
+    /// "click to live-poll" chip.
+    fn draw_intl_site_markers(
+        &self,
+        painter: &egui::Painter,
+        intl_points: &[(usize, egui::Pos2)],
+        hovered: Option<usize>,
+    ) {
+        if intl_points.is_empty() {
+            return;
+        }
+        let sites = data_source::international::intl_static_sites();
+        let active = match &self.poll_source {
+            PollSource::Intl {
+                provider_id,
+                site_id,
+            } if self.poll_active => Some((provider_id.as_str(), site_id.as_str())),
+            _ => None,
+        };
+        // Warm amber against the cool CONUS site dots.
+        const INTL_IDLE: egui::Color32 = egui::Color32::from_rgb(196, 156, 84);
+        const INTL_LIT: egui::Color32 = egui::Color32::from_rgb(255, 214, 130);
+        for (index, position) in intl_points {
+            let Some(site) = sites.get(*index) else {
+                continue;
+            };
+            let is_active = active == Some((site.provider_id, site.site_id.as_str()));
+            let is_hovered = hovered == Some(*index);
+            if is_active {
+                painter.circle_filled(*position, 5.5, INTL_LIT);
+                painter.circle_stroke(
+                    *position,
+                    10.0,
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 240, 214)),
+                );
+                painter.text(
+                    *position + egui::vec2(12.0, -10.0),
+                    egui::Align2::LEFT_CENTER,
+                    &site.label,
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_rgb(255, 244, 224),
+                );
+            } else {
+                // Hollow ring: selectable, but not the live poll target.
+                painter.circle_stroke(
+                    *position,
+                    if is_hovered { 4.5 } else { 3.0 },
+                    egui::Stroke::new(1.5, if is_hovered { INTL_LIT } else { INTL_IDLE }),
+                );
+            }
+            if is_hovered && !is_active {
+                let text = format!(
+                    "{} · {} — click to live-poll",
+                    site.label,
+                    intl_provider_label(site.provider_id)
+                );
+                // Same chip idiom as draw_mode_chip (width from char count).
+                let width = 12.0 + text.chars().count() as f32 * 6.6;
+                let chip = egui::Rect::from_min_size(
+                    *position + egui::vec2(10.0, -26.0),
+                    egui::vec2(width, 18.0),
+                );
+                painter.rect_filled(
+                    chip,
+                    4.0,
+                    egui::Color32::from_rgba_unmultiplied(16, 22, 30, 230),
+                );
+                painter.text(
+                    chip.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &text,
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_rgb(238, 226, 200),
+                );
+            }
+        }
+    }
+
     fn draw_loaded_volume_marker(&self, painter: &egui::Painter, rect: egui::Rect) {
         let Some(volume) = &self.volume else {
             return;
@@ -17230,6 +17369,22 @@ fn lerp_u8(start: u8, end: u8, t: f32) -> u8 {
 
 fn site_location(site: &RadarSite) -> Option<(f32, f32)> {
     Some((site.latitude_deg?, site.longitude_deg?))
+}
+
+/// The marker in `points` nearest to `pointer` within the shared 12 px
+/// click/hover halo, with its distance — one hit test for the CONUS and
+/// international marker sets.
+fn nearest_marker_within(
+    points: &[(usize, egui::Pos2)],
+    pointer: egui::Pos2,
+) -> Option<(usize, f32)> {
+    points
+        .iter()
+        .filter_map(|(index, position)| {
+            let distance = position.distance(pointer);
+            (distance <= 12.0).then_some((*index, distance))
+        })
+        .min_by(|left, right| left.1.total_cmp(&right.1))
 }
 
 fn format_site_label(site: &RadarSite) -> String {
@@ -23257,6 +23412,44 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(PollSource::intl_from_settings(&blank), None);
+    }
+
+    #[test]
+    fn nearest_marker_within_respects_the_click_halo() {
+        let points = vec![
+            (0, egui::pos2(100.0, 100.0)),
+            (7, egui::pos2(106.0, 100.0)),
+            (9, egui::pos2(300.0, 300.0)),
+        ];
+        // Nearest of two in-halo candidates wins (index 7 at 1 px vs 0 at 5 px).
+        assert_eq!(
+            nearest_marker_within(&points, egui::pos2(105.0, 100.0)),
+            Some((7, 1.0))
+        );
+        // Outside the 12 px halo: no hit, even with markers on screen.
+        assert_eq!(
+            nearest_marker_within(&points, egui::pos2(150.0, 100.0)),
+            None
+        );
+        assert_eq!(nearest_marker_within(&[], egui::pos2(0.0, 0.0)), None);
+    }
+
+    /// The map-marker catalog the intl markers draw from: embedded tables
+    /// only, so it must be non-empty and fully located without any network.
+    #[test]
+    fn intl_static_marker_catalog_is_complete_offline() {
+        let sites = data_source::international::intl_static_sites();
+        assert!(sites.len() >= 60, "expected 60+ static intl sites");
+        for site in sites {
+            assert!(
+                site.latitude_deg.is_some() && site.longitude_deg.is_some(),
+                "{}/{} missing coordinates",
+                site.provider_id,
+                site.site_id
+            );
+            // Every marker's provider label resolves for the hover chip.
+            assert_ne!(intl_provider_label(site.provider_id), site.provider_id);
+        }
     }
 
     #[test]

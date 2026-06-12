@@ -33,14 +33,23 @@ const SITE_DISCOVERY_LIMIT: u32 = 50;
 /// (dmi.dk/friedata/dokumentation/radar-data): the active network is
 /// Bornholm, Rømø, Sindal, Stevns, and Samsø. Unknown station ids fall back
 /// to the feed's file prefix (e.g. `DKSTE`).
-const STATION_LABELS: &[(&str, &str)] = &[
-    ("06036", "Sindal"),
-    ("06133", "Samsø"),
-    ("06177", "Stevns"),
-    ("06194", "Bornholm"),
-    ("60960", "Rømø/Juvre"),
-    // Listed inactive by DMI; labeled in case archive items surface it.
-    ("06103", "Virring Skanderborg"),
+///
+/// Coordinates: EUMETNET OPERA radar database, `OPERA_RADARS_DB.json`
+/// (fetched 2026-06-12) from
+/// <https://eumetnet.eu/activities/observations-programme/current-activities/opera/>,
+/// matched by station name (OPERA ODIM code in each trailing comment).
+/// The trailing flag marks stations OPERA lists operational (status 1);
+/// inactive stations are kept for archive items but excluded from the
+/// static marker catalog.
+const DMI_STATIONS: &[(&str, &str, f32, f32, bool)] = &[
+    ("06036", "Sindal", 57.4893, 10.1365, true),    // dksin
+    ("06133", "Samsø", 55.8119, 10.5853, true),     // dksam
+    ("06177", "Stevns", 55.3262, 12.4493, true),    // dkste
+    ("06194", "Bornholm", 55.1127, 14.8875, true),  // dkbor
+    ("60960", "Rømø/Juvre", 55.1731, 8.5520, true), // dkrom
+    // Listed inactive by DMI and OPERA (status 0); labeled in case archive
+    // items surface it.
+    ("06103", "Virring Skanderborg", 56.0240, 10.0246, false), // dkvir
 ];
 
 /// DMI Denmark: single-file ODIM PVOL frames from the `volume` collection.
@@ -91,6 +100,23 @@ impl IntlProvider for DmiProvider {
             .map_err(|err| format!("DMI volume items for station {site_id} ({url}): {err}"))?;
         plan_from_items(site_id, &json)
     }
+
+    fn static_sites(&self) -> Vec<IntlSite> {
+        DMI_STATIONS
+            .iter()
+            .filter(|&&(.., active)| active)
+            .map(
+                |&(station_id, label, latitude_deg, longitude_deg, _)| IntlSite {
+                    provider_id: self.id(),
+                    site_id: station_id.to_owned(),
+                    label: label.to_owned(),
+                    country: self.country(),
+                    latitude_deg: Some(latitude_deg),
+                    longitude_deg: Some(longitude_deg),
+                },
+            )
+            .collect()
+    }
 }
 
 /// Station ids are query-string values; DMI's are numeric WMO-style ids
@@ -115,6 +141,7 @@ fn sites_from_items(json: &str) -> Result<Vec<IntlSite>, String> {
         if stations.contains_key(station_id) {
             continue;
         }
+        let known = DMI_STATIONS.iter().find(|(id, ..)| *id == station_id);
         stations.insert(
             station_id.to_owned(),
             IntlSite {
@@ -122,8 +149,8 @@ fn sites_from_items(json: &str) -> Result<Vec<IntlSite>, String> {
                 site_id: station_id.to_owned(),
                 label: station_label(station_id, &feature.id),
                 country: "Denmark",
-                latitude_deg: None,
-                longitude_deg: None,
+                latitude_deg: known.map(|&(_, _, latitude_deg, _, _)| latitude_deg),
+                longitude_deg: known.map(|&(_, _, _, longitude_deg, _)| longitude_deg),
             },
         );
     }
@@ -134,7 +161,7 @@ fn sites_from_items(json: &str) -> Result<Vec<IntlSite>, String> {
 }
 
 fn station_label(station_id: &str, feature_id: &str) -> String {
-    if let Some((_, label)) = STATION_LABELS.iter().find(|(id, _)| *id == station_id) {
+    if let Some((_, label, ..)) = DMI_STATIONS.iter().find(|(id, ..)| *id == station_id) {
         return (*label).to_owned();
     }
     // Fall back to the feed's file prefix, e.g. "dkste_2026....vol.h5"
@@ -234,6 +261,15 @@ mod tests {
             .find(|site| site.site_id == "06177")
             .expect("stevns present");
         assert_eq!(stevns.label, "Stevns");
+        assert_eq!(stevns.latitude_deg, Some(55.3262));
+        assert_eq!(stevns.longitude_deg, Some(12.4493));
+        // Every discovered station is in the static table -> all carry coords.
+        assert!(
+            sites
+                .iter()
+                .all(|site| site.latitude_deg.is_some() && site.longitude_deg.is_some()),
+            "live catalog should carry static coordinates for every station"
+        );
     }
 
     #[test]

@@ -152,6 +152,16 @@ pub trait IntlProvider: Send + Sync {
     /// `Err` with a descriptive message when the site is unknown or the
     /// upstream catalog is unreachable/malformed.
     fn latest(&self, site_id: &str) -> Result<FramePlan, String>;
+
+    /// The provider's EMBEDDED site catalog: every currently operational
+    /// site with its static coordinates, straight from the provider's
+    /// compiled-in table. Never touches the network, so it is safe on the
+    /// UI thread — this is what map markers draw from before any poll or
+    /// catalog fetch has happened. May lag reality (a brand-new radar
+    /// appears here only after a table refresh), so pickers wanting
+    /// freshness still call [`Self::list_sites`]. Contract: every returned
+    /// site has `Some` finite latitude/longitude inside its country.
+    fn static_sites(&self) -> Vec<IntlSite>;
 }
 
 /// Registry of all built-in international providers.
@@ -173,6 +183,22 @@ pub fn intl_providers() -> Vec<Box<dyn IntlProvider>> {
         Box::new(ChmiProvider::new()),
         Box::new(JmaProvider),
     ]
+}
+
+/// Every provider's embedded static site table, flattened in registry
+/// order and memoized for the life of the process.
+///
+/// This is the map-marker catalog: a pure function over the providers'
+/// compiled-in tables ([`IntlProvider::static_sites`]), it never touches
+/// the network and is therefore safe to call on the UI thread every frame.
+pub fn intl_static_sites() -> &'static [IntlSite] {
+    static SITES: OnceLock<Vec<IntlSite>> = OnceLock::new();
+    SITES.get_or_init(|| {
+        intl_providers()
+            .iter()
+            .flat_map(|provider| provider.static_sites())
+            .collect()
+    })
 }
 
 /// Process-lifetime memoization of a provider's site catalog.
@@ -332,6 +358,40 @@ const JMA_LOOKBACK_MINUTES: i64 = 40;
 /// merge per elevation.
 pub struct JmaProvider;
 
+/// JMA operational radar stations: id, station number, latitude, longitude.
+///
+/// Decoded from the live N5 reflectivity tar
+/// `Z__C_RJTD_20260612083000_RDR_JMAGPV_N5_grib2.tar` (NICT mirror, fetched
+/// 2026-06-12) via `nexrad_io::jma::jma_tar_station_headers` — the same
+/// per-station GRIB2 product-section headers (JMA GRIB2 template 4.51022
+/// per the JMA technical format documentation) that the live catalog path
+/// reads, so the static table and a live listing agree on ids and
+/// coordinates. Regenerate by running
+/// `cargo test -p data_source jma_regenerate_static_station_table -- --ignored --nocapture`
+/// and pasting the printed rows.
+const JMA_STATIONS: &[(&str, u16, f32, f32)] = &[
+    ("AKIT", 47582, 39.7178, 140.0994),
+    ("FUNC", 47909, 28.3942, 129.5519),
+    ("HAIG", 47792, 34.2703, 132.5933),
+    ("HAKO", 47432, 41.9336, 140.7814),
+    ("ISHI", 47920, 24.4267, 124.1822),
+    ("ITOK", 47937, 26.1533, 127.765),
+    ("KASH", 47695, 35.8597, 139.9597),
+    ("KURU", 47611, 36.1031, 138.1958),
+    ("KUSH", 47419, 42.9608, 144.5175),
+    ("MAKI", 47659, 34.7428, 138.1336),
+    ("MISA", 47791, 35.5417, 133.1036),
+    ("MURO", 47899, 33.2525, 134.1772),
+    ("NAGO", 47636, 35.1681, 136.9653),
+    ("SAPP", 47415, 43.1389, 141.0097),
+    ("SEFU", 47806, 33.4344, 130.3569),
+    ("SEND", 47590, 38.2622, 140.8972),
+    ("TAKA", 47773, 34.6164, 135.6564),
+    ("TANE", 47869, 30.6397, 130.9792),
+    ("TOJI", 47705, 36.2375, 136.1422),
+    ("YAHI", 47572, 37.7186, 138.8161),
+];
+
 /// Process-lifetime station-list cache: the JMA network is static within a
 /// session and rebuilding it costs a full tar download.
 fn jma_site_cache() -> &'static Mutex<Option<Vec<IntlSite>>> {
@@ -411,31 +471,46 @@ impl IntlProvider for JmaProvider {
             return Ok(sites.clone());
         }
 
-        let stamp = jma_newest_stamp()?;
-        let url = jma_tar_url(JMA_REFLECTIVITY_PRODUCT, stamp);
-        let bytes = crate::fetch_volume_bytes(&url)
-            .map_err(|err| format!("JMA station catalog download failed ({url}): {err}"))?;
-        let stations = nexrad_io::jma::jma_tar_station_headers(&bytes)
-            .map_err(|err| format!("JMA station catalog decode failed ({url}): {err}"))?;
+        let live = (|| -> Result<Vec<IntlSite>, String> {
+            let stamp = jma_newest_stamp()?;
+            let url = jma_tar_url(JMA_REFLECTIVITY_PRODUCT, stamp);
+            let bytes = crate::fetch_volume_bytes(&url)
+                .map_err(|err| format!("JMA station catalog download failed ({url}): {err}"))?;
+            let stations = nexrad_io::jma::jma_tar_station_headers(&bytes)
+                .map_err(|err| format!("JMA station catalog decode failed ({url}): {err}"))?;
 
-        let mut sites: Vec<IntlSite> = stations
-            .into_iter()
-            .map(|station| IntlSite {
-                provider_id: self.id(),
-                site_id: station.id.clone(),
-                label: format!("{} (RS{})", station.id, station.number),
-                country: self.country(),
-                latitude_deg: Some(station.latitude_deg as f32),
-                longitude_deg: Some(station.longitude_deg as f32),
-            })
-            .collect();
-        sites.sort_by(|left, right| left.site_id.cmp(&right.site_id));
-        sites.dedup_by(|left, right| left.site_id == right.site_id);
+            let mut sites: Vec<IntlSite> = stations
+                .into_iter()
+                .map(|station| IntlSite {
+                    provider_id: self.id(),
+                    site_id: station.id.clone(),
+                    label: format!("{} (RS{})", station.id, station.number),
+                    country: self.country(),
+                    latitude_deg: Some(station.latitude_deg as f32),
+                    longitude_deg: Some(station.longitude_deg as f32),
+                })
+                .collect();
+            sites.sort_by(|left, right| left.site_id.cmp(&right.site_id));
+            sites.dedup_by(|left, right| left.site_id == right.site_id);
+            Ok(sites)
+        })();
 
-        if let Ok(mut cache) = jma_site_cache().lock() {
-            *cache = Some(sites.clone());
+        match live {
+            Ok(sites) => {
+                // Only a LIVE answer is cached: the static fallback below
+                // must not stop a later call from retrying the (fresher,
+                // authoritative) tar headers.
+                if let Ok(mut cache) = jma_site_cache().lock() {
+                    *cache = Some(sites.clone());
+                }
+                Ok(sites)
+            }
+            // Mirror unreachable: seed the picker from the embedded table
+            // so Japan stays selectable offline-of-NICT; site ids match
+            // the tar headers, so a selection made from this list polls
+            // identically once the mirror answers.
+            Err(_) => Ok(self.static_sites()),
         }
-        Ok(sites)
     }
 
     fn latest(&self, site_id: &str) -> Result<FramePlan, String> {
@@ -444,6 +519,21 @@ impl IntlProvider for JmaProvider {
             return Err(format!("unknown JMA site '{site_id}'"));
         }
         Ok(jma_frame_plan(jma_newest_stamp()?, site_id))
+    }
+
+    fn static_sites(&self) -> Vec<IntlSite> {
+        JMA_STATIONS
+            .iter()
+            .map(|&(id, number, latitude_deg, longitude_deg)| IntlSite {
+                provider_id: self.id(),
+                site_id: id.to_owned(),
+                // Same label grammar as the live tar-derived catalog.
+                label: format!("{id} (RS{number})"),
+                country: self.country(),
+                latitude_deg: Some(latitude_deg),
+                longitude_deg: Some(longitude_deg),
+            })
+            .collect()
     }
 }
 
@@ -495,6 +585,10 @@ mod tests {
                 merge: false,
             })
         }
+
+        fn static_sites(&self) -> Vec<IntlSite> {
+            self.list_sites().unwrap_or_default()
+        }
     }
 
     #[test]
@@ -526,6 +620,133 @@ mod tests {
             assert!(!provider.country().is_empty());
         }
         assert_provider_box_is_send_sync::<dyn IntlProvider>();
+    }
+
+    /// Coordinate sanity for every provider's EMBEDDED catalog: each static
+    /// site has finite coordinates inside a generous national bounding box
+    /// (radars sit on national territory; a swapped lat/lon, a missing
+    /// minus sign, or a degrees/radians slip all land far outside).
+    /// `(lat_min, lat_max, lon_min, lon_max)` for each provider country.
+    fn national_bounding_box(country: &str) -> Option<(f32, f32, f32, f32)> {
+        Some(match country {
+            "Sweden" => (55.0, 69.5, 10.5, 24.5),
+            "Denmark" => (54.5, 58.0, 8.0, 15.5),
+            "Austria" => (46.3, 49.1, 9.4, 17.2),
+            "Finland" => (59.5, 70.5, 19.0, 31.8),
+            "Slovakia" => (47.7, 49.7, 16.8, 22.6),
+            "Germany" => (47.2, 55.1, 5.8, 15.1),
+            "Czechia" => (48.5, 51.1, 12.0, 18.9),
+            // Japan incl. the southwest island arcs (Okinawa, Ishigaki).
+            "Japan" => (24.0, 45.6, 122.5, 146.0),
+            _ => return None,
+        })
+    }
+
+    #[test]
+    fn every_static_site_has_finite_coords_in_its_national_bounding_box() {
+        for provider in intl_providers() {
+            let sites = provider.static_sites();
+            assert!(
+                !sites.is_empty(),
+                "{}: static catalog must not be empty",
+                provider.id()
+            );
+            let (lat_min, lat_max, lon_min, lon_max) = national_bounding_box(provider.country())
+                .unwrap_or_else(|| panic!("no bounding box for {}", provider.country()));
+            for site in &sites {
+                assert_eq!(site.provider_id, provider.id());
+                assert!(!site.site_id.is_empty() && !site.label.is_empty());
+                let (Some(latitude), Some(longitude)) = (site.latitude_deg, site.longitude_deg)
+                else {
+                    panic!(
+                        "{}/{}: static site without coordinates",
+                        provider.id(),
+                        site.site_id
+                    );
+                };
+                assert!(
+                    latitude.is_finite()
+                        && longitude.is_finite()
+                        && (lat_min..=lat_max).contains(&latitude)
+                        && (lon_min..=lon_max).contains(&longitude),
+                    "{}/{} ({}): ({latitude}, {longitude}) outside {} box",
+                    provider.id(),
+                    site.site_id,
+                    site.label,
+                    provider.country()
+                );
+            }
+        }
+    }
+
+    /// The flattened marker catalog covers every provider and never
+    /// duplicates a (provider, site) pair.
+    #[test]
+    fn intl_static_sites_flattens_every_provider_once() {
+        let sites = intl_static_sites();
+        for provider in intl_providers() {
+            assert!(
+                sites.iter().any(|site| site.provider_id == provider.id()),
+                "{} missing from intl_static_sites",
+                provider.id()
+            );
+        }
+        let mut keys: Vec<(&str, &str)> = sites
+            .iter()
+            .map(|site| (site.provider_id, site.site_id.as_str()))
+            .collect();
+        keys.sort_unstable();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), before, "duplicate (provider, site) pair");
+        // Memoized: repeated calls hand back the same slice.
+        assert!(std::ptr::eq(sites, intl_static_sites()));
+    }
+
+    /// Regenerates [`JMA_STATIONS`] from the live tar headers. Network
+    /// test; run with
+    /// `cargo test -p data_source jma_regenerate_static_station_table -- --ignored --nocapture`
+    /// and paste the printed rows (and the printed tar URL into the table's
+    /// doc comment) when the JMA network changes.
+    #[test]
+    #[ignore = "live NICT endpoint probe — run manually with --ignored"]
+    fn jma_regenerate_static_station_table() {
+        let stamp = jma_newest_stamp().expect("newest JMA stamp");
+        let url = jma_tar_url(JMA_REFLECTIVITY_PRODUCT, stamp);
+        println!("// source tar: {url}");
+        let bytes = crate::fetch_volume_bytes(&url).expect("tar download");
+        let mut stations =
+            nexrad_io::jma::jma_tar_station_headers(&bytes).expect("station headers");
+        stations.sort_by(|left, right| left.id.cmp(&right.id));
+        for station in &stations {
+            println!(
+                "    (\"{}\", {}, {:.4}, {:.4}),",
+                station.id, station.number, station.latitude_deg, station.longitude_deg
+            );
+        }
+        assert!(!stations.is_empty());
+    }
+
+    /// The static table must agree with the live tar headers (same ids,
+    /// numbers, and coordinates to table precision). Network test; run with
+    /// `cargo test -p data_source jma_static_table -- --ignored --nocapture`
+    #[test]
+    #[ignore = "live NICT endpoint probe — run manually with --ignored"]
+    fn jma_static_table_matches_live_tar_headers() {
+        let stamp = jma_newest_stamp().expect("newest JMA stamp");
+        let url = jma_tar_url(JMA_REFLECTIVITY_PRODUCT, stamp);
+        let bytes = crate::fetch_volume_bytes(&url).expect("tar download");
+        let stations = nexrad_io::jma::jma_tar_station_headers(&bytes).expect("station headers");
+        assert_eq!(stations.len(), JMA_STATIONS.len(), "station count changed");
+        for station in &stations {
+            let (_, number, latitude, longitude) = JMA_STATIONS
+                .iter()
+                .find(|(id, ..)| *id == station.id)
+                .unwrap_or_else(|| panic!("{} missing from JMA_STATIONS", station.id));
+            assert_eq!(*number, station.number, "{}", station.id);
+            assert!((f64::from(*latitude) - station.latitude_deg).abs() < 5e-4);
+            assert!((f64::from(*longitude) - station.longitude_deg).abs() < 5e-4);
+        }
     }
 
     #[test]

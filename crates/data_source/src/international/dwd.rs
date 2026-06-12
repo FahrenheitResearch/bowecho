@@ -88,25 +88,32 @@ const DWD_PRODUCTS: [DwdProduct; 5] = [
     },
 ];
 
-/// DWD radar network station labels (place names, DWD station catalog).
-const DWD_STATIONS: [(&str, &str); 17] = [
-    ("asb", "Borkum (ASR)"),
-    ("boo", "Boostedt"),
-    ("drs", "Dresden"),
-    ("eis", "Eisberg"),
-    ("ess", "Essen"),
-    ("fbg", "Feldberg"),
-    ("fld", "Flechtdorf"),
-    ("hnr", "Hannover"),
-    ("isn", "Isen"),
-    ("mem", "Memmingen"),
-    ("neu", "Neuhaus"),
-    ("nhb", "Neuheilenbach"),
-    ("oft", "Offenthal"),
-    ("pro", "Prötzel"),
-    ("ros", "Rostock"),
-    ("tur", "Türkheim"),
-    ("umd", "Ummendorf"),
+/// DWD radar network station labels (place names, DWD station catalog) and
+/// radar coordinates (the open-data catalog tree carries none).
+///
+/// Coordinates: EUMETNET OPERA radar database, `OPERA_RADARS_DB.json`
+/// (fetched 2026-06-12) from
+/// <https://eumetnet.eu/activities/observations-programme/current-activities/opera/>,
+/// matched by the `de{code}` ODIM site code directly (e.g. `asb` ->
+/// `deasb`). All seventeen stations are listed operational (status 1).
+const DWD_STATIONS: [(&str, &str, f32, f32); 17] = [
+    ("asb", "Borkum (ASR)", 53.5640, 6.7482),
+    ("boo", "Boostedt", 54.0043, 10.0468),
+    ("drs", "Dresden", 51.1246, 13.7686),
+    ("eis", "Eisberg", 49.5407, 12.4028),
+    ("ess", "Essen", 51.4055, 6.9669),
+    ("fbg", "Feldberg", 47.8736, 8.0039),
+    ("fld", "Flechtdorf", 51.3112, 8.8020),
+    ("hnr", "Hannover", 52.4600, 9.6945),
+    ("isn", "Isen", 48.1747, 12.1017),
+    ("mem", "Memmingen", 48.0421, 10.2192),
+    ("neu", "Neuhaus", 50.5001, 11.1351),
+    ("nhb", "Neuheilenbach", 50.1097, 6.5483),
+    ("oft", "Offenthal", 49.9847, 8.7129),
+    ("pro", "Prötzel", 52.6486, 13.8580),
+    ("ros", "Rostock", 54.1757, 12.0580),
+    ("tur", "Türkheim", 48.5853, 9.7828),
+    ("umd", "Ummendorf", 52.1601, 11.1761),
 ];
 
 /// Germany's DWD open-data sweep feed (one file per sweep per product).
@@ -166,21 +173,21 @@ impl IntlProvider for DwdProvider {
         let mut sites: Vec<IntlSite> = parse_autoindex(&html)
             .into_iter()
             .filter(|entry| entry.is_dir)
-            .map(|entry| IntlSite {
-                provider_id: self.id(),
-                label: DWD_STATIONS
-                    .iter()
-                    .find(|(id, _)| *id == entry.name)
-                    .map_or_else(
+            .map(|entry| {
+                let known = DWD_STATIONS.iter().find(|(id, ..)| *id == entry.name);
+                IntlSite {
+                    provider_id: self.id(),
+                    label: known.map_or_else(
                         || entry.name.to_ascii_uppercase(),
-                        |(_, label)| (*label).to_owned(),
+                        |(_, label, _, _)| (*label).to_owned(),
                     ),
-                // The catalog tree carries no coordinates; the decoded ODIM
-                // volume's /where group does.
-                latitude_deg: None,
-                longitude_deg: None,
-                site_id: entry.name,
-                country: self.country(),
+                    // The catalog tree carries no coordinates; the static
+                    // station table (OPERA database) does.
+                    latitude_deg: known.map(|&(_, _, latitude_deg, _)| latitude_deg),
+                    longitude_deg: known.map(|&(_, _, _, longitude_deg)| longitude_deg),
+                    site_id: entry.name,
+                    country: self.country(),
+                }
             })
             .collect();
         if sites.is_empty() {
@@ -258,6 +265,20 @@ impl IntlProvider for DwdProvider {
             parts,
             merge: true,
         })
+    }
+
+    fn static_sites(&self) -> Vec<IntlSite> {
+        DWD_STATIONS
+            .iter()
+            .map(|&(code, label, latitude_deg, longitude_deg)| IntlSite {
+                provider_id: self.id(),
+                site_id: code.to_owned(),
+                label: label.to_owned(),
+                country: self.country(),
+                latitude_deg: Some(latitude_deg),
+                longitude_deg: Some(longitude_deg),
+            })
+            .collect()
     }
 }
 

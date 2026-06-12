@@ -65,9 +65,253 @@ fn sr_wind_color() -> Color32 {
     Color32::from_rgba_unmultiplied(180, 255, 180, 200)
 }
 
-// ---- composite canvas (2400×1800) ----
+// ---- composite canvas & aspect-adaptive packing ----
+//
+// The composite is assembled from fixed-size blocks; every block keeps the
+// spec's internal tuning (docs/skewt-parity-spec.md) and is positioned by
+// its (x, y) canvas origin only. `choose_layout` is a pure function of the
+// pane aspect (recomputed per frame, no state, no hysteresis):
+//
+//   STANDARD (0.95 < aspect < 1.55) — the original 2400×1800 packing,
+//     offset-for-offset identical to the historical fixed canvas.
+//   WIDE (aspect >= 1.55, the 16:9 dock case) — 3050×1548 (aspect 1.97):
+//     the skew-T | summary | hodograph/slinky row is unchanged; the
+//     parameter table re-packs into a shallow bottom strip (PARCELS ·
+//     LAPSE RATES · THERMODYNAMICS) plus a new right column
+//     (SHEAR/HELICITY · STORM MOTIONS · COMPOSITES). A 16:9 pane
+//     letterboxes ~9.8% instead of the old 25%.
+//   TALL (aspect <= 0.95, the docked-right-column case) — 1680×3036
+//     (aspect 0.55): skew-T + summary on top (standard offsets),
+//     hodograph + slinky side by side beneath, the three table groups
+//     stacked below (PARCELS group full row, then SHEAR | THERMO groups).
+//
+// Table text draws at the same canvas-pixel size in every packing, so the
+// tables never shrink relative to the rest of the composite.
+
+/// Standard packing canvas (the historical fixed canvas).
 const CANVAS_W: f32 = 2400.0;
 const CANVAS_H: f32 = 1800.0;
+
+/// Title bar height; the bar spans the chosen canvas width in every variant.
+const TITLE_H: f32 = 44.0;
+
+// Block sizes in canvas px (mapped from the real draw bounds below; the
+// per-block internal layout never changes, only the origin moves).
+const SKEWT_SIZE: (f32, f32) = (1176.0, 1120.0);
+const SUMMARY_SIZE: (f32, f32) = (504.0, 1120.0);
+const HODO_SIZE: (f32, f32) = (720.0, 600.0);
+const SLINKY_SIZE: (f32, f32) = (720.0, 520.0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Variant {
+    Standard,
+    Wide,
+    Tall,
+}
+
+/// Separator stroke classes (the three line colors the composite uses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SepKind {
+    /// `LINE` — the strong row separator above the table region.
+    Table,
+    /// `H_BORDER` — region dividers around the hodograph column.
+    Region,
+    /// `LINE_DIM` — faint dividers between table panels.
+    Dim,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Sep {
+    a: (f32, f32),
+    b: (f32, f32),
+    kind: SepKind,
+}
+
+/// One packing: canvas size plus the origin of every block. Sections of
+/// the parameter table are placed individually (the WIDE packing splits
+/// the PARCELS group across a strip and a column); panel backgrounds and
+/// separators are per-variant decorations.
+struct Layout {
+    /// Which packing this is (read by the layout tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    variant: Variant,
+    canvas: (f32, f32),
+    skewt: (f32, f32),
+    summary: (f32, f32),
+    hodo: (f32, f32),
+    slinky: (f32, f32),
+    parcels: (f32, f32),
+    motions: (f32, f32),
+    lapse: (f32, f32),
+    shear: (f32, f32),
+    thermo: (f32, f32),
+    composites: (f32, f32),
+    panels: &'static [(f32, f32, f32, f32)],
+    seps: &'static [Sep],
+}
+
+/// Today's 2400×1800 packing — the golden path. Every offset here is the
+/// historical absolute coordinate, so this variant is pixel-identical to
+/// the fixed-canvas layout (guarded by `standard_packing_is_historical`).
+const PACK_STANDARD: Layout = Layout {
+    variant: Variant::Standard,
+    canvas: (CANVAS_W, CANVAS_H),
+    skewt: (0.0, 44.0),
+    summary: (1176.0, 44.0),
+    hodo: (1680.0, 44.0),
+    slinky: (1680.0, 644.0),
+    parcels: (20.0, 1184.0),
+    motions: (20.0, 1448.0),
+    lapse: (450.0, 1448.0),
+    shear: (1144.0, 1184.0),
+    thermo: (1764.0, 1184.0),
+    composites: (1764.0, 1542.0),
+    panels: &[
+        (10.0, 1174.0, 1100.0, 616.0),
+        (1130.0, 1174.0, 590.0, 616.0),
+        (1750.0, 1174.0, 630.0, 616.0),
+    ],
+    seps: &[
+        Sep {
+            a: (0.0, 1164.0),
+            b: (2400.0, 1164.0),
+            kind: SepKind::Table,
+        },
+        Sep {
+            a: (1680.0, 44.0),
+            b: (1680.0, 1163.0),
+            kind: SepKind::Region,
+        },
+        Sep {
+            a: (1680.0, 644.0),
+            b: (2400.0, 644.0),
+            kind: SepKind::Region,
+        },
+        Sep {
+            a: (1119.0, 1178.0),
+            b: (1119.0, 1775.0),
+            kind: SepKind::Dim,
+        },
+        Sep {
+            a: (1739.0, 1178.0),
+            b: (1739.0, 1775.0),
+            kind: SepKind::Dim,
+        },
+    ],
+};
+
+/// 16:9-dock packing, 3050×1548 (aspect 1.97). The 2400-wide top row is
+/// byte-for-byte the standard one; the table sections that stack to 636
+/// canvas px (SHEAR 476, MOTIONS 322, COMPOSITES 254 tall) move into a
+/// 650-wide right column, and the shallow sections (PARCELS 236, LAPSE
+/// 314, THERMO 356 tall) form a 366-deep bottom strip.
+const PACK_WIDE: Layout = Layout {
+    variant: Variant::Wide,
+    canvas: (3050.0, 1548.0),
+    skewt: (0.0, 44.0),
+    summary: (1176.0, 44.0),
+    hodo: (1680.0, 44.0),
+    slinky: (1680.0, 644.0),
+    parcels: (20.0, 1184.0),
+    lapse: (1124.0, 1184.0),
+    thermo: (1764.0, 1184.0),
+    shear: (2424.0, 64.0),
+    motions: (2424.0, 682.0),
+    composites: (2424.0, 1146.0),
+    panels: &[
+        (10.0, 1174.0, 1080.0, 366.0),
+        (1110.0, 1174.0, 620.0, 366.0),
+        (1750.0, 1174.0, 630.0, 366.0),
+        (2410.0, 54.0, 630.0, 500.0),
+        (2410.0, 672.0, 630.0, 346.0),
+        (2410.0, 1136.0, 630.0, 278.0),
+    ],
+    seps: &[
+        Sep {
+            a: (0.0, 1164.0),
+            b: (2400.0, 1164.0),
+            kind: SepKind::Table,
+        },
+        Sep {
+            a: (1680.0, 44.0),
+            b: (1680.0, 1163.0),
+            kind: SepKind::Region,
+        },
+        Sep {
+            a: (1680.0, 644.0),
+            b: (2400.0, 644.0),
+            kind: SepKind::Region,
+        },
+        Sep {
+            a: (2400.0, 44.0),
+            b: (2400.0, 1543.0),
+            kind: SepKind::Region,
+        },
+        Sep {
+            a: (1100.0, 1178.0),
+            b: (1100.0, 1530.0),
+            kind: SepKind::Dim,
+        },
+        Sep {
+            a: (1740.0, 1178.0),
+            b: (1740.0, 1530.0),
+            kind: SepKind::Dim,
+        },
+    ],
+};
+
+/// Right-column packing, 1680×3036 (aspect 0.55): skew-T + summary keep
+/// their standard offsets, hodograph and slinky sit side by side beneath,
+/// then the three table groups stack (the group-internal offsets match the
+/// standard strip exactly, shifted as whole groups).
+const PACK_TALL: Layout = Layout {
+    variant: Variant::Tall,
+    canvas: (1680.0, 3036.0),
+    skewt: (0.0, 44.0),
+    summary: (1176.0, 44.0),
+    hodo: (0.0, 1164.0),
+    slinky: (720.0, 1164.0),
+    parcels: (20.0, 1784.0),
+    motions: (20.0, 2048.0),
+    lapse: (450.0, 2048.0),
+    shear: (24.0, 2420.0),
+    thermo: (644.0, 2420.0),
+    composites: (644.0, 2778.0),
+    panels: &[
+        (10.0, 1774.0, 1100.0, 616.0),
+        (10.0, 2410.0, 590.0, 616.0),
+        (630.0, 2410.0, 630.0, 616.0),
+    ],
+    seps: &[
+        Sep {
+            a: (0.0, 1164.0),
+            b: (1680.0, 1164.0),
+            kind: SepKind::Table,
+        },
+        Sep {
+            a: (0.0, 1764.0),
+            b: (1680.0, 1764.0),
+            kind: SepKind::Table,
+        },
+        Sep {
+            a: (619.0, 2414.0),
+            b: (619.0, 3011.0),
+            kind: SepKind::Dim,
+        },
+    ],
+};
+
+/// Pure layout chooser: pane aspect -> packing. A NaN aspect (unlaid-out
+/// zero rect) falls through to STANDARD.
+fn choose_layout(aspect: f32) -> &'static Layout {
+    if aspect <= 0.95 {
+        &PACK_TALL
+    } else if aspect >= 1.55 {
+        &PACK_WIDE
+    } else {
+        &PACK_STANDARD
+    }
+}
 
 struct G {
     origin: Pos2,
@@ -75,9 +319,10 @@ struct G {
 }
 
 impl G {
-    fn fit(rect: Rect) -> Self {
-        let s = (rect.width() / CANVAS_W).min(rect.height() / CANVAS_H);
-        let used = vec2(CANVAS_W * s, CANVAS_H * s);
+    fn fit(rect: Rect, canvas: (f32, f32)) -> Self {
+        let (cw, ch) = canvas;
+        let s = (rect.width() / cw).min(rect.height() / ch);
+        let used = vec2(cw * s, ch * s);
         // Center horizontally, anchor TOP vertically: a width-bound fit
         // in a tall pane otherwise floats the canvas mid-darkness with
         // dead space above and below (field report: "small and bad").
@@ -105,14 +350,18 @@ impl G {
 }
 
 /// The full production sounding composite (title, skew-T, summary,
-/// hodograph, slinky, parameter table). Resolution independent.
+/// hodograph, slinky, parameter table). Resolution independent, and
+/// aspect-adaptive: the packing is chosen per frame from the pane shape so
+/// a docked tile fills instead of letterboxing the fixed 4:3 canvas.
 pub fn draw_full(ui: &mut egui::Ui, rect: Rect, sounding: &NativeSounding) {
     let painter = ui.painter_at(rect);
-    let g = G::fit(rect);
-    painter.rect_filled(g.rect(0.0, 0.0, CANVAS_W, CANVAS_H), 0.0, BG);
+    let layout = choose_layout(rect.width() / rect.height());
+    let (cw, ch) = layout.canvas;
+    let g = G::fit(rect, layout.canvas);
+    painter.rect_filled(g.rect(0.0, 0.0, cw, ch), 0.0, BG);
 
-    // Title bar.
-    painter.rect_filled(g.rect(0.0, 0.0, CANVAS_W, 44.0), 0.0, TITLE_BG);
+    // Title bar — spans the chosen canvas width in every variant.
+    painter.rect_filled(g.rect(0.0, 0.0, cw, TITLE_H), 0.0, TITLE_BG);
     let meta = &sounding.metadata;
     let mut title = "BowEcho Sounding Analysis".to_owned();
     if let (Some(lat), Some(lon)) = (meta.latitude_deg, meta.longitude_deg) {
@@ -122,40 +371,55 @@ pub fn draw_full(ui: &mut egui::Ui, rect: Rect, sounding: &NativeSounding) {
         title.push_str(&format!(" — {}", meta.valid_time));
     }
     painter.text(
-        g.pos(CANVAS_W / 2.0, 3.0),
+        g.pos(cw / 2.0, 3.0),
         Align2::CENTER_TOP,
         title,
         g.font(33.0),
         TEXT,
     );
 
+    // Table panel backgrounds (spec §9 fills; positions are per-variant).
+    for &(x, y, w, h) in layout.panels {
+        painter.rect_filled(g.rect(x, y, w, h), 0.0, PANEL_BG);
+    }
+
     // Skew-T (the visible 1176-wide region of the sub-canvas).
-    let skewt_rect = g.rect(0.0, 44.0, 1176.0, 1120.0);
+    let skewt_rect = g.rect(layout.skewt.0, layout.skewt.1, SKEWT_SIZE.0, SKEWT_SIZE.1);
     crate::skewt_native::draw_skewt(ui, skewt_rect, sounding);
 
     // Summary panel (replaces the locator pair; spec §8 summary columns).
-    draw_summary(&painter, &g, sounding);
+    draw_summary(&painter, &g, layout.summary.0, layout.summary.1, sounding);
 
     // Hodograph + slinky.
-    draw_hodograph(&painter, &g, sounding);
-    draw_slinky(&painter, &g, sounding);
+    draw_hodograph(&painter, &g, layout.hodo.0, layout.hodo.1, sounding);
+    draw_slinky(&painter, &g, layout.slinky.0, layout.slinky.1, sounding);
 
-    // Parameter table.
-    draw_table(&painter, &g, sounding);
+    // Parameter table sections.
+    draw_parcels(&painter, &g, layout.parcels.0, layout.parcels.1, sounding);
+    draw_storm_motions(&painter, &g, layout.motions.0, layout.motions.1, sounding);
+    draw_lapse_rates(&painter, &g, layout.lapse.0, layout.lapse.1, sounding);
+    draw_shear_helicity(&painter, &g, layout.shear.0, layout.shear.1, sounding);
+    draw_thermodynamics(&painter, &g, layout.thermo.0, layout.thermo.1, sounding);
+    draw_composites(
+        &painter,
+        &g,
+        layout.composites.0,
+        layout.composites.1,
+        sounding,
+    );
 
-    // Separators (spec §1).
-    painter.line_segment(
-        [g.pos(0.0, 1164.0), g.pos(CANVAS_W, 1164.0)],
-        g.stroke(1.0, LINE),
-    );
-    painter.line_segment(
-        [g.pos(1680.0, 44.0), g.pos(1680.0, 1163.0)],
-        g.stroke(1.0, H_BORDER),
-    );
-    painter.line_segment(
-        [g.pos(1680.0, 644.0), g.pos(CANVAS_W, 644.0)],
-        g.stroke(1.0, H_BORDER),
-    );
+    // Separators (spec §1; per-variant geometry, same three strokes).
+    for sep in layout.seps {
+        let color = match sep.kind {
+            SepKind::Table => LINE,
+            SepKind::Region => H_BORDER,
+            SepKind::Dim => LINE_DIM,
+        };
+        painter.line_segment(
+            [g.pos(sep.a.0, sep.a.1), g.pos(sep.b.0, sep.b.1)],
+            g.stroke(1.0, color),
+        );
+    }
 }
 
 // ---- helpers ----
@@ -302,7 +566,7 @@ fn shear_mag(profile: &rustwx_sounding::SharprsProfile, pbot: f64, ptop: f64) ->
         .unwrap_or(f64::NAN)
 }
 
-// ---- summary panel (1176,44,504,1120) ----
+// ---- summary panel (504×1120 block; standard origin (1176,44)) ----
 
 #[allow(clippy::too_many_arguments)] // mirrors the spec's column signature
 fn key_value_row(
@@ -333,11 +597,11 @@ fn section_title(painter: &egui::Painter, g: &G, x: f32, y: f32, w: f32, title: 
     );
 }
 
-fn draw_summary(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
-    let rect = g.rect(1176.0, 44.0, 504.0, 1120.0);
+fn draw_summary(painter: &egui::Painter, g: &G, x: f32, y: f32, sounding: &NativeSounding) {
+    let rect = g.rect(x, y, SUMMARY_SIZE.0, SUMMARY_SIZE.1);
     painter.rect_filled(rect, 0.0, PANEL_BG);
     painter.rect_stroke(rect, 0.0, g.stroke(1.0, LINE), egui::StrokeKind::Inside);
-    let (x0, y0) = (1190.0, 58.0);
+    let (x0, y0) = (x + 14.0, y + 14.0);
     painter.text(
         g.pos(x0, y0),
         Align2::LEFT_TOP,
@@ -479,10 +743,10 @@ fn draw_summary(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
     }
 }
 
-// ---- hodograph (1680,44,720,600), spec §6 ----
+// ---- hodograph (720×600 block; standard origin (1680,44)), spec §6 ----
 
-fn draw_hodograph(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
-    let (rx, ry, rw, _rh) = (1680.0f32, 44.0f32, 720.0f32, 600.0f32);
+fn draw_hodograph(painter: &egui::Painter, g: &G, x: f32, y: f32, sounding: &NativeSounding) {
+    let (rx, ry, rw, _rh) = (x, y, HODO_SIZE.0, HODO_SIZE.1);
     painter.rect_filled(g.rect(rx, ry, 720.0, 600.0), 0.0, H_PANEL_BG);
     painter.rect_stroke(
         g.rect(rx, ry, 720.0, 600.0),
@@ -769,10 +1033,10 @@ fn draw_hodograph(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
     }
 }
 
-// ---- storm slinky (1680,644,720,520), spec §7 ----
+// ---- storm slinky (720×520 block; standard origin (1680,644)), spec §7 ----
 
-fn draw_slinky(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
-    let (rx, ry, rw, rh) = (1680.0f32, 644.0f32, 720.0f32, 520.0f32);
+fn draw_slinky(painter: &egui::Painter, g: &G, x: f32, y: f32, sounding: &NativeSounding) {
+    let (rx, ry, rw, rh) = (x, y, SLINKY_SIZE.0, SLINKY_SIZE.1);
     painter.rect_filled(g.rect(rx, ry, rw, rh), 0.0, H_PANEL_BG);
     painter.rect_stroke(
         g.rect(rx, ry, rw, rh),
@@ -902,25 +1166,20 @@ fn draw_slinky(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
     }
 }
 
-// ---- parameter table (0,1164,2400,636), spec §9 ----
+// ---- parameter table sections, spec §9 ----
+//
+// Standard packing keeps the historical strip (0,1164,2400,636): the
+// PARCELS / STORM MOTIONS / LAPSE RATES group on the left panel, the
+// SHEAR/HELICITY panel in the middle, the THERMODYNAMICS / COMPOSITES
+// panel on the right. Each section now takes its own (x, y) origin so the
+// other packings can re-arrange them; the internal column anchors are the
+// spec's, untouched.
 
-fn draw_table(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
-    let profile = &sounding.profile;
+// === PARCELS (content 1060×236; standard origin (20,1184)) ===
+fn draw_parcels(painter: &egui::Painter, g: &G, x: f32, y: f32, sounding: &NativeSounding) {
     let p = &sounding.params;
     let e = &sounding.verified_ecape;
-    // Panels.
-    for (x, w) in [(10.0f32, 1100.0f32), (1130.0, 590.0), (1750.0, 630.0)] {
-        painter.rect_filled(g.rect(x, 1174.0, w, 616.0), 0.0, PANEL_BG);
-    }
-    for x in [1119.0f32, 1739.0] {
-        painter.line_segment(
-            [g.pos(x, 1178.0), g.pos(x, 1775.0)],
-            g.stroke(1.0, LINE_DIM),
-        );
-    }
-
-    // === PARCELS ===
-    let (px0, py0) = (20.0f32, 1184.0f32);
+    let (px0, py0) = (x, y);
     section_title(painter, g, px0, py0, 1060.0, "PARCELS");
     let header_y = py0 + 54.0;
     let anchors: [(f32, &str, &str); 9] = [
@@ -1013,9 +1272,12 @@ fn draw_table(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
             );
         }
     }
+}
 
-    // === STORM MOTIONS ===
-    let (mx, my) = (20.0f32, 1448.0f32);
+// === STORM MOTIONS (content 370×322; standard origin (20,1448)) ===
+fn draw_storm_motions(painter: &egui::Painter, g: &G, x: f32, y: f32, sounding: &NativeSounding) {
+    let p = &sounding.params;
+    let (mx, my) = (x, y);
     section_title(painter, g, mx, my, 370.0, "STORM MOTIONS");
     let (rm_dir, rm_spd) = comp2vec(p.rstu, p.rstv);
     let (lm_dir, lm_spd) = comp2vec(p.lstu, p.lstv);
@@ -1042,9 +1304,13 @@ fn draw_table(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
             *color,
         );
     }
+}
 
-    // === LAPSE RATES ===
-    let (lx, ly) = (450.0f32, 1448.0f32);
+// === LAPSE RATES (content 600×314; standard origin (450,1448)) ===
+fn draw_lapse_rates(painter: &egui::Painter, g: &G, x: f32, y: f32, sounding: &NativeSounding) {
+    let profile = &sounding.profile;
+    let p = &sounding.params;
+    let (lx, ly) = (x, y);
     section_title(painter, g, lx, ly, 600.0, "LAPSE RATES");
     let lr03 = p.lr03.unwrap_or(f64::NAN);
     let lr36 = p.lr36.unwrap_or(f64::NAN);
@@ -1077,9 +1343,13 @@ fn draw_table(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
             lapse_color(*value),
         );
     }
+}
 
-    // === SHEAR / HELICITY ===
-    let (sx, sy) = (1144.0f32, 1184.0f32);
+// === SHEAR / HELICITY (content 560×476; standard origin (1144,1184)) ===
+fn draw_shear_helicity(painter: &egui::Painter, g: &G, x: f32, y: f32, sounding: &NativeSounding) {
+    let profile = &sounding.profile;
+    let p = &sounding.params;
+    let (sx, sy) = (x, y);
     section_title(painter, g, sx, sy, 560.0, "SHEAR / HELICITY");
     let sh_header = sy + 54.0;
     let sh_anchors: [(f32, &str, &str); 5] = [
@@ -1192,9 +1462,14 @@ fn draw_table(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
             );
         }
     }
+}
 
-    // === THERMODYNAMICS ===
-    let (tx, ty) = (1764.0f32, 1184.0f32);
+// === THERMODYNAMICS (content 610×356; standard origin (1764,1184)) ===
+fn draw_thermodynamics(painter: &egui::Painter, g: &G, x: f32, y: f32, sounding: &NativeSounding) {
+    let profile = &sounding.profile;
+    let p = &sounding.params;
+    let p_sfc = profile.sfc_pressure();
+    let (tx, ty) = (x, y);
     section_title(painter, g, tx, ty, 610.0, "THERMODYNAMICS");
     let sfc_rh = profile.relh.get(profile.sfc).copied().unwrap_or(f64::NAN);
     let (dgz_bot, dgz_top) = indices::dgz(profile);
@@ -1258,13 +1533,18 @@ fn draw_table(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
             *color,
         );
     }
+}
 
-    // === COMPOSITES ===
-    let (cx0, cy0) = (1764.0f32, 1542.0f32);
+// === COMPOSITES (content 610×254; standard origin (1764,1542)) ===
+fn draw_composites(painter: &egui::Painter, g: &G, x: f32, y: f32, sounding: &NativeSounding) {
+    let profile = &sounding.profile;
+    let p = &sounding.params;
+    let (cx0, cy0) = (x, y);
     section_title(painter, g, cx0, cy0, 610.0, "COMPOSITES");
     let lr03_v = p
         .lr03
         .unwrap_or_else(|| indices::lapse_rate(profile, 0.0, 3000.0, false).unwrap_or(f64::NAN));
+    let p1km = profile.pres_at_height(profile.to_msl(1000.0));
     let p3500m = profile.pres_at_height(profile.to_msl(3500.0));
     let mean_wind_1_35_ms = mean_wind_mag(profile, p1km, p3500m) * 0.514_444;
     let wndg = composites::wndg(p.mlpcl.bplus, lr03_v, mean_wind_1_35_ms, p.mlpcl.bminus)
@@ -1334,5 +1614,248 @@ fn draw_table(painter: &egui::Painter, g: &G, sounding: &NativeSounding) {
             value,
             *color,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustwx_sounding::{SoundingColumn, SoundingMetadata};
+
+    // Mapped content bounds of the six table sections (canvas px), measured
+    // from the draw fns: section title + rule, column anchors, last row + a
+    // 28 px text line. The packing tests place blocks with these footprints.
+    const PARCELS_SIZE: (f32, f32) = (1060.0, 236.0);
+    const MOTIONS_SIZE: (f32, f32) = (370.0, 322.0);
+    const LAPSE_SIZE: (f32, f32) = (600.0, 314.0);
+    const SHEAR_SIZE: (f32, f32) = (560.0, 476.0);
+    const THERMO_SIZE: (f32, f32) = (610.0, 356.0);
+    const COMPOSITES_SIZE: (f32, f32) = (610.0, 254.0);
+
+    fn block_rects(l: &Layout) -> Vec<(&'static str, Rect)> {
+        let r =
+            |o: (f32, f32), s: (f32, f32)| Rect::from_min_size(Pos2::new(o.0, o.1), vec2(s.0, s.1));
+        vec![
+            ("title", r((0.0, 0.0), (l.canvas.0, TITLE_H))),
+            ("skewt", r(l.skewt, SKEWT_SIZE)),
+            ("summary", r(l.summary, SUMMARY_SIZE)),
+            ("hodo", r(l.hodo, HODO_SIZE)),
+            ("slinky", r(l.slinky, SLINKY_SIZE)),
+            ("parcels", r(l.parcels, PARCELS_SIZE)),
+            ("motions", r(l.motions, MOTIONS_SIZE)),
+            ("lapse", r(l.lapse, LAPSE_SIZE)),
+            ("shear", r(l.shear, SHEAR_SIZE)),
+            ("thermo", r(l.thermo, THERMO_SIZE)),
+            ("composites", r(l.composites, COMPOSITES_SIZE)),
+        ]
+    }
+
+    /// Strict interior overlap — blocks may share an edge, not area.
+    fn overlaps(a: Rect, b: Rect) -> bool {
+        a.min.x < b.max.x && b.min.x < a.max.x && a.min.y < b.max.y && b.min.y < a.max.y
+    }
+
+    #[test]
+    fn chooser_maps_pane_aspect_to_variant() {
+        // TALL at and below 0.95 (the docked right-column case).
+        assert_eq!(choose_layout(0.40).variant, Variant::Tall);
+        assert_eq!(choose_layout(0.95).variant, Variant::Tall);
+        // STANDARD between the thresholds (golden path).
+        assert_eq!(choose_layout(0.96).variant, Variant::Standard);
+        assert_eq!(choose_layout(4.0 / 3.0).variant, Variant::Standard);
+        assert_eq!(choose_layout(1.54).variant, Variant::Standard);
+        // WIDE at and above 1.55 (the 16:9 case).
+        assert_eq!(choose_layout(1.55).variant, Variant::Wide);
+        assert_eq!(choose_layout(16.0 / 9.0).variant, Variant::Wide);
+        assert_eq!(choose_layout(2.4).variant, Variant::Wide);
+        // A zero rect (NaN aspect) must not panic and gets the golden path.
+        assert_eq!(choose_layout(f32::NAN).variant, Variant::Standard);
+    }
+
+    #[test]
+    fn every_packing_is_collision_free_and_inside_its_canvas() {
+        for layout in [&PACK_STANDARD, &PACK_WIDE, &PACK_TALL] {
+            let canvas = Rect::from_min_size(Pos2::ZERO, vec2(layout.canvas.0, layout.canvas.1));
+            let blocks = block_rects(layout);
+            for (name, rect) in &blocks {
+                assert!(
+                    canvas.contains_rect(*rect),
+                    "{:?}: {name} {rect:?} outside canvas {canvas:?}",
+                    layout.variant
+                );
+            }
+            for (i, (name_a, a)) in blocks.iter().enumerate() {
+                for (name_b, b) in &blocks[i + 1..] {
+                    assert!(
+                        !overlaps(*a, *b),
+                        "{:?}: {name_a} {a:?} overlaps {name_b} {b:?}",
+                        layout.variant
+                    );
+                }
+            }
+            // Decorations stay on the canvas too.
+            for &(x, y, w, h) in layout.panels {
+                let panel = Rect::from_min_size(Pos2::new(x, y), vec2(w, h));
+                assert!(
+                    canvas.contains_rect(panel),
+                    "{:?}: panel {panel:?} outside canvas",
+                    layout.variant
+                );
+            }
+            for sep in layout.seps {
+                for (x, y) in [sep.a, sep.b] {
+                    assert!(
+                        canvas.contains(Pos2::new(x, y)),
+                        "{:?}: separator point ({x},{y}) outside canvas",
+                        layout.variant
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn canvas_aspects_land_in_their_bands() {
+        let aspect = |l: &Layout| l.canvas.0 / l.canvas.1;
+        let std = aspect(&PACK_STANDARD);
+        assert!((0.95..1.55).contains(&std), "standard {std}");
+        let wide = aspect(&PACK_WIDE);
+        assert!((1.9..=2.2).contains(&wide), "wide {wide}");
+        let tall = aspect(&PACK_TALL);
+        assert!((0.55..=0.75).contains(&tall), "tall {tall}");
+        // The motivating case: a 16:9 pane keeps dead area at ~10% or less.
+        let pane = 16.0 / 9.0;
+        let dead = 1.0 - pane / wide;
+        assert!(dead <= 0.10, "16:9 dead fraction {dead}");
+    }
+
+    /// The STANDARD packing is the historical fixed 2400×1800 canvas,
+    /// offset for offset — the pixel-identity guard for the golden path.
+    #[test]
+    fn standard_packing_is_the_historical_fixed_canvas() {
+        let l = &PACK_STANDARD;
+        assert_eq!(l.canvas, (2400.0, 1800.0));
+        assert_eq!(l.skewt, (0.0, 44.0));
+        assert_eq!(l.summary, (1176.0, 44.0));
+        assert_eq!(l.hodo, (1680.0, 44.0));
+        assert_eq!(l.slinky, (1680.0, 644.0));
+        assert_eq!(l.parcels, (20.0, 1184.0));
+        assert_eq!(l.motions, (20.0, 1448.0));
+        assert_eq!(l.lapse, (450.0, 1448.0));
+        assert_eq!(l.shear, (1144.0, 1184.0));
+        assert_eq!(l.thermo, (1764.0, 1184.0));
+        assert_eq!(l.composites, (1764.0, 1542.0));
+        assert_eq!(
+            l.panels,
+            &[
+                (10.0, 1174.0, 1100.0, 616.0),
+                (1130.0, 1174.0, 590.0, 616.0),
+                (1750.0, 1174.0, 630.0, 616.0),
+            ]
+        );
+        assert_eq!(
+            l.seps,
+            &[
+                Sep {
+                    a: (0.0, 1164.0),
+                    b: (2400.0, 1164.0),
+                    kind: SepKind::Table,
+                },
+                Sep {
+                    a: (1680.0, 44.0),
+                    b: (1680.0, 1163.0),
+                    kind: SepKind::Region,
+                },
+                Sep {
+                    a: (1680.0, 644.0),
+                    b: (2400.0, 644.0),
+                    kind: SepKind::Region,
+                },
+                Sep {
+                    a: (1119.0, 1178.0),
+                    b: (1119.0, 1775.0),
+                    kind: SepKind::Dim,
+                },
+                Sep {
+                    a: (1739.0, 1178.0),
+                    b: (1739.0, 1775.0),
+                    kind: SepKind::Dim,
+                },
+            ]
+        );
+    }
+
+    /// A small physically plausible column (sharprs-valid: monotonic
+    /// pressure/height, dewpoint <= temperature) so the paint test runs
+    /// the real compute path.
+    fn synthetic_sounding() -> NativeSounding {
+        let pressure_hpa = vec![
+            1000.0, 950.0, 900.0, 850.0, 800.0, 750.0, 700.0, 650.0, 600.0, 550.0, 500.0, 450.0,
+            400.0, 350.0, 300.0, 250.0, 200.0, 150.0, 100.0,
+        ];
+        let height_m_msl = vec![
+            110.0, 540.0, 990.0, 1460.0, 1950.0, 2470.0, 3010.0, 3590.0, 4200.0, 4870.0, 5570.0,
+            6340.0, 7180.0, 8120.0, 9160.0, 10360.0, 11780.0, 13600.0, 16180.0,
+        ];
+        // ~6.5 C/km lapse to a -65 C tropopause.
+        let temperature_c: Vec<f64> = height_m_msl
+            .iter()
+            .map(|h| f64::max(25.0 - 6.5 * (h - 110.0) / 1000.0, -65.0))
+            .collect();
+        let dewpoint_dep = [
+            2.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 15.0, 18.0, 20.0, 25.0, 30.0, 30.0,
+            30.0, 30.0, 30.0, 30.0,
+        ];
+        let dewpoint_c: Vec<f64> = temperature_c
+            .iter()
+            .zip(dewpoint_dep)
+            .map(|(t, dep)| t - dep)
+            .collect();
+        let n = pressure_hpa.len();
+        // Veering, strengthening flow.
+        let u_ms: Vec<f64> = (0..n)
+            .map(|i| 2.0 + 33.0 * i as f64 / (n - 1) as f64)
+            .collect();
+        let v_ms: Vec<f64> = (0..n)
+            .map(|i| 5.0 + 10.0 * i as f64 / (n - 1) as f64)
+            .collect();
+        let column = SoundingColumn {
+            pressure_hpa,
+            height_m_msl,
+            temperature_c,
+            dewpoint_c,
+            u_ms,
+            v_ms,
+            omega_pa_s: Vec::new(),
+            metadata: SoundingMetadata {
+                station_id: "TEST".to_owned(),
+                valid_time: "2026-06-09 05:51Z".to_owned(),
+                latitude_deg: Some(38.81),
+                longitude_deg: Some(-94.26),
+                elevation_m: Some(110.0),
+                ..SoundingMetadata::default()
+            },
+        };
+        NativeSounding::from_column(&column).expect("synthetic column is sharprs-valid")
+    }
+
+    /// Painting the composite in all three packings must not panic — this
+    /// exercises every block draw through its per-variant origin (same
+    /// end-to-end pattern as `annotate::draw`'s paint test).
+    #[test]
+    fn painting_all_three_variants_is_panic_free() {
+        let sounding = synthetic_sounding();
+        // Pane shapes straddling all three aspect bands.
+        let panes = [
+            vec2(1200.0, 900.0), // 4:3 -> STANDARD
+            vec2(1920.0, 900.0), // ultrawide dock -> WIDE
+            vec2(540.0, 1350.0), // right column -> TALL
+        ];
+        for size in panes {
+            let ctx = egui::Context::default();
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                draw_full(ui, Rect::from_min_size(Pos2::ZERO, size), &sounding);
+            });
+        }
     }
 }

@@ -24,21 +24,33 @@ use super::{
 
 const BUCKET_BASE: &str = "https://fmi-opendata-radar-volume-hdf5.s3.amazonaws.com";
 
-/// Station names for FMI's radar network site codes. Codes missing here
-/// (new radars) fall back to the uppercased code.
-const SITE_LABELS: &[(&str, &str)] = &[
-    ("fianj", "Anjalankoski"),
-    ("fiika", "Ikaalinen"),
-    ("fikan", "Kankaanpää"),
-    ("fikes", "Kesälahti"),
-    ("fikor", "Korppoo"),
-    ("fikuo", "Kuopio"),
-    ("filuo", "Luosto"),
-    ("finur", "Nurmes"),
-    ("fipet", "Petäjävesi"),
-    ("fiuta", "Utajärvi"),
-    ("fivih", "Vihti"),
-    ("fivim", "Vimpeli"),
+/// Station names and radar coordinates for FMI's radar network site codes
+/// (the bucket listing carries no coordinates). Codes missing here (new
+/// radars) fall back to the uppercased code without coordinates.
+///
+/// Coordinates: EUMETNET OPERA radar database, `OPERA_RADARS_DB.json`
+/// (fetched 2026-06-12) from
+/// <https://eumetnet.eu/activities/observations-programme/current-activities/opera/>,
+/// matched by the `fi***` ODIM site code directly; `fiika` (Ikaalinen) is
+/// no longer in the main database and comes from the companion archive
+/// `OPERA_RADARS_ARH_DB.json` (status 0, decommissioned). The trailing
+/// flag marks stations OPERA lists operational (status 1); decommissioned
+/// codes are kept for archive keys but excluded from the static marker
+/// catalog.
+const FMI_SITES: &[(&str, &str, f32, f32, bool)] = &[
+    ("fianj", "Anjalankoski", 60.9039, 27.1081, true),
+    ("fiika", "Ikaalinen", 61.7673, 23.0764, false),
+    ("fikan", "Kankaanpää", 61.8108, 22.5020, true),
+    ("fikau", "Kaunispää", 68.4344, 27.4440, true),
+    ("fikes", "Kesälahti", 61.9069, 29.7977, true),
+    ("fikor", "Korppoo", 60.1285, 21.6434, true),
+    ("fikuo", "Kuopio", 62.8626, 27.3815, true),
+    ("filuo", "Luosto", 67.1391, 26.8969, true),
+    ("finur", "Nurmes", 63.8378, 29.4489, true),
+    ("fipet", "Petäjävesi", 62.3045, 25.4401, true),
+    ("fiuta", "Utajärvi", 64.7749, 26.3189, true),
+    ("fivih", "Vihti", 60.5562, 24.4956, true),
+    ("fivim", "Vimpeli", 63.1048, 23.8209, true),
 ];
 
 /// FMI Finland: single-file ODIM PVOL frames from the volume bucket.
@@ -110,6 +122,21 @@ impl IntlProvider for FmiProvider {
             "FMI: no PVOL files for site '{site_id}' today or yesterday (UTC)"
         ))
     }
+
+    fn static_sites(&self) -> Vec<IntlSite> {
+        FMI_SITES
+            .iter()
+            .filter(|&&(.., active)| active)
+            .map(|&(code, label, latitude_deg, longitude_deg, _)| IntlSite {
+                provider_id: self.id(),
+                site_id: code.to_owned(),
+                label: label.to_owned(),
+                country: self.country(),
+                latitude_deg: Some(latitude_deg),
+                longitude_deg: Some(longitude_deg),
+            })
+            .collect()
+    }
 }
 
 /// Today and (for the midnight/outage window) the previous UTC day.
@@ -145,13 +172,14 @@ fn sites_from_prefixes(common_prefixes: &[String]) -> Vec<IntlSite> {
             if code.is_empty() {
                 return None;
             }
+            let known = FMI_SITES.iter().find(|(known, ..)| *known == code);
             Some(IntlSite {
                 provider_id: "fmi",
                 site_id: code.to_owned(),
                 label: site_label(code),
                 country: "Finland",
-                latitude_deg: None,
-                longitude_deg: None,
+                latitude_deg: known.map(|&(_, _, latitude_deg, _, _)| latitude_deg),
+                longitude_deg: known.map(|&(_, _, _, longitude_deg, _)| longitude_deg),
             })
         })
         .collect::<Vec<_>>();
@@ -161,7 +189,7 @@ fn sites_from_prefixes(common_prefixes: &[String]) -> Vec<IntlSite> {
 }
 
 fn site_label(code: &str) -> String {
-    if let Some((_, label)) = SITE_LABELS.iter().find(|(known, _)| *known == code) {
+    if let Some((_, label, ..)) = FMI_SITES.iter().find(|(known, ..)| *known == code) {
         return (*label).to_owned();
     }
     code.to_ascii_uppercase()
@@ -205,13 +233,28 @@ mod tests {
             .find(|site| site.site_id == "fianj")
             .expect("fianj present");
         assert_eq!(anjalankoski.label, "Anjalankoski");
+        assert_eq!(anjalankoski.latitude_deg, Some(60.9039));
+        assert_eq!(anjalankoski.longitude_deg, Some(27.1081));
 
-        // Codes outside the label table keep a code-derived label.
+        // Kaunispää joined the static table from the OPERA database after
+        // the live bucket started listing it.
         let kau = sites
             .iter()
             .find(|site| site.site_id == "fikau")
             .expect("fikau present");
-        assert_eq!(kau.label, "FIKAU");
+        assert_eq!(kau.label, "Kaunispää");
+        assert_eq!(kau.latitude_deg, Some(68.4344));
+
+        // Every live-listed code is in the static table -> all have coords.
+        assert!(
+            sites
+                .iter()
+                .all(|site| site.latitude_deg.is_some() && site.longitude_deg.is_some()),
+            "live catalog should carry static coordinates for every site"
+        );
+
+        // Codes outside the table keep a code-derived label and no coords.
+        assert_eq!(site_label("fixyz"), "FIXYZ");
     }
 
     #[test]

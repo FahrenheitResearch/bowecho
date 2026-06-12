@@ -179,6 +179,20 @@ impl IntlProvider for ShmuProvider {
             merge: true,
         })
     }
+
+    fn static_sites(&self) -> Vec<IntlSite> {
+        SHMU_STATIONS
+            .iter()
+            .map(|&(site_id, label, latitude_deg, longitude_deg)| IntlSite {
+                provider_id: self.id(),
+                site_id: site_id.to_owned(),
+                label: label.to_owned(),
+                country: self.country(),
+                latitude_deg: Some(latitude_deg),
+                longitude_deg: Some(longitude_deg),
+            })
+            .collect()
+    }
 }
 
 /// `{site}_{stamp}_p{N}_h{url-hash}`: stable for one upstream frame, and a

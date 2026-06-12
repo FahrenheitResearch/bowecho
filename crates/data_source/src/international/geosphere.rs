@@ -25,6 +25,16 @@ const DATAHUB_BASE: &str = "https://public.hub.geosphere.at/datahub";
 const FILE_PREFIX: &str = "resources/radar_volumen_hochficht-v1-5min/filelisting/";
 const SITE_ID: &str = "hochficht";
 
+/// Hochficht radar coordinates. The GeoSphere research radar is not in the
+/// EUMETNET OPERA radar database (checked `OPERA_RADARS_DB.json` and the
+/// `OPERA_RADARS_ARH_DB.json` archive, fetched 2026-06-12: no Austrian
+/// Hochficht entry), so these come from the authoritative bytes themselves:
+/// decoded live 2026-06-12 from the ODIM `/where` group of
+/// `WXRHOF_202606120820.hdf` (`lat=48.73688`, `lon=13.92089`,
+/// `height=1333 m`, source `RAD:hochficht`).
+const SITE_LATITUDE_DEG: f32 = 48.7369;
+const SITE_LONGITUDE_DEG: f32 = 13.9209;
+
 /// Listing lookback windows: a fresh feed answers within 12 h; the 72 h
 /// fallback still finds the newest frame across a multi-day outage without
 /// paging through the dataset's full history.
@@ -64,14 +74,7 @@ impl IntlProvider for GeoSphereProvider {
     }
 
     fn list_sites(&self) -> Result<Vec<IntlSite>, String> {
-        Ok(vec![IntlSite {
-            provider_id: self.id(),
-            site_id: SITE_ID.to_owned(),
-            label: "Hochficht".to_owned(),
-            country: self.country(),
-            latitude_deg: None,
-            longitude_deg: None,
-        }])
+        Ok(self.static_sites())
     }
 
     fn latest(&self, site_id: &str) -> Result<FramePlan, String> {
@@ -121,6 +124,17 @@ impl IntlProvider for GeoSphereProvider {
              the last {} h",
             LOOKBACK_HOURS[LOOKBACK_HOURS.len() - 1]
         ))
+    }
+
+    fn static_sites(&self) -> Vec<IntlSite> {
+        vec![IntlSite {
+            provider_id: self.id(),
+            site_id: SITE_ID.to_owned(),
+            label: "Hochficht".to_owned(),
+            country: self.country(),
+            latitude_deg: Some(SITE_LATITUDE_DEG),
+            longitude_deg: Some(SITE_LONGITUDE_DEG),
+        }]
     }
 }
 
@@ -183,6 +197,9 @@ mod tests {
         let sites = provider.list_sites().expect("static site list");
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].site_id, SITE_ID);
+        assert_eq!(sites[0].latitude_deg, Some(SITE_LATITUDE_DEG));
+        assert_eq!(sites[0].longitude_deg, Some(SITE_LONGITUDE_DEG));
+        assert_eq!(sites, provider.static_sites());
 
         let err = provider.latest("vienna").unwrap_err();
         assert!(err.contains("unknown site"), "unexpected error: {err}");

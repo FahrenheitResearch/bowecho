@@ -216,6 +216,20 @@ impl IntlProvider for ChmiProvider {
             merge: true,
         })
     }
+
+    fn static_sites(&self) -> Vec<IntlSite> {
+        CHMI_STATIONS
+            .iter()
+            .map(|&(site_id, label, latitude_deg, longitude_deg)| IntlSite {
+                provider_id: self.id(),
+                site_id: site_id.to_owned(),
+                label: label.to_owned(),
+                country: self.country(),
+                latitude_deg: Some(latitude_deg),
+                longitude_deg: Some(longitude_deg),
+            })
+            .collect()
+    }
 }
 
 /// One CHMI data file: scan task letter, start time, and verbatim name.
