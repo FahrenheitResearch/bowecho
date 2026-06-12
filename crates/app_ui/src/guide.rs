@@ -763,6 +763,11 @@ fn shortcuts(ui: &mut egui::Ui) {
         "screenshot — full window to the clipboard + a PNG in Pictures/BowEcho",
     );
     key_row(ui, "Shift+F12", "screenshot cropped to the map only");
+    key_row(
+        ui,
+        "Tab",
+        "clean screen — hide all toolbars/panels for pure-radar captures (Tab or Esc restores)",
+    );
     para(
         ui,
         "Rebind the number row in config.json — Settings \u{25b8} Hotkeys shows the current \

@@ -684,6 +684,9 @@ struct ViewerApp {
     show_satellite: bool,
     /// In-app Guide window (reference docs, opened on demand — never forced).
     show_guide: bool,
+    /// Clean-screen mode: hide ALL chrome (top bar, sidebar, status) so
+    /// captures are pure radar. Tab toggles, Esc restores.
+    chrome_hidden: bool,
     /// Model-data dock (rusty-weather rw-ui panels), created on first open.
     model_dock: Option<model_data::ModelDataDock>,
     model_dock_open: bool,
@@ -2689,6 +2692,7 @@ impl ViewerApp {
             sat_player: rw_ui::SatPlayerPanel::new(),
             show_satellite: false,
             show_guide: false,
+            chrome_hidden: false,
             model_dock: None,
             model_dock_open: false,
             sat_layer: None,
@@ -6278,19 +6282,83 @@ impl eframe::App for ViewerApp {
         self.handle_keyboard_navigation(&ctx);
         self.handle_media(&ctx);
 
-        egui::Panel::top("top_bar")
-            .exact_size(42.0)
-            .show_inside(ui, |ui| self.top_bar(ui));
+        // Clean-screen mode: Tab hides every chrome panel so captures are
+        // pure radar (data panels — cross-section, RHI — stay). Esc or Tab
+        // restores; a hover hint near the top edge keeps it discoverable
+        // without ever appearing in a pointer-away screenshot.
+        if !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
+            self.chrome_hidden = !self.chrome_hidden;
+        }
+        if self.chrome_hidden && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.chrome_hidden = false;
+        }
+        if !self.chrome_hidden {
+            egui::Panel::top("top_bar")
+                .exact_size(42.0)
+                .show_inside(ui, |ui| self.top_bar(ui));
 
-        egui::Panel::right("product_tilt_panel")
-            .resizable(true)
-            .default_size(SIDEBAR_DEFAULT_WIDTH)
-            .size_range(SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH)
-            .show_inside(ui, |ui| self.side_panel(ui, &ctx));
+            egui::Panel::right("product_tilt_panel")
+                .resizable(true)
+                .default_size(SIDEBAR_DEFAULT_WIDTH)
+                .size_range(SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH)
+                .show_inside(ui, |ui| self.side_panel(ui, &ctx));
 
-        egui::Panel::bottom("status_bar")
-            .exact_size(30.0)
-            .show_inside(ui, |ui| self.status_bar(ui));
+            egui::Panel::bottom("status_bar")
+                .exact_size(30.0)
+                .show_inside(ui, |ui| self.status_bar(ui));
+        } else {
+            // The minimal readout stays: a shared radar image without
+            // site / product / tilt / scan time is meteorologically
+            // useless — this chip IS the attribution.
+            if let Some(volume) = &self.volume {
+                let tilt = volume
+                    .cuts
+                    .get(self.selected_cut)
+                    .map(|cut| format!(" {:.1}°", cut.elevation_deg))
+                    .unwrap_or_default();
+                let line = format!(
+                    "{} {}{tilt} · {}",
+                    volume.site.id,
+                    self.selected_product.label(),
+                    volume.volume_time.format("%Y-%m-%d %H:%M:%SZ"),
+                );
+                egui::Area::new(egui::Id::new("chrome_readout"))
+                    .fixed_pos(egui::pos2(10.0, 8.0))
+                    .show(&ctx, |ui| {
+                        let galley = ui.painter().layout_no_wrap(
+                            line,
+                            egui::FontId::monospace(13.0),
+                            egui::Color32::from_rgb(235, 240, 246),
+                        );
+                        let rect = egui::Rect::from_min_size(
+                            ui.next_widget_position(),
+                            galley.size() + egui::vec2(12.0, 8.0),
+                        );
+                        ui.painter().rect_filled(
+                            rect,
+                            4.0,
+                            egui::Color32::from_rgba_unmultiplied(10, 13, 18, 200),
+                        );
+                        ui.painter().galley(
+                            rect.min + egui::vec2(6.0, 4.0),
+                            galley,
+                            egui::Color32::from_rgb(235, 240, 246),
+                        );
+                        ui.allocate_rect(rect, egui::Sense::hover());
+                    });
+            }
+            if ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| p.y < 60.0)) {
+                egui::Area::new(egui::Id::new("chrome_hint"))
+                    .fixed_pos(egui::pos2(12.0, 38.0))
+                    .show(&ctx, |ui| {
+                        ui.label(
+                            egui::RichText::new("Tab — show UI")
+                                .size(12.0)
+                                .color(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150)),
+                        );
+                    });
+            }
+        }
 
         if self.cross_section_armed || self.cross_section_a_lonlat.is_some() {
             egui::Panel::bottom("cross_section_panel")
@@ -22375,6 +22443,7 @@ mod tests {
             sat_player: rw_ui::SatPlayerPanel::new(),
             show_satellite: false,
             show_guide: false,
+            chrome_hidden: false,
             model_dock: None,
             model_dock_open: false,
             sat_layer: None,
