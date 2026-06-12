@@ -804,6 +804,11 @@ struct ViewerApp {
     poll_last_file: Option<String>,
     poll_next: Option<Instant>,
     poll_rx: Option<mpsc::Receiver<PolledVolumeResult>>,
+    /// In-flight international Load Loop: a stream of (identity, volume)
+    /// frames oldest-first from [`fetch_intl_recent_frames`], installed
+    /// through the same `install_polled_volume` history path the poll
+    /// uses. While set, the regular intl poll tick defers.
+    intl_loop_rx: Option<mpsc::Receiver<IntlLoopFrameResult>>,
     /// What the poller follows when `poll_active`: the custom URL
     /// (default) or an international provider/site from data_source's
     /// registry. One poll, two sources — see [`PollSource`].
@@ -976,9 +981,31 @@ struct ViewerApp {
     annotations: annotate::AnnotationState,
 }
 
+/// One fetched international frame: `Ok(Some)` = new (identity, volume),
+/// `Ok(None)` = unchanged upstream, `Err` = catalog/download/decode error.
+type IntlFrameResult = std::result::Result<Option<(String, RadarVolume)>, String>;
+/// One streamed Load Loop frame (no unchanged marker — every plan in the
+/// window downloads).
+type IntlLoopFrameResult = std::result::Result<(String, RadarVolume), String>;
+
+/// An overlay layer's international source: refreshed from the provider
+/// registry's catalog probe + identity dedupe instead of the US Level-II
+/// chain (field request: Ctrl+right-click multi-radar for intl sites).
+struct IntlOverlayFeed {
+    provider_id: String,
+    site_id: String,
+    /// Last installed FramePlan identity — poll-style dedupe, so an
+    /// unchanged frame costs one catalog probe and zero downloads.
+    last_identity: Option<String>,
+    rx: Option<mpsc::Receiver<IntlFrameResult>>,
+}
+
 struct RadarOverlayLayer {
     id: u64,
     site: RadarSite,
+    /// `Some` = this layer follows an international feed; `None` = US
+    /// Level-II via `start_radar_layer_load`.
+    intl_feed: Option<IntlOverlayFeed>,
     source_path: Option<PathBuf>,
     volume: Option<Arc<RadarVolume>>,
     load_timing: Option<LoadTimings>,
@@ -1006,6 +1033,7 @@ impl RadarOverlayLayer {
         Self {
             id,
             site,
+            intl_feed: None,
             source_path: None,
             volume: None,
             load_timing: None,
@@ -2937,6 +2965,7 @@ impl ViewerApp {
             poll_last_file: None,
             poll_next: None,
             poll_rx: None,
+            intl_loop_rx: None,
             spc_data: spc_layers::SpcData::default(),
             spc_kinds_memory: restored_overlays.4.clone(),
             spc_outlooks_enabled: restored_overlays.4,
@@ -3205,6 +3234,22 @@ impl ViewerApp {
             if !layer.visible || layer.load_receiver.is_some() {
                 continue;
             }
+            // International layers refresh on the intl poll cadence via
+            // the provider catalog probe — never the US Level-II chain.
+            if let Some(feed) = &layer.intl_feed {
+                if feed.rx.is_none() {
+                    let refresh_after = Duration::from_secs(INTL_POLL_SECONDS)
+                        + Duration::from_millis((index as u64 % 8) * 350);
+                    if layer
+                        .last_realtime_level2_refresh
+                        .is_none_or(|last_refresh| last_refresh.elapsed() >= refresh_after)
+                    {
+                        Self::start_intl_radar_layer_load(layer, ctx);
+                        requested_repaint = true;
+                    }
+                }
+                continue;
+            }
             let refresh_after = Duration::from_secs(OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS)
                 + Duration::from_millis((index as u64 % 8) * 350);
             let should_refresh = layer
@@ -3218,6 +3263,62 @@ impl ViewerApp {
 
         if !requested_repaint && !self.radar_layers.is_empty() {
             ctx.request_repaint_after(Duration::from_secs(1));
+        }
+    }
+
+    /// Ctrl+right-click: overlay the nearest radar — US or international,
+    /// whichever marker is geographically closer (field request: intl
+    /// multi-radar like CONUS).
+    fn add_nearest_radar_overlay_at(
+        &mut self,
+        rect: egui::Rect,
+        pointer: egui::Pos2,
+        ctx: &egui::Context,
+    ) {
+        let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
+        let sq_deg = |site_lat: f32, site_lon: f32| {
+            let dx = (site_lon - lon) * lat.to_radians().cos();
+            let dy = site_lat - lat;
+            dx.mul_add(dx, dy * dy)
+        };
+        let us = self
+            .nearest_site_to_position(rect, pointer)
+            .and_then(|index| {
+                let site = self.sites.get(index)?;
+                let (site_lat, site_lon) = site_location(site)?;
+                Some((index, sq_deg(site_lat, site_lon)))
+            });
+        let intl = data_source::international::intl_static_sites()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, site)| {
+                let (Some(site_lat), Some(site_lon)) = (site.latitude_deg, site.longitude_deg)
+                else {
+                    return None;
+                };
+                Some((index, sq_deg(site_lat, site_lon)))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        match (us, intl) {
+            (Some((index, us_d)), Some((_, intl_d))) if us_d <= intl_d => {
+                if let Some(site) = self.sites.get(index).cloned() {
+                    self.add_or_refresh_radar_layer(site, ctx);
+                }
+            }
+            (_, Some((intl_index, _))) => {
+                if let Some(intl_site) = data_source::international::intl_static_sites()
+                    .get(intl_index)
+                    .cloned()
+                {
+                    self.add_or_refresh_intl_radar_layer(&intl_site, ctx);
+                }
+            }
+            (Some((index, _)), None) => {
+                if let Some(site) = self.sites.get(index).cloned() {
+                    self.add_or_refresh_radar_layer(site, ctx);
+                }
+            }
+            (None, None) => {}
         }
     }
 
@@ -3251,6 +3352,132 @@ impl ViewerApp {
         Self::start_radar_layer_load(&mut layer, LatestLoadMode::User, ctx);
         self.status = format!("Added overlay {}", site.level2_id);
         self.radar_layers.push(layer);
+    }
+
+    /// Ctrl+right-click on (or near) an international marker: add that
+    /// site as a radar overlay layer, mirroring the US multi-radar flow
+    /// (field request). Dedupe by provider/site; respects the layer cap.
+    fn add_or_refresh_intl_radar_layer(
+        &mut self,
+        intl: &data_source::international::IntlSite,
+        ctx: &egui::Context,
+    ) {
+        if let Some(index) = self.radar_layers.iter().position(|layer| {
+            layer.intl_feed.as_ref().is_some_and(|feed| {
+                feed.provider_id == intl.provider_id && feed.site_id == intl.site_id
+            })
+        }) {
+            let layer = &mut self.radar_layers[index];
+            layer.visible = true;
+            if layer
+                .intl_feed
+                .as_ref()
+                .is_some_and(|feed| feed.rx.is_none())
+            {
+                Self::start_intl_radar_layer_load(layer, ctx);
+            }
+            self.status = format!("Refreshing overlay {}", layer.site.level2_id);
+            return;
+        }
+
+        if self.radar_layers.len() >= MAX_RADAR_OVERLAY_LAYERS {
+            let remove_index = self
+                .radar_layers
+                .iter()
+                .position(|layer| !layer.visible)
+                .unwrap_or(0);
+            self.radar_layers.remove(remove_index);
+        }
+
+        let id = self.next_radar_layer_id;
+        self.next_radar_layer_id = self.next_radar_layer_id.saturating_add(1);
+        let site = RadarSite {
+            level2_id: intl.label.clone(),
+            name: Some(format!("{}/{}", intl.provider_id, intl.site_id)),
+            latitude_deg: intl.latitude_deg,
+            longitude_deg: intl.longitude_deg,
+        };
+        let mut layer = RadarOverlayLayer::new(id, site);
+        layer.intl_feed = Some(IntlOverlayFeed {
+            provider_id: intl.provider_id.to_owned(),
+            site_id: intl.site_id.clone(),
+            last_identity: None,
+            rx: None,
+        });
+        Self::start_intl_radar_layer_load(&mut layer, ctx);
+        self.status = format!("Added overlay {}", intl.label);
+        self.radar_layers.push(layer);
+    }
+
+    /// One catalog-probe + download for an international overlay layer —
+    /// the layer-side analog of one intl poll tick.
+    fn start_intl_radar_layer_load(layer: &mut RadarOverlayLayer, ctx: &egui::Context) {
+        let Some(feed) = &mut layer.intl_feed else {
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        feed.rx = Some(receiver);
+        layer.last_realtime_level2_refresh = Some(Instant::now());
+        let provider_id = feed.provider_id.clone();
+        let site_id = feed.site_id.clone();
+        let last_identity = feed.last_identity.clone();
+        layer.status = format!("Loading {}", layer.site.level2_id);
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            let result = fetch_intl_frame(&provider_id, &site_id, last_identity.as_deref());
+            let _ = sender.send(result);
+            ctx_clone.request_repaint();
+        });
+        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+    }
+
+    /// Drain international overlay-layer fetches (the intl analog of
+    /// `poll_radar_layer_loads`).
+    fn poll_intl_radar_layer_loads(&mut self, ctx: &egui::Context) {
+        let mut saw_message = false;
+        for layer in &mut self.radar_layers {
+            let message = {
+                let Some(feed) = &layer.intl_feed else {
+                    continue;
+                };
+                let Some(receiver) = &feed.rx else {
+                    continue;
+                };
+                match receiver.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => continue,
+                    Err(mpsc::TryRecvError::Disconnected) => None,
+                    Ok(message) => Some(message),
+                }
+            };
+            saw_message = true;
+            let label = layer.site.level2_id.clone();
+            let Some(feed) = &mut layer.intl_feed else {
+                continue;
+            };
+            feed.rx = None;
+            match message {
+                Some(Ok(Some((identity, volume)))) => {
+                    feed.last_identity = Some(identity.clone());
+                    Self::install_radar_layer_volume(
+                        layer,
+                        DecodedLoad {
+                            path: PathBuf::from(format!("intl:{identity}")),
+                            volume,
+                            timings: LoadTimings::default(),
+                            status: FrameStatus::LiveComplete,
+                            source_label: identity,
+                        },
+                    );
+                    layer.status = format!("Loaded {label}");
+                }
+                Some(Ok(None)) => layer.status = format!("Current {label}"),
+                Some(Err(err)) => layer.status = format!("Load failed for {label}: {err}"),
+                None => layer.status = format!("Layer load worker disconnected ({label})"),
+            }
+        }
+        if saw_message {
+            ctx.request_repaint();
+        }
     }
 
     fn start_radar_layer_load(
@@ -6333,8 +6560,10 @@ impl ViewerApp {
                 self.status = format!("Archive: {} volumes listed", volumes.len());
                 self.archive_volumes = Some(volumes);
                 // Track jump: load the loop SPANNING the event window
-                // [track start - 15 min, end + 15 min] and auto-play it
-                // at the lowest tilt — "like it would have been live".
+                // plus the user-set scans of context each side and
+                // auto-play it at the lowest tilt — "like it would have
+                // been live".
+                let event_pad = usize::from(self.app_settings.event_pad_frames);
                 let pending_range = self.event_explorer.pending_range.take().and_then(
                     |(window_start, window_end)| {
                         let volumes = self.archive_volumes.as_ref()?;
@@ -6354,6 +6583,7 @@ impl ViewerApp {
                             &labels,
                             &start_label,
                             &end_label,
+                            event_pad,
                             MAX_HISTORY_FRAME_LIMIT,
                         )
                     },
@@ -6575,6 +6805,8 @@ impl eframe::App for ViewerApp {
         self.poll_async_site_catalog(&ctx);
         self.poll_async_load(&ctx);
         self.poll_radar_layer_loads(&ctx);
+        self.poll_intl_radar_layer_loads(&ctx);
+        self.drain_intl_loop_load(&ctx);
         self.poll_async_render(&ctx);
         self.poll_radar_layer_renders(&ctx);
         self.poll_async_hazards(&ctx);
@@ -7663,13 +7895,25 @@ impl ViewerApp {
             if fixed_action_button(ui, "Load Latest", 88.0).clicked()
                 && self.load_receiver.is_none()
             {
-                self.load_latest_level2_for_selected_site(ui.ctx());
-                self.remember_startup_site();
+                // An armed international poll owns the primary view —
+                // Latest forces a poll tick instead of yanking the view
+                // back to the last US site (field report).
+                if self.intl_poll_owns_primary() {
+                    self.poll_next = None;
+                    self.status = "Refreshing international feed…".to_owned();
+                } else {
+                    self.load_latest_level2_for_selected_site(ui.ctx());
+                    self.remember_startup_site();
+                }
             }
             if fixed_action_button(ui, "Load Loop", 82.0).clicked() && self.load_receiver.is_none()
             {
-                self.load_loop_history_for_selected_site(ui.ctx());
-                self.remember_startup_site();
+                if self.intl_poll_owns_primary() {
+                    self.start_intl_loop_load(ui.ctx());
+                } else {
+                    self.load_loop_history_for_selected_site(ui.ctx());
+                    self.remember_startup_site();
+                }
             }
             ui.checkbox(&mut self.realtime_level2_auto_refresh, "Live");
             ui.checkbox(&mut self.display_live_chunk_updates, "Chunks")
@@ -8695,7 +8939,11 @@ impl ViewerApp {
         if let Some(index) = refresh_index
             && let Some(layer) = self.radar_layers.get_mut(index)
         {
-            Self::start_radar_layer_load(layer, LatestLoadMode::User, ctx);
+            if layer.intl_feed.is_some() {
+                Self::start_intl_radar_layer_load(layer, ctx);
+            } else {
+                Self::start_radar_layer_load(layer, LatestLoadMode::User, ctx);
+            }
         }
         if let Some(site) = center_site
             && let Some((latitude_deg, longitude_deg)) = site_location(&site)
@@ -8703,14 +8951,27 @@ impl ViewerApp {
             self.center_map_on(latitude_deg, longitude_deg);
         }
         if let Some(site) = promote_site {
-            if let Some(index) = self
-                .sites
+            // An international overlay promotes to the primary by starting
+            // its live poll (the intl analog of a latest-volume load).
+            if let Some(feed) = self
+                .radar_layers
                 .iter()
-                .position(|candidate| candidate.level2_id == site.level2_id)
+                .find(|layer| layer.site.level2_id == site.level2_id)
+                .and_then(|layer| layer.intl_feed.as_ref())
             {
-                self.selected_site_index = index;
+                let (provider_id, site_id) = (feed.provider_id.clone(), feed.site_id.clone());
+                self.start_intl_poll(provider_id, site_id);
+                self.status = format!("Live-polling {}", site.level2_id);
+            } else {
+                if let Some(index) = self
+                    .sites
+                    .iter()
+                    .position(|candidate| candidate.level2_id == site.level2_id)
+                {
+                    self.selected_site_index = index;
+                }
+                self.start_latest_level2_load(site, ctx);
             }
-            self.start_latest_level2_load(site, ctx);
         }
         if let Some(index) = remove_index {
             self.radar_layers.remove(index);
@@ -9622,7 +9883,11 @@ impl ViewerApp {
                 ui.label(format!("map {:.0} px/deg", self.map_scale));
                 ui.separator();
                 let readout = if let Some(readout) = &self.cursor_readout {
-                    format_cursor_readout(readout, self.units())
+                    let display_unit = table_display_unit(
+                        self.active_table_for_product(&readout.product),
+                        &readout.product,
+                    );
+                    format_cursor_readout(readout, self.units(), display_unit)
                 } else {
                     format!(
                         "{} cut {}",
@@ -10082,12 +10347,9 @@ impl ViewerApp {
             && let Some(pointer) = response.interact_pointer_pos()
         {
             if ui.input(|input| input.modifiers.ctrl) {
-                if let Some(index) = self.nearest_site_to_position(rect, pointer)
-                    && let Some(site) = self.sites.get(index).cloned()
-                {
-                    // Layer add must not retarget the primary auto-refresh.
-                    self.add_or_refresh_radar_layer(site, ui.ctx());
-                }
+                // Layer add must not retarget the primary auto-refresh.
+                // Nearest marker wins, US or international.
+                self.add_nearest_radar_overlay_at(rect, pointer, ui.ctx());
             } else if self.app_settings.right_click_loads_nearest {
                 let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
                 self.switch_to_nearest_radar_at(lon, lat, ui.ctx());
@@ -10392,12 +10654,9 @@ impl ViewerApp {
                 && let Some(pointer) = response.interact_pointer_pos()
             {
                 if ui.input(|input| input.modifiers.ctrl) {
-                    if let Some(index) = self.nearest_site_to_position(cell, pointer)
-                        && let Some(site) = self.sites.get(index).cloned()
-                    {
-                        // Layer add must not retarget the primary auto-refresh.
-                        self.add_or_refresh_radar_layer(site, ui.ctx());
-                    }
+                    // Layer add must not retarget the primary auto-refresh.
+                    // Nearest marker wins, US or international.
+                    self.add_nearest_radar_overlay_at(cell, pointer, ui.ctx());
                 } else if self.app_settings.right_click_loads_nearest {
                     let (lon, lat) = self.screen_to_lon_lat(cell, pointer);
                     self.switch_to_nearest_radar_at(lon, lat, ui.ctx());
@@ -12897,6 +13156,87 @@ impl ViewerApp {
         }
     }
 
+    /// True when an armed, active international poll owns the primary view
+    /// — the state in which Load Latest / Load Loop must target the
+    /// international feed, not the last US site (field report: Load Loop
+    /// on a foreign radar loaded the previous US radar's loop).
+    fn intl_poll_owns_primary(&self) -> bool {
+        self.poll_active
+            && matches!(&self.poll_source, PollSource::Intl { .. })
+            && self.poll_source_armed()
+    }
+
+    /// Load Loop for the active international feed: stream up to the
+    /// frame-history limit of recent frames (provider catalogs permitting)
+    /// through the shared poll install path, oldest first, so they land as
+    /// a playable history loop.
+    fn start_intl_loop_load(&mut self, ctx: &egui::Context) {
+        if self.intl_loop_rx.is_some() {
+            return;
+        }
+        let PollSource::Intl {
+            provider_id,
+            site_id,
+        } = self.poll_source.clone()
+        else {
+            return;
+        };
+        let count = self.history_frame_limit.max(2);
+        let (sender, receiver) = mpsc::channel();
+        self.intl_loop_rx = Some(receiver);
+        self.status = format!("Loading {provider_id}/{site_id} loop…");
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            fetch_intl_recent_frames(&provider_id, &site_id, count, &sender);
+            ctx_clone.request_repaint();
+        });
+        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+    }
+
+    /// Drain the international loop stream: every landed frame installs
+    /// through `install_polled_volume` (history upsert + follow), and the
+    /// newest identity becomes the poll dedupe key so the live poll
+    /// continues seamlessly after the loop.
+    fn drain_intl_loop_load(&mut self, ctx: &egui::Context) {
+        if self.intl_loop_rx.is_none() {
+            return;
+        }
+        let mut frames = Vec::new();
+        let mut errors = Vec::new();
+        let mut done = false;
+        if let Some(receiver) = &self.intl_loop_rx {
+            loop {
+                match receiver.try_recv() {
+                    Ok(Ok(frame)) => frames.push(frame),
+                    Ok(Err(message)) => errors.push(message),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let landed = !frames.is_empty();
+        for (identity, volume) in frames {
+            self.poll_last_file = Some(identity.clone());
+            self.install_polled_volume(&identity, Arc::new(volume), ctx);
+        }
+        if let Some(message) = errors.last() {
+            self.status = format!("Intl loop: {message}");
+        } else if done {
+            self.intl_loop_rx = None;
+            self.status = "International loop loaded".to_owned();
+        } else if landed && let Some(name) = &self.poll_last_file {
+            self.status = format!("Intl loop: {name}");
+        }
+        if done {
+            self.intl_loop_rx = None;
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+        }
+    }
+
     /// International feed polling: every [`INTL_POLL_SECONDS`] ask the
     /// provider's catalog for the newest frame ([`data_source::international`]
     /// registry); when its identity changes, download every plan part,
@@ -12909,6 +13249,12 @@ impl ViewerApp {
     /// radar path.
     fn poll_intl(&mut self, provider_id: &str, site_id: &str, ctx: &egui::Context) {
         if !self.poll_active || provider_id.is_empty() || site_id.is_empty() {
+            return;
+        }
+        // A Load Loop stream is installing history right now — let it
+        // finish rather than racing it (it leaves the newest identity as
+        // the dedupe key, so the next tick is a cheap no-change probe).
+        if self.intl_loop_rx.is_some() {
             return;
         }
         let due = self
@@ -15280,16 +15626,21 @@ impl ViewerApp {
         self.draw_colorbar_for_product(painter, rect, &self.selected_product.clone());
     }
 
+    /// The table the product actually renders with: the per-product
+    /// palette override when one is set, else the family default.
+    fn active_table_for_product(&self, product: &DisplayProduct) -> &ColorTable {
+        self.palette_product_overrides
+            .get(product.label())
+            .unwrap_or_else(|| self.color_tables.for_family(product.color_family()))
+    }
+
     fn draw_colorbar_for_product(
         &self,
         painter: &egui::Painter,
         rect: egui::Rect,
         product: &DisplayProduct,
     ) {
-        let table = self
-            .palette_product_overrides
-            .get(product.label())
-            .unwrap_or_else(|| self.color_tables.for_family(product.color_family()));
+        let table = self.active_table_for_product(product);
         let stops = table.stops();
         let (Some(first), Some(last)) = (stops.first(), stops.last()) else {
             return;
@@ -15347,13 +15698,19 @@ impl ViewerApp {
             painter.line_segment(seg, border);
         }
 
-        // value ticks + units
+        // value ticks + units — both in the table's DECLARED unit space
+        // (an mph velocity table ticks in mph under an mph chip).
+        let (unit_label, unit_scale) = table_display_unit(table, product);
         let label_color = egui::Color32::from_rgb(214, 220, 228);
         let font = egui::FontId::proportional(11.0);
-        let decimals = if (vmax - vmin) < 5.0 { 2 } else { 0 };
+        let decimals = if (vmax - vmin) / unit_scale < 5.0 {
+            2
+        } else {
+            0
+        };
         for t in 0..=5 {
             let f = t as f32 / 5.0;
-            let v = vmax + (vmin - vmax) * f;
+            let v = (vmax + (vmin - vmax) * f) / unit_scale;
             let y = top + bar_h * f;
             painter.text(
                 egui::pos2(x0 - 5.0, y),
@@ -15366,7 +15723,7 @@ impl ViewerApp {
         painter.text(
             egui::pos2(x0 + bar_w * 0.5, top - 10.0),
             egui::Align2::CENTER_CENTER,
-            product_units(product),
+            unit_label,
             font,
             label_color,
         );
@@ -15433,11 +15790,17 @@ impl ViewerApp {
             lines.push(format!("{lat:.3}, {lon:.3}"));
         }
         if let Some(readout) = &readout {
-            let units = product_units(&readout.product);
+            // Value in the active table's declared unit space (an mph
+            // velocity table reads out mph) — the SI diagnostics below
+            // (raw VEL, Nyquist) deliberately stay m/s.
+            let (units, unit_scale) = table_display_unit(
+                self.active_table_for_product(&readout.product),
+                &readout.product,
+            );
             lines.push(format!(
                 "{} {:.1}{}{}",
                 readout.product.label(),
-                readout.value,
+                readout.value / unit_scale,
                 if units.is_empty() { "" } else { " " },
                 units
             ));
@@ -19038,6 +19401,33 @@ fn product_units(product: &DisplayProduct) -> &'static str {
     }
 }
 
+/// The display unit an internal-m/s product takes from the active color
+/// table: a velocity/SW table declared in kt or mph relabels AND rescales
+/// the readout, colorbar ticks, and unit chip — GR2A semantics, where the
+/// palette's `Units:` header is the product's display unit (field report:
+/// an mph table's editor said mph while the map readout stayed m/s).
+/// Returns (label, declared→internal factor — divide internal values by it
+/// for display). Non-m/s products and SI/unknown declarations are identity.
+fn table_display_unit(table: &ColorTable, product: &DisplayProduct) -> (&'static str, f32) {
+    let base = product_units(product);
+    if base != "m/s" {
+        return (base, 1.0);
+    }
+    let declared = table
+        .units()
+        .map(str::trim)
+        .filter(|units| !units.is_empty());
+    let Some(declared) = declared else {
+        return (base, 1.0);
+    };
+    match declared.to_ascii_lowercase().as_str() {
+        "kt" | "kts" | "knot" | "knots" => ("kt", color_tables::unit_scale_to_internal(declared)),
+        "mph" | "mi/h" => ("mph", color_tables::unit_scale_to_internal(declared)),
+        // m/s, mps, and unrecognized spellings stay SI (factor 1).
+        _ => (base, 1.0),
+    }
+}
+
 /// Subdivide the map canvas into per-pane cell rects for a layout. `One`
 /// returns exactly `[outer]` (no inset/gap) so single-pane stays byte-identical
 /// to today. `TwoVertical` splits left|right; `FourGrid` is 2×2.
@@ -19336,16 +19726,23 @@ fn family_threshold_is_symmetric(family: ColorTableFamily) -> bool {
     )
 }
 
-fn format_cursor_readout(readout: &CursorReadout, unit_system: units::Units) -> String {
+fn format_cursor_readout(
+    readout: &CursorReadout,
+    unit_system: units::Units,
+    display_unit: (&str, f32),
+) -> String {
     let raw = readout
         .raw
         .map(|raw| raw.to_string())
         .unwrap_or_else(|| "-".to_owned());
-    let units = product_units(&readout.product);
+    // Main value in the active table's declared unit space (see
+    // `table_display_unit`); the SI diagnostics (raw VEL, Vrot, Nyq)
+    // deliberately stay m/s.
+    let (units, unit_scale) = display_unit;
     let value = if units.is_empty() {
         format!("{:.1}", readout.value)
     } else {
-        format!("{:.1} {units}", readout.value)
+        format!("{:.1} {units}", readout.value / unit_scale)
     };
     let base_value = readout
         .base_value
@@ -22531,6 +22928,16 @@ fn fetch_intl_frame(
     if last_identity == Some(plan.identity.as_str()) {
         return Ok(None);
     }
+    fetch_assemble_intl_plan(&plan, site_id).map(Some)
+}
+
+/// Download every part of one [`FramePlan`], decode (JMA tars through the
+/// site-filtered decoder), and assemble — the shared download half of
+/// [`fetch_intl_frame`], reused by the loop loader.
+fn fetch_assemble_intl_plan(
+    plan: &data_source::international::FramePlan,
+    site_id: &str,
+) -> std::result::Result<(String, RadarVolume), String> {
     let mut decoded = Vec::with_capacity(plan.parts.len());
     for part in &plan.parts {
         let raw = data_source::fetch_volume_bytes(&part.url)
@@ -22552,7 +22959,46 @@ fn fetch_intl_frame(
     }
     let volume = assemble_intl_parts(plan.merge, decoded)
         .map_err(|err| format!("{}: {err}", plan.identity))?;
-    Ok(Some((plan.identity, volume)))
+    Ok((plan.identity.clone(), volume))
+}
+
+/// Load Loop for an international feed (field request: the button used to
+/// fall through to the last US site): describe up to `count` recent frames
+/// via the provider's `recent`, then fetch + assemble each OLDEST FIRST,
+/// streaming every frame to `sender` as it lands so the history loop fills
+/// progressively. One bad frame is reported and skipped — a gap must not
+/// kill the rest of the loop. The receiver treats channel close as done.
+fn fetch_intl_recent_frames(
+    provider_id: &str,
+    site_id: &str,
+    count: usize,
+    sender: &mpsc::Sender<IntlLoopFrameResult>,
+) {
+    let providers = data_source::international::intl_providers();
+    let Some(provider) = providers
+        .iter()
+        .find(|provider| provider.id() == provider_id)
+    else {
+        let _ = sender.send(Err(format!(
+            "unknown international provider '{provider_id}'"
+        )));
+        return;
+    };
+    let plans = match provider.recent(site_id, count) {
+        Ok(plans) => plans,
+        Err(err) => {
+            let _ = sender.send(Err(err));
+            return;
+        }
+    };
+    // Providers return oldest-first; keep the NEWEST `count` defensively.
+    let skip = plans.len().saturating_sub(count);
+    for plan in plans.into_iter().skip(skip) {
+        let message = fetch_assemble_intl_plan(&plan, site_id);
+        if sender.send(message).is_err() {
+            return; // receiver dropped (source switched) — stop downloading
+        }
+    }
 }
 
 /// Assemble decoded plan parts into the volume to install. Split frames
@@ -23235,6 +23681,36 @@ mod tests {
         }
     }
 
+    /// A velocity palette's declared `Units:` is the display unit (GR2A
+    /// semantics): mph tables read out and tick in mph; SI and non-m/s
+    /// products are identity.
+    #[test]
+    fn table_display_unit_follows_the_declared_palette_units() {
+        let mph = ColorTable::parse_gr_pal(
+            "MPH VEL",
+            "Product: BV\nUnits: MPH\nColor: -89 12 24 36\nColor: 89 200 210 220\n",
+        )
+        .expect("mph table parses");
+        let product = DisplayProduct::Moment(MomentType::Velocity);
+        let (label, scale) = table_display_unit(&mph, &product);
+        assert_eq!(label, "mph");
+        // Stops scaled into m/s at parse; display divides back to ±89.
+        let vmax = mph.stops().last().expect("stops").value;
+        assert!((vmax - 39.79).abs() < 0.05, "internal vmax {vmax}");
+        assert!(
+            (vmax / scale - 89.0).abs() < 0.01,
+            "display vmax {} (scale {scale})",
+            vmax / scale
+        );
+
+        let si = ColorTable::parse_gr_pal("SI VEL", "Color: -30 1 2 3\nColor: 30 4 5 6\n")
+            .expect("si table parses");
+        assert_eq!(table_display_unit(&si, &product), ("m/s", 1.0));
+        // Non-m/s products never rescale off the table's declaration.
+        let dbz = DisplayProduct::Moment(MomentType::Reflectivity);
+        assert_eq!(table_display_unit(&mph, &dbz), ("dBZ", 1.0));
+    }
+
     /// User tables resolve by name even when their Product: header put
     /// them in another family (community files often mislabel it).
     #[test]
@@ -23394,7 +23870,7 @@ mod tests {
             realtime_last_chunk_type: None,
         };
 
-        let formatted = format_cursor_readout(&readout, units::Units::Imperial);
+        let formatted = format_cursor_readout(&readout, units::Units::Imperial, ("m/s", 1.0));
 
         assert!(formatted.contains("KTLX 01:30:00"));
         assert!(formatted.contains("row 42 gate 123"));
@@ -23403,9 +23879,16 @@ mod tests {
         assert!(formatted.contains("rt v012 c034"));
         // Imperial keeps the kft parenthetical; metric drops it.
         assert!(formatted.contains("hgt 900 m (3.0 kft)"));
-        let metric = format_cursor_readout(&readout, units::Units::Metric);
+        let metric = format_cursor_readout(&readout, units::Units::Metric, ("m/s", 1.0));
         assert!(metric.contains("hgt 900 m"));
         assert!(!metric.contains("kft"));
+
+        // A table declared in mph relabels and rescales the MAIN value
+        // (field report: mph table, m/s readout) — diagnostics stay SI.
+        let scale = color_tables::unit_scale_to_internal("mph");
+        let mph = format_cursor_readout(&readout, units::Units::Imperial, ("mph", scale));
+        assert!(mph.contains("50.3 mph"), "got: {mph}"); // 22.5 m/s
+        assert!(!mph.contains("22.5"));
     }
 
     #[test]
@@ -23449,7 +23932,7 @@ mod tests {
             realtime_last_chunk_type: None,
         };
 
-        let formatted = format_cursor_readout(&readout, units::Units::Imperial);
+        let formatted = format_cursor_readout(&readout, units::Units::Imperial, ("m/s", 1.0));
 
         assert!(formatted.contains("Vrot 21.0 m/s dV 42.0 sep 1.25 km"));
         assert!(formatted.contains("in r4/g100 210.5 -18.0"));
@@ -26229,6 +26712,7 @@ mod tests {
             poll_last_file: None,
             poll_next: None,
             poll_rx: None,
+            intl_loop_rx: None,
             poll_source: PollSource::CustomUrl(String::new()),
             intl_picker_provider: String::new(),
             intl_sites: None,

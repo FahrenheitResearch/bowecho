@@ -755,8 +755,9 @@ fn archive(ui: &mut egui::Ui) {
         ui,
         "Click a tornado track",
         "— loads the lowest-beam WSR-88D at the track midpoint with a loop SPANNING the \
-         track (15 min before touchdown to 15 min after the estimated lift), auto-playing at \
-         the lowest tilt — and when the track's END is closer to a different radar, that \
+         track plus extra scans of context each side (the \u{b1} scans control on the Event \
+         day row, default 5 before touchdown and 5 after the estimated lift), auto-playing \
+         at the lowest tilt — and when the track's END is closer to a different radar, that \
          site loads as a second radar overlay at the event time.",
     );
 }

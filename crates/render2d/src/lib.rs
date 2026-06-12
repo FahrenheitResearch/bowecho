@@ -1768,6 +1768,8 @@ impl ViewportLookupTable {
             max_range_km_sq: self.geometry.max_range_km_sq,
             radar_x_px: self.geometry.radar_x_px,
             km_per_px_x: self.geometry.km_per_px_x,
+            rot_sin: self.geometry.rot_sin,
+            rot_cos: self.geometry.rot_cos,
             first_gate_m: self.first_gate_m,
             gate_spacing_m: self.gate_spacing_m,
             gate_count: self.gate_count,
@@ -1783,6 +1785,8 @@ struct ViewportLookupRow {
     max_range_km_sq: f32,
     radar_x_px: f32,
     km_per_px_x: f32,
+    rot_sin: f32,
+    rot_cos: f32,
     first_gate_m: f32,
     gate_spacing_m: f32,
     gate_count: usize,
@@ -1802,7 +1806,15 @@ impl ViewportLookupRow {
             return None;
         }
 
-        let azimuth_deg = azimuth_from_xy(dx_km, self.dy_km);
+        // Same screen-ENU → radar-ENU rotation as `viewport_lookup`: the
+        // viewport raster bakes the AEQD convergence angle and the draw
+        // quad applies only the residual, so a table that skipped the
+        // rotation skewed every azimuth by the baked amount (field
+        // report: slight pan/zoom-dependent offset). Range is
+        // rotation-invariant, so the gate above stays raw.
+        let east_km = dx_km * self.rot_cos - self.dy_km * self.rot_sin;
+        let north_km = dx_km * self.rot_sin + self.dy_km * self.rot_cos;
+        let azimuth_deg = azimuth_from_xy(east_km, north_km);
         let azimuth_bin = row_lookup.filled_bin_for_azimuth(azimuth_deg)?;
         Some(SampleLookup {
             azimuth_bin,
@@ -4486,6 +4498,137 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The fast table path must agree with `viewport_lookup` (whose
+    /// rotation convention is pinned by `rotated_north_pixel_resolves_to_
+    /// azimuth_zero`) when a convergence angle is baked in — the table
+    /// used to drop the rotation entirely (field-reported skew).
+    #[test]
+    fn viewport_lookup_table_matches_rotated_viewport_lookup() {
+        let volume = test_volume();
+        let cut = &volume.cuts[0];
+        let grid = cut
+            .moments
+            .get(&MomentType::Reflectivity)
+            .expect("reflectivity grid");
+        let row_lookup = AzimuthLookup::new(cut, grid);
+        for rotation_rad in [-0.21f32, 0.005, 0.35] {
+            let geometry = viewport_geometry(
+                grid,
+                ViewportRasterOptions {
+                    width: 333,
+                    height: 217,
+                    radar_x_px: 166.5,
+                    radar_y_px: 108.5,
+                    km_per_px_x: 0.5,
+                    km_per_px_y: 0.5,
+                    rotation_rad,
+                },
+            );
+            let lookup_table = ViewportLookupTable::new(grid, geometry);
+            for y in 0..217 {
+                let row = lookup_table.row(y);
+                for x in 0..333 {
+                    let table_sample = row.as_ref().and_then(|row| {
+                        row.x_range
+                            .contains(&x)
+                            .then(|| row.lookup(x, &row_lookup))
+                            .flatten()
+                    });
+                    assert_eq!(
+                        table_sample,
+                        viewport_lookup(x, y, grid, &row_lookup, geometry),
+                        "rotated lookup mismatch at {x},{y} (gamma {rotation_rad})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Rotation must actually FLOW through the table path: a 0.35 rad
+    /// baked convergence has to move some pixels into different azimuth
+    /// bins than the unrotated table. The bug was the table silently
+    /// ignoring the baked angle, which kept the two identical (so the
+    /// parity test above passed at rotation 0 while the screen skewed).
+    #[test]
+    fn baked_rotation_changes_table_azimuth_bins() {
+        // Full-circle 1°-radial cut: the 4-radial `test_volume` leaves
+        // most azimuth bins unfilled, which would no-op this sweep.
+        let gate_range = GateRange {
+            first_gate_m: 0,
+            gate_spacing_m: 100,
+            gate_count: 60,
+        };
+        let mut cut = ElevationCut::new(0.5, Some(1));
+        let mut reflectivity = MomentGrid::new_u8(
+            MomentType::Reflectivity,
+            gate_range.clone(),
+            1.0,
+            0.0,
+            Some(0),
+            Some(1),
+        );
+        for i in 0..360 {
+            cut.radials.push(Radial {
+                azimuth_deg: i as f32,
+                elevation_deg: 0.5,
+                time_offset_ms: 0,
+                gate_range: gate_range.clone(),
+                nyquist_velocity_mps: Some(32.0),
+                radial_status: None,
+            });
+            reflectivity
+                .push_u8_row_slice(i, &[40u8; 60])
+                .expect("reflectivity row");
+        }
+        cut.moments.insert(MomentType::Reflectivity, reflectivity);
+        let grid = cut
+            .moments
+            .get(&MomentType::Reflectivity)
+            .expect("reflectivity grid");
+        let row_lookup = AzimuthLookup::new(&cut, grid);
+        let options = |rotation_rad| ViewportRasterOptions {
+            width: 96,
+            height: 96,
+            radar_x_px: 48.0,
+            radar_y_px: 48.0,
+            km_per_px_x: 0.1,
+            km_per_px_y: 0.1,
+            rotation_rad,
+        };
+        let rotated = ViewportLookupTable::new(grid, viewport_geometry(grid, options(0.35)));
+        let straight = ViewportLookupTable::new(grid, viewport_geometry(grid, options(0.0)));
+        let sample_at = |table: &ViewportLookupTable, x: u32, y: u32| {
+            table.row(y).and_then(|row| {
+                row.x_range
+                    .contains(&x)
+                    .then(|| row.lookup(x, &row_lookup))
+                    .flatten()
+            })
+        };
+        let mut resolved = 0usize;
+        let mut moved_bins = 0usize;
+        for y in 0..96 {
+            for x in 0..96 {
+                let (a, b) = (sample_at(&rotated, x, y), sample_at(&straight, x, y));
+                if let (Some(a), Some(b)) = (a, b) {
+                    resolved += 1;
+                    // Range is rotation-invariant; only azimuth may move.
+                    assert_eq!(a.gate, b.gate, "gate changed under rotation at {x},{y}");
+                    if a.azimuth_bin != b.azimuth_bin {
+                        moved_bins += 1;
+                    }
+                }
+            }
+        }
+        assert!(resolved > 100, "sweep barely hit the volume ({resolved})");
+        // 0.35 rad ≈ 20°: against 1° radials nearly every pixel must land
+        // in a different radial than the unrotated table.
+        assert!(
+            moved_bins * 2 > resolved,
+            "baked rotation moved only {moved_bins}/{resolved} pixels — rotation is not reaching the table path"
+        );
     }
 
     #[test]

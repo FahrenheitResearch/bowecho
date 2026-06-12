@@ -155,6 +155,19 @@ pub trait IntlProvider: Send + Sync {
     /// upstream catalog is unreachable/malformed.
     fn latest(&self, site_id: &str) -> Result<FramePlan, String>;
 
+    /// Describe up to `count` recent frames for `site_id`, OLDEST FIRST
+    /// (install order — the newest frame is last, and its identity is what
+    /// the live poll dedupes against). Same cheapness contract as
+    /// [`Self::latest`]: list/inspect the catalog, never download volume
+    /// bytes. Providers whose catalogs only expose the newest frame keep
+    /// this default (a one-frame "loop"); providers with a rolling archive
+    /// override it so the app's Load Loop works on international feeds the
+    /// way it does on US ones (field request).
+    fn recent(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
+        let _ = count;
+        Ok(vec![self.latest(site_id)?])
+    }
+
     /// The provider's EMBEDDED site catalog: every currently operational
     /// site with its static coordinates, straight from the provider's
     /// compiled-in table. Never touches the network, so it is safe on the

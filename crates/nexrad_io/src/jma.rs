@@ -192,7 +192,26 @@ pub fn decode_jma_tar_volumes(
         return Err(first_error
             .unwrap_or_else(|| "no JMA GRIB2 member decoded into a radar volume".to_owned()));
     }
+    for volume in &mut volumes {
+        sort_cuts_lowest_first(volume);
+    }
     Ok(volumes)
+}
+
+/// JMA packs sweeps in whatever order the GRIB member carries them —
+/// observed highest-tilt-first, so tilt 0 in the UI showed the ~25° cone
+/// (field report) — and a station spanning several tar members restarts
+/// its sweep numbering per member. Sort each station's ladder lowest
+/// beam first (stable: repeated elevations — the 10-minute file's two
+/// 5-minute repetitions — keep their scan order) and renumber, matching
+/// every other provider's cut order.
+fn sort_cuts_lowest_first(volume: &mut RadarVolume) {
+    volume
+        .cuts
+        .sort_by(|a, b| a.elevation_deg.total_cmp(&b.elevation_deg));
+    for (index, cut) in volume.cuts.iter_mut().enumerate() {
+        cut.elevation_number = u8::try_from(index + 1).ok();
+    }
 }
 
 /// Decode only the FIRST station of a JMA tar — the shared byte router's
@@ -960,8 +979,20 @@ mod tests {
 
     /// One-sweep JMA GRIB2 message: 2 radials x 3 gates, run-length levels
     /// `[1, 2, 3, 1, 2, 0]` against the level table `[10.5, 20.5, 30.5]`
-    /// (decimal scale 1), category/number per `parameter`.
+    /// (decimal scale 1), category/number per `parameter`, 0.50 deg tilt.
     fn synthetic_jma_grib2(station_id: &[u8; 4], station_number: u16, parameter: u8) -> Vec<u8> {
+        synthetic_jma_grib2_at_elevation(station_id, station_number, parameter, 50)
+    }
+
+    /// [`synthetic_jma_grib2`] with the product elevation in centidegrees
+    /// (the per-ray table rides 0.05 deg above it, so "per-ray wins"
+    /// stays observable at any tilt).
+    fn synthetic_jma_grib2_at_elevation(
+        station_id: &[u8; 4],
+        station_number: u16,
+        parameter: u8,
+        elevation_centideg: u16,
+    ) -> Vec<u8> {
         let radials = 2usize;
         let gates = 3usize;
 
@@ -1003,7 +1034,7 @@ mod tests {
             body.extend_from_slice(&[0, 0]); // polarization, operation mode
             body.push(0); // pad to octet 40
             body.extend_from_slice(&[0, 0]); // qc, clutter filter
-            push_u16(body, 50); // elevation 0.50 deg
+            push_u16(body, elevation_centideg); // product elevation
             body.push(0); // pad to octet 44
             push_u16(body, 1_000); // representative PRF 1
             push_u16(body, 1_000); // representative PRF 2
@@ -1012,7 +1043,7 @@ mod tests {
             push_u16(body, 0); // obs end offset
             body.extend_from_slice(&[0; 6]); // pad to octet 60
             for _ in 0..radials {
-                push_u16(body, 55); // per-ray elevation 0.55 deg
+                push_u16(body, elevation_centideg + 5); // per-ray elevation
                 push_u16(body, 1_000); // per-ray PRF
             }
         });
@@ -1159,6 +1190,28 @@ mod tests {
         assert!(!looks_like_jma_tar_bytes(&other));
         // Non-tar bytes.
         assert!(!looks_like_jma_tar_bytes(&[0u8; 1024]));
+    }
+
+    /// Field report: tilt #00 on JMA radars showed the ~25° cone — the
+    /// GRIB members carry sweeps high-tilt-first, and a station split
+    /// across tar members restarted its sweep numbering. The ladder must
+    /// come back lowest beam first with sequential numbering.
+    #[test]
+    fn cuts_sort_lowest_elevation_first_across_members() {
+        let high = synthetic_jma_grib2_at_elevation(b"ALFA", 47001, 1, 2500); // 25.0 deg
+        let low = synthetic_jma_grib2_at_elevation(b"ALFA", 47001, 1, 50); // 0.5 deg
+        let tar = tar_archive(&[
+            (&member_name(47001, "zeh"), &high),
+            (&member_name(47001, "zel"), &low),
+        ]);
+        let volumes = decode_jma_tar_volumes(&tar, None).expect("decode");
+        assert_eq!(volumes.len(), 1, "same station must merge");
+        let cuts = &volumes[0].cuts;
+        assert_eq!(cuts.len(), 2);
+        assert_eq!(cuts[0].elevation_deg, 0.5);
+        assert_eq!(cuts[1].elevation_deg, 25.0);
+        assert_eq!(cuts[0].elevation_number, Some(1));
+        assert_eq!(cuts[1].elevation_number, Some(2));
     }
 
     #[test]

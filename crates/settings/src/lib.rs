@@ -105,6 +105,11 @@ pub struct AppSettings {
     /// the GIF/MP4 recorder's frame timing, so exports match the screen.
     #[serde(default = "default_loop_speed_percent")]
     pub loop_speed_percent: u16,
+    /// Extra archive scans loaded on each side of a clicked tornado
+    /// track's window — context before touchdown and after lift (field
+    /// request: a short track otherwise loads only a handful of frames).
+    #[serde(default = "default_event_pad_frames")]
+    pub event_pad_frames: u16,
     /// Last GR2A-style poll URL (mobile/research radar feeds) — typing it
     /// once per deployment is fine, once per session is not.
     #[serde(default)]
@@ -162,6 +167,10 @@ fn default_model_slug() -> String {
 
 fn default_loop_speed_percent() -> u16 {
     100
+}
+
+fn default_event_pad_frames() -> u16 {
+    5
 }
 
 /// A persisted FARM drape georeference. Coordinates are stored as scaled
@@ -249,6 +258,7 @@ impl Default for AppSettings {
             smooth_display: false,
             smooth_display_mode: String::new(),
             loop_speed_percent: default_loop_speed_percent(),
+            event_pad_frames: default_event_pad_frames(),
             poll_url: String::new(),
             intl_provider: String::new(),
             intl_site: String::new(),

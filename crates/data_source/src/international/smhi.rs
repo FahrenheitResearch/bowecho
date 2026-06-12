@@ -97,6 +97,14 @@ impl IntlProvider for SmhiProvider {
         plan_from_qcvol_catalog(site_id, &json)
     }
 
+    fn recent(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
+        validate_area_key(site_id)?;
+        let url = format!("{API_BASE}/area/{site_id}/product/qcvol");
+        let json = crate::fetch_text(&url)
+            .map_err(|err| format!("SMHI qcvol catalog for '{site_id}' ({url}): {err}"))?;
+        plans_from_qcvol_catalog(site_id, &json, count.max(1))
+    }
+
     fn static_sites(&self) -> Vec<IntlSite> {
         SMHI_SITES
             .iter()
@@ -164,37 +172,52 @@ fn area_label(key: &str) -> String {
 }
 
 fn plan_from_qcvol_catalog(area: &str, json: &str) -> Result<FramePlan, String> {
+    plans_from_qcvol_catalog(area, json, 1)?
+        .pop()
+        .ok_or_else(|| format!("SMHI qcvol catalog for '{area}' has no lastFiles entry"))
+}
+
+/// The newest `count` qcvol entries as plans, OLDEST FIRST — the
+/// `lastFiles` keys embed `yyyymmddhhmm`, so lexicographic order is
+/// chronological. This is what makes Load Loop work on Swedish radars.
+fn plans_from_qcvol_catalog(
+    area: &str,
+    json: &str,
+    count: usize,
+) -> Result<Vec<FramePlan>, String> {
     let product: QcvolCatalog = serde_json::from_str(json)
         .map_err(|err| format!("SMHI qcvol catalog JSON parse failed for '{area}': {err}"))?;
-    let newest = product
-        .last_files
+    let mut entries: Vec<_> = product.last_files.iter().collect();
+    entries.sort_by(|left, right| left.key.cmp(&right.key));
+    let skip = entries.len().saturating_sub(count);
+    entries[skip..]
         .iter()
-        .max_by(|left, right| left.key.cmp(&right.key))
-        .ok_or_else(|| format!("SMHI qcvol catalog for '{area}' has no lastFiles entry"))?;
-
-    // Prefer the dated URL derived from the key so the downloaded bytes
-    // always match the identity; fall back to the API's h5 link (the
-    // identity-less `latest.h5`) if the key shape ever changes.
-    let url = match dated_url_from_key(area, &newest.key) {
-        Some(url) => url,
-        None => newest
-            .formats
-            .iter()
-            .find(|format| format.key == "h5")
-            .map(|format| format.link.clone())
-            .ok_or_else(|| {
-                format!(
-                    "SMHI qcvol entry '{}' for '{area}' has no h5 format link",
-                    newest.key
-                )
-            })?,
-    };
-
-    Ok(FramePlan {
-        identity: newest.key.clone(),
-        parts: vec![PlanPart { url }],
-        merge: false,
-    })
+        .map(|newest| {
+            // Prefer the dated URL derived from the key so the downloaded
+            // bytes always match the identity; fall back to the API's h5
+            // link (the identity-less `latest.h5`) if the key shape ever
+            // changes.
+            let url = match dated_url_from_key(area, &newest.key) {
+                Some(url) => url,
+                None => newest
+                    .formats
+                    .iter()
+                    .find(|format| format.key == "h5")
+                    .map(|format| format.link.clone())
+                    .ok_or_else(|| {
+                        format!(
+                            "SMHI qcvol entry '{}' for '{area}' has no h5 format link",
+                            newest.key
+                        )
+                    })?,
+            };
+            Ok(FramePlan {
+                identity: newest.key.clone(),
+                parts: vec![PlanPart { url }],
+                merge: false,
+            })
+        })
+        .collect()
 }
 
 /// `radar_{area}_qcvol_{yyyymmddhhmm}` -> the dated download URL.

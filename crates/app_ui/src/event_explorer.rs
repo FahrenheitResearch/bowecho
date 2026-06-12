@@ -28,8 +28,6 @@ use std::time::{Duration, Instant};
 
 /// Click/hover tolerance around a track segment, screen px.
 const EVENT_TRACK_CLICK_PX: f32 = 8.0;
-/// The loaded loop spans [track start - PAD, track end + PAD].
-const EVENT_LOOP_PAD_MINUTES: i64 = 15;
 /// Same eligibility radius as the report jump (lowest-beam rule).
 const EVENT_RADAR_MAX_RANGE_KM: f32 = 460.0;
 /// Track duration estimate: the WCM database carries no end TIME, only a
@@ -165,20 +163,25 @@ pub(crate) fn nearest_volume_index(labels: &[String], target_label: &str) -> Opt
 }
 
 /// The volume range covering a [start, end] window: from the volume
-/// scanning at the window start through the last volume inside it,
-/// capped at `cap` frames by advancing the start (keep the track's end —
-/// matches how the frame history trims oldest-first).
+/// scanning at the window start through the last volume inside it, plus
+/// `pad` scans of context each side (clamped to the day's listing — the
+/// user-set frames-before-touchdown/after-lift, default 5), capped at
+/// `cap` frames by advancing the start (keep the track's end — matches
+/// how the frame history trims oldest-first).
 pub(crate) fn range_volume_indices(
     labels: &[String],
     start_label: &str,
     end_label: &str,
+    pad: usize,
     cap: usize,
 ) -> Option<(usize, usize)> {
     if cap == 0 {
         return None;
     }
     let end = nearest_volume_index(labels, end_label)?;
-    let mut start = nearest_volume_index(labels, start_label)?.min(end);
+    let start = nearest_volume_index(labels, start_label)?.min(end);
+    let mut start = start.saturating_sub(pad);
+    let end = (end + pad).min(labels.len().saturating_sub(1));
     if end + 1 - start > cap {
         start = end + 1 - cap;
     }
@@ -337,6 +340,25 @@ impl crate::ViewerApp {
                 self.event_explorer.pinned_day = None;
                 self.spc_data.fetched_at = None; // outlook follows again
                 ctx.request_repaint();
+            }
+            // Track-click loop context (persisted): scans loaded beyond
+            // the track window on each side — short tracks otherwise
+            // land a loop of only a few frames (field request).
+            let mut pad = self.app_settings.event_pad_frames;
+            ui.add(
+                egui::DragValue::new(&mut pad)
+                    .range(0..=40)
+                    .speed(0.1)
+                    .prefix("±")
+                    .suffix(" scans"),
+            )
+            .on_hover_text(
+                "Clicking a tornado track loads this many extra archive scans before \
+                 touchdown and after lift, on top of the track's own window",
+            );
+            if pad != self.app_settings.event_pad_frames {
+                self.app_settings.event_pad_frames = pad;
+                let _ = self.app_settings.save();
             }
             if self.event_explorer.fetch.is_some() {
                 ui.spinner();
@@ -578,10 +600,11 @@ impl crate::ViewerApp {
     }
 
     /// Track click: PRIMARY = the lowest-beam WSR-88D nearest the track
-    /// midpoint, loaded as an archive loop spanning [start - 15 min,
-    /// end + 15 min] that auto-plays at the lowest tilt; when the radar
-    /// nearest the track END differs, it loads as a second radar overlay
-    /// at the event time. (The `jump_to_spc_report` flow, generalized.)
+    /// midpoint, loaded as an archive loop spanning the track window plus
+    /// `event_pad_frames` scans of context each side that auto-plays at
+    /// the lowest tilt; when the radar nearest the track END differs, it
+    /// loads as a second radar overlay at the event time. (The
+    /// `jump_to_spc_report` flow, generalized.)
     pub(crate) fn jump_to_event_track(&mut self, hit: &EventTrackHit, ctx: &egui::Context) {
         let eligible: Vec<(usize, f32, f32)> = self
             .sites
@@ -607,16 +630,16 @@ impl crate::ViewerApp {
         self.map_center_lon = (hit.begin.1 + hit.end.1) / 2.0;
         self.map_scale = self.map_scale.max(220.0);
         let end_time = hit.lift_time();
-        let pad = ChronoDuration::minutes(EVENT_LOOP_PAD_MINUTES);
         // The track time's RADAR date can differ from the SPC file date
         // (12Z convention) — list the track's own calendar date.
         self.archive_date_input = hit.time_utc.format("%Y-%m-%d").to_string();
-        self.event_explorer.pending_range = Some((hit.time_utc - pad, end_time + pad));
+        self.event_explorer.pending_range = Some((hit.time_utc, end_time));
         self.status = format!(
-            "Event jump: {} · loop {}–{}Z",
+            "Event jump: {} · loop {}–{}Z ±{} scans",
             hit.label,
-            (hit.time_utc - pad).format("%H%M"),
-            (end_time + pad).format("%H%M")
+            hit.time_utc.format("%H%M"),
+            end_time.format("%H%M"),
+            self.app_settings.event_pad_frames,
         );
         self.start_archive_listing(ctx);
         if let Some(overlay_index) = overlay
@@ -805,26 +828,54 @@ mod tests {
         // Window 20:07–20:18: the volume scanning at the start (20:05)
         // through the last inside (20:15).
         assert_eq!(
-            range_volume_indices(&list, "20:07:00", "20:18:00", 200),
+            range_volume_indices(&list, "20:07:00", "20:18:00", 0, 200),
             Some((1, 3))
         );
         // Window edges off both ends of the day clamp to the listing.
         assert_eq!(
-            range_volume_indices(&list, "00:00:00", "23:59:59", 200),
+            range_volume_indices(&list, "00:00:00", "23:59:59", 0, 200),
             Some((0, 5))
         );
         // Cap trims the START (keep the track's end).
         assert_eq!(
-            range_volume_indices(&list, "00:00:00", "23:59:59", 3),
+            range_volume_indices(&list, "00:00:00", "23:59:59", 0, 3),
             Some((3, 5))
         );
         // Inverted/degenerate window collapses to one volume.
         assert_eq!(
-            range_volume_indices(&list, "20:18:00", "20:07:00", 200),
+            range_volume_indices(&list, "20:18:00", "20:07:00", 0, 200),
             Some((1, 1))
         );
-        assert_eq!(range_volume_indices(&list, "20:07:00", "20:18:00", 0), None);
-        assert_eq!(range_volume_indices(&[], "20:07:00", "20:18:00", 5), None);
+        assert_eq!(
+            range_volume_indices(&list, "20:07:00", "20:18:00", 0, 0),
+            None
+        );
+        assert_eq!(
+            range_volume_indices(&[], "20:07:00", "20:18:00", 0, 5),
+            None
+        );
+    }
+
+    #[test]
+    fn range_volume_indices_pad_extends_each_side_and_clamps() {
+        let list = labels(&[
+            "20:00:00", "20:05:00", "20:10:00", "20:15:00", "20:20:00", "20:25:00",
+        ]);
+        // Bare window covers (1..=3); one scan of context each side.
+        assert_eq!(
+            range_volume_indices(&list, "20:07:00", "20:18:00", 1, 200),
+            Some((0, 4))
+        );
+        // Pad clamps to the day's listing at both edges.
+        assert_eq!(
+            range_volume_indices(&list, "20:07:00", "20:18:00", 50, 200),
+            Some((0, 5))
+        );
+        // Cap still trims the padded START (keep the track's end).
+        assert_eq!(
+            range_volume_indices(&list, "20:07:00", "20:18:00", 50, 3),
+            Some((3, 5))
+        );
     }
 
     #[test]

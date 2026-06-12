@@ -123,6 +123,42 @@ impl IntlProvider for FmiProvider {
         ))
     }
 
+    fn recent(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
+        validate_site_code(site_id)?;
+        let count = count.max(1);
+        // Oldest listed day first so the combined key list stays
+        // chronological (keys embed the date path + timestamp, so sort
+        // order is time order). A missing day folder is skipped, not
+        // fatal — the midnight window legitimately 404s.
+        let mut keys: Vec<String> = Vec::new();
+        let mut dates = candidate_utc_dates();
+        dates.reverse();
+        for date in dates {
+            let prefix = format!("{}{site_id}/", date_prefix(date));
+            let url = s3_style_listing_url(BUCKET_BASE, &prefix, None, None, 1000);
+            if let Ok(listing) = fetch_s3_style_listing(&url) {
+                keys.extend(pvol_keys(&listing.keys, site_id).map(str::to_owned));
+            }
+        }
+        if keys.is_empty() {
+            return Err(format!(
+                "FMI: no PVOL files for site '{site_id}' today or yesterday (UTC)"
+            ));
+        }
+        keys.sort();
+        let skip = keys.len().saturating_sub(count);
+        Ok(keys[skip..]
+            .iter()
+            .map(|key| FramePlan {
+                identity: key.rsplit('/').next().unwrap_or(key).to_owned(),
+                parts: vec![PlanPart {
+                    url: format!("{BUCKET_BASE}/{key}"),
+                }],
+                merge: false,
+            })
+            .collect())
+    }
+
     fn static_sites(&self) -> Vec<IntlSite> {
         FMI_SITES
             .iter()
@@ -198,14 +234,17 @@ fn site_label(code: &str) -> String {
 /// The newest `{stamp}_{site}_PVOL.h5` key for `site`. Zero-padded stamps
 /// sort chronologically; other products under the same prefix are ignored.
 fn newest_pvol_key<'k>(keys: &'k [String], site: &str) -> Option<&'k str> {
+    pvol_keys(keys, site).max()
+}
+
+fn pvol_keys<'k>(keys: &'k [String], site: &str) -> impl Iterator<Item = &'k str> {
     let suffix = format!("_{site}_PVOL.h5");
     keys.iter()
-        .filter(|key| {
+        .filter(move |key| {
             key.rsplit('/')
                 .next()
                 .is_some_and(|file_name| file_name.ends_with(&suffix))
         })
-        .max_by(|left, right| left.cmp(right))
         .map(String::as_str)
 }
 
