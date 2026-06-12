@@ -9781,6 +9781,25 @@ impl ViewerApp {
             ui.weak(format!("{} is hidden", pane.tab_title()));
             return;
         }
+        // Always-visible undock affordance (field report: the tab ✕ and
+        // right-click menu were not discoverable). Bodies run inside the
+        // tree pass, so dock-state changes travel as deferred requests.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("Float ⧉")
+                .on_hover_text("Pop this pane back out as a floating window")
+                .clicked()
+            {
+                self.workspace.requests.push(dock::DockRequest::Float(pane));
+            }
+            if ui
+                .small_button("Hide")
+                .on_hover_text("Close this pane — its top-bar button reopens it here")
+                .clicked()
+            {
+                self.workspace.requests.push(dock::DockRequest::Hide(pane));
+            }
+        });
         match pane {
             dock::WorkspacePane::Map => {}
             dock::WorkspacePane::Sounding => self.sounding_pane_body(ui),
