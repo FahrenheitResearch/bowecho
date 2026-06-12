@@ -75,6 +75,10 @@ pub(crate) fn annotation<F: Fn(GeoPoint) -> Pos2>(
             let color = resolve_color(style, ToolKind::Freehand, alpha);
             stroke_open(painter, &pts, style.thickness, color, alpha);
         }
+        Annotation::Text { at, text, style } => {
+            let color = resolve_color(style, ToolKind::Text, alpha);
+            draw_text_stamp(painter, project(*at), text, style, color, alpha);
+        }
         Annotation::Front {
             front,
             points,
@@ -95,18 +99,28 @@ pub(crate) fn annotation<F: Fn(GeoPoint) -> Pos2>(
             a,
             b,
             hatch,
+            label,
             style,
         } => {
             let pts: Vec<Pos2> = box_corners(*a, *b).iter().map(|p| project(*p)).collect();
-            draw_watch_box(painter, *watch, &pts, *hatch, style, alpha);
+            draw_watch_box(
+                painter,
+                *watch,
+                &pts,
+                *hatch,
+                label.as_deref(),
+                style,
+                alpha,
+            );
         }
         Annotation::WarnPolygon {
             warn,
             points,
+            label,
             style,
         } => {
             let pts: Vec<Pos2> = points.iter().map(|p| project(*p)).collect();
-            draw_warn_polygon(painter, *warn, &pts, style, alpha);
+            draw_warn_polygon(painter, *warn, &pts, label.as_deref(), style, alpha);
         }
         Annotation::Icon { icon, at, style } => {
             draw_icon(painter, *icon, project(*at), style, alpha);
@@ -167,6 +181,33 @@ fn draw_range_circle<F: Fn(GeoPoint) -> Pos2>(
         halo_color(alpha),
     );
     painter.text(anchor, egui::Align2::CENTER_BOTTOM, label, font, color);
+}
+
+/// Free text stamp: haloed proportional text centered on the anchor. The
+/// Width slider maps to type size so one control scales annotations from
+/// callout to headline.
+fn draw_text_stamp(
+    painter: &egui::Painter,
+    at: Pos2,
+    text: &str,
+    style: &ShapeStyle,
+    color: Color32,
+    alpha: f32,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let size = (10.0 + style.thickness * 3.0).clamp(13.0, 42.0);
+    let font = egui::FontId::proportional(size);
+    let offset = (size / 14.0).max(1.0);
+    painter.text(
+        at + vec2(offset, offset),
+        egui::Align2::CENTER_CENTER,
+        text,
+        font.clone(),
+        halo_color(alpha),
+    );
+    painter.text(at, egui::Align2::CENTER_CENTER, text, font, color);
 }
 
 fn geo_distance_km(a: GeoPoint, b: GeoPoint) -> f32 {
@@ -551,6 +592,7 @@ fn draw_watch_box(
     kind: WatchKind,
     pts: &[Pos2],
     hatch: bool,
+    label_override: Option<&str>,
     style: &ShapeStyle,
     alpha: f32,
 ) {
@@ -568,7 +610,7 @@ fn draw_watch_box(
         }
     }
     stroke_closed(painter, pts, style.thickness.max(2.5), stroke_color, alpha);
-    if let Some(label) = watch_label(kind) {
+    if let Some(label) = label_override.or_else(|| watch_label(kind)) {
         let centroid = pts.iter().fold(Pos2::ZERO, |acc, p| acc + p.to_vec2()) / pts.len() as f32;
         label_chip(
             painter,
@@ -603,6 +645,7 @@ fn draw_warn_polygon(
     painter: &egui::Painter,
     kind: WarnKind,
     pts: &[Pos2],
+    label_override: Option<&str>,
     style: &ShapeStyle,
     alpha: f32,
 ) {
@@ -622,7 +665,7 @@ fn draw_warn_polygon(
     for dash in dash_segments(&ring, &WARN_DASH) {
         painter.add(egui::Shape::line(dash, Stroke::new(width, stroke_color)));
     }
-    if let Some(label) = warn_label(kind) {
+    if let Some(label) = label_override.or_else(|| warn_label(kind)) {
         let top = pts.iter().fold(f32::MAX, |acc, p| acc.min(p.y));
         let cx = pts.iter().fold(0.0, |acc, p| acc + p.x) / pts.len() as f32;
         label_chip(
@@ -819,6 +862,7 @@ mod tests {
                         flip: true,
                         pips: true,
                         hatch: true,
+                        label: Some("CUSTOM TEXT".to_owned()),
                     },
                 );
                 annotation(&painter, &draft, &project, 0.6);

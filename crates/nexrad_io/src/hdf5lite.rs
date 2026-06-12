@@ -130,11 +130,17 @@ impl<'a> H5File<'a> {
         }
         let version = *bytes.get(8).ok_or_else(|| truncated(8, 1, bytes.len()))?;
         if version > 1 {
+            // Real-world note: netCDF-4 files (modern CfRadial 1.x and all
+            // CfRadial 2, written by Radx/netCDF) carry this superblock —
+            // every public CfRadial sample checked in 2026 does. Point
+            // those users at the conversion that actually works.
             return Err(invalid(
                 8,
                 format!(
-                    "HDF5 superblock version {version} (1.10+ 'latest' layout) is unsupported; \
-                     rewrite the file with default/earliest library settings"
+                    "HDF5 superblock version {version} (1.10+ 'latest' layout) is unsupported. \
+                     If this is a netCDF-4 CfRadial file, convert it to classic netCDF \
+                     (`nccopy -k classic` or RadxConvert) and open the .nc; ODIM_H5 writers \
+                     should use default/earliest library settings"
                 ),
             ));
         }

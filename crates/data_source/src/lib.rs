@@ -1,5 +1,7 @@
 //! Public radar data-source helpers.
 
+mod embedded_sites;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -188,9 +190,19 @@ impl RadarSite {
 }
 
 pub fn fallback_sites() -> Vec<RadarSite> {
-    FALLBACK_SITE_IDS
+    // The embedded table carries COORDINATES, so offline the map markers,
+    // site picker, and right-click beam lookup all still work (field
+    // report: bad internet -> "no radar near").
+    embedded_site_table()
+}
+
+/// The compiled-in station list (see embedded_sites.rs) as RadarSites.
+fn embedded_site_table() -> Vec<RadarSite> {
+    embedded_sites::EMBEDDED_SITES
         .iter()
-        .map(|id| RadarSite::new(*id))
+        .map(|(id, name, lat, lon)| {
+            RadarSite::new(*id).with_location(Some((*name).to_owned()), Some(*lat), Some(*lon))
+        })
         .collect()
 }
 
@@ -317,11 +329,15 @@ pub fn fetch_volume_bytes(url: &str) -> Result<Vec<u8>> {
 }
 
 pub fn fetch_level2_radar_sites(days_back: i64) -> Result<Vec<RadarSite>> {
-    let weather_sites = fetch_weather_gov_radar_sites().unwrap_or_default();
-    let weather_by_id = weather_sites
+    // Embedded base FIRST, live API overlay second: site locations must
+    // never depend on the network being up.
+    let mut weather_by_id = embedded_site_table()
         .into_iter()
         .map(|site| (site.level2_id.clone(), site))
         .collect::<BTreeMap<_, _>>();
+    for site in fetch_weather_gov_radar_sites().unwrap_or_default() {
+        weather_by_id.insert(site.level2_id.clone(), site);
+    }
 
     let mut sites = list_recent_level2_sites(days_back).unwrap_or_else(|_| fallback_sites());
     for site in &mut sites {
@@ -1274,25 +1290,8 @@ impl From<CommonPrefixXml> for CommonPrefix {
     }
 }
 
-const FALLBACK_SITE_IDS: &[&str] = &[
-    "KABR", "KABX", "KAKQ", "KAMA", "KAMX", "KAPX", "KARX", "KATX", "KBBX", "KBGM", "KBHX", "KBIS",
-    "KBLX", "KBMX", "KBOX", "KBRO", "KBUF", "KBYX", "KCAE", "KCBW", "KCBX", "KCCX", "KCLE", "KCLX",
-    "KCRP", "KCXX", "KCYS", "KDAX", "KDDC", "KDFX", "KDGX", "KDIX", "KDLH", "KDMX", "KDOX", "KDTX",
-    "KDVN", "KDYX", "KEAX", "KEMX", "KENX", "KEOX", "KEPZ", "KESX", "KEVX", "KEWX", "KEYX", "KFCX",
-    "KFDR", "KFDX", "KFFC", "KFSD", "KFSX", "KFTG", "KFWS", "KGGW", "KGJX", "KGLD", "KGRB", "KGRK",
-    "KGRR", "KGSP", "KGWX", "KGYX", "KHDX", "KHGX", "KHNX", "KHPX", "KHTX", "KICT", "KICX", "KILN",
-    "KILX", "KIND", "KINX", "KIWA", "KIWX", "KJAX", "KJGX", "KJKL", "KLBB", "KLCH", "KLGX", "KLNX",
-    "KLOT", "KLRX", "KLSX", "KLTX", "KLVX", "KLWX", "KLZK", "KMAF", "KMAX", "KMBX", "KMHX", "KMKX",
-    "KMLB", "KMOB", "KMPX", "KMQT", "KMRX", "KMSX", "KMTX", "KMUX", "KMVX", "KMXX", "KNKX", "KNQA",
-    "KOAX", "KOHX", "KOKX", "KOTX", "KPAH", "KPBZ", "KPDT", "KPOE", "KPUX", "KRAX", "KRGX", "KRIW",
-    "KRLX", "KRTX", "KSFX", "KSGF", "KSHV", "KSJT", "KSOX", "KSRX", "KTBW", "KTFX", "KTLH", "KTLX",
-    "KTWX", "KTYX", "KUDX", "KUEX", "KVAX", "KVBX", "KVNX", "KVTX", "KVWX", "KYUX", "PABC", "PACG",
-    "PAEC", "PAHG", "PAIH", "PAKC", "PAPD", "PHKI", "PHMO", "PHWA", "RKJK", "RKSG", "TADW", "TATL",
-    "TBNA", "TBOS", "TCLT", "TCMH", "TCVG", "TDAL", "TDAY", "TDCA", "TDEN", "TDFW", "TDTW", "TEWR",
-    "TFLL", "THOU", "TIAD", "TIAH", "TIDS", "TJFK", "TJUA", "TLAS", "TLVE", "TMCI", "TMCO", "TMDW",
-    "TMEM", "TMIA", "TMKE", "TMSP", "TMSY", "TOKC", "TORD", "TPBI", "TPHL", "TPHX", "TPIT", "TRDU",
-    "TSDF", "TSJU", "TSLC", "TSTL", "TTPA", "TTUL",
-];
+// The bare-id fallback list was superseded by embedded_sites.rs, which
+// carries coordinates (208 stations, weather.gov-generated).
 
 #[cfg(test)]
 mod tests {

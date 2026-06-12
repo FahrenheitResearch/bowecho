@@ -152,6 +152,14 @@ pub(crate) enum Annotation {
         #[serde(default)]
         style: ShapeStyle,
     },
+    /// Free text stamped at a geo point (the toolbar's Text field at stamp
+    /// time). The Width slider doubles as the type size.
+    Text {
+        at: GeoPoint,
+        text: String,
+        #[serde(default)]
+        style: ShapeStyle,
+    },
     /// A front drawn along a vertex path, smoothed at render time; glyphs
     /// march along the smoothed curve at even arc-length spacing. `flip`
     /// mirrors the glyph side; `pips` adds the optional outflow-boundary
@@ -181,6 +189,10 @@ pub(crate) enum Annotation {
         b: GeoPoint,
         #[serde(default)]
         hatch: bool,
+        /// Custom chip text; None = the kind's preset wording (none for
+        /// Free boxes).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
         #[serde(default)]
         style: ShapeStyle,
     },
@@ -188,6 +200,10 @@ pub(crate) enum Annotation {
     WarnPolygon {
         warn: WarnKind,
         points: Vec<GeoPoint>,
+        /// Custom banner text; None = the kind's preset wording (none for
+        /// Free polygons).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
         #[serde(default)]
         style: ShapeStyle,
     },
@@ -232,6 +248,7 @@ pub(crate) enum ToolKind {
     Arrow,
     RangeCircle,
     Freehand,
+    Text,
     Front(FrontKind),
     FlowArrow,
     Watch(WatchKind),
@@ -280,7 +297,7 @@ enum Interaction {
 
 fn interaction(tool: ToolKind) -> Interaction {
     match tool {
-        ToolKind::Crosshair | ToolKind::Icon(_) => Interaction::Stamp,
+        ToolKind::Crosshair | ToolKind::Text | ToolKind::Icon(_) => Interaction::Stamp,
         ToolKind::Box | ToolKind::Arrow | ToolKind::RangeCircle | ToolKind::Watch(_) => {
             Interaction::Drag
         }
@@ -384,6 +401,13 @@ pub(crate) const TOOLS: &[ToolDescriptor] = &[
         hint: "Drag outward from the center; the label reads the radius in mi / km.",
         group: ToolGroup::Lines,
         tool: ToolKind::RangeCircle,
+    },
+    ToolDescriptor {
+        id: "text",
+        label: "Text",
+        hint: "Click to stamp the toolbar's Text field at that spot (Width sets the type size)",
+        group: ToolGroup::Lines,
+        tool: ToolKind::Text,
     },
     ToolDescriptor {
         id: "freehand",
@@ -510,7 +534,7 @@ pub(crate) fn tool_default_color(tool: ToolKind) -> egui::Color32 {
         ToolKind::Crosshair | ToolKind::Box | ToolKind::Arrow | ToolKind::Freehand => {
             ANNOTATION_COLOR
         }
-        ToolKind::RangeCircle => Color32::from_rgb(240, 240, 245),
+        ToolKind::RangeCircle | ToolKind::Text => Color32::from_rgb(240, 240, 245),
         ToolKind::FlowArrow => Color32::from_rgb(255, 255, 0),
         ToolKind::Front(front) => match front {
             FrontKind::Cold | FrontKind::Stationary => Color32::from_rgb(0x33, 0x33, 0xcc),
@@ -563,6 +587,9 @@ pub(crate) struct AnnotationState {
     pub(crate) outflow_pips: bool,
     /// Diagonal hatch fill for new watch boxes.
     pub(crate) watch_hatch: bool,
+    /// Toolbar Text field: stamped by the Text tool and written into new
+    /// watch boxes / warning polygons (empty = the kind's preset wording).
+    pub(crate) label_text: String,
     /// Per-tool color overrides (descriptor id → RGB), applied to NEW
     /// shapes of that tool.
     pub(crate) color_overrides: BTreeMap<&'static str, [u8; 3]>,
@@ -585,6 +612,7 @@ impl Default for AnnotationState {
             flip: false,
             outflow_pips: false,
             watch_hatch: true,
+            label_text: String::new(),
             color_overrides: BTreeMap::new(),
             save_name: String::new(),
             io_status: None,
@@ -599,6 +627,35 @@ impl AnnotationState {
             opacity: self.opacity,
             color: self.color_overrides.get(descriptor(tool).id).copied(),
         }
+    }
+
+    /// Toolbar Text field, trimmed; None when empty (= preset wording).
+    pub(crate) fn normalized_label(&self) -> Option<String> {
+        let text = self.label_text.trim();
+        (!text.is_empty()).then(|| text.to_owned())
+    }
+
+    /// Rewrite the text of the most recent text-bearing shape (Text stamp,
+    /// watch box, or warning polygon) from the toolbar field — the v1 text
+    /// editor while shapes have no selection mechanic. Returns whether a
+    /// shape was found.
+    pub(crate) fn apply_label_to_last(&mut self) -> bool {
+        let label = self.normalized_label();
+        for shape in self.shapes.iter_mut().rev() {
+            match shape {
+                Annotation::Text { text, .. } => {
+                    *text = label.unwrap_or_else(|| "Text".to_owned());
+                    return true;
+                }
+                Annotation::WatchBox { label: slot, .. }
+                | Annotation::WarnPolygon { label: slot, .. } => {
+                    *slot = label;
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Undo one step: drop the last path vertex while drafting, else the
@@ -764,6 +821,46 @@ impl ViewerApp {
                         self.annotations.color_overrides.remove(id);
                     }
                 }
+
+                // Text editor: stamped by the Text tool; watch boxes and
+                // warning polygons take it as custom chip/banner wording.
+                if matches!(
+                    tool,
+                    ToolKind::Text | ToolKind::Watch(_) | ToolKind::Warn(_)
+                ) {
+                    ui.label("Text");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.annotations.label_text)
+                            .desired_width(130.0)
+                            .hint_text(match tool {
+                                ToolKind::Text => "click the map to stamp",
+                                _ => "preset wording",
+                            }),
+                    )
+                    .on_hover_text(
+                        "Applied to NEW shapes of this tool. Empty keeps the preset \
+                         wording (TOR WATCH, TORNADO WARNING, …; Free shapes stay \
+                         unlabeled).",
+                    );
+                    let has_target = self.annotations.shapes.iter().any(|shape| {
+                        matches!(
+                            shape,
+                            Annotation::Text { .. }
+                                | Annotation::WatchBox { .. }
+                                | Annotation::WarnPolygon { .. }
+                        )
+                    });
+                    if ui
+                        .add_enabled(has_target, egui::Button::new("→ last"))
+                        .on_hover_text(
+                            "Rewrite the text of the most recent text / watch / \
+                             warning shape (empty restores the preset wording)",
+                        )
+                        .clicked()
+                    {
+                        self.annotations.apply_label_to_last();
+                    }
+                }
             }
 
             ui.separator();
@@ -927,6 +1024,15 @@ impl ViewerApp {
                             at: geo,
                             style,
                         },
+                        ToolKind::Text => Annotation::Text {
+                            at: geo,
+                            // Empty field still stamps something visible.
+                            text: self
+                                .annotations
+                                .normalized_label()
+                                .unwrap_or_else(|| "Text".to_owned()),
+                            style,
+                        },
                         _ => Annotation::Crosshair { at: geo, style },
                     });
                 }
@@ -981,6 +1087,7 @@ impl ViewerApp {
                 flip: self.annotations.flip,
                 pips: self.annotations.outflow_pips,
                 hatch: self.annotations.watch_hatch,
+                label: self.annotations.normalized_label(),
             },
         )
     }
@@ -1081,11 +1188,13 @@ impl ViewerApp {
 }
 
 /// Flags captured into new drafts from the toolbar state.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct DraftFlags {
     pub(crate) flip: bool,
     pub(crate) pips: bool,
     pub(crate) hatch: bool,
+    /// Custom text for watch boxes / warning polygons (None = preset).
+    pub(crate) label: Option<String>,
 }
 
 pub(crate) fn start_draft(
@@ -1115,6 +1224,11 @@ pub(crate) fn start_draft(
             points: vec![geo],
             style,
         },
+        ToolKind::Text => Annotation::Text {
+            at: geo,
+            text: flags.label.unwrap_or_else(|| "Text".to_owned()),
+            style,
+        },
         ToolKind::Front(front) => Annotation::Front {
             front,
             points: vec![geo],
@@ -1131,11 +1245,13 @@ pub(crate) fn start_draft(
             a: geo,
             b: geo,
             hatch: flags.hatch,
+            label: flags.label,
             style,
         },
         ToolKind::Warn(warn) => Annotation::WarnPolygon {
             warn,
             points: vec![geo],
+            label: flags.label,
             style,
         },
         ToolKind::Icon(icon) => Annotation::Icon {
@@ -1148,7 +1264,9 @@ pub(crate) fn start_draft(
 
 pub(crate) fn update_draft(draft: &mut Annotation, geo: GeoPoint, spacing_ok: bool) {
     match draft {
-        Annotation::Crosshair { at, .. } | Annotation::Icon { at, .. } => *at = geo,
+        Annotation::Crosshair { at, .. }
+        | Annotation::Text { at, .. }
+        | Annotation::Icon { at, .. } => *at = geo,
         Annotation::Box { b, .. } | Annotation::WatchBox { b, .. } => *b = geo,
         Annotation::Arrow { head, .. } => *head = geo,
         Annotation::RangeCircle { edge, .. } => *edge = geo,
@@ -1165,7 +1283,7 @@ pub(crate) fn update_draft(draft: &mut Annotation, geo: GeoPoint, spacing_ok: bo
 
 pub(crate) fn draft_is_valid(draft: &Annotation) -> bool {
     match draft {
-        Annotation::Crosshair { .. } | Annotation::Icon { .. } => true,
+        Annotation::Crosshair { .. } | Annotation::Text { .. } | Annotation::Icon { .. } => true,
         Annotation::Box { a, b, .. } | Annotation::WatchBox { a, b, .. } => a != b,
         Annotation::Arrow { tail, head, .. } => tail != head,
         Annotation::RangeCircle { center, edge, .. } => center != edge,
@@ -1312,8 +1430,14 @@ mod tests {
             flip: true,
             pips: true,
             hatch: false,
+            label: None,
         };
-        let mut draft = start_draft(ToolKind::Front(FrontKind::Outflow), p1, style(), flags);
+        let mut draft = start_draft(
+            ToolKind::Front(FrontKind::Outflow),
+            p1,
+            style(),
+            flags.clone(),
+        );
         assert!(!draft_is_valid(&draft));
         update_draft(&mut draft, p2, true);
         match &draft {

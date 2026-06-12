@@ -461,61 +461,83 @@ impl crate::ViewerApp {
         }
     }
 
-    /// Layer toggles for the ALGORITHMS section (next to rotation markers).
-    pub(crate) fn tor_tracks_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// Rotation tracks + TDS as unified layer-rail rows (ui-overhaul spec
+    /// §2: every map overlay is a row). Reset stays an inline extra — the
+    /// accumulation window is the layer's one operational control.
+    pub(crate) fn tor_tracks_rail_rows(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        use crate::{LayerRowGear, LayerRowOpacity, LayerRowSpec, LayerRowVis, layer_row};
         let newest = self
             .frame_history
             .last()
             .map(|frame| frame.identity.scan_time_utc);
         let state = &mut self.tor_tracks;
-        ui.horizontal(|ui| {
-            if ui
-                .checkbox(&mut state.show_tracks, "Rotation tracks")
-                .on_hover_text(
-                    "Per-pixel MAXIMUM low-level (0–2 km, lowest tilts) cyclonic azimuthal shear accumulated across the loaded loop — the swath a translating mesocyclone paints. Single-radar analogue of the MRMS rotation tracks (Mahalik et al. 2019; Miller et al. 2013; Smith et al. 2016). Transparent below 0.003 s⁻¹, magenta at 0.02 s⁻¹. Scrubbing shows the accumulation up to the viewed frame.",
-                )
-                .changed()
-            {
-                ctx.request_repaint();
-            }
-            if (state.show_tracks || state.show_tds)
-                && !state.frames.is_empty()
-                && crate::fixed_action_button(ui, "Reset", 50.0)
-                    .on_hover_text("Restart the accumulation window at the newest loaded frame")
-                    .clicked()
-            {
-                state.reset_floor = newest;
-                if let Some(floor) = state.reset_floor {
-                    state.frames.retain(|frame| frame.scan_time >= floor);
-                }
-                state.display = None;
-                state.generation = state.generation.wrapping_add(1);
-                ctx.request_repaint();
-            }
-        });
-        if state.show_tracks {
-            ui.horizontal(|ui| {
-                ui.add_space(18.0);
-                if ui
-                    .add(
-                        egui::Slider::new(&mut state.tracks_opacity, 0.2..=1.0)
-                            .show_value(false)
-                            .text("opacity"),
-                    )
-                    .on_hover_text("Rotation-tracks layer opacity")
-                    .changed()
+        let mut reset = false;
+        let can_reset = (state.show_tracks || state.show_tds) && !state.frames.is_empty();
+        if layer_row(
+            ui,
+            LayerRowSpec {
+                vis: LayerRowVis::Toggle {
+                    value: &mut state.show_tracks,
+                    hover: "Per-pixel MAXIMUM low-level (0–2 km, lowest tilts) cyclonic azimuthal shear accumulated across the loaded loop — the swath a translating mesocyclone paints. Single-radar analogue of the MRMS rotation tracks (Mahalik et al. 2019; Miller et al. 2013; Smith et al. 2016). Transparent below 0.003 s⁻¹, magenta at 0.02 s⁻¹. Scrubbing shows the accumulation up to the viewed frame.",
+                },
+                name: "Rotation tracks",
+                name_width: crate::NAME_W_STD,
+                name_hover: "Low-level azimuthal-shear swath across the loop (MRMS rotation-tracks lineage)",
+                opacity: Some(LayerRowOpacity::F32 {
+                    value: &mut state.tracks_opacity,
+                    min: 0.2,
+                    hover: "Rotation-tracks layer opacity",
+                }),
+                gear: Some(LayerRowGear::Menu {
+                    hover: "Rotation-tracks options",
+                    content: Box::new(|ui| {
+                        ui.weak("Appearance controls (ramp, thresholds)");
+                        ui.weak("land here next.");
+                    }),
+                }),
+                ..Default::default()
+            },
+            |ui| {
+                if can_reset
+                    && crate::fixed_action_button(ui, "Reset", 50.0)
+                        .on_hover_text("Restart the accumulation window at the newest loaded frame")
+                        .clicked()
                 {
-                    ctx.request_repaint();
+                    reset = true;
                 }
-            });
+            },
+        ) {
+            ctx.request_repaint();
         }
-        if ui
-            .checkbox(&mut state.show_tds, "TDS flag")
-            .on_hover_text(
-                "Tornado debris signature — a deterministic dual-pol physics flag, NOT a probability: ρhv < 0.82 inside > 30 dBZ echo within 5 km of a rank ≥ 3 circulation, lowest tilt (Ryzhkov et al. 2005; Van Den Broeke & Jauernic 2014; Snyder & Ryzhkov 2015). White/magenta gates at the viewed frame; the magenta trail is the debris track across the loop.",
-            )
-            .changed()
-        {
+        if reset {
+            state.reset_floor = newest;
+            if let Some(floor) = state.reset_floor {
+                state.frames.retain(|frame| frame.scan_time >= floor);
+            }
+            state.display = None;
+            state.generation = state.generation.wrapping_add(1);
+            ctx.request_repaint();
+        }
+        if layer_row(
+            ui,
+            LayerRowSpec {
+                vis: LayerRowVis::Toggle {
+                    value: &mut state.show_tds,
+                    hover: "Tornado debris signature — a deterministic dual-pol physics flag, NOT a probability: ρhv < 0.82 inside > 30 dBZ echo within 5 km of a rank ≥ 3 circulation, lowest tilt (Ryzhkov et al. 2005; Van Den Broeke & Jauernic 2014; Snyder & Ryzhkov 2015). White/magenta gates at the viewed frame; the magenta trail is the debris track across the loop.",
+                },
+                name: "TDS flag",
+                name_width: crate::NAME_W_STD,
+                name_hover: "Dual-pol tornado debris signature gates + the debris track across the loop",
+                gear: Some(LayerRowGear::Menu {
+                    hover: "TDS options",
+                    content: Box::new(|ui| {
+                        ui.weak("Appearance controls land here next.");
+                    }),
+                }),
+                ..Default::default()
+            },
+            |_ui| {},
+        ) {
             ctx.request_repaint();
         }
         if state.show_tracks || state.show_tds {

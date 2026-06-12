@@ -8,16 +8,17 @@
 
 use eframe::egui;
 
-/// Section header color — same as `ViewerApp::section_header`.
-const SUBHEAD_COLOR: egui::Color32 = egui::Color32::from_rgb(148, 160, 172);
-/// Keycap/action accent — same family as the "Editing pane" hint.
-const KEY_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 168, 220);
+// Same constants the sidebar reads (ui_theme.rs) — the Guide can't drift
+// from the chrome it documents.
+use crate::ui_theme::ACCENT_COLOR as KEY_COLOR;
+use crate::ui_theme::SUBHEAD_COLOR;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum GuideSection {
     #[default]
     GettingStarted,
     Products,
+    Layers,
     ModelData,
     Satellite,
     Archive,
@@ -27,9 +28,10 @@ enum GuideSection {
 }
 
 impl GuideSection {
-    const ALL: [GuideSection; 8] = [
+    const ALL: [GuideSection; 9] = [
         Self::GettingStarted,
         Self::Products,
+        Self::Layers,
         Self::ModelData,
         Self::Satellite,
         Self::Archive,
@@ -42,6 +44,7 @@ impl GuideSection {
         match self {
             Self::GettingStarted => "Getting started",
             Self::Products => "Products explained",
+            Self::Layers => "Layers",
             Self::ModelData => "Model data & soundings",
             Self::Satellite => "Satellite",
             Self::Archive => "Archive & events",
@@ -97,6 +100,7 @@ pub fn guide_window(ctx: &egui::Context, open: &mut bool) {
                         match section {
                             GuideSection::GettingStarted => getting_started(ui),
                             GuideSection::Products => products(ui),
+                            GuideSection::Layers => layers(ui),
                             GuideSection::ModelData => model_data(ui),
                             GuideSection::Satellite => satellite(ui),
                             GuideSection::Archive => archive(ui),
@@ -183,10 +187,21 @@ fn getting_started(ui: &mut egui::Ui) {
     ui.heading("Getting started");
     para(
         ui,
-        "BowEcho is the radar map plus the sidebar on the right. The sidebar has four tabs: \
-         Radar (site, products, tilts, loop, tools), Archive (any past day + SPC events), \
-         Warnings (NWS alert polygons), and Settings (display, color tables, hotkeys, \
-         performance).",
+        "BowEcho is the radar map plus the sidebar on the right. The sidebar has five tabs: \
+         Radar (site, products, tilts, loop, algorithms, tools — live operations), Layers \
+         (everything drawn over the map, one uniform list), Severe (NWS warning polygons + \
+         SPC outlooks and reports), Data (archive days, live poll feeds, the model store, \
+         local files), and \u{2699} Settings (display, color tables, hotkeys, performance). \
+         Collapsible sections remember whether you left them open.",
+    );
+    para(
+        ui,
+        "The top bar holds one-shot actions on the left (Reset View, Reload, Screenshot, \
+         Annotate) and, on the right, the Windows \u{25be} menu — every data window (Model, \
+         Satellite, WoFS, FARM, 3D Volume, Sounding) opens from there — plus this Guide. \
+         Status chips (a green FARM LIVE chip when a mobile radar is plotting, an \
+         update-available notice) appear beside the menus. Tab hides all chrome for a clean \
+         capture; Tab or Esc brings it back.",
     );
 
     subhead(ui, "PICK A RADAR");
@@ -478,6 +493,68 @@ fn products(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. Layers — the rail
+
+fn layers(ui: &mut egui::Ui) {
+    ui.heading("Layers");
+    para(
+        ui,
+        "The Layers tab is one uniform list of everything drawn over the map: the primary \
+         radar, overlay radars, rotation tracks + TDS, GOES, model and mesoanalysis fields, \
+         WoFS and FARM drapes, surface obs, lightning, SPC outlooks and reports, warning \
+         polygons, and placefiles. Layers draw bottom-to-top in list order.",
+    );
+
+    subhead(ui, "THE ROW");
+    para(
+        ui,
+        "Every layer wears the same row: a visibility checkbox, the name (hover it for \
+         details), a state dot where the layer has a lifecycle (live / loading / paused), an \
+         opacity slider where the layer has one, \u{2191}/\u{2193} reorder buttons where \
+         order matters (model fields), then the row's one or two earned inline extras, a \
+         \u{2699} gear, and \u{2715} remove.",
+    );
+    action(
+        ui,
+        "\u{2699} gear",
+        "— opens the layer's owning surface: the Model/Satellite/WoFS/FARM window for window \
+         layers, the Severe tab for SPC and warnings, or a small popover for layers with \
+         only a few options (surface-obs networks, lightning). Appearance controls land in \
+         these popovers next.",
+    );
+    action(
+        ui,
+        "+ Add layer \u{25be}",
+        "— the single front door for every map data type: radar overlays, model fields, \
+         satellite, WoFS/FARM drapes, mesoanalysis composites, surface obs, placefiles. You \
+         never need to know which window a layer is born in.",
+    );
+
+    subhead(ui, "ANALYSIS (OA)");
+    para(
+        ui,
+        "At the bottom of the tab: compute that EMITS layers. Analyze obs runs a Bratseth \
+         objective analysis of the model surface field against live obs; Compute composites \
+         builds the full SPC mesoanalysis suite (SCP, STP, SHIP, EHI, …) — each field then \
+         adds as an instant \"(OA)\" layer, also reachable from + Add layer \u{25b8} \
+         Mesoanalysis (OA).",
+    );
+    cite(
+        ui,
+        "Bratseth 1986 (Tellus 38A); Bothwell et al. 2002 (SPC mesoanalysis); ADAS weights.",
+    );
+
+    subhead(ui, "WHERE THE OLD TOGGLES WENT");
+    para(
+        ui,
+        "Everything that used to hide in the Radar tab's Layers fold lives here now. The \
+         Radar tab keeps a one-line \"Layers: N \u{2192}\" link; Poll-URL feeds moved to the \
+         Data tab (they replace the volume source — acquisition, not a layer); SPC \
+         day/kind config moved to the Severe tab.",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 3. Model data & soundings
 
 fn model_data(ui: &mut egui::Ui) {
@@ -485,8 +562,8 @@ fn model_data(ui: &mut egui::Ui) {
     para(
         ui,
         "HRRR fields and skew-T soundings, layered straight onto the radar map. Enable the \
-         master switch first: Radar tab \u{25b8} Layers \u{25b8} Model data (off = pure radar \
-         app). The Model button in the top bar opens the Model data window.",
+         master switch first: \u{2699} Settings \u{25b8} Model \u{25b8} Model data (off = \
+         pure radar app). Windows \u{25be} \u{25b8} Model data opens the Model window.",
     );
 
     subhead(ui, "GETTING DATA");
@@ -572,8 +649,8 @@ fn satellite(ui: &mut egui::Ui) {
     ui.heading("Satellite");
     para(
         ui,
-        "The Sat button in the top bar opens the GOES window: a live follow engine on top, a \
-         frame player below.",
+        "Windows \u{25be} \u{25b8} Satellite opens the GOES window: a live follow engine on \
+         top, a frame player below.",
     );
 
     subhead(ui, "LIVE FOLLOW");
@@ -597,7 +674,7 @@ fn satellite(ui: &mut egui::Ui) {
         ui,
         "Show on radar map",
         "— puts the current frame under the radar as a map layer. Opacity and removal live in \
-         Radar tab \u{25b8} Layers \u{25b8} GOES.",
+         the Layers tab's GOES row.",
     );
 
     subhead(ui, "BAND PICKS");
@@ -616,9 +693,11 @@ fn archive(ui: &mut egui::Ui) {
     ui.heading("Archive & events");
     para(
         ui,
-        "The Archive tab replays any day in the Level II record for the selected site — the \
-         loop transport sits at the top of the tab so you never switch tabs to play what you \
-         just loaded.",
+        "The Data tab's Archive section replays any day in the Level II record for the \
+         selected site — the loop transport sits at the top of the tab so you never switch \
+         tabs to play what you just loaded. Data also holds Live feeds (GR2A-style dir.list \
+         polling for research/mobile radars), the Model store summary, and local file/folder \
+         openers.",
     );
 
     subhead(ui, "BROWSING A DAY");

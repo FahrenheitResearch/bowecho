@@ -292,28 +292,11 @@ fn canonical_quantity(quantity: &str) -> Option<MomentType> {
 }
 
 fn parse_site(file: &H5File<'_>) -> RadarSite {
-    // source: comma-separated "TYP:value" identifier pairs (spec Table 3),
-    // e.g. "WMO:02606,RAD:SE50,PLC:Karlskrona,NOD:sekkr".
     let source = file
         .attr("/what", "source")
         .and_then(|attr| attr.as_str().map(str::to_owned))
         .unwrap_or_default();
-    let mut id = String::new();
-    let mut name = None;
-    for pair in source.split(',') {
-        let Some((key, value)) = pair.split_once(':') else {
-            continue;
-        };
-        match key.trim() {
-            "NOD" if id.is_empty() => id = value.trim().to_uppercase(),
-            "RAD" | "WMO" if id.is_empty() => id = value.trim().to_owned(),
-            "PLC" => name = Some(value.trim().to_owned()),
-            _ => {}
-        }
-    }
-    if id.is_empty() {
-        id = "ODIM".to_owned();
-    }
+    let (id, name) = site_identity_from_source(&source);
     RadarSite {
         id,
         name,
@@ -321,6 +304,34 @@ fn parse_site(file: &H5File<'_>) -> RadarSite {
         longitude_deg: attr_f64(file, "/where", "lon").map(|value| value as f32),
         elevation_m: attr_f64(file, "/where", "height").map(|value| value as f32),
     }
+}
+
+/// Pick site id + display name out of the `/what` `source` attribute:
+/// comma-separated "TYP:value" identifier pairs (spec Table 3), e.g.
+/// "WMO:02606,RAD:SE50,PLC:Karlskrona,NOD:sekkr". Preference is
+/// NOD > RAD > WMO regardless of pair order — operational files (RMI
+/// Belgium, met.no) list WMO first but NOD is the canonical OPERA site
+/// code (validated against bejab/norst sample volumes).
+fn site_identity_from_source(source: &str) -> (String, Option<String>) {
+    let (mut nod, mut rad, mut wmo, mut name) = (None, None, None, None);
+    for pair in source.split(',') {
+        let Some((key, value)) = pair.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "NOD" => nod = Some(value.to_uppercase()),
+            "RAD" => rad = Some(value.to_owned()),
+            "WMO" => wmo = Some(value.to_owned()),
+            "PLC" => name = Some(value.to_owned()),
+            _ => {}
+        }
+    }
+    let id = nod.or(rad).or(wmo).unwrap_or_else(|| "ODIM".to_owned());
+    (id, name)
 }
 
 fn parse_datetime(file: &H5File<'_>, group: &str) -> Option<chrono::DateTime<Utc>> {
@@ -356,6 +367,23 @@ mod tests {
             Some(MomentType::CorrelationCoefficient)
         );
         assert_eq!(canonical_quantity("QIND"), None);
+    }
+
+    #[test]
+    fn site_identity_prefers_nod_over_wmo_regardless_of_pair_order() {
+        // Real operational source strings put WMO first; NOD must win.
+        let (id, name) = site_identity_from_source(
+            "WMO:06410,RAD:BX42,PLC:Jabbeke,NOD:bejab,CTY:605,CMT:bejab_scan_v3_Z_dBZ",
+        );
+        assert_eq!(id, "BEJAB");
+        assert_eq!(name.as_deref(), Some("Jabbeke"));
+        // No NOD: fall back RAD, then WMO; empty values are skipped.
+        let (id, _) = site_identity_from_source("RAD:AU40,PLC:CapFlat,CTY:500,STN:70341");
+        assert_eq!(id, "AU40");
+        let (id, _) = site_identity_from_source("WMO:01104,NOD:");
+        assert_eq!(id, "01104");
+        let (id, _) = site_identity_from_source("CMT:whatever");
+        assert_eq!(id, "ODIM");
     }
 
     #[test]

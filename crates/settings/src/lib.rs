@@ -56,6 +56,12 @@ pub struct AppSettings {
     /// GR2-style bold town labels (white, heavy halo) readable over echoes.
     #[serde(default = "default_bold_labels")]
     pub bold_labels: bool,
+    /// Map right-click: false (default) = open the lowest-beam radar menu;
+    /// true = switch straight to the closest WSR-88D, no menu (field
+    /// request: "i might sometimes want right click to just load closest
+    /// radar").
+    #[serde(default)]
+    pub right_click_loads_nearest: bool,
     /// Reflectivity gate filter threshold in deci-dBZ; None = off. Hides
     /// non-REF gates whose co-located reflectivity is weaker (GR2-style
     /// GateFilter).
@@ -95,6 +101,11 @@ pub struct AppSettings {
     /// default. Read once at startup; Settings says "restart to apply".
     #[serde(default)]
     pub data_dir: String,
+    /// Sidebar section open/closed memory (section id -> open). eframe is
+    /// built without the `persistence` feature, so egui's own collapsing
+    /// state dies with the process — this map is what survives restarts.
+    #[serde(default)]
+    pub sidebar_section_open: BTreeMap<String, bool>,
 }
 
 /// A persisted FARM drape georeference. Coordinates are stored as scaled
@@ -173,6 +184,7 @@ impl Default for AppSettings {
             placefiles: Vec::new(),
             basemap_style: default_basemap_style(),
             bold_labels: default_bold_labels(),
+            right_click_loads_nearest: false,
             gate_filter_decidbz: None,
             model_keep_runs: default_model_keep_runs(),
             perf_hud: false,
@@ -181,6 +193,7 @@ impl Default for AppSettings {
             farm_georefs: Vec::new(),
             workspace_layout: None,
             data_dir: String::new(),
+            sidebar_section_open: BTreeMap::new(),
         }
     }
 }
@@ -224,6 +237,14 @@ impl AppSettings {
         if !self.favorites.iter().any(|s| s.eq_ignore_ascii_case(site)) {
             self.favorites.push(site.to_ascii_uppercase());
         }
+    }
+
+    pub fn remove_favorite(&mut self, site: &str) {
+        self.favorites.retain(|s| !s.eq_ignore_ascii_case(site));
+    }
+
+    pub fn is_favorite(&self, site: &str) -> bool {
+        self.favorites.iter().any(|s| s.eq_ignore_ascii_case(site))
     }
 }
 

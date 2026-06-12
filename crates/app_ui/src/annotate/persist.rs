@@ -125,6 +125,11 @@ pub(crate) fn every_shape_kind() -> Vec<Annotation> {
             points: vec![p(-98.0, 34.0), p(-97.9, 34.1), p(-97.7, 34.05)],
             style: styled,
         },
+        Annotation::Text {
+            at: p(-97.6, 34.9),
+            text: "Hook echo here".to_owned(),
+            style: styled,
+        },
         Annotation::Front {
             front: FrontKind::Cold,
             points: vec![p(-99.0, 36.0), p(-98.0, 35.5), p(-97.0, 35.6)],
@@ -148,11 +153,21 @@ pub(crate) fn every_shape_kind() -> Vec<Annotation> {
             a: p(-99.5, 33.5),
             b: p(-97.5, 35.5),
             hatch: true,
+            label: None,
             style: ShapeStyle::default(),
+        },
+        Annotation::WatchBox {
+            watch: WatchKind::Free,
+            a: p(-99.0, 33.0),
+            b: p(-98.2, 33.8),
+            hatch: true,
+            label: Some("PDS AREA".to_owned()),
+            style: styled,
         },
         Annotation::WarnPolygon {
             warn: WarnKind::Svr,
             points: vec![p(-98.0, 34.0), p(-97.5, 34.4), p(-97.2, 33.9)],
+            label: Some("MACROBURST".to_owned()),
             style: styled,
         },
         Annotation::Icon {
@@ -186,6 +201,7 @@ mod tests {
             "arrow",
             "range_circle",
             "freehand",
+            "text",
             "front",
             "flow_arrow",
             "watch_box",

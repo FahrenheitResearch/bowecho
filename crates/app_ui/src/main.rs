@@ -31,6 +31,7 @@ mod farm_live;
 mod glm_layer;
 mod guide;
 mod ingest_worker;
+mod layers_rail;
 mod media;
 mod mesoanalysis;
 mod model_data;
@@ -44,8 +45,10 @@ mod sat_worker;
 mod skewt_native;
 mod sounding_panels;
 mod spc_layers;
+mod table_editor;
 mod tiles;
 mod tor_tracks;
+mod ui_theme;
 mod vol3d;
 mod wofs;
 mod wofs_georef;
@@ -139,12 +142,14 @@ const COLOR_STATUS_SCROLL_HEIGHT: f32 = 34.0;
 const HAZARD_SUMMARY_SCROLL_HEIGHT: f32 = 86.0;
 const HAZARD_DETAIL_SCROLL_HEIGHT: f32 = 150.0;
 const TILT_LIST_SCROLL_HEIGHT: f32 = 168.0;
-const PANEL_BUTTON_HEIGHT: f32 = 24.0;
-/// Shared opacity-slider width for the unified layer rows (Layers fold).
-const LAYER_ROW_SLIDER_WIDTH: f32 = 56.0;
-const SIDEBAR_DEFAULT_WIDTH: f32 = 380.0;
-const SIDEBAR_MIN_WIDTH: f32 = 300.0;
-const SIDEBAR_MAX_WIDTH: f32 = 560.0;
+// The density contract lives in ui_theme.rs (spec §4); the old names stay
+// as crate-wide aliases so 100+ call sites keep reading naturally.
+pub(crate) use ui_theme::ROW_H as PANEL_BUTTON_HEIGHT;
+pub(crate) use ui_theme::{
+    ACCENT_COLOR, LAYER_ROW_SLIDER_WIDTH, LIVE_COLOR, NAME_W_SITE, NAME_W_STD, NAME_W_WIDE,
+    ROW_SPACING_X, SECTION_SPACING, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    SUBHEAD_COLOR,
+};
 const DEFAULT_HIDDEN_HAZARD_FAMILIES: &[&str] = &[];
 const HAZARD_FILTER_FAMILIES: &[(&str, &str)] = &[
     ("tornado", "TOR"),
@@ -596,6 +601,9 @@ struct ViewerApp {
     /// Quick-picker binding scope: false = whole family (the default
     /// mental model — REF/CREF share), true = this product only.
     bind_palette_to_product: bool,
+    /// The color-table editor window (table_editor.rs): draft, live
+    /// preview snapshot, and open state.
+    table_editor: table_editor::TableEditor,
     flip_velocity_color_polarity: bool,
     unfold_velocity_display: bool,
     color_table_target: ColorTableFamily,
@@ -786,6 +794,9 @@ struct ViewerApp {
     /// SPC outlooks + live storm reports.
     spc_data: spc_layers::SpcData,
     spc_outlooks_enabled: Vec<String>,
+    /// Last non-empty outlook-kind set — the rail row's vis toggle restores
+    /// it when re-enabled (off = clear all kinds, on = bring them back).
+    spc_kinds_memory: Vec<String>,
     spc_reports_enabled: bool,
     spc_day: u8,
     spc_last_key: Option<SpcFetchKey>,
@@ -2568,27 +2579,38 @@ struct VrotGate {
     azimuth_deg: f32,
 }
 
+/// The five sidebar tabs (ui-overhaul spec §1): RADAR operates the primary
+/// radar, LAYERS is the rail (everything drawn over the map), SEVERE is
+/// warnings + SPC, DATA is acquisition (archive, live feeds, stores), ⚙ is
+/// settings (icon tab keeps ≥60 px per text tab at the 300 px minimum).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SidebarTab {
     Radar,
-    Archive,
-    Warnings,
+    Layers,
+    Severe,
+    Data,
     Settings,
 }
 
 const SIDEBAR_TABS: &[(SidebarTab, &str)] = &[
     (SidebarTab::Radar, "Radar"),
-    (SidebarTab::Archive, "Archive"),
-    (SidebarTab::Warnings, "Warnings"),
-    (SidebarTab::Settings, "Settings"),
+    (SidebarTab::Layers, "Layers"),
+    (SidebarTab::Severe, "Severe"),
+    (SidebarTab::Data, "Data"),
+    (SidebarTab::Settings, "⚙"),
 ];
 
 fn sidebar_tab_tooltip(tab: SidebarTab) -> &'static str {
     match tab {
         SidebarTab::Radar => "Site, products, tilt, loop, algorithms — live operations",
-        SidebarTab::Archive => "Any date in history: volumes, loops, SPC tornado events",
-        SidebarTab::Warnings => "Warnings, watches, MDs, and alert filters",
-        SidebarTab::Settings => "Basemap, color tables, hotkeys, diagnostics — always available",
+        SidebarTab::Layers => {
+            "Everything drawn over the map: radars, model fields, satellite, obs, SPC, warnings, placefiles"
+        }
+        SidebarTab::Severe => "Warnings, watches, MDs, SPC outlooks + reports, alert filters",
+        SidebarTab::Data => {
+            "Acquisition: any date in history, live poll feeds, the model store, local files"
+        }
+        SidebarTab::Settings => "Settings: basemap, color tables, hotkeys, diagnostics",
     }
 }
 
@@ -2674,6 +2696,7 @@ impl ViewerApp {
             user_color_tables: Vec::new(),
             palette_product_overrides: BTreeMap::new(),
             bind_palette_to_product: false,
+            table_editor: table_editor::TableEditor::default(),
             flip_velocity_color_polarity: false,
             unfold_velocity_display: true,
             color_table_target: ColorTableFamily::Velocity,
@@ -2784,6 +2807,7 @@ impl ViewerApp {
             poll_next: None,
             poll_rx: None,
             spc_data: spc_layers::SpcData::default(),
+            spc_kinds_memory: restored_overlays.4.clone(),
             spc_outlooks_enabled: restored_overlays.4,
             spc_reports_enabled: restored_overlays.5,
             spc_day: 1,
@@ -3778,11 +3802,13 @@ impl ViewerApp {
         if sites.is_empty() {
             return;
         }
+        // Selection first: the user may have picked a site whose volume is
+        // still in flight (slow internet) — remapping to the DISPLAYED
+        // volume here would snap their pick back to the old site.
         let current_site_id = self
-            .volume
-            .as_ref()
-            .map(|volume| volume.site.id.clone())
-            .or_else(|| self.selected_site().map(|site| site.level2_id.clone()));
+            .selected_site()
+            .map(|site| site.level2_id.clone())
+            .or_else(|| self.volume.as_ref().map(|volume| volume.site.id.clone()));
         self.sites = sites;
         if let Some(site_id) = current_site_id
             && let Some(index) = self.sites.iter().position(|site| site.level2_id == site_id)
@@ -5726,12 +5752,13 @@ impl ViewerApp {
     /// Archive tab: date navigation, the day's volumes, SPC tornado
     /// events, and loop-size controls.
     fn archive_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // The loop transport lives here too — archive browsing shouldn't
-        // need a tab switch to play what it just loaded.
-        self.frame_history_panel(ui, ctx);
-        ui.separator();
+        // (The loop transport renders above this section in the DATA tab —
+        // archive browsing shouldn't need a tab switch to play what it just
+        // loaded.)
         ui.horizontal(|ui| {
-            ui.label("Frames");
+            ui.label("Fetch N scans").on_hover_text(
+                "How many volumes an archive loop load fetches (ending at the chosen scan) — not the currently loaded frame count",
+            );
             if ui
                 .add(
                     egui::DragValue::new(&mut self.archive_frame_count)
@@ -5959,7 +5986,8 @@ impl ViewerApp {
             .iter()
             .enumerate()
             .filter_map(|(index, site)| {
-                // WSR-88Ds only — TDWRs live in a different archive bucket.
+                // WSR-88Ds only — TDWRs' short range / attenuation make
+                // them the wrong default for an event jump.
                 if site.level2_id.starts_with('T') {
                     return None;
                 }
@@ -6529,6 +6557,7 @@ impl eframe::App for ViewerApp {
         self.vol3d_window(&ctx);
         self.wofs_window(&ctx);
         self.farm_window(&ctx);
+        self.table_editor_window(&ctx);
         guide::guide_window(&ctx, &mut self.show_guide);
 
         self.sounding_window(&ctx);
@@ -6545,6 +6574,12 @@ impl eframe::App for ViewerApp {
 }
 
 impl ViewerApp {
+    /// Top bar (ui-overhaul spec §3): brand · one-shot actions on the left,
+    /// then — right-aligned — Guide and the `Windows ▾` menu in FIXED edge
+    /// positions with the status chips extending leftward from them. Chips
+    /// are *status*, buttons are *commands*; they no longer share widgets
+    /// (the old FARM button changed width when a sensor went live — layout
+    /// shift mid-ops).
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         self.poll_update_check();
         ui.horizontal_centered(|ui| {
@@ -6558,80 +6593,22 @@ impl ViewerApp {
             }
             self.media_top_bar_ui(ui);
             self.annotate_top_bar_ui(ui);
-            if ui
-                .selectable_label(self.show_satellite, "Sat")
-                .on_hover_text("GOES satellite: live follow + frame playback (rw-sat)")
-                .clicked()
-            {
-                self.toggle_viewer(dock::WorkspacePane::Satellite);
-            }
-            if ui
-                .selectable_label(self.model_dock_open, "Model")
-                .on_hover_text(
-                    "NWP model fields + skew-T soundings (rusty-weather store) — turns the model master switch on if needed",
-                )
-                .clicked()
-            {
-                self.toggle_viewer(dock::WorkspacePane::Model);
-                // Opening the window states intent (ui-refresh proposal
-                // §1.3.7): with the master switch off, poll_model_layer
-                // would tear the dock down next frame and the window
-                // flashed for one frame and died. Flip the switch on.
-                if self.model_dock_open && !self.model_enabled {
-                    self.model_enabled = true;
-                }
-            }
-            if ui
-                .selectable_label(self.wofs.open, "WoFS")
-                .on_hover_text(
-                    "NSSL Warn-on-Forecast System: rapid-cycling ensemble guidance (paintballs, probabilities, ensemble means), radar-time-synced",
-                )
-                .clicked()
-            {
-                self.toggle_viewer(dock::WorkspacePane::Wofs);
-            }
-            {
-                let live = self.farm.live_sensor().map(|s| (s.id, s.name.clone()));
-                let label = match &live {
-                    Some((_, name)) => egui::RichText::new(format!("{name} LIVE"))
-                        .color(egui::Color32::from_rgb(110, 245, 130))
-                        .strong(),
-                    None => egui::RichText::new("FARM"),
-                };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Guide stays top-level forever: with the no-tours rule it is
+                // the discoverability anchor and must never be buried.
                 if ui
-                    .selectable_label(self.farm.open, label)
-                    .on_hover_text(
-                        "FARM mobile radars (DOW/COW): live PPI quicklooks during field deployments — the chip lights up the moment a sensor starts plotting",
-                    )
+                    .selectable_label(self.show_guide, "Guide")
+                    .on_hover_text("How to read every product + where every feature lives")
                     .clicked()
                 {
-                    self.toggle_viewer(dock::WorkspacePane::Farm);
-                    if self.farm.open
-                        && let Some((id, _)) = live
-                    {
-                        self.farm.select_sensor(id);
-                    }
+                    self.show_guide = !self.show_guide;
                 }
-            }
-            if ui
-                .selectable_label(self.vol3d.open, "3D")
-                .on_hover_text(
-                    "Volume Explorer: GPU direct volume rendering of the reflectivity volume (drag to rotate, scroll to zoom)",
-                )
-                .clicked()
-            {
-                self.toggle_viewer(dock::WorkspacePane::Vol3d);
-            }
-            if ui
-                .selectable_label(self.show_guide, "Guide")
-                .on_hover_text("How to read every product + where every feature lives")
-                .clicked()
-            {
-                self.show_guide = !self.show_guide;
-            }
-            if let Some(tag) = &self.update_available {
-                let tag = tag.clone();
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.windows_menu(ui);
+                ui.separator();
+                // STATUS CHIPS — far right after the menus, so a chip
+                // appearing/disappearing never moves a command button.
+                if let Some(tag) = &self.update_available {
+                    let tag = tag.clone();
                     let text = egui::RichText::new(format!("{tag} available"))
                         .small()
                         .color(egui::Color32::from_rgb(255, 196, 110));
@@ -6646,9 +6623,117 @@ impl ViewerApp {
                         ui.ctx()
                             .open_url(egui::OpenUrl::new_tab(BOWECHO_RELEASES_PAGE_URL));
                     }
-                });
-            }
+                }
+                let live = self.farm.live_sensor().map(|s| (s.id, s.name.clone()));
+                if let Some((id, name)) = live {
+                    let chip = egui::RichText::new(format!("{name} LIVE"))
+                        .color(LIVE_COLOR)
+                        .strong();
+                    if ui
+                        .add(egui::Label::new(chip).sense(egui::Sense::click()))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(
+                            "A FARM mobile radar (DOW/COW) is plotting live right now — click to open its quicklook viewer",
+                        )
+                        .clicked()
+                    {
+                        self.open_viewer(dock::WorkspacePane::Farm);
+                        self.farm.select_sensor(id);
+                    }
+                }
+            });
         });
+    }
+
+    /// `Windows ▾` — the one scalable home for every data window (ui-overhaul
+    /// spec §3). Each entry is a checked/unchecked toggle through the dock
+    /// tri-state; every window also stays reachable from its layer-row ⚙, so
+    /// this menu is a third path, not the only one.
+    fn windows_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Windows ▾", |ui| {
+            ui.set_min_width(170.0);
+            let mut toggle: Option<dock::WorkspacePane> = None;
+            for (pane, label, hover) in [
+                (
+                    dock::WorkspacePane::Model,
+                    "Model data",
+                    "NWP model fields + skew-T soundings (rusty-weather store) — turns the model master switch on if needed",
+                ),
+                (
+                    dock::WorkspacePane::Satellite,
+                    "Satellite",
+                    "GOES satellite: live follow + frame playback (rw-sat)",
+                ),
+                (
+                    dock::WorkspacePane::Wofs,
+                    "WoFS",
+                    "NSSL Warn-on-Forecast System: rapid-cycling ensemble guidance (paintballs, probabilities, ensemble means), radar-time-synced",
+                ),
+                (
+                    dock::WorkspacePane::Farm,
+                    "FARM",
+                    "FARM mobile radars (DOW/COW): live PPI quicklooks during field deployments",
+                ),
+                (
+                    dock::WorkspacePane::Vol3d,
+                    "3D Volume",
+                    "Volume Explorer: GPU direct volume rendering of the reflectivity volume (drag to rotate, scroll to zoom)",
+                ),
+            ] {
+                if ui
+                    .selectable_label(self.viewer_open(pane), label)
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    toggle = Some(pane);
+                    ui.close();
+                }
+            }
+            // Sounding finally gets a front door (it used to open only as a
+            // side effect of Alt-click and could never be reopened).
+            let has_sounding = self.native_sounding.is_some();
+            if ui
+                .add_enabled(
+                    has_sounding,
+                    egui::Button::selectable(
+                        self.viewer_open(dock::WorkspacePane::Sounding),
+                        "Sounding",
+                    ),
+                )
+                .on_hover_text(if has_sounding {
+                    "Reopen the last skew-T sounding (Alt-click the map with model data to launch a new one)"
+                } else {
+                    "No sounding yet — Alt-click the map (with model data) to launch one"
+                })
+                .clicked()
+            {
+                toggle = Some(dock::WorkspacePane::Sounding);
+                ui.close();
+            }
+            if let Some(pane) = toggle {
+                self.toggle_viewer(pane);
+                // Opening the Model window states intent (ui-refresh proposal
+                // §1.3.7): with the master switch off, poll_model_layer would
+                // tear the dock down next frame and the window flashed for
+                // one frame and died. Flip the switch on.
+                if pane == dock::WorkspacePane::Model
+                    && self.model_dock_open
+                    && !self.model_enabled
+                {
+                    self.model_enabled = true;
+                }
+                // Opening FARM while a sensor is live jumps straight to it
+                // (same behavior the old live-morphing button had).
+                if pane == dock::WorkspacePane::Farm
+                    && self.farm.open
+                    && let Some(id) = self.farm.live_sensor().map(|s| s.id)
+                {
+                    self.farm.select_sensor(id);
+                }
+            }
+        })
+        .response
+        .on_hover_text("Data windows: Model · Satellite · WoFS · FARM · 3D · Sounding");
     }
 
     /// One release-version check per launch, on a background thread: never
@@ -6700,22 +6785,34 @@ impl ViewerApp {
                         self.radar_controls_panel(ui, ctx);
                     });
             }
-            SidebarTab::Archive => {
+            SidebarTab::Layers => {
                 egui::ScrollArea::vertical()
-                    .id_salt("sidebar_archive_tab")
+                    .id_salt("sidebar_layers_tab")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        self.archive_panel(ui, ctx);
+                        self.layers_rail(ui, ctx);
+                        ui.add_space(4.0);
+                        self.add_layer_menu(ui, ctx);
+                        self.oa_analysis_section(ui, ctx);
                     });
             }
-            SidebarTab::Warnings => {
+            SidebarTab::Severe => {
                 egui::ScrollArea::vertical()
                     .id_salt("sidebar_hazards_tab")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         self.hazard_panel(ui);
+                    });
+            }
+            SidebarTab::Data => {
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar_archive_tab")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        self.data_panel(ui, ctx);
                     });
             }
             SidebarTab::Settings => {
@@ -6730,15 +6827,136 @@ impl ViewerApp {
         }
     }
 
+    /// Sidebar collapsible-section open state, persisted in config.json —
+    /// eframe is built without egui persistence, so Memory dies with the
+    /// process; this map is what survives restarts (spec §1).
+    pub(crate) fn section_open(&self, key: &str, default_open: bool) -> bool {
+        self.app_settings
+            .sidebar_section_open
+            .get(key)
+            .copied()
+            .unwrap_or(default_open)
+    }
+
+    pub(crate) fn set_section_open(&mut self, key: &str, open: bool) {
+        self.app_settings
+            .sidebar_section_open
+            .insert(key.to_owned(), open);
+        let _ = self.app_settings.save();
+    }
+
+    /// A collapsible sidebar section that remembers its open state across
+    /// restarts. The header is forced from the persisted state every frame
+    /// (`.open(Some(..))`) and clicks write back through AppSettings.
+    fn remembered_section<R>(
+        &mut self,
+        ui: &mut egui::Ui,
+        key: &'static str,
+        label: &str,
+        default_open: bool,
+        body: impl FnOnce(&mut Self, &mut egui::Ui) -> R,
+    ) -> Option<R> {
+        let open = self.section_open(key, default_open);
+        let response = egui::CollapsingHeader::new(label)
+            .id_salt(key)
+            .open(Some(open))
+            .show(ui, |ui| body(self, ui));
+        if response.header_response.clicked() {
+            self.set_section_open(key, !open);
+        }
+        response.body_returned
+    }
+
+    /// DATA — acquisition and sources (spec §1): the archive browser, live
+    /// poll feeds, a two-line model-store summary, and local file entry
+    /// points. Everything that REPLACES or FEEDS the primary volume source
+    /// lives here; layers live in LAYERS.
+    fn data_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // The loop transport stays at the top unfolded — archive browsing
+        // shouldn't need a tab switch to play what it just loaded.
+        self.frame_history_panel(ui, ctx);
+        ui.separator();
+        self.remembered_section(ui, "data_archive", "Archive", true, |app, ui| {
+            app.archive_panel(ui, ctx);
+        });
+        self.remembered_section(ui, "data_live_feeds", "Live feeds", true, |app, ui| {
+            app.live_feeds_section(ui, ctx);
+        });
+        self.remembered_section(ui, "data_model_store", "Model store", true, |app, ui| {
+            let newest = app
+                .model_dock
+                .as_ref()
+                .and_then(|dock| dock.newest_run())
+                .map(|(model, run, hours)| format!("{model} {run} · {hours} hrs in store"))
+                .unwrap_or_else(|| "no runs in store".to_owned());
+            ui.weak(newest)
+                .on_hover_text("Newest model run in the local store (rusty-weather rw-store)");
+            if ui
+                .button("Download…")
+                .on_hover_text(
+                    "Open the Model window's Download section: Fetch latest one-click ingest, or any run/hours with size + compute estimates",
+                )
+                .clicked()
+            {
+                app.model_enabled = true;
+                app.open_viewer(dock::WorkspacePane::Model);
+                app.model_download_open = true;
+            }
+        });
+        self.remembered_section(ui, "data_local", "Local files", true, |app, ui| {
+            let _ = (&app, &ui);
+            #[cfg(any(windows, target_os = "macos"))]
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Open radar file…")
+                    .on_hover_text(
+                        "Open a local radar file: NEXRAD Level II (.ar2v/.gz/.msg31), a DORADE \
+                         sweepfile (swp.*), or a DOW/COW/RaXPol deployment .zip",
+                    )
+                    .clicked()
+                    && app.load_receiver.is_none()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("All radar files (swp.* sweepfiles)", &["*"])
+                        .add_filter(
+                            "Level II / archives",
+                            &[
+                                "zip", "ar2v", "gz", "bz2", "raw", "msg31", "v06", "v08", "h5",
+                                "nc",
+                            ],
+                        )
+                        .set_title("Open radar data")
+                        .pick_file()
+                {
+                    app.start_local_volume_load(path, ui.ctx());
+                }
+                if ui
+                    .button("Open folder…")
+                    .on_hover_text(
+                        "Open a whole deployment folder: per-sweep DORADE files group into \
+                         volumes automatically; Level II files inside load too",
+                    )
+                    .clicked()
+                    && let Some(dir) = rfd::FileDialog::new()
+                        .set_title("Open a radar deployment folder")
+                        .pick_folder()
+                {
+                    app.start_local_volume_load(dir, ui.ctx());
+                }
+            });
+            #[cfg(not(any(windows, target_os = "macos")))]
+            ui.weak("Native file dialogs need Windows/macOS — use RADAR ▸ SITE on Linux.");
+        });
+    }
+
     /// Small uppercase section header — visual rhythm for the Radar tab.
     fn section_header(ui: &mut egui::Ui, label: &str) {
-        ui.add_space(8.0);
+        ui.add_space(SECTION_SPACING);
         ui.separator();
         ui.label(
             egui::RichText::new(label)
                 .small()
                 .strong()
-                .color(egui::Color32::from_rgb(148, 160, 172)),
+                .color(SUBHEAD_COLOR),
         );
     }
 
@@ -6788,6 +7006,20 @@ impl ViewerApp {
             self.app_settings.bold_labels = self.bold_labels;
             let _ = self.app_settings.save();
             ctx.request_repaint();
+        }
+        if ui
+            .checkbox(
+                &mut self.app_settings.right_click_loads_nearest,
+                "Right-click loads closest radar",
+            )
+            .on_hover_text(
+                "Skip the lowest-beam menu: right-clicking the map switches straight \
+                 to the nearest WSR-88D. Off (default) keeps the menu of the three \
+                 lowest-beam radars; Ctrl+click always jumps to the lowest-beam pick.",
+            )
+            .changed()
+        {
+            let _ = self.app_settings.save();
         }
         ui.horizontal(|ui| {
             ui.label("Workspace");
@@ -6879,49 +7111,43 @@ impl ViewerApp {
     }
 
     /// Settings tab: everything volume-independent, set once per session.
+    /// ⚙ Settings — collapsible sections, open-state remembered across
+    /// restarts (spec §1). A future Appearance section (style registry
+    /// surfaces, docs/customization-spec.md §5) slots in beside these.
     fn settings_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        egui::CollapsingHeader::new("Display")
-            .default_open(true)
-            .show(ui, |ui| {
-                self.display_settings_section(ui, ctx);
-            });
-        let color_tables_id = ui.make_persistent_id("settings_color_tables");
+        self.remembered_section(ui, "settings_display", "Display", true, |app, ui| {
+            app.display_settings_section(ui, ctx);
+        });
+        // One-shot expand path: the PRODUCTS color picker's "Edit…" lands
+        // the user here with the section open.
         if self.open_color_tables_request {
             self.open_color_tables_request = false;
-            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
-                ctx,
-                color_tables_id,
-                false,
-            );
-            state.set_open(true);
-            state.store(ctx);
+            self.set_section_open("settings_color_tables", true);
         }
-        egui::collapsing_header::CollapsingState::load_with_default_open(
-            ctx,
-            color_tables_id,
+        self.remembered_section(
+            ui,
+            "settings_color_tables",
+            "Color tables",
             false,
-        )
-        .show_header(ui, |ui| {
-            ui.label("Color tables");
-        })
-        .body(|ui| {
-            self.color_table_panel(ui, ctx);
+            |app, ui| {
+                app.color_table_panel(ui, ctx);
+            },
+        );
+        self.remembered_section(ui, "settings_hotkeys", "Hotkeys", false, |app, ui| {
+            app.hotkeys_section(ui);
         });
-        egui::CollapsingHeader::new("Hotkeys")
-            .default_open(false)
-            .show(ui, |ui| {
-                self.hotkeys_section(ui);
-            });
-        egui::CollapsingHeader::new("Performance")
-            .default_open(false)
-            .show(ui, |ui| {
-                self.stats_panel(ui);
-            });
-        egui::CollapsingHeader::new("Model")
-            .default_open(false)
-            .show(ui, |ui| {
-                self.model_settings_section(ui, ctx);
-            });
+        self.remembered_section(
+            ui,
+            "settings_performance",
+            "Performance",
+            false,
+            |app, ui| {
+                app.stats_panel(ui);
+            },
+        );
+        self.remembered_section(ui, "settings_model", "Model", false, |app, ui| {
+            app.model_settings_section(ui, ctx);
+        });
     }
 
     /// Settings ▸ Model — the settings-class controls evicted from the
@@ -6968,18 +7194,24 @@ impl ViewerApp {
 
     fn sidebar_tab_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 3.0;
+            ui.spacing_mut().item_spacing.x = ROW_SPACING_X;
+            // The ⚙ tab is a fixed narrow icon so the four text tabs keep
+            // ≥60 px at the 300 px minimum sidebar width (spec §1).
+            let gear_width = 30.0;
+            let text_tab_count = (SIDEBAR_TABS.len() - 1) as f32;
+            let gaps = (SIDEBAR_TABS.len() as f32 - 1.0) * ui.spacing().item_spacing.x;
+            let text_width =
+                ((ui.available_width() - gear_width - gaps) / text_tab_count).max(60.0);
             for (tab, label) in SIDEBAR_TABS {
                 let selected = self.sidebar_tab == *tab;
+                let width = if *tab == SidebarTab::Settings {
+                    gear_width
+                } else {
+                    text_width
+                };
                 let response = ui
                     .add_sized(
-                        egui::vec2(
-                            (ui.available_width()
-                                - (SIDEBAR_TABS.len() as f32 - 1.0) * ui.spacing().item_spacing.x)
-                                .max(60.0)
-                                / SIDEBAR_TABS.len() as f32,
-                            PANEL_BUTTON_HEIGHT,
-                        ),
+                        egui::vec2(width, PANEL_BUTTON_HEIGHT),
                         egui::Button::selectable(selected, *label),
                     )
                     .on_hover_text(sidebar_tab_tooltip(*tab));
@@ -7039,7 +7271,7 @@ impl ViewerApp {
         });
         if let Some(slot) = editing_pane {
             ui.colored_label(
-                egui::Color32::from_rgb(120, 168, 220),
+                ACCENT_COLOR,
                 format!(
                     "Editing pane {} — click the main (top-left) pane to edit all",
                     slot + 2
@@ -7057,7 +7289,7 @@ impl ViewerApp {
             let mut selected_site_index = self.selected_site_index;
             egui::ComboBox::from_id_salt("site_combo")
                 .selected_text(selected_site_label)
-                .width((ui.available_width() - 70.0).max(160.0))
+                .width((ui.available_width() - 96.0).max(160.0))
                 .show_ui(ui, |ui| {
                     for (index, site) in self.sites.iter().enumerate() {
                         ui.selectable_value(
@@ -7070,10 +7302,72 @@ impl ViewerApp {
             if selected_site_index != self.selected_site_index {
                 self.selected_site_index = selected_site_index;
             }
+            // ★ favorite toggle for the selected site — finally writing AND
+            // reading AppSettings::favorites (it was write-only for months).
+            if let Some(site_id) = self.selected_site().map(|s| s.level2_id.clone()) {
+                let is_favorite = self.app_settings.is_favorite(&site_id);
+                let star = if is_favorite { "★" } else { "☆" };
+                if ui
+                    .small_button(star)
+                    .on_hover_text(if is_favorite {
+                        "Remove this site from favorites"
+                    } else {
+                        "Favorite this site: one-click chip below + favorites-first site lists"
+                    })
+                    .clicked()
+                {
+                    if is_favorite {
+                        self.app_settings.remove_favorite(&site_id);
+                    } else {
+                        self.app_settings.add_favorite(&site_id);
+                    }
+                    let _ = self.app_settings.save();
+                }
+            }
             if fixed_action_button(ui, "Center", 58.0).clicked() {
                 self.center_selected_site();
             }
         });
+        // Favorites chip row (spec §1 RADAR ▸ SITE): each chip = one-click
+        // site switch + load-latest. Right-click removes the favorite.
+        if !self.app_settings.favorites.is_empty() {
+            let mut switch_to: Option<String> = None;
+            let mut remove: Option<String> = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = ROW_SPACING_X;
+                for fav in &self.app_settings.favorites {
+                    let selected = self
+                        .selected_site()
+                        .is_some_and(|s| s.level2_id.eq_ignore_ascii_case(fav));
+                    let response = ui
+                        .selectable_label(selected, format!("★{fav}"))
+                        .on_hover_text(
+                            "Switch to this site and load the latest volume (right-click: remove favorite)",
+                        );
+                    if response.clicked() {
+                        switch_to = Some(fav.clone());
+                    }
+                    if response.secondary_clicked() {
+                        remove = Some(fav.clone());
+                    }
+                }
+            });
+            if let Some(fav) = remove {
+                self.app_settings.remove_favorite(&fav);
+                let _ = self.app_settings.save();
+            } else if let Some(fav) = switch_to
+                && let Some(index) = self
+                    .sites
+                    .iter()
+                    .position(|site| site.level2_id.eq_ignore_ascii_case(&fav))
+            {
+                self.selected_site_index = index;
+                if self.load_receiver.is_none() {
+                    self.load_latest_level2_for_selected_site(ui.ctx());
+                    self.remember_startup_site();
+                }
+            }
+        }
         ui.horizontal(|ui| {
             if fixed_action_button(ui, "Load Latest", 88.0).clicked()
                 && self.load_receiver.is_none()
@@ -7175,771 +7469,19 @@ impl ViewerApp {
             ui.label(&self.status);
         }
 
-        // R2: LAYERS — radar overlays + placefiles together, available with or
-        // without a loaded volume.
-        // Honest layer count (ui-refresh proposal §1.3.3): everything the
-        // fold shows as a row — primary radar (when loaded), overlay radars,
-        // GOES, model layers, surface obs, enabled placefiles.
-        let layer_count = usize::from(self.volume.is_some())
-            + self.radar_layers.len()
-            + usize::from(self.sat_layer.is_some())
-            + self.model_layers.len()
-            + usize::from(self.obs_enabled)
-            + self.placefile_slots.iter().filter(|s| s.enabled).count();
-        ui.add_space(8.0);
-        ui.separator();
-        egui::CollapsingHeader::new(format!("Layers ({layer_count})"))
-            .id_salt("layers_fold")
-            .default_open(layer_count > 0)
-            .show(ui, |ui| {
-                // PRIMARY RADAR as a layer row (proposal §3-A): the old bare
-                // "Radar" opacity slider, wearing the same row grammar as
-                // everything else. No vis toggle / no ✕ — the primary IS the
-                // app (badge ◉ instead); site/products live in the sections
-                // above.
-                let primary_name = match &self.volume {
-                    Some(volume) => {
-                        format!("{} {}", volume.site.id, self.selected_product.label())
-                    }
-                    None => "Radar".to_owned(),
-                };
-                let primary_state = if self.load_receiver.is_some() {
-                    "loading"
-                } else if self.volume.is_none() {
-                    "idle"
-                } else if self.realtime_level2_auto_refresh {
-                    "live"
-                } else {
-                    "loaded"
-                };
-                if layer_row(
-                    ui,
-                    LayerRowSpec {
-                        vis: LayerRowVis::Badge {
-                            glyph: "◉",
-                            hover: "Primary radar — always drawn; site and products in the sections above",
-                        },
-                        name: &primary_name,
-                        name_width: 96.0,
-                        name_hover: "Primary radar (site/products in SITE and PRODUCTS above)",
-                        state: Some(primary_state),
-                        opacity: Some(LayerRowOpacity::F32 {
-                            value: &mut self.radar_opacity,
-                            min: 0.15,
-                            hover: "Primary radar opacity (model layer shows through)",
-                        }),
-                    },
-                    |_ui| {},
-                ) {
-                    ctx.request_repaint();
-                }
-                self.radar_layers_panel(ui, ctx);
-                // (The model master switch + "Keep runs" retention policy
-                // moved to Settings ▸ Model — proposal step 4: the fold holds
-                // layers, not app policy.)
-                let mut remove_sat_layer = false;
-                let mut open_sat_window = false;
-                if let Some(layer) = &mut self.sat_layer {
-                    ui.separator();
-                    if layer_row(
-                        ui,
-                        LayerRowSpec {
-                            vis: LayerRowVis::Toggle {
-                                value: &mut layer.visible,
-                                hover: "Show GOES on map",
-                            },
-                            name: "GOES",
-                            name_width: 96.0,
-                            name_hover: "GOES satellite frame (configure in the Sat window)",
-                            state: None,
-                            opacity: Some(LayerRowOpacity::F32 {
-                                value: &mut layer.opacity,
-                                min: 0.1,
-                                hover: "Satellite layer opacity",
-                            }),
-                        },
-                        |ui| {
-                            if ui
-                                .small_button("⚙")
-                                .on_hover_text(
-                                    "Open the Satellite window (band · sector · cadence · playback)",
-                                )
-                                .clicked()
-                            {
-                                open_sat_window = true;
-                            }
-                            if ui
-                                .small_button("✕")
-                                .on_hover_text("Remove satellite layer")
-                                .clicked()
-                            {
-                                remove_sat_layer = true;
-                            }
-                        },
-                    ) {
-                        ctx.request_repaint();
-                    }
-                }
-                if open_sat_window {
-                    self.open_viewer(dock::WorkspacePane::Satellite);
-                }
-                if remove_sat_layer {
-                    self.sat_layer = None;
-                    self.sat_layer_texture = None;
-                    ctx.request_repaint();
-                }
-                {
-                    // Surface obs as a layer row; the network sub-toggles ride
-                    // in the row's trailing slot. `obs_on` is a copy so the
-                    // trailing closure can gate on it while the row holds the
-                    // &mut (a fresh toggle shows its sub-toggles next frame —
-                    // the repaint below makes that instant).
-                    let obs_on = self.obs_enabled;
-                    let obs_show_metar = &mut self.obs_show_metar;
-                    let obs_show_mesonet = &mut self.obs_show_mesonet;
-                    let obs_adjust_soundings = &mut self.obs_adjust_soundings;
-                    let obs_fetched_at = self.obs_fetched_at;
-                    let obs_station_count = self.surface_obs.station_count;
-                    let obs_fetching = self.obs_rx.is_some();
-                    if layer_row(
-                        ui,
-                        LayerRowSpec {
-                            vis: LayerRowVis::Toggle {
-                                value: &mut self.obs_enabled,
-                                hover: "METAR station plots: temperature/dewpoint (°F), wind barbs, gusts — every reporting station, refreshed ~5 min",
-                            },
-                            name: "Surface obs",
-                            name_width: 96.0,
-                            name_hover: "METAR station plots: temperature/dewpoint (°F), wind barbs, gusts — every reporting station, refreshed ~5 min",
-                            state: None,
-                            opacity: None,
-                        },
-                        |ui| {
-                            if !obs_on {
-                                return;
-                            }
-                            ui.checkbox(obs_show_metar, "METAR")
-                                .on_hover_text("Airport-grade ASOS/AWOS stations");
-                            ui.checkbox(obs_show_mesonet, "Mesonet")
-                                .on_hover_text(
-                                    "IEM RWIS road sensors + DCP/RAWS networks — denser but lower siting quality (road sensors read hot in sun); uncheck for strict-QC METAR-only",
-                                );
-                            if ui
-                                .checkbox(obs_adjust_soundings, "adj snd")
-                                .on_hover_text(
-                                    "Obs-adjusted soundings: the skew-T's surface T/Td/wind come from the nearest station (within 30 km, fresher than 60 min) instead of the model — parcels recompute from the REAL surface. The title shows which station adjusted it.",
-                                )
-                                .changed()
-                            {
-                                ui.ctx().request_repaint();
-                            }
-                            if let Some(at) = obs_fetched_at {
-                                ui.weak(format!(
-                                    "{} stn · {}m ago",
-                                    obs_station_count,
-                                    at.elapsed().as_secs() / 60
-                                ));
-                            }
-                            if obs_fetching {
-                                ui.spinner();
-                            }
-                        },
-                    ) {
-                        ctx.request_repaint();
-                    }
-                }
-                ui.horizontal(|ui| {
-                    if ui
-                        .checkbox(&mut self.glm_enabled, "Lightning (GLM)")
-                        .on_hover_text(
-                            "GOES GLM flashes, free via AWS (no key): trailing 10-minute window, age-faded, time-synced to the radar loop. First data ~1 min after enabling (S3 poll + granule decode).",
-                        )
-                        .changed()
-                    {
-                        self.save_overlay_defaults();
-                        ctx.request_repaint();
-                    }
-                    if self.glm_enabled
-                        && let Some(glm) = &self.glm
-                    {
-                        let frame_ms = chrono::Utc::now().timestamp_millis();
-                        let window_min = self.style_registry.glm().window_minutes;
-                        let count = glm.frame_flashes(frame_ms, window_min).count();
-                        ui.weak(format!("{count} flashes/{window_min}m"));
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("SPC:").on_hover_text(
-                        "Convective outlooks (SPC's own colors, archive-aware: shows the displayed day's outlook) + today's filtered storm reports",
-                    );
-                    egui::ComboBox::from_id_salt("spc_day")
-                        .selected_text(format!("D{}", self.spc_day))
-                        .width(48.0)
-                        .show_ui(ui, |ui| {
-                            for d in 1..=3u8 {
-                                if ui
-                                    .selectable_value(&mut self.spc_day, d, format!("Day {d}"))
-                                    .changed()
-                                {
-                                    self.spc_data.fetched_at = None;
-                                }
-                            }
-                        });
-                    let mut changed = false;
-                    for (slug, label) in spc_layers::OUTLOOK_KINDS {
-                        let mut on = self.spc_outlooks_enabled.iter().any(|k| k == slug);
-                        if ui.checkbox(&mut on, label).changed() {
-                            if on {
-                                self.spc_outlooks_enabled.push(slug.to_owned());
-                            } else {
-                                self.spc_outlooks_enabled.retain(|k| k != slug);
-                            }
-                            self.spc_data.fetched_at = None; // force refetch
-                            changed = true;
-                        }
-                    }
-                    if ui.checkbox(&mut self.spc_reports_enabled, "Reports").changed() {
-                        self.spc_data.fetched_at = None;
-                        changed = true;
-                    }
-                    if changed {
-                        self.save_overlay_defaults();
-                        ctx.request_repaint();
-                    }
-                    if self.spc_rx.is_some() {
-                        ui.spinner();
-                    }
-                });
-                let mut remove_layer: Option<u64> = None;
-                let mut move_layer: Option<(u64, i64)> = None;
-                let mut open_model_window = false;
-                let mut step_hour: i64 = 0;
-                if !self.model_layers.is_empty() {
-                    ui.separator();
-                }
-                // Freshness rides in the row hover now (proposal step 4) —
-                // the fold's standalone freshness/ingest row is gone; deep
-                // acquisition lives in the Model window's Download section.
-                let newest_run_text = self
-                    .model_dock
-                    .as_ref()
-                    .and_then(|dock| dock.newest_run())
-                    .map(|(model, run, hours)| format!("{model} {run} · {hours} hrs in store"))
-                    .unwrap_or_else(|| "no runs in store".to_owned());
-                let model_row_count = self.model_layers.len();
-                for slot in &mut self.model_layers {
-                    let id = slot.id;
-                    let layer = &mut slot.layer;
-                    let name = format!("{} f{:02}", layer.field.key.var, layer.field.key.hour.hour);
-                    let name_hover = format!(
-                        "{} ({}) — layers draw bottom-to-top in list order\nNewest: {}",
-                        layer.field.key.var, layer.field.units, newest_run_text
-                    );
-                    if layer_row(
-                        ui,
-                        LayerRowSpec {
-                            vis: LayerRowVis::Toggle {
-                                value: &mut layer.visible,
-                                hover: "Show on map (unchecked: hidden but still feeds the inspector + Alt+click soundings)",
-                            },
-                            name: &name,
-                            name_width: 96.0,
-                            name_hover: &name_hover,
-                            state: None,
-                            opacity: Some(LayerRowOpacity::F32 {
-                                value: &mut layer.opacity,
-                                min: 0.1,
-                                hover: "Model layer opacity",
-                            }),
-                        },
-                        |ui| {
-                            if model_row_count > 1 {
-                                if ui
-                                    .small_button("↑")
-                                    .on_hover_text("Draw later (higher)")
-                                    .clicked()
-                                {
-                                    move_layer = Some((id, 1));
-                                }
-                                if ui
-                                    .small_button("↓")
-                                    .on_hover_text("Draw earlier (lower)")
-                                    .clicked()
-                                {
-                                    move_layer = Some((id, -1));
-                                }
-                            }
-                            if ui
-                                .small_button("⚙")
-                                .on_hover_text(
-                                    "Open the Model data window (runs · fields · soundings · download)",
-                                )
-                                .clicked()
-                            {
-                                open_model_window = true;
-                            }
-                            if ui
-                                .small_button("✕")
-                                .on_hover_text("Remove this layer")
-                                .clicked()
-                            {
-                                remove_layer = Some(id);
-                            }
-                        },
-                    ) {
-                        ctx.request_repaint();
-                    }
-                }
-                if open_model_window {
-                    self.open_viewer(dock::WorkspacePane::Model);
-                }
-                if !self.model_layers.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.weak("Hour");
-                        if ui.small_button("◀").on_hover_text("Previous forecast hour (layers showing the dock's variable follow)").clicked() {
-                            step_hour = -1;
-                        }
-                        if ui.small_button("▶").on_hover_text("Next forecast hour").clicked() {
-                            step_hour = 1;
-                        }
-                    });
-                }
-                if let Some(id) = remove_layer {
-                    self.model_layers.retain(|slot| slot.id != id);
-                    ctx.request_repaint();
-                }
-                if let Some((id, delta)) = move_layer
-                    && let Some(index) = self.model_layers.iter().position(|slot| slot.id == id)
-                {
-                    let target = index as i64 + delta;
-                    if target >= 0 && (target as usize) < self.model_layers.len() {
-                        self.model_layers.swap(index, target as usize);
-                        ctx.request_repaint();
-                    }
-                }
-                if step_hour != 0
-                    && let Some(dock) = &mut self.model_dock
-                {
-                    dock.step_hour(step_hour);
-                }
-                // MESOANALYSIS: Bratseth obs-correction of the dock's
-                // current surface field, stacked as its own "(OA)" layer.
-                // OA tools render whenever a model hour exists — gating the
-                // whole section on the DISPLAYED variable made the buttons
-                // vanish after restarts (field report). Disabled states
-                // explain themselves instead.
-                let oa_var = self
-                    .model_dock
-                    .as_ref()
-                    .and_then(|dock| dock.latest_field())
-                    .map(|field| field.key.var.clone())
-                    .filter(|var| mesoanalysis::config_for(var).is_some());
-                let dock_has_field = self
-                    .model_dock
-                    .as_ref()
-                    .and_then(|dock| dock.latest_field())
-                    .is_some();
-                if dock_has_field {
-                    let var = oa_var.clone().unwrap_or_default();
-                    ui.horizontal(|ui| {
-                        let ready = oa_var.is_some()
-                            && self.obs_enabled
-                            && !self.surface_obs.is_empty()
-                            && self.model_lut.is_some()
-                            && self.oa_rx.is_none();
-                        if ui
-                            .add_enabled(ready, egui::Button::new("Analyze obs"))
-                            .on_hover_text(format!(
-                                "Bratseth objective analysis: correct {var} with the live surface obs (converges to Optimal Interpolation; Bratseth 1986, ADAS weights, RTMA-style QC). Adds a \"{var} (OA)\" layer.",
-                            ))
-                            .clicked()
-                        {
-                            self.start_mesoanalysis(ctx);
-                        }
-                        if self.oa_rx.is_some() {
-                            ui.spinner();
-                        }
-                        if !self.obs_enabled {
-                            ui.weak("← turn on Surface obs above");
-                        } else if self.surface_obs.is_empty() {
-                            ui.weak("waiting for obs fetch…");
-                        } else if self.model_lut.is_none() {
-                            ui.weak("← \"Show on radar map\" first (Model window)");
-                        } else if oa_var.is_none() {
-                            ui.weak("show T2m / Td2m / 10m wind to analyze");
-                        }
-                    });
-                    if let Some(summary) = &self.oa_last_summary {
-                        ui.weak(summary);
-                    }
-                    // OBSERVED sounding: nearest RAOB launch, rendered by
-                    // the same native skew-T (full sharprs suite on real
-                    // radiosonde data). Archive-aware: uses the displayed
-                    // frame's time.
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button("Obs sounding (RAOB)")
-                            .on_hover_text(
-                                "Nearest radiosonde launch to the map center, at the synoptic time before the displayed frame (IEM archive, no key). Renders in the native skew-T with the full parameter suite.",
-                            )
-                            .clicked()
-                        {
-                            self.start_raob_sounding(ctx);
-                        }
-                    });
-                    // FULL SPC-mesoanalysis composites: one heavy pass
-                    // (sharprs compute_all_params per cell, OA-corrected
-                    // surface incl winds) caches the 64-field catalog
-                    // suite (docs/spc-catalog.md); each is then an
-                    // instant layer.
-                    ui.horizontal(|ui| {
-                        let busy = self.oa_comp_rx.is_some();
-                        let ready = self.obs_enabled
-                            && !self.surface_obs.is_empty()
-                            && self.model_lut.is_some()
-                            && !busy;
-                        if self.oa_composites.is_none() {
-                            if ui
-                                .add_enabled(ready, egui::Button::new("Compute composites (SCP/STP/…)"))
-                                .on_hover_text(
-                                    "One pass computes the full SPC suite (SCP, STP, SHIP, EHI, effective SRH/shear, K-index, PW, …) from the obs-corrected surface + model profiles — then every field is an instant layer. ~30-90 s background.",
-                                )
-                                .clicked()
-                            {
-                                self.start_oa_composites(ctx);
-                            }
-                        } else {
-                            ui.menu_button("Composites ▾", |ui| {
-                                let mut pick: Option<usize> = None;
-                                let _ = &mut pick;
-                                // Grouped like the SPC Mesoscale Analysis
-                                // page sections (docs/spc-catalog.md).
-                                if let Some(fields) = &self.oa_composites {
-                                    for group in oa_derived::GROUPS {
-                                        if !fields.iter().any(|f| f.group == group) {
-                                            continue;
-                                        }
-                                        ui.menu_button(group, |ui| {
-                                            for (i, field) in fields
-                                                .iter()
-                                                .enumerate()
-                                                .filter(|(_, f)| f.group == group)
-                                            {
-                                                if ui.button(field.name).clicked() {
-                                                    pick = Some(i);
-                                                    ui.close();
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                                if let Some(p) = pick {
-                                    self.oa_comp_pick = Some(p);
-                                }
-                                ui.separator();
-                                if ui.button("Recompute").clicked() {
-                                    self.oa_composites = None;
-                                    self.start_oa_composites(ctx);
-                                    ui.close();
-                                }
-                            });
-                        }
-                        if busy {
-                            ui.spinner();
-                            let done = self
-                                .oa_comp_progress
-                                .load(std::sync::atomic::Ordering::Relaxed);
-                            ui.weak(format!("{done}/{} cells", self.oa_comp_total));
-                        }
-                    });
-                    if let Some(pick) = self.take_composite_pick() {
-                        self.push_composite_layer(pick, ctx);
-                    }
-                    // SPC-style derived product: analyze the surface, then
-                    // recompute CAPE from the corrected surface + profiles.
-                    ui.horizontal(|ui| {
-                        let ready = self.obs_enabled
-                            && !self.surface_obs.is_empty()
-                            && self.model_lut.is_some()
-                            && self.oa_cape_rx.is_none();
-                        ui.add_enabled_ui(ready, |ui| {
-                            ui.menu_button("Derive (OA) ▾", |ui| {
-                                for product in oa_derived::OaProduct::ALL {
-                                    if ui.button(product.label()).clicked() {
-                                        self.start_oa_derive(product, ctx);
-                                        ui.close();
-                                    }
-                                }
-                                ui.separator();
-                                ui.weak("Surface-driven thermo only — obs can't\ncorrect winds aloft (SRH/shear stay model).");
-                            })
-                            .response
-                            .on_hover_text(
-                                "SPC-mesoanalysis-style derived fields: Bratseth-correct the surface with live obs, then recompute the parameter from the corrected surface + model profiles (analyze-then-derive, Bothwell et al. 2002).",
-                            );
-                        });
-                        if self.oa_cape_rx.is_some() {
-                            ui.spinner();
-                        }
-                    });
-                }
-                // (The freshness/ingest row left the fold — proposal step 4:
-                // freshness is the model rows' hover, one-click + flexible
-                // acquisition live in the Model window's Download section.)
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Poll URL").on_hover_text(
-                        "GR2A-style polling: a served directory containing dir.list (the convention DOW/mobile radar crews use). Newest file loads automatically every 15 s, decoded natively (Level II or DORADE), and joins the frame loop.",
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.poll_url)
-                            .hint_text("http://host:port/path")
-                            .desired_width(150.0),
-                    );
-                    ui.menu_button("Feeds ▾", |ui| {
-                        ui.weak("research radars serving raw Level II");
-                        for (label, url) in KNOWN_POLL_FEEDS {
-                            if ui.button(*label).clicked() {
-                                self.poll_url = (*url).to_owned();
-                                self.poll_active = true;
-                                self.poll_last_file = None;
-                                self.poll_next = None;
-                                // An auto-refresh load already in flight
-                                // would land AFTER the first poll install
-                                // and wipe the polled frames — drop it.
-                                self.load_receiver = None;
-                                self.app_settings.poll_url = self.poll_url.clone();
-                                let _ = self.app_settings.save();
-                            }
-                        }
-                    })
-                    .response
-                    .on_hover_text(
-                        "Community research-radar poll roots (IEM Level II host + self-hosted university radars) — radars that aren't NEXRAD sites",
-                    );
-                    let label = if self.poll_active { "Stop" } else { "Start" };
-                    if ui.button(label).clicked() {
-                        self.poll_active = !self.poll_active;
-                        self.poll_last_file = None;
-                        self.poll_next = None;
-                        if self.poll_active {
-                            // Drop any in-flight auto-refresh load: it
-                            // would land after the first poll install and
-                            // wipe the polled frames.
-                            self.load_receiver = None;
-                        }
-                        if self.poll_active && self.app_settings.poll_url != self.poll_url {
-                            self.app_settings.poll_url = self.poll_url.clone();
-                            let _ = self.app_settings.save();
-                        }
-                    }
-                    if self.poll_active {
-                        ui.weak(
-                            self.poll_last_file
-                                .as_deref()
-                                .unwrap_or("waiting for dir.list…"),
-                        );
-                    }
-                });
-                ui.separator();
-                ui.label("Placefiles");
-                ui.horizontal(|ui| {
-                    let url_response = ui.add(
-                        egui::TextEdit::singleline(&mut self.placefile_url_input)
-                            .hint_text("https://… placefile URL")
-                            .desired_width(190.0),
-                    );
-                    if self.placefile_input_focus {
-                        self.placefile_input_focus = false;
-                        url_response.request_focus();
-                    }
-                    if ui.button("Add").clicked() {
-                        let url = self.placefile_url_input.trim().to_owned();
-                        if url.starts_with("http")
-                            && !self.placefile_slots.iter().any(|slot| slot.url == url)
-                        {
-                            let mut slot = PlacefileSlot::new(url, true);
-                            slot.show_text =
-                                self.style_registry.placefiles().default_show_text;
-                            self.placefile_slots.push(slot);
-                            self.placefile_url_input.clear();
-                            self.save_placefile_settings();
-                            ctx.request_repaint();
-                        }
-                    }
-                });
-                let mut remove: Option<usize> = None;
-                let mut changed = false;
-                let mut placefiles_dirty = false;
-                for (index, slot) in self.placefile_slots.iter_mut().enumerate() {
-                    let title = slot
-                        .data
-                        .as_ref()
-                        .map(|p| p.title.clone())
-                        .filter(|t| !t.is_empty())
-                        .unwrap_or_else(|| slot.url.clone());
-                    let hover = format!(
-                        "{}
-{}",
-                        slot.url, slot.status
-                    );
-                    // Field-split the slot so the row's vis toggle and the
-                    // trailing refresh button can borrow disjoint fields.
-                    let enabled = &mut slot.enabled;
-                    let next_refresh = &mut slot.next_refresh;
-                    if layer_row(
-                        ui,
-                        LayerRowSpec {
-                            vis: LayerRowVis::Toggle {
-                                value: enabled,
-                                hover: "Show this placefile on the map",
-                            },
-                            name: &title,
-                            name_width: 150.0,
-                            name_hover: &hover,
-                            state: None,
-                            opacity: None,
-                        },
-                        |ui| {
-                            if ui
-                            .selectable_label(slot.show_text, "T")
-                            .on_hover_text("Draw the file's text labels (off = icons only)")
-                            .clicked()
-                        {
-                            slot.show_text = !slot.show_text;
-                            placefiles_dirty = true;
-                        }
-                        if ui.small_button("↻").on_hover_text("Refresh now").clicked() {
-                                *next_refresh = Some(Instant::now());
-                            }
-                            if ui
-                                .small_button("✕")
-                                .on_hover_text("Remove placefile")
-                                .clicked()
-                            {
-                                remove = Some(index);
-                            }
-                        },
-                    ) {
-                        changed = true;
-                    }
-                }
-                if let Some(index) = remove {
-                    self.placefile_slots.remove(index);
-                    changed = true;
-                }
-                if changed || placefiles_dirty {
-                    self.save_placefile_settings();
-                    ctx.request_repaint();
-                }
-                // THE single front door for every map data type (proposal
-                // section 4 step 5 / discoverability fix 1.4): you no longer
-                // need to know that layers are born inside the Model/Sat
-                // windows' "Show on radar map" buttons.
-                ui.add_space(4.0);
-                let mut add_site: Option<RadarSite> = None;
-                ui.menu_button("+ Add layer ▾", |ui| {
-                    ui.menu_button("Radar overlay", |ui| {
-                        ui.set_min_width(220.0);
-                        egui::ScrollArea::vertical()
-                            .id_salt("add_layer_site_list")
-                            .max_height(300.0)
-                            .show(ui, |ui| {
-                                for site in &self.sites {
-                                    if ui.button(format_site_label(site)).clicked() {
-                                        add_site = Some(site.clone());
-                                        ui.close();
-                                    }
-                                }
-                            });
-                    })
-                    .response
-                    .on_hover_text(
-                        "Another radar drawn over the map (tip: right-click the map → \"lowest beam here\" does this too)",
-                    );
-                    if ui
-                        .button("Model field…")
-                        .on_hover_text(
-                            "Open the Model window: pick a run + field, then \"Show on radar map\"",
-                        )
-                        .clicked()
-                    {
-                        // Same intent rule as the top-bar Model button.
-                        self.model_enabled = true;
-                        self.open_viewer(dock::WorkspacePane::Model);
-                        // No data yet? Land the user on the Download section.
-                        if self
-                            .model_dock
-                            .as_ref()
-                            .and_then(|dock| dock.newest_run())
-                            .is_none()
-                        {
-                            self.model_download_open = true;
-                        }
-                        ui.close();
-                    }
-                    if ui
-                        .button("SpotterNetwork (placefile)")
-                        .on_hover_text(
-                            "Add the public SpotterNetwork positions placefile (spotter icons, 1-min refresh)",
-                        )
-                        .clicked()
-                    {
-                        let url = "https://www.spotternetwork.org/feeds/gr.txt".to_owned();
-                        if !self.placefile_slots.iter().any(|slot| slot.url == url) {
-                            let mut slot = PlacefileSlot::new(url, true);
-                            slot.show_text = false; // dots only; hover has the card
-                            self.placefile_slots.push(slot);
-                            self.save_placefile_settings();
-                        }
-                        ui.close();
-                    }
-                    if ui
-                        .button("Get model data… (download)")
-                        .on_hover_text(
-                            "Open the Model window's Download section: Fetch latest one-click ingest, or any run/hours with size + compute estimates",
-                        )
-                        .clicked()
-                    {
-                        self.model_enabled = true;
-                        self.open_viewer(dock::WorkspacePane::Model);
-                        self.model_download_open = true;
-                        ui.close();
-                    }
-                    if ui
-                        .button("Satellite (GOES)…")
-                        .on_hover_text(
-                            "Open the Satellite window: configure the follow, then \"Show on radar map\"",
-                        )
-                        .clicked()
-                    {
-                        self.open_viewer(dock::WorkspacePane::Satellite);
-                        ui.close();
-                    }
-                    if ui
-                        .button("Surface obs")
-                        .on_hover_text(
-                            "METAR/mesonet station plots: temperature/dewpoint, wind barbs, gusts",
-                        )
-                        .clicked()
-                    {
-                        self.obs_enabled = true;
-                        ctx.request_repaint();
-                        ui.close();
-                    }
-                    if ui
-                        .button("Placefile URL…")
-                        .on_hover_text("Paste a GR-style placefile URL (box above)")
-                        .clicked()
-                    {
-                        self.placefile_input_focus = true;
-                        ui.close();
-                    }
-                });
-                if let Some(site) = add_site {
-                    self.add_or_refresh_radar_layer(site, ctx);
-                }
-            });
+        // R2: the layer rail lives in the LAYERS tab now (spec §1) — RADAR
+        // keeps a one-line link-row so the count stays visible from the
+        // operations tab.
+        let layer_count = self.rail_layer_count();
+        if ui
+            .link(format!("Layers: {layer_count} →"))
+            .on_hover_text(
+                "Open the LAYERS tab: everything drawn over the map — radars, model fields, satellite, obs, lightning, SPC, warnings, placefiles",
+            )
+            .clicked()
+        {
+            self.sidebar_tab = SidebarTab::Layers;
+        }
 
         // Everything below genuinely needs a loaded volume (the status line
         // above already explains the empty state).
@@ -8324,7 +7866,8 @@ impl ViewerApp {
             }
             ctx.request_repaint();
         }
-        self.tor_tracks_ui(ui, ctx);
+        // (Rotation tracks + TDS moved to the layer rail — they are map
+        // layers with opacity/order needs; spec §2.3 + lane directive.)
         ui.horizontal(|ui| {
             if ui
                 .checkbox(&mut self.show_storm_tracks, "Storm tracks")
@@ -8618,16 +8161,24 @@ impl ViewerApp {
                 .on_hover_text(format!("Apply to {product_label} only (persists)"));
         });
         let mut chosen: Option<ColorTable> = None;
+        // Catalog rows (swatch + badges + hover description) in the quick
+        // picker too — see tables before applying (§2.1).
         egui::ComboBox::from_id_salt("active_product_color_preset")
             .selected_text(&current_name)
-            .width(220.0)
+            .width(ui_theme::COMBO_MAX_W)
             .show_ui(ui, |ui| {
-                for table in builtin_tables_for_family(family) {
-                    if ui
-                        .selectable_label(table.name() == current_name, table.name())
-                        .clicked()
-                    {
-                        chosen = Some(table);
+                ui.set_min_width(300.0);
+                for entry in color_tables::builtin_catalog_for_family(family) {
+                    let selected = entry.table.name() == current_name;
+                    if table_editor::catalog_row(
+                        ui,
+                        &entry.table,
+                        entry.badges,
+                        entry.description,
+                        selected,
+                        ui.available_width().max(280.0),
+                    ) {
+                        chosen = Some(entry.table);
                     }
                 }
                 let user_tables: Vec<ColorTable> = self
@@ -8642,15 +8193,57 @@ impl ViewerApp {
                     ui.separator();
                     ui.weak("My tables");
                     for table in user_tables {
-                        if ui
-                            .selectable_label(table.name() == current_name, table.name())
-                            .clicked()
-                        {
+                        let selected = table.name() == current_name;
+                        let description = format!("{}.pal in My tables", table.name());
+                        if table_editor::catalog_row(
+                            ui,
+                            &table,
+                            &[],
+                            &description,
+                            selected,
+                            ui.available_width().max(280.0),
+                        ) {
                             chosen = Some(table);
                         }
                     }
                 }
             });
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("New table…")
+                .on_hover_text("Open the color-table editor with a fresh draft for this family")
+                .clicked()
+            {
+                self.open_table_editor_new(ctx, family);
+            }
+            if ui
+                .small_button("Edit a copy…")
+                .on_hover_text(
+                    "Fork the table this product renders with (built-ins stay immutable)",
+                )
+                .clicked()
+            {
+                let has_product_override =
+                    self.palette_product_overrides.contains_key(&product_label);
+                let active = self
+                    .palette_product_overrides
+                    .get(&product_label)
+                    .cloned()
+                    .unwrap_or_else(|| self.color_tables.for_family(family).clone());
+                let is_user_table = self
+                    .user_color_tables
+                    .iter()
+                    .any(|(_, table)| table.name() == active.name());
+                self.open_table_editor_copy(ctx, family, &active, !is_user_table);
+                if has_product_override {
+                    // Live preview drives the FAMILY slot; a per-product
+                    // binding outranks it for this product, so say so.
+                    self.append_table_editor_status(format!(
+                        "{product_label} keeps its per-product binding while previewing — remove it (✕) to see the draft on this product"
+                    ));
+                }
+            }
+        });
         if let Some(table) = chosen {
             self.color_table_target = family;
             if self.bind_palette_to_product {
@@ -8674,25 +8267,10 @@ impl ViewerApp {
         ui.label(current_summary);
     }
 
+    /// Overlay-radar rows only — the count + Clear action live on the
+    /// rail's BASE group header (layers_rail.rs).
     fn radar_layers_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            ui.label(format!("Overlays {}", self.radar_layers.len()));
-            if ui
-                .add_enabled_ui(!self.radar_layers.is_empty(), |ui| {
-                    fixed_action_button(ui, "Clear", 52.0)
-                })
-                .inner
-                .clicked()
-            {
-                self.radar_layers.clear();
-                self.status = "Cleared radar overlays".to_owned();
-                ctx.request_repaint();
-            }
-        });
-
         if self.radar_layers.is_empty() {
-            ui.label("No overlays");
             return;
         }
 
@@ -8726,7 +8304,10 @@ impl ViewerApp {
             let center_site = &mut center_site;
             let refresh_index = &mut refresh_index;
             let promote_site = &mut promote_site;
-            let remove_index = &mut remove_index;
+            // The storm-hop workflow earns Go an inline slot; Refresh and
+            // Make-primary ride behind the ⚙ (two-extra budget, spec §2.3).
+            let mut remove_this = false;
+            let gear_site = site.clone();
             if layer_row(
                 ui,
                 LayerRowSpec {
@@ -8735,13 +8316,44 @@ impl ViewerApp {
                         hover: "Show this overlay radar on the map",
                     },
                     name: &site.level2_id,
-                    name_width: 42.0,
+                    name_width: NAME_W_SITE,
                     name_hover: &details_text,
                     state: Some(state),
                     opacity: Some(LayerRowOpacity::U8 {
                         value: &mut layer.opacity,
                         min: min_overlay_alpha,
+                        max: u8::MAX,
                     }),
+                    gear: Some(LayerRowGear::Menu {
+                        hover: "Overlay radar actions (refresh · make primary)",
+                        content: Box::new(move |ui| {
+                            if ui
+                                .button("Refresh")
+                                .on_hover_text("Reload this overlay radar's latest volume")
+                                .clicked()
+                            {
+                                if load_idle {
+                                    *refresh_index = Some(index);
+                                }
+                                ui.close();
+                            }
+                            if ui
+                                .button("Make primary")
+                                .on_hover_text(
+                                    "Promote this radar to the primary (site/products/tilt control it)",
+                                )
+                                .clicked()
+                            {
+                                *promote_site = Some(gear_site.clone());
+                                ui.close();
+                            }
+                        }),
+                    }),
+                    remove: Some(LayerRowRemove {
+                        hover: &details_text,
+                        clicked: &mut remove_this,
+                    }),
+                    ..Default::default()
                 },
                 |ui| {
                     if fixed_action_button(ui, "Go", 28.0)
@@ -8750,28 +8362,12 @@ impl ViewerApp {
                     {
                         *center_site = Some(site.clone());
                     }
-                    if fixed_action_button(ui, "Ref", 32.0)
-                        .on_hover_text("Refresh this overlay radar")
-                        .clicked()
-                        && load_idle
-                    {
-                        *refresh_index = Some(index);
-                    }
-                    if fixed_action_button(ui, "Pri", 30.0)
-                        .on_hover_text("Make this radar the primary radar")
-                        .clicked()
-                    {
-                        *promote_site = Some(site.clone());
-                    }
-                    if fixed_action_button(ui, "x", 20.0)
-                        .on_hover_text(&details_text)
-                        .clicked()
-                    {
-                        *remove_index = Some(index);
-                    }
                 },
             ) {
                 ctx.request_repaint();
+            }
+            if remove_this {
+                remove_index = Some(index);
             }
         }
 
@@ -8824,27 +8420,74 @@ impl ViewerApp {
         });
 
         let table = self.color_tables.for_family(self.color_table_target);
+        let current_name = table.name().to_owned();
         ui.label(format!(
-            "{}: {}",
-            self.color_table_target.label(),
-            table.name()
+            "{}: {current_name}",
+            self.color_table_target.label()
         ));
         ui.label(color_table_summary(table));
         let mut chosen: Option<ColorTable> = None;
+        // Built-ins as badged catalog rows: swatch strip + badges, hover
+        // = description + summary (customization-spec §2.1).
         egui::ComboBox::from_id_salt("color_table_builtin_preset")
             .selected_text("Built-ins")
-            .width(220.0)
+            .width(ui_theme::COMBO_MAX_W)
             .show_ui(ui, |ui| {
-                for table in builtin_tables_for_family(self.color_table_target) {
-                    if ui.selectable_label(false, table.name()).clicked() {
-                        chosen = Some(table);
+                ui.set_min_width(300.0);
+                for entry in color_tables::builtin_catalog_for_family(self.color_table_target) {
+                    let selected = entry.table.name() == current_name;
+                    if table_editor::catalog_row(
+                        ui,
+                        &entry.table,
+                        entry.badges,
+                        entry.description,
+                        selected,
+                        ui.available_width().max(280.0),
+                    ) {
+                        chosen = Some(entry.table);
                     }
                 }
             });
+        // The editor (table_editor.rs): fresh draft, or fork the family's
+        // live table — built-ins are immutable, so editing one forks
+        // "My <name>"; user tables open under their own name.
+        ui.horizontal(|ui| {
+            if fixed_action_button(ui, "New table…", 96.0)
+                .on_hover_text("Open the color-table editor with a fresh draft for this family")
+                .clicked()
+            {
+                self.open_table_editor_new(ctx, self.color_table_target);
+            }
+            if fixed_action_button(ui, "Edit a copy…", 104.0)
+                .on_hover_text(
+                    "Fork the family's current table in the editor (built-ins stay immutable)",
+                )
+                .clicked()
+            {
+                let family = self.color_table_target;
+                let current = self.color_tables.for_family(family).clone();
+                let is_user_table = self
+                    .user_color_tables
+                    .iter()
+                    .any(|(_, table)| table.name() == current.name());
+                self.open_table_editor_copy(ctx, family, &current, !is_user_table);
+            }
+        });
         // My tables: user .pal files living in the config dir (Import…
-        // copies them there). The current family's tables list first;
-        // everything else follows — community files often mislabel
-        // Product:, and a table is loadable into any slot.
+        // copies them there, the editor saves there). The current
+        // family's tables list first; everything else follows —
+        // community files often mislabel Product:, and a table is
+        // loadable into any slot.
+        ui.horizontal(|ui| {
+            ui.label(format!("My tables ({})", self.user_color_tables.len()));
+            if ui
+                .small_button("Show folder")
+                .on_hover_text(settings::color_tables_dir().display().to_string())
+                .clicked()
+            {
+                table_editor::show_in_file_browser(&settings::color_tables_dir());
+            }
+        });
         if !self.user_color_tables.is_empty() {
             let current_family = self.color_table_target;
             let mut ordered: Vec<(ColorTableFamily, ColorTable)> = self
@@ -8859,24 +8502,52 @@ impl ViewerApp {
                     .filter(|(family, _)| *family != current_family)
                     .cloned(),
             );
-            egui::ComboBox::from_id_salt("color_table_user_tables")
-                .selected_text(format!("My tables ({})", ordered.len()))
-                .width(220.0)
-                .show_ui(ui, |ui| {
-                    for (family, table) in ordered {
-                        let tag = if family == current_family {
-                            String::new()
-                        } else {
-                            format!("  [{}]", family.label())
-                        };
-                        if ui
-                            .selectable_label(false, format!("{}{tag}", table.name()))
-                            .clicked()
-                        {
-                            chosen = Some(table);
-                        }
+            // PR5's rich rows (swatch + Edit/Delete) supersede the
+            // restructure's placeholder combo for My tables.
+            let mut edit_table: Option<ColorTable> = None;
+            let mut delete_name: Option<String> = None;
+            for (family, table) in ordered {
+                ui.horizontal(|ui| {
+                    let description = if family == current_family {
+                        format!("{}.pal in My tables", table.name())
+                    } else {
+                        format!(
+                            "{}.pal in My tables — Product: header says {}",
+                            table.name(),
+                            family.label()
+                        )
+                    };
+                    let selected = table.name() == current_name;
+                    let row_width = (ui.available_width() - 84.0).max(200.0);
+                    if table_editor::catalog_row(ui, &table, &[], &description, selected, row_width)
+                    {
+                        chosen = Some(table.clone());
+                    }
+                    if ui
+                        .small_button("Edit")
+                        .on_hover_text("Open this table in the editor (Save overwrites it)")
+                        .clicked()
+                    {
+                        edit_table = Some(table.clone());
+                    }
+                    if ui
+                        .small_button("✕")
+                        .on_hover_text(format!(
+                            "Delete {}.pal from My tables (no undo)",
+                            table.name()
+                        ))
+                        .clicked()
+                    {
+                        delete_name = Some(table.name().to_owned());
                     }
                 });
+            }
+            if let Some(table) = edit_table {
+                self.open_table_editor_copy(ctx, self.color_table_target, &table, false);
+            }
+            if let Some(name) = delete_name {
+                self.delete_user_color_table(&name);
+            }
         }
         if let Some(table) = chosen {
             self.apply_family_table(ctx, self.color_table_target, table);
@@ -9002,9 +8673,14 @@ impl ViewerApp {
 
     fn hazard_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.hazards_visible, "Show");
-            ui.checkbox(&mut self.hazards_active_only, "Active");
-            ui.checkbox(&mut self.live_hazard_auto_refresh, "Auto");
+            ui.checkbox(&mut self.hazards_visible, "Show")
+                .on_hover_text(
+                    "Draw warning polygons on the map (also the LAYERS-tab Warnings row)",
+                );
+            ui.checkbox(&mut self.hazards_active_only, "Active only")
+                .on_hover_text("Hide expired/cancelled alerts");
+            ui.checkbox(&mut self.live_hazard_auto_refresh, "Auto-refresh")
+                .on_hover_text("Re-fetch active alerts on the live cadence");
         });
         ui.horizontal_wrapped(|ui| {
             for (family, label) in HAZARD_FILTER_FAMILIES {
@@ -9077,20 +8753,77 @@ impl ViewerApp {
             },
         );
 
-        egui::CollapsingHeader::new("Local file")
-            .id_salt("hazard_local_path_loader")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.hazard_path_text)
-                        .desired_width(220.0)
-                        .hint_text("Path"),
+        // SPC OUTLOOKS — config consolidated here from the layer rail (spec
+        // §1 SEVERE table); the rail's SPC rows' ⚙ jumps to this section.
+        self.remembered_section(ui, "severe_spc_outlooks", "SPC outlooks", true, |app, ui| {
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.label("Day").on_hover_text(
+                    "Outlook day (archive-aware: an archive loop shows THAT day's outlook)",
                 );
-                let loading = self.hazard_receiver.is_some();
-                if fixed_action_button(ui, "Load Path", 82.0).clicked() && !loading {
-                    self.load_local_hazards(ui.ctx());
+                egui::ComboBox::from_id_salt("severe_spc_day")
+                    .selected_text(format!("D{}", app.spc_day))
+                    .width(64.0)
+                    .show_ui(ui, |ui| {
+                        for d in 1..=3u8 {
+                            if ui
+                                .selectable_value(&mut app.spc_day, d, format!("Day {d}"))
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                        }
+                    });
+                if app.spc_rx.is_some() {
+                    ui.spinner();
                 }
             });
+            ui.horizontal_wrapped(|ui| {
+                for (slug, label) in spc_layers::OUTLOOK_KINDS {
+                    let mut on = app.spc_outlooks_enabled.iter().any(|k| k == slug);
+                    if ui
+                        .checkbox(&mut on, label)
+                        .on_hover_text("Outlook kind — drawn in SPC's own colors")
+                        .changed()
+                    {
+                        if on {
+                            app.spc_outlooks_enabled.push(slug.to_owned());
+                        } else {
+                            app.spc_outlooks_enabled.retain(|k| k != slug);
+                        }
+                        changed = true;
+                    }
+                }
+                if ui
+                    .checkbox(&mut app.spc_reports_enabled, "Reports")
+                    .on_hover_text(
+                        "Today's filtered storm reports (tornado / wind / hail) — same state as the LAYERS-tab row",
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+            });
+            if changed {
+                if !app.spc_outlooks_enabled.is_empty() {
+                    app.spc_kinds_memory = app.spc_outlooks_enabled.clone();
+                }
+                app.spc_data.fetched_at = None; // force refetch
+                app.save_overlay_defaults();
+                ui.ctx().request_repaint();
+            }
+        });
+        self.remembered_section(ui, "severe_local_file", "Local file", false, |app, ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut app.hazard_path_text)
+                    .desired_width(220.0)
+                    .hint_text("Path"),
+            );
+            let loading = app.hazard_receiver.is_some();
+            if fixed_action_button(ui, "Load Path", 82.0).clicked() && !loading {
+                app.load_local_hazards(ui.ctx());
+            }
+        });
     }
 
     fn stats_panel(&mut self, ui: &mut egui::Ui) {
@@ -9906,7 +9639,10 @@ impl ViewerApp {
                     .drape
                     .place_radar(self.farm.sensor_id, lat as f64, lon as f64, scan);
             }
-        } else if !self.cross_section_armed && !self.vrot_tool_armed {
+        } else if !self.cross_section_armed
+            && !self.vrot_tool_armed
+            && !self.app_settings.right_click_loads_nearest
+        {
             if response.secondary_clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
@@ -9993,18 +9729,27 @@ impl ViewerApp {
         }
 
         if !armed
+            && !self.vrot_tool_armed
+            && !self.farm.drape.place_armed
             && response.secondary_clicked()
             && let Some(pointer) = response.interact_pointer_pos()
-            && let Some(index) = self.nearest_site_to_position(rect, pointer)
-            && let Some(site) = self.sites.get(index).cloned()
         {
             if ui.input(|input| input.modifiers.ctrl) {
-                // Layer add must not retarget the primary auto-refresh.
-                self.add_or_refresh_radar_layer(site, ui.ctx());
-            } else {
-                self.selected_site_index = index;
-                self.start_latest_level2_load(site, ui.ctx());
+                if let Some(index) = self.nearest_site_to_position(rect, pointer)
+                    && let Some(site) = self.sites.get(index).cloned()
+                {
+                    // Layer add must not retarget the primary auto-refresh.
+                    self.add_or_refresh_radar_layer(site, ui.ctx());
+                }
+            } else if self.app_settings.right_click_loads_nearest {
+                let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
+                self.switch_to_nearest_radar_at(lon, lat, ui.ctx());
             }
+            // else: the lowest-beam context menu owns plain right-click —
+            // eagerly loading the nearest catalog site here raced the menu
+            // pick (the nearest site to a city is its TDWR, whose landing
+            // volume then snapped selection back: "I select KCLE and it
+            // goes back to the Txxx one").
         }
 
         if !armed
@@ -10256,16 +10001,26 @@ impl ViewerApp {
             if !armed
                 && response.secondary_clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
-                && let Some(index) = self.nearest_site_to_position(cell, pointer)
-                && let Some(site) = self.sites.get(index).cloned()
             {
                 if ui.input(|input| input.modifiers.ctrl) {
-                    // Layer add must not retarget the primary auto-refresh.
-                    self.add_or_refresh_radar_layer(site, ui.ctx());
+                    if let Some(index) = self.nearest_site_to_position(cell, pointer)
+                        && let Some(site) = self.sites.get(index).cloned()
+                    {
+                        // Layer add must not retarget the primary auto-refresh.
+                        self.add_or_refresh_radar_layer(site, ui.ctx());
+                    }
+                } else if self.app_settings.right_click_loads_nearest {
+                    let (lon, lat) = self.screen_to_lon_lat(cell, pointer);
+                    self.switch_to_nearest_radar_at(lon, lat, ui.ctx());
                 } else {
-                    self.selected_site_index = index;
-                    self.start_latest_level2_load(site, ui.ctx());
+                    // Same lowest-beam menu as the single-pane map (an
+                    // eager nearest-site load here raced the menu pick —
+                    // see the single-pane handler).
+                    self.context_menu_lonlat = Some(self.screen_to_lon_lat(cell, pointer));
                 }
+            }
+            if !armed && !self.app_settings.right_click_loads_nearest {
+                response.context_menu(|ui| self.best_radar_context_menu(ui));
             }
 
             if armed {
@@ -10925,8 +10680,9 @@ impl ViewerApp {
     /// (site index, id, beam height m, distance km). Geometry only — the
     /// terrain-blockage version needs a coverage dataset (wxKobold's
     /// boundary placefile draws those regions as an overlay today).
-    /// WSR-88Ds only (K/P prefixes): TDWRs (Txxx) have short range and a
-    /// separate archive — never the right answer for "best radar here".
+    /// WSR-88Ds only (K/P prefixes): TDWRs (Txxx) have ~90 km range and
+    /// C-band attenuation, so they list in their own menu section
+    /// ([`tdwr_candidates`]) instead of competing in this ranking.
     fn best_radar_candidates(&self, lat: f32, lon: f32) -> Vec<(usize, String, f32, f32)> {
         let mut candidates: Vec<(usize, String, f32, f32)> = self
             .sites
@@ -10950,6 +10706,29 @@ impl ViewerApp {
         candidates
     }
 
+    /// Nearby TDWRs for the context menu's own section: Txxx sites by
+    /// ground distance. TDWRs are C-band terminal radars with very low
+    /// tilts (0.1-0.6°) but ~90 km Doppler range and rain attenuation
+    /// (Vasiloff 2001 WAF; Istok et al. 2009, 25th IIPS), so they list
+    /// separately instead of competing in the lowest-beam ranking.
+    fn tdwr_candidates(&self, lat: f32, lon: f32) -> Vec<(usize, String, f32)> {
+        let mut candidates: Vec<(usize, String, f32)> = self
+            .sites
+            .iter()
+            .enumerate()
+            .filter_map(|(index, site)| {
+                if !site.level2_id.starts_with('T') {
+                    return None;
+                }
+                let (site_lat, site_lon) = site_location(site)?;
+                let distance_km = haversine_km(lat, lon, site_lat, site_lon);
+                (distance_km <= 120.0).then(|| (index, site.level2_id.clone(), distance_km))
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
+        candidates
+    }
+
     /// Ctrl+click: jump straight to the context menu's #1 pick — the
     /// lowest-beam WSR-88D for the clicked point — and load its latest
     /// volume (broadcast-meteorologist request: GR2-style ctrl+click to
@@ -10960,16 +10739,34 @@ impl ViewerApp {
             self.status = "No radar within 460 km of your click".to_owned();
             return;
         };
-        // Same switch action as the context menu buttons: select the site
-        // and load it unless a load is already in flight.
+        // Same switch action as the context menu buttons. An explicit pick
+        // beats any in-flight load: start_latest_level2_load replaces the
+        // receiver, cancelling it (the old guard silently DROPPED the pick,
+        // and the stale volume's landing then snapped selection back).
         self.selected_site_index = index;
-        if self.load_receiver.is_none() {
-            let site = self.sites[index].clone();
-            self.start_latest_level2_load(site, ctx);
-        }
+        let site = self.sites[index].clone();
+        self.start_latest_level2_load(site, ctx);
         // Set AFTER the load kick so the user sees what happened (the load
         // start overwrites self.status with "Loading latest L2 …").
         self.status = format!("Switched to {id} — lowest beam {beam_m:.0} m at your click");
+    }
+
+    /// Right-click with Settings ▸ "Right-click loads closest radar" on:
+    /// switch straight to the nearest WSR-88D by ground distance (the
+    /// lowest-beam pick stays on Ctrl+click and the context menu).
+    fn switch_to_nearest_radar_at(&mut self, lon: f32, lat: f32, ctx: &egui::Context) {
+        let Some((index, id, _, distance_km)) = self
+            .best_radar_candidates(lat, lon)
+            .into_iter()
+            .min_by(|a, b| a.3.total_cmp(&b.3))
+        else {
+            self.status = "No radar within 460 km of your click".to_owned();
+            return;
+        };
+        self.selected_site_index = index;
+        let site = self.sites[index].clone();
+        self.start_latest_level2_load(site, ctx);
+        self.status = format!("Switched to {id} — closest WSR-88D ({distance_km:.0} km)");
     }
 
     /// Context menu: the three lowest-beam radars over the clicked point.
@@ -10998,13 +10795,35 @@ impl ViewerApp {
                 ui.close();
             }
         }
-        if let Some(index) = load {
-            self.selected_site_index = index;
-            if self.load_receiver.is_none() {
-                let site = self.sites[index].clone();
-                let ctx = ui.ctx().clone();
-                self.start_latest_level2_load(site, &ctx);
+        // Terminal Doppler radars get their own rows (field report: the
+        // accidental right-click TDWR path was the only way to reach them).
+        let tdwrs = self.tdwr_candidates(lat, lon);
+        if !tdwrs.is_empty() {
+            ui.separator();
+            ui.label("TDWR here:");
+            for (index, id, distance_km) in tdwrs.into_iter().take(2) {
+                if ui
+                    .button(format!("{id} · TDWR · {distance_km:.0} km"))
+                    .on_hover_text(
+                        "Terminal Doppler: 0.1-0.6° tilts right over the metro, \
+                         ~90 km Doppler range, C-band (attenuates in heavy rain)",
+                    )
+                    .clicked()
+                {
+                    load = Some(index);
+                    ui.close();
+                }
             }
+        }
+        if let Some(index) = load {
+            // No in-flight guard: the menu pick is explicit intent and must
+            // win — start_latest_level2_load replaces the receiver, which
+            // cancels whatever was loading (the old guard silently dropped
+            // the pick and the stale volume snapped selection back).
+            self.selected_site_index = index;
+            let site = self.sites[index].clone();
+            let ctx = ui.ctx().clone();
+            self.start_latest_level2_load(site, &ctx);
         }
     }
 
@@ -12360,18 +12179,49 @@ impl ViewerApp {
             thread::spawn(move || {
                 let result =
                     (|| -> std::result::Result<Option<(String, Arc<RadarVolume>)>, String> {
-                        let listing = data_source::fetch_text(&format!("{base}/dir.list"))
-                            .map_err(|e| format!("dir.list: {e}"))?;
-                        // dir.list lines: "<size> <filename>" or bare filenames;
-                        // newest = last lexicographic (GR convention: names sort
-                        // by time).
-                        let newest = listing
-                            .lines()
-                            .filter_map(|line| line.split_whitespace().last())
-                            .filter(|name| !name.is_empty())
-                            .max_by(|a, b| a.cmp(b))
-                            .ok_or("empty dir.list")?
-                            .to_owned();
+                        // <base>/dir.list directly, else the GR2A root
+                        // convention: grlevel2.cfg names per-site subdirs
+                        // ("Site:" lines). With exactly one site, poll
+                        // <base>/<site>/ — the user pasted the server root
+                        // (field case: a local JMA radar bridge).
+                        let root_listing = data_source::fetch_text(&format!("{base}/dir.list"));
+                        let (listing, prefix) = match &root_listing {
+                            Ok(listing) if newest_dir_list_entry(listing).is_some() => {
+                                (listing.clone(), String::new())
+                            }
+                            _ => {
+                                let sites =
+                                    data_source::fetch_text(&format!("{base}/grlevel2.cfg"))
+                                        .map(|cfg| grlevel2_cfg_sites(&cfg))
+                                        .unwrap_or_default();
+                                match sites.as_slice() {
+                                    [site] => {
+                                        let listing = data_source::fetch_text(&format!(
+                                            "{base}/{site}/dir.list"
+                                        ))
+                                        .map_err(|e| format!("{site}/dir.list: {e}"))?;
+                                        (listing, format!("{site}/"))
+                                    }
+                                    [] => {
+                                        return Err(match root_listing {
+                                            Ok(_) => "dir.list: no data files listed".to_owned(),
+                                            Err(e) => format!("dir.list: {e}"),
+                                        });
+                                    }
+                                    multiple => {
+                                        return Err(format!(
+                                            "server hosts {} sites ({}) — append one to the URL",
+                                            multiple.len(),
+                                            multiple.join(", ")
+                                        ));
+                                    }
+                                }
+                            }
+                        };
+                        let newest = format!(
+                            "{prefix}{}",
+                            newest_dir_list_entry(&listing).ok_or("empty dir.list")?
+                        );
                         if last.as_deref() == Some(newest.as_str()) {
                             return Ok(None);
                         }
@@ -13255,7 +13105,7 @@ impl ViewerApp {
                         .unwrap_or_default();
                     egui::ComboBox::from_id_salt("wofs_run")
                         .selected_text(run_label)
-                        .width(220.0)
+                        .width(ui_theme::COMBO_MAX_W)
                         .show_ui(ui, |ui| {
                             for (i, run) in catalog.runs.iter().enumerate().take(20) {
                                 if ui
@@ -17457,7 +17307,7 @@ fn fixed_state_dot(ui: &mut egui::Ui, color: egui::Color32, hover_text: &str) {
 fn layer_state_color(state: &str) -> egui::Color32 {
     match state {
         "loading" => egui::Color32::from_rgb(238, 218, 62),
-        "live" => egui::Color32::from_rgb(65, 238, 104),
+        "live" => LIVE_COLOR,
         _ => egui::Color32::from_rgb(106, 132, 154),
     }
 }
@@ -17470,7 +17320,8 @@ enum LayerRowVis<'a> {
 }
 
 /// Opacity slot of a unified layer row: overlay radars store u8 alpha,
-/// GOES/model layers and the primary radar store f32 (max is always 1.0/255).
+/// GOES/model layers and the primary radar store f32 (max is always 1.0
+/// unless capped — the warnings fill stops at 80/255 by design).
 enum LayerRowOpacity<'a> {
     F32 {
         value: &'a mut f32,
@@ -17480,7 +17331,44 @@ enum LayerRowOpacity<'a> {
     U8 {
         value: &'a mut u8,
         min: u8,
+        max: u8,
     },
+}
+
+/// Standardized reorder slot: two small ↑/↓ buttons. Deliberately NOT
+/// drag-and-drop — the priority persona operates a trackpad in a moving
+/// truck; two 18 px buttons beat a drag gesture under stress (spec §2.1).
+/// A click writes +1 (draw later/higher) or -1 (draw earlier/lower) into
+/// `delta`; the caller applies it after the row returns.
+struct LayerRowOrder<'a> {
+    delta: &'a mut i8,
+}
+
+/// Standardized ⚙ slot — the extensibility rule (ui-overhaul spec §2.1):
+/// the gear opens the layer's OWNING SURFACE (a window or a sidebar-tab
+/// section), or an inline popover for layers with only 2–3 small options.
+/// A row may carry at most two inline extras besides ⚙/✕; everything else
+/// goes behind the gear. This single rule is what keeps future features
+/// from re-crowding the rail.
+enum LayerRowGear<'a> {
+    /// ⚙ jumps to the layer's owning window/tab; the click lands in
+    /// `clicked` for the caller to act on after the row returns.
+    Open {
+        hover: &'a str,
+        clicked: &'a mut bool,
+    },
+    /// ⚙ opens a small anchored popover with the layer's few options.
+    Menu {
+        hover: &'a str,
+        content: Box<dyn FnOnce(&mut egui::Ui) + 'a>,
+    },
+}
+
+/// Standardized ✕ slot, rendered last. Rows where removal makes no sense
+/// (the primary radar) opt out.
+struct LayerRowRemove<'a> {
+    hover: &'a str,
+    clicked: &'a mut bool,
 }
 
 /// The fixed slots of one unified layer row (see `layer_row`).
@@ -17491,18 +17379,41 @@ struct LayerRowSpec<'a> {
     name_hover: &'a str,
     state: Option<&'a str>,
     opacity: Option<LayerRowOpacity<'a>>,
+    order: Option<LayerRowOrder<'a>>,
+    gear: Option<LayerRowGear<'a>>,
+    remove: Option<LayerRowRemove<'a>>,
 }
 
-/// One unified layer row — the row grammar from docs/ui-refresh-proposal.md
-/// §3 direction A ("everything is a layer"):
+impl Default for LayerRowSpec<'_> {
+    fn default() -> Self {
+        Self {
+            vis: LayerRowVis::Badge {
+                glyph: "·",
+                hover: "",
+            },
+            name: "",
+            name_width: NAME_W_STD,
+            name_hover: "",
+            state: None,
+            opacity: None,
+            order: None,
+            gear: None,
+            remove: None,
+        }
+    }
+}
+
+/// One unified layer row — the row grammar v2 (docs/ui-overhaul-spec.md §2.1,
+/// direction A "everything is a layer"):
 ///
-///   [vis] [name (hover = details)] [state dot] [opacity ───] [row-specific]
+///   [vis] [name (hover = details)] [state dot] [opacity ───] [↑↓] [extras…] [⚙] [✕]
 ///
-/// Every layer type in the Layers fold (primary radar, overlay radars, GOES,
-/// model fields, surface obs, placefiles) renders through this one shape;
-/// row-specific controls (Go/Ref/Pri, reorder, refresh, remove, sub-toggles)
-/// come in through `trailing`. Rows opt out of slots they don't have (None).
-/// Returns true when visibility or opacity changed (callers repaint).
+/// Every layer type in the rail (primary radar, overlay radars, GOES, model
+/// fields, drapes, surface obs, lightning, SPC, warnings, placefiles)
+/// renders through this one shape. `trailing` carries the row's earned
+/// inline extras (max two besides ⚙/✕); reorder, gear, and remove are
+/// standardized slots. Returns true when visibility or opacity changed
+/// (callers repaint).
 fn layer_row(
     ui: &mut egui::Ui,
     spec: LayerRowSpec<'_>,
@@ -17515,10 +17426,13 @@ fn layer_row(
         name_hover,
         state,
         opacity,
+        order,
+        gear,
+        remove,
     } = spec;
     let mut changed = false;
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 3.0;
+        ui.spacing_mut().item_spacing.x = ROW_SPACING_X;
         match vis {
             LayerRowVis::Toggle { value, hover } => {
                 let response = ui.checkbox(value, "");
@@ -17560,12 +17474,12 @@ fn layer_row(
                     changed = true;
                 }
             }
-            Some(LayerRowOpacity::U8 { value, min }) => {
+            Some(LayerRowOpacity::U8 { value, min, max }) => {
                 let hover = format!("Opacity {}", *value);
                 if ui
                     .add_sized(
                         egui::vec2(LAYER_ROW_SLIDER_WIDTH, PANEL_BUTTON_HEIGHT),
-                        egui::Slider::new(value, min..=u8::MAX).show_value(false),
+                        egui::Slider::new(value, min..=max).show_value(false),
                     )
                     .on_hover_text(hover)
                     .changed()
@@ -17575,7 +17489,44 @@ fn layer_row(
             }
             None => {}
         }
+        if let Some(LayerRowOrder { delta }) = order {
+            if ui
+                .small_button("↑")
+                .on_hover_text("Draw later (higher)")
+                .clicked()
+            {
+                *delta = 1;
+            }
+            if ui
+                .small_button("↓")
+                .on_hover_text("Draw earlier (lower)")
+                .clicked()
+            {
+                *delta = -1;
+            }
+        }
         trailing(ui);
+        match gear {
+            Some(LayerRowGear::Open { hover, clicked }) => {
+                if ui.small_button("⚙").on_hover_text(hover).clicked() {
+                    *clicked = true;
+                }
+            }
+            Some(LayerRowGear::Menu { hover, content }) => {
+                ui.menu_button("⚙", |ui| {
+                    ui.set_min_width(170.0);
+                    content(ui);
+                })
+                .response
+                .on_hover_text(hover);
+            }
+            None => {}
+        }
+        if let Some(LayerRowRemove { hover, clicked }) = remove
+            && ui.small_button("✕").on_hover_text(hover).clicked()
+        {
+            *clicked = true;
+        }
     });
     changed
 }
@@ -20979,6 +20930,40 @@ fn latest_load_pauses_poll(mode: LatestLoadMode, poll_active: bool) -> bool {
     poll_active && mode != LatestLoadMode::AutoRefresh
 }
 
+/// Newest data file in a GR2A dir.list ("<size> <filename>" or bare names,
+/// newest = last lexicographic — GR convention: names sort by time).
+/// Metadata sidecars are skipped: a field bridge serving latest.json next
+/// to the volumes otherwise wins every lexicographic pick and the poll
+/// "decodes" JSON forever. Directory entries (trailing '/') likewise.
+fn newest_dir_list_entry(listing: &str) -> Option<String> {
+    const METADATA_EXTENSIONS: &[&str] = &[
+        "json", "cfg", "txt", "html", "htm", "xml", "css", "js", "ini", "md", "php", "gis",
+    ];
+    listing
+        .lines()
+        .filter_map(|line| line.split_whitespace().last())
+        .filter(|name| !name.is_empty() && !name.ends_with('/'))
+        .filter(|name| {
+            let extension = name
+                .rsplit_once('.')
+                .map(|(_, extension)| extension.to_ascii_lowercase());
+            !matches!(extension, Some(e) if METADATA_EXTENSIONS.contains(&e.as_str()))
+        })
+        .max()
+        .map(str::to_owned)
+}
+
+/// Site ids from a grlevel2.cfg ("Site: KXXX" lines — the GR2A server
+/// convention: the root hosts one subdirectory per listed site).
+fn grlevel2_cfg_sites(cfg: &str) -> Vec<String> {
+    cfg.lines()
+        .filter_map(|line| {
+            let id = line.trim().strip_prefix("Site:")?.trim();
+            (!id.is_empty()).then(|| id.to_owned())
+        })
+        .collect()
+}
+
 fn normalized_history_limit(limit: usize) -> usize {
     // Clamp, don't snap to presets: deployment loads raise the limit past
     // the combo options, and trims must not collapse it back to 7.
@@ -21499,6 +21484,27 @@ mod tests {
         );
         assert_eq!(misses.len(), 1);
         assert!(misses[0].contains("Deleted Table"), "{}", misses[0]);
+    }
+
+    /// Field report: "make it so when you restart the app the color table
+    /// saves". The save side writes table.name() into config.json
+    /// (apply_family_table); this pins the restore side: every name any
+    /// picker can offer must resolve back to the same table on boot.
+    #[test]
+    fn every_builtin_table_survives_a_restart_round_trip() {
+        for family in ColorTableFamily::ALL {
+            for table in builtin_tables_for_family(family) {
+                let resolved =
+                    resolve_palette_binding(family, table.name(), &[]).unwrap_or_else(|| {
+                        panic!(
+                            "{} table {:?} did not resolve by name",
+                            family.label(),
+                            table.name()
+                        )
+                    });
+                assert_eq!(resolved.name(), table.name());
+            }
+        }
     }
 
     /// User tables resolve by name even when their Product: header put
@@ -22573,6 +22579,39 @@ mod tests {
         assert!(latest_load_pauses_poll(LatestLoadMode::Loop, true));
         assert!(!latest_load_pauses_poll(LatestLoadMode::AutoRefresh, true));
         assert!(!latest_load_pauses_poll(LatestLoadMode::User, false));
+    }
+
+    #[test]
+    fn newest_dir_list_entry_skips_metadata_and_dirs() {
+        // The field repro: latest.json sorts after every timestamped
+        // volume and poisoned the lexicographic pick on a local bridge.
+        let listing = "1024 ITOK_20260611_001000\n2048 ITOK_20260611_002000\n64 latest.json\n";
+        assert_eq!(
+            newest_dir_list_entry(listing).as_deref(),
+            Some("ITOK_20260611_002000")
+        );
+        // Bare names (no size column) and uppercase sidecar extensions.
+        let listing = "a_20260611_0010\na_20260611_0020\nREADME.TXT\ngrlevel2.cfg\n";
+        assert_eq!(
+            newest_dir_list_entry(listing).as_deref(),
+            Some("a_20260611_0020")
+        );
+        // Directory entries and metadata only -> no usable pick.
+        assert_eq!(newest_dir_list_entry("ITOK/\nlatest.json\n"), None);
+        assert_eq!(newest_dir_list_entry(""), None);
+        // Dotted volume names with data extensions still win.
+        let listing = "KILX_20260611_0020.gz\nlatest.json\n";
+        assert_eq!(
+            newest_dir_list_entry(listing).as_deref(),
+            Some("KILX_20260611_0020.gz")
+        );
+    }
+
+    #[test]
+    fn grlevel2_cfg_sites_parses_site_lines() {
+        let cfg = "# comment\nSite: ITOK\n  Site:KCLE  \nRefresh: 2\nSite:\n";
+        assert_eq!(grlevel2_cfg_sites(cfg), vec!["ITOK", "KCLE"]);
+        assert!(grlevel2_cfg_sites("Refresh: 2\n").is_empty());
     }
 
     #[test]
@@ -23816,6 +23855,7 @@ mod tests {
             user_color_tables: Vec::new(),
             palette_product_overrides: BTreeMap::new(),
             bind_palette_to_product: false,
+            table_editor: table_editor::TableEditor::default(),
             flip_velocity_color_polarity: false,
             unfold_velocity_display: true,
             color_table_target: ColorTableFamily::Velocity,
@@ -23926,6 +23966,7 @@ mod tests {
             poll_rx: None,
             spc_data: spc_layers::SpcData::default(),
             spc_outlooks_enabled: Vec::new(),
+            spc_kinds_memory: Vec::new(),
             spc_reports_enabled: false,
             spc_day: 1,
             spc_last_key: None,

@@ -2,6 +2,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
+use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 
 const KNOT_TO_MPS: f32 = 0.514_444;
@@ -121,10 +122,64 @@ pub fn family_for_product_code(code: &str) -> ColorTableFamily {
         "VIL" | "DVL" => ColorTableFamily::Vil,
         "VILD" => ColorTableFamily::VilDensity,
         "MEHS" | "HAIL" => ColorTableFamily::HailSize,
+        "AZSHEAR" => ColorTableFamily::AzimuthalShear,
         "PHI" | "PHIDP" => ColorTableFamily::DifferentialPhase,
         "KDP" => ColorTableFamily::SpecificDifferentialPhase,
         _ => ColorTableFamily::Generic,
     }
+}
+
+/// Inverse of [`family_for_product_code`]: the `Product:` header code the
+/// editor stamps on saved tables and `to_gr_pal` writes for exports.
+/// Generic has no GR product code (`None` ⇒ omit the header; the file
+/// scans back into Generic, which is exactly where it started).
+pub fn product_code_for_family(family: ColorTableFamily) -> Option<&'static str> {
+    match family {
+        ColorTableFamily::Reflectivity => Some("BR"),
+        ColorTableFamily::Velocity => Some("BV"),
+        ColorTableFamily::SpectrumWidth => Some("SW"),
+        ColorTableFamily::CorrelationCoefficient => Some("CC"),
+        ColorTableFamily::DifferentialReflectivity => Some("ZDR"),
+        ColorTableFamily::EchoTops => Some("ET"),
+        ColorTableFamily::Vil => Some("VIL"),
+        ColorTableFamily::VilDensity => Some("VILD"),
+        ColorTableFamily::HailSize => Some("MEHS"),
+        ColorTableFamily::AzimuthalShear => Some("AZSHEAR"),
+        ColorTableFamily::DifferentialPhase => Some("PHI"),
+        ColorTableFamily::SpecificDifferentialPhase => Some("KDP"),
+        ColorTableFamily::Generic => None,
+    }
+}
+
+/// Picker badges (docs/customization-spec.md §2.1). An entry can carry
+/// several; `Default` marks the table the family ships with.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Badge {
+    Default,
+    CvdSafe,
+    Classic,
+    Smooth,
+    HighContrast,
+}
+
+impl Badge {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::CvdSafe => "CVD-safe",
+            Self::Classic => "classic",
+            Self::Smooth => "smooth",
+            Self::HighContrast => "high contrast",
+        }
+    }
+}
+
+/// A built-in table plus the metadata the picker renders: one-line
+/// description (hover) and badges (docs/customization-spec.md §2.1).
+pub struct CatalogEntry {
+    pub table: ColorTable,
+    pub description: &'static str,
+    pub badges: &'static [Badge],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -488,7 +543,11 @@ impl ColorTable {
         table
     }
 
-    fn from_parts(
+    /// Build a table from explicit parts — the in-app editor's path (the
+    /// parsers funnel here too). Stop values are in INTERNAL units (the
+    /// editor converts declared kt/mph before calling); stops are sorted
+    /// and bit-deduped, and at least two distinct stops are required.
+    pub fn from_parts(
         name: String,
         product: Option<String>,
         units: Option<String>,
@@ -908,47 +967,193 @@ pub fn vortex_velocity_table() -> ColorTable {
         .expect("built-in velocity color table is valid")
 }
 
+/// Back-compat table list (picker order). Single-sourced from the catalog
+/// so names/order can never drift from the badged entries.
 pub fn builtin_tables_for_family(family: ColorTableFamily) -> Vec<ColorTable> {
+    builtin_catalog_for_family(family)
+        .into_iter()
+        .map(|entry| entry.table)
+        .collect()
+}
+
+/// The badged built-in catalog (docs/customization-spec.md §2.1): every
+/// family's tables in picker order, each with a one-line description and
+/// badges. Position 0 is the family default and carries `Badge::Default`
+/// (pinned by `every_family_has_a_default_badged_catalog_entry`).
+pub fn builtin_catalog_for_family(family: ColorTableFamily) -> Vec<CatalogEntry> {
+    fn entry(
+        table: ColorTable,
+        description: &'static str,
+        badges: &'static [Badge],
+    ) -> CatalogEntry {
+        CatalogEntry {
+            table,
+            description,
+            badges,
+        }
+    }
     match family {
         ColorTableFamily::Reflectivity => vec![
-            builtin_reflectivity_table(),
-            gr2_reflectivity_table(),
-            analyst_classic_reflectivity_table(),
-            nws_reflectivity_table(),
-            dark_scope_reflectivity_table(),
-            hail_core_reflectivity_table(),
-            low_precip_reflectivity_table(),
-            tornado_debris_reflectivity_table(),
-            clean_light_reflectivity_table(),
+            entry(
+                builtin_reflectivity_table(),
+                "NWS-convention dBZ ladder, transparent below 10 dBZ, magenta held for 65+ hail cores — the BowEcho default",
+                &[Badge::Default],
+            ),
+            entry(
+                turbo_reflectivity_table(),
+                "Smooth turbo ramp (Mikhailov 2019): near-uniform perceptual steps for fine echo structure, no hard category edges",
+                &[Badge::Smooth],
+            ),
+            entry(
+                gr2_reflectivity_table(),
+                "The GR2Analyst default palette the community's eyes are calibrated to",
+                &[Badge::Classic],
+            ),
+            entry(
+                analyst_classic_reflectivity_table(),
+                "Classic electric hue ladder with cleaned-up category boundaries",
+                &[Badge::Classic],
+            ),
+            entry(
+                nws_reflectivity_table(),
+                "Traditional NWS web-radar palette: cyan lows into the familiar green/yellow/red severe ladder",
+                &[Badge::Classic],
+            ),
+            entry(
+                dark_scope_reflectivity_table(),
+                "Muted, darker ramp for night ops and dim rooms",
+                &[],
+            ),
+            entry(
+                hail_core_reflectivity_table(),
+                "Extended high end: white and cyan flag 80+ dBZ hail spikes",
+                &[Badge::HighContrast],
+            ),
+            entry(
+                low_precip_reflectivity_table(),
+                "Low-end stretch for drizzle, snow bands, and weak-echo detail",
+                &[],
+            ),
+            entry(
+                tornado_debris_reflectivity_table(),
+                "High-end contrast tuned for debris-ball co-location work",
+                &[],
+            ),
+            entry(
+                clean_light_reflectivity_table(),
+                "Lighter, lower-saturation ramp for bright rooms and screenshots",
+                &[],
+            ),
         ],
         ColorTableFamily::Velocity => vec![
-            builtin_velocity_table(),
-            balance_velocity_table(),
-            tornado_velocity_table(),
-            analyst_velocity_table(),
-            radarscope_contrast_velocity_table(),
-            sign_check_velocity_table(),
-            couplet_pop_velocity_table(),
-            gr2_ish_analyst_velocity_table(),
-            subtle_srv_velocity_table(),
+            entry(
+                builtin_velocity_table(),
+                "Diverging green/red (NWS convention) with a neutral-dark zero so couplets read by chroma jump — the BowEcho default",
+                &[Badge::Default],
+            ),
+            entry(
+                balance_velocity_table(),
+                "Perceptually uniform blue-red diverging modeled on cmocean balance / CET-D (Thyng et al. 2016; Kovesi 2015); robust under red-green color vision deficiency",
+                &[Badge::CvdSafe, Badge::Smooth],
+            ),
+            entry(
+                tornado_velocity_table(),
+                "Hot break colors at tornadic velocities; extremes wash bright for instant couplet pop",
+                &[Badge::HighContrast],
+            ),
+            entry(
+                analyst_velocity_table(),
+                "Stepped operational diverging ramp with bright-washed extremes",
+                &[],
+            ),
+            entry(
+                radarscope_contrast_velocity_table(),
+                "RadarScope-style contrast curve with pale extreme bands",
+                &[],
+            ),
+            entry(
+                sign_check_velocity_table(),
+                "Three hard bands — toward, zero, away. Polarity and dealiasing QC",
+                &[Badge::HighContrast],
+            ),
+            entry(
+                couplet_pop_velocity_table(),
+                "Dark mid-range, saturated cores: rotation couplets jump out at storm scale",
+                &[],
+            ),
+            entry(
+                gr2_ish_analyst_velocity_table(),
+                "GR2Analyst-flavored greens and reds with a modern zero treatment",
+                &[Badge::Classic],
+            ),
+            entry(
+                subtle_srv_velocity_table(),
+                "Low-saturation ramp for storm-relative work under other overlays",
+                &[],
+            ),
         ],
-        ColorTableFamily::SpectrumWidth => vec![builtin_spectrum_width_table()],
-        ColorTableFamily::CorrelationCoefficient => {
-            vec![builtin_correlation_coefficient_table(), tornado_cc_table()]
-        }
-        ColorTableFamily::DifferentialReflectivity => {
-            vec![builtin_differential_reflectivity_table()]
-        }
-        ColorTableFamily::EchoTops => vec![builtin_echo_tops_table()],
-        ColorTableFamily::Vil => vec![builtin_vil_table()],
-        ColorTableFamily::VilDensity => vec![builtin_vil_density_table()],
-        ColorTableFamily::HailSize => vec![builtin_hail_size_table()],
-        ColorTableFamily::AzimuthalShear => vec![builtin_azimuthal_shear_table()],
-        ColorTableFamily::DifferentialPhase => vec![builtin_differential_phase_table()],
-        ColorTableFamily::SpecificDifferentialPhase => {
-            vec![builtin_specific_differential_phase_table()]
-        }
-        ColorTableFamily::Generic => vec![builtin_generic_table()],
+        ColorTableFamily::SpectrumWidth => vec![entry(
+            builtin_spectrum_width_table(),
+            "Dark below ~4 m/s where most of the field lives; warm break into the 8+ m/s turbulence/rotation range",
+            &[Badge::Default],
+        )],
+        ColorTableFamily::CorrelationCoefficient => vec![
+            entry(
+                builtin_correlation_coefficient_table(),
+                "Cool non-met lows, warm precip above 0.95; resolution packed into the 0.80-1.00 diagnostic band",
+                &[Badge::Default],
+            ),
+            entry(
+                tornado_cc_table(),
+                "Exaggerated 0.5-0.8 drop so tornadic debris signatures pop hard",
+                &[Badge::HighContrast],
+            ),
+        ],
+        ColorTableFamily::DifferentialReflectivity => vec![entry(
+            builtin_differential_reflectivity_table(),
+            "Diverging about 0 dB: gray spheres, warm oblate drops; resolution favors 0-4 dB",
+            &[Badge::Default],
+        )],
+        ColorTableFamily::EchoTops => vec![entry(
+            builtin_echo_tops_table(),
+            "Storm-top rainbow ramp over ~5-60 kft (values are metres above the radar)",
+            &[Badge::Default],
+        )],
+        ColorTableFamily::Vil => vec![entry(
+            builtin_vil_table(),
+            "Blue-to-magenta kg/m² ramp; the warm/magenta high end flags the large-hail VIL range",
+            &[Badge::Default],
+        )],
+        ColorTableFamily::VilDensity => vec![entry(
+            builtin_vil_density_table(),
+            "Hard warm break at ~3.5 g/m³ — the Amburn & Wolf (1997) large-hail threshold",
+            &[Badge::Default],
+        )],
+        ColorTableFamily::HailSize => vec![entry(
+            builtin_hail_size_table(),
+            "Breaks at the 19/25/44/50 mm report thresholds (cf. Witt et al. 1998): severe goes warm, giant goes magenta",
+            &[Badge::Default],
+        )],
+        ColorTableFamily::AzimuthalShear => vec![entry(
+            builtin_azimuthal_shear_table(),
+            "Diverging about zero: cyclonic shear warms to red/white, anticyclonic cools to violet, near-zero stays dark",
+            &[Badge::Default],
+        )],
+        ColorTableFamily::DifferentialPhase => vec![entry(
+            builtin_differential_phase_table(),
+            "Monotonic ramp over the 0-180°+ accumulated differential phase range",
+            &[Badge::Default],
+        )],
+        ColorTableFamily::SpecificDifferentialPhase => vec![entry(
+            builtin_specific_differential_phase_table(),
+            "Diverging about zero; positive KDP (liquid-water loading) warms green to red",
+            &[Badge::Default],
+        )],
+        ColorTableFamily::Generic => vec![entry(
+            builtin_generic_table(),
+            "Neutral monotonic ramp for products without a dedicated family",
+            &[Badge::Default],
+        )],
     }
 }
 
@@ -1249,6 +1454,20 @@ pub fn clean_light_reflectivity_table() -> ColorTable {
         .expect("built-in clean light reflectivity color table is valid")
 }
 
+/// Smooth turbo-derived reflectivity ramp for fine echo-structure work
+/// (QLCS surges, couplet co-location): turbo keeps a near-uniform
+/// perceptual derivative where jet's banding creates false edges
+/// (Mikhailov 2019, Google AI Blog, "Turbo, An Improved Rainbow Colormap
+/// for Visualization"; on rainbow-map hazards cf. Borland & Taylor 2007,
+/// IEEE CG&A 27(2)). Stops sample the official 5th-order polynomial
+/// approximation of turbo (Ruofei Du, Apache-2.0) every 5 dBZ over
+/// 10–75 dBZ, with an alpha fade-in below 10 dBZ hiding clear-air junk.
+/// Deliberately interpolated, not stepped — this is the "smooth" badge.
+pub fn turbo_reflectivity_table() -> ColorTable {
+    ColorTable::parse("Turbo REF (smooth)", TURBO_REFLECTIVITY_TABLE)
+        .expect("built-in turbo reflectivity color table is valid")
+}
+
 pub fn analyst_velocity_table() -> ColorTable {
     ColorTable::parse_stepped("Analyst Pro VEL", ANALYST_PRO_VELOCITY_TABLE)
         .expect("built-in analyst velocity color table is valid")
@@ -1530,6 +1749,358 @@ fn unit_value_to_mps_scale(units: &str) -> f32 {
         _ => 1.0,
     }
 }
+
+/// The factor that converts a value declared in `units` to the internal
+/// representation (kt/mph → m/s; anything else is label-only, factor 1).
+/// The in-app editor authors stops in declared units and pre-scales them
+/// for [`ColorTable::from_parts`] — exactly what the parser does to a
+/// community `.pal`, so a velocity table authored in kt behaves
+/// identically to one loaded from disk.
+pub fn unit_scale_to_internal(units: &str) -> f32 {
+    unit_value_to_mps_scale(units)
+}
+
+// ---------------------------------------------------------------------------
+// GR2Analyst-compatible .pal writer (docs/customization-spec.md §2.3)
+// ---------------------------------------------------------------------------
+
+/// One emitted `.pal` color row, in internal units until the unit
+/// conversion pass rewrites `value`.
+struct PalRow {
+    value: f32,
+    color: Rgba8,
+    end_color: Option<Rgba8>,
+    solid: bool,
+}
+
+/// Serialize a table as a GR2Analyst-compatible `.pal`.
+///
+/// Dialect (verified against `parse_gr_pal`): `Product:`/`Units:`/`RF:`
+/// headers, a legend-only `Step:` hint, and `Color:`/`Color4:`/
+/// `SolidColor:`/`SolidColor4:` rows — no nonstandard headers, so the
+/// file is bit-faithful in GR2A. Re-parsing through
+/// [`ColorTable::parse_gr_pal`] reproduces `sample()` EXACTLY at every
+/// value: representation may change (stepped tables become `SolidColor:`
+/// bands; quantized tables expand to one solid band per quantization
+/// step), sampling never does — pinned by the export round-trip tests.
+///
+/// Velocity tables declared in kt/mph write their values back in the
+/// declared unit (the parser's kt→m/s scaling then restores the exact
+/// internal floats); when a value has no exact preimage under the unit
+/// scale the whole file falls back to SI (`Units: m/s`, unscaled) rather
+/// than shift a stop by an ULP.
+pub fn to_gr_pal(table: &ColorTable) -> String {
+    let mut rows = pal_rows(table);
+
+    let mut units = table
+        .units()
+        .map(str::trim)
+        .filter(|units| !units.is_empty())
+        .map(str::to_owned);
+    let scale = units.as_deref().map(unit_value_to_mps_scale).unwrap_or(1.0);
+    if scale != 1.0 {
+        let declared: Option<Vec<f32>> = rows
+            .iter()
+            .map(|row| exact_unscaled(row.value, scale))
+            .collect();
+        match declared {
+            Some(values) => {
+                for (row, value) in rows.iter_mut().zip(values) {
+                    row.value = value;
+                }
+            }
+            None => units = Some("m/s".to_owned()),
+        }
+    }
+
+    let mut text = String::new();
+    let _ = writeln!(text, "; exported by BowEcho {}", env!("CARGO_PKG_VERSION"));
+    if let Some(product) = table
+        .product()
+        .map(str::trim)
+        .filter(|product| !product.is_empty())
+    {
+        let _ = writeln!(text, "Product: {product}");
+    }
+    if let Some(units) = &units {
+        let _ = writeln!(text, "Units: {units}");
+    }
+    if let Some(step) = legend_step(&rows) {
+        let _ = writeln!(text, "Step: {step}");
+    }
+    let rf = table.range_folded_rgba();
+    let _ = writeln!(text, "RF: {} {} {} {}", rf.r, rf.g, rf.b, rf.a);
+    for row in &rows {
+        let value = row.value;
+        let Rgba8 { r, g, b, a } = row.color;
+        if row.solid {
+            if a == 255 {
+                let _ = writeln!(text, "SolidColor: {value} {r} {g} {b}");
+            } else {
+                let _ = writeln!(text, "SolidColor4: {value} {r} {g} {b} {a}");
+            }
+        } else if let Some(end) = row.end_color {
+            if a == 255 && end.a == 255 {
+                let _ = writeln!(
+                    text,
+                    "Color: {value} {r} {g} {b} {} {} {}",
+                    end.r, end.g, end.b
+                );
+            } else {
+                let _ = writeln!(
+                    text,
+                    "Color4: {value} {r} {g} {b} {a} {} {} {} {}",
+                    end.r, end.g, end.b, end.a
+                );
+            }
+        } else if a == 255 {
+            let _ = writeln!(text, "Color: {value} {r} {g} {b}");
+        } else {
+            let _ = writeln!(text, "Color4: {value} {r} {g} {b} {a}");
+        }
+    }
+    text
+}
+
+/// Map a table's stops into GR rows whose `parse_gr_pal` sampling matches
+/// the table's own sample mode exactly.
+fn pal_rows(table: &ColorTable) -> Vec<PalRow> {
+    let stops = table.stops();
+    match table.sample_mode {
+        // Already GR semantics: solid stops (end == color) write as
+        // SolidColor rows, explicit ramps keep their end color.
+        SampleMode::GrPal => stops
+            .iter()
+            .map(|stop| {
+                if stop.end_color == Some(stop.color) {
+                    PalRow {
+                        value: stop.value,
+                        color: stop.color,
+                        end_color: None,
+                        solid: true,
+                    }
+                } else {
+                    PalRow {
+                        value: stop.value,
+                        color: stop.color,
+                        end_color: stop.end_color,
+                        solid: false,
+                    }
+                }
+            })
+            .collect(),
+        // Stepped bins are exactly GR's SolidColor bands.
+        SampleMode::Stepped => stops
+            .iter()
+            .map(|stop| PalRow {
+                value: stop.value,
+                color: stop.color,
+                end_color: None,
+                solid: true,
+            })
+            .collect(),
+        SampleMode::Interpolated => interpolated_rows(stops),
+        SampleMode::QuantizedInterpolated { step, origin } => {
+            if step.is_finite() && step > 0.0 {
+                quantized_rows(table, step, origin).unwrap_or_else(|| interpolated_rows(stops))
+            } else {
+                // Invalid step never quantizes (quantize_value passes the
+                // value through) — plain interpolation.
+                interpolated_rows(stops)
+            }
+        }
+    }
+}
+
+/// Plain `Color:` rows ramp to the next row in GR — identical to
+/// interpolated sampling — EXCEPT that GR holds a transparent row's color
+/// across its interval; interpolated tables lerp through it, so those
+/// rows get an explicit end color.
+fn interpolated_rows(stops: &[ColorStop]) -> Vec<PalRow> {
+    stops
+        .iter()
+        .enumerate()
+        .map(|(index, stop)| {
+            let end_color = (stop.color.a == 0)
+                .then(|| stops.get(index + 1).map(|next| next.color))
+                .flatten()
+                .filter(|next| *next != stop.color);
+            PalRow {
+                value: stop.value,
+                color: stop.color,
+                end_color,
+                solid: false,
+            }
+        })
+        .collect()
+}
+
+/// Expand a quantized table into one `SolidColor` band per quantization
+/// step. Band boundaries are found by bit-level bisection against the
+/// SAME arithmetic `quantize_value` uses, so the expansion reproduces the
+/// original's rounding (including round-half-away-from-zero asymmetry)
+/// to the last ULP. Returns None for degenerate tables (caller falls
+/// back to interpolated rows).
+fn quantized_rows(table: &ColorTable, step: f32, origin: f32) -> Option<Vec<PalRow>> {
+    const MAX_BANDS: i64 = 4096;
+    let first = table.stops.first()?;
+    let last = table.stops.last()?;
+    let band_of = |value: f32| -> i64 { ((value - origin) / step).round() as i64 };
+    // One band beyond each end so out-of-range values clamp to the same
+    // first/last colors the original clamps to.
+    let k_lo = band_of(first.value).checked_sub(1)?;
+    let k_hi = band_of(last.value).checked_add(1)?;
+    if k_hi.checked_sub(k_lo)? > MAX_BANDS {
+        return None;
+    }
+    let q = |k: i64| origin + (k as f32) * step;
+    if !q(k_lo).is_finite() || !q(k_hi).is_finite() {
+        return None;
+    }
+
+    let mut bands: Vec<(f32, Rgba8)> = Vec::new();
+    // The anchor row only needs to sit below every band-1 boundary;
+    // everything beneath it clamps to its color anyway.
+    bands.push((next_down(q(k_lo)), table.sample_interpolated(q(k_lo))));
+    for k in (k_lo + 1)..=k_hi {
+        let boundary = lowest_value_in_band(k, q(k - 1), q(k), band_of);
+        bands.push((boundary, table.sample_interpolated(q(k))));
+    }
+
+    // The quantized mode's noise clamp: RAW values below the first opaque
+    // stop are hard transparent (0,0,0,0), not the lerped stop color.
+    if let Some(first_opaque) = table.first_opaque_value() {
+        bands.retain(|(value, _)| *value > first_opaque);
+        bands.insert(
+            0,
+            (
+                first_opaque,
+                table.sample_interpolated(quantize_value(first_opaque, step, origin)),
+            ),
+        );
+        bands.insert(0, (next_down(first_opaque), Rgba8::TRANSPARENT));
+    }
+
+    // Strictly ascending values (an empty band collapses onto the next
+    // boundary — the LATER band owns the shared value), then merge
+    // equal-color runs (solid bands: keeping the first row of a run
+    // samples identically).
+    let mut cleaned: Vec<(f32, Rgba8)> = Vec::new();
+    for (value, color) in bands {
+        while cleaned
+            .last()
+            .is_some_and(|(previous, _)| *previous >= value)
+        {
+            cleaned.pop();
+        }
+        cleaned.push((value, color));
+    }
+    cleaned.dedup_by(|later, earlier| later.1 == earlier.1);
+    if cleaned.len() < 2 {
+        return None;
+    }
+
+    Some(
+        cleaned
+            .into_iter()
+            .map(|(value, color)| PalRow {
+                value,
+                color,
+                end_color: None,
+                solid: true,
+            })
+            .collect(),
+    )
+}
+
+/// Smallest f32 in `(lower, upper]` whose band index reaches `k`, by
+/// bisection on the total-ordered f32 bit lattice — `band_of` is
+/// monotone non-decreasing, so this is the exact crossover.
+fn lowest_value_in_band(k: i64, lower: f32, upper: f32, band_of: impl Fn(f32) -> i64) -> f32 {
+    if band_of(lower) >= k {
+        return lower;
+    }
+    let mut low_key = ordered_key(lower);
+    let mut high_key = ordered_key(upper);
+    while low_key + 1 < high_key {
+        let mid_key = low_key + (high_key - low_key) / 2;
+        if band_of(from_ordered_key(mid_key)) >= k {
+            high_key = mid_key;
+        } else {
+            low_key = mid_key;
+        }
+    }
+    from_ordered_key(high_key)
+}
+
+/// Monotone f32 → i32 key (IEEE-754 totally ordered; the same xor is its
+/// own inverse on each sign branch).
+fn ordered_key(value: f32) -> i32 {
+    let bits = value.to_bits() as i32;
+    bits ^ (((bits >> 31) as u32) >> 1) as i32
+}
+
+fn from_ordered_key(key: i32) -> f32 {
+    f32::from_bits((key ^ (((key >> 31) as u32) >> 1) as i32) as u32)
+}
+
+/// The next f32 strictly below `value`.
+fn next_down(value: f32) -> f32 {
+    from_ordered_key(ordered_key(value) - 1)
+}
+
+/// Find the declared-units value that reparses (one f32 multiply by
+/// `scale`) to exactly `internal`: search the few floats around the
+/// naive quotient for a bit-exact preimage.
+fn exact_unscaled(internal: f32, scale: f32) -> Option<f32> {
+    if !internal.is_finite() || !scale.is_finite() || scale == 0.0 {
+        return None;
+    }
+    let center = ordered_key(internal / scale);
+    (-8i32..=8)
+        .map(|delta| from_ordered_key(center.wrapping_add(delta)))
+        .find(|candidate| candidate.is_finite() && candidate * scale == internal)
+}
+
+/// Legend tick hint (`Step:` is legend-only in GR — never quantizes):
+/// a round 1/2/5×10ⁿ step giving ~10 ticks across the value range.
+fn legend_step(rows: &[PalRow]) -> Option<f32> {
+    let first = rows.first()?.value;
+    let last = rows.last()?.value;
+    let range = (last - first).abs();
+    if !range.is_finite() || range <= 0.0 {
+        return None;
+    }
+    let raw = range / 10.0;
+    let magnitude = 10f32.powf(raw.log10().floor());
+    [1.0f32, 2.0, 5.0, 10.0]
+        .iter()
+        .map(|multiple| multiple * magnitude)
+        .find(|step| *step >= raw && step.is_finite() && *step > 0.0)
+}
+
+/// Turbo (Mikhailov 2019) sampled at 5 dBZ steps via the official
+/// polynomial approximation; see `turbo_reflectivity_table`. No `step:`
+/// header — the ramp interpolates.
+const TURBO_REFLECTIVITY_TABLE: &str = r#"
+product: BR
+units: dBZ
+color4: 7.5 35 23 27 0
+color4: 10 35 23 27 255
+color: 15 75 72 195
+color: 20 61 126 248
+color: 25 40 177 234
+color: 30 40 218 191
+color: 35 68 245 141
+color: 40 119 254 98
+color: 45 179 243 67
+color: 50 231 214 47
+color: 55 255 169 36
+color: 60 255 116 27
+color: 65 221 64 17
+color: 70 171 24 5
+color: 75 144 12 0
+"#;
 
 const ANALYST_REFLECTIVITY_HD_TABLE: &str = r#"
 product: BR
@@ -2703,6 +3274,7 @@ mod tests {
             reflectivity,
             vec![
                 "Analyst Reflectivity HD",
+                "Turbo REF (smooth)",
                 "GR2Analyst Classic REF",
                 "Analyst Classic REF",
                 "NWS Classic REF",
@@ -2881,5 +3453,341 @@ mod tests {
             assert_eq!(ColorTableFamily::from_label(family.label()), Some(family));
         }
         assert_eq!(ColorTableFamily::from_label("nope"), None);
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    /// §2.1 completeness: every family ships a Default-badged entry — and
+    /// it is the table `ColorTableSet::default()` actually uses, in
+    /// position 0, with a non-empty description on every entry.
+    #[test]
+    fn every_family_has_a_default_badged_catalog_entry() {
+        let defaults = ColorTableSet::default();
+        for family in ColorTableFamily::ALL {
+            let catalog = builtin_catalog_for_family(family);
+            assert!(
+                !catalog.is_empty(),
+                "{} has an empty catalog",
+                family.label()
+            );
+            let default_entries: Vec<&CatalogEntry> = catalog
+                .iter()
+                .filter(|entry| entry.badges.contains(&Badge::Default))
+                .collect();
+            assert_eq!(
+                default_entries.len(),
+                1,
+                "{} must have exactly one Default-badged entry",
+                family.label()
+            );
+            assert_eq!(
+                default_entries[0].table.name(),
+                defaults.for_family(family).name(),
+                "{}'s Default badge sits on a table that is not the family default",
+                family.label()
+            );
+            assert_eq!(
+                catalog[0].table.name(),
+                defaults.for_family(family).name(),
+                "{}'s default should lead the picker list",
+                family.label()
+            );
+            for entry in &catalog {
+                assert!(
+                    !entry.description.trim().is_empty(),
+                    "{} entry '{}' is missing a description",
+                    family.label(),
+                    entry.table.name()
+                );
+            }
+        }
+    }
+
+    /// The legacy list API stays single-sourced from the catalog.
+    #[test]
+    fn builtin_tables_match_catalog_order() {
+        for family in ColorTableFamily::ALL {
+            let names: Vec<String> = builtin_tables_for_family(family)
+                .iter()
+                .map(|table| table.name().to_owned())
+                .collect();
+            let catalog_names: Vec<String> = builtin_catalog_for_family(family)
+                .iter()
+                .map(|entry| entry.table.name().to_owned())
+                .collect();
+            assert_eq!(names, catalog_names);
+        }
+    }
+
+    #[test]
+    fn product_codes_round_trip_through_family_mapping() {
+        for family in ColorTableFamily::ALL {
+            match product_code_for_family(family) {
+                Some(code) => assert_eq!(
+                    family_for_product_code(code),
+                    family,
+                    "{code} does not map back to {}",
+                    family.label()
+                ),
+                None => assert_eq!(family, ColorTableFamily::Generic),
+            }
+        }
+    }
+
+    #[test]
+    fn turbo_reflectivity_is_smooth_and_filters_clear_air() {
+        let table = turbo_reflectivity_table();
+        assert!(table.interpolates(), "the smooth badge means interpolated");
+        assert_eq!(table.sample(5.0).a, 0, "clear-air junk stays hidden");
+        assert_eq!(table.sample(10.0).a, 255);
+        // No banding: neighboring dBZ differ smoothly.
+        assert_ne!(table.sample(31.0), table.sample(33.0));
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    fn nudge_up(value: f32) -> f32 {
+        from_ordered_key(ordered_key(value) + 1)
+    }
+
+    fn nudge_down(value: f32) -> f32 {
+        next_down(value)
+    }
+
+    /// Every public built-in constructor — including the tables outside
+    /// the picker catalog — so the writer faces every sample mode
+    /// (interpolated / stepped / quantized / GrPal) and every units
+    /// variant (m/s, dBZ, kt, MPH+Scale) we ship.
+    fn all_builtin_tables() -> Vec<ColorTable> {
+        let mut tables: Vec<ColorTable> = ColorTableFamily::ALL
+            .iter()
+            .flat_map(|family| builtin_tables_for_family(*family))
+            .collect();
+        tables.extend([
+            vortex_velocity_table(),
+            nws_velocity_table(),
+            gr2_velocity_table(),
+            tight_couplet_velocity_table(),
+            nws_split_velocity_table(),
+            dark_analyst_velocity_table(),
+            storm_detail_reflectivity_table(),
+            analyst_reflectivity_table(),
+        ]);
+        tables
+    }
+
+    /// Dense sweep + every stop value (± one ULP) + quantization band
+    /// boundaries (± one ULP) + non-finite specials.
+    fn probe_values(table: &ColorTable) -> Vec<f32> {
+        let stops = table.stops();
+        let min = stops.first().unwrap().value;
+        let max = stops.last().unwrap().value;
+        let span = (max - min).max(1.0);
+
+        let mut probes: Vec<f32> = Vec::new();
+        for index in 0..=4000 {
+            probes.push(min - 0.1 * span + (index as f32) * (1.2 * span / 4000.0));
+        }
+        for stop in stops {
+            probes.push(stop.value);
+            probes.push(nudge_up(stop.value));
+            probes.push(nudge_down(stop.value));
+        }
+        if let Some(step) = table.step_size() {
+            // Built-in quantized tables all use origin 0; even if one did
+            // not, these are still valid probe values.
+            let mut boundary = (min / step).floor() * step - 0.5 * step;
+            while boundary <= max + step {
+                probes.push(boundary);
+                probes.push(nudge_up(boundary));
+                probes.push(nudge_down(boundary));
+                boundary += step;
+            }
+        }
+        probes.extend([
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            f32::MIN,
+            0.0,
+            -0.0,
+        ]);
+        probes
+    }
+
+    fn assert_export_round_trips(table: &ColorTable) {
+        let pal = to_gr_pal(table);
+        let reparsed = ColorTable::parse_gr_pal(table.name(), &pal)
+            .unwrap_or_else(|err| panic!("{} failed to reparse: {err}\n{pal}", table.name()));
+        for value in probe_values(table) {
+            assert_eq!(
+                reparsed.color_for_value(value),
+                table.color_for_value(value),
+                "'{}' diverges at {value}\n--- exported .pal ---\n{pal}",
+                table.name()
+            );
+        }
+        assert_eq!(
+            reparsed.range_folded_color(),
+            table.range_folded_color(),
+            "'{}' RF color diverges",
+            table.name()
+        );
+    }
+
+    /// THE round-trip guarantee (§2.3): parse_gr_pal(to_gr_pal(t)) is
+    /// sampling-identical for every built-in.
+    #[test]
+    fn exported_builtins_round_trip_sampling_exactly() {
+        for table in all_builtin_tables() {
+            assert_export_round_trips(&table);
+        }
+    }
+
+    /// Synthetic alpha / two-color-gradient / solid coverage, plus the
+    /// community file that exercises every GR dialect feature at once.
+    #[test]
+    fn exported_synthetic_tables_round_trip_sampling_exactly() {
+        let radar_omega = ColorTable::parse_gr_pal(
+            "RadarOmega",
+            "units: dBZ\nstep: 10\nproduct: BR\n\
+             color4: -10 7 59 71 0\n\
+             color: 0 62 69 71 191 193 197\n\
+             color: 20 135 229 125\n\
+             color: 30 48 102 43\n\
+             color: 35 253 227 0\n\
+             color: 50 254 26 0 181 0 52\n\
+             color: 60 163 0 136 254 4 250\n\
+             color: 80 166 176 150 255 231 188\n\
+             color: 85 255 231 188\n",
+        )
+        .expect("synthetic gradient table parses");
+
+        let alpha_ramp = ColorTable::parse(
+            "alpha ramp",
+            "product: BR\nunits: dBZ\n\
+             color4: 0 10 20 30 0\n\
+             color4: 10 40 80 120 128\n\
+             color4: 20 200 100 50 255\n\
+             color4: 30 240 240 240 64\n",
+        )
+        .expect("synthetic alpha table parses");
+
+        let solid_bands = ColorTable::parse_gr_pal(
+            "solid bands",
+            "product: BV\n\
+             solidcolor: -10 0 0 200\n\
+             solidcolor4: 0 120 120 120 200\n\
+             solidcolor: 10 200 0 0\n",
+        )
+        .expect("synthetic solid table parses");
+
+        let stepped = ColorTable::new_stepped(
+            "stepped synthetic",
+            vec![
+                ColorStop {
+                    value: -5.0,
+                    color: Rgba8::new(1, 2, 3, 0),
+                    end_color: None,
+                },
+                ColorStop {
+                    value: 2.5,
+                    color: Rgba8::opaque(50, 100, 150),
+                    end_color: None,
+                },
+                ColorStop {
+                    value: 11.25,
+                    color: Rgba8::new(200, 150, 100, 80),
+                    end_color: None,
+                },
+            ],
+        )
+        .expect("synthetic stepped table builds");
+
+        // Interpolated with a transparent stop in the MIDDLE: GR holds
+        // transparent rows, interpolation lerps through them — the writer
+        // must emit the explicit end color.
+        let transparent_middle = ColorTable::new(
+            "transparent middle",
+            vec![
+                ColorStop {
+                    value: 0.0,
+                    color: Rgba8::opaque(255, 0, 0),
+                    end_color: None,
+                },
+                ColorStop {
+                    value: 10.0,
+                    color: Rgba8::new(60, 70, 80, 0),
+                    end_color: None,
+                },
+                ColorStop {
+                    value: 20.0,
+                    color: Rgba8::opaque(0, 0, 255),
+                    end_color: None,
+                },
+            ],
+        )
+        .expect("synthetic transparent-middle table builds");
+
+        for table in [
+            radar_omega,
+            alpha_ramp,
+            solid_bands,
+            stepped,
+            transparent_middle,
+        ] {
+            assert_export_round_trips(&table);
+        }
+    }
+
+    /// §2.3 units fidelity: a kt-declared table exports its values back
+    /// in knots (community-natural) and STILL reparses to the exact
+    /// internal m/s floats.
+    #[test]
+    fn kt_units_round_trip_in_declared_units() {
+        let table = nws_velocity_table();
+        let pal = to_gr_pal(&table);
+        assert!(pal.contains("Units: kt"), "kt header lost:\n{pal}");
+        // Stop values are written in knots, not the internal m/s.
+        assert!(
+            pal.lines()
+                .any(|line| line.trim().starts_with("SolidColor: -120 ")),
+            "expected the -120 kt stop in declared units:\n{pal}"
+        );
+        assert_export_round_trips(&table);
+    }
+
+    #[test]
+    fn export_header_carries_version_product_and_rf() {
+        let table = sign_check_velocity_table();
+        let pal = to_gr_pal(&table);
+        let mut lines = pal.lines();
+        let comment = lines.next().expect("first line");
+        assert!(
+            comment.starts_with("; exported by BowEcho "),
+            "missing export comment: {comment}"
+        );
+        assert!(pal.contains("Product: BV"));
+        // Sign Check's custom RF color (180 80 255 255) survives with alpha.
+        assert!(pal.contains("RF: 180 80 255 255"), "RF line lost:\n{pal}");
+    }
+
+    /// `Step:` in exports is a legend hint only — it must never make the
+    /// reparsed table quantized.
+    #[test]
+    fn exported_step_header_stays_legend_only() {
+        let table = builtin_reflectivity_table();
+        let pal = to_gr_pal(&table);
+        assert!(pal.contains("Step: "));
+        let reparsed = ColorTable::parse_gr_pal(table.name(), &pal).expect("reparse");
+        assert_eq!(reparsed.sample_mode_label(), "GR pal");
+        assert_eq!(reparsed.step_size(), None);
     }
 }
