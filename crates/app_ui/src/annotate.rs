@@ -398,7 +398,8 @@ pub(crate) const TOOLS: &[ToolDescriptor] = &[
     ToolDescriptor {
         id: "range_circle",
         label: "Range Circle",
-        hint: "Drag outward from the center; the label reads the radius in mi / km.",
+        hint: "Drag outward from the center; the label reads the radius in your \
+               Settings ▸ Display units.",
         group: ToolGroup::Lines,
         tool: ToolKind::RangeCircle,
     },
@@ -1173,12 +1174,13 @@ impl ViewerApp {
             return;
         }
         let project = |point: GeoPoint| self.lon_lat_to_screen(rect, point.lon, point.lat);
+        let units = self.units();
         for annotation in &self.annotations.shapes {
-            draw::annotation(painter, annotation, &project, 1.0);
+            draw::annotation(painter, annotation, &project, 1.0, units);
         }
         if let Some(draft) = &self.annotations.draft {
             let preview = preview_shape(draft, self.annotations.hover_geo);
-            draw::annotation(painter, &preview, &project, DRAFT_ALPHA);
+            draw::annotation(painter, &preview, &project, DRAFT_ALPHA, units);
             if let Some(points) = draft.path_points() {
                 let screen: Vec<egui::Pos2> = points.iter().map(|p| project(*p)).collect();
                 draw::draft_nodes(painter, &screen);

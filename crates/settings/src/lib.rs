@@ -80,6 +80,26 @@ pub struct AppSettings {
     /// "REF", "VEL", "SRV", "RHO", "ZDR", "SW", "CREF", "ET", "VIL", "VILD",
     /// "PHI", "KDP", "AzShr", "Div"). Edit in config.json to customize.
     pub product_hotkeys: BTreeMap<String, String>,
+    /// Legacy display-smoothing flag (the old Settings ▸ Display ▸ Smooth
+    /// display checkbox). Superseded by `smooth_display_mode` but still
+    /// READ (an old config with `smooth_display=true` maps to "soften")
+    /// and still WRITTEN (true for any non-native mode) so older builds
+    /// opening a newer config keep a smoothed look.
+    #[serde(default)]
+    pub smooth_display: bool,
+    /// Display smoothing mode (Settings ▸ Display ▸ Smoothing):
+    /// "native" (no smoothing), "soften" (3×3 binomial over the polar
+    /// grid — the legacy Smooth display), or "interpolated" (bilinear
+    /// polar upsampling — inter-gate interpolation). Empty = derive from
+    /// the legacy `smooth_display` bool, so old configs keep their
+    /// setting unchanged.
+    #[serde(default)]
+    pub smooth_display_mode: String,
+    /// Loop playback speed in percent of the 700 ms/frame baseline
+    /// (100 = baseline, 200 = twice as fast). Drives history playback AND
+    /// the GIF/MP4 recorder's frame timing, so exports match the screen.
+    #[serde(default = "default_loop_speed_percent")]
+    pub loop_speed_percent: u16,
     /// Last GR2A-style poll URL (mobile/research radar feeds) — typing it
     /// once per deployment is fine, once per session is not.
     #[serde(default)]
@@ -119,10 +139,24 @@ pub struct AppSettings {
     /// back to HRRR at use sites.
     #[serde(default = "default_model_slug")]
     pub model_slug: String,
+    /// Readout unit system: "imperial" (the default — US-born app) or
+    /// "metric". Unknown values read as imperial at use sites
+    /// (app_ui/src/units.rs); kept as a string so `AppSettings` stays
+    /// UI-crate-free and Eq-derivable.
+    #[serde(default = "default_units")]
+    pub units: String,
+}
+
+fn default_units() -> String {
+    "imperial".to_owned()
 }
 
 fn default_model_slug() -> String {
     "hrrr".to_owned()
+}
+
+fn default_loop_speed_percent() -> u16 {
+    100
 }
 
 /// A persisted FARM drape georeference. Coordinates are stored as scaled
@@ -206,6 +240,9 @@ impl Default for AppSettings {
             model_keep_runs: default_model_keep_runs(),
             perf_hud: false,
             product_hotkeys: default_product_hotkeys(),
+            smooth_display: false,
+            smooth_display_mode: String::new(),
+            loop_speed_percent: default_loop_speed_percent(),
             poll_url: String::new(),
             intl_provider: String::new(),
             intl_site: String::new(),
@@ -214,6 +251,7 @@ impl Default for AppSettings {
             data_dir: String::new(),
             sidebar_section_open: BTreeMap::new(),
             model_slug: default_model_slug(),
+            units: default_units(),
         }
     }
 }
@@ -517,6 +555,23 @@ mod tests {
     }
 
     #[test]
+    fn smooth_display_mode_round_trips_and_defaults_empty() {
+        // Older configs predate the mode string: it stays empty (the app
+        // derives the mode from the legacy bool), and the bool is intact.
+        let old = AppSettings::from_json(r#"{ "smooth_display": true }"#);
+        assert!(old.smooth_display);
+        assert_eq!(old.smooth_display_mode, "");
+        let s = AppSettings {
+            smooth_display: true,
+            smooth_display_mode: "interpolated".to_owned(),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&s.to_json());
+        assert_eq!(back.smooth_display_mode, "interpolated");
+        assert!(back.smooth_display);
+    }
+
+    #[test]
     fn model_slug_defaults_to_hrrr_and_round_trips() {
         // Older configs have no model_slug field — default to HRRR.
         assert_eq!(AppSettings::from_json("{}").model_slug, "hrrr");
@@ -525,6 +580,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(AppSettings::from_json(&s.to_json()).model_slug, "gfs");
+    }
+
+    #[test]
+    fn units_default_to_imperial_and_round_trip() {
+        // Older configs have no units field — default to imperial.
+        assert_eq!(AppSettings::from_json("{}").units, "imperial");
+        let s = AppSettings {
+            units: "metric".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(AppSettings::from_json(&s.to_json()).units, "metric");
     }
 
     #[test]

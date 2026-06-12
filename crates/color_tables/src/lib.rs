@@ -160,6 +160,9 @@ pub enum Badge {
     Classic,
     Smooth,
     HighContrast,
+    /// Tables ported from research-radar toolkits (DOW/COW mobile-radar
+    /// work), e.g. the GURT V3 set by ambient330.
+    Research,
 }
 
 impl Badge {
@@ -170,6 +173,7 @@ impl Badge {
             Self::Classic => "classic",
             Self::Smooth => "smooth",
             Self::HighContrast => "high contrast",
+            Self::Research => "research",
         }
     }
 }
@@ -1044,6 +1048,11 @@ pub fn builtin_catalog_for_family(family: ColorTableFamily) -> Vec<CatalogEntry>
                 "Lighter, lower-saturation ramp for bright rooms and screenshots",
                 &[],
             ),
+            entry(
+                gurt_reflectivity_table(),
+                "GURT V3 research ramp by ambient330 — full -20..70 dBZ span with no clear-air cutoff, for attenuation-shifted X-band/DOW work",
+                &[Badge::Research],
+            ),
         ],
         ColorTableFamily::Velocity => vec![
             entry(
@@ -1091,12 +1100,29 @@ pub fn builtin_catalog_for_family(family: ColorTableFamily) -> Vec<CatalogEntry>
                 "Low-saturation ramp for storm-relative work under other overlays",
                 &[],
             ),
+            entry(
+                gurt_velocity_table(),
+                "GURT V3 research ramp by ambient330 over ±30 m/s — sized to low X-band/DOW Nyquist intervals so none of the ramp is wasted",
+                &[Badge::Research],
+            ),
+            entry(
+                gurt_velocity_dealiased_table(),
+                "GURT V3 ramp stretched to ±60 m/s — upstream's dealiased-velocity scale, for post-dealias couplet work",
+                &[Badge::Research],
+            ),
         ],
-        ColorTableFamily::SpectrumWidth => vec![entry(
-            builtin_spectrum_width_table(),
-            "Dark below ~4 m/s where most of the field lives; warm break into the 8+ m/s turbulence/rotation range",
-            &[Badge::Default],
-        )],
+        ColorTableFamily::SpectrumWidth => vec![
+            entry(
+                builtin_spectrum_width_table(),
+                "Dark below ~4 m/s where most of the field lives; warm break into the 8+ m/s turbulence/rotation range",
+                &[Badge::Default],
+            ),
+            entry(
+                gurt_spectrum_width_table(),
+                "GURT V3 research ramp by ambient330 over 0-15 m/s: dark-violet quiet end through warm mids to gray/cyan tops",
+                &[Badge::Research],
+            ),
+        ],
         ColorTableFamily::CorrelationCoefficient => vec![
             entry(
                 builtin_correlation_coefficient_table(),
@@ -1108,12 +1134,24 @@ pub fn builtin_catalog_for_family(family: ColorTableFamily) -> Vec<CatalogEntry>
                 "Exaggerated 0.5-0.8 drop so tornadic debris signatures pop hard",
                 &[Badge::HighContrast],
             ),
+            entry(
+                gurt_correlation_coefficient_table(),
+                "GURT V3 research ramp by ambient330: blues across the non-met band, warm break to maroon as rhoHV approaches 1",
+                &[Badge::Research],
+            ),
         ],
-        ColorTableFamily::DifferentialReflectivity => vec![entry(
-            builtin_differential_reflectivity_table(),
-            "Diverging about 0 dB: gray spheres, warm oblate drops; resolution favors 0-4 dB",
-            &[Badge::Default],
-        )],
+        ColorTableFamily::DifferentialReflectivity => vec![
+            entry(
+                builtin_differential_reflectivity_table(),
+                "Diverging about 0 dB: gray spheres, warm oblate drops; resolution favors 0-4 dB",
+                &[Badge::Default],
+            ),
+            entry(
+                gurt_differential_reflectivity_table(),
+                "GURT V3 research ramp by ambient330 over -2..8 dB: dark negatives, rain-range blue→green→yellow→red, pink/purple extremes",
+                &[Badge::Research],
+            ),
+        ],
         ColorTableFamily::EchoTops => vec![entry(
             builtin_echo_tops_table(),
             "Storm-top rainbow ramp over ~5-60 kft (values are metres above the radar)",
@@ -1144,11 +1182,18 @@ pub fn builtin_catalog_for_family(family: ColorTableFamily) -> Vec<CatalogEntry>
             "Monotonic ramp over the 0-180°+ accumulated differential phase range",
             &[Badge::Default],
         )],
-        ColorTableFamily::SpecificDifferentialPhase => vec![entry(
-            builtin_specific_differential_phase_table(),
-            "Diverging about zero; positive KDP (liquid-water loading) warms green to red",
-            &[Badge::Default],
-        )],
+        ColorTableFamily::SpecificDifferentialPhase => vec![
+            entry(
+                builtin_specific_differential_phase_table(),
+                "Diverging about zero; positive KDP (liquid-water loading) warms green to red",
+                &[Badge::Default],
+            ),
+            entry(
+                gurt_specific_differential_phase_table(),
+                "GURT V3 research ramp by ambient330 over -2..12 °/km: gray negatives, warm liquid-loading mid-range, violet extremes",
+                &[Badge::Research],
+            ),
+        ],
         ColorTableFamily::Generic => vec![entry(
             builtin_generic_table(),
             "Neutral monotonic ramp for products without a dedicated family",
@@ -1587,6 +1632,144 @@ pub fn builtin_generic_table() -> ColorTable {
         ],
     )
     .expect("built-in generic color table is valid")
+}
+
+// ─── GURT V3 research-radar palettes ────────────────────────────────────────
+//
+// Color tables from GURT V3 — the Graphic Utility Radar Toolkit by ambient330
+// (github.com/ambient330/Graphic-Utility-Radar-Toolkit-V3, MIT license), a
+// Py-ART based SOLO3-style editor for DORADE sweepfiles from research radars.
+// The ramps are tuned for mobile/X-band deployments (DOW/COW): velocity spans
+// the low X-band Nyquist interval instead of the NEXRAD-scale convention, and
+// reflectivity keeps resolution across the attenuation-shifted -20..70 dBZ
+// span. Ported with appreciation; values are bit-faithful to upstream.
+//
+// Upstream (GurtV3.3.py) builds each colormap with `_make_cmap` (line 1159),
+// which hex-decodes the list and REVERSES it (`rgb[::-1]`) before handing it
+// to matplotlib's `LinearSegmentedColormap.from_list`: the hex arrays below
+// are written top-of-colorbar first exactly as upstream, so the LAST entry is
+// the low end of the scale. Anchors are evenly spaced over the field range
+// and matplotlib interpolates linearly between them — which is exactly
+// [`SampleMode::Interpolated`] over the stops [`gurt_stops`] builds. Field
+// ranges come from upstream's FIELD_DEFAULTS (GurtV3.3.py lines 1256-1277).
+
+/// GURT velocity hexes (GurtV3.3.py lines 1180-1186). Upstream's `gurt_ref`
+/// (lines 1187-1193) is a byte-identical list — only the field range differs
+/// — so the reflectivity table reuses this constant.
+const GURT_VELOCITY_HEX: [u32; 39] = [
+    0xF2465B, 0xE0365B, 0xCF2646, 0xB71630, 0x9F0100, 0xA05060, 0x7C544C, 0x885840, 0x966440,
+    0xA5703E, 0xB37B36, 0xC1872E, 0xD09326, 0xDE9F1E, 0xECAB16, 0xEFB70E, 0xEFC306, 0xEFCF00,
+    0xECE4B0, 0xD0E4D0, 0xBFDCBF, 0xA1D0A1, 0x85C485, 0x67B867, 0x4AAD4A, 0x2DA12D, 0x0F950F,
+    0x007D00, 0x017100, 0x30855F, 0x48969A, 0x718FFE, 0x6A60FE, 0x5A24E5, 0x4A0EC3, 0x3A0EAB,
+    0x2A0E94, 0x673A8F, 0x7805A3,
+];
+
+/// GURT ZDR hexes (GurtV3.3.py lines 1163-1166).
+const GURT_ZDR_HEX: [u32; 22] = [
+    0x922E97, 0xB26CB6, 0xC998CB, 0xE2C7E3, 0xFEF9FB, 0xF8BEDB, 0xEF77B2, 0xCF3B58, 0xB00000,
+    0xC80603, 0xDE1A0B, 0xEE8836, 0xFEF861, 0x5ADE64, 0x3FE2CF, 0x2474B4, 0x0B0D9C, 0xD1D1D9,
+    0x7F6CA2, 0x453B58, 0x292335, 0x060507,
+];
+
+/// GURT RhoHV/CC hexes (GurtV3.3.py lines 1167-1170).
+const GURT_CC_HEX: [u32; 20] = [
+    0x8B1E4D, 0xE41000, 0xFC7F00, 0xFFB600, 0xFFFB00, 0xBCE906, 0x87D70B, 0x61ED6E, 0x719CD2,
+    0x5151E8, 0x2929D1, 0x0A0ABD, 0x0C0CAC, 0x0D0D9C, 0x0F0F8C, 0x1C1C9E, 0x2D2D84, 0x404068,
+    0x454561, 0x4F4F4F,
+];
+
+/// GURT KDP hexes (GurtV3.3.py lines 1171-1175).
+const GURT_KDP_HEX: [u32; 27] = [
+    0xC361F9, 0x6F329A, 0x160234, 0x624264, 0xB18596, 0xFAC4C5, 0xFF7B00, 0xFFBC00, 0xFEFF00,
+    0x84DA1A, 0x16BA31, 0x3ADB94, 0x60FEF6, 0x74C7D1, 0x8987A2, 0x9B507A, 0xEA77B8, 0xCE5B93,
+    0xB03D6A, 0x921F42, 0x75021B, 0x62000E, 0x4B0101, 0x4B2828, 0x4B4A4A, 0x5F5F5F, 0x757575,
+];
+
+/// GURT spectrum-width hexes (GurtV3.3.py lines 1176-1179).
+const GURT_SPECTRUM_WIDTH_HEX: [u32; 21] = [
+    0x02A0C8, 0x2CA7C6, 0x53AEC5, 0x78B4C3, 0x9FBBC1, 0xC1C1C1, 0xDCDCDC, 0xE6E6E6, 0xF2F2F2,
+    0xFFFD01, 0xFDC60F, 0xFDB313, 0xFC991A, 0xF7742D, 0xEF6341, 0xE54F5B, 0xDE406D, 0xB73192,
+    0x7D26BD, 0x31148A, 0x1A0855,
+];
+
+/// Evenly spaced stops over `min..=max` from a GURT hex list (written
+/// top-of-scale first; reversed here exactly like upstream `_make_cmap`).
+fn gurt_stops(min: f32, max: f32, top_of_scale_first: &[u32]) -> Vec<ColorStop> {
+    let last = (top_of_scale_first.len() - 1) as f32;
+    top_of_scale_first
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(index, &hex)| {
+            stop(
+                min + (index as f32 / last) * (max - min),
+                (hex >> 16) as u8,
+                (hex >> 8) as u8,
+                hex as u8,
+            )
+        })
+        .collect()
+}
+
+/// GURT V3 reflectivity over -20..70 dBZ (FIELD_DEFAULTS "DBZH",
+/// GurtV3.3.py line 1257). Unlike the NEXRAD-tuned defaults this paints the
+/// whole span — X-band attenuation shifts usable reflectivity low, so there
+/// is no clear-air cutoff.
+pub fn gurt_reflectivity_table() -> ColorTable {
+    ColorTable::new(
+        "GURT Reflectivity",
+        gurt_stops(-20.0, 70.0, &GURT_VELOCITY_HEX),
+    )
+    .expect("built-in GURT reflectivity color table is valid")
+}
+
+/// GURT V3 velocity over ±30 m/s (FIELD_DEFAULTS "VEL", GurtV3.3.py line
+/// 1262) — matched to the low Nyquist velocities of X-band research radars.
+pub fn gurt_velocity_table() -> ColorTable {
+    ColorTable::new("GURT Velocity", gurt_stops(-30.0, 30.0, &GURT_VELOCITY_HEX))
+        .expect("built-in GURT velocity color table is valid")
+}
+
+/// GURT V3 dealiased velocity over ±60 m/s (FIELD_DEFAULTS "VELD",
+/// GurtV3.3.py line 1265) — the same ramp on upstream's doubled,
+/// post-dealias scale.
+pub fn gurt_velocity_dealiased_table() -> ColorTable {
+    ColorTable::new(
+        "GURT Velocity Dealiased",
+        gurt_stops(-60.0, 60.0, &GURT_VELOCITY_HEX),
+    )
+    .expect("built-in GURT dealiased velocity color table is valid")
+}
+
+/// GURT V3 spectrum width over 0..15 m/s (FIELD_DEFAULTS "SW", GurtV3.3.py
+/// line 1275).
+pub fn gurt_spectrum_width_table() -> ColorTable {
+    ColorTable::new(
+        "GURT Spectrum Width",
+        gurt_stops(0.0, 15.0, &GURT_SPECTRUM_WIDTH_HEX),
+    )
+    .expect("built-in GURT spectrum width color table is valid")
+}
+
+/// GURT V3 RhoHV/CC over 0..1 (FIELD_DEFAULTS "RHOHV", GurtV3.3.py line
+/// 1267).
+pub fn gurt_correlation_coefficient_table() -> ColorTable {
+    ColorTable::new("GURT CC", gurt_stops(0.0, 1.0, &GURT_CC_HEX))
+        .expect("built-in GURT correlation coefficient color table is valid")
+}
+
+/// GURT V3 differential reflectivity over -2..8 dB (FIELD_DEFAULTS "ZDR",
+/// GurtV3.3.py line 1266).
+pub fn gurt_differential_reflectivity_table() -> ColorTable {
+    ColorTable::new("GURT ZDR", gurt_stops(-2.0, 8.0, &GURT_ZDR_HEX))
+        .expect("built-in GURT differential reflectivity color table is valid")
+}
+
+/// GURT V3 specific differential phase over -2..12 °/km (FIELD_DEFAULTS
+/// "KDP", GurtV3.3.py line 1268).
+pub fn gurt_specific_differential_phase_table() -> ColorTable {
+    ColorTable::new("GURT KDP", gurt_stops(-2.0, 12.0, &GURT_KDP_HEX))
+        .expect("built-in GURT specific differential phase color table is valid")
 }
 
 fn stop(value: f32, r: u8, g: u8, b: u8) -> ColorStop {
@@ -3283,6 +3466,7 @@ mod tests {
                 "Analyst Low Precip REF",
                 "Tornado Debris REF",
                 "Clean Light REF",
+                "GURT Reflectivity",
             ]
         );
         assert_eq!(
@@ -3297,6 +3481,8 @@ mod tests {
                 "Couplet Pop VEL",
                 "GR2-ish Analyst VEL",
                 "Subtle SRV VEL",
+                "GURT Velocity",
+                "GURT Velocity Dealiased",
             ]
         );
     }
@@ -3545,6 +3731,159 @@ mod catalog_tests {
         assert_eq!(table.sample(10.0).a, 255);
         // No banding: neighboring dBZ differ smoothly.
         assert_ne!(table.sample(31.0), table.sample(33.0));
+    }
+}
+
+/// Pin the GURT V3 ports bit-for-bit against the upstream source
+/// (github.com/ambient330/Graphic-Utility-Radar-Toolkit-V3, GurtV3.3.py).
+/// Each test samples anchor stops and asserts the exact RGBA decoded from
+/// the upstream hex literal. Remember `_make_cmap` (GurtV3.3.py line 1159)
+/// reverses the hex list, so stop index `i` (low end first) corresponds to
+/// upstream list entry `n-1-i`.
+#[cfg(test)]
+mod gurt_upstream_fidelity_tests {
+    use super::*;
+
+    /// The value of stop `index` — the same arithmetic as `gurt_stops`, so
+    /// sampling at it hits the stop's exact-match path.
+    fn anchor(min: f32, max: f32, count: usize, index: usize) -> f32 {
+        min + (index as f32 / (count - 1) as f32) * (max - min)
+    }
+
+    /// Hexes: GurtV3.3.py lines 1187-1193 (`gurt_ref`); range -20..70 dBZ
+    /// from FIELD_DEFAULTS "DBZH" (line 1257).
+    #[test]
+    fn gurt_reflectivity_matches_upstream_anchors() {
+        let table = gurt_reflectivity_table();
+        assert!(table.interpolates(), "matplotlib from_list interpolates");
+        assert_eq!(table.stops().len(), 39);
+        let at = |index| anchor(-20.0, 70.0, 39, index);
+        assert_eq!(table.sample(at(0)), Rgba8::opaque(0x78, 0x05, 0xA3)); // -20 dBZ   '#7805A3'
+        assert_eq!(table.sample(at(9)), Rgba8::opaque(0x30, 0x85, 0x5F)); // ~1.3 dBZ  '#30855F'
+        assert_eq!(table.sample(at(19)), Rgba8::opaque(0xD0, 0xE4, 0xD0)); // 25 dBZ   '#D0E4D0'
+        assert_eq!(table.sample(at(28)), Rgba8::opaque(0xB3, 0x7B, 0x36)); // ~46 dBZ  '#B37B36'
+        assert_eq!(table.sample(at(38)), Rgba8::opaque(0xF2, 0x46, 0x5B)); // 70 dBZ   '#F2465B'
+    }
+
+    /// Hexes: GurtV3.3.py lines 1180-1186 (`gurt_vel`); range ±30 m/s from
+    /// FIELD_DEFAULTS "VEL" (line 1262).
+    #[test]
+    fn gurt_velocity_matches_upstream_anchors() {
+        let table = gurt_velocity_table();
+        assert!(table.interpolates());
+        assert_eq!(table.stops().len(), 39);
+        let at = |index| anchor(-30.0, 30.0, 39, index);
+        assert_eq!(table.sample(at(0)), Rgba8::opaque(0x78, 0x05, 0xA3)); // -30 m/s   '#7805A3'
+        assert_eq!(table.sample(at(9)), Rgba8::opaque(0x30, 0x85, 0x5F)); // ~-15.8    '#30855F'
+        assert_eq!(table.sample(0.0), Rgba8::opaque(0xD0, 0xE4, 0xD0)); // 0 m/s      '#D0E4D0'
+        assert_eq!(table.sample(at(28)), Rgba8::opaque(0xB3, 0x7B, 0x36)); // ~14.2    '#B37B36'
+        assert_eq!(table.sample(at(38)), Rgba8::opaque(0xF2, 0x46, 0x5B)); // 30 m/s   '#F2465B'
+    }
+
+    /// Range ±60 m/s from FIELD_DEFAULTS "VELD" (GurtV3.3.py line 1265);
+    /// same `gurt_vel` hexes (lines 1180-1186) on the doubled scale.
+    #[test]
+    fn gurt_velocity_dealiased_matches_upstream_anchors() {
+        let table = gurt_velocity_dealiased_table();
+        assert!(table.interpolates());
+        assert_eq!(table.stops().len(), 39);
+        let at = |index| anchor(-60.0, 60.0, 39, index);
+        assert_eq!(table.sample(at(0)), Rgba8::opaque(0x78, 0x05, 0xA3)); // -60 m/s   '#7805A3'
+        assert_eq!(table.sample(at(9)), Rgba8::opaque(0x30, 0x85, 0x5F)); // ~-31.6    '#30855F'
+        assert_eq!(table.sample(0.0), Rgba8::opaque(0xD0, 0xE4, 0xD0)); // 0 m/s      '#D0E4D0'
+        assert_eq!(table.sample(at(28)), Rgba8::opaque(0xB3, 0x7B, 0x36)); // ~28.4    '#B37B36'
+        assert_eq!(table.sample(at(38)), Rgba8::opaque(0xF2, 0x46, 0x5B)); // 60 m/s   '#F2465B'
+    }
+
+    /// Hexes: GurtV3.3.py lines 1176-1179 (`gurt_sw`); range 0..15 m/s from
+    /// FIELD_DEFAULTS "SW" (line 1275).
+    #[test]
+    fn gurt_spectrum_width_matches_upstream_anchors() {
+        let table = gurt_spectrum_width_table();
+        assert!(table.interpolates());
+        assert_eq!(table.stops().len(), 21);
+        assert_eq!(table.sample(0.0), Rgba8::opaque(0x1A, 0x08, 0x55)); // 0 m/s      '#1A0855'
+        assert_eq!(table.sample(3.75), Rgba8::opaque(0xE5, 0x4F, 0x5B)); // 3.75 m/s  '#E54F5B'
+        assert_eq!(table.sample(7.5), Rgba8::opaque(0xFD, 0xC6, 0x0F)); // 7.5 m/s    '#FDC60F'
+        assert_eq!(table.sample(11.25), Rgba8::opaque(0xC1, 0xC1, 0xC1)); // 11.25    '#C1C1C1'
+        assert_eq!(table.sample(15.0), Rgba8::opaque(0x02, 0xA0, 0xC8)); // 15 m/s    '#02A0C8'
+    }
+
+    /// Hexes: GurtV3.3.py lines 1167-1170 (`gurt_cc`); range 0..1 from
+    /// FIELD_DEFAULTS "RHOHV" (line 1267).
+    #[test]
+    fn gurt_correlation_coefficient_matches_upstream_anchors() {
+        let table = gurt_correlation_coefficient_table();
+        assert!(table.interpolates());
+        assert_eq!(table.stops().len(), 20);
+        let at = |index| anchor(0.0, 1.0, 20, index);
+        assert_eq!(table.sample(at(0)), Rgba8::opaque(0x4F, 0x4F, 0x4F)); // 0.0      '#4F4F4F'
+        assert_eq!(table.sample(at(5)), Rgba8::opaque(0x0F, 0x0F, 0x8C)); // ~0.26    '#0F0F8C'
+        assert_eq!(table.sample(at(9)), Rgba8::opaque(0x29, 0x29, 0xD1)); // ~0.47    '#2929D1'
+        assert_eq!(table.sample(at(14)), Rgba8::opaque(0xBC, 0xE9, 0x06)); // ~0.74   '#BCE906'
+        assert_eq!(table.sample(at(19)), Rgba8::opaque(0x8B, 0x1E, 0x4D)); // 1.0     '#8B1E4D'
+    }
+
+    /// Hexes: GurtV3.3.py lines 1163-1166 (`gurt_zdr`); range -2..8 dB from
+    /// FIELD_DEFAULTS "ZDR" (line 1266).
+    #[test]
+    fn gurt_differential_reflectivity_matches_upstream_anchors() {
+        let table = gurt_differential_reflectivity_table();
+        assert!(table.interpolates());
+        assert_eq!(table.stops().len(), 22);
+        let at = |index| anchor(-2.0, 8.0, 22, index);
+        assert_eq!(table.sample(at(0)), Rgba8::opaque(0x06, 0x05, 0x07)); // -2 dB    '#060507'
+        assert_eq!(table.sample(at(5)), Rgba8::opaque(0x0B, 0x0D, 0x9C)); // ~0.38    '#0B0D9C'
+        assert_eq!(table.sample(at(10)), Rgba8::opaque(0xEE, 0x88, 0x36)); // ~2.76   '#EE8836'
+        assert_eq!(table.sample(at(16)), Rgba8::opaque(0xF8, 0xBE, 0xDB)); // ~5.62   '#F8BEDB'
+        assert_eq!(table.sample(at(21)), Rgba8::opaque(0x92, 0x2E, 0x97)); // 8 dB    '#922E97'
+    }
+
+    /// Hexes: GurtV3.3.py lines 1171-1175 (`gurt_kdp`); range -2..12 °/km
+    /// from FIELD_DEFAULTS "KDP" (line 1268).
+    #[test]
+    fn gurt_specific_differential_phase_matches_upstream_anchors() {
+        let table = gurt_specific_differential_phase_table();
+        assert!(table.interpolates());
+        assert_eq!(table.stops().len(), 27);
+        let at = |index| anchor(-2.0, 12.0, 27, index);
+        assert_eq!(table.sample(at(0)), Rgba8::opaque(0x75, 0x75, 0x75)); // -2 °/km  '#757575'
+        assert_eq!(table.sample(at(6)), Rgba8::opaque(0x75, 0x02, 0x1B)); // ~1.23    '#75021B'
+        assert_eq!(table.sample(5.0), Rgba8::opaque(0x74, 0xC7, 0xD1)); // 5 °/km    '#74C7D1'
+        assert_eq!(table.sample(at(20)), Rgba8::opaque(0xFF, 0x7B, 0x00)); // ~8.77   '#FF7B00'
+        assert_eq!(table.sample(at(26)), Rgba8::opaque(0xC3, 0x61, 0xF9)); // 12 °/km '#C361F9'
+    }
+
+    /// Upstream defines `gurt_ref` (GurtV3.3.py lines 1187-1193) and
+    /// `gurt_vel` (lines 1180-1186) with byte-identical hex lists; only the
+    /// field range differs.
+    #[test]
+    fn gurt_reflectivity_shares_the_velocity_ramp() {
+        let reflectivity = gurt_reflectivity_table();
+        let velocity = gurt_velocity_table();
+        for (ref_stop, vel_stop) in reflectivity.stops().iter().zip(velocity.stops()) {
+            assert_eq!(ref_stop.color, vel_stop.color);
+        }
+    }
+
+    /// FIELD_DEFAULTS "VELD" (±60) is exactly the "VEL" scale (±30) doubled.
+    #[test]
+    fn gurt_velocity_dealiased_doubles_the_native_scale() {
+        let native = gurt_velocity_table();
+        let dealiased = gurt_velocity_dealiased_table();
+        for (n, d) in native.stops().iter().zip(dealiased.stops()) {
+            assert_eq!(n.color, d.color);
+            assert_eq!(d.value, n.value * 2.0);
+        }
+    }
+
+    /// Out-of-range values clamp to the end anchors, matching matplotlib's
+    /// over/under behavior for `from_list` colormaps.
+    #[test]
+    fn gurt_tables_clamp_like_matplotlib() {
+        let table = gurt_velocity_table();
+        assert_eq!(table.sample(-90.0), Rgba8::opaque(0x78, 0x05, 0xA3));
+        assert_eq!(table.sample(90.0), Rgba8::opaque(0xF2, 0x46, 0x5B));
     }
 }
 

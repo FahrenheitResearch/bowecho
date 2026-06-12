@@ -1,5 +1,6 @@
 //! Public radar data-source helpers.
 
+pub mod community_feeds;
 mod embedded_sites;
 pub mod international;
 
@@ -19,7 +20,12 @@ pub const LEVEL2_ARCHIVE_BUCKET: &str = "unidata-nexrad-level2";
 pub const LEVEL2_CHUNKS_BUCKET: &str = "unidata-nexrad-level2-chunks";
 const HTTP_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(4);
 const HTTP_METADATA_TIMEOUT: StdDuration = StdDuration::from_secs(8);
-const HTTP_DOWNLOAD_TIMEOUT: StdDuration = StdDuration::from_secs(45);
+/// Whole-request budget on the download client. Field report: SMHI qcvol
+/// volumes run 17-18 MB and a user on a slow link hit the old 45 s budget
+/// MID-BODY every tick (surfacing as reqwest's cryptic "error decoding
+/// response body"). 180 s admits ~120 KB/s links; pathological hangs
+/// occupy only a background poll thread.
+const HTTP_DOWNLOAD_TIMEOUT: StdDuration = StdDuration::from_secs(180);
 const HTTP_USER_AGENT: &str = "bowecho (GR2Analyst-compatible placefile client)";
 const REALTIME_VOLUME_ID_MODULUS: u16 = 1000;
 const REALTIME_CHUNK_LIST_MAX_KEYS: usize = 1000;
@@ -133,7 +139,11 @@ pub struct RealtimeLevel2Volume {
 
 #[derive(Debug, Error)]
 pub enum DataSourceError {
-    #[error("HTTP request failed: {0}")]
+    // Full cause chain: reqwest's top-level Display hides the source, so
+    // field statuses read "error decoding response body" when the actual
+    // cause was a mid-body timeout, or "error sending request" when DNS
+    // or a reset connection was at fault.
+    #[error("HTTP request failed: {}", reqwest_error_chain(.0))]
     Http(#[from] reqwest::Error),
     #[error("S3 XML parse failed: {0}")]
     Xml(#[from] quick_xml::DeError),
@@ -283,11 +293,24 @@ pub fn fetch_weather_gov_radar_sites() -> Result<Vec<RadarSite>> {
 }
 
 pub fn fetch_text(url: &str) -> Result<String> {
-    Ok(metadata_http_client()
-        .get(url)
-        .send()?
+    Ok(send_with_retry(&metadata_http_client(), url)?
         .error_for_status()?
         .text()?)
+}
+
+/// One GET with a single immediate retry on SEND-stage failures (the
+/// stale-pooled-connection class: the server closed an idle keep-alive
+/// and the first reuse fails before any response). Status and body
+/// errors are NOT retried — they are real answers.
+fn send_with_retry(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> std::result::Result<reqwest::blocking::Response, reqwest::Error> {
+    match client.get(url).send() {
+        Ok(response) => Ok(response),
+        Err(first) if first.is_status() || first.is_body() || first.is_decode() => Err(first),
+        Err(_transient) => client.get(url).send(),
+    }
 }
 
 /// Fetch a large catalog/listing text resource on the download client.
@@ -298,9 +321,7 @@ pub fn fetch_text(url: &str) -> Result<String> {
 /// [`fetch_text`] on a slow link. Listings still must complete within the
 /// 45-second download budget.
 pub fn fetch_listing_text(url: &str) -> Result<String> {
-    Ok(download_http_client()
-        .get(url)
-        .send()?
+    Ok(send_with_retry(&download_http_client(), url)?
         .error_for_status()?
         .text()?)
 }
@@ -341,14 +362,13 @@ pub fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
 }
 
 /// Fetch a radar volume from a polled feed. Volumes run 5–25 MB
-/// (compressed NEXRAD or uncompressed msg31 conversions), so this uses
-/// the download client (long timeout) with a generous cap — unlike
-/// `fetch_bytes`, which is sized for sprite sheets on the metadata
-/// client and rejects anything over 4 MiB.
+/// (compressed NEXRAD or uncompressed msg31 conversions; international
+/// ODIM PVOLs reach ~18 MB), so this uses the download client (long
+/// timeout) with a generous cap — unlike `fetch_bytes`, which is sized
+/// for sprite sheets on the metadata client and rejects anything over
+/// 4 MiB.
 pub fn fetch_volume_bytes(url: &str) -> Result<Vec<u8>> {
-    let bytes = download_http_client()
-        .get(url)
-        .send()?
+    let bytes = send_with_retry(&download_http_client(), url)?
         .error_for_status()?
         .bytes()?;
     const MAX: usize = 256 * 1024 * 1024;
@@ -359,6 +379,23 @@ pub fn fetch_volume_bytes(url: &str) -> Result<Vec<u8>> {
         )));
     }
     Ok(bytes.to_vec())
+}
+
+/// reqwest's Display drops the cause ("error decoding response body" with
+/// the timeout hidden in source()) — join the whole chain for status text.
+fn reqwest_error_chain(err: &reqwest::Error) -> String {
+    use std::error::Error as _;
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !text.contains(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    text
 }
 
 pub fn fetch_level2_radar_sites(days_back: i64) -> Result<Vec<RadarSite>> {
@@ -1091,6 +1128,11 @@ fn build_http_client(timeout: StdDuration) -> Result<reqwest::blocking::Client> 
     let mut builder = reqwest::blocking::Client::builder()
         .user_agent(HTTP_USER_AGENT)
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        // Below S3's ~20 s idle close: the pollers tick every 60 s, so a
+        // pooled keep-alive from the previous tick is ALWAYS stale by S3's
+        // rules and reusing it fails the send (field report: FMI listing
+        // "error sending request" every tick).
+        .pool_idle_timeout(StdDuration::from_secs(15))
         .timeout(timeout);
     // Extra trust anchor for AIA-incomplete servers (see the constant's
     // docs). Skipped, never fatal, if the embedded PEM fails to parse.

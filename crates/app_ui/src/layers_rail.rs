@@ -14,9 +14,9 @@ use std::time::Instant;
 use eframe::egui;
 
 use crate::{
-    KNOWN_POLL_FEEDS, LayerRowGear, LayerRowOpacity, LayerRowOrder, LayerRowRemove, LayerRowSpec,
-    LayerRowVis, PlacefileSlot, PollSource, RadarSite, SidebarTab, ViewerApp, dock,
-    format_site_label, intl_provider_label, layer_row, mesoanalysis, oa_derived,
+    LayerRowGear, LayerRowOpacity, LayerRowOrder, LayerRowRemove, LayerRowSpec, LayerRowVis,
+    PlacefileSlot, PollSource, RadarSite, SidebarTab, ViewerApp, dock, format_site_label,
+    intl_provider_label, layer_row, mesoanalysis, oa_derived,
 };
 
 impl ViewerApp {
@@ -423,11 +423,11 @@ impl ViewerApp {
                 LayerRowSpec {
                     vis: LayerRowVis::Toggle {
                         value: &mut self.obs_enabled,
-                        hover: "METAR station plots: temperature/dewpoint (°F), wind barbs, gusts — every reporting station, refreshed ~5 min",
+                        hover: "METAR station plots: temperature/dewpoint (units per Settings ▸ Display), wind barbs, gusts — every reporting station, refreshed ~5 min",
                     },
                     name: "Surface obs",
                     name_width: crate::NAME_W_STD,
-                    name_hover: "METAR station plots: temperature/dewpoint (°F), wind barbs, gusts — every reporting station, refreshed ~5 min",
+                    name_hover: "METAR station plots: temperature/dewpoint (units per Settings ▸ Display), wind barbs, gusts — every reporting station, refreshed ~5 min",
                     gear: Some(LayerRowGear::Menu {
                         hover: "Networks: METAR · Mesonet · obs-adjusted soundings",
                         content: Box::new(|ui| {
@@ -942,25 +942,40 @@ impl ViewerApp {
                     );
                     ui.menu_button("Feeds ▾", |ui| {
                         ui.weak("research radars serving raw Level II");
-                        for (label, url) in KNOWN_POLL_FEEDS {
-                            if ui.button(*label).clicked() {
-                                self.poll_url = (*url).to_owned();
-                                self.set_custom_url_poll_source();
-                                self.poll_active = true;
-                                self.poll_last_file = None;
-                                self.poll_next = None;
-                                // An auto-refresh load already in flight
-                                // would land AFTER the first poll install
-                                // and wipe the polled frames — drop it.
-                                self.load_receiver = None;
-                                self.app_settings.poll_url = self.poll_url.clone();
-                                let _ = self.app_settings.save();
-                            }
-                        }
+                        // Grown from the same community table the map
+                        // markers draw from, grouped by state — menu and
+                        // markers stay in lockstep by construction.
+                        let feeds = data_source::community_feeds::community_feeds();
+                        let mut states: Vec<&'static str> =
+                            feeds.iter().map(|feed| feed.state).collect();
+                        states.sort_unstable();
+                        states.dedup();
+                        egui::ScrollArea::vertical()
+                            .id_salt("community_feed_menu_list")
+                            .max_height(340.0)
+                            .show(ui, |ui| {
+                                for (index, state) in states.iter().enumerate() {
+                                    if index > 0 {
+                                        ui.separator();
+                                    }
+                                    ui.weak(*state);
+                                    for feed in
+                                        feeds.iter().filter(|feed| feed.state == *state)
+                                    {
+                                        if ui
+                                            .button(format!("{} — {}", feed.id, feed.label))
+                                            .clicked()
+                                        {
+                                            self.start_known_feed_poll(feed.poll_url);
+                                            ui.close();
+                                        }
+                                    }
+                                }
+                            });
                     })
                     .response
                     .on_hover_text(
-                        "Community research-radar poll roots (IEM Level II host + self-hosted university radars) — radars that aren't NEXRAD sites",
+                        "Community research-radar poll roots (IEM Level II host, ND State Water Commission, self-hosted university radars) — radars that aren't NEXRAD sites. Community-contributed catalog; the same sites are click-to-poll teal markers on the map.",
                     );
                     let label = if self.poll_active { "Stop" } else { "Start" };
                     if ui.button(label).clicked() {
@@ -988,6 +1003,22 @@ impl ViewerApp {
                     }
                 });
         self.intl_feeds_row(ui, ctx);
+    }
+
+    /// Start the shared poller on a known research-feed poll root — the
+    /// Feeds-menu click path, reused verbatim by the community map
+    /// markers so there is exactly one custom-URL start sequence.
+    pub(crate) fn start_known_feed_poll(&mut self, url: &str) {
+        self.poll_url = url.to_owned();
+        self.set_custom_url_poll_source();
+        self.poll_active = true;
+        self.poll_last_file = None;
+        self.poll_next = None;
+        // An auto-refresh load already in flight would land AFTER the
+        // first poll install and wipe the polled frames — drop it.
+        self.load_receiver = None;
+        self.app_settings.poll_url = self.poll_url.clone();
+        let _ = self.app_settings.save();
     }
 
     /// Point the shared poller at the URL text field (the custom-URL

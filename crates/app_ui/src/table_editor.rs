@@ -86,6 +86,7 @@ fn badge_color(badge: Badge) -> egui::Color32 {
         Badge::Classic => egui::Color32::from_rgb(158, 158, 158),
         Badge::Smooth => egui::Color32::from_rgb(176, 136, 224),
         Badge::HighContrast => egui::Color32::from_rgb(224, 166, 78),
+        Badge::Research => egui::Color32::from_rgb(118, 196, 98),
     }
 }
 

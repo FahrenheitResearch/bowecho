@@ -361,7 +361,9 @@ impl ViewerApp {
         let frame_tx = spawn_loop_encoder(LoopEncodeJob {
             format,
             max_width: self.media.record_size.max_width(),
-            frame_delay_ms: crate::HISTORY_LOOP_FRAME_MS as u32,
+            // The persisted loop speed: a recording plays back at exactly
+            // the on-screen cadence (field request: speed control).
+            frame_delay_ms: self.loop_frame_ms() as u32,
             out_path: path,
             result_tx: self.media.result_tx.clone(),
             repaint_ctx: ctx.clone(),

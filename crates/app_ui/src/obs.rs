@@ -6,10 +6,11 @@
 //! pipeline (github.com/FahrenheitResearch/hrrr-mesoanalysis); the IEM
 //! multi-network mesonet density (currents.json) is the planned v1.5.
 //!
-//! Plots draw GR2A-style: temperature (°F, red) upper-left, dewpoint
-//! (°F, green) lower-left, wind barb at the station, gusts as "G##",
-//! station id at high zoom. A screen-grid declutter keeps roughly one
-//! station per cell, preferring fuller reports.
+//! Plots draw GR2A-style: temperature (red) upper-left, dewpoint
+//! (green) lower-left — °F, or °C when Settings ▸ Display ▸ Units is
+//! Metric — wind barb at the station, gusts as "G##", station id at
+//! high zoom. A screen-grid declutter keeps roughly one station per
+//! cell, preferring fuller reports.
 
 use chrono::{DateTime, Utc};
 use std::io::Read;

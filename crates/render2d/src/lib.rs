@@ -12,6 +12,7 @@ mod cascade;
 mod cells;
 mod detect;
 mod gate_filter;
+mod interpolate;
 mod rhi;
 mod shear;
 mod smooth;
@@ -26,6 +27,11 @@ pub use detect::{
 };
 pub use gate_filter::apply_reflectivity_gate_filter;
 use image::{ImageBuffer, ImageError, Rgba};
+pub use interpolate::{
+    INTERP_MAX_FACTOR, INTERP_MAX_GRID_BYTES, INTERP_TARGET_AZIMUTH_DEG,
+    INTERP_TARGET_GATE_SPACING_M, InterpolatedGrid, UpsampleFactors, upsample_factors,
+    upsample_moment_grid,
+};
 use radar_core::{
     ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, ProductId, RadarVolume,
 };
@@ -703,6 +709,42 @@ impl ViewportMomentCache {
             cut_index,
             moment: grid.moment.clone(),
             row_lookup: AzimuthLookup::new(cut, &grid),
+            color_lookup: CachedColorLookup::new_for_family(&grid, color_tables, family),
+            storm_motion_basis: None,
+            dealiased_grid: Some(grid),
+        })
+    }
+
+    /// Build a cache around a display grid whose ROWS are synthetic — the
+    /// interpolated (bilinear-upsampled) grid from `upsample_moment_grid`.
+    /// Unlike `new_derived`, the azimuth lookup comes from the grid's own
+    /// per-row azimuths instead of the cut's radials (the grid has more
+    /// rows than the sweep). Renders through the same fast path.
+    pub fn new_resampled(
+        volume: &RadarVolume,
+        cut_index: usize,
+        grid: MomentGrid,
+        row_azimuths_deg: &[f32],
+        family: ColorTableFamily,
+        color_tables: &ColorTableSet,
+    ) -> Result<Self> {
+        if cut_index >= volume.cuts.len() {
+            return Err(RenderError::CutOutOfRange {
+                index: cut_index,
+                cut_count: volume.cuts.len(),
+            });
+        }
+        if grid.radial_indices.is_empty() || row_azimuths_deg.len() != grid.radial_count() {
+            return Err(RenderError::EmptyMoment {
+                cut_index,
+                moment: grid.moment.clone(),
+            });
+        }
+        Ok(Self {
+            volume_ptr: volume as *const RadarVolume as usize,
+            cut_index,
+            moment: grid.moment.clone(),
+            row_lookup: AzimuthLookup::from_row_azimuths(row_azimuths_deg, &grid),
             color_lookup: CachedColorLookup::new_for_family(&grid, color_tables, family),
             storm_motion_basis: None,
             dealiased_grid: Some(grid),
@@ -3674,12 +3716,33 @@ struct AzimuthLookup {
 
 impl AzimuthLookup {
     fn new(cut: &ElevationCut, grid: &MomentGrid) -> Self {
+        Self::from_row_azimuths_iter(
+            grid,
+            grid.radial_indices
+                .iter()
+                .enumerate()
+                .filter_map(|(row, radial_index)| {
+                    cut.radials
+                        .get(*radial_index)
+                        .map(|radial| (row, radial.azimuth_deg))
+                }),
+        )
+    }
+
+    /// Lookup for a grid whose rows do NOT correspond to cut radials —
+    /// the interpolated display grid carries its own synthetic per-row
+    /// azimuths (one entry per grid row).
+    fn from_row_azimuths(row_azimuths_deg: &[f32], grid: &MomentGrid) -> Self {
+        Self::from_row_azimuths_iter(grid, row_azimuths_deg.iter().copied().enumerate())
+    }
+
+    fn from_row_azimuths_iter(
+        grid: &MomentGrid,
+        row_azimuths: impl Iterator<Item = (usize, f32)>,
+    ) -> Self {
         let mut groups = vec![None; AZIMUTH_BINS];
-        for (row, radial_index) in grid.radial_indices.iter().enumerate() {
-            let Some(radial) = cut.radials.get(*radial_index) else {
-                continue;
-            };
-            let azimuth = radial.azimuth_deg.rem_euclid(360.0);
+        for (row, azimuth_deg) in row_azimuths {
+            let azimuth = azimuth_deg.rem_euclid(360.0);
             let bin = azimuth_bin(azimuth);
             let group = groups[bin].get_or_insert_with(|| AzimuthGroup {
                 azimuth: bin as f32 * AZIMUTH_BIN_WIDTH_DEG,

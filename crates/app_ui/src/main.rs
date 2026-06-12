@@ -17,9 +17,9 @@ use render2d::{
     composite_reflectivity_grid, dealias_velocity_grid, dealias_velocity_grid_cascade,
     detect_rotation_sites, echo_top_grid, gust_proxy_grid, hail_grids, identify_storm_cells,
     marc_grid, mehs_grid, poh_grid, radial_divergence_grid, reflectivity_cross_section,
-    smooth_moment_grid, storm_relative_velocity_mps, velocity_cross_section_cached,
-    viewport_rgba_buffer_len, viewport_sample_cache_storage_upper_bound, vil_density_grid,
-    vil_grid,
+    smooth_moment_grid, storm_relative_velocity_mps, upsample_moment_grid,
+    velocity_cross_section_cached, viewport_rgba_buffer_len,
+    viewport_sample_cache_storage_upper_bound, vil_density_grid, vil_grid,
 };
 use serde::Deserialize;
 
@@ -28,6 +28,7 @@ mod basemap_data;
 mod basemap_towns;
 mod dock;
 mod farm_live;
+mod fonts;
 mod glm_layer;
 mod guide;
 mod ingest_worker;
@@ -49,6 +50,7 @@ mod table_editor;
 mod tiles;
 mod tor_tracks;
 mod ui_theme;
+mod units;
 mod vol3d;
 mod wofs;
 mod wofs_georef;
@@ -89,6 +91,36 @@ const DEFAULT_HISTORY_FRAME_LIMIT: usize = 7;
 /// load 100+ volumes.
 const MAX_HISTORY_FRAME_LIMIT: usize = 200;
 const HISTORY_LOOP_FRAME_MS: u64 = 700;
+/// Loop-speed picker steps, percent of the 700 ms baseline (¼× … 4×).
+const LOOP_SPEED_PERCENT_OPTIONS: &[u16] = &[25, 50, 75, 100, 150, 200, 300, 400];
+
+/// What a lowest-beam menu pick switches to (the ranking spans every
+/// pollable family, so the action differs per family).
+#[derive(Clone, Debug, PartialEq)]
+enum BeamTarget {
+    /// CONUS catalog index — select the site + load latest Level II.
+    Conus(usize),
+    /// International provider site — starts its live poll.
+    Intl {
+        provider_id: String,
+        site_id: String,
+    },
+    /// US community research feed — starts its custom-URL poll.
+    Research { url: String },
+}
+
+/// One row of the lowest-beam ranking.
+#[derive(Clone, Debug)]
+struct BeamCandidate {
+    target: BeamTarget,
+    /// Row head: site id (CONUS) or site/marker label.
+    label: String,
+    /// Weak provenance suffix for non-CONUS rows ("SMHI Sweden",
+    /// "research feed"); None for the home catalog.
+    origin: Option<String>,
+    beam_m: f32,
+    distance_km: f32,
+}
 const LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG: f32 = 1.0;
 const LIVE_LOW_LEVEL_AUTO_ADVANCE_MIN_SECONDS: i64 = 90;
 const LIVE_COMPLETE_LOW_LEVEL_TILT_MIN_RADIALS: usize = 720;
@@ -96,33 +128,6 @@ const LIVE_COMPLETE_TILT_MIN_RADIALS: usize = 360;
 const LIVE_COMPLETE_TILT_MIN_AZIMUTH_COVERAGE_DEG: f32 = 350.0;
 const HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM: usize = 6;
 
-/// Research-radar GR2A poll roots serving raw Level II (msg31) — the
-/// radars that DON'T exist in the NEXRAD site list. Iowa Environmental
-/// Mesonet's community Level II host + self-hosted university radars;
-/// all verified live 2026-06-11. NEXRAD itself loads natively from S3,
-/// so these presets cover only what S3 can't.
-const KNOWN_POLL_FEEDS: &[(&str, &str)] = &[
-    (
-        "WILU — Western Illinois Univ.",
-        "https://mesonet-nexrad.agron.iastate.edu/level2/raw/WILU",
-    ),
-    (
-        "FWLX — Furuno (Lawrenceburg TN)",
-        "https://mesonet-nexrad.agron.iastate.edu/level2/raw/FWLX",
-    ),
-    (
-        "FUSA — Furuno (Delmarva, 1-min)",
-        "https://mesonet-nexrad.agron.iastate.edu/level2/raw/FUSA",
-    ),
-    (
-        "MZZU — Univ. of Missouri",
-        "https://mesonet-nexrad.agron.iastate.edu/level2/raw/MZZU",
-    ),
-    (
-        "GAWX — Georgia (intermittent)",
-        "https://mesonet-nexrad.agron.iastate.edu/level2/raw/GAWX",
-    ),
-];
 /// International catalog-poll cadence. National open-data feeds publish on
 /// 5-minute-ish schedules and each tick costs an upstream API round trip —
 /// 60 s, not the custom URL poll's 15 s dir.list cadence.
@@ -677,9 +682,10 @@ struct ViewerApp {
     /// tilt-cascade (vertical-reference branch selection; helps on VCPs whose
     /// upper tilts are unaliased — see docs/dealias-fold-branch-analysis.md).
     dealias_cascade: bool,
-    /// GR2-style display smoothing (polar-grid binomial kernel, worker-side,
-    /// cached). Off by default — native super-res is the app's identity.
-    display_smoothing: bool,
+    /// Display smoothing mode (worker-side, cached): Native (default —
+    /// super-res gates are the app's identity), Soften (GR2-style polar
+    /// binomial kernel), or Interpolated (bilinear polar upsampling).
+    display_smoothing: SmoothingMode,
     /// Hail environment for the Witt et al. 1998 MEHS product: melting-level
     /// and -20C heights above the radar, in km (set from a sounding).
     hail_freezing_level_km: f32,
@@ -808,6 +814,11 @@ struct ViewerApp {
     intl_picker_provider: String,
     intl_sites: Option<Vec<data_source::international::IntlSite>>,
     intl_sites_rx: Option<mpsc::Receiver<IntlSiteListResult>>,
+    /// Community research-feed cluster picker: the marker index (into
+    /// [`data_source::community_feeds::community_markers`]) whose stacked
+    /// feeds are listed in a small map menu — the Norman Testbed marker,
+    /// where eight feeds share one pad. `None`: no picker open.
+    community_menu: Option<usize>,
     /// SPC outlooks + live storm reports.
     spc_data: spc_layers::SpcData,
     spc_outlooks_enabled: Vec<String>,
@@ -1832,9 +1843,10 @@ struct RenderRequest {
     color_tables: ColorTableSet,
     storm_motion: StormMotion,
     hail_levels_m: (f32, f32),
-    /// Display smoothing: the worker smooths the polar grid once (cached) and
-    /// renders it through the unchanged fast path.
-    smoothed: bool,
+    /// Display smoothing: the worker preprocesses the polar grid once
+    /// (cached) — binomial soften or bilinear upsample — and renders it
+    /// through the unchanged fast path.
+    smoothing: SmoothingMode,
     /// Velocity dealias engine (false = region, true = tilt-cascade).
     dealias_cascade: bool,
     /// Gate filter threshold in deci-dBZ; i16::MIN = off.
@@ -2039,7 +2051,7 @@ struct RenderWorkerMomentCache {
     moment: MomentType,
     dealiased_velocity: bool,
     derived: Option<DerivedProduct>,
-    smoothed: bool,
+    smoothing: SmoothingMode,
     dealias_cascade: bool,
     gate_filter_decidbz: i16,
     color_table_signature: u64,
@@ -2221,7 +2233,7 @@ struct RenderWorkerViewportSignature {
     color_table_signature: u64,
     storm_motion_key: (i16, i16),
     hail_levels_key: (i16, i16),
-    smoothed: bool,
+    smoothing: SmoothingMode,
     dealias_cascade: bool,
     gate_filter_decidbz: i16,
     viewport: ViewportKey,
@@ -2238,7 +2250,7 @@ impl RenderWorkerViewportSignature {
         color_table_signature: u64,
         storm_motion_key: (i16, i16),
         hail_levels_key: (i16, i16),
-        smoothed: bool,
+        smoothing: SmoothingMode,
         dealias_cascade: bool,
         gate_filter_decidbz: i16,
         viewport: ViewportKey,
@@ -2252,7 +2264,7 @@ impl RenderWorkerViewportSignature {
             color_table_signature,
             storm_motion_key,
             hail_levels_key,
-            smoothed,
+            smoothing,
             dealias_cascade,
             gate_filter_decidbz,
             viewport,
@@ -2267,6 +2279,11 @@ struct RenderWorkerSampleCacheSignature {
     product: DisplayProduct,
     moment: MomentType,
     dealiased_velocity: bool,
+    /// Sample caches map pixels → (row, gate) of the displayed grid:
+    /// native and soften share them (the binomial pass preserves geometry
+    /// AND coverage by design), but the interpolated grid has different
+    /// geometry, so its caches must never be confused with native ones.
+    interpolated_grid: bool,
     viewport: ViewportKey,
 }
 
@@ -2277,6 +2294,7 @@ impl RenderWorkerSampleCacheSignature {
         product: DisplayProduct,
         moment: MomentType,
         dealiased_velocity: bool,
+        smoothing: SmoothingMode,
         viewport: ViewportKey,
     ) -> Self {
         Self {
@@ -2285,6 +2303,7 @@ impl RenderWorkerSampleCacheSignature {
             product,
             moment,
             dealiased_velocity,
+            interpolated_grid: smoothing.changes_grid_geometry(),
             viewport,
         }
     }
@@ -2350,7 +2369,7 @@ fn spawn_render_worker_with_mode(
                 request.key.color_table_signature,
                 request.key.storm_motion_key,
                 request.key.hail_levels_key,
-                request.key.smoothed,
+                request.key.smoothing,
                 request.key.dealias_cascade,
                 request.key.gate_filter_decidbz,
                 request.key.viewport,
@@ -2702,6 +2721,9 @@ fn sidebar_tab_tooltip(tab: SidebarTab) -> &'static str {
 impl ViewerApp {
     fn new(cc: &eframe::CreationContext<'_>, source_path: Option<PathBuf>) -> Self {
         configure_style(&cc.egui_ctx);
+        // CJK fallback before the first frame: Japanese site names render
+        // as glyphs, not tofu (appended LAST — Latin text is untouched).
+        fonts::install_cjk_fallback(&cc.egui_ctx);
         // Volume Explorer GPU resources (pipeline + textures) — once,
         // the eframe custom-3D pattern.
         if let Some(render_state) = cc.wgpu_render_state.as_ref() {
@@ -2839,7 +2861,7 @@ impl ViewerApp {
             tor_tracks: tor_tracks::TorTracksState::default(),
             gate_filter_dbz: None,
             dealias_cascade: false,
-            display_smoothing: false,
+            display_smoothing: SmoothingMode::Native,
             hail_freezing_level_km: 3.2,
             hail_minus20_level_km: 6.4,
             display_thresholds: BTreeMap::new(),
@@ -2894,6 +2916,7 @@ impl ViewerApp {
             intl_picker_provider: restored_intl_provider,
             intl_sites: None,
             intl_sites_rx: None,
+            community_menu: None,
             poll_url: restored_poll_url,
             poll_active: false,
             poll_last_file: None,
@@ -2992,6 +3015,7 @@ impl ViewerApp {
         app.basemap_style = restored_basemap_style;
         app.bold_labels = restored_bold_labels;
         app.gate_filter_dbz = restored_gate_filter_dbz;
+        app.display_smoothing = SmoothingMode::from_settings(&app.app_settings);
         app.restore_workspace_layout();
         // Palette persistence: scan My tables (user .pal files copied into
         // the config dir), then resolve the saved family bindings and
@@ -3671,9 +3695,10 @@ impl ViewerApp {
         if !self.history_playing || self.frame_history.len() <= 1 {
             return;
         }
-        let should_step = self.last_history_step.is_none_or(|last_step| {
-            last_step.elapsed() >= Duration::from_millis(HISTORY_LOOP_FRAME_MS)
-        });
+        let frame_ms = self.loop_frame_ms();
+        let should_step = self
+            .last_history_step
+            .is_none_or(|last_step| last_step.elapsed() >= Duration::from_millis(frame_ms));
         if should_step {
             let next_index = (self.selected_frame_index + 1) % self.frame_history.len();
             self.last_history_step = Some(Instant::now());
@@ -4455,7 +4480,7 @@ impl ViewerApp {
             color_tables.signature_for_family(self.selected_product.color_family());
         let render_dealiased_velocity =
             self.product_render_uses_dealiased_velocity(&self.selected_product);
-        let smoothed = self.smoothing_for_product(&self.selected_product);
+        let smoothing = self.smoothing_for_product(&self.selected_product);
         let key = TextureKey {
             volume_ptr: Arc::as_ptr(&volume) as usize,
             cut: self.selected_cut,
@@ -4464,7 +4489,7 @@ impl ViewerApp {
             color_table_signature,
             storm_motion_key: self.storm_motion_key(),
             hail_levels_key: self.hail_levels_key(),
-            smoothed,
+            smoothing,
             dealias_cascade: self.dealias_cascade,
             gate_filter_decidbz: self.gate_filter_key(),
             viewport: viewport_key,
@@ -4489,7 +4514,7 @@ impl ViewerApp {
                 color_tables,
                 storm_motion: self.current_storm_motion(),
                 hail_levels_m: self.hail_levels_m(),
-                smoothed,
+                smoothing,
                 dealias_cascade: self.dealias_cascade,
                 gate_filter_decidbz: self.gate_filter_key(),
                 viewport_options,
@@ -4534,8 +4559,12 @@ impl ViewerApp {
 
     /// Smoothing applies to everything except storm-relative products (their
     /// per-row palette path bypasses the grid-smoothing seam).
-    fn smoothing_for_product(&self, product: &DisplayProduct) -> bool {
-        self.display_smoothing && !product.is_storm_relative_velocity()
+    fn smoothing_for_product(&self, product: &DisplayProduct) -> SmoothingMode {
+        if product.is_storm_relative_velocity() {
+            SmoothingMode::Native
+        } else {
+            self.display_smoothing
+        }
     }
 
     fn render_color_tables_for_product(&self, product: &DisplayProduct) -> ColorTableSet {
@@ -4595,7 +4624,7 @@ impl ViewerApp {
             let color_tables = self.render_color_tables_for_product(&product);
             let color_table_signature = color_tables.signature_for_family(product.color_family());
             let render_dealiased_velocity = self.product_render_uses_dealiased_velocity(&product);
-            let smoothed = self.smoothing_for_product(&product);
+            let smoothing = self.smoothing_for_product(&product);
             let key = TextureKey {
                 volume_ptr: Arc::as_ptr(&volume) as usize,
                 cut,
@@ -4604,7 +4633,7 @@ impl ViewerApp {
                 color_table_signature,
                 storm_motion_key: self.storm_motion_key(),
                 hail_levels_key: self.hail_levels_key(),
-                smoothed,
+                smoothing,
                 dealias_cascade: self.dealias_cascade,
                 gate_filter_decidbz: self.gate_filter_key(),
                 viewport: viewport_key,
@@ -4629,7 +4658,7 @@ impl ViewerApp {
                     color_tables,
                     storm_motion: self.current_storm_motion(),
                     hail_levels_m: self.hail_levels_m(),
-                    smoothed,
+                    smoothing,
                     dealias_cascade: self.dealias_cascade,
                     gate_filter_decidbz: self.gate_filter_key(),
                     viewport_options,
@@ -4738,7 +4767,7 @@ impl ViewerApp {
             &base_moment,
             dealiased_velocity,
             derived,
-            request.smoothed,
+            request.smoothing,
             request.dealias_cascade,
             request.gate_filter_decidbz,
             color_table_signature,
@@ -4758,9 +4787,9 @@ impl ViewerApp {
                     request.cut,
                     &request.color_tables,
                     request.hail_levels_m,
-                    request.smoothed,
+                    request.smoothing,
                 )
-            } else if request.smoothed
+            } else if request.smoothing != SmoothingMode::Native
                 || gate_filter.is_some()
                 || (dealiased_velocity && request.dealias_cascade)
             {
@@ -4775,7 +4804,7 @@ impl ViewerApp {
                     dealiased_velocity,
                     request.dealias_cascade,
                     gate_filter,
-                    request.smoothed,
+                    request.smoothing,
                     &request.color_tables,
                 )
             } else if dealiased_velocity {
@@ -4803,7 +4832,7 @@ impl ViewerApp {
                     moment: base_moment.clone(),
                     dealiased_velocity,
                     derived,
-                    smoothed: request.smoothed,
+                    smoothing: request.smoothing,
                     dealias_cascade: request.dealias_cascade,
                     gate_filter_decidbz: request.gate_filter_decidbz,
                     color_table_signature,
@@ -4825,7 +4854,7 @@ impl ViewerApp {
             color_table_signature,
             request.key.storm_motion_key,
             request.key.hail_levels_key,
-            request.key.smoothed,
+            request.key.smoothing,
             request.key.dealias_cascade,
             request.key.gate_filter_decidbz,
             request.key.viewport,
@@ -4836,6 +4865,7 @@ impl ViewerApp {
             request.product.clone(),
             base_moment.clone(),
             dealiased_velocity,
+            request.key.smoothing,
             request.key.viewport,
         );
 
@@ -5035,7 +5065,7 @@ impl ViewerApp {
             request.key.color_table_signature,
             request.key.storm_motion_key,
             request.key.hail_levels_key,
-            request.key.smoothed,
+            request.key.smoothing,
             request.key.dealias_cascade,
             request.key.gate_filter_decidbz,
             request.key.viewport,
@@ -5046,6 +5076,7 @@ impl ViewerApp {
             request.product.clone(),
             request.product.base_moment(),
             request.render_dealiased_velocity,
+            request.key.smoothing,
             request.key.viewport,
         );
         if Self::touch_sample_cache(sample_caches, &sample_cache_signature) {
@@ -5058,7 +5089,7 @@ impl ViewerApp {
             &viewport_signature.moment,
             request.render_dealiased_velocity,
             request.product.derived(),
-            request.key.smoothed,
+            request.key.smoothing,
             request.key.dealias_cascade,
             request.key.gate_filter_decidbz,
             viewport_signature.color_table_signature,
@@ -5113,6 +5144,9 @@ impl ViewerApp {
             DisplayProduct::Moment(MomentType::Velocity),
             MomentType::Velocity,
             velocity_render_dealiased,
+            // The prefetch warms a NATIVE velocity cache (the geometry
+            // the interaction path samples).
+            SmoothingMode::Native,
             request.key.viewport,
         );
 
@@ -5123,7 +5157,7 @@ impl ViewerApp {
             &MomentType::Velocity,
             velocity_render_dealiased,
             None,
-            false,
+            SmoothingMode::Native,
             false,
             i16::MIN,
             velocity_color_table_signature,
@@ -5156,7 +5190,7 @@ impl ViewerApp {
                     moment: MomentType::Velocity,
                     dealiased_velocity: velocity_render_dealiased,
                     derived: None,
-                    smoothed: false,
+                    smoothing: SmoothingMode::Native,
                     dealias_cascade: false,
                     gate_filter_decidbz: i16::MIN,
                     color_table_signature: velocity_color_table_signature,
@@ -5187,7 +5221,7 @@ impl ViewerApp {
             &MomentType::Velocity,
             velocity_render_dealiased,
             None,
-            false,
+            SmoothingMode::Native,
             false,
             i16::MIN,
             velocity_color_table_signature,
@@ -5225,7 +5259,7 @@ impl ViewerApp {
         moment: &MomentType,
         dealiased_velocity: bool,
         derived: Option<DerivedProduct>,
-        smoothed: bool,
+        smoothing: SmoothingMode,
         dealias_cascade: bool,
         gate_filter_decidbz: i16,
         color_table_signature: u64,
@@ -5236,7 +5270,7 @@ impl ViewerApp {
                 && cached.moment == *moment
                 && cached.dealiased_velocity == dealiased_velocity
                 && cached.derived == derived
-                && cached.smoothed == smoothed
+                && cached.smoothing == smoothing
                 && cached.dealias_cascade == dealias_cascade
                 && cached.gate_filter_decidbz == gate_filter_decidbz
                 && cached.color_table_signature == color_table_signature
@@ -5257,7 +5291,7 @@ impl ViewerApp {
                 || cached.moment != cache.moment
                 || cached.dealiased_velocity != cache.dealiased_velocity
                 || cached.derived != cache.derived
-                || cached.smoothed != cache.smoothed
+                || cached.smoothing != cache.smoothing
                 || cached.dealias_cascade != cache.dealias_cascade
                 || cached.gate_filter_decidbz != cache.gate_filter_decidbz
         });
@@ -5538,7 +5572,7 @@ impl ViewerApp {
         let color_tables = self.render_color_tables_for_product(&product);
         let color_table_signature = color_tables.signature_for_family(product.color_family());
         let render_dealiased_velocity = self.product_render_uses_dealiased_velocity(&product);
-        let smoothed = self.smoothing_for_product(&product);
+        let smoothing = self.smoothing_for_product(&product);
         let key = TextureKey {
             volume_ptr: Arc::as_ptr(&volume) as usize,
             cut,
@@ -5547,7 +5581,7 @@ impl ViewerApp {
             color_table_signature,
             storm_motion_key: self.storm_motion_key(),
             hail_levels_key: self.hail_levels_key(),
-            smoothed,
+            smoothing,
             dealias_cascade: self.dealias_cascade,
             gate_filter_decidbz: self.gate_filter_key(),
             viewport: viewport_key,
@@ -5575,7 +5609,7 @@ impl ViewerApp {
             color_tables,
             storm_motion: self.current_storm_motion(),
             hail_levels_m: self.hail_levels_m(),
-            smoothed,
+            smoothing,
             dealias_cascade: self.dealias_cascade,
             gate_filter_decidbz: self.gate_filter_key(),
             viewport_options,
@@ -5791,6 +5825,14 @@ impl ViewerApp {
         // next poll tick stomps the opened volume within 15 s.
         let paused_poll = self.poll_active;
         self.poll_active = false;
+        // The Live auto-refresh is the same threat from the other side: as
+        // soon as the local batch installs and frees the load receiver, a
+        // live tick reloads the selected catalog site and wipes the
+        // deployment (field report: "loads for a second and then goes
+        // away; unchecking Live fixes it"). Pause it; re-checking Live
+        // resumes the catalog site.
+        let paused_live = self.realtime_level2_auto_refresh;
+        self.realtime_level2_auto_refresh = false;
         self.begin_primary_load_telemetry();
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
@@ -5798,6 +5840,9 @@ impl ViewerApp {
         self.status = format!("Loading {label}");
         if paused_poll {
             self.status.push_str(" — URL poll paused");
+        }
+        if paused_live {
+            self.status.push_str(" — Live paused");
         }
 
         thread::spawn(move || {
@@ -7060,17 +7105,82 @@ impl ViewerApp {
         );
     }
 
+    /// The persisted unit-system preference, parsed (imperial unless the
+    /// config says "metric") — every units-aware readout reads this.
+    fn units(&self) -> units::Units {
+        units::Units::from_settings(&self.app_settings)
+    }
+
     /// Display preferences (Settings ▸ Display).
     fn display_settings_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if ui
-            .checkbox(&mut self.display_smoothing, "Smooth display")
-            .on_hover_text(
-                "GR2-style smoothing: a binomial kernel over the polar grid, computed once per product on the render worker and drawn through the regular fast path (pans stay fast). Native super-res detail is the default; note RF gates render transparent while smoothing.",
-            )
-            .changed()
-        {
-            ctx.request_repaint();
-        }
+        ui.horizontal(|ui| {
+            ui.label("Smoothing");
+            let mut changed = false;
+            changed |= ui
+                .radio_value(&mut self.display_smoothing, SmoothingMode::Native, "Native")
+                .on_hover_text(
+                    "Raw gates, nearest-gate rendering — full super-res detail (the app's identity), RF purple visible.",
+                )
+                .changed();
+            changed |= ui
+                .radio_value(&mut self.display_smoothing, SmoothingMode::Soften, "Soften")
+                .on_hover_text(
+                    "GR2-style smoothing: a 3×3 binomial kernel over the polar grid, computed once per product on the render worker and drawn through the regular fast path (pans stay fast). Values soften but cell edges remain. RF gates render transparent.",
+                )
+                .changed();
+            changed |= ui
+                .radio_value(
+                    &mut self.display_smoothing,
+                    SmoothingMode::Interpolated,
+                    "Interpolated",
+                )
+                .on_hover_text(
+                    "Inter-gate interpolation: bilinear upsampling on the polar grid — synthetic radials and gates between the native ones (e.g. a 1° × 500 m international cut renders at 0.25° × 250 m), computed once per product and drawn through the regular fast path (pans stay fast). Continuous look without cell edges; coarse international cuts benefit most. Echo coverage never grows, velocity never blends across folds/couplets, and RF gates render transparent.",
+                )
+                .changed();
+            if changed {
+                self.app_settings.smooth_display_mode =
+                    self.display_smoothing.settings_str().to_owned();
+                // Keep the legacy bool meaningful for older builds reading
+                // this config: any non-native mode maps back to their
+                // Smooth display checkbox.
+                self.app_settings.smooth_display =
+                    self.display_smoothing != SmoothingMode::Native;
+                let _ = self.app_settings.save();
+                ctx.request_repaint();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Units");
+            let current = self.units();
+            let mut picked = None;
+            egui::ComboBox::from_id_salt("display_units")
+                .selected_text(current.label())
+                .width(118.0)
+                .show_ui(ui, |ui| {
+                    for option in [units::Units::Imperial, units::Units::Metric] {
+                        if ui
+                            .selectable_label(current == option, option.label())
+                            .clicked()
+                        {
+                            picked = Some(option);
+                        }
+                    }
+                });
+            if let Some(option) = picked
+                && option != current
+            {
+                self.app_settings.units = option.slug().to_owned();
+                let _ = self.app_settings.save();
+                ctx.request_repaint();
+            }
+        })
+        .response
+        .on_hover_text(
+            "Readout units: beam heights, distances, temperatures (lowest-beam menu, \
+             cursor inspector, station plots, range circles). BowEcho is US-born so \
+             imperial is the default — metric is this one click.",
+        );
         ui.horizontal(|ui| {
             ui.label("Basemap");
             let mut changed_style = None;
@@ -8098,7 +8208,8 @@ impl ViewerApp {
                         self.selected_frame_index + 1 < self.frame_history.len();
                 }
                 self.last_history_step = Some(Instant::now());
-                ctx.request_repaint_after(Duration::from_millis(HISTORY_LOOP_FRAME_MS));
+                let frame_ms = self.loop_frame_ms();
+                ctx.request_repaint_after(Duration::from_millis(frame_ms));
             }
             if ui
                 .add_enabled_ui(frame_count > 1, |ui| fixed_action_button(ui, ">", 28.0))
@@ -8120,6 +8231,27 @@ impl ViewerApp {
                 });
             if selected_limit != self.history_frame_limit {
                 self.set_history_frame_limit(selected_limit, ctx);
+            }
+            // Playback speed (field request) — also the GIF/MP4 frame
+            // timing, so a recording plays back exactly like the screen.
+            let mut speed = self.app_settings.loop_speed_percent;
+            egui::ComboBox::from_id_salt("loop_speed")
+                .selected_text(loop_speed_label(speed))
+                .width(56.0)
+                .show_ui(ui, |ui| {
+                    for option in LOOP_SPEED_PERCENT_OPTIONS {
+                        ui.selectable_value(&mut speed, *option, loop_speed_label(*option));
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Loop speed — frames per step of the playback AND of recorded GIF/MP4 loops",
+                );
+            if speed != self.app_settings.loop_speed_percent {
+                self.app_settings.loop_speed_percent = speed;
+                let _ = self.app_settings.save();
+                let frame_ms = self.loop_frame_ms();
+                ctx.request_repaint_after(Duration::from_millis(frame_ms));
             }
         });
 
@@ -9409,7 +9541,7 @@ impl ViewerApp {
                 ui.label(format!("map {:.0} px/deg", self.map_scale));
                 ui.separator();
                 let readout = if let Some(readout) = &self.cursor_readout {
-                    format_cursor_readout(readout)
+                    format_cursor_readout(readout, self.units())
                 } else {
                     format!(
                         "{} cut {}",
@@ -9817,6 +9949,7 @@ impl ViewerApp {
             })
             .collect::<Vec<_>>();
         let intl_points = self.intl_site_points(rect);
+        let community_points = self.community_site_points(rect);
 
         let shift_held = ui.input(|input| input.modifiers.shift);
         if !armed
@@ -9835,7 +9968,7 @@ impl ViewerApp {
             && response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
         {
-            self.handle_marker_click(&site_points, &intl_points, pointer);
+            self.handle_marker_click(&site_points, &intl_points, &community_points, pointer);
         }
 
         if !armed
@@ -9998,6 +10131,11 @@ impl ViewerApp {
             .and_then(|pointer| nearest_marker_within(&intl_points, pointer))
             .map(|(index, _)| index);
         self.draw_intl_site_markers(painter, &intl_points, hovered_intl);
+        let hovered_community = response
+            .hover_pos()
+            .and_then(|pointer| nearest_marker_within(&community_points, pointer))
+            .map(|(index, _)| index);
+        self.draw_community_site_markers(painter, &community_points, hovered_community);
         self.draw_radar_layer_markers(painter, rect);
         self.draw_loaded_volume_marker(painter, rect);
         self.draw_colorbar(painter, rect);
@@ -10005,6 +10143,7 @@ impl ViewerApp {
         self.draw_raw_velocity_tag(painter, rect);
         self.draw_cross_section_line(painter, rect, response.hover_pos());
         self.draw_cursor_inspector(painter, rect, response.hover_pos());
+        self.show_community_feed_menu(ui, rect);
 
         if self.texture.is_none()
             && self
@@ -10107,6 +10246,7 @@ impl ViewerApp {
                 })
                 .collect::<Vec<_>>();
             let intl_points = self.intl_site_points(cell);
+            let community_points = self.community_site_points(cell);
 
             let shift_held = ui.input(|input| input.modifiers.shift);
             if !armed
@@ -10124,7 +10264,7 @@ impl ViewerApp {
                 && response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
-                self.handle_marker_click(&site_points, &intl_points, pointer);
+                self.handle_marker_click(&site_points, &intl_points, &community_points, pointer);
                 if let Some(index) = self.hazard_at_position(cell, pointer) {
                     self.selected_hazard_index = Some(index);
                 }
@@ -10236,6 +10376,14 @@ impl ViewerApp {
                 .and_then(|pointer| nearest_marker_within(&intl_points, pointer))
                 .map(|(index, _)| index);
             self.draw_intl_site_markers(&cell_painter, &intl_points, hovered_intl);
+            let community_points = self.community_site_points(cell);
+            let hovered_community = hovers
+                .get(cell_index)
+                .copied()
+                .flatten()
+                .and_then(|pointer| nearest_marker_within(&community_points, pointer))
+                .map(|(index, _)| index);
+            self.draw_community_site_markers(&cell_painter, &community_points, hovered_community);
             self.draw_radar_layer_markers(&cell_painter, cell);
             self.draw_loaded_volume_marker(&cell_painter, cell);
             if cell_index == 0 {
@@ -10276,6 +10424,13 @@ impl ViewerApp {
             cell_painter.line_segment([cell.left_bottom(), cell.right_bottom()], border);
             cell_painter.line_segment([cell.left_top(), cell.left_bottom()], border);
             cell_painter.line_segment([cell.right_top(), cell.right_bottom()], border);
+        }
+
+        // One picker for the whole grid, anchored in cell 0 — the geo
+        // transform is shared, so the marker sits at the same lon/lat in
+        // every cell.
+        if let Some(cell) = cells.first().copied() {
+            self.show_community_feed_menu(ui, cell);
         }
 
         self.cursor_readout = hovered_readout;
@@ -10815,16 +10970,21 @@ impl ViewerApp {
         });
     }
 
-    /// Lowest-beam radar candidates for a geo point, sorted by 0.5° beam
-    /// height ascending (slant range → 4/3-Earth beam height):
-    /// (site index, id, beam height m, distance km). Geometry only — the
-    /// terrain-blockage version needs a coverage dataset (wxKobold's
-    /// boundary placefile draws those regions as an overlay today).
-    /// WSR-88Ds only (K/P prefixes): TDWRs (Txxx) have ~90 km range and
-    /// C-band attenuation, so they list in their own menu section
-    /// ([`tdwr_candidates`]) instead of competing in this ranking.
-    fn best_radar_candidates(&self, lat: f32, lon: f32) -> Vec<(usize, String, f32, f32)> {
-        let mut candidates: Vec<(usize, String, f32, f32)> = self
+    /// Lowest-beam radar candidates for a geo point across EVERY pollable
+    /// family — CONUS WSR-88Ds, international providers, and US community
+    /// research feeds (field request: the nearest-radar menu "working with
+    /// international radars too") — sorted by 0.5° beam height ascending
+    /// (slant range → 4/3-Earth beam height; 0.5° is nominal for non-NEXRAD
+    /// sites whose lowest tilt we don't know, disclosed in the hover).
+    /// Geometry only — the terrain-blockage version needs a coverage
+    /// dataset. TDWRs (Txxx) have ~90 km range and C-band attenuation, so
+    /// they list in their own menu section ([`tdwr_candidates`]) instead
+    /// of competing in this ranking.
+    fn best_radar_candidates(&self, lat: f32, lon: f32) -> Vec<BeamCandidate> {
+        let beam_at = |distance_km: f32| {
+            radar_core::beam_height_above_radar_m(distance_km as f64 * 1000.0, 0.5) as f32
+        };
+        let mut candidates: Vec<BeamCandidate> = self
             .sites
             .iter()
             .enumerate()
@@ -10837,13 +10997,85 @@ impl ViewerApp {
                 if distance_km > 460.0 {
                     return None;
                 }
-                let beam_m =
-                    radar_core::beam_height_above_radar_m(distance_km as f64 * 1000.0, 0.5) as f32;
-                Some((index, site.level2_id.clone(), beam_m, distance_km))
+                Some(BeamCandidate {
+                    target: BeamTarget::Conus(index),
+                    label: site.level2_id.clone(),
+                    origin: None,
+                    beam_m: beam_at(distance_km),
+                    distance_km,
+                })
             })
             .collect();
-        candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
+        for site in data_source::international::intl_static_sites() {
+            let (Some(site_lat), Some(site_lon)) = (site.latitude_deg, site.longitude_deg) else {
+                continue;
+            };
+            let distance_km = haversine_km(lat, lon, site_lat, site_lon);
+            if distance_km > 460.0 {
+                continue;
+            }
+            candidates.push(BeamCandidate {
+                target: BeamTarget::Intl {
+                    provider_id: site.provider_id.to_owned(),
+                    site_id: site.site_id.clone(),
+                },
+                label: site.label.clone(),
+                origin: Some(intl_provider_label(site.provider_id)),
+                beam_m: beam_at(distance_km),
+                distance_km,
+            });
+        }
+        for marker in data_source::community_feeds::community_markers() {
+            // Clusters rank as ONE row that starts the first feed (the map
+            // marker keeps the full per-feed picker).
+            let Some(feed) = marker
+                .feed_indices
+                .first()
+                .and_then(|&index| data_source::community_feeds::community_feeds().get(index))
+            else {
+                continue;
+            };
+            let distance_km = haversine_km(lat, lon, marker.latitude_deg, marker.longitude_deg);
+            if distance_km > 460.0 {
+                continue;
+            }
+            candidates.push(BeamCandidate {
+                target: BeamTarget::Research {
+                    url: feed.poll_url.to_owned(),
+                },
+                label: marker.label.clone(),
+                origin: Some("research feed".to_owned()),
+                beam_m: beam_at(distance_km),
+                distance_km,
+            });
+        }
+        candidates.sort_by(|a, b| a.beam_m.total_cmp(&b.beam_m));
         candidates
+    }
+
+    /// Switch to a beam-ranked pick: CONUS sites select + load latest
+    /// Level II; international and research sites start their live poll
+    /// (the same paths as their map markers and pickers). Explicit picks
+    /// always win — every path replaces/clears the in-flight receivers.
+    fn activate_beam_target(&mut self, candidate: &BeamCandidate, ctx: &egui::Context) {
+        match &candidate.target {
+            BeamTarget::Conus(index) => {
+                self.selected_site_index = *index;
+                let site = self.sites[*index].clone();
+                self.start_latest_level2_load(site, ctx);
+            }
+            BeamTarget::Intl {
+                provider_id,
+                site_id,
+            } => {
+                self.start_intl_poll(provider_id.clone(), site_id.clone());
+                self.status = format!("Live-polling {}", candidate.label);
+            }
+            BeamTarget::Research { url } => {
+                self.start_known_feed_poll(url);
+                self.status = format!("Live-polling {}", candidate.label);
+            }
+        }
     }
 
     /// Nearby TDWRs for the context menu's own section: Txxx sites by
@@ -10874,39 +11106,48 @@ impl ViewerApp {
     /// volume (broadcast-meteorologist request: GR2-style ctrl+click to
     /// the nearest/best radar, no menu round-trip).
     fn switch_to_best_radar_at(&mut self, lon: f32, lat: f32, ctx: &egui::Context) {
-        let Some((index, id, beam_m, _)) = self.best_radar_candidates(lat, lon).into_iter().next()
-        else {
+        let Some(candidate) = self.best_radar_candidates(lat, lon).into_iter().next() else {
             self.status = "No radar within 460 km of your click".to_owned();
             return;
         };
         // Same switch action as the context menu buttons. An explicit pick
-        // beats any in-flight load: start_latest_level2_load replaces the
-        // receiver, cancelling it (the old guard silently DROPPED the pick,
+        // beats any in-flight load: every activation path replaces the
+        // in-flight receivers (the old guard silently DROPPED the pick,
         // and the stale volume's landing then snapped selection back).
-        self.selected_site_index = index;
-        let site = self.sites[index].clone();
-        self.start_latest_level2_load(site, ctx);
-        // Set AFTER the load kick so the user sees what happened (the load
-        // start overwrites self.status with "Loading latest L2 …").
-        self.status = format!("Switched to {id} — lowest beam {beam_m:.0} m at your click");
+        let label = candidate.label.clone();
+        let beam_m = candidate.beam_m;
+        self.activate_beam_target(&candidate, ctx);
+        if matches!(candidate.target, BeamTarget::Conus(_)) {
+            // Set AFTER the load kick so the user sees what happened (the
+            // load start overwrites self.status with "Loading latest L2 …").
+            self.status = format!(
+                "Switched to {label} — lowest beam {} at your click",
+                units::format_beam_height(beam_m, self.units())
+            );
+        }
     }
 
     /// Right-click with Settings ▸ "Right-click loads closest radar" on:
-    /// switch straight to the nearest WSR-88D by ground distance (the
-    /// lowest-beam pick stays on Ctrl+click and the context menu).
+    /// switch straight to the nearest radar of any family by ground
+    /// distance (the lowest-beam pick stays on Ctrl+click and the menu).
     fn switch_to_nearest_radar_at(&mut self, lon: f32, lat: f32, ctx: &egui::Context) {
-        let Some((index, id, _, distance_km)) = self
+        let Some(candidate) = self
             .best_radar_candidates(lat, lon)
             .into_iter()
-            .min_by(|a, b| a.3.total_cmp(&b.3))
+            .min_by(|a, b| a.distance_km.total_cmp(&b.distance_km))
         else {
             self.status = "No radar within 460 km of your click".to_owned();
             return;
         };
-        self.selected_site_index = index;
-        let site = self.sites[index].clone();
-        self.start_latest_level2_load(site, ctx);
-        self.status = format!("Switched to {id} — closest WSR-88D ({distance_km:.0} km)");
+        let label = candidate.label.clone();
+        let distance_km = candidate.distance_km;
+        self.activate_beam_target(&candidate, ctx);
+        if matches!(candidate.target, BeamTarget::Conus(_)) {
+            self.status = format!(
+                "Switched to {label} — closest radar ({})",
+                units::format_distance_km(distance_km, self.units())
+            );
+        }
     }
 
     /// Context menu: the three lowest-beam radars over the clicked point.
@@ -10923,15 +11164,27 @@ impl ViewerApp {
             return;
         }
         ui.label("Lowest beam here:");
-        let mut load: Option<usize> = None;
-        for (index, id, beam_m, distance_km) in candidates.into_iter().take(3) {
-            let beam_kft = beam_m * 3.280_84 / 1000.0;
-            if ui
-                .button(format!("{id} · {beam_kft:.1} kft · {distance_km:.0} km"))
-                .on_hover_text("Switch to this site and load the latest volume")
-                .clicked()
-            {
-                load = Some(index);
+        let units = self.units();
+        let mut activate: Option<BeamCandidate> = None;
+        for candidate in candidates.into_iter().take(4) {
+            let mut row = format!(
+                "{} · {} · {}",
+                candidate.label,
+                units::format_beam_height(candidate.beam_m, units),
+                units::format_distance_km(candidate.distance_km, units),
+            );
+            if let Some(origin) = &candidate.origin {
+                row.push_str(&format!(" · {origin}"));
+            }
+            let hover = match candidate.target {
+                BeamTarget::Conus(_) => "Switch to this site and load the latest volume",
+                _ => {
+                    "Start live-polling this feed (beam height assumes a \
+                     nominal 0.5° lowest tilt)"
+                }
+            };
+            if ui.button(row).on_hover_text(hover).clicked() {
+                activate = Some(candidate);
                 ui.close();
             }
         }
@@ -10943,27 +11196,34 @@ impl ViewerApp {
             ui.label("TDWR here:");
             for (index, id, distance_km) in tdwrs.into_iter().take(2) {
                 if ui
-                    .button(format!("{id} · TDWR · {distance_km:.0} km"))
+                    .button(format!(
+                        "{id} · TDWR · {}",
+                        units::format_distance_km(distance_km, units)
+                    ))
                     .on_hover_text(
                         "Terminal Doppler: 0.1-0.6° tilts right over the metro, \
                          ~90 km Doppler range, C-band (attenuates in heavy rain)",
                     )
                     .clicked()
                 {
-                    load = Some(index);
+                    activate = Some(BeamCandidate {
+                        target: BeamTarget::Conus(index),
+                        label: id,
+                        origin: None,
+                        beam_m: 0.0,
+                        distance_km,
+                    });
                     ui.close();
                 }
             }
         }
-        if let Some(index) = load {
+        if let Some(candidate) = activate {
             // No in-flight guard: the menu pick is explicit intent and must
-            // win — start_latest_level2_load replaces the receiver, which
-            // cancels whatever was loading (the old guard silently dropped
-            // the pick and the stale volume snapped selection back).
-            self.selected_site_index = index;
-            let site = self.sites[index].clone();
+            // win — every activation path replaces the in-flight receivers
+            // (the old guard silently dropped the pick and the stale
+            // volume snapped selection back).
             let ctx = ui.ctx().clone();
-            self.start_latest_level2_load(site, &ctx);
+            self.activate_beam_target(&candidate, &ctx);
         }
     }
 
@@ -11245,6 +11505,14 @@ impl ViewerApp {
     /// Native skew-T window (floating). The body is `sounding_pane_body`,
     /// shared with the docked Sounding pane — the overhaul's headline ask
     /// ("size soundings how I want and snap to its own thing").
+    /// Effective playback frame duration: the 700 ms baseline scaled by
+    /// the persisted loop speed (200 % = twice as fast). Also the
+    /// recorder's GIF/MP4 frame timing, so exports match the screen.
+    fn loop_frame_ms(&self) -> u64 {
+        let percent = u64::from(self.app_settings.loop_speed_percent.clamp(10, 1000));
+        (HISTORY_LOOP_FRAME_MS * 100 / percent).max(40)
+    }
+
     fn sounding_window(&mut self, ctx: &egui::Context) {
         // No native_sounding gate: the body placeholder explains how to
         // launch one, which beats a window that silently refuses to open.
@@ -14343,7 +14611,8 @@ impl ViewerApp {
         }
     }
 
-    /// Surface-obs station plots: GR2A-style T/Td (°F) + wind barb +
+    /// Surface-obs station plots: GR2A-style T/Td (°F, or °C when
+    /// Settings ▸ Display ▸ Units is Metric) + wind barb +
     /// gust, screen-grid decluttered (fuller reports win the cell), ids
     /// at street zoom. Pure vector — no raster, no worker.
     fn draw_surface_obs(&self, painter: &egui::Painter, rect: egui::Rect) {
@@ -14373,6 +14642,7 @@ impl ViewerApp {
         // previously hid hourly METARs for hours after launch — the
         // dedup'd pool accumulates them slowly. Field report fixed.)
         let looping = self.history_playing || self.browsing_history;
+        let plot_units = self.units();
         for ob in order {
             let is_metar = ob.network == "METAR";
             if (is_metar && !self.obs_show_metar) || (!is_metar && !self.obs_show_mesonet) {
@@ -14407,12 +14677,13 @@ impl ViewerApp {
             if let (Some(dir), Some(spd)) = (ob.wind_dir_deg, ob.wind_speed_kt) {
                 draw_station_barb(painter, pos, dir, spd, obs_style);
             }
-            // T upper-left (red), Td lower-left (green), °F.
+            // T upper-left (red), Td lower-left (green) — °F or °C per
+            // Settings ▸ Display ▸ Units (station models omit the suffix).
             if let Some(t) = ob.temp_c {
                 painter.text(
                     pos + egui::vec2(-6.0, -12.0),
                     egui::Align2::RIGHT_CENTER,
-                    format!("{:.0}", t * 9.0 / 5.0 + 32.0),
+                    units::format_station_temp_c(t, plot_units),
                     font_v.clone(),
                     style_color32(obs_style.temp_color),
                 );
@@ -14421,7 +14692,7 @@ impl ViewerApp {
                 painter.text(
                     pos + egui::vec2(-6.0, 12.0),
                     egui::Align2::RIGHT_CENTER,
-                    format!("{:.0}", td * 9.0 / 5.0 + 32.0),
+                    units::format_station_temp_c(td, plot_units),
                     font_v.clone(),
                     style_color32(obs_style.dewpoint_color),
                 );
@@ -14993,11 +15264,18 @@ impl ViewerApp {
                 ));
             }
             if self.inspector_show_beam {
-                lines.push(format!(
-                    "beam ↑ {:.0} m ({:.1} kft)",
-                    readout.height_above_radar_m,
-                    readout.height_above_radar_m * 0.003_280_84
-                ));
+                let beam_m = readout.height_above_radar_m;
+                lines.push(match self.units() {
+                    // Imperial keeps the m + kft dual (analyst convention).
+                    units::Units::Imperial => format!(
+                        "beam ↑ {beam_m:.0} m ({})",
+                        units::format_beam_height(beam_m, units::Units::Imperial)
+                    ),
+                    units::Units::Metric => format!(
+                        "beam ↑ {}",
+                        units::format_beam_height(beam_m, units::Units::Metric)
+                    ),
+                });
             }
         }
         // Nearest surface ob under the cursor (within ~28 px) — the full
@@ -15021,9 +15299,15 @@ impl ViewerApp {
                 let mut line = ob.station_id.clone();
                 if let (Some(t), Some(td)) = (ob.temp_c, ob.dewpoint_c) {
                     line.push_str(&format!(
-                        " {:.0}/{:.0}°F",
-                        t * 9.0 / 5.0 + 32.0,
-                        td * 9.0 / 5.0 + 32.0
+                        " {}",
+                        units::format_temp_pair_c(t, td, self.units())
+                    ));
+                } else if let Some(t) = ob.temp_c {
+                    // T-only stations (some mesonet sensors skip dewpoint)
+                    // still get their temperature on the card.
+                    line.push_str(&format!(
+                        " {}",
+                        units::format_temperature_c(t, self.units())
                     ));
                 }
                 if let (Some(dir), Some(spd)) = (ob.wind_dir_deg, ob.wind_speed_kt) {
@@ -16439,25 +16723,32 @@ impl ViewerApp {
     }
 
     /// Left-click on map markers: the nearest hit inside the shared 12 px
-    /// halo wins across BOTH catalogs. A CONUS hit selects the site (the
-    /// existing behavior); an international hit starts that site's live
-    /// poll through [`Self::start_intl_poll`] — the exact path the
-    /// DATA-tab picker uses.
+    /// halo wins across ALL three catalogs ([`resolve_marker_click`]). A
+    /// CONUS hit selects the site (the existing behavior); an
+    /// international hit starts that site's live poll through
+    /// [`Self::start_intl_poll`] — the exact path the DATA-tab picker
+    /// uses; a community hit starts the feed's custom-URL poll through
+    /// [`Self::start_known_feed_poll`] — the exact path the Feeds menu
+    /// uses — or, on the shared-pad cluster marker, toggles the stacked
+    /// feeds picker ([`Self::show_community_feed_menu`]).
     fn handle_marker_click(
         &mut self,
         site_points: &[(usize, egui::Pos2)],
         intl_points: &[(usize, egui::Pos2)],
+        community_points: &[(usize, egui::Pos2)],
         pointer: egui::Pos2,
     ) {
-        let conus = nearest_marker_within(site_points, pointer);
-        let intl = nearest_marker_within(intl_points, pointer);
-        match (conus, intl) {
-            (Some((index, conus_distance)), intl)
-                if intl.is_none_or(|(_, intl_distance)| conus_distance <= intl_distance) =>
-            {
-                self.selected_site_index = index;
-            }
-            (_, Some((index, _))) => {
+        // Any map click dismisses an open cluster picker (clicks on the
+        // picker itself land on its foreground layer, never here); a
+        // cluster-marker hit below re-opens it, so re-clicking toggles.
+        let open_menu = self.community_menu.take();
+        match resolve_marker_click(
+            nearest_marker_within(site_points, pointer),
+            nearest_marker_within(intl_points, pointer),
+            nearest_marker_within(community_points, pointer),
+        ) {
+            Some((MarkerFamily::Conus, index)) => self.selected_site_index = index,
+            Some((MarkerFamily::Intl, index)) => {
                 let Some(site) = data_source::international::intl_static_sites().get(index) else {
                     return;
                 };
@@ -16468,7 +16759,28 @@ impl ViewerApp {
                 );
                 self.start_intl_poll(site.provider_id.to_owned(), site.site_id.clone());
             }
-            _ => {}
+            Some((MarkerFamily::Community, index)) => {
+                let Some(marker) = data_source::community_feeds::community_markers().get(index)
+                else {
+                    return;
+                };
+                match marker.feed_indices.as_slice() {
+                    [feed_index] => {
+                        let Some(feed) =
+                            data_source::community_feeds::community_feeds().get(*feed_index)
+                        else {
+                            return;
+                        };
+                        self.status = format!("Polling {} · research feed", marker.label);
+                        self.start_known_feed_poll(feed.poll_url);
+                    }
+                    // Stacked feeds (the Norman Testbed): one marker,
+                    // a small picker instead of eight useless overlaps.
+                    _ if open_menu != Some(index) => self.community_menu = Some(index),
+                    _ => {}
+                }
+            }
+            None => {}
         }
     }
 
@@ -16551,6 +16863,189 @@ impl ViewerApp {
                     egui::Color32::from_rgb(238, 226, 200),
                 );
             }
+        }
+    }
+
+    /// Screen positions of the community research-feed markers inside
+    /// `rect` — the same viewport culling as the CONUS and international
+    /// passes. Indices key into
+    /// [`data_source::community_feeds::community_markers`]: the embedded
+    /// table, pure data, never the network, safe on the UI thread every
+    /// frame.
+    fn community_site_points(&self, rect: egui::Rect) -> Vec<(usize, egui::Pos2)> {
+        data_source::community_feeds::community_markers()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, marker)| {
+                let position =
+                    self.lon_lat_to_screen(rect, marker.longitude_deg, marker.latitude_deg);
+                rect.expand(18.0)
+                    .contains(position)
+                    .then_some((index, position))
+            })
+            .collect()
+    }
+
+    /// The community feed URL the shared poller is actively following, if
+    /// any — `poll_url` is what the live tick reads, so a marker lights up
+    /// exactly when its feed is the one being polled.
+    fn active_community_poll_url(&self) -> Option<&str> {
+        (self.poll_active && matches!(self.poll_source, PollSource::CustomUrl(_)))
+            .then_some(self.poll_url.as_str())
+    }
+
+    /// Community research-feed markers: the third marker family. Same
+    /// visual grammar as [`Self::draw_intl_site_markers`] (hollow ring,
+    /// hover chip, lit-when-polled) but cool teal against the warm amber
+    /// international rings and the filled CONUS dots, so all three
+    /// catalogs read apart at a glance.
+    fn draw_community_site_markers(
+        &self,
+        painter: &egui::Painter,
+        community_points: &[(usize, egui::Pos2)],
+        hovered: Option<usize>,
+    ) {
+        if community_points.is_empty() {
+            return;
+        }
+        let markers = data_source::community_feeds::community_markers();
+        let feeds = data_source::community_feeds::community_feeds();
+        let active_url = self.active_community_poll_url();
+        // Cool teal against the warm amber intl rings (research radars).
+        const COMMUNITY_IDLE: egui::Color32 = egui::Color32::from_rgb(70, 168, 172);
+        const COMMUNITY_LIT: egui::Color32 = egui::Color32::from_rgb(126, 238, 234);
+        for (index, position) in community_points {
+            let Some(marker) = markers.get(*index) else {
+                continue;
+            };
+            // Which of the marker's feeds (one, or eight on the shared
+            // pad) the poller is following, if any.
+            let active_feed = marker.feed_indices.iter().find_map(|&feed_index| {
+                let feed = feeds.get(feed_index)?;
+                (active_url == Some(feed.poll_url)).then_some(feed)
+            });
+            let is_hovered = hovered == Some(*index);
+            if let Some(feed) = active_feed {
+                painter.circle_filled(*position, 5.5, COMMUNITY_LIT);
+                painter.circle_stroke(
+                    *position,
+                    10.0,
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(214, 252, 250)),
+                );
+                painter.text(
+                    *position + egui::vec2(12.0, -10.0),
+                    egui::Align2::LEFT_CENTER,
+                    feed.id,
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_rgb(224, 252, 250),
+                );
+            } else {
+                // Hollow ring: selectable, but not the live poll target.
+                painter.circle_stroke(
+                    *position,
+                    if is_hovered { 4.5 } else { 3.0 },
+                    egui::Stroke::new(
+                        1.5,
+                        if is_hovered {
+                            COMMUNITY_LIT
+                        } else {
+                            COMMUNITY_IDLE
+                        },
+                    ),
+                );
+            }
+            if is_hovered && active_feed.is_none() {
+                let text = if marker.feed_indices.len() > 1 {
+                    format!(
+                        "{} · {} research feeds — click to choose",
+                        marker.label,
+                        marker.feed_indices.len()
+                    )
+                } else {
+                    format!("{} · research feed — click to live-poll", marker.label)
+                };
+                // Same chip idiom as draw_mode_chip (width from char count).
+                let width = 12.0 + text.chars().count() as f32 * 6.6;
+                let chip = egui::Rect::from_min_size(
+                    *position + egui::vec2(10.0, -26.0),
+                    egui::vec2(width, 18.0),
+                );
+                painter.rect_filled(
+                    chip,
+                    4.0,
+                    egui::Color32::from_rgba_unmultiplied(16, 22, 30, 230),
+                );
+                painter.text(
+                    chip.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &text,
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_rgb(208, 244, 242),
+                );
+            }
+        }
+    }
+
+    /// The shared-pad cluster picker (the Norman Testbed marker): a small
+    /// floating menu over the map listing the marker's stacked feeds.
+    /// Re-anchored from lon/lat every frame so it tracks panning; closes
+    /// on Escape, on any map click elsewhere ([`Self::handle_marker_click`]
+    /// dismisses it first), when the marker pans offscreen, when a drawing
+    /// tool arms, or when a feed is picked — which starts the poll through
+    /// the same [`Self::start_known_feed_poll`] path as the Feeds menu.
+    fn show_community_feed_menu(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let Some(marker_index) = self.community_menu else {
+            return;
+        };
+        // An armed drawing tool owns map clicks, so the click-elsewhere
+        // dismissal in handle_marker_click can't run — and the picker's
+        // rect would shadow endpoint placement beneath it. Dismiss.
+        if self.cross_section_armed || self.vrot_tool_armed {
+            self.community_menu = None;
+            return;
+        }
+        let Some(marker) = data_source::community_feeds::community_markers().get(marker_index)
+        else {
+            self.community_menu = None;
+            return;
+        };
+        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.community_menu = None;
+            return;
+        }
+        let anchor = self.lon_lat_to_screen(rect, marker.longitude_deg, marker.latitude_deg);
+        if !rect.expand(18.0).contains(anchor) {
+            // Panned away: the picker has nothing to point at.
+            self.community_menu = None;
+            return;
+        }
+        let feeds = data_source::community_feeds::community_feeds();
+        let mut picked: Option<&'static data_source::community_feeds::CommunityFeed> = None;
+        egui::Area::new(egui::Id::new("community_feed_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(anchor + egui::vec2(14.0, -10.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(140.0);
+                    ui.weak(&marker.label);
+                    for &feed_index in &marker.feed_indices {
+                        let Some(feed) = feeds.get(feed_index) else {
+                            continue;
+                        };
+                        if ui
+                            .button(feed.id)
+                            .on_hover_text(format!("Live-poll {}", feed.poll_url))
+                            .clicked()
+                        {
+                            picked = Some(feed);
+                        }
+                    }
+                });
+            });
+        if let Some(feed) = picked {
+            self.status = format!("Polling {} · research feed", feed.id);
+            self.start_known_feed_poll(feed.poll_url);
+            self.community_menu = None;
         }
     }
 
@@ -17169,6 +17664,54 @@ struct HazardOverlayShapes {
     labels: Vec<(egui::Pos2, String, bool)>,
 }
 
+/// Display smoothing mode (Settings ▸ Display ▸ Smoothing). Persisted as a
+/// string in `AppSettings::smooth_display_mode`; the legacy
+/// `smooth_display` bool maps to `Soften` so old configs keep their look.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SmoothingMode {
+    /// Raw gates, nearest-gate rendering — the app's identity.
+    #[default]
+    Native,
+    /// 3×3 binomial over the polar grid (the legacy "Smooth display").
+    Soften,
+    /// Bilinear polar upsampling: synthetic radials/gates between the
+    /// native ones (inter-gate interpolation), nearest-gate rendered.
+    Interpolated,
+}
+
+impl SmoothingMode {
+    fn from_settings(settings: &settings::AppSettings) -> Self {
+        match settings.smooth_display_mode.as_str() {
+            "native" => Self::Native,
+            "soften" => Self::Soften,
+            "interpolated" => Self::Interpolated,
+            // Pre-mode configs: the legacy bool was the binomial pass.
+            _ => {
+                if settings.smooth_display {
+                    Self::Soften
+                } else {
+                    Self::Native
+                }
+            }
+        }
+    }
+
+    fn settings_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Soften => "soften",
+            Self::Interpolated => "interpolated",
+        }
+    }
+
+    /// The interpolated mode is the only one that changes the GRID
+    /// GEOMETRY (more rows/gates) — native and soften share viewport
+    /// sample caches, interpolated cannot.
+    fn changes_grid_geometry(self) -> bool {
+        self == Self::Interpolated
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TextureKey {
     volume_ptr: usize,
@@ -17178,7 +17721,7 @@ struct TextureKey {
     color_table_signature: u64,
     storm_motion_key: (i16, i16),
     hail_levels_key: (i16, i16),
-    smoothed: bool,
+    smoothing: SmoothingMode,
     dealias_cascade: bool,
     gate_filter_decidbz: i16,
     viewport: ViewportKey,
@@ -17372,8 +17915,8 @@ fn site_location(site: &RadarSite) -> Option<(f32, f32)> {
 }
 
 /// The marker in `points` nearest to `pointer` within the shared 12 px
-/// click/hover halo, with its distance — one hit test for the CONUS and
-/// international marker sets.
+/// click/hover halo, with its distance — one hit test for the CONUS,
+/// international, and community marker sets.
 fn nearest_marker_within(
     points: &[(usize, egui::Pos2)],
     pointer: egui::Pos2,
@@ -17385,6 +17928,40 @@ fn nearest_marker_within(
             (distance <= 12.0).then_some((*index, distance))
         })
         .min_by(|left, right| left.1.total_cmp(&right.1))
+}
+
+/// The three map-marker catalogs a click can land on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MarkerFamily {
+    /// `self.sites` — the NEXRAD site list (click selects the site).
+    Conus,
+    /// `data_source::international::intl_static_sites` (click live-polls).
+    Intl,
+    /// `data_source::community_feeds::community_markers` (click live-polls
+    /// a direct feed, or opens the shared-pad cluster picker).
+    Community,
+}
+
+/// Which marker a click resolves to across the three families: the
+/// nearest in-halo hit wins; exact distance ties keep the declaration
+/// order CONUS > international > community (preserving the historical
+/// CONUS-wins-ties behavior). Inputs are [`nearest_marker_within`]
+/// results.
+fn resolve_marker_click(
+    conus: Option<(usize, f32)>,
+    intl: Option<(usize, f32)>,
+    community: Option<(usize, f32)>,
+) -> Option<(MarkerFamily, usize)> {
+    [
+        conus.map(|(index, distance)| (MarkerFamily::Conus, index, distance)),
+        intl.map(|(index, distance)| (MarkerFamily::Intl, index, distance)),
+        community.map(|(index, distance)| (MarkerFamily::Community, index, distance)),
+    ]
+    .into_iter()
+    .flatten()
+    // Stable: min_by keeps the FIRST of equal elements, i.e. family order.
+    .min_by(|left, right| left.2.total_cmp(&right.2))
+    .map(|(family, index, _)| (family, index))
 }
 
 fn format_site_label(site: &RadarSite) -> String {
@@ -18215,9 +18792,10 @@ fn detect_rotation_markers_for_volume(
 }
 
 /// Preprocessed plain/dealiased moment: optional cascade dealias, optional
-/// reflectivity gate filter (GR2-style GateFilter), optional smoothing —
-/// in that order — rendered via the derived-cache entry. Each combination
-/// is keyed separately, so the per-frame fast path is untouched.
+/// reflectivity gate filter (GR2-style GateFilter), optional smoothing
+/// (binomial soften OR bilinear upsample) — in that order — rendered via
+/// the derived-cache entry. Each combination is keyed separately, so the
+/// per-frame fast path is untouched.
 #[allow(clippy::too_many_arguments)]
 fn build_preprocessed_plain_cache(
     volume: &RadarVolume,
@@ -18226,7 +18804,7 @@ fn build_preprocessed_plain_cache(
     dealiased_velocity: bool,
     dealias_cascade: bool,
     gate_filter_dbz: Option<f32>,
-    smoothed: bool,
+    smoothing: SmoothingMode,
     color_tables: &ColorTableSet,
 ) -> std::result::Result<ViewportMomentCache, String> {
     let cut = volume
@@ -18248,8 +18826,25 @@ fn build_preprocessed_plain_cache(
     if let Some(threshold) = gate_filter_dbz {
         source = apply_reflectivity_gate_filter(cut, &source, threshold);
     }
-    if smoothed {
-        source = smooth_moment_grid(&source);
+    match smoothing {
+        SmoothingMode::Native => {}
+        SmoothingMode::Soften => source = smooth_moment_grid(&source),
+        SmoothingMode::Interpolated => {
+            // Bilinear polar upsampling: the cached grid grows, the
+            // per-frame fast path stays nearest-gate. A grid already
+            // at/finer than the display targets passes through native.
+            if let Some(up) = upsample_moment_grid(cut, &source) {
+                return ViewportMomentCache::new_resampled(
+                    volume,
+                    cut_index,
+                    up.grid,
+                    &up.row_azimuths_deg,
+                    color_family_for_moment(moment),
+                    color_tables,
+                )
+                .map_err(|err| err.to_string());
+            }
+        }
     }
     ViewportMomentCache::new_derived(
         volume,
@@ -18267,7 +18862,7 @@ fn build_derived_moment_cache(
     selected_cut: usize,
     color_tables: &ColorTableSet,
     hail_levels_m: (f32, f32),
-    smoothed: bool,
+    smoothing: SmoothingMode,
 ) -> std::result::Result<ViewportMomentCache, String> {
     let (geometry_cut, grid) = if derived.is_volume_wide() {
         // Volume products render on the lowest reflectivity tilt.
@@ -18322,14 +18917,32 @@ fn build_derived_moment_cache(
         (selected_cut, Some(grid))
     };
     let grid = grid.ok_or_else(|| format!("{} compute failed", derived.label()))?;
+    let grid = match smoothing {
+        SmoothingMode::Native => grid,
+        SmoothingMode::Soften => smooth_moment_grid(&grid),
+        SmoothingMode::Interpolated => {
+            let cut = volume
+                .cuts
+                .get(geometry_cut)
+                .ok_or_else(|| "geometry cut missing".to_owned())?;
+            if let Some(up) = upsample_moment_grid(cut, &grid) {
+                return ViewportMomentCache::new_resampled(
+                    volume,
+                    geometry_cut,
+                    up.grid,
+                    &up.row_azimuths_deg,
+                    derived.color_family(),
+                    color_tables,
+                )
+                .map_err(|err| err.to_string());
+            }
+            grid
+        }
+    };
     ViewportMomentCache::new_derived(
         volume,
         geometry_cut,
-        if smoothed {
-            smooth_moment_grid(&grid)
-        } else {
-            grid
-        },
+        grid,
         derived.color_family(),
         color_tables,
     )
@@ -18414,7 +19027,7 @@ fn family_threshold_is_symmetric(family: ColorTableFamily) -> bool {
     )
 }
 
-fn format_cursor_readout(readout: &CursorReadout) -> String {
+fn format_cursor_readout(readout: &CursorReadout, unit_system: units::Units) -> String {
     let raw = readout
         .raw
         .map(|raw| raw.to_string())
@@ -18466,11 +19079,15 @@ fn format_cursor_readout(readout: &CursorReadout) -> String {
         (Some(volume_id), None, _) => format!(" rt v{volume_id:03}"),
         _ => String::new(),
     };
-    let height = format!(
-        " hgt {:.0} m ({:.1} kft)",
-        readout.height_above_radar_m,
-        readout.height_above_radar_m * 0.003_280_84,
-    );
+    let height = match unit_system {
+        // Imperial keeps the m + kft dual (analyst convention).
+        units::Units::Imperial => format!(
+            " hgt {:.0} m ({})",
+            readout.height_above_radar_m,
+            units::format_beam_height(readout.height_above_radar_m, unit_system),
+        ),
+        units::Units::Metric => format!(" hgt {:.0} m", readout.height_above_radar_m),
+    };
     format!(
         "{} {} {} cut {} {} raw {} row {} gate {} @ {} m{}{} az {:05.1} src {:05.1} range {:.1} km elev {:.2}{}{}{}",
         readout.site_id,
@@ -21662,6 +22279,17 @@ fn grlevel2_cfg_sites(cfg: &str) -> Vec<String> {
         .collect()
 }
 
+/// "1×", "2×", "½×" — the loop-speed combo's display text.
+fn loop_speed_label(percent: u16) -> String {
+    match percent {
+        25 => "¼×".to_owned(),
+        50 => "½×".to_owned(),
+        75 => "¾×".to_owned(),
+        _ if percent.is_multiple_of(100) => format!("{}×", percent / 100),
+        _ => format!("{:.1}×", f32::from(percent) / 100.0),
+    }
+}
+
 fn normalized_history_limit(limit: usize) -> usize {
     // Clamp, don't snap to presets: deployment loads raise the limit past
     // the combo options, and trims must not collapse it back to 7.
@@ -22066,10 +22694,30 @@ mod tests {
         ];
 
         let candidates = app.best_radar_candidates(35.4, -97.2);
-        let ids: Vec<&str> = candidates.iter().map(|(_, id, _, _)| id.as_str()).collect();
-        assert_eq!(ids, vec!["KTLX", "KFWS"]);
+        let labels: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.label.as_str())
+            .collect();
+        // The ranking now spans families: the Norman Testbed research pad
+        // (community static table, ~30 km out) outranks Fort Worth.
+        assert_eq!(labels, vec!["KTLX", "Norman Testbed", "KFWS"]);
+        assert_eq!(candidates[0].target, BeamTarget::Conus(2));
+        assert!(matches!(candidates[1].target, BeamTarget::Research { .. }));
+        assert_eq!(candidates[1].origin.as_deref(), Some("research feed"));
         // Sorted by 0.5° beam height ascending.
-        assert!(candidates[0].2 < candidates[1].2);
+        assert!(candidates[0].beam_m < candidates[1].beam_m);
+        assert!(candidates[1].beam_m < candidates[2].beam_m);
+
+        // Over Europe the CONUS catalog is empty but the menu still ranks:
+        // Ängelholm's click point must offer SMHI's site first.
+        let europe = app.best_radar_candidates(56.4, 12.9);
+        assert!(!europe.is_empty(), "European click must find intl sites");
+        assert!(matches!(europe[0].target, BeamTarget::Intl { .. }));
+        assert!(
+            europe[0].label.contains("ngelholm"),
+            "nearest to the click: {}",
+            europe[0].label
+        );
     }
 
     #[test]
@@ -22437,13 +23085,18 @@ mod tests {
             realtime_last_chunk_type: None,
         };
 
-        let formatted = format_cursor_readout(&readout);
+        let formatted = format_cursor_readout(&readout, units::Units::Imperial);
 
         assert!(formatted.contains("KTLX 01:30:00"));
         assert!(formatted.contains("row 42 gate 123"));
         assert!(formatted.contains("az 181.2 src 180.9"));
         assert!(formatted.contains("raw 86"));
         assert!(formatted.contains("rt v012 c034"));
+        // Imperial keeps the kft parenthetical; metric drops it.
+        assert!(formatted.contains("hgt 900 m (3.0 kft)"));
+        let metric = format_cursor_readout(&readout, units::Units::Metric);
+        assert!(metric.contains("hgt 900 m"));
+        assert!(!metric.contains("kft"));
     }
 
     #[test]
@@ -22487,7 +23140,7 @@ mod tests {
             realtime_last_chunk_type: None,
         };
 
-        let formatted = format_cursor_readout(&readout);
+        let formatted = format_cursor_readout(&readout, units::Units::Imperial);
 
         assert!(formatted.contains("Vrot 21.0 m/s dV 42.0 sep 1.25 km"));
         assert!(formatted.contains("in r4/g100 210.5 -18.0"));
@@ -22532,7 +23185,7 @@ mod tests {
             123,
             (0, 0),
             (32, 64),
-            false,
+            SmoothingMode::Native,
             false,
             i16::MIN,
             viewport,
@@ -22546,30 +23199,201 @@ mod tests {
             456,
             (0, 0),
             (32, 64),
-            false,
+            SmoothingMode::Native,
             false,
             i16::MIN,
             viewport,
         );
         assert_ne!(first_pixels, second_pixels);
 
-        let first_samples = RenderWorkerSampleCacheSignature::new(
-            10,
-            1,
-            DisplayProduct::Moment(MomentType::Reflectivity),
-            MomentType::Reflectivity,
-            false,
-            viewport,
+        let sample_signature = |smoothing: SmoothingMode| {
+            RenderWorkerSampleCacheSignature::new(
+                10,
+                1,
+                DisplayProduct::Moment(MomentType::Reflectivity),
+                MomentType::Reflectivity,
+                false,
+                smoothing,
+                viewport,
+            )
+        };
+        assert_eq!(
+            sample_signature(SmoothingMode::Native),
+            sample_signature(SmoothingMode::Native)
         );
-        let second_samples = RenderWorkerSampleCacheSignature::new(
-            10,
-            1,
-            DisplayProduct::Moment(MomentType::Reflectivity),
-            MomentType::Reflectivity,
-            false,
-            viewport,
+        // Native and Soften SHARE sample caches (the binomial pass keeps
+        // geometry and coverage identical by construction)…
+        assert_eq!(
+            sample_signature(SmoothingMode::Native),
+            sample_signature(SmoothingMode::Soften)
         );
-        assert_eq!(first_samples, second_samples);
+        // …but the interpolated grid has different geometry: its sample
+        // caches must never be confused with native ones.
+        assert_ne!(
+            sample_signature(SmoothingMode::Native),
+            sample_signature(SmoothingMode::Interpolated)
+        );
+    }
+
+    #[test]
+    fn smoothing_modes_render_under_distinct_keys() {
+        let viewport_signature = |smoothing: SmoothingMode| {
+            RenderWorkerViewportSignature::new(
+                10,
+                1,
+                DisplayProduct::Moment(MomentType::Reflectivity),
+                MomentType::Reflectivity,
+                false,
+                123,
+                (0, 0),
+                (32, 64),
+                smoothing,
+                false,
+                i16::MIN,
+                ViewportKey {
+                    width: 800,
+                    height: 600,
+                    radar_x_px: 4_000,
+                    radar_y_px: 3_000,
+                    km_per_px_x: 160_000,
+                    km_per_px_y: 160_000,
+                    rotation_mrad: 0,
+                },
+            )
+        };
+        assert_ne!(
+            viewport_signature(SmoothingMode::Native),
+            viewport_signature(SmoothingMode::Soften)
+        );
+        assert_ne!(
+            viewport_signature(SmoothingMode::Soften),
+            viewport_signature(SmoothingMode::Interpolated)
+        );
+        assert_ne!(
+            viewport_signature(SmoothingMode::Native),
+            viewport_signature(SmoothingMode::Interpolated)
+        );
+    }
+
+    #[test]
+    fn interpolated_paint_stays_inside_native_coverage() {
+        // A coarse international-style cut (1° × 1000 m) with echo over a
+        // 90° sector: the interpolated render must paint pixels ONLY where
+        // the native render does (the field rule: a gate only renders
+        // where the native display would), while still painting the bulk
+        // of the sector.
+        let gate_range = radar_core::GateRange {
+            first_gate_m: 1000,
+            gate_spacing_m: 1000,
+            gate_count: 60,
+        };
+        let mut volume = RadarVolume::new(
+            radar_core::RadarSite::new("TEST"),
+            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+        );
+        let mut cut = ElevationCut::new(0.5, Some(1));
+        let mut grid = MomentGrid::new_u8(
+            MomentType::Reflectivity,
+            gate_range.clone(),
+            2.0,
+            66.0,
+            Some(0),
+            Some(1),
+        );
+        for radial in 0..360 {
+            cut.radials
+                .push(test_radial(radial as f32, gate_range.clone()));
+            let row = if radial < 90 {
+                // 40-50 dBZ ramp along range.
+                (0..60)
+                    .map(|gate| 66 + 80 + (gate % 20) as u8)
+                    .collect::<Vec<u8>>()
+            } else {
+                vec![0; 60] // nodata
+            };
+            grid.push_u8_row_slice(radial, &row).expect("row");
+        }
+        cut.moments.insert(MomentType::Reflectivity, grid);
+        volume.cuts.push(cut);
+
+        let options = ViewportRasterOptions {
+            width: 240,
+            height: 240,
+            radar_x_px: 120.0,
+            radar_y_px: 120.0,
+            km_per_px_x: 0.6,
+            km_per_px_y: 0.6,
+            rotation_rad: 0.0,
+        };
+        let color_tables = ColorTableSet::default();
+        let render = |smoothing: SmoothingMode| {
+            let cache = build_preprocessed_plain_cache(
+                &volume,
+                0,
+                &MomentType::Reflectivity,
+                false,
+                false,
+                None,
+                smoothing,
+                &color_tables,
+            )
+            .expect("cache builds");
+            let mut pixels = vec![0u8; 240 * 240 * 4];
+            cache
+                .render_moment_rgba_into(&volume, options, &mut pixels)
+                .expect("renders");
+            pixels
+        };
+        let native = render(SmoothingMode::Native);
+        let interpolated = render(SmoothingMode::Interpolated);
+
+        let mut native_painted = 0usize;
+        let mut interpolated_painted = 0usize;
+        let mut grew = 0usize;
+        for pixel in 0..240 * 240 {
+            let native_on = native[pixel * 4 + 3] != 0;
+            let interpolated_on = interpolated[pixel * 4 + 3] != 0;
+            native_painted += usize::from(native_on);
+            interpolated_painted += usize::from(interpolated_on);
+            if interpolated_on && !native_on {
+                grew += 1;
+            }
+        }
+        assert!(native_painted > 1000, "native painted {native_painted}");
+        assert_eq!(
+            grew, 0,
+            "interpolated mode painted {grew} pixels outside native coverage"
+        );
+        assert!(
+            interpolated_painted as f32 >= native_painted as f32 * 0.9,
+            "interpolated lost too much coverage: {interpolated_painted} vs {native_painted}"
+        );
+    }
+
+    #[test]
+    fn smoothing_mode_settings_round_trip_and_legacy_mapping() {
+        let mut s = settings::AppSettings::default();
+        // Fresh config: native.
+        assert_eq!(SmoothingMode::from_settings(&s), SmoothingMode::Native);
+        // Legacy config: the old checkbox meant the binomial pass.
+        s.smooth_display = true;
+        assert_eq!(SmoothingMode::from_settings(&s), SmoothingMode::Soften);
+        // The mode string wins over the legacy bool when present.
+        s.smooth_display_mode = "interpolated".to_owned();
+        assert_eq!(
+            SmoothingMode::from_settings(&s),
+            SmoothingMode::Interpolated
+        );
+        s.smooth_display_mode = "native".to_owned();
+        assert_eq!(SmoothingMode::from_settings(&s), SmoothingMode::Native);
+        for mode in [
+            SmoothingMode::Native,
+            SmoothingMode::Soften,
+            SmoothingMode::Interpolated,
+        ] {
+            s.smooth_display_mode = mode.settings_str().to_owned();
+            assert_eq!(SmoothingMode::from_settings(&s), mode);
+        }
     }
 
     #[test]
@@ -22749,7 +23573,7 @@ mod tests {
                 color_table_signature,
                 storm_motion_key: (450, 350),
                 hail_levels_key: (32, 64),
-                smoothed: false,
+                smoothing: SmoothingMode::Native,
                 dealias_cascade: false,
                 gate_filter_decidbz: i16::MIN,
                 viewport: test_viewport_key(1320, 820),
@@ -22762,7 +23586,7 @@ mod tests {
             plain_velocity_render_dealiased: true,
             color_tables,
             hail_levels_m: (3200.0, 6400.0),
-            smoothed: false,
+            smoothing: SmoothingMode::Native,
             dealias_cascade: false,
             gate_filter_decidbz: i16::MIN,
             storm_motion: StormMotion {
@@ -23452,6 +24276,88 @@ mod tests {
         }
     }
 
+    /// The community map-marker catalog mirrors the intl contract:
+    /// embedded table only, finite coordinates, every marker resolvable to
+    /// its feeds — and the Feeds menu grows from the SAME table, so menu
+    /// and markers stay in lockstep by construction.
+    #[test]
+    fn community_marker_catalog_is_complete_offline() {
+        let feeds = data_source::community_feeds::community_feeds();
+        let markers = data_source::community_feeds::community_markers();
+        assert!(!markers.is_empty());
+        let mut covered = 0;
+        for marker in markers {
+            assert!(!marker.label.is_empty());
+            assert!(marker.latitude_deg.is_finite() && marker.longitude_deg.is_finite());
+            // Every index a click can dispatch on resolves to a feed.
+            for &feed_index in &marker.feed_indices {
+                assert!(feeds.get(feed_index).is_some(), "{}", marker.label);
+            }
+            covered += marker.feed_indices.len();
+        }
+        // Lockstep: the markers cover the menu's table exactly.
+        assert_eq!(covered, feeds.len());
+        // The shared-pad cluster draws as ONE marker with a picker.
+        assert!(
+            markers
+                .iter()
+                .any(|marker| marker.label == "Norman Testbed" && marker.feed_indices.len() == 8)
+        );
+    }
+
+    #[test]
+    fn resolve_marker_click_picks_the_nearest_family_with_conus_winning_ties() {
+        use MarkerFamily::*;
+        // Nearest across families wins regardless of declaration order.
+        assert_eq!(
+            resolve_marker_click(Some((1, 9.0)), Some((2, 4.0)), Some((3, 6.0))),
+            Some((Intl, 2))
+        );
+        assert_eq!(
+            resolve_marker_click(Some((1, 9.0)), None, Some((3, 2.0))),
+            Some((Community, 3))
+        );
+        // Exact ties keep the historical precedence: CONUS > intl >
+        // community.
+        assert_eq!(
+            resolve_marker_click(Some((1, 5.0)), Some((2, 5.0)), Some((3, 5.0))),
+            Some((Conus, 1))
+        );
+        assert_eq!(
+            resolve_marker_click(None, Some((2, 5.0)), Some((3, 5.0))),
+            Some((Intl, 2))
+        );
+        assert_eq!(resolve_marker_click(None, None, None), None);
+    }
+
+    /// Clicking the shared-pad cluster marker opens the feed picker
+    /// instead of polling (eight stacked markers would be useless), and
+    /// re-clicking it toggles the picker shut.
+    #[test]
+    fn cluster_marker_click_toggles_the_feed_picker() {
+        let markers = data_source::community_feeds::community_markers();
+        let cluster_index = markers
+            .iter()
+            .position(|marker| marker.feed_indices.len() > 1)
+            .expect("the Norman Testbed cluster exists");
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let community_points = vec![(cluster_index, egui::pos2(100.0, 100.0))];
+        let pointer = egui::pos2(103.0, 100.0);
+
+        app.handle_marker_click(&[], &[], &community_points, pointer);
+        assert_eq!(app.community_menu, Some(cluster_index));
+        // The picker, not the poll, owns a cluster click.
+        assert!(!app.poll_active);
+
+        app.handle_marker_click(&[], &[], &community_points, pointer);
+        assert_eq!(app.community_menu, None, "re-click toggles the picker");
+
+        // A click elsewhere on the map dismisses an open picker.
+        app.community_menu = Some(cluster_index);
+        app.handle_marker_click(&[], &[], &community_points, egui::pos2(500.0, 500.0));
+        assert_eq!(app.community_menu, None);
+    }
+
     #[test]
     fn assemble_intl_parts_single_file_and_merge_contracts() {
         let volume = test_aliased_velocity_volume();
@@ -23484,6 +24390,35 @@ mod tests {
         // A saved selection from a build that shipped more providers must
         // not panic the picker — fall back to the raw id.
         assert_eq!(intl_provider_label("not-a-provider"), "not-a-provider");
+    }
+
+    /// Live smoke of one community research feed through the same pieces
+    /// the custom-URL poll tick composes: dir.list -> newest entry ->
+    /// download -> shared magic-byte decode. Excluded from gates; run
+    /// explicitly with
+    /// `cargo test -p app_ui community_feed_live -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "network: hits the live IEM community Level II host"]
+    fn community_feed_live_poll_roundtrip_iem() {
+        let feed = data_source::community_feeds::community_feeds()
+            .iter()
+            .find(|feed| feed.id == "WILU")
+            .expect("WILU in the community table");
+        let listing =
+            data_source::fetch_text(&format!("{}/dir.list", feed.poll_url)).expect("live dir.list");
+        let newest = newest_dir_list_entry(&listing).expect("non-empty dir.list");
+        println!("newest {} entry: {newest}", feed.id);
+        let raw = data_source::fetch_volume_bytes(&format!("{}/{newest}", feed.poll_url))
+            .expect("volume download");
+        let volume = nexrad_io::decode_supported_volume_bytes(&raw).expect("decode");
+        println!(
+            "decoded {} at {}: {} cuts, {} radials",
+            volume.site.id,
+            volume.volume_time,
+            volume.cuts.len(),
+            volume.metadata.decoded_radial_count
+        );
+        assert!(!volume.cuts.is_empty());
     }
 
     /// Live smoke of the full international poll pipeline (network):
@@ -24852,7 +25787,7 @@ mod tests {
             tor_tracks: tor_tracks::TorTracksState::default(),
             gate_filter_dbz: None,
             dealias_cascade: false,
-            display_smoothing: false,
+            display_smoothing: SmoothingMode::Native,
             hail_freezing_level_km: 3.2,
             hail_minus20_level_km: 6.4,
             display_thresholds: BTreeMap::new(),
@@ -24912,6 +25847,7 @@ mod tests {
             intl_picker_provider: String::new(),
             intl_sites: None,
             intl_sites_rx: None,
+            community_menu: None,
             spc_data: spc_layers::SpcData::default(),
             spc_outlooks_enabled: Vec::new(),
             spc_kinds_memory: Vec::new(),
@@ -25287,7 +26223,7 @@ mod tests {
             0,
             (0, 0),
             (32, 64),
-            false,
+            SmoothingMode::Native,
             false,
             i16::MIN,
             test_viewport_key(width, 100),
@@ -25363,7 +26299,7 @@ mod tests {
                 0,
                 (0, 0),
                 (32, 64),
-                false,
+                SmoothingMode::Native,
                 false,
                 i16::MIN,
                 test_viewport_key(width, height),

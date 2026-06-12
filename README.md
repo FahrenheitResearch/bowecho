@@ -145,6 +145,12 @@ During severe weather, follow your local NWS office and emergency management.
   grayskieswx (YouTube). The map annotation tools' front glyphs, hatch
   fills, warning-polygon styling, and icon designs reimplement his
   renderer's geometry in Rust, shared by the author for this purpose.
+- Research-radar color tables ("research" badge in the pickers) from
+  GURT V3 — the Graphic Utility Radar Toolkit by ambient330
+  ([Graphic-Utility-Radar-Toolkit-V3](https://github.com/ambient330/Graphic-Utility-Radar-Toolkit-V3),
+  MIT license), used with appreciation. The GURT reflectivity, velocity,
+  spectrum width, CC, ZDR, and KDP ramps are ported value-for-value,
+  tuned for DOW/COW mobile-radar (X-band) work.
 
 ## License
 

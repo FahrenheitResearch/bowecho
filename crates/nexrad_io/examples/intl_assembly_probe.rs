@@ -1,6 +1,6 @@
 //! Live end-to-end probe of the split-volume international ODIM providers
-//! (SHMU Slovakia, DWD Germany, CHMI Czechia): plan -> download -> decode
-//! -> merge, against the real open-data endpoints.
+//! (SHMU Slovakia, DWD Germany, CHMI Czechia, EUMETNET ORD): plan ->
+//! download -> decode -> merge, against the real open-data endpoints.
 //!
 //! For each requested provider this fetches the newest [`FramePlan`] for
 //! one site, downloads every part with `data_source::fetch_volume_bytes`,
@@ -18,10 +18,13 @@
 //!
 //! `dwd-full` probes `DwdProvider::with_dual_pol()` (ZDR/RhoHV/PhiDP
 //! sweeps included, ~50 parts); it is not part of `all`. Default sites:
-//! shmu=skjav, dwd=asb, chmi=brd. Exit code 1 when any requested probe
-//! fails.
+//! shmu=skjav, dwd=asb, chmi=brd, ord=nohur (Norway's split PVOL feed —
+//! pass another ORD site, e.g. frtou, to probe the per-sweep SCAN shape).
+//! Exit code 1 when any requested probe fails.
 
-use data_source::international::{ChmiProvider, DwdProvider, IntlProvider, ShmuProvider};
+use data_source::international::{
+    ChmiProvider, DwdProvider, IntlProvider, OrdProvider, ShmuProvider,
+};
 use radar_core::RadarVolume;
 
 fn main() {
@@ -34,6 +37,7 @@ fn main() {
         ("dwd", Box::new(DwdProvider::new()), "asb"),
         ("dwd-full", Box::new(DwdProvider::with_dual_pol()), "asb"),
         ("chmi", Box::new(ChmiProvider::new()), "brd"),
+        ("ord", Box::new(OrdProvider::new()), "nohur"),
     ];
 
     let mut ran = 0usize;
@@ -58,7 +62,9 @@ fn main() {
     }
 
     if ran == 0 {
-        eprintln!("unknown provider '{selection}' (expected shmu, dwd, dwd-full, chmi, or all)");
+        eprintln!(
+            "unknown provider '{selection}' (expected shmu, dwd, dwd-full, chmi, ord, or all)"
+        );
         std::process::exit(2);
     }
     if failures > 0 {

@@ -763,8 +763,8 @@ fn tools(ui: &mut egui::Ui) {
         ui,
         "Right-click the map",
         "— the \"Lowest beam here\" menu: the three WSR-88Ds with the lowest 0.5° beam over \
-         that point, each with beam height (kft) and distance; click to switch and load. \
-         Right-clicking also jumps to the nearest site directly.",
+         that point, each with beam height and distance (units per Settings ▸ Display); \
+         click to switch and load. Right-clicking also jumps to the nearest site directly.",
     );
     action(
         ui,

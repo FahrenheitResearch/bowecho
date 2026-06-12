@@ -25,6 +25,7 @@ const PREFERRED_SITES: &[(&str, &str)] = &[
     ("dmi", "06177"),
     ("geosphere", "hochficht"),
     ("fmi", "fianj"),
+    ("ord", "nlhrw"),
 ];
 
 fn main() {

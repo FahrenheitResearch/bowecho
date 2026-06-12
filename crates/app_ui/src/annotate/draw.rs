@@ -41,12 +41,14 @@ const PIP_OUTLINE_WIDTH: f32 = 1.5;
 const ARC_SEGMENTS: usize = 12;
 
 /// Draws one annotation through `project` at `alpha` (1.0 committed,
-/// lower for the in-progress draft preview).
+/// lower for the in-progress draft preview). `units` drives the range
+/// circle's radius label; every other shape ignores it.
 pub(crate) fn annotation<F: Fn(GeoPoint) -> Pos2>(
     painter: &egui::Painter,
     annotation: &Annotation,
     project: &F,
     alpha: f32,
+    units: crate::units::Units,
 ) {
     match annotation {
         Annotation::Crosshair { at, style } => {
@@ -67,8 +69,7 @@ pub(crate) fn annotation<F: Fn(GeoPoint) -> Pos2>(
             edge,
             style,
         } => {
-            let color = resolve_color(style, ToolKind::RangeCircle, alpha);
-            draw_range_circle(painter, *center, *edge, project, style, color, alpha);
+            draw_range_circle(painter, *center, *edge, project, style, alpha, units);
         }
         Annotation::Freehand { points, style } => {
             let pts: Vec<Pos2> = points.iter().map(|p| project(*p)).collect();
@@ -148,15 +149,18 @@ pub(crate) fn draft_nodes(painter: &egui::Painter, points: &[Pos2]) {
 /// anchor — exact under the map's AEQD) + a haloed radius label at
 /// 12 o'clock reading geodesic distance, so the readout is honest at any
 /// zoom. Haversine, spherical Earth R = 6371 km (<0.5% — fine for a label).
+/// The label follows Settings ▸ Display ▸ Units: imperial leads with
+/// miles (km in parentheses), metric reads km alone.
 fn draw_range_circle<F: Fn(GeoPoint) -> Pos2>(
     painter: &egui::Painter,
     center: GeoPoint,
     edge: GeoPoint,
     project: &F,
     style: &ShapeStyle,
-    color: Color32,
     alpha: f32,
+    units: crate::units::Units,
 ) {
+    let color = resolve_color(style, ToolKind::RangeCircle, alpha);
     let center_px = project(center);
     let radius_px = center_px.distance(project(edge));
     if radius_px < 2.0 {
@@ -170,7 +174,7 @@ fn draw_range_circle<F: Fn(GeoPoint) -> Pos2>(
     painter.circle_stroke(center_px, radius_px, Stroke::new(style.thickness, color));
     painter.circle_filled(center_px, 2.5, color);
     let km = geo_distance_km(center, edge);
-    let label = format!("{:.1} mi / {:.1} km", km * 0.621_371, km);
+    let label = crate::units::format_range_ring_km(km, units);
     let anchor = center_px - vec2(0.0, radius_px + 5.0);
     let font = egui::FontId::proportional(12.0);
     painter.text(
@@ -846,8 +850,14 @@ mod tests {
             // Linear toy projection: enough to spread shapes across screen.
             let project = |g: GeoPoint| pos2((g.lon + 100.0) * 40.0, (40.0 - g.lat) * 40.0);
             for shape in super::super::persist::every_shape_kind() {
-                annotation(&painter, &shape, &project, 1.0);
-                annotation(&painter, &shape, &project, 0.6);
+                annotation(
+                    &painter,
+                    &shape,
+                    &project,
+                    1.0,
+                    crate::units::Units::Imperial,
+                );
+                annotation(&painter, &shape, &project, 0.6, crate::units::Units::Metric);
             }
             // Single-vertex drafts (the first click) must render quietly.
             for d in super::super::TOOLS {
@@ -865,7 +875,13 @@ mod tests {
                         label: Some("CUSTOM TEXT".to_owned()),
                     },
                 );
-                annotation(&painter, &draft, &project, 0.6);
+                annotation(
+                    &painter,
+                    &draft,
+                    &project,
+                    0.6,
+                    crate::units::Units::Imperial,
+                );
             }
             draft_nodes(&painter, &[pos2(10.0, 10.0), pos2(50.0, 40.0)]);
         });

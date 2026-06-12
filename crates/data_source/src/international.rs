@@ -49,6 +49,7 @@ mod dwd;
 mod fmi;
 mod geosphere;
 pub mod listing;
+mod ord;
 mod shmu;
 mod smhi;
 
@@ -57,6 +58,7 @@ pub use dmi::DmiProvider;
 pub use dwd::DwdProvider;
 pub use fmi::FmiProvider;
 pub use geosphere::GeoSphereProvider;
+pub use ord::OrdProvider;
 pub use shmu::ShmuProvider;
 pub use smhi::SmhiProvider;
 
@@ -171,7 +173,9 @@ pub trait IntlProvider: Send + Sync {
 /// feeds (one frame = several ODIM files merged with
 /// `radar_core::merge_radar_volumes`): SHMU Slovakia, DWD Germany, CHMI
 /// Czechia. Multi-station tar feed (site-filtered decode, see
-/// [`JmaProvider`]): JMA Japan.
+/// [`JmaProvider`]): JMA Japan. Multi-country feed mixing single-file and
+/// split plan shapes per site: EUMETNET ORD ([`OrdProvider`], 14 European
+/// countries without a national BowEcho provider).
 pub fn intl_providers() -> Vec<Box<dyn IntlProvider>> {
     vec![
         Box::new(SmhiProvider::new()),
@@ -182,6 +186,7 @@ pub fn intl_providers() -> Vec<Box<dyn IntlProvider>> {
         Box::new(DwdProvider::new()),
         Box::new(ChmiProvider::new()),
         Box::new(JmaProvider),
+        Box::new(OrdProvider::new()),
     ]
 }
 
@@ -608,7 +613,8 @@ mod tests {
                 "shmu",
                 "dwd",
                 "chmi",
-                "jma"
+                "jma",
+                "ord"
             ]
         );
         let mut unique = ids.clone();
@@ -626,7 +632,9 @@ mod tests {
     /// site has finite coordinates inside a generous national bounding box
     /// (radars sit on national territory; a swapped lat/lon, a missing
     /// minus sign, or a degrees/radians slip all land far outside).
-    /// `(lat_min, lat_max, lon_min, lon_max)` for each provider country.
+    /// `(lat_min, lat_max, lon_min, lon_max)` for each SITE country — the
+    /// multi-country ORD provider spans 14 of them, so the lookup keys off
+    /// [`IntlSite::country`] rather than the provider's own label.
     fn national_bounding_box(country: &str) -> Option<(f32, f32, f32, f32)> {
         Some(match country {
             "Sweden" => (55.0, 69.5, 10.5, 24.5),
@@ -638,6 +646,21 @@ mod tests {
             "Czechia" => (48.5, 51.1, 12.0, 18.9),
             // Japan incl. the southwest island arcs (Okinawa, Ishigaki).
             "Japan" => (24.0, 45.6, 122.5, 146.0),
+            // EUMETNET ORD countries (France incl. Corsica).
+            "Belgium" => (49.4, 51.6, 2.4, 6.5),
+            "Switzerland" => (45.7, 47.9, 5.9, 10.6),
+            "Estonia" => (57.4, 59.8, 21.6, 28.3),
+            "France" => (41.2, 51.2, -5.3, 9.7),
+            "Croatia" => (42.3, 46.6, 13.4, 19.5),
+            "Ireland" => (51.3, 55.5, -10.7, -5.9),
+            "Iceland" => (63.2, 66.7, -24.6, -13.4),
+            "Lithuania" => (53.8, 56.5, 20.9, 26.9),
+            "Malta" => (35.7, 36.1, 14.1, 14.6),
+            "Netherlands" => (50.7, 53.6, 3.3, 7.3),
+            "Norway" => (57.9, 71.3, 4.5, 31.2),
+            "Poland" => (49.0, 54.9, 14.1, 24.2),
+            "Romania" => (43.6, 48.3, 20.2, 29.8),
+            "Slovenia" => (45.4, 46.9, 13.3, 16.6),
             _ => return None,
         })
     }
@@ -651,9 +674,9 @@ mod tests {
                 "{}: static catalog must not be empty",
                 provider.id()
             );
-            let (lat_min, lat_max, lon_min, lon_max) = national_bounding_box(provider.country())
-                .unwrap_or_else(|| panic!("no bounding box for {}", provider.country()));
             for site in &sites {
+                let (lat_min, lat_max, lon_min, lon_max) = national_bounding_box(site.country)
+                    .unwrap_or_else(|| panic!("no bounding box for {}", site.country));
                 assert_eq!(site.provider_id, provider.id());
                 assert!(!site.site_id.is_empty() && !site.label.is_empty());
                 let (Some(latitude), Some(longitude)) = (site.latitude_deg, site.longitude_deg)
@@ -673,7 +696,7 @@ mod tests {
                     provider.id(),
                     site.site_id,
                     site.label,
-                    provider.country()
+                    site.country
                 );
             }
         }
