@@ -6,8 +6,14 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+nexrad_io = { path = "../nexrad_io" }
 quick-xml.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Only for examples/intl_probe.rs (live download + decode smoke); the
+# library itself must never depend on the decode layer.
+nexrad_io = { path = "../nexrad_io" }

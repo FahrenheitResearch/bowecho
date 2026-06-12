@@ -123,6 +123,10 @@ const KNOWN_POLL_FEEDS: &[(&str, &str)] = &[
         "https://mesonet-nexrad.agron.iastate.edu/level2/raw/GAWX",
     ),
 ];
+/// International catalog-poll cadence. National open-data feeds publish on
+/// 5-minute-ish schedules and each tick costs an upstream API round trip —
+/// 60 s, not the custom URL poll's 15 s dir.list cadence.
+const INTL_POLL_SECONDS: u64 = 60;
 const ACTIVE_ALERTS_URL: &str = "https://api.weather.gov/alerts/active?status=actual";
 const SPC_MD_INDEX_URL: &str = "https://www.spc.noaa.gov/products/md/";
 const SPC_PRODUCT_BASE_URL: &str = "https://www.spc.noaa.gov";
@@ -415,6 +419,8 @@ enum LocalRadarKind {
     OdimH5,
     /// CfRadial 1.x classic netCDF (CDF magic).
     CfRadial,
+    /// JMA polar-coordinate radar GRIB2 tar (ustar magic + JMAGPV name).
+    JmaGrib2Tar,
     /// Anything Archive II-shaped (AR2V, gzip, bzip2, msg31).
     NexradLevel2,
 }
@@ -426,7 +432,9 @@ fn sniff_local_radar_kind(path: &Path) -> LocalRadarKind {
     if path.is_dir() {
         return LocalRadarKind::MobileArchive;
     }
-    let mut head = [0u8; 8];
+    // 512 bytes: every magic lives in the first 8 except the JMA tar check
+    // (ustar magic at byte 257 + member name), which needs one header block.
+    let mut head = [0u8; 512];
     let filled = std::fs::File::open(path)
         .and_then(|mut file| {
             use std::io::Read;
@@ -445,16 +453,18 @@ fn sniff_local_radar_kind(path: &Path) -> LocalRadarKind {
     if nexrad_io::mobile_archive::looks_like_zip_bytes(head) {
         return LocalRadarKind::MobileArchive;
     }
-    if nexrad_io::dorade::looks_like_dorade_bytes(head)
-        || (filled < 8 && nexrad_io::dorade::looks_like_dorade_path(path))
-    {
+    // Sweepfile names cover heads too short for the DORADE byte sniff.
+    if filled < 8 && nexrad_io::dorade::looks_like_dorade_path(path) {
         return LocalRadarKind::DoradeSweep;
     }
-    if nexrad_io::odim::looks_like_hdf5_bytes(head) {
-        return LocalRadarKind::OdimH5;
-    }
-    if nexrad_io::cfradial::looks_like_netcdf3_bytes(head) {
-        return LocalRadarKind::CfRadial;
+    // Shared magic-byte order — the same dispatch
+    // nexrad_io::decode_supported_volume_bytes uses.
+    match nexrad_io::sniff_supported_volume_format(head) {
+        nexrad_io::SupportedVolumeFormat::Dorade => return LocalRadarKind::DoradeSweep,
+        nexrad_io::SupportedVolumeFormat::OdimH5 => return LocalRadarKind::OdimH5,
+        nexrad_io::SupportedVolumeFormat::CfRadial => return LocalRadarKind::CfRadial,
+        nexrad_io::SupportedVolumeFormat::JmaGrib2Tar => return LocalRadarKind::JmaGrib2Tar,
+        nexrad_io::SupportedVolumeFormat::NexradLevel2 => {}
     }
     // Sniff failed entirely (unreadable file): fall back to names so the
     // error surfaces from the matching decoder.
@@ -513,21 +523,17 @@ fn decode_mobile_radar_batch(
                 source_label: format!("DORADE {}", path.display()),
             });
         }
-        LocalRadarKind::OdimH5 | LocalRadarKind::CfRadial => {
+        LocalRadarKind::OdimH5 | LocalRadarKind::CfRadial | LocalRadarKind::JmaGrib2Tar => {
             let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
-            let (mut volume, format_label) = if kind == LocalRadarKind::OdimH5 {
-                (
-                    nexrad_io::odim::decode_odim_h5_volume(&bytes)
-                        .map_err(|err| err.to_string())?,
-                    "ODIM_H5",
-                )
-            } else {
-                (
-                    nexrad_io::cfradial::decode_cfradial1_volume(&bytes)
-                        .map_err(|err| err.to_string())?,
-                    "CfRadial",
-                )
+            let format_label = match kind {
+                LocalRadarKind::OdimH5 => "ODIM_H5",
+                LocalRadarKind::CfRadial => "CfRadial",
+                _ => "JMA GRIB2",
             };
+            // The shared router re-sniffs the full bytes and dispatches to
+            // the same decoder the head sniff picked (all magics live in
+            // the head window).
+            let mut volume = nexrad_io::decode_supported_volume_bytes(&bytes)?;
             volume.metadata.source_path = Some(path.display().to_string());
             timings.decode_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
             frames.push(DecodedLoad {
@@ -755,7 +761,7 @@ struct ViewerApp {
     model_layer_generation: u64,
     /// Primary radar layer opacity (draw-time tint; no re-render).
     radar_opacity: f32,
-    /// Background HRRR ingest (rw-ingest library) in flight.
+    /// Background model ingest (rw-ingest library) in flight.
     model_ingest_rx: Option<mpsc::Receiver<std::result::Result<String, String>>>,
     /// Live per-stage progress lines from the ingest worker.
     model_ingest_progress_rx: Option<mpsc::Receiver<String>>,
@@ -791,6 +797,17 @@ struct ViewerApp {
     poll_last_file: Option<String>,
     poll_next: Option<Instant>,
     poll_rx: Option<mpsc::Receiver<PolledVolumeResult>>,
+    /// What the poller follows when `poll_active`: the custom URL
+    /// (default) or an international provider/site from data_source's
+    /// registry. One poll, two sources — see [`PollSource`].
+    poll_source: PollSource,
+    /// International picker state (DATA tab): the provider whose site list
+    /// is shown, the fetched catalog, and the in-flight background fetch
+    /// (site listings hit the provider's HTTP catalog — never the UI
+    /// thread).
+    intl_picker_provider: String,
+    intl_sites: Option<Vec<data_source::international::IntlSite>>,
+    intl_sites_rx: Option<mpsc::Receiver<IntlSiteListResult>>,
     /// SPC outlooks + live storm reports.
     spc_data: spc_layers::SpcData,
     spc_outlooks_enabled: Vec<String>,
@@ -1625,6 +1642,74 @@ type OaDeriveResult = std::result::Result<(Arc<rw_ui::FieldData>, String), Strin
 type OaCompositesResult = std::result::Result<Vec<oa_derived::CompositeField>, String>;
 /// URL-poll download: (file name, decoded volume) or error.
 type PolledVolumeResult = std::result::Result<(String, Arc<RadarVolume>), String>;
+/// International site-catalog fetch: (provider id it answers for, sites or
+/// error) — the id lets the drain drop answers for a provider the user has
+/// since navigated away from.
+type IntlSiteListResult = (
+    String,
+    std::result::Result<Vec<data_source::international::IntlSite>, String>,
+);
+
+/// What the shared poller follows. There is ONE poll: both variants share
+/// `poll_active` / `poll_rx` / `poll_last_file` / `poll_next` and the
+/// `install_polled_volume` install path, so every ownership guard — the
+/// auto-refresh skip in `maybe_refresh_realtime_level2`, the explicit-load
+/// pauses, history upsert + follow — applies to both identically.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PollSource {
+    /// GR2A-style dir.list root polling (the original custom-URL poll).
+    /// The payload records the URL the poll was STARTED with (persistence
+    /// and source-change detection); the live tick keeps following the
+    /// `poll_url` text field exactly as it always has.
+    CustomUrl(String),
+    /// A `data_source::international` registry feed: provider id
+    /// ([`data_source::international::IntlProvider::id`]) + its
+    /// provider-scoped site id.
+    Intl {
+        provider_id: String,
+        site_id: String,
+    },
+}
+
+impl PollSource {
+    /// Persist the selection, mirroring `poll_url`'s behavior: each variant
+    /// writes only its own settings fields, so switching sources never
+    /// forgets the other one.
+    fn save_to_settings(&self, settings: &mut settings::AppSettings) {
+        match self {
+            PollSource::CustomUrl(url) => settings.poll_url = url.clone(),
+            PollSource::Intl {
+                provider_id,
+                site_id,
+            } => {
+                settings.intl_provider = provider_id.clone();
+                settings.intl_site = site_id.clone();
+            }
+        }
+    }
+
+    /// Rebuild the last session's international selection — `None` until
+    /// the user has ever started an international poll (mirrors how a
+    /// restored `poll_url` arms Start without auto-starting).
+    fn intl_from_settings(settings: &settings::AppSettings) -> Option<PollSource> {
+        let provider_id = settings.intl_provider.trim();
+        let site_id = settings.intl_site.trim();
+        (!provider_id.is_empty() && !site_id.is_empty()).then(|| PollSource::Intl {
+            provider_id: provider_id.to_owned(),
+            site_id: site_id.to_owned(),
+        })
+    }
+}
+
+/// Picker label for an international provider id; falls back to the raw id
+/// when a saved selection references a provider this build doesn't ship.
+pub(crate) fn intl_provider_label(provider_id: &str) -> String {
+    data_source::international::intl_providers()
+        .into_iter()
+        .find(|provider| provider.id() == provider_id)
+        .map(|provider| provider.label().to_owned())
+        .unwrap_or_else(|| provider_id.to_owned())
+}
 /// SPC fetch identity: (day, archive date) — refetch when it changes.
 type SpcFetchKey = (u8, Option<(i32, u32, u32)>);
 type ModelLayerRender = (u64, ModelLayerView, egui::ColorImage, f32);
@@ -2629,6 +2714,9 @@ impl ViewerApp {
         let data_dir = app_settings.data_dir.trim();
         settings::set_data_dir_override((!data_dir.is_empty()).then(|| PathBuf::from(data_dir)));
         let restored_poll_url = app_settings.poll_url.clone();
+        // Re-arm the international picker on the last-used provider so the
+        // saved site selection has its provider context back.
+        let restored_intl_provider = app_settings.intl_provider.clone();
         let restored_farm = farm_live::FarmState::with_saved(&app_settings.farm_georefs);
         let restored_overlays = (
             app_settings.overlay_obs,
@@ -2677,6 +2765,7 @@ impl ViewerApp {
         let initial_radar_opacity = style_registry.drapes().radar_opacity;
 
         let restored_model_keep_runs = app_settings.model_keep_runs;
+        let restored_model_slug = app_settings.model_slug.clone();
         let mut app = Self {
             source_path,
             volume: None,
@@ -2769,7 +2858,7 @@ impl ViewerApp {
             spc_receiver: None,
             archive_pending_event: None,
             ingest: None,
-            download_panel: rw_ui::DownloadPanel::new(default_download_spec()),
+            download_panel: rw_ui::DownloadPanel::new(default_download_spec(&restored_model_slug)),
             sat: None,
             sat_panel: rw_ui::SatellitePanel::new(rw_ui::SatFollowSpec::default()),
             sat_player: rw_ui::SatPlayerPanel::new(),
@@ -2801,6 +2890,10 @@ impl ViewerApp {
             vol3d: vol3d::Vol3d::default(),
             wofs: wofs::WofsState::default(),
             farm: restored_farm,
+            poll_source: PollSource::CustomUrl(restored_poll_url.clone()),
+            intl_picker_provider: restored_intl_provider,
+            intl_sites: None,
+            intl_sites_rx: None,
             poll_url: restored_poll_url,
             poll_active: false,
             poll_last_file: None,
@@ -3016,14 +3109,20 @@ impl ViewerApp {
         if !self.realtime_level2_auto_refresh {
             return;
         }
-        // An active custom-URL poll owns the primary view: a catalog-site
-        // refresh here would wipe the polled frames from frame_history
-        // (history_contains_other_site) every tick and, when it installs,
-        // overwrite the polled volume. Overlay layers keep refreshing via
-        // maybe_refresh_radar_layers — they never touch primary state.
-        if self.poll_active && !self.poll_url.is_empty() {
-            self.live_refresh_skip_reason =
-                Some("custom URL poll owns the primary view".to_owned());
+        // An active poll (custom URL or international) owns the primary
+        // view: a catalog-site refresh here would wipe the polled frames
+        // from frame_history (history_contains_other_site) every tick and,
+        // when it installs, overwrite the polled volume. Overlay layers
+        // keep refreshing via maybe_refresh_radar_layers — they never
+        // touch primary state.
+        if self.poll_active && self.poll_source_armed() {
+            self.live_refresh_skip_reason = Some(match &self.poll_source {
+                PollSource::CustomUrl(_) => "custom URL poll owns the primary view".to_owned(),
+                PollSource::Intl {
+                    provider_id,
+                    site_id,
+                } => format!("international poll {provider_id}/{site_id} owns the primary view"),
+            });
             // Keep a heartbeat: with hazards/layers/playback all off, no
             // other path schedules repaints, and the poller's 15 s
             // due-check would stall until mouse input.
@@ -5710,7 +5809,10 @@ impl ViewerApp {
                 kind @ (LocalRadarKind::MobileArchive
                 | LocalRadarKind::DoradeSweep
                 | LocalRadarKind::OdimH5
-                | LocalRadarKind::CfRadial) => decode_mobile_radar_batch(&path, kind, total_start),
+                | LocalRadarKind::CfRadial
+                | LocalRadarKind::JmaGrib2Tar) => {
+                    decode_mobile_radar_batch(&path, kind, total_start)
+                }
                 LocalRadarKind::NexradLevel2 => decode_load_path_with_optional_preview(
                     path,
                     &label,
@@ -6412,7 +6514,8 @@ impl eframe::App for ViewerApp {
         self.poll_oa_cape(&ctx);
         self.poll_oa_composites(&ctx);
         self.poll_spc(&ctx);
-        self.poll_custom_url(&ctx);
+        self.poll_feed(&ctx);
+        self.poll_intl_sites();
         self.poll_native_sounding(&ctx);
         if self.tile_layer.borrow_mut().poll(&ctx) {
             ctx.request_repaint();
@@ -6690,20 +6793,17 @@ impl ViewerApp {
                 }
             }
             // Sounding finally gets a front door (it used to open only as a
-            // side effect of Alt-click and could never be reopened).
+            // side effect of Alt-click and could never be reopened). Always
+            // clickable — with no sounding yet the pane shows the Alt-click
+            // how-to instead of the entry greying out mysteriously (field
+            // report: "why is soundings greyed out").
             let has_sounding = self.native_sounding.is_some();
             if ui
-                .add_enabled(
-                    has_sounding,
-                    egui::Button::selectable(
-                        self.viewer_open(dock::WorkspacePane::Sounding),
-                        "Sounding",
-                    ),
-                )
+                .selectable_label(self.viewer_open(dock::WorkspacePane::Sounding), "Sounding")
                 .on_hover_text(if has_sounding {
                     "Reopen the last skew-T sounding (Alt-click the map with model data to launch a new one)"
                 } else {
-                    "No sounding yet — Alt-click the map (with model data) to launch one"
+                    "No sounding yet — opens with instructions; Alt-click the map (with model data) to launch one"
                 })
                 .clicked()
             {
@@ -7685,16 +7785,24 @@ impl ViewerApp {
                         .max(self.hail_freezing_level_km + 0.1);
                     ctx.request_repaint();
                 }
-                if self.model_enabled
-                    && self.model_lut.is_some()
-                    && ui
-                        .small_button("From HRRR")
-                        .on_hover_text(
-                            "Set both heights from the HRRR temperature profile at the radar site (0°C and −20°C crossings)",
-                        )
+                if self.model_enabled && self.model_lut.is_some() {
+                    // Label the button with the model the sample will
+                    // actually come from (the latest loaded field's model).
+                    let model = self
+                        .model_dock
+                        .as_ref()
+                        .and_then(|dock| dock.latest_field())
+                        .map(|field| field.key.hour.model.to_uppercase())
+                        .unwrap_or_else(|| "model".to_owned());
+                    if ui
+                        .small_button(format!("From {model}"))
+                        .on_hover_text(format!(
+                            "Set both heights from the {model} temperature profile at the radar site (0°C and −20°C crossings)",
+                        ))
                         .clicked()
-                {
-                    self.request_hail_env_from_model(ctx);
+                    {
+                        self.request_hail_env_from_model(ctx);
+                    }
                 }
             });
         }
@@ -9487,19 +9595,27 @@ impl ViewerApp {
     /// every dockable window body; the docked pane's way back is its tab
     /// (✕ floats it, right-click for float/hide).
     fn dock_toggle_row(&mut self, ui: &mut egui::Ui, pane: dock::WorkspacePane) {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .small_button("Dock ⊞")
-                .on_hover_text(
-                    "Snap this viewer into the workspace as a tile next to the map. \
-                     Drag its tab to rearrange or split; the tab's ✕ floats it back out.",
-                )
-                .clicked()
-            {
-                // Safe direct mutation: windows render OUTSIDE the tree
-                // pass, so the live tree is on `self` here.
-                self.workspace.dock(pane);
-            }
+        // horizontal() wrapper is load-bearing: a bare right-to-left
+        // with_layout consumes the WHOLE remaining container height
+        // (egui 0.34), starving everything below it of space — the same
+        // mechanism as the v0.16.1 blank docked panes, here it blanked
+        // floating windows after an undock (field report: "all grey
+        // full screen").
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("Dock ⊞")
+                    .on_hover_text(
+                        "Snap this viewer into the workspace as a tile next to the map. \
+                         Drag its tab to rearrange or split; the tab's ✕ floats it back out.",
+                    )
+                    .clicked()
+                {
+                    // Safe direct mutation: windows render OUTSIDE the tree
+                    // pass, so the live tree is on `self` here.
+                    self.workspace.dock(pane);
+                }
+            });
         });
     }
 
@@ -9807,24 +9923,49 @@ impl ViewerApp {
             };
             if let Some(pointer) = pointer {
                 let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
-                let lookup = self.model_lut.as_ref().and_then(|(_, lut)| {
-                    let nx = self
+                // The LUT rebuild is async: pair the LUT with the field
+                // only when their grid hashes agree, or a stale grid's
+                // LUT decomposes indices on the new field's nx.
+                let lookup = self.model_lut.as_ref().and_then(|(hash, lut)| {
+                    let field = self
                         .model_dock
                         .as_ref()
-                        .and_then(|dock| dock.latest_field())
-                        .map(|field| field.nx)?;
-                    lut.lookup(lat, lon).map(|index| (index, nx))
+                        .and_then(|dock| dock.latest_field())?;
+                    if field.grid.as_ref().map(|grid| &grid.hash) != Some(hash) {
+                        return None;
+                    }
+                    lut.lookup(lat, lon)
+                        .map(|index| (index, field.nx, field.key.hour.model.clone()))
                 });
-                if let Some((index, nx)) = lookup
+                if let Some((index, nx, lut_model)) = lookup
                     && self.last_sounding_request != Some(index)
-                    && let Some(dock) = &mut self.model_dock
                 {
-                    let fx = (index % nx) as f64;
-                    let fy = (index / nx) as f64;
-                    dock.request_sounding_at(fx, fy);
-                    self.last_sounding_request = Some(index);
-                    // The Sounding window opens via poll_native_sounding;
-                    // the Model window only opens from the top-bar button.
+                    let target = self
+                        .volume
+                        .as_ref()
+                        .map(|volume| volume.volume_time.with_timezone(&Utc))
+                        .unwrap_or_else(Utc::now);
+                    if let Some(dock) = &mut self.model_dock {
+                        let fx = (index % nx) as f64;
+                        let fy = (index / nx) as f64;
+                        // Mixed hrrr+gfs stores: these grid coords belong
+                        // to the LUT's model. The browser-selected hour is
+                        // only safe to sample when the models agree;
+                        // otherwise pin to the LUT model's hour valid
+                        // nearest the display time — a wrong-grid skew-T
+                        // reads plausible from a continent away.
+                        if dock.browsed_hour_model().as_deref() == Some(lut_model.as_str()) {
+                            dock.request_sounding_at(fx, fy);
+                            self.last_sounding_request = Some(index);
+                        } else if let Some((key, _, _)) =
+                            dock.newest_hour_valid_near(target, Some(&lut_model))
+                        {
+                            dock.request_sounding_for(key, fx, fy);
+                            self.last_sounding_request = Some(index);
+                        }
+                        // The Sounding window opens via poll_native_sounding;
+                        // the Model window only opens from the top-bar button.
+                    }
                 }
             }
         } else if self.vrot_tool_armed {
@@ -10841,20 +10982,50 @@ impl ViewerApp {
         Some((direction, (speed_mps / KNOT_TO_MPS as f64) as f32))
     }
 
-    /// Kick a background HRRR ingest for the freshest plausible init
-    /// (next 3 forecast hours, sounding-grade --no-heavy), then prune the
-    /// store to the two newest runs and re-scan.
+    /// The model the one-click ingest targets: the Download panel's
+    /// (persisted) pick — except a primary radar outside HRRR's CONUS
+    /// coverage prefers GFS, so international radars get usable model
+    /// layers and soundings without manual switching ("the model follows
+    /// the radar"). Returns (model, auto-switched-for-coverage).
+    fn auto_model_for_radar(&self) -> (rustwx_core::ModelId, bool) {
+        let selected = self
+            .download_panel
+            .spec()
+            .model
+            .parse::<rustwx_core::ModelId>()
+            .ok()
+            .filter(|&model| rw_ingest::ingest_supported(model))
+            .unwrap_or(rustwx_core::ModelId::Hrrr);
+        if selected == rustwx_core::ModelId::Hrrr
+            && let Some((lat, lon)) = self.radar_location()
+            && !ingest_worker::hrrr_conus_covers(lat, lon)
+        {
+            return (rustwx_core::ModelId::Gfs, true);
+        }
+        (selected, false)
+    }
+
+    /// Kick a background model ingest for the freshest plausible init
+    /// (sounding-grade --no-heavy, four hours bracketing now), then prune
+    /// the store to the two newest runs and re-scan. The model comes from
+    /// [`Self::auto_model_for_radar`].
     fn start_model_ingest(&mut self, ctx: &egui::Context) {
         if self.model_ingest_rx.is_some() {
             return;
         }
+        let (model, auto_switched) = self.auto_model_for_radar();
+        let label = model.as_str().to_uppercase();
         let (sender, receiver) = mpsc::channel();
         let (progress_tx, progress_rx) = mpsc::channel();
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.model_ingest_rx = Some(receiver);
         self.model_ingest_progress_rx = Some(progress_rx);
         self.model_ingest_cancel = Some(Arc::clone(&cancel));
-        self.status = "Fetching latest HRRR…".to_owned();
+        self.status = if auto_switched {
+            format!("Fetching latest {label}… (radar outside HRRR coverage)")
+        } else {
+            format!("Fetching latest {label}…")
+        };
         let ctx = ctx.clone();
         let keep_runs = self.model_keep_runs as usize;
         thread::spawn(move || {
@@ -10863,13 +11034,14 @@ impl ViewerApp {
             // result: 0.2 ms frames at 99.8% system CPU).
             rw_ingest::throttle::set_current_thread_background_priority();
             let pool = rw_ingest::throttle::build_background_pool(None);
-            let result = pool.install(|| run_model_ingest(&cancel, &progress_tx, &ctx, keep_runs));
+            let result =
+                pool.install(|| run_model_ingest(model, &cancel, &progress_tx, &ctx, keep_runs));
             let _ = sender.send(result);
             ctx.request_repaint();
         });
     }
 
-    /// Request the HRRR profile at the radar site to auto-set the hail
+    /// Request the model profile at the radar site to auto-set the hail
     /// environment (H0 / H−20). The reply is intercepted by
     /// poll_native_sounding (hail_env_pending) without opening the window.
     fn request_hail_env_from_model(&mut self, ctx: &egui::Context) {
@@ -10877,28 +11049,36 @@ impl ViewerApp {
             self.status = "No radar location for hail environment".to_owned();
             return;
         };
-        let lookup = self.model_lut.as_ref().and_then(|(_, lut)| {
-            let nx = self
+        let lookup = self.model_lut.as_ref().and_then(|(hash, lut)| {
+            let field = self
                 .model_dock
                 .as_ref()
-                .and_then(|dock| dock.latest_field())
-                .map(|field| field.nx)?;
-            lut.lookup(radar_lat, radar_lon).map(|index| (index, nx))
+                .and_then(|dock| dock.latest_field())?;
+            // Async LUT rebuild: only pair LUT + field on matching grids.
+            if field.grid.as_ref().map(|grid| &grid.hash) != Some(hash) {
+                return None;
+            }
+            lut.lookup(radar_lat, radar_lon)
+                .map(|index| (index, field.nx, field.key.hour.model.clone()))
         });
-        let Some((index, nx)) = lookup else {
+        let Some((index, nx, lut_model)) = lookup else {
             self.status = "Radar site is outside the model grid".to_owned();
             return;
         };
         // Use the radar display's time as the validity target (falls back
         // to wall clock), the NEWEST run in the store, and the forecast
         // hour valid closest to it — never the browser's stale selection.
+        // The run must belong to the SAME model as the LUT's grid (mixed
+        // hrrr+gfs stores): grid coords from one model's LUT are garbage
+        // on the other model's grid.
         let target = self
             .volume
             .as_ref()
             .map(|volume| volume.volume_time.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
         if let Some(dock) = &mut self.model_dock {
-            let Some((key, valid, run_age)) = dock.newest_hour_valid_near(target) else {
+            let Some((key, valid, run_age)) = dock.newest_hour_valid_near(target, Some(&lut_model))
+            else {
                 self.status = "No model runs in the store (Fetch latest first)".to_owned();
                 return;
             };
@@ -10911,7 +11091,8 @@ impl ViewerApp {
                 String::new()
             };
             self.status = format!(
-                "Hail levels from {} f{:02} (valid {}){stale_note}",
+                "Hail levels from {} {} f{:02} (valid {}){stale_note}",
+                key.model.to_uppercase(),
                 key.run,
                 key.hour,
                 valid.format("%H:%MZ")
@@ -11013,6 +11194,11 @@ impl ViewerApp {
                         // Hail-environment request: extract H0/H−20 and keep
                         // the window closed.
                         self.hail_env_pending = false;
+                        let model = self
+                            .native_sounding_src
+                            .as_ref()
+                            .map(|data| data.hour.model.to_uppercase())
+                            .unwrap_or_else(|| "model".to_owned());
                         let h0 = Self::profile_crossing_km(&native.profile, 0.0);
                         let hm20 = Self::profile_crossing_km(&native.profile, -20.0);
                         match (h0, hm20) {
@@ -11022,11 +11208,11 @@ impl ViewerApp {
                                 self.clear_texture();
                                 self.derived_readout_cache = None;
                                 self.status = format!(
-                                    "Hail env from HRRR: 0°C {h0:.1} km · −20°C {hm20:.1} km"
+                                    "Hail env from {model}: 0°C {h0:.1} km · −20°C {hm20:.1} km"
                                 );
                             }
                             _ => {
-                                self.status = "HRRR profile lacks a 0°C/−20°C crossing".to_owned();
+                                self.status = format!("{model} profile lacks a 0°C/−20°C crossing");
                             }
                         }
                         self.native_sounding = Some(Arc::new(native));
@@ -11061,10 +11247,9 @@ impl ViewerApp {
     /// shared with the docked Sounding pane — the overhaul's headline ask
     /// ("size soundings how I want and snap to its own thing").
     fn sounding_window(&mut self, ctx: &egui::Context) {
-        if !self.native_skewt_open
-            || self.native_sounding.is_none()
-            || self.workspace.is_docked(dock::WorkspacePane::Sounding)
-        {
+        // No native_sounding gate: the body placeholder explains how to
+        // launch one, which beats a window that silently refuses to open.
+        if !self.native_skewt_open || self.workspace.is_docked(dock::WorkspacePane::Sounding) {
             return;
         }
         let mut open = self.native_skewt_open;
@@ -11169,11 +11354,18 @@ impl ViewerApp {
                             }
                         }
                         let fetching = self.model_ingest_rx.is_some();
+                        let (auto_model, auto_switched) = self.auto_model_for_radar();
+                        let auto_label = auto_model.as_str().to_uppercase();
+                        let coverage_note = if auto_switched {
+                            " — radar is outside HRRR coverage, GFS selected automatically"
+                        } else {
+                            ""
+                        };
                         if ui
                             .add_enabled(!fetching, egui::Button::new("Fetch latest"))
-                            .on_hover_text(
-                                "Ingest the freshest HRRR init (next 3 hours, sounding-grade) and prune to the two newest runs (~1 min)",
-                            )
+                            .on_hover_text(format!(
+                                "Ingest the freshest {auto_label} init (four hours bracketing now, sounding-grade) and prune to the two newest runs{coverage_note}",
+                            ))
                             .clicked()
                         {
                             self.start_model_ingest(&ctx);
@@ -11187,12 +11379,72 @@ impl ViewerApp {
                             }
                         }
                     });
+                    // Hours presets, model-aware: HRRR's short-range
+                    // loadouts next to GFS's longer sounding-grade spans.
+                    // The panel owns its spec, so a preset rebuilds it
+                    // with the new hours/profile; the SpecChanged event
+                    // refreshes pickers and the size estimate.
+                    ui.horizontal(|ui| {
+                        ui.weak("Presets:");
+                        let gfs_selected = self.download_panel.spec().model == "gfs";
+                        let presets: &[(&str, &str, &str, &str)] = if gfs_selected {
+                            &[
+                                (
+                                    "Sounding 0-12h",
+                                    "sounding",
+                                    "0-12",
+                                    "Hourly sounding-grade GFS — global skew-T soundings for the next half day",
+                                ),
+                                (
+                                    "Full 0-48h",
+                                    "full",
+                                    "0-48",
+                                    "Full GFS pack (2D maps + derived fields) through two days",
+                                ),
+                            ]
+                        } else {
+                            &[
+                                (
+                                    "Sounding 0-3h",
+                                    "sounding",
+                                    "0-3",
+                                    "The one-click loadout: next three hours, sounding-grade",
+                                ),
+                                (
+                                    "Full 0-18h",
+                                    "full",
+                                    "0-18",
+                                    "Full pack (2D maps + derived fields) through the short range",
+                                ),
+                            ]
+                        };
+                        let running = self.download_panel.is_running();
+                        for &(label, profile, hours, hover) in presets {
+                            if ui
+                                .add_enabled(!running, egui::Button::new(label).small())
+                                .on_hover_text(hover)
+                                .clicked()
+                            {
+                                let mut spec = self.download_panel.spec().clone();
+                                spec.profile = profile.to_owned();
+                                spec.hours = hours.to_owned();
+                                // Snap the compute flags to the profile's
+                                // defaults (mirrors the panel's own combo).
+                                spec.derived = profile != "sounding";
+                                spec.heavy = false;
+                                self.download_panel = rw_ui::DownloadPanel::new(spec.clone());
+                                self.download_panel
+                                    .set_model_options(ingest_worker_model_options());
+                                events.push(rw_ui::DownloadEvent::SpecChanged(spec));
+                            }
+                        }
+                    });
                     ui.separator();
                     egui::ScrollArea::vertical()
                         .id_salt("model_window_download_scroll")
                         .max_height(380.0)
                         .show(ui, |ui| {
-                            events = self.download_panel.ui(ui);
+                            events.extend(self.download_panel.ui(ui));
                         });
                 });
             ui.separator();
@@ -11237,6 +11489,14 @@ impl ViewerApp {
         for event in events {
             match event {
                 rw_ui::DownloadEvent::SpecChanged(spec) => {
+                    if spec.model != self.app_settings.model_slug {
+                        // Model switch: persist the pick and snap date/cycle
+                        // to the model's newest available run (cadences
+                        // differ — an HRRR 07z is no GFS cycle).
+                        self.app_settings.model_slug = spec.model.clone();
+                        let _ = self.app_settings.save();
+                        ingest.send(ingest_worker::IngestRequest::Latest(spec.clone()));
+                    }
                     sync_run_pickers(&mut self.download_panel, &spec);
                     ingest.send(ingest_worker::IngestRequest::Estimate(spec));
                 }
@@ -12159,6 +12419,159 @@ impl ViewerApp {
         self.install_volume_arc(volume, None, true, None, FrameStatus::Complete, ctx);
     }
 
+    /// True when the active poll source is fully specified — the condition
+    /// under which an active poll owns the primary view. Extends the old
+    /// `!poll_url.is_empty()` guard to the international source.
+    fn poll_source_armed(&self) -> bool {
+        match &self.poll_source {
+            PollSource::CustomUrl(_) => !self.poll_url.is_empty(),
+            PollSource::Intl {
+                provider_id,
+                site_id,
+            } => !provider_id.is_empty() && !site_id.is_empty(),
+        }
+    }
+
+    /// Drive whichever feed the poller follows. One dispatcher so the poll
+    /// stays singular: shared `poll_active`/`poll_rx`/`poll_last_file`,
+    /// shared install path, shared ownership guards.
+    fn poll_feed(&mut self, ctx: &egui::Context) {
+        match self.poll_source.clone() {
+            PollSource::CustomUrl(_) => self.poll_custom_url(ctx),
+            PollSource::Intl {
+                provider_id,
+                site_id,
+            } => self.poll_intl(&provider_id, &site_id, ctx),
+        }
+    }
+
+    /// Drain the in-flight poll worker — shared verbatim by the custom-URL
+    /// and international pollers: success installs the volume and records
+    /// the dedupe key as `Polled: {name}`; the empty-string `Err` is the
+    /// no-change marker; real errors surface as `Poll: {msg}`.
+    fn drain_polled_volume(&mut self, ctx: &egui::Context) {
+        if let Some(receiver) = &self.poll_rx {
+            match receiver.try_recv() {
+                Ok(Ok((name, volume))) => {
+                    self.poll_rx = None;
+                    self.poll_last_file = Some(name.clone());
+                    self.status = format!("Polled: {name}");
+                    self.install_polled_volume(&name, volume, ctx);
+                }
+                Ok(Err(message)) => {
+                    self.poll_rx = None;
+                    if !message.is_empty() {
+                        self.status = format!("Poll: {message}");
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.poll_rx = None,
+            }
+        }
+    }
+
+    /// International feed polling: every [`INTL_POLL_SECONDS`] ask the
+    /// provider's catalog for the newest frame ([`data_source::international`]
+    /// registry); when its identity changes, download every plan part,
+    /// decode through the shared magic-byte router, merge split frames, and
+    /// install through the SAME `install_polled_volume` path as the
+    /// custom-URL poll. It IS the poll: history upsert + follow, the
+    /// auto-refresh skip, and the explicit-load pauses all apply
+    /// identically, and a first install of a not-in-catalog site with
+    /// coordinates jumps the map there via `install_volume_arc`'s mobile
+    /// radar path.
+    fn poll_intl(&mut self, provider_id: &str, site_id: &str, ctx: &egui::Context) {
+        if !self.poll_active || provider_id.is_empty() || site_id.is_empty() {
+            return;
+        }
+        let due = self
+            .poll_next
+            .map(|at| Instant::now() >= at)
+            .unwrap_or(true);
+        if due && self.poll_rx.is_none() {
+            self.poll_next = Some(Instant::now() + Duration::from_secs(INTL_POLL_SECONDS));
+            let provider_id = provider_id.to_owned();
+            let site_id = site_id.to_owned();
+            let last = self.poll_last_file.clone();
+            let (sender, receiver) = mpsc::channel();
+            self.poll_rx = Some(receiver);
+            let ctx_clone = ctx.clone();
+            thread::spawn(move || {
+                let result = match fetch_intl_frame(&provider_id, &site_id, last.as_deref()) {
+                    Ok(Some((identity, volume))) => Ok((identity, Arc::new(volume))),
+                    Ok(None) => Err(String::new()), // no-change marker
+                    Err(message) => Err(message),
+                };
+                let _ = sender.send(result);
+                ctx_clone.request_repaint();
+            });
+        }
+        self.drain_polled_volume(ctx);
+    }
+
+    /// Kick a background fetch of an international provider's site catalog
+    /// for the DATA tab picker. Never on the UI thread: `list_sites` hits
+    /// the provider's HTTP catalog on first call.
+    fn start_intl_site_listing(&mut self, provider_id: &str, ctx: &egui::Context) {
+        self.intl_picker_provider = provider_id.to_owned();
+        self.intl_sites = None;
+        let provider_id = provider_id.to_owned();
+        let (sender, receiver) = mpsc::channel();
+        self.intl_sites_rx = Some(receiver);
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            let result = data_source::international::intl_providers()
+                .into_iter()
+                .find(|provider| provider.id() == provider_id)
+                .map(|provider| provider.list_sites())
+                .unwrap_or_else(|| Err(format!("unknown international provider '{provider_id}'")));
+            let _ = sender.send((provider_id, result));
+            ctx_clone.request_repaint();
+        });
+    }
+
+    /// Drain the site-catalog fetch; an answer for a provider the user has
+    /// since navigated away from is dropped.
+    fn poll_intl_sites(&mut self) {
+        let Some(receiver) = &self.intl_sites_rx else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok((provider_id, result)) => {
+                self.intl_sites_rx = None;
+                if provider_id != self.intl_picker_provider {
+                    return;
+                }
+                match result {
+                    Ok(sites) => self.intl_sites = Some(sites),
+                    Err(message) => self.status = format!("Poll: {message}"),
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.intl_sites_rx = None,
+        }
+    }
+
+    /// Start (or resume) the shared poller on an international feed. Same
+    /// ownership contract as the custom-URL Start.
+    pub(crate) fn start_intl_poll(&mut self, provider_id: String, site_id: String) {
+        self.poll_source = PollSource::Intl {
+            provider_id,
+            site_id,
+        };
+        self.poll_active = true;
+        self.poll_last_file = None;
+        self.poll_next = None;
+        // An auto-refresh load already in flight would land AFTER the
+        // first poll install and wipe the polled frames — drop it.
+        self.load_receiver = None;
+        // A still-in-flight tick of the PREVIOUS source must not install
+        // under the new one (its sender now writes into a closed channel).
+        self.poll_rx = None;
+        self.poll_source.save_to_settings(&mut self.app_settings);
+        let _ = self.app_settings.save();
+    }
+
     /// GR2A-style polling: fetch <url>/dir.list, newest entry wins; when
     /// it changes, download + decode + install as the live volume.
     fn poll_custom_url(&mut self, ctx: &egui::Context) {
@@ -12231,21 +12644,12 @@ impl ViewerApp {
                         let raw = data_source::fetch_volume_bytes(&format!("{base}/{newest}"))
                             .map_err(|e| format!("{newest}: {e}"))?;
                         // Field feeds serve Level-II conversions (the GR2A
-                        // msg31 convention) or native DORADE sweepfiles;
-                        // route by magic bytes like the file-open path.
-                        let volume = if nexrad_io::dorade::looks_like_dorade_bytes(&raw) {
-                            nexrad_io::dorade::decode_dorade_sweep_volume(&raw)
-                                .map_err(|e| format!("decode {newest}: {e}"))?
-                        } else if nexrad_io::odim::looks_like_hdf5_bytes(&raw) {
-                            nexrad_io::odim::decode_odim_h5_volume(&raw)
-                                .map_err(|e| format!("decode {newest}: {e}"))?
-                        } else if nexrad_io::cfradial::looks_like_netcdf3_bytes(&raw) {
-                            nexrad_io::cfradial::decode_cfradial1_volume(&raw)
-                                .map_err(|e| format!("decode {newest}: {e}"))?
-                        } else {
-                            nexrad_io::decode_volume_from_bytes(&raw)
-                                .map_err(|e| format!("decode {newest}: {e}"))?
-                        };
+                        // msg31 convention), native DORADE sweepfiles, or
+                        // international ODIM_H5/CfRadial volumes; the shared
+                        // router dispatches by magic bytes like the
+                        // file-open path.
+                        let volume = nexrad_io::decode_supported_volume_bytes(&raw)
+                            .map_err(|e| format!("decode {newest}: {e}"))?;
                         Ok(Some((newest, Arc::new(volume))))
                     })();
                 let _ = sender.send(match result {
@@ -12256,24 +12660,7 @@ impl ViewerApp {
                 ctx_clone.request_repaint();
             });
         }
-        if let Some(receiver) = &self.poll_rx {
-            match receiver.try_recv() {
-                Ok(Ok((name, volume))) => {
-                    self.poll_rx = None;
-                    self.poll_last_file = Some(name.clone());
-                    self.status = format!("Polled: {name}");
-                    self.install_polled_volume(&name, volume, ctx);
-                }
-                Ok(Err(message)) => {
-                    self.poll_rx = None;
-                    if !message.is_empty() {
-                        self.status = format!("Poll: {message}");
-                    }
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => self.poll_rx = None,
-            }
-        }
+        self.drain_polled_volume(ctx);
     }
 
     /// Fetch + render the nearest RAOB launch through the native skew-T
@@ -12526,7 +12913,7 @@ impl ViewerApp {
                 self.model_ingest_rx = None;
                 self.model_ingest_progress_rx = None;
                 self.model_ingest_cancel = None;
-                self.status = format!("HRRR ingest failed: {err}");
+                self.status = format!("Model ingest failed: {err}");
                 ctx.request_repaint();
             }
             Err(mpsc::TryRecvError::Empty) => {}
@@ -13980,7 +14367,7 @@ impl ViewerApp {
         let font_id = egui::FontId::proportional(obs_style.small_font_px);
         // Fuller reports first so they win declutter cells.
         let mut order: Vec<&obs::SurfaceOb> = self.surface_obs.frame_obs(frame_time).collect();
-        order.sort_by(|a, b| b.completeness.cmp(&a.completeness));
+        order.sort_by_key(|ob| std::cmp::Reverse(ob.completeness));
         // During loop playback/scrubbing, stations draw only when their
         // report is FRESH relative to the frame (45 min) — stale reporters
         // freeze mid-loop and read as clutter. (A report-count rule here
@@ -14699,8 +15086,11 @@ impl ViewerApp {
                 && value.is_finite()
             {
                 lines.push(format!(
-                    "HRRR {} {:.1} {}",
-                    field.key.var, value, field.units
+                    "{} {} {:.1} {}",
+                    field.key.hour.model.to_uppercase(),
+                    field.key.var,
+                    value,
+                    field.units
                 ));
             }
         }
@@ -18274,11 +18664,15 @@ fn run_model_download(
     ))
 }
 
-/// In-process HRRR ingest via the rw-ingest LIBRARY (typed per-stage
-/// progress + cooperative cancel; atomic writes mean cancel never leaves a
-/// partial hour). Freshest plausible init first (publication lag ~55 min),
-/// fall back one cycle; then prune the store to the two newest runs.
+/// In-process one-click model ingest via the rw-ingest LIBRARY (typed
+/// per-stage progress + cooperative cancel; atomic writes mean cancel never
+/// leaves a partial hour). Freshest plausible init first — cycle cadence
+/// from rustwx_models, publication lag per model (HRRR ~55 min, GFS
+/// ~3.5 h) — fall back one cycle; then prune the store to the newest runs.
+/// The four ingested hours start at the run's age so their valid times
+/// bracket now..now+3 h (the auto hail-env sampling window).
 fn run_model_ingest(
+    model: rustwx_core::ModelId,
     cancel: &std::sync::atomic::AtomicBool,
     progress: &mpsc::Sender<String>,
     ctx: &egui::Context,
@@ -18292,19 +18686,21 @@ fn run_model_ingest(
     let STORE: &str = &store_str;
     #[allow(non_snake_case)]
     let CACHE: &str = &cache_str;
+    let label = model.as_str().to_uppercase();
+    let model_slug = model.as_str().replace('-', "_");
     let now = Utc::now();
-    let candidates = [
-        now - chrono::Duration::minutes(55),
-        now - chrono::Duration::minutes(115),
-    ];
+    let candidates = ingest_worker::recent_cycle_candidates(
+        now,
+        rustwx_models::model_summary(model).cycle_hours_utc,
+        ingest_worker::publication_lag_minutes(model),
+        2,
+    );
     let report = |line: String| {
         let _ = progress.send(line);
         ctx.request_repaint();
     };
-    let mut last_error = String::new();
-    'candidates: for candidate in candidates {
-        let date = candidate.format("%Y%m%d").to_string();
-        let cycle_hour: u8 = candidate.format("%H").to_string().parse().unwrap_or(0);
+    let mut last_error = format!("{label}: no plausible cycle candidates");
+    'candidates: for (date, cycle_hour) in candidates {
         let Ok(cycle) = rustwx_core::CycleSpec::new(&date, cycle_hour) else {
             continue;
         };
@@ -18312,54 +18708,64 @@ fn run_model_ingest(
         let run_slug = format!("{date}_{cycle_hour:02}z");
         let progress_sink = std::sync::Mutex::new(progress.clone());
         let ctx_sink = ctx.clone();
+        let stage_label = label.clone();
         let on_event = move |event: rw_ingest::IngestEvent| {
             if let rw_ingest::IngestEvent::StageStarted { hour, stage } = event
                 && let Ok(sender) = progress_sink.lock()
             {
-                let _ = sender.send(format!("HRRR f{hour:02}: {stage:?}…"));
+                let _ = sender.send(format!("{stage_label} f{hour:02}: {stage:?}…"));
                 ctx_sink.request_repaint();
             }
         };
         let config = rw_ingest::IngestConfig {
-            model: rustwx_core::ModelId::Hrrr,
+            model,
             cycle: &cycle,
             source_override: None,
             cache_root: std::path::Path::new(CACHE),
             use_cache: true,
             store_root: std::path::Path::new(STORE),
-            model_slug: "hrrr",
+            model_slug: &model_slug,
             run_slug: &run_slug,
             profile: &profile,
             verify: false,
             progress: &on_event,
             cancel,
         };
-        for hour in 0..=3u16 {
+        let init = chrono::NaiveDate::parse_from_str(&date, "%Y%m%d")
+            .ok()
+            .and_then(|d| d.and_hms_opt(cycle_hour as u32, 0, 0))
+            .map(|naive| naive.and_utc());
+        let run_age_minutes = init.map(|init| (now - init).num_minutes()).unwrap_or(55);
+        let first = ingest_worker::first_live_hour(run_age_minutes);
+        for hour in first..=first + 3 {
             match rw_ingest::ingest_hour_serial(&config, hour) {
                 Ok(_) => {
-                    report(format!("HRRR {date} {cycle_hour:02}z f{hour:02} stored"));
+                    report(format!("{label} {date} {cycle_hour:02}z f{hour:02} stored"));
                 }
                 Err(rw_ingest::IngestError::Cancelled) => {
                     return Err("cancelled".to_owned());
                 }
                 Err(err) => {
-                    last_error = err.to_string();
+                    last_error = format!("{label}: {err}");
                     // This cycle likely isn't published yet — try the
                     // previous one (unless some hours already landed, in
                     // which case report the partial truthfully).
-                    if hour == 0 {
+                    if hour == first {
                         continue 'candidates;
                     }
                     prune_model_store(STORE, keep_runs);
                     return Ok(format!(
-                        "HRRR {date} {cycle_hour:02}z: f00–f{:02} stored (f{hour:02} failed: {last_error})",
+                        "{label} {date} {cycle_hour:02}z: f{first:02}–f{:02} stored (f{hour:02} failed: {last_error})",
                         hour - 1
                     ));
                 }
             }
         }
         prune_model_store(STORE, keep_runs);
-        return Ok(format!("HRRR {date} {cycle_hour:02}z ingested (f00–f03)"));
+        return Ok(format!(
+            "{label} {date} {cycle_hour:02}z ingested (f{first:02}–f{:02})",
+            first + 3
+        ));
     }
     Err(last_error)
 }
@@ -18498,6 +18904,67 @@ fn draw_station_barb(
     }
 }
 
+/// Saturation vapor pressure (hPa) over liquid water at `t_c` — the
+/// Magnus-type fit with Bolton's constants (Bolton 1980, Mon. Wea. Rev.
+/// 108, 1046–1053, Eq. 10): es = 6.112·exp(17.67·T / (T + 243.5)).
+fn saturation_vapor_pressure_hpa(t_c: f64) -> f64 {
+    6.112 * ((17.67 * t_c) / (t_c + 243.5)).exp()
+}
+
+/// Dewpoint (K) from temperature (K) and relative humidity (%), inverting
+/// the Bolton (1980) fit: Td = 243.5·ln(e/6.112) / (17.67 − ln(e/6.112))
+/// with e = (RH/100)·es(T). Accurate to ≈0.1 °C over meteorological
+/// ranges — the same fit sharprs/MetPy-style thermo uses.
+fn dewpoint_k_from_rh(t_k: f32, rh_percent: f32) -> f32 {
+    let t_c = f64::from(t_k) - 273.15;
+    let rh = f64::from(rh_percent).clamp(0.1, 100.0) / 100.0;
+    let e = (rh * saturation_vapor_pressure_hpa(t_c)).max(1e-9);
+    let ln = (e / 6.112).ln();
+    let td_c = 243.5 * ln / (17.67 - ln);
+    (td_c + 273.15) as f32
+}
+
+/// GFS pgrb2 carries isobaric moisture as RELATIVE HUMIDITY, so rw-ingest
+/// stores `rh_iso` (its documented dewpoint fallback) — but the rw-ui
+/// skew-T bridge requires `dewpoint_iso` and rejects the hour outright.
+/// Bridge the gap app-side: synthesize `dewpoint_iso` from
+/// `temperature_iso` + `rh_iso` on rh's levels (Bolton 1980 inversion).
+/// `None` = nothing to do (dewpoint already stored, e.g. HRRR, or no rh).
+fn with_synthesized_dewpoint(data: &rw_ui::SoundingData) -> Option<rw_ui::SoundingData> {
+    if data.vars.iter().any(|var| var.name == "dewpoint_iso") {
+        return None;
+    }
+    let rh = data.vars.iter().find(|var| var.name == "rh_iso")?;
+    let temperature = data
+        .vars
+        .iter()
+        .find(|var| var.name == "temperature_iso")
+        .filter(|var| var.units == "K")?;
+    let values: Vec<f32> = rh
+        .levels_hpa
+        .iter()
+        .zip(rh.values.iter())
+        .map(|(&level, &rh_value)| {
+            temperature
+                .levels_hpa
+                .iter()
+                .position(|&have| have == level)
+                .and_then(|index| temperature.values.get(index).copied())
+                .filter(|t_k| t_k.is_finite() && rh_value.is_finite())
+                .map(|t_k| dewpoint_k_from_rh(t_k, rh_value))
+                .unwrap_or(f32::NAN)
+        })
+        .collect();
+    let mut out = data.clone();
+    out.vars.push(rw_ui::ProfileVar {
+        name: "dewpoint_iso".to_owned(),
+        units: "K".to_owned(),
+        levels_hpa: rh.levels_hpa.clone(),
+        values,
+    });
+    Some(out)
+}
+
 /// Build the native sounding, optionally swapping the model surface for
 /// a nearby fresh observation (T/Td clamped sane, wind kt -> m/s) before
 /// the sharprs parcel math runs — "obs-adjusted sounding". The title
@@ -18506,6 +18973,9 @@ fn build_native_sounding_adjusted(
     data: &rw_ui::SoundingData,
     adjust: Option<(f32, obs::SurfaceOb)>,
 ) -> std::result::Result<rustwx_sounding::NativeSounding, String> {
+    // RH-only stores (GFS) get a synthesized dewpoint profile first.
+    let synthesized = with_synthesized_dewpoint(data);
+    let data = synthesized.as_ref().unwrap_or(data);
     let mut column = rw_ui::skewt::build_sounding_column(data)?;
     let mut tag = None;
     if let Some((distance_km, ob)) = adjust
@@ -18538,8 +19008,16 @@ fn build_native_sounding_adjusted(
 /// Heavy is ~5x the compute (all cores, minutes per hour on laptops) —
 /// it must be an informed opt-in, never the default a new user trips on
 /// (field report: "model data downloading is slow" = heavy by accident).
-fn default_download_spec() -> rw_ui::DownloadSpec {
+/// `model_slug` is the persisted last-used model; unknown or
+/// not-ingest-supported slugs (hand-edited config) fall back to HRRR.
+fn default_download_spec(model_slug: &str) -> rw_ui::DownloadSpec {
+    let model = model_slug
+        .parse::<rustwx_core::ModelId>()
+        .ok()
+        .filter(|&model| rw_ingest::ingest_supported(model))
+        .unwrap_or(rustwx_core::ModelId::Hrrr);
     rw_ui::DownloadSpec {
+        model: model.as_str().to_owned(),
         profile: "sounding".to_owned(),
         heavy: false,
         hours: "0-3".to_owned(),
@@ -20953,6 +21431,71 @@ fn newest_dir_list_entry(listing: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// One international poll tick (runs on the poll worker thread): catalog
+/// probe -> identity dedupe -> download parts -> shared magic-byte decode
+/// -> merge. `Ok(None)` means the frame is unchanged and nothing was
+/// downloaded — the [`data_source::international::FramePlan`] consumer
+/// pipeline, with `poll_last_file` as the identity store.
+fn fetch_intl_frame(
+    provider_id: &str,
+    site_id: &str,
+    last_identity: Option<&str>,
+) -> std::result::Result<Option<(String, RadarVolume)>, String> {
+    let providers = data_source::international::intl_providers();
+    let provider = providers
+        .iter()
+        .find(|provider| provider.id() == provider_id)
+        .ok_or_else(|| format!("unknown international provider '{provider_id}'"))?;
+    let plan = provider.latest(site_id)?;
+    if last_identity == Some(plan.identity.as_str()) {
+        return Ok(None);
+    }
+    let mut decoded = Vec::with_capacity(plan.parts.len());
+    for part in &plan.parts {
+        let raw = data_source::fetch_volume_bytes(&part.url)
+            .map_err(|err| format!("{}: {err}", part.url))?;
+        // JMA NICT tars are multi-station archives: the generic router
+        // would return the tar's FIRST station regardless of the user's
+        // pick, so they dispatch through the site-filtered JMA decoder.
+        let volume = if nexrad_io::jma::looks_like_jma_tar_bytes(&raw) {
+            nexrad_io::jma::decode_jma_tar_volumes(&raw, Some(site_id))
+                .map_err(|err| format!("decode {}: {err}", part.url))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| format!("{}: station '{site_id}' not in the tar", part.url))?
+        } else {
+            nexrad_io::decode_supported_volume_bytes(&raw)
+                .map_err(|err| format!("decode {}: {err}", part.url))?
+        };
+        decoded.push(volume);
+    }
+    let volume = assemble_intl_parts(plan.merge, decoded)
+        .map_err(|err| format!("{}: {err}", plan.identity))?;
+    Ok(Some((plan.identity, volume)))
+}
+
+/// Assemble decoded plan parts into the volume to install. Split frames
+/// (`merge`) go through `radar_core::merge_radar_volumes` — first part is
+/// the merge base per the FramePlan ordering contract; single-file frames
+/// must be exactly one part (the FramePlan shape contract — anything else
+/// is a provider bug surfaced as a poll error, never a panic).
+fn assemble_intl_parts(
+    merge: bool,
+    parts: Vec<RadarVolume>,
+) -> std::result::Result<RadarVolume, String> {
+    if merge {
+        return radar_core::merge_radar_volumes(parts).map(|(volume, _report)| volume);
+    }
+    let mut parts = parts.into_iter();
+    match (parts.next(), parts.next()) {
+        (Some(volume), None) => Ok(volume),
+        (None, _) => Err("frame plan listed no parts".to_owned()),
+        (Some(_), Some(_)) => {
+            Err("single-file frame plan listed multiple parts (provider bug)".to_owned())
+        }
+    }
+}
+
 /// Site ids from a grlevel2.cfg ("Site: KXXX" lines — the GR2A server
 /// convention: the root hosts one subdirectory per listed site).
 fn grlevel2_cfg_sites(cfg: &str) -> Vec<String> {
@@ -21241,6 +21784,79 @@ fn radar_rgba_is_premultiplied_compatible(rgba: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bolton (1980) round-trip sanity: saturated air dews at the air
+    /// temperature; the textbook 20 °C / 50% case lands at ≈9.3 °C.
+    #[test]
+    fn dewpoint_from_rh_matches_bolton() {
+        let saturated = dewpoint_k_from_rh(293.15, 100.0);
+        assert!((saturated - 293.15).abs() < 0.05, "got {saturated}");
+        let half = dewpoint_k_from_rh(293.15, 50.0) - 273.15;
+        assert!(
+            (half - 9.27).abs() < 0.1,
+            "20C/50%% -> {half} C, want ~9.27"
+        );
+        let cold = dewpoint_k_from_rh(253.15, 70.0) - 273.15;
+        assert!((-24.5..=-22.5).contains(&cold), "-20C/70%% -> {cold} C");
+        // Dewpoint never exceeds temperature.
+        assert!(dewpoint_k_from_rh(300.0, 100.0) <= 300.0 + 0.05);
+    }
+
+    /// The GFS rh_iso -> dewpoint_iso shim: synthesizes only when needed,
+    /// on rh's levels, skipping levels temperature does not share.
+    #[test]
+    fn synthesized_dewpoint_covers_rh_only_stores() {
+        let var = |name: &str, units: &str, levels: Vec<u16>, values: Vec<f32>| rw_ui::ProfileVar {
+            name: name.to_owned(),
+            units: units.to_owned(),
+            levels_hpa: levels,
+            values,
+        };
+        let data = |vars: Vec<rw_ui::ProfileVar>| rw_ui::SoundingData {
+            hour: rw_ui::HourKey {
+                model: "gfs".to_owned(),
+                run: "20260612_00z".to_owned(),
+                hour: 7,
+            },
+            fx: 0.0,
+            fy: 0.0,
+            lat: None,
+            lon: None,
+            vars,
+            surface: Vec::new(),
+            read_ms: 0.0,
+        };
+        // RH-only store (GFS): synthesize on rh's levels.
+        let gfs = data(vec![
+            var(
+                "temperature_iso",
+                "K",
+                vec![1000, 850, 500],
+                vec![293.15, 283.15, 253.15],
+            ),
+            var("rh_iso", "%", vec![1000, 850, 700], vec![100.0, 50.0, 80.0]),
+        ]);
+        let out = with_synthesized_dewpoint(&gfs).expect("synthesizes for rh-only");
+        let dew = out
+            .vars
+            .iter()
+            .find(|v| v.name == "dewpoint_iso")
+            .expect("dewpoint var added");
+        assert_eq!(dew.units, "K");
+        assert_eq!(dew.levels_hpa, vec![1000, 850, 700]);
+        assert!((dew.values[0] - 293.15).abs() < 0.05, "saturated 1000 hPa");
+        assert!(dew.values[1] < 283.15, "subsaturated dewpoint below T");
+        assert!(dew.values[2].is_nan(), "700 hPa has no temperature: NaN");
+        // Store already carries dewpoint (HRRR): no-op.
+        let hrrr = data(vec![
+            var("temperature_iso", "K", vec![1000], vec![293.15]),
+            var("dewpoint_iso", "K", vec![1000], vec![283.15]),
+        ]);
+        assert!(with_synthesized_dewpoint(&hrrr).is_none());
+        // No moisture at all: nothing to synthesize.
+        let dry = data(vec![var("temperature_iso", "K", vec![1000], vec![293.15])]);
+        assert!(with_synthesized_dewpoint(&dry).is_none());
+    }
 
     #[test]
     fn nearest_site_index_prefers_closest_coordinate() {
@@ -22571,6 +23187,141 @@ mod tests {
         app.last_realtime_level2_refresh = Some(Instant::now());
         app.maybe_refresh_realtime_level2(&ctx);
         assert_eq!(app.live_refresh_skip_reason, None);
+    }
+
+    #[test]
+    fn active_intl_poll_blocks_primary_auto_refresh() {
+        // The intl poll IS the poll: same ownership guard, with poll_url
+        // empty (the old guard keyed on poll_url and would have let the
+        // auto-refresh stomp the polled frames).
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.realtime_level2_auto_refresh = true;
+        app.poll_active = true;
+        app.poll_source = PollSource::Intl {
+            provider_id: "smhi".to_owned(),
+            site_id: "angelholm".to_owned(),
+        };
+        assert!(app.poll_url.is_empty());
+        app.sites = vec![RadarSite::new("KTLX")];
+        app.selected_site_index = 0;
+
+        let ctx = egui::Context::default();
+        app.maybe_refresh_realtime_level2(&ctx);
+
+        assert!(app.load_receiver.is_none());
+        assert_eq!(
+            app.live_refresh_skip_reason.as_deref(),
+            Some("international poll smhi/angelholm owns the primary view")
+        );
+
+        // An unarmed source (cleared selection) releases the guard.
+        app.poll_source = PollSource::Intl {
+            provider_id: String::new(),
+            site_id: String::new(),
+        };
+        app.live_refresh_skip_reason = None;
+        app.last_realtime_level2_refresh = Some(Instant::now());
+        app.maybe_refresh_realtime_level2(&ctx);
+        assert_eq!(app.live_refresh_skip_reason, None);
+    }
+
+    #[test]
+    fn poll_source_settings_round_trip() {
+        let mut settings = settings::AppSettings::default();
+        let intl = PollSource::Intl {
+            provider_id: "smhi".to_owned(),
+            site_id: "angelholm".to_owned(),
+        };
+        intl.save_to_settings(&mut settings);
+        // Mirrors poll_url: the selection survives the JSON config round
+        // trip and rebuilds the same source for next session's Start.
+        let restored = settings::AppSettings::from_json(&settings.to_json());
+        assert_eq!(PollSource::intl_from_settings(&restored), Some(intl));
+
+        // Each variant writes only its own fields: starting a custom URL
+        // poll must not forget the international selection (and vice
+        // versa).
+        PollSource::CustomUrl("http://example.com/dow8".to_owned()).save_to_settings(&mut settings);
+        assert_eq!(settings.poll_url, "http://example.com/dow8");
+        assert_eq!(settings.intl_provider, "smhi");
+        assert_eq!(settings.intl_site, "angelholm");
+
+        // No saved selection (or a blank one) -> nothing to resume.
+        assert_eq!(
+            PollSource::intl_from_settings(&settings::AppSettings::default()),
+            None
+        );
+        let blank = settings::AppSettings {
+            intl_provider: "  ".to_owned(),
+            intl_site: "angelholm".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(PollSource::intl_from_settings(&blank), None);
+    }
+
+    #[test]
+    fn assemble_intl_parts_single_file_and_merge_contracts() {
+        let volume = test_aliased_velocity_volume();
+
+        // Single-file plan: exactly one part installs as-is.
+        let single = assemble_intl_parts(false, vec![volume.clone()]).expect("single part");
+        assert_eq!(single.site.id, volume.site.id);
+        assert_eq!(single.cuts.len(), volume.cuts.len());
+
+        // Contract violations are descriptive errors, never panics.
+        let err = assemble_intl_parts(false, Vec::new()).unwrap_err();
+        assert!(err.contains("no parts"), "unexpected error: {err}");
+        let err = assemble_intl_parts(false, vec![volume.clone(), volume.clone()]).unwrap_err();
+        assert!(err.contains("multiple parts"), "unexpected error: {err}");
+
+        // Split plans route through radar_core::merge_radar_volumes (same
+        // site merges; different sites surface its error).
+        let merged =
+            assemble_intl_parts(true, vec![volume.clone(), volume.clone()]).expect("merge");
+        assert_eq!(merged.site.id, volume.site.id);
+        let mut other = volume.clone();
+        other.site.id = "OTHER".to_owned();
+        let err = assemble_intl_parts(true, vec![volume, other]).unwrap_err();
+        assert!(err.contains("different sites"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn intl_provider_label_resolves_registry_ids() {
+        assert_eq!(intl_provider_label("smhi"), "SMHI Sweden");
+        // A saved selection from a build that shipped more providers must
+        // not panic the picker — fall back to the raw id.
+        assert_eq!(intl_provider_label("not-a-provider"), "not-a-provider");
+    }
+
+    /// Live smoke of the full international poll pipeline (network):
+    /// catalog -> plan -> download -> decode -> identity dedupe. Excluded
+    /// from gates; run explicitly with
+    /// `cargo test -p app_ui fetch_intl_frame_live -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "network: hits the live SMHI open-data API"]
+    fn fetch_intl_frame_live_smhi() {
+        let (identity, volume) = fetch_intl_frame("smhi", "angelholm", None)
+            .expect("live SMHI fetch")
+            .expect("first poll always yields a frame");
+        println!(
+            "live SMHI frame: identity={identity} site={} lat={:?} lon={:?} cuts={} moments(first cut)={:?}",
+            volume.site.id,
+            volume.site.latitude_deg,
+            volume.site.longitude_deg,
+            volume.cuts.len(),
+            volume.cuts.first().map(|cut| cut.moments_available())
+        );
+        assert!(identity.contains("angelholm"), "identity: {identity}");
+        assert!(!volume.cuts.is_empty());
+        // The not-in-catalog map jump needs coordinates from the volume.
+        assert!(volume.site.latitude_deg.is_some());
+        assert!(volume.site.longitude_deg.is_some());
+        // Second tick with the installed identity: no download, no change.
+        assert!(
+            fetch_intl_frame("smhi", "angelholm", Some(&identity))
+                .expect("live SMHI re-probe")
+                .is_none()
+        );
     }
 
     #[test]
@@ -23927,7 +24678,7 @@ mod tests {
             spc_receiver: None,
             archive_pending_event: None,
             ingest: None,
-            download_panel: rw_ui::DownloadPanel::new(default_download_spec()),
+            download_panel: rw_ui::DownloadPanel::new(default_download_spec("hrrr")),
             sat: None,
             sat_panel: rw_ui::SatellitePanel::new(rw_ui::SatFollowSpec::default()),
             sat_player: rw_ui::SatPlayerPanel::new(),
@@ -23964,6 +24715,10 @@ mod tests {
             poll_last_file: None,
             poll_next: None,
             poll_rx: None,
+            poll_source: PollSource::CustomUrl(String::new()),
+            intl_picker_provider: String::new(),
+            intl_sites: None,
+            intl_sites_rx: None,
             spc_data: spc_layers::SpcData::default(),
             spc_outlooks_enabled: Vec::new(),
             spc_kinds_memory: Vec::new(),

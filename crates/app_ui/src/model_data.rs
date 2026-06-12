@@ -175,6 +175,14 @@ impl ModelDataDock {
         self.select_hour(key);
     }
 
+    /// Model slug of the hour selected in the store browser — what
+    /// `request_sounding_at` would sample. Callers holding grid coords
+    /// from a specific model's LUT use this to detect cross-model
+    /// mismatches in mixed hrrr+gfs stores.
+    pub fn browsed_hour_model(&self) -> Option<String> {
+        self.viewer.hour().map(|hour| hour.model.clone())
+    }
+
     /// Request a sounding at storage-order grid coordinates (map click).
     pub fn request_sounding_at(&mut self, fx: f64, fy: f64) {
         if let Some(hour) = self.viewer.hour().cloned() {
@@ -195,12 +203,21 @@ impl ModelDataDock {
     /// The hour key in the NEWEST run whose valid time is closest to
     /// `target` — run slugs parse as "YYYYMMDD_HHz", valid = run + fhr.
     /// Returns (key, valid time, run age at `target`).
+    ///
+    /// `preferred_model` pins the lookup to one model's runs (callers
+    /// holding grid coordinates from a specific model's LUT must not mix
+    /// grids in an hrrr+gfs store); `None` keeps the historical
+    /// first-model behavior.
     pub fn newest_hour_valid_near(
         &self,
         target: chrono::DateTime<chrono::Utc>,
+        preferred_model: Option<&str>,
     ) -> Option<(HourKey, chrono::DateTime<chrono::Utc>, chrono::Duration)> {
         let tree = self.tree.as_ref()?;
-        let model = tree.models.first()?;
+        let model = match preferred_model {
+            Some(slug) => tree.models.iter().find(|entry| entry.model == slug)?,
+            None => tree.models.first()?,
+        };
         let run = model.runs.last()?;
         let (date, cycle) = run.run.split_once('_')?;
         let naive = chrono::NaiveDate::parse_from_str(date, "%Y%m%d").ok()?;

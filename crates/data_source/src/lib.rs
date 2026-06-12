@@ -1,6 +1,7 @@
 //! Public radar data-source helpers.
 
 mod embedded_sites;
+pub mod international;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -287,6 +288,38 @@ pub fn fetch_text(url: &str) -> Result<String> {
         .send()?
         .error_for_status()?
         .text()?)
+}
+
+/// Fetch a large catalog/listing text resource on the download client.
+///
+/// Some international feed catalogs are multi-megabyte autoindex pages (a
+/// DWD per-station sweep listing runs ~2 MB and the server does not gzip
+/// it), which can outrun the 8-second metadata-client budget of
+/// [`fetch_text`] on a slow link. Listings still must complete within the
+/// 45-second download budget.
+pub fn fetch_listing_text(url: &str) -> Result<String> {
+    Ok(download_http_client()
+        .get(url)
+        .send()?
+        .error_for_status()?
+        .text()?)
+}
+
+/// `Ok(true)` when a HEAD request says `url` exists (2xx), `Ok(false)` on
+/// 404/410, `Err` on transport failures and other HTTP statuses. The cheap
+/// existence probe for feeds whose newest file name must be guessed
+/// (e.g. the 5-minute-aligned JMA/NICT tar stamps).
+pub fn url_exists(url: &str) -> Result<bool> {
+    let response = metadata_http_client().head(url).send()?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(true);
+    }
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+        return Ok(false);
+    }
+    response.error_for_status()?;
+    Ok(false)
 }
 
 /// Fetch a small binary resource (e.g. a placefile icon sheet). Capped at
@@ -1042,12 +1075,29 @@ fn download_http_client() -> reqwest::blocking::Client {
         .clone()
 }
 
+/// Sectigo "Public Server Authentication CA DV R36" intermediate (valid to
+/// 2036-03-21, chains to the Mozilla-trusted Sectigo Root R46), fetched from
+/// the certificate's own AIA URL
+/// (`http://crt.sectigo.com/SectigoPublicServerAuthenticationCADVR36.crt`).
+///
+/// SHMU's open-data server (opendata.shmu.sk, the Slovak radar volume feed)
+/// sends an incomplete TLS chain — the leaf only. Browsers and schannel
+/// repair that by chasing the AIA URL; rustls deliberately does not, so
+/// without this anchor every fetch from the feed fails the TLS handshake.
+const SECTIGO_DV_R36_INTERMEDIATE_PEM: &str =
+    include_str!("../certs/sectigo_public_server_authentication_ca_dv_r36.pem");
+
 fn build_http_client(timeout: StdDuration) -> Result<reqwest::blocking::Client> {
-    Ok(reqwest::blocking::Client::builder()
+    let mut builder = reqwest::blocking::Client::builder()
         .user_agent(HTTP_USER_AGENT)
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
-        .timeout(timeout)
-        .build()?)
+        .timeout(timeout);
+    // Extra trust anchor for AIA-incomplete servers (see the constant's
+    // docs). Skipped, never fatal, if the embedded PEM fails to parse.
+    if let Ok(cert) = reqwest::Certificate::from_pem(SECTIGO_DV_R36_INTERMEDIATE_PEM.as_bytes()) {
+        builder = builder.add_root_certificate(cert);
+    }
+    Ok(builder.build()?)
 }
 
 fn latest_object_cache() -> &'static Mutex<BTreeMap<LatestObjectCacheKey, CachedLatestObject>> {

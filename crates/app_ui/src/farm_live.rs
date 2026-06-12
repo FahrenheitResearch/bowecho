@@ -868,11 +868,14 @@ fn build_drape_image(img: &egui::ColorImage, axes: AxesRect) -> DrapeImage {
             }
             let out = oy * half_w + ox;
             plain[out] = egui::Color32::from_rgb((r / 4) as u8, (g / 4) as u8, (b / 4) as u8);
+            // max(1) keeps the divisor provably nonzero (== en inside the
+            // guard), sidestepping clippy 1.96's manual_checked_ops.
+            let echo_count = en.max(1);
             if en > 0 {
                 echoes[out] = egui::Color32::from_rgba_unmultiplied(
-                    (er / en) as u8,
-                    (eg / en) as u8,
-                    (eb / en) as u8,
+                    (er / echo_count) as u8,
+                    (eg / echo_count) as u8,
+                    (eb / echo_count) as u8,
                     (en * 255 / 4) as u8,
                 );
             }

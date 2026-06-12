@@ -7,6 +7,7 @@
 pub mod cfradial;
 pub mod dorade;
 pub mod hdf5lite;
+pub mod jma;
 pub mod mobile_archive;
 pub mod netcdf3;
 pub mod odim;
@@ -120,6 +121,88 @@ pub fn decode_volume_from_bytes(bytes: &[u8]) -> Result<RadarVolume> {
 
     let (bytes, compression) = normalize_archive_bytes(bytes)?;
     decode_normalized_volume_bytes(&bytes, compression)
+}
+
+/// A radar container format this crate can decode from a single byte buffer,
+/// in magic-byte sniff precedence order.
+///
+/// The variants and their order are the one shared routing contract used by
+/// local file open, URL polling, and international providers — keep
+/// [`sniff_supported_volume_format`] and [`decode_supported_volume_bytes`]
+/// in lockstep with it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SupportedVolumeFormat {
+    /// DORADE sweepfile (solo/Radx descriptor blocks: `COMM`/`SSWB`/`VOLD`/`RADD`).
+    Dorade,
+    /// HDF5 container, decoded as ODIM_H5 PVOL/SCAN (EUMETNET OPERA Data
+    /// Information Model; Michelson et al., OPERA WP 2.1/2.2, v2.2-2.3).
+    OdimH5,
+    /// Classic netCDF (`CDF\x01`/`CDF\x02`, plus CDF-5 sniffed for a useful
+    /// rejection), decoded as CfRadial 1.x.
+    CfRadial,
+    /// JMA polar-coordinate radar GRIB2 tar (`Z__C_RJTD_*_RDR_JMAGPV*.tar`;
+    /// ustar magic at byte 257, JMA GRIB2 templates 3.50120/4.51022/5.200
+    /// per the JMA technical format documentation).
+    JmaGrib2Tar,
+    /// Everything else: NEXRAD Archive II / Level II (AR2V, gzip, bzip2,
+    /// LDM block-bzip, GR2-style msg31 exports).
+    NexradLevel2,
+}
+
+/// Sniff which decoder [`decode_supported_volume_bytes`] would route to.
+///
+/// Most magic signatures live in the first 8 bytes, but the JMA tar check
+/// reads the first 512-byte tar header block (ustar magic at byte 257), and
+/// the DORADE check also validates the first descriptor block length against
+/// the buffer length — pass the full buffer when you have it; a short head
+/// prefix may sniff DORADE or a JMA tar as Level II. Anything unrecognized
+/// falls through to [`SupportedVolumeFormat::NexradLevel2`] so the error
+/// surfaces from the Archive II decoder, matching the historical routing
+/// chains.
+pub fn sniff_supported_volume_format(head: &[u8]) -> SupportedVolumeFormat {
+    if dorade::looks_like_dorade_bytes(head) {
+        SupportedVolumeFormat::Dorade
+    } else if hdf5lite::looks_like_hdf5_bytes(head) {
+        SupportedVolumeFormat::OdimH5
+    } else if netcdf3::looks_like_netcdf3_bytes(head) {
+        SupportedVolumeFormat::CfRadial
+    } else if jma::looks_like_jma_tar_bytes(head) {
+        SupportedVolumeFormat::JmaGrib2Tar
+    } else {
+        SupportedVolumeFormat::NexradLevel2
+    }
+}
+
+/// Decode any supported single-buffer radar container by magic bytes:
+/// DORADE → ODIM_H5 (HDF5) → CfRadial 1.x (classic netCDF) → JMA GRIB2 tar
+/// → NEXRAD Archive II fallback.
+///
+/// This is the one shared router for bytes of unknown provenance (local
+/// file open, custom URL polling, international feed downloads). Errors are
+/// the dispatched decoder's message, stringified — callers add their own
+/// source context (file name, URL). Never panics on malformed input.
+///
+/// JMA tars are multi-station archives (one GRIB2 member per radar of the
+/// national network); this router decodes the FIRST station only, because
+/// its contract is one volume per buffer. Providers that need a specific
+/// station call [`jma::decode_jma_tar_volumes`] with a `site_filter`
+/// directly instead of going through the router.
+pub fn decode_supported_volume_bytes(raw: &[u8]) -> std::result::Result<RadarVolume, String> {
+    match sniff_supported_volume_format(raw) {
+        SupportedVolumeFormat::Dorade => {
+            dorade::decode_dorade_sweep_volume(raw).map_err(|err| err.to_string())
+        }
+        SupportedVolumeFormat::OdimH5 => {
+            odim::decode_odim_h5_volume(raw).map_err(|err| err.to_string())
+        }
+        SupportedVolumeFormat::CfRadial => {
+            cfradial::decode_cfradial1_volume(raw).map_err(|err| err.to_string())
+        }
+        SupportedVolumeFormat::JmaGrib2Tar => jma::decode_jma_tar_first_station(raw),
+        SupportedVolumeFormat::NexradLevel2 => {
+            decode_volume_from_bytes(raw).map_err(|err| err.to_string())
+        }
+    }
 }
 
 pub fn decode_gzip_volume_from_reader(reader: impl Read) -> Result<RadarVolume> {
@@ -1697,6 +1780,87 @@ mod tests {
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::io::Write;
+
+    #[test]
+    fn sniffs_supported_volume_formats_in_router_order() {
+        // DORADE descriptor blocks win over everything (8-byte head form:
+        // 4-byte name + a block length plausible in at least one byte order).
+        let mut dorade_head = b"VOLD".to_vec();
+        dorade_head.extend_from_slice(&8u32.to_le_bytes());
+        assert_eq!(
+            sniff_supported_volume_format(&dorade_head),
+            SupportedVolumeFormat::Dorade
+        );
+        assert_eq!(
+            sniff_supported_volume_format(b"\x89HDF\r\n\x1a\nrest"),
+            SupportedVolumeFormat::OdimH5
+        );
+        assert_eq!(
+            sniff_supported_volume_format(b"CDF\x01...."),
+            SupportedVolumeFormat::CfRadial
+        );
+        // JMA radar tar: ustar magic at byte 257 + Z__C_RJTD member name.
+        let mut jma_tar = vec![0u8; 1024];
+        let jma_name =
+            b"Z__C_RJTD_20260612064000_RDR_JMAGPV_RS47937_Gar0p5km0p7deg_Pze_ANAL_grib2.bin";
+        jma_tar[..jma_name.len()].copy_from_slice(jma_name);
+        jma_tar[257..262].copy_from_slice(b"ustar");
+        assert_eq!(
+            sniff_supported_volume_format(&jma_tar),
+            SupportedVolumeFormat::JmaGrib2Tar
+        );
+        // A generic (non-JMA) tar is not claimed; it falls through.
+        let mut plain_tar = vec![0u8; 1024];
+        plain_tar[..9].copy_from_slice(b"notes.txt");
+        plain_tar[257..262].copy_from_slice(b"ustar");
+        assert_eq!(
+            sniff_supported_volume_format(&plain_tar),
+            SupportedVolumeFormat::NexradLevel2
+        );
+        // Archive II, compressed wrappers, and unknown garbage all fall
+        // through to the Level II decoder so its errors surface.
+        assert_eq!(
+            sniff_supported_volume_format(b"AR2V0006."),
+            SupportedVolumeFormat::NexradLevel2
+        );
+        assert_eq!(
+            sniff_supported_volume_format(b"\x1f\x8b\x08\0\0\0\0\0"),
+            SupportedVolumeFormat::NexradLevel2
+        );
+        assert_eq!(
+            sniff_supported_volume_format(b""),
+            SupportedVolumeFormat::NexradLevel2
+        );
+        // CDF-3 does not exist; netCDF-3 sniff accepts 1/2/5 only.
+        assert_eq!(
+            sniff_supported_volume_format(b"CDF\x03...."),
+            SupportedVolumeFormat::NexradLevel2
+        );
+    }
+
+    #[test]
+    fn router_decodes_synthetic_archive_ii_same_as_direct_decoder() {
+        let bytes = synthetic_archive(false);
+        let direct = decode_volume_from_bytes(&bytes).expect("direct Archive II decode");
+        let routed = decode_supported_volume_bytes(&bytes).expect("routed Archive II decode");
+        assert_eq!(routed, direct);
+    }
+
+    #[test]
+    fn router_stringifies_level2_error_for_unrecognized_bytes() {
+        // Short unrecognized bytes fail the Archive II volume-header check;
+        // the router must surface that exact decoder message, stringified.
+        let direct_err = decode_volume_from_bytes(b"not radar")
+            .expect_err("short garbage must not decode")
+            .to_string();
+        let routed_err =
+            decode_supported_volume_bytes(b"not radar").expect_err("short garbage must not decode");
+        assert_eq!(routed_err, direct_err);
+        assert!(
+            routed_err.contains("too short for an Archive II volume header"),
+            "unexpected error text: {routed_err}"
+        );
+    }
 
     #[test]
     fn parses_archive_volume_header() {

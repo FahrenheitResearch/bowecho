@@ -84,6 +84,14 @@ pub struct AppSettings {
     /// once per deployment is fine, once per session is not.
     #[serde(default)]
     pub poll_url: String,
+    /// Last international live-feed selection, mirroring `poll_url`: the
+    /// data_source international provider id (e.g. "smhi") plus its
+    /// provider-scoped site id (e.g. "angelholm"), so the DATA tab's
+    /// International Start can resume the feed next session.
+    #[serde(default)]
+    pub intl_provider: String,
+    #[serde(default)]
+    pub intl_site: String,
     /// FARM quicklook map-drape georeferences, one per sensor id —
     /// auto-located or manually pinned deployment positions survive
     /// restarts (re-located automatically when the scan id changes).
@@ -106,6 +114,15 @@ pub struct AppSettings {
     /// state dies with the process — this map is what survives restarts.
     #[serde(default)]
     pub sidebar_section_open: BTreeMap<String, bool>,
+    /// Last-used NWP model slug for the Download panel / one-click ingest
+    /// ("hrrr", "gfs", ...). Unknown or no-longer-supported slugs fall
+    /// back to HRRR at use sites.
+    #[serde(default = "default_model_slug")]
+    pub model_slug: String,
+}
+
+fn default_model_slug() -> String {
+    "hrrr".to_owned()
 }
 
 /// A persisted FARM drape georeference. Coordinates are stored as scaled
@@ -190,10 +207,13 @@ impl Default for AppSettings {
             perf_hud: false,
             product_hotkeys: default_product_hotkeys(),
             poll_url: String::new(),
+            intl_provider: String::new(),
+            intl_site: String::new(),
             farm_georefs: Vec::new(),
             workspace_layout: None,
             data_dir: String::new(),
             sidebar_section_open: BTreeMap::new(),
+            model_slug: default_model_slug(),
         }
     }
 }
@@ -454,6 +474,8 @@ mod tests {
             startup_site: Some("KEAX".to_owned()),
             polling_interval_seconds: 30,
             perf_hud: true,
+            intl_provider: "smhi".to_owned(),
+            intl_site: "angelholm".to_owned(),
             ..Default::default()
         };
         s.add_favorite("ktwx");
@@ -492,6 +514,17 @@ mod tests {
         assert_eq!(s.startup_site.as_deref(), Some("KDMX"));
         assert_eq!(s.polling_interval_seconds, 60);
         assert_eq!(s.saved_layout_slots, 8);
+    }
+
+    #[test]
+    fn model_slug_defaults_to_hrrr_and_round_trips() {
+        // Older configs have no model_slug field — default to HRRR.
+        assert_eq!(AppSettings::from_json("{}").model_slug, "hrrr");
+        let s = AppSettings {
+            model_slug: "gfs".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(AppSettings::from_json(&s.to_json()).model_slug, "gfs");
     }
 
     #[test]

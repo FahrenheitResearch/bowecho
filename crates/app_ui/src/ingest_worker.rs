@@ -200,7 +200,7 @@ fn resolve_spec(
         .map_err(|_| format!("unknown model '{}'", spec.model))?;
     if !rw_ingest::ingest_supported(model) {
         return Err(format!(
-            "model '{}' is not ingest-supported yet (HRRR only today)",
+            "model '{}' is not ingest-supported yet",
             spec.model
         ));
     }
@@ -302,6 +302,11 @@ pub fn format_time_hint(
 /// pool; HRRR's catalog order would otherwise probe NOMADS serially —
 /// 49 round trips). The actual fetch still tries every source in catalog
 /// order, so a freshest-hour lag on AWS only affects the chips.
+///
+/// Products come from the model's ingest fetch plan (HRRR: `prs`+`sfc`
+/// pair, GFS: single `pgrb2.0p25`); an hour is available when every
+/// product the profile needs exists. A pressure-only file (HRRR `prs`)
+/// is probed only when the profile reads isobaric data.
 fn probe_availability(state: &mut WorkerState, spec: &DownloadSpec) -> AvailabilityView {
     let mut view = AvailabilityView {
         model: spec.model.clone(),
@@ -318,42 +323,166 @@ fn probe_availability(state: &mut WorkerState, spec: &DownloadSpec) -> Availabil
             return view;
         }
     };
+    let products = match probe_products(model, &profile) {
+        Ok(products) => products,
+        Err(message) => {
+            view.note = Some(message);
+            return view;
+        }
+    };
     view.candidates = supported_forecast_hours(model, spec.cycle);
     let date = spec.date.clone();
     let cycle = spec.cycle;
-    let probe = |product: &str| {
-        rustwx_io::available_forecast_hours(model, &date, cycle, product, Some(SourceId::Aws))
+    let probe = |product: &str, source: Option<SourceId>| {
+        rustwx_io::available_forecast_hours(model, &date, cycle, product, source)
     };
     let result = state.pool().install(|| {
-        let sfc = probe("sfc")?;
-        if !profile.needs_prs() {
-            return Ok(sfc);
+        // An hour is available when every fetch-plan product has it.
+        let run = |source: Option<SourceId>| {
+            let mut available: Option<Vec<u16>> = None;
+            for product in &products {
+                let hours = probe(product, source)?;
+                available = Some(match available {
+                    None => hours,
+                    Some(have) => have
+                        .into_iter()
+                        .filter(|hour| hours.contains(hour))
+                        .collect(),
+                });
+            }
+            Ok::<Vec<u16>, rustwx_io::IoError>(available.unwrap_or_default())
+        };
+        // Fast path stays the parallel AWS idx HEADs; an EMPTY result
+        // walks the full source catalog once — NOMADS publishes minutes
+        // ahead of the mirrors, and a cycle in that window (or an AWS
+        // outage) must not read as absent (field request: upload time
+        // matters).
+        let aws = run(Some(SourceId::Aws))?;
+        if aws.is_empty() {
+            run(None).map(|hours| (hours, true))
+        } else {
+            Ok((aws, false))
         }
-        let prs = probe("prs")?;
-        Ok::<Vec<u16>, rustwx_io::IoError>(
-            sfc.into_iter().filter(|hour| prs.contains(hour)).collect(),
-        )
     });
     match result {
-        Ok(available) => {
+        Ok((available, walked_catalog)) => {
             view.available = available;
-            view.note = Some("probed via AWS idx".to_string());
+            view.note = Some(if walked_catalog {
+                "probed across the source catalog (cycle not on AWS yet)".to_owned()
+            } else {
+                "probed via AWS idx".to_owned()
+            });
         }
         Err(err) => view.note = Some(format!("availability probe failed: {err}")),
     }
     view
 }
 
+/// The product files an availability probe must check for `model` under
+/// `profile`: every fetch-plan entry the profile actually reads. Surface
+/// sources are always read; pressure sources only when the profile needs
+/// isobaric data (`needs_prs`). HRRR sounding-grade -> `["prs", "sfc"]`
+/// (plan order); GFS -> `["pgrb2.0p25"]`.
+fn probe_products(model: ModelId, profile: &IngestProfile) -> Result<Vec<&'static str>, String> {
+    let plan = rw_ingest::fetch_plan(model).map_err(|err| err.to_string())?;
+    Ok(plan
+        .iter()
+        .filter(|fetch| fetch.surface_source || (fetch.pressure_source && profile.needs_prs()))
+        .map(|fetch| fetch.product)
+        .collect())
+}
+
 /// Newest available run for the spec's model, walking back from the spec's
-/// date (AWS-pinned probes for speed).
+/// date. Probes the whole source catalog (or the spec's pinned source):
+/// the engine prefers the newest cycle over source priority, so a run
+/// that NOMADS has published but the mirrors haven't yet still wins —
+/// the old AWS pin both lagged fresh cycles and turned one source's
+/// outage into "no working source found".
 fn find_latest(spec: &DownloadSpec) -> Result<(String, u8), String> {
     let model: ModelId = spec
         .model
         .parse()
         .map_err(|_| format!("unknown model '{}'", spec.model))?;
-    let latest = rustwx_models::latest_available_run(model, Some(SourceId::Aws), &spec.date)
+    let source = source_override(spec)?;
+    let latest = rustwx_models::latest_available_run(model, source, &spec.date)
         .map_err(|err| format!("latest-run probe failed: {err}"))?;
     Ok((latest.cycle.date_yyyymmdd, latest.cycle.hour_utc))
+}
+
+// --- One-click ("Fetch latest") ingest helpers — pure, no network. ---
+
+/// Rough HRRR CONUS coverage test: lat 21..52.5 N, lon 134..60 W. The
+/// HRRR Lambert domain's top edge sags toward its corners (≈52.6 N at
+/// top-center, lower east/west), so the box top stays inside the grid and
+/// the test errs toward the GFS fallback when a radar is outside CONUS
+/// (Guam, Alaska, international feeds). The northernmost CONUS 88Ds sit
+/// ≈48.7 N, far from the edge either way.
+pub fn hrrr_conus_covers(lat_deg: f32, lon_deg: f32) -> bool {
+    (21.0..=52.5).contains(&lat_deg) && (-134.0..=-60.0).contains(&lon_deg)
+}
+
+/// Publication lag floor for a model: minutes after init when the first
+/// forecast files are plausibly complete upstream. HRRR hours appear
+/// ~50-55 min after init; GFS pgrb2.0p25 early hours land ~3.5-4 h after
+/// init (NCEP production suite timing), so 220 min is the optimistic
+/// edge — the one-click path falls back one cycle when the guess loses.
+pub fn publication_lag_minutes(model: ModelId) -> i64 {
+    match model {
+        ModelId::Gfs => 220,
+        _ => 55,
+    }
+}
+
+/// The freshest `count` plausible runs for a model with `cycle_hours`
+/// cadence: every cycle init at or before `now - lag_minutes`, newest
+/// first, as (YYYYMMDD, cycle-hour) pairs. Generalizes the HRRR one-click
+/// guess (hourly cadence, candidates at now-55 m and now-115 m) to sparse
+/// cadences like GFS's 00/06/12/18z.
+pub fn recent_cycle_candidates(
+    now: chrono::DateTime<chrono::Utc>,
+    cycle_hours: &[u8],
+    lag_minutes: i64,
+    count: usize,
+) -> Vec<(String, u8)> {
+    use chrono::Timelike;
+    let mut cycles: Vec<u8> = cycle_hours.iter().copied().filter(|&h| h < 24).collect();
+    cycles.sort_unstable();
+    cycles.dedup();
+    if cycles.is_empty() || count == 0 {
+        return Vec::new();
+    }
+    let cutoff = now - chrono::Duration::minutes(lag_minutes);
+    let cutoff_hour = cutoff.hour() as u8;
+    let mut out = Vec::with_capacity(count);
+    let mut day = cutoff.date_naive();
+    let mut first_day = true;
+    while out.len() < count {
+        for &cycle in cycles.iter().rev() {
+            if first_day && cycle > cutoff_hour {
+                continue;
+            }
+            out.push((day.format("%Y%m%d").to_string(), cycle));
+            if out.len() == count {
+                break;
+            }
+        }
+        first_day = false;
+        let Some(previous) = day.pred_opt() else {
+            break;
+        };
+        day = previous;
+    }
+    out
+}
+
+/// First forecast hour worth ingesting for a run initialized
+/// `age_minutes` ago: the hour whose valid time most recently passed, so
+/// `first..=first+3` brackets the now..now+3 h window the auto hail-env
+/// path samples. A fresh HRRR run (age <2 h) starts at f00/f01; an older
+/// GFS cycle (age ~4-10 h) starts at f04-f10 instead of wasting the
+/// fetch on hours whose valid times are already hours in the past.
+pub fn first_live_hour(age_minutes: i64) -> u16 {
+    (age_minutes.max(0) / 60) as u16
 }
 
 /// rw-ingest stage -> panel stage.
@@ -554,6 +683,56 @@ mod tests {
         }
     }
 
+    /// Field repro: GFS Latest/Download did nothing with no error. Drives
+    /// the REAL worker thread with a gfs spec exactly like the panel does
+    /// and requires a response for every request — a worker panic shows up
+    /// here as a recv timeout instead of a silent no-op.
+    /// `cargo test -p app_ui gfs_panel_live -- --ignored --nocapture`
+    #[test]
+    #[ignore = "live network probe of the GFS panel path"]
+    fn gfs_panel_live_latest_estimate_probe_all_answer() {
+        let scratch = std::env::temp_dir().join("bowecho-gfs-panel-live");
+        let worker = IngestWorker::spawn(scratch, || {});
+        let mut gfs = spec();
+        gfs.model = "gfs".to_string();
+        gfs.date = chrono::Utc::now().format("%Y%m%d").to_string();
+        gfs.cycle = 0;
+        gfs.hours = "0-3".to_string();
+
+        let recv = |what: &str| -> IngestResponse {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                if let Some(response) = worker.try_recv() {
+                    return response;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what}: no response in 120 s — worker thread likely dead"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+
+        worker.send(IngestRequest::Estimate(gfs.clone()));
+        let estimate = recv("estimate");
+        println!("estimate -> {estimate:?}");
+
+        worker.send(IngestRequest::Latest(gfs.clone()));
+        let latest = recv("latest");
+        println!("latest -> {latest:?}");
+        match &latest {
+            IngestResponse::Latest { date, cycle } => {
+                gfs.date = date.clone();
+                gfs.cycle = *cycle;
+            }
+            other => panic!("Latest must answer Latest{{..}}, got {other:?}"),
+        }
+
+        worker.send(IngestRequest::Probe(gfs.clone()));
+        let probe = recv("probe");
+        println!("probe -> {probe:?}");
+    }
+
     #[test]
     fn resolve_spec_accepts_a_valid_sounding_spec() {
         let (model, profile, hours, cycle) = resolve_spec(&spec()).expect("valid spec resolves");
@@ -603,6 +782,104 @@ mod tests {
             message.contains("outside the supported range"),
             "got: {message}"
         );
+    }
+
+    #[test]
+    fn conus_box_separates_hrrr_radars_from_international_sites() {
+        // Inside: KTLX, KEAX, Miami, Seattle.
+        assert!(hrrr_conus_covers(35.33, -97.28));
+        assert!(hrrr_conus_covers(38.81, -94.26));
+        assert!(hrrr_conus_covers(25.76, -80.19));
+        assert!(hrrr_conus_covers(47.68, -122.25));
+        // Outside: Stockholm, Guam (PGUA), Anchorage (PAHG), São Paulo.
+        assert!(!hrrr_conus_covers(59.3, 18.1));
+        assert!(!hrrr_conus_covers(13.46, 144.81));
+        assert!(!hrrr_conus_covers(60.73, -151.35));
+        assert!(!hrrr_conus_covers(-23.55, -46.63));
+        // Box edges stay inside (top capped at 52.5 N: the HRRR Lambert
+        // domain's upper edge sags toward its corners).
+        assert!(hrrr_conus_covers(21.0, -134.0));
+        assert!(hrrr_conus_covers(52.5, -60.0));
+        assert!(!hrrr_conus_covers(52.9, -100.0));
+    }
+
+    fn utc(date: &str, h: u32, m: u32) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        let d = chrono::NaiveDate::parse_from_str(date, "%Y%m%d").unwrap();
+        chrono::Utc.from_utc_datetime(&d.and_hms_opt(h, m, 0).unwrap())
+    }
+
+    #[test]
+    fn hourly_candidates_match_the_historical_hrrr_guess() {
+        // The HRRR one-click guess was (now-55m, now-115m) formatted to the
+        // hour. The generalized helper must reproduce it exactly.
+        let hourly: Vec<u8> = (0..24).collect();
+        let now = utc("20260611", 12, 30);
+        let got = recent_cycle_candidates(now, &hourly, 55, 2);
+        assert_eq!(
+            got,
+            vec![("20260611".to_string(), 11), ("20260611".to_string(), 10)]
+        );
+        // Midnight wrap: 00:30 UTC - 55 m lands on the previous day.
+        let got = recent_cycle_candidates(utc("20260611", 0, 30), &hourly, 55, 2);
+        assert_eq!(
+            got,
+            vec![("20260610".to_string(), 23), ("20260610".to_string(), 22)]
+        );
+    }
+
+    #[test]
+    fn six_hourly_candidates_respect_cadence_and_lag() {
+        let gfs: &[u8] = &[0, 6, 12, 18];
+        // 14:00 UTC with a 220-min lag: cutoff 10:20 -> 06z, then 00z.
+        let got = recent_cycle_candidates(utc("20260611", 14, 0), gfs, 220, 2);
+        assert_eq!(
+            got,
+            vec![("20260611".to_string(), 6), ("20260611".to_string(), 0)]
+        );
+        // 16:00 UTC: cutoff 12:20 -> 12z is in.
+        let got = recent_cycle_candidates(utc("20260611", 16, 0), gfs, 220, 2);
+        assert_eq!(
+            got,
+            vec![("20260611".to_string(), 12), ("20260611".to_string(), 6)]
+        );
+        // 02:00 UTC: cutoff 22:20 previous day -> 18z, 12z of 06/10.
+        let got = recent_cycle_candidates(utc("20260611", 2, 0), gfs, 220, 2);
+        assert_eq!(
+            got,
+            vec![("20260610".to_string(), 18), ("20260610".to_string(), 12)]
+        );
+        // Degenerate inputs.
+        assert!(recent_cycle_candidates(utc("20260611", 2, 0), &[], 220, 2).is_empty());
+        assert!(recent_cycle_candidates(utc("20260611", 2, 0), gfs, 220, 0).is_empty());
+    }
+
+    #[test]
+    fn first_live_hour_floors_run_age_to_hours() {
+        assert_eq!(first_live_hour(0), 0);
+        assert_eq!(first_live_hour(55), 0);
+        assert_eq!(first_live_hour(60), 1);
+        assert_eq!(first_live_hour(115), 1);
+        assert_eq!(first_live_hour(220), 3);
+        assert_eq!(first_live_hour(9 * 60 + 40), 9);
+        assert_eq!(first_live_hour(-5), 0); // clock skew never panics
+    }
+
+    #[test]
+    fn probe_products_follow_the_fetch_plan() {
+        // HRRR sounding-grade reads 3D volumes -> both prs and sfc.
+        let sounding = IngestProfile::preset("sounding").unwrap();
+        assert_eq!(
+            probe_products(ModelId::Hrrr, &sounding).unwrap(),
+            vec!["prs", "sfc"]
+        );
+        // GFS: one file serves both roles.
+        assert_eq!(
+            probe_products(ModelId::Gfs, &sounding).unwrap(),
+            vec!["pgrb2.0p25"]
+        );
+        // Models without a fetch plan surface an error, not a panic.
+        assert!(probe_products(ModelId::Rap, &sounding).is_err());
     }
 
     #[test]
@@ -726,5 +1003,225 @@ mod tests {
             }
             other => panic!("expected Estimate, got {other:?}"),
         }
+    }
+
+    /// LIVE end-to-end GFS lane validation — network + a real (subsetted)
+    /// GFS download into a SCRATCH store (never the user's). Run manually:
+    ///
+    /// ```text
+    /// cargo test -p app_ui -- --ignored gfs_live --nocapture
+    /// ```
+    ///
+    /// Ingests two sounding-grade hours of the freshest plausible GFS
+    /// cycle, then asserts the full app-side chain: the stored field loads
+    /// with the 0.25° global dims, the map-drape InverseLut builds and
+    /// resolves Stockholm (59.33 N 18.07 E — far outside HRRR coverage),
+    /// and a native skew-T extracts there with physically plausible
+    /// temperatures/pressures.
+    #[test]
+    #[ignore = "live network: downloads a GFS hour into a scratch store"]
+    fn gfs_live_ingest_field_lut_and_stockholm_sounding() {
+        let scratch = std::env::temp_dir().join(format!("bowecho-gfs-e2e-{}", std::process::id()));
+        let store_root = scratch.join("store");
+        let cache_root = scratch.join("cache");
+        std::fs::create_dir_all(&store_root).expect("scratch store dir");
+        std::fs::create_dir_all(&cache_root).expect("scratch cache dir");
+
+        // --- Ingest: freshest plausible cycle via the one-click helpers ---
+        let model = ModelId::Gfs;
+        let now = chrono::Utc::now();
+        let candidates = recent_cycle_candidates(
+            now,
+            rustwx_models::model_summary(model).cycle_hours_utc,
+            publication_lag_minutes(model),
+            2,
+        );
+        let profile = IngestProfile::sounding();
+        let cancel = AtomicBool::new(false);
+        let progress = |event: IngestEvent| {
+            if let IngestEvent::StageStarted { hour, stage } = event {
+                println!("gfs e2e: f{hour:02} {stage:?}…");
+            }
+        };
+        let mut stored: Option<(String, u8, Vec<u16>)> = None;
+        'candidates: for (date, cycle_hour) in candidates {
+            let cycle = CycleSpec::new(&date, cycle_hour).expect("cycle spec");
+            let run_slug = format!("{date}_{cycle_hour:02}z");
+            let config = IngestConfig {
+                model,
+                cycle: &cycle,
+                source_override: None,
+                cache_root: &cache_root,
+                use_cache: true,
+                store_root: &store_root,
+                model_slug: "gfs",
+                run_slug: &run_slug,
+                profile: &profile,
+                verify: false,
+                progress: &progress,
+                cancel: &cancel,
+            };
+            let init = chrono::NaiveDate::parse_from_str(&date, "%Y%m%d")
+                .expect("candidate date")
+                .and_hms_opt(cycle_hour as u32, 0, 0)
+                .expect("cycle time")
+                .and_utc();
+            let first = first_live_hour((now - init).num_minutes());
+            let hours = vec![first, first + 1];
+            for &hour in &hours {
+                if let Err(err) = rw_ingest::ingest_hour_serial(&config, hour) {
+                    println!("gfs e2e: {date} {cycle_hour:02}z f{hour:02} failed: {err}");
+                    continue 'candidates;
+                }
+                println!("gfs e2e: {date} {cycle_hour:02}z f{hour:02} stored");
+            }
+            stored = Some((date, cycle_hour, hours));
+            break;
+        }
+        let (date, cycle_hour, hours) =
+            stored.expect("no plausible GFS cycle ingested — network down or NOMADS/AWS outage?");
+
+        // --- Store read-back: the exact dock flow (rw-ui StoreWorker) ---
+        let worker = rw_ui::StoreWorker::spawn(rw_ui::StoreView::new(&store_root), || {});
+        let timeout = std::time::Duration::from_secs(60);
+        let key = rw_ui::HourKey {
+            model: "gfs".to_owned(),
+            run: format!("{date}_{cycle_hour:02}z"),
+            hour: hours[0],
+        };
+        worker.send(rw_ui::StoreRequest::LoadHour(key.clone()));
+        let vars = loop {
+            match worker.recv_timeout(timeout).expect("hour vars response") {
+                rw_ui::StoreResponse::HourVars(got, result) if got == key => {
+                    break result.expect("stored hour lists variables");
+                }
+                _ => {}
+            }
+        };
+        let surface_var = vars
+            .iter()
+            .find(|var| var.kind == rw_ui::VarKind::Surface2D)
+            .expect("sounding profile stores 2D surface vars")
+            .name
+            .clone();
+        worker.send(rw_ui::StoreRequest::LoadField(rw_ui::FieldKey {
+            hour: key.clone(),
+            var: surface_var.clone(),
+        }));
+        let field = loop {
+            if let rw_ui::StoreResponse::Field(_, boxed) =
+                worker.recv_timeout(timeout).expect("field response")
+            {
+                break boxed.expect("field loads");
+            }
+        };
+        println!(
+            "gfs e2e: field {surface_var} nx={} ny={} ({} values, units {})",
+            field.nx,
+            field.ny,
+            field.values.len(),
+            field.units
+        );
+        // GFS 0.25°: 1440 x 721 global grid.
+        assert_eq!((field.nx, field.ny), (1440, 721), "GFS 0.25° dims");
+        assert_eq!(field.values.len(), field.nx * field.ny);
+        let grid = field.grid.as_ref().expect(".rwg grid metadata present");
+
+        // --- Map drape: the InverseLut the radar map layer uses ---
+        let lut = crate::model_layer::InverseLut::build(&grid.lat, &grid.lon)
+            .expect("InverseLut builds for the global grid");
+        let (stockholm_lat, stockholm_lon) = (59.33_f32, 18.07_f32);
+        let index = lut
+            .lookup(stockholm_lat, stockholm_lon)
+            .expect("Stockholm resolves in the LUT");
+        println!(
+            "gfs e2e: LUT Stockholm -> index {index} (grid point {:.2}N {:.2}E, field value {:.2} {})",
+            grid.lat[index], grid.lon[index], field.values[index], field.units
+        );
+        assert!((grid.lat[index] - stockholm_lat).abs() < 0.5);
+        assert!((grid.lon[index] - stockholm_lon).abs() < 0.5);
+
+        // --- Native sounding at Stockholm (model-agnostic fx/fy path) ---
+        let (fx, fy) = ((index % field.nx) as f64, (index / field.nx) as f64);
+        worker.send(rw_ui::StoreRequest::LoadSounding {
+            hour: key.clone(),
+            fx,
+            fy,
+        });
+        let sounding = loop {
+            if let rw_ui::StoreResponse::Sounding(_, result) =
+                worker.recv_timeout(timeout).expect("sounding response")
+            {
+                break result.expect("sounding extracts");
+            }
+        };
+        println!(
+            "gfs e2e: sounding at fx={fx} fy={fy} -> lat {:?} lon {:?}, {} profile vars, {} surface samples",
+            sounding.lat,
+            sounding.lon,
+            sounding.vars.len(),
+            sounding.surface.len()
+        );
+        let native = crate::build_native_sounding_adjusted(&sounding, None)
+            .expect("sharprs-native sounding builds");
+        let profile = &native.profile;
+        assert!(
+            profile.pres.len() >= 20,
+            "expected a real column, got {} levels",
+            profile.pres.len()
+        );
+        let sfc_p = profile.sfc_pressure();
+        let sfc_t = profile.tmpc[0];
+        println!(
+            "gfs e2e: Stockholm profile — {} levels, sfc {sfc_p:.1} hPa / {sfc_t:.1} C, top {:.1} hPa / {:.1} C",
+            profile.pres.len(),
+            profile.pres[profile.pres.len() - 1],
+            profile.tmpc[profile.tmpc.len() - 1]
+        );
+        for (p, t) in profile.pres.iter().zip(profile.tmpc.iter()).take(6) {
+            println!("gfs e2e:   {p:.0} hPa  {t:.1} C");
+        }
+        // Stockholm is near sea level; June surface temps are mild.
+        assert!(
+            (950.0..=1050.0).contains(&sfc_p),
+            "surface pressure {sfc_p} hPa implausible for Stockholm"
+        );
+        assert!(
+            (-15.0..=40.0).contains(&sfc_t),
+            "surface temperature {sfc_t} C implausible"
+        );
+        // Pressure strictly decreases with height; temps stay physical.
+        assert!(
+            profile.pres.windows(2).all(|w| w[1] < w[0]),
+            "pressure column must descend"
+        );
+        assert!(
+            profile
+                .tmpc
+                .iter()
+                .filter(|t| t.is_finite())
+                .all(|&t| (-120.0..=60.0).contains(&t)),
+            "temperatures outside physical bounds"
+        );
+        // 0°C crossing height above the surface — the auto hail-env value.
+        let sfc_h = profile.sfc_height();
+        let h0 = profile
+            .tmpc
+            .iter()
+            .zip(profile.hght.iter())
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find_map(|pair| {
+                let (&t0, &h0) = pair[0];
+                let (&t1, &h1) = pair[1];
+                (t0 >= 0.0 && t1 <= 0.0 && t0 != t1)
+                    .then(|| (h0 + (t0 / (t0 - t1)) * (h1 - h0) - sfc_h) / 1000.0)
+            });
+        println!("gfs e2e: 0C crossing {h0:?} km AGL");
+        let h0 = h0.expect("June mid-latitude profile crosses 0C");
+        assert!((0.1..=6.0).contains(&h0), "0C height {h0} km implausible");
+
+        drop(worker);
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

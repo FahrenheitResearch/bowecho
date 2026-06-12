@@ -283,8 +283,11 @@ fn canonical_quantity(quantity: &str) -> Option<MomentType> {
         "DBZH" | "DBZV" | "TH" | "TV" | "DBZ" => Some(MomentType::Reflectivity),
         "VRADH" | "VRADV" | "VRAD" | "VRADDH" => Some(MomentType::Velocity),
         "WRADH" | "WRADV" | "WRAD" => Some(MomentType::SpectrumWidth),
-        "ZDR" | "ZDRU" => Some(MomentType::DifferentialReflectivity),
-        "RHOHV" | "RHOHVU" => Some(MomentType::CorrelationCoefficient),
+        // The unfiltered dual-pol spellings come in both orders in the
+        // wild: spec-style trailing U (ZDRU) and DWD's leading U (UZDR,
+        // URHOHV — live opendata.dwd.de sweep files, 2026-06-12).
+        "ZDR" | "ZDRU" | "UZDR" => Some(MomentType::DifferentialReflectivity),
+        "RHOHV" | "RHOHVU" | "URHOHV" => Some(MomentType::CorrelationCoefficient),
         "PHIDP" | "PHIDPU" | "UPHIDP" => Some(MomentType::DifferentialPhase),
         "KDP" | "KDPU" => Some(MomentType::SpecificDifferentialPhase),
         _ => None,

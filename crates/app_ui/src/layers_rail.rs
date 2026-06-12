@@ -15,8 +15,8 @@ use eframe::egui;
 
 use crate::{
     KNOWN_POLL_FEEDS, LayerRowGear, LayerRowOpacity, LayerRowOrder, LayerRowRemove, LayerRowSpec,
-    LayerRowVis, PlacefileSlot, RadarSite, SidebarTab, ViewerApp, dock, format_site_label,
-    layer_row, mesoanalysis, oa_derived,
+    LayerRowVis, PlacefileSlot, PollSource, RadarSite, SidebarTab, ViewerApp, dock,
+    format_site_label, intl_provider_label, layer_row, mesoanalysis, oa_derived,
 };
 
 impl ViewerApp {
@@ -188,7 +188,10 @@ impl ViewerApp {
                         hover: "Show on map (unchecked: hidden but still feeds the inspector + Alt+click soundings)",
                     },
                     name: &name,
-                    name_width: crate::NAME_W_STD,
+                    // Model field keys run long (temperature_2m, …) — the
+                    // standard tier truncated them to "temperature_…"
+                    // (field report).
+                    name_width: crate::NAME_W_WIDE,
                     name_hover: &name_hover,
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut layer.opacity,
@@ -924,11 +927,10 @@ impl ViewerApp {
         }
     }
 
-    /// LIVE FEEDS — GR2A-style dir.list URL polling. This is acquisition
-    /// (it replaces the primary volume source), not a layer — it lives in
-    /// the DATA tab (spec §1).
+    /// LIVE FEEDS — GR2A-style dir.list URL polling plus the international
+    /// open-data feeds. This is acquisition (it replaces the primary volume
+    /// source), not a layer — it lives in the DATA tab (spec §1).
     pub(crate) fn live_feeds_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let _ = ctx;
         ui.horizontal(|ui| {
                     ui.label("Poll URL").on_hover_text(
                         "GR2A-style polling: a served directory containing dir.list (the convention DOW/mobile radar crews use). Newest file loads automatically every 15 s, decoded natively (Level II or DORADE), and joins the frame loop.",
@@ -943,6 +945,7 @@ impl ViewerApp {
                         for (label, url) in KNOWN_POLL_FEEDS {
                             if ui.button(*label).clicked() {
                                 self.poll_url = (*url).to_owned();
+                                self.set_custom_url_poll_source();
                                 self.poll_active = true;
                                 self.poll_last_file = None;
                                 self.poll_next = None;
@@ -965,6 +968,7 @@ impl ViewerApp {
                         self.poll_last_file = None;
                         self.poll_next = None;
                         if self.poll_active {
+                            self.set_custom_url_poll_source();
                             // Drop any in-flight auto-refresh load: it
                             // would land after the first poll install and
                             // wipe the polled frames.
@@ -975,7 +979,7 @@ impl ViewerApp {
                             let _ = self.app_settings.save();
                         }
                     }
-                    if self.poll_active {
+                    if self.poll_active && matches!(self.poll_source, PollSource::CustomUrl(_)) {
                         ui.weak(
                             self.poll_last_file
                                 .as_deref()
@@ -983,6 +987,126 @@ impl ViewerApp {
                         );
                     }
                 });
+        self.intl_feeds_row(ui, ctx);
+    }
+
+    /// Point the shared poller at the URL text field (the custom-URL
+    /// Start/known-feed click). Switching away from a different source
+    /// drops a still-in-flight tick so it can't install under the new one.
+    fn set_custom_url_poll_source(&mut self) {
+        let source = PollSource::CustomUrl(self.poll_url.clone());
+        if self.poll_source != source {
+            self.poll_rx = None;
+            self.poll_source = source;
+        }
+    }
+
+    /// INTERNATIONAL — national open-data radar feeds from data_source's
+    /// provider registry (providers from other lanes appear here
+    /// automatically once registered in `intl_providers()`). Picking a
+    /// site starts the shared poller in Intl mode; Start resumes the
+    /// persisted last selection, mirroring the poll URL row.
+    fn intl_feeds_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut list_provider: Option<String> = None;
+        let mut start: Option<(String, String)> = None;
+        ui.horizontal(|ui| {
+            ui.label("International").on_hover_text(
+                "National open-data radar networks (ODIM_H5 polar volumes — OPERA Data Information Model), decoded natively. Pick a country's provider, then a site: the newest volume polls every 60 s and joins the frame loop like any polled feed.",
+            );
+            let provider_button = if self.intl_picker_provider.is_empty() {
+                "Country ▾".to_owned()
+            } else {
+                format!("{} ▾", intl_provider_label(&self.intl_picker_provider))
+            };
+            ui.menu_button(provider_button, |ui| {
+                ui.set_min_width(190.0);
+                let providers = data_source::international::intl_providers();
+                // Group by country; registry order within a country.
+                let mut countries: Vec<&'static str> = providers
+                    .iter()
+                    .map(|provider| provider.country())
+                    .collect();
+                countries.sort_unstable();
+                countries.dedup();
+                for (index, country) in countries.iter().enumerate() {
+                    if index > 0 {
+                        ui.separator();
+                    }
+                    ui.weak(*country);
+                    for provider in providers
+                        .iter()
+                        .filter(|provider| provider.country() == *country)
+                    {
+                        if ui.button(provider.label()).clicked() {
+                            list_provider = Some(provider.id().to_owned());
+                            ui.close();
+                        }
+                    }
+                }
+            })
+            .response
+            .on_hover_text("National feed providers, grouped by country");
+            if self.intl_sites_rx.is_some() {
+                ui.spinner();
+            }
+            if let Some(sites) = &self.intl_sites {
+                ui.menu_button("Site ▾", |ui| {
+                    ui.set_min_width(160.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("intl_site_list")
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            for site in sites {
+                                if ui.button(&site.label).clicked() {
+                                    start = Some((
+                                        site.provider_id.to_owned(),
+                                        site.site_id.clone(),
+                                    ));
+                                    ui.close();
+                                }
+                            }
+                        });
+                });
+            }
+            let intl_polling =
+                self.poll_active && matches!(self.poll_source, PollSource::Intl { .. });
+            if intl_polling {
+                if ui.button("Stop").clicked() {
+                    self.poll_active = false;
+                    self.poll_last_file = None;
+                    self.poll_next = None;
+                }
+                // Same status grammar as the URL poll: the dedupe key of
+                // the installed frame (Polled:/Poll: live in self.status).
+                ui.weak(
+                    self.poll_last_file
+                        .as_deref()
+                        .unwrap_or("waiting for catalog…"),
+                );
+            } else if let Some(PollSource::Intl {
+                provider_id,
+                site_id,
+            }) = PollSource::intl_from_settings(&self.app_settings)
+            {
+                // Resume the persisted selection (mirrors poll_url Start).
+                if ui
+                    .button("Start")
+                    .on_hover_text(format!(
+                        "Resume {} {site_id}",
+                        intl_provider_label(&provider_id)
+                    ))
+                    .clicked()
+                {
+                    start = Some((provider_id, site_id));
+                }
+            }
+        });
+        if let Some(provider_id) = list_provider {
+            self.start_intl_site_listing(&provider_id, ctx);
+        }
+        if let Some((provider_id, site_id)) = start {
+            self.start_intl_poll(provider_id, site_id);
+        }
     }
 
     /// `+ Add layer ▾` — THE single front door for every map data type

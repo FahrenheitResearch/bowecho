@@ -61,7 +61,7 @@ impl RadarVolume {
     ) -> &mut ElevationCut {
         if let Some(index) = self.cuts.iter().rposition(|cut| {
             cut.elevation_number == elevation_number
-                || (cut.elevation_deg - elevation_deg).abs() <= 0.05
+                || (cut.elevation_deg - elevation_deg).abs() <= CUT_ELEVATION_MATCH_TOLERANCE_DEG
         }) {
             return &mut self.cuts[index];
         }
@@ -87,6 +87,123 @@ impl Default for RadarVolume {
             DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch is a valid timestamp"),
         )
     }
+}
+
+/// Tolerance used to treat two cut elevations as the same tilt, both by
+/// [`RadarVolume::find_or_insert_cut`] and by [`merge_radar_volumes`].
+pub const CUT_ELEVATION_MATCH_TOLERANCE_DEG: f32 = 0.05;
+
+/// Counters describing what [`merge_radar_volumes`] did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MergeReport {
+    /// Moment grids moved from a later part into an elevation-matched cut.
+    pub merged_moments: usize,
+    /// Later-part cuts that matched an elevation but had different
+    /// radial/gate geometry and were therefore dropped entirely.
+    pub skipped_geometry: usize,
+    /// Moment grids dropped because the matched cut already carried that
+    /// moment type (first part wins).
+    pub moment_collisions: usize,
+}
+
+/// Merge per-product / per-sweep partial volumes of one scan into a single
+/// [`RadarVolume`].
+///
+/// Several international feeds split one physical volume scan across files:
+/// ODIM_H5 feeds (EUMETNET OPERA Data Information Model; Michelson et al.,
+/// OPERA WP 2.1/2.2, v2.2-2.3) like DWD/CHMI publish one file per product
+/// and/or sweep, SHMU one full PVOL per product. This helper reassembles
+/// them.
+///
+/// Semantics:
+/// - All parts must share `site.id`, else `Err`. The first part supplies the
+///   site record, VCP, and metadata.
+/// - `volume_time` is the earliest part time (parts of one scan carry
+///   per-product write times).
+/// - Cuts are matched by `elevation_deg` within
+///   [`CUT_ELEVATION_MATCH_TOLERANCE_DEG`]; an incoming cut merges into the
+///   first existing cut inside the tolerance.
+/// - A matched cut contributes its moment grids to the existing cut's
+///   moment map. On a moment-type collision the first part wins and the
+///   incoming grid is dropped (counted in
+///   [`MergeReport::moment_collisions`]); otherwise the move is counted in
+///   [`MergeReport::merged_moments`].
+/// - A matched cut whose radial/gate geometry differs (radial count,
+///   per-radial azimuth beyond the same tolerance, or per-radial gate
+///   layout) is NOT merged: moment-grid rows index into the cut's radial
+///   list, so mixing geometries would scramble the display. The whole cut is
+///   dropped and counted in [`MergeReport::skipped_geometry`].
+/// - Unmatched cuts are unioned in, and the final cut list is sorted by
+///   elevation (stable: equal elevations keep first-part-then-arrival
+///   order).
+///
+/// Never panics: malformed combinations come back as `Err` or as skip
+/// counters.
+pub fn merge_radar_volumes(parts: Vec<RadarVolume>) -> Result<(RadarVolume, MergeReport), String> {
+    let mut parts = parts.into_iter();
+    let Some(mut base) = parts.next() else {
+        return Err("no radar volumes to merge".to_owned());
+    };
+    let mut report = MergeReport::default();
+
+    for part in parts {
+        if part.site.id != base.site.id {
+            return Err(format!(
+                "cannot merge radar volumes from different sites: '{}' vs '{}'",
+                base.site.id, part.site.id
+            ));
+        }
+        if part.volume_time < base.volume_time {
+            base.volume_time = part.volume_time;
+        }
+        for cut in part.cuts {
+            let matched = base.cuts.iter_mut().find(|existing| {
+                (existing.elevation_deg - cut.elevation_deg).abs()
+                    <= CUT_ELEVATION_MATCH_TOLERANCE_DEG
+            });
+            let Some(existing) = matched else {
+                base.cuts.push(cut);
+                continue;
+            };
+            if !cut_geometry_matches(existing, &cut) {
+                report.skipped_geometry += 1;
+                continue;
+            }
+            for (moment, grid) in cut.moments {
+                match existing.moments.entry(moment) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert(grid);
+                        report.merged_moments += 1;
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {
+                        report.moment_collisions += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    base.cuts
+        .sort_by(|a, b| a.elevation_deg.total_cmp(&b.elevation_deg));
+    Ok((base, report))
+}
+
+/// `true` when two cuts describe the same radial/gate geometry, so moment
+/// grids whose rows index one cut's radials are valid against the other's.
+fn cut_geometry_matches(a: &ElevationCut, b: &ElevationCut) -> bool {
+    a.radials.len() == b.radials.len()
+        && a.radials.iter().zip(&b.radials).all(|(ra, rb)| {
+            azimuth_difference_deg(ra.azimuth_deg, rb.azimuth_deg)
+                <= CUT_ELEVATION_MATCH_TOLERANCE_DEG
+                && ra.gate_range == rb.gate_range
+        })
+}
+
+/// Smallest absolute angular difference, wrap-aware (359.99° vs 0.01° is
+/// 0.02°, not 359.98°).
+fn azimuth_difference_deg(a: f32, b: f32) -> f32 {
+    let diff = (a - b).abs() % 360.0;
+    diff.min(360.0 - diff)
 }
 
 /// One elevation sweep/cut in a volume scan.
@@ -833,6 +950,293 @@ mod tests {
             MomentType::from_nexrad_bytes(b"\0VEL"),
             MomentType::Velocity
         );
+    }
+
+    fn merge_gate_range(gate_count: usize) -> GateRange {
+        GateRange {
+            first_gate_m: 50,
+            gate_spacing_m: 250,
+            gate_count,
+        }
+    }
+
+    fn merge_radial(azimuth_deg: f32, elevation_deg: f32, gate_count: usize) -> Radial {
+        Radial {
+            azimuth_deg,
+            elevation_deg,
+            time_offset_ms: 0,
+            gate_range: merge_gate_range(gate_count),
+            nyquist_velocity_mps: None,
+            radial_status: None,
+        }
+    }
+
+    /// A 3-radial cut carrying one u8 moment with `scale` recorded so tests
+    /// can tell which part a surviving grid came from.
+    fn merge_cut(elevation_deg: f32, moment: MomentType, scale: f32) -> ElevationCut {
+        let mut cut = ElevationCut::new(elevation_deg, None);
+        for index in 0..3 {
+            cut.radials
+                .push(merge_radial(index as f32 * 120.0, elevation_deg, 4));
+        }
+        let mut grid = MomentGrid::new_u8(
+            moment.clone(),
+            merge_gate_range(4),
+            scale,
+            66.0,
+            Some(0),
+            Some(1),
+        );
+        for index in 0..3 {
+            grid.push_row(index, MomentRow::U8(vec![2, 3, 4, 5]))
+                .unwrap();
+        }
+        cut.moments.insert(moment, grid);
+        cut
+    }
+
+    fn merge_volume(site: &str, time_s: i64, cuts: Vec<ElevationCut>) -> RadarVolume {
+        let mut volume = RadarVolume::new(
+            RadarSite::new(site),
+            DateTime::<Utc>::from_timestamp(time_s, 0).unwrap(),
+        );
+        volume.cuts = cuts;
+        volume
+    }
+
+    #[test]
+    fn merge_rejects_empty_input() {
+        let err = merge_radar_volumes(Vec::new()).unwrap_err();
+        assert!(err.contains("no radar volumes"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn merge_single_part_is_identity_with_sorted_cuts() {
+        let part = merge_volume(
+            "SKJAV",
+            1_000,
+            vec![
+                merge_cut(1.5, MomentType::Reflectivity, 2.0),
+                merge_cut(0.5, MomentType::Reflectivity, 2.0),
+            ],
+        );
+        let (merged, report) = merge_radar_volumes(vec![part.clone()]).unwrap();
+
+        assert_eq!(report, MergeReport::default());
+        assert_eq!(merged.site, part.site);
+        assert_eq!(merged.volume_time, part.volume_time);
+        // Identity up to the documented elevation sort.
+        assert_eq!(merged.cuts.len(), 2);
+        assert_eq!(merged.cuts[0].elevation_deg, 0.5);
+        assert_eq!(merged.cuts[1].elevation_deg, 1.5);
+    }
+
+    #[test]
+    fn merge_rejects_mismatched_site_ids() {
+        let a = merge_volume("SKJAV", 0, vec![]);
+        let b = merge_volume("SKKOJ", 0, vec![]);
+        let err = merge_radar_volumes(vec![a, b]).unwrap_err();
+        assert!(
+            err.contains("SKJAV") && err.contains("SKKOJ"),
+            "error must name both sites: {err}"
+        );
+    }
+
+    #[test]
+    fn merge_keeps_earliest_volume_time() {
+        let a = merge_volume("SKJAV", 2_000, vec![]);
+        let b = merge_volume("SKJAV", 1_000, vec![]);
+        let c = merge_volume("SKJAV", 3_000, vec![]);
+        let (merged, _) = merge_radar_volumes(vec![a, b, c]).unwrap();
+        assert_eq!(
+            merged.volume_time,
+            DateTime::<Utc>::from_timestamp(1_000, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn merge_unions_moments_of_elevation_matched_cuts() {
+        // SHMU-style split: one PVOL per product, same scan geometry, cut
+        // elevations differing within the 0.05 deg tolerance.
+        let dbz = merge_volume(
+            "SKJAV",
+            1_000,
+            vec![merge_cut(0.5, MomentType::Reflectivity, 2.0)],
+        );
+        let vel = merge_volume(
+            "SKJAV",
+            1_010,
+            vec![merge_cut(0.52, MomentType::Velocity, 2.0)],
+        );
+        let (merged, report) = merge_radar_volumes(vec![dbz, vel]).unwrap();
+
+        assert_eq!(merged.cuts.len(), 1);
+        let cut = &merged.cuts[0];
+        assert_eq!(cut.elevation_deg, 0.5, "first part's cut is the base");
+        assert!(cut.moments.contains_key(&MomentType::Reflectivity));
+        assert!(cut.moments.contains_key(&MomentType::Velocity));
+        assert_eq!(
+            report,
+            MergeReport {
+                merged_moments: 1,
+                skipped_geometry: 0,
+                moment_collisions: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn merge_collision_keeps_first_part_grid() {
+        let first = merge_volume(
+            "SKJAV",
+            1_000,
+            vec![merge_cut(0.5, MomentType::Reflectivity, 2.0)],
+        );
+        let second = merge_volume(
+            "SKJAV",
+            1_000,
+            vec![merge_cut(0.5, MomentType::Reflectivity, 4.0)],
+        );
+        let (merged, report) = merge_radar_volumes(vec![first, second]).unwrap();
+
+        let grid = &merged.cuts[0].moments[&MomentType::Reflectivity];
+        assert_eq!(grid.scale, 2.0, "first part must win the collision");
+        assert_eq!(
+            report,
+            MergeReport {
+                merged_moments: 0,
+                skipped_geometry: 0,
+                moment_collisions: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn merge_unions_unmatched_cuts_sorted_by_elevation() {
+        let a = merge_volume(
+            "SKJAV",
+            1_000,
+            vec![
+                merge_cut(0.5, MomentType::Reflectivity, 2.0),
+                merge_cut(2.5, MomentType::Reflectivity, 2.0),
+            ],
+        );
+        let b = merge_volume(
+            "SKJAV",
+            1_000,
+            vec![
+                merge_cut(1.5, MomentType::Velocity, 2.0),
+                merge_cut(0.2, MomentType::Velocity, 2.0),
+            ],
+        );
+        let (merged, report) = merge_radar_volumes(vec![a, b]).unwrap();
+
+        let elevations: Vec<f32> = merged.cuts.iter().map(|cut| cut.elevation_deg).collect();
+        assert_eq!(elevations, vec![0.2, 0.5, 1.5, 2.5]);
+        assert_eq!(report.merged_moments, 0);
+        assert_eq!(report.skipped_geometry, 0);
+    }
+
+    #[test]
+    fn merge_skips_matched_cut_with_different_radial_count() {
+        let a = merge_volume(
+            "SKJAV",
+            1_000,
+            vec![merge_cut(0.5, MomentType::Reflectivity, 2.0)],
+        );
+        let mut short_cut = merge_cut(0.5, MomentType::Velocity, 2.0);
+        short_cut.radials.pop();
+        let b = merge_volume("SKJAV", 1_000, vec![short_cut]);
+        let (merged, report) = merge_radar_volumes(vec![a, b]).unwrap();
+
+        assert_eq!(merged.cuts.len(), 1);
+        assert!(!merged.cuts[0].moments.contains_key(&MomentType::Velocity));
+        assert_eq!(report.skipped_geometry, 1);
+        assert_eq!(report.merged_moments, 0);
+    }
+
+    #[test]
+    fn merge_skips_matched_cut_with_shifted_azimuths() {
+        let a = merge_volume(
+            "SKJAV",
+            1_000,
+            vec![merge_cut(0.5, MomentType::Reflectivity, 2.0)],
+        );
+        let mut rotated = merge_cut(0.5, MomentType::Velocity, 2.0);
+        for radial in &mut rotated.radials {
+            radial.azimuth_deg += 1.0;
+        }
+        let b = merge_volume("SKJAV", 1_000, vec![rotated]);
+        let (merged, report) = merge_radar_volumes(vec![a, b]).unwrap();
+
+        assert!(!merged.cuts[0].moments.contains_key(&MomentType::Velocity));
+        assert_eq!(report.skipped_geometry, 1);
+    }
+
+    #[test]
+    fn merge_accepts_azimuths_equal_across_the_north_wrap() {
+        let mut a_cut = merge_cut(0.5, MomentType::Reflectivity, 2.0);
+        a_cut.radials[0].azimuth_deg = 359.99;
+        let mut b_cut = merge_cut(0.5, MomentType::Velocity, 2.0);
+        b_cut.radials[0].azimuth_deg = 0.01;
+        let a = merge_volume("SKJAV", 1_000, vec![a_cut]);
+        let b = merge_volume("SKJAV", 1_000, vec![b_cut]);
+        let (merged, report) = merge_radar_volumes(vec![a, b]).unwrap();
+
+        assert!(merged.cuts[0].moments.contains_key(&MomentType::Velocity));
+        assert_eq!(report.merged_moments, 1);
+        assert_eq!(report.skipped_geometry, 0);
+    }
+
+    #[test]
+    fn merge_skips_matched_cut_with_different_gate_layout() {
+        let a = merge_volume(
+            "SKJAV",
+            1_000,
+            vec![merge_cut(0.5, MomentType::Reflectivity, 2.0)],
+        );
+        let mut stretched = merge_cut(0.5, MomentType::Velocity, 2.0);
+        for radial in &mut stretched.radials {
+            radial.gate_range.gate_spacing_m = 1_000;
+        }
+        let b = merge_volume("SKJAV", 1_000, vec![stretched]);
+        let (merged, report) = merge_radar_volumes(vec![a, b]).unwrap();
+
+        assert!(!merged.cuts[0].moments.contains_key(&MomentType::Velocity));
+        assert_eq!(report.skipped_geometry, 1);
+    }
+
+    #[test]
+    fn merge_three_product_parts_assembles_full_dual_pol_cut() {
+        // DWD/CHMI-style assembly: same sweep from sweep_vol_z / _v / _zdr.
+        let parts = vec![
+            merge_volume(
+                "DEASB",
+                1_020,
+                vec![merge_cut(0.5, MomentType::Reflectivity, 2.0)],
+            ),
+            merge_volume(
+                "DEASB",
+                1_000,
+                vec![merge_cut(0.5, MomentType::Velocity, 2.0)],
+            ),
+            merge_volume(
+                "DEASB",
+                1_040,
+                vec![merge_cut(0.5, MomentType::DifferentialReflectivity, 2.0)],
+            ),
+        ];
+        let (merged, report) = merge_radar_volumes(parts).unwrap();
+
+        assert_eq!(merged.cuts.len(), 1);
+        assert_eq!(merged.cuts[0].moments.len(), 3);
+        assert_eq!(
+            merged.volume_time,
+            DateTime::<Utc>::from_timestamp(1_000, 0).unwrap()
+        );
+        assert_eq!(report.merged_moments, 2);
+        assert_eq!(report.moment_collisions, 0);
+        assert_eq!(report.skipped_geometry, 0);
     }
 
     #[test]

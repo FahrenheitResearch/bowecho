@@ -41,7 +41,9 @@ fn main() {
 }
 
 /// Magic-byte routing in the same precedence order as
-/// `app_ui::sniff_local_radar_kind` (zip > DORADE > HDF5 > CDF > Archive II).
+/// `app_ui::sniff_local_radar_kind` (zip > DORADE > HDF5 > CDF > Archive II):
+/// zip archives need the path-based batch decoder; everything else goes
+/// through the shared `nexrad_io::decode_supported_volume_bytes` router.
 fn decode_like_the_app(path: &Path, bytes: &[u8]) -> (&'static str, Result<RadarVolume, String>) {
     let head = &bytes[..bytes.len().min(8)];
     if nexrad_io::mobile_archive::looks_like_zip_bytes(head) {
@@ -56,28 +58,14 @@ fn decode_like_the_app(path: &Path, bytes: &[u8]) -> (&'static str, Result<Radar
             });
         return ("MobileArchive", result);
     }
-    if nexrad_io::dorade::looks_like_dorade_bytes(head) {
-        return (
-            "DoradeSweep",
-            nexrad_io::dorade::decode_dorade_sweep_volume(bytes).map_err(|err| err.to_string()),
-        );
-    }
-    if nexrad_io::odim::looks_like_hdf5_bytes(head) {
-        return (
-            "OdimH5",
-            nexrad_io::odim::decode_odim_h5_volume(bytes).map_err(|err| err.to_string()),
-        );
-    }
-    if nexrad_io::cfradial::looks_like_netcdf3_bytes(head) {
-        return (
-            "CfRadial",
-            nexrad_io::cfradial::decode_cfradial1_volume(bytes).map_err(|err| err.to_string()),
-        );
-    }
-    (
-        "NexradLevel2",
-        nexrad_io::decode_volume_from_bytes(bytes).map_err(|err| err.to_string()),
-    )
+    let kind = match nexrad_io::sniff_supported_volume_format(bytes) {
+        nexrad_io::SupportedVolumeFormat::Dorade => "DoradeSweep",
+        nexrad_io::SupportedVolumeFormat::OdimH5 => "OdimH5",
+        nexrad_io::SupportedVolumeFormat::CfRadial => "CfRadial",
+        nexrad_io::SupportedVolumeFormat::JmaGrib2Tar => "JmaGrib2Tar",
+        nexrad_io::SupportedVolumeFormat::NexradLevel2 => "NexradLevel2",
+    };
+    (kind, nexrad_io::decode_supported_volume_bytes(bytes))
 }
 
 fn dump(volume: &RadarVolume) {

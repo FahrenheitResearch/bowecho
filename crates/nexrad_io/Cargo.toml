@@ -14,3 +14,8 @@ radar_core = { path = "../radar_core" }
 rayon.workspace = true
 thiserror.workspace = true
 zip.workspace = true
+
+[dev-dependencies]
+# For the live international-feed probe example only (data_source has no
+# path dependencies, so this cannot cycle).
+data_source = { path = "../data_source" }

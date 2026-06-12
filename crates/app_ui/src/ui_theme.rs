@@ -40,4 +40,6 @@ pub const LAYER_ROW_SLIDER_WIDTH: f32 = 56.0;
 
 pub const SIDEBAR_DEFAULT_WIDTH: f32 = 380.0;
 pub const SIDEBAR_MIN_WIDTH: f32 = 300.0;
-pub const SIDEBAR_MAX_WIDTH: f32 = 560.0;
+/// Generous cap (field request: free sidebar resizing) — the panel edge
+/// drags; the map pane absorbs whatever is left.
+pub const SIDEBAR_MAX_WIDTH: f32 = 900.0;

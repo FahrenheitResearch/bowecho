@@ -78,8 +78,11 @@ impl G {
     fn fit(rect: Rect) -> Self {
         let s = (rect.width() / CANVAS_W).min(rect.height() / CANVAS_H);
         let used = vec2(CANVAS_W * s, CANVAS_H * s);
+        // Center horizontally, anchor TOP vertically: a width-bound fit
+        // in a tall pane otherwise floats the canvas mid-darkness with
+        // dead space above and below (field report: "small and bad").
         Self {
-            origin: rect.min + (rect.size() - used) / 2.0,
+            origin: Pos2::new(rect.min.x + (rect.width() - used.x) / 2.0, rect.min.y),
             s,
         }
     }

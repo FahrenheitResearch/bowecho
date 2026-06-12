@@ -412,7 +412,7 @@ fn products(ui: &mut egui::Ui) {
          Severe Hail Index, then sized with Witt's calibration MESH = 2.54\u{b7}\u{221a}SHI \
          (the calibration operational MRMS still ships).",
         "MEHS \u{2265} 29 mm is the climatological severe (1 in.) threshold. Set the \
-         0°C/\u{2212}20°C heights first — the From HRRR button samples the model profile at \
+         0°C/\u{2212}20°C heights first — the From-model button samples the model profile at \
          the radar site; MESH is sensitive to them. A 75th-percentile fit by design: it \
          underestimates giant hail.",
         "Witt et al. 1998, Wea. Forecasting 13, 286\u{2013}303; severe threshold: Cintineo \
@@ -561,7 +561,8 @@ fn model_data(ui: &mut egui::Ui) {
     ui.heading("Model data & soundings");
     para(
         ui,
-        "HRRR fields and skew-T soundings, layered straight onto the radar map. Enable the \
+        "Model fields and skew-T soundings (HRRR over CONUS, GFS worldwide), layered \
+         straight onto the radar map. Enable the \
          master switch first: \u{2699} Settings \u{25b8} Model \u{25b8} Model data (off = \
          pure radar app). Windows \u{25be} \u{25b8} Model data opens the Model window.",
     );
@@ -570,8 +571,9 @@ fn model_data(ui: &mut egui::Ui) {
     action(
         ui,
         "Fetch latest",
-        "(Layers row) — ingests the freshest HRRR init, next 3 forecast hours, sounding-grade \
-         profile, then prunes the store to the newest runs. About a minute, throttled below \
+        "(Layers row) — ingests the freshest init of the picked model (GFS automatically \
+         when the radar sits outside HRRR coverage), sounding-grade hours bracketing now, \
+         then prunes the store to the newest runs. About a minute, throttled below \
          the UI so frames never stutter.",
     );
     action(
@@ -608,7 +610,7 @@ fn model_data(ui: &mut egui::Ui) {
         ui,
         "Alt+click",
         "anywhere on the map — a native skew-T for that exact point opens in the Sounding \
-         window, computed from the HRRR profile.",
+         window, computed from the model profile.",
     );
     action(
         ui,
@@ -623,12 +625,13 @@ fn model_data(ui: &mut egui::Ui) {
         "Both need Model data enabled and at least one ingested run on disk.",
     );
 
-    subhead(ui, "HAIL LEVELS FROM HRRR");
+    subhead(ui, "HAIL LEVELS FROM THE MODEL");
     action(
         ui,
-        "From HRRR",
+        "From HRRR / From GFS",
         "— with MEHS, POSH, or POH selected, the \"Hail 0°C/\u{2212}20°C\" row appears under \
-         PRODUCTS. From HRRR samples the model temperature profile at the radar site and sets \
+         PRODUCTS. The button (named for the loaded model) samples its temperature profile \
+         at the radar site and sets \
          both crossing heights — the same environmental inputs MRMS takes from model \
          analyses. The hail products are sensitive to these; use it instead of the defaults \
          whenever model data is loaded.",
@@ -637,7 +640,7 @@ fn model_data(ui: &mut egui::Ui) {
     subhead(ui, "INSPECTOR");
     para(
         ui,
-        "With \"Model value\" ticked in Inspector\u{2026}, the cursor card reads the HRRR \
+        "With \"Model value\" ticked in Inspector\u{2026}, the cursor card reads the model \
          field under the cursor — even while the map layer is hidden.",
     );
 }
@@ -744,7 +747,7 @@ fn tools(ui: &mut egui::Ui) {
         "The floating card at the cursor reads the data under it: product value with units; \
          on velocity products an in/outbound arrow at the probed gate plus an automatic \
          couplet probe (Vrot, \u{394}V, separation) when one is nearby; raw VEL with the \
-         Nyquist and a fold warning; range @ azimuth and tilt; beam height; and the HRRR \
+         Nyquist and a fold warning; range @ azimuth and tilt; beam height; and the model \
          value. Pick exactly which lines you want via the Inspector\u{2026} menu in TOOLS.",
     );
     action(
@@ -945,7 +948,8 @@ fn sources(ui: &mut egui::Ui) {
     subhead(ui, "MODEL & SATELLITE");
     para(
         ui,
-        "HRRR (NOAA High-Resolution Rapid Refresh) ingested into a local store by the \
+        "HRRR (NOAA High-Resolution Rapid Refresh) and GFS (0.25° global) ingested into a \
+         local store by the \
          rusty-weather stack (rw-ingest / rw-ui); the native skew-T is verified against \
          sharprs. GOES-16/18/19 ABI imagery from NOAA open-data buckets via rw-sat.",
     );

@@ -33,6 +33,11 @@ const TREE_ID: &str = "bowecho_workspace_tree";
 /// Map-pane share of the root split when the first viewer docks.
 const MAP_SHARE_ON_FIRST_DOCK: f32 = 0.62;
 
+/// Sounding-pane share when it opens the dock area: a full-width bottom
+/// strip ~1/3 of the window tall (field request), where its 4:3 canvas
+/// reads at analyst size instead of letterboxing in a tall column.
+const SOUNDING_DOCK_SHARE: f32 = 0.34;
+
 /// Persisted-layout schema version (`AppSettings::workspace_layout`).
 const LAYOUT_VERSION: u32 = 1;
 
@@ -220,15 +225,25 @@ impl Workspace {
             self.mark_dirty();
             return;
         }
-        // No viewer tabs to join: open the dock area as a right-hand split.
+        // No viewer tabs to join: open the dock area as a split. The
+        // Sounding's 4:3 canvas letterboxed badly in the tall right
+        // column (field report: "soundings need like 1/3rd the height
+        // window") — it docks as a full-width bottom strip instead;
+        // other viewers keep the right-hand split. Drag the divider to
+        // taste; shares persist in the saved layout.
+        let (direction, map_share) = if pane == WorkspacePane::Sounding {
+            (egui_tiles::LinearDir::Vertical, 1.0 - SOUNDING_DOCK_SHARE)
+        } else {
+            (egui_tiles::LinearDir::Horizontal, MAP_SHARE_ON_FIRST_DOCK)
+        };
         let tabs_id = self.tree.tiles.insert_tab_tile(vec![child]);
         match self.tree.root {
             Some(old_root) => {
                 let new_root = self.tree.tiles.insert_new(egui_tiles::Tile::Container(
                     egui_tiles::Container::Linear(egui_tiles::Linear::new_binary(
-                        egui_tiles::LinearDir::Horizontal,
+                        direction,
                         [old_root, tabs_id],
-                        MAP_SHARE_ON_FIRST_DOCK,
+                        map_share,
                     )),
                 ));
                 self.tree.root = Some(new_root);
@@ -345,6 +360,18 @@ impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
         // Tab switches, drops and share resizes all change the serialized
         // tree — mark for the debounced persist.
         self.app.workspace.mark_dirty();
+    }
+
+    fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
+        egui_tiles::SimplificationOptions {
+            // Every pane keeps its tab: the tab IS the drag handle for
+            // grid rearrangement (field request: "why cant we drag n
+            // drop"). The default pruned lone Tabs containers, so a
+            // single docked pane had nothing to grab — drag a tab onto
+            // any pane edge to split, onto a tab strip to stack.
+            all_panes_must_have_tabs: true,
+            ..Default::default()
+        }
     }
 }
 
