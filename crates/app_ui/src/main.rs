@@ -27,6 +27,7 @@ mod annotate;
 mod basemap_data;
 mod basemap_towns;
 mod dock;
+mod event_explorer;
 mod farm_live;
 mod fonts;
 mod glm_layer;
@@ -829,11 +830,24 @@ struct ViewerApp {
     spc_day: u8,
     spc_last_key: Option<SpcFetchKey>,
     spc_rx: Option<mpsc::Receiver<spc_layers::SpcData>>,
+    /// Event Explorer: dated reports/tornado-track day cache + the
+    /// pending track-click loop window (src/event_explorer.rs).
+    event_explorer: event_explorer::EventExplorerState,
     /// GLM lightning layer (in-process rw-glm follow + time-synced draw).
     glm: Option<glm_layer::GlmWorker>,
     glm_enabled: bool,
-    /// RAOB site list (lazy-fetched once) for observed soundings.
+    /// RAOB site list (background-fetched once per session) for observed
+    /// soundings and the RAOB station markers; the embedded
+    /// [`obs_soundings::static_sites`] table covers until it lands.
     raob_sites: Option<Vec<obs_soundings::RaobSite>>,
+    raob_sites_rx:
+        Option<mpsc::Receiver<std::result::Result<Vec<obs_soundings::RaobSite>, String>>>,
+    /// One live-list fetch per session — a failed fetch must not retry
+    /// every frame (the static table keeps the layer working).
+    raob_sites_fetch_attempted: bool,
+    /// RAOB station markers on the map (the Layers rail OBS row): click
+    /// one for that station's observed sounding at the displayed time.
+    raob_markers_enabled: bool,
     /// Surface observations layer (METAR station plots).
     obs_enabled: bool,
     /// Source-class QC toggles: METAR = airport-grade; mesonet = IEM
@@ -2747,6 +2761,7 @@ impl ViewerApp {
             app_settings.overlay_glm,
             app_settings.overlay_spc_outlooks.clone(),
             app_settings.overlay_spc_reports,
+            app_settings.overlay_raob,
         );
         let restored_grid_layout = match app_settings.grid_pane_count {
             2 => PanelLayout::TwoVertical,
@@ -2930,6 +2945,7 @@ impl ViewerApp {
             spc_last_key: None,
             glm: None,
             spc_rx: None,
+            event_explorer: event_explorer::EventExplorerState::default(),
             glm_enabled: restored_overlays.3,
             oa_rx: None,
             oa_last_summary: None,
@@ -2940,6 +2956,9 @@ impl ViewerApp {
             oa_comp_total: 0,
             oa_comp_pick: None,
             raob_sites: None,
+            raob_sites_rx: None,
+            raob_sites_fetch_attempted: false,
+            raob_markers_enabled: restored_overlays.6,
             obs_enabled: restored_overlays.0,
             obs_show_metar: restored_overlays.1,
             obs_show_mesonet: restored_overlays.2,
@@ -3971,6 +3990,7 @@ impl ViewerApp {
                             }
                             self.load_receiver = None;
                             self.pending_site_id = None;
+                            self.event_explorer.pending_autoplay = false;
                             self.live_refresh_skip_reason = Some(reason.clone());
                             self.status = format!("Current {} ({reason})", message.label);
                             ctx.request_repaint_after(Duration::from_secs(1));
@@ -3987,8 +4007,22 @@ impl ViewerApp {
                                     if selected_loaded {
                                         self.status = format!("Loaded {}", message.label);
                                     }
+                                    // A track jump's range load rolls the
+                                    // loop the moment it lands (the
+                                    // local-deployment autoplay pattern).
+                                    if std::mem::take(&mut self.event_explorer.pending_autoplay)
+                                        && self.frame_history.len() > 1
+                                    {
+                                        self.history_playing = true;
+                                        self.last_history_step = None;
+                                        self.status = format!(
+                                            "Event loop rolling — {} frames",
+                                            self.frame_history.len()
+                                        );
+                                    }
                                 }
                                 Err(err) => {
+                                    self.event_explorer.pending_autoplay = false;
                                     self.status =
                                         format!("Load failed for {}: {err}", message.label);
                                 }
@@ -6298,8 +6332,39 @@ impl ViewerApp {
                     .collect();
                 self.status = format!("Archive: {} volumes listed", volumes.len());
                 self.archive_volumes = Some(volumes);
+                // Track jump: load the loop SPANNING the event window
+                // [track start - 15 min, end + 15 min] and auto-play it
+                // at the lowest tilt — "like it would have been live".
+                let pending_range = self.event_explorer.pending_range.take().and_then(
+                    |(window_start, window_end)| {
+                        let volumes = self.archive_volumes.as_ref()?;
+                        let labels: Vec<String> =
+                            volumes.iter().map(|(_, label)| label.clone()).collect();
+                        let listed = chrono::NaiveDate::parse_from_str(
+                            self.archive_date_input.trim(),
+                            "%Y-%m-%d",
+                        )
+                        .unwrap_or_else(|_| window_start.date_naive());
+                        let (start_label, end_label) = event_explorer::window_labels_for_date(
+                            listed,
+                            window_start,
+                            window_end,
+                        );
+                        event_explorer::range_volume_indices(
+                            &labels,
+                            &start_label,
+                            &end_label,
+                            MAX_HISTORY_FRAME_LIMIT,
+                        )
+                    },
+                );
+                if let Some((start, end)) = pending_range {
+                    self.event_explorer.pending_autoplay = true;
+                    self.selected_cut = 0;
+                    self.start_archive_range_load(start, end, ctx);
+                }
                 // Event jump: load the volume nearest the report time.
-                if let Some(target) = self.archive_pending_event.take()
+                else if let Some(target) = self.archive_pending_event.take()
                     && let Some(volumes) = &self.archive_volumes
                     && !volumes.is_empty()
                 {
@@ -6325,29 +6390,38 @@ impl ViewerApp {
 
     /// Load a loop of archive volumes ending at the chosen index (the
     /// chosen scan plus the preceding history-limit-1 scans), through the
-    /// normal decode/install pipeline. Disables live auto-refresh so the
-    /// next poll doesn't snap back to the present.
+    /// normal decode/install pipeline.
     fn start_archive_loop_load(&mut self, chosen: usize, ctx: &egui::Context) {
+        let limit = if self.archive_load_loop {
+            self.archive_frame_count.max(1)
+        } else {
+            1
+        };
+        self.start_archive_range_load(chosen.saturating_sub(limit - 1), chosen, ctx);
+    }
+
+    /// Load the archive volumes `start..=chosen` as a loop (a track
+    /// jump's event window, or the chosen-scan loop above), through the
+    /// normal decode/install pipeline. Grows the frame-history cap to
+    /// hold the whole range (it trims oldest-first, which would silently
+    /// eat the loop's tail), bounded by [`MAX_HISTORY_FRAME_LIMIT`].
+    /// Disables live auto-refresh so the next poll doesn't snap back to
+    /// the present.
+    fn start_archive_range_load(&mut self, start: usize, chosen: usize, ctx: &egui::Context) {
         let Some(site) = self.selected_site().cloned() else {
             return;
         };
         let Some(volumes) = &self.archive_volumes else {
             return;
         };
-        if chosen >= volumes.len() || self.load_receiver.is_some() {
+        if chosen >= volumes.len() || start > chosen || self.load_receiver.is_some() {
             return;
         }
-        let limit = if self.archive_load_loop {
-            self.archive_frame_count.max(1)
-        } else {
-            1
-        };
-        // The frame-history cap must hold every requested frame (it trims
-        // oldest-first, which would silently eat the loop's tail).
-        if limit > self.history_frame_limit {
-            self.history_frame_limit = limit;
+        let total_frames = (chosen - start + 1).min(MAX_HISTORY_FRAME_LIMIT);
+        let start = chosen + 1 - total_frames;
+        if total_frames > self.history_frame_limit {
+            self.history_frame_limit = total_frames;
         }
-        let start = chosen.saturating_sub(limit - 1);
         self.archive_loaded_range = Some((start, chosen));
         let objects: Vec<data_source::S3Object> = volumes[start..=chosen]
             .iter()
@@ -6518,6 +6592,7 @@ impl eframe::App for ViewerApp {
         self.poll_placefiles(&ctx);
         self.poll_archive_listing(&ctx);
         self.poll_spc_reports(&ctx);
+        self.poll_event_day(&ctx);
         // Apply deferred layout changes FIRST — before anything paints.
         if let Some(layout) = self.pending_grid_layout.take() {
             self.grid_layout = layout;
@@ -6561,6 +6636,7 @@ impl eframe::App for ViewerApp {
         self.poll_spc(&ctx);
         self.poll_feed(&ctx);
         self.poll_intl_sites();
+        self.poll_raob_sites(&ctx);
         self.poll_native_sounding(&ctx);
         if self.tile_layer.borrow_mut().poll(&ctx) {
             ctx.request_repaint();
@@ -7023,6 +7099,11 @@ impl ViewerApp {
         ui.separator();
         self.remembered_section(ui, "data_archive", "Archive", true, |app, ui| {
             app.archive_panel(ui, ctx);
+        });
+        // Event Explorer: pick a convective day (12Z-12Z), get every
+        // storm report + clickable tornado tracks + that day's outlook.
+        self.remembered_section(ui, "data_event_day", "Event day", true, |app, ui| {
+            app.event_day_section(ui, ctx);
         });
         self.remembered_section(ui, "data_live_feeds", "Live feeds", true, |app, ui| {
             app.live_feeds_section(ui, ctx);
@@ -9928,6 +10009,9 @@ impl ViewerApp {
         self.draw_hazard_overlays(painter, rect, &self.selected_product.clone());
         self.draw_rotation_markers(painter, rect);
         self.draw_storm_tracks(painter, rect);
+        // Tornado track lines under the report dots (the dots mark the
+        // climo report points; the lines are the surveyed paths).
+        self.draw_event_tracks(painter, rect);
         self.draw_spc_reports(painter, rect);
         self.draw_glm(painter, rect);
         self.draw_surface_obs(painter, rect);
@@ -9950,6 +10034,7 @@ impl ViewerApp {
             .collect::<Vec<_>>();
         let intl_points = self.intl_site_points(rect);
         let community_points = self.community_site_points(rect);
+        let raob_points = self.raob_site_points(rect);
 
         let shift_held = ui.input(|input| input.modifiers.shift);
         if !armed
@@ -9968,7 +10053,26 @@ impl ViewerApp {
             && response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
         {
-            self.handle_marker_click(&site_points, &intl_points, &community_points, pointer);
+            // Site/feed markers keep priority (their 12 px halo is the
+            // established click grammar — RAOB diamonds included); a
+            // tornado track only takes the click when no marker is in
+            // reach.
+            let marker_hit = nearest_marker_within(&site_points, pointer).is_some()
+                || nearest_marker_within(&intl_points, pointer).is_some()
+                || nearest_marker_within(&community_points, pointer).is_some()
+                || nearest_marker_within(&raob_points, pointer).is_some();
+            if !marker_hit && let Some(hit) = self.event_track_at(rect, pointer) {
+                self.jump_to_event_track(&hit, ui.ctx());
+            } else {
+                self.handle_marker_click(
+                    &site_points,
+                    &intl_points,
+                    &community_points,
+                    &raob_points,
+                    pointer,
+                    ui.ctx(),
+                );
+            }
         }
 
         if !armed
@@ -10136,6 +10240,11 @@ impl ViewerApp {
             .and_then(|pointer| nearest_marker_within(&community_points, pointer))
             .map(|(index, _)| index);
         self.draw_community_site_markers(painter, &community_points, hovered_community);
+        let hovered_raob = response
+            .hover_pos()
+            .and_then(|pointer| nearest_marker_within(&raob_points, pointer))
+            .map(|(index, _)| index);
+        self.draw_raob_site_markers(painter, &raob_points, hovered_raob);
         self.draw_radar_layer_markers(painter, rect);
         self.draw_loaded_volume_marker(painter, rect);
         self.draw_colorbar(painter, rect);
@@ -10247,6 +10356,7 @@ impl ViewerApp {
                 .collect::<Vec<_>>();
             let intl_points = self.intl_site_points(cell);
             let community_points = self.community_site_points(cell);
+            let raob_points = self.raob_site_points(cell);
 
             let shift_held = ui.input(|input| input.modifiers.shift);
             if !armed
@@ -10264,7 +10374,14 @@ impl ViewerApp {
                 && response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
-                self.handle_marker_click(&site_points, &intl_points, &community_points, pointer);
+                self.handle_marker_click(
+                    &site_points,
+                    &intl_points,
+                    &community_points,
+                    &raob_points,
+                    pointer,
+                    ui.ctx(),
+                );
                 if let Some(index) = self.hazard_at_position(cell, pointer) {
                     self.selected_hazard_index = Some(index);
                 }
@@ -10384,6 +10501,14 @@ impl ViewerApp {
                 .and_then(|pointer| nearest_marker_within(&community_points, pointer))
                 .map(|(index, _)| index);
             self.draw_community_site_markers(&cell_painter, &community_points, hovered_community);
+            let raob_points = self.raob_site_points(cell);
+            let hovered_raob = hovers
+                .get(cell_index)
+                .copied()
+                .flatten()
+                .and_then(|pointer| nearest_marker_within(&raob_points, pointer))
+                .map(|(index, _)| index);
+            self.draw_raob_site_markers(&cell_painter, &raob_points, hovered_raob);
             self.draw_radar_layer_markers(&cell_painter, cell);
             self.draw_loaded_volume_marker(&cell_painter, cell);
             if cell_index == 0 {
@@ -11705,6 +11830,41 @@ impl ViewerApp {
                                 events.push(rw_ui::DownloadEvent::SpecChanged(spec));
                             }
                         }
+                        // Archive sync (field request): one click seeds
+                        // the init covering the DISPLAYED frame so a
+                        // model overlay on an archive event needs no date
+                        // math. AWS mirrors hold the deep archives; the
+                        // probe button reports per-hour reality.
+                        if let Some(displayed) = self
+                            .volume
+                            .as_ref()
+                            .map(|volume| volume.volume_time.with_timezone(&Utc))
+                            && ui
+                                .add_enabled(
+                                    !running,
+                                    egui::Button::new("@ displayed frame").small(),
+                                )
+                                .on_hover_text(
+                                    "Set run date/cycle to the model init covering the \
+                                     displayed radar frame, hours bracketing it — overlay \
+                                     the model that verified an archive event",
+                                )
+                                .clicked()
+                            && let Some((date, cycle, hours)) =
+                                ingest_worker::spec_fields_for_displayed_time(
+                                    &self.download_panel.spec().model,
+                                    displayed,
+                                )
+                        {
+                            let mut spec = self.download_panel.spec().clone();
+                            spec.date = date;
+                            spec.cycle = cycle;
+                            spec.hours = hours;
+                            self.download_panel = rw_ui::DownloadPanel::new(spec.clone());
+                            self.download_panel
+                                .set_model_options(ingest_worker_model_options());
+                            events.push(rw_ui::DownloadEvent::SpecChanged(spec));
+                        }
                     });
                     ui.separator();
                     egui::ScrollArea::vertical()
@@ -12930,9 +13090,84 @@ impl ViewerApp {
         self.drain_polled_volume(ctx);
     }
 
-    /// Fetch + render the nearest RAOB launch through the native skew-T
-    /// channel (the poll installs it and opens the window).
+    /// The RAOB launch-site catalog the markers and nearest-site picks
+    /// walk: the live-fetched list when the session fetch has landed, the
+    /// embedded table otherwise — pure data either way, safe on the UI
+    /// thread every frame.
+    fn raob_marker_sites(&self) -> &[obs_soundings::RaobSite] {
+        // Closure, not the fn item: &'static coerces to &'self at the
+        // closure's return, which the bare fn pointer would not.
+        self.raob_sites
+            .as_deref()
+            .unwrap_or_else(|| obs_soundings::static_sites())
+    }
+
+    /// RAOB site-list refresh: one background fetch per session once the
+    /// layer (or a sounding request) shows interest, the intl_sites
+    /// convention — the UI thread never blocks, and the embedded static
+    /// table keeps markers live if the fetch fails.
+    fn poll_raob_sites(&mut self, ctx: &egui::Context) {
+        if self.raob_markers_enabled
+            && self.raob_sites.is_none()
+            && self.raob_sites_rx.is_none()
+            && !self.raob_sites_fetch_attempted
+        {
+            self.raob_sites_fetch_attempted = true;
+            let (sender, receiver) = mpsc::channel();
+            self.raob_sites_rx = Some(receiver);
+            let ctx_clone = ctx.clone();
+            thread::spawn(move || {
+                let _ = sender.send(obs_soundings::fetch_sites());
+                ctx_clone.request_repaint();
+            });
+        }
+        let Some(receiver) = &self.raob_sites_rx else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(sites)) => {
+                self.raob_sites_rx = None;
+                self.raob_sites = Some(sites);
+            }
+            // Quietly keep the static table — the layer still works.
+            Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => self.raob_sites_rx = None,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Fetch + render the RAOB launch nearest the map center through the
+    /// native skew-T channel — the Analysis (OA) button path, now one
+    /// caller of the station-parameterized fetch.
     fn start_raob_sounding(&mut self, ctx: &egui::Context) {
+        let (center_lat, center_lon) = (self.map_center_lat, self.map_center_lon);
+        let Some(nearest) = self
+            .raob_marker_sites()
+            .iter()
+            .min_by(|a, b| {
+                haversine_km(center_lat, center_lon, a.lat, a.lon)
+                    .total_cmp(&haversine_km(center_lat, center_lon, b.lat, b.lon))
+            })
+            .cloned()
+        else {
+            self.status = "No RAOB sites".to_owned();
+            return;
+        };
+        let distance = haversine_km(center_lat, center_lon, nearest.lat, nearest.lon);
+        self.start_raob_sounding_for(nearest, Some(distance), ctx);
+    }
+
+    /// Fetch + render ONE station's RAOB launch nearest the displayed
+    /// radar time (specials included — scrub the loop to 21z, get the 21z
+    /// special) through the native skew-T channel; the poll installs the
+    /// result and opens the Sounding viewer. `distance_km`: the
+    /// nearest-to-center path's context annotation; marker clicks pass
+    /// None (the user chose the station, distance is noise).
+    fn start_raob_sounding_for(
+        &mut self,
+        site: obs_soundings::RaobSite,
+        distance_km: Option<f32>,
+        ctx: &egui::Context,
+    ) {
         if self.native_sounding_rx.is_some() {
             return;
         }
@@ -12941,60 +13176,28 @@ impl ViewerApp {
             .as_ref()
             .map(|volume| volume.volume_time.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
-        let (center_lat, center_lon) = (self.map_center_lat, self.map_center_lon);
-        let sites_cache = self.raob_sites.take();
         let (sender, receiver) = mpsc::channel();
         self.native_sounding_rx = Some(receiver);
         self.open_viewer(dock::WorkspacePane::Sounding);
-        self.status = "Fetching RAOB…".to_owned();
+        self.status = format!("Fetching RAOB {}…", site.id);
         let ctx_clone = ctx.clone();
-        let (site_tx, site_rx) = mpsc::channel();
         thread::spawn(move || {
             let compute_start = Instant::now();
             let result =
                 (|| -> std::result::Result<(rustwx_sounding::NativeSounding, f32), String> {
-                    let sites = match sites_cache {
-                        Some(sites) => sites,
-                        None => obs_soundings::fetch_sites()?,
-                    };
-                    let nearest = sites
-                        .iter()
-                        .min_by(|a, b| {
-                            haversine_km(center_lat, center_lon, a.lat, a.lon)
-                                .total_cmp(&haversine_km(center_lat, center_lon, b.lat, b.lon))
-                        })
-                        .ok_or("no RAOB sites")?;
-                    let station = nearest.id.clone();
-                    let distance = haversine_km(center_lat, center_lon, nearest.lat, nearest.lon);
-                    let _ = site_tx.send(sites);
-                    let mut last_err = String::new();
-                    for launch in obs_soundings::launch_times_before(when) {
-                        match obs_soundings::fetch_raob(&station, launch) {
-                            Ok(column) => {
-                                let mut native =
-                                    rustwx_sounding::NativeSounding::from_column(&column)
-                                        .map_err(|e| e.to_string())?;
-                                native.metadata.station_id = format!(
-                                    "{station} RAOB {} ({distance:.0} km)",
-                                    launch.format("%m-%d %Hz")
-                                );
-                                return Ok((
-                                    native,
-                                    compute_start.elapsed().as_secs_f32() * 1000.0,
-                                ));
-                            }
-                            Err(e) => last_err = e,
-                        }
-                    }
-                    Err(format!("no recent launch for {station}: {last_err}"))
+                    let (column, valid) = obs_soundings::fetch_raob_near(&site, when)?;
+                    let mut native = rustwx_sounding::NativeSounding::from_column(&column)
+                        .map_err(|e| e.to_string())?;
+                    let context = distance_km
+                        .map(|km| format!(" ({km:.0} km)"))
+                        .unwrap_or_default();
+                    native.metadata.station_id =
+                        format!("{} RAOB {}{context}", site.id, valid.format("%m-%d %Hz"));
+                    Ok((native, compute_start.elapsed().as_secs_f32() * 1000.0))
                 })();
             let _ = sender.send(result);
             ctx_clone.request_repaint();
         });
-        // Restore the site cache when the worker forwarded it back.
-        if let Ok(sites) = site_rx.try_recv() {
-            self.raob_sites = Some(sites);
-        }
     }
 
     /// Persist the current overlay toggles as the startup defaults.
@@ -13003,6 +13206,7 @@ impl ViewerApp {
         self.app_settings.overlay_obs_metar = self.obs_show_metar;
         self.app_settings.overlay_obs_mesonet = self.obs_show_mesonet;
         self.app_settings.overlay_glm = self.glm_enabled;
+        self.app_settings.overlay_raob = self.raob_markers_enabled;
         self.app_settings.overlay_spc_outlooks = self.spc_outlooks_enabled.clone();
         self.app_settings.overlay_spc_reports = self.spc_reports_enabled;
         let _ = self.app_settings.save();
@@ -13011,15 +13215,18 @@ impl ViewerApp {
     /// SPC outlooks + reports: fetch when enabled, refresh every 5 min.
     fn poll_spc(&mut self, ctx: &egui::Context) {
         let wants = !self.spc_outlooks_enabled.is_empty() || self.spc_reports_enabled;
-        let current_key = {
-            let archive_date = self.volume.as_ref().and_then(|volume| {
-                let when = volume.volume_time.date_naive();
-                let today = Utc::now().date_naive();
-                use chrono::Datelike;
-                (when != today).then(|| (when.year(), when.month(), when.day()))
-            });
-            Some((self.spc_day, archive_date))
+        // Archive-aware: the Event-day pin wins, else the displayed
+        // volume's day — show THAT day's outlook (latest issuance).
+        let archive_date = {
+            use chrono::Datelike;
+            let when = self
+                .event_explorer
+                .pinned_day
+                .or_else(|| self.volume.as_ref().map(|v| v.volume_time.date_naive()));
+            let today = Utc::now().date_naive();
+            when.and_then(|when| (when != today).then(|| (when.year(), when.month(), when.day())))
         };
+        let current_key = Some((self.spc_day, archive_date));
         let key_changed = wants && self.spc_last_key != current_key;
         if wants
             && self.spc_rx.is_none()
@@ -13033,16 +13240,10 @@ impl ViewerApp {
             let (sender, receiver) = mpsc::channel();
             self.spc_rx = Some(receiver);
             let kinds: Vec<String> = self.spc_outlooks_enabled.clone();
-            let want_reports = self.spc_reports_enabled;
+            // Dated days draw from the Event Explorer cache instead of
+            // the live filtered CSVs — skip the redundant live fetch.
+            let want_reports = self.spc_reports_enabled && self.event_followed_day().is_none();
             let day = self.spc_day;
-            // Archive-aware: when the displayed volume is from another
-            // day, show THAT day's outlook (latest issuance).
-            let archive_date = self.volume.as_ref().and_then(|volume| {
-                let when = volume.volume_time.date_naive();
-                let today = Utc::now().date_naive();
-                use chrono::Datelike;
-                (when != today).then(|| (when.year(), when.month(), when.day()))
-            });
             self.spc_last_key = Some((day, archive_date));
             let ctx_clone = ctx.clone();
             thread::spawn(move || {
@@ -14483,9 +14684,11 @@ impl ViewerApp {
         // Magnitude labels (wind speed, hail size) draw when the visible
         // set is small enough to stay readable — a CONUS view on a big
         // day has hundreds of reports and the numbers become noise.
+        // The set follows the displayed day: live filtered reports on
+        // the current convective day, the Event Explorer's dated cache
+        // when browsing archives (event_explorer.rs).
         let visible: Vec<(&spc_layers::StormReport, egui::Pos2)> = self
-            .spc_data
-            .reports
+            .reports_for_display()
             .iter()
             .filter_map(|report| {
                 let pos = self.lon_lat_to_screen(rect, report.lon, report.lat);
@@ -16722,21 +16925,47 @@ impl ViewerApp {
             .collect()
     }
 
+    /// Screen positions of the RAOB launch-site markers inside `rect` —
+    /// the same viewport culling as the other marker passes. Indices key
+    /// into [`Self::raob_marker_sites`] (the embedded table until the
+    /// session fetch lands): pure data, never the network, safe on the
+    /// UI thread every frame. Empty unless the layer is toggled on.
+    fn raob_site_points(&self, rect: egui::Rect) -> Vec<(usize, egui::Pos2)> {
+        if !self.raob_markers_enabled {
+            return Vec::new();
+        }
+        self.raob_marker_sites()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, site)| {
+                let position = self.lon_lat_to_screen(rect, site.lon, site.lat);
+                rect.expand(18.0)
+                    .contains(position)
+                    .then_some((index, position))
+            })
+            .collect()
+    }
+
     /// Left-click on map markers: the nearest hit inside the shared 12 px
-    /// halo wins across ALL three catalogs ([`resolve_marker_click`]). A
+    /// halo wins across ALL four catalogs ([`resolve_marker_click`]). A
     /// CONUS hit selects the site (the existing behavior); an
     /// international hit starts that site's live poll through
     /// [`Self::start_intl_poll`] — the exact path the DATA-tab picker
     /// uses; a community hit starts the feed's custom-URL poll through
     /// [`Self::start_known_feed_poll`] — the exact path the Feeds menu
     /// uses — or, on the shared-pad cluster marker, toggles the stacked
-    /// feeds picker ([`Self::show_community_feed_menu`]).
+    /// feeds picker ([`Self::show_community_feed_menu`]); a RAOB hit
+    /// fetches that station's observed sounding at the displayed time
+    /// through [`Self::start_raob_sounding_for`] — the exact path the
+    /// Analysis (OA) button uses.
     fn handle_marker_click(
         &mut self,
         site_points: &[(usize, egui::Pos2)],
         intl_points: &[(usize, egui::Pos2)],
         community_points: &[(usize, egui::Pos2)],
+        raob_points: &[(usize, egui::Pos2)],
         pointer: egui::Pos2,
+        ctx: &egui::Context,
     ) {
         // Any map click dismisses an open cluster picker (clicks on the
         // picker itself land on its foreground layer, never here); a
@@ -16746,6 +16975,7 @@ impl ViewerApp {
             nearest_marker_within(site_points, pointer),
             nearest_marker_within(intl_points, pointer),
             nearest_marker_within(community_points, pointer),
+            nearest_marker_within(raob_points, pointer),
         ) {
             Some((MarkerFamily::Conus, index)) => self.selected_site_index = index,
             Some((MarkerFamily::Intl, index)) => {
@@ -16779,6 +17009,12 @@ impl ViewerApp {
                     _ if open_menu != Some(index) => self.community_menu = Some(index),
                     _ => {}
                 }
+            }
+            Some((MarkerFamily::Raob, index)) => {
+                let Some(site) = self.raob_marker_sites().get(index).cloned() else {
+                    return;
+                };
+                self.start_raob_sounding_for(site, None, ctx);
             }
             None => {}
         }
@@ -16981,6 +17217,72 @@ impl ViewerApp {
                     &text,
                     egui::FontId::proportional(11.0),
                     egui::Color32::from_rgb(208, 244, 242),
+                );
+            }
+        }
+    }
+
+    /// RAOB launch-site markers: the fourth marker family. Same visual
+    /// grammar as [`Self::draw_intl_site_markers`] (hollow + hover chip,
+    /// identical culling) but a lavender hollow DIAMOND — shape and hue
+    /// both read apart from the filled CONUS dots, the warm amber intl
+    /// rings, and the cool teal community rings. Clicking fetches that
+    /// station's observed sounding at the displayed radar time.
+    fn draw_raob_site_markers(
+        &self,
+        painter: &egui::Painter,
+        raob_points: &[(usize, egui::Pos2)],
+        hovered: Option<usize>,
+    ) {
+        if raob_points.is_empty() {
+            return;
+        }
+        let sites = self.raob_marker_sites();
+        // Lavender against the amber intl and teal community rings.
+        const RAOB_IDLE: egui::Color32 = egui::Color32::from_rgb(164, 138, 218);
+        const RAOB_LIT: egui::Color32 = egui::Color32::from_rgb(216, 196, 255);
+        for (index, position) in raob_points {
+            let Some(site) = sites.get(*index) else {
+                continue;
+            };
+            let is_hovered = hovered == Some(*index);
+            let (radius, color) = if is_hovered {
+                (5.5, RAOB_LIT)
+            } else {
+                (4.0, RAOB_IDLE)
+            };
+            // Hollow diamond: the launch pad, not a radar.
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    *position + egui::vec2(0.0, -radius),
+                    *position + egui::vec2(radius, 0.0),
+                    *position + egui::vec2(0.0, radius),
+                    *position + egui::vec2(-radius, 0.0),
+                ],
+                egui::Stroke::new(1.5, color),
+            ));
+            if is_hovered {
+                let text = format!(
+                    "{} {} · RAOB — click for the sounding at the displayed time",
+                    site.id, site.name
+                );
+                // Same chip idiom as draw_mode_chip (width from char count).
+                let width = 12.0 + text.chars().count() as f32 * 6.6;
+                let chip = egui::Rect::from_min_size(
+                    *position + egui::vec2(10.0, -26.0),
+                    egui::vec2(width, 18.0),
+                );
+                painter.rect_filled(
+                    chip,
+                    4.0,
+                    egui::Color32::from_rgba_unmultiplied(16, 22, 30, 230),
+                );
+                painter.text(
+                    chip.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &text,
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_rgb(232, 222, 252),
                 );
             }
         }
@@ -17930,7 +18232,7 @@ fn nearest_marker_within(
         .min_by(|left, right| left.1.total_cmp(&right.1))
 }
 
-/// The three map-marker catalogs a click can land on.
+/// The four map-marker catalogs a click can land on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MarkerFamily {
     /// `self.sites` — the NEXRAD site list (click selects the site).
@@ -17940,22 +18242,29 @@ enum MarkerFamily {
     /// `data_source::community_feeds::community_markers` (click live-polls
     /// a direct feed, or opens the shared-pad cluster picker).
     Community,
+    /// `ViewerApp::raob_marker_sites` — RAOB launch sites (click fetches
+    /// the observed sounding at the displayed time). An overlay, not a
+    /// radar: it ranks LAST, so it can never steal a radar click.
+    Raob,
 }
 
-/// Which marker a click resolves to across the three families: the
+/// Which marker a click resolves to across the four families: the
 /// nearest in-halo hit wins; exact distance ties keep the declaration
-/// order CONUS > international > community (preserving the historical
-/// CONUS-wins-ties behavior). Inputs are [`nearest_marker_within`]
+/// order CONUS > international > community > RAOB (preserving the
+/// historical CONUS-wins-ties behavior; RAOB is an overlay and always
+/// loses ties to radar markers). Inputs are [`nearest_marker_within`]
 /// results.
 fn resolve_marker_click(
     conus: Option<(usize, f32)>,
     intl: Option<(usize, f32)>,
     community: Option<(usize, f32)>,
+    raob: Option<(usize, f32)>,
 ) -> Option<(MarkerFamily, usize)> {
     [
         conus.map(|(index, distance)| (MarkerFamily::Conus, index, distance)),
         intl.map(|(index, distance)| (MarkerFamily::Intl, index, distance)),
         community.map(|(index, distance)| (MarkerFamily::Community, index, distance)),
+        raob.map(|(index, distance)| (MarkerFamily::Raob, index, distance)),
     ]
     .into_iter()
     .flatten()
@@ -24310,24 +24619,54 @@ mod tests {
         use MarkerFamily::*;
         // Nearest across families wins regardless of declaration order.
         assert_eq!(
-            resolve_marker_click(Some((1, 9.0)), Some((2, 4.0)), Some((3, 6.0))),
+            resolve_marker_click(Some((1, 9.0)), Some((2, 4.0)), Some((3, 6.0)), None),
             Some((Intl, 2))
         );
         assert_eq!(
-            resolve_marker_click(Some((1, 9.0)), None, Some((3, 2.0))),
+            resolve_marker_click(Some((1, 9.0)), None, Some((3, 2.0)), None),
             Some((Community, 3))
         );
         // Exact ties keep the historical precedence: CONUS > intl >
-        // community.
+        // community > RAOB.
         assert_eq!(
-            resolve_marker_click(Some((1, 5.0)), Some((2, 5.0)), Some((3, 5.0))),
+            resolve_marker_click(
+                Some((1, 5.0)),
+                Some((2, 5.0)),
+                Some((3, 5.0)),
+                Some((4, 5.0))
+            ),
             Some((Conus, 1))
         );
         assert_eq!(
-            resolve_marker_click(None, Some((2, 5.0)), Some((3, 5.0))),
+            resolve_marker_click(None, Some((2, 5.0)), Some((3, 5.0)), None),
             Some((Intl, 2))
         );
-        assert_eq!(resolve_marker_click(None, None, None), None);
+        assert_eq!(resolve_marker_click(None, None, None, None), None);
+    }
+
+    /// RAOB markers are an overlay, not a radar: at EQUAL distance every
+    /// radar family wins the click — RAOB only resolves when it is
+    /// strictly nearest (or alone in the halo).
+    #[test]
+    fn raob_markers_never_steal_an_equal_distance_radar_click() {
+        use MarkerFamily::*;
+        for radar in [
+            resolve_marker_click(Some((1, 5.0)), None, None, Some((4, 5.0))),
+            resolve_marker_click(None, Some((2, 5.0)), None, Some((4, 5.0))),
+            resolve_marker_click(None, None, Some((3, 5.0)), Some((4, 5.0))),
+        ] {
+            assert_ne!(radar.map(|(family, _)| family), Some(Raob));
+        }
+        // Strictly nearest (the marker the user aimed at) still wins…
+        assert_eq!(
+            resolve_marker_click(Some((1, 5.0)), None, None, Some((4, 4.9))),
+            Some((Raob, 4))
+        );
+        // …and an unaccompanied RAOB hit resolves normally.
+        assert_eq!(
+            resolve_marker_click(None, None, None, Some((4, 5.0))),
+            Some((Raob, 4))
+        );
     }
 
     /// Clicking the shared-pad cluster marker opens the feed picker
@@ -24343,19 +24682,66 @@ mod tests {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let community_points = vec![(cluster_index, egui::pos2(100.0, 100.0))];
         let pointer = egui::pos2(103.0, 100.0);
+        let ctx = egui::Context::default();
 
-        app.handle_marker_click(&[], &[], &community_points, pointer);
+        app.handle_marker_click(&[], &[], &community_points, &[], pointer, &ctx);
         assert_eq!(app.community_menu, Some(cluster_index));
         // The picker, not the poll, owns a cluster click.
         assert!(!app.poll_active);
 
-        app.handle_marker_click(&[], &[], &community_points, pointer);
+        app.handle_marker_click(&[], &[], &community_points, &[], pointer, &ctx);
         assert_eq!(app.community_menu, None, "re-click toggles the picker");
 
         // A click elsewhere on the map dismisses an open picker.
         app.community_menu = Some(cluster_index);
-        app.handle_marker_click(&[], &[], &community_points, egui::pos2(500.0, 500.0));
+        app.handle_marker_click(
+            &[],
+            &[],
+            &community_points,
+            &[],
+            egui::pos2(500.0, 500.0),
+            &ctx,
+        );
         assert_eq!(app.community_menu, None);
+    }
+
+    /// RAOB marker plumbing, offline: the layer toggle gates the point
+    /// pass (no markers, no hit-testing while off), the catalog resolves
+    /// marker indices to stations, and an in-flight native-sounding build
+    /// blocks a click dispatch instead of racing it (the
+    /// `start_raob_sounding_for` guard — no fetch thread is spawned, so
+    /// this test never touches the network).
+    #[test]
+    fn raob_marker_layer_gates_points_and_respects_the_inflight_guard() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        // Center the viewport on Lincoln IL (the field request's station).
+        app.map_center_lat = 40.15;
+        app.map_center_lon = -88.6;
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        // Layer off (the default): no points, nothing to hit-test.
+        assert!(!app.raob_markers_enabled);
+        assert!(app.raob_site_points(rect).is_empty());
+        // Layer on: the static catalog puts launch sites in the viewport.
+        app.raob_markers_enabled = true;
+        let points = app.raob_site_points(rect);
+        assert!(!points.is_empty(), "no RAOB markers around KILX");
+        for (index, _) in &points {
+            assert!(app.raob_marker_sites().get(*index).is_some());
+        }
+
+        // Occupy the native-sounding channel: a marker click must not
+        // replace the in-flight build.
+        let (_keep_alive, receiver) = mpsc::channel();
+        app.native_sounding_rx = Some(receiver);
+        let ilx_index = obs_soundings::static_sites()
+            .iter()
+            .position(|site| site.id == "KILX")
+            .expect("KILX in the static table");
+        let raob_points = vec![(ilx_index, egui::pos2(100.0, 100.0))];
+        let ctx = egui::Context::default();
+        let status_before = app.status.clone();
+        app.handle_marker_click(&[], &[], &[], &raob_points, egui::pos2(103.0, 100.0), &ctx);
+        assert_eq!(app.status, status_before, "in-flight guard must hold");
     }
 
     #[test]
@@ -25856,6 +26242,7 @@ mod tests {
             spc_last_key: None,
             glm: None,
             spc_rx: None,
+            event_explorer: event_explorer::EventExplorerState::default(),
             glm_enabled: false,
             oa_rx: None,
             oa_last_summary: None,
@@ -25866,6 +26253,9 @@ mod tests {
             oa_comp_total: 0,
             oa_comp_pick: None,
             raob_sites: None,
+            raob_sites_rx: None,
+            raob_sites_fetch_attempted: false,
+            raob_markers_enabled: false,
             obs_enabled: false,
             obs_show_metar: true,
             obs_show_mesonet: true,

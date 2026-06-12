@@ -438,6 +438,30 @@ pub fn publication_lag_minutes(model: ModelId) -> i64 {
 /// first, as (YYYYMMDD, cycle-hour) pairs. Generalizes the HRRR one-click
 /// guess (hourly cadence, candidates at now-55 m and now-115 m) to sparse
 /// cadences like GFS's 00/06/12/18z.
+/// Download-spec fields targeting the model init that covers a displayed
+/// (typically archive) frame: the newest cycle at or before the frame on
+/// the model's cadence, with the hour window bracketing the frame (field
+/// request: load a tornado archive → the panel pre-fills the matching
+/// run so a model overlay is one click). Pure — no availability probing;
+/// the AWS mirrors hold the deep HRRR/GFS archives and the panel's
+/// availability probe reports per-hour reality.
+pub fn spec_fields_for_displayed_time(
+    model_slug: &str,
+    displayed: chrono::DateTime<chrono::Utc>,
+) -> Option<(String, u8, String)> {
+    let model: ModelId = model_slug.parse().ok()?;
+    let summary = rustwx_models::model_summary(model);
+    let (date, cycle) = recent_cycle_candidates(displayed, summary.cycle_hours_utc, 0, 1)
+        .into_iter()
+        .next()?;
+    let init = chrono::NaiveDate::parse_from_str(&date, "%Y%m%d")
+        .ok()?
+        .and_hms_opt(u32::from(cycle), 0, 0)?;
+    let init = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(init, chrono::Utc);
+    let fhr = (displayed - init).num_hours().max(0) as u16;
+    Some((date, cycle, format!("{fhr}-{}", fhr + 1)))
+}
+
 pub fn recent_cycle_candidates(
     now: chrono::DateTime<chrono::Utc>,
     cycle_hours: &[u8],
@@ -807,6 +831,30 @@ mod tests {
         use chrono::TimeZone;
         let d = chrono::NaiveDate::parse_from_str(date, "%Y%m%d").unwrap();
         chrono::Utc.from_utc_datetime(&d.and_hms_opt(h, m, 0).unwrap())
+    }
+
+    #[test]
+    fn displayed_time_spec_brackets_the_frame_per_cadence() {
+        // HRRR (hourly): a 21:30Z archive frame -> the 21z init, f0-1.
+        let (date, cycle, hours) =
+            spec_fields_for_displayed_time("hrrr", utc("20260611", 21, 30)).unwrap();
+        assert_eq!(
+            (date.as_str(), cycle, hours.as_str()),
+            ("20260611", 21, "0-1")
+        );
+        // GFS (6-hourly): same frame -> the 18z init, f3-4.
+        let (date, cycle, hours) =
+            spec_fields_for_displayed_time("gfs", utc("20260611", 21, 30)).unwrap();
+        assert_eq!(
+            (date.as_str(), cycle, hours.as_str()),
+            ("20260611", 18, "3-4")
+        );
+        // Just past a GFS init -> f0-1 of that init.
+        let (_, cycle, hours) =
+            spec_fields_for_displayed_time("gfs", utc("20260611", 0, 10)).unwrap();
+        assert_eq!((cycle, hours.as_str()), (0, "0-1"));
+        // Unknown model slug: no fields, no panic.
+        assert!(spec_fields_for_displayed_time("carrier-pigeon", utc("20260611", 0, 0)).is_none());
     }
 
     #[test]

@@ -232,6 +232,18 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      - name: Generate SHA-256 checksums
+        shell: bash
+        # Published beside every asset so users can verify a download is the
+        # CI-built binary (antivirus ML heuristics flag unsigned Rust exes;
+        # a hash check against the release page settles provenance).
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in *; do
+            sha256sum "$f" > "$f.sha256"
+          done
+
       - name: Upload release asset
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash

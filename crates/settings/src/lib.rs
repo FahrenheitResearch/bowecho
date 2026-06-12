@@ -45,6 +45,11 @@ pub struct AppSettings {
     pub overlay_obs_mesonet: bool,
     #[serde(default)]
     pub overlay_glm: bool,
+    /// RAOB launch-site markers (the observed-soundings obs layer) —
+    /// default off; clicking a marker fetches that station's sounding at
+    /// the displayed radar time.
+    #[serde(default)]
+    pub overlay_raob: bool,
     /// Enabled SPC outlook kinds ("cat", "torn", "wind", "hail").
     #[serde(default)]
     pub overlay_spc_outlooks: Vec<String>,
@@ -223,6 +228,7 @@ impl Default for AppSettings {
             overlay_obs_metar: true,
             overlay_obs_mesonet: true,
             overlay_glm: false,
+            overlay_raob: false,
             overlay_spc_outlooks: Vec::new(),
             overlay_spc_reports: false,
             startup_site: None,
@@ -569,6 +575,17 @@ mod tests {
         let back = AppSettings::from_json(&s.to_json());
         assert_eq!(back.smooth_display_mode, "interpolated");
         assert!(back.smooth_display);
+    }
+
+    #[test]
+    fn overlay_raob_defaults_off_and_round_trips() {
+        // Older configs have no overlay_raob field — the layer stays off.
+        assert!(!AppSettings::from_json("{}").overlay_raob);
+        let s = AppSettings {
+            overlay_raob: true,
+            ..Default::default()
+        };
+        assert!(AppSettings::from_json(&s.to_json()).overlay_raob);
     }
 
     #[test]

@@ -165,6 +165,21 @@ pub enum DataSourceError {
 
 pub type Result<T> = std::result::Result<T, DataSourceError>;
 
+impl DataSourceError {
+    /// True when the server answered "this resource does not exist"
+    /// (HTTP 404, or an empty S3 listing). Callers distinguishing "no
+    /// file published for that date" from a real transport failure
+    /// (SPC storm-report archives: a 404 means a quiet/pre-archive day,
+    /// not an error worth surfacing or retrying).
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            DataSourceError::Http(err) => err.status() == Some(reqwest::StatusCode::NOT_FOUND),
+            DataSourceError::NoObjects { .. } => true,
+            _ => false,
+        }
+    }
+}
+
 impl Default for SourcePriority {
     fn default() -> Self {
         Self {

@@ -29,6 +29,7 @@ impl ViewerApp {
             + self.model_layers.len()
             + usize::from(self.obs_enabled)
             + usize::from(self.glm_enabled)
+            + usize::from(self.raob_markers_enabled)
             + usize::from(!self.spc_outlooks_enabled.is_empty())
             + usize::from(self.spc_reports_enabled)
             + usize::from(self.hazards_visible && self.hazard_overlay.is_some())
@@ -512,6 +513,45 @@ impl ViewerApp {
                 ctx.request_repaint();
             }
         }
+        // RAOB STATIONS — radiosonde launch sites as click-to-sound map
+        // markers (field request: "show 21z ILX yesterday in sharppy
+        // format" — scrub the loop to the time, click the station).
+        {
+            let site_count = self.raob_marker_sites().len();
+            let fetching_list = self.raob_sites_rx.is_some();
+            if layer_row(
+                ui,
+                LayerRowSpec {
+                    vis: LayerRowVis::Toggle {
+                        value: &mut self.raob_markers_enabled,
+                        hover: "Radiosonde launch sites as lavender diamond markers — click one for that station's observed sounding at the DISPLAYED radar time (specials included: scrub an archive loop to 21z, get the 21z special). Wyoming + IEM archives, no key.",
+                    },
+                    name: "RAOB stations",
+                    name_width: crate::NAME_W_STD,
+                    name_hover: "Observed-sounding launch sites (click a marker for the sounding at the displayed time, rendered in the native skew-T)",
+                    gear: Some(LayerRowGear::Menu {
+                        hover: "RAOB layer notes",
+                        content: Box::new(move |ui| {
+                            ui.weak(format!("{site_count} launch sites (live + archive)."));
+                            ui.weak("Soundings come from the U. Wyoming archive");
+                            ui.weak("(every launch incl. off-hour specials, decades");
+                            ui.weak("deep) with the IEM RAOB archive as fallback");
+                            ui.weak("(synoptic 00/12z). The launch nearest BEFORE");
+                            ui.weak("the displayed frame time is fetched.");
+                        }),
+                    }),
+                    ..Default::default()
+                },
+                |ui| {
+                    if fetching_list {
+                        ui.spinner();
+                    }
+                },
+            ) {
+                self.save_overlay_defaults();
+                ctx.request_repaint();
+            }
+        }
         Self::rail_group_header(ui, "SEVERE", |ui| {
             let _ = ui;
         });
@@ -576,11 +616,11 @@ impl ViewerApp {
                 LayerRowSpec {
                     vis: LayerRowVis::Toggle {
                         value: &mut self.spc_reports_enabled,
-                        hover: "Today's filtered storm reports (tornado / wind / hail), refreshed ~5 min",
+                        hover: "Filtered storm reports (tornado / wind / hail) for the DISPLAYED day: live today (refreshed ~5 min), the archived convective day (12Z-12Z) when browsing the past — with clickable tornado tracks (DATA tab: Event day)",
                     },
                     name: "SPC reports",
                     name_width: crate::NAME_W_STD,
-                    name_hover: "SPC storm report dots for the displayed day",
+                    name_hover: "SPC storm report dots + tornado track lines for the displayed day; click a track to load its radar loop",
                     gear: Some(LayerRowGear::Open {
                         hover: "Open the SEVERE tab",
                         clicked: &mut open_severe,
@@ -819,7 +859,7 @@ impl ViewerApp {
                         if ui
                             .button("Obs sounding (RAOB)")
                             .on_hover_text(
-                                "Nearest radiosonde launch to the map center, at the synoptic time before the displayed frame (IEM archive, no key). Renders in the native skew-T with the full parameter suite.",
+                                "Nearest radiosonde launch site to the map center, at the launch nearest the displayed frame — specials included (Wyoming + IEM archives, no key). Renders in the native skew-T with the full parameter suite. Tip: the RAOB stations layer puts every launch site on the map, click-to-sound.",
                             )
                             .clicked()
                         {

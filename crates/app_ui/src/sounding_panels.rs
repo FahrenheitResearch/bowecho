@@ -364,6 +364,12 @@ pub fn draw_full(ui: &mut egui::Ui, rect: Rect, sounding: &NativeSounding) {
     painter.rect_filled(g.rect(0.0, 0.0, cw, TITLE_H), 0.0, TITLE_BG);
     let meta = &sounding.metadata;
     let mut title = "BowEcho Sounding Analysis".to_owned();
+    // RAOB launches ("KILX RAOB 06-11 21z") and obs-adjusted tags carry
+    // their identity in station_id; model soundings leave it empty
+    // (field report: the plot title was generic for observed soundings).
+    if !meta.station_id.is_empty() {
+        title.push_str(&format!(" — {}", meta.station_id));
+    }
     if let (Some(lat), Some(lon)) = (meta.latitude_deg, meta.longitude_deg) {
         title.push_str(&format!(" — {lat:.3}, {lon:.3}"));
     }

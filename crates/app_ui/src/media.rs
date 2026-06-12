@@ -52,6 +52,10 @@ enum CaptureKind {
 pub(crate) enum RecordSize {
     Small720,
     Full1280,
+    Hd1920,
+    /// No downscale — frames keep the capture's full physical-pixel
+    /// resolution (field request: higher-res exports). GIFs get big.
+    Native,
 }
 
 impl RecordSize {
@@ -59,6 +63,8 @@ impl RecordSize {
         match self {
             Self::Small720 => "720",
             Self::Full1280 => "1280",
+            Self::Hd1920 => "1920",
+            Self::Native => "native",
         }
     }
 
@@ -66,6 +72,10 @@ impl RecordSize {
         match self {
             Self::Small720 => 720,
             Self::Full1280 => 1280,
+            Self::Hd1920 => 1920,
+            // target_dimensions caps at min(width, max_width): MAX means
+            // the capture resolution passes through untouched.
+            Self::Native => u32::MAX,
         }
     }
 }
@@ -307,12 +317,21 @@ impl ViewerApp {
                 .selected_text(self.media.record_size.label())
                 .width(56.0)
                 .show_ui(ui, |ui| {
-                    for size in [RecordSize::Small720, RecordSize::Full1280] {
+                    for size in [
+                        RecordSize::Small720,
+                        RecordSize::Full1280,
+                        RecordSize::Hd1920,
+                        RecordSize::Native,
+                    ] {
                         ui.selectable_value(&mut self.media.record_size, size, size.label());
                     }
                 })
                 .response
-                .on_hover_text("Maximum recording width in pixels (smaller = Discord-friendlier)");
+                .on_hover_text(
+                    "Maximum recording width in pixels (smaller = Discord-friendlier). \
+                     native = the full capture resolution, no downscale — crispest, \
+                     biggest files (MP4 handles it well; GIFs get large)",
+                );
             egui::ComboBox::from_id_salt("media_record_format")
                 .selected_text(self.media.record_format.label())
                 .width(56.0)

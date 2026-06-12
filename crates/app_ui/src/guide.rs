@@ -733,6 +733,32 @@ fn archive(ui: &mut egui::Ui) {
          map there, and loads the loop at the report time. One click from \"tornado near X\" \
          to the right radar at the right minute.",
     );
+
+    subhead(ui, "EVENT EXPLORER");
+    para(
+        ui,
+        "Pick a day, see everything that happened. With the SPC reports layer on, the report \
+         dots FOLLOW the displayed radar time's convective day (12Z\u{2013}12Z — a 03Z report \
+         belongs to the previous day's file) whenever you browse the archive, exactly like \
+         the outlooks do. Tornado TRACKS draw as red begin\u{2192}end lines with a direction \
+         arrowhead — surveyed paths from the SPC WCM tornado database; days the database \
+         hasn't reached yet (the current year) show the torn report points instead.",
+    );
+    action(
+        ui,
+        "Event day \u{25b8} Load",
+        "— pins the reports/outlook day from the DATA tab without moving the map, and shows \
+         the day's count (\"N reports · M tornado segments\"). A day with no SPC file (quiet \
+         or pre-2004) says so — no error spam. Unpin returns to following the displayed time.",
+    );
+    action(
+        ui,
+        "Click a tornado track",
+        "— loads the lowest-beam WSR-88D at the track midpoint with a loop SPANNING the \
+         track (15 min before touchdown to 15 min after the estimated lift), auto-playing at \
+         the lowest tilt — and when the track's END is closer to a different radar, that \
+         site loads as a second radar overlay at the event time.",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -941,8 +967,10 @@ fn sources(ui: &mut egui::Ui) {
     para(
         ui,
         "Warnings: NWS active alerts (api.weather.gov) plus hot NWS text products and SPC \
-         mesoscale discussions. Tornado events: SPC storm-report CSVs \
-         (spc.noaa.gov/climo/reports).",
+         mesoscale discussions. Storm reports: SPC filtered storm-report CSVs, live and per \
+         convective day (spc.noaa.gov/climo/reports). Tornado tracks: the SPC WCM \
+         severe-weather database (spc.noaa.gov/wcm, \"onetor\" format; Schaefer & Edwards \
+         1999, 11th Conf. Applied Climatology).",
     );
 
     subhead(ui, "MODEL & SATELLITE");

@@ -35,6 +35,22 @@ self-contained (no installer, no runtime dependencies). Builds are not yet
 code-signed, so SmartScreen may show "Windows protected your PC" the first
 time: click **More info → Run anyway**.
 
+> **Antivirus false positives.** Windows Defender's machine-learning
+> heuristics sometimes flag new, unsigned Rust executables with names like
+> `Trojan:Script/Sabsik.fl.A!ml` or `Wacatac.B!ml` — the `!ml` suffix means
+> "ML guess", not a matched virus signature, and it's a well-known false
+> positive for freshly compiled open-source binaries. Every BowEcho release
+> is built by GitHub Actions directly from the tagged source in this
+> repository (the full build log is public under the Actions tab), and each
+> asset ships with a `.sha256` checksum so you can verify your download is
+> byte-identical to what CI produced:
+> `Get-FileHash bowecho-windows-x64.zip` (PowerShell) and compare. If
+> Defender quarantines it, restore + add an exclusion, or report the false
+> positive to Microsoft at
+> <https://www.microsoft.com/en-us/wdsi/filesubmission> — developer
+> submissions of `!ml` detections are typically cleared within days. You
+> can always audit and build from source instead (see below).
+
 **macOS:** unzip and open `BowEcho.app`. Unsigned for now — right-click the
 app and choose **Open** the first time (or run
 `xattr -d com.apple.quarantine BowEcho.app` in Terminal).
