@@ -31,7 +31,12 @@ pub struct AppSettings {
     /// Velocity family).
     #[serde(default)]
     pub palette_by_product: BTreeMap<String, String>,
-    /// Multi-pane grid layout pane count from the last session (1, 2 or 4).
+    /// Active built-in/user appearance profile name. The live style document
+    /// remains the source of truth; this records which profile it started
+    /// from so the UI can show "modified" after manual tweaks.
+    #[serde(default = "default_style_profile")]
+    pub style_profile: String,
+    /// Multi-pane grid layout pane count from the last session (1, 2, 3, or 4).
     pub grid_pane_count: usize,
     /// Placefile URLs (GRLevelX-style overlays) with per-file enable flags.
     pub placefiles: Vec<PlacefileEntry>,
@@ -61,6 +66,10 @@ pub struct AppSettings {
     /// GR2-style bold town labels (white, heavy halo) readable over echoes.
     #[serde(default = "default_bold_labels")]
     pub bold_labels: bool,
+    /// Draw CONUS radar site/TDWR labels next to radar markers. Markers
+    /// stay visible/clickable when labels are off.
+    #[serde(default = "default_true")]
+    pub show_radar_labels: bool,
     /// Map right-click: false (default) = open the lowest-beam radar menu;
     /// true = switch straight to the closest WSR-88D, no menu (field
     /// request: "i might sometimes want right click to just load closest
@@ -81,6 +90,27 @@ pub struct AppSettings {
     /// default off.
     #[serde(default)]
     pub perf_hud: bool,
+    /// Flash/mark newly issued, current warnings until the operator clicks or
+    /// acknowledges them. Default on to preserve the existing documentation
+    /// workflow.
+    #[serde(default = "default_true")]
+    pub alert_flash_enabled: bool,
+    /// Warning families that may latch the visual NEW/flash state. Empty =
+    /// all supported warning families.
+    #[serde(default)]
+    pub alert_flash_families: Vec<String>,
+    /// Play an operator alert sound when a newly issued, current warning is
+    /// latched in the Severe tab. Default off so existing installs stay quiet.
+    #[serde(default)]
+    pub alert_sound_enabled: bool,
+    /// Optional custom `.wav` file for the warning alert. Empty = platform
+    /// system alert sound.
+    #[serde(default)]
+    pub alert_sound_path: String,
+    /// Warning families that may play the alert. Empty = all supported
+    /// warning families, keeping old configs sparse.
+    #[serde(default)]
+    pub alert_sound_families: Vec<String>,
     /// Product hotkeys: number-row key ("0"-"9") -> product label (e.g.
     /// "REF", "VEL", "SRV", "RHO", "ZDR", "SW", "CREF", "ET", "VIL", "VILD",
     /// "PHI", "KDP", "AzShr", "Div"). Edit in config.json to customize.
@@ -110,10 +140,22 @@ pub struct AppSettings {
     /// request: a short track otherwise loads only a handful of frames).
     #[serde(default = "default_event_pad_frames")]
     pub event_pad_frames: u16,
+    /// Archive browser click mode: true = load a loop ending at the chosen
+    /// scan, false = load only that scan.
+    #[serde(default = "default_true")]
+    pub archive_load_loop: bool,
+    /// Archive browser "Fetch N scans" control. Clamped by the UI to its
+    /// supported range when read.
+    #[serde(default = "default_archive_frame_count")]
+    pub archive_frame_count: u16,
     /// Last GR2A-style poll URL (mobile/research radar feeds) — typing it
     /// once per deployment is fine, once per session is not.
     #[serde(default)]
     pub poll_url: String,
+    /// User-saved GR2A-style poll roots plus map positions for private,
+    /// lab, or field radars that are not in BowEcho's built-in catalogs.
+    #[serde(default)]
+    pub custom_poll_links: Vec<CustomPollLinkEntry>,
     /// Last international live-feed selection, mirroring `poll_url`: the
     /// data_source international provider id (e.g. "smhi") plus its
     /// provider-scoped site id (e.g. "angelholm"), so the DATA tab's
@@ -155,10 +197,20 @@ pub struct AppSettings {
     /// UI-crate-free and Eq-derivable.
     #[serde(default = "default_units")]
     pub units: String,
+    /// Operator-facing timestamp display zone. "utc" preserves the
+    /// historical BowEcho behavior; app_ui also accepts US zones such as
+    /// "eastern", "central", "mountain", and "pacific". Data fetch keys
+    /// remain UTC regardless of this display preference.
+    #[serde(default = "default_time_zone")]
+    pub time_zone: String,
 }
 
 fn default_units() -> String {
     "imperial".to_owned()
+}
+
+fn default_time_zone() -> String {
+    "utc".to_owned()
 }
 
 fn default_model_slug() -> String {
@@ -171,6 +223,10 @@ fn default_loop_speed_percent() -> u16 {
 
 fn default_event_pad_frames() -> u16 {
     5
+}
+
+fn default_archive_frame_count() -> u16 {
+    10
 }
 
 /// A persisted FARM drape georeference. Coordinates are stored as scaled
@@ -193,6 +249,23 @@ pub struct FarmGeorefEntry {
     pub scan_id: String,
     /// True when the user pinned the position by hand.
     pub manual: bool,
+}
+
+/// A user-saved custom radar poll root and marker. Coordinates are stored
+/// as microdegrees so `AppSettings` remains `Eq`-derivable.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CustomPollLinkEntry {
+    /// Human label shown in the DATA tab and map hover chip.
+    pub label: String,
+    /// Optional short site id, e.g. ARMOR or FWLX.
+    pub site_id: String,
+    /// Marker latitude/longitude in microdegrees.
+    pub lat_e6: i64,
+    pub lon_e6: i64,
+    /// GR2A-style root URL. BowEcho polls `{poll_url}/dir.list`, or a
+    /// single site discovered from `{poll_url}/grlevel2.cfg`.
+    pub poll_url: String,
 }
 
 /// A persisted placefile reference.
@@ -230,6 +303,10 @@ fn default_model_keep_runs() -> u8 {
     2
 }
 
+fn default_style_profile() -> String {
+    "BowEcho default".to_owned()
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -246,20 +323,30 @@ impl Default for AppSettings {
             saved_layout_slots: 8,
             palette_by_family: BTreeMap::new(),
             palette_by_product: BTreeMap::new(),
+            style_profile: default_style_profile(),
             grid_pane_count: 1,
             placefiles: Vec::new(),
             basemap_style: default_basemap_style(),
             bold_labels: default_bold_labels(),
+            show_radar_labels: true,
             right_click_loads_nearest: false,
             gate_filter_decidbz: None,
             model_keep_runs: default_model_keep_runs(),
             perf_hud: false,
+            alert_flash_enabled: true,
+            alert_flash_families: Vec::new(),
+            alert_sound_enabled: false,
+            alert_sound_path: String::new(),
+            alert_sound_families: Vec::new(),
             product_hotkeys: default_product_hotkeys(),
             smooth_display: false,
             smooth_display_mode: String::new(),
             loop_speed_percent: default_loop_speed_percent(),
             event_pad_frames: default_event_pad_frames(),
+            archive_load_loop: true,
+            archive_frame_count: default_archive_frame_count(),
             poll_url: String::new(),
+            custom_poll_links: Vec::new(),
             intl_provider: String::new(),
             intl_site: String::new(),
             farm_georefs: Vec::new(),
@@ -268,6 +355,7 @@ impl Default for AppSettings {
             sidebar_section_open: BTreeMap::new(),
             model_slug: default_model_slug(),
             units: default_units(),
+            time_zone: default_time_zone(),
         }
     }
 }
@@ -528,6 +616,13 @@ mod tests {
             startup_site: Some("KEAX".to_owned()),
             polling_interval_seconds: 30,
             perf_hud: true,
+            alert_flash_enabled: false,
+            alert_flash_families: vec!["tornado".to_owned()],
+            alert_sound_enabled: true,
+            alert_sound_path: "C:\\alerts\\tor.wav".to_owned(),
+            alert_sound_families: vec!["tornado".to_owned(), "severe thunderstorm".to_owned()],
+            archive_load_loop: false,
+            archive_frame_count: 17,
             intl_provider: "smhi".to_owned(),
             intl_site: "angelholm".to_owned(),
             ..Default::default()
@@ -540,9 +635,109 @@ mod tests {
         );
         s.palette_by_product
             .insert("SRV".to_owned(), "Balance VEL (CVD-safe)".to_owned());
+        s.style_profile = "Chase dark".to_owned();
+        s.custom_poll_links.push(CustomPollLinkEntry {
+            label: "ARMOR".to_owned(),
+            site_id: "ARMOR".to_owned(),
+            lat_e6: 34_646_000,
+            lon_e6: -86_772_000,
+            poll_url: "http://192.0.2.10/armor".to_owned(),
+        });
         let back = AppSettings::from_json(&s.to_json());
         assert_eq!(back, s);
         assert_eq!(back.favorites, vec!["KTWX".to_owned()]);
+    }
+
+    #[test]
+    fn custom_poll_links_default_and_round_trip() {
+        assert!(AppSettings::from_json("{}").custom_poll_links.is_empty());
+
+        let settings = AppSettings {
+            custom_poll_links: vec![CustomPollLinkEntry {
+                label: "FWLX".to_owned(),
+                site_id: "FWLX".to_owned(),
+                lat_e6: 30_123_456,
+                lon_e6: -97_654_321,
+                poll_url: "http://198.51.100.7:8080".to_owned(),
+            }],
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert_eq!(back.custom_poll_links, settings.custom_poll_links);
+    }
+
+    #[test]
+    fn radar_labels_default_on_and_round_trip() {
+        assert!(AppSettings::from_json("{}").show_radar_labels);
+
+        let settings = AppSettings {
+            show_radar_labels: false,
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert!(!back.show_radar_labels);
+    }
+
+    #[test]
+    fn style_profile_defaults_and_round_trips() {
+        assert_eq!(
+            AppSettings::from_json("{}").style_profile,
+            "BowEcho default"
+        );
+
+        let settings = AppSettings {
+            style_profile: "Accessibility (CVD-safe)".to_owned(),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert_eq!(back.style_profile, "Accessibility (CVD-safe)");
+    }
+
+    #[test]
+    fn archive_controls_default_and_round_trip() {
+        let old = AppSettings::from_json("{}");
+        assert!(old.archive_load_loop);
+        assert_eq!(old.archive_frame_count, 10);
+
+        let settings = AppSettings {
+            archive_load_loop: false,
+            archive_frame_count: 24,
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert!(!back.archive_load_loop);
+        assert_eq!(back.archive_frame_count, 24);
+    }
+
+    #[test]
+    fn event_pad_frames_default_and_round_trip() {
+        let old = AppSettings::from_json("{}");
+        assert_eq!(old.event_pad_frames, 5);
+
+        let settings = AppSettings {
+            event_pad_frames: 12,
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert_eq!(back.event_pad_frames, 12);
+    }
+
+    #[test]
+    fn data_dir_default_and_round_trip() {
+        assert_eq!(AppSettings::from_json("{}").data_dir, "");
+
+        let settings = AppSettings {
+            data_dir: "D:\\BowEchoData".to_owned(),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert_eq!(back.data_dir, "D:\\BowEchoData");
     }
 
     #[test]
@@ -618,6 +813,52 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(AppSettings::from_json(&s.to_json()).units, "metric");
+    }
+
+    #[test]
+    fn time_zone_defaults_to_utc_and_round_trips() {
+        // Older configs have no time_zone field — keep legacy UTC labels.
+        assert_eq!(AppSettings::from_json("{}").time_zone, "utc");
+        let s = AppSettings {
+            time_zone: "eastern".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(AppSettings::from_json(&s.to_json()).time_zone, "eastern");
+    }
+
+    #[test]
+    fn alert_sound_settings_default_quiet_and_round_trip() {
+        let old = AppSettings::from_json("{}");
+        assert!(!old.alert_sound_enabled);
+        assert!(old.alert_sound_path.is_empty());
+        assert!(old.alert_sound_families.is_empty());
+
+        let s = AppSettings {
+            alert_sound_enabled: true,
+            alert_sound_path: "C:\\alerts\\warn.wav".to_owned(),
+            alert_sound_families: vec!["tornado".to_owned()],
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&s.to_json());
+        assert!(back.alert_sound_enabled);
+        assert_eq!(back.alert_sound_path, "C:\\alerts\\warn.wav");
+        assert_eq!(back.alert_sound_families, vec!["tornado".to_owned()]);
+    }
+
+    #[test]
+    fn alert_flash_settings_default_on_and_round_trip() {
+        let old = AppSettings::from_json("{}");
+        assert!(old.alert_flash_enabled);
+        assert!(old.alert_flash_families.is_empty());
+
+        let s = AppSettings {
+            alert_flash_enabled: false,
+            alert_flash_families: vec!["flash flood".to_owned()],
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&s.to_json());
+        assert!(!back.alert_flash_enabled);
+        assert_eq!(back.alert_flash_families, vec!["flash flood".to_owned()]);
     }
 
     #[test]

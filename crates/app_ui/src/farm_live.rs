@@ -979,6 +979,17 @@ impl DrapeState {
         std::mem::take(&mut self.dirty)
     }
 
+    pub fn background_activity_label(&self) -> Option<String> {
+        self.analysis_rx.is_some().then(|| {
+            let status = self.status.trim();
+            if status.is_empty() {
+                "Locating FARM deployment".to_owned()
+            } else {
+                status.to_owned()
+            }
+        })
+    }
+
     /// Switch sensors: clear the frame cache, drop any in-flight
     /// analysis (it belongs to the old sensor), restore the saved fix.
     fn on_sensor_change(&mut self, sensor_id: Option<u32>) {
@@ -1299,6 +1310,16 @@ impl FarmState {
         self.sensors.iter().find(|s| s.is_live())
     }
 
+    pub fn background_activity_label(&self) -> Option<String> {
+        if self.frames_rx.is_some() {
+            return Some("Loading FARM frames".to_owned());
+        }
+        if self.image_rx.is_some() {
+            return Some("Loading FARM quicklook".to_owned());
+        }
+        self.drape.background_activity_label()
+    }
+
     /// Scan id of the currently displayed frame.
     pub fn current_scan_id(&self) -> String {
         self.frames
@@ -1565,6 +1586,35 @@ mod tests {
         assert_eq!(product_label("DBZHC_F"), "Reflectivity (filtered)");
         assert_eq!(product_label("VEL_F"), "Velocity (filtered)");
         assert_eq!(product_label("DBZHC"), "Reflectivity");
+    }
+
+    #[test]
+    fn background_activity_label_reports_user_visible_fetches() {
+        let mut state = FarmState::default();
+
+        let (_sender, receiver) = mpsc::channel::<Result<FarmPage, String>>();
+        state.frames_rx = Some(receiver);
+        assert_eq!(
+            state.background_activity_label().as_deref(),
+            Some("Loading FARM frames")
+        );
+        state.frames_rx = None;
+
+        let (_sender, receiver) = mpsc::channel::<(String, Result<egui::ColorImage, String>)>();
+        state.image_rx = Some(receiver);
+        assert_eq!(
+            state.background_activity_label().as_deref(),
+            Some("Loading FARM quicklook")
+        );
+        state.image_rx = None;
+
+        let (_sender, receiver) = mpsc::channel::<AnalysisOutcome>();
+        state.drape.analysis_rx = Some(receiver);
+        state.drape.status = "locating deployment...".to_owned();
+        assert_eq!(
+            state.background_activity_label().as_deref(),
+            Some("locating deployment...")
+        );
     }
 
     #[test]

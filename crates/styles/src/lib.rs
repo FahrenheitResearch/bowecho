@@ -39,6 +39,9 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 pub struct StyleSettings {
     /// Schema version; 0 in old files is treated as 1.
     pub schema: u32,
+    /// Base map canvas style.
+    #[serde(skip_serializing_if = "is_default")]
+    pub map: MapStyleOverride,
     /// Hazard polygon overrides. Keys: family ids ("tornado",
     /// "severe-thunderstorm", "flash-flood", "flood", "special-marine",
     /// "snow-squall", "watch", "mesoscale-discussion", "local-storm-report",
@@ -74,6 +77,7 @@ impl Default for StyleSettings {
     fn default() -> Self {
         Self {
             schema: STYLES_SCHEMA,
+            map: MapStyleOverride::default(),
             hazards: BTreeMap::new(),
             hazard_global: HazardGlobalOverride::default(),
             spc: SpcStyleOverride::default(),
@@ -101,6 +105,14 @@ impl StyleSettings {
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_owned())
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MapStyleOverride {
+    /// Opaque canvas fill behind vector lines and while raster tiles load.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background_color: Option<Rgba>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -324,6 +336,11 @@ pub struct DrapeStyleOverride {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct MapStyle {
+    pub background_color: Rgba,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct PolygonStyle {
     pub stroke_color: Rgba,
     pub stroke_width: f32,
@@ -458,6 +475,14 @@ pub const HAZARD_ESCALATIONS: &[&str] = &[
     "severe-thunderstorm/destructive",
     "flash-flood/catastrophic",
 ];
+
+impl Default for MapStyle {
+    fn default() -> Self {
+        Self {
+            background_color: [7, 10, 14, 255],
+        }
+    }
+}
 
 /// Built-in stroke color per hazard key (family or escalation subkey).
 /// The damage-threat escalation follows the operational color language:
@@ -636,6 +661,7 @@ impl Default for DrapeStyle {
 /// shape-cache keys. Rebuild on every edit (`from_settings`); hold one in
 /// the app and hand `&` into draw code.
 pub struct StyleRegistry {
+    map: MapStyle,
     hazards: BTreeMap<String, PolygonStyle>,
     hazard_fallback: PolygonStyle,
     hazard_global: HazardGlobalStyle,
@@ -661,6 +687,14 @@ impl Default for StyleRegistry {
 
 impl StyleRegistry {
     pub fn from_settings(settings: &StyleSettings) -> Self {
+        let map_override = &settings.map;
+        let map_default = MapStyle::default();
+        let map = MapStyle {
+            background_color: map_override
+                .background_color
+                .unwrap_or(map_default.background_color),
+        };
+
         let mut hazards = BTreeMap::new();
         for family in HAZARD_FAMILIES {
             hazards.insert((*family).to_owned(), resolve_polygon(settings, family));
@@ -796,6 +830,7 @@ impl StyleRegistry {
         };
 
         Self {
+            map,
             hazards,
             hazard_fallback,
             hazard_global,
@@ -812,6 +847,10 @@ impl StyleRegistry {
             drapes,
             signature: signature_of(settings),
         }
+    }
+
+    pub fn map(&self) -> &MapStyle {
+        &self.map
     }
 
     /// Resolved polygon style for a hazard record. `family` accepts the
@@ -1111,6 +1150,7 @@ mod tests {
     #[test]
     fn default_registry_pins_legacy_constants() {
         let registry = StyleRegistry::default();
+        assert_eq!(registry.map().background_color, [7, 10, 14, 255]);
         // The operational escalation colors (Tornado Emergency purple, PDS
         // magenta, destructive SVR deep orange) and the base table.
         assert_eq!(
@@ -1152,6 +1192,22 @@ mod tests {
         assert_eq!(global.stroke_alpha, 205);
         assert_eq!(global.stroke_alpha_selected, 245);
         assert_eq!(global.fill_alpha, 24);
+    }
+
+    #[test]
+    fn map_background_override_round_trips_and_resolves() {
+        let mut settings = StyleSettings::default();
+        settings.map.background_color = Some([12, 24, 36, 255]);
+
+        let json = settings.to_json();
+        assert!(json.contains("background_color"));
+
+        let back = StyleSettings::from_json(&json);
+        assert_eq!(back, settings);
+        assert_eq!(
+            StyleRegistry::from_settings(&back).map().background_color,
+            [12, 24, 36, 255]
+        );
     }
 
     #[test]

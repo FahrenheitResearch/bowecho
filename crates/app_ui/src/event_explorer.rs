@@ -61,6 +61,21 @@ pub(crate) struct EventExplorerState {
     pub pending_autoplay: bool,
 }
 
+impl EventExplorerState {
+    pub(crate) fn fetching_day(&self) -> Option<NaiveDate> {
+        self.fetch.as_ref().map(|(day, _)| *day)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_fetch_for_test(
+        &mut self,
+        day: NaiveDate,
+        receiver: mpsc::Receiver<Result<EventDayData, String>>,
+    ) {
+        self.fetch = Some((day, receiver));
+    }
+}
+
 /// What a click on a tornado track resolves to (lat/lon pairs).
 #[derive(Clone, Debug)]
 pub(crate) struct EventTrackHit {
@@ -120,6 +135,22 @@ pub(crate) fn select_event_radar_indices(
     let primary = nearest_to(midpoint)?;
     let overlay = nearest_to(end).filter(|&index| index != primary);
     Some((primary, overlay))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EventTrackLoadPlan {
+    load_primary_archive: bool,
+    overlay_index: Option<usize>,
+}
+
+fn event_track_load_plan(
+    primary_cache_hit: bool,
+    overlay_index: Option<usize>,
+) -> EventTrackLoadPlan {
+    EventTrackLoadPlan {
+        load_primary_archive: !primary_cache_hit,
+        overlay_index,
+    }
 }
 
 /// Estimated time the tornado lifted: begin time plus path length over
@@ -344,17 +375,20 @@ impl crate::ViewerApp {
             // Track-click loop context (persisted): scans loaded beyond
             // the track window on each side — short tracks otherwise
             // land a loop of only a few frames (field request).
-            let mut pad = self.app_settings.event_pad_frames;
+            let mut pad = crate::normalized_event_pad_frames(self.app_settings.event_pad_frames);
+            ui.label("Track pad").on_hover_text(
+                "Tornado track clicks only. SPC report dots use the Archive Fetch N scans control.",
+            );
             ui.add(
                 egui::DragValue::new(&mut pad)
-                    .range(0..=40)
+                    .range(0..=crate::MAX_EVENT_PAD_FRAMES)
                     .speed(0.1)
                     .prefix("±")
                     .suffix(" scans"),
             )
             .on_hover_text(
                 "Clicking a tornado track loads this many extra archive scans before \
-                 touchdown and after lift, on top of the track's own window",
+                 touchdown and after lift. SPC report dots use Archive > Fetch N scans instead.",
             );
             if pad != self.app_settings.event_pad_frames {
                 self.app_settings.event_pad_frames = pad;
@@ -626,23 +660,29 @@ impl crate::ViewerApp {
             return;
         };
         self.selected_site_index = primary;
+        let primary_site_id = self.sites[primary].level2_id.clone();
         self.map_center_lat = (hit.begin.0 + hit.end.0) / 2.0;
         self.map_center_lon = (hit.begin.1 + hit.end.1) / 2.0;
         self.map_scale = self.map_scale.max(220.0);
         let end_time = hit.lift_time();
-        // The track time's RADAR date can differ from the SPC file date
-        // (12Z convention) — list the track's own calendar date.
-        self.archive_date_input = hit.time_utc.format("%Y-%m-%d").to_string();
-        self.event_explorer.pending_range = Some((hit.time_utc, end_time));
-        self.status = format!(
-            "Event jump: {} · loop {}–{}Z ±{} scans",
-            hit.label,
-            hit.time_utc.format("%H%M"),
-            end_time.format("%H%M"),
-            self.app_settings.event_pad_frames,
-        );
-        self.start_archive_listing(ctx);
-        if let Some(overlay_index) = overlay
+        let primary_cache_hit =
+            self.select_cached_event_frame(&primary_site_id, hit.time_utc, &hit.label, ctx);
+        let load_plan = event_track_load_plan(primary_cache_hit, overlay);
+        if load_plan.load_primary_archive {
+            // The track time's RADAR date can differ from the SPC file date
+            // (12Z convention) — list the track's own calendar date.
+            self.archive_date_input = hit.time_utc.format("%Y-%m-%d").to_string();
+            self.event_explorer.pending_range = Some((hit.time_utc, end_time));
+            self.status = format!(
+                "Event jump: {} · loop {}–{}Z ±{} scans",
+                hit.label,
+                hit.time_utc.format("%H%M"),
+                end_time.format("%H%M"),
+                crate::normalized_event_pad_frames(self.app_settings.event_pad_frames),
+            );
+            self.start_archive_listing(ctx);
+        }
+        if let Some(overlay_index) = load_plan.overlay_index
             && let Some(site) = self.sites.get(overlay_index).cloned()
         {
             self.start_radar_layer_event_load(site, end_time, ctx);
@@ -730,6 +770,7 @@ impl crate::ViewerApp {
                 Instant::now(),
                 &sender,
                 false,
+                true,
             ) {
                 Ok(Some(decoded)) => send_final(Ok(crate::DecodedLoadBatch::single(decoded))),
                 Ok(None) => send_final(Err("event volume had no displayable products".to_owned())),
@@ -785,6 +826,35 @@ mod tests {
         assert_eq!(
             select_event_radar_indices(&sites, (60.0, -150.0), (60.0, -150.0)),
             None
+        );
+    }
+
+    #[test]
+    fn event_track_load_plan_keeps_overlay_when_primary_is_cached() {
+        assert_eq!(
+            event_track_load_plan(true, Some(7)),
+            EventTrackLoadPlan {
+                load_primary_archive: false,
+                overlay_index: Some(7),
+            }
+        );
+        assert_eq!(
+            event_track_load_plan(true, None),
+            EventTrackLoadPlan {
+                load_primary_archive: false,
+                overlay_index: None,
+            }
+        );
+    }
+
+    #[test]
+    fn event_track_load_plan_lists_primary_when_cache_misses() {
+        assert_eq!(
+            event_track_load_plan(false, Some(3)),
+            EventTrackLoadPlan {
+                load_primary_archive: true,
+                overlay_index: Some(3),
+            }
         );
     }
 

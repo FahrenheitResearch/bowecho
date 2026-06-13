@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.21.2"
+version = "0.22.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FahrenheitResearch/bowecho"
@@ -12,7 +12,7 @@ repository = "https://github.com/FahrenheitResearch/bowecho"
 byteorder = "1.5"
 bzip2 = { version = "0.6", default-features = false, features = ["bzip2-sys"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-eframe = "0.34.3"
+eframe = { version = "0.34.3", features = ["glow"] }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }

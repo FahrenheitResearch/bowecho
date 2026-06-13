@@ -13,6 +13,24 @@ use eframe::egui;
 use crate::ui_theme::ACCENT_COLOR as KEY_COLOR;
 use crate::ui_theme::SUBHEAD_COLOR;
 
+const GUIDE_TOP_BAR_TEXT: &str = "The top bar holds one-shot actions on the left \
+    (Reset View, Reload, Map Only, Screenshot, Annotate) plus Workflows presets. \
+    On the right, the Windows menu opens every data window (Model, Radar \
+    overlays, Satellite, WoFS, FARM, 3D Volume, Sounding) beside this Guide. Status chips appear \
+    beside the menus. Map Only hides chrome for a clean capture; Tab or Esc \
+    brings it back.";
+const GUIDE_PANES_LABEL: &str = "Panes 1 / 2 / 3 / 4";
+const GUIDE_PANES_TEXT: &str = "— synced multi-pane grids (shared pan/zoom/tilt, \
+    independent product per pane; three-pane is REF / DVEL / CC for warning \
+    review, and quad defaults to REF / VEL / CC / ZDR). Click a pane to focus it \
+    — the sidebar and arrow keys then edit that pane; the main (top-left) pane \
+    edits everything.";
+const GUIDE_DEBUG_CASES_TEXT: &str = "— one-click repro launchers for known radar \
+    issues. The built-ins include KBMX Tuscaloosa 2011 22:15Z and 22:19Z DVEL \
+    scans, and they use the same archive loader as normal case review.";
+const GUIDE_CUSTOM_LAYER_ROW_LABEL: &str = "Layer row in Custom";
+const GUIDE_CUSTOM_OVERLAY_TEXT: &str = "add the nearest radar as an overlay layer. Manage overlays (opacity, refresh, promote, remove) in Custom.";
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum GuideSection {
     #[default]
@@ -44,7 +62,7 @@ impl GuideSection {
         match self {
             Self::GettingStarted => "Getting started",
             Self::Products => "Products explained",
-            Self::Layers => "Layers",
+            Self::Layers => "Custom & layers",
             Self::ModelData => "Model data & soundings",
             Self::Satellite => "Satellite",
             Self::Archive => "Archive & events",
@@ -188,20 +206,23 @@ fn getting_started(ui: &mut egui::Ui) {
     para(
         ui,
         "BowEcho is the radar map plus the sidebar on the right. The sidebar has five tabs: \
-         Radar (site, products, tilts, loop, algorithms, tools — live operations), Layers \
-         (everything drawn over the map, one uniform list), Severe (NWS warning polygons + \
+         Radar (site, products, tilts, loop, algorithms, tools — live operations), Custom \
+         (map layers, added overlays, analysis overlays, appearance), Severe (NWS warning polygons + \
          SPC outlooks and reports), Data (archive days, live poll feeds, the model store, \
-         local files), and \u{2699} Settings (display, color tables, hotkeys, performance). \
+         local files), and \u{2699} Settings (display, security and updates, alerts, hotkeys, performance). \
          Collapsible sections remember whether you left them open.",
     );
-    para(
+    para(ui, GUIDE_TOP_BAR_TEXT);
+
+    subhead(ui, "WORKFLOWS");
+    action(
         ui,
-        "The top bar holds one-shot actions on the left (Reset View, Reload, Screenshot, \
-         Annotate) and, on the right, the Windows \u{25be} menu — every data window (Model, \
-         Satellite, WoFS, FARM, 3D Volume, Sounding) opens from there — plus this Guide. \
-         Status chips (a green FARM LIVE chip when a mobile radar is plotting, an \
-         update-available notice) appear beside the menus. Tab hides all chrome for a clean \
-         capture; Tab or Esc brings it back.",
+        "Workflows \u{25be}",
+        "â€” applies one of the built-in operating setups: live severe, triple severe, \
+         velocity couplet, quad dual-pol, archive review, documentation, or model context. \
+         The current workflow marker is only a label for the latest preset; manual tweaks \
+         stay yours, Restore previous setup undoes the latest preset's setup changes, and Clear \
+         marker hides only the label.",
     );
 
     subhead(ui, "PICK A RADAR");
@@ -259,13 +280,7 @@ fn getting_started(ui: &mut egui::Ui) {
     );
 
     subhead(ui, "PANES & THE MAP");
-    action(
-        ui,
-        "Panes 1 / 2 / 4",
-        "— synced multi-pane grids (shared pan/zoom/tilt, independent product per pane; the \
-         quad defaults to REF / VEL / CC / ZDR). Click a pane to focus it — the sidebar and \
-         arrow keys then edit that pane; the main (top-left) pane edits everything.",
-    );
+    action(ui, GUIDE_PANES_LABEL, GUIDE_PANES_TEXT);
     para(
         ui,
         "Drag pans, the scroll wheel zooms about the cursor, Reset View (top bar) recenters on \
@@ -289,7 +304,7 @@ fn products(ui: &mut egui::Ui) {
         ui,
         "REF — Reflectivity (dBZ)",
         "precipitation intensity. The default Analyst Reflectivity HD palette keeps magenta \
-         for \u{2265}65 dBZ (hail cores); more palettes in Settings \u{25b8} Color tables.",
+         for \u{2265}65 dBZ (hail cores); more palettes in Custom \u{25b8} Appearance.",
         "the workhorse. Watch for bright-banding near the melting layer and ground clutter \
          close to the radar.",
         "",
@@ -493,16 +508,17 @@ fn products(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 2b. Layers — the rail
+// 2b. Custom — layers and appearance
 
 fn layers(ui: &mut egui::Ui) {
-    ui.heading("Layers");
+    ui.heading("Custom");
     para(
         ui,
-        "The Layers tab is one uniform list of everything drawn over the map: the primary \
-         radar, overlay radars, rotation tracks + TDS, GOES, model and mesoanalysis fields, \
-         WoFS and FARM drapes, surface obs, lightning, SPC outlooks and reports, warning \
-         polygons, and placefiles. Layers draw bottom-to-top in list order.",
+        "The Custom tab groups map layers, added overlays, analysis overlays, and appearance. \
+         Map layers include the primary radar, overlay radars, rotation tracks + TDS, GOES, \
+         model and mesoanalysis fields, WoFS and FARM drapes, surface obs, lightning, SPC \
+         outlooks and reports, warning polygons, and placefiles. Layers draw bottom-to-top \
+         in list order.",
     );
 
     subhead(ui, "THE ROW");
@@ -519,8 +535,15 @@ fn layers(ui: &mut egui::Ui) {
         "\u{2699} gear",
         "— opens the layer's owning surface: the Model/Satellite/WoFS/FARM window for window \
          layers, the Severe tab for SPC and warnings, or a small popover for layers with \
-         only a few options (surface-obs networks, lightning). Appearance controls land in \
-         these popovers next.",
+         only a few options (surface-obs networks, lightning). Broader appearance controls \
+         live in Custom ▸ Appearance.",
+    );
+    para(
+        ui,
+        "Custom \u{25b8} Appearance also owns deep visual tuning: map backdrop, warning-polygon \
+         fill/width, per-family polygon colors and dash style, radar-age ring/marker arc/chip \
+         colors and thresholds, radar product color tables, and built-in appearance profiles \
+         such as GR2-classic, Chase dark, and Accessibility.",
     );
     action(
         ui,
@@ -533,7 +556,7 @@ fn layers(ui: &mut egui::Ui) {
     subhead(ui, "ANALYSIS (OA)");
     para(
         ui,
-        "At the bottom of the tab: compute that EMITS layers. Analyze obs runs a Bratseth \
+        "In Analysis overlays: compute that EMITS layers. Analyze obs runs a Bratseth \
          objective analysis of the model surface field against live obs; Compute composites \
          builds the full SPC mesoanalysis suite (SCP, STP, SHIP, EHI, …) — each field then \
          adds as an instant \"(OA)\" layer, also reachable from + Add layer \u{25b8} \
@@ -548,7 +571,7 @@ fn layers(ui: &mut egui::Ui) {
     para(
         ui,
         "Everything that used to hide in the Radar tab's Layers fold lives here now. The \
-         Radar tab keeps a one-line \"Layers: N \u{2192}\" link; Poll-URL feeds moved to the \
+         Radar tab keeps a one-line \"Custom: N layers \u{2192}\" link; Poll-URL feeds moved to the \
          Data tab (they replace the volume source — acquisition, not a layer); SPC \
          day/kind config moved to the Severe tab.",
     );
@@ -571,7 +594,7 @@ fn model_data(ui: &mut egui::Ui) {
     action(
         ui,
         "Fetch latest",
-        "(Layers row) — ingests the freshest init of the picked model (GFS automatically \
+        "(Custom row) — ingests the freshest init of the picked model (GFS automatically \
          when the radar sits outside HRRR coverage), sounding-grade hours bracketing now, \
          then prunes the store to the newest runs. About a minute, throttled below \
          the UI so frames never stutter.",
@@ -598,7 +621,7 @@ fn model_data(ui: &mut egui::Ui) {
     );
     action(
         ui,
-        "Layer row in Layers",
+        GUIDE_CUSTOM_LAYER_ROW_LABEL,
         "— the checkbox hides the layer without losing it (a hidden layer still feeds the \
          inspector and Alt+click soundings); \u{25c0} \u{25b6} step the forecast hour; the \
          slider sets layer opacity; \u{2715} removes it. The Radar opacity slider above lets \
@@ -677,7 +700,7 @@ fn satellite(ui: &mut egui::Ui) {
         ui,
         "Show on radar map",
         "— puts the current frame under the radar as a map layer. Opacity and removal live in \
-         the Layers tab's GOES row.",
+         the Custom tab's GOES row.",
     );
 
     subhead(ui, "BAND PICKS");
@@ -760,6 +783,12 @@ fn archive(ui: &mut egui::Ui) {
          at the lowest tilt — and when the track's END is closer to a different radar, that \
          site loads as a second radar overlay at the event time.",
     );
+    subhead(ui, "DEBUG CASES");
+    action(
+        ui,
+        "\u{2699} Settings \u{25b8} Debug cases",
+        GUIDE_DEBUG_CASES_TEXT,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -797,7 +826,7 @@ fn tools(ui: &mut egui::Ui) {
         ui,
         "Ctrl+right-click",
         "— adds the nearest radar as an extra overlay layer instead of switching, for \
-         multi-radar mosaics. Manage overlays (opacity, refresh, promote, remove) in Layers.",
+         multi-radar mosaics. Manage overlays (opacity, refresh, promote, remove) in Custom.",
     );
 
     subhead(ui, "VROT TOOL");
@@ -920,11 +949,7 @@ fn shortcuts(ui: &mut egui::Ui) {
         "right-click",
         "\"Lowest beam here\" menu + jump to the nearest site",
     );
-    key_row(
-        ui,
-        "Ctrl+right-click",
-        "add the nearest radar as an overlay layer",
-    );
+    key_row(ui, "Ctrl+right-click", GUIDE_CUSTOM_OVERLAY_TEXT);
     key_row(ui, "Shift+click", "pin / release the inspector card");
     key_row(
         ui,
@@ -1033,4 +1058,34 @@ fn sources(ui: &mut egui::Ui) {
         "Deeper write-ups live in the repo: docs/products-guide.md and \
          docs/hail-wind-algo-spec.md.",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guide_copy_mentions_current_navigation_and_repro_surfaces() {
+        assert_eq!(GuideSection::Layers.label(), "Custom & layers");
+        assert!(GUIDE_TOP_BAR_TEXT.contains("Map Only"));
+        assert!(GUIDE_TOP_BAR_TEXT.contains("Workflows"));
+        assert!(GUIDE_TOP_BAR_TEXT.contains("Radar overlays"));
+        let guide_src = include_str!("guide.rs");
+        assert!(guide_src.contains("security and updates"));
+        assert_eq!(GUIDE_PANES_LABEL, "Panes 1 / 2 / 3 / 4");
+        assert!(GUIDE_PANES_TEXT.contains("three-pane"));
+        assert!(GUIDE_DEBUG_CASES_TEXT.contains("Tuscaloosa"));
+        assert_eq!(GUIDE_CUSTOM_LAYER_ROW_LABEL, "Layer row in Custom");
+        assert!(GUIDE_CUSTOM_OVERLAY_TEXT.contains("Custom"));
+        assert!(guide_src.contains("Custom: N layers"));
+        assert!(guide_src.contains("warning-polygon"));
+        assert!(guide_src.contains("radar-age ring/marker arc/chip"));
+        assert!(guide_src.contains("appearance profiles"));
+        let stale_color_tables = ["Settings", "\u{25b8}", "Color tables"].join(" ");
+        assert!(!guide_src.contains(&stale_color_tables));
+        let stale_link: String = ['"', 'L', 'a', 'y', 'e', 'r', 's', ':', ' ', 'N']
+            .into_iter()
+            .collect();
+        assert!(!guide_src.contains(&stale_link));
+    }
 }

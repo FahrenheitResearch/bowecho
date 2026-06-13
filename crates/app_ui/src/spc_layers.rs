@@ -27,7 +27,7 @@
 //! paths live. The current year's file does not exist yet, so for recent
 //! days the torn reports stand in as zero-length segments.
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc};
 use eframe::egui;
 use std::time::Instant;
 
@@ -58,6 +58,7 @@ pub struct SpcData {
     pub fetched_at: Option<Instant>,
 }
 
+#[derive(Clone)]
 #[allow(dead_code)] // time/magnitude/location/remark feed the hover card next
 pub struct StormReport {
     pub kind: ReportKind,
@@ -556,6 +557,24 @@ pub fn fetch_event_day(convective: NaiveDate) -> Result<EventDayData, String> {
     Ok(data)
 }
 
+fn live_outlook_urls(day: u8, kind: &str, now: DateTime<Utc>) -> Vec<String> {
+    let live_url =
+        format!("https://www.spc.noaa.gov/products/outlook/day{day}otlk_{kind}.lyr.geojson");
+    if day == 1 && (1..12).contains(&now.hour()) {
+        let y = now.year();
+        let m = now.month();
+        let d = now.day();
+        vec![
+            format!(
+                "https://www.spc.noaa.gov/products/outlook/archive/{y}/day1otlk_{y}{m:02}{d:02}_0100_{kind}.lyr.geojson"
+            ),
+            live_url,
+        ]
+    } else {
+        vec![live_url]
+    }
+}
+
 /// Blocking fetch of everything enabled — worker thread only.
 /// `archive_date`: when viewing archive data, fetch THAT day's outlook
 /// from SPC's archive (latest issuance found, walking 2000 -> 1630 ->
@@ -572,10 +591,9 @@ pub fn fetch_spc(
     };
     for kind in outlook_kinds {
         let text = match archive_date {
-            None => data_source::fetch_text(&format!(
-                "https://www.spc.noaa.gov/products/outlook/day{day}otlk_{kind}.lyr.geojson"
-            ))
-            .ok(),
+            None => live_outlook_urls(day, kind, Utc::now())
+                .into_iter()
+                .find_map(|url| data_source::fetch_text(&url).ok()),
             Some((y, m, d)) => ["2000", "1630", "1300", "1200", "0100"]
                 .iter()
                 .find_map(|issue| {
@@ -622,6 +640,32 @@ mod tests {
         // Base colors, fully opaque — alphas are a draw-time style concern.
         assert_eq!(parsed[0].fill, egui::Color32::from_rgb(0xFF, 0xE0, 0x66));
         assert_eq!(parsed[0].stroke, egui::Color32::from_rgb(0xDD, 0xAA, 0x00));
+    }
+
+    #[test]
+    fn live_day1_prefers_valid_now_0100_outlook_before_12z() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 13, 6, 30, 0).unwrap();
+        let urls = live_outlook_urls(1, "cat", now);
+
+        assert_eq!(
+            urls[0],
+            "https://www.spc.noaa.gov/products/outlook/archive/2026/day1otlk_20260613_0100_cat.lyr.geojson"
+        );
+        assert_eq!(
+            urls[1],
+            "https://www.spc.noaa.gov/products/outlook/day1otlk_cat.lyr.geojson"
+        );
+    }
+
+    #[test]
+    fn live_day1_uses_headline_outlook_after_12z() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 13, 12, 0, 0).unwrap();
+        let urls = live_outlook_urls(1, "cat", now);
+
+        assert_eq!(
+            urls,
+            vec!["https://www.spc.noaa.gov/products/outlook/day1otlk_cat.lyr.geojson"]
+        );
     }
 
     #[test]

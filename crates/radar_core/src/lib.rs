@@ -128,11 +128,12 @@ pub struct MergeReport {
 ///   incoming grid is dropped (counted in
 ///   [`MergeReport::moment_collisions`]); otherwise the move is counted in
 ///   [`MergeReport::merged_moments`].
-/// - A matched cut whose radial/gate geometry differs (radial count,
-///   per-radial azimuth beyond the same tolerance, or per-radial gate
-///   layout) is NOT merged: moment-grid rows index into the cut's radial
-///   list, so mixing geometries would scramble the display. The whole cut is
-///   dropped and counted in [`MergeReport::skipped_geometry`].
+/// - A matched cut whose radial geometry differs (radial count or per-radial
+///   azimuth beyond the same tolerance) is NOT merged: moment-grid rows index
+///   into the cut's radial list, so mixing azimuths would scramble the
+///   display. Different gate ranges are allowed because every [`MomentGrid`]
+///   carries its own [`GateRange`] and render/readout code uses the selected
+///   grid's range. Rejected cuts are counted in [`MergeReport::skipped_geometry`].
 /// - Unmatched cuts are unioned in, and the final cut list is sorted by
 ///   elevation (stable: equal elevations keep first-part-then-arrival
 ///   order).
@@ -165,10 +166,11 @@ pub fn merge_radar_volumes(parts: Vec<RadarVolume>) -> Result<(RadarVolume, Merg
                 base.cuts.push(cut);
                 continue;
             };
-            if !cut_geometry_matches(existing, &cut) {
+            if !cut_radials_match(existing, &cut) {
                 report.skipped_geometry += 1;
                 continue;
             }
+            merge_radial_metadata(existing, &cut);
             for (moment, grid) in cut.moments {
                 match existing.moments.entry(moment) {
                     std::collections::btree_map::Entry::Vacant(slot) => {
@@ -188,15 +190,22 @@ pub fn merge_radar_volumes(parts: Vec<RadarVolume>) -> Result<(RadarVolume, Merg
     Ok((base, report))
 }
 
-/// `true` when two cuts describe the same radial/gate geometry, so moment
+/// `true` when two cuts describe the same radial azimuth geometry, so moment
 /// grids whose rows index one cut's radials are valid against the other's.
-fn cut_geometry_matches(a: &ElevationCut, b: &ElevationCut) -> bool {
+fn cut_radials_match(a: &ElevationCut, b: &ElevationCut) -> bool {
     a.radials.len() == b.radials.len()
         && a.radials.iter().zip(&b.radials).all(|(ra, rb)| {
             azimuth_difference_deg(ra.azimuth_deg, rb.azimuth_deg)
                 <= CUT_ELEVATION_MATCH_TOLERANCE_DEG
-                && ra.gate_range == rb.gate_range
         })
+}
+
+fn merge_radial_metadata(existing: &mut ElevationCut, incoming: &ElevationCut) {
+    for (base, other) in existing.radials.iter_mut().zip(&incoming.radials) {
+        if base.nyquist_velocity_mps.is_none() {
+            base.nyquist_velocity_mps = other.nyquist_velocity_mps;
+        }
+    }
 }
 
 /// Smallest absolute angular difference, wrap-aware (359.99° vs 0.01° is
@@ -1189,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_skips_matched_cut_with_different_gate_layout() {
+    fn merge_accepts_matched_cut_with_different_gate_layout() {
         let a = merge_volume(
             "SKJAV",
             1_000,
@@ -1198,12 +1207,24 @@ mod tests {
         let mut stretched = merge_cut(0.5, MomentType::Velocity, 2.0);
         for radial in &mut stretched.radials {
             radial.gate_range.gate_spacing_m = 1_000;
+            radial.nyquist_velocity_mps = Some(18.5);
+        }
+        for grid in stretched.moments.values_mut() {
+            grid.gate_range.gate_spacing_m = 1_000;
         }
         let b = merge_volume("SKJAV", 1_000, vec![stretched]);
         let (merged, report) = merge_radar_volumes(vec![a, b]).unwrap();
 
-        assert!(!merged.cuts[0].moments.contains_key(&MomentType::Velocity));
-        assert_eq!(report.skipped_geometry, 1);
+        let cut = &merged.cuts[0];
+        assert!(cut.moments.contains_key(&MomentType::Velocity));
+        assert_eq!(
+            cut.moments[&MomentType::Velocity].gate_range.gate_spacing_m,
+            1_000,
+            "moment grid keeps its own range; radial range is only azimuth metadata"
+        );
+        assert_eq!(cut.radials[0].nyquist_velocity_mps, Some(18.5));
+        assert_eq!(report.skipped_geometry, 0);
+        assert_eq!(report.merged_moments, 1);
     }
 
     #[test]

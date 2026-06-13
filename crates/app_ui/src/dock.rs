@@ -1,6 +1,7 @@
 //! Dockable workspace: the egui_tiles tile tree that hosts the radar map
-//! pane plus any DOCKED viewer panes (Sounding / WoFS / FARM / Satellite /
-//! Model / 3D). Crate evaluation + integration design: docs/docking-spike.md.
+//! pane plus any DOCKED viewer panes (Sounding / Radar overlays / WoFS /
+//! FARM / Satellite / Model / 3D). Crate evaluation + integration design:
+//! docs/docking-spike.md.
 //!
 //! Division of labor:
 //! - The tree owns LAYOUT ONLY. Heavy viewer state (workers, textures,
@@ -51,6 +52,7 @@ pub enum WorkspacePane {
     /// share one geo transform + focus logic the sidebar edits.
     Map,
     Sounding,
+    RadarOverlays,
     Wofs,
     Farm,
     Satellite,
@@ -60,8 +62,9 @@ pub enum WorkspacePane {
 
 impl WorkspacePane {
     /// Every dockable viewer (everything but the map anchor).
-    pub const VIEWERS: [Self; 6] = [
+    pub const VIEWERS: [Self; 7] = [
         Self::Sounding,
+        Self::RadarOverlays,
         Self::Wofs,
         Self::Farm,
         Self::Satellite,
@@ -74,6 +77,7 @@ impl WorkspacePane {
         match self {
             Self::Map => "Radar",
             Self::Sounding => "Sounding",
+            Self::RadarOverlays => "Radar overlays",
             Self::Wofs => "WoFS",
             Self::Farm => "FARM",
             Self::Satellite => "Satellite",
@@ -387,6 +391,12 @@ mod tests {
         for viewer in WorkspacePane::VIEWERS {
             assert!(!workspace.is_docked(viewer));
         }
+    }
+
+    #[test]
+    fn radar_overlays_is_a_first_class_viewer_pane() {
+        assert!(WorkspacePane::VIEWERS.contains(&WorkspacePane::RadarOverlays));
+        assert_eq!(WorkspacePane::RadarOverlays.tab_title(), "Radar overlays");
     }
 
     #[test]

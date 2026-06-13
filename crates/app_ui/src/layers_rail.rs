@@ -15,8 +15,10 @@ use eframe::egui;
 
 use crate::{
     LayerRowGear, LayerRowOpacity, LayerRowOrder, LayerRowRemove, LayerRowSpec, LayerRowVis,
-    PlacefileSlot, PollSource, RadarSite, SidebarTab, ViewerApp, dock, format_site_label,
-    intl_provider_label, layer_row, mesoanalysis, oa_derived,
+    PlacefileSlot, PollSource, RadarSite, SidebarTab, ViewerApp, custom_poll_entry_label,
+    custom_poll_entry_lat_lon, custom_poll_links_from_gis, dock, format_site_label,
+    intl_provider_label, layer_row, mesoanalysis, normalized_poll_url, oa_derived,
+    parse_custom_poll_marker_inputs, poll_url_name, poll_urls_match,
 };
 
 impl ViewerApp {
@@ -1019,19 +1021,15 @@ impl ViewerApp {
                     );
                     let label = if self.poll_active { "Stop" } else { "Start" };
                     if ui.button(label).clicked() {
-                        self.poll_active = !self.poll_active;
-                        self.poll_last_file = None;
-                        self.poll_next = None;
                         if self.poll_active {
-                            self.set_custom_url_poll_source();
-                            // Drop any in-flight auto-refresh load: it
-                            // would land after the first poll install and
-                            // wipe the polled frames.
-                            self.load_receiver = None;
-                        }
-                        if self.poll_active && self.app_settings.poll_url != self.poll_url {
-                            self.app_settings.poll_url = self.poll_url.clone();
-                            let _ = self.app_settings.save();
+                            self.poll_active = false;
+                            self.poll_last_file = None;
+                            self.poll_next = None;
+                        } else if normalized_poll_url(&self.poll_url).is_empty() {
+                            self.status = "Poll URL: enter a URL or choose a saved link".to_owned();
+                        } else {
+                            let url = self.poll_url.clone();
+                            self.start_known_feed_poll(&url);
                         }
                     }
                     if self.poll_active && matches!(self.poll_source, PollSource::CustomUrl(_)) {
@@ -1042,14 +1040,283 @@ impl ViewerApp {
                         );
                     }
                 });
+        self.custom_poll_links_section(ui, ctx);
         self.intl_feeds_row(ui, ctx);
     }
 
     /// Start the shared poller on a known research-feed poll root — the
     /// Feeds-menu click path, reused verbatim by the community map
     /// markers so there is exactly one custom-URL start sequence.
+    fn custom_poll_links_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Custom links").on_hover_text(
+                "Saved GR2A-style poll roots for private/mobile radars. Each saved link can also carry a marker position, drawn as a red dot on the map.",
+            );
+            if ui
+                .button("Use loaded")
+                .on_hover_text("Fill label/site/lat/lon from the currently loaded radar volume")
+                .clicked()
+            {
+                if let Some(volume) = &self.volume {
+                    self.custom_poll_label_input = volume.site.name.clone().unwrap_or_else(|| {
+                        if volume.site.id.is_empty() {
+                            poll_url_name(&self.poll_url)
+                        } else {
+                            volume.site.id.clone()
+                        }
+                    });
+                    self.custom_poll_site_input = volume.site.id.clone();
+                    if let Some((lat, lon)) = self.loaded_volume_location() {
+                        self.custom_poll_lat_input = format!("{lat:.5}");
+                        self.custom_poll_lon_input = format!("{lon:.5}");
+                    }
+                } else {
+                    self.status = "Custom poll link: no loaded radar to copy".to_owned();
+                }
+            }
+            if ui
+                .button("Map center")
+                .on_hover_text("Fill lat/lon from the current map center")
+                .clicked()
+            {
+                self.custom_poll_lat_input = format!("{:.5}", self.map_center_lat);
+                self.custom_poll_lon_input = format!("{:.5}", self.map_center_lon);
+            }
+            #[cfg(any(windows, target_os = "macos"))]
+            if ui
+                .button("Import GIS…")
+                .on_hover_text(
+                    "Import GR customradars.gis/radars.gis rows. The current Poll URL is used as the base root; use {site} in the URL to control per-site expansion.",
+                )
+                .clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_title("Import GR custom radar GIS")
+                    .add_filter("GR radar GIS", &["gis", "txt"])
+                    .pick_file()
+            {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => self.import_custom_poll_gis_text(&text),
+                    Err(err) => {
+                        self.status = format!("Custom GIS import: {err}");
+                    }
+                }
+                ctx.request_repaint();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.custom_poll_label_input)
+                    .hint_text("label")
+                    .desired_width(86.0),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.custom_poll_site_input)
+                    .hint_text("site")
+                    .desired_width(58.0),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.custom_poll_lat_input)
+                    .hint_text("lat")
+                    .desired_width(62.0),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.custom_poll_lon_input)
+                    .hint_text("lon")
+                    .desired_width(68.0),
+            );
+            if ui
+                .button("Save")
+                .on_hover_text(
+                    "Save the current Poll URL. Leave lat/lon blank for a link-only entry; fill both to draw a red map marker.",
+                )
+                .clicked()
+            {
+                self.save_custom_poll_link_from_inputs();
+                ctx.request_repaint();
+            }
+        });
+
+        let mut start_index = None;
+        let mut edit_index = None;
+        let mut remove_index = None;
+        if self.app_settings.custom_poll_links.is_empty() {
+            ui.weak("No custom poll links saved yet.");
+        } else {
+            egui::ScrollArea::vertical()
+                .id_salt("custom_poll_links")
+                .max_height(118.0)
+                .show(ui, |ui| {
+                    for (index, entry) in self.app_settings.custom_poll_links.iter().enumerate() {
+                        let label = custom_poll_entry_label(entry);
+                        let site_id = entry.site_id.trim();
+                        let coords = custom_poll_entry_lat_lon(entry)
+                            .map(|(lat, lon)| format!(" {lat:.3}, {lon:.3}"))
+                            .unwrap_or_else(|| " no marker".to_owned());
+                        let active = self.poll_active
+                            && matches!(self.poll_source, PollSource::CustomUrl(_))
+                            && poll_urls_match(&self.poll_url, &entry.poll_url);
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 116, 118),
+                                if active { "●" } else { "○" },
+                            );
+                            let title = if site_id.is_empty() {
+                                label.clone()
+                            } else {
+                                format!("{site_id} {label}")
+                            };
+                            ui.label(title)
+                                .on_hover_text(format!("{}\n{}", entry.poll_url, coords));
+                            if ui.button("Poll").clicked() {
+                                start_index = Some(index);
+                            }
+                            if ui.button("Edit").clicked() {
+                                edit_index = Some(index);
+                            }
+                            if ui
+                                .button("×")
+                                .on_hover_text("Remove this custom link")
+                                .clicked()
+                            {
+                                remove_index = Some(index);
+                            }
+                        });
+                    }
+                });
+        }
+
+        if let Some(index) = start_index {
+            self.start_custom_poll_link(index);
+        }
+        if let Some(index) = edit_index
+            && let Some(entry) = self.app_settings.custom_poll_links.get(index)
+        {
+            self.poll_url = entry.poll_url.clone();
+            self.custom_poll_label_input = entry.label.clone();
+            self.custom_poll_site_input = entry.site_id.clone();
+            if let Some((lat, lon)) = custom_poll_entry_lat_lon(entry) {
+                self.custom_poll_lat_input = format!("{lat:.5}");
+                self.custom_poll_lon_input = format!("{lon:.5}");
+            } else {
+                self.custom_poll_lat_input.clear();
+                self.custom_poll_lon_input.clear();
+            }
+        }
+        if let Some(index) = remove_index
+            && index < self.app_settings.custom_poll_links.len()
+        {
+            let label = custom_poll_entry_label(&self.app_settings.custom_poll_links[index]);
+            self.app_settings.custom_poll_links.remove(index);
+            let _ = self.app_settings.save();
+            self.status = format!("Removed custom poll link {label}");
+            ctx.request_repaint();
+        }
+    }
+
+    fn save_custom_poll_link_from_inputs(&mut self) {
+        let url = normalized_poll_url(&self.poll_url);
+        if url.is_empty() {
+            self.status = "Custom poll link: enter a Poll URL first".to_owned();
+            return;
+        }
+        let (lat_e6, lon_e6) = match parse_custom_poll_marker_inputs(
+            &self.custom_poll_lat_input,
+            &self.custom_poll_lon_input,
+        ) {
+            Ok(coords) => coords,
+            Err(message) => {
+                self.status = message.to_owned();
+                return;
+            }
+        };
+        let site_id = self.custom_poll_site_input.trim().to_owned();
+        let label = self.custom_poll_label_input.trim().to_owned();
+        let entry = settings::CustomPollLinkEntry {
+            label: if label.is_empty() {
+                poll_url_name(&url)
+            } else {
+                label
+            },
+            site_id: site_id.clone(),
+            lat_e6,
+            lon_e6,
+            poll_url: url.clone(),
+        };
+        let replace_index = self
+            .app_settings
+            .custom_poll_links
+            .iter()
+            .position(|existing| {
+                poll_urls_match(&existing.poll_url, &url)
+                    || (!site_id.is_empty()
+                        && existing
+                            .site_id
+                            .trim()
+                            .eq_ignore_ascii_case(site_id.as_str()))
+            });
+        let label = custom_poll_entry_label(&entry);
+        if let Some(index) = replace_index {
+            self.app_settings.custom_poll_links[index] = entry;
+            self.status = format!("Updated custom poll link {label}");
+        } else {
+            self.app_settings.custom_poll_links.push(entry);
+            self.status = format!("Saved custom poll link {label}");
+        }
+        self.poll_url = url;
+        self.set_custom_url_poll_source();
+        let _ = self.app_settings.save();
+    }
+
+    fn import_custom_poll_gis_text(&mut self, text: &str) {
+        let base_url = self.poll_url.clone();
+        let entries = match custom_poll_links_from_gis(text, &base_url) {
+            Ok(entries) => entries,
+            Err(message) => {
+                self.status = format!("Custom GIS import: {message}");
+                return;
+            }
+        };
+        let imported = entries.len();
+        let mut updated = 0usize;
+        for entry in entries {
+            if self.upsert_custom_poll_link(entry) {
+                updated += 1;
+            }
+        }
+        let added = imported.saturating_sub(updated);
+        let _ = self.app_settings.save();
+        self.status = format!("Custom GIS import: {added} added, {updated} updated");
+    }
+
+    fn upsert_custom_poll_link(&mut self, entry: settings::CustomPollLinkEntry) -> bool {
+        let url = normalized_poll_url(&entry.poll_url);
+        let site_id = entry.site_id.trim().to_owned();
+        let replace_index = self
+            .app_settings
+            .custom_poll_links
+            .iter()
+            .position(|existing| {
+                poll_urls_match(&existing.poll_url, &url)
+                    || (!site_id.is_empty()
+                        && existing
+                            .site_id
+                            .trim()
+                            .eq_ignore_ascii_case(site_id.as_str()))
+            });
+        let mut entry = entry;
+        entry.poll_url = url;
+        if let Some(index) = replace_index {
+            self.app_settings.custom_poll_links[index] = entry;
+            true
+        } else {
+            self.app_settings.custom_poll_links.push(entry);
+            false
+        }
+    }
+
     pub(crate) fn start_known_feed_poll(&mut self, url: &str) {
-        self.poll_url = url.to_owned();
+        self.poll_url = normalized_poll_url(url);
         self.set_custom_url_poll_source();
         self.poll_active = true;
         self.poll_last_file = None;
@@ -1065,6 +1332,7 @@ impl ViewerApp {
     /// Start/known-feed click). Switching away from a different source
     /// drops a still-in-flight tick so it can't install under the new one.
     fn set_custom_url_poll_source(&mut self) {
+        self.poll_url = normalized_poll_url(&self.poll_url);
         let source = PollSource::CustomUrl(self.poll_url.clone());
         if self.poll_source != source {
             self.poll_rx = None;

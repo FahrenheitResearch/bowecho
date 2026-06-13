@@ -50,6 +50,8 @@
 //! pseudo-station (gridded composites, not polar volumes) and is also
 //! excluded.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, NaiveDateTime, Utc};
 
 use super::listing::fnv1a64;
@@ -477,6 +479,18 @@ impl OrdFile {
             .unwrap_or(f32::MAX)
     }
 
+    fn elevation_tokens(&self) -> impl Iterator<Item = &str> {
+        self.elevations.split('_').filter(|token| !token.is_empty())
+    }
+
+    fn has_reflectivity(&self) -> bool {
+        self.moments.split('_').any(is_reflectivity_token)
+    }
+
+    fn has_velocity(&self) -> bool {
+        self.moments.split('_').any(is_velocity_token)
+    }
+
     /// Merge-order rank per the [`FramePlan`] contract (reflectivity
     /// first): cleaned reflectivity, then unfiltered reflectivity, then
     /// other moments, then velocity/spectrum-width-only files.
@@ -528,35 +542,9 @@ fn plan_from_keys(site_id: &str, kind: ObjectKind, keys: &[String]) -> Result<Fr
         .iter()
         .filter_map(|key| OrdFile::parse(key, site_id))
         .collect();
-    let anchor = files
-        .iter()
-        .map(|file| file.stamp)
-        .max()
+    let anchor = select_frame_anchor(&files, kind)
         .ok_or_else(|| format!("ORD '{site_id}': no parseable volume keys in the listing"))?;
-    let window_start = anchor - chrono::Duration::minutes(CYCLE_WINDOW_MINUTES);
-
-    let mut chosen: Vec<OrdFile> = Vec::new();
-    for file in &files {
-        if file.stamp <= window_start || file.stamp > anchor {
-            continue;
-        }
-        let group = chosen.iter_mut().find(|other| match kind {
-            ObjectKind::Pvol => other.moments == file.moments,
-            ObjectKind::Scan => {
-                other.moments == file.moments && other.elevations == file.elevations
-            }
-        });
-        match group {
-            Some(other) => {
-                let newer = (file.stamp, file.elevation_count(), &file.key)
-                    > (other.stamp, other.elevation_count(), &other.key);
-                if newer {
-                    *other = file.clone();
-                }
-            }
-            None => chosen.push(file.clone()),
-        }
-    }
+    let mut chosen = choose_files_for_anchor(&files, kind, anchor);
 
     // Redundant unfiltered reflectivity: parts carrying ONLY TH/TV and
     // fully shadowed by a DBZH part over the same elevations add bytes
@@ -602,6 +590,86 @@ fn plan_from_keys(site_id: &str, kind: ObjectKind, keys: &[String]) -> Result<Fr
         merge: parts.len() > 1,
         parts,
     })
+}
+
+fn select_frame_anchor(files: &[OrdFile], kind: ObjectKind) -> Option<NaiveDateTime> {
+    let mut anchors: Vec<NaiveDateTime> = files.iter().map(|file| file.stamp).collect();
+    anchors.sort_unstable();
+    anchors.dedup();
+    anchors.reverse();
+
+    let mut fallback = None;
+    for anchor in anchors {
+        let chosen = choose_files_for_anchor(files, kind, anchor);
+        if chosen.is_empty() {
+            continue;
+        }
+        fallback.get_or_insert(anchor);
+        if chosen_has_reflectivity_and_velocity(&chosen) {
+            return Some(anchor);
+        }
+    }
+    fallback
+}
+
+fn choose_files_for_anchor(
+    files: &[OrdFile],
+    kind: ObjectKind,
+    anchor: NaiveDateTime,
+) -> Vec<OrdFile> {
+    let window_start = anchor - chrono::Duration::minutes(CYCLE_WINDOW_MINUTES);
+    let mut chosen: Vec<OrdFile> = Vec::new();
+    for file in files {
+        if file.stamp <= window_start || file.stamp > anchor {
+            continue;
+        }
+        let group = chosen.iter_mut().find(|other| match kind {
+            ObjectKind::Pvol => other.moments == file.moments,
+            ObjectKind::Scan => {
+                other.moments == file.moments && other.elevations == file.elevations
+            }
+        });
+        match group {
+            Some(other) => {
+                let newer = (file.stamp, file.elevation_count(), &file.key)
+                    > (other.stamp, other.elevation_count(), &other.key);
+                if newer {
+                    *other = file.clone();
+                }
+            }
+            None => chosen.push(file.clone()),
+        }
+    }
+    chosen
+}
+
+fn chosen_has_reflectivity_and_velocity(files: &[OrdFile]) -> bool {
+    let mut reflectivity_elevations = BTreeSet::new();
+    let mut velocity_elevations = BTreeSet::new();
+    for file in files {
+        let has_reflectivity = file.has_reflectivity();
+        let has_velocity = file.has_velocity();
+        if has_reflectivity && has_velocity {
+            return true;
+        }
+        if has_reflectivity {
+            reflectivity_elevations.extend(file.elevation_tokens().map(str::to_owned));
+        }
+        if has_velocity {
+            velocity_elevations.extend(file.elevation_tokens().map(str::to_owned));
+        }
+    }
+    reflectivity_elevations
+        .iter()
+        .any(|elevation| velocity_elevations.contains(elevation))
+}
+
+fn is_reflectivity_token(token: &str) -> bool {
+    matches!(token, "DBZH" | "DBZV" | "DBZ" | "TH" | "TV")
+}
+
+fn is_velocity_token(token: &str) -> bool {
+    token.starts_with('V')
 }
 
 #[cfg(test)]
@@ -796,6 +864,53 @@ mod tests {
         assert!(!plan.merge);
         assert_eq!(plan.parts.len(), 1);
         assert!(plan.parts[0].url.contains("iedub@20260612T1445@"));
+    }
+
+    #[test]
+    fn newer_velocity_only_tail_does_not_displace_complete_pvol_cycle() {
+        let elevs = "0.5_1.5_2.5_3.5_5.4_9.1_15.0_23.8";
+        let keys = vec![
+            format!("2026/06/13/PL/plleg/PVOL/plleg@20260613T1651@{elevs}@DBZH.h5"),
+            format!("2026/06/13/PL/plleg/PVOL/plleg@20260613T1651@{elevs}@TH.h5"),
+            format!("2026/06/13/PL/plleg/PVOL/plleg@20260613T1651@{elevs}@VRADH.h5"),
+            format!("2026/06/13/PL/plleg/PVOL/plleg@20260613T1656@{elevs}@VRADH.h5"),
+        ];
+
+        let plan = plan_from_keys("plleg", ObjectKind::Pvol, &keys).expect("plan");
+        let parts: Vec<&str> = plan.parts.iter().map(|part| part.url.as_str()).collect();
+
+        assert!(plan.merge);
+        assert_eq!(parts.len(), 2, "parts: {parts:?}");
+        assert!(plan.identity.starts_with("plleg_20260613T1651_p2_h"));
+        assert!(parts[0].contains("T1651@") && parts[0].ends_with("@DBZH.h5"));
+        assert!(parts[1].contains("T1651@") && parts[1].ends_with("@VRADH.h5"));
+        assert!(
+            parts.iter().all(|part| !part.contains("T1656@")),
+            "newer incomplete tail should wait for its cycle"
+        );
+    }
+
+    #[test]
+    fn newer_scan_tail_with_mismatched_product_heights_does_not_win() {
+        let keys = vec![
+            "2026/06/13/EE/eesur/SCAN/eesur@20260613T1651@0.5@DBZH.h5".to_owned(),
+            "2026/06/13/EE/eesur/SCAN/eesur@20260613T1651@0.5@VRADH.h5".to_owned(),
+            "2026/06/13/EE/eesur/SCAN/eesur@20260613T1656@0.5@DBZH.h5".to_owned(),
+            "2026/06/13/EE/eesur/SCAN/eesur@20260613T1656@1.5@VRADH.h5".to_owned(),
+        ];
+
+        let plan = plan_from_keys("eesur", ObjectKind::Scan, &keys).expect("plan");
+        let parts: Vec<&str> = plan.parts.iter().map(|part| part.url.as_str()).collect();
+
+        assert!(plan.merge);
+        assert_eq!(parts.len(), 2, "parts: {parts:?}");
+        assert!(plan.identity.starts_with("eesur_20260613T1651_p2_h"));
+        assert!(parts[0].contains("T1651@0.5@DBZH.h5"));
+        assert!(parts[1].contains("T1651@0.5@VRADH.h5"));
+        assert!(
+            parts.iter().all(|part| !part.contains("T1656@")),
+            "newer scan tail has reflectivity and velocity at different heights"
+        );
     }
 
     #[test]

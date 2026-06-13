@@ -1,11 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use app_ui::PanelLayout;
-use chrono::{DateTime, NaiveDateTime, SecondsFormat, TimeZone, Utc};
+use chrono::{
+    DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc,
+    Weekday,
+};
 use color_tables::{ColorTable, ColorTableFamily, ColorTableSet, builtin_tables_for_family};
 use data_source::{LEVEL2_ARCHIVE_BUCKET, RadarSite, RealtimeChunkType};
 use eframe::egui;
@@ -68,6 +72,7 @@ const DEFAULT_RADAR_RANGE_KM: f32 = 460.0;
 /// Top of the vertical cross-section (m above the radar) — shared by the
 /// compute and the panel's height-axis labels so they can't drift.
 const CROSS_SECTION_TOP_M: f32 = 18_000.0;
+const CROSS_SECTION_HANDLE_HIT_PX: f32 = 20.0;
 const DEFAULT_STORM_MOTION_DIRECTION_DEG: f32 = 45.0;
 const DEFAULT_STORM_MOTION_SPEED_KT: f32 = 35.0;
 const KNOT_TO_MPS: f32 = 0.514_444;
@@ -88,16 +93,137 @@ const PRIMARY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 1;
 const OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 5;
 const MAX_RADAR_OVERLAY_LAYERS: usize = 10;
 const DEFAULT_RADAR_OVERLAY_ALPHA: u8 = 210;
+const ALERT_SOUND_FAMILY_OPTIONS: &[(&str, &str)] = &[
+    ("tornado", "Tornado"),
+    ("severe thunderstorm", "Severe thunderstorm"),
+    ("flash flood", "Flash flood"),
+];
 const PERF_SAMPLE_CAPACITY: usize = 96;
 const STALE_LATEST_DISPLAY_CLEAR_SECONDS: i64 = 15 * 60;
+const ARCHIVE_EVENT_CACHE_HIT_MAX_SECONDS: i64 = 10 * 60;
 const HISTORY_SIZE_OPTIONS: &[usize] = &[3, 5, 7, 10, 15, 20, 25, 30];
 const DEFAULT_HISTORY_FRAME_LIMIT: usize = 7;
+const DEFAULT_ARCHIVE_FRAME_COUNT: usize = 10;
+const MAX_ARCHIVE_FRAME_COUNT: usize = 30;
+pub(crate) const MAX_EVENT_PAD_FRAMES: u16 = 40;
 /// Hard ceiling for the frame strip — deployment folders legitimately
 /// load 100+ volumes.
 const MAX_HISTORY_FRAME_LIMIT: usize = 200;
 const HISTORY_LOOP_FRAME_MS: u64 = 700;
 /// Loop-speed picker steps, percent of the 700 ms baseline (¼× … 4×).
 const LOOP_SPEED_PERCENT_OPTIONS: &[u16] = &[25, 50, 75, 100, 150, 200, 300, 400];
+const BACKGROUND_ACTIVITY_REPAINT_MS: u64 = 250;
+const SATELLITE_MAP_LAYER_HOVER: &str =
+    "Render the current frame as a layer under the radar (opacity in Custom)";
+const RADAR_OVERLAYS_EMPTY_HELP: &str = "No overlay radars yet. Add one from Custom > Add layer > Radar overlay, or Ctrl+right-click the map to add the nearest radar without leaving the map.";
+const SECURITY_UNSIGNED_BUILD_TEXT: &str = "Windows Defender or SmartScreen may warn on unsigned or newly built executables. Use official GitHub release assets when possible; do not whitelist random copies.";
+const SECURITY_SIGNATURE_STATUS_TEXT: &str = "Signature status: not verified in-app. A future signed installer should be verified by Windows before launch.";
+const WGPU_TO_GLOW_FALLBACK_NOTICE: &str =
+    "WGPU startup failed; running with OpenGL fallback. Update graphics drivers if this repeats.";
+
+#[cfg(windows)]
+mod alert_audio {
+    use std::ffi::{OsStr, c_void};
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr::null_mut;
+
+    const MB_ICONEXCLAMATION: u32 = 0x0000_0030;
+    const SND_ASYNC: u32 = 0x0001;
+    const SND_NODEFAULT: u32 = 0x0002;
+    const SND_FILENAME: u32 = 0x0002_0000;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBeep(uType: u32) -> i32;
+    }
+
+    #[link(name = "winmm")]
+    unsafe extern "system" {
+        fn PlaySoundW(pszSound: *const u16, hmod: *mut c_void, fdwSound: u32) -> i32;
+    }
+
+    pub fn play(sound_path: &str) -> bool {
+        let path = sound_path.trim();
+        if !path.is_empty() && Path::new(path).is_file() {
+            let wide = OsStr::new(path)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            // Fire-and-forget: warning documentation should never block on audio IO.
+            return unsafe {
+                PlaySoundW(
+                    wide.as_ptr(),
+                    null_mut(),
+                    SND_FILENAME | SND_ASYNC | SND_NODEFAULT,
+                ) != 0
+            };
+        }
+        unsafe { MessageBeep(MB_ICONEXCLAMATION) != 0 }
+    }
+}
+
+#[cfg(not(windows))]
+mod alert_audio {
+    pub fn play(_sound_path: &str) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DebugArchiveCase {
+    label: &'static str,
+    description: &'static str,
+    site_id: &'static str,
+    date_input: &'static str,
+    s3_key: &'static str,
+    s3_size: u64,
+    center_lat: f32,
+    center_lon: f32,
+    map_scale: f32,
+    preferred_cut: usize,
+}
+
+impl DebugArchiveCase {
+    fn product(self) -> DisplayProduct {
+        DisplayProduct::DealiasedVelocity
+    }
+
+    fn object(self) -> data_source::S3Object {
+        data_source::S3Object {
+            key: self.s3_key.to_owned(),
+            size: self.s3_size,
+            last_modified: None,
+        }
+    }
+}
+
+const DEBUG_ARCHIVE_CASES: &[DebugArchiveCase] = &[
+    DebugArchiveCase {
+        label: "Tuscaloosa 2011 22:15Z",
+        description: "KBMX 2011-04-27 22:15:10Z: quick DVEL repro centered on Tuscaloosa.",
+        site_id: "KBMX",
+        date_input: "2011-04-27",
+        s3_key: "2011/04/27/KBMX/KBMX20110427_221510_V03.gz",
+        s3_size: 5_036_878,
+        center_lat: 33.133,
+        center_lon: -87.511,
+        map_scale: 850.0,
+        preferred_cut: 5,
+    },
+    DebugArchiveCase {
+        label: "Tuscaloosa 2011 22:19Z",
+        description: "KBMX 2011-04-27 22:19:45Z: follow-up Tuscaloosa DVEL comparison scan.",
+        site_id: "KBMX",
+        date_input: "2011-04-27",
+        s3_key: "2011/04/27/KBMX/KBMX20110427_221945_V03.gz",
+        s3_size: 5_060_945,
+        center_lat: 33.133,
+        center_lon: -87.511,
+        map_scale: 850.0,
+        preferred_cut: 5,
+    },
+];
 
 /// What a lowest-beam menu pick switches to (the ranking spans every
 /// pollable family, so the action differs per family).
@@ -126,6 +252,14 @@ struct BeamCandidate {
     beam_m: f32,
     distance_km: f32,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+struct CustomGisSite {
+    site_id: String,
+    label: String,
+    latitude_deg: f32,
+    longitude_deg: f32,
+}
 const LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG: f32 = 1.0;
 const LIVE_LOW_LEVEL_AUTO_ADVANCE_MIN_SECONDS: i64 = 90;
 const LIVE_COMPLETE_LOW_LEVEL_TILT_MIN_RADIALS: usize = 720;
@@ -153,16 +287,22 @@ const HAZARD_MAX_RENDER_LAT_SPAN_DEG: f32 = 30.0;
 const HAZARD_MAX_RENDER_EDGE_KM: f32 = 2_500.0;
 const MAP_DRAG_DEAD_ZONE_PX: f32 = 3.0;
 const COLOR_STATUS_SCROLL_HEIGHT: f32 = 34.0;
+const HAZARD_LIST_SCROLL_HEIGHT: f32 = 156.0;
 const HAZARD_SUMMARY_SCROLL_HEIGHT: f32 = 86.0;
 const HAZARD_DETAIL_SCROLL_HEIGHT: f32 = 150.0;
 const TILT_LIST_SCROLL_HEIGHT: f32 = 168.0;
+const HAZARD_FOCUS_TARGET_PX: f32 = 360.0;
+const HAZARD_FOCUS_MIN_SCALE: f32 = 130.0;
+const HAZARD_FOCUS_MAX_SCALE: f32 = 950.0;
+const SITE_LABEL_MIN_SCALE: f32 = 95.0;
+const TERMINAL_SITE_LABEL_MIN_SCALE: f32 = 58.0;
 // The density contract lives in ui_theme.rs (spec §4); the old names stay
 // as crate-wide aliases so 100+ call sites keep reading naturally.
 pub(crate) use ui_theme::ROW_H as PANEL_BUTTON_HEIGHT;
 pub(crate) use ui_theme::{
     ACCENT_COLOR, LAYER_ROW_SLIDER_WIDTH, LIVE_COLOR, NAME_W_SITE, NAME_W_STD, NAME_W_WIDE,
-    ROW_SPACING_X, SECTION_SPACING, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
-    SUBHEAD_COLOR,
+    ROW_SPACING_X, SECTION_SEPARATOR_COLOR, SECTION_SPACING, SIDEBAR_DEFAULT_WIDTH,
+    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SUBHEAD_COLOR,
 };
 const DEFAULT_HIDDEN_HAZARD_FAMILIES: &[&str] = &[];
 const HAZARD_FILTER_FAMILIES: &[(&str, &str)] = &[
@@ -214,30 +354,121 @@ fn main() -> eframe::Result {
     }));
     let input_path = std::env::args_os().nth(1).map(PathBuf::from);
 
+    match run_bowecho_native(eframe::Renderer::Wgpu, input_path.clone(), None) {
+        Ok(()) => Ok(()),
+        Err(err) if should_retry_startup_with_glow(&err) => {
+            eprintln!("WGPU startup failed ({err:?}); retrying BowEcho with OpenGL renderer");
+            run_bowecho_native(
+                eframe::Renderer::Glow,
+                input_path,
+                Some(WGPU_TO_GLOW_FALLBACK_NOTICE.to_owned()),
+            )
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn bowecho_native_options(renderer: eframe::Renderer) -> eframe::NativeOptions {
     // The icon: the first Tornado Emergency displayed in BowEcho — the
     // Toluca IL supercell of 2026-06-11 (KILX TO.W 0088), as captured
     // live by a user. Real data is the brand.
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/bowecho.png"))
         .unwrap_or_default();
-    let native_options = eframe::NativeOptions {
+    eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1500.0, 950.0])
             .with_min_inner_size([1120.0, 700.0])
             .with_icon(icon),
+        renderer,
         ..Default::default()
-    };
+    }
+}
 
+fn run_bowecho_native(
+    renderer: eframe::Renderer,
+    input_path: Option<PathBuf>,
+    startup_notice: Option<String>,
+) -> eframe::Result {
     eframe::run_native(
         "BowEcho",
-        native_options,
-        Box::new(move |cc| Ok(Box::new(ViewerApp::new(cc, input_path)))),
+        bowecho_native_options(renderer),
+        Box::new(move |cc| Ok(Box::new(ViewerApp::new(cc, input_path, startup_notice)))),
     )
+}
+
+fn should_retry_startup_with_glow(error: &eframe::Error) -> bool {
+    should_retry_startup_with_glow_message(&format!("{error:?}"))
+}
+
+fn should_retry_startup_with_glow_message(message: &str) -> bool {
+    message.contains("Wgpu")
+        || message.contains("wgpu")
+        || message.contains("RequestDevice")
+        || message.contains("DeviceLost")
+        || message.contains("RequestAdapter")
 }
 
 fn cache_dir(name: &str) -> PathBuf {
     app_cache_root()
         .join("level2")
         .join(sanitized_cache_segment(name))
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CacheClearSummary {
+    files: usize,
+    dirs: usize,
+}
+
+impl CacheClearSummary {
+    fn status_text(self, root: &Path) -> String {
+        if self.files == 0 && self.dirs == 0 {
+            return format!("Map tile cache already empty: {}", root.display());
+        }
+        format!(
+            "Cleared map tile cache: {} files, {} dirs from {}",
+            self.files,
+            self.dirs,
+            root.display()
+        )
+    }
+}
+
+fn clear_map_tile_cache_dir(root: &Path) -> Result<CacheClearSummary, String> {
+    let Some(name) = root.file_name().and_then(|name| name.to_str()) else {
+        return Err("refusing to clear unnamed tile cache path".to_owned());
+    };
+    if name != "tiles" {
+        return Err(format!(
+            "refusing to clear non-tile cache path: {}",
+            root.display()
+        ));
+    }
+    if !root.exists() {
+        return Ok(CacheClearSummary::default());
+    }
+    if !root.is_dir() {
+        return Err(format!(
+            "tile cache path is not a directory: {}",
+            root.display()
+        ));
+    }
+    let mut summary = CacheClearSummary::default();
+    for entry in std::fs::read_dir(root).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_dir() {
+            std::fs::remove_dir_all(&path).map_err(|error| error.to_string())?;
+            summary.dirs += 1;
+        } else {
+            std::fs::remove_file(&path)
+                .or_else(|_| std::fs::remove_dir(&path))
+                .map_err(|error| error.to_string())?;
+            summary.files += 1;
+        }
+    }
+    Ok(summary)
 }
 
 fn app_cache_root() -> PathBuf {
@@ -587,6 +818,8 @@ fn dominant_site_id<'a>(volumes: impl Iterator<Item = &'a RadarVolume>) -> Optio
 
 struct ViewerApp {
     source_path: Option<PathBuf>,
+    renderer_backend: &'static str,
+    startup_notice: Option<String>,
     volume: Option<Arc<RadarVolume>>,
     selected_cut: usize,
     selected_product: DisplayProduct,
@@ -634,6 +867,7 @@ struct ViewerApp {
     map_center_lon: f32,
     map_center_lat: f32,
     map_scale: f32,
+    place_search_query: String,
     radar_range_km: f32,
     load_timing: Option<LoadTimings>,
     active_load_started_at: Option<Instant>,
@@ -650,6 +884,7 @@ struct ViewerApp {
     selected_site_index: usize,
     app_settings: settings::AppSettings,
     radar_layers: Vec<RadarOverlayLayer>,
+    radar_overlays_open: bool,
     next_radar_layer_id: u64,
     site_catalog_receiver: Option<mpsc::Receiver<AsyncSiteCatalogResult>>,
     load_receiver: Option<mpsc::Receiver<AsyncLoadResult>>,
@@ -728,9 +963,12 @@ struct ViewerApp {
     /// SPC storm reports for the archive date (tornado events browser).
     spc_reports: Option<Vec<SpcReport>>,
     spc_receiver: Option<mpsc::Receiver<std::result::Result<Vec<SpcReport>, String>>>,
-    /// One-shot: after an event click, auto-load the volume nearest this
+    /// One-shot: after an event click, auto-load the loop centered on this
     /// time once the archive listing lands.
-    archive_pending_event: Option<DateTime<Utc>>,
+    archive_pending_event: Option<ArchivePendingEvent>,
+    /// One-shot debug launcher focus: after the requested archive object
+    /// lands, switch to the known product/cut/view for the repro case.
+    pending_debug_archive_case: Option<DebugArchiveCase>,
     /// Production model download: rw-ui DownloadPanel + the ported
     /// IngestWorker harness (live estimates, per-hour stage chips, probe,
     /// cancel — the full rusty-weather download workflow).
@@ -744,6 +982,13 @@ struct ViewerApp {
     show_satellite: bool,
     /// In-app Guide window (reference docs, opened on demand — never forced).
     show_guide: bool,
+    /// Session marker for the last workflow preset the user applied. It is
+    /// intentionally not persisted: presets are commands, not hidden startup
+    /// defaults, and manual tweaks after a preset remain allowed.
+    current_workflow: Option<WorkflowPreset>,
+    /// Session-only restore point captured immediately before applying the
+    /// latest workflow preset.
+    previous_workflow_snapshot: Option<WorkflowSnapshot>,
     /// Clean-screen mode: hide ALL chrome (top bar, sidebar, status) so
     /// captures are pure radar. Tab toggles, Esc restores.
     chrome_hidden: bool,
@@ -804,6 +1049,10 @@ struct ViewerApp {
     /// GR2A-style custom URL polling: a served directory with dir.list
     /// (the convention mobile radars/DOWs use in the field).
     poll_url: String,
+    custom_poll_label_input: String,
+    custom_poll_site_input: String,
+    custom_poll_lat_input: String,
+    custom_poll_lon_input: String,
     poll_active: bool,
     poll_last_file: Option<String>,
     poll_next: Option<Instant>,
@@ -913,6 +1162,10 @@ struct ViewerApp {
     /// Indices into archive_volumes covered by the last loop load
     /// (start..=chosen) — drives the "+N earlier" extension.
     archive_loaded_range: Option<(usize, usize)>,
+    /// Visible state for archive listing/loop jobs. Archive work streams
+    /// frames progressively; this is what keeps long downloads from feeling
+    /// like dead clicks.
+    archive_load_progress: Option<ArchiveLoadProgress>,
     /// Archive click mode: true = loop ending at the chosen scan.
     archive_load_loop: bool,
     /// Archive browser: date input + listed volumes for the selected site.
@@ -970,6 +1223,10 @@ struct ViewerApp {
     sidebar_tab: SidebarTab,
     last_live_hazard_refresh: Option<Instant>,
     selected_hazard_index: Option<usize>,
+    /// Hazard event ids added by a later refresh and not yet clicked. This is
+    /// a session latch for live documentation: it survives auto-refreshes but
+    /// clears when the user selects the warning row/polygon.
+    unacknowledged_hazard_event_ids: BTreeSet<String>,
     storm_motion_direction_deg: f32,
     storm_motion_speed_kt: f32,
     /// One-shot derived-grid readout cache: (product, volume ptr, cut for
@@ -1075,8 +1332,80 @@ struct AsyncLoadResult {
     update: AsyncLoadUpdate,
 }
 
+#[derive(Clone, Debug)]
+struct ArchiveLoadProgress {
+    label: String,
+    detail: String,
+    done: usize,
+    total: usize,
+}
+
+impl ArchiveLoadProgress {
+    fn listing(site_id: &str, date: chrono::NaiveDate) -> Self {
+        Self {
+            label: "Archive listing".to_owned(),
+            detail: format!("Listing {site_id} {date}"),
+            done: 0,
+            total: 0,
+        }
+    }
+
+    fn status_text(&self) -> String {
+        if self.total == 0 {
+            self.detail.clone()
+        } else {
+            format!(
+                "{} {}/{} - {}",
+                self.label, self.done, self.total, self.detail
+            )
+        }
+    }
+
+    fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            0.0
+        } else {
+            (self.done as f32 / self.total as f32).clamp(0.0, 1.0)
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct BackgroundActivity {
+    label: String,
+    fraction: Option<f32>,
+}
+
+impl BackgroundActivity {
+    fn indeterminate(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            fraction: None,
+        }
+    }
+
+    fn progress(label: impl Into<String>, done: usize, total: usize) -> Self {
+        let fraction = if total == 0 {
+            None
+        } else {
+            Some((done as f32 / total as f32).clamp(0.0, 1.0))
+        };
+        Self {
+            label: label.into(),
+            fraction,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ArchivePendingEvent {
+    time_utc: DateTime<Utc>,
+    label: String,
+}
+
 #[allow(clippy::large_enum_variant)]
 enum AsyncLoadUpdate {
+    ArchiveProgress(ArchiveLoadProgress),
     Preview(DecodedLoad),
     History(DecodedLoadBatch, bool),
     Unchanged {
@@ -1253,6 +1582,40 @@ fn history_archive_load_parallelism_for_threads(threads: usize) -> usize {
     }
 }
 
+fn centered_archive_loop_range(
+    center: usize,
+    len: usize,
+    requested: usize,
+) -> Option<(usize, usize)> {
+    if len == 0 || requested == 0 || center >= len {
+        return None;
+    }
+    let total = requested.min(len).min(MAX_HISTORY_FRAME_LIMIT);
+    let before = total / 2;
+    let mut start = center.saturating_sub(before);
+    let end = (start + total - 1).min(len - 1);
+    start = end + 1 - total;
+    Some((start, end))
+}
+
+fn send_archive_progress(
+    sender: &mpsc::Sender<AsyncLoadResult>,
+    label: &str,
+    detail: impl Into<String>,
+    done: usize,
+    total: usize,
+) {
+    let _ = sender.send(AsyncLoadResult {
+        label: label.to_owned(),
+        update: AsyncLoadUpdate::ArchiveProgress(ArchiveLoadProgress {
+            label: label.to_owned(),
+            detail: detail.into(),
+            done,
+            total,
+        }),
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_archive_history_object(
     site_id: &str,
@@ -1263,6 +1626,7 @@ fn decode_archive_history_object(
     total_start: Instant,
     sender: &mpsc::Sender<AsyncLoadResult>,
     preview: bool,
+    skip_known_frame: bool,
 ) -> Result<Option<DecodedLoad>, String> {
     let mut timings = LoadTimings {
         lookup_ms: archive_lookup_ms,
@@ -1276,7 +1640,7 @@ fn decode_archive_history_object(
     timings.fetch_ms = Some(fetch_start.elapsed().as_secs_f32() * 1000.0);
     timings.fetch_cache_hit = Some(downloaded.cache_hit);
 
-    if downloaded.cache_hit && known_frame_paths.contains(&downloaded.path) {
+    if skip_known_frame && downloaded.cache_hit && known_frame_paths.contains(&downloaded.path) {
         return Ok(None);
     }
 
@@ -1308,10 +1672,13 @@ fn load_archive_history_objects_parallel(
     sender: &mpsc::Sender<AsyncLoadResult>,
 ) -> (Vec<DecodedLoad>, Option<String>) {
     let parallelism = history_archive_load_parallelism();
-    let priority_count = objects.len().min(parallelism.min(3));
+    let total_objects = objects.len();
+    let progress_label = format!("L2 {site_id} loop");
+    let priority_count = total_objects.min(parallelism.min(3));
     let mut decoded_frames = Vec::new();
     let mut first_error = None;
     let mut offset = 0;
+    let mut completed = 0;
 
     while offset < objects.len() {
         let chunk_size = if offset == 0 && priority_count > 0 {
@@ -1337,6 +1704,7 @@ fn load_archive_history_objects_parallel(
                         total_start,
                         &sender,
                         false,
+                        true,
                     )
                 }));
             }
@@ -1353,6 +1721,7 @@ fn load_archive_history_objects_parallel(
         });
 
         for result in batch_results {
+            completed += 1;
             match result {
                 Ok(Ok(Some(decoded))) => {
                     let _ = sender.send(AsyncLoadResult {
@@ -1372,6 +1741,13 @@ fn load_archive_history_objects_parallel(
                     first_error.get_or_insert(err);
                 }
             }
+            send_archive_progress(
+                sender,
+                &progress_label,
+                "Decoded recent archive frame",
+                completed,
+                total_objects,
+            );
         }
         offset = end;
     }
@@ -1558,6 +1934,7 @@ fn spawn_latest_level2_load_worker(
                             total_start,
                             &sender,
                             should_preview_loads(),
+                            true,
                         ) {
                             Ok(Some(decoded)) => {
                                 selected_identity =
@@ -1759,6 +2136,49 @@ impl PollSource {
             site_id: site_id.to_owned(),
         })
     }
+}
+
+fn diagnostic_poll_source_label(source: &PollSource) -> String {
+    match source {
+        PollSource::CustomUrl(url) => format!("custom {}", diagnostic_url_label(url)),
+        PollSource::Intl {
+            provider_id,
+            site_id,
+        } => format!("intl {provider_id}/{site_id}"),
+    }
+}
+
+fn diagnostic_url_label(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return "-".to_owned();
+    }
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return trimmed
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or(trimmed)
+            .to_owned();
+    };
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|host| !host.is_empty())
+        .unwrap_or(rest);
+    format!("{scheme}://{host}/...")
+}
+
+fn optional_ms_label(value: Option<f32>) -> String {
+    value
+        .map(|value| format!("{value:.1}"))
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn push_optional_path(text: &mut String, label: &str, path: Option<&Path>) {
+    let value = path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "-".to_owned());
+    let _ = writeln!(text, "{label}: {value}");
 }
 
 /// Picker label for an international provider id; falls back to the raw id
@@ -1969,6 +2389,15 @@ struct HazardRecord {
 struct HazardPoint {
     lon: f32,
     lat: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct HazardListRow {
+    index: usize,
+    label: String,
+    hover: String,
+    selected: bool,
+    unacknowledged: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2690,6 +3119,16 @@ impl DisplayProduct {
     }
 }
 
+fn manual_vrot_product_supported(product: &DisplayProduct) -> bool {
+    matches!(
+        product,
+        DisplayProduct::Moment(MomentType::Velocity)
+            | DisplayProduct::DealiasedVelocity
+            | DisplayProduct::StormRelativeVelocity
+            | DisplayProduct::StormRelativeDealiasedVelocity
+    )
+}
+
 #[derive(Clone, Debug)]
 struct CursorReadout {
     site_id: String,
@@ -2745,9 +3184,489 @@ enum SidebarTab {
     Settings,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum DisplayTimeZone {
+    #[default]
+    Utc,
+    Eastern,
+    Central,
+    Mountain,
+    Pacific,
+}
+
+impl DisplayTimeZone {
+    const ALL: [Self; 5] = [
+        Self::Utc,
+        Self::Eastern,
+        Self::Central,
+        Self::Mountain,
+        Self::Pacific,
+    ];
+
+    fn from_slug(slug: &str) -> Self {
+        match slug.trim().to_ascii_lowercase().as_str() {
+            "eastern" | "et" | "est" | "edt" => Self::Eastern,
+            "central" | "ct" | "cst" | "cdt" => Self::Central,
+            "mountain" | "mt" | "mst" | "mdt" => Self::Mountain,
+            "pacific" | "pt" | "pst" | "pdt" => Self::Pacific,
+            _ => Self::Utc,
+        }
+    }
+
+    fn from_settings(settings: &settings::AppSettings) -> Self {
+        Self::from_slug(&settings.time_zone)
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Utc => "utc",
+            Self::Eastern => "eastern",
+            Self::Central => "central",
+            Self::Mountain => "mountain",
+            Self::Pacific => "pacific",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Utc => "UTC",
+            Self::Eastern => "Eastern",
+            Self::Central => "Central",
+            Self::Mountain => "Mountain",
+            Self::Pacific => "Pacific",
+        }
+    }
+
+    fn standard_offset_hours(self) -> i32 {
+        match self {
+            Self::Utc => 0,
+            Self::Eastern => -5,
+            Self::Central => -6,
+            Self::Mountain => -7,
+            Self::Pacific => -8,
+        }
+    }
+
+    fn daylight_offset_hours(self) -> i32 {
+        self.standard_offset_hours() + 1
+    }
+
+    fn transition_start_utc_hour(self) -> u32 {
+        match self {
+            Self::Utc => 0,
+            Self::Eastern => 7,
+            Self::Central => 8,
+            Self::Mountain => 9,
+            Self::Pacific => 10,
+        }
+    }
+
+    fn transition_end_utc_hour(self) -> u32 {
+        match self {
+            Self::Utc => 0,
+            Self::Eastern => 6,
+            Self::Central => 7,
+            Self::Mountain => 8,
+            Self::Pacific => 9,
+        }
+    }
+
+    fn is_dst_at(self, time_utc: DateTime<Utc>) -> bool {
+        if self == Self::Utc {
+            return false;
+        }
+        let year = time_utc.year();
+        let start_day = nth_weekday_of_month(year, 3, Weekday::Sun, 2);
+        let end_day = nth_weekday_of_month(year, 11, Weekday::Sun, 1);
+        let start = Utc
+            .with_ymd_and_hms(year, 3, start_day, self.transition_start_utc_hour(), 0, 0)
+            .unwrap();
+        let end = Utc
+            .with_ymd_and_hms(year, 11, end_day, self.transition_end_utc_hour(), 0, 0)
+            .unwrap();
+        time_utc >= start && time_utc < end
+    }
+
+    fn abbreviation(self, time_utc: DateTime<Utc>) -> &'static str {
+        let dst = self.is_dst_at(time_utc);
+        match (self, dst) {
+            (Self::Utc, _) => "UTC",
+            (Self::Eastern, false) => "EST",
+            (Self::Eastern, true) => "EDT",
+            (Self::Central, false) => "CST",
+            (Self::Central, true) => "CDT",
+            (Self::Mountain, false) => "MST",
+            (Self::Mountain, true) => "MDT",
+            (Self::Pacific, false) => "PST",
+            (Self::Pacific, true) => "PDT",
+        }
+    }
+
+    fn fixed_offset(self, time_utc: DateTime<Utc>) -> FixedOffset {
+        let hours = if self.is_dst_at(time_utc) {
+            self.daylight_offset_hours()
+        } else {
+            self.standard_offset_hours()
+        };
+        FixedOffset::east_opt(hours * 3600).unwrap_or_else(|| FixedOffset::east_opt(0).unwrap())
+    }
+
+    fn format_hm(self, time_utc: DateTime<Utc>) -> String {
+        if self == Self::Utc {
+            return time_utc.format("%H:%MZ").to_string();
+        }
+        let local = time_utc.with_timezone(&self.fixed_offset(time_utc));
+        format!("{} {}", local.format("%H:%M"), self.abbreviation(time_utc))
+    }
+
+    fn format_hms(self, time_utc: DateTime<Utc>) -> String {
+        if self == Self::Utc {
+            return time_utc.format("%H:%M:%SZ").to_string();
+        }
+        let local = time_utc.with_timezone(&self.fixed_offset(time_utc));
+        format!(
+            "{} {}",
+            local.format("%H:%M:%S"),
+            self.abbreviation(time_utc)
+        )
+    }
+
+    fn format_date_hms(self, time_utc: DateTime<Utc>) -> String {
+        if self == Self::Utc {
+            return time_utc.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+        }
+        let local = time_utc.with_timezone(&self.fixed_offset(time_utc));
+        format!(
+            "{} {}",
+            local.format("%Y-%m-%d %H:%M:%S"),
+            self.abbreviation(time_utc)
+        )
+    }
+
+    fn format_month_day_hour(self, time_utc: DateTime<Utc>) -> String {
+        if self == Self::Utc {
+            return time_utc.format("%m-%d %Hz").to_string();
+        }
+        let local = time_utc.with_timezone(&self.fixed_offset(time_utc));
+        format!(
+            "{} {}",
+            local.format("%m-%d %Hh"),
+            self.abbreviation(time_utc)
+        )
+    }
+}
+
+fn nth_weekday_of_month(year: i32, month: u32, weekday: Weekday, nth: u32) -> u32 {
+    let first = NaiveDate::from_ymd_opt(year, month, 1).expect("valid DST transition month");
+    let first_weekday = first.weekday().num_days_from_sunday() as i32;
+    let target = weekday.num_days_from_sunday() as i32;
+    let first_match = 1 + (target - first_weekday).rem_euclid(7) as u32;
+    first_match + (nth.saturating_sub(1) * 7)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkflowPreset {
+    LiveSevere,
+    TripleSevere,
+    VelocityCouplet,
+    QuadDualPol,
+    ArchiveReview,
+    Documentation,
+    ModelContext,
+}
+
+impl WorkflowPreset {
+    const ALL: [Self; 7] = [
+        Self::LiveSevere,
+        Self::TripleSevere,
+        Self::VelocityCouplet,
+        Self::QuadDualPol,
+        Self::ArchiveReview,
+        Self::Documentation,
+        Self::ModelContext,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::LiveSevere => "Live severe",
+            Self::TripleSevere => "Triple severe",
+            Self::VelocityCouplet => "Velocity couplet",
+            Self::QuadDualPol => "Quad dual-pol",
+            Self::ArchiveReview => "Archive review",
+            Self::Documentation => "Documentation",
+            Self::ModelContext => "Model context",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::LiveSevere => {
+                "Warnings, SPC outlooks/reports, rotation/storm tracks, obs, and lightning for live ops"
+            }
+            Self::TripleSevere => {
+                "Three-pane REF / DVEL / CC layout for warning review without crowding four panes"
+            }
+            Self::VelocityCouplet => {
+                "Two-pane DVEL/SRV view with Vrot armed and velocity-focused inspection"
+            }
+            Self::QuadDualPol => "Classic REF / VEL / CC / ZDR warning-desk layout",
+            Self::ArchiveReview => {
+                "Data tab, archive loop mode, reports/outlooks visible, and live polling paused"
+            }
+            Self::Documentation => {
+                "Clean map capture mode with app chrome hidden; Tab or Esc restores"
+            }
+            Self::ModelContext => {
+                "Open the model workflow with obs adjustment and map context layers ready"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppearanceProfile {
+    BowEchoDefault,
+    Gr2Classic,
+    ChaseDark,
+    AccessibilityCvd,
+}
+
+impl AppearanceProfile {
+    const ALL: [Self; 4] = [
+        Self::BowEchoDefault,
+        Self::Gr2Classic,
+        Self::ChaseDark,
+        Self::AccessibilityCvd,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::BowEchoDefault => "BowEcho default",
+            Self::Gr2Classic => "GR2-classic",
+            Self::ChaseDark => "Chase dark",
+            Self::AccessibilityCvd => "Accessibility (CVD-safe)",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::BowEchoDefault => {
+                "Built-in BowEcho colors, palettes, warning fills, and scan-age cues"
+            }
+            Self::Gr2Classic => {
+                "GR2-familiar REF/VEL palettes with outline-first TOR/SVR/FFW polygons"
+            }
+            Self::ChaseDark => {
+                "Dim-cab profile: darker backdrop, thicker warnings, brighter labels, and storm-scale palettes"
+            }
+            Self::AccessibilityCvd => {
+                "Color-vision-deficiency-safe velocity palette and warning families separated by hue plus dash"
+            }
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|profile| profile.label() == label)
+    }
+
+    fn style_settings(self) -> styles::StyleSettings {
+        let mut settings = styles::StyleSettings::default();
+        match self {
+            Self::BowEchoDefault => {}
+            Self::Gr2Classic => {
+                settings.hazard_global.fill_alpha = Some(0);
+                settings.hazard_global.stroke_width_scale = Some(1.1);
+                settings.hazard_global.selected_width_boost = Some(1.0);
+                settings.hazards.insert(
+                    "tornado".to_owned(),
+                    polygon_style([255, 0, 0, 255], None, Some(2.0), None),
+                );
+                settings.hazards.insert(
+                    "severe-thunderstorm".to_owned(),
+                    polygon_style([255, 255, 0, 255], None, Some(2.0), None),
+                );
+                settings.hazards.insert(
+                    "flash-flood".to_owned(),
+                    polygon_style([0, 255, 0, 255], None, Some(2.0), None),
+                );
+                settings.hazards.insert(
+                    "tornado/catastrophic".to_owned(),
+                    polygon_style([255, 0, 0, 255], None, Some(3.0), None),
+                );
+                settings.hazards.insert(
+                    "severe-thunderstorm/destructive".to_owned(),
+                    polygon_style([255, 190, 0, 255], None, Some(2.6), None),
+                );
+            }
+            Self::ChaseDark => {
+                settings.map.background_color = Some([3, 6, 9, 255]);
+                settings.hazard_global.fill_alpha = Some(30);
+                settings.hazard_global.stroke_width_scale = Some(1.4);
+                settings.hazard_global.selected_width_boost = Some(1.4);
+                settings.hazard_global.label_font_px = Some(13.0);
+                settings.hazard_global.label_font_selected_px = Some(15.0);
+                settings.labels.town_font_scale = Some(1.12);
+                settings.labels.warning_halo_color = Some([0, 0, 0, 235]);
+                settings.range_rings.primary_width = Some(2.1);
+                settings.range_rings.overlay_width = Some(1.8);
+                settings.radar_age.glyph_arc_radius_px = Some(10.5);
+                settings.obs.value_font_px = Some(12.0);
+                settings.obs.small_font_px = Some(9.5);
+                settings.glm.size_scale = Some(1.15);
+            }
+            Self::AccessibilityCvd => {
+                settings.hazard_global.fill_alpha = Some(18);
+                settings.hazard_global.stroke_width_scale = Some(1.35);
+                settings.hazards.insert(
+                    "tornado".to_owned(),
+                    polygon_style([35, 120, 255, 255], None, Some(2.8), None),
+                );
+                settings.hazards.insert(
+                    "severe-thunderstorm".to_owned(),
+                    polygon_style(
+                        [230, 159, 0, 255],
+                        None,
+                        Some(2.2),
+                        Some(styles::DashPattern::Dashed {
+                            dash: 7.0,
+                            gap: 4.0,
+                        }),
+                    ),
+                );
+                settings.hazards.insert(
+                    "flash-flood".to_owned(),
+                    polygon_style(
+                        [0, 158, 115, 255],
+                        None,
+                        Some(2.2),
+                        Some(styles::DashPattern::Dotted),
+                    ),
+                );
+                settings.hazards.insert(
+                    "tornado/catastrophic".to_owned(),
+                    polygon_style([204, 0, 121, 255], None, Some(3.2), None),
+                );
+                settings
+                    .reports
+                    .insert("tornado".to_owned(), marker_style([35, 120, 255, 255], 5.5));
+                settings
+                    .reports
+                    .insert("wind".to_owned(), marker_style([230, 159, 0, 255], 5.0));
+                settings
+                    .reports
+                    .insert("hail".to_owned(), marker_style([0, 158, 115, 255], 5.0));
+                settings.radar_age.fresh_color = Some([0, 158, 115, 255]);
+                settings.radar_age.aging_color = Some([230, 159, 0, 255]);
+                settings.radar_age.stale_color = Some([213, 94, 0, 255]);
+                settings.radar_age.expired_color = Some([204, 0, 121, 255]);
+            }
+        }
+        settings
+    }
+
+    fn palette_by_family(self) -> BTreeMap<String, String> {
+        let bindings: &[(ColorTableFamily, &str)] = match self {
+            Self::BowEchoDefault => &[],
+            Self::Gr2Classic => &[
+                (ColorTableFamily::Reflectivity, "GR2Analyst Classic REF"),
+                (ColorTableFamily::Velocity, "GR2-ish Analyst VEL"),
+            ],
+            Self::ChaseDark => &[
+                (ColorTableFamily::Reflectivity, "Dark Scope REF"),
+                (ColorTableFamily::Velocity, "Couplet Pop VEL"),
+            ],
+            Self::AccessibilityCvd => &[
+                (ColorTableFamily::Reflectivity, "Turbo REF (smooth)"),
+                (ColorTableFamily::Velocity, "Balance VEL (CVD-safe)"),
+            ],
+        };
+        bindings
+            .iter()
+            .map(|(family, table)| (family.label().to_owned(), (*table).to_owned()))
+            .collect()
+    }
+
+    fn palette_by_product(self) -> BTreeMap<String, String> {
+        BTreeMap::new()
+    }
+}
+
+fn polygon_style(
+    stroke_color: styles::Rgba,
+    fill_color: Option<styles::Rgba>,
+    stroke_width: Option<f32>,
+    dash: Option<styles::DashPattern>,
+) -> styles::PolygonStyleOverride {
+    styles::PolygonStyleOverride {
+        stroke_color: Some(stroke_color),
+        fill_color,
+        stroke_width,
+        dash,
+        ..Default::default()
+    }
+}
+
+fn marker_style(color: styles::Rgba, size_px: f32) -> styles::MarkerStyleOverride {
+    styles::MarkerStyleOverride {
+        color: Some(color),
+        size_px: Some(size_px),
+        ..Default::default()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct WorkflowPaneSnapshot {
+    product: DisplayProduct,
+    cut: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct WorkflowSnapshot {
+    grid_layout: PanelLayout,
+    active_pane: usize,
+    selected_cut: usize,
+    selected_product: DisplayProduct,
+    extra_panes: Vec<WorkflowPaneSnapshot>,
+    sidebar_tab: SidebarTab,
+    hazards_visible: bool,
+    hazards_active_only: bool,
+    live_hazard_auto_refresh: bool,
+    spc_outlooks_enabled: Vec<String>,
+    spc_reports_enabled: bool,
+    obs_enabled: bool,
+    obs_show_metar: bool,
+    obs_show_mesonet: bool,
+    obs_adjust_soundings: bool,
+    glm_enabled: bool,
+    model_enabled: bool,
+    model_download_open: bool,
+    model_viewer_mode: dock::ViewerMode,
+    show_rotation_markers: bool,
+    show_storm_tracks: bool,
+    show_inspector_card: bool,
+    vrot_tool_armed: bool,
+    vrot_points: Vec<(f32, f32, f32, f32)>,
+    cross_section_armed: bool,
+    cross_section_a_lonlat: Option<(f32, f32)>,
+    cross_section_b_lonlat: Option<(f32, f32)>,
+    cross_section_status: String,
+    annotation_tool: Option<annotate::ToolKind>,
+    annotation_draft: Option<annotate::Annotation>,
+    annotation_hover_geo: Option<annotate::GeoPoint>,
+    chrome_hidden: bool,
+    archive_load_loop: bool,
+    archive_frame_count: usize,
+    history_frame_limit: usize,
+    history_playing: bool,
+    realtime_level2_auto_refresh: bool,
+    poll_active: bool,
+}
+
 const SIDEBAR_TABS: &[(SidebarTab, &str)] = &[
     (SidebarTab::Radar, "Radar"),
-    (SidebarTab::Layers, "Layers"),
+    (SidebarTab::Layers, "Custom"),
     (SidebarTab::Severe, "Severe"),
     (SidebarTab::Data, "Data"),
     (SidebarTab::Settings, "⚙"),
@@ -2757,22 +3676,33 @@ fn sidebar_tab_tooltip(tab: SidebarTab) -> &'static str {
     match tab {
         SidebarTab::Radar => "Site, products, tilt, loop, algorithms — live operations",
         SidebarTab::Layers => {
-            "Everything drawn over the map: radars, model fields, satellite, obs, SPC, warnings, placefiles"
+            "Customization: map layers, added overlays, analysis overlays, radar age, and appearance/color tables"
         }
         SidebarTab::Severe => "Warnings, watches, MDs, SPC outlooks + reports, alert filters",
         SidebarTab::Data => {
             "Acquisition: any date in history, live poll feeds, the model store, local files"
         }
-        SidebarTab::Settings => "Settings: basemap, color tables, hotkeys, diagnostics",
+        SidebarTab::Settings => {
+            "Settings: display, basemap, alerts, hotkeys, performance, diagnostics"
+        }
     }
 }
 
 impl ViewerApp {
-    fn new(cc: &eframe::CreationContext<'_>, source_path: Option<PathBuf>) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        source_path: Option<PathBuf>,
+        startup_notice: Option<String>,
+    ) -> Self {
         configure_style(&cc.egui_ctx);
         // CJK fallback before the first frame: Japanese site names render
         // as glyphs, not tofu (appended LAST — Latin text is untouched).
         fonts::install_cjk_fallback(&cc.egui_ctx);
+        let renderer_backend = if cc.wgpu_render_state.is_some() {
+            "wgpu"
+        } else {
+            "glow"
+        };
         // Volume Explorer GPU resources (pipeline + textures) — once,
         // the eframe custom-3D pattern.
         if let Some(render_state) = cc.wgpu_render_state.as_ref() {
@@ -2800,6 +3730,7 @@ impl ViewerApp {
         );
         let restored_grid_layout = match app_settings.grid_pane_count {
             2 => PanelLayout::TwoVertical,
+            3 => PanelLayout::ThreeStacked,
             4 => PanelLayout::FourGrid,
             _ => PanelLayout::One,
         };
@@ -2838,8 +3769,13 @@ impl ViewerApp {
 
         let restored_model_keep_runs = app_settings.model_keep_runs;
         let restored_model_slug = app_settings.model_slug.clone();
+        let restored_archive_frame_count =
+            normalized_archive_frame_count(usize::from(app_settings.archive_frame_count));
+        let restored_archive_load_loop = app_settings.archive_load_loop;
         let mut app = Self {
             source_path,
+            renderer_backend,
+            startup_notice,
             volume: None,
             selected_cut: 0,
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
@@ -2873,6 +3809,7 @@ impl ViewerApp {
             map_center_lon,
             map_center_lat,
             map_scale: DEFAULT_MAP_SCALE,
+            place_search_query: String::new(),
             radar_range_km: DEFAULT_RADAR_RANGE_KM,
             load_timing: None,
             active_load_started_at: None,
@@ -2889,6 +3826,7 @@ impl ViewerApp {
             selected_site_index,
             app_settings,
             radar_layers: Vec::new(),
+            radar_overlays_open: false,
             next_radar_layer_id: 1,
             site_catalog_receiver: None,
             load_receiver: None,
@@ -2929,6 +3867,7 @@ impl ViewerApp {
             spc_reports: None,
             spc_receiver: None,
             archive_pending_event: None,
+            pending_debug_archive_case: None,
             ingest: None,
             download_panel: rw_ui::DownloadPanel::new(default_download_spec(&restored_model_slug)),
             sat: None,
@@ -2936,6 +3875,8 @@ impl ViewerApp {
             sat_player: rw_ui::SatPlayerPanel::new(),
             show_satellite: false,
             show_guide: false,
+            current_workflow: None,
+            previous_workflow_snapshot: None,
             chrome_hidden: false,
             pending_local_autoplay: false,
             workspace: dock::Workspace::default(),
@@ -2968,6 +3909,10 @@ impl ViewerApp {
             intl_sites_rx: None,
             community_menu: None,
             poll_url: restored_poll_url,
+            custom_poll_label_input: String::new(),
+            custom_poll_site_input: String::new(),
+            custom_poll_lat_input: String::new(),
+            custom_poll_lon_input: String::new(),
             poll_active: false,
             poll_last_file: None,
             poll_next: None,
@@ -3022,9 +3967,10 @@ impl ViewerApp {
             native_sounding_rx: None,
             native_sounding_src: None,
             native_skewt_open: false,
-            archive_frame_count: 10,
+            archive_frame_count: restored_archive_frame_count,
             archive_loaded_range: None,
-            archive_load_loop: true,
+            archive_load_progress: None,
+            archive_load_loop: restored_archive_load_loop,
             archive_date_input: String::new(),
             archive_volumes: None,
             archive_list_receiver: None,
@@ -3059,6 +4005,7 @@ impl ViewerApp {
             sidebar_tab: SidebarTab::Radar,
             last_live_hazard_refresh: None,
             selected_hazard_index: None,
+            unacknowledged_hazard_event_ids: BTreeSet::new(),
             storm_motion_direction_deg: DEFAULT_STORM_MOTION_DIRECTION_DEG,
             storm_motion_speed_kt: DEFAULT_STORM_MOTION_SPEED_KT,
             derived_readout_cache: None,
@@ -3526,6 +4473,9 @@ impl ViewerApp {
                     Ok(message) => {
                         saw_message = true;
                         match message.update {
+                            AsyncLoadUpdate::ArchiveProgress(progress) => {
+                                layer.status = progress.status_text();
+                            }
                             AsyncLoadUpdate::Preview(decoded) => {
                                 Self::install_radar_layer_volume(layer, decoded);
                                 layer.status = format!("Preview {}", message.label);
@@ -3930,7 +4880,7 @@ impl ViewerApp {
     fn selected_frame_status_text(&self) -> String {
         self.frame_history
             .get(self.selected_frame_index)
-            .map(|frame| frame_status_text(frame, Utc::now()))
+            .map(|frame| frame_status_text(frame, Utc::now(), self.time_zone()))
             .unwrap_or_else(|| "No Level II frame loaded".to_owned())
     }
 
@@ -3979,6 +4929,18 @@ impl ViewerApp {
             self.selected_frame_index = self.frame_history.len().saturating_sub(1);
         }
         ctx.request_repaint();
+    }
+
+    fn persist_archive_controls(&mut self) {
+        self.archive_frame_count = normalized_archive_frame_count(self.archive_frame_count);
+        let count = self.archive_frame_count as u16;
+        if self.app_settings.archive_frame_count != count
+            || self.app_settings.archive_load_loop != self.archive_load_loop
+        {
+            self.app_settings.archive_frame_count = count;
+            self.app_settings.archive_load_loop = self.archive_load_loop;
+            let _ = self.app_settings.save();
+        }
     }
 
     fn begin_primary_load_telemetry(&mut self) {
@@ -4033,6 +4995,50 @@ impl ViewerApp {
         if keep_receiver {
             self.hazard_receiver = Some(receiver);
         }
+    }
+
+    fn alert_sound_should_play_for_new_ids(
+        &self,
+        overlay: &HazardOverlay,
+        new_attention_ids: &[String],
+    ) -> bool {
+        self.app_settings.alert_sound_enabled
+            && !new_attention_ids.is_empty()
+            && overlay.records.iter().any(|record| {
+                new_attention_ids.contains(&record.event_id)
+                    && hazard_record_should_latch_attention(record)
+                    && alert_family_enabled(
+                        &self.app_settings.alert_sound_families,
+                        &record.event_family,
+                    )
+            })
+    }
+
+    fn visual_alert_event_ids(
+        &self,
+        overlay: &HazardOverlay,
+        new_attention_ids: &[String],
+    ) -> Vec<String> {
+        if !self.app_settings.alert_flash_enabled {
+            return Vec::new();
+        }
+        overlay
+            .records
+            .iter()
+            .filter(|record| new_attention_ids.contains(&record.event_id))
+            .filter(|record| hazard_record_should_latch_attention(record))
+            .filter(|record| {
+                alert_family_enabled(
+                    &self.app_settings.alert_flash_families,
+                    &record.event_family,
+                )
+            })
+            .map(|record| record.event_id.clone())
+            .collect()
+    }
+
+    fn trigger_alert_sound(&self) {
+        let _ = alert_audio::play(&self.app_settings.alert_sound_path);
     }
 
     fn install_hazard_result(
@@ -4094,6 +5100,17 @@ impl ViewerApp {
                     .hazard_overlay
                     .as_ref()
                     .map(|existing| hazard_overlay_change(existing, &overlay));
+                let new_attention_ids = if !updating {
+                    self.hazard_overlay
+                        .as_ref()
+                        .map(|existing| new_hazard_attention_event_ids(existing, &overlay))
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let play_alert_sound =
+                    self.alert_sound_should_play_for_new_ids(&overlay, &new_attention_ids);
+                let visual_alert_ids = self.visual_alert_event_ids(&overlay, &new_attention_ids);
                 let selected_event_id = self
                     .selected_hazard_record()
                     .map(|record| record.event_id.clone());
@@ -4114,6 +5131,17 @@ impl ViewerApp {
                     &overlay.records,
                     selected_event_id.as_deref(),
                 );
+                if !updating {
+                    self.unacknowledged_hazard_event_ids
+                        .extend(visual_alert_ids.iter().cloned());
+                    prune_unacknowledged_hazard_ids(
+                        &overlay,
+                        &mut self.unacknowledged_hazard_event_ids,
+                    );
+                    if play_alert_sound {
+                        self.trigger_alert_sound();
+                    }
+                }
                 self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
                 self.hazard_overlay = Some(overlay);
                 true
@@ -4128,6 +5156,7 @@ impl ViewerApp {
                 self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
                 self.hazard_overlay = None;
                 self.selected_hazard_index = None;
+                self.unacknowledged_hazard_event_ids.clear();
                 true
             }
         }
@@ -4207,6 +5236,11 @@ impl ViewerApp {
                 Ok(message) => {
                     saw_message = true;
                     match message.update {
+                        AsyncLoadUpdate::ArchiveProgress(progress) => {
+                            self.status = progress.status_text();
+                            self.archive_load_progress = Some(progress);
+                            ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+                        }
                         AsyncLoadUpdate::Preview(decoded) => {
                             self.install_preview_volume(decoded, ctx);
                             self.status = format!("Preview {}", message.label);
@@ -4217,6 +5251,7 @@ impl ViewerApp {
                             self.live_refresh_skip_reason = None;
                             if select_frame && selected_loaded {
                                 self.status = format!("Loaded {}", message.label);
+                                self.apply_debug_archive_focus_if_pending(ctx);
                             }
                         }
                         AsyncLoadUpdate::Unchanged { timings, reason } => {
@@ -4224,15 +5259,19 @@ impl ViewerApp {
                                 self.load_timing = Some(timings);
                             }
                             self.load_receiver = None;
+                            self.archive_load_progress = None;
                             self.pending_site_id = None;
                             self.event_explorer.pending_autoplay = false;
+                            self.pending_debug_archive_case = None;
                             self.live_refresh_skip_reason = Some(reason.clone());
                             self.status = format!("Current {} ({reason})", message.label);
+                            self.try_start_pending_archive_selection(ctx);
                             ctx.request_repaint_after(Duration::from_secs(1));
                             return;
                         }
                         AsyncLoadUpdate::Final(result) => {
                             self.load_receiver = None;
+                            self.archive_load_progress = None;
                             self.pending_site_id = None;
                             match result {
                                 Ok(batch) => {
@@ -4241,6 +5280,7 @@ impl ViewerApp {
                                     self.live_refresh_skip_reason = None;
                                     if selected_loaded {
                                         self.status = format!("Loaded {}", message.label);
+                                        self.apply_debug_archive_focus_if_pending(ctx);
                                     }
                                     // A track jump's range load rolls the
                                     // loop the moment it lands (the
@@ -4255,13 +5295,16 @@ impl ViewerApp {
                                             self.frame_history.len()
                                         );
                                     }
+                                    self.pending_debug_archive_case = None;
                                 }
                                 Err(err) => {
                                     self.event_explorer.pending_autoplay = false;
+                                    self.pending_debug_archive_case = None;
                                     self.status =
                                         format!("Load failed for {}: {err}", message.label);
                                 }
                             }
+                            self.try_start_pending_archive_selection(ctx);
                             ctx.request_repaint();
                             return;
                         }
@@ -4277,8 +5320,12 @@ impl ViewerApp {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.load_receiver = None;
+                    self.archive_load_progress = None;
                     self.pending_site_id = None;
+                    self.event_explorer.pending_autoplay = false;
+                    self.pending_debug_archive_case = None;
                     self.status = "L2 load worker disconnected".to_owned();
+                    self.try_start_pending_archive_selection(ctx);
                     return;
                 }
             }
@@ -4300,6 +5347,10 @@ impl ViewerApp {
             }
         }
         if is_displayable_on_cut(volume, self.selected_cut, &self.selected_product) {
+            return;
+        }
+        if let Some(cut) = best_cut_for_product(volume, self.selected_cut, &self.selected_product) {
+            self.selected_cut = cut;
             return;
         }
         let preferred = [
@@ -4334,6 +5385,13 @@ impl ViewerApp {
 
         if self.handle_product_hotkeys(ctx) {
             ctx.request_repaint();
+            return;
+        }
+
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+            if self.toggle_history_playback(ctx) {
+                ctx.request_repaint();
+            }
             return;
         }
 
@@ -6173,25 +7231,28 @@ impl ViewerApp {
         // loaded.)
         ui.horizontal(|ui| {
             ui.label("Fetch N scans").on_hover_text(
-                "How many volumes an archive loop load fetches (ending at the chosen scan) — not the currently loaded frame count",
+                "Manual archive chips load this many scans ending at the chosen scan. SPC report jumps use this count centered on the nearest event scan.",
             );
             if ui
                 .add(
                     egui::DragValue::new(&mut self.archive_frame_count)
-                        .range(1..=30)
+                        .range(1..=MAX_ARCHIVE_FRAME_COUNT)
                         .speed(0.2),
                 )
                 .on_hover_text(
-                    "How many volumes an archive loop load fetches (ending at the chosen scan)",
+                    "Manual archive chips end at the clicked scan; SPC report jumps center this count on the event scan",
                 )
                 .changed()
             {
+                self.persist_archive_controls();
                 ctx.request_repaint();
             }
             if self.archive_loaded_range.is_some()
                 && ui
-                    .button("+5 earlier")
-                    .on_hover_text("Extend the loaded loop five volumes further back")
+                    .button("+5 older")
+                    .on_hover_text(
+                        "Prepend five older scans to the currently loaded archive loop only",
+                    )
                     .clicked()
             {
                 self.extend_archive_loop_earlier(5, ctx);
@@ -6238,6 +7299,7 @@ impl ViewerApp {
                 ui.spinner();
             }
         });
+        let previous_archive_load_loop = self.archive_load_loop;
         ui.horizontal(|ui| {
             ui.label("On click:");
             ui.selectable_value(&mut self.archive_load_loop, true, "Loop")
@@ -6245,6 +7307,20 @@ impl ViewerApp {
             ui.selectable_value(&mut self.archive_load_loop, false, "Single")
                 .on_hover_text("Load only the chosen scan");
         });
+        if self.archive_load_loop != previous_archive_load_loop {
+            self.persist_archive_controls();
+        }
+        if let Some(progress) = &self.archive_load_progress {
+            let status = progress.status_text();
+            if progress.total == 0 {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.weak(status);
+                });
+            } else {
+                ui.add(egui::ProgressBar::new(progress.fraction()).text(status));
+            }
+        }
         if let Some(volumes) = &self.archive_volumes {
             if volumes.is_empty() {
                 ui.weak("No volumes for that date");
@@ -6320,8 +7396,8 @@ impl ViewerApp {
                                 format!("EF{} ", report.f_scale)
                             };
                             let label = format!(
-                                "{}Z {}{}, {}",
-                                report.time_utc.format("%H:%M"),
+                                "{} {}{}, {}",
+                                self.time_zone().format_hm(report.time_utc),
                                 scale,
                                 report.location,
                                 report.state
@@ -6391,10 +7467,105 @@ impl ViewerApp {
         }
     }
 
+    fn best_archive_event_site_index(&self, lat: f32, lon: f32) -> Option<(usize, f32)> {
+        self.sites
+            .iter()
+            .enumerate()
+            .filter_map(|(index, site)| {
+                if site.level2_id.starts_with('T') {
+                    return None;
+                }
+                let (site_lat, site_lon) = site_location(site)?;
+                let distance_km = haversine_km(lat, lon, site_lat, site_lon);
+                (distance_km <= 460.0).then_some((index, distance_km))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+    }
+
+    fn select_cached_event_frame(
+        &mut self,
+        site_id: &str,
+        target: DateTime<Utc>,
+        label: &str,
+        ctx: &egui::Context,
+    ) -> bool {
+        let best = self
+            .frame_history
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| frame.identity.site_id == site_id)
+            .map(|(index, frame)| {
+                let delta = frame
+                    .identity
+                    .scan_time_utc
+                    .signed_duration_since(target)
+                    .num_seconds()
+                    .abs();
+                (index, delta)
+            })
+            .min_by_key(|(_, delta)| *delta);
+        if let Some((index, delta)) = best
+            && delta <= ARCHIVE_EVENT_CACHE_HIT_MAX_SECONDS
+        {
+            self.history_playing = false;
+            self.browsing_history = true;
+            self.select_history_frame(index, false, ctx);
+            // A cache hit is immediate, not background work. Leaving a
+            // completed progress object here kept the global activity bar
+            // alive forever and made a successful click look stuck.
+            self.archive_load_progress = None;
+            self.status = format!(
+                "Selected cached {site_id} frame for {label} (within {}m)",
+                (delta + 59) / 60
+            );
+            return true;
+        }
+        false
+    }
+
+    fn jump_to_archive_event(
+        &mut self,
+        lat: f32,
+        lon: f32,
+        time_utc: DateTime<Utc>,
+        label: String,
+        ctx: &egui::Context,
+    ) {
+        let Some((site_index, _)) = self.best_archive_event_site_index(lat, lon) else {
+            self.status = "No radar within 460 km of that event".to_owned();
+            return;
+        };
+        let site_id = self.sites[site_index].level2_id.clone();
+        self.selected_site_index = site_index;
+        self.map_center_lat = lat;
+        self.map_center_lon = lon;
+        self.map_scale = self.map_scale.max(220.0);
+        self.selected_cut = 0;
+        if self.select_cached_event_frame(&site_id, time_utc, &label, ctx) {
+            return;
+        }
+        self.archive_date_input = time_utc.format("%Y-%m-%d").to_string();
+        self.archive_pending_event = Some(ArchivePendingEvent {
+            time_utc,
+            label: label.clone(),
+        });
+        self.status = format!(
+            "Event jump: {label} - listing {site_id} {}",
+            time_utc.format("%Y-%m-%d")
+        );
+        self.start_archive_listing(ctx);
+    }
+
     /// Event click: switch to the lowest-beam radar over the report, center
     /// the map there, and queue an archive load of the volume nearest the
     /// report time (fires when the listing lands).
     fn jump_to_spc_report(&mut self, report: &SpcReport, ctx: &egui::Context) {
+        let scale = if report.f_scale.is_empty() || report.f_scale == "UNK" {
+            String::new()
+        } else {
+            format!("EF{} ", report.f_scale)
+        };
+        let event_label = format!("{scale}{}, {}", report.location, report.state);
         // Lowest beam over the report location (same rule as the
         // right-click menu).
         let best = self
@@ -6416,15 +7587,52 @@ impl ViewerApp {
             self.status = "No radar within 460 km of that report".to_owned();
             return;
         };
+        let site_id = self.sites[site_index].level2_id.clone();
         self.selected_site_index = site_index;
         self.map_center_lat = report.lat;
         self.map_center_lon = report.lon;
         self.map_scale = self.map_scale.max(220.0);
+        self.selected_cut = 0;
+        if self.select_cached_event_frame(&site_id, report.time_utc, &event_label, ctx) {
+            return;
+        }
         // The report time's RADAR date can differ from the SPC file date
         // (12Z convention) — list the report's own calendar date.
         self.archive_date_input = report.time_utc.format("%Y-%m-%d").to_string();
-        self.archive_pending_event = Some(report.time_utc);
+        self.archive_pending_event = Some(ArchivePendingEvent {
+            time_utc: report.time_utc,
+            label: event_label,
+        });
         self.start_archive_listing(ctx);
+    }
+
+    fn jump_to_storm_report(&mut self, report: &spc_layers::StormReport, ctx: &egui::Context) {
+        let magnitude = report
+            .magnitude_label()
+            .map(|value| format!(" {value}"))
+            .unwrap_or_default();
+        let label = format!("{}{} {}", report.kind.label(), magnitude, report.location);
+        self.jump_to_archive_event(report.lat, report.lon, report.time_utc, label, ctx);
+    }
+
+    fn spc_report_at_position(
+        &self,
+        rect: egui::Rect,
+        position: egui::Pos2,
+    ) -> Option<spc_layers::StormReport> {
+        if !self.spc_reports_enabled {
+            return None;
+        }
+        self.reports_for_display()
+            .iter()
+            .filter_map(|report| {
+                let report_pos = self.lon_lat_to_screen(rect, report.lon, report.lat);
+                let distance = report_pos.distance(position);
+                (rect.expand(12.0).contains(report_pos) && distance <= 12.0)
+                    .then_some((distance, report.clone()))
+            })
+            .min_by(|left, right| left.0.total_cmp(&right.0))
+            .map(|(_, report)| report)
     }
 
     /// Extend the loaded archive loop further back in time: decode `count`
@@ -6461,13 +7669,35 @@ impl ViewerApp {
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
         self.pending_site_id = Some(site_id.clone());
-        self.status = format!("Extending loop {} volumes earlier", objects.len());
+        let progress = ArchiveLoadProgress {
+            label: "Archive extend".to_owned(),
+            detail: format!("Queued {site_id} {} earlier scans", objects.len()),
+            done: 0,
+            total: objects.len(),
+        };
+        self.status = progress.status_text();
+        self.archive_load_progress = Some(progress);
         let site_cache = cache_dir(&site.level2_id);
         let known_frame_paths = self.current_history_paths();
         thread::spawn(move || {
             let total_start = Instant::now();
             let mut decoded_frames = Vec::new();
-            for object in objects {
+            let count = objects.len();
+            let progress_label = "Archive extend";
+            for (index, object) in objects.into_iter().enumerate() {
+                let object_name = object
+                    .key
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&object.key)
+                    .to_owned();
+                send_archive_progress(
+                    &sender,
+                    progress_label,
+                    format!("Fetching {site_id} {object_name}"),
+                    index,
+                    count,
+                );
                 match decode_archive_history_object(
                     &site_id,
                     object,
@@ -6477,6 +7707,7 @@ impl ViewerApp {
                     total_start,
                     &sender,
                     false,
+                    true,
                 ) {
                     Ok(Some(decoded)) => {
                         let _ = sender.send(AsyncLoadResult {
@@ -6493,6 +7724,13 @@ impl ViewerApp {
                     }
                     Ok(None) => {}
                     Err(err) => {
+                        send_archive_progress(
+                            &sender,
+                            progress_label,
+                            format!("Failed {site_id} {object_name}"),
+                            index + 1,
+                            count,
+                        );
                         let _ = sender.send(AsyncLoadResult {
                             label: format!("L2 {site_id} archive extend"),
                             update: AsyncLoadUpdate::Final(Err(err)),
@@ -6500,6 +7738,13 @@ impl ViewerApp {
                         return;
                     }
                 }
+                send_archive_progress(
+                    &sender,
+                    progress_label,
+                    format!("Decoded {site_id} {object_name}"),
+                    index + 1,
+                    count,
+                );
             }
             let _ = sender.send(AsyncLoadResult {
                 label: format!("L2 {site_id} archive extend"),
@@ -6530,6 +7775,9 @@ impl ViewerApp {
             self.status = "Archive date must be YYYY-MM-DD".to_owned();
             return;
         };
+        let progress = ArchiveLoadProgress::listing(&site.level2_id, date);
+        self.status = progress.status_text();
+        self.archive_load_progress = Some(progress);
         let (sender, receiver) = mpsc::channel();
         self.archive_list_receiver = Some(receiver);
         self.archive_volumes = None;
@@ -6543,6 +7791,78 @@ impl ViewerApp {
         });
     }
 
+    fn try_start_pending_archive_selection(&mut self, ctx: &egui::Context) -> bool {
+        if let Some((window_start, window_end)) = self.event_explorer.pending_range {
+            let Some(volumes) = self.archive_volumes.as_ref() else {
+                return false;
+            };
+            let labels: Vec<String> = volumes.iter().map(|(_, label)| label.clone()).collect();
+            let listed =
+                chrono::NaiveDate::parse_from_str(self.archive_date_input.trim(), "%Y-%m-%d")
+                    .unwrap_or_else(|_| window_start.date_naive());
+            let (start_label, end_label) =
+                event_explorer::window_labels_for_date(listed, window_start, window_end);
+            let event_pad = usize::from(normalized_event_pad_frames(
+                self.app_settings.event_pad_frames,
+            ));
+            let Some((start, end)) = event_explorer::range_volume_indices(
+                &labels,
+                &start_label,
+                &end_label,
+                event_pad,
+                MAX_HISTORY_FRAME_LIMIT,
+            ) else {
+                return false;
+            };
+            self.selected_cut = 0;
+            if self.start_archive_range_load(start, end, ctx) {
+                self.event_explorer.pending_range = None;
+                self.event_explorer.pending_autoplay = true;
+                return true;
+            }
+            return false;
+        }
+
+        let Some(target) = self.archive_pending_event.clone() else {
+            return false;
+        };
+        let Some(volumes) = &self.archive_volumes else {
+            return false;
+        };
+        if volumes.is_empty() {
+            self.archive_pending_event = None;
+            self.status = format!(
+                "Archive: no volumes listed for {}",
+                target.time_utc.format("%Y-%m-%d")
+            );
+            return false;
+        }
+        let target_label = target.time_utc.format("%H:%M:%S").to_string();
+        let labels: Vec<String> = volumes.iter().map(|(_, label)| label.clone()).collect();
+        let Some(index) = event_explorer::nearest_volume_index(&labels, &target_label) else {
+            return false;
+        };
+        let requested = if self.archive_load_loop {
+            self.archive_frame_count.max(1)
+        } else {
+            1
+        };
+        let Some((start, end)) = centered_archive_loop_range(index, volumes.len(), requested)
+        else {
+            return false;
+        };
+        if self.start_archive_range_load_selecting(start, end, index, ctx) {
+            self.archive_pending_event = None;
+            self.status = format!(
+                "Event jump: {} @ {}",
+                target.label,
+                self.time_zone().format_hm(target.time_utc)
+            );
+            return true;
+        }
+        false
+    }
+
     fn poll_archive_listing(&mut self, ctx: &egui::Context) {
         let Some(receiver) = &self.archive_list_receiver else {
             return;
@@ -6550,6 +7870,7 @@ impl ViewerApp {
         match receiver.try_recv() {
             Ok(Ok(objects)) => {
                 self.archive_list_receiver = None;
+                self.archive_load_progress = None;
                 let volumes: Vec<(data_source::S3Object, String)> = objects
                     .into_iter()
                     .map(|object| {
@@ -6571,9 +7892,13 @@ impl ViewerApp {
                 // plus the user-set scans of context each side and
                 // auto-play it at the lowest tilt — "like it would have
                 // been live".
-                let event_pad = usize::from(self.app_settings.event_pad_frames);
-                let pending_range = self.event_explorer.pending_range.take().and_then(
+                let event_pad = usize::from(normalized_event_pad_frames(
+                    self.app_settings.event_pad_frames,
+                ));
+                let pending_range = self.event_explorer.pending_range.as_ref().and_then(
                     |(window_start, window_end)| {
+                        let window_start = *window_start;
+                        let window_end = *window_end;
                         let volumes = self.archive_volumes.as_ref()?;
                         let labels: Vec<String> =
                             volumes.iter().map(|(_, label)| label.clone()).collect();
@@ -6597,45 +7922,76 @@ impl ViewerApp {
                     },
                 );
                 if let Some((start, end)) = pending_range {
-                    self.event_explorer.pending_autoplay = true;
                     self.selected_cut = 0;
-                    self.start_archive_range_load(start, end, ctx);
+                    if self.start_archive_range_load(start, end, ctx) {
+                        self.event_explorer.pending_range = None;
+                        self.event_explorer.pending_autoplay = true;
+                    }
                 }
-                // Event jump: load the volume nearest the report time.
-                else if let Some(target) = self.archive_pending_event.take()
-                    && let Some(volumes) = &self.archive_volumes
-                    && !volumes.is_empty()
-                {
-                    let target_label = target.format("%H:%M:%S").to_string();
-                    let index = volumes
-                        .iter()
-                        .position(|(_, label)| label.as_str() > target_label.as_str())
-                        .unwrap_or(volumes.len())
-                        .saturating_sub(1);
-                    self.start_archive_loop_load(index, ctx);
+                // Event jump: load a +/- loop centered on the nearest
+                // volume to the report time.
+                else if let Some(target) = self.archive_pending_event.clone() {
+                    if let Some(volumes) = &self.archive_volumes
+                        && !volumes.is_empty()
+                    {
+                        let target_label = target.time_utc.format("%H:%M:%S").to_string();
+                        let labels: Vec<String> =
+                            volumes.iter().map(|(_, label)| label.clone()).collect();
+                        if let Some(index) =
+                            event_explorer::nearest_volume_index(&labels, &target_label)
+                        {
+                            let requested = if self.archive_load_loop {
+                                self.archive_frame_count.max(1)
+                            } else {
+                                1
+                            };
+                            if let Some((start, end)) =
+                                centered_archive_loop_range(index, volumes.len(), requested)
+                            {
+                                self.status = format!(
+                                    "Event jump: {} @ {}",
+                                    target.label,
+                                    self.time_zone().format_hm(target.time_utc)
+                                );
+                                if self.start_archive_range_load_selecting(start, end, index, ctx) {
+                                    self.archive_pending_event = None;
+                                }
+                            }
+                        }
+                    } else {
+                        self.archive_pending_event = None;
+                        self.status = format!(
+                            "Archive: no volumes listed for {}",
+                            target.time_utc.format("%Y-%m-%d")
+                        );
+                    }
                 }
                 ctx.request_repaint();
             }
             Ok(Err(err)) => {
                 self.archive_list_receiver = None;
+                self.archive_load_progress = None;
                 self.status = format!("Archive listing failed: {err}");
                 ctx.request_repaint();
             }
             Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => self.archive_list_receiver = None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.archive_list_receiver = None;
+                self.archive_load_progress = None;
+            }
         }
     }
 
     /// Load a loop of archive volumes ending at the chosen index (the
     /// chosen scan plus the preceding history-limit-1 scans), through the
     /// normal decode/install pipeline.
-    fn start_archive_loop_load(&mut self, chosen: usize, ctx: &egui::Context) {
+    fn start_archive_loop_load(&mut self, chosen: usize, ctx: &egui::Context) -> bool {
         let limit = if self.archive_load_loop {
             self.archive_frame_count.max(1)
         } else {
             1
         };
-        self.start_archive_range_load(chosen.saturating_sub(limit - 1), chosen, ctx);
+        self.start_archive_range_load(chosen.saturating_sub(limit - 1), chosen, ctx)
     }
 
     /// Load the archive volumes `start..=chosen` as a loop (a track
@@ -6645,25 +8001,190 @@ impl ViewerApp {
     /// eat the loop's tail), bounded by [`MAX_HISTORY_FRAME_LIMIT`].
     /// Disables live auto-refresh so the next poll doesn't snap back to
     /// the present.
-    fn start_archive_range_load(&mut self, start: usize, chosen: usize, ctx: &egui::Context) {
-        let Some(site) = self.selected_site().cloned() else {
-            return;
-        };
-        let Some(volumes) = &self.archive_volumes else {
-            return;
-        };
-        if chosen >= volumes.len() || start > chosen || self.load_receiver.is_some() {
+    fn start_archive_range_load(
+        &mut self,
+        start: usize,
+        chosen: usize,
+        ctx: &egui::Context,
+    ) -> bool {
+        self.start_archive_range_load_selecting(start, chosen, chosen, ctx)
+    }
+
+    fn start_debug_archive_case(&mut self, case: DebugArchiveCase, ctx: &egui::Context) {
+        if self.load_receiver.is_some() {
+            self.status = "Wait for the current load to finish".to_owned();
             return;
         }
-        let total_frames = (chosen - start + 1).min(MAX_HISTORY_FRAME_LIMIT);
-        let start = chosen + 1 - total_frames;
+        let Some(site_index) = self
+            .sites
+            .iter()
+            .position(|site| site.level2_id.eq_ignore_ascii_case(case.site_id))
+        else {
+            self.status = format!("Debug case site {} is not in the catalog", case.site_id);
+            return;
+        };
+
+        let site_id = self.sites[site_index].level2_id.clone();
+        self.selected_site_index = site_index;
+        self.archive_date_input = case.date_input.to_owned();
+        self.archive_loaded_range = None;
+        self.archive_volumes = None;
+        self.archive_load_loop = false;
+        self.pending_debug_archive_case = Some(case);
+        self.history_playing = false;
+        self.browsing_history = false;
+        self.realtime_level2_auto_refresh = false;
+        self.poll_active = false;
+        self.center_map_on(case.center_lat, case.center_lon);
+        self.map_scale = case.map_scale.clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
+        self.clamp_map_center();
+        if history_contains_other_site(&self.frame_history, &site_id) {
+            self.clear_frame_history();
+        }
+        self.begin_primary_load_telemetry();
+
+        let progress = ArchiveLoadProgress {
+            label: "Debug case".to_owned(),
+            detail: format!("Queued {}", case.label),
+            done: 0,
+            total: 1,
+        };
+        self.status = progress.status_text();
+        self.archive_load_progress = Some(progress.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.load_receiver = Some(receiver);
+        self.pending_site_id = Some(site_id.clone());
+        let site_cache = cache_dir(&site_id);
+        let object = case.object();
+        thread::spawn(move || {
+            let total_start = Instant::now();
+            let progress_label = progress.label;
+            let object_name = object
+                .key
+                .rsplit('/')
+                .next()
+                .unwrap_or(&object.key)
+                .to_owned();
+            send_archive_progress(
+                &sender,
+                &progress_label,
+                format!("Fetching {site_id} {object_name}"),
+                0,
+                1,
+            );
+            match decode_archive_history_object(
+                &site_id,
+                object,
+                &site_cache,
+                &BTreeSet::new(),
+                None,
+                total_start,
+                &sender,
+                false,
+                false,
+            ) {
+                Ok(Some(decoded)) => {
+                    send_archive_progress(
+                        &sender,
+                        &progress_label,
+                        format!("Decoded {site_id} {object_name}"),
+                        1,
+                        1,
+                    );
+                    let _ = sender.send(AsyncLoadResult {
+                        label: case.label.to_owned(),
+                        update: AsyncLoadUpdate::Final(Ok(DecodedLoadBatch {
+                            frames: vec![decoded],
+                            selected_index: 0,
+                        })),
+                    });
+                }
+                Ok(None) => {
+                    let _ = sender.send(AsyncLoadResult {
+                        label: case.label.to_owned(),
+                        update: AsyncLoadUpdate::Final(Err(
+                            "debug archive scan decoded no displayable products".to_owned(),
+                        )),
+                    });
+                }
+                Err(err) => {
+                    let _ = sender.send(AsyncLoadResult {
+                        label: case.label.to_owned(),
+                        update: AsyncLoadUpdate::Final(Err(err)),
+                    });
+                }
+            }
+        });
+        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+    }
+
+    fn apply_debug_archive_focus_if_pending(&mut self, ctx: &egui::Context) {
+        let Some(case) = self.pending_debug_archive_case else {
+            return;
+        };
+        let Some(volume) = self.volume.as_deref() else {
+            return;
+        };
+        if !volume.site.id.eq_ignore_ascii_case(case.site_id) {
+            return;
+        }
+        let product = case.product();
+        let cut = if is_displayable_on_cut(volume, case.preferred_cut, &product) {
+            Some(case.preferred_cut)
+        } else {
+            best_cut_for_product(volume, case.preferred_cut, &product)
+        };
+        let Some(cut) = cut else {
+            self.status = format!(
+                "Debug case loaded, but {} is not available",
+                product.label()
+            );
+            return;
+        };
+        self.selected_product = product.clone();
+        self.selected_cut = cut;
+        self.center_map_on(case.center_lat, case.center_lon);
+        self.map_scale = case.map_scale.clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
+        self.clamp_map_center();
+        self.clear_texture();
+        self.status = format!("Debug case loaded: {} {}", case.label, product.label());
+        ctx.request_repaint();
+    }
+
+    fn start_archive_range_load_selecting(
+        &mut self,
+        start: usize,
+        end: usize,
+        selected: usize,
+        ctx: &egui::Context,
+    ) -> bool {
+        let Some(site) = self.selected_site().cloned() else {
+            self.status = "No site selected".to_owned();
+            return false;
+        };
+        let Some(volumes) = &self.archive_volumes else {
+            self.status = "Archive: list a date before loading".to_owned();
+            return false;
+        };
+        if self.load_receiver.is_some() {
+            self.status = "Wait for the current load to finish".to_owned();
+            return false;
+        }
+        if end >= volumes.len() || start > end || selected < start || selected > end {
+            self.status = "Archive load request was out of range".to_owned();
+            return false;
+        }
+        let total_frames = (end - start + 1).min(MAX_HISTORY_FRAME_LIMIT);
+        let start = end + 1 - total_frames;
+        let selected = selected.clamp(start, end);
         if total_frames > self.history_frame_limit {
             self.history_frame_limit = total_frames;
         }
-        self.archive_loaded_range = Some((start, chosen));
-        let objects: Vec<data_source::S3Object> = volumes[start..=chosen]
+        self.archive_loaded_range = Some((start, end));
+        let objects: Vec<(usize, data_source::S3Object)> = volumes[start..=end]
             .iter()
-            .map(|(object, _)| object.clone())
+            .enumerate()
+            .map(|(offset, (object, _))| (start + offset, object.clone()))
             .collect();
         let site_id = site.level2_id.clone();
         if history_contains_other_site(&self.frame_history, &site_id) {
@@ -6674,15 +8195,41 @@ impl ViewerApp {
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
         self.pending_site_id = Some(site_id.clone());
-        self.status = format!("Loading {} archive volumes for {site_id}", objects.len());
+        let progress = ArchiveLoadProgress {
+            label: if objects.len() == 1 {
+                "Archive scan".to_owned()
+            } else {
+                "Archive loop".to_owned()
+            },
+            detail: format!("Queued {site_id} {} scans", objects.len()),
+            done: 0,
+            total: objects.len(),
+        };
+        self.status = progress.status_text();
+        self.archive_load_progress = Some(progress.clone());
         let site_cache = cache_dir(&site.level2_id);
         let known_frame_paths = self.current_history_paths();
         thread::spawn(move || {
             let total_start = Instant::now();
             let mut decoded_frames = Vec::new();
             let count = objects.len();
-            for (index, object) in objects.into_iter().enumerate() {
-                let is_last = index + 1 == count;
+            let mut selected_decoded_index = None;
+            let progress_label = progress.label;
+            for (index, (absolute_index, object)) in objects.into_iter().enumerate() {
+                let object_name = object
+                    .key
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&object.key)
+                    .to_owned();
+                send_archive_progress(
+                    &sender,
+                    &progress_label,
+                    format!("Fetching {site_id} {object_name}"),
+                    index,
+                    count,
+                );
+                let select_frame = absolute_index == selected;
                 match decode_archive_history_object(
                     &site_id,
                     object,
@@ -6692,8 +8239,12 @@ impl ViewerApp {
                     total_start,
                     &sender,
                     false,
+                    !select_frame,
                 ) {
                     Ok(Some(decoded)) => {
+                        if select_frame {
+                            selected_decoded_index = Some(decoded_frames.len());
+                        }
                         let _ = sender.send(AsyncLoadResult {
                             label: format!("L2 {site_id} archive"),
                             update: AsyncLoadUpdate::History(
@@ -6701,13 +8252,20 @@ impl ViewerApp {
                                     frames: vec![decoded.clone()],
                                     selected_index: 0,
                                 },
-                                is_last,
+                                select_frame,
                             ),
                         });
                         decoded_frames.push(decoded);
                     }
                     Ok(None) => {}
                     Err(err) => {
+                        send_archive_progress(
+                            &sender,
+                            &progress_label,
+                            format!("Failed {site_id} {object_name}"),
+                            index + 1,
+                            count,
+                        );
                         let _ = sender.send(AsyncLoadResult {
                             label: format!("L2 {site_id} archive"),
                             update: AsyncLoadUpdate::Final(Err(err)),
@@ -6715,6 +8273,13 @@ impl ViewerApp {
                         return;
                     }
                 }
+                send_archive_progress(
+                    &sender,
+                    &progress_label,
+                    format!("Decoded {site_id} {object_name}"),
+                    index + 1,
+                    count,
+                );
             }
             if decoded_frames.is_empty() {
                 let _ = sender.send(AsyncLoadResult {
@@ -6722,7 +8287,8 @@ impl ViewerApp {
                     update: AsyncLoadUpdate::Final(Err("no archive volumes decoded".to_owned())),
                 });
             } else {
-                let selected_index = decoded_frames.len() - 1;
+                let selected_index =
+                    selected_decoded_index.unwrap_or_else(|| decoded_frames.len() - 1);
                 let _ = sender.send(AsyncLoadResult {
                     label: format!("L2 {site_id} archive"),
                     update: AsyncLoadUpdate::Final(Ok(DecodedLoadBatch {
@@ -6733,6 +8299,7 @@ impl ViewerApp {
             }
         });
         ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+        true
     }
 
     fn start_latest_level2_load(&mut self, site: RadarSite, ctx: &egui::Context) {
@@ -6938,7 +8505,8 @@ impl eframe::App for ViewerApp {
                     "{} {}{tilt} · {}",
                     volume.site.id,
                     self.selected_product.label(),
-                    volume.volume_time.format("%Y-%m-%d %H:%M:%SZ"),
+                    self.time_zone()
+                        .format_date_hms(volume.volume_time.with_timezone(&Utc)),
                 );
                 egui::Area::new(egui::Id::new("chrome_readout"))
                     .fixed_pos(egui::pos2(10.0, 8.0))
@@ -7017,6 +8585,7 @@ impl eframe::App for ViewerApp {
         }
 
         self.model_data_window(&ctx);
+        self.radar_overlays_window(&ctx);
         self.satellite_window(&ctx);
         self.vol3d_window(&ctx);
         self.wofs_window(&ctx);
@@ -7028,9 +8597,10 @@ impl eframe::App for ViewerApp {
 
         // Workspace layout persistence (debounced; on_exit flushes).
         self.maybe_persist_workspace_layout();
+        self.request_repaint_for_background_activity(&ctx);
     }
 
-    fn on_exit(&mut self) {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if self.workspace.dirty {
             self.persist_workspace_layout();
         }
@@ -7055,6 +8625,13 @@ impl ViewerApp {
             if fixed_action_button(ui, "Reload", 62.0).clicked() {
                 self.load_volume(ui.ctx());
             }
+            if fixed_action_button(ui, "Map Only", 74.0)
+                .on_hover_text("Hide chrome and leave the map/data workspace visible (Tab or Esc restores)")
+                .clicked()
+            {
+                self.chrome_hidden = true;
+            }
+            self.workflow_menu(ui);
             self.media_top_bar_ui(ui);
             self.annotate_top_bar_ui(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -7105,8 +8682,395 @@ impl ViewerApp {
                         self.farm.select_sensor(id);
                     }
                 }
+                let new_alert_count = self.unacknowledged_hazard_event_ids.len();
+                if new_alert_count > 0 {
+                    ui.ctx().request_repaint_after(Duration::from_millis(500));
+                    let blink_on = ui.input(|input| (input.time * 2.0) as i64 % 2 == 0);
+                    let color = if blink_on {
+                        egui::Color32::from_rgb(255, 222, 92)
+                    } else {
+                        egui::Color32::from_rgb(255, 128, 88)
+                    };
+                    let label = if new_alert_count == 1 {
+                        "1 NEW ALERT".to_owned()
+                    } else {
+                        format!("{new_alert_count} NEW ALERTS")
+                    };
+                    if ui
+                        .add(
+                            egui::Label::new(egui::RichText::new(label).strong().color(color))
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Click to jump to the next unacknowledged warning")
+                        .clicked()
+                    {
+                        self.sidebar_tab = SidebarTab::Severe;
+                        if let Some(index) = self.first_unacknowledged_hazard_index() {
+                            self.focus_hazard_record(index);
+                        }
+                    }
+                }
+                if let Some(workflow) = self.current_workflow {
+                    ui.label(
+                        egui::RichText::new(workflow.label())
+                            .small()
+                            .strong()
+                            .color(ACCENT_COLOR),
+                    )
+                    .on_hover_text(
+                        "Last workflow preset applied this session. Use Workflows > Restore previous setup to undo it, or Clear marker to hide this label.",
+                    );
+                }
             });
         });
+    }
+
+    fn workflow_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Workflows ▾", |ui| {
+            ui.set_min_width(180.0);
+            if let Some(workflow) = self.current_workflow {
+                ui.weak(format!("Last applied: {}", workflow.label()));
+                if ui.button("Clear marker").clicked() {
+                    self.clear_workflow_marker();
+                    ui.close();
+                }
+                ui.separator();
+            }
+            if self.previous_workflow_snapshot.is_some() {
+                if ui
+                    .button("Restore previous setup")
+                    .on_hover_text("Undo the layout, pane, overlay, archive, model, and tool-state changes from the latest workflow preset")
+                    .clicked()
+                {
+                    self.restore_previous_workflow(ui.ctx());
+                    ui.close();
+                }
+                ui.separator();
+            }
+            for preset in WorkflowPreset::ALL {
+                if ui
+                    .button(preset.label())
+                    .on_hover_text(preset.description())
+                    .clicked()
+                {
+                    self.apply_workflow_preset(preset, ui.ctx());
+                    ui.close();
+                }
+            }
+        });
+    }
+
+    fn apply_workflow_preset(&mut self, preset: WorkflowPreset, ctx: &egui::Context) {
+        self.previous_workflow_snapshot = Some(self.capture_workflow_snapshot());
+        self.chrome_hidden = false;
+        self.cross_section_armed = false;
+        self.annotations.active_tool = None;
+        match preset {
+            WorkflowPreset::LiveSevere => {
+                self.set_workflow_layout(PanelLayout::One);
+                self.sidebar_tab = SidebarTab::Severe;
+                self.hazards_visible = true;
+                self.hazards_active_only = true;
+                self.live_hazard_auto_refresh = true;
+                self.spc_outlooks_enabled = ["cat", "torn", "wind", "hail"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+                self.spc_reports_enabled = true;
+                self.obs_enabled = true;
+                self.obs_show_metar = true;
+                self.obs_show_mesonet = true;
+                self.glm_enabled = true;
+                self.show_rotation_markers = true;
+                self.show_storm_tracks = true;
+                self.show_inspector_card = true;
+                self.vrot_tool_armed = false;
+                self.realtime_level2_auto_refresh = true;
+            }
+            WorkflowPreset::TripleSevere => {
+                self.set_workflow_layout(PanelLayout::ThreeStacked);
+                self.set_primary_product_prefer(DisplayProduct::Moment(MomentType::Reflectivity));
+                self.set_extra_pane_products(&[
+                    DisplayProduct::DealiasedVelocity,
+                    DisplayProduct::Moment(MomentType::CorrelationCoefficient),
+                ]);
+                self.sidebar_tab = SidebarTab::Radar;
+                self.hazards_visible = true;
+                self.hazards_active_only = true;
+                self.show_rotation_markers = true;
+                self.show_storm_tracks = true;
+                self.show_inspector_card = true;
+                self.vrot_tool_armed = false;
+                self.vrot_points.clear();
+            }
+            WorkflowPreset::VelocityCouplet => {
+                self.set_workflow_layout(PanelLayout::TwoVertical);
+                self.set_primary_product_prefer(DisplayProduct::DealiasedVelocity);
+                self.set_extra_pane_products(&[DisplayProduct::StormRelativeDealiasedVelocity]);
+                self.sidebar_tab = SidebarTab::Radar;
+                self.hazards_visible = true;
+                self.hazards_active_only = true;
+                self.show_rotation_markers = true;
+                self.show_storm_tracks = true;
+                self.show_inspector_card = true;
+                self.vrot_tool_armed = true;
+                self.vrot_points.clear();
+            }
+            WorkflowPreset::QuadDualPol => {
+                self.set_workflow_layout(PanelLayout::FourGrid);
+                self.set_primary_product_prefer(DisplayProduct::Moment(MomentType::Reflectivity));
+                self.set_extra_pane_products(&[
+                    DisplayProduct::Moment(MomentType::Velocity),
+                    DisplayProduct::Moment(MomentType::CorrelationCoefficient),
+                    DisplayProduct::Moment(MomentType::DifferentialReflectivity),
+                ]);
+                self.sidebar_tab = SidebarTab::Radar;
+                self.vrot_tool_armed = false;
+                self.vrot_points.clear();
+                self.show_inspector_card = true;
+            }
+            WorkflowPreset::ArchiveReview => {
+                self.set_workflow_layout(PanelLayout::One);
+                self.sidebar_tab = SidebarTab::Data;
+                self.archive_load_loop = true;
+                self.archive_frame_count =
+                    self.archive_frame_count.max(DEFAULT_ARCHIVE_FRAME_COUNT);
+                self.history_frame_limit = self.history_frame_limit.max(self.archive_frame_count);
+                self.app_settings.archive_load_loop = self.archive_load_loop;
+                self.app_settings.archive_frame_count = self.archive_frame_count as u16;
+                self.realtime_level2_auto_refresh = false;
+                self.poll_active = false;
+                self.hazards_visible = true;
+                self.hazards_active_only = false;
+                self.spc_outlooks_enabled = ["cat"].into_iter().map(str::to_owned).collect();
+                self.spc_reports_enabled = true;
+                self.history_playing = false;
+            }
+            WorkflowPreset::Documentation => {
+                self.set_workflow_layout(PanelLayout::One);
+                self.show_inspector_card = false;
+                self.vrot_tool_armed = false;
+                self.vrot_points.clear();
+                self.cross_section_armed = false;
+                self.cross_section_a_lonlat = None;
+                self.cross_section_b_lonlat = None;
+                self.cross_section_texture = None;
+                self.cross_section_signature = None;
+                self.cross_section_user_signature = None;
+                self.cross_section_status =
+                    "Cross-section: arm, then click endpoint A then B".to_owned();
+                self.annotations.active_tool = None;
+                self.annotations.draft = None;
+                self.annotations.hover_geo = None;
+                self.chrome_hidden = true;
+            }
+            WorkflowPreset::ModelContext => {
+                self.set_workflow_layout(PanelLayout::TwoVertical);
+                self.sidebar_tab = SidebarTab::Layers;
+                self.model_enabled = true;
+                self.open_viewer(dock::WorkspacePane::Model);
+                self.model_download_open = true;
+                self.obs_enabled = true;
+                self.obs_adjust_soundings = true;
+                self.glm_enabled = true;
+            }
+        }
+        self.current_workflow = Some(preset);
+        self.status = format!("Workflow: {}", preset.label());
+        self.clear_texture();
+        self.clear_extra_pane_textures();
+        ctx.request_repaint();
+    }
+
+    fn capture_workflow_snapshot(&self) -> WorkflowSnapshot {
+        WorkflowSnapshot {
+            grid_layout: self.grid_layout,
+            active_pane: self.active_pane,
+            selected_cut: self.selected_cut,
+            selected_product: self.selected_product.clone(),
+            extra_panes: self
+                .extra_panes
+                .iter()
+                .map(|pane| WorkflowPaneSnapshot {
+                    product: pane.product.clone(),
+                    cut: pane.cut,
+                })
+                .collect(),
+            sidebar_tab: self.sidebar_tab,
+            hazards_visible: self.hazards_visible,
+            hazards_active_only: self.hazards_active_only,
+            live_hazard_auto_refresh: self.live_hazard_auto_refresh,
+            spc_outlooks_enabled: self.spc_outlooks_enabled.clone(),
+            spc_reports_enabled: self.spc_reports_enabled,
+            obs_enabled: self.obs_enabled,
+            obs_show_metar: self.obs_show_metar,
+            obs_show_mesonet: self.obs_show_mesonet,
+            obs_adjust_soundings: self.obs_adjust_soundings,
+            glm_enabled: self.glm_enabled,
+            model_enabled: self.model_enabled,
+            model_download_open: self.model_download_open,
+            model_viewer_mode: self.viewer_mode(dock::WorkspacePane::Model),
+            show_rotation_markers: self.show_rotation_markers,
+            show_storm_tracks: self.show_storm_tracks,
+            show_inspector_card: self.show_inspector_card,
+            vrot_tool_armed: self.vrot_tool_armed,
+            vrot_points: self.vrot_points.clone(),
+            cross_section_armed: self.cross_section_armed,
+            cross_section_a_lonlat: self.cross_section_a_lonlat,
+            cross_section_b_lonlat: self.cross_section_b_lonlat,
+            cross_section_status: self.cross_section_status.clone(),
+            annotation_tool: self.annotations.active_tool,
+            annotation_draft: self.annotations.draft.clone(),
+            annotation_hover_geo: self.annotations.hover_geo,
+            chrome_hidden: self.chrome_hidden,
+            archive_load_loop: self.archive_load_loop,
+            archive_frame_count: self.archive_frame_count,
+            history_frame_limit: self.history_frame_limit,
+            history_playing: self.history_playing,
+            realtime_level2_auto_refresh: self.realtime_level2_auto_refresh,
+            poll_active: self.poll_active,
+        }
+    }
+
+    fn restore_previous_workflow(&mut self, ctx: &egui::Context) {
+        let Some(snapshot) = self.previous_workflow_snapshot.take() else {
+            self.status = "No workflow setup to restore".to_owned();
+            return;
+        };
+        self.restore_workflow_snapshot(snapshot);
+        self.current_workflow = None;
+        self.status = "Restored setup before workflow".to_owned();
+        self.clear_texture();
+        self.clear_extra_pane_textures();
+        ctx.request_repaint();
+    }
+
+    fn restore_workflow_snapshot(&mut self, snapshot: WorkflowSnapshot) {
+        self.selected_cut = snapshot.selected_cut;
+        self.selected_product = snapshot.selected_product;
+        self.pending_grid_layout = None;
+        self.grid_layout = snapshot.grid_layout;
+        self.app_settings.grid_pane_count = snapshot.grid_layout.panel_count();
+        self.sync_extra_panes();
+        for (pane, pane_snapshot) in self.extra_panes.iter_mut().zip(snapshot.extra_panes) {
+            pane.product = pane_snapshot.product;
+            pane.cut = pane_snapshot.cut;
+            pane.render_ms = None;
+        }
+        self.active_pane = snapshot
+            .active_pane
+            .min(self.grid_layout.panel_count().saturating_sub(1));
+        self.sidebar_tab = snapshot.sidebar_tab;
+        self.hazards_visible = snapshot.hazards_visible;
+        self.hazards_active_only = snapshot.hazards_active_only;
+        self.live_hazard_auto_refresh = snapshot.live_hazard_auto_refresh;
+        self.spc_outlooks_enabled = snapshot.spc_outlooks_enabled;
+        self.spc_reports_enabled = snapshot.spc_reports_enabled;
+        self.obs_enabled = snapshot.obs_enabled;
+        self.obs_show_metar = snapshot.obs_show_metar;
+        self.obs_show_mesonet = snapshot.obs_show_mesonet;
+        self.obs_adjust_soundings = snapshot.obs_adjust_soundings;
+        self.glm_enabled = snapshot.glm_enabled;
+        self.model_enabled = snapshot.model_enabled;
+        self.model_download_open = snapshot.model_download_open;
+        self.restore_viewer_mode(dock::WorkspacePane::Model, snapshot.model_viewer_mode);
+        self.show_rotation_markers = snapshot.show_rotation_markers;
+        self.show_storm_tracks = snapshot.show_storm_tracks;
+        self.show_inspector_card = snapshot.show_inspector_card;
+        self.vrot_tool_armed = snapshot.vrot_tool_armed;
+        self.vrot_points = snapshot.vrot_points;
+        self.cross_section_armed = snapshot.cross_section_armed;
+        self.cross_section_a_lonlat = snapshot.cross_section_a_lonlat;
+        self.cross_section_b_lonlat = snapshot.cross_section_b_lonlat;
+        self.cross_section_status = snapshot.cross_section_status;
+        self.cross_section_texture = None;
+        self.cross_section_signature = None;
+        self.cross_section_user_signature = None;
+        self.annotations.active_tool = snapshot.annotation_tool;
+        self.annotations.draft = snapshot.annotation_draft;
+        self.annotations.hover_geo = snapshot.annotation_hover_geo;
+        self.chrome_hidden = snapshot.chrome_hidden;
+        self.archive_load_loop = snapshot.archive_load_loop;
+        self.archive_frame_count = normalized_archive_frame_count(snapshot.archive_frame_count);
+        self.history_frame_limit = normalized_history_limit(snapshot.history_frame_limit);
+        self.history_playing = snapshot.history_playing;
+        self.realtime_level2_auto_refresh = snapshot.realtime_level2_auto_refresh;
+        self.poll_active = snapshot.poll_active;
+        self.app_settings.archive_load_loop = self.archive_load_loop;
+        self.app_settings.archive_frame_count = self.archive_frame_count as u16;
+        self.app_settings.overlay_obs = self.obs_enabled;
+        self.app_settings.overlay_obs_metar = self.obs_show_metar;
+        self.app_settings.overlay_obs_mesonet = self.obs_show_mesonet;
+        self.app_settings.overlay_glm = self.glm_enabled;
+        self.app_settings.overlay_spc_outlooks = self.spc_outlooks_enabled.clone();
+        self.app_settings.overlay_spc_reports = self.spc_reports_enabled;
+    }
+
+    fn restore_viewer_mode(&mut self, pane: dock::WorkspacePane, mode: dock::ViewerMode) {
+        match mode {
+            dock::ViewerMode::Hidden => {
+                self.set_viewer_open(pane, false);
+                self.workspace.undock(pane);
+            }
+            dock::ViewerMode::Floating => {
+                self.set_viewer_open(pane, true);
+                self.workspace.undock(pane);
+            }
+            dock::ViewerMode::Docked => {
+                self.set_viewer_open(pane, true);
+                if !self.workspace.is_docked(pane) {
+                    self.workspace.dock(pane);
+                }
+            }
+        }
+    }
+
+    fn clear_workflow_marker(&mut self) {
+        self.current_workflow = None;
+        self.status = "Workflow marker cleared".to_owned();
+    }
+
+    fn set_workflow_layout(&mut self, layout: PanelLayout) {
+        self.pending_grid_layout = None;
+        self.grid_layout = layout;
+        self.active_pane = 0;
+        self.app_settings.grid_pane_count = layout.panel_count();
+        self.sync_extra_panes();
+    }
+
+    fn set_primary_product_prefer(&mut self, product: DisplayProduct) {
+        if let Some(volume) = self.volume.as_deref() {
+            let cut = if is_displayable_on_cut(volume, self.selected_cut, &product) {
+                Some(self.selected_cut)
+            } else {
+                best_cut_for_product(volume, self.selected_cut, &product)
+            };
+            if let Some(cut) = cut {
+                self.selected_cut = cut;
+                self.selected_product = product;
+            }
+        } else {
+            self.selected_product = product;
+        }
+    }
+
+    fn set_extra_pane_products(&mut self, products: &[DisplayProduct]) {
+        self.sync_extra_panes();
+        for (pane, product) in self.extra_panes.iter_mut().zip(products.iter()) {
+            pane.product = product.clone();
+            pane.cut = None;
+            pane.render_ms = None;
+        }
+    }
+
+    fn clear_extra_pane_textures(&mut self) {
+        for pane in &mut self.extra_panes {
+            pane.texture = None;
+            pane.texture_key = None;
+            pane.pending_render_key = None;
+            pane.render_ms = None;
+        }
     }
 
     /// `Windows ▾` — the one scalable home for every data window (ui-overhaul
@@ -7122,6 +9086,11 @@ impl ViewerApp {
                     dock::WorkspacePane::Model,
                     "Model data",
                     "NWP model fields + skew-T soundings (rusty-weather store) — turns the model master switch on if needed",
+                ),
+                (
+                    dock::WorkspacePane::RadarOverlays,
+                    "Radar overlays",
+                    "Separate window/pane for extra radars: visibility, opacity, refresh, center, promote, and remove",
                 ),
                 (
                     dock::WorkspacePane::Satellite,
@@ -7248,14 +9217,11 @@ impl ViewerApp {
             }
             SidebarTab::Layers => {
                 egui::ScrollArea::vertical()
-                    .id_salt("sidebar_layers_tab")
+                    .id_salt("sidebar_custom_tab")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        self.layers_rail(ui, ctx);
-                        ui.add_space(4.0);
-                        self.add_layer_menu(ui, ctx);
-                        self.oa_analysis_section(ui, ctx);
+                        self.customization_panel(ui, ctx);
                     });
             }
             SidebarTab::Severe => {
@@ -7318,7 +9284,9 @@ impl ViewerApp {
         body: impl FnOnce(&mut Self, &mut egui::Ui) -> R,
     ) -> Option<R> {
         let open = self.section_open(key, default_open);
-        let response = egui::CollapsingHeader::new(label)
+        Self::section_rule(ui);
+        let header_text = egui::RichText::new(label).strong().color(SUBHEAD_COLOR);
+        let response = egui::CollapsingHeader::new(header_text)
             .id_salt(key)
             .open(Some(open))
             .show(ui, |ui| body(self, ui));
@@ -7326,6 +9294,596 @@ impl ViewerApp {
             self.set_section_open(key, !open);
         }
         response.body_returned
+    }
+
+    fn customization_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.open_color_tables_request {
+            self.open_color_tables_request = false;
+            self.set_section_open("customize_appearance", true);
+        }
+        self.remembered_section(ui, "customize_map_layers", "Map layers", true, |app, ui| {
+            app.radar_marker_label_toggle(ui, ctx);
+            ui.separator();
+            app.layers_rail(ui, ctx);
+        });
+        self.remembered_section(ui, "customize_add_layer", "Add layer", true, |app, ui| {
+            app.add_layer_menu(ui, ctx);
+        });
+        self.remembered_section(
+            ui,
+            "customize_analysis_overlays",
+            "Analysis overlays",
+            false,
+            |app, ui| {
+                app.oa_analysis_section(ui, ctx);
+            },
+        );
+        self.remembered_section(
+            ui,
+            "customize_appearance",
+            "Appearance",
+            false,
+            |app, ui| {
+                app.appearance_panel(ui, ctx);
+            },
+        );
+    }
+
+    fn appearance_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.appearance_profile_row(ui, ctx);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Style overrides");
+            let reset_enabled = !self.styles_newer_schema && self.style_settings != Default::default();
+            if ui
+                .add_enabled(reset_enabled, egui::Button::new("Reset all"))
+                .on_hover_text(if self.styles_newer_schema {
+                    "styles.json was written by a newer BowEcho; reset is disabled so this build cannot clobber it"
+                } else {
+                    "Delete all styles.json overrides and return map appearance to built-in defaults"
+                })
+                .clicked()
+            {
+                self.reset_style_overrides(ctx);
+            }
+        });
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Map backdrop");
+            let mut color = self
+                .style_settings
+                .map
+                .background_color
+                .unwrap_or(self.style_registry.map().background_color);
+            let response = ui.color_edit_button_srgba_unmultiplied(&mut color);
+            if response.changed() {
+                color[3] = 255;
+                self.style_settings.map.background_color = Some(color);
+                self.rebuild_style_registry();
+                self.save_styles();
+                ctx.request_repaint();
+            }
+            if fixed_action_button(ui, "Reset", 52.0)
+                .on_hover_text("Reset to the built-in dark map backdrop")
+                .clicked()
+            {
+                self.style_settings.map.background_color = None;
+                self.rebuild_style_registry();
+                self.save_styles();
+                ctx.request_repaint();
+            }
+        });
+        ui.separator();
+        self.hazard_polygon_style_panel(ui, ctx);
+        ui.separator();
+        self.radar_age_style_panel(ui, ctx);
+        ui.separator();
+        ui.label(egui::RichText::new("Color tables").strong());
+        self.color_table_panel(ui, ctx);
+    }
+
+    fn radar_marker_label_toggle(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut show = self.app_settings.show_radar_labels;
+        if ui
+            .checkbox(&mut show, "Radar labels")
+            .on_hover_text("Show radar-site and TDWR/Txxx labels next to map markers. Markers remain visible and clickable when this is off.")
+            .changed()
+        {
+            self.app_settings.show_radar_labels = show;
+            let _ = self.app_settings.save();
+            ctx.request_repaint();
+        }
+    }
+
+    fn appearance_profile_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Profile");
+            let active = self.active_appearance_profile();
+            let modified = self.appearance_profile_modified(active);
+            let selected_text = if modified {
+                format!("{} (modified)", active.label())
+            } else {
+                active.label().to_owned()
+            };
+            let mut chosen = active;
+            ui.add_enabled_ui(!self.styles_newer_schema, |ui| {
+                egui::ComboBox::from_id_salt("appearance_profile")
+                    .selected_text(selected_text)
+                    .width(ui_theme::COMBO_MAX_W)
+                    .show_ui(ui, |ui| {
+                        for profile in AppearanceProfile::ALL {
+                            ui.selectable_value(&mut chosen, profile, profile.label())
+                                .on_hover_text(profile.description());
+                        }
+                    });
+            })
+            .response
+            .on_disabled_hover_text(
+                "styles.json was written by a newer BowEcho; profile switching is disabled so this build cannot clobber it",
+            );
+
+            if chosen != active && !self.styles_newer_schema {
+                self.apply_appearance_profile(chosen, ctx);
+            }
+            if modified {
+                ui.weak("modified");
+            }
+        });
+    }
+
+    fn active_appearance_profile(&self) -> AppearanceProfile {
+        AppearanceProfile::from_label(&self.app_settings.style_profile)
+            .unwrap_or(AppearanceProfile::BowEchoDefault)
+    }
+
+    fn appearance_profile_modified(&self, profile: AppearanceProfile) -> bool {
+        self.style_settings != profile.style_settings()
+            || self.app_settings.palette_by_family != profile.palette_by_family()
+            || self.app_settings.palette_by_product != profile.palette_by_product()
+    }
+
+    fn apply_appearance_profile_in_memory(&mut self, profile: AppearanceProfile) -> Vec<String> {
+        self.style_settings = profile.style_settings();
+        self.rebuild_style_registry();
+        self.app_settings.style_profile = profile.label().to_owned();
+        self.app_settings.palette_by_family = profile.palette_by_family();
+        self.app_settings.palette_by_product = profile.palette_by_product();
+
+        self.color_tables = ColorTableSet::default();
+        let mut misses = restore_palette_bindings(
+            &mut self.color_tables,
+            &self.app_settings.palette_by_family,
+            &self.user_color_tables,
+        );
+        let (overrides, product_misses) = resolve_product_palette_overrides(
+            &self.app_settings.palette_by_product,
+            &self.user_color_tables,
+        );
+        self.palette_product_overrides = overrides;
+        misses.extend(product_misses);
+        self.clear_texture();
+        misses
+    }
+
+    fn apply_appearance_profile(&mut self, profile: AppearanceProfile, ctx: &egui::Context) {
+        if self.styles_newer_schema {
+            self.status =
+                "Profile switch disabled because styles.json was written by a newer BowEcho"
+                    .to_owned();
+            return;
+        }
+        let misses = self.apply_appearance_profile_in_memory(profile);
+        let style_result = styles::save(&self.style_settings);
+        let settings_result = self.app_settings.save();
+        self.color_table_status = if misses.is_empty() {
+            format!("Profile palettes applied: {}", profile.label())
+        } else {
+            misses.join("\n")
+        };
+        self.status = match (style_result, settings_result) {
+            (Ok(()), Ok(())) => format!("Applied appearance profile: {}", profile.label()),
+            (Err(style_error), Ok(())) => {
+                format!("Applied profile in session; style save failed: {style_error}")
+            }
+            (Ok(()), Err(settings_error)) => {
+                format!("Applied profile in session; settings save failed: {settings_error}")
+            }
+            (Err(style_error), Err(settings_error)) => format!(
+                "Applied profile in session; saves failed: styles {style_error}; settings {settings_error}"
+            ),
+        };
+        ctx.request_repaint();
+    }
+
+    fn radar_age_style_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label(egui::RichText::new("Radar age").strong());
+        let resolved = self.style_registry.radar_age().clone();
+        ui.horizontal_wrapped(|ui| {
+            let mut ring_enabled = resolved.ring_enabled;
+            if ui
+                .checkbox(&mut ring_enabled, "Age ring")
+                .on_hover_text("Color the radar data-edge ring by scan age")
+                .changed()
+            {
+                self.style_settings.radar_age.ring_enabled = Some(ring_enabled);
+                self.rebuild_style_registry();
+                self.save_styles();
+                ctx.request_repaint();
+            }
+
+            let mut glyph_arc_enabled = resolved.glyph_arc_enabled;
+            if ui
+                .checkbox(&mut glyph_arc_enabled, "Marker arc")
+                .on_hover_text("Draw a fixed-size age arc around loaded radar site markers")
+                .changed()
+            {
+                self.style_settings.radar_age.glyph_arc_enabled = Some(glyph_arc_enabled);
+                self.rebuild_style_registry();
+                self.save_styles();
+                ctx.request_repaint();
+            }
+
+            let mut glyph_arc_radius_px = resolved.glyph_arc_radius_px.clamp(4.0, 24.0);
+            let arc_radius_response = ui
+                .add(
+                    egui::DragValue::new(&mut glyph_arc_radius_px)
+                        .range(4.0..=24.0)
+                        .speed(0.25)
+                        .prefix("Arc ")
+                        .suffix(" px"),
+                )
+                .on_hover_text("Fixed screen radius for loaded-site age arcs");
+            if arc_radius_response.changed() {
+                self.style_settings.radar_age.glyph_arc_radius_px =
+                    Some(glyph_arc_radius_px.clamp(4.0, 24.0));
+                self.rebuild_style_registry();
+                ctx.request_repaint();
+            }
+            if arc_radius_response.drag_stopped()
+                || (arc_radius_response.changed() && !arc_radius_response.dragged())
+            {
+                self.save_styles();
+            }
+
+            let mut stale_minutes =
+                (resolved.stale_chip_seconds.max(0) as f32 / 60.0).clamp(1.0, 60.0);
+            let stale_response = ui
+                .add(
+                    egui::DragValue::new(&mut stale_minutes)
+                        .range(1.0..=60.0)
+                        .speed(0.25)
+                        .prefix("STALE ")
+                        .suffix(" min"),
+                )
+                .on_hover_text("Live radar older than this shows the STALE chip");
+            if stale_response.changed() {
+                self.style_settings.radar_age.stale_chip_seconds =
+                    Some((stale_minutes * 60.0).round() as i64);
+                self.rebuild_style_registry();
+                ctx.request_repaint();
+            }
+            if stale_response.drag_stopped()
+                || (stale_response.changed() && !stale_response.dragged())
+            {
+                self.save_styles();
+            }
+
+            if fixed_action_button(ui, "Reset", 52.0)
+                .on_hover_text("Reset radar-age ring, marker arc, thresholds, chip, and colors")
+                .clicked()
+            {
+                self.style_settings.radar_age = styles::RadarAgeStyleOverride::default();
+                self.rebuild_style_registry();
+                self.save_styles();
+                ctx.request_repaint();
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Age thresholds")
+                .on_hover_text("Colors move from fresh to aging to stale to expired by scan age");
+            let mut fresh_minutes = (resolved.green_seconds.max(1) as f32 / 60.0).clamp(0.5, 240.0);
+            let mut aging_minutes =
+                (resolved.yellow_seconds.max(1) as f32 / 60.0).clamp(0.5, 240.0);
+            let mut stale_minutes = (resolved.red_seconds.max(1) as f32 / 60.0).clamp(0.5, 240.0);
+
+            let fresh_response = ui
+                .add(
+                    egui::DragValue::new(&mut fresh_minutes)
+                        .range(0.5..=240.0)
+                        .speed(0.25)
+                        .prefix("Fresh <= ")
+                        .suffix(" min"),
+                )
+                .on_hover_text("Age that still renders as the fresh color");
+            let aging_response = ui
+                .add(
+                    egui::DragValue::new(&mut aging_minutes)
+                        .range(0.5..=240.0)
+                        .speed(0.25)
+                        .prefix("Aging <= ")
+                        .suffix(" min"),
+                )
+                .on_hover_text("Age where the gradient reaches the aging color");
+            let stale_response = ui
+                .add(
+                    egui::DragValue::new(&mut stale_minutes)
+                        .range(0.5..=240.0)
+                        .speed(0.25)
+                        .prefix("Stale <= ")
+                        .suffix(" min"),
+                )
+                .on_hover_text(
+                    "Age where the gradient reaches stale and the marker arc becomes full",
+                );
+
+            if fresh_response.changed() || aging_response.changed() || stale_response.changed() {
+                let fresh_seconds = ((fresh_minutes * 60.0).round() as i64).max(1);
+                let aging_seconds = ((aging_minutes * 60.0).round() as i64).max(fresh_seconds);
+                let stale_seconds = ((stale_minutes * 60.0).round() as i64).max(aging_seconds);
+                self.style_settings.radar_age.green_seconds = Some(fresh_seconds);
+                self.style_settings.radar_age.yellow_seconds = Some(aging_seconds);
+                self.style_settings.radar_age.red_seconds = Some(stale_seconds);
+                self.rebuild_style_registry();
+                ctx.request_repaint();
+            }
+            let thresholds_committed = fresh_response.drag_stopped()
+                || aging_response.drag_stopped()
+                || stale_response.drag_stopped()
+                || (fresh_response.changed() && !fresh_response.dragged())
+                || (aging_response.changed() && !aging_response.dragged())
+                || (stale_response.changed() && !stale_response.dragged());
+            if thresholds_committed {
+                self.save_styles();
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            let mut fresh = self
+                .style_settings
+                .radar_age
+                .fresh_color
+                .unwrap_or(resolved.fresh_color);
+            ui.label("Fresh");
+            if ui
+                .color_edit_button_srgba_unmultiplied(&mut fresh)
+                .changed()
+            {
+                self.style_settings.radar_age.fresh_color = Some(fresh);
+                self.rebuild_style_registry();
+                self.save_styles();
+                ctx.request_repaint();
+            }
+
+            let mut aging = self
+                .style_settings
+                .radar_age
+                .aging_color
+                .unwrap_or(resolved.aging_color);
+            ui.label("Aging");
+            if ui
+                .color_edit_button_srgba_unmultiplied(&mut aging)
+                .changed()
+            {
+                self.style_settings.radar_age.aging_color = Some(aging);
+                self.rebuild_style_registry();
+                self.save_styles();
+                ctx.request_repaint();
+            }
+
+            let mut stale = self
+                .style_settings
+                .radar_age
+                .stale_color
+                .unwrap_or(resolved.stale_color);
+            ui.label("Stale");
+            if ui
+                .color_edit_button_srgba_unmultiplied(&mut stale)
+                .changed()
+            {
+                self.style_settings.radar_age.stale_color = Some(stale);
+                self.rebuild_style_registry();
+                self.save_styles();
+                ctx.request_repaint();
+            }
+
+            let mut expired = self
+                .style_settings
+                .radar_age
+                .expired_color
+                .unwrap_or(resolved.expired_color);
+            ui.label("Expired");
+            if ui
+                .color_edit_button_srgba_unmultiplied(&mut expired)
+                .changed()
+            {
+                self.style_settings.radar_age.expired_color = Some(expired);
+                self.rebuild_style_registry();
+                self.save_styles();
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn hazard_polygon_style_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label(egui::RichText::new("Warning polygons").strong());
+        ui.horizontal_wrapped(|ui| {
+            let global = self.style_registry.hazard_global().clone();
+            let mut fill_alpha = global.fill_alpha as f32;
+            let fill_response = ui.add(egui::Slider::new(&mut fill_alpha, 0.0..=80.0).text("Fill"));
+            if fill_response.changed() {
+                self.style_settings.hazard_global.fill_alpha = Some(fill_alpha.round() as u8);
+                self.rebuild_style_registry();
+                ctx.request_repaint();
+            }
+            if fill_response.drag_stopped() || (fill_response.changed() && !fill_response.dragged())
+            {
+                self.save_styles();
+            }
+
+            let mut stroke_scale = global.stroke_width_scale;
+            let stroke_response =
+                ui.add(egui::Slider::new(&mut stroke_scale, 0.5..=3.0).text("Width"));
+            if stroke_response.changed() {
+                self.style_settings.hazard_global.stroke_width_scale =
+                    Some((stroke_scale * 100.0).round() / 100.0);
+                self.rebuild_style_registry();
+                ctx.request_repaint();
+            }
+            if stroke_response.drag_stopped()
+                || (stroke_response.changed() && !stroke_response.dragged())
+            {
+                self.save_styles();
+            }
+
+            let mut selected_boost = global.selected_width_boost;
+            let selected_response =
+                ui.add(egui::Slider::new(&mut selected_boost, 0.0..=4.0).text("Selected +"));
+            if selected_response.changed() {
+                self.style_settings.hazard_global.selected_width_boost =
+                    Some((selected_boost * 100.0).round() / 100.0);
+                self.rebuild_style_registry();
+                ctx.request_repaint();
+            }
+            if selected_response.drag_stopped()
+                || (selected_response.changed() && !selected_response.dragged())
+            {
+                self.save_styles();
+            }
+
+            if fixed_action_button(ui, "Reset", 52.0)
+                .on_hover_text("Reset global warning-polygon alpha and width defaults")
+                .clicked()
+            {
+                self.style_settings.hazard_global = styles::HazardGlobalOverride::default();
+                self.rebuild_style_registry();
+                self.save_styles();
+                ctx.request_repaint();
+            }
+        });
+
+        let selection_id = ui.make_persistent_id("appearance_hazard_polygon_style_key");
+        let mut selected_key = ctx
+            .data_mut(|data| data.get_persisted::<String>(selection_id))
+            .filter(|key| hazard_style_key_known(key))
+            .unwrap_or_else(|| HAZARD_STYLE_DEFAULT_KEY.to_owned());
+        ui.horizontal(|ui| {
+            ui.label("Family");
+            egui::ComboBox::from_id_salt("appearance_hazard_polygon_style_combo")
+                .selected_text(hazard_style_label(&selected_key))
+                .width(ui_theme::COMBO_MAX_W)
+                .show_ui(ui, |ui| {
+                    for key in hazard_style_keys() {
+                        ui.selectable_value(
+                            &mut selected_key,
+                            (*key).to_owned(),
+                            hazard_style_label(key),
+                        );
+                    }
+                });
+            if self.style_settings.hazards.contains_key(&selected_key)
+                && fixed_action_button(ui, "Reset", 52.0)
+                    .on_hover_text("Reset this warning polygon family to built-in styling")
+                    .clicked()
+            {
+                self.style_settings.hazards.remove(&selected_key);
+                self.rebuild_style_registry();
+                self.save_styles();
+                ctx.request_repaint();
+            }
+        });
+        ctx.data_mut(|data| data.insert_persisted(selection_id, selected_key.clone()));
+
+        let resolved = hazard_style_resolved_polygon(&self.style_registry, &selected_key);
+        let existing = self
+            .style_settings
+            .hazards
+            .get(&selected_key)
+            .cloned()
+            .unwrap_or_default();
+
+        ui.horizontal_wrapped(|ui| {
+            let mut stroke_color = existing.stroke_color.unwrap_or(resolved.stroke_color);
+            ui.label("Stroke");
+            if ui
+                .color_edit_button_srgba_unmultiplied(&mut stroke_color)
+                .changed()
+            {
+                self.style_settings
+                    .hazards
+                    .entry(selected_key.clone())
+                    .or_default()
+                    .stroke_color = Some(stroke_color);
+                self.rebuild_style_registry();
+                self.save_styles();
+                ctx.request_repaint();
+            }
+
+            let mut fill_color = existing.fill_color.unwrap_or(resolved.fill_color);
+            ui.label("Fill");
+            if ui
+                .color_edit_button_srgba_unmultiplied(&mut fill_color)
+                .changed()
+            {
+                self.style_settings
+                    .hazards
+                    .entry(selected_key.clone())
+                    .or_default()
+                    .fill_color = Some(fill_color);
+                self.rebuild_style_registry();
+                self.save_styles();
+                ctx.request_repaint();
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            let mut stroke_width = existing.stroke_width.unwrap_or(resolved.stroke_width);
+            let width_response =
+                ui.add(egui::Slider::new(&mut stroke_width, 0.5..=8.0).text("Line px"));
+            if width_response.changed() {
+                self.style_settings
+                    .hazards
+                    .entry(selected_key.clone())
+                    .or_default()
+                    .stroke_width = Some((stroke_width * 100.0).round() / 100.0);
+                self.rebuild_style_registry();
+                ctx.request_repaint();
+            }
+            if width_response.drag_stopped()
+                || (width_response.changed() && !width_response.dragged())
+            {
+                self.save_styles();
+            }
+
+            let current_dash = existing.dash.unwrap_or(resolved.dash);
+            let mut dash = current_dash;
+            egui::ComboBox::from_id_salt("appearance_hazard_polygon_dash")
+                .selected_text(hazard_dash_label(dash))
+                .width(104.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut dash, styles::DashPattern::Solid, "Solid");
+                    ui.selectable_value(
+                        &mut dash,
+                        styles::DashPattern::Dashed {
+                            dash: 9.0,
+                            gap: 6.0,
+                        },
+                        "Dashed",
+                    );
+                    ui.selectable_value(&mut dash, styles::DashPattern::Dotted, "Dotted");
+                });
+            if dash != current_dash {
+                self.style_settings
+                    .hazards
+                    .entry(selected_key.clone())
+                    .or_default()
+                    .dash = Some(dash);
+                self.rebuild_style_registry();
+                self.save_styles();
+                ctx.request_repaint();
+            }
+        });
+        ui.weak("These style changes apply to live alerts, watches, SPC discussions, and loaded text polygons.");
     }
 
     /// DATA — acquisition and sources (spec §1): the archive browser, live
@@ -7417,7 +9975,7 @@ impl ViewerApp {
     /// Small uppercase section header — visual rhythm for the Radar tab.
     fn section_header(ui: &mut egui::Ui, label: &str) {
         ui.add_space(SECTION_SPACING);
-        ui.separator();
+        Self::section_rule(ui);
         ui.label(
             egui::RichText::new(label)
                 .small()
@@ -7426,10 +9984,34 @@ impl ViewerApp {
         );
     }
 
+    fn section_rule(ui: &mut egui::Ui) {
+        let width = ui.available_width().max(1.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
+        ui.painter().line_segment(
+            [rect.left_center(), rect.right_center()],
+            egui::Stroke::new(1.0, SECTION_SEPARATOR_COLOR),
+        );
+    }
+
     /// The persisted unit-system preference, parsed (imperial unless the
     /// config says "metric") — every units-aware readout reads this.
     fn units(&self) -> units::Units {
         units::Units::from_settings(&self.app_settings)
+    }
+
+    /// Operator-facing timestamp display zone. Fetch/listing internals stay UTC.
+    fn time_zone(&self) -> DisplayTimeZone {
+        DisplayTimeZone::from_settings(&self.app_settings)
+    }
+
+    fn set_data_folder_override_in_memory(&mut self, dir: PathBuf) {
+        self.app_settings.data_dir = dir.display().to_string();
+        self.status = "Data folder saved - restart BowEcho to apply".to_owned();
+    }
+
+    fn reset_data_folder_override_in_memory(&mut self) {
+        self.app_settings.data_dir.clear();
+        self.status = "Data folder reset - restart BowEcho to apply".to_owned();
     }
 
     /// Display preferences (Settings ▸ Display).
@@ -7503,6 +10085,36 @@ impl ViewerApp {
              imperial is the default — metric is this one click.",
         );
         ui.horizontal(|ui| {
+            ui.label("Time zone");
+            let current = self.time_zone();
+            let mut picked = None;
+            egui::ComboBox::from_id_salt("display_time_zone")
+                .selected_text(current.label())
+                .width(118.0)
+                .show_ui(ui, |ui| {
+                    for option in DisplayTimeZone::ALL {
+                        if ui
+                            .selectable_label(current == option, option.label())
+                            .clicked()
+                        {
+                            picked = Some(option);
+                        }
+                    }
+                });
+            if let Some(option) = picked
+                && option != current
+            {
+                self.app_settings.time_zone = option.slug().to_owned();
+                let _ = self.app_settings.save();
+                ctx.request_repaint();
+            }
+        })
+        .response
+        .on_hover_text(
+            "Display-only time zone for map chips and readouts. Archive keys, \
+             SPC/day logic, and downloads stay UTC so midnight cases do not shift.",
+        );
+        ui.horizontal(|ui| {
             ui.label("Basemap");
             let mut changed_style = None;
             egui::ComboBox::from_id_salt("basemap_style")
@@ -7557,20 +10169,12 @@ impl ViewerApp {
             if ui
                 .button("Reset layout")
                 .on_hover_text(
-                    "Undock every viewer pane and return the map to the full \
-                     workspace (docked viewers reopen as floating windows)",
+                    "Clear the saved workspace and pane layout, then return the map \
+                     to a single full workspace",
                 )
                 .clicked()
             {
-                // Docked viewers keep showing, just floating again.
-                let docked: Vec<dock::WorkspacePane> = dock::WorkspacePane::VIEWERS
-                    .into_iter()
-                    .filter(|pane| self.workspace.is_docked(*pane))
-                    .collect();
-                self.workspace.reset();
-                for pane in docked {
-                    self.set_viewer_open(pane, true);
-                }
+                self.reset_workspace_layout();
                 ctx.request_repaint();
             }
         });
@@ -7602,18 +10206,21 @@ impl ViewerApp {
                     .set_title("Choose the BowEcho data folder")
                     .pick_folder()
             {
-                self.app_settings.data_dir = dir.display().to_string();
+                self.set_data_folder_override_in_memory(dir);
                 let _ = self.app_settings.save();
-                self.status = "Data folder saved — restart BowEcho to apply".to_owned();
             }
+            let has_data_folder_override = !self.app_settings.data_dir.trim().is_empty();
             if ui
-                .button("Default")
-                .on_hover_text("Return to the platform app-data location (restart to apply)")
+                .add_enabled(has_data_folder_override, egui::Button::new("Default"))
+                .on_hover_text(if has_data_folder_override {
+                    "Return to the platform app-data location (restart to apply)"
+                } else {
+                    "Already using the platform app-data location"
+                })
                 .clicked()
             {
-                self.app_settings.data_dir.clear();
+                self.reset_data_folder_override_in_memory();
                 let _ = self.app_settings.save();
-                self.status = "Data folder reset — restart BowEcho to apply".to_owned();
             }
         });
     }
@@ -7641,6 +10248,168 @@ impl ViewerApp {
         }
     }
 
+    /// Settings ▸ Debug cases — tiny repro launchers for known radar bugs.
+    fn alert_sound_path_label(&self) -> String {
+        let path = self.app_settings.alert_sound_path.trim();
+        if path.is_empty() {
+            return "System alert".to_owned();
+        }
+        Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| path.to_owned())
+    }
+
+    /// Settings: visual and audible warning latches, family-scoped.
+    fn alert_settings_section(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .checkbox(
+                &mut self.app_settings.alert_flash_enabled,
+                "Flash new warnings until acknowledged",
+            )
+            .on_hover_text(
+                "Mark newly issued current warnings as NEW and flash the top-bar alert chip until clicked or acknowledged",
+            )
+            .changed()
+        {
+            if !self.app_settings.alert_flash_enabled {
+                self.unacknowledged_hazard_event_ids.clear();
+            }
+            let _ = self.app_settings.save();
+        }
+        ui.add_enabled_ui(self.app_settings.alert_flash_enabled, |ui| {
+            ui.label("Flashing warning types");
+            for (family, label) in ALERT_SOUND_FAMILY_OPTIONS {
+                let mut enabled =
+                    alert_family_enabled(&self.app_settings.alert_flash_families, family);
+                if ui.checkbox(&mut enabled, *label).changed() {
+                    set_alert_family_enabled(
+                        &mut self.app_settings.alert_flash_families,
+                        family,
+                        enabled,
+                    );
+                    let _ = self.app_settings.save();
+                }
+            }
+            if self.app_settings.alert_flash_families.is_empty() {
+                ui.weak("All supported warning types flash.");
+            }
+        });
+        ui.separator();
+        if ui
+            .checkbox(
+                &mut self.app_settings.alert_sound_enabled,
+                "Play sound for new warnings",
+            )
+            .on_hover_text(
+                "Opt-in audible cue when a newly issued current warning is latched as NEW in the Severe tab",
+            )
+            .changed()
+        {
+            let _ = self.app_settings.save();
+        }
+
+        ui.add_enabled_ui(self.app_settings.alert_sound_enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Sound");
+                ui.weak(self.alert_sound_path_label());
+                #[cfg(any(windows, target_os = "macos"))]
+                if ui
+                    .button("Choose WAV…")
+                    .on_hover_text("Pick a custom .wav file; empty uses the platform system alert")
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .set_title("Choose BowEcho warning sound")
+                        .add_filter("WAV audio", &["wav"])
+                        .pick_file()
+                {
+                    self.app_settings.alert_sound_path = path.display().to_string();
+                    let _ = self.app_settings.save();
+                }
+                if ui
+                    .button("System")
+                    .on_hover_text("Use the platform system alert sound")
+                    .clicked()
+                {
+                    self.app_settings.alert_sound_path.clear();
+                    let _ = self.app_settings.save();
+                }
+                if ui
+                    .button("Test")
+                    .on_hover_text("Play the selected alert sound once")
+                    .clicked()
+                {
+                    self.trigger_alert_sound();
+                }
+            });
+            ui.label("Sound warning types");
+            for (family, label) in ALERT_SOUND_FAMILY_OPTIONS {
+                let mut enabled =
+                    alert_family_enabled(&self.app_settings.alert_sound_families, family);
+                if ui.checkbox(&mut enabled, *label).changed() {
+                    set_alert_family_enabled(
+                        &mut self.app_settings.alert_sound_families,
+                        family,
+                        enabled,
+                    );
+                    let _ = self.app_settings.save();
+                }
+            }
+            if self.app_settings.alert_sound_families.is_empty() {
+                ui.weak("All supported warning types are enabled.");
+            }
+        });
+    }
+
+    fn security_updates_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+        ui.weak(security_update_status_label(
+            self.update_available.as_deref(),
+            self.update_check_rx.is_some(),
+        ));
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("Open releases")
+                .on_hover_text("Open the official BowEcho GitHub releases page")
+                .clicked()
+            {
+                ctx.open_url(egui::OpenUrl::new_tab(BOWECHO_RELEASES_PAGE_URL));
+            }
+            let checking = self.update_check_rx.is_some();
+            if ui
+                .add_enabled(!checking, egui::Button::new("Check now"))
+                .on_hover_text("Re-run the background release check")
+                .clicked()
+            {
+                self.start_update_check(ctx);
+                self.status = "Checking BowEcho releases".to_owned();
+            }
+            if checking {
+                ui.spinner();
+            }
+        });
+        ui.separator();
+        ui.strong("Windows Defender / SmartScreen");
+        ui.weak(SECURITY_UNSIGNED_BUILD_TEXT);
+        ui.weak(SECURITY_SIGNATURE_STATUS_TEXT);
+    }
+
+    fn debug_cases_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.load_receiver.is_some() {
+            ui.weak("Load in progress");
+        }
+        for case in DEBUG_ARCHIVE_CASES {
+            let clicked = ui
+                .add_enabled(self.load_receiver.is_none(), egui::Button::new(case.label))
+                .on_hover_text(case.description)
+                .clicked();
+            if clicked {
+                self.start_debug_archive_case(*case, ctx);
+            }
+        }
+    }
+
     /// Settings tab: everything volume-independent, set once per session.
     /// ⚙ Settings — collapsible sections, open-state remembered across
     /// restarts (spec §1). A future Appearance section (style registry
@@ -7650,22 +10419,20 @@ impl ViewerApp {
             app.display_settings_section(ui, ctx);
         });
         // One-shot expand path: the PRODUCTS color picker's "Edit…" lands
-        // the user here with the section open.
-        if self.open_color_tables_request {
-            self.open_color_tables_request = false;
-            self.set_section_open("settings_color_tables", true);
-        }
         self.remembered_section(
             ui,
-            "settings_color_tables",
-            "Color tables",
+            "settings_security_updates",
+            "Security & updates",
             false,
             |app, ui| {
-                app.color_table_panel(ui, ctx);
+                app.security_updates_section(ui, ctx);
             },
         );
         self.remembered_section(ui, "settings_hotkeys", "Hotkeys", false, |app, ui| {
             app.hotkeys_section(ui);
+        });
+        self.remembered_section(ui, "settings_alerts", "Alerts", false, |app, ui| {
+            app.alert_settings_section(ui);
         });
         self.remembered_section(
             ui,
@@ -7674,6 +10441,15 @@ impl ViewerApp {
             false,
             |app, ui| {
                 app.stats_panel(ui);
+            },
+        );
+        self.remembered_section(
+            ui,
+            "settings_debug_cases",
+            "Debug cases",
+            false,
+            |app, ui| {
+                app.debug_cases_section(ui, ctx);
             },
         );
         self.remembered_section(ui, "settings_model", "Model", false, |app, ui| {
@@ -7779,6 +10555,11 @@ impl ViewerApp {
                     "Two panes side by side (synced)",
                 ),
                 (
+                    PanelLayout::ThreeStacked,
+                    "3",
+                    "Three panes: large primary plus two stacked comparison panes",
+                ),
+                (
                     PanelLayout::FourGrid,
                     "4",
                     "Quad grid — REF / VEL / CC / ZDR (synced)",
@@ -7859,6 +10640,50 @@ impl ViewerApp {
                 self.center_selected_site();
             }
         });
+        let mut jump_to_place: Option<PlaceSearchResult> = None;
+        let place_results = place_search_matches(
+            &self.place_search_query,
+            self.map_center_lat,
+            self.map_center_lon,
+            5,
+        );
+        ui.horizontal(|ui| {
+            ui.label("Place");
+            let edit_width = (ui.available_width() - 74.0).max(140.0);
+            let response = ui.add_sized(
+                egui::vec2(edit_width, PANEL_BUTTON_HEIGHT),
+                egui::TextEdit::singleline(&mut self.place_search_query).hint_text("City or town"),
+            );
+            let submitted =
+                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if fixed_action_button(ui, "Go", 42.0).clicked() || submitted {
+                jump_to_place = place_results.first().copied();
+            }
+        });
+        if !place_results.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = ROW_SPACING_X;
+                for result in &place_results {
+                    if ui
+                        .small_button(place_search_result_label(result))
+                        .on_hover_text(format!(
+                            "{} ({:.2}N {:.2}W)",
+                            place_search_display_name(result),
+                            result.lat,
+                            result.lon.abs()
+                        ))
+                        .clicked()
+                    {
+                        jump_to_place = Some(*result);
+                    }
+                }
+            });
+        }
+        if let Some(result) = jump_to_place {
+            self.center_map_on(result.lat, result.lon);
+            self.map_scale = self.map_scale.max(420.0);
+            self.status = format!("Centered map on {}", place_search_display_name(&result));
+        }
         // Favorites chip row (spec §1 RADAR ▸ SITE): each chip = one-click
         // site switch + load-latest. Right-click removes the favorite.
         if !self.app_settings.favorites.is_empty() {
@@ -7979,10 +10804,8 @@ impl ViewerApp {
         // One-line status — always rendered, hover carries the details.
         if let Some(volume) = &self.volume {
             let site = volume.site.id.clone();
-            let volume_time = volume
-                .volume_time
-                .format("%Y-%m-%d %H:%M:%S UTC")
-                .to_string();
+            let time_zone = self.time_zone();
+            let volume_time = time_zone.format_date_hms(volume.volume_time.with_timezone(&Utc));
             let vcp = volume
                 .vcp
                 .as_ref()
@@ -7990,14 +10813,14 @@ impl ViewerApp {
                 .unwrap_or_else(|| "unknown".to_owned());
             let cut_count = volume.cuts.len();
             let decoded_radials = volume.metadata.decoded_radial_count;
-            let clock = volume.volume_time.format("%H:%M:%S").to_string();
-            ui.weak(format!("{site} · VCP {vcp} · {clock}Z · {cut_count} cuts"))
+            let clock = time_zone.format_hms(volume.volume_time.with_timezone(&Utc));
+            ui.weak(format!("{site} · VCP {vcp} · {clock} · {cut_count} cuts"))
                 .on_hover_text(format!(
                     "Site {site}\nStart {volume_time}\nVCP {vcp}\n{cut_count} cuts, {decoded_radials} radials"
                 ));
             if let Some(frame) = self.selected_frame()
                 && frame.identity.site_id == site
-                && let Some(readout) = live_chunk_readout(frame, Utc::now())
+                && let Some(readout) = live_chunk_readout(frame, Utc::now(), time_zone)
             {
                 ui.weak(readout);
             }
@@ -8018,14 +10841,13 @@ impl ViewerApp {
             ui.label(&self.status);
         }
 
-        // R2: the layer rail lives in the LAYERS tab now (spec §1) — RADAR
-        // keeps a one-line link-row so the count stays visible from the
-        // operations tab.
+        // R2: layer/customization state lives in the Custom tab now; RADAR
+        // keeps a one-line link-row so the count stays visible from ops.
         let layer_count = self.rail_layer_count();
         if ui
-            .link(format!("Layers: {layer_count} →"))
+            .link(format!("Custom: {layer_count} layers →"))
             .on_hover_text(
-                "Open the LAYERS tab: everything drawn over the map — radars, model fields, satellite, obs, lightning, SPC, warnings, placefiles",
+                "Open the Custom tab: map layers, added overlays, analysis overlays, and appearance/color tables",
             )
             .clicked()
         {
@@ -8536,19 +11358,10 @@ impl ViewerApp {
                     fixed_action_button(ui, play_label, 54.0)
                 })
                 .inner
-                .on_hover_text("Loop loaded history frames")
+                .on_hover_text("Loop loaded history frames (Space)")
                 .clicked()
             {
-                self.history_playing = !self.history_playing;
-                if self.history_playing {
-                    self.browsing_history = false;
-                } else {
-                    self.browsing_history =
-                        self.selected_frame_index + 1 < self.frame_history.len();
-                }
-                self.last_history_step = Some(Instant::now());
-                let frame_ms = self.loop_frame_ms();
-                ctx.request_repaint_after(Duration::from_millis(frame_ms));
+                self.toggle_history_playback(ctx);
             }
             if ui
                 .add_enabled_ui(frame_count > 1, |ui| fixed_action_button(ui, ">", 28.0))
@@ -8622,15 +11435,16 @@ impl ViewerApp {
             .default_open(false)
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
+                    let time_zone = self.time_zone();
                     for (index, frame) in self.frame_history.iter().enumerate() {
-                        let label = compact_frame_label(frame, Utc::now());
+                        let label = compact_frame_label(frame, Utc::now(), time_zone);
                         let selected = index == self.selected_frame_index;
                         if ui
                             .add_sized(
                                 egui::vec2(72.0, PANEL_BUTTON_HEIGHT),
                                 egui::Button::selectable(selected, label),
                             )
-                            .on_hover_text(frame_status_text(frame, Utc::now()))
+                            .on_hover_text(frame_status_text(frame, Utc::now(), time_zone))
                             .clicked()
                         {
                             next_frame_index = Some(index);
@@ -8646,6 +11460,22 @@ impl ViewerApp {
             // longer steal the selection); clicking the newest releases it.
             self.browsing_history = index + 1 < self.frame_history.len();
         }
+    }
+
+    fn toggle_history_playback(&mut self, ctx: &egui::Context) -> bool {
+        if self.frame_history.len() <= 1 {
+            return false;
+        }
+        self.history_playing = !self.history_playing;
+        if self.history_playing {
+            self.browsing_history = false;
+        } else {
+            self.browsing_history = self.selected_frame_index + 1 < self.frame_history.len();
+        }
+        self.last_history_step = Some(Instant::now());
+        let frame_ms = self.loop_frame_ms();
+        ctx.request_repaint_after(Duration::from_millis(frame_ms));
+        true
     }
 
     /// Apply a table to a family slot AND persist the binding
@@ -8695,6 +11525,12 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
+    fn request_color_table_manager(&mut self, family: ColorTableFamily) {
+        self.sidebar_tab = SidebarTab::Layers;
+        self.color_table_target = family;
+        self.open_color_tables_request = true;
+    }
+
     fn active_product_color_picker(
         &mut self,
         ui: &mut egui::Ui,
@@ -8721,12 +11557,10 @@ impl ViewerApp {
             ui.label("Color");
             if ui
                 .small_button("Edit…")
-                .on_hover_text("Open the full color-table manager (Settings tab)")
+                .on_hover_text("Open the Appearance section in the Custom tab")
                 .clicked()
             {
-                self.sidebar_tab = SidebarTab::Settings;
-                self.color_table_target = family;
-                self.open_color_tables_request = true;
+                self.request_color_table_manager(family);
             }
             // Binding scope: family is the default mental model (REF/CREF
             // share); per-product gives e.g. SRV its own table vs VEL.
@@ -9256,6 +12090,27 @@ impl ViewerApp {
         self.style_registry = styles::StyleRegistry::from_settings(&self.style_settings);
     }
 
+    fn reset_style_overrides_in_memory(&mut self) {
+        self.style_settings = styles::StyleSettings::default();
+        self.rebuild_style_registry();
+        self.clear_texture();
+    }
+
+    fn reset_style_overrides(&mut self, ctx: &egui::Context) {
+        if self.styles_newer_schema {
+            self.status = "Style reset disabled because styles.json was written by a newer BowEcho"
+                .to_owned();
+            return;
+        }
+        self.reset_style_overrides_in_memory();
+        if let Err(error) = styles::save(&self.style_settings) {
+            self.status = format!("Style save failed: {error}");
+        } else {
+            self.status = "Reset appearance styles to built-in defaults".to_owned();
+        }
+        ctx.request_repaint();
+    }
+
     /// Persist styles.json (best-effort; disabled when the file came from
     /// a newer BowEcho so we never clobber a schema we don't understand).
     fn save_styles(&mut self) {
@@ -9271,7 +12126,7 @@ impl ViewerApp {
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.hazards_visible, "Show")
                 .on_hover_text(
-                    "Draw warning polygons on the map (also the LAYERS-tab Warnings row)",
+                    "Draw warning polygons on the map (also the Custom-tab Warnings row)",
                 );
             ui.checkbox(&mut self.hazards_active_only, "Active only")
                 .on_hover_text("Hide expired/cancelled alerts");
@@ -9318,9 +12173,83 @@ impl ViewerApp {
                 self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
                 self.hazard_overlay = None;
                 self.selected_hazard_index = None;
+                self.unacknowledged_hazard_event_ids.clear();
                 self.hazard_status = "No hazard polygons loaded".to_owned();
             }
         });
+
+        self.remembered_section(
+            ui,
+            "severe_current_alerts",
+            "Current alerts",
+            true,
+            |app, ui| {
+                let rows = app.visible_hazard_list_rows();
+                let total = app
+                    .hazard_overlay
+                    .as_ref()
+                    .map(|overlay| overlay.records.len())
+                    .unwrap_or(0);
+                if app.hazard_receiver.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("refreshing alerts");
+                    });
+                }
+                if total == 0 {
+                    ui.weak("No hazard polygons loaded");
+                    return;
+                }
+                ui.weak(format!("{} shown of {} loaded", rows.len(), total));
+                if rows.is_empty() {
+                    ui.weak("No alerts match the active filters");
+                    return;
+                }
+                let unacknowledged_count = rows.iter().filter(|row| row.unacknowledged).count();
+                if unacknowledged_count > 0 {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 202, 92),
+                            format!("{unacknowledged_count} new"),
+                        );
+                        if fixed_action_button(ui, "Ack all", 58.0).clicked() {
+                            app.acknowledge_all_visible_hazards();
+                        }
+                    });
+                }
+                let mut focus_index = None;
+                fixed_height_scroll(
+                    ui,
+                    "hazard_current_alerts_list",
+                    HAZARD_LIST_SCROLL_HEIGHT,
+                    |ui| {
+                        for row in &rows {
+                            let text = if row.unacknowledged {
+                                egui::RichText::new(&row.label)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(255, 220, 106))
+                            } else {
+                                egui::RichText::new(&row.label)
+                            };
+                            let response = ui
+                                .add_sized(
+                                    egui::vec2(ui.available_width(), PANEL_BUTTON_HEIGHT),
+                                    egui::Button::selectable(row.selected, text),
+                                )
+                                .on_hover_text(&row.hover);
+                            if response.clicked() {
+                                focus_index = Some(row.index);
+                            }
+                        }
+                    },
+                );
+                if let Some(index) = focus_index
+                    && app.focus_hazard_record(index)
+                {
+                    ui.ctx().request_repaint();
+                }
+            },
+        );
 
         if let Some(record) = self.selected_hazard_record() {
             ui.add_space(6.0);
@@ -9393,7 +12322,7 @@ impl ViewerApp {
                 if ui
                     .checkbox(&mut app.spc_reports_enabled, "Reports")
                     .on_hover_text(
-                        "Today's filtered storm reports (tornado / wind / hail) — same state as the LAYERS-tab row",
+                        "Today's filtered storm reports (tornado / wind / hail) — same state as the Custom-tab row",
                     )
                     .changed()
                 {
@@ -9422,6 +12351,154 @@ impl ViewerApp {
         });
     }
 
+    fn clear_map_tile_cache(&mut self, ctx: &egui::Context) {
+        let Some(root) = settings::tile_cache_dir() else {
+            self.status = "No map tile cache directory is available".to_owned();
+            return;
+        };
+        match clear_map_tile_cache_dir(&root) {
+            Ok(summary) => {
+                self.tile_layer.borrow_mut().clear_memory();
+                self.status = summary.status_text(&root);
+                ctx.request_repaint();
+            }
+            Err(error) => {
+                self.status = format!("Map tile cache clear failed: {error}");
+            }
+        }
+    }
+
+    fn diagnostic_summary(&self) -> String {
+        let mut text = String::new();
+        let _ = writeln!(text, "BowEcho diagnostics");
+        let _ = writeln!(text, "version: {}", env!("CARGO_PKG_VERSION"));
+        let _ = writeln!(
+            text,
+            "target: {} {}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        let _ = writeln!(text, "renderer: {}", self.renderer_backend);
+        if let Some(notice) = self.startup_notice.as_deref() {
+            let _ = writeln!(text, "startup_notice: {notice}");
+        }
+        let _ = writeln!(text, "status: {}", self.status_or_activity_label("idle"));
+        if let Some(activity) = self.active_background_activity() {
+            match activity.fraction {
+                Some(fraction) => {
+                    let _ = writeln!(
+                        text,
+                        "background: {} ({:.0}%)",
+                        activity.label,
+                        fraction * 100.0
+                    );
+                }
+                None => {
+                    let _ = writeln!(text, "background: {}", activity.label);
+                }
+            }
+        }
+
+        let _ = writeln!(
+            text,
+            "map: center={:.4},{:.4} scale={:.1} range_km={:.0} layout={} active_pane={}",
+            self.map_center_lat,
+            self.map_center_lon,
+            self.map_scale,
+            self.radar_range_km,
+            self.grid_layout.panel_count(),
+            self.active_pane + 1
+        );
+        let _ = writeln!(
+            text,
+            "selection: {} cut {} frame={}",
+            self.selected_product.label(),
+            self.selected_cut,
+            self.selected_frame_status_text()
+        );
+
+        if let Some(volume) = self.volume.as_ref() {
+            let products = global_displayable_products(volume)
+                .into_iter()
+                .map(|product| product.label().to_owned())
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = writeln!(
+                text,
+                "volume: site={} time={} cuts={} products=[{}]",
+                volume.site.id,
+                volume
+                    .volume_time
+                    .to_rfc3339_opts(SecondsFormat::Secs, true),
+                volume.cuts.len(),
+                products
+            );
+        } else {
+            let _ = writeln!(text, "volume: none");
+        }
+        if let Some(path) = self.source_path.as_ref() {
+            let _ = writeln!(text, "source_path: {}", path.display());
+        }
+
+        let _ = writeln!(
+            text,
+            "history: frames={} selected={}",
+            self.frame_history.len(),
+            self.selected_frame_index
+        );
+        let _ = writeln!(
+            text,
+            "poll: active={} source={} last={}",
+            self.poll_active,
+            diagnostic_poll_source_label(&self.poll_source),
+            self.poll_last_file.as_deref().unwrap_or("-")
+        );
+        let _ = writeln!(
+            text,
+            "workers: load={} render_pending={} overlays={} hazards={} model_layers={} sat_layer={}",
+            self.load_receiver.is_some(),
+            self.pending_render_key.is_some(),
+            self.radar_layers.len(),
+            self.hazard_overlay
+                .as_ref()
+                .map(|overlay| overlay.records.len())
+                .unwrap_or(0),
+            self.model_layers.len(),
+            self.sat_layer.is_some()
+        );
+        if let Some(load_timing) = &self.load_timing {
+            let _ = writeln!(
+                text,
+                "timing: load_ms={:.1} decode_ms={:.1} render_ms={} texture_ms={}",
+                load_timing.total_ms,
+                load_timing.decode_ms,
+                optional_ms_label(self.render_ms),
+                optional_ms_label(self.texture_ms)
+            );
+        } else {
+            let _ = writeln!(
+                text,
+                "timing: render_ms={} texture_ms={} frame_ms={:.1}",
+                optional_ms_label(self.render_ms),
+                optional_ms_label(self.texture_ms),
+                self.frame_ms_avg
+            );
+        }
+
+        push_optional_path(
+            &mut text,
+            "config",
+            settings::AppSettings::config_path().as_deref(),
+        );
+        push_optional_path(&mut text, "styles", styles::styles_path().as_deref());
+        push_optional_path(&mut text, "tiles", settings::tile_cache_dir().as_deref());
+        let model_store = settings::model_store_dir();
+        push_optional_path(&mut text, "model_store", Some(&model_store));
+        let sat_store = settings::sat_store_dir();
+        push_optional_path(&mut text, "sat_store", Some(&sat_store));
+        text
+    }
+
     fn stats_panel(&mut self, ui: &mut egui::Ui) {
         let mut perf_hud = self.app_settings.perf_hud;
         if ui
@@ -9434,6 +12511,29 @@ impl ViewerApp {
             self.app_settings.perf_hud = perf_hud;
             let _ = self.app_settings.save();
         }
+        if ui
+            .button("Copy diagnostics")
+            .on_hover_text("Copy a compact support snapshot: version, renderer, source, map state, workers, timing, and data paths")
+            .clicked()
+        {
+            ui.ctx().copy_text(self.diagnostic_summary());
+            self.status = "Diagnostics copied".to_owned();
+        }
+        ui.horizontal(|ui| {
+            ui.label("Map tile cache");
+            if ui
+                .button("Clear")
+                .on_hover_text(
+                    "Delete cached Satellite/Streets/Topo map tiles only; radar, model, satellite, and warning data are untouched",
+                )
+                .clicked()
+            {
+                self.clear_map_tile_cache(ui.ctx());
+            }
+            if let Some(root) = settings::tile_cache_dir() {
+                ui.weak(root.display().to_string());
+            }
+        });
         ui.checkbox(&mut self.show_performance_stats, "Details");
         if let Some(render_ms) = self.render_ms {
             ui.label(format!("Render {render_ms:.1} ms"));
@@ -9484,6 +12584,99 @@ impl ViewerApp {
             }
         }
         lines
+    }
+
+    fn visible_hazard_list_rows(&self) -> Vec<HazardListRow> {
+        let Some(overlay) = &self.hazard_overlay else {
+            return Vec::new();
+        };
+        overlay
+            .records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                self.hazard_record_visible(record) && hazard_points_renderable(&record.points)
+            })
+            .map(|(index, record)| HazardListRow {
+                index,
+                label: hazard_record_list_label(record),
+                hover: hazard_record_list_hover(record),
+                selected: self.selected_hazard_index == Some(index),
+                unacknowledged: self
+                    .unacknowledged_hazard_event_ids
+                    .contains(&record.event_id),
+            })
+            .collect()
+    }
+
+    fn focus_hazard_record(&mut self, index: usize) -> bool {
+        let Some((bbox, label)) = self
+            .hazard_overlay
+            .as_ref()
+            .and_then(|overlay| overlay.records.get(index))
+            .and_then(|record| {
+                (self.hazard_record_visible(record) && hazard_points_renderable(&record.points))
+                    .then(|| (record.bbox, record.label.clone()))
+            })
+        else {
+            return false;
+        };
+        let (lat, lon, scale) = hazard_focus_view(bbox);
+        self.select_hazard_index(index);
+        self.center_map_on(lat, lon);
+        self.map_scale = scale;
+        self.clamp_map_center();
+        self.status = format!("Selected {label}");
+        true
+    }
+
+    fn select_hazard_index(&mut self, index: usize) {
+        self.selected_hazard_index = Some(index);
+        self.acknowledge_hazard_index(index);
+    }
+
+    fn first_unacknowledged_hazard_index(&self) -> Option<usize> {
+        self.hazard_overlay
+            .as_ref()?
+            .records
+            .iter()
+            .enumerate()
+            .find_map(|(index, record)| {
+                (self
+                    .unacknowledged_hazard_event_ids
+                    .contains(&record.event_id)
+                    && self.hazard_record_visible(record)
+                    && hazard_points_renderable(&record.points))
+                .then_some(index)
+            })
+    }
+
+    fn acknowledge_hazard_index(&mut self, index: usize) {
+        if let Some(record) = self
+            .hazard_overlay
+            .as_ref()
+            .and_then(|overlay| overlay.records.get(index))
+        {
+            self.unacknowledged_hazard_event_ids
+                .remove(&record.event_id);
+        }
+    }
+
+    fn acknowledge_all_visible_hazards(&mut self) {
+        let Some(overlay) = &self.hazard_overlay else {
+            return;
+        };
+        let visible_ids = overlay
+            .records
+            .iter()
+            .filter(|record| {
+                self.hazard_record_visible(record) && hazard_points_renderable(&record.points)
+            })
+            .map(|record| record.event_id.clone())
+            .collect::<Vec<_>>();
+        for event_id in visible_ids {
+            self.unacknowledged_hazard_event_ids.remove(&event_id);
+        }
     }
 
     fn selected_hazard_record(&self) -> Option<&HazardRecord> {
@@ -9883,6 +13076,18 @@ impl ViewerApp {
             let height = ui.available_height();
             ui.add_sized([230.0, height], egui::Label::new(&self.status).truncate());
             ui.separator();
+            if let Some(activity) = self.active_background_activity() {
+                if let Some(fraction) = activity.fraction {
+                    ui.add_sized(
+                        [210.0, height],
+                        egui::ProgressBar::new(fraction).text(activity.label),
+                    );
+                } else {
+                    ui.spinner();
+                    ui.add_sized([190.0, height], egui::Label::new(activity.label).truncate());
+                }
+                ui.separator();
+            }
             // Stable metrics anchor to the right edge; the variable-width
             // hover readout absorbs the leftover middle and truncates.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -9901,17 +13106,297 @@ impl ViewerApp {
                         self.active_table_for_product(&readout.product),
                         &readout.product,
                     );
-                    format_cursor_readout(readout, self.units(), display_unit)
+                    format_cursor_readout(readout, self.units(), display_unit, self.time_zone())
                 } else {
-                    format!(
-                        "{} cut {}",
-                        self.selected_product.label(),
-                        self.selected_cut
-                    )
+                    let (product, cut) = self.status_bar_product_cut();
+                    format!("{} cut {}", product.label(), cut)
                 };
                 ui.add(egui::Label::new(readout).truncate());
             });
         });
+    }
+
+    fn request_repaint_for_background_activity(&self, ctx: &egui::Context) {
+        if self.active_background_activity().is_some() {
+            ctx.request_repaint_after(Duration::from_millis(BACKGROUND_ACTIVITY_REPAINT_MS));
+        }
+    }
+
+    fn status_or_activity_label(&self, fallback: &str) -> String {
+        let status = self.status.trim();
+        if status.is_empty() {
+            self.startup_notice
+                .as_deref()
+                .unwrap_or(fallback)
+                .to_owned()
+        } else {
+            status.to_owned()
+        }
+    }
+
+    fn active_background_activity(&self) -> Option<BackgroundActivity> {
+        if let Some(progress) = &self.archive_load_progress {
+            return Some(BackgroundActivity {
+                label: progress.status_text(),
+                fraction: (progress.total > 0).then(|| progress.fraction()),
+            });
+        }
+        if self.load_receiver.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                self.status_or_activity_label("Loading Level II"),
+            ));
+        }
+        if self.archive_list_receiver.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                self.status_or_activity_label("Listing archive volumes"),
+            ));
+        }
+        if self.model_ingest_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                self.status_or_activity_label("Model ingest running"),
+            ));
+        }
+        if self.oa_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                self.status_or_activity_label("Analyzing observations"),
+            ));
+        }
+        if self.oa_comp_rx.is_some() {
+            let done = self
+                .oa_comp_progress
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(self.oa_comp_total);
+            let label = if self.oa_comp_total > 0 {
+                format!("Composites {done}/{}", self.oa_comp_total)
+            } else {
+                "Composites running".to_owned()
+            };
+            return Some(BackgroundActivity::progress(
+                label,
+                done,
+                self.oa_comp_total,
+            ));
+        }
+        if self.oa_cape_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                self.status_or_activity_label("OA derived layer running"),
+            ));
+        }
+        if self.hazard_receiver.is_some() {
+            let status = self.hazard_status.trim();
+            return Some(BackgroundActivity::indeterminate(if status.is_empty() {
+                "Loading hazards".to_owned()
+            } else {
+                status.to_owned()
+            }));
+        }
+        let overlay_loads = self
+            .radar_layers
+            .iter()
+            .filter(|layer| {
+                layer.load_receiver.is_some()
+                    || layer
+                        .intl_feed
+                        .as_ref()
+                        .is_some_and(|feed| feed.rx.is_some())
+            })
+            .count();
+        if overlay_loads > 0 {
+            return Some(BackgroundActivity::indeterminate(if overlay_loads == 1 {
+                "Loading radar overlay".to_owned()
+            } else {
+                format!("Loading {overlay_loads} radar overlays")
+            }));
+        }
+        let radar_renders = usize::from(self.pending_render_key.is_some())
+            + self
+                .extra_panes
+                .iter()
+                .filter(|pane| pane.pending_render_key.is_some())
+                .count()
+            + self
+                .radar_layers
+                .iter()
+                .filter(|layer| layer.pending_render_key.is_some())
+                .count();
+        if radar_renders > 0 {
+            return Some(BackgroundActivity::indeterminate(if radar_renders == 1 {
+                "Rendering radar".to_owned()
+            } else {
+                format!("Rendering {radar_renders} radar panes/layers")
+            }));
+        }
+        if self.model_layer_build_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate("Building model layer"));
+        }
+        let model_renders = self
+            .model_layers
+            .iter()
+            .filter(|slot| slot.render_rx.is_some())
+            .count();
+        if model_renders > 0 {
+            return Some(BackgroundActivity::indeterminate(if model_renders == 1 {
+                "Rendering model layer".to_owned()
+            } else {
+                format!("Rendering {model_renders} model layers")
+            }));
+        }
+        if self.sat_layer_build_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                "Building satellite layer",
+            ));
+        }
+        if self.sat_layer_render_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                "Rendering satellite layer",
+            ));
+        }
+        if self.vol3d.resample_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                self.status_or_activity_label("Resampling 3D volume"),
+            ));
+        }
+        if let Some(activity) = self.wofs_background_activity() {
+            return Some(activity);
+        }
+        if let Some(label) = self.farm.background_activity_label() {
+            return Some(BackgroundActivity::indeterminate(label));
+        }
+        if self.poll_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate("Polling radar feed"));
+        }
+        if self.intl_loop_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                self.status_or_activity_label("Loading international loop"),
+            ));
+        }
+        if self.spc_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate("Refreshing SPC layers"));
+        }
+        if self.spc_receiver.is_some() {
+            return Some(BackgroundActivity::indeterminate("Loading SPC reports"));
+        }
+        if let Some(day) = self.event_explorer.fetching_day() {
+            return Some(BackgroundActivity::indeterminate(format!(
+                "Loading event day {day}"
+            )));
+        }
+        if self.raob_sites_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate("Loading RAOB sites"));
+        }
+        if self.obs_rx.is_some() || self.mesonet_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate("Loading surface obs"));
+        }
+        if self.native_sounding_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate("Computing sounding"));
+        }
+        if self.model_lut_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                "Building model geolocation",
+            ));
+        }
+        if self.storm_cells_receiver.is_some() {
+            return Some(BackgroundActivity::indeterminate("Analyzing storm tracks"));
+        }
+        if self.rotation_receiver.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                "Detecting rotation markers",
+            ));
+        }
+        let placefile_fetches = self
+            .placefile_slots
+            .iter()
+            .filter(|slot| slot.receiver.is_some())
+            .count();
+        if placefile_fetches > 0 {
+            return Some(BackgroundActivity::indeterminate(
+                if placefile_fetches == 1 {
+                    "Loading placefile".to_owned()
+                } else {
+                    format!("Loading {placefile_fetches} placefiles")
+                },
+            ));
+        }
+        let placefile_sheets = self
+            .placefile_slots
+            .iter()
+            .filter(|slot| slot.sheets_receiver.is_some())
+            .count();
+        if placefile_sheets > 0 {
+            return Some(BackgroundActivity::indeterminate(
+                if placefile_sheets == 1 {
+                    "Loading placefile icons".to_owned()
+                } else {
+                    format!("Loading icons for {placefile_sheets} placefiles")
+                },
+            ));
+        }
+        if self.site_catalog_receiver.is_some() {
+            return Some(BackgroundActivity::indeterminate("Loading radar catalog"));
+        }
+        if self.intl_sites_rx.is_some() {
+            let provider = self.intl_picker_provider.trim();
+            return Some(BackgroundActivity::indeterminate(if provider.is_empty() {
+                "Loading international sites".to_owned()
+            } else {
+                format!("Loading international sites: {provider}")
+            }));
+        }
+        None
+    }
+
+    fn wofs_background_activity(&self) -> Option<BackgroundActivity> {
+        if self.wofs.catalog_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate("Loading WoFS catalog"));
+        }
+        if self.wofs.image_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate("Loading WoFS imagery"));
+        }
+        if self.wofs.stations_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                "Loading WoFS sounding stations",
+            ));
+        }
+        if self.wofs.georef_rx.is_some() {
+            let done = self
+                .wofs
+                .georef_progress
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(wofs_georef::CALIBRATION_TOTAL);
+            return Some(BackgroundActivity::progress(
+                format!(
+                    "Calibrating WoFS georef {done}/{}",
+                    wofs_georef::CALIBRATION_TOTAL
+                ),
+                done,
+                wofs_georef::CALIBRATION_TOTAL,
+            ));
+        }
+        None
+    }
+
+    fn status_bar_product_cut(&self) -> (DisplayProduct, usize) {
+        if self.grid_layout != PanelLayout::One
+            && let Some((product, cut)) = self.pane_product_cut(self.active_pane)
+        {
+            return (product, cut);
+        }
+        (self.selected_product.clone(), self.selected_cut)
+    }
+
+    fn pane_product_cut(&self, pane_index: usize) -> Option<(DisplayProduct, usize)> {
+        if pane_index == 0 {
+            return Some((self.selected_product.clone(), self.selected_cut));
+        }
+        let pane = self.extra_panes.get(pane_index - 1)?;
+        let product = pane.product.clone();
+        let preferred_cut = pane.cut.unwrap_or(self.selected_cut);
+        let cut = self
+            .volume
+            .as_deref()
+            .and_then(|volume| best_cut_for_product(volume, preferred_cut, &product))
+            .unwrap_or(preferred_cut);
+        Some((product, cut))
     }
 
     /// Render the workspace tile tree (map pane + docked viewer panes).
@@ -9924,6 +13409,40 @@ impl ViewerApp {
         tree.ui(&mut dock::WorkspaceBehavior { app: self }, ui);
         self.workspace.tree = tree;
         self.apply_dock_requests();
+    }
+
+    /// Restore the operator-safe default workspace: map-only, one radar
+    /// pane, no saved dock tree. Docked viewers stay open for this session,
+    /// but float instead of being re-persisted into the reset layout.
+    fn reset_workspace_layout_state(&mut self) {
+        let docked: Vec<dock::WorkspacePane> = dock::WorkspacePane::VIEWERS
+            .into_iter()
+            .filter(|pane| self.workspace.is_docked(*pane))
+            .collect();
+
+        self.workspace.reset();
+        self.workspace.requests.clear();
+        for pane in docked {
+            self.set_viewer_open(pane, true);
+        }
+
+        self.pending_grid_layout = None;
+        self.grid_layout = PanelLayout::One;
+        self.extra_panes.clear();
+        self.active_pane = 0;
+        self.app_settings.grid_pane_count = PanelLayout::One.panel_count();
+        self.app_settings.workspace_layout = None;
+
+        // Reset is an explicit clearing action, not an edit to debounce back
+        // into config.json on the next frame.
+        self.workspace.dirty = false;
+        self.workspace.last_edit = None;
+        self.status = "Workspace layout reset".to_owned();
+    }
+
+    fn reset_workspace_layout(&mut self) {
+        self.reset_workspace_layout_state();
+        let _ = self.app_settings.save();
     }
 
     /// Apply dock mutations requested during the tree pass (tab close
@@ -9958,6 +13477,7 @@ impl ViewerApp {
         match pane {
             dock::WorkspacePane::Map => {}
             dock::WorkspacePane::Sounding => self.native_skewt_open = open,
+            dock::WorkspacePane::RadarOverlays => self.radar_overlays_open = open,
             dock::WorkspacePane::Wofs => self.wofs.open = open,
             dock::WorkspacePane::Farm => self.farm.open = open,
             dock::WorkspacePane::Satellite => self.show_satellite = open,
@@ -9971,6 +13491,7 @@ impl ViewerApp {
         match pane {
             dock::WorkspacePane::Map => true,
             dock::WorkspacePane::Sounding => self.native_skewt_open,
+            dock::WorkspacePane::RadarOverlays => self.radar_overlays_open,
             dock::WorkspacePane::Wofs => self.wofs.open,
             dock::WorkspacePane::Farm => self.farm.open,
             dock::WorkspacePane::Satellite => self.show_satellite,
@@ -10150,6 +13671,10 @@ impl ViewerApp {
         match pane {
             dock::WorkspacePane::Map => {}
             dock::WorkspacePane::Sounding => self.sounding_pane_body(ui),
+            dock::WorkspacePane::RadarOverlays => {
+                let ctx = ui.ctx().clone();
+                self.radar_overlays_pane_body(ui, &ctx);
+            }
             dock::WorkspacePane::Wofs => self.wofs_pane_body(ui),
             dock::WorkspacePane::Farm => self.farm_pane_body(ui),
             dock::WorkspacePane::Satellite => {
@@ -10176,7 +13701,7 @@ impl ViewerApp {
         };
         let (rect, response) = ui.allocate_exact_size(available, sense);
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(7, 10, 14));
+        painter.rect_filled(rect, 0.0, self.map_backdrop_color());
         self.media.last_map_rect = Some(rect);
 
         // Hard guard: the 1×1 layout runs the original single-pane path
@@ -10186,6 +13711,10 @@ impl ViewerApp {
         } else {
             self.grid_canvas(ui, rect);
         }
+    }
+
+    fn map_backdrop_color(&self) -> egui::Color32 {
+        style_color32(self.style_registry.map().background_color)
     }
 
     fn single_pane_canvas(
@@ -10199,10 +13728,21 @@ impl ViewerApp {
         // instead of panning / selecting (zoom stays live; endpoints are lon/lat
         // so they don't drift). All four mutating interactions are gated.
         let armed = self.cross_section_armed;
+        let vrot_armed = self.vrot_tool_armed;
         // Annotate mode owns the pointer the same way (zoom stays live).
         let annotating = self.handle_annotation_input(rect, response, ui);
+        let cross_section_handle_owns_pointer = if !annotating && !vrot_armed {
+            self.cross_section_handle_interactions(ui, rect, 0)
+        } else {
+            false
+        };
 
-        if !armed && !annotating && response.dragged() {
+        if !armed
+            && !vrot_armed
+            && !annotating
+            && !cross_section_handle_owns_pointer
+            && response.dragged()
+        {
             let delta = response.drag_delta();
             if delta.length_sq() >= MAP_DRAG_DEAD_ZONE_PX * MAP_DRAG_DEAD_ZONE_PX {
                 // Pan through the projection's own inverse: linear degree
@@ -10241,6 +13781,7 @@ impl ViewerApp {
         if self.farm.drape.place_armed {
             // FARM manual placement: right-click pins the deployment.
             if response.secondary_clicked()
+                && !cross_section_handle_owns_pointer
                 && let Some(pointer) = response.interact_pointer_pos()
             {
                 let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
@@ -10251,7 +13792,11 @@ impl ViewerApp {
             }
         } else if !self.cross_section_armed
             && !self.vrot_tool_armed
-            && !self.app_settings.right_click_loads_nearest
+            && !cross_section_handle_owns_pointer
+            && plain_context_menu_allowed(
+                ui.input(|input| input.modifiers),
+                self.app_settings.right_click_loads_nearest,
+            )
         {
             if response.secondary_clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
@@ -10315,11 +13860,19 @@ impl ViewerApp {
             .collect::<Vec<_>>();
         let intl_points = self.intl_site_points(rect);
         let community_points = self.community_site_points(rect);
+        let custom_poll_points = self.custom_poll_points(rect);
         let raob_points = self.raob_site_points(rect);
 
-        let shift_held = ui.input(|input| input.modifiers.shift);
+        let modifiers = ui.input(|input| input.modifiers);
+        let model_soundings_available = self.model_soundings_available();
+        let shift_held = modifiers.shift;
+        let alt_model_sounding = alt_model_sounding_active(modifiers, model_soundings_available);
+        let ctrl_best_radar = ctrl_best_radar_click(modifiers);
+        let plain_click = plain_map_click_allowed(modifiers, model_soundings_available);
         if !armed
+            && !vrot_armed
             && !annotating
+            && !cross_section_handle_owns_pointer
             && shift_held
             && response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
@@ -10329,8 +13882,10 @@ impl ViewerApp {
         }
 
         if !armed
+            && !vrot_armed
             && !annotating
-            && !shift_held
+            && !cross_section_handle_owns_pointer
+            && plain_click
             && response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
         {
@@ -10341,14 +13896,30 @@ impl ViewerApp {
             let marker_hit = nearest_marker_within(&site_points, pointer).is_some()
                 || nearest_marker_within(&intl_points, pointer).is_some()
                 || nearest_marker_within(&community_points, pointer).is_some()
+                || nearest_marker_within(&custom_poll_points, pointer).is_some()
                 || nearest_marker_within(&raob_points, pointer).is_some();
-            if !marker_hit && let Some(hit) = self.event_track_at(rect, pointer) {
-                self.jump_to_event_track(&hit, ui.ctx());
+            if !marker_hit {
+                if let Some(report) = self.spc_report_at_position(rect, pointer) {
+                    self.jump_to_storm_report(&report, ui.ctx());
+                } else if let Some(hit) = self.event_track_at(rect, pointer) {
+                    self.jump_to_event_track(&hit, ui.ctx());
+                } else {
+                    self.handle_marker_click(
+                        &site_points,
+                        &intl_points,
+                        &community_points,
+                        &custom_poll_points,
+                        &raob_points,
+                        pointer,
+                        ui.ctx(),
+                    );
+                }
             } else {
                 self.handle_marker_click(
                     &site_points,
                     &intl_points,
                     &community_points,
+                    &custom_poll_points,
                     &raob_points,
                     pointer,
                     ui.ctx(),
@@ -10359,6 +13930,7 @@ impl ViewerApp {
         if !armed
             && !self.vrot_tool_armed
             && !self.farm.drape.place_armed
+            && !cross_section_handle_owns_pointer
             && response.secondary_clicked()
             && let Some(pointer) = response.interact_pointer_pos()
         {
@@ -10378,19 +13950,24 @@ impl ViewerApp {
         }
 
         if !armed
+            && !vrot_armed
             && !annotating
-            && !shift_held
+            && !cross_section_handle_owns_pointer
+            && plain_click
             && response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
             && let Some(index) = self.hazard_at_position(rect, pointer)
         {
-            self.selected_hazard_index = Some(index);
+            self.select_hazard_index(index);
         }
 
         // Armed: left-click places endpoint A then B (restart after both set);
         // right-click clears.
         if annotating {
             // Annotations already consumed the pointer above.
+        } else if cross_section_handle_owns_pointer {
+            // Endpoint handles own their drags/clicks; do not also pan,
+            // select hazards, or restart the section underneath.
         } else if armed {
             if response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
@@ -10417,12 +13994,12 @@ impl ViewerApp {
                 self.cross_section_signature = None;
                 self.cross_section_status = "Cross-section: click endpoint A then B".to_owned();
             }
-        } else if self.model_enabled && ui.input(|i| i.modifiers.alt) && self.model_lut.is_some() {
+        } else if alt_model_sounding {
             // Alt+click = one-shot sounding. Ctrl+Alt = FOLLOW THE MOUSE:
             // no buttons involved, so the map never pans, and the store
             // worker coalesces requests (latest wins) while the ~100 ms
             // native compute streams the skew-T live under the cursor.
-            let follow = ui.input(|i| i.modifiers.ctrl);
+            let follow = modifiers.ctrl;
             let pointer = if follow {
                 response.hover_pos()
             } else if response.clicked() {
@@ -10480,20 +14057,17 @@ impl ViewerApp {
         } else if self.vrot_tool_armed {
             if response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
-                && let Some(readout) = self.cursor_readout_at(rect, pointer)
             {
-                let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
-                if self.vrot_points.len() >= 2 {
-                    self.vrot_points.clear();
-                }
-                self.vrot_points
-                    .push((lon, lat, readout.value, readout.height_above_radar_m));
+                let product = self.selected_product.clone();
+                let cut = self.selected_cut;
+                self.add_vrot_tool_point(rect, pointer, &product, cut);
             }
             if response.secondary_clicked() {
                 self.vrot_points.clear();
+                self.status = "Vrot points cleared".to_owned();
             }
         } else if response.clicked()
-            && ui.input(|i| i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift)
+            && ctrl_best_radar
             && let Some(pointer) = response.interact_pointer_pos()
         {
             // Ctrl+click = instant switch to the lowest-beam radar for this
@@ -10504,8 +14078,6 @@ impl ViewerApp {
             let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
             self.switch_to_best_radar_at(lon, lat, ui.ctx());
         }
-
-        self.cross_section_handle_interactions(ui, rect, 0);
 
         self.draw_site_markers(painter, &site_points);
         let hovered_intl = response
@@ -10518,6 +14090,11 @@ impl ViewerApp {
             .and_then(|pointer| nearest_marker_within(&community_points, pointer))
             .map(|(index, _)| index);
         self.draw_community_site_markers(painter, &community_points, hovered_community);
+        let hovered_custom = response
+            .hover_pos()
+            .and_then(|pointer| nearest_marker_within(&custom_poll_points, pointer))
+            .map(|(index, _)| index);
+        self.draw_custom_poll_markers(painter, &custom_poll_points, hovered_custom);
         let hovered_raob = response
             .hover_pos()
             .and_then(|pointer| nearest_marker_within(&raob_points, pointer))
@@ -10555,6 +14132,13 @@ impl ViewerApp {
         self.sync_extra_panes();
         let cells = pane_cell_rects(self.grid_layout, rect, 2.0);
         let armed = self.cross_section_armed;
+        let vrot_armed = self.vrot_tool_armed;
+        let annotation_active = self.annotations.active_tool.is_some();
+        let annotation_target_cell = annotation_target_cell(
+            &cells,
+            ui.input(|input| input.pointer.hover_pos()),
+            self.active_pane,
+        );
         let ctx = ui.ctx().clone();
         let frame_start = Instant::now();
         let mut hovered_readout = None;
@@ -10577,8 +14161,22 @@ impl ViewerApp {
                 self.active_pane = cell_index;
             }
 
+            if annotation_target_cell == Some(cell_index) {
+                self.handle_annotation_input(cell, &response, ui);
+            }
+            let cross_section_handle_owns_pointer = if !annotation_active && !vrot_armed {
+                self.cross_section_handle_interactions(ui, cell, cell_index + 1)
+            } else {
+                false
+            };
+
             // Shared pan: dragging any cell moves every pane in sync.
-            if !armed && response.dragged() {
+            if !armed
+                && !vrot_armed
+                && !annotation_active
+                && !cross_section_handle_owns_pointer
+                && response.dragged()
+            {
                 let delta = response.drag_delta();
                 if delta.length_sq() >= MAP_DRAG_DEAD_ZONE_PX * MAP_DRAG_DEAD_ZONE_PX {
                     // Projection-true pan — see the single-pane handler.
@@ -10634,38 +14232,94 @@ impl ViewerApp {
                 .collect::<Vec<_>>();
             let intl_points = self.intl_site_points(cell);
             let community_points = self.community_site_points(cell);
+            let custom_poll_points = self.custom_poll_points(cell);
             let raob_points = self.raob_site_points(cell);
 
-            let shift_held = ui.input(|input| input.modifiers.shift);
+            let modifiers = ui.input(|input| input.modifiers);
+            let model_soundings_available = self.model_soundings_available();
+            let shift_held = modifiers.shift;
+            let alt_model_sounding =
+                alt_model_sounding_active(modifiers, model_soundings_available);
+            let ctrl_best_radar = ctrl_best_radar_click(modifiers);
+            let plain_click = plain_map_click_allowed(modifiers, model_soundings_available);
             if !armed
+                && !vrot_armed
+                && !annotation_active
+                && !cross_section_handle_owns_pointer
                 && shift_held
-                && cell_index == 0
                 && response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
-                // Shift+click pins the inspector (main pane only — its
-                // readout samples the primary product).
+                // Shift+click pins the inspector from any grid pane.
                 self.toggle_inspector_pin(cell, pointer);
             }
             if !armed
-                && !shift_held
+                && !vrot_armed
+                && !annotation_active
+                && !cross_section_handle_owns_pointer
+                && alt_model_sounding
+            {
+                let pointer = if modifiers.ctrl {
+                    response.hover_pos()
+                } else if response.clicked() {
+                    response.interact_pointer_pos()
+                } else {
+                    None
+                };
+                if let Some(pointer) = pointer {
+                    let (lon, lat) = self.screen_to_lon_lat(cell, pointer);
+                    self.request_model_sounding_at_lonlat(lon, lat);
+                }
+            }
+            if !armed
+                && !vrot_armed
+                && !annotation_active
+                && !cross_section_handle_owns_pointer
+                && ctrl_best_radar
                 && response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
-                self.handle_marker_click(
+                let (lon, lat) = self.screen_to_lon_lat(cell, pointer);
+                self.switch_to_best_radar_at(lon, lat, ui.ctx());
+            }
+            if !armed
+                && !vrot_armed
+                && !annotation_active
+                && !cross_section_handle_owns_pointer
+                && plain_click
+                && response.clicked()
+                && let Some(pointer) = response.interact_pointer_pos()
+            {
+                self.handle_plain_map_click(
+                    cell,
                     &site_points,
                     &intl_points,
                     &community_points,
+                    &custom_poll_points,
                     &raob_points,
                     pointer,
                     ui.ctx(),
                 );
                 if let Some(index) = self.hazard_at_position(cell, pointer) {
-                    self.selected_hazard_index = Some(index);
+                    self.select_hazard_index(index);
                 }
             }
 
-            if !armed
+            if self.farm.drape.place_armed {
+                if response.secondary_clicked()
+                    && !cross_section_handle_owns_pointer
+                    && let Some(pointer) = response.interact_pointer_pos()
+                {
+                    let (lon, lat) = self.screen_to_lon_lat(cell, pointer);
+                    let scan = self.farm.current_scan_id();
+                    self.farm
+                        .drape
+                        .place_radar(self.farm.sensor_id, lat as f64, lon as f64, scan);
+                }
+            } else if !armed
+                && !vrot_armed
+                && !annotation_active
+                && !cross_section_handle_owns_pointer
                 && response.secondary_clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
@@ -10683,11 +14337,22 @@ impl ViewerApp {
                     self.context_menu_lonlat = Some(self.screen_to_lon_lat(cell, pointer));
                 }
             }
-            if !armed && !self.app_settings.right_click_loads_nearest {
+            if !armed
+                && !vrot_armed
+                && !annotation_active
+                && !self.farm.drape.place_armed
+                && !cross_section_handle_owns_pointer
+                && plain_context_menu_allowed(
+                    modifiers,
+                    self.app_settings.right_click_loads_nearest,
+                )
+            {
                 response.context_menu(|ui| self.best_radar_context_menu(ui));
             }
 
-            if armed {
+            if cross_section_handle_owns_pointer {
+                // Endpoint handles own their drags/clicks in grid panes too.
+            } else if armed {
                 if response.clicked()
                     && let Some(pointer) = response.interact_pointer_pos()
                 {
@@ -10713,9 +14378,21 @@ impl ViewerApp {
                     self.cross_section_signature = None;
                     self.cross_section_status = "Cross-section: click endpoint A then B".to_owned();
                 }
+            } else if vrot_armed {
+                if response.clicked()
+                    && let Some(pointer) = response.interact_pointer_pos()
+                {
+                    let (product, cut) = self
+                        .pane_product_cut(cell_index)
+                        .unwrap_or_else(|| (self.selected_product.clone(), self.selected_cut));
+                    self.add_vrot_tool_point(cell, pointer, &product, cut);
+                }
+                if response.secondary_clicked() {
+                    self.vrot_points.clear();
+                    self.status = "Vrot points cleared".to_owned();
+                }
             }
 
-            self.cross_section_handle_interactions(ui, cell, cell_index + 1);
             hovers.push(response.hover_pos());
         }
 
@@ -10735,6 +14412,9 @@ impl ViewerApp {
                 })
                 .collect::<Vec<_>>();
             let intl_points = self.intl_site_points(cell);
+            let (pane_product, pane_cut) = self
+                .pane_product_cut(cell_index)
+                .unwrap_or_else(|| (self.selected_product.clone(), self.selected_cut));
             let cell_painter = ui.painter_at(cell);
             self.draw_basemap(&cell_painter, cell);
             self.draw_graticule(&cell_painter, cell);
@@ -10750,16 +14430,12 @@ impl ViewerApp {
             self.draw_basemap_overlay(&cell_painter, cell);
             // Hazard fills honor THIS pane's product (velocity panes suppress
             // fills so couplets stay readable).
-            let fill_product = if cell_index == 0 {
-                self.selected_product.clone()
-            } else {
-                self.extra_panes[cell_index - 1].product.clone()
-            };
             self.draw_tor_tracks(&cell_painter, cell);
-            self.draw_hazard_overlays(&cell_painter, cell, &fill_product);
+            self.draw_hazard_overlays(&cell_painter, cell, &pane_product);
             self.draw_rotation_markers(&cell_painter, cell);
             self.draw_storm_tracks(&cell_painter, cell);
             self.draw_placefiles(&cell_painter, cell);
+            self.draw_map_annotations(&cell_painter, cell);
             self.draw_site_markers(&cell_painter, &site_points);
             let hovered_intl = hovers
                 .get(cell_index)
@@ -10776,6 +14452,14 @@ impl ViewerApp {
                 .and_then(|pointer| nearest_marker_within(&community_points, pointer))
                 .map(|(index, _)| index);
             self.draw_community_site_markers(&cell_painter, &community_points, hovered_community);
+            let custom_poll_points = self.custom_poll_points(cell);
+            let hovered_custom = hovers
+                .get(cell_index)
+                .copied()
+                .flatten()
+                .and_then(|pointer| nearest_marker_within(&custom_poll_points, pointer))
+                .map(|(index, _)| index);
+            self.draw_custom_poll_markers(&cell_painter, &custom_poll_points, hovered_custom);
             let raob_points = self.raob_site_points(cell);
             let hovered_raob = hovers
                 .get(cell_index)
@@ -10788,20 +14472,18 @@ impl ViewerApp {
             self.draw_loaded_volume_marker(&cell_painter, cell);
             if cell_index == 0 {
                 self.draw_colorbar(&cell_painter, cell);
-                self.draw_mode_chip(&cell_painter, cell);
-                self.draw_raw_velocity_tag(&cell_painter, cell);
             } else if self.extra_panes[cell_index - 1].texture.is_some() {
                 // Each pane gets a legend for ITS product.
-                self.draw_colorbar_for_product(&cell_painter, cell, &fill_product);
+                self.draw_colorbar_for_product(&cell_painter, cell, &pane_product);
             }
             self.draw_cross_section_line(
                 &cell_painter,
                 cell,
                 hovers.get(cell_index).copied().flatten(),
             );
-            if cell_index > 0 {
-                self.pane_product_chip(ui, &cell_painter, cell, cell_index);
-            }
+            self.draw_vrot_tool(&cell_painter, cell);
+            self.pane_info_bar(ui, &cell_painter, cell, cell_index, &pane_product, pane_cut);
+            self.draw_raw_velocity_tag_for_product(&cell_painter, cell, &pane_product, 34.0);
             // The inspector card follows the hovered pane (its readout now
             // reflects that pane's product); the pinned card stays geo-true.
             let inspector_cell = hovered_cell.unwrap_or(0);
@@ -10837,44 +14519,63 @@ impl ViewerApp {
         self.basemap_ms = Some(frame_start.elapsed().as_secs_f32() * 1000.0);
     }
 
-    /// A small product chip in an extra pane's top-left corner: shows the
-    /// pane's product; click cycles forward through the displayable products,
-    /// right-click cycles backward.
-    fn pane_product_chip(
+    /// Per-pane attribution bar for the multi-pane grid. It mirrors the
+    /// single-pane scan/product context and keeps extra-pane product cycling.
+    fn pane_info_bar(
         &mut self,
         ui: &egui::Ui,
         painter: &egui::Painter,
         cell: egui::Rect,
-        pane_number: usize,
+        pane_index: usize,
+        product: &DisplayProduct,
+        cut: usize,
     ) {
-        let Some(pane) = pane_number
-            .checked_sub(1)
-            .and_then(|slot| self.extra_panes.get(slot))
-        else {
+        let Some(volume) = self.volume.as_ref() else {
             return;
         };
-        let mut label = pane.product.label().to_owned();
-        if let (Some(cut), Some(volume)) = (pane.cut, self.volume.as_deref())
-            && let Some(elevation) = volume.cuts.get(cut).map(|c| c.elevation_deg)
-        {
-            // Pinned tilt — this pane no longer follows the main tilt.
-            label = format!("{label} · {elevation:.1}°");
-        }
+        let site_id = volume.site.id.clone();
+        let scan_time = self
+            .time_zone()
+            .format_hm(volume.volume_time.with_timezone(&Utc));
+        let tilt = volume
+            .cuts
+            .get(cut)
+            .map(|c| format!(" {:.1}°", c.elevation_deg))
+            .unwrap_or_default();
+        let (_, bg, mode) = self.mode_chip_state().unwrap_or((
+            "ARCHIVE".to_owned(),
+            egui::Color32::from_rgb(132, 96, 24),
+            "ARCH",
+        ));
+        let candidates = [
+            format!("{mode} {site_id} {}{tilt} · {scan_time}", product.label()),
+            format!("{site_id} {}{tilt} · {scan_time}", product.label()),
+            format!("{site_id} {}{tilt}", product.label()),
+            format!("{}{tilt}", product.label()),
+        ];
+        let max_width = (cell.width() - 20.0).max(48.0);
+        let label = candidates
+            .iter()
+            .find(|candidate| chip_width_for_text(candidate) <= max_width)
+            .unwrap_or(&candidates[candidates.len() - 1]);
         let pos = egui::pos2(cell.left() + 10.0, cell.top() + 10.0);
-        let width = 18.0 + label.chars().count() as f32 * 7.2;
+        let width = chip_width_for_text(label).min(max_width);
         let chip = egui::Rect::from_min_size(pos, egui::vec2(width, 20.0));
-        painter.rect_filled(chip, 4.0, egui::Color32::from_rgb(32, 40, 52));
+        painter.rect_filled(chip, 4.0, bg);
         painter.text(
             chip.center(),
             egui::Align2::CENTER_CENTER,
             label,
             egui::FontId::monospace(12.0),
-            egui::Color32::from_rgb(214, 222, 232),
+            egui::Color32::from_rgb(235, 240, 246),
         );
+        if pane_index == 0 {
+            return;
+        }
         let response = ui
             .interact(
                 chip,
-                ui.id().with(("pane-product-chip", pane_number)),
+                ui.id().with(("pane-info-bar", pane_index)),
                 egui::Sense::click(),
             )
             .on_hover_text("Click: next product · Right-click: previous");
@@ -10892,7 +14593,7 @@ impl ViewerApp {
             if products.is_empty() {
                 return;
             }
-            let pane = &mut self.extra_panes[pane_number - 1];
+            let pane = &mut self.extra_panes[pane_index - 1];
             let current = products
                 .iter()
                 .position(|product| *product == pane.product)
@@ -11449,6 +15150,26 @@ impl ViewerApp {
                 distance_km,
             });
         }
+        for entry in &self.app_settings.custom_poll_links {
+            let Some((site_lat, site_lon)) = custom_poll_entry_lat_lon(entry) else {
+                continue;
+            };
+            let url = normalized_poll_url(&entry.poll_url);
+            if url.is_empty() {
+                continue;
+            }
+            let distance_km = haversine_km(lat, lon, site_lat, site_lon);
+            if distance_km > 460.0 {
+                continue;
+            }
+            candidates.push(BeamCandidate {
+                target: BeamTarget::Research { url },
+                label: custom_poll_entry_label(entry),
+                origin: Some("custom feed".to_owned()),
+                beam_m: beam_at(distance_km),
+                distance_km,
+            });
+        }
         candidates.sort_by(|a, b| a.beam_m.total_cmp(&b.beam_m));
         candidates
     }
@@ -11735,6 +15456,7 @@ impl ViewerApp {
             .as_ref()
             .map(|volume| volume.volume_time.with_timezone(&Utc))
             .unwrap_or_else(Utc::now);
+        let time_zone = self.time_zone();
         if let Some(dock) = &mut self.model_dock {
             let Some((key, valid, run_age)) = dock.newest_hour_valid_near(target, Some(&lut_model))
             else {
@@ -11754,7 +15476,7 @@ impl ViewerApp {
                 key.model.to_uppercase(),
                 key.run,
                 key.hour,
-                valid.format("%H:%MZ")
+                time_zone.format_hm(valid)
             );
             dock.request_sounding_for(key, (index % nx) as f64, (index / nx) as f64);
             self.hail_env_pending = true;
@@ -11942,6 +15664,49 @@ impl ViewerApp {
         } else {
             ui.weak("No sounding yet — Alt-click the map (with model data) to launch one.");
         }
+    }
+
+    fn radar_overlays_window(&mut self, ctx: &egui::Context) {
+        if !self.radar_overlays_open || self.workspace.is_docked(dock::WorkspacePane::RadarOverlays)
+        {
+            return;
+        }
+        let mut open = self.radar_overlays_open;
+        egui::Window::new("Radar overlays")
+            .open(&mut open)
+            .default_size([520.0, 460.0])
+            .min_size([360.0, 260.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                self.dock_toggle_row(ui, dock::WorkspacePane::RadarOverlays);
+                self.radar_overlays_pane_body(ui, ctx);
+            });
+        self.set_viewer_open(dock::WorkspacePane::RadarOverlays, open);
+    }
+
+    fn radar_overlays_pane_body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Extra radars");
+            ui.weak(format!(
+                "{} / {} overlays",
+                self.radar_layers.len(),
+                MAX_RADAR_OVERLAY_LAYERS
+            ));
+        });
+        ui.weak(
+            "Each overlay is its own radar source drawn on the shared map. Promote makes it the primary radar for products, tilts, and archive/live controls.",
+        );
+        ui.add_space(4.0);
+        if self.radar_layers.is_empty() {
+            ui.weak(RADAR_OVERLAYS_EMPTY_HELP);
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("radar_overlays_window_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.radar_layers_panel(ui, ctx);
+            });
     }
 
     fn model_data_window(&mut self, ctx: &egui::Context) {
@@ -12490,9 +16255,7 @@ impl ViewerApp {
         if self.sat_last_frame.is_some()
             && ui
                 .button("Show on radar map")
-                .on_hover_text(
-                    "Render the current frame as a layer under the radar (opacity in Layers)",
-                )
+                .on_hover_text(SATELLITE_MAP_LAYER_HOVER)
                 .clicked()
             && let (Some(sat), Some((key, hhmm))) = (&self.sat, &self.sat_last_frame)
         {
@@ -13126,7 +16889,7 @@ impl ViewerApp {
     /// `!poll_url.is_empty()` guard to the international source.
     fn poll_source_armed(&self) -> bool {
         match &self.poll_source {
-            PollSource::CustomUrl(_) => !self.poll_url.is_empty(),
+            PollSource::CustomUrl(_) => !normalized_poll_url(&self.poll_url).is_empty(),
             PollSource::Intl {
                 provider_id,
                 site_id,
@@ -13394,7 +17157,8 @@ impl ViewerApp {
     /// GR2A-style polling: fetch <url>/dir.list, newest entry wins; when
     /// it changes, download + decode + install as the live volume.
     fn poll_custom_url(&mut self, ctx: &egui::Context) {
-        if !self.poll_active || self.poll_url.is_empty() {
+        let base = normalized_poll_url(&self.poll_url);
+        if !self.poll_active || base.is_empty() {
             return;
         }
         let due = self
@@ -13403,7 +17167,6 @@ impl ViewerApp {
             .unwrap_or(true);
         if due && self.poll_rx.is_none() {
             self.poll_next = Some(Instant::now() + Duration::from_secs(15));
-            let base = self.poll_url.trim_end_matches('/').to_owned();
             let last = self.poll_last_file.clone();
             let (sender, receiver) = mpsc::channel();
             self.poll_rx = Some(receiver);
@@ -13573,6 +17336,7 @@ impl ViewerApp {
         self.open_viewer(dock::WorkspacePane::Sounding);
         self.status = format!("Fetching RAOB {}…", site.id);
         let ctx_clone = ctx.clone();
+        let time_zone = self.time_zone();
         thread::spawn(move || {
             let compute_start = Instant::now();
             let result =
@@ -13583,8 +17347,11 @@ impl ViewerApp {
                     let context = distance_km
                         .map(|km| format!(" ({km:.0} km)"))
                         .unwrap_or_default();
-                    native.metadata.station_id =
-                        format!("{} RAOB {}{context}", site.id, valid.format("%m-%d %Hz"));
+                    native.metadata.station_id = format!(
+                        "{} RAOB {}{context}",
+                        site.id,
+                        time_zone.format_month_day_hour(valid)
+                    );
                     Ok((native, compute_start.elapsed().as_secs_f32() * 1000.0))
                 })();
             let _ = sender.send(result);
@@ -14545,8 +18312,8 @@ impl ViewerApp {
                     let mut response = ui.selectable_label(selected, text);
                     if let Some(at) = sensor.last_plot {
                         response = response.on_hover_text(format!(
-                            "last plot {} UTC{}",
-                            at.format("%Y-%m-%d %H:%M:%S"),
+                            "last plot {}{}",
+                            self.time_zone().format_date_hms(at),
                             if live { " — LIVE" } else { "" }
                         ));
                     }
@@ -15608,14 +19375,24 @@ impl ViewerApp {
     /// WITHOUT dealiasing — folded gates read as opposite-direction flow, so
     /// raw mode must never be silent (operational safety).
     fn draw_raw_velocity_tag(&self, painter: &egui::Painter, rect: egui::Rect) {
-        let velocity_family = self.selected_product.color_family() == ColorTableFamily::Velocity;
+        self.draw_raw_velocity_tag_for_product(painter, rect, &self.selected_product, 34.0);
+    }
+
+    fn draw_raw_velocity_tag_for_product(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        product: &DisplayProduct,
+        top_offset: f32,
+    ) {
+        let velocity_family = product.color_family() == ColorTableFamily::Velocity;
         if !velocity_family
-            || self.product_render_uses_dealiased_velocity(&self.selected_product)
+            || self.product_render_uses_dealiased_velocity(product)
             || self.volume.is_none()
         {
             return;
         }
-        let pos = egui::pos2(rect.left() + 10.0, rect.top() + 34.0);
+        let pos = egui::pos2(rect.left() + 10.0, rect.top() + top_offset);
         let label = "RAW VEL — folds possible";
         let width = 16.0 + label.chars().count() as f32 * 7.2;
         let chip = egui::Rect::from_min_size(pos, egui::vec2(width, 20.0));
@@ -15632,24 +19409,8 @@ impl ViewerApp {
     /// Paint a LIVE / ARCHIVE / STALE mode chip top-left so a stale frame is
     /// never mistaken for live data (operational safety).
     fn draw_mode_chip(&self, painter: &egui::Painter, rect: egui::Rect) {
-        let Some(volume) = self.volume.as_ref() else {
+        let Some((label, bg, _)) = self.mode_chip_state() else {
             return;
-        };
-        let age_min = (Utc::now() - volume.volume_time.with_timezone(&Utc)).num_minutes();
-        let live = self.realtime_level2_auto_refresh;
-        // A live feed should refresh every few minutes; if it has not, flag stale.
-        let (label, bg) = if live && age_min <= 8 {
-            ("● LIVE".to_owned(), egui::Color32::from_rgb(26, 96, 44))
-        } else if live {
-            (
-                format!("● LIVE · STALE {age_min}m"),
-                egui::Color32::from_rgb(150, 40, 36),
-            )
-        } else {
-            (
-                format!("ARCHIVE · {age_min}m old"),
-                egui::Color32::from_rgb(132, 96, 24),
-            )
         };
         let pos = egui::pos2(rect.left() + 10.0, rect.top() + 10.0);
         let width = 16.0 + label.chars().count() as f32 * 7.2;
@@ -15662,6 +19423,28 @@ impl ViewerApp {
             egui::FontId::proportional(12.0),
             egui::Color32::from_rgb(232, 236, 240),
         );
+    }
+
+    fn mode_chip_state(&self) -> Option<(String, egui::Color32, &'static str)> {
+        let volume = self.volume.as_ref()?;
+        let age = Utc::now() - volume.volume_time.with_timezone(&Utc);
+        let age_seconds = age.num_seconds().max(0);
+        let age_min = age_seconds / 60;
+        let live = self.realtime_level2_auto_refresh;
+        let age_style = self.style_registry.radar_age();
+        let fresh_bg = style_color32(age_style.fresh_color);
+        let stale_bg = style_color32(age_style.stale_color);
+        let archive_bg = style_color32(age_style.aging_color);
+        let stale_chip_seconds = age_style.stale_chip_seconds.max(0);
+        // A live feed should refresh every few minutes; if it has not, flag stale.
+        let state = if live && age_seconds <= stale_chip_seconds {
+            ("● LIVE".to_owned(), fresh_bg, "LIVE")
+        } else if live {
+            (format!("● LIVE · STALE {age_min}m"), stale_bg, "STALE")
+        } else {
+            (format!("ARCHIVE · {age_min}m old"), archive_bg, "ARCH")
+        };
+        Some(state)
     }
 
     /// Paint an on-canvas color-scale legend for the active product, bottom-right.
@@ -16054,6 +19837,58 @@ impl ViewerApp {
         self.pinned_inspector_lonlat = Some((lon, lat));
     }
 
+    fn model_soundings_available(&self) -> bool {
+        self.model_enabled && self.model_lut.is_some()
+    }
+
+    fn request_model_sounding_at_lonlat(&mut self, lon: f32, lat: f32) -> bool {
+        // The LUT rebuild is async: pair the LUT with the field only when
+        // their grid hashes agree, or a stale grid's LUT decomposes indices
+        // on the new field's nx.
+        let lookup = self.model_lut.as_ref().and_then(|(hash, lut)| {
+            let field = self
+                .model_dock
+                .as_ref()
+                .and_then(|dock| dock.latest_field())?;
+            if field.grid.as_ref().map(|grid| &grid.hash) != Some(hash) {
+                return None;
+            }
+            lut.lookup(lat, lon)
+                .map(|index| (index, field.nx, field.key.hour.model.clone()))
+        });
+        let Some((index, nx, lut_model)) = lookup else {
+            return false;
+        };
+        if self.last_sounding_request == Some(index) {
+            return false;
+        }
+        let target = self
+            .volume
+            .as_ref()
+            .map(|volume| volume.volume_time.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+        let Some(dock) = &mut self.model_dock else {
+            return false;
+        };
+        let fx = (index % nx) as f64;
+        let fy = (index / nx) as f64;
+        // Mixed hrrr+gfs stores: these grid coords belong to the LUT's
+        // model. The browser-selected hour is only safe to sample when the
+        // models agree; otherwise pin to the LUT model's hour valid nearest
+        // the display time.
+        if dock.browsed_hour_model().as_deref() == Some(lut_model.as_str()) {
+            dock.request_sounding_at(fx, fy);
+            self.last_sounding_request = Some(index);
+            true
+        } else if let Some((key, _, _)) = dock.newest_hour_valid_near(target, Some(&lut_model)) {
+            dock.request_sounding_for(key, fx, fy);
+            self.last_sounding_request = Some(index);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Draw the armed cross-section line + endpoint handles on the map (and a
     /// rubber-band from A to the cursor while only A is set).
     fn draw_cross_section_line(
@@ -16104,7 +19939,8 @@ impl ViewerApp {
         ui: &egui::Ui,
         rect: egui::Rect,
         id_salt: usize,
-    ) {
+    ) -> bool {
+        let mut owns_pointer = false;
         for (which, endpoint) in [
             (0usize, self.cross_section_a_lonlat),
             (1usize, self.cross_section_b_lonlat),
@@ -16116,7 +19952,7 @@ impl ViewerApp {
             if !rect.expand(12.0).contains(position) {
                 continue;
             }
-            let handle = egui::Rect::from_center_size(position, egui::vec2(20.0, 20.0));
+            let handle = cross_section_handle_rect(position);
             let response = ui
                 .interact(
                     handle,
@@ -16125,6 +19961,10 @@ impl ViewerApp {
                 )
                 .on_hover_cursor(egui::CursorIcon::Grab)
                 .on_hover_text("Drag to sweep the cross-section");
+            owns_pointer |= response.hovered()
+                || response.drag_started()
+                || response.dragged()
+                || response.clicked();
             if response.dragged()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
@@ -16134,8 +19974,10 @@ impl ViewerApp {
                 } else {
                     self.cross_section_b_lonlat = Some(next);
                 }
+                self.cross_section_signature = None;
             }
         }
+        owns_pointer
     }
 
     /// Recompute the cross-section texture if its inputs changed (signature
@@ -17348,14 +21190,12 @@ impl ViewerApp {
     }
 
     fn draw_site_markers(&self, painter: &egui::Painter, site_points: &[(usize, egui::Pos2)]) {
-        let rings = self.style_registry.range_rings();
         for (index, position) in site_points {
             let selected = *index == self.selected_site_index;
-            let fill = style_color32(if selected {
-                rings.site_selected_color
-            } else {
-                rings.site_idle_color
-            });
+            let Some(site) = self.sites.get(*index) else {
+                continue;
+            };
+            let fill = self.site_marker_color(site, selected);
             let radius = if selected { 5.5 } else { 3.0 };
             painter.circle_filled(*position, radius, fill);
             if selected {
@@ -17364,17 +21204,101 @@ impl ViewerApp {
                     10.0,
                     egui::Stroke::new(1.5, egui::Color32::from_rgb(236, 246, 255)),
                 );
-                if let Some(site) = self.sites.get(*index) {
-                    painter.text(
-                        *position + egui::vec2(12.0, -10.0),
-                        egui::Align2::LEFT_CENTER,
-                        &site.level2_id,
-                        egui::FontId::proportional(13.0),
-                        egui::Color32::from_rgb(238, 246, 255),
-                    );
-                }
             }
         }
+
+        let mut occupied = Vec::with_capacity(site_points.len().min(48));
+        for (index, position) in site_points {
+            let selected = *index == self.selected_site_index;
+            let Some(site) = self.sites.get(*index) else {
+                continue;
+            };
+            if !self.site_marker_should_label(site, selected) {
+                continue;
+            }
+            self.draw_site_marker_label(painter, *position, site, selected, &mut occupied);
+        }
+    }
+
+    fn site_marker_color(&self, site: &RadarSite, selected: bool) -> egui::Color32 {
+        if let Some(scan_time) = self.loaded_site_scan_time_utc(&site.level2_id) {
+            return freshness_ring_color(
+                scan_time,
+                Utc::now(),
+                if selected { 255 } else { 220 },
+                self.style_registry.radar_age(),
+            );
+        }
+        if site_is_terminal_radar(site) {
+            return egui::Color32::from_rgb(255, 202, 92);
+        }
+        let rings = self.style_registry.range_rings();
+        style_color32(if selected {
+            rings.site_selected_color
+        } else {
+            rings.site_idle_color
+        })
+    }
+
+    fn loaded_site_scan_time_utc(&self, site_id: &str) -> Option<DateTime<Utc>> {
+        if let Some(volume) = &self.volume
+            && volume.site.id.eq_ignore_ascii_case(site_id)
+        {
+            return Some(volume.volume_time.with_timezone(&Utc));
+        }
+        self.radar_layers.iter().find_map(|layer| {
+            let volume = layer.volume.as_ref()?;
+            (volume.site.id.eq_ignore_ascii_case(site_id))
+                .then(|| volume.volume_time.with_timezone(&Utc))
+        })
+    }
+
+    fn site_marker_should_label(&self, site: &RadarSite, selected: bool) -> bool {
+        self.app_settings.show_radar_labels
+            && (selected
+                || self.map_scale >= SITE_LABEL_MIN_SCALE
+                || (site_is_terminal_radar(site)
+                    && self.map_scale >= TERMINAL_SITE_LABEL_MIN_SCALE))
+    }
+
+    fn draw_site_marker_label(
+        &self,
+        painter: &egui::Painter,
+        position: egui::Pos2,
+        site: &RadarSite,
+        selected: bool,
+        occupied: &mut Vec<egui::Rect>,
+    ) {
+        let terminal = site_is_terminal_radar(site);
+        let label = site_marker_label(site);
+        let font_px = if selected { 13.0 } else { 11.0 };
+        let text_color = if terminal {
+            egui::Color32::from_rgb(25, 18, 6)
+        } else {
+            egui::Color32::from_rgb(238, 246, 255)
+        };
+        let galley = painter.layout_no_wrap(label, egui::FontId::proportional(font_px), text_color);
+        let rect = egui::Rect::from_min_size(
+            position + egui::vec2(10.0, if terminal { -15.0 } else { -12.0 }),
+            galley.size() + egui::vec2(8.0, 4.0),
+        );
+        if !selected
+            && occupied
+                .iter()
+                .any(|existing| existing.intersects(rect.expand(2.0)))
+        {
+            return;
+        }
+        let bg = if terminal {
+            egui::Color32::from_rgba_unmultiplied(255, 202, 92, if selected { 245 } else { 218 })
+        } else if selected {
+            egui::Color32::from_rgba_unmultiplied(12, 18, 26, 224)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(3, 6, 10, 168)
+        };
+        painter.rect_filled(rect, 3.0, bg);
+        painter.galley(rect.min + egui::vec2(4.0, 2.0), galley, text_color);
+        occupied.push(rect);
     }
 
     /// Screen positions of the international static-catalog markers inside
@@ -17423,7 +21347,7 @@ impl ViewerApp {
     }
 
     /// Left-click on map markers: the nearest hit inside the shared 12 px
-    /// halo wins across ALL four catalogs ([`resolve_marker_click`]). A
+    /// halo wins across ALL marker catalogs ([`resolve_marker_click`]). A
     /// CONUS hit selects the site (the existing behavior); an
     /// international hit starts that site's live poll through
     /// [`Self::start_intl_poll`] — the exact path the DATA-tab picker
@@ -17434,11 +21358,13 @@ impl ViewerApp {
     /// fetches that station's observed sounding at the displayed time
     /// through [`Self::start_raob_sounding_for`] — the exact path the
     /// Analysis (OA) button uses.
+    #[allow(clippy::too_many_arguments)]
     fn handle_marker_click(
         &mut self,
         site_points: &[(usize, egui::Pos2)],
         intl_points: &[(usize, egui::Pos2)],
         community_points: &[(usize, egui::Pos2)],
+        custom_poll_points: &[(usize, egui::Pos2)],
         raob_points: &[(usize, egui::Pos2)],
         pointer: egui::Pos2,
         ctx: &egui::Context,
@@ -17451,6 +21377,7 @@ impl ViewerApp {
             nearest_marker_within(site_points, pointer),
             nearest_marker_within(intl_points, pointer),
             nearest_marker_within(community_points, pointer),
+            nearest_marker_within(custom_poll_points, pointer),
             nearest_marker_within(raob_points, pointer),
         ) {
             Some((MarkerFamily::Conus, index)) => self.selected_site_index = index,
@@ -17486,6 +21413,7 @@ impl ViewerApp {
                     _ => {}
                 }
             }
+            Some((MarkerFamily::CustomPoll, index)) => self.start_custom_poll_link(index),
             Some((MarkerFamily::Raob, index)) => {
                 let Some(site) = self.raob_marker_sites().get(index).cloned() else {
                     return;
@@ -17494,6 +21422,48 @@ impl ViewerApp {
             }
             None => {}
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_plain_map_click(
+        &mut self,
+        rect: egui::Rect,
+        site_points: &[(usize, egui::Pos2)],
+        intl_points: &[(usize, egui::Pos2)],
+        community_points: &[(usize, egui::Pos2)],
+        custom_poll_points: &[(usize, egui::Pos2)],
+        raob_points: &[(usize, egui::Pos2)],
+        pointer: egui::Pos2,
+        ctx: &egui::Context,
+    ) {
+        // Site/feed markers keep priority (their 12 px halo is the
+        // established click grammar, RAOB diamonds included); SPC report
+        // dots and tornado tracks take the click only when no marker is in
+        // reach.
+        let marker_hit = nearest_marker_within(site_points, pointer).is_some()
+            || nearest_marker_within(intl_points, pointer).is_some()
+            || nearest_marker_within(community_points, pointer).is_some()
+            || nearest_marker_within(custom_poll_points, pointer).is_some()
+            || nearest_marker_within(raob_points, pointer).is_some();
+        if !marker_hit {
+            if let Some(report) = self.spc_report_at_position(rect, pointer) {
+                self.jump_to_storm_report(&report, ctx);
+                return;
+            }
+            if let Some(hit) = self.event_track_at(rect, pointer) {
+                self.jump_to_event_track(&hit, ctx);
+                return;
+            }
+        }
+        self.handle_marker_click(
+            site_points,
+            intl_points,
+            community_points,
+            custom_poll_points,
+            raob_points,
+            pointer,
+            ctx,
+        );
     }
 
     /// International site markers: the same visual grammar as
@@ -17606,10 +21576,113 @@ impl ViewerApp {
             .then_some(self.poll_url.as_str())
     }
 
-    /// Community research-feed markers: the third marker family. Same
+    pub(crate) fn start_custom_poll_link(&mut self, index: usize) {
+        let Some(entry) = self.app_settings.custom_poll_links.get(index).cloned() else {
+            return;
+        };
+        let label = custom_poll_entry_label(&entry);
+        self.status = format!("Polling {label} Â· custom feed");
+        self.start_known_feed_poll(&entry.poll_url);
+    }
+
+    /// Screen positions of user-saved custom radar poll markers. These are
+    /// operator-owned entries from the DATA tab: no network, just persisted
+    /// lat/lon plus a GR2A-style poll root.
+    fn custom_poll_points(&self, rect: egui::Rect) -> Vec<(usize, egui::Pos2)> {
+        self.app_settings
+            .custom_poll_links
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let (latitude_deg, longitude_deg) = custom_poll_entry_lat_lon(entry)?;
+                let position = self.lon_lat_to_screen(rect, longitude_deg, latitude_deg);
+                rect.expand(18.0)
+                    .contains(position)
+                    .then_some((index, position))
+            })
+            .collect()
+    }
+
+    /// User custom-feed markers: red dots/rings so private IP/direct feeds
+    /// are visually distinct from CONUS dots, amber international rings,
+    /// and teal community research feeds.
+    fn draw_custom_poll_markers(
+        &self,
+        painter: &egui::Painter,
+        custom_points: &[(usize, egui::Pos2)],
+        hovered: Option<usize>,
+    ) {
+        if custom_points.is_empty() {
+            return;
+        }
+        let active_url = self.active_community_poll_url();
+        const CUSTOM_IDLE: egui::Color32 = egui::Color32::from_rgb(220, 70, 72);
+        const CUSTOM_LIT: egui::Color32 = egui::Color32::from_rgb(255, 116, 118);
+        for (index, position) in custom_points {
+            let Some(entry) = self.app_settings.custom_poll_links.get(*index) else {
+                continue;
+            };
+            let label = custom_poll_entry_label(entry);
+            let is_active = active_url.is_some_and(|url| poll_urls_match(url, &entry.poll_url));
+            let is_hovered = hovered == Some(*index);
+            if is_active {
+                painter.circle_filled(*position, 5.5, CUSTOM_LIT);
+                painter.circle_stroke(
+                    *position,
+                    10.0,
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 210, 210)),
+                );
+                painter.text(
+                    *position + egui::vec2(12.0, -10.0),
+                    egui::Align2::LEFT_CENTER,
+                    &label,
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_rgb(255, 224, 224),
+                );
+            } else {
+                painter.circle_stroke(
+                    *position,
+                    if is_hovered { 4.8 } else { 3.4 },
+                    egui::Stroke::new(1.7, if is_hovered { CUSTOM_LIT } else { CUSTOM_IDLE }),
+                );
+                painter.circle_filled(
+                    *position,
+                    1.8,
+                    if is_hovered { CUSTOM_LIT } else { CUSTOM_IDLE },
+                );
+            }
+            if is_hovered && !is_active {
+                let site_id = entry.site_id.trim();
+                let text = if site_id.is_empty() {
+                    format!("{label} Â· custom feed â€” click to live-poll")
+                } else {
+                    format!("{site_id} {label} Â· custom feed â€” click to live-poll")
+                };
+                let width = 12.0 + text.chars().count() as f32 * 6.6;
+                let chip = egui::Rect::from_min_size(
+                    *position + egui::vec2(10.0, -26.0),
+                    egui::vec2(width, 18.0),
+                );
+                painter.rect_filled(
+                    chip,
+                    4.0,
+                    egui::Color32::from_rgba_unmultiplied(16, 22, 30, 230),
+                );
+                painter.text(
+                    chip.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &text,
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_rgb(255, 224, 224),
+                );
+            }
+        }
+    }
+
+    /// Community research-feed markers. Same
     /// visual grammar as [`Self::draw_intl_site_markers`] (hollow ring,
     /// hover chip, lit-when-polled) but cool teal against the warm amber
-    /// international rings and the filled CONUS dots, so all three
+    /// international rings and the filled CONUS dots, so the catalogs
     /// catalogs read apart at a glance.
     fn draw_community_site_markers(
         &self,
@@ -17698,7 +21771,7 @@ impl ViewerApp {
         }
     }
 
-    /// RAOB launch-site markers: the fourth marker family. Same visual
+    /// RAOB launch-site markers. Same visual
     /// grammar as [`Self::draw_intl_site_markers`] (hollow + hover chip,
     /// identical culling) but a lavender hollow DIAMOND — shape and hue
     /// both read apart from the filled CONUS dots, the warm amber intl
@@ -17778,7 +21851,10 @@ impl ViewerApp {
         // An armed drawing tool owns map clicks, so the click-elsewhere
         // dismissal in handle_marker_click can't run — and the picker's
         // rect would shadow endpoint placement beneath it. Dismiss.
-        if self.cross_section_armed || self.vrot_tool_armed {
+        if self.cross_section_armed
+            || self.vrot_tool_armed
+            || self.annotations.active_tool.is_some()
+        {
             self.community_menu = None;
             return;
         }
@@ -17845,6 +21921,12 @@ impl ViewerApp {
             11.0,
             egui::Stroke::new(1.8, egui::Color32::from_rgb(244, 252, 255)),
         );
+        self.draw_radar_age_glyph_arc(
+            painter,
+            position,
+            volume.volume_time.with_timezone(&Utc),
+            255,
+        );
         painter.text(
             position + egui::vec2(12.0, -10.0),
             egui::Align2::LEFT_CENTER,
@@ -17876,6 +21958,14 @@ impl ViewerApp {
                     egui::Color32::from_rgba_unmultiplied(214, 242, 255, layer.opacity),
                 ),
             );
+            if let Some(volume) = &layer.volume {
+                self.draw_radar_age_glyph_arc(
+                    painter,
+                    position,
+                    volume.volume_time.with_timezone(&Utc),
+                    layer.opacity,
+                );
+            }
             painter.text(
                 position + egui::vec2(10.0, 10.0),
                 egui::Align2::LEFT_CENTER,
@@ -17884,6 +21974,31 @@ impl ViewerApp {
                 egui::Color32::from_rgba_unmultiplied(214, 242, 255, layer.opacity),
             );
         }
+    }
+
+    fn draw_radar_age_glyph_arc(
+        &self,
+        painter: &egui::Painter,
+        position: egui::Pos2,
+        volume_time_utc: DateTime<Utc>,
+        alpha: u8,
+    ) {
+        let age_style = self.style_registry.radar_age();
+        if !age_style.glyph_arc_enabled {
+            return;
+        }
+        let now_utc = Utc::now();
+        let points = radar_age_glyph_arc_points(position, volume_time_utc, now_utc, age_style);
+        if points.len() < 2 {
+            return;
+        }
+        painter.add(egui::Shape::line(
+            points,
+            egui::Stroke::new(
+                2.5,
+                freshness_ring_color(volume_time_utc, now_utc, alpha, age_style),
+            ),
+        ));
     }
 
     fn nearest_site_to_position(&self, rect: egui::Rect, position: egui::Pos2) -> Option<usize> {
@@ -18051,6 +22166,45 @@ impl ViewerApp {
         let product = self.selected_product.clone();
         let cut = self.selected_cut;
         self.cursor_readout_for(rect, position, &product, cut)
+    }
+
+    fn add_vrot_tool_point(
+        &mut self,
+        rect: egui::Rect,
+        position: egui::Pos2,
+        product: &DisplayProduct,
+        cut: usize,
+    ) {
+        if !manual_vrot_product_supported(product) {
+            self.status = "Vrot tool needs VEL, DVEL, SRV, or DSRV".to_owned();
+            return;
+        }
+        let Some(readout) = self.cursor_readout_for(rect, position, product, cut) else {
+            self.status = "No velocity gate under Vrot click".to_owned();
+            return;
+        };
+        if !manual_vrot_product_supported(&readout.product) || !readout.value.is_finite() {
+            self.status = "No velocity gate under Vrot click".to_owned();
+            return;
+        }
+        let (lon, lat) = self.screen_to_lon_lat(rect, position);
+        if self.vrot_points.len() >= 2 {
+            self.vrot_points.clear();
+        }
+        self.vrot_points
+            .push((lon, lat, readout.value, readout.height_above_radar_m));
+        self.status = match self.vrot_points.as_slice() {
+            [_] => "Vrot point 1 set; click the opposite velocity max".to_owned(),
+            [a, b] => {
+                let vrot_kt = ((a.2.abs() + b.2.abs()) / 2.0) / KNOT_TO_MPS;
+                if a.2.signum() == b.2.signum() {
+                    format!("Vrot {:.0} kt; points have the same sign", vrot_kt)
+                } else {
+                    format!("Vrot {:.0} kt set", vrot_kt)
+                }
+            }
+            _ => String::new(),
+        };
     }
 
     /// Readout for an arbitrary product/tilt — lets every grid pane report
@@ -18279,6 +22433,433 @@ struct PlaceLabelSet {
     labels: &'static [basemap_data::BasemapLabel],
     max_rank: u8,
     max_labels: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PlaceSearchResult {
+    name: &'static str,
+    lon: f32,
+    lat: f32,
+    rank: u8,
+    match_score: u8,
+    distance_km: f32,
+    state_abbr: Option<&'static str>,
+    context_label: Option<&'static str>,
+    source_rank: u8,
+}
+
+#[derive(Clone, Copy)]
+struct PlaceSearchSource {
+    labels: &'static [basemap_data::BasemapLabel],
+    context_label: Option<&'static str>,
+    source_rank: u8,
+}
+
+fn place_search_matches(
+    query: &str,
+    center_lat: f32,
+    center_lon: f32,
+    limit: usize,
+) -> Vec<PlaceSearchResult> {
+    let (query, state_filter, country_filter) = parse_place_search_query(query);
+    if query.len() < 2 || limit == 0 {
+        return Vec::new();
+    }
+
+    let mut results = Vec::new();
+
+    for source in place_search_sources(country_filter) {
+        results.extend(source.labels.iter().filter_map(|label| {
+            let match_score = place_name_match_score(label.name, &query)?;
+            let state_abbr = source
+                .context_label
+                .is_none()
+                .then(|| us_state_abbr_for_lon_lat(label.lat, label.lon))
+                .flatten();
+            let context_label = state_abbr
+                .or(source.context_label)
+                .or_else(|| place_search_context_for_lon_lat(label.lat, label.lon));
+            if let Some(state_filter) = state_filter
+                && state_abbr != Some(state_filter)
+            {
+                return None;
+            }
+            if let Some(country_filter) = country_filter
+                && context_label != Some(country_filter)
+            {
+                return None;
+            }
+            Some(PlaceSearchResult {
+                name: label.name,
+                lon: label.lon,
+                lat: label.lat,
+                rank: label.rank,
+                match_score,
+                distance_km: haversine_km(center_lat, center_lon, label.lat, label.lon),
+                state_abbr,
+                context_label,
+                source_rank: source.source_rank,
+            })
+        }));
+    }
+
+    results.sort_by(|a, b| {
+        a.match_score
+            .cmp(&b.match_score)
+            .then_with(|| a.distance_km.total_cmp(&b.distance_km))
+            .then(a.rank.cmp(&b.rank))
+            .then(a.source_rank.cmp(&b.source_rank))
+            .then(a.name.cmp(b.name))
+    });
+    results.dedup_by(|a, b| a.name == b.name && haversine_km(a.lat, a.lon, b.lat, b.lon) < 8.0);
+    results.truncate(limit);
+    for result in &mut results {
+        if result.state_abbr.is_none() {
+            result.state_abbr = us_state_abbr_for_lon_lat(result.lat, result.lon);
+        }
+        if result.context_label.is_none() {
+            result.context_label = result
+                .state_abbr
+                .or_else(|| place_search_context_for_lon_lat(result.lat, result.lon));
+        }
+    }
+    results
+}
+
+fn place_search_sources(country_filter: Option<&'static str>) -> Vec<PlaceSearchSource> {
+    let mut sources = Vec::new();
+    let include_us = country_filter.is_none();
+    if include_us {
+        sources.push(PlaceSearchSource {
+            labels: basemap_data::BASEMAP_US_PLACE_LABELS,
+            context_label: None,
+            source_rank: 0,
+        });
+        sources.push(PlaceSearchSource {
+            labels: basemap_towns::BASEMAP_US_TOWN_LABELS,
+            context_label: None,
+            source_rank: 1,
+        });
+    }
+
+    for (country, places, admins) in [
+        (
+            "Canada",
+            basemap_data::BASEMAP_CANADA_PLACE_LABELS,
+            basemap_data::BASEMAP_CANADA_ADMIN_LABELS,
+        ),
+        (
+            "Mexico",
+            basemap_data::BASEMAP_MEXICO_PLACE_LABELS,
+            basemap_data::BASEMAP_MEXICO_ADMIN_LABELS,
+        ),
+        (
+            "Japan",
+            basemap_data::BASEMAP_JAPAN_PLACE_LABELS,
+            basemap_data::BASEMAP_JAPAN_ADMIN_LABELS,
+        ),
+    ] {
+        if country_filter.is_none_or(|filter| filter == country) {
+            sources.push(PlaceSearchSource {
+                labels: places,
+                context_label: Some(country),
+                source_rank: 2,
+            });
+            sources.push(PlaceSearchSource {
+                labels: admins,
+                context_label: Some(country),
+                source_rank: 3,
+            });
+        }
+    }
+
+    sources.push(PlaceSearchSource {
+        labels: basemap_data::BASEMAP_WORLD_PLACE_LABELS,
+        context_label: None,
+        source_rank: 8,
+    });
+    sources
+}
+
+fn parse_place_search_query(query: &str) -> (String, Option<&'static str>, Option<&'static str>) {
+    let normalized = normalize_place_search_text(query);
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    for (alias, abbr) in US_STATE_QUERY_ALIASES {
+        let alias_tokens = alias.split_whitespace().collect::<Vec<_>>();
+        if tokens.len() <= alias_tokens.len() {
+            continue;
+        }
+        if tokens[tokens.len() - alias_tokens.len()..] == alias_tokens[..] {
+            return (
+                tokens[..tokens.len() - alias_tokens.len()].join(" "),
+                Some(*abbr),
+                None,
+            );
+        }
+    }
+    for (alias, country) in PLACE_COUNTRY_QUERY_ALIASES {
+        let alias_tokens = alias.split_whitespace().collect::<Vec<_>>();
+        if tokens.len() <= alias_tokens.len() {
+            continue;
+        }
+        if tokens[tokens.len() - alias_tokens.len()..] == alias_tokens[..] {
+            return (
+                tokens[..tokens.len() - alias_tokens.len()].join(" "),
+                None,
+                Some(*country),
+            );
+        }
+    }
+    (normalized, None, None)
+}
+
+fn normalize_place_search_text(text: &str) -> String {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn place_name_match_score(name: &str, query_lower: &str) -> Option<u8> {
+    let name_lower = name.to_ascii_lowercase();
+    if name_lower == query_lower {
+        Some(0)
+    } else if name_lower.starts_with(query_lower) {
+        Some(1)
+    } else if name_lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| part.starts_with(query_lower))
+    {
+        Some(2)
+    } else if name_lower.contains(query_lower) {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+fn place_search_result_label(result: &PlaceSearchResult) -> String {
+    let lon_suffix = if result.lon < 0.0 { "W" } else { "E" };
+    let lat_suffix = if result.lat < 0.0 { "S" } else { "N" };
+    format!(
+        "{} · {:.1}{lat_suffix} {:.1}{lon_suffix}",
+        place_search_display_name(result),
+        result.lat.abs(),
+        result.lon.abs(),
+    )
+}
+
+fn place_search_display_name(result: &PlaceSearchResult) -> String {
+    result
+        .state_abbr
+        .or(result.context_label)
+        .map(|context| format!("{}, {context}", result.name))
+        .unwrap_or_else(|| result.name.to_owned())
+}
+
+fn place_search_context_for_lon_lat(lat: f32, lon: f32) -> Option<&'static str> {
+    if let Some(state) = us_state_abbr_for_lon_lat(lat, lon) {
+        return Some(state);
+    }
+    if bbox_contains(basemap_data::BASEMAP_CANADA_BOUNDS, lon, lat) {
+        Some("Canada")
+    } else if bbox_contains(basemap_data::BASEMAP_MEXICO_BOUNDS, lon, lat) {
+        Some("Mexico")
+    } else if bbox_contains(basemap_data::BASEMAP_JAPAN_BOUNDS, lon, lat) {
+        Some("Japan")
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UsStateAnchor {
+    abbr: &'static str,
+    lon: f32,
+    lat: f32,
+}
+
+#[rustfmt::skip]
+const US_STATE_ANCHORS: &[UsStateAnchor] = &[
+    UsStateAnchor { abbr: "AL", lon: -86.8, lat: 32.8 },
+    UsStateAnchor { abbr: "AK", lon: -152.0, lat: 64.2 },
+    UsStateAnchor { abbr: "AZ", lon: -111.7, lat: 34.3 },
+    UsStateAnchor { abbr: "AR", lon: -92.4, lat: 34.9 },
+    UsStateAnchor { abbr: "CA", lon: -119.7, lat: 36.6 },
+    UsStateAnchor { abbr: "CO", lon: -105.5, lat: 39.0 },
+    UsStateAnchor { abbr: "CT", lon: -72.7, lat: 41.6 },
+    UsStateAnchor { abbr: "DE", lon: -75.5, lat: 39.0 },
+    UsStateAnchor { abbr: "DC", lon: -77.0, lat: 38.9 },
+    UsStateAnchor { abbr: "FL", lon: -82.4, lat: 28.6 },
+    UsStateAnchor { abbr: "GA", lon: -83.4, lat: 32.7 },
+    UsStateAnchor { abbr: "HI", lon: -157.5, lat: 20.9 },
+    UsStateAnchor { abbr: "ID", lon: -114.7, lat: 44.1 },
+    UsStateAnchor { abbr: "IL", lon: -89.2, lat: 40.0 },
+    UsStateAnchor { abbr: "IN", lon: -86.1, lat: 39.9 },
+    UsStateAnchor { abbr: "IA", lon: -93.5, lat: 42.1 },
+    UsStateAnchor { abbr: "KS", lon: -98.4, lat: 38.5 },
+    UsStateAnchor { abbr: "KY", lon: -85.3, lat: 37.5 },
+    UsStateAnchor { abbr: "LA", lon: -91.9, lat: 30.9 },
+    UsStateAnchor { abbr: "ME", lon: -69.2, lat: 45.3 },
+    UsStateAnchor { abbr: "MD", lon: -76.7, lat: 39.0 },
+    UsStateAnchor { abbr: "MA", lon: -71.8, lat: 42.3 },
+    UsStateAnchor { abbr: "MI", lon: -84.6, lat: 44.3 },
+    UsStateAnchor { abbr: "MN", lon: -94.6, lat: 46.3 },
+    UsStateAnchor { abbr: "MS", lon: -89.7, lat: 32.7 },
+    UsStateAnchor { abbr: "MO", lon: -92.5, lat: 38.5 },
+    UsStateAnchor { abbr: "MT", lon: -110.4, lat: 46.9 },
+    UsStateAnchor { abbr: "NE", lon: -99.8, lat: 41.5 },
+    UsStateAnchor { abbr: "NV", lon: -116.6, lat: 39.3 },
+    UsStateAnchor { abbr: "NH", lon: -71.6, lat: 43.7 },
+    UsStateAnchor { abbr: "NJ", lon: -74.7, lat: 40.1 },
+    UsStateAnchor { abbr: "NM", lon: -106.1, lat: 34.4 },
+    UsStateAnchor { abbr: "NY", lon: -75.5, lat: 42.9 },
+    UsStateAnchor { abbr: "NC", lon: -79.4, lat: 35.5 },
+    UsStateAnchor { abbr: "ND", lon: -100.5, lat: 47.5 },
+    UsStateAnchor { abbr: "OH", lon: -82.8, lat: 40.3 },
+    UsStateAnchor { abbr: "OK", lon: -97.5, lat: 35.6 },
+    UsStateAnchor { abbr: "OR", lon: -120.6, lat: 43.9 },
+    UsStateAnchor { abbr: "PA", lon: -77.8, lat: 40.9 },
+    UsStateAnchor { abbr: "RI", lon: -71.5, lat: 41.7 },
+    UsStateAnchor { abbr: "SC", lon: -80.9, lat: 33.8 },
+    UsStateAnchor { abbr: "SD", lon: -100.2, lat: 44.4 },
+    UsStateAnchor { abbr: "TN", lon: -86.4, lat: 35.8 },
+    UsStateAnchor { abbr: "TX", lon: -99.3, lat: 31.5 },
+    UsStateAnchor { abbr: "UT", lon: -111.7, lat: 39.3 },
+    UsStateAnchor { abbr: "VT", lon: -72.7, lat: 44.0 },
+    UsStateAnchor { abbr: "VA", lon: -78.7, lat: 37.5 },
+    UsStateAnchor { abbr: "WA", lon: -120.4, lat: 47.4 },
+    UsStateAnchor { abbr: "WV", lon: -80.6, lat: 38.6 },
+    UsStateAnchor { abbr: "WI", lon: -89.8, lat: 44.5 },
+    UsStateAnchor { abbr: "WY", lon: -107.6, lat: 43.0 },
+    UsStateAnchor { abbr: "PR", lon: -66.5, lat: 18.2 },
+    UsStateAnchor { abbr: "VI", lon: -64.8, lat: 18.1 },
+    UsStateAnchor { abbr: "GU", lon: 144.8, lat: 13.4 },
+    UsStateAnchor { abbr: "MP", lon: 145.6, lat: 15.1 },
+    UsStateAnchor { abbr: "AS", lon: -170.7, lat: -14.3 },
+];
+
+#[rustfmt::skip]
+const US_STATE_QUERY_ALIASES: &[(&str, &str)] = &[
+    ("al", "AL"), ("alabama", "AL"),
+    ("ak", "AK"), ("alaska", "AK"),
+    ("az", "AZ"), ("arizona", "AZ"),
+    ("ar", "AR"), ("arkansas", "AR"),
+    ("ca", "CA"), ("california", "CA"),
+    ("co", "CO"), ("colorado", "CO"),
+    ("ct", "CT"), ("connecticut", "CT"),
+    ("de", "DE"), ("delaware", "DE"),
+    ("dc", "DC"), ("district of columbia", "DC"),
+    ("fl", "FL"), ("florida", "FL"),
+    ("ga", "GA"), ("georgia", "GA"),
+    ("hi", "HI"), ("hawaii", "HI"),
+    ("id", "ID"), ("idaho", "ID"),
+    ("il", "IL"), ("illinois", "IL"),
+    ("in", "IN"), ("indiana", "IN"),
+    ("ia", "IA"), ("iowa", "IA"),
+    ("ks", "KS"), ("kansas", "KS"),
+    ("ky", "KY"), ("kentucky", "KY"),
+    ("la", "LA"), ("louisiana", "LA"),
+    ("me", "ME"), ("maine", "ME"),
+    ("md", "MD"), ("maryland", "MD"),
+    ("ma", "MA"), ("massachusetts", "MA"),
+    ("mi", "MI"), ("michigan", "MI"),
+    ("mn", "MN"), ("minnesota", "MN"),
+    ("ms", "MS"), ("mississippi", "MS"),
+    ("mo", "MO"), ("missouri", "MO"),
+    ("mt", "MT"), ("montana", "MT"),
+    ("ne", "NE"), ("nebraska", "NE"),
+    ("nv", "NV"), ("nevada", "NV"),
+    ("nh", "NH"), ("new hampshire", "NH"),
+    ("nj", "NJ"), ("new jersey", "NJ"),
+    ("nm", "NM"), ("new mexico", "NM"),
+    ("ny", "NY"), ("new york", "NY"),
+    ("nc", "NC"), ("north carolina", "NC"),
+    ("nd", "ND"), ("north dakota", "ND"),
+    ("oh", "OH"), ("ohio", "OH"),
+    ("ok", "OK"), ("oklahoma", "OK"),
+    ("or", "OR"), ("oregon", "OR"),
+    ("pa", "PA"), ("pennsylvania", "PA"),
+    ("ri", "RI"), ("rhode island", "RI"),
+    ("sc", "SC"), ("south carolina", "SC"),
+    ("sd", "SD"), ("south dakota", "SD"),
+    ("tn", "TN"), ("tennessee", "TN"),
+    ("tx", "TX"), ("texas", "TX"),
+    ("ut", "UT"), ("utah", "UT"),
+    ("vt", "VT"), ("vermont", "VT"),
+    ("va", "VA"), ("virginia", "VA"),
+    ("wa", "WA"), ("washington", "WA"),
+    ("wv", "WV"), ("west virginia", "WV"),
+    ("wi", "WI"), ("wisconsin", "WI"),
+    ("wy", "WY"), ("wyoming", "WY"),
+    ("pr", "PR"), ("puerto rico", "PR"),
+    ("vi", "VI"), ("virgin islands", "VI"),
+    ("gu", "GU"), ("guam", "GU"),
+    ("mp", "MP"), ("northern mariana islands", "MP"),
+    ("as", "AS"), ("american samoa", "AS"),
+];
+
+#[rustfmt::skip]
+const PLACE_COUNTRY_QUERY_ALIASES: &[(&str, &str)] = &[
+    ("canada", "Canada"),
+    ("mexico", "Mexico"), ("mx", "Mexico"),
+    ("japan", "Japan"), ("jp", "Japan"),
+];
+
+fn us_state_abbr_for_lon_lat(lat: f32, lon: f32) -> Option<&'static str> {
+    if lat >= 50.0 && (lon <= -130.0 || lon >= 170.0) {
+        return Some("AK");
+    }
+    if (18.5..=23.0).contains(&lat) && (-161.0..=-154.0).contains(&lon) {
+        return Some("HI");
+    }
+
+    let mut best_area = f32::INFINITY;
+    let mut best_bbox = None;
+    for line in basemap_data::BASEMAP_US_STATE_LINES {
+        if !bbox_contains(line.bbox, lon, lat) || !basemap_line_contains_lon_lat(line, lon, lat) {
+            continue;
+        }
+        let area = (line.bbox[2] - line.bbox[0]).abs() * (line.bbox[3] - line.bbox[1]).abs();
+        if area < best_area {
+            best_area = area;
+            best_bbox = Some(line.bbox);
+        }
+    }
+    best_bbox.map(us_state_abbr_for_bbox)
+}
+
+fn basemap_line_contains_lon_lat(line: &basemap_data::BasemapLine, lon: f32, lat: f32) -> bool {
+    if line.points.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut previous = line.points[line.points.len() - 1];
+    for current in line.points {
+        let crosses = (current.1 > lat) != (previous.1 > lat);
+        if crosses {
+            let lon_at_lat =
+                (previous.0 - current.0) * (lat - current.1) / (previous.1 - current.1) + current.0;
+            if lon < lon_at_lat {
+                inside = !inside;
+            }
+        }
+        previous = *current;
+    }
+    inside
+}
+
+fn us_state_abbr_for_bbox(bbox: [f32; 4]) -> &'static str {
+    let lon = (bbox[0] + bbox[2]) * 0.5;
+    let lat = (bbox[1] + bbox[3]) * 0.5;
+    US_STATE_ANCHORS
+        .iter()
+        .min_by(|a, b| {
+            haversine_km(lat, lon, a.lat, a.lon).total_cmp(&haversine_km(lat, lon, b.lat, b.lon))
+        })
+        .map(|anchor| anchor.abbr)
+        .unwrap_or("US")
 }
 
 const REGIONAL_BASEMAP_LAYERS: &[RegionalBasemapLayer] = &[
@@ -18610,6 +23191,47 @@ fn positive_ratio(numerator: f32, denominator: f32) -> f32 {
     }
 }
 
+fn radar_age_glyph_arc_points(
+    center: egui::Pos2,
+    volume_time_utc: DateTime<Utc>,
+    now_utc: DateTime<Utc>,
+    age_style: &styles::RadarAgeStyle,
+) -> Vec<egui::Pos2> {
+    let sweep_fraction = radar_age_glyph_arc_sweep_fraction(volume_time_utc, now_utc, age_style);
+    if sweep_fraction <= f32::EPSILON {
+        return Vec::new();
+    }
+    let radius = if age_style.glyph_arc_radius_px.is_finite() {
+        age_style.glyph_arc_radius_px.clamp(4.0, 48.0)
+    } else {
+        styles::RadarAgeStyle::default().glyph_arc_radius_px
+    };
+    let segments = ((48.0 * sweep_fraction).ceil() as usize).clamp(2, 48);
+    let sweep = std::f32::consts::TAU * sweep_fraction;
+    (0..=segments)
+        .map(|index| {
+            let angle = sweep * index as f32 / segments as f32;
+            egui::pos2(
+                center.x + radius * angle.sin(),
+                center.y - radius * angle.cos(),
+            )
+        })
+        .collect()
+}
+
+fn radar_age_glyph_arc_sweep_fraction(
+    volume_time_utc: DateTime<Utc>,
+    now_utc: DateTime<Utc>,
+    age_style: &styles::RadarAgeStyle,
+) -> f32 {
+    let age_seconds = now_utc
+        .signed_duration_since(volume_time_utc)
+        .num_seconds()
+        .max(0) as f32;
+    let red_seconds = age_style.red_seconds.max(1) as f32;
+    (age_seconds / red_seconds).clamp(0.0, 1.0)
+}
+
 /// Scan-age ring color: green → yellow → red → dark-red across the style's
 /// thresholds (defaults 6/10/15 min). Thresholds AND colors come from the
 /// radar-age style group so the gradient is one customization shared by
@@ -18708,7 +23330,7 @@ fn nearest_marker_within(
         .min_by(|left, right| left.1.total_cmp(&right.1))
 }
 
-/// The four map-marker catalogs a click can land on.
+/// The map-marker catalogs a click can land on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MarkerFamily {
     /// `self.sites` — the NEXRAD site list (click selects the site).
@@ -18718,15 +23340,17 @@ enum MarkerFamily {
     /// `data_source::community_feeds::community_markers` (click live-polls
     /// a direct feed, or opens the shared-pad cluster picker).
     Community,
+    /// `AppSettings::custom_poll_links` (click live-polls the saved URL).
+    CustomPoll,
     /// `ViewerApp::raob_marker_sites` — RAOB launch sites (click fetches
     /// the observed sounding at the displayed time). An overlay, not a
     /// radar: it ranks LAST, so it can never steal a radar click.
     Raob,
 }
 
-/// Which marker a click resolves to across the four families: the
+/// Which marker a click resolves to across the marker families: the
 /// nearest in-halo hit wins; exact distance ties keep the declaration
-/// order CONUS > international > community > RAOB (preserving the
+/// order CONUS > international > community > custom poll > RAOB (preserving the
 /// historical CONUS-wins-ties behavior; RAOB is an overlay and always
 /// loses ties to radar markers). Inputs are [`nearest_marker_within`]
 /// results.
@@ -18734,12 +23358,14 @@ fn resolve_marker_click(
     conus: Option<(usize, f32)>,
     intl: Option<(usize, f32)>,
     community: Option<(usize, f32)>,
+    custom_poll: Option<(usize, f32)>,
     raob: Option<(usize, f32)>,
 ) -> Option<(MarkerFamily, usize)> {
     [
         conus.map(|(index, distance)| (MarkerFamily::Conus, index, distance)),
         intl.map(|(index, distance)| (MarkerFamily::Intl, index, distance)),
         community.map(|(index, distance)| (MarkerFamily::Community, index, distance)),
+        custom_poll.map(|(index, distance)| (MarkerFamily::CustomPoll, index, distance)),
         raob.map(|(index, distance)| (MarkerFamily::Raob, index, distance)),
     ]
     .into_iter()
@@ -18752,6 +23378,18 @@ fn resolve_marker_click(
 fn format_site_label(site: &RadarSite) -> String {
     match &site.name {
         Some(name) if !name.is_empty() => format!("{} {}", site.level2_id, name),
+        _ => site.level2_id.clone(),
+    }
+}
+
+fn site_is_terminal_radar(site: &RadarSite) -> bool {
+    site.level2_id.starts_with('T')
+}
+
+fn site_marker_label(site: &RadarSite) -> String {
+    match &site.name {
+        Some(name) if !name.trim().is_empty() => format!("{} {}", site.level2_id, name.trim()),
+        _ if site_is_terminal_radar(site) => format!("{} TDWR", site.level2_id),
         _ => site.level2_id.clone(),
     }
 }
@@ -18929,6 +23567,53 @@ fn default_hidden_hazard_families() -> BTreeSet<String> {
         .iter()
         .map(|family| (*family).to_owned())
         .collect()
+}
+
+fn normalize_alert_family(family: &str) -> String {
+    family.trim().to_ascii_lowercase()
+}
+
+fn alert_family_enabled(configured: &[String], family: &str) -> bool {
+    if configured.is_empty() {
+        return true;
+    }
+    let family = normalize_alert_family(family);
+    configured
+        .iter()
+        .any(|configured| normalize_alert_family(configured) == family)
+}
+
+fn set_alert_family_enabled(configured: &mut Vec<String>, family: &str, enabled: bool) {
+    let family = normalize_alert_family(family);
+    let mut selected = if configured.is_empty() {
+        ALERT_SOUND_FAMILY_OPTIONS
+            .iter()
+            .map(|(slug, _)| (*slug).to_owned())
+            .collect::<BTreeSet<_>>()
+    } else {
+        configured
+            .iter()
+            .map(|family| normalize_alert_family(family))
+            .collect::<BTreeSet<_>>()
+    };
+    if enabled {
+        selected.insert(family);
+    } else {
+        selected.remove(&family);
+    }
+    let all_selected = ALERT_SOUND_FAMILY_OPTIONS
+        .iter()
+        .all(|(slug, _)| selected.contains(*slug));
+    configured.clear();
+    if all_selected {
+        return;
+    }
+    configured.extend(
+        ALERT_SOUND_FAMILY_OPTIONS
+            .iter()
+            .filter(|(slug, _)| selected.contains(*slug))
+            .map(|(slug, _)| (*slug).to_owned()),
+    );
 }
 
 fn parse_color_table_for_family(
@@ -19487,6 +24172,50 @@ fn hazard_record_detail_lines(record: &HazardRecord) -> Vec<String> {
     lines
 }
 
+fn hazard_record_list_label(record: &HazardRecord) -> String {
+    let status = record
+        .lifecycle_status
+        .as_deref()
+        .filter(|status| !status.trim().is_empty())
+        .unwrap_or(&record.action);
+    let office = if record.office.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" {}", record.office)
+    };
+    let until = record
+        .valid_end
+        .as_deref()
+        .filter(|until| !until.trim().is_empty())
+        .map(|until| format!(" until {until}"))
+        .unwrap_or_default();
+    format!("{} · {status}{office}{until}", record.label)
+}
+
+fn hazard_record_list_hover(record: &HazardRecord) -> String {
+    hazard_record_detail_lines(record)
+        .into_iter()
+        .take(10)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn hazard_focus_view(bbox: [f32; 4]) -> (f32, f32, f32) {
+    let west = bbox[0].min(bbox[2]);
+    let east = bbox[0].max(bbox[2]);
+    let south = bbox[1].min(bbox[3]);
+    let north = bbox[1].max(bbox[3]);
+    let lat = ((south + north) * 0.5).clamp(-85.0, 85.0);
+    let lon = normalize_lon((west + east) * 0.5);
+    let lon_span = (east - west).abs().max(0.08);
+    let lat_span = (north - south).abs().max(0.08);
+    let span = lon_span.max(lat_span);
+    let scale = (HAZARD_FOCUS_TARGET_PX / span)
+        .clamp(HAZARD_FOCUS_MIN_SCALE, HAZARD_FOCUS_MAX_SCALE)
+        .clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
+    (lat, lon, scale)
+}
+
 fn angle_delta_deg(left: f32, right: f32) -> f32 {
     let delta = (left - right).abs().rem_euclid(360.0);
     delta.min(360.0 - delta)
@@ -19543,7 +24272,9 @@ fn table_display_unit(table: &ColorTable, product: &DisplayProduct) -> (&'static
 
 /// Subdivide the map canvas into per-pane cell rects for a layout. `One`
 /// returns exactly `[outer]` (no inset/gap) so single-pane stays byte-identical
-/// to today. `TwoVertical` splits left|right; `FourGrid` is 2×2.
+/// to today. `TwoVertical` splits left|right; `ThreeStacked` keeps a large
+/// primary pane on the left and stacks two comparison panes on the right;
+/// `FourGrid` is 2×2.
 #[allow(dead_code)] // wired into map_canvas in the multi-pane grid step
 fn pane_cell_rects(layout: PanelLayout, outer: egui::Rect, gap: f32) -> Vec<egui::Rect> {
     match layout {
@@ -19555,6 +24286,24 @@ fn pane_cell_rects(layout: PanelLayout, outer: egui::Rect, gap: f32) -> Vec<egui
                 egui::Rect::from_min_size(
                     egui::pos2(outer.min.x + w + gap, outer.min.y),
                     egui::vec2(w, outer.height()),
+                ),
+            ]
+        }
+        PanelLayout::ThreeStacked => {
+            let left_w = ((outer.width() - gap) * 0.58).max(0.0);
+            let right_w = (outer.width() - left_w - gap).max(0.0);
+            let right_h = ((outer.height() - gap) * 0.5).max(0.0);
+            let right_x = outer.min.x + left_w + gap;
+            let lower_y = outer.min.y + right_h + gap;
+            vec![
+                egui::Rect::from_min_size(outer.min, egui::vec2(left_w, outer.height())),
+                egui::Rect::from_min_size(
+                    egui::pos2(right_x, outer.min.y),
+                    egui::vec2(right_w, right_h),
+                ),
+                egui::Rect::from_min_size(
+                    egui::pos2(right_x, lower_y),
+                    egui::vec2(right_w, right_h),
                 ),
             ]
         }
@@ -19572,6 +24321,48 @@ fn pane_cell_rects(layout: PanelLayout, outer: egui::Rect, gap: f32) -> Vec<egui
             ]
         }
     }
+}
+
+fn annotation_target_cell(
+    cells: &[egui::Rect],
+    pointer: Option<egui::Pos2>,
+    active_pane: usize,
+) -> Option<usize> {
+    if cells.is_empty() {
+        return None;
+    }
+    pointer
+        .and_then(|position| cells.iter().position(|cell| cell.contains(position)))
+        .or_else(|| Some(active_pane.min(cells.len() - 1)))
+}
+
+fn cross_section_handle_rect(position: egui::Pos2) -> egui::Rect {
+    egui::Rect::from_center_size(
+        position,
+        egui::vec2(CROSS_SECTION_HANDLE_HIT_PX, CROSS_SECTION_HANDLE_HIT_PX),
+    )
+}
+
+fn ctrl_best_radar_click(modifiers: egui::Modifiers) -> bool {
+    modifiers.ctrl && !modifiers.alt && !modifiers.shift
+}
+
+fn alt_model_sounding_active(modifiers: egui::Modifiers, model_soundings_available: bool) -> bool {
+    modifiers.alt && model_soundings_available
+}
+
+fn plain_map_click_allowed(modifiers: egui::Modifiers, model_soundings_available: bool) -> bool {
+    !modifiers.shift
+        && !ctrl_best_radar_click(modifiers)
+        && !alt_model_sounding_active(modifiers, model_soundings_available)
+}
+
+fn plain_context_menu_allowed(modifiers: egui::Modifiers, right_click_loads_nearest: bool) -> bool {
+    !modifiers.ctrl && !right_click_loads_nearest
+}
+
+fn chip_width_for_text(text: &str) -> f32 {
+    18.0 + text.chars().count() as f32 * 7.2
 }
 
 /// Compute a volume-derived product and wrap it in a render cache on the
@@ -19843,6 +24634,7 @@ fn format_cursor_readout(
     readout: &CursorReadout,
     unit_system: units::Units,
     display_unit: (&str, f32),
+    time_zone: DisplayTimeZone,
 ) -> String {
     let raw = readout
         .raw
@@ -19910,7 +24702,7 @@ fn format_cursor_readout(
     format!(
         "{} {} {} cut {} {} raw {} row {} gate {} @ {} m{}{} az {:05.1} src {:05.1} range {:.1} km elev {:.2}{}{}{}",
         readout.site_id,
-        readout.volume_time_utc.format("%H:%M:%S"),
+        time_zone.format_hms(readout.volume_time_utc),
         readout.product.label(),
         readout.cut,
         value,
@@ -20664,6 +25456,16 @@ fn newer_release_tag(tag_name: &str, current_version: &str) -> Option<String> {
     (remote > current).then(|| tag_name.trim().to_owned())
 }
 
+fn security_update_status_label(update_available: Option<&str>, checking: bool) -> String {
+    if let Some(tag) = update_available {
+        format!("Update available: {tag}")
+    } else if checking {
+        "Checking official releases".to_owned()
+    } else {
+        "No newer release detected this launch".to_owned()
+    }
+}
+
 /// Parse "v1.2.3" / "1.2.3" into (major, minor, patch). Tolerates the
 /// release-tag leading 'v'/'V', missing components ("v0.9" → (0, 9, 0)),
 /// and a pre-release/build suffix ("v0.9.0-rc1" parses as (0, 9, 0) —
@@ -21001,6 +25803,40 @@ fn selected_hazard_index_for_event_id(
 
 fn hazard_overlay_records_match(left: &HazardOverlay, right: &HazardOverlay) -> bool {
     left.records == right.records
+}
+
+fn hazard_record_should_latch_attention(record: &HazardRecord) -> bool {
+    hazard_record_is_active_or_pending(record)
+        && hazard_points_renderable(&record.points)
+        && record.event_family != "local storm report"
+}
+
+fn new_hazard_attention_event_ids(
+    existing: &HazardOverlay,
+    incoming: &HazardOverlay,
+) -> Vec<String> {
+    let existing_ids = existing
+        .records
+        .iter()
+        .map(|record| record.event_id.as_str())
+        .collect::<BTreeSet<_>>();
+    incoming
+        .records
+        .iter()
+        .filter(|record| !existing_ids.contains(record.event_id.as_str()))
+        .filter(|record| hazard_record_should_latch_attention(record))
+        .map(|record| record.event_id.clone())
+        .collect()
+}
+
+fn prune_unacknowledged_hazard_ids(overlay: &HazardOverlay, event_ids: &mut BTreeSet<String>) {
+    let current_ids = overlay
+        .records
+        .iter()
+        .filter(|record| hazard_record_should_latch_attention(record))
+        .map(|record| record.event_id.as_str())
+        .collect::<BTreeSet<_>>();
+    event_ids.retain(|event_id| current_ids.contains(event_id.as_str()));
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -22041,7 +26877,16 @@ fn parse_compact_lat_lon_token(value: &str) -> Option<HazardPoint> {
         return None;
     }
     let lat = parse_coordinate_hundredths(&value[..4], false)?;
-    let lon = parse_coordinate_hundredths(&value[4..], true)?;
+    let mut longitude_abs = value[4..].parse::<i32>().ok()? as f32 / 100.0;
+    // SPC/NWS compact LAT...LON tokens use four longitude digits even west
+    // of 100W, omitting the leading "1" (e.g. 35880436 = 35.88N 104.36W).
+    // U.S. products should never legitimately land near 0-60W, so restore
+    // the missing hundreds digit while keeping eastern CONUS tokens like
+    // 36377580 (= 75.80W) unchanged.
+    if longitude_abs < 60.0 {
+        longitude_abs += 100.0;
+    }
+    let lon = -longitude_abs;
     Some(HazardPoint { lon, lat })
 }
 
@@ -22289,6 +27134,60 @@ fn hazard_label(
 /// [r,g,b,a] style color (toolkit-agnostic `styles` crate) → egui.
 fn style_color32(rgba: styles::Rgba) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3])
+}
+
+const HAZARD_STYLE_DEFAULT_KEY: &str = "tornado";
+
+fn hazard_style_keys() -> impl Iterator<Item = &'static str> {
+    styles::HAZARD_FAMILIES
+        .iter()
+        .copied()
+        .chain(styles::HAZARD_ESCALATIONS.iter().copied())
+}
+
+fn hazard_style_key_known(key: &str) -> bool {
+    hazard_style_keys().any(|known| known == key)
+}
+
+fn hazard_style_label(key: &str) -> String {
+    match key {
+        "tornado" => "Tornado warning".to_owned(),
+        "tornado/catastrophic" => "Tornado emergency".to_owned(),
+        "tornado/considerable" => "PDS tornado".to_owned(),
+        "severe-thunderstorm" => "Severe thunderstorm warning".to_owned(),
+        "severe-thunderstorm/destructive" => "Destructive severe thunderstorm".to_owned(),
+        "flash-flood" => "Flash flood warning".to_owned(),
+        "flash-flood/catastrophic" => "Flash flood emergency".to_owned(),
+        "flood" => "Flood warning".to_owned(),
+        "special-marine" => "Special marine warning".to_owned(),
+        "snow-squall" => "Snow squall warning".to_owned(),
+        "watch" => "Watch polygons".to_owned(),
+        "mesoscale-discussion" => "Mesoscale discussions".to_owned(),
+        "local-storm-report" => "Local storm reports".to_owned(),
+        "special-weather" => "Special weather statements".to_owned(),
+        "text-polygon" => "Text-product polygons".to_owned(),
+        "other" => "Other polygons".to_owned(),
+        _ => key.replace(['-', '/'], " "),
+    }
+}
+
+fn hazard_style_resolved_polygon(
+    registry: &styles::StyleRegistry,
+    key: &str,
+) -> styles::PolygonStyle {
+    if let Some((family, threat)) = key.split_once('/') {
+        registry.hazard_polygon(family, Some(threat)).clone()
+    } else {
+        registry.hazard_polygon(key, None).clone()
+    }
+}
+
+fn hazard_dash_label(dash: styles::DashPattern) -> &'static str {
+    match dash {
+        styles::DashPattern::Solid => "Solid",
+        styles::DashPattern::Dashed { .. } => "Dashed",
+        styles::DashPattern::Dotted => "Dotted",
+    }
 }
 
 /// Hazard stroke color from the style registry (built-in defaults are the
@@ -23148,6 +28047,243 @@ fn grlevel2_cfg_sites(cfg: &str) -> Vec<String> {
 }
 
 /// "1×", "2×", "½×" — the loop-speed combo's display text.
+fn normalized_poll_url(input: &str) -> String {
+    let trimmed = input.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        trimmed.to_owned()
+    } else {
+        format!("http://{trimmed}")
+    }
+}
+
+fn poll_urls_match(left: &str, right: &str) -> bool {
+    normalized_poll_url(left).eq_ignore_ascii_case(&normalized_poll_url(right))
+}
+
+fn custom_poll_entry_lat_lon(entry: &settings::CustomPollLinkEntry) -> Option<(f32, f32)> {
+    let lat = entry.lat_e6 as f32 / 1_000_000.0;
+    let lon = entry.lon_e6 as f32 / 1_000_000.0;
+    (lat.is_finite()
+        && lon.is_finite()
+        && (-90.0..=90.0).contains(&lat)
+        && (-180.0..=180.0).contains(&lon))
+    .then_some((lat, lon))
+}
+
+const CUSTOM_POLL_NO_MARKER_LAT_E6: i64 = 91_000_000;
+const CUSTOM_POLL_NO_MARKER_LON_E6: i64 = 181_000_000;
+
+fn parse_custom_poll_marker_inputs(
+    lat_input: &str,
+    lon_input: &str,
+) -> std::result::Result<(i64, i64), &'static str> {
+    let lat_input = lat_input.trim();
+    let lon_input = lon_input.trim();
+    if lat_input.is_empty() && lon_input.is_empty() {
+        return Ok((CUSTOM_POLL_NO_MARKER_LAT_E6, CUSTOM_POLL_NO_MARKER_LON_E6));
+    }
+    if lat_input.is_empty() || lon_input.is_empty() {
+        return Err("Custom poll link: enter both latitude and longitude, or leave both blank");
+    }
+    let lat = lat_input
+        .parse::<f32>()
+        .map_err(|_| "Custom poll link: latitude must be -90 to 90")?;
+    if !lat.is_finite() || !(-90.0..=90.0).contains(&lat) {
+        return Err("Custom poll link: latitude must be -90 to 90");
+    }
+    let lon = lon_input
+        .parse::<f32>()
+        .map_err(|_| "Custom poll link: longitude must be -180 to 180")?;
+    if !lon.is_finite() || !(-180.0..=180.0).contains(&lon) {
+        return Err("Custom poll link: longitude must be -180 to 180");
+    }
+    Ok((
+        (lat * 1_000_000.0).round() as i64,
+        (lon * 1_000_000.0).round() as i64,
+    ))
+}
+
+fn custom_poll_entry_label(entry: &settings::CustomPollLinkEntry) -> String {
+    let label = entry.label.trim();
+    if !label.is_empty() {
+        return label.to_owned();
+    }
+    let site_id = entry.site_id.trim();
+    if !site_id.is_empty() {
+        return site_id.to_owned();
+    }
+    poll_url_name(&entry.poll_url)
+}
+
+fn poll_url_name(url: &str) -> String {
+    let normalized = normalized_poll_url(url);
+    let without_scheme = normalized
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(normalized.as_str());
+    let without_query = without_scheme
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(without_scheme);
+    without_query
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("custom feed")
+        .to_owned()
+}
+
+fn parse_custom_radar_gis(text: &str) -> Vec<CustomGisSite> {
+    text.lines()
+        .filter_map(parse_custom_radar_gis_line)
+        .collect()
+}
+
+fn parse_custom_radar_gis_line(raw_line: &str) -> Option<CustomGisSite> {
+    let line = raw_line.trim().trim_start_matches('\u{feff}');
+    if line.is_empty() || line.starts_with(';') || line.starts_with('#') || line.starts_with("//") {
+        return None;
+    }
+    let line = custom_radar_gis_payload(line);
+    if line.contains(',') {
+        parse_custom_radar_gis_csv_line(line)
+    } else {
+        parse_custom_radar_gis_whitespace_line(line)
+    }
+}
+
+fn custom_radar_gis_payload(line: &str) -> &str {
+    if let Some((prefix, rest)) = line.split_once(':') {
+        let prefix = prefix.trim();
+        let rest = rest.trim();
+        if !prefix.contains(',')
+            && !prefix.contains(char::is_whitespace)
+            && rest.contains(',')
+            && !rest.is_empty()
+        {
+            return rest;
+        }
+    }
+    line
+}
+
+fn parse_custom_radar_gis_csv_line(line: &str) -> Option<CustomGisSite> {
+    let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+    if fields.len() < 4 {
+        return None;
+    }
+    let site_id = fields.first()?.trim();
+    let lat = fields.get(2)?.parse::<f32>().ok()?;
+    let lon = fields.get(3)?.parse::<f32>().ok()?;
+    let state = fields.get(6).copied().unwrap_or("").trim();
+    let name = fields
+        .get(7..)
+        .unwrap_or(&[])
+        .iter()
+        .copied()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+    custom_gis_site_from_parts(site_id, state, &name, lat, lon)
+}
+
+fn parse_custom_radar_gis_whitespace_line(line: &str) -> Option<CustomGisSite> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let site_id = parts[0];
+    let lat = parts.get(2)?.parse::<f32>().ok()?;
+    let lon = parts.get(3)?.parse::<f32>().ok()?;
+    let state = parts.get(6).copied().unwrap_or("");
+    let name = parts.get(7..).unwrap_or(&[]).to_vec().join(" ");
+    custom_gis_site_from_parts(site_id, state, &name, lat, lon)
+}
+
+fn custom_gis_site_from_parts(
+    site_id: &str,
+    state: &str,
+    name: &str,
+    latitude_deg: f32,
+    longitude_deg: f32,
+) -> Option<CustomGisSite> {
+    let site_id = site_id.trim();
+    if site_id.is_empty()
+        || !latitude_deg.is_finite()
+        || !longitude_deg.is_finite()
+        || !(-90.0..=90.0).contains(&latitude_deg)
+        || !(-180.0..=180.0).contains(&longitude_deg)
+    {
+        return None;
+    }
+    let label = if !name.trim().is_empty() {
+        name.trim().to_owned()
+    } else if !state.trim().is_empty() {
+        state.trim().to_owned()
+    } else {
+        site_id.to_owned()
+    };
+    Some(CustomGisSite {
+        site_id: site_id.to_owned(),
+        label,
+        latitude_deg,
+        longitude_deg,
+    })
+}
+
+fn custom_poll_links_from_gis(
+    text: &str,
+    base_poll_url: &str,
+) -> std::result::Result<Vec<settings::CustomPollLinkEntry>, String> {
+    let sites = parse_custom_radar_gis(text);
+    if sites.is_empty() {
+        return Err("no valid GR radar GIS site rows found".to_owned());
+    }
+    let base_url = normalized_poll_url(base_poll_url);
+    if base_url.is_empty() {
+        return Err("enter a Poll URL base before importing GIS".to_owned());
+    }
+    let total_sites = sites.len();
+    Ok(sites
+        .into_iter()
+        .map(|site| settings::CustomPollLinkEntry {
+            label: site.label,
+            site_id: site.site_id.clone(),
+            lat_e6: (site.latitude_deg * 1_000_000.0).round() as i64,
+            lon_e6: (site.longitude_deg * 1_000_000.0).round() as i64,
+            poll_url: custom_poll_url_for_gis_site(&base_url, &site.site_id, total_sites),
+        })
+        .collect())
+}
+
+fn custom_poll_url_for_gis_site(base_url: &str, site_id: &str, total_sites: usize) -> String {
+    let base_url = normalized_poll_url(base_url);
+    let site_id = site_id.trim();
+    if base_url.is_empty() || site_id.is_empty() {
+        return base_url;
+    }
+    for placeholder in ["{site}", "{SITE}", "{id}", "{ID}"] {
+        if base_url.contains(placeholder) {
+            return base_url.replace(placeholder, site_id);
+        }
+    }
+    let last_segment = base_url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    if last_segment.eq_ignore_ascii_case(site_id) || total_sites == 1 {
+        base_url
+    } else {
+        format!("{}/{}", base_url.trim_end_matches('/'), site_id)
+    }
+}
+
 fn loop_speed_label(percent: u16) -> String {
     match percent {
         25 => "¼×".to_owned(),
@@ -23166,6 +28302,18 @@ fn normalized_history_limit(limit: usize) -> usize {
     } else {
         limit.clamp(HISTORY_SIZE_OPTIONS[0], MAX_HISTORY_FRAME_LIMIT)
     }
+}
+
+fn normalized_archive_frame_count(count: usize) -> usize {
+    if count == 0 {
+        DEFAULT_ARCHIVE_FRAME_COUNT
+    } else {
+        count.clamp(1, MAX_ARCHIVE_FRAME_COUNT)
+    }
+}
+
+pub(crate) fn normalized_event_pad_frames(count: u16) -> u16 {
+    count.min(MAX_EVENT_PAD_FRAMES)
 }
 
 fn frame_identity_for_volume(volume: &RadarVolume) -> FrameIdentity {
@@ -23211,14 +28359,18 @@ fn volume_total_radials(volume: &RadarVolume) -> usize {
     volume.cuts.iter().map(|cut| cut.radials.len()).sum()
 }
 
-fn frame_status_text(frame: &FrameHistoryEntry, now_utc: DateTime<Utc>) -> String {
-    let live_chunk = live_chunk_readout(frame, now_utc)
+fn frame_status_text(
+    frame: &FrameHistoryEntry,
+    now_utc: DateTime<Utc>,
+    time_zone: DisplayTimeZone,
+) -> String {
+    let live_chunk = live_chunk_readout(frame, now_utc, time_zone)
         .map(|readout| format!(" {readout}"))
         .unwrap_or_default();
     format!(
         "{} {} {} age {}{} ({})",
         frame.identity.site_id,
-        frame.identity.scan_time_utc.format("%Y-%m-%d %H:%M:%S UTC"),
+        time_zone.format_date_hms(frame.identity.scan_time_utc),
         frame.status.label(),
         frame_age_label(frame.identity.scan_time_utc, now_utc),
         live_chunk,
@@ -23226,7 +28378,11 @@ fn frame_status_text(frame: &FrameHistoryEntry, now_utc: DateTime<Utc>) -> Strin
     )
 }
 
-fn live_chunk_readout(frame: &FrameHistoryEntry, now_utc: DateTime<Utc>) -> Option<String> {
+fn live_chunk_readout(
+    frame: &FrameHistoryEntry,
+    now_utc: DateTime<Utc>,
+    time_zone: DisplayTimeZone,
+) -> Option<String> {
     if !matches!(
         frame.status,
         FrameStatus::LivePartial | FrameStatus::LiveComplete
@@ -23243,7 +28399,7 @@ fn live_chunk_readout(frame: &FrameHistoryEntry, now_utc: DateTime<Utc>) -> Opti
         .unwrap_or("chunk");
     Some(format!(
         "last chunk {} age {} chunks {} id {} {}",
-        last_modified.format("%H:%M:%S UTC"),
+        time_zone.format_hms(last_modified),
         frame_age_label(last_modified, now_utc),
         chunk_count,
         chunk_id,
@@ -23251,10 +28407,14 @@ fn live_chunk_readout(frame: &FrameHistoryEntry, now_utc: DateTime<Utc>) -> Opti
     ))
 }
 
-fn compact_frame_label(frame: &FrameHistoryEntry, now_utc: DateTime<Utc>) -> String {
+fn compact_frame_label(
+    frame: &FrameHistoryEntry,
+    now_utc: DateTime<Utc>,
+    time_zone: DisplayTimeZone,
+) -> String {
     format!(
         "{} {}",
-        frame.identity.scan_time_utc.format("%H:%M"),
+        time_zone.format_hm(frame.identity.scan_time_utc),
         short_frame_status_label(frame.status, frame.identity.scan_time_utc, now_utc)
     )
 }
@@ -23436,6 +28596,14 @@ fn radar_rgba_is_premultiplied_compatible(rgba: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("bowecho-{label}-{}-{nanos}", std::process::id()))
+    }
+
     /// Bolton (1980) round-trip sanity: saturated air dews at the air
     /// temperature; the textbook 20 °C / 50% case lands at ≈9.3 °C.
     #[test]
@@ -23589,6 +28757,48 @@ mod tests {
     }
 
     #[test]
+    fn best_radar_candidates_include_custom_poll_links() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites.clear();
+        app.app_settings
+            .custom_poll_links
+            .push(settings::CustomPollLinkEntry {
+                label: "Private Furuno".to_owned(),
+                site_id: "FWLX".to_owned(),
+                lat_e6: 35_400_000,
+                lon_e6: -97_200_000,
+                poll_url: "198.51.100.9/fwlx".to_owned(),
+            });
+        app.app_settings
+            .custom_poll_links
+            .push(settings::CustomPollLinkEntry {
+                label: "Link only".to_owned(),
+                site_id: "NOLOC".to_owned(),
+                lat_e6: CUSTOM_POLL_NO_MARKER_LAT_E6,
+                lon_e6: CUSTOM_POLL_NO_MARKER_LON_E6,
+                poll_url: "198.51.100.10/noloc".to_owned(),
+            });
+
+        let candidates = app.best_radar_candidates(35.4, -97.2);
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.label == "Private Furuno")
+            .expect("custom poll link participates in the best-radar menu");
+
+        assert_eq!(candidate.origin.as_deref(), Some("custom feed"));
+        assert!(matches!(
+            &candidate.target,
+            BeamTarget::Research { url } if url.as_str() == "http://198.51.100.9/fwlx"
+        ));
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.label != "Link only"),
+            "link-only custom feeds should stay saved without claiming a map/range candidate"
+        );
+    }
+
+    #[test]
     fn parse_semver_triple_handles_release_tags() {
         assert_eq!(parse_semver_triple("v0.8.2"), Some((0, 8, 2)));
         assert_eq!(parse_semver_triple("V1.2.3"), Some((1, 2, 3)));
@@ -23617,6 +28827,83 @@ mod tests {
         assert_eq!(newer_release_tag("v0.8.1", "0.8.2"), None);
         assert_eq!(newer_release_tag("v0.8.2-rc1", "0.8.2"), None);
         assert_eq!(newer_release_tag("latest", "0.8.2"), None);
+    }
+
+    #[test]
+    fn wgpu_device_lost_startup_error_retries_with_glow() {
+        let message = "Wgpu(RequestDeviceError(RequestDeviceError { inner: Core(DeviceLost) }))";
+
+        assert!(should_retry_startup_with_glow_message(message));
+        assert!(WGPU_TO_GLOW_FALLBACK_NOTICE.contains("OpenGL fallback"));
+        assert!(!should_retry_startup_with_glow_message(
+            "settings file could not be read"
+        ));
+    }
+
+    #[test]
+    fn security_updates_copy_explains_unsigned_builds() {
+        assert!(SECURITY_UNSIGNED_BUILD_TEXT.contains("Windows Defender"));
+        assert!(SECURITY_UNSIGNED_BUILD_TEXT.contains("unsigned"));
+        assert!(SECURITY_SIGNATURE_STATUS_TEXT.contains("not verified in-app"));
+        assert_eq!(
+            security_update_status_label(Some("v0.99.0"), false),
+            "Update available: v0.99.0"
+        );
+        assert_eq!(
+            security_update_status_label(None, true),
+            "Checking official releases"
+        );
+        assert_eq!(
+            security_update_status_label(None, false),
+            "No newer release detected this launch"
+        );
+    }
+
+    #[test]
+    fn diagnostic_url_label_keeps_host_and_redacts_path() {
+        assert_eq!(
+            diagnostic_url_label("http://198.51.100.9/fwlx/dir.list?x=1"),
+            "http://198.51.100.9/..."
+        );
+        assert_eq!(diagnostic_url_label("198.51.100.9/fwlx"), "198.51.100.9");
+        assert_eq!(diagnostic_url_label(""), "-");
+    }
+
+    #[test]
+    fn diagnostic_summary_includes_support_context() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.renderer_backend = "glow";
+        app.startup_notice = Some(WGPU_TO_GLOW_FALLBACK_NOTICE.to_owned());
+        app.status = "Polled FWLX".to_owned();
+        app.source_path = Some(PathBuf::from("C:/cases/FWLX20260613_120000"));
+        app.volume = Some(Arc::new(test_ref_then_velocity_volume()));
+        app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
+        app.selected_cut = 1;
+        app.poll_active = true;
+        app.poll_source =
+            PollSource::CustomUrl("http://198.51.100.9/fwlx/dir.list?token=test".to_owned());
+        app.poll_last_file = Some("FWLX20260613_120000".to_owned());
+        app.archive_load_progress = Some(ArchiveLoadProgress {
+            label: "Archive loop".to_owned(),
+            detail: "Decoded FWLX scan".to_owned(),
+            done: 3,
+            total: 5,
+        });
+
+        let summary = app.diagnostic_summary();
+
+        assert!(summary.contains("version:"));
+        assert!(summary.contains("renderer: glow"));
+        assert!(summary.contains("startup_notice: WGPU startup failed"));
+        assert!(summary.contains("status: Polled FWLX"));
+        assert!(summary.contains("background: Archive loop 3/5 - Decoded FWLX scan (60%)"));
+        assert!(summary.contains("selection: VEL cut 1"));
+        assert!(summary.contains("volume: site=TEST"));
+        assert!(summary.contains("products=[REF,VEL,DVEL,SRV,DSRV"));
+        assert!(summary.contains("poll: active=true source=custom http://198.51.100.9/..."));
+        assert!(summary.contains("source_path: C:/cases/FWLX20260613_120000"));
+        assert!(summary.contains("config:"));
+        assert!(summary.contains("styles:"));
     }
 
     #[test]
@@ -23937,6 +29224,25 @@ mod tests {
     }
 
     #[test]
+    fn manual_vrot_product_filter_accepts_velocity_only() {
+        for product in [
+            DisplayProduct::Moment(MomentType::Velocity),
+            DisplayProduct::DealiasedVelocity,
+            DisplayProduct::StormRelativeVelocity,
+            DisplayProduct::StormRelativeDealiasedVelocity,
+        ] {
+            assert!(manual_vrot_product_supported(&product));
+        }
+
+        assert!(!manual_vrot_product_supported(&DisplayProduct::Moment(
+            MomentType::Reflectivity
+        )));
+        assert!(!manual_vrot_product_supported(&DisplayProduct::Derived(
+            DerivedProduct::CompositeReflectivity
+        )));
+    }
+
+    #[test]
     fn cursor_readout_uses_dealiased_velocity_grid_for_dvel() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.volume = Some(Arc::new(test_aliased_velocity_volume()));
@@ -23983,25 +29289,48 @@ mod tests {
             realtime_last_chunk_type: None,
         };
 
-        let formatted = format_cursor_readout(&readout, units::Units::Imperial, ("m/s", 1.0));
+        let formatted = format_cursor_readout(
+            &readout,
+            units::Units::Imperial,
+            ("m/s", 1.0),
+            DisplayTimeZone::Utc,
+        );
 
-        assert!(formatted.contains("KTLX 01:30:00"));
+        assert!(formatted.contains("KTLX 01:30:00Z"));
         assert!(formatted.contains("row 42 gate 123"));
         assert!(formatted.contains("az 181.2 src 180.9"));
         assert!(formatted.contains("raw 86"));
         assert!(formatted.contains("rt v012 c034"));
         // Imperial keeps the kft parenthetical; metric drops it.
         assert!(formatted.contains("hgt 900 m (3.0 kft)"));
-        let metric = format_cursor_readout(&readout, units::Units::Metric, ("m/s", 1.0));
+        let metric = format_cursor_readout(
+            &readout,
+            units::Units::Metric,
+            ("m/s", 1.0),
+            DisplayTimeZone::Utc,
+        );
         assert!(metric.contains("hgt 900 m"));
         assert!(!metric.contains("kft"));
 
         // A table declared in mph relabels and rescales the MAIN value
         // (field report: mph table, m/s readout) — diagnostics stay SI.
         let scale = color_tables::unit_scale_to_internal("mph");
-        let mph = format_cursor_readout(&readout, units::Units::Imperial, ("mph", scale));
+        let mph = format_cursor_readout(
+            &readout,
+            units::Units::Imperial,
+            ("mph", scale),
+            DisplayTimeZone::Utc,
+        );
         assert!(mph.contains("50.3 mph"), "got: {mph}"); // 22.5 m/s
         assert!(!mph.contains("22.5"));
+
+        let eastern = format_cursor_readout(
+            &readout,
+            units::Units::Imperial,
+            ("m/s", 1.0),
+            DisplayTimeZone::Eastern,
+        );
+        assert!(eastern.contains("KTLX 21:30:00 EDT"), "got: {eastern}");
     }
 
     #[test]
@@ -24045,7 +29374,12 @@ mod tests {
             realtime_last_chunk_type: None,
         };
 
-        let formatted = format_cursor_readout(&readout, units::Units::Imperial, ("m/s", 1.0));
+        let formatted = format_cursor_readout(
+            &readout,
+            units::Units::Imperial,
+            ("m/s", 1.0),
+            DisplayTimeZone::Utc,
+        );
 
         assert!(formatted.contains("Vrot 21.0 m/s dV 42.0 sep 1.25 km"));
         assert!(formatted.contains("in r4/g100 210.5 -18.0"));
@@ -24067,6 +29401,40 @@ mod tests {
         assert_eq!(high.sample_cache_capacity(), 6);
         assert_eq!(high.moment_cache_capacity(), 6);
         assert_eq!(high.sample_cache_bytes(), HIGH_END_SAMPLE_CACHE_BYTES);
+    }
+
+    #[test]
+    fn clear_map_tile_cache_dir_removes_contents_but_keeps_root() {
+        let root = unique_test_dir("tile-cache-clear").join("tiles");
+        std::fs::create_dir_all(root.join("satellite").join("8")).expect("create tile dir");
+        std::fs::write(root.join("satellite").join("8").join("1_2.bin"), b"tile")
+            .expect("write tile");
+        std::fs::write(root.join("orphan.bin"), b"tile").expect("write orphan");
+
+        let summary = clear_map_tile_cache_dir(&root).expect("clear tile cache");
+
+        assert_eq!(summary, CacheClearSummary { files: 1, dirs: 1 });
+        assert!(root.is_dir());
+        assert!(
+            std::fs::read_dir(&root)
+                .expect("read root")
+                .next()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(root.parent().expect("test parent"));
+    }
+
+    #[test]
+    fn clear_map_tile_cache_dir_refuses_non_tiles_leaf() {
+        let root = unique_test_dir("tile-cache-refuse").join("not-tiles");
+        std::fs::create_dir_all(&root).expect("create cache dir");
+        std::fs::write(root.join("keep.bin"), b"tile").expect("write sentinel");
+
+        let err = clear_map_tile_cache_dir(&root).expect_err("wrong leaf rejected");
+
+        assert!(err.contains("non-tile cache path"));
+        assert!(root.join("keep.bin").exists());
+        let _ = std::fs::remove_dir_all(root.parent().expect("test parent"));
     }
 
     #[test]
@@ -24549,6 +29917,16 @@ mod tests {
     }
 
     #[test]
+    fn centered_archive_loop_range_centers_and_clamps() {
+        assert_eq!(centered_archive_loop_range(5, 10, 5), Some((3, 7)));
+        assert_eq!(centered_archive_loop_range(0, 10, 5), Some((0, 4)));
+        assert_eq!(centered_archive_loop_range(9, 10, 5), Some((5, 9)));
+        assert_eq!(centered_archive_loop_range(2, 4, 10), Some((0, 3)));
+        assert_eq!(centered_archive_loop_range(0, 0, 5), None);
+        assert_eq!(centered_archive_loop_range(10, 10, 5), None);
+    }
+
+    #[test]
     fn velocity_cut_exposes_dealiased_products() {
         let volume = test_ref_then_velocity_volume();
         let products = displayable_products(&volume, 1);
@@ -24597,6 +29975,22 @@ mod tests {
             ),
             (1, DisplayProduct::StormRelativeVelocity)
         );
+    }
+
+    #[test]
+    fn sanitize_selection_keeps_product_intent_on_nearest_cut() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(Arc::new(test_ref_then_velocity_volume()));
+        app.selected_cut = 0;
+        app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
+
+        app.sanitize_selection();
+
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Velocity)
+        );
+        assert_eq!(app.selected_cut, 1);
     }
 
     #[test]
@@ -24863,6 +30257,59 @@ mod tests {
                 .identity
                 .scan_time_utc,
             scan_time
+        );
+    }
+
+    #[test]
+    fn loop_playback_toggle_requires_multiple_frames() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+
+        assert!(!app.toggle_history_playback(&ctx));
+        assert!(!app.history_playing);
+
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+        app.upsert_history_frame(test_decoded_live_partial(
+            PathBuf::from("KTLX-0130"),
+            "KTLX",
+            scan_time,
+            10,
+        ));
+
+        assert!(!app.toggle_history_playback(&ctx));
+        assert!(!app.history_playing);
+    }
+
+    #[test]
+    fn loop_playback_toggle_updates_browse_state_like_play_button() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+        app.upsert_history_frame(test_decoded_live_partial(
+            PathBuf::from("KTLX-0130"),
+            "KTLX",
+            scan_time,
+            10,
+        ));
+        app.upsert_history_frame(test_decoded_live_partial(
+            PathBuf::from("KTLX-0133"),
+            "KTLX",
+            scan_time + chrono::Duration::minutes(3),
+            10,
+        ));
+        app.selected_frame_index = 0;
+        app.browsing_history = true;
+        let ctx = egui::Context::default();
+
+        assert!(app.toggle_history_playback(&ctx));
+        assert!(app.history_playing);
+        assert!(!app.browsing_history);
+        assert!(app.last_history_step.is_some());
+
+        assert!(app.toggle_history_playback(&ctx));
+        assert!(!app.history_playing);
+        assert!(
+            app.browsing_history,
+            "pausing on an older frame should preserve browse mode"
         );
     }
 
@@ -25144,6 +30591,85 @@ mod tests {
     }
 
     #[test]
+    fn custom_poll_urls_normalize_bare_hosts_and_compare_cleanly() {
+        assert_eq!(
+            normalized_poll_url("192.0.2.8:8080/armor/"),
+            "http://192.0.2.8:8080/armor"
+        );
+        assert!(poll_urls_match(
+            "HTTP://EXAMPLE.COM/fwlx/",
+            "http://example.com/fwlx"
+        ));
+        assert_eq!(poll_url_name("http://example.com/poll/ARMOR/"), "ARMOR");
+    }
+
+    #[test]
+    fn custom_poll_marker_inputs_allow_link_only_entries() {
+        let (lat_e6, lon_e6) =
+            parse_custom_poll_marker_inputs("  ", "").expect("blank coordinates are link-only");
+        let entry = settings::CustomPollLinkEntry {
+            label: "Mobile radar".to_owned(),
+            site_id: String::new(),
+            lat_e6,
+            lon_e6,
+            poll_url: "http://192.0.2.8:8080".to_owned(),
+        };
+        assert_eq!(custom_poll_entry_lat_lon(&entry), None);
+
+        let (lat_e6, lon_e6) =
+            parse_custom_poll_marker_inputs("34.6464", "-86.7722").expect("valid marker");
+        assert_eq!(lat_e6, 34_646_400);
+        assert_eq!(lon_e6, -86_772_200);
+
+        assert!(parse_custom_poll_marker_inputs("34.0", "").is_err());
+        assert!(parse_custom_poll_marker_inputs("95.0", "-86.0").is_err());
+    }
+
+    #[test]
+    fn custom_radar_gis_parser_accepts_gr_whitespace_and_csv_rows() {
+        let sites = parse_custom_radar_gis(
+            r#"
+            ; comments are ignored
+            kund rdr1 47.922 -97.087 254 1 ND University of North Dakota
+            FWLX: fwlx,fwlx, 35.254, -87.325, 220, 1, TN, WLX X-Band
+            dan1, kcri, 35.238274, -97.460030, 366, 1, OK, BUILD 12 SUPER,RESOLUTION
+            "#,
+        );
+
+        assert_eq!(sites.len(), 3);
+        assert_eq!(sites[0].site_id, "kund");
+        assert_eq!(sites[0].label, "University of North Dakota");
+        assert!((sites[0].latitude_deg - 47.922).abs() < 0.001);
+        assert_eq!(sites[1].site_id, "fwlx");
+        assert_eq!(sites[1].label, "WLX X-Band");
+        assert_eq!(sites[2].label, "BUILD 12 SUPER, RESOLUTION");
+    }
+
+    #[test]
+    fn custom_radar_gis_import_expands_poll_roots_and_placeholders() {
+        let gis = "fwlx,fwlx, 35.254, -87.325, 220, 1, TN, WLX X-Band\n\
+                   wilu,wilu, 40.465, -90.685, 212, 1, IL, WIU";
+        let entries =
+            custom_poll_links_from_gis(gis, "https://example.com/level2/raw").expect("parse gis");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].site_id, "fwlx");
+        assert_eq!(entries[0].poll_url, "https://example.com/level2/raw/fwlx");
+        assert_eq!(entries[1].poll_url, "https://example.com/level2/raw/wilu");
+
+        let placeholder =
+            custom_poll_links_from_gis(gis, "https://example.com/{SITE}/poll").expect("parse gis");
+        assert_eq!(placeholder[0].poll_url, "https://example.com/fwlx/poll");
+
+        let single = custom_poll_links_from_gis(
+            "armor armor 34.646 -86.772 190 1 AL ARMOR",
+            "192.0.2.5:8080",
+        )
+        .expect("single direct feed keeps the exact root");
+        assert_eq!(single[0].poll_url, "http://192.0.2.5:8080");
+    }
+
+    #[test]
     fn nearest_marker_within_respects_the_click_halo() {
         let points = vec![
             (0, egui::pos2(100.0, 100.0)),
@@ -25215,29 +30741,34 @@ mod tests {
         use MarkerFamily::*;
         // Nearest across families wins regardless of declaration order.
         assert_eq!(
-            resolve_marker_click(Some((1, 9.0)), Some((2, 4.0)), Some((3, 6.0)), None),
+            resolve_marker_click(Some((1, 9.0)), Some((2, 4.0)), Some((3, 6.0)), None, None),
             Some((Intl, 2))
         );
         assert_eq!(
-            resolve_marker_click(Some((1, 9.0)), None, Some((3, 2.0)), None),
+            resolve_marker_click(Some((1, 9.0)), None, Some((3, 2.0)), None, None),
             Some((Community, 3))
         );
         // Exact ties keep the historical precedence: CONUS > intl >
-        // community > RAOB.
+        // community > custom poll > RAOB.
         assert_eq!(
             resolve_marker_click(
                 Some((1, 5.0)),
                 Some((2, 5.0)),
                 Some((3, 5.0)),
+                Some((4, 5.0)),
                 Some((4, 5.0))
             ),
             Some((Conus, 1))
         );
         assert_eq!(
-            resolve_marker_click(None, Some((2, 5.0)), Some((3, 5.0)), None),
+            resolve_marker_click(None, Some((2, 5.0)), Some((3, 5.0)), None, None),
             Some((Intl, 2))
         );
-        assert_eq!(resolve_marker_click(None, None, None, None), None);
+        assert_eq!(
+            resolve_marker_click(None, None, None, Some((7, 2.0)), None),
+            Some((CustomPoll, 7))
+        );
+        assert_eq!(resolve_marker_click(None, None, None, None, None), None);
     }
 
     /// RAOB markers are an overlay, not a radar: at EQUAL distance every
@@ -25247,20 +30778,21 @@ mod tests {
     fn raob_markers_never_steal_an_equal_distance_radar_click() {
         use MarkerFamily::*;
         for radar in [
-            resolve_marker_click(Some((1, 5.0)), None, None, Some((4, 5.0))),
-            resolve_marker_click(None, Some((2, 5.0)), None, Some((4, 5.0))),
-            resolve_marker_click(None, None, Some((3, 5.0)), Some((4, 5.0))),
+            resolve_marker_click(Some((1, 5.0)), None, None, None, Some((4, 5.0))),
+            resolve_marker_click(None, Some((2, 5.0)), None, None, Some((4, 5.0))),
+            resolve_marker_click(None, None, Some((3, 5.0)), None, Some((4, 5.0))),
+            resolve_marker_click(None, None, None, Some((5, 5.0)), Some((4, 5.0))),
         ] {
             assert_ne!(radar.map(|(family, _)| family), Some(Raob));
         }
         // Strictly nearest (the marker the user aimed at) still wins…
         assert_eq!(
-            resolve_marker_click(Some((1, 5.0)), None, None, Some((4, 4.9))),
+            resolve_marker_click(Some((1, 5.0)), None, None, None, Some((4, 4.9))),
             Some((Raob, 4))
         );
         // …and an unaccompanied RAOB hit resolves normally.
         assert_eq!(
-            resolve_marker_click(None, None, None, Some((4, 5.0))),
+            resolve_marker_click(None, None, None, None, Some((4, 5.0))),
             Some((Raob, 4))
         );
     }
@@ -25280,12 +30812,12 @@ mod tests {
         let pointer = egui::pos2(103.0, 100.0);
         let ctx = egui::Context::default();
 
-        app.handle_marker_click(&[], &[], &community_points, &[], pointer, &ctx);
+        app.handle_marker_click(&[], &[], &community_points, &[], &[], pointer, &ctx);
         assert_eq!(app.community_menu, Some(cluster_index));
         // The picker, not the poll, owns a cluster click.
         assert!(!app.poll_active);
 
-        app.handle_marker_click(&[], &[], &community_points, &[], pointer, &ctx);
+        app.handle_marker_click(&[], &[], &community_points, &[], &[], pointer, &ctx);
         assert_eq!(app.community_menu, None, "re-click toggles the picker");
 
         // A click elsewhere on the map dismisses an open picker.
@@ -25295,10 +30827,43 @@ mod tests {
             &[],
             &community_points,
             &[],
+            &[],
             egui::pos2(500.0, 500.0),
             &ctx,
         );
         assert_eq!(app.community_menu, None);
+    }
+
+    #[test]
+    fn custom_poll_marker_click_starts_saved_feed() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings
+            .custom_poll_links
+            .push(settings::CustomPollLinkEntry {
+                label: "ARMOR".to_owned(),
+                site_id: "ARMOR".to_owned(),
+                lat_e6: 34_646_000,
+                lon_e6: -86_772_000,
+                poll_url: "192.0.2.8:8080/armor/".to_owned(),
+            });
+        let custom_points = vec![(0, egui::pos2(100.0, 100.0))];
+        let ctx = egui::Context::default();
+
+        app.handle_marker_click(
+            &[],
+            &[],
+            &[],
+            &custom_points,
+            &[],
+            egui::pos2(101.0, 100.0),
+            &ctx,
+        );
+
+        assert!(app.poll_active);
+        assert_eq!(app.poll_url, "http://192.0.2.8:8080/armor");
+        assert!(matches!(app.poll_source, PollSource::CustomUrl(_)));
+        assert_eq!(app.app_settings.poll_url, app.poll_url);
+        assert!(app.status.contains("ARMOR"));
     }
 
     /// RAOB marker plumbing, offline: the layer toggle gates the point
@@ -25336,7 +30901,15 @@ mod tests {
         let raob_points = vec![(ilx_index, egui::pos2(100.0, 100.0))];
         let ctx = egui::Context::default();
         let status_before = app.status.clone();
-        app.handle_marker_click(&[], &[], &[], &raob_points, egui::pos2(103.0, 100.0), &ctx);
+        app.handle_marker_click(
+            &[],
+            &[],
+            &[],
+            &[],
+            &raob_points,
+            egui::pos2(103.0, 100.0),
+            &ctx,
+        );
         assert_eq!(app.status, status_before, "in-flight guard must hold");
     }
 
@@ -25536,6 +31109,68 @@ mod tests {
     }
 
     #[test]
+    fn terminal_site_markers_use_tdwr_label_and_yellow_fill() {
+        let terminal = RadarSite::new("TATL").with_location(
+            Some("Atlanta Terminal".to_owned()),
+            Some(33.63),
+            Some(-84.44),
+        );
+        let app = test_viewer_app_with_hazards(Vec::new());
+
+        assert!(site_is_terminal_radar(&terminal));
+        assert_eq!(site_marker_label(&terminal), "TATL Atlanta Terminal");
+        assert!(app.site_marker_should_label(&terminal, false));
+        assert_eq!(
+            app.site_marker_color(&terminal, false),
+            egui::Color32::from_rgb(255, 202, 92)
+        );
+    }
+
+    #[test]
+    fn radar_label_toggle_hides_site_and_tdwr_labels() {
+        let terminal = RadarSite::new("TATL").with_location(
+            Some("Atlanta Terminal".to_owned()),
+            Some(33.63),
+            Some(-84.44),
+        );
+        let nexrad = RadarSite::new("KTLX").with_location(
+            Some("Oklahoma City".to_owned()),
+            Some(35.333),
+            Some(-97.278),
+        );
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.map_scale = SITE_LABEL_MIN_SCALE + 10.0;
+
+        assert!(app.site_marker_should_label(&terminal, false));
+        assert!(app.site_marker_should_label(&nexrad, true));
+
+        app.app_settings.show_radar_labels = false;
+
+        assert!(!app.site_marker_should_label(&terminal, false));
+        assert!(!app.site_marker_should_label(&nexrad, true));
+    }
+
+    #[test]
+    fn loaded_site_marker_uses_scan_age_color() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let scan_time = Utc::now() - chrono::Duration::minutes(20);
+        app.volume = Some(Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("KTLX"),
+            scan_time,
+        )));
+        let site = RadarSite::new("KTLX");
+
+        let color = app.site_marker_color(&site, true);
+
+        assert_eq!(color.a(), 255);
+        assert!(color.r() > color.g(), "stale loaded site should skew red");
+        assert_ne!(
+            color,
+            style_color32(app.style_registry.range_rings().site_selected_color)
+        );
+    }
+
+    #[test]
     fn freshness_ring_color_preserves_overlay_alpha() {
         let now = Utc.with_ymd_and_hms(2026, 6, 7, 23, 0, 0).unwrap();
         let style = styles::RadarAgeStyle::default();
@@ -25580,6 +31215,108 @@ mod tests {
                 &styles::RadarAgeStyle::default()
             ),
             egui::Color32::from_rgba_unmultiplied(65, 238, 104, 200)
+        );
+    }
+
+    #[test]
+    fn mode_chip_uses_radar_age_style_threshold_and_colors() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let mut style_settings = styles::StyleSettings::default();
+        style_settings.radar_age.stale_chip_seconds = Some(90);
+        style_settings.radar_age.fresh_color = Some([1, 2, 3, 255]);
+        style_settings.radar_age.stale_color = Some([4, 5, 6, 255]);
+        style_settings.radar_age.aging_color = Some([7, 8, 9, 255]);
+        app.style_settings = style_settings.clone();
+        app.style_registry = styles::StyleRegistry::from_settings(&style_settings);
+        app.realtime_level2_auto_refresh = true;
+        app.volume = Some(Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("KTLX"),
+            Utc::now() - chrono::Duration::seconds(10),
+        )));
+
+        let (_, live_bg, live_kind) = app.mode_chip_state().expect("live chip");
+
+        assert_eq!(live_kind, "LIVE");
+        assert_eq!(live_bg, egui::Color32::from_rgba_unmultiplied(1, 2, 3, 255));
+
+        app.volume = Some(Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("KTLX"),
+            Utc::now() - chrono::Duration::minutes(3),
+        )));
+        let (_, stale_bg, stale_kind) = app.mode_chip_state().expect("stale chip");
+
+        assert_eq!(stale_kind, "STALE");
+        assert_eq!(
+            stale_bg,
+            egui::Color32::from_rgba_unmultiplied(4, 5, 6, 255)
+        );
+
+        app.realtime_level2_auto_refresh = false;
+        let (_, archive_bg, archive_kind) = app.mode_chip_state().expect("archive chip");
+
+        assert_eq!(archive_kind, "ARCH");
+        assert_eq!(
+            archive_bg,
+            egui::Color32::from_rgba_unmultiplied(7, 8, 9, 255)
+        );
+
+        app.volume = Some(Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("KTLX"),
+            Utc::now() + chrono::Duration::minutes(5),
+        )));
+        let (future_label, _, future_kind) = app.mode_chip_state().expect("future archive chip");
+
+        assert_eq!(future_kind, "ARCH");
+        assert!(future_label.contains("0m old"));
+    }
+
+    #[test]
+    fn radar_age_glyph_arc_sweep_uses_red_threshold_and_clamps() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 23, 0, 0).unwrap();
+        let style = styles::RadarAgeStyle {
+            red_seconds: 120,
+            ..styles::RadarAgeStyle::default()
+        };
+
+        assert_eq!(radar_age_glyph_arc_sweep_fraction(now, now, &style), 0.0);
+        assert_eq!(
+            radar_age_glyph_arc_sweep_fraction(now + chrono::Duration::seconds(30), now, &style),
+            0.0
+        );
+        assert!(
+            (radar_age_glyph_arc_sweep_fraction(now - chrono::Duration::seconds(60), now, &style)
+                - 0.5)
+                .abs()
+                < 0.001
+        );
+        assert_eq!(
+            radar_age_glyph_arc_sweep_fraction(now - chrono::Duration::seconds(180), now, &style),
+            1.0
+        );
+    }
+
+    #[test]
+    fn radar_age_glyph_arc_points_start_at_noon_and_sweep_clockwise() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 23, 0, 0).unwrap();
+        let center = egui::pos2(20.0, 30.0);
+        let style = styles::RadarAgeStyle {
+            red_seconds: 100,
+            glyph_arc_radius_px: 10.0,
+            ..styles::RadarAgeStyle::default()
+        };
+
+        let points =
+            radar_age_glyph_arc_points(center, now - chrono::Duration::seconds(50), now, &style);
+        let first = points.first().expect("arc starts");
+        let last = points.last().expect("arc ends");
+
+        assert!((first.x - 20.0).abs() < 0.001);
+        assert!((first.y - 20.0).abs() < 0.001);
+        assert!((last.x - 20.0).abs() < 0.001);
+        assert!((last.y - 40.0).abs() < 0.001);
+        assert!(
+            radar_age_glyph_arc_points(center, now, now, &style).is_empty(),
+            "zero-age scan draws no arc"
         );
     }
 
@@ -26038,6 +31775,96 @@ mod tests {
     }
 
     #[test]
+    fn place_search_prefers_nearby_duplicate_names() {
+        let results = place_search_matches("denton", 33.2, -97.1, 4);
+
+        assert!(!results.is_empty());
+        assert_eq!(results[0].name, "Denton");
+        assert!((results[0].lat - 33.216).abs() < 0.01);
+        assert!((results[0].lon + 97.129).abs() < 0.01);
+    }
+
+    #[test]
+    fn place_search_matches_words_inside_place_names() {
+        let results = place_search_matches("fort w", 32.8, -97.3, 4);
+
+        assert!(!results.is_empty());
+        assert_eq!(results[0].name, "Fort Worth");
+        assert_eq!(results[0].match_score, 1);
+    }
+
+    #[test]
+    fn place_search_labels_duplicate_names_with_state() {
+        let results = place_search_matches("portland", 39.0, -98.0, 12);
+
+        assert!(results.iter().any(|result| {
+            result.name == "Portland"
+                && place_search_result_label(result).starts_with("Portland, OR")
+        }));
+        assert!(results.iter().any(|result| {
+            result.name == "Portland"
+                && place_search_result_label(result).starts_with("Portland, ME")
+        }));
+    }
+
+    #[test]
+    fn place_search_accepts_trailing_state_filter() {
+        let oregon = place_search_matches("portland or", 39.0, -98.0, 4);
+        let maine = place_search_matches("portland maine", 39.0, -98.0, 4);
+
+        assert!(!oregon.is_empty());
+        assert_eq!(oregon[0].name, "Portland");
+        assert_eq!(oregon[0].state_abbr, Some("OR"));
+        assert!(!maine.is_empty());
+        assert_eq!(maine[0].name, "Portland");
+        assert_eq!(maine[0].state_abbr, Some("ME"));
+    }
+
+    #[test]
+    fn place_search_finds_regional_international_places() {
+        let tokyo = place_search_matches("tokyo", 39.0, -98.0, 8);
+        let toronto = place_search_matches("toronto", 39.0, -98.0, 8);
+        let mexico_city = place_search_matches("mexico city", 39.0, -98.0, 8);
+
+        assert!(tokyo.iter().any(|result| {
+            result.name == "Tokyo" && place_search_display_name(result) == "Tokyo, Japan"
+        }));
+        assert!(toronto.iter().any(|result| {
+            result.name == "Toronto" && place_search_display_name(result) == "Toronto, Canada"
+        }));
+        assert!(mexico_city.iter().any(|result| {
+            result.name == "Mexico City"
+                && place_search_display_name(result) == "Mexico City, Mexico"
+        }));
+    }
+
+    #[test]
+    fn place_search_accepts_trailing_country_filter() {
+        let tokyo = place_search_matches("tokyo jp", 39.0, -98.0, 4);
+        let toronto = place_search_matches("toronto canada", 39.0, -98.0, 4);
+        let mexico_city = place_search_matches("mexico city mexico", 39.0, -98.0, 4);
+
+        assert!(!tokyo.is_empty());
+        assert_eq!(tokyo[0].name, "Tokyo");
+        assert_eq!(tokyo[0].context_label, Some("Japan"));
+        assert!(!toronto.is_empty());
+        assert_eq!(toronto[0].name, "Toronto");
+        assert_eq!(toronto[0].context_label, Some("Canada"));
+        assert!(!mexico_city.is_empty());
+        assert_eq!(mexico_city[0].name, "Mexico City");
+        assert_eq!(mexico_city[0].context_label, Some("Mexico"));
+    }
+
+    #[test]
+    fn place_search_country_alias_does_not_steal_state_abbreviation() {
+        let california = place_search_matches("los angeles ca", 39.0, -98.0, 4);
+
+        assert!(!california.is_empty());
+        assert_eq!(california[0].name, "Los Angeles");
+        assert_eq!(california[0].state_abbr, Some("CA"));
+    }
+
+    #[test]
     fn hazard_parser_extracts_warning_polygon_and_tags() {
         let query_time = Utc
             .with_ymd_and_hms(2026, 4, 21, 16, 25, 0)
@@ -26216,6 +32043,278 @@ mod tests {
 
         assert_eq!(app.hazard_at_position(rect, label_hit), Some(0));
         assert_eq!(app.hazard_at_position(rect, label_miss), None);
+    }
+
+    #[test]
+    fn current_alert_rows_honor_filters_and_selection() {
+        let active = test_hazard_record(
+            "active",
+            "TOR 1",
+            "tornado",
+            square_hazard_points(-101.0, 34.0, -100.0, 35.0),
+        );
+        let mut expired = test_hazard_record(
+            "expired",
+            "SVR 2",
+            "severe thunderstorm",
+            square_hazard_points(-99.0, 34.0, -98.0, 35.0),
+        );
+        expired.lifecycle_status = Some("Expired".to_owned());
+        let hidden = test_hazard_record(
+            "hidden",
+            "FFW 3",
+            "flash flood",
+            square_hazard_points(-97.0, 34.0, -96.0, 35.0),
+        );
+        let artifact = test_hazard_record(
+            "artifact",
+            "SPS 4",
+            "special weather",
+            square_hazard_points(-74.0, -0.1, 10.0, 0.1),
+        );
+        let mut app = test_viewer_app_with_hazards(vec![active, expired, hidden, artifact]);
+        app.selected_hazard_index = Some(0);
+        app.hidden_hazard_families.insert("flash flood".to_owned());
+
+        let rows = app.visible_hazard_list_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].index, 0);
+        assert!(rows[0].selected);
+        assert!(rows[0].label.contains("TOR 1"));
+        assert!(rows[0].hover.contains("active"));
+    }
+
+    #[test]
+    fn current_alert_focus_selects_recenters_and_zooms() {
+        let warning = test_hazard_record(
+            "warning",
+            "TOR 1",
+            "tornado",
+            square_hazard_points(-101.0, 34.0, -100.0, 35.0),
+        );
+        let mut app = test_viewer_app_with_hazards(vec![warning]);
+        app.map_center_lat = 40.0;
+        app.map_center_lon = -90.0;
+        app.map_scale = 80.0;
+
+        assert!(app.focus_hazard_record(0));
+
+        assert_eq!(app.selected_hazard_index, Some(0));
+        assert!((app.map_center_lat - 34.5).abs() < 0.001);
+        assert!((app.map_center_lon + 100.5).abs() < 0.001);
+        assert!((app.map_scale - 360.0).abs() < 0.001);
+        assert!(app.status.contains("TOR 1"));
+        assert!(!app.focus_hazard_record(99));
+    }
+
+    #[test]
+    fn new_hazard_attention_tracks_added_current_records() {
+        let existing = test_hazard_record(
+            "old",
+            "TOR 1",
+            "tornado",
+            square_hazard_points(-101.0, 34.0, -100.0, 35.0),
+        );
+        let added = test_hazard_record(
+            "new",
+            "SVR 2",
+            "severe thunderstorm",
+            square_hazard_points(-99.0, 34.0, -98.0, 35.0),
+        );
+        let mut expired = test_hazard_record(
+            "expired",
+            "FFW 3",
+            "flash flood",
+            square_hazard_points(-97.0, 34.0, -96.0, 35.0),
+        );
+        expired.lifecycle_status = Some("Expired".to_owned());
+        let report = test_hazard_record(
+            "report",
+            "LSR",
+            "local storm report",
+            square_hazard_points(-95.0, 34.0, -94.0, 35.0),
+        );
+        let incoming = test_hazard_overlay(vec![existing.clone(), added, expired, report]);
+
+        assert_eq!(
+            new_hazard_attention_event_ids(&test_hazard_overlay(vec![existing]), &incoming),
+            vec!["new".to_owned()]
+        );
+    }
+
+    #[test]
+    fn install_hazard_result_latches_new_alert_and_focus_acknowledges() {
+        let existing = test_hazard_record(
+            "old",
+            "TOR 1",
+            "tornado",
+            square_hazard_points(-101.0, 34.0, -100.0, 35.0),
+        );
+        let added = test_hazard_record(
+            "new",
+            "SVR 2",
+            "severe thunderstorm",
+            square_hazard_points(-99.0, 34.0, -98.0, 35.0),
+        );
+        let mut app = test_viewer_app_with_hazards(vec![existing.clone()]);
+
+        assert!(app.install_hazard_result(Ok(test_hazard_overlay(vec![existing, added])), false));
+
+        assert!(app.unacknowledged_hazard_event_ids.contains("new"));
+        assert_eq!(app.first_unacknowledged_hazard_index(), Some(1));
+        assert!(app.visible_hazard_list_rows()[1].unacknowledged);
+
+        assert!(app.focus_hazard_record(1));
+
+        assert_eq!(app.selected_hazard_index, Some(1));
+        assert!(!app.unacknowledged_hazard_event_ids.contains("new"));
+    }
+
+    #[test]
+    fn acknowledge_all_visible_hazards_clears_visible_new_rows_only() {
+        let visible = test_hazard_record(
+            "visible",
+            "TOR 1",
+            "tornado",
+            square_hazard_points(-101.0, 34.0, -100.0, 35.0),
+        );
+        let hidden = test_hazard_record(
+            "hidden",
+            "FFW 2",
+            "flash flood",
+            square_hazard_points(-99.0, 34.0, -98.0, 35.0),
+        );
+        let mut app = test_viewer_app_with_hazards(vec![visible, hidden]);
+        app.hidden_hazard_families.insert("flash flood".to_owned());
+        app.unacknowledged_hazard_event_ids
+            .insert("visible".to_owned());
+        app.unacknowledged_hazard_event_ids
+            .insert("hidden".to_owned());
+
+        app.acknowledge_all_visible_hazards();
+
+        assert!(!app.unacknowledged_hazard_event_ids.contains("visible"));
+        assert!(app.unacknowledged_hazard_event_ids.contains("hidden"));
+    }
+
+    #[test]
+    fn alert_sound_family_selection_defaults_to_all_and_can_narrow() {
+        let mut families = Vec::new();
+        assert!(alert_family_enabled(&families, "tornado"));
+        assert!(alert_family_enabled(&families, "severe thunderstorm"));
+        assert!(alert_family_enabled(&families, "flash flood"));
+
+        set_alert_family_enabled(&mut families, "flash flood", false);
+        assert!(alert_family_enabled(&families, "tornado"));
+        assert!(alert_family_enabled(&families, "severe thunderstorm"));
+        assert!(!alert_family_enabled(&families, "flash flood"));
+        assert_eq!(
+            families,
+            vec!["tornado".to_owned(), "severe thunderstorm".to_owned()]
+        );
+
+        set_alert_family_enabled(&mut families, "flash flood", true);
+        assert!(families.is_empty(), "all selected should persist sparsely");
+    }
+
+    #[test]
+    fn alert_sound_gate_requires_enabled_matching_new_warning_family() {
+        let tornado = test_hazard_record(
+            "tor",
+            "TOR 1",
+            "tornado",
+            square_hazard_points(-101.0, 34.0, -100.0, 35.0),
+        );
+        let flash_flood = test_hazard_record(
+            "ffw",
+            "FFW 2",
+            "flash flood",
+            square_hazard_points(-99.0, 34.0, -98.0, 35.0),
+        );
+        let overlay = test_hazard_overlay(vec![tornado, flash_flood]);
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ids = vec!["tor".to_owned(), "ffw".to_owned()];
+
+        assert!(!app.alert_sound_should_play_for_new_ids(&overlay, &ids));
+
+        app.app_settings.alert_sound_enabled = true;
+        app.app_settings.alert_sound_families = vec!["tornado".to_owned()];
+        assert!(app.alert_sound_should_play_for_new_ids(&overlay, &ids));
+        assert!(!app.alert_sound_should_play_for_new_ids(&overlay, &["ffw".to_owned()]));
+    }
+
+    #[test]
+    fn visual_alert_gate_respects_flash_toggle_and_family_filter() {
+        let tornado = test_hazard_record(
+            "tor",
+            "TOR 1",
+            "tornado",
+            square_hazard_points(-101.0, 34.0, -100.0, 35.0),
+        );
+        let flash_flood = test_hazard_record(
+            "ffw",
+            "FFW 2",
+            "flash flood",
+            square_hazard_points(-99.0, 34.0, -98.0, 35.0),
+        );
+        let overlay = test_hazard_overlay(vec![tornado, flash_flood]);
+        let ids = vec!["tor".to_owned(), "ffw".to_owned()];
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+
+        assert_eq!(app.visual_alert_event_ids(&overlay, &ids), ids);
+
+        app.app_settings.alert_flash_families = vec!["tornado".to_owned()];
+        assert_eq!(
+            app.visual_alert_event_ids(&overlay, &ids),
+            vec!["tor".to_owned()]
+        );
+
+        app.app_settings.alert_flash_enabled = false;
+        assert!(app.visual_alert_event_ids(&overlay, &ids).is_empty());
+    }
+
+    #[test]
+    fn install_hazard_result_latches_only_visual_flash_families() {
+        let existing = test_hazard_record(
+            "old",
+            "TOR 1",
+            "tornado",
+            square_hazard_points(-103.0, 34.0, -102.0, 35.0),
+        );
+        let tornado = test_hazard_record(
+            "tor",
+            "TOR 2",
+            "tornado",
+            square_hazard_points(-101.0, 34.0, -100.0, 35.0),
+        );
+        let flash_flood = test_hazard_record(
+            "ffw",
+            "FFW 3",
+            "flash flood",
+            square_hazard_points(-99.0, 34.0, -98.0, 35.0),
+        );
+        let mut app = test_viewer_app_with_hazards(vec![existing.clone()]);
+        app.app_settings.alert_flash_families = vec!["flash flood".to_owned()];
+
+        assert!(app.install_hazard_result(
+            Ok(test_hazard_overlay(vec![existing, tornado, flash_flood])),
+            false
+        ));
+
+        assert!(!app.unacknowledged_hazard_event_ids.contains("tor"));
+        assert!(app.unacknowledged_hazard_event_ids.contains("ffw"));
+    }
+
+    #[test]
+    fn hazard_focus_view_clamps_tiny_and_large_polygons() {
+        let (lat, lon, small_scale) = hazard_focus_view([-101.0, 34.0, -100.99, 34.01]);
+        assert!((lat - 34.005).abs() < 0.001);
+        assert!((lon + 100.995).abs() < 0.001);
+        assert_eq!(small_scale, HAZARD_FOCUS_MAX_SCALE);
+
+        let (_, _, large_scale) = hazard_focus_view([-105.0, 34.0, -95.0, 40.0]);
+        assert_eq!(large_scale, HAZARD_FOCUS_MIN_SCALE);
     }
 
     #[test]
@@ -26624,6 +32723,31 @@ mod tests {
     }
 
     #[test]
+    fn spc_md_compact_polygon_restores_implied_west_100_longitudes() {
+        let points = parse_lat_lon_points(&[
+            "LAT...LON   35880436 36100370 36470288 36870233 37260186 37400156",
+            "            37460100 37350044 37200025 36940013 36640013 36330021",
+            "            36020049 35840086 35680131 35530192 35450269 35380335",
+            "            35330382 35420425 35690439 35740442 35880436",
+            "",
+        ]);
+
+        assert_eq!(points.len(), 23);
+        assert_eq!(points[0].lat, 35.88);
+        assert_eq!(points[0].lon, -104.36);
+        assert_eq!(points[6].lon, -101.00);
+        assert_eq!(points[9].lon, -100.13);
+        assert_eq!(hazard_bbox(&points), [-104.42, 35.33, -100.13, 37.46]);
+        assert!(hazard_polygon_contains_point(
+            &points,
+            HazardPoint {
+                lon: -102.25,
+                lat: 36.5
+            }
+        ));
+    }
+
+    #[test]
     fn hazard_parser_marks_expired_against_query_time() {
         let query_time = Utc
             .with_ymd_and_hms(2026, 4, 21, 17, 0, 0)
@@ -26699,6 +32823,8 @@ mod tests {
             mpsc::channel::<RenderRecycleBuffer>();
         ViewerApp {
             source_path: None,
+            renderer_backend: "test",
+            startup_notice: None,
             volume: None,
             selected_cut: 0,
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
@@ -26731,6 +32857,7 @@ mod tests {
             map_center_lon: 0.0,
             map_center_lat: 0.0,
             map_scale: 100.0,
+            place_search_query: String::new(),
             radar_range_km: DEFAULT_RADAR_RANGE_KM,
             load_timing: None,
             active_load_started_at: None,
@@ -26747,6 +32874,7 @@ mod tests {
             selected_site_index: 0,
             app_settings: settings::AppSettings::default(),
             radar_layers: Vec::new(),
+            radar_overlays_open: false,
             next_radar_layer_id: 1,
             site_catalog_receiver: None,
             load_receiver: None,
@@ -26787,6 +32915,7 @@ mod tests {
             spc_reports: None,
             spc_receiver: None,
             archive_pending_event: None,
+            pending_debug_archive_case: None,
             ingest: None,
             download_panel: rw_ui::DownloadPanel::new(default_download_spec("hrrr")),
             sat: None,
@@ -26794,6 +32923,8 @@ mod tests {
             sat_player: rw_ui::SatPlayerPanel::new(),
             show_satellite: false,
             show_guide: false,
+            current_workflow: None,
+            previous_workflow_snapshot: None,
             chrome_hidden: false,
             pending_local_autoplay: false,
             workspace: dock::Workspace::default(),
@@ -26821,6 +32952,10 @@ mod tests {
             wofs: wofs::WofsState::default(),
             farm: farm_live::FarmState::default(),
             poll_url: String::new(),
+            custom_poll_label_input: String::new(),
+            custom_poll_site_input: String::new(),
+            custom_poll_lat_input: String::new(),
+            custom_poll_lon_input: String::new(),
             poll_active: false,
             poll_last_file: None,
             poll_next: None,
@@ -26882,6 +33017,7 @@ mod tests {
             native_skewt_open: false,
             archive_frame_count: 10,
             archive_loaded_range: None,
+            archive_load_progress: None,
             archive_load_loop: true,
             archive_date_input: String::new(),
             archive_volumes: None,
@@ -26917,6 +33053,7 @@ mod tests {
             sidebar_tab: SidebarTab::Radar,
             last_live_hazard_refresh: None,
             selected_hazard_index: None,
+            unacknowledged_hazard_event_ids: BTreeSet::new(),
             storm_motion_direction_deg: DEFAULT_STORM_MOTION_DIRECTION_DEG,
             storm_motion_speed_kt: DEFAULT_STORM_MOTION_SPEED_KT,
             derived_readout_cache: None,
@@ -27071,10 +33208,1126 @@ mod tests {
         assert_eq!(two[1].max, outer.max);
         assert!(two[1].min.x > two[0].max.x); // left | right with a gap
 
+        let three = pane_cell_rects(PanelLayout::ThreeStacked, outer, 2.0);
+        assert_eq!(three.len(), 3);
+        assert_eq!(three[0].min, outer.min);
+        assert_eq!(three[0].max.y, outer.max.y);
+        assert_eq!(three[1].max.x, outer.max.x);
+        assert_eq!(three[2].max, outer.max);
+        assert!(three[1].min.x > three[0].max.x);
+        assert!(three[2].min.y > three[1].max.y);
+
         let four = pane_cell_rects(PanelLayout::FourGrid, outer, 2.0);
         assert_eq!(four.len(), 4);
         assert_eq!(four[0].min, outer.min);
         assert_eq!(four[3].max, outer.max);
+    }
+
+    #[test]
+    fn annotation_target_cell_prefers_hovered_pane_and_clamps_fallback() {
+        let outer = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 600.0));
+        let cells = pane_cell_rects(PanelLayout::ThreeStacked, outer, 2.0);
+
+        assert_eq!(
+            annotation_target_cell(&cells, Some(cells[2].center()), 0),
+            Some(2)
+        );
+        assert_eq!(
+            annotation_target_cell(&cells, Some(egui::pos2(-20.0, -20.0)), 1),
+            Some(1)
+        );
+        assert_eq!(annotation_target_cell(&cells, None, 99), Some(2));
+        assert_eq!(annotation_target_cell(&[], None, 0), None);
+    }
+
+    #[test]
+    fn cross_section_handle_hit_box_matches_canvas_ownership_guard() {
+        let center = egui::pos2(250.0, 180.0);
+        let handle = cross_section_handle_rect(center);
+
+        assert_eq!(handle.size(), egui::vec2(20.0, 20.0));
+        assert!(handle.contains(center + egui::vec2(9.9, 0.0)));
+        assert!(!handle.contains(center + egui::vec2(10.1, 0.0)));
+    }
+
+    #[test]
+    fn inspector_pin_uses_extra_grid_pane_geometry() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.map_center_lon = -97.0;
+        app.map_center_lat = 35.0;
+        app.map_scale = 500.0;
+        let outer = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(900.0, 600.0));
+        let cells = pane_cell_rects(PanelLayout::ThreeStacked, outer, 2.0);
+        let extra_cell = cells[2];
+        let pointer = extra_cell.center() + egui::vec2(32.0, -18.0);
+        let expected = app.screen_to_lon_lat(extra_cell, pointer);
+
+        app.toggle_inspector_pin(extra_cell, pointer);
+
+        let (lon, lat) = app.pinned_inspector_lonlat.expect("pin set");
+        assert!((lon - expected.0).abs() < 0.001);
+        assert!((lat - expected.1).abs() < 0.001);
+
+        app.toggle_inspector_pin(extra_cell, pointer);
+
+        assert!(app.pinned_inspector_lonlat.is_none());
+    }
+
+    #[test]
+    fn modified_map_clicks_are_exclusive_from_plain_marker_clicks() {
+        let none = egui::Modifiers::default();
+        assert!(plain_map_click_allowed(none, true));
+        assert!(plain_context_menu_allowed(none, false));
+        assert!(!plain_context_menu_allowed(none, true));
+
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert!(ctrl_best_radar_click(ctrl));
+        assert!(!plain_map_click_allowed(ctrl, true));
+        assert!(!plain_context_menu_allowed(ctrl, false));
+
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        assert!(alt_model_sounding_active(alt, true));
+        assert!(!plain_map_click_allowed(alt, true));
+        assert!(plain_map_click_allowed(alt, false));
+
+        let ctrl_alt = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Default::default()
+        };
+        assert!(!ctrl_best_radar_click(ctrl_alt));
+        assert!(alt_model_sounding_active(ctrl_alt, true));
+        assert!(!plain_map_click_allowed(ctrl_alt, true));
+
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert!(!plain_map_click_allowed(shift, true));
+    }
+
+    #[test]
+    fn plain_map_click_routes_reports_only_when_no_marker_is_hit() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.spc_reports_enabled = true;
+        app.spc_data.reports.push(spc_layers::StormReport {
+            kind: spc_layers::ReportKind::Tornado,
+            time_hhmm: "2215".to_owned(),
+            time_utc: Utc.with_ymd_and_hms(2011, 4, 27, 22, 15, 0).unwrap(),
+            lat: 0.0,
+            lon: 0.0,
+            magnitude: "EF4".to_owned(),
+            location: "Tuscaloosa".to_owned(),
+            remark: String::new(),
+        });
+        let rect = test_map_rect();
+        let pointer = rect.center();
+        let ctx = egui::Context::default();
+
+        app.handle_plain_map_click(rect, &[], &[], &[], &[], &[], pointer, &ctx);
+
+        assert_eq!(app.status, "No radar within 460 km of that event");
+
+        app.status.clear();
+        app.handle_plain_map_click(rect, &[(0, pointer)], &[], &[], &[], &[], pointer, &ctx);
+
+        assert_eq!(app.status, "");
+    }
+
+    #[test]
+    fn background_activity_reports_archive_progress_with_fraction() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.archive_load_progress = Some(ArchiveLoadProgress {
+            label: "Archive loop".to_owned(),
+            detail: "Decoded KTLX scan".to_owned(),
+            done: 3,
+            total: 5,
+        });
+
+        let activity = app.active_background_activity().expect("activity");
+
+        assert_eq!(activity.label, "Archive loop 3/5 - Decoded KTLX scan");
+        assert_eq!(activity.fraction, Some(0.6));
+    }
+
+    fn test_archive_object(site: &str, time_hms: &str) -> data_source::S3Object {
+        data_source::S3Object {
+            key: format!("{site}/{site}20110427_{}_V06", time_hms.replace(':', "")),
+            size: 1,
+            last_modified: None,
+        }
+    }
+
+    fn arm_busy_primary_load(app: &mut ViewerApp) {
+        let (_sender, receiver) = mpsc::channel::<AsyncLoadResult>();
+        app.load_receiver = Some(receiver);
+    }
+
+    #[test]
+    fn archive_report_jump_survives_busy_decode_when_listing_lands() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![data_source::RadarSite {
+            level2_id: "KTLX".to_owned(),
+            name: None,
+            latitude_deg: Some(35.33),
+            longitude_deg: Some(-97.28),
+        }];
+        app.archive_date_input = "2011-04-27".to_owned();
+        app.archive_pending_event = Some(ArchivePendingEvent {
+            time_utc: Utc.with_ymd_and_hms(2011, 4, 27, 22, 15, 0).unwrap(),
+            label: "Tuscaloosa".to_owned(),
+        });
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(vec![test_archive_object("KTLX", "22:15:00")]))
+            .unwrap();
+        app.archive_list_receiver = Some(receiver);
+        arm_busy_primary_load(&mut app);
+
+        app.poll_archive_listing(&egui::Context::default());
+
+        assert!(app.archive_pending_event.is_some());
+        assert_eq!(app.status, "Wait for the current load to finish");
+    }
+
+    #[test]
+    fn archive_track_jump_survives_busy_decode_when_listing_lands() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![data_source::RadarSite {
+            level2_id: "KTLX".to_owned(),
+            name: None,
+            latitude_deg: Some(35.33),
+            longitude_deg: Some(-97.28),
+        }];
+        app.archive_date_input = "2011-04-27".to_owned();
+        app.event_explorer.pending_range = Some((
+            Utc.with_ymd_and_hms(2011, 4, 27, 22, 10, 0).unwrap(),
+            Utc.with_ymd_and_hms(2011, 4, 27, 22, 20, 0).unwrap(),
+        ));
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(vec![
+                test_archive_object("KTLX", "22:10:00"),
+                test_archive_object("KTLX", "22:15:00"),
+                test_archive_object("KTLX", "22:20:00"),
+            ]))
+            .unwrap();
+        app.archive_list_receiver = Some(receiver);
+        arm_busy_primary_load(&mut app);
+
+        app.poll_archive_listing(&egui::Context::default());
+
+        assert!(app.event_explorer.pending_range.is_some());
+        assert!(!app.event_explorer.pending_autoplay);
+        assert_eq!(app.status, "Wait for the current load to finish");
+    }
+
+    #[test]
+    fn cached_event_frame_selection_does_not_leave_background_progress() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let scan_time = Utc.with_ymd_and_hms(2011, 4, 27, 22, 15, 0).unwrap();
+        let volume = Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("KTLX"),
+            scan_time,
+        ));
+        app.frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(&volume),
+            path: PathBuf::from("archive://KTLX20110427_221500_V06"),
+            volume,
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "archive KTLX".to_owned(),
+        });
+        app.archive_load_progress = Some(ArchiveLoadProgress {
+            label: "Archive loop".to_owned(),
+            detail: "stale previous job".to_owned(),
+            done: 1,
+            total: 5,
+        });
+
+        let selected = app.select_cached_event_frame(
+            "KTLX",
+            scan_time,
+            "Tuscaloosa",
+            &egui::Context::default(),
+        );
+
+        assert!(selected);
+        assert!(app.archive_load_progress.is_none());
+        assert!(app.active_background_activity().is_none());
+        assert_eq!(app.selected_frame_index, 0);
+        assert!(app.status.contains("Selected cached KTLX frame"));
+    }
+
+    #[test]
+    fn background_activity_reports_model_ingest_status_without_panel() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let (_sender, receiver) = mpsc::channel();
+        app.model_ingest_rx = Some(receiver);
+        app.status = "HRRR 2026-06-13 12z f03 stored".to_owned();
+
+        let activity = app.active_background_activity().expect("activity");
+
+        assert_eq!(
+            activity,
+            BackgroundActivity::indeterminate("HRRR 2026-06-13 12z f03 stored")
+        );
+    }
+
+    #[test]
+    fn background_activity_reports_composite_fraction() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let (_sender, receiver) = mpsc::channel();
+        app.oa_comp_rx = Some(receiver);
+        app.oa_comp_total = 100;
+        app.oa_comp_progress
+            .store(42, std::sync::atomic::Ordering::Relaxed);
+
+        let activity = app.active_background_activity().expect("activity");
+
+        assert_eq!(
+            activity,
+            BackgroundActivity::progress("Composites 42/100", 42, 100)
+        );
+    }
+
+    #[test]
+    fn background_activity_reports_docked_viewer_workers() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+
+        let (_sender, receiver) = mpsc::channel::<Option<vol3d::VolumeBox>>();
+        app.vol3d.resample_rx = Some(receiver);
+        assert_eq!(
+            app.active_background_activity(),
+            Some(BackgroundActivity::indeterminate("Resampling 3D volume"))
+        );
+        app.vol3d.resample_rx = None;
+
+        let (_sender, receiver) = mpsc::channel::<Result<wofs::WofsCatalog, String>>();
+        app.wofs.catalog_rx = Some(receiver);
+        assert_eq!(
+            app.active_background_activity(),
+            Some(BackgroundActivity::indeterminate("Loading WoFS catalog"))
+        );
+        app.wofs.catalog_rx = None;
+
+        let (_sender, receiver) = mpsc::channel::<(String, Result<egui::ColorImage, String>)>();
+        app.wofs.image_rx = Some(receiver);
+        assert_eq!(
+            app.active_background_activity(),
+            Some(BackgroundActivity::indeterminate("Loading WoFS imagery"))
+        );
+        app.wofs.image_rx = None;
+
+        let (_sender, receiver) = mpsc::channel::<wofs::StationsMsg>();
+        app.wofs.stations_rx = Some(receiver);
+        assert_eq!(
+            app.active_background_activity(),
+            Some(BackgroundActivity::indeterminate(
+                "Loading WoFS sounding stations"
+            ))
+        );
+        app.wofs.stations_rx = None;
+
+        let (_sender, receiver) = mpsc::channel::<Result<wofs_georef::WofsGeoref, String>>();
+        app.wofs.georef_rx = Some(("WOFSRun20260611-144912d1".to_owned(), receiver));
+        app.wofs
+            .georef_progress
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            app.active_background_activity(),
+            Some(BackgroundActivity::progress(
+                format!(
+                    "Calibrating WoFS georef 7/{}",
+                    wofs_georef::CALIBRATION_TOTAL
+                ),
+                7,
+                wofs_georef::CALIBRATION_TOTAL
+            ))
+        );
+    }
+
+    #[test]
+    fn background_activity_reports_secondary_worker_labels() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+
+        let (_sender, receiver) = mpsc::channel::<OaResult>();
+        app.oa_rx = Some(receiver);
+        assert_eq!(
+            app.active_background_activity(),
+            Some(BackgroundActivity::indeterminate("Analyzing observations"))
+        );
+        app.oa_rx = None;
+
+        let (_sender, receiver) = mpsc::channel::<IntlLoopFrameResult>();
+        app.intl_loop_rx = Some(receiver);
+        assert_eq!(
+            app.active_background_activity(),
+            Some(BackgroundActivity::indeterminate(
+                "Loading international loop"
+            ))
+        );
+        app.intl_loop_rx = None;
+
+        let (_sender, receiver) = mpsc::channel::<StormCellsResult>();
+        app.storm_cells_receiver = Some(receiver);
+        assert_eq!(
+            app.active_background_activity(),
+            Some(BackgroundActivity::indeterminate("Analyzing storm tracks"))
+        );
+        app.storm_cells_receiver = None;
+
+        let (_sender, receiver) = mpsc::channel::<(usize, Vec<RotationMarker>)>();
+        app.rotation_receiver = Some(receiver);
+        assert_eq!(
+            app.active_background_activity(),
+            Some(BackgroundActivity::indeterminate(
+                "Detecting rotation markers"
+            ))
+        );
+    }
+
+    #[test]
+    fn background_activity_reports_catalog_and_placefile_workers() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+
+        let (_sender, receiver) = mpsc::channel::<IntlSiteListResult>();
+        app.intl_picker_provider = "jma".to_owned();
+        app.intl_sites_rx = Some(receiver);
+        assert_eq!(
+            app.active_background_activity(),
+            Some(BackgroundActivity::indeterminate(
+                "Loading international sites: jma"
+            ))
+        );
+        app.intl_sites_rx = None;
+
+        let (_sender, receiver) =
+            mpsc::channel::<std::result::Result<placefiles::Placefile, String>>();
+        let mut slot = PlacefileSlot::new("https://example.test/placefile.txt".to_owned(), true);
+        slot.receiver = Some(receiver);
+        app.placefile_slots.push(slot);
+        assert_eq!(
+            app.active_background_activity(),
+            Some(BackgroundActivity::indeterminate("Loading placefile"))
+        );
+        app.placefile_slots[0].receiver = None;
+
+        let (_sender, receiver) = mpsc::channel::<Vec<DecodedSheet>>();
+        app.placefile_slots[0].sheets_receiver = Some(receiver);
+        assert_eq!(
+            app.active_background_activity(),
+            Some(BackgroundActivity::indeterminate("Loading placefile icons"))
+        );
+    }
+
+    #[test]
+    fn background_activity_reports_event_day_fetch() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let (_sender, receiver) =
+            mpsc::channel::<std::result::Result<spc_layers::EventDayData, String>>();
+        let day = NaiveDate::from_ymd_opt(2011, 4, 27).unwrap();
+        app.event_explorer.set_fetch_for_test(day, receiver);
+
+        assert_eq!(
+            app.active_background_activity(),
+            Some(BackgroundActivity::indeterminate(
+                "Loading event day 2011-04-27"
+            ))
+        );
+    }
+
+    #[test]
+    fn workspace_reset_clears_persisted_layout_and_grid_state() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.set_viewer_open(dock::WorkspacePane::Model, true);
+        app.workspace.dock(dock::WorkspacePane::Model);
+        app.workspace
+            .requests
+            .push(dock::DockRequest::Hide(dock::WorkspacePane::Model));
+        app.grid_layout = PanelLayout::FourGrid;
+        app.sync_extra_panes();
+        app.active_pane = 3;
+        app.pending_grid_layout = Some(PanelLayout::TwoVertical);
+        app.app_settings.grid_pane_count = 4;
+        app.app_settings.workspace_layout = Some(serde_json::json!({
+            "version": 1,
+            "sentinel": true,
+        }));
+        app.workspace.mark_dirty();
+
+        app.reset_workspace_layout_state();
+
+        assert_eq!(app.grid_layout, PanelLayout::One);
+        assert!(app.extra_panes.is_empty());
+        assert_eq!(app.active_pane, 0);
+        assert!(app.pending_grid_layout.is_none());
+        assert_eq!(app.app_settings.grid_pane_count, 1);
+        assert!(app.app_settings.workspace_layout.is_none());
+        assert!(app.workspace.is_docked(dock::WorkspacePane::Map));
+        assert!(!app.workspace.is_docked(dock::WorkspacePane::Model));
+        assert!(app.viewer_open(dock::WorkspacePane::Model));
+        assert!(app.workspace.prefer_docked.is_empty());
+        assert!(app.workspace.requests.is_empty());
+        assert!(!app.workspace.dirty);
+        assert!(app.workspace.last_edit.is_none());
+        assert_eq!(app.status, "Workspace layout reset");
+    }
+
+    #[test]
+    fn data_folder_selection_and_reset_are_scoped_to_data_dir() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.startup_site = Some("KTLX".to_owned());
+        app.app_settings.favorites = vec!["KTLX".to_owned()];
+        app.app_settings.archive_load_loop = false;
+        app.app_settings.archive_frame_count = 17;
+        app.app_settings.workspace_layout = Some(serde_json::json!({
+            "version": 1,
+            "sentinel": true,
+        }));
+
+        let custom_root = PathBuf::from("custom-data-root");
+        app.set_data_folder_override_in_memory(custom_root.clone());
+        assert_eq!(app.app_settings.data_dir, custom_root.display().to_string());
+        assert_eq!(app.status, "Data folder saved - restart BowEcho to apply");
+
+        app.reset_data_folder_override_in_memory();
+
+        assert!(app.app_settings.data_dir.is_empty());
+        assert_eq!(app.app_settings.startup_site.as_deref(), Some("KTLX"));
+        assert_eq!(app.app_settings.favorites, vec!["KTLX".to_owned()]);
+        assert!(!app.app_settings.archive_load_loop);
+        assert_eq!(app.app_settings.archive_frame_count, 17);
+        assert!(app.app_settings.workspace_layout.is_some());
+        assert_eq!(app.status, "Data folder reset - restart BowEcho to apply");
+    }
+
+    #[test]
+    fn load_worker_disconnect_clears_stale_archive_progress() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let (_sender, receiver) = mpsc::channel::<AsyncLoadResult>();
+        drop(_sender);
+        app.load_receiver = Some(receiver);
+        app.archive_load_progress = Some(ArchiveLoadProgress {
+            label: "Archive loop".to_owned(),
+            detail: "Fetching KTLX".to_owned(),
+            done: 1,
+            total: 4,
+        });
+        app.event_explorer.pending_autoplay = true;
+
+        app.poll_async_load(&egui::Context::default());
+
+        assert!(app.load_receiver.is_none());
+        assert!(app.archive_load_progress.is_none());
+        assert!(!app.event_explorer.pending_autoplay);
+        assert_eq!(app.status, "L2 load worker disconnected");
+        assert!(app.active_background_activity().is_none());
+    }
+
+    #[test]
+    fn archive_frame_count_clamps_config_values_to_ui_range() {
+        assert_eq!(
+            normalized_archive_frame_count(0),
+            DEFAULT_ARCHIVE_FRAME_COUNT
+        );
+        assert_eq!(normalized_archive_frame_count(1), 1);
+        assert_eq!(normalized_archive_frame_count(17), 17);
+        assert_eq!(normalized_archive_frame_count(999), MAX_ARCHIVE_FRAME_COUNT);
+    }
+
+    #[test]
+    fn event_pad_frames_clamp_to_event_explorer_ui_range() {
+        assert_eq!(normalized_event_pad_frames(0), 0);
+        assert_eq!(normalized_event_pad_frames(12), 12);
+        assert_eq!(
+            normalized_event_pad_frames(MAX_EVENT_PAD_FRAMES + 1),
+            MAX_EVENT_PAD_FRAMES
+        );
+        assert_eq!(normalized_event_pad_frames(u16::MAX), MAX_EVENT_PAD_FRAMES);
+    }
+
+    #[test]
+    fn workflow_presets_have_unique_labels() {
+        let mut labels = BTreeSet::new();
+        for preset in WorkflowPreset::ALL {
+            assert!(
+                labels.insert(preset.label()),
+                "duplicate {}",
+                preset.label()
+            );
+            assert!(!preset.description().is_empty());
+        }
+    }
+
+    #[test]
+    fn custom_tab_advertises_layers_and_appearance() {
+        assert!(SIDEBAR_TABS.contains(&(SidebarTab::Layers, "Custom")));
+        let tooltip = sidebar_tab_tooltip(SidebarTab::Layers);
+        assert!(tooltip.contains("map layers"));
+        assert!(tooltip.contains("radar age"));
+        assert!(tooltip.contains("appearance"));
+        assert!(tooltip.contains("color tables"));
+        let settings_tooltip = sidebar_tab_tooltip(SidebarTab::Settings);
+        assert!(settings_tooltip.contains("alerts"));
+        assert!(settings_tooltip.contains("performance"));
+        assert!(!settings_tooltip.contains("color tables"));
+        assert!(SATELLITE_MAP_LAYER_HOVER.contains("Custom"));
+        assert!(!SATELLITE_MAP_LAYER_HOVER.contains("Layers"));
+    }
+
+    #[test]
+    fn appearance_profiles_have_unique_labels_and_resolvable_builtin_palettes() {
+        let mut labels = BTreeSet::new();
+        for profile in AppearanceProfile::ALL {
+            assert!(
+                labels.insert(profile.label()),
+                "duplicate {}",
+                profile.label()
+            );
+            assert!(!profile.description().is_empty());
+            for (family_label, table_name) in profile.palette_by_family() {
+                let family = ColorTableFamily::from_label(&family_label)
+                    .unwrap_or_else(|| panic!("unknown family {family_label}"));
+                let found = color_tables::builtin_catalog_for_family(family)
+                    .iter()
+                    .any(|entry| entry.table.name() == table_name);
+                assert!(found, "{} references missing {table_name}", profile.label());
+            }
+        }
+    }
+
+    #[test]
+    fn appearance_profile_application_replaces_styles_and_palette_bindings() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+
+        let misses = app.apply_appearance_profile_in_memory(AppearanceProfile::ChaseDark);
+
+        assert!(misses.is_empty());
+        assert_eq!(app.app_settings.style_profile, "Chase dark");
+        assert_eq!(
+            app.style_settings.map.background_color,
+            Some([3, 6, 9, 255])
+        );
+        assert_eq!(
+            app.app_settings
+                .palette_by_family
+                .get(ColorTableFamily::Reflectivity.label())
+                .map(String::as_str),
+            Some("Dark Scope REF")
+        );
+        assert_eq!(
+            app.color_tables
+                .for_family(ColorTableFamily::Reflectivity)
+                .name(),
+            "Dark Scope REF"
+        );
+        assert!(!app.appearance_profile_modified(AppearanceProfile::ChaseDark));
+
+        app.style_settings.radar_age.glyph_arc_radius_px = Some(18.0);
+        app.rebuild_style_registry();
+
+        assert!(app.appearance_profile_modified(AppearanceProfile::ChaseDark));
+
+        let misses = app.apply_appearance_profile_in_memory(AppearanceProfile::BowEchoDefault);
+
+        assert!(misses.is_empty());
+        assert_eq!(app.app_settings.style_profile, "BowEcho default");
+        assert!(app.app_settings.palette_by_family.is_empty());
+        assert!(app.app_settings.palette_by_product.is_empty());
+        assert_eq!(app.style_settings, styles::StyleSettings::default());
+    }
+
+    #[test]
+    fn radar_overlays_window_tracks_viewer_state() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        assert!(RADAR_OVERLAYS_EMPTY_HELP.contains("Ctrl+right-click"));
+        assert!(RADAR_OVERLAYS_EMPTY_HELP.contains("Radar overlay"));
+
+        assert!(!app.viewer_open(dock::WorkspacePane::RadarOverlays));
+        app.open_viewer(dock::WorkspacePane::RadarOverlays);
+        assert!(app.viewer_open(dock::WorkspacePane::RadarOverlays));
+        assert!(!app.workspace.is_docked(dock::WorkspacePane::RadarOverlays));
+
+        app.workspace
+            .prefer_docked
+            .insert(dock::WorkspacePane::RadarOverlays);
+        app.toggle_viewer(dock::WorkspacePane::RadarOverlays);
+        assert!(!app.viewer_open(dock::WorkspacePane::RadarOverlays));
+        app.toggle_viewer(dock::WorkspacePane::RadarOverlays);
+        assert!(app.viewer_open(dock::WorkspacePane::RadarOverlays));
+        assert!(app.workspace.is_docked(dock::WorkspacePane::RadarOverlays));
+    }
+
+    #[test]
+    fn color_table_manager_opens_custom_appearance_surface() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+
+        app.request_color_table_manager(ColorTableFamily::Reflectivity);
+
+        assert_eq!(app.sidebar_tab, SidebarTab::Layers);
+        assert_eq!(app.color_table_target, ColorTableFamily::Reflectivity);
+        assert!(app.open_color_tables_request);
+    }
+
+    #[test]
+    fn map_backdrop_uses_style_registry_color() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+
+        assert_eq!(app.map_backdrop_color(), egui::Color32::from_rgb(7, 10, 14));
+
+        app.style_settings.map.background_color = Some([12, 24, 36, 255]);
+        app.rebuild_style_registry();
+
+        assert_eq!(
+            app.map_backdrop_color(),
+            egui::Color32::from_rgb(12, 24, 36)
+        );
+    }
+
+    #[test]
+    fn hazard_polygon_style_keys_cover_families_and_escalations() {
+        assert!(hazard_style_key_known("tornado"));
+        assert!(hazard_style_key_known("tornado/catastrophic"));
+        assert!(!hazard_style_key_known("not-a-real-polygon-family"));
+        assert!(hazard_style_label("tornado/catastrophic").contains("emergency"));
+        assert_eq!(
+            hazard_dash_label(styles::DashPattern::Dashed {
+                dash: 9.0,
+                gap: 6.0
+            }),
+            "Dashed"
+        );
+    }
+
+    #[test]
+    fn hazard_polygon_style_overrides_resolve_for_custom_editor() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+
+        app.style_settings.hazard_global.fill_alpha = Some(55);
+        app.style_settings.hazard_global.stroke_width_scale = Some(1.75);
+        app.style_settings.hazards.insert(
+            "tornado".to_owned(),
+            styles::PolygonStyleOverride {
+                stroke_color: Some([10, 20, 30, 255]),
+                fill_color: Some([40, 50, 60, 255]),
+                stroke_width: Some(3.25),
+                dash: Some(styles::DashPattern::Dotted),
+                ..Default::default()
+            },
+        );
+        app.style_settings.hazards.insert(
+            "tornado/catastrophic".to_owned(),
+            styles::PolygonStyleOverride {
+                stroke_color: Some([70, 80, 90, 255]),
+                ..Default::default()
+            },
+        );
+        app.rebuild_style_registry();
+
+        let tornado = hazard_style_resolved_polygon(&app.style_registry, "tornado");
+        assert_eq!(tornado.stroke_color, [10, 20, 30, 255]);
+        assert_eq!(tornado.fill_color, [40, 50, 60, 255]);
+        assert_eq!(tornado.stroke_width, 3.25);
+        assert_eq!(tornado.dash, styles::DashPattern::Dotted);
+        assert_eq!(app.style_registry.hazard_global().fill_alpha, 55);
+        assert_eq!(app.style_registry.hazard_global().stroke_width_scale, 1.75);
+
+        let emergency = hazard_style_resolved_polygon(&app.style_registry, "tornado/catastrophic");
+        assert_eq!(emergency.stroke_color, [70, 80, 90, 255]);
+        assert_eq!(emergency.fill_color, [40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn reset_style_overrides_restores_sparse_defaults_and_registry() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.style_settings.map.background_color = Some([12, 24, 36, 255]);
+        app.style_settings.hazard_global.fill_alpha = Some(55);
+        app.style_settings.hazards.insert(
+            "tornado".to_owned(),
+            styles::PolygonStyleOverride {
+                stroke_width: Some(9.0),
+                ..Default::default()
+            },
+        );
+        app.rebuild_style_registry();
+        assert_ne!(app.style_settings, styles::StyleSettings::default());
+        assert_eq!(
+            app.map_backdrop_color(),
+            egui::Color32::from_rgb(12, 24, 36)
+        );
+
+        app.reset_style_overrides_in_memory();
+
+        assert_eq!(app.style_settings, styles::StyleSettings::default());
+        assert_eq!(
+            app.style_registry.signature(),
+            styles::StyleRegistry::default().signature()
+        );
+        assert_eq!(app.map_backdrop_color(), egui::Color32::from_rgb(7, 10, 14));
+    }
+
+    #[test]
+    fn workflow_preset_records_current_marker() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+
+        app.apply_workflow_preset(WorkflowPreset::LiveSevere, &ctx);
+
+        assert_eq!(app.current_workflow, Some(WorkflowPreset::LiveSevere));
+        assert_eq!(app.sidebar_tab, SidebarTab::Severe);
+        assert_eq!(app.status, "Workflow: Live severe");
+    }
+
+    #[test]
+    fn clearing_workflow_marker_does_not_revert_preset_state() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+
+        app.apply_workflow_preset(WorkflowPreset::ArchiveReview, &ctx);
+        app.clear_workflow_marker();
+
+        assert_eq!(app.current_workflow, None);
+        assert_eq!(app.sidebar_tab, SidebarTab::Data);
+        assert!(app.archive_load_loop);
+        assert_eq!(app.status, "Workflow marker cleared");
+    }
+
+    #[test]
+    fn workflow_restore_returns_previous_layout_and_archive_state() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.grid_layout = PanelLayout::FourGrid;
+        app.sync_extra_panes();
+        app.app_settings.grid_pane_count = 4;
+        app.active_pane = 2;
+        app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
+        app.selected_cut = 1;
+        app.extra_panes[0].product = DisplayProduct::DealiasedVelocity;
+        app.extra_panes[0].cut = Some(3);
+        app.extra_panes[1].product = DisplayProduct::Moment(MomentType::SpectrumWidth);
+        app.extra_panes[1].cut = Some(2);
+        app.sidebar_tab = SidebarTab::Settings;
+        app.hazards_visible = false;
+        app.hazards_active_only = true;
+        app.spc_outlooks_enabled = vec!["torn".to_owned(), "hail".to_owned()];
+        app.spc_reports_enabled = false;
+        app.archive_load_loop = false;
+        app.archive_frame_count = 3;
+        app.history_frame_limit = 7;
+        app.app_settings.archive_load_loop = false;
+        app.app_settings.archive_frame_count = 3;
+        app.realtime_level2_auto_refresh = true;
+        app.poll_active = true;
+        app.history_playing = true;
+
+        app.apply_workflow_preset(WorkflowPreset::ArchiveReview, &ctx);
+
+        assert_eq!(app.grid_layout, PanelLayout::One);
+        assert_eq!(app.sidebar_tab, SidebarTab::Data);
+        assert!(app.archive_load_loop);
+        assert_eq!(app.archive_frame_count, DEFAULT_ARCHIVE_FRAME_COUNT);
+        assert_eq!(app.history_frame_limit, DEFAULT_ARCHIVE_FRAME_COUNT);
+        assert!(!app.realtime_level2_auto_refresh);
+        assert!(!app.poll_active);
+        assert!(app.hazards_visible);
+        assert!(!app.hazards_active_only);
+        assert_eq!(app.spc_outlooks_enabled, vec!["cat".to_owned()]);
+        assert!(app.spc_reports_enabled);
+
+        app.restore_previous_workflow(&ctx);
+
+        assert_eq!(app.current_workflow, None);
+        assert!(app.previous_workflow_snapshot.is_none());
+        assert_eq!(app.status, "Restored setup before workflow");
+        assert_eq!(app.grid_layout, PanelLayout::FourGrid);
+        assert_eq!(app.app_settings.grid_pane_count, 4);
+        assert_eq!(app.active_pane, 2);
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Velocity)
+        );
+        assert_eq!(app.selected_cut, 1);
+        assert_eq!(
+            app.extra_panes[0].product,
+            DisplayProduct::DealiasedVelocity
+        );
+        assert_eq!(app.extra_panes[0].cut, Some(3));
+        assert_eq!(
+            app.extra_panes[1].product,
+            DisplayProduct::Moment(MomentType::SpectrumWidth)
+        );
+        assert_eq!(app.extra_panes[1].cut, Some(2));
+        assert_eq!(app.sidebar_tab, SidebarTab::Settings);
+        assert!(!app.hazards_visible);
+        assert!(app.hazards_active_only);
+        assert_eq!(app.spc_outlooks_enabled, vec!["torn", "hail"]);
+        assert!(!app.spc_reports_enabled);
+        assert!(!app.archive_load_loop);
+        assert_eq!(app.archive_frame_count, 3);
+        assert_eq!(app.history_frame_limit, 7);
+        assert!(!app.app_settings.archive_load_loop);
+        assert_eq!(app.app_settings.archive_frame_count, 3);
+        assert!(app.realtime_level2_auto_refresh);
+        assert!(app.poll_active);
+        assert!(app.history_playing);
+    }
+
+    #[test]
+    fn workflow_restore_closes_model_context_window_when_it_was_hidden() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.model_enabled = false;
+        app.model_download_open = false;
+        app.obs_enabled = false;
+        app.obs_adjust_soundings = false;
+        app.glm_enabled = false;
+
+        app.apply_workflow_preset(WorkflowPreset::ModelContext, &ctx);
+
+        assert_eq!(app.grid_layout, PanelLayout::TwoVertical);
+        assert_eq!(app.sidebar_tab, SidebarTab::Layers);
+        assert!(app.model_enabled);
+        assert!(app.model_download_open);
+        assert!(app.viewer_open(dock::WorkspacePane::Model));
+        assert!(app.obs_enabled);
+        assert!(app.obs_adjust_soundings);
+        assert!(app.glm_enabled);
+
+        app.restore_previous_workflow(&ctx);
+
+        assert_eq!(app.grid_layout, PanelLayout::One);
+        assert_eq!(app.app_settings.grid_pane_count, 1);
+        assert_eq!(app.sidebar_tab, SidebarTab::Radar);
+        assert!(!app.model_enabled);
+        assert!(!app.model_download_open);
+        assert!(!app.viewer_open(dock::WorkspacePane::Model));
+        assert!(!app.workspace.is_docked(dock::WorkspacePane::Model));
+        assert!(!app.obs_enabled);
+        assert!(!app.obs_adjust_soundings);
+        assert!(!app.glm_enabled);
+    }
+
+    #[test]
+    fn documentation_workflow_hides_temporary_map_measurements_and_restores_them() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.cross_section_armed = true;
+        app.cross_section_a_lonlat = Some((-97.7, 35.1));
+        app.cross_section_b_lonlat = Some((-96.9, 35.5));
+        app.cross_section_status = "Cross-section: 42 km".to_owned();
+        app.annotations.active_tool = Some(annotate::ToolKind::Box);
+        app.annotations.draft = Some(annotate::Annotation::Box {
+            a: annotate::GeoPoint {
+                lon: -97.4,
+                lat: 35.0,
+            },
+            b: annotate::GeoPoint {
+                lon: -97.2,
+                lat: 35.2,
+            },
+            style: annotate::ShapeStyle::default(),
+        });
+        app.annotations.hover_geo = Some(annotate::GeoPoint {
+            lon: -97.1,
+            lat: 35.3,
+        });
+        app.annotations
+            .shapes
+            .push(annotate::Annotation::Crosshair {
+                at: annotate::GeoPoint {
+                    lon: -97.3,
+                    lat: 35.1,
+                },
+                style: annotate::ShapeStyle::default(),
+            });
+
+        app.apply_workflow_preset(WorkflowPreset::Documentation, &ctx);
+
+        assert!(app.chrome_hidden);
+        assert!(!app.cross_section_armed);
+        assert!(app.cross_section_a_lonlat.is_none());
+        assert!(app.cross_section_b_lonlat.is_none());
+        assert!(app.cross_section_texture.is_none());
+        assert!(app.cross_section_signature.is_none());
+        assert_eq!(
+            app.cross_section_status,
+            "Cross-section: arm, then click endpoint A then B"
+        );
+        assert!(app.annotations.active_tool.is_none());
+        assert!(app.annotations.draft.is_none());
+        assert!(app.annotations.hover_geo.is_none());
+        assert_eq!(app.annotations.shapes.len(), 1);
+
+        app.restore_previous_workflow(&ctx);
+
+        assert!(app.cross_section_armed);
+        assert_eq!(app.cross_section_a_lonlat, Some((-97.7, 35.1)));
+        assert_eq!(app.cross_section_b_lonlat, Some((-96.9, 35.5)));
+        assert_eq!(app.cross_section_status, "Cross-section: 42 km");
+        assert_eq!(app.annotations.active_tool, Some(annotate::ToolKind::Box));
+        assert!(matches!(
+            app.annotations.draft,
+            Some(annotate::Annotation::Box { .. })
+        ));
+        assert_eq!(
+            app.annotations.hover_geo,
+            Some(annotate::GeoPoint {
+                lon: -97.1,
+                lat: 35.3,
+            })
+        );
+        assert_eq!(app.annotations.shapes.len(), 1);
+    }
+
+    #[test]
+    fn archive_review_workflow_restores_loop_fetch_count() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.archive_load_loop = false;
+        app.archive_frame_count = 1;
+        app.history_frame_limit = 3;
+        app.app_settings.archive_load_loop = false;
+        app.app_settings.archive_frame_count = 1;
+        let ctx = egui::Context::default();
+
+        app.apply_workflow_preset(WorkflowPreset::ArchiveReview, &ctx);
+
+        assert!(app.archive_load_loop);
+        assert_eq!(app.archive_frame_count, DEFAULT_ARCHIVE_FRAME_COUNT);
+        assert_eq!(app.history_frame_limit, DEFAULT_ARCHIVE_FRAME_COUNT);
+        assert!(app.app_settings.archive_load_loop);
+        assert_eq!(
+            app.app_settings.archive_frame_count,
+            DEFAULT_ARCHIVE_FRAME_COUNT as u16
+        );
+    }
+
+    #[test]
+    fn display_time_zone_formats_utc_and_us_dst_labels() {
+        let summer = Utc.with_ymd_and_hms(2026, 6, 13, 1, 30, 0).unwrap();
+        let winter = Utc.with_ymd_and_hms(2026, 1, 13, 1, 30, 0).unwrap();
+
+        assert_eq!(DisplayTimeZone::from_slug("est"), DisplayTimeZone::Eastern);
+        assert_eq!(DisplayTimeZone::from_slug("bogus"), DisplayTimeZone::Utc);
+        assert_eq!(DisplayTimeZone::Utc.format_hms(summer), "01:30:00Z");
+        assert_eq!(DisplayTimeZone::Eastern.format_hms(summer), "21:30:00 EDT");
+        assert_eq!(
+            DisplayTimeZone::Eastern.format_date_hms(summer),
+            "2026-06-12 21:30:00 EDT"
+        );
+        assert_eq!(DisplayTimeZone::Central.format_hm(summer), "20:30 CDT");
+        assert_eq!(DisplayTimeZone::Pacific.format_hms(winter), "17:30:00 PST");
+    }
+
+    #[test]
+    fn display_time_zone_switches_on_us_dst_boundaries() {
+        let before_start = Utc.with_ymd_and_hms(2026, 3, 8, 6, 59, 0).unwrap();
+        let after_start = Utc.with_ymd_and_hms(2026, 3, 8, 7, 0, 0).unwrap();
+        let before_end = Utc.with_ymd_and_hms(2026, 11, 1, 5, 59, 0).unwrap();
+        let after_end = Utc.with_ymd_and_hms(2026, 11, 1, 6, 0, 0).unwrap();
+
+        assert_eq!(
+            DisplayTimeZone::Eastern.format_hms(before_start),
+            "01:59:00 EST"
+        );
+        assert_eq!(
+            DisplayTimeZone::Eastern.format_hms(after_start),
+            "03:00:00 EDT"
+        );
+        assert_eq!(
+            DisplayTimeZone::Eastern.format_hms(before_end),
+            "01:59:00 EDT"
+        );
+        assert_eq!(
+            DisplayTimeZone::Eastern.format_hms(after_end),
+            "01:00:00 EST"
+        );
+    }
+
+    #[test]
+    fn velocity_workflow_sets_two_pane_vrot_velocity_state() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(Arc::new(test_ref_then_velocity_volume()));
+        let ctx = egui::Context::default();
+
+        app.apply_workflow_preset(WorkflowPreset::VelocityCouplet, &ctx);
+
+        assert_eq!(app.grid_layout, PanelLayout::TwoVertical);
+        assert_eq!(app.app_settings.grid_pane_count, 2);
+        assert_eq!(app.selected_product, DisplayProduct::DealiasedVelocity);
+        assert_eq!(app.selected_cut, 1);
+        assert_eq!(
+            app.extra_panes[0].product,
+            DisplayProduct::StormRelativeDealiasedVelocity
+        );
+        assert!(app.vrot_tool_armed);
+        assert!(app.show_inspector_card);
+    }
+
+    #[test]
+    fn triple_severe_workflow_sets_three_pane_review_state() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+
+        app.apply_workflow_preset(WorkflowPreset::TripleSevere, &ctx);
+
+        assert_eq!(app.grid_layout, PanelLayout::ThreeStacked);
+        assert_eq!(app.app_settings.grid_pane_count, 3);
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Reflectivity)
+        );
+        let pane_products: Vec<DisplayProduct> = app
+            .extra_panes
+            .iter()
+            .map(|pane| pane.product.clone())
+            .collect();
+        assert_eq!(
+            pane_products,
+            vec![
+                DisplayProduct::DealiasedVelocity,
+                DisplayProduct::Moment(MomentType::CorrelationCoefficient),
+            ]
+        );
+        assert!(app.hazards_visible);
+        assert!(app.hazards_active_only);
+        assert!(app.show_rotation_markers);
+        assert!(!app.vrot_tool_armed);
+    }
+
+    #[test]
+    fn quad_dual_pol_workflow_sets_expected_panes() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+
+        app.apply_workflow_preset(WorkflowPreset::QuadDualPol, &ctx);
+
+        assert_eq!(app.grid_layout, PanelLayout::FourGrid);
+        assert_eq!(app.app_settings.grid_pane_count, 4);
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Reflectivity)
+        );
+        let pane_products: Vec<DisplayProduct> = app
+            .extra_panes
+            .iter()
+            .map(|pane| pane.product.clone())
+            .collect();
+        assert_eq!(
+            pane_products,
+            vec![
+                DisplayProduct::Moment(MomentType::Velocity),
+                DisplayProduct::Moment(MomentType::CorrelationCoefficient),
+                DisplayProduct::Moment(MomentType::DifferentialReflectivity),
+            ]
+        );
+        assert!(!app.vrot_tool_armed);
     }
 
     #[test]

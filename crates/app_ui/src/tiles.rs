@@ -199,6 +199,17 @@ impl TileLayer {
         None
     }
 
+    /// Drop in-memory tile state after the on-disk tile cache is cleared.
+    pub fn clear_memory(&mut self) {
+        self.textures.clear();
+        self.lru.clear();
+        self.pending.clear();
+        self.failed.clear();
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.clear();
+        }
+    }
+
     /// Queue a fetch for a missing tile (newest requests first).
     pub fn request(&mut self, style: TileStyle, tile: TileId) {
         if std::env::var_os("BOWECHO_TILE_DEBUG").is_some() {

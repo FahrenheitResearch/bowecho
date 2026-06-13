@@ -32,6 +32,7 @@ use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use radar_core::{
     GateRange, MomentGrid, MomentRow, MomentType, RadarSite, RadarVolume, Radial, ScanMode,
 };
+use std::collections::BTreeMap;
 
 pub use crate::hdf5lite::looks_like_hdf5_bytes;
 use crate::hdf5lite::{H5Attr, H5Data, H5File};
@@ -157,6 +158,7 @@ fn decode_sweep(
         });
     }
 
+    let mut canonical_priorities = BTreeMap::<MomentType, u8>::new();
     for plane_name in &data_names {
         let what_path = format!("/{dataset}/{plane_name}/what");
         let quantity = file
@@ -179,9 +181,14 @@ fn decode_sweep(
             continue;
         }
 
-        let moment = match canonical_quantity(&quantity) {
-            Some(moment) if !cut.moments.contains_key(&moment) => moment,
-            _ => MomentType::Unknown(quantity.clone()),
+        let canonical = canonical_quantity(&quantity);
+        let Some(moment) = decode_moment_for_quantity(
+            &quantity,
+            canonical.clone(),
+            &canonical_priorities,
+            &cut.moments,
+        ) else {
+            continue;
         };
         // ODIM physical = gain·raw + offset ⇔ grid (raw − o)/s with
         // s = 1/gain, o = −offset/gain.
@@ -262,6 +269,9 @@ fn decode_sweep(
             }
         };
         grid.moment = moment.clone();
+        if let Some(canonical) = canonical {
+            canonical_priorities.insert(canonical, canonical_quantity_priority(&quantity));
+        }
         cut.moments.insert(moment, grid);
     }
     volume.cuts.push(cut);
@@ -291,6 +301,43 @@ fn canonical_quantity(quantity: &str) -> Option<MomentType> {
         "PHIDP" | "PHIDPU" | "UPHIDP" => Some(MomentType::DifferentialPhase),
         "KDP" | "KDPU" => Some(MomentType::SpecificDifferentialPhase),
         _ => None,
+    }
+}
+
+fn canonical_quantity_priority(quantity: &str) -> u8 {
+    match quantity {
+        // Prefer filtered reflectivity when a file carries both DBZH and
+        // unfiltered TH/TV. ODIM writers do not guarantee plane order.
+        "DBZH" | "DBZV" => 30,
+        "DBZ" => 25,
+        "TH" | "TV" => 10,
+        // Prefer filtered dual-pol spellings over explicitly unfiltered ones.
+        "ZDR" | "RHOHV" | "PHIDP" | "KDP" => 30,
+        "ZDRU" | "UZDR" | "RHOHVU" | "URHOHV" | "PHIDPU" | "UPHIDP" | "KDPU" => 10,
+        _ => 20,
+    }
+}
+
+fn decode_moment_for_quantity(
+    quantity: &str,
+    canonical: Option<MomentType>,
+    canonical_priorities: &BTreeMap<MomentType, u8>,
+    existing_moments: &BTreeMap<MomentType, MomentGrid>,
+) -> Option<MomentType> {
+    match canonical {
+        Some(moment) => {
+            let priority = canonical_quantity_priority(quantity);
+            let existing_priority = canonical_priorities.get(&moment).copied();
+            if existing_priority.is_none_or(|existing| priority > existing) {
+                Some(moment)
+            } else {
+                None
+            }
+        }
+        None => {
+            let unknown = MomentType::Unknown(quantity.to_owned());
+            (!existing_moments.contains_key(&unknown)).then_some(unknown)
+        }
     }
 }
 
@@ -370,6 +417,31 @@ mod tests {
             Some(MomentType::CorrelationCoefficient)
         );
         assert_eq!(canonical_quantity("QIND"), None);
+    }
+
+    #[test]
+    fn filtered_odim_quantities_win_duplicate_canonical_moments() {
+        let mut priorities = BTreeMap::new();
+        let moments = BTreeMap::new();
+        let reflectivity = Some(MomentType::Reflectivity);
+
+        assert_eq!(
+            decode_moment_for_quantity("TH", reflectivity.clone(), &priorities, &moments),
+            Some(MomentType::Reflectivity)
+        );
+        priorities.insert(MomentType::Reflectivity, canonical_quantity_priority("TH"));
+        assert_eq!(
+            decode_moment_for_quantity("DBZH", reflectivity.clone(), &priorities, &moments),
+            Some(MomentType::Reflectivity)
+        );
+        priorities.insert(
+            MomentType::Reflectivity,
+            canonical_quantity_priority("DBZH"),
+        );
+        assert_eq!(
+            decode_moment_for_quantity("TH", reflectivity, &priorities, &moments),
+            None
+        );
     }
 
     #[test]
