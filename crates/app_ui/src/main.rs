@@ -8295,16 +8295,18 @@ impl ViewerApp {
         rect: egui::Rect,
         pane_number: usize,
     ) {
-        if self.volume.is_none() {
-            return;
-        }
         let Some(pane) = pane_number
             .checked_sub(1)
             .and_then(|slot| self.extra_panes.get(slot))
         else {
             return;
         };
-        let Some((latitude_deg, longitude_deg)) = self.radar_location() else {
+        let Some(volume) = pane.volume.as_ref().or(self.volume.as_ref()) else {
+            return;
+        };
+        let Some((latitude_deg, longitude_deg)) =
+            volume.site.latitude_deg.zip(volume.site.longitude_deg)
+        else {
             return;
         };
         if let Some(texture) = &pane.texture {
@@ -8321,6 +8323,31 @@ impl ViewerApp {
                 self.lon_lat_to_screen(rect, longitude_deg, latitude_deg),
                 self.aeqd_north_angle(rect, latitude_deg, longitude_deg) - baked,
                 egui::Color32::from_white_alpha((self.radar_opacity * 255.0) as u8),
+            );
+        }
+        if self.style_registry.radar_age().ring_enabled {
+            let cut = pane
+                .texture_key
+                .as_ref()
+                .map(|key| key.cut)
+                .unwrap_or_else(|| pane.cut.unwrap_or(self.selected_cut));
+            let product = pane
+                .texture_key
+                .as_ref()
+                .map(|key| &key.product)
+                .unwrap_or(&pane.product);
+            let range_km = selected_grid_range_km_for(volume.as_ref(), cut, product)
+                .unwrap_or(DEFAULT_RADAR_RANGE_KM);
+            self.draw_range_ring(
+                painter,
+                rect,
+                latitude_deg,
+                longitude_deg,
+                range_km,
+                egui::Stroke::new(
+                    self.style_registry.range_rings().primary_width,
+                    self.data_edge_ring_color(volume.volume_time.with_timezone(&Utc), 230),
+                ),
             );
         }
     }
@@ -23832,6 +23859,196 @@ impl ViewerApp {
         occupied.push(rect);
     }
 
+    fn intl_site_marker_active(&self, site: &data_source::international::IntlSite) -> bool {
+        if let Some(volume) = &self.volume {
+            let volume_id = volume.site.id.as_str();
+            return volume_id.eq_ignore_ascii_case(&site.site_id)
+                || volume_id.eq_ignore_ascii_case(&site.label);
+        }
+        matches!(
+            &self.poll_source,
+            PollSource::Intl { provider_id, site_id }
+                if self.poll_active
+                    && provider_id == site.provider_id
+                    && site_id.eq_ignore_ascii_case(&site.site_id)
+        )
+    }
+
+    fn intl_site_marker_should_label(&self, selected: bool) -> bool {
+        self.app_settings.show_radar_labels && (selected || self.map_scale >= SITE_LABEL_MIN_SCALE)
+    }
+
+    fn intl_site_marker_label_parts(
+        &self,
+        site: &data_source::international::IntlSite,
+        selected: bool,
+    ) -> (RadarLabelStyle, String, f32, egui::Color32, egui::Vec2) {
+        let style = RadarLabelStyle::from_key(&self.app_settings.radar_label_style);
+        let label = match style {
+            RadarLabelStyle::IdBox => site.site_id.to_ascii_uppercase(),
+            RadarLabelStyle::FullBox | RadarLabelStyle::Text => site.label.clone(),
+        };
+        let font_px = if selected { 13.0 } else { 11.0 };
+        let text_color = match style {
+            RadarLabelStyle::FullBox => egui::Color32::from_rgb(26, 20, 7),
+            RadarLabelStyle::IdBox => egui::Color32::from_rgb(255, 232, 168),
+            RadarLabelStyle::Text => egui::Color32::from_rgb(255, 235, 198),
+        };
+        let padding = match style {
+            RadarLabelStyle::Text => egui::vec2(8.0, 4.0),
+            RadarLabelStyle::IdBox => egui::vec2(10.0, 5.0),
+            RadarLabelStyle::FullBox => egui::vec2(8.0, 4.0),
+        };
+        (style, label, font_px, text_color, padding)
+    }
+
+    fn intl_site_marker_label_rect(
+        &self,
+        position: egui::Pos2,
+        site: &data_source::international::IntlSite,
+        selected: bool,
+    ) -> egui::Rect {
+        let (_style, label, font_px, _text_color, padding) =
+            self.intl_site_marker_label_parts(site, selected);
+        let text_width = label.chars().count() as f32 * font_px * 0.64;
+        let text_height = font_px * 1.25;
+        egui::Rect::from_min_size(
+            position + egui::vec2(10.0, -12.0),
+            egui::vec2(text_width, text_height) + padding,
+        )
+    }
+
+    fn nearest_intl_marker_within(
+        &self,
+        intl_points: &[(usize, egui::Pos2)],
+        pointer: egui::Pos2,
+    ) -> Option<(usize, f32)> {
+        let marker_hit = nearest_marker_within(intl_points, pointer);
+        let sites = data_source::international::intl_static_sites();
+        let mut occupied = Vec::with_capacity(intl_points.len().min(48));
+        let label_hit = intl_points
+            .iter()
+            .filter_map(|(index, position)| {
+                let site = sites.get(*index)?;
+                let selected = self.intl_site_marker_active(site);
+                if !self.intl_site_marker_should_label(selected) {
+                    return None;
+                }
+                let rect = self.intl_site_marker_label_rect(*position, site, selected);
+                if !selected
+                    && occupied
+                        .iter()
+                        .any(|existing: &egui::Rect| existing.intersects(rect.expand(2.0)))
+                {
+                    return None;
+                }
+                occupied.push(rect);
+                rect.expand(2.0)
+                    .contains(pointer)
+                    .then_some((*index, 0.0_f32))
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1));
+
+        match (marker_hit, label_hit) {
+            (Some(marker), Some(label)) => {
+                if marker.1 <= label.1 {
+                    Some(marker)
+                } else {
+                    Some(label)
+                }
+            }
+            (Some(marker), None) => Some(marker),
+            (None, Some(label)) => Some(label),
+            (None, None) => None,
+        }
+    }
+
+    fn draw_intl_site_marker_label(
+        &self,
+        painter: &egui::Painter,
+        position: egui::Pos2,
+        site: &data_source::international::IntlSite,
+        selected: bool,
+        occupied: &mut Vec<egui::Rect>,
+    ) {
+        let (style, label, font_px, text_color, _padding) =
+            self.intl_site_marker_label_parts(site, selected);
+        let rect = self.intl_site_marker_label_rect(position, site, selected);
+        if !selected
+            && occupied
+                .iter()
+                .any(|existing| existing.intersects(rect.expand(2.0)))
+        {
+            return;
+        }
+        match style {
+            RadarLabelStyle::Text => {
+                draw_halo_text(
+                    painter,
+                    rect.left_center(),
+                    egui::Align2::LEFT_CENTER,
+                    &label,
+                    egui::FontId::proportional(font_px),
+                    text_color,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
+                );
+            }
+            RadarLabelStyle::IdBox => {
+                let radius = rect.height() * 0.5;
+                painter.rect_filled(
+                    rect,
+                    radius,
+                    egui::Color32::from_rgba_unmultiplied(
+                        2,
+                        4,
+                        7,
+                        if selected { 236 } else { 204 },
+                    ),
+                );
+                painter.rect_stroke(
+                    rect,
+                    radius,
+                    egui::Stroke::new(
+                        if selected { 1.7 } else { 1.2 },
+                        if selected {
+                            egui::Color32::from_rgb(255, 240, 214)
+                        } else {
+                            egui::Color32::from_rgb(196, 156, 84)
+                        },
+                    ),
+                    egui::StrokeKind::Outside,
+                );
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &label,
+                    egui::FontId::proportional(font_px),
+                    text_color,
+                );
+            }
+            RadarLabelStyle::FullBox => {
+                painter.rect_filled(
+                    rect,
+                    3.0,
+                    egui::Color32::from_rgba_unmultiplied(
+                        255,
+                        202,
+                        92,
+                        if selected { 245 } else { 218 },
+                    ),
+                );
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &label,
+                    egui::FontId::proportional(font_px),
+                    text_color,
+                );
+            }
+        }
+        occupied.push(rect);
+    }
+
     /// Screen positions of the international static-catalog markers inside
     /// `rect` — the same viewport culling as the CONUS `site_points` pass,
     /// so a CONUS view never pays for (or shows) markers a continent away.
@@ -23919,7 +24136,7 @@ impl ViewerApp {
         let open_menu = self.community_menu.take();
         match resolve_marker_click(
             self.nearest_site_marker_within(site_points, pointer),
-            nearest_marker_within(intl_points, pointer),
+            self.nearest_intl_marker_within(intl_points, pointer),
             nearest_marker_within(community_points, pointer),
             nearest_marker_within(custom_poll_points, pointer),
             nearest_marker_within(raob_points, pointer),
@@ -23982,7 +24199,7 @@ impl ViewerApp {
     ) -> bool {
         match resolve_marker_click(
             self.nearest_site_marker_within(site_points, pointer),
-            nearest_marker_within(intl_points, pointer),
+            self.nearest_intl_marker_within(intl_points, pointer),
             nearest_marker_within(community_points, pointer),
             nearest_marker_within(custom_poll_points, pointer),
             nearest_marker_within(raob_points, pointer),
@@ -24080,7 +24297,9 @@ impl ViewerApp {
         let marker_hit = self
             .nearest_site_marker_within(site_points, pointer)
             .is_some()
-            || nearest_marker_within(intl_points, pointer).is_some()
+            || self
+                .nearest_intl_marker_within(intl_points, pointer)
+                .is_some()
             || nearest_marker_within(community_points, pointer).is_some()
             || nearest_marker_within(custom_poll_points, pointer).is_some()
             || nearest_marker_within(raob_points, pointer).is_some();
@@ -24121,13 +24340,6 @@ impl ViewerApp {
             return;
         }
         let sites = data_source::international::intl_static_sites();
-        let active = match &self.poll_source {
-            PollSource::Intl {
-                provider_id,
-                site_id,
-            } if self.poll_active => Some((provider_id.as_str(), site_id.as_str())),
-            _ => None,
-        };
         // Warm amber against the cool CONUS site dots.
         const INTL_IDLE: egui::Color32 = egui::Color32::from_rgb(196, 156, 84);
         const INTL_LIT: egui::Color32 = egui::Color32::from_rgb(255, 214, 130);
@@ -24135,7 +24347,7 @@ impl ViewerApp {
             let Some(site) = sites.get(*index) else {
                 continue;
             };
-            let is_active = active == Some((site.provider_id, site.site_id.as_str()));
+            let is_active = self.intl_site_marker_active(site);
             let is_hovered = hovered == Some(*index);
             if is_active {
                 painter.circle_filled(*position, 5.5, INTL_LIT);
@@ -24143,13 +24355,6 @@ impl ViewerApp {
                     *position,
                     10.0,
                     egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 240, 214)),
-                );
-                painter.text(
-                    *position + egui::vec2(12.0, -10.0),
-                    egui::Align2::LEFT_CENTER,
-                    &site.label,
-                    egui::FontId::proportional(13.0),
-                    egui::Color32::from_rgb(255, 244, 224),
                 );
             } else {
                 // Hollow ring: selectable, but not the live poll target.
@@ -24182,6 +24387,22 @@ impl ViewerApp {
                     &text,
                     egui::FontId::proportional(11.0),
                     egui::Color32::from_rgb(238, 226, 200),
+                );
+            }
+        }
+        let mut occupied = Vec::with_capacity(intl_points.len().min(48));
+        for (index, position) in intl_points {
+            let Some(site) = sites.get(*index) else {
+                continue;
+            };
+            let is_active = self.intl_site_marker_active(site);
+            if self.intl_site_marker_should_label(is_active) {
+                self.draw_intl_site_marker_label(
+                    painter,
+                    *position,
+                    site,
+                    is_active,
+                    &mut occupied,
                 );
             }
         }
@@ -33784,6 +34005,33 @@ mod tests {
 
         app.app_settings.show_radar_labels = false;
         assert_eq!(app.nearest_site_marker_within(&points, pointer), None);
+    }
+
+    #[test]
+    fn visible_international_label_box_is_clickable_like_the_marker() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.map_scale = SITE_LABEL_MIN_SCALE + 10.0;
+        app.app_settings.show_radar_labels = true;
+        app.app_settings.radar_label_style = "id-box".to_owned();
+
+        let sites = data_source::international::intl_static_sites();
+        let site = sites.first().expect("static international sites");
+        let position = egui::pos2(100.0, 100.0);
+        let points = vec![(0, position)];
+        let pointer = app
+            .intl_site_marker_label_rect(position, site, false)
+            .center();
+        assert!(
+            position.distance(pointer) > 12.0,
+            "test point must be outside the old dot-only click halo"
+        );
+        assert_eq!(
+            app.nearest_intl_marker_within(&points, pointer),
+            Some((0, 0.0))
+        );
+
+        app.app_settings.show_radar_labels = false;
+        assert_eq!(app.nearest_intl_marker_within(&points, pointer), None);
     }
 
     /// The map-marker catalog the intl markers draw from: embedded tables
