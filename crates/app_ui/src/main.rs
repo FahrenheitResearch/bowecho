@@ -7825,6 +7825,10 @@ impl ViewerApp {
             display_live_chunk_updates,
             require_complete_live_cut,
         );
+        let site_changed = pane
+            .volume
+            .as_ref()
+            .is_none_or(|existing| !existing.site.id.eq_ignore_ascii_case(&volume.site.id));
         if let Some(source_path) = source_path {
             pane.source_path = Some(source_path);
         }
@@ -7832,8 +7836,9 @@ impl ViewerApp {
         pane.pinned_site_id = Some(volume.site.id.clone());
         pane.volume = Some(Arc::clone(&volume));
         pane.pending_site_id = None;
-        if let (Some(latitude_deg), Some(longitude_deg)) =
-            (volume.site.latitude_deg, volume.site.longitude_deg)
+        if site_changed
+            && let (Some(latitude_deg), Some(longitude_deg)) =
+                (volume.site.latitude_deg, volume.site.longitude_deg)
         {
             pane.map_center_lat = latitude_deg.clamp(-85.0, 85.0);
             pane.map_center_lon = normalize_lon(longitude_deg);
@@ -16742,6 +16747,10 @@ impl ViewerApp {
     /// (the same paths as their map markers and pickers). Explicit picks
     /// always win — every path replaces/clears the in-flight receivers.
     fn activate_beam_target(&mut self, candidate: &BeamCandidate, ctx: &egui::Context) {
+        if let Some(pane_slot) = self.independent_editing_pane() {
+            self.activate_beam_target_for_extra_pane(pane_slot, candidate, ctx);
+            return;
+        }
         match &candidate.target {
             BeamTarget::Conus(index) => {
                 self.selected_site_index = *index;
@@ -23440,6 +23449,19 @@ impl ViewerApp {
         pointer: egui::Pos2,
         ctx: &egui::Context,
     ) {
+        if let Some(pane_slot) = self.independent_editing_pane() {
+            self.handle_extra_pane_marker_click(
+                pane_slot,
+                site_points,
+                intl_points,
+                community_points,
+                custom_poll_points,
+                raob_points,
+                pointer,
+                ctx,
+            );
+            return;
+        }
         // Any map click dismisses an open cluster picker (clicks on the
         // picker itself land on its foreground layer, never here); a
         // cluster-marker hit below re-opens it, so re-clicking toggles.
@@ -23506,7 +23528,7 @@ impl ViewerApp {
         raob_points: &[(usize, egui::Pos2)],
         pointer: egui::Pos2,
         ctx: &egui::Context,
-    ) {
+    ) -> bool {
         match resolve_marker_click(
             nearest_marker_within(site_points, pointer),
             nearest_marker_within(intl_points, pointer),
@@ -23516,8 +23538,9 @@ impl ViewerApp {
         ) {
             Some((MarkerFamily::Conus, index)) => {
                 let Some(site) = self.sites.get(index).cloned() else {
-                    return;
+                    return false;
                 };
+                let site_id = site.level2_id.clone();
                 self.set_extra_pane_selected_site(pane_slot, index);
                 self.start_extra_pane_latest_load(pane_slot, site, ctx);
                 if let Some(pane) = self.extra_panes.get(pane_slot) {
@@ -23525,10 +23548,12 @@ impl ViewerApp {
                     self.map_center_lon = pane.map_center_lon;
                     self.map_scale = pane.map_scale;
                 }
+                self.status = format!("Pane {} loading latest L2 {site_id}", pane_slot + 2);
+                true
             }
             Some((MarkerFamily::Intl, index)) => {
                 let Some(site) = data_source::international::intl_static_sites().get(index) else {
-                    return;
+                    return false;
                 };
                 let status = format!(
                     "{} is a live feed; independent panes currently load catalog Level II sites",
@@ -23538,11 +23563,12 @@ impl ViewerApp {
                     pane.status = status.clone();
                 }
                 self.status = status;
+                true
             }
             Some((MarkerFamily::Community, index)) => {
                 let Some(marker) = data_source::community_feeds::community_markers().get(index)
                 else {
-                    return;
+                    return false;
                 };
                 let status = format!(
                     "{} is a live feed; independent panes currently load catalog Level II sites",
@@ -23552,6 +23578,7 @@ impl ViewerApp {
                     pane.status = status.clone();
                 }
                 self.status = status;
+                true
             }
             Some((MarkerFamily::CustomPoll, index)) => {
                 let label = self
@@ -23567,14 +23594,16 @@ impl ViewerApp {
                     pane.status = status.clone();
                 }
                 self.status = status;
+                true
             }
             Some((MarkerFamily::Raob, index)) => {
                 let Some(site) = self.raob_marker_sites().get(index).cloned() else {
-                    return;
+                    return false;
                 };
                 self.start_raob_sounding_for(site, None, ctx);
+                true
             }
-            None => {}
+            None => false,
         }
     }
 
@@ -32650,6 +32679,53 @@ mod tests {
         assert!(pane.history_playing);
         assert!(!pane.browsing_history);
         assert!(pane.status.contains("Playing 2 frames"));
+    }
+
+    #[test]
+    fn independent_pane_frame_step_preserves_zoom_for_same_site_loop() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.extra_panes
+            .push(ViewPane::new(DisplayProduct::DealiasedVelocity));
+        let ctx = egui::Context::default();
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+        let mut first = test_ref_then_velocity_volume();
+        first.site.id = "KTLX".to_owned();
+        first.site.latitude_deg = Some(35.333);
+        first.site.longitude_deg = Some(-97.278);
+        first.volume_time = scan_time;
+        let mut second = first.clone();
+        second.volume_time = scan_time + chrono::Duration::minutes(3);
+
+        app.install_extra_pane_decoded_load_batch(
+            0,
+            DecodedLoadBatch {
+                frames: vec![
+                    test_decoded_from_volume(
+                        PathBuf::from("KTLX-0130"),
+                        first,
+                        FrameStatus::Complete,
+                    ),
+                    test_decoded_from_volume(
+                        PathBuf::from("KTLX-0133"),
+                        second,
+                        FrameStatus::Complete,
+                    ),
+                ],
+                selected_index: 0,
+            },
+            true,
+            &ctx,
+        );
+        app.extra_panes[0].map_center_lat = 35.91;
+        app.extra_panes[0].map_center_lon = -96.82;
+        app.extra_panes[0].map_scale = 980.0;
+
+        app.select_extra_pane_history_frame(0, 1, &ctx);
+
+        assert_eq!(app.extra_panes[0].selected_frame_index, 1);
+        assert!((app.extra_panes[0].map_center_lat - 35.91).abs() < 0.001);
+        assert!((app.extra_panes[0].map_center_lon + 96.82).abs() < 0.001);
+        assert_eq!(app.extra_panes[0].map_scale, 980.0);
     }
 
     #[test]
