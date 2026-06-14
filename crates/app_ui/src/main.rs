@@ -17631,13 +17631,18 @@ impl ViewerApp {
         };
         let current_key = Some((self.spc_day, archive_date));
         let key_changed = wants && self.spc_last_key != current_key;
+        let refresh_after = if archive_date.is_none() && self.spc_data.outlook_geojson_lagging {
+            Duration::from_secs(20)
+        } else {
+            Duration::from_secs(300)
+        };
         if wants
             && self.spc_rx.is_none()
             && (key_changed
                 || self
                     .spc_data
                     .fetched_at
-                    .map(|at| at.elapsed() > Duration::from_secs(300))
+                    .map(|at| at.elapsed() > refresh_after)
                     .unwrap_or(true))
         {
             let (sender, receiver) = mpsc::channel();
@@ -19194,16 +19199,26 @@ impl ViewerApp {
                     if !bbox.intersects(rect) {
                         continue;
                     }
-                    painter.add(egui::Shape::closed_line(
-                        screen.clone(),
-                        egui::Stroke::new(spc_style.outlook_stroke_width, stroke_color),
-                    ));
+                    let ring_is_closed = screen
+                        .first()
+                        .zip(screen.last())
+                        .map(|(first, last)| first.distance(*last) <= 0.5)
+                        .unwrap_or(false);
+                    let stroke = egui::Stroke::new(spc_style.outlook_stroke_width, stroke_color);
+                    if ring_is_closed {
+                        painter.add(egui::Shape::closed_line(screen.clone(), stroke));
+                    } else {
+                        painter.add(egui::Shape::line(screen.clone(), stroke));
+                    }
                     // Translucent interior wash: PROPER ear-clip tessellation
                     // (the warning-polygon path's own) — outlook rings are
                     // deeply concave, and a centroid fan sprays triangles
                     // across the map ("spokes" field report). The cleaner
                     // also absorbs SPC's unclosed/degenerate ring edge cases.
-                    if let Some(mesh) = filled_polygon_mesh(&screen, fill) {
+                    if feature.fill_enabled
+                        && ring_is_closed
+                        && let Some(mesh) = filled_polygon_mesh(&screen, fill)
+                    {
                         painter.add(egui::Shape::mesh(mesh));
                     }
                     if let Some(first) = screen.first() {

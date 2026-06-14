@@ -46,6 +46,10 @@ pub struct OutlookFeature {
     /// style registry's outlook alphas.
     pub fill: egui::Color32,
     pub stroke: egui::Color32,
+    /// Raw PTS point lists can be open "to the right of a line" outlines.
+    /// They may be useful as an early release signal, but they are not
+    /// always safe to fill as closed polygons.
+    pub fill_enabled: bool,
     /// Outer rings, (lon, lat).
     pub rings: Vec<Vec<(f32, f32)>>,
 }
@@ -56,6 +60,10 @@ pub struct SpcData {
     pub outlooks: Vec<(String, Vec<OutlookFeature>)>,
     pub reports: Vec<StormReport>,
     pub fetched_at: Option<Instant>,
+    /// Live raw PTS says a newer outlook issue exists than the GeoJSON
+    /// products we rendered. UI polling uses this to retry quickly while
+    /// staying on official GeoJSON geometry.
+    pub outlook_geojson_lagging: bool,
 }
 
 #[derive(Clone)]
@@ -209,9 +217,311 @@ pub fn parse_outlook(text: &str) -> Vec<OutlookFeature> {
                 label2,
                 fill,
                 stroke,
+                fill_enabled: true,
                 rings,
             });
         }
+    }
+    out
+}
+
+#[cfg(test)]
+fn geojson_valid_key(text: &str) -> Option<i64> {
+    let root = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let feature = root.get("features")?.as_array()?.first()?;
+    let valid = feature.get("properties")?.get("VALID")?;
+    if let Some(valid) = valid.as_str() {
+        valid.parse::<i64>().ok()
+    } else {
+        valid.as_i64()
+    }
+}
+
+fn shifted_year_month(year: i32, month: u32, offset: i32) -> (i32, u32) {
+    let zero_based = year * 12 + month as i32 - 1 + offset;
+    (
+        zero_based.div_euclid(12),
+        zero_based.rem_euclid(12) as u32 + 1,
+    )
+}
+
+fn infer_ddhhmm_time(token: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let token = token.trim_end_matches('Z');
+    if token.len() != 6 {
+        return None;
+    }
+    let day = token[0..2].parse::<u32>().ok()?;
+    let hour = token[2..4].parse::<u32>().ok()?;
+    let minute = token[4..6].parse::<u32>().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    let mut best: Option<(i64, i64)> = None;
+    for month_offset in -1..=1 {
+        let (year, month) = shifted_year_month(now.year(), now.month(), month_offset);
+        let Some(date) = NaiveDate::from_ymd_opt(year, month, day) else {
+            continue;
+        };
+        let Some(naive) = date.and_hms_opt(hour, minute, 0) else {
+            continue;
+        };
+        let candidate = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
+        let delta = (candidate - now).num_seconds().abs();
+        if best
+            .map(|(best_delta, _)| delta < best_delta)
+            .unwrap_or(true)
+        {
+            best = Some((delta, candidate.timestamp()));
+        }
+    }
+    best.and_then(|(_, timestamp)| DateTime::<Utc>::from_timestamp(timestamp, 0))
+}
+
+#[cfg(test)]
+fn issue_key(time: DateTime<Utc>) -> i64 {
+    (time.year() as i64) * 100_000_000
+        + (time.month() as i64) * 1_000_000
+        + (time.day() as i64) * 10_000
+        + (time.hour() as i64) * 100
+        + time.minute() as i64
+}
+
+#[cfg(test)]
+fn pts_valid_time(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let token = text.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let rest = trimmed.strip_prefix("VALID TIME ")?;
+        rest.split_whitespace().next()
+    })?;
+    infer_ddhhmm_time(token, now)
+}
+
+#[cfg(test)]
+fn pts_valid_key(text: &str, now: DateTime<Utc>) -> Option<i64> {
+    pts_valid_time(text, now).map(issue_key)
+}
+
+fn pts_issue_time(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let token = text
+        .lines()
+        .next()?
+        .split_whitespace()
+        .find(|part| part.len() == 6 && part.chars().all(|ch| ch.is_ascii_digit()))?;
+    infer_ddhhmm_time(token, now)
+}
+
+fn geojson_issue_time(text: &str) -> Option<DateTime<Utc>> {
+    let root = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let feature = root.get("features")?.as_array()?.first()?;
+    let props = feature.get("properties")?;
+    if let Some(issue_iso) = props.get("ISSUE_ISO").and_then(|v| v.as_str()) {
+        if let Ok(time) = DateTime::parse_from_rfc3339(issue_iso) {
+            return Some(time.with_timezone(&Utc));
+        }
+    }
+    let issue = props.get("ISSUE")?;
+    let key = issue
+        .as_str()
+        .and_then(|value| value.parse::<i64>().ok())
+        .or_else(|| issue.as_i64())?;
+    let year = (key / 100_000_000) as i32;
+    let month = ((key / 1_000_000) % 100) as u32;
+    let day = ((key / 10_000) % 100) as u32;
+    let hour = ((key / 100) % 100) as u32;
+    let minute = (key % 100) as u32;
+    NaiveDate::from_ymd_opt(year, month, day)?
+        .and_hms_opt(hour, minute, 0)
+        .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+}
+
+fn live_pts_url(day: u8) -> Option<&'static str> {
+    match day {
+        1 => Some("https://tgftp.nws.noaa.gov/data/raw/wu/wuus01.kwns.pts.dy1.txt"),
+        2 => Some("https://tgftp.nws.noaa.gov/data/raw/wu/wuus02.kwns.pts.dy2.txt"),
+        3 => Some("https://tgftp.nws.noaa.gov/data/raw/wu/wuus03.kwns.pts.dy3.txt"),
+        4..=8 => Some("https://tgftp.nws.noaa.gov/data/raw/wu/wuus48.kwns.pts.d48.txt"),
+        _ => None,
+    }
+}
+
+fn pts_section_name(kind: &str) -> Option<&'static str> {
+    match kind {
+        "cat" => Some("CATEGORICAL"),
+        "torn" => Some("TORNADO"),
+        "wind" => Some("WIND"),
+        "hail" => Some("HAIL"),
+        _ => None,
+    }
+}
+
+fn categorical_label2(label: &str) -> &'static str {
+    match label {
+        "TSTM" => "General Thunderstorms Risk",
+        "MRGL" => "Marginal Risk",
+        "SLGT" => "Slight Risk",
+        "ENH" => "Enhanced Risk",
+        "MDT" => "Moderate Risk",
+        "HIGH" => "High Risk",
+        _ => "Categorical Risk",
+    }
+}
+
+fn categorical_colors(label: &str) -> (egui::Color32, egui::Color32) {
+    match label {
+        "TSTM" => (hex_color("#C1E9C1"), hex_color("#55BB55")),
+        "MRGL" => (hex_color("#66A366"), hex_color("#005500")),
+        "SLGT" => (hex_color("#FFE066"), hex_color("#DDAA00")),
+        "ENH" => (hex_color("#FFB266"), hex_color("#FF6600")),
+        "MDT" => (hex_color("#E066E0"), hex_color("#A000A0")),
+        "HIGH" => (hex_color("#FF66FF"), hex_color("#CC00CC")),
+        _ => (egui::Color32::from_rgb(128, 128, 128), egui::Color32::WHITE),
+    }
+}
+
+fn probability_colors(label: &str) -> (egui::Color32, egui::Color32) {
+    match label {
+        "0.02" => (hex_color("#79BA7A"), hex_color("#1A731D")),
+        "0.05" => (hex_color("#C5A392"), hex_color("#8B4726")),
+        "0.10" => (hex_color("#FFE066"), hex_color("#DDAA00")),
+        "0.15" => (hex_color("#FFEB7F"), hex_color("#FF9600")),
+        "0.30" => (hex_color("#FF7F7F"), hex_color("#FF0000")),
+        "0.45" => (hex_color("#DDA0DD"), hex_color("#800080")),
+        "0.60" => (hex_color("#FF66FF"), hex_color("#CC00CC")),
+        _ => (egui::Color32::from_rgb(128, 128, 128), egui::Color32::WHITE),
+    }
+}
+
+fn pts_label2(kind: &str, label: &str) -> String {
+    if kind == "cat" {
+        return categorical_label2(label).to_owned();
+    }
+    let product = match kind {
+        "torn" => "Tornado",
+        "wind" => "Wind",
+        "hail" => "Hail",
+        _ => "Severe",
+    };
+    let percent = label
+        .parse::<f32>()
+        .map(|value| format!("{:.0}", value * 100.0))
+        .unwrap_or_else(|_| label.to_owned());
+    format!("{percent}% {product} Risk")
+}
+
+fn pts_colors(kind: &str, label: &str) -> (egui::Color32, egui::Color32) {
+    if kind == "cat" {
+        categorical_colors(label)
+    } else {
+        probability_colors(label)
+    }
+}
+
+fn is_pts_label(kind: &str, token: &str) -> bool {
+    if kind == "cat" {
+        matches!(token, "TSTM" | "MRGL" | "SLGT" | "ENH" | "MDT" | "HIGH")
+    } else {
+        token.contains('.') && token.parse::<f32>().is_ok()
+    }
+}
+
+fn parse_pts_coord(token: &str) -> Option<(f32, f32)> {
+    if token.len() != 8 || !token.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let lat = token[0..4].parse::<f32>().ok()? / 100.0;
+    let mut lon = token[4..8].parse::<f32>().ok()? / 100.0;
+    // SPC point strings omit the leading "1" for longitudes west of 100W
+    // (e.g. 31641340 = 31.64N, 113.40W).
+    if lon < 30.0 {
+        lon += 100.0;
+    }
+    Some((-lon, lat))
+}
+
+#[derive(Default)]
+struct PtsFeatureBuilder {
+    label: String,
+    rings: Vec<Vec<(f32, f32)>>,
+    current: Vec<(f32, f32)>,
+}
+
+impl PtsFeatureBuilder {
+    fn new(label: &str) -> Self {
+        Self {
+            label: label.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn finish_ring(&mut self) {
+        if self.current.len() >= 3 {
+            self.rings.push(std::mem::take(&mut self.current));
+        } else {
+            self.current.clear();
+        }
+    }
+
+    fn finish(mut self, kind: &str) -> Option<OutlookFeature> {
+        self.finish_ring();
+        if self.rings.is_empty() {
+            return None;
+        }
+        let (fill, stroke) = pts_colors(kind, &self.label);
+        Some(OutlookFeature {
+            label2: pts_label2(kind, &self.label),
+            label: self.label,
+            fill,
+            stroke,
+            fill_enabled: false,
+            rings: self.rings,
+        })
+    }
+}
+
+/// Parse raw SPC PTS point blocks. This is intentionally not used for
+/// normal map rendering yet: PTS files are excellent release tripwires, but
+/// some outlines are "to the right of a line" products that need coastline
+/// or border closure before they are safe filled polygons.
+pub fn parse_pts_outlook(text: &str, kind: &str) -> Vec<OutlookFeature> {
+    let Some(section_name) = pts_section_name(kind) else {
+        return Vec::new();
+    };
+    let mut active = false;
+    let mut builder: Option<PtsFeatureBuilder> = None;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "&&" && active {
+            break;
+        }
+        if trimmed.starts_with("...") && trimmed.ends_with("...") {
+            let name = trimmed.trim_matches('.').trim();
+            active = name.eq_ignore_ascii_case(section_name);
+            continue;
+        }
+        if !active || trimmed.is_empty() {
+            continue;
+        }
+        for token in trimmed.split_whitespace() {
+            if is_pts_label(kind, token) {
+                if let Some(previous) = builder.take().and_then(|b| b.finish(kind)) {
+                    out.push(previous);
+                }
+                builder = Some(PtsFeatureBuilder::new(token));
+                continue;
+            }
+            let Some(builder) = builder.as_mut() else {
+                continue;
+            };
+            if token == "99999999" || token.starts_with("CIG") {
+                builder.finish_ring();
+            } else if let Some(point) = parse_pts_coord(token) {
+                builder.current.push(point);
+            }
+        }
+    }
+    if let Some(feature) = builder.and_then(|b| b.finish(kind)) {
+        out.push(feature);
     }
     out
 }
@@ -589,9 +899,20 @@ pub fn fetch_spc(
         fetched_at: Some(Instant::now()),
         ..Default::default()
     };
+    let now = Utc::now();
+    let live_pts = if archive_date.is_none() && !outlook_kinds.is_empty() {
+        live_pts_url(day).and_then(|url| data_source::fetch_text(url).ok())
+    } else {
+        None
+    };
+    let live_pts_issue = live_pts
+        .as_deref()
+        .and_then(|text| pts_issue_time(text, now));
+    let mut latest_geojson_issue: Option<DateTime<Utc>> = None;
+    let mut missing_geojson_outlook = false;
     for kind in outlook_kinds {
         let text = match archive_date {
-            None => live_outlook_urls(day, kind, Utc::now())
+            None => live_outlook_urls(day, kind, now)
                 .into_iter()
                 .find_map(|url| data_source::fetch_text(&url).ok()),
             Some((y, m, d)) => ["2000", "1630", "1300", "1200", "0100"]
@@ -603,11 +924,84 @@ pub fn fetch_spc(
                     .ok()
                 }),
         };
-        if let Some(text) = text {
-            data.outlooks
-                .push(((*kind).to_owned(), parse_outlook(&text)));
+        if let Some(mut text) = text {
+            let mut geojson_issue = geojson_issue_time(&text);
+            if archive_date.is_none() {
+                let pts_is_ahead = live_pts_issue
+                    .zip(geojson_issue)
+                    .map(|(pts_issue, geojson_issue)| {
+                        pts_issue - geojson_issue > Duration::minutes(10)
+                    })
+                    .unwrap_or(false);
+                if pts_is_ahead {
+                    let live_url = format!(
+                        "https://www.spc.noaa.gov/products/outlook/day{day}otlk_{kind}.lyr.geojson"
+                    );
+                    if let Ok(live_text) = data_source::fetch_text(&live_url) {
+                        let live_issue = geojson_issue_time(&live_text);
+                        let live_is_current = live_pts_issue
+                            .zip(live_issue)
+                            .map(|(pts_issue, live_issue)| {
+                                pts_issue - live_issue <= Duration::minutes(10)
+                            })
+                            .unwrap_or(false);
+                        let live_is_newer = live_issue
+                            .zip(geojson_issue)
+                            .map(|(live_issue, geojson_issue)| live_issue > geojson_issue)
+                            .unwrap_or(false);
+                        if live_is_current || live_is_newer {
+                            text = live_text;
+                            geojson_issue = live_issue;
+                        }
+                    }
+                }
+            }
+            if let Some(issue) = geojson_issue {
+                latest_geojson_issue = Some(
+                    latest_geojson_issue
+                        .map(|latest| latest.max(issue))
+                        .unwrap_or(issue),
+                );
+            }
+            let overlay_pts = archive_date.is_none()
+                && live_pts_issue
+                    .zip(geojson_issue)
+                    .map(|(pts_issue, geojson_issue)| {
+                        pts_issue - geojson_issue > Duration::minutes(10)
+                    })
+                    .unwrap_or(false);
+            let mut features = parse_outlook(&text);
+            if overlay_pts {
+                let pts_features = live_pts
+                    .as_deref()
+                    .map(|pts_text| parse_pts_outlook(pts_text, kind))
+                    .unwrap_or_default();
+                features.extend(pts_features);
+            }
+            data.outlooks.push(((*kind).to_owned(), features));
+        } else {
+            missing_geojson_outlook = true;
+            if archive_date.is_none() {
+                let pts_features = live_pts
+                    .as_deref()
+                    .map(|pts_text| parse_pts_outlook(pts_text, kind))
+                    .unwrap_or_default();
+                if !pts_features.is_empty() {
+                    data.outlooks.push(((*kind).to_owned(), pts_features));
+                }
+            }
         }
     }
+    data.outlook_geojson_lagging = archive_date.is_none()
+        && !outlook_kinds.is_empty()
+        && live_pts_issue
+            .map(|pts_issue| {
+                missing_geojson_outlook
+                    || latest_geojson_issue
+                        .map(|geojson_issue| pts_issue - geojson_issue > Duration::minutes(10))
+                        .unwrap_or(true)
+            })
+            .unwrap_or(false);
     if want_reports {
         // "today" on SPC's side is the CURRENT convective day (12Z-12Z).
         let convective = spc_convective_date(Utc::now());
@@ -640,6 +1034,94 @@ mod tests {
         // Base colors, fully opaque — alphas are a draw-time style concern.
         assert_eq!(parsed[0].fill, egui::Color32::from_rgb(0xFF, 0xE0, 0x66));
         assert_eq!(parsed[0].stroke, egui::Color32::from_rgb(0xDD, 0xAA, 0x00));
+    }
+
+    #[test]
+    fn parses_raw_pts_categorical_sections_and_splits_offshore_rings() {
+        let sample = "WUUS01 KWNS 140600\n\
+PTSDY1\n\
+\n\
+VALID TIME 141200Z - 151200Z\n\
+\n\
+CATEGORICAL OUTLOOK POINTS DAY 1\n\
+\n\
+... CATEGORICAL ...\n\
+\n\
+MRGL   31480729 32560725 33160661 31480729\n\
+TSTM   31641340 34521417 36361477 99999999\n\
+       30808083 30658239 31178351\n\
+&&\n\
+THERE IS A MARGINAL RISK OF SVR TSTMS...\n";
+
+        let parsed = parse_pts_outlook(sample, "cat");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].label, "MRGL");
+        assert_eq!(parsed[0].rings.len(), 1);
+        assert_eq!(parsed[1].label, "TSTM");
+        assert_eq!(parsed[1].rings.len(), 2);
+        assert!(!parsed[1].fill_enabled);
+        assert_ne!(parsed[1].rings[0].first(), parsed[1].rings[0].last());
+        // 31641340 is 31.64N, 113.40W. PTS omits the leading "1" west
+        // of 100W, so this catches the common raw-PTS longitude trap.
+        assert_eq!(parsed[1].rings[0][0], (-113.40, 31.64));
+        assert_eq!(parsed[1].rings[1][0], (-80.83, 30.80));
+    }
+
+    #[test]
+    fn parses_raw_pts_probability_sections() {
+        let sample = "WUUS03 KWNS 140612\n\
+PTSDY3\n\
+\n\
+VALID TIME 161200Z - 171200Z\n\
+\n\
+PROBABILISTIC OUTLOOK POINTS DAY 3\n\
+\n\
+... WIND ...\n\
+\n\
+0.05   30808083 30658239 31178351 30808083\n\
+0.15   36057492 35657601 35387761 36057492\n\
+&&\n";
+
+        let parsed = parse_pts_outlook(sample, "wind");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].label, "0.05");
+        assert_eq!(parsed[0].label2, "5% Wind Risk");
+        assert_eq!(parsed[1].label, "0.15");
+    }
+
+    #[test]
+    fn pts_valid_key_infers_month_near_now() {
+        let sample = "WUUS01 KWNS 140600\n\
+PTSDY1\n\
+\n\
+VALID TIME 141200Z - 151200Z\n";
+        let now = Utc.with_ymd_and_hms(2026, 6, 14, 6, 30, 0).unwrap();
+        assert_eq!(pts_valid_key(sample, now), Some(202606141200));
+    }
+
+    #[test]
+    fn geojson_valid_key_reads_spc_properties() {
+        let sample = r##"{"features":[{"properties":{"VALID":"202606141200","LABEL":"SLGT"},"geometry":{"type":"Polygon","coordinates":[]}}]}"##;
+        assert_eq!(geojson_valid_key(sample), Some(202606141200));
+    }
+
+    #[test]
+    fn pts_issue_time_reads_raw_header() {
+        let sample = "WUUS01 KWNS 140600\nPTSDY1\n";
+        let now = Utc.with_ymd_and_hms(2026, 6, 14, 6, 30, 0).unwrap();
+        assert_eq!(
+            pts_issue_time(sample, now),
+            Some(Utc.with_ymd_and_hms(2026, 6, 14, 6, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn geojson_issue_time_reads_spc_issue_properties() {
+        let sample = r##"{"features":[{"properties":{"ISSUE":"202606140558","ISSUE_ISO":"2026-06-14T05:58:00+00:00","LABEL":"SLGT"},"geometry":{"type":"Polygon","coordinates":[]}}]}"##;
+        assert_eq!(
+            geojson_issue_time(sample),
+            Some(Utc.with_ymd_and_hms(2026, 6, 14, 5, 58, 0).unwrap())
+        );
     }
 
     #[test]
