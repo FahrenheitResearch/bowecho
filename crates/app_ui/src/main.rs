@@ -7829,6 +7829,26 @@ impl ViewerApp {
             .volume
             .as_ref()
             .is_none_or(|existing| !existing.site.id.eq_ignore_ascii_case(&volume.site.id));
+        let previous_volume_ptr = pane
+            .volume
+            .as_ref()
+            .map(|volume| Arc::as_ptr(volume) as usize);
+        let next_volume_ptr = Arc::as_ptr(&volume) as usize;
+        let same_volume = previous_volume_ptr == Some(next_volume_ptr);
+        let keep_existing_texture = should_keep_texture_for_volume_install(
+            pane.volume.as_deref(),
+            volume.as_ref(),
+            same_volume,
+        );
+        let retarget_existing_texture = pane.texture.is_some()
+            && selected_cut == previous_cut
+            && selected_product == previous_product
+            && selected_cut_render_data_unchanged(
+                pane.volume.as_deref(),
+                volume.as_ref(),
+                selected_cut,
+                &selected_product,
+            );
         if let Some(source_path) = source_path {
             pane.source_path = Some(source_path);
         }
@@ -7846,7 +7866,19 @@ impl ViewerApp {
         }
         pane.cut = Some(selected_cut);
         pane.product = selected_product;
-        pane.clear_texture();
+        if keep_existing_texture {
+            pane.pending_render_key = None;
+            if retarget_existing_texture && let Some(texture_key) = &mut pane.texture_key {
+                texture_key.volume_ptr = next_volume_ptr;
+                texture_key.cut = selected_cut;
+                texture_key.product = pane.product.clone();
+            } else if !same_volume && let Some(texture_key) = &mut pane.texture_key {
+                texture_key.volume_ptr = 0;
+            }
+            pane.render_ms = None;
+        } else {
+            pane.clear_texture();
+        }
         ctx.request_repaint();
     }
 
@@ -15398,7 +15430,9 @@ impl ViewerApp {
             // established click grammar — RAOB diamonds included); a
             // tornado track only takes the click when no marker is in
             // reach.
-            let marker_hit = nearest_marker_within(&site_points, pointer).is_some()
+            let marker_hit = self
+                .nearest_site_marker_within(&site_points, pointer)
+                .is_some()
                 || nearest_marker_within(&intl_points, pointer).is_some()
                 || nearest_marker_within(&community_points, pointer).is_some()
                 || nearest_marker_within(&custom_poll_points, pointer).is_some()
@@ -23281,14 +23315,11 @@ impl ViewerApp {
                     && self.map_scale >= TERMINAL_SITE_LABEL_MIN_SCALE))
     }
 
-    fn draw_site_marker_label(
+    fn site_marker_label_parts(
         &self,
-        painter: &egui::Painter,
-        position: egui::Pos2,
         site: &RadarSite,
         selected: bool,
-        occupied: &mut Vec<egui::Rect>,
-    ) {
+    ) -> (RadarLabelStyle, String, f32, egui::Color32, egui::Vec2) {
         let terminal = site_is_terminal_radar(site);
         let style = RadarLabelStyle::from_key(&self.app_settings.radar_label_style);
         let label = match style {
@@ -23301,20 +23332,92 @@ impl ViewerApp {
             RadarLabelStyle::IdBox if terminal => egui::Color32::from_rgb(255, 232, 168),
             _ => egui::Color32::from_rgb(238, 246, 255),
         };
-        let galley = painter.layout_no_wrap(
-            label.clone(),
-            egui::FontId::proportional(font_px),
-            text_color,
-        );
         let padding = match style {
             RadarLabelStyle::Text => egui::vec2(8.0, 4.0),
             RadarLabelStyle::IdBox => egui::vec2(10.0, 5.0),
             RadarLabelStyle::FullBox => egui::vec2(8.0, 4.0),
         };
-        let rect = egui::Rect::from_min_size(
+        (style, label, font_px, text_color, padding)
+    }
+
+    fn site_marker_label_rect(
+        &self,
+        position: egui::Pos2,
+        site: &RadarSite,
+        selected: bool,
+    ) -> egui::Rect {
+        let (_style, label, font_px, _text_color, padding) =
+            self.site_marker_label_parts(site, selected);
+        let terminal = site_is_terminal_radar(site);
+        let text_width = label.chars().count() as f32 * font_px * 0.64;
+        let text_height = font_px * 1.25;
+        egui::Rect::from_min_size(
             position + egui::vec2(10.0, if terminal { -15.0 } else { -12.0 }),
-            galley.size() + padding,
+            egui::vec2(text_width, text_height) + padding,
+        )
+    }
+
+    fn nearest_site_marker_within(
+        &self,
+        site_points: &[(usize, egui::Pos2)],
+        pointer: egui::Pos2,
+    ) -> Option<(usize, f32)> {
+        let marker_hit = nearest_marker_within(site_points, pointer);
+        let mut occupied = Vec::with_capacity(site_points.len().min(48));
+        let label_hit = site_points
+            .iter()
+            .filter_map(|(index, position)| {
+                let selected = *index == self.selected_site_index;
+                let site = self.sites.get(*index)?;
+                if !self.site_marker_should_label(site, selected) {
+                    return None;
+                }
+                let rect = self.site_marker_label_rect(*position, site, selected);
+                if !selected
+                    && occupied
+                        .iter()
+                        .any(|existing: &egui::Rect| existing.intersects(rect.expand(2.0)))
+                {
+                    return None;
+                }
+                occupied.push(rect);
+                rect.expand(2.0)
+                    .contains(pointer)
+                    .then_some((*index, 0.0_f32))
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1));
+
+        match (marker_hit, label_hit) {
+            (Some(marker), Some(label)) => {
+                if marker.1 <= label.1 {
+                    Some(marker)
+                } else {
+                    Some(label)
+                }
+            }
+            (Some(marker), None) => Some(marker),
+            (None, Some(label)) => Some(label),
+            (None, None) => None,
+        }
+    }
+
+    fn draw_site_marker_label(
+        &self,
+        painter: &egui::Painter,
+        position: egui::Pos2,
+        site: &RadarSite,
+        selected: bool,
+        occupied: &mut Vec<egui::Rect>,
+    ) {
+        let (style, label, font_px, text_color, _padding) =
+            self.site_marker_label_parts(site, selected);
+        let galley = painter.layout_no_wrap(
+            label.clone(),
+            egui::FontId::proportional(font_px),
+            text_color,
         );
+        let terminal = site_is_terminal_radar(site);
+        let rect = self.site_marker_label_rect(position, site, selected);
         if !selected
             && occupied
                 .iter()
@@ -23467,7 +23570,7 @@ impl ViewerApp {
         // cluster-marker hit below re-opens it, so re-clicking toggles.
         let open_menu = self.community_menu.take();
         match resolve_marker_click(
-            nearest_marker_within(site_points, pointer),
+            self.nearest_site_marker_within(site_points, pointer),
             nearest_marker_within(intl_points, pointer),
             nearest_marker_within(community_points, pointer),
             nearest_marker_within(custom_poll_points, pointer),
@@ -23530,7 +23633,7 @@ impl ViewerApp {
         ctx: &egui::Context,
     ) -> bool {
         match resolve_marker_click(
-            nearest_marker_within(site_points, pointer),
+            self.nearest_site_marker_within(site_points, pointer),
             nearest_marker_within(intl_points, pointer),
             nearest_marker_within(community_points, pointer),
             nearest_marker_within(custom_poll_points, pointer),
@@ -23623,7 +23726,9 @@ impl ViewerApp {
         // established click grammar, RAOB diamonds included); SPC report
         // dots and tornado tracks take the click only when no marker is in
         // reach.
-        let marker_hit = nearest_marker_within(site_points, pointer).is_some()
+        let marker_hit = self
+            .nearest_site_marker_within(site_points, pointer)
+            .is_some()
             || nearest_marker_within(intl_points, pointer).is_some()
             || nearest_marker_within(community_points, pointer).is_some()
             || nearest_marker_within(custom_poll_points, pointer).is_some()
@@ -32719,6 +32824,24 @@ mod tests {
         app.extra_panes[0].map_center_lat = 35.91;
         app.extra_panes[0].map_center_lon = -96.82;
         app.extra_panes[0].map_scale = 980.0;
+        let old_volume_ptr = app.extra_panes[0]
+            .volume
+            .as_ref()
+            .map(|volume| Arc::as_ptr(volume) as usize)
+            .unwrap();
+        app.extra_panes[0].texture_key = Some(TextureKey {
+            volume_ptr: old_volume_ptr,
+            cut: app.extra_panes[0].cut.unwrap_or(0),
+            product: app.extra_panes[0].product.clone(),
+            render_dealiased_velocity: false,
+            color_table_signature: 1,
+            storm_motion_key: (0, 0),
+            hail_levels_key: (32, 64),
+            smoothing: SmoothingMode::Native,
+            dealias_cascade: false,
+            gate_filter_decidbz: i16::MIN,
+            viewport: test_viewport_key(720, 480),
+        });
 
         app.select_extra_pane_history_frame(0, 1, &ctx);
 
@@ -32726,6 +32849,14 @@ mod tests {
         assert!((app.extra_panes[0].map_center_lat - 35.91).abs() < 0.001);
         assert!((app.extra_panes[0].map_center_lon + 96.82).abs() < 0.001);
         assert_eq!(app.extra_panes[0].map_scale, 980.0);
+        let texture_key = app.extra_panes[0]
+            .texture_key
+            .as_ref()
+            .expect("same-site frame step keeps old texture visible");
+        assert_eq!(
+            texture_key.volume_ptr, 0,
+            "stale key is poisoned so the pane re-renders without blanking"
+        );
     }
 
     #[test]
@@ -33182,6 +33313,37 @@ mod tests {
             None
         );
         assert_eq!(nearest_marker_within(&[], egui::pos2(0.0, 0.0)), None);
+    }
+
+    #[test]
+    fn visible_radar_label_box_is_clickable_like_the_marker() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![RadarSite::new("KOHX").with_location(
+            Some("Nashville".to_owned()),
+            Some(36.247),
+            Some(-86.562),
+        )];
+        app.selected_site_index = 0;
+        app.map_scale = SITE_LABEL_MIN_SCALE + 10.0;
+        app.app_settings.show_radar_labels = true;
+        app.app_settings.radar_label_style = "id-box".to_owned();
+
+        let position = egui::pos2(100.0, 100.0);
+        let points = vec![(0, position)];
+        let pointer = app
+            .site_marker_label_rect(position, &app.sites[0], true)
+            .center();
+        assert!(
+            position.distance(pointer) > 12.0,
+            "test point must be outside the old dot-only click halo"
+        );
+        assert_eq!(
+            app.nearest_site_marker_within(&points, pointer),
+            Some((0, 0.0))
+        );
+
+        app.app_settings.show_radar_labels = false;
+        assert_eq!(app.nearest_site_marker_within(&points, pointer), None);
     }
 
     /// The map-marker catalog the intl markers draw from: embedded tables
