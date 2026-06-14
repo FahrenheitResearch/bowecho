@@ -16542,9 +16542,11 @@ impl ViewerApp {
         let mut open = self.show_satellite;
         let mut events = (Vec::new(), Vec::new());
         egui::Window::new("Satellite (GOES)")
+            .id(egui::Id::new("bowecho_satellite_goes_window"))
             .open(&mut open)
             .default_size([900.0, 700.0])
             .min_size([520.0, 400.0])
+            .collapsible(false)
             .resizable(true)
             .show(ctx, |ui| {
                 self.dock_toggle_row(ui, dock::WorkspacePane::Satellite);
