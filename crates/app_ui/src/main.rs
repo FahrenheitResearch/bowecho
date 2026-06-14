@@ -2363,6 +2363,18 @@ struct ViewPane {
     /// Independent tilt override; None = follow the main pane's tilt, so
     /// scrubbing the main tilt moves every un-pinned pane in sync.
     cut: Option<usize>,
+    /// None = follow the primary radar volume. Some(id) = this pane owns
+    /// its own latest-load source and map view.
+    pinned_site_id: Option<String>,
+    volume: Option<Arc<RadarVolume>>,
+    source_path: Option<PathBuf>,
+    load_timing: Option<LoadTimings>,
+    load_receiver: Option<mpsc::Receiver<AsyncLoadResult>>,
+    pending_site_id: Option<String>,
+    status: String,
+    map_center_lat: f32,
+    map_center_lon: f32,
+    map_scale: f32,
     texture: Option<egui::TextureHandle>,
     texture_key: Option<TextureKey>,
     pending_render_key: Option<TextureKey>,
@@ -2374,12 +2386,41 @@ impl ViewPane {
         Self {
             product,
             cut: None,
+            pinned_site_id: None,
+            volume: None,
+            source_path: None,
+            load_timing: None,
+            load_receiver: None,
+            pending_site_id: None,
+            status: "Following primary radar".to_owned(),
+            map_center_lat: 0.0,
+            map_center_lon: 0.0,
+            map_scale: DEFAULT_MAP_SCALE,
             texture: None,
             texture_key: None,
             pending_render_key: None,
             render_ms: None,
         }
     }
+
+    fn owns_radar(&self) -> bool {
+        self.pinned_site_id.is_some()
+    }
+
+    fn clear_texture(&mut self) {
+        self.texture = None;
+        self.texture_key = None;
+        self.pending_render_key = None;
+        self.render_ms = None;
+    }
+}
+
+struct PaneContextSnapshot {
+    volume: Option<Arc<RadarVolume>>,
+    load_timing: Option<LoadTimings>,
+    map_center_lat: f32,
+    map_center_lon: f32,
+    map_scale: f32,
 }
 
 struct RenderRequest {
@@ -4650,11 +4691,10 @@ impl ViewerApp {
         // (it would geo-anchor at the NEW site's location) or pinned tilts
         // (a different VCP renumbers the cuts).
         for pane in &mut self.extra_panes {
-            pane.texture = None;
-            pane.texture_key = None;
-            pane.pending_render_key = None;
-            pane.render_ms = None;
-            pane.cut = None;
+            if !pane.owns_radar() {
+                pane.clear_texture();
+                pane.cut = None;
+            }
         }
         ctx.request_repaint();
     }
@@ -5427,9 +5467,31 @@ impl ViewerApp {
             return;
         }
         self.selected_cut = self.selected_cut.min(volume.cuts.len() - 1);
+        let primary_volume = self.volume.clone();
         for pane in &mut self.extra_panes {
-            if let Some(cut) = pane.cut {
-                pane.cut = Some(cut.min(volume.cuts.len() - 1));
+            if let Some(pane_volume) = pane.volume.clone().or_else(|| primary_volume.clone()) {
+                if let Some(cut) = pane.cut {
+                    pane.cut = Some(cut.min(pane_volume.cuts.len().saturating_sub(1)));
+                }
+                if !is_displayable_on_cut(
+                    pane_volume.as_ref(),
+                    pane.cut.unwrap_or(self.selected_cut),
+                    &pane.product,
+                ) {
+                    if let Some(cut) = best_cut_for_product(
+                        pane_volume.as_ref(),
+                        pane.cut.unwrap_or(self.selected_cut),
+                        &pane.product,
+                    ) {
+                        pane.cut = Some(cut);
+                    } else if let Some(product) = global_displayable_products(pane_volume.as_ref())
+                        .first()
+                        .cloned()
+                    {
+                        pane.product = product;
+                        pane.cut = Some(0);
+                    }
+                }
             }
         }
         if is_displayable_on_cut(volume, self.selected_cut, &self.selected_product) {
@@ -6925,6 +6987,236 @@ impl ViewerApp {
         }
     }
 
+    fn extra_pane_display_volume(&self, pane_slot: usize) -> Option<Arc<RadarVolume>> {
+        self.extra_panes
+            .get(pane_slot)
+            .and_then(|pane| pane.volume.clone())
+            .or_else(|| self.volume.clone())
+    }
+
+    fn begin_extra_pane_context(&mut self, pane_slot: usize) -> Option<PaneContextSnapshot> {
+        let pane = self.extra_panes.get(pane_slot)?;
+        if !pane.owns_radar() {
+            return None;
+        }
+        let snapshot = PaneContextSnapshot {
+            volume: self.volume.clone(),
+            load_timing: self.load_timing,
+            map_center_lat: self.map_center_lat,
+            map_center_lon: self.map_center_lon,
+            map_scale: self.map_scale,
+        };
+        self.volume = pane.volume.clone();
+        self.load_timing = pane.load_timing;
+        self.map_center_lat = pane.map_center_lat;
+        self.map_center_lon = pane.map_center_lon;
+        self.map_scale = pane.map_scale;
+        Some(snapshot)
+    }
+
+    fn end_extra_pane_context(&mut self, pane_slot: usize, snapshot: PaneContextSnapshot) {
+        if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+            pane.map_center_lat = self.map_center_lat;
+            pane.map_center_lon = self.map_center_lon;
+            pane.map_scale = self.map_scale;
+        }
+        self.volume = snapshot.volume;
+        self.load_timing = snapshot.load_timing;
+        self.map_center_lat = snapshot.map_center_lat;
+        self.map_center_lon = snapshot.map_center_lon;
+        self.map_scale = snapshot.map_scale;
+    }
+
+    fn clear_extra_pane_radar(&mut self, pane_slot: usize) {
+        if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+            pane.pinned_site_id = None;
+            pane.volume = None;
+            pane.source_path = None;
+            pane.load_timing = None;
+            pane.load_receiver = None;
+            pane.pending_site_id = None;
+            pane.status = "Following primary radar".to_owned();
+            pane.cut = None;
+            pane.clear_texture();
+        }
+    }
+
+    fn center_extra_pane_on_site(&mut self, pane_slot: usize, site: &RadarSite) {
+        let Some((latitude_deg, longitude_deg)) = site_location(site) else {
+            return;
+        };
+        if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+            pane.map_center_lat = latitude_deg.clamp(-85.0, 85.0);
+            pane.map_center_lon = normalize_lon(longitude_deg);
+            pane.map_scale = pane.map_scale.max(220.0);
+        }
+    }
+
+    fn start_extra_pane_latest_load(
+        &mut self,
+        pane_slot: usize,
+        site: RadarSite,
+        ctx: &egui::Context,
+    ) {
+        let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
+            return;
+        };
+        if pane.load_receiver.is_some() {
+            return;
+        }
+        let site_id = site.level2_id.clone();
+        let (sender, receiver) = mpsc::channel();
+        let current_source_path = pane.source_path.clone();
+        let current_frame_identity = pane
+            .volume
+            .as_ref()
+            .filter(|volume| volume.site.id == site_id)
+            .map(|volume| frame_identity_for_volume(volume.as_ref()));
+        pane.pinned_site_id = Some(site_id.clone());
+        pane.pending_site_id = Some(site_id.clone());
+        pane.load_receiver = Some(receiver);
+        pane.status = format!("Loading latest L2 {site_id}");
+        self.center_extra_pane_on_site(pane_slot, &site);
+        spawn_latest_level2_load_worker(
+            site,
+            LatestLoadMode::User,
+            current_source_path,
+            BTreeSet::new(),
+            current_frame_identity,
+            1,
+            self.display_live_chunk_updates,
+            sender,
+        );
+        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+    }
+
+    fn poll_extra_pane_loads(&mut self, ctx: &egui::Context) {
+        for pane_slot in 0..self.extra_panes.len() {
+            let mut saw_message = false;
+            loop {
+                let Some(result) = self.extra_panes[pane_slot]
+                    .load_receiver
+                    .as_ref()
+                    .map(mpsc::Receiver::try_recv)
+                else {
+                    break;
+                };
+                match result {
+                    Ok(message) => {
+                        saw_message = true;
+                        match message.update {
+                            AsyncLoadUpdate::ArchiveProgress(progress) => {
+                                self.extra_panes[pane_slot].status = progress.status_text();
+                                ctx.request_repaint_after(Duration::from_millis(
+                                    ACTIVE_LOAD_POLL_MS,
+                                ));
+                            }
+                            AsyncLoadUpdate::Preview(decoded) => {
+                                self.install_extra_pane_volume(pane_slot, decoded, ctx);
+                                self.extra_panes[pane_slot].status =
+                                    format!("Preview {}", message.label);
+                            }
+                            AsyncLoadUpdate::History(batch, select_frame) => {
+                                if select_frame && let Some(decoded) = batch.into_selected() {
+                                    self.install_extra_pane_volume(pane_slot, decoded, ctx);
+                                    self.extra_panes[pane_slot].status =
+                                        format!("Loaded {}", message.label);
+                                }
+                            }
+                            AsyncLoadUpdate::Unchanged { timings, reason } => {
+                                let pane = &mut self.extra_panes[pane_slot];
+                                pane.load_receiver = None;
+                                pane.pending_site_id = None;
+                                if let Some(timings) = timings {
+                                    pane.load_timing = Some(timings);
+                                }
+                                pane.status = format!("Current {} ({reason})", message.label);
+                                ctx.request_repaint_after(Duration::from_secs(1));
+                                break;
+                            }
+                            AsyncLoadUpdate::Final(result) => {
+                                self.extra_panes[pane_slot].load_receiver = None;
+                                self.extra_panes[pane_slot].pending_site_id = None;
+                                match result {
+                                    Ok(batch) => {
+                                        if let Some(decoded) = batch.into_selected() {
+                                            self.install_extra_pane_volume(pane_slot, decoded, ctx);
+                                            self.extra_panes[pane_slot].status =
+                                                format!("Loaded {}", message.label);
+                                        }
+                                    }
+                                    Err(err) => {
+                                        self.extra_panes[pane_slot].status =
+                                            format!("Load failed for {}: {err}", message.label);
+                                    }
+                                }
+                                ctx.request_repaint();
+                                break;
+                            }
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        if saw_message {
+                            ctx.request_repaint();
+                        } else {
+                            ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+                        }
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        let pane = &mut self.extra_panes[pane_slot];
+                        pane.load_receiver = None;
+                        pane.pending_site_id = None;
+                        pane.status = "Pane L2 load worker disconnected".to_owned();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn install_extra_pane_volume(
+        &mut self,
+        pane_slot: usize,
+        decoded: DecodedLoad,
+        ctx: &egui::Context,
+    ) {
+        let volume = Arc::new(decoded.volume);
+        let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
+            return;
+        };
+        pane.source_path = Some(decoded.path);
+        pane.load_timing = Some(decoded.timings);
+        pane.pinned_site_id = Some(volume.site.id.clone());
+        pane.volume = Some(Arc::clone(&volume));
+        pane.pending_site_id = None;
+        if let (Some(latitude_deg), Some(longitude_deg)) =
+            (volume.site.latitude_deg, volume.site.longitude_deg)
+        {
+            pane.map_center_lat = latitude_deg.clamp(-85.0, 85.0);
+            pane.map_center_lon = normalize_lon(longitude_deg);
+            pane.map_scale = pane.map_scale.max(220.0);
+        }
+        if let Some(cut) = pane.cut {
+            pane.cut = Some(cut.min(volume.cuts.len().saturating_sub(1)));
+        }
+        if !is_displayable_on_cut(volume.as_ref(), pane.cut.unwrap_or(0), &pane.product) {
+            if let Some(cut) =
+                best_cut_for_product(volume.as_ref(), pane.cut.unwrap_or(0), &pane.product)
+            {
+                pane.cut = Some(cut);
+            } else if let Some(product) = global_displayable_products(volume.as_ref())
+                .first()
+                .cloned()
+            {
+                pane.product = product;
+                pane.cut = Some(0);
+            }
+        }
+        pane.clear_texture();
+        ctx.request_repaint();
+    }
+
     /// Route a render result for an extra pane (1-based index) to its texture.
     fn install_pane_render_result(&mut self, ctx: &egui::Context, message: AsyncRenderResult) {
         let Some(pane_slot) = message.pane.checked_sub(1) else {
@@ -6997,7 +7289,7 @@ impl ViewerApp {
         let Some(pane_slot) = pane_number.checked_sub(1) else {
             return;
         };
-        let Some(volume) = self.volume.clone() else {
+        let Some(volume) = self.extra_pane_display_volume(pane_slot) else {
             return;
         };
         let Some((viewport_options, viewport_key)) = self.viewport_raster_options(ctx, rect) else {
@@ -8494,6 +8786,7 @@ impl eframe::App for ViewerApp {
         let ctx = ui.ctx().clone();
         self.poll_async_site_catalog(&ctx);
         self.poll_async_load(&ctx);
+        self.poll_extra_pane_loads(&ctx);
         self.poll_radar_layer_loads(&ctx);
         self.poll_intl_radar_layer_loads(&ctx);
         self.drain_intl_loop_load(&ctx);
@@ -10669,6 +10962,81 @@ impl ViewerApp {
         });
     }
 
+    fn extra_pane_site_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        pane_slot: usize,
+    ) {
+        let Some(pane) = self.extra_panes.get(pane_slot) else {
+            return;
+        };
+        let mut selected_site_id = pane.pinned_site_id.clone();
+        let selected_text = selected_site_id
+            .as_deref()
+            .and_then(|id| self.sites.iter().find(|site| site.level2_id == id))
+            .map(format_site_label)
+            .unwrap_or_else(|| "Follow primary radar".to_owned());
+        ui.horizontal(|ui| {
+            ui.label("Pane radar");
+            egui::ComboBox::from_id_salt(("pane_site_combo", pane_slot))
+                .selected_text(selected_text)
+                .width((ui.available_width() - 156.0).max(150.0))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut selected_site_id, None, "Follow primary radar");
+                    for site in &self.sites {
+                        ui.selectable_value(
+                            &mut selected_site_id,
+                            Some(site.level2_id.clone()),
+                            format_site_label(site),
+                        );
+                    }
+                });
+            let busy = self.extra_panes[pane_slot].load_receiver.is_some();
+            let selected_site = selected_site_id
+                .as_deref()
+                .and_then(|id| self.sites.iter().find(|site| site.level2_id == id))
+                .cloned();
+            if fixed_action_button(ui, "Load", 48.0)
+                .on_hover_text("Load this radar only into the focused pane")
+                .clicked()
+                && !busy
+                && let Some(site) = selected_site.clone()
+            {
+                self.start_extra_pane_latest_load(pane_slot, site, ctx);
+            }
+            if fixed_action_button(ui, "Center", 58.0)
+                .on_hover_text("Center this pane on its selected radar")
+                .clicked()
+                && let Some(site) = selected_site.clone()
+            {
+                self.center_extra_pane_on_site(pane_slot, &site);
+                ctx.request_repaint();
+            }
+        });
+        let previous = self.extra_panes[pane_slot].pinned_site_id.clone();
+        if selected_site_id != previous {
+            match selected_site_id {
+                Some(site_id) => {
+                    if let Some(site) = self
+                        .sites
+                        .iter()
+                        .find(|site| site.level2_id == site_id)
+                        .cloned()
+                    {
+                        let pane = &mut self.extra_panes[pane_slot];
+                        pane.pinned_site_id = Some(site_id.clone());
+                        pane.status = format!("Pane radar set to {site_id}; click Load");
+                        self.center_extra_pane_on_site(pane_slot, &site);
+                    }
+                }
+                None => self.clear_extra_pane_radar(pane_slot),
+            }
+            ctx.request_repaint();
+        }
+        ui.weak(&self.extra_panes[pane_slot].status);
+    }
+
     fn radar_controls_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // The sidebar edits the FOCUSED pane: the main pane (or 1x1) edits the
         // shared state everyone follows; a focused extra pane edits itself.
@@ -10729,6 +11097,7 @@ impl ViewerApp {
                     slot + 2
                 ),
             );
+            self.extra_pane_site_controls(ui, ctx, slot);
         }
 
         // R1: SITE — pick, load, live state, one-line status.
@@ -10999,9 +11368,17 @@ impl ViewerApp {
 
         // Everything below genuinely needs a loaded volume (the status line
         // above already explains the empty state).
-        let Some(volume) = &self.volume else {
+        let active_volume = editing_pane
+            .and_then(|slot| {
+                self.extra_panes
+                    .get(slot)
+                    .and_then(|pane| pane.volume.clone())
+            })
+            .or_else(|| self.volume.clone());
+        let Some(volume) = active_volume else {
             return;
         };
+        let volume = volume.as_ref();
 
         let product_buttons = global_displayable_products(volume)
             .into_iter()
@@ -13575,9 +13952,8 @@ impl ViewerApp {
         let pane = self.extra_panes.get(pane_index - 1)?;
         let product = pane.product.clone();
         let preferred_cut = pane.cut.unwrap_or(self.selected_cut);
-        let cut = self
-            .volume
-            .as_deref()
+        let volume = pane.volume.as_deref().or(self.volume.as_deref());
+        let cut = volume
             .and_then(|volume| best_cut_for_product(volume, preferred_cut, &product))
             .unwrap_or(preferred_cut);
         Some((product, cut))
@@ -14335,6 +14711,14 @@ impl ViewerApp {
         // the paint pass below renders all panes with the same final
         // transform (no one-frame shear between panes during a drag).
         for (cell_index, cell) in cells.iter().copied().enumerate() {
+            let owns_cell_radar = cell_index > 0
+                && self
+                    .extra_panes
+                    .get(cell_index - 1)
+                    .is_some_and(ViewPane::owns_radar);
+            let pane_context = (cell_index > 0)
+                .then(|| self.begin_extra_pane_context(cell_index - 1))
+                .flatten();
             let response = ui.interact(
                 cell,
                 ui.id().with(("grid-pane", cell_index)),
@@ -14476,16 +14860,22 @@ impl ViewerApp {
                 && response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
-                self.handle_plain_map_click(
-                    cell,
-                    &site_points,
-                    &intl_points,
-                    &community_points,
-                    &custom_poll_points,
-                    &raob_points,
-                    pointer,
-                    ui.ctx(),
-                );
+                if owns_cell_radar {
+                    self.status =
+                        "Focused pane owns its radar; use the pane SITE controls to retarget it"
+                            .to_owned();
+                } else {
+                    self.handle_plain_map_click(
+                        cell,
+                        &site_points,
+                        &intl_points,
+                        &community_points,
+                        &custom_poll_points,
+                        &raob_points,
+                        pointer,
+                        ui.ctx(),
+                    );
+                }
                 if let Some(index) = self.hazard_at_position(cell, pointer) {
                     self.select_hazard_index(index);
                 }
@@ -14580,11 +14970,17 @@ impl ViewerApp {
             }
 
             hovers.push(response.hover_pos());
+            if let Some(snapshot) = pane_context {
+                self.end_extra_pane_context(cell_index - 1, snapshot);
+            }
         }
 
         // Paint pass: post-interaction transform; site markers recomputed
         // here so they land at the final positions too.
         for (cell_index, cell) in cells.iter().copied().enumerate() {
+            let pane_context = (cell_index > 0)
+                .then(|| self.begin_extra_pane_context(cell_index - 1))
+                .flatten();
             let site_points = self
                 .sites
                 .iter()
@@ -14692,6 +15088,9 @@ impl ViewerApp {
             cell_painter.line_segment([cell.left_bottom(), cell.right_bottom()], border);
             cell_painter.line_segment([cell.left_top(), cell.left_bottom()], border);
             cell_painter.line_segment([cell.right_top(), cell.right_bottom()], border);
+            if let Some(snapshot) = pane_context {
+                self.end_extra_pane_context(cell_index - 1, snapshot);
+            }
         }
 
         // One picker for the whole grid, anchored in cell 0 — the geo
