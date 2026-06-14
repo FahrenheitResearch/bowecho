@@ -394,6 +394,32 @@ impl crate::ViewerApp {
                 self.app_settings.event_pad_frames = pad;
                 let _ = self.app_settings.save();
             }
+            let mut auto_model = self.app_settings.event_track_auto_model;
+            let mut model_slug =
+                crate::normalize_event_track_model_slug(&self.app_settings.event_track_model_slug);
+            ui.checkbox(&mut auto_model, "Auto model").on_hover_text(
+                "Tornado track clicks only: download a sounding-grade HRRR/RAP run for the init covering the track time.",
+            );
+            ui.add_enabled_ui(auto_model, |ui| {
+                egui::ComboBox::from_id_salt("event_track_auto_model_slug")
+                    .selected_text(model_slug.to_ascii_uppercase())
+                    .width(64.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut model_slug, "hrrr".to_owned(), "HRRR");
+                        ui.selectable_value(&mut model_slug, "rap".to_owned(), "RAP");
+                    });
+            })
+            .response
+            .on_hover_text(
+                "HRRR and RAP are hourly, so BowEcho picks the cycle at or before the track time and downloads the bracketing forecast hours.",
+            );
+            if auto_model != self.app_settings.event_track_auto_model
+                || model_slug != self.app_settings.event_track_model_slug
+            {
+                self.app_settings.event_track_auto_model = auto_model;
+                self.app_settings.event_track_model_slug = model_slug;
+                let _ = self.app_settings.save();
+            }
             if self.event_explorer.fetch.is_some() {
                 ui.spinner();
             }
@@ -686,6 +712,9 @@ impl crate::ViewerApp {
             && let Some(site) = self.sites.get(overlay_index).cloned()
         {
             self.start_radar_layer_event_load(site, end_time, ctx);
+        }
+        if self.app_settings.event_track_auto_model {
+            self.start_event_track_model_ingest(hit.time_utc, &hit.label, ctx);
         }
     }
 

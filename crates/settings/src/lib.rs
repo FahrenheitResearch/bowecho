@@ -144,6 +144,16 @@ pub struct AppSettings {
     /// request: a short track otherwise loads only a handful of frames).
     #[serde(default = "default_event_pad_frames")]
     pub event_pad_frames: u16,
+    /// When a tornado track is clicked from the Event day layer, optionally
+    /// kick a sounding-grade model ingest for the init covering that track
+    /// time so skew-T soundings are ready without manual date/cycle math.
+    #[serde(default)]
+    pub event_track_auto_model: bool,
+    /// Model slug for `event_track_auto_model`. Kept separate from the
+    /// Download panel's general model pick because a user may prefer HRRR
+    /// for storm events while browsing other model products elsewhere.
+    #[serde(default = "default_model_slug")]
+    pub event_track_model_slug: String,
     /// Archive browser click mode: true = load a loop ending at the chosen
     /// scan, false = load only that scan.
     #[serde(default = "default_true")]
@@ -348,6 +358,8 @@ impl Default for AppSettings {
             smooth_display_mode: String::new(),
             loop_speed_percent: default_loop_speed_percent(),
             event_pad_frames: default_event_pad_frames(),
+            event_track_auto_model: false,
+            event_track_model_slug: default_model_slug(),
             archive_load_loop: true,
             archive_frame_count: default_archive_frame_count(),
             poll_url: String::new(),
@@ -753,6 +765,23 @@ mod tests {
         let back = AppSettings::from_json(&settings.to_json());
 
         assert_eq!(back.event_pad_frames, 12);
+    }
+
+    #[test]
+    fn event_track_model_settings_default_and_round_trip() {
+        let old = AppSettings::from_json("{}");
+        assert!(!old.event_track_auto_model);
+        assert_eq!(old.event_track_model_slug, "hrrr");
+
+        let settings = AppSettings {
+            event_track_auto_model: true,
+            event_track_model_slug: "rap".to_owned(),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert!(back.event_track_auto_model);
+        assert_eq!(back.event_track_model_slug, "rap");
     }
 
     #[test]

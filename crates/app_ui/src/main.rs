@@ -16169,7 +16169,7 @@ impl ViewerApp {
     /// Spawn the flexible-download worker on first use (the Download
     /// section's body rendering — NOT window open, so no network probes
     /// fire until the user actually looks at acquisition).
-    fn ensure_ingest_worker(&mut self, ctx: &egui::Context) {
+    fn ensure_ingest_worker_started(&mut self, ctx: &egui::Context) {
         if self.ingest.is_some() {
             return;
         }
@@ -16180,6 +16180,77 @@ impl ViewerApp {
         });
         self.download_panel
             .set_model_options(ingest_worker_model_options());
+        self.ingest = Some(worker);
+    }
+
+    fn start_event_track_model_ingest(
+        &mut self,
+        target: DateTime<Utc>,
+        event_label: &str,
+        ctx: &egui::Context,
+    ) {
+        if self.model_ingest_rx.is_some() || self.download_panel.is_running() {
+            self.status = "Model download already running; skipped event auto-model".to_owned();
+            return;
+        }
+        let model_slug =
+            normalize_event_track_model_slug(&self.app_settings.event_track_model_slug);
+        let Some((date, cycle, hours)) =
+            ingest_worker::spec_fields_for_displayed_time(&model_slug, target)
+        else {
+            self.status = format!(
+                "Event auto-model could not map {} to a model cycle",
+                target.format("%Y-%m-%d %H:%MZ")
+            );
+            return;
+        };
+        let mut spec = default_download_spec(&model_slug);
+        spec.date = date;
+        spec.cycle = cycle;
+        spec.hours = hours;
+        spec.profile = "sounding".to_owned();
+        spec.derived = false;
+        spec.heavy = false;
+        spec.source = "auto".to_owned();
+        spec.cache_dir = settings::model_cache_dir().to_string_lossy().into_owned();
+
+        self.model_enabled = true;
+        self.model_dock_open = true;
+        self.model_download_open = true;
+        if self.model_dock.is_none() {
+            self.model_dock = Some(model_data::ModelDataDock::new(
+                ctx,
+                settings::model_store_dir(),
+            ));
+        }
+        self.ensure_ingest_worker_started(ctx);
+        self.download_panel = rw_ui::DownloadPanel::new(spec.clone());
+        self.download_panel
+            .set_model_options(ingest_worker_model_options());
+        sync_run_pickers(&mut self.download_panel, &spec);
+        if let Ok(parsed_hours) = rw_ingest::ingest_hour::parse_hours(&spec.hours) {
+            self.download_panel.begin_run(&parsed_hours);
+        }
+        if let Some(ingest) = &self.ingest {
+            ingest.send(ingest_worker::IngestRequest::Estimate(spec.clone()));
+            ingest.send(ingest_worker::IngestRequest::Start(spec.clone()));
+        }
+        self.status = format!(
+            "Event auto-model: fetching {} {} {:02}z f{} for {}",
+            spec.model.to_ascii_uppercase(),
+            spec.date,
+            spec.cycle,
+            spec.hours,
+            event_label
+        );
+        ctx.request_repaint();
+    }
+
+    fn ensure_ingest_worker(&mut self, ctx: &egui::Context) {
+        if self.ingest.is_some() {
+            return;
+        }
+        self.ensure_ingest_worker_started(ctx);
         let mut spec = self.download_panel.spec().clone();
         // Never open empty (field bug): seed today's UTC date, then
         // probe the newest ACTUALLY-AVAILABLE run, which corrects both
@@ -16188,9 +16259,10 @@ impl ViewerApp {
             spec.date = Utc::now().format("%Y%m%d").to_string();
         }
         sync_run_pickers(&mut self.download_panel, &spec);
-        worker.send(ingest_worker::IngestRequest::Estimate(spec.clone()));
-        worker.send(ingest_worker::IngestRequest::Latest(spec));
-        self.ingest = Some(worker);
+        if let Some(worker) = &self.ingest {
+            worker.send(ingest_worker::IngestRequest::Estimate(spec.clone()));
+            worker.send(ingest_worker::IngestRequest::Latest(spec));
+        }
     }
 
     fn dispatch_download_events(&mut self, events: Vec<rw_ui::DownloadEvent>) {
@@ -25846,6 +25918,18 @@ fn default_download_spec(model_slug: &str) -> rw_ui::DownloadSpec {
         // (field report: os error 30 on model downloads).
         cache_dir: settings::model_cache_dir().to_string_lossy().into_owned(),
         ..rw_ui::DownloadSpec::default()
+    }
+}
+
+pub(crate) fn normalize_event_track_model_slug(model_slug: &str) -> String {
+    let requested = match model_slug.trim().to_ascii_lowercase().as_str() {
+        "rap" => rustwx_core::ModelId::Rap,
+        _ => rustwx_core::ModelId::Hrrr,
+    };
+    if rw_ingest::ingest_supported(requested) {
+        requested.as_str().to_owned()
+    } else {
+        rustwx_core::ModelId::Hrrr.as_str().to_owned()
     }
 }
 
