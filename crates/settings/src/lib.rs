@@ -38,6 +38,10 @@ pub struct AppSettings {
     pub style_profile: String,
     /// Multi-pane grid layout pane count from the last session (1, 2, 3, or 4).
     pub grid_pane_count: usize,
+    /// When true, focused extra panes own their radar source/history/load
+    /// controls instead of always following the primary pane.
+    #[serde(default)]
+    pub independent_panels: bool,
     /// Placefile URLs (GRLevelX-style overlays) with per-file enable flags.
     pub placefiles: Vec<PlacefileEntry>,
     /// Default overlay toggles, restored at startup (user request: "let
@@ -339,6 +343,7 @@ impl Default for AppSettings {
             palette_by_product: BTreeMap::new(),
             style_profile: default_style_profile(),
             grid_pane_count: 1,
+            independent_panels: false,
             placefiles: Vec::new(),
             basemap_style: default_basemap_style(),
             bold_labels: default_bold_labels(),
@@ -751,6 +756,21 @@ mod tests {
 
         assert!(!back.archive_load_loop);
         assert_eq!(back.archive_frame_count, 24);
+    }
+
+    #[test]
+    fn independent_panels_default_and_round_trip() {
+        assert!(!AppSettings::from_json("{}").independent_panels);
+
+        let settings = AppSettings {
+            independent_panels: true,
+            grid_pane_count: 4,
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert!(back.independent_panels);
+        assert_eq!(back.grid_pane_count, 4);
     }
 
     #[test]

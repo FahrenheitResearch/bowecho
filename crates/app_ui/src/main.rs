@@ -2369,6 +2369,12 @@ struct ViewPane {
     volume: Option<Arc<RadarVolume>>,
     source_path: Option<PathBuf>,
     load_timing: Option<LoadTimings>,
+    frame_history: Vec<FrameHistoryEntry>,
+    selected_frame_index: usize,
+    history_playing: bool,
+    browsing_history: bool,
+    last_history_step: Option<Instant>,
+    archive_load_progress: Option<ArchiveLoadProgress>,
     load_receiver: Option<mpsc::Receiver<AsyncLoadResult>>,
     pending_site_id: Option<String>,
     status: String,
@@ -2390,6 +2396,12 @@ impl ViewPane {
             volume: None,
             source_path: None,
             load_timing: None,
+            frame_history: Vec::new(),
+            selected_frame_index: 0,
+            history_playing: false,
+            browsing_history: false,
+            last_history_step: None,
+            archive_load_progress: None,
             load_receiver: None,
             pending_site_id: None,
             status: "Following primary radar".to_owned(),
@@ -2412,6 +2424,15 @@ impl ViewPane {
         self.texture_key = None;
         self.pending_render_key = None;
         self.render_ms = None;
+    }
+
+    fn clear_history(&mut self) {
+        self.frame_history.clear();
+        self.selected_frame_index = 0;
+        self.history_playing = false;
+        self.browsing_history = false;
+        self.last_history_step = None;
+        self.archive_load_progress = None;
     }
 }
 
@@ -5037,6 +5058,86 @@ impl ViewerApp {
         ctx.request_repaint_after(Duration::from_millis(50));
     }
 
+    fn maybe_advance_extra_pane_history_loops(&mut self, ctx: &egui::Context) {
+        if !self.app_settings.independent_panels {
+            return;
+        }
+        let frame_ms = self.loop_frame_ms();
+        let mut steps = Vec::new();
+        for (slot, pane) in self.extra_panes.iter().enumerate() {
+            if !pane.history_playing || pane.frame_history.len() <= 1 {
+                continue;
+            }
+            let should_step = pane
+                .last_history_step
+                .is_none_or(|last_step| last_step.elapsed() >= Duration::from_millis(frame_ms));
+            if should_step {
+                let next_index = (pane.selected_frame_index + 1) % pane.frame_history.len();
+                steps.push((slot, next_index));
+            }
+        }
+        if steps.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for (slot, next_index) in steps {
+            if let Some(pane) = self.extra_panes.get_mut(slot) {
+                pane.last_history_step = Some(now);
+            }
+            self.select_extra_pane_history_frame(slot, next_index, ctx);
+        }
+        ctx.request_repaint_after(Duration::from_millis(50));
+    }
+
+    fn toggle_extra_pane_history_playback(
+        &mut self,
+        pane_slot: usize,
+        ctx: &egui::Context,
+    ) -> bool {
+        let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
+            return false;
+        };
+        if pane.frame_history.len() <= 1 {
+            return false;
+        }
+        pane.history_playing = !pane.history_playing;
+        if pane.history_playing {
+            pane.browsing_history = false;
+        } else {
+            pane.browsing_history = pane.selected_frame_index + 1 < pane.frame_history.len();
+        }
+        pane.last_history_step = Some(Instant::now());
+        let frame_ms = self.loop_frame_ms();
+        ctx.request_repaint_after(Duration::from_millis(frame_ms));
+        true
+    }
+
+    fn step_extra_pane_history_frame(
+        &mut self,
+        pane_slot: usize,
+        delta: isize,
+        ctx: &egui::Context,
+    ) -> bool {
+        let Some(pane) = self.extra_panes.get(pane_slot) else {
+            return false;
+        };
+        let frame_count = pane.frame_history.len();
+        if frame_count <= 1 {
+            return false;
+        }
+        let next_index =
+            (pane.selected_frame_index as isize + delta).rem_euclid(frame_count as isize) as usize;
+        if next_index == pane.selected_frame_index {
+            return false;
+        }
+        if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+            pane.history_playing = false;
+            pane.browsing_history = next_index + 1 < pane.frame_history.len();
+        }
+        self.select_extra_pane_history_frame(pane_slot, next_index, ctx);
+        true
+    }
+
     fn set_history_frame_limit(&mut self, limit: usize, ctx: &egui::Context) {
         let active_identity = self
             .volume
@@ -5537,7 +5638,11 @@ impl ViewerApp {
         }
 
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
-            if self.toggle_history_playback(ctx) {
+            let toggled = match self.independent_editing_pane() {
+                Some(slot) => self.toggle_extra_pane_history_playback(slot, ctx),
+                None => self.toggle_history_playback(ctx),
+            };
+            if toggled {
                 ctx.request_repaint();
             }
             return;
@@ -5553,7 +5658,11 @@ impl ViewerApp {
             }
         });
         if frame_delta != 0 {
-            if self.step_history_frame(frame_delta, ctx) {
+            let stepped = match self.independent_editing_pane() {
+                Some(slot) => self.step_extra_pane_history_frame(slot, frame_delta, ctx),
+                None => self.step_history_frame(frame_delta, ctx),
+            };
+            if stepped {
                 ctx.request_repaint();
             }
             return;
@@ -5614,7 +5723,15 @@ impl ViewerApp {
             (egui::Key::Num9, "9"),
             (egui::Key::Num0, "0"),
         ];
-        let Some(volume) = self.volume.clone() else {
+        let focused_slot = self.focused_extra_pane();
+        let Some(volume) = focused_slot
+            .and_then(|slot| {
+                self.extra_panes
+                    .get(slot)
+                    .and_then(|pane| pane.volume.clone())
+            })
+            .or_else(|| self.volume.clone())
+        else {
             return false;
         };
         for (key, name) in KEYS {
@@ -5630,9 +5747,16 @@ impl ViewerApp {
             else {
                 return false;
             };
-            match self.focused_extra_pane() {
+            match focused_slot {
                 Some(slot) => {
                     if self.extra_panes[slot].product != product {
+                        if let Some(cut) = best_cut_for_product(
+                            volume.as_ref(),
+                            self.extra_panes[slot].cut.unwrap_or(self.selected_cut),
+                            &product,
+                        ) {
+                            self.extra_panes[slot].cut = Some(cut);
+                        }
                         self.extra_panes[slot].product = product;
                         self.extra_panes[slot].render_ms = None;
                     }
@@ -5665,10 +5789,15 @@ impl ViewerApp {
     }
 
     fn step_pane_product(&mut self, slot: usize, delta: isize) -> bool {
-        let Some(volume) = self.volume.as_ref() else {
+        let Some(volume) = self
+            .extra_panes
+            .get(slot)
+            .and_then(|pane| pane.volume.clone())
+            .or_else(|| self.volume.clone())
+        else {
             return false;
         };
-        let products = global_displayable_products(volume);
+        let products = global_displayable_products(volume.as_ref());
         let Some(next) =
             stepped_product(&products, &self.extra_panes[slot].product, delta).cloned()
         else {
@@ -5677,6 +5806,13 @@ impl ViewerApp {
         if self.extra_panes[slot].product == next {
             return false;
         }
+        if let Some(cut) = best_cut_for_product(
+            volume.as_ref(),
+            self.extra_panes[slot].cut.unwrap_or(self.selected_cut),
+            &next,
+        ) {
+            self.extra_panes[slot].cut = Some(cut);
+        }
         self.extra_panes[slot].product = next;
         self.extra_panes[slot].render_ms = None;
         true
@@ -5684,11 +5820,16 @@ impl ViewerApp {
 
     /// Step the focused pane's tilt, pinning it (independent of main).
     fn step_pane_tilt(&mut self, slot: usize, delta: isize) -> bool {
-        let Some(volume) = self.volume.as_ref() else {
+        let Some(volume) = self
+            .extra_panes
+            .get(slot)
+            .and_then(|pane| pane.volume.clone())
+            .or_else(|| self.volume.clone())
+        else {
             return false;
         };
         let product = self.extra_panes[slot].product.clone();
-        let cuts = displayable_cuts_for_product(volume, &product);
+        let cuts = displayable_cuts_for_product(volume.as_ref(), &product);
         let current = self.extra_panes[slot].cut.unwrap_or(self.selected_cut);
         let Some(next_cut) = stepped_cut(&cuts, current, delta) else {
             return false;
@@ -6983,8 +7124,152 @@ impl ViewerApp {
                 })
                 .cloned()
                 .unwrap_or(DisplayProduct::Moment(MomentType::Reflectivity));
+            let slot = self.extra_panes.len();
             self.extra_panes.push(ViewPane::new(next));
+            if self.app_settings.independent_panels {
+                self.initialize_extra_pane_from_primary(slot);
+            }
         }
+    }
+
+    fn independent_editing_pane(&self) -> Option<usize> {
+        self.app_settings
+            .independent_panels
+            .then(|| self.focused_extra_pane())
+            .flatten()
+    }
+
+    fn set_independent_panels(&mut self, enabled: bool, ctx: &egui::Context) {
+        if self.app_settings.independent_panels == enabled {
+            return;
+        }
+        self.app_settings.independent_panels = enabled;
+        let _ = self.app_settings.save();
+        self.sync_extra_panes();
+        if enabled {
+            for slot in 0..self.extra_panes.len() {
+                self.initialize_extra_pane_from_primary(slot);
+            }
+            self.status =
+                "Independent panels on - selected pane owns radar loads and loops".to_owned();
+        } else {
+            for slot in 0..self.extra_panes.len() {
+                self.clear_extra_pane_radar(slot);
+            }
+            self.status = "Independent panels off - extra panes follow primary radar".to_owned();
+        }
+        ctx.request_repaint();
+    }
+
+    fn initialize_extra_pane_from_primary(&mut self, pane_slot: usize) {
+        let primary_volume = self.volume.clone();
+        let source_path = self.source_path.clone();
+        let load_timing = self.load_timing;
+        let frame_history = self.frame_history.clone();
+        let selected_frame_index = self
+            .selected_frame_index
+            .min(frame_history.len().saturating_sub(1));
+        let selected_site = self.selected_site().cloned();
+        let site_id = primary_volume
+            .as_ref()
+            .map(|volume| volume.site.id.clone())
+            .or_else(|| selected_site.as_ref().map(|site| site.level2_id.clone()));
+        let center = primary_volume
+            .as_ref()
+            .and_then(|volume| Some((volume.site.latitude_deg?, volume.site.longitude_deg?)))
+            .or_else(|| selected_site.as_ref().and_then(site_location));
+
+        let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
+            return;
+        };
+        pane.pinned_site_id = site_id.clone();
+        pane.volume = primary_volume.clone();
+        pane.source_path = source_path;
+        pane.load_timing = load_timing;
+        pane.frame_history = frame_history;
+        pane.selected_frame_index = selected_frame_index;
+        pane.history_playing = false;
+        pane.browsing_history =
+            self.browsing_history && selected_frame_index + 1 < pane.frame_history.len();
+        pane.last_history_step = None;
+        pane.archive_load_progress = None;
+        pane.load_receiver = None;
+        pane.pending_site_id = None;
+        pane.map_center_lat = self.map_center_lat;
+        pane.map_center_lon = self.map_center_lon;
+        pane.map_scale = self.map_scale;
+        if let Some((latitude_deg, longitude_deg)) = center {
+            pane.map_center_lat = latitude_deg.clamp(-85.0, 85.0);
+            pane.map_center_lon = normalize_lon(longitude_deg);
+            pane.map_scale = pane.map_scale.max(220.0);
+        }
+        if let Some(volume) = primary_volume.as_deref() {
+            let current_cut = pane.cut.unwrap_or(self.selected_cut);
+            if !is_displayable_on_cut(volume, current_cut, &pane.product) {
+                if let Some(cut) = best_cut_for_product(volume, current_cut, &pane.product) {
+                    pane.cut = Some(cut);
+                } else if let Some(product) = global_displayable_products(volume).first().cloned() {
+                    pane.product = product;
+                    pane.cut = Some(0);
+                }
+            } else {
+                pane.cut = Some(current_cut);
+            }
+        }
+        pane.status = site_id
+            .map(|id| {
+                if primary_volume.is_some() {
+                    format!("Independent pane loaded from {id}")
+                } else {
+                    format!("Independent pane set to {id}; click Load Latest")
+                }
+            })
+            .unwrap_or_else(|| "Independent pane ready".to_owned());
+        pane.clear_texture();
+    }
+
+    fn extra_pane_selected_site_index(&self, pane_slot: usize) -> usize {
+        self.extra_panes
+            .get(pane_slot)
+            .and_then(|pane| {
+                pane.pinned_site_id
+                    .as_deref()
+                    .or_else(|| pane.volume.as_ref().map(|volume| volume.site.id.as_str()))
+            })
+            .and_then(|site_id| {
+                self.sites
+                    .iter()
+                    .position(|site| site.level2_id.eq_ignore_ascii_case(site_id))
+            })
+            .unwrap_or(self.selected_site_index)
+    }
+
+    fn set_extra_pane_selected_site(&mut self, pane_slot: usize, site_index: usize) {
+        let Some(site) = self.sites.get(site_index).cloned() else {
+            return;
+        };
+        let site_id = site.level2_id.clone();
+        let changed = self
+            .extra_panes
+            .get(pane_slot)
+            .and_then(|pane| pane.pinned_site_id.as_deref())
+            != Some(site_id.as_str());
+        if !changed {
+            return;
+        }
+        if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+            pane.pinned_site_id = Some(site_id.clone());
+            pane.volume = None;
+            pane.source_path = None;
+            pane.load_timing = None;
+            pane.load_receiver = None;
+            pane.pending_site_id = None;
+            pane.cut = None;
+            pane.status = format!("Pane radar set to {site_id}; click Load Latest");
+            pane.clear_history();
+            pane.clear_texture();
+        }
+        self.center_extra_pane_on_site(pane_slot, &site);
     }
 
     fn extra_pane_display_volume(&self, pane_slot: usize) -> Option<Arc<RadarVolume>> {
@@ -7035,6 +7320,7 @@ impl ViewerApp {
             pane.load_timing = None;
             pane.load_receiver = None;
             pane.pending_site_id = None;
+            pane.clear_history();
             pane.status = "Following primary radar".to_owned();
             pane.cut = None;
             pane.clear_texture();
@@ -7058,32 +7344,67 @@ impl ViewerApp {
         site: RadarSite,
         ctx: &egui::Context,
     ) {
-        let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
-            return;
-        };
-        if pane.load_receiver.is_some() {
+        self.start_extra_pane_level2_load_with_mode(pane_slot, site, LatestLoadMode::User, ctx);
+    }
+
+    fn start_extra_pane_loop_load(
+        &mut self,
+        pane_slot: usize,
+        site: RadarSite,
+        ctx: &egui::Context,
+    ) {
+        self.start_extra_pane_level2_load_with_mode(pane_slot, site, LatestLoadMode::Loop, ctx);
+    }
+
+    fn start_extra_pane_level2_load_with_mode(
+        &mut self,
+        pane_slot: usize,
+        site: RadarSite,
+        mode: LatestLoadMode,
+        ctx: &egui::Context,
+    ) {
+        if pane_slot >= self.extra_panes.len()
+            || self.extra_panes[pane_slot].load_receiver.is_some()
+        {
             return;
         }
         let site_id = site.level2_id.clone();
+        if history_contains_other_site(&self.extra_panes[pane_slot].frame_history, &site_id) {
+            self.extra_panes[pane_slot].clear_history();
+        }
         let (sender, receiver) = mpsc::channel();
-        let current_source_path = pane.source_path.clone();
-        let current_frame_identity = pane
+        let current_source_path = self.extra_panes[pane_slot].source_path.clone();
+        let known_frame_paths = if mode == LatestLoadMode::Loop {
+            self.current_extra_pane_history_paths(pane_slot)
+        } else {
+            BTreeSet::new()
+        };
+        let current_frame_identity = self.extra_panes[pane_slot]
             .volume
             .as_ref()
             .filter(|volume| volume.site.id == site_id)
             .map(|volume| frame_identity_for_volume(volume.as_ref()));
-        pane.pinned_site_id = Some(site_id.clone());
-        pane.pending_site_id = Some(site_id.clone());
-        pane.load_receiver = Some(receiver);
-        pane.status = format!("Loading latest L2 {site_id}");
+        let progress = (mode == LatestLoadMode::Loop)
+            .then(|| ArchiveLoadProgress::latest_loop_start(&site_id));
+        {
+            let pane = &mut self.extra_panes[pane_slot];
+            pane.pinned_site_id = Some(site_id.clone());
+            pane.pending_site_id = Some(site_id.clone());
+            pane.load_receiver = Some(receiver);
+            pane.archive_load_progress = progress.clone();
+            pane.status = progress.as_ref().map_or_else(
+                || format!("Loading latest L2 {site_id}"),
+                ArchiveLoadProgress::status_text,
+            );
+        }
         self.center_extra_pane_on_site(pane_slot, &site);
         spawn_latest_level2_load_worker(
             site,
-            LatestLoadMode::User,
+            mode,
             current_source_path,
-            BTreeSet::new(),
+            known_frame_paths,
             current_frame_identity,
-            1,
+            self.history_frame_limit,
             self.display_live_chunk_updates,
             sender,
         );
@@ -7106,7 +7427,9 @@ impl ViewerApp {
                         saw_message = true;
                         match message.update {
                             AsyncLoadUpdate::ArchiveProgress(progress) => {
-                                self.extra_panes[pane_slot].status = progress.status_text();
+                                let pane = &mut self.extra_panes[pane_slot];
+                                pane.status = progress.status_text();
+                                pane.archive_load_progress = Some(progress);
                                 ctx.request_repaint_after(Duration::from_millis(
                                     ACTIVE_LOAD_POLL_MS,
                                 ));
@@ -7117,16 +7440,18 @@ impl ViewerApp {
                                     format!("Preview {}", message.label);
                             }
                             AsyncLoadUpdate::History(batch, select_frame) => {
-                                if select_frame && let Some(decoded) = batch.into_selected() {
-                                    self.install_extra_pane_volume(pane_slot, decoded, ctx);
-                                    self.extra_panes[pane_slot].status =
-                                        format!("Loaded {}", message.label);
-                                }
+                                self.install_extra_pane_decoded_load_batch(
+                                    pane_slot,
+                                    batch,
+                                    select_frame,
+                                    ctx,
+                                );
                             }
                             AsyncLoadUpdate::Unchanged { timings, reason } => {
                                 let pane = &mut self.extra_panes[pane_slot];
                                 pane.load_receiver = None;
                                 pane.pending_site_id = None;
+                                pane.archive_load_progress = None;
                                 if let Some(timings) = timings {
                                     pane.load_timing = Some(timings);
                                 }
@@ -7137,12 +7462,23 @@ impl ViewerApp {
                             AsyncLoadUpdate::Final(result) => {
                                 self.extra_panes[pane_slot].load_receiver = None;
                                 self.extra_panes[pane_slot].pending_site_id = None;
+                                self.extra_panes[pane_slot].archive_load_progress = None;
                                 match result {
                                     Ok(batch) => {
-                                        if let Some(decoded) = batch.into_selected() {
-                                            self.install_extra_pane_volume(pane_slot, decoded, ctx);
-                                            self.extra_panes[pane_slot].status =
-                                                format!("Loaded {}", message.label);
+                                        let frame_count = batch.frames.len();
+                                        let selected = self.install_extra_pane_decoded_load_batch(
+                                            pane_slot, batch, true, ctx,
+                                        );
+                                        if !selected {
+                                            self.extra_panes[pane_slot].status = if frame_count > 1
+                                            {
+                                                format!(
+                                                    "Loaded {frame_count} frames for {}",
+                                                    message.label
+                                                )
+                                            } else {
+                                                format!("Loaded {}", message.label)
+                                            };
                                         }
                                     }
                                     Err(err) => {
@@ -7167,12 +7503,211 @@ impl ViewerApp {
                         let pane = &mut self.extra_panes[pane_slot];
                         pane.load_receiver = None;
                         pane.pending_site_id = None;
+                        pane.archive_load_progress = None;
                         pane.status = "Pane L2 load worker disconnected".to_owned();
                         break;
                     }
                 }
             }
         }
+    }
+
+    fn install_extra_pane_decoded_load_batch(
+        &mut self,
+        pane_slot: usize,
+        batch: DecodedLoadBatch,
+        select_loaded_frame: bool,
+        ctx: &egui::Context,
+    ) -> bool {
+        if pane_slot >= self.extra_panes.len() || batch.frames.is_empty() {
+            return false;
+        }
+        let selected_index = batch.selected_index.min(batch.frames.len() - 1);
+        let selected_identity = frame_identity_for_volume(&batch.frames[selected_index].volume);
+        let selected_site_id = selected_identity.site_id.clone();
+        let active_identity = self.extra_panes[pane_slot]
+            .volume
+            .as_ref()
+            .map(|volume| frame_identity_for_volume(volume.as_ref()));
+        let should_reset = self.extra_panes[pane_slot]
+            .volume
+            .as_ref()
+            .is_some_and(|volume| volume.site.id != selected_site_id)
+            || history_contains_other_site(
+                &self.extra_panes[pane_slot].frame_history,
+                &selected_site_id,
+            );
+        if should_reset {
+            let old_len = self.extra_panes[pane_slot].frame_history.len();
+            let pane = &mut self.extra_panes[pane_slot];
+            pane.status =
+                format!("history reset (site change to {selected_site_id}, had {old_len} frames)");
+            pane.clear_history();
+        }
+
+        for decoded in batch.frames {
+            self.extra_pane_upsert_history_frame(pane_slot, decoded);
+        }
+        if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+            pane.frame_history
+                .sort_by(|left, right| left.identity.cmp(&right.identity));
+        }
+        self.trim_extra_pane_history(pane_slot);
+
+        let should_select_loaded_frame = {
+            let pane = &self.extra_panes[pane_slot];
+            select_loaded_frame && !pane.history_playing && !pane.browsing_history
+        };
+        if should_select_loaded_frame {
+            let next_index = self.extra_panes[pane_slot]
+                .frame_history
+                .iter()
+                .position(|frame| frame.identity == selected_identity)
+                .unwrap_or_else(|| {
+                    self.extra_panes[pane_slot]
+                        .frame_history
+                        .len()
+                        .saturating_sub(1)
+                });
+            let active_volume = self.extra_panes[pane_slot].volume.clone();
+            let product = self.extra_panes[pane_slot].product.clone();
+            if should_defer_live_partial_selection_for_active_product(
+                active_volume.as_deref(),
+                &product,
+                self.extra_panes[pane_slot].frame_history.get(next_index),
+            ) {
+                if let Some(active_identity) = active_identity.clone()
+                    && let Some(index) = self.extra_panes[pane_slot]
+                        .frame_history
+                        .iter()
+                        .position(|frame| frame.identity == active_identity)
+                {
+                    self.extra_panes[pane_slot].selected_frame_index = index;
+                }
+                self.extra_panes[pane_slot].status = format!(
+                    "Waiting for {} in {}",
+                    product.label(),
+                    selected_identity.site_id
+                );
+                ctx.request_repaint();
+                return false;
+            }
+            self.select_extra_pane_history_frame(pane_slot, next_index, ctx);
+            true
+        } else if let Some(active_identity) = active_identity
+            && let Some(index) = self.extra_panes[pane_slot]
+                .frame_history
+                .iter()
+                .position(|frame| frame.identity == active_identity)
+        {
+            self.extra_panes[pane_slot].selected_frame_index = index;
+            self.extra_panes[pane_slot].status =
+                format!("Backfilled {}", selected_identity.site_id);
+            ctx.request_repaint();
+            false
+        } else {
+            ctx.request_repaint();
+            false
+        }
+    }
+
+    fn extra_pane_upsert_history_frame(&mut self, pane_slot: usize, decoded: DecodedLoad) {
+        let identity = frame_identity_for_volume(&decoded.volume);
+        let frame = FrameHistoryEntry {
+            identity: identity.clone(),
+            path: decoded.path,
+            volume: Arc::new(decoded.volume),
+            timings: Some(decoded.timings),
+            status: decoded.status,
+            source_label: decoded.source_label,
+        };
+        let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
+            return;
+        };
+        if let Some(existing) = pane
+            .frame_history
+            .iter_mut()
+            .find(|candidate| candidate.identity == identity)
+        {
+            if live_partial_frame_has_new_data(&frame, existing) {
+                *existing = frame;
+            } else if frame.path == existing.path && frame.status == existing.status {
+                existing.timings = frame.timings;
+                existing.source_label = frame.source_label;
+            } else if frame_status_priority(frame.status) > frame_status_priority(existing.status)
+                || (frame_status_priority(frame.status) == frame_status_priority(existing.status)
+                    && frame.path != existing.path)
+            {
+                *existing = frame;
+            }
+        } else {
+            pane.frame_history.push(frame);
+        }
+    }
+
+    fn trim_extra_pane_history(&mut self, pane_slot: usize) {
+        let limit = normalized_history_limit(self.history_frame_limit);
+        let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
+            return;
+        };
+        while pane.frame_history.len() > limit {
+            pane.frame_history.remove(0);
+        }
+        pane.selected_frame_index = pane
+            .selected_frame_index
+            .min(pane.frame_history.len().saturating_sub(1));
+    }
+
+    fn current_extra_pane_history_paths(&self, pane_slot: usize) -> BTreeSet<PathBuf> {
+        self.extra_panes
+            .get(pane_slot)
+            .map(|pane| {
+                pane.frame_history
+                    .iter()
+                    .map(|frame| frame.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn select_extra_pane_history_frame(
+        &mut self,
+        pane_slot: usize,
+        index: usize,
+        ctx: &egui::Context,
+    ) {
+        let Some(frame) = self
+            .extra_panes
+            .get(pane_slot)
+            .and_then(|pane| pane.frame_history.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+            pane.selected_frame_index = index;
+            pane.history_playing &= pane.frame_history.len() > 1;
+        }
+        self.install_extra_pane_volume_arc(
+            pane_slot,
+            Arc::clone(&frame.volume),
+            frame.timings,
+            Some(frame.path),
+            frame.status,
+            ctx,
+        );
+        let status = self.extra_pane_selected_frame_status_text(pane_slot);
+        if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+            pane.status = status;
+        }
+    }
+
+    fn extra_pane_selected_frame_status_text(&self, pane_slot: usize) -> String {
+        self.extra_panes
+            .get(pane_slot)
+            .and_then(|pane| pane.frame_history.get(pane.selected_frame_index))
+            .map(|frame| frame_status_text(frame, Utc::now(), self.time_zone()))
+            .unwrap_or_else(|| "No Level II frame loaded".to_owned())
     }
 
     fn install_extra_pane_volume(
@@ -7182,11 +7717,47 @@ impl ViewerApp {
         ctx: &egui::Context,
     ) {
         let volume = Arc::new(decoded.volume);
+        self.install_extra_pane_volume_arc(
+            pane_slot,
+            volume,
+            Some(decoded.timings),
+            Some(decoded.path),
+            decoded.status,
+            ctx,
+        );
+    }
+
+    fn install_extra_pane_volume_arc(
+        &mut self,
+        pane_slot: usize,
+        volume: Arc<RadarVolume>,
+        load_timing: Option<LoadTimings>,
+        source_path: Option<PathBuf>,
+        frame_status: FrameStatus,
+        ctx: &egui::Context,
+    ) {
+        let display_live_chunk_updates = self.display_live_chunk_updates;
+        let main_cut = self.selected_cut;
         let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
             return;
         };
-        pane.source_path = Some(decoded.path);
-        pane.load_timing = Some(decoded.timings);
+        let previous_cut = pane.cut.unwrap_or(main_cut);
+        let previous_product = pane.product.clone();
+        let require_complete_live_cut =
+            frame_status == FrameStatus::LivePartial && !display_live_chunk_updates;
+        let (selected_cut, selected_product) = selection_for_installed_volume(
+            pane.volume.as_deref(),
+            previous_cut,
+            &previous_product,
+            volume.as_ref(),
+            !pane.history_playing,
+            display_live_chunk_updates,
+            require_complete_live_cut,
+        );
+        if let Some(source_path) = source_path {
+            pane.source_path = Some(source_path);
+        }
+        pane.load_timing = load_timing;
         pane.pinned_site_id = Some(volume.site.id.clone());
         pane.volume = Some(Arc::clone(&volume));
         pane.pending_site_id = None;
@@ -7197,22 +7768,8 @@ impl ViewerApp {
             pane.map_center_lon = normalize_lon(longitude_deg);
             pane.map_scale = pane.map_scale.max(220.0);
         }
-        if let Some(cut) = pane.cut {
-            pane.cut = Some(cut.min(volume.cuts.len().saturating_sub(1)));
-        }
-        if !is_displayable_on_cut(volume.as_ref(), pane.cut.unwrap_or(0), &pane.product) {
-            if let Some(cut) =
-                best_cut_for_product(volume.as_ref(), pane.cut.unwrap_or(0), &pane.product)
-            {
-                pane.cut = Some(cut);
-            } else if let Some(product) = global_displayable_products(volume.as_ref())
-                .first()
-                .cloned()
-            {
-                pane.product = product;
-                pane.cut = Some(0);
-            }
-        }
+        pane.cut = Some(selected_cut);
+        pane.product = selected_product;
         pane.clear_texture();
         ctx.request_repaint();
     }
@@ -8800,6 +9357,7 @@ impl eframe::App for ViewerApp {
         }
         self.maybe_refresh_live_hazards(&ctx);
         self.maybe_advance_history_loop(&ctx);
+        self.maybe_advance_extra_pane_history_loops(&ctx);
         self.sanitize_selection();
         self.poll_rotation_markers(&ctx);
         self.poll_tor_tracks(&ctx);
@@ -11037,6 +11595,54 @@ impl ViewerApp {
         ui.weak(&self.extra_panes[pane_slot].status);
     }
 
+    fn extra_pane_status_ui(&self, ui: &mut egui::Ui, pane_slot: usize) {
+        let Some(pane) = self.extra_panes.get(pane_slot) else {
+            return;
+        };
+        if let Some(progress) = &pane.archive_load_progress {
+            archive_load_progress_row(ui, progress);
+        }
+        if let Some(volume) = &pane.volume {
+            let site = volume.site.id.clone();
+            let time_zone = self.time_zone();
+            let volume_time = time_zone.format_date_hms(volume.volume_time.with_timezone(&Utc));
+            let vcp = volume
+                .vcp
+                .as_ref()
+                .map(|vcp| vcp.pattern.to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let cut_count = volume.cuts.len();
+            let decoded_radials = volume.metadata.decoded_radial_count;
+            let clock = time_zone.format_hms(volume.volume_time.with_timezone(&Utc));
+            ui.weak(format!("{site} · VCP {vcp} · {clock} · {cut_count} cuts"))
+                .on_hover_text(format!(
+                    "Site {site}\nStart {volume_time}\nVCP {vcp}\n{cut_count} cuts, {decoded_radials} radials"
+                ));
+            if let Some(frame) = pane.frame_history.get(pane.selected_frame_index)
+                && frame.identity.site_id == site
+                && let Some(readout) = live_chunk_readout(frame, Utc::now(), time_zone)
+            {
+                ui.weak(readout);
+            }
+            egui::CollapsingHeader::new("Volume details")
+                .id_salt(("pane_volume_details", pane_slot))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label(format!("Site {site}"));
+                    ui.label(format!("Start {volume_time}"));
+                    if let Some(frame) = pane.frame_history.get(pane.selected_frame_index)
+                        && frame.identity.site_id == site
+                    {
+                        ui.label(format!("Status {}", frame.status.label()));
+                    }
+                    ui.label(format!("VCP {vcp}"));
+                    ui.label(format!("{cut_count} cuts, {decoded_radials} radials"));
+                });
+        } else {
+            ui.label(&pane.status);
+        }
+    }
+
     fn radar_controls_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // The sidebar edits the FOCUSED pane: the main pane (or 1x1) edits the
         // shared state everyone follows; a focused extra pane edits itself.
@@ -11045,6 +11651,7 @@ impl ViewerApp {
             && self.active_pane >= 1
             && self.active_pane - 1 < self.extra_panes.len())
         .then(|| self.active_pane - 1);
+        let independent_pane = self.independent_editing_pane();
         let editing_product = editing_pane
             .map(|slot| self.extra_panes[slot].product.clone())
             .unwrap_or_else(|| self.selected_product.clone());
@@ -11053,6 +11660,7 @@ impl ViewerApp {
             .unwrap_or(self.selected_cut);
 
         // R0: panes row + editing-pane context, above everything it affects.
+        let mut independent_toggle: Option<bool> = None;
         ui.horizontal(|ui| {
             ui.label("Panes");
             for (layout, label, hover) in [
@@ -11088,26 +11696,55 @@ impl ViewerApp {
                     ctx.request_repaint();
                 }
             }
+            ui.separator();
+            let mut independent = self.app_settings.independent_panels;
+            if ui
+                .checkbox(&mut independent, "Independent")
+                .on_hover_text(
+                    "Selected extra panes own their radar source, loop history, pan/zoom, products, and tilts",
+                )
+                .changed()
+            {
+                independent_toggle = Some(independent);
+            }
         });
+        if let Some(enabled) = independent_toggle {
+            self.set_independent_panels(enabled, ctx);
+        }
         if let Some(slot) = editing_pane {
-            ui.colored_label(
-                ACCENT_COLOR,
-                format!(
-                    "Editing pane {} — click the main (top-left) pane to edit all",
-                    slot + 2
-                ),
-            );
-            self.extra_pane_site_controls(ui, ctx, slot);
+            if independent_pane == Some(slot) {
+                ui.colored_label(
+                    ACCENT_COLOR,
+                    format!(
+                        "Independent pane {} - SITE, products, tilt, and loop controls target this pane",
+                        slot + 2
+                    ),
+                );
+            } else {
+                ui.colored_label(
+                    ACCENT_COLOR,
+                    format!(
+                        "Editing pane {} — click the main (top-left) pane to edit all",
+                        slot + 2
+                    ),
+                );
+                self.extra_pane_site_controls(ui, ctx, slot);
+            }
         }
 
         // R1: SITE — pick, load, live state, one-line status.
         Self::section_header(ui, "SITE");
+        let site_control_pane = independent_pane;
+        let mut selected_site_index = site_control_pane
+            .map(|slot| self.extra_pane_selected_site_index(slot))
+            .unwrap_or(self.selected_site_index);
+        let original_site_index = selected_site_index;
         ui.horizontal(|ui| {
             let selected_site_label = self
-                .selected_site()
+                .sites
+                .get(selected_site_index)
                 .map(format_site_label)
                 .unwrap_or_else(|| "None".to_owned());
-            let mut selected_site_index = self.selected_site_index;
             egui::ComboBox::from_id_salt("site_combo")
                 .selected_text(selected_site_label)
                 .width((ui.available_width() - 96.0).max(160.0))
@@ -11120,12 +11757,20 @@ impl ViewerApp {
                         );
                     }
                 });
-            if selected_site_index != self.selected_site_index {
-                self.selected_site_index = selected_site_index;
+            if selected_site_index != original_site_index {
+                if let Some(slot) = site_control_pane {
+                    self.set_extra_pane_selected_site(slot, selected_site_index);
+                } else {
+                    self.selected_site_index = selected_site_index;
+                }
             }
             // ★ favorite toggle for the selected site — finally writing AND
             // reading AppSettings::favorites (it was write-only for months).
-            if let Some(site_id) = self.selected_site().map(|s| s.level2_id.clone()) {
+            if let Some(site_id) = self
+                .sites
+                .get(selected_site_index)
+                .map(|site| site.level2_id.clone())
+            {
                 let is_favorite = self.app_settings.is_favorite(&site_id);
                 let star = if is_favorite { "★" } else { "☆" };
                 if ui
@@ -11146,14 +11791,27 @@ impl ViewerApp {
                 }
             }
             if fixed_action_button(ui, "Center", 58.0).clicked() {
-                self.center_selected_site();
+                if let Some(slot) = site_control_pane {
+                    if let Some(site) = self.sites.get(selected_site_index).cloned() {
+                        self.center_extra_pane_on_site(slot, &site);
+                    }
+                } else {
+                    self.center_selected_site();
+                }
             }
         });
         let mut jump_to_place: Option<PlaceSearchResult> = None;
+        let (place_search_lat, place_search_lon) = site_control_pane
+            .and_then(|slot| {
+                self.extra_panes
+                    .get(slot)
+                    .map(|pane| (pane.map_center_lat, pane.map_center_lon))
+            })
+            .unwrap_or((self.map_center_lat, self.map_center_lon));
         let place_results = place_search_matches(
             &self.place_search_query,
-            self.map_center_lat,
-            self.map_center_lon,
+            place_search_lat,
+            place_search_lon,
             5,
         );
         ui.horizontal(|ui| {
@@ -11189,9 +11847,18 @@ impl ViewerApp {
             });
         }
         if let Some(result) = jump_to_place {
-            self.center_map_on(result.lat, result.lon);
-            self.map_scale = self.map_scale.max(420.0);
-            self.status = format!("Centered map on {}", place_search_display_name(&result));
+            if let Some(slot) = site_control_pane {
+                if let Some(pane) = self.extra_panes.get_mut(slot) {
+                    pane.map_center_lat = result.lat.clamp(-85.0, 85.0);
+                    pane.map_center_lon = normalize_lon(result.lon);
+                    pane.map_scale = pane.map_scale.max(420.0);
+                    pane.status = format!("Centered map on {}", place_search_display_name(&result));
+                }
+            } else {
+                self.center_map_on(result.lat, result.lon);
+                self.map_scale = self.map_scale.max(420.0);
+                self.status = format!("Centered map on {}", place_search_display_name(&result));
+            }
         }
         // Favorites chip row (spec §1 RADAR ▸ SITE): each chip = one-click
         // site switch + load-latest. Right-click removes the favorite.
@@ -11201,9 +11868,17 @@ impl ViewerApp {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = ROW_SPACING_X;
                 for fav in &self.app_settings.favorites {
-                    let selected = self
-                        .selected_site()
-                        .is_some_and(|s| s.level2_id.eq_ignore_ascii_case(fav));
+                    let selected = if let Some(slot) = site_control_pane {
+                        self.extra_panes.get(slot).is_some_and(|pane| {
+                            pane.pinned_site_id
+                                .as_deref()
+                                .or_else(|| pane.volume.as_ref().map(|volume| volume.site.id.as_str()))
+                                .is_some_and(|site_id| site_id.eq_ignore_ascii_case(fav))
+                        })
+                    } else {
+                        self.selected_site()
+                            .is_some_and(|s| s.level2_id.eq_ignore_ascii_case(fav))
+                    };
                     let response = ui
                         .selectable_label(selected, format!("★{fav}"))
                         .on_hover_text(
@@ -11226,26 +11901,43 @@ impl ViewerApp {
                     .iter()
                     .position(|site| site.level2_id.eq_ignore_ascii_case(&fav))
             {
-                self.selected_site_index = index;
-                if self.load_receiver.is_none() {
-                    self.load_latest_level2_for_selected_site(ui.ctx());
-                    self.remember_startup_site();
+                if let Some(slot) = site_control_pane {
+                    self.set_extra_pane_selected_site(slot, index);
+                    if self.extra_panes[slot].load_receiver.is_none()
+                        && let Some(site) = self.sites.get(index).cloned()
+                    {
+                        self.start_extra_pane_latest_load(slot, site, ui.ctx());
+                    }
+                } else {
+                    self.selected_site_index = index;
+                    if self.load_receiver.is_none() {
+                        self.load_latest_level2_for_selected_site(ui.ctx());
+                        self.remember_startup_site();
+                    }
                 }
             }
         }
+        let target_load_busy = site_control_pane
+            .and_then(|slot| self.extra_panes.get(slot))
+            .map(|pane| pane.load_receiver.is_some())
+            .unwrap_or_else(|| self.load_receiver.is_some());
         ui.horizontal(|ui| {
-            if fixed_action_button(ui, "Load Latest", 88.0).clicked()
-                && self.load_receiver.is_none()
-            {
-                // An armed international poll owns the primary view —
-                // Latest forces a poll tick instead of yanking the view
-                // back to the last US site (field report).
-                if self.intl_poll_owns_primary() {
-                    self.poll_next = None;
-                    self.status = "Refreshing international feed…".to_owned();
+            if fixed_action_button(ui, "Load Latest", 88.0).clicked() && !target_load_busy {
+                if let Some(slot) = site_control_pane {
+                    if let Some(site) = self.sites.get(selected_site_index).cloned() {
+                        self.start_extra_pane_latest_load(slot, site, ui.ctx());
+                    }
                 } else {
-                    self.load_latest_level2_for_selected_site(ui.ctx());
-                    self.remember_startup_site();
+                    // An armed international poll owns the primary view —
+                    // Latest forces a poll tick instead of yanking the view
+                    // back to the last US site (field report).
+                    if self.intl_poll_owns_primary() {
+                        self.poll_next = None;
+                        self.status = "Refreshing international feed…".to_owned();
+                    } else {
+                        self.load_latest_level2_for_selected_site(ui.ctx());
+                        self.remember_startup_site();
+                    }
                 }
             }
             if fixed_action_button(ui, "Load Loop", 82.0)
@@ -11254,13 +11946,19 @@ impl ViewerApp {
                      list full loops; other countries start at the newest scan and grow live",
                 )
                 .clicked()
-                && self.load_receiver.is_none()
+                && !target_load_busy
             {
-                if self.intl_poll_owns_primary() {
-                    self.start_intl_loop_load(ui.ctx());
+                if let Some(slot) = site_control_pane {
+                    if let Some(site) = self.sites.get(selected_site_index).cloned() {
+                        self.start_extra_pane_loop_load(slot, site, ui.ctx());
+                    }
                 } else {
-                    self.load_loop_history_for_selected_site(ui.ctx());
-                    self.remember_startup_site();
+                    if self.intl_poll_owns_primary() {
+                        self.start_intl_loop_load(ui.ctx());
+                    } else {
+                        self.load_loop_history_for_selected_site(ui.ctx());
+                        self.remember_startup_site();
+                    }
                 }
             }
             ui.checkbox(&mut self.realtime_level2_auto_refresh, "Live");
@@ -11311,46 +12009,50 @@ impl ViewerApp {
             }
         });
         // One-line status — always rendered, hover carries the details.
-        if let Some(progress) = &self.archive_load_progress {
-            archive_load_progress_row(ui, progress);
-        }
-        if let Some(volume) = &self.volume {
-            let site = volume.site.id.clone();
-            let time_zone = self.time_zone();
-            let volume_time = time_zone.format_date_hms(volume.volume_time.with_timezone(&Utc));
-            let vcp = volume
-                .vcp
-                .as_ref()
-                .map(|vcp| vcp.pattern.to_string())
-                .unwrap_or_else(|| "unknown".to_owned());
-            let cut_count = volume.cuts.len();
-            let decoded_radials = volume.metadata.decoded_radial_count;
-            let clock = time_zone.format_hms(volume.volume_time.with_timezone(&Utc));
-            ui.weak(format!("{site} · VCP {vcp} · {clock} · {cut_count} cuts"))
+        if let Some(slot) = site_control_pane {
+            self.extra_pane_status_ui(ui, slot);
+        } else {
+            if let Some(progress) = &self.archive_load_progress {
+                archive_load_progress_row(ui, progress);
+            }
+            if let Some(volume) = &self.volume {
+                let site = volume.site.id.clone();
+                let time_zone = self.time_zone();
+                let volume_time = time_zone.format_date_hms(volume.volume_time.with_timezone(&Utc));
+                let vcp = volume
+                    .vcp
+                    .as_ref()
+                    .map(|vcp| vcp.pattern.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned());
+                let cut_count = volume.cuts.len();
+                let decoded_radials = volume.metadata.decoded_radial_count;
+                let clock = time_zone.format_hms(volume.volume_time.with_timezone(&Utc));
+                ui.weak(format!("{site} · VCP {vcp} · {clock} · {cut_count} cuts"))
                 .on_hover_text(format!(
                     "Site {site}\nStart {volume_time}\nVCP {vcp}\n{cut_count} cuts, {decoded_radials} radials"
                 ));
-            if let Some(frame) = self.selected_frame()
-                && frame.identity.site_id == site
-                && let Some(readout) = live_chunk_readout(frame, Utc::now(), time_zone)
-            {
-                ui.weak(readout);
+                if let Some(frame) = self.selected_frame()
+                    && frame.identity.site_id == site
+                    && let Some(readout) = live_chunk_readout(frame, Utc::now(), time_zone)
+                {
+                    ui.weak(readout);
+                }
+                egui::CollapsingHeader::new("Volume details")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(format!("Site {site}"));
+                        ui.label(format!("Start {volume_time}"));
+                        if let Some(frame) = self.selected_frame()
+                            && frame.identity.site_id == site
+                        {
+                            ui.label(format!("Status {}", frame.status.label()));
+                        }
+                        ui.label(format!("VCP {vcp}"));
+                        ui.label(format!("{cut_count} cuts, {decoded_radials} radials"));
+                    });
+            } else {
+                ui.label(&self.status);
             }
-            egui::CollapsingHeader::new("Volume details")
-                .default_open(false)
-                .show(ui, |ui| {
-                    ui.label(format!("Site {site}"));
-                    ui.label(format!("Start {volume_time}"));
-                    if let Some(frame) = self.selected_frame()
-                        && frame.identity.site_id == site
-                    {
-                        ui.label(format!("Status {}", frame.status.label()));
-                    }
-                    ui.label(format!("VCP {vcp}"));
-                    ui.label(format!("{cut_count} cuts, {decoded_radials} radials"));
-                });
-        } else {
-            ui.label(&self.status);
         }
 
         // R2: layer/customization state lives in the Custom tab now; RADAR
@@ -11433,6 +12135,9 @@ impl ViewerApp {
                         // Keep the old texture anchored while the new product
                         // renders (the key's product change re-requests).
                         self.extra_panes[slot].product = product.clone();
+                        if let Some(cut_index) = target_cut {
+                            self.extra_panes[slot].cut = Some(*cut_index);
+                        }
                         self.extra_panes[slot].render_ms = None;
                         ctx.request_repaint();
                     } else {
@@ -11850,7 +12555,143 @@ impl ViewerApp {
         });
     }
 
+    fn extra_pane_frame_history_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        pane_slot: usize,
+    ) {
+        let Some(pane) = self.extra_panes.get(pane_slot) else {
+            return;
+        };
+        if pane.frame_history.is_empty() {
+            ui.weak("No loop - use Load Loop");
+            return;
+        }
+
+        let frame_count = pane.frame_history.len();
+        let selected_frame_index = pane.selected_frame_index.min(frame_count - 1);
+        let history_playing = pane.history_playing;
+        let frames = pane.frame_history.clone();
+        let mut next_frame_index = None;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled_ui(frame_count > 1, |ui| fixed_action_button(ui, "<", 28.0))
+                .inner
+                .on_hover_text("Previous frame")
+                .clicked()
+            {
+                next_frame_index = Some((selected_frame_index + frame_count - 1) % frame_count);
+            }
+            let play_label = if history_playing { "Pause" } else { "Play" };
+            if ui
+                .add_enabled_ui(frame_count > 1, |ui| {
+                    fixed_action_button(ui, play_label, 54.0)
+                })
+                .inner
+                .on_hover_text("Loop loaded history frames (Space)")
+                .clicked()
+            {
+                self.toggle_extra_pane_history_playback(pane_slot, ctx);
+            }
+            if ui
+                .add_enabled_ui(frame_count > 1, |ui| fixed_action_button(ui, ">", 28.0))
+                .inner
+                .on_hover_text("Next frame")
+                .clicked()
+            {
+                next_frame_index = Some((selected_frame_index + 1) % frame_count);
+            }
+            ui.weak(format!("{}/{}", selected_frame_index + 1, frame_count));
+            let mut selected_limit = self.history_frame_limit;
+            egui::ComboBox::from_id_salt(("pane_history_frame_limit", pane_slot))
+                .selected_text(format!("{}", self.history_frame_limit))
+                .width(52.0)
+                .show_ui(ui, |ui| {
+                    for limit in HISTORY_SIZE_OPTIONS {
+                        ui.selectable_value(&mut selected_limit, *limit, format!("{limit} frames"));
+                    }
+                });
+            if selected_limit != self.history_frame_limit {
+                self.history_frame_limit = normalized_history_limit(selected_limit);
+                self.trim_extra_pane_history(pane_slot);
+                ctx.request_repaint();
+            }
+            let mut speed = self.app_settings.loop_speed_percent;
+            egui::ComboBox::from_id_salt(("pane_loop_speed", pane_slot))
+                .selected_text(loop_speed_label(speed))
+                .width(56.0)
+                .show_ui(ui, |ui| {
+                    for option in LOOP_SPEED_PERCENT_OPTIONS {
+                        ui.selectable_value(&mut speed, *option, loop_speed_label(*option));
+                    }
+                })
+                .response
+                .on_hover_text("Loop speed for playback and recorded GIF/MP4 loops");
+            if speed != self.app_settings.loop_speed_percent {
+                self.app_settings.loop_speed_percent = speed;
+                let _ = self.app_settings.save();
+                let frame_ms = self.loop_frame_ms();
+                ctx.request_repaint_after(Duration::from_millis(frame_ms));
+            }
+        });
+
+        let mut slider_index = selected_frame_index;
+        let slider_response = ui
+            .add_enabled_ui(frame_count > 1, |ui| {
+                ui.add_sized(
+                    egui::vec2(ui.available_width(), PANEL_BUTTON_HEIGHT),
+                    egui::Slider::new(&mut slider_index, 0..=frame_count - 1).show_value(false),
+                )
+            })
+            .inner
+            .on_hover_text("Scrub decoded frame history")
+            .changed();
+        if slider_response {
+            next_frame_index = Some(slider_index);
+        }
+
+        let selected_status_text = self.extra_pane_selected_frame_status_text(pane_slot);
+        ui.add(egui::Label::new(egui::RichText::new(&selected_status_text).weak()).truncate())
+            .on_hover_text(&selected_status_text);
+
+        egui::CollapsingHeader::new(format!("Frames ({frame_count})"))
+            .id_salt(("pane_loop_frames", pane_slot))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let time_zone = self.time_zone();
+                    for (index, frame) in frames.iter().enumerate() {
+                        let label = compact_frame_label(frame, Utc::now(), time_zone);
+                        let selected = index == selected_frame_index;
+                        if ui
+                            .add_sized(
+                                egui::vec2(72.0, PANEL_BUTTON_HEIGHT),
+                                egui::Button::selectable(selected, label),
+                            )
+                            .on_hover_text(frame_status_text(frame, Utc::now(), time_zone))
+                            .clicked()
+                        {
+                            next_frame_index = Some(index);
+                        }
+                    }
+                });
+            });
+
+        if let Some(index) = next_frame_index {
+            if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+                pane.history_playing = false;
+                pane.browsing_history = index + 1 < pane.frame_history.len();
+            }
+            self.select_extra_pane_history_frame(pane_slot, index, ctx);
+        }
+    }
+
     fn frame_history_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if let Some(slot) = self.independent_editing_pane() {
+            self.extra_pane_frame_history_panel(ui, ctx, slot);
+            return;
+        }
         if self.frame_history.is_empty() {
             ui.weak("No loop — use Load Loop");
             return;
@@ -13706,6 +14547,22 @@ impl ViewerApp {
             return Some(BackgroundActivity::indeterminate(
                 self.status_or_activity_label("Loading Level II"),
             ));
+        }
+        for (slot, pane) in self.extra_panes.iter().enumerate() {
+            if let Some(progress) = &pane.archive_load_progress {
+                return Some(BackgroundActivity {
+                    label: format!("Pane {} {}", slot + 2, progress.status_text()),
+                    fraction: (progress.total > 0).then(|| progress.fraction()),
+                });
+            }
+            if pane.load_receiver.is_some() {
+                let status = pane.status.trim();
+                return Some(BackgroundActivity::indeterminate(if status.is_empty() {
+                    format!("Pane {} loading Level II", slot + 2)
+                } else {
+                    format!("Pane {} {status}", slot + 2)
+                }));
+            }
         }
         if self.archive_list_receiver.is_some() {
             return Some(BackgroundActivity::indeterminate(
