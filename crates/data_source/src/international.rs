@@ -347,6 +347,9 @@ const JMA_BASE_URL: &str = "https://pawr.nict.go.jp/jmadata/JMA-PolarCoordsRadar
 /// Reflectivity tar (`Pze` members). The sibling `N6` tar at the same stamp
 /// carries radial velocity (`Pvr`).
 const JMA_REFLECTIVITY_PRODUCT: &str = "N5";
+/// Radial-velocity tar (`Pvr` members), same stamp/stations as `N5` when
+/// published.
+const JMA_VELOCITY_PRODUCT: &str = "N6";
 /// Tar stamps are aligned to 5-minute boundaries.
 const JMA_STAMP_STEP_MINUTES: i64 = 5;
 /// How far back `latest` probes for the newest published tar. Publication
@@ -367,13 +370,13 @@ const JMA_LOOKBACK_MINUTES: i64 = 40;
 /// probes backward over [`JMA_LOOKBACK_MINUTES`] of 5-minute stamps for the
 /// newest tar that exists.
 ///
-/// Decode contract: the plan's single part is the N5 (reflectivity) tar
-/// containing ALL stations — the poll consumer must decode it with
+/// Decode contract: the plan's first part is the N5 (reflectivity) tar
+/// containing ALL stations — the poll consumer must decode JMA parts with
 /// `nexrad_io::jma::decode_jma_tar_volumes(bytes, Some(site_id))`; the
 /// generic `decode_supported_volume_bytes` router would return the tar's
-/// first station regardless of the selection. Consumers that also want
-/// Doppler velocity can fetch the `_N6_` sibling at the same stamp and
-/// merge per elevation.
+/// first station regardless of the selection. When the `_N6_` sibling exists
+/// at the same stamp, the plan includes it and requests a per-elevation merge
+/// so Japan exposes Doppler velocity in the same live frame.
 pub struct JmaProvider;
 
 /// JMA operational radar stations: id, station number, latitude, longitude.
@@ -458,14 +461,25 @@ fn jma_newest_stamp() -> Result<DateTime<Utc>, String> {
     })
 }
 
+fn jma_velocity_available(stamp: DateTime<Utc>) -> bool {
+    crate::url_exists(&jma_tar_url(JMA_VELOCITY_PRODUCT, stamp)).unwrap_or(false)
+}
+
 /// The frame plan for one already-probed stamp (pure; unit-testable).
-fn jma_frame_plan(stamp: DateTime<Utc>, site_id: &str) -> FramePlan {
+fn jma_frame_plan(stamp: DateTime<Utc>, site_id: &str, include_velocity: bool) -> FramePlan {
+    let mut parts = vec![PlanPart {
+        url: jma_tar_url(JMA_REFLECTIVITY_PRODUCT, stamp),
+    }];
+    if include_velocity {
+        parts.push(PlanPart {
+            url: jma_tar_url(JMA_VELOCITY_PRODUCT, stamp),
+        });
+    }
+    let products = if include_velocity { "N5_N6" } else { "N5" };
     FramePlan {
-        identity: format!("{}_{site_id}", stamp.format("%Y%m%d%H%M%S")),
-        parts: vec![PlanPart {
-            url: jma_tar_url(JMA_REFLECTIVITY_PRODUCT, stamp),
-        }],
-        merge: false,
+        identity: format!("{}_{site_id}_{products}", stamp.format("%Y%m%d%H%M%S")),
+        parts,
+        merge: include_velocity,
     }
 }
 
@@ -536,7 +550,12 @@ impl IntlProvider for JmaProvider {
         if !sites.iter().any(|site| site.site_id == site_id) {
             return Err(format!("unknown JMA site '{site_id}'"));
         }
-        Ok(jma_frame_plan(jma_newest_stamp()?, site_id))
+        let stamp = jma_newest_stamp()?;
+        Ok(jma_frame_plan(
+            stamp,
+            site_id,
+            jma_velocity_available(stamp),
+        ))
     }
 
     fn static_sites(&self) -> Vec<IntlSite> {
@@ -923,35 +942,56 @@ mod tests {
 
         let site = &sites[0];
         let plan = provider.latest(&site.site_id).expect("live JMA frame plan");
-        assert!(!plan.merge);
-        assert_eq!(plan.parts.len(), 1);
-        println!("plan identity={} url={}", plan.identity, plan.parts[0].url);
+        assert!(plan.parts[0].url.ends_with("_N5_grib2.tar"));
+        if plan.merge {
+            assert_eq!(plan.parts.len(), 2);
+            assert!(plan.parts[1].url.ends_with("_N6_grib2.tar"));
+        } else {
+            assert_eq!(plan.parts.len(), 1);
+        }
+        println!("plan identity={} parts={}", plan.identity, plan.parts.len());
 
-        let bytes = crate::fetch_volume_bytes(&plan.parts[0].url).expect("live tar download");
-        let volumes = nexrad_io::jma::decode_jma_tar_volumes(&bytes, Some(&site.site_id))
-            .expect("site-filtered decode");
-        assert_eq!(volumes.len(), 1, "filter must select exactly one station");
-        assert_eq!(volumes[0].site.id, site.site_id);
-        assert!(!volumes[0].cuts.is_empty());
-        println!(
-            "decoded {} at {}: {} cuts, {} radials",
-            volumes[0].site.id,
-            volumes[0].volume_time,
-            volumes[0].cuts.len(),
-            volumes[0].metadata.decoded_radial_count
-        );
+        for part in &plan.parts {
+            println!("downloading {}", part.url);
+            let bytes = crate::fetch_volume_bytes(&part.url).expect("live tar download");
+            let volumes = nexrad_io::jma::decode_jma_tar_volumes(&bytes, Some(&site.site_id))
+                .expect("site-filtered decode");
+            assert_eq!(volumes.len(), 1, "filter must select exactly one station");
+            assert_eq!(volumes[0].site.id, site.site_id);
+            assert!(!volumes[0].cuts.is_empty());
+            println!(
+                "decoded {} at {}: {} cuts, {} radials",
+                volumes[0].site.id,
+                volumes[0].volume_time,
+                volumes[0].cuts.len(),
+                volumes[0].metadata.decoded_radial_count
+            );
+        }
     }
 
     #[test]
-    fn jma_frame_plan_is_a_single_unmerged_tar_with_a_stable_identity() {
+    fn jma_frame_plan_without_velocity_is_a_single_unmerged_tar_with_a_stable_identity() {
         let stamp = chrono::Utc.with_ymd_and_hms(2026, 6, 12, 6, 40, 0).unwrap();
-        let plan = jma_frame_plan(stamp, "ITOK");
-        assert_eq!(plan.identity, "20260612064000_ITOK");
+        let plan = jma_frame_plan(stamp, "ITOK", false);
+        assert_eq!(plan.identity, "20260612064000_ITOK_N5");
         assert!(!plan.merge);
         assert_eq!(plan.parts.len(), 1);
         assert!(plan.parts[0].url.ends_with("_N5_grib2.tar"));
         // Same upstream frame -> same plan (dedupe key stability).
-        assert_eq!(jma_frame_plan(stamp, "ITOK"), plan);
+        assert_eq!(jma_frame_plan(stamp, "ITOK", false), plan);
+    }
+
+    #[test]
+    fn jma_frame_plan_with_velocity_merges_reflectivity_and_velocity_tars() {
+        let stamp = chrono::Utc.with_ymd_and_hms(2026, 6, 12, 6, 40, 0).unwrap();
+        let plan = jma_frame_plan(stamp, "ITOK", true);
+        assert_eq!(plan.identity, "20260612064000_ITOK_N5_N6");
+        assert!(plan.merge);
+        assert_eq!(plan.parts.len(), 2);
+        assert!(plan.parts[0].url.ends_with("_N5_grib2.tar"));
+        assert!(plan.parts[1].url.ends_with("_N6_grib2.tar"));
+        // Same upstream frame -> same plan (dedupe key stability).
+        assert_eq!(jma_frame_plan(stamp, "ITOK", true), plan);
     }
 
     #[test]

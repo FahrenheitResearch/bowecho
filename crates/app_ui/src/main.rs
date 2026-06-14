@@ -68,7 +68,7 @@ const DEFAULT_MAP_SCALE: f32 = 115.0;
 /// the antipode smear that turned the basemap into sheared slabs at the
 /// old floor of 2 (field screenshot, 2026-06-13).
 const MIN_MAP_SCALE: f32 = 7.0;
-const MAX_MAP_SCALE: f32 = 3_200.0;
+const MAX_MAP_SCALE: f32 = 8_000.0;
 const DEFAULT_RADAR_RANGE_KM: f32 = 460.0;
 /// Top of the vertical cross-section (m above the radar) — shared by the
 /// compute and the panel's height-axis labels so they can't drift.
@@ -706,6 +706,19 @@ enum LocalRadarKind {
     NexradLevel2,
 }
 
+impl LocalRadarKind {
+    fn mergeable_file_set_label(self) -> Option<&'static str> {
+        match self {
+            LocalRadarKind::OdimH5 => Some("ODIM_H5"),
+            LocalRadarKind::CfRadial => Some("CfRadial"),
+            LocalRadarKind::JmaGrib2Tar => Some("JMA GRIB2"),
+            LocalRadarKind::MobileArchive
+            | LocalRadarKind::DoradeSweep
+            | LocalRadarKind::NexradLevel2 => None,
+        }
+    }
+}
+
 fn sniff_local_radar_kind(path: &Path) -> LocalRadarKind {
     // A FOLDER is a deployment: research data ships as directories of
     // per-sweep DORADE files (one file per tilt), so the directory is
@@ -753,6 +766,20 @@ fn sniff_local_radar_kind(path: &Path) -> LocalRadarKind {
         return LocalRadarKind::MobileArchive;
     }
     LocalRadarKind::NexradLevel2
+}
+
+fn local_file_set_label(paths: &[PathBuf]) -> String {
+    let count = paths.len();
+    let first = paths
+        .first()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("radar files");
+    if count <= 1 {
+        first.to_owned()
+    } else {
+        format!("{count} radar files ({first}...)")
+    }
 }
 
 /// Decode a mobile-radar source (zip deployment archive or loose DORADE
@@ -842,6 +869,87 @@ fn decode_mobile_radar_batch(
     Ok(DecodedLoadBatch {
         frames,
         selected_index,
+    })
+}
+
+/// Decode and merge a same-scan local file set, e.g. ORD archive downloads
+/// split as separate DBZH/TH/VRADH ODIM_H5 files.
+fn decode_local_radar_file_set(
+    paths: Vec<PathBuf>,
+    total_start: Instant,
+) -> Result<DecodedLoadBatch, String> {
+    if paths.len() < 2 {
+        return Err("select two or more radar files to merge".to_owned());
+    }
+
+    let mut paths = paths;
+    paths.sort();
+    let mut read_ms = 0.0f32;
+    let mut decode_ms = 0.0f32;
+    let mut volumes = Vec::with_capacity(paths.len());
+    let mut format_labels = BTreeSet::new();
+
+    for path in &paths {
+        let kind = sniff_local_radar_kind(path);
+        let Some(format_label) = kind.mergeable_file_set_label() else {
+            return Err(format!(
+                "multi-file open can merge ODIM_H5/CfRadial/JMA single-frame parts; '{}' looks like {kind:?}",
+                path.display()
+            ));
+        };
+        format_labels.insert(format_label);
+
+        let read_start = Instant::now();
+        let bytes = std::fs::read(path)
+            .map_err(|err| format!("I/O error reading {}: {err}", path.display()))?;
+        read_ms += read_start.elapsed().as_secs_f32() * 1000.0;
+
+        let decode_start = Instant::now();
+        let mut volume = nexrad_io::decode_supported_volume_bytes(&bytes)
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+        decode_ms += decode_start.elapsed().as_secs_f32() * 1000.0;
+        if volume.cuts.is_empty() {
+            return Err(format!(
+                "{} decoded with no displayable cuts",
+                path.display()
+            ));
+        }
+        volume.metadata.source_path = Some(path.display().to_string());
+        volumes.push(volume);
+    }
+
+    let merge_start = Instant::now();
+    let (mut volume, report) = radar_core::merge_radar_volumes(volumes)?;
+    decode_ms += merge_start.elapsed().as_secs_f32() * 1000.0;
+    if volume.cuts.is_empty() {
+        return Err("merged file set has no displayable cuts".to_owned());
+    }
+
+    let source_paths = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(" + ");
+    volume.metadata.source_path = Some(source_paths);
+
+    let mut timings = LoadTimings::default();
+    timings.read_ms = Some(read_ms);
+    timings.decode_ms = decode_ms;
+    let formats = format_labels.into_iter().collect::<Vec<_>>().join("+");
+    let source_label = format!(
+        "{formats} merged set ({} files, {} moments merged)",
+        paths.len(),
+        report.merged_moments
+    );
+    Ok(DecodedLoadBatch {
+        frames: vec![DecodedLoad {
+            path: paths[0].clone(),
+            volume,
+            timings: timings.finish(total_start),
+            status: FrameStatus::Local,
+            source_label,
+        }],
+        selected_index: 0,
     })
 }
 
@@ -1305,6 +1413,23 @@ struct IntlOverlayFeed {
     /// unchanged frame costs one catalog probe and zero downloads.
     last_identity: Option<String>,
     rx: Option<mpsc::Receiver<IntlFrameResult>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PaneIntlSource {
+    provider_id: String,
+    site_id: String,
+    label: String,
+}
+
+impl PaneIntlSource {
+    fn from_site(site: &data_source::international::IntlSite) -> Self {
+        Self {
+            provider_id: site.provider_id.to_owned(),
+            site_id: site.site_id.clone(),
+            label: site.label.clone(),
+        }
+    }
 }
 
 struct RadarOverlayLayer {
@@ -2412,6 +2537,10 @@ struct ViewPane {
     /// None = follow the primary radar volume. Some(id) = this pane owns
     /// its own latest-load source and map view.
     pinned_site_id: Option<String>,
+    /// International provider/site source for independent panes. Kept
+    /// separate from `pinned_site_id` because those ids are not US Level-II
+    /// catalog ids and should not be looked up in `self.sites`.
+    intl_source: Option<PaneIntlSource>,
     volume: Option<Arc<RadarVolume>>,
     source_path: Option<PathBuf>,
     load_timing: Option<LoadTimings>,
@@ -2440,6 +2569,7 @@ impl ViewPane {
             product,
             cut: None,
             pinned_site_id: None,
+            intl_source: None,
             volume: None,
             source_path: None,
             load_timing: None,
@@ -2464,7 +2594,7 @@ impl ViewPane {
     }
 
     fn owns_radar(&self) -> bool {
-        self.pinned_site_id.is_some()
+        self.pinned_site_id.is_some() || self.intl_source.is_some()
     }
 
     fn clear_texture(&mut self) {
@@ -7214,11 +7344,24 @@ impl ViewerApp {
             .as_ref()
             .and_then(|volume| Some((volume.site.latitude_deg?, volume.site.longitude_deg?)))
             .or_else(|| selected_site.as_ref().and_then(site_location));
+        let intl_source = match (&self.poll_source, self.poll_active) {
+            (
+                PollSource::Intl {
+                    provider_id,
+                    site_id,
+                },
+                true,
+            ) => Self::find_intl_site(provider_id, site_id)
+                .as_ref()
+                .map(PaneIntlSource::from_site),
+            _ => None,
+        };
 
         let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
             return;
         };
         pane.pinned_site_id = site_id.clone();
+        pane.intl_source = intl_source;
         pane.volume = primary_volume.clone();
         pane.source_path = source_path;
         pane.load_timing = load_timing;
@@ -7296,6 +7439,7 @@ impl ViewerApp {
         }
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
             pane.pinned_site_id = Some(site_id.clone());
+            pane.intl_source = None;
             pane.volume = None;
             pane.source_path = None;
             pane.load_timing = None;
@@ -7353,6 +7497,7 @@ impl ViewerApp {
     fn clear_extra_pane_radar(&mut self, pane_slot: usize) {
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
             pane.pinned_site_id = None;
+            pane.intl_source = None;
             pane.volume = None;
             pane.source_path = None;
             pane.load_timing = None;
@@ -7375,6 +7520,114 @@ impl ViewerApp {
             pane.map_center_lon = normalize_lon(longitude_deg);
             pane.map_scale = pane.map_scale.max(220.0);
         }
+    }
+
+    fn center_extra_pane_on_intl_site(
+        &mut self,
+        pane_slot: usize,
+        site: &data_source::international::IntlSite,
+    ) {
+        let (Some(latitude_deg), Some(longitude_deg)) = (site.latitude_deg, site.longitude_deg)
+        else {
+            return;
+        };
+        if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+            pane.map_center_lat = latitude_deg.clamp(-85.0, 85.0);
+            pane.map_center_lon = normalize_lon(longitude_deg);
+            pane.map_scale = pane.map_scale.max(220.0);
+        }
+    }
+
+    fn find_intl_site(
+        provider_id: &str,
+        site_id: &str,
+    ) -> Option<data_source::international::IntlSite> {
+        data_source::international::intl_static_sites()
+            .iter()
+            .find(|site| site.provider_id == provider_id && site.site_id == site_id)
+            .cloned()
+    }
+
+    fn start_extra_pane_intl_load(
+        &mut self,
+        pane_slot: usize,
+        site: data_source::international::IntlSite,
+        mode: LatestLoadMode,
+        ctx: &egui::Context,
+    ) {
+        if pane_slot >= self.extra_panes.len() {
+            return;
+        }
+        let source = PaneIntlSource::from_site(&site);
+        let provider_id = source.provider_id.clone();
+        let site_id = source.site_id.clone();
+        let label = source.label.clone();
+        let progress = (mode == LatestLoadMode::Loop).then(|| {
+            ArchiveLoadProgress::indeterminate(
+                format!("{label} loop"),
+                format!("Starting international loop load for {label}"),
+            )
+        });
+        let (sender, receiver) = mpsc::channel();
+        {
+            let pane = &mut self.extra_panes[pane_slot];
+            if pane.intl_source.as_ref() != Some(&source) {
+                pane.clear_history();
+                pane.volume = None;
+                pane.source_path = None;
+                pane.load_timing = None;
+                pane.cut = None;
+                pane.clear_texture();
+            }
+            pane.pinned_site_id = None;
+            pane.intl_source = Some(source);
+            pane.pending_site_id = Some(site_id.clone());
+            pane.load_receiver = Some(receiver);
+            pane.load_mode = Some(mode);
+            pane.archive_load_progress = progress.clone();
+            pane.status = match &progress {
+                Some(progress) => progress.status_text(),
+                None => format!("Loading {label}"),
+            };
+        }
+        self.center_extra_pane_on_intl_site(pane_slot, &site);
+        let history_frame_limit = self.history_frame_limit.max(2);
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            match mode {
+                LatestLoadMode::Loop => {
+                    fetch_intl_recent_frame_batch(
+                        &provider_id,
+                        &site_id,
+                        &label,
+                        history_frame_limit,
+                        &sender,
+                    );
+                }
+                LatestLoadMode::User | LatestLoadMode::AutoRefresh => {
+                    let start = Instant::now();
+                    let update = match fetch_intl_frame(&provider_id, &site_id, None) {
+                        Ok(Some((identity, volume))) => {
+                            AsyncLoadUpdate::Final(Ok(DecodedLoadBatch::single(DecodedLoad {
+                                path: PathBuf::from(format!("intl:{identity}")),
+                                volume,
+                                timings: LoadTimings::default().finish(start),
+                                status: FrameStatus::LiveComplete,
+                                source_label: identity,
+                            })))
+                        }
+                        Ok(None) => AsyncLoadUpdate::Unchanged {
+                            timings: Some(LoadTimings::default().finish(start)),
+                            reason: "no new frame".to_owned(),
+                        },
+                        Err(err) => AsyncLoadUpdate::Final(Err(err)),
+                    };
+                    let _ = sender.send(AsyncLoadResult { label, update });
+                }
+            }
+            ctx_clone.request_repaint();
+        });
+        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
     }
 
     fn start_extra_pane_latest_load(
@@ -7426,6 +7679,7 @@ impl ViewerApp {
         {
             let pane = &mut self.extra_panes[pane_slot];
             pane.pinned_site_id = Some(site_id.clone());
+            pane.intl_source = None;
             pane.pending_site_id = Some(site_id.clone());
             pane.load_receiver = Some(receiver);
             pane.load_mode = Some(mode);
@@ -8217,12 +8471,18 @@ impl ViewerApp {
         )
     }
 
-    fn start_local_volume_load(&mut self, path: PathBuf, ctx: &egui::Context) {
-        let label = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("local L2")
-            .to_owned();
+    fn start_local_volume_file_selection(&mut self, mut paths: Vec<PathBuf>, ctx: &egui::Context) {
+        if paths.is_empty() {
+            return;
+        }
+        if paths.len() == 1 {
+            self.start_local_volume_load(paths.remove(0), ctx);
+        } else {
+            self.start_local_volume_set_load(paths, ctx);
+        }
+    }
+
+    fn prepare_local_volume_load(&mut self, label: &str) {
         // Deployments are opened to be WATCHED: when this load lands as a
         // multi-frame batch, grow history to fit it and start the loop.
         self.pending_local_autoplay = true;
@@ -8240,9 +8500,7 @@ impl ViewerApp {
         let paused_live = self.realtime_level2_auto_refresh;
         self.realtime_level2_auto_refresh = false;
         self.begin_primary_load_telemetry();
-        let (sender, receiver) = mpsc::channel();
-        self.load_receiver = Some(receiver);
-        self.pending_site_id = Some(label.clone());
+        self.pending_site_id = Some(label.to_owned());
         self.status = format!("Loading {label}");
         if paused_poll {
             self.status.push_str(" — URL poll paused");
@@ -8250,6 +8508,34 @@ impl ViewerApp {
         if paused_live {
             self.status.push_str(" — Live paused");
         }
+    }
+
+    fn start_local_volume_set_load(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        let label = local_file_set_label(&paths);
+        self.prepare_local_volume_load(&label);
+        let (sender, receiver) = mpsc::channel();
+        self.load_receiver = Some(receiver);
+
+        thread::spawn(move || {
+            let total_start = Instant::now();
+            let result = decode_local_radar_file_set(paths, total_start);
+            let _ = sender.send(AsyncLoadResult {
+                label,
+                update: AsyncLoadUpdate::Final(result),
+            });
+        });
+        ctx.request_repaint_after(Duration::from_millis(8));
+    }
+
+    fn start_local_volume_load(&mut self, path: PathBuf, ctx: &egui::Context) {
+        let label = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("local L2")
+            .to_owned();
+        self.prepare_local_volume_load(&label);
+        let (sender, receiver) = mpsc::channel();
+        self.load_receiver = Some(receiver);
 
         thread::spawn(move || {
             let total_start = Instant::now();
@@ -11054,24 +11340,25 @@ impl ViewerApp {
                 if ui
                     .button("Open radar file…")
                     .on_hover_text(
-                        "Open a local radar file: NEXRAD Level II (.ar2v/.gz/.msg31), a DORADE \
-                         sweepfile (swp.*), or a DOW/COW/RaXPol deployment .zip",
+                        "Open local radar file(s): NEXRAD Level II (.ar2v/.gz/.msg31), a DORADE \
+                         sweepfile (swp.*), ODIM_H5/CfRadial (.h5/.hdf/.nc), or a DOW/COW/RaXPol deployment .zip. \
+                         Select multiple same-scan ODIM files to merge split DBZH/TH/VRADH archive downloads.",
                     )
                     .clicked()
                     && app.load_receiver.is_none()
-                    && let Some(path) = rfd::FileDialog::new()
+                    && let Some(paths) = rfd::FileDialog::new()
                         .add_filter("All radar files (swp.* sweepfiles)", &["*"])
                         .add_filter(
                             "Level II / archives",
                             &[
                                 "zip", "ar2v", "gz", "bz2", "raw", "msg31", "v06", "v08", "h5",
-                                "nc",
+                                "hdf", "hd5", "nc",
                             ],
                         )
                         .set_title("Open radar data")
-                        .pick_file()
+                        .pick_files()
                 {
-                    app.start_local_volume_load(path, ui.ctx());
+                    app.start_local_volume_file_selection(paths, ui.ctx());
                 }
                 if ui
                     .button("Open folder…")
@@ -11656,6 +11943,15 @@ impl ViewerApp {
             .as_deref()
             .and_then(|id| self.sites.iter().find(|site| site.level2_id == id))
             .map(format_site_label)
+            .or_else(|| {
+                pane.intl_source.as_ref().map(|source| {
+                    format!(
+                        "{} ({})",
+                        source.label,
+                        intl_provider_label(&source.provider_id)
+                    )
+                })
+            })
             .unwrap_or_else(|| "Follow primary radar".to_owned());
         ui.horizontal(|ui| {
             ui.label("Pane radar");
@@ -11677,21 +11973,32 @@ impl ViewerApp {
                 .as_deref()
                 .and_then(|id| self.sites.iter().find(|site| site.level2_id == id))
                 .cloned();
+            let selected_intl_site = self.extra_panes[pane_slot]
+                .intl_source
+                .as_ref()
+                .and_then(|source| Self::find_intl_site(&source.provider_id, &source.site_id));
             if fixed_action_button(ui, "Load", 48.0)
                 .on_hover_text("Load this radar only into the focused pane")
                 .clicked()
                 && !busy
-                && let Some(site) = selected_site.clone()
             {
-                self.start_extra_pane_latest_load(pane_slot, site, ctx);
+                if let Some(site) = selected_site.clone() {
+                    self.start_extra_pane_latest_load(pane_slot, site, ctx);
+                } else if let Some(site) = selected_intl_site.clone() {
+                    self.start_extra_pane_intl_load(pane_slot, site, LatestLoadMode::User, ctx);
+                }
             }
             if fixed_action_button(ui, "Center", 58.0)
                 .on_hover_text("Center this pane on its selected radar")
                 .clicked()
-                && let Some(site) = selected_site.clone()
             {
-                self.center_extra_pane_on_site(pane_slot, &site);
-                ctx.request_repaint();
+                if let Some(site) = selected_site.clone() {
+                    self.center_extra_pane_on_site(pane_slot, &site);
+                    ctx.request_repaint();
+                } else if let Some(site) = selected_intl_site {
+                    self.center_extra_pane_on_intl_site(pane_slot, &site);
+                    ctx.request_repaint();
+                }
             }
         });
         let previous = self.extra_panes[pane_slot].pinned_site_id.clone();
@@ -11706,6 +12013,7 @@ impl ViewerApp {
                     {
                         let pane = &mut self.extra_panes[pane_slot];
                         pane.pinned_site_id = Some(site_id.clone());
+                        pane.intl_source = None;
                         pane.status = format!("Pane radar set to {site_id}; click Load");
                         self.center_extra_pane_on_site(pane_slot, &site);
                     }
@@ -11857,15 +12165,24 @@ impl ViewerApp {
         // R1: SITE — pick, load, live state, one-line status.
         Self::section_header(ui, "SITE");
         let site_control_pane = independent_pane;
+        let pane_intl_source = site_control_pane
+            .and_then(|slot| self.extra_panes.get(slot))
+            .and_then(|pane| pane.intl_source.clone());
         let mut selected_site_index = site_control_pane
             .map(|slot| self.extra_pane_selected_site_index(slot))
             .unwrap_or(self.selected_site_index);
         let original_site_index = selected_site_index;
         ui.horizontal(|ui| {
-            let selected_site_label = self
-                .sites
-                .get(selected_site_index)
-                .map(format_site_label)
+            let selected_site_label = pane_intl_source
+                .as_ref()
+                .map(|source| {
+                    format!(
+                        "{} ({})",
+                        source.label,
+                        intl_provider_label(&source.provider_id)
+                    )
+                })
+                .or_else(|| self.sites.get(selected_site_index).map(format_site_label))
                 .unwrap_or_else(|| "None".to_owned());
             egui::ComboBox::from_id_salt("site_combo")
                 .selected_text(selected_site_label)
@@ -11914,7 +12231,12 @@ impl ViewerApp {
             }
             if fixed_action_button(ui, "Center", 58.0).clicked() {
                 if let Some(slot) = site_control_pane {
-                    if let Some(site) = self.sites.get(selected_site_index).cloned() {
+                    if let Some(source) = pane_intl_source.as_ref()
+                        && let Some(site) =
+                            Self::find_intl_site(&source.provider_id, &source.site_id)
+                    {
+                        self.center_extra_pane_on_intl_site(slot, &site);
+                    } else if let Some(site) = self.sites.get(selected_site_index).cloned() {
                         self.center_extra_pane_on_site(slot, &site);
                     }
                 } else {
@@ -12046,7 +12368,12 @@ impl ViewerApp {
         ui.horizontal(|ui| {
             if fixed_action_button(ui, "Load Latest", 88.0).clicked() && !target_load_busy {
                 if let Some(slot) = site_control_pane {
-                    if let Some(site) = self.sites.get(selected_site_index).cloned() {
+                    if let Some(source) = pane_intl_source.as_ref()
+                        && let Some(site) =
+                            Self::find_intl_site(&source.provider_id, &source.site_id)
+                    {
+                        self.start_extra_pane_intl_load(slot, site, LatestLoadMode::User, ui.ctx());
+                    } else if let Some(site) = self.sites.get(selected_site_index).cloned() {
                         self.start_extra_pane_latest_load(slot, site, ui.ctx());
                     }
                 } else {
@@ -12071,7 +12398,12 @@ impl ViewerApp {
                 && !target_load_busy
             {
                 if let Some(slot) = site_control_pane {
-                    if let Some(site) = self.sites.get(selected_site_index).cloned() {
+                    if let Some(source) = pane_intl_source.as_ref()
+                        && let Some(site) =
+                            Self::find_intl_site(&source.provider_id, &source.site_id)
+                    {
+                        self.start_extra_pane_intl_load(slot, site, LatestLoadMode::Loop, ui.ctx());
+                    } else if let Some(site) = self.sites.get(selected_site_index).cloned() {
                         self.start_extra_pane_loop_load(slot, site, ui.ctx());
                     }
                 } else {
@@ -12094,12 +12426,13 @@ impl ViewerApp {
             #[cfg(any(windows, target_os = "macos"))]
             if fixed_action_button(ui, "Open…", 52.0)
                 .on_hover_text(
-                    "Open a local radar file: NEXRAD Level II (.ar2v/.gz/.msg31), a DORADE \
-                     sweepfile (swp.*), or a DOW/COW/RaXPol deployment .zip",
+                    "Open local radar file(s): NEXRAD Level II (.ar2v/.gz/.msg31), a DORADE \
+                     sweepfile (swp.*), ODIM_H5/CfRadial (.h5/.hdf/.nc), or a DOW/COW/RaXPol deployment .zip. \
+                     Select multiple same-scan ODIM files to merge split DBZH/TH/VRADH archive downloads.",
                 )
                 .clicked()
                 && self.load_receiver.is_none()
-                && let Some(path) = rfd::FileDialog::new()
+                && let Some(paths) = rfd::FileDialog::new()
                     // "All files" FIRST: DORADE sweepfiles (swp.*) have no
                     // extension and were invisible under a typed default
                     // filter (field report: "I can't see anything").
@@ -12107,13 +12440,14 @@ impl ViewerApp {
                     .add_filter(
                         "Level II / archives",
                         &[
-                            "zip", "ar2v", "gz", "bz2", "raw", "msg31", "v06", "v08", "h5", "nc",
+                            "zip", "ar2v", "gz", "bz2", "raw", "msg31", "v06", "v08", "h5",
+                            "hdf", "hd5", "nc",
                         ],
                     )
                     .set_title("Open radar data")
-                    .pick_file()
+                    .pick_files()
             {
-                self.start_local_volume_load(path, ui.ctx());
+                self.start_local_volume_file_selection(paths, ui.ctx());
             }
             #[cfg(any(windows, target_os = "macos"))]
             if fixed_action_button(ui, "Open Folder…", 96.0)
@@ -16824,7 +17158,17 @@ impl ViewerApp {
                 self.start_extra_pane_latest_load(pane_slot, site, ctx);
                 true
             }
-            BeamTarget::Intl { .. } | BeamTarget::Research { .. } => {
+            BeamTarget::Intl {
+                provider_id,
+                site_id,
+            } => {
+                let Some(site) = Self::find_intl_site(provider_id, site_id) else {
+                    return false;
+                };
+                self.start_extra_pane_intl_load(pane_slot, site, LatestLoadMode::User, ctx);
+                true
+            }
+            BeamTarget::Research { .. } => {
                 let status = format!(
                     "{} is a live feed; independent panes currently load catalog Level II sites",
                     candidate.label
@@ -23659,17 +24003,20 @@ impl ViewerApp {
                 true
             }
             Some((MarkerFamily::Intl, index)) => {
-                let Some(site) = data_source::international::intl_static_sites().get(index) else {
+                let Some(site) = data_source::international::intl_static_sites()
+                    .get(index)
+                    .cloned()
+                else {
                     return false;
                 };
-                let status = format!(
-                    "{} is a live feed; independent panes currently load catalog Level II sites",
-                    site.label
-                );
-                if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-                    pane.status = status.clone();
+                let label = site.label.clone();
+                self.start_extra_pane_intl_load(pane_slot, site, LatestLoadMode::User, ctx);
+                if let Some(pane) = self.extra_panes.get(pane_slot) {
+                    self.map_center_lat = pane.map_center_lat;
+                    self.map_center_lon = pane.map_center_lon;
+                    self.map_scale = pane.map_scale;
                 }
-                self.status = status;
+                self.status = format!("Pane {} loading {label}", pane_slot + 2);
                 true
             }
             Some((MarkerFamily::Community, index)) => {
@@ -30401,6 +30748,94 @@ fn fetch_intl_recent_frames(
 /// the merge base per the FramePlan ordering contract; single-file frames
 /// must be exactly one part (the FramePlan shape contract — anything else
 /// is a provider bug surfaced as a poll error, never a panic).
+fn fetch_intl_recent_frame_batch(
+    provider_id: &str,
+    site_id: &str,
+    label: &str,
+    count: usize,
+    sender: &mpsc::Sender<AsyncLoadResult>,
+) {
+    let providers = data_source::international::intl_providers();
+    let Some(provider) = providers
+        .iter()
+        .find(|provider| provider.id() == provider_id)
+    else {
+        let _ = sender.send(AsyncLoadResult {
+            label: label.to_owned(),
+            update: AsyncLoadUpdate::Final(Err(format!(
+                "unknown international provider '{provider_id}'"
+            ))),
+        });
+        return;
+    };
+    let plans = match provider.recent(site_id, count) {
+        Ok(plans) => plans,
+        Err(err) => {
+            let _ = sender.send(AsyncLoadResult {
+                label: label.to_owned(),
+                update: AsyncLoadUpdate::Final(Err(err)),
+            });
+            return;
+        }
+    };
+    let skip = plans.len().saturating_sub(count);
+    let plans: Vec<_> = plans.into_iter().skip(skip).collect();
+    let total = plans.len();
+    let mut frames = Vec::new();
+    let mut errors = Vec::new();
+    for (index, plan) in plans.iter().enumerate() {
+        let _ = sender.send(AsyncLoadResult {
+            label: label.to_owned(),
+            update: AsyncLoadUpdate::ArchiveProgress(ArchiveLoadProgress {
+                label: format!("{label} loop"),
+                detail: plan.identity.clone(),
+                done: index,
+                total,
+            }),
+        });
+        let frame_start = Instant::now();
+        match fetch_assemble_intl_plan(plan, site_id) {
+            Ok((identity, volume)) => {
+                frames.push(DecodedLoad {
+                    path: PathBuf::from(format!("intl:{identity}")),
+                    volume,
+                    timings: LoadTimings::default().finish(frame_start),
+                    status: FrameStatus::LiveComplete,
+                    source_label: identity,
+                });
+            }
+            Err(err) => errors.push(err),
+        }
+        let _ = sender.send(AsyncLoadResult {
+            label: label.to_owned(),
+            update: AsyncLoadUpdate::ArchiveProgress(ArchiveLoadProgress {
+                label: format!("{label} loop"),
+                detail: plan.identity.clone(),
+                done: index + 1,
+                total,
+            }),
+        });
+    }
+    if frames.is_empty() {
+        let reason = errors
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "provider returned no recent frames".to_owned());
+        let _ = sender.send(AsyncLoadResult {
+            label: label.to_owned(),
+            update: AsyncLoadUpdate::Final(Err(reason)),
+        });
+        return;
+    }
+    let _ = sender.send(AsyncLoadResult {
+        label: label.to_owned(),
+        update: AsyncLoadUpdate::Final(Ok(DecodedLoadBatch {
+            selected_index: frames.len().saturating_sub(1),
+            frames,
+        })),
+    });
+}
+
 fn assemble_intl_parts(
     merge: bool,
     parts: Vec<RadarVolume>,
@@ -33599,6 +34034,21 @@ mod tests {
         other.site.id = "OTHER".to_owned();
         let err = assemble_intl_parts(true, vec![volume, other]).unwrap_err();
         assert!(err.contains("different sites"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn local_odim_file_set_loads_through_merge_path() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../nexrad_io/tests/data/odim_pvol_synth.h5");
+
+        let batch = decode_local_radar_file_set(vec![fixture.clone(), fixture], Instant::now())
+            .expect("ODIM file set decodes and merges");
+
+        assert_eq!(batch.frames.len(), 1);
+        assert_eq!(batch.selected_index, 0);
+        assert_eq!(batch.frames[0].status, FrameStatus::Local);
+        assert!(batch.frames[0].source_label.contains("ODIM_H5"));
+        assert!(!batch.frames[0].volume.cuts.is_empty());
     }
 
     #[test]
