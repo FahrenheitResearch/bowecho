@@ -258,6 +258,41 @@ struct BeamCandidate {
     distance_km: f32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RadarLabelStyle {
+    FullBox,
+    IdBox,
+    Text,
+}
+
+impl RadarLabelStyle {
+    const ALL: [Self; 3] = [Self::FullBox, Self::IdBox, Self::Text];
+
+    fn from_key(key: &str) -> Self {
+        match key.trim().to_ascii_lowercase().as_str() {
+            "id-box" | "id" | "compact" => Self::IdBox,
+            "text" | "plain" => Self::Text,
+            _ => Self::FullBox,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::FullBox => "full-box",
+            Self::IdBox => "id-box",
+            Self::Text => "text",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::FullBox => "Full box",
+            Self::IdBox => "ID box",
+            Self::Text => "Text",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct CustomGisSite {
     site_id: String,
@@ -2380,6 +2415,7 @@ struct ViewPane {
     last_history_step: Option<Instant>,
     archive_load_progress: Option<ArchiveLoadProgress>,
     load_receiver: Option<mpsc::Receiver<AsyncLoadResult>>,
+    load_mode: Option<LatestLoadMode>,
     pending_site_id: Option<String>,
     status: String,
     map_center_lat: f32,
@@ -2407,6 +2443,7 @@ impl ViewPane {
             last_history_step: None,
             archive_load_progress: None,
             load_receiver: None,
+            load_mode: None,
             pending_site_id: None,
             status: "Following primary radar".to_owned(),
             map_center_lat: 0.0,
@@ -5712,21 +5749,9 @@ impl ViewerApp {
         }
     }
 
-    /// Number-row product hotkeys (customizable in config.json). Routes to
-    /// the focused pane, like the arrow keys.
+    /// Product hotkeys (customizable in config.json). Routes to the focused
+    /// pane, like the arrow keys.
     fn handle_product_hotkeys(&mut self, ctx: &egui::Context) -> bool {
-        const KEYS: [(egui::Key, &str); 10] = [
-            (egui::Key::Num1, "1"),
-            (egui::Key::Num2, "2"),
-            (egui::Key::Num3, "3"),
-            (egui::Key::Num4, "4"),
-            (egui::Key::Num5, "5"),
-            (egui::Key::Num6, "6"),
-            (egui::Key::Num7, "7"),
-            (egui::Key::Num8, "8"),
-            (egui::Key::Num9, "9"),
-            (egui::Key::Num0, "0"),
-        ];
         let focused_slot = self.focused_extra_pane();
         let Some(volume) = focused_slot
             .and_then(|slot| {
@@ -5738,13 +5763,13 @@ impl ViewerApp {
         else {
             return false;
         };
-        for (key, name) in KEYS {
+        for (name, label) in self.app_settings.product_hotkeys.clone() {
+            let Some(key) = product_hotkey_egui_key(&name) else {
+                continue;
+            };
             if !ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key)) {
                 continue;
             }
-            let Some(label) = self.app_settings.product_hotkeys.get(name).cloned() else {
-                return false;
-            };
             let Some(product) = global_displayable_products(&volume)
                 .into_iter()
                 .find(|product| product.label().eq_ignore_ascii_case(&label))
@@ -7198,6 +7223,7 @@ impl ViewerApp {
         pane.last_history_step = None;
         pane.archive_load_progress = None;
         pane.load_receiver = None;
+        pane.load_mode = None;
         pane.pending_site_id = None;
         pane.map_center_lat = self.map_center_lat;
         pane.map_center_lon = self.map_center_lon;
@@ -7267,6 +7293,7 @@ impl ViewerApp {
             pane.source_path = None;
             pane.load_timing = None;
             pane.load_receiver = None;
+            pane.load_mode = None;
             pane.pending_site_id = None;
             pane.cut = None;
             pane.status = format!("Pane radar set to {site_id}; click Load Latest");
@@ -7323,6 +7350,7 @@ impl ViewerApp {
             pane.source_path = None;
             pane.load_timing = None;
             pane.load_receiver = None;
+            pane.load_mode = None;
             pane.pending_site_id = None;
             pane.clear_history();
             pane.status = "Following primary radar".to_owned();
@@ -7367,9 +7395,7 @@ impl ViewerApp {
         mode: LatestLoadMode,
         ctx: &egui::Context,
     ) {
-        if pane_slot >= self.extra_panes.len()
-            || self.extra_panes[pane_slot].load_receiver.is_some()
-        {
+        if pane_slot >= self.extra_panes.len() {
             return;
         }
         let site_id = site.level2_id.clone();
@@ -7395,6 +7421,7 @@ impl ViewerApp {
             pane.pinned_site_id = Some(site_id.clone());
             pane.pending_site_id = Some(site_id.clone());
             pane.load_receiver = Some(receiver);
+            pane.load_mode = Some(mode);
             pane.archive_load_progress = progress.clone();
             pane.status = progress.as_ref().map_or_else(
                 || format!("Loading latest L2 {site_id}"),
@@ -7413,6 +7440,30 @@ impl ViewerApp {
             sender,
         );
         ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+    }
+
+    fn start_extra_pane_history_loop_if_ready(
+        &mut self,
+        pane_slot: usize,
+        ctx: &egui::Context,
+    ) -> bool {
+        let frame_count = self
+            .extra_panes
+            .get(pane_slot)
+            .map(|pane| pane.frame_history.len())
+            .unwrap_or_default();
+        if frame_count <= 1 {
+            return false;
+        }
+        let frame_ms = self.loop_frame_ms();
+        if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+            pane.history_playing = true;
+            pane.browsing_history = false;
+            pane.last_history_step = Some(Instant::now());
+            pane.status = format!("Playing {frame_count} frames");
+        }
+        ctx.request_repaint_after(Duration::from_millis(frame_ms));
+        true
     }
 
     fn poll_extra_pane_loads(&mut self, ctx: &egui::Context) {
@@ -7452,6 +7503,7 @@ impl ViewerApp {
                                 );
                             }
                             AsyncLoadUpdate::Unchanged { timings, reason } => {
+                                let load_mode = self.extra_panes[pane_slot].load_mode.take();
                                 let pane = &mut self.extra_panes[pane_slot];
                                 pane.load_receiver = None;
                                 pane.pending_site_id = None;
@@ -7460,10 +7512,14 @@ impl ViewerApp {
                                     pane.load_timing = Some(timings);
                                 }
                                 pane.status = format!("Current {} ({reason})", message.label);
+                                if load_mode == Some(LatestLoadMode::Loop) {
+                                    self.start_extra_pane_history_loop_if_ready(pane_slot, ctx);
+                                }
                                 ctx.request_repaint_after(Duration::from_secs(1));
                                 break;
                             }
                             AsyncLoadUpdate::Final(result) => {
+                                let load_mode = self.extra_panes[pane_slot].load_mode.take();
                                 self.extra_panes[pane_slot].load_receiver = None;
                                 self.extra_panes[pane_slot].pending_site_id = None;
                                 self.extra_panes[pane_slot].archive_load_progress = None;
@@ -7473,7 +7529,17 @@ impl ViewerApp {
                                         let selected = self.install_extra_pane_decoded_load_batch(
                                             pane_slot, batch, true, ctx,
                                         );
-                                        if !selected {
+                                        if load_mode == Some(LatestLoadMode::Loop)
+                                            && frame_count > 1
+                                            && self.start_extra_pane_history_loop_if_ready(
+                                                pane_slot, ctx,
+                                            )
+                                        {
+                                            self.extra_panes[pane_slot].status = format!(
+                                                "Playing {frame_count} frames for {}",
+                                                message.label
+                                            );
+                                        } else if !selected {
                                             self.extra_panes[pane_slot].status = if frame_count > 1
                                             {
                                                 format!(
@@ -7506,6 +7572,7 @@ impl ViewerApp {
                     Err(mpsc::TryRecvError::Disconnected) => {
                         let pane = &mut self.extra_panes[pane_slot];
                         pane.load_receiver = None;
+                        pane.load_mode = None;
                         pane.pending_site_id = None;
                         pane.archive_load_progress = None;
                         pane.status = "Pane L2 load worker disconnected".to_owned();
@@ -10364,6 +10431,25 @@ impl ViewerApp {
             let _ = self.app_settings.save();
             ctx.request_repaint();
         }
+        ui.add_enabled_ui(self.app_settings.show_radar_labels, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Label style");
+                let mut style = RadarLabelStyle::from_key(&self.app_settings.radar_label_style);
+                egui::ComboBox::from_id_salt("radar_label_style")
+                    .selected_text(style.label())
+                    .width(96.0)
+                    .show_ui(ui, |ui| {
+                        for option in RadarLabelStyle::ALL {
+                            ui.selectable_value(&mut style, option, option.label());
+                        }
+                    });
+                if style.key() != self.app_settings.radar_label_style {
+                    self.app_settings.radar_label_style = style.key().to_owned();
+                    let _ = self.app_settings.save();
+                    ctx.request_repaint();
+                }
+            });
+        });
     }
 
     fn appearance_profile_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -11225,16 +11311,7 @@ impl ViewerApp {
         ui.weak("←/→ product · ↑/↓ tilt (focused pane)");
         let mut bindings: Vec<(&String, &String)> =
             self.app_settings.product_hotkeys.iter().collect();
-        bindings.sort_by(|a, b| {
-            let order = |k: &str| {
-                if k == "0" {
-                    10
-                } else {
-                    k.parse::<u8>().unwrap_or(99)
-                }
-            };
-            order(a.0).cmp(&order(b.0))
-        });
+        bindings.sort_by_key(|(key, _)| product_hotkey_sort_key(key));
         for (key, label) in bindings {
             ui.monospace(format!("{key}  →  {label}"));
         }
@@ -15711,7 +15788,17 @@ impl ViewerApp {
                 && let Some(pointer) = response.interact_pointer_pos()
             {
                 let (lon, lat) = self.screen_to_lon_lat(cell, pointer);
-                self.switch_to_best_radar_at(lon, lat, ui.ctx());
+                if self.app_settings.independent_panels && cell_index > 0 {
+                    let pane_slot = cell_index - 1;
+                    self.switch_extra_pane_to_best_radar_at(pane_slot, lon, lat, ui.ctx());
+                    if let Some(pane) = self.extra_panes.get(pane_slot) {
+                        self.map_center_lat = pane.map_center_lat;
+                        self.map_center_lon = pane.map_center_lon;
+                        self.map_scale = pane.map_scale;
+                    }
+                } else {
+                    self.switch_to_best_radar_at(lon, lat, ui.ctx());
+                }
             }
             if !armed
                 && !vrot_armed
@@ -15766,7 +15853,17 @@ impl ViewerApp {
                     self.add_nearest_radar_overlay_at(cell, pointer, ui.ctx());
                 } else if self.app_settings.right_click_loads_nearest {
                     let (lon, lat) = self.screen_to_lon_lat(cell, pointer);
-                    self.switch_to_nearest_radar_at(lon, lat, ui.ctx());
+                    if self.app_settings.independent_panels && cell_index > 0 {
+                        let pane_slot = cell_index - 1;
+                        self.switch_extra_pane_to_nearest_radar_at(pane_slot, lon, lat, ui.ctx());
+                        if let Some(pane) = self.extra_panes.get(pane_slot) {
+                            self.map_center_lat = pane.map_center_lat;
+                            self.map_center_lon = pane.map_center_lon;
+                            self.map_scale = pane.map_scale;
+                        }
+                    } else {
+                        self.switch_to_nearest_radar_at(lon, lat, ui.ctx());
+                    }
                 } else {
                     // Same lowest-beam menu as the single-pane map (an
                     // eager nearest-site load here raced the menu pick —
@@ -16654,6 +16751,35 @@ impl ViewerApp {
         }
     }
 
+    fn activate_beam_target_for_extra_pane(
+        &mut self,
+        pane_slot: usize,
+        candidate: &BeamCandidate,
+        ctx: &egui::Context,
+    ) -> bool {
+        match &candidate.target {
+            BeamTarget::Conus(index) => {
+                let Some(site) = self.sites.get(*index).cloned() else {
+                    return false;
+                };
+                self.set_extra_pane_selected_site(pane_slot, *index);
+                self.start_extra_pane_latest_load(pane_slot, site, ctx);
+                true
+            }
+            BeamTarget::Intl { .. } | BeamTarget::Research { .. } => {
+                let status = format!(
+                    "{} is a live feed; independent panes currently load catalog Level II sites",
+                    candidate.label
+                );
+                if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+                    pane.status = status.clone();
+                }
+                self.status = status;
+                false
+            }
+        }
+    }
+
     /// Nearby TDWRs for the context menu's own section: Txxx sites by
     /// ground distance. TDWRs are C-band terminal radars with very low
     /// tilts (0.1-0.6°) but ~90 km Doppler range and rain attenuation
@@ -16703,6 +16829,32 @@ impl ViewerApp {
         }
     }
 
+    fn switch_extra_pane_to_best_radar_at(
+        &mut self,
+        pane_slot: usize,
+        lon: f32,
+        lat: f32,
+        ctx: &egui::Context,
+    ) {
+        let Some(candidate) = self.best_radar_candidates(lat, lon).into_iter().next() else {
+            if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+                pane.status = "No radar within 460 km of your click".to_owned();
+            }
+            return;
+        };
+        let label = candidate.label.clone();
+        let beam_m = candidate.beam_m;
+        if self.activate_beam_target_for_extra_pane(pane_slot, &candidate, ctx) {
+            let status = format!(
+                "Pane switched to {label} - lowest beam {} at your click",
+                units::format_beam_height(beam_m, self.units())
+            );
+            if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+                pane.status = status;
+            }
+        }
+    }
+
     /// Right-click with Settings ▸ "Right-click loads closest radar" on:
     /// switch straight to the nearest radar of any family by ground
     /// distance (the lowest-beam pick stays on Ctrl+click and the menu).
@@ -16723,6 +16875,36 @@ impl ViewerApp {
                 "Switched to {label} — closest radar ({})",
                 units::format_distance_km(distance_km, self.units())
             );
+        }
+    }
+
+    fn switch_extra_pane_to_nearest_radar_at(
+        &mut self,
+        pane_slot: usize,
+        lon: f32,
+        lat: f32,
+        ctx: &egui::Context,
+    ) {
+        let Some(candidate) = self
+            .best_radar_candidates(lat, lon)
+            .into_iter()
+            .min_by(|a, b| a.distance_km.total_cmp(&b.distance_km))
+        else {
+            if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+                pane.status = "No radar within 460 km of your click".to_owned();
+            }
+            return;
+        };
+        let label = candidate.label.clone();
+        let distance_km = candidate.distance_km;
+        if self.activate_beam_target_for_extra_pane(pane_slot, &candidate, ctx) {
+            let status = format!(
+                "Pane switched to {label} - closest radar ({})",
+                units::format_distance_km(distance_km, self.units())
+            );
+            if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+                pane.status = status;
+            }
         }
     }
 
@@ -22129,6 +22311,7 @@ impl ViewerApp {
         }
         let built = self.cached_hazard_overlay_shapes(rect);
         painter.extend(built.outline_shapes.iter().cloned());
+        self.draw_unacknowledged_hazard_flashes(painter, rect);
         if !self.app_settings.show_hazard_labels {
             return;
         }
@@ -22148,6 +22331,64 @@ impl ViewerApp {
                 egui::Color32::from_rgb(245, 248, 250),
                 halo,
             );
+        }
+    }
+
+    fn draw_unacknowledged_hazard_flashes(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if self.unacknowledged_hazard_event_ids.is_empty() {
+            return;
+        }
+        let Some(overlay) = &self.hazard_overlay else {
+            return;
+        };
+        painter
+            .ctx()
+            .request_repaint_after(Duration::from_millis(350));
+        let blink_on = painter
+            .ctx()
+            .input(|input| (input.time * 2.4) as i64 % 2 == 0);
+        let color = if blink_on {
+            egui::Color32::from_rgba_unmultiplied(255, 230, 96, 245)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(255, 118, 72, 220)
+        };
+        let stroke = egui::Stroke::new(if blink_on { 4.5 } else { 2.75 }, color);
+        let bounds = self.visible_geo_bounds(rect).expand(0.05);
+        let global = self.style_registry.hazard_global();
+        let halo = style_color32(self.style_registry.labels().warning_halo_color);
+        for record in &overlay.records {
+            if !self
+                .unacknowledged_hazard_event_ids
+                .contains(&record.event_id)
+                || !self.hazard_record_visible(record)
+                || !hazard_points_renderable(&record.points)
+                || !bounds.intersects_bbox(record.bbox)
+            {
+                continue;
+            }
+            let points = record
+                .points
+                .iter()
+                .map(|point| self.lon_lat_to_screen(rect, point.lon, point.lat))
+                .collect::<Vec<_>>();
+            if points.len() < 3 {
+                continue;
+            }
+            painter.add(egui::Shape::closed_line(points.clone(), stroke));
+            if self.app_settings.show_hazard_labels && self.map_scale >= 62.0 {
+                let center = polygon_screen_centroid(&points);
+                if rect.expand(24.0).contains(center) {
+                    draw_halo_text(
+                        painter,
+                        center,
+                        egui::Align2::CENTER_CENTER,
+                        &format!("NEW {}", record.label),
+                        egui::FontId::proportional(global.label_font_selected_px),
+                        color,
+                        halo,
+                    );
+                }
+            }
         }
     }
 
@@ -23029,17 +23270,30 @@ impl ViewerApp {
         occupied: &mut Vec<egui::Rect>,
     ) {
         let terminal = site_is_terminal_radar(site);
-        let label = site_marker_label(site);
-        let font_px = if selected { 13.0 } else { 11.0 };
-        let text_color = if terminal {
-            egui::Color32::from_rgb(25, 18, 6)
-        } else {
-            egui::Color32::from_rgb(238, 246, 255)
+        let style = RadarLabelStyle::from_key(&self.app_settings.radar_label_style);
+        let label = match style {
+            RadarLabelStyle::FullBox | RadarLabelStyle::Text => site_marker_label(site),
+            RadarLabelStyle::IdBox => site.level2_id.clone(),
         };
-        let galley = painter.layout_no_wrap(label, egui::FontId::proportional(font_px), text_color);
+        let font_px = if selected { 13.0 } else { 11.0 };
+        let text_color = match style {
+            RadarLabelStyle::FullBox if terminal => egui::Color32::from_rgb(25, 18, 6),
+            RadarLabelStyle::IdBox if terminal => egui::Color32::from_rgb(255, 232, 168),
+            _ => egui::Color32::from_rgb(238, 246, 255),
+        };
+        let galley = painter.layout_no_wrap(
+            label.clone(),
+            egui::FontId::proportional(font_px),
+            text_color,
+        );
+        let padding = match style {
+            RadarLabelStyle::Text => egui::vec2(8.0, 4.0),
+            RadarLabelStyle::IdBox => egui::vec2(10.0, 5.0),
+            RadarLabelStyle::FullBox => egui::vec2(8.0, 4.0),
+        };
         let rect = egui::Rect::from_min_size(
             position + egui::vec2(10.0, if terminal { -15.0 } else { -12.0 }),
-            galley.size() + egui::vec2(8.0, 4.0),
+            galley.size() + padding,
         );
         if !selected
             && occupied
@@ -23048,15 +23302,62 @@ impl ViewerApp {
         {
             return;
         }
-        let bg = if terminal {
-            egui::Color32::from_rgba_unmultiplied(255, 202, 92, if selected { 245 } else { 218 })
-        } else if selected {
-            egui::Color32::from_rgba_unmultiplied(12, 18, 26, 224)
-        } else {
-            egui::Color32::from_rgba_unmultiplied(3, 6, 10, 168)
-        };
-        painter.rect_filled(rect, 3.0, bg);
-        painter.galley(rect.min + egui::vec2(4.0, 2.0), galley, text_color);
+        match style {
+            RadarLabelStyle::Text => {
+                draw_halo_text(
+                    painter,
+                    rect.left_center(),
+                    egui::Align2::LEFT_CENTER,
+                    &label,
+                    egui::FontId::proportional(font_px),
+                    text_color,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
+                );
+            }
+            RadarLabelStyle::IdBox => {
+                let radius = rect.height() * 0.5;
+                painter.rect_filled(
+                    rect,
+                    radius,
+                    egui::Color32::from_rgba_unmultiplied(
+                        2,
+                        4,
+                        7,
+                        if selected { 236 } else { 204 },
+                    ),
+                );
+                let outline = if terminal {
+                    egui::Color32::from_rgb(255, 202, 92)
+                } else if selected {
+                    egui::Color32::from_rgb(236, 246, 255)
+                } else {
+                    egui::Color32::from_rgb(152, 176, 196)
+                };
+                painter.rect_stroke(
+                    rect,
+                    radius,
+                    egui::Stroke::new(if selected { 1.7 } else { 1.2 }, outline),
+                    egui::StrokeKind::Outside,
+                );
+                painter.galley(rect.min + egui::vec2(5.0, 2.5), galley, text_color);
+            }
+            RadarLabelStyle::FullBox => {
+                let bg = if terminal {
+                    egui::Color32::from_rgba_unmultiplied(
+                        255,
+                        202,
+                        92,
+                        if selected { 245 } else { 218 },
+                    )
+                } else if selected {
+                    egui::Color32::from_rgba_unmultiplied(12, 18, 26, 224)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(3, 6, 10, 168)
+                };
+                painter.rect_filled(rect, 3.0, bg);
+                painter.galley(rect.min + egui::vec2(4.0, 2.0), galley, text_color);
+            }
+        }
         occupied.push(rect);
     }
 
@@ -29384,6 +29685,68 @@ fn is_allowed_live_low_level_tilt(cut: &ElevationCut, allow_incomplete: bool) ->
     }
 }
 
+fn product_hotkey_egui_key(name: &str) -> Option<egui::Key> {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "1" => Some(egui::Key::Num1),
+        "2" => Some(egui::Key::Num2),
+        "3" => Some(egui::Key::Num3),
+        "4" => Some(egui::Key::Num4),
+        "5" => Some(egui::Key::Num5),
+        "6" => Some(egui::Key::Num6),
+        "7" => Some(egui::Key::Num7),
+        "8" => Some(egui::Key::Num8),
+        "9" => Some(egui::Key::Num9),
+        "0" => Some(egui::Key::Num0),
+        "A" => Some(egui::Key::A),
+        "B" => Some(egui::Key::B),
+        "C" => Some(egui::Key::C),
+        "D" => Some(egui::Key::D),
+        "E" => Some(egui::Key::E),
+        "F" => Some(egui::Key::F),
+        "G" => Some(egui::Key::G),
+        "H" => Some(egui::Key::H),
+        "I" => Some(egui::Key::I),
+        "J" => Some(egui::Key::J),
+        "K" => Some(egui::Key::K),
+        "L" => Some(egui::Key::L),
+        "M" => Some(egui::Key::M),
+        "N" => Some(egui::Key::N),
+        "O" => Some(egui::Key::O),
+        "P" => Some(egui::Key::P),
+        "Q" => Some(egui::Key::Q),
+        "R" => Some(egui::Key::R),
+        "S" => Some(egui::Key::S),
+        "T" => Some(egui::Key::T),
+        "U" => Some(egui::Key::U),
+        "V" => Some(egui::Key::V),
+        "W" => Some(egui::Key::W),
+        "X" => Some(egui::Key::X),
+        "Y" => Some(egui::Key::Y),
+        "Z" => Some(egui::Key::Z),
+        _ => None,
+    }
+}
+
+fn product_hotkey_sort_key(name: &str) -> (u8, u8, String) {
+    let normalized = name.trim().to_ascii_uppercase();
+    match normalized.as_str() {
+        "1" => (0, 1, normalized),
+        "2" => (0, 2, normalized),
+        "3" => (0, 3, normalized),
+        "4" => (0, 4, normalized),
+        "5" => (0, 5, normalized),
+        "6" => (0, 6, normalized),
+        "7" => (0, 7, normalized),
+        "8" => (0, 8, normalized),
+        "9" => (0, 9, normalized),
+        "0" => (0, 10, normalized),
+        letter if letter.len() == 1 && letter.as_bytes()[0].is_ascii_uppercase() => {
+            (1, letter.as_bytes()[0] - b'A', normalized)
+        }
+        _ => (2, 0, normalized),
+    }
+}
+
 fn stepped_product<'a>(
     products: &'a [DisplayProduct],
     current: &DisplayProduct,
@@ -32146,6 +32509,56 @@ mod tests {
     }
 
     #[test]
+    fn independent_pane_loop_load_starts_playback_when_final_batch_lands() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.independent_panels = true;
+        app.extra_panes
+            .push(ViewPane::new(DisplayProduct::DealiasedVelocity));
+        let (sender, receiver) = mpsc::channel::<AsyncLoadResult>();
+        app.extra_panes[0].load_receiver = Some(receiver);
+        app.extra_panes[0].load_mode = Some(LatestLoadMode::Loop);
+
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+        let mut first = test_ref_then_velocity_volume();
+        first.site.id = "KTLX".to_owned();
+        first.volume_time = scan_time;
+        let mut second = test_ref_then_velocity_volume();
+        second.site.id = "KTLX".to_owned();
+        second.volume_time = scan_time + chrono::Duration::minutes(3);
+        sender
+            .send(AsyncLoadResult {
+                label: "KTLX loop".to_owned(),
+                update: AsyncLoadUpdate::Final(Ok(DecodedLoadBatch {
+                    frames: vec![
+                        test_decoded_from_volume(
+                            PathBuf::from("KTLX-0130"),
+                            first,
+                            FrameStatus::Complete,
+                        ),
+                        test_decoded_from_volume(
+                            PathBuf::from("KTLX-0133"),
+                            second,
+                            FrameStatus::Complete,
+                        ),
+                    ],
+                    selected_index: 1,
+                })),
+            })
+            .unwrap();
+
+        app.poll_extra_pane_loads(&egui::Context::default());
+
+        let pane = &app.extra_panes[0];
+        assert!(pane.load_receiver.is_none());
+        assert!(pane.load_mode.is_none());
+        assert_eq!(pane.frame_history.len(), 2);
+        assert_eq!(pane.selected_frame_index, 1);
+        assert!(pane.history_playing);
+        assert!(!pane.browsing_history);
+        assert!(pane.status.contains("Playing 2 frames"));
+    }
+
+    #[test]
     fn loop_playback_toggle_updates_browse_state_like_play_button() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
@@ -32212,6 +32625,17 @@ mod tests {
         assert!(app.step_history_frame(-1, &ctx));
         assert_eq!(app.selected_frame_index, 0);
         assert!(app.browsing_history);
+    }
+
+    #[test]
+    fn product_hotkeys_accept_numbers_and_letters() {
+        assert_eq!(product_hotkey_egui_key("1"), Some(egui::Key::Num1));
+        assert_eq!(product_hotkey_egui_key("0"), Some(egui::Key::Num0));
+        assert_eq!(product_hotkey_egui_key("a"), Some(egui::Key::A));
+        assert_eq!(product_hotkey_egui_key("Z"), Some(egui::Key::Z));
+        assert_eq!(product_hotkey_egui_key("Space"), None);
+        assert!(product_hotkey_sort_key("9") < product_hotkey_sort_key("0"));
+        assert!(product_hotkey_sort_key("0") < product_hotkey_sort_key("A"));
     }
 
     #[test]
@@ -33049,6 +33473,21 @@ mod tests {
 
         assert!(!app.site_marker_should_label(&terminal, false));
         assert!(!app.site_marker_should_label(&nexrad, true));
+    }
+
+    #[test]
+    fn radar_label_style_parses_compact_id_box_with_safe_fallback() {
+        assert_eq!(
+            RadarLabelStyle::from_key("full-box"),
+            RadarLabelStyle::FullBox
+        );
+        assert_eq!(RadarLabelStyle::from_key("id-box"), RadarLabelStyle::IdBox);
+        assert_eq!(RadarLabelStyle::from_key("compact"), RadarLabelStyle::IdBox);
+        assert_eq!(RadarLabelStyle::from_key("text"), RadarLabelStyle::Text);
+        assert_eq!(
+            RadarLabelStyle::from_key("unknown"),
+            RadarLabelStyle::FullBox
+        );
     }
 
     #[test]

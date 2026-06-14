@@ -74,6 +74,9 @@ pub struct AppSettings {
     /// stay visible/clickable when labels are off.
     #[serde(default = "default_true")]
     pub show_radar_labels: bool,
+    /// Radar marker label style: "full-box", "id-box", or "text".
+    #[serde(default = "default_radar_label_style")]
+    pub radar_label_style: String,
     /// Draw compact warning-polygon labels such as "SVR 0653" on the map.
     /// Polygons remain visible/clickable when labels are off.
     #[serde(default = "default_true")]
@@ -119,7 +122,8 @@ pub struct AppSettings {
     /// warning families, keeping old configs sparse.
     #[serde(default)]
     pub alert_sound_families: Vec<String>,
-    /// Product hotkeys: number-row key ("0"-"9") -> product label (e.g.
+    /// Product hotkeys: number-row key ("0"-"9") or letter ("A"-"Z") ->
+    /// product label (e.g.
     /// "REF", "VEL", "SRV", "RHO", "ZDR", "SW", "CREF", "ET", "VIL", "VILD",
     /// "PHI", "KDP", "AzShr", "Div"). Edit in config.json to customize.
     pub product_hotkeys: BTreeMap<String, String>,
@@ -348,6 +352,7 @@ impl Default for AppSettings {
             basemap_style: default_basemap_style(),
             bold_labels: default_bold_labels(),
             show_radar_labels: true,
+            radar_label_style: default_radar_label_style(),
             show_hazard_labels: true,
             right_click_loads_nearest: false,
             gate_filter_decidbz: None,
@@ -438,6 +443,10 @@ fn default_basemap_style() -> String {
 
 fn default_bold_labels() -> bool {
     true
+}
+
+fn default_radar_label_style() -> String {
+    "full-box".to_owned()
 }
 
 /// Platform bowecho config root (`%APPDATA%\bowecho` on Windows, the
@@ -712,15 +721,18 @@ mod tests {
     #[test]
     fn radar_labels_default_on_and_round_trip() {
         assert!(AppSettings::from_json("{}").show_radar_labels);
+        assert_eq!(AppSettings::from_json("{}").radar_label_style, "full-box");
 
         let settings = AppSettings {
             show_radar_labels: false,
+            radar_label_style: "id-box".to_owned(),
             show_hazard_labels: false,
             ..Default::default()
         };
         let back = AppSettings::from_json(&settings.to_json());
 
         assert!(!back.show_radar_labels);
+        assert_eq!(back.radar_label_style, "id-box");
         assert!(!back.show_hazard_labels);
         assert!(AppSettings::from_json("{}").show_hazard_labels);
     }
