@@ -15808,7 +15808,18 @@ impl ViewerApp {
                 && response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
-                if owns_cell_radar {
+                if self.app_settings.independent_panels && cell_index > 0 {
+                    self.handle_extra_pane_marker_click(
+                        cell_index - 1,
+                        &site_points,
+                        &intl_points,
+                        &community_points,
+                        &custom_poll_points,
+                        &raob_points,
+                        pointer,
+                        ui.ctx(),
+                    );
+                } else if owns_cell_radar {
                     self.status =
                         "Focused pane owns its radar; use the pane SITE controls to retarget it"
                             .to_owned();
@@ -23474,6 +23485,89 @@ impl ViewerApp {
                 }
             }
             Some((MarkerFamily::CustomPoll, index)) => self.start_custom_poll_link(index),
+            Some((MarkerFamily::Raob, index)) => {
+                let Some(site) = self.raob_marker_sites().get(index).cloned() else {
+                    return;
+                };
+                self.start_raob_sounding_for(site, None, ctx);
+            }
+            None => {}
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_extra_pane_marker_click(
+        &mut self,
+        pane_slot: usize,
+        site_points: &[(usize, egui::Pos2)],
+        intl_points: &[(usize, egui::Pos2)],
+        community_points: &[(usize, egui::Pos2)],
+        custom_poll_points: &[(usize, egui::Pos2)],
+        raob_points: &[(usize, egui::Pos2)],
+        pointer: egui::Pos2,
+        ctx: &egui::Context,
+    ) {
+        match resolve_marker_click(
+            nearest_marker_within(site_points, pointer),
+            nearest_marker_within(intl_points, pointer),
+            nearest_marker_within(community_points, pointer),
+            nearest_marker_within(custom_poll_points, pointer),
+            nearest_marker_within(raob_points, pointer),
+        ) {
+            Some((MarkerFamily::Conus, index)) => {
+                let Some(site) = self.sites.get(index).cloned() else {
+                    return;
+                };
+                self.set_extra_pane_selected_site(pane_slot, index);
+                self.start_extra_pane_latest_load(pane_slot, site, ctx);
+                if let Some(pane) = self.extra_panes.get(pane_slot) {
+                    self.map_center_lat = pane.map_center_lat;
+                    self.map_center_lon = pane.map_center_lon;
+                    self.map_scale = pane.map_scale;
+                }
+            }
+            Some((MarkerFamily::Intl, index)) => {
+                let Some(site) = data_source::international::intl_static_sites().get(index) else {
+                    return;
+                };
+                let status = format!(
+                    "{} is a live feed; independent panes currently load catalog Level II sites",
+                    site.label
+                );
+                if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+                    pane.status = status.clone();
+                }
+                self.status = status;
+            }
+            Some((MarkerFamily::Community, index)) => {
+                let Some(marker) = data_source::community_feeds::community_markers().get(index)
+                else {
+                    return;
+                };
+                let status = format!(
+                    "{} is a live feed; independent panes currently load catalog Level II sites",
+                    marker.label
+                );
+                if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+                    pane.status = status.clone();
+                }
+                self.status = status;
+            }
+            Some((MarkerFamily::CustomPoll, index)) => {
+                let label = self
+                    .app_settings
+                    .custom_poll_links
+                    .get(index)
+                    .map(custom_poll_entry_label)
+                    .unwrap_or_else(|| "Custom feed".to_owned());
+                let status = format!(
+                    "{label} is a live feed; independent panes currently load catalog Level II sites"
+                );
+                if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+                    pane.status = status.clone();
+                }
+                self.status = status;
+            }
             Some((MarkerFamily::Raob, index)) => {
                 let Some(site) = self.raob_marker_sites().get(index).cloned() else {
                     return;
