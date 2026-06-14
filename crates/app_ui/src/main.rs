@@ -7476,14 +7476,11 @@ impl ViewerApp {
     fn poll_extra_pane_loads(&mut self, ctx: &egui::Context) {
         for pane_slot in 0..self.extra_panes.len() {
             let mut saw_message = false;
-            loop {
-                let Some(result) = self.extra_panes[pane_slot]
-                    .load_receiver
-                    .as_ref()
-                    .map(mpsc::Receiver::try_recv)
-                else {
-                    break;
-                };
+            while let Some(result) = self.extra_panes[pane_slot]
+                .load_receiver
+                .as_ref()
+                .map(mpsc::Receiver::try_recv)
+            {
                 match result {
                     Ok(message) => {
                         saw_message = true;
