@@ -89,6 +89,10 @@ const HIGH_END_SAMPLE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const LOW_CORE_PREVIEW_THREADS: usize = 4;
 const LOW_CORE_PREVIEW_RENDER_HEAD_START_MS: u64 = 8;
 const ACTIVE_LOAD_POLL_MS: u64 = 8;
+/// Some GPUs expose a max 2D texture dimension of 8192. GOES full-disk
+/// preview frames can be 10000 px wide, so cap the player preview well
+/// below the hard limit before egui uploads it.
+const MAX_SAT_PLAYER_TEXTURE_DIM: usize = 4096;
 const LIVE_HAZARD_REFRESH_SECONDS: u64 = 60;
 const PRIMARY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 1;
 const OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 5;
@@ -17931,6 +17935,13 @@ impl ViewerApp {
                 sat_worker::SatResponse::Frame { key, hhmm, result } => match *result {
                     Ok(frame) => {
                         self.sat_last_frame = Some((key.clone(), hhmm));
+                        let (frame, resized) = sat_player_frame_within_texture_limit(frame);
+                        if let Some((old_size, new_size)) = resized {
+                            self.sat_panel.apply_note(format!(
+                                "preview downsampled {}x{} -> {}x{} for GPU texture limit",
+                                old_size[0], old_size[1], new_size[0], new_size[1]
+                            ));
+                        }
                         self.sat_player.set_frame(frame);
                     }
                     Err(message) => {
@@ -30361,6 +30372,45 @@ fn radar_color_image_from_rgba(size: [usize; 2], rgba: &[u8]) -> egui::ColorImag
     egui::ColorImage::new(size, pixels)
 }
 
+fn sat_player_frame_within_texture_limit(
+    mut frame: rw_ui::SatFrameImage,
+) -> (rw_ui::SatFrameImage, Option<([usize; 2], [usize; 2])>) {
+    let old_size = frame.image.size;
+    let max_dim = old_size[0].max(old_size[1]);
+    if max_dim <= MAX_SAT_PLAYER_TEXTURE_DIM {
+        return (frame, None);
+    }
+    let scale = MAX_SAT_PLAYER_TEXTURE_DIM as f32 / max_dim as f32;
+    let new_size = [
+        ((old_size[0] as f32 * scale).round() as usize).clamp(1, MAX_SAT_PLAYER_TEXTURE_DIM),
+        ((old_size[1] as f32 * scale).round() as usize).clamp(1, MAX_SAT_PLAYER_TEXTURE_DIM),
+    ];
+    frame.image = resize_color_image_nearest(&frame.image, new_size);
+    (frame, Some((old_size, new_size)))
+}
+
+fn resize_color_image_nearest(image: &egui::ColorImage, new_size: [usize; 2]) -> egui::ColorImage {
+    let old_size = image.size;
+    if old_size == new_size {
+        return image.clone();
+    }
+    let (old_w, old_h) = (old_size[0], old_size[1]);
+    let (new_w, new_h) = (new_size[0].max(1), new_size[1].max(1));
+    if old_w == 0 || old_h == 0 || image.pixels.is_empty() {
+        return egui::ColorImage::new(new_size, vec![egui::Color32::TRANSPARENT; new_w * new_h]);
+    }
+    let mut pixels = Vec::with_capacity(new_w * new_h);
+    for y in 0..new_h {
+        let src_y = (y * old_h / new_h).min(old_h - 1);
+        let row = src_y * old_w;
+        for x in 0..new_w {
+            let src_x = (x * old_w / new_w).min(old_w - 1);
+            pixels.push(image.pixels[row + src_x]);
+        }
+    }
+    egui::ColorImage::new([new_w, new_h], pixels)
+}
+
 fn radar_rgba_is_premultiplied_compatible(rgba: &[u8]) -> bool {
     rgba.chunks_exact(4).all(|pixel| match pixel[3] {
         0 => pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0,
@@ -30615,6 +30665,25 @@ mod tests {
         assert!(!should_retry_startup_with_glow_message(
             "settings file could not be read"
         ));
+    }
+
+    #[test]
+    fn satellite_player_preview_is_capped_below_wgpu_texture_limit() {
+        let frame = rw_ui::SatFrameImage {
+            key: rw_ui::SatRunKey {
+                model: "g19".to_owned(),
+                run: "fulldisk_c13_20260614".to_owned(),
+            },
+            hhmm: 1850,
+            image: egui::ColorImage::new([10_000, 16], vec![egui::Color32::WHITE; 10_000 * 16]),
+            read_ms: 1.0,
+        };
+
+        let (frame, resized) = sat_player_frame_within_texture_limit(frame);
+
+        assert_eq!(resized, Some(([10_000, 16], [4096, 7])));
+        assert_eq!(frame.image.size, [MAX_SAT_PLAYER_TEXTURE_DIM, 7]);
+        assert_eq!(frame.image.pixels.len(), MAX_SAT_PLAYER_TEXTURE_DIM * 7);
     }
 
     #[test]
