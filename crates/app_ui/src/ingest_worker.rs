@@ -304,9 +304,9 @@ pub fn format_time_hint(
 /// order, so a freshest-hour lag on AWS only affects the chips.
 ///
 /// Products come from the model's ingest fetch plan (HRRR: `prs`+`sfc`
-/// pair, GFS: single `pgrb2.0p25`); an hour is available when every
-/// product the profile needs exists. A pressure-only file (HRRR `prs`)
-/// is probed only when the profile reads isobaric data.
+/// pair, GFS/RAP: single pressure-grid file); an hour is available when
+/// every product the profile needs exists. A pressure-only file (HRRR
+/// `prs`) is probed only when the profile reads isobaric data.
 fn probe_availability(state: &mut WorkerState, spec: &DownloadSpec) -> AvailabilityView {
     let mut view = AvailabilityView {
         model: spec.model.clone(),
@@ -921,13 +921,17 @@ mod tests {
             probe_products(ModelId::Hrrr, &sounding).unwrap(),
             vec!["prs", "sfc"]
         );
-        // GFS: one file serves both roles.
+        // GFS/RAP: one file serves both roles.
         assert_eq!(
             probe_products(ModelId::Gfs, &sounding).unwrap(),
             vec!["pgrb2.0p25"]
         );
+        assert_eq!(
+            probe_products(ModelId::Rap, &sounding).unwrap(),
+            vec!["awp130pgrb"]
+        );
         // Models without a fetch plan surface an error, not a panic.
-        assert!(probe_products(ModelId::Rap, &sounding).is_err());
+        assert!(probe_products(ModelId::Nbm, &sounding).is_err());
     }
 
     #[test]

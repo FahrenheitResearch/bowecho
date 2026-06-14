@@ -22,7 +22,7 @@ pub const SECTION_SPACING: f32 = 8.0;
 /// Section + rail-group header text (matches guide.rs's subheads).
 pub const SUBHEAD_COLOR: Color32 = Color32::from_rgb(202, 212, 224);
 /// Brighter section rule so dense sidebars have clear scan breaks.
-pub const SECTION_SEPARATOR_COLOR: Color32 = Color32::from_rgb(108, 124, 142);
+pub const SECTION_SEPARATOR_COLOR: Color32 = Color32::from_rgb(138, 154, 174);
 /// Editing-pane notice, keycap hints.
 pub const ACCENT_COLOR: Color32 = Color32::from_rgb(120, 168, 220);
 /// Live chips/dots ONLY — never decorative.

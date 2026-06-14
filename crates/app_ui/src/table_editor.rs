@@ -154,19 +154,29 @@ pub(crate) fn catalog_row(
 }
 
 /// Reveal a path in the OS file browser (the "My tables" folder).
-pub(crate) fn show_in_file_browser(path: &Path) {
+pub(crate) fn show_in_file_browser(path: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("explorer").arg(path).spawn();
+        std::process::Command::new("explorer")
+            .arg(path)
+            .spawn()
+            .map_err(|err| format!("Open folder failed for {}: {err}", path.display()))?;
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open").arg(path).spawn();
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .map_err(|err| format!("Open folder failed for {}: {err}", path.display()))?;
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map_err(|err| format!("Open folder failed for {}: {err}", path.display()))?;
     }
+    Ok(())
 }
 
 // ------------------------------------------------------------------------
@@ -1045,7 +1055,16 @@ impl ViewerApp {
                 return;
             }
         };
-        let directory = settings::color_tables_dir();
+        let directory = match settings::ensure_color_tables_dir() {
+            Ok(directory) => directory,
+            Err(error) => {
+                self.table_editor.status = format!(
+                    "Save failed: My tables folder unavailable at {}: {error}",
+                    settings::color_tables_dir_path().display()
+                );
+                return;
+            }
+        };
         let path = directory.join(format!("{sanitized}.pal"));
         match std::fs::write(&path, to_gr_pal(&table)) {
             Ok(()) => {
@@ -1057,7 +1076,7 @@ impl ViewerApp {
                 self.table_editor.status = format!("Saved {}", path.display());
             }
             Err(error) => {
-                self.table_editor.status = format!("Save failed: {error}");
+                self.table_editor.status = format!("Save failed for {}: {error}", path.display());
             }
         }
     }
@@ -1121,9 +1140,19 @@ impl ViewerApp {
     /// table falls back to the default on next boot via
     /// `restore_palette_bindings`'s miss path.
     pub(crate) fn delete_user_color_table(&mut self, name: &str) {
-        let directory = settings::color_tables_dir();
+        let directory = match settings::ensure_color_tables_dir() {
+            Ok(directory) => directory,
+            Err(error) => {
+                self.color_table_status = format!(
+                    "My tables folder unavailable at {}: {error}",
+                    settings::color_tables_dir_path().display()
+                );
+                return;
+            }
+        };
         let Ok(entries) = std::fs::read_dir(&directory) else {
-            self.color_table_status = "My tables folder is unreadable".to_owned();
+            self.color_table_status =
+                format!("My tables folder is unreadable: {}", directory.display());
             return;
         };
         let target = entries.flatten().map(|entry| entry.path()).find(|path| {
@@ -1139,7 +1168,8 @@ impl ViewerApp {
                     self.color_table_status = format!("Deleted {}", path.display());
                 }
                 Err(error) => {
-                    self.color_table_status = format!("Delete failed: {error}");
+                    self.color_table_status =
+                        format!("Delete failed for {}: {error}", path.display());
                 }
             },
             None => {

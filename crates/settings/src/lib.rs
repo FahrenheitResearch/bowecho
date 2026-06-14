@@ -70,6 +70,10 @@ pub struct AppSettings {
     /// stay visible/clickable when labels are off.
     #[serde(default = "default_true")]
     pub show_radar_labels: bool,
+    /// Draw compact warning-polygon labels such as "SVR 0653" on the map.
+    /// Polygons remain visible/clickable when labels are off.
+    #[serde(default = "default_true")]
+    pub show_hazard_labels: bool,
     /// Map right-click: false (default) = open the lowest-beam radar menu;
     /// true = switch straight to the closest WSR-88D, no menu (field
     /// request: "i might sometimes want right click to just load closest
@@ -329,6 +333,7 @@ impl Default for AppSettings {
             basemap_style: default_basemap_style(),
             bold_labels: default_bold_labels(),
             show_radar_labels: true,
+            show_hazard_labels: true,
             right_click_loads_nearest: false,
             gate_filter_decidbz: None,
             model_keep_runs: default_model_keep_runs(),
@@ -459,18 +464,38 @@ pub fn data_dir_override() -> Option<PathBuf> {
 /// Imported .pal files are COPIED here so a palette choice survives the
 /// original file moving. Created on use.
 pub fn color_tables_dir() -> PathBuf {
-    bowecho_dir("color_tables")
+    let dir = color_tables_dir_path();
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Path for user color tables without creating it. Use this for diagnostics
+/// so permission errors can name the exact folder that failed.
+pub fn color_tables_dir_path() -> PathBuf {
+    bowecho_dir_path("color_tables")
+}
+
+/// Ensure the user color-table folder exists, returning the underlying IO
+/// error instead of hiding it behind a later save/import failure.
+pub fn ensure_color_tables_dir() -> std::io::Result<PathBuf> {
+    let dir = color_tables_dir_path();
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 /// Platform-correct bowecho data root (config dir scoped, or the user's
 /// data-folder override). Created on use.
 fn bowecho_dir(leaf: &str) -> PathBuf {
-    let dir = data_dir_override()
-        .map(|root| root.join(leaf))
-        .or_else(|| bowecho_config_dir().map(|dir| dir.join(leaf)))
-        .unwrap_or_else(|| PathBuf::from("bowecho-data").join(leaf));
+    let dir = bowecho_dir_path(leaf);
     let _ = std::fs::create_dir_all(&dir);
     dir
+}
+
+fn bowecho_dir_path(leaf: &str) -> PathBuf {
+    data_dir_override()
+        .map(|root| root.join(leaf))
+        .or_else(|| bowecho_config_dir().map(|dir| dir.join(leaf)))
+        .unwrap_or_else(|| PathBuf::from("bowecho-data").join(leaf))
 }
 
 /// Model (rw-store) root. Dev convenience: when the local rusty-weather
@@ -673,11 +698,14 @@ mod tests {
 
         let settings = AppSettings {
             show_radar_labels: false,
+            show_hazard_labels: false,
             ..Default::default()
         };
         let back = AppSettings::from_json(&settings.to_json());
 
         assert!(!back.show_radar_labels);
+        assert!(!back.show_hazard_labels);
+        assert!(AppSettings::from_json("{}").show_hazard_labels);
     }
 
     #[test]

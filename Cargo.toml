@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.22.0"
+version = "0.22.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FahrenheitResearch/bowecho"
@@ -37,4 +37,4 @@ strip = true
 # GOES-19 parse), not crates.io 0.3 ??? [patch] only applies from the
 # workspace root, so every consumer of their crates must repeat it.
 [patch.crates-io]
-hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "d853afa" }
+hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "b48387bf76c52b74a638ab84e4339205e3c0f76e" }

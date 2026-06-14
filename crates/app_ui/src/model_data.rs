@@ -125,6 +125,11 @@ impl ModelDataDock {
         self.latest_field.as_ref()
     }
 
+    /// Selected model hour in the store browser.
+    pub fn selected_hour(&self) -> Option<&rw_ui::HourKey> {
+        self.browser.selected()
+    }
+
     /// The most recent sounding (for the native skew-T window).
     pub fn latest_sounding(&self) -> Option<&std::sync::Arc<rw_ui::SoundingData>> {
         self.latest_sounding.as_ref()

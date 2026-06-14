@@ -56,6 +56,7 @@ mod tiles;
 mod tor_tracks;
 mod ui_theme;
 mod units;
+mod upper_air;
 mod vol3d;
 mod wofs;
 mod wofs_georef;
@@ -1015,6 +1016,9 @@ struct ViewerApp {
     model_layers: Vec<MapLayerSlot>,
     model_layer_build_rx: Option<mpsc::Receiver<Option<model_layer::ModelMapLayer>>>,
     model_layer_generation: u64,
+    /// SPC-style upper-air quicklook (height/temp contours + model wind barbs).
+    upper_air_layer: Option<upper_air::UpperAirLayer>,
+    upper_air_rx: Option<mpsc::Receiver<UpperAirResult>>,
     /// Primary radar layer opacity (draw-time tint; no re-render).
     radar_opacity: f32,
     /// Background model ingest (rw-ingest library) in flight.
@@ -1341,13 +1345,24 @@ struct ArchiveLoadProgress {
 }
 
 impl ArchiveLoadProgress {
-    fn listing(site_id: &str, date: chrono::NaiveDate) -> Self {
+    fn indeterminate(label: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
-            label: "Archive listing".to_owned(),
-            detail: format!("Listing {site_id} {date}"),
+            label: label.into(),
+            detail: detail.into(),
             done: 0,
             total: 0,
         }
+    }
+
+    fn listing(site_id: &str, date: chrono::NaiveDate) -> Self {
+        Self::indeterminate("Archive listing", format!("Listing {site_id} {date}"))
+    }
+
+    fn latest_loop_start(site_id: &str) -> Self {
+        Self::indeterminate(
+            format!("L2 {site_id} loop"),
+            format!("Starting live loop load for {site_id}"),
+        )
     }
 
     fn status_text(&self) -> String {
@@ -1394,6 +1409,18 @@ impl BackgroundActivity {
             label: label.into(),
             fraction,
         }
+    }
+}
+
+fn archive_load_progress_row(ui: &mut egui::Ui, progress: &ArchiveLoadProgress) {
+    let status = progress.status_text();
+    if progress.total == 0 {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.weak(status);
+        });
+    } else {
+        ui.add(egui::ProgressBar::new(progress.fraction()).text(status));
     }
 }
 
@@ -1670,15 +1697,18 @@ fn load_archive_history_objects_parallel(
     archive_lookup_ms: Option<f32>,
     total_start: Instant,
     sender: &mpsc::Sender<AsyncLoadResult>,
+    progress_done_start: usize,
+    progress_total: usize,
 ) -> (Vec<DecodedLoad>, Option<String>) {
     let parallelism = history_archive_load_parallelism();
     let total_objects = objects.len();
+    let progress_total = progress_total.max(total_objects);
     let progress_label = format!("L2 {site_id} loop");
     let priority_count = total_objects.min(parallelism.min(3));
     let mut decoded_frames = Vec::new();
     let mut first_error = None;
     let mut offset = 0;
-    let mut completed = 0;
+    let mut completed = progress_done_start.min(progress_total);
 
     while offset < objects.len() {
         let chunk_size = if offset == 0 && priority_count > 0 {
@@ -1746,7 +1776,7 @@ fn load_archive_history_objects_parallel(
                 &progress_label,
                 "Decoded recent archive frame",
                 completed,
-                total_objects,
+                progress_total,
             );
         }
         offset = end;
@@ -1774,6 +1804,16 @@ fn spawn_latest_level2_load_worker(
         let final_update = (|| -> Result<AsyncLoadUpdate, String> {
             let history_limit = history_limit.max(1);
             let explicit_loop_load = mode == LatestLoadMode::Loop;
+            let loop_progress_label = format!("L2 {site_id} loop");
+            if explicit_loop_load {
+                send_archive_progress(
+                    &sender,
+                    &loop_progress_label,
+                    "Checking current realtime scan",
+                    0,
+                    0,
+                );
+            }
             let mut decoded_frames = Vec::new();
             let mut selected_identity = if explicit_loop_load {
                 current_frame_identity.filter(|identity| identity.site_id == site_id)
@@ -1905,6 +1945,15 @@ fn spawn_latest_level2_load_worker(
                 let archive_limit = if explicit_loop_load { history_limit } else { 1 };
                 let archive_lookup_start = Instant::now();
                 let mut archive_lookup_ms = None;
+                if explicit_loop_load {
+                    send_archive_progress(
+                        &sender,
+                        &loop_progress_label,
+                        "Listing recent archive scans",
+                        0,
+                        0,
+                    );
+                }
                 let recent_archive_objects =
                     match data_source::recent_level2_objects(&site.level2_id, 7, archive_limit) {
                         Ok(objects) => {
@@ -1914,9 +1963,29 @@ fn spawn_latest_level2_load_worker(
                         }
                         Err(err) => {
                             fallback_error.get_or_insert_with(|| err.to_string());
+                            if explicit_loop_load {
+                                send_archive_progress(
+                                    &sender,
+                                    &loop_progress_label,
+                                    "Archive scan listing failed",
+                                    0,
+                                    0,
+                                );
+                            }
                             Vec::new()
                         }
                     };
+                let recent_archive_total = recent_archive_objects.len();
+                let mut archive_progress_done = 0usize;
+                if explicit_loop_load && recent_archive_total > 0 {
+                    send_archive_progress(
+                        &sender,
+                        &loop_progress_label,
+                        "Queued recent archive scans",
+                        0,
+                        recent_archive_total,
+                    );
+                }
 
                 let mut remaining_archive_objects = Vec::new();
                 for (index, object) in recent_archive_objects.into_iter().enumerate() {
@@ -1925,7 +1994,7 @@ fn spawn_latest_level2_load_worker(
                     }
                     if selected_identity.is_none() {
                         let select_archive_frame = true;
-                        match decode_archive_history_object(
+                        let progress_detail = match decode_archive_history_object(
                             &site_id,
                             object,
                             &site_cache_dir,
@@ -1950,11 +2019,23 @@ fn spawn_latest_level2_load_worker(
                                     ),
                                 });
                                 decoded_frames.push(decoded);
+                                "Decoded recent archive frame"
                             }
-                            Ok(None) => {}
+                            Ok(None) => "Skipped cached archive frame",
                             Err(err) => {
                                 fallback_error.get_or_insert(err);
+                                "Archive frame failed"
                             }
+                        };
+                        if explicit_loop_load {
+                            archive_progress_done += 1;
+                            send_archive_progress(
+                                &sender,
+                                &loop_progress_label,
+                                progress_detail,
+                                archive_progress_done,
+                                recent_archive_total,
+                            );
                         }
                     } else if explicit_loop_load {
                         remaining_archive_objects.push((index, object));
@@ -1970,6 +2051,8 @@ fn spawn_latest_level2_load_worker(
                         archive_lookup_ms,
                         total_start,
                         &sender,
+                        archive_progress_done,
+                        recent_archive_total,
                     );
                     fallback_error = fallback_error.or(history_error);
                     for decoded in history_frames {
@@ -2077,6 +2160,7 @@ type OaResult = std::result::Result<(Arc<rw_ui::FieldData>, Arc<rw_ui::FieldData
 /// Background derive/composite build: (field, status line) or error.
 type OaDeriveResult = std::result::Result<(Arc<rw_ui::FieldData>, String), String>;
 type OaCompositesResult = std::result::Result<Vec<oa_derived::CompositeField>, String>;
+type UpperAirResult = std::result::Result<upper_air::UpperAirLayer, String>;
 /// URL-poll download: (file name, decoded volume) or error.
 type PolledVolumeResult = std::result::Result<(String, Arc<RadarVolume>), String>;
 /// International site-catalog fetch: (provider id it answers for, sites or
@@ -3891,6 +3975,8 @@ impl ViewerApp {
             model_layers: Vec::new(),
             model_layer_build_rx: None,
             model_layer_generation: 0,
+            upper_air_layer: None,
+            upper_air_rx: None,
             radar_opacity: initial_radar_opacity,
             model_ingest_rx: None,
             model_ingest_progress_rx: None,
@@ -5395,6 +5481,22 @@ impl ViewerApp {
             return;
         }
 
+        let frame_delta = ctx.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::PageDown) {
+                1
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
+                -1
+            } else {
+                0
+            }
+        });
+        if frame_delta != 0 {
+            if self.step_history_frame(frame_delta, ctx) {
+                ctx.request_repaint();
+            }
+            return;
+        }
+
         let product_delta = ctx.input_mut(|input| {
             if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
                 1
@@ -5533,6 +5635,22 @@ impl ViewerApp {
             return false;
         }
         self.extra_panes[slot].cut = Some(next_cut);
+        true
+    }
+
+    fn step_history_frame(&mut self, delta: isize, ctx: &egui::Context) -> bool {
+        let frame_count = self.frame_history.len();
+        if frame_count <= 1 {
+            return false;
+        }
+        let next_index =
+            (self.selected_frame_index as isize + delta).rem_euclid(frame_count as isize) as usize;
+        if next_index == self.selected_frame_index {
+            return false;
+        }
+        self.history_playing = false;
+        self.select_history_frame(next_index, false, ctx);
+        self.browsing_history = next_index + 1 < self.frame_history.len();
         true
     }
 
@@ -7311,15 +7429,7 @@ impl ViewerApp {
             self.persist_archive_controls();
         }
         if let Some(progress) = &self.archive_load_progress {
-            let status = progress.status_text();
-            if progress.total == 0 {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.weak(status);
-                });
-            } else {
-                ui.add(egui::ProgressBar::new(progress.fraction()).text(status));
-            }
+            archive_load_progress_row(ui, progress);
         }
         if let Some(volumes) = &self.archive_volumes {
             if volumes.is_empty() {
@@ -8337,6 +8447,11 @@ impl ViewerApp {
         if paused_poll {
             self.status.push_str(" — URL poll paused");
         }
+        if mode == LatestLoadMode::Loop {
+            let progress = ArchiveLoadProgress::latest_loop_start(&site_id);
+            self.status = progress.status_text();
+            self.archive_load_progress = Some(progress);
+        }
         let current_source_path = (mode == LatestLoadMode::AutoRefresh)
             .then(|| self.source_path.clone())
             .flatten();
@@ -8435,6 +8550,7 @@ impl eframe::App for ViewerApp {
             self.glm = None; // Drop cancels the follow thread.
         }
         self.poll_mesoanalysis(&ctx);
+        self.poll_upper_air(&ctx);
         // FARM index probe runs even with the window closed — the LIVE
         // chip must appear the moment a mobile radar starts plotting.
         self.farm.pump_index(&ctx);
@@ -9855,6 +9971,28 @@ impl ViewerApp {
                 self.save_styles();
             }
 
+            let mut family_fill_alpha = existing.fill_alpha.unwrap_or_else(|| {
+                resolved
+                    .fill_alpha
+                    .unwrap_or(self.style_registry.hazard_global().fill_alpha)
+            }) as f32;
+            let fill_alpha_response =
+                ui.add(egui::Slider::new(&mut family_fill_alpha, 0.0..=100.0).text("Fill alpha"));
+            if fill_alpha_response.changed() {
+                self.style_settings
+                    .hazards
+                    .entry(selected_key.clone())
+                    .or_default()
+                    .fill_alpha = Some(family_fill_alpha.round() as u8);
+                self.rebuild_style_registry();
+                ctx.request_repaint();
+            }
+            if fill_alpha_response.drag_stopped()
+                || (fill_alpha_response.changed() && !fill_alpha_response.dragged())
+            {
+                self.save_styles();
+            }
+
             let current_dash = existing.dash.unwrap_or(resolved.dash);
             let mut dash = current_dash;
             egui::ComboBox::from_id_salt("appearance_hazard_polygon_dash")
@@ -9974,22 +10112,23 @@ impl ViewerApp {
 
     /// Small uppercase section header — visual rhythm for the Radar tab.
     fn section_header(ui: &mut egui::Ui, label: &str) {
-        ui.add_space(SECTION_SPACING);
+        ui.add_space(SECTION_SPACING + 2.0);
         Self::section_rule(ui);
         ui.label(
             egui::RichText::new(label)
-                .small()
+                .size(13.5)
                 .strong()
-                .color(SUBHEAD_COLOR),
+                .color(egui::Color32::from_rgb(230, 236, 244)),
         );
+        ui.add_space(1.0);
     }
 
     fn section_rule(ui: &mut egui::Ui) {
         let width = ui.available_width().max(1.0);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 2.0), egui::Sense::hover());
         ui.painter().line_segment(
             [rect.left_center(), rect.right_center()],
-            egui::Stroke::new(1.0, SECTION_SEPARATOR_COLOR),
+            egui::Stroke::new(1.35, SECTION_SEPARATOR_COLOR),
         );
     }
 
@@ -10227,6 +10366,7 @@ impl ViewerApp {
 
     /// Hotkey reference (Settings ▸ Hotkeys).
     fn hotkeys_section(&mut self, ui: &mut egui::Ui) {
+        ui.weak("PgUp/PgDn frames - Space play");
         ui.weak("←/→ product · ↑/↓ tilt (focused pane)");
         let mut bindings: Vec<(&String, &String)> =
             self.app_settings.product_hotkeys.iter().collect();
@@ -10802,6 +10942,9 @@ impl ViewerApp {
             }
         });
         // One-line status — always rendered, hover carries the details.
+        if let Some(progress) = &self.archive_load_progress {
+            archive_load_progress_row(ui, progress);
+        }
         if let Some(volume) = &self.volume {
             let site = volume.site.id.clone();
             let time_zone = self.time_zone();
@@ -11912,10 +12055,26 @@ impl ViewerApp {
             ui.label(format!("My tables ({})", self.user_color_tables.len()));
             if ui
                 .small_button("Show folder")
-                .on_hover_text(settings::color_tables_dir().display().to_string())
+                .on_hover_text(settings::color_tables_dir_path().display().to_string())
                 .clicked()
             {
-                table_editor::show_in_file_browser(&settings::color_tables_dir());
+                match settings::ensure_color_tables_dir() {
+                    Ok(directory) => match table_editor::show_in_file_browser(&directory) {
+                        Ok(()) => {
+                            self.color_table_status =
+                                format!("Opened My tables folder: {}", directory.display());
+                        }
+                        Err(error) => {
+                            self.color_table_status = error;
+                        }
+                    },
+                    Err(error) => {
+                        self.color_table_status = format!(
+                            "My tables folder unavailable at {}: {error}",
+                            settings::color_tables_dir_path().display()
+                        );
+                    }
+                }
             }
         });
         if !self.user_color_tables.is_empty() {
@@ -12044,7 +12203,17 @@ impl ViewerApp {
             }
         };
         let mut import_note = String::new();
-        let user_dir = settings::color_tables_dir();
+        let user_dir = match settings::ensure_color_tables_dir() {
+            Ok(user_dir) => user_dir,
+            Err(err) => {
+                self.color_table_status = format!(
+                    "Color table loaded for this session, but My tables folder is unavailable at {}: {err}",
+                    settings::color_tables_dir_path().display()
+                );
+                self.apply_family_table(ctx, self.color_table_target, table);
+                return;
+            }
+        };
         let file_name = path
             .file_name()
             .map(|f| f.to_os_string())
@@ -12056,7 +12225,12 @@ impl ViewerApp {
                     self.user_color_tables = scan_user_color_tables(&user_dir);
                     import_note = " — copied to My tables".to_owned();
                 }
-                Err(err) => import_note = format!(" — copy to My tables failed: {err}"),
+                Err(err) => {
+                    import_note = format!(
+                        " — copy to My tables failed for {}: {err}",
+                        destination.display()
+                    );
+                }
             }
         }
         self.apply_family_table(ctx, self.color_table_target, table);
@@ -12128,6 +12302,16 @@ impl ViewerApp {
                 .on_hover_text(
                     "Draw warning polygons on the map (also the Custom-tab Warnings row)",
                 );
+            let mut show_labels = self.app_settings.show_hazard_labels;
+            if ui
+                .checkbox(&mut show_labels, "Labels")
+                .on_hover_text("Draw compact warning labels such as SVR 0653 on the map")
+                .changed()
+            {
+                self.app_settings.show_hazard_labels = show_labels;
+                let _ = self.app_settings.save();
+                ui.ctx().request_repaint();
+            }
             ui.checkbox(&mut self.hazards_active_only, "Active only")
                 .on_hover_text("Hide expired/cancelled alerts");
             ui.checkbox(&mut self.live_hazard_auto_refresh, "Auto-refresh")
@@ -13811,6 +13995,7 @@ impl ViewerApp {
         self.draw_sat_layer(painter, rect);
         self.draw_spc_outlooks(painter, rect);
         self.draw_model_layers(painter, rect);
+        self.draw_upper_air_layer(painter, rect);
         self.wofs.draw_drape(painter, rect, &|lon, lat| {
             self.lon_lat_to_screen(rect, lon, lat)
         });
@@ -13827,12 +14012,13 @@ impl ViewerApp {
         let underlay_ms = basemap_start.elapsed().as_secs_f32() * 1000.0;
         self.request_radar_layer_renders(ui.ctx(), rect);
         self.request_texture_render(ui.ctx(), rect);
+        self.draw_hazard_fills(painter, rect);
         self.draw_radar_overlay_layers(ui.ctx(), painter, rect);
         self.draw_radar_layer(ui.ctx(), painter, rect);
         let overlay_start = Instant::now();
         self.draw_basemap_overlay(painter, rect);
         self.draw_tor_tracks(painter, rect);
-        self.draw_hazard_overlays(painter, rect, &self.selected_product.clone());
+        self.draw_hazard_overlays(painter, rect);
         self.draw_rotation_markers(painter, rect);
         self.draw_storm_tracks(painter, rect);
         // Tornado track lines under the report dots (the dots mark the
@@ -14421,17 +14607,17 @@ impl ViewerApp {
             if cell_index == 0 {
                 self.request_radar_layer_renders(&ctx, cell);
                 self.request_texture_render(&ctx, cell);
+                self.draw_hazard_fills(&cell_painter, cell);
                 self.draw_radar_overlay_layers(&ctx, &cell_painter, cell);
                 self.draw_radar_layer(&ctx, &cell_painter, cell);
             } else {
                 self.request_pane_render(&ctx, cell, cell_index);
+                self.draw_hazard_fills(&cell_painter, cell);
                 self.draw_extra_pane_layer(&ctx, &cell_painter, cell, cell_index);
             }
             self.draw_basemap_overlay(&cell_painter, cell);
-            // Hazard fills honor THIS pane's product (velocity panes suppress
-            // fills so couplets stay readable).
             self.draw_tor_tracks(&cell_painter, cell);
-            self.draw_hazard_overlays(&cell_painter, cell, &pane_product);
+            self.draw_hazard_overlays(&cell_painter, cell);
             self.draw_rotation_markers(&cell_painter, cell);
             self.draw_storm_tracks(&cell_painter, cell);
             self.draw_placefiles(&cell_painter, cell);
@@ -14542,7 +14728,7 @@ impl ViewerApp {
             .get(cut)
             .map(|c| format!(" {:.1}°", c.elevation_deg))
             .unwrap_or_default();
-        let (_, bg, mode) = self.mode_chip_state().unwrap_or((
+        let (_, accent, mode) = self.mode_chip_state().unwrap_or((
             "ARCHIVE".to_owned(),
             egui::Color32::from_rgb(132, 96, 24),
             "ARCH",
@@ -14553,21 +14739,30 @@ impl ViewerApp {
             format!("{site_id} {}{tilt}", product.label()),
             format!("{}{tilt}", product.label()),
         ];
-        let max_width = (cell.width() - 20.0).max(48.0);
+        let max_width = (cell.width() - 18.0).max(48.0);
         let label = candidates
             .iter()
             .find(|candidate| chip_width_for_text(candidate) <= max_width)
             .unwrap_or(&candidates[candidates.len() - 1]);
-        let pos = egui::pos2(cell.left() + 10.0, cell.top() + 10.0);
-        let width = chip_width_for_text(label).min(max_width);
-        let chip = egui::Rect::from_min_size(pos, egui::vec2(width, 20.0));
-        painter.rect_filled(chip, 4.0, bg);
+        let pos = egui::pos2(cell.left() + 6.0, cell.top() + 6.0);
+        let width = (chip_width_for_text(label) + 8.0).min(max_width);
+        let chip = egui::Rect::from_min_size(pos, egui::vec2(width, 22.0));
+        painter.rect_filled(
+            chip,
+            2.0,
+            egui::Color32::from_rgba_unmultiplied(6, 8, 11, 218),
+        );
+        painter.rect_filled(
+            egui::Rect::from_min_max(chip.min, egui::pos2(chip.min.x + 4.0, chip.max.y)),
+            2.0,
+            accent,
+        );
         painter.text(
-            chip.center(),
-            egui::Align2::CENTER_CENTER,
+            egui::pos2(chip.left() + 9.0, chip.center().y),
+            egui::Align2::LEFT_CENTER,
             label,
-            egui::FontId::monospace(12.0),
-            egui::Color32::from_rgb(235, 240, 246),
+            egui::FontId::monospace(11.0),
+            egui::Color32::from_rgb(232, 238, 246),
         );
         if pane_index == 0 {
             return;
@@ -15906,6 +16101,55 @@ impl ViewerApp {
                             events.push(rw_ui::DownloadEvent::SpecChanged(spec));
                         }
                     });
+                    let selected_hour = self
+                        .model_dock
+                        .as_ref()
+                        .and_then(|dock| dock.selected_hour())
+                        .cloned();
+                    let mut requested_upper_air: Option<u16> = None;
+                    let mut clear_upper_air = false;
+                    ui.horizontal(|ui| {
+                        ui.weak("SPC UA:");
+                        let busy = self.upper_air_rx.is_some();
+                        for level in upper_air::QUICKLOOK_LEVELS_HPA {
+                            if ui
+                                .add_enabled(
+                                    selected_hour.is_some() && !busy,
+                                    egui::Button::new(format!("{level} mb")).small(),
+                                )
+                                .on_hover_text(
+                                    "Draw 20 m height contours, 2 C temperature contours, and model wind barbs for the selected run/hour",
+                                )
+                                .clicked()
+                            {
+                                requested_upper_air = Some(level);
+                            }
+                        }
+                        if busy {
+                            ui.spinner();
+                        }
+                        if let Some(layer) = &mut self.upper_air_layer {
+                            ui.checkbox(&mut layer.visible, "show");
+                            ui.add(
+                                egui::Slider::new(&mut layer.opacity, 0.25..=1.0)
+                                    .show_value(false),
+                            );
+                            ui.weak(layer.short_label());
+                            if ui.small_button("Clear").clicked() {
+                                clear_upper_air = true;
+                            }
+                        } else if selected_hour.is_none() {
+                            ui.weak("select a model hour");
+                        }
+                    });
+                    if clear_upper_air {
+                        self.upper_air_layer = None;
+                    }
+                    if let Some(level) = requested_upper_air
+                        && let Some(hour) = selected_hour
+                    {
+                        self.start_upper_air_quicklook(hour, level, &ctx);
+                    }
                     ui.separator();
                     egui::ScrollArea::vertical()
                         .id_salt("model_window_download_scroll")
@@ -17447,6 +17691,54 @@ impl ViewerApp {
         }
     }
 
+    fn start_upper_air_quicklook(
+        &mut self,
+        hour: rw_ui::HourKey,
+        level_hpa: u16,
+        ctx: &egui::Context,
+    ) {
+        if self.upper_air_rx.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.upper_air_rx = Some(receiver);
+        self.status = format!(
+            "Upper-air quicklook: building {} {} F{:03} {} mb...",
+            hour.model.to_uppercase(),
+            hour.run,
+            hour.hour,
+            level_hpa
+        );
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            rw_ingest::throttle::set_current_thread_background_priority();
+            let result = upper_air::build_layer(settings::model_store_dir(), hour, level_hpa);
+            let _ = sender.send(result);
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn poll_upper_air(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.upper_air_rx else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(layer)) => {
+                self.upper_air_rx = None;
+                self.status = layer.summary.clone();
+                self.upper_air_layer = Some(layer);
+                ctx.request_repaint();
+            }
+            Ok(Err(message)) => {
+                self.upper_air_rx = None;
+                self.status = format!("Upper-air quicklook failed: {message}");
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.upper_air_rx = None,
+        }
+    }
+
     /// Surface-obs refresh: fetch the METAR cache on enable and every
     /// 5 minutes after (background thread; one in flight).
     fn poll_surface_obs(&mut self, ctx: &egui::Context) {
@@ -18039,6 +18331,99 @@ impl ViewerApp {
                     egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                     egui::Color32::from_white_alpha(opacity),
                 );
+            }
+        }
+    }
+
+    fn draw_upper_air_layer(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let Some(layer) = &self.upper_air_layer else {
+            return;
+        };
+        if !layer.visible {
+            return;
+        }
+        let alpha = (layer.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let height_color = egui::Color32::from_rgba_unmultiplied(18, 20, 24, alpha);
+        let temp_color = egui::Color32::from_rgba_unmultiplied(230, 40, 34, alpha);
+        let halo_color = egui::Color32::from_rgba_unmultiplied(
+            245,
+            248,
+            250,
+            ((alpha as f32) * 0.52).round() as u8,
+        );
+        let to_screen = |point: upper_air::ContourPoint| -> Option<egui::Pos2> {
+            let (lon, lat) = upper_air::grid_lon_lat(&layer.grid, point.x, point.y)?;
+            Some(self.lon_lat_to_screen(rect, lon, lat))
+        };
+        let draw_segments = |segments: &[upper_air::ContourSegment],
+                             color: egui::Color32,
+                             label_major_only: bool| {
+            for segment in segments {
+                let (Some(a), Some(b)) = (to_screen(segment.a), to_screen(segment.b)) else {
+                    continue;
+                };
+                let width = if segment.major { 1.65 } else { 0.95 };
+                painter.line_segment([a, b], egui::Stroke::new(width + 1.8, halo_color));
+                painter.line_segment([a, b], egui::Stroke::new(width, color));
+            }
+            let label_stride = (segments.len() / 48).clamp(60, 240);
+            for (index, segment) in segments.iter().enumerate() {
+                if index % label_stride != 0 || (label_major_only && !segment.major) {
+                    continue;
+                }
+                let mid = upper_air::ContourPoint {
+                    x: (segment.a.x + segment.b.x) * 0.5,
+                    y: (segment.a.y + segment.b.y) * 0.5,
+                };
+                let Some(pos) = to_screen(mid) else {
+                    continue;
+                };
+                if !rect.expand(10.0).contains(pos) {
+                    continue;
+                }
+                painter.text(
+                    pos,
+                    egui::Align2::CENTER_CENTER,
+                    format!("{:.0}", segment.level),
+                    egui::FontId::monospace(10.0),
+                    color,
+                );
+            }
+        };
+        draw_segments(&layer.height_contours, height_color, true);
+        draw_segments(&layer.temp_contours, temp_color, false);
+
+        let mut barb_style = self.style_registry.obs().clone();
+        barb_style.barb_color[3] = ((barb_style.barb_color[3] as f32) * layer.opacity)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        let expanded = rect.expand(34.0);
+        for y in (0..layer.ny).step_by(layer.wind_step) {
+            for x in (0..layer.nx).step_by(layer.wind_step) {
+                let index = y * layer.nx + x;
+                let (Some(&u), Some(&v)) = (layer.u_ms.get(index), layer.v_ms.get(index)) else {
+                    continue;
+                };
+                if !(u.is_finite() && v.is_finite()) {
+                    continue;
+                }
+                let speed_kt = u.hypot(v) / KNOT_TO_MPS;
+                if speed_kt < 2.5 {
+                    continue;
+                }
+                let Some((lon, lat)) = upper_air::grid_lon_lat(&layer.grid, x as f32, y as f32)
+                else {
+                    continue;
+                };
+                let pos = self.lon_lat_to_screen(rect, lon, lat);
+                if !expanded.contains(pos) {
+                    continue;
+                }
+                let mut dir_deg = (-u).atan2(-v).to_degrees();
+                if dir_deg < 0.0 {
+                    dir_deg += 360.0;
+                }
+                draw_station_barb(painter, pos, dir_deg, speed_kt, &barb_style);
             }
         }
     }
@@ -19347,12 +19732,13 @@ impl ViewerApp {
                 }
             }
             if self.map_scale >= 120.0 {
+                let (velocity_scale, velocity_unit) = vrot_display_scale_unit(self.units());
                 draw_halo_text(
                     painter,
                     position + egui::vec2(0.0, -14.0),
                     egui::Align2::CENTER_BOTTOM,
                     &format!(
-                        "{}R{} {:.0} m/s",
+                        "{}R{} {:.0} {velocity_unit}",
                         if marker.strength == render2d::RotationStrength::Mesocyclone
                             && marker.persistence < 2
                         {
@@ -19361,7 +19747,7 @@ impl ViewerApp {
                             ""
                         },
                         marker.rank,
-                        marker.vrot_mps
+                        marker.vrot_mps / velocity_scale
                     ),
                     egui::FontId::proportional(10.0),
                     egui::Color32::from_rgb(245, 240, 220),
@@ -19773,10 +20159,7 @@ impl ViewerApp {
             }
         }
         if let Some(probe) = readout.as_ref().and_then(|readout| readout.vrot) {
-            lines.push(format!(
-                "Vrot {:.1} m/s · ΔV {:.1} · sep {:.2} km",
-                probe.vrot_mps, probe.delta_v_mps, probe.separation_km
-            ));
+            lines.push(format_vrot_card_line(probe, self.units()));
         }
         if pinned {
             lines.push("pinned — Shift+click to release".to_owned());
@@ -20370,40 +20753,29 @@ impl ViewerApp {
         anchored_radar_texture_rect(rect, ctx.pixels_per_point(), texture_key.viewport, current)
     }
 
-    fn draw_hazard_overlays(
-        &self,
-        painter: &egui::Painter,
-        rect: egui::Rect,
-        fill_product: &DisplayProduct,
-    ) {
+    fn draw_hazard_fills(&self, painter: &egui::Painter, rect: egui::Rect) {
         if !self.hazards_visible {
             return;
         }
-        let Some(overlay) = &self.hazard_overlay else {
+        if self.hazard_overlay.is_none() {
             return;
-        };
-        // Polygon projection + ear-clip tessellation is cached per view key:
-        // idle repaints reuse it; pan/zoom/selection/content changes rebuild.
-        // The generation counter invalidates exactly on overlay replacement.
-        use std::hash::{Hash, Hasher};
-        let _ = overlay;
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.view_shape_key(2, rect).hash(&mut hasher);
-        self.hazard_overlay_generation.hash(&mut hasher);
-        self.selected_hazard_index.hash(&mut hasher);
-        // Style edits must repaint: the registry signature covers every
-        // styled property (it subsumes the old hazard_fill_alpha hash).
-        self.style_registry.signature().hash(&mut hasher);
-        fill_product.label().hash(&mut hasher);
-        self.hazards_active_only.hash(&mut hasher);
-        for family in &self.hidden_hazard_families {
-            family.hash(&mut hasher);
         }
-        let key = hasher.finish();
-        let mut cache = self.hazard_shape_cache.borrow_mut();
-        let built =
-            cache.get_or_insert_with(key, || self.build_hazard_overlay_shapes(rect, fill_product));
-        painter.extend(built.shapes.iter().cloned());
+        let built = self.cached_hazard_overlay_shapes(rect);
+        painter.extend(built.fill_shapes.iter().cloned());
+    }
+
+    fn draw_hazard_overlays(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if !self.hazards_visible {
+            return;
+        }
+        if self.hazard_overlay.is_none() {
+            return;
+        }
+        let built = self.cached_hazard_overlay_shapes(rect);
+        painter.extend(built.outline_shapes.iter().cloned());
+        if !self.app_settings.show_hazard_labels {
+            return;
+        }
         let global = self.style_registry.hazard_global();
         let halo = style_color32(self.style_registry.labels().warning_halo_color);
         for (center, label, selected) in &built.labels {
@@ -20423,13 +20795,33 @@ impl ViewerApp {
         }
     }
 
-    fn build_hazard_overlay_shapes(
-        &self,
-        rect: egui::Rect,
-        fill_product: &DisplayProduct,
-    ) -> HazardOverlayShapes {
+    fn cached_hazard_overlay_shapes(&self, rect: egui::Rect) -> HazardOverlayShapes {
+        // Polygon projection + ear-clip tessellation is cached per view key:
+        // idle repaints reuse it; pan/zoom/selection/content changes rebuild.
+        // The generation counter invalidates exactly on overlay replacement.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.view_shape_key(2, rect).hash(&mut hasher);
+        self.hazard_overlay_generation.hash(&mut hasher);
+        self.selected_hazard_index.hash(&mut hasher);
+        // Style edits must repaint: the registry signature covers every
+        // styled property (it subsumes the old hazard_fill_alpha hash).
+        self.style_registry.signature().hash(&mut hasher);
+        self.hazards_active_only.hash(&mut hasher);
+        for family in &self.hidden_hazard_families {
+            family.hash(&mut hasher);
+        }
+        let key = hasher.finish();
+        let mut cache = self.hazard_shape_cache.borrow_mut();
+        cache
+            .get_or_insert_with(key, || self.build_hazard_overlay_shapes(rect))
+            .clone()
+    }
+
+    fn build_hazard_overlay_shapes(&self, rect: egui::Rect) -> HazardOverlayShapes {
         let mut out = HazardOverlayShapes {
-            shapes: Vec::new(),
+            fill_shapes: Vec::new(),
+            outline_shapes: Vec::new(),
             labels: Vec::new(),
         };
         let Some(overlay) = &self.hazard_overlay else {
@@ -20458,7 +20850,7 @@ impl ViewerApp {
             let global = self.style_registry.hazard_global();
             let color = style_color32(style.stroke_color);
             let base_alpha = style.fill_alpha.unwrap_or(global.fill_alpha);
-            let fill_alpha = hazard_fill_alpha_for_product(base_alpha, selected, fill_product);
+            let fill_alpha = hazard_fill_alpha(base_alpha, selected);
             let fill_rgb = style.fill_color;
             let fill = egui::Color32::from_rgba_unmultiplied(
                 fill_rgb[0],
@@ -20486,29 +20878,40 @@ impl ViewerApp {
                 ),
             );
             let solid = matches!(style.dash, styles::DashPattern::Solid);
-            if solid && is_convex_screen_polygon(&points) {
-                out.shapes
-                    .push(egui::Shape::convex_polygon(points.clone(), fill, stroke));
+            let convex = is_convex_screen_polygon(&points);
+            if convex {
+                out.fill_shapes.push(egui::Shape::convex_polygon(
+                    points.clone(),
+                    fill,
+                    egui::Stroke::NONE,
+                ));
+            } else if let Some(mesh) = filled_polygon_mesh(&points, fill) {
+                out.fill_shapes.push(egui::Shape::mesh(mesh));
+            }
+            if solid {
+                out.outline_shapes
+                    .push(egui::Shape::closed_line(points.clone(), stroke));
             } else {
-                if is_convex_screen_polygon(&points) {
-                    out.shapes.push(egui::Shape::convex_polygon(
-                        points.clone(),
-                        fill,
-                        egui::Stroke::NONE,
-                    ));
-                } else if let Some(mesh) = filled_polygon_mesh(&points, fill) {
-                    out.shapes.push(egui::Shape::mesh(mesh));
-                }
                 match style.dash {
-                    styles::DashPattern::Solid => out
-                        .shapes
-                        .push(egui::Shape::closed_line(points.clone(), stroke)),
+                    styles::DashPattern::Solid => unreachable!("solid handled above"),
                     styles::DashPattern::Dashed { dash, gap } => {
-                        push_dashed_closed_line(&mut out.shapes, &points, stroke, dash, gap);
+                        push_dashed_closed_line(
+                            &mut out.outline_shapes,
+                            &points,
+                            stroke,
+                            dash,
+                            gap,
+                        );
                     }
                     styles::DashPattern::Dotted => {
                         let dot = stroke.width.max(1.0);
-                        push_dashed_closed_line(&mut out.shapes, &points, stroke, dot, dot * 2.0);
+                        push_dashed_closed_line(
+                            &mut out.outline_shapes,
+                            &points,
+                            stroke,
+                            dot,
+                            dot * 2.0,
+                        );
                     }
                 }
             }
@@ -23016,10 +23419,12 @@ struct PlacefileDrawList {
     hovers: Vec<(egui::Pos2, String)>,
 }
 
-/// Cached hazard-overlay geometry: the (possibly ear-clipped) polygon shapes
-/// plus label anchors (centroid, text, selected) drawn live each frame.
+/// Cached hazard-overlay geometry: fill shapes draw below radar, outlines
+/// and label anchors draw above it.
+#[derive(Clone)]
 struct HazardOverlayShapes {
-    shapes: Vec<egui::Shape>,
+    fill_shapes: Vec<egui::Shape>,
+    outline_shapes: Vec<egui::Shape>,
     labels: Vec<(egui::Pos2, String, bool)>,
 }
 
@@ -24630,6 +25035,23 @@ fn family_threshold_is_symmetric(family: ColorTableFamily) -> bool {
     )
 }
 
+fn vrot_display_scale_unit(unit_system: units::Units) -> (f32, &'static str) {
+    match unit_system {
+        units::Units::Imperial => (KNOT_TO_MPS, "kt"),
+        units::Units::Metric => (1.0, "m/s"),
+    }
+}
+
+fn format_vrot_card_line(probe: VrotProbe, unit_system: units::Units) -> String {
+    let (velocity_scale, velocity_unit) = vrot_display_scale_unit(unit_system);
+    format!(
+        "Vrot {:.1} {velocity_unit} - dV {:.1} {velocity_unit} - sep {:.2} km",
+        probe.vrot_mps / velocity_scale,
+        probe.delta_v_mps / velocity_scale,
+        probe.separation_km
+    )
+}
+
 fn format_cursor_readout(
     readout: &CursorReadout,
     unit_system: units::Units,
@@ -24641,8 +25063,7 @@ fn format_cursor_readout(
         .map(|raw| raw.to_string())
         .unwrap_or_else(|| "-".to_owned());
     // Main value in the active table's declared unit space (see
-    // `table_display_unit`); the SI diagnostics (raw VEL, Vrot, Nyq)
-    // deliberately stay m/s.
+    // `table_display_unit`); raw VEL/Nyq diagnostics deliberately stay SI.
     let (units, unit_scale) = display_unit;
     let value = if units.is_empty() {
         format!("{:.1}", readout.value)
@@ -24656,19 +25077,20 @@ fn format_cursor_readout(
     let vrot = readout
         .vrot
         .map(|probe| {
+            let (velocity_scale, velocity_unit) = vrot_display_scale_unit(unit_system);
             format!(
-                " Vrot {:.1} m/s dV {:.1} sep {:.2} km in r{}/g{} {:05.1} {:.1} out r{}/g{} {:05.1} {:.1}",
-                probe.vrot_mps,
-                probe.delta_v_mps,
+                " Vrot {:.1} {velocity_unit} dV {:.1} {velocity_unit} sep {:.2} km in r{}/g{} {:05.1} {:.1} {velocity_unit} out r{}/g{} {:05.1} {:.1} {velocity_unit}",
+                probe.vrot_mps / velocity_scale,
+                probe.delta_v_mps / velocity_scale,
                 probe.separation_km,
                 probe.inbound.row,
                 probe.inbound.gate,
                 probe.inbound.azimuth_deg,
-                probe.inbound.value_mps,
+                probe.inbound.value_mps / velocity_scale,
                 probe.outbound.row,
                 probe.outbound.gate,
                 probe.outbound.azimuth_deg,
-                probe.outbound.value_mps
+                probe.outbound.value_mps / velocity_scale
             )
         })
         .unwrap_or_default();
@@ -27226,10 +27648,8 @@ fn push_dashed_closed_line(
     ));
 }
 
-fn hazard_fill_alpha_for_product(base_alpha: u8, selected: bool, product: &DisplayProduct) -> u8 {
-    if product.base_moment() == MomentType::Velocity {
-        0
-    } else if selected {
+fn hazard_fill_alpha(base_alpha: u8, selected: bool) -> u8 {
+    if selected {
         base_alpha.saturating_add(20).min(100)
     } else {
         base_alpha
@@ -28938,31 +29358,10 @@ mod tests {
     }
 
     #[test]
-    fn velocity_products_draw_hazard_polygons_outline_only() {
-        assert_eq!(
-            hazard_fill_alpha_for_product(50, false, &DisplayProduct::Moment(MomentType::Velocity)),
-            0
-        );
-        assert_eq!(
-            hazard_fill_alpha_for_product(50, true, &DisplayProduct::StormRelativeVelocity),
-            0
-        );
-        assert_eq!(
-            hazard_fill_alpha_for_product(
-                50,
-                false,
-                &DisplayProduct::Moment(MomentType::Reflectivity)
-            ),
-            50
-        );
-        assert_eq!(
-            hazard_fill_alpha_for_product(
-                50,
-                true,
-                &DisplayProduct::Moment(MomentType::Reflectivity)
-            ),
-            70
-        );
+    fn hazard_fill_alpha_is_product_independent() {
+        assert_eq!(hazard_fill_alpha(50, false), 50);
+        assert_eq!(hazard_fill_alpha(50, true), 70);
+        assert_eq!(hazard_fill_alpha(90, true), 100);
     }
 
     /// Golden parity net for the style-registry refactor: an EMPTY style
@@ -29381,9 +29780,49 @@ mod tests {
             DisplayTimeZone::Utc,
         );
 
-        assert!(formatted.contains("Vrot 21.0 m/s dV 42.0 sep 1.25 km"));
-        assert!(formatted.contains("in r4/g100 210.5 -18.0"));
-        assert!(formatted.contains("out r6/g103 212.0 24.0"));
+        assert!(formatted.contains("Vrot 40.8 kt dV 81.6 kt sep 1.25 km"));
+        assert!(formatted.contains("in r4/g100 210.5 -35.0 kt"));
+        assert!(formatted.contains("out r6/g103 212.0 46.7 kt"));
+
+        let metric = format_cursor_readout(
+            &readout,
+            units::Units::Metric,
+            ("m/s", 1.0),
+            DisplayTimeZone::Utc,
+        );
+        assert!(metric.contains("Vrot 21.0 m/s dV 42.0 m/s sep 1.25 km"));
+        assert!(metric.contains("in r4/g100 210.5 -18.0 m/s"));
+        assert!(metric.contains("out r6/g103 212.0 24.0 m/s"));
+    }
+
+    #[test]
+    fn inspector_vrot_card_line_uses_selected_units() {
+        let probe = VrotProbe {
+            delta_v_mps: 42.0,
+            vrot_mps: 21.0,
+            separation_km: 1.25,
+            inbound: VrotGate {
+                row: 4,
+                gate: 100,
+                value_mps: -18.0,
+                azimuth_deg: 210.5,
+            },
+            outbound: VrotGate {
+                row: 6,
+                gate: 103,
+                value_mps: 24.0,
+                azimuth_deg: 212.0,
+            },
+        };
+
+        assert_eq!(
+            format_vrot_card_line(probe, units::Units::Imperial),
+            "Vrot 40.8 kt - dV 81.6 kt - sep 1.25 km"
+        );
+        assert_eq!(
+            format_vrot_card_line(probe, units::Units::Metric),
+            "Vrot 21.0 m/s - dV 42.0 m/s - sep 1.25 km"
+        );
     }
 
     #[test]
@@ -30311,6 +30750,42 @@ mod tests {
             app.browsing_history,
             "pausing on an older frame should preserve browse mode"
         );
+    }
+
+    #[test]
+    fn keyboard_frame_step_selects_history_and_updates_browse_state() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+        let mut first = test_ref_then_velocity_volume();
+        first.volume_time = scan_time;
+        let mut second = test_ref_then_velocity_volume();
+        second.volume_time = scan_time + chrono::Duration::minutes(3);
+        app.upsert_history_frame(test_decoded_from_volume(
+            PathBuf::from("TEST-0130"),
+            first,
+            FrameStatus::Complete,
+        ));
+        app.upsert_history_frame(test_decoded_from_volume(
+            PathBuf::from("TEST-0133"),
+            second,
+            FrameStatus::Complete,
+        ));
+        app.frame_history
+            .sort_by(|left, right| left.identity.cmp(&right.identity));
+        app.selected_frame_index = 0;
+        app.volume = Some(Arc::clone(&app.frame_history[0].volume));
+        app.history_playing = true;
+        app.browsing_history = true;
+        let ctx = egui::Context::default();
+
+        assert!(app.step_history_frame(1, &ctx));
+        assert_eq!(app.selected_frame_index, 1);
+        assert!(!app.history_playing);
+        assert!(!app.browsing_history);
+
+        assert!(app.step_history_frame(-1, &ctx));
+        assert_eq!(app.selected_frame_index, 0);
+        assert!(app.browsing_history);
     }
 
     #[test]
@@ -31473,9 +31948,13 @@ mod tests {
             square_hazard_points(-0.5, -0.5, 0.5, 0.5),
         )]);
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
-        let product = DisplayProduct::Moment(MomentType::Reflectivity);
-        let solid = app.build_hazard_overlay_shapes(rect, &product);
-        assert_eq!(solid.shapes.len(), 1, "solid convex = one polygon shape");
+        let solid = app.build_hazard_overlay_shapes(rect);
+        assert_eq!(solid.fill_shapes.len(), 1, "solid convex = one fill shape");
+        assert_eq!(
+            solid.outline_shapes.len(),
+            1,
+            "solid convex = one outline shape"
+        );
 
         app.style_settings.hazards.insert(
             "tornado".to_owned(),
@@ -31488,11 +31967,12 @@ mod tests {
             },
         );
         app.style_registry = styles::StyleRegistry::from_settings(&app.style_settings);
-        let dashed = app.build_hazard_overlay_shapes(rect, &product);
+        let dashed = app.build_hazard_overlay_shapes(rect);
+        assert_eq!(dashed.fill_shapes.len(), 1, "dash keeps one fill underlay");
         assert!(
-            dashed.shapes.len() > solid.shapes.len() + 1,
-            "dashed outline must emit fill + many dash segments, got {}",
-            dashed.shapes.len()
+            dashed.outline_shapes.len() > solid.outline_shapes.len() + 1,
+            "dashed outline must emit many dash segments, got {}",
+            dashed.outline_shapes.len()
         );
     }
 
@@ -32939,6 +33419,8 @@ mod tests {
             model_layers: Vec::new(),
             model_layer_build_rx: None,
             model_layer_generation: 0,
+            upper_air_layer: None,
+            upper_air_rx: None,
             radar_opacity: 1.0,
             model_ingest_rx: None,
             model_ingest_progress_rx: None,

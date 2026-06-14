@@ -20,6 +20,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -33,6 +34,9 @@ const RECORD_SETTLE_FRAMES: u8 = 2;
 const RECORD_RENDER_TIMEOUT_FRAMES: u32 = 1_200;
 /// Updates to wait for the screenshot event before aborting the recording.
 const RECORD_CAPTURE_TIMEOUT_FRAMES: u32 = 600;
+/// Free/manual recordings are meant for panning, zooming, and scrubbing the
+/// UI. 10 fps keeps files reasonable while still feeling like motion.
+const FREE_RECORD_FRAME_DELAY_MS: u32 = 100;
 /// GIF quantizer speed (1 = best/slowest, 30 = worst/fastest). The `image`
 /// crate feeds this to NeuQuant (Dekker 1994, "Kohonen neural networks for
 /// optimal colour quantization", Network: Computation in Neural Systems).
@@ -46,6 +50,7 @@ enum CaptureKind {
     FullWindow,
     MapOnly,
     RecordFrame,
+    FreeRecordFrame,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +146,19 @@ struct RecorderState {
     format: ResolvedRecordFormat,
 }
 
+enum FreeRecorderPhase {
+    Ready,
+    AwaitScreenshot { waited: u32 },
+}
+
+struct FreeRecorderState {
+    frames: usize,
+    phase: FreeRecorderPhase,
+    next_capture_at: Instant,
+    frame_tx: mpsc::Sender<EncoderMsg>,
+    format: ResolvedRecordFormat,
+}
+
 enum EncoderMsg {
     Frame(Arc<egui::ColorImage>),
     Finish,
@@ -161,6 +179,7 @@ pub(crate) struct MediaShare {
     /// Lazily detected on first record; `ffmpeg -version` on PATH.
     ffmpeg_available: Option<bool>,
     recorder: Option<RecorderState>,
+    free_recorder: Option<FreeRecorderState>,
 }
 
 impl Default for MediaShare {
@@ -174,13 +193,14 @@ impl Default for MediaShare {
             record_format: RecordFormat::Auto,
             ffmpeg_available: None,
             recorder: None,
+            free_recorder: None,
         }
     }
 }
 
 impl MediaShare {
     pub(crate) fn is_recording(&self) -> bool {
-        self.recorder.is_some()
+        self.recorder.is_some() || self.free_recorder.is_some()
     }
 }
 
@@ -192,6 +212,17 @@ impl ViewerApp {
             self.status = result.message;
         }
 
+        if ctx.input_mut(|input| {
+            input.consume_key(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::F12,
+            )
+        }) {
+            self.toggle_recording(ctx);
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::F12)) {
+            self.toggle_free_recording(ctx);
+        }
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::SHIFT, egui::Key::F12)) {
             self.request_screenshot(ctx, CaptureKind::MapOnly);
         }
@@ -225,10 +256,12 @@ impl ViewerApp {
                 CaptureKind::FullWindow => self.finish_still_capture(ctx, &image, false),
                 CaptureKind::MapOnly => self.finish_still_capture(ctx, &image, true),
                 CaptureKind::RecordFrame => self.record_frame_captured(ctx, image),
+                CaptureKind::FreeRecordFrame => self.free_record_frame_captured(ctx, image),
             }
         }
 
         self.drive_recorder(ctx);
+        self.drive_free_recorder(ctx);
     }
 
     fn request_screenshot(&self, ctx: &egui::Context, kind: CaptureKind) {
@@ -289,14 +322,25 @@ impl ViewerApp {
                     .strong(),
                 ),
             );
+        } else if let Some(recorder) = &self.media.free_recorder {
+            let show = !matches!(recorder.phase, FreeRecorderPhase::AwaitScreenshot { .. });
+            ui.add_visible(
+                show,
+                egui::Label::new(
+                    egui::RichText::new(format!("REC {}", recorder.frames))
+                        .color(egui::Color32::from_rgb(235, 64, 52))
+                        .strong(),
+                ),
+            );
         }
     }
 
     /// Record button + output options, drawn next to the playback controls.
     pub(crate) fn record_controls_ui(&mut self, ui: &mut egui::Ui) {
-        let recording = self.media.recorder.is_some();
-        let record_label = if recording { "Stop" } else { "Record" };
-        let record_enabled = recording || self.frame_history.len() > 1;
+        let loop_recording = self.media.recorder.is_some();
+        let free_recording = self.media.free_recorder.is_some();
+        let record_label = if loop_recording { "Stop" } else { "Loop" };
+        let record_enabled = !free_recording && (loop_recording || self.frame_history.len() > 1);
         if ui
             .add_enabled_ui(record_enabled, |ui| {
                 crate::fixed_action_button(ui, record_label, 62.0)
@@ -305,14 +349,29 @@ impl ViewerApp {
             .on_hover_text(
                 "Record one clean cycle of this loop to a shareable GIF/MP4 in \
                  Pictures/BowEcho (needs 2+ frames; pan/zoom during recording \
-                 is captured too)",
+                 is captured too). Hotkey: Ctrl+Shift+F12",
             )
             .clicked()
         {
             self.toggle_recording(ui.ctx());
         }
 
-        ui.add_enabled_ui(!recording, |ui| {
+        let free_label = if free_recording { "Stop" } else { "Free" };
+        if ui
+            .add_enabled_ui(!loop_recording, |ui| {
+                crate::fixed_action_button(ui, free_label, 54.0)
+            })
+            .inner
+            .on_hover_text(
+                "Start/stop a free full-window recording of your app movement. \
+                 Pan, zoom, scrub, change panes, then stop. Hotkey: Ctrl+F12",
+            )
+            .clicked()
+        {
+            self.toggle_free_recording(ui.ctx());
+        }
+
+        ui.add_enabled_ui(!loop_recording && !free_recording, |ui| {
             egui::ComboBox::from_id_salt("media_record_size")
                 .selected_text(self.media.record_size.label())
                 .width(56.0)
@@ -354,22 +413,17 @@ impl ViewerApp {
     }
 
     fn start_recording(&mut self, ctx: &egui::Context) {
+        if self.media.free_recorder.is_some() {
+            self.status = "Stop free recording before starting loop recording".to_owned();
+            return;
+        }
         let total = self.frame_history.len();
         if total < 2 {
             self.status =
                 "Recording needs at least 2 history frames (use Load Loop first)".to_owned();
             return;
         }
-        let ffmpeg = *self
-            .media
-            .ffmpeg_available
-            .get_or_insert_with(detect_ffmpeg);
-        let format = match self.media.record_format {
-            RecordFormat::Gif => ResolvedRecordFormat::Gif,
-            RecordFormat::Mp4 | RecordFormat::Auto if ffmpeg => ResolvedRecordFormat::Mp4,
-            RecordFormat::Mp4 | RecordFormat::Auto => ResolvedRecordFormat::Gif,
-        };
-        let mp4_fallback = self.media.record_format == RecordFormat::Mp4 && !ffmpeg;
+        let (format, mp4_fallback) = self.resolve_record_format();
         let path = match new_capture_path(format.extension()) {
             Ok(path) => path,
             Err(err) => {
@@ -408,6 +462,64 @@ impl ViewerApp {
             format!("Recording loop: {total} frames as {}...", format.label())
         };
         ctx.request_repaint();
+    }
+
+    fn toggle_free_recording(&mut self, ctx: &egui::Context) {
+        if self.media.free_recorder.is_some() {
+            self.finish_free_recording(ctx);
+        } else {
+            self.start_free_recording(ctx);
+        }
+    }
+
+    fn start_free_recording(&mut self, ctx: &egui::Context) {
+        if self.media.recorder.is_some() {
+            self.status = "Stop loop recording before starting free recording".to_owned();
+            return;
+        }
+        let (format, mp4_fallback) = self.resolve_record_format();
+        let path = match new_capture_path(format.extension()) {
+            Ok(path) => path,
+            Err(err) => {
+                self.status = format!("Free recording failed: {err}");
+                return;
+            }
+        };
+        let frame_tx = spawn_loop_encoder(LoopEncodeJob {
+            format,
+            max_width: self.media.record_size.max_width(),
+            frame_delay_ms: FREE_RECORD_FRAME_DELAY_MS,
+            out_path: path,
+            result_tx: self.media.result_tx.clone(),
+            repaint_ctx: ctx.clone(),
+        });
+        self.media.free_recorder = Some(FreeRecorderState {
+            frames: 0,
+            phase: FreeRecorderPhase::Ready,
+            next_capture_at: Instant::now(),
+            frame_tx,
+            format,
+        });
+        self.status = if mp4_fallback {
+            "ffmpeg not found on PATH; free recording as GIF instead...".to_owned()
+        } else {
+            format!("Free recording as {}... Ctrl+F12 to stop", format.label())
+        };
+        ctx.request_repaint();
+    }
+
+    fn resolve_record_format(&mut self) -> (ResolvedRecordFormat, bool) {
+        let ffmpeg = *self
+            .media
+            .ffmpeg_available
+            .get_or_insert_with(detect_ffmpeg);
+        let format = match self.media.record_format {
+            RecordFormat::Gif => ResolvedRecordFormat::Gif,
+            RecordFormat::Mp4 | RecordFormat::Auto if ffmpeg => ResolvedRecordFormat::Mp4,
+            RecordFormat::Mp4 | RecordFormat::Auto => ResolvedRecordFormat::Gif,
+        };
+        let mp4_fallback = self.media.record_format == RecordFormat::Mp4 && !ffmpeg;
+        (format, mp4_fallback)
     }
 
     /// Advances the deterministic record state machine by one update.
@@ -500,6 +612,60 @@ impl ViewerApp {
         }
     }
 
+    /// Drives the free/manual recorder: one full-window screenshot every
+    /// FREE_RECORD_FRAME_DELAY_MS until the user stops it.
+    fn drive_free_recorder(&mut self, ctx: &egui::Context) {
+        let Some(recorder) = self.media.free_recorder.as_mut() else {
+            return;
+        };
+        enum DriveAction {
+            None,
+            Capture,
+            AbortCaptureTimeout,
+        }
+        let now = Instant::now();
+        let action = match &mut recorder.phase {
+            FreeRecorderPhase::Ready => {
+                if now >= recorder.next_capture_at {
+                    recorder.phase = FreeRecorderPhase::AwaitScreenshot { waited: 0 };
+                    DriveAction::Capture
+                } else {
+                    ctx.request_repaint_after(recorder.next_capture_at - now);
+                    DriveAction::None
+                }
+            }
+            FreeRecorderPhase::AwaitScreenshot { waited } => {
+                *waited += 1;
+                if *waited > RECORD_CAPTURE_TIMEOUT_FRAMES {
+                    DriveAction::AbortCaptureTimeout
+                } else {
+                    DriveAction::None
+                }
+            }
+        };
+        match action {
+            DriveAction::None => {}
+            DriveAction::Capture => self.request_screenshot(ctx, CaptureKind::FreeRecordFrame),
+            DriveAction::AbortCaptureTimeout => {
+                self.abort_free_recording(ctx, "screenshot capture timed out");
+                return;
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn free_record_frame_captured(&mut self, ctx: &egui::Context, image: Arc<egui::ColorImage>) {
+        let Some(recorder) = self.media.free_recorder.as_mut() else {
+            return;
+        };
+        let _ = recorder.frame_tx.send(EncoderMsg::Frame(image));
+        recorder.frames += 1;
+        recorder.phase = FreeRecorderPhase::Ready;
+        recorder.next_capture_at =
+            Instant::now() + Duration::from_millis(FREE_RECORD_FRAME_DELAY_MS as u64);
+        ctx.request_repaint_after(Duration::from_millis(FREE_RECORD_FRAME_DELAY_MS as u64));
+    }
+
     /// Ends the recording (loop complete or user pressed Stop) and hands the
     /// captured frames to the background encoder.
     fn finish_recording(&mut self, ctx: &egui::Context) {
@@ -529,6 +695,33 @@ impl ViewerApp {
         let _ = recorder.frame_tx.send(EncoderMsg::Abort);
         self.restore_after_recording(&recorder, ctx);
         self.status = format!("Recording aborted: {reason}");
+        ctx.request_repaint();
+    }
+
+    fn finish_free_recording(&mut self, ctx: &egui::Context) {
+        let Some(recorder) = self.media.free_recorder.take() else {
+            return;
+        };
+        self.status = if recorder.frames == 0 {
+            let _ = recorder.frame_tx.send(EncoderMsg::Abort);
+            "Free recording cancelled (no frames captured)".to_owned()
+        } else {
+            let _ = recorder.frame_tx.send(EncoderMsg::Finish);
+            format!(
+                "Encoding {} free recording ({} frames) in the background...",
+                recorder.format.label(),
+                recorder.frames
+            )
+        };
+        ctx.request_repaint();
+    }
+
+    fn abort_free_recording(&mut self, ctx: &egui::Context, reason: &str) {
+        let Some(recorder) = self.media.free_recorder.take() else {
+            return;
+        };
+        let _ = recorder.frame_tx.send(EncoderMsg::Abort);
+        self.status = format!("Free recording aborted: {reason}");
         ctx.request_repaint();
     }
 
@@ -593,11 +786,17 @@ fn run_loop_encoder(job: &LoopEncodeJob, frame_rx: &mpsc::Receiver<EncoderMsg>) 
             }
             Ok(EncoderMsg::Finish) => {
                 return Some(match sink.finish(&job.out_path) {
-                    Ok(()) => format!(
-                        "Saved {} loop ({frames} frames): {}",
-                        job.format.label(),
-                        job.out_path.display()
-                    ),
+                    Ok(()) => {
+                        let copy_note = match copy_recording_file_to_clipboard(&job.out_path) {
+                            Ok(()) => " and copied the file to clipboard".to_owned(),
+                            Err(err) => format!(" (file clipboard copy failed: {err})"),
+                        };
+                        format!(
+                            "Saved {} recording ({frames} frames){copy_note}: {}",
+                            job.format.label(),
+                            job.out_path.display()
+                        )
+                    }
                     Err(err) => format!("Recording failed: {err}"),
                 });
             }
@@ -867,6 +1066,46 @@ fn ffmpeg_binary_responds(program: &str) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+fn copy_recording_file_to_clipboard(path: &Path) -> Result<(), String> {
+    copy_file_to_clipboard(path)
+}
+
+#[cfg(windows)]
+fn copy_file_to_clipboard(path: &Path) -> Result<(), String> {
+    let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+$files = New-Object System.Collections.Specialized.StringCollection
+[void]$files.Add($args[0])
+[System.Windows.Forms.Clipboard]::SetFileDropList($files)
+"#;
+    let mut command = Command::new("powershell.exe");
+    command
+        .arg("-NoProfile")
+        .arg("-STA")
+        .arg("-Command")
+        .arg(script)
+        .arg(path.as_os_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_console_window(&mut command);
+    command
+        .status()
+        .map_err(|err| format!("clipboard helper spawn: {err}"))
+        .and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!("clipboard helper exited with {status}"))
+            }
+        })
+}
+
+#[cfg(not(windows))]
+fn copy_file_to_clipboard(_path: &Path) -> Result<(), String> {
+    Err("file clipboard is currently Windows-only".to_owned())
 }
 
 /// Keeps spawned helpers (ffmpeg) from flashing a console window on Windows.
