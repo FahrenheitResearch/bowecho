@@ -314,10 +314,10 @@ fn geojson_issue_time(text: &str) -> Option<DateTime<Utc>> {
     let root = serde_json::from_str::<serde_json::Value>(text).ok()?;
     let feature = root.get("features")?.as_array()?.first()?;
     let props = feature.get("properties")?;
-    if let Some(issue_iso) = props.get("ISSUE_ISO").and_then(|v| v.as_str()) {
-        if let Ok(time) = DateTime::parse_from_rfc3339(issue_iso) {
-            return Some(time.with_timezone(&Utc));
-        }
+    if let Some(issue_iso) = props.get("ISSUE_ISO").and_then(|v| v.as_str())
+        && let Ok(time) = DateTime::parse_from_rfc3339(issue_iso)
+    {
+        return Some(time.with_timezone(&Utc));
     }
     let issue = props.get("ISSUE")?;
     let key = issue

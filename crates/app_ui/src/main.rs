@@ -1728,26 +1728,31 @@ fn decode_archive_history_object(
     Ok(Some(decoded))
 }
 
-fn load_archive_history_objects_parallel(
-    site_id: &str,
-    site_cache_dir: &Path,
-    objects: Vec<(usize, data_source::S3Object)>,
-    known_frame_paths: &BTreeSet<PathBuf>,
+struct ArchiveHistoryLoadContext<'a> {
+    site_id: &'a str,
+    site_cache_dir: &'a Path,
+    known_frame_paths: &'a BTreeSet<PathBuf>,
     archive_lookup_ms: Option<f32>,
     total_start: Instant,
-    sender: &mpsc::Sender<AsyncLoadResult>,
+    sender: &'a mpsc::Sender<AsyncLoadResult>,
     progress_done_start: usize,
     progress_total: usize,
+}
+
+fn load_archive_history_objects_parallel(
+    ctx: ArchiveHistoryLoadContext<'_>,
+    objects: Vec<(usize, data_source::S3Object)>,
 ) -> (Vec<DecodedLoad>, Option<String>) {
     let parallelism = history_archive_load_parallelism();
     let total_objects = objects.len();
-    let progress_total = progress_total.max(total_objects);
+    let progress_total = ctx.progress_total.max(total_objects);
+    let site_id = ctx.site_id;
     let progress_label = format!("L2 {site_id} loop");
     let priority_count = total_objects.min(parallelism.min(3));
     let mut decoded_frames = Vec::new();
     let mut first_error = None;
     let mut offset = 0;
-    let mut completed = progress_done_start.min(progress_total);
+    let mut completed = ctx.progress_done_start.min(progress_total);
 
     while offset < objects.len() {
         let chunk_size = if offset == 0 && priority_count > 0 {
@@ -1761,16 +1766,16 @@ fn load_archive_history_objects_parallel(
             let mut workers = Vec::with_capacity(chunk.len());
             for (index, object) in chunk.iter().cloned() {
                 let site_id = site_id.to_owned();
-                let site_cache_dir = site_cache_dir.to_path_buf();
-                let sender = sender.clone();
+                let site_cache_dir = ctx.site_cache_dir.to_path_buf();
+                let sender = ctx.sender.clone();
                 workers.push(scope.spawn(move || {
                     decode_archive_history_object(
                         &site_id,
                         object,
                         &site_cache_dir,
-                        known_frame_paths,
-                        (index == 0).then_some(archive_lookup_ms).flatten(),
-                        total_start,
+                        ctx.known_frame_paths,
+                        (index == 0).then_some(ctx.archive_lookup_ms).flatten(),
+                        ctx.total_start,
                         &sender,
                         false,
                         true,
@@ -1793,7 +1798,7 @@ fn load_archive_history_objects_parallel(
             completed += 1;
             match result {
                 Ok(Ok(Some(decoded))) => {
-                    let _ = sender.send(AsyncLoadResult {
+                    let _ = ctx.sender.send(AsyncLoadResult {
                         label: format!("L2 {site_id} loop frame"),
                         update: AsyncLoadUpdate::History(
                             DecodedLoadBatch {
@@ -1811,7 +1816,7 @@ fn load_archive_history_objects_parallel(
                 }
             }
             send_archive_progress(
-                sender,
+                ctx.sender,
                 &progress_label,
                 "Decoded recent archive frame",
                 completed,
@@ -2083,15 +2088,17 @@ fn spawn_latest_level2_load_worker(
 
                 if explicit_loop_load && !remaining_archive_objects.is_empty() {
                     let (history_frames, history_error) = load_archive_history_objects_parallel(
-                        &site_id,
-                        &site_cache_dir,
+                        ArchiveHistoryLoadContext {
+                            site_id: &site_id,
+                            site_cache_dir: &site_cache_dir,
+                            known_frame_paths: &known_frame_paths,
+                            archive_lookup_ms,
+                            total_start,
+                            sender: &sender,
+                            progress_done_start: archive_progress_done,
+                            progress_total: recent_archive_total,
+                        },
                         remaining_archive_objects,
-                        &known_frame_paths,
-                        archive_lookup_ms,
-                        total_start,
-                        &sender,
-                        archive_progress_done,
-                        recent_archive_total,
                     );
                     fallback_error = fallback_error.or(history_error);
                     for decoded in history_frames {
@@ -30963,9 +30970,10 @@ fn radar_color_image_from_rgba(size: [usize; 2], rgba: &[u8]) -> egui::ColorImag
     egui::ColorImage::new(size, pixels)
 }
 
-fn sat_player_frame_within_texture_limit(
-    mut frame: rw_ui::SatFrameImage,
-) -> (rw_ui::SatFrameImage, Option<([usize; 2], [usize; 2])>) {
+type SatResizeNotice = Option<([usize; 2], [usize; 2])>;
+type SatFrameResizeResult = (rw_ui::SatFrameImage, SatResizeNotice);
+
+fn sat_player_frame_within_texture_limit(mut frame: rw_ui::SatFrameImage) -> SatFrameResizeResult {
     let old_size = frame.image.size;
     let max_dim = old_size[0].max(old_size[1]);
     if max_dim <= MAX_SAT_PLAYER_TEXTURE_DIM {
