@@ -934,9 +934,11 @@ fn decode_local_radar_file_set(
         .join(" + ");
     volume.metadata.source_path = Some(source_paths);
 
-    let mut timings = LoadTimings::default();
-    timings.read_ms = Some(read_ms);
-    timings.decode_ms = decode_ms;
+    let timings = LoadTimings {
+        read_ms: Some(read_ms),
+        decode_ms,
+        ..Default::default()
+    };
     let formats = format_labels.into_iter().collect::<Vec<_>>().join("+");
     let source_label = format!(
         "{formats} merged set ({} files, {} moments merged)",
@@ -19929,12 +19931,13 @@ impl ViewerApp {
         {
             let bounds = self.visible_geo_bounds(rect).expand(0.25);
             let stations = self.surface_obs.stale_metars_in_bounds(
-                bounds.west,
-                bounds.south,
-                bounds.east,
-                bounds.north,
-                self.map_center_lat,
-                self.map_center_lon,
+                obs::ObBounds {
+                    west: bounds.west,
+                    south: bounds.south,
+                    east: bounds.east,
+                    north: bounds.north,
+                },
+                (self.map_center_lat, self.map_center_lon),
                 Utc::now(),
                 chrono::Duration::minutes(18),
                 48,

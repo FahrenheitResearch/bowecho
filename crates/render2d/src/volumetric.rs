@@ -785,8 +785,7 @@ pub fn reflectivity_cross_section_with_smoothing(
         &cols,
         start_km,
         end_km,
-        width,
-        height,
+        (width, height),
         top_m,
         InterpPolicy::LinearAngle,
         smoothing,
@@ -897,7 +896,13 @@ pub fn moment_cross_section_with_smoothing(
         .collect();
     cols.sort_by(|a, b| a.elevation_deg.total_cmp(&b.elevation_deg));
     cross_section_from_columns(
-        &cols, start_km, end_km, width, height, top_m, policy, smoothing,
+        &cols,
+        start_km,
+        end_km,
+        (width, height),
+        top_m,
+        policy,
+        smoothing,
     )
 }
 
@@ -980,6 +985,7 @@ pub fn velocity_cross_section_cached(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // cache plus section geometry keeps this call site explicit
 pub fn velocity_cross_section_cached_with_smoothing(
     volume: &RadarVolume,
     cache: &mut VolumeDealiasCache,
@@ -1001,8 +1007,7 @@ pub fn velocity_cross_section_cached_with_smoothing(
         &cols,
         start_km,
         end_km,
-        width,
-        height,
+        (width, height),
         top_m,
         InterpPolicy::VelocityGuard,
         smoothing,
@@ -1015,12 +1020,12 @@ fn cross_section_from_columns(
     cols: &[CutColumn<'_>],
     start_km: (f32, f32),
     end_km: (f32, f32),
-    width: usize,
-    height: usize,
+    dims: (usize, usize),
     top_m: f32,
     policy: InterpPolicy,
     smoothing: CrossSectionSmoothing,
 ) -> Option<CrossSection> {
+    let (width, height) = dims;
     if width < 2 || height < 2 || top_m <= 0.0 || cols.is_empty() {
         return None;
     }

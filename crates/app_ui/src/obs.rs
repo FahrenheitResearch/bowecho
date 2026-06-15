@@ -54,6 +54,14 @@ pub fn fetch_surface_obs() -> Result<Vec<SurfaceOb>, String> {
     parse_metar_cache(&text)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ObBounds {
+    pub west: f32,
+    pub south: f32,
+    pub east: f32,
+    pub north: f32,
+}
+
 pub fn fetch_nws_latest_obs(stations: Vec<(String, f32, f32)>) -> Vec<SurfaceOb> {
     let results = std::sync::Mutex::new(Vec::new());
     let queue = std::sync::Mutex::new(stations.into_iter());
@@ -482,16 +490,13 @@ impl ObPool {
 
     pub fn stale_metars_in_bounds(
         &self,
-        west: f32,
-        south: f32,
-        east: f32,
-        north: f32,
-        center_lat: f32,
-        center_lon: f32,
+        bounds: ObBounds,
+        center: (f32, f32),
         now: DateTime<Utc>,
         stale_after: chrono::Duration,
         limit: usize,
     ) -> Vec<(String, f32, f32)> {
+        let (center_lat, center_lon) = center;
         let mut candidates = Vec::new();
         for (station, list) in &self.by_station {
             let Some(latest) = list.last() else {
@@ -500,7 +505,11 @@ impl ObPool {
             if latest.network != "METAR" || !station.starts_with('K') || station.len() != 4 {
                 continue;
             }
-            if latest.lon < west || latest.lon > east || latest.lat < south || latest.lat > north {
+            if latest.lon < bounds.west
+                || latest.lon > bounds.east
+                || latest.lat < bounds.south
+                || latest.lat > bounds.north
+            {
                 continue;
             }
             let Some(time_utc) = latest.time_utc else {
@@ -666,12 +675,13 @@ mod tests {
         pool.by_station.insert("MNET".into(), vec![mesonet]);
 
         let candidates = pool.stale_metars_in_bounds(
-            -99.0,
-            34.0,
-            -96.0,
-            37.0,
-            35.0,
-            -97.0,
+            ObBounds {
+                west: -99.0,
+                south: 34.0,
+                east: -96.0,
+                north: 37.0,
+            },
+            (35.0, -97.0),
             now,
             chrono::Duration::minutes(18),
             8,
