@@ -19,16 +19,29 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use eframe::egui::{Color32, ColorImage};
 use rw_sat::composite::GoesAbiRgbCompositeStyle;
 use rw_sat::events::{SatError, SatEvent};
+use rw_sat::fci::{FciChannel, FciValueMode, assemble_fci_chunks};
 use rw_sat::follow::FollowConfig;
 use rw_sat::goes::{GoesSatellite, parse_goes_abi_filename};
+use rw_sat::himawari::{
+    HIMAWARI_DOWNLOAD_MANIFEST_SCHEMA, HimawariDownloadManifest, HimawariLatestRequest,
+    HimawariManifestSegment, HimawariProduct, HimawariSatellite, HimawariValueMode,
+    assemble_hsd_segments, is_complete_segment_set, list_latest_segments, stage_download_manifest,
+};
+use rw_sat::mtg::{
+    EumetsatCredentials, MtgCollection, MtgSearchRequest, download_product, request_access_token,
+    search_products, unpack_package,
+};
 use rw_sat::palette::{anchor_color, band_anchors};
-use rw_sat::s3::{Sector, bucket_for_satellite, object_filename};
-use rw_sat::store::{frame_file_name, run_day};
+use rw_sat::s3::{
+    Sector, bucket_for_satellite, build_agent, download_object, object_filename, object_url,
+};
+use rw_sat::store::{frame_file_name, run_day, selector_band, write_satellite_grid_frame};
 use rw_sat::window::WindowConfig;
 use rw_store::grid::GridFile;
 use rw_store::reader::HourReader;
@@ -46,10 +59,70 @@ pub enum SatRequest {
     Scan,
     /// Start a live follow session (one at a time).
     Follow(SatFollowSpec),
+    /// One-shot current-hour ingest for quickly creating a playable loop.
+    LoadLoop(SatFollowSpec),
     /// Read one stored frame and color it with its band palette.
     LoadFrame { key: SatRunKey, hhmm: u16 },
     /// Read a frame PLUS its run grid for the radar-map layer.
     LoadFrameForMap { key: SatRunKey, hhmm: u16 },
+    /// Download/decode the latest Himawari AHI frame into the shared sat store.
+    IngestLatestHimawari(HimawariQuickSpec),
+    /// Public EUMETSAT OpenSearch discovery for MTG products.
+    DiscoverMtg {
+        collection: String,
+        minutes: i64,
+        count: usize,
+    },
+    /// Verify EUMETSAT credentials from session fields or process environment.
+    CheckMtgAuth {
+        validity_secs: u64,
+        consumer_key: Option<String>,
+        consumer_secret: Option<String>,
+    },
+    /// Download the latest credential-gated MTG FCI product and decode it.
+    DownloadLatestMtgFci(MtgFciDownloadSpec),
+    /// Decode local MTG FCI CHK-BODY NetCDF file(s) into the shared sat store.
+    IngestMtgFciLocal(MtgFciLocalSpec),
+}
+
+#[derive(Debug, Clone)]
+pub struct HimawariQuickSpec {
+    pub satellite: String,
+    pub band: u8,
+    pub lookback_minutes: i64,
+    pub segment_limit: usize,
+    pub downsample: usize,
+}
+
+impl Default for HimawariQuickSpec {
+    fn default() -> Self {
+        Self {
+            satellite: "h9".to_string(),
+            band: 13,
+            lookback_minutes: 180,
+            segment_limit: usize::MAX,
+            downsample: 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MtgFciLocalSpec {
+    pub paths: Vec<PathBuf>,
+    pub channel: String,
+    pub value: String,
+    pub downsample: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct MtgFciDownloadSpec {
+    pub collection: String,
+    pub minutes: i64,
+    pub channel: String,
+    pub value: String,
+    pub downsample: usize,
+    pub consumer_key: Option<String>,
+    pub consumer_secret: Option<String>,
 }
 
 /// A frame prepared for the map layer: the palette-colored image, the
@@ -116,6 +189,10 @@ pub enum SatResponse {
     },
     Note(String),
     DiskUsage(SatDiskUsage),
+    SelectFrame {
+        key: SatRunKey,
+        hhmm: u16,
+    },
     Frame {
         key: SatRunKey,
         hhmm: u16,
@@ -482,6 +559,11 @@ struct WorkerState {
     grids: HashMap<(String, String), GridInfo>,
 }
 
+struct ColoredSatFrame {
+    frame: SatFrameImage,
+    band: u8,
+}
+
 /// Frame + run grid for the radar-map layer (one GridFile open per call;
 /// the layer rebuild is a user action, not a per-frame hot path).
 fn load_frame_for_map(
@@ -490,7 +572,8 @@ fn load_frame_for_map(
     key: &SatRunKey,
     hhmm: u16,
 ) -> Result<SatMapFrame, String> {
-    let frame = load_frame(state, store_root, key, hhmm)?;
+    let mut colored = load_colored_frame(state, store_root, key, hhmm)?;
+    apply_ir_map_overlay_alpha(&mut colored.frame.image, colored.band);
     let run_dir = store_root.join(&key.model).join(&key.run);
     let grid = GridFile::open(&run_dir.join("grid.rwg")).map_err(|err| err.to_string())?;
     let flip_rows = state
@@ -501,7 +584,7 @@ fn load_frame_for_map(
     Ok(SatMapFrame {
         key: key.clone(),
         hhmm,
-        image: frame.image,
+        image: colored.frame.image,
         grid: std::sync::Arc::new(grid),
         flip_rows,
     })
@@ -515,6 +598,15 @@ fn load_frame(
     key: &SatRunKey,
     hhmm: u16,
 ) -> Result<SatFrameImage, String> {
+    load_colored_frame(state, store_root, key, hhmm).map(|colored| colored.frame)
+}
+
+fn load_colored_frame(
+    state: &mut WorkerState,
+    store_root: &Path,
+    key: &SatRunKey,
+    hhmm: u16,
+) -> Result<ColoredSatFrame, String> {
     let started = Instant::now();
     let run_dir = store_root.join(&key.model).join(&key.run);
     let reader =
@@ -525,15 +617,7 @@ fn load_frame(
         .iter()
         .find(|var| var.kind == "surface2d")
         .ok_or_else(|| format!("{key}/t{hhmm:04} holds no 2D variable"))?;
-    let band = variable.selector["goes"]["band"]
-        .as_u64()
-        .and_then(|value| u8::try_from(value).ok())
-        .or_else(|| {
-            variable
-                .name
-                .strip_prefix("cmi_c")
-                .and_then(|raw| raw.parse::<u8>().ok())
-        })
+    let band = selector_band(&variable.selector, &variable.name)
         .ok_or_else(|| format!("{key}/t{hhmm:04} selector carries no band"))?;
 
     let grid_key = (key.model.clone(), key.run.clone());
@@ -558,10 +642,36 @@ fn load_frame(
     let (nx, ny) = (meta.nx, meta.ny);
     let name = variable.name.clone();
     let values = reader.read_full_2d(&name).map_err(|err| err.to_string())?;
+    let pixels = render_sat_pixels(&name, band, &values, nx, ny, grid.flip_rows);
+    Ok(ColoredSatFrame {
+        frame: SatFrameImage {
+            key: key.clone(),
+            hhmm,
+            image: ColorImage::new([nx, ny], pixels),
+            read_ms: started.elapsed().as_secs_f32() * 1000.0,
+        },
+        band,
+    })
+}
+
+fn render_sat_pixels(
+    variable_name: &str,
+    band: u8,
+    values: &[f32],
+    nx: usize,
+    ny: usize,
+    flip_rows: bool,
+) -> Vec<Color32> {
+    if himawari_dynamic_ir(variable_name, band)
+        && let Some((lo, hi)) = finite_percentile_range(values, 0.02, 0.98)
+    {
+        return render_stretched_ir_pixels(values, nx, ny, flip_rows, lo, hi);
+    }
+
     let anchors = band_anchors(band);
     let mut pixels = Vec::with_capacity(nx * ny);
     for image_row in 0..ny {
-        let grid_row = if grid.flip_rows {
+        let grid_row = if flip_rows {
             ny - 1 - image_row
         } else {
             image_row
@@ -571,12 +681,79 @@ fn load_frame(
             pixels.push(Color32::from_rgba_unmultiplied(r, g, b, a));
         }
     }
-    Ok(SatFrameImage {
-        key: key.clone(),
-        hhmm,
-        image: ColorImage::new([nx, ny], pixels),
-        read_ms: started.elapsed().as_secs_f32() * 1000.0,
-    })
+    pixels
+}
+
+fn himawari_dynamic_ir(variable_name: &str, band: u8) -> bool {
+    variable_name.starts_with("ahi_bt_") && (7..=16).contains(&band)
+}
+
+fn finite_percentile_range(values: &[f32], low: f32, high: f32) -> Option<(f32, f32)> {
+    let mut finite = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    if finite.is_empty() {
+        return None;
+    }
+    finite.sort_by(|a, b| a.total_cmp(b));
+    let last = finite.len() - 1;
+    let low_idx = ((last as f32) * low.clamp(0.0, 1.0)).round() as usize;
+    let high_idx = ((last as f32) * high.clamp(0.0, 1.0)).round() as usize;
+    let lo = finite[low_idx.min(last)];
+    let hi = finite[high_idx.max(low_idx).min(last)];
+    if hi > lo {
+        Some((lo, hi))
+    } else {
+        Some((lo, lo + 1.0))
+    }
+}
+
+fn render_stretched_ir_pixels(
+    values: &[f32],
+    nx: usize,
+    ny: usize,
+    flip_rows: bool,
+    lo: f32,
+    hi: f32,
+) -> Vec<Color32> {
+    let span = (hi - lo).max(1.0);
+    let mut pixels = Vec::with_capacity(nx * ny);
+    for image_row in 0..ny {
+        let grid_row = if flip_rows {
+            ny - 1 - image_row
+        } else {
+            image_row
+        };
+        for &value in &values[grid_row * nx..(grid_row + 1) * nx] {
+            if !value.is_finite() {
+                pixels.push(Color32::TRANSPARENT);
+                continue;
+            }
+            let cold = (1.0 - ((value - lo) / span).clamp(0.0, 1.0)).powf(0.75);
+            let shade = (cold * 245.0 + 10.0).round() as u8;
+            let blue = ((shade as f32) * 1.08).min(255.0).round() as u8;
+            pixels.push(Color32::from_rgba_unmultiplied(shade, shade, blue, 255));
+        }
+    }
+    pixels
+}
+
+fn apply_ir_map_overlay_alpha(image: &mut ColorImage, band: u8) {
+    if !(7..=16).contains(&band) {
+        return;
+    }
+    for pixel in &mut image.pixels {
+        if pixel.a() == 0 {
+            continue;
+        }
+        let luminance = 0.2126 * f32::from(pixel.r())
+            + 0.7152 * f32::from(pixel.g())
+            + 0.0722 * f32::from(pixel.b());
+        let alpha = ((luminance - 28.0) / (190.0 - 28.0) * 230.0).clamp(0.0, 230.0) as u8;
+        *pixel = Color32::from_rgba_unmultiplied(pixel.r(), pixel.g(), pixel.b(), alpha);
+    }
 }
 
 /// Map one follow-engine event into panel-ready responses. `current_key`
@@ -639,6 +816,358 @@ fn download_label(key: &str) -> String {
     }
 }
 
+fn ingest_latest_himawari(
+    store_root: &Path,
+    spec: &HimawariQuickSpec,
+    send: &impl Fn(SatResponse) -> bool,
+) -> Result<String, String> {
+    let satellite = HimawariSatellite::parse(&spec.satellite)
+        .ok_or_else(|| format!("unknown Himawari satellite '{}'", spec.satellite))?;
+    let band = spec.band.clamp(1, 16);
+    let agent = build_agent();
+    let request = HimawariLatestRequest {
+        satellite,
+        product: HimawariProduct::AhiL1bFldk,
+        band: Some(band),
+        lookback_minutes: spec.lookback_minutes.max(10),
+        require_complete: true,
+    };
+    let result = list_latest_segments(&agent, &request).map_err(|err| err.to_string())?;
+    let source_complete = is_complete_segment_set(&result.segments);
+    let segment_count = spec.segment_limit.max(1).min(result.segments.len());
+    let cache_root = store_root.join("cache");
+    let source_root = store_root.join("sources").join("himawari");
+    let manifest_dir = source_root.join("manifest");
+    let raw_dir = source_root.join("raw");
+
+    let mut manifest_segments = Vec::with_capacity(segment_count);
+    let mut row_ids = Vec::with_capacity(segment_count);
+    let mut total_bytes = 0_u64;
+    for segment in result.segments.iter().take(segment_count) {
+        let id = segment.object.key.clone();
+        row_ids.push(id.clone());
+        let label = format!(
+            "{} B{:02} S{:02}/{:02}",
+            result.satellite.platform(),
+            segment.name.band,
+            segment.name.segment_index,
+            segment.name.segment_count
+        );
+        send(SatResponse::DownloadStarted {
+            id: id.clone(),
+            label,
+            bytes: segment.object.size_bytes,
+        });
+        let started = Instant::now();
+        let downloaded = download_object(
+            &agent,
+            result.satellite.bucket(),
+            &cache_root,
+            &segment.object,
+            true,
+        )
+        .map_err(|err| err.to_string())?;
+        send(SatResponse::DownloadDone {
+            id,
+            ms: started.elapsed().as_millis(),
+            cache_hit: downloaded.cache_hit,
+        });
+        total_bytes = total_bytes.saturating_add(segment.object.size_bytes);
+        manifest_segments.push(HimawariManifestSegment {
+            band: segment.name.band,
+            segment_index: segment.name.segment_index,
+            segment_count: segment.name.segment_count,
+            product: segment.name.product.clone(),
+            resolution: segment.name.resolution.clone(),
+            key: segment.object.key.clone(),
+            url: object_url(result.satellite.bucket(), &segment.object.key),
+            last_modified: segment.object.last_modified.clone(),
+            size_bytes: segment.object.size_bytes,
+            cache_path: downloaded.path.display().to_string(),
+            cache_hit: downloaded.cache_hit,
+        });
+    }
+
+    std::fs::create_dir_all(&manifest_dir).map_err(|err| err.to_string())?;
+    let manifest_path = manifest_dir.join(format!(
+        "{}_{}_b{band:02}_{}.json",
+        result.satellite.slug(),
+        result.product.slug(),
+        result.scan_time.format("%Y%m%dT%H%M%SZ")
+    ));
+    let manifest = HimawariDownloadManifest {
+        schema: HIMAWARI_DOWNLOAD_MANIFEST_SCHEMA.to_string(),
+        satellite: result.satellite.slug().to_string(),
+        platform: result.satellite.platform().to_string(),
+        bucket: result.satellite.bucket().to_string(),
+        product: result.product.slug().to_string(),
+        scan_time_utc: result.scan_time.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        prefix: result.prefix,
+        band,
+        segments_downloaded: manifest_segments.len(),
+        segments_available: result.segments.len(),
+        source_complete,
+        allow_partial: false,
+        total_downloaded_bytes: total_bytes,
+        cache_root: cache_root.display().to_string(),
+        segments: manifest_segments,
+    };
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|err| err.to_string())?;
+    std::fs::write(&manifest_path, manifest_bytes).map_err(|err| err.to_string())?;
+
+    let staged =
+        stage_download_manifest(&manifest_path, &raw_dir).map_err(|err| err.to_string())?;
+    let paths = staged
+        .segments
+        .iter()
+        .map(|segment| PathBuf::from(&segment.raw_path))
+        .collect::<Vec<_>>();
+    let field = assemble_hsd_segments(
+        &paths,
+        HimawariValueMode::BrightnessTemperature,
+        spec.downsample.max(1),
+    )
+    .map_err(|err| err.to_string())?;
+    let nx = field.scene.fixed_grid.nx;
+    let ny = field.scene.fixed_grid.ny;
+    let frame =
+        write_satellite_grid_frame(store_root, &field, Utc::now().timestamp().max(0) as u64)
+            .map_err(|err| err.to_string())?;
+    for id in row_ids {
+        send(SatResponse::FrameWritten {
+            id,
+            run: frame.run.clone(),
+            hhmm: frame.hhmm,
+            bytes: frame.bytes,
+            encode_ms: frame.encode_ms,
+        });
+    }
+    send(SatResponse::Runs(scan_runs(store_root)));
+    send(SatResponse::SelectFrame {
+        key: SatRunKey {
+            model: frame.model.clone(),
+            run: frame.run.clone(),
+        },
+        hhmm: frame.hhmm,
+    });
+    Ok(format!(
+        "Himawari {} B{band:02}: {} segment(s), {}x{}, wrote {}/{}/t{:04}",
+        result.satellite.platform(),
+        paths.len(),
+        nx,
+        ny,
+        frame.model,
+        frame.run,
+        frame.hhmm
+    ))
+}
+
+fn discover_mtg(collection: &str, minutes: i64, count: usize) -> Result<String, String> {
+    let collection = MtgCollection::parse(collection)
+        .ok_or_else(|| format!("unknown MTG collection '{collection}'"))?;
+    let end = Utc::now();
+    let start = end - chrono::Duration::minutes(minutes.max(1));
+    let request = MtgSearchRequest::new(collection, start, end, count.max(1));
+    let agent = build_agent();
+    let result = search_products(&agent, &request).map_err(|err| err.to_string())?;
+    let first = result
+        .products
+        .first()
+        .map(|product| {
+            format!(
+                "{} {}",
+                product.date.as_deref().unwrap_or("(no time)"),
+                product.id
+            )
+        })
+        .unwrap_or_else(|| "no products".to_string());
+    Ok(format!(
+        "MTG {} discovery: {} shown of {}; newest {first}; download/decode requires an MTG FCI body file or EUMETSAT credentials",
+        collection.slug(),
+        result.products.len(),
+        result.total_results
+    ))
+}
+
+fn check_mtg_auth(
+    validity_secs: u64,
+    consumer_key: Option<&str>,
+    consumer_secret: Option<&str>,
+) -> Result<String, String> {
+    let credentials = mtg_credentials(consumer_key, consumer_secret)?;
+    let agent = build_agent();
+    let token = request_access_token(&agent, &credentials, validity_secs.max(60))
+        .map_err(|err| err.to_string())?;
+    Ok(format!(
+        "EUMETSAT auth OK: token acquired; expires in {}s",
+        token.expires_in
+    ))
+}
+
+fn mtg_credentials(
+    consumer_key: Option<&str>,
+    consumer_secret: Option<&str>,
+) -> Result<EumetsatCredentials, String> {
+    match (consumer_key, consumer_secret) {
+        (Some(key), Some(secret)) if !key.trim().is_empty() && !secret.trim().is_empty() => {
+            Ok(EumetsatCredentials::new(key.trim(), secret.trim()))
+        }
+        _ => EumetsatCredentials::from_env().map_err(|err| err.to_string()),
+    }
+}
+
+fn download_latest_mtg_fci(
+    store_root: &Path,
+    spec: &MtgFciDownloadSpec,
+) -> Result<(String, SatRunKey, u16), String> {
+    let collection = MtgCollection::parse(&spec.collection)
+        .ok_or_else(|| format!("unknown MTG collection '{}'", spec.collection))?;
+    let channel = FciChannel::parse(&spec.channel).ok_or_else(|| {
+        format!(
+            "unknown FCI channel '{}' (choices: {}; or c01..c16)",
+            spec.channel,
+            FciChannel::choices()
+        )
+    })?;
+    let mode = FciValueMode::parse(&spec.value).ok_or_else(|| {
+        format!(
+            "unknown FCI value '{}' (choices: brightness-temp, bt, radiance, reflectance, count)",
+            spec.value
+        )
+    })?;
+    let agent = build_agent();
+    let end = Utc::now();
+    let start = end - chrono::Duration::minutes(spec.minutes.max(1));
+    let request = MtgSearchRequest::new(collection, start, end, 1);
+    let search = search_products(&agent, &request).map_err(|err| err.to_string())?;
+    let product = search
+        .products
+        .first()
+        .ok_or_else(|| format!("MTG {} discovery returned no products", collection.slug()))?;
+    let product_id = product.id.clone();
+    let credentials = mtg_credentials(
+        spec.consumer_key.as_deref(),
+        spec.consumer_secret.as_deref(),
+    )?;
+    let token = request_access_token(&agent, &credentials, 3600).map_err(|err| err.to_string())?;
+    let source_root = store_root.join("sources").join("mtg");
+    let download_dir = source_root.join("downloads").join(collection.slug());
+    let downloaded = download_product(&agent, collection, &product_id, &token, &download_dir)
+        .map_err(|err| err.to_string())?;
+    let unpack_dir = source_root
+        .join("unpacked")
+        .join(collection.slug())
+        .join(format!(
+            "{}_{}",
+            Utc::now().format("%Y%m%dT%H%M%SZ"),
+            downloaded.filename
+        ));
+    let unpacked =
+        unpack_package(&downloaded.path, &unpack_dir, true).map_err(|err| err.to_string())?;
+    let paths = unpacked
+        .extracted
+        .iter()
+        .filter(|entry| is_netcdf_path(&entry.path))
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Err(format!(
+            "downloaded {} but no NetCDF body files were extracted",
+            downloaded.path.display()
+        ));
+    }
+
+    let field = assemble_fci_chunks(&paths, channel, mode, spec.downsample.max(1))
+        .map_err(|err| err.to_string())?;
+    let nx = field.scene.fixed_grid.nx;
+    let ny = field.scene.fixed_grid.ny;
+    let frame =
+        write_satellite_grid_frame(store_root, &field, Utc::now().timestamp().max(0) as u64)
+            .map_err(|err| err.to_string())?;
+    let key = SatRunKey {
+        model: frame.model.clone(),
+        run: frame.run.clone(),
+    };
+    let hhmm = frame.hhmm;
+    Ok((
+        format!(
+            "MTG FCI downloaded/decode {} {}: {} NetCDF file(s), {}x{}, wrote {}/{}/t{:04}",
+            channel.name,
+            mode.slug(),
+            paths.len(),
+            nx,
+            ny,
+            frame.model,
+            frame.run,
+            frame.hhmm
+        ),
+        key,
+        hhmm,
+    ))
+}
+
+fn is_netcdf_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower.ends_with(".nc")
+                || lower.ends_with(".nc4")
+                || lower.ends_with(".nc4e")
+                || lower.ends_with(".netcdf")
+        })
+        .unwrap_or(false)
+}
+
+fn ingest_local_mtg_fci(
+    store_root: &Path,
+    spec: &MtgFciLocalSpec,
+) -> Result<(String, SatRunKey, u16), String> {
+    if spec.paths.is_empty() {
+        return Err("choose at least one MTG FCI CHK-BODY NetCDF file".to_string());
+    }
+    let channel = FciChannel::parse(&spec.channel).ok_or_else(|| {
+        format!(
+            "unknown FCI channel '{}' (choices: {}; or c01..c16)",
+            spec.channel,
+            FciChannel::choices()
+        )
+    })?;
+    let mode = FciValueMode::parse(&spec.value).ok_or_else(|| {
+        format!(
+            "unknown FCI value '{}' (choices: brightness-temp, bt, radiance, reflectance, count)",
+            spec.value
+        )
+    })?;
+    let field = assemble_fci_chunks(&spec.paths, channel, mode, spec.downsample.max(1))
+        .map_err(|err| err.to_string())?;
+    let nx = field.scene.fixed_grid.nx;
+    let ny = field.scene.fixed_grid.ny;
+    let frame =
+        write_satellite_grid_frame(store_root, &field, Utc::now().timestamp().max(0) as u64)
+            .map_err(|err| err.to_string())?;
+    let key = SatRunKey {
+        model: frame.model.clone(),
+        run: frame.run.clone(),
+    };
+    let hhmm = frame.hhmm;
+    Ok((
+        format!(
+            "MTG FCI {} {}: {} chunk(s), {}x{}, wrote {}/{}/t{:04}",
+            channel.name,
+            mode.slug(),
+            spec.paths.len(),
+            nx,
+            ny,
+            frame.model,
+            frame.run,
+            frame.hhmm
+        ),
+        key,
+        hhmm,
+    ))
+}
+
 fn worker_loop(
     store_root: PathBuf,
     requests: &Receiver<SatRequest>,
@@ -679,6 +1208,184 @@ fn worker_loop(
                 let result = load_frame_for_map(&mut state, &store_root, &key, hhmm);
                 if !send(SatResponse::MapFrame(Box::new(result))) {
                     return;
+                }
+            }
+            SatRequest::IngestLatestHimawari(spec) => {
+                send(SatResponse::Note(format!(
+                    "Himawari: locating latest {} B{:02}",
+                    spec.satellite, spec.band
+                )));
+                match ingest_latest_himawari(&store_root, &spec, &send) {
+                    Ok(summary) => {
+                        send(SatResponse::Note(summary));
+                        send(SatResponse::Runs(scan_runs(&store_root)));
+                    }
+                    Err(message) => {
+                        send(SatResponse::Note(format!("Himawari failed: {message}")));
+                    }
+                }
+            }
+            SatRequest::DiscoverMtg {
+                collection,
+                minutes,
+                count,
+            } => {
+                send(SatResponse::Note(format!(
+                    "MTG: searching {collection} for the last {minutes} minutes"
+                )));
+                match discover_mtg(&collection, minutes, count) {
+                    Ok(summary) => {
+                        send(SatResponse::Note(summary));
+                    }
+                    Err(message) => {
+                        send(SatResponse::Note(format!(
+                            "MTG discovery failed: {message}"
+                        )));
+                    }
+                }
+            }
+            SatRequest::CheckMtgAuth {
+                validity_secs,
+                consumer_key,
+                consumer_secret,
+            } => {
+                send(SatResponse::Note(
+                    "EUMETSAT: requesting token from session/env credentials".to_string(),
+                ));
+                match check_mtg_auth(
+                    validity_secs,
+                    consumer_key.as_deref(),
+                    consumer_secret.as_deref(),
+                ) {
+                    Ok(summary) => {
+                        send(SatResponse::Note(summary));
+                    }
+                    Err(message) => {
+                        send(SatResponse::Note(format!(
+                            "EUMETSAT auth failed: {message}"
+                        )));
+                    }
+                }
+            }
+            SatRequest::DownloadLatestMtgFci(spec) => {
+                send(SatResponse::Note(format!(
+                    "MTG FCI: downloading latest {} from last {} minutes",
+                    spec.collection, spec.minutes
+                )));
+                match download_latest_mtg_fci(&store_root, &spec) {
+                    Ok((summary, key, hhmm)) => {
+                        send(SatResponse::Note(summary));
+                        send(SatResponse::Runs(scan_runs(&store_root)));
+                        send(SatResponse::SelectFrame { key, hhmm });
+                    }
+                    Err(message) => {
+                        send(SatResponse::Note(format!(
+                            "MTG FCI download failed: {message}"
+                        )));
+                    }
+                }
+            }
+            SatRequest::IngestMtgFciLocal(spec) => {
+                send(SatResponse::Note(format!(
+                    "MTG FCI: decoding {} local NetCDF file(s)",
+                    spec.paths.len()
+                )));
+                match ingest_local_mtg_fci(&store_root, &spec) {
+                    Ok((summary, key, hhmm)) => {
+                        send(SatResponse::Note(summary));
+                        send(SatResponse::Runs(scan_runs(&store_root)));
+                        send(SatResponse::SelectFrame { key, hhmm });
+                    }
+                    Err(message) => {
+                        send(SatResponse::Note(format!("MTG FCI failed: {message}")));
+                    }
+                }
+            }
+            SatRequest::LoadLoop(spec) => {
+                if follow_active.swap(true, Ordering::SeqCst) {
+                    send(SatResponse::Note(
+                        "a satellite ingest session is already running".to_string(),
+                    ));
+                    continue;
+                }
+                let mut config = match follow_config(&spec, &store_root) {
+                    Ok(config) => config,
+                    Err(message) => {
+                        follow_active.store(false, Ordering::SeqCst);
+                        send(SatResponse::FollowFinished(Err(message)));
+                        continue;
+                    }
+                };
+                config.max_polls = Some(1);
+                config.max_frames = Some(24);
+                config.poll_interval = Some(Duration::from_secs(1));
+                config.jitter_frac = 0.0;
+                let (model, prefixes) =
+                    run_prefixes(&spec).expect("spec validated by follow_config");
+                cancel.store(false, Ordering::Relaxed);
+                if !send(SatResponse::FollowStarted) {
+                    return;
+                }
+                send(SatResponse::Note(
+                    "GOES loop: loading current-hour frames".to_string(),
+                ));
+                send(SatResponse::DiskUsage(disk_usage(
+                    &store_root,
+                    &model,
+                    &prefixes,
+                )));
+
+                let tx = responses.clone();
+                let thread_notify = Arc::clone(notify);
+                let thread_cancel = Arc::clone(cancel);
+                let active = Arc::clone(&follow_active);
+                let root = store_root.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("rw-sat-loop-load".to_string())
+                    .spawn(move || {
+                        rw_ingest::throttle::set_current_thread_background_priority();
+                        let result = {
+                            let mut current_key: Option<String> = None;
+                            let mut sink = |event: SatEvent| {
+                                let usage_due = matches!(
+                                    event,
+                                    SatEvent::FrameWritten { .. } | SatEvent::Evicted { .. }
+                                );
+                                for response in map_event(event, &mut current_key) {
+                                    let _ = tx.send(response);
+                                }
+                                if usage_due {
+                                    let _ = tx.send(SatResponse::DiskUsage(disk_usage(
+                                        &root, &model, &prefixes,
+                                    )));
+                                }
+                                thread_notify();
+                            };
+                            rw_sat::follow(&config, &mut sink, &thread_cancel)
+                        };
+                        active.store(false, Ordering::SeqCst);
+                        let response = match result {
+                            Ok(summary) => SatResponse::FollowFinished(Ok(format!(
+                                "loop load done - {} frame(s) in {} poll(s)",
+                                summary.frames.len(),
+                                summary.polls
+                            ))),
+                            Err(SatError::Cancelled) => {
+                                SatResponse::FollowFinished(Ok("loop load stopped".to_string()))
+                            }
+                            Err(err) => SatResponse::FollowFinished(Err(err.to_string())),
+                        };
+                        let _ = tx.send(response);
+                        let _ = tx.send(SatResponse::Runs(scan_runs(&root)));
+                        let _ =
+                            tx.send(SatResponse::DiskUsage(disk_usage(&root, &model, &prefixes)));
+                        thread_notify();
+                    });
+                if let Err(err) = spawned {
+                    follow_active.store(false, Ordering::SeqCst);
+                    send(SatResponse::FollowFinished(Err(format!(
+                        "failed to spawn the loop-load thread: {err}"
+                    ))));
                 }
             }
             SatRequest::Follow(spec) => {
@@ -941,6 +1648,82 @@ mod tests {
         let missing = load_frame(&mut state, &dir, &key, 1900);
         assert!(missing.is_err(), "absent frame surfaces an error");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn himawari_bt_uses_dynamic_stretch_for_narrow_warm_ranges() {
+        let values = vec![f32::NAN, 326.0, 327.0, 328.0, 329.0, 330.0];
+        let pixels = render_sat_pixels("ahi_bt_c13", 13, &values, 3, 2, false);
+
+        assert_eq!(pixels[0].a(), 0, "NaN stays transparent");
+        assert!(
+            pixels[1].r() > 200,
+            "cold end of a narrow Himawari BT range is made visible"
+        );
+        assert!(
+            pixels[5].r() < 40,
+            "warm end remains dark for map overlay transparency"
+        );
+    }
+
+    #[test]
+    fn export_display_proof_png_when_env_is_set() {
+        let Some(out) = std::env::var_os("BOWECHO_SAT_PROOF_PNG") else {
+            return;
+        };
+        let store = std::env::var_os("BOWECHO_SAT_PROOF_STORE")
+            .map(PathBuf::from)
+            .expect("BOWECHO_SAT_PROOF_STORE is required when exporting a proof PNG");
+        let model = std::env::var("BOWECHO_SAT_PROOF_MODEL")
+            .expect("BOWECHO_SAT_PROOF_MODEL is required when exporting a proof PNG");
+        let run = std::env::var("BOWECHO_SAT_PROOF_RUN")
+            .expect("BOWECHO_SAT_PROOF_RUN is required when exporting a proof PNG");
+        let hhmm = std::env::var("BOWECHO_SAT_PROOF_HHMM")
+            .expect("BOWECHO_SAT_PROOF_HHMM is required when exporting a proof PNG")
+            .parse::<u16>()
+            .expect("BOWECHO_SAT_PROOF_HHMM must be HHMM");
+
+        let key = SatRunKey { model, run };
+        let mut state = WorkerState::default();
+        let frame = load_frame(&mut state, &store, &key, hhmm).expect("proof frame loads");
+        let mut rgba = Vec::with_capacity(frame.image.pixels.len() * 4);
+        for pixel in frame.image.pixels {
+            rgba.extend_from_slice(&[pixel.r(), pixel.g(), pixel.b(), pixel.a()]);
+        }
+        let image = image::RgbaImage::from_raw(
+            frame.image.size[0] as u32,
+            frame.image.size[1] as u32,
+            rgba,
+        )
+        .expect("proof image dimensions match");
+        if let Some(parent) = PathBuf::from(&out).parent() {
+            std::fs::create_dir_all(parent).expect("proof png parent directory");
+        }
+        image.save(&out).expect("proof png writes");
+    }
+
+    #[test]
+    fn ir_map_overlay_alpha_makes_warm_dark_pixels_transparent() {
+        let mut image = ColorImage::new(
+            [3, 1],
+            vec![
+                Color32::from_rgba_unmultiplied(5, 5, 5, 255),
+                Color32::from_rgba_unmultiplied(120, 120, 120, 255),
+                Color32::from_rgba_unmultiplied(245, 245, 245, 255),
+            ],
+        );
+
+        apply_ir_map_overlay_alpha(&mut image, 13);
+
+        assert_eq!(image.pixels[0].a(), 0, "warm black IR surface clears");
+        assert!(
+            image.pixels[1].a() > 0 && image.pixels[1].a() < image.pixels[2].a(),
+            "middle cloud shade is semi-transparent"
+        );
+        assert!(
+            image.pixels[2].a() > 200,
+            "cold bright cloud top stays visible"
+        );
     }
 
     #[test]

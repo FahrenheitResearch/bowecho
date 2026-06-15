@@ -38,6 +38,8 @@ pub const OUTLOOK_KINDS: [(&str, &str); 4] = [
     ("hail", "Hail %"),
 ];
 
+pub const ESTOFEX_OUTLOOK_KIND: &str = "estofex";
+
 pub struct OutlookFeature {
     pub label: String,
     #[allow(dead_code)] // long name for the hover card
@@ -46,9 +48,9 @@ pub struct OutlookFeature {
     /// style registry's outlook alphas.
     pub fill: egui::Color32,
     pub stroke: egui::Color32,
-    /// Raw PTS point lists can be open "to the right of a line" outlines.
-    /// They may be useful as an early release signal, but they are not
-    /// always safe to fill as closed polygons.
+    /// True when the ring is safe to fill as a polygon. SPC GeoJSON and
+    /// ESTOFEX XML are closed. Raw PTS rings are closed during parsing when
+    /// used as the fast live fallback.
     pub fill_enabled: bool,
     /// Outer rings, (lon, lat).
     pub rings: Vec<Vec<(f32, f32)>>,
@@ -454,8 +456,8 @@ impl PtsFeatureBuilder {
     }
 
     fn finish_ring(&mut self) {
-        if self.current.len() >= 3 {
-            self.rings.push(std::mem::take(&mut self.current));
+        if let Some(ring) = close_pts_ring(std::mem::take(&mut self.current)) {
+            self.rings.push(ring);
         } else {
             self.current.clear();
         }
@@ -472,16 +474,37 @@ impl PtsFeatureBuilder {
             label: self.label,
             fill,
             stroke,
-            fill_enabled: false,
+            fill_enabled: true,
             rings: self.rings,
         })
     }
 }
 
-/// Parse raw SPC PTS point blocks. This is intentionally not used for
-/// normal map rendering yet: PTS files are excellent release tripwires, but
-/// some outlines are "to the right of a line" products that need coastline
-/// or border closure before they are safe filled polygons.
+fn close_pts_ring(mut ring: Vec<(f32, f32)>) -> Option<Vec<(f32, f32)>> {
+    if ring.len() < 3 {
+        return None;
+    }
+    ring.dedup_by(|left, right| {
+        (left.0 - right.0).abs() < 0.001 && (left.1 - right.1).abs() < 0.001
+    });
+    if ring.len() < 3 {
+        return None;
+    }
+    let needs_close = ring
+        .first()
+        .zip(ring.last())
+        .map(|(first, last)| (first.0 - last.0).abs() > 0.001 || (first.1 - last.1).abs() > 0.001)
+        .unwrap_or(false);
+    if needs_close {
+        ring.push(ring[0]);
+    }
+    Some(ring)
+}
+
+/// Parse raw SPC PTS point blocks. This is the fast live path: PTS products
+/// usually appear before SPC's direct GeoJSON. `99999999` splits separate
+/// rings, and each ring is closed before drawing so the layer can be filled
+/// until the official GeoJSON catches up.
 pub fn parse_pts_outlook(text: &str, kind: &str) -> Vec<OutlookFeature> {
     let Some(section_name) = pts_section_name(kind) else {
         return Vec::new();
@@ -524,6 +547,107 @@ pub fn parse_pts_outlook(text: &str, kind: &str) -> Vec<OutlookFeature> {
         out.push(feature);
     }
     out
+}
+
+fn estofex_colors(label: &str) -> (egui::Color32, egui::Color32) {
+    match label {
+        "EU L1" => (hex_color("#FFE066"), hex_color("#DDAA00")),
+        "EU L2" => (hex_color("#FF9F40"), hex_color("#E06A00")),
+        "EU L3" => (hex_color("#FF6666"), hex_color("#CC0000")),
+        "EU TSTM15" => (hex_color("#78D8FF"), hex_color("#1798C8")),
+        "EU TSTM50" => (hex_color("#3B8CFF"), hex_color("#0063C7")),
+        _ => (egui::Color32::from_rgb(160, 160, 160), egui::Color32::WHITE),
+    }
+}
+
+fn estofex_label(risktype: &str) -> Option<(&'static str, &'static str)> {
+    match risktype.trim().to_ascii_lowercase().as_str() {
+        "level 1" => Some(("EU L1", "ESTOFEX Level 1")),
+        "level 2" => Some(("EU L2", "ESTOFEX Level 2")),
+        "level 3" => Some(("EU L3", "ESTOFEX Level 3")),
+        "15thunder" => Some(("EU TSTM15", "ESTOFEX 15% thunder")),
+        "50thunder" => Some(("EU TSTM50", "ESTOFEX 50% thunder")),
+        _ => None,
+    }
+}
+
+fn attr_value(event: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
+    event.attributes().flatten().find_map(|attr| {
+        (attr.key.as_ref() == key)
+            .then(|| {
+                attr.decode_and_unescape_value(event.decoder())
+                    .ok()
+                    .map(|value| value.into_owned())
+            })
+            .flatten()
+    })
+}
+
+struct EstofexAreaBuilder {
+    label: String,
+    label2: String,
+    ring: Vec<(f32, f32)>,
+}
+
+pub fn parse_estofex_outlook_xml(text: &str) -> Vec<OutlookFeature> {
+    use quick_xml::events::Event;
+
+    let mut reader = quick_xml::Reader::from_str(text);
+    reader.config_mut().trim_text(true);
+    let mut current: Option<EstofexAreaBuilder> = None;
+    let mut out = Vec::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(event)) if event.name().as_ref() == b"area" => {
+                current = attr_value(&event, b"risktype").and_then(|risk| {
+                    let (label, label2) = estofex_label(&risk)?;
+                    Some(EstofexAreaBuilder {
+                        label: label.to_owned(),
+                        label2: label2.to_owned(),
+                        ring: Vec::new(),
+                    })
+                });
+            }
+            Ok(Event::Empty(event)) if event.name().as_ref() == b"point" => {
+                if let Some(area) = current.as_mut() {
+                    let lat =
+                        attr_value(&event, b"lat").and_then(|value| value.parse::<f32>().ok());
+                    let lon =
+                        attr_value(&event, b"lon").and_then(|value| value.parse::<f32>().ok());
+                    if let (Some(lat), Some(lon)) = (lat, lon) {
+                        area.ring.push((lon, lat));
+                    }
+                }
+            }
+            Ok(Event::End(event)) if event.name().as_ref() == b"area" => {
+                if let Some(area) = current.take()
+                    && let Some(ring) = close_pts_ring(area.ring)
+                {
+                    let (fill, stroke) = estofex_colors(&area.label);
+                    out.push(OutlookFeature {
+                        label: area.label,
+                        label2: area.label2,
+                        fill,
+                        stroke,
+                        fill_enabled: true,
+                        rings: vec![ring],
+                    });
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    out
+}
+
+fn fetch_estofex_outlooks() -> Vec<OutlookFeature> {
+    data_source::fetch_text("https://www.estofex.org/cgi-bin/polygon/showforecast.cgi?xml=yes")
+        .map(|text| parse_estofex_outlook_xml(&text))
+        .unwrap_or_default()
 }
 
 /// The SPC convective day containing `when`: report days run 12Z -> 12Z
@@ -900,7 +1024,13 @@ pub fn fetch_spc(
         ..Default::default()
     };
     let now = Utc::now();
-    let live_pts = if archive_date.is_none() && !outlook_kinds.is_empty() {
+    let spc_kinds: Vec<&str> = outlook_kinds
+        .iter()
+        .copied()
+        .filter(|kind| *kind != ESTOFEX_OUTLOOK_KIND)
+        .collect();
+    let wants_estofex = outlook_kinds.contains(&ESTOFEX_OUTLOOK_KIND);
+    let live_pts = if archive_date.is_none() && !spc_kinds.is_empty() {
         live_pts_url(day).and_then(|url| data_source::fetch_text(url).ok())
     } else {
         None
@@ -910,7 +1040,8 @@ pub fn fetch_spc(
         .and_then(|text| pts_issue_time(text, now));
     let mut latest_geojson_issue: Option<DateTime<Utc>> = None;
     let mut missing_geojson_outlook = false;
-    for kind in outlook_kinds {
+    for kind in &spc_kinds {
+        let kind = *kind;
         let text = match archive_date {
             None => live_outlook_urls(day, kind, now)
                 .into_iter()
@@ -970,15 +1101,18 @@ pub fn fetch_spc(
                         pts_issue - geojson_issue > Duration::minutes(10)
                     })
                     .unwrap_or(false);
-            let mut features = parse_outlook(&text);
             if overlay_pts {
                 let pts_features = live_pts
                     .as_deref()
                     .map(|pts_text| parse_pts_outlook(pts_text, kind))
                     .unwrap_or_default();
-                features.extend(pts_features);
+                if !pts_features.is_empty() {
+                    data.outlooks.push((kind.to_owned(), pts_features));
+                    continue;
+                }
             }
-            data.outlooks.push(((*kind).to_owned(), features));
+            let features = parse_outlook(&text);
+            data.outlooks.push((kind.to_owned(), features));
         } else {
             missing_geojson_outlook = true;
             if archive_date.is_none() {
@@ -987,13 +1121,20 @@ pub fn fetch_spc(
                     .map(|pts_text| parse_pts_outlook(pts_text, kind))
                     .unwrap_or_default();
                 if !pts_features.is_empty() {
-                    data.outlooks.push(((*kind).to_owned(), pts_features));
+                    data.outlooks.push((kind.to_owned(), pts_features));
                 }
             }
         }
     }
+    if wants_estofex {
+        let estofex = fetch_estofex_outlooks();
+        if !estofex.is_empty() {
+            data.outlooks
+                .push((ESTOFEX_OUTLOOK_KIND.to_owned(), estofex));
+        }
+    }
     data.outlook_geojson_lagging = archive_date.is_none()
-        && !outlook_kinds.is_empty()
+        && !spc_kinds.is_empty()
         && live_pts_issue
             .map(|pts_issue| {
                 missing_geojson_outlook
@@ -1059,8 +1200,8 @@ THERE IS A MARGINAL RISK OF SVR TSTMS...\n";
         assert_eq!(parsed[0].rings.len(), 1);
         assert_eq!(parsed[1].label, "TSTM");
         assert_eq!(parsed[1].rings.len(), 2);
-        assert!(!parsed[1].fill_enabled);
-        assert_ne!(parsed[1].rings[0].first(), parsed[1].rings[0].last());
+        assert!(parsed[1].fill_enabled);
+        assert_eq!(parsed[1].rings[0].first(), parsed[1].rings[0].last());
         // 31641340 is 31.64N, 113.40W. PTS omits the leading "1" west
         // of 100W, so this catches the common raw-PTS longitude trap.
         assert_eq!(parsed[1].rings[0][0], (-113.40, 31.64));
@@ -1087,6 +1228,51 @@ PROBABILISTIC OUTLOOK POINTS DAY 3\n\
         assert_eq!(parsed[0].label, "0.05");
         assert_eq!(parsed[0].label2, "5% Wind Risk");
         assert_eq!(parsed[1].label, "0.15");
+    }
+
+    #[test]
+    fn parses_estofex_xml_areas() {
+        let sample = r#"
+<forecast>
+  <area risktype="level 2">
+    <point lat="45.2" lon="20.7"/>
+    <point lat="44.8" lon="20.3"/>
+    <point lat="44.7" lon="19.5"/>
+  </area>
+  <area risktype="15thunder">
+    <point lat="56.1" lon="21.4"/>
+    <point lat="57.6" lon="21.8"/>
+    <point lat="59.0" lon="23.5"/>
+  </area>
+  <area risktype="severe storms unlikely"></area>
+</forecast>
+"#;
+        let parsed = parse_estofex_outlook_xml(sample);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].label, "EU L2");
+        assert_eq!(parsed[0].label2, "ESTOFEX Level 2");
+        assert!(parsed[0].fill_enabled);
+        assert_eq!(parsed[0].rings[0].first(), parsed[0].rings[0].last());
+        assert_eq!(parsed[1].label, "EU TSTM15");
+    }
+
+    #[test]
+    #[ignore = "network: fetches live SPC raw PTS and ESTOFEX XML"]
+    fn live_outlook_sources_parse_smoke() {
+        let pts = data_source::fetch_text(live_pts_url(1).unwrap()).expect("SPC PTS fetch");
+        assert!(
+            !parse_pts_outlook(&pts, "cat").is_empty(),
+            "current SPC PTS categorical outlook should parse"
+        );
+        let estofex = data_source::fetch_text(
+            "https://www.estofex.org/cgi-bin/polygon/showforecast.cgi?xml=yes",
+        )
+        .expect("ESTOFEX XML fetch");
+        assert!(
+            estofex.contains("<forecast"),
+            "ESTOFEX endpoint should return forecast XML"
+        );
+        parse_estofex_outlook_xml(&estofex);
     }
 
     #[test]

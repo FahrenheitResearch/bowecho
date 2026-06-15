@@ -32,6 +32,20 @@ impl InverseLut {
     /// Build from the grid's lat/lon arrays (~a second for CONUS HRRR;
     /// run on a background thread).
     pub fn build(lat: &[f32], lon: &[f32]) -> Option<Self> {
+        Self::build_inner(lat, lon, None)
+    }
+
+    /// Build from a shaped lat/lon grid. Satellite grids can be strongly
+    /// curvilinear, so estimate spacing from real row/column neighbors
+    /// instead of only 1D consecutive samples.
+    pub fn build_with_shape(lat: &[f32], lon: &[f32], nx: usize, ny: usize) -> Option<Self> {
+        if nx == 0 || ny == 0 || nx.saturating_mul(ny) != lat.len() || lat.len() != lon.len() {
+            return Self::build(lat, lon);
+        }
+        Self::build_inner(lat, lon, Some((nx, ny)))
+    }
+
+    fn build_inner(lat: &[f32], lon: &[f32], shape: Option<(usize, usize)>) -> Option<Self> {
         let mut lat_min = f32::INFINITY;
         let mut lat_max = f32::NEG_INFINITY;
         let mut lon_min = f32::INFINITY;
@@ -52,20 +66,10 @@ impl InverseLut {
         // sample, which the fill passes close. Median of non-degenerate
         // consecutive steps — row-wrap jumps (tens of degrees between the
         // end of one row and the start of the next) are filtered out.
-        let mut steps: Vec<f32> = Vec::with_capacity(4096);
-        for source in [lat, lon] {
-            for pair in source.windows(2).take(4096) {
-                if pair[0].is_finite() && pair[1].is_finite() {
-                    let step = (pair[1] - pair[0]).abs();
-                    if step > 1e-6 && step < 2.0 {
-                        steps.push(step);
-                    }
-                }
-            }
-        }
-        steps.sort_by(f32::total_cmp);
-        let spacing = steps.get(steps.len() / 2).copied().unwrap_or(MIN_BIN_DEG);
-        let bin = (spacing * 1.1).max(MIN_BIN_DEG);
+        let spacing = shape
+            .and_then(|(nx, ny)| shaped_grid_spacing(lat, lon, nx, ny))
+            .unwrap_or_else(|| consecutive_spacing(lat, lon).unwrap_or(MIN_BIN_DEG));
+        let bin = (spacing * if shape.is_some() { 1.25 } else { 1.1 }).max(MIN_BIN_DEG);
         let width = (((lon_max - lon_min) / bin).ceil() as usize + 1).min(8192);
         let height = (((lat_max - lat_min) / bin).ceil() as usize + 1).min(8192);
         let mut index = vec![u32::MAX; width * height];
@@ -132,6 +136,63 @@ impl InverseLut {
     }
 }
 
+fn consecutive_spacing(lat: &[f32], lon: &[f32]) -> Option<f32> {
+    let mut steps: Vec<f32> = Vec::with_capacity(4096);
+    for source in [lat, lon] {
+        for pair in source.windows(2).take(4096) {
+            if pair[0].is_finite() && pair[1].is_finite() {
+                let step = (pair[1] - pair[0]).abs();
+                if step > 1e-6 && step < 2.0 {
+                    steps.push(step);
+                }
+            }
+        }
+    }
+    percentile_step(steps, 0.5)
+}
+
+fn shaped_grid_spacing(lat: &[f32], lon: &[f32], nx: usize, ny: usize) -> Option<f32> {
+    let mut steps: Vec<f32> = Vec::with_capacity(8192);
+    let step_x = (nx / 96).max(1);
+    let step_y = (ny / 96).max(1);
+    for y in (0..ny).step_by(step_y) {
+        for x in (0..nx.saturating_sub(1)).step_by(step_x) {
+            push_neighbor_step(&mut steps, lat, lon, y * nx + x, y * nx + x + 1);
+        }
+    }
+    for y in (0..ny.saturating_sub(1)).step_by(step_y) {
+        for x in (0..nx).step_by(step_x) {
+            push_neighbor_step(&mut steps, lat, lon, y * nx + x, (y + 1) * nx + x);
+        }
+    }
+    percentile_step(steps, 0.75)
+}
+
+fn push_neighbor_step(steps: &mut Vec<f32>, lat: &[f32], lon: &[f32], a: usize, b: usize) {
+    let (lat_a, lon_a, lat_b, lon_b) = (lat[a], lon[a], lat[b], lon[b]);
+    if !lat_a.is_finite() || !lon_a.is_finite() || !lat_b.is_finite() || !lon_b.is_finite() {
+        return;
+    }
+    let step = (lat_a - lat_b).abs().max(wrapped_lon_delta(lon_a, lon_b));
+    if step > 1e-5 && step < 5.0 {
+        steps.push(step);
+    }
+}
+
+fn wrapped_lon_delta(a: f32, b: f32) -> f32 {
+    let raw = (a - b).abs().rem_euclid(360.0);
+    raw.min(360.0 - raw)
+}
+
+fn percentile_step(mut steps: Vec<f32>, percentile: f32) -> Option<f32> {
+    if steps.is_empty() {
+        return None;
+    }
+    steps.sort_by(f32::total_cmp);
+    let index = ((steps.len() - 1) as f32 * percentile.clamp(0.0, 1.0)).round() as usize;
+    steps.get(index).copied()
+}
+
 /// The active model map layer: a field + its inverse LUT + display params.
 pub struct ModelMapLayer {
     pub field: Arc<FieldData>,
@@ -173,5 +234,37 @@ mod tests {
         }
         // Far outside: None.
         assert!(lut.lookup(50.0, -80.0).is_none());
+    }
+
+    #[test]
+    fn shaped_lut_uses_row_column_spacing_for_curvilinear_grids() {
+        let (nx, ny) = (120usize, 80usize);
+        let mut lat = Vec::with_capacity(nx * ny);
+        let mut lon = Vec::with_capacity(nx * ny);
+        for y in 0..ny {
+            for x in 0..nx {
+                let yf = y as f32;
+                let xf = x as f32;
+                lat.push(5.0 + yf * 0.16 + (xf * 0.05).sin() * 0.01);
+                lon.push(55.0 + xf * 0.18 + yf * 0.015);
+            }
+        }
+
+        let spacing = shaped_grid_spacing(&lat, &lon, nx, ny).expect("spacing");
+        assert!(
+            spacing > 0.12,
+            "shape-aware spacing should follow grid cells, got {spacing}"
+        );
+
+        let lut = InverseLut::build_with_shape(&lat, &lon, nx, ny).expect("lut");
+        let midpoint = |a: usize, b: usize, c: usize, d: usize, values: &[f32]| {
+            (values[a] + values[b] + values[c] + values[d]) * 0.25
+        };
+        let x = 47;
+        let y = 31;
+        let i = y * nx + x;
+        let query_lat = midpoint(i, i + 1, i + nx, i + nx + 1, &lat);
+        let query_lon = midpoint(i, i + 1, i + nx, i + nx + 1, &lon);
+        assert!(lut.lookup(query_lat, query_lon).is_some());
     }
 }

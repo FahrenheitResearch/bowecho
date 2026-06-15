@@ -1132,6 +1132,9 @@ struct ViewerApp {
     sat_panel: rw_ui::SatellitePanel,
     sat_player: rw_ui::SatPlayerPanel,
     show_satellite: bool,
+    himawari_band: u8,
+    eumetsat_consumer_key: String,
+    eumetsat_consumer_secret: String,
     /// In-app Guide window (reference docs, opened on demand — never forced).
     show_guide: bool,
     /// Session marker for the last workflow preset the user applied. It is
@@ -1161,6 +1164,13 @@ struct ViewerApp {
     sat_layer_generation: u64,
     /// Last frame shown in the sat player (the "Show on map" source).
     sat_last_frame: Option<(rw_ui::SatRunKey, u16)>,
+    /// Sticky mode: satellite player play/scrub changes refresh the radar-map
+    /// satellite layer too, not just the side-panel preview.
+    sat_map_follow: bool,
+    /// One map-frame worker request at a time; playback replaces this with
+    /// the newest requested frame while the worker/layer build is busy.
+    sat_map_inflight: Option<(rw_ui::SatRunKey, u16)>,
+    sat_map_pending: Option<(rw_ui::SatRunKey, u16)>,
     /// Model fields rendered as radar-map layers (under the radar), in
     /// draw order. Multiple fields stack (e.g. CAPE under wind under
     /// radar); each slot owns its texture + render channel.
@@ -2312,6 +2322,8 @@ type NativeSoundingReceiver =
 /// geolocation (same world-anchored draw as the model layer; sat sits
 /// UNDER the model layer and radar).
 struct SatMapLayer {
+    key: rw_ui::SatRunKey,
+    hhmm: u16,
     image: Arc<egui::ColorImage>,
     lut: Arc<model_layer::InverseLut>,
     nx: usize,
@@ -4213,6 +4225,9 @@ impl ViewerApp {
             sat_panel: rw_ui::SatellitePanel::new(rw_ui::SatFollowSpec::default()),
             sat_player: rw_ui::SatPlayerPanel::new(),
             show_satellite: false,
+            himawari_band: 13,
+            eumetsat_consumer_key: String::new(),
+            eumetsat_consumer_secret: String::new(),
             show_guide: false,
             current_workflow: None,
             previous_workflow_snapshot: None,
@@ -4227,6 +4242,9 @@ impl ViewerApp {
             sat_layer_render_rx: None,
             sat_layer_generation: 0,
             sat_last_frame: None,
+            sat_map_follow: false,
+            sat_map_inflight: None,
+            sat_map_pending: None,
             model_layers: Vec::new(),
             model_layer_build_rx: None,
             model_layer_generation: 0,
@@ -14251,8 +14269,19 @@ impl ViewerApp {
 
         // SPC OUTLOOKS — config consolidated here from the layer rail (spec
         // §1 SEVERE table); the rail's SPC rows' ⚙ jumps to this section.
-        self.remembered_section(ui, "severe_spc_outlooks", "SPC outlooks", true, |app, ui| {
+        self.remembered_section(ui, "severe_spc_outlooks", "Outlooks", true, |app, ui| {
             let mut changed = false;
+            let mut estofex_on = app
+                .spc_outlooks_enabled
+                .iter()
+                .any(|k| k == spc_layers::ESTOFEX_OUTLOOK_KIND);
+            let estofex_count = app
+                .spc_data
+                .outlooks
+                .iter()
+                .find(|(kind, _)| kind == spc_layers::ESTOFEX_OUTLOOK_KIND)
+                .map(|(_, features)| features.len())
+                .unwrap_or(0);
             ui.horizontal(|ui| {
                 ui.label("Day").on_hover_text(
                     "Outlook day (archive-aware: an archive loop shows THAT day's outlook)",
@@ -14299,12 +14328,58 @@ impl ViewerApp {
                 {
                     changed = true;
                 }
+                if ui
+                    .checkbox(&mut estofex_on, "ESTOFEX Europe")
+                    .on_hover_text(
+                        "Current ESTOFEX European Storm Forecast Experiment outlook from the live XML feed",
+                    )
+                    .changed()
+                {
+                    if estofex_on {
+                        app.spc_outlooks_enabled
+                            .push(spc_layers::ESTOFEX_OUTLOOK_KIND.to_owned());
+                    } else {
+                        app.spc_outlooks_enabled
+                            .retain(|k| k != spc_layers::ESTOFEX_OUTLOOK_KIND);
+                    }
+                    changed = true;
+                }
+                if fixed_action_button(ui, "Center Europe", 108.0)
+                    .on_hover_text("Jump to a Europe overview so ESTOFEX polygons are visible")
+                    .clicked()
+                {
+                    app.center_map_on(50.5, 12.0);
+                    app.map_scale = 22.0;
+                    app.status = "Centered map on Europe for ESTOFEX".to_owned();
+                    ui.ctx().request_repaint();
+                }
             });
+            if estofex_on {
+                let status = if app.spc_rx.is_some() {
+                    "ESTOFEX: fetching live XML".to_owned()
+                } else if estofex_count > 0 {
+                    format!("ESTOFEX: {estofex_count} areas loaded - use Center Europe if the map is over the U.S.")
+                } else if app.spc_data.fetched_at.is_some() {
+                    "ESTOFEX: no areas returned by the current XML feed".to_owned()
+                } else {
+                    "ESTOFEX: waiting for the next outlook fetch".to_owned()
+                };
+                ui.weak(status);
+            }
             if changed {
                 if !app.spc_outlooks_enabled.is_empty() {
                     app.spc_kinds_memory = app.spc_outlooks_enabled.clone();
                 }
                 app.spc_data.fetched_at = None; // force refetch
+                app.status = if app
+                    .spc_outlooks_enabled
+                    .iter()
+                    .any(|k| k == spc_layers::ESTOFEX_OUTLOOK_KIND)
+                {
+                    "Fetching outlooks with ESTOFEX".to_owned()
+                } else {
+                    "Fetching SPC outlooks".to_owned()
+                };
                 app.save_overlay_defaults();
                 ui.ctx().request_repaint();
             }
@@ -15227,6 +15302,11 @@ impl ViewerApp {
             } else {
                 format!("Rendering {model_renders} model layers")
             }));
+        }
+        if self.sat_map_inflight.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                "Loading satellite map frame",
+            ));
         }
         if self.sat_layer_build_rx.is_some() {
             return Some(BackgroundActivity::indeterminate(
@@ -18469,9 +18549,8 @@ impl ViewerApp {
         });
     }
 
-    /// GOES satellite window: follow-engine control panel + frame player,
-    /// wired to the ported rw-sat worker (host pattern mirrors
-    /// rusty-weather-ui; the rolling store is shared with it on disk).
+    /// Satellite window: GOES live-follow plus non-GOES ingest/discovery
+    /// actions, all writing into BowEcho's own rolling satellite store.
     fn satellite_window(&mut self, ctx: &egui::Context) {
         if !self.show_satellite {
             return;
@@ -18505,8 +18584,8 @@ impl ViewerApp {
         }
         let mut open = self.show_satellite;
         let mut events = (Vec::new(), Vec::new());
-        egui::Window::new("Satellite (GOES)")
-            .id(egui::Id::new("bowecho_satellite_goes_window"))
+        egui::Window::new("Satellite")
+            .id(egui::Id::new("bowecho_satellite_window"))
             .open(&mut open)
             .default_size([900.0, 700.0])
             .min_size([520.0, 400.0])
@@ -18528,26 +18607,300 @@ impl ViewerApp {
         ui: &mut egui::Ui,
     ) -> (Vec<rw_ui::SatelliteEvent>, Vec<rw_ui::SatPlayerEvent>) {
         let mut panel_events = Vec::new();
-        egui::CollapsingHeader::new("Live follow")
+        let mut load_goes_loop = false;
+        egui::CollapsingHeader::new("GOES live follow")
             .default_open(true)
             .show(ui, |ui| {
                 panel_events = self.sat_panel.ui(ui);
+                if fixed_action_button(ui, "Load loop", 82.0)
+                    .on_hover_text(
+                        "One-shot current-hour GOES ingest for the selected satellite/sector/layer, then play it in the frame player.",
+                    )
+                    .clicked()
+                {
+                    load_goes_loop = true;
+                }
             });
+        if load_goes_loop && let Some(sat) = &self.sat {
+            self.status = "Satellite: loading GOES loop".to_owned();
+            self.sat_panel
+                .apply_note("GOES loop: queued current-hour ingest".to_string());
+            sat.send(sat_worker::SatRequest::LoadLoop(
+                self.sat_panel.spec().clone(),
+            ));
+        }
         ui.separator();
-        if self.sat_last_frame.is_some()
-            && ui
-                .button("Show on radar map")
-                .on_hover_text(SATELLITE_MAP_LAYER_HOVER)
-                .clicked()
-            && let (Some(sat), Some((key, hhmm))) = (&self.sat, &self.sat_last_frame)
-        {
-            sat.send(sat_worker::SatRequest::LoadFrameForMap {
-                key: key.clone(),
-                hhmm: *hhmm,
+        let mut load_himawari = false;
+        let mut discover_mtg_fci = false;
+        let mut check_mtg_auth = false;
+        let mut download_mtg_fci = false;
+        let mut mtg_fci_paths: Option<Vec<PathBuf>> = None;
+        const HIMAWARI_IR_BANDS: &[(u8, &str)] = &[
+            (7, "B07 Shortwave IR 3.9"),
+            (8, "B08 Upper WV 6.2"),
+            (9, "B09 Mid WV 6.9"),
+            (10, "B10 Low WV 7.3"),
+            (11, "B11 Cloud-top IR 8.6"),
+            (12, "B12 Ozone 9.6"),
+            (13, "B13 Clean IR 10.4"),
+            (14, "B14 Longwave IR 11.2"),
+            (15, "B15 Dirty IR 12.3"),
+            (16, "B16 CO2 IR 13.3"),
+        ];
+        let selected_himawari_label = HIMAWARI_IR_BANDS
+            .iter()
+            .find(|(band, _)| *band == self.himawari_band)
+            .map(|(_, label)| *label)
+            .unwrap_or("B13 Clean IR 10.4");
+        let eumetsat_env_ready = std::env::var_os("EUMETSAT_CONSUMER_KEY").is_some()
+            && std::env::var_os("EUMETSAT_CONSUMER_SECRET").is_some();
+        egui::CollapsingHeader::new("Other satellite sources")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("H9");
+                    egui::ComboBox::from_id_salt("himawari_ir_band")
+                        .selected_text(selected_himawari_label)
+                        .width(150.0)
+                        .show_ui(ui, |ui| {
+                            for &(band, label) in HIMAWARI_IR_BANDS {
+                                ui.selectable_value(&mut self.himawari_band, band, label);
+                            }
+                        });
+                    if fixed_action_button(ui, "Load Full", 84.0)
+                        .on_hover_text(
+                            "Download/decode all latest Himawari-9 full-disk segments for the selected IR/WV band",
+                        )
+                        .clicked()
+                    {
+                        load_himawari = true;
+                    }
+                    if fixed_action_button(ui, "MTG FCI Discover", 116.0)
+                        .on_hover_text(
+                            "Search public EUMETSAT OpenSearch for recent MTG FCI product IDs; this does not download account-gated bytes",
+                        )
+                        .clicked()
+                    {
+                        discover_mtg_fci = true;
+                    }
+                    if fixed_action_button(ui, "MTG Auth Check", 120.0)
+                        .on_hover_text(
+                            "Request an EUMETSAT token from EUMETSAT_CONSUMER_KEY / EUMETSAT_CONSUMER_SECRET in this app process. Secrets are not saved.",
+                        )
+                        .clicked()
+                    {
+                        check_mtg_auth = true;
+                    }
+                    if fixed_action_button(ui, "MTG Download", 112.0)
+                        .on_hover_text(
+                            "Use EUMETSAT credentials to download the newest MTG FCI L1c package, unpack NetCDF body files, decode IR 10.5, and select the stored frame.",
+                        )
+                        .clicked()
+                    {
+                        download_mtg_fci = true;
+                    }
+                    if fixed_action_button(ui, "Open MTG FCI...", 112.0)
+                        .on_hover_text(
+                            "Decode local MTG FCI CHK-BODY NetCDF file(s) into the satellite store",
+                        )
+                        .clicked()
+                        && let Some(paths) = rfd::FileDialog::new()
+                            .add_filter("MTG FCI NetCDF", &["nc"])
+                            .add_filter("HDF5/NetCDF", &["h5", "hdf5", "nc"])
+                            .pick_files()
+                    {
+                        mtg_fci_paths = Some(paths);
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("EUMETSAT");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.eumetsat_consumer_key)
+                            .hint_text("consumer key")
+                            .password(true)
+                            .desired_width(150.0),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.eumetsat_consumer_secret)
+                            .hint_text("consumer secret")
+                            .password(true)
+                            .desired_width(170.0),
+                    );
+                    if fixed_action_button(ui, "Clear", 52.0)
+                        .on_hover_text("Clear session-only EUMETSAT credentials from this app run")
+                        .clicked()
+                    {
+                        self.eumetsat_consumer_key.clear();
+                        self.eumetsat_consumer_secret.clear();
+                    }
+                });
+                let session_ready = !self.eumetsat_consumer_key.trim().is_empty()
+                    && !self.eumetsat_consumer_secret.trim().is_empty();
+                let auth_status = if eumetsat_env_ready {
+                    "EUMETSAT env: key+secret present"
+                } else if session_ready {
+                    "EUMETSAT session: key+secret entered"
+                } else {
+                    "EUMETSAT: missing key/secret"
+                };
+                ui.weak(auth_status).on_hover_text(
+                    "Paste credentials here for this run, or set EUMETSAT_CONSUMER_KEY and EUMETSAT_CONSUMER_SECRET before launching BowEcho. Secrets are not saved.",
+                );
+                ui.weak("GOES follows live continuously. Himawari and MTG actions write real gridded frames into the same player/store.");
             });
+        if let Some(sat) = &self.sat {
+            if load_himawari {
+                let band = self.himawari_band.clamp(7, 16);
+                self.status = format!("Satellite: loading latest Himawari-9 B{band:02}");
+                self.sat_panel.apply_note(format!(
+                    "Himawari: queued latest H9 B{band:02} full-disk ingest"
+                ));
+                let spec = sat_worker::HimawariQuickSpec {
+                    band,
+                    ..sat_worker::HimawariQuickSpec::default()
+                };
+                sat.send(sat_worker::SatRequest::IngestLatestHimawari(spec));
+            }
+            if discover_mtg_fci {
+                self.status = "Satellite: searching MTG FCI".to_owned();
+                self.sat_panel
+                    .apply_note("MTG: queued public FCI discovery".to_string());
+                sat.send(sat_worker::SatRequest::DiscoverMtg {
+                    collection: "fci-l1c".to_string(),
+                    minutes: 720,
+                    count: 5,
+                });
+            }
+            if check_mtg_auth {
+                self.status = "Satellite: checking EUMETSAT credentials".to_owned();
+                self.sat_panel
+                    .apply_note("EUMETSAT: queued auth check".to_string());
+                let session_credentials = (
+                    self.eumetsat_consumer_key.trim().to_owned(),
+                    self.eumetsat_consumer_secret.trim().to_owned(),
+                );
+                let (consumer_key, consumer_secret) =
+                    if session_credentials.0.is_empty() || session_credentials.1.is_empty() {
+                        (None, None)
+                    } else {
+                        (Some(session_credentials.0), Some(session_credentials.1))
+                    };
+                sat.send(sat_worker::SatRequest::CheckMtgAuth {
+                    validity_secs: 3600,
+                    consumer_key,
+                    consumer_secret,
+                });
+            }
+            if download_mtg_fci {
+                self.status = "Satellite: downloading latest MTG FCI".to_owned();
+                self.sat_panel
+                    .apply_note("MTG FCI: queued credentialed latest download".to_string());
+                let session_credentials = (
+                    self.eumetsat_consumer_key.trim().to_owned(),
+                    self.eumetsat_consumer_secret.trim().to_owned(),
+                );
+                let (consumer_key, consumer_secret) =
+                    if session_credentials.0.is_empty() || session_credentials.1.is_empty() {
+                        (None, None)
+                    } else {
+                        (Some(session_credentials.0), Some(session_credentials.1))
+                    };
+                sat.send(sat_worker::SatRequest::DownloadLatestMtgFci(
+                    sat_worker::MtgFciDownloadSpec {
+                        collection: "fci-l1c".to_string(),
+                        minutes: 720,
+                        channel: "ir_105".to_string(),
+                        value: "brightness-temp".to_string(),
+                        downsample: 8,
+                        consumer_key,
+                        consumer_secret,
+                    },
+                ));
+            }
+            if let Some(paths) = mtg_fci_paths {
+                self.status = format!("Satellite: decoding {} MTG FCI file(s)", paths.len());
+                self.sat_panel
+                    .apply_note(format!("MTG FCI: queued {} local file(s)", paths.len()));
+                sat.send(sat_worker::SatRequest::IngestMtgFciLocal(
+                    sat_worker::MtgFciLocalSpec {
+                        paths,
+                        channel: "ir_105".to_string(),
+                        value: "brightness-temp".to_string(),
+                        downsample: 8,
+                    },
+                ));
+            }
+        }
+        ui.separator();
+        if self.sat_last_frame.is_some() || self.sat_layer.is_some() {
+            let mut map_request: Option<(rw_ui::SatRunKey, u16)> = None;
+            let frame_available = self.sat_last_frame.is_some();
+            let button_label = if self.sat_layer.is_some() {
+                "Refresh map frame"
+            } else {
+                "Show on radar map"
+            };
+            ui.horizontal_wrapped(|ui| {
+                let follow_was_enabled = self.sat_map_follow;
+                if ui
+                    .add_enabled(
+                        frame_available,
+                        egui::Checkbox::new(&mut self.sat_map_follow, "Map follows player"),
+                    )
+                    .on_hover_text(
+                        "When enabled, satellite play/scrub changes update the radar-map satellite layer too.",
+                    )
+                    .changed()
+                    && self.sat_map_follow
+                    && !follow_was_enabled
+                {
+                    map_request = self.sat_last_frame.clone();
+                }
+                if ui
+                    .add_enabled(frame_available, egui::Button::new(button_label))
+                    .on_hover_text(SATELLITE_MAP_LAYER_HOVER)
+                    .clicked()
+                {
+                    self.sat_map_follow = true;
+                    map_request = self.sat_last_frame.clone();
+                }
+                if let Some(layer) = &mut self.sat_layer {
+                    ui.checkbox(&mut layer.visible, "show");
+                    ui.weak(format!("{} {:04}Z", layer.key, layer.hhmm));
+                }
+            });
+            if let Some((key, hhmm)) = map_request {
+                self.request_sat_map_frame(key, hhmm);
+            }
         }
         let player_events = self.sat_player.ui(ui);
         (panel_events, player_events)
+    }
+
+    fn request_sat_map_frame(&mut self, key: rw_ui::SatRunKey, hhmm: u16) {
+        self.sat_last_frame = Some((key.clone(), hhmm));
+        if self.sat_layer_build_rx.is_some() || self.sat_map_inflight.is_some() {
+            self.sat_map_pending = Some((key, hhmm));
+            return;
+        }
+        let Some(sat) = &self.sat else {
+            self.sat_map_pending = Some((key, hhmm));
+            return;
+        };
+        sat.send(sat_worker::SatRequest::LoadFrameForMap {
+            key: key.clone(),
+            hhmm,
+        });
+        self.sat_map_inflight = Some((key, hhmm));
+    }
+
+    fn flush_pending_sat_map_request(&mut self) {
+        if self.sat_layer_build_rx.is_some() || self.sat_map_inflight.is_some() {
+            return;
+        }
+        if let Some((key, hhmm)) = self.sat_map_pending.take() {
+            self.request_sat_map_frame(key, hhmm);
+        }
     }
 
     fn handle_satellite_events(
@@ -18555,29 +18908,42 @@ impl ViewerApp {
         panel_events: Vec<rw_ui::SatelliteEvent>,
         player_events: Vec<rw_ui::SatPlayerEvent>,
     ) {
-        let Some(sat) = &self.sat else {
-            return;
-        };
         for event in panel_events {
             match event {
                 rw_ui::SatelliteEvent::SpecChanged(spec) => {
-                    sat.send(sat_worker::SatRequest::Validate(spec));
+                    if let Some(sat) = &self.sat {
+                        sat.send(sat_worker::SatRequest::Validate(spec));
+                    }
                 }
                 rw_ui::SatelliteEvent::StartRequested(spec) => {
-                    sat.send(sat_worker::SatRequest::Follow(spec));
+                    if let Some(sat) = &self.sat {
+                        sat.send(sat_worker::SatRequest::Follow(spec));
+                    }
                 }
                 rw_ui::SatelliteEvent::StopRequested => {
-                    sat.stop_follow();
+                    if let Some(sat) = &self.sat {
+                        sat.stop_follow();
+                    }
                 }
             }
         }
         for event in player_events {
             match event {
                 rw_ui::SatPlayerEvent::FrameWanted { key, hhmm } => {
-                    sat.send(sat_worker::SatRequest::LoadFrame { key, hhmm });
+                    if let Some(sat) = &self.sat {
+                        sat.send(sat_worker::SatRequest::LoadFrame { key, hhmm });
+                    }
+                }
+                rw_ui::SatPlayerEvent::FrameSelected { key, hhmm } => {
+                    self.sat_last_frame = Some((key.clone(), hhmm));
+                    if self.sat_map_follow {
+                        self.request_sat_map_frame(key, hhmm);
+                    }
                 }
                 rw_ui::SatPlayerEvent::RefreshRequested => {
-                    sat.send(sat_worker::SatRequest::Scan);
+                    if let Some(sat) = &self.sat {
+                        sat.send(sat_worker::SatRequest::Scan);
+                    }
                 }
             }
         }
@@ -18628,12 +18994,28 @@ impl ViewerApp {
                     }
                 }
                 sat_worker::SatResponse::Sleeping { ms } => self.sat_panel.apply_sleeping(ms),
-                sat_worker::SatResponse::Note(message) => self.sat_panel.apply_note(message),
+                sat_worker::SatResponse::Note(message) => {
+                    self.status = format!("Satellite: {message}");
+                    self.sat_panel.apply_note(message);
+                }
                 sat_worker::SatResponse::DiskUsage(usage) => self.sat_panel.set_disk_usage(usage),
+                sat_worker::SatResponse::SelectFrame { key, hhmm } => {
+                    self.sat_last_frame = Some((key.clone(), hhmm));
+                    self.sat_player.select_frame(key.clone(), hhmm);
+                    if let Some(sat) = &self.sat {
+                        sat.send(sat_worker::SatRequest::LoadFrame { key, hhmm });
+                    }
+                }
                 sat_worker::SatResponse::MapFrame(result) => match *result {
-                    Ok(frame) => self.install_sat_layer(frame),
+                    Ok(frame) => {
+                        self.sat_map_inflight = None;
+                        self.install_sat_layer(frame);
+                        self.flush_pending_sat_map_request();
+                    }
                     Err(message) => {
+                        self.sat_map_inflight = None;
                         self.status = format!("Sat layer: {message}");
+                        self.flush_pending_sat_map_request();
                     }
                 },
                 sat_worker::SatResponse::Frame { key, hhmm, result } => match *result {
@@ -19710,8 +20092,41 @@ impl ViewerApp {
         if let Some(receiver) = &self.spc_rx {
             match receiver.try_recv() {
                 Ok(data) => {
+                    let estofex_count = data
+                        .outlooks
+                        .iter()
+                        .find(|(kind, _)| kind == spc_layers::ESTOFEX_OUTLOOK_KIND)
+                        .map(|(_, features)| features.len())
+                        .unwrap_or(0);
+                    let spc_count: usize = data
+                        .outlooks
+                        .iter()
+                        .filter(|(kind, _)| kind != spc_layers::ESTOFEX_OUTLOOK_KIND)
+                        .map(|(_, features)| features.len())
+                        .sum();
+                    let report_count = data.reports.len();
+                    let geojson_lagging = data.outlook_geojson_lagging;
+                    let mut parts = Vec::new();
+                    if spc_count > 0 {
+                        parts.push(format!("SPC {spc_count} areas"));
+                    }
+                    if estofex_count > 0 {
+                        parts.push(format!("ESTOFEX {estofex_count} areas"));
+                    }
+                    if report_count > 0 {
+                        parts.push(format!("{report_count} reports"));
+                    }
+                    let mut status = if parts.is_empty() {
+                        "Outlooks updated: no active polygons".to_owned()
+                    } else {
+                        format!("Outlooks updated: {}", parts.join(" - "))
+                    };
+                    if geojson_lagging {
+                        status.push_str(" - SPC raw PTS is newer than GeoJSON");
+                    }
                     self.spc_rx = None;
                     self.spc_data = data;
+                    self.status = status;
                     ctx.request_repaint();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -20167,31 +20582,72 @@ impl ViewerApp {
     /// background thread; same machinery as the model layer).
     fn install_sat_layer(&mut self, frame: sat_worker::SatMapFrame) {
         if self.sat_layer_build_rx.is_some() {
+            self.sat_map_pending = Some((frame.key, frame.hhmm));
+            return;
+        }
+        let key = frame.key.clone();
+        let hhmm = frame.hhmm;
+        let nx = frame.grid.nx;
+        let ny = frame.grid.ny;
+        if let Some(existing) = &self.sat_layer
+            && existing.key == key
+            && existing.nx == nx
+            && existing.ny == ny
+            && existing.flip_rows == frame.flip_rows
+        {
+            let generation = self.sat_layer_generation + 1;
+            self.sat_layer_generation = generation;
+            self.sat_layer = Some(SatMapLayer {
+                key,
+                hhmm,
+                image: Arc::new(frame.image),
+                lut: Arc::clone(&existing.lut),
+                nx,
+                ny,
+                flip_rows: existing.flip_rows,
+                opacity: existing.opacity,
+                visible: existing.visible,
+                generation,
+            });
+            // Keep the previous map texture visible until the next frame's
+            // viewport render is ready. Clearing here makes playback blink
+            // blank between frames, especially now that sat overlays render
+            // at full viewport resolution.
+            self.sat_layer_render_rx = None;
+            self.status = format!("Satellite map: {hhmm:04}Z");
             return;
         }
         let (sender, receiver) = mpsc::channel();
         self.sat_layer_build_rx = Some(receiver);
         let generation = self.sat_layer_generation + 1;
-        let nx = frame.grid.nx;
-        let ny = frame.grid.ny;
-        let initial_opacity = self.style_registry.drapes().goes_opacity;
+        let initial_opacity = self
+            .sat_layer
+            .as_ref()
+            .map(|layer| layer.opacity)
+            .unwrap_or_else(|| self.style_registry.drapes().goes_opacity);
+        let initial_visible = self
+            .sat_layer
+            .as_ref()
+            .map(|layer| layer.visible)
+            .unwrap_or(true);
         thread::spawn(move || {
             let layer =
-                model_layer::InverseLut::build(&frame.grid.lat, &frame.grid.lon).map(|lut| {
-                    SatMapLayer {
+                model_layer::InverseLut::build_with_shape(&frame.grid.lat, &frame.grid.lon, nx, ny)
+                    .map(|lut| SatMapLayer {
+                        key: frame.key,
+                        hhmm: frame.hhmm,
                         image: Arc::new(frame.image),
                         lut: Arc::new(lut),
                         nx,
                         ny,
                         flip_rows: frame.flip_rows,
                         opacity: initial_opacity,
-                        visible: true,
+                        visible: initial_visible,
                         generation,
-                    }
-                });
+                    });
             let _ = sender.send(layer);
         });
-        self.status = "Building satellite layer…".to_owned();
+        self.status = format!("Building satellite layer {key} {hhmm:04}Z");
     }
 
     fn poll_sat_layer(&mut self, ctx: &egui::Context) {
@@ -20202,12 +20658,15 @@ impl ViewerApp {
                     if let Some(layer) = layer {
                         self.sat_layer_generation = layer.generation;
                         self.sat_layer = Some(layer);
-                        self.sat_layer_texture = None;
+                        // Keep the old texture as a placeholder while the
+                        // new layer renders; draw_sat_layer detects the
+                        // generation mismatch and refreshes it.
                         self.status = "Satellite layer active".to_owned();
                     } else {
                         self.status = "Satellite grid has no geolocation".to_owned();
                     }
                     ctx.request_repaint();
+                    self.flush_pending_sat_map_request();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => self.sat_layer_build_rx = None,
@@ -20235,8 +20694,8 @@ impl ViewerApp {
         }
     }
 
-    /// Draw the satellite layer (world-anchored; renders at half res on a
-    /// background thread, exactly like the model layer).
+    /// Draw the satellite layer (world-anchored; renders at viewport
+    /// resolution on a background thread, exactly like the model layer).
     fn draw_sat_layer(&mut self, painter: &egui::Painter, rect: egui::Rect) {
         let Some(layer) = &self.sat_layer else {
             return;
@@ -20270,14 +20729,14 @@ impl ViewerApp {
             let (w_pts, h_pts) = (rect.width() as f64, rect.height() as f64);
             thread::spawn(move || {
                 let render_start = Instant::now();
-                let w = (w_pts / 2.0).max(8.0) as usize;
-                let h = (h_pts / 2.0).max(8.0) as usize;
+                let w = w_pts.max(8.0) as usize;
+                let h = h_pts.max(8.0) as usize;
                 let mut pixels = vec![egui::Color32::TRANSPARENT; w * h];
                 for (i, px) in pixels.iter_mut().enumerate() {
                     let x = (i % w) as f64;
                     let y = (i / w) as f64;
-                    let east_km = (x - w as f64 / 2.0) * 2.0 * km_per_pt;
-                    let north_km = (h as f64 / 2.0 - y) * 2.0 * km_per_pt;
+                    let east_km = (x - w as f64 / 2.0) * km_per_pt;
+                    let north_km = (h as f64 / 2.0 - y) * km_per_pt;
                     let (lat, lon) = aeqd_inverse_km(center_lat, center_lon, east_km, north_km);
                     let Some(index) = lut.lookup(lat as f32, lon as f32) else {
                         continue;
@@ -36717,6 +37176,9 @@ mod tests {
             sat_panel: rw_ui::SatellitePanel::new(rw_ui::SatFollowSpec::default()),
             sat_player: rw_ui::SatPlayerPanel::new(),
             show_satellite: false,
+            himawari_band: 13,
+            eumetsat_consumer_key: String::new(),
+            eumetsat_consumer_secret: String::new(),
             show_guide: false,
             current_workflow: None,
             previous_workflow_snapshot: None,
@@ -36731,6 +37193,9 @@ mod tests {
             sat_layer_render_rx: None,
             sat_layer_generation: 0,
             sat_last_frame: None,
+            sat_map_follow: false,
+            sat_map_inflight: None,
+            sat_map_pending: None,
             model_layers: Vec::new(),
             model_layer_build_rx: None,
             model_layer_generation: 0,

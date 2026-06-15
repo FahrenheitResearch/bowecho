@@ -18,7 +18,7 @@ use crate::{
     PlacefileSlot, PollSource, RadarSite, SidebarTab, ViewerApp, custom_poll_entry_label,
     custom_poll_entry_lat_lon, custom_poll_links_from_gis, dock, format_site_label,
     intl_provider_label, layer_row, mesoanalysis, normalized_poll_url, oa_derived,
-    parse_custom_poll_marker_inputs, poll_url_name, poll_urls_match,
+    parse_custom_poll_marker_inputs, poll_url_name, poll_urls_match, spc_layers,
 };
 
 impl ViewerApp {
@@ -564,7 +564,19 @@ impl ViewerApp {
         // tab's SPC outlooks section (day + kinds live there now).
         {
             let mut spc_on = !self.spc_outlooks_enabled.is_empty();
-            let name = format!("SPC D{} outlook", self.spc_day);
+            let has_estofex = self
+                .spc_outlooks_enabled
+                .iter()
+                .any(|kind| kind == spc_layers::ESTOFEX_OUTLOOK_KIND);
+            let has_spc = self
+                .spc_outlooks_enabled
+                .iter()
+                .any(|kind| kind != spc_layers::ESTOFEX_OUTLOOK_KIND);
+            let name = match (has_spc, has_estofex) {
+                (true, true) => "SPC/ESTOFEX outlooks".to_owned(),
+                (false, true) => "ESTOFEX outlook".to_owned(),
+                _ => format!("SPC D{} outlook", self.spc_day),
+            };
             let fetching = self.spc_rx.is_some();
             let mut open_severe = false;
             let vis_changed = layer_row(

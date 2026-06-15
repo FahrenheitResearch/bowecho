@@ -59,7 +59,7 @@ pub struct AppSettings {
     /// the displayed radar time.
     #[serde(default)]
     pub overlay_raob: bool,
-    /// Enabled SPC outlook kinds ("cat", "torn", "wind", "hail").
+    /// Enabled outlook kinds ("cat", "torn", "wind", "hail", "estofex").
     #[serde(default)]
     pub overlay_spc_outlooks: Vec<String>,
     #[serde(default)]
