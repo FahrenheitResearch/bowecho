@@ -1897,13 +1897,13 @@ fn parse_numbers(value: &str) -> Vec<f32> {
 }
 
 fn byte_component(value: f32, line: usize) -> Result<u8, ColorTableError> {
-    if !(0.0..=255.0).contains(&value) {
+    if !value.is_finite() {
         return Err(ColorTableError::InvalidColor {
             line,
-            reason: "color component must be 0-255",
+            reason: "color component must be finite",
         });
     }
-    Ok(value.round() as u8)
+    Ok(value.round().clamp(0.0, 255.0) as u8)
 }
 
 fn parse_positive_f32(value: &str) -> Option<f32> {
@@ -2927,6 +2927,18 @@ color: 85 255 231 188
         assert_eq!(table.sample(5.0), Rgba8::opaque(50, 0, 0));
         assert_eq!(table.sample(11.0), Rgba8::opaque(100, 0, 0));
         assert_eq!(table.sample(19.0), Rgba8::opaque(100, 0, 0));
+    }
+
+    #[test]
+    fn gr_pal_clamps_overflowing_byte_channels_from_community_tables() {
+        let table = ColorTable::parse_gr_pal(
+            "Viper overflow tail",
+            "product: BR\nunits: dBZ\ncolor: 94.0 254 254 254\ncolor: 94.5 258 258 258\ncolor: 100.0 262 262 262\n",
+        )
+        .expect("overflowing community table parses");
+
+        assert_eq!(table.sample(94.5), Rgba8::opaque(255, 255, 255));
+        assert_eq!(table.sample(100.0), Rgba8::opaque(255, 255, 255));
     }
 }
 

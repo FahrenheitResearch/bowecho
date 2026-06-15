@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Utc};
+use reqwest::header::{ACCEPT, COOKIE, REFERER, SET_COOKIE};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -311,6 +312,40 @@ pub fn fetch_text(url: &str) -> Result<String> {
     Ok(send_with_retry(&metadata_http_client(), url)?
         .error_for_status()?
         .text()?)
+}
+
+/// Fetch the public mPING display GeoJSON.
+///
+/// The documented full reports API is token-protected. The public display
+/// layer uses a no-key GeoJSON endpoint, but the server expects the same-site
+/// session cookie created by first visiting `/display/` plus a GeoJSON Accept
+/// header. Keep those quirks in one place so callers can treat it as a normal
+/// public display feed.
+pub fn fetch_mping_reports_geojson() -> Result<String> {
+    let client = metadata_http_client();
+    let display_response = client
+        .get("https://mping.ou.edu/display/")
+        .header(ACCEPT, "text/html,*/*")
+        .send()?
+        .error_for_status()?;
+    let cookie_header = display_response
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.split(';').next())
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    let mut request = client
+        .get("https://mping.ou.edu/mping/api/v2/reports.geojson")
+        .header(ACCEPT, "application/vnd.geo+json,*/*")
+        .header(REFERER, "https://mping.ou.edu/display/");
+    if !cookie_header.is_empty() {
+        request = request.header(COOKIE, cookie_header);
+    }
+    Ok(request.send()?.error_for_status()?.text()?)
 }
 
 /// One GET with a single immediate retry on SEND-stage failures (the

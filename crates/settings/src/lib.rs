@@ -64,12 +64,17 @@ pub struct AppSettings {
     pub overlay_spc_outlooks: Vec<String>,
     #[serde(default)]
     pub overlay_spc_reports: bool,
+    #[serde(default)]
+    pub overlay_mping_reports: bool,
     /// Basemap style key: "dark" (vector), "satellite", "streets", "topo".
     #[serde(default = "default_basemap_style")]
     pub basemap_style: String,
     /// GR2-style bold town labels (white, heavy halo) readable over echoes.
     #[serde(default = "default_bold_labels")]
     pub bold_labels: bool,
+    /// Draw latitude/longitude graticule lines and edge labels on the basemap.
+    #[serde(default = "default_true")]
+    pub show_lat_lon_grid: bool,
     /// Draw CONUS radar site/TDWR labels next to radar markers. Markers
     /// stay visible/clickable when labels are off.
     #[serde(default = "default_true")]
@@ -142,6 +147,11 @@ pub struct AppSettings {
     /// setting unchanged.
     #[serde(default)]
     pub smooth_display_mode: String,
+    /// Vertical cross-section cleanup mode: "smoothed" fills short path
+    /// sampling gaps and blends horizontally; "native" shows raw section
+    /// samples. Smoothed is the historical/default behavior.
+    #[serde(default = "default_cross_section_smoothing")]
+    pub cross_section_smoothing: String,
     /// Loop playback speed in percent of the 700 ms/frame baseline
     /// (100 = baseline, 200 = twice as fast). Drives history playback AND
     /// the GIF/MP4 recorder's frame timing, so exports match the screen.
@@ -243,6 +253,10 @@ fn default_loop_speed_percent() -> u16 {
     100
 }
 
+fn default_cross_section_smoothing() -> String {
+    "smoothed".to_owned()
+}
+
 fn default_event_pad_frames() -> u16 {
     5
 }
@@ -339,6 +353,7 @@ impl Default for AppSettings {
             overlay_raob: false,
             overlay_spc_outlooks: Vec::new(),
             overlay_spc_reports: false,
+            overlay_mping_reports: false,
             startup_site: None,
             favorites: Vec::new(),
             polling_interval_seconds: 60,
@@ -351,6 +366,7 @@ impl Default for AppSettings {
             placefiles: Vec::new(),
             basemap_style: default_basemap_style(),
             bold_labels: default_bold_labels(),
+            show_lat_lon_grid: true,
             show_radar_labels: true,
             radar_label_style: default_radar_label_style(),
             show_hazard_labels: true,
@@ -366,6 +382,7 @@ impl Default for AppSettings {
             product_hotkeys: default_product_hotkeys(),
             smooth_display: false,
             smooth_display_mode: String::new(),
+            cross_section_smoothing: default_cross_section_smoothing(),
             loop_speed_percent: default_loop_speed_percent(),
             event_pad_frames: default_event_pad_frames(),
             event_track_auto_model: false,

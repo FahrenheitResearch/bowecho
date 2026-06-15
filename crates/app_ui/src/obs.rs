@@ -54,6 +54,142 @@ pub fn fetch_surface_obs() -> Result<Vec<SurfaceOb>, String> {
     parse_metar_cache(&text)
 }
 
+pub fn fetch_nws_latest_obs(stations: Vec<(String, f32, f32)>) -> Vec<SurfaceOb> {
+    let results = std::sync::Mutex::new(Vec::new());
+    let queue = std::sync::Mutex::new(stations.into_iter());
+    std::thread::scope(|scope| {
+        for _ in 0..6 {
+            scope.spawn(|| {
+                loop {
+                    let Some((station_id, fallback_lat, fallback_lon)) =
+                        queue.lock().ok().and_then(|mut q| q.next())
+                    else {
+                        return;
+                    };
+                    if let Ok(ob) =
+                        fetch_nws_latest_station_ob(&station_id, fallback_lat, fallback_lon)
+                        && let Ok(mut all) = results.lock()
+                    {
+                        all.push(ob);
+                    }
+                }
+            });
+        }
+    });
+    results.into_inner().unwrap_or_default()
+}
+
+fn fetch_nws_latest_station_ob(
+    station_id: &str,
+    fallback_lat: f32,
+    fallback_lon: f32,
+) -> Result<SurfaceOb, String> {
+    let url = format!("https://api.weather.gov/stations/{station_id}/observations/latest");
+    let body = data_source::fetch_text(&url).map_err(|err| err.to_string())?;
+    let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|err| err.to_string())?;
+    parse_nws_latest_ob(&parsed, station_id, fallback_lat, fallback_lon)
+        .ok_or_else(|| format!("NWS latest observation for {station_id} had no plottable data"))
+}
+
+fn parse_nws_latest_ob(
+    parsed: &serde_json::Value,
+    fallback_station_id: &str,
+    fallback_lat: f32,
+    fallback_lon: f32,
+) -> Option<SurfaceOb> {
+    let properties = parsed.get("properties")?;
+    let station_id = properties
+        .get("station")
+        .and_then(|station| station.as_str())
+        .and_then(|station_url| station_url.rsplit('/').next())
+        .filter(|station| !station.is_empty())
+        .unwrap_or(fallback_station_id)
+        .to_owned();
+    let (lon, lat) = parsed
+        .get("geometry")
+        .and_then(|geometry| geometry.get("coordinates"))
+        .and_then(|coordinates| coordinates.as_array())
+        .and_then(|coordinates| {
+            Some((
+                coordinates.first()?.as_f64()? as f32,
+                coordinates.get(1)?.as_f64()? as f32,
+            ))
+        })
+        .filter(|(lon, lat)| (-180.0..=180.0).contains(lon) && (-90.0..=90.0).contains(lat))
+        .unwrap_or((fallback_lon, fallback_lat));
+    if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
+        return None;
+    }
+
+    let time_utc = properties
+        .get("timestamp")
+        .and_then(|timestamp| timestamp.as_str())
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+        .map(|time| time.with_timezone(&Utc));
+    let temp_c =
+        nws_quantity(properties, "temperature").filter(|value| (-60.0..=55.0).contains(value));
+    let dewpoint_c =
+        nws_quantity(properties, "dewpoint").filter(|value| (-60.0..=40.0).contains(value));
+    let wind_dir_deg =
+        nws_quantity(properties, "windDirection").filter(|value| (0.0..=360.0).contains(value));
+    let wind_speed_kt = nws_quantity(properties, "windSpeed")
+        .map(kmh_to_kt)
+        .filter(|value| (0.0..250.0).contains(value));
+    let wind_gust_kt = nws_quantity(properties, "windGust")
+        .map(kmh_to_kt)
+        .filter(|value| (0.0..250.0).contains(value));
+    let altim_in_hg = nws_quantity(properties, "barometricPressure")
+        .map(pa_to_in_hg)
+        .filter(|value| (25.0..=33.0).contains(value));
+    let elevation_m = properties
+        .get("elevation")
+        .and_then(|elevation| elevation.get("value"))
+        .and_then(|value| value.as_f64())
+        .map(|value| value as f32)
+        .filter(|value| (-430.0..=4500.0).contains(value));
+
+    let completeness = temp_c.is_some() as u8
+        + dewpoint_c.is_some() as u8
+        + wind_speed_kt.is_some() as u8
+        + altim_in_hg.is_some() as u8
+        + wind_gust_kt.is_some() as u8;
+    if completeness == 0 {
+        return None;
+    }
+
+    Some(SurfaceOb {
+        station_id,
+        time_utc,
+        lat,
+        lon,
+        temp_c,
+        dewpoint_c,
+        wind_dir_deg,
+        wind_speed_kt,
+        wind_gust_kt,
+        altim_in_hg,
+        completeness,
+        network: "METAR".to_owned(),
+        elevation_m,
+    })
+}
+
+fn nws_quantity(properties: &serde_json::Value, key: &str) -> Option<f32> {
+    properties
+        .get(key)
+        .and_then(|quantity| quantity.get("value"))
+        .and_then(|value| value.as_f64())
+        .map(|value| value as f32)
+}
+
+fn kmh_to_kt(kmh: f32) -> f32 {
+    kmh / 1.852
+}
+
+fn pa_to_in_hg(pa: f32) -> f32 {
+    pa / 3386.389
+}
+
 fn parse_metar_cache(text: &str) -> Result<Vec<SurfaceOb>, String> {
     // The cache has preamble lines; the header row starts with "raw_text".
     let mut columns: Option<Vec<&str>> = None;
@@ -294,7 +430,11 @@ impl ObPool {
         let cutoff = Utc::now() - RETAIN;
         for ob in fetched {
             let entry = self.by_station.entry(ob.station_id.clone()).or_default();
-            if !entry.iter().any(|have| have.time_utc == ob.time_utc) {
+            if let Some(existing) = entry.iter_mut().find(|have| have.time_utc == ob.time_utc) {
+                if ob.completeness > existing.completeness {
+                    *existing = ob;
+                }
+            } else {
                 entry.push(ob);
             }
         }
@@ -339,6 +479,52 @@ impl ObPool {
             .keys()
             .filter_map(move |station| self.ob_at(station, frame_time))
     }
+
+    pub fn stale_metars_in_bounds(
+        &self,
+        west: f32,
+        south: f32,
+        east: f32,
+        north: f32,
+        center_lat: f32,
+        center_lon: f32,
+        now: DateTime<Utc>,
+        stale_after: chrono::Duration,
+        limit: usize,
+    ) -> Vec<(String, f32, f32)> {
+        let mut candidates = Vec::new();
+        for (station, list) in &self.by_station {
+            let Some(latest) = list.last() else {
+                continue;
+            };
+            if latest.network != "METAR" || !station.starts_with('K') || station.len() != 4 {
+                continue;
+            }
+            if latest.lon < west || latest.lon > east || latest.lat < south || latest.lat > north {
+                continue;
+            }
+            let Some(time_utc) = latest.time_utc else {
+                continue;
+            };
+            if now - time_utc <= stale_after {
+                continue;
+            }
+            let dx = (latest.lon - center_lon) * center_lat.to_radians().cos().abs().max(0.15);
+            let dy = latest.lat - center_lat;
+            candidates.push((
+                dx.mul_add(dx, dy * dy),
+                station.clone(),
+                latest.lat,
+                latest.lon,
+            ));
+        }
+        candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
+        candidates
+            .into_iter()
+            .take(limit)
+            .map(|(_, station, lat, lon)| (station, lat, lon))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -355,6 +541,33 @@ mod tests {
         assert_eq!(ob.temp_c, Some(25.0));
         assert_eq!(ob.wind_gust_kt, Some(13.0));
         assert!(ob.completeness >= 4);
+    }
+
+    #[test]
+    fn parses_nws_latest_observation_units() {
+        let value = serde_json::json!({
+            "geometry": {"coordinates": [-97.6003, 35.3843]},
+            "properties": {
+                "station": "https://api.weather.gov/stations/KOKC",
+                "timestamp": "2026-06-14T23:20:00+00:00",
+                "temperature": {"unitCode": "wmoUnit:degC", "value": 25.0},
+                "dewpoint": {"unitCode": "wmoUnit:degC", "value": 14.0},
+                "windDirection": {"unitCode": "wmoUnit:degree_(angle)", "value": 50.0},
+                "windSpeed": {"unitCode": "wmoUnit:km_h-1", "value": 20.376},
+                "windGust": {"unitCode": "wmoUnit:km_h-1", "value": null},
+                "barometricPressure": {"unitCode": "wmoUnit:Pa", "value": 101760.98},
+                "elevation": {"unitCode": "wmoUnit:m", "value": 391.0}
+            }
+        });
+        let ob = parse_nws_latest_ob(&value, "KOKC", 0.0, 0.0).expect("NWS ob");
+        assert_eq!(ob.station_id, "KOKC");
+        assert_eq!(ob.network, "METAR");
+        assert_eq!(ob.temp_c, Some(25.0));
+        assert_eq!(ob.dewpoint_c, Some(14.0));
+        assert_eq!(ob.wind_dir_deg, Some(50.0));
+        assert!((ob.wind_speed_kt.unwrap() - 11.0).abs() < 0.01);
+        assert!((ob.altim_in_hg.unwrap() - 30.05).abs() < 0.01);
+        assert_eq!(ob.elevation_m, Some(391.0));
     }
 
     #[test]
@@ -393,5 +606,100 @@ mod tests {
             pool.ob_at("KTST", t0 + chrono::Duration::hours(4))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn pool_replaces_same_time_with_more_complete_ob() {
+        let now = Utc::now();
+        let mut weak = test_ob("KAAA", now, 35.0, -97.0);
+        weak.dewpoint_c = None;
+        weak.wind_speed_kt = None;
+        weak.altim_in_hg = None;
+        weak.completeness = 1;
+        let mut better = weak.clone();
+        better.dewpoint_c = Some(20.0);
+        better.wind_speed_kt = Some(12.0);
+        better.altim_in_hg = Some(30.02);
+        better.completeness = 4;
+
+        let mut pool = ObPool::new();
+        pool.merge(vec![weak]);
+        pool.merge(vec![better]);
+        let ob = pool.ob_at("KAAA", now).expect("merged ob");
+        assert_eq!(ob.completeness, 4);
+        assert_eq!(ob.dewpoint_c, Some(20.0));
+    }
+
+    #[test]
+    fn stale_metar_candidates_are_visible_airports_nearest_first() {
+        let now = Utc::now();
+        let mut pool = ObPool::new();
+        pool.by_station.insert(
+            "KOKC".into(),
+            vec![test_ob(
+                "KOKC",
+                now - chrono::Duration::minutes(30),
+                35.1,
+                -97.1,
+            )],
+        );
+        pool.by_station.insert(
+            "KFAR".into(),
+            vec![test_ob(
+                "KFAR",
+                now - chrono::Duration::minutes(30),
+                36.5,
+                -98.5,
+            )],
+        );
+        pool.by_station.insert(
+            "KFRESH".into(),
+            vec![test_ob(
+                "KFRESH",
+                now - chrono::Duration::minutes(5),
+                35.2,
+                -97.2,
+            )],
+        );
+        let mut mesonet = test_ob("MNET", now - chrono::Duration::minutes(30), 35.0, -97.0);
+        mesonet.network = "OK_DCP".into();
+        pool.by_station.insert("MNET".into(), vec![mesonet]);
+
+        let candidates = pool.stale_metars_in_bounds(
+            -99.0,
+            34.0,
+            -96.0,
+            37.0,
+            35.0,
+            -97.0,
+            now,
+            chrono::Duration::minutes(18),
+            8,
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|(station, ..)| station.as_str())
+                .collect::<Vec<_>>(),
+            vec!["KOKC", "KFAR"]
+        );
+    }
+
+    fn test_ob(station: &str, time_utc: DateTime<Utc>, lat: f32, lon: f32) -> SurfaceOb {
+        SurfaceOb {
+            station_id: station.to_owned(),
+            time_utc: Some(time_utc),
+            lat,
+            lon,
+            temp_c: Some(25.0),
+            dewpoint_c: Some(15.0),
+            wind_dir_deg: Some(180.0),
+            wind_speed_kt: Some(10.0),
+            wind_gust_kt: None,
+            altim_in_hg: Some(30.0),
+            completeness: 4,
+            network: "METAR".to_owned(),
+            elevation_m: None,
+        }
     }
 }

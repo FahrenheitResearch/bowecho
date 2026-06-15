@@ -34,6 +34,7 @@ impl ViewerApp {
             + usize::from(self.raob_markers_enabled)
             + usize::from(!self.spc_outlooks_enabled.is_empty())
             + usize::from(self.spc_reports_enabled)
+            + usize::from(self.mping_enabled)
             + usize::from(self.hazards_visible && self.hazard_overlay.is_some())
             + usize::from(self.tor_tracks.show_tracks)
             + usize::from(self.tor_tracks.show_tds)
@@ -420,7 +421,8 @@ impl ViewerApp {
             let obs_adjust_soundings = &mut self.obs_adjust_soundings;
             let obs_fetched_at = self.obs_fetched_at;
             let obs_station_count = self.surface_obs.station_count;
-            let obs_fetching = self.obs_rx.is_some();
+            let obs_fetching =
+                self.obs_rx.is_some() || self.nws_obs_rx.is_some() || self.mesonet_rx.is_some();
             if layer_row(
                 ui,
                 LayerRowSpec {
@@ -637,6 +639,38 @@ impl ViewerApp {
             }
             if open_severe {
                 self.sidebar_tab = SidebarTab::Severe;
+            }
+        }
+        // mPING REPORTS — live crowd reports from the public display feed.
+        {
+            let mping_status = if self.mping_rx.is_some() {
+                Some("loading".to_owned())
+            } else if self.mping_enabled && !self.mping_reports.is_empty() {
+                Some(format!("{} rpt", self.mping_reports.len()))
+            } else {
+                None
+            };
+            if layer_row(
+                ui,
+                LayerRowSpec {
+                    vis: LayerRowVis::Toggle {
+                        value: &mut self.mping_enabled,
+                        hover: "mPING crowd reports from the public display feed, refreshed about every 5 min",
+                    },
+                    name: "mPING",
+                    name_width: crate::NAME_W_STD,
+                    name_hover: "Recent mPING public display reports: precipitation, hail, wind damage, flooding, visibility, and winter impacts",
+                    ..Default::default()
+                },
+                |ui| {
+                    if let Some(status) = &mping_status {
+                        ui.weak(status);
+                    }
+                },
+            ) {
+                self.mping_fetched_at = None;
+                self.save_overlay_defaults();
+                ctx.request_repaint();
             }
         }
         // WARNINGS — the polygon layer finally appears in the layer
@@ -1530,6 +1564,22 @@ impl ViewerApp {
                         if !self.placefile_slots.iter().any(|slot| slot.url == url) {
                             let mut slot = PlacefileSlot::new(url, true);
                             slot.show_text = false; // dots only; hover has the card
+                            self.placefile_slots.push(slot);
+                            self.save_placefile_settings();
+                        }
+                        ui.close();
+                    }
+                    if ui
+                        .button("SpotterNetwork reports")
+                        .on_hover_text(
+                            "Add the public SpotterNetwork reports-only placefile (recent report icons, 1-min refresh)",
+                        )
+                        .clicked()
+                    {
+                        let url = "https://www.spotternetwork.org/feeds/reports.txt".to_owned();
+                        if !self.placefile_slots.iter().any(|slot| slot.url == url) {
+                            let mut slot = PlacefileSlot::new(url, true);
+                            slot.show_text = false; // report details are in the hover card
                             self.placefile_slots.push(slot);
                             self.save_placefile_settings();
                         }

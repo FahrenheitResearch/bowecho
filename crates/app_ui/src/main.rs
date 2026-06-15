@@ -15,14 +15,15 @@ use data_source::{LEVEL2_ARCHIVE_BUCKET, RadarSite, RealtimeChunkType};
 use eframe::egui;
 use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType, RadarVolume};
 use render2d::{
-    ECHO_TOP_THRESHOLD_DBZ, StormCell, StormMotion, StormRelativePaletteCache, StormTracker,
-    ViewportMomentCache, ViewportRasterOptions, ViewportSampleCache, VolumeDealiasCache,
-    apply_reflectivity_gate_filter, azimuthal_shear_grid, color_family_for_moment,
-    composite_reflectivity_grid, dealias_velocity_grid, dealias_velocity_grid_cascade,
-    detect_rotation_sites, echo_top_grid, gust_proxy_grid, hail_grids, identify_storm_cells,
-    marc_grid, mehs_grid, poh_grid, radial_divergence_grid, reflectivity_cross_section,
+    CrossSectionSmoothing, ECHO_TOP_THRESHOLD_DBZ, StormCell, StormMotion,
+    StormRelativePaletteCache, StormTracker, ViewportMomentCache, ViewportRasterOptions,
+    ViewportSampleCache, VolumeDealiasCache, apply_reflectivity_gate_filter, azimuthal_shear_grid,
+    color_family_for_moment, composite_reflectivity_grid, dealias_velocity_grid,
+    dealias_velocity_grid_cascade, detect_rotation_sites, echo_top_grid, gust_proxy_grid,
+    hail_grids, identify_storm_cells, marc_grid, mehs_grid, moment_cross_section_with_smoothing,
+    poh_grid, radial_divergence_grid, reflectivity_cross_section_with_smoothing,
     smooth_moment_grid, storm_relative_velocity_mps, upsample_moment_grid,
-    velocity_cross_section_cached, viewport_rgba_buffer_len,
+    velocity_cross_section_cached_with_smoothing, viewport_rgba_buffer_len,
     viewport_sample_cache_storage_upper_bound, vil_density_grid, vil_grid,
 };
 use serde::Deserialize;
@@ -42,6 +43,7 @@ mod media;
 mod mesoanalysis;
 mod model_data;
 mod model_layer;
+mod mping;
 mod oa_derived;
 mod obs;
 mod obs_soundings;
@@ -1242,6 +1244,10 @@ struct ViewerApp {
     spc_day: u8,
     spc_last_key: Option<SpcFetchKey>,
     spc_rx: Option<mpsc::Receiver<spc_layers::SpcData>>,
+    mping_reports: Vec<mping::MpingReport>,
+    mping_enabled: bool,
+    mping_fetched_at: Option<Instant>,
+    mping_rx: Option<mpsc::Receiver<std::result::Result<Vec<mping::MpingReport>, String>>>,
     /// Event Explorer: dated reports/tornado-track day cache + the
     /// pending track-click loop window (src/event_explorer.rs).
     event_explorer: event_explorer::EventExplorerState,
@@ -1274,6 +1280,8 @@ struct ViewerApp {
     surface_obs: obs::ObPool,
     obs_fetched_at: Option<Instant>,
     obs_rx: Option<mpsc::Receiver<std::result::Result<Vec<obs::SurfaceOb>, String>>>,
+    nws_obs_fetched_at: Option<Instant>,
+    nws_obs_rx: Option<mpsc::Receiver<Vec<obs::SurfaceOb>>>,
     mesonet_fetched_at: Option<Instant>,
     mesonet_rx: Option<mpsc::Receiver<Vec<obs::SurfaceOb>>>,
     /// Inspector card customization: which sections render.
@@ -1332,6 +1340,8 @@ struct ViewerApp {
     cross_section_b_lonlat: Option<(f32, f32)>,
     cross_section_texture: Option<egui::TextureHandle>,
     cross_section_signature: Option<u64>,
+    cross_section_readout: Option<CrossSectionReadout>,
+    cross_section_smoothing: CrossSectionSmoothing,
     cross_section_status: String,
     /// Height-axis ceiling of the current section (m); auto-scaled to the
     /// beam coverage along the drawn path so storms fill the panel.
@@ -3959,6 +3969,7 @@ struct WorkflowSnapshot {
     live_hazard_auto_refresh: bool,
     spc_outlooks_enabled: Vec<String>,
     spc_reports_enabled: bool,
+    mping_enabled: bool,
     obs_enabled: bool,
     obs_show_metar: bool,
     obs_show_mesonet: bool,
@@ -4051,6 +4062,7 @@ impl ViewerApp {
             app_settings.overlay_spc_outlooks.clone(),
             app_settings.overlay_spc_reports,
             app_settings.overlay_raob,
+            app_settings.overlay_mping_reports,
         );
         let restored_grid_layout = match app_settings.grid_pane_count {
             2 => PanelLayout::TwoVertical,
@@ -4096,6 +4108,7 @@ impl ViewerApp {
         let restored_archive_frame_count =
             normalized_archive_frame_count(usize::from(app_settings.archive_frame_count));
         let restored_archive_load_loop = app_settings.archive_load_loop;
+        let restored_cross_section_smoothing = cross_section_smoothing_from_settings(&app_settings);
         let mut app = Self {
             source_path,
             renderer_backend,
@@ -4253,6 +4266,10 @@ impl ViewerApp {
             spc_last_key: None,
             glm: None,
             spc_rx: None,
+            mping_reports: Vec::new(),
+            mping_enabled: restored_overlays.7,
+            mping_fetched_at: None,
+            mping_rx: None,
             event_explorer: event_explorer::EventExplorerState::default(),
             glm_enabled: restored_overlays.3,
             oa_rx: None,
@@ -4274,6 +4291,8 @@ impl ViewerApp {
             surface_obs: obs::ObPool::new(),
             obs_fetched_at: None,
             obs_rx: None,
+            nws_obs_fetched_at: None,
+            nws_obs_rx: None,
             mesonet_fetched_at: None,
             mesonet_rx: None,
             last_sounding_request: None,
@@ -4306,6 +4325,8 @@ impl ViewerApp {
             cross_section_b_lonlat: None,
             cross_section_texture: None,
             cross_section_signature: None,
+            cross_section_readout: None,
+            cross_section_smoothing: restored_cross_section_smoothing,
             cross_section_status: "Cross-section: arm, then click endpoint A then B".to_owned(),
             cross_section_top_m: CROSS_SECTION_TOP_M,
             cross_section_user_signature: None,
@@ -5811,6 +5832,18 @@ impl ViewerApp {
         }
 
         if self.handle_product_hotkeys(ctx) {
+            ctx.request_repaint();
+            return;
+        }
+
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::G)) {
+            self.app_settings.show_lat_lon_grid = !self.app_settings.show_lat_lon_grid;
+            self.status = if self.app_settings.show_lat_lon_grid {
+                "Lat/lon grid shown".to_owned()
+            } else {
+                "Lat/lon grid hidden".to_owned()
+            };
+            let _ = self.app_settings.save();
             ctx.request_repaint();
             return;
         }
@@ -9791,6 +9824,7 @@ impl eframe::App for ViewerApp {
         self.poll_archive_listing(&ctx);
         self.poll_spc_reports(&ctx);
         self.poll_event_day(&ctx);
+        self.poll_mping(&ctx);
         // Apply deferred layout changes FIRST — before anything paints.
         if let Some(layout) = self.pending_grid_layout.take() {
             self.grid_layout = layout;
@@ -10249,6 +10283,7 @@ impl ViewerApp {
                 self.cross_section_b_lonlat = None;
                 self.cross_section_texture = None;
                 self.cross_section_signature = None;
+                self.cross_section_readout = None;
                 self.cross_section_user_signature = None;
                 self.cross_section_status =
                     "Cross-section: arm, then click endpoint A then B".to_owned();
@@ -10295,6 +10330,7 @@ impl ViewerApp {
             live_hazard_auto_refresh: self.live_hazard_auto_refresh,
             spc_outlooks_enabled: self.spc_outlooks_enabled.clone(),
             spc_reports_enabled: self.spc_reports_enabled,
+            mping_enabled: self.mping_enabled,
             obs_enabled: self.obs_enabled,
             obs_show_metar: self.obs_show_metar,
             obs_show_mesonet: self.obs_show_mesonet,
@@ -10359,6 +10395,7 @@ impl ViewerApp {
         self.live_hazard_auto_refresh = snapshot.live_hazard_auto_refresh;
         self.spc_outlooks_enabled = snapshot.spc_outlooks_enabled;
         self.spc_reports_enabled = snapshot.spc_reports_enabled;
+        self.mping_enabled = snapshot.mping_enabled;
         self.obs_enabled = snapshot.obs_enabled;
         self.obs_show_metar = snapshot.obs_show_metar;
         self.obs_show_mesonet = snapshot.obs_show_mesonet;
@@ -10378,6 +10415,7 @@ impl ViewerApp {
         self.cross_section_status = snapshot.cross_section_status;
         self.cross_section_texture = None;
         self.cross_section_signature = None;
+        self.cross_section_readout = None;
         self.cross_section_user_signature = None;
         self.annotations.active_tool = snapshot.annotation_tool;
         self.annotations.draft = snapshot.annotation_draft;
@@ -10397,6 +10435,7 @@ impl ViewerApp {
         self.app_settings.overlay_glm = self.glm_enabled;
         self.app_settings.overlay_spc_outlooks = self.spc_outlooks_enabled.clone();
         self.app_settings.overlay_spc_reports = self.spc_reports_enabled;
+        self.app_settings.overlay_mping_reports = self.mping_enabled;
     }
 
     fn restore_viewer_mode(&mut self, pane: dock::WorkspacePane, mode: dock::ViewerMode) {
@@ -11582,6 +11621,14 @@ impl ViewerApp {
             .changed()
         {
             self.app_settings.bold_labels = self.bold_labels;
+            let _ = self.app_settings.save();
+            ctx.request_repaint();
+        }
+        if ui
+            .checkbox(&mut self.app_settings.show_lat_lon_grid, "Lat/lon grid")
+            .on_hover_text("Show basemap latitude/longitude grid lines and labels. Hotkey: G")
+            .changed()
+        {
             let _ = self.app_settings.save();
             ctx.request_repaint();
         }
@@ -13033,9 +13080,46 @@ impl ViewerApp {
                 self.cross_section_b_lonlat = None;
                 self.cross_section_texture = None;
                 self.cross_section_signature = None;
+                self.cross_section_readout = None;
                 self.cross_section_status = "Cross-section: arm, then click endpoint A then B".to_owned();
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("XS smoothing");
+            let current = self.cross_section_smoothing;
+            let mut picked = None;
+            egui::ComboBox::from_id_salt("cross_section_smoothing")
+                .selected_text(cross_section_smoothing_label(current))
+                .width(92.0)
+                .show_ui(ui, |ui| {
+                    for option in [CrossSectionSmoothing::Smoothed, CrossSectionSmoothing::Native] {
+                        if ui
+                            .selectable_label(
+                                current == option,
+                                cross_section_smoothing_label(option),
+                            )
+                            .clicked()
+                        {
+                            picked = Some(option);
+                        }
+                    }
+                });
+            if let Some(option) = picked
+                && option != current
+            {
+                self.cross_section_smoothing = option;
+                self.app_settings.cross_section_smoothing =
+                    cross_section_smoothing_slug(option).to_owned();
+                self.cross_section_signature = None;
+                self.cross_section_user_signature = None;
+                let _ = self.app_settings.save();
+                ctx.request_repaint();
+            }
+        })
+        .response
+        .on_hover_text(
+            "Smoothed fills short path-sampling gaps and softens barcode stripes. Native shows the raw section samples.",
+        );
     }
 
     fn extra_pane_frame_history_panel(
@@ -15174,6 +15258,11 @@ impl ViewerApp {
         if self.spc_rx.is_some() {
             return Some(BackgroundActivity::indeterminate("Refreshing SPC layers"));
         }
+        if self.mping_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                "Refreshing mPING reports",
+            ));
+        }
         if self.spc_receiver.is_some() {
             return Some(BackgroundActivity::indeterminate("Loading SPC reports"));
         }
@@ -15185,7 +15274,7 @@ impl ViewerApp {
         if self.raob_sites_rx.is_some() {
             return Some(BackgroundActivity::indeterminate("Loading RAOB sites"));
         }
-        if self.obs_rx.is_some() || self.mesonet_rx.is_some() {
+        if self.obs_rx.is_some() || self.nws_obs_rx.is_some() || self.mesonet_rx.is_some() {
             return Some(BackgroundActivity::indeterminate("Loading surface obs"));
         }
         if self.native_sounding_rx.is_some() {
@@ -15741,6 +15830,7 @@ impl ViewerApp {
         // climo report points; the lines are the surveyed paths).
         self.draw_event_tracks(painter, rect);
         self.draw_spc_reports(painter, rect);
+        self.draw_mping_reports(painter, rect);
         self.draw_glm(painter, rect);
         self.draw_surface_obs(painter, rect);
         self.draw_vrot_tool(painter, rect);
@@ -16389,6 +16479,7 @@ impl ViewerApp {
             self.draw_hazard_overlays(&cell_painter, cell);
             self.draw_rotation_markers(&cell_painter, cell);
             self.draw_storm_tracks(&cell_painter, cell);
+            self.draw_mping_reports(&cell_painter, cell);
             self.draw_placefiles(&cell_painter, cell);
             self.draw_map_annotations(&cell_painter, cell);
             self.draw_site_markers(&cell_painter, &site_points);
@@ -19564,6 +19655,7 @@ impl ViewerApp {
         self.app_settings.overlay_raob = self.raob_markers_enabled;
         self.app_settings.overlay_spc_outlooks = self.spc_outlooks_enabled.clone();
         self.app_settings.overlay_spc_reports = self.spc_reports_enabled;
+        self.app_settings.overlay_mping_reports = self.mping_enabled;
         let _ = self.app_settings.save();
     }
 
@@ -19622,6 +19714,49 @@ impl ViewerApp {
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => self.spc_rx = None,
+            }
+        }
+    }
+
+    /// Public mPING display reports: no-key GeoJSON layer, refreshed on the
+    /// same cadence as the official display page.
+    fn poll_mping(&mut self, ctx: &egui::Context) {
+        if !self.mping_enabled {
+            return;
+        }
+        if self.mping_rx.is_none()
+            && self
+                .mping_fetched_at
+                .map(|at| at.elapsed() > Duration::from_secs(300))
+                .unwrap_or(true)
+        {
+            let (sender, receiver) = mpsc::channel();
+            self.mping_rx = Some(receiver);
+            let ctx_clone = ctx.clone();
+            thread::spawn(move || {
+                let result = mping::fetch_reports();
+                let _ = sender.send(result);
+                ctx_clone.request_repaint();
+            });
+        }
+        if let Some(receiver) = &self.mping_rx {
+            match receiver.try_recv() {
+                Ok(Ok(reports)) => {
+                    self.mping_rx = None;
+                    self.mping_fetched_at = Some(Instant::now());
+                    let count = reports.len();
+                    self.mping_reports = reports;
+                    self.status = format!("mPING: {count} recent reports");
+                    ctx.request_repaint();
+                }
+                Ok(Err(error)) => {
+                    self.mping_rx = None;
+                    self.mping_fetched_at = Some(Instant::now());
+                    self.status = format!("mPING failed: {error}");
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.mping_rx = None,
             }
         }
     }
@@ -19761,6 +19896,59 @@ impl ViewerApp {
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => self.obs_rx = None,
+            }
+        }
+        if let Some(receiver) = &self.nws_obs_rx {
+            match receiver.try_recv() {
+                Ok(observations) => {
+                    self.nws_obs_rx = None;
+                    self.nws_obs_fetched_at = Some(Instant::now());
+                    let updated = observations.len();
+                    if updated > 0 {
+                        self.surface_obs.merge(observations);
+                        self.status = format!(
+                            "Surface obs: {} stations (+{updated} NWS latest)",
+                            self.surface_obs.station_count
+                        );
+                    }
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.nws_obs_rx = None,
+            }
+        }
+        if self.obs_enabled
+            && self.obs_show_metar
+            && self.nws_obs_rx.is_none()
+            && !self.surface_obs.is_empty()
+            && self
+                .nws_obs_fetched_at
+                .map(|at| at.elapsed() > Duration::from_secs(180))
+                .unwrap_or(true)
+            && let Some(rect) = self.media.last_map_rect
+        {
+            let bounds = self.visible_geo_bounds(rect).expand(0.25);
+            let stations = self.surface_obs.stale_metars_in_bounds(
+                bounds.west,
+                bounds.south,
+                bounds.east,
+                bounds.north,
+                self.map_center_lat,
+                self.map_center_lon,
+                Utc::now(),
+                chrono::Duration::minutes(18),
+                48,
+            );
+            self.nws_obs_fetched_at = Some(Instant::now());
+            if !stations.is_empty() {
+                let (sender, receiver) = mpsc::channel();
+                self.nws_obs_rx = Some(receiver);
+                let ctx_clone = ctx.clone();
+                thread::spawn(move || {
+                    let obs = obs::fetch_nws_latest_obs(stations);
+                    let _ = sender.send(obs);
+                    ctx_clone.request_repaint();
+                });
             }
         }
     }
@@ -21287,6 +21475,80 @@ impl ViewerApp {
         }
     }
 
+    /// mPING crowd reports from the public display GeoJSON. This is a live
+    /// quick-look layer, distinct from SPC-filtered severe reports.
+    fn draw_mping_reports(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if !self.mping_enabled || self.mping_reports.is_empty() {
+            return;
+        }
+        let now = Utc::now();
+        let visible: Vec<(&mping::MpingReport, egui::Pos2)> = self
+            .mping_reports
+            .iter()
+            .filter_map(|report| {
+                let pos = self.lon_lat_to_screen(rect, report.lon, report.lat);
+                rect.expand(8.0).contains(pos).then_some((report, pos))
+            })
+            .collect();
+        let label_glyphs = visible.len() <= 120 && self.map_scale >= 18.0;
+        for (report, pos) in &visible {
+            let age_min = (now - report.obtime).num_minutes().max(0) as f32;
+            let alpha = if age_min <= 30.0 {
+                235
+            } else {
+                (235.0 - (age_min - 30.0) * 1.7).clamp(70.0, 235.0) as u8
+            };
+            let base = mping::report_color(report);
+            let fill = egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), alpha);
+            painter.circle_filled(*pos, 4.3, fill);
+            painter.circle_stroke(
+                *pos,
+                4.3,
+                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 210)),
+            );
+            if label_glyphs {
+                let glyph = mping::report_glyph(report);
+                if !glyph.is_empty() {
+                    draw_halo_text(
+                        painter,
+                        *pos + egui::vec2(5.5, -5.0),
+                        egui::Align2::LEFT_CENTER,
+                        glyph,
+                        egui::FontId::proportional(9.5),
+                        fill,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 210),
+                    );
+                }
+            }
+        }
+        if let Some(pointer) = painter.ctx().pointer_hover_pos()
+            && rect.contains(pointer)
+        {
+            let mut texts = Vec::new();
+            for (report, pos) in &visible {
+                if pos.distance(pointer) <= 9.0 {
+                    texts.push(report.hover_text());
+                }
+                if texts.len() >= 5 {
+                    break;
+                }
+            }
+            if !texts.is_empty() {
+                egui::Tooltip::always_open(
+                    painter.ctx().clone(),
+                    egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("mping_hover")),
+                    egui::Id::new("mping_tip"),
+                    egui::PopupAnchor::Pointer,
+                )
+                .gap(12.0)
+                .show(|ui| {
+                    ui.set_max_width(300.0);
+                    ui.label(texts.join("\n------\n"));
+                });
+            }
+        }
+    }
+
     /// GLM lightning flashes, time-synced: each frame draws the trailing
     /// 10-minute window BEFORE ITS OWN TIME (loops replay lightning
     /// history), age-faded, sized by log-energy, degraded QC'd out.
@@ -22335,14 +22597,17 @@ impl ViewerApp {
     fn update_cross_section_texture(&mut self, ctx: &egui::Context) {
         let (Some(a), Some(b)) = (self.cross_section_a_lonlat, self.cross_section_b_lonlat) else {
             self.cross_section_texture = None;
+            self.cross_section_readout = None;
             return;
         };
         let Some(volume) = self.volume.clone() else {
             self.cross_section_status = "No volume loaded".to_owned();
             self.cross_section_texture = None;
+            self.cross_section_readout = None;
             return;
         };
         let Some((radar_lat, radar_lon)) = self.loaded_volume_location() else {
+            self.cross_section_readout = None;
             return;
         };
         // Only reflectivity and (dealiased) velocity sections are supported.
@@ -22364,6 +22629,7 @@ impl ViewerApp {
             self.cross_section_status =
                 "Cross-section supports REF, velocity, CC and ZDR products".to_owned();
             self.cross_section_texture = None;
+            self.cross_section_readout = None;
             return;
         }
         let family = if velocity {
@@ -22394,6 +22660,7 @@ impl ViewerApp {
             radar_core::beam_height_above_radar_m(max_range_m, max_elevation as f64) as f32;
         let top_m = (coverage_top * 1.08).clamp(4_000.0, CROSS_SECTION_TOP_M);
         let (w, h) = (640usize, 256usize);
+        let smoothing = self.cross_section_smoothing;
 
         // recompute guard (top_m derives from endpoints+volume, both hashed)
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -22403,6 +22670,7 @@ impl ViewerApp {
         b.0.to_bits().hash(&mut hasher);
         b.1.to_bits().hash(&mut hasher);
         velocity.hash(&mut hasher);
+        smoothing.hash(&mut hasher);
         (Arc::as_ptr(&volume) as usize).hash(&mut hasher);
         self.color_tables
             .signature_for_family(family)
@@ -22421,6 +22689,7 @@ impl ViewerApp {
         b.0.to_bits().hash(&mut user_hasher);
         b.1.to_bits().hash(&mut user_hasher);
         velocity.hash(&mut user_hasher);
+        smoothing.hash(&mut user_hasher);
         self.color_tables
             .signature_for_family(family)
             .hash(&mut user_hasher);
@@ -22446,10 +22715,19 @@ impl ViewerApp {
             return;
         }
 
+        let readout_product = if velocity {
+            DisplayProduct::DealiasedVelocity
+        } else if cc {
+            DisplayProduct::Moment(MomentType::CorrelationCoefficient)
+        } else if zdr {
+            DisplayProduct::Moment(MomentType::DifferentialReflectivity)
+        } else {
+            DisplayProduct::Moment(MomentType::Reflectivity)
+        };
         let section = if cc {
             // CC slices never blend through the melting layer (the rho_hv
             // minimum IS the signature): nearest-gate below 0.97.
-            render2d::moment_cross_section(
+            moment_cross_section_with_smoothing(
                 &volume,
                 MomentType::CorrelationCoefficient,
                 render2d::InterpPolicy::CcGuard,
@@ -22458,9 +22736,10 @@ impl ViewerApp {
                 w,
                 h,
                 top_m,
+                smoothing,
             )
         } else if zdr {
-            render2d::moment_cross_section(
+            moment_cross_section_with_smoothing(
                 &volume,
                 MomentType::DifferentialReflectivity,
                 render2d::InterpPolicy::LinearAngle,
@@ -22469,9 +22748,10 @@ impl ViewerApp {
                 w,
                 h,
                 top_m,
+                smoothing,
             )
         } else if velocity {
-            velocity_cross_section_cached(
+            velocity_cross_section_cached_with_smoothing(
                 &volume,
                 &mut self.cross_section_dealias_cache,
                 start,
@@ -22479,16 +22759,26 @@ impl ViewerApp {
                 w,
                 h,
                 top_m,
+                smoothing,
             )
         } else {
-            reflectivity_cross_section(&volume, start, end, w, h, top_m)
+            reflectivity_cross_section_with_smoothing(&volume, start, end, w, h, top_m, smoothing)
         };
         let Some(section) = section else {
             self.cross_section_status = "No data along section".to_owned();
             self.cross_section_texture = None;
+            self.cross_section_readout = None;
             self.cross_section_signature = Some(sig);
             return;
         };
+        self.cross_section_readout = Some(CrossSectionReadout {
+            product: readout_product,
+            width: section.width,
+            height: section.height,
+            top_m: section.top_m,
+            length_m: section.length_m,
+            values: section.values.clone(),
+        });
 
         let table = self.color_tables.for_family(family);
         let mut rgba = vec![0u8; section.width * section.height * 4];
@@ -22501,11 +22791,15 @@ impl ViewerApp {
         // would violate the premultiplied invariant of the radar texture helper.
         let image =
             egui::ColorImage::from_rgba_unmultiplied([section.width, section.height], &rgba);
+        let texture_options = match smoothing {
+            CrossSectionSmoothing::Native => egui::TextureOptions::NEAREST,
+            CrossSectionSmoothing::Smoothed => egui::TextureOptions::LINEAR,
+        };
         match &mut self.cross_section_texture {
-            Some(texture) => texture.set(image, egui::TextureOptions::LINEAR),
+            Some(texture) => texture.set(image, texture_options),
             None => {
                 self.cross_section_texture =
-                    Some(ctx.load_texture("cross-section", image, egui::TextureOptions::LINEAR));
+                    Some(ctx.load_texture("cross-section", image, texture_options));
             }
         }
         self.cross_section_signature = Some(sig);
@@ -22515,7 +22809,7 @@ impl ViewerApp {
             volume_top_deg.max(self.cross_section_volume_top_deg * 0.0);
         self.cross_section_top_m = top_m;
         self.cross_section_status = format!(
-            "{} · {:.0} km long · top {:.0} km",
+            "{} · {:.0} km long · top {:.0} km · {}",
             if velocity {
                 "Velocity"
             } else if cc {
@@ -22527,6 +22821,7 @@ impl ViewerApp {
             },
             section.length_m / 1000.0,
             top_m / 1000.0,
+            cross_section_smoothing_label(smoothing),
         );
     }
 
@@ -22543,7 +22838,7 @@ impl ViewerApp {
         if avail.y < 24.0 {
             return;
         }
-        let (rect, _) = ui.allocate_exact_size(avail, egui::Sense::hover());
+        let (rect, response) = ui.allocate_exact_size(avail, egui::Sense::hover());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(12, 14, 18));
         let Some(texture) = &self.cross_section_texture else {
@@ -22595,6 +22890,87 @@ impl ViewerApp {
             font,
             label,
         );
+        if let Some(readout) = &self.cross_section_readout
+            && response.hovered()
+            && let Some(pointer) = ui.ctx().pointer_hover_pos()
+            && plot.contains(pointer)
+            && readout.width > 1
+            && readout.height > 1
+        {
+            let fx = ((pointer.x - plot.left()) / plot.width()).clamp(0.0, 1.0);
+            let fy = ((pointer.y - plot.top()) / plot.height()).clamp(0.0, 1.0);
+            let x = (fx * (readout.width - 1) as f32).round() as usize;
+            let y = (fy * (readout.height - 1) as f32).round() as usize;
+            let value = readout.values[y * readout.width + x];
+            let distance_km = readout.length_m * fx / 1000.0;
+            let height_m = readout.top_m * (1.0 - fy);
+            painter.line_segment(
+                [
+                    egui::pos2(pointer.x, plot.top()),
+                    egui::pos2(pointer.x, plot.bottom()),
+                ],
+                egui::Stroke::new(1.0, egui::Color32::from_white_alpha(75)),
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(plot.left(), pointer.y),
+                    egui::pos2(plot.right(), pointer.y),
+                ],
+                egui::Stroke::new(1.0, egui::Color32::from_white_alpha(75)),
+            );
+            if value.is_finite() {
+                let (unit_label, unit_scale) = table_display_unit(
+                    self.active_table_for_product(&readout.product),
+                    &readout.product,
+                );
+                let value_line = format!(
+                    "{} {:.1}{}{}",
+                    readout.product.label(),
+                    value / unit_scale,
+                    if unit_label.is_empty() { "" } else { " " },
+                    unit_label
+                );
+                let height_line = format!(
+                    "{:.0} km · {}",
+                    distance_km,
+                    units::format_beam_height(height_m, self.units())
+                );
+                let card_size = egui::vec2(210.0, 40.0);
+                let mut card_pos = pointer + egui::vec2(12.0, 12.0);
+                if card_pos.x + card_size.x > rect.right() {
+                    card_pos.x = pointer.x - card_size.x - 12.0;
+                }
+                if card_pos.y + card_size.y > rect.bottom() {
+                    card_pos.y = pointer.y - card_size.y - 12.0;
+                }
+                let card = egui::Rect::from_min_size(card_pos, card_size);
+                painter.rect_filled(
+                    card,
+                    2.0,
+                    egui::Color32::from_rgba_unmultiplied(8, 11, 15, 235),
+                );
+                painter.rect_stroke(
+                    card,
+                    2.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(95)),
+                    egui::StrokeKind::Outside,
+                );
+                painter.text(
+                    card.left_top() + egui::vec2(7.0, 7.0),
+                    egui::Align2::LEFT_TOP,
+                    value_line,
+                    egui::FontId::monospace(11.0),
+                    egui::Color32::WHITE,
+                );
+                painter.text(
+                    card.left_top() + egui::vec2(7.0, 23.0),
+                    egui::Align2::LEFT_TOP,
+                    height_line,
+                    egui::FontId::monospace(10.0),
+                    egui::Color32::from_rgb(190, 198, 210),
+                );
+            }
+        }
     }
 
     fn draw_radar_layer(&self, ctx: &egui::Context, painter: &egui::Painter, rect: egui::Rect) {
@@ -23545,6 +23921,9 @@ impl ViewerApp {
     }
 
     fn draw_graticule(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if !self.app_settings.show_lat_lon_grid {
+            return;
+        }
         let bounds = self.visible_geo_bounds(rect);
         let lon_min = bounds.west;
         let lon_max = bounds.east;
@@ -25885,6 +26264,16 @@ struct HazardOverlayShapes {
     labels: Vec<(egui::Pos2, String, bool)>,
 }
 
+#[derive(Clone, Debug)]
+struct CrossSectionReadout {
+    product: DisplayProduct,
+    width: usize,
+    height: usize,
+    top_m: f32,
+    length_m: f32,
+    values: Vec<f32>,
+}
+
 /// Display smoothing mode (Settings ▸ Display ▸ Smoothing). Persisted as a
 /// string in `AppSettings::smooth_display_mode`; the legacy
 /// `smooth_display` bool maps to `Soften` so old configs keep their look.
@@ -25930,6 +26319,29 @@ impl SmoothingMode {
     /// sample caches, interpolated cannot.
     fn changes_grid_geometry(self) -> bool {
         self == Self::Interpolated
+    }
+}
+
+fn cross_section_smoothing_from_settings(
+    settings: &settings::AppSettings,
+) -> CrossSectionSmoothing {
+    match settings.cross_section_smoothing.as_str() {
+        "native" => CrossSectionSmoothing::Native,
+        _ => CrossSectionSmoothing::Smoothed,
+    }
+}
+
+fn cross_section_smoothing_slug(smoothing: CrossSectionSmoothing) -> &'static str {
+    match smoothing {
+        CrossSectionSmoothing::Native => "native",
+        CrossSectionSmoothing::Smoothed => "smoothed",
+    }
+}
+
+fn cross_section_smoothing_label(smoothing: CrossSectionSmoothing) -> &'static str {
+    match smoothing {
+        CrossSectionSmoothing::Native => "Native",
+        CrossSectionSmoothing::Smoothed => "Smoothed",
     }
 }
 
@@ -36357,6 +36769,10 @@ mod tests {
             spc_last_key: None,
             glm: None,
             spc_rx: None,
+            mping_reports: Vec::new(),
+            mping_enabled: false,
+            mping_fetched_at: None,
+            mping_rx: None,
             event_explorer: event_explorer::EventExplorerState::default(),
             glm_enabled: false,
             oa_rx: None,
@@ -36378,6 +36794,8 @@ mod tests {
             surface_obs: obs::ObPool::new(),
             obs_fetched_at: None,
             obs_rx: None,
+            nws_obs_fetched_at: None,
+            nws_obs_rx: None,
             mesonet_fetched_at: None,
             mesonet_rx: None,
             last_sounding_request: None,
@@ -36409,6 +36827,8 @@ mod tests {
             cross_section_a_lonlat: None,
             cross_section_b_lonlat: None,
             cross_section_texture: None,
+            cross_section_readout: None,
+            cross_section_smoothing: CrossSectionSmoothing::Smoothed,
             cross_section_signature: None,
             cross_section_status: "Cross-section: arm, then click endpoint A then B".to_owned(),
             cross_section_top_m: CROSS_SECTION_TOP_M,

@@ -48,6 +48,7 @@ mod dmi;
 mod dwd;
 mod fmi;
 mod geosphere;
+mod kaia;
 pub mod listing;
 mod ord;
 mod shmu;
@@ -58,6 +59,7 @@ pub use dmi::DmiProvider;
 pub use dwd::DwdProvider;
 pub use fmi::FmiProvider;
 pub use geosphere::GeoSphereProvider;
+pub use kaia::KaiaEstoniaProvider;
 pub use ord::OrdProvider;
 pub use shmu::ShmuProvider;
 pub use smhi::SmhiProvider;
@@ -186,9 +188,11 @@ pub trait IntlProvider: Send + Sync {
 /// feeds (one frame = several ODIM files merged with
 /// `radar_core::merge_radar_volumes`): SHMU Slovakia, DWD Germany, CHMI
 /// Czechia. Multi-station tar feed (site-filtered decode, see
-/// [`JmaProvider`]): JMA Japan. Multi-country feed mixing single-file and
-/// split plan shapes per site: EUMETNET ORD ([`OrdProvider`], 14 European
-/// countries without a national BowEcho provider).
+/// [`JmaProvider`]): JMA Japan. Single-site KAIA bridge for Estonia's Harku
+/// radar, which is not currently present in ORD's rolling cache:
+/// [`KaiaEstoniaProvider`]. Multi-country feed mixing single-file and split
+/// plan shapes per site: EUMETNET ORD ([`OrdProvider`], 14 European countries
+/// without a national BowEcho provider).
 pub fn intl_providers() -> Vec<Box<dyn IntlProvider>> {
     vec![
         Box::new(SmhiProvider::new()),
@@ -199,6 +203,7 @@ pub fn intl_providers() -> Vec<Box<dyn IntlProvider>> {
         Box::new(DwdProvider::new()),
         Box::new(ChmiProvider::new()),
         Box::new(JmaProvider),
+        Box::new(KaiaEstoniaProvider::new()),
         Box::new(OrdProvider::new()),
     ]
 }
@@ -646,6 +651,7 @@ mod tests {
                 "dwd",
                 "chmi",
                 "jma",
+                "kaia",
                 "ord"
             ]
         );

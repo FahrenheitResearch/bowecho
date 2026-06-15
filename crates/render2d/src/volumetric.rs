@@ -243,6 +243,12 @@ pub enum InterpPolicy {
     VelocityGuard,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CrossSectionSmoothing {
+    Native,
+    Smoothed,
+}
+
 /// Slant range + elevation angle at (ground distance s, height h) — the
 /// exact closed-form inverse of the 4/3-earth height equation (law of
 /// cosines on the effective sphere; unit-tested to round-trip).
@@ -754,6 +760,26 @@ pub fn reflectivity_cross_section(
     height: usize,
     top_m: f32,
 ) -> Option<CrossSection> {
+    reflectivity_cross_section_with_smoothing(
+        volume,
+        start_km,
+        end_km,
+        width,
+        height,
+        top_m,
+        CrossSectionSmoothing::Smoothed,
+    )
+}
+
+pub fn reflectivity_cross_section_with_smoothing(
+    volume: &RadarVolume,
+    start_km: (f32, f32),
+    end_km: (f32, f32),
+    width: usize,
+    height: usize,
+    top_m: f32,
+    smoothing: CrossSectionSmoothing,
+) -> Option<CrossSection> {
     let cols = reflectivity_columns(volume);
     cross_section_from_columns(
         &cols,
@@ -763,6 +789,7 @@ pub fn reflectivity_cross_section(
         height,
         top_m,
         InterpPolicy::LinearAngle,
+        smoothing,
     )
 }
 
@@ -834,6 +861,31 @@ pub fn moment_cross_section(
     height: usize,
     top_m: f32,
 ) -> Option<CrossSection> {
+    moment_cross_section_with_smoothing(
+        volume,
+        moment,
+        policy,
+        start_km,
+        end_km,
+        width,
+        height,
+        top_m,
+        CrossSectionSmoothing::Smoothed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // section geometry is irreducibly 6 values
+pub fn moment_cross_section_with_smoothing(
+    volume: &RadarVolume,
+    moment: MomentType,
+    policy: InterpPolicy,
+    start_km: (f32, f32),
+    end_km: (f32, f32),
+    width: usize,
+    height: usize,
+    top_m: f32,
+    smoothing: CrossSectionSmoothing,
+) -> Option<CrossSection> {
     let mut cols: Vec<CutColumn<'_>> = volume
         .cuts
         .iter()
@@ -844,7 +896,9 @@ pub fn moment_cross_section(
         })
         .collect();
     cols.sort_by(|a, b| a.elevation_deg.total_cmp(&b.elevation_deg));
-    cross_section_from_columns(&cols, start_km, end_km, width, height, top_m, policy)
+    cross_section_from_columns(
+        &cols, start_km, end_km, width, height, top_m, policy, smoothing,
+    )
 }
 
 /// Dealiased-velocity vertical cross-section (m/s) — shows the RIJ descent /
@@ -914,6 +968,28 @@ pub fn velocity_cross_section_cached(
     height: usize,
     top_m: f32,
 ) -> Option<CrossSection> {
+    velocity_cross_section_cached_with_smoothing(
+        volume,
+        cache,
+        start_km,
+        end_km,
+        width,
+        height,
+        top_m,
+        CrossSectionSmoothing::Smoothed,
+    )
+}
+
+pub fn velocity_cross_section_cached_with_smoothing(
+    volume: &RadarVolume,
+    cache: &mut VolumeDealiasCache,
+    start_km: (f32, f32),
+    end_km: (f32, f32),
+    width: usize,
+    height: usize,
+    top_m: f32,
+    smoothing: CrossSectionSmoothing,
+) -> Option<CrossSection> {
     cache.ensure(volume);
     let mut cols: Vec<CutColumn<'_>> = cache
         .grids
@@ -929,6 +1005,7 @@ pub fn velocity_cross_section_cached(
         height,
         top_m,
         InterpPolicy::VelocityGuard,
+        smoothing,
     )
 }
 
@@ -942,6 +1019,7 @@ fn cross_section_from_columns(
     height: usize,
     top_m: f32,
     policy: InterpPolicy,
+    smoothing: CrossSectionSmoothing,
 ) -> Option<CrossSection> {
     if width < 2 || height < 2 || top_m <= 0.0 || cols.is_empty() {
         return None;
@@ -976,6 +1054,15 @@ fn cross_section_from_columns(
         for (y, v) in column.iter().enumerate() {
             values[y * width + x] = *v;
         }
+    }
+    if smoothing == CrossSectionSmoothing::Native {
+        return Some(CrossSection {
+            width,
+            height,
+            top_m,
+            length_m,
+            values,
+        });
     }
     // Path-sampling cleanup. Each column samples ONE nearest radial/gate, so
     // (a) some columns miss entirely (azimuth/gate gaps -> NaN stripes) and

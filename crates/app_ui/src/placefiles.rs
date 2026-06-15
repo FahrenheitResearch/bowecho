@@ -107,7 +107,7 @@ pub fn parse_placefile(text: &str, base_url: &str) -> Placefile {
     let mut pending_polygon: Option<Vec<(f32, f32)>> = None;
     let mut object_anchor: Option<(f32, f32)> = None;
 
-    for raw_line in text.lines() {
+    for raw_line in logical_lines(text) {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with(';') || line.starts_with("//") {
             continue;
@@ -234,11 +234,7 @@ pub fn parse_placefile(text: &str, base_url: &str) -> Placefile {
                     let heading = parts[2].trim().parse::<f32>().unwrap_or(0.0);
                     let file_index = parts[3].trim().parse::<u32>().unwrap_or(0);
                     let icon_index = parts[4].trim().parse::<u32>().unwrap_or(1);
-                    let label = parts
-                        .get(5)
-                        .map(|s| unquote(s))
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.lines().next().unwrap_or_default().to_owned());
+                    let label = parts.get(5).map(|s| unquote(s)).filter(|s| !s.is_empty());
                     push_item(
                         &mut out,
                         in_time_window,
@@ -428,6 +424,40 @@ fn pair_valid(a: f32, b: f32, offsets: bool) -> bool {
 
 fn unquote(value: &str) -> String {
     value.trim().trim_matches('"').trim().to_owned()
+}
+
+fn logical_lines(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for raw in text.lines() {
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(raw);
+        update_quote_state(raw, &mut in_quotes);
+        if !in_quotes {
+            out.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+fn update_quote_state(line: &str, in_quotes: &mut bool) {
+    let mut escaped = false;
+    for ch in line.chars() {
+        if ch == '\\' && !escaped {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' && !escaped {
+            *in_quotes = !*in_quotes;
+        }
+        escaped = false;
+    }
 }
 
 /// Push an item unless the active TimeRange excludes the current moment.
@@ -657,6 +687,36 @@ End:
         match &pf.objects[1] {
             PlacefileObject::Icon { anchor, .. } => assert!(anchor.is_none()),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_spotter_network_reports_with_multiline_hover() {
+        let sample = r#"
+Refresh: 1
+Threshold: 999
+Title: Spotter Network (96dpi) - Reports Only
+Font: 1, 11, 0, "Courier New"
+IconFile: 3, 30, 30, 15, 15, "https://www.spotternetwork.org/iconsheets/SN_Reports_096.png"
+Icon: 40.217899,-79.495102,000,3,3,"Reported By: Test Spotter\nRotating Wall Cloud\nTime: 2026-06-14 23:18:34 UTC\nNotes: first line
+second line from wrapped feed"
+"#;
+        let pf = parse_placefile(sample, "https://www.spotternetwork.org/feeds/reports.txt");
+        assert_eq!(pf.refresh_minutes, 1);
+        assert_eq!(pf.title, "Spotter Network (96dpi) - Reports Only");
+        assert_eq!(pf.icon_sheets.len(), 1);
+        assert_eq!(pf.icon_sheets[0].index, 3);
+        assert_eq!(pf.objects.len(), 1);
+        match &pf.objects[0] {
+            PlacefileObject::Icon {
+                file_index, label, ..
+            } => {
+                assert_eq!(*file_index, 3);
+                let label = label.as_deref().expect("report hover text");
+                assert!(label.contains("Rotating Wall Cloud"));
+                assert!(label.contains("second line from wrapped feed"));
+            }
+            other => panic!("expected report icon, got {other:?}"),
         }
     }
 
