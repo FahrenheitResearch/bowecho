@@ -200,6 +200,9 @@ pub(crate) enum Annotation {
     WarnPolygon {
         warn: WarnKind,
         points: Vec<GeoPoint>,
+        /// Optional diagonal hatch fill, matching watch-box hatch behavior.
+        #[serde(default)]
+        hatch: bool,
         /// Custom banner text; None = the kind's preset wording (none for
         /// Free polygons).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -743,14 +746,43 @@ impl ViewerApp {
                     }
                     match group {
                         ToolGroup::Fronts => {
-                            ui.separator();
-                            ui.checkbox(&mut self.annotations.outflow_pips, "Outflow pips")
-                                .on_hover_text("Add semicircle scallops to new outflow boundaries");
+                            if matches!(
+                                active,
+                                Some(ToolKind::Front(FrontKind::Outflow | FrontKind::Squall))
+                            ) {
+                                ui.separator();
+                                let changed = ui
+                                    .checkbox(&mut self.annotations.outflow_pips, "Outflow pips")
+                                    .on_hover_text(
+                                        "Add semicircle outflow scallops to new outflow boundaries and squall lines",
+                                    )
+                                    .changed();
+                                if changed
+                                    && let Some(Annotation::Front { front, pips, .. }) =
+                                        &mut self.annotations.draft
+                                    && matches!(*front, FrontKind::Outflow | FrontKind::Squall)
+                                {
+                                    *pips = self.annotations.outflow_pips;
+                                }
+                            }
                         }
                         ToolGroup::Boxes => {
                             ui.separator();
-                            ui.checkbox(&mut self.annotations.watch_hatch, "Hatch fill")
-                                .on_hover_text("Diagonal hatch fill for new watch boxes");
+                            let changed = ui
+                                .checkbox(&mut self.annotations.watch_hatch, "Hatch fill")
+                                .on_hover_text(
+                                    "Diagonal hatch fill for new watch boxes and warning/free polygons",
+                                )
+                                .changed();
+                            if changed {
+                                match &mut self.annotations.draft {
+                                    Some(Annotation::WatchBox { hatch, .. })
+                                    | Some(Annotation::WarnPolygon { hatch, .. }) => {
+                                        *hatch = self.annotations.watch_hatch;
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -1235,7 +1267,7 @@ pub(crate) fn start_draft(
             front,
             points: vec![geo],
             flip: flags.flip,
-            pips: front == FrontKind::Outflow && flags.pips,
+            pips: matches!(front, FrontKind::Outflow | FrontKind::Squall) && flags.pips,
             style,
         },
         ToolKind::FlowArrow => Annotation::FlowArrow {
@@ -1253,6 +1285,7 @@ pub(crate) fn start_draft(
         ToolKind::Warn(warn) => Annotation::WarnPolygon {
             warn,
             points: vec![geo],
+            hatch: flags.hatch,
             label: flags.label,
             style,
         },
@@ -1453,7 +1486,17 @@ mod tests {
             other => panic!("unexpected draft: {other:?}"),
         }
         assert!(draft_is_valid(&draft));
-        // Pips only apply to outflow boundaries.
+        // Pips apply to outflow boundaries and optional squall scallops.
+        let squall = start_draft(
+            ToolKind::Front(FrontKind::Squall),
+            p1,
+            style(),
+            flags.clone(),
+        );
+        match squall {
+            Annotation::Front { pips, .. } => assert!(pips),
+            other => panic!("unexpected draft: {other:?}"),
+        }
         let cold = start_draft(ToolKind::Front(FrontKind::Cold), p1, style(), flags);
         match cold {
             Annotation::Front { pips, .. } => assert!(!pips),
@@ -1468,8 +1511,15 @@ mod tests {
             ToolKind::Warn(WarnKind::Tor),
             p(-98.0, 34.0),
             style(),
-            DraftFlags::default(),
+            DraftFlags {
+                hatch: true,
+                ..Default::default()
+            },
         );
+        match &draft {
+            Annotation::WarnPolygon { hatch, .. } => assert!(*hatch),
+            other => panic!("unexpected draft: {other:?}"),
+        }
         update_draft(&mut draft, p(-97.5, 34.4), true);
         assert!(!draft_is_valid(&draft), "two vertices is not a polygon");
         update_draft(&mut draft, p(-97.2, 33.9), true);

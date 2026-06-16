@@ -59,6 +59,9 @@ pub(crate) struct EventExplorerState {
     pub pending_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     /// One-shot: start the history loop when the range load installs.
     pub pending_autoplay: bool,
+    /// Optional camera target for a clicked tornado track. Playback uses
+    /// the displayed frame time to interpolate from touchdown to lift.
+    pub camera_follow: Option<EventTrackCameraFollow>,
 }
 
 impl EventExplorerState {
@@ -95,6 +98,47 @@ impl EventTrackHit {
     fn lift_time(&self) -> DateTime<Utc> {
         self.end_time_utc
             .unwrap_or_else(|| estimated_track_end_time(self.time_utc, self.length_mi))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EventTrackCameraFollow {
+    pub label: String,
+    pub begin: (f32, f32),
+    pub end: (f32, f32),
+    pub start_utc: DateTime<Utc>,
+    pub end_utc: DateTime<Utc>,
+}
+
+impl EventTrackCameraFollow {
+    pub(crate) fn from_hit(hit: &EventTrackHit) -> Self {
+        Self {
+            label: hit.label.clone(),
+            begin: hit.begin,
+            end: hit.end,
+            start_utc: hit.time_utc,
+            end_utc: hit.lift_time(),
+        }
+    }
+
+    pub(crate) fn position_at(&self, time_utc: DateTime<Utc>) -> (f32, f32) {
+        let total = self
+            .end_utc
+            .signed_duration_since(self.start_utc)
+            .num_milliseconds()
+            .max(0) as f32;
+        if total <= f32::EPSILON {
+            return self.end;
+        }
+        let elapsed = time_utc
+            .signed_duration_since(self.start_utc)
+            .num_milliseconds()
+            .clamp(0, total as i64) as f32;
+        let t = elapsed / total;
+        (
+            self.begin.0 + (self.end.0 - self.begin.0) * t,
+            self.begin.1 + (self.end.1 - self.begin.1) * t,
+        )
     }
 }
 
@@ -394,6 +438,20 @@ impl crate::ViewerApp {
                 self.app_settings.event_pad_frames = pad;
                 let _ = self.app_settings.save();
             }
+            let mut camera_follow = self.app_settings.event_track_camera_follow;
+            if ui
+                .checkbox(&mut camera_follow, "Follow track")
+                .on_hover_text(
+                    "Tornado track clicks only: keep the camera centered on the estimated track position while the loaded loop plays.",
+                )
+                .changed()
+            {
+                self.app_settings.event_track_camera_follow = camera_follow;
+                if !camera_follow {
+                    self.event_explorer.camera_follow = None;
+                }
+                let _ = self.app_settings.save();
+            }
             let mut auto_model = self.app_settings.event_track_auto_model;
             let mut model_slug =
                 crate::normalize_event_track_model_slug(&self.app_settings.event_track_model_slug);
@@ -691,6 +749,10 @@ impl crate::ViewerApp {
         self.map_center_lon = (hit.begin.1 + hit.end.1) / 2.0;
         self.map_scale = self.map_scale.max(220.0);
         let end_time = hit.lift_time();
+        self.event_explorer.camera_follow = self
+            .app_settings
+            .event_track_camera_follow
+            .then(|| EventTrackCameraFollow::from_hit(hit));
         let primary_cache_hit =
             self.select_cached_event_frame(&primary_site_id, hit.time_utc, &hit.label, ctx);
         let load_plan = event_track_load_plan(primary_cache_hit, overlay);
@@ -830,6 +892,31 @@ mod tests {
         assert_eq!(point_segment_distance(pos(13.0, 4.0), a, b), 5.0);
         // Zero-length = point distance.
         assert_eq!(point_segment_distance(pos(3.0, 4.0), a, a), 5.0);
+    }
+
+    #[test]
+    fn track_camera_follow_interpolates_and_clamps_time() {
+        let start = Utc.with_ymd_and_hms(2026, 6, 14, 22, 0, 0).unwrap();
+        let end = start + ChronoDuration::minutes(20);
+        let follow = EventTrackCameraFollow {
+            label: "Test track".to_owned(),
+            begin: (35.0, -100.0),
+            end: (36.0, -98.0),
+            start_utc: start,
+            end_utc: end,
+        };
+
+        assert_eq!(
+            follow.position_at(start - ChronoDuration::minutes(5)),
+            follow.begin
+        );
+        assert_eq!(
+            follow.position_at(end + ChronoDuration::minutes(5)),
+            follow.end
+        );
+        let midpoint = follow.position_at(start + ChronoDuration::minutes(10));
+        assert!((midpoint.0 - 35.5).abs() < 0.001);
+        assert!((midpoint.1 + 99.0).abs() < 0.001);
     }
 
     #[test]

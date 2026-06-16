@@ -167,6 +167,7 @@ pub(crate) fn every_shape_kind() -> Vec<Annotation> {
         Annotation::WarnPolygon {
             warn: WarnKind::Svr,
             points: vec![p(-98.0, 34.0), p(-97.5, 34.4), p(-97.2, 33.9)],
+            hatch: true,
             label: Some("MACROBURST".to_owned()),
             style: styled,
         },

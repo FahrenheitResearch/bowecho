@@ -198,7 +198,7 @@ fn resolve_spec(
         .model
         .parse()
         .map_err(|_| format!("unknown model '{}'", spec.model))?;
-    if !rw_ingest::ingest_supported(model) {
+    if !bowecho_ingest_supported(model) {
         return Err(format!(
             "model '{}' is not ingest-supported yet",
             spec.model
@@ -220,6 +220,11 @@ fn resolve_spec(
         ));
     }
     Ok((model, profile, hours, cycle))
+}
+
+fn bowecho_ingest_supported(model: ModelId) -> bool {
+    matches!(model, ModelId::Hrrr | ModelId::Gfs | ModelId::Rap)
+        && rw_ingest::ingest_supported(model)
 }
 
 /// Source spec -> override: "auto" tries every catalog source in order.
@@ -932,6 +937,21 @@ mod tests {
         );
         // Models without a fetch plan surface an error, not a panic.
         assert!(probe_products(ModelId::Nbm, &sounding).is_err());
+    }
+
+    #[test]
+    fn bowecho_worker_accepts_rap_and_rejects_rrfs_until_enabled() {
+        let mut rap = spec();
+        rap.model = "rap".to_owned();
+        assert!(resolve_spec(&rap).is_ok());
+
+        let mut rrfs = spec();
+        rrfs.model = "rrfs-a".to_owned();
+        let err = resolve_spec(&rrfs).expect_err("RRFS is not a BowEcho model option yet");
+        assert!(
+            err.contains("not ingest-supported yet"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

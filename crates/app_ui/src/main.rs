@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -113,6 +115,7 @@ const HISTORY_SIZE_OPTIONS: &[usize] = &[3, 5, 7, 10, 15, 20, 25, 30];
 const DEFAULT_HISTORY_FRAME_LIMIT: usize = 7;
 const DEFAULT_ARCHIVE_FRAME_COUNT: usize = 10;
 const MAX_ARCHIVE_FRAME_COUNT: usize = 30;
+const MAX_LIVE_PRELOAD_FRAME_COUNT: usize = 10;
 pub(crate) const MAX_EVENT_PAD_FRAMES: u16 = 40;
 /// Hard ceiling for the frame strip — deployment folders legitimately
 /// load 100+ volumes.
@@ -331,6 +334,8 @@ const HAZARD_LABEL_CLICK_RADIUS_PX: f32 = 18.0;
 const HAZARD_MAX_RENDER_LON_SPAN_DEG: f32 = 45.0;
 const HAZARD_MAX_RENDER_LAT_SPAN_DEG: f32 = 30.0;
 const HAZARD_MAX_RENDER_EDGE_KM: f32 = 2_500.0;
+const HAZARD_GENERIC_ALERT_SPIKY_MIN_POINTS: usize = 8;
+const HAZARD_GENERIC_ALERT_SPIKY_PATH_RATIO: f32 = 1.6;
 const MAP_DRAG_DEAD_ZONE_PX: f32 = 3.0;
 const COLOR_STATUS_SCROLL_HEIGHT: f32 = 34.0;
 const HAZARD_LIST_SCROLL_HEIGHT: f32 = 156.0;
@@ -1999,6 +2004,7 @@ fn decode_archive_history_object(
 
 struct ArchiveHistoryLoadContext<'a> {
     site_id: &'a str,
+    progress_label: &'a str,
     site_cache_dir: &'a Path,
     known_frame_paths: &'a BTreeSet<PathBuf>,
     archive_lookup_ms: Option<f32>,
@@ -2016,7 +2022,7 @@ fn load_archive_history_objects_parallel(
     let total_objects = objects.len();
     let progress_total = ctx.progress_total.max(total_objects);
     let site_id = ctx.site_id;
-    let progress_label = format!("L2 {site_id} loop");
+    let progress_label = ctx.progress_label;
     let priority_count = total_objects.min(parallelism.min(3));
     let mut decoded_frames = Vec::new();
     let mut first_error = None;
@@ -2106,6 +2112,7 @@ fn spawn_latest_level2_load_worker(
     known_frame_paths: BTreeSet<PathBuf>,
     current_frame_identity: Option<FrameIdentity>,
     history_limit: usize,
+    live_preload_frame_count: usize,
     display_live_chunk_updates: bool,
     sender: mpsc::Sender<AsyncLoadResult>,
 ) {
@@ -2117,7 +2124,10 @@ fn spawn_latest_level2_load_worker(
         let final_update = (|| -> Result<AsyncLoadUpdate, String> {
             let history_limit = history_limit.max(1);
             let explicit_loop_load = mode == LatestLoadMode::Loop;
+            let live_preload_frames =
+                live_preload_frames_for_mode(mode, live_preload_frame_count, history_limit);
             let loop_progress_label = format!("L2 {site_id} loop");
+            let preload_progress_label = format!("L2 {site_id} preload");
             if explicit_loop_load {
                 send_archive_progress(
                     &sender,
@@ -2253,9 +2263,12 @@ fn spawn_latest_level2_load_worker(
                 }
             }
 
-            let needs_archive_frames = explicit_loop_load || decoded_frames.is_empty();
-            if needs_archive_frames {
-                let archive_limit = if explicit_loop_load { history_limit } else { 1 };
+            if let Some(archive_limit) = archive_fetch_count_for_latest_load(
+                mode,
+                live_preload_frames,
+                history_limit,
+                !decoded_frames.is_empty(),
+            ) {
                 let archive_lookup_start = Instant::now();
                 let mut archive_lookup_ms = None;
                 if explicit_loop_load {
@@ -2263,6 +2276,14 @@ fn spawn_latest_level2_load_worker(
                         &sender,
                         &loop_progress_label,
                         "Listing recent archive scans",
+                        0,
+                        0,
+                    );
+                } else if live_preload_frames > 0 {
+                    send_archive_progress(
+                        &sender,
+                        &preload_progress_label,
+                        "Listing recent history",
                         0,
                         0,
                     );
@@ -2276,10 +2297,14 @@ fn spawn_latest_level2_load_worker(
                         }
                         Err(err) => {
                             fallback_error.get_or_insert_with(|| err.to_string());
-                            if explicit_loop_load {
+                            if explicit_loop_load || live_preload_frames > 0 {
                                 send_archive_progress(
                                     &sender,
-                                    &loop_progress_label,
+                                    if explicit_loop_load {
+                                        &loop_progress_label
+                                    } else {
+                                        &preload_progress_label
+                                    },
                                     "Archive scan listing failed",
                                     0,
                                     0,
@@ -2290,11 +2315,19 @@ fn spawn_latest_level2_load_worker(
                     };
                 let recent_archive_total = recent_archive_objects.len();
                 let mut archive_progress_done = 0usize;
-                if explicit_loop_load && recent_archive_total > 0 {
+                if (explicit_loop_load || live_preload_frames > 0) && recent_archive_total > 0 {
                     send_archive_progress(
                         &sender,
-                        &loop_progress_label,
-                        "Queued recent archive scans",
+                        if explicit_loop_load {
+                            &loop_progress_label
+                        } else {
+                            &preload_progress_label
+                        },
+                        if explicit_loop_load {
+                            "Queued recent archive scans"
+                        } else {
+                            "Queued live preload frames"
+                        },
                         0,
                         recent_archive_total,
                     );
@@ -2302,9 +2335,6 @@ fn spawn_latest_level2_load_worker(
 
                 let mut remaining_archive_objects = Vec::new();
                 for (index, object) in recent_archive_objects.into_iter().enumerate() {
-                    if !explicit_loop_load && !decoded_frames.is_empty() {
-                        break;
-                    }
                     if selected_identity.is_none() {
                         let select_archive_frame = true;
                         let progress_detail = match decode_archive_history_object(
@@ -2340,25 +2370,39 @@ fn spawn_latest_level2_load_worker(
                                 "Archive frame failed"
                             }
                         };
-                        if explicit_loop_load {
+                        if explicit_loop_load || live_preload_frames > 0 {
                             archive_progress_done += 1;
                             send_archive_progress(
                                 &sender,
-                                &loop_progress_label,
+                                if explicit_loop_load {
+                                    &loop_progress_label
+                                } else {
+                                    &preload_progress_label
+                                },
                                 progress_detail,
                                 archive_progress_done,
                                 recent_archive_total,
                             );
                         }
-                    } else if explicit_loop_load {
+                    } else if explicit_loop_load || live_preload_frames > 0 {
                         remaining_archive_objects.push((index, object));
+                    } else {
+                        break;
                     }
                 }
 
-                if explicit_loop_load && !remaining_archive_objects.is_empty() {
+                if (explicit_loop_load || live_preload_frames > 0)
+                    && !remaining_archive_objects.is_empty()
+                {
+                    let progress_label = if explicit_loop_load {
+                        &loop_progress_label
+                    } else {
+                        &preload_progress_label
+                    };
                     let (history_frames, history_error) = load_archive_history_objects_parallel(
                         ArchiveHistoryLoadContext {
                             site_id: &site_id,
+                            progress_label,
                             site_cache_dir: &site_cache_dir,
                             known_frame_paths: &known_frame_paths,
                             archive_lookup_ms,
@@ -5011,6 +5055,7 @@ impl ViewerApp {
             BTreeSet::new(),
             None,
             1,
+            0,
             false,
             sender,
         );
@@ -5317,7 +5362,27 @@ impl ViewerApp {
             frame.status,
             ctx,
         );
-        self.status = self.selected_frame_status_text();
+        let frame_status = self.selected_frame_status_text();
+        if let Some(label) = self.apply_event_track_camera_follow_for_frame(&frame.volume, ctx) {
+            self.status = format!("{frame_status} - following {label}");
+        } else {
+            self.status = frame_status;
+        }
+    }
+
+    fn apply_event_track_camera_follow_for_frame(
+        &mut self,
+        volume: &RadarVolume,
+        ctx: &egui::Context,
+    ) -> Option<String> {
+        let follow = self.event_explorer.camera_follow.clone()?;
+        let (lat, lon) = follow.position_at(volume.volume_time.with_timezone(&Utc));
+        self.map_center_lat = lat.clamp(-85.0, 85.0);
+        self.map_center_lon = normalize_lon(lon);
+        self.clamp_map_center();
+        self.clear_texture();
+        ctx.request_repaint();
+        Some(follow.label)
     }
 
     fn install_volume_arc(
@@ -7924,6 +7989,19 @@ impl ViewerApp {
             .as_ref()
             .filter(|volume| volume.site.id == site_id)
             .map(|volume| frame_identity_for_volume(volume.as_ref()));
+        let live_preload_frame_count = if mode == LatestLoadMode::User {
+            normalized_live_preload_frame_count(usize::from(
+                self.app_settings.live_preload_frame_count,
+            ))
+        } else {
+            0
+        };
+        let history_frame_limit = self
+            .history_frame_limit
+            .max(live_preload_frame_count.saturating_add(1));
+        if live_preload_frame_count > 0 {
+            self.history_frame_limit = normalized_history_limit(history_frame_limit);
+        }
         let progress = (mode == LatestLoadMode::Loop)
             .then(|| ArchiveLoadProgress::latest_loop_start(&site_id));
         {
@@ -7946,7 +8024,8 @@ impl ViewerApp {
             current_source_path,
             known_frame_paths,
             current_frame_identity,
-            self.history_frame_limit,
+            history_frame_limit,
+            live_preload_frame_count,
             self.display_live_chunk_updates,
             sender,
         );
@@ -9184,6 +9263,7 @@ impl ViewerApp {
             return;
         };
         let site_id = self.sites[site_index].level2_id.clone();
+        self.event_explorer.camera_follow = None;
         self.selected_site_index = site_index;
         self.map_center_lat = lat;
         self.map_center_lon = lon;
@@ -9236,6 +9316,7 @@ impl ViewerApp {
             return;
         };
         let site_id = self.sites[site_index].level2_id.clone();
+        self.event_explorer.camera_follow = None;
         self.selected_site_index = site_index;
         self.map_center_lat = report.lat;
         self.map_center_lon = report.lon;
@@ -10013,6 +10094,7 @@ impl ViewerApp {
         self.realtime_level2_auto_refresh = false;
         self.archive_pending_event = None;
         self.pending_debug_archive_case = None;
+        self.event_explorer.camera_follow = None;
         self.archive_date_input = plan.start_utc.format("%Y-%m-%d").to_string();
         self.archive_volumes = None;
         self.archive_list_receiver = None;
@@ -10120,6 +10202,7 @@ impl ViewerApp {
                 let (mut decoded_frames, first_error) = load_archive_history_objects_parallel(
                     ArchiveHistoryLoadContext {
                         site_id: &site_id,
+                        progress_label: "Event loop radar",
                         site_cache_dir: &site_cache,
                         known_frame_paths: &known_frame_paths,
                         archive_lookup_ms: None,
@@ -10177,6 +10260,9 @@ impl ViewerApp {
             // poll; keep poll_url/poll_last_file so Start resumes it.
             self.poll_active = false;
         }
+        if mode != LatestLoadMode::AutoRefresh {
+            self.event_explorer.camera_follow = None;
+        }
         if history_contains_other_site(&self.frame_history, &site_id) {
             self.clear_frame_history();
         }
@@ -10200,11 +10286,26 @@ impl ViewerApp {
             self.status = progress.status_text();
             self.archive_load_progress = Some(progress);
         }
+        let live_preload_frame_count = if mode == LatestLoadMode::User {
+            normalized_live_preload_frame_count(usize::from(
+                self.app_settings.live_preload_frame_count,
+            ))
+        } else {
+            0
+        };
+        if live_preload_frame_count > 0 {
+            self.history_frame_limit = normalized_history_limit(
+                self.history_frame_limit
+                    .max(live_preload_frame_count.saturating_add(1)),
+            );
+        }
         let current_source_path = (mode == LatestLoadMode::AutoRefresh)
             .then(|| self.source_path.clone())
             .flatten();
         let known_frame_paths =
-            if matches!(mode, LatestLoadMode::AutoRefresh | LatestLoadMode::Loop) {
+            if matches!(mode, LatestLoadMode::AutoRefresh | LatestLoadMode::Loop)
+                || live_preload_frame_count > 0
+            {
                 self.current_history_paths()
             } else {
                 BTreeSet::new()
@@ -10230,6 +10331,7 @@ impl ViewerApp {
             known_frame_paths,
             current_frame_identity,
             self.history_frame_limit,
+            live_preload_frame_count,
             self.display_live_chunk_updates,
             sender,
         );
@@ -13012,6 +13114,26 @@ impl ViewerApp {
                 .on_hover_text(
                     "Display incomplete live chunk tilts before a full low-level tilt is available",
                 );
+            let mut live_preload = normalized_live_preload_frame_count(usize::from(
+                self.app_settings.live_preload_frame_count,
+            ));
+            ui.label("Preload").on_hover_text(
+                "After Load Latest displays the newest scan, backfill this many previous scans in the background",
+            );
+            if ui
+                .add(
+                    egui::DragValue::new(&mut live_preload)
+                        .range(0..=MAX_LIVE_PRELOAD_FRAME_COUNT)
+                        .speed(0.1),
+                )
+                .on_hover_text(
+                    "0 disables the quick history backfill. Use Load Loop for a full recent loop.",
+                )
+                .changed()
+            {
+                self.app_settings.live_preload_frame_count = live_preload as u16;
+                let _ = self.app_settings.save();
+            }
             // Native file dialog (Windows/macOS; Linux needs the GTK dev
             // libs rfd's portal backends pull in — same gating as the
             // color-table browser).
@@ -16358,6 +16480,7 @@ impl ViewerApp {
                 // Pan through the projection's own inverse: linear degree
                 // math is only locally correct under AEQD and drifted at
                 // distance/zoom-out (field QOL report).
+                self.event_explorer.camera_follow = None;
                 let (lon, lat) = self.screen_to_lon_lat(rect, rect.center() - delta);
                 self.center_map_on(lat, lon);
             }
@@ -16369,6 +16492,7 @@ impl ViewerApp {
                 let pointer = ui.input(|input| input.pointer.hover_pos());
                 let before = pointer.map(|position| self.screen_to_lon_lat(rect, position));
                 let factor = (1.0_f32 + scroll / 600.0).clamp(0.75, 1.35);
+                self.event_explorer.camera_follow = None;
                 self.map_scale = (self.map_scale * factor).clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
                 if let (Some(position), Some((lon_before, lat_before))) = (pointer, before) {
                     let (lon_after, lat_after) = self.screen_to_lon_lat(rect, position);
@@ -16803,6 +16927,7 @@ impl ViewerApp {
                 let delta = response.drag_delta();
                 if delta.length_sq() >= MAP_DRAG_DEAD_ZONE_PX * MAP_DRAG_DEAD_ZONE_PX {
                     // Projection-true pan — see the single-pane handler.
+                    self.event_explorer.camera_follow = None;
                     let (lon, lat) = self.screen_to_lon_lat(cell, cell.center() - delta);
                     self.center_map_on(lat, lon);
                 }
@@ -16814,6 +16939,7 @@ impl ViewerApp {
                     let pointer = ui.input(|input| input.pointer.hover_pos());
                     let before = pointer.map(|position| self.screen_to_lon_lat(cell, position));
                     let factor = (1.0_f32 + scroll / 600.0).clamp(0.75, 1.35);
+                    self.event_explorer.camera_follow = None;
                     self.map_scale = (self.map_scale * factor).clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
                     if let (Some(position), Some((lon_before, lat_before))) = (pointer, before) {
                         let (lon_after, lat_after) = self.screen_to_lon_lat(cell, position);
@@ -30038,20 +30164,22 @@ fn prune_model_store(store_root: &str, keep: usize) {
 fn ingest_worker_model_options() -> Vec<rw_ui::ModelOption> {
     rustwx_models::supported_models()
         .iter()
-        .map(|&model| {
-            let enabled = rw_ingest::ingest_supported(model);
-            rw_ui::ModelOption {
-                slug: model.as_str().to_string(),
-                label: model.as_str().to_uppercase(),
-                enabled,
-                note: if enabled {
-                    String::new()
-                } else {
-                    "ingest not yet supported — multi-model coming soon".to_string()
-                },
-            }
+        .copied()
+        .filter(|&model| bowecho_model_download_supported(model))
+        .map(|model| rw_ui::ModelOption {
+            slug: model.as_str().to_string(),
+            label: model.as_str().to_uppercase(),
+            enabled: true,
+            note: String::new(),
         })
         .collect()
+}
+
+fn bowecho_model_download_supported(model: rustwx_core::ModelId) -> bool {
+    matches!(
+        model,
+        rustwx_core::ModelId::Hrrr | rustwx_core::ModelId::Gfs | rustwx_core::ModelId::Rap
+    ) && rw_ingest::ingest_supported(model)
 }
 
 /// Keep the download panel's cycle/source pickers + hours hint in sync
@@ -30245,7 +30373,7 @@ fn default_download_spec(model_slug: &str) -> rw_ui::DownloadSpec {
     let model = model_slug
         .parse::<rustwx_core::ModelId>()
         .ok()
-        .filter(|&model| rw_ingest::ingest_supported(model))
+        .filter(|&model| bowecho_model_download_supported(model))
         .unwrap_or(rustwx_core::ModelId::Hrrr);
     rw_ui::DownloadSpec {
         model: model.as_str().to_owned(),
@@ -31481,38 +31609,40 @@ fn parse_weather_alert_feature(
     Ok(rings
         .into_iter()
         .enumerate()
-        .filter(|(_, points)| points.len() >= 3)
-        .map(|(index, points)| HazardRecord {
-            event_id: if label_count > 1 {
-                format!("{event_id}#{index}")
-            } else {
-                event_id.clone()
-            },
-            label: if label_count > 1 {
-                format!("{} {}", label, index + 1)
-            } else {
-                label.clone()
-            },
-            event_family: event_family.clone(),
-            action: "ALERT".to_owned(),
-            lifecycle_status: lifecycle_status.clone(),
-            office: office.clone(),
-            headline: headline.clone(),
-            source_url: source_url.clone(),
-            area: area.clone(),
-            motion: motion.clone(),
-            details: Vec::new(),
-            valid_start: valid_start_text.clone(),
-            valid_end: valid_end_text.clone(),
-            severity: feature.properties.severity.clone(),
-            certainty: feature.properties.certainty.clone(),
-            urgency: feature.properties.urgency.clone(),
-            tornado: tags.tornado.clone(),
-            hail_inches: tags.hail_inches,
-            wind_mph: tags.wind_mph,
-            damage_threat: tags.damage_threat.clone(),
-            bbox: hazard_bbox(&points),
-            points,
+        .filter_map(|(index, points)| {
+            let points = sanitize_weather_alert_ring(points, &event_family);
+            (points.len() >= 3).then(|| HazardRecord {
+                event_id: if label_count > 1 {
+                    format!("{event_id}#{index}")
+                } else {
+                    event_id.clone()
+                },
+                label: if label_count > 1 {
+                    format!("{} {}", label, index + 1)
+                } else {
+                    label.clone()
+                },
+                event_family: event_family.clone(),
+                action: "ALERT".to_owned(),
+                lifecycle_status: lifecycle_status.clone(),
+                office: office.clone(),
+                headline: headline.clone(),
+                source_url: source_url.clone(),
+                area: area.clone(),
+                motion: motion.clone(),
+                details: Vec::new(),
+                valid_start: valid_start_text.clone(),
+                valid_end: valid_end_text.clone(),
+                severity: feature.properties.severity.clone(),
+                certainty: feature.properties.certainty.clone(),
+                urgency: feature.properties.urgency.clone(),
+                tornado: tags.tornado.clone(),
+                hail_inches: tags.hail_inches,
+                wind_mph: tags.wind_mph,
+                damage_threat: tags.damage_threat.clone(),
+                bbox: hazard_bbox(&points),
+                points,
+            })
         })
         .collect())
 }
@@ -32353,6 +32483,85 @@ fn hazard_points_renderable(points: &[HazardPoint]) -> bool {
     true
 }
 
+fn sanitize_weather_alert_ring(points: Vec<HazardPoint>, event_family: &str) -> Vec<HazardPoint> {
+    if event_family != "alert" || !generic_alert_ring_needs_hull(&points) {
+        return points;
+    }
+    let hull = hazard_convex_hull(&points);
+    if hull.len() >= 3 { hull } else { points }
+}
+
+fn generic_alert_ring_needs_hull(points: &[HazardPoint]) -> bool {
+    if points.len() < HAZARD_GENERIC_ALERT_SPIKY_MIN_POINTS {
+        return false;
+    }
+    let hull = hazard_convex_hull(points);
+    if hull.len() < 3 || hull.len().saturating_add(2) >= points.len() {
+        return false;
+    }
+    let hull_perimeter = hazard_ring_perimeter_km(&hull);
+    hull_perimeter > f32::EPSILON
+        && hazard_ring_perimeter_km(points) / hull_perimeter
+            >= HAZARD_GENERIC_ALERT_SPIKY_PATH_RATIO
+}
+
+fn hazard_ring_perimeter_km(points: &[HazardPoint]) -> f32 {
+    if points.len() < 2 {
+        return 0.0;
+    }
+    let mut previous = points[points.len() - 1];
+    let mut total = 0.0;
+    for point in points {
+        total += hazard_point_distance_km(previous, *point);
+        previous = *point;
+    }
+    total
+}
+
+fn hazard_convex_hull(points: &[HazardPoint]) -> Vec<HazardPoint> {
+    let mut unique = points.to_vec();
+    unique.sort_by(|left, right| {
+        left.lon
+            .total_cmp(&right.lon)
+            .then_with(|| left.lat.total_cmp(&right.lat))
+    });
+    unique.dedup_by(|left, right| {
+        (left.lon - right.lon).abs() <= f32::EPSILON && (left.lat - right.lat).abs() <= f32::EPSILON
+    });
+    if unique.len() <= 3 {
+        return unique;
+    }
+
+    let mut lower = Vec::<HazardPoint>::new();
+    for point in &unique {
+        while lower.len() >= 2
+            && hazard_point_cross(lower[lower.len() - 2], lower[lower.len() - 1], *point) <= 0.0
+        {
+            lower.pop();
+        }
+        lower.push(*point);
+    }
+
+    let mut upper = Vec::<HazardPoint>::new();
+    for point in unique.iter().rev() {
+        while upper.len() >= 2
+            && hazard_point_cross(upper[upper.len() - 2], upper[upper.len() - 1], *point) <= 0.0
+        {
+            upper.pop();
+        }
+        upper.push(*point);
+    }
+
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    lower
+}
+
+fn hazard_point_cross(origin: HazardPoint, a: HazardPoint, b: HazardPoint) -> f32 {
+    (a.lon - origin.lon) * (b.lat - origin.lat) - (a.lat - origin.lat) * (b.lon - origin.lon)
+}
+
 fn hazard_point_distance_km(a: HazardPoint, b: HazardPoint) -> f32 {
     const EARTH_RADIUS_KM: f32 = 6_371.0;
     let lat1 = a.lat.to_radians();
@@ -33029,6 +33238,36 @@ fn should_clear_display_before_latest_load(
 /// stop the poller.
 fn latest_load_pauses_poll(mode: LatestLoadMode, poll_active: bool) -> bool {
     poll_active && mode != LatestLoadMode::AutoRefresh
+}
+
+fn live_preload_frames_for_mode(
+    mode: LatestLoadMode,
+    requested: usize,
+    history_limit: usize,
+) -> usize {
+    if mode != LatestLoadMode::User {
+        return 0;
+    }
+    requested
+        .min(MAX_LIVE_PRELOAD_FRAME_COUNT)
+        .min(history_limit.saturating_sub(1))
+}
+
+fn archive_fetch_count_for_latest_load(
+    mode: LatestLoadMode,
+    live_preload_frames: usize,
+    history_limit: usize,
+    has_displayed_frame: bool,
+) -> Option<usize> {
+    let history_limit = history_limit.max(1);
+    match mode {
+        LatestLoadMode::Loop => Some(history_limit),
+        LatestLoadMode::AutoRefresh if has_displayed_frame => None,
+        LatestLoadMode::AutoRefresh => Some(1),
+        LatestLoadMode::User if live_preload_frames > 0 => Some(live_preload_frames + 1),
+        LatestLoadMode::User if !has_displayed_frame => Some(1),
+        LatestLoadMode::User => None,
+    }
 }
 
 /// Newest data file in a GR2A dir.list ("<size> <filename>" or bare names,
@@ -33758,6 +33997,10 @@ fn normalized_archive_frame_count(count: usize) -> usize {
     } else {
         count.clamp(1, MAX_ARCHIVE_FRAME_COUNT)
     }
+}
+
+fn normalized_live_preload_frame_count(count: usize) -> usize {
+    count.min(MAX_LIVE_PRELOAD_FRAME_COUNT)
 }
 
 fn decoded_load_is_ord_archive_frame(frame: &DecodedLoad) -> bool {
@@ -37222,6 +37465,38 @@ mod tests {
     }
 
     #[test]
+    fn live_preload_only_applies_to_explicit_latest_loads() {
+        assert_eq!(live_preload_frames_for_mode(LatestLoadMode::User, 5, 7), 5);
+        assert_eq!(live_preload_frames_for_mode(LatestLoadMode::User, 50, 7), 6);
+        assert_eq!(live_preload_frames_for_mode(LatestLoadMode::Loop, 5, 7), 0);
+        assert_eq!(
+            live_preload_frames_for_mode(LatestLoadMode::AutoRefresh, 5, 7),
+            0
+        );
+
+        assert_eq!(
+            archive_fetch_count_for_latest_load(LatestLoadMode::User, 5, 7, true),
+            Some(6)
+        );
+        assert_eq!(
+            archive_fetch_count_for_latest_load(LatestLoadMode::User, 0, 7, true),
+            None
+        );
+        assert_eq!(
+            archive_fetch_count_for_latest_load(LatestLoadMode::User, 0, 7, false),
+            Some(1)
+        );
+        assert_eq!(
+            archive_fetch_count_for_latest_load(LatestLoadMode::Loop, 0, 7, true),
+            Some(7)
+        );
+        assert_eq!(
+            archive_fetch_count_for_latest_load(LatestLoadMode::AutoRefresh, 0, 7, true),
+            None
+        );
+    }
+
+    #[test]
     fn newest_dir_list_entry_skips_metadata_and_dirs() {
         // The field repro: latest.json sorts after every timestamped
         // volume and poisoned the lexicographic pick on a local bridge.
@@ -38205,6 +38480,65 @@ mod tests {
                 lat: 37.33
             }
         ));
+    }
+
+    #[test]
+    fn weather_gov_alert_parser_sanitizes_spiky_generic_alert_geometry() {
+        let feature: WeatherAlertFeature = serde_json::from_value(serde_json::json!({
+            "id": "https://api.weather.gov/alerts/urn:oid:marine-spike",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [-97.39, 26.90],
+                    [-97.36, 27.24],
+                    [-96.95, 26.79],
+                    [-97.30, 26.63],
+                    [-97.38, 26.89],
+                    [-97.31, 26.65],
+                    [-97.35, 26.70],
+                    [-97.32, 26.62],
+                    [-97.33, 26.62],
+                    [-97.33, 26.63],
+                    [-97.44, 26.59],
+                    [-97.58, 26.85],
+                    [-97.56, 26.84],
+                    [-97.57, 26.98],
+                    [-97.42, 27.25],
+                    [-97.39, 26.90]
+                ]]
+            },
+            "properties": {
+                "id": "urn:oid:marine-spike",
+                "event": "Marine Weather Statement",
+                "headline": "Marine Weather Statement issued June 15 at 10:28PM CDT by NWS Brownsville TX",
+                "areaDesc": "Laguna Madre From 5 nm North Of Port Mansfield To Baffin Bay TX",
+                "senderName": "NWS Brownsville TX",
+                "severity": "Minor",
+                "certainty": "Observed",
+                "urgency": "Expected",
+                "onset": "2026-06-16T03:28:00+00:00",
+                "expires": "2026-06-16T04:30:00+00:00",
+                "parameters": {}
+            }
+        }))
+        .expect("spiky marine alert feature");
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 16, 4, 20, 19)
+            .single()
+            .expect("valid query time");
+
+        let records =
+            parse_weather_alert_feature(&feature, query_time).expect("weather alert feature parse");
+
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.event_family, "alert");
+        assert_eq!(record.label, "ALERT");
+        assert_eq!(record.lifecycle_status.as_deref(), Some("Active"));
+        assert!(record.points.len() < 15);
+        assert_eq!(record.bbox, hazard_bbox(&record.points));
+        assert!(hazard_points_renderable(&record.points));
+        assert!(!generic_alert_ring_needs_hull(&record.points));
     }
 
     #[test]
@@ -40540,6 +40874,22 @@ mod tests {
         assert!(!app.obs_enabled);
         assert!(!app.obs_adjust_soundings);
         assert!(!app.glm_enabled);
+    }
+
+    #[test]
+    fn model_download_options_expose_rap_not_rrfs() {
+        let options = ingest_worker_model_options();
+
+        assert!(
+            options
+                .iter()
+                .any(|option| option.slug == "rap" && option.enabled),
+            "RAP must be active in BowEcho's model download picker"
+        );
+        assert!(
+            !options.iter().any(|option| option.slug.starts_with("rrfs")),
+            "RRFS should stay hidden until BowEcho intentionally supports it"
+        );
     }
 
     #[test]

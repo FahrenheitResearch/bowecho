@@ -117,11 +117,12 @@ pub(crate) fn annotation<F: Fn(GeoPoint) -> Pos2>(
         Annotation::WarnPolygon {
             warn,
             points,
+            hatch,
             label,
             style,
         } => {
             let pts: Vec<Pos2> = points.iter().map(|p| project(*p)).collect();
-            draw_warn_polygon(painter, *warn, &pts, label.as_deref(), style, alpha);
+            draw_warn_polygon(painter, *warn, &pts, *hatch, label.as_deref(), style, alpha);
         }
         Annotation::Icon { icon, at, style } => {
             draw_icon(painter, *icon, project(*at), style, alpha);
@@ -472,6 +473,9 @@ fn draw_front(
         FrontKind::Squall => {
             stroke_open(painter, &pts, t + 2.5, color, alpha);
             squall_ticks(painter, &pts, total, t, color, alpha);
+            if pips {
+                front_arcs(painter, &pts, total, t, side, color, alpha, 1, 0, false);
+            }
         }
     }
 }
@@ -649,6 +653,7 @@ fn draw_warn_polygon(
     painter: &egui::Painter,
     kind: WarnKind,
     pts: &[Pos2],
+    hatch: bool,
     label_override: Option<&str>,
     style: &ShapeStyle,
     alpha: f32,
@@ -658,6 +663,12 @@ fn draw_warn_polygon(
     }
     let stroke_color = resolve_color(style, ToolKind::Warn(kind), alpha);
     fill_polygon(painter, pts, fade(stroke_color, warn_fill_alpha(kind)));
+    if hatch {
+        let hatch_stroke = Stroke::new(HATCH_STROKE_WIDTH, fade(stroke_color, HATCH_STROKE_ALPHA));
+        for (a, b) in hatch_lines(pts, 135.0, WATCH_HATCH_PERIOD) {
+            painter.line_segment([a, b], hatch_stroke);
+        }
+    }
     let width = style.thickness + 0.5;
     painter.add(egui::Shape::closed_line(
         pts.to_vec(),

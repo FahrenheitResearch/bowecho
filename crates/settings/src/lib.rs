@@ -172,6 +172,10 @@ pub struct AppSettings {
     /// for storm events while browsing other model products elsewhere.
     #[serde(default = "default_model_slug")]
     pub event_track_model_slug: String,
+    /// When a tornado track click loads an archive loop, keep the camera
+    /// centered on the estimated tornado position as frames advance.
+    #[serde(default = "default_true")]
+    pub event_track_camera_follow: bool,
     /// Archive browser click mode: true = load a loop ending at the chosen
     /// scan, false = load only that scan.
     #[serde(default = "default_true")]
@@ -180,6 +184,11 @@ pub struct AppSettings {
     /// supported range when read.
     #[serde(default = "default_archive_frame_count")]
     pub archive_frame_count: u16,
+    /// After an explicit live "Load Latest", backfill this many prior
+    /// Level II frames in the background so a short loop is available
+    /// almost immediately. Auto-refresh does not use this.
+    #[serde(default = "default_live_preload_frame_count")]
+    pub live_preload_frame_count: u16,
     /// Last GR2A-style poll URL (mobile/research radar feeds) — typing it
     /// once per deployment is fine, once per session is not.
     #[serde(default)]
@@ -263,6 +272,10 @@ fn default_event_pad_frames() -> u16 {
 
 fn default_archive_frame_count() -> u16 {
     10
+}
+
+fn default_live_preload_frame_count() -> u16 {
+    5
 }
 
 /// A persisted FARM drape georeference. Coordinates are stored as scaled
@@ -387,8 +400,10 @@ impl Default for AppSettings {
             event_pad_frames: default_event_pad_frames(),
             event_track_auto_model: false,
             event_track_model_slug: default_model_slug(),
+            event_track_camera_follow: true,
             archive_load_loop: true,
             archive_frame_count: default_archive_frame_count(),
+            live_preload_frame_count: default_live_preload_frame_count(),
             poll_url: String::new(),
             custom_poll_links: Vec::new(),
             intl_provider: String::new(),
@@ -691,6 +706,7 @@ mod tests {
             alert_sound_families: vec!["tornado".to_owned(), "severe thunderstorm".to_owned()],
             archive_load_loop: false,
             archive_frame_count: 17,
+            live_preload_frame_count: 6,
             intl_provider: "smhi".to_owned(),
             intl_site: "angelholm".to_owned(),
             ..Default::default()
@@ -775,16 +791,19 @@ mod tests {
         let old = AppSettings::from_json("{}");
         assert!(old.archive_load_loop);
         assert_eq!(old.archive_frame_count, 10);
+        assert_eq!(old.live_preload_frame_count, 5);
 
         let settings = AppSettings {
             archive_load_loop: false,
             archive_frame_count: 24,
+            live_preload_frame_count: 4,
             ..Default::default()
         };
         let back = AppSettings::from_json(&settings.to_json());
 
         assert!(!back.archive_load_loop);
         assert_eq!(back.archive_frame_count, 24);
+        assert_eq!(back.live_preload_frame_count, 4);
     }
 
     #[test]
@@ -821,16 +840,19 @@ mod tests {
         let old = AppSettings::from_json("{}");
         assert!(!old.event_track_auto_model);
         assert_eq!(old.event_track_model_slug, "hrrr");
+        assert!(old.event_track_camera_follow);
 
         let settings = AppSettings {
             event_track_auto_model: true,
             event_track_model_slug: "rap".to_owned(),
+            event_track_camera_follow: false,
             ..Default::default()
         };
         let back = AppSettings::from_json(&settings.to_json());
 
         assert!(back.event_track_auto_model);
         assert_eq!(back.event_track_model_slug, "rap");
+        assert!(!back.event_track_camera_follow);
     }
 
     #[test]
