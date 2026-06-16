@@ -30,10 +30,10 @@ Grab the latest build from the **[Releases](../../releases)** page:
 | Linux x64 | `bowecho-linux-x64.tar.gz` |
 | Linux ARM64 | `bowecho-linux-arm64.tar.gz` |
 
-**Windows:** unzip and run `bowecho.exe` — that's it. The exe is fully
-self-contained (no installer, no runtime dependencies). Builds are not yet
-code-signed, so SmartScreen may show "Windows protected your PC" the first
-time: click **More info → Run anyway**.
+**Windows:** unzip and run `bowecho.exe` - that's it. The exe is fully
+self-contained (no installer, no runtime dependencies). Windows builds are not
+yet code-signed, so SmartScreen may show "Windows protected your PC" the first
+time: click **More info -> Run anyway**.
 
 > **Antivirus false positives.** Windows Defender's machine-learning
 > heuristics sometimes flag new, unsigned Rust executables with names like
@@ -51,12 +51,28 @@ time: click **More info → Run anyway**.
 > submissions of `!ml` detections are typically cleared within days. You
 > can always audit and build from source instead (see below).
 
-**macOS:** unzip and open `BowEcho.app`. Unsigned for now — right-click the
-app and choose **Open** the first time (or run
+**macOS:** unzip and open `BowEcho.app`. Release apps are signed and notarized
+when the repository's Apple Developer ID secrets are available. If Gatekeeper
+still shows a first-run warning after a manual download, right-click the app
+and choose **Open** once (or run
 `xattr -d com.apple.quarantine BowEcho.app` in Terminal).
 
 **Linux:** untar and run `./bowecho` (needs X11/Wayland + OpenGL, standard on
 desktops).
+
+## Trust and verification
+
+BowEcho releases are produced by GitHub Actions from the exact tagged source in
+this repository. Each downloadable asset is published with a `.sha256` file so
+users can verify that a local download matches the CI-built artifact.
+
+```powershell
+Get-FileHash .\bowecho-windows-x64.zip -Algorithm SHA256
+```
+
+Compare the hash with the matching `.sha256` file on the release page. For
+signing status, false-positive guidance, and responsible disclosure, see
+[docs/SIGNING.md](docs/SIGNING.md) and [SECURITY.md](SECURITY.md).
 
 ## Quick start (storm mode)
 
