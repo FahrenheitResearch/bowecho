@@ -84,6 +84,7 @@ const DEFAULT_STORM_MOTION_SPEED_KT: f32 = 35.0;
 const KNOT_TO_MPS: f32 = 0.514_444;
 const VROT_ROW_RADIUS: usize = 2;
 const VROT_GATE_RADIUS: usize = 4;
+const DERIVED_READOUT_FALLBACK_RADIUS: usize = 3;
 const SPECULATIVE_SAMPLE_CACHE_MIN_PIXELS: u64 = 720 * 480;
 const LOW_END_SPECULATIVE_SAMPLE_CACHE_MIN_RENDER_MS: f32 = 4.0;
 const HIGH_END_SPECULATIVE_SAMPLE_CACHE_MIN_RENDER_MS: f32 = 0.25;
@@ -1488,10 +1489,9 @@ struct ViewerApp {
     unacknowledged_hazard_event_ids: BTreeSet<String>,
     storm_motion_direction_deg: f32,
     storm_motion_speed_kt: f32,
-    /// One-shot derived-grid readout cache: (product, volume ptr, cut for
-    /// per-cut derivatives, base cut index, grid). Computed on first hover
-    /// over a derived product, reused until product/volume changes.
-    derived_readout_cache: Option<(DerivedProduct, usize, usize, usize, Arc<MomentGrid>)>,
+    /// One-shot derived-grid readout cache. Computed on first hover over a
+    /// derived product, reused until product/volume/smoothing inputs change.
+    derived_readout_cache: Option<DerivedReadoutCache>,
     dealiased_readout_cache: Option<DealiasedReadoutCache>,
     /// One-shot startup release check (background thread, fails silently):
     /// the receiver delivers `Some(tag)` when GitHub has a newer release.
@@ -3727,6 +3727,16 @@ struct VrotGate {
     gate: usize,
     value_mps: f32,
     azimuth_deg: f32,
+}
+
+struct DerivedReadoutCache {
+    product: DerivedProduct,
+    volume_ptr: usize,
+    cut_key: usize,
+    smoothing: SmoothingMode,
+    hail_key: (i16, i16),
+    base_idx: usize,
+    grid: Arc<MomentGrid>,
 }
 
 /// The five sidebar tabs (ui-overhaul spec §1): RADAR operates the primary
@@ -6632,31 +6642,43 @@ impl ViewerApp {
         }
     }
 
+    fn display_source_volume_for_product(
+        &self,
+        product: &DisplayProduct,
+        volume: Arc<RadarVolume>,
+    ) -> Arc<RadarVolume> {
+        let Some(derived) = product.derived() else {
+            return volume;
+        };
+        if !derived.is_volume_wide() {
+            return volume;
+        }
+        let Some(frame) = self.selected_frame() else {
+            return volume;
+        };
+        if frame.status != FrameStatus::LivePartial {
+            return volume;
+        }
+        self.frame_history
+            .iter()
+            .rev()
+            .find(|frame| frame.status != FrameStatus::LivePartial)
+            .map(|frame| Arc::clone(&frame.volume))
+            .unwrap_or(volume)
+    }
+
     fn request_texture_render(&mut self, ctx: &egui::Context, rect: egui::Rect) {
-        let Some(mut volume) = self.volume.clone() else {
+        let Some(volume) = self.volume.clone() else {
             return;
         };
         // Volume-wide derived products (CREF/ET/VIL/MEHS/POSH/POH/MARC/...)
         // need a COMPLETE volume: on a live-partial frame the column walk
         // tops out at whatever tilts have arrived, painting range rings at
         // the coverage steps (field report: MEHS/CREF rings). Substitute the
-        // newest complete frame's volume until this one finishes.
-        if self
-            .selected_product
-            .derived()
-            .map(|d| d.is_volume_wide())
-            .unwrap_or(false)
-            && self
-                .selected_frame()
-                .is_some_and(|frame| frame.status == FrameStatus::LivePartial)
-            && let Some(complete) = self
-                .frame_history
-                .iter()
-                .rev()
-                .find(|frame| frame.status != FrameStatus::LivePartial)
-        {
-            volume = Arc::clone(&complete.volume);
-        }
+        // newest complete frame's volume until this one finishes. The cursor
+        // inspector uses the same helper so it cannot sample a different
+        // partial volume than the one currently rendered.
+        let volume = self.display_source_volume_for_product(&self.selected_product, volume);
         let Some((viewport_options, viewport_key)) = self.viewport_raster_options(ctx, rect) else {
             return;
         };
@@ -27044,6 +27066,8 @@ impl ViewerApp {
         selected_cut: usize,
     ) -> Option<CursorReadout> {
         let volume_ptr = Arc::as_ptr(volume) as usize;
+        let smoothing = self.smoothing_for_product(&DisplayProduct::Derived(derived));
+        let hail_key = self.hail_levels_key();
         let cut_key = if derived.is_volume_wide() {
             usize::MAX
         } else {
@@ -27052,15 +27076,18 @@ impl ViewerApp {
         let cached = self
             .derived_readout_cache
             .as_ref()
-            .filter(|(d, vp, ck, _, _)| *d == derived && *vp == volume_ptr && *ck == cut_key)
-            .map(|(_, _, _, base_idx, grid)| (*base_idx, Arc::clone(grid)));
+            .filter(|cache| {
+                cache.product == derived
+                    && cache.volume_ptr == volume_ptr
+                    && cache.cut_key == cut_key
+                    && cache.smoothing == smoothing
+                    && cache.hail_key == hail_key
+            })
+            .map(|cache| (cache.base_idx, Arc::clone(&cache.grid)));
         let (base_idx, grid) = match cached {
             Some(hit) => hit,
             None => {
-                let hail = (
-                    self.hail_freezing_level_km * 1000.0,
-                    self.hail_minus20_level_km * 1000.0,
-                );
+                let hail = self.hail_levels_m();
                 let (base_idx, grid) = if derived.is_volume_wide() {
                     let base_moment = derived.base_moment();
                     let base_idx = volume
@@ -27102,16 +27129,38 @@ impl ViewerApp {
                     };
                     (selected_cut, grid)
                 };
+                let grid = match smoothing {
+                    SmoothingMode::Native | SmoothingMode::Interpolated => grid,
+                    SmoothingMode::Soften => smooth_moment_grid(&grid),
+                };
                 let grid = Arc::new(grid);
-                self.derived_readout_cache =
-                    Some((derived, volume_ptr, cut_key, base_idx, Arc::clone(&grid)));
+                self.derived_readout_cache = Some(DerivedReadoutCache {
+                    product: derived,
+                    volume_ptr,
+                    cut_key,
+                    smoothing,
+                    hail_key,
+                    base_idx,
+                    grid: Arc::clone(&grid),
+                });
                 (base_idx, grid)
             }
         };
         let cut = volume.cuts.get(base_idx)?;
-        let (row, gate, radial_index, azimuth_deg, range_km, slant_range_m) =
+        let (mut row, mut gate, mut radial_index, mut azimuth_deg, mut range_km, mut slant_range_m) =
             self.sample_grid_geometry(rect, position, cut, &grid)?;
-        let value = grid.scaled_value(row, gate)?;
+        let (finite_row, finite_gate, value) =
+            nearest_finite_grid_sample(&grid, row, gate, DERIVED_READOUT_FALLBACK_RADIUS)?;
+        if finite_row != row || finite_gate != gate {
+            row = finite_row;
+            gate = finite_gate;
+            radial_index = grid.radial_indices.get(row).copied()?;
+            let radial = cut.radials.get(radial_index)?;
+            azimuth_deg = radial.azimuth_deg.rem_euclid(360.0);
+            slant_range_m = grid.gate_range.first_gate_m as f64
+                + gate as f64 * grid.gate_range.gate_spacing_m as f64;
+            range_km = (slant_range_m / 1000.0) as f32;
+        }
         let source_azimuth_deg = cut
             .radials
             .get(radial_index)
@@ -27244,7 +27293,10 @@ impl ViewerApp {
         product: &DisplayProduct,
         cut_index: usize,
     ) -> Option<CursorReadout> {
-        let volume = self.volume.clone()?;
+        let volume = self
+            .volume
+            .clone()
+            .map(|volume| self.display_source_volume_for_product(product, volume))?;
         let selected_cut = cut_index;
         let selected_product = product.clone();
         // Derived products sample a cached one-shot grid (computed on the
@@ -27287,7 +27339,9 @@ impl ViewerApp {
         }
         let (row, radial_index) = nearest_grid_row(cut, grid, azimuth_deg)?;
         let gate = gate_for_range(grid, range_km)?;
-        let base_value = grid.scaled_value(row, gate)?;
+        let base_value = grid
+            .scaled_value(row, gate)
+            .filter(|value| value.is_finite())?;
         let raw = (!selected_product.uses_dealiased_velocity())
             .then(|| grid_raw_value(grid, row, gate))
             .flatten();
@@ -28622,6 +28676,52 @@ fn gate_for_range(grid: &MomentGrid, range_km: f32) -> Option<usize> {
         return None;
     }
     Some(gate as usize)
+}
+
+fn nearest_finite_grid_sample(
+    grid: &MomentGrid,
+    center_row: usize,
+    center_gate: usize,
+    max_radius: usize,
+) -> Option<(usize, usize, f32)> {
+    let rows = grid.radial_count();
+    let gates = grid.gate_range.gate_count;
+    if rows == 0 || gates == 0 || center_gate >= gates {
+        return None;
+    }
+    for radius in 0..=max_radius {
+        let mut best: Option<(usize, usize, usize, f32)> = None;
+        let radius = radius as isize;
+        for row_delta in -radius..=radius {
+            for gate_delta in -radius..=radius {
+                if row_delta.abs().max(gate_delta.abs()) != radius {
+                    continue;
+                }
+                let gate = center_gate as isize + gate_delta;
+                if gate < 0 || gate as usize >= gates {
+                    continue;
+                }
+                let row = (center_row as isize + row_delta).rem_euclid(rows as isize) as usize;
+                let gate = gate as usize;
+                let Some(value) = grid
+                    .scaled_value(row, gate)
+                    .filter(|value| value.is_finite())
+                else {
+                    continue;
+                };
+                let distance_sq = (row_delta * row_delta + gate_delta * gate_delta) as usize;
+                if best.as_ref().is_none_or(|current| {
+                    (distance_sq, row, gate) < (current.0, current.1, current.2)
+                }) {
+                    best = Some((distance_sq, row, gate, value));
+                }
+            }
+        }
+        if let Some((_, row, gate, value)) = best {
+            return Some((row, gate, value));
+        }
+    }
+    None
 }
 
 fn nearest_grid_row(
@@ -35023,6 +35123,43 @@ mod tests {
         assert_eq!(gate_for_range(&grid, 0.75), Some(1));
         assert_eq!(gate_for_range(&grid, 1.25), Some(3));
         assert_eq!(gate_for_range(&grid, 1.50), None);
+    }
+
+    #[test]
+    fn derived_readout_sample_uses_nearest_finite_neighbor() {
+        let grid = MomentGrid {
+            moment: MomentType::Reflectivity,
+            gate_range: radar_core::GateRange {
+                first_gate_m: 0,
+                gate_spacing_m: 250,
+                gate_count: 4,
+            },
+            scale: 1.0,
+            offset: 0.0,
+            nodata: None,
+            range_folded: None,
+            radial_indices: vec![0, 1, 2],
+            storage: MomentStorage::F32(vec![
+                f32::NAN,
+                f32::NAN,
+                f32::NAN,
+                f32::NAN,
+                f32::NAN,
+                f32::NAN,
+                42.0,
+                f32::NAN,
+                f32::NAN,
+                f32::NAN,
+                f32::NAN,
+                f32::NAN,
+            ]),
+        };
+
+        assert_eq!(
+            nearest_finite_grid_sample(&grid, 1, 1, DERIVED_READOUT_FALLBACK_RADIUS),
+            Some((1, 2, 42.0))
+        );
+        assert_eq!(nearest_finite_grid_sample(&grid, 0, 0, 0), None);
     }
 
     #[test]

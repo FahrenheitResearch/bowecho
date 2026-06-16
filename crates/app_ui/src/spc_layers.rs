@@ -551,11 +551,12 @@ pub fn parse_pts_outlook(text: &str, kind: &str) -> Vec<OutlookFeature> {
 
 fn estofex_colors(label: &str) -> (egui::Color32, egui::Color32) {
     match label {
-        "EU L1" => (hex_color("#FFE066"), hex_color("#DDAA00")),
-        "EU L2" => (hex_color("#FF9F40"), hex_color("#E06A00")),
-        "EU L3" => (hex_color("#FF6666"), hex_color("#CC0000")),
-        "EU TSTM15" => (hex_color("#78D8FF"), hex_color("#1798C8")),
-        "EU TSTM50" => (hex_color("#3B8CFF"), hex_color("#0063C7")),
+        // ESTOFEX official legend: lightning probability is yellow, level 1
+        // orange, level 2 red, level 3 magenta.
+        "EU TSTM15" | "EU TSTM50" => (hex_color("#FFFF00"), hex_color("#FFFF00")),
+        "EU L1" => (hex_color("#FF8000"), hex_color("#FF8000")),
+        "EU L2" => (hex_color("#FF0000"), hex_color("#FF0000")),
+        "EU L3" => (hex_color("#FF00FF"), hex_color("#FF00FF")),
         _ => (egui::Color32::from_rgb(160, 160, 160), egui::Color32::WHITE),
     }
 }
@@ -1261,9 +1262,12 @@ PROBABILISTIC OUTLOOK POINTS DAY 3\n\
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].label, "EU L2");
         assert_eq!(parsed[0].label2, "ESTOFEX Level 2");
+        assert_eq!(parsed[0].fill, hex_color("#FF0000"));
+        assert_eq!(parsed[0].stroke, hex_color("#FF0000"));
         assert!(parsed[0].fill_enabled);
         assert_eq!(parsed[0].rings[0].first(), parsed[0].rings[0].last());
         assert_eq!(parsed[1].label, "EU TSTM15");
+        assert_eq!(parsed[1].stroke, hex_color("#FFFF00"));
     }
 
     #[test]
@@ -1285,6 +1289,16 @@ PROBABILISTIC OUTLOOK POINTS DAY 3\n\
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].label, "EU L1");
         assert_eq!(parsed[0].label2, "ESTOFEX Level 1");
+        assert_eq!(parsed[0].stroke, hex_color("#FF8000"));
+    }
+
+    #[test]
+    fn estofex_official_legend_colors_are_pinned() {
+        assert_eq!(estofex_colors("EU TSTM15").1, hex_color("#FFFF00"));
+        assert_eq!(estofex_colors("EU TSTM50").1, hex_color("#FFFF00"));
+        assert_eq!(estofex_colors("EU L1").1, hex_color("#FF8000"));
+        assert_eq!(estofex_colors("EU L2").1, hex_color("#FF0000"));
+        assert_eq!(estofex_colors("EU L3").1, hex_color("#FF00FF"));
     }
 
     #[test]
