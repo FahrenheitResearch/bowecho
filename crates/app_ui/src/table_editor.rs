@@ -226,6 +226,7 @@ fn units_for_family(family: ColorTableFamily) -> &'static [&'static str] {
         ColorTableFamily::Vil => &["kg/m^2"],
         ColorTableFamily::VilDensity => &["g/m^3"],
         ColorTableFamily::HailSize => &["mm"],
+        ColorTableFamily::Probability => &["%"],
         ColorTableFamily::AzimuthalShear => &["1e-3/s"],
         ColorTableFamily::DifferentialPhase => &["deg"],
         ColorTableFamily::SpecificDifferentialPhase => &["deg/km"],

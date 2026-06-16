@@ -69,6 +69,14 @@ pub struct AppSettings {
     /// Basemap style key: "dark" (vector), "satellite", "streets", "topo".
     #[serde(default = "default_basemap_style")]
     pub basemap_style: String,
+    /// Basemap boundary-line brightness percentage. 100 preserves the
+    /// shipped look; lower values dim satellite/administrative outlines.
+    #[serde(default = "default_basemap_line_brightness_percent")]
+    pub basemap_line_brightness_percent: u16,
+    /// Basemap boundary-line thickness percentage. 100 preserves the
+    /// shipped look.
+    #[serde(default = "default_basemap_line_thickness_percent")]
+    pub basemap_line_thickness_percent: u16,
     /// GR2-style bold town labels (white, heavy halo) readable over echoes.
     #[serde(default = "default_bold_labels")]
     pub bold_labels: bool,
@@ -378,6 +386,8 @@ impl Default for AppSettings {
             independent_panels: false,
             placefiles: Vec::new(),
             basemap_style: default_basemap_style(),
+            basemap_line_brightness_percent: default_basemap_line_brightness_percent(),
+            basemap_line_thickness_percent: default_basemap_line_thickness_percent(),
             bold_labels: default_bold_labels(),
             show_lat_lon_grid: true,
             show_radar_labels: true,
@@ -471,6 +481,14 @@ impl AppSettings {
 
 fn default_basemap_style() -> String {
     "dark".to_owned()
+}
+
+fn default_basemap_line_brightness_percent() -> u16 {
+    100
+}
+
+fn default_basemap_line_thickness_percent() -> u16 {
+    100
 }
 
 fn default_bold_labels() -> bool {

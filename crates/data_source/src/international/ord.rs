@@ -103,14 +103,15 @@ const ORD_COUNTRIES: &[(&str, &str, &str)] = &[
 ///
 /// Codes and coordinates: the ORD EDR locations catalog
 /// (`https://api.meteogate.eu/eu-eumetnet-weather-radar/collections/observations/locations`,
-/// fetched 2026-06-12; 74 stations across the enabled countries, exactly
-/// matching the bucket's site directories that day). Labels left blank by
+/// fetched 2026-06-12; updated with BEHEL from the live 2026-06-16 bucket).
+/// Labels left blank by
 /// the EDR catalog (CH, NO, PL, RO) come from the EUMETNET OPERA radar
 /// database, `OPERA_RADARS_DB.json` (fetched 2026-06-12) from
 /// <https://eumetnet.eu/activities/observations-programme/current-activities/opera/>,
 /// matched by ODIM code; both sources agree on coordinates to the 4
-/// decimals kept here. All 74 stations are OPERA status 1 (operational).
+/// decimals kept here. Listed stations are OPERA status 1 (operational).
 const ORD_SITES: &[(&str, &str, f32, f32, bool)] = &[
+    ("behel", "Helchteren", 51.0702, 5.4054, true),
     ("bejab", "Jabbeke", 51.1917, 3.0642, true),
     ("bewid", "Wideumont", 49.9136, 5.5044, true),
     ("chalb", "Albis", 47.2843, 8.5120, false),
@@ -487,6 +488,9 @@ impl IntlProvider for OrdProvider {
         ORD_SITES
             .iter()
             .filter_map(|&(code, label, latitude_deg, longitude_deg, _)| {
+                if site_superseded_by_native_provider(code) {
+                    return None;
+                }
                 let (_, _, country) = country_for_code(code)?;
                 Some(IntlSite {
                     provider_id: self.id(),
@@ -542,6 +546,13 @@ fn country_for_code(code: &str) -> Option<(&'static str, &'static str, &'static 
     ORD_COUNTRIES.iter().find(|(lc, ..)| *lc == prefix).copied()
 }
 
+fn site_superseded_by_native_provider(code: &str) -> bool {
+    // Estonia's KAIA feed exposes both Harku and Sürgavere with the richer
+    // national product set. Keep explicit ORD loads possible, but avoid a
+    // mixed KAIA/ORD Estonia catalog in the picker and map markers.
+    code == "eesur"
+}
+
 /// Picker/marker label: the static-table name when known (with the
 /// country, since this provider's site list spans 14 of them), else the
 /// uppercased code.
@@ -561,6 +572,9 @@ fn sites_from_prefixes(common_prefixes: &[String]) -> Vec<IntlSite> {
         .filter_map(|prefix| {
             let code = prefix.trim_end_matches('/').rsplit('/').next()?;
             validate_site_code(code).ok()?;
+            if site_superseded_by_native_provider(code) {
+                return None;
+            }
             let (_, _, country) = country_for_code(code)?;
             let known = ORD_SITES.iter().find(|(id, ..)| *id == code);
             Some(IntlSite {
@@ -982,7 +996,16 @@ mod tests {
             );
         }
         assert_eq!(ORD_COUNTRIES.len(), 14);
-        assert_eq!(ORD_SITES.len(), 74);
+        assert_eq!(ORD_SITES.len(), 75);
+        let visible = OrdProvider::new().static_sites();
+        assert!(visible.iter().any(|site| site.site_id == "behel"
+            && site.label == "Helchteren (Belgium)"
+            && site.latitude_deg == Some(51.0702)
+            && site.longitude_deg == Some(5.4054)));
+        assert!(
+            !visible.iter().any(|site| site.site_id == "eesur"),
+            "Sürgavere is advertised by KAIA, not ORD"
+        );
     }
 
     #[test]
@@ -1013,6 +1036,7 @@ mod tests {
         let prefixes = vec![
             "2026/06/12/OPERA/composites/".to_owned(),
             "2026/06/12/DE/deasb/".to_owned(), // native DWD coverage
+            "2026/06/12/EE/eesur/".to_owned(), // native KAIA coverage
             "2026/06/12/NL/nldhl/".to_owned(),
         ];
         let sites = sites_from_prefixes(&prefixes);

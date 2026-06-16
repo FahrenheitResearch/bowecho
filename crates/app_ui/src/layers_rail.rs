@@ -1362,7 +1362,15 @@ impl ViewerApp {
     }
 
     pub(crate) fn start_known_feed_poll(&mut self, url: &str) {
-        self.poll_url = normalized_poll_url(url);
+        let next_url = normalized_poll_url(url);
+        let same_source = self.poll_active
+            && matches!(self.poll_source, PollSource::CustomUrl(_))
+            && poll_urls_match(&self.poll_url, &next_url);
+        if !same_source {
+            self.clear_frame_history();
+            self.intl_loop_rx = None;
+        }
+        self.poll_url = next_url;
         self.set_custom_url_poll_source();
         self.poll_active = true;
         self.poll_last_file = None;

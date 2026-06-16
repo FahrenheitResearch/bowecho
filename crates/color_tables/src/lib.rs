@@ -58,6 +58,7 @@ pub enum ColorTableFamily {
     Vil,
     VilDensity,
     HailSize,
+    Probability,
     AzimuthalShear,
     DifferentialPhase,
     SpecificDifferentialPhase,
@@ -76,6 +77,7 @@ impl ColorTableFamily {
             Self::Vil => "VIL",
             Self::VilDensity => "VIL Density",
             Self::HailSize => "Hail Size (MEHS)",
+            Self::Probability => "Probability / Percent",
             Self::AzimuthalShear => "Azimuthal Shear",
             Self::DifferentialPhase => "Differential Phase (PHI)",
             Self::SpecificDifferentialPhase => "Specific Diff Phase (KDP)",
@@ -84,7 +86,7 @@ impl ColorTableFamily {
     }
 
     /// Every family, in picker order.
-    pub const ALL: [ColorTableFamily; 13] = [
+    pub const ALL: [ColorTableFamily; 14] = [
         Self::Reflectivity,
         Self::Velocity,
         Self::SpectrumWidth,
@@ -94,6 +96,7 @@ impl ColorTableFamily {
         Self::Vil,
         Self::VilDensity,
         Self::HailSize,
+        Self::Probability,
         Self::AzimuthalShear,
         Self::DifferentialPhase,
         Self::SpecificDifferentialPhase,
@@ -122,6 +125,9 @@ pub fn family_for_product_code(code: &str) -> ColorTableFamily {
         "VIL" | "DVL" => ColorTableFamily::Vil,
         "VILD" => ColorTableFamily::VilDensity,
         "MEHS" | "HAIL" => ColorTableFamily::HailSize,
+        "PROB" | "PROBABILITY" | "PERCENT" | "PCT" | "POH" | "POSH" => {
+            ColorTableFamily::Probability
+        }
         "AZSHEAR" => ColorTableFamily::AzimuthalShear,
         "PHI" | "PHIDP" => ColorTableFamily::DifferentialPhase,
         "KDP" => ColorTableFamily::SpecificDifferentialPhase,
@@ -144,6 +150,7 @@ pub fn product_code_for_family(family: ColorTableFamily) -> Option<&'static str>
         ColorTableFamily::Vil => Some("VIL"),
         ColorTableFamily::VilDensity => Some("VILD"),
         ColorTableFamily::HailSize => Some("MEHS"),
+        ColorTableFamily::Probability => Some("PROB"),
         ColorTableFamily::AzimuthalShear => Some("AZSHEAR"),
         ColorTableFamily::DifferentialPhase => Some("PHI"),
         ColorTableFamily::SpecificDifferentialPhase => Some("KDP"),
@@ -840,6 +847,7 @@ pub struct ColorTableSet {
     vil: ColorTable,
     vil_density: ColorTable,
     hail_size: ColorTable,
+    probability: ColorTable,
     azimuthal_shear: ColorTable,
     differential_phase: ColorTable,
     specific_differential_phase: ColorTable,
@@ -858,6 +866,7 @@ impl ColorTableSet {
             ColorTableFamily::Vil => &self.vil,
             ColorTableFamily::VilDensity => &self.vil_density,
             ColorTableFamily::HailSize => &self.hail_size,
+            ColorTableFamily::Probability => &self.probability,
             ColorTableFamily::AzimuthalShear => &self.azimuthal_shear,
             ColorTableFamily::DifferentialPhase => &self.differential_phase,
             ColorTableFamily::SpecificDifferentialPhase => &self.specific_differential_phase,
@@ -876,6 +885,7 @@ impl ColorTableSet {
             ColorTableFamily::Vil => self.vil = table,
             ColorTableFamily::VilDensity => self.vil_density = table,
             ColorTableFamily::HailSize => self.hail_size = table,
+            ColorTableFamily::Probability => self.probability = table,
             ColorTableFamily::AzimuthalShear => self.azimuthal_shear = table,
             ColorTableFamily::DifferentialPhase => self.differential_phase = table,
             ColorTableFamily::SpecificDifferentialPhase => self.specific_differential_phase = table,
@@ -900,6 +910,7 @@ impl Default for ColorTableSet {
             vil: builtin_vil_table(),
             vil_density: builtin_vil_density_table(),
             hail_size: builtin_hail_size_table(),
+            probability: builtin_probability_table(),
             azimuthal_shear: builtin_azimuthal_shear_table(),
             differential_phase: builtin_differential_phase_table(),
             specific_differential_phase: builtin_specific_differential_phase_table(),
@@ -1172,6 +1183,11 @@ pub fn builtin_catalog_for_family(family: ColorTableFamily) -> Vec<CatalogEntry>
             "Breaks at the 19/25/44/50 mm report thresholds (cf. Witt et al. 1998): severe goes warm, giant goes magenta",
             &[Badge::Default],
         )],
+        ColorTableFamily::Probability => vec![entry(
+            builtin_probability_table(),
+            "0-100% monotonic probability ramp for POH/POSH-style products; labels stay in percent, never echo-top metres",
+            &[Badge::Default],
+        )],
         ColorTableFamily::AzimuthalShear => vec![entry(
             builtin_azimuthal_shear_table(),
             "Diverging about zero: cyclonic shear warms to red/white, anticyclonic cools to violet, near-zero stays dark",
@@ -1289,6 +1305,30 @@ pub fn builtin_hail_size_table() -> ColorTable {
         ],
     )
     .expect("built-in hail size color table is valid")
+}
+
+/// Probability palette (%). Sequential, capped at 100 so POH/POSH legends
+/// stay in their native percent domain instead of inheriting echo-top metres.
+pub fn builtin_probability_table() -> ColorTable {
+    ColorTable::from_parts(
+        "Analyst Probability".to_owned(),
+        Some("PROB".to_owned()),
+        Some("%".to_owned()),
+        default_range_folded_color(),
+        SampleMode::Interpolated,
+        vec![
+            stop(0.0, 30, 38, 64),
+            stop(5.0, 36, 82, 148),
+            stop(15.0, 30, 138, 184),
+            stop(30.0, 36, 174, 116),
+            stop(45.0, 154, 196, 58),
+            stop(60.0, 238, 216, 54),
+            stop(75.0, 244, 142, 38),
+            stop(90.0, 218, 58, 54),
+            stop(100.0, 244, 232, 238),
+        ],
+    )
+    .expect("built-in probability color table is valid")
 }
 
 /// Azimuthal-shear palette (×10^-3 s^-1), diverging about zero: near-zero is
@@ -2964,21 +3004,7 @@ mod tests {
 
     #[test]
     fn sampler_matches_direct_sampling_exactly() {
-        const FAMILIES: [ColorTableFamily; 12] = [
-            ColorTableFamily::Reflectivity,
-            ColorTableFamily::Velocity,
-            ColorTableFamily::SpectrumWidth,
-            ColorTableFamily::CorrelationCoefficient,
-            ColorTableFamily::DifferentialReflectivity,
-            ColorTableFamily::EchoTops,
-            ColorTableFamily::Vil,
-            ColorTableFamily::VilDensity,
-            ColorTableFamily::AzimuthalShear,
-            ColorTableFamily::DifferentialPhase,
-            ColorTableFamily::SpecificDifferentialPhase,
-            ColorTableFamily::Generic,
-        ];
-        let mut tables: Vec<ColorTable> = FAMILIES
+        let mut tables: Vec<ColorTable> = ColorTableFamily::ALL
             .iter()
             .flat_map(|family| builtin_tables_for_family(*family))
             .collect();
@@ -3632,6 +3658,18 @@ mod tests {
         );
         assert_eq!(family_for_product_code("ET"), ColorTableFamily::EchoTops);
         assert_eq!(family_for_product_code("VIL"), ColorTableFamily::Vil);
+        assert_eq!(
+            family_for_product_code("POSH"),
+            ColorTableFamily::Probability
+        );
+        assert_eq!(
+            family_for_product_code("POH"),
+            ColorTableFamily::Probability
+        );
+        assert_eq!(
+            family_for_product_code("PCT"),
+            ColorTableFamily::Probability
+        );
         assert_eq!(
             family_for_product_code("PHI"),
             ColorTableFamily::DifferentialPhase

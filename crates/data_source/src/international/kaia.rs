@@ -3,9 +3,10 @@
 //! Estonia publishes radar volume files through the national KAIA open-data
 //! repository. The public document query API lists `VOL` HDF5 files for
 //! each radar, and the file endpoint returns the ODIM_H5 payload directly
-//! (HDF5 magic confirmed live 2026-06-15 for Harku). ORD currently exposes
-//! Sürgavere in its 24-hour bucket but not Harku, so this provider fills the
-//! missing `eehar` site without duplicating Sürgavere's existing ORD marker.
+//! (HDF5 magic confirmed live 2026-06-15 for Harku). KAIA exposes both
+//! Harku and Sürgavere with the richer national product set, so BowEcho uses
+//! this provider for Estonia instead of mixing one KAIA marker with one ORD
+//! marker.
 
 use std::time::Duration;
 
@@ -30,13 +31,22 @@ struct KaiaSite {
     longitude_deg: f32,
 }
 
-const KAIA_SITES: &[KaiaSite] = &[KaiaSite {
-    site_id: "eehar",
-    label: "Harku",
-    radar_filter: "Harku radar (HAR)",
-    latitude_deg: 59.3971,
-    longitude_deg: 24.6021,
-}];
+const KAIA_SITES: &[KaiaSite] = &[
+    KaiaSite {
+        site_id: "eehar",
+        label: "Harku",
+        radar_filter: "Harku radar (HAR)",
+        latitude_deg: 59.3971,
+        longitude_deg: 24.6021,
+    },
+    KaiaSite {
+        site_id: "eesur",
+        label: "Sürgavere",
+        radar_filter: "Sürgavere radar (SUR)",
+        latitude_deg: 58.4823,
+        longitude_deg: 25.5187,
+    },
+];
 
 /// KAIA Estonia: single-file ODIM PVOL frames from the active document API.
 pub struct KaiaEstoniaProvider {
@@ -340,16 +350,22 @@ mod tests {
     }"#;
 
     #[test]
-    fn static_catalog_exposes_harku() {
+    fn static_catalog_exposes_estonian_radars() {
         let provider = KaiaEstoniaProvider::new();
         let sites = provider.static_sites();
-        assert_eq!(sites.len(), 1);
+        assert_eq!(sites.len(), 2);
         assert_eq!(sites[0].provider_id, "kaia");
         assert_eq!(sites[0].site_id, "eehar");
         assert_eq!(sites[0].label, "Harku");
         assert_eq!(sites[0].country, "Estonia");
         assert_eq!(sites[0].latitude_deg, Some(59.3971));
         assert_eq!(sites[0].longitude_deg, Some(24.6021));
+        assert_eq!(sites[1].provider_id, "kaia");
+        assert_eq!(sites[1].site_id, "eesur");
+        assert_eq!(sites[1].label, "Sürgavere");
+        assert_eq!(sites[1].country, "Estonia");
+        assert_eq!(sites[1].latitude_deg, Some(58.4823));
+        assert_eq!(sites[1].longitude_deg, Some(25.5187));
     }
 
     #[test]

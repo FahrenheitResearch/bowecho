@@ -93,7 +93,13 @@ const MID_RANGE_SAMPLE_CACHE_BYTES: usize = 24 * 1024 * 1024;
 const HIGH_END_SAMPLE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const LOW_CORE_PREVIEW_THREADS: usize = 4;
 const LOW_CORE_PREVIEW_RENDER_HEAD_START_MS: u64 = 8;
-const ACTIVE_LOAD_POLL_MS: u64 = 8;
+const ACTIVE_LOAD_POLL_MS: u64 = 50;
+const RENDER_RESULT_POLL_MS: u64 = 50;
+const LOW_ZOOM_RENDER_BACKOFF_SCALE: f32 = 48.0;
+const LOW_ZOOM_RENDER_BACKOFF_MIN_MS: u64 = 2_000;
+const LOW_ZOOM_RENDER_BACKOFF_MIN_RENDER_MS: f32 = 80.0;
+const LOW_ZOOM_REALTIME_REFRESH_SECONDS: u64 = 5;
+const ALGO_FRAME_CACHE_LIMIT: usize = 96;
 /// Some GPUs expose a max 2D texture dimension of 8192. GOES full-disk
 /// preview frames can be 10000 px wide, so cap the player preview well
 /// below the hard limit before egui uploads it.
@@ -1111,6 +1117,8 @@ struct ViewerApp {
     storm_tracks_site: String,
     storm_cells_volume_ptr: usize,
     storm_cells_receiver: Option<mpsc::Receiver<StormCellsResult>>,
+    storm_cells_cache: BTreeMap<FrameWorkKey, Vec<StormCell>>,
+    storm_cells_cache_order: VecDeque<FrameWorkKey>,
     show_storm_tracks: bool,
     /// Rotation (meso/TVS) markers from the lowest velocity tilt (Stumpf et
     /// al. 1998 / Mitchell et al. 1998 thresholds on LLSD azimuthal shear).
@@ -1118,7 +1126,9 @@ struct ViewerApp {
     /// only spawns, polls, and draws (speed doctrine: zero hot-path cost).
     rotation_markers: Vec<RotationMarker>,
     rotation_markers_volume_ptr: usize,
-    rotation_receiver: Option<mpsc::Receiver<(usize, Vec<RotationMarker>)>>,
+    rotation_receiver: Option<mpsc::Receiver<RotationMarkersResult>>,
+    rotation_markers_cache: BTreeMap<FrameWorkKey, Vec<RotationMarker>>,
+    rotation_markers_cache_order: VecDeque<FrameWorkKey>,
     show_rotation_markers: bool,
     /// TOR TRACKS: rotation-tracks accumulation + TDS flag layers (state,
     /// background jobs, and paint live in `tor_tracks.rs`).
@@ -1837,6 +1847,40 @@ struct FrameIdentity {
     scan_time_utc: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct FrameWorkKey {
+    identity: FrameIdentity,
+    volume_ptr: usize,
+}
+
+impl FrameWorkKey {
+    fn new(volume: &RadarVolume, volume_ptr: usize) -> Self {
+        Self {
+            identity: frame_identity_for_volume(volume),
+            volume_ptr,
+        }
+    }
+}
+
+fn insert_limited_frame_cache<T>(
+    cache: &mut BTreeMap<FrameWorkKey, T>,
+    order: &mut VecDeque<FrameWorkKey>,
+    key: FrameWorkKey,
+    value: T,
+    limit: usize,
+) {
+    if !cache.contains_key(&key) {
+        order.push_back(key.clone());
+    }
+    cache.insert(key, value);
+    while cache.len() > limit {
+        let Some(oldest) = order.pop_front() else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FrameStatus {
     Local,
@@ -2092,7 +2136,7 @@ fn load_archive_history_objects_parallel(
             }
             send_archive_progress(
                 ctx.sender,
-                &progress_label,
+                progress_label,
                 "Decoded recent archive frame",
                 completed,
                 progress_total,
@@ -2477,8 +2521,9 @@ struct AsyncRenderResult {
     result: Result<RenderedTexture, String>,
 }
 
-/// Background cell-identification result: (volume ptr, volume time, cells).
-type StormCellsResult = (usize, DateTime<Utc>, Vec<StormCell>);
+/// Background cell-identification result: (frame key, cells).
+type StormCellsResult = (FrameWorkKey, Vec<StormCell>);
+type RotationMarkersResult = (FrameWorkKey, Vec<RotationMarker>);
 /// (grid hash, inverse LUT) for the decoupled model geolocation.
 type ModelLutEntry = (String, Arc<model_layer::InverseLut>);
 type NativeSoundingReceiver =
@@ -3508,8 +3553,7 @@ impl DerivedProduct {
             Self::Vil => ColorTableFamily::Vil,
             Self::VilDensity => ColorTableFamily::VilDensity,
             Self::Mehs => ColorTableFamily::HailSize,
-            // Probabilities ride the echo-tops ramp (monotonic 0..max).
-            Self::Posh | Self::Poh => ColorTableFamily::EchoTops,
+            Self::Posh | Self::Poh => ColorTableFamily::Probability,
             // Wind magnitudes ride the VIL ramp (monotonic, hot = strong).
             Self::Marc | Self::GustProxy => ColorTableFamily::Vil,
             // Divergence shares the diverging shear palette (convergence cool,
@@ -4358,10 +4402,14 @@ impl ViewerApp {
             storm_tracks_site: String::new(),
             storm_cells_volume_ptr: 0,
             storm_cells_receiver: None,
+            storm_cells_cache: BTreeMap::new(),
+            storm_cells_cache_order: VecDeque::new(),
             show_storm_tracks: true,
             rotation_markers: Vec::new(),
             rotation_markers_volume_ptr: 0,
             rotation_receiver: None,
+            rotation_markers_cache: BTreeMap::new(),
+            rotation_markers_cache_order: VecDeque::new(),
             show_rotation_markers: true,
             tor_tracks: tor_tracks::TorTracksState::default(),
             gate_filter_dbz: None,
@@ -4757,11 +4805,16 @@ impl ViewerApp {
             ctx.request_repaint_after(Duration::from_millis(250));
             return;
         }
+        if self.pending_render_key.is_some() {
+            self.live_refresh_skip_reason = Some("render pending".to_owned());
+            ctx.request_repaint_after(Duration::from_millis(RENDER_RESULT_POLL_MS));
+            return;
+        }
+        let refresh_interval = self.primary_realtime_refresh_interval();
         let should_refresh = self
             .last_realtime_level2_refresh
             .is_none_or(|last_refresh| {
-                last_refresh.elapsed()
-                    >= Duration::from_secs(PRIMARY_REALTIME_LEVEL2_REFRESH_SECONDS)
+                last_refresh.elapsed() >= Duration::from_secs(refresh_interval)
             });
         if !should_refresh {
             ctx.request_repaint_after(Duration::from_secs(1));
@@ -5175,6 +5228,10 @@ impl ViewerApp {
         self.history_playing = false;
         self.browsing_history = false;
         self.last_history_step = None;
+        self.storm_cells_cache.clear();
+        self.storm_cells_cache_order.clear();
+        self.rotation_markers_cache.clear();
+        self.rotation_markers_cache_order.clear();
     }
 
     fn install_preview_volume(&mut self, decoded: DecodedLoad, ctx: &egui::Context) {
@@ -5523,7 +5580,7 @@ impl ViewerApp {
         if !self.history_playing || self.frame_history.len() <= 1 {
             return;
         }
-        let frame_ms = self.loop_frame_ms();
+        let frame_ms = self.screen_loop_frame_ms();
         let should_step = self
             .last_history_step
             .is_none_or(|last_step| last_step.elapsed() >= Duration::from_millis(frame_ms));
@@ -5539,7 +5596,7 @@ impl ViewerApp {
         if !self.app_settings.independent_panels {
             return;
         }
-        let frame_ms = self.loop_frame_ms();
+        let frame_ms = self.screen_loop_frame_ms();
         let mut steps = Vec::new();
         for (slot, pane) in self.extra_panes.iter().enumerate() {
             if !pane.history_playing || pane.frame_history.len() <= 1 {
@@ -5584,7 +5641,7 @@ impl ViewerApp {
             pane.browsing_history = pane.selected_frame_index + 1 < pane.frame_history.len();
         }
         pane.last_history_step = Some(Instant::now());
-        let frame_ms = self.loop_frame_ms();
+        let frame_ms = self.screen_loop_frame_ms();
         ctx.request_repaint_after(Duration::from_millis(frame_ms));
         true
     }
@@ -6431,7 +6488,7 @@ impl ViewerApp {
         if saw_message {
             ctx.request_repaint();
         } else if self.pending_render_key.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(8));
+            ctx.request_repaint_after(Duration::from_millis(RENDER_RESULT_POLL_MS));
         }
     }
 
@@ -6492,7 +6549,7 @@ impl ViewerApp {
             .iter()
             .any(|layer| layer.pending_render_key.is_some())
         {
-            ctx.request_repaint_after(Duration::from_millis(8));
+            ctx.request_repaint_after(Duration::from_millis(RENDER_RESULT_POLL_MS));
         }
     }
 
@@ -6566,7 +6623,7 @@ impl ViewerApp {
                 if self.load_receiver.is_none() {
                     self.status = "Rendering".to_owned();
                 }
-                ctx.request_repaint_after(Duration::from_millis(8));
+                ctx.request_repaint_after(Duration::from_millis(RENDER_RESULT_POLL_MS));
             }
             Err(_) => {
                 self.pending_render_key = None;
@@ -6626,7 +6683,7 @@ impl ViewerApp {
             return;
         }
         if self.pending_render_key.as_ref() == Some(&key) {
-            ctx.request_repaint_after(Duration::from_millis(8));
+            ctx.request_repaint_after(Duration::from_millis(RENDER_RESULT_POLL_MS));
             return;
         }
 
@@ -6819,7 +6876,7 @@ impl ViewerApp {
             .iter()
             .any(|layer| layer.pending_render_key.is_some())
         {
-            ctx.request_repaint_after(Duration::from_millis(8));
+            ctx.request_repaint_after(Duration::from_millis(RENDER_RESULT_POLL_MS));
         }
     }
 
@@ -8045,7 +8102,7 @@ impl ViewerApp {
         if frame_count <= 1 {
             return false;
         }
-        let frame_ms = self.loop_frame_ms();
+        let frame_ms = self.screen_loop_frame_ms();
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
             pane.history_playing = true;
             pane.browsing_history = false;
@@ -8581,7 +8638,7 @@ impl ViewerApp {
                 return;
             }
             if pane.pending_render_key.as_ref() == Some(&key) {
-                ctx.request_repaint_after(Duration::from_millis(8));
+                ctx.request_repaint_after(Duration::from_millis(RENDER_RESULT_POLL_MS));
                 return;
             }
         }
@@ -8607,7 +8664,7 @@ impl ViewerApp {
         match self.render_sender.send(request) {
             Ok(()) => {
                 self.extra_panes[pane_slot].pending_render_key = Some(key);
-                ctx.request_repaint_after(Duration::from_millis(8));
+                ctx.request_repaint_after(Duration::from_millis(RENDER_RESULT_POLL_MS));
             }
             Err(_) => {
                 self.extra_panes[pane_slot].pending_render_key = None;
@@ -12188,6 +12245,47 @@ impl ViewerApp {
                 ctx.request_repaint();
             }
         });
+        let mut basemap_lines_changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Line brightness");
+            basemap_lines_changed |= ui
+                .add(
+                    egui::Slider::new(
+                        &mut self.app_settings.basemap_line_brightness_percent,
+                        20..=200,
+                    )
+                    .suffix("%")
+                    .show_value(true),
+                )
+                .on_hover_text("Boundary/admin line intensity on the basemap")
+                .changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Line thickness");
+            basemap_lines_changed |= ui
+                .add(
+                    egui::Slider::new(
+                        &mut self.app_settings.basemap_line_thickness_percent,
+                        25..=250,
+                    )
+                    .suffix("%")
+                    .show_value(true),
+                )
+                .on_hover_text("Boundary/admin line width on the basemap")
+                .changed();
+        });
+        if basemap_lines_changed {
+            self.app_settings.basemap_line_brightness_percent = self
+                .app_settings
+                .basemap_line_brightness_percent
+                .clamp(20, 200);
+            self.app_settings.basemap_line_thickness_percent = self
+                .app_settings
+                .basemap_line_thickness_percent
+                .clamp(25, 250);
+            let _ = self.app_settings.save();
+            ctx.request_repaint();
+        }
         if ui
             .checkbox(&mut self.bold_labels, "Bold town labels")
             .on_hover_text(
@@ -13855,7 +13953,7 @@ impl ViewerApp {
             if speed != self.app_settings.loop_speed_percent {
                 self.app_settings.loop_speed_percent = speed;
                 let _ = self.app_settings.save();
-                let frame_ms = self.loop_frame_ms();
+                let frame_ms = self.screen_loop_frame_ms();
                 ctx.request_repaint_after(Duration::from_millis(frame_ms));
             }
         });
@@ -13987,7 +14085,7 @@ impl ViewerApp {
             if speed != self.app_settings.loop_speed_percent {
                 self.app_settings.loop_speed_percent = speed;
                 let _ = self.app_settings.save();
-                let frame_ms = self.loop_frame_ms();
+                let frame_ms = self.screen_loop_frame_ms();
                 ctx.request_repaint_after(Duration::from_millis(frame_ms));
             }
         });
@@ -14058,7 +14156,7 @@ impl ViewerApp {
             self.browsing_history = self.selected_frame_index + 1 < self.frame_history.len();
         }
         self.last_history_step = Some(Instant::now());
-        let frame_ms = self.loop_frame_ms();
+        let frame_ms = self.screen_loop_frame_ms();
         ctx.request_repaint_after(Duration::from_millis(frame_ms));
         true
     }
@@ -14421,6 +14519,7 @@ impl ViewerApp {
                     for family in [
                         ColorTableFamily::Velocity,
                         ColorTableFamily::Reflectivity,
+                        ColorTableFamily::Probability,
                         ColorTableFamily::SpectrumWidth,
                         ColorTableFamily::CorrelationCoefficient,
                         ColorTableFamily::DifferentialReflectivity,
@@ -15786,8 +15885,13 @@ impl ViewerApp {
                             egui::ProgressBar::new(fraction).text(activity.label),
                         );
                     } else {
-                        ui.spinner();
-                        ui.add_sized([190.0, height], egui::Label::new(activity.label).truncate());
+                        ui.add_sized(
+                            [38.0, height],
+                            egui::Label::new(
+                                egui::RichText::new("BUSY").small().color(ACCENT_COLOR),
+                            ),
+                        );
+                        ui.add_sized([172.0, height], egui::Label::new(activity.label).truncate());
                     }
                     ui.separator();
                 }
@@ -17819,34 +17923,50 @@ impl ViewerApp {
     /// Kick background storm-cell identification per volume and fold results
     /// into the track history (SCIT association: nearest cell to each
     /// track's predicted position, then unmatched cells start new tracks).
+    fn install_storm_cells_for_frame(
+        &mut self,
+        key: &FrameWorkKey,
+        cells: &[StormCell],
+        ctx: &egui::Context,
+    ) {
+        self.storm_cells_volume_ptr = key.volume_ptr;
+        // Live-partial policy: track only COMPLETE volumes. Partial
+        // composites bias centroids and poison the motion fit, but still
+        // draw advected tracks.
+        let complete = self
+            .selected_frame()
+            .map(|frame| frame.status != FrameStatus::LivePartial)
+            .unwrap_or(true);
+        if complete {
+            let user_motion = {
+                let dir = (self.storm_motion_direction_deg as f64).to_radians();
+                let speed = self.storm_motion_speed_kt as f64 * KNOT_TO_MPS as f64;
+                (speed > 1.0).then(|| (speed * dir.sin(), speed * dir.cos()))
+            };
+            self.storm_tracker
+                .associate(key.identity.scan_time_utc, cells, user_motion);
+        }
+        ctx.request_repaint();
+    }
+
     fn poll_storm_tracks(&mut self, ctx: &egui::Context) {
         if let Some(receiver) = &self.storm_cells_receiver {
             match receiver.try_recv() {
-                Ok((volume_ptr, time, cells)) => {
+                Ok((key, cells)) => {
                     self.storm_cells_receiver = None;
-                    let current = self
+                    insert_limited_frame_cache(
+                        &mut self.storm_cells_cache,
+                        &mut self.storm_cells_cache_order,
+                        key.clone(),
+                        cells.clone(),
+                        ALGO_FRAME_CACHE_LIMIT,
+                    );
+                    let current_key = self
                         .volume
                         .as_ref()
-                        .map(|v| Arc::as_ptr(v) as usize)
-                        .unwrap_or(0);
-                    if volume_ptr == current {
-                        // Live-partial policy: track only COMPLETE volumes —
-                        // partial composites bias centroids and poison the
-                        // motion fit (the old replace-last-fix is abolished).
-                        // Partial volumes still draw advected tracks.
-                        let complete = self
-                            .selected_frame()
-                            .map(|frame| frame.status != FrameStatus::LivePartial)
-                            .unwrap_or(true);
-                        if complete {
-                            let user_motion = {
-                                let dir = (self.storm_motion_direction_deg as f64).to_radians();
-                                let speed = self.storm_motion_speed_kt as f64 * KNOT_TO_MPS as f64;
-                                (speed > 1.0).then(|| (speed * dir.sin(), speed * dir.cos()))
-                            };
-                            self.storm_tracker.associate(time, &cells, user_motion);
-                        }
-                        ctx.request_repaint();
+                        .map(|volume| FrameWorkKey::new(volume, Arc::as_ptr(volume) as usize));
+                    if current_key.as_ref() == Some(&key) {
+                        self.install_storm_cells_for_frame(&key, &cells, ctx);
                     } else {
                         self.storm_cells_volume_ptr = 0;
                     }
@@ -17865,19 +17985,30 @@ impl ViewerApp {
         if self.storm_tracks_site != volume.site.id {
             self.storm_tracker.clear();
             self.storm_tracks_site = volume.site.id.clone();
+            self.storm_cells_cache.clear();
+            self.storm_cells_cache_order.clear();
+            self.storm_cells_volume_ptr = 0;
         }
         let volume_ptr = Arc::as_ptr(&volume) as usize;
-        if volume_ptr == self.storm_cells_volume_ptr || self.storm_cells_receiver.is_some() {
+        if volume_ptr == self.storm_cells_volume_ptr {
+            return;
+        }
+        let key = FrameWorkKey::new(&volume, volume_ptr);
+        if let Some(cells) = self.storm_cells_cache.get(&key).cloned() {
+            self.install_storm_cells_for_frame(&key, &cells, ctx);
+            return;
+        }
+        if self.storm_cells_receiver.is_some() {
             return;
         }
         self.storm_cells_volume_ptr = volume_ptr;
         let (sender, receiver) = mpsc::channel();
         self.storm_cells_receiver = Some(receiver);
-        let time = volume.volume_time.with_timezone(&Utc);
         let ctx = ctx.clone();
+        let key_for_worker = key.clone();
         thread::spawn(move || {
             let cells = identify_storm_cells(&volume);
-            let _ = sender.send((volume_ptr, time, cells));
+            let _ = sender.send((key_for_worker, cells));
             ctx.request_repaint();
         });
     }
@@ -17962,6 +18093,9 @@ impl ViewerApp {
             });
         }
         for entry in &self.app_settings.custom_poll_links {
+            if custom_poll_entry_matches_community_feed(entry) {
+                continue;
+            }
             let Some((site_lat, site_lon)) = custom_poll_entry_lat_lon(entry) else {
                 continue;
             };
@@ -18543,6 +18677,30 @@ impl ViewerApp {
     fn loop_frame_ms(&self) -> u64 {
         let percent = u64::from(self.app_settings.loop_speed_percent.clamp(10, 1000));
         (HISTORY_LOOP_FRAME_MS * 100 / percent).max(40)
+    }
+
+    fn screen_loop_frame_ms(&self) -> u64 {
+        let base_ms = self.loop_frame_ms();
+        if self.expensive_low_zoom_render_active() {
+            base_ms.max(LOW_ZOOM_RENDER_BACKOFF_MIN_MS)
+        } else {
+            base_ms
+        }
+    }
+
+    fn primary_realtime_refresh_interval(&self) -> u64 {
+        if self.expensive_low_zoom_render_active() {
+            LOW_ZOOM_REALTIME_REFRESH_SECONDS
+        } else {
+            PRIMARY_REALTIME_LEVEL2_REFRESH_SECONDS
+        }
+    }
+
+    fn expensive_low_zoom_render_active(&self) -> bool {
+        self.map_scale <= LOW_ZOOM_RENDER_BACKOFF_SCALE
+            && self
+                .render_ms
+                .is_some_and(|ms| ms >= LOW_ZOOM_RENDER_BACKOFF_MIN_RENDER_MS)
     }
 
     fn sounding_window(&mut self, ctx: &egui::Context) {
@@ -20214,6 +20372,14 @@ impl ViewerApp {
     /// 12 s COW sequence is useless as single frames), then onto the map.
     fn install_polled_volume(&mut self, name: &str, volume: Arc<RadarVolume>, ctx: &egui::Context) {
         let identity = frame_identity_for_volume(&volume);
+        if self
+            .volume
+            .as_ref()
+            .is_some_and(|active| active.site.id != identity.site_id)
+            || history_contains_other_site(&self.frame_history, &identity.site_id)
+        {
+            self.clear_frame_history();
+        }
         let frame = FrameHistoryEntry {
             identity: identity.clone(),
             path: PathBuf::from(format!("poll://{name}")),
@@ -20231,10 +20397,16 @@ impl ViewerApp {
         } else {
             self.frame_history.push(frame);
         }
+        self.frame_history
+            .sort_by(|left, right| left.identity.cmp(&right.identity));
         self.trim_frame_history();
         // Follow the feed unless the user is looping history.
         if !self.history_playing {
-            self.selected_frame_index = self.frame_history.len().saturating_sub(1);
+            self.selected_frame_index = self
+                .frame_history
+                .iter()
+                .position(|frame| frame.identity == identity)
+                .unwrap_or_else(|| self.frame_history.len().saturating_sub(1));
         }
         self.install_volume_arc(volume, None, true, None, FrameStatus::Complete, ctx);
     }
@@ -20867,7 +21039,9 @@ impl ViewerApp {
                         // (field case: a local JMA radar bridge).
                         let root_listing = data_source::fetch_text(&format!("{base}/dir.list"));
                         let (listing, prefix) = match &root_listing {
-                            Ok(listing) if newest_dir_list_entry(listing).is_some() => {
+                            Ok(listing)
+                                if !dir_list_volume_entries_newest_first(listing).is_empty() =>
+                            {
                                 (listing.clone(), String::new())
                             }
                             _ => {
@@ -20899,26 +21073,45 @@ impl ViewerApp {
                                 }
                             }
                         };
-                        let newest = format!(
-                            "{prefix}{}",
-                            newest_dir_list_entry(&listing).ok_or("empty dir.list")?
-                        );
-                        if last.as_deref() == Some(newest.as_str()) {
-                            return Ok(None);
+                        let candidates = dir_list_volume_entries_newest_first(&listing);
+                        if candidates.is_empty() {
+                            return Err("empty dir.list".to_owned());
                         }
-                        // Volume client: real Level II runs 5-25 MB —
-                        // fetch_bytes' 4 MiB sprite-sheet cap and 8 s
-                        // metadata timeout both fail on field links.
-                        let raw = data_source::fetch_volume_bytes(&format!("{base}/{newest}"))
-                            .map_err(|e| format!("{newest}: {e}"))?;
-                        // Field feeds serve Level-II conversions (the GR2A
-                        // msg31 convention), native DORADE sweepfiles, or
-                        // international ODIM_H5/CfRadial volumes; the shared
-                        // router dispatches by magic bytes like the
-                        // file-open path.
-                        let volume = nexrad_io::decode_supported_volume_bytes(&raw)
-                            .map_err(|e| format!("decode {newest}: {e}"))?;
-                        Ok(Some((newest, Arc::new(volume))))
+                        let mut failures = Vec::new();
+                        for entry in candidates.into_iter().take(8) {
+                            let newest = format!("{prefix}{entry}");
+                            if last.as_deref() == Some(newest.as_str()) {
+                                return Ok(None);
+                            }
+                            // Volume client: real Level II runs 5-25 MB —
+                            // fetch_bytes' 4 MiB sprite-sheet cap and 8 s
+                            // metadata timeout both fail on field links.
+                            let raw = match data_source::fetch_volume_bytes(&format!(
+                                "{base}/{newest}"
+                            )) {
+                                Ok(raw) => raw,
+                                Err(err) => {
+                                    failures.push(format!("{newest}: {err}"));
+                                    continue;
+                                }
+                            };
+                            // Field feeds serve Level-II conversions (the GR2A
+                            // msg31 convention), native DORADE sweepfiles, or
+                            // international ODIM_H5/CfRadial volumes; the shared
+                            // router dispatches by magic bytes like the
+                            // file-open path.
+                            match nexrad_io::decode_supported_volume_bytes(&raw) {
+                                Ok(volume) => return Ok(Some((newest, Arc::new(volume)))),
+                                Err(err) => failures.push(format!("decode {newest}: {err}")),
+                            }
+                        }
+                        Err(format!(
+                            "no usable volume in newest dir.list entries ({})",
+                            failures
+                                .last()
+                                .cloned()
+                                .unwrap_or_else(|| "all candidates skipped".to_owned())
+                        ))
                     })();
                 let _ = sender.send(match result {
                     Ok(Some(pair)) => Ok(pair),
@@ -23322,39 +23515,53 @@ impl ViewerApp {
     /// and install finished results. Stale results (a newer volume arrived
     /// while detecting) are dropped by pointer check. The detection itself
     /// (dealias + LLSD + clustering, ~tens of ms) never touches the UI thread.
+    fn install_rotation_markers_for_frame(
+        &mut self,
+        key: &FrameWorkKey,
+        mut markers: Vec<RotationMarker>,
+        ctx: &egui::Context,
+    ) {
+        // Time association (Stumpf 1998 section 3d): a circulation seen near
+        // a previous-volume site inherits and increments persistence.
+        const ASSOC_DEG: f32 = 0.05; // about 5 km
+        for marker in &mut markers {
+            if let Some(previous) = self
+                .rotation_markers
+                .iter()
+                .filter(|p| {
+                    (p.lon - marker.lon).abs() < ASSOC_DEG && (p.lat - marker.lat).abs() < ASSOC_DEG
+                })
+                .max_by_key(|p| p.persistence)
+            {
+                marker.persistence = previous.persistence.saturating_add(1);
+            }
+        }
+        self.rotation_markers = markers;
+        self.rotation_markers_volume_ptr = key.volume_ptr;
+        ctx.request_repaint();
+    }
+
     fn poll_rotation_markers(&mut self, ctx: &egui::Context) {
         // Install any finished detection for the CURRENT volume.
         if let Some(receiver) = &self.rotation_receiver {
             match receiver.try_recv() {
-                Ok((volume_ptr, mut markers)) => {
+                Ok((key, markers)) => {
                     self.rotation_receiver = None;
-                    let current = self
+                    insert_limited_frame_cache(
+                        &mut self.rotation_markers_cache,
+                        &mut self.rotation_markers_cache_order,
+                        key.clone(),
+                        markers.clone(),
+                        ALGO_FRAME_CACHE_LIMIT,
+                    );
+                    let current_key = self
                         .volume
                         .as_ref()
-                        .map(|v| Arc::as_ptr(v) as usize)
-                        .unwrap_or(0);
-                    if volume_ptr == current {
-                        // Time association (Stumpf 1998 §3d): a circulation
-                        // seen near a previous-volume site inherits and
-                        // increments its persistence count.
-                        const ASSOC_DEG: f32 = 0.05; // ≈ 5 km
-                        for marker in &mut markers {
-                            if let Some(previous) = self
-                                .rotation_markers
-                                .iter()
-                                .filter(|p| {
-                                    (p.lon - marker.lon).abs() < ASSOC_DEG
-                                        && (p.lat - marker.lat).abs() < ASSOC_DEG
-                                })
-                                .max_by_key(|p| p.persistence)
-                            {
-                                marker.persistence = previous.persistence.saturating_add(1);
-                            }
-                        }
-                        self.rotation_markers = markers;
-                        ctx.request_repaint();
+                        .map(|volume| FrameWorkKey::new(volume, Arc::as_ptr(volume) as usize));
+                    if current_key.as_ref() == Some(&key) {
+                        self.install_rotation_markers_for_frame(&key, markers, ctx);
                     } else {
-                        // Stale — re-kick below for the new volume.
+                        // Stale - re-kick below for the new volume.
                         self.rotation_markers_volume_ptr = 0;
                     }
                 }
@@ -23373,7 +23580,15 @@ impl ViewerApp {
             return;
         };
         let volume_ptr = Arc::as_ptr(&volume) as usize;
-        if volume_ptr == self.rotation_markers_volume_ptr || self.rotation_receiver.is_some() {
+        if volume_ptr == self.rotation_markers_volume_ptr {
+            return;
+        }
+        let key = FrameWorkKey::new(&volume, volume_ptr);
+        if let Some(markers) = self.rotation_markers_cache.get(&key).cloned() {
+            self.install_rotation_markers_for_frame(&key, markers, ctx);
+            return;
+        }
+        if self.rotation_receiver.is_some() {
             return;
         }
         let Some((radar_lat, radar_lon)) = self.radar_location() else {
@@ -23383,9 +23598,10 @@ impl ViewerApp {
         let (sender, receiver) = mpsc::channel();
         self.rotation_receiver = Some(receiver);
         let ctx = ctx.clone();
+        let key_for_worker = key.clone();
         thread::spawn(move || {
             let markers = detect_rotation_markers_for_volume(&volume, radar_lat, radar_lon);
-            let _ = sender.send((volume_ptr, markers));
+            let _ = sender.send((key_for_worker, markers));
             ctx.request_repaint();
         });
     }
@@ -24839,6 +25055,12 @@ impl ViewerApp {
         self.map_center_lat.to_bits().hash(&mut hasher);
         self.map_scale.to_bits().hash(&mut hasher);
         self.basemap_style.key().hash(&mut hasher);
+        settings_basemap_line_brightness(&self.app_settings)
+            .to_bits()
+            .hash(&mut hasher);
+        settings_basemap_line_thickness(&self.app_settings)
+            .to_bits()
+            .hash(&mut hasher);
         hasher.finish()
     }
 
@@ -25015,12 +25237,16 @@ impl ViewerApp {
         let mut sink = Vec::new();
         let bounds = self.visible_geo_bounds(rect).expand(0.25);
         let us_detail_visible = us_detail_visible(bounds);
-        let strokes = basemap_underlay_strokes(self.basemap_style);
-        self.collect_basemap_line_shapes(
+        let strokes = basemap_underlay_strokes(
+            self.basemap_style,
+            settings_basemap_line_brightness(&self.app_settings),
+            settings_basemap_line_thickness(&self.app_settings),
+        );
+        self.collect_world_country_line_shapes(
             rect,
             bounds,
-            basemap_data::BASEMAP_WORLD_COUNTRY_LINES,
             strokes.world,
+            us_detail_visible,
             &mut sink,
         );
 
@@ -25079,13 +25305,17 @@ impl ViewerApp {
         let mut sink = Vec::new();
         let bounds = self.visible_geo_bounds(rect).expand(0.15);
         let us_detail_visible = us_detail_visible(bounds);
-        let strokes = basemap_overlay_strokes(self.basemap_style);
+        let strokes = basemap_overlay_strokes(
+            self.basemap_style,
+            settings_basemap_line_brightness(&self.app_settings),
+            settings_basemap_line_thickness(&self.app_settings),
+        );
         if self.map_scale >= 18.0 {
-            self.collect_basemap_line_shapes(
+            self.collect_world_country_line_shapes(
                 rect,
                 bounds,
-                basemap_data::BASEMAP_WORLD_COUNTRY_LINES,
                 strokes.world,
+                us_detail_visible,
                 &mut sink,
             );
         }
@@ -25123,6 +25353,26 @@ impl ViewerApp {
             }
         }
         sink
+    }
+
+    fn collect_world_country_line_shapes(
+        &self,
+        rect: egui::Rect,
+        bounds: GeoBounds,
+        stroke: egui::Stroke,
+        us_detail_visible: bool,
+        sink: &mut Vec<egui::Shape>,
+    ) {
+        for line in basemap_data::BASEMAP_WORLD_COUNTRY_LINES {
+            if us_detail_visible && world_country_line_duplicates_us_detail(line) {
+                continue;
+            }
+            if bounds.intersects_bbox(line.bbox)
+                && let Some(shape) = self.geo_line_shape(rect, line.points, stroke)
+            {
+                sink.push(shape);
+            }
+        }
     }
 
     fn collect_basemap_line_shapes(
@@ -26358,6 +26608,9 @@ impl ViewerApp {
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
+                if custom_poll_entry_matches_community_feed(entry) {
+                    return None;
+                }
                 let (latitude_deg, longitude_deg) = custom_poll_entry_lat_lon(entry)?;
                 let position = self.lon_lat_to_screen(rect, longitude_deg, latitude_deg);
                 rect.expand(18.0)
@@ -26471,7 +26724,9 @@ impl ViewerApp {
             // pad) the poller is following, if any.
             let active_feed = marker.feed_indices.iter().find_map(|&feed_index| {
                 let feed = feeds.get(feed_index)?;
-                (active_url == Some(feed.poll_url)).then_some(feed)
+                active_url
+                    .is_some_and(|url| poll_urls_match(url, feed.poll_url))
+                    .then_some(feed)
             });
             let is_hovered = hovered == Some(*index);
             if let Some(feed) = active_feed {
@@ -27209,9 +27464,68 @@ struct BasemapLineStrokes {
     regional: egui::Stroke,
 }
 
-fn basemap_underlay_strokes(style: tiles::TileStyle) -> BasemapLineStrokes {
-    if style == tiles::TileStyle::Satellite {
-        return BasemapLineStrokes {
+fn world_country_line_duplicates_us_detail(line: &basemap_data::BasemapLine) -> bool {
+    let [west, south, east, north] = line.bbox;
+    // Natural Earth's contiguous-US country outline is intentionally coarse.
+    // When Census state lines are active it creates a false sliver north of
+    // the 49th parallel; the Census lines carry the accurate border/coast.
+    west < -124.0 && east > -67.5 && south < 26.0 && (49.0..50.0).contains(&north)
+}
+
+fn settings_basemap_line_brightness(settings: &settings::AppSettings) -> f32 {
+    settings.basemap_line_brightness_percent.clamp(20, 200) as f32 / 100.0
+}
+
+fn settings_basemap_line_thickness(settings: &settings::AppSettings) -> f32 {
+    settings.basemap_line_thickness_percent.clamp(25, 250) as f32 / 100.0
+}
+
+fn basemap_line_brightness(value: f32) -> f32 {
+    value.clamp(0.2, 2.0)
+}
+
+fn basemap_line_thickness(value: f32) -> f32 {
+    value.clamp(0.25, 2.5)
+}
+
+fn tune_basemap_line_color(color: egui::Color32, brightness: f32) -> egui::Color32 {
+    let brightness = basemap_line_brightness(brightness);
+    let scale = |value: u8| ((value as f32 * brightness).round()).clamp(0.0, 255.0) as u8;
+    egui::Color32::from_rgba_unmultiplied(
+        scale(color.r()),
+        scale(color.g()),
+        scale(color.b()),
+        scale(color.a()),
+    )
+}
+
+fn tune_basemap_stroke(stroke: egui::Stroke, brightness: f32, thickness: f32) -> egui::Stroke {
+    egui::Stroke::new(
+        stroke.width * basemap_line_thickness(thickness),
+        tune_basemap_line_color(stroke.color, brightness),
+    )
+}
+
+fn tune_basemap_strokes(
+    strokes: BasemapLineStrokes,
+    brightness: f32,
+    thickness: f32,
+) -> BasemapLineStrokes {
+    BasemapLineStrokes {
+        world: tune_basemap_stroke(strokes.world, brightness, thickness),
+        county: tune_basemap_stroke(strokes.county, brightness, thickness),
+        state: tune_basemap_stroke(strokes.state, brightness, thickness),
+        regional: tune_basemap_stroke(strokes.regional, brightness, thickness),
+    }
+}
+
+fn basemap_underlay_strokes(
+    style: tiles::TileStyle,
+    brightness: f32,
+    thickness: f32,
+) -> BasemapLineStrokes {
+    let strokes = if style == tiles::TileStyle::Satellite {
+        BasemapLineStrokes {
             world: egui::Stroke::new(
                 0.9,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 176),
@@ -27228,19 +27542,25 @@ fn basemap_underlay_strokes(style: tiles::TileStyle) -> BasemapLineStrokes {
                 0.85,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 146),
             ),
-        };
-    }
-    BasemapLineStrokes {
-        world: egui::Stroke::new(0.75, egui::Color32::from_rgb(31, 45, 57)),
-        county: egui::Stroke::new(0.65, egui::Color32::from_rgb(24, 35, 46)),
-        state: egui::Stroke::new(1.05, egui::Color32::from_rgb(41, 58, 73)),
-        regional: egui::Stroke::new(0.85, egui::Color32::from_rgb(36, 52, 65)),
-    }
+        }
+    } else {
+        BasemapLineStrokes {
+            world: egui::Stroke::new(0.75, egui::Color32::from_rgb(31, 45, 57)),
+            county: egui::Stroke::new(0.65, egui::Color32::from_rgb(24, 35, 46)),
+            state: egui::Stroke::new(1.05, egui::Color32::from_rgb(41, 58, 73)),
+            regional: egui::Stroke::new(0.85, egui::Color32::from_rgb(36, 52, 65)),
+        }
+    };
+    tune_basemap_strokes(strokes, brightness, thickness)
 }
 
-fn basemap_overlay_strokes(style: tiles::TileStyle) -> BasemapLineStrokes {
-    if style == tiles::TileStyle::Satellite {
-        return BasemapLineStrokes {
+fn basemap_overlay_strokes(
+    style: tiles::TileStyle,
+    brightness: f32,
+    thickness: f32,
+) -> BasemapLineStrokes {
+    let strokes = if style == tiles::TileStyle::Satellite {
+        BasemapLineStrokes {
             world: egui::Stroke::new(
                 0.85,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 118),
@@ -27257,26 +27577,28 @@ fn basemap_overlay_strokes(style: tiles::TileStyle) -> BasemapLineStrokes {
                 0.75,
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, 128),
             ),
-        };
-    }
-    BasemapLineStrokes {
-        world: egui::Stroke::new(
-            0.85,
-            egui::Color32::from_rgba_unmultiplied(102, 126, 145, 84),
-        ),
-        county: egui::Stroke::new(
-            0.55,
-            egui::Color32::from_rgba_unmultiplied(92, 112, 128, 92),
-        ),
-        state: egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgba_unmultiplied(126, 150, 170, 116),
-        ),
-        regional: egui::Stroke::new(
-            0.75,
-            egui::Color32::from_rgba_unmultiplied(112, 136, 154, 96),
-        ),
-    }
+        }
+    } else {
+        BasemapLineStrokes {
+            world: egui::Stroke::new(
+                0.85,
+                egui::Color32::from_rgba_unmultiplied(102, 126, 145, 84),
+            ),
+            county: egui::Stroke::new(
+                0.55,
+                egui::Color32::from_rgba_unmultiplied(92, 112, 128, 92),
+            ),
+            state: egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(126, 150, 170, 116),
+            ),
+            regional: egui::Stroke::new(
+                0.75,
+                egui::Color32::from_rgba_unmultiplied(112, 136, 154, 96),
+            ),
+        }
+    };
+    tune_basemap_strokes(strokes, brightness, thickness)
 }
 
 #[derive(Clone, Copy)]
@@ -33275,11 +33597,11 @@ fn archive_fetch_count_for_latest_load(
 /// Metadata sidecars are skipped: a field bridge serving latest.json next
 /// to the volumes otherwise wins every lexicographic pick and the poll
 /// "decodes" JSON forever. Directory entries (trailing '/') likewise.
-fn newest_dir_list_entry(listing: &str) -> Option<String> {
+fn dir_list_volume_entries_newest_first(listing: &str) -> Vec<String> {
     const METADATA_EXTENSIONS: &[&str] = &[
         "json", "cfg", "txt", "html", "htm", "xml", "css", "js", "ini", "md", "php", "gis",
     ];
-    listing
+    let mut entries: Vec<String> = listing
         .lines()
         .filter_map(|line| line.split_whitespace().last())
         .filter(|name| !name.is_empty() && !name.ends_with('/'))
@@ -33289,8 +33611,19 @@ fn newest_dir_list_entry(listing: &str) -> Option<String> {
                 .map(|(_, extension)| extension.to_ascii_lowercase());
             !matches!(extension, Some(e) if METADATA_EXTENSIONS.contains(&e.as_str()))
         })
-        .max()
         .map(str::to_owned)
+        .collect();
+    entries.sort();
+    entries.dedup();
+    entries.reverse();
+    entries
+}
+
+#[cfg(test)]
+fn newest_dir_list_entry(listing: &str) -> Option<String> {
+    dir_list_volume_entries_newest_first(listing)
+        .into_iter()
+        .next()
 }
 
 /// One international poll tick (runs on the poll worker thread): catalog
@@ -33804,6 +34137,14 @@ fn custom_poll_entry_label(entry: &settings::CustomPollLinkEntry) -> String {
         return site_id.to_owned();
     }
     poll_url_name(&entry.poll_url)
+}
+
+fn custom_poll_entry_matches_community_feed(entry: &settings::CustomPollLinkEntry) -> bool {
+    let poll_url = normalized_poll_url(&entry.poll_url);
+    !poll_url.is_empty()
+        && data_source::community_feeds::community_feeds()
+            .iter()
+            .any(|feed| poll_urls_match(&poll_url, feed.poll_url))
 }
 
 fn poll_url_name(url: &str) -> String {
@@ -34845,6 +35186,21 @@ mod tests {
         // Non-m/s products never rescale off the table's declaration.
         let dbz = DisplayProduct::Moment(MomentType::Reflectivity);
         assert_eq!(table_display_unit(&mph, &dbz), ("dBZ", 1.0));
+    }
+
+    #[test]
+    fn hail_probability_products_use_percent_palette_domain() {
+        let table_set = ColorTableSet::default();
+        for product in [
+            DisplayProduct::Derived(DerivedProduct::Posh),
+            DisplayProduct::Derived(DerivedProduct::Poh),
+        ] {
+            assert_eq!(product.color_family(), ColorTableFamily::Probability);
+            let table = table_set.for_family(product.color_family());
+            assert_eq!(table_display_unit(table, &product), ("%", 1.0));
+            assert_eq!(table.stops().first().map(|stop| stop.value), Some(0.0));
+            assert_eq!(table.stops().last().map(|stop| stop.value), Some(100.0));
+        }
     }
 
     /// User tables resolve by name even when their Product: header put
@@ -36133,6 +36489,83 @@ mod tests {
     }
 
     #[test]
+    fn polled_volume_drops_previous_site_history() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+        app.upsert_history_frame(test_decoded_live_partial(
+            PathBuf::from("KTLX-live"),
+            "KTLX",
+            scan_time,
+            10,
+        ));
+        app.volume = Some(Arc::clone(&app.frame_history[0].volume));
+
+        let ctx = egui::Context::default();
+        let fwlx = test_decoded_live_partial(
+            PathBuf::from("FWLX-live"),
+            "FWLX",
+            scan_time + chrono::Duration::minutes(3),
+            10,
+        );
+        app.install_polled_volume("FWLX20260608_0133", Arc::new(fwlx.volume), &ctx);
+
+        assert_eq!(app.frame_history.len(), 1);
+        assert_eq!(app.frame_history[0].identity.site_id, "FWLX");
+        assert_eq!(app.selected_frame_index, 0);
+    }
+
+    #[test]
+    fn polled_volume_history_stays_time_sorted() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+        let ctx = egui::Context::default();
+
+        let later = test_decoded_live_partial(
+            PathBuf::from("FWLX-0136"),
+            "FWLX",
+            scan_time + chrono::Duration::minutes(6),
+            10,
+        );
+        app.install_polled_volume("FWLX20260608_0136", Arc::new(later.volume), &ctx);
+        let earlier = test_decoded_live_partial(
+            PathBuf::from("FWLX-0133"),
+            "FWLX",
+            scan_time + chrono::Duration::minutes(3),
+            10,
+        );
+        app.install_polled_volume("FWLX20260608_0133", Arc::new(earlier.volume), &ctx);
+
+        assert_eq!(
+            app.frame_history
+                .iter()
+                .map(|frame| frame.identity.scan_time_utc)
+                .collect::<Vec<_>>(),
+            vec![
+                scan_time + chrono::Duration::minutes(3),
+                scan_time + chrono::Duration::minutes(6)
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_poll_links_matching_built_in_community_feeds_are_deduped() {
+        let entry = settings::CustomPollLinkEntry {
+            label: "FWLX duplicate".to_owned(),
+            site_id: "FWLX".to_owned(),
+            lat_e6: 35_254_000,
+            lon_e6: -87_325_000,
+            poll_url: "https://mesonet-nexrad.agron.iastate.edu/level2/raw/FWLX/".to_owned(),
+        };
+        assert!(custom_poll_entry_matches_community_feed(&entry));
+
+        let private = settings::CustomPollLinkEntry {
+            poll_url: "http://192.0.2.5/FWLX".to_owned(),
+            ..entry
+        };
+        assert!(!custom_poll_entry_matches_community_feed(&private));
+    }
+
+    #[test]
     fn live_update_does_not_steal_selection_while_history_is_playing() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
@@ -36354,6 +36787,56 @@ mod tests {
             app.browsing_history,
             "pausing on an older frame should preserve browse mode"
         );
+    }
+
+    #[test]
+    fn low_zoom_expensive_render_backs_off_screen_refresh_cadence() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let base_loop_ms = app.loop_frame_ms();
+
+        app.map_scale = LOW_ZOOM_RENDER_BACKOFF_SCALE;
+        app.render_ms = Some(LOW_ZOOM_RENDER_BACKOFF_MIN_RENDER_MS);
+
+        assert_eq!(
+            app.screen_loop_frame_ms(),
+            base_loop_ms.max(LOW_ZOOM_RENDER_BACKOFF_MIN_MS)
+        );
+        assert_eq!(
+            app.primary_realtime_refresh_interval(),
+            LOW_ZOOM_REALTIME_REFRESH_SECONDS
+        );
+
+        app.map_scale = LOW_ZOOM_RENDER_BACKOFF_SCALE + 1.0;
+
+        assert_eq!(app.screen_loop_frame_ms(), base_loop_ms);
+        assert_eq!(
+            app.primary_realtime_refresh_interval(),
+            PRIMARY_REALTIME_LEVEL2_REFRESH_SECONDS
+        );
+    }
+
+    #[test]
+    fn frame_work_cache_key_keeps_live_partial_replacements_distinct() {
+        let identity = FrameIdentity {
+            site_id: "KTLX".to_owned(),
+            scan_time_utc: Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap(),
+        };
+        let first = FrameWorkKey {
+            identity: identity.clone(),
+            volume_ptr: 1,
+        };
+        let replacement = FrameWorkKey {
+            identity,
+            volume_ptr: 2,
+        };
+        let mut cache = BTreeMap::new();
+        let mut order = VecDeque::new();
+
+        insert_limited_frame_cache(&mut cache, &mut order, first.clone(), vec![1], 96);
+        insert_limited_frame_cache(&mut cache, &mut order, replacement.clone(), vec![2], 96);
+
+        assert_eq!(cache.get(&first), Some(&vec![1]));
+        assert_eq!(cache.get(&replacement), Some(&vec![2]));
     }
 
     #[test]
@@ -37520,6 +38003,15 @@ mod tests {
             newest_dir_list_entry(listing).as_deref(),
             Some("KILX_20260611_0020.gz")
         );
+        assert_eq!(
+            dir_list_volume_entries_newest_first(
+                "10 GAWX_20260615_0607\n10 GAWX_20260615_0609\nlatest.json\n"
+            ),
+            vec![
+                "GAWX_20260615_0609".to_owned(),
+                "GAWX_20260615_0607".to_owned()
+            ]
+        );
     }
 
     #[test]
@@ -38157,6 +38649,22 @@ mod tests {
     }
 
     #[test]
+    fn basemap_suppresses_duplicate_natural_earth_conus_outline() {
+        let duplicates: Vec<_> = basemap_data::BASEMAP_WORLD_COUNTRY_LINES
+            .iter()
+            .filter(|line| world_country_line_duplicates_us_detail(line))
+            .collect();
+        assert_eq!(
+            duplicates.len(),
+            1,
+            "the duplicate filter should only catch the coarse CONUS country outline"
+        );
+        let [west, south, east, north] = duplicates[0].bbox;
+        assert!(west < -124.0 && east > -67.5);
+        assert!(south < 26.0 && (49.0..50.0).contains(&north));
+    }
+
+    #[test]
     fn basemap_detail_layers_are_gated_by_viewport() {
         let central_us = GeoBounds {
             west: -101.0,
@@ -38212,9 +38720,9 @@ mod tests {
 
     #[test]
     fn satellite_basemap_uses_white_vector_strokes() {
-        let dark = basemap_underlay_strokes(tiles::TileStyle::DarkVector);
-        let satellite = basemap_underlay_strokes(tiles::TileStyle::Satellite);
-        let satellite_overlay = basemap_overlay_strokes(tiles::TileStyle::Satellite);
+        let dark = basemap_underlay_strokes(tiles::TileStyle::DarkVector, 1.0, 1.0);
+        let satellite = basemap_underlay_strokes(tiles::TileStyle::Satellite, 1.0, 1.0);
+        let satellite_overlay = basemap_overlay_strokes(tiles::TileStyle::Satellite, 1.0, 1.0);
 
         assert_eq!(dark.world.color, egui::Color32::from_rgb(31, 45, 57));
         assert_eq!(satellite.world.color.r(), satellite.world.color.g());
@@ -38229,6 +38737,18 @@ mod tests {
             satellite_overlay.state.color.b()
         );
         assert!(satellite_overlay.state.color.a() > 100);
+    }
+
+    #[test]
+    fn basemap_line_tuning_changes_alpha_and_width() {
+        let base = basemap_overlay_strokes(tiles::TileStyle::Satellite, 1.0, 1.0);
+        let dim = basemap_overlay_strokes(tiles::TileStyle::Satellite, 0.5, 0.5);
+        let bright = basemap_overlay_strokes(tiles::TileStyle::Satellite, 1.5, 1.5);
+
+        assert!(dim.state.color.a() < base.state.color.a());
+        assert!(dim.state.width < base.state.width);
+        assert!(bright.state.color.a() > base.state.color.a());
+        assert!(bright.state.width > base.state.width);
     }
 
     #[test]
@@ -39619,10 +40139,14 @@ mod tests {
             storm_tracks_site: String::new(),
             storm_cells_volume_ptr: 0,
             storm_cells_receiver: None,
+            storm_cells_cache: BTreeMap::new(),
+            storm_cells_cache_order: VecDeque::new(),
             show_storm_tracks: true,
             rotation_markers: Vec::new(),
             rotation_markers_volume_ptr: 0,
             rotation_receiver: None,
+            rotation_markers_cache: BTreeMap::new(),
+            rotation_markers_cache_order: VecDeque::new(),
             show_rotation_markers: true,
             tor_tracks: tor_tracks::TorTracksState::default(),
             gate_filter_dbz: None,
@@ -40345,7 +40869,7 @@ mod tests {
         );
         app.storm_cells_receiver = None;
 
-        let (_sender, receiver) = mpsc::channel::<(usize, Vec<RotationMarker>)>();
+        let (_sender, receiver) = mpsc::channel::<RotationMarkersResult>();
         app.rotation_receiver = Some(receiver);
         assert_eq!(
             app.active_background_activity(),
