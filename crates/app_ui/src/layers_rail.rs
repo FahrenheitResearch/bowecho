@@ -15,10 +15,10 @@ use eframe::egui;
 
 use crate::{
     LayerRowGear, LayerRowOpacity, LayerRowOrder, LayerRowRemove, LayerRowSpec, LayerRowVis,
-    PlacefileSlot, PollSource, RadarSite, SidebarTab, ViewerApp, custom_poll_entry_label,
-    custom_poll_entry_lat_lon, custom_poll_links_from_gis, dock, format_site_label,
-    intl_provider_label, layer_row, mesoanalysis, normalized_poll_url, oa_derived,
-    parse_custom_poll_marker_inputs, poll_url_name, poll_urls_match, spc_layers,
+    OrdArchiveLoadMode, PlacefileSlot, PollSource, RadarSite, SidebarTab, ViewerApp,
+    custom_poll_entry_label, custom_poll_entry_lat_lon, custom_poll_links_from_gis, dock,
+    format_site_label, intl_provider_label, layer_row, mesoanalysis, normalized_poll_url,
+    oa_derived, parse_custom_poll_marker_inputs, poll_url_name, poll_urls_match, spc_layers,
 };
 
 impl ViewerApp {
@@ -1085,7 +1085,7 @@ impl ViewerApp {
                                 .unwrap_or("waiting for dir.list…"),
                         );
                     }
-                });
+        });
         self.custom_poll_links_section(ui, ctx);
         self.intl_feeds_row(ui, ctx);
     }
@@ -1377,7 +1377,7 @@ impl ViewerApp {
     /// Point the shared poller at the URL text field (the custom-URL
     /// Start/known-feed click). Switching away from a different source
     /// drops a still-in-flight tick so it can't install under the new one.
-    fn set_custom_url_poll_source(&mut self) {
+    pub(crate) fn set_custom_url_poll_source(&mut self) {
         self.poll_url = normalized_poll_url(&self.poll_url);
         let source = PollSource::CustomUrl(self.poll_url.clone());
         if self.poll_source != source {
@@ -1497,6 +1497,217 @@ impl ViewerApp {
     /// `+ Add layer ▾` — THE single front door for every map data type
     /// (spec §2.4): you never need to know that layers are born inside the
     /// Model/Sat windows' "Show on radar map" buttons.
+    pub(crate) fn ord_archive_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.ord_archive_date_input.is_empty() {
+            let now = chrono::Utc::now();
+            self.ord_archive_date_input = now.format("%Y-%m-%d").to_string();
+            self.ord_archive_hour_input = now.format("%H").to_string();
+            self.ord_archive_minute_input = "00".to_owned();
+        }
+        if self.ord_archive_site_input.is_empty()
+            && let PollSource::Intl {
+                provider_id,
+                site_id,
+            } = &self.poll_source
+            && provider_id == "ord"
+        {
+            self.ord_archive_site_input = site_id.clone();
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Fetch N scans").on_hover_text(
+                "Clicking an ORD scan chip loads this many scans ending at that scan when On click is Loop.",
+            );
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.archive_frame_count)
+                        .range(1..=crate::MAX_ARCHIVE_FRAME_COUNT)
+                        .speed(0.2),
+                )
+                .changed()
+            {
+                self.persist_archive_controls();
+                ctx.request_repaint();
+            }
+            if self.ord_archive_loaded_range.is_some()
+                && ui
+                    .button("+5 older")
+                    .on_hover_text("Prepend five older ORD scans from the current listed day")
+                    .clicked()
+            {
+                self.extend_ord_archive_loop_earlier(5, ctx);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Site").on_hover_text(
+                "Fetch historical EUMETNET ORD per-radar polar files from CloudFerro openradar-archive. \
+                 For split sites this downloads/merges DBZH/VRADH/TH automatically. \
+                 This control targets direct per-site ODIM HDF5 PVOL/SCAN objects; older BUFR holdings and OPERA composites are separate product paths.",
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.ord_archive_site_input)
+                    .hint_text("plbrz")
+                    .desired_width(58.0),
+            )
+            .on_hover_text("Lowercase ORD site code, e.g. plbrz, plleg, eesur, frtou");
+            if ui
+                .small_button("Use active")
+                .on_hover_text("Fill from the currently live-polled ORD radar")
+                .clicked()
+            {
+                if let PollSource::Intl {
+                    provider_id,
+                    site_id,
+                } = &self.poll_source
+                    && provider_id == "ord"
+                {
+                    self.ord_archive_site_input = site_id.clone();
+                } else {
+                    self.status = "ORD archive: active radar is not an ORD site".to_owned();
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            let mut step_days: i64 = 0;
+            if ui.small_button("◀").on_hover_text("Previous day").clicked() {
+                step_days = -1;
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut self.ord_archive_date_input)
+                    .hint_text("YYYY-MM-DD")
+                    .desired_width(88.0),
+            );
+            if ui.small_button("▶").on_hover_text("Next day").clicked() {
+                step_days = 1;
+            }
+            if ui.small_button("Today").clicked() {
+                let now = chrono::Utc::now();
+                self.ord_archive_date_input = now.format("%Y-%m-%d").to_string();
+                self.start_ord_archive_day_listing(ctx);
+            }
+            if step_days != 0
+                && let Ok(date) = chrono::NaiveDate::parse_from_str(
+                    self.ord_archive_date_input.trim(),
+                    "%Y-%m-%d",
+                )
+            {
+                self.ord_archive_date_input = (date + chrono::Duration::days(step_days))
+                    .format("%Y-%m-%d")
+                    .to_string();
+                self.start_ord_archive_day_listing(ctx);
+            }
+            let listing = self.ord_archive_list_rx.is_some();
+            if ui
+                .add_enabled(!listing, egui::Button::new("List"))
+                .on_hover_text("List all complete ORD scans for this UTC date")
+                .clicked()
+            {
+                self.start_ord_archive_day_listing(ctx);
+            }
+            if listing {
+                ui.spinner();
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Exact load:");
+            ui.selectable_value(&mut self.archive_load_loop, true, "Loop")
+                .on_hover_text(
+                    "The Exact UTC Load button uses Fetch N scans ending nearest the target time",
+                );
+            ui.selectable_value(&mut self.archive_load_loop, false, "Single")
+                .on_hover_text("The Exact UTC Load button loads only the nearest scan");
+            ui.weak("scan chips use Fetch N");
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Exact UTC");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.ord_archive_hour_input)
+                    .hint_text("HH")
+                    .desired_width(34.0),
+            )
+            .on_hover_text("UTC hour, 0-23");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.ord_archive_minute_input)
+                    .hint_text("MM")
+                    .desired_width(34.0),
+            )
+            .on_hover_text("UTC minute for nearest-scan fetch; whole-hour fetch ignores it");
+            if ui
+                .button("Load")
+                .on_hover_text(
+                    "Use the UTC target below. Loop mode loads Fetch N scans ending nearest this time; Single loads the nearest scan.",
+                )
+                .clicked()
+            {
+                self.start_ord_archive_exact_load(ctx);
+            }
+            if ui
+                .button("Nearest")
+                .on_hover_text("Load the complete ORD scan nearest this UTC time")
+                .clicked()
+            {
+                self.start_ord_archive_load(OrdArchiveLoadMode::Nearest, ctx);
+            }
+            if ui
+                .button("Hour")
+                .on_hover_text("Load every complete ORD scan in this UTC hour as a loop")
+                .clicked()
+            {
+                self.start_ord_archive_load(OrdArchiveLoadMode::Hour, ctx);
+            }
+        });
+        if let Some(progress) = &self.archive_load_progress
+            && progress.label.starts_with("ORD archive")
+        {
+            crate::archive_load_progress_row(ui, progress);
+        }
+        if let Some(scans) = &self.ord_archive_scans {
+            if scans.is_empty() {
+                ui.weak("No ORD per-site scans found for that UTC date");
+            } else {
+                ui.weak(format!("{} scans (UTC)", scans.len()));
+                let mut load_scan: Option<usize> = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("ord_archive_scan_list")
+                    .max_height(190.0)
+                    .show(ui, |ui| {
+                        let mut index = 0usize;
+                        while index < scans.len() {
+                            let hour = scans[index].stamp_utc.format("%H").to_string();
+                            ui.weak(format!("{hour} UTC"));
+                            ui.horizontal_wrapped(|ui| {
+                                while index < scans.len()
+                                    && scans[index].stamp_utc.format("%H").to_string() == hour
+                                {
+                                    let label = scans[index].stamp_utc.format("%M:%S").to_string();
+                                    let hover = format!(
+                                        "{} · {} · {} part(s)",
+                                        scans[index].stamp_utc.format("%Y-%m-%d %H:%M:%SZ"),
+                                        scans[index].object_kind,
+                                        scans[index].frame.parts.len()
+                                    );
+                                    if ui
+                                        .add_sized(
+                                            egui::vec2(52.0, crate::PANEL_BUTTON_HEIGHT),
+                                            egui::Button::new(label),
+                                        )
+                                        .on_hover_text(hover)
+                                        .clicked()
+                                    {
+                                        load_scan = Some(index);
+                                    }
+                                    index += 1;
+                                }
+                            });
+                        }
+                    });
+                if let Some(index) = load_scan {
+                    self.start_ord_archive_scan_load(index, ctx);
+                }
+            }
+        }
+    }
+
     pub(crate) fn add_layer_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // THE single front door for every map data type (proposal
         // section 4 step 5 / discoverability fix 1.4): you no longer

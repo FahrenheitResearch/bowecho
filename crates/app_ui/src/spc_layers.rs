@@ -592,7 +592,8 @@ struct EstofexAreaBuilder {
 pub fn parse_estofex_outlook_xml(text: &str) -> Vec<OutlookFeature> {
     use quick_xml::events::Event;
 
-    let mut reader = quick_xml::Reader::from_str(text);
+    let polygon_text = estofex_polygon_fragment(text).unwrap_or(text);
+    let mut reader = quick_xml::Reader::from_str(polygon_text);
     reader.config_mut().trim_text(true);
     let mut current: Option<EstofexAreaBuilder> = None;
     let mut out = Vec::new();
@@ -642,6 +643,15 @@ pub fn parse_estofex_outlook_xml(text: &str) -> Vec<OutlookFeature> {
     }
 
     out
+}
+
+fn estofex_polygon_fragment(text: &str) -> Option<&str> {
+    let start = text.find("<area")?;
+    let end = text
+        .rfind("</area>")
+        .map(|index| index + "</area>".len())
+        .unwrap_or(text.len());
+    (start < end).then(|| &text[start..end])
 }
 
 fn fetch_estofex_outlooks() -> Vec<OutlookFeature> {
@@ -1257,6 +1267,27 @@ PROBABILISTIC OUTLOOK POINTS DAY 3\n\
     }
 
     #[test]
+    fn parses_estofex_xml_after_malformed_preamble() {
+        let sample = r#"
+<?xml version="1.0"?>
+<forecast>
+  <graphicname>&begin=2026061606</graphicname>
+  <text>A level 1 was issued.<BR><BR>DISCUSSION</text>
+  <area risktype="level 1">
+    <point lat="49.3" lon="7.6"/>
+    <point lat="50.3" lon="6.7"/>
+    <point lat="51.5" lon="7.4"/>
+    <point lat="49.3" lon="7.6"/>
+  </area>
+</forecast>
+"#;
+        let parsed = parse_estofex_outlook_xml(sample);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].label, "EU L1");
+        assert_eq!(parsed[0].label2, "ESTOFEX Level 1");
+    }
+
+    #[test]
     #[ignore = "network: fetches live SPC raw PTS and ESTOFEX XML"]
     fn live_outlook_sources_parse_smoke() {
         let pts = data_source::fetch_text(live_pts_url(1).unwrap()).expect("SPC PTS fetch");
@@ -1272,7 +1303,10 @@ PROBABILISTIC OUTLOOK POINTS DAY 3\n\
             estofex.contains("<forecast"),
             "ESTOFEX endpoint should return forecast XML"
         );
-        parse_estofex_outlook_xml(&estofex);
+        assert!(
+            !parse_estofex_outlook_xml(&estofex).is_empty(),
+            "current ESTOFEX XML should expose active polygon areas"
+        );
     }
 
     #[test]

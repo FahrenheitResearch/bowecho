@@ -60,7 +60,7 @@ pub use dwd::DwdProvider;
 pub use fmi::FmiProvider;
 pub use geosphere::GeoSphereProvider;
 pub use kaia::KaiaEstoniaProvider;
-pub use ord::OrdProvider;
+pub use ord::{OrdArchivePlan, OrdProvider, archive_plan_nearest, archive_plans_for_hour};
 pub use shmu::ShmuProvider;
 pub use smhi::SmhiProvider;
 

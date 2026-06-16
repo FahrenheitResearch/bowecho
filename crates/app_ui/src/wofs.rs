@@ -203,6 +203,94 @@ pub fn image_url(run: &WofsRun, init: &str, product: &str, minute: u32) -> Strin
     )
 }
 
+pub fn product_label(slug: &str) -> String {
+    if let Some(label) = known_product_label(slug) {
+        return label.to_owned();
+    }
+
+    let mut parts = slug.splitn(2, "__");
+    let field = parts.next().unwrap_or(slug);
+    let base = field_label(field);
+    let Some(detail) = parts.next() else {
+        return base;
+    };
+    let detail = detail_label(detail);
+    if detail.is_empty() {
+        base
+    } else {
+        format!("{base} ({detail})")
+    }
+}
+
+fn known_product_label(slug: &str) -> Option<&'static str> {
+    match slug {
+        "comp_dz__paintballs_thresh_40" => Some("Composite reflectivity (paintballs >=40 dBZ)"),
+        "comp_dz__ens_mean" => Some("Composite reflectivity (ensemble mean)"),
+        "t_2__ens_mean" => Some("2 m temperature (ensemble mean)"),
+        "td_2__ens_mean" => Some("2 m dewpoint (ensemble mean)"),
+        "uh_0to2__paintballs_thresh_75" => Some("0-2 km updraft helicity (paintballs >=75)"),
+        "uh_2to5__paintballs_thresh_75" => Some("2-5 km updraft helicity (paintballs >=75)"),
+        _ => None,
+    }
+}
+
+fn field_label(field: &str) -> String {
+    match field {
+        "comp_dz" => "Composite reflectivity".to_owned(),
+        "dz" => "Reflectivity".to_owned(),
+        "t_2" => "2 m temperature".to_owned(),
+        "td_2" => "2 m dewpoint".to_owned(),
+        "u_10" => "10 m U wind".to_owned(),
+        "v_10" => "10 m V wind".to_owned(),
+        "uh_0to2" => "0-2 km updraft helicity".to_owned(),
+        "uh_2to5" => "2-5 km updraft helicity".to_owned(),
+        "w_up" | "updraft" => "Updraft speed".to_owned(),
+        "mlcape" => "Mixed-layer CAPE".to_owned(),
+        "mucape" => "Most-unstable CAPE".to_owned(),
+        "sbcape" => "Surface-based CAPE".to_owned(),
+        _ => title_slug(field),
+    }
+}
+
+fn detail_label(detail: &str) -> String {
+    match detail {
+        "ens_mean" => "ensemble mean".to_owned(),
+        "ens_max" => "ensemble max".to_owned(),
+        "ens_min" => "ensemble min".to_owned(),
+        "ens_sd" | "ens_std" => "ensemble spread".to_owned(),
+        _ if detail.starts_with("paintballs_thresh_") => format!(
+            "paintballs >={}",
+            detail.trim_start_matches("paintballs_thresh_")
+        ),
+        _ if detail.starts_with("prob_thresh_") => {
+            format!(
+                "probability >={}",
+                detail.trim_start_matches("prob_thresh_")
+            )
+        }
+        _ => title_slug(detail).to_ascii_lowercase(),
+    }
+}
+
+fn title_slug(slug: &str) -> String {
+    let words = slug
+        .split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| match word {
+            "dz" => "reflectivity".to_owned(),
+            "uh" => "updraft helicity".to_owned(),
+            "to" => "to".to_owned(),
+            _ if word.contains("to") => word.replace("to", "-"),
+            _ => word.to_owned(),
+        })
+        .collect::<Vec<_>>();
+    let mut text = words.join(" ");
+    if let Some(first) = text.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    text
+}
+
 /// One sounding station from the lattice JSON: `{station:"RR_CC", x, y}`
 /// where x/y are fractions of the product-PNG axes box ([`AXES_BOX`]),
 /// y from the bottom (row 01 = south).
@@ -1010,6 +1098,22 @@ mod tests {
         assert_eq!(
             sounding_url(&run, "1700", 36, "10_10"),
             "https://ep-wofs-sounding-etb5awe5cdfqawe8.a01.azurefd.net/api/sounding/WOFSRun20260611-144912d1/202606111700/36/wofs_snd_10_10.png"
+        );
+    }
+
+    #[test]
+    fn product_label_turns_common_slugs_readable() {
+        assert_eq!(
+            product_label("t_2__ens_mean"),
+            "2 m temperature (ensemble mean)"
+        );
+        assert_eq!(
+            product_label("comp_dz__paintballs_thresh_40"),
+            "Composite reflectivity (paintballs >=40 dBZ)"
+        );
+        assert_eq!(
+            product_label("uh_2to5__prob_thresh_75"),
+            "2-5 km updraft helicity (probability >=75)"
         );
     }
 

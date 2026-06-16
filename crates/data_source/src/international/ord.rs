@@ -52,7 +52,7 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
 
 use super::listing::fnv1a64;
 use super::{
@@ -61,6 +61,7 @@ use super::{
 };
 
 const BUCKET_BASE: &str = "https://s3.waw3-1.cloudferro.com/openradar-24h";
+const ARCHIVE_BUCKET_BASE: &str = "https://s3.waw3-1.cloudferro.com/openradar-archive";
 
 /// One scan cycle: a file belongs to the frame anchored at the newest
 /// stamp when its own stamp is inside this trailing window (same role as
@@ -71,6 +72,10 @@ const CYCLE_WINDOW_MINUTES: i64 = 5;
 /// declaring a site silent (covers publication lag and short outages
 /// without ever listing the whole 24-hour cache).
 const HOUR_LOOKBACK_SLOTS: i64 = 6;
+/// The live ORD cache is a rolling 24-hour bucket. Load Loop walks that
+/// whole window, newest hour back, then returns the newest requested frames
+/// oldest-first for playback.
+const RECENT_HOUR_LOOKBACK_SLOTS: i64 = 23;
 
 /// ORD countries this provider enables: lowercase ODIM site-code prefix,
 /// bucket directory, and country label. Countries with native BowEcho
@@ -220,6 +225,94 @@ impl Default for OrdProvider {
     }
 }
 
+/// One historical ORD scan resolved from the immutable archive bucket.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrdArchivePlan {
+    /// Scan anchor time in UTC.
+    pub stamp_utc: DateTime<Utc>,
+    /// ORD object directory used for the plan (`PVOL` or `SCAN`).
+    pub object_kind: &'static str,
+    /// The download/merge plan. URLs point at `openradar-archive`.
+    pub frame: FramePlan,
+}
+
+/// Build download plans for every complete scan anchored inside one UTC hour.
+///
+/// The public CloudFerro archive uses the same key grammar as the live
+/// 24-hour cache, so this reuses the live ORD split-file planner but swaps
+/// the bucket base. Plans are returned oldest-first for loop installation.
+pub fn archive_plans_for_hour(
+    site_id: &str,
+    hour_utc: DateTime<Utc>,
+) -> Result<Vec<OrdArchivePlan>, String> {
+    validate_site_code(site_id)?;
+    let (_, dir, _) = country_for_code(site_id)
+        .ok_or_else(|| format!("ORD: site '{site_id}' is not in an enabled country"))?;
+    let hour_utc = truncate_to_utc_hour(hour_utc);
+    let pvol_hint = ORD_SITES
+        .iter()
+        .find(|(code, ..)| *code == site_id)
+        .is_none_or(|&(.., pvol)| pvol);
+    let kinds = if pvol_hint {
+        [ObjectKind::Pvol, ObjectKind::Scan]
+    } else {
+        [ObjectKind::Scan, ObjectKind::Pvol]
+    };
+
+    let mut empty_kinds = Vec::new();
+    for kind in kinds {
+        let mut keys = list_hour_keys_from_base(ARCHIVE_BUCKET_BASE, dir, site_id, kind, hour_utc)
+            .map_err(|err| format!("ORD archive '{site_id}': {err}"))?;
+        let previous = list_hour_keys_from_base(
+            ARCHIVE_BUCKET_BASE,
+            dir,
+            site_id,
+            kind,
+            hour_utc - chrono::Duration::hours(1),
+        )
+        .map_err(|err| format!("ORD archive '{site_id}': {err}"))?;
+        keys.extend(previous);
+        let plans = archive_plans_from_keys(site_id, kind, &keys, hour_utc)?;
+        if !plans.is_empty() {
+            return Ok(plans);
+        }
+        empty_kinds.push(kind.dir());
+    }
+
+    Err(format!(
+        "ORD archive: no complete {} scan for {site_id} during {}Z",
+        empty_kinds.join("/"),
+        hour_utc.format("%Y-%m-%d %H")
+    ))
+}
+
+/// Build the archive plan nearest a requested UTC time.
+pub fn archive_plan_nearest(
+    site_id: &str,
+    target_utc: DateTime<Utc>,
+) -> Result<OrdArchivePlan, String> {
+    let hour = truncate_to_utc_hour(target_utc);
+    let mut plans = Vec::new();
+    let mut last_error = None;
+    for offset_hours in [-1, 0, 1] {
+        match archive_plans_for_hour(site_id, hour + chrono::Duration::hours(offset_hours)) {
+            Ok(mut hour_plans) => plans.append(&mut hour_plans),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    plans
+        .into_iter()
+        .min_by_key(|plan| (plan.stamp_utc - target_utc).num_seconds().unsigned_abs())
+        .ok_or_else(|| {
+            last_error.unwrap_or_else(|| {
+                format!(
+                    "ORD archive: no complete scan near {} for {site_id}",
+                    target_utc.format("%Y-%m-%d %H:%MZ")
+                )
+            })
+        })
+}
+
 impl IntlProvider for OrdProvider {
     fn id(&self) -> &'static str {
         "ord"
@@ -324,6 +417,72 @@ impl IntlProvider for OrdProvider {
         ))
     }
 
+    fn recent(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        validate_site_code(site_id)?;
+        let (_, dir, _) = country_for_code(site_id)
+            .ok_or_else(|| format!("ORD: site '{site_id}' is not in an enabled country"))?;
+
+        let pvol_hint = ORD_SITES
+            .iter()
+            .find(|(code, ..)| *code == site_id)
+            .is_none_or(|&(.., pvol)| pvol);
+        let kinds = if pvol_hint {
+            [ObjectKind::Pvol, ObjectKind::Scan]
+        } else {
+            [ObjectKind::Scan, ObjectKind::Pvol]
+        };
+
+        let now = truncate_to_utc_hour(Utc::now());
+        let mut first_error = None;
+        for kind in kinds {
+            let mut plans = Vec::new();
+            for slot in 0..=RECENT_HOUR_LOOKBACK_SLOTS {
+                let hour = now - chrono::Duration::hours(slot);
+                let mut keys = match list_hour_keys(dir, site_id, kind, hour) {
+                    Ok(keys) => keys,
+                    Err(err) => {
+                        first_error.get_or_insert(err);
+                        continue;
+                    }
+                };
+                if keys.is_empty() {
+                    continue;
+                }
+                match list_hour_keys(dir, site_id, kind, hour - chrono::Duration::hours(1)) {
+                    Ok(previous) => keys.extend(previous),
+                    Err(err) => {
+                        first_error.get_or_insert(err);
+                    }
+                }
+                let mut hour_plans =
+                    plans_from_keys_for_hour(BUCKET_BASE, site_id, kind, &keys, hour)?;
+                plans.append(&mut hour_plans);
+                if plans.len() >= count {
+                    break;
+                }
+            }
+            if !plans.is_empty() {
+                plans.sort_by_key(|plan| plan.stamp_utc);
+                plans.dedup_by(|left, right| left.frame.identity == right.frame.identity);
+                let skip = plans.len().saturating_sub(count);
+                return Ok(plans
+                    .into_iter()
+                    .skip(skip)
+                    .map(|plan| plan.frame)
+                    .collect());
+            }
+        }
+
+        Err(first_error
+            .map(|err| format!("ORD '{site_id}': {err}"))
+            .unwrap_or_else(|| {
+                format!("ORD: no recent files for site '{site_id}' in the 24-hour cache")
+            }))
+    }
+
     fn static_sites(&self) -> Vec<IntlSite> {
         ORD_SITES
             .iter()
@@ -354,6 +513,13 @@ fn candidate_utc_dates() -> [chrono::NaiveDate; 2] {
 fn date_prefix(date: chrono::NaiveDate) -> String {
     use chrono::Datelike;
     format!("{:04}/{:02}/{:02}/", date.year(), date.month(), date.day())
+}
+
+fn truncate_to_utc_hour(time: DateTime<Utc>) -> DateTime<Utc> {
+    time.with_minute(0)
+        .and_then(|time| time.with_second(0))
+        .and_then(|time| time.with_nanosecond(0))
+        .unwrap_or(time)
 }
 
 /// Site codes are key-path segments (e.g. `nlhrw`); their first two
@@ -417,13 +583,23 @@ fn list_hour_keys(
     kind: ObjectKind,
     hour: DateTime<Utc>,
 ) -> Result<Vec<String>, String> {
+    list_hour_keys_from_base(BUCKET_BASE, dir, site_id, kind, hour)
+}
+
+fn list_hour_keys_from_base(
+    bucket_base: &str,
+    dir: &str,
+    site_id: &str,
+    kind: ObjectKind,
+    hour: DateTime<Utc>,
+) -> Result<Vec<String>, String> {
     let prefix = format!(
         "{}{dir}/{site_id}/{}/{site_id}@{}",
         date_prefix(hour.date_naive()),
         kind.dir(),
         hour.format("%Y%m%dT%H"),
     );
-    let url = s3_style_listing_url(BUCKET_BASE, &prefix, None, None, 1000);
+    let url = s3_style_listing_url(bucket_base, &prefix, None, None, 1000);
     let listing = fetch_s3_style_listing(&url)?;
     if listing.is_truncated {
         // S3 lists ascending, so truncation would hide the NEWEST keys —
@@ -538,13 +714,92 @@ impl OrdFile {
 /// a pure function of the listing per the [`FramePlan`] stability
 /// contract.
 fn plan_from_keys(site_id: &str, kind: ObjectKind, keys: &[String]) -> Result<FramePlan, String> {
+    plan_from_keys_with_base(BUCKET_BASE, site_id, kind, keys)
+}
+
+fn plan_from_keys_with_base(
+    bucket_base: &str,
+    site_id: &str,
+    kind: ObjectKind,
+    keys: &[String],
+) -> Result<FramePlan, String> {
     let files: Vec<OrdFile> = keys
         .iter()
         .filter_map(|key| OrdFile::parse(key, site_id))
         .collect();
     let anchor = select_frame_anchor(&files, kind)
         .ok_or_else(|| format!("ORD '{site_id}': no parseable volume keys in the listing"))?;
-    let mut chosen = choose_files_for_anchor(&files, kind, anchor);
+    plan_from_files_for_anchor(bucket_base, site_id, kind, &files, anchor)
+}
+
+fn archive_plans_from_keys(
+    site_id: &str,
+    kind: ObjectKind,
+    keys: &[String],
+    hour_utc: DateTime<Utc>,
+) -> Result<Vec<OrdArchivePlan>, String> {
+    plans_from_keys_for_hour(ARCHIVE_BUCKET_BASE, site_id, kind, keys, hour_utc)
+}
+
+fn plans_from_keys_for_hour(
+    bucket_base: &str,
+    site_id: &str,
+    kind: ObjectKind,
+    keys: &[String],
+    hour_utc: DateTime<Utc>,
+) -> Result<Vec<OrdArchivePlan>, String> {
+    let files: Vec<OrdFile> = keys
+        .iter()
+        .filter_map(|key| OrdFile::parse(key, site_id))
+        .collect();
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let hour_start = hour_utc.naive_utc();
+    let hour_end = hour_start + chrono::Duration::hours(1);
+
+    let all_files = files.clone();
+    let mut remaining = files;
+    let mut plans = Vec::new();
+    while let Some(anchor) = select_frame_anchor(&remaining, kind) {
+        let window_start = anchor - chrono::Duration::minutes(CYCLE_WINDOW_MINUTES);
+        let chosen = choose_files_for_anchor(&remaining, kind, anchor);
+        if anchor >= hour_start
+            && anchor < hour_end
+            && archive_chosen_files_are_complete(&all_files, &chosen)
+        {
+            let frame = plan_from_files_for_anchor(bucket_base, site_id, kind, &remaining, anchor)?;
+            if !plans
+                .iter()
+                .any(|plan: &OrdArchivePlan| plan.frame.identity == frame.identity)
+            {
+                plans.push(OrdArchivePlan {
+                    stamp_utc: DateTime::from_naive_utc_and_offset(anchor, Utc),
+                    object_kind: kind.dir(),
+                    frame,
+                });
+            }
+        }
+        remaining.retain(|file| file.stamp <= window_start || file.stamp > anchor);
+    }
+    plans.sort_by_key(|plan| plan.stamp_utc);
+    Ok(plans)
+}
+
+fn plan_from_files_for_anchor(
+    bucket_base: &str,
+    site_id: &str,
+    kind: ObjectKind,
+    files: &[OrdFile],
+    anchor: NaiveDateTime,
+) -> Result<FramePlan, String> {
+    let mut chosen = choose_files_for_anchor(files, kind, anchor);
+    if chosen.is_empty() {
+        return Err(format!(
+            "ORD '{site_id}': no files matched scan window anchored at {}",
+            anchor.format("%Y%m%dT%H%M")
+        ));
+    }
 
     // Redundant unfiltered reflectivity: parts carrying ONLY TH/TV and
     // fully shadowed by a DBZH part over the same elevations add bytes
@@ -577,7 +832,7 @@ fn plan_from_keys(site_id: &str, kind: ObjectKind, keys: &[String]) -> Result<Fr
     let parts: Vec<PlanPart> = chosen
         .iter()
         .map(|file| PlanPart {
-            url: format!("{BUCKET_BASE}/{}", file.key),
+            url: format!("{bucket_base}/{}", file.key),
         })
         .collect();
     Ok(FramePlan {
@@ -590,6 +845,24 @@ fn plan_from_keys(site_id: &str, kind: ObjectKind, keys: &[String]) -> Result<Fr
         merge: parts.len() > 1,
         parts,
     })
+}
+
+fn archive_chosen_files_are_complete(all_files: &[OrdFile], chosen: &[OrdFile]) -> bool {
+    if chosen.is_empty() {
+        return false;
+    }
+    let archive_has_reflectivity = all_files.iter().any(OrdFile::has_reflectivity);
+    let archive_has_velocity = all_files.iter().any(OrdFile::has_velocity);
+    if archive_has_reflectivity && archive_has_velocity {
+        return chosen_has_reflectivity_and_velocity(chosen);
+    }
+    if archive_has_reflectivity {
+        return chosen.iter().any(OrdFile::has_reflectivity);
+    }
+    if archive_has_velocity {
+        return chosen.iter().any(OrdFile::has_velocity);
+    }
+    true
 }
 
 fn select_frame_anchor(files: &[OrdFile], kind: ObjectKind) -> Option<NaiveDateTime> {
@@ -891,6 +1164,95 @@ mod tests {
     }
 
     #[test]
+    fn archive_plan_uses_archive_bucket_and_drops_incomplete_tail() {
+        let elevs = "0.5_1.5_2.5_3.5_5.4_9.1_15.0_23.8";
+        let keys = vec![
+            format!("2026/05/30/PL/plbrz/PVOL/plbrz@20260530T1716@{elevs}@DBZH.h5"),
+            format!("2026/05/30/PL/plbrz/PVOL/plbrz@20260530T1716@{elevs}@TH.h5"),
+            format!("2026/05/30/PL/plbrz/PVOL/plbrz@20260530T1716@{elevs}@VRADH.h5"),
+            format!("2026/05/30/PL/plbrz/PVOL/plbrz@20260530T1721@{elevs}@VRADH.h5"),
+        ];
+        let plans = archive_plans_from_keys(
+            "plbrz",
+            ObjectKind::Pvol,
+            &keys,
+            utc_time(2026, 5, 30, 17, 0),
+        )
+        .expect("plans");
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].stamp_utc, utc_time(2026, 5, 30, 17, 16));
+        assert_eq!(plans[0].object_kind, "PVOL");
+        let parts: Vec<&str> = plans[0]
+            .frame
+            .parts
+            .iter()
+            .map(|part| part.url.as_str())
+            .collect();
+        assert_eq!(parts.len(), 2, "parts: {parts:?}");
+        assert!(
+            parts
+                .iter()
+                .all(|part| part.starts_with(ARCHIVE_BUCKET_BASE))
+        );
+        assert!(parts[0].ends_with("@DBZH.h5"));
+        assert!(parts[1].ends_with("@VRADH.h5"));
+        assert!(parts.iter().all(|part| !part.contains("T1721@")));
+    }
+
+    #[test]
+    fn archive_hour_plans_are_oldest_first() {
+        let elevs = "0.5_1.5_2.5_3.5_5.4_9.1_15.0_23.8";
+        let keys = vec![
+            format!("2026/05/30/PL/plbrz/PVOL/plbrz@20260530T1706@{elevs}@DBZH.h5"),
+            format!("2026/05/30/PL/plbrz/PVOL/plbrz@20260530T1706@{elevs}@VRADH.h5"),
+            format!("2026/05/30/PL/plbrz/PVOL/plbrz@20260530T1716@{elevs}@DBZH.h5"),
+            format!("2026/05/30/PL/plbrz/PVOL/plbrz@20260530T1716@{elevs}@VRADH.h5"),
+        ];
+        let plans = archive_plans_from_keys(
+            "plbrz",
+            ObjectKind::Pvol,
+            &keys,
+            utc_time(2026, 5, 30, 17, 0),
+        )
+        .expect("plans");
+
+        let stamps: Vec<_> = plans.iter().map(|plan| plan.stamp_utc).collect();
+        assert_eq!(
+            stamps,
+            [utc_time(2026, 5, 30, 17, 6), utc_time(2026, 5, 30, 17, 16)]
+        );
+    }
+
+    #[test]
+    fn archive_hour_collapses_staggered_split_products_into_scan_cycles() {
+        let elevs = "0.5_1.5_2.5_3.5_5.4_9.1_15.0_23.8";
+        let keys = vec![
+            format!("2026/05/30/PL/plbrz/PVOL/plbrz@20260530T1706@{elevs}@DBZH.h5"),
+            format!("2026/05/30/PL/plbrz/PVOL/plbrz@20260530T1707@{elevs}@TH.h5"),
+            format!("2026/05/30/PL/plbrz/PVOL/plbrz@20260530T1708@{elevs}@VRADH.h5"),
+            format!("2026/05/30/PL/plbrz/PVOL/plbrz@20260530T1716@{elevs}@DBZH.h5"),
+            format!("2026/05/30/PL/plbrz/PVOL/plbrz@20260530T1717@{elevs}@TH.h5"),
+            format!("2026/05/30/PL/plbrz/PVOL/plbrz@20260530T1718@{elevs}@VRADH.h5"),
+        ];
+        let plans = archive_plans_from_keys(
+            "plbrz",
+            ObjectKind::Pvol,
+            &keys,
+            utc_time(2026, 5, 30, 17, 0),
+        )
+        .expect("plans");
+
+        let stamps: Vec<_> = plans.iter().map(|plan| plan.stamp_utc).collect();
+        assert_eq!(
+            stamps,
+            [utc_time(2026, 5, 30, 17, 8), utc_time(2026, 5, 30, 17, 18)]
+        );
+        assert_eq!(plans[0].frame.parts.len(), 2);
+        assert_eq!(plans[1].frame.parts.len(), 2);
+    }
+
+    #[test]
     fn newer_scan_tail_with_mismatched_product_heights_does_not_win() {
         let keys = vec![
             "2026/06/13/EE/eesur/SCAN/eesur@20260613T1651@0.5@DBZH.h5".to_owned(),
@@ -934,6 +1296,11 @@ mod tests {
         assert!(validate_site_code("NLHRW").is_err());
         assert!(validate_site_code("nl/hrw").is_err());
         assert!(validate_site_code("nl@hrw").is_err());
+    }
+
+    fn utc_time(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
+        let date = chrono::NaiveDate::from_ymd_opt(year, month, day).expect("date");
+        DateTime::from_naive_utc_and_offset(date.and_hms_opt(hour, minute, 0).expect("time"), Utc)
     }
 
     #[test]
