@@ -358,8 +358,8 @@ const TILT_LIST_SCROLL_HEIGHT: f32 = 168.0;
 const HAZARD_FOCUS_TARGET_PX: f32 = 360.0;
 const HAZARD_FOCUS_MIN_SCALE: f32 = 130.0;
 const HAZARD_FOCUS_MAX_SCALE: f32 = 950.0;
-const SITE_LABEL_MIN_SCALE: f32 = 95.0;
-const TERMINAL_SITE_LABEL_MIN_SCALE: f32 = 58.0;
+const SITE_LABEL_MIN_SCALE: f32 = 58.0;
+const TERMINAL_SITE_LABEL_MIN_SCALE: f32 = 95.0;
 // The density contract lives in ui_theme.rs (spec §4); the old names stay
 // as crate-wide aliases so 100+ call sites keep reading naturally.
 pub(crate) use ui_theme::ROW_H as PANEL_BUTTON_HEIGHT;
@@ -10396,7 +10396,7 @@ impl ViewerApp {
         self.spc_reports_enabled = false;
         self.mping_enabled = false;
         if plan.include_warnings {
-            self.hazards_active_only = true;
+            self.hazards_active_only = false;
             self.live_hazard_auto_refresh = false;
             self.load_event_loop_hazards(plan.start_utc, plan.end_utc, ctx);
         } else {
@@ -14001,35 +14001,6 @@ impl ViewerApp {
                 self.storm_cells_volume_ptr = 0;
                 ctx.request_repaint();
             }
-            ui.menu_button("Settings", |ui| {
-                let mut max_tracks = self.storm_track_max_tracks;
-                egui::ComboBox::from_id_salt("storm_track_max_tracks")
-                    .selected_text(format!("{max_tracks} tracks"))
-                    .width(96.0)
-                    .show_ui(ui, |ui| {
-                        for option in STORM_TRACK_MAX_TRACK_OPTIONS {
-                            ui.selectable_value(
-                                &mut max_tracks,
-                                *option,
-                                format!("{option} tracks"),
-                            );
-                        }
-                    });
-                let mut min_dbz = self.storm_track_min_dbz;
-                let min_changed = ui
-                    .add(
-                        egui::Slider::new(
-                            &mut min_dbz,
-                            MIN_STORM_TRACK_MIN_DBZ..=MAX_STORM_TRACK_MIN_DBZ,
-                        )
-                        .step_by(1.0)
-                        .text("Min dBZ"),
-                    )
-                    .changed();
-                if max_tracks != self.storm_track_max_tracks || min_changed {
-                    self.set_storm_track_filters(max_tracks, min_dbz, ctx);
-                }
-            });
             if let Some((direction, speed_kt)) = self.storm_motion_from_tracks()
                 && ui
                     .small_button("SRV←tracks")
@@ -14080,6 +14051,41 @@ impl ViewerApp {
                 }
             }
         });
+        egui::CollapsingHeader::new("Storm track settings")
+            .id_salt("storm_track_settings")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Max");
+                    let mut max_tracks = self.storm_track_max_tracks;
+                    egui::ComboBox::from_id_salt("storm_track_max_tracks")
+                        .selected_text(format!("{max_tracks} tracks"))
+                        .width(96.0)
+                        .show_ui(ui, |ui| {
+                            for option in STORM_TRACK_MAX_TRACK_OPTIONS {
+                                ui.selectable_value(
+                                    &mut max_tracks,
+                                    *option,
+                                    format!("{option} tracks"),
+                                );
+                            }
+                        });
+                    let mut min_dbz = self.storm_track_min_dbz;
+                    let min_changed = ui
+                        .add(
+                            egui::Slider::new(
+                                &mut min_dbz,
+                                MIN_STORM_TRACK_MIN_DBZ..=MAX_STORM_TRACK_MIN_DBZ,
+                            )
+                            .step_by(1.0)
+                            .text("Min dBZ"),
+                        )
+                        .changed();
+                    if max_tracks != self.storm_track_max_tracks || min_changed {
+                        self.set_storm_track_filters(max_tracks, min_dbz, ctx);
+                    }
+                });
+            });
 
         // R7: TOOLS.
         Self::section_header(ui, "TOOLS");
@@ -15335,17 +15341,27 @@ impl ViewerApp {
                 }
             });
             ui.horizontal_wrapped(|ui| {
-                for (slug, label) in spc_layers::OUTLOOK_KINDS {
-                    let mut on = app.spc_outlooks_enabled.iter().any(|k| k == slug);
+                for (slug, label) in spc_layers::outlook_kind_options(app.spc_day) {
+                    let mut on = if app.spc_day == 3 && *slug == "prob" {
+                        app.spc_outlooks_enabled
+                            .iter()
+                            .any(|k| matches!(k.as_str(), "prob" | "torn" | "wind" | "hail"))
+                    } else {
+                        app.spc_outlooks_enabled.iter().any(|k| k == slug)
+                    };
                     if ui
-                        .checkbox(&mut on, label)
+                        .checkbox(&mut on, *label)
                         .on_hover_text("Outlook kind — drawn in SPC's own colors")
                         .changed()
                     {
-                        if on {
-                            app.spc_outlooks_enabled.push(slug.to_owned());
+                        if app.spc_day == 3 && *slug == "prob" {
+                            app.spc_outlooks_enabled
+                                .retain(|k| !matches!(k.as_str(), "prob" | "torn" | "wind" | "hail"));
                         } else {
                             app.spc_outlooks_enabled.retain(|k| k != slug);
+                        }
+                        if on {
+                            app.spc_outlooks_enabled.push((*slug).to_owned());
                         }
                         changed = true;
                     }
@@ -15772,7 +15788,7 @@ impl ViewerApp {
                 .as_ref()
                 .map(|volume| volume.volume_time.with_timezone(&Utc))
             else {
-                return false;
+                return event_loop_hazard_record_intersects_window(record, start_utc, end_utc);
             };
             if frame_time < start_utc || frame_time >= end_utc {
                 return false;
@@ -26302,11 +26318,15 @@ impl ViewerApp {
     }
 
     fn site_marker_should_label(&self, site: &RadarSite, selected: bool) -> bool {
-        self.app_settings.show_radar_labels
-            && (selected
-                || self.map_scale >= SITE_LABEL_MIN_SCALE
-                || (site_is_terminal_radar(site)
-                    && self.map_scale >= TERMINAL_SITE_LABEL_MIN_SCALE))
+        if !self.app_settings.show_radar_labels {
+            return false;
+        }
+        selected
+            || if site_is_terminal_radar(site) {
+                self.map_scale >= TERMINAL_SITE_LABEL_MIN_SCALE
+            } else {
+                self.map_scale >= SITE_LABEL_MIN_SCALE
+            }
     }
 
     fn selected_radar_label_fill(&self) -> egui::Color32 {
@@ -38863,6 +38883,28 @@ mod tests {
     }
 
     #[test]
+    fn operational_radar_labels_appear_before_terminal_labels() {
+        let terminal = RadarSite::new("TATL").with_location(
+            Some("Atlanta Terminal".to_owned()),
+            Some(33.63),
+            Some(-84.44),
+        );
+        let nexrad = RadarSite::new("KTLX").with_location(
+            Some("Oklahoma City".to_owned()),
+            Some(35.333),
+            Some(-97.278),
+        );
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+
+        app.map_scale = SITE_LABEL_MIN_SCALE;
+        assert!(app.site_marker_should_label(&nexrad, false));
+        assert!(!app.site_marker_should_label(&terminal, false));
+
+        app.map_scale = TERMINAL_SITE_LABEL_MIN_SCALE;
+        assert!(app.site_marker_should_label(&terminal, false));
+    }
+
+    #[test]
     fn radar_label_toggle_hides_site_and_tdwr_labels() {
         let terminal = RadarSite::new("TATL").with_location(
             Some("Atlanta Terminal".to_owned()),
@@ -38875,7 +38917,7 @@ mod tests {
             Some(-97.278),
         );
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.map_scale = SITE_LABEL_MIN_SCALE + 10.0;
+        app.map_scale = TERMINAL_SITE_LABEL_MIN_SCALE + 10.0;
 
         assert!(app.site_marker_should_label(&terminal, false));
         assert!(app.site_marker_should_label(&nexrad, true));
@@ -40117,7 +40159,7 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 6, 14, 13, 0, 0).unwrap(),
             Utc.with_ymd_and_hms(2026, 6, 14, 16, 0, 0).unwrap(),
         ));
-        assert!(app.visible_hazard_list_rows().is_empty());
+        assert_eq!(app.visible_hazard_list_rows().len(), 1);
 
         app.volume = Some(Arc::new(RadarVolume::new(
             radar_core::RadarSite::new("KTLX"),
@@ -40136,6 +40178,37 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 6, 14, 15, 0, 0).unwrap(),
         )));
         assert!(app.visible_hazard_list_rows().is_empty());
+    }
+
+    #[test]
+    fn event_loop_hazards_show_window_records_before_first_frame() {
+        let mut warning = test_hazard_record(
+            "event-loop-warning",
+            "TOR 45",
+            "tornado",
+            square_hazard_points(-101.0, 34.0, -100.0, 35.0),
+        );
+        warning.valid_start = Some("2026-06-14T14:00:00Z".to_owned());
+        warning.valid_end = Some("2026-06-14T15:00:00Z".to_owned());
+        let mut outside = test_hazard_record(
+            "outside-window",
+            "SVR 46",
+            "severe thunderstorm",
+            square_hazard_points(-99.0, 34.0, -98.0, 35.0),
+        );
+        outside.valid_start = Some("2026-06-14T18:00:00Z".to_owned());
+        outside.valid_end = Some("2026-06-14T19:00:00Z".to_owned());
+        let mut app = test_viewer_app_with_hazards(vec![warning, outside]);
+        app.hazards_active_only = true;
+        app.event_loop_hazard_window = Some((
+            Utc.with_ymd_and_hms(2026, 6, 14, 13, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 6, 14, 16, 0, 0).unwrap(),
+        ));
+
+        let rows = app.visible_hazard_list_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].label.starts_with("TOR 45"));
     }
 
     #[test]
@@ -40158,7 +40231,7 @@ mod tests {
         ));
         let rect = test_map_rect();
         assert!(
-            app.cached_hazard_overlay_shapes(rect)
+            !app.cached_hazard_overlay_shapes(rect)
                 .outline_shapes
                 .is_empty()
         );

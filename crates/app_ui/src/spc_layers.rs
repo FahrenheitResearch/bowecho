@@ -37,8 +37,56 @@ pub const OUTLOOK_KINDS: [(&str, &str); 4] = [
     ("wind", "Wind %"),
     ("hail", "Hail %"),
 ];
+pub const DAY2_OUTLOOK_KINDS: [(&str, &str); 5] = [
+    ("cat", "Categorical"),
+    ("torn", "Tornado %"),
+    ("wind", "Wind %"),
+    ("hail", "Hail %"),
+    ("prob", "Any Severe %"),
+];
+pub const DAY3_OUTLOOK_KINDS: [(&str, &str); 2] =
+    [("cat", "Categorical"), ("prob", "Any Severe %")];
 
 pub const ESTOFEX_OUTLOOK_KIND: &str = "estofex";
+
+pub fn outlook_kind_options(day: u8) -> &'static [(&'static str, &'static str)] {
+    match day {
+        2 => &DAY2_OUTLOOK_KINDS,
+        3 => &DAY3_OUTLOOK_KINDS,
+        _ => &OUTLOOK_KINDS,
+    }
+}
+
+pub fn effective_spc_outlook_kinds(day: u8, requested: &[&str]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for &kind in requested {
+        let Some(kind) = effective_spc_outlook_kind(day, kind) else {
+            continue;
+        };
+        if !out.contains(&kind) {
+            out.push(kind);
+        }
+    }
+    out
+}
+
+fn effective_spc_outlook_kind(day: u8, kind: &str) -> Option<&'static str> {
+    match (day, kind) {
+        (_, ESTOFEX_OUTLOOK_KIND) => None,
+        (1, "cat") => Some("cat"),
+        (1, "torn") => Some("torn"),
+        (1, "wind") => Some("wind"),
+        (1, "hail") => Some("hail"),
+        (2, "cat") => Some("cat"),
+        (2, "torn") => Some("torn"),
+        (2, "wind") => Some("wind"),
+        (2, "hail") => Some("hail"),
+        (2, "prob") => Some("prob"),
+        (3, "cat") => Some("cat"),
+        (3, "prob" | "torn" | "wind" | "hail") => Some("prob"),
+        _ => None,
+    }
+}
 
 pub struct OutlookFeature {
     pub label: String,
@@ -352,6 +400,7 @@ fn pts_section_name(kind: &str) -> Option<&'static str> {
         "torn" => Some("TORNADO"),
         "wind" => Some("WIND"),
         "hail" => Some("HAIL"),
+        "prob" => Some("ANY SEVERE"),
         _ => None,
     }
 }
@@ -401,6 +450,7 @@ fn pts_label2(kind: &str, label: &str) -> String {
         "torn" => "Tornado",
         "wind" => "Wind",
         "hail" => "Hail",
+        "prob" => "Any Severe",
         _ => "Severe",
     };
     let percent = label
@@ -1035,11 +1085,7 @@ pub fn fetch_spc(
         ..Default::default()
     };
     let now = Utc::now();
-    let spc_kinds: Vec<&str> = outlook_kinds
-        .iter()
-        .copied()
-        .filter(|kind| *kind != ESTOFEX_OUTLOOK_KIND)
-        .collect();
+    let spc_kinds = effective_spc_outlook_kinds(day, outlook_kinds);
     let wants_estofex = outlook_kinds.contains(&ESTOFEX_OUTLOOK_KIND);
     let live_pts = if archive_date.is_none() && !spc_kinds.is_empty() {
         live_pts_url(day).and_then(|url| data_source::fetch_text(url).ok())
@@ -1239,6 +1285,44 @@ PROBABILISTIC OUTLOOK POINTS DAY 3\n\
         assert_eq!(parsed[0].label, "0.05");
         assert_eq!(parsed[0].label2, "5% Wind Risk");
         assert_eq!(parsed[1].label, "0.15");
+    }
+
+    #[test]
+    fn parses_day3_any_severe_pts_probability_section() {
+        let sample = "WUUS03 KWNS 161934\n\
+PTSDY3\n\
+\n\
+VALID TIME 181200Z - 191200Z\n\
+\n\
+PROBABILISTIC OUTLOOK POINTS DAY 3\n\
+\n\
+... ANY SEVERE ...\n\
+\n\
+0.05   28159459 31809331 33219378 28159459\n\
+0.15   38127401 37457784 36518360 38127401\n\
+&&\n";
+
+        let parsed = parse_pts_outlook(sample, "prob");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].label, "0.05");
+        assert_eq!(parsed[0].label2, "5% Any Severe Risk");
+        assert_eq!(parsed[1].label, "0.15");
+    }
+
+    #[test]
+    fn day3_hazard_probability_requests_collapse_to_any_severe() {
+        assert_eq!(
+            effective_spc_outlook_kinds(3, &["cat", "torn", "wind", "hail"]),
+            vec!["cat", "prob"]
+        );
+        assert_eq!(
+            live_outlook_urls(
+                3,
+                "prob",
+                Utc.with_ymd_and_hms(2026, 6, 16, 20, 0, 0).unwrap()
+            ),
+            vec!["https://www.spc.noaa.gov/products/outlook/day3otlk_prob.lyr.geojson"]
+        );
     }
 
     #[test]
