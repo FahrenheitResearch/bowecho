@@ -1498,7 +1498,7 @@ impl ViewerApp {
             self.start_intl_site_listing(&provider_id, ctx);
         }
         if let Some((provider_id, site_id)) = start {
-            self.start_intl_poll(provider_id, site_id);
+            self.start_intl_poll(provider_id, site_id, ctx);
         }
     }
 

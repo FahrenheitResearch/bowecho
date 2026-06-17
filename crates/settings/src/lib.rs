@@ -77,6 +77,11 @@ pub struct AppSettings {
     /// shipped look.
     #[serde(default = "default_basemap_line_thickness_percent")]
     pub basemap_line_thickness_percent: u16,
+    /// Low-end rendering mode for the basemap: skip dense county/regional
+    /// administrative detail while keeping countries, states, cities, and
+    /// radar/weather layers intact.
+    #[serde(default)]
+    pub basemap_lightweight: bool,
     /// GR2-style bold town labels (white, heavy halo) readable over echoes.
     #[serde(default = "default_bold_labels")]
     pub bold_labels: bool,
@@ -413,6 +418,7 @@ impl Default for AppSettings {
             basemap_style: default_basemap_style(),
             basemap_line_brightness_percent: default_basemap_line_brightness_percent(),
             basemap_line_thickness_percent: default_basemap_line_thickness_percent(),
+            basemap_lightweight: false,
             bold_labels: default_bold_labels(),
             show_lat_lon_grid: true,
             show_radar_labels: true,
@@ -814,6 +820,19 @@ mod tests {
         assert_eq!(back.radar_label_style, "id-box");
         assert!(!back.show_hazard_labels);
         assert!(AppSettings::from_json("{}").show_hazard_labels);
+    }
+
+    #[test]
+    fn lightweight_basemap_defaults_off_and_round_trips() {
+        assert!(!AppSettings::from_json("{}").basemap_lightweight);
+
+        let settings = AppSettings {
+            basemap_lightweight: true,
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert!(back.basemap_lightweight);
     }
 
     #[test]

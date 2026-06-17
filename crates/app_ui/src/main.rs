@@ -12517,6 +12517,19 @@ impl ViewerApp {
             ctx.request_repaint();
         }
         if ui
+            .checkbox(
+                &mut self.app_settings.basemap_lightweight,
+                "Lightweight basemap",
+            )
+            .on_hover_text(
+                "Skip dense county and regional admin detail for low-end systems; states, countries, cities, and weather layers stay visible",
+            )
+            .changed()
+        {
+            let _ = self.app_settings.save();
+            ctx.request_repaint();
+        }
+        if ui
             .checkbox(&mut self.bold_labels, "Bold town labels")
             .on_hover_text(
                 "GR2-style callout labels: bold white with a heavy outline, readable over storm cores",
@@ -13396,7 +13409,11 @@ impl ViewerApp {
                     // Latest forces a poll tick instead of yanking the view
                     // back to the last US site (field report).
                     if let Some(source) = primary_intl_source.as_ref() {
-                        self.start_intl_poll(source.provider_id.clone(), source.site_id.clone());
+                        self.start_intl_poll(
+                            source.provider_id.clone(),
+                            source.site_id.clone(),
+                            ui.ctx(),
+                        );
                         self.poll_next = None;
                         self.status = format!(
                             "Refreshing {} {}",
@@ -14792,7 +14809,7 @@ impl ViewerApp {
                 .and_then(|layer| layer.intl_feed.as_ref())
             {
                 let (provider_id, site_id) = (feed.provider_id.clone(), feed.site_id.clone());
-                self.start_intl_poll(provider_id, site_id);
+                self.start_intl_poll(provider_id, site_id, ctx);
                 self.status = format!("Live-polling {}", site.level2_id);
             } else {
                 if let Some(index) = self
@@ -18526,7 +18543,7 @@ impl ViewerApp {
                 provider_id,
                 site_id,
             } => {
-                self.start_intl_poll(provider_id.clone(), site_id.clone());
+                self.start_intl_poll(provider_id.clone(), site_id.clone(), ctx);
                 self.status = format!("Live-polling {}", candidate.label);
             }
             BeamTarget::Research { url } => {
@@ -21069,7 +21086,12 @@ impl ViewerApp {
 
     /// Start (or resume) the shared poller on an international feed. Same
     /// ownership contract as the custom-URL Start.
-    pub(crate) fn start_intl_poll(&mut self, provider_id: String, site_id: String) {
+    pub(crate) fn start_intl_poll(
+        &mut self,
+        provider_id: String,
+        site_id: String,
+        ctx: &egui::Context,
+    ) {
         // Cross-site switch: a history loop must never mix radars (field
         // report: Load Loop "switched between the 4 radars" after browsing
         // several intl sites) — any change of site, or arriving from a
@@ -21085,6 +21107,7 @@ impl ViewerApp {
         if !same_site {
             self.clear_frame_history();
             self.intl_loop_rx = None;
+            self.clear_displayed_volume_for_pending_load(ctx);
         }
         self.poll_source = PollSource::Intl {
             provider_id,
@@ -25576,6 +25599,7 @@ impl ViewerApp {
         settings_basemap_line_thickness(&self.app_settings)
             .to_bits()
             .hash(&mut hasher);
+        self.app_settings.basemap_lightweight.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -25752,6 +25776,7 @@ impl ViewerApp {
         let mut sink = Vec::new();
         let bounds = self.visible_geo_bounds(rect).expand(0.25);
         let us_detail_visible = us_detail_visible(bounds);
+        let lightweight = self.app_settings.basemap_lightweight;
         let strokes = basemap_underlay_strokes(
             self.basemap_style,
             settings_basemap_line_brightness(&self.app_settings),
@@ -25765,7 +25790,7 @@ impl ViewerApp {
             &mut sink,
         );
 
-        if us_detail_visible && self.map_scale >= 38.0 {
+        if !lightweight && us_detail_visible && self.map_scale >= 38.0 {
             self.collect_basemap_line_shapes(
                 rect,
                 bounds,
@@ -25784,7 +25809,7 @@ impl ViewerApp {
             );
         }
 
-        if self.map_scale >= 36.0 {
+        if !lightweight && self.map_scale >= 36.0 {
             for layer in REGIONAL_BASEMAP_LAYERS {
                 if bounds.intersects_bbox(layer.bounds) {
                     self.collect_basemap_line_shapes(
@@ -25820,6 +25845,7 @@ impl ViewerApp {
         let mut sink = Vec::new();
         let bounds = self.visible_geo_bounds(rect).expand(0.15);
         let us_detail_visible = us_detail_visible(bounds);
+        let lightweight = self.app_settings.basemap_lightweight;
         let strokes = basemap_overlay_strokes(
             self.basemap_style,
             settings_basemap_line_brightness(&self.app_settings),
@@ -25835,7 +25861,7 @@ impl ViewerApp {
             );
         }
 
-        if us_detail_visible && self.map_scale >= 76.0 {
+        if !lightweight && us_detail_visible && self.map_scale >= 76.0 {
             self.collect_basemap_line_shapes(
                 rect,
                 bounds,
@@ -25854,7 +25880,7 @@ impl ViewerApp {
             );
         }
 
-        if self.map_scale >= 74.0 {
+        if !lightweight && self.map_scale >= 74.0 {
             for layer in REGIONAL_BASEMAP_LAYERS {
                 if bounds.intersects_bbox(layer.bounds) {
                     self.collect_basemap_line_shapes(
@@ -26105,6 +26131,9 @@ impl ViewerApp {
         bounds: GeoBounds,
         occupied: &mut Vec<egui::Rect>,
     ) {
+        if self.app_settings.basemap_lightweight {
+            return;
+        }
         if self.map_scale < 118.0 {
             return;
         }
@@ -26824,7 +26853,7 @@ impl ViewerApp {
                     site.label,
                     intl_provider_label(site.provider_id)
                 );
-                self.start_intl_poll(site.provider_id.to_owned(), site.site_id.clone());
+                self.start_intl_poll(site.provider_id.to_owned(), site.site_id.clone(), ctx);
             }
             Some((MarkerFamily::Community, index)) => {
                 let Some(marker) = data_source::community_feeds::community_markers().get(index)
@@ -37913,6 +37942,51 @@ mod tests {
     }
 
     #[test]
+    fn starting_intl_poll_clears_previous_us_primary_display() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let previous = Arc::new(test_aliased_velocity_volume());
+        app.volume = Some(previous.clone());
+        app.frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(&previous),
+            path: PathBuf::from("poll://KTLX"),
+            volume: previous,
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "polled KTLX".to_owned(),
+        });
+        let (_sender, receiver) = mpsc::channel::<AsyncLoadResult>();
+        app.load_receiver = Some(receiver);
+        app.texture_key = Some(TextureKey {
+            volume_ptr: 1,
+            cut: 0,
+            product: app.selected_product.clone(),
+            render_dealiased_velocity: false,
+            color_table_signature: 1,
+            storm_motion_key: (0, 0),
+            hail_levels_key: (32, 64),
+            smoothing: SmoothingMode::Native,
+            dealias_cascade: false,
+            gate_filter_decidbz: i16::MIN,
+            viewport: test_viewport_key(100, 100),
+        });
+
+        let ctx = egui::Context::default();
+        app.start_intl_poll("smhi".to_owned(), "angelholm".to_owned(), &ctx);
+
+        assert!(app.volume.is_none());
+        assert!(app.frame_history.is_empty());
+        assert!(app.texture_key.is_none());
+        assert!(app.load_receiver.is_none());
+        assert!(app.poll_active);
+        assert!(matches!(
+            app.poll_source,
+            PollSource::Intl { ref provider_id, ref site_id }
+                if provider_id == "smhi" && site_id == "angelholm"
+        ));
+        assert!(app.intl_source_owns_primary_display());
+    }
+
+    #[test]
     fn poll_source_settings_round_trip() {
         let mut settings = settings::AppSettings::default();
         let intl = PollSource::Intl {
@@ -39566,6 +39640,43 @@ mod tests {
         let satellite_key = app.view_shape_key(0, rect);
 
         assert_ne!(dark_key, satellite_key);
+    }
+
+    #[test]
+    fn basemap_shape_key_includes_lightweight_detail_toggle() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        app.app_settings.basemap_lightweight = false;
+        let full_key = app.view_shape_key(0, rect);
+        app.app_settings.basemap_lightweight = true;
+        let light_key = app.view_shape_key(0, rect);
+
+        assert_ne!(full_key, light_key);
+    }
+
+    #[test]
+    fn lightweight_basemap_skips_dense_admin_but_keeps_world_context() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 800.0));
+        app.map_center_lat = 37.5;
+        app.map_center_lon = -96.0;
+        app.map_scale = 90.0;
+        app.app_settings.basemap_lightweight = false;
+        let full = app.build_basemap_overlay_shapes(rect).len();
+
+        app.app_settings.basemap_lightweight = true;
+        let light = app.build_basemap_overlay_shapes(rect).len();
+
+        assert!(full > light, "full={full} light={light}");
+        assert!(light > 0, "world/state context should still render");
+
+        app.map_center_lat = 49.0;
+        app.map_center_lon = 10.0;
+        let europe_light = app.build_basemap_overlay_shapes(rect).len();
+        assert!(
+            europe_light > 0,
+            "Europe country context should still render"
+        );
     }
 
     #[test]
