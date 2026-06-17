@@ -19,8 +19,8 @@
 //! downloading one PVOL per product at a common timestamp and merging them
 //! (`radar_core::merge_radar_volumes`), which is exactly what the
 //! [`FramePlan`] returned by [`ShmuProvider::latest`] describes: dBZ first
-//! (merge base), V second, then ZDR/RhoHV/PhiDP/KDP when present at that
-//! timestamp.
+//! (merge base), V second, then W/ZDR/RhoHV/PhiDP/KDP/dBuZ when present at
+//! that timestamp.
 //!
 //! The WMO bulletin header in the file name varies per station and product
 //! (`T_PAGZ41_C_LZIB_*` is skjav dBZ, `T_PAHZ41_*` skjav V, `T_PAGZ51_*`
@@ -37,7 +37,7 @@ const SHMU_VOLUME_ROOT: &str = "https://opendata.shmu.sk/meteorology/weather/rad
 /// Products required to build a frame, in merge order (dBZ is the base).
 const REQUIRED_PRODUCTS: [&str; 2] = ["dBZ", "V"];
 /// Products merged in when a file exists at the chosen timestamp.
-const OPTIONAL_PRODUCTS: [&str; 4] = ["ZDR", "RhoHV", "PhiDP", "KDP"];
+const OPTIONAL_PRODUCTS: [&str; 6] = ["W", "ZDR", "RhoHV", "PhiDP", "KDP", "dBuZ"];
 
 /// Station labels and coordinates, verified 2026-06-12 against the `/where`
 /// group of live SHMU ODIM volumes (lat/lon as decoded, 4 decimals).

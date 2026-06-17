@@ -135,6 +135,15 @@ pub struct AppSettings {
     /// warning families, keeping old configs sparse.
     #[serde(default)]
     pub alert_sound_families: Vec<String>,
+    /// Maximum SCIT storm cells fed into the storm-track associator each scan.
+    /// Lower values reduce linear-mode clutter without touching radar render
+    /// resolution or algorithm caches.
+    #[serde(default = "default_storm_track_max_tracks")]
+    pub storm_track_max_tracks: u16,
+    /// Minimum peak composite reflectivity for storm-track cells, in
+    /// tenths of dBZ.
+    #[serde(default = "default_storm_track_min_dbz_tenths")]
+    pub storm_track_min_dbz_tenths: u16,
     /// Product hotkeys: number-row key ("0"-"9") or letter ("A"-"Z") ->
     /// product label (e.g.
     /// "REF", "VEL", "SRV", "RHO", "ZDR", "SW", "CREF", "ET", "VIL", "VILD",
@@ -165,6 +174,10 @@ pub struct AppSettings {
     /// the GIF/MP4 recorder's frame timing, so exports match the screen.
     #[serde(default = "default_loop_speed_percent")]
     pub loop_speed_percent: u16,
+    /// Free/manual viewport recording frame rate. Loop exports still preserve
+    /// the loop-speed cadence; this controls the live viewport recorder.
+    #[serde(default = "default_record_fps")]
+    pub record_fps: u16,
     /// Extra archive scans loaded on each side of a clicked tornado
     /// track's window — context before touchdown and after lift (field
     /// request: a short track otherwise loads only a handful of frames).
@@ -268,6 +281,18 @@ fn default_model_slug() -> String {
 
 fn default_loop_speed_percent() -> u16 {
     100
+}
+
+fn default_record_fps() -> u16 {
+    30
+}
+
+fn default_storm_track_max_tracks() -> u16 {
+    16
+}
+
+fn default_storm_track_min_dbz_tenths() -> u16 {
+    350
 }
 
 fn default_cross_section_smoothing() -> String {
@@ -402,11 +427,14 @@ impl Default for AppSettings {
             alert_sound_enabled: false,
             alert_sound_path: String::new(),
             alert_sound_families: Vec::new(),
+            storm_track_max_tracks: default_storm_track_max_tracks(),
+            storm_track_min_dbz_tenths: default_storm_track_min_dbz_tenths(),
             product_hotkeys: default_product_hotkeys(),
             smooth_display: false,
             smooth_display_mode: String::new(),
             cross_section_smoothing: default_cross_section_smoothing(),
             loop_speed_percent: default_loop_speed_percent(),
+            record_fps: default_record_fps(),
             event_pad_frames: default_event_pad_frames(),
             event_track_auto_model: false,
             event_track_model_slug: default_model_slug(),
@@ -822,6 +850,37 @@ mod tests {
         assert!(!back.archive_load_loop);
         assert_eq!(back.archive_frame_count, 24);
         assert_eq!(back.live_preload_frame_count, 4);
+    }
+
+    #[test]
+    fn storm_track_filters_default_and_round_trip() {
+        let old = AppSettings::from_json("{}");
+        assert_eq!(old.storm_track_max_tracks, 16);
+        assert_eq!(old.storm_track_min_dbz_tenths, 350);
+
+        let settings = AppSettings {
+            storm_track_max_tracks: 24,
+            storm_track_min_dbz_tenths: 420,
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert_eq!(back.storm_track_max_tracks, 24);
+        assert_eq!(back.storm_track_min_dbz_tenths, 420);
+    }
+
+    #[test]
+    fn record_fps_defaults_to_30_and_round_trips() {
+        let old = AppSettings::from_json("{}");
+        assert_eq!(old.record_fps, 30);
+
+        let settings = AppSettings {
+            record_fps: 60,
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert_eq!(back.record_fps, 60);
     }
 
     #[test]

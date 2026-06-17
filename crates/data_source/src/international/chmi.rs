@@ -53,7 +53,7 @@ struct ChmiProduct {
 }
 
 /// Product directories to assemble, in merge order per task.
-const CHMI_PRODUCTS: [ChmiProduct; 5] = [
+const CHMI_PRODUCTS: [ChmiProduct; 7] = [
     ChmiProduct {
         dir: "vol_z",
         required: true,
@@ -61,6 +61,14 @@ const CHMI_PRODUCTS: [ChmiProduct; 5] = [
     ChmiProduct {
         dir: "vol_v",
         required: true,
+    },
+    ChmiProduct {
+        dir: "vol_w",
+        required: false,
+    },
+    ChmiProduct {
+        dir: "vol_u",
+        required: false,
     },
     ChmiProduct {
         dir: "vol_zdr",

@@ -3996,8 +3996,18 @@ pub fn color_family_for_moment(moment: &MomentType) -> ColorTableFamily {
         MomentType::DifferentialReflectivity => ColorTableFamily::DifferentialReflectivity,
         MomentType::DifferentialPhase => ColorTableFamily::DifferentialPhase,
         MomentType::SpecificDifferentialPhase => ColorTableFamily::SpecificDifferentialPhase,
+        MomentType::Unknown(name) if unknown_reflectivity_like(name) => {
+            ColorTableFamily::Reflectivity
+        }
         _ => ColorTableFamily::Generic,
     }
+}
+
+fn unknown_reflectivity_like(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_uppercase().as_str(),
+        "DBUZ" | "UDBZ" | "UDBZH" | "DBZ_U" | "THU" | "TVU"
+    )
 }
 
 #[cfg(test)]
@@ -4008,6 +4018,18 @@ mod tests {
     #[test]
     fn base_layer_starts_visible() {
         assert!(RenderLayer::base(MomentType::Reflectivity).visible);
+    }
+
+    #[test]
+    fn unfiltered_reflectivity_codes_use_reflectivity_coloring() {
+        assert_eq!(
+            color_family_for_moment(&MomentType::Unknown("dBuZ".to_owned())),
+            ColorTableFamily::Reflectivity
+        );
+        assert_eq!(
+            color_family_for_moment(&MomentType::Unknown("mystery".to_owned())),
+            ColorTableFamily::Generic
+        );
     }
 
     #[test]

@@ -448,7 +448,7 @@ impl crate::ViewerApp {
             {
                 self.app_settings.event_track_camera_follow = camera_follow;
                 if !camera_follow {
-                    self.event_explorer.camera_follow = None;
+                    self.clear_camera_follow_targets();
                 }
                 let _ = self.app_settings.save();
             }
@@ -749,6 +749,7 @@ impl crate::ViewerApp {
         self.map_center_lon = (hit.begin.1 + hit.end.1) / 2.0;
         self.map_scale = self.map_scale.max(220.0);
         let end_time = hit.lift_time();
+        self.clear_camera_follow_targets();
         self.event_explorer.camera_follow = self
             .app_settings
             .event_track_camera_follow

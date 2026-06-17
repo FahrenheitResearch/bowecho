@@ -2,6 +2,7 @@
 
 pub mod community_feeds;
 mod embedded_sites;
+pub mod grid_products;
 pub mod international;
 
 use std::collections::BTreeMap;

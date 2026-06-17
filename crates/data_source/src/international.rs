@@ -200,7 +200,7 @@ pub fn intl_providers() -> Vec<Box<dyn IntlProvider>> {
         Box::new(GeoSphereProvider::new()),
         Box::new(FmiProvider::new()),
         Box::new(ShmuProvider::new()),
-        Box::new(DwdProvider::new()),
+        Box::new(DwdProvider::with_dual_pol()),
         Box::new(ChmiProvider::new()),
         Box::new(JmaProvider),
         Box::new(KaiaEstoniaProvider::new()),

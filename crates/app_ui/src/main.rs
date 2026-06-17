@@ -18,14 +18,14 @@ use eframe::egui;
 use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType, RadarVolume};
 use render2d::{
     CrossSectionSmoothing, ECHO_TOP_THRESHOLD_DBZ, StormCell, StormMotion,
-    StormRelativePaletteCache, StormTracker, ViewportMomentCache, ViewportRasterOptions,
-    ViewportSampleCache, VolumeDealiasCache, apply_reflectivity_gate_filter, azimuthal_shear_grid,
-    color_family_for_moment, composite_reflectivity_grid, dealias_velocity_grid,
-    dealias_velocity_grid_cascade, detect_rotation_sites, echo_top_grid, gust_proxy_grid,
-    hail_grids, identify_storm_cells, marc_grid, mehs_grid, moment_cross_section_with_smoothing,
-    poh_grid, radial_divergence_grid, reflectivity_cross_section_with_smoothing,
-    smooth_moment_grid, storm_relative_velocity_mps, upsample_moment_grid,
-    velocity_cross_section_cached_with_smoothing, viewport_rgba_buffer_len,
+    StormRelativePaletteCache, StormTrack, StormTracker, ViewportMomentCache,
+    ViewportRasterOptions, ViewportSampleCache, VolumeDealiasCache, apply_reflectivity_gate_filter,
+    azimuthal_shear_grid, color_family_for_moment, composite_reflectivity_grid,
+    dealias_velocity_grid, dealias_velocity_grid_cascade, detect_rotation_sites, echo_top_grid,
+    gust_proxy_grid, hail_grids, identify_storm_cells, marc_grid, mehs_grid,
+    moment_cross_section_with_smoothing, poh_grid, radial_divergence_grid,
+    reflectivity_cross_section_with_smoothing, smooth_moment_grid, storm_relative_velocity_mps,
+    upsample_moment_grid, velocity_cross_section_cached_with_smoothing, viewport_rgba_buffer_len,
     viewport_sample_cache_storage_upper_bound, vil_density_grid, vil_grid,
 };
 use serde::Deserialize;
@@ -118,11 +118,16 @@ const ALERT_SOUND_FAMILY_OPTIONS: &[(&str, &str)] = &[
 const PERF_SAMPLE_CAPACITY: usize = 96;
 const STALE_LATEST_DISPLAY_CLEAR_SECONDS: i64 = 15 * 60;
 const ARCHIVE_EVENT_CACHE_HIT_MAX_SECONDS: i64 = 10 * 60;
-const HISTORY_SIZE_OPTIONS: &[usize] = &[3, 5, 7, 10, 15, 20, 25, 30];
+const HISTORY_SIZE_OPTIONS: &[usize] = &[3, 5, 7, 10, 15, 20, 25, 30, 48, 72, 96];
 const DEFAULT_HISTORY_FRAME_LIMIT: usize = 7;
 const DEFAULT_ARCHIVE_FRAME_COUNT: usize = 10;
 const MAX_ARCHIVE_FRAME_COUNT: usize = 30;
 const MAX_LIVE_PRELOAD_FRAME_COUNT: usize = 10;
+const STORM_TRACK_MAX_TRACK_OPTIONS: &[usize] = &[8, 12, 16, 24, 32];
+const DEFAULT_STORM_TRACK_MAX_TRACKS: usize = 16;
+const DEFAULT_STORM_TRACK_MIN_DBZ: f32 = 35.0;
+const MIN_STORM_TRACK_MIN_DBZ: f32 = 30.0;
+const MAX_STORM_TRACK_MIN_DBZ: f32 = 65.0;
 pub(crate) const MAX_EVENT_PAD_FRAMES: u16 = 40;
 /// Hard ceiling for the frame strip — deployment folders legitimately
 /// load 100+ volumes.
@@ -344,6 +349,8 @@ const HAZARD_MAX_RENDER_EDGE_KM: f32 = 2_500.0;
 const HAZARD_GENERIC_ALERT_SPIKY_MIN_POINTS: usize = 8;
 const HAZARD_GENERIC_ALERT_SPIKY_PATH_RATIO: f32 = 1.6;
 const MAP_DRAG_DEAD_ZONE_PX: f32 = 3.0;
+const STORM_TRACK_CLICK_TOLERANCE_PX: f32 = 12.0;
+const STORM_TRACK_FOLLOW_RING_PX: f32 = 8.0;
 const COLOR_STATUS_SCROLL_HEIGHT: f32 = 34.0;
 const HAZARD_LIST_SCROLL_HEIGHT: f32 = 156.0;
 const HAZARD_SUMMARY_SCROLL_HEIGHT: f32 = 86.0;
@@ -1121,6 +1128,10 @@ struct ViewerApp {
     storm_cells_cache: BTreeMap<FrameWorkKey, Vec<StormCell>>,
     storm_cells_cache_order: VecDeque<FrameWorkKey>,
     show_storm_tracks: bool,
+    storm_track_max_tracks: usize,
+    storm_track_min_dbz: f32,
+    storm_track_follow: Option<StormTrackFollow>,
+    storm_follow_lead: StormFollowLead,
     /// Rotation (meso/TVS) markers from the lowest velocity tilt (Stumpf et
     /// al. 1998 / Mitchell et al. 1998 thresholds on LLSD azimuthal shear).
     /// Detection runs on a BACKGROUND thread once per volume — the UI thread
@@ -1860,6 +1871,57 @@ impl FrameWorkKey {
             volume_ptr,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum StormFollowLead {
+    #[default]
+    Current,
+    Plus15,
+    Plus30,
+    Plus45,
+}
+
+impl StormFollowLead {
+    const ALL: [Self; 4] = [Self::Current, Self::Plus15, Self::Plus30, Self::Plus45];
+
+    fn seconds(self) -> f64 {
+        match self {
+            Self::Current => 0.0,
+            Self::Plus15 => 15.0 * 60.0,
+            Self::Plus30 => 30.0 * 60.0,
+            Self::Plus45 => 45.0 * 60.0,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Plus15 => "+15 min",
+            Self::Plus30 => "+30 min",
+            Self::Plus45 => "+45 min",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StormTrackFollow {
+    track_id: u32,
+    lead: StormFollowLead,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StormTrackCameraPosition {
+    track_id: u32,
+    lon: f32,
+    lat: f32,
+    lead: StormFollowLead,
+    max_dbz: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StormTrackHit {
+    track_id: u32,
 }
 
 fn insert_limited_frame_cache<T>(
@@ -4343,6 +4405,11 @@ impl ViewerApp {
             normalized_archive_frame_count(usize::from(app_settings.archive_frame_count));
         let restored_archive_load_loop = app_settings.archive_load_loop;
         let restored_cross_section_smoothing = cross_section_smoothing_from_settings(&app_settings);
+        let restored_record_fps = media::normalize_record_fps(app_settings.record_fps);
+        let restored_storm_track_max_tracks =
+            normalized_storm_track_max_tracks(usize::from(app_settings.storm_track_max_tracks));
+        let restored_storm_track_min_dbz =
+            normalized_storm_track_min_dbz(app_settings.storm_track_min_dbz_tenths as f32 / 10.0);
         let mut app = Self {
             source_path,
             renderer_backend,
@@ -4415,6 +4482,10 @@ impl ViewerApp {
             storm_cells_cache: BTreeMap::new(),
             storm_cells_cache_order: VecDeque::new(),
             show_storm_tracks: true,
+            storm_track_max_tracks: restored_storm_track_max_tracks,
+            storm_track_min_dbz: restored_storm_track_min_dbz,
+            storm_track_follow: None,
+            storm_follow_lead: StormFollowLead::default(),
             rotation_markers: Vec::new(),
             rotation_markers_volume_ptr: 0,
             rotation_receiver: None,
@@ -4614,7 +4685,7 @@ impl ViewerApp {
             dealiased_readout_cache: None,
             update_check_rx: None,
             update_available: None,
-            media: media::MediaShare::default(),
+            media: media::MediaShare::with_record_fps(restored_record_fps),
             annotations: annotate::AnnotationState::default(),
         };
         app.basemap_style = restored_basemap_style;
@@ -5238,6 +5309,11 @@ impl ViewerApp {
         self.history_playing = false;
         self.browsing_history = false;
         self.last_history_step = None;
+        self.storm_tracker = StormTracker::default();
+        self.storm_tracks_site.clear();
+        self.storm_cells_volume_ptr = 0;
+        self.storm_cells_receiver = None;
+        self.storm_track_follow = None;
         self.storm_cells_cache.clear();
         self.storm_cells_cache_order.clear();
         self.rotation_markers_cache.clear();
@@ -5430,11 +5506,18 @@ impl ViewerApp {
             ctx,
         );
         let frame_status = self.selected_frame_status_text();
-        if let Some(label) = self.apply_event_track_camera_follow_for_frame(&frame.volume, ctx) {
-            self.status = format!("{frame_status} - following {label}");
+        let follow_status = if let Some(label) =
+            self.apply_event_track_camera_follow_for_frame(&frame.volume, ctx)
+        {
+            Some(format!("following {label}"))
         } else {
-            self.status = frame_status;
-        }
+            self.apply_storm_track_camera_follow_for_frame(&frame.volume, ctx)
+        };
+        self.status = if let Some(label) = follow_status {
+            format!("{frame_status} - {label}")
+        } else {
+            frame_status
+        };
     }
 
     fn apply_event_track_camera_follow_for_frame(
@@ -5450,6 +5533,110 @@ impl ViewerApp {
         self.clear_texture();
         ctx.request_repaint();
         Some(follow.label)
+    }
+
+    fn clear_camera_follow_targets(&mut self) {
+        self.event_explorer.camera_follow = None;
+        self.storm_track_follow = None;
+    }
+
+    fn storm_tracking_active(&self) -> bool {
+        self.show_storm_tracks || self.storm_track_follow.is_some()
+    }
+
+    fn storm_track_offset_to_lon_lat(&self, east_km: f64, north_km: f64) -> Option<(f32, f32)> {
+        let (radar_lat, radar_lon) = self.radar_location()?;
+        let (lat, lon) = aeqd_inverse_km(radar_lat as f64, radar_lon as f64, east_km, north_km);
+        Some((lat.clamp(-85.0, 85.0) as f32, normalize_lon(lon as f32)))
+    }
+
+    fn storm_track_screen_position(
+        &self,
+        rect: egui::Rect,
+        east_km: f64,
+        north_km: f64,
+    ) -> Option<egui::Pos2> {
+        let (lat, lon) = self.storm_track_offset_to_lon_lat(east_km, north_km)?;
+        Some(self.lon_lat_to_screen(rect, lon, lat))
+    }
+
+    fn storm_track_position_for_follow(
+        &self,
+        volume: &RadarVolume,
+        follow: StormTrackFollow,
+    ) -> Option<StormTrackCameraPosition> {
+        let track = self
+            .storm_tracker
+            .tracks
+            .iter()
+            .find(|track| track.id == follow.track_id && track.merged_into.is_none())?;
+        let (fix_time, east_km, north_km) = track.last_fix()?;
+        let (u_mps, v_mps) = track.motion().unwrap_or((0.0, 0.0));
+        let dt_s = volume
+            .volume_time
+            .with_timezone(&Utc)
+            .signed_duration_since(fix_time)
+            .num_milliseconds() as f64
+            / 1000.0
+            + follow.lead.seconds();
+        let (lat, lon) = self.storm_track_offset_to_lon_lat(
+            east_km + u_mps * dt_s / 1000.0,
+            north_km + v_mps * dt_s / 1000.0,
+        )?;
+        Some(StormTrackCameraPosition {
+            track_id: track.id,
+            lon,
+            lat,
+            lead: follow.lead,
+            max_dbz: track.max_dbz,
+        })
+    }
+
+    fn current_storm_track_follow_position(&self) -> Option<StormTrackCameraPosition> {
+        let follow = self.storm_track_follow?;
+        let volume = self.volume.as_deref()?;
+        self.storm_track_position_for_follow(volume, follow)
+    }
+
+    fn storm_track_follow_label(position: StormTrackCameraPosition) -> String {
+        let lead = if position.lead == StormFollowLead::Current {
+            String::new()
+        } else {
+            format!(" {}", position.lead.label())
+        };
+        format!(
+            "following storm #{}{} ({:.0} dBZ)",
+            position.track_id, lead, position.max_dbz
+        )
+    }
+
+    fn apply_storm_track_camera_follow_for_current_frame(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<String> {
+        let volume = self.volume.clone()?;
+        self.apply_storm_track_camera_follow_for_frame(&volume, ctx)
+    }
+
+    fn apply_storm_track_camera_follow_for_frame(
+        &mut self,
+        volume: &RadarVolume,
+        ctx: &egui::Context,
+    ) -> Option<String> {
+        let follow = self.storm_track_follow?;
+        match self.storm_track_position_for_follow(volume, follow) {
+            Some(position) => {
+                self.center_map_on(position.lat, position.lon);
+                self.clear_texture();
+                ctx.request_repaint();
+                Some(Self::storm_track_follow_label(position))
+            }
+            None => {
+                self.storm_track_follow = None;
+                ctx.request_repaint();
+                Some(format!("lost storm #{}", follow.track_id))
+            }
+        }
     }
 
     fn install_volume_arc(
@@ -5712,6 +5899,36 @@ impl ViewerApp {
             self.app_settings.archive_load_loop = self.archive_load_loop;
             let _ = self.app_settings.save();
         }
+    }
+
+    fn set_storm_track_filters(&mut self, max_tracks: usize, min_dbz: f32, ctx: &egui::Context) {
+        let max_tracks = normalized_storm_track_max_tracks(max_tracks);
+        let min_dbz = normalized_storm_track_min_dbz(min_dbz).round();
+        if self.storm_track_max_tracks == max_tracks
+            && (self.storm_track_min_dbz - min_dbz).abs() < f32::EPSILON
+        {
+            return;
+        }
+        self.storm_track_max_tracks = max_tracks;
+        self.storm_track_min_dbz = min_dbz;
+        self.app_settings.storm_track_max_tracks = max_tracks as u16;
+        self.app_settings.storm_track_min_dbz_tenths = (min_dbz * 10.0).round() as u16;
+        let _ = self.app_settings.save();
+        self.storm_tracker.clear();
+        self.storm_track_follow = None;
+        self.storm_cells_volume_ptr = 0;
+        ctx.request_repaint();
+    }
+
+    fn storm_track_cells_for_settings(&self, cells: &[StormCell]) -> Vec<StormCell> {
+        let min_dbz = normalized_storm_track_min_dbz(self.storm_track_min_dbz);
+        let max_tracks = normalized_storm_track_max_tracks(self.storm_track_max_tracks);
+        cells
+            .iter()
+            .copied()
+            .filter(|cell| cell.max_dbz >= min_dbz)
+            .take(max_tracks)
+            .collect()
     }
 
     fn begin_primary_load_telemetry(&mut self) {
@@ -9342,7 +9559,7 @@ impl ViewerApp {
             return;
         };
         let site_id = self.sites[site_index].level2_id.clone();
-        self.event_explorer.camera_follow = None;
+        self.clear_camera_follow_targets();
         self.selected_site_index = site_index;
         self.map_center_lat = lat;
         self.map_center_lon = lon;
@@ -9395,7 +9612,7 @@ impl ViewerApp {
             return;
         };
         let site_id = self.sites[site_index].level2_id.clone();
-        self.event_explorer.camera_follow = None;
+        self.clear_camera_follow_targets();
         self.selected_site_index = site_index;
         self.map_center_lat = report.lat;
         self.map_center_lon = report.lon;
@@ -10173,7 +10390,7 @@ impl ViewerApp {
         self.realtime_level2_auto_refresh = false;
         self.archive_pending_event = None;
         self.pending_debug_archive_case = None;
-        self.event_explorer.camera_follow = None;
+        self.clear_camera_follow_targets();
         self.archive_date_input = plan.start_utc.format("%Y-%m-%d").to_string();
         self.archive_volumes = None;
         self.archive_list_receiver = None;
@@ -10340,7 +10557,7 @@ impl ViewerApp {
             self.poll_active = false;
         }
         if mode != LatestLoadMode::AutoRefresh {
-            self.event_explorer.camera_follow = None;
+            self.clear_camera_follow_targets();
         }
         if history_contains_other_site(&self.frame_history, &site_id) {
             self.clear_frame_history();
@@ -13787,12 +14004,41 @@ impl ViewerApp {
                 )
                 .changed()
             {
-                if !self.show_storm_tracks {
+                if !self.show_storm_tracks && self.storm_track_follow.is_none() {
                     self.storm_tracker.clear();
                 }
                 self.storm_cells_volume_ptr = 0;
                 ctx.request_repaint();
             }
+            ui.menu_button("Settings", |ui| {
+                let mut max_tracks = self.storm_track_max_tracks;
+                egui::ComboBox::from_id_salt("storm_track_max_tracks")
+                    .selected_text(format!("{max_tracks} tracks"))
+                    .width(96.0)
+                    .show_ui(ui, |ui| {
+                        for option in STORM_TRACK_MAX_TRACK_OPTIONS {
+                            ui.selectable_value(
+                                &mut max_tracks,
+                                *option,
+                                format!("{option} tracks"),
+                            );
+                        }
+                    });
+                let mut min_dbz = self.storm_track_min_dbz;
+                let min_changed = ui
+                    .add(
+                        egui::Slider::new(
+                            &mut min_dbz,
+                            MIN_STORM_TRACK_MIN_DBZ..=MAX_STORM_TRACK_MIN_DBZ,
+                        )
+                        .step_by(1.0)
+                        .text("Min dBZ"),
+                    )
+                    .changed();
+                if max_tracks != self.storm_track_max_tracks || min_changed {
+                    self.set_storm_track_filters(max_tracks, min_dbz, ctx);
+                }
+            });
             if let Some((direction, speed_kt)) = self.storm_motion_from_tracks()
                 && ui
                     .small_button("SRV←tracks")
@@ -13805,6 +14051,42 @@ impl ViewerApp {
                 self.storm_motion_speed_kt = speed_kt;
                 self.clear_texture();
                 ctx.request_repaint();
+            }
+            if let Some(track_id) = self.storm_track_follow.map(|follow| follow.track_id) {
+                ui.separator();
+                ui.label(format!("Follow #{track_id}"));
+                let mut lead = self.storm_follow_lead;
+                egui::ComboBox::from_id_salt("storm_track_follow_lead")
+                    .selected_text(lead.label())
+                    .width(76.0)
+                    .show_ui(ui, |ui| {
+                        for candidate in StormFollowLead::ALL {
+                            ui.selectable_value(&mut lead, candidate, candidate.label());
+                        }
+                    });
+                if lead != self.storm_follow_lead {
+                    self.storm_follow_lead = lead;
+                    if let Some(follow) = &mut self.storm_track_follow {
+                        follow.lead = lead;
+                    }
+                    if let Some(label) = self.apply_storm_track_camera_follow_for_current_frame(ctx)
+                    {
+                        self.status = label;
+                    }
+                    ctx.request_repaint();
+                }
+                if ui
+                    .small_button("Stop")
+                    .on_hover_text("Stop storm-track camera follow")
+                    .clicked()
+                {
+                    self.storm_track_follow = None;
+                    if !self.show_storm_tracks {
+                        self.storm_tracker.clear();
+                        self.storm_cells_volume_ptr = 0;
+                    }
+                    ctx.request_repaint();
+                }
             }
         });
 
@@ -16606,7 +16888,7 @@ impl ViewerApp {
                 // Pan through the projection's own inverse: linear degree
                 // math is only locally correct under AEQD and drifted at
                 // distance/zoom-out (field QOL report).
-                self.event_explorer.camera_follow = None;
+                self.clear_camera_follow_targets();
                 let (lon, lat) = self.screen_to_lon_lat(rect, rect.center() - delta);
                 self.center_map_on(lat, lon);
             }
@@ -16618,7 +16900,7 @@ impl ViewerApp {
                 let pointer = ui.input(|input| input.pointer.hover_pos());
                 let before = pointer.map(|position| self.screen_to_lon_lat(rect, position));
                 let factor = (1.0_f32 + scroll / 600.0).clamp(0.75, 1.35);
-                self.event_explorer.camera_follow = None;
+                self.clear_camera_follow_targets();
                 self.map_scale = (self.map_scale * factor).clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
                 if let (Some(position), Some((lon_before, lat_before))) = (pointer, before) {
                     let (lon_after, lat_after) = self.screen_to_lon_lat(rect, position);
@@ -16697,6 +16979,7 @@ impl ViewerApp {
         self.draw_hazard_overlays(painter, rect);
         self.draw_rotation_markers(painter, rect);
         self.draw_storm_tracks(painter, rect);
+        self.draw_storm_follow_target(painter, rect);
         // Tornado track lines under the report dots (the dots mark the
         // climo report points; the lines are the surveyed paths).
         self.draw_event_tracks(painter, rect);
@@ -16754,7 +17037,7 @@ impl ViewerApp {
         {
             // Site/feed markers keep priority (their 12 px halo is the
             // established click grammar — RAOB diamonds included); a
-            // tornado track only takes the click when no marker is in
+            // report dots and track overlays only take the click when no marker is in
             // reach.
             let marker_hit = self
                 .nearest_site_marker_within(&site_points, pointer)
@@ -16768,6 +17051,8 @@ impl ViewerApp {
                     self.jump_to_storm_report(&report, ui.ctx());
                 } else if let Some(hit) = self.event_track_at(rect, pointer) {
                     self.jump_to_event_track(&hit, ui.ctx());
+                } else if let Some(hit) = self.storm_track_at(rect, pointer) {
+                    self.start_storm_track_follow(hit, ui.ctx());
                 } else {
                     self.handle_marker_click(
                         &site_points,
@@ -17053,7 +17338,7 @@ impl ViewerApp {
                 let delta = response.drag_delta();
                 if delta.length_sq() >= MAP_DRAG_DEAD_ZONE_PX * MAP_DRAG_DEAD_ZONE_PX {
                     // Projection-true pan — see the single-pane handler.
-                    self.event_explorer.camera_follow = None;
+                    self.clear_camera_follow_targets();
                     let (lon, lat) = self.screen_to_lon_lat(cell, cell.center() - delta);
                     self.center_map_on(lat, lon);
                 }
@@ -17065,7 +17350,7 @@ impl ViewerApp {
                     let pointer = ui.input(|input| input.pointer.hover_pos());
                     let before = pointer.map(|position| self.screen_to_lon_lat(cell, position));
                     let factor = (1.0_f32 + scroll / 600.0).clamp(0.75, 1.35);
-                    self.event_explorer.camera_follow = None;
+                    self.clear_camera_follow_targets();
                     self.map_scale = (self.map_scale * factor).clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
                     if let (Some(position), Some((lon_before, lat_before))) = (pointer, before) {
                         let (lon_after, lat_after) = self.screen_to_lon_lat(cell, position);
@@ -17354,6 +17639,7 @@ impl ViewerApp {
             self.draw_hazard_overlays(&cell_painter, cell);
             self.draw_rotation_markers(&cell_painter, cell);
             self.draw_storm_tracks(&cell_painter, cell);
+            self.draw_storm_follow_target(&cell_painter, cell);
             self.draw_event_tracks(&cell_painter, cell);
             self.draw_spc_reports(&cell_painter, cell);
             self.draw_mping_reports(&cell_painter, cell);
@@ -17951,6 +18237,9 @@ impl ViewerApp {
         cells: &[StormCell],
         ctx: &egui::Context,
     ) {
+        if self.rebuild_storm_tracker_from_cached_history(key, ctx) {
+            return;
+        }
         self.storm_cells_volume_ptr = key.volume_ptr;
         // Live-partial policy: track only COMPLETE volumes. Partial
         // composites bias centroids and poison the motion fit, but still
@@ -17960,15 +18249,78 @@ impl ViewerApp {
             .map(|frame| frame.status != FrameStatus::LivePartial)
             .unwrap_or(true);
         if complete {
-            let user_motion = {
-                let dir = (self.storm_motion_direction_deg as f64).to_radians();
-                let speed = self.storm_motion_speed_kt as f64 * KNOT_TO_MPS as f64;
-                (speed > 1.0).then(|| (speed * dir.sin(), speed * dir.cos()))
-            };
+            let user_motion = self.storm_track_user_motion();
+            let cells = self.storm_track_cells_for_settings(cells);
             self.storm_tracker
-                .associate(key.identity.scan_time_utc, cells, user_motion);
+                .associate(key.identity.scan_time_utc, &cells, user_motion);
+        }
+        if let Some(label) = self.apply_storm_track_camera_follow_for_current_frame(ctx) {
+            self.status = label;
         }
         ctx.request_repaint();
+    }
+
+    fn storm_track_user_motion(&self) -> Option<(f64, f64)> {
+        let dir = (self.storm_motion_direction_deg as f64).to_radians();
+        let speed = self.storm_motion_speed_kt as f64 * KNOT_TO_MPS as f64;
+        (speed > 1.0).then(|| (speed * dir.sin(), speed * dir.cos()))
+    }
+
+    fn rebuild_storm_tracker_from_cached_history(
+        &mut self,
+        current_key: &FrameWorkKey,
+        ctx: &egui::Context,
+    ) -> bool {
+        let Some(current_index) = self.frame_history.iter().position(|frame| {
+            frame.identity == current_key.identity
+                && Arc::as_ptr(&frame.volume) as usize == current_key.volume_ptr
+        }) else {
+            return false;
+        };
+        let site_id = current_key.identity.site_id.clone();
+        let frames: Vec<(FrameWorkKey, FrameStatus)> = self
+            .frame_history
+            .iter()
+            .take(current_index + 1)
+            .filter(|frame| frame.identity.site_id == site_id)
+            .map(|frame| {
+                (
+                    FrameWorkKey::new(&frame.volume, Arc::as_ptr(&frame.volume) as usize),
+                    frame.status,
+                )
+            })
+            .collect();
+
+        self.storm_tracker = StormTracker::default();
+        self.storm_tracks_site = site_id;
+        let user_motion = self.storm_track_user_motion();
+        let mut installed_current = false;
+        for (key, status) in frames {
+            if status == FrameStatus::LivePartial {
+                continue;
+            }
+            let Some(cells) = self.storm_cells_cache.get(&key).cloned() else {
+                continue;
+            };
+            let cells = self.storm_track_cells_for_settings(&cells);
+            self.storm_tracker
+                .associate(key.identity.scan_time_utc, &cells, user_motion);
+            if key == *current_key {
+                installed_current = true;
+            }
+        }
+        self.storm_cells_volume_ptr = if installed_current {
+            current_key.volume_ptr
+        } else {
+            0
+        };
+        if installed_current
+            && let Some(label) = self.apply_storm_track_camera_follow_for_current_frame(ctx)
+        {
+            self.status = label;
+        }
+        ctx.request_repaint();
+        installed_current
     }
 
     fn poll_storm_tracks(&mut self, ctx: &egui::Context) {
@@ -17987,8 +18339,16 @@ impl ViewerApp {
                         .volume
                         .as_ref()
                         .map(|volume| FrameWorkKey::new(volume, Arc::as_ptr(volume) as usize));
-                    if current_key.as_ref() == Some(&key) {
-                        self.install_storm_cells_for_frame(&key, &cells, ctx);
+                    if let Some(current_key) = current_key {
+                        if let Some(current_cells) =
+                            self.storm_cells_cache.get(&current_key).cloned()
+                        {
+                            self.install_storm_cells_for_frame(&current_key, &current_cells, ctx);
+                        } else if current_key == key {
+                            self.install_storm_cells_for_frame(&key, &cells, ctx);
+                        } else {
+                            self.storm_cells_volume_ptr = 0;
+                        }
                     } else {
                         self.storm_cells_volume_ptr = 0;
                     }
@@ -17997,7 +18357,7 @@ impl ViewerApp {
                 Err(mpsc::TryRecvError::Disconnected) => self.storm_cells_receiver = None,
             }
         }
-        if !self.show_storm_tracks {
+        if !self.storm_tracking_active() {
             return;
         }
         let Some(volume) = self.volume.clone() else {
@@ -18006,6 +18366,7 @@ impl ViewerApp {
         // Site change resets the history (tracks are radar-relative).
         if self.storm_tracks_site != volume.site.id {
             self.storm_tracker.clear();
+            self.storm_track_follow = None;
             self.storm_tracks_site = volume.site.id.clone();
             self.storm_cells_cache.clear();
             self.storm_cells_cache_order.clear();
@@ -23460,33 +23821,34 @@ impl ViewerApp {
         if !self.show_storm_tracks || self.storm_tracker.tracks.is_empty() {
             return;
         }
-        let Some((radar_lat, radar_lon)) = self.radar_location() else {
-            return;
-        };
-        let cos_lat = radar_lat.to_radians().cos().max(0.05);
-        let to_screen = |east_km: f64, north_km: f64| -> egui::Pos2 {
-            let lon = radar_lon + (east_km as f32) / (111.32 * cos_lat);
-            let lat = radar_lat + (north_km as f32) / 111.32;
-            self.lon_lat_to_screen(rect, lon, lat)
-        };
-        let line_color = egui::Color32::from_rgb(235, 240, 245);
         for track in &self.storm_tracker.tracks {
             if track.history.is_empty() || track.merged_into.is_some() {
                 continue;
             }
+            let is_followed = self
+                .storm_track_follow
+                .map(|follow| follow.track_id == track.id)
+                .unwrap_or(false);
+            let line_color = if is_followed {
+                egui::Color32::from_rgb(255, 205, 75)
+            } else {
+                egui::Color32::from_rgb(235, 240, 245)
+            };
             let points: Vec<egui::Pos2> = track
                 .history
                 .iter()
-                .map(|&(_, e, n)| to_screen(e, n))
+                .filter_map(|&(_, e, n)| self.storm_track_screen_position(rect, e, n))
                 .collect();
-            let current = *points.last().expect("non-empty");
+            let Some(&current) = points.last() else {
+                continue;
+            };
             if !rect.expand(40.0).contains(current) {
                 continue;
             }
             if points.len() >= 2 {
                 painter.add(egui::Shape::line(
                     points.clone(),
-                    egui::Stroke::new(1.6, line_color),
+                    egui::Stroke::new(if is_followed { 2.1 } else { 1.6 }, line_color),
                 ));
             }
             painter.circle_filled(current, 3.5, line_color);
@@ -23494,9 +23856,19 @@ impl ViewerApp {
             if let Some((u, v)) = track.fitted_motion {
                 let (_, east, north) = track.last_fix().expect("non-empty");
                 let mut previous = current;
-                for minutes in [15.0f64, 30.0, 45.0] {
-                    let t = minutes * 60.0;
-                    let position = to_screen(east + u * t / 1000.0, north + v * t / 1000.0);
+                for lead in [
+                    StormFollowLead::Plus15,
+                    StormFollowLead::Plus30,
+                    StormFollowLead::Plus45,
+                ] {
+                    let t = lead.seconds();
+                    let Some(position) = self.storm_track_screen_position(
+                        rect,
+                        east + u * t / 1000.0,
+                        north + v * t / 1000.0,
+                    ) else {
+                        continue;
+                    };
                     painter.line_segment(
                         [previous, position],
                         egui::Stroke::new(
@@ -23531,6 +23903,118 @@ impl ViewerApp {
                 );
             }
         }
+    }
+
+    fn draw_storm_follow_target(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let Some(position) = self.current_storm_track_follow_position() else {
+            return;
+        };
+        let screen = self.lon_lat_to_screen(rect, position.lon, position.lat);
+        if !rect.expand(40.0).contains(screen) {
+            return;
+        }
+        let gold = egui::Color32::from_rgb(255, 205, 75);
+        painter.circle_stroke(
+            screen,
+            STORM_TRACK_FOLLOW_RING_PX + 3.0,
+            egui::Stroke::new(1.2, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220)),
+        );
+        painter.circle_stroke(
+            screen,
+            STORM_TRACK_FOLLOW_RING_PX,
+            egui::Stroke::new(2.0, gold),
+        );
+        painter.circle_filled(screen, 2.4, gold);
+        if self.map_scale >= 90.0 {
+            draw_halo_text(
+                painter,
+                screen + egui::vec2(9.0, -9.0),
+                egui::Align2::LEFT_BOTTOM,
+                &format!("Follow #{}", position.track_id),
+                egui::FontId::proportional(10.0),
+                gold,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 210),
+            );
+        }
+    }
+
+    fn storm_track_hit_distance_sq(
+        &self,
+        rect: egui::Rect,
+        track: &StormTrack,
+        position: egui::Pos2,
+    ) -> Option<f32> {
+        if track.history.is_empty() || track.merged_into.is_some() {
+            return None;
+        }
+        let points: Vec<egui::Pos2> = track
+            .history
+            .iter()
+            .filter_map(|&(_, e, n)| self.storm_track_screen_position(rect, e, n))
+            .collect();
+        let mut best_distance_sq = points
+            .iter()
+            .map(|point| point.distance_sq(position))
+            .fold(f32::INFINITY, f32::min);
+        for segment in points.windows(2) {
+            best_distance_sq =
+                best_distance_sq.min(point_segment_distance_sq(position, segment[0], segment[1]));
+        }
+        if let Some((u, v)) = track.fitted_motion {
+            let (_, east, north) = track.last_fix()?;
+            let mut previous = *points.last()?;
+            for lead in [
+                StormFollowLead::Plus15,
+                StormFollowLead::Plus30,
+                StormFollowLead::Plus45,
+            ] {
+                let t = lead.seconds();
+                let Some(forecast) = self.storm_track_screen_position(
+                    rect,
+                    east + u * t / 1000.0,
+                    north + v * t / 1000.0,
+                ) else {
+                    continue;
+                };
+                best_distance_sq = best_distance_sq
+                    .min(forecast.distance_sq(position))
+                    .min(point_segment_distance_sq(position, previous, forecast));
+                previous = forecast;
+            }
+        }
+        best_distance_sq.is_finite().then_some(best_distance_sq)
+    }
+
+    fn storm_track_at(&self, rect: egui::Rect, position: egui::Pos2) -> Option<StormTrackHit> {
+        if !self.show_storm_tracks {
+            return None;
+        }
+        let max_distance_sq = STORM_TRACK_CLICK_TOLERANCE_PX * STORM_TRACK_CLICK_TOLERANCE_PX;
+        self.storm_tracker
+            .tracks
+            .iter()
+            .filter_map(|track| {
+                let distance_sq = self.storm_track_hit_distance_sq(rect, track, position)?;
+                (distance_sq <= max_distance_sq).then_some((track.id, distance_sq))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(track_id, _)| StormTrackHit { track_id })
+    }
+
+    fn start_storm_track_follow(&mut self, hit: StormTrackHit, ctx: &egui::Context) {
+        self.event_explorer.camera_follow = None;
+        let follow = StormTrackFollow {
+            track_id: hit.track_id,
+            lead: self.storm_follow_lead,
+        };
+        self.storm_track_follow = Some(follow);
+        self.status =
+            if let Some(label) = self.apply_storm_track_camera_follow_for_current_frame(ctx) {
+                label
+            } else {
+                format!("following storm #{}", hit.track_id)
+            };
+        ctx.request_repaint();
     }
 
     /// Kick background rotation detection when the displayed volume changes
@@ -23708,7 +24192,13 @@ impl ViewerApp {
     /// WITHOUT dealiasing — folded gates read as opposite-direction flow, so
     /// raw mode must never be silent (operational safety).
     fn draw_raw_velocity_tag(&self, painter: &egui::Painter, rect: egui::Rect) {
-        self.draw_raw_velocity_tag_for_product(painter, rect, &self.selected_product, 34.0);
+        self.draw_velocity_quality_tag_for_product(
+            painter,
+            rect,
+            &self.selected_product,
+            34.0,
+            self.primary_velocity_provider_id(),
+        );
     }
 
     fn draw_raw_velocity_tag_for_product(
@@ -23737,6 +24227,45 @@ impl ViewerApp {
             egui::FontId::proportional(12.0),
             egui::Color32::from_rgb(248, 238, 220),
         );
+    }
+
+    fn draw_velocity_quality_tag_for_product(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        product: &DisplayProduct,
+        top_offset: f32,
+        provider_id: Option<&str>,
+    ) {
+        if self.product_render_uses_dealiased_velocity(product)
+            && matches!(provider_id, Some("ord"))
+            && self.volume.is_some()
+        {
+            let label = "VRADH dealiased locally";
+            let pos = egui::pos2(rect.left() + 10.0, rect.top() + top_offset);
+            let width = 16.0 + label.chars().count() as f32 * 7.2;
+            let chip = egui::Rect::from_min_size(pos, egui::vec2(width, 20.0));
+            painter.rect_filled(chip, 4.0, egui::Color32::from_rgb(44, 78, 108));
+            painter.text(
+                chip.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_rgb(228, 238, 248),
+            );
+        } else {
+            self.draw_raw_velocity_tag_for_product(painter, rect, product, top_offset);
+        }
+    }
+
+    fn primary_velocity_provider_id(&self) -> Option<&str> {
+        if !self.intl_source_owns_primary_display() {
+            return None;
+        }
+        match &self.poll_source {
+            PollSource::Intl { provider_id, .. } => Some(provider_id.as_str()),
+            PollSource::CustomUrl(_) => None,
+        }
     }
 
     /// Paint a LIVE / ARCHIVE / STALE mode chip top-left so a stale frame is
@@ -26468,7 +26997,7 @@ impl ViewerApp {
     ) {
         // Site/feed markers keep priority (their 12 px halo is the
         // established click grammar, RAOB diamonds included); SPC report
-        // dots and tornado tracks take the click only when no marker is in
+        // dots and track overlays take the click only when no marker is in
         // reach.
         let marker_hit = self
             .nearest_site_marker_within(site_points, pointer)
@@ -26486,6 +27015,10 @@ impl ViewerApp {
             }
             if let Some(hit) = self.event_track_at(rect, pointer) {
                 self.jump_to_event_track(&hit, ctx);
+                return;
+            }
+            if let Some(hit) = self.storm_track_at(rect, pointer) {
+                self.start_storm_track_follow(hit, ctx);
                 return;
             }
         }
@@ -34432,6 +34965,25 @@ fn normalized_history_limit(limit: usize) -> usize {
     }
 }
 
+fn normalized_storm_track_max_tracks(count: usize) -> usize {
+    if count == 0 {
+        DEFAULT_STORM_TRACK_MAX_TRACKS
+    } else {
+        count.clamp(
+            STORM_TRACK_MAX_TRACK_OPTIONS[0],
+            *STORM_TRACK_MAX_TRACK_OPTIONS.last().unwrap_or(&32),
+        )
+    }
+}
+
+fn normalized_storm_track_min_dbz(dbz: f32) -> f32 {
+    if dbz.is_finite() {
+        dbz.clamp(MIN_STORM_TRACK_MIN_DBZ, MAX_STORM_TRACK_MIN_DBZ)
+    } else {
+        DEFAULT_STORM_TRACK_MIN_DBZ
+    }
+}
+
 fn normalized_archive_frame_count(count: usize) -> usize {
     if count == 0 {
         DEFAULT_ARCHIVE_FRAME_COUNT
@@ -36974,6 +37526,132 @@ mod tests {
 
         assert_eq!(cache.get(&first), Some(&vec![1]));
         assert_eq!(cache.get(&replacement), Some(&vec![2]));
+    }
+
+    fn test_storm_cell(east_km: f64) -> StormCell {
+        StormCell {
+            east_km,
+            north_km: 0.0,
+            max_dbz: 50.0,
+            area_km2: 80.0,
+            eq_radius_km: 5.0,
+            mass: 1.0,
+            hlevel_dbz: 45.0,
+        }
+    }
+
+    #[test]
+    fn history_size_options_reach_96_without_changing_default() {
+        assert_eq!(DEFAULT_HISTORY_FRAME_LIMIT, 7);
+        assert!(HISTORY_SIZE_OPTIONS.contains(&96));
+        assert_eq!(normalized_history_limit(0), DEFAULT_HISTORY_FRAME_LIMIT);
+        assert_eq!(normalized_history_limit(96), 96);
+    }
+
+    #[test]
+    fn storm_track_settings_filter_cells_before_tracking() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.storm_track_max_tracks = 8;
+        app.storm_track_min_dbz = 50.0;
+
+        let mut raw_cells = Vec::new();
+        for (idx, max_dbz) in (53..=62).rev().enumerate() {
+            let mut cell = test_storm_cell(idx as f64);
+            cell.max_dbz = max_dbz as f32;
+            raw_cells.push(cell);
+        }
+        let mut filtered_out = test_storm_cell(20.0);
+        filtered_out.max_dbz = 44.0;
+        raw_cells.push(filtered_out);
+
+        let cells = app.storm_track_cells_for_settings(&raw_cells);
+
+        assert_eq!(cells.len(), 8);
+        assert!(cells.iter().all(|cell| cell.max_dbz >= 50.0));
+        assert_eq!(cells[0].max_dbz, 62.0);
+    }
+
+    fn cached_storm_key_for_frame(app: &ViewerApp, index: usize) -> FrameWorkKey {
+        let frame = &app.frame_history[index];
+        FrameWorkKey::new(&frame.volume, Arc::as_ptr(&frame.volume) as usize)
+    }
+
+    #[test]
+    fn storm_tracks_rebuild_from_cached_history_when_loop_extends_backward() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let base = Utc.with_ymd_and_hms(2026, 6, 8, 1, 0, 0).unwrap();
+        for (minutes, east_km) in [(5, 2.0), (10, 4.0)] {
+            let mut volume = RadarVolume::new(
+                radar_core::RadarSite::new("KTLX"),
+                base + chrono::Duration::minutes(minutes),
+            );
+            volume.metadata.source_path = Some(format!("KTLX-{minutes:02}"));
+            app.upsert_history_frame(test_decoded_from_volume(
+                PathBuf::from(format!("KTLX-{minutes:02}")),
+                volume,
+                FrameStatus::Complete,
+            ));
+            let index = app.frame_history.len() - 1;
+            let key = cached_storm_key_for_frame(&app, index);
+            insert_limited_frame_cache(
+                &mut app.storm_cells_cache,
+                &mut app.storm_cells_cache_order,
+                key,
+                vec![test_storm_cell(east_km)],
+                ALGO_FRAME_CACHE_LIMIT,
+            );
+        }
+        app.frame_history
+            .sort_by(|left, right| left.identity.cmp(&right.identity));
+        app.selected_frame_index = 1;
+        app.volume = Some(Arc::clone(&app.frame_history[1].volume));
+        let newest_key = cached_storm_key_for_frame(&app, 1);
+        let newest_cells = app.storm_cells_cache[&newest_key].clone();
+
+        app.install_storm_cells_for_frame(&newest_key, &newest_cells, &ctx);
+        assert_eq!(
+            app.storm_tracker
+                .tracks
+                .iter()
+                .map(|track| track.history.len())
+                .max(),
+            Some(2)
+        );
+
+        let mut older = RadarVolume::new(radar_core::RadarSite::new("KTLX"), base);
+        older.metadata.source_path = Some("KTLX-00".to_owned());
+        app.upsert_history_frame(test_decoded_from_volume(
+            PathBuf::from("KTLX-00"),
+            older,
+            FrameStatus::Complete,
+        ));
+        app.frame_history
+            .sort_by(|left, right| left.identity.cmp(&right.identity));
+        let older_key = cached_storm_key_for_frame(&app, 0);
+        insert_limited_frame_cache(
+            &mut app.storm_cells_cache,
+            &mut app.storm_cells_cache_order,
+            older_key,
+            vec![test_storm_cell(0.0)],
+            ALGO_FRAME_CACHE_LIMIT,
+        );
+        app.selected_frame_index = 2;
+        app.volume = Some(Arc::clone(&app.frame_history[2].volume));
+        let newest_key = cached_storm_key_for_frame(&app, 2);
+        let newest_cells = app.storm_cells_cache[&newest_key].clone();
+
+        app.install_storm_cells_for_frame(&newest_key, &newest_cells, &ctx);
+
+        assert_eq!(
+            app.storm_tracker
+                .tracks
+                .iter()
+                .map(|track| track.history.len())
+                .max(),
+            Some(3),
+            "adding older loop frames after live preload must extend storm tracks backward"
+        );
     }
 
     #[test]
@@ -40279,6 +40957,10 @@ mod tests {
             storm_cells_cache: BTreeMap::new(),
             storm_cells_cache_order: VecDeque::new(),
             show_storm_tracks: true,
+            storm_track_max_tracks: DEFAULT_STORM_TRACK_MAX_TRACKS,
+            storm_track_min_dbz: DEFAULT_STORM_TRACK_MIN_DBZ,
+            storm_track_follow: None,
+            storm_follow_lead: StormFollowLead::default(),
             rotation_markers: Vec::new(),
             rotation_markers_volume_ptr: 0,
             rotation_receiver: None,
@@ -40551,6 +41233,118 @@ mod tests {
 
     fn test_map_rect() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0))
+    }
+
+    fn test_storm_volume(scan_time: DateTime<Utc>) -> RadarVolume {
+        let mut site = radar_core::RadarSite::new("KTLX");
+        site.latitude_deg = Some(35.333);
+        site.longitude_deg = Some(-97.277);
+        RadarVolume::new(site, scan_time)
+    }
+
+    fn test_storm_track(
+        id: u32,
+        fix_time: DateTime<Utc>,
+        east_km: f64,
+        north_km: f64,
+        fitted_motion: Option<(f64, f64)>,
+    ) -> StormTrack {
+        let mut history = VecDeque::new();
+        history.push_back((fix_time, east_km, north_km));
+        StormTrack {
+            id,
+            history,
+            max_dbz: 58.0,
+            eq_radius_km: 3.0,
+            fitted_motion,
+            assumed_motion: None,
+            missed: 0,
+            suspect: 0,
+            parent_id: None,
+            merged_into: None,
+        }
+    }
+
+    #[test]
+    fn storm_track_click_selects_rendered_track() {
+        let scan_time = Utc
+            .with_ymd_and_hms(2026, 6, 16, 20, 0, 0)
+            .single()
+            .expect("valid scan time");
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(Arc::new(test_storm_volume(scan_time)));
+        app.center_map_on(35.333, -97.277);
+        app.map_scale = 650.0;
+        app.storm_tracker
+            .tracks
+            .push(test_storm_track(7, scan_time, 8.0, 4.0, None));
+
+        let rect = test_map_rect();
+        let (lat, lon) = app
+            .storm_track_offset_to_lon_lat(8.0, 4.0)
+            .expect("track position");
+        let pointer = app.lon_lat_to_screen(rect, lon, lat);
+        let hit = app
+            .storm_track_at(rect, pointer)
+            .expect("click should hit storm track");
+
+        assert_eq!(hit.track_id, 7);
+        let ctx = egui::Context::default();
+        app.start_storm_track_follow(hit, &ctx);
+        assert_eq!(
+            app.storm_track_follow.map(|follow| follow.track_id),
+            Some(7)
+        );
+        assert!(app.status.contains("storm #7"));
+    }
+
+    #[test]
+    fn storm_follow_recenters_to_predicted_lead_position() {
+        let fix_time = Utc
+            .with_ymd_and_hms(2026, 6, 16, 20, 0, 0)
+            .single()
+            .expect("valid scan time");
+        let volume_time = fix_time + chrono::Duration::minutes(10);
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(Arc::new(test_storm_volume(volume_time)));
+        app.center_map_on(35.333, -97.277);
+        app.storm_tracker
+            .tracks
+            .push(test_storm_track(9, fix_time, 0.0, 0.0, Some((10.0, 0.0))));
+        let follow = StormTrackFollow {
+            track_id: 9,
+            lead: StormFollowLead::Plus15,
+        };
+        app.storm_follow_lead = follow.lead;
+        app.storm_track_follow = Some(follow);
+        let expected = app
+            .storm_track_position_for_follow(app.volume.as_deref().expect("volume"), follow)
+            .expect("predicted position");
+
+        let ctx = egui::Context::default();
+        let label = app
+            .apply_storm_track_camera_follow_for_current_frame(&ctx)
+            .expect("follow label");
+
+        assert!(label.contains("+15 min"));
+        assert!((app.map_center_lat - expected.lat).abs() < 1e-5);
+        assert!((app.map_center_lon - expected.lon).abs() < 1e-5);
+    }
+
+    #[test]
+    fn storm_tracking_stays_active_when_layer_hidden_but_following() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.show_storm_tracks = false;
+        assert!(!app.storm_tracking_active());
+
+        app.storm_track_follow = Some(StormTrackFollow {
+            track_id: 3,
+            lead: StormFollowLead::Current,
+        });
+        assert!(app.storm_tracking_active());
+
+        app.clear_camera_follow_targets();
+        assert!(!app.storm_tracking_active());
     }
 
     fn test_nws_product_summary(index: usize, issuance_time: DateTime<Utc>) -> NwsProductSummary {

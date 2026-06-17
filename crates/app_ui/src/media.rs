@@ -34,9 +34,11 @@ const RECORD_SETTLE_FRAMES: u8 = 2;
 const RECORD_RENDER_TIMEOUT_FRAMES: u32 = 1_200;
 /// Updates to wait for the screenshot event before aborting the recording.
 const RECORD_CAPTURE_TIMEOUT_FRAMES: u32 = 600;
-/// Free/manual recordings are meant for panning, zooming, and scrubbing the
-/// UI. 10 fps keeps files reasonable while still feeling like motion.
-const FREE_RECORD_FRAME_DELAY_MS: u32 = 100;
+/// Free/manual recordings are meant for panning, zooming, and scrubbing the UI.
+const DEFAULT_RECORD_FPS: u16 = 30;
+const RECORD_FPS_CHOICES: [u16; 5] = [10, 15, 24, 30, 60];
+const RECORD_FPS_MIN: u16 = 1;
+const RECORD_FPS_MAX: u16 = 60;
 /// GIF quantizer speed (1 = best/slowest, 30 = worst/fastest). The `image`
 /// crate feeds this to NeuQuant (Dekker 1994, "Kohonen neural networks for
 /// optimal colour quantization", Network: Computation in Neural Systems).
@@ -155,12 +157,17 @@ struct FreeRecorderState {
     frames: usize,
     phase: FreeRecorderPhase,
     next_capture_at: Instant,
+    last_capture_at: Option<Instant>,
+    frame_delay_ms: u32,
     frame_tx: mpsc::Sender<EncoderMsg>,
     format: ResolvedRecordFormat,
 }
 
 enum EncoderMsg {
-    Frame(Arc<egui::ColorImage>),
+    Frame {
+        image: Arc<egui::ColorImage>,
+        repeat: usize,
+    },
     Finish,
     Abort,
 }
@@ -176,6 +183,7 @@ pub(crate) struct MediaShare {
     pub(crate) last_map_rect: Option<egui::Rect>,
     record_size: RecordSize,
     record_format: RecordFormat,
+    record_fps: u16,
     /// Lazily detected on first record; `ffmpeg -version` on PATH.
     ffmpeg_available: Option<bool>,
     recorder: Option<RecorderState>,
@@ -191,6 +199,7 @@ impl Default for MediaShare {
             last_map_rect: None,
             record_size: RecordSize::Small720,
             record_format: RecordFormat::Auto,
+            record_fps: DEFAULT_RECORD_FPS,
             ffmpeg_available: None,
             recorder: None,
             free_recorder: None,
@@ -199,8 +208,23 @@ impl Default for MediaShare {
 }
 
 impl MediaShare {
+    pub(crate) fn with_record_fps(record_fps: u16) -> Self {
+        Self {
+            record_fps: normalize_record_fps(record_fps),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn is_recording(&self) -> bool {
         self.recorder.is_some() || self.free_recorder.is_some()
+    }
+
+    fn normalized_record_fps(&self) -> u16 {
+        normalize_record_fps(self.record_fps)
+    }
+
+    fn free_record_frame_delay_ms(&self) -> u32 {
+        frame_delay_ms_for_fps(self.normalized_record_fps())
     }
 }
 
@@ -401,6 +425,25 @@ impl ViewerApp {
                 })
                 .response
                 .on_hover_text("Auto = MP4 when ffmpeg is on PATH, otherwise GIF");
+            let before_fps = self.media.record_fps;
+            egui::ComboBox::from_id_salt("media_record_fps")
+                .selected_text(format!("{}fps", self.media.normalized_record_fps()))
+                .width(62.0)
+                .show_ui(ui, |ui| {
+                    for fps in RECORD_FPS_CHOICES {
+                        ui.selectable_value(&mut self.media.record_fps, fps, format!("{fps}fps"));
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Free recording capture/playback FPS. Loop recording still follows \
+                     the loop speed setting so radar-frame exports match playback.",
+                );
+            self.media.record_fps = normalize_record_fps(self.media.record_fps);
+            if self.media.record_fps != before_fps {
+                self.app_settings.record_fps = self.media.record_fps;
+                let _ = self.app_settings.save();
+            }
         });
     }
 
@@ -437,6 +480,7 @@ impl ViewerApp {
             // The persisted loop speed: a recording plays back at exactly
             // the on-screen cadence (field request: speed control).
             frame_delay_ms: self.loop_frame_ms() as u32,
+            frame_rate_fps: None,
             out_path: path,
             result_tx: self.media.result_tx.clone(),
             repaint_ctx: ctx.clone(),
@@ -485,10 +529,13 @@ impl ViewerApp {
                 return;
             }
         };
+        let record_fps = self.media.normalized_record_fps();
+        let frame_delay_ms = self.media.free_record_frame_delay_ms();
         let frame_tx = spawn_loop_encoder(LoopEncodeJob {
             format,
             max_width: self.media.record_size.max_width(),
-            frame_delay_ms: FREE_RECORD_FRAME_DELAY_MS,
+            frame_delay_ms,
+            frame_rate_fps: Some(record_fps),
             out_path: path,
             result_tx: self.media.result_tx.clone(),
             repaint_ctx: ctx.clone(),
@@ -497,13 +544,18 @@ impl ViewerApp {
             frames: 0,
             phase: FreeRecorderPhase::Ready,
             next_capture_at: Instant::now(),
+            last_capture_at: None,
+            frame_delay_ms,
             frame_tx,
             format,
         });
         self.status = if mp4_fallback {
             "ffmpeg not found on PATH; free recording as GIF instead...".to_owned()
         } else {
-            format!("Free recording as {}... Ctrl+F12 to stop", format.label())
+            format!(
+                "Free recording as {} at {record_fps}fps... Ctrl+F12 to stop",
+                format.label()
+            )
         };
         ctx.request_repaint();
     }
@@ -602,7 +654,9 @@ impl ViewerApp {
         let Some(recorder) = self.media.recorder.as_mut() else {
             return;
         };
-        let _ = recorder.frame_tx.send(EncoderMsg::Frame(image));
+        let _ = recorder
+            .frame_tx
+            .send(EncoderMsg::Frame { image, repeat: 1 });
         recorder.cursor += 1;
         if recorder.cursor >= recorder.total {
             self.finish_recording(ctx);
@@ -612,8 +666,8 @@ impl ViewerApp {
         }
     }
 
-    /// Drives the free/manual recorder: one full-window screenshot every
-    /// FREE_RECORD_FRAME_DELAY_MS until the user stops it.
+    /// Drives the free/manual recorder at the selected viewport-recording FPS
+    /// until the user stops it.
     fn drive_free_recorder(&mut self, ctx: &egui::Context) {
         let Some(recorder) = self.media.free_recorder.as_mut() else {
             return;
@@ -658,12 +712,22 @@ impl ViewerApp {
         let Some(recorder) = self.media.free_recorder.as_mut() else {
             return;
         };
-        let _ = recorder.frame_tx.send(EncoderMsg::Frame(image));
+        let now = Instant::now();
+        let repeat = recorder
+            .last_capture_at
+            .map(|last| {
+                frame_repeat_for_elapsed(
+                    now.saturating_duration_since(last),
+                    recorder.frame_delay_ms,
+                )
+            })
+            .unwrap_or(1);
+        recorder.last_capture_at = Some(now);
+        let _ = recorder.frame_tx.send(EncoderMsg::Frame { image, repeat });
         recorder.frames += 1;
         recorder.phase = FreeRecorderPhase::Ready;
-        recorder.next_capture_at =
-            Instant::now() + Duration::from_millis(FREE_RECORD_FRAME_DELAY_MS as u64);
-        ctx.request_repaint_after(Duration::from_millis(FREE_RECORD_FRAME_DELAY_MS as u64));
+        recorder.next_capture_at = now + Duration::from_millis(u64::from(recorder.frame_delay_ms));
+        ctx.request_repaint_after(Duration::from_millis(u64::from(recorder.frame_delay_ms)));
     }
 
     /// Ends the recording (loop complete or user pressed Stop) and hands the
@@ -745,6 +809,7 @@ struct LoopEncodeJob {
     format: ResolvedRecordFormat,
     max_width: u32,
     frame_delay_ms: u32,
+    frame_rate_fps: Option<u16>,
     out_path: PathBuf,
     result_tx: mpsc::Sender<MediaResult>,
     repaint_ctx: egui::Context,
@@ -776,13 +841,16 @@ fn run_loop_encoder(job: &LoopEncodeJob, frame_rx: &mpsc::Receiver<EncoderMsg>) 
     let mut frames = 0_usize;
     loop {
         match frame_rx.recv() {
-            Ok(EncoderMsg::Frame(image)) => {
-                if let Err(err) = sink.push(&image) {
-                    drain_until_end(frame_rx);
-                    sink.discard(&job.out_path);
-                    return Some(format!("Recording failed: {err}"));
+            Ok(EncoderMsg::Frame { image, repeat }) => {
+                let repeat = repeat.max(1);
+                for _ in 0..repeat {
+                    if let Err(err) = sink.push(&image) {
+                        drain_until_end(frame_rx);
+                        sink.discard(&job.out_path);
+                        return Some(format!("Recording failed: {err}"));
+                    }
                 }
-                frames += 1;
+                frames += repeat;
             }
             Ok(EncoderMsg::Finish) => {
                 return Some(match sink.finish(&job.out_path) {
@@ -833,6 +901,7 @@ impl LoopSink {
                 job.out_path.clone(),
                 job.max_width,
                 job.frame_delay_ms,
+                job.frame_rate_fps,
             ))),
         }
     }
@@ -909,16 +978,23 @@ struct FfmpegSink {
     out_path: PathBuf,
     max_width: u32,
     frame_delay_ms: u32,
+    frame_rate_fps: Option<u16>,
     locked_dims: Option<(u32, u32)>,
     child: Option<Child>,
 }
 
 impl FfmpegSink {
-    fn new(out_path: PathBuf, max_width: u32, frame_delay_ms: u32) -> Self {
+    fn new(
+        out_path: PathBuf,
+        max_width: u32,
+        frame_delay_ms: u32,
+        frame_rate_fps: Option<u16>,
+    ) -> Self {
         Self {
             out_path,
             max_width,
             frame_delay_ms,
+            frame_rate_fps,
             locked_dims: None,
             child: None,
         }
@@ -928,7 +1004,13 @@ impl FfmpegSink {
         let frame = scaled_record_frame(image, self.max_width, &mut self.locked_dims)?;
         if self.child.is_none() {
             let (width, height) = frame.dimensions();
-            let args = ffmpeg_encode_args(width, height, self.frame_delay_ms, &self.out_path);
+            let args = ffmpeg_encode_args(
+                width,
+                height,
+                self.frame_delay_ms,
+                self.frame_rate_fps,
+                &self.out_path,
+            );
             let mut command = Command::new("ffmpeg");
             command
                 .args(&args)
@@ -995,11 +1077,14 @@ fn scaled_record_frame(
     if frame.dimensions() == (target_width, target_height) {
         return Ok(frame);
     }
+    if width.saturating_sub(target_width) <= 1 && height.saturating_sub(target_height) <= 1 {
+        return Ok(image::imageops::crop_imm(&frame, 0, 0, target_width, target_height).to_image());
+    }
     Ok(image::imageops::resize(
         &frame,
         target_width,
         target_height,
-        image::imageops::FilterType::Triangle,
+        image::imageops::FilterType::Lanczos3,
     ))
 }
 
@@ -1016,9 +1101,13 @@ fn ffmpeg_encode_args(
     width: u32,
     height: u32,
     frame_delay_ms: u32,
+    frame_rate_fps: Option<u16>,
     out_path: &Path,
 ) -> Vec<std::ffi::OsString> {
     let delay = frame_delay_ms.max(1);
+    let framerate = frame_rate_fps
+        .map(|fps| fps.to_string())
+        .unwrap_or_else(|| format!("1000/{delay}"));
     [
         "-hide_banner",
         "-loglevel",
@@ -1031,7 +1120,7 @@ fn ffmpeg_encode_args(
         "-video_size",
         &format!("{width}x{height}"),
         "-framerate",
-        &format!("1000/{delay}"),
+        &framerate,
         "-i",
         "-",
         "-c:v",
@@ -1039,7 +1128,7 @@ fn ffmpeg_encode_args(
         "-pix_fmt",
         "yuv420p",
         "-crf",
-        "20",
+        "18",
         "-movflags",
         "+faststart",
     ]
@@ -1047,6 +1136,21 @@ fn ffmpeg_encode_args(
     .map(std::ffi::OsString::from)
     .chain(std::iter::once(out_path.as_os_str().to_owned()))
     .collect()
+}
+
+pub(crate) fn normalize_record_fps(fps: u16) -> u16 {
+    fps.clamp(RECORD_FPS_MIN, RECORD_FPS_MAX)
+}
+
+fn frame_delay_ms_for_fps(fps: u16) -> u32 {
+    let fps = normalize_record_fps(fps);
+    ((1000.0 / f32::from(fps)).round() as u32).max(1)
+}
+
+fn frame_repeat_for_elapsed(elapsed: Duration, frame_delay_ms: u32) -> usize {
+    let frame_delay_ms = frame_delay_ms.max(1) as f64;
+    let repeat = (elapsed.as_secs_f64() * 1000.0 / frame_delay_ms).round() as usize;
+    repeat.clamp(1, 300)
 }
 
 /// True when `ffmpeg -version` succeeds on PATH.
@@ -1271,8 +1375,23 @@ mod tests {
     }
 
     #[test]
+    fn native_odd_sized_recording_crops_instead_of_resampling() {
+        let pixels = (0..9)
+            .map(|index| egui::Color32::from_rgb(index as u8, 0, 0))
+            .collect::<Vec<_>>();
+        let image = egui::ColorImage::new([3, 3], pixels);
+        let mut locked_dims = None;
+
+        let frame = scaled_record_frame(&image, u32::MAX, &mut locked_dims).unwrap();
+
+        assert_eq!(frame.dimensions(), (2, 2));
+        assert_eq!(frame.get_pixel(0, 0).0, [0, 0, 0, 255]);
+        assert_eq!(frame.get_pixel(1, 1).0, [4, 0, 0, 255]);
+    }
+
+    #[test]
     fn ffmpeg_args_request_compatible_h264() {
-        let args = ffmpeg_encode_args(1280, 720, 700, Path::new("out.mp4"));
+        let args = ffmpeg_encode_args(1280, 720, 700, None, Path::new("out.mp4"));
         let args: Vec<String> = args
             .iter()
             .map(|value| value.to_string_lossy().into_owned())
@@ -1283,6 +1402,33 @@ mod tests {
         assert!(args.contains(&"libx264".to_owned()));
         assert!(args.contains(&"yuv420p".to_owned()));
         assert_eq!(args.last(), Some(&"out.mp4".to_owned()));
+    }
+
+    #[test]
+    fn ffmpeg_args_use_exact_free_record_fps_when_requested() {
+        let args = ffmpeg_encode_args(1280, 720, 33, Some(30), Path::new("out.mp4"));
+        let args: Vec<String> = args
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(args.contains(&"30".to_owned()));
+        assert!(!args.contains(&"1000/33".to_owned()));
+    }
+
+    #[test]
+    fn record_fps_is_clamped_and_converted_to_frame_delay() {
+        assert_eq!(normalize_record_fps(0), 1);
+        assert_eq!(normalize_record_fps(30), 30);
+        assert_eq!(normalize_record_fps(500), 60);
+        assert_eq!(frame_delay_ms_for_fps(30), 33);
+    }
+
+    #[test]
+    fn late_free_record_captures_repeat_frames_to_preserve_wall_time() {
+        assert_eq!(frame_repeat_for_elapsed(Duration::from_millis(16), 16), 1);
+        assert_eq!(frame_repeat_for_elapsed(Duration::from_millis(33), 16), 2);
+        assert_eq!(frame_repeat_for_elapsed(Duration::from_millis(100), 16), 6);
     }
 
     #[test]
