@@ -4,7 +4,7 @@ Goal: make BowEcho as robust, fluid, and workflow-complete as practical. This is
 
 ## Baseline
 
-- Worktree: `C:\Users\drew\radar-work\wt-codex-robustness`
+- Worktree: local Codex robustness worktree
 - Branch: `codex/robustness-overhaul`
 - Base commit: `d2071d2 v0.21.2`
 - Seeded changes: current Codex map/hazard patch, including archive progress/event-click loading, place search state labels, per-pane info bars, debug cases, Vrot hardening, and SPC valid-now Day 1 fix.
@@ -51,10 +51,7 @@ Goal: make BowEcho as robust, fluid, and workflow-complete as practical. This is
 - Full app UI test: `cargo test -p app_ui` passed with `358 passed; 0 failed; 10 ignored` in `src/main.rs`, plus the `src/lib.rs` pane test.
 - Full data-source test: `cargo test -p data_source` passed with `87 passed; 0 failed; 4 ignored`.
 - Release build: `cargo build --release -p app_ui` completed after the cached event-frame progress cleanup, cached-track overlay planning, archive busy-load intent preservation, Clippy cleanup, Documentation workflow cleanup, stale Settings tooltip cleanup, radar-age customization, loaded-site marker arc, radar-label toggle, Space loop play/pause shortcut, v0.22.0 version bump, dynamic macOS bundle versioning, international ODIM/merge/startup fixes, custom poll-link, GR radar GIS import, split-product cut/product selection, copy-diagnostics, international place-search, WGPU fallback notice, ORD same-elevation planner, and link-only custom poll slices.
-- Codex executables:
-  - `C:\Users\drew\radar-work\wt-codex-robustness\target\release\bowecho-codex-robustness.exe`
-  - `C:\Users\drew\radar-work\wt-codex-robustness\target\release\bowecho-codex.exe`
-- SHA256: `3B13F799D7CD5392D7C797855CE81F639C17AC87C6E0D076FCCEC073F5685810`
+- Local release test builds were produced for the robustness branch. Official release provenance belongs to the GitHub Actions artifacts and matching `.sha256` files on tagged releases.
 
 ## Already Present In Current App
 

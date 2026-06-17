@@ -74,6 +74,14 @@ Compare the hash with the matching `.sha256` file on the release page. For
 signing status, false-positive guidance, and responsible disclosure, see
 [docs/SIGNING.md](docs/SIGNING.md) and [SECURITY.md](SECURITY.md).
 
+The `docs/` tree also preserves curated AI-assisted engineering records:
+design rationale, literature checks, adversarial verification notes, and
+handoffs. See
+[docs/ai-assisted-engineering-process.md](docs/ai-assisted-engineering-process.md)
+for what is intentionally kept public and
+[docs/public-docs-hygiene.md](docs/public-docs-hygiene.md) for the publication
+checklist.
+
 ## Quick start (storm mode)
 
 1. Launch BowEcho. Pick a radar site from the sidebar (or right-click any site

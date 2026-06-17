@@ -1,6 +1,6 @@
 # Fastest Radar — UI Revamp & Warning-Desk Parity (Design / Plan of Record)
 
-Date: 2026-06-09 · Status: approved-by-owner-directive (autonomous execution) · Branch: `fix/region-based-velocity-dealias` → feature branches per sub-project
+Date: 2026-06-09 · Status: approved plan of record · Branch: `fix/region-based-velocity-dealias` → feature branches per sub-project
 
 ## North Star
 
@@ -29,7 +29,7 @@ et al. 2016); live NWS/SPC hazard polygons with parsed attributes; up to 10
 multi-radar overlay layers; vector basemap + site catalog; AWS live-chunk +
 archive ingest with rayon-parallel decode; honest perf telemetry.
 
-## Locked decisions (owner delegated; not asking)
+## Locked design decisions
 
 - **Feel:** GR2 warning-desk ergonomics, RadarScope-grade speed. Dark theme,
   dense layout, keyboard-first, multi-pane.
@@ -135,9 +135,9 @@ Plus shared-infra: **SP0a beam-height geometry**, **SP0b smoothing sampler**,
 - Threshold/mask are render-time sampler clamps (cheaper, not extra passes).
 - Telemetry stays honest (per-stage timings already exist; extend per pane).
 
-## Delivered (autonomous session 2026-06-09)
+## Delivered in implementation session 2026-06-09
 
-Shipped + committed to `main`, ~189 tests green, clippy clean, exe on Desktop:
+Shipped + committed to `main`, with the focused test suite green, clippy clean, and a local release test build produced:
 
 - **Shared infra:** 4/3-Earth beam height/ground-range (`radar_core`); inspector
   now shows beam height (m/kft).

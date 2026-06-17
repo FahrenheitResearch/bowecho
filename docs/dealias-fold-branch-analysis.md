@@ -7,7 +7,7 @@ polygon where RadarScope (dealiased) showed uniform inbound flow. Transient —
 gone the next volume.
 
 ## Reproduction
-`KMBX20260609_235423_V06` (kept at `radar-work/data/`). The
+`KMBX20260609_235423_V06` (kept in a local data cache). The
 `dealias_blob_probe` example finds the failure:
 
 ```

@@ -63,13 +63,10 @@ Azure Trusted Signing is the preferred CI-friendly path.
 2. Create a Microsoft Entra app registration with a client secret.
 3. Grant that app the `Trusted Signing Certificate Profile Signer` role on the
    Trusted Signing account/profile.
-4. Add these GitHub Actions secrets to `FahrenheitResearch/bowecho`:
-   - `AZURE_TENANT_ID`
-   - `AZURE_CLIENT_ID`
-   - `AZURE_CLIENT_SECRET`
-   - `AZURE_TS_ENDPOINT`, for example `https://eus.codesigning.azure.net`
-   - `AZURE_TS_ACCOUNT`
-   - `AZURE_TS_PROFILE`
+4. Add the GitHub Actions secrets consumed by the release workflow for the
+   Azure tenant, client identity, client credential, Trusted Signing endpoint,
+   account, and certificate profile. The workflow file is the source of truth
+   for exact secret names.
 
 The release workflow is already scaffolded to sign Windows binaries when those
 secrets exist. Without them, the signing step is skipped.
@@ -84,12 +81,10 @@ if this path is chosen.
 2. Create a Developer ID Application certificate and export it from Keychain
    Access as a password-protected `.p12`.
 3. Create an App Store Connect API key for notarization.
-4. Add these GitHub Actions secrets:
-   - `MACOS_CERTIFICATE_BASE64`
-   - `MACOS_CERTIFICATE_PWD`
-   - `ASC_API_KEY_BASE64`
-   - `ASC_KEY_ID`
-   - `ASC_ISSUER_ID`
+4. Add the GitHub Actions secrets consumed by the release workflow for the
+   Developer ID certificate, certificate password, App Store Connect API key,
+   key id, and issuer id. The workflow file is the source of truth for exact
+   secret names.
 
 The release workflow imports the certificate, signs the `.app`, submits it to
 Apple notarization, staples the ticket, and then zips the app when those

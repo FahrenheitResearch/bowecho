@@ -3,7 +3,7 @@
 # Objective analysis for bowecho: blending surface obs with an HRRR 3-km background
 ## Implementation spec (Rust, ~5-minute re-analysis cadence)
 
-All equations below were verified against the primary papers (full-text or page scans), not from memory. Local copies of every source live in `C:\Users\drew\radar-work\bowecho\.research_tmp\` (`koch1983.pdf` + page PNGs, `bratseth_p1..9.png` page scans of the Tellus paper, `lazarus2002.pdf/.txt`, `myrick2005.pdf/.txt`, `tyndall2013.pdf/.txt`, `depondeca2011.pdf/.txt`, `bouttier_courtier_clean.txt`). Equation numbers cited are the papers' own.
+All equations below were verified against the primary papers (full-text or page scans), not from memory. Local research-cache copies included Koch 1983, Bratseth 1986, Lazarus 2002, Myrick 2005, Tyndall & Horel 2013, De Pondeca 2011, and Bouttier & Courtier materials. Equation numbers cited are the papers' own.
 
 ---
 
@@ -344,7 +344,7 @@ Validation checklist (all reproduce published results):
 ## OPERATIONAL PRACTICE
 # Operational Surface Mesoanalysis Systems — Practice Spec for the bowecho OBS ARC
 
-Source documents downloaded and text-extracted to `C:\Users\drew\radar-work\_meso_research\` (depondeca2011.pdf, tyndall2013_v2.pdf, coniglio2012.pdf, morris2020.pdf, madaus2014.pdf, madis_sfc_qc_2005.html, coniglio2022_view.html). Local pipeline assessed: `C:\Users\drew\hrrr-mesoanalysis\mesoanalysis\obs\qc.py`, `C:\Users\drew\hrrr-mesoanalysis\mesoanalysis\analysis\barnes.py`.
+Source documents were downloaded and text-extracted into a local research cache (De Pondeca 2011, Tyndall & Horel 2013, Coniglio 2012, Morris 2020, Madaus 2014, MADIS surface QC docs, and Coniglio & Jewell 2022). A separate external reference implementation was assessed at `<external reference implementation>/mesoanalysis/obs/qc.py` and `<external reference implementation>/mesoanalysis/analysis/barnes.py`.
 
 ---
 
@@ -512,7 +512,7 @@ Published practice is **station-withholding cross-validation against the analysi
 ## VERIFICATION: SCHEMES
 # Adversarial verification of the bowecho objective-analysis spec
 
-Every formula and constant was re-checked against the primary sources in `C:\Users\drew\radar-work\bowecho\.research_tmp\` (Koch 1983 page scans `koch_p3..p7.png` = pp. 1489–1493; Bratseth 1986 scans `bratseth_p1..p9.png` = pp. 439–447; full texts of Lazarus 2002, Myrick 2005, Tyndall & Horel 2013, De Pondeca 2011, Bouttier & Courtier, and `rtma_preprint.txt`), with zoomed crops where OCR was absent, plus web cross-checks of bibliographic metadata ([AMS record for Koch et al. 1983](https://journals.ametsoc.org/view/journals/apme/22/9/1520-0450_1983_022_1487_aiboma_2_0_co_2.xml), [Wiley record for Bratseth 1986](https://onlinelibrary.wiley.com/doi/abs/10.1111/j.1600-0870.1986.tb00476.x), [Tellus archive copy](https://tellusjournal.org/articles/10.3402/tellusa.v38i5.11730)). Verdict: the spec is overwhelmingly faithful — the Bratseth weight normalization, the ADAS concrete form, the ITT, and all RTMA/Tyndall tables check out exactly — but there are **3 hard errors, 3 substantive mischaracterizations, and several unsourced constants**.
+Every formula and constant was re-checked against the primary sources in a local research cache (Koch 1983 page scans, Bratseth 1986 scans, full texts of Lazarus 2002, Myrick 2005, Tyndall & Horel 2013, De Pondeca 2011, Bouttier & Courtier, and an RTMA preprint), with zoomed crops where OCR was absent, plus web cross-checks of bibliographic metadata ([AMS record for Koch et al. 1983](https://journals.ametsoc.org/view/journals/apme/22/9/1520-0450_1983_022_1487_aiboma_2_0_co_2.xml), [Wiley record for Bratseth 1986](https://onlinelibrary.wiley.com/doi/abs/10.1111/j.1600-0870.1986.tb00476.x), [Tellus archive copy](https://tellusjournal.org/articles/10.3402/tellusa.v38i5.11730)). Verdict: the spec is overwhelmingly faithful — the Bratseth weight normalization, the ADAS concrete form, the ITT, and all RTMA/Tyndall tables check out exactly — but there are **3 hard errors, 3 substantive mischaracterizations, and several unsourced constants**.
 
 ## A. WRONG — must fix
 
@@ -566,7 +566,7 @@ The architecture-level claims the task flagged for special attention all survive
 ## VERIFICATION: OPERATIONAL
 # Adversarial Verification — Operational Surface Mesoanalysis Spec (bowecho OBS ARC)
 
-Verified against the primary texts in `C:\Users\drew\radar-work\_meso_research\` (null-stripped copies `*_nn.txt` created; plus newly fetched `bothwell2002.pdf/.txt`, `steeves.txt`, `coniglio2022.txt`, `madis_sfc_qc.txt`), the live SPC help page, and the local code (`C:\Users\drew\hrrr-mesoanalysis\mesoanalysis\obs\qc.py`, `...\analysis\barnes.py`).
+Verified against primary texts in a local research cache (including Bothwell 2002, Steeves, Coniglio & Jewell 2022, and MADIS surface QC references), the live SPC help page, and the external reference implementation (`<external reference implementation>/mesoanalysis/obs/qc.py`, `<external reference implementation>/mesoanalysis/analysis/barnes.py`).
 
 ## Bottom line
 
@@ -623,4 +623,3 @@ The spec is **substantially accurate**. All three priority areas check out again
 2. The :45 SFCOA "final" run QCs against the RUC **analysis** rather than the 1-h forecast — a free accuracy upgrade bowecho can copy when HRRR analyses are available.
 3. De Pondeca: actual obs error is **inflated for duplicates and in response to MADIS flags** — duplicate handling matters once CWOP+NWS+mesonet feeds overlap (same station via multiple aggregators).
 4. Tyndall's note that Mount-Rainier-type sensor-vs-grid elevation mismatch is exactly what the variability term protects — supports the spec's bilinear-near-coasts caveat and suggests also skipping the gross check where |station − grid elevation| is extreme for T (not just pressure).
-

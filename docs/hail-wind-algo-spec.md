@@ -4,7 +4,7 @@
 
 **Status of verification:** every constant below was checked against the primary literature (full text of Murillo & Homeyer 2019 via PMC, the 2021 AMS corrigendum, NOAA/WDTD official WSR-88D product documentation, Forcadell et al. 2024 restatement) and cross-checked against the reference implementation `pyhail` (github.com/joshua-wx/pyhail, `src/pyhail/mesh_grid.py`, `mesh_formulas.py`, `hsda.py`, `hsda_mf.py`). One **critical trap** was found and resolved (§2).
 
-**Existing code this builds on:** `C:\Users\drew\radar-work\radar-rs-analyst\crates\render2d\src\volumetric.rs` — `mehs_grid()` (line 351) already implements Witt-MESH correctly on the shared `CutColumn`/`column_profile` ground-location column walk; `vil_grid()` (295), `echo_top_grid()` (254), 4/3-Earth beam height in `radar_core`. The work is: refactor `mehs_grid` into a hail-products walk that emits **SHI + MESH (3 calibrations) + POSH**, add **POH** (one-liner on existing echo tops), wire **H0/H−20 from HRRR soundings**, and (phase 2) HSDA.
+**Existing code this builds on:** `crates/render2d/src/volumetric.rs` — `mehs_grid()` already implements Witt-MESH correctly on the shared `CutColumn`/`column_profile` ground-location column walk; `vil_grid()`, `echo_top_grid()`, and 4/3-Earth beam height in `radar_core` provide the rest of the foundation. The work is: refactor `mehs_grid` into a hail-products walk that emits **SHI + MESH (3 calibrations) + POSH**, add **POH** (one-liner on existing echo tops), wire **H0/H−20 from HRRR soundings**, and (phase 2) HSDA.
 
 ---
 
@@ -445,7 +445,7 @@ Reuse cells/VIL/echo-tops/LLSD to compute, per cell per volume, the parameters D
 - Atkins & Wakimoto 1991, *WAF* **6**, 470–482 — Δθe ≥ 20 K / ≤ 13 K; Wheeler & Spratt 1996 (NWS SR Tech Memo 163) + AMU report — MDPI, CT = 30 K.
 - NWS operational: weather.gov/lmk/squallbow (MARC > 50 kt, 3–7 km, 15–20-min lead); WDTB AWOC Severe Track FY10 QLCS lesson (mesovortex context: tornadic mesovortices mean Vr ≈ 12 m/s low-level, azshear > 10×10⁻³ s⁻¹, ~2-km diameter — optional companion product riding existing azShear).
 
-Local artifacts from this session: DDPDA full text `C:\Users\drew\AppData\Local\Temp\ddpda.pdf` (+ extracted text at `C:\Users\drew\.claude\projects\C--Users-drew\2c09b16f-3f0d-478d-b6dc-78d5612dd641\tool-results\b4vb0zaeo.txt`), Kuster `kuster.pdf`, Sherburn `wgr.pdf`, Krupar `krupar.pdf` in the same Temp dir; AWOC QLCS + Wheeler/Spratt memo PDFs under `C:\Users\drew\.claude\projects\C--Users-drew\...\tool-results\`.
+Verification used local extraction artifacts while the spec was written; those private machine and tool-output paths are intentionally omitted from the public record.
 
 ## WIND PAPERS
 - Schmocker, G. K., R. W. Przybylinski, and Y.-J. Lin, 1996: Forecasting the initial onset of damaging downburst winds associated with a mesoscale convective system (MCS) using the mid-altitude radial convergence (MARC) signature. Preprints, 15th Conf. on Weather Analysis and Forecasting, Norfolk VA, AMS, 306-311
@@ -470,7 +470,7 @@ Local artifacts from this session: DDPDA full text `C:\Users\drew\AppData\Local\
 ## HAIL VERIFICATION
 # Adversarial verification of the hail-algorithm spec — findings
 
-**Method.** Verified against primary sources directly: Witt et al. (1998) full text (AMS, fetched verbatim), Murillo & Homeyer (2019) full text (PMC8050948, verbatim HTML grep), the 2021 AMS Corrigendum (JAMC-D-20-0271.1, verbatim), Murillo/Homeyer/Allen (2021) Table 1 (PMC8050942), Ortega et al. (2016) full text (AMS, verbatim), Cintineo et al. (2012) full text (AMS), WDTD SHI/POSH pages, Forcadell et al. (2024, AMT), Aregger et al.-type AMT 17:4529 (Foote POH polynomial), and a fresh clone of pyhail (`C:\Users\drew\AppData\Local\Temp\pyhail\src\pyhail\` — `mesh_grid.py`, `mesh_formulas.py`, `hsda.py`, `hsda_mf.py`, `hdr.py`).
+**Method.** Verified against primary sources directly: Witt et al. (1998) full text (AMS, fetched verbatim), Murillo & Homeyer (2019) full text (PMC8050948, verbatim HTML grep), the 2021 AMS Corrigendum (JAMC-D-20-0271.1, verbatim), Murillo/Homeyer/Allen (2021) Table 1 (PMC8050942), Ortega et al. (2016) full text (AMS), Cintineo et al. (2012) full text (AMS), WDTD SHI/POSH pages, Forcadell et al. (2024, AMT), Aregger et al.-type AMT 17:4529 (Foote POH polynomial), and pyhail source files (`mesh_grid.py`, `mesh_formulas.py`, `hsda.py`, `hsda_mf.py`, `hdr.py`).
 
 **Bottom line.** The load-bearing numerics (Witt Ė/W(Z)/W_T/SHI/POSH/MESH constants, corrigendum coefficients 15.096/0.206 and 22.157/0.212, HSDA membership tables, HDR constants, the analytic unit test) are **correct**. Found **3 wrong constants/claims**, **3 wrong attributions**, and **4 provenance/semantics problems** that should be fixed before implementation.
 
@@ -544,15 +544,15 @@ Local artifacts from this session: DDPDA full text `C:\Users\drew\AppData\Local\
 4. pyhail clips dBZ to ±100 (spec's claim ✓, `mesh_grid.py:294-295`).
 
 ## Files
-- pyhail reference clone: `C:\Users\drew\AppData\Local\Temp\pyhail\src\pyhail\` (mesh_grid.py, mesh_formulas.py, hsda.py, hsda_mf.py, hdr.py)
-- Verbatim source dumps: `C:\Users\drew\AppData\Local\Temp\{mh19,corr,witt98,ortega16,cintineo12}.html`
-- Spec implementation target (unchanged): `C:\Users\drew\radar-work\radar-rs-analyst\crates\render2d\src\volumetric.rs`
+- pyhail reference files checked: `mesh_grid.py`, `mesh_formulas.py`, `hsda.py`, `hsda_mf.py`, `hdr.py`
+- Public source references: primary papers, NOAA/WDTD pages, and DOI/URL citations listed above
+- Spec implementation target (unchanged): `crates/render2d/src/volumetric.rs`
 
 
 ## WIND VERIFICATION
 # Adversarial Verification of the Damaging-Wind Algorithm Spec
 
-Verified 2026-06-10 against primary full texts (local PDFs: `C:\Users\drew\AppData\Local\Temp\ddpda.pdf`, `kuster.pdf`, `wgr.pdf`, `krupar.pdf`; freshly fetched: NWS SR-163 memo, NASA AMU CR-201354, AWOC FY10 QLCS lesson — text extractions saved alongside) plus NWS LMK operational pages and AMS records.
+Verified 2026-06-10 against primary full texts (DDPDA, Kuster, Sherburn, Krupar, NWS SR-163, NASA AMU CR-201354, and AWOC FY10 QLCS lesson), plus NWS LMK operational pages and AMS records.
 
 **Bottom line: the spec is substantially correct.** Every Rust constant in §2.1–§2.3 traces to its claimed source verbatim. I found **1 outright factual error** (Krupar gust-ratio attribution), **2 misattributions/omissions** (MDPI citation + missing 650–500-mb layer; WINDEX zero-floor convention presented as published), and **5 nuances** that should be corrected before the constants ship in doc-comments.
 
@@ -638,4 +638,4 @@ The formula, units (kt), and **R_Q = Q_L/12 capped at 1** verify against McCann 
 5. Add DDPDA footnote: lead times are medians of means, capped at 15 min by the scoring method.
 6. Add single-case caveat to the AWOC mesovortex companion-product numbers.
 
-Sources: [NWS LMK squallbow](https://www.weather.gov/lmk/squallbow), [Funk/DeWald/Lin 14 May 1995 case](https://www.weather.gov/lmk/paper-51495), [SLU/COMET MARC research summary](https://www.comet.ucar.edu/sites/default/files/outreach/media/documents/9671862.htm), [Wilson et al. 1984 (AMS)](https://journals.ametsoc.org/view/journals/apme/23/6/1520-0450_1984_023_0898_mwsaeo_2_0_co_2.xml), [Roberts & Wilson 1989 (AMS)](https://journals.ametsoc.org/view/journals/apme/28/4/1520-0450_1989_028_0285_apmnpu_2_0_co_2.xml), [Hjelmfelt 1988 (AMS)](https://journals.ametsoc.org/view/journals/apme/27/8/1520-0450_1988_027_0900_salcom_2_0_co_2.xml), [Ibrahim et al. 2023 (AMS)](https://journals.ametsoc.org/view/journals/atot/40/2/JTECH-D-22-0028.1.xml), [Kuster et al. 2021 (AMS)](https://journals.ametsoc.org/view/journals/wefo/36/4/WAF-D-21-0005.1.xml), [McCann 1994 (AMS)](https://journals.ametsoc.org/view/journals/wefo/9/4/1520-0434_1994_009_0532_wniffm_2_0_co_2.xml), [Atkins & Wakimoto 1991 (AMS)](https://journals.ametsoc.org/view/journals/wefo/6/4/1520-0434_1991_006_0470_wmaots_2_0_co_2.xml), [NWS SR-163 (Wheeler & Spratt)](https://www.weather.gov/media/mlb/research/SR_TechMemo163.pdf), [AMU CR-201354 MDPI/WINDEX report](https://kscweather.ksc.nasa.gov/amu/files/final-reports/mdpi-windex.pdf), [AWOC Severe FY10 QLCS lesson](https://training.weather.gov/wdtd/courses/woc/documentation/severe/qlcs.pdf). Local full texts: `ddpda.pdf`, `kuster.pdf`, `wgr.pdf`, `krupar.pdf` in `C:\Users\drew\AppData\Local\Temp\` (extractions `*_text.txt` same dir); `sr163_text.txt`, `amu_mdpi_text.txt`, `awoc_qlcs_text.txt` in `C:\Users\drew\.claude\projects\C--Users-drew\2c09b16f-3f0d-478d-b6dc-78d5612dd641\tool-results\`.
+Sources: [NWS LMK squallbow](https://www.weather.gov/lmk/squallbow), [Funk/DeWald/Lin 14 May 1995 case](https://www.weather.gov/lmk/paper-51495), [SLU/COMET MARC research summary](https://www.comet.ucar.edu/sites/default/files/outreach/media/documents/9671862.htm), [Wilson et al. 1984 (AMS)](https://journals.ametsoc.org/view/journals/apme/23/6/1520-0450_1984_023_0898_mwsaeo_2_0_co_2.xml), [Roberts & Wilson 1989 (AMS)](https://journals.ametsoc.org/view/journals/apme/28/4/1520-0450_1989_028_0285_apmnpu_2_0_co_2.xml), [Hjelmfelt 1988 (AMS)](https://journals.ametsoc.org/view/journals/apme/27/8/1520-0450_1988_027_0900_salcom_2_0_co_2.xml), [Ibrahim et al. 2023 (AMS)](https://journals.ametsoc.org/view/journals/atot/40/2/JTECH-D-22-0028.1.xml), [Kuster et al. 2021 (AMS)](https://journals.ametsoc.org/view/journals/wefo/36/4/WAF-D-21-0005.1.xml), [McCann 1994 (AMS)](https://journals.ametsoc.org/view/journals/wefo/9/4/1520-0434_1994_009_0532_wniffm_2_0_co_2.xml), [Atkins & Wakimoto 1991 (AMS)](https://journals.ametsoc.org/view/journals/wefo/6/4/1520-0434_1991_006_0470_wmaots_2_0_co_2.xml), [NWS SR-163 (Wheeler & Spratt)](https://www.weather.gov/media/mlb/research/SR_TechMemo163.pdf), [AMU CR-201354 MDPI/WINDEX report](https://kscweather.ksc.nasa.gov/amu/files/final-reports/mdpi-windex.pdf), [AWOC Severe FY10 QLCS lesson](https://training.weather.gov/wdtd/courses/woc/documentation/severe/qlcs.pdf). Verification used local extraction artifacts; only public references are retained here.

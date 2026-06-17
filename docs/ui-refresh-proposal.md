@@ -165,7 +165,7 @@ The owner's community are **GR2Analyst natives**; RadarScope is the other shared
 
 - **Map IS the app.** Compact pickers (radar / product / tilt) as popovers anchored to a minimal toolbar; warnings are **tap-the-polygon → detail sheet**; layers (lightning, watches, local storm reports) toggle in a single settings sheet with uniform rows.
 - **One place to toggle any data type** — the layer sheet — is the closest existing peer to direction A below, and spotters in trucks already know it.
-- Desktop RadarScope keeps the same model with an inspector pane; it does not do docking either.
+- RadarScope for desktop keeps the same model with an inspector pane; it does not do docking either.
 
 **Implication:** for the single-screen-truck persona, RadarScope proves that *uniform layer rows + polygon-tap detail + map-anchored pickers* work under stress. Both peers agree on one thing: **warning text belongs on the map, at the polygon, not in a tab.**
 

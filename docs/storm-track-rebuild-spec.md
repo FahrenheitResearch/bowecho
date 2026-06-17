@@ -1,6 +1,6 @@
 # BowEcho Storm-Cell Tracking Rebuild — Implementation Spec
 
-Replaces: `C:\Users\drew\radar-work\bowecho\crates\render2d\src\cells.rs` (multi-threshold CC, 40/45/50/55 dBZ, 8 km², overlap dedup, linear-Z centroids) and the tracking half of `C:\Users\drew\radar-work\bowecho\crates\app_ui\src\main.rs` (`StormTrack` ~L1110–1166, `associate_storm_cells` ~L7528–7590: greedy nearest-to-prediction, flat 16 km gate, replace-last-fix on partial volumes, drop at 2 missed).
+Replaces: `crates/render2d/src/cells.rs` (multi-threshold CC, 40/45/50/55 dBZ, 8 km², overlap dedup, linear-Z centroids) and the tracking half of `crates/app_ui/src/main.rs` (`StormTrack`, `associate_storm_cells`: greedy nearest-to-prediction, flat 16 km gate, replace-last-fix on partial volumes, drop at 2 missed).
 
 Root causes of the QLCS failure, mapped to literature: (a) greedy per-track matching steals neighbors when cell spacing (~10–15 km) is comparable to per-volume displacement (25–35 m/s × 300 s ≈ 9 km) — exactly the regime TITAN's global assignment was built for (Dixon & Wiener 1993, J. Atmos. Oceanic Technol. 10(6), 785–797, §3a); (b) single-pass CC at 40 dBZ glues line cells into one blob, so detections appear/vanish/recombine frame to frame (Han et al. 2009 "ETITAN", JTECH 26(4), 719–732, motivation; Lakshmanan, Hondl & Rabin 2009, JTECH 26(3), 523–537); (c) replace-last-fix on live partial composites corrupts histories; (d) hard-killing the motion fit at >60 m/s leaves tracks gateless.
 

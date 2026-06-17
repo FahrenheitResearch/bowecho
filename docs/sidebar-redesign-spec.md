@@ -1,6 +1,6 @@
-# BowEcho Sidebar Redesign — SYNTHESIZED SPEC (v1, judge output)
+# BowEcho Sidebar Redesign — Synthesized Implementation Spec
 
-Base skeleton: Design B (3 tabs, GR2A order). Grafts: A's stable hot block + hotkey prefixes + verified enum facts; C's same-row add_enabled conditionals, Layers fold above the volume gate, one-line status, id_salt pinning. All line numbers = C:\Users\drew\radar-work\radar-rs-analyst\crates\app_ui\src\main.rs (15,939 lines). Every widget in the inventory has a destination; nothing is removed. No egui::Window — everything stays in the existing right panel (shell 4970–4974 untouched).
+Base skeleton: Design B (3 tabs, GR2A order). Grafts: A's stable hot block + hotkey prefixes + verified enum facts; C's same-row add_enabled conditionals, Layers fold above the volume gate, one-line status, id_salt pinning. Line numbers refer to the audited `app_ui` main.rs snapshot and may drift; function names are the durable references. Every widget in the inventory has a destination; nothing is removed. No egui::Window — everything stays in the existing right panel.
 
 ## TAB BAR — 3 tabs: RADAR · WARNINGS · SETTINGS
 - Delete `ui.heading("Controls")` (5007). Tab bar becomes row 1.
