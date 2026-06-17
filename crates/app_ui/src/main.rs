@@ -350,7 +350,6 @@ const HAZARD_GENERIC_ALERT_SPIKY_MIN_POINTS: usize = 8;
 const HAZARD_GENERIC_ALERT_SPIKY_PATH_RATIO: f32 = 1.6;
 const MAP_DRAG_DEAD_ZONE_PX: f32 = 3.0;
 const STORM_TRACK_CLICK_TOLERANCE_PX: f32 = 12.0;
-const STORM_TRACK_FOLLOW_RING_PX: f32 = 8.0;
 const COLOR_STATUS_SCROLL_HEIGHT: f32 = 34.0;
 const HAZARD_LIST_SCROLL_HEIGHT: f32 = 156.0;
 const HAZARD_SUMMARY_SCROLL_HEIGHT: f32 = 86.0;
@@ -5530,7 +5529,6 @@ impl ViewerApp {
         self.map_center_lat = lat.clamp(-85.0, 85.0);
         self.map_center_lon = normalize_lon(lon);
         self.clamp_map_center();
-        self.clear_texture();
         ctx.request_repaint();
         Some(follow.label)
     }
@@ -5592,12 +5590,6 @@ impl ViewerApp {
         })
     }
 
-    fn current_storm_track_follow_position(&self) -> Option<StormTrackCameraPosition> {
-        let follow = self.storm_track_follow?;
-        let volume = self.volume.as_deref()?;
-        self.storm_track_position_for_follow(volume, follow)
-    }
-
     fn storm_track_follow_label(position: StormTrackCameraPosition) -> String {
         let lead = if position.lead == StormFollowLead::Current {
             String::new()
@@ -5627,7 +5619,6 @@ impl ViewerApp {
         match self.storm_track_position_for_follow(volume, follow) {
             Some(position) => {
                 self.center_map_on(position.lat, position.lon);
-                self.clear_texture();
                 ctx.request_repaint();
                 Some(Self::storm_track_follow_label(position))
             }
@@ -16979,7 +16970,6 @@ impl ViewerApp {
         self.draw_hazard_overlays(painter, rect);
         self.draw_rotation_markers(painter, rect);
         self.draw_storm_tracks(painter, rect);
-        self.draw_storm_follow_target(painter, rect);
         // Tornado track lines under the report dots (the dots mark the
         // climo report points; the lines are the surveyed paths).
         self.draw_event_tracks(painter, rect);
@@ -17639,7 +17629,6 @@ impl ViewerApp {
             self.draw_hazard_overlays(&cell_painter, cell);
             self.draw_rotation_markers(&cell_painter, cell);
             self.draw_storm_tracks(&cell_painter, cell);
-            self.draw_storm_follow_target(&cell_painter, cell);
             self.draw_event_tracks(&cell_painter, cell);
             self.draw_spc_reports(&cell_painter, cell);
             self.draw_mping_reports(&cell_painter, cell);
@@ -23825,15 +23814,7 @@ impl ViewerApp {
             if track.history.is_empty() || track.merged_into.is_some() {
                 continue;
             }
-            let is_followed = self
-                .storm_track_follow
-                .map(|follow| follow.track_id == track.id)
-                .unwrap_or(false);
-            let line_color = if is_followed {
-                egui::Color32::from_rgb(255, 205, 75)
-            } else {
-                egui::Color32::from_rgb(235, 240, 245)
-            };
+            let line_color = egui::Color32::from_rgb(235, 240, 245);
             let points: Vec<egui::Pos2> = track
                 .history
                 .iter()
@@ -23848,7 +23829,7 @@ impl ViewerApp {
             if points.len() >= 2 {
                 painter.add(egui::Shape::line(
                     points.clone(),
-                    egui::Stroke::new(if is_followed { 2.1 } else { 1.6 }, line_color),
+                    egui::Stroke::new(1.6, line_color),
                 ));
             }
             painter.circle_filled(current, 3.5, line_color);
@@ -23902,39 +23883,6 @@ impl ViewerApp {
                     egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
                 );
             }
-        }
-    }
-
-    fn draw_storm_follow_target(&self, painter: &egui::Painter, rect: egui::Rect) {
-        let Some(position) = self.current_storm_track_follow_position() else {
-            return;
-        };
-        let screen = self.lon_lat_to_screen(rect, position.lon, position.lat);
-        if !rect.expand(40.0).contains(screen) {
-            return;
-        }
-        let gold = egui::Color32::from_rgb(255, 205, 75);
-        painter.circle_stroke(
-            screen,
-            STORM_TRACK_FOLLOW_RING_PX + 3.0,
-            egui::Stroke::new(1.2, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220)),
-        );
-        painter.circle_stroke(
-            screen,
-            STORM_TRACK_FOLLOW_RING_PX,
-            egui::Stroke::new(2.0, gold),
-        );
-        painter.circle_filled(screen, 2.4, gold);
-        if self.map_scale >= 90.0 {
-            draw_halo_text(
-                painter,
-                screen + egui::vec2(9.0, -9.0),
-                egui::Align2::LEFT_BOTTOM,
-                &format!("Follow #{}", position.track_id),
-                egui::FontId::proportional(10.0),
-                gold,
-                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 210),
-            );
         }
     }
 
@@ -41317,6 +41265,21 @@ mod tests {
         };
         app.storm_follow_lead = follow.lead;
         app.storm_track_follow = Some(follow);
+        let retained_texture_key = TextureKey {
+            volume_ptr: 42,
+            cut: 0,
+            product: DisplayProduct::Moment(MomentType::Reflectivity),
+            render_dealiased_velocity: false,
+            color_table_signature: 7,
+            storm_motion_key: (0, 0),
+            hail_levels_key: (32, 64),
+            smoothing: SmoothingMode::Native,
+            dealias_cascade: false,
+            gate_filter_decidbz: i16::MIN,
+            viewport: test_viewport_key(720, 480),
+        };
+        app.texture_key = Some(retained_texture_key.clone());
+        app.pending_render_key = Some(retained_texture_key.clone());
         let expected = app
             .storm_track_position_for_follow(app.volume.as_deref().expect("volume"), follow)
             .expect("predicted position");
@@ -41329,6 +41292,12 @@ mod tests {
         assert!(label.contains("+15 min"));
         assert!((app.map_center_lat - expected.lat).abs() < 1e-5);
         assert!((app.map_center_lon - expected.lon).abs() < 1e-5);
+        assert_eq!(app.texture_key.as_ref(), Some(&retained_texture_key));
+        assert_eq!(
+            app.pending_render_key.as_ref(),
+            Some(&retained_texture_key),
+            "follow recenter must not blank radar while the next frame renders"
+        );
     }
 
     #[test]
