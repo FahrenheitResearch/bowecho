@@ -179,6 +179,22 @@ pub struct AppSettings {
     /// the GIF/MP4 recorder's frame timing, so exports match the screen.
     #[serde(default = "default_loop_speed_percent")]
     pub loop_speed_percent: u16,
+    /// During loop playback, step through complete low-level SAILS/MESO-SAILS
+    /// sweeps inside each volume before moving to the next volume. The loop
+    /// frame count remains the scan/volume count shown in the UI.
+    #[serde(default)]
+    pub loop_low_sweeps: bool,
+    /// Low-sweep loop cut filter: "all" keeps every complete low-level cut;
+    /// "base" keeps only the lowest elevation bucket to avoid TDWR/Sails jumps.
+    #[serde(default = "default_loop_low_sweep_filter")]
+    pub loop_low_sweep_filter: String,
+    /// During live updates, advance to each newly completed low-level sweep
+    /// instead of waiting for a scan-separated low-level revisit.
+    #[serde(default)]
+    pub live_low_sweep_auto_advance: bool,
+    /// Draw a small screen-center capture reticle over map panes.
+    #[serde(default)]
+    pub show_center_crosshair: bool,
     /// Free/manual viewport recording frame rate. Loop exports still preserve
     /// the loop-speed cadence; this controls the live viewport recorder.
     #[serde(default = "default_record_fps")]
@@ -286,6 +302,10 @@ fn default_model_slug() -> String {
 
 fn default_loop_speed_percent() -> u16 {
     100
+}
+
+fn default_loop_low_sweep_filter() -> String {
+    "all".to_owned()
 }
 
 fn default_record_fps() -> u16 {
@@ -440,6 +460,10 @@ impl Default for AppSettings {
             smooth_display_mode: String::new(),
             cross_section_smoothing: default_cross_section_smoothing(),
             loop_speed_percent: default_loop_speed_percent(),
+            loop_low_sweeps: false,
+            loop_low_sweep_filter: default_loop_low_sweep_filter(),
+            live_low_sweep_auto_advance: false,
+            show_center_crosshair: false,
             record_fps: default_record_fps(),
             event_pad_frames: default_event_pad_frames(),
             event_track_auto_model: false,
@@ -759,6 +783,10 @@ mod tests {
             archive_load_loop: false,
             archive_frame_count: 17,
             live_preload_frame_count: 6,
+            loop_low_sweeps: true,
+            loop_low_sweep_filter: "base".to_owned(),
+            live_low_sweep_auto_advance: true,
+            show_center_crosshair: true,
             intl_provider: "smhi".to_owned(),
             intl_site: "angelholm".to_owned(),
             ..Default::default()
@@ -857,11 +885,19 @@ mod tests {
         assert!(old.archive_load_loop);
         assert_eq!(old.archive_frame_count, 10);
         assert_eq!(old.live_preload_frame_count, 5);
+        assert!(!old.loop_low_sweeps);
+        assert_eq!(old.loop_low_sweep_filter, "all");
+        assert!(!old.live_low_sweep_auto_advance);
+        assert!(!old.show_center_crosshair);
 
         let settings = AppSettings {
             archive_load_loop: false,
             archive_frame_count: 24,
             live_preload_frame_count: 4,
+            loop_low_sweeps: true,
+            loop_low_sweep_filter: "base".to_owned(),
+            live_low_sweep_auto_advance: true,
+            show_center_crosshair: true,
             ..Default::default()
         };
         let back = AppSettings::from_json(&settings.to_json());
@@ -869,6 +905,10 @@ mod tests {
         assert!(!back.archive_load_loop);
         assert_eq!(back.archive_frame_count, 24);
         assert_eq!(back.live_preload_frame_count, 4);
+        assert!(back.loop_low_sweeps);
+        assert_eq!(back.loop_low_sweep_filter, "base");
+        assert!(back.live_low_sweep_auto_advance);
+        assert!(back.show_center_crosshair);
     }
 
     #[test]

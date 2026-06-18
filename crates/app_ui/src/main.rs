@@ -311,6 +311,38 @@ impl RadarLabelStyle {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum LowSweepLoopFilter {
+    #[default]
+    All,
+    BaseOnly,
+}
+
+impl LowSweepLoopFilter {
+    const ALL: [Self; 2] = [Self::All, Self::BaseOnly];
+
+    fn from_key(key: &str) -> Self {
+        match key {
+            "base" => Self::BaseOnly,
+            _ => Self::All,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::BaseOnly => "base",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all low",
+            Self::BaseOnly => "base only",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct CustomGisSite {
     site_id: String,
@@ -318,11 +350,14 @@ struct CustomGisSite {
     latitude_deg: f32,
     longitude_deg: f32,
 }
-const LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG: f32 = 1.0;
-const LIVE_LOW_LEVEL_AUTO_ADVANCE_MIN_SECONDS: i64 = 90;
+const LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG: f32 = 1.4;
+const LIVE_LOW_LEVEL_AUTO_ADVANCE_MIN_SECONDS: i64 = 60;
+const FAST_LOW_SWEEP_AUTO_ADVANCE_MIN_SECONDS: i64 = 1;
 const LIVE_COMPLETE_LOW_LEVEL_TILT_MIN_RADIALS: usize = 720;
+const LIVE_COMPLETE_TERMINAL_LOW_LEVEL_TILT_MIN_RADIALS: usize = 360;
 const LIVE_COMPLETE_TILT_MIN_RADIALS: usize = 360;
 const LIVE_COMPLETE_TILT_MIN_AZIMUTH_COVERAGE_DEG: f32 = 350.0;
+const LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG: f32 = 0.25;
 const HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM: usize = 6;
 
 /// International catalog-poll cadence. National open-data feeds publish on
@@ -1045,6 +1080,7 @@ struct ViewerApp {
     selected_product: DisplayProduct,
     frame_history: Vec<FrameHistoryEntry>,
     selected_frame_index: usize,
+    low_sweep_disabled_cuts: BTreeSet<LowSweepCutKey>,
     /// Raster tile basemap (satellite/streets/topo) under the radar.
     tile_layer: std::cell::RefCell<tiles::TileLayer>,
     basemap_style: tiles::TileStyle,
@@ -1131,6 +1167,7 @@ struct ViewerApp {
     storm_track_min_dbz: f32,
     storm_track_follow: Option<StormTrackFollow>,
     storm_follow_lead: StormFollowLead,
+    manual_camera_path: ManualCameraPath,
     /// Rotation (meso/TVS) markers from the lowest velocity tilt (Stumpf et
     /// al. 1998 / Mitchell et al. 1998 thresholds on LLSD azimuthal shear).
     /// Detection runs on a BACKGROUND thread once per volume — the UI thread
@@ -1858,6 +1895,21 @@ struct FrameIdentity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct LowSweepCutKey {
+    identity: FrameIdentity,
+    cut_index: usize,
+}
+
+impl LowSweepCutKey {
+    fn new(identity: &FrameIdentity, cut_index: usize) -> Self {
+        Self {
+            identity: identity.clone(),
+            cut_index,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct FrameWorkKey {
     identity: FrameIdentity,
     volume_ptr: usize,
@@ -1919,8 +1971,30 @@ struct StormTrackCameraPosition {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct ManualCameraKeyframe {
+    time_utc: DateTime<Utc>,
+    lat: f32,
+    lon: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ManualCameraPath {
+    keyframes: Vec<ManualCameraKeyframe>,
+    follow: bool,
+    hide_tracks_during_follow: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct StormTrackHit {
     track_id: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VolumeSelectionPolicy {
+    allow_low_level_auto_advance: bool,
+    allow_incomplete_live_chunk_advance: bool,
+    require_complete_live_cut: bool,
+    low_level_min_seconds: i64,
 }
 
 fn insert_limited_frame_cache<T>(
@@ -4418,6 +4492,7 @@ impl ViewerApp {
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
             frame_history: Vec::new(),
             selected_frame_index: 0,
+            low_sweep_disabled_cuts: BTreeSet::new(),
             tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(settings::tile_cache_dir())),
             basemap_style: tiles::TileStyle::DarkVector,
             open_color_tables_request: false,
@@ -4485,6 +4560,7 @@ impl ViewerApp {
             storm_track_min_dbz: restored_storm_track_min_dbz,
             storm_track_follow: None,
             storm_follow_lead: StormFollowLead::default(),
+            manual_camera_path: ManualCameraPath::default(),
             rotation_markers: Vec::new(),
             rotation_markers_volume_ptr: 0,
             rotation_receiver: None,
@@ -5305,6 +5381,7 @@ impl ViewerApp {
     fn clear_frame_history(&mut self) {
         self.frame_history.clear();
         self.selected_frame_index = 0;
+        self.low_sweep_disabled_cuts.clear();
         self.history_playing = false;
         self.browsing_history = false;
         self.last_history_step = None;
@@ -5504,19 +5581,38 @@ impl ViewerApp {
             frame.status,
             ctx,
         );
+        self.select_first_history_low_sweep_if_enabled(ctx);
         let frame_status = self.selected_frame_status_text();
-        let follow_status = if let Some(label) =
-            self.apply_event_track_camera_follow_for_frame(&frame.volume, ctx)
-        {
-            Some(format!("following {label}"))
-        } else {
-            self.apply_storm_track_camera_follow_for_frame(&frame.volume, ctx)
-        };
+        let follow_status = self.apply_camera_follow_for_frame(&frame.volume, ctx);
         self.status = if let Some(label) = follow_status {
             format!("{frame_status} - {label}")
         } else {
             frame_status
         };
+    }
+
+    fn apply_camera_follow_for_current_frame(&mut self, ctx: &egui::Context) -> Option<String> {
+        let volume = self.volume.clone()?;
+        self.apply_camera_follow_for_frame(&volume, ctx)
+    }
+
+    fn apply_camera_follow_for_frame(
+        &mut self,
+        volume: &RadarVolume,
+        ctx: &egui::Context,
+    ) -> Option<String> {
+        if let Some(label) = self.apply_event_track_camera_follow_for_frame(volume, ctx) {
+            return Some(format!("following {label}"));
+        }
+        if let Some(label) = self.apply_manual_camera_path_for_frame(volume, ctx) {
+            return Some(label);
+        }
+        self.apply_storm_track_camera_follow_for_frame(volume, ctx)
+    }
+
+    fn camera_time_for_volume(&self, volume: &RadarVolume) -> DateTime<Utc> {
+        cut_start_time_utc(volume, self.selected_cut)
+            .unwrap_or_else(|| volume.volume_time.with_timezone(&Utc))
     }
 
     fn apply_event_track_camera_follow_for_frame(
@@ -5525,7 +5621,7 @@ impl ViewerApp {
         ctx: &egui::Context,
     ) -> Option<String> {
         let follow = self.event_explorer.camera_follow.clone()?;
-        let (lat, lon) = follow.position_at(volume.volume_time.with_timezone(&Utc));
+        let (lat, lon) = follow.position_at(self.camera_time_for_volume(volume));
         self.map_center_lat = lat.clamp(-85.0, 85.0);
         self.map_center_lon = normalize_lon(lon);
         self.clamp_map_center();
@@ -5533,9 +5629,93 @@ impl ViewerApp {
         Some(follow.label)
     }
 
+    fn manual_camera_position_at(&self, time_utc: DateTime<Utc>) -> Option<(f32, f32)> {
+        let keyframes = &self.manual_camera_path.keyframes;
+        let first = keyframes.first()?;
+        if keyframes.len() == 1 || time_utc <= first.time_utc {
+            return Some((first.lat, first.lon));
+        }
+        let last = keyframes.last()?;
+        if time_utc >= last.time_utc {
+            return Some((last.lat, last.lon));
+        }
+        for pair in keyframes.windows(2) {
+            let [left, right] = pair else {
+                continue;
+            };
+            if time_utc < left.time_utc || time_utc > right.time_utc {
+                continue;
+            }
+            let span_ms = (right.time_utc - left.time_utc).num_milliseconds().max(1) as f32;
+            let offset_ms = (time_utc - left.time_utc).num_milliseconds() as f32;
+            let t = (offset_ms / span_ms).clamp(0.0, 1.0);
+            let mut lon_delta = right.lon - left.lon;
+            if lon_delta > 180.0 {
+                lon_delta -= 360.0;
+            } else if lon_delta < -180.0 {
+                lon_delta += 360.0;
+            }
+            let lat = left.lat + (right.lat - left.lat) * t;
+            let lon = normalize_lon(left.lon + lon_delta * t);
+            return Some((lat, lon));
+        }
+        Some((last.lat, last.lon))
+    }
+
+    fn apply_manual_camera_path_for_frame(
+        &mut self,
+        volume: &RadarVolume,
+        ctx: &egui::Context,
+    ) -> Option<String> {
+        if !self.manual_camera_path.follow {
+            return None;
+        }
+        let (lat, lon) = self.manual_camera_position_at(self.camera_time_for_volume(volume))?;
+        self.center_map_on(lat, lon);
+        ctx.request_repaint();
+        Some("following manual path".to_owned())
+    }
+
+    fn add_manual_camera_keyframe_from_center(&mut self) {
+        let time_utc = self
+            .volume
+            .as_deref()
+            .map(|volume| self.camera_time_for_volume(volume))
+            .unwrap_or_else(Utc::now);
+        let keyframe = ManualCameraKeyframe {
+            time_utc,
+            lat: self.map_center_lat,
+            lon: self.map_center_lon,
+        };
+        if let Some(existing) = self
+            .manual_camera_path
+            .keyframes
+            .iter_mut()
+            .find(|existing| existing.time_utc == time_utc)
+        {
+            *existing = keyframe;
+        } else {
+            self.manual_camera_path.keyframes.push(keyframe);
+            self.manual_camera_path
+                .keyframes
+                .sort_by_key(|keyframe| keyframe.time_utc);
+        }
+        self.status = format!(
+            "Manual camera keyframe {} at {:.3}, {:.3}",
+            self.time_zone().format_hms(time_utc),
+            keyframe.lat,
+            keyframe.lon
+        );
+    }
+
     fn clear_camera_follow_targets(&mut self) {
         self.event_explorer.camera_follow = None;
         self.storm_track_follow = None;
+        self.manual_camera_path.follow = false;
+    }
+
+    fn hide_camera_follow_guides(&self) -> bool {
+        self.manual_camera_path.follow && self.manual_camera_path.hide_tracks_during_follow
     }
 
     fn storm_tracking_active(&self) -> bool {
@@ -5570,9 +5750,8 @@ impl ViewerApp {
             .find(|track| track.id == follow.track_id && track.merged_into.is_none())?;
         let (fix_time, east_km, north_km) = track.last_fix()?;
         let (u_mps, v_mps) = track.motion().unwrap_or((0.0, 0.0));
-        let dt_s = volume
-            .volume_time
-            .with_timezone(&Utc)
+        let dt_s = self
+            .camera_time_for_volume(volume)
             .signed_duration_since(fix_time)
             .num_milliseconds() as f64
             / 1000.0
@@ -5641,17 +5820,22 @@ impl ViewerApp {
     ) {
         let previous_cut = self.selected_cut;
         let previous_product = self.selected_product.clone();
+        let previous_volume_for_panes = self.volume.clone();
         let require_complete_live_cut =
             frame_status == FrameStatus::LivePartial && !self.display_live_chunk_updates;
-        let (selected_cut, selected_product) = selection_for_installed_volume(
-            self.volume.as_deref(),
-            self.selected_cut,
-            &self.selected_product,
-            volume.as_ref(),
-            !self.history_playing,
-            self.display_live_chunk_updates,
-            require_complete_live_cut,
-        );
+        let (selected_cut, selected_product) =
+            selection_for_installed_volume_with_low_sweep_min_seconds(
+                self.volume.as_deref(),
+                self.selected_cut,
+                &self.selected_product,
+                volume.as_ref(),
+                VolumeSelectionPolicy {
+                    allow_low_level_auto_advance: !self.history_playing,
+                    allow_incomplete_live_chunk_advance: self.display_live_chunk_updates,
+                    require_complete_live_cut,
+                    low_level_min_seconds: self.live_low_sweep_auto_advance_min_seconds(),
+                },
+            );
         let catalog_index = self
             .sites
             .iter()
@@ -5713,6 +5897,15 @@ impl ViewerApp {
         self.dealiased_readout_cache = None;
         self.selected_cut = selected_cut;
         self.selected_product = selected_product;
+        let installed_volume = self.volume.clone();
+        if let Some(installed_volume) = installed_volume {
+            self.sync_following_pane_selections_for_volume_install(
+                previous_volume_for_panes.as_deref(),
+                installed_volume.as_ref(),
+                previous_cut,
+                frame_status,
+            );
+        }
         self.sanitize_selection();
         if keep_existing_texture {
             self.pending_render_key = None;
@@ -5746,6 +5939,75 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
+    fn sync_following_pane_selections_for_volume_install(
+        &mut self,
+        previous_volume: Option<&RadarVolume>,
+        volume: &RadarVolume,
+        previous_primary_cut: usize,
+        frame_status: FrameStatus,
+    ) {
+        if self.extra_panes.is_empty() {
+            return;
+        }
+        let require_complete_live_cut =
+            frame_status == FrameStatus::LivePartial && !self.display_live_chunk_updates;
+        let live_partial = frame_status == FrameStatus::LivePartial;
+        let low_level_min_seconds = self.live_low_sweep_auto_advance_min_seconds();
+        for pane in &mut self.extra_panes {
+            if pane.owns_radar() {
+                continue;
+            }
+            let previous_product = pane.product.clone();
+            let previous_cut = pane
+                .cut
+                .or_else(|| {
+                    previous_volume.and_then(|previous| {
+                        best_cut_for_product(previous, previous_primary_cut, &previous_product)
+                    })
+                })
+                .unwrap_or(previous_primary_cut);
+
+            let product_ready = volume_has_displayable_product_with_live_filter(
+                volume,
+                &previous_product,
+                require_complete_live_cut,
+            );
+            if live_partial && !product_ready {
+                continue;
+            }
+
+            let same_site =
+                previous_volume.is_some_and(|previous| previous.site.id == volume.site.id);
+            if !same_site
+                && let Some(cut) = best_cut_for_product_with_live_filter(
+                    volume,
+                    previous_cut,
+                    &previous_product,
+                    require_complete_live_cut,
+                )
+            {
+                pane.cut = Some(cut);
+                continue;
+            }
+
+            let (selected_cut, selected_product) =
+                selection_for_installed_volume_with_low_sweep_min_seconds(
+                    previous_volume,
+                    previous_cut,
+                    &previous_product,
+                    volume,
+                    VolumeSelectionPolicy {
+                        allow_low_level_auto_advance: !self.history_playing,
+                        allow_incomplete_live_chunk_advance: self.display_live_chunk_updates,
+                        require_complete_live_cut,
+                        low_level_min_seconds,
+                    },
+                );
+            pane.cut = Some(selected_cut);
+            pane.product = selected_product;
+        }
+    }
+
     fn selected_frame_status_text(&self) -> String {
         self.frame_history
             .get(self.selected_frame_index)
@@ -5773,8 +6035,12 @@ impl ViewerApp {
             .last_history_step
             .is_none_or(|last_step| last_step.elapsed() >= Duration::from_millis(frame_ms));
         if should_step {
-            let next_index = (self.selected_frame_index + 1) % self.frame_history.len();
             self.last_history_step = Some(Instant::now());
+            if self.advance_history_loop_low_sweep(ctx) {
+                ctx.request_repaint_after(Duration::from_millis(50));
+                return;
+            }
+            let next_index = (self.selected_frame_index + 1) % self.frame_history.len();
             self.select_history_frame(next_index, false, ctx);
         }
         ctx.request_repaint_after(Duration::from_millis(50));
@@ -5794,21 +6060,349 @@ impl ViewerApp {
                 .last_history_step
                 .is_none_or(|last_step| last_step.elapsed() >= Duration::from_millis(frame_ms));
             if should_step {
-                let next_index = (pane.selected_frame_index + 1) % pane.frame_history.len();
-                steps.push((slot, next_index));
+                steps.push(slot);
             }
         }
         if steps.is_empty() {
             return;
         }
         let now = Instant::now();
-        for (slot, next_index) in steps {
+        for slot in steps {
             if let Some(pane) = self.extra_panes.get_mut(slot) {
                 pane.last_history_step = Some(now);
             }
+            if self.advance_extra_pane_history_loop_low_sweep(slot, ctx) {
+                continue;
+            }
+            let Some(next_index) = self.extra_panes.get(slot).and_then(|pane| {
+                (!pane.frame_history.is_empty())
+                    .then_some((pane.selected_frame_index + 1) % pane.frame_history.len())
+            }) else {
+                continue;
+            };
             self.select_extra_pane_history_frame(slot, next_index, ctx);
         }
         ctx.request_repaint_after(Duration::from_millis(50));
+    }
+
+    fn select_first_history_low_sweep_if_enabled(&mut self, ctx: &egui::Context) {
+        if !self.app_settings.loop_low_sweeps {
+            return;
+        }
+        let Some(frame) = self.frame_history.get(self.selected_frame_index) else {
+            return;
+        };
+        if let Some(cut) = low_sweep_cuts_for_history_entry(
+            frame,
+            &self.selected_product,
+            self.low_sweep_loop_filter(),
+            &self.low_sweep_disabled_cuts,
+        )
+        .first()
+        .copied()
+            && self.selected_cut != cut
+        {
+            self.set_selected_cut_preserving_texture(cut);
+            ctx.request_repaint();
+        }
+    }
+
+    fn advance_history_loop_low_sweep(&mut self, ctx: &egui::Context) -> bool {
+        if !self.app_settings.loop_low_sweeps {
+            return false;
+        }
+        let Some(frame) = self.frame_history.get(self.selected_frame_index) else {
+            return false;
+        };
+        let cuts = low_sweep_cuts_for_history_entry(
+            frame,
+            &self.selected_product,
+            self.low_sweep_loop_filter(),
+            &self.low_sweep_disabled_cuts,
+        );
+        let Some(position) = cuts.iter().position(|cut| *cut == self.selected_cut) else {
+            return false;
+        };
+        let Some(next_cut) = cuts.get(position + 1).copied() else {
+            return false;
+        };
+        self.set_selected_cut_preserving_texture(next_cut);
+        if let Some(label) = self.apply_camera_follow_for_current_frame(ctx) {
+            self.status = label;
+        }
+        ctx.request_repaint();
+        true
+    }
+
+    fn set_selected_cut_preserving_texture(&mut self, cut: usize) {
+        self.selected_cut = cut;
+        self.pending_render_key = None;
+        self.render_ms = None;
+        self.worker_ms = None;
+        self.texture_ms = None;
+        self.sample_cache_build_ms = None;
+    }
+
+    fn select_first_extra_pane_low_sweep_if_enabled(
+        &mut self,
+        pane_slot: usize,
+        ctx: &egui::Context,
+    ) {
+        if !self.app_settings.loop_low_sweeps {
+            return;
+        }
+        let filter = self.low_sweep_loop_filter();
+        let Some((next_cut, current_cut)) = self.extra_panes.get(pane_slot).and_then(|pane| {
+            let frame = pane.frame_history.get(pane.selected_frame_index)?;
+            low_sweep_cuts_for_history_entry(
+                frame,
+                &pane.product,
+                filter,
+                &self.low_sweep_disabled_cuts,
+            )
+            .first()
+            .copied()
+            .map(|cut| (cut, pane.cut))
+        }) else {
+            return;
+        };
+        if current_cut != Some(next_cut)
+            && let Some(pane) = self.extra_panes.get_mut(pane_slot)
+        {
+            Self::set_pane_cut_preserving_texture(pane, next_cut);
+            ctx.request_repaint();
+        }
+    }
+
+    fn advance_extra_pane_history_loop_low_sweep(
+        &mut self,
+        pane_slot: usize,
+        ctx: &egui::Context,
+    ) -> bool {
+        if !self.app_settings.loop_low_sweeps {
+            return false;
+        }
+        let filter = self.low_sweep_loop_filter();
+        let Some((cuts, current)) = self.extra_panes.get(pane_slot).and_then(|pane| {
+            let frame = pane.frame_history.get(pane.selected_frame_index)?;
+            Some((
+                low_sweep_cuts_for_history_entry(
+                    frame,
+                    &pane.product,
+                    filter,
+                    &self.low_sweep_disabled_cuts,
+                ),
+                pane.cut.unwrap_or(self.selected_cut),
+            ))
+        }) else {
+            return false;
+        };
+        let Some(position) = cuts.iter().position(|cut| *cut == current) else {
+            return false;
+        };
+        let Some(next_cut) = cuts.get(position + 1).copied() else {
+            return false;
+        };
+        if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+            Self::set_pane_cut_preserving_texture(pane, next_cut);
+            ctx.request_repaint();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn set_pane_cut_preserving_texture(pane: &mut ViewPane, cut: usize) {
+        pane.cut = Some(cut);
+        pane.pending_render_key = None;
+        pane.render_ms = None;
+    }
+
+    fn low_sweep_loop_filter(&self) -> LowSweepLoopFilter {
+        LowSweepLoopFilter::from_key(self.app_settings.loop_low_sweep_filter.trim())
+    }
+
+    fn low_sweep_filter_combo_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        id_salt: impl std::hash::Hash,
+        ctx: &egui::Context,
+        pane_slot: Option<usize>,
+    ) {
+        let mut filter = self.low_sweep_loop_filter();
+        egui::ComboBox::from_id_salt(id_salt)
+            .selected_text(filter.label())
+            .width(78.0)
+            .show_ui(ui, |ui| {
+                for option in LowSweepLoopFilter::ALL {
+                    ui.selectable_value(&mut filter, option, option.label())
+                        .on_hover_text(match option {
+                            LowSweepLoopFilter::All => {
+                                "Play every complete low-level cut in chronological order"
+                            }
+                            LowSweepLoopFilter::BaseOnly => {
+                                "Keep only the lowest elevation bucket; useful when a low loop jumps"
+                            }
+                        });
+                }
+            });
+        if filter.key() != self.app_settings.loop_low_sweep_filter {
+            self.app_settings.loop_low_sweep_filter = filter.key().to_owned();
+            let _ = self.app_settings.save();
+            if let Some(slot) = pane_slot {
+                self.select_first_extra_pane_low_sweep_if_enabled(slot, ctx);
+            } else {
+                self.select_first_history_low_sweep_if_enabled(ctx);
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn history_low_sweep_cut_controls_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if !self.app_settings.loop_low_sweeps {
+            return;
+        }
+        let Some(frame) = self.frame_history.get(self.selected_frame_index) else {
+            return;
+        };
+        let filter = self.low_sweep_loop_filter();
+        let candidates =
+            low_sweep_cuts_for_product(frame.volume.as_ref(), &self.selected_product, filter);
+        if candidates.len() <= 1 {
+            return;
+        }
+        let identity = frame.identity.clone();
+        let volume = Arc::clone(&frame.volume);
+        let mut changed = false;
+        let mut reset_all = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.weak("Low cuts");
+            for cut in candidates {
+                let key = LowSweepCutKey::new(&identity, cut);
+                let mut enabled = !self.low_sweep_disabled_cuts.contains(&key);
+                if ui
+                    .checkbox(&mut enabled, low_sweep_cut_label(volume.as_ref(), cut))
+                    .on_hover_text(low_sweep_cut_hover_text(volume.as_ref(), cut))
+                    .changed()
+                {
+                    if enabled {
+                        self.low_sweep_disabled_cuts.remove(&key);
+                    } else {
+                        self.low_sweep_disabled_cuts.insert(key);
+                    }
+                    changed = true;
+                }
+            }
+            if ui
+                .small_button("All")
+                .on_hover_text("Enable all cuts in this scan")
+                .clicked()
+            {
+                reset_all = true;
+            }
+        });
+        if reset_all {
+            self.low_sweep_disabled_cuts
+                .retain(|key| key.identity != identity);
+            changed = true;
+        }
+        if changed {
+            let Some(frame) = self.frame_history.get(self.selected_frame_index) else {
+                return;
+            };
+            let enabled_cuts = low_sweep_cuts_for_history_entry(
+                frame,
+                &self.selected_product,
+                filter,
+                &self.low_sweep_disabled_cuts,
+            );
+            if !enabled_cuts.contains(&self.selected_cut)
+                && let Some(cut) = enabled_cuts.first().copied()
+            {
+                self.set_selected_cut_preserving_texture(cut);
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn extra_pane_low_sweep_cut_controls_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        pane_slot: usize,
+    ) {
+        if !self.app_settings.loop_low_sweeps {
+            return;
+        }
+        let Some(pane) = self.extra_panes.get(pane_slot) else {
+            return;
+        };
+        let Some(frame) = pane.frame_history.get(pane.selected_frame_index) else {
+            return;
+        };
+        let filter = self.low_sweep_loop_filter();
+        let candidates = low_sweep_cuts_for_product(frame.volume.as_ref(), &pane.product, filter);
+        if candidates.len() <= 1 {
+            return;
+        }
+        let identity = frame.identity.clone();
+        let volume = Arc::clone(&frame.volume);
+        let product = pane.product.clone();
+        let current = pane.cut.unwrap_or(self.selected_cut);
+        let mut changed = false;
+        let mut reset_all = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.weak("Low cuts");
+            for cut in candidates {
+                let key = LowSweepCutKey::new(&identity, cut);
+                let mut enabled = !self.low_sweep_disabled_cuts.contains(&key);
+                if ui
+                    .checkbox(&mut enabled, low_sweep_cut_label(volume.as_ref(), cut))
+                    .on_hover_text(low_sweep_cut_hover_text(volume.as_ref(), cut))
+                    .changed()
+                {
+                    if enabled {
+                        self.low_sweep_disabled_cuts.remove(&key);
+                    } else {
+                        self.low_sweep_disabled_cuts.insert(key);
+                    }
+                    changed = true;
+                }
+            }
+            if ui
+                .small_button("All")
+                .on_hover_text("Enable all cuts in this scan")
+                .clicked()
+            {
+                reset_all = true;
+            }
+        });
+        if reset_all {
+            self.low_sweep_disabled_cuts
+                .retain(|key| key.identity != identity);
+            changed = true;
+        }
+        if changed {
+            let Some(pane) = self.extra_panes.get(pane_slot) else {
+                return;
+            };
+            let Some(frame) = pane.frame_history.get(pane.selected_frame_index) else {
+                return;
+            };
+            let enabled_cuts = low_sweep_cuts_for_history_entry(
+                frame,
+                &product,
+                filter,
+                &self.low_sweep_disabled_cuts,
+            );
+            if !enabled_cuts.contains(&current)
+                && let Some(cut) = enabled_cuts.first().copied()
+                && let Some(pane) = self.extra_panes.get_mut(pane_slot)
+            {
+                Self::set_pane_cut_preserving_texture(pane, cut);
+            }
+            ctx.request_repaint();
+        }
     }
 
     fn toggle_extra_pane_history_playback(
@@ -6326,6 +6920,11 @@ impl ViewerApp {
         let primary_volume = self.volume.clone();
         for pane in &mut self.extra_panes {
             if let Some(pane_volume) = pane.volume.clone().or_else(|| primary_volume.clone()) {
+                if !pane.owns_radar()
+                    && !volume_has_displayable_product(pane_volume.as_ref(), &pane.product)
+                {
+                    continue;
+                }
                 if let Some(cut) = pane.cut {
                     pane.cut = Some(cut.min(pane_volume.cuts.len().saturating_sub(1)));
                 }
@@ -6340,9 +6939,10 @@ impl ViewerApp {
                         &pane.product,
                     ) {
                         pane.cut = Some(cut);
-                    } else if let Some(product) = global_displayable_products(pane_volume.as_ref())
-                        .first()
-                        .cloned()
+                    } else if pane.owns_radar()
+                        && let Some(product) = global_displayable_products(pane_volume.as_ref())
+                            .first()
+                            .cloned()
                     {
                         pane.product = product;
                         pane.cut = Some(0);
@@ -8641,6 +9241,7 @@ impl ViewerApp {
             frame.status,
             ctx,
         );
+        self.select_first_extra_pane_low_sweep_if_enabled(pane_slot, ctx);
         let status = self.extra_pane_selected_frame_status_text(pane_slot);
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
             pane.status = status;
@@ -8682,6 +9283,7 @@ impl ViewerApp {
         ctx: &egui::Context,
     ) {
         let display_live_chunk_updates = self.display_live_chunk_updates;
+        let low_level_min_seconds = self.live_low_sweep_auto_advance_min_seconds();
         let main_cut = self.selected_cut;
         let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
             return;
@@ -8690,15 +9292,19 @@ impl ViewerApp {
         let previous_product = pane.product.clone();
         let require_complete_live_cut =
             frame_status == FrameStatus::LivePartial && !display_live_chunk_updates;
-        let (selected_cut, selected_product) = selection_for_installed_volume(
-            pane.volume.as_deref(),
-            previous_cut,
-            &previous_product,
-            volume.as_ref(),
-            !pane.history_playing,
-            display_live_chunk_updates,
-            require_complete_live_cut,
-        );
+        let (selected_cut, selected_product) =
+            selection_for_installed_volume_with_low_sweep_min_seconds(
+                pane.volume.as_deref(),
+                previous_cut,
+                &previous_product,
+                volume.as_ref(),
+                VolumeSelectionPolicy {
+                    allow_low_level_auto_advance: !pane.history_playing,
+                    allow_incomplete_live_chunk_advance: display_live_chunk_updates,
+                    require_complete_live_cut,
+                    low_level_min_seconds,
+                },
+            );
         let site_changed = pane
             .volume
             .as_ref()
@@ -13459,6 +14065,17 @@ impl ViewerApp {
                 .on_hover_text(
                     "Display incomplete live chunk tilts before a full low-level tilt is available",
                 );
+            let mut fast_low = self.app_settings.live_low_sweep_auto_advance;
+            if ui
+                .checkbox(&mut fast_low, "Fast low")
+                .on_hover_text(
+                    "Advance live display as soon as a complete <=1.4 degree low sweep arrives",
+                )
+                .changed()
+            {
+                self.app_settings.live_low_sweep_auto_advance = fast_low;
+                let _ = self.app_settings.save();
+            }
             let mut live_preload = normalized_live_preload_frame_count(usize::from(
                 self.app_settings.live_preload_frame_count,
             ));
@@ -13596,14 +14213,16 @@ impl ViewerApp {
             return;
         };
         let volume = volume.as_ref();
+        let editing_effective_cut =
+            best_cut_for_product(volume, editing_cut, &editing_product).unwrap_or(editing_cut);
 
         let product_buttons = global_displayable_products(volume)
             .into_iter()
             .map(|product| {
-                let target_cut = if is_displayable_on_cut(volume, editing_cut, &product) {
-                    Some(editing_cut)
+                let target_cut = if is_displayable_on_cut(volume, editing_effective_cut, &product) {
+                    Some(editing_effective_cut)
                 } else {
-                    best_cut_for_product(volume, editing_cut, &product)
+                    best_cut_for_product(volume, editing_effective_cut, &product)
                 };
                 (product, target_cut)
             })
@@ -13618,7 +14237,7 @@ impl ViewerApp {
                     cut.elevation_deg,
                     cut.radials.len(),
                     cut_start_time_utc(volume, index),
-                    index == editing_cut,
+                    index == editing_effective_cut,
                     is_displayable_on_cut(volume, index, &editing_product),
                 )
             })
@@ -14102,10 +14721,68 @@ impl ViewerApp {
                         self.set_storm_track_filters(max_tracks, min_dbz, ctx);
                     }
                 });
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    let keyframes = self.manual_camera_path.keyframes.len();
+                    ui.label(format!("Camera path: {keyframes} points"));
+                    if ui
+                        .small_button("Mark center")
+                        .on_hover_text(
+                            "Add/replace a manual camera keyframe at the current loop time and map center",
+                        )
+                        .clicked()
+                    {
+                        self.add_manual_camera_keyframe_from_center();
+                    }
+                    let can_follow = self.manual_camera_path.keyframes.len() >= 2;
+                    let mut follow = self.manual_camera_path.follow;
+                    if ui
+                        .add_enabled(
+                            can_follow,
+                            egui::Checkbox::new(&mut follow, "Follow path"),
+                        )
+                        .on_hover_text(
+                            "Interpolate the map center between manual keyframes during loop playback",
+                        )
+                        .changed()
+                    {
+                        self.event_explorer.camera_follow = None;
+                        self.storm_track_follow = None;
+                        self.manual_camera_path.follow = follow;
+                        if let Some(label) = self.apply_camera_follow_for_current_frame(ctx) {
+                            self.status = label;
+                        }
+                        ctx.request_repaint();
+                    }
+                    ui.checkbox(
+                        &mut self.manual_camera_path.hide_tracks_during_follow,
+                        "Hide tracks",
+                    )
+                    .on_hover_text("Hide storm/tornado track guide lines while following the manual path");
+                    if ui
+                        .small_button("Clear path")
+                        .on_hover_text("Remove manual camera keyframes")
+                        .clicked()
+                    {
+                        self.manual_camera_path.keyframes.clear();
+                        self.manual_camera_path.follow = false;
+                        ctx.request_repaint();
+                    }
+                });
             });
 
         // R7: TOOLS.
         Self::section_header(ui, "TOOLS");
+        let mut show_center_crosshair = self.app_settings.show_center_crosshair;
+        if ui
+            .checkbox(&mut show_center_crosshair, "Center crosshair")
+            .on_hover_text("Draw a red open-center reticle at the exact center of each map pane")
+            .changed()
+        {
+            self.app_settings.show_center_crosshair = show_center_crosshair;
+            let _ = self.app_settings.save();
+            ctx.request_repaint();
+        }
         ui.menu_button("Inspector…", |ui| {
             ui.checkbox(
                 &mut self.inspector_show_raw_vel,
@@ -14274,7 +14951,29 @@ impl ViewerApp {
                 let frame_ms = self.screen_loop_frame_ms();
                 ctx.request_repaint_after(Duration::from_millis(frame_ms));
             }
+            let mut low_sweeps = self.app_settings.loop_low_sweeps;
+            if ui
+                .checkbox(&mut low_sweeps, "Low sweeps")
+                .on_hover_text(
+                    "During playback, step through complete low-level SAILS sweeps inside each scan",
+                )
+                .changed()
+            {
+                self.app_settings.loop_low_sweeps = low_sweeps;
+                let _ = self.app_settings.save();
+                self.select_first_extra_pane_low_sweep_if_enabled(pane_slot, ctx);
+                ctx.request_repaint();
+            }
+            if self.app_settings.loop_low_sweeps {
+                self.low_sweep_filter_combo_ui(
+                    ui,
+                    ("pane_loop_low_sweep_filter", pane_slot),
+                    ctx,
+                    Some(pane_slot),
+                );
+            }
         });
+        self.extra_pane_low_sweep_cut_controls_ui(ui, ctx, pane_slot);
 
         let mut slider_index = selected_frame_index;
         let slider_response = ui
@@ -14406,7 +15105,24 @@ impl ViewerApp {
                 let frame_ms = self.screen_loop_frame_ms();
                 ctx.request_repaint_after(Duration::from_millis(frame_ms));
             }
+            let mut low_sweeps = self.app_settings.loop_low_sweeps;
+            if ui
+                .checkbox(&mut low_sweeps, "Low sweeps")
+                .on_hover_text(
+                    "During playback, step through complete low-level SAILS sweeps inside each scan",
+                )
+                .changed()
+            {
+                self.app_settings.loop_low_sweeps = low_sweeps;
+                let _ = self.app_settings.save();
+                self.select_first_history_low_sweep_if_enabled(ctx);
+                ctx.request_repaint();
+            }
+            if self.app_settings.loop_low_sweeps {
+                self.low_sweep_filter_combo_ui(ui, "loop_low_sweep_filter", ctx, None);
+            }
         });
+        self.history_low_sweep_cut_controls_ui(ui, ctx);
 
         ui.horizontal(|ui| {
             self.record_controls_ui(ui);
@@ -17002,10 +17718,14 @@ impl ViewerApp {
         self.draw_tor_tracks(painter, rect);
         self.draw_hazard_overlays(painter, rect);
         self.draw_rotation_markers(painter, rect);
-        self.draw_storm_tracks(painter, rect);
+        if !self.hide_camera_follow_guides() {
+            self.draw_storm_tracks(painter, rect);
+        }
         // Tornado track lines under the report dots (the dots mark the
         // climo report points; the lines are the surveyed paths).
-        self.draw_event_tracks(painter, rect);
+        if !self.hide_camera_follow_guides() {
+            self.draw_event_tracks(painter, rect);
+        }
         self.draw_spc_reports(painter, rect);
         self.draw_mping_reports(painter, rect);
         self.draw_glm(painter, rect);
@@ -17112,8 +17832,19 @@ impl ViewerApp {
                 // Nearest marker wins, US or international.
                 self.add_nearest_radar_overlay_at(rect, pointer, ui.ctx());
             } else if self.app_settings.right_click_loads_nearest {
-                let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
-                self.switch_to_nearest_radar_at(lon, lat, ui.ctx());
+                let marker_handled = self.handle_marker_click(
+                    &site_points,
+                    &intl_points,
+                    &community_points,
+                    &custom_poll_points,
+                    &[],
+                    pointer,
+                    ui.ctx(),
+                );
+                if !marker_handled {
+                    let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
+                    self.switch_to_nearest_radar_at(lon, lat, ui.ctx());
+                }
             }
             // else: the lowest-beam context menu owns plain right-click —
             // eagerly loading the nearest catalog site here raced the menu
@@ -17279,6 +18010,7 @@ impl ViewerApp {
         self.draw_mode_chip(painter, rect);
         self.draw_raw_velocity_tag(painter, rect);
         self.draw_cross_section_line(painter, rect, response.hover_pos());
+        self.draw_center_crosshair(painter, rect);
         self.draw_cursor_inspector(painter, rect, response.hover_pos());
         self.show_community_feed_menu(ui, rect);
 
@@ -17538,17 +18270,48 @@ impl ViewerApp {
                     // Nearest marker wins, US or international.
                     self.add_nearest_radar_overlay_at(cell, pointer, ui.ctx());
                 } else if self.app_settings.right_click_loads_nearest {
-                    let (lon, lat) = self.screen_to_lon_lat(cell, pointer);
-                    if self.app_settings.independent_panels && cell_index > 0 {
-                        let pane_slot = cell_index - 1;
-                        self.switch_extra_pane_to_nearest_radar_at(pane_slot, lon, lat, ui.ctx());
-                        if let Some(pane) = self.extra_panes.get(pane_slot) {
-                            self.map_center_lat = pane.map_center_lat;
-                            self.map_center_lon = pane.map_center_lon;
-                            self.map_scale = pane.map_scale;
-                        }
+                    let marker_handled = if self.app_settings.independent_panels && cell_index > 0 {
+                        self.handle_extra_pane_marker_click(
+                            cell_index - 1,
+                            &site_points,
+                            &intl_points,
+                            &community_points,
+                            &custom_poll_points,
+                            &[],
+                            pointer,
+                            ui.ctx(),
+                        )
+                    } else if owns_cell_radar {
+                        false
                     } else {
-                        self.switch_to_nearest_radar_at(lon, lat, ui.ctx());
+                        self.handle_marker_click(
+                            &site_points,
+                            &intl_points,
+                            &community_points,
+                            &custom_poll_points,
+                            &[],
+                            pointer,
+                            ui.ctx(),
+                        )
+                    };
+                    if !marker_handled {
+                        let (lon, lat) = self.screen_to_lon_lat(cell, pointer);
+                        if self.app_settings.independent_panels && cell_index > 0 {
+                            let pane_slot = cell_index - 1;
+                            self.switch_extra_pane_to_nearest_radar_at(
+                                pane_slot,
+                                lon,
+                                lat,
+                                ui.ctx(),
+                            );
+                            if let Some(pane) = self.extra_panes.get(pane_slot) {
+                                self.map_center_lat = pane.map_center_lat;
+                                self.map_center_lon = pane.map_center_lon;
+                                self.map_scale = pane.map_scale;
+                            }
+                        } else {
+                            self.switch_to_nearest_radar_at(lon, lat, ui.ctx());
+                        }
                     }
                 } else {
                     // Same lowest-beam menu as the single-pane map (an
@@ -17661,8 +18424,10 @@ impl ViewerApp {
             self.draw_tor_tracks(&cell_painter, cell);
             self.draw_hazard_overlays(&cell_painter, cell);
             self.draw_rotation_markers(&cell_painter, cell);
-            self.draw_storm_tracks(&cell_painter, cell);
-            self.draw_event_tracks(&cell_painter, cell);
+            if !self.hide_camera_follow_guides() {
+                self.draw_storm_tracks(&cell_painter, cell);
+                self.draw_event_tracks(&cell_painter, cell);
+            }
             self.draw_spc_reports(&cell_painter, cell);
             self.draw_mping_reports(&cell_painter, cell);
             self.draw_glm(&cell_painter, cell);
@@ -17714,6 +18479,7 @@ impl ViewerApp {
                 cell,
                 hovers.get(cell_index).copied().flatten(),
             );
+            self.draw_center_crosshair(&cell_painter, cell);
             self.draw_vrot_tool(&cell_painter, cell);
             self.pane_info_bar(ui, &cell_painter, cell, cell_index, &pane_product, pane_cut);
             self.draw_raw_velocity_tag_for_product(&cell_painter, cell, &pane_product, 34.0);
@@ -17844,10 +18610,16 @@ impl ViewerApp {
                 .position(|product| *product == pane.product)
                 .unwrap_or(0);
             let next = (current as isize + step).rem_euclid(products.len() as isize) as usize;
+            let next_product = products[next].clone();
+            let preferred_cut = pane.cut.unwrap_or(self.selected_cut);
+            let next_cut = best_cut_for_product(volume, preferred_cut, &next_product);
             // Keep the old texture (and its anchor key) on screen while the
             // new product renders — the request guard re-renders because the
             // key's product differs.
-            pane.product = products[next].clone();
+            pane.product = next_product;
+            if let Some(next_cut) = next_cut {
+                pane.cut = Some(next_cut);
+            }
             pane.render_ms = None;
         }
     }
@@ -19090,6 +19862,14 @@ impl ViewerApp {
             base_ms.max(LOW_ZOOM_RENDER_BACKOFF_MIN_MS)
         } else {
             base_ms
+        }
+    }
+
+    fn live_low_sweep_auto_advance_min_seconds(&self) -> i64 {
+        if self.app_settings.live_low_sweep_auto_advance {
+            FAST_LOW_SWEEP_AUTO_ADVANCE_MIN_SECONDS
+        } else {
+            LIVE_LOW_LEVEL_AUTO_ADVANCE_MIN_SECONDS
         }
     }
 
@@ -23778,6 +24558,33 @@ impl ViewerApp {
         }
     }
 
+    fn draw_center_crosshair(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if !self.app_settings.show_center_crosshair {
+            return;
+        }
+        let center = rect.center();
+        let gap = 5.0;
+        let arm = 18.0;
+        let shadow = egui::Stroke::new(3.0, egui::Color32::from_black_alpha(180));
+        let red = egui::Stroke::new(1.8, egui::Color32::from_rgb(255, 30, 30));
+        let segments = [
+            [
+                center + egui::vec2(-arm, 0.0),
+                center + egui::vec2(-gap, 0.0),
+            ],
+            [center + egui::vec2(gap, 0.0), center + egui::vec2(arm, 0.0)],
+            [
+                center + egui::vec2(0.0, -arm),
+                center + egui::vec2(0.0, -gap),
+            ],
+            [center + egui::vec2(0.0, gap), center + egui::vec2(0.0, arm)],
+        ];
+        for segment in segments {
+            painter.line_segment(segment, shadow);
+            painter.line_segment(segment, red);
+        }
+    }
+
     /// GR2-style Vrot measurement overlay: two clicked gates (max inbound +
     /// max outbound), connecting line, and a card with
     /// Vrot = (|Vin| + |Vout|) / 2, couplet diameter, and beam height.
@@ -23990,6 +24797,7 @@ impl ViewerApp {
 
     fn start_storm_track_follow(&mut self, hit: StormTrackHit, ctx: &egui::Context) {
         self.event_explorer.camera_follow = None;
+        self.manual_camera_path.follow = false;
         let follow = StormTrackFollow {
             track_id: hit.track_id,
             lead: self.storm_follow_lead,
@@ -26818,9 +27626,9 @@ impl ViewerApp {
         raob_points: &[(usize, egui::Pos2)],
         pointer: egui::Pos2,
         ctx: &egui::Context,
-    ) {
+    ) -> bool {
         if let Some(pane_slot) = self.independent_editing_pane() {
-            self.handle_extra_pane_marker_click(
+            return self.handle_extra_pane_marker_click(
                 pane_slot,
                 site_points,
                 intl_points,
@@ -26830,7 +27638,6 @@ impl ViewerApp {
                 pointer,
                 ctx,
             );
-            return;
         }
         // Any map click dismisses an open cluster picker (clicks on the
         // picker itself land on its foreground layer, never here); a
@@ -26843,10 +27650,18 @@ impl ViewerApp {
             nearest_marker_within(custom_poll_points, pointer),
             nearest_marker_within(raob_points, pointer),
         ) {
-            Some((MarkerFamily::Conus, index)) => self.selected_site_index = index,
+            Some((MarkerFamily::Conus, index)) => {
+                let Some(site) = self.sites.get(index).cloned() else {
+                    return false;
+                };
+                self.selected_site_index = index;
+                self.start_latest_level2_load(site, ctx);
+                self.remember_startup_site();
+                true
+            }
             Some((MarkerFamily::Intl, index)) => {
                 let Some(site) = data_source::international::intl_static_sites().get(index) else {
-                    return;
+                    return false;
                 };
                 self.status = format!(
                     "Polling {} · {}",
@@ -26854,18 +27669,19 @@ impl ViewerApp {
                     intl_provider_label(site.provider_id)
                 );
                 self.start_intl_poll(site.provider_id.to_owned(), site.site_id.clone(), ctx);
+                true
             }
             Some((MarkerFamily::Community, index)) => {
                 let Some(marker) = data_source::community_feeds::community_markers().get(index)
                 else {
-                    return;
+                    return false;
                 };
                 match marker.feed_indices.as_slice() {
                     [feed_index] => {
                         let Some(feed) =
                             data_source::community_feeds::community_feeds().get(*feed_index)
                         else {
-                            return;
+                            return false;
                         };
                         self.status = format!("Polling {} · research feed", marker.label);
                         self.start_known_feed_poll(feed.poll_url);
@@ -26875,15 +27691,20 @@ impl ViewerApp {
                     _ if open_menu != Some(index) => self.community_menu = Some(index),
                     _ => {}
                 }
+                true
             }
-            Some((MarkerFamily::CustomPoll, index)) => self.start_custom_poll_link(index),
+            Some((MarkerFamily::CustomPoll, index)) => {
+                self.start_custom_poll_link(index);
+                true
+            }
             Some((MarkerFamily::Raob, index)) => {
                 let Some(site) = self.raob_marker_sites().get(index).cloned() else {
-                    return;
+                    return false;
                 };
                 self.start_raob_sounding_for(site, None, ctx);
+                true
             }
-            None => {}
+            None => false,
         }
     }
 
@@ -29175,7 +29996,11 @@ fn format_site_label(site: &RadarSite) -> String {
 }
 
 fn site_is_terminal_radar(site: &RadarSite) -> bool {
-    site.level2_id.starts_with('T')
+    site_id_is_terminal_radar(&site.level2_id)
+}
+
+fn site_id_is_terminal_radar(site_id: &str) -> bool {
+    site_id.starts_with('T')
 }
 
 fn site_marker_label(site: &RadarSite) -> String {
@@ -33774,15 +34599,87 @@ fn displayable_cuts_for_product(volume: &RadarVolume, product: &DisplayProduct) 
         .collect()
 }
 
+fn low_sweep_cuts_for_product(
+    volume: &RadarVolume,
+    product: &DisplayProduct,
+    filter: LowSweepLoopFilter,
+) -> Vec<usize> {
+    let mut cuts = (0..volume.cuts.len())
+        .filter(|index| {
+            volume.cuts.get(*index).is_some_and(|cut| {
+                is_complete_live_low_level_tilt_for_site(cut, &volume.site.id)
+                    && is_displayable_on_cut(volume, *index, product)
+            })
+        })
+        .collect::<Vec<_>>();
+    cuts.sort_by_key(|index| {
+        cut_start_time_utc(volume, *index).unwrap_or_else(|| volume.volume_time.with_timezone(&Utc))
+    });
+    if filter == LowSweepLoopFilter::BaseOnly
+        && let Some(min_elevation) = cuts
+            .iter()
+            .filter_map(|index| volume.cuts.get(*index).map(|cut| cut.elevation_deg))
+            .filter(|elevation| elevation.is_finite())
+            .min_by(|a, b| a.total_cmp(b))
+    {
+        cuts.retain(|index| {
+            volume.cuts.get(*index).is_some_and(|cut| {
+                (cut.elevation_deg - min_elevation).abs()
+                    <= LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG
+            })
+        });
+    }
+    cuts
+}
+
+fn low_sweep_cuts_for_history_entry(
+    frame: &FrameHistoryEntry,
+    product: &DisplayProduct,
+    filter: LowSweepLoopFilter,
+    disabled_cuts: &BTreeSet<LowSweepCutKey>,
+) -> Vec<usize> {
+    low_sweep_cuts_for_product(frame.volume.as_ref(), product, filter)
+        .into_iter()
+        .filter(|cut| !disabled_cuts.contains(&LowSweepCutKey::new(&frame.identity, *cut)))
+        .collect()
+}
+
+fn low_sweep_cut_label(volume: &RadarVolume, cut_index: usize) -> String {
+    let Some(cut) = volume.cuts.get(cut_index) else {
+        return format!("#{cut_index:02}");
+    };
+    format!("#{cut_index:02} {:.2}", cut.elevation_deg)
+}
+
+fn low_sweep_cut_hover_text(volume: &RadarVolume, cut_index: usize) -> String {
+    let time = cut_start_time_utc(volume, cut_index)
+        .map(|time| time.format("%H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "time unknown".to_owned());
+    let Some(cut) = volume.cuts.get(cut_index) else {
+        return time;
+    };
+    format!(
+        "Cut #{cut_index:02}, {:.2} deg, {} radials, {time}",
+        cut.elevation_deg,
+        cut.radials.len()
+    )
+}
+
 fn live_partial_has_complete_low_level_tilt(volume: &RadarVolume) -> bool {
     volume.cuts.iter().enumerate().any(|(index, cut)| {
-        is_complete_live_low_level_tilt(cut) && !displayable_products(volume, index).is_empty()
+        is_complete_live_low_level_tilt_for_site(cut, &volume.site.id)
+            && !displayable_products(volume, index).is_empty()
     })
 }
 
-fn is_complete_live_low_level_tilt(cut: &ElevationCut) -> bool {
+fn is_complete_live_low_level_tilt_for_site(cut: &ElevationCut, site_id: &str) -> bool {
+    let min_radials = if site_id_is_terminal_radar(site_id) {
+        LIVE_COMPLETE_TERMINAL_LOW_LEVEL_TILT_MIN_RADIALS
+    } else {
+        LIVE_COMPLETE_LOW_LEVEL_TILT_MIN_RADIALS
+    };
     is_live_low_level_tilt(cut)
-        && cut.radials.len() >= LIVE_COMPLETE_LOW_LEVEL_TILT_MIN_RADIALS
+        && cut.radials.len() >= min_radials
         && live_tilt_azimuth_coverage_deg(cut) >= LIVE_COMPLETE_TILT_MIN_AZIMUTH_COVERAGE_DEG
 }
 
@@ -33820,11 +34717,15 @@ fn is_live_low_level_tilt(cut: &ElevationCut) -> bool {
     cut.elevation_deg <= LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG
 }
 
-fn is_allowed_live_low_level_tilt(cut: &ElevationCut, allow_incomplete: bool) -> bool {
+fn is_allowed_live_low_level_tilt_for_site(
+    cut: &ElevationCut,
+    site_id: &str,
+    allow_incomplete: bool,
+) -> bool {
     if allow_incomplete {
         is_live_low_level_tilt(cut)
     } else {
-        is_complete_live_low_level_tilt(cut)
+        is_complete_live_low_level_tilt_for_site(cut, site_id)
     }
 }
 
@@ -33974,6 +34875,7 @@ fn selected_cut_render_data_unchanged(
         && previous_grid.gate_range == next_grid.gate_range
 }
 
+#[cfg(test)]
 fn selection_for_installed_volume(
     previous_volume: Option<&RadarVolume>,
     previous_cut: usize,
@@ -33983,15 +34885,37 @@ fn selection_for_installed_volume(
     allow_incomplete_live_chunk_advance: bool,
     require_complete_live_cut: bool,
 ) -> (usize, DisplayProduct) {
+    selection_for_installed_volume_with_low_sweep_min_seconds(
+        previous_volume,
+        previous_cut,
+        previous_product,
+        volume,
+        VolumeSelectionPolicy {
+            allow_low_level_auto_advance,
+            allow_incomplete_live_chunk_advance,
+            require_complete_live_cut,
+            low_level_min_seconds: LIVE_LOW_LEVEL_AUTO_ADVANCE_MIN_SECONDS,
+        },
+    )
+}
+
+fn selection_for_installed_volume_with_low_sweep_min_seconds(
+    previous_volume: Option<&RadarVolume>,
+    previous_cut: usize,
+    previous_product: &DisplayProduct,
+    volume: &RadarVolume,
+    policy: VolumeSelectionPolicy,
+) -> (usize, DisplayProduct) {
     let same_site = previous_volume.is_some_and(|previous| previous.site.id == volume.site.id);
     if same_site
-        && allow_low_level_auto_advance
+        && policy.allow_low_level_auto_advance
         && let Some(next_cut) = latest_newer_low_level_cut(
             previous_volume,
             previous_cut,
             previous_product,
             volume,
-            allow_incomplete_live_chunk_advance,
+            policy.allow_incomplete_live_chunk_advance,
+            policy.low_level_min_seconds,
         )
     {
         return (next_cut, previous_product.clone());
@@ -34001,7 +34925,7 @@ fn selection_for_installed_volume(
             volume,
             previous_cut,
             previous_product,
-            require_complete_live_cut,
+            policy.require_complete_live_cut,
         )
     {
         return (previous_cut, previous_product.clone());
@@ -34011,13 +34935,13 @@ fn selection_for_installed_volume(
             volume,
             previous_cut,
             previous_product,
-            require_complete_live_cut,
+            policy.require_complete_live_cut,
         )
     {
         return (cut, previous_product.clone());
     }
 
-    default_selection_for_volume_with_live_filter(volume, require_complete_live_cut)
+    default_selection_for_volume_with_live_filter(volume, policy.require_complete_live_cut)
 }
 
 fn latest_newer_low_level_cut(
@@ -34026,13 +34950,18 @@ fn latest_newer_low_level_cut(
     previous_product: &DisplayProduct,
     volume: &RadarVolume,
     allow_incomplete_live_chunk_advance: bool,
+    low_level_min_seconds: i64,
 ) -> Option<usize> {
     let previous_volume = previous_volume?;
     if frame_identity_for_volume(previous_volume) != frame_identity_for_volume(volume) {
         return None;
     }
     let previous_cut_data = previous_volume.cuts.get(previous_cut)?;
-    if !is_allowed_live_low_level_tilt(previous_cut_data, allow_incomplete_live_chunk_advance) {
+    if !is_allowed_live_low_level_tilt_for_site(
+        previous_cut_data,
+        &previous_volume.site.id,
+        allow_incomplete_live_chunk_advance,
+    ) {
         return None;
     }
     let previous_time = cut_start_time_utc(previous_volume, previous_cut)?;
@@ -34040,12 +34969,16 @@ fn latest_newer_low_level_cut(
     (0..volume.cuts.len())
         .filter(|cut_index| {
             volume.cuts.get(*cut_index).is_some_and(|cut| {
-                is_allowed_live_low_level_tilt(cut, allow_incomplete_live_chunk_advance)
+                is_allowed_live_low_level_tilt_for_site(
+                    cut,
+                    &volume.site.id,
+                    allow_incomplete_live_chunk_advance,
+                )
             }) && is_displayable_on_cut(volume, *cut_index, previous_product)
         })
         .filter_map(|cut_index| {
             let cut_time = cut_start_time_utc(volume, cut_index)?;
-            ((cut_time - previous_time).num_seconds() >= LIVE_LOW_LEVEL_AUTO_ADVANCE_MIN_SECONDS)
+            ((cut_time - previous_time).num_seconds() >= low_level_min_seconds)
                 .then_some((cut_index, cut_time))
         })
         .max_by_key(|(_, cut_time)| *cut_time)
@@ -34104,7 +35037,9 @@ fn default_selection_for_volume_with_live_filter(
         let Some(cut) = volume.cuts.get(cut_index) else {
             continue;
         };
-        if require_complete_live_cut && !is_complete_live_tilt(cut) {
+        if require_complete_live_cut
+            && !is_complete_live_candidate_tilt_for_site(cut, &volume.site.id)
+        {
             continue;
         }
         if let Some(product) = displayable_products(volume, cut_index).first().cloned() {
@@ -34154,7 +35089,15 @@ fn is_displayable_on_live_candidate_cut(
         || volume
             .cuts
             .get(cut_index)
-            .is_some_and(is_complete_live_tilt)
+            .is_some_and(|cut| is_complete_live_candidate_tilt_for_site(cut, &volume.site.id))
+}
+
+fn is_complete_live_candidate_tilt_for_site(cut: &ElevationCut, site_id: &str) -> bool {
+    if is_live_low_level_tilt(cut) {
+        is_complete_live_low_level_tilt_for_site(cut, site_id)
+    } else {
+        is_complete_live_tilt(cut)
+    }
 }
 
 fn should_clear_display_for_latest_load(
@@ -36956,6 +37899,77 @@ mod tests {
     }
 
     #[test]
+    fn synced_velocity_pane_does_not_flip_to_ref_on_ref_only_live_partial() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(Arc::new(test_ref_then_velocity_volume()));
+        app.selected_cut = 0;
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
+        app.extra_panes[0].cut = Some(1);
+        app.display_live_chunk_updates = false;
+        let ctx = egui::Context::default();
+
+        app.install_volume_arc(
+            Arc::new(test_reflectivity_sails_volume_with_radials(
+                &[(0.5, 0)],
+                720,
+            )),
+            None,
+            false,
+            None,
+            FrameStatus::LivePartial,
+            &ctx,
+        );
+
+        assert_eq!(
+            app.extra_panes[0].product,
+            DisplayProduct::Moment(MomentType::Velocity)
+        );
+        assert_ne!(
+            app.extra_panes[0].product,
+            DisplayProduct::Moment(MomentType::Reflectivity)
+        );
+        assert_eq!(app.extra_panes[0].cut, Some(1));
+    }
+
+    #[test]
+    fn synced_velocity_pane_advances_to_newer_low_level_revisit() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(Arc::new(test_velocity_sails_volume_with_radials(
+            &[(0.5, 0)],
+            720,
+        )));
+        app.selected_cut = 0;
+        app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
+        app.extra_panes[0].cut = Some(0);
+        app.display_live_chunk_updates = false;
+        let ctx = egui::Context::default();
+
+        app.install_volume_arc(
+            Arc::new(test_velocity_sails_volume_with_radials(
+                &[(0.5, 0), (0.5, 86_000)],
+                720,
+            )),
+            None,
+            false,
+            None,
+            FrameStatus::LivePartial,
+            &ctx,
+        );
+
+        assert_eq!(
+            app.extra_panes[0].product,
+            DisplayProduct::Moment(MomentType::Velocity)
+        );
+        assert_eq!(app.extra_panes[0].cut, Some(1));
+    }
+
+    #[test]
     fn same_site_live_update_advances_to_newer_low_level_sails_sweep() {
         let product = DisplayProduct::Moment(MomentType::Reflectivity);
         let previous = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
@@ -36983,14 +37997,28 @@ mod tests {
     }
 
     #[test]
-    fn low_level_auto_advance_ignores_short_lag_and_high_tilts() {
+    fn low_level_auto_advance_accepts_sails_revisit_but_ignores_short_lag_and_high_tilts() {
         let product = DisplayProduct::Moment(MomentType::Reflectivity);
         let previous = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        let sails_revisit =
+            test_reflectivity_sails_volume_with_radials(&[(0.5, 0), (0.5, 86_000)], 720);
         let short_lag =
-            test_reflectivity_sails_volume_with_radials(&[(0.5, 0), (0.7, 75_000)], 720);
+            test_reflectivity_sails_volume_with_radials(&[(0.5, 0), (0.7, 30_000)], 720);
         let high_tilt =
             test_reflectivity_sails_volume_with_radials(&[(0.5, 0), (1.8, 180_000)], 720);
 
+        assert_eq!(
+            selection_for_installed_volume(
+                Some(&previous),
+                0,
+                &product,
+                &sails_revisit,
+                true,
+                false,
+                false,
+            ),
+            (1, product.clone())
+        );
         assert_eq!(
             selection_for_installed_volume(
                 Some(&previous),
@@ -37014,6 +38042,42 @@ mod tests {
                 false,
             ),
             (0, product)
+        );
+    }
+
+    #[test]
+    fn fast_low_sweep_auto_advance_accepts_short_low_level_revisit() {
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let previous = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        let short_lag =
+            test_reflectivity_sails_volume_with_radials(&[(0.5, 0), (0.7, 30_000)], 720);
+
+        assert_eq!(
+            selection_for_installed_volume(
+                Some(&previous),
+                0,
+                &product,
+                &short_lag,
+                true,
+                false,
+                false
+            ),
+            (0, product.clone())
+        );
+        assert_eq!(
+            selection_for_installed_volume_with_low_sweep_min_seconds(
+                Some(&previous),
+                0,
+                &product,
+                &short_lag,
+                VolumeSelectionPolicy {
+                    allow_low_level_auto_advance: true,
+                    allow_incomplete_live_chunk_advance: false,
+                    require_complete_live_cut: false,
+                    low_level_min_seconds: FAST_LOW_SWEEP_AUTO_ADVANCE_MIN_SECONDS,
+                },
+            ),
+            (1, product)
         );
     }
 
@@ -37062,6 +38126,113 @@ mod tests {
         assert!(!live_partial_has_complete_low_level_tilt(&tail_chunk));
         assert!(!live_partial_has_complete_low_level_tilt(&sector_chunk));
         assert!(live_partial_has_complete_low_level_tilt(&full_low));
+    }
+
+    #[test]
+    fn terminal_radar_complete_low_level_tilt_accepts_360_radials() {
+        let mut terminal = test_velocity_sails_volume_with_radials(&[(0.5, 0)], 360);
+        terminal.site.id = "TCVG".to_owned();
+        let mut nexrad = test_velocity_sails_volume_with_radials(&[(0.5, 0)], 360);
+        nexrad.site.id = "KTLX".to_owned();
+
+        assert!(live_partial_has_complete_low_level_tilt(&terminal));
+        assert!(!live_partial_has_complete_low_level_tilt(&nexrad));
+    }
+
+    #[test]
+    fn loop_low_sweeps_steps_inside_one_history_frame() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_low_sweeps = true;
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.selected_cut = 0;
+        let retained_texture_key = TextureKey {
+            volume_ptr: 42,
+            cut: 0,
+            product: DisplayProduct::Moment(MomentType::Reflectivity),
+            render_dealiased_velocity: false,
+            color_table_signature: 7,
+            storm_motion_key: (0, 0),
+            hail_levels_key: (32, 64),
+            smoothing: SmoothingMode::Native,
+            dealias_cascade: false,
+            gate_filter_decidbz: i16::MIN,
+            viewport: test_viewport_key(720, 480),
+        };
+        app.texture_key = Some(retained_texture_key.clone());
+        app.pending_render_key = Some(retained_texture_key.clone());
+        let volume = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0), (0.7, 30_000), (1.2, 55_000)],
+            720,
+        ));
+        app.volume = Some(Arc::clone(&volume));
+        app.frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from("loop-low-sweeps"),
+            volume,
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        });
+        let ctx = egui::Context::default();
+
+        assert_eq!(
+            low_sweep_cuts_for_product(
+                app.frame_history[0].volume.as_ref(),
+                &DisplayProduct::Moment(MomentType::Reflectivity),
+                LowSweepLoopFilter::All
+            ),
+            vec![0, 1, 2]
+        );
+        assert!(app.advance_history_loop_low_sweep(&ctx));
+        assert_eq!(app.selected_frame_index, 0);
+        assert_eq!(app.selected_cut, 1);
+        assert_eq!(app.texture_key.as_ref(), Some(&retained_texture_key));
+        assert!(
+            app.pending_render_key.is_none(),
+            "old pending key is dropped so the new low sweep can queue, but the visible texture is retained"
+        );
+    }
+
+    #[test]
+    fn low_sweep_base_only_filter_drops_jumpy_higher_low_cuts() {
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let volume = test_reflectivity_sails_volume_with_radials(
+            &[(0.09, 0), (0.97, 20_000), (0.10, 60_000), (0.98, 90_000)],
+            720,
+        );
+
+        assert_eq!(
+            low_sweep_cuts_for_product(&volume, &product, LowSweepLoopFilter::All),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(
+            low_sweep_cuts_for_product(&volume, &product, LowSweepLoopFilter::BaseOnly),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn low_sweep_manual_cut_veto_excludes_one_bad_cut_in_a_scan() {
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let volume = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0), (0.5, 30_000), (0.5, 60_000)],
+            720,
+        ));
+        let frame = FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from("loop-low-sweeps-veto"),
+            volume,
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        };
+        let mut disabled = BTreeSet::new();
+        disabled.insert(LowSweepCutKey::new(&frame.identity, 1));
+
+        assert_eq!(
+            low_sweep_cuts_for_history_entry(&frame, &product, LowSweepLoopFilter::All, &disabled),
+            vec![0, 2]
+        );
     }
 
     #[test]
@@ -37751,6 +38922,112 @@ mod tests {
         );
         assert!(app.status.contains("Waiting for VEL"));
         assert_eq!(app.frame_history.len(), 2);
+    }
+
+    #[test]
+    fn live_partial_with_half_built_low_velocity_keeps_previous_visible_frame() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+        let mut previous = test_ref_then_velocity_volume();
+        previous.site.id = "KTLX".to_owned();
+        previous.volume_time = scan_time;
+        let previous_frame = FrameHistoryEntry {
+            identity: frame_identity_for_volume(&previous),
+            path: PathBuf::from("KTLX-0130"),
+            volume: Arc::new(previous.clone()),
+            timings: Some(LoadTimings::default()),
+            status: FrameStatus::LiveComplete,
+            source_label: "realtime L2 KTLX".to_owned(),
+        };
+        app.volume = Some(Arc::clone(&previous_frame.volume));
+        app.selected_cut = 1;
+        app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
+        app.frame_history.push(previous_frame);
+
+        let mut next = test_velocity_sails_volume_with_radials(&[(0.5, 0)], 360);
+        next.site.id = "KTLX".to_owned();
+        next.volume_time = scan_time + chrono::Duration::minutes(3);
+
+        let ctx = egui::Context::default();
+        let selected = app.install_decoded_load_batch(
+            DecodedLoadBatch {
+                frames: vec![test_decoded_from_volume(
+                    PathBuf::from("KTLX-0133-velocity-half"),
+                    next,
+                    FrameStatus::LivePartial,
+                )],
+                selected_index: 0,
+            },
+            true,
+            true,
+            &ctx,
+        );
+
+        assert!(!selected);
+        assert_eq!(
+            app.volume
+                .as_ref()
+                .map(|volume| volume.volume_time.with_timezone(&Utc)),
+            Some(scan_time)
+        );
+        assert_eq!(app.selected_frame_index, 0);
+        assert!(app.status.contains("Waiting for VEL"));
+        assert_eq!(app.frame_history.len(), 2);
+    }
+
+    #[test]
+    fn live_partial_with_complete_low_velocity_switches_visible_frame() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+        let mut previous = test_ref_then_velocity_volume();
+        previous.site.id = "KTLX".to_owned();
+        previous.volume_time = scan_time;
+        let previous_frame = FrameHistoryEntry {
+            identity: frame_identity_for_volume(&previous),
+            path: PathBuf::from("KTLX-0130"),
+            volume: Arc::new(previous),
+            timings: Some(LoadTimings::default()),
+            status: FrameStatus::LiveComplete,
+            source_label: "realtime L2 KTLX".to_owned(),
+        };
+        app.volume = Some(Arc::clone(&previous_frame.volume));
+        app.selected_cut = 1;
+        app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
+        app.frame_history.push(previous_frame);
+
+        let next_time = scan_time + chrono::Duration::minutes(3);
+        let mut next = test_velocity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        next.site.id = "KTLX".to_owned();
+        next.volume_time = next_time;
+
+        let ctx = egui::Context::default();
+        let selected = app.install_decoded_load_batch(
+            DecodedLoadBatch {
+                frames: vec![test_decoded_from_volume(
+                    PathBuf::from("KTLX-0133-velocity-full"),
+                    next,
+                    FrameStatus::LivePartial,
+                )],
+                selected_index: 0,
+            },
+            true,
+            true,
+            &ctx,
+        );
+
+        assert!(selected);
+        assert_eq!(
+            app.volume
+                .as_ref()
+                .map(|volume| volume.volume_time.with_timezone(&Utc)),
+            Some(next_time)
+        );
+        assert_eq!(app.selected_frame_index, 1);
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Velocity)
+        );
+        assert_eq!(app.selected_cut, 0);
     }
 
     #[test]
@@ -38585,6 +39862,41 @@ mod tests {
             &ctx,
         );
         assert_eq!(app.community_menu, None);
+    }
+
+    #[test]
+    fn conus_marker_click_selects_site_and_starts_latest_load() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![
+            RadarSite::new("KOHX").with_location(
+                Some("Nashville".to_owned()),
+                Some(36.247),
+                Some(-86.562),
+            ),
+            RadarSite::new("KTLX").with_location(
+                Some("Oklahoma City".to_owned()),
+                Some(35.333),
+                Some(-97.278),
+            ),
+        ];
+        app.selected_site_index = 0;
+        app.app_settings.startup_site = Some("KTLX".to_owned());
+        let ctx = egui::Context::default();
+
+        app.handle_marker_click(
+            &[(1, egui::pos2(100.0, 100.0))],
+            &[],
+            &[],
+            &[],
+            &[],
+            egui::pos2(101.0, 100.0),
+            &ctx,
+        );
+
+        assert_eq!(app.selected_site_index, 1);
+        assert_eq!(app.pending_site_id.as_deref(), Some("KTLX"));
+        assert!(app.load_receiver.is_some());
+        assert!(app.status.contains("Loading latest L2 KTLX"));
     }
 
     #[test]
@@ -41027,6 +42339,7 @@ mod tests {
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
             frame_history: Vec::new(),
             selected_frame_index: 0,
+            low_sweep_disabled_cuts: BTreeSet::new(),
             tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(settings::tile_cache_dir())),
             basemap_style: tiles::TileStyle::DarkVector,
             open_color_tables_request: false,
@@ -41093,6 +42406,7 @@ mod tests {
             storm_track_min_dbz: DEFAULT_STORM_TRACK_MIN_DBZ,
             storm_track_follow: None,
             storm_follow_lead: StormFollowLead::default(),
+            manual_camera_path: ManualCameraPath::default(),
             rotation_markers: Vec::new(),
             rotation_markers_volume_ptr: 0,
             rotation_receiver: None,
@@ -42778,6 +44092,43 @@ mod tests {
                     .expect("reflectivity row");
             }
             cut.moments.insert(MomentType::Reflectivity, grid);
+            volume.cuts.push(cut);
+        }
+        volume
+    }
+
+    fn test_velocity_sails_volume_with_radials(
+        cuts: &[(f32, i32)],
+        radial_count: usize,
+    ) -> RadarVolume {
+        let gate_range = radar_core::GateRange {
+            first_gate_m: 500,
+            gate_spacing_m: 250,
+            gate_count: 3,
+        };
+        let mut volume = RadarVolume::new(
+            radar_core::RadarSite::new("TEST"),
+            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+        );
+        for (index, (elevation_deg, time_offset_ms)) in cuts.iter().enumerate() {
+            let mut cut = ElevationCut::new(*elevation_deg, Some(index as u8));
+            let mut grid = MomentGrid::new_u8(
+                MomentType::Velocity,
+                gate_range.clone(),
+                1.0,
+                64.0,
+                Some(0),
+                Some(1),
+            );
+            for row in 0..radial_count {
+                let mut radial = test_radial(row as f32, gate_range.clone());
+                radial.elevation_deg = *elevation_deg;
+                radial.time_offset_ms = *time_offset_ms + row as i32;
+                cut.radials.push(radial);
+                grid.push_u8_row_slice(row, &[64, 74, 54])
+                    .expect("velocity row");
+            }
+            cut.moments.insert(MomentType::Velocity, grid);
             volume.cuts.push(cut);
         }
         volume

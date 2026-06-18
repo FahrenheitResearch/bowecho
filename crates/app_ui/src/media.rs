@@ -726,8 +726,13 @@ impl ViewerApp {
         let _ = recorder.frame_tx.send(EncoderMsg::Frame { image, repeat });
         recorder.frames += 1;
         recorder.phase = FreeRecorderPhase::Ready;
-        recorder.next_capture_at = now + Duration::from_millis(u64::from(recorder.frame_delay_ms));
-        ctx.request_repaint_after(Duration::from_millis(u64::from(recorder.frame_delay_ms)));
+        let frame_delay = Duration::from_millis(u64::from(recorder.frame_delay_ms));
+        recorder.next_capture_at += frame_delay;
+        if recorder.next_capture_at <= now {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(recorder.next_capture_at - now);
+        }
     }
 
     /// Ends the recording (loop complete or user pressed Stop) and hands the
