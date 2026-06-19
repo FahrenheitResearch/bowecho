@@ -1275,8 +1275,6 @@ struct ViewerApp {
     sat_run_listings: Vec<rw_ui::SatRunListing>,
     show_satellite: bool,
     himawari_band: u8,
-    eumetsat_consumer_key: String,
-    eumetsat_consumer_secret: String,
     /// In-app Guide window (reference docs, opened on demand — never forced).
     show_guide: bool,
     /// Session marker for the last workflow preset the user applied. It is
@@ -4941,8 +4939,6 @@ impl ViewerApp {
             sat_run_listings: Vec::new(),
             show_satellite: false,
             himawari_band: 13,
-            eumetsat_consumer_key: String::new(),
-            eumetsat_consumer_secret: String::new(),
             show_guide: false,
             current_workflow: None,
             previous_workflow_snapshot: None,
@@ -13314,12 +13310,20 @@ impl eframe::App for ViewerApp {
         self.pump_ingest_responses();
         self.poll_surface_obs(&ctx);
         if self.glm_enabled {
-            if self.glm.is_none() {
-                self.glm = Some(glm_layer::GlmWorker::spawn(
-                    &ctx,
-                    "goes19",
-                    settings::glm_store_dir(),
-                ));
+            if let Some(satellite) = self.desired_glm_satellite() {
+                if self
+                    .glm
+                    .as_ref()
+                    .is_none_or(|glm| glm.satellite != satellite)
+                {
+                    self.glm = Some(glm_layer::GlmWorker::spawn(
+                        &ctx,
+                        satellite,
+                        settings::glm_store_dir(),
+                    ));
+                }
+            } else if self.glm.is_some() {
+                self.glm = None;
             }
             if let Some(glm) = &mut self.glm {
                 glm.pump();
@@ -23715,10 +23719,6 @@ impl ViewerApp {
         }
         ui.separator();
         let mut load_himawari = false;
-        let mut discover_mtg_fci = false;
-        let mut check_mtg_auth = false;
-        let mut download_mtg_fci = false;
-        let mut mtg_fci_paths: Option<Vec<PathBuf>> = None;
         const HIMAWARI_IR_BANDS: &[(u8, &str)] = &[
             (7, "B07 Shortwave IR 3.9"),
             (8, "B08 Upper WV 6.2"),
@@ -23736,8 +23736,6 @@ impl ViewerApp {
             .find(|(band, _)| *band == self.himawari_band)
             .map(|(_, label)| *label)
             .unwrap_or("B13 Clean IR 10.4");
-        let eumetsat_env_ready = std::env::var_os("EUMETSAT_CONSUMER_KEY").is_some()
-            && std::env::var_os("EUMETSAT_CONSUMER_SECRET").is_some();
         egui::CollapsingHeader::new("Other satellite sources")
             .default_open(true)
             .show(ui, |ui| {
@@ -23759,169 +23757,27 @@ impl ViewerApp {
                     {
                         load_himawari = true;
                     }
-                    if fixed_action_button(ui, "MTG FCI Discover", 116.0)
-                        .on_hover_text(
-                            "Search public EUMETSAT OpenSearch for recent MTG FCI product IDs; this does not download account-gated bytes",
-                        )
-                        .clicked()
-                    {
-                        discover_mtg_fci = true;
-                    }
-                    if fixed_action_button(ui, "MTG Auth Check", 120.0)
-                        .on_hover_text(
-                            "Request an EUMETSAT token from EUMETSAT_CONSUMER_KEY / EUMETSAT_CONSUMER_SECRET in this app process. Secrets are not saved.",
-                        )
-                        .clicked()
-                    {
-                        check_mtg_auth = true;
-                    }
-                    if fixed_action_button(ui, "MTG Download", 112.0)
-                        .on_hover_text(
-                            "Use EUMETSAT credentials to download the newest MTG FCI L1c package, unpack NetCDF body files, decode IR 10.5, and select the stored frame.",
-                        )
-                        .clicked()
-                    {
-                        download_mtg_fci = true;
-                    }
-                    let open_mtg_fci = fixed_action_button(ui, "Open MTG FCI...", 112.0)
-                        .on_hover_text(
-                            "Decode local MTG FCI CHK-BODY NetCDF file(s) into the satellite store",
-                        )
-                        .clicked();
-                    #[cfg(any(windows, target_os = "macos"))]
-                    if open_mtg_fci
-                        && let Some(paths) = rfd::FileDialog::new()
-                            .add_filter("MTG FCI NetCDF", &["nc"])
-                            .add_filter("HDF5/NetCDF", &["h5", "hdf5", "nc"])
-                            .pick_files()
-                    {
-                        mtg_fci_paths = Some(paths);
-                    }
-                    #[cfg(not(any(windows, target_os = "macos")))]
-                    if open_mtg_fci {
-                        self.status =
-                            "Local MTG FCI file picker is available on Windows/macOS builds"
-                                .to_owned();
-                    }
                 });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("EUMETSAT");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.eumetsat_consumer_key)
-                            .hint_text("consumer key")
-                            .password(true)
-                            .desired_width(150.0),
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.eumetsat_consumer_secret)
-                            .hint_text("consumer secret")
-                            .password(true)
-                            .desired_width(170.0),
-                    );
-                    if fixed_action_button(ui, "Clear", 52.0)
-                        .on_hover_text("Clear session-only EUMETSAT credentials from this app run")
-                        .clicked()
-                    {
-                        self.eumetsat_consumer_key.clear();
-                        self.eumetsat_consumer_secret.clear();
-                    }
-                });
-                let session_ready = !self.eumetsat_consumer_key.trim().is_empty()
-                    && !self.eumetsat_consumer_secret.trim().is_empty();
-                let auth_status = if eumetsat_env_ready {
-                    "EUMETSAT env: key+secret present"
-                } else if session_ready {
-                    "EUMETSAT session: key+secret entered"
-                } else {
-                    "EUMETSAT: missing key/secret"
-                };
-                ui.weak(auth_status).on_hover_text(
-                    "Paste credentials here for this run, or set EUMETSAT_CONSUMER_KEY and EUMETSAT_CONSUMER_SECRET before launching BowEcho. Secrets are not saved.",
+                ui.weak(
+                    "MTG/European satellite imagery is temporarily hidden until EUMETSAT access is reliable.",
                 );
-                ui.weak("GOES follows live continuously. Himawari and MTG actions write real gridded frames into the same player/store.");
+                ui.weak(
+                    "GOES follows live continuously. Himawari writes gridded full-disk frames into the same player/store.",
+                );
             });
-        if let Some(sat) = &self.sat {
-            if load_himawari {
-                let band = self.himawari_band.clamp(7, 16);
-                self.status = format!("Satellite: loading latest Himawari-9 B{band:02}");
-                self.sat_panel.apply_note(format!(
-                    "Himawari: queued latest H9 B{band:02} full-disk ingest"
-                ));
-                let spec = sat_worker::HimawariQuickSpec {
-                    band,
-                    ..sat_worker::HimawariQuickSpec::default()
-                };
-                sat.send(sat_worker::SatRequest::IngestLatestHimawari(spec));
-            }
-            if discover_mtg_fci {
-                self.status = "Satellite: searching MTG FCI".to_owned();
-                self.sat_panel
-                    .apply_note("MTG: queued public FCI discovery".to_string());
-                sat.send(sat_worker::SatRequest::DiscoverMtg {
-                    collection: "fci-l1c".to_string(),
-                    minutes: 720,
-                    count: 5,
-                });
-            }
-            if check_mtg_auth {
-                self.status = "Satellite: checking EUMETSAT credentials".to_owned();
-                self.sat_panel
-                    .apply_note("EUMETSAT: queued auth check".to_string());
-                let session_credentials = (
-                    self.eumetsat_consumer_key.trim().to_owned(),
-                    self.eumetsat_consumer_secret.trim().to_owned(),
-                );
-                let (consumer_key, consumer_secret) =
-                    if session_credentials.0.is_empty() || session_credentials.1.is_empty() {
-                        (None, None)
-                    } else {
-                        (Some(session_credentials.0), Some(session_credentials.1))
-                    };
-                sat.send(sat_worker::SatRequest::CheckMtgAuth {
-                    validity_secs: 3600,
-                    consumer_key,
-                    consumer_secret,
-                });
-            }
-            if download_mtg_fci {
-                self.status = "Satellite: downloading latest MTG FCI".to_owned();
-                self.sat_panel
-                    .apply_note("MTG FCI: queued credentialed latest download".to_string());
-                let session_credentials = (
-                    self.eumetsat_consumer_key.trim().to_owned(),
-                    self.eumetsat_consumer_secret.trim().to_owned(),
-                );
-                let (consumer_key, consumer_secret) =
-                    if session_credentials.0.is_empty() || session_credentials.1.is_empty() {
-                        (None, None)
-                    } else {
-                        (Some(session_credentials.0), Some(session_credentials.1))
-                    };
-                sat.send(sat_worker::SatRequest::DownloadLatestMtgFci(
-                    sat_worker::MtgFciDownloadSpec {
-                        collection: "fci-l1c".to_string(),
-                        minutes: 720,
-                        channel: "ir_105".to_string(),
-                        value: "brightness-temp".to_string(),
-                        downsample: 8,
-                        consumer_key,
-                        consumer_secret,
-                    },
-                ));
-            }
-            if let Some(paths) = mtg_fci_paths {
-                self.status = format!("Satellite: decoding {} MTG FCI file(s)", paths.len());
-                self.sat_panel
-                    .apply_note(format!("MTG FCI: queued {} local file(s)", paths.len()));
-                sat.send(sat_worker::SatRequest::IngestMtgFciLocal(
-                    sat_worker::MtgFciLocalSpec {
-                        paths,
-                        channel: "ir_105".to_string(),
-                        value: "brightness-temp".to_string(),
-                        downsample: 8,
-                    },
-                ));
-            }
+        if let Some(sat) = &self.sat
+            && load_himawari
+        {
+            let band = self.himawari_band.clamp(7, 16);
+            self.status = format!("Satellite: loading latest Himawari-9 B{band:02}");
+            self.sat_panel.apply_note(format!(
+                "Himawari: queued latest H9 B{band:02} full-disk ingest"
+            ));
+            let spec = sat_worker::HimawariQuickSpec {
+                band,
+                ..sat_worker::HimawariQuickSpec::default()
+            };
+            sat.send(sat_worker::SatRequest::IngestLatestHimawari(spec));
         }
         ui.separator();
         if self.sat_last_frame.is_some() || self.sat_layer.is_some() {
@@ -25600,6 +25456,10 @@ impl ViewerApp {
         self.app_settings.overlay_spc_reports = self.spc_reports_enabled;
         self.app_settings.overlay_mping_reports = self.mping_enabled;
         let _ = self.app_settings.save();
+    }
+
+    pub(crate) fn desired_glm_satellite(&self) -> Option<&'static str> {
+        glm_satellite_for_lon(self.map_center_lon)
     }
 
     /// SPC outlooks + reports: fetch when enabled, refresh every 5 min.
@@ -33825,10 +33685,14 @@ fn fixed_disabled_action_button(
         .inner
 }
 
-fn fixed_status_label(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(width, PANEL_BUTTON_HEIGHT), egui::Sense::hover());
-    ui.put(rect, egui::Label::new(text).truncate())
+fn fixed_status_label_with_sense(
+    ui: &mut egui::Ui,
+    text: &str,
+    width: f32,
+    sense: egui::Sense,
+) -> egui::Response {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, PANEL_BUTTON_HEIGHT), sense);
+    ui.put(rect, egui::Label::new(text).truncate().sense(sense))
 }
 
 fn fixed_state_dot(ui: &mut egui::Ui, color: egui::Color32, hover_text: &str) {
@@ -33843,6 +33707,39 @@ fn layer_state_color(state: &str) -> egui::Color32 {
         "loading" => egui::Color32::from_rgb(238, 218, 62),
         "live" => LIVE_COLOR,
         _ => egui::Color32::from_rgb(106, 132, 154),
+    }
+}
+
+pub(crate) fn glm_satellite_for_lon(lon: f32) -> Option<&'static str> {
+    let lon = normalize_lon(lon);
+    if (-180.0..=-100.0).contains(&lon) {
+        Some("goes18")
+    } else if (-110.0..=15.0).contains(&lon) {
+        Some("goes19")
+    } else {
+        None
+    }
+}
+
+pub(crate) fn glm_satellite_label(satellite: &str) -> &'static str {
+    match satellite {
+        "goes18" => "GOES-West",
+        "goes19" => "GOES-East",
+        _ => "GOES GLM",
+    }
+}
+
+pub(crate) fn compact_layer_status(status: &str, max_chars: usize) -> String {
+    let trimmed = status.trim();
+    if trimmed.chars().count() <= max_chars {
+        trimmed.to_owned()
+    } else {
+        let mut compact = trimmed
+            .chars()
+            .take(max_chars.saturating_sub(3))
+            .collect::<String>();
+        compact.push_str("...");
+        compact
     }
 }
 
@@ -33967,6 +33864,7 @@ fn layer_row(
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = ROW_SPACING_X;
+        let mut label_toggle: Option<&mut bool> = None;
         match vis {
             LayerRowVis::Toggle { value, hover } => {
                 let response = ui.checkbox(value, "");
@@ -33978,6 +33876,7 @@ fn layer_row(
                 if response.changed() {
                     changed = true;
                 }
+                label_toggle = Some(value);
             }
             LayerRowVis::Badge { glyph, hover } => {
                 let (rect, response) = ui.allocate_exact_size(
@@ -33988,9 +33887,33 @@ fn layer_row(
                 response.on_hover_text(hover);
             }
         }
-        let name_response = fixed_status_label(ui, name, name_width);
+        let name_response = fixed_status_label_with_sense(
+            ui,
+            name,
+            name_width,
+            if label_toggle.is_some() {
+                egui::Sense::click()
+            } else {
+                egui::Sense::hover()
+            },
+        );
         if !name_hover.is_empty() {
-            name_response.on_hover_text(name_hover.to_owned());
+            let name_response = name_response.on_hover_text(name_hover.to_owned());
+            if let Some(value) = label_toggle
+                && name_response
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+            {
+                *value = !*value;
+                changed = true;
+            }
+        } else if let Some(value) = label_toggle
+            && name_response
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+        {
+            *value = !*value;
+            changed = true;
         }
         if let Some(state) = state {
             fixed_state_dot(ui, layer_state_color(state), state);
@@ -49593,8 +49516,6 @@ mod tests {
             sat_run_listings: Vec::new(),
             show_satellite: false,
             himawari_band: 13,
-            eumetsat_consumer_key: String::new(),
-            eumetsat_consumer_secret: String::new(),
             show_guide: false,
             current_workflow: None,
             previous_workflow_snapshot: None,

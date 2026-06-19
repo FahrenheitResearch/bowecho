@@ -16,9 +16,10 @@ use eframe::egui;
 use crate::{
     LayerRowGear, LayerRowOpacity, LayerRowOrder, LayerRowRemove, LayerRowSpec, LayerRowVis,
     OrdArchiveLoadMode, PlacefileSlot, PollSource, RadarSite, SidebarTab, ViewerApp,
-    custom_poll_entry_label, custom_poll_entry_lat_lon, custom_poll_links_from_gis, dock,
-    format_site_label, intl_provider_label, layer_row, mesoanalysis, normalized_poll_url,
-    oa_derived, parse_custom_poll_marker_inputs, poll_url_name, poll_urls_match, spc_layers,
+    compact_layer_status, custom_poll_entry_label, custom_poll_entry_lat_lon,
+    custom_poll_links_from_gis, dock, format_site_label, glm_satellite_label, intl_provider_label,
+    layer_row, mesoanalysis, normalized_poll_url, oa_derived, parse_custom_poll_marker_inputs,
+    poll_url_name, poll_urls_match, spc_layers,
 };
 
 impl ViewerApp {
@@ -477,39 +478,71 @@ impl ViewerApp {
         // grammar (spec §2.3). No opacity in v1: age-fade is
         // intrinsic to the layer.
         {
-            let flash_count = if self.glm_enabled {
-                self.glm.as_ref().map(|glm| {
-                    let frame_ms = chrono::Utc::now().timestamp_millis();
-                    let window_min = self.style_registry.glm().window_minutes;
-                    (glm.frame_flashes(frame_ms, window_min).count(), window_min)
-                })
+            let glm_window_min = self.style_registry.glm().window_minutes;
+            let glm_source = self.desired_glm_satellite();
+            let glm_state: Option<&'static str> = if self.glm_enabled {
+                if self.glm.is_some() {
+                    Some("live")
+                } else if glm_source.is_some() {
+                    Some("loading")
+                } else {
+                    Some("outside")
+                }
             } else {
                 None
             };
+            let glm_line = if self.glm_enabled {
+                if let Some(glm) = &self.glm {
+                    let frame_ms = chrono::Utc::now().timestamp_millis();
+                    let count = glm.frame_flashes(frame_ms, glm_window_min).count();
+                    let source = glm_satellite_label(&glm.satellite);
+                    if count > 0 {
+                        format!("{source} {count} fl/{glm_window_min}m")
+                    } else {
+                        format!("{source} {}", compact_layer_status(&glm.last_status, 26))
+                    }
+                } else if let Some(source) = glm_source {
+                    format!("{} starting", glm_satellite_label(source))
+                } else {
+                    "outside GOES view".to_owned()
+                }
+            } else {
+                String::new()
+            };
+            let source_note = if let Some(source) = glm_source {
+                format!(
+                    "Source: {} GLM, selected from the current map longitude.",
+                    glm_satellite_label(source)
+                )
+            } else {
+                "Source: GOES GLM is unavailable for this map longitude.".to_owned()
+            };
+            let show_glm_line = self.glm_enabled;
             if layer_row(
                 ui,
                 LayerRowSpec {
                     vis: LayerRowVis::Toggle {
                         value: &mut self.glm_enabled,
-                        hover: "GOES GLM flashes, free via AWS (no key): trailing 10-minute window, age-faded, time-synced to the radar loop. First data ~1 min after enabling (S3 poll + granule decode).",
+                        hover: "GOES GLM flashes, free via AWS (no key): trailing 10-minute window, age-faded, time-synced to the radar loop. First data usually arrives after the first S3 poll + granule decode.",
                     },
                     name: "Lightning",
                     name_width: crate::NAME_W_STD,
-                    name_hover: "GOES GLM lightning flashes (trailing window, age-faded, loop-synced)",
+                    name_hover: "GOES GLM lightning flashes. The row label toggles the layer too. Europe/Japan require a separate MTG/Himawari lightning path and are not shown by this layer.",
+                    state: glm_state,
                     gear: Some(LayerRowGear::Menu {
                         hover: "Lightning layer options",
-                        content: Box::new(|ui| {
-                            ui.weak("Source: GOES-East GLM (fixed for now;");
-                            ui.weak("satellite pick lands here next).");
+                        content: Box::new(move |ui| {
+                            ui.weak(source_note);
+                            ui.weak("MTG Lightning Imager is not enabled here yet.");
                             ui.separator();
                             ui.weak("Appearance controls land here next.");
                         }),
                     }),
                     ..Default::default()
                 },
-                |ui| {
-                    if let Some((count, window_min)) = flash_count {
-                        ui.weak(format!("{count} fl/{window_min}m"));
+                move |ui| {
+                    if show_glm_line {
+                        ui.weak(glm_line);
                     }
                 },
             ) {

@@ -68,20 +68,24 @@ pub enum SatRequest {
     /// Download/decode the latest Himawari AHI frame into the shared sat store.
     IngestLatestHimawari(HimawariQuickSpec),
     /// Public EUMETSAT OpenSearch discovery for MTG products.
+    #[allow(dead_code)]
     DiscoverMtg {
         collection: String,
         minutes: i64,
         count: usize,
     },
     /// Verify EUMETSAT credentials from session fields or process environment.
+    #[allow(dead_code)]
     CheckMtgAuth {
         validity_secs: u64,
         consumer_key: Option<String>,
         consumer_secret: Option<String>,
     },
     /// Download the latest credential-gated MTG FCI product and decode it.
+    #[allow(dead_code)]
     DownloadLatestMtgFci(MtgFciDownloadSpec),
     /// Decode local MTG FCI CHK-BODY NetCDF file(s) into the shared sat store.
+    #[allow(dead_code)]
     IngestMtgFciLocal(MtgFciLocalSpec),
 }
 
