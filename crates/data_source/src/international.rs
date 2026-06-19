@@ -186,8 +186,8 @@ pub trait IntlProvider: Send + Sync {
 /// Single-file ODIM PVOL feeds (one HDF5 download per frame): SMHI Sweden,
 /// DMI Denmark, GeoSphere Austria, FMI Finland. Split-volume assembly
 /// feeds (one frame = several ODIM files merged with
-/// `radar_core::merge_radar_volumes`): SHMU Slovakia, DWD Germany, CHMI
-/// Czechia. Multi-station tar feed (site-filtered decode, see
+/// `radar_core::merge_radar_volumes`): SHMU Slovakia, DWD Germany (REF+VEL
+/// by default), CHMI Czechia. Multi-station tar feed (site-filtered decode, see
 /// [`JmaProvider`]): JMA Japan. Single-site KAIA bridge for Estonia's Harku
 /// radar, which is not currently present in ORD's rolling cache:
 /// [`KaiaEstoniaProvider`]. Multi-country feed mixing single-file and split
@@ -200,7 +200,7 @@ pub fn intl_providers() -> Vec<Box<dyn IntlProvider>> {
         Box::new(GeoSphereProvider::new()),
         Box::new(FmiProvider::new()),
         Box::new(ShmuProvider::new()),
-        Box::new(DwdProvider::with_dual_pol()),
+        Box::new(DwdProvider::new()),
         Box::new(ChmiProvider::new()),
         Box::new(JmaProvider),
         Box::new(KaiaEstoniaProvider::new()),

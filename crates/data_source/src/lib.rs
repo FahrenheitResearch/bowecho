@@ -21,13 +21,14 @@ use thiserror::Error;
 pub const LEVEL2_ARCHIVE_BUCKET: &str = "unidata-nexrad-level2";
 pub const LEVEL2_CHUNKS_BUCKET: &str = "unidata-nexrad-level2-chunks";
 const HTTP_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(4);
-const HTTP_METADATA_TIMEOUT: StdDuration = StdDuration::from_secs(8);
+const HTTP_METADATA_TIMEOUT: StdDuration = StdDuration::from_secs(25);
 /// Whole-request budget on the download client. Field report: SMHI qcvol
 /// volumes run 17-18 MB and a user on a slow link hit the old 45 s budget
 /// MID-BODY every tick (surfacing as reqwest's cryptic "error decoding
 /// response body"). 180 s admits ~120 KB/s links; pathological hangs
 /// occupy only a background poll thread.
 const HTTP_DOWNLOAD_TIMEOUT: StdDuration = StdDuration::from_secs(180);
+const HTTP_VOLUME_RETRY_BACKOFF: StdDuration = StdDuration::from_secs(2);
 const HTTP_USER_AGENT: &str = "bowecho (GR2Analyst-compatible placefile client)";
 const REALTIME_VOLUME_ID_MODULUS: u16 = 1000;
 const REALTIME_CHUNK_LIST_MAX_KEYS: usize = 1000;
@@ -419,9 +420,20 @@ pub fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
 /// for sprite sheets on the metadata client and rejects anything over
 /// 4 MiB.
 pub fn fetch_volume_bytes(url: &str) -> Result<Vec<u8>> {
-    let bytes = send_with_retry(&download_http_client(), url)?
-        .error_for_status()?
-        .bytes()?;
+    let client = download_http_client();
+    let result = send_with_retry(&client, url)
+        .and_then(|response| response.error_for_status())
+        .and_then(|response| response.bytes());
+    let bytes = match result {
+        Ok(bytes) => bytes,
+        Err(err) if should_retry_volume_fetch(&err) => {
+            thread::sleep(HTTP_VOLUME_RETRY_BACKOFF);
+            send_with_retry(&client, url)
+                .and_then(|response| response.error_for_status())
+                .and_then(|response| response.bytes())?
+        }
+        Err(err) => return Err(err.into()),
+    };
     const MAX: usize = 256 * 1024 * 1024;
     if bytes.len() > MAX {
         return Err(DataSourceError::Io(std::io::Error::new(
@@ -430,6 +442,10 @@ pub fn fetch_volume_bytes(url: &str) -> Result<Vec<u8>> {
         )));
     }
     Ok(bytes.to_vec())
+}
+
+fn should_retry_volume_fetch(err: &reqwest::Error) -> bool {
+    !err.is_status() && (err.is_timeout() || err.is_body() || err.is_decode())
 }
 
 /// reqwest's Display drops the cause ("error decoding response body" with

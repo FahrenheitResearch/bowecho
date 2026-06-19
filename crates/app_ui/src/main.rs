@@ -1370,7 +1370,7 @@ struct ViewerApp {
     /// frames oldest-first from [`fetch_intl_recent_frames`], installed
     /// through the same `install_polled_volume` history path the poll
     /// uses. While set, the regular intl poll tick defers.
-    intl_loop_rx: Option<mpsc::Receiver<IntlLoopFrameResult>>,
+    intl_loop_rx: Option<mpsc::Receiver<IntlLoopFrameMessage>>,
     /// Frames landed by the current/last Load Loop stream — drives the
     /// "this catalog only lists the newest frame" hint on completion.
     intl_loop_frames: usize,
@@ -1591,6 +1591,10 @@ type IntlFrameResult = std::result::Result<Option<(String, RadarVolume)>, String
 /// One streamed Load Loop frame (no unchanged marker — every plan in the
 /// window downloads).
 type IntlLoopFrameResult = std::result::Result<(String, RadarVolume), String>;
+enum IntlLoopFrameMessage {
+    Progress(ArchiveLoadProgress),
+    Frame(IntlLoopFrameResult),
+}
 type OrdArchiveListResult =
     std::result::Result<Vec<data_source::international::OrdArchivePlan>, String>;
 
@@ -16999,7 +17003,7 @@ impl ViewerApp {
             }
             if fixed_action_button(ui, "Load Loop", 82.0)
                 .on_hover_text(
-                    "Loop of recent scans. International feeds with recent catalogs (SMHI/FMI/ORD) \
+                    "Loop of recent scans. International feeds with recent catalogs (SMHI/FMI/KAIA/ORD) \
                      load loops; single-frame feeds start at newest scan and grow live",
                 )
                 .clicked()
@@ -24773,6 +24777,15 @@ impl ViewerApp {
         self.intl_loop_frames = 0;
         self.intl_loop_requested = count;
         self.status = format!("Loading {provider_id}/{site_id} loop…");
+        let label = intl_provider_label(&provider_id);
+        let progress = ArchiveLoadProgress {
+            label: "International loop".to_owned(),
+            detail: format!("Cataloging {label} {site_id}"),
+            done: 0,
+            total: count,
+        };
+        self.status = progress.status_text();
+        self.archive_load_progress = Some(progress);
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
             fetch_intl_recent_frames(&provider_id, &site_id, count, &sender);
@@ -24791,12 +24804,16 @@ impl ViewerApp {
         }
         let mut frames = Vec::new();
         let mut errors = Vec::new();
+        let mut progress_update = None;
         let mut done = false;
         if let Some(receiver) = &self.intl_loop_rx {
             loop {
                 match receiver.try_recv() {
-                    Ok(Ok(frame)) => frames.push(frame),
-                    Ok(Err(message)) => errors.push(message),
+                    Ok(IntlLoopFrameMessage::Progress(progress)) => {
+                        progress_update = Some(progress);
+                    }
+                    Ok(IntlLoopFrameMessage::Frame(Ok(frame))) => frames.push(frame),
+                    Ok(IntlLoopFrameMessage::Frame(Err(message))) => errors.push(message),
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         done = true;
@@ -24807,6 +24824,11 @@ impl ViewerApp {
         }
         let landed = !frames.is_empty();
         self.intl_loop_frames += frames.len();
+        if let Some(progress) = progress_update {
+            self.intl_loop_requested = progress.total.max(1);
+            self.status = progress.status_text();
+            self.archive_load_progress = Some(progress);
+        }
         for (identity, volume) in frames {
             self.poll_last_file = Some(identity.clone());
             self.install_polled_volume(&identity, Arc::new(volume), ctx);
@@ -24816,12 +24838,13 @@ impl ViewerApp {
         } else if done {
             self.intl_loop_rx = None;
             self.intl_loop_requested = 0;
+            self.archive_load_progress = None;
             // One frame back = this provider's catalog only lists the
             // newest scan — say so instead of leaving a "loop" of one
             // frame unexplained (full loops: SMHI Sweden, FMI Finland).
             self.status = if self.intl_loop_frames <= 1 {
                 "This feed lists only its newest scan — the loop grows as new scans arrive \
-                 (full loops: Sweden SMHI, Finland FMI)"
+                 (full loops: SMHI Sweden, FMI Finland, KAIA Estonia, EUMETNET ORD)"
                     .to_owned()
             } else {
                 format!(
@@ -24835,6 +24858,7 @@ impl ViewerApp {
         if done {
             self.intl_loop_rx = None;
             self.intl_loop_requested = 0;
+            self.archive_load_progress = None;
         } else {
             ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
         }
@@ -38533,6 +38557,43 @@ fn fetch_assemble_intl_plan(
     Ok((plan.identity.clone(), volume))
 }
 
+fn compact_intl_identity(identity: &str) -> String {
+    const MAX_CHARS: usize = 96;
+    if identity.chars().count() <= MAX_CHARS {
+        identity.to_owned()
+    } else {
+        let mut compact = identity
+            .chars()
+            .take(MAX_CHARS.saturating_sub(3))
+            .collect::<String>();
+        compact.push_str("...");
+        compact
+    }
+}
+
+fn intl_plan_progress(
+    provider_label: &str,
+    site_id: &str,
+    plan: &data_source::international::FramePlan,
+    done: usize,
+    total: usize,
+) -> ArchiveLoadProgress {
+    let parts = plan.parts.len();
+    ArchiveLoadProgress {
+        label: "International loop".to_owned(),
+        detail: format!(
+            "{} {}: {} ({} part{})",
+            provider_label,
+            site_id,
+            compact_intl_identity(&plan.identity),
+            parts,
+            if parts == 1 { "" } else { "s" }
+        ),
+        done,
+        total,
+    }
+}
+
 /// Load Loop for an international feed (field request: the button used to
 /// fall through to the last US site): describe up to `count` recent frames
 /// via the provider's `recent`, then fetch + assemble each OLDEST FIRST,
@@ -38543,32 +38604,54 @@ fn fetch_intl_recent_frames(
     provider_id: &str,
     site_id: &str,
     count: usize,
-    sender: &mpsc::Sender<IntlLoopFrameResult>,
+    sender: &mpsc::Sender<IntlLoopFrameMessage>,
 ) {
     let providers = data_source::international::intl_providers();
     let Some(provider) = providers
         .iter()
         .find(|provider| provider.id() == provider_id)
     else {
-        let _ = sender.send(Err(format!(
+        let _ = sender.send(IntlLoopFrameMessage::Frame(Err(format!(
             "unknown international provider '{provider_id}'"
-        )));
+        ))));
         return;
     };
     let plans = match provider.recent(site_id, count) {
         Ok(plans) => plans,
         Err(err) => {
-            let _ = sender.send(Err(err));
+            let _ = sender.send(IntlLoopFrameMessage::Frame(Err(err)));
             return;
         }
     };
     // Providers return oldest-first; keep the NEWEST `count` defensively.
     let skip = plans.len().saturating_sub(count);
-    for plan in plans.into_iter().skip(skip) {
+    let plans: Vec<_> = plans.into_iter().skip(skip).collect();
+    let total = plans.len();
+    let provider_label = provider.label().to_owned();
+    for (index, plan) in plans.into_iter().enumerate() {
+        if sender
+            .send(IntlLoopFrameMessage::Progress(intl_plan_progress(
+                &provider_label,
+                site_id,
+                &plan,
+                index,
+                total,
+            )))
+            .is_err()
+        {
+            return;
+        }
         let message = fetch_assemble_intl_plan(&plan, site_id);
-        if sender.send(message).is_err() {
+        if sender.send(IntlLoopFrameMessage::Frame(message)).is_err() {
             return; // receiver dropped (source switched) — stop downloading
         }
+        let _ = sender.send(IntlLoopFrameMessage::Progress(intl_plan_progress(
+            &provider_label,
+            site_id,
+            &plan,
+            index + 1,
+            total,
+        )));
     }
 }
 
@@ -50541,7 +50624,7 @@ mod tests {
         );
         app.oa_rx = None;
 
-        let (_sender, receiver) = mpsc::channel::<IntlLoopFrameResult>();
+        let (_sender, receiver) = mpsc::channel::<IntlLoopFrameMessage>();
         app.intl_loop_rx = Some(receiver);
         app.intl_loop_frames = 4;
         app.intl_loop_requested = 12;
