@@ -22900,8 +22900,7 @@ impl ViewerApp {
     /// shared with the docked Sounding pane — the overhaul's headline ask
     /// ("size soundings how I want and snap to its own thing").
     /// Effective playback frame duration: the 700 ms baseline scaled by
-    /// the persisted loop speed (200 % = twice as fast). Also the
-    /// recorder's GIF/MP4 frame timing, so exports match the screen.
+    /// the persisted loop speed (200 % = twice as fast).
     fn loop_frame_ms(&self) -> u64 {
         let percent = u64::from(
             self.app_settings
@@ -22909,6 +22908,10 @@ impl ViewerApp {
                 .clamp(10, MAX_LOOP_SPEED_PERCENT),
         );
         (HISTORY_LOOP_FRAME_MS * 100 / percent).max(8)
+    }
+
+    fn loop_record_frame_ms(&self) -> u64 {
+        HISTORY_LOOP_FRAME_MS
     }
 
     fn screen_loop_frame_ms(&self) -> u64 {
@@ -45163,6 +45166,15 @@ mod tests {
             app.loop_frame_ms() < 20,
             "64x should not be clamped to the old 10x scheduler"
         );
+    }
+
+    #[test]
+    fn loop_recording_keeps_one_x_cadence_even_at_high_screen_speed() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_speed_percent = 6400;
+
+        assert!(app.loop_frame_ms() < 20);
+        assert_eq!(app.loop_record_frame_ms(), HISTORY_LOOP_FRAME_MS);
     }
 
     #[test]

@@ -11,8 +11,7 @@
 //! to settle before each capture, so the output contains exactly one clean
 //! cycle regardless of wall-clock decode/render latency. Frames stream to a
 //! background encoder thread (GIF via the `image` crate's NeuQuant
-//! quantizer, or H.264 MP4 by piping raw RGBA into an `ffmpeg` found on
-//! PATH).
+//! quantizer, or MP4/WebP by piping raw RGBA into an `ffmpeg` found on PATH).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -92,6 +91,7 @@ pub(crate) enum RecordFormat {
     Auto,
     Gif,
     Mp4,
+    WebP,
 }
 
 impl RecordFormat {
@@ -100,6 +100,7 @@ impl RecordFormat {
             Self::Auto => "Auto",
             Self::Gif => "GIF",
             Self::Mp4 => "MP4",
+            Self::WebP => "WebP",
         }
     }
 }
@@ -108,6 +109,7 @@ impl RecordFormat {
 enum ResolvedRecordFormat {
     Gif,
     Mp4,
+    WebP,
 }
 
 impl ResolvedRecordFormat {
@@ -115,6 +117,7 @@ impl ResolvedRecordFormat {
         match self {
             Self::Gif => "GIF",
             Self::Mp4 => "MP4",
+            Self::WebP => "WebP",
         }
     }
 
@@ -122,6 +125,7 @@ impl ResolvedRecordFormat {
         match self {
             Self::Gif => "gif",
             Self::Mp4 => "mp4",
+            Self::WebP => "webp",
         }
     }
 }
@@ -189,6 +193,8 @@ pub(crate) struct MediaShare {
     record_fps: u16,
     /// Lazily detected on first record; `ffmpeg -version` on PATH.
     ffmpeg_available: Option<bool>,
+    /// Lazily detected when WebP is requested; needs ffmpeg's animated WebP encoder.
+    ffmpeg_webp_available: Option<bool>,
     recorder: Option<RecorderState>,
     free_recorder: Option<FreeRecorderState>,
 }
@@ -204,6 +210,7 @@ impl Default for MediaShare {
             record_format: RecordFormat::Auto,
             record_fps: DEFAULT_RECORD_FPS,
             ffmpeg_available: None,
+            ffmpeg_webp_available: None,
             recorder: None,
             free_recorder: None,
         }
@@ -232,7 +239,7 @@ impl MediaShare {
 
     pub(crate) fn record_settings_label(&self) -> String {
         format!(
-            "{} {} · free {}fps",
+            "{} {} · loop 1x · free {}fps",
             self.record_size.label(),
             self.record_format.label(),
             self.normalized_record_fps()
@@ -461,12 +468,19 @@ impl ViewerApp {
                 .selected_text(self.media.record_format.label())
                 .width(56.0)
                 .show_ui(ui, |ui| {
-                    for format in [RecordFormat::Auto, RecordFormat::Gif, RecordFormat::Mp4] {
+                    for format in [
+                        RecordFormat::Auto,
+                        RecordFormat::Gif,
+                        RecordFormat::Mp4,
+                        RecordFormat::WebP,
+                    ] {
                         ui.selectable_value(&mut self.media.record_format, format, format.label());
                     }
                 })
                 .response
-                .on_hover_text("Auto = MP4 when ffmpeg is on PATH, otherwise GIF");
+                .on_hover_text(
+                    "Auto = MP4 when ffmpeg is on PATH, otherwise GIF. WebP uses ffmpeg's animated WebP encoder.",
+                );
             let before_fps = self.media.record_fps;
             egui::ComboBox::from_id_salt("media_record_fps")
                 .selected_text(format!("{}fps", self.media.normalized_record_fps()))
@@ -478,8 +492,7 @@ impl ViewerApp {
                 })
                 .response
                 .on_hover_text(
-                    "Free recording capture/playback FPS. Loop recording still follows \
-                     the loop speed setting so radar-frame exports match playback.",
+                    "Free recording capture/playback FPS. Loop recording exports at a stable 1x radar cadence so high-speed playback does not make one-second loops.",
                 );
             self.media.record_fps = normalize_record_fps(self.media.record_fps);
             if self.media.record_fps != before_fps {
@@ -661,7 +674,7 @@ impl ViewerApp {
         self.maybe_auto_sync_timeline_warnings(ctx);
         let waiting_for_timeline_overlays = !self.loop_record_timeline_overlays_settled();
         let waiting_for_time_layers = !self.loop_record_time_layers_settled();
-        let (format, mp4_fallback) = self.resolve_record_format();
+        let (format, fallback_note) = self.resolve_record_format();
         let path = match new_capture_path(format.extension()) {
             Ok(path) => path,
             Err(err) => {
@@ -672,9 +685,10 @@ impl ViewerApp {
         let frame_tx = spawn_loop_encoder(LoopEncodeJob {
             format,
             max_width: self.media.record_size.max_width(),
-            // The persisted loop speed: a recording plays back at exactly
-            // the on-screen cadence (field request: speed control).
-            frame_delay_ms: self.loop_frame_ms() as u32,
+            // Deterministic loop exports use the stable 1x radar cadence,
+            // not whatever high-speed playback rate the operator is using
+            // to scrub around on screen.
+            frame_delay_ms: self.loop_record_frame_ms() as u32,
             frame_rate_fps: None,
             out_path: path,
             result_tx: self.media.result_tx.clone(),
@@ -708,8 +722,8 @@ impl ViewerApp {
                 }
             }
         }
-        self.status = if mp4_fallback {
-            format!("ffmpeg not found on PATH; recording {total} frames as GIF instead...")
+        self.status = if let Some(fallback_note) = fallback_note {
+            format!("{fallback_note}; recording {total} frames as GIF instead...")
         } else if waiting_for_time_layers {
             format!(
                 "Recording loop: waiting for timeline layers, then {total} frames as {}...",
@@ -743,7 +757,7 @@ impl ViewerApp {
             self.status = "Stop loop recording before starting free recording".to_owned();
             return;
         }
-        let (format, mp4_fallback) = self.resolve_record_format();
+        let (format, fallback_note) = self.resolve_record_format();
         let path = match new_capture_path(format.extension()) {
             Ok(path) => path,
             Err(err) => {
@@ -771,8 +785,8 @@ impl ViewerApp {
             frame_tx,
             format,
         });
-        self.status = if mp4_fallback {
-            "ffmpeg not found on PATH; free recording as GIF instead...".to_owned()
+        self.status = if let Some(fallback_note) = fallback_note {
+            format!("{fallback_note}; free recording as GIF instead...")
         } else {
             format!(
                 "Free recording as {} at {record_fps}fps... Ctrl+F12 to stop",
@@ -782,18 +796,32 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
-    fn resolve_record_format(&mut self) -> (ResolvedRecordFormat, bool) {
+    fn resolve_record_format(&mut self) -> (ResolvedRecordFormat, Option<&'static str>) {
         let ffmpeg = *self
             .media
             .ffmpeg_available
             .get_or_insert_with(detect_ffmpeg);
-        let format = match self.media.record_format {
-            RecordFormat::Gif => ResolvedRecordFormat::Gif,
-            RecordFormat::Mp4 | RecordFormat::Auto if ffmpeg => ResolvedRecordFormat::Mp4,
-            RecordFormat::Mp4 | RecordFormat::Auto => ResolvedRecordFormat::Gif,
+        let mut webp_available = || {
+            *self
+                .media
+                .ffmpeg_webp_available
+                .get_or_insert_with(detect_ffmpeg_webp_anim)
         };
-        let mp4_fallback = self.media.record_format == RecordFormat::Mp4 && !ffmpeg;
-        (format, mp4_fallback)
+        match self.media.record_format {
+            RecordFormat::Gif => (ResolvedRecordFormat::Gif, None),
+            RecordFormat::Mp4 if ffmpeg => (ResolvedRecordFormat::Mp4, None),
+            RecordFormat::Mp4 => (ResolvedRecordFormat::Gif, Some("ffmpeg not found on PATH")),
+            RecordFormat::WebP if !ffmpeg => {
+                (ResolvedRecordFormat::Gif, Some("ffmpeg not found on PATH"))
+            }
+            RecordFormat::WebP if webp_available() => (ResolvedRecordFormat::WebP, None),
+            RecordFormat::WebP => (
+                ResolvedRecordFormat::Gif,
+                Some("ffmpeg animated WebP encoder not found"),
+            ),
+            RecordFormat::Auto if ffmpeg => (ResolvedRecordFormat::Mp4, None),
+            RecordFormat::Auto => (ResolvedRecordFormat::Gif, None),
+        }
     }
 
     /// Advances the deterministic record state machine by one update.
@@ -1208,6 +1236,7 @@ fn drain_until_end(frame_rx: &mpsc::Receiver<EncoderMsg>) {
 enum LoopSink {
     Gif(GifSink),
     Mp4(FfmpegSink),
+    WebP(FfmpegSink),
 }
 
 impl LoopSink {
@@ -1223,6 +1252,14 @@ impl LoopSink {
                 job.max_width,
                 job.frame_delay_ms,
                 job.frame_rate_fps,
+                job.format,
+            ))),
+            ResolvedRecordFormat::WebP => Ok(Self::WebP(FfmpegSink::new(
+                job.out_path.clone(),
+                job.max_width,
+                job.frame_delay_ms,
+                job.frame_rate_fps,
+                job.format,
             ))),
         }
     }
@@ -1231,6 +1268,7 @@ impl LoopSink {
         match self {
             Self::Gif(sink) => sink.push(image),
             Self::Mp4(sink) => sink.push(image),
+            Self::WebP(sink) => sink.push(image),
         }
     }
 
@@ -1238,6 +1276,7 @@ impl LoopSink {
         match self {
             Self::Gif(sink) => sink.finish(),
             Self::Mp4(sink) => sink.finish(out_path),
+            Self::WebP(sink) => sink.finish(out_path),
         }
     }
 
@@ -1245,6 +1284,7 @@ impl LoopSink {
         match self {
             Self::Gif(sink) => drop(sink),
             Self::Mp4(sink) => sink.discard(),
+            Self::WebP(sink) => sink.discard(),
         }
         let _ = std::fs::remove_file(out_path);
     }
@@ -1293,13 +1333,14 @@ impl GifSink {
     }
 }
 
-/// Pipes raw RGBA frames into `ffmpeg` for H.264 MP4 output. The child is
+/// Pipes raw RGBA frames into `ffmpeg` for MP4/WebP output. The child is
 /// spawned lazily on the first frame (dimensions must be known up front).
 struct FfmpegSink {
     out_path: PathBuf,
     max_width: u32,
     frame_delay_ms: u32,
     frame_rate_fps: Option<u16>,
+    format: ResolvedRecordFormat,
     locked_dims: Option<(u32, u32)>,
     child: Option<Child>,
 }
@@ -1310,12 +1351,14 @@ impl FfmpegSink {
         max_width: u32,
         frame_delay_ms: u32,
         frame_rate_fps: Option<u16>,
+        format: ResolvedRecordFormat,
     ) -> Self {
         Self {
             out_path,
             max_width,
             frame_delay_ms,
             frame_rate_fps,
+            format,
             locked_dims: None,
             child: None,
         }
@@ -1330,6 +1373,7 @@ impl FfmpegSink {
                 height,
                 self.frame_delay_ms,
                 self.frame_rate_fps,
+                self.format,
                 &self.out_path,
             );
             let mut command = Command::new("ffmpeg");
@@ -1423,13 +1467,14 @@ fn ffmpeg_encode_args(
     height: u32,
     frame_delay_ms: u32,
     frame_rate_fps: Option<u16>,
+    format: ResolvedRecordFormat,
     out_path: &Path,
 ) -> Vec<std::ffi::OsString> {
     let delay = frame_delay_ms.max(1);
     let framerate = frame_rate_fps
         .map(|fps| fps.to_string())
         .unwrap_or_else(|| format!("1000/{delay}"));
-    [
+    let mut args = [
         "-hide_banner",
         "-loglevel",
         "error",
@@ -1444,19 +1489,46 @@ fn ffmpeg_encode_args(
         &framerate,
         "-i",
         "-",
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-crf",
-        "18",
-        "-movflags",
-        "+faststart",
     ]
     .iter()
     .map(std::ffi::OsString::from)
-    .chain(std::iter::once(out_path.as_os_str().to_owned()))
-    .collect()
+    .collect::<Vec<_>>();
+    match format {
+        ResolvedRecordFormat::Mp4 => args.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-crf",
+                "18",
+                "-movflags",
+                "+faststart",
+            ]
+            .iter()
+            .map(std::ffi::OsString::from),
+        ),
+        ResolvedRecordFormat::WebP => args.extend(
+            [
+                "-an",
+                "-c:v",
+                "libwebp_anim",
+                "-loop",
+                "0",
+                "-lossless",
+                "0",
+                "-q:v",
+                "85",
+                "-compression_level",
+                "6",
+            ]
+            .iter()
+            .map(std::ffi::OsString::from),
+        ),
+        ResolvedRecordFormat::Gif => unreachable!("GIF does not use ffmpeg"),
+    }
+    args.push(out_path.as_os_str().to_owned());
+    args
 }
 
 pub(crate) fn normalize_record_fps(fps: u16) -> u16 {
@@ -1479,6 +1551,10 @@ fn detect_ffmpeg() -> bool {
     ffmpeg_binary_responds("ffmpeg")
 }
 
+fn detect_ffmpeg_webp_anim() -> bool {
+    ffmpeg_encoder_available("libwebp_anim")
+}
+
 fn ffmpeg_binary_responds(program: &str) -> bool {
     let mut command = Command::new(program);
     command
@@ -1490,6 +1566,21 @@ fn ffmpeg_binary_responds(program: &str) -> bool {
     command
         .status()
         .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn ffmpeg_encoder_available(encoder: &str) -> bool {
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-hide_banner", "-v", "error", "-encoders"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    hide_console_window(&mut command);
+    command
+        .output()
+        .map(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains(encoder)
+        })
         .unwrap_or(false)
 }
 
@@ -1712,7 +1803,14 @@ mod tests {
 
     #[test]
     fn ffmpeg_args_request_compatible_h264() {
-        let args = ffmpeg_encode_args(1280, 720, 700, None, Path::new("out.mp4"));
+        let args = ffmpeg_encode_args(
+            1280,
+            720,
+            700,
+            None,
+            ResolvedRecordFormat::Mp4,
+            Path::new("out.mp4"),
+        );
         let args: Vec<String> = args
             .iter()
             .map(|value| value.to_string_lossy().into_owned())
@@ -1727,7 +1825,14 @@ mod tests {
 
     #[test]
     fn ffmpeg_args_use_exact_free_record_fps_when_requested() {
-        let args = ffmpeg_encode_args(1280, 720, 33, Some(30), Path::new("out.mp4"));
+        let args = ffmpeg_encode_args(
+            1280,
+            720,
+            33,
+            Some(30),
+            ResolvedRecordFormat::Mp4,
+            Path::new("out.mp4"),
+        );
         let args: Vec<String> = args
             .iter()
             .map(|value| value.to_string_lossy().into_owned())
@@ -1735,6 +1840,29 @@ mod tests {
 
         assert!(args.contains(&"30".to_owned()));
         assert!(!args.contains(&"1000/33".to_owned()));
+    }
+
+    #[test]
+    fn ffmpeg_args_request_animated_webp_loop() {
+        let args = ffmpeg_encode_args(
+            1280,
+            720,
+            700,
+            None,
+            ResolvedRecordFormat::WebP,
+            Path::new("out.webp"),
+        );
+        let args: Vec<String> = args
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(args.contains(&"1000/700".to_owned()));
+        assert!(args.contains(&"libwebp_anim".to_owned()));
+        assert!(args.contains(&"-loop".to_owned()));
+        assert!(args.contains(&"0".to_owned()));
+        assert!(args.contains(&"85".to_owned()));
+        assert_eq!(args.last(), Some(&"out.webp".to_owned()));
     }
 
     #[test]
@@ -1754,7 +1882,10 @@ mod tests {
             ..MediaShare::default()
         };
 
-        assert_eq!(media.record_settings_label(), "native MP4 · free 60fps");
+        assert_eq!(
+            media.record_settings_label(),
+            "native MP4 · loop 1x · free 60fps"
+        );
     }
 
     #[test]
