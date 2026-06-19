@@ -554,7 +554,7 @@ fn default_bold_labels() -> bool {
 }
 
 fn default_radar_label_style() -> String {
-    "full-box".to_owned()
+    "id-box".to_owned()
 }
 
 /// Platform bowecho config root (`%APPDATA%\bowecho` on Windows, the
@@ -834,7 +834,7 @@ mod tests {
     #[test]
     fn radar_labels_default_on_and_round_trip() {
         assert!(AppSettings::from_json("{}").show_radar_labels);
-        assert_eq!(AppSettings::from_json("{}").radar_label_style, "full-box");
+        assert_eq!(AppSettings::from_json("{}").radar_label_style, "id-box");
 
         let settings = AppSettings {
             show_radar_labels: false,

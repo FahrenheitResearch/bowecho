@@ -6,8 +6,8 @@
 //! frame's raw input. The default capture is the FULL window so shared media
 //! keeps the map plus any open sounding/WoFS/FARM windows as context.
 //!
-//! Loop recording steps the frame-history loop deterministically: one
-//! history frame per captured screenshot, waiting for the async radar render
+//! Loop recording steps the timeline deterministically: one selected
+//! frame/cut step per captured screenshot, waiting for the async radar render
 //! to settle before each capture, so the output contains exactly one clean
 //! cycle regardless of wall-clock decode/render latency. Frames stream to a
 //! background encoder thread (GIF via the `image` crate's NeuQuant
@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::ViewerApp;
+use crate::{LoopTimelineStep, LoopTimelineTarget, ViewerApp};
 
 const CAPTURE_FILE_PREFIX: &str = "bowecho";
 /// Extra repaints to wait after renders settle so the freshly uploaded
@@ -136,12 +136,15 @@ enum RecorderPhase {
 }
 
 struct RecorderState {
+    target: LoopTimelineTarget,
     cursor: usize,
     total: usize,
     /// History length at record start; any change shifts indices, so abort.
     history_len: usize,
+    steps: Vec<LoopTimelineStep>,
     phase: RecorderPhase,
     restore_index: usize,
+    restore_cut: usize,
     restore_playing: bool,
     restore_browsing: bool,
     frame_tx: mpsc::Sender<EncoderMsg>,
@@ -219,12 +222,38 @@ impl MediaShare {
         self.recorder.is_some() || self.free_recorder.is_some()
     }
 
+    pub(crate) fn loop_recording(&self) -> bool {
+        self.recorder.is_some()
+    }
+
+    pub(crate) fn free_recording(&self) -> bool {
+        self.free_recorder.is_some()
+    }
+
+    pub(crate) fn record_settings_label(&self) -> String {
+        format!(
+            "{} {} · free {}fps",
+            self.record_size.label(),
+            self.record_format.label(),
+            self.normalized_record_fps()
+        )
+    }
+
     fn normalized_record_fps(&self) -> u16 {
         normalize_record_fps(self.record_fps)
     }
 
     fn free_record_frame_delay_ms(&self) -> u32 {
         frame_delay_ms_for_fps(self.normalized_record_fps())
+    }
+
+    pub(crate) fn full_resolution_mp4_enabled(&self) -> bool {
+        self.record_size == RecordSize::Native && self.record_format == RecordFormat::Mp4
+    }
+
+    pub(crate) fn use_full_resolution_mp4_preset(&mut self) {
+        self.record_size = RecordSize::Native;
+        self.record_format = RecordFormat::Mp4;
     }
 }
 
@@ -242,7 +271,7 @@ impl ViewerApp {
                 egui::Key::F12,
             )
         }) {
-            self.toggle_recording(ctx);
+            self.toggle_recording(ctx, None);
         }
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::F12)) {
             self.toggle_free_recording(ctx);
@@ -360,11 +389,18 @@ impl ViewerApp {
     }
 
     /// Record button + output options, drawn next to the playback controls.
-    pub(crate) fn record_controls_ui(&mut self, ui: &mut egui::Ui) {
+    pub(crate) fn record_controls_ui_for_target(
+        &mut self,
+        ui: &mut egui::Ui,
+        target: Option<LoopTimelineTarget>,
+    ) {
         let loop_recording = self.media.recorder.is_some();
         let free_recording = self.media.free_recorder.is_some();
         let record_label = if loop_recording { "Stop" } else { "Loop" };
-        let record_enabled = !free_recording && (loop_recording || self.frame_history.len() > 1);
+        let step_count = target
+            .map(|target| self.loop_timeline_steps_for_target(target).len())
+            .unwrap_or_else(|| self.loop_timeline_steps_for_recording().len());
+        let record_enabled = !free_recording && (loop_recording || step_count > 1);
         if ui
             .add_enabled_ui(record_enabled, |ui| {
                 crate::fixed_action_button(ui, record_label, 62.0)
@@ -377,7 +413,7 @@ impl ViewerApp {
             )
             .clicked()
         {
-            self.toggle_recording(ui.ctx());
+            self.toggle_recording(ui.ctx(), target);
         }
 
         let free_label = if free_recording { "Stop" } else { "Free" };
@@ -395,6 +431,12 @@ impl ViewerApp {
             self.toggle_free_recording(ui.ctx());
         }
 
+        self.record_options_ui(ui);
+    }
+
+    pub(crate) fn record_options_ui(&mut self, ui: &mut egui::Ui) {
+        let loop_recording = self.media.recorder.is_some();
+        let free_recording = self.media.free_recorder.is_some();
         ui.add_enabled_ui(!loop_recording && !free_recording, |ui| {
             egui::ComboBox::from_id_salt("media_record_size")
                 .selected_text(self.media.record_size.label())
@@ -447,25 +489,178 @@ impl ViewerApp {
         });
     }
 
-    fn toggle_recording(&mut self, ctx: &egui::Context) {
-        if self.media.recorder.is_some() {
-            self.finish_recording(ctx);
-        } else {
-            self.start_recording(ctx);
+    pub(crate) fn loop_record_renders_settled(&self) -> bool {
+        self.pending_render_key.is_none()
+            && self
+                .extra_panes
+                .iter()
+                .all(|pane| pane.pending_render_key.is_none())
+            && self
+                .radar_layers
+                .iter()
+                .all(|layer| layer.pending_render_key.is_none())
+    }
+
+    pub(crate) fn loop_record_selected_textures_ready(&self, target: LoopTimelineTarget) -> bool {
+        match target {
+            LoopTimelineTarget::Primary => {
+                self.loop_record_primary_texture_ready()
+                    && self.loop_record_radar_layers_textures_ready()
+                    && self
+                        .extra_panes
+                        .iter()
+                        .take(self.grid_layout.panel_count().saturating_sub(1))
+                        .enumerate()
+                        .all(|(slot, pane)| {
+                            !self.extra_pane_participates_in_primary_timeline(pane)
+                                || self.loop_record_extra_pane_texture_ready(slot)
+                        })
+            }
+            LoopTimelineTarget::ExtraPane(slot) => {
+                self.loop_record_extra_pane_texture_ready(slot)
+                    && self.loop_record_radar_layers_textures_ready()
+            }
         }
     }
 
-    fn start_recording(&mut self, ctx: &egui::Context) {
+    fn loop_record_primary_texture_ready(&self) -> bool {
+        let Some(volume) = self.volume.as_ref() else {
+            return true;
+        };
+        if self.selected_cut >= volume.cuts.len() {
+            return true;
+        }
+        let render_volume =
+            self.display_source_volume_for_product(&self.selected_product, Arc::clone(volume));
+        self.texture_key.as_ref().is_some_and(|key| {
+            key.volume_ptr == Arc::as_ptr(&render_volume) as usize
+                && key.cut == self.selected_cut
+                && key.product == self.selected_product
+        })
+    }
+
+    fn loop_record_extra_pane_texture_ready(&self, pane_slot: usize) -> bool {
+        let Some(pane) = self.extra_panes.get(pane_slot) else {
+            return true;
+        };
+        let Some(volume) = self.extra_pane_display_volume(pane_slot) else {
+            return true;
+        };
+        let preferred_cut = pane.cut.unwrap_or(self.selected_cut);
+        let Some(cut) =
+            crate::display_cut_for_product(volume.as_ref(), preferred_cut, &pane.product)
+        else {
+            return true;
+        };
+        pane.texture_key.as_ref().is_some_and(|key| {
+            key.volume_ptr == Arc::as_ptr(&volume) as usize
+                && key.cut == cut
+                && key.product == pane.product
+        })
+    }
+
+    fn loop_record_radar_layers_textures_ready(&self) -> bool {
+        self.radar_layers
+            .iter()
+            .filter(|layer| layer.visible)
+            .all(|layer| {
+                let Some(volume) = layer.volume.as_ref() else {
+                    return true;
+                };
+                let product = self.selected_product.clone();
+                let Some(cut) =
+                    crate::display_cut_for_product(volume.as_ref(), self.selected_cut, &product)
+                else {
+                    return true;
+                };
+                layer.texture_key.as_ref().is_some_and(|key| {
+                    key.volume_ptr == Arc::as_ptr(volume) as usize
+                        && key.cut == cut
+                        && key.product == product
+                })
+            })
+    }
+
+    pub(crate) fn loop_record_timeline_overlays_settled(&self) -> bool {
+        if !self.hazards_visible
+            || self.loop_timeline_history_len(self.active_loop_timeline_target()) <= 1
+        {
+            return true;
+        }
+        if self.hazard_receiver.is_some()
+            && (self.event_loop_hazard_window.is_some() || self.unified_player.auto_sync_warnings)
+        {
+            return false;
+        }
+        if self.unified_player.auto_sync_warnings {
+            return self.timeline_warning_window_covers_loaded_loop();
+        }
+        true
+    }
+
+    pub(crate) fn loop_record_time_layers_settled(&self) -> bool {
+        if self.loop_timeline_steps_for_recording().len() <= 1 {
+            return true;
+        }
+        if !self.timeline_satellite_map_settled() {
+            return false;
+        }
+        self.timeline_model_layers_settled()
+    }
+
+    fn toggle_recording(&mut self, ctx: &egui::Context, target: Option<LoopTimelineTarget>) {
+        if self.media.recorder.is_some() {
+            self.finish_recording(ctx);
+        } else {
+            self.start_recording(ctx, target);
+        }
+    }
+
+    pub(crate) fn toggle_loop_recording_from_unified_player(&mut self, ctx: &egui::Context) {
+        self.toggle_recording(ctx, None);
+    }
+
+    fn start_recording(&mut self, ctx: &egui::Context, target: Option<LoopTimelineTarget>) {
         if self.media.free_recorder.is_some() {
             self.status = "Stop free recording before starting loop recording".to_owned();
             return;
         }
-        let total = self.frame_history.len();
+        let target = target.unwrap_or_else(|| self.active_loop_timeline_target());
+        let steps = self.loop_timeline_steps_for_target(target);
+        let total = steps.len();
         if total < 2 {
             self.status =
                 "Recording needs at least 2 history frames (use Load Loop first)".to_owned();
             return;
         }
+        let (restore_index, restore_cut, restore_playing, restore_browsing) = match target {
+            LoopTimelineTarget::Primary => (
+                self.selected_frame_index,
+                self.selected_cut,
+                self.history_playing,
+                self.browsing_history,
+            ),
+            LoopTimelineTarget::ExtraPane(slot) => self
+                .extra_panes
+                .get(slot)
+                .map(|pane| {
+                    (
+                        pane.selected_frame_index,
+                        pane.cut.unwrap_or(self.selected_cut),
+                        pane.history_playing,
+                        pane.browsing_history,
+                    )
+                })
+                .unwrap_or((
+                    self.selected_frame_index,
+                    self.selected_cut,
+                    self.history_playing,
+                    self.browsing_history,
+                )),
+        };
+        self.maybe_auto_sync_timeline_warnings(ctx);
+        let waiting_for_timeline_overlays = !self.loop_record_timeline_overlays_settled();
+        let waiting_for_time_layers = !self.loop_record_time_layers_settled();
         let (format, mp4_fallback) = self.resolve_record_format();
         let path = match new_capture_path(format.extension()) {
             Ok(path) => path,
@@ -486,22 +681,45 @@ impl ViewerApp {
             repaint_ctx: ctx.clone(),
         });
         self.media.recorder = Some(RecorderState {
+            target,
             cursor: 0,
             total,
-            history_len: total,
+            history_len: self.loop_timeline_history_len(target),
+            steps,
             phase: RecorderPhase::SelectFrame,
-            restore_index: self.selected_frame_index,
-            restore_playing: self.history_playing,
-            restore_browsing: self.browsing_history,
+            restore_index,
+            restore_cut,
+            restore_playing,
+            restore_browsing,
             frame_tx,
             format,
         });
-        self.history_playing = false;
-        // Latch browsing so an in-flight live load cannot steal the
-        // selection mid-recording.
-        self.browsing_history = true;
+        match target {
+            LoopTimelineTarget::Primary => {
+                self.history_playing = false;
+                // Latch browsing so an in-flight live load cannot steal the
+                // selection mid-recording.
+                self.browsing_history = true;
+            }
+            LoopTimelineTarget::ExtraPane(slot) => {
+                if let Some(pane) = self.extra_panes.get_mut(slot) {
+                    pane.history_playing = false;
+                    pane.browsing_history = true;
+                }
+            }
+        }
         self.status = if mp4_fallback {
             format!("ffmpeg not found on PATH; recording {total} frames as GIF instead...")
+        } else if waiting_for_time_layers {
+            format!(
+                "Recording loop: waiting for timeline layers, then {total} frames as {}...",
+                format.label()
+            )
+        } else if waiting_for_timeline_overlays {
+            format!(
+                "Recording loop: waiting for timeline warnings, then {total} frames as {}...",
+                format.label()
+            )
         } else {
             format!("Recording loop: {total} frames as {}...", format.label())
         };
@@ -514,6 +732,10 @@ impl ViewerApp {
         } else {
             self.start_free_recording(ctx);
         }
+    }
+
+    pub(crate) fn toggle_free_recording_from_unified_player(&mut self, ctx: &egui::Context) {
+        self.toggle_free_recording(ctx);
     }
 
     fn start_free_recording(&mut self, ctx: &egui::Context) {
@@ -579,25 +801,25 @@ impl ViewerApp {
         if self.media.recorder.is_none() {
             return;
         }
-        if self
-            .media
-            .recorder
-            .as_ref()
-            .is_some_and(|recorder| recorder.history_len != self.frame_history.len())
-        {
+        if self.media.recorder.as_ref().is_some_and(|recorder| {
+            recorder.history_len != self.loop_timeline_history_len(recorder.target)
+        }) {
             self.abort_recording(ctx, "history changed during recording");
             return;
         }
 
-        let renders_settled = self.pending_render_key.is_none()
-            && self
-                .radar_layers
-                .iter()
-                .all(|layer| layer.pending_render_key.is_none());
+        let renders_settled = self.loop_record_renders_settled();
+        let selected_textures_ready = self
+            .media
+            .recorder
+            .as_ref()
+            .is_none_or(|recorder| self.loop_record_selected_textures_ready(recorder.target));
+        let timeline_overlays_settled = self.loop_record_timeline_overlays_settled();
+        let time_layers_settled = self.loop_record_time_layers_settled();
 
         enum DriveAction {
             None,
-            Select(usize),
+            Select(LoopTimelineTarget, LoopTimelineStep),
             Capture,
             AbortCaptureTimeout,
         }
@@ -607,15 +829,24 @@ impl ViewerApp {
             };
             match &mut recorder.phase {
                 RecorderPhase::SelectFrame => {
-                    let index = recorder.cursor;
+                    let step = recorder.steps.get(recorder.cursor).copied();
+                    let target = recorder.target;
                     recorder.phase = RecorderPhase::WaitRender {
                         waited: 0,
                         settle: RECORD_SETTLE_FRAMES,
                     };
-                    DriveAction::Select(index)
+                    match step {
+                        Some(step) => DriveAction::Select(target, step),
+                        None => DriveAction::AbortCaptureTimeout,
+                    }
                 }
                 RecorderPhase::WaitRender { waited, settle } => {
-                    if renders_settled || *waited > RECORD_RENDER_TIMEOUT_FRAMES {
+                    if (renders_settled
+                        && selected_textures_ready
+                        && timeline_overlays_settled
+                        && time_layers_settled)
+                        || *waited > RECORD_RENDER_TIMEOUT_FRAMES
+                    {
                         if *settle == 0 {
                             recorder.phase = RecorderPhase::AwaitScreenshot { waited: 0 };
                             DriveAction::Capture
@@ -640,7 +871,7 @@ impl ViewerApp {
         };
         match action {
             DriveAction::None => {}
-            DriveAction::Select(index) => self.select_history_frame(index, false, ctx),
+            DriveAction::Select(target, step) => self.select_history_record_step(target, step, ctx),
             DriveAction::Capture => self.request_screenshot(ctx, CaptureKind::RecordFrame),
             DriveAction::AbortCaptureTimeout => {
                 self.abort_recording(ctx, "screenshot capture timed out");
@@ -795,18 +1026,103 @@ impl ViewerApp {
     }
 
     fn restore_after_recording(&mut self, recorder: &RecorderState, ctx: &egui::Context) {
+        if let LoopTimelineTarget::ExtraPane(slot) = recorder.target {
+            let restore_index = self
+                .extra_panes
+                .get(slot)
+                .map(|pane| {
+                    recorder
+                        .restore_index
+                        .min(pane.frame_history.len().saturating_sub(1))
+                })
+                .unwrap_or(0);
+            if self
+                .extra_panes
+                .get(slot)
+                .is_some_and(|pane| !pane.frame_history.is_empty())
+            {
+                self.select_extra_pane_history_frame(slot, restore_index, ctx);
+                let can_restore_playing = self.extra_pane_history_loop_can_step(slot);
+                if let Some(pane) = self.extra_panes.get_mut(slot) {
+                    if pane
+                        .volume
+                        .as_ref()
+                        .is_some_and(|volume| recorder.restore_cut < volume.cuts.len())
+                    {
+                        Self::set_pane_cut_preserving_texture(pane, recorder.restore_cut);
+                    }
+                    pane.history_playing = recorder.restore_playing && can_restore_playing;
+                    pane.browsing_history = if pane.history_playing {
+                        false
+                    } else {
+                        recorder.restore_browsing
+                    };
+                }
+            }
+            return;
+        }
         let restore_index = recorder
             .restore_index
             .min(self.frame_history.len().saturating_sub(1));
         if !self.frame_history.is_empty() {
             self.select_history_frame(restore_index, false, ctx);
+            if self
+                .volume
+                .as_ref()
+                .is_some_and(|volume| recorder.restore_cut < volume.cuts.len())
+            {
+                self.set_selected_cut_preserving_texture(recorder.restore_cut);
+                self.sync_following_extra_panes_to_current_low_sweep_rank(ctx);
+            }
         }
-        self.history_playing = recorder.restore_playing && self.frame_history.len() > 1;
+        self.history_playing = recorder.restore_playing && self.primary_history_loop_can_step();
         self.browsing_history = if self.history_playing {
             false
         } else {
             recorder.restore_browsing
         };
+    }
+
+    pub(crate) fn select_history_record_step(
+        &mut self,
+        target: LoopTimelineTarget,
+        step: LoopTimelineStep,
+        ctx: &egui::Context,
+    ) {
+        if let LoopTimelineTarget::ExtraPane(slot) = target {
+            self.select_extra_pane_timeline_step(slot, step, ctx);
+            return;
+        }
+        self.select_history_frame_with_options(step.frame_index, false, false, ctx);
+        let Some(cut_index) = step.cut_index else {
+            return;
+        };
+        if step.low_sweep_rank.is_some() {
+            self.set_shared_low_sweep_step(step, ctx);
+            self.sync_active_timeline_side_effects(ctx);
+            if let Some(label) = self.apply_camera_follow_for_current_frame(ctx) {
+                let frame_status = self.selected_frame_status_text();
+                self.status = format!("{frame_status} - {label}");
+            }
+            ctx.request_repaint();
+            return;
+        }
+        self.sync_owned_extra_panes_to_primary_timeline_frame(step.frame_index, ctx);
+        if self
+            .volume
+            .as_ref()
+            .is_none_or(|volume| cut_index >= volume.cuts.len())
+        {
+            return;
+        }
+        self.set_selected_cut_preserving_texture(cut_index);
+        self.sync_following_extra_panes_to_current_low_sweep_rank(ctx);
+        self.sync_active_timeline_side_effects(ctx);
+        if let Some(label) = self.apply_camera_follow_for_current_frame(ctx) {
+            let frame_status = self.selected_frame_status_text();
+            self.status = format!("{frame_status} - {label}");
+        }
+        ctx.request_repaint();
     }
 }
 
@@ -1427,6 +1743,31 @@ mod tests {
         assert_eq!(normalize_record_fps(30), 30);
         assert_eq!(normalize_record_fps(500), 60);
         assert_eq!(frame_delay_ms_for_fps(30), 33);
+    }
+
+    #[test]
+    fn record_settings_label_exposes_native_format_and_fps() {
+        let media = MediaShare {
+            record_size: RecordSize::Native,
+            record_format: RecordFormat::Mp4,
+            record_fps: 60,
+            ..MediaShare::default()
+        };
+
+        assert_eq!(media.record_settings_label(), "native MP4 · free 60fps");
+    }
+
+    #[test]
+    fn full_resolution_mp4_preset_sets_native_mp4_export() {
+        let mut media = MediaShare::default();
+
+        assert!(!media.full_resolution_mp4_enabled());
+        media.use_full_resolution_mp4_preset();
+
+        assert!(media.full_resolution_mp4_enabled());
+        let label = media.record_settings_label();
+        assert!(label.contains("native MP4"));
+        assert!(label.contains("30fps"));
     }
 
     #[test]

@@ -633,11 +633,15 @@ impl crate::ViewerApp {
             // The report-dot tooltip wins where both would fire (stacked
             // popups at one anchor are unreadable) — the dots carry the
             // same story for coincident points.
-            let dot_nearby = self.reports_for_display().iter().any(|report| {
-                self.lon_lat_to_screen(rect, report.lon, report.lat)
-                    .distance(pointer)
-                    <= 10.0
-            });
+            let dot_nearby = self
+                .reports_for_display()
+                .iter()
+                .filter(|report| self.spc_report_visible_for_timeline(report))
+                .any(|report| {
+                    self.lon_lat_to_screen(rect, report.lon, report.lat)
+                        .distance(pointer)
+                        <= 10.0
+                });
             if !dot_nearby {
                 egui::Tooltip::always_open(
                     painter.ctx().clone(),
@@ -697,7 +701,11 @@ impl crate::ViewerApp {
         }
         // Torn report dots double as zero-length events (consistent
         // click behavior whether or not the WCM database covers the day).
-        for report in self.reports_for_display() {
+        for report in self
+            .reports_for_display()
+            .iter()
+            .filter(|report| self.spc_report_visible_for_timeline(report))
+        {
             if report.kind != spc_layers::ReportKind::Tornado {
                 continue;
             }

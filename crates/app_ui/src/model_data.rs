@@ -48,6 +48,13 @@ impl ModelDataDock {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test(ctx: &egui::Context, tree: StoreTree) -> Self {
+        let mut dock = Self::new(ctx, std::env::temp_dir().join("bowecho-model-dock-test"));
+        dock.tree = Some(tree);
+        dock
+    }
+
     fn select_hour(&mut self, key: HourKey) {
         self.worker.send(StoreRequest::LoadHour(key));
     }
@@ -128,6 +135,17 @@ impl ModelDataDock {
     /// Selected model hour in the store browser.
     pub fn selected_hour(&self) -> Option<&rw_ui::HourKey> {
         self.browser.selected()
+    }
+
+    /// Select an exact store hour, requesting its variable list if it is a
+    /// real change. Returns true when a new hour was requested.
+    pub fn select_hour_key(&mut self, key: HourKey) -> bool {
+        if self.browser.selected() == Some(&key) {
+            return false;
+        }
+        self.browser.select(key.clone());
+        self.select_hour(key);
+        true
     }
 
     /// The most recent sounding (for the native skew-T window).
@@ -224,13 +242,7 @@ impl ModelDataDock {
             None => tree.models.first()?,
         };
         let run = model.runs.last()?;
-        let (date, cycle) = run.run.split_once('_')?;
-        let naive = chrono::NaiveDate::parse_from_str(date, "%Y%m%d").ok()?;
-        let cycle_hour: u32 = cycle.trim_end_matches('z').parse().ok()?;
-        let run_time = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-            naive.and_hms_opt(cycle_hour, 0, 0)?,
-            chrono::Utc,
-        );
+        let run_time = model_run_time_utc(&run.run)?;
         let best = run.hours.iter().min_by_key(|hour| {
             (run_time + chrono::Duration::hours(hour.hour as i64) - target)
                 .num_seconds()
@@ -246,6 +258,24 @@ impl ModelDataDock {
             valid,
             target - run_time,
         ))
+    }
+
+    /// Select the newest-run forecast hour valid closest to `target`.
+    /// Existing map layers auto-refresh when their variable lands, so this
+    /// is the bridge used by BowEcho's unified timeline player.
+    pub fn select_newest_hour_valid_near(
+        &mut self,
+        target: chrono::DateTime<chrono::Utc>,
+        preferred_model: Option<&str>,
+    ) -> Option<(
+        HourKey,
+        chrono::DateTime<chrono::Utc>,
+        chrono::Duration,
+        bool,
+    )> {
+        let (key, valid, run_age) = self.newest_hour_valid_near(target, preferred_model)?;
+        let changed = self.select_hour_key(key.clone());
+        Some((key, valid, run_age, changed))
     }
 
     /// The dock body — call inside an egui Window/panel. Returns false when
@@ -351,5 +381,30 @@ impl ModelDataDock {
                 None => {}
             }
         });
+    }
+}
+
+fn model_run_time_utc(run: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let (date, cycle) = run.split_once('_')?;
+    let naive = chrono::NaiveDate::parse_from_str(date, "%Y%m%d").ok()?;
+    let cycle_hour: u32 = cycle.trim_end_matches('z').parse().ok()?;
+    Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+        naive.and_hms_opt(cycle_hour, 0, 0)?,
+        chrono::Utc,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn model_run_time_parses_operational_run_slug() {
+        assert_eq!(
+            model_run_time_utc("20260618_03z"),
+            Some(chrono::Utc.with_ymd_and_hms(2026, 6, 18, 3, 0, 0).unwrap())
+        );
+        assert_eq!(model_run_time_utc("bad-run"), None);
     }
 }

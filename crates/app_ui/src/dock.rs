@@ -1,6 +1,6 @@
 //! Dockable workspace: the egui_tiles tile tree that hosts the radar map
 //! pane plus any DOCKED viewer panes (Sounding / Radar overlays / WoFS /
-//! FARM / Satellite / Model / 3D). Crate evaluation + integration design:
+//! FARM / Satellite / Model / Unified Player / 3D). Crate evaluation + integration design:
 //! docs/docking-spike.md.
 //!
 //! Division of labor:
@@ -57,18 +57,20 @@ pub enum WorkspacePane {
     Farm,
     Satellite,
     Model,
+    UnifiedPlayer,
     Vol3d,
 }
 
 impl WorkspacePane {
     /// Every dockable viewer (everything but the map anchor).
-    pub const VIEWERS: [Self; 7] = [
+    pub const VIEWERS: [Self; 8] = [
         Self::Sounding,
         Self::RadarOverlays,
         Self::Wofs,
         Self::Farm,
         Self::Satellite,
         Self::Model,
+        Self::UnifiedPlayer,
         Self::Vol3d,
     ];
 
@@ -82,6 +84,7 @@ impl WorkspacePane {
             Self::Farm => "FARM",
             Self::Satellite => "Satellite",
             Self::Model => "Model",
+            Self::UnifiedPlayer => "Player",
             Self::Vol3d => "3D Volume",
         }
     }
