@@ -1,7 +1,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque, hash_map::DefaultHasher};
 use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
@@ -101,6 +102,7 @@ const HIGH_END_LOOP_RENDER_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const LOOP_PREWARM_PLAYING_LOOKAHEAD_FRAMES: usize = 24;
 const LOOP_PREWARM_IDLE_LOOKAHEAD_FRAMES: usize = 4;
 const LOOP_PREWARM_RENDER_PANE: usize = usize::MAX;
+const LOOP_PREWARM_INTERACTION_PAUSE_MS: u64 = 250;
 const LOW_CORE_PREVIEW_THREADS: usize = 4;
 const LOW_CORE_PREVIEW_RENDER_HEAD_START_MS: u64 = 8;
 const ACTIVE_LOAD_POLL_MS: u64 = 50;
@@ -1142,6 +1144,7 @@ struct ViewerApp {
     loop_render_cache_bytes: usize,
     loop_prewarm_inflight: Vec<TextureKey>,
     loop_render_context: Option<LoopRenderContextKey>,
+    loop_prewarm_paused_until: Option<Instant>,
     map_center_lon: f32,
     map_center_lat: f32,
     map_scale: f32,
@@ -1242,7 +1245,7 @@ struct ViewerApp {
     pending_grid_layout: Option<PanelLayout>,
     // Frame-cost caches (RefCell: draw fns take &self on the UI thread).
     basemap_shape_cache: std::cell::RefCell<ShapeCache<Vec<egui::Shape>>>,
-    hazard_shape_cache: std::cell::RefCell<ShapeCache<HazardOverlayShapes>>,
+    hazard_shape_cache: std::cell::RefCell<ShapeCache<Arc<HazardOverlayShapes>>>,
     // Cross-section (RHI) draw mode + rendered section.
     cross_section_armed: bool,
     /// Last right-click location (for the context menu's best-radar list).
@@ -1922,14 +1925,14 @@ struct FrameHistoryEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LoopTimelineSummaryCacheKey {
     target: LoopTimelineTarget,
-    frame_identities: Vec<FrameIdentity>,
+    frame_signature: u64,
     low_sweeps: bool,
     filter: LowSweepLoopFilter,
     disabled_cuts: BTreeSet<LowSweepCutKey>,
     selected_product: DisplayProduct,
     active_pane: usize,
     panel_count: usize,
-    extra_panes: Vec<(bool, DisplayProduct, Vec<FrameIdentity>)>,
+    extra_panes: Vec<(bool, DisplayProduct, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1974,6 +1977,21 @@ enum CoordinatedOverlayLoadMode {
 struct FrameIdentity {
     site_id: String,
     scan_time_utc: DateTime<Utc>,
+}
+
+fn frame_history_signature(frames: &[FrameHistoryEntry]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    frames.len().hash(&mut hasher);
+    for frame in frames {
+        frame.identity.site_id.hash(&mut hasher);
+        frame
+            .identity
+            .scan_time_utc
+            .timestamp_millis()
+            .hash(&mut hasher);
+        (Arc::as_ptr(&frame.volume) as usize).hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -4839,6 +4857,7 @@ impl ViewerApp {
             loop_render_cache_bytes: 0,
             loop_prewarm_inflight: Vec::new(),
             loop_render_context: None,
+            loop_prewarm_paused_until: None,
             map_center_lon,
             map_center_lat,
             map_scale: DEFAULT_MAP_SCALE,
@@ -4876,7 +4895,7 @@ impl ViewerApp {
             storm_cells_receiver: None,
             storm_cells_cache: BTreeMap::new(),
             storm_cells_cache_order: VecDeque::new(),
-            show_storm_tracks: true,
+            show_storm_tracks: false,
             storm_track_max_tracks: restored_storm_track_max_tracks,
             storm_track_min_dbz: restored_storm_track_min_dbz,
             storm_track_follow: None,
@@ -6972,7 +6991,7 @@ impl ViewerApp {
         let frames = self.loop_timeline_frames_for_target(target)?;
         Some(LoopTimelineSummaryCacheKey {
             target,
-            frame_identities: frames.iter().map(|frame| frame.identity.clone()).collect(),
+            frame_signature: frame_history_signature(frames),
             low_sweeps: self.app_settings.loop_low_sweeps,
             filter: self.low_sweep_loop_filter(),
             disabled_cuts: self.low_sweep_disabled_cuts.clone(),
@@ -6986,10 +7005,7 @@ impl ViewerApp {
                     (
                         pane.owns_radar(),
                         pane.product.clone(),
-                        pane.frame_history
-                            .iter()
-                            .map(|frame| frame.identity.clone())
-                            .collect(),
+                        frame_history_signature(&pane.frame_history),
                     )
                 })
                 .collect(),
@@ -9310,6 +9326,17 @@ impl ViewerApp {
         loop_render_cache_budget_bytes_for_threads(effective_worker_threads())
     }
 
+    fn pause_loop_prewarm_for_interaction(&mut self) {
+        self.loop_prewarm_paused_until =
+            Some(Instant::now() + Duration::from_millis(LOOP_PREWARM_INTERACTION_PAUSE_MS));
+        self.loop_prewarm_inflight.clear();
+    }
+
+    fn loop_prewarm_paused_for_interaction(&self) -> bool {
+        self.loop_prewarm_paused_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
     fn schedule_loop_render_prewarm(
         &mut self,
         ctx: &egui::Context,
@@ -9317,6 +9344,9 @@ impl ViewerApp {
         current_key: &TextureKey,
     ) {
         if self.frame_history.len() <= 1 {
+            return;
+        }
+        if self.loop_prewarm_paused_for_interaction() {
             return;
         }
         self.ensure_loop_render_context(current_key);
@@ -14866,6 +14896,7 @@ impl ViewerApp {
         step: LoopTimelineStep,
         ctx: &egui::Context,
     ) {
+        self.pause_loop_prewarm_for_interaction();
         if let LoopTimelineTarget::ExtraPane(slot) = target {
             self.select_extra_pane_timeline_step(slot, step, ctx);
             return;
@@ -14897,6 +14928,7 @@ impl ViewerApp {
         step: LoopTimelineStep,
         ctx: &egui::Context,
     ) {
+        self.pause_loop_prewarm_for_interaction();
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
             pane.history_playing = false;
         }
@@ -19497,11 +19529,26 @@ impl ViewerApp {
     }
 
     fn hazard_record_visible(&self, record: &HazardRecord) -> bool {
+        self.hazard_record_visible_at_timeline_time(record, self.hazard_overlay_timeline_time())
+    }
+
+    fn hazard_overlay_timeline_time(&self) -> Option<DateTime<Utc>> {
+        self.event_loop_hazard_window
+            .is_some()
+            .then(|| self.displayed_timeline_time_utc())
+            .flatten()
+    }
+
+    fn hazard_record_visible_at_timeline_time(
+        &self,
+        record: &HazardRecord,
+        frame_time: Option<DateTime<Utc>>,
+    ) -> bool {
         if self.hidden_hazard_families.contains(&record.event_family) {
             return false;
         }
         if let Some((start_utc, end_utc)) = self.event_loop_hazard_window {
-            let Some(frame_time) = self.displayed_timeline_time_utc() else {
+            let Some(frame_time) = frame_time else {
                 return event_loop_hazard_record_intersects_window(record, start_utc, end_utc);
             };
             if frame_time < start_utc || frame_time >= end_utc {
@@ -19513,6 +19560,27 @@ impl ViewerApp {
             return true;
         }
         hazard_record_is_active_or_pending(record)
+    }
+
+    fn hazard_visibility_signature(&self, frame_time: Option<DateTime<Utc>>) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.hazards_active_only.hash(&mut hasher);
+        if let Some((start_utc, end_utc)) = self.event_loop_hazard_window {
+            start_utc.timestamp_millis().hash(&mut hasher);
+            end_utc.timestamp_millis().hash(&mut hasher);
+        }
+        let Some(overlay) = &self.hazard_overlay else {
+            return hasher.finish();
+        };
+        for (index, record) in overlay.records.iter().enumerate() {
+            if self.hazard_record_visible_at_timeline_time(record, frame_time)
+                && hazard_points_renderable(&record.points)
+            {
+                index.hash(&mut hasher);
+                record.event_id.hash(&mut hasher);
+            }
+        }
+        hasher.finish()
     }
 
     fn hazard_at_position(&self, rect: egui::Rect, position: egui::Pos2) -> Option<usize> {
@@ -20616,6 +20684,7 @@ impl ViewerApp {
                 // math is only locally correct under AEQD and drifted at
                 // distance/zoom-out (field QOL report).
                 self.clear_camera_follow_targets();
+                self.pause_loop_prewarm_for_interaction();
                 let (lon, lat) = self.screen_to_lon_lat(rect, rect.center() - delta);
                 self.center_map_on(lat, lon);
             }
@@ -20628,6 +20697,7 @@ impl ViewerApp {
                 let before = pointer.map(|position| self.screen_to_lon_lat(rect, position));
                 let factor = (1.0_f32 + scroll / 600.0).clamp(0.75, 1.35);
                 self.clear_camera_follow_targets();
+                self.pause_loop_prewarm_for_interaction();
                 self.map_scale = (self.map_scale * factor).clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
                 if let (Some(position), Some((lon_before, lat_before))) = (pointer, before) {
                     let (lon_after, lat_after) = self.screen_to_lon_lat(rect, position);
@@ -21077,6 +21147,7 @@ impl ViewerApp {
                 if delta.length_sq() >= MAP_DRAG_DEAD_ZONE_PX * MAP_DRAG_DEAD_ZONE_PX {
                     // Projection-true pan — see the single-pane handler.
                     self.clear_camera_follow_targets();
+                    self.pause_loop_prewarm_for_interaction();
                     let (lon, lat) = self.screen_to_lon_lat(cell, cell.center() - delta);
                     self.center_map_on(lat, lon);
                 }
@@ -21089,6 +21160,7 @@ impl ViewerApp {
                     let before = pointer.map(|position| self.screen_to_lon_lat(cell, position));
                     let factor = (1.0_f32 + scroll / 600.0).clamp(0.75, 1.35);
                     self.clear_camera_follow_targets();
+                    self.pause_loop_prewarm_for_interaction();
                     self.map_scale = (self.map_scale * factor).clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
                     if let (Some(position), Some((lon_before, lat_before))) = (pointer, before) {
                         let (lon_after, lat_after) = self.screen_to_lon_lat(cell, position);
@@ -29324,6 +29396,9 @@ impl ViewerApp {
     }
 
     fn draw_unacknowledged_hazard_flashes(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if self.event_loop_hazard_window.is_some() {
+            return;
+        }
         if self.unacknowledged_hazard_event_ids.is_empty() {
             return;
         }
@@ -29381,11 +29456,12 @@ impl ViewerApp {
         }
     }
 
-    fn cached_hazard_overlay_shapes(&self, rect: egui::Rect) -> HazardOverlayShapes {
+    fn cached_hazard_overlay_shapes(&self, rect: egui::Rect) -> Arc<HazardOverlayShapes> {
         // Polygon projection + ear-clip tessellation is cached per view key:
         // idle repaints reuse it; pan/zoom/selection/content changes rebuild.
         // The generation counter invalidates exactly on overlay replacement.
         use std::hash::{Hash, Hasher};
+        let frame_time = self.hazard_overlay_timeline_time();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.view_shape_key(2, rect).hash(&mut hasher);
         self.hazard_overlay_generation.hash(&mut hasher);
@@ -29393,25 +29469,25 @@ impl ViewerApp {
         // Style edits must repaint: the registry signature covers every
         // styled property (it subsumes the old hazard_fill_alpha hash).
         self.style_registry.signature().hash(&mut hasher);
-        self.hazards_active_only.hash(&mut hasher);
-        if let Some((start_utc, end_utc)) = self.event_loop_hazard_window {
-            start_utc.timestamp_millis().hash(&mut hasher);
-            end_utc.timestamp_millis().hash(&mut hasher);
-            self.displayed_timeline_time_utc()
-                .map(|time| time.timestamp_millis())
-                .hash(&mut hasher);
-        }
+        self.hazard_visibility_signature(frame_time)
+            .hash(&mut hasher);
         for family in &self.hidden_hazard_families {
             family.hash(&mut hasher);
         }
         let key = hasher.finish();
         let mut cache = self.hazard_shape_cache.borrow_mut();
         cache
-            .get_or_insert_with(key, || self.build_hazard_overlay_shapes(rect))
+            .get_or_insert_with(key, || {
+                Arc::new(self.build_hazard_overlay_shapes(rect, frame_time))
+            })
             .clone()
     }
 
-    fn build_hazard_overlay_shapes(&self, rect: egui::Rect) -> HazardOverlayShapes {
+    fn build_hazard_overlay_shapes(
+        &self,
+        rect: egui::Rect,
+        frame_time: Option<DateTime<Utc>>,
+    ) -> HazardOverlayShapes {
         let mut out = HazardOverlayShapes {
             fill_shapes: Vec::new(),
             outline_shapes: Vec::new(),
@@ -29422,7 +29498,7 @@ impl ViewerApp {
         };
         let bounds = self.visible_geo_bounds(rect).expand(0.05);
         for (index, record) in overlay.records.iter().enumerate() {
-            if !self.hazard_record_visible(record)
+            if !self.hazard_record_visible_at_timeline_time(record, frame_time)
                 || !hazard_points_renderable(&record.points)
                 || !bounds.intersects_bbox(record.bbox)
             {
@@ -42258,6 +42334,97 @@ mod tests {
     }
 
     #[test]
+    fn loop_prewarm_pauses_during_manual_interaction() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let first = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0), (0.5, 30_000)],
+            720,
+        ));
+        let second = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 60_000), (0.5, 90_000)],
+            720,
+        ));
+        app.frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(first.as_ref()),
+            path: PathBuf::from("prewarm-pause-1"),
+            volume: first,
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        });
+        app.frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(second.as_ref()),
+            path: PathBuf::from("prewarm-pause-2"),
+            volume: second,
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        });
+        let current_key = TextureKey {
+            volume_ptr: 42,
+            cut: 0,
+            product: DisplayProduct::Moment(MomentType::Reflectivity),
+            render_dealiased_velocity: false,
+            color_table_signature: 7,
+            storm_motion_key: (0, 0),
+            hail_levels_key: (32, 64),
+            smoothing: SmoothingMode::Native,
+            dealias_cascade: false,
+            gate_filter_decidbz: i16::MIN,
+            viewport: test_viewport_key(720, 480),
+        };
+
+        app.loop_prewarm_inflight.push(current_key.clone());
+        app.pause_loop_prewarm_for_interaction();
+        app.schedule_loop_render_prewarm(
+            &egui::Context::default(),
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0)),
+            &current_key,
+        );
+
+        assert!(app.loop_prewarm_inflight.is_empty());
+        assert!(
+            app.loop_render_context.is_none(),
+            "manual pan/zoom/scrub should not even establish a prewarm context"
+        );
+    }
+
+    #[test]
+    fn frame_history_signature_changes_for_replacement_volume() {
+        let first = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0)],
+            720,
+        ));
+        let replacement = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0)],
+            720,
+        ));
+        let identity = frame_identity_for_volume(first.as_ref());
+        let first_frame = FrameHistoryEntry {
+            identity: identity.clone(),
+            path: PathBuf::from("signature-first"),
+            volume: first,
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        };
+        let replacement_frame = FrameHistoryEntry {
+            identity,
+            path: PathBuf::from("signature-replacement"),
+            volume: replacement,
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        };
+
+        assert_ne!(
+            frame_history_signature(&[first_frame]),
+            frame_history_signature(&[replacement_frame]),
+            "same scan time with a new volume object must invalidate cached low-sweep summaries"
+        );
+    }
+
+    #[test]
     fn low_sweep_loop_syncs_following_extra_pane_by_timestamp() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.app_settings.loop_low_sweeps = true;
@@ -46949,6 +47116,14 @@ mod tests {
     }
 
     #[test]
+    fn storm_tracks_default_hidden_in_fresh_app_and_player_context() {
+        let app = test_viewer_app_with_hazards(Vec::new());
+
+        assert!(!app.show_storm_tracks);
+        assert!(!app.unified_player_context().storm_tracks_enabled);
+    }
+
+    #[test]
     fn loaded_site_marker_uses_scan_age_color() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let scan_time = Utc::now() - chrono::Duration::minutes(20);
@@ -47285,7 +47460,7 @@ mod tests {
             square_hazard_points(-0.5, -0.5, 0.5, 0.5),
         )]);
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
-        let solid = app.build_hazard_overlay_shapes(rect);
+        let solid = app.build_hazard_overlay_shapes(rect, None);
         assert_eq!(solid.fill_shapes.len(), 1, "solid convex = one fill shape");
         assert_eq!(
             solid.outline_shapes.len(),
@@ -47304,7 +47479,7 @@ mod tests {
             },
         );
         app.style_registry = styles::StyleRegistry::from_settings(&app.style_settings);
-        let dashed = app.build_hazard_overlay_shapes(rect);
+        let dashed = app.build_hazard_overlay_shapes(rect, None);
         assert_eq!(dashed.fill_shapes.len(), 1, "dash keeps one fill underlay");
         assert!(
             dashed.outline_shapes.len() > solid.outline_shapes.len() + 1,
@@ -48300,6 +48475,53 @@ mod tests {
     }
 
     #[test]
+    fn event_loop_hazard_shape_cache_reuses_same_visibility_window() {
+        let mut warning = test_hazard_record(
+            "event-loop-warning",
+            "TOR 45",
+            "tornado",
+            square_hazard_points(-101.0, 34.0, -100.0, 35.0),
+        );
+        warning.valid_start = Some("2026-06-14T14:00:00Z".to_owned());
+        warning.valid_end = Some("2026-06-14T15:00:00Z".to_owned());
+        let mut app = test_viewer_app_with_hazards(vec![warning]);
+        app.map_center_lon = -100.5;
+        app.map_center_lat = 34.5;
+        app.map_scale = 360.0;
+        app.event_loop_hazard_window = Some((
+            Utc.with_ymd_and_hms(2026, 6, 14, 13, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 6, 14, 16, 0, 0).unwrap(),
+        ));
+        let rect = test_map_rect();
+
+        app.volume = Some(Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("KTLX"),
+            Utc.with_ymd_and_hms(2026, 6, 14, 14, 5, 0).unwrap(),
+        )));
+        let first = app.cached_hazard_overlay_shapes(rect);
+        assert!(!first.outline_shapes.is_empty());
+
+        app.volume = Some(Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("KTLX"),
+            Utc.with_ymd_and_hms(2026, 6, 14, 14, 10, 0).unwrap(),
+        )));
+        let second = app.cached_hazard_overlay_shapes(rect);
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "timeline warning geometry should not rebuild on every low-sweep cut while the visible warning set is unchanged"
+        );
+
+        app.volume = Some(Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("KTLX"),
+            Utc.with_ymd_and_hms(2026, 6, 14, 15, 10, 0).unwrap(),
+        )));
+        let expired = app.cached_hazard_overlay_shapes(rect);
+        assert!(!Arc::ptr_eq(&second, &expired));
+        assert!(expired.outline_shapes.is_empty());
+    }
+
+    #[test]
     fn event_loop_hazard_visibility_uses_selected_cut_time() {
         let mut warning = test_hazard_record(
             "cut-time-warning",
@@ -49186,6 +49408,7 @@ mod tests {
             loop_render_cache_bytes: 0,
             loop_prewarm_inflight: Vec::new(),
             loop_render_context: None,
+            loop_prewarm_paused_until: None,
             map_center_lon: 0.0,
             map_center_lat: 0.0,
             map_scale: 100.0,
@@ -49223,7 +49446,7 @@ mod tests {
             storm_cells_receiver: None,
             storm_cells_cache: BTreeMap::new(),
             storm_cells_cache_order: VecDeque::new(),
-            show_storm_tracks: true,
+            show_storm_tracks: false,
             storm_track_max_tracks: DEFAULT_STORM_TRACK_MAX_TRACKS,
             storm_track_min_dbz: DEFAULT_STORM_TRACK_MIN_DBZ,
             storm_track_follow: None,
