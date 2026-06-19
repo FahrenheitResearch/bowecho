@@ -38,6 +38,8 @@ const DEFAULT_RECORD_FPS: u16 = 30;
 const RECORD_FPS_CHOICES: [u16; 5] = [10, 15, 24, 30, 60];
 const RECORD_FPS_MIN: u16 = 1;
 const RECORD_FPS_MAX: u16 = 60;
+pub(crate) const LOOP_RECORD_SPEED_PERCENT_OPTIONS: &[u16] =
+    &[25, 50, 75, 100, 150, 200, 300, 400, 800, 1600, 3200, 6400];
 /// GIF quantizer speed (1 = best/slowest, 30 = worst/fastest). The `image`
 /// crate feeds this to NeuQuant (Dekker 1994, "Kohonen neural networks for
 /// optimal colour quantization", Network: Computation in Neural Systems).
@@ -237,11 +239,12 @@ impl MediaShare {
         self.free_recorder.is_some()
     }
 
-    pub(crate) fn record_settings_label(&self) -> String {
+    pub(crate) fn record_settings_label(&self, loop_record_speed_percent: u16) -> String {
         format!(
-            "{} {} · loop 1x · free {}fps",
+            "{} {} · loop {} · free {}fps",
             self.record_size.label(),
             self.record_format.label(),
+            loop_record_speed_label(loop_record_speed_percent),
             self.normalized_record_fps()
         )
     }
@@ -481,6 +484,29 @@ impl ViewerApp {
                 .on_hover_text(
                     "Auto = MP4 when ffmpeg is on PATH, otherwise GIF. WebP uses ffmpeg's animated WebP encoder.",
                 );
+            let before_loop_speed = self.app_settings.loop_record_speed_percent;
+            let mut loop_speed =
+                normalize_loop_record_speed_percent(self.app_settings.loop_record_speed_percent);
+            egui::ComboBox::from_id_salt("media_loop_record_speed")
+                .selected_text(format!("loop {}", loop_record_speed_label(loop_speed)))
+                .width(76.0)
+                .show_ui(ui, |ui| {
+                    for speed in LOOP_RECORD_SPEED_PERCENT_OPTIONS {
+                        ui.selectable_value(
+                            &mut loop_speed,
+                            *speed,
+                            loop_record_speed_label(*speed),
+                        );
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "GIF/MP4/WebP loop export speed. Separate from screen playback so giant low-sweep loops can be compressed intentionally.",
+                );
+            self.app_settings.loop_record_speed_percent = loop_speed;
+            if self.app_settings.loop_record_speed_percent != before_loop_speed {
+                let _ = self.app_settings.save();
+            }
             let before_fps = self.media.record_fps;
             egui::ComboBox::from_id_salt("media_record_fps")
                 .selected_text(format!("{}fps", self.media.normalized_record_fps()))
@@ -1535,6 +1561,22 @@ pub(crate) fn normalize_record_fps(fps: u16) -> u16 {
     fps.clamp(RECORD_FPS_MIN, RECORD_FPS_MAX)
 }
 
+pub(crate) fn normalize_loop_record_speed_percent(percent: u16) -> u16 {
+    percent.clamp(10, crate::MAX_LOOP_SPEED_PERCENT)
+}
+
+fn loop_record_speed_label(percent: u16) -> String {
+    let percent = normalize_loop_record_speed_percent(percent);
+    match percent {
+        25 => "0.25x".to_owned(),
+        50 => "0.5x".to_owned(),
+        75 => "0.75x".to_owned(),
+        100 => "1x".to_owned(),
+        value if value % 100 == 0 => format!("{}x", value / 100),
+        value => format!("{:.2}x", f32::from(value) / 100.0),
+    }
+}
+
 fn frame_delay_ms_for_fps(fps: u16) -> u32 {
     let fps = normalize_record_fps(fps);
     ((1000.0 / f32::from(fps)).round() as u32).max(1)
@@ -1883,9 +1925,17 @@ mod tests {
         };
 
         assert_eq!(
-            media.record_settings_label(),
-            "native MP4 · loop 1x · free 60fps"
+            media.record_settings_label(1600),
+            "native MP4 · loop 16x · free 60fps"
         );
+    }
+
+    #[test]
+    fn loop_record_speed_labels_cover_fast_exports() {
+        assert_eq!(loop_record_speed_label(25), "0.25x");
+        assert_eq!(loop_record_speed_label(100), "1x");
+        assert_eq!(loop_record_speed_label(1600), "16x");
+        assert_eq!(loop_record_speed_label(6400), "64x");
     }
 
     #[test]
@@ -1896,7 +1946,7 @@ mod tests {
         media.use_full_resolution_mp4_preset();
 
         assert!(media.full_resolution_mp4_enabled());
-        let label = media.record_settings_label();
+        let label = media.record_settings_label(100);
         assert!(label.contains("native MP4"));
         assert!(label.contains("30fps"));
     }

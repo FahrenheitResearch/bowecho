@@ -14169,7 +14169,9 @@ impl ViewerApp {
             free_recording: self.media.free_recording(),
             can_record_loop: timeline_step_count > 1,
             full_resolution_export: self.media.full_resolution_mp4_enabled(),
-            record_settings_label: self.media.record_settings_label(),
+            record_settings_label: self
+                .media
+                .record_settings_label(self.app_settings.loop_record_speed_percent),
             docked: self.workspace.is_docked(dock::WorkspacePane::UnifiedPlayer),
         }
     }
@@ -22911,7 +22913,10 @@ impl ViewerApp {
     }
 
     fn loop_record_frame_ms(&self) -> u64 {
-        HISTORY_LOOP_FRAME_MS
+        let percent = u64::from(media::normalize_loop_record_speed_percent(
+            self.app_settings.loop_record_speed_percent,
+        ));
+        (HISTORY_LOOP_FRAME_MS * 100 / percent).max(8)
     }
 
     fn screen_loop_frame_ms(&self) -> u64 {
@@ -45175,6 +45180,11 @@ mod tests {
 
         assert!(app.loop_frame_ms() < 20);
         assert_eq!(app.loop_record_frame_ms(), HISTORY_LOOP_FRAME_MS);
+        app.app_settings.loop_record_speed_percent = 6400;
+        assert_eq!(
+            app.loop_record_frame_ms(),
+            (HISTORY_LOOP_FRAME_MS * 100 / u64::from(MAX_LOOP_SPEED_PERCENT)).max(8)
+        );
     }
 
     #[test]

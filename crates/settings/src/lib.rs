@@ -196,9 +196,15 @@ pub struct AppSettings {
     #[serde(default)]
     pub show_center_crosshair: bool,
     /// Free/manual viewport recording frame rate. Loop exports still preserve
-    /// the loop-speed cadence; this controls the live viewport recorder.
+    /// their own export-speed cadence; this controls the live viewport recorder.
     #[serde(default = "default_record_fps")]
     pub record_fps: u16,
+    /// Loop export speed in percent of the 700 ms/frame baseline. Kept
+    /// separate from screen playback speed so operators can scrub at 64x
+    /// without accidentally creating one-second share loops, but can still
+    /// intentionally compress very long low-sweep exports.
+    #[serde(default = "default_loop_record_speed_percent")]
+    pub loop_record_speed_percent: u16,
     /// Extra archive scans loaded on each side of a clicked tornado
     /// track's window — context before touchdown and after lift (field
     /// request: a short track otherwise loads only a handful of frames).
@@ -310,6 +316,10 @@ fn default_loop_low_sweep_filter() -> String {
 
 fn default_record_fps() -> u16 {
     30
+}
+
+fn default_loop_record_speed_percent() -> u16 {
+    100
 }
 
 fn default_storm_track_max_tracks() -> u16 {
@@ -465,6 +475,7 @@ impl Default for AppSettings {
             live_low_sweep_auto_advance: false,
             show_center_crosshair: false,
             record_fps: default_record_fps(),
+            loop_record_speed_percent: default_loop_record_speed_percent(),
             event_pad_frames: default_event_pad_frames(),
             event_track_auto_model: false,
             event_track_model_slug: default_model_slug(),
@@ -932,14 +943,17 @@ mod tests {
     fn record_fps_defaults_to_30_and_round_trips() {
         let old = AppSettings::from_json("{}");
         assert_eq!(old.record_fps, 30);
+        assert_eq!(old.loop_record_speed_percent, 100);
 
         let settings = AppSettings {
             record_fps: 60,
+            loop_record_speed_percent: 1600,
             ..Default::default()
         };
         let back = AppSettings::from_json(&settings.to_json());
 
         assert_eq!(back.record_fps, 60);
+        assert_eq!(back.loop_record_speed_percent, 1600);
     }
 
     #[test]
