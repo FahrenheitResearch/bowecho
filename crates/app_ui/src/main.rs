@@ -131,7 +131,9 @@ const ALERT_SOUND_FAMILY_OPTIONS: &[(&str, &str)] = &[
 const PERF_SAMPLE_CAPACITY: usize = 96;
 const STALE_LATEST_DISPLAY_CLEAR_SECONDS: i64 = 15 * 60;
 const ARCHIVE_EVENT_CACHE_HIT_MAX_SECONDS: i64 = 10 * 60;
-const HISTORY_SIZE_OPTIONS: &[usize] = &[3, 5, 7, 10, 15, 20, 25, 30, 48, 72, 96, 128, 160, 200];
+const HISTORY_SIZE_OPTIONS: &[usize] = &[
+    3, 5, 7, 10, 15, 20, 25, 30, 48, 72, 96, 128, 160, 200, 256, 384, 512, 768, 1000, 1500, 2000,
+];
 const DEFAULT_HISTORY_FRAME_LIMIT: usize = 7;
 const DEFAULT_ARCHIVE_FRAME_COUNT: usize = 10;
 const MAX_ARCHIVE_FRAME_COUNT: usize = MAX_HISTORY_FRAME_LIMIT;
@@ -144,7 +146,7 @@ const MAX_STORM_TRACK_MIN_DBZ: f32 = 65.0;
 pub(crate) const MAX_EVENT_PAD_FRAMES: u16 = 40;
 /// Hard ceiling for the frame strip — deployment folders legitimately
 /// load 100+ volumes.
-const MAX_HISTORY_FRAME_LIMIT: usize = 200;
+const MAX_HISTORY_FRAME_LIMIT: usize = 2000;
 const HISTORY_LOOP_FRAME_MS: u64 = 700;
 const MAX_LOOP_SPEED_PERCENT: u16 = 6400;
 const MAX_LOOP_REPAINT_POLL_MS: u64 = 50;
@@ -1428,6 +1430,9 @@ struct ViewerApp {
     event_loop_hazard_window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     /// GLM lightning layer (in-process rw-glm follow + time-synced draw).
     glm: Option<glm_layer::GlmWorker>,
+    glm_secondary: Option<glm_layer::GlmWorker>,
+    glm_refresh_requested_at: Option<Instant>,
+    glm_ignore_before_ms: Option<i64>,
     glm_enabled: bool,
     /// RAOB site list (background-fetched once per session) for observed
     /// soundings and the RAOB station markers; the embedded
@@ -5006,6 +5011,9 @@ impl ViewerApp {
             spc_day: 1,
             spc_last_key: None,
             glm: None,
+            glm_secondary: None,
+            glm_refresh_requested_at: None,
+            glm_ignore_before_ms: None,
             spc_rx: None,
             mping_reports: Vec::new(),
             mping_enabled: restored_overlays.7,
@@ -13310,26 +13318,32 @@ impl eframe::App for ViewerApp {
         self.pump_ingest_responses();
         self.poll_surface_obs(&ctx);
         if self.glm_enabled {
-            if let Some(satellite) = self.desired_glm_satellite() {
-                if self
-                    .glm
-                    .as_ref()
-                    .is_none_or(|glm| glm.satellite != satellite)
-                {
-                    self.glm = Some(glm_layer::GlmWorker::spawn(
+            let glm_read_window_ms = self.desired_glm_read_window_ms();
+            let satellites = self.desired_glm_satellites();
+            match satellites {
+                [primary, secondary, ..] => {
+                    Self::ensure_glm_slot(&ctx, &mut self.glm, primary, self.glm_ignore_before_ms);
+                    Self::ensure_glm_slot(
                         &ctx,
-                        satellite,
-                        settings::glm_store_dir(),
-                    ));
+                        &mut self.glm_secondary,
+                        secondary,
+                        self.glm_ignore_before_ms,
+                    );
                 }
-            } else if self.glm.is_some() {
-                self.glm = None;
+                [primary] => {
+                    Self::ensure_glm_slot(&ctx, &mut self.glm, primary, self.glm_ignore_before_ms);
+                    self.glm_secondary = None;
+                }
+                [] => {
+                    self.glm = None;
+                    self.glm_secondary = None;
+                }
             }
-            if let Some(glm) = &mut self.glm {
-                glm.pump();
-            }
-        } else if self.glm.is_some() {
+            Self::pump_glm_slot(&ctx, &mut self.glm, glm_read_window_ms);
+            Self::pump_glm_slot(&ctx, &mut self.glm_secondary, glm_read_window_ms);
+        } else if self.glm.is_some() || self.glm_secondary.is_some() {
             self.glm = None; // Drop cancels the follow thread.
+            self.glm_secondary = None;
         }
         self.poll_mesoanalysis(&ctx);
         self.poll_upper_air(&ctx);
@@ -25462,6 +25476,130 @@ impl ViewerApp {
         glm_satellite_for_lon(self.map_center_lon)
     }
 
+    fn desired_glm_satellites(&self) -> &'static [&'static str] {
+        // One GLM is enough for a map view. Starting East and West together
+        // doubles the cold-start listing/download work and can make a healthy
+        // feed look dead on a slow link. Switch feeds only when the map center
+        // crosses the normal East/West selection boundary.
+        match self.desired_glm_satellite() {
+            Some("goes18") => &["goes18"],
+            Some("goes19") => &["goes19"],
+            _ => &[],
+        }
+    }
+
+    /// Lightning follows wall-clock time only while the map is following the
+    /// live edge. Once the operator browses or plays history, use the exact
+    /// displayed radar time and never substitute current lightning.
+    fn glm_display_time_ms(&self, now_ms: i64) -> i64 {
+        let selected_is_live = self
+            .frame_history
+            .get(self.selected_frame_index)
+            .is_some_and(|frame| {
+                matches!(
+                    frame.status,
+                    FrameStatus::LivePartial | FrameStatus::LiveComplete
+                )
+            });
+        if selected_is_live && !self.browsing_history && !self.history_playing {
+            now_ms
+        } else {
+            self.displayed_timeline_time_utc()
+                .map(|time| time.timestamp_millis())
+                .unwrap_or(now_ms)
+        }
+    }
+
+    fn desired_glm_read_window_ms(&self) -> Option<(i64, i64)> {
+        let target = self.active_loop_timeline_target();
+        let loop_window = self.loaded_loop_summary_time_window_for_target(target)?;
+        let has_loop_context =
+            self.loop_timeline_history_len(target) > 1 || self.loop_timeline_playing(target);
+        if !has_loop_context && !self.browsing_history {
+            return None;
+        }
+        let display_window_ms =
+            i64::from(self.app_settings.glm_show_last_minutes.clamp(1, 60)) * 60_000;
+        let start_ms = loop_window
+            .0
+            .timestamp_millis()
+            .saturating_sub(display_window_ms);
+        let end_ms = loop_window.1.timestamp_millis();
+        Some((start_ms, end_ms))
+    }
+
+    fn timeline_glm_layer_settled(&self) -> bool {
+        if !self.glm_enabled {
+            return true;
+        }
+        let Some((t0_ms, t1_ms)) = self.desired_glm_read_window_ms() else {
+            return true;
+        };
+        self.desired_glm_satellites().iter().all(|satellite| {
+            [self.glm.as_ref(), self.glm_secondary.as_ref()]
+                .into_iter()
+                .flatten()
+                .find(|glm| glm.satellite == *satellite)
+                .is_some_and(|glm| glm.read_range_covers(t0_ms, t1_ms))
+        })
+    }
+
+    fn ensure_glm_slot(
+        ctx: &egui::Context,
+        slot: &mut Option<glm_layer::GlmWorker>,
+        satellite: &str,
+        ignore_before_ms: Option<i64>,
+    ) {
+        if slot.as_ref().is_none_or(|glm| glm.satellite != satellite) {
+            *slot = Some(glm_layer::GlmWorker::spawn(
+                ctx,
+                satellite,
+                settings::glm_store_dir(),
+                ignore_before_ms,
+            ));
+        }
+    }
+
+    fn pump_glm_slot(
+        ctx: &egui::Context,
+        slot: &mut Option<glm_layer::GlmWorker>,
+        read_window_ms: Option<(i64, i64)>,
+    ) {
+        let Some(glm) = slot else {
+            return;
+        };
+        glm.pump_for_window(read_window_ms);
+        if glm.restart_requested() {
+            let satellite = glm.satellite.clone();
+            let ignore_before_ms = glm.ignore_flashes_before_ms();
+            *slot = Some(glm_layer::GlmWorker::spawn(
+                ctx,
+                &satellite,
+                settings::glm_store_dir(),
+                ignore_before_ms,
+            ));
+        }
+    }
+
+    fn refresh_glm_data(&mut self, ctx: &egui::Context) {
+        let refresh_ms = chrono::Utc::now().timestamp_millis();
+        // Keep the rolling store and its dedup manifest. Deleting only
+        // window.json while leaving .rwl buckets causes the same granules to
+        // be appended again; the worker's startup repair already handles a
+        // genuinely poisoned manifest. A refresh is simply a live-edge worker
+        // restart with a bounded acquisition lookback.
+        self.glm = None;
+        self.glm_secondary = None;
+        self.glm_refresh_requested_at = Some(Instant::now());
+        self.glm_ignore_before_ms =
+            Some(refresh_ms - glm_layer::LIVE_BOOTSTRAP_WINDOW_MINUTES * 60_000);
+        self.glm_enabled = true;
+        self.app_settings.overlay_glm = true;
+        let _ = self.app_settings.save();
+        self.status = "Refreshing GOES GLM lightning data".to_owned();
+        ctx.request_repaint();
+    }
+
     /// SPC outlooks + reports: fetch when enabled, refresh every 5 min.
     fn poll_spc(&mut self, ctx: &egui::Context) {
         let wants = !self.spc_outlooks_enabled.is_empty() || self.spc_reports_enabled;
@@ -27521,21 +27659,38 @@ impl ViewerApp {
     }
 
     /// GLM lightning flashes, time-synced: each frame draws the trailing
-    /// 10-minute window BEFORE ITS OWN TIME (loops replay lightning
+    /// live window BEFORE ITS OWN TIME (loops replay lightning
     /// history), age-faded, sized by log-energy, degraded QC'd out.
     fn draw_glm(&self, painter: &egui::Painter, rect: egui::Rect) {
         if !self.glm_enabled {
             return;
         }
-        let Some(glm) = &self.glm else {
+        if self.glm.is_none() && self.glm_secondary.is_none() {
             return;
-        };
-        let frame_ms = self
-            .displayed_timeline_time_utc()
-            .map(|time| time.timestamp_millis())
-            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let frame_ms = self.glm_display_time_ms(now_ms);
         let glm_style = self.style_registry.glm();
-        for (flash, age) in glm.frame_flashes(frame_ms, glm_style.window_minutes) {
+        let glm_window_minutes = i64::from(self.app_settings.glm_show_last_minutes.clamp(1, 60));
+        for glm in [self.glm.as_ref(), self.glm_secondary.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            self.draw_glm_for_frame_ms(painter, rect, glm, glm_style, frame_ms, glm_window_minutes);
+        }
+    }
+
+    fn draw_glm_for_frame_ms(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        glm: &glm_layer::GlmWorker,
+        glm_style: &styles::GlmStyle,
+        frame_ms: i64,
+        window_minutes: i64,
+    ) -> usize {
+        let mut drawn = 0;
+        for (flash, age) in glm.frame_flashes(frame_ms, window_minutes) {
             let pos = self.lon_lat_to_screen(rect, flash.lon, flash.lat);
             if !rect.contains(pos) {
                 continue;
@@ -27554,7 +27709,9 @@ impl ViewerApp {
                 [pos - egui::vec2(0.0, size), pos + egui::vec2(0.0, size)],
                 stroke,
             );
+            drawn += 1;
         }
+        drawn
     }
 
     /// Surface-obs station plots: GR2A-style T/Td (°F, or °C when
@@ -33706,6 +33863,7 @@ fn layer_state_color(state: &str) -> egui::Color32 {
     match state {
         "loading" => egui::Color32::from_rgb(238, 218, 62),
         "live" => LIVE_COLOR,
+        "stale" => egui::Color32::from_rgb(225, 164, 56),
         _ => egui::Color32::from_rgb(106, 132, 154),
     }
 }
@@ -33727,6 +33885,16 @@ pub(crate) fn glm_satellite_label(satellite: &str) -> &'static str {
         "goes19" => "GOES-East",
         _ => "GOES GLM",
     }
+}
+
+pub(crate) const GLM_LIVE_MAX_AGE_MINUTES: i64 = 5;
+
+pub(crate) fn glm_latest_age_minutes(frame_ms: i64, latest_ms: i64) -> i64 {
+    frame_ms.saturating_sub(latest_ms).max(0) / 60_000
+}
+
+pub(crate) fn glm_latest_is_live(frame_ms: i64, latest_ms: i64) -> bool {
+    frame_ms.saturating_sub(latest_ms).max(0) <= GLM_LIVE_MAX_AGE_MINUTES * 60_000
 }
 
 pub(crate) fn compact_layer_status(status: &str, max_chars: usize) -> String {
@@ -43249,6 +43417,38 @@ mod tests {
     }
 
     #[test]
+    fn loop_recording_waits_for_glm_loop_window_read() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        add_two_test_history_frames(&mut app);
+        app.map_center_lon = -95.0;
+        app.glm_enabled = true;
+        app.app_settings.glm_show_last_minutes = 5;
+        let (read_start_ms, read_end_ms) = app
+            .desired_glm_read_window_ms()
+            .expect("GLM loop read window");
+
+        assert!(
+            !app.loop_record_time_layers_settled(),
+            "recording must wait until GLM has read the loop-covering window"
+        );
+
+        app.glm = Some(glm_layer::GlmWorker::new_for_test(
+            "goes19",
+            Some((read_start_ms + 1, read_end_ms)),
+        ));
+        assert!(
+            !app.loop_record_time_layers_settled(),
+            "a partial GLM read window can still miss first-frame lightning"
+        );
+
+        app.glm = Some(glm_layer::GlmWorker::new_for_test(
+            "goes19",
+            Some((read_start_ms, read_end_ms)),
+        ));
+        assert!(app.loop_record_time_layers_settled());
+    }
+
+    #[test]
     fn loop_recording_waits_for_timeline_model_layer_work() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         add_two_test_history_frames(&mut app);
@@ -47360,6 +47560,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn glm_runs_only_the_selected_goes_feed() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.map_center_lon = -119.8;
+        assert_eq!(app.desired_glm_satellite(), Some("goes18"));
+        assert_eq!(app.desired_glm_satellites(), &["goes18"]);
+
+        app.map_center_lon = -82.0;
+        assert_eq!(app.desired_glm_satellite(), Some("goes19"));
+        assert_eq!(app.desired_glm_satellites(), &["goes19"]);
+
+        app.map_center_lon = 80.0;
+        assert_eq!(app.desired_glm_satellite(), None);
+        assert!(app.desired_glm_satellites().is_empty());
+    }
+
+    #[test]
+    fn glm_live_status_uses_five_minute_age_gate() {
+        let now = 1_800_000;
+        assert!(glm_latest_is_live(now, now - 5 * 60_000));
+        assert!(!glm_latest_is_live(now, now - 6 * 60_000));
+        assert_eq!(glm_latest_age_minutes(now, now - 47 * 60_000), 47);
+    }
+
+    #[test]
+    fn glm_read_window_tracks_loaded_loop_span() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        add_two_test_history_frames(&mut app);
+        app.glm_enabled = true;
+        app.app_settings.glm_show_last_minutes = 5;
+
+        let (loop_start, loop_end) = app
+            .loaded_loop_summary_time_window_for_target(LoopTimelineTarget::Primary)
+            .expect("loaded loop window");
+        let (read_start_ms, read_end_ms) = app
+            .desired_glm_read_window_ms()
+            .expect("GLM loop read window");
+
+        assert_eq!(read_start_ms, loop_start.timestamp_millis() - 5 * 60_000);
+        assert_eq!(read_end_ms, loop_end.timestamp_millis());
+    }
+
+    #[test]
+    fn player_frame_limit_exposes_two_thousand_frame_loops() {
+        let app = test_viewer_app_with_hazards(Vec::new());
+        let context = app.unified_player_context();
+
+        assert_eq!(context.history_frame_limit_max, 2000);
+        assert!(context.history_frame_limit_options.contains(&2000));
+        assert_eq!(MAX_HISTORY_FRAME_LIMIT, 2000);
+    }
+
     /// Golden parity: default SPC outlook styling (fill 36, stroke 230,
     /// width 2.0, published colors) and report markers (tornado red 5 px
     /// w/ black outline, wind blue 3.5, hail green 3.5, no outline).
@@ -49583,6 +49835,9 @@ mod tests {
             spc_day: 1,
             spc_last_key: None,
             glm: None,
+            glm_secondary: None,
+            glm_refresh_requested_at: None,
+            glm_ignore_before_ms: None,
             spc_rx: None,
             mping_reports: Vec::new(),
             mping_enabled: false,
@@ -49796,6 +50051,7 @@ mod tests {
         app.volume = Some(Arc::new(test_storm_volume(scan_time)));
         app.center_map_on(35.333, -97.277);
         app.map_scale = 650.0;
+        app.show_storm_tracks = true;
         app.storm_tracker
             .tracks
             .push(test_storm_track(7, scan_time, 8.0, 4.0, None));
@@ -50724,7 +50980,11 @@ mod tests {
         );
         assert_eq!(normalized_archive_frame_count(1), 1);
         assert_eq!(normalized_archive_frame_count(17), 17);
-        assert_eq!(normalized_archive_frame_count(999), MAX_ARCHIVE_FRAME_COUNT);
+        assert_eq!(normalized_archive_frame_count(999), 999);
+        assert_eq!(
+            normalized_archive_frame_count(MAX_ARCHIVE_FRAME_COUNT + 1),
+            MAX_ARCHIVE_FRAME_COUNT
+        );
     }
 
     #[test]

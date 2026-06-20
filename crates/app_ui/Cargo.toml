@@ -38,48 +38,48 @@ rfd.workspace = true
 # Model-data dock and satellite/model stack (rusty-weather).
 [dependencies.rw-ui]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "7e8d9780b2441778ee35f5545dbd28b5222eebe7"
+rev = "da16604e76de21c10a6c05c2379d24b52e192659"
 
 [dependencies.rustwx-render]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "7e8d9780b2441778ee35f5545dbd28b5222eebe7"
+rev = "da16604e76de21c10a6c05c2379d24b52e192659"
 
 [dependencies.rustwx-sounding]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "7e8d9780b2441778ee35f5545dbd28b5222eebe7"
+rev = "da16604e76de21c10a6c05c2379d24b52e192659"
 
 [dependencies.sharprs]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "7e8d9780b2441778ee35f5545dbd28b5222eebe7"
+rev = "da16604e76de21c10a6c05c2379d24b52e192659"
 
 [dependencies.rw-ingest]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "7e8d9780b2441778ee35f5545dbd28b5222eebe7"
+rev = "da16604e76de21c10a6c05c2379d24b52e192659"
 
 [dependencies.rw-glm]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "7e8d9780b2441778ee35f5545dbd28b5222eebe7"
+rev = "da16604e76de21c10a6c05c2379d24b52e192659"
 
 [dependencies.rustwx-products]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "7e8d9780b2441778ee35f5545dbd28b5222eebe7"
+rev = "da16604e76de21c10a6c05c2379d24b52e192659"
 
 [dependencies.rustwx-core]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "7e8d9780b2441778ee35f5545dbd28b5222eebe7"
+rev = "da16604e76de21c10a6c05c2379d24b52e192659"
 
 [dependencies.rustwx-io]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "7e8d9780b2441778ee35f5545dbd28b5222eebe7"
+rev = "da16604e76de21c10a6c05c2379d24b52e192659"
 
 [dependencies.rustwx-models]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "7e8d9780b2441778ee35f5545dbd28b5222eebe7"
+rev = "da16604e76de21c10a6c05c2379d24b52e192659"
 
 [dependencies.rw-sat]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "7e8d9780b2441778ee35f5545dbd28b5222eebe7"
+rev = "da16604e76de21c10a6c05c2379d24b52e192659"
 
 [dependencies.rw-store]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
-rev = "7e8d9780b2441778ee35f5545dbd28b5222eebe7"
+rev = "da16604e76de21c10a6c05c2379d24b52e192659"

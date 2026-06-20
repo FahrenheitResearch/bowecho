@@ -804,8 +804,11 @@ impl Default for UnifiedPlayerContext {
             loop_start_utc: None,
             loop_end_utc: None,
             history_frame_limit: 10,
-            history_frame_limit_max: 200,
-            history_frame_limit_options: vec![3, 5, 7, 10, 15, 20, 25, 30, 48, 72, 96],
+            history_frame_limit_max: 2000,
+            history_frame_limit_options: vec![
+                3, 5, 7, 10, 15, 20, 25, 30, 48, 72, 96, 128, 160, 200, 256, 384, 512, 768, 1000,
+                1500, 2000,
+            ],
             loop_speed_percent: 100,
             loop_speed_options: vec![25, 50, 100, 200, 400, 800, 1600, 3200, 6400],
             low_sweeps_enabled: false,

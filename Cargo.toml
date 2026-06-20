@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.25.3"
+version = "0.25.4"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FahrenheitResearch/bowecho"
@@ -32,3 +32,6 @@ strip = true
 # panic = "abort" is intentionally NOT set: app_ui isolates worker panics
 # with catch_unwind / thread joins, and abort would turn those contained
 # failures into full app crashes.
+
+[patch.crates-io]
+hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather", rev = "da16604e76de21c10a6c05c2379d24b52e192659" }

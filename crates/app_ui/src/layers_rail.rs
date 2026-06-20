@@ -9,15 +9,16 @@
 //! most two inline extras besides the gear and remove slots, which is what
 //! keeps new features from re-crowding the rail.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
 use crate::{
-    LayerRowGear, LayerRowOpacity, LayerRowOrder, LayerRowRemove, LayerRowSpec, LayerRowVis,
-    OrdArchiveLoadMode, PlacefileSlot, PollSource, RadarSite, SidebarTab, ViewerApp,
-    compact_layer_status, custom_poll_entry_label, custom_poll_entry_lat_lon,
-    custom_poll_links_from_gis, dock, format_site_label, glm_satellite_label, intl_provider_label,
+    GLM_LIVE_MAX_AGE_MINUTES, LayerRowGear, LayerRowOpacity, LayerRowOrder, LayerRowRemove,
+    LayerRowSpec, LayerRowVis, OrdArchiveLoadMode, PlacefileSlot, PollSource, RadarSite,
+    SidebarTab, ViewerApp, compact_layer_status, custom_poll_entry_label,
+    custom_poll_entry_lat_lon, custom_poll_links_from_gis, dock, format_site_label,
+    glm_latest_age_minutes, glm_latest_is_live, glm_satellite_label, intl_provider_label,
     layer_row, mesoanalysis, normalized_poll_url, oa_derived, parse_custom_poll_marker_inputs,
     poll_url_name, poll_urls_match, spc_layers,
 };
@@ -478,12 +479,41 @@ impl ViewerApp {
         // grammar (spec §2.3). No opacity in v1: age-fade is
         // intrinsic to the layer.
         {
-            let glm_window_min = self.style_registry.glm().window_minutes;
+            let glm_window_min = i64::from(self.app_settings.glm_show_last_minutes.clamp(1, 60));
+            let live_ms = chrono::Utc::now().timestamp_millis();
+            let frame_ms = self.glm_display_time_ms(live_ms);
+            let displaying_live_time = frame_ms == live_ms;
             let glm_source = self.desired_glm_satellite();
+            let glm_slots = [self.glm.as_ref(), self.glm_secondary.as_ref()];
+            let has_glm_worker = glm_slots.iter().any(|slot| slot.is_some());
+            let has_live_glm = glm_slots
+                .iter()
+                .flatten()
+                .filter_map(|glm| glm.latest_flash_time_ms)
+                .any(|latest_ms| glm_latest_is_live(live_ms, latest_ms));
+            let has_stale_glm = glm_slots.iter().flatten().any(|glm| {
+                glm.latest_flash_time_ms.is_some()
+                    || glm.last_read_count > 0
+                    || glm.fetched_at.is_some()
+            });
+            if has_live_glm {
+                self.glm_refresh_requested_at = None;
+                self.glm_ignore_before_ms = None;
+            }
+            let refresh_elapsed = self
+                .glm_refresh_requested_at
+                .map(|started| started.elapsed());
+            let refresh_active = self.glm_enabled
+                && refresh_elapsed.is_some_and(|elapsed| elapsed < Duration::from_secs(45))
+                && !has_live_glm;
             let glm_state: Option<&'static str> = if self.glm_enabled {
-                if self.glm.is_some() {
+                if refresh_active {
+                    Some("loading")
+                } else if has_live_glm {
                     Some("live")
-                } else if glm_source.is_some() {
+                } else if has_glm_worker && has_stale_glm {
+                    Some("stale")
+                } else if has_glm_worker || glm_source.is_some() {
                     Some("loading")
                 } else {
                     Some("outside")
@@ -492,17 +522,59 @@ impl ViewerApp {
                 None
             };
             let glm_line = if self.glm_enabled {
-                if let Some(glm) = &self.glm {
-                    let frame_ms = chrono::Utc::now().timestamp_millis();
-                    let count = glm.frame_flashes(frame_ms, glm_window_min).count();
-                    let source = glm_satellite_label(&glm.satellite);
-                    if count > 0 {
-                        format!("{source} {count} fl/{glm_window_min}m")
+                let lines = glm_slots
+                    .into_iter()
+                    .flatten()
+                    .map(|glm| {
+                        let count = glm.frame_flashes(frame_ms, glm_window_min).count();
+                        let source = glm_satellite_label(&glm.satellite);
+                        if count > 0 && !displaying_live_time {
+                            format!("{source} {count} at selected time")
+                        } else if count > 0 {
+                            format!("{source} live ({count}/{glm_window_min}m)")
+                        } else if let Some(error) = &glm.last_read_error {
+                            format!("{source} read {}", compact_layer_status(error, 18))
+                        } else if let Some(latest_ms) = glm.latest_flash_time_ms {
+                            let latest_count = glm.frame_flashes(latest_ms, glm_window_min).count();
+                            let age_min = glm_latest_age_minutes(live_ms, latest_ms);
+                            if glm_latest_is_live(live_ms, latest_ms) {
+                                if displaying_live_time {
+                                    format!("{source} live ({latest_count}/{glm_window_min}m)")
+                                } else {
+                                    format!("{source} live · none at selected time")
+                                }
+                            } else {
+                                format!("{source} stale {age_min}m ago")
+                            }
+                        } else if glm.last_read_count > 0 {
+                            format!("{source} stale")
+                        } else if glm.fetched_at.is_some() {
+                            let status = compact_layer_status(&glm.last_status, 34);
+                            format!("{source} no flashes in last {glm_window_min}m · {status}")
+                        } else {
+                            format!("{source} {}", compact_layer_status(&glm.last_status, 20))
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let refresh_note = refresh_elapsed
+                    .filter(|elapsed| !has_live_glm && *elapsed < Duration::from_secs(45))
+                    .map(|elapsed| format!("refreshing {}s", elapsed.as_secs()));
+                let no_live_note = refresh_elapsed
+                    .filter(|elapsed| !has_live_glm && *elapsed >= Duration::from_secs(45))
+                    .map(|_| "no live GLM yet".to_owned());
+                let refresh_note = refresh_note.or(no_live_note);
+                if !lines.is_empty() {
+                    if let Some(note) = refresh_note {
+                        format!("{note} · {}", lines.join(" | "))
                     } else {
-                        format!("{source} {}", compact_layer_status(&glm.last_status, 26))
+                        lines.join(" | ")
                     }
                 } else if let Some(source) = glm_source {
-                    format!("{} starting", glm_satellite_label(source))
+                    if let Some(note) = refresh_note {
+                        format!("{note} · {} starting", glm_satellite_label(source))
+                    } else {
+                        format!("{} starting", glm_satellite_label(source))
+                    }
                 } else {
                     "outside GOES view".to_owned()
                 }
@@ -518,24 +590,56 @@ impl ViewerApp {
                 "Source: GOES GLM is unavailable for this map longitude.".to_owned()
             };
             let show_glm_line = self.glm_enabled;
-            if layer_row(
+            let mut refresh_glm = false;
+            let mut next_window_min = glm_window_min;
+            let mut glm_style_changed = false;
+            let row_changed = layer_row(
                 ui,
                 LayerRowSpec {
                     vis: LayerRowVis::Toggle {
                         value: &mut self.glm_enabled,
-                        hover: "GOES GLM flashes, free via AWS (no key): trailing 10-minute window, age-faded, time-synced to the radar loop. First data usually arrives after the first S3 poll + granule decode.",
+                        hover: "GOES GLM flashes, free via AWS (no key): trailing Show last window, age-faded, time-synced to the radar loop. Live/stale health uses the newest-flash gate.",
                     },
                     name: "Lightning",
                     name_width: crate::NAME_W_STD,
                     name_hover: "GOES GLM lightning flashes. The row label toggles the layer too. Europe/Japan require a separate MTG/Himawari lightning path and are not shown by this layer.",
                     state: glm_state,
                     gear: Some(LayerRowGear::Menu {
-                        hover: "Lightning layer options",
-                        content: Box::new(move |ui| {
+                        hover: "Lightning data status",
+                        content: Box::new(|ui| {
                             ui.weak(source_note);
+                            ui.weak(format!(
+                                "Live means newest GLM flash is {GLM_LIVE_MAX_AGE_MINUTES} minutes old or newer."
+                            ));
+                            ui.weak(
+                                "Older data is stale. Use Refresh data if it does not catch up.",
+                            );
+                            ui.weak(
+                                "Loaded loops read the loop time span from the rolling GLM store.",
+                            );
                             ui.weak("MTG Lightning Imager is not enabled here yet.");
                             ui.separator();
-                            ui.weak("Appearance controls land here next.");
+                            ui.horizontal(|ui| {
+                                ui.label("Show last");
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut next_window_min)
+                                            .range(1..=60)
+                                            .speed(1.0)
+                                            .suffix(" min"),
+                                    )
+                                    .on_hover_text(
+                                        "Display flashes from the last N minutes. This does not change the live/stale health rule.",
+                                    )
+                                    .changed()
+                                {
+                                    glm_style_changed = true;
+                                }
+                            });
+                            if ui.button("Refresh data").clicked() {
+                                refresh_glm = true;
+                                ui.close();
+                            }
                         }),
                     }),
                     ..Default::default()
@@ -545,7 +649,17 @@ impl ViewerApp {
                         ui.weak(glm_line);
                     }
                 },
-            ) {
+            );
+            if refresh_glm {
+                self.refresh_glm_data(ctx);
+                ctx.request_repaint();
+            }
+            if glm_style_changed {
+                self.app_settings.glm_show_last_minutes = next_window_min.clamp(1, 60) as u16;
+                let _ = self.app_settings.save();
+                ctx.request_repaint();
+            }
+            if row_changed {
                 self.save_overlay_defaults();
                 ctx.request_repaint();
             }

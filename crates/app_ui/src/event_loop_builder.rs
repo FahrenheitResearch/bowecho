@@ -273,7 +273,7 @@ impl EventLoopBuilderState {
             ui.label("Radar cap");
             ui.add(
                 egui::DragValue::new(&mut self.max_radar_frames)
-                    .range(1..=200)
+                    .range(1..=2000)
                     .suffix(" scans"),
             );
             ui.checkbox(&mut self.auto_play, "Play");

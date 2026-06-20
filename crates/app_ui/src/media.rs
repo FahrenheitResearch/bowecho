@@ -644,6 +644,9 @@ impl ViewerApp {
         if !self.timeline_satellite_map_settled() {
             return false;
         }
+        if !self.timeline_glm_layer_settled() {
+            return false;
+        }
         self.timeline_model_layers_settled()
     }
 

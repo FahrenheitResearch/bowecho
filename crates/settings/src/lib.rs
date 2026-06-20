@@ -7,7 +7,8 @@ fn default_true() -> bool {
 }
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +55,10 @@ pub struct AppSettings {
     pub overlay_obs_mesonet: bool,
     #[serde(default)]
     pub overlay_glm: bool,
+    /// GOES GLM display filter: draw flashes from the trailing N minutes.
+    /// This is separate from the fixed live/stale newest-flash health gate.
+    #[serde(default = "default_glm_show_last_minutes")]
+    pub glm_show_last_minutes: u16,
     /// RAOB launch-site markers (the observed-soundings obs layer) —
     /// default off; clicking a marker fetches that station's sounding at
     /// the displayed radar time.
@@ -346,6 +351,10 @@ fn default_live_preload_frame_count() -> u16 {
     5
 }
 
+fn default_glm_show_last_minutes() -> u16 {
+    5
+}
+
 /// A persisted FARM drape georeference. Coordinates are stored as scaled
 /// integers (microdegrees etc.) so `AppSettings` stays `Eq`-derivable.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -431,6 +440,7 @@ impl Default for AppSettings {
             overlay_obs_metar: true,
             overlay_obs_mesonet: true,
             overlay_glm: false,
+            glm_show_last_minutes: default_glm_show_last_minutes(),
             overlay_raob: false,
             overlay_spc_outlooks: Vec::new(),
             overlay_spc_reports: false,
@@ -683,10 +693,50 @@ pub fn sat_store_dir() -> PathBuf {
     bowecho_dir("sat-store")
 }
 
-/// BowEcho-owned GLM lightning store (own dir per app — writer locks make
-/// sharing safe, but separate stores avoid pruning-policy fights).
+/// BowEcho-owned GLM lightning store.
+///
+/// The live GLM follower is a writer. Use a per-process child store so two
+/// BowEcho exes running during release testing cannot block each other on the
+/// same satellite writer lock. Old per-process stores are tiny and are cleaned
+/// opportunistically.
 pub fn glm_store_dir() -> PathBuf {
-    bowecho_dir("glm-store")
+    let root = bowecho_dir("glm-store");
+    cleanup_old_glm_session_dirs(&root);
+    let dir = root
+        .join("sessions")
+        .join(format!("pid-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+fn cleanup_old_glm_session_dirs(root: &Path) {
+    const KEEP_FOR: Duration = Duration::from_secs(3 * 24 * 3600);
+    let sessions = root.join("sessions");
+    let Ok(entries) = std::fs::read_dir(&sessions) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("pid-") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if now.duration_since(modified).is_ok_and(|age| age > KEEP_FOR) {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
 }
 
 /// WoFS drape georeference cache: calibration OCRs ~20 sounding PNGs
