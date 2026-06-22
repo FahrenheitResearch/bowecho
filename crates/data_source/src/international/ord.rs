@@ -77,10 +77,11 @@ const HOUR_LOOKBACK_SLOTS: i64 = 6;
 /// oldest-first for playback.
 const RECENT_HOUR_LOOKBACK_SLOTS: i64 = 23;
 
-/// ORD countries this provider enables: lowercase ODIM site-code prefix,
-/// bucket directory, and country label. Countries with native BowEcho
-/// providers (SE, DK, AT, FI, SK, DE, CZ) are deliberately absent.
-const ORD_COUNTRIES: &[(&str, &str, &str)] = &[
+/// ORD countries this provider enables for live/recent polling: lowercase
+/// ODIM site-code prefix, bucket directory, and country label. Countries
+/// with native BowEcho providers (SE/SMHI, DK/DMI, AT/GeoSphere, FI/FMI,
+/// SK/SHMU, DE/DWD, CZ/CHMI) stay absent from the live picker.
+const ORD_LIVE_COUNTRIES: &[(&str, &str, &str)] = &[
     ("be", "BE", "Belgium"),
     ("ch", "CH", "Switzerland"),
     ("ee", "EE", "Estonia"),
@@ -95,6 +96,34 @@ const ORD_COUNTRIES: &[(&str, &str, &str)] = &[
     ("pl", "PL", "Poland"),
     ("ro", "RO", "Romania"),
     ("si", "SI", "Slovenia"),
+];
+
+/// ORD countries allowed for direct historical archive lookup. This is
+/// intentionally broader than live/recent: native providers remain the
+/// preferred live source, but the immutable archive bucket may be the only
+/// path for older per-site ODIM files.
+const ORD_ARCHIVE_COUNTRIES: &[(&str, &str, &str)] = &[
+    ("at", "AT", "Austria"),
+    ("be", "BE", "Belgium"),
+    ("ch", "CH", "Switzerland"),
+    ("cz", "CZ", "Czechia"),
+    ("de", "DE", "Germany"),
+    ("dk", "DK", "Denmark"),
+    ("ee", "EE", "Estonia"),
+    ("fi", "FI", "Finland"),
+    ("fr", "FR", "France"),
+    ("hr", "HR", "Croatia"),
+    ("ie", "IE", "Ireland"),
+    ("is", "IS", "Iceland"),
+    ("lt", "LT", "Lithuania"),
+    ("mt", "MT", "Malta"),
+    ("nl", "NL", "Netherlands"),
+    ("no", "NO", "Norway"),
+    ("pl", "PL", "Poland"),
+    ("ro", "RO", "Romania"),
+    ("se", "SE", "Sweden"),
+    ("si", "SI", "Slovenia"),
+    ("sk", "SK", "Slovakia"),
 ];
 
 /// ORD site table: ODIM code, label, latitude, longitude, and whether the
@@ -183,6 +212,7 @@ const ORD_SITES: &[(&str, &str, f32, f32, bool)] = &[
     ("rocra", "Craiova", 44.3103, 23.8674, true),
     ("romed", "Medgidia", 44.2434, 28.2506, true),
     ("roora", "Oradea", 47.0922, 21.9429, true),
+    ("seatv", "Atvidaberg / Vilebo", 58.1059, 15.9365, true),
     ("rotim", "Timișoara", 45.7717, 21.2577, true),
     ("silis", "Lisca", 46.0678, 15.2849, true),
     ("sipas", "Pasja Ravan", 46.0980, 14.2282, true),
@@ -247,7 +277,7 @@ pub fn archive_plans_for_hour(
     hour_utc: DateTime<Utc>,
 ) -> Result<Vec<OrdArchivePlan>, String> {
     validate_site_code(site_id)?;
-    let (_, dir, _) = country_for_code(site_id)
+    let (_, dir, _) = country_for_archive_code(site_id)
         .ok_or_else(|| format!("ORD: site '{site_id}' is not in an enabled country"))?;
     let hour_utc = truncate_to_utc_hour(hour_utc);
     let pvol_hint = ORD_SITES
@@ -331,7 +361,7 @@ impl IntlProvider for OrdProvider {
         self.sites.get_or_fill(|| {
             let mut sites: Vec<IntlSite> = Vec::new();
             let mut first_error: Option<String> = None;
-            for &(_, dir, _) in ORD_COUNTRIES {
+            for &(_, dir, _) in ORD_LIVE_COUNTRIES {
                 // Today first; the previous UTC day only when today's
                 // directory is still empty (midnight / country outage).
                 let mut found = false;
@@ -370,7 +400,7 @@ impl IntlProvider for OrdProvider {
 
     fn latest(&self, site_id: &str) -> Result<FramePlan, String> {
         validate_site_code(site_id)?;
-        let (_, dir, _) = country_for_code(site_id)
+        let (_, dir, _) = country_for_live_code(site_id)
             .ok_or_else(|| format!("ORD: site '{site_id}' is not in an enabled country"))?;
 
         // Static-table hint orders the probe; the other kind is still
@@ -423,7 +453,7 @@ impl IntlProvider for OrdProvider {
             return Ok(Vec::new());
         }
         validate_site_code(site_id)?;
-        let (_, dir, _) = country_for_code(site_id)
+        let (_, dir, _) = country_for_live_code(site_id)
             .ok_or_else(|| format!("ORD: site '{site_id}' is not in an enabled country"))?;
 
         let pvol_hint = ORD_SITES
@@ -491,7 +521,7 @@ impl IntlProvider for OrdProvider {
                 if site_superseded_by_native_provider(code) {
                     return None;
                 }
-                let (_, _, country) = country_for_code(code)?;
+                let (_, _, country) = country_for_live_code(code)?;
                 Some(IntlSite {
                     provider_id: self.id(),
                     site_id: code.to_owned(),
@@ -540,10 +570,22 @@ fn validate_site_code(site_id: &str) -> Result<(), String> {
     }
 }
 
-/// The enabled-country row for an ODIM site code, by its 2-letter prefix.
-fn country_for_code(code: &str) -> Option<(&'static str, &'static str, &'static str)> {
+/// The live/recent enabled-country row for an ODIM site code, by prefix.
+fn country_for_live_code(code: &str) -> Option<(&'static str, &'static str, &'static str)> {
     let prefix = code.get(..2)?;
-    ORD_COUNTRIES.iter().find(|(lc, ..)| *lc == prefix).copied()
+    ORD_LIVE_COUNTRIES
+        .iter()
+        .find(|(lc, ..)| *lc == prefix)
+        .copied()
+}
+
+/// The historical archive enabled-country row for an ODIM site code.
+fn country_for_archive_code(code: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    let prefix = code.get(..2)?;
+    ORD_ARCHIVE_COUNTRIES
+        .iter()
+        .find(|(lc, ..)| *lc == prefix)
+        .copied()
 }
 
 fn site_superseded_by_native_provider(code: &str) -> bool {
@@ -575,7 +617,7 @@ fn sites_from_prefixes(common_prefixes: &[String]) -> Vec<IntlSite> {
             if site_superseded_by_native_provider(code) {
                 return None;
             }
-            let (_, _, country) = country_for_code(code)?;
+            let (_, _, country) = country_for_live_code(code)?;
             let known = ORD_SITES.iter().find(|(id, ..)| *id == code);
             Some(IntlSite {
                 provider_id: "ord",
@@ -983,20 +1025,21 @@ mod tests {
     fn country_table_covers_every_static_site_and_skips_native_feeds() {
         for &(code, ..) in ORD_SITES {
             assert!(
-                country_for_code(code).is_some(),
-                "{code}: no enabled country for prefix"
+                country_for_archive_code(code).is_some(),
+                "{code}: no archive country for prefix"
             );
             assert!(validate_site_code(code).is_ok(), "{code}: invalid code");
         }
         // Natively covered countries must stay excluded.
         for native in ["se", "dk", "at", "fi", "sk", "de", "cz"] {
             assert!(
-                !ORD_COUNTRIES.iter().any(|(lc, ..)| *lc == native),
+                !ORD_LIVE_COUNTRIES.iter().any(|(lc, ..)| *lc == native),
                 "{native} has a native BowEcho provider"
             );
         }
-        assert_eq!(ORD_COUNTRIES.len(), 14);
-        assert_eq!(ORD_SITES.len(), 75);
+        assert_eq!(ORD_LIVE_COUNTRIES.len(), 14);
+        assert!(ORD_ARCHIVE_COUNTRIES.iter().any(|(lc, ..)| *lc == "se"));
+        assert_eq!(ORD_SITES.len(), 76);
         let visible = OrdProvider::new().static_sites();
         assert!(visible.iter().any(|site| site.site_id == "behel"
             && site.label == "Helchteren (Belgium)"
@@ -1006,6 +1049,18 @@ mod tests {
             !visible.iter().any(|site| site.site_id == "eesur"),
             "Sürgavere is advertised by KAIA, not ORD"
         );
+    }
+
+    #[test]
+    fn ord_archive_country_table_allows_sweden_without_live_advertising() {
+        let visible = OrdProvider::new().static_sites();
+
+        assert!(!visible.iter().any(|site| site.site_id == "seatv"));
+        assert_eq!(
+            country_for_archive_code("seatv").map(|(_, dir, country)| (dir, country)),
+            Some(("SE", "Sweden"))
+        );
+        assert!(country_for_live_code("seatv").is_none());
     }
 
     #[test]

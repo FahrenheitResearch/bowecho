@@ -39,6 +39,7 @@ pub(crate) struct DataPackScene {
     pub(crate) layout: DataPackLayout,
     pub(crate) autoplay: bool,
     pub(crate) options: DataPackLoadOptions,
+    pub(crate) resume_poll_url: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,6 +47,20 @@ pub(crate) struct LoadedDataPack {
     pub(crate) id: &'static str,
     pub(crate) extra_start_scans: usize,
     pub(crate) extra_end_scans: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResearchFeedDataPack {
+    pub(crate) id: &'static str,
+    pub(crate) title: &'static str,
+    pub(crate) summary: &'static str,
+    pub(crate) feed_id: &'static str,
+    pub(crate) poll_url: &'static str,
+    pub(crate) frame_count: usize,
+    pub(crate) focus_lat: f32,
+    pub(crate) focus_lon: f32,
+    pub(crate) map_scale: f32,
+    pub(crate) layout: DataPackLayout,
 }
 
 impl BuiltInDataPack {
@@ -92,11 +107,44 @@ impl BuiltInDataPack {
             layout: self.layout,
             autoplay: true,
             options,
+            resume_poll_url: None,
+        }
+    }
+}
+
+impl ResearchFeedDataPack {
+    pub(crate) fn scene(self) -> DataPackScene {
+        DataPackScene {
+            id: self.id,
+            title: self.title,
+            site_id: self.feed_id,
+            focus_lat: self.focus_lat,
+            focus_lon: self.focus_lon,
+            map_scale: self.map_scale,
+            layout: self.layout,
+            autoplay: false,
+            options: DataPackLoadOptions::default(),
+            resume_poll_url: Some(self.poll_url),
         }
     }
 }
 
 pub(crate) const BUILT_IN_DATA_PACKS: &[BuiltInDataPack] = &[
+    BuiltInDataPack {
+        id: "kvwx-2026-dealias-debug",
+        title: "KVWX Velocity Fold Debug",
+        summary: "KVWX 2026-06-22 03:31 UTC 1.23 degree velocity case for hybrid dealias QA.",
+        site_id: "KVWX",
+        start_utc: "2026-06-22T03:20:00Z",
+        end_utc: "2026-06-22T03:36:00Z",
+        anchor_utc: "2026-06-22T03:31:06Z",
+        focus_lat: 37.955,
+        focus_lon: -87.433,
+        map_scale: 5375.0,
+        pad_scans: 2,
+        max_frames: 20,
+        layout: DataPackLayout::DualPolTornadoReview,
+    },
     BuiltInDataPack {
         id: "moore-2013-ktlx",
         title: "Moore EF5",
@@ -174,6 +222,19 @@ pub(crate) const BUILT_IN_DATA_PACKS: &[BuiltInDataPack] = &[
     },
 ];
 
+pub(crate) const RESEARCH_FEED_DATA_PACKS: &[ResearchFeedDataPack] = &[ResearchFeedDataPack {
+    id: "kcri-latest-20",
+    title: "KCRI Latest 20",
+    summary: "Newest 20 decodable KCRI research-radar frames from the IEM GR2A feed.",
+    feed_id: "KCRI",
+    poll_url: "https://mesonet-nexrad.agron.iastate.edu/level2/raw/KCRI",
+    frame_count: 20,
+    focus_lat: 35.238,
+    focus_lon: -97.460,
+    map_scale: 920.0,
+    layout: DataPackLayout::DualPolTornadoReview,
+}];
+
 fn parse_pack_time(value: &str) -> Result<DateTime<Utc>, String> {
     DateTime::parse_from_rfc3339(value)
         .map(|time| time.with_timezone(&Utc))
@@ -186,7 +247,7 @@ mod tests {
 
     #[test]
     fn built_in_data_packs_parse_to_valid_windows() {
-        assert_eq!(BUILT_IN_DATA_PACKS.len(), 5);
+        assert_eq!(BUILT_IN_DATA_PACKS.len(), 6);
 
         for pack in BUILT_IN_DATA_PACKS {
             let request = pack
@@ -235,5 +296,17 @@ mod tests {
         assert_eq!(scene.id, pack.id);
         assert_eq!(scene.options.extra_start_scans, 6);
         assert_eq!(scene.options.extra_end_scans, 3);
+        assert_eq!(scene.resume_poll_url, None);
+    }
+
+    #[test]
+    fn research_feed_pack_resumes_its_poll_url() {
+        let pack = RESEARCH_FEED_DATA_PACKS[0];
+        let scene = pack.scene();
+
+        assert_eq!(scene.site_id, "KCRI");
+        assert_eq!(scene.resume_poll_url, Some(pack.poll_url));
+        assert!(!scene.autoplay);
+        assert_eq!(pack.frame_count, 20);
     }
 }

@@ -14,6 +14,7 @@
 //! identity and bytes in lockstep. Probed live 2026-06-12: 13 areas, dated
 //! URLs serve HDF5 (`\x89HDF`) anonymously.
 
+use chrono::{Datelike, NaiveDate};
 use serde::Deserialize;
 
 use super::{FramePlan, IntlProvider, IntlSite, PlanPart, SiteCache};
@@ -68,6 +69,19 @@ impl Default for SmhiProvider {
     }
 }
 
+pub fn smhi_archive_plans_for_day(area: &str, date: NaiveDate) -> Result<Vec<FramePlan>, String> {
+    validate_area_key(area)?;
+    let url = format!(
+        "{API_BASE}/area/{area}/product/qcvol/{:04}/{:02}/{:02}",
+        date.year(),
+        date.month(),
+        date.day()
+    );
+    let json = crate::fetch_text(&url)
+        .map_err(|err| format!("SMHI qcvol day {date} for '{area}' ({url}): {err}"))?;
+    plans_from_qcvol_day_catalog(area, &json)
+}
+
 impl IntlProvider for SmhiProvider {
     fn id(&self) -> &'static str {
         "smhi"
@@ -102,7 +116,7 @@ impl IntlProvider for SmhiProvider {
         let url = format!("{API_BASE}/area/{site_id}/product/qcvol");
         let json = crate::fetch_text(&url)
             .map_err(|err| format!("SMHI qcvol catalog for '{site_id}' ({url}): {err}"))?;
-        plans_from_qcvol_catalog(site_id, &json, count.max(1))
+        recent_plans_from_qcvol_tree(site_id, &json, count.max(1))
     }
 
     fn static_sites(&self) -> Vec<IntlSite> {
@@ -187,37 +201,136 @@ fn plans_from_qcvol_catalog(
 ) -> Result<Vec<FramePlan>, String> {
     let product: QcvolCatalog = serde_json::from_str(json)
         .map_err(|err| format!("SMHI qcvol catalog JSON parse failed for '{area}': {err}"))?;
-    let mut entries: Vec<_> = product.last_files.iter().collect();
-    entries.sort_by(|left, right| left.key.cmp(&right.key));
+    if product.last_files.is_empty() {
+        return Err(format!(
+            "SMHI qcvol catalog for '{area}' has no lastFiles entry"
+        ));
+    }
+    plans_from_file_entries(area, product.last_files, count)
+}
+
+/// Walk SMHI's dated year/month/day catalog for recent-loop loads. The root
+/// product endpoint can publish the newest `lastFiles` entry before today's
+/// day listing has caught up, so seed with `lastFiles` and use the tree only
+/// to backfill older frames.
+fn recent_plans_from_qcvol_tree(
+    area: &str,
+    root_json: &str,
+    count: usize,
+) -> Result<Vec<FramePlan>, String> {
+    let product: QcvolCatalog = serde_json::from_str(root_json)
+        .map_err(|err| format!("SMHI qcvol catalog JSON parse failed for '{area}': {err}"))?;
+    let mut entries = product.last_files;
+    if entries.len() < count {
+        let mut years = product.years;
+        years.sort_by(|left, right| right.key.cmp(&left.key));
+        for year in years {
+            let year_json = crate::fetch_text(&year.link)
+                .map_err(|err| format!("SMHI qcvol year {} for '{area}': {err}", year.key))?;
+            let mut months: Vec<LinkEntry> = serde_json::from_str::<YearCatalog>(&year_json)
+                .map_err(|err| {
+                    format!(
+                        "SMHI qcvol year {} JSON parse failed for '{area}': {err}",
+                        year.key
+                    )
+                })?
+                .months;
+            months.sort_by(|left, right| right.key.cmp(&left.key));
+            for month in months {
+                let month_json = crate::fetch_text(&month.link).map_err(|err| {
+                    format!(
+                        "SMHI qcvol month {}-{} for '{area}': {err}",
+                        year.key, month.key
+                    )
+                })?;
+                let mut days: Vec<LinkEntry> = serde_json::from_str::<MonthCatalog>(&month_json)
+                    .map_err(|err| {
+                        format!(
+                            "SMHI qcvol month {}-{} JSON parse failed for '{area}': {err}",
+                            year.key, month.key
+                        )
+                    })?
+                    .days;
+                days.sort_by(|left, right| right.key.cmp(&left.key));
+                for day in days {
+                    let day_json = crate::fetch_text(&day.link).map_err(|err| {
+                        format!(
+                            "SMHI qcvol day {}-{}-{} for '{area}': {err}",
+                            year.key, month.key, day.key
+                        )
+                    })?;
+                    let day_catalog: DayCatalog =
+                        serde_json::from_str(&day_json).map_err(|err| {
+                            format!(
+                                "SMHI qcvol day {}-{}-{} JSON parse failed for '{area}': {err}",
+                                year.key, month.key, day.key
+                            )
+                        })?;
+                    entries.extend(day_catalog.files);
+                    if newest_unique_entries(&entries).len() >= count {
+                        return plans_from_file_entries(area, entries, count);
+                    }
+                }
+            }
+        }
+    }
+    plans_from_file_entries(area, entries, count)
+}
+
+fn plans_from_file_entries(
+    area: &str,
+    entries: Vec<FileEntry>,
+    count: usize,
+) -> Result<Vec<FramePlan>, String> {
+    let entries = newest_unique_entries(&entries);
+    if entries.is_empty() {
+        return Err(format!(
+            "SMHI qcvol catalog for '{area}' has no file entries"
+        ));
+    }
     let skip = entries.len().saturating_sub(count);
     entries[skip..]
         .iter()
-        .map(|newest| {
-            // Prefer the dated URL derived from the key so the downloaded
-            // bytes always match the identity; fall back to the API's h5
-            // link (the identity-less `latest.h5`) if the key shape ever
-            // changes.
-            let url = match dated_url_from_key(area, &newest.key) {
-                Some(url) => url,
-                None => newest
-                    .formats
-                    .iter()
-                    .find(|format| format.key == "h5")
-                    .map(|format| format.link.clone())
-                    .ok_or_else(|| {
-                        format!(
-                            "SMHI qcvol entry '{}' for '{area}' has no h5 format link",
-                            newest.key
-                        )
-                    })?,
-            };
-            Ok(FramePlan {
-                identity: newest.key.clone(),
-                parts: vec![PlanPart { url }],
-                merge: false,
-            })
-        })
+        .map(|entry| frame_plan_from_file_entry(area, entry))
         .collect()
+}
+
+fn plans_from_qcvol_day_catalog(area: &str, json: &str) -> Result<Vec<FramePlan>, String> {
+    let day: DayCatalog = serde_json::from_str(json)
+        .map_err(|err| format!("SMHI qcvol day JSON parse failed for '{area}': {err}"))?;
+    plans_from_file_entries(area, day.files, usize::MAX)
+}
+
+fn newest_unique_entries(entries: &[FileEntry]) -> Vec<FileEntry> {
+    let mut entries = entries.to_vec();
+    entries.sort_by(|left, right| left.key.cmp(&right.key));
+    entries.dedup_by(|left, right| left.key == right.key);
+    entries
+}
+
+fn frame_plan_from_file_entry(area: &str, entry: &FileEntry) -> Result<FramePlan, String> {
+    // Prefer the dated URL derived from the key so the downloaded bytes
+    // always match the identity; fall back to the API's h5 link (the
+    // identity-less `latest.h5`) if the key shape ever changes.
+    let url = match dated_url_from_key(area, &entry.key) {
+        Some(url) => url,
+        None => entry
+            .formats
+            .iter()
+            .find(|format| format.key == "h5")
+            .map(|format| format.link.clone())
+            .ok_or_else(|| {
+                format!(
+                    "SMHI qcvol entry '{}' for '{area}' has no h5 format link",
+                    entry.key
+                )
+            })?,
+    };
+    Ok(FramePlan {
+        identity: entry.key.clone(),
+        parts: vec![PlanPart { url }],
+        merge: false,
+    })
 }
 
 /// `radar_{area}_qcvol_{yyyymmddhhmm}` -> the dated download URL.
@@ -249,16 +362,42 @@ struct AreaEntry {
 struct QcvolCatalog {
     #[serde(rename = "lastFiles", default)]
     last_files: Vec<FileEntry>,
+    #[serde(default)]
+    years: Vec<LinkEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LinkEntry {
+    key: String,
+    link: String,
 }
 
 #[derive(Debug, Deserialize)]
+struct YearCatalog {
+    #[serde(default)]
+    months: Vec<LinkEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MonthCatalog {
+    #[serde(default)]
+    days: Vec<LinkEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DayCatalog {
+    #[serde(default)]
+    files: Vec<FileEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct FileEntry {
     key: String,
     #[serde(default)]
     formats: Vec<FormatEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct FormatEntry {
     key: String,
     link: String,
@@ -317,6 +456,86 @@ mod tests {
 
         let err = plan_from_qcvol_catalog("angelholm", "not json").unwrap_err();
         assert!(err.contains("parse failed"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn qcvol_day_catalog_entries_become_oldest_first_recent_plans() {
+        let day: DayCatalog = serde_json::from_str(
+            r#"{
+                "files": [
+                    {
+                        "key": "radar_angelholm_qcvol_202606220000",
+                        "formats": [
+                            {
+                                "key": "h5",
+                                "link": "https://example.test/older.h5"
+                            }
+                        ]
+                    },
+                    {
+                        "key": "radar_angelholm_qcvol_202606220005",
+                        "formats": [
+                            {
+                                "key": "h5",
+                                "link": "https://example.test/newer.h5"
+                            }
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .expect("day parse");
+
+        let plans = plans_from_file_entries("angelholm", day.files, 2).expect("plans");
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| plan.identity.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "radar_angelholm_qcvol_202606220000",
+                "radar_angelholm_qcvol_202606220005"
+            ]
+        );
+        assert_eq!(
+            plans[1].parts[0].url,
+            "https://opendata-download-radar.smhi.se/api/version/latest/area/angelholm\
+             /product/qcvol/2026/06/22/radar_angelholm_qcvol_202606220005.h5"
+        );
+    }
+
+    #[test]
+    fn qcvol_recent_entries_dedupe_and_keep_newest_count() {
+        let entries = vec![
+            FileEntry {
+                key: "radar_angelholm_qcvol_202606220000".to_owned(),
+                formats: vec![],
+            },
+            FileEntry {
+                key: "radar_angelholm_qcvol_202606220005".to_owned(),
+                formats: vec![],
+            },
+            FileEntry {
+                key: "radar_angelholm_qcvol_202606220005".to_owned(),
+                formats: vec![],
+            },
+            FileEntry {
+                key: "radar_angelholm_qcvol_202606220010".to_owned(),
+                formats: vec![],
+            },
+        ];
+
+        let plans = plans_from_file_entries("angelholm", entries, 2).expect("plans");
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| plan.identity.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "radar_angelholm_qcvol_202606220005",
+                "radar_angelholm_qcvol_202606220010"
+            ]
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod cascade;
 mod cells;
 mod detect;
 mod gate_filter;
+mod hybrid;
 mod interpolate;
 mod rhi;
 mod shear;
@@ -26,6 +27,7 @@ pub use detect::{
     RotationSite, RotationStrength, detect_rotation_sites, rotation_features_per_tilt,
 };
 pub use gate_filter::apply_reflectivity_gate_filter;
+pub use hybrid::dealias_velocity_grid_hybrid;
 use image::{ImageBuffer, ImageError, Rgba};
 pub use interpolate::{
     INTERP_MAX_FACTOR, INTERP_MAX_GRID_BYTES, INTERP_TARGET_AZIMUTH_DEG,
@@ -3055,8 +3057,43 @@ impl RangeBandReference {
     }
 }
 
+/// A local velocity reference already mapped onto the target cut's polar
+/// lattice.  `NaN` means no trustworthy reference for that gate.  The hybrid
+/// engine builds this once, then the region solver performs O(1) lookups while
+/// deciding whole-region Nyquist branches.
+pub(crate) struct DenseVelocityReference {
+    rows: usize,
+    gates: usize,
+    values: Vec<f32>,
+}
+
+impl DenseVelocityReference {
+    pub(crate) fn new(rows: usize, gates: usize, values: Vec<f32>) -> Option<Self> {
+        let total = rows.checked_mul(gates)?;
+        if total == 0 || values.len() != total || !values.iter().any(|value| value.is_finite()) {
+            return None;
+        }
+        Some(Self {
+            rows,
+            gates,
+            values,
+        })
+    }
+
+    #[inline]
+    fn eval(&self, row: usize, gate: usize) -> Option<f32> {
+        if row >= self.rows || gate >= self.gates {
+            return None;
+        }
+        self.values
+            .get(row * self.gates + gate)
+            .copied()
+            .filter(|value| value.is_finite())
+    }
+}
+
 pub fn dealias_velocity_grid(cut: &ElevationCut, source: &MomentGrid) -> MomentGrid {
-    dealias_velocity_grid_with_reference(cut, source, None)
+    dealias_velocity_grid_with_references(cut, source, None, None)
 }
 
 /// `dealias_velocity_grid` with an optional external wind reference: the
@@ -3067,6 +3104,18 @@ pub fn dealias_velocity_grid_with_reference(
     cut: &ElevationCut,
     source: &MomentGrid,
     reference: Option<&RangeBandReference>,
+) -> MomentGrid {
+    dealias_velocity_grid_with_references(cut, source, reference, None)
+}
+
+/// Internal superset used by the hybrid engine: the broad harmonic reference
+/// is applied first, then the dense spatial/temporal field may make only
+/// decisive whole-region branch corrections.
+pub(crate) fn dealias_velocity_grid_with_references(
+    cut: &ElevationCut,
+    source: &MomentGrid,
+    reference: Option<&RangeBandReference>,
+    dense_reference: Option<&DenseVelocityReference>,
 ) -> MomentGrid {
     let rows = source.radial_count();
     let gate_count = source.gate_range.gate_count;
@@ -3093,7 +3142,15 @@ pub fn dealias_velocity_grid_with_reference(
     }
 
     let azimuths = radial_azimuths(cut, source);
-    let folds = region_based_dealias_folds(&observed, &nyq, rows, gate_count, &azimuths, reference);
+    let folds = region_based_dealias_folds(
+        &observed,
+        &nyq,
+        rows,
+        gate_count,
+        &azimuths,
+        reference,
+        dense_reference,
+    );
 
     let mut corrected = vec![DEALIASED_VELOCITY_NODATA; total];
     #[allow(clippy::needless_range_loop)]
@@ -3139,6 +3196,19 @@ const REGION_MAX_FOLD: i32 = 5;
 /// pair is a valid estimate, and because edges resolve strongest-first a lone
 /// spurious contact only ever resolves last (as a no-op cycle).
 const REGION_EDGE_MIN_SUPPORT: u32 = 1;
+/// Dense spatial/temporal references are intentionally conservative: a whole
+/// connected group moves only when the alternate Nyquist branch wins by a
+/// large, well-separated margin.
+const DENSE_REFERENCE_MIN_GROUP_SAMPLES: u64 = 32;
+const DENSE_REFERENCE_MIN_REGION_SAMPLES: u32 = 16;
+const DENSE_REFERENCE_MIN_GROUP_COVERAGE: f64 = 0.15;
+const DENSE_REFERENCE_MIN_REGION_COVERAGE: f64 = 0.20;
+const DENSE_REFERENCE_GROUP_IMPROVEMENT_MPS: f64 = 5.0;
+const DENSE_REFERENCE_REGION_IMPROVEMENT_MPS: f64 = 6.0;
+const DENSE_REFERENCE_GROUP_RATIO: f64 = 0.75;
+const DENSE_REFERENCE_REGION_RATIO: f64 = 0.68;
+const DENSE_REFERENCE_MIN_SEPARATION_MPS: f64 = 2.0;
+const DENSE_REFERENCE_LOSS_CAP_MPS: f64 = 40.0;
 
 /// Plain union-find for connected-component region labelling.
 struct UnionFind {
@@ -3273,6 +3343,7 @@ fn region_based_dealias_folds(
     gates: usize,
     azimuths: &[f32],
     reference: Option<&RangeBandReference>,
+    dense_reference: Option<&DenseVelocityReference>,
 ) -> Vec<i32> {
     let total = rows.saturating_mul(gates);
     let mut folds = vec![0i32; total];
@@ -3474,8 +3545,7 @@ fn region_based_dealias_folds(
         // Group branch: cost per (root, g) for g ∈ −2..=+2.
         let mut group_cost: std::collections::HashMap<u32, ([f64; 5], u64, u64)> =
             std::collections::HashMap::new();
-        for row in 0..rows {
-            let n = nyq[row];
+        for (row, n) in nyq.iter().copied().enumerate().take(rows) {
             if !n.is_finite() || n <= 0.0 {
                 continue;
             }
@@ -3522,8 +3592,7 @@ fn region_based_dealias_folds(
         // group selection (a subgraph can be internally consistent yet wrong).
         let mut cost = vec![[0.0f64; 3]; region_count];
         let mut covered = vec![0u32; region_count];
-        for row in 0..rows {
-            let n = nyq[row];
+        for (row, n) in nyq.iter().copied().enumerate().take(rows) {
             if !n.is_finite() || n <= 0.0 {
                 continue;
             }
@@ -3559,6 +3628,150 @@ fn region_based_dealias_folds(
             if best_slot != 1 && *best_cost < 0.6 * current {
                 let dg = best_slot as i32 - 1;
                 region_fold[rid] = (region_fold[rid] + dg).clamp(-REGION_MAX_FOLD, REGION_MAX_FOLD);
+            }
+        }
+    }
+
+    // ---- 5c. dense spatial/temporal branch refinement ----
+    // Unlike the broad wind fit above, this reference is local to each target
+    // gate.  It can therefore preserve a compact mesocyclone while still
+    // resolving the absolute Nyquist branch.  Changes are deliberately
+    // conservative: first shift an entire connected vote-graph group, then
+    // permit a single-region repair only when it wins decisively.
+    if let Some(reference) = dense_reference {
+        // Resolve the vote-graph roots once per REGION, then use compact
+        // integer group ids in the per-gate pass.  Avoiding a HashMap lookup
+        // for every gate is important on 1M+ gate super-resolution sweeps.
+        let mut root_to_group: std::collections::HashMap<u32, usize> =
+            std::collections::HashMap::new();
+        let mut region_group = vec![0usize; region_count];
+        let mut group_total: Vec<u64> = Vec::new();
+        for rid in 0..region_count as u32 {
+            let (root, _) = dsu.find(rid);
+            let group = *root_to_group.entry(root).or_insert_with(|| {
+                let group = group_total.len();
+                group_total.push(0);
+                group
+            });
+            region_group[rid as usize] = group;
+            group_total[group] += region_size[rid as usize] as u64;
+        }
+
+        let mut group_cost = vec![[0.0f64; 5]; group_total.len()];
+        let mut group_covered = vec![0u64; group_total.len()];
+        for (row, n) in nyq.iter().copied().enumerate().take(rows) {
+            if !n.is_finite() || n <= 0.0 {
+                continue;
+            }
+            for gate in 0..gates {
+                let idx = row * gates + gate;
+                let rid = region_of[idx];
+                if rid == u32::MAX {
+                    continue;
+                }
+                let Some(predicted) = reference.eval(row, gate) else {
+                    continue;
+                };
+                let rid = rid as usize;
+                let group = region_group[rid];
+                group_covered[group] += 1;
+                let current_fold = region_fold[rid];
+                for (slot, delta) in (-2i32..=2).enumerate() {
+                    let unfolded = observed[idx] + (current_fold + delta) as f32 * 2.0 * n;
+                    group_cost[group][slot] +=
+                        ((unfolded - predicted).abs() as f64).min(DENSE_REFERENCE_LOSS_CAP_MPS);
+                }
+            }
+        }
+
+        let mut group_adjustment = vec![0i32; group_total.len()];
+        for group in 0..group_total.len() {
+            let covered = group_covered[group];
+            let total_gates = group_total[group];
+            if covered < DENSE_REFERENCE_MIN_GROUP_SAMPLES
+                || total_gates == 0
+                || (covered as f64) < DENSE_REFERENCE_MIN_GROUP_COVERAGE * total_gates as f64
+            {
+                continue;
+            }
+            let costs = &group_cost[group];
+            let mut order = [0usize, 1, 2, 3, 4];
+            order.sort_by(|left, right| costs[*left].total_cmp(&costs[*right]));
+            let best_slot = order[0];
+            if best_slot == 2 {
+                continue;
+            }
+            let samples = covered as f64;
+            let best_average = costs[best_slot] / samples;
+            let current_average = costs[2] / samples;
+            let second_average = costs[order[1]] / samples;
+            if current_average - best_average >= DENSE_REFERENCE_GROUP_IMPROVEMENT_MPS
+                && best_average <= DENSE_REFERENCE_GROUP_RATIO * current_average
+                && second_average - best_average >= DENSE_REFERENCE_MIN_SEPARATION_MPS
+            {
+                group_adjustment[group] = best_slot as i32 - 2;
+            }
+        }
+        if group_adjustment.iter().any(|delta| *delta != 0) {
+            for rid in 0..region_count {
+                let delta = group_adjustment[region_group[rid]];
+                if delta != 0 {
+                    region_fold[rid] =
+                        (region_fold[rid] + delta).clamp(-REGION_MAX_FOLD, REGION_MAX_FOLD);
+                }
+            }
+        }
+
+        let mut region_cost = vec![[0.0f64; 3]; region_count];
+        let mut region_covered = vec![0u32; region_count];
+        for (row, n) in nyq.iter().copied().enumerate().take(rows) {
+            if !n.is_finite() || n <= 0.0 {
+                continue;
+            }
+            for gate in 0..gates {
+                let idx = row * gates + gate;
+                let rid = region_of[idx];
+                if rid == u32::MAX {
+                    continue;
+                }
+                let Some(predicted) = reference.eval(row, gate) else {
+                    continue;
+                };
+                let rid = rid as usize;
+                region_covered[rid] += 1;
+                let current_fold = region_fold[rid];
+                for (slot, delta) in (-1i32..=1).enumerate() {
+                    let unfolded = observed[idx] + (current_fold + delta) as f32 * 2.0 * n;
+                    region_cost[rid][slot] +=
+                        ((unfolded - predicted).abs() as f64).min(DENSE_REFERENCE_LOSS_CAP_MPS);
+                }
+            }
+        }
+        for rid in 0..region_count {
+            let covered = region_covered[rid];
+            if covered < DENSE_REFERENCE_MIN_REGION_SAMPLES
+                || (covered as f64) < DENSE_REFERENCE_MIN_REGION_COVERAGE * region_size[rid] as f64
+            {
+                continue;
+            }
+            let costs = &region_cost[rid];
+            let mut order = [0usize, 1, 2];
+            order.sort_by(|left, right| costs[*left].total_cmp(&costs[*right]));
+            let best_slot = order[0];
+            if best_slot == 1 {
+                continue;
+            }
+            let samples = covered as f64;
+            let best_average = costs[best_slot] / samples;
+            let current_average = costs[1] / samples;
+            let second_average = costs[order[1]] / samples;
+            if current_average - best_average >= DENSE_REFERENCE_REGION_IMPROVEMENT_MPS
+                && best_average <= DENSE_REFERENCE_REGION_RATIO * current_average
+                && second_average - best_average >= DENSE_REFERENCE_MIN_SEPARATION_MPS
+            {
+                let delta = best_slot as i32 - 1;
+                region_fold[rid] =
+                    (region_fold[rid] + delta).clamp(-REGION_MAX_FOLD, REGION_MAX_FOLD);
             }
         }
     }

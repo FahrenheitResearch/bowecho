@@ -22,7 +22,7 @@ use render2d::{
     StormRelativePaletteCache, StormTrack, StormTracker, TIME_GATE_S, ViewportMomentCache,
     ViewportRasterOptions, ViewportSampleCache, VolumeDealiasCache, apply_reflectivity_gate_filter,
     azimuthal_shear_grid, color_family_for_moment, composite_reflectivity_grid,
-    dealias_velocity_grid, dealias_velocity_grid_cascade, detect_rotation_sites, echo_top_grid,
+    dealias_velocity_grid, dealias_velocity_grid_hybrid, detect_rotation_sites, echo_top_grid,
     gust_proxy_grid, hail_grids, identify_storm_cells, marc_grid, mehs_grid,
     moment_cross_section_with_smoothing, poh_grid, radial_divergence_grid,
     reflectivity_cross_section_with_smoothing, smooth_moment_grid, storm_relative_velocity_mps,
@@ -129,6 +129,13 @@ const TIMELINE_REPORT_LEAD_SECONDS: i64 = 90;
 const PRIMARY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 1;
 const OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 5;
 const MAX_RADAR_OVERLAY_LAYERS: usize = 10;
+const STORM_VIDEO_SYNC_TOTAL_RADARS: usize = 5;
+const STORM_VIDEO_SYNC_OVERLAY_RADARS: usize = STORM_VIDEO_SYNC_TOTAL_RADARS - 1;
+/// A coordinated overlay holds the newest observation at-or-before the master
+/// timeline time, but not indefinitely. This comfortably spans normal WSR-88D
+/// volume gaps while preventing a failed/one-frame radar from becoming a
+/// permanent ghost over the rest of the loop.
+const COORDINATED_RADAR_MAX_STALENESS_SECONDS: i64 = 12 * 60;
 const DEFAULT_RADAR_OVERLAY_ALPHA: u8 = 210;
 const ALERT_SOUND_FAMILY_OPTIONS: &[(&str, &str)] = &[
     ("tornado", "Tornado"),
@@ -340,14 +347,23 @@ impl RadarLabelStyle {
 enum LowSweepLoopFilter {
     #[default]
     All,
+    /// Keep one coherent elevation family per volume. The family with the
+    /// most repeated cuts wins (ties prefer the lower family), so SAILS/
+    /// MESO-SAILS revisits remain while 0.9/1.3-degree companion cuts do not
+    /// make the loop jump vertically. Actual reported angles may drift from
+    /// one volume to the next; clustering handles that without exact equality.
+    SameLevel,
+    /// Keep the lowest coherent elevation family, even when another family
+    /// contains more revisits.
     BaseOnly,
 }
 
 impl LowSweepLoopFilter {
-    const ALL: [Self; 2] = [Self::All, Self::BaseOnly];
+    const ALL: [Self; 3] = [Self::All, Self::SameLevel, Self::BaseOnly];
 
     fn from_key(key: &str) -> Self {
         match key {
+            "same" => Self::SameLevel,
             "base" => Self::BaseOnly,
             _ => Self::All,
         }
@@ -356,6 +372,7 @@ impl LowSweepLoopFilter {
     fn key(self) -> &'static str {
         match self {
             Self::All => "all",
+            Self::SameLevel => "same",
             Self::BaseOnly => "base",
         }
     }
@@ -363,6 +380,7 @@ impl LowSweepLoopFilter {
     fn label(self) -> &'static str {
         match self {
             Self::All => "all low",
+            Self::SameLevel => "same level",
             Self::BaseOnly => "base only",
         }
     }
@@ -1226,9 +1244,10 @@ struct ViewerApp {
     tor_tracks: tor_tracks::TorTracksState,
     /// Reflectivity gate filter threshold (dBZ); None = off.
     gate_filter_dbz: Option<f32>,
-    /// Velocity dealias engine: false = region (default, proven), true =
-    /// tilt-cascade (vertical-reference branch selection; helps on VCPs whose
-    /// upper tilts are unaliased — see docs/dealias-fold-branch-analysis.md).
+    /// Velocity dealias engine: false = same-cut region solver; true = hybrid
+    /// 3-D + temporal branch selection using the previous matching tilt and
+    /// neighboring current-volume velocity tilts, with the cascade wind fit as
+    /// a conservative fallback.
     dealias_cascade: bool,
     /// Display smoothing mode (worker-side, cached): Native (default —
     /// super-res gates are the app's identity), Soften (GR2-style polar
@@ -1409,6 +1428,15 @@ struct ViewerApp {
     intl_picker_provider: String,
     intl_sites: Option<Vec<data_source::international::IntlSite>>,
     intl_sites_rx: Option<mpsc::Receiver<IntlSiteListResult>>,
+    /// Radar Coverage Explorer: metadata-only capability probe state for
+    /// international sources.
+    coverage_provider_id: String,
+    coverage_site_id: String,
+    coverage_frame_count: usize,
+    coverage_date_input: String,
+    coverage_hour_input: String,
+    coverage_probe_rx: Option<mpsc::Receiver<IntlCoverageProbeResult>>,
+    coverage_probe_result: Option<IntlCoverageProbeResult>,
     /// ORD archive helper inputs: direct CloudFerro openradar-archive fetches
     /// for historical European ODIM split files.
     ord_archive_site_input: String,
@@ -1426,6 +1454,7 @@ struct ViewerApp {
     /// SPC outlooks + live storm reports.
     spc_data: spc_layers::SpcData,
     spc_outlooks_enabled: Vec<String>,
+    estofex_issue_id: Option<String>,
     /// Last non-empty outlook-kind set — the rail row's vis toggle restores
     /// it when re-enabled (off = clear all kinds, on = bring them back).
     spc_kinds_memory: Vec<String>,
@@ -1624,6 +1653,22 @@ enum IntlLoopFrameMessage {
 }
 type OrdArchiveListResult =
     std::result::Result<Vec<data_source::international::OrdArchivePlan>, String>;
+type IntlCoverageProbeResult = std::result::Result<IntlCoverageProbe, String>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IntlCoverageProbe {
+    provider_id: String,
+    provider_label: String,
+    site_id: String,
+    requested: usize,
+    frame_count: usize,
+    first_identity: Option<String>,
+    latest_identity: Option<String>,
+    first_part_count: usize,
+    latest_part_count: usize,
+    checked_at_utc: DateTime<Utc>,
+    elapsed_ms: u128,
+}
 
 /// An overlay layer's international source: refreshed from the provider
 /// registry's catalog probe + identity dedupe instead of the US Level-II
@@ -1664,6 +1709,14 @@ struct RadarOverlayLayer {
     volume: Option<Arc<RadarVolume>>,
     frame_history: Vec<FrameHistoryEntry>,
     selected_frame_index: usize,
+    /// True only for overlays loaded by the Unified Player's coordinated
+    /// archive-loop actions. Ordinary live/manual overlays keep their own
+    /// newest frame and are not forced onto an archive cursor.
+    timeline_sync: bool,
+    /// Cut chosen for the coordinated timeline observation. This is separate
+    /// from the primary radar's cut index: different radars/VCPs can put the
+    /// same physical elevation at completely different indices.
+    selected_cut: Option<usize>,
     load_timing: Option<LoadTimings>,
     texture: Option<egui::TextureHandle>,
     texture_key: Option<TextureKey>,
@@ -1694,6 +1747,8 @@ impl RadarOverlayLayer {
             volume: None,
             frame_history: Vec::new(),
             selected_frame_index: 0,
+            timeline_sync: false,
+            selected_cut: None,
             load_timing: None,
             texture: None,
             texture_key: None,
@@ -2023,6 +2078,34 @@ fn frame_history_signature(frames: &[FrameHistoryEntry]) -> u64 {
         (Arc::as_ptr(&frame.volume) as usize).hash(&mut hasher);
     }
     hasher.finish()
+}
+
+/// Previous same-site volume used by the hybrid 3-D + temporal velocity
+/// dealiaser.  The reference is strictly older than the target scan; duplicate
+/// live-partial/full objects for the same volume are not treated as a temporal
+/// observation.
+fn previous_dealias_reference_volume(
+    frames: &[FrameHistoryEntry],
+    selected_index: usize,
+    current: &Arc<RadarVolume>,
+) -> Option<Arc<RadarVolume>> {
+    let current_ptr = Arc::as_ptr(current) as usize;
+    let current_position = frames
+        .iter()
+        .position(|frame| Arc::as_ptr(&frame.volume) as usize == current_ptr)
+        .unwrap_or_else(|| selected_index.min(frames.len()));
+    frames
+        .get(..current_position)?
+        .iter()
+        .rev()
+        .find(|frame| {
+            !matches!(
+                frame.status,
+                FrameStatus::Preview | FrameStatus::LivePartial
+            ) && frame.volume.site.id.eq_ignore_ascii_case(&current.site.id)
+                && frame.volume.volume_time < current.volume_time
+        })
+        .map(|frame| Arc::clone(&frame.volume))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -2905,7 +2988,13 @@ type OaDeriveResult = std::result::Result<(Arc<rw_ui::FieldData>, String), Strin
 type OaCompositesResult = std::result::Result<Vec<oa_derived::CompositeField>, String>;
 type UpperAirResult = std::result::Result<upper_air::UpperAirLayer, String>;
 /// URL-poll download: (file name, decoded volume) or error.
-type PolledVolumeResult = std::result::Result<(String, Arc<RadarVolume>), String>;
+struct PolledVolumeLoad {
+    name: String,
+    dedupe_key: String,
+    volume: Arc<RadarVolume>,
+}
+
+type PolledVolumeResult = std::result::Result<PolledVolumeLoad, String>;
 /// International site-catalog fetch: (provider id it answers for, sites or
 /// error) — the id lets the drain drop answers for a provider the user has
 /// since navigated away from.
@@ -3201,6 +3290,10 @@ struct RenderRequest {
     /// one for the SAME pane only, so one pane's traffic can't starve another.
     pane: usize,
     volume: Arc<RadarVolume>,
+    /// Strictly older same-site volume used by the hybrid 3-D + temporal
+    /// dealiaser. Kept as an Arc so background/prewarm workers never borrow
+    /// mutable UI history.
+    previous_volume: Option<Arc<RadarVolume>>,
     cut: usize,
     product: DisplayProduct,
     render_dealiased_velocity: bool,
@@ -3212,7 +3305,7 @@ struct RenderRequest {
     /// (cached) — binomial soften or bilinear upsample — and renders it
     /// through the unchanged fast path.
     smoothing: SmoothingMode,
-    /// Velocity dealias engine (false = region, true = tilt-cascade).
+    /// Velocity dealias engine (false = region, true = hybrid 3-D + time).
     dealias_cascade: bool,
     /// Gate filter threshold in deci-dBZ; i16::MIN = off.
     gate_filter_decidbz: i16,
@@ -3320,7 +3413,9 @@ struct RenderRecycleBuffer {
 
 struct DealiasedReadoutCache {
     volume_ptr: usize,
+    reference_volume_ptr: usize,
     cut_index: usize,
+    hybrid: bool,
     grid: Arc<MomentGrid>,
 }
 
@@ -3372,6 +3467,7 @@ struct HazardPoint {
 struct HazardListRow {
     index: usize,
     label: String,
+    family: String,
     hover: String,
     selected: bool,
     unacknowledged: bool,
@@ -3502,6 +3598,7 @@ fn percentile_index(len: usize, percentile: usize) -> usize {
 
 struct RenderWorkerMomentCache {
     volume_ptr: usize,
+    reference_volume_ptr: usize,
     cut: usize,
     moment: MomentType,
     dealiased_velocity: bool,
@@ -3681,6 +3778,7 @@ impl RenderWorkerCachePolicy {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RenderWorkerViewportSignature {
     volume_ptr: usize,
+    reference_volume_ptr: usize,
     cut: usize,
     product: DisplayProduct,
     moment: MomentType,
@@ -3698,6 +3796,7 @@ impl RenderWorkerViewportSignature {
     #[allow(clippy::too_many_arguments)]
     fn new(
         volume_ptr: usize,
+        reference_volume_ptr: usize,
         cut: usize,
         product: DisplayProduct,
         moment: MomentType,
@@ -3712,6 +3811,7 @@ impl RenderWorkerViewportSignature {
     ) -> Self {
         Self {
             volume_ptr,
+            reference_volume_ptr,
             cut,
             product,
             moment,
@@ -3896,6 +3996,7 @@ fn spawn_render_worker_with_mode(
             };
             let requested_buffer_signature = RenderWorkerViewportSignature::new(
                 Arc::as_ptr(&request.volume) as usize,
+                request.key.dealias_reference_volume_ptr,
                 request.cut,
                 request.product.clone(),
                 request.product.base_moment(),
@@ -4699,6 +4800,7 @@ struct WorkflowSnapshot {
     hazards_active_only: bool,
     live_hazard_auto_refresh: bool,
     spc_outlooks_enabled: Vec<String>,
+    estofex_issue_id: Option<String>,
     spc_reports_enabled: bool,
     mping_enabled: bool,
     obs_enabled: bool,
@@ -5012,6 +5114,13 @@ impl ViewerApp {
             intl_picker_provider: restored_intl_provider,
             intl_sites: None,
             intl_sites_rx: None,
+            coverage_provider_id: "smhi".to_owned(),
+            coverage_site_id: "angelholm".to_owned(),
+            coverage_frame_count: DEFAULT_ARCHIVE_FRAME_COUNT,
+            coverage_date_input: String::new(),
+            coverage_hour_input: String::new(),
+            coverage_probe_rx: None,
+            coverage_probe_result: None,
             ord_archive_site_input: String::new(),
             ord_archive_date_input: String::new(),
             ord_archive_hour_input: String::new(),
@@ -5035,6 +5144,7 @@ impl ViewerApp {
             spc_data: spc_layers::SpcData::default(),
             spc_kinds_memory: restored_overlays.4.clone(),
             spc_outlooks_enabled: restored_overlays.4,
+            estofex_issue_id: None,
             spc_reports_enabled: restored_overlays.5,
             spc_day: 1,
             spc_last_key: None,
@@ -5335,9 +5445,9 @@ impl ViewerApp {
         // An active poll (custom URL or international) owns the primary
         // view: a catalog-site refresh here would wipe the polled frames
         // from frame_history (history_contains_other_site) every tick and,
-        // when it installs, overwrite the polled volume. Overlay layers
-        // keep refreshing via maybe_refresh_radar_layers — they never
-        // touch primary state.
+        // when it installs, overwrite the polled volume. Live overlay layers
+        // refresh via maybe_refresh_radar_layers; coordinated archive overlays
+        // deliberately remain owned by their master timeline.
         if self.poll_active && self.poll_source_armed() {
             self.live_refresh_skip_reason = Some(match &self.poll_source {
                 PollSource::CustomUrl(_) => "custom URL poll owns the primary view".to_owned(),
@@ -5368,7 +5478,7 @@ impl ViewerApp {
             ctx.request_repaint_after(Duration::from_millis(250));
             return;
         }
-        if self.pending_render_key.is_some() {
+        if self.pending_render_key.is_some() && !self.camera_follow_active() {
             self.live_refresh_skip_reason = Some("render pending".to_owned());
             ctx.request_repaint_after(Duration::from_millis(RENDER_RESULT_POLL_MS));
             return;
@@ -5398,7 +5508,11 @@ impl ViewerApp {
 
         let mut requested_repaint = false;
         for (index, layer) in self.radar_layers.iter_mut().enumerate() {
-            if !layer.visible || layer.load_receiver.is_some() {
+            if !layer.visible || layer.load_receiver.is_some() || layer.timeline_sync {
+                // Coordinated archive overlays are owned by the master loop
+                // cursor. Refreshing them through the live/latest path turns
+                // one site into a static newest-frame ghost over the archive
+                // loop and discards its synchronized history.
                 continue;
             }
             // International layers refresh on the intl poll cadence via
@@ -5497,6 +5611,8 @@ impl ViewerApp {
         {
             let layer = &mut self.radar_layers[index];
             layer.visible = true;
+            layer.timeline_sync = false;
+            layer.selected_cut = None;
             if layer.load_receiver.is_none() {
                 Self::start_radar_layer_load(layer, LatestLoadMode::User, ctx);
             }
@@ -5575,6 +5691,8 @@ impl ViewerApp {
         }) {
             let layer = &mut self.radar_layers[index];
             layer.visible = true;
+            layer.timeline_sync = false;
+            layer.selected_cut = None;
             if layer
                 .intl_feed
                 .as_ref()
@@ -5691,6 +5809,8 @@ impl ViewerApp {
         mode: LatestLoadMode,
         ctx: &egui::Context,
     ) {
+        layer.timeline_sync = false;
+        layer.selected_cut = None;
         let site_id = layer.site.level2_id.clone();
         let (sender, receiver) = mpsc::channel();
         layer.load_receiver = Some(receiver);
@@ -5724,6 +5844,24 @@ impl ViewerApp {
         max_frames: usize,
         ctx: &egui::Context,
     ) {
+        // Coordinated loops must never keep painting an unrelated previous or
+        // final frame while their archive window is loading. Clear the old
+        // display and rebuild the history from the requested window; cached
+        // files are still read from NVMe, they are simply not skipped as
+        // "already present" in an in-memory history we just replaced.
+        layer.timeline_sync = true;
+        layer.frame_history.clear();
+        layer.selected_frame_index = 0;
+        layer.selected_cut = None;
+        layer.source_path = None;
+        layer.volume = None;
+        layer.texture = None;
+        layer.texture_key = None;
+        layer.pending_render_key = None;
+        layer.render_ms = None;
+        layer.worker_ms = None;
+        layer.texture_ms = None;
+
         let site_id = layer.site.level2_id.clone();
         let (sender, receiver) = mpsc::channel();
         layer.load_receiver = Some(receiver);
@@ -5734,11 +5872,7 @@ impl ViewerApp {
             end_utc.format("%H:%MZ")
         );
         let site_cache = cache_dir(&site_id);
-        let known_frame_paths = layer
-            .frame_history
-            .iter()
-            .map(|frame| frame.path.clone())
-            .collect::<BTreeSet<_>>();
+        let known_frame_paths = BTreeSet::new();
         let max_frames = max_frames.clamp(1, MAX_HISTORY_FRAME_LIMIT);
         thread::spawn(move || {
             let total_start = Instant::now();
@@ -5933,9 +6067,12 @@ impl ViewerApp {
             return false;
         };
         layer.selected_frame_index = index;
+        layer.selected_cut = None;
         layer.source_path = Some(frame.path);
         layer.load_timing = frame.timings;
         layer.volume = Some(frame.volume);
+        layer.texture = None;
+        layer.texture_key = None;
         layer.pending_render_key = None;
         layer.render_ms = None;
         layer.worker_ms = None;
@@ -5943,29 +6080,131 @@ impl ViewerApp {
         true
     }
 
+    fn set_radar_layer_selected_cut(layer: &mut RadarOverlayLayer, cut: usize) -> bool {
+        if layer.selected_cut == Some(cut) {
+            return false;
+        }
+        layer.selected_cut = Some(cut);
+        layer.texture = None;
+        layer.texture_key = None;
+        layer.pending_render_key = None;
+        layer.render_ms = None;
+        layer.worker_ms = None;
+        layer.texture_ms = None;
+        true
+    }
+
+    fn clear_radar_layer_timeline_display(layer: &mut RadarOverlayLayer) -> bool {
+        let changed = layer.volume.is_some()
+            || layer.texture.is_some()
+            || layer.texture_key.is_some()
+            || layer.pending_render_key.is_some()
+            || layer.selected_cut.is_some();
+        layer.source_path = None;
+        layer.volume = None;
+        layer.selected_cut = None;
+        layer.texture = None;
+        layer.texture_key = None;
+        layer.pending_render_key = None;
+        layer.render_ms = None;
+        layer.worker_ms = None;
+        layer.texture_ms = None;
+        changed
+    }
+
     fn sync_radar_overlay_layers_to_timeline(&mut self, ctx: &egui::Context) {
         let Some(target_utc) = self.displayed_timeline_time_utc() else {
             return;
         };
+        let product = self.selected_product.clone();
+        let low_sweeps = self.app_settings.loop_low_sweeps;
+        let filter = self.low_sweep_loop_filter();
+        let disabled_cuts = &self.low_sweep_disabled_cuts;
+        let primary_elevation = self
+            .volume
+            .as_ref()
+            .and_then(|volume| volume.cuts.get(self.selected_cut))
+            .map(|cut| cut.elevation_deg)
+            .filter(|elevation| elevation.is_finite());
+
         let mut changed = false;
         for layer in &mut self.radar_layers {
-            if layer.frame_history.len() <= 1 {
+            if !layer.timeline_sync {
                 continue;
             }
-            let Some(index) = nearest_history_frame_index(&layer.frame_history, target_utc) else {
+
+            let selection = if low_sweeps {
+                low_sweep_history_cut_at_or_before_near_elevation(
+                    &layer.frame_history,
+                    &product,
+                    filter,
+                    disabled_cuts,
+                    target_utc,
+                    primary_elevation,
+                )
+                .and_then(|(frame_index, cut)| {
+                    let frame = layer.frame_history.get(frame_index)?;
+                    let observation_time = cut_start_time_utc(frame.volume.as_ref(), cut)
+                        .unwrap_or(frame.identity.scan_time_utc);
+                    coordinated_observation_is_usable(observation_time, target_utc).then_some((
+                        frame_index,
+                        cut,
+                        observation_time,
+                    ))
+                })
+            } else {
+                history_frame_index_at_or_before(
+                    &layer.frame_history,
+                    target_utc,
+                    COORDINATED_RADAR_MAX_STALENESS_SECONDS,
+                )
+                .and_then(|frame_index| {
+                    let frame = layer.frame_history.get(frame_index)?;
+                    let cut = primary_elevation
+                        .and_then(|elevation| {
+                            displayable_cut_nearest_elevation(
+                                frame.volume.as_ref(),
+                                &product,
+                                elevation,
+                            )
+                        })
+                        .or_else(|| best_cut_for_product(frame.volume.as_ref(), 0, &product))?;
+                    Some((frame_index, cut, frame.identity.scan_time_utc))
+                })
+            };
+
+            let Some((frame_index, cut, observation_time)) = selection else {
+                if Self::clear_radar_layer_timeline_display(layer) {
+                    changed = true;
+                }
+                layer.status = format!(
+                    "No {} scan at-or-before {}",
+                    layer.site.level2_id,
+                    target_utc.format("%H:%M:%SZ")
+                );
                 continue;
             };
-            if index != layer.selected_frame_index
-                && Self::select_radar_layer_history_frame(layer, index)
+
+            let selected_volume_matches = layer
+                .volume
+                .as_ref()
+                .zip(layer.frame_history.get(frame_index))
+                .is_some_and(|(selected, frame)| Arc::ptr_eq(selected, &frame.volume));
+            if (layer.selected_frame_index != frame_index || !selected_volume_matches)
+                && Self::select_radar_layer_history_frame(layer, frame_index)
             {
-                layer.status = format!(
-                    "Synced {} {}/{}",
-                    layer.site.level2_id,
-                    index + 1,
-                    layer.frame_history.len()
-                );
                 changed = true;
             }
+            if Self::set_radar_layer_selected_cut(layer, cut) {
+                changed = true;
+            }
+            layer.status = format!(
+                "Synced {} {}/{} · {}",
+                layer.site.level2_id,
+                frame_index + 1,
+                layer.frame_history.len(),
+                observation_time.format("%H:%M:%SZ")
+            );
         }
         if changed {
             ctx.request_repaint();
@@ -6654,6 +6893,7 @@ impl ViewerApp {
             self.volume.as_deref(),
             volume.as_ref(),
             same_volume,
+            !self.history_playing,
         );
         let retained_texture_matches_previous = self
             .texture_key
@@ -7234,7 +7474,14 @@ impl ViewerApp {
     /// render worker, whose newest-request coalescing then drops intermediate
     /// frames before they are ever painted.
     fn primary_screen_loop_texture_ready(&self) -> bool {
-        if self.pending_render_key.is_some() || !self.loop_record_primary_texture_ready() {
+        // Screen playback only waits when the visible texture belongs to the
+        // wrong DATA step. A camera pan/zoom can have a newer viewport render
+        // pending while the correctly selected texture is still transformed
+        // on screen; blocking on that refinement makes smooth follow freeze.
+        // Deterministic recording keeps the stricter pending-render gate.
+        if !self.loop_record_primary_texture_ready()
+            || !self.radar_overlay_screen_loop_textures_ready()
+        {
             return false;
         }
         self.extra_panes
@@ -7243,16 +7490,41 @@ impl ViewerApp {
             .enumerate()
             .all(|(slot, pane)| {
                 !self.extra_pane_participates_in_primary_timeline(pane)
-                    || (pane.pending_render_key.is_none()
-                        && self.loop_record_extra_pane_texture_ready(slot))
+                    || self.loop_record_extra_pane_texture_ready(slot)
+            })
+    }
+
+    fn radar_overlay_screen_loop_textures_ready(&self) -> bool {
+        self.radar_layers
+            .iter()
+            .filter(|layer| layer.visible)
+            .all(|layer| {
+                let Some(volume) = layer.volume.as_ref() else {
+                    return true;
+                };
+                let product = self.selected_product.clone();
+                let cut = if layer.timeline_sync {
+                    layer
+                        .selected_cut
+                        .filter(|cut| is_displayable_on_cut(volume.as_ref(), *cut, &product))
+                } else {
+                    display_cut_for_product(volume.as_ref(), self.selected_cut, &product)
+                };
+                let Some(cut) = cut else {
+                    return true;
+                };
+                layer.texture_key.as_ref().is_some_and(|key| {
+                    key.volume_ptr == Arc::as_ptr(volume) as usize
+                        && key.cut == cut
+                        && key.product == product
+                })
             })
     }
 
     fn extra_pane_screen_loop_texture_ready(&self, pane_slot: usize) -> bool {
-        self.extra_panes.get(pane_slot).is_none_or(|pane| {
-            pane.pending_render_key.is_none()
-                && self.loop_record_extra_pane_texture_ready(pane_slot)
-        })
+        self.extra_panes
+            .get(pane_slot)
+            .is_none_or(|_| self.loop_record_extra_pane_texture_ready(pane_slot))
     }
 
     fn maybe_advance_history_loop(&mut self, ctx: &egui::Context) {
@@ -7634,6 +7906,116 @@ impl ViewerApp {
                 .map(|pane| self.loop_timeline_steps_for(&pane.frame_history, &pane.product))
                 .unwrap_or_default(),
         }
+    }
+
+    fn smooth_camera_follow_playback_active(&self) -> bool {
+        if !self.camera_follow_active() || self.media.is_recording() {
+            return false;
+        }
+        self.loop_timeline_playing(self.active_loop_timeline_target())
+    }
+
+    fn next_loop_timeline_time_utc(&self, target: LoopTimelineTarget) -> Option<DateTime<Utc>> {
+        let (frames, selected_frame_index, product, current_cut) = match target {
+            LoopTimelineTarget::Primary => {
+                let (product, current_cut) = self.shared_low_sweep_driver();
+                (
+                    self.frame_history.as_slice(),
+                    self.selected_frame_index,
+                    product,
+                    current_cut,
+                )
+            }
+            LoopTimelineTarget::ExtraPane(slot) => {
+                let pane = self.extra_panes.get(slot)?;
+                (
+                    pane.frame_history.as_slice(),
+                    pane.selected_frame_index,
+                    pane.product.clone(),
+                    pane.cut.unwrap_or(self.selected_cut),
+                )
+            }
+        };
+        let current_frame = frames.get(selected_frame_index)?;
+        if self.app_settings.loop_low_sweeps {
+            let cuts = low_sweep_cuts_for_history_entry(
+                current_frame,
+                &product,
+                self.low_sweep_loop_filter(),
+                &self.low_sweep_disabled_cuts,
+            );
+            if let Some(current_rank) = cuts.iter().position(|cut| *cut == current_cut)
+                && let Some(next_cut) = cuts.get(current_rank + 1).copied()
+            {
+                return Some(
+                    cut_start_time_utc(current_frame.volume.as_ref(), next_cut)
+                        .unwrap_or(current_frame.identity.scan_time_utc),
+                );
+            }
+        }
+
+        // The timeline always contributes at least one step per history
+        // frame, so after the current frame's last accepted low sweep the next
+        // observation is simply the first accepted cut (or scan time) in the
+        // following frame. No full 1,500-step vector is rebuilt per repaint.
+        let next_frame = frames.get(selected_frame_index + 1)?;
+        if self.app_settings.loop_low_sweeps {
+            let next_cuts = low_sweep_cuts_for_history_entry(
+                next_frame,
+                &product,
+                self.low_sweep_loop_filter(),
+                &self.low_sweep_disabled_cuts,
+            );
+            if let Some(next_cut) = next_cuts.first().copied() {
+                return Some(
+                    cut_start_time_utc(next_frame.volume.as_ref(), next_cut)
+                        .unwrap_or(next_frame.identity.scan_time_utc),
+                );
+            }
+        }
+        Some(next_frame.identity.scan_time_utc)
+    }
+
+    /// Continuous timeline time for camera follow. Radar data still changes
+    /// only on real observations, but the camera advances through the interval
+    /// between the current and next observation on every repaint. This removes
+    /// the stop/jump cadence that makes track-follow loops feel mechanical.
+    fn continuous_camera_follow_time_utc(&self) -> Option<DateTime<Utc>> {
+        if !self.smooth_camera_follow_playback_active() {
+            return None;
+        }
+        let target = self.active_loop_timeline_target();
+        let current_time = self.loop_timeline_frame_time_utc(target)?;
+        // Do not animate the final frame back across the event to the first
+        // frame; the normal loop reset remains an explicit seam.
+        let Some(next_time) = self.next_loop_timeline_time_utc(target) else {
+            return Some(current_time);
+        };
+        if next_time <= current_time {
+            return Some(current_time);
+        }
+        let step_started = match target {
+            LoopTimelineTarget::Primary => self.last_history_step,
+            LoopTimelineTarget::ExtraPane(slot) => self
+                .extra_panes
+                .get(slot)
+                .and_then(|pane| pane.last_history_step),
+        };
+        let Some(step_started) = step_started else {
+            return Some(current_time);
+        };
+        let progress = (step_started.elapsed().as_secs_f64()
+            / (self.screen_loop_frame_ms().max(1) as f64 / 1000.0))
+            .clamp(0.0, 1.0);
+        let span_ms = (next_time - current_time).num_milliseconds();
+        Some(current_time + chrono::Duration::milliseconds((span_ms as f64 * progress) as i64))
+    }
+
+    fn maybe_apply_continuous_camera_follow(&mut self, ctx: &egui::Context) {
+        let Some(time_utc) = self.continuous_camera_follow_time_utc() else {
+            return;
+        };
+        let _ = self.apply_camera_follow_at_time(time_utc, ctx);
     }
 
     fn loop_timeline_steps(&self) -> Vec<LoopTimelineStep> {
@@ -8104,8 +8486,11 @@ impl ViewerApp {
                             LowSweepLoopFilter::All => {
                                 "Play every complete low-level cut in chronological order"
                             }
+                            LowSweepLoopFilter::SameLevel => {
+                                "Keep the most-repeated elevation family in each scan; actual angles may drift slightly between volumes"
+                            }
                             LowSweepLoopFilter::BaseOnly => {
-                                "Keep only the lowest elevation bucket; useful when a low loop jumps"
+                                "Keep only the lowest elevation family; useful when a low loop jumps vertically"
                             }
                         });
                 }
@@ -9479,7 +9864,19 @@ impl ViewerApp {
     ) -> Option<RenderRequest> {
         let frame = self.frame_history.get(step.frame_index)?;
         let cut = self.primary_cut_for_loop_step(step)?;
-        self.primary_render_request_for_volume(ctx, rect, Arc::clone(&frame.volume), cut)
+        let previous_volume = (self.dealias_cascade
+            && self.product_render_uses_dealiased_velocity(&self.selected_product))
+        .then(|| {
+            previous_dealias_reference_volume(&self.frame_history, step.frame_index, &frame.volume)
+        })
+        .flatten();
+        self.primary_render_request_for_volume(
+            ctx,
+            rect,
+            Arc::clone(&frame.volume),
+            previous_volume,
+            cut,
+        )
     }
 
     fn primary_render_request_for_current(
@@ -9487,7 +9884,24 @@ impl ViewerApp {
         ctx: &egui::Context,
         rect: egui::Rect,
     ) -> Option<RenderRequest> {
-        self.primary_render_request_for_volume(ctx, rect, self.volume.clone()?, self.selected_cut)
+        let volume = self.volume.clone()?;
+        let previous_volume = (self.dealias_cascade
+            && self.product_render_uses_dealiased_velocity(&self.selected_product))
+        .then(|| {
+            previous_dealias_reference_volume(
+                &self.frame_history,
+                self.selected_frame_index,
+                &volume,
+            )
+        })
+        .flatten();
+        self.primary_render_request_for_volume(
+            ctx,
+            rect,
+            volume,
+            previous_volume,
+            self.selected_cut,
+        )
     }
 
     fn primary_render_request_for_volume(
@@ -9495,6 +9909,7 @@ impl ViewerApp {
         ctx: &egui::Context,
         rect: egui::Rect,
         volume: Arc<RadarVolume>,
+        previous_volume: Option<Arc<RadarVolume>>,
         cut: usize,
     ) -> Option<RenderRequest> {
         // Volume-wide derived products (CREF/ET/VIL/MEHS/POSH/POH/MARC/...)
@@ -9512,8 +9927,17 @@ impl ViewerApp {
         let render_dealiased_velocity =
             self.product_render_uses_dealiased_velocity(&self.selected_product);
         let smoothing = self.smoothing_for_product(&self.selected_product);
+        let dealias_reference_volume_ptr = if self.dealias_cascade && render_dealiased_velocity {
+            previous_volume
+                .as_ref()
+                .map(|reference| Arc::as_ptr(reference) as usize)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let key = TextureKey {
             volume_ptr: Arc::as_ptr(&volume) as usize,
+            dealias_reference_volume_ptr,
             cut,
             product: self.selected_product.clone(),
             render_dealiased_velocity,
@@ -9529,6 +9953,7 @@ impl ViewerApp {
             key,
             pane: 0,
             volume,
+            previous_volume,
             cut,
             product: self.selected_product.clone(),
             render_dealiased_velocity,
@@ -9551,6 +9976,34 @@ impl ViewerApp {
             return;
         };
         let key = request.key.clone();
+        if self.smooth_camera_follow_playback_active() {
+            if self
+                .texture_key
+                .as_ref()
+                .is_some_and(|visible| texture_keys_match_data_and_style(visible, &key))
+            {
+                // During between-scan camera motion, georeference the already
+                // rendered native frame as a moving quad instead of rerastering
+                // the same radar data for every animation repaint. The next
+                // actual radar step still requests a fresh native render.
+                if self
+                    .pending_render_key
+                    .as_ref()
+                    .is_some_and(|pending| !texture_keys_match_data_and_style(pending, &key))
+                {
+                    self.pending_render_key = None;
+                }
+                return;
+            }
+            if self
+                .pending_render_key
+                .as_ref()
+                .is_some_and(|pending| texture_keys_match_data_and_style(pending, &key))
+            {
+                ctx.request_repaint_after(Duration::from_millis(RENDER_RESULT_POLL_MS));
+                return;
+            }
+        }
         self.ensure_loop_render_context(&key);
         if self.texture_key.as_ref() == Some(&key) {
             self.schedule_loop_render_prewarm(ctx, rect, &key);
@@ -9655,7 +10108,11 @@ impl ViewerApp {
         rect: egui::Rect,
         current_key: &TextureKey,
     ) {
-        if self.loop_prewarm_paused_for_interaction() {
+        if self.loop_prewarm_paused_for_interaction() || self.smooth_camera_follow_playback_active()
+        {
+            // A followed camera gives each future step a different viewport.
+            // Prewarming them at the current center is almost guaranteed to
+            // miss and only competes with the selected native render.
             return;
         }
         self.ensure_loop_render_context(current_key);
@@ -9782,7 +10239,9 @@ impl ViewerApp {
 
     fn request_radar_layer_renders(&mut self, ctx: &egui::Context, rect: egui::Rect) {
         self.sync_radar_overlay_layers_to_timeline(ctx);
+        let smooth_follow = self.smooth_camera_follow_playback_active();
         let mut requests = Vec::new();
+        let mut clear_pending = Vec::new();
         for (index, layer) in self.radar_layers.iter().enumerate() {
             if !layer.visible {
                 continue;
@@ -9799,8 +10258,14 @@ impl ViewerApp {
                 continue;
             };
             let product = self.selected_product.clone();
-            let Some(cut) = best_cut_for_product(volume.as_ref(), self.selected_cut, &product)
-            else {
+            let cut = if layer.timeline_sync {
+                layer
+                    .selected_cut
+                    .filter(|cut| is_displayable_on_cut(volume.as_ref(), *cut, &product))
+            } else {
+                best_cut_for_product(volume.as_ref(), self.selected_cut, &product)
+            };
+            let Some(cut) = cut else {
                 continue;
             };
             let color_tables = self.render_color_tables_for_product(&product);
@@ -9809,6 +10274,7 @@ impl ViewerApp {
             let smoothing = self.smoothing_for_product(&product);
             let key = TextureKey {
                 volume_ptr: Arc::as_ptr(&volume) as usize,
+                dealias_reference_volume_ptr: 0,
                 cut,
                 product: product.clone(),
                 render_dealiased_velocity,
@@ -9820,8 +10286,30 @@ impl ViewerApp {
                 gate_filter_decidbz: self.gate_filter_key(),
                 viewport: viewport_key,
             };
-            if layer.texture_key.as_ref() == Some(&key)
-                || layer.pending_render_key.as_ref() == Some(&key)
+            if layer.texture_key.as_ref() == Some(&key) {
+                continue;
+            }
+            if smooth_follow
+                && layer
+                    .texture_key
+                    .as_ref()
+                    .is_some_and(|visible| texture_keys_match_data_and_style(visible, &key))
+            {
+                if layer
+                    .pending_render_key
+                    .as_ref()
+                    .is_some_and(|pending| !texture_keys_match_data_and_style(pending, &key))
+                {
+                    clear_pending.push(index);
+                }
+                continue;
+            }
+            if layer.pending_render_key.as_ref() == Some(&key)
+                || (smooth_follow
+                    && layer
+                        .pending_render_key
+                        .as_ref()
+                        .is_some_and(|pending| texture_keys_match_data_and_style(pending, &key)))
             {
                 continue;
             }
@@ -9833,6 +10321,7 @@ impl ViewerApp {
                     key,
                     pane: 0,
                     volume,
+                    previous_volume: None,
                     cut,
                     product,
                     render_dealiased_velocity,
@@ -9847,6 +10336,12 @@ impl ViewerApp {
                     radar_range_km,
                 },
             ));
+        }
+
+        for index in clear_pending {
+            if let Some(layer) = self.radar_layers.get_mut(index) {
+                layer.pending_render_key = None;
+            }
         }
 
         for (index, request) in requests {
@@ -9923,6 +10418,7 @@ impl ViewerApp {
         }
 
         let volume_ptr = Arc::as_ptr(&request.volume) as usize;
+        let reference_volume_ptr = request.key.dealias_reference_volume_ptr;
         let base_moment = request.product.base_moment();
         let dealiased_velocity = request.render_dealiased_velocity;
         let derived = request.product.derived();
@@ -9939,6 +10435,7 @@ impl ViewerApp {
         if Self::touch_moment_cache(
             moment_caches,
             volume_ptr,
+            reference_volume_ptr,
             cache_cut,
             &base_moment,
             dealiased_velocity,
@@ -9975,6 +10472,7 @@ impl ViewerApp {
                 // pans stay full speed.
                 build_preprocessed_plain_cache(
                     request.volume.as_ref(),
+                    request.previous_volume.as_deref(),
                     request.cut,
                     &base_moment,
                     dealiased_velocity,
@@ -10004,6 +10502,7 @@ impl ViewerApp {
                 cache_policy,
                 RenderWorkerMomentCache {
                     volume_ptr,
+                    reference_volume_ptr,
                     cut: cache_cut,
                     moment: base_moment.clone(),
                     dealiased_velocity,
@@ -10023,6 +10522,7 @@ impl ViewerApp {
         let cache = &moment_cache.cache;
         let viewport_signature = RenderWorkerViewportSignature::new(
             volume_ptr,
+            reference_volume_ptr,
             request.cut,
             request.product.clone(),
             base_moment.clone(),
@@ -10234,6 +10734,7 @@ impl ViewerApp {
         let volume_ptr = Arc::as_ptr(&request.volume) as usize;
         let viewport_signature = RenderWorkerViewportSignature::new(
             volume_ptr,
+            request.key.dealias_reference_volume_ptr,
             request.cut,
             request.product.clone(),
             request.product.base_moment(),
@@ -10261,6 +10762,7 @@ impl ViewerApp {
         let Some(moment_index) = Self::touch_moment_cache(
             moment_caches,
             viewport_signature.volume_ptr,
+            viewport_signature.reference_volume_ptr,
             viewport_signature.cut,
             &viewport_signature.moment,
             request.render_dealiased_velocity,
@@ -10329,6 +10831,7 @@ impl ViewerApp {
         if Self::touch_moment_cache(
             moment_caches,
             volume_ptr,
+            0,
             cut,
             &MomentType::Velocity,
             velocity_render_dealiased,
@@ -10362,6 +10865,7 @@ impl ViewerApp {
                 cache_policy,
                 RenderWorkerMomentCache {
                     volume_ptr,
+                    reference_volume_ptr: 0,
                     cut,
                     moment: MomentType::Velocity,
                     dealiased_velocity: velocity_render_dealiased,
@@ -10393,6 +10897,7 @@ impl ViewerApp {
         let Some(moment_index) = Self::touch_moment_cache(
             moment_caches,
             volume_ptr,
+            0,
             cut,
             &MomentType::Velocity,
             velocity_render_dealiased,
@@ -10431,6 +10936,7 @@ impl ViewerApp {
     fn touch_moment_cache(
         moment_caches: &mut Vec<RenderWorkerMomentCache>,
         volume_ptr: usize,
+        reference_volume_ptr: usize,
         cut: usize,
         moment: &MomentType,
         dealiased_velocity: bool,
@@ -10442,6 +10948,7 @@ impl ViewerApp {
     ) -> Option<usize> {
         let index = moment_caches.iter().position(|cached| {
             cached.volume_ptr == volume_ptr
+                && cached.reference_volume_ptr == reference_volume_ptr
                 && cached.cut == cut
                 && cached.moment == *moment
                 && cached.dealiased_velocity == dealiased_velocity
@@ -10463,6 +10970,7 @@ impl ViewerApp {
     ) {
         moment_caches.retain(|cached| {
             cached.volume_ptr != cache.volume_ptr
+                || cached.reference_volume_ptr != cache.reference_volume_ptr
                 || cached.cut != cache.cut
                 || cached.moment != cache.moment
                 || cached.dealiased_velocity != cache.dealiased_velocity
@@ -11494,6 +12002,7 @@ impl ViewerApp {
             pane.volume.as_deref(),
             volume.as_ref(),
             same_volume,
+            !pane.history_playing,
         );
         let retained_texture_matches_previous = pane
             .texture_key
@@ -11635,8 +12144,36 @@ impl ViewerApp {
         let color_table_signature = color_tables.signature_for_family(product.color_family());
         let render_dealiased_velocity = self.product_render_uses_dealiased_velocity(&product);
         let smoothing = self.smoothing_for_product(&product);
+        let previous_volume = (self.dealias_cascade && render_dealiased_velocity)
+            .then(|| {
+                self.extra_panes.get(pane_slot).and_then(|pane| {
+                    if pane.owns_radar() {
+                        previous_dealias_reference_volume(
+                            &pane.frame_history,
+                            pane.selected_frame_index,
+                            &volume,
+                        )
+                    } else {
+                        previous_dealias_reference_volume(
+                            &self.frame_history,
+                            self.selected_frame_index,
+                            &volume,
+                        )
+                    }
+                })
+            })
+            .flatten();
+        let dealias_reference_volume_ptr = if self.dealias_cascade && render_dealiased_velocity {
+            previous_volume
+                .as_ref()
+                .map(|reference| Arc::as_ptr(reference) as usize)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let key = TextureKey {
             volume_ptr: Arc::as_ptr(&volume) as usize,
+            dealias_reference_volume_ptr,
             cut,
             product: product.clone(),
             render_dealiased_velocity,
@@ -11648,12 +12185,34 @@ impl ViewerApp {
             gate_filter_decidbz: self.gate_filter_key(),
             viewport: viewport_key,
         };
+        let smooth_follow = self.smooth_camera_follow_playback_active();
         {
-            let pane = &self.extra_panes[pane_slot];
+            let pane = &mut self.extra_panes[pane_slot];
             if pane.texture_key.as_ref() == Some(&key) {
                 return;
             }
-            if pane.pending_render_key.as_ref() == Some(&key) {
+            if smooth_follow
+                && pane
+                    .texture_key
+                    .as_ref()
+                    .is_some_and(|visible| texture_keys_match_data_and_style(visible, &key))
+            {
+                if pane
+                    .pending_render_key
+                    .as_ref()
+                    .is_some_and(|pending| !texture_keys_match_data_and_style(pending, &key))
+                {
+                    pane.pending_render_key = None;
+                }
+                return;
+            }
+            if pane.pending_render_key.as_ref() == Some(&key)
+                || (smooth_follow
+                    && pane
+                        .pending_render_key
+                        .as_ref()
+                        .is_some_and(|pending| texture_keys_match_data_and_style(pending, &key)))
+            {
                 ctx.request_repaint_after(Duration::from_millis(RENDER_RESULT_POLL_MS));
                 return;
             }
@@ -11664,6 +12223,7 @@ impl ViewerApp {
             key: key.clone(),
             pane: pane_number,
             volume,
+            previous_volume,
             cut,
             product,
             render_dealiased_velocity,
@@ -11873,19 +12433,46 @@ impl ViewerApp {
         cut_index: usize,
     ) -> Option<Arc<MomentGrid>> {
         let volume_ptr = volume as *const RadarVolume as usize;
+        let previous_volume = self
+            .volume
+            .as_ref()
+            .filter(|current| Arc::as_ptr(current) as usize == volume_ptr)
+            .and_then(|current| {
+                previous_dealias_reference_volume(
+                    &self.frame_history,
+                    self.selected_frame_index,
+                    current,
+                )
+            });
+        let reference_volume_ptr = if self.dealias_cascade {
+            previous_volume
+                .as_ref()
+                .map(|reference| Arc::as_ptr(reference) as usize)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         if let Some(cache) = &self.dealiased_readout_cache
             && cache.volume_ptr == volume_ptr
+            && cache.reference_volume_ptr == reference_volume_ptr
             && cache.cut_index == cut_index
+            && cache.hybrid == self.dealias_cascade
         {
             return Some(Arc::clone(&cache.grid));
         }
 
         let cut = volume.cuts.get(cut_index)?;
         let source_grid = cut.moments.get(&MomentType::Velocity)?;
-        let grid = Arc::new(dealias_velocity_grid(cut, source_grid));
+        let grid = Arc::new(if self.dealias_cascade {
+            dealias_velocity_grid_hybrid(volume, cut_index, previous_volume.as_deref())?
+        } else {
+            dealias_velocity_grid(cut, source_grid)
+        });
         self.dealiased_readout_cache = Some(DealiasedReadoutCache {
             volume_ptr,
+            reference_volume_ptr,
             cut_index,
+            hybrid: self.dealias_cascade,
             grid,
         });
         self.dealiased_readout_cache
@@ -13227,6 +13814,49 @@ impl ViewerApp {
             }
         }
 
+        for pack in data_packs::RESEARCH_FEED_DATA_PACKS {
+            let mut expanded = self.data_pack_expanded.contains(pack.id);
+            let loaded = self.loaded_data_pack.filter(|loaded| loaded.id == pack.id);
+            ui.separator();
+            ui.push_id(pack.id, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button(if expanded { "v" } else { ">" })
+                        .on_hover_text("Show pack details")
+                        .clicked()
+                    {
+                        expanded = !expanded;
+                    }
+                    ui.label(egui::RichText::new(pack.title).strong());
+                    ui.weak(format!("{} | latest {} research frames", pack.feed_id, pack.frame_count));
+                    if loaded.is_some() {
+                        ui.weak(format!("{} frames", self.frame_history.len()));
+                    }
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Load"))
+                        .on_hover_text("Fetch the feed dir.list, download the newest decodable frames, and apply the review scene")
+                        .clicked()
+                    {
+                        self.start_research_feed_data_pack(*pack, ctx);
+                    }
+                });
+                if expanded {
+                    ui.indent("research_data_pack_details", |ui| {
+                        ui.weak(pack.summary);
+                        ui.weak(format!(
+                            "Feed {} | focus {:.3}, {:.3} | frames {}",
+                            pack.poll_url, pack.focus_lat, pack.focus_lon, pack.frame_count
+                        ));
+                    });
+                }
+            });
+            if expanded {
+                self.data_pack_expanded.insert(pack.id.to_owned());
+            } else {
+                self.data_pack_expanded.remove(pack.id);
+            }
+        }
+
         if let Some((pack, options, replace_history)) = requested {
             self.start_data_pack(pack, options, replace_history, ctx);
         }
@@ -13430,6 +14060,159 @@ impl ViewerApp {
         ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
     }
 
+    fn start_research_feed_data_pack(
+        &mut self,
+        pack: data_packs::ResearchFeedDataPack,
+        ctx: &egui::Context,
+    ) {
+        if self.data_pack_load_blocked() {
+            self.status = "Wait for the current load to finish".to_owned();
+            return;
+        }
+        self.supersede_live_load_for_data_pack();
+        let scene = pack.scene();
+        self.pending_data_pack_scene = Some(scene);
+        self.pending_debug_archive_case = None;
+        self.history_playing = false;
+        self.browsing_history = false;
+        self.realtime_level2_auto_refresh = false;
+        self.poll_active = false;
+        self.poll_rx = None;
+        self.poll_next = None;
+        self.poll_last_file = None;
+        self.poll_url = normalized_poll_url(pack.poll_url);
+        self.set_custom_url_poll_source();
+        self.clear_frame_history();
+        self.clear_displayed_volume_for_pending_load(ctx);
+        self.history_frame_limit = normalized_history_limit(
+            self.history_frame_limit
+                .max(pack.frame_count.min(MAX_HISTORY_FRAME_LIMIT)),
+        );
+        self.center_map_on(scene.focus_lat, scene.focus_lon);
+        self.map_scale = scene.map_scale.clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
+        self.clamp_map_center();
+        self.begin_primary_load_telemetry();
+
+        let progress = ArchiveLoadProgress {
+            label: "Data pack".to_owned(),
+            detail: format!("Listing {} research feed", pack.feed_id),
+            done: 0,
+            total: 0,
+        };
+        self.status = progress.status_text();
+        self.archive_load_progress = Some(progress.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.load_receiver = Some(receiver);
+        self.pending_site_id = Some(pack.feed_id.to_owned());
+        let pack_title = pack.title.to_owned();
+        let progress_label = progress.label.clone();
+        let feed_id = pack.feed_id.to_owned();
+        let poll_url = normalized_poll_url(pack.poll_url);
+        let frame_count = pack.frame_count.max(1);
+        thread::spawn(move || {
+            let total_start = Instant::now();
+            send_archive_progress(
+                &sender,
+                &progress_label,
+                format!("Listing {feed_id} dir.list"),
+                0,
+                0,
+            );
+            let final_result = (|| -> Result<DecodedLoadBatch, String> {
+                let (listing, prefix) = gr2a_listing_with_prefix(&poll_url)?;
+                let candidates = dir_list_volume_entries_newest_first(&listing);
+                if candidates.is_empty() {
+                    return Err("research feed listed no radar files".to_owned());
+                }
+                let attempt_limit = frame_count.saturating_mul(3).max(frame_count);
+                let candidates = candidates
+                    .into_iter()
+                    .take(attempt_limit)
+                    .collect::<Vec<_>>();
+                send_archive_progress(
+                    &sender,
+                    &progress_label,
+                    format!("Queued {} {} candidates", feed_id, candidates.len()),
+                    0,
+                    candidates.len(),
+                );
+                let mut decoded_frames = Vec::new();
+                let mut failures = Vec::new();
+                for (index, entry) in candidates.into_iter().enumerate() {
+                    if decoded_frames.len() >= frame_count {
+                        break;
+                    }
+                    let name = format!("{prefix}{entry}");
+                    send_archive_progress(
+                        &sender,
+                        &progress_label,
+                        format!("Fetching {feed_id} {name}"),
+                        index,
+                        attempt_limit,
+                    );
+                    let url = format!("{poll_url}/{name}");
+                    let fetch_start = Instant::now();
+                    let raw = match data_source::fetch_volume_bytes(&url) {
+                        Ok(raw) => raw,
+                        Err(err) => {
+                            failures.push(format!("{name}: {err}"));
+                            continue;
+                        }
+                    };
+                    let decode_start = Instant::now();
+                    match nexrad_io::decode_supported_volume_bytes(&raw) {
+                        Ok(mut volume) => {
+                            volume.metadata.source_path = Some(url);
+                            let timings = LoadTimings {
+                                fetch_ms: Some(fetch_start.elapsed().as_secs_f32() * 1000.0),
+                                decode_ms: decode_start.elapsed().as_secs_f32() * 1000.0,
+                                ..Default::default()
+                            };
+                            decoded_frames.push(DecodedLoad {
+                                path: PathBuf::from(format!("poll://{name}")),
+                                volume: Arc::new(volume),
+                                timings: timings.finish(total_start),
+                                status: FrameStatus::Complete,
+                                source_label: format!("research {feed_id}"),
+                            });
+                        }
+                        Err(err) => failures.push(format!("decode {name}: {err}")),
+                    }
+                    send_archive_progress(
+                        &sender,
+                        &progress_label,
+                        format!("Decoded {} of {}", decoded_frames.len(), frame_count),
+                        index + 1,
+                        attempt_limit,
+                    );
+                }
+                if decoded_frames.is_empty() {
+                    return Err(format!(
+                        "no usable research frames ({})",
+                        failures
+                            .last()
+                            .cloned()
+                            .unwrap_or_else(|| "all candidates skipped".to_owned())
+                    ));
+                }
+                decoded_frames.sort_by(|left, right| {
+                    frame_identity_for_volume(&left.volume)
+                        .cmp(&frame_identity_for_volume(&right.volume))
+                });
+                let selected_index = decoded_frames.len().saturating_sub(1);
+                Ok(DecodedLoadBatch {
+                    frames: decoded_frames,
+                    selected_index,
+                })
+            })();
+            let _ = sender.send(AsyncLoadResult {
+                label: pack_title,
+                update: AsyncLoadUpdate::Final(final_result),
+            });
+        });
+        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+    }
+
     fn data_pack_load_blocked(&self) -> bool {
         if self.intl_loop_rx.is_some()
             || self.pending_data_pack_scene.is_some()
@@ -13512,9 +14295,29 @@ impl ViewerApp {
         self.sanitize_selection();
         self.clear_texture();
         self.clear_extra_pane_textures();
+        let loaded_poll_name = self.frame_history.last().and_then(|frame| {
+            frame
+                .path
+                .to_str()
+                .and_then(|path| path.strip_prefix("poll://"))
+                .map(str::to_owned)
+        });
         if scene.autoplay && self.frame_history.len() > 1 {
             self.history_playing = true;
             self.last_history_step = None;
+        }
+        if let Some(poll_url) = scene.resume_poll_url {
+            self.poll_url = normalized_poll_url(poll_url);
+            self.set_custom_url_poll_source();
+            self.poll_active = true;
+            self.poll_rx = None;
+            self.poll_last_file = loaded_poll_name;
+            self.poll_next = None;
+            self.history_playing = false;
+            self.browsing_history = false;
+            self.last_history_step = None;
+            self.app_settings.poll_url = self.poll_url.clone();
+            let _ = self.app_settings.save();
         }
         self.status = format!(
             "Data pack loaded: {} - {} frames",
@@ -13986,6 +14789,7 @@ impl eframe::App for ViewerApp {
         self.maybe_refresh_live_hazards(&ctx);
         self.maybe_advance_history_loop(&ctx);
         self.maybe_advance_extra_pane_history_loops(&ctx);
+        self.maybe_apply_continuous_camera_follow(&ctx);
         self.sanitize_selection();
         self.poll_rotation_markers(&ctx);
         self.poll_tor_tracks(&ctx);
@@ -14058,6 +14862,7 @@ impl eframe::App for ViewerApp {
         self.poll_spc(&ctx);
         self.poll_feed(&ctx);
         self.poll_intl_sites();
+        self.poll_coverage_probe(&ctx);
         self.poll_raob_sites(&ctx);
         self.poll_native_sounding(&ctx);
         if self.tile_layer.borrow_mut().poll(&ctx) {
@@ -14313,20 +15118,56 @@ impl ViewerApp {
                     } else {
                         format!("{new_alert_count} NEW ALERTS")
                     };
-                    if ui
-                        .add(
-                            egui::Label::new(egui::RichText::new(label).strong().color(color))
-                                .sense(egui::Sense::click()),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text("Click to jump to the next unacknowledged warning")
-                        .clicked()
-                    {
-                        self.sidebar_tab = SidebarTab::Severe;
-                        if let Some(index) = self.first_unacknowledged_hazard_index() {
-                            self.focus_hazard_record(index);
+                    let groups = self.unacknowledged_hazard_menu_groups();
+                    ui.menu_button(egui::RichText::new(label).strong().color(color), |ui| {
+                        ui.set_min_width(330.0);
+                        if fixed_action_button(ui, "Next", 58.0).clicked() {
+                            self.sidebar_tab = SidebarTab::Severe;
+                            if let Some(index) = self.first_unacknowledged_hazard_index() {
+                                self.focus_hazard_record(index);
+                            }
+                            ui.close();
                         }
-                    }
+                        if fixed_action_button(ui, "Ack all", 58.0).clicked() {
+                            self.acknowledge_all_visible_hazards();
+                            ui.close();
+                        }
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .max_height(360.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for (family, rows) in &groups {
+                                    ui.label(
+                                        egui::RichText::new(format!("{family} ({})", rows.len()))
+                                            .strong()
+                                            .color(SUBHEAD_COLOR),
+                                    );
+                                    for row in rows {
+                                        let text = egui::RichText::new(&row.label)
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(255, 220, 106));
+                                        let response = ui
+                                            .add_sized(
+                                                egui::vec2(
+                                                    ui.available_width(),
+                                                    PANEL_BUTTON_HEIGHT,
+                                                ),
+                                                egui::Button::selectable(row.selected, text),
+                                            )
+                                            .on_hover_text(&row.hover);
+                                        if response.clicked() {
+                                            self.sidebar_tab = SidebarTab::Severe;
+                                            self.focus_hazard_record(row.index);
+                                            ui.close();
+                                        }
+                                    }
+                                }
+                            });
+                    })
+                    .response
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Open new warnings grouped by type");
                 }
                 if let Some(workflow) = self.current_workflow {
                     ui.label(
@@ -14520,6 +15361,7 @@ impl ViewerApp {
             hazards_active_only: self.hazards_active_only,
             live_hazard_auto_refresh: self.live_hazard_auto_refresh,
             spc_outlooks_enabled: self.spc_outlooks_enabled.clone(),
+            estofex_issue_id: self.estofex_issue_id.clone(),
             spc_reports_enabled: self.spc_reports_enabled,
             mping_enabled: self.mping_enabled,
             obs_enabled: self.obs_enabled,
@@ -14585,6 +15427,7 @@ impl ViewerApp {
         self.hazards_active_only = snapshot.hazards_active_only;
         self.live_hazard_auto_refresh = snapshot.live_hazard_auto_refresh;
         self.spc_outlooks_enabled = snapshot.spc_outlooks_enabled;
+        self.estofex_issue_id = snapshot.estofex_issue_id;
         self.spc_reports_enabled = snapshot.spc_reports_enabled;
         self.mping_enabled = snapshot.mping_enabled;
         self.obs_enabled = snapshot.obs_enabled;
@@ -14861,6 +15704,14 @@ impl ViewerApp {
             loop_speed_percent: self.app_settings.loop_speed_percent,
             loop_speed_options: LOOP_SPEED_PERCENT_OPTIONS.to_vec(),
             low_sweeps_enabled: self.app_settings.loop_low_sweeps,
+            low_sweep_filter_index: LowSweepLoopFilter::ALL
+                .iter()
+                .position(|filter| *filter == self.low_sweep_loop_filter())
+                .unwrap_or(0),
+            low_sweep_filter_options: LowSweepLoopFilter::ALL
+                .iter()
+                .map(|filter| filter.label().to_owned())
+                .collect(),
             auto_sync_warnings: self.unified_player.auto_sync_warnings,
             warnings_synced_window: self.event_loop_hazard_window,
             warnings_loaded: self.hazard_overlay.is_some(),
@@ -15047,6 +15898,25 @@ impl ViewerApp {
                         self.select_first_extra_pane_low_sweep_if_enabled(slot, ctx)
                     }
                 }
+                ctx.request_repaint();
+            }
+            Some(unified_player::UnifiedPlayerAction::SetLowSweepFilter(index)) => {
+                let filter = LowSweepLoopFilter::ALL
+                    .get(index)
+                    .copied()
+                    .unwrap_or_default();
+                self.app_settings.loop_low_sweep_filter = filter.key().to_owned();
+                let _ = self.app_settings.save();
+                match self.active_loop_timeline_target() {
+                    LoopTimelineTarget::Primary => {
+                        self.select_first_history_low_sweep_if_enabled(ctx)
+                    }
+                    LoopTimelineTarget::ExtraPane(slot) => {
+                        self.select_first_extra_pane_low_sweep_if_enabled(slot, ctx)
+                    }
+                }
+                self.unified_player
+                    .mark_status(format!("Low-sweep mode: {}", filter.label()));
                 ctx.request_repaint();
             }
             Some(unified_player::UnifiedPlayerAction::SetAutoWarningSync(auto_sync)) => {
@@ -15254,6 +16124,9 @@ impl ViewerApp {
             Some(unified_player::UnifiedPlayerAction::AddCoordinatedSitesAsOverlays) => {
                 self.add_unified_player_coordinated_site_overlays(ctx);
             }
+            Some(unified_player::UnifiedPlayerAction::SyncNearbyRadarLoops) => {
+                self.sync_unified_player_nearby_radar_loops(ctx);
+            }
             Some(unified_player::UnifiedPlayerAction::Dock) => {
                 self.workspace.dock(dock::WorkspacePane::UnifiedPlayer);
                 self.unified_player.mark_status("Docked Unified Player");
@@ -15305,6 +16178,26 @@ impl ViewerApp {
     }
 
     fn populate_unified_player_nearby_sites(&mut self) {
+        let radius = self
+            .unified_player
+            .coordinated_site_radius_km
+            .clamp(25.0, 460.0);
+        let candidates = self.nearby_coordinated_overlay_sites(8);
+        if candidates.is_empty() {
+            self.unified_player
+                .mark_status(format!("No WSR-88D sites within {:.0} km", radius));
+            return;
+        }
+        self.unified_player.coordinated_sites_input = candidates
+            .iter()
+            .map(|(_, site)| site.level2_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.unified_player
+            .mark_status(format!("Found {} nearby radar sites", candidates.len()));
+    }
+
+    fn nearby_coordinated_overlay_sites(&self, max_count: usize) -> Vec<(f32, RadarSite)> {
         let (lat, lon) = self
             .radar_location()
             .unwrap_or((self.map_center_lat, self.map_center_lon));
@@ -15321,23 +16214,12 @@ impl ViewerApp {
             .filter_map(|site| {
                 let (site_lat, site_lon) = site_location(site)?;
                 let distance_km = haversine_km(lat, lon, site_lat, site_lon);
-                (distance_km <= radius).then(|| (distance_km, site.level2_id.clone()))
+                (distance_km <= radius).then(|| (distance_km, site.clone()))
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
-        candidates.truncate(8);
-        if candidates.is_empty() {
-            self.unified_player
-                .mark_status(format!("No WSR-88D sites within {:.0} km", radius));
-            return;
-        }
-        self.unified_player.coordinated_sites_input = candidates
-            .iter()
-            .map(|(_, site_id)| site_id.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        self.unified_player
-            .mark_status(format!("Found {} nearby radar sites", candidates.len()));
+        candidates.truncate(max_count);
+        candidates
     }
 
     fn add_unified_player_coordinated_site_overlays(&mut self, ctx: &egui::Context) {
@@ -15379,6 +16261,55 @@ impl ViewerApp {
                 details.join("; ")
             ));
         }
+    }
+
+    fn sync_unified_player_nearby_radar_loops(&mut self, ctx: &egui::Context) {
+        let mode = self.coordinated_overlay_load_mode();
+        let CoordinatedOverlayLoadMode::ArchiveWindow {
+            start_utc,
+            end_utc,
+            max_frames,
+        } = mode
+        else {
+            self.unified_player
+                .mark_status("Load a multi-frame radar loop before Sync 5");
+            return;
+        };
+        let radius = self
+            .unified_player
+            .coordinated_site_radius_km
+            .clamp(25.0, 460.0);
+        let candidates = self.nearby_coordinated_overlay_sites(STORM_VIDEO_SYNC_OVERLAY_RADARS);
+        if candidates.is_empty() {
+            self.unified_player
+                .mark_status(format!("No WSR-88D sites within {:.0} km", radius));
+            return;
+        }
+
+        let selected_ids = candidates
+            .iter()
+            .map(|(_, site)| site.level2_id.clone())
+            .collect::<BTreeSet<_>>();
+        self.unified_player.coordinated_sites_input = candidates
+            .iter()
+            .map(|(_, site)| site.level2_id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        for layer in &mut self.radar_layers {
+            if !selected_ids.contains(&layer.site.level2_id) {
+                layer.visible = false;
+            }
+        }
+        for (_, site) in candidates {
+            self.add_or_refresh_radar_layer_archive_window(
+                site, start_utc, end_utc, max_frames, ctx,
+            );
+        }
+        self.sync_radar_overlay_layers_to_timeline(ctx);
+        let total = selected_ids.len() + 1;
+        let status = format!("Loading {total} synced radar sites for storm video");
+        self.status = status.clone();
+        self.unified_player.mark_status(status);
     }
 
     fn coordinated_overlay_load_mode(&self) -> CoordinatedOverlayLoadMode {
@@ -16583,9 +17514,24 @@ impl ViewerApp {
         self.remembered_section(ui, "data_event_day", "Event day", true, |app, ui| {
             app.event_day_section(ui, ctx);
         });
-        self.remembered_section(ui, "data_ord_archive", "ORD archive", true, |app, ui| {
-            app.ord_archive_section(ui, ctx);
-        });
+        self.remembered_section(
+            ui,
+            "data_radar_coverage",
+            "Radar coverage",
+            true,
+            |app, ui| {
+                app.radar_coverage_section(ui, ctx);
+            },
+        );
+        self.remembered_section(
+            ui,
+            "data_ord_archive",
+            "ORD per-site archive",
+            true,
+            |app, ui| {
+                app.ord_archive_section(ui, ctx);
+            },
+        );
         self.remembered_section(ui, "data_live_feeds", "Live feeds", true, |app, ui| {
             app.live_feeds_section(ui, ctx);
         });
@@ -18049,48 +18995,58 @@ impl ViewerApp {
         // FOCUSED pane's product, so the tilt list below barely shifts.
         if editing_product.color_family() == ColorTableFamily::Velocity {
             ui.horizontal(|ui| {
-                if matches!(editing_product, DisplayProduct::Moment(MomentType::Velocity)) {
+                let plain_velocity =
+                    matches!(editing_product, DisplayProduct::Moment(MomentType::Velocity));
+                if plain_velocity {
                     let unfold_changed = ui
                         .checkbox(&mut self.unfold_velocity_display, "Auto-dealias VEL")
                         .on_hover_text(
-                            "Optional: run BowEcho's dealiaser on the raw VEL product. Off keeps VEL faithful to the radar; use DVEL/DSRV for explicitly dealiased products.",
+                            "Off keeps plain VEL exactly as transmitted by the radar. Turn on to render VEL through the selected dealias engine; DVEL and DSRV are always dealiased.",
                         )
                         .changed();
                     if unfold_changed {
-                        self.clear_texture();
-                        ctx.request_repaint();
-                    }
-                    let mut engine_changed = false;
-                    ui.add_enabled_ui(self.unfold_velocity_display, |ui| {
-                        egui::ComboBox::from_id_salt("dealias_engine")
-                            .selected_text(if self.dealias_cascade {
-                                "Cascade (beta)"
-                            } else {
-                                "Region"
-                            })
-                            .width(110.0)
-                            .show_ui(ui, |ui| {
-                                engine_changed |= ui
-                                    .selectable_value(&mut self.dealias_cascade, false, "Region")
-                                    .on_hover_text("Region-based unfolding (default, proven)")
-                                    .changed();
-                                engine_changed |= ui
-                                    .selectable_value(
-                                        &mut self.dealias_cascade,
-                                        true,
-                                        "Cascade (beta)",
-                                    )
-                                    .on_hover_text(
-                                        "Tilt-cascade: dealias top-down, each tilt branch-checked against the wind fit from the (less aliased) tilt above. Helps on VCPs with high-Nyquist upper tilts; see docs/dealias-fold-branch-analysis.md.",
-                                    )
-                                    .changed();
-                            });
-                    });
-                    if engine_changed {
+                        self.dealiased_readout_cache = None;
                         self.clear_texture();
                         ctx.request_repaint();
                     }
                 }
+
+                let engine_applies = editing_product.uses_dealiased_velocity()
+                    || (plain_velocity && self.unfold_velocity_display);
+                let mut engine_changed = false;
+                ui.add_enabled_ui(engine_applies, |ui| {
+                    egui::ComboBox::from_id_salt("dealias_engine")
+                        .selected_text(if self.dealias_cascade {
+                            "3D + time (beta)"
+                        } else {
+                            "Region"
+                        })
+                        .width(104.0)
+                        .show_ui(ui, |ui| {
+                            engine_changed |= ui
+                                .selectable_value(&mut self.dealias_cascade, false, "Region")
+                                .on_hover_text(
+                                    "Fast same-tilt region unfolding. Good fallback, but an isolated connected group's absolute Nyquist branch can be ambiguous.",
+                                )
+                                .changed();
+                            engine_changed |= ui
+                                .selectable_value(
+                                    &mut self.dealias_cascade,
+                                    true,
+                                    "3D + time (beta)",
+                                )
+                                .on_hover_text(
+                                    "Hybrid branch selection: region unfolding plus the previous volume's matching elevation, nearby current-volume velocity tilts, and the cascade wind fit. Designed for folded 1-3 degree tilts and live partial volumes.",
+                                )
+                                .changed();
+                        });
+                });
+                if engine_changed {
+                    self.dealiased_readout_cache = None;
+                    self.clear_texture();
+                    ctx.request_repaint();
+                }
+
                 let changed = ui
                     .checkbox(&mut self.flip_velocity_color_polarity, "Flip")
                     .on_hover_text("Diagnostic: color positive velocity values with the negative side of the active velocity table, and vice versa (all panes)")
@@ -19223,14 +20179,24 @@ impl ViewerApp {
         let mut promote_site = None;
         let min_overlay_alpha = self.style_registry.drapes().min_overlay_alpha;
         for (index, layer) in self.radar_layers.iter_mut().enumerate() {
-            let state = if layer.volume.is_some() {
-                "live"
-            } else if layer.load_receiver.is_some() {
+            let state = if layer.load_receiver.is_some() {
                 "loading"
+            } else if layer.timeline_sync {
+                "timeline"
+            } else if layer.volume.is_some() {
+                "live"
             } else {
                 "queued"
             };
             let mut details = vec![layer.status.clone()];
+            if layer.timeline_sync {
+                details.push(
+                    "Owned by the Unified Player timeline; live refresh is paused".to_owned(),
+                );
+                if let Some(cut) = layer.selected_cut {
+                    details.push(format!("selected coordinated cut #{cut:02}"));
+                }
+            }
             if let Some(path) = &layer.source_path {
                 details.push(path.display().to_string());
             }
@@ -19251,6 +20217,7 @@ impl ViewerApp {
             // Make-primary ride behind the ⚙ (two-extra budget, spec §2.3).
             let mut remove_this = false;
             let gear_site = site.clone();
+            let timeline_sync = layer.timeline_sync;
             if layer_row(
                 ui,
                 LayerRowSpec {
@@ -19268,11 +20235,20 @@ impl ViewerApp {
                         max: u8::MAX,
                     }),
                     gear: Some(LayerRowGear::Menu {
-                        hover: "Overlay radar actions (refresh · make primary)",
+                        hover: "Overlay radar actions (refresh/detach · make primary)",
                         content: Box::new(move |ui| {
+                            let refresh_label = if timeline_sync {
+                                "Detach timeline + load live"
+                            } else {
+                                "Refresh live"
+                            };
                             if ui
-                                .button("Refresh")
-                                .on_hover_text("Reload this overlay radar's latest volume")
+                                .button(refresh_label)
+                                .on_hover_text(if timeline_sync {
+                                    "Stop following the coordinated archive cursor and load this radar's latest volume"
+                                } else {
+                                    "Reload this overlay radar's latest volume"
+                                })
                                 .clicked()
                             {
                                 if load_idle {
@@ -19860,11 +20836,24 @@ impl ViewerApp {
                 .any(|k| k == spc_layers::ESTOFEX_OUTLOOK_KIND);
             let estofex_count = app
                 .spc_data
-                .outlooks
+                .estofex_issues
                 .iter()
-                .find(|(kind, _)| kind == spc_layers::ESTOFEX_OUTLOOK_KIND)
-                .map(|(_, features)| features.len())
-                .unwrap_or(0);
+                .map(|issue| issue.polygons.len())
+                .sum::<usize>();
+            let displayed_time = app.displayed_timeline_time_utc().unwrap_or_else(Utc::now);
+            let selected_estofex_issue = spc_layers::selected_estofex_issue(
+                &app.spc_data.estofex_issues,
+                app.estofex_issue_id.as_deref(),
+                displayed_time,
+            )
+            .map(|issue| {
+                (
+                    issue.id.clone(),
+                    spc_layers::estofex_issue_label(issue),
+                    issue.polygons.len(),
+                    spc_layers::estofex_issue_valid_at(issue, displayed_time),
+                )
+            });
             ui.horizontal(|ui| {
                 ui.label("Day").on_hover_text(
                     "Outlook day (archive-aware: an archive loop shows THAT day's outlook)",
@@ -19924,7 +20913,7 @@ impl ViewerApp {
                 if ui
                     .checkbox(&mut estofex_on, "ESTOFEX Europe")
                     .on_hover_text(
-                        "Current ESTOFEX European Storm Forecast Experiment outlook from the live XML feed",
+                        "ESTOFEX European Storm Forecast Experiment outlooks, with issue selection separate from SPC day",
                     )
                     .changed()
                 {
@@ -19934,6 +20923,7 @@ impl ViewerApp {
                     } else {
                         app.spc_outlooks_enabled
                             .retain(|k| k != spc_layers::ESTOFEX_OUTLOOK_KIND);
+                        app.estofex_issue_id = None;
                     }
                     changed = true;
                 }
@@ -19948,14 +20938,67 @@ impl ViewerApp {
                 }
             });
             if estofex_on {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("ESTOFEX issue").on_hover_text(
+                        "Auto chooses the newest issue valid at the displayed radar time and never shows an update before it was issued.",
+                    );
+                    let selected_text = selected_estofex_issue
+                        .as_ref()
+                        .map(|(_, label, _, valid)| {
+                            if *valid || app.estofex_issue_id.is_some() {
+                                label.clone()
+                            } else {
+                                "Auto - no valid issue".to_owned()
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            if app.estofex_issue_id.is_some() {
+                                "Missing selected issue".to_owned()
+                            } else {
+                                "Auto - valid at displayed time".to_owned()
+                            }
+                        });
+                    egui::ComboBox::from_id_salt("severe_estofex_issue")
+                        .selected_text(selected_text)
+                        .width(260.0)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_value(
+                                    &mut app.estofex_issue_id,
+                                    None,
+                                    "Auto - valid at displayed time",
+                                )
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                            for issue in &app.spc_data.estofex_issues {
+                                if ui
+                                    .selectable_value(
+                                        &mut app.estofex_issue_id,
+                                        Some(issue.id.clone()),
+                                        spc_layers::estofex_issue_label(issue),
+                                    )
+                                    .changed()
+                                {
+                                    changed = true;
+                                }
+                            }
+                        });
+                });
                 let status = if app.spc_rx.is_some() {
-                    "ESTOFEX: fetching live XML".to_owned()
+                    "ESTOFEX: fetching issue list".to_owned()
+                } else if let Some((_, label, area_count, valid)) = &selected_estofex_issue {
+                    let stale = if *valid { "" } else { " - stale at displayed time" };
+                    format!("ESTOFEX: {area_count} areas, {label}{stale}")
                 } else if estofex_count > 0 {
-                    format!("ESTOFEX: {estofex_count} areas loaded - use Center Europe if the map is over the U.S.")
+                    format!(
+                        "ESTOFEX: {estofex_count} areas cached, none valid at displayed time"
+                    )
                 } else if app.spc_data.fetched_at.is_some() {
-                    "ESTOFEX: no areas returned by the current XML feed".to_owned()
+                    "ESTOFEX: no issues returned by the live feed".to_owned()
                 } else {
-                    "ESTOFEX: waiting for the next outlook fetch".to_owned()
+                    "ESTOFEX: waiting for the next issue fetch".to_owned()
                 };
                 ui.weak(status);
             }
@@ -20239,6 +21282,7 @@ impl ViewerApp {
             .map(|(index, record)| HazardListRow {
                 index,
                 label: hazard_record_list_label(record),
+                family: record.event_family.clone(),
                 hover: hazard_record_list_hover(record),
                 selected: self.selected_hazard_index == Some(index),
                 unacknowledged: self
@@ -20246,6 +21290,30 @@ impl ViewerApp {
                     .contains(&record.event_id),
             })
             .collect()
+    }
+
+    fn unacknowledged_hazard_menu_groups(&self) -> Vec<(String, Vec<HazardListRow>)> {
+        let mut rows = self
+            .visible_hazard_list_rows()
+            .into_iter()
+            .filter(|row| row.unacknowledged)
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            hazard_family_order(&left.family)
+                .cmp(&hazard_family_order(&right.family))
+                .then_with(|| left.label.cmp(&right.label))
+        });
+
+        let mut groups: Vec<(String, Vec<HazardListRow>)> = Vec::new();
+        for row in rows {
+            let label = hazard_family_menu_label(&row.family);
+            if let Some((_, group_rows)) = groups.iter_mut().find(|(family, _)| family == &label) {
+                group_rows.push(row);
+            } else {
+                groups.push((label, vec![row]));
+            }
+        }
+        groups
     }
 
     fn focus_hazard_record(&mut self, index: usize) -> bool {
@@ -25343,11 +26411,11 @@ impl ViewerApp {
     fn drain_polled_volume(&mut self, ctx: &egui::Context) {
         if let Some(receiver) = &self.poll_rx {
             match receiver.try_recv() {
-                Ok(Ok((name, volume))) => {
+                Ok(Ok(load)) => {
                     self.poll_rx = None;
-                    self.poll_last_file = Some(name.clone());
-                    self.status = format!("Polled: {name}");
-                    self.install_polled_volume(&name, volume, ctx);
+                    self.poll_last_file = Some(load.dedupe_key.clone());
+                    self.status = format!("Polled: {}", load.name);
+                    self.install_polled_volume(&load.name, load.volume, ctx);
                 }
                 Ok(Err(message)) => {
                     self.poll_rx = None;
@@ -25390,8 +26458,12 @@ impl ViewerApp {
     }
 
     fn set_ord_archive_primary_source(&mut self, site_id: &str) {
+        self.set_intl_archive_primary_source("ord", site_id);
+    }
+
+    fn set_intl_archive_primary_source(&mut self, provider_id: &str, site_id: &str) {
         self.poll_source = PollSource::Intl {
-            provider_id: "ord".to_owned(),
+            provider_id: provider_id.to_owned(),
             site_id: site_id.to_owned(),
         };
         self.poll_active = false;
@@ -25400,6 +26472,67 @@ impl ViewerApp {
         self.poll_next = None;
         self.poll_source.save_to_settings(&mut self.app_settings);
         let _ = self.app_settings.save();
+    }
+
+    pub(crate) fn start_smhi_coverage_archive_load(
+        &mut self,
+        hour: Option<u32>,
+        ctx: &egui::Context,
+    ) {
+        let site_id = self.coverage_site_id.trim().to_owned();
+        if self.coverage_provider_id != "smhi" || site_id.is_empty() {
+            self.status = "SMHI archive: choose an SMHI Sweden site".to_owned();
+            return;
+        }
+        if let Some(hour) = hour
+            && hour > 23
+        {
+            self.status = "SMHI archive hour must be 0-23".to_owned();
+            return;
+        }
+        let date = match NaiveDate::parse_from_str(self.coverage_date_input.trim(), "%Y-%m-%d") {
+            Ok(date) => date,
+            Err(_) => {
+                self.status = "SMHI archive date must be YYYY-MM-DD".to_owned();
+                return;
+            }
+        };
+        let count = self.coverage_frame_count.clamp(1, MAX_HISTORY_FRAME_LIMIT);
+        self.coverage_frame_count = count;
+        self.history_frame_limit = self.history_frame_limit.max(count);
+        let label = match hour {
+            Some(hour) => format!("SMHI {site_id} {date} {hour:02}Z"),
+            None => format!("SMHI {site_id} {date}"),
+        };
+        let replaced = self.load_receiver.take().is_some();
+        self.set_intl_archive_primary_source("smhi", &site_id);
+        self.intl_loop_rx = None;
+        self.intl_loop_requested = 0;
+        self.pending_site_id = Some(site_id.clone());
+        self.live_refresh_skip_reason = None;
+        self.clear_frame_history();
+        self.clear_displayed_volume_for_pending_load(ctx);
+
+        let (sender, receiver) = mpsc::channel();
+        self.load_receiver = Some(receiver);
+        self.archive_load_progress = Some(ArchiveLoadProgress {
+            label: label.clone(),
+            detail: "listing SMHI archive".to_owned(),
+            done: 0,
+            total: count,
+        });
+        self.status = if replaced {
+            format!("Replaced active load; {label} queued")
+        } else {
+            format!("{label} queued")
+        };
+        let worker_label = label.clone();
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            fetch_smhi_archive_frame_batch(&site_id, date, hour, count, &worker_label, &sender);
+            ctx_clone.request_repaint();
+        });
+        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
     }
 
     /// Load Loop for the active international feed: stream up to the
@@ -25544,7 +26677,11 @@ impl ViewerApp {
             let ctx_clone = ctx.clone();
             thread::spawn(move || {
                 let result = match fetch_intl_frame(&provider_id, &site_id, last.as_deref()) {
-                    Ok(Some((identity, volume))) => Ok((identity, Arc::new(volume))),
+                    Ok(Some((identity, volume))) => Ok(PolledVolumeLoad {
+                        name: identity.clone(),
+                        dedupe_key: identity,
+                        volume: Arc::new(volume),
+                    }),
                     Ok(None) => Err(String::new()), // no-change marker
                     Err(message) => Err(message),
                 };
@@ -25595,6 +26732,55 @@ impl ViewerApp {
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => self.intl_sites_rx = None,
+        }
+    }
+
+    fn start_coverage_probe(&mut self, ctx: &egui::Context) {
+        let provider_id = self.coverage_provider_id.trim().to_owned();
+        let site_id = self.coverage_site_id.trim().to_owned();
+        if provider_id.is_empty() || site_id.is_empty() {
+            self.status = "Coverage probe: choose a provider and site".to_owned();
+            return;
+        }
+        let count = self.coverage_frame_count.clamp(1, MAX_HISTORY_FRAME_LIMIT);
+        self.coverage_frame_count = count;
+        self.coverage_probe_result = None;
+        let (sender, receiver) = mpsc::channel();
+        self.coverage_probe_rx = Some(receiver);
+        self.status = format!("Coverage probe: {provider_id}/{site_id}");
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            let result = probe_intl_recent_coverage(&provider_id, &site_id, count);
+            let _ = sender.send(result);
+            ctx_clone.request_repaint();
+        });
+        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+    }
+
+    fn poll_coverage_probe(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.coverage_probe_rx else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(result) => {
+                self.coverage_probe_rx = None;
+                self.status = match &result {
+                    Ok(probe) => format!(
+                        "Coverage probe: {} {} listed {}/{} frames",
+                        probe.provider_label, probe.site_id, probe.frame_count, probe.requested
+                    ),
+                    Err(message) => format!("Coverage probe failed: {message}"),
+                };
+                self.coverage_probe_result = Some(result);
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.coverage_probe_rx = None;
+                self.status = "Coverage probe worker disconnected".to_owned();
+            }
         }
     }
 
@@ -26027,89 +27213,92 @@ impl ViewerApp {
             self.poll_rx = Some(receiver);
             let ctx_clone = ctx.clone();
             thread::spawn(move || {
-                let result =
-                    (|| -> std::result::Result<Option<(String, Arc<RadarVolume>)>, String> {
-                        // <base>/dir.list directly, else the GR2A root
-                        // convention: grlevel2.cfg names per-site subdirs
-                        // ("Site:" lines). With exactly one site, poll
-                        // <base>/<site>/ — the user pasted the server root
-                        // (field case: a local JMA radar bridge).
-                        let root_listing = data_source::fetch_text(&format!("{base}/dir.list"));
-                        let (listing, prefix) = match &root_listing {
-                            Ok(listing)
-                                if !dir_list_volume_entries_newest_first(listing).is_empty() =>
-                            {
-                                (listing.clone(), String::new())
-                            }
-                            _ => {
-                                let sites =
-                                    data_source::fetch_text(&format!("{base}/grlevel2.cfg"))
-                                        .map(|cfg| grlevel2_cfg_sites(&cfg))
-                                        .unwrap_or_default();
-                                match sites.as_slice() {
-                                    [site] => {
-                                        let listing = data_source::fetch_text(&format!(
-                                            "{base}/{site}/dir.list"
-                                        ))
-                                        .map_err(|e| format!("{site}/dir.list: {e}"))?;
-                                        (listing, format!("{site}/"))
-                                    }
-                                    [] => {
-                                        return Err(match root_listing {
-                                            Ok(_) => "dir.list: no data files listed".to_owned(),
-                                            Err(e) => format!("dir.list: {e}"),
-                                        });
-                                    }
-                                    multiple => {
-                                        return Err(format!(
-                                            "server hosts {} sites ({}) — append one to the URL",
-                                            multiple.len(),
-                                            multiple.join(", ")
-                                        ));
-                                    }
+                let result = (|| -> std::result::Result<Option<PolledVolumeLoad>, String> {
+                    // <base>/dir.list directly, else the GR2A root
+                    // convention: grlevel2.cfg names per-site subdirs
+                    // ("Site:" lines). With exactly one site, poll
+                    // <base>/<site>/ — the user pasted the server root
+                    // (field case: a local JMA radar bridge).
+                    let root_listing = data_source::fetch_text(&format!("{base}/dir.list"));
+                    let (listing, prefix) = match &root_listing {
+                        Ok(listing)
+                            if !dir_list_volume_entries_newest_first(listing).is_empty() =>
+                        {
+                            (listing.clone(), String::new())
+                        }
+                        _ => {
+                            let sites = data_source::fetch_text(&format!("{base}/grlevel2.cfg"))
+                                .map(|cfg| grlevel2_cfg_sites(&cfg))
+                                .unwrap_or_default();
+                            match sites.as_slice() {
+                                [site] => {
+                                    let listing =
+                                        data_source::fetch_text(&format!("{base}/{site}/dir.list"))
+                                            .map_err(|e| format!("{site}/dir.list: {e}"))?;
+                                    (listing, format!("{site}/"))
                                 }
+                                [] => {
+                                    return Err(match root_listing {
+                                        Ok(_) => "dir.list: no data files listed".to_owned(),
+                                        Err(e) => format!("dir.list: {e}"),
+                                    });
+                                }
+                                multiple => {
+                                    return Err(format!(
+                                        "server hosts {} sites ({}) — append one to the URL",
+                                        multiple.len(),
+                                        multiple.join(", ")
+                                    ));
+                                }
+                            }
+                        }
+                    };
+                    let candidates = dir_list_volume_entry_records_newest_first(&listing);
+                    if candidates.is_empty() {
+                        return Err("empty dir.list".to_owned());
+                    }
+                    let mut failures = Vec::new();
+                    for entry in candidates.into_iter().take(8) {
+                        let newest = format!("{prefix}{}", entry.name);
+                        let dedupe_key = format!("{prefix}{}", entry.signature);
+                        if last.as_deref() == Some(dedupe_key.as_str()) {
+                            return Ok(None);
+                        }
+                        // Volume client: real Level II runs 5-25 MB —
+                        // fetch_bytes' 4 MiB sprite-sheet cap and 8 s
+                        // metadata timeout both fail on field links.
+                        let raw = match data_source::fetch_volume_bytes(&format!("{base}/{newest}"))
+                        {
+                            Ok(raw) => raw,
+                            Err(err) => {
+                                failures.push(format!("{newest}: {err}"));
+                                continue;
                             }
                         };
-                        let candidates = dir_list_volume_entries_newest_first(&listing);
-                        if candidates.is_empty() {
-                            return Err("empty dir.list".to_owned());
-                        }
-                        let mut failures = Vec::new();
-                        for entry in candidates.into_iter().take(8) {
-                            let newest = format!("{prefix}{entry}");
-                            if last.as_deref() == Some(newest.as_str()) {
-                                return Ok(None);
+                        // Field feeds serve Level-II conversions (the GR2A
+                        // msg31 convention), native DORADE sweepfiles, or
+                        // international ODIM_H5/CfRadial volumes; the shared
+                        // router dispatches by magic bytes like the
+                        // file-open path.
+                        match nexrad_io::decode_supported_volume_bytes(&raw) {
+                            Ok(volume) => {
+                                return Ok(Some(PolledVolumeLoad {
+                                    name: newest,
+                                    dedupe_key,
+                                    volume: Arc::new(volume),
+                                }));
                             }
-                            // Volume client: real Level II runs 5-25 MB —
-                            // fetch_bytes' 4 MiB sprite-sheet cap and 8 s
-                            // metadata timeout both fail on field links.
-                            let raw = match data_source::fetch_volume_bytes(&format!(
-                                "{base}/{newest}"
-                            )) {
-                                Ok(raw) => raw,
-                                Err(err) => {
-                                    failures.push(format!("{newest}: {err}"));
-                                    continue;
-                                }
-                            };
-                            // Field feeds serve Level-II conversions (the GR2A
-                            // msg31 convention), native DORADE sweepfiles, or
-                            // international ODIM_H5/CfRadial volumes; the shared
-                            // router dispatches by magic bytes like the
-                            // file-open path.
-                            match nexrad_io::decode_supported_volume_bytes(&raw) {
-                                Ok(volume) => return Ok(Some((newest, Arc::new(volume)))),
-                                Err(err) => failures.push(format!("decode {newest}: {err}")),
-                            }
+                            Err(err) => failures.push(format!("decode {newest}: {err}")),
                         }
-                        Err(format!(
-                            "no usable volume in newest dir.list entries ({})",
-                            failures
-                                .last()
-                                .cloned()
-                                .unwrap_or_else(|| "all candidates skipped".to_owned())
-                        ))
-                    })();
+                    }
+                    Err(format!(
+                        "no usable volume in newest dir.list entries ({})",
+                        failures
+                            .last()
+                            .cloned()
+                            .unwrap_or_else(|| "all candidates skipped".to_owned())
+                    ))
+                })();
                 let _ = sender.send(match result {
                     Ok(Some(pair)) => Ok(pair),
                     Ok(None) => Err(String::new()), // no-change marker
@@ -26426,11 +27615,10 @@ impl ViewerApp {
             match receiver.try_recv() {
                 Ok(data) => {
                     let estofex_count = data
-                        .outlooks
+                        .estofex_issues
                         .iter()
-                        .find(|(kind, _)| kind == spc_layers::ESTOFEX_OUTLOOK_KIND)
-                        .map(|(_, features)| features.len())
-                        .unwrap_or(0);
+                        .map(|issue| issue.polygons.len())
+                        .sum::<usize>();
                     let spc_count: usize = data
                         .outlooks
                         .iter()
@@ -28252,6 +29440,82 @@ impl ViewerApp {
                         );
                     }
                 }
+            }
+        }
+        if self
+            .spc_outlooks_enabled
+            .iter()
+            .any(|k| k == spc_layers::ESTOFEX_OUTLOOK_KIND)
+        {
+            let displayed_time = self.displayed_timeline_time_utc().unwrap_or_else(Utc::now);
+            if let Some(issue) = spc_layers::selected_estofex_issue(
+                &self.spc_data.estofex_issues,
+                self.estofex_issue_id.as_deref(),
+                displayed_time,
+            ) {
+                for feature in &issue.polygons {
+                    self.draw_estofex_outlook_feature(painter, rect, feature, spc_style);
+                }
+            }
+        }
+    }
+
+    fn draw_estofex_outlook_feature(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        feature: &spc_layers::OutlookFeature,
+        spc_style: &styles::SpcStyle,
+    ) {
+        let fill = egui::Color32::from_rgba_unmultiplied(
+            feature.fill.r(),
+            feature.fill.g(),
+            feature.fill.b(),
+            spc_style.outlook_fill_alpha,
+        );
+        let stroke_color = egui::Color32::from_rgba_unmultiplied(
+            feature.stroke.r(),
+            feature.stroke.g(),
+            feature.stroke.b(),
+            spc_style.outlook_stroke_alpha,
+        );
+        let stroke = egui::Stroke::new(spc_style.outlook_stroke_width, stroke_color);
+        for polygon in &feature.polygons {
+            let outer_screen: Vec<egui::Pos2> = polygon
+                .outer
+                .iter()
+                .map(|(lon, lat)| self.lon_lat_to_screen(rect, *lon, *lat))
+                .collect();
+            if !screen_polygon_bbox_intersects(&outer_screen, rect) {
+                continue;
+            }
+            draw_outlook_ring(painter, &outer_screen, stroke);
+            let hole_screens = polygon
+                .holes
+                .iter()
+                .map(|ring| {
+                    ring.iter()
+                        .map(|(lon, lat)| self.lon_lat_to_screen(rect, *lon, *lat))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            for hole in &hole_screens {
+                draw_outlook_ring(painter, hole, stroke);
+            }
+            if feature.fill_enabled
+                && let Some(mesh) =
+                    filled_polygon_with_holes_mesh(&outer_screen, &hole_screens, fill)
+            {
+                painter.add(egui::Shape::mesh(mesh));
+            }
+            if let Some(first) = outer_screen.first() {
+                painter.text(
+                    *first + egui::vec2(6.0, 6.0),
+                    egui::Align2::LEFT_TOP,
+                    &feature.label,
+                    egui::FontId::proportional(11.0),
+                    stroke_color,
+                );
             }
         }
     }
@@ -30203,18 +31467,36 @@ impl ViewerApp {
         }
         let global = self.style_registry.hazard_global();
         let halo = style_color32(self.style_registry.labels().warning_halo_color);
-        for (center, label, selected) in &built.labels {
+        let overlay = self.hazard_overlay.as_ref();
+        let new_label_color = new_hazard_label_color(painter.ctx());
+        for (center, label, selected, record_index) in &built.labels {
+            let unacknowledged = overlay
+                .and_then(|overlay| overlay.records.get(*record_index))
+                .is_some_and(|record| {
+                    self.unacknowledged_hazard_event_ids
+                        .contains(&record.event_id)
+                });
+            let display_label = if unacknowledged {
+                format!("NEW {label}")
+            } else {
+                label.clone()
+            };
+            let text_color = if unacknowledged {
+                new_label_color
+            } else {
+                egui::Color32::from_rgb(245, 248, 250)
+            };
             draw_halo_text(
                 painter,
                 *center,
                 egui::Align2::CENTER_CENTER,
-                label,
-                egui::FontId::proportional(if *selected {
+                &display_label,
+                egui::FontId::proportional(if *selected || unacknowledged {
                     global.label_font_selected_px
                 } else {
                     global.label_font_px
                 }),
-                egui::Color32::from_rgb(245, 248, 250),
+                text_color,
                 halo,
             );
         }
@@ -30243,8 +31525,6 @@ impl ViewerApp {
         };
         let stroke = egui::Stroke::new(if blink_on { 4.5 } else { 2.75 }, color);
         let bounds = self.visible_geo_bounds(rect).expand(0.05);
-        let global = self.style_registry.hazard_global();
-        let halo = style_color32(self.style_registry.labels().warning_halo_color);
         for record in &overlay.records {
             if !self
                 .unacknowledged_hazard_event_ids
@@ -30264,20 +31544,6 @@ impl ViewerApp {
                 continue;
             }
             painter.add(egui::Shape::closed_line(points.clone(), stroke));
-            if self.app_settings.show_hazard_labels && self.map_scale >= 62.0 {
-                let center = polygon_screen_centroid(&points);
-                if rect.expand(24.0).contains(center) {
-                    draw_halo_text(
-                        painter,
-                        center,
-                        egui::Align2::CENTER_CENTER,
-                        &format!("NEW {}", record.label),
-                        egui::FontId::proportional(global.label_font_selected_px),
-                        color,
-                        halo,
-                    );
-                }
-            }
         }
     }
 
@@ -30411,7 +31677,8 @@ impl ViewerApp {
             }
             let center = polygon_screen_centroid(&points);
             if rect.expand(24.0).contains(center) && self.map_scale >= 62.0 {
-                out.labels.push((center, record.label.clone(), selected));
+                out.labels
+                    .push((center, record.label.clone(), selected, index));
             }
         }
         out
@@ -32296,21 +33563,33 @@ impl ViewerApp {
             return;
         }
         let feeds = data_source::community_feeds::community_feeds();
+        let active_url = self.active_community_poll_url();
         let mut picked: Option<&'static data_source::community_feeds::CommunityFeed> = None;
         egui::Area::new(egui::Id::new("community_feed_menu"))
             .order(egui::Order::Foreground)
             .fixed_pos(anchor + egui::vec2(14.0, -10.0))
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(140.0);
+                    ui.set_min_width(190.0);
                     ui.weak(&marker.label);
                     for &feed_index in &marker.feed_indices {
                         let Some(feed) = feeds.get(feed_index) else {
                             continue;
                         };
+                        let active =
+                            active_url.is_some_and(|url| poll_urls_match(url, feed.poll_url));
+                        let label = if active {
+                            format!("{}  active", feed.id)
+                        } else {
+                            feed.id.to_owned()
+                        };
                         if ui
-                            .button(feed.id)
-                            .on_hover_text(format!("Live-poll {}", feed.poll_url))
+                            .add(egui::Button::selectable(active, label))
+                            .on_hover_text(if active {
+                                format!("Poll {} now", feed.poll_url)
+                            } else {
+                                format!("Switch live poll to {}", feed.poll_url)
+                            })
                             .clicked()
                         {
                             picked = Some(feed);
@@ -33630,7 +34909,7 @@ struct PlacefileDrawList {
 struct HazardOverlayShapes {
     fill_shapes: Vec<egui::Shape>,
     outline_shapes: Vec<egui::Shape>,
-    labels: Vec<(egui::Pos2, String, bool)>,
+    labels: Vec<(egui::Pos2, String, bool, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -33717,6 +34996,10 @@ fn cross_section_smoothing_label(smoothing: CrossSectionSmoothing) -> &'static s
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TextureKey {
     volume_ptr: usize,
+    /// Previous-volume identity participates only in hybrid dealiased renders.
+    /// It prevents a newly available temporal reference from reusing an older
+    /// region-only texture for the same current volume.
+    dealias_reference_volume_ptr: usize,
     cut: usize,
     product: DisplayProduct,
     render_dealiased_velocity: bool,
@@ -33727,6 +35010,20 @@ struct TextureKey {
     dealias_cascade: bool,
     gate_filter_decidbz: i16,
     viewport: ViewportKey,
+}
+
+fn texture_keys_match_data_and_style(left: &TextureKey, right: &TextureKey) -> bool {
+    left.volume_ptr == right.volume_ptr
+        && left.dealias_reference_volume_ptr == right.dealias_reference_volume_ptr
+        && left.cut == right.cut
+        && left.product == right.product
+        && left.render_dealiased_velocity == right.render_dealiased_velocity
+        && left.color_table_signature == right.color_table_signature
+        && left.storm_motion_key == right.storm_motion_key
+        && left.hail_levels_key == right.hail_levels_key
+        && left.smoothing == right.smoothing
+        && left.dealias_cascade == right.dealias_cascade
+        && left.gate_filter_decidbz == right.gate_filter_decidbz
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35019,6 +36316,15 @@ fn hazard_record_list_hover(record: &HazardRecord) -> String {
         .join("\n")
 }
 
+fn new_hazard_label_color(ctx: &egui::Context) -> egui::Color32 {
+    let blink_on = ctx.input(|input| (input.time * 2.4) as i64 % 2 == 0);
+    if blink_on {
+        egui::Color32::from_rgba_unmultiplied(255, 230, 96, 245)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(255, 118, 72, 220)
+    }
+}
+
 fn hazard_focus_view(bbox: [f32; 4]) -> (f32, f32, f32) {
     let west = bbox[0].min(bbox[2]);
     let east = bbox[0].max(bbox[2]);
@@ -35221,6 +36527,7 @@ fn detect_rotation_markers_for_volume(
 #[allow(clippy::too_many_arguments)]
 fn build_preprocessed_plain_cache(
     volume: &RadarVolume,
+    previous_volume: Option<&RadarVolume>,
     cut_index: usize,
     moment: &MomentType,
     dealiased_velocity: bool,
@@ -35238,8 +36545,8 @@ fn build_preprocessed_plain_cache(
         .get(moment)
         .ok_or_else(|| format!("moment {moment:?} missing"))?;
     let mut source = if dealiased_velocity && dealias_cascade {
-        dealias_velocity_grid_cascade(volume, cut_index)
-            .ok_or_else(|| "cascade dealias failed".to_owned())?
+        dealias_velocity_grid_hybrid(volume, cut_index, previous_volume)
+            .ok_or_else(|| "hybrid 3-D + temporal dealias failed".to_owned())?
     } else if dealiased_velocity {
         dealias_velocity_grid(cut, grid)
     } else {
@@ -38351,6 +39658,13 @@ fn hazard_family_order(family: &str) -> u8 {
     }
 }
 
+fn hazard_family_menu_label(family: &str) -> String {
+    HAZARD_FILTER_FAMILIES
+        .iter()
+        .find_map(|(known_family, label)| (*known_family == family).then_some((*label).to_owned()))
+        .unwrap_or_else(|| family.to_owned())
+}
+
 fn hazard_label(
     event_family: &str,
     event_tracking_number: &str,
@@ -38692,6 +40006,84 @@ fn filled_polygon_mesh(points: &[egui::Pos2], fill: egui::Color32) -> Option<egu
     Some(mesh)
 }
 
+fn filled_polygon_with_holes_mesh(
+    outer: &[egui::Pos2],
+    holes: &[Vec<egui::Pos2>],
+    fill: egui::Color32,
+) -> Option<egui::epaint::Mesh> {
+    if fill == egui::Color32::TRANSPARENT {
+        return None;
+    }
+    let outer = cleaned_screen_polygon(outer);
+    if outer.len() < 3 {
+        return None;
+    }
+    let mut rings = Vec::with_capacity(1 + holes.len());
+    rings.push(outer);
+    for hole in holes {
+        let hole = cleaned_screen_polygon(hole);
+        if hole.len() >= 3 {
+            rings.push(hole);
+        }
+    }
+
+    let mut vertices = Vec::new();
+    let mut hole_indices = Vec::new();
+    let mut points = Vec::new();
+    for (ring_index, ring) in rings.iter().enumerate() {
+        if ring_index > 0 {
+            hole_indices.push(points.len());
+        }
+        for point in ring {
+            vertices.push(point.x as f64);
+            vertices.push(point.y as f64);
+            points.push(*point);
+        }
+    }
+    let triangles = earcutr::earcut(&vertices, &hole_indices, 2).ok()?;
+    if triangles.len() < 3 {
+        return None;
+    }
+    let mut mesh = egui::epaint::Mesh::default();
+    for point in &points {
+        mesh.colored_vertex(*point, fill);
+    }
+    for triangle in triangles.chunks_exact(3) {
+        mesh.add_triangle(triangle[0] as u32, triangle[1] as u32, triangle[2] as u32);
+    }
+    Some(mesh)
+}
+
+fn screen_polygon_bbox_intersects(points: &[egui::Pos2], rect: egui::Rect) -> bool {
+    let Some(first) = points.first() else {
+        return false;
+    };
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (first.x, first.y, first.x, first.y);
+    for point in points.iter().skip(1) {
+        min_x = min_x.min(point.x);
+        min_y = min_y.min(point.y);
+        max_x = max_x.max(point.x);
+        max_y = max_y.max(point.y);
+    }
+    egui::Rect::from_min_max(egui::pos2(min_x, min_y), egui::pos2(max_x, max_y)).intersects(rect)
+}
+
+fn draw_outlook_ring(painter: &egui::Painter, screen: &[egui::Pos2], stroke: egui::Stroke) {
+    if screen.len() < 2 {
+        return;
+    }
+    let ring_is_closed = screen
+        .first()
+        .zip(screen.last())
+        .map(|(first, last)| first.distance(*last) <= 0.5)
+        .unwrap_or(false);
+    if ring_is_closed {
+        painter.add(egui::Shape::closed_line(screen.to_vec(), stroke));
+    } else {
+        painter.add(egui::Shape::line(screen.to_vec(), stroke));
+    }
+}
+
 fn cleaned_screen_polygon(points: &[egui::Pos2]) -> Vec<egui::Pos2> {
     let mut cleaned = Vec::<egui::Pos2>::with_capacity(points.len());
     for point in points {
@@ -38893,20 +40285,58 @@ fn low_sweep_cuts_for_product(
     cuts.sort_by_key(|index| {
         cut_start_time_utc(volume, *index).unwrap_or_else(|| volume.volume_time.with_timezone(&Utc))
     });
-    if filter == LowSweepLoopFilter::BaseOnly
-        && let Some(min_elevation) = cuts
-            .iter()
-            .filter_map(|index| volume.cuts.get(*index).map(|cut| cut.elevation_deg))
-            .filter(|elevation| elevation.is_finite())
-            .min_by(|a, b| a.total_cmp(b))
-    {
-        cuts.retain(|index| {
-            volume.cuts.get(*index).is_some_and(|cut| {
-                (cut.elevation_deg - min_elevation).abs()
-                    <= LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG
-            })
-        });
+
+    if filter == LowSweepLoopFilter::All || cuts.len() <= 1 {
+        return cuts;
     }
+
+    // Reported antenna elevations are not exact nominal VCP angles. A base
+    // family can arrive as 0.44, 0.50, or 0.62 degrees across neighboring
+    // scans, so exact-angle filtering creates a visibly jumpy loop. Cluster
+    // by physical elevation first, then retain one complete family while
+    // preserving the original chronological cut order.
+    let mut by_elevation = cuts
+        .iter()
+        .filter_map(|index| {
+            volume
+                .cuts
+                .get(*index)
+                .map(|cut| (*index, cut.elevation_deg))
+                .filter(|(_, elevation)| elevation.is_finite())
+        })
+        .collect::<Vec<_>>();
+    by_elevation.sort_by(|left, right| left.1.total_cmp(&right.1));
+
+    let mut clusters: Vec<(f32, Vec<usize>)> = Vec::new();
+    for (cut_index, elevation) in by_elevation {
+        if let Some((mean, members)) = clusters.last_mut()
+            && (elevation - *mean).abs() <= LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG
+        {
+            let count = members.len() as f32;
+            *mean = (*mean * count + elevation) / (count + 1.0);
+            members.push(cut_index);
+        } else {
+            clusters.push((elevation, vec![cut_index]));
+        }
+    }
+    let Some((_, selected_members)) = (match filter {
+        LowSweepLoopFilter::All => None,
+        LowSweepLoopFilter::BaseOnly => clusters
+            .iter()
+            .min_by(|left, right| left.0.total_cmp(&right.0)),
+        LowSweepLoopFilter::SameLevel => clusters.iter().max_by(|left, right| {
+            left.1
+                .len()
+                .cmp(&right.1.len())
+                // For equal revisit counts, the lower family is the stable
+                // operational choice and matches users' base-tilt intuition.
+                .then_with(|| right.0.total_cmp(&left.0))
+        }),
+    }) else {
+        return cuts;
+    };
+    let selected = selected_members.iter().copied().collect::<BTreeSet<_>>();
+    cuts.retain(|cut| selected.contains(cut));
     cuts
 }
 
@@ -38964,6 +40394,67 @@ fn low_sweep_history_cut_at_or_before(
         }
     }
     best.map(|(_, frame_index, cut)| (frame_index, cut))
+}
+
+fn low_sweep_history_cut_at_or_before_near_elevation(
+    frames: &[FrameHistoryEntry],
+    product: &DisplayProduct,
+    filter: LowSweepLoopFilter,
+    disabled_cuts: &BTreeSet<LowSweepCutKey>,
+    timeline_time: DateTime<Utc>,
+    target_elevation_deg: Option<f32>,
+) -> Option<(usize, usize)> {
+    let Some(target_elevation_deg) = target_elevation_deg else {
+        return low_sweep_history_cut_at_or_before(
+            frames,
+            product,
+            filter,
+            disabled_cuts,
+            timeline_time,
+        );
+    };
+    let elevation_tolerance = LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG * 1.5;
+    let mut matched: Option<(DateTime<Utc>, f32, usize, usize)> = None;
+    let mut fallback: Option<(DateTime<Utc>, usize, usize)> = None;
+    for (frame_index, frame) in frames.iter().enumerate() {
+        for cut in low_sweep_cuts_for_history_entry(frame, product, filter, disabled_cuts) {
+            let cut_time = cut_start_time_utc(frame.volume.as_ref(), cut)
+                .unwrap_or(frame.identity.scan_time_utc);
+            if cut_time > timeline_time {
+                continue;
+            }
+            if fallback
+                .as_ref()
+                .is_none_or(|(best_time, _, _)| cut_time > *best_time)
+            {
+                fallback = Some((cut_time, frame_index, cut));
+            }
+            let Some(elevation) = frame
+                .volume
+                .cuts
+                .get(cut)
+                .map(|cut| cut.elevation_deg)
+                .filter(|elevation| elevation.is_finite())
+            else {
+                continue;
+            };
+            let delta = (elevation - target_elevation_deg).abs();
+            if delta > elevation_tolerance {
+                continue;
+            }
+            let replace = matched
+                .as_ref()
+                .is_none_or(|(best_time, best_delta, _, _)| {
+                    cut_time > *best_time || (cut_time == *best_time && delta < *best_delta)
+                });
+            if replace {
+                matched = Some((cut_time, delta, frame_index, cut));
+            }
+        }
+    }
+    matched
+        .map(|(_, _, frame_index, cut)| (frame_index, cut))
+        .or_else(|| fallback.map(|(_, frame_index, cut)| (frame_index, cut)))
 }
 
 fn low_sweep_cuts_for_volume_identity(
@@ -39173,8 +40664,11 @@ fn should_keep_texture_for_volume_install(
     previous_volume: Option<&RadarVolume>,
     next_volume: &RadarVolume,
     same_volume: bool,
+    retain_same_site_texture: bool,
 ) -> bool {
-    same_volume || previous_volume.is_some_and(|previous| previous.site.id == next_volume.site.id)
+    same_volume
+        || (retain_same_site_texture
+            && previous_volume.is_some_and(|previous| previous.site.id == next_volume.site.id))
 }
 
 fn selected_cut_render_data_unchanged(
@@ -39516,26 +41010,83 @@ fn archive_fetch_count_for_latest_load(
 /// Metadata sidecars are skipped: a field bridge serving latest.json next
 /// to the volumes otherwise wins every lexicographic pick and the poll
 /// "decodes" JSON forever. Directory entries (trailing '/') likewise.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirListVolumeEntry {
+    name: String,
+    signature: String,
+}
+
 fn dir_list_volume_entries_newest_first(listing: &str) -> Vec<String> {
+    dir_list_volume_entry_records_newest_first(listing)
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect()
+}
+
+fn dir_list_volume_entry_records_newest_first(listing: &str) -> Vec<DirListVolumeEntry> {
     const METADATA_EXTENSIONS: &[&str] = &[
         "json", "cfg", "txt", "html", "htm", "xml", "css", "js", "ini", "md", "php", "gis",
     ];
-    let mut entries: Vec<String> = listing
+    let mut entries: Vec<DirListVolumeEntry> = listing
         .lines()
-        .filter_map(|line| line.split_whitespace().last())
-        .filter(|name| !name.is_empty() && !name.ends_with('/'))
-        .filter(|name| {
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let first = parts.next()?;
+            let name = parts.last().unwrap_or(first);
+            if name.is_empty() || name.ends_with('/') {
+                return None;
+            }
             let extension = name
                 .rsplit_once('.')
                 .map(|(_, extension)| extension.to_ascii_lowercase());
-            !matches!(extension, Some(e) if METADATA_EXTENSIONS.contains(&e.as_str()))
+            if matches!(extension, Some(e) if METADATA_EXTENSIONS.contains(&e.as_str())) {
+                return None;
+            }
+            let signature = if first != name && first.chars().all(|ch| ch.is_ascii_digit()) {
+                format!("{first} {name}")
+            } else {
+                name.to_owned()
+            };
+            Some(DirListVolumeEntry {
+                name: name.to_owned(),
+                signature,
+            })
         })
-        .map(str::to_owned)
         .collect();
-    entries.sort();
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
     entries.dedup();
     entries.reverse();
     entries
+}
+
+fn gr2a_listing_with_prefix(base: &str) -> Result<(String, String), String> {
+    let root_listing = data_source::fetch_text(&format!("{base}/dir.list"));
+    match &root_listing {
+        Ok(listing) if !dir_list_volume_entries_newest_first(listing).is_empty() => {
+            Ok((listing.clone(), String::new()))
+        }
+        _ => {
+            let sites = data_source::fetch_text(&format!("{base}/grlevel2.cfg"))
+                .map(|cfg| grlevel2_cfg_sites(&cfg))
+                .unwrap_or_default();
+            match sites.as_slice() {
+                [site] => {
+                    let listing = data_source::fetch_text(&format!("{base}/{site}/dir.list"))
+                        .map_err(|err| format!("{site}/dir.list: {err}"))?;
+                    Ok((listing, format!("{site}/")))
+                }
+                [] => Err(match root_listing {
+                    Ok(_) => "dir.list: no data files listed".to_owned(),
+                    Err(err) => format!("dir.list: {err}"),
+                }),
+                multiple => Err(format!(
+                    "server hosts {} sites ({}) - append one to the URL",
+                    multiple.len(),
+                    multiple.join(", ")
+                )),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -39633,6 +41184,37 @@ fn intl_plan_progress(
         done,
         total,
     }
+}
+
+fn probe_intl_recent_coverage(
+    provider_id: &str,
+    site_id: &str,
+    count: usize,
+) -> IntlCoverageProbeResult {
+    let start = Instant::now();
+    let providers = data_source::international::intl_providers();
+    let provider = providers
+        .iter()
+        .find(|provider| provider.id() == provider_id)
+        .ok_or_else(|| format!("unknown international provider '{provider_id}'"))?;
+    let plans = provider.recent(site_id, count)?;
+    let skip = plans.len().saturating_sub(count);
+    let plans: Vec<_> = plans.into_iter().skip(skip).collect();
+    let first = plans.first();
+    let latest = plans.last();
+    Ok(IntlCoverageProbe {
+        provider_id: provider_id.to_owned(),
+        provider_label: provider.label().to_owned(),
+        site_id: site_id.to_owned(),
+        requested: count,
+        frame_count: plans.len(),
+        first_identity: first.map(|plan| plan.identity.clone()),
+        latest_identity: latest.map(|plan| plan.identity.clone()),
+        first_part_count: first.map(|plan| plan.parts.len()).unwrap_or(0),
+        latest_part_count: latest.map(|plan| plan.parts.len()).unwrap_or(0),
+        checked_at_utc: Utc::now(),
+        elapsed_ms: start.elapsed().as_millis(),
+    })
 }
 
 /// Load Loop for an international feed (field request: the button used to
@@ -39972,6 +41554,128 @@ fn fetch_ord_archive_day_plans(
         return Err(err);
     }
     Ok(scans)
+}
+
+fn fetch_smhi_archive_frame_batch(
+    site_id: &str,
+    date: NaiveDate,
+    hour: Option<u32>,
+    count: usize,
+    label: &str,
+    sender: &mpsc::Sender<AsyncLoadResult>,
+) {
+    let mut plans = match data_source::international::smhi_archive_plans_for_day(site_id, date) {
+        Ok(plans) => plans,
+        Err(err) => {
+            let _ = sender.send(AsyncLoadResult {
+                label: label.to_owned(),
+                update: AsyncLoadUpdate::Final(Err(err)),
+            });
+            return;
+        }
+    };
+    if let Some(hour) = hour {
+        plans.retain(|plan| smhi_identity_hour_utc(&plan.identity) == Some(hour));
+    }
+    if plans.is_empty() {
+        let detail = match hour {
+            Some(hour) => format!("SMHI archive: no scans for {site_id} {date} {hour:02}Z"),
+            None => format!("SMHI archive: no scans for {site_id} {date}"),
+        };
+        let _ = sender.send(AsyncLoadResult {
+            label: label.to_owned(),
+            update: AsyncLoadUpdate::Final(Err(detail)),
+        });
+        return;
+    }
+    let skip = plans.len().saturating_sub(count);
+    let plans: Vec<_> = plans.into_iter().skip(skip).collect();
+    let selected_index = plans.len().saturating_sub(1);
+    fetch_intl_frame_plan_batch(
+        site_id,
+        plans,
+        selected_index,
+        label,
+        "smhi-archive",
+        "SMHI archive",
+        sender,
+    );
+}
+
+fn smhi_identity_hour_utc(identity: &str) -> Option<u32> {
+    let stamp = identity.rsplit('_').next()?;
+    if stamp.len() != 12 || !stamp.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    NaiveDateTime::parse_from_str(stamp, "%Y%m%d%H%M")
+        .ok()
+        .map(|time| time.hour())
+}
+
+fn fetch_intl_frame_plan_batch(
+    site_id: &str,
+    plans: Vec<data_source::international::FramePlan>,
+    selected_index: usize,
+    label: &str,
+    path_prefix: &str,
+    source_prefix: &str,
+    sender: &mpsc::Sender<AsyncLoadResult>,
+) {
+    let total = plans.len();
+    let mut frames = Vec::new();
+    let mut errors = Vec::new();
+    for (index, plan) in plans.iter().enumerate() {
+        let _ = sender.send(AsyncLoadResult {
+            label: label.to_owned(),
+            update: AsyncLoadUpdate::ArchiveProgress(ArchiveLoadProgress {
+                label: label.to_owned(),
+                detail: compact_intl_identity(&plan.identity),
+                done: index,
+                total,
+            }),
+        });
+        let frame_start = Instant::now();
+        match fetch_assemble_intl_plan(plan, site_id) {
+            Ok((identity, volume)) => {
+                frames.push(DecodedLoad {
+                    path: PathBuf::from(format!("{path_prefix}:{identity}")),
+                    volume: Arc::new(volume),
+                    timings: LoadTimings::default().finish(frame_start),
+                    status: FrameStatus::Complete,
+                    source_label: format!("{source_prefix} {site_id} {identity}"),
+                });
+            }
+            Err(err) => errors.push(err),
+        }
+        let _ = sender.send(AsyncLoadResult {
+            label: label.to_owned(),
+            update: AsyncLoadUpdate::ArchiveProgress(ArchiveLoadProgress {
+                label: label.to_owned(),
+                detail: compact_intl_identity(&plan.identity),
+                done: index + 1,
+                total,
+            }),
+        });
+    }
+
+    if frames.is_empty() {
+        let reason = errors
+            .last()
+            .cloned()
+            .unwrap_or_else(|| format!("{source_prefix}: no archive frames decoded"));
+        let _ = sender.send(AsyncLoadResult {
+            label: label.to_owned(),
+            update: AsyncLoadUpdate::Final(Err(reason)),
+        });
+        return;
+    }
+    let _ = sender.send(AsyncLoadResult {
+        label: label.to_owned(),
+        update: AsyncLoadUpdate::Final(Ok(DecodedLoadBatch {
+            selected_index: selected_index.min(frames.len().saturating_sub(1)),
+            frames,
+        })),
+    });
 }
 
 fn fetch_ord_archive_plans_frame_batch(
@@ -40513,22 +42217,52 @@ fn frame_history_entry_from_decoded(decoded: DecodedLoad) -> FrameHistoryEntry {
     }
 }
 
-fn nearest_history_frame_index(
+fn coordinated_observation_is_usable(
+    observation_time: DateTime<Utc>,
+    target_utc: DateTime<Utc>,
+) -> bool {
+    let age_seconds = target_utc
+        .signed_duration_since(observation_time)
+        .num_seconds();
+    (0..=COORDINATED_RADAR_MAX_STALENESS_SECONDS).contains(&age_seconds)
+}
+
+fn history_frame_index_at_or_before(
     history: &[FrameHistoryEntry],
     target_utc: DateTime<Utc>,
+    max_staleness_seconds: i64,
 ) -> Option<usize> {
-    history
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, frame)| {
-            frame
-                .identity
-                .scan_time_utc
-                .signed_duration_since(target_utc)
-                .num_milliseconds()
-                .abs()
+    let index = history
+        .partition_point(|frame| frame.identity.scan_time_utc <= target_utc)
+        .checked_sub(1)?;
+    let frame_time = history.get(index)?.identity.scan_time_utc;
+    let age_seconds = target_utc.signed_duration_since(frame_time).num_seconds();
+    (0..=max_staleness_seconds)
+        .contains(&age_seconds)
+        .then_some(index)
+}
+
+fn displayable_cut_nearest_elevation(
+    volume: &RadarVolume,
+    product: &DisplayProduct,
+    target_elevation_deg: f32,
+) -> Option<usize> {
+    displayable_cuts_for_product(volume, product)
+        .into_iter()
+        .filter(|cut| {
+            volume
+                .cuts
+                .get(*cut)
+                .is_some_and(|cut| cut.elevation_deg.is_finite())
         })
-        .map(|(index, _)| index)
+        .min_by(|left, right| {
+            let left_delta = volume.cuts[*left].elevation_deg - target_elevation_deg;
+            let right_delta = volume.cuts[*right].elevation_deg - target_elevation_deg;
+            left_delta
+                .abs()
+                .total_cmp(&right_delta.abs())
+                .then_with(|| left.cmp(right))
+        })
 }
 
 fn archive_frame_status(volume_time_utc: DateTime<Utc>, now_utc: DateTime<Utc>) -> FrameStatus {
@@ -41601,6 +43335,50 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_dealias_reference_uses_the_last_complete_older_scan() {
+        let start = Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap();
+        let older = Arc::new(test_volume_with_site_time("KTEST", start));
+        let partial = Arc::new(test_volume_with_site_time(
+            "KTEST",
+            start + chrono::Duration::minutes(4),
+        ));
+        let current = Arc::new(test_volume_with_site_time(
+            "KTEST",
+            start + chrono::Duration::minutes(5),
+        ));
+        let frames = vec![
+            FrameHistoryEntry {
+                identity: frame_identity_for_volume(older.as_ref()),
+                path: PathBuf::from("older"),
+                volume: Arc::clone(&older),
+                timings: None,
+                status: FrameStatus::LiveComplete,
+                source_label: "test".to_owned(),
+            },
+            FrameHistoryEntry {
+                identity: frame_identity_for_volume(partial.as_ref()),
+                path: PathBuf::from("partial"),
+                volume: partial,
+                timings: None,
+                status: FrameStatus::LivePartial,
+                source_label: "test".to_owned(),
+            },
+            FrameHistoryEntry {
+                identity: frame_identity_for_volume(current.as_ref()),
+                path: PathBuf::from("current"),
+                volume: Arc::clone(&current),
+                timings: None,
+                status: FrameStatus::LiveComplete,
+                source_label: "test".to_owned(),
+            },
+        ];
+
+        let reference = previous_dealias_reference_volume(&frames, 2, &current)
+            .expect("complete previous volume");
+        assert!(Arc::ptr_eq(&reference, &older));
+    }
+
+    #[test]
     fn cursor_readout_uses_dealiased_velocity_grid_for_dvel() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.volume = Some(Arc::new(test_aliased_velocity_volume()));
@@ -42176,6 +43954,7 @@ mod tests {
         RenderRequest {
             key: TextureKey {
                 volume_ptr: Arc::as_ptr(&volume) as usize,
+                dealias_reference_volume_ptr: 0,
                 cut,
                 product: product.clone(),
                 render_dealiased_velocity: product.render_uses_dealiased_velocity(false),
@@ -42189,6 +43968,7 @@ mod tests {
             },
             pane: 0,
             volume,
+            previous_volume: None,
             cut,
             product: product.clone(),
             render_dealiased_velocity: product.render_uses_dealiased_velocity(false),
@@ -42271,6 +44051,7 @@ mod tests {
 
         let first_pixels = RenderWorkerViewportSignature::new(
             10,
+            0,
             1,
             DisplayProduct::Moment(MomentType::Reflectivity),
             MomentType::Reflectivity,
@@ -42285,6 +44066,7 @@ mod tests {
         );
         let second_pixels = RenderWorkerViewportSignature::new(
             10,
+            0,
             1,
             DisplayProduct::Moment(MomentType::Reflectivity),
             MomentType::Reflectivity,
@@ -42333,6 +44115,7 @@ mod tests {
         let viewport_signature = |smoothing: SmoothingMode| {
             RenderWorkerViewportSignature::new(
                 10,
+                0,
                 1,
                 DisplayProduct::Moment(MomentType::Reflectivity),
                 MomentType::Reflectivity,
@@ -42422,6 +44205,7 @@ mod tests {
         let render = |smoothing: SmoothingMode| {
             let cache = build_preprocessed_plain_cache(
                 &volume,
+                None,
                 0,
                 &MomentType::Reflectivity,
                 false,
@@ -42520,7 +44304,7 @@ mod tests {
     }
 
     #[test]
-    fn radar_overlay_history_syncs_to_nearest_timeline_frame() {
+    fn radar_overlay_history_syncs_to_latest_frame_at_or_before_timeline() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let ctx = egui::Context::default();
         let base = Utc.with_ymd_and_hms(2026, 6, 17, 18, 0, 0).unwrap();
@@ -42541,6 +44325,7 @@ mod tests {
         app.select_history_frame(0, false, &ctx);
 
         let mut layer = RadarOverlayLayer::new(42, RadarSite::new("KOUN"));
+        layer.timeline_sync = true;
         ViewerApp::install_radar_layer_history(
             &mut layer,
             DecodedLoadBatch {
@@ -42576,7 +44361,7 @@ mod tests {
     }
 
     #[test]
-    fn nearest_history_frame_index_picks_closest_scan_time() {
+    fn history_frame_asof_join_never_selects_future_scan() {
         let base = Utc.with_ymd_and_hms(2026, 6, 17, 18, 0, 0).unwrap();
         let history = [0, 5, 10]
             .into_iter()
@@ -42590,12 +44375,29 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(
-            nearest_history_frame_index(&history, base + chrono::Duration::minutes(7)),
+            history_frame_index_at_or_before(
+                &history,
+                base + chrono::Duration::minutes(7),
+                COORDINATED_RADAR_MAX_STALENESS_SECONDS,
+            ),
             Some(1)
         );
         assert_eq!(
-            nearest_history_frame_index(&history, base + chrono::Duration::minutes(9)),
-            Some(2)
+            history_frame_index_at_or_before(
+                &history,
+                base + chrono::Duration::minutes(9),
+                COORDINATED_RADAR_MAX_STALENESS_SECONDS,
+            ),
+            Some(1),
+            "the 18:10 scan must not be shown at 18:09"
+        );
+        assert_eq!(
+            history_frame_index_at_or_before(
+                &history,
+                base - chrono::Duration::seconds(1),
+                COORDINATED_RADAR_MAX_STALENESS_SECONDS,
+            ),
+            None
         );
     }
 
@@ -42746,6 +44548,7 @@ mod tests {
         let request = RenderRequest {
             key: TextureKey {
                 volume_ptr: Arc::as_ptr(&volume) as usize,
+                dealias_reference_volume_ptr: 0,
                 cut: 0,
                 product: DisplayProduct::Moment(MomentType::Reflectivity),
                 render_dealiased_velocity: false,
@@ -42759,6 +44562,7 @@ mod tests {
             },
             pane: 0,
             volume,
+            previous_volume: None,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Reflectivity),
             render_dealiased_velocity: false,
@@ -43407,6 +45211,7 @@ mod tests {
         app.selected_cut = 0;
         let retained_texture_key = TextureKey {
             volume_ptr: 42,
+            dealias_reference_volume_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Reflectivity),
             render_dealiased_velocity: false,
@@ -43502,6 +45307,7 @@ mod tests {
     fn loop_render_context_survives_low_sweep_cut_changes() {
         let first = TextureKey {
             volume_ptr: 42,
+            dealias_reference_volume_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Velocity),
             render_dealiased_velocity: false,
@@ -43594,6 +45400,7 @@ mod tests {
         });
         let current_key = TextureKey {
             volume_ptr: 42,
+            dealias_reference_volume_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Reflectivity),
             render_dealiased_velocity: false,
@@ -45579,6 +47386,88 @@ mod tests {
     }
 
     #[test]
+    fn camera_follow_interpolates_continuously_between_radar_steps() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let first_time = Utc.with_ymd_and_hms(2026, 6, 22, 12, 0, 0).unwrap();
+        let second_time = first_time + chrono::Duration::minutes(3);
+        let first = Arc::new(test_volume_with_site_time("KAAA", first_time));
+        let second = Arc::new(test_volume_with_site_time("KAAA", second_time));
+        app.volume = Some(Arc::clone(&first));
+        app.frame_history = [Arc::clone(&first), second]
+            .into_iter()
+            .enumerate()
+            .map(|(index, volume)| FrameHistoryEntry {
+                identity: frame_identity_for_volume(volume.as_ref()),
+                path: PathBuf::from(format!("smooth-follow-{index}")),
+                volume,
+                timings: None,
+                status: FrameStatus::Complete,
+                source_label: "test".to_owned(),
+            })
+            .collect();
+        app.selected_frame_index = 0;
+        app.history_playing = true;
+        app.last_history_step = Some(Instant::now() - Duration::from_millis(350));
+        app.manual_camera_path = ManualCameraPath {
+            keyframes: vec![
+                ManualCameraKeyframe {
+                    time_utc: first_time,
+                    lat: 30.0,
+                    lon: -90.0,
+                },
+                ManualCameraKeyframe {
+                    time_utc: second_time,
+                    lat: 40.0,
+                    lon: -80.0,
+                },
+            ],
+            follow: true,
+            hide_tracks_during_follow: false,
+        };
+
+        let time = app
+            .continuous_camera_follow_time_utc()
+            .expect("playing follow has a continuous time");
+        let offset_seconds = (time - first_time).num_seconds();
+        assert!((80..=100).contains(&offset_seconds));
+
+        app.maybe_apply_continuous_camera_follow(&egui::Context::default());
+        assert!((app.map_center_lat - 35.0).abs() < 1.0);
+        assert!((app.map_center_lon + 85.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn screen_playback_does_not_freeze_on_same_data_viewport_refinement() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.selected_cut = 0;
+        let volume = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0)],
+            720,
+        ));
+        app.volume = Some(Arc::clone(&volume));
+        let visible_key = test_screen_texture_key(
+            Arc::as_ptr(&volume) as usize,
+            0,
+            app.selected_product.clone(),
+        );
+        app.texture_key = Some(visible_key.clone());
+        app.pending_render_key = Some(TextureKey {
+            viewport: test_viewport_key(1280, 720),
+            ..visible_key
+        });
+
+        assert!(
+            app.primary_screen_loop_texture_ready(),
+            "a pending pan/follow refinement must not stop a correctly selected frame's dwell"
+        );
+        assert!(
+            !app.loop_record_renders_settled(),
+            "recording still waits for the exact pending viewport render"
+        );
+    }
+
+    #[test]
     fn loop_recording_waits_for_extra_pane_render_completion() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.app_settings.grid_pane_count = 2;
@@ -45586,6 +47475,7 @@ mod tests {
         app.sync_extra_panes();
         let pending_key = TextureKey {
             volume_ptr: 42,
+            dealias_reference_volume_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Reflectivity),
             render_dealiased_velocity: false,
@@ -45662,6 +47552,86 @@ mod tests {
             app.selected_frame_index, 0,
             "a ready frame starts its dwell first"
         );
+        assert!(app.last_history_step.is_some());
+
+        app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        app.maybe_advance_history_loop(&ctx);
+        assert_eq!(app.selected_frame_index, 1);
+        assert!(
+            app.texture_key.is_none(),
+            "active playback must not keep painting the previous frame while the next frame renders"
+        );
+    }
+
+    #[test]
+    fn high_speed_primary_playback_waits_for_synced_radar_overlay_texture() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_speed_percent = 400;
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.selected_cut = 0;
+        let first = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0)],
+            720,
+        ));
+        let mut second = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        second.volume_time += chrono::Duration::minutes(3);
+        let second = Arc::new(second);
+        app.volume = Some(Arc::clone(&first));
+        app.frame_history = [Arc::clone(&first), Arc::clone(&second)]
+            .into_iter()
+            .map(|volume| FrameHistoryEntry {
+                identity: frame_identity_for_volume(volume.as_ref()),
+                path: PathBuf::from(format!(
+                    "high-speed-overlay-render-gate-{}",
+                    volume.volume_time.timestamp()
+                )),
+                volume,
+                timings: None,
+                status: FrameStatus::LiveComplete,
+                source_label: "test".to_owned(),
+            })
+            .collect();
+        app.history_playing = true;
+        app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        mark_primary_screen_textures_ready(&mut app);
+
+        let mut layer = RadarOverlayLayer::new(
+            9,
+            RadarSite::new("KBBB").with_location(
+                Some("Overlay".to_owned()),
+                Some(35.0),
+                Some(-97.0),
+            ),
+        );
+        layer.visible = true;
+        layer.volume = Some(Arc::clone(&first));
+        layer.frame_history = app.frame_history.clone();
+        layer.texture_key = Some(test_screen_texture_key(
+            Arc::as_ptr(&second) as usize,
+            0,
+            app.selected_product.clone(),
+        ));
+        app.radar_layers.push(layer);
+        let ctx = egui::Context::default();
+
+        app.maybe_advance_history_loop(&ctx);
+
+        assert_eq!(
+            app.selected_frame_index, 0,
+            "screen playback must hold while a synced radar overlay is still painted on a stale frame"
+        );
+        assert!(
+            app.last_history_step.is_none(),
+            "overlay render wait time must not consume the selected frame's dwell"
+        );
+
+        app.radar_layers[0].texture_key = Some(test_screen_texture_key(
+            Arc::as_ptr(&first) as usize,
+            0,
+            app.selected_product.clone(),
+        ));
+        app.maybe_advance_history_loop(&ctx);
+        assert_eq!(app.selected_frame_index, 0);
         assert!(app.last_history_step.is_some());
 
         app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
@@ -45753,6 +47723,7 @@ mod tests {
         });
         let current_key = TextureKey {
             volume_ptr,
+            dealias_reference_volume_ptr: 0,
             cut: 1,
             product: DisplayProduct::Moment(MomentType::Velocity),
             render_dealiased_velocity: false,
@@ -45797,6 +47768,7 @@ mod tests {
         app.volume = Some(Arc::clone(&volume));
         app.texture_key = Some(TextureKey {
             volume_ptr,
+            dealias_reference_volume_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Reflectivity),
             render_dealiased_velocity: false,
@@ -45823,6 +47795,7 @@ mod tests {
         app.extra_panes[0].cut = Some(1);
         app.extra_panes[0].texture_key = Some(TextureKey {
             volume_ptr,
+            dealias_reference_volume_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Velocity),
             render_dealiased_velocity: false,
@@ -45842,6 +47815,7 @@ mod tests {
 
         app.extra_panes[0].texture_key = Some(TextureKey {
             volume_ptr,
+            dealias_reference_volume_ptr: 0,
             cut: 1,
             product: DisplayProduct::Moment(MomentType::Velocity),
             render_dealiased_velocity: false,
@@ -45871,6 +47845,7 @@ mod tests {
         app.volume = Some(Arc::clone(&new_volume));
         app.texture_key = Some(TextureKey {
             volume_ptr: Arc::as_ptr(&new_volume) as usize,
+            dealias_reference_volume_ptr: 0,
             cut: 0,
             product: app.selected_product.clone(),
             render_dealiased_velocity: false,
@@ -45903,6 +47878,7 @@ mod tests {
         }];
         layer.texture_key = Some(TextureKey {
             volume_ptr: Arc::as_ptr(&old_volume) as usize,
+            dealias_reference_volume_ptr: 0,
             cut: 0,
             product: app.selected_product.clone(),
             render_dealiased_velocity: false,
@@ -45923,6 +47899,7 @@ mod tests {
 
         app.radar_layers[0].texture_key = Some(TextureKey {
             volume_ptr: Arc::as_ptr(&new_volume) as usize,
+            dealias_reference_volume_ptr: 0,
             cut: 0,
             product: app.selected_product.clone(),
             render_dealiased_velocity: false,
@@ -45935,6 +47912,265 @@ mod tests {
             viewport: test_viewport_key(720, 480),
         });
         assert!(app.loop_record_selected_textures_ready(LoopTimelineTarget::Primary));
+    }
+
+    #[test]
+    fn radar_overlay_timeline_sync_clears_stale_texture() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.selected_cut = 0;
+        let first = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0)],
+            720,
+        ));
+        let mut second = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        second.volume_time += chrono::Duration::minutes(3);
+        let second = Arc::new(second);
+        app.volume = Some(Arc::clone(&second));
+        app.selected_frame_index = 1;
+        app.frame_history = [Arc::clone(&first), Arc::clone(&second)]
+            .into_iter()
+            .map(|volume| FrameHistoryEntry {
+                identity: frame_identity_for_volume(volume.as_ref()),
+                path: PathBuf::from(format!(
+                    "overlay-sync-stale-texture-{}",
+                    volume.volume_time.timestamp()
+                )),
+                volume,
+                timings: None,
+                status: FrameStatus::Complete,
+                source_label: "test".to_owned(),
+            })
+            .collect();
+
+        let mut layer = RadarOverlayLayer::new(4, RadarSite::new("KBBB"));
+        layer.visible = true;
+        layer.timeline_sync = true;
+        layer.volume = Some(Arc::clone(&first));
+        layer.frame_history = app.frame_history.clone();
+        layer.selected_frame_index = 0;
+        layer.texture_key = Some(test_screen_texture_key(
+            Arc::as_ptr(&first) as usize,
+            0,
+            app.selected_product.clone(),
+        ));
+        app.radar_layers.push(layer);
+
+        app.sync_radar_overlay_layers_to_timeline(&egui::Context::default());
+
+        assert_eq!(app.radar_layers[0].selected_frame_index, 1);
+        assert!(
+            app.radar_layers[0].texture_key.is_none(),
+            "overlay timeline sync must not keep painting the old frame after changing frames"
+        );
+    }
+
+    #[test]
+    fn coordinated_archive_overlay_is_not_replaced_by_live_auto_refresh() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.realtime_level2_auto_refresh = true;
+        let mut layer = RadarOverlayLayer::new(54, RadarSite::new("KBBB"));
+        layer.timeline_sync = true;
+        layer.last_realtime_level2_refresh = Some(
+            Instant::now() - Duration::from_secs(OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS + 10),
+        );
+        app.radar_layers.push(layer);
+
+        app.maybe_refresh_radar_layers(&egui::Context::default());
+
+        assert!(app.radar_layers[0].load_receiver.is_none());
+        assert!(app.radar_layers[0].timeline_sync);
+    }
+
+    #[test]
+    fn coordinated_one_frame_overlay_never_paints_a_future_final_scan() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.selected_cut = 0;
+        let base = Utc.with_ymd_and_hms(2026, 6, 22, 12, 0, 0).unwrap();
+        let primary = Arc::new(test_volume_with_site_time("KAAA", base));
+        app.volume = Some(Arc::clone(&primary));
+        app.frame_history = vec![FrameHistoryEntry {
+            identity: frame_identity_for_volume(primary.as_ref()),
+            path: PathBuf::from("primary-1200"),
+            volume: primary,
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "test".to_owned(),
+        }];
+
+        let future = Arc::new(test_volume_with_site_time(
+            "KBBB",
+            base + chrono::Duration::minutes(5),
+        ));
+        let mut layer = RadarOverlayLayer::new(55, RadarSite::new("KBBB"));
+        layer.timeline_sync = true;
+        layer.volume = Some(Arc::clone(&future));
+        layer.frame_history = vec![FrameHistoryEntry {
+            identity: frame_identity_for_volume(future.as_ref()),
+            path: PathBuf::from("overlay-final-1205"),
+            volume: Arc::clone(&future),
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "test".to_owned(),
+        }];
+        layer.texture_key = Some(test_screen_texture_key(
+            Arc::as_ptr(&future) as usize,
+            0,
+            app.selected_product.clone(),
+        ));
+        app.radar_layers.push(layer);
+
+        app.sync_radar_overlay_layers_to_timeline(&egui::Context::default());
+
+        assert!(app.radar_layers[0].volume.is_none());
+        assert!(app.radar_layers[0].texture_key.is_none());
+        assert!(app.radar_layers[0].selected_cut.is_none());
+    }
+
+    #[test]
+    fn coordinated_one_frame_overlay_holds_only_within_staleness_budget() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.selected_cut = 0;
+        let base = Utc.with_ymd_and_hms(2026, 6, 22, 12, 0, 0).unwrap();
+        let target = base + chrono::Duration::minutes(8);
+        let primary = Arc::new(test_volume_with_site_time("KAAA", target));
+        app.volume = Some(Arc::clone(&primary));
+        app.frame_history = vec![FrameHistoryEntry {
+            identity: frame_identity_for_volume(primary.as_ref()),
+            path: PathBuf::from("primary-1208"),
+            volume: primary,
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "test".to_owned(),
+        }];
+
+        let overlay = Arc::new(test_volume_with_site_time("KBBB", base));
+        let mut layer = RadarOverlayLayer::new(56, RadarSite::new("KBBB"));
+        layer.timeline_sync = true;
+        layer.frame_history = vec![FrameHistoryEntry {
+            identity: frame_identity_for_volume(overlay.as_ref()),
+            path: PathBuf::from("overlay-1200"),
+            volume: Arc::clone(&overlay),
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "test".to_owned(),
+        }];
+        app.radar_layers.push(layer);
+
+        app.sync_radar_overlay_layers_to_timeline(&egui::Context::default());
+        assert!(app.radar_layers[0].volume.is_some());
+        assert_eq!(app.radar_layers[0].selected_cut, Some(0));
+
+        let stale_primary = Arc::new(test_volume_with_site_time(
+            "KAAA",
+            base + chrono::Duration::seconds(COORDINATED_RADAR_MAX_STALENESS_SECONDS + 1),
+        ));
+        app.volume = Some(Arc::clone(&stale_primary));
+        app.frame_history = vec![FrameHistoryEntry {
+            identity: frame_identity_for_volume(stale_primary.as_ref()),
+            path: PathBuf::from("primary-stale"),
+            volume: stale_primary,
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "test".to_owned(),
+        }];
+        app.sync_radar_overlay_layers_to_timeline(&egui::Context::default());
+        assert!(app.radar_layers[0].volume.is_none());
+    }
+
+    #[test]
+    fn coordinated_low_sweep_overlay_joins_by_cut_time_not_primary_cut_index() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_low_sweeps = true;
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let base = Utc.with_ymd_and_hms(2026, 6, 22, 12, 0, 0).unwrap();
+
+        let mut primary =
+            test_reflectivity_sails_volume_with_radials(&[(0.50, 0), (0.50, 30_000)], 720);
+        primary.site = radar_core::RadarSite::new("KAAA");
+        primary.volume_time = base;
+        let primary = Arc::new(primary);
+        app.selected_cut = 1;
+        app.volume = Some(Arc::clone(&primary));
+        app.frame_history = vec![FrameHistoryEntry {
+            identity: frame_identity_for_volume(primary.as_ref()),
+            path: PathBuf::from("primary-low-sweeps"),
+            volume: primary,
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "test".to_owned(),
+        }];
+
+        let mut overlay =
+            test_reflectivity_sails_volume_with_radials(&[(0.62, 5_000), (0.44, 25_000)], 720);
+        overlay.site = radar_core::RadarSite::new("KBBB");
+        overlay.volume_time = base;
+        let overlay = Arc::new(overlay);
+        let mut layer = RadarOverlayLayer::new(57, RadarSite::new("KBBB"));
+        layer.timeline_sync = true;
+        layer.frame_history = vec![FrameHistoryEntry {
+            identity: frame_identity_for_volume(overlay.as_ref()),
+            path: PathBuf::from("overlay-low-sweeps"),
+            volume: overlay,
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "test".to_owned(),
+        }];
+        app.radar_layers.push(layer);
+
+        app.sync_radar_overlay_layers_to_timeline(&egui::Context::default());
+
+        assert_eq!(app.radar_layers[0].selected_cut, Some(1));
+    }
+
+    #[test]
+    fn coordinated_low_sweep_overlay_prefers_primary_elevation_family_over_newer_other_tilt() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_low_sweeps = true;
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let base = Utc.with_ymd_and_hms(2026, 6, 22, 12, 0, 0).unwrap();
+
+        let mut primary = test_reflectivity_sails_volume_with_radials(&[(0.50, 30_000)], 720);
+        primary.site = radar_core::RadarSite::new("KAAA");
+        primary.volume_time = base;
+        let primary = Arc::new(primary);
+        app.selected_cut = 0;
+        app.volume = Some(Arc::clone(&primary));
+        app.frame_history = vec![FrameHistoryEntry {
+            identity: frame_identity_for_volume(primary.as_ref()),
+            path: PathBuf::from("primary-family"),
+            volume: primary,
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "test".to_owned(),
+        }];
+
+        let mut overlay =
+            test_reflectivity_sails_volume_with_radials(&[(0.48, 5_000), (1.20, 25_000)], 720);
+        overlay.site = radar_core::RadarSite::new("KBBB");
+        overlay.volume_time = base;
+        let overlay = Arc::new(overlay);
+        let mut layer = RadarOverlayLayer::new(58, RadarSite::new("KBBB"));
+        layer.timeline_sync = true;
+        layer.frame_history = vec![FrameHistoryEntry {
+            identity: frame_identity_for_volume(overlay.as_ref()),
+            path: PathBuf::from("overlay-family"),
+            volume: overlay,
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "test".to_owned(),
+        }];
+        app.radar_layers.push(layer);
+
+        app.sync_radar_overlay_layers_to_timeline(&egui::Context::default());
+
+        assert_eq!(
+            app.radar_layers[0].selected_cut,
+            Some(0),
+            "a newer 1.2-degree overlay cut must not replace the primary 0.5-degree family"
+        );
     }
 
     #[test]
@@ -45951,6 +48187,7 @@ mod tests {
         app.volume = Some(Arc::clone(&primary));
         app.texture_key = Some(TextureKey {
             volume_ptr: primary_ptr,
+            dealias_reference_volume_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Velocity),
             render_dealiased_velocity: false,
@@ -45972,6 +48209,7 @@ mod tests {
         app.extra_panes[0].cut = Some(1);
         app.extra_panes[0].texture_key = Some(TextureKey {
             volume_ptr: Arc::as_ptr(&pane_volume) as usize,
+            dealias_reference_volume_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Velocity),
             render_dealiased_velocity: false,
@@ -46009,6 +48247,32 @@ mod tests {
         assert_eq!(
             low_sweep_cuts_for_product(&volume, &product, LowSweepLoopFilter::BaseOnly),
             vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn low_sweep_same_level_keeps_a_repeated_family_despite_angle_drift() {
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let volume = test_reflectivity_sails_volume_with_radials(
+            &[
+                (0.44, 0),
+                (1.18, 15_000),
+                (0.62, 30_000),
+                (1.22, 45_000),
+                (1.19, 60_000),
+            ],
+            720,
+        );
+
+        assert_eq!(
+            low_sweep_cuts_for_product(&volume, &product, LowSweepLoopFilter::SameLevel),
+            vec![1, 3, 4],
+            "same-level mode should keep one repeated physical family rather than exact degree equality"
+        );
+        assert_eq!(
+            low_sweep_cuts_for_product(&volume, &product, LowSweepLoopFilter::BaseOnly),
+            vec![0, 2],
+            "base-only remains the lowest family even when another family repeats more often"
         );
     }
 
@@ -46079,17 +48343,26 @@ mod tests {
         assert!(should_keep_texture_for_volume_install(
             Some(&previous),
             &next,
-            false
+            false,
+            true,
         ));
         assert!(should_keep_texture_for_volume_install(
             Some(&previous),
             &different,
-            true
+            true,
+            false,
         ));
         assert!(!should_keep_texture_for_volume_install(
             Some(&previous),
             &different,
-            false
+            false,
+            true,
+        ));
+        assert!(!should_keep_texture_for_volume_install(
+            Some(&previous),
+            &next,
+            false,
+            false,
         ));
     }
 
@@ -46386,6 +48659,7 @@ mod tests {
             .unwrap();
         app.extra_panes[0].texture_key = Some(TextureKey {
             volume_ptr: old_volume_ptr,
+            dealias_reference_volume_ptr: 0,
             cut: app.extra_panes[0].cut.unwrap_or(0),
             product: app.extra_panes[0].product.clone(),
             render_dealiased_velocity: false,
@@ -47323,6 +49597,7 @@ mod tests {
         app.load_receiver = Some(receiver);
         app.texture_key = Some(TextureKey {
             volume_ptr: 1,
+            dealias_reference_volume_ptr: 0,
             cut: 0,
             product: app.selected_product.clone(),
             render_dealiased_velocity: false,
@@ -47438,6 +49713,48 @@ mod tests {
     }
 
     #[test]
+    fn nearby_coordinated_overlay_sites_returns_nearest_four_for_sync_five() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![
+            RadarSite::new("KAAA").with_location(
+                Some("Primary".to_owned()),
+                Some(35.0),
+                Some(-97.0),
+            ),
+            RadarSite::new("KFFF").with_location(Some("Fifth".to_owned()), Some(35.5), Some(-97.0)),
+            RadarSite::new("KDDD").with_location(Some("Third".to_owned()), Some(35.3), Some(-97.0)),
+            RadarSite::new("TGGG").with_location(
+                Some("Terminal".to_owned()),
+                Some(35.05),
+                Some(-97.0),
+            ),
+            RadarSite::new("KBBB").with_location(Some("First".to_owned()), Some(35.1), Some(-97.0)),
+            RadarSite::new("KEEE").with_location(
+                Some("Fourth".to_owned()),
+                Some(35.4),
+                Some(-97.0),
+            ),
+            RadarSite::new("KCCC").with_location(
+                Some("Second".to_owned()),
+                Some(35.2),
+                Some(-97.0),
+            ),
+        ];
+        app.selected_site_index = 0;
+        app.map_center_lat = 35.0;
+        app.map_center_lon = -97.0;
+        app.unified_player.coordinated_site_radius_km = 100.0;
+
+        let site_ids = app
+            .nearby_coordinated_overlay_sites(STORM_VIDEO_SYNC_OVERLAY_RADARS)
+            .into_iter()
+            .map(|(_, site)| site.level2_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(site_ids, vec!["KBBB", "KCCC", "KDDD", "KEEE"]);
+    }
+
+    #[test]
     fn unified_player_coordinated_overlay_resolution_skips_primary_radar() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.sites = vec![
@@ -47548,6 +49865,16 @@ mod tests {
         assert!(parse_ord_archive_target_utc("2026/05/30", "17", "16").is_err());
         assert!(parse_ord_archive_target_utc("2026-05-30", "24", "16").is_err());
         assert!(parse_ord_archive_target_utc("2026-05-30", "17", "60").is_err());
+    }
+
+    #[test]
+    fn smhi_identity_hour_parser_filters_archive_hours() {
+        assert_eq!(
+            smhi_identity_hour_utc("radar_angelholm_qcvol_202606221735"),
+            Some(17)
+        );
+        assert_eq!(smhi_identity_hour_utc("radar_angelholm_qcvol_latest"), None);
+        assert_eq!(smhi_identity_hour_utc("not-smhi"), None);
     }
 
     #[test]
@@ -47996,6 +50323,24 @@ mod tests {
     }
 
     #[test]
+    fn known_research_feed_pick_forces_fresh_poll_attempt() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let (_sender, receiver) = mpsc::channel();
+        app.poll_rx = Some(receiver);
+        app.poll_active = true;
+        app.poll_last_file = Some("KCRI_20260622_010000".to_owned());
+        app.poll_next = Some(Instant::now() + Duration::from_secs(60));
+
+        app.start_known_feed_poll("https://mesonet-nexrad.agron.iastate.edu/level2/raw/KCRI");
+
+        assert!(app.poll_rx.is_none());
+        assert_eq!(app.poll_last_file, None);
+        assert_eq!(app.poll_next, None);
+        assert!(app.poll_active);
+        assert!(matches!(app.poll_source, PollSource::CustomUrl(_)));
+    }
+
+    #[test]
     fn resolve_marker_click_picks_the_nearest_family_with_conus_winning_ties() {
         use MarkerFamily::*;
         // Nearest across families wins regardless of declaration order.
@@ -48409,6 +50754,21 @@ mod tests {
                 "GAWX_20260615_0609".to_owned(),
                 "GAWX_20260615_0607".to_owned()
             ]
+        );
+    }
+
+    #[test]
+    fn dir_list_signatures_keep_growing_same_name_pollable() {
+        let first = dir_list_volume_entry_records_newest_first("2389 KCRI_20260622_082432.bz2\n");
+        let later =
+            dir_list_volume_entry_records_newest_first("17079978 KCRI_20260622_082432.bz2\n");
+
+        assert_eq!(first[0].name, "KCRI_20260622_082432.bz2");
+        assert_eq!(later[0].name, "KCRI_20260622_082432.bz2");
+        assert_ne!(first[0].signature, later[0].signature);
+        assert_eq!(
+            dir_list_volume_entries_newest_first("2389 KCRI_20260622_082432.bz2\n"),
+            vec!["KCRI_20260622_082432.bz2".to_owned()]
         );
     }
 
@@ -50863,6 +53223,38 @@ mod tests {
     }
 
     #[test]
+    fn outlook_polygon_mesh_keeps_interior_ring_unfilled() {
+        let outer = vec![
+            egui::pos2(0.0, 0.0),
+            egui::pos2(10.0, 0.0),
+            egui::pos2(10.0, 10.0),
+            egui::pos2(0.0, 10.0),
+            egui::pos2(0.0, 0.0),
+        ];
+        let holes = vec![vec![
+            egui::pos2(3.0, 3.0),
+            egui::pos2(7.0, 3.0),
+            egui::pos2(7.0, 7.0),
+            egui::pos2(3.0, 7.0),
+            egui::pos2(3.0, 3.0),
+        ]];
+        let mesh =
+            filled_polygon_with_holes_mesh(&outer, &holes, egui::Color32::from_rgb(255, 255, 0))
+                .expect("donut triangulates");
+        let contains = |point: egui::Pos2| {
+            mesh.indices.chunks_exact(3).any(|triangle| {
+                let a = mesh.vertices[triangle[0] as usize].pos;
+                let b = mesh.vertices[triangle[1] as usize].pos;
+                let c = mesh.vertices[triangle[2] as usize].pos;
+                point_in_triangle(point, a, b, c)
+            })
+        };
+
+        assert!(contains(egui::pos2(1.0, 1.0)));
+        assert!(!contains(egui::pos2(5.0, 5.0)));
+    }
+
+    #[test]
     fn map_projection_equalizes_local_lat_lon_kilometers() {
         let rect = test_map_rect();
         let mut app = test_viewer_app_with_hazards(Vec::new());
@@ -51289,6 +53681,13 @@ mod tests {
             intl_picker_provider: String::new(),
             intl_sites: None,
             intl_sites_rx: None,
+            coverage_provider_id: "smhi".to_owned(),
+            coverage_site_id: "angelholm".to_owned(),
+            coverage_frame_count: DEFAULT_ARCHIVE_FRAME_COUNT,
+            coverage_date_input: String::new(),
+            coverage_hour_input: String::new(),
+            coverage_probe_rx: None,
+            coverage_probe_result: None,
             ord_archive_site_input: String::new(),
             ord_archive_date_input: String::new(),
             ord_archive_hour_input: String::new(),
@@ -51299,6 +53698,7 @@ mod tests {
             community_menu: None,
             spc_data: spc_layers::SpcData::default(),
             spc_outlooks_enabled: Vec::new(),
+            estofex_issue_id: None,
             spc_kinds_memory: Vec::new(),
             spc_reports_enabled: false,
             spc_day: 1,
@@ -51566,6 +53966,7 @@ mod tests {
         app.storm_track_follow = Some(follow);
         let retained_texture_key = TextureKey {
             volume_ptr: 42,
+            dealias_reference_volume_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Reflectivity),
             render_dealiased_velocity: false,
@@ -53293,6 +55694,7 @@ mod tests {
     fn test_viewport_signature(width: u32) -> RenderWorkerViewportSignature {
         RenderWorkerViewportSignature::new(
             1,
+            0,
             width as usize,
             DisplayProduct::Moment(MomentType::Velocity),
             MomentType::Velocity,
@@ -53326,6 +55728,7 @@ mod tests {
     ) -> TextureKey {
         TextureKey {
             volume_ptr,
+            dealias_reference_volume_ptr: 0,
             cut,
             render_dealiased_velocity: product.render_uses_dealiased_velocity(false),
             product,
@@ -53462,6 +55865,7 @@ mod tests {
             rgba: Vec::new(),
             buffer_signature: RenderWorkerViewportSignature::new(
                 1,
+                0,
                 1,
                 DisplayProduct::Moment(MomentType::Velocity),
                 MomentType::Velocity,

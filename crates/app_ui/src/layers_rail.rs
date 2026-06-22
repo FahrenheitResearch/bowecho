@@ -1522,6 +1522,7 @@ impl ViewerApp {
         self.poll_active = true;
         self.poll_last_file = None;
         self.poll_next = None;
+        self.poll_rx = None;
         // An auto-refresh load already in flight would land AFTER the
         // first poll install and wipe the polled frames — drop it.
         self.load_receiver = None;
@@ -1546,6 +1547,300 @@ impl ViewerApp {
     /// automatically once registered in `intl_providers()`). Picking a
     /// site starts the shared poller in Intl mode; Start resumes the
     /// persisted last selection, mirroring the poll URL row.
+    fn coverage_badge(ui: &mut egui::Ui, label: &str, enabled: bool) {
+        let color = if enabled {
+            egui::Color32::from_rgb(108, 190, 132)
+        } else {
+            egui::Color32::from_rgb(118, 126, 138)
+        };
+        ui.colored_label(color, label);
+    }
+
+    pub(crate) fn radar_coverage_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let capabilities = data_source::international::intl_provider_capabilities();
+        if !capabilities
+            .iter()
+            .any(|capability| capability.provider_id == self.coverage_provider_id)
+            && let Some(first) = capabilities.first()
+        {
+            self.coverage_provider_id = first.provider_id.to_owned();
+        }
+
+        let provider_sites = data_source::international::intl_static_sites()
+            .iter()
+            .filter(|site| site.provider_id == self.coverage_provider_id)
+            .collect::<Vec<_>>();
+        if !provider_sites
+            .iter()
+            .any(|site| site.site_id == self.coverage_site_id)
+            && let Some(first) = provider_sites.first()
+        {
+            self.coverage_site_id = first.site_id.clone();
+        }
+
+        let selected_capability = capabilities
+            .iter()
+            .find(|capability| capability.provider_id == self.coverage_provider_id);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Source").on_hover_text(
+                "Choose a provider/site, probe the recent catalog without downloading volumes, then load the same path.",
+            );
+            let provider_text = selected_capability
+                .map(|capability| capability.provider_label)
+                .unwrap_or("Provider");
+            let mut next_provider = self.coverage_provider_id.clone();
+            egui::ComboBox::from_id_salt("coverage_provider_combo")
+                .selected_text(provider_text)
+                .width(168.0)
+                .show_ui(ui, |ui| {
+                    for capability in &capabilities {
+                        ui.selectable_value(
+                            &mut next_provider,
+                            capability.provider_id.to_owned(),
+                            format!("{} ({})", capability.provider_label, capability.country),
+                        );
+                    }
+                });
+            if next_provider != self.coverage_provider_id {
+                self.coverage_provider_id = next_provider;
+                if let Some(first) = data_source::international::intl_static_sites()
+                    .iter()
+                    .find(|site| site.provider_id == self.coverage_provider_id)
+                {
+                    self.coverage_site_id = first.site_id.clone();
+                } else {
+                    self.coverage_site_id.clear();
+                }
+                self.coverage_probe_result = None;
+            }
+
+            let site_text = provider_sites
+                .iter()
+                .find(|site| site.site_id == self.coverage_site_id)
+                .map(|site| format!("{} {}", site.site_id, site.label))
+                .unwrap_or_else(|| "Site".to_owned());
+            let mut next_site = self.coverage_site_id.clone();
+            egui::ComboBox::from_id_salt("coverage_site_combo")
+                .selected_text(site_text)
+                .width((ui.available_width() - 180.0).clamp(130.0, 240.0))
+                .show_ui(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("coverage_site_combo_scroll")
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            for site in &provider_sites {
+                                ui.selectable_value(
+                                    &mut next_site,
+                                    site.site_id.clone(),
+                                    format!("{} - {}", site.site_id, site.label),
+                                );
+                            }
+                        });
+                });
+            if next_site != self.coverage_site_id {
+                self.coverage_site_id = next_site;
+                self.coverage_probe_result = None;
+            }
+
+            ui.label("Frames");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.coverage_frame_count)
+                        .range(1..=crate::MAX_HISTORY_FRAME_LIMIT)
+                        .speed(0.2),
+                )
+                .changed()
+            {
+                self.coverage_frame_count = self
+                    .coverage_frame_count
+                    .clamp(1, crate::MAX_HISTORY_FRAME_LIMIT);
+            }
+        });
+
+        if let Some(capability) = selected_capability {
+            ui.horizontal_wrapped(|ui| {
+                Self::coverage_badge(ui, "Live", capability.live);
+                Self::coverage_badge(ui, "Loop", capability.recent_loop);
+                Self::coverage_badge(ui, "Archive", capability.archive_lookup);
+                ui.weak(format!("{} sites", capability.visible_sites));
+                ui.weak(capability.current_window)
+                    .on_hover_text(capability.upstream_window);
+            });
+            ui.weak(capability.bowecho_status)
+                .on_hover_text(format!("Next unlock: {}", capability.next_unlock));
+        }
+
+        if self.coverage_provider_id == "smhi" {
+            if self.coverage_date_input.is_empty() {
+                self.coverage_date_input = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            }
+            if self.coverage_hour_input.is_empty() {
+                self.coverage_hour_input = chrono::Utc::now().format("%H").to_string();
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label("SMHI UTC");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.coverage_date_input)
+                        .hint_text("YYYY-MM-DD")
+                        .desired_width(88.0),
+                )
+                .on_hover_text("Swedish qcvol archive date");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.coverage_hour_input)
+                        .hint_text("HH")
+                        .desired_width(34.0),
+                )
+                .on_hover_text("UTC hour, 0-23");
+                if ui
+                    .button("Load hour")
+                    .on_hover_text("Load up to Frames scans from this Swedish radar UTC hour")
+                    .clicked()
+                {
+                    match self.coverage_hour_input.trim().parse::<u32>() {
+                        Ok(hour) if hour <= 23 => {
+                            self.start_smhi_coverage_archive_load(Some(hour), ctx);
+                        }
+                        _ => self.status = "SMHI archive hour must be 0-23".to_owned(),
+                    }
+                }
+                if ui
+                    .button("Load day")
+                    .on_hover_text("Load up to Frames newest scans from this Swedish radar UTC day")
+                    .clicked()
+                {
+                    self.start_smhi_coverage_archive_load(None, ctx);
+                }
+            });
+        }
+
+        let busy = self.coverage_probe_rx.is_some();
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!busy, egui::Button::new("Probe"))
+                .on_hover_text("List recent frame plans only; no radar volumes are downloaded")
+                .clicked()
+            {
+                self.start_coverage_probe(ctx);
+            }
+            if busy {
+                ui.spinner();
+            }
+            if ui
+                .button("Use live")
+                .on_hover_text("Start live polling this provider/site")
+                .clicked()
+                && !self.coverage_provider_id.is_empty()
+                && !self.coverage_site_id.is_empty()
+            {
+                self.start_intl_poll(
+                    self.coverage_provider_id.clone(),
+                    self.coverage_site_id.clone(),
+                    ctx,
+                );
+            }
+            if ui
+                .add_enabled(
+                    !busy && self.intl_loop_rx.is_none(),
+                    egui::Button::new("Load loop"),
+                )
+                .on_hover_text(
+                    "Start this site live, then load the selected number of recent frames",
+                )
+                .clicked()
+                && !self.coverage_provider_id.is_empty()
+                && !self.coverage_site_id.is_empty()
+            {
+                self.history_frame_limit = self
+                    .history_frame_limit
+                    .max(self.coverage_frame_count)
+                    .min(crate::MAX_HISTORY_FRAME_LIMIT);
+                self.start_intl_poll(
+                    self.coverage_provider_id.clone(),
+                    self.coverage_site_id.clone(),
+                    ctx,
+                );
+                self.start_intl_loop_load(ctx);
+            }
+            if self.coverage_provider_id == "ord"
+                && ui
+                    .button("List ORD day")
+                    .on_hover_text("Fill the ORD per-site archive controls and list this UTC date")
+                    .clicked()
+            {
+                self.ord_archive_site_input = self.coverage_site_id.clone();
+                if self.ord_archive_date_input.is_empty() {
+                    self.ord_archive_date_input = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                }
+                self.start_ord_archive_day_listing(ctx);
+            }
+        });
+
+        match &self.coverage_probe_result {
+            Some(Ok(probe)) => {
+                let current = probe.provider_id == self.coverage_provider_id
+                    && probe.site_id == self.coverage_site_id;
+                let prefix = if current { "Probe" } else { "Last probe" };
+                ui.weak(format!(
+                    "{prefix}: {}/{} frames in {} ms at {}",
+                    probe.frame_count,
+                    probe.requested,
+                    probe.elapsed_ms,
+                    probe.checked_at_utc.format("%H:%M:%SZ")
+                ));
+                if let Some(first) = &probe.first_identity {
+                    ui.weak(format!(
+                        "First {} ({} part{})",
+                        crate::compact_intl_identity(first),
+                        probe.first_part_count,
+                        if probe.first_part_count == 1 { "" } else { "s" }
+                    ));
+                }
+                if let Some(latest) = &probe.latest_identity {
+                    ui.weak(format!(
+                        "Latest {} ({} part{})",
+                        crate::compact_intl_identity(latest),
+                        probe.latest_part_count,
+                        if probe.latest_part_count == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ));
+                }
+            }
+            Some(Err(message)) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 130, 130),
+                    format!("Probe failed: {message}"),
+                );
+            }
+            None => {}
+        }
+
+        egui::CollapsingHeader::new("Provider capability rows")
+            .id_salt("coverage_provider_rows")
+            .default_open(false)
+            .show(ui, |ui| {
+                for capability in capabilities {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(capability.provider_label);
+                        ui.weak(format!("{} sites", capability.visible_sites));
+                        Self::coverage_badge(ui, "Loop", capability.recent_loop);
+                        Self::coverage_badge(ui, "Archive", capability.archive_lookup);
+                    });
+                    ui.weak(format!(
+                        "{} - upstream: {}",
+                        capability.current_window, capability.upstream_window
+                    ));
+                    ui.weak(format!(
+                        "{}; next: {}",
+                        capability.bowecho_status, capability.next_unlock
+                    ));
+                    ui.add_space(4.0);
+                }
+            });
+    }
+
     fn intl_feeds_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let mut list_provider: Option<String> = None;
         let mut start: Option<(String, String)> = None;
@@ -1704,7 +1999,7 @@ impl ViewerApp {
                     .hint_text("plbrz")
                     .desired_width(58.0),
             )
-            .on_hover_text("Lowercase ORD site code, e.g. plbrz, plleg, eesur, frtou");
+            .on_hover_text("Lowercase ORD site code, e.g. plbrz, plleg, seatv, frtou");
             if ui
                 .small_button("Use active")
                 .on_hover_text("Fill from the currently live-polled ORD radar")

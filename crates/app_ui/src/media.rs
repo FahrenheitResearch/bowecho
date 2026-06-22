@@ -607,9 +607,14 @@ impl ViewerApp {
                     return true;
                 };
                 let product = self.selected_product.clone();
-                let Some(cut) =
+                let cut = if layer.timeline_sync {
+                    layer
+                        .selected_cut
+                        .filter(|cut| crate::is_displayable_on_cut(volume.as_ref(), *cut, &product))
+                } else {
                     crate::display_cut_for_product(volume.as_ref(), self.selected_cut, &product)
-                else {
+                };
+                let Some(cut) = cut else {
                     return true;
                 };
                 layer.texture_key.as_ref().is_some_and(|key| {

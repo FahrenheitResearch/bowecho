@@ -272,7 +272,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -283,7 +283,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -294,11 +294,12 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "app_ui"
-version = "0.25.5"
+version = "0.25.6"
 dependencies = [
  "chrono",
  "color_tables",
  "data_source",
+ "earcutr",
  "eframe",
  "egui_tiles",
  "flate2",
@@ -816,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "0.25.5"
+version = "0.25.6"
 
 [[package]]
 name = "calloop"
@@ -1028,7 +1029,7 @@ checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
 
 [[package]]
 name = "color_tables"
-version = "0.25.5"
+version = "0.25.6"
 
 [[package]]
 name = "colorchoice"
@@ -1226,7 +1227,7 @@ dependencies = [
 
 [[package]]
 name = "data_source"
-version = "0.25.5"
+version = "0.25.6"
 dependencies = [
  "chrono",
  "nexrad_io",
@@ -1348,6 +1349,16 @@ name = "dpi"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
+
+[[package]]
+name = "earcutr"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "afc28d89ac6cb489f679fcf51aaa62b4667bb0fb73a30f1d4d23949069707c07"
+dependencies = [
+ "itertools",
+ "num-traits",
+]
 
 [[package]]
 name = "ecape-rs"
@@ -1673,7 +1684,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3044,7 +3055,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nexrad_io"
-version = "0.25.5"
+version = "0.25.6"
 dependencies = [
  "byteorder",
  "bzip2 0.6.1",
@@ -3971,7 +3982,7 @@ dependencies = [
 
 [[package]]
 name = "product_engine"
-version = "0.25.5"
+version = "0.25.6"
 dependencies = [
  "radar_core",
 ]
@@ -4104,7 +4115,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radar_core"
-version = "0.25.5"
+version = "0.25.6"
 dependencies = [
  "chrono",
  "serde",
@@ -4307,7 +4318,7 @@ dependencies = [
 
 [[package]]
 name = "render2d"
-version = "0.25.5"
+version = "0.25.6"
 dependencies = [
  "chrono",
  "color_tables",
@@ -4480,7 +4491,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4912,7 +4923,7 @@ dependencies = [
 
 [[package]]
 name = "settings"
-version = "0.25.5"
+version = "0.25.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -5125,7 +5136,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5185,7 +5196,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "styles"
-version = "0.25.5"
+version = "0.25.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -5239,7 +5250,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5326,7 +5337,7 @@ checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
 
 [[package]]
 name = "timeline"
-version = "0.25.5"
+version = "0.25.6"
 dependencies = [
  "chrono",
  "serde",
@@ -5587,7 +5598,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6254,7 +6265,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

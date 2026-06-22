@@ -88,6 +88,13 @@ fn effective_spc_outlook_kind(day: u8, kind: &str) -> Option<&'static str> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutlookPolygon {
+    pub outer: Vec<(f32, f32)>,
+    pub holes: Vec<Vec<(f32, f32)>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct OutlookFeature {
     pub label: String,
     #[allow(dead_code)] // long name for the hover card
@@ -100,14 +107,25 @@ pub struct OutlookFeature {
     /// ESTOFEX XML are closed. Raw PTS rings are closed during parsing when
     /// used as the fast live fallback.
     pub fill_enabled: bool,
-    /// Outer rings, (lon, lat).
+    /// Outer rings, (lon, lat), kept for older SPC/PTX code paths and tests.
     pub rings: Vec<Vec<(f32, f32)>>,
+    pub polygons: Vec<OutlookPolygon>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EstofexIssue {
+    pub id: String,
+    pub issued_at: DateTime<Utc>,
+    pub valid_from: DateTime<Utc>,
+    pub valid_to: DateTime<Utc>,
+    pub polygons: Vec<OutlookFeature>,
 }
 
 #[derive(Default)]
 pub struct SpcData {
     /// kind slug -> features (drawn in file order: SPC orders low->high risk).
     pub outlooks: Vec<(String, Vec<OutlookFeature>)>,
+    pub estofex_issues: Vec<EstofexIssue>,
     pub reports: Vec<StormReport>,
     pub fetched_at: Option<Instant>,
     /// Live raw PTS says a newer outlook issue exists than the GeoJSON
@@ -228,7 +246,6 @@ pub fn parse_outlook(text: &str) -> Vec<OutlookFeature> {
         let fill = hex_color(props["fill"].as_str().unwrap_or(""));
         let stroke = hex_color(props["stroke"].as_str().unwrap_or(""));
         let geom = &feature["geometry"];
-        let mut rings: Vec<Vec<(f32, f32)>> = Vec::new();
         let parse_ring = |ring: &serde_json::Value| -> Vec<(f32, f32)> {
             ring.as_array()
                 .map(|points| {
@@ -243,25 +260,44 @@ pub fn parse_outlook(text: &str) -> Vec<OutlookFeature> {
                 })
                 .unwrap_or_default()
         };
+        let parse_polygon = |polygon: &serde_json::Value| -> Option<OutlookPolygon> {
+            let rings = polygon.as_array()?;
+            let outer = parse_ring(rings.first()?);
+            if outer.len() < 3 {
+                return None;
+            }
+            let holes = rings
+                .iter()
+                .skip(1)
+                .map(parse_ring)
+                .filter(|ring| ring.len() >= 3)
+                .collect();
+            Some(OutlookPolygon { outer, holes })
+        };
+        let mut polygons: Vec<OutlookPolygon> = Vec::new();
         match geom["type"].as_str() {
             Some("Polygon") => {
-                if let Some(outer) = geom["coordinates"].get(0) {
-                    rings.push(parse_ring(outer));
+                if let Some(polygon) = parse_polygon(&geom["coordinates"]) {
+                    polygons.push(polygon);
                 }
             }
             Some("MultiPolygon") => {
                 if let Some(polys) = geom["coordinates"].as_array() {
                     for poly in polys {
-                        if let Some(outer) = poly.get(0) {
-                            rings.push(parse_ring(outer));
+                        if let Some(polygon) = parse_polygon(poly) {
+                            polygons.push(polygon);
                         }
                     }
                 }
             }
             _ => {}
         }
+        let mut rings = polygons
+            .iter()
+            .map(|polygon| polygon.outer.clone())
+            .collect::<Vec<_>>();
         rings.retain(|r| r.len() >= 3);
-        if !rings.is_empty() {
+        if !polygons.is_empty() {
             out.push(OutlookFeature {
                 label,
                 label2,
@@ -269,6 +305,7 @@ pub fn parse_outlook(text: &str) -> Vec<OutlookFeature> {
                 stroke,
                 fill_enabled: true,
                 rings,
+                polygons,
             });
         }
     }
@@ -519,6 +556,15 @@ impl PtsFeatureBuilder {
             return None;
         }
         let (fill, stroke) = pts_colors(kind, &self.label);
+        let polygons = self
+            .rings
+            .iter()
+            .cloned()
+            .map(|outer| OutlookPolygon {
+                outer,
+                holes: Vec::new(),
+            })
+            .collect();
         Some(OutlookFeature {
             label2: pts_label2(kind, &self.label),
             label: self.label,
@@ -526,6 +572,7 @@ impl PtsFeatureBuilder {
             stroke,
             fill_enabled: true,
             rings: self.rings,
+            polygons,
         })
     }
 }
@@ -637,10 +684,74 @@ fn attr_value(event: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<S
 struct EstofexAreaBuilder {
     label: String,
     label2: String,
-    ring: Vec<(f32, f32)>,
+    rings: Vec<Vec<(f32, f32)>>,
+    current_ring: Vec<(f32, f32)>,
 }
 
+impl EstofexAreaBuilder {
+    fn finish_ring(&mut self) {
+        if let Some(ring) = close_pts_ring(std::mem::take(&mut self.current_ring)) {
+            self.rings.push(ring);
+        } else {
+            self.current_ring.clear();
+        }
+    }
+
+    fn finish(mut self) -> Option<OutlookFeature> {
+        self.finish_ring();
+        if self.rings.is_empty() {
+            return None;
+        }
+        let polygons = rings_to_polygons_with_holes(self.rings);
+        if polygons.is_empty() {
+            return None;
+        }
+        let rings = polygons
+            .iter()
+            .map(|polygon| polygon.outer.clone())
+            .collect();
+        let (fill, stroke) = estofex_colors(&self.label);
+        Some(OutlookFeature {
+            label: self.label,
+            label2: self.label2,
+            fill,
+            stroke,
+            fill_enabled: true,
+            rings,
+            polygons,
+        })
+    }
+}
+
+#[cfg(test)]
 pub fn parse_estofex_outlook_xml(text: &str) -> Vec<OutlookFeature> {
+    parse_estofex_area_features_xml(text)
+}
+
+pub fn parse_estofex_issue_xml(text: &str, id_hint: Option<&str>) -> Option<EstofexIssue> {
+    let issued_at = estofex_time_tag_value(text, "issue_time")?;
+    let valid_from = estofex_time_tag_value(text, "start_time")?;
+    let valid_to = estofex_time_tag_value(text, "expiry_time")?;
+    if valid_to <= valid_from {
+        return None;
+    }
+    let id = id_hint.map(str::to_owned).unwrap_or_else(|| {
+        format!(
+            "{}-{}",
+            valid_from.format("%Y%m%d%H"),
+            issued_at.format("%Y%m%d%H%M")
+        )
+    });
+    Some(EstofexIssue {
+        id,
+        issued_at,
+        valid_from,
+        valid_to,
+        polygons: parse_estofex_area_features_xml(text),
+    })
+}
+
+fn parse_estofex_area_features_xml(text: &str) -> Vec<OutlookFeature> {
     use quick_xml::events::Event;
 
     let polygon_text = estofex_polygon_fragment(text).unwrap_or(text);
@@ -657,9 +768,15 @@ pub fn parse_estofex_outlook_xml(text: &str) -> Vec<OutlookFeature> {
                     Some(EstofexAreaBuilder {
                         label: label.to_owned(),
                         label2: label2.to_owned(),
-                        ring: Vec::new(),
+                        rings: Vec::new(),
+                        current_ring: Vec::new(),
                     })
                 });
+            }
+            Ok(Event::Start(event)) if estofex_ring_boundary_tag(event.name().as_ref()) => {
+                if let Some(area) = current.as_mut() {
+                    area.finish_ring();
+                }
             }
             Ok(Event::Empty(event)) if event.name().as_ref() == b"point" => {
                 if let Some(area) = current.as_mut() {
@@ -668,23 +785,18 @@ pub fn parse_estofex_outlook_xml(text: &str) -> Vec<OutlookFeature> {
                     let lon =
                         attr_value(&event, b"lon").and_then(|value| value.parse::<f32>().ok());
                     if let (Some(lat), Some(lon)) = (lat, lon) {
-                        area.ring.push((lon, lat));
+                        area.current_ring.push((lon, lat));
                     }
                 }
             }
+            Ok(Event::End(event)) if estofex_ring_boundary_tag(event.name().as_ref()) => {
+                if let Some(area) = current.as_mut() {
+                    area.finish_ring();
+                }
+            }
             Ok(Event::End(event)) if event.name().as_ref() == b"area" => {
-                if let Some(area) = current.take()
-                    && let Some(ring) = close_pts_ring(area.ring)
-                {
-                    let (fill, stroke) = estofex_colors(&area.label);
-                    out.push(OutlookFeature {
-                        label: area.label,
-                        label2: area.label2,
-                        fill,
-                        stroke,
-                        fill_enabled: true,
-                        rings: vec![ring],
-                    });
+                if let Some(area) = current.take().and_then(EstofexAreaBuilder::finish) {
+                    out.push(area);
                 }
             }
             Ok(Event::Eof) => break,
@@ -696,6 +808,163 @@ pub fn parse_estofex_outlook_xml(text: &str) -> Vec<OutlookFeature> {
     out
 }
 
+fn estofex_ring_boundary_tag(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"ring" | b"polygon" | b"contour" | b"path" | b"part" | b"hole"
+    )
+}
+
+fn parse_estofex_time_value(value: &str) -> Option<DateTime<Utc>> {
+    let trimmed = value.trim();
+    let normalized;
+    let value = match trimmed.len() {
+        10 => {
+            normalized = format!("{trimmed}00");
+            normalized.as_str()
+        }
+        12 => trimmed,
+        _ => return None,
+    };
+    chrono::NaiveDateTime::parse_from_str(value, "%Y%m%d%H%M")
+        .ok()
+        .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+}
+
+fn estofex_time_tag_value(text: &str, tag: &str) -> Option<DateTime<Utc>> {
+    let start = text.find(&format!("<{tag}"))?;
+    let tag_text = &text[start..text[start..].find('>').map(|end| start + end)?];
+    let value_start = tag_text
+        .find("value=\"")
+        .map(|index| index + "value=\"".len())?;
+    let value_rest = &tag_text[value_start..];
+    let value_end = value_rest.find('"')?;
+    parse_estofex_time_value(&value_rest[..value_end])
+}
+
+fn rings_to_polygons_with_holes(mut rings: Vec<Vec<(f32, f32)>>) -> Vec<OutlookPolygon> {
+    rings.retain(|ring| ring.len() >= 3);
+    rings.sort_by(|left, right| {
+        ring_area(right)
+            .abs()
+            .partial_cmp(&ring_area(left).abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut polygons: Vec<OutlookPolygon> = Vec::new();
+    for ring in rings {
+        let center = ring_centroid(&ring);
+        if let Some(parent) = polygons.iter_mut().find(|polygon| {
+            ring_contains_point(&polygon.outer, center)
+                && !polygon
+                    .holes
+                    .iter()
+                    .any(|hole| ring_contains_point(hole, center))
+        }) {
+            parent.holes.push(ring);
+        } else {
+            polygons.push(OutlookPolygon {
+                outer: ring,
+                holes: Vec::new(),
+            });
+        }
+    }
+    polygons
+}
+
+fn ring_area(ring: &[(f32, f32)]) -> f32 {
+    if ring.len() < 3 {
+        return 0.0;
+    }
+    let mut area = 0.0;
+    for index in 0..ring.len() {
+        let current = ring[index];
+        let next = ring[(index + 1) % ring.len()];
+        area += current.0 * next.1 - next.0 * current.1;
+    }
+    area * 0.5
+}
+
+fn ring_centroid(ring: &[(f32, f32)]) -> (f32, f32) {
+    let mut sum_lon = 0.0;
+    let mut sum_lat = 0.0;
+    let mut count = 0usize;
+    for &(lon, lat) in ring {
+        sum_lon += lon;
+        sum_lat += lat;
+        count += 1;
+    }
+    let denom = count.max(1) as f32;
+    (sum_lon / denom, sum_lat / denom)
+}
+
+fn ring_contains_point(ring: &[(f32, f32)], point: (f32, f32)) -> bool {
+    if ring.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut previous = ring[ring.len() - 1];
+    for &current in ring {
+        let crosses = (current.1 > point.1) != (previous.1 > point.1);
+        if crosses {
+            let lon_at_lat = (previous.0 - current.0) * (point.1 - current.1)
+                / (previous.1 - current.1)
+                + current.0;
+            if point.0 < lon_at_lat {
+                inside = !inside;
+            }
+        }
+        previous = current;
+    }
+    inside
+}
+
+#[cfg(test)]
+pub fn outlook_polygon_contains_point(polygon: &OutlookPolygon, lon: f32, lat: f32) -> bool {
+    let point = (lon, lat);
+    ring_contains_point(&polygon.outer, point)
+        && !polygon
+            .holes
+            .iter()
+            .any(|hole| ring_contains_point(hole, point))
+}
+
+#[cfg(test)]
+pub fn outlook_feature_contains_point(feature: &OutlookFeature, lon: f32, lat: f32) -> bool {
+    feature
+        .polygons
+        .iter()
+        .any(|polygon| outlook_polygon_contains_point(polygon, lon, lat))
+}
+
+pub fn estofex_issue_valid_at(issue: &EstofexIssue, displayed_time: DateTime<Utc>) -> bool {
+    issue.issued_at <= displayed_time
+        && issue.valid_from <= displayed_time
+        && displayed_time < issue.valid_to
+}
+
+pub fn selected_estofex_issue<'a>(
+    issues: &'a [EstofexIssue],
+    selected_id: Option<&str>,
+    displayed_time: DateTime<Utc>,
+) -> Option<&'a EstofexIssue> {
+    if let Some(selected_id) = selected_id {
+        return issues.iter().find(|issue| issue.id == selected_id);
+    }
+    issues
+        .iter()
+        .filter(|issue| estofex_issue_valid_at(issue, displayed_time))
+        .max_by_key(|issue| issue.issued_at)
+}
+
+pub fn estofex_issue_label(issue: &EstofexIssue) -> String {
+    format!(
+        "{} update - valid {} to {}",
+        issue.issued_at.format("%b %-d %HZ"),
+        issue.valid_from.format("%b %-d %HZ"),
+        issue.valid_to.format("%b %-d %HZ")
+    )
+}
+
 fn estofex_polygon_fragment(text: &str) -> Option<&str> {
     let start = text.find("<area")?;
     let end = text
@@ -705,10 +974,45 @@ fn estofex_polygon_fragment(text: &str) -> Option<&str> {
     (start < end).then(|| &text[start..end])
 }
 
-fn fetch_estofex_outlooks() -> Vec<OutlookFeature> {
-    data_source::fetch_text("https://www.estofex.org/cgi-bin/polygon/showforecast.cgi?xml=yes")
-        .map(|text| parse_estofex_outlook_xml(&text))
+fn fetch_estofex_issues() -> Vec<EstofexIssue> {
+    const BASE: &str = "https://www.estofex.org/cgi-bin/polygon/showforecast.cgi";
+    let mut issues = data_source::fetch_text(&format!("{BASE}?listvalid=yes"))
+        .map(|text| estofex_fcstfiles_from_listing(&text))
         .unwrap_or_default()
+        .into_iter()
+        .filter_map(|fcstfile| {
+            let url = format!("{BASE}?xml=yes&fcstfile={fcstfile}");
+            data_source::fetch_text(&url)
+                .ok()
+                .and_then(|text| parse_estofex_issue_xml(&text, Some(&fcstfile)))
+        })
+        .collect::<Vec<_>>();
+    if issues.is_empty()
+        && let Ok(text) = data_source::fetch_text(&format!("{BASE}?xml=yes"))
+        && let Some(issue) = parse_estofex_issue_xml(&text, None)
+    {
+        issues.push(issue);
+    }
+    issues.sort_by_key(|issue| issue.issued_at);
+    issues.dedup_by(|left, right| left.id == right.id);
+    issues
+}
+
+fn estofex_fcstfiles_from_listing(text: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut rest = text;
+    while let Some(index) = rest.find("fcstfile=") {
+        rest = &rest[index + "fcstfile=".len()..];
+        let end = rest
+            .find(['"', '\'', '&', '<', '>', ')', ' '])
+            .unwrap_or(rest.len());
+        let file = rest[..end].trim();
+        if file.ends_with(".xml") && !files.iter().any(|known| known == file) {
+            files.push(file.to_owned());
+        }
+        rest = &rest[end..];
+    }
+    files
 }
 
 /// The SPC convective day containing `when`: report days run 12Z -> 12Z
@@ -1184,11 +1488,7 @@ pub fn fetch_spc(
         }
     }
     if wants_estofex {
-        let estofex = fetch_estofex_outlooks();
-        if !estofex.is_empty() {
-            data.outlooks
-                .push((ESTOFEX_OUTLOOK_KIND.to_owned(), estofex));
-        }
+        data.estofex_issues = fetch_estofex_issues();
     }
     data.outlook_geojson_lagging = archive_date.is_none()
         && !spc_kinds.is_empty()
@@ -1352,6 +1652,148 @@ PROBABILISTIC OUTLOOK POINTS DAY 3\n\
         assert_eq!(parsed[0].rings[0].first(), parsed[0].rings[0].last());
         assert_eq!(parsed[1].label, "EU TSTM15");
         assert_eq!(parsed[1].stroke, hex_color("#FFFF00"));
+    }
+
+    #[test]
+    fn estofex_interior_rings_remain_holes() {
+        let sample = r#"
+<forecast>
+  <start_time value="2026062206"/>
+  <expiry_time value="2026062306"/>
+  <issue_time value="202606220500"/>
+  <area risktype="15thunder">
+    <ring>
+      <point lat="0.0" lon="0.0"/>
+      <point lat="0.0" lon="10.0"/>
+      <point lat="10.0" lon="10.0"/>
+      <point lat="10.0" lon="0.0"/>
+      <point lat="0.0" lon="0.0"/>
+    </ring>
+    <ring>
+      <point lat="3.0" lon="3.0"/>
+      <point lat="3.0" lon="7.0"/>
+      <point lat="7.0" lon="7.0"/>
+      <point lat="7.0" lon="3.0"/>
+      <point lat="3.0" lon="3.0"/>
+    </ring>
+  </area>
+</forecast>
+"#;
+        let issue = parse_estofex_issue_xml(sample, Some("donut")).expect("issue");
+        let feature = &issue.polygons[0];
+
+        assert_eq!(feature.polygons.len(), 1);
+        assert_eq!(feature.polygons[0].holes.len(), 1);
+        assert_eq!(
+            feature.rings.len(),
+            1,
+            "hole must not become a duplicate label/risk ring"
+        );
+        assert!(outlook_feature_contains_point(feature, 1.0, 1.0));
+        assert!(!outlook_feature_contains_point(feature, 5.0, 5.0));
+    }
+
+    #[test]
+    fn estofex_same_day_updates_are_separately_selectable() {
+        let first = EstofexIssue {
+            id: "early".to_owned(),
+            issued_at: Utc.with_ymd_and_hms(2026, 6, 22, 6, 0, 0).unwrap(),
+            valid_from: Utc.with_ymd_and_hms(2026, 6, 22, 6, 0, 0).unwrap(),
+            valid_to: Utc.with_ymd_and_hms(2026, 6, 23, 6, 0, 0).unwrap(),
+            polygons: Vec::new(),
+        };
+        let second = EstofexIssue {
+            id: "update".to_owned(),
+            issued_at: Utc.with_ymd_and_hms(2026, 6, 22, 18, 0, 0).unwrap(),
+            ..first.clone()
+        };
+        let issues = vec![first, second];
+        let displayed = Utc.with_ymd_and_hms(2026, 6, 22, 19, 0, 0).unwrap();
+
+        assert_eq!(
+            selected_estofex_issue(&issues, None, displayed).map(|issue| issue.id.as_str()),
+            Some("update")
+        );
+        assert_eq!(
+            selected_estofex_issue(&issues, Some("early"), displayed)
+                .map(|issue| issue.id.as_str()),
+            Some("early")
+        );
+    }
+
+    #[test]
+    fn estofex_listing_extracts_distinct_issue_files() {
+        let html = r#"
+<A HREF="/cgi-bin/polygon/showforecast.cgi?text=yes&fcstfile=2026062306_202606211403_1_stormforecast.xml">one</A>
+<IMG SRC="/cgi-bin/polygon/showforecast.cgi?map=yes&fcstfile=2026062306_202606211403_1_stormforecast.xml">
+<A HREF="/cgi-bin/polygon/showforecast.cgi?text=yes&fcstfile=2026062306_202606221800_1_stormforecast.xml">two</A>
+"#;
+
+        assert_eq!(
+            estofex_fcstfiles_from_listing(html),
+            vec![
+                "2026062306_202606211403_1_stormforecast.xml".to_owned(),
+                "2026062306_202606221800_1_stormforecast.xml".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn estofex_auto_issue_expires_at_valid_to() {
+        let issue = EstofexIssue {
+            id: "expires".to_owned(),
+            issued_at: Utc.with_ymd_and_hms(2026, 6, 22, 5, 0, 0).unwrap(),
+            valid_from: Utc.with_ymd_and_hms(2026, 6, 22, 6, 0, 0).unwrap(),
+            valid_to: Utc.with_ymd_and_hms(2026, 6, 23, 6, 0, 0).unwrap(),
+            polygons: Vec::new(),
+        };
+        let issues = vec![issue];
+
+        assert!(
+            selected_estofex_issue(
+                &issues,
+                None,
+                Utc.with_ymd_and_hms(2026, 6, 23, 5, 59, 59).unwrap()
+            )
+            .is_some()
+        );
+        assert!(
+            selected_estofex_issue(
+                &issues,
+                None,
+                Utc.with_ymd_and_hms(2026, 6, 23, 6, 0, 0).unwrap()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn estofex_auto_never_displays_update_before_issue_time() {
+        let issue = EstofexIssue {
+            id: "late-update".to_owned(),
+            issued_at: Utc.with_ymd_and_hms(2026, 6, 22, 18, 0, 0).unwrap(),
+            valid_from: Utc.with_ymd_and_hms(2026, 6, 22, 6, 0, 0).unwrap(),
+            valid_to: Utc.with_ymd_and_hms(2026, 6, 23, 6, 0, 0).unwrap(),
+            polygons: Vec::new(),
+        };
+        let issues = vec![issue];
+
+        assert!(
+            selected_estofex_issue(
+                &issues,
+                None,
+                Utc.with_ymd_and_hms(2026, 6, 22, 17, 59, 59).unwrap()
+            )
+            .is_none()
+        );
+        assert!(
+            selected_estofex_issue(
+                &issues,
+                None,
+                Utc.with_ymd_and_hms(2026, 6, 22, 18, 0, 0).unwrap()
+            )
+            .is_some()
+        );
     }
 
     #[test]

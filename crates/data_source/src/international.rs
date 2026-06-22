@@ -62,7 +62,7 @@ pub use geosphere::GeoSphereProvider;
 pub use kaia::KaiaEstoniaProvider;
 pub use ord::{OrdArchivePlan, OrdProvider, archive_plan_nearest, archive_plans_for_hour};
 pub use shmu::ShmuProvider;
-pub use smhi::SmhiProvider;
+pub use smhi::{SmhiProvider, smhi_archive_plans_for_day};
 
 /// One selectable radar site offered by a provider.
 #[derive(Clone, Debug, PartialEq)]
@@ -222,6 +222,146 @@ pub fn intl_static_sites() -> &'static [IntlSite] {
             .flat_map(|provider| provider.static_sites())
             .collect()
     })
+}
+
+/// User-facing capability summary for one built-in international provider.
+/// This is intentionally conservative: dynamic probe results may prove a
+/// specific site/date works, but these labels describe what BowEcho can offer
+/// predictably from the adapter contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IntlProviderCapability {
+    pub provider_id: &'static str,
+    pub provider_label: &'static str,
+    pub country: &'static str,
+    pub visible_sites: usize,
+    pub live: bool,
+    pub recent_loop: bool,
+    pub archive_lookup: bool,
+    pub current_window: &'static str,
+    pub upstream_window: &'static str,
+    pub bowecho_status: &'static str,
+    pub next_unlock: &'static str,
+}
+
+/// Capability cards for the Data tab coverage explorer and diagnostics. The
+/// site count is read from the same embedded tables that draw markers.
+pub fn intl_provider_capabilities() -> Vec<IntlProviderCapability> {
+    intl_providers()
+        .into_iter()
+        .map(|provider| {
+            let visible_sites = provider.static_sites().len();
+            let (
+                recent_loop,
+                archive_lookup,
+                current_window,
+                upstream_window,
+                bowecho_status,
+                next_unlock,
+            ) = match provider.id() {
+                "smhi" => (
+                    true,
+                    false,
+                    "dated tree, newest N frames",
+                    "year/month/day qcvol tree; observed 2025-2026 by site",
+                    "expanded: Load Loop walks the dated tree",
+                    "add arbitrary date/window picker",
+                ),
+                "fmi" => (
+                    true,
+                    false,
+                    "today + yesterday",
+                    "public ODIM HDF5 archive, roughly 2007-present",
+                    "recent loop only",
+                    "walk historical date prefixes",
+                ),
+                "dmi" => (
+                    false,
+                    false,
+                    "latest only",
+                    "STAC date ranges with pagination",
+                    "latest frame only",
+                    "use STAC date-range queries",
+                ),
+                "geosphere" => (
+                    false,
+                    false,
+                    "latest only",
+                    "rolling ~3 days",
+                    "latest frame only",
+                    "list recent objects by prefix",
+                ),
+                "dwd" => (
+                    false,
+                    false,
+                    "latest only",
+                    "rolling ~2 days",
+                    "latest frame only",
+                    "walk timestamped sweep files",
+                ),
+                "shmu" => (
+                    false,
+                    false,
+                    "latest only",
+                    "observed rolling ~1 month",
+                    "latest frame only",
+                    "list dated directories",
+                ),
+                "chmi" => (
+                    false,
+                    false,
+                    "latest only",
+                    "observed rolling ~89 hours",
+                    "latest frame only",
+                    "list recent ODIM volume files",
+                ),
+                "kaia" => (
+                    true,
+                    false,
+                    "14 days",
+                    "historical repository likely deeper, not guaranteed",
+                    "real in-app recent archive",
+                    "probe longer retention",
+                ),
+                "ord" => (
+                    true,
+                    true,
+                    "rolling 24h + per-site archive lookup",
+                    "ORD single-site archive is partial/opportunistic; OPERA composites separate",
+                    "recent loop and date/hour lookup",
+                    "cache per-site coverage probes",
+                ),
+                "jma" => (
+                    false,
+                    false,
+                    "latest only",
+                    "NICT mirror recent operational tars",
+                    "latest frame only",
+                    "add tar directory scan if needed",
+                ),
+                _ => (
+                    false,
+                    false,
+                    "latest only",
+                    "unknown",
+                    "latest frame only",
+                    "provider-specific probe",
+                ),
+            };
+            IntlProviderCapability {
+                provider_id: provider.id(),
+                provider_label: provider.label(),
+                country: provider.country(),
+                visible_sites,
+                live: true,
+                recent_loop,
+                archive_lookup,
+                current_window,
+                upstream_window,
+                bowecho_status,
+                next_unlock,
+            }
+        })
+        .collect()
 }
 
 /// Process-lifetime memoization of a provider's site catalog.
@@ -583,6 +723,7 @@ impl IntlProvider for JmaProvider {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::collections::BTreeSet;
 
     /// Compile-time proof the trait stays object safe and thread-shareable
     /// (the registry and the poller both rely on `Box<dyn IntlProvider>`
@@ -664,6 +805,40 @@ mod tests {
             assert!(!provider.country().is_empty());
         }
         assert_provider_box_is_send_sync::<dyn IntlProvider>();
+    }
+
+    #[test]
+    fn capability_catalog_tracks_registered_providers() {
+        let provider_ids = intl_providers()
+            .iter()
+            .map(|provider| provider.id())
+            .collect::<BTreeSet<_>>();
+        let capabilities = intl_provider_capabilities();
+        let capability_ids = capabilities
+            .iter()
+            .map(|capability| capability.provider_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(capability_ids, provider_ids);
+        assert!(capabilities.iter().all(|capability| capability.live));
+        assert!(
+            capabilities
+                .iter()
+                .all(|capability| capability.visible_sites > 0)
+        );
+
+        let smhi = capabilities
+            .iter()
+            .find(|capability| capability.provider_id == "smhi")
+            .expect("SMHI capability");
+        assert!(smhi.recent_loop);
+        assert!(smhi.current_window.contains("dated tree"));
+
+        let ord = capabilities
+            .iter()
+            .find(|capability| capability.provider_id == "ord")
+            .expect("ORD capability");
+        assert!(ord.recent_loop);
+        assert!(ord.archive_lookup);
     }
 
     /// Coordinate sanity for every provider's EMBEDDED catalog: each static

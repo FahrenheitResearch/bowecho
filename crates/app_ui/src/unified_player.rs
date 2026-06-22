@@ -34,6 +34,8 @@ pub(crate) struct UnifiedPlayerContext {
     pub(crate) loop_speed_percent: u16,
     pub(crate) loop_speed_options: Vec<u16>,
     pub(crate) low_sweeps_enabled: bool,
+    pub(crate) low_sweep_filter_index: usize,
+    pub(crate) low_sweep_filter_options: Vec<String>,
     pub(crate) auto_sync_warnings: bool,
     pub(crate) warnings_synced_window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     pub(crate) warnings_loaded: bool,
@@ -79,6 +81,7 @@ pub(crate) enum UnifiedPlayerAction {
     SetHistoryFrameLimit(usize),
     SetLoopSpeedPercent(u16),
     SetLowSweepsEnabled(bool),
+    SetLowSweepFilter(usize),
     SetAutoWarningSync(bool),
     SyncWarningsToLoop,
     ReleaseWarningSync,
@@ -100,6 +103,7 @@ pub(crate) enum UnifiedPlayerAction {
     ToggleFreeRecording,
     FindNearbySites,
     AddCoordinatedSitesAsOverlays,
+    SyncNearbyRadarLoops,
     Dock,
 }
 
@@ -383,6 +387,24 @@ impl UnifiedPlayerState {
                 {
                     action = Some(UnifiedPlayerAction::SetLowSweepsEnabled(low_sweeps));
                 }
+                if low_sweeps && !context.low_sweep_filter_options.is_empty() {
+                    let mut filter_index = context
+                        .low_sweep_filter_index
+                        .min(context.low_sweep_filter_options.len() - 1);
+                    egui::ComboBox::from_id_salt("unified_player_low_sweep_filter")
+                        .selected_text(&context.low_sweep_filter_options[filter_index])
+                        .width(92.0)
+                        .show_ui(ui, |ui| {
+                            for (index, label) in
+                                context.low_sweep_filter_options.iter().enumerate()
+                            {
+                                ui.selectable_value(&mut filter_index, index, label);
+                            }
+                        });
+                    if filter_index != context.low_sweep_filter_index {
+                        action = Some(UnifiedPlayerAction::SetLowSweepFilter(filter_index));
+                    }
+                }
             });
 
             ui.separator();
@@ -520,7 +542,7 @@ impl UnifiedPlayerState {
             });
 
             ui.separator();
-            ui.label(egui::RichText::new("Coordinated Sites").strong());
+            ui.label(egui::RichText::new("Radar Sources").strong());
             ui.horizontal_wrapped(|ui| {
                 ui.label("Sites");
                 ui.add(
@@ -542,8 +564,16 @@ impl UnifiedPlayerState {
                 if stable_button(ui, "Find nearby", 92.0, true).clicked() {
                     action = Some(UnifiedPlayerAction::FindNearbySites);
                 }
-                if stable_button(ui, "Add overlays", 104.0, true).clicked() {
+                if stable_button(ui, "Add mosaic", 104.0, true).clicked() {
                     action = Some(UnifiedPlayerAction::AddCoordinatedSitesAsOverlays);
+                }
+                if stable_button(ui, "Mosaic 5", 82.0, true)
+                    .on_hover_text(
+                        "Load the primary radar plus the nearest four radar overlays as a time-coordinated mosaic loop",
+                    )
+                    .clicked()
+                {
+                    action = Some(UnifiedPlayerAction::SyncNearbyRadarLoops);
                 }
             });
 
@@ -568,7 +598,7 @@ impl UnifiedPlayerState {
                         egui::vec2(126.0, CONTROL_HEIGHT),
                         egui::Button::new("Follow strongest"),
                     )
-                    .on_hover_text("Pick the strongest current storm track and keep the camera centered on it")
+                    .on_hover_text("Pick the strongest current storm track and follow it with continuous between-scan camera motion")
                     .clicked()
                 {
                     action = Some(UnifiedPlayerAction::AutoFollowStrongestStorm);
@@ -814,6 +844,12 @@ impl Default for UnifiedPlayerContext {
             loop_speed_percent: 100,
             loop_speed_options: vec![25, 50, 100, 200, 400, 800, 1600, 3200, 6400],
             low_sweeps_enabled: false,
+            low_sweep_filter_index: 0,
+            low_sweep_filter_options: vec![
+                "all low".to_owned(),
+                "same level".to_owned(),
+                "base only".to_owned(),
+            ],
             auto_sync_warnings: false,
             warnings_synced_window: None,
             warnings_loaded: false,

@@ -15,6 +15,7 @@ eframe.workspace = true
 # Dockable workspace tile tree (docs/docking-spike.md: egui_tiles 0.15.0
 # verified compatible with egui 0.34; rerun-io maintained, serde layouts).
 egui_tiles = { version = "0.15", features = ["serde"] }
+earcutr.workspace = true
 image = { workspace = true, features = ["gif"] }
 nexrad_io = { path = "../nexrad_io" }
 radar_core = { path = "../radar_core" }
