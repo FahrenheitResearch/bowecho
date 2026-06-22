@@ -18,17 +18,34 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          notes_file="docs/releases/${GITHUB_REF_NAME}.md"
           if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             echo "Release ${GITHUB_REF_NAME} already exists."
+            if [ -f "$notes_file" ]; then
+              gh release edit "${GITHUB_REF_NAME}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --notes-file "$notes_file"
+            fi
           else
-            gh release create "${GITHUB_REF_NAME}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --title "BowEcho ${GITHUB_REF_NAME}" \
-              --generate-notes
+            release_args=(
+              "${GITHUB_REF_NAME}"
+              --repo "${GITHUB_REPOSITORY}"
+              --title "BowEcho ${GITHUB_REF_NAME}"
+              --draft
+            )
+            if [ -f "$notes_file" ]; then
+              release_args+=(--notes-file "$notes_file")
+            else
+              release_args+=(--generate-notes)
+            fi
+            gh release create "${release_args[@]}"
           fi
 
   build:
@@ -80,11 +97,35 @@ jobs:
       - name: Build release binary
         run: cargo build --release -p app_ui --bin bowecho
 
+      - name: Detect Windows signing secrets
+        id: windows_signing
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TS_ENDPOINT: ${{ secrets.AZURE_TS_ENDPOINT }}
+          AZURE_TS_ACCOUNT: ${{ secrets.AZURE_TS_ACCOUNT }}
+          AZURE_TS_PROFILE: ${{ secrets.AZURE_TS_PROFILE }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$AZURE_TENANT_ID" \
+            && -n "$AZURE_CLIENT_ID" \
+            && -n "$AZURE_CLIENT_SECRET" \
+            && -n "$AZURE_TS_ENDPOINT" \
+            && -n "$AZURE_TS_ACCOUNT" \
+            && -n "$AZURE_TS_PROFILE" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # Signs bowecho.exe via Azure Trusted Signing when the secrets exist
       # (docs/SIGNING.md) — silently skipped until then, so adding the
       # secrets is the ONLY step needed to start shipping signed builds.
       - name: Sign Windows binary (Azure Trusted Signing)
-        if: runner.os == 'Windows' && env.AZURE_TENANT_ID != ''
+        if: runner.os == 'Windows' && steps.windows_signing.outputs.enabled == 'true'
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
@@ -164,13 +205,35 @@ jobs:
           </plist>
           PLIST
 
+      - name: Detect macOS signing secrets
+        id: macos_signing
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          ASC_API_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$MACOS_CERTIFICATE_BASE64" \
+            && -n "$MACOS_CERTIFICATE_PWD" \
+            && -n "$ASC_API_KEY_BASE64" \
+            && -n "$ASC_KEY_ID" \
+            && -n "$ASC_ISSUER_ID" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # Signs + notarizes BowEcho.app when the Apple secrets exist
       # (docs/SIGNING.md) — silently skipped until then, so adding the
       # secrets is the ONLY step needed to ship Gatekeeper-clean builds.
       # Signs + notarizes BowEcho.app with the repo's Developer ID
       # certificate and App Store Connect API key (docs/SIGNING.md).
       - name: Sign and notarize macOS app
-        if: runner.os == 'macOS' && env.MACOS_CERTIFICATE_BASE64 != ''
+        if: runner.os == 'macOS' && steps.macos_signing.outputs.enabled == 'true'
         shell: bash
         env:
           MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
@@ -255,3 +318,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${GITHUB_REF_NAME}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
+
+  publish-release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') && needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publish release after all assets upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${GITHUB_REF_NAME}" --draft=false --repo "${GITHUB_REPOSITORY}"

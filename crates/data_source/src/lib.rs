@@ -519,6 +519,163 @@ pub fn level2_objects_for_date(site: &str, date: NaiveDate) -> Result<Vec<S3Obje
     Ok(objects)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Level2ArchiveWindowRequest {
+    pub start_utc: DateTime<Utc>,
+    pub end_utc: DateTime<Utc>,
+    pub anchor_utc: DateTime<Utc>,
+    pub pad_scans: usize,
+    pub extra_start_scans: usize,
+    pub extra_end_scans: usize,
+    pub max_objects: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Level2ArchiveWindowSelection {
+    pub objects: Vec<S3Object>,
+    pub selected_index: usize,
+}
+
+pub fn level2_objects_for_window(
+    site: &str,
+    request: &Level2ArchiveWindowRequest,
+) -> Result<Level2ArchiveWindowSelection> {
+    let site = site.to_ascii_uppercase();
+    let end_utc = request.end_utc.max(request.start_utc);
+    let mut objects = Vec::new();
+    for date in level2_window_listing_dates(request) {
+        match level2_objects_for_date(&site, date) {
+            Ok(mut listed) => objects.append(&mut listed),
+            Err(err) if err.is_not_found() => {}
+            Err(err) => return Err(err),
+        }
+    }
+    select_level2_objects_for_window(&objects, request).ok_or_else(|| DataSourceError::NoObjects {
+        bucket: LEVEL2_ARCHIVE_BUCKET.to_owned(),
+        prefix: format!(
+            "{} {}..{}",
+            site,
+            request.start_utc.to_rfc3339(),
+            end_utc.to_rfc3339()
+        ),
+    })
+}
+
+fn level2_window_listing_dates(request: &Level2ArchiveWindowRequest) -> Vec<NaiveDate> {
+    let end_utc = request.end_utc.max(request.start_utc);
+    let start_date = request.start_utc.date_naive();
+    let end_date = end_utc.date_naive();
+    // Context scans can live just outside the event's UTC dates. With any pad
+    // request, list one adjacent day on each side so midnight loops can still
+    // include the scan that began before/after the nominal event window.
+    let first_date = if request.pad_scans > 0 {
+        start_date.pred_opt().unwrap_or(start_date)
+    } else {
+        start_date
+    };
+    let last_date = if request.pad_scans > 0 {
+        end_date.succ_opt().unwrap_or(end_date)
+    } else {
+        end_date
+    };
+    let mut dates = Vec::new();
+    let mut date = first_date;
+    while date <= last_date {
+        dates.push(date);
+        let Some(next) = date.succ_opt() else {
+            break;
+        };
+        date = next;
+    }
+    dates
+}
+
+pub fn select_level2_objects_for_window(
+    objects: &[S3Object],
+    request: &Level2ArchiveWindowRequest,
+) -> Option<Level2ArchiveWindowSelection> {
+    if request.max_objects == 0 {
+        return None;
+    }
+    let mut timed = objects
+        .iter()
+        .filter_map(|object| Some((level2_object_time_utc(object)?, object.clone())))
+        .collect::<Vec<_>>();
+    if timed.is_empty() {
+        return None;
+    }
+    timed.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.key.cmp(&right.1.key))
+    });
+    timed.dedup_by(|left, right| left.0 == right.0 && left.1.key == right.1.key);
+
+    let end_utc = request.end_utc.max(request.start_utc);
+    let mut start = object_active_at_or_before(&timed, request.start_utc);
+    let end = object_active_at_or_before(&timed, end_utc).max(start);
+    start = start.saturating_sub(request.pad_scans + request.extra_start_scans);
+    let end = (end + request.pad_scans + request.extra_end_scans).min(timed.len() - 1);
+    if end + 1 - start > request.max_objects {
+        start = end + 1 - request.max_objects;
+    }
+    let objects = timed[start..=end]
+        .iter()
+        .map(|(_, object)| object.clone())
+        .collect::<Vec<_>>();
+    let selected_index = objects
+        .iter()
+        .enumerate()
+        .filter_map(|(index, object)| {
+            Some((
+                index,
+                (level2_object_time_utc(object)? - request.anchor_utc)
+                    .num_milliseconds()
+                    .unsigned_abs(),
+            ))
+        })
+        .min_by_key(|(_, distance)| *distance)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    Some(Level2ArchiveWindowSelection {
+        objects,
+        selected_index,
+    })
+}
+
+fn object_active_at_or_before(timed: &[(DateTime<Utc>, S3Object)], target: DateTime<Utc>) -> usize {
+    timed
+        .partition_point(|(time, _)| *time <= target)
+        .saturating_sub(1)
+}
+
+pub fn level2_object_time_utc(object: &S3Object) -> Option<DateTime<Utc>> {
+    parse_level2_object_time_utc(&object.key)
+}
+
+fn parse_level2_object_time_utc(key: &str) -> Option<DateTime<Utc>> {
+    let name = key.rsplit('/').next()?;
+    let underscore = name.find('_')?;
+    if underscore < 8 || name.len() < underscore + 7 {
+        return None;
+    }
+    let date = &name[underscore - 8..underscore];
+    let time = &name[underscore + 1..underscore + 7];
+    if !date.bytes().all(|byte| byte.is_ascii_digit())
+        || !time.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let naive = NaiveDate::parse_from_str(date, "%Y%m%d")
+        .ok()?
+        .and_hms_opt(
+            time[0..2].parse().ok()?,
+            time[2..4].parse().ok()?,
+            time[4..6].parse().ok()?,
+        )?;
+    Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+}
+
 pub fn recent_level2_objects(
     site: &str,
     days_back: i64,
@@ -1553,6 +1710,135 @@ mod tests {
     }
 
     #[test]
+    fn level2_object_time_parses_plain_and_compressed_archive_keys() {
+        assert_eq!(
+            parse_level2_object_time_utc("2026/06/09/KTLX/KTLX20260609_235423_V06")
+                .expect("plain key")
+                .to_rfc3339(),
+            "2026-06-09T23:54:23+00:00"
+        );
+        assert_eq!(
+            parse_level2_object_time_utc("2011/04/27/KBMX/KBMX20110427_221510_V03.gz")
+                .expect("compressed key")
+                .to_rfc3339(),
+            "2011-04-27T22:15:10+00:00"
+        );
+        assert!(parse_level2_object_time_utc("bad-key").is_none());
+    }
+
+    #[test]
+    fn archive_window_selection_pads_caps_and_keeps_tail() {
+        let objects = test_level2_objects(
+            "KTLX",
+            &[
+                "200000", "200500", "201000", "201500", "202000", "202500", "203000",
+            ],
+        );
+        let request = Level2ArchiveWindowRequest {
+            start_utc: test_time("20260609", "200800"),
+            end_utc: test_time("20260609", "202300"),
+            anchor_utc: test_time("20260609", "201500"),
+            pad_scans: 1,
+            extra_start_scans: 0,
+            extra_end_scans: 0,
+            max_objects: 4,
+        };
+
+        let selected = select_level2_objects_for_window(&objects, &request).expect("selection");
+
+        assert_eq!(selected.objects.len(), 4);
+        assert!(selected.objects[0].key.contains("_201000_"));
+        assert!(selected.objects[3].key.contains("_202500_"));
+        assert_eq!(selected.selected_index, 1);
+    }
+
+    #[test]
+    fn archive_window_selection_can_span_midnight() {
+        let objects = vec![
+            test_level2_object("KTLX", "20260609", "235500"),
+            test_level2_object("KTLX", "20260610", "000200"),
+            test_level2_object("KTLX", "20260610", "000700"),
+        ];
+        let request = Level2ArchiveWindowRequest {
+            start_utc: test_time("20260609", "235900"),
+            end_utc: test_time("20260610", "000300"),
+            anchor_utc: test_time("20260610", "000100"),
+            pad_scans: 0,
+            extra_start_scans: 0,
+            extra_end_scans: 0,
+            max_objects: 10,
+        };
+
+        let selected = select_level2_objects_for_window(&objects, &request).expect("selection");
+
+        assert_eq!(selected.objects.len(), 2);
+        assert!(selected.objects[0].key.contains("20260609_235500"));
+        assert!(selected.objects[1].key.contains("20260610_000200"));
+        assert_eq!(selected.selected_index, 1);
+    }
+
+    #[test]
+    fn archive_window_selection_supports_asymmetric_extra_scans() {
+        let objects = test_level2_objects(
+            "KTLX",
+            &[
+                "195000", "195500", "200000", "200500", "201000", "201500", "202000", "202500",
+                "203000",
+            ],
+        );
+        let request = Level2ArchiveWindowRequest {
+            start_utc: test_time("20260609", "200600"),
+            end_utc: test_time("20260609", "201600"),
+            anchor_utc: test_time("20260609", "201000"),
+            pad_scans: 0,
+            extra_start_scans: 2,
+            extra_end_scans: 1,
+            max_objects: 10,
+        };
+
+        let selected = select_level2_objects_for_window(&objects, &request).expect("selection");
+
+        assert_eq!(
+            selected
+                .objects
+                .iter()
+                .filter_map(level2_object_time_utc)
+                .map(|time| time.format("%H%M%S").to_string())
+                .collect::<Vec<_>>(),
+            vec!["195500", "200000", "200500", "201000", "201500", "202000"]
+        );
+        assert_eq!(selected.selected_index, 3);
+    }
+
+    #[test]
+    fn archive_window_listing_dates_include_adjacent_days_for_padding() {
+        let mut request = Level2ArchiveWindowRequest {
+            start_utc: test_time("20260610", "000200"),
+            end_utc: test_time("20260610", "000700"),
+            anchor_utc: test_time("20260610", "000200"),
+            pad_scans: 0,
+            extra_start_scans: 0,
+            extra_end_scans: 0,
+            max_objects: 10,
+        };
+
+        assert_eq!(
+            level2_window_listing_dates(&request),
+            vec![NaiveDate::from_ymd_opt(2026, 6, 10).unwrap()]
+        );
+
+        request.pad_scans = 1;
+        assert_eq!(
+            level2_window_listing_dates(&request),
+            vec![
+                NaiveDate::from_ymd_opt(2026, 6, 9).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 6, 10).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 6, 11).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
     fn fallback_has_many_sites() {
         assert!(fallback_sites().len() > 150);
     }
@@ -1726,5 +2012,41 @@ mod tests {
             complete: chunks.last().is_some_and(|chunk| chunk.chunk_type.is_end()),
             chunks,
         }
+    }
+
+    fn test_level2_objects(site: &str, times: &[&str]) -> Vec<S3Object> {
+        times
+            .iter()
+            .map(|time| test_level2_object(site, "20260609", time))
+            .collect()
+    }
+
+    fn test_level2_object(site: &str, date: &str, time: &str) -> S3Object {
+        S3Object {
+            key: format!(
+                "{}/{}/{}/{}/{}{}_{}_V06",
+                &date[0..4],
+                &date[4..6],
+                &date[6..8],
+                site,
+                site,
+                date,
+                time
+            ),
+            size: 100,
+            last_modified: None,
+        }
+    }
+
+    fn test_time(date: &str, time: &str) -> DateTime<Utc> {
+        let naive = NaiveDate::parse_from_str(date, "%Y%m%d")
+            .expect("test date")
+            .and_hms_opt(
+                time[0..2].parse().expect("hour"),
+                time[2..4].parse().expect("minute"),
+                time[4..6].parse().expect("second"),
+            )
+            .expect("test time");
+        DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)
     }
 }

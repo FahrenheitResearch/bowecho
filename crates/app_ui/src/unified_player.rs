@@ -107,7 +107,7 @@ impl Default for UnifiedPlayerState {
     fn default() -> Self {
         Self {
             open: false,
-            auto_sync_warnings: true,
+            auto_sync_warnings: false,
             start_date_input: String::new(),
             start_hour_input: String::new(),
             start_minute_input: String::new(),
@@ -649,8 +649,10 @@ impl UnifiedPlayerState {
             ui.horizontal_wrapped(|ui| {
                 let mut auto_sync = context.auto_sync_warnings;
                 if ui
-                    .checkbox(&mut auto_sync, "Auto sync")
-                    .on_hover_text("Keep warning polygons tied to the loaded timeline range")
+                    .checkbox(&mut auto_sync, "Auto sync archive")
+                    .on_hover_text(
+                        "Keep warning polygons tied to archive loops. Live-follow radar always keeps current warnings",
+                    )
                     .changed()
                 {
                     action = Some(UnifiedPlayerAction::SetAutoWarningSync(auto_sync));
@@ -812,7 +814,7 @@ impl Default for UnifiedPlayerContext {
             loop_speed_percent: 100,
             loop_speed_options: vec![25, 50, 100, 200, 400, 800, 1600, 3200, 6400],
             low_sweeps_enabled: false,
-            auto_sync_warnings: true,
+            auto_sync_warnings: false,
             warnings_synced_window: None,
             warnings_loaded: false,
             warnings_loading: false,
@@ -923,6 +925,12 @@ mod tests {
 
         assert_eq!(start.to_rfc3339(), "2026-06-17T22:05:00+00:00");
         assert_eq!(end.to_rfc3339(), "2026-06-18T01:30:00+00:00");
+    }
+
+    #[test]
+    fn warning_auto_sync_is_opt_in() {
+        assert!(!UnifiedPlayerState::default().auto_sync_warnings);
+        assert!(!UnifiedPlayerContext::default().auto_sync_warnings);
     }
 
     #[test]

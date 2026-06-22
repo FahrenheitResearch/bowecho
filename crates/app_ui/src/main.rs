@@ -34,6 +34,7 @@ use serde::Deserialize;
 mod annotate;
 mod basemap_data;
 mod basemap_towns;
+mod data_packs;
 mod dock;
 mod event_explorer;
 mod event_loop_builder;
@@ -103,6 +104,9 @@ const LOOP_PREWARM_PLAYING_LOOKAHEAD_FRAMES: usize = 24;
 const LOOP_PREWARM_IDLE_LOOKAHEAD_FRAMES: usize = 4;
 const LOOP_PREWARM_RENDER_PANE: usize = usize::MAX;
 const LOOP_PREWARM_INTERACTION_PAUSE_MS: u64 = 250;
+/// While playback is waiting for the selected native-resolution texture, poll
+/// the render worker promptly instead of advancing the timeline past it.
+const LOOP_RENDER_WAIT_POLL_MS: u64 = 8;
 const LOW_CORE_PREVIEW_THREADS: usize = 4;
 const LOW_CORE_PREVIEW_RENDER_HEAD_START_MS: u64 = 8;
 const ACTIVE_LOAD_POLL_MS: u64 = 50;
@@ -116,7 +120,10 @@ const ALGO_FRAME_CACHE_LIMIT: usize = 96;
 /// preview frames can be 10000 px wide, so cap the player preview well
 /// below the hard limit before egui uploads it.
 const MAX_SAT_PLAYER_TEXTURE_DIM: usize = 4096;
-const LIVE_HAZARD_REFRESH_SECONDS: u64 = 60;
+/// Current NWS alerts are one lightweight request. The NWS Alerts Web Service
+/// recommends polling no more often than every 30 seconds; overlapping loads
+/// are already prevented by `hazard_receiver.is_some()`.
+const LIVE_HAZARD_REFRESH_SECONDS: u64 = 30;
 const TIMELINE_REPORT_TRAILING_MINUTES: i64 = 90;
 const TIMELINE_REPORT_LEAD_SECONDS: i64 = 90;
 const PRIMARY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 1;
@@ -369,8 +376,8 @@ struct CustomGisSite {
     longitude_deg: f32,
 }
 const LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG: f32 = 1.4;
-const LIVE_LOW_LEVEL_AUTO_ADVANCE_MIN_SECONDS: i64 = 60;
-const FAST_LOW_SWEEP_AUTO_ADVANCE_MIN_SECONDS: i64 = 1;
+const MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS: u16 = 1;
+const MAX_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS: u16 = 180;
 const LIVE_COMPLETE_LOW_LEVEL_TILT_MIN_RADIALS: usize = 720;
 const LIVE_COMPLETE_TERMINAL_LOW_LEVEL_TILT_MIN_RADIALS: usize = 360;
 const LIVE_COMPLETE_TILT_MIN_RADIALS: usize = 360;
@@ -383,16 +390,24 @@ const HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM: usize = 6;
 /// 60 s, not the custom URL poll's 15 s dir.list cadence.
 const INTL_POLL_SECONDS: u64 = 60;
 const ACTIVE_ALERTS_URL: &str = "https://api.weather.gov/alerts/active?status=actual";
+#[cfg(test)]
+#[allow(dead_code)]
 const SPC_MD_INDEX_URL: &str = "https://www.spc.noaa.gov/products/md/";
+#[cfg(test)]
+#[allow(dead_code)]
 const SPC_PRODUCT_BASE_URL: &str = "https://www.spc.noaa.gov";
 const NWS_PRODUCT_API_BASE_URL: &str = "https://api.weather.gov/products/types";
 const HOT_TEXT_PRODUCT_TYPES: &[&str] = &["TOR", "SVR", "SVS", "FFW", "FFS", "SMW", "SQW"];
+#[cfg(test)]
 const HOT_TEXT_PRODUCTS_MIN_PER_TYPE: usize = 4;
+#[cfg(test)]
 const HOT_TEXT_PRODUCTS_MAX_PER_TYPE: usize = 16;
+#[cfg(test)]
 const HOT_TEXT_PRODUCTS_RECENT_WINDOW_MINUTES: i64 = 60;
 const EVENT_LOOP_HAZARD_PRODUCTS_MAX_PER_TYPE: usize = 96;
 const EVENT_LOOP_HAZARD_PRODUCT_PAD_MINUTES: i64 = 180;
 const EVENT_LOOP_HAZARD_PRODUCT_FUTURE_PAD_MINUTES: i64 = 15;
+const EVENT_LOOP_ACTIVE_ALERT_MERGE_LAG_MINUTES: i64 = 90;
 const HOT_TEXT_DETAIL_CACHE_MAX: usize = 512;
 const HAZARD_CLICK_TOLERANCE_PX: f32 = 12.0;
 const HAZARD_LABEL_CLICK_RADIUS_PX: f32 = 18.0;
@@ -1100,6 +1115,7 @@ struct ViewerApp {
     frame_history: Vec<FrameHistoryEntry>,
     selected_frame_index: usize,
     low_sweep_disabled_cuts: BTreeSet<LowSweepCutKey>,
+    manual_primary_cut_hold: Option<LowSweepCutKey>,
     loop_timeline_summary_cache: std::cell::RefCell<Option<LoopTimelineSummaryCache>>,
     /// Raster tile basemap (satellite/streets/topo) under the radar.
     tile_layer: std::cell::RefCell<tiles::TileLayer>,
@@ -1261,6 +1277,11 @@ struct ViewerApp {
     /// One-shot debug launcher focus: after the requested archive object
     /// lands, switch to the known product/cut/view for the repro case.
     pending_debug_archive_case: Option<DebugArchiveCase>,
+    /// One-shot data pack scene: after the selected archive window lands,
+    /// apply the curated layout, products, map focus, and playback.
+    pending_data_pack_scene: Option<data_packs::DataPackScene>,
+    data_pack_expanded: BTreeSet<String>,
+    loaded_data_pack: Option<data_packs::LoadedDataPack>,
     /// Production model download: rw-ui DownloadPanel + the ported
     /// IngestWorker harness (live estimates, per-hour stage chips, probe,
     /// cancel — the full rusty-weather download workflow).
@@ -1428,6 +1449,9 @@ struct ViewerApp {
     /// When set, warning visibility is evaluated against the currently
     /// displayed radar frame time so archive-loop warnings pop in/out.
     event_loop_hazard_window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// Archive-window warning load requested but not installed yet. Keep the
+    /// current overlay/window visible until the replacement is complete.
+    pending_event_loop_hazard_window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     /// GLM lightning layer (in-process rw-glm follow + time-synced draw).
     glm: Option<glm_layer::GlmWorker>,
     glm_secondary: Option<glm_layer::GlmWorker>,
@@ -4832,6 +4856,7 @@ impl ViewerApp {
             frame_history: Vec::new(),
             selected_frame_index: 0,
             low_sweep_disabled_cuts: BTreeSet::new(),
+            manual_primary_cut_hold: None,
             loop_timeline_summary_cache: std::cell::RefCell::new(None),
             tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(settings::tile_cache_dir())),
             basemap_style: tiles::TileStyle::DarkVector,
@@ -4847,7 +4872,7 @@ impl ViewerApp {
             bind_palette_to_product: false,
             table_editor: table_editor::TableEditor::default(),
             flip_velocity_color_polarity: false,
-            unfold_velocity_display: true,
+            unfold_velocity_display: false,
             color_table_target: ColorTableFamily::Velocity,
             color_table_path_text: String::new(),
             color_table_status:
@@ -4936,6 +4961,9 @@ impl ViewerApp {
             spc_receiver: None,
             archive_pending_event: None,
             pending_debug_archive_case: None,
+            pending_data_pack_scene: None,
+            data_pack_expanded: BTreeSet::new(),
+            loaded_data_pack: None,
             ingest: None,
             download_panel: rw_ui::DownloadPanel::new(default_download_spec(&restored_model_slug)),
             sat: None,
@@ -5023,6 +5051,7 @@ impl ViewerApp {
             event_loop_builder: event_loop_builder::EventLoopBuilderState::default(),
             unified_player: unified_player::UnifiedPlayerState::default(),
             event_loop_hazard_window: None,
+            pending_event_loop_hazard_window: None,
             glm_enabled: restored_overlays.3,
             oa_rx: None,
             oa_last_summary: None,
@@ -5175,6 +5204,7 @@ impl ViewerApp {
             return;
         }
         self.event_loop_hazard_window = None;
+        self.pending_event_loop_hazard_window = None;
         let query_time_utc = Utc::now();
         let (sender, receiver) = mpsc::channel();
         self.hazard_receiver = Some(receiver);
@@ -5193,6 +5223,34 @@ impl ViewerApp {
         ctx.request_repaint_after(Duration::from_millis(25));
     }
 
+    fn switch_to_live_hazard_mode(&mut self) {
+        let clear_timeline_overlay = self.event_loop_hazard_window.is_some()
+            || self.pending_event_loop_hazard_window.is_some()
+            || self.hazard_overlay.as_ref().is_some_and(|overlay| {
+                overlay.source_label.contains("archive")
+                    || overlay.source_label.contains("timeline")
+                    || overlay.source_label.contains("window")
+            });
+        self.unified_player.auto_sync_warnings = false;
+        self.event_loop_hazard_window = None;
+        self.pending_event_loop_hazard_window = None;
+        self.hazards_active_only = true;
+        self.live_hazard_auto_refresh = true;
+        self.last_live_hazard_refresh = None;
+        if clear_timeline_overlay {
+            self.hazard_overlay = None;
+            self.selected_hazard_index = None;
+            self.unacknowledged_hazard_event_ids.clear();
+            self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
+        }
+    }
+
+    fn refresh_live_hazards_manually(&mut self, ctx: &egui::Context) {
+        self.hazard_receiver = None;
+        self.switch_to_live_hazard_mode();
+        self.load_live_hazards(ctx);
+    }
+
     fn load_event_loop_hazards(
         &mut self,
         start_utc: DateTime<Utc>,
@@ -5200,11 +5258,7 @@ impl ViewerApp {
         ctx: &egui::Context,
     ) {
         let replaced_active_load = self.hazard_receiver.take().is_some();
-        self.event_loop_hazard_window = Some((start_utc, end_utc));
-        self.hazard_overlay = None;
-        self.selected_hazard_index = None;
-        self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
-        self.unacknowledged_hazard_event_ids.clear();
+        self.pending_event_loop_hazard_window = Some((start_utc, end_utc));
         self.last_live_hazard_refresh = None;
         let (sender, receiver) = mpsc::channel();
         self.hazard_receiver = Some(receiver);
@@ -5237,6 +5291,7 @@ impl ViewerApp {
             return;
         }
         self.event_loop_hazard_window = None;
+        self.pending_event_loop_hazard_window = None;
         let trimmed_path = self.hazard_path_text.trim();
         if trimmed_path.is_empty() {
             self.hazard_status = "No local hazard path entered".to_owned();
@@ -5932,6 +5987,7 @@ impl ViewerApp {
         self.load_timing = None;
         self.dealiased_readout_cache = None;
         self.selected_cut = 0;
+        self.manual_primary_cut_hold = None;
         self.clear_texture();
         // Cross-site load: extra panes must not keep the old site's imagery
         // (it would geo-anchor at the NEW site's location) or pinned tilts
@@ -5949,6 +6005,7 @@ impl ViewerApp {
         self.frame_history.clear();
         self.selected_frame_index = 0;
         self.low_sweep_disabled_cuts.clear();
+        self.manual_primary_cut_hold = None;
         self.history_playing = false;
         self.browsing_history = false;
         self.last_history_step = None;
@@ -6024,6 +6081,10 @@ impl ViewerApp {
             .volume
             .as_ref()
             .map(|volume| frame_identity_for_volume(volume.as_ref()));
+        let active_volume_ptr = self
+            .volume
+            .as_ref()
+            .map(|volume| Arc::as_ptr(volume) as usize);
         let selected_site_id = selected_identity.site_id.clone();
         if self
             .volume
@@ -6047,14 +6108,22 @@ impl ViewerApp {
             .sort_by(|left, right| left.identity.cmp(&right.identity));
         self.trim_frame_history();
 
-        let should_select_loaded_frame =
-            select_loaded_frame && !self.history_playing && !self.browsing_history;
+        let display_is_blank = self.volume.is_none();
+        let should_select_loaded_frame = select_loaded_frame
+            && !self.history_playing
+            && (!self.browsing_history || display_is_blank);
         if should_select_loaded_frame {
             let next_index = self
                 .frame_history
                 .iter()
                 .position(|frame| frame.identity == selected_identity)
                 .unwrap_or_else(|| self.frame_history.len().saturating_sub(1));
+            let preserve_active_frame_cut = active_identity.as_ref() == Some(&selected_identity)
+                && self.frame_history.get(next_index).is_some_and(|frame| {
+                    active_volume_ptr == Some(Arc::as_ptr(&frame.volume) as usize)
+                });
+            let previous_cut = self.selected_cut;
+            let previous_product = self.selected_product.clone();
             if should_defer_live_partial_selection_for_active_product(
                 self.volume.as_deref(),
                 &self.selected_product,
@@ -6076,7 +6145,27 @@ impl ViewerApp {
                 ctx.request_repaint();
                 return false;
             }
-            self.select_history_frame(next_index, record_final_decode, ctx);
+            if display_is_blank {
+                self.browsing_history = false;
+            }
+            let select_first_low_sweep =
+                !preserve_active_frame_cut && active_identity.as_ref() != Some(&selected_identity);
+            self.select_history_frame_with_options(
+                next_index,
+                record_final_decode,
+                select_first_low_sweep,
+                ctx,
+            );
+            if preserve_active_frame_cut
+                && let Some(volume) = self.volume.as_deref()
+                && is_displayable_on_cut(volume, previous_cut, &previous_product)
+            {
+                self.selected_product = previous_product;
+                if self.selected_cut != previous_cut {
+                    self.set_selected_cut_preserving_texture(previous_cut);
+                }
+                ctx.request_repaint();
+            }
             true
         } else if let Some(active_identity) = active_identity
             && let Some(index) = self
@@ -6491,9 +6580,24 @@ impl ViewerApp {
         let previous_cut = self.selected_cut;
         let previous_product = self.selected_product.clone();
         let previous_volume_for_panes = self.volume.clone();
+        let next_identity = frame_identity_for_volume(volume.as_ref());
+        if self
+            .manual_primary_cut_hold
+            .as_ref()
+            .is_some_and(|hold| hold.identity != next_identity)
+        {
+            self.manual_primary_cut_hold = None;
+        }
         let require_complete_live_cut =
             frame_status == FrameStatus::LivePartial && !self.display_live_chunk_updates;
-        let (selected_cut, selected_product) =
+        let manual_hold_cut = self.manual_primary_cut_hold.as_ref().and_then(|hold| {
+            (hold.identity == next_identity
+                && is_displayable_on_cut(volume.as_ref(), hold.cut_index, &previous_product))
+            .then_some(hold.cut_index)
+        });
+        let (selected_cut, selected_product) = if let Some(cut) = manual_hold_cut {
+            (cut, previous_product.clone())
+        } else {
             selection_for_installed_volume_with_low_sweep_min_seconds(
                 self.volume.as_deref(),
                 self.selected_cut,
@@ -6505,7 +6609,8 @@ impl ViewerApp {
                     require_complete_live_cut,
                     low_level_min_seconds: self.live_low_sweep_auto_advance_min_seconds(),
                 },
-            );
+            )
+        };
         let catalog_index = self
             .sites
             .iter()
@@ -6550,7 +6655,12 @@ impl ViewerApp {
             volume.as_ref(),
             same_volume,
         );
+        let retained_texture_matches_previous = self
+            .texture_key
+            .as_ref()
+            .is_some_and(|key| key.cut == previous_cut && key.product == previous_product);
         let retarget_existing_texture = self.texture.is_some()
+            && retained_texture_matches_previous
             && selected_cut == previous_cut
             && selected_product == previous_product
             && selected_cut_render_data_unchanged(
@@ -6687,6 +6797,33 @@ impl ViewerApp {
 
     fn selected_frame(&self) -> Option<&FrameHistoryEntry> {
         self.frame_history.get(self.selected_frame_index)
+    }
+
+    fn selected_frame_scan_time_utc(&self) -> Option<DateTime<Utc>> {
+        self.frame_history
+            .get(self.selected_frame_index)
+            .map(|frame| frame.identity.scan_time_utc)
+            .or_else(|| {
+                self.volume
+                    .as_deref()
+                    .map(|volume| frame_identity_for_volume(volume).scan_time_utc)
+            })
+    }
+
+    fn active_loop_timeline_scan_time_utc(&self) -> Option<DateTime<Utc>> {
+        match self.active_loop_timeline_target() {
+            LoopTimelineTarget::Primary => self.selected_frame_scan_time_utc(),
+            LoopTimelineTarget::ExtraPane(slot) => self.extra_panes.get(slot).and_then(|pane| {
+                pane.frame_history
+                    .get(pane.selected_frame_index)
+                    .map(|frame| frame.identity.scan_time_utc)
+                    .or_else(|| {
+                        pane.volume
+                            .as_deref()
+                            .map(|volume| frame_identity_for_volume(volume).scan_time_utc)
+                    })
+            }),
+        }
     }
 
     fn active_loop_timeline_target(&self) -> LoopTimelineTarget {
@@ -7068,9 +7205,7 @@ impl ViewerApp {
     }
 
     fn timeline_report_reference_time_utc(&self) -> Option<DateTime<Utc>> {
-        if self.loop_timeline_history_len(self.active_loop_timeline_target()) <= 1
-            || !(self.event_loop_hazard_window.is_some() || self.unified_player.auto_sync_warnings)
-        {
+        if self.loop_timeline_history_len(self.active_loop_timeline_target()) <= 1 {
             return None;
         }
         self.displayed_timeline_time_utc()
@@ -7093,49 +7228,110 @@ impl ViewerApp {
             .collect()
     }
 
+    /// Screen playback is frame-accurate: the dwell clock starts only after
+    /// the currently selected native-resolution texture is actually visible.
+    /// Otherwise high-speed playback can advance selection faster than the
+    /// render worker, whose newest-request coalescing then drops intermediate
+    /// frames before they are ever painted.
+    fn primary_screen_loop_texture_ready(&self) -> bool {
+        if self.pending_render_key.is_some() || !self.loop_record_primary_texture_ready() {
+            return false;
+        }
+        self.extra_panes
+            .iter()
+            .take(self.grid_layout.panel_count().saturating_sub(1))
+            .enumerate()
+            .all(|(slot, pane)| {
+                !self.extra_pane_participates_in_primary_timeline(pane)
+                    || (pane.pending_render_key.is_none()
+                        && self.loop_record_extra_pane_texture_ready(slot))
+            })
+    }
+
+    fn extra_pane_screen_loop_texture_ready(&self, pane_slot: usize) -> bool {
+        self.extra_panes.get(pane_slot).is_none_or(|pane| {
+            pane.pending_render_key.is_none()
+                && self.loop_record_extra_pane_texture_ready(pane_slot)
+        })
+    }
+
     fn maybe_advance_history_loop(&mut self, ctx: &egui::Context) {
         if !self.history_playing || !self.primary_history_loop_can_step() {
             return;
         }
         let frame_ms = self.screen_loop_frame_ms();
-        let should_step = self
-            .last_history_step
-            .is_none_or(|last_step| last_step.elapsed() >= Duration::from_millis(frame_ms));
-        if should_step {
-            self.last_history_step = Some(Instant::now());
-            self.advance_primary_screen_loop(ctx);
+        if !self.primary_screen_loop_texture_ready() {
+            // Do not let time spent decoding/rendering count against this
+            // frame's on-screen dwell. The current selection stays put until
+            // its texture lands, so no timeline step can disappear visually.
+            self.last_history_step = None;
+            ctx.request_repaint_after(Duration::from_millis(LOOP_RENDER_WAIT_POLL_MS));
+            return;
+        }
+
+        let now = Instant::now();
+        match self.last_history_step {
+            None => self.last_history_step = Some(now),
+            Some(last_step) if last_step.elapsed() >= Duration::from_millis(frame_ms) => {
+                self.advance_primary_screen_loop(ctx);
+                // The newly selected step gets its own complete dwell after
+                // its matching texture is ready.
+                self.last_history_step = None;
+                ctx.request_repaint_after(Duration::from_millis(LOOP_RENDER_WAIT_POLL_MS));
+                return;
+            }
+            Some(_) => {}
         }
         ctx.request_repaint_after(Duration::from_millis(loop_repaint_poll_ms(frame_ms)));
     }
 
     fn maybe_advance_extra_pane_history_loops(&mut self, ctx: &egui::Context) {
         let frame_ms = self.screen_loop_frame_ms();
+        let now = Instant::now();
         let mut steps = Vec::new();
-        for (slot, pane) in self.extra_panes.iter().enumerate() {
-            if !pane.history_playing || !self.extra_pane_history_loop_can_step(slot) {
+        let mut waiting_for_render = false;
+        let mut any_playing = false;
+
+        for slot in 0..self.extra_panes.len() {
+            if !self.extra_panes[slot].history_playing
+                || !self.extra_pane_history_loop_can_step(slot)
+            {
                 continue;
             }
-            let should_step = pane
-                .last_history_step
-                .is_none_or(|last_step| last_step.elapsed() >= Duration::from_millis(frame_ms));
-            if should_step {
-                steps.push(slot);
+            any_playing = true;
+            if !self.extra_pane_screen_loop_texture_ready(slot) {
+                self.extra_panes[slot].last_history_step = None;
+                waiting_for_render = true;
+                continue;
+            }
+            match self.extra_panes[slot].last_history_step {
+                None => self.extra_panes[slot].last_history_step = Some(now),
+                Some(last_step) if last_step.elapsed() >= Duration::from_millis(frame_ms) => {
+                    steps.push(slot);
+                }
+                Some(_) => {}
             }
         }
-        if steps.is_empty() {
-            return;
-        }
-        let now = Instant::now();
-        for slot in steps {
-            if let Some(pane) = self.extra_panes.get_mut(slot) {
-                pane.last_history_step = Some(now);
-            }
+
+        for slot in steps.iter().copied() {
             self.advance_extra_pane_screen_loop(slot, ctx);
+            if let Some(pane) = self.extra_panes.get_mut(slot) {
+                pane.last_history_step = None;
+            }
         }
-        ctx.request_repaint_after(Duration::from_millis(loop_repaint_poll_ms(frame_ms)));
+
+        if any_playing {
+            let poll_ms = if waiting_for_render || !steps.is_empty() {
+                LOOP_RENDER_WAIT_POLL_MS
+            } else {
+                loop_repaint_poll_ms(frame_ms)
+            };
+            ctx.request_repaint_after(Duration::from_millis(poll_ms));
+        }
     }
 
     fn advance_primary_screen_loop(&mut self, ctx: &egui::Context) {
+        self.manual_primary_cut_hold = None;
         if self.advance_history_loop_low_sweep(ctx) {
             return;
         }
@@ -7724,6 +7920,7 @@ impl ViewerApp {
             timeline_time,
         ) && self.selected_cut != cut
         {
+            self.manual_primary_cut_hold = None;
             self.set_selected_cut_preserving_texture(cut);
             changed = true;
         }
@@ -8263,39 +8460,22 @@ impl ViewerApp {
         match result {
             Ok(overlay) => {
                 if updating {
-                    if !overlay.source_label.contains("NWS active alerts") {
-                        return false;
-                    }
-                    if overlay.records.is_empty()
-                        || self.hazard_overlay.as_ref().is_some_and(|existing| {
-                            hazard_overlay_records_match(existing, &overlay)
-                        })
-                    {
-                        return false;
-                    }
-                    let selected_event_id = self
-                        .selected_hazard_record()
-                        .map(|record| record.event_id.clone());
-                    self.hazard_status = format!(
-                        "Preview {} polygons from {} items in {:.1} ms",
-                        overlay.records.len(),
-                        overlay.parsed_items,
-                        overlay.load_ms
-                    );
-                    self.selected_hazard_index = selected_hazard_index_for_event_id(
-                        &overlay.records,
-                        selected_event_id.as_deref(),
-                    );
-                    self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
-                    self.hazard_overlay = Some(overlay);
-                    return true;
+                    return false;
+                }
+                let previous_event_loop_window = self.event_loop_hazard_window;
+                let pending_event_loop_window = self.pending_event_loop_hazard_window.take();
+                let event_loop_window_changed = pending_event_loop_window
+                    .as_ref()
+                    .is_some_and(|window| previous_event_loop_window.as_ref() != Some(window));
+                if let Some(window) = pending_event_loop_window {
+                    self.event_loop_hazard_window = Some(window);
                 }
                 if let Some(existing) = &self.hazard_overlay
                     && hazard_overlay_records_match(existing, &overlay)
                 {
-                    if !updating
-                        && (existing.source_label != overlay.source_label
-                            || self.hazard_status.starts_with("Preview "))
+                    if existing.source_label != overlay.source_label
+                        || self.hazard_status.starts_with("Preview ")
+                        || event_loop_window_changed
                     {
                         self.hazard_status = format!(
                             "{} polygons from {} items in {:.1} ms",
@@ -8303,8 +8483,10 @@ impl ViewerApp {
                             overlay.parsed_items,
                             overlay.load_ms
                         );
-                        self.hazard_overlay_generation =
-                            self.hazard_overlay_generation.wrapping_add(1);
+                        if event_loop_window_changed {
+                            self.hazard_overlay_generation =
+                                self.hazard_overlay_generation.wrapping_add(1);
+                        }
                         self.hazard_overlay = Some(overlay);
                         return true;
                     }
@@ -8364,6 +8546,7 @@ impl ViewerApp {
                 true
             }
             Err(err) => {
+                self.pending_event_loop_hazard_window = None;
                 if self.hazard_overlay.is_some() {
                     self.hazard_status =
                         format!("Hazard refresh failed; keeping current polygons: {err}");
@@ -8372,6 +8555,7 @@ impl ViewerApp {
                 self.hazard_status = err;
                 self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
                 self.hazard_overlay = None;
+                self.pending_event_loop_hazard_window = None;
                 self.selected_hazard_index = None;
                 self.unacknowledged_hazard_event_ids.clear();
                 true
@@ -8480,6 +8664,7 @@ impl ViewerApp {
                             self.pending_site_id = None;
                             self.event_explorer.pending_autoplay = false;
                             self.pending_debug_archive_case = None;
+                            self.pending_data_pack_scene = None;
                             self.live_refresh_skip_reason = Some(reason.clone());
                             self.status = format!("Current {} ({reason})", message.label);
                             self.try_start_pending_archive_selection(ctx);
@@ -8499,6 +8684,7 @@ impl ViewerApp {
                                         self.status = format!("Loaded {}", message.label);
                                         self.apply_debug_archive_focus_if_pending(ctx);
                                     }
+                                    self.apply_data_pack_scene_if_pending(ctx);
                                     // A track jump's range load rolls the
                                     // loop the moment it lands (the
                                     // local-deployment autoplay pattern).
@@ -8517,6 +8703,7 @@ impl ViewerApp {
                                 Err(err) => {
                                     self.event_explorer.pending_autoplay = false;
                                     self.pending_debug_archive_case = None;
+                                    self.pending_data_pack_scene = None;
                                     self.status =
                                         format!("Load failed for {}: {err}", message.label);
                                 }
@@ -8541,6 +8728,7 @@ impl ViewerApp {
                     self.pending_site_id = None;
                     self.event_explorer.pending_autoplay = false;
                     self.pending_debug_archive_case = None;
+                    self.pending_data_pack_scene = None;
                     self.status = "L2 load worker disconnected".to_owned();
                     self.try_start_pending_archive_selection(ctx);
                     return;
@@ -8621,6 +8809,24 @@ impl ViewerApp {
         {
             self.selected_product = product;
         }
+    }
+
+    fn select_primary_cut_manually(&mut self, cut: usize, ctx: &egui::Context) {
+        self.history_playing = false;
+        self.last_history_step = None;
+        self.selected_cut = cut;
+        self.sanitize_selection();
+        self.manual_primary_cut_hold = self.volume.as_ref().and_then(|volume| {
+            (self.selected_cut < volume.cuts.len()).then(|| {
+                LowSweepCutKey::new(
+                    &frame_identity_for_volume(volume.as_ref()),
+                    self.selected_cut,
+                )
+            })
+        });
+        self.clear_texture();
+        self.sync_active_timeline_side_effects(ctx);
+        ctx.request_repaint();
     }
 
     fn handle_keyboard_navigation(&mut self, ctx: &egui::Context) {
@@ -9163,19 +9369,117 @@ impl ViewerApp {
             .unwrap_or(volume)
     }
 
-    fn primary_render_request_for_frame_index(
+    fn primary_loop_steps_in_frame(
+        &self,
+        frame_index: usize,
+        product: &DisplayProduct,
+    ) -> Vec<LoopTimelineStep> {
+        let Some(frame) = self.frame_history.get(frame_index) else {
+            return Vec::new();
+        };
+        if self.app_settings.loop_low_sweeps {
+            let cuts = low_sweep_cuts_for_history_entry(
+                frame,
+                product,
+                self.low_sweep_loop_filter(),
+                &self.low_sweep_disabled_cuts,
+            );
+            if !cuts.is_empty() {
+                return cuts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, cut_index)| LoopTimelineStep {
+                        frame_index,
+                        cut_index: Some(cut_index),
+                        low_sweep_rank: Some(rank),
+                    })
+                    .collect();
+            }
+        }
+        vec![LoopTimelineStep {
+            frame_index,
+            cut_index: None,
+            low_sweep_rank: None,
+        }]
+    }
+
+    /// Return only the nearby timeline steps needed by the prewarmer. This is
+    /// deliberately bounded by `limit`: rebuilding the full 1,500-step low-
+    /// sweep timeline on every paint was a previous performance failure.
+    fn upcoming_primary_loop_steps(&self, limit: usize) -> Vec<LoopTimelineStep> {
+        let frame_count = self.frame_history.len();
+        if frame_count == 0 || limit == 0 {
+            return Vec::new();
+        }
+        let product = self.shared_low_sweep_driver_product();
+        let mut frame_index = self.selected_frame_index.min(frame_count - 1);
+        let mut frame_steps = self.primary_loop_steps_in_frame(frame_index, &product);
+        if frame_steps.is_empty() {
+            return Vec::new();
+        }
+        let current_cut = self.shared_low_sweep_driver().1;
+        let mut position = if frame_steps.len() == 1 && frame_steps[0].cut_index.is_none() {
+            Some(0)
+        } else {
+            frame_steps
+                .iter()
+                .position(|step| step.cut_index == Some(current_cut))
+        };
+        let mut upcoming = Vec::with_capacity(limit);
+
+        for _ in 0..limit {
+            let next_position = position.map_or(0, |position| position + 1);
+            if next_position >= frame_steps.len() {
+                frame_index = (frame_index + 1) % frame_count;
+                frame_steps = self.primary_loop_steps_in_frame(frame_index, &product);
+                if frame_steps.is_empty() {
+                    break;
+                }
+                position = Some(0);
+            } else {
+                position = Some(next_position);
+            }
+            let Some(position_index) = position else {
+                break;
+            };
+            upcoming.push(frame_steps[position_index]);
+        }
+        upcoming
+    }
+
+    fn primary_cut_for_loop_step(&self, step: LoopTimelineStep) -> Option<usize> {
+        let frame = self.frame_history.get(step.frame_index)?;
+        if self.app_settings.loop_low_sweeps {
+            let timeline_time = step
+                .cut_index
+                .and_then(|cut| cut_start_time_utc(frame.volume.as_ref(), cut))
+                .unwrap_or(frame.identity.scan_time_utc);
+            if let Some(cut) = low_sweep_cut_at_or_before_in_frame(
+                frame,
+                &self.selected_product,
+                self.low_sweep_loop_filter(),
+                &self.low_sweep_disabled_cuts,
+                timeline_time,
+            ) {
+                return Some(cut);
+            }
+        }
+        display_cut_for_product(
+            frame.volume.as_ref(),
+            self.selected_cut,
+            &self.selected_product,
+        )
+    }
+
+    fn primary_render_request_for_loop_step(
         &self,
         ctx: &egui::Context,
         rect: egui::Rect,
-        frame_index: usize,
+        step: LoopTimelineStep,
     ) -> Option<RenderRequest> {
-        let frame = self.frame_history.get(frame_index)?;
-        self.primary_render_request_for_volume(
-            ctx,
-            rect,
-            Arc::clone(&frame.volume),
-            self.selected_cut,
-        )
+        let frame = self.frame_history.get(step.frame_index)?;
+        let cut = self.primary_cut_for_loop_step(step)?;
+        self.primary_render_request_for_volume(ctx, rect, Arc::clone(&frame.volume), cut)
     }
 
     fn primary_render_request_for_current(
@@ -9351,9 +9655,6 @@ impl ViewerApp {
         rect: egui::Rect,
         current_key: &TextureKey,
     ) {
-        if self.frame_history.len() <= 1 {
-            return;
-        }
         if self.loop_prewarm_paused_for_interaction() {
             return;
         }
@@ -9362,19 +9663,16 @@ impl ViewerApp {
         if self.loop_prewarm_inflight.len() >= inflight_limit {
             return;
         }
-        let frame_count = self.frame_history.len();
         let lookahead = if self.history_playing || self.media.loop_recording() {
             LOOP_PREWARM_PLAYING_LOOKAHEAD_FRAMES
         } else {
             LOOP_PREWARM_IDLE_LOOKAHEAD_FRAMES
         };
-        for offset in 1..=frame_count.min(lookahead) {
+        for step in self.upcoming_primary_loop_steps(lookahead) {
             if self.loop_prewarm_inflight.len() >= inflight_limit {
                 break;
             }
-            let frame_index = (self.selected_frame_index + offset) % frame_count;
-            let Some(mut request) =
-                self.primary_render_request_for_frame_index(ctx, rect, frame_index)
+            let Some(mut request) = self.primary_render_request_for_loop_step(ctx, rect, step)
             else {
                 continue;
             };
@@ -11197,7 +11495,12 @@ impl ViewerApp {
             volume.as_ref(),
             same_volume,
         );
+        let retained_texture_matches_previous = pane
+            .texture_key
+            .as_ref()
+            .is_some_and(|key| key.cut == previous_cut && key.product == previous_product);
         let retarget_existing_texture = pane.texture.is_some()
+            && retained_texture_matches_previous
             && selected_cut == previous_cut
             && selected_product == previous_product
             && selected_cut_render_data_unchanged(
@@ -12833,6 +13136,400 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
+    fn data_packs_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let busy = self.data_pack_load_blocked();
+        if busy {
+            ui.weak("A load is already running.");
+        }
+
+        let mut requested = None;
+        for pack in data_packs::BUILT_IN_DATA_PACKS {
+            let mut expanded = self.data_pack_expanded.contains(pack.id);
+            let loaded = self.loaded_data_pack.filter(|loaded| loaded.id == pack.id);
+            ui.separator();
+            ui.push_id(pack.id, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button(if expanded { "v" } else { ">" })
+                        .on_hover_text("Show pack details")
+                        .clicked()
+                    {
+                        expanded = !expanded;
+                    }
+                    ui.label(egui::RichText::new(pack.title).strong());
+                    ui.weak(format!(
+                        "{} | {} to {}",
+                        pack.site_id, pack.start_utc, pack.end_utc
+                    ));
+                    if loaded.is_some() {
+                        ui.weak(format!("{} frames", self.frame_history.len()));
+                    }
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Load"))
+                        .on_hover_text("List the public Level II archive, download the pack frames, and apply the review scene")
+                        .clicked()
+                    {
+                        requested = Some((
+                            *pack,
+                            data_packs::DataPackLoadOptions::default(),
+                            true,
+                        ));
+                    }
+                    let prev_options =
+                        loaded.map(|loaded| data_packs::DataPackLoadOptions {
+                            extra_start_scans: loaded.extra_start_scans + 3,
+                            extra_end_scans: loaded.extra_end_scans,
+                        });
+                    if ui
+                        .add_enabled(!busy && prev_options.is_some(), egui::Button::new("-3"))
+                        .on_hover_text("Load three more scans before this pack's current start")
+                        .clicked()
+                        && let Some(options) = prev_options
+                    {
+                        requested = Some((*pack, options, false));
+                    }
+                    let next_options =
+                        loaded.map(|loaded| data_packs::DataPackLoadOptions {
+                            extra_start_scans: loaded.extra_start_scans,
+                            extra_end_scans: loaded.extra_end_scans + 3,
+                        });
+                    if ui
+                        .add_enabled(!busy && next_options.is_some(), egui::Button::new("+3"))
+                        .on_hover_text("Load three more scans after this pack's current end")
+                        .clicked()
+                        && let Some(options) = next_options
+                    {
+                        requested = Some((*pack, options, false));
+                    }
+                });
+                if expanded {
+                    ui.indent("data_pack_details", |ui| {
+                        ui.weak(pack.summary);
+                        let (extra_start, extra_end) = loaded
+                            .map(|loaded| (loaded.extra_start_scans, loaded.extra_end_scans))
+                            .unwrap_or((0, 0));
+                        ui.weak(format!(
+                            "Anchor {} | focus {:.3}, {:.3} | frames {} (+{} / +{})",
+                            pack.anchor_utc,
+                            pack.focus_lat,
+                            pack.focus_lon,
+                            pack.max_frames,
+                            extra_start,
+                            extra_end
+                        ));
+                    });
+                }
+            });
+            if expanded {
+                self.data_pack_expanded.insert(pack.id.to_owned());
+            } else {
+                self.data_pack_expanded.remove(pack.id);
+            }
+        }
+
+        if let Some((pack, options, replace_history)) = requested {
+            self.start_data_pack(pack, options, replace_history, ctx);
+        }
+    }
+
+    fn start_data_pack(
+        &mut self,
+        pack: data_packs::BuiltInDataPack,
+        options: data_packs::DataPackLoadOptions,
+        replace_history: bool,
+        ctx: &egui::Context,
+    ) {
+        if self.data_pack_load_blocked() {
+            self.status = "Wait for the current load to finish".to_owned();
+            return;
+        }
+        self.supersede_live_load_for_data_pack();
+        let request = match pack.window_request_with_options(options) {
+            Ok(request) => request,
+            Err(err) => {
+                self.status = format!("Data pack is invalid: {err}");
+                return;
+            }
+        };
+        let Some(site_index) = self
+            .sites
+            .iter()
+            .position(|site| site.level2_id.eq_ignore_ascii_case(pack.site_id))
+        else {
+            self.status = format!("Data pack site {} is not in the catalog", pack.site_id);
+            return;
+        };
+
+        let scene = pack.scene(options);
+        let site_id = self.sites[site_index].level2_id.clone();
+        self.selected_site_index = site_index;
+        self.archive_date_input = request.start_utc.date_naive().to_string();
+        self.archive_loaded_range = None;
+        self.archive_volumes = None;
+        self.archive_load_loop = true;
+        self.archive_frame_count = request.max_objects.clamp(1, MAX_HISTORY_FRAME_LIMIT);
+        self.history_frame_limit = self.history_frame_limit.max(self.archive_frame_count);
+        self.pending_data_pack_scene = Some(scene);
+        self.pending_debug_archive_case = None;
+        self.history_playing = false;
+        self.browsing_history = false;
+        self.realtime_level2_auto_refresh = false;
+        self.poll_active = false;
+        self.poll_rx = None;
+        self.poll_next = None;
+        self.intl_loop_rx = None;
+        self.intl_loop_frames = 0;
+        self.intl_loop_requested = 0;
+        if replace_history || history_contains_other_site(&self.frame_history, &site_id) {
+            self.clear_frame_history();
+            self.loaded_data_pack = None;
+        }
+        self.center_map_on(scene.focus_lat, scene.focus_lon);
+        self.map_scale = scene.map_scale.clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
+        self.clamp_map_center();
+        self.begin_primary_load_telemetry();
+
+        let progress = ArchiveLoadProgress {
+            label: "Data pack".to_owned(),
+            detail: format!("Listing {} for {}", site_id, pack.title),
+            done: 0,
+            total: 0,
+        };
+        self.status = progress.status_text();
+        self.archive_load_progress = Some(progress.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.load_receiver = Some(receiver);
+        self.pending_site_id = Some(site_id.clone());
+        let site_cache = cache_dir(&site_id);
+        let pack_title = pack.title.to_owned();
+        let known_frame_paths = if replace_history {
+            BTreeSet::new()
+        } else {
+            self.current_history_paths()
+        };
+        thread::spawn(move || {
+            let total_start = Instant::now();
+            let progress_label = progress.label;
+            send_archive_progress(
+                &sender,
+                &progress_label,
+                format!("Listing {site_id} archive objects"),
+                0,
+                0,
+            );
+            let selection = match data_source::level2_objects_for_window(&site_id, &request) {
+                Ok(selection) => selection,
+                Err(err) => {
+                    let _ = sender.send(AsyncLoadResult {
+                        label: pack_title.clone(),
+                        update: AsyncLoadUpdate::Final(Err(format!("{err}"))),
+                    });
+                    return;
+                }
+            };
+            let count = selection.objects.len();
+            let selected_object_index = selection.selected_index.min(count.saturating_sub(1));
+            send_archive_progress(
+                &sender,
+                &progress_label,
+                format!("Queued {site_id} {count} scans"),
+                0,
+                count,
+            );
+
+            let mut decoded_frames = Vec::new();
+            let mut selected_decoded_index = None;
+            for (index, object) in selection.objects.into_iter().enumerate() {
+                let object_name = object
+                    .key
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&object.key)
+                    .to_owned();
+                send_archive_progress(
+                    &sender,
+                    &progress_label,
+                    format!("Fetching {site_id} {object_name}"),
+                    index,
+                    count,
+                );
+                let select_frame = index == selected_object_index;
+                match decode_archive_history_object(
+                    &site_id,
+                    object,
+                    &site_cache,
+                    &known_frame_paths,
+                    None,
+                    total_start,
+                    &sender,
+                    false,
+                    !select_frame,
+                ) {
+                    Ok(Some(decoded)) => {
+                        if select_frame {
+                            selected_decoded_index = Some(decoded_frames.len());
+                        }
+                        let _ = sender.send(AsyncLoadResult {
+                            label: pack_title.clone(),
+                            update: AsyncLoadUpdate::History(
+                                DecodedLoadBatch {
+                                    frames: vec![decoded.clone()],
+                                    selected_index: 0,
+                                },
+                                select_frame,
+                            ),
+                        });
+                        decoded_frames.push(decoded);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        send_archive_progress(
+                            &sender,
+                            &progress_label,
+                            format!("Failed {site_id} {object_name}"),
+                            index + 1,
+                            count,
+                        );
+                        let _ = sender.send(AsyncLoadResult {
+                            label: pack_title.clone(),
+                            update: AsyncLoadUpdate::Final(Err(err)),
+                        });
+                        return;
+                    }
+                }
+                send_archive_progress(
+                    &sender,
+                    &progress_label,
+                    format!("Decoded {site_id} {object_name}"),
+                    index + 1,
+                    count,
+                );
+            }
+
+            if decoded_frames.is_empty() {
+                let _ = sender.send(AsyncLoadResult {
+                    label: pack_title,
+                    update: AsyncLoadUpdate::Final(Err(
+                        "data pack decoded no displayable archive volumes".to_owned(),
+                    )),
+                });
+                return;
+            }
+            let selected_index = selected_decoded_index.unwrap_or_else(|| {
+                let midpoint = decoded_frames.len() / 2;
+                midpoint.min(decoded_frames.len() - 1)
+            });
+            let _ = sender.send(AsyncLoadResult {
+                label: pack_title,
+                update: AsyncLoadUpdate::Final(Ok(DecodedLoadBatch {
+                    frames: decoded_frames,
+                    selected_index,
+                })),
+            });
+        });
+        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+    }
+
+    fn data_pack_load_blocked(&self) -> bool {
+        if self.intl_loop_rx.is_some()
+            || self.pending_data_pack_scene.is_some()
+            || self.pending_debug_archive_case.is_some()
+        {
+            return true;
+        }
+        self.load_receiver.is_some() && !self.data_pack_can_supersede_current_load()
+    }
+
+    fn data_pack_can_supersede_current_load(&self) -> bool {
+        if self.realtime_level2_auto_refresh || self.poll_active {
+            return true;
+        }
+        let status = self.status.as_str();
+        status.starts_with("Refreshing realtime L2")
+            || status.starts_with("Loading latest L2")
+            || status.starts_with("Loading L2 loop")
+            || self.archive_load_progress.as_ref().is_some_and(|progress| {
+                progress.label.starts_with("L2 ") && progress.label.ends_with(" loop")
+            })
+    }
+
+    fn supersede_live_load_for_data_pack(&mut self) {
+        let can_supersede = self.data_pack_can_supersede_current_load();
+        self.realtime_level2_auto_refresh = false;
+        self.poll_active = false;
+        self.poll_rx = None;
+        self.poll_next = None;
+        if self.load_receiver.is_some() && can_supersede {
+            self.load_receiver = None;
+            self.archive_load_progress = None;
+            self.pending_site_id = None;
+            self.live_refresh_skip_reason = None;
+            self.event_explorer.pending_autoplay = false;
+        }
+    }
+
+    fn apply_data_pack_scene_if_pending(&mut self, ctx: &egui::Context) {
+        let Some(scene) = self.pending_data_pack_scene else {
+            return;
+        };
+        let Some(volume) = self.volume.as_deref() else {
+            return;
+        };
+        if !volume.site.id.eq_ignore_ascii_case(scene.site_id) {
+            return;
+        }
+
+        self.selected_cut = 0;
+        match scene.layout {
+            data_packs::DataPackLayout::DualPolTornadoReview => {
+                self.set_workflow_layout(PanelLayout::FourGrid);
+                self.set_primary_product_prefer(DisplayProduct::Moment(MomentType::Reflectivity));
+                self.set_extra_pane_products(&[
+                    DisplayProduct::DealiasedVelocity,
+                    DisplayProduct::Moment(MomentType::CorrelationCoefficient),
+                    DisplayProduct::Moment(MomentType::DifferentialReflectivity),
+                ]);
+            }
+        }
+        self.sidebar_tab = SidebarTab::Radar;
+        self.hazards_visible = true;
+        self.hazards_active_only = false;
+        self.spc_day = 1;
+        self.spc_outlooks_enabled = ["cat", "torn", "wind", "hail"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        self.spc_reports_enabled = true;
+        self.spc_last_key = None;
+        self.show_rotation_markers = true;
+        self.show_storm_tracks = true;
+        self.show_inspector_card = true;
+        self.vrot_tool_armed = false;
+        self.vrot_points.clear();
+        self.center_map_on(scene.focus_lat, scene.focus_lon);
+        self.map_scale = scene.map_scale.clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
+        self.clamp_map_center();
+        self.sanitize_selection();
+        self.clear_texture();
+        self.clear_extra_pane_textures();
+        if scene.autoplay && self.frame_history.len() > 1 {
+            self.history_playing = true;
+            self.last_history_step = None;
+        }
+        self.status = format!(
+            "Data pack loaded: {} - {} frames",
+            scene.title,
+            self.frame_history.len()
+        );
+        self.loaded_data_pack = Some(data_packs::LoadedDataPack {
+            id: scene.id,
+            extra_start_scans: scene.options.extra_start_scans,
+            extra_end_scans: scene.options.extra_end_scans,
+        });
+        self.pending_data_pack_scene = None;
+        ctx.request_repaint();
+    }
+
     fn start_archive_range_load_selecting(
         &mut self,
         start: usize,
@@ -13036,6 +13733,7 @@ impl ViewerApp {
             self.load_event_loop_hazards(plan.start_utc, plan.end_utc, ctx);
         } else {
             self.event_loop_hazard_window = None;
+            self.pending_event_loop_hazard_window = None;
         }
         if plan.include_models {
             self.model_enabled = true;
@@ -13184,6 +13882,11 @@ impl ViewerApp {
         }
         if mode != LatestLoadMode::AutoRefresh {
             self.clear_camera_follow_targets();
+        }
+        if mode == LatestLoadMode::User {
+            self.history_playing = false;
+            self.browsing_history = false;
+            self.last_history_step = None;
         }
         if history_contains_other_site(&self.frame_history, &site_id) {
             self.clear_frame_history();
@@ -14135,7 +14838,8 @@ impl ViewerApp {
         let warnings_timeline_ready = self
             .timeline_warning_window_covers_window(loop_window.as_ref())
             && self.hazard_receiver.is_none();
-        let warnings_need_sync = loop_window.is_some()
+        let warnings_need_sync = !self.active_loop_timeline_is_live_follow()
+            && loop_window.is_some()
             && (self.hazards_visible || self.unified_player.auto_sync_warnings)
             && !warnings_timeline_ready;
         unified_player::UnifiedPlayerContext {
@@ -14346,19 +15050,46 @@ impl ViewerApp {
                 ctx.request_repaint();
             }
             Some(unified_player::UnifiedPlayerAction::SetAutoWarningSync(auto_sync)) => {
-                self.unified_player.auto_sync_warnings = auto_sync;
-                if auto_sync {
-                    self.arm_unified_player_timeline_warning_sync();
-                    self.maybe_auto_sync_timeline_warnings(ctx);
-                    self.unified_player
-                        .mark_status("Timeline warning sync enabled");
+                if auto_sync && self.active_loop_timeline_is_live_follow() {
+                    // A live-follow history is still a live product. Tying the
+                    // warning layer to that rolling frame window suppresses the
+                    // authoritative current-alert refresh and makes old
+                    // polygons intentionally reappear while the loop plays.
+                    // Keep live warnings live; the one-shot button below still
+                    // lets an operator explicitly snapshot a recent loop.
+                    self.unified_player.auto_sync_warnings = false;
+                    self.release_timeline_warning_sync(ctx);
+                    self.unified_player.mark_status(
+                        "Auto warning sync is archive-only; live warnings remain current",
+                    );
+                } else if auto_sync {
+                    self.unified_player.auto_sync_warnings = true;
+                    if self.loaded_loop_time_window().is_some() {
+                        self.arm_unified_player_timeline_warning_sync();
+                        self.maybe_auto_sync_timeline_warnings(ctx);
+                        self.unified_player
+                            .mark_status("Archive warning auto-sync enabled");
+                    } else {
+                        // Merely checking the option before an archive is
+                        // loaded must not switch off current warnings.
+                        self.unified_player.mark_status(
+                            "Archive warning auto-sync armed for the next archive loop",
+                        );
+                    }
                 } else {
+                    // Disabling the checkbox must actually leave timeline
+                    // mode. Previously it only flipped the bool, leaving the
+                    // stale archive overlay installed with live refresh off.
+                    self.unified_player.auto_sync_warnings = false;
+                    self.release_timeline_warning_sync(ctx);
                     self.unified_player
-                        .mark_status("Timeline warning sync paused");
+                        .mark_status("Warnings returned to live/current mode");
                 }
             }
             Some(unified_player::UnifiedPlayerAction::SyncWarningsToLoop) => {
-                self.unified_player.auto_sync_warnings = true;
+                // One-shot sync is deliberately independent from the Auto
+                // checkbox. Loading one archive snapshot must not silently arm
+                // a persistent mode that later hijacks live warnings.
                 let status = self.sync_warnings_to_loaded_loop(ctx);
                 self.unified_player.mark_status(status);
             }
@@ -14992,10 +15723,11 @@ impl ViewerApp {
     }
 
     fn release_timeline_warning_sync(&mut self, ctx: &egui::Context) {
-        self.event_loop_hazard_window = None;
-        self.hazards_active_only = true;
-        self.live_hazard_auto_refresh = true;
+        // Dropping the receiver invalidates any in-flight archive load; its
+        // sender can finish harmlessly, but it can no longer overwrite the
+        // fresh live snapshot.
         self.hazard_receiver = None;
+        self.switch_to_live_hazard_mode();
         self.load_live_hazards(ctx);
     }
 
@@ -15015,10 +15747,24 @@ impl ViewerApp {
             .is_some_and(|(start, end)| start <= *target_start && end >= *target_end)
     }
 
+    pub(crate) fn active_loop_timeline_is_live_follow(&self) -> bool {
+        let target = self.active_loop_timeline_target();
+        self.loop_timeline_frames_for_target(target)
+            .is_some_and(|frames| {
+                frames.iter().any(|frame| {
+                    matches!(
+                        frame.status,
+                        FrameStatus::LivePartial | FrameStatus::LiveComplete
+                    )
+                })
+            })
+    }
+
     fn should_auto_sync_timeline_warnings(&self) -> bool {
         if !self.unified_player.auto_sync_warnings
             || !self.hazards_visible
             || self.hazard_receiver.is_some()
+            || self.active_loop_timeline_is_live_follow()
         {
             return false;
         }
@@ -15031,6 +15777,15 @@ impl ViewerApp {
     }
 
     fn maybe_auto_sync_timeline_warnings(&mut self, ctx: &egui::Context) {
+        if self.unified_player.auto_sync_warnings && self.active_loop_timeline_is_live_follow() {
+            // A user can move from an archive loop back into a live-follow
+            // history without reopening the player. Never let the old archive
+            // mode survive that transition.
+            self.release_timeline_warning_sync(ctx);
+            self.unified_player
+                .mark_status("Live radar detected; warnings returned to current mode");
+            return;
+        }
         if !self.should_auto_sync_timeline_warnings() {
             return;
         }
@@ -15817,6 +16572,9 @@ impl ViewerApp {
         // shouldn't need a tab switch to play what it just loaded.
         self.frame_history_panel(ui, ctx);
         ui.separator();
+        self.remembered_section(ui, "data_packs", "Data packs", true, |app, ui| {
+            app.data_packs_section(ui, ctx);
+        });
         self.remembered_section(ui, "data_archive", "Archive", true, |app, ui| {
             app.archive_panel(ui, ctx);
         });
@@ -17050,15 +17808,31 @@ impl ViewerApp {
                 .on_hover_text(
                     "Display incomplete live chunk tilts before a full low-level tilt is available",
                 );
-            let mut fast_low = self.app_settings.live_low_sweep_auto_advance;
+            ui.label("Low gap").on_hover_text(
+                "Minimum seconds between same-scan low-level sweeps before live display advances to the newer complete low tilt",
+            );
+            let mut low_sweep_seconds = if self.app_settings.live_low_sweep_auto_advance {
+                MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS
+            } else {
+                self.app_settings.live_low_sweep_auto_advance_seconds.clamp(
+                    MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS,
+                    MAX_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS,
+                )
+            };
             if ui
-                .checkbox(&mut fast_low, "Fast low")
-                .on_hover_text(
-                    "Advance live display as soon as a complete <=1.4 degree low sweep arrives",
+                .add(
+                    egui::DragValue::new(&mut low_sweep_seconds)
+                        .range(
+                            MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS
+                                ..=MAX_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS,
+                        )
+                        .speed(1)
+                        .suffix(" s"),
                 )
                 .changed()
             {
-                self.app_settings.live_low_sweep_auto_advance = fast_low;
+                self.app_settings.live_low_sweep_auto_advance = false;
+                self.app_settings.live_low_sweep_auto_advance_seconds = low_sweep_seconds;
                 let _ = self.app_settings.save();
             }
             let mut live_preload = normalized_live_preload_frame_count(usize::from(
@@ -17277,9 +18051,9 @@ impl ViewerApp {
             ui.horizontal(|ui| {
                 if matches!(editing_product, DisplayProduct::Moment(MomentType::Velocity)) {
                     let unfold_changed = ui
-                        .checkbox(&mut self.unfold_velocity_display, "Unfold VEL")
+                        .checkbox(&mut self.unfold_velocity_display, "Auto-dealias VEL")
                         .on_hover_text(
-                            "Use the dealiased continuity grid for base velocity display colors (all panes)",
+                            "Optional: run BowEcho's dealiaser on the raw VEL product. Off keeps VEL faithful to the radar; use DVEL/DSRV for explicitly dealiased products.",
                         )
                         .changed();
                     if unfold_changed {
@@ -17578,10 +18352,7 @@ impl ViewerApp {
                             self.extra_panes[slot].cut = Some(*index);
                             ctx.request_repaint();
                         } else {
-                            self.selected_cut = *index;
-                            self.sanitize_selection();
-                            self.clear_texture();
-                            ctx.request_repaint();
+                            self.select_primary_cut_manually(*index, ctx);
                         }
                     }
                 }
@@ -18217,6 +18988,7 @@ impl ViewerApp {
         }
         self.history_playing = !self.history_playing;
         if self.history_playing {
+            self.manual_primary_cut_hold = None;
             self.browsing_history = false;
             self.last_history_step = Some(Instant::now());
             ctx.request_repaint();
@@ -18967,7 +19739,7 @@ impl ViewerApp {
         ui.horizontal(|ui| {
             let loading = self.hazard_receiver.is_some();
             if fixed_action_button(ui, "Refresh Live", 96.0).clicked() && !loading {
-                self.load_live_hazards(ui.ctx());
+                self.refresh_live_hazards_manually(ui.ctx());
             }
             if fixed_action_button(ui, "Clear", 52.0).clicked() {
                 self.hazard_overlay_generation = self.hazard_overlay_generation.wrapping_add(1);
@@ -19559,7 +20331,7 @@ impl ViewerApp {
     fn hazard_overlay_timeline_time(&self) -> Option<DateTime<Utc>> {
         self.event_loop_hazard_window
             .is_some()
-            .then(|| self.displayed_timeline_time_utc())
+            .then(|| self.active_loop_timeline_scan_time_utc())
             .flatten()
     }
 
@@ -22951,10 +23723,14 @@ impl ViewerApp {
     }
 
     fn live_low_sweep_auto_advance_min_seconds(&self) -> i64 {
+        let configured = self.app_settings.live_low_sweep_auto_advance_seconds.clamp(
+            MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS,
+            MAX_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS,
+        );
         if self.app_settings.live_low_sweep_auto_advance {
-            FAST_LOW_SWEEP_AUTO_ADVANCE_MIN_SECONDS
+            i64::from(MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS)
         } else {
-            LIVE_LOW_LEVEL_AUTO_ADVANCE_MIN_SECONDS
+            i64::from(configured)
         }
     }
 
@@ -33737,7 +34513,17 @@ fn live_hazard_record_has_authoritative_source(
     active_alert_event_ids: &BTreeSet<String>,
 ) -> bool {
     !live_warning_requires_active_alert(record)
-        || active_alert_event_ids.contains(base_hazard_event_id(&record.event_id))
+        || (record.action == "ALERT"
+            && active_alert_event_ids.contains(base_hazard_event_id(&record.event_id)))
+}
+
+fn hazard_record_shadowed_by_active_alert(
+    record: &HazardRecord,
+    active_alert_event_ids: &BTreeSet<String>,
+) -> bool {
+    live_warning_requires_active_alert(record)
+        && record.action != "ALERT"
+        && active_alert_event_ids.contains(base_hazard_event_id(&record.event_id))
 }
 
 fn live_warning_requires_active_alert(record: &HazardRecord) -> bool {
@@ -35673,101 +36459,25 @@ fn load_live_hazard_overlay_with_preview<F>(
 where
     F: FnMut(HazardOverlay),
 {
+    // Live warning latency must be governed by the authoritative current-alert
+    // endpoint, not by dozens of optional text-product enrichment requests.
+    // The CAP/GeoJSON alert already carries geometry, lifecycle, VTEC,
+    // observed/radar-indicated tags, damage threat, hail, wind, headline, and
+    // description. Historical warning reconstruction keeps using the richer
+    // text-product path below.
     let start = Instant::now();
-    let mut records = Vec::new();
-    let mut scanned_items = 0usize;
-    let mut parsed_items = 0usize;
-    let mut error_count = 0usize;
-    let mut source_labels = Vec::<String>::new();
-    let mut first_error = None::<String>;
-
-    thread::scope(|scope| {
-        let (source_sender, source_receiver) = mpsc::channel::<LiveHazardSourceMessage>();
-
-        let active_sender = source_sender.clone();
-        scope.spawn(move || {
-            send_live_hazard_source_load(
-                active_sender,
-                "NWS active alerts".to_owned(),
-                "NWS active alert worker panicked",
-                || load_weather_gov_active_alerts(query_time_utc),
-            );
-        });
-
-        for &product_type in HOT_TEXT_PRODUCT_TYPES {
-            let hot_text_sender = source_sender.clone();
-            scope.spawn(move || {
-                send_live_hazard_source_load(
-                    hot_text_sender,
-                    format!("NWS {product_type} text"),
-                    "Hot NWS product type worker panicked",
-                    || fetch_hot_text_product_type(product_type, query_time_utc),
-                );
-            });
-        }
-
-        let spc_md_sender = source_sender.clone();
-        scope.spawn(move || {
-            send_live_hazard_source_load(
-                spc_md_sender,
-                "SPC current MDs".to_owned(),
-                "SPC MD fetch worker panicked",
-                || load_spc_mesoscale_discussions(query_time_utc),
-            );
-        });
-
-        drop(source_sender);
-
-        for message in source_receiver {
-            match message.result {
-                Ok(mut load) => {
-                    scanned_items += load.scanned_items;
-                    parsed_items += load.parsed_items;
-                    error_count += load.error_count;
-                    if !load.records.is_empty() {
-                        if !source_labels
-                            .iter()
-                            .any(|label| label == &message.source_label)
-                        {
-                            source_labels.push(message.source_label);
-                        }
-                        records.append(&mut load.records);
-                        on_preview(build_live_hazard_overlay(
-                            source_labels.join(" + "),
-                            query_time_utc,
-                            scanned_items,
-                            parsed_items,
-                            error_count,
-                            start,
-                            records.clone(),
-                        ));
-                    }
-                }
-                Err(err) => {
-                    error_count += 1;
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
-                }
-            }
-        }
-    });
-
-    if records.is_empty()
-        && let Some(err) = first_error
-    {
-        return Err(err);
-    }
-
-    Ok(build_live_hazard_overlay(
-        "NWS active alerts + hot NWS text + SPC current MDs".to_owned(),
+    let load = load_weather_gov_active_alerts(query_time_utc)?;
+    let overlay = build_live_hazard_overlay(
+        "NWS active alerts".to_owned(),
         query_time_utc,
-        scanned_items,
-        parsed_items,
-        error_count,
+        load.scanned_items,
+        load.parsed_items,
+        load.error_count,
         start,
-        records,
-    ))
+        load.records,
+    );
+    on_preview(overlay.clone());
+    Ok(overlay)
 }
 
 fn load_event_loop_hazard_overlay_with_preview<F>(
@@ -35785,9 +36495,27 @@ where
     let mut error_count = 0usize;
     let mut source_labels = Vec::<String>::new();
     let mut first_error = None::<String>;
+    let active_alert_query_time_utc = Utc::now();
+    let include_active_alerts = event_loop_window_should_merge_active_alerts(
+        start_utc,
+        end_utc,
+        active_alert_query_time_utc,
+    );
 
     thread::scope(|scope| {
         let (source_sender, source_receiver) = mpsc::channel::<LiveHazardSourceMessage>();
+
+        if include_active_alerts {
+            let active_sender = source_sender.clone();
+            scope.spawn(move || {
+                send_live_hazard_source_load(
+                    active_sender,
+                    "NWS active alerts".to_owned(),
+                    "Event-loop NWS active alert worker panicked",
+                    || load_weather_gov_active_alerts(active_alert_query_time_utc),
+                );
+            });
+        }
 
         for &product_type in HOT_TEXT_PRODUCT_TYPES {
             let hot_text_sender = source_sender.clone();
@@ -35845,7 +36573,11 @@ where
     }
 
     Ok(build_event_loop_hazard_overlay(
-        "NWS warning text archive window".to_owned(),
+        if include_active_alerts {
+            "NWS active alerts + warning text archive window".to_owned()
+        } else {
+            "NWS warning text archive window".to_owned()
+        },
         (start_utc, end_utc),
         scanned_items,
         parsed_items,
@@ -35853,6 +36585,15 @@ where
         start,
         records,
     ))
+}
+
+fn event_loop_window_should_merge_active_alerts(
+    start_utc: DateTime<Utc>,
+    end_utc: DateTime<Utc>,
+    now_utc: DateTime<Utc>,
+) -> bool {
+    start_utc <= now_utc + chrono::Duration::minutes(5)
+        && end_utc >= now_utc - chrono::Duration::minutes(EVENT_LOOP_ACTIVE_ALERT_MERGE_LAG_MINUTES)
 }
 
 fn send_live_hazard_source_load<F>(
@@ -35941,9 +36682,11 @@ fn build_event_loop_hazard_overlay(
     mut records: Vec<HazardRecord>,
 ) -> HazardOverlay {
     let (start_utc, end_utc) = window_utc;
+    let active_alert_event_ids = active_alert_event_ids(&records);
     dedupe_hazard_records(&mut records);
     records.retain(|record| {
         !matches!(record.action.as_str(), "CAN" | "EXP")
+            && !hazard_record_shadowed_by_active_alert(record, &active_alert_event_ids)
             && event_loop_hazard_record_intersects_window(record, start_utc, end_utc)
     });
     sort_hazard_records(&mut records);
@@ -36008,9 +36751,56 @@ fn sort_hazard_records(records: &mut [HazardRecord]) {
     records.sort_by(|left, right| {
         hazard_family_order(&left.event_family)
             .cmp(&hazard_family_order(&right.event_family))
+            .then_with(|| {
+                hazard_record_threat_priority(right).cmp(&hazard_record_threat_priority(left))
+            })
             .then_with(|| left.valid_end.cmp(&right.valid_end))
             .then_with(|| left.label.cmp(&right.label))
     });
+}
+
+fn hazard_record_threat_priority(record: &HazardRecord) -> u8 {
+    let damage_priority = record
+        .damage_threat
+        .as_deref()
+        .and_then(canonical_damage_threat)
+        .map(|threat| damage_threat_priority(&threat))
+        .unwrap_or(0);
+    let tornado_priority = if record.event_family == "tornado" {
+        record
+            .tornado
+            .as_deref()
+            .map(tornado_detection_priority)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    damage_priority.max(tornado_priority)
+}
+
+fn damage_threat_priority(threat: &str) -> u8 {
+    match threat {
+        "CATASTROPHIC" => 60,
+        "DESTRUCTIVE" => 50,
+        "CONSIDERABLE" => 40,
+        _ => 0,
+    }
+}
+
+fn tornado_detection_priority(value: &str) -> u8 {
+    let upper = value.to_ascii_uppercase();
+    if upper.contains("OBSERVED")
+        || upper.contains("CONFIRMED")
+        || upper.contains("EMERGENCY")
+        || upper.contains("SPOTTER")
+        || upper.contains("LAW ENFORCEMENT")
+    {
+        30
+    } else if upper.contains("RADAR") {
+        10
+    } else {
+        0
+    }
 }
 
 fn selected_hazard_index_for_event_id(
@@ -36139,7 +36929,10 @@ fn merge_duplicate_hazard_record(
         } else {
             existing
         };
-    let geometry_source = if existing.action == "ALERT" {
+    let authoritative_alert_source = authoritative_active_alert_record(existing, candidate);
+    let geometry_source = if let Some(alert_source) = authoritative_alert_source {
+        alert_source
+    } else if existing.action == "ALERT" {
         existing
     } else if candidate.action == "ALERT" {
         candidate
@@ -36163,6 +36956,11 @@ fn merge_duplicate_hazard_record(
     }
     if merged.area.is_none() {
         merged.area = fallback_source.area.clone();
+    }
+    for detail in &fallback_source.details {
+        if !merged.details.contains(detail) {
+            merged.details.push(detail.clone());
+        }
     }
     if merged.motion.is_none() {
         merged.motion = fallback_source.motion.clone();
@@ -36201,7 +36999,73 @@ fn merge_duplicate_hazard_record(
     if merged.damage_threat.is_none() {
         merged.damage_threat = fallback_source.damage_threat.clone();
     }
+    if let Some(alert_source) = authoritative_alert_source {
+        merged.action = alert_source.action.clone();
+        if alert_source.tornado.is_some() {
+            merged.tornado = alert_source.tornado.clone();
+        }
+        if alert_source.hail_inches.is_some() {
+            merged.hail_inches = alert_source.hail_inches;
+        }
+        if alert_source.wind_mph.is_some() {
+            merged.wind_mph = alert_source.wind_mph;
+        }
+        if alert_source.damage_threat.is_some() {
+            merged.damage_threat = alert_source.damage_threat.clone();
+        }
+    }
+    refresh_hazard_label_from_tags(&mut merged);
     merged
+}
+
+fn authoritative_active_alert_record<'a>(
+    left: &'a HazardRecord,
+    right: &'a HazardRecord,
+) -> Option<&'a HazardRecord> {
+    [left, right]
+        .into_iter()
+        .filter(|record| record.action == "ALERT" && live_hazard_record_is_current(record))
+        .max_by_key(|record| active_alert_authority_key(record))
+}
+
+fn active_alert_authority_key(record: &HazardRecord) -> (u8, i64) {
+    (
+        hazard_record_threat_priority(record),
+        parse_hazard_record_time(&record.valid_start)
+            .map(|time| time.timestamp_millis())
+            .unwrap_or(i64::MIN),
+    )
+}
+
+fn refresh_hazard_label_from_tags(record: &mut HazardRecord) {
+    let Some(event_tracking_number) =
+        hazard_event_tracking_number(base_hazard_event_id(&record.event_id))
+    else {
+        return;
+    };
+    if !matches!(
+        record.event_family.as_str(),
+        "tornado"
+            | "severe thunderstorm"
+            | "flash flood"
+            | "flood"
+            | "special marine"
+            | "snow squall"
+    ) {
+        return;
+    }
+    let tags = ParsedWarningTags {
+        tornado: record.tornado.clone(),
+        hail_inches: record.hail_inches,
+        wind_mph: record.wind_mph,
+        damage_threat: record.damage_threat.clone(),
+    };
+    record.label = hazard_label(&record.event_family, event_tracking_number, &tags);
+}
+
+fn hazard_event_tracking_number(event_id: &str) -> Option<&str> {
+    let parts = event_id.split('.').collect::<Vec<_>>();
+    (parts.len() == 4).then(|| parts[3])
 }
 
 fn preferred_lifecycle_status(left: Option<&str>, right: Option<&str>) -> Option<String> {
@@ -36241,6 +37105,8 @@ struct SpcMdLoad {
     records: Vec<HazardRecord>,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn fetch_hot_text_product_type(
     product_type: &str,
     query_time_utc: DateTime<Utc>,
@@ -36379,6 +37245,7 @@ fn fetch_hot_text_product_type_for_window(
     })
 }
 
+#[cfg(test)]
 fn select_hot_text_summaries(
     mut products: Vec<NwsProductSummary>,
     query_time_utc: DateTime<Utc>,
@@ -36456,6 +37323,8 @@ fn nws_product_detail_cache() -> &'static Mutex<BTreeMap<String, NwsProductDetai
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn load_spc_mesoscale_discussions(query_time_utc: DateTime<Utc>) -> Result<SpcMdLoad, String> {
     let index_html = data_source::fetch_text(SPC_MD_INDEX_URL)
         .map_err(|err| format!("SPC MD index fetch failed: {err}"))?;
@@ -36486,6 +37355,8 @@ fn load_spc_mesoscale_discussions(query_time_utc: DateTime<Utc>) -> Result<SpcMd
     })
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn spc_md_product_links(index_html: &str) -> Vec<String> {
     let mut links = Vec::new();
     for part in index_html.split("href=\"").skip(1) {
@@ -36509,6 +37380,7 @@ fn spc_md_product_links(index_html: &str) -> Vec<String> {
     links
 }
 
+#[cfg(test)]
 fn parse_spc_md_product_page(
     source_url: &str,
     html: &str,
@@ -36569,12 +37441,14 @@ fn parse_spc_md_product_page(
     })
 }
 
+#[cfg(test)]
 fn extract_preformatted_text(html: &str) -> Option<&str> {
     let start = html.find("<pre>")? + "<pre>".len();
     let end = html[start..].find("</pre>")? + start;
     Some(html[start..end].trim())
 }
 
+#[cfg(test)]
 fn strip_prefixed_line(lines: &[&str], prefix: &str) -> Option<String> {
     lines.iter().find_map(|line| {
         line.trim()
@@ -36719,6 +37593,7 @@ fn parse_weather_alert_feature(
         .or_else(|| feature.properties.description.clone());
     let source_url = weather_alert_source_url(feature);
     let area = feature.properties.area_desc.clone();
+    let description = feature.properties.description.clone();
     let motion = weather_alert_parameter(&feature.properties.parameters, "eventMotionDescription");
     let label_count = rings.len();
 
@@ -36746,7 +37621,12 @@ fn parse_weather_alert_feature(
                 source_url: source_url.clone(),
                 area: area.clone(),
                 motion: motion.clone(),
-                details: Vec::new(),
+                details: description
+                    .as_ref()
+                    .filter(|description| headline.as_ref() != Some(description))
+                    .cloned()
+                    .into_iter()
+                    .collect(),
                 valid_start: valid_start_text.clone(),
                 valid_end: valid_end_text.clone(),
                 severity: feature.properties.severity.clone(),
@@ -36841,28 +37721,72 @@ fn weather_alert_family(event: &str) -> String {
 
 fn parse_weather_alert_tags(parameters: &BTreeMap<String, Vec<String>>) -> ParsedWarningTags {
     ParsedWarningTags {
-        tornado: weather_alert_parameter(parameters, "tornadoDetection"),
-        hail_inches: weather_alert_parameter(parameters, "maxHailSize")
-            .as_deref()
-            .and_then(parse_leading_float),
-        wind_mph: weather_alert_parameter(parameters, "maxWindGust")
-            .as_deref()
-            .and_then(parse_leading_u16),
-        damage_threat: weather_alert_parameter(parameters, "tornadoDamageThreat")
-            .or_else(|| weather_alert_parameter(parameters, "thunderstormDamageThreat"))
-            .or_else(|| weather_alert_parameter(parameters, "flashFloodDamageThreat")),
+        tornado: preferred_weather_alert_tornado_detection(parameters),
+        hail_inches: max_weather_alert_float_parameter(parameters, "maxHailSize"),
+        wind_mph: max_weather_alert_u16_parameter(parameters, "maxWindGust"),
+        damage_threat: preferred_weather_alert_damage_threat(parameters),
     }
+}
+
+fn weather_alert_parameter_values<'a>(
+    parameters: &'a BTreeMap<String, Vec<String>>,
+    key: &str,
+) -> impl Iterator<Item = &'a str> {
+    parameters
+        .get(key)
+        .into_iter()
+        .flatten()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
 }
 
 fn weather_alert_parameter(
     parameters: &BTreeMap<String, Vec<String>>,
     key: &str,
 ) -> Option<String> {
-    parameters
-        .get(key)
-        .and_then(|values| values.first())
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
+    weather_alert_parameter_values(parameters, key)
+        .next()
+        .map(str::to_owned)
+}
+
+fn preferred_weather_alert_tornado_detection(
+    parameters: &BTreeMap<String, Vec<String>>,
+) -> Option<String> {
+    weather_alert_parameter_values(parameters, "tornadoDetection")
+        .max_by_key(|value| tornado_detection_priority(value))
+        .map(str::to_owned)
+}
+
+fn preferred_weather_alert_damage_threat(
+    parameters: &BTreeMap<String, Vec<String>>,
+) -> Option<String> {
+    [
+        "tornadoDamageThreat",
+        "thunderstormDamageThreat",
+        "flashFloodDamageThreat",
+    ]
+    .into_iter()
+    .flat_map(|key| weather_alert_parameter_values(parameters, key))
+    .filter_map(canonical_damage_threat)
+    .max_by_key(|threat| damage_threat_priority(threat))
+}
+
+fn max_weather_alert_float_parameter(
+    parameters: &BTreeMap<String, Vec<String>>,
+    key: &str,
+) -> Option<f32> {
+    weather_alert_parameter_values(parameters, key)
+        .filter_map(parse_leading_float)
+        .reduce(f32::max)
+}
+
+fn max_weather_alert_u16_parameter(
+    parameters: &BTreeMap<String, Vec<String>>,
+    key: &str,
+) -> Option<u16> {
+    weather_alert_parameter_values(parameters, key)
+        .filter_map(parse_leading_u16)
+        .max()
 }
 
 fn weather_alert_source_url(feature: &WeatherAlertFeature) -> Option<String> {
@@ -37225,10 +38149,25 @@ fn parse_warning_tags(lines: &[&str]) -> ParsedWarningTags {
             .or_else(|| trimmed.strip_prefix("TSTM DAMAGE THREAT..."))
             .or_else(|| trimmed.strip_prefix("FLASH FLOOD DAMAGE THREAT..."))
         {
-            tags.damage_threat = Some(value.trim().to_owned());
+            tags.damage_threat = canonical_damage_threat(value);
         }
     }
     tags
+}
+
+fn canonical_damage_threat(value: &str) -> Option<String> {
+    let upper = value.trim().to_ascii_uppercase();
+    if upper.is_empty() {
+        None
+    } else if upper.contains("CATASTROPHIC") {
+        Some("CATASTROPHIC".to_owned())
+    } else if upper.contains("CONSIDERABLE") {
+        Some("CONSIDERABLE".to_owned())
+    } else if upper.contains("DESTRUCTIVE") {
+        Some("DESTRUCTIVE".to_owned())
+    } else {
+        Some(upper)
+    }
 }
 
 fn parse_leading_float(value: &str) -> Option<f32> {
@@ -37422,7 +38361,7 @@ fn hazard_label(
     let threat = tags
         .damage_threat
         .as_deref()
-        .map(str::to_ascii_uppercase)
+        .and_then(canonical_damage_threat)
         .unwrap_or_default();
     let prefix = match event_family {
         "tornado" => match threat.as_str() {
@@ -38290,7 +39229,7 @@ fn selection_for_installed_volume(
             allow_low_level_auto_advance,
             allow_incomplete_live_chunk_advance,
             require_complete_live_cut,
-            low_level_min_seconds: LIVE_LOW_LEVEL_AUTO_ADVANCE_MIN_SECONDS,
+            low_level_min_seconds: 60,
         },
     )
 }
@@ -38452,6 +39391,10 @@ fn best_cut_for_product_with_live_filter(
     product: &DisplayProduct,
     require_complete_live_cut: bool,
 ) -> Option<usize> {
+    if is_displayable_on_live_candidate_cut(volume, current_cut, product, require_complete_live_cut)
+    {
+        return Some(current_cut);
+    }
     let current_elevation = volume.cuts.get(current_cut).map(|cut| cut.elevation_deg);
     volume
         .cuts
@@ -38467,7 +39410,14 @@ fn best_cut_for_product_with_live_filter(
             let right_delta = current_elevation
                 .map(|elevation| (right_cut.elevation_deg - elevation).abs())
                 .unwrap_or(*right_index as f32);
-            left_delta.total_cmp(&right_delta)
+            left_delta
+                .total_cmp(&right_delta)
+                .then_with(|| {
+                    left_index
+                        .abs_diff(current_cut)
+                        .cmp(&right_index.abs_diff(current_cut))
+                })
+                .then_with(|| left_index.cmp(right_index))
         })
         .map(|(index, _)| index)
 }
@@ -39756,6 +40706,9 @@ fn best_cut_for_product(
     current_cut: usize,
     product: &DisplayProduct,
 ) -> Option<usize> {
+    if is_displayable_on_cut(volume, current_cut, product) {
+        return Some(current_cut);
+    }
     let current_elevation = volume.cuts.get(current_cut).map(|cut| cut.elevation_deg);
     volume
         .cuts
@@ -39769,7 +40722,14 @@ fn best_cut_for_product(
             let right_delta = current_elevation
                 .map(|elevation| (right_cut.elevation_deg - elevation).abs())
                 .unwrap_or(*right_index as f32);
-            left_delta.total_cmp(&right_delta)
+            left_delta
+                .total_cmp(&right_delta)
+                .then_with(|| {
+                    left_index
+                        .abs_diff(current_cut)
+                        .cmp(&right_index.abs_diff(current_cut))
+                })
+                .then_with(|| left_index.cmp(right_index))
         })
         .map(|(index, _)| index)
 }
@@ -41530,10 +42490,16 @@ mod tests {
     }
 
     #[test]
-    fn plain_velocity_render_unfolds_by_default_but_can_show_raw() {
+    fn plain_velocity_is_raw_by_default_and_dealiasing_is_explicit() {
+        let app = test_viewer_app_with_hazards(Vec::new());
         let velocity = DisplayProduct::Moment(MomentType::Velocity);
+
+        assert!(
+            !app.unfold_velocity_display,
+            "plain VEL must start as the radar's raw velocity field"
+        );
+        assert!(!velocity.render_uses_dealiased_velocity(app.unfold_velocity_display));
         assert!(velocity.render_uses_dealiased_velocity(true));
-        assert!(!velocity.render_uses_dealiased_velocity(false));
         assert!(DisplayProduct::DealiasedVelocity.render_uses_dealiased_velocity(false));
         assert!(!DisplayProduct::StormRelativeVelocity.render_uses_dealiased_velocity(false));
     }
@@ -42147,6 +43113,32 @@ mod tests {
     }
 
     #[test]
+    fn best_cut_for_product_prefers_exact_duplicate_elevation_cut() {
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let volume = test_reflectivity_sails_volume_with_radials(
+            &[
+                (0.64, 0),
+                (0.44, 17_000),
+                (0.75, 40_000),
+                (0.81, 57_000),
+                (0.52, 80_000),
+                (0.44, 97_000),
+            ],
+            720,
+        );
+
+        assert_eq!(best_cut_for_product(&volume, 5, &product), Some(5));
+        assert_eq!(
+            best_cut_for_product_with_live_filter(&volume, 5, &product, false),
+            Some(5)
+        );
+        assert_eq!(
+            best_cut_for_product_with_live_filter(&volume, 5, &product, true),
+            Some(5)
+        );
+    }
+
+    #[test]
     fn synced_velocity_pane_does_not_flip_to_ref_on_ref_only_live_partial() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.volume = Some(Arc::new(test_ref_then_velocity_volume()));
@@ -42322,10 +43314,26 @@ mod tests {
                     allow_low_level_auto_advance: true,
                     allow_incomplete_live_chunk_advance: false,
                     require_complete_live_cut: false,
-                    low_level_min_seconds: FAST_LOW_SWEEP_AUTO_ADVANCE_MIN_SECONDS,
+                    low_level_min_seconds: i64::from(MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS),
                 },
             ),
             (1, product)
+        );
+    }
+
+    #[test]
+    fn live_low_sweep_auto_advance_seconds_setting_controls_threshold() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.live_low_sweep_auto_advance_seconds = 30;
+        assert_eq!(app.live_low_sweep_auto_advance_min_seconds(), 30);
+
+        app.app_settings.live_low_sweep_auto_advance_seconds = 10;
+        assert_eq!(app.live_low_sweep_auto_advance_min_seconds(), 10);
+
+        app.app_settings.live_low_sweep_auto_advance = true;
+        assert_eq!(
+            app.live_low_sweep_auto_advance_min_seconds(),
+            i64::from(MIN_LIVE_LOW_SWEEP_AUTO_ADVANCE_SECONDS)
         );
     }
 
@@ -42513,6 +43521,48 @@ mod tests {
             LoopRenderContextKey::from_texture_key(&next_cut),
             "TextureKey separates cuts; changing low-sweep cut must not flush the whole loop cache"
         );
+    }
+
+    #[test]
+    fn loop_prewarm_walks_actual_low_sweep_steps_inside_one_volume() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_low_sweeps = true;
+        app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
+        app.selected_cut = 0;
+        let volume = Arc::new(test_velocity_sails_volume_with_radials(
+            &[(0.5, 0), (0.5, 30_000), (0.5, 60_000)],
+            720,
+        ));
+        app.volume = Some(Arc::clone(&volume));
+        app.frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from("one-volume-low-sweep-prewarm"),
+            volume,
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        });
+
+        let steps = app.upcoming_primary_loop_steps(2);
+
+        assert_eq!(
+            steps,
+            vec![
+                LoopTimelineStep {
+                    frame_index: 0,
+                    cut_index: Some(1),
+                    low_sweep_rank: Some(1),
+                },
+                LoopTimelineStep {
+                    frame_index: 0,
+                    cut_index: Some(2),
+                    low_sweep_rank: Some(2),
+                },
+            ],
+            "prewarming must follow SAILS cuts, not only volume indices"
+        );
+        assert_eq!(app.primary_cut_for_loop_step(steps[0]), Some(1));
+        assert_eq!(app.primary_cut_for_loop_step(steps[1]), Some(2));
     }
 
     #[test]
@@ -42795,13 +43845,13 @@ mod tests {
         app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
         let ctx = egui::Context::default();
 
-        app.maybe_advance_history_loop(&ctx);
+        advance_primary_screen_loop_for_test(&mut app, &ctx);
         assert_eq!(app.selected_frame_index, 0);
         assert_eq!(app.selected_cut, 1);
         assert!(app.history_playing);
 
         app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
-        app.maybe_advance_history_loop(&ctx);
+        advance_primary_screen_loop_for_test(&mut app, &ctx);
         assert_eq!(app.selected_frame_index, 0);
         assert_eq!(app.selected_cut, 0);
         assert!(app.history_playing);
@@ -42905,11 +43955,30 @@ mod tests {
     }
 
     #[test]
-    fn unified_player_reports_warning_sync_needed_even_when_overlay_hidden() {
+    fn unified_player_live_follow_does_not_request_warning_sync() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.hazards_visible = false;
         app.unified_player.auto_sync_warnings = true;
         add_two_test_history_frames(&mut app);
+        app.volume = Some(Arc::clone(&app.frame_history[0].volume));
+
+        let context = app.unified_player_context();
+
+        assert!(context.can_sync_warnings());
+        assert!(!context.warnings_need_sync);
+        assert!(!context.warnings_timeline_ready);
+        assert!(!app.should_auto_sync_timeline_warnings());
+    }
+
+    #[test]
+    fn unified_player_archive_reports_warning_sync_needed_even_when_overlay_hidden() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.hazards_visible = false;
+        app.unified_player.auto_sync_warnings = true;
+        add_two_test_history_frames(&mut app);
+        for frame in &mut app.frame_history {
+            frame.status = FrameStatus::Complete;
+        }
         app.volume = Some(Arc::clone(&app.frame_history[0].volume));
 
         let context = app.unified_player_context();
@@ -42920,7 +43989,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_player_auto_sync_action_arms_timeline_warning_layer() {
+    fn unified_player_auto_sync_without_archive_keeps_live_warning_layer() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.hazards_visible = false;
         app.hazards_active_only = true;
@@ -42936,9 +44005,29 @@ mod tests {
         );
 
         assert!(app.unified_player.auto_sync_warnings);
-        assert!(app.hazards_visible);
-        assert!(!app.hazards_active_only);
-        assert!(!app.live_hazard_auto_refresh);
+        assert!(!app.hazards_visible);
+        assert!(app.hazards_active_only);
+        assert!(app.live_hazard_auto_refresh);
+    }
+
+    #[test]
+    fn manual_live_warning_refresh_disarms_timeline_warning_sync() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let start = Utc.with_ymd_and_hms(2026, 6, 21, 22, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 6, 21, 23, 0, 0).unwrap();
+        app.unified_player.auto_sync_warnings = true;
+        app.event_loop_hazard_window = Some((start, end));
+        app.pending_event_loop_hazard_window = Some((start + chrono::Duration::minutes(5), end));
+        app.hazards_active_only = false;
+        app.live_hazard_auto_refresh = false;
+
+        app.switch_to_live_hazard_mode();
+
+        assert!(!app.unified_player.auto_sync_warnings);
+        assert!(app.event_loop_hazard_window.is_none());
+        assert!(app.pending_event_loop_hazard_window.is_none());
+        assert!(app.hazards_active_only);
+        assert!(app.live_hazard_auto_refresh);
     }
 
     #[test]
@@ -43200,6 +44289,13 @@ mod tests {
         assert!(!app.should_auto_sync_timeline_warnings());
 
         add_two_test_history_frames(&mut app);
+        assert!(
+            !app.should_auto_sync_timeline_warnings(),
+            "live-follow histories must keep current warnings"
+        );
+        for frame in &mut app.frame_history {
+            frame.status = FrameStatus::Complete;
+        }
         assert!(app.should_auto_sync_timeline_warnings());
 
         app.event_loop_hazard_window = app.loaded_loop_time_window();
@@ -43243,7 +44339,7 @@ mod tests {
                 path: PathBuf::from(format!("independent-warning-sync-{minutes}")),
                 volume,
                 timings: None,
-                status: FrameStatus::LiveComplete,
+                status: FrameStatus::Complete,
                 source_label: "test".to_owned(),
             });
         }
@@ -43284,7 +44380,7 @@ mod tests {
             path: PathBuf::from("low-sweep-warning-sync"),
             volume,
             timings: None,
-            status: FrameStatus::LiveComplete,
+            status: FrameStatus::Complete,
             source_label: "test".to_owned(),
         });
 
@@ -43298,6 +44394,9 @@ mod tests {
         app.unified_player.auto_sync_warnings = true;
         app.hazards_visible = true;
         add_two_test_history_frames(&mut app);
+        for frame in &mut app.frame_history {
+            frame.status = FrameStatus::Complete;
+        }
 
         assert!(
             !app.loop_record_timeline_overlays_settled(),
@@ -43768,13 +44867,13 @@ mod tests {
         let ctx = egui::Context::default();
 
         app.last_history_step = None;
-        app.maybe_advance_history_loop(&ctx);
+        advance_primary_screen_loop_for_test(&mut app, &ctx);
         assert_eq!(app.selected_frame_index, 1);
         assert_eq!(app.extra_panes[0].cut, Some(0));
         assert_eq!(app.current_loop_timeline_step_index(), 1);
 
         app.last_history_step = None;
-        app.maybe_advance_history_loop(&ctx);
+        advance_primary_screen_loop_for_test(&mut app, &ctx);
         assert_eq!(app.selected_frame_index, 1);
         assert_eq!(
             app.extra_panes[0].cut,
@@ -43784,12 +44883,12 @@ mod tests {
         assert_eq!(app.current_loop_timeline_step_index(), 2);
 
         app.last_history_step = None;
-        app.maybe_advance_history_loop(&ctx);
+        advance_primary_screen_loop_for_test(&mut app, &ctx);
         assert_eq!(app.extra_panes[0].cut, Some(2));
         assert_eq!(app.current_loop_timeline_step_index(), 3);
 
         app.last_history_step = None;
-        app.maybe_advance_history_loop(&ctx);
+        advance_primary_screen_loop_for_test(&mut app, &ctx);
         assert_eq!(app.selected_frame_index, 0);
         assert_eq!(app.extra_panes[0].cut, Some(0));
         assert_eq!(app.current_loop_timeline_step_index(), 0);
@@ -43917,7 +45016,7 @@ mod tests {
         let ctx = egui::Context::default();
 
         app.extra_panes[0].last_history_step = None;
-        app.maybe_advance_extra_pane_history_loops(&ctx);
+        advance_extra_pane_screen_loops_for_test(&mut app, &ctx);
         assert_eq!(app.extra_panes[0].selected_frame_index, 1);
         assert_eq!(app.extra_panes[0].cut, Some(0));
         assert_eq!(
@@ -43926,7 +45025,7 @@ mod tests {
         );
 
         app.extra_panes[0].last_history_step = None;
-        app.maybe_advance_extra_pane_history_loops(&ctx);
+        advance_extra_pane_screen_loops_for_test(&mut app, &ctx);
         assert_eq!(app.extra_panes[0].selected_frame_index, 1);
         assert_eq!(
             app.extra_panes[0].cut,
@@ -44025,7 +45124,7 @@ mod tests {
         pane.last_history_step = None;
         let ctx = egui::Context::default();
 
-        app.maybe_advance_extra_pane_history_loops(&ctx);
+        advance_extra_pane_screen_loops_for_test(&mut app, &ctx);
         assert_eq!(app.extra_panes[0].selected_frame_index, 1);
         assert_eq!(app.extra_panes[0].cut, Some(0));
         assert!(app.extra_panes[0].history_playing);
@@ -44076,7 +45175,7 @@ mod tests {
         let ctx = egui::Context::default();
 
         app.last_history_step = None;
-        app.maybe_advance_history_loop(&ctx);
+        advance_primary_screen_loop_for_test(&mut app, &ctx);
         assert_eq!(app.selected_frame_index, 1);
         assert_eq!(
             app.extra_panes[0].selected_frame_index, 1,
@@ -44085,7 +45184,7 @@ mod tests {
         assert_eq!(app.extra_panes[0].cut, Some(0));
 
         app.last_history_step = None;
-        app.maybe_advance_history_loop(&ctx);
+        advance_primary_screen_loop_for_test(&mut app, &ctx);
         assert_eq!(app.selected_frame_index, 1);
         assert_eq!(app.extra_panes[0].selected_frame_index, 1);
         assert_eq!(
@@ -44513,7 +45612,7 @@ mod tests {
     }
 
     #[test]
-    fn high_speed_primary_playback_advances_with_stale_texture() {
+    fn high_speed_primary_playback_waits_for_matching_texture() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.app_settings.loop_speed_percent = 400;
         app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
@@ -44528,7 +45627,7 @@ mod tests {
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
                 path: PathBuf::from(format!(
-                    "high-speed-primary-no-render-gate-{}",
+                    "high-speed-primary-render-gate-{}",
                     volume.volume_time.timestamp()
                 )),
                 volume,
@@ -44538,32 +45637,40 @@ mod tests {
             })
             .collect();
         app.history_playing = true;
-        app.last_history_step = None;
-        app.texture_key = Some(TextureKey {
-            volume_ptr: Arc::as_ptr(&second) as usize,
-            cut: 0,
-            product: DisplayProduct::Moment(MomentType::Velocity),
-            render_dealiased_velocity: false,
-            color_table_signature: 1,
-            storm_motion_key: (0, 0),
-            hail_levels_key: (32, 64),
-            smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
-            gate_filter_decidbz: i16::MIN,
-            viewport: test_viewport_key(720, 480),
-        });
+        app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        app.texture_key = Some(test_screen_texture_key(
+            Arc::as_ptr(&second) as usize,
+            0,
+            DisplayProduct::Moment(MomentType::Velocity),
+        ));
         let ctx = egui::Context::default();
 
         app.maybe_advance_history_loop(&ctx);
 
         assert_eq!(
-            app.selected_frame_index, 1,
-            "screen playback must not reuse recording-grade texture readiness as a frame gate"
+            app.selected_frame_index, 0,
+            "screen playback must hold selection while the visible texture belongs to another frame"
         );
+        assert!(
+            app.last_history_step.is_none(),
+            "render wait time must not consume the selected frame's dwell"
+        );
+
+        mark_primary_screen_textures_ready(&mut app);
+        app.maybe_advance_history_loop(&ctx);
+        assert_eq!(
+            app.selected_frame_index, 0,
+            "a ready frame starts its dwell first"
+        );
+        assert!(app.last_history_step.is_some());
+
+        app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        app.maybe_advance_history_loop(&ctx);
+        assert_eq!(app.selected_frame_index, 1);
     }
 
     #[test]
-    fn high_speed_extra_pane_playback_advances_with_stale_texture() {
+    fn high_speed_extra_pane_playback_waits_for_matching_texture() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.app_settings.loop_speed_percent = 400;
         app.app_settings.grid_pane_count = 2;
@@ -44583,7 +45690,7 @@ mod tests {
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
                 path: PathBuf::from(format!(
-                    "high-speed-pane-no-render-gate-{}",
+                    "high-speed-pane-render-gate-{}",
                     volume.volume_time.timestamp()
                 )),
                 volume,
@@ -44593,28 +45700,30 @@ mod tests {
             })
             .collect();
         pane.history_playing = true;
-        pane.last_history_step = None;
-        pane.texture_key = Some(TextureKey {
-            volume_ptr: Arc::as_ptr(&second) as usize,
-            cut: 0,
-            product: DisplayProduct::Moment(MomentType::Velocity),
-            render_dealiased_velocity: false,
-            color_table_signature: 1,
-            storm_motion_key: (0, 0),
-            hail_levels_key: (32, 64),
-            smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
-            gate_filter_decidbz: i16::MIN,
-            viewport: test_viewport_key(720, 480),
-        });
+        pane.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        pane.texture_key = Some(test_screen_texture_key(
+            Arc::as_ptr(&second) as usize,
+            0,
+            DisplayProduct::Moment(MomentType::Velocity),
+        ));
         let ctx = egui::Context::default();
 
         app.maybe_advance_extra_pane_history_loops(&ctx);
 
         assert_eq!(
-            app.extra_panes[0].selected_frame_index, 1,
-            "extra-pane screen playback must not block on stale pane texture readiness"
+            app.extra_panes[0].selected_frame_index, 0,
+            "independent pane playback must hold while its selected texture is stale"
         );
+        assert!(app.extra_panes[0].last_history_step.is_none());
+
+        mark_extra_pane_screen_texture_ready(&mut app, 0);
+        app.maybe_advance_extra_pane_history_loops(&ctx);
+        assert_eq!(app.extra_panes[0].selected_frame_index, 0);
+        assert!(app.extra_panes[0].last_history_step.is_some());
+
+        app.extra_panes[0].last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        app.maybe_advance_extra_pane_history_loops(&ctx);
+        assert_eq!(app.extra_panes[0].selected_frame_index, 1);
     }
 
     #[test]
@@ -45715,6 +46824,39 @@ mod tests {
     }
 
     #[test]
+    fn blank_browse_state_selects_loaded_latest_frame() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.browsing_history = true;
+        app.history_playing = false;
+        app.volume = None;
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+
+        let mut latest = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        latest.site.id = "KTLX".to_owned();
+        latest.volume_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 35, 0).unwrap();
+        let ctx = egui::Context::default();
+
+        let selected = app.install_decoded_load_batch(
+            DecodedLoadBatch {
+                frames: vec![test_decoded_from_volume(
+                    PathBuf::from("KTLX-latest"),
+                    latest,
+                    FrameStatus::Complete,
+                )],
+                selected_index: 0,
+            },
+            true,
+            true,
+            &ctx,
+        );
+
+        assert!(selected);
+        assert!(!app.browsing_history);
+        assert!(app.volume.is_some());
+        assert_eq!(app.selected_frame_index, 0);
+    }
+
+    #[test]
     fn product_hotkeys_accept_numbers_and_letters() {
         assert_eq!(product_hotkey_egui_key("1"), Some(egui::Key::Num1));
         assert_eq!(product_hotkey_egui_key("0"), Some(egui::Key::Num0));
@@ -45884,6 +47026,96 @@ mod tests {
             DisplayProduct::Moment(MomentType::Velocity)
         );
         assert_eq!(app.selected_cut, 0);
+    }
+
+    #[test]
+    fn same_frame_completion_preserves_manual_low_sweep_cut() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_low_sweeps = true;
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let mut latest = test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0), (0.5, 60_000), (0.5, 120_000)],
+            720,
+        );
+        latest.site.id = "KTLX".to_owned();
+        latest.volume_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 35, 0).unwrap();
+        let ctx = egui::Context::default();
+
+        assert!(app.install_decoded_load_batch(
+            DecodedLoadBatch {
+                frames: vec![test_decoded_from_volume(
+                    PathBuf::from("KTLX-latest"),
+                    latest.clone(),
+                    FrameStatus::LiveComplete,
+                )],
+                selected_index: 0,
+            },
+            true,
+            true,
+            &ctx,
+        ));
+        assert_eq!(app.selected_cut, 0);
+
+        app.selected_cut = 1;
+        assert!(app.install_decoded_load_batch(
+            DecodedLoadBatch {
+                frames: vec![test_decoded_from_volume(
+                    PathBuf::from("KTLX-latest"),
+                    latest,
+                    FrameStatus::LiveComplete,
+                )],
+                selected_index: 0,
+            },
+            true,
+            true,
+            &ctx,
+        ));
+
+        assert_eq!(app.selected_cut, 1);
+    }
+
+    #[test]
+    fn manual_tilt_click_pauses_loop_and_keeps_selected_cut() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_low_sweeps = true;
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let volume = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[
+                (0.64, 0),
+                (0.44, 17_000),
+                (0.75, 40_000),
+                (0.81, 57_000),
+                (0.52, 80_000),
+                (0.44, 97_000),
+            ],
+            720,
+        ));
+        app.volume = Some(Arc::clone(&volume));
+        app.frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from("manual-tilt"),
+            volume,
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        });
+        app.selected_frame_index = 0;
+        app.selected_cut = 0;
+        app.history_playing = true;
+        app.last_history_step = Some(Instant::now() - Duration::from_secs(10));
+        let ctx = egui::Context::default();
+
+        app.select_primary_cut_manually(5, &ctx);
+        app.maybe_advance_history_loop(&ctx);
+
+        assert_eq!(app.selected_cut, 5);
+        assert_eq!(
+            app.manual_primary_cut_hold
+                .as_ref()
+                .map(|hold| hold.cut_index),
+            Some(5)
+        );
+        assert!(!app.history_playing);
     }
 
     #[test]
@@ -48376,7 +49608,7 @@ mod tests {
         );
         // Case-insensitive: text products and CAP parameters both feed this.
         let pds = ParsedWarningTags {
-            damage_threat: Some("considerable".into()),
+            damage_threat: Some("considerable damage threat".into()),
             ..Default::default()
         };
         assert_eq!(hazard_label("tornado", "0001", &pds), "PDS TOR 0001");
@@ -48387,12 +49619,147 @@ mod tests {
                 "severe thunderstorm",
                 "0300",
                 &ParsedWarningTags {
-                    damage_threat: Some("DESTRUCTIVE".into()),
+                    damage_threat: Some("DESTRUCTIVE DAMAGE THREAT".into()),
                     ..Default::default()
                 }
             ),
             "SVR DESTRUCTIVE 0300"
         );
+    }
+
+    #[test]
+    fn weather_gov_alert_tags_prefer_strongest_repeated_values() {
+        let mut parameters = BTreeMap::new();
+        parameters.insert(
+            "tornadoDetection".to_owned(),
+            vec!["RADAR INDICATED".to_owned(), "OBSERVED".to_owned()],
+        );
+        parameters.insert(
+            "tornadoDamageThreat".to_owned(),
+            vec!["base".to_owned(), "considerable damage threat".to_owned()],
+        );
+        parameters.insert(
+            "maxHailSize".to_owned(),
+            vec!["0.75".to_owned(), "1.50".to_owned()],
+        );
+        parameters.insert(
+            "maxWindGust".to_owned(),
+            vec!["60 MPH".to_owned(), "80 MPH".to_owned()],
+        );
+
+        let tags = parse_weather_alert_tags(&parameters);
+
+        assert_eq!(tags.tornado.as_deref(), Some("OBSERVED"));
+        assert_eq!(tags.damage_threat.as_deref(), Some("CONSIDERABLE"));
+        assert_eq!(tags.hail_inches, Some(1.5));
+        assert_eq!(tags.wind_mph, Some(80));
+        assert_eq!(
+            hazard_label("tornado", "0075", &tags),
+            "PDS TOR 0075 OBSERVED"
+        );
+    }
+
+    #[test]
+    fn duplicate_active_alert_merge_prefers_stronger_current_tags() {
+        let mut older = test_hazard_record(
+            "KLSX.TO.W.0075",
+            "TOR 0075 RADAR INDICATED",
+            "tornado",
+            square_hazard_points(-90.0, 38.0, -89.0, 39.0),
+        );
+        older.action = "ALERT".to_owned();
+        older.tornado = Some("RADAR INDICATED".to_owned());
+        older.valid_start = Some("2026-06-21T23:00:00Z".to_owned());
+        older.valid_end = Some("2026-06-22T00:15:00Z".to_owned());
+        let mut newer = test_hazard_record(
+            "KLSX.TO.W.0075",
+            "PDS TOR 0075 OBSERVED",
+            "tornado",
+            square_hazard_points(-89.8, 38.2, -88.8, 39.2),
+        );
+        newer.action = "ALERT".to_owned();
+        newer.tornado = Some("OBSERVED".to_owned());
+        newer.damage_threat = Some("CONSIDERABLE".to_owned());
+        newer.valid_start = Some("2026-06-21T23:24:00Z".to_owned());
+        newer.valid_end = Some("2026-06-22T00:15:00Z".to_owned());
+        let mut records = vec![older, newer.clone()];
+
+        dedupe_hazard_records(&mut records);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].bbox, newer.bbox);
+        assert_eq!(records[0].action, "ALERT");
+        assert_eq!(records[0].tornado.as_deref(), Some("OBSERVED"));
+        assert_eq!(records[0].damage_threat.as_deref(), Some("CONSIDERABLE"));
+        assert_eq!(records[0].label, "PDS TOR 0075 OBSERVED");
+    }
+
+    #[test]
+    fn hazard_sort_promotes_observed_tornado_rows() {
+        let mut radar = test_hazard_record(
+            "KIND.TO.W.0063",
+            "TOR 0063 RADAR INDICATED",
+            "tornado",
+            square_hazard_points(-87.0, 39.0, -86.0, 40.0),
+        );
+        radar.tornado = Some("RADAR INDICATED".to_owned());
+        radar.valid_end = Some("2026-06-21T23:30:00Z".to_owned());
+        let mut observed = test_hazard_record(
+            "KLSX.TO.W.0075",
+            "PDS TOR 0075 OBSERVED",
+            "tornado",
+            square_hazard_points(-90.0, 38.0, -89.0, 39.0),
+        );
+        observed.tornado = Some("OBSERVED".to_owned());
+        observed.damage_threat = Some("CONSIDERABLE".to_owned());
+        observed.valid_end = Some("2026-06-22T00:15:00Z".to_owned());
+        let mut records = vec![radar, observed];
+
+        sort_hazard_records(&mut records);
+
+        assert_eq!(records[0].label, "PDS TOR 0075 OBSERVED");
+    }
+
+    #[test]
+    fn event_loop_active_alert_shadows_stale_product_text_row() {
+        let start = Instant::now();
+        let window_start = Utc.with_ymd_and_hms(2026, 6, 21, 23, 0, 0).unwrap();
+        let window_end = Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap();
+        let mut active = test_hazard_record(
+            "KLSX.TO.W.0075#0",
+            "PDS TOR 0075 OBSERVED",
+            "tornado",
+            square_hazard_points(-89.8, 38.2, -88.8, 39.2),
+        );
+        active.action = "ALERT".to_owned();
+        active.tornado = Some("OBSERVED".to_owned());
+        active.damage_threat = Some("CONSIDERABLE".to_owned());
+        active.valid_start = Some("2026-06-21T23:24:00Z".to_owned());
+        active.valid_end = Some("2026-06-22T00:15:00Z".to_owned());
+        let mut product = test_hazard_record(
+            "KLSX.TO.W.0075",
+            "TOR 0075 RADAR INDICATED",
+            "tornado",
+            square_hazard_points(-90.0, 38.0, -89.0, 39.0),
+        );
+        product.action = "NEW".to_owned();
+        product.tornado = Some("RADAR INDICATED".to_owned());
+        product.valid_start = Some("2026-06-21T23:00:00Z".to_owned());
+        product.valid_end = Some("2026-06-22T00:15:00Z".to_owned());
+
+        let overlay = build_event_loop_hazard_overlay(
+            "test".to_owned(),
+            (window_start, window_end),
+            2,
+            2,
+            0,
+            start,
+            vec![product, active],
+        );
+
+        assert_eq!(overlay.records.len(), 1);
+        assert_eq!(overlay.records[0].event_id, "KLSX.TO.W.0075#0");
+        assert_eq!(overlay.records[0].label, "PDS TOR 0075 OBSERVED");
     }
 
     #[test]
@@ -48802,14 +50169,14 @@ mod tests {
     }
 
     #[test]
-    fn event_loop_hazard_visibility_uses_selected_cut_time() {
+    fn event_loop_hazard_visibility_uses_scan_time_not_selected_cut_time() {
         let mut warning = test_hazard_record(
             "cut-time-warning",
             "TOR 45",
             "tornado",
             square_hazard_points(-101.0, 34.0, -100.0, 35.0),
         );
-        warning.valid_start = Some("1970-01-01T00:01:00Z".to_owned());
+        warning.valid_start = Some("1970-01-01T00:00:00Z".to_owned());
         warning.valid_end = Some("1970-01-01T00:02:00Z".to_owned());
         let mut app = test_viewer_app_with_hazards(vec![warning]);
         app.volume = Some(Arc::new(test_reflectivity_sails_volume_with_radials(
@@ -48822,7 +50189,7 @@ mod tests {
         ));
 
         app.selected_cut = 0;
-        assert!(app.visible_hazard_list_rows().is_empty());
+        assert_eq!(app.visible_hazard_list_rows().len(), 1);
 
         app.selected_cut = 1;
         assert_eq!(app.visible_hazard_list_rows().len(), 1);
@@ -49145,8 +50512,10 @@ mod tests {
             square_hazard_points(-0.1, -0.1, 0.1, 0.1),
         );
         let mut app = test_viewer_app_with_hazards(vec![warning.clone()]);
+        let generation = app.hazard_overlay_generation;
 
         assert!(!app.install_hazard_result(Ok(test_hazard_overlay(vec![warning])), false));
+        assert_eq!(app.hazard_overlay_generation, generation);
     }
 
     #[test]
@@ -49164,9 +50533,11 @@ mod tests {
             square_hazard_points(0.3, 0.3, 0.5, 0.5),
         );
         let mut app = test_viewer_app_with_hazards(vec![existing]);
+        let generation = app.hazard_overlay_generation;
 
         assert!(!app.install_hazard_result(Ok(test_hazard_overlay(vec![incoming])), true));
         assert_eq!(app.hazard_overlay.as_ref().unwrap().records.len(), 1);
+        assert_eq!(app.hazard_overlay_generation, generation);
     }
 
     #[test]
@@ -49351,6 +50722,100 @@ mod tests {
         assert_eq!(overlay.records.len(), 1);
         assert_eq!(overlay.records[0].bbox, alert.bbox);
         assert_eq!(overlay.records[0].details, ["Richer product text"]);
+    }
+
+    #[test]
+    fn active_alert_tornado_detection_survives_older_product_text() {
+        let start = Instant::now();
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 21, 22, 58, 0)
+            .single()
+            .expect("valid query time");
+        let mut alert = test_hazard_record(
+            "KILX.TO.W.0128",
+            "TOR 0128 OBSERVED",
+            "tornado",
+            square_hazard_points(-88.0, 38.6, -87.8, 38.8),
+        );
+        alert.action = "ALERT".to_owned();
+        alert.lifecycle_status = Some("Active".to_owned());
+        alert.source_url = Some("https://api.weather.gov/alerts/1".to_owned());
+        alert.tornado = Some("OBSERVED".to_owned());
+        alert.hail_inches = Some(1.25);
+        let mut product = test_hazard_record(
+            "KILX.TO.W.0128",
+            "TOR 0128 RADAR INDICATED",
+            "tornado",
+            square_hazard_points(-89.0, 38.0, -87.0, 39.0),
+        );
+        product.action = "CON".to_owned();
+        product.lifecycle_status = Some("Active".to_owned());
+        product.tornado = Some("RADAR INDICATED".to_owned());
+        product.details.push("Richer continuation text".to_owned());
+
+        let overlay = build_live_hazard_overlay(
+            "test".to_owned(),
+            query_time,
+            2,
+            2,
+            0,
+            start,
+            vec![product, alert.clone()],
+        );
+
+        assert_eq!(overlay.records.len(), 1);
+        assert_eq!(overlay.records[0].bbox, alert.bbox);
+        assert_eq!(overlay.records[0].tornado.as_deref(), Some("OBSERVED"));
+        assert_eq!(overlay.records[0].hail_inches, Some(1.25));
+        assert_eq!(overlay.records[0].label, "TOR 0128 OBSERVED");
+        assert_eq!(overlay.records[0].details, ["Richer continuation text"]);
+    }
+
+    #[test]
+    fn product_text_can_fill_missing_active_alert_pds_threat() {
+        let start = Instant::now();
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 21, 22, 58, 0)
+            .single()
+            .expect("valid query time");
+        let mut alert = test_hazard_record(
+            "KILX.TO.W.0128",
+            "TOR 0128 OBSERVED",
+            "tornado",
+            square_hazard_points(-88.0, 38.6, -87.8, 38.8),
+        );
+        alert.action = "ALERT".to_owned();
+        alert.lifecycle_status = Some("Active".to_owned());
+        alert.source_url = Some("https://api.weather.gov/alerts/1".to_owned());
+        alert.tornado = Some("OBSERVED".to_owned());
+        let mut product = test_hazard_record(
+            "KILX.TO.W.0128",
+            "PDS TOR 0128 RADAR INDICATED",
+            "tornado",
+            square_hazard_points(-89.0, 38.0, -87.0, 39.0),
+        );
+        product.action = "CON".to_owned();
+        product.lifecycle_status = Some("Active".to_owned());
+        product.tornado = Some("RADAR INDICATED".to_owned());
+        product.damage_threat = Some("CONSIDERABLE".to_owned());
+
+        let overlay = build_live_hazard_overlay(
+            "test".to_owned(),
+            query_time,
+            2,
+            2,
+            0,
+            start,
+            vec![alert, product],
+        );
+
+        assert_eq!(overlay.records.len(), 1);
+        assert_eq!(overlay.records[0].tornado.as_deref(), Some("OBSERVED"));
+        assert_eq!(
+            overlay.records[0].damage_threat.as_deref(),
+            Some("CONSIDERABLE")
+        );
+        assert_eq!(overlay.records[0].label, "PDS TOR 0128 OBSERVED");
     }
 
     #[test]
@@ -49657,6 +51122,7 @@ mod tests {
             frame_history: Vec::new(),
             selected_frame_index: 0,
             low_sweep_disabled_cuts: BTreeSet::new(),
+            manual_primary_cut_hold: None,
             loop_timeline_summary_cache: std::cell::RefCell::new(None),
             tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(settings::tile_cache_dir())),
             basemap_style: tiles::TileStyle::DarkVector,
@@ -49672,7 +51138,7 @@ mod tests {
             bind_palette_to_product: false,
             table_editor: table_editor::TableEditor::default(),
             flip_velocity_color_polarity: false,
-            unfold_velocity_display: true,
+            unfold_velocity_display: false,
             color_table_target: ColorTableFamily::Velocity,
             color_table_path_text: String::new(),
             color_table_status: String::new(),
@@ -49760,6 +51226,9 @@ mod tests {
             spc_receiver: None,
             archive_pending_event: None,
             pending_debug_archive_case: None,
+            pending_data_pack_scene: None,
+            data_pack_expanded: BTreeSet::new(),
+            loaded_data_pack: None,
             ingest: None,
             download_panel: rw_ui::DownloadPanel::new(default_download_spec("hrrr")),
             sat: None,
@@ -49847,6 +51316,7 @@ mod tests {
             event_loop_builder: event_loop_builder::EventLoopBuilderState::default(),
             unified_player: unified_player::UnifiedPlayerState::default(),
             event_loop_hazard_window: None,
+            pending_event_loop_hazard_window: None,
             glm_enabled: false,
             oa_rx: None,
             oa_last_summary: None,
@@ -50603,6 +52073,28 @@ mod tests {
     fn arm_busy_primary_load(app: &mut ViewerApp) {
         let (_sender, receiver) = mpsc::channel::<AsyncLoadResult>();
         app.load_receiver = Some(receiver);
+    }
+
+    #[test]
+    fn data_pack_load_state_ignores_live_refresh_receiver() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        arm_busy_primary_load(&mut app);
+        app.realtime_level2_auto_refresh = true;
+
+        assert!(!app.data_pack_load_blocked());
+
+        app.supersede_live_load_for_data_pack();
+
+        assert!(app.load_receiver.is_none());
+        assert!(!app.realtime_level2_auto_refresh);
+    }
+
+    #[test]
+    fn data_pack_load_state_blocks_regular_primary_load() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        arm_busy_primary_load(&mut app);
+
+        assert!(app.data_pack_load_blocked());
     }
 
     #[test]
@@ -51825,6 +53317,99 @@ mod tests {
             km_per_px_x: 1,
             km_per_px_y: 1,
         }
+    }
+
+    fn test_screen_texture_key(
+        volume_ptr: usize,
+        cut: usize,
+        product: DisplayProduct,
+    ) -> TextureKey {
+        TextureKey {
+            volume_ptr,
+            cut,
+            render_dealiased_velocity: product.render_uses_dealiased_velocity(false),
+            product,
+            color_table_signature: 1,
+            storm_motion_key: (0, 0),
+            hail_levels_key: (32, 64),
+            smoothing: SmoothingMode::Native,
+            dealias_cascade: false,
+            gate_filter_decidbz: i16::MIN,
+            viewport: test_viewport_key(720, 480),
+        }
+    }
+
+    fn mark_extra_pane_screen_texture_ready(app: &mut ViewerApp, pane_slot: usize) {
+        let Some(volume) = app.extra_pane_display_volume(pane_slot) else {
+            return;
+        };
+        let Some((preferred_cut, product)) = app
+            .extra_panes
+            .get(pane_slot)
+            .map(|pane| (pane.cut.unwrap_or(app.selected_cut), pane.product.clone()))
+        else {
+            return;
+        };
+        let Some(cut) = display_cut_for_product(volume.as_ref(), preferred_cut, &product) else {
+            return;
+        };
+        if let Some(pane) = app.extra_panes.get_mut(pane_slot) {
+            pane.pending_render_key = None;
+            pane.texture_key = Some(test_screen_texture_key(
+                Arc::as_ptr(&volume) as usize,
+                cut,
+                product,
+            ));
+        }
+    }
+
+    fn mark_primary_screen_textures_ready(app: &mut ViewerApp) {
+        let Some(volume) = app.volume.clone() else {
+            return;
+        };
+        let render_volume =
+            app.display_source_volume_for_product(&app.selected_product, Arc::clone(&volume));
+        app.pending_render_key = None;
+        app.texture_key = Some(test_screen_texture_key(
+            Arc::as_ptr(&render_volume) as usize,
+            app.selected_cut,
+            app.selected_product.clone(),
+        ));
+        let pane_slots = app
+            .extra_panes
+            .iter()
+            .take(app.grid_layout.panel_count().saturating_sub(1))
+            .enumerate()
+            .filter_map(|(slot, pane)| {
+                app.extra_pane_participates_in_primary_timeline(pane)
+                    .then_some(slot)
+            })
+            .collect::<Vec<_>>();
+        for slot in pane_slots {
+            mark_extra_pane_screen_texture_ready(app, slot);
+        }
+    }
+
+    fn advance_primary_screen_loop_for_test(app: &mut ViewerApp, ctx: &egui::Context) {
+        mark_primary_screen_textures_ready(app);
+        app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        app.maybe_advance_history_loop(ctx);
+    }
+
+    fn advance_extra_pane_screen_loops_for_test(app: &mut ViewerApp, ctx: &egui::Context) {
+        let playing_slots = app
+            .extra_panes
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, pane)| pane.history_playing.then_some(slot))
+            .collect::<Vec<_>>();
+        for slot in playing_slots {
+            mark_extra_pane_screen_texture_ready(app, slot);
+            if let Some(pane) = app.extra_panes.get_mut(slot) {
+                pane.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+            }
+        }
+        app.maybe_advance_extra_pane_history_loops(ctx);
     }
 
     fn test_rendered_texture(render_ms: f32, used_sample_cache: bool) -> RenderedTexture {

@@ -197,6 +197,10 @@ pub struct AppSettings {
     /// instead of waiting for a scan-separated low-level revisit.
     #[serde(default)]
     pub live_low_sweep_auto_advance: bool,
+    /// Minimum age gap, in seconds, before live display advances to a newer
+    /// complete low-level sweep within the same scan.
+    #[serde(default = "default_live_low_sweep_auto_advance_seconds")]
+    pub live_low_sweep_auto_advance_seconds: u16,
     /// Draw a small screen-center capture reticle over map panes.
     #[serde(default)]
     pub show_center_crosshair: bool,
@@ -433,6 +437,10 @@ fn default_style_profile() -> String {
     "BowEcho default".to_owned()
 }
 
+pub fn default_live_low_sweep_auto_advance_seconds() -> u16 {
+    60
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -483,6 +491,7 @@ impl Default for AppSettings {
             loop_low_sweeps: false,
             loop_low_sweep_filter: default_loop_low_sweep_filter(),
             live_low_sweep_auto_advance: false,
+            live_low_sweep_auto_advance_seconds: default_live_low_sweep_auto_advance_seconds(),
             show_center_crosshair: false,
             record_fps: default_record_fps(),
             loop_record_speed_percent: default_loop_record_speed_percent(),
@@ -847,6 +856,7 @@ mod tests {
             loop_low_sweeps: true,
             loop_low_sweep_filter: "base".to_owned(),
             live_low_sweep_auto_advance: true,
+            live_low_sweep_auto_advance_seconds: 30,
             show_center_crosshair: true,
             intl_provider: "smhi".to_owned(),
             intl_site: "angelholm".to_owned(),
@@ -949,6 +959,10 @@ mod tests {
         assert!(!old.loop_low_sweeps);
         assert_eq!(old.loop_low_sweep_filter, "all");
         assert!(!old.live_low_sweep_auto_advance);
+        assert_eq!(
+            old.live_low_sweep_auto_advance_seconds,
+            default_live_low_sweep_auto_advance_seconds()
+        );
         assert!(!old.show_center_crosshair);
 
         let settings = AppSettings {
@@ -958,6 +972,7 @@ mod tests {
             loop_low_sweeps: true,
             loop_low_sweep_filter: "base".to_owned(),
             live_low_sweep_auto_advance: true,
+            live_low_sweep_auto_advance_seconds: 10,
             show_center_crosshair: true,
             ..Default::default()
         };
@@ -969,6 +984,7 @@ mod tests {
         assert!(back.loop_low_sweeps);
         assert_eq!(back.loop_low_sweep_filter, "base");
         assert!(back.live_low_sweep_auto_advance);
+        assert_eq!(back.live_low_sweep_auto_advance_seconds, 10);
         assert!(back.show_center_crosshair);
     }
 

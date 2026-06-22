@@ -562,7 +562,7 @@ impl ViewerApp {
         }
     }
 
-    fn loop_record_primary_texture_ready(&self) -> bool {
+    pub(crate) fn loop_record_primary_texture_ready(&self) -> bool {
         let Some(volume) = self.volume.as_ref() else {
             return true;
         };
@@ -578,7 +578,7 @@ impl ViewerApp {
         })
     }
 
-    fn loop_record_extra_pane_texture_ready(&self, pane_slot: usize) -> bool {
+    pub(crate) fn loop_record_extra_pane_texture_ready(&self, pane_slot: usize) -> bool {
         let Some(pane) = self.extra_panes.get(pane_slot) else {
             return true;
         };
@@ -621,13 +621,19 @@ impl ViewerApp {
     }
 
     pub(crate) fn loop_record_timeline_overlays_settled(&self) -> bool {
+        let live_current_mode = self.active_loop_timeline_is_live_follow()
+            && self.event_loop_hazard_window.is_none()
+            && self.pending_event_loop_hazard_window.is_none();
         if !self.hazards_visible
+            || live_current_mode
             || self.loop_timeline_history_len(self.active_loop_timeline_target()) <= 1
         {
             return true;
         }
         if self.hazard_receiver.is_some()
-            && (self.event_loop_hazard_window.is_some() || self.unified_player.auto_sync_warnings)
+            && (self.event_loop_hazard_window.is_some()
+                || self.pending_event_loop_hazard_window.is_some()
+                || self.unified_player.auto_sync_warnings)
         {
             return false;
         }
