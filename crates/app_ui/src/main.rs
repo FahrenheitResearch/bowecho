@@ -36,6 +36,7 @@ use settings::{LoopSweepControl, SweepPolicy, SweepPolicyMode, SweepPolicySet, S
 mod annotate;
 mod basemap_data;
 mod basemap_towns;
+mod brand;
 mod data_packs;
 mod dock;
 mod event_explorer;
@@ -630,6 +631,13 @@ const BASEMAP_US_DETAIL_BOUNDS: &[[f32; 4]] = &[
 ];
 const RAYON_NUM_THREADS_ENV: &str = "RAYON_NUM_THREADS";
 
+fn load_startup_settings() -> settings::AppSettings {
+    settings::AppSettings::load_with_distribution_default(
+        option_env!("BOWECHO_DEFAULT_BRAND"),
+        option_env!("BOWECHO_STORAGE_NAMESPACE"),
+    )
+}
+
 fn main() -> eframe::Result {
     // Crash forensics: panics land in a log next to the settings so field
     // reports from other machines carry a backtrace ("crashes a lot when
@@ -659,11 +667,14 @@ fn main() -> eframe::Result {
         default_hook(info);
     }));
     let input_path = std::env::args_os().nth(1).map(PathBuf::from);
+    let startup_name = brand::window_title(&load_startup_settings().brand);
 
     match run_bowecho_native(eframe::Renderer::Wgpu, input_path.clone(), None) {
         Ok(()) => Ok(()),
         Err(err) if should_retry_startup_with_glow(&err) => {
-            eprintln!("WGPU startup failed ({err:?}); retrying BowEcho with OpenGL renderer");
+            eprintln!(
+                "WGPU startup failed ({err:?}); retrying {startup_name} with OpenGL renderer"
+            );
             run_bowecho_native(
                 eframe::Renderer::Glow,
                 input_path,
@@ -674,12 +685,17 @@ fn main() -> eframe::Result {
     }
 }
 
-fn bowecho_native_options(renderer: eframe::Renderer) -> eframe::NativeOptions {
-    // The icon: the first Tornado Emergency displayed in BowEcho — the
-    // Toluca IL supercell of 2026-06-11 (KILX TO.W 0088), as captured
-    // live by a user. Real data is the brand.
-    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/bowecho.png"))
-        .unwrap_or_default();
+fn bowecho_native_options(
+    renderer: eframe::Renderer,
+    brand_config: &settings::BrandConfig,
+) -> eframe::NativeOptions {
+    // The built-in icon is the first Tornado Emergency displayed in BowEcho.
+    // A Brand Kit PNG can replace the launch icon on the next app start; the
+    // executable resource remains a build-time concern.
+    let icon = brand::configured_app_icon(brand_config).unwrap_or_else(|| {
+        eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/bowecho.png"))
+            .unwrap_or_default()
+    });
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1500.0, 950.0])
@@ -695,9 +711,11 @@ fn run_bowecho_native(
     input_path: Option<PathBuf>,
     startup_notice: Option<String>,
 ) -> eframe::Result {
+    let startup_settings = load_startup_settings();
+    let title = brand::window_title(&startup_settings.brand);
     eframe::run_native(
-        "BowEcho",
-        bowecho_native_options(renderer),
+        &title,
+        bowecho_native_options(renderer, &startup_settings.brand),
         Box::new(move |cc| Ok(Box::new(ViewerApp::new(cc, input_path, startup_notice)))),
     )
 }
@@ -787,27 +805,33 @@ fn app_cache_root() -> PathBuf {
     if let Some(root) = settings::data_dir_override() {
         return root.join("cache");
     }
+    let storage_namespace = settings::active_storage_namespace();
 
     #[cfg(windows)]
     if let Ok(path) = std::env::var("LOCALAPPDATA") {
-        return PathBuf::from(path).join("BowEcho").join("cache");
+        let folder = if storage_namespace == settings::DEFAULT_STORAGE_NAMESPACE {
+            "BowEcho"
+        } else {
+            storage_namespace.as_str()
+        };
+        return PathBuf::from(path).join(folder).join("cache");
     }
 
     #[cfg(not(windows))]
     if let Ok(path) = std::env::var("XDG_CACHE_HOME") {
-        return PathBuf::from(path).join("bowecho");
+        return PathBuf::from(path).join(&storage_namespace);
     }
 
     #[cfg(not(windows))]
     if let Ok(path) = std::env::var("HOME") {
-        return PathBuf::from(path).join(".cache").join("bowecho");
+        return PathBuf::from(path).join(".cache").join(&storage_namespace);
     }
 
     std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .unwrap_or_else(std::env::temp_dir)
-        .join("bowecho-cache")
+        .join(format!("{storage_namespace}-cache"))
 }
 
 fn sanitized_cache_segment(value: &str) -> String {
@@ -1802,6 +1826,8 @@ struct ViewerApp {
     update_available: Option<String>,
     /// Media sharing: screenshot capture + loop recording state.
     media: media::MediaShare,
+    /// Lazily decoded runtime brand images (header, watermark, share card).
+    brand_assets: brand::BrandTextureCache,
     /// Geo-anchored map annotations (crosshair/box/arrow/freehand).
     annotations: annotate::AnnotationState,
 }
@@ -5163,13 +5189,30 @@ struct WorkflowSnapshot {
     poll_active: bool,
 }
 
-const SIDEBAR_TABS: &[(SidebarTab, &str)] = &[
-    (SidebarTab::Radar, "Radar"),
-    (SidebarTab::Layers, "Custom"),
-    (SidebarTab::Severe, "Severe"),
-    (SidebarTab::Data, "Data"),
-    (SidebarTab::Settings, "⚙"),
+const SIDEBAR_TABS: &[SidebarTab] = &[
+    SidebarTab::Radar,
+    SidebarTab::Layers,
+    SidebarTab::Severe,
+    SidebarTab::Data,
+    SidebarTab::Settings,
 ];
+
+fn sidebar_tab_label(tab: SidebarTab, brand: &settings::BrandConfig) -> &str {
+    fn non_empty<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+        if value.trim().is_empty() {
+            fallback
+        } else {
+            value.trim()
+        }
+    }
+    match tab {
+        SidebarTab::Radar => non_empty(&brand.features.radar, "Radar"),
+        SidebarTab::Layers => non_empty(&brand.features.map, "Custom"),
+        SidebarTab::Severe => non_empty(&brand.features.warnings, "Severe"),
+        SidebarTab::Data => "Data",
+        SidebarTab::Settings => "⚙",
+    }
+}
 
 fn sidebar_tab_tooltip(tab: SidebarTab) -> &'static str {
     match tab {
@@ -5187,13 +5230,109 @@ fn sidebar_tab_tooltip(tab: SidebarTab) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy)]
+enum BrandAssetField {
+    AppIconPng,
+    AppIconIco,
+    HeaderLogo,
+    SocialWatermark,
+    ShareCardBackground,
+}
+
+impl BrandAssetField {
+    const ALL: [Self; 5] = [
+        Self::AppIconPng,
+        Self::AppIconIco,
+        Self::HeaderLogo,
+        Self::SocialWatermark,
+        Self::ShareCardBackground,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::AppIconPng => "Launch icon PNG",
+            Self::AppIconIco => "Executable icon ICO",
+            Self::HeaderLogo => "Header logo",
+            Self::SocialWatermark => "Social watermark",
+            Self::ShareCardBackground => "Share background",
+        }
+    }
+
+    fn value_mut(self, assets: &mut settings::BrandAssets) -> &mut Option<String> {
+        match self {
+            Self::AppIconPng => &mut assets.app_icon_png,
+            Self::AppIconIco => &mut assets.app_icon_ico,
+            Self::HeaderLogo => &mut assets.header_logo,
+            Self::SocialWatermark => &mut assets.social_watermark,
+            Self::ShareCardBackground => &mut assets.share_card_background,
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn extensions(self) -> &'static [&'static str] {
+        match self {
+            Self::AppIconIco => &["ico"],
+            Self::AppIconPng => &["png"],
+            Self::HeaderLogo | Self::SocialWatermark | Self::ShareCardBackground => {
+                &["png", "jpg", "jpeg"]
+            }
+        }
+    }
+}
+
+fn brand_text_field(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
+    ui.label(label);
+    let changed = ui
+        .add(egui::TextEdit::singleline(value).desired_width(260.0))
+        .changed();
+    ui.end_row();
+    changed
+}
+
+fn brand_color_field(ui: &mut egui::Ui, label: &str, value: &mut String, fallback: &str) -> bool {
+    ui.label(label);
+    let parsed = settings::parse_hex_color(value).or_else(|| settings::parse_hex_color(fallback));
+    let response = ui.add(egui::TextEdit::singleline(value).desired_width(108.0));
+    let (swatch, _) = ui.allocate_exact_size(egui::vec2(34.0, 18.0), egui::Sense::hover());
+    if let Some(rgb) = parsed {
+        ui.painter().rect_filled(swatch, 3.0, brand::color32(rgb));
+    }
+    let outline = if settings::parse_hex_color(value).is_some() {
+        egui::Color32::from_gray(100)
+    } else {
+        egui::Color32::from_rgb(235, 74, 74)
+    };
+    ui.painter().rect_stroke(
+        swatch,
+        3.0,
+        egui::Stroke::new(1.0, outline),
+        egui::StrokeKind::Inside,
+    );
+    if settings::parse_hex_color(value).is_none() {
+        ui.colored_label(
+            egui::Color32::from_rgb(235, 96, 96),
+            "invalid → preset fallback",
+        );
+    }
+    ui.end_row();
+    response.changed()
+}
+
+fn safe_brand_link(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (value.starts_with("https://") || value.starts_with("http://") || value.starts_with("mailto:"))
+        .then_some(value)
+}
+
 impl ViewerApp {
     fn new(
         cc: &eframe::CreationContext<'_>,
         source_path: Option<PathBuf>,
         startup_notice: Option<String>,
     ) -> Self {
-        configure_style(&cc.egui_ctx);
+        let app_settings = load_startup_settings();
+        settings::set_storage_namespace(app_settings.brand.effective_storage_namespace());
+        configure_style(&cc.egui_ctx, &app_settings.brand);
         // CJK fallback before the first frame: Japanese site names render
         // as glyphs, not tofu (appended LAST — Latin text is untouched).
         fonts::install_cjk_fallback(&cc.egui_ctx);
@@ -5207,7 +5346,6 @@ impl ViewerApp {
         if let Some(render_state) = cc.wgpu_render_state.as_ref() {
             vol3d::init_gpu(render_state);
         }
-        let app_settings = settings::AppSettings::load();
         // Data-folder override (field request: limited LOCALAPPDATA
         // space): root every cache/store at the user's chosen folder.
         // Set once, before any worker resolves a directory.
@@ -5585,6 +5723,7 @@ impl ViewerApp {
             update_check_rx: None,
             update_available: None,
             media: media::MediaShare::with_record_fps(restored_record_fps),
+            brand_assets: brand::BrandTextureCache::default(),
             annotations: annotate::AnnotationState::default(),
         };
         app.basemap_style = restored_basemap_style;
@@ -15493,6 +15632,30 @@ impl eframe::App for ViewerApp {
 
         self.sounding_window(&ctx);
 
+        if self.media.capture_overlay_visible()
+            && let Some(map_rect) = self.media.last_map_rect
+        {
+            let metadata = brand::ShareMetadata {
+                site: self
+                    .volume
+                    .as_ref()
+                    .map(|volume| volume.site.id.clone())
+                    .unwrap_or_default(),
+                time: self
+                    .displayed_timeline_time_utc()
+                    .map(|time| self.time_zone().format_date_hms(time))
+                    .unwrap_or_default(),
+                product: self.selected_product.label().to_owned(),
+            };
+            brand::paint_capture_overlay(
+                &ctx,
+                map_rect,
+                &self.app_settings.brand,
+                &metadata,
+                &mut self.brand_assets,
+            );
+        }
+
         // Workspace layout persistence (debounced; on_exit flushes).
         self.maybe_persist_workspace_layout();
         self.request_repaint_for_background_activity(&ctx);
@@ -15514,8 +15677,20 @@ impl ViewerApp {
     /// shift mid-ops).
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         self.poll_update_check();
+        let display_name = self.app_settings.brand.resolved_display_name().to_owned();
+        let header_logo = self.app_settings.brand.assets.header_logo.clone();
+        let releases_url = brand::releases_page_url(&self.app_settings.brand);
         ui.horizontal_centered(|ui| {
-            ui.heading("BowEcho");
+            if let Some((texture, size)) = self.brand_assets.texture(
+                ui.ctx(),
+                "header-logo",
+                header_logo.as_deref(),
+            ) {
+                let source = egui::vec2(size[0] as f32, size[1] as f32);
+                let scale = (26.0 / source.y.max(1.0)).min(92.0 / source.x.max(1.0));
+                ui.add(egui::Image::new((texture.id(), source * scale)));
+            }
+            ui.heading(&display_name);
             ui.separator();
             if fixed_action_button(ui, "Reset View", 90.0).clicked() {
                 self.reset_view();
@@ -15554,13 +15729,14 @@ impl ViewerApp {
                     if ui
                         .add(egui::Label::new(text).sense(egui::Sense::click()))
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text(
-                            "A newer BowEcho release is available — open the releases page",
-                        )
+                        .on_hover_text(format!(
+                            "A newer {display_name} release is available — open the releases page"
+                        ))
                         .clicked()
+                        && let Some(releases_url) = &releases_url
                     {
                         ui.ctx()
-                            .open_url(egui::OpenUrl::new_tab(BOWECHO_RELEASES_PAGE_URL));
+                            .open_url(egui::OpenUrl::new_tab(releases_url));
                     }
                 }
                 let live = self.farm.live_sensor().map(|s| (s.id, s.name.clone()));
@@ -17390,11 +17566,16 @@ impl ViewerApp {
         if self.update_check_rx.is_some() {
             return;
         }
+        let Some(api_url) = brand::github_latest_release_api_url(&self.app_settings.brand.repo_url)
+        else {
+            self.update_available = None;
+            return;
+        };
         let (sender, receiver) = mpsc::channel();
         self.update_check_rx = Some(receiver);
         let ctx = ctx.clone();
         thread::spawn(move || {
-            let newer = fetch_newer_release_tag();
+            let newer = fetch_newer_release_tag(&api_url);
             let repaint = newer.is_some();
             let _ = sender.send(newer);
             if repaint {
@@ -18287,12 +18468,18 @@ impl ViewerApp {
 
     fn set_data_folder_override_in_memory(&mut self, dir: PathBuf) {
         self.app_settings.data_dir = dir.display().to_string();
-        self.status = "Data folder saved - restart BowEcho to apply".to_owned();
+        self.status = format!(
+            "Data folder saved - restart {} to apply",
+            self.app_settings.brand.resolved_display_name()
+        );
     }
 
     fn reset_data_folder_override_in_memory(&mut self) {
         self.app_settings.data_dir.clear();
-        self.status = "Data folder reset - restart BowEcho to apply".to_owned();
+        self.status = format!(
+            "Data folder reset - restart {} to apply",
+            self.app_settings.brand.resolved_display_name()
+        );
     }
 
     /// Display preferences (Settings ▸ Display).
@@ -18546,7 +18733,10 @@ impl ViewerApp {
             #[cfg(any(windows, target_os = "macos"))]
             if ui.button("Change…").clicked()
                 && let Some(dir) = rfd::FileDialog::new()
-                    .set_title("Choose the BowEcho data folder")
+                    .set_title(format!(
+                        "Choose the {} data folder",
+                        self.app_settings.brand.resolved_display_name()
+                    ))
                     .pick_folder()
             {
                 self.set_data_folder_override_in_memory(dir);
@@ -18655,7 +18845,10 @@ impl ViewerApp {
                     .on_hover_text("Pick a custom .wav file; empty uses the platform system alert")
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new()
-                        .set_title("Choose BowEcho warning sound")
+                        .set_title(format!(
+                            "Choose {} warning sound",
+                            self.app_settings.brand.resolved_display_name()
+                        ))
                         .add_filter("WAV audio", &["wav"])
                         .pick_file()
                 {
@@ -18698,27 +18891,39 @@ impl ViewerApp {
     }
 
     fn security_updates_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let display_name = self.app_settings.brand.resolved_display_name().to_owned();
+        let releases_url = brand::releases_page_url(&self.app_settings.brand);
+        let release_check_available =
+            brand::github_latest_release_api_url(&self.app_settings.brand.repo_url).is_some();
         ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-        ui.weak(security_update_status_label(
-            self.update_available.as_deref(),
-            self.update_check_rx.is_some(),
-        ));
+        if release_check_available {
+            ui.weak(security_update_status_label(
+                self.update_available.as_deref(),
+                self.update_check_rx.is_some(),
+            ));
+        } else {
+            ui.weak("Automatic update checks are not configured for this brand.");
+        }
         ui.horizontal_wrapped(|ui| {
             if ui
-                .button("Open releases")
-                .on_hover_text("Open the official BowEcho GitHub releases page")
+                .add_enabled(releases_url.is_some(), egui::Button::new("Open releases"))
+                .on_hover_text(format!("Open the configured {display_name} releases page"))
                 .clicked()
+                && let Some(releases_url) = &releases_url
             {
-                ctx.open_url(egui::OpenUrl::new_tab(BOWECHO_RELEASES_PAGE_URL));
+                ctx.open_url(egui::OpenUrl::new_tab(releases_url));
             }
             let checking = self.update_check_rx.is_some();
             if ui
-                .add_enabled(!checking, egui::Button::new("Check now"))
+                .add_enabled(
+                    release_check_available && !checking,
+                    egui::Button::new("Check now"),
+                )
                 .on_hover_text("Re-run the background release check")
                 .clicked()
             {
                 self.start_update_check(ctx);
-                self.status = "Checking BowEcho releases".to_owned();
+                self.status = format!("Checking {display_name} releases");
             }
             if checking {
                 ui.spinner();
@@ -18745,6 +18950,413 @@ impl ViewerApp {
         }
     }
 
+    fn brand_settings_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let original = self.app_settings.brand.clone();
+        let mut edited = original.clone();
+        let mut changed = false;
+        let mut preset_replaced = false;
+        let mut status_message = None;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Preset");
+            let mut selected = edited.preset;
+            egui::ComboBox::from_id_salt("brand_preset")
+                .selected_text(selected.label())
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for preset in settings::BrandPreset::BUILT_INS {
+                        ui.selectable_value(&mut selected, preset, preset.label());
+                    }
+                    if edited.preset == settings::BrandPreset::Custom {
+                        ui.selectable_value(
+                            &mut selected,
+                            settings::BrandPreset::Custom,
+                            settings::BrandPreset::Custom.label(),
+                        );
+                    }
+                });
+            if selected != edited.preset {
+                edited = match selected {
+                    settings::BrandPreset::Custom => {
+                        let mut custom = edited.clone();
+                        custom.mark_custom();
+                        custom
+                    }
+                    preset => settings::BrandConfig::preset(preset),
+                };
+                changed = true;
+                preset_replaced = true;
+                status_message = Some(format!("Applied {} preset", selected.label()));
+            }
+            if ui.button("Reset preset").clicked() {
+                let preset = match edited.preset {
+                    settings::BrandPreset::CaliforniaWildfireTracking => {
+                        settings::BrandPreset::CaliforniaWildfireTracking
+                    }
+                    settings::BrandPreset::BowEcho | settings::BrandPreset::Custom => {
+                        settings::BrandPreset::BowEcho
+                    }
+                };
+                edited = settings::BrandConfig::preset(preset);
+                changed = true;
+                preset_replaced = true;
+                status_message = Some(format!("Reset to {}", preset.label()));
+            }
+        });
+        ui.weak(
+            "The California Wildfire Tracking preset is a community partner skin. It ships no third-party logo/icon assets and does not claim official CAL FIRE ownership.",
+        );
+
+        ui.separator();
+        ui.strong("Identity");
+        egui::Grid::new("brand_identity_grid")
+            .num_columns(2)
+            .spacing([10.0, 5.0])
+            .show(ui, |ui| {
+                changed |= brand_text_field(ui, "Display name", &mut edited.display_name);
+                changed |= brand_text_field(ui, "Short name", &mut edited.short_name);
+                changed |= brand_text_field(ui, "Organization", &mut edited.organization);
+                changed |= brand_text_field(ui, "Tagline", &mut edited.tagline);
+                changed |= brand_text_field(
+                    ui,
+                    "Filename prefix",
+                    &mut edited.screenshot_filename_prefix,
+                );
+                changed |= brand_text_field(ui, "Output folder", &mut edited.output_folder_label);
+            });
+        ui.weak(format!(
+            "Resolved media path: Pictures/{} · files start {}_",
+            edited.output_folder_name(),
+            edited.filename_prefix()
+        ));
+
+        ui.separator();
+        ui.strong("Links");
+        egui::Grid::new("brand_links_grid")
+            .num_columns(2)
+            .spacing([10.0, 5.0])
+            .show(ui, |ui| {
+                changed |= brand_text_field(ui, "Website", &mut edited.website_url);
+                changed |= brand_text_field(ui, "Repository", &mut edited.repo_url);
+                changed |= brand_text_field(ui, "Releases", &mut edited.releases_url);
+                changed |= brand_text_field(ui, "Support", &mut edited.support_url);
+                changed |= brand_text_field(ui, "Donate", &mut edited.donate_url);
+                changed |= brand_text_field(ui, "Contact", &mut edited.contact_url);
+                changed |= brand_text_field(ui, "Privacy", &mut edited.privacy_url);
+            });
+        ui.horizontal_wrapped(|ui| {
+            for (label, url) in [
+                ("Website", edited.website_url.as_str()),
+                ("Repository", edited.repo_url.as_str()),
+                ("Releases", edited.releases_url.as_str()),
+                ("Support", edited.support_url.as_str()),
+                ("Donate", edited.donate_url.as_str()),
+                ("Contact", edited.contact_url.as_str()),
+                ("Privacy", edited.privacy_url.as_str()),
+            ] {
+                if let Some(url) = safe_brand_link(url)
+                    && ui.small_button(label).clicked()
+                {
+                    ctx.open_url(egui::OpenUrl::new_tab(url));
+                }
+            }
+        });
+
+        ui.separator();
+        ui.strong("Storage namespace");
+        changed |= ui
+            .checkbox(
+                &mut edited.use_custom_storage_namespace,
+                "Use branded storage namespace after restart",
+            )
+            .on_hover_text(
+                "Opt-in only. config.json and styles.json stay in the legacy BowEcho root; caches/stores/user data use the branded namespace after restart.",
+            )
+            .changed();
+        ui.horizontal(|ui| {
+            ui.label("Namespace");
+            changed |= ui
+                .add(egui::TextEdit::singleline(&mut edited.storage_namespace).desired_width(180.0))
+                .changed();
+            let resolved = settings::sanitize_namespace(&edited.storage_namespace)
+                .unwrap_or_else(|| settings::DEFAULT_STORAGE_NAMESPACE.to_owned());
+            ui.weak(format!("→ {resolved}"));
+        });
+        ui.weak(
+            "No existing %APPDATA%/bowecho data is moved or deleted. Import storage copies a selected tree, skips symlinks, and never overwrites destination files.",
+        );
+        ui.horizontal_wrapped(|ui| {
+            #[cfg(any(windows, target_os = "macos"))]
+            {
+                let import_enabled = edited.use_custom_storage_namespace
+                    && edited.effective_storage_namespace().is_some();
+                if ui
+                    .add_enabled(import_enabled, egui::Button::new("Import storage..."))
+                    .on_hover_text(
+                        "Choose an existing BowEcho data root. Files are copied non-destructively into the configured namespace.",
+                    )
+                    .clicked()
+                    && let Some(source) = rfd::FileDialog::new()
+                        .set_title("Import existing app storage")
+                        .pick_folder()
+                    && let Some(namespace) = edited.effective_storage_namespace()
+                    && let Some(destination) = settings::storage_root_for_namespace(&namespace)
+                {
+                    match settings::import_storage_tree(&source, &destination) {
+                        Ok(summary) => {
+                            status_message = Some(format!(
+                                "Imported storage: {} files copied, {} skipped, {} folders created",
+                                summary.files_copied,
+                                summary.files_skipped,
+                                summary.directories_created
+                            ));
+                        }
+                        Err(error) => {
+                            status_message = Some(format!("Storage import failed: {error}"));
+                        }
+                    }
+                }
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
+            {
+                ui.weak("Storage import folder picker is available on Windows/macOS.");
+            }
+        });
+
+        ui.separator();
+        ui.strong("Palette");
+        let fallback = edited.palette_fallback();
+        egui::Grid::new("brand_palette_grid")
+            .num_columns(4)
+            .spacing([10.0, 5.0])
+            .show(ui, |ui| {
+                changed |= brand_color_field(
+                    ui,
+                    "Primary",
+                    &mut edited.palette.primary,
+                    &fallback.primary,
+                );
+                changed |=
+                    brand_color_field(ui, "Accent", &mut edited.palette.accent, &fallback.accent);
+                changed |= brand_color_field(
+                    ui,
+                    "Danger / fire",
+                    &mut edited.palette.danger,
+                    &fallback.danger,
+                );
+                changed |= brand_color_field(
+                    ui,
+                    "Warning",
+                    &mut edited.palette.warning,
+                    &fallback.warning,
+                );
+                changed |= brand_color_field(
+                    ui,
+                    "Success",
+                    &mut edited.palette.success,
+                    &fallback.success,
+                );
+                changed |= brand_color_field(
+                    ui,
+                    "Surface",
+                    &mut edited.palette.surface,
+                    &fallback.surface,
+                );
+                changed |= brand_color_field(
+                    ui,
+                    "Surface alt",
+                    &mut edited.palette.surface_alt,
+                    &fallback.surface_alt,
+                );
+                changed |= brand_color_field(ui, "Text", &mut edited.palette.text, &fallback.text);
+                changed |= brand_color_field(
+                    ui,
+                    "Muted text",
+                    &mut edited.palette.muted_text,
+                    &fallback.muted_text,
+                );
+                changed |= brand_color_field(
+                    ui,
+                    "Outline",
+                    &mut edited.palette.outline,
+                    &fallback.outline,
+                );
+            });
+        if ui.button("Reset palette to preset").clicked() {
+            edited.palette = fallback;
+            changed = true;
+        }
+
+        ui.separator();
+        ui.strong("Feature labels");
+        egui::Grid::new("brand_features_grid")
+            .num_columns(2)
+            .spacing([10.0, 5.0])
+            .show(ui, |ui| {
+                changed |= brand_text_field(ui, "Radar", &mut edited.features.radar);
+                changed |= brand_text_field(ui, "Map", &mut edited.features.map);
+                changed |= brand_text_field(ui, "Warnings", &mut edited.features.warnings);
+                changed |= brand_text_field(ui, "Evacuation", &mut edited.features.evacuation);
+                changed |= brand_text_field(ui, "Air quality", &mut edited.features.air_quality);
+            });
+
+        ui.separator();
+        ui.strong("Assets");
+        for field in BrandAssetField::ALL {
+            ui.horizontal(|ui| {
+                ui.label(field.label());
+                let value = field.value_mut(&mut edited.assets);
+                let mut text = value.as_deref().unwrap_or_default().to_owned();
+                if ui
+                    .add(egui::TextEdit::singleline(&mut text).desired_width(250.0))
+                    .changed()
+                {
+                    *value = (!text.trim().is_empty()).then(|| text.trim().to_owned());
+                    changed = true;
+                }
+                #[cfg(any(windows, target_os = "macos"))]
+                if ui.small_button("Choose...").clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter(field.label(), field.extensions())
+                        .set_title(format!("Choose {}", field.label()))
+                        .pick_file()
+                {
+                    *value = Some(path.display().to_string());
+                    changed = true;
+                }
+                if ui.small_button("Clear").clicked() {
+                    *value = None;
+                    changed = true;
+                }
+                if value
+                    .as_deref()
+                    .is_some_and(|path| !path.trim().is_empty() && !Path::new(path).is_file())
+                {
+                    ui.colored_label(egui::Color32::from_rgb(235, 96, 96), "missing");
+                }
+            });
+        }
+        ui.weak(
+            "Header/watermark/share assets apply at runtime. The launch icon applies on the next start. The executable .ico is build-time only (BOWECHO_APP_ICON_ICO).",
+        );
+
+        ui.separator();
+        ui.strong("Social sharing");
+        changed |= ui
+            .checkbox(&mut edited.sharing.watermark_enabled, "Watermark exports")
+            .changed();
+        changed |= ui
+            .checkbox(&mut edited.sharing.card_enabled, "Share-card metadata")
+            .changed();
+        ui.horizontal(|ui| {
+            ui.label("Layout");
+            let before = edited.sharing.layout;
+            egui::ComboBox::from_id_salt("brand_share_layout")
+                .selected_text(edited.sharing.layout.label())
+                .width(92.0)
+                .show_ui(ui, |ui| {
+                    for layout in settings::ShareLayout::ALL {
+                        ui.selectable_value(&mut edited.sharing.layout, layout, layout.label());
+                    }
+                });
+            changed |= edited.sharing.layout != before;
+            ui.weak("Aspect presets pad instead of cropping existing context.");
+        });
+        egui::Grid::new("brand_share_grid")
+            .num_columns(2)
+            .spacing([10.0, 5.0])
+            .show(ui, |ui| {
+                changed |= brand_text_field(ui, "Card title", &mut edited.sharing.title);
+                changed |= brand_text_field(ui, "Subtitle", &mut edited.sharing.subtitle);
+                changed |= brand_text_field(ui, "Site label", &mut edited.sharing.site_label);
+                changed |= brand_text_field(ui, "Source footer", &mut edited.sharing.source_footer);
+            });
+
+        brand::preview_ui(ui, &edited, &mut self.brand_assets);
+
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            #[cfg(any(windows, target_os = "macos"))]
+            {
+                let prefix = edited.filename_prefix();
+                if ui.button("Export Brand Kit...").clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Brand Kit", &["json"])
+                        .set_file_name(format!("{prefix}-brand-kit.json"))
+                        .set_title(format!(
+                            "Export {} Brand Kit",
+                            edited.resolved_display_name()
+                        ))
+                        .save_file()
+                {
+                    match std::fs::write(&path, edited.to_json()) {
+                        Ok(()) => {
+                            status_message =
+                                Some(format!("Exported Brand Kit to {}", path.display()));
+                        }
+                        Err(error) => {
+                            status_message = Some(format!("Brand Kit export failed: {error}"));
+                        }
+                    }
+                }
+                if ui.button("Import Brand Kit...").clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Brand Kit", &["json"])
+                        .set_title(format!(
+                            "Import {} Brand Kit",
+                            edited.resolved_display_name()
+                        ))
+                        .pick_file()
+                {
+                    match std::fs::read_to_string(&path)
+                        .map_err(|error| error.to_string())
+                        .and_then(|text| settings::BrandConfig::from_json(&text))
+                    {
+                        Ok(imported) => {
+                            edited = imported;
+                            changed = true;
+                            preset_replaced = true;
+                            status_message =
+                                Some(format!("Imported Brand Kit from {}", path.display()));
+                        }
+                        Err(error) => {
+                            status_message = Some(format!("Brand Kit import failed: {error}"));
+                        }
+                    }
+                }
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
+            {
+                ui.weak("Brand Kit file dialogs are available on Windows/macOS.");
+            }
+        });
+
+        if changed {
+            if !preset_replaced {
+                edited.mark_custom();
+            }
+            let update_source_changed = original.repo_url != edited.repo_url
+                || original.releases_url != edited.releases_url;
+            self.app_settings.brand = edited;
+            configure_style(ctx, &self.app_settings.brand);
+            self.brand_assets.clear();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(brand::window_title(
+                &self.app_settings.brand,
+            )));
+            if update_source_changed {
+                self.update_available = None;
+                self.update_check_rx = None;
+                self.start_update_check(ctx);
+            }
+            if let Err(error) = self.app_settings.save() {
+                status_message = Some(format!("Brand settings save failed: {error}"));
+            }
+        }
+        if let Some(message) = status_message {
+            self.status = message;
+        }
+    }
+
     /// Settings tab: everything volume-independent, set once per session.
     /// ⚙ Settings — collapsible sections, open-state remembered across
     /// restarts (spec §1). A future Appearance section (style registry
@@ -18753,6 +19365,15 @@ impl ViewerApp {
         self.remembered_section(ui, "settings_display", "Display", true, |app, ui| {
             app.display_settings_section(ui, ctx);
         });
+        self.remembered_section(
+            ui,
+            "settings_brand",
+            "App Identity / Brand Kit",
+            false,
+            |app, ui| {
+                app.brand_settings_section(ui, ctx);
+            },
+        );
         // One-shot expand path: the PRODUCTS color picker's "Edit…" lands
         self.remembered_section(
             ui,
@@ -18807,6 +19428,10 @@ impl ViewerApp {
     fn settings_backup_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         #[cfg(not(any(windows, target_os = "macos")))]
         let _ = ctx;
+        #[cfg(any(windows, target_os = "macos"))]
+        let display_name = self.app_settings.brand.resolved_display_name().to_owned();
+        #[cfg(any(windows, target_os = "macos"))]
+        let filename_prefix = self.app_settings.brand.filename_prefix();
         ui.horizontal_wrapped(|ui| {
             #[cfg(any(windows, target_os = "macos"))]
             {
@@ -18814,9 +19439,9 @@ impl ViewerApp {
                     .on_hover_text("Save the current config.json preferences to a backup file")
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("BowEcho config", &["json"])
-                        .set_file_name("bowecho-config.json")
-                        .set_title("Export BowEcho settings")
+                        .add_filter(format!("{display_name} config"), &["json"])
+                        .set_file_name(format!("{filename_prefix}-config.json"))
+                        .set_title(format!("Export {display_name} settings"))
                         .save_file()
                 {
                     match std::fs::write(&path, self.app_settings.to_json()) {
@@ -18826,12 +19451,14 @@ impl ViewerApp {
                 }
                 if fixed_action_button(ui, "Import config...", 112.0)
                     .on_hover_text(
-                        "Replace config.json from a backup; restart BowEcho so every setting rehydrates cleanly",
+                        format!(
+                            "Replace config.json from a backup; restart {display_name} so every setting rehydrates cleanly"
+                        ),
                     )
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("BowEcho config", &["json"])
-                        .set_title("Import BowEcho settings")
+                        .add_filter(format!("{display_name} config"), &["json"])
+                        .set_title(format!("Import {display_name} settings"))
                         .pick_file()
                 {
                     self.import_app_settings_from_path(&path);
@@ -18841,9 +19468,9 @@ impl ViewerApp {
                     .on_hover_text("Save warning polygon, map, radar-age, and layer style overrides")
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("BowEcho styles", &["json"])
-                        .set_file_name("bowecho-styles.json")
-                        .set_title("Export BowEcho appearance")
+                        .add_filter(format!("{display_name} styles"), &["json"])
+                        .set_file_name(format!("{filename_prefix}-styles.json"))
+                        .set_title(format!("Export {display_name} appearance"))
                         .save_file()
                 {
                     self.export_styles_to_path(&path);
@@ -18852,8 +19479,8 @@ impl ViewerApp {
                     .on_hover_text("Load warning polygon, map, radar-age, and layer style overrides")
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new()
-                        .add_filter("BowEcho styles", &["json"])
-                        .set_title("Import BowEcho appearance")
+                        .add_filter(format!("{display_name} styles"), &["json"])
+                        .set_title(format!("Import {display_name} appearance"))
                         .pick_file()
                 {
                     self.import_styles_from_path(&path, ctx);
@@ -18881,18 +19508,21 @@ impl ViewerApp {
                 return;
             }
         };
-        let imported = match serde_json::from_str::<settings::AppSettings>(&text) {
+        let mut imported = match serde_json::from_str::<settings::AppSettings>(&text) {
             Ok(imported) => imported,
             Err(error) => {
                 self.status = format!("Settings import failed: {error}");
                 return;
             }
         };
+        imported.brand = imported.brand.normalized_for_load();
         self.app_settings = imported;
         match self.app_settings.save() {
             Ok(()) => {
-                self.status =
-                    "Imported settings backup - restart BowEcho to apply every setting".to_owned();
+                self.status = format!(
+                    "Imported settings backup - restart {} to apply every setting",
+                    self.app_settings.brand.resolved_display_name()
+                );
             }
             Err(error) => {
                 self.status = format!("Imported settings in session; save failed: {error}")
@@ -18984,17 +19614,18 @@ impl ViewerApp {
             let gaps = (SIDEBAR_TABS.len() as f32 - 1.0) * ui.spacing().item_spacing.x;
             let text_width =
                 ((ui.available_width() - gear_width - gaps) / text_tab_count).max(60.0);
-            for (tab, label) in SIDEBAR_TABS {
+            for tab in SIDEBAR_TABS {
                 let selected = self.sidebar_tab == *tab;
                 let width = if *tab == SidebarTab::Settings {
                     gear_width
                 } else {
                     text_width
                 };
+                let label = sidebar_tab_label(*tab, &self.app_settings.brand);
                 let response = ui
                     .add_sized(
                         egui::vec2(width, PANEL_BUTTON_HEIGHT),
-                        egui::Button::selectable(selected, *label),
+                        egui::Button::selectable(selected, label),
                     )
                     .on_hover_text(sidebar_tab_tooltip(*tab));
                 if response.clicked() {
@@ -21878,7 +22509,11 @@ impl ViewerApp {
 
     fn diagnostic_summary(&self) -> String {
         let mut text = String::new();
-        let _ = writeln!(text, "BowEcho diagnostics");
+        let _ = writeln!(
+            text,
+            "{} diagnostics",
+            self.app_settings.brand.resolved_display_name()
+        );
         let _ = writeln!(text, "version: {}", env!("CARGO_PKG_VERSION"));
         let _ = writeln!(
             text,
@@ -39382,16 +40017,11 @@ fn haversine_km(lat_a: f32, lon_a: f32, lat_b: f32, lon_b: f32) -> f32 {
     2.0 * earth_radius_km * a.sqrt().atan2((1.0 - a).max(0.0).sqrt())
 }
 
-const BOWECHO_LATEST_RELEASE_API_URL: &str =
-    "https://api.github.com/repos/FahrenheitResearch/bowecho/releases/latest";
-const BOWECHO_RELEASES_PAGE_URL: &str = "https://github.com/FahrenheitResearch/bowecho/releases";
-
-/// Fetch the latest GitHub release tag and return it iff it is newer than
-/// the running build. `data_source::fetch_text` sets a User-Agent (GitHub
-/// rejects UA-less requests) and metadata timeouts; any network or parse
-/// error returns None so the caller stays silent.
-fn fetch_newer_release_tag() -> Option<String> {
-    let body = data_source::fetch_text(BOWECHO_LATEST_RELEASE_API_URL).ok()?;
+/// Fetch the latest configured GitHub release tag and return it iff it is
+/// newer than the running build. Invalid/non-GitHub repository URLs disable
+/// the check before this helper is called; network/parse errors stay silent.
+fn fetch_newer_release_tag(api_url: &str) -> Option<String> {
+    let body = data_source::fetch_text(api_url).ok()?;
     let value: serde_json::Value = serde_json::from_str(&body).ok()?;
     let tag = value.get("tag_name")?.as_str()?;
     newer_release_tag(tag, env!("CARGO_PKG_VERSION"))
@@ -44430,7 +45060,7 @@ fn display_cut_for_product(
     }
 }
 
-fn configure_style(ctx: &egui::Context) {
+fn configure_style(ctx: &egui::Context, brand_config: &settings::BrandConfig) {
     use egui::Color32;
     let mut style = (*ctx.global_style()).clone();
     // Snappy = fast: no widget animations (the app's identity is speed).
@@ -44440,28 +45070,29 @@ fn configure_style(ctx: &egui::Context) {
     // GR2 "warning-desk" look: near-black, low-chroma neutral panels so the
     // saturated REF/VEL/CC/ZDR palettes pop. This is the single biggest cheap
     // lever for reading as a pro radar tool.
-    let panel = Color32::from_rgb(14, 15, 17);
-    let raised = Color32::from_rgb(22, 24, 27);
+    let palette = brand_config.resolved_palette();
+    let panel = brand::color32(palette.surface);
+    let raised = brand::color32(palette.surface_alt);
     let sunken = Color32::from_rgb(9, 10, 12);
     style.visuals.panel_fill = panel;
     style.visuals.window_fill = panel;
     style.visuals.extreme_bg_color = sunken; // text edits, sliders troughs
     style.visuals.faint_bg_color = Color32::from_rgb(20, 22, 25); // table striping
-    style.visuals.window_stroke = egui::Stroke::new(1.0, Color32::from_rgb(40, 44, 50));
+    style.visuals.window_stroke = egui::Stroke::new(1.0, brand::color32(palette.outline));
     // Desaturated light text, not pure white.
-    style.visuals.override_text_color = Some(Color32::from_rgb(205, 210, 216));
+    style.visuals.override_text_color = Some(brand::color32(palette.text));
 
     // Low-chroma muted-blue selection/active accents.
     style.visuals.selection.bg_fill = Color32::from_rgb(38, 74, 108);
-    style.visuals.selection.stroke = egui::Stroke::new(1.0, Color32::from_rgb(120, 170, 210));
+    style.visuals.selection.stroke = egui::Stroke::new(1.0, brand::color32(palette.accent));
     let w = &mut style.visuals.widgets;
     w.noninteractive.bg_fill = panel;
     w.inactive.bg_fill = raised;
     w.inactive.weak_bg_fill = raised;
     w.hovered.bg_fill = Color32::from_rgb(36, 46, 58);
     w.hovered.weak_bg_fill = Color32::from_rgb(36, 46, 58);
-    w.active.bg_fill = Color32::from_rgb(48, 88, 126);
-    w.active.weak_bg_fill = Color32::from_rgb(48, 88, 126);
+    w.active.bg_fill = brand::color32(palette.primary);
+    w.active.weak_bg_fill = brand::color32(palette.primary);
     w.open.bg_fill = raised;
 
     // Tighten density toward GR2's information-dense layout.
@@ -56382,6 +57013,7 @@ mod tests {
             update_check_rx: None,
             update_available: None,
             media: media::MediaShare::default(),
+            brand_assets: brand::BrandTextureCache::default(),
             annotations: annotate::AnnotationState::default(),
         }
     }
@@ -57584,7 +58216,11 @@ mod tests {
 
     #[test]
     fn custom_tab_advertises_layers_and_appearance() {
-        assert!(SIDEBAR_TABS.contains(&(SidebarTab::Layers, "Custom")));
+        assert!(SIDEBAR_TABS.contains(&SidebarTab::Layers));
+        assert_eq!(
+            sidebar_tab_label(SidebarTab::Layers, &settings::BrandConfig::default()),
+            "Custom"
+        );
         let tooltip = sidebar_tab_tooltip(SidebarTab::Layers);
         assert!(tooltip.contains("map layers"));
         assert!(tooltip.contains("radar age"));

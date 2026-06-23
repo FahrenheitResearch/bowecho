@@ -12,6 +12,9 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+mod brand;
+pub use brand::*;
+
 /// Product families used by the loop sweep controller. Keeping this model in
 /// `settings` lets the primary radar, extra panes, and coordinated overlays
 /// share one persisted policy without making the settings crate depend on UI
@@ -120,6 +123,10 @@ pub struct LoopSweepControl {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
+    /// App identity / Brand Kit. The untouched BowEcho value is omitted so
+    /// existing config.json files stay byte-small and backwards compatible.
+    #[serde(default, skip_serializing_if = "BrandConfig::is_default")]
+    pub brand: BrandConfig,
     /// Site to load on startup (e.g. "KEAX"). None = built-in default.
     pub startup_site: Option<String>,
     /// Favorite site ids, in user order.
@@ -564,6 +571,7 @@ pub fn default_live_low_sweep_auto_advance_seconds() -> u16 {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            brand: BrandConfig::default(),
             overlay_obs: false,
             overlay_obs_metar: true,
             overlay_obs_mesonet: true,
@@ -651,10 +659,23 @@ impl AppSettings {
     /// Load settings from `config_path()`, falling back to defaults on any
     /// missing-file / parse error.
     pub fn load() -> Self {
+        Self::load_with_distribution_default(None, None)
+    }
+
+    /// Load settings while allowing the executable package to provide an
+    /// opt-in default Brand Kit for first run. A readable config remains the
+    /// source of truth; legacy JSON without `brand` still resolves to BowEcho.
+    pub fn load_with_distribution_default(
+        build_brand: Option<&str>,
+        build_namespace: Option<&str>,
+    ) -> Self {
         Self::config_path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|path| std::fs::read_to_string(path).ok())
             .map(|text| Self::from_json(&text))
-            .unwrap_or_default()
+            .unwrap_or_else(|| Self {
+                brand: BrandConfig::distribution_default_from(build_brand, build_namespace),
+                ..Self::default()
+            })
     }
 
     /// Persist to `config_path()`, creating the parent directory. Returns an
@@ -668,7 +689,9 @@ impl AppSettings {
     }
 
     pub fn from_json(text: &str) -> Self {
-        serde_json::from_str(text).unwrap_or_default()
+        let mut settings: Self = serde_json::from_str(text).unwrap_or_default();
+        settings.brand = settings.brand.normalized_for_load();
+        settings
     }
 
     pub fn to_json(&self) -> String {
@@ -726,12 +749,104 @@ pub fn bowecho_config_dir() -> Option<PathBuf> {
     config_dir().map(|dir| dir.join("bowecho"))
 }
 
+/// Runtime-selected storage namespace for caches/stores/user data. The
+/// settings and styles documents deliberately stay in the legacy BowEcho root
+/// so an opt-in namespace can always be found and reverted.
+static STORAGE_NAMESPACE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn set_storage_namespace(namespace: Option<String>) {
+    let namespace = namespace
+        .as_deref()
+        .and_then(sanitize_namespace)
+        .unwrap_or_else(|| DEFAULT_STORAGE_NAMESPACE.to_owned());
+    let _ = STORAGE_NAMESPACE.set(namespace);
+}
+
+pub fn active_storage_namespace() -> String {
+    STORAGE_NAMESPACE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_STORAGE_NAMESPACE.to_owned())
+}
+
+pub fn active_storage_root() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join(active_storage_namespace()))
+}
+
+pub fn storage_root_for_namespace(namespace: &str) -> Option<PathBuf> {
+    let namespace = sanitize_namespace(namespace)?;
+    config_dir().map(|dir| dir.join(namespace))
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StorageImportSummary {
+    pub files_copied: usize,
+    pub directories_created: usize,
+    pub files_skipped: usize,
+}
+
+/// Explicit, non-destructive namespace migration helper. Files are copied,
+/// never moved; existing destination files and symlinks are skipped.
+pub fn import_storage_tree(
+    source: &Path,
+    destination: &Path,
+) -> Result<StorageImportSummary, String> {
+    if !source.is_dir() {
+        return Err(format!(
+            "storage import source is not a directory: {}",
+            source.display()
+        ));
+    }
+    std::fs::create_dir_all(destination).map_err(|error| error.to_string())?;
+    let source = source.canonicalize().map_err(|error| error.to_string())?;
+    let destination = destination
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if destination == source || destination.starts_with(&source) {
+        return Err("storage import destination cannot be inside the source tree".to_owned());
+    }
+
+    let mut summary = StorageImportSummary::default();
+    import_storage_tree_inner(&source, &destination, &mut summary)?;
+    Ok(summary)
+}
+
+fn import_storage_tree_inner(
+    source: &Path,
+    destination: &Path,
+    summary: &mut StorageImportSummary,
+) -> Result<(), String> {
+    for entry in std::fs::read_dir(source).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            if !target.exists() {
+                std::fs::create_dir_all(&target).map_err(|error| error.to_string())?;
+                summary.directories_created += 1;
+            }
+            import_storage_tree_inner(&entry.path(), &target, summary)?;
+        } else if file_type.is_file() {
+            if target.exists() {
+                summary.files_skipped += 1;
+            } else {
+                std::fs::copy(entry.path(), &target).map_err(|error| error.to_string())?;
+                summary.files_copied += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Directory for the on-disk raster tile cache.
 pub fn tile_cache_dir() -> Option<PathBuf> {
     if let Some(root) = data_dir_override() {
         return Some(root.join("tiles"));
     }
-    bowecho_config_dir().map(|dir| dir.join("tiles"))
+    active_storage_root().map(|dir| dir.join("tiles"))
 }
 
 /// User-chosen data root override (field report: "not so wealthy in
@@ -789,7 +904,7 @@ fn bowecho_dir(leaf: &str) -> PathBuf {
 fn bowecho_dir_path(leaf: &str) -> PathBuf {
     data_dir_override()
         .map(|root| root.join(leaf))
-        .or_else(|| bowecho_config_dir().map(|dir| dir.join(leaf)))
+        .or_else(|| active_storage_root().map(|dir| dir.join(leaf)))
         .unwrap_or_else(|| PathBuf::from("bowecho-data").join(leaf))
 }
 
@@ -896,10 +1011,19 @@ pub fn annotations_dir() -> PathBuf {
 /// (`~/Pictures/BowEcho`), NOT the config dir — these files exist to be
 /// shared. `BOWECHO_SCREENSHOT_DIR` overrides. Created on demand by callers.
 pub fn screenshots_dir() -> PathBuf {
+    screenshots_dir_for_folder("BowEcho")
+}
+
+pub fn screenshots_dir_for_brand(brand: &BrandConfig) -> PathBuf {
+    screenshots_dir_for_folder(&brand.output_folder_name())
+}
+
+fn screenshots_dir_for_folder(folder: &str) -> PathBuf {
     screenshots_dir_from(
         std::env::var("BOWECHO_SCREENSHOT_DIR").ok(),
         std::env::var("USERPROFILE").ok(),
         std::env::var("HOME").ok(),
+        folder,
     )
 }
 
@@ -907,6 +1031,7 @@ fn screenshots_dir_from(
     override_dir: Option<String>,
     userprofile: Option<String>,
     home: Option<String>,
+    folder: &str,
 ) -> PathBuf {
     if let Some(dir) = override_dir
         && !dir.trim().is_empty()
@@ -918,7 +1043,7 @@ fn screenshots_dir_from(
         .or(home.filter(|value| !value.trim().is_empty()))
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    base.join("Pictures").join("BowEcho")
+    base.join("Pictures").join(folder)
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -944,6 +1069,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn brand_default_and_empty_settings_json_keep_bowecho_identity() {
+        let direct = BrandConfig::default();
+        let settings = AppSettings::from_json("{}");
+
+        assert_eq!(settings.brand, direct);
+        assert_eq!(settings.brand.resolved_display_name(), "BowEcho");
+        assert_eq!(settings.brand.filename_prefix(), "bowecho");
+        assert_eq!(settings.brand.output_folder_name(), "BowEcho");
+        assert!(!settings.brand.use_custom_storage_namespace);
+    }
+
+    #[test]
+    fn brand_default_stays_sparse_in_app_settings_json() {
+        assert!(!AppSettings::default().to_json().contains("\"brand\""));
+    }
+
+    #[test]
+    fn brand_storage_import_copies_without_overwriting() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "bowecho-brand-import-{}-{nonce}",
+            std::process::id()
+        ));
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(source.join("nested")).expect("source tree");
+        std::fs::create_dir_all(&destination).expect("destination tree");
+        std::fs::write(source.join("keep.txt"), b"new").expect("source file");
+        std::fs::write(source.join("nested/copied.txt"), b"copied").expect("nested file");
+        std::fs::write(destination.join("keep.txt"), b"existing").expect("existing file");
+
+        let summary = import_storage_tree(&source, &destination).expect("safe copy import");
+
+        assert_eq!(summary.files_copied, 1);
+        assert_eq!(summary.files_skipped, 1);
+        assert_eq!(
+            std::fs::read(destination.join("keep.txt")).unwrap(),
+            b"existing"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("nested/copied.txt")).unwrap(),
+            b"copied"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn default_has_eight_layout_slots() {
         assert_eq!(AppSettings::default().saved_layout_slots, 8);
     }
@@ -955,17 +1130,18 @@ mod tests {
                 Some("D:\\captures".to_owned()),
                 Some("C:\\Users\\test".to_owned()),
                 None,
+                "BowEcho",
             ),
             PathBuf::from("D:\\captures")
         );
         assert_eq!(
-            screenshots_dir_from(None, Some("C:\\Users\\test".to_owned()), None),
+            screenshots_dir_from(None, Some("C:\\Users\\test".to_owned()), None, "BowEcho"),
             PathBuf::from("C:\\Users\\test")
                 .join("Pictures")
                 .join("BowEcho")
         );
         assert_eq!(
-            screenshots_dir_from(None, None, Some("/home/test".to_owned())),
+            screenshots_dir_from(None, None, Some("/home/test".to_owned()), "BowEcho"),
             PathBuf::from("/home/test").join("Pictures").join("BowEcho")
         );
     }

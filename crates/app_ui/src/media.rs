@@ -25,7 +25,6 @@ use eframe::egui;
 
 use crate::{LoopTimelineStep, LoopTimelineTarget, ViewerApp};
 
-const CAPTURE_FILE_PREFIX: &str = "bowecho";
 /// Extra repaints to wait after renders settle so the freshly uploaded
 /// texture is actually painted before the capture frame.
 const RECORD_SETTLE_FRAMES: u8 = 2;
@@ -190,6 +189,10 @@ pub(crate) struct MediaShare {
     result_rx: mpsc::Receiver<MediaResult>,
     /// Most recent map canvas rect (points), used for map-only crops.
     pub(crate) last_map_rect: Option<egui::Rect>,
+    /// True only while a screenshot command is in flight. The main UI paints
+    /// the Brand Kit watermark/share-card overlay on that capture frame, never
+    /// during ordinary operation.
+    capture_overlay_visible: bool,
     record_size: RecordSize,
     record_format: RecordFormat,
     record_fps: u16,
@@ -208,6 +211,7 @@ impl Default for MediaShare {
             result_tx,
             result_rx,
             last_map_rect: None,
+            capture_overlay_visible: false,
             record_size: RecordSize::Small720,
             record_format: RecordFormat::Auto,
             record_fps: DEFAULT_RECORD_FPS,
@@ -229,6 +233,10 @@ impl MediaShare {
 
     pub(crate) fn is_recording(&self) -> bool {
         self.recorder.is_some() || self.free_recorder.is_some()
+    }
+
+    pub(crate) fn capture_overlay_visible(&self) -> bool {
+        self.capture_overlay_visible
     }
 
     pub(crate) fn loop_recording(&self) -> bool {
@@ -315,6 +323,7 @@ impl ViewerApp {
                 .collect()
         });
         for (kind, image) in captures {
+            self.media.capture_overlay_visible = false;
             match kind {
                 CaptureKind::FullWindow => self.finish_still_capture(ctx, &image, false),
                 CaptureKind::MapOnly => self.finish_still_capture(ctx, &image, true),
@@ -327,7 +336,8 @@ impl ViewerApp {
         self.drive_free_recorder(ctx);
     }
 
-    fn request_screenshot(&self, ctx: &egui::Context, kind: CaptureKind) {
+    fn request_screenshot(&mut self, ctx: &egui::Context, kind: CaptureKind) {
+        self.media.capture_overlay_visible = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(kind)));
         ctx.request_repaint();
     }
@@ -343,27 +353,42 @@ impl ViewerApp {
         } else {
             image.clone()
         };
+        let brand_config = self.app_settings.brand.clone();
+        let image = apply_share_layout(
+            &image,
+            brand_config.sharing.layout,
+            brand_config.resolved_palette().surface,
+        );
         ctx.copy_image(image.clone());
 
         let result_tx = self.media.result_tx.clone();
         let repaint_ctx = ctx.clone();
+        let short_name = brand_config.resolved_short_name().to_owned();
         thread::spawn(move || {
-            let message = match save_capture_png(&image) {
-                Ok(path) => format!("Screenshot copied to clipboard + saved {}", path.display()),
-                Err(err) => format!("Screenshot copied to clipboard; PNG save failed: {err}"),
+            let message = match save_capture_png(&image, &brand_config) {
+                Ok(path) => format!(
+                    "{short_name} screenshot copied to clipboard + saved {}",
+                    path.display()
+                ),
+                Err(err) => {
+                    format!("{short_name} screenshot copied to clipboard; PNG save failed: {err}")
+                }
             };
             let _ = result_tx.send(MediaResult { message });
             repaint_ctx.request_repaint();
         });
-        self.status = "Screenshot copied to clipboard; saving PNG...".to_owned();
+        self.status = format!(
+            "{} screenshot copied to clipboard; saving PNG...",
+            self.app_settings.brand.resolved_short_name()
+        );
     }
 
     pub(crate) fn media_top_bar_ui(&mut self, ui: &mut egui::Ui) {
+        let output_folder = self.app_settings.brand.output_folder_name();
         if crate::fixed_action_button(ui, "Screenshot", 86.0)
-            .on_hover_text(
-                "Copy a full-window screenshot to the clipboard and save a PNG \
-                 (F12; Shift+F12 captures the map only)",
-            )
+            .on_hover_text(format!(
+                "Copy a full-window screenshot to the clipboard and save a PNG in Pictures/{output_folder} (F12; Shift+F12 captures the map only)"
+            ))
             .clicked()
         {
             self.request_screenshot(ui.ctx(), CaptureKind::FullWindow);
@@ -411,16 +436,15 @@ impl ViewerApp {
             .map(|target| self.loop_timeline_steps_for_target(target).len())
             .unwrap_or_else(|| self.loop_timeline_steps_for_recording().len());
         let record_enabled = !free_recording && (loop_recording || step_count > 1);
+        let output_folder = self.app_settings.brand.output_folder_name();
         if ui
             .add_enabled_ui(record_enabled, |ui| {
                 crate::fixed_action_button(ui, record_label, 62.0)
             })
             .inner
-            .on_hover_text(
-                "Record one clean cycle of this loop to a shareable GIF/MP4 in \
-                 Pictures/BowEcho (needs 2+ frames; pan/zoom during recording \
-                 is captured too). Hotkey: Ctrl+Shift+F12",
-            )
+            .on_hover_text(format!(
+                "Record one clean cycle of this loop to a shareable GIF/MP4 in Pictures/{output_folder} (needs 2+ frames; pan/zoom during recording is captured too). Hotkey: Ctrl+Shift+F12"
+            ))
             .clicked()
         {
             self.toggle_recording(ui.ctx(), target);
@@ -715,7 +739,7 @@ impl ViewerApp {
         let waiting_for_timeline_overlays = !self.loop_record_timeline_overlays_settled();
         let waiting_for_time_layers = !self.loop_record_time_layers_settled();
         let (format, fallback_note) = self.resolve_record_format();
-        let path = match new_capture_path(format.extension()) {
+        let path = match new_capture_path(format.extension(), &self.app_settings.brand) {
             Ok(path) => path,
             Err(err) => {
                 self.status = format!("Recording failed: {err}");
@@ -724,6 +748,7 @@ impl ViewerApp {
         };
         let frame_tx = spawn_loop_encoder(LoopEncodeJob {
             format,
+            brand_short_name: self.app_settings.brand.resolved_short_name().to_owned(),
             max_width: self.media.record_size.max_width(),
             // Deterministic loop exports use the stable 1x radar cadence,
             // not whatever high-speed playback rate the operator is using
@@ -798,7 +823,7 @@ impl ViewerApp {
             return;
         }
         let (format, fallback_note) = self.resolve_record_format();
-        let path = match new_capture_path(format.extension()) {
+        let path = match new_capture_path(format.extension(), &self.app_settings.brand) {
             Ok(path) => path,
             Err(err) => {
                 self.status = format!("Free recording failed: {err}");
@@ -809,6 +834,7 @@ impl ViewerApp {
         let frame_delay_ms = self.media.free_record_frame_delay_ms();
         let frame_tx = spawn_loop_encoder(LoopEncodeJob {
             format,
+            brand_short_name: self.app_settings.brand.resolved_short_name().to_owned(),
             max_width: self.media.record_size.max_width(),
             frame_delay_ms,
             frame_rate_fps: Some(record_fps),
@@ -950,6 +976,11 @@ impl ViewerApp {
     }
 
     fn record_frame_captured(&mut self, ctx: &egui::Context, image: Arc<egui::ColorImage>) {
+        let image = Arc::new(apply_share_layout(
+            &image,
+            self.app_settings.brand.sharing.layout,
+            self.app_settings.brand.resolved_palette().surface,
+        ));
         let Some(recorder) = self.media.recorder.as_mut() else {
             return;
         };
@@ -1008,6 +1039,11 @@ impl ViewerApp {
     }
 
     fn free_record_frame_captured(&mut self, ctx: &egui::Context, image: Arc<egui::ColorImage>) {
+        let image = Arc::new(apply_share_layout(
+            &image,
+            self.app_settings.brand.sharing.layout,
+            self.app_settings.brand.resolved_palette().surface,
+        ));
         let Some(recorder) = self.media.free_recorder.as_mut() else {
             return;
         };
@@ -1037,6 +1073,7 @@ impl ViewerApp {
     /// Ends the recording (loop complete or user pressed Stop) and hands the
     /// captured frames to the background encoder.
     fn finish_recording(&mut self, ctx: &egui::Context) {
+        self.media.capture_overlay_visible = false;
         let Some(recorder) = self.media.recorder.take() else {
             return;
         };
@@ -1057,6 +1094,7 @@ impl ViewerApp {
     }
 
     fn abort_recording(&mut self, ctx: &egui::Context, reason: &str) {
+        self.media.capture_overlay_visible = false;
         let Some(recorder) = self.media.recorder.take() else {
             return;
         };
@@ -1067,6 +1105,7 @@ impl ViewerApp {
     }
 
     fn finish_free_recording(&mut self, ctx: &egui::Context) {
+        self.media.capture_overlay_visible = false;
         let Some(recorder) = self.media.free_recorder.take() else {
             return;
         };
@@ -1085,6 +1124,7 @@ impl ViewerApp {
     }
 
     fn abort_free_recording(&mut self, ctx: &egui::Context, reason: &str) {
+        self.media.capture_overlay_visible = false;
         let Some(recorder) = self.media.free_recorder.take() else {
             return;
         };
@@ -1196,6 +1236,7 @@ impl ViewerApp {
 
 struct LoopEncodeJob {
     format: ResolvedRecordFormat,
+    brand_short_name: String,
     max_width: u32,
     frame_delay_ms: u32,
     frame_rate_fps: Option<u16>,
@@ -1249,7 +1290,8 @@ fn run_loop_encoder(job: &LoopEncodeJob, frame_rx: &mpsc::Receiver<EncoderMsg>) 
                             Err(err) => format!(" (file clipboard copy failed: {err})"),
                         };
                         format!(
-                            "Saved {} recording ({frames} frames){copy_note}: {}",
+                            "Saved {} {} recording ({frames} frames){copy_note}: {}",
+                            job.brand_short_name,
                             job.format.label(),
                             job.out_path.display()
                         )
@@ -1689,11 +1731,12 @@ fn hide_console_window(_command: &mut Command) {
     }
 }
 
-fn capture_file_base(time: chrono::DateTime<chrono::Local>) -> String {
-    format!("{CAPTURE_FILE_PREFIX}_{}", time.format("%Y%m%d_%H%M%S"))
+fn capture_file_base(time: chrono::DateTime<chrono::Local>, prefix: &str) -> String {
+    let prefix = settings::sanitize_namespace(prefix).unwrap_or_else(|| "bowecho".to_owned());
+    format!("{prefix}_{}", time.format("%Y%m%d_%H%M%S"))
 }
 
-/// Builds a non-colliding `<dir>/bowecho_<stamp>[_<n>].<ext>` path.
+/// Builds a non-colliding `<dir>/<brand>_<stamp>[_<n>].<ext>` path.
 fn unique_capture_path(dir: &Path, base: &str, extension: &str) -> PathBuf {
     let mut path = dir.join(format!("{base}.{extension}"));
     let mut counter = 2_u32;
@@ -1704,13 +1747,19 @@ fn unique_capture_path(dir: &Path, base: &str, extension: &str) -> PathBuf {
     path
 }
 
-fn new_capture_path(extension: &str) -> Result<PathBuf, String> {
-    let dir = settings::screenshots_dir();
+fn new_capture_path(
+    extension: &str,
+    brand_config: &settings::BrandConfig,
+) -> Result<PathBuf, String> {
+    let dir = settings::screenshots_dir_for_brand(brand_config);
     std::fs::create_dir_all(&dir)
         .map_err(|err| format!("could not create {}: {err}", dir.display()))?;
     Ok(unique_capture_path(
         &dir,
-        &capture_file_base(chrono::Local::now()),
+        &capture_file_base(
+            chrono::Local::now(),
+            &brand_config.screenshot_filename_prefix,
+        ),
         extension,
     ))
 }
@@ -1726,8 +1775,11 @@ fn rgba_bytes_from_color_image(image: &egui::ColorImage) -> Vec<u8> {
     rgba
 }
 
-fn save_capture_png(image: &egui::ColorImage) -> Result<PathBuf, String> {
-    let path = new_capture_path("png")?;
+fn save_capture_png(
+    image: &egui::ColorImage,
+    brand_config: &settings::BrandConfig,
+) -> Result<PathBuf, String> {
+    let path = new_capture_path("png", brand_config)?;
     let rgba = rgba_bytes_from_color_image(image);
     image::save_buffer_with_format(
         &path,
@@ -1739,6 +1791,95 @@ fn save_capture_png(image: &egui::ColorImage) -> Result<PathBuf, String> {
     )
     .map_err(|err| format!("{err}"))?;
     Ok(path)
+}
+
+const SHARE_LAYOUT_MAX_DIM: usize = 4096;
+
+/// Letterboxes a capture into a social aspect preset without cropping map or
+/// UI context. Very large portrait conversions are scaled before padding so a
+/// 4K-wide source cannot produce an unbounded 7K-tall frame.
+fn apply_share_layout(
+    image: &egui::ColorImage,
+    layout: settings::ShareLayout,
+    fill_rgb: [u8; 3],
+) -> egui::ColorImage {
+    let Some((ratio_width, ratio_height)) = layout.ratio() else {
+        return image.clone();
+    };
+    let [source_width, source_height] = image.size;
+    if source_width == 0 || source_height == 0 {
+        return image.clone();
+    }
+
+    let mut content = image.clone();
+    let mut target =
+        share_layout_dimensions(source_width, source_height, ratio_width, ratio_height);
+    let largest = target[0].max(target[1]);
+    if largest > SHARE_LAYOUT_MAX_DIM {
+        let scale = SHARE_LAYOUT_MAX_DIM as f64 / largest as f64;
+        let resized = [
+            ((source_width as f64 * scale).round() as usize).max(1),
+            ((source_height as f64 * scale).round() as usize).max(1),
+        ];
+        content = resize_color_image_nearest(&content, resized);
+        target = share_layout_dimensions(resized[0], resized[1], ratio_width, ratio_height);
+    }
+
+    if target == content.size {
+        return content;
+    }
+    let fill = egui::Color32::from_rgb(fill_rgb[0], fill_rgb[1], fill_rgb[2]);
+    let mut output = egui::ColorImage::new(target, vec![fill; target[0] * target[1]]);
+    let offset_x = (target[0] - content.size[0]) / 2;
+    let offset_y = (target[1] - content.size[1]) / 2;
+    for row in 0..content.size[1] {
+        let source_start = row * content.size[0];
+        let target_start = (row + offset_y) * target[0] + offset_x;
+        output.pixels[target_start..target_start + content.size[0]]
+            .copy_from_slice(&content.pixels[source_start..source_start + content.size[0]]);
+    }
+    output
+}
+
+fn share_layout_dimensions(
+    width: usize,
+    height: usize,
+    ratio_width: usize,
+    ratio_height: usize,
+) -> [usize; 2] {
+    let width = width.max(1);
+    let height = height.max(1);
+    let ratio_width = ratio_width.max(1);
+    let ratio_height = ratio_height.max(1);
+    if width as u128 * ratio_height as u128 >= height as u128 * ratio_width as u128 {
+        let target_height =
+            (width as u128 * ratio_height as u128).div_ceil(ratio_width as u128) as usize;
+        [width, target_height.max(height)]
+    } else {
+        let target_width =
+            (height as u128 * ratio_width as u128).div_ceil(ratio_height as u128) as usize;
+        [target_width.max(width), height]
+    }
+}
+
+fn resize_color_image_nearest(image: &egui::ColorImage, new_size: [usize; 2]) -> egui::ColorImage {
+    let [old_width, old_height] = image.size;
+    let [new_width, new_height] = [new_size[0].max(1), new_size[1].max(1)];
+    if old_width == 0 || old_height == 0 || image.pixels.is_empty() {
+        return egui::ColorImage::new(
+            [new_width, new_height],
+            vec![egui::Color32::TRANSPARENT; new_width * new_height],
+        );
+    }
+    let mut pixels = Vec::with_capacity(new_width * new_height);
+    for y in 0..new_height {
+        let source_y = (y * old_height / new_height).min(old_height - 1);
+        for x in 0..new_width {
+            let source_x = (x * old_width / new_width).min(old_width - 1);
+            pixels.push(image.pixels[source_y * old_width + source_x]);
+        }
+    }
+    egui::ColorImage::new([new_width, new_height], pixels)
 }
 
 /// Crops a physical-pixel screenshot to a rect given in egui points,
@@ -1770,7 +1911,32 @@ mod tests {
         let time = chrono::Local
             .with_ymd_and_hms(2026, 6, 11, 5, 51, 9)
             .unwrap();
-        assert_eq!(capture_file_base(time), "bowecho_20260611_055109");
+        assert_eq!(
+            capture_file_base(time, "bowecho"),
+            "bowecho_20260611_055109"
+        );
+    }
+
+    #[test]
+    fn brand_capture_file_base_uses_configured_prefix() {
+        let time = chrono::Local
+            .with_ymd_and_hms(2026, 6, 11, 5, 51, 9)
+            .unwrap();
+        let brand =
+            settings::BrandConfig::preset(settings::BrandPreset::CaliforniaWildfireTracking);
+        assert_eq!(
+            capture_file_base(time, &brand.screenshot_filename_prefix),
+            "cwt_20260611_055109"
+        );
+    }
+
+    #[test]
+    fn brand_share_layout_letterboxes_without_cropping() {
+        let image = egui::ColorImage::new([4, 2], vec![egui::Color32::WHITE; 8]);
+        let square = apply_share_layout(&image, settings::ShareLayout::Square1x1, [1, 2, 3]);
+        assert_eq!(square.size, [4, 4]);
+        assert_eq!(square.pixels[0], egui::Color32::from_rgb(1, 2, 3));
+        assert_eq!(square.pixels[4], egui::Color32::WHITE);
     }
 
     #[test]
