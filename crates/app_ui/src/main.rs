@@ -24313,7 +24313,6 @@ impl ViewerApp {
         self.vol3d.volume_key = None;
         self.vol3d.resample_rx = None;
         self.vol3d.status = format!("resampling selected {:.0} km 3D box...", half_km * 2.0);
-        self.clear_vol3d_texture();
         self.open_viewer(dock::WorkspacePane::Vol3d);
         ctx.request_repaint();
         true
@@ -31244,6 +31243,10 @@ impl ViewerApp {
         false
     }
 
+    fn vol3d_control_panel_width(ui: &egui::Ui) -> f32 {
+        ui.available_width().clamp(280.0, 360.0)
+    }
+
     fn vol3d_volume_controls_body(
         &mut self,
         ui: &mut egui::Ui,
@@ -31252,7 +31255,10 @@ impl ViewerApp {
         value_max: f32,
         value_suffix: &str,
     ) {
-        ui.set_min_width(280.0);
+        let panel_width = Self::vol3d_control_panel_width(ui);
+        ui.set_width(panel_width);
+        ui.set_min_width(panel_width);
+        ui.set_max_width(panel_width);
         ui.label(egui::RichText::new("Transfer function").strong());
         let mut threshold = self.vol3d.threshold_dbz.clamp(value_min, value_max);
         ui.add(
@@ -31309,7 +31315,10 @@ impl ViewerApp {
         value_max: f32,
         value_suffix: &str,
     ) {
-        ui.set_min_width(280.0);
+        let panel_width = Self::vol3d_control_panel_width(ui);
+        ui.set_width(panel_width);
+        ui.set_min_width(panel_width);
+        ui.set_max_width(panel_width);
         ui.label(egui::RichText::new("Ground underlay").strong());
         egui::ComboBox::from_id_salt("vol3d_floor_mode_panel")
             .selected_text(self.vol3d.floor_mode.label())
@@ -31329,7 +31338,15 @@ impl ViewerApp {
             );
             self.vol3d.floor_threshold_dbz = floor_threshold;
         });
-        ui.weak("Lowest tilt paints the best complete low-level PPI. Column max projects the visible 3D slab onto the ground.");
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "Lowest tilt paints the best complete low-level PPI. Column max projects the visible 3D slab onto the ground.",
+                )
+                .weak(),
+            )
+            .wrap(),
+        );
     }
 
     fn vol3d_pane_body(&mut self, ui: &mut egui::Ui) {
@@ -31537,9 +31554,6 @@ impl ViewerApp {
                 self.vol3d.volume_key = None;
                 self.vol3d.resample_rx = None;
                 self.vol3d.status = format!("resampling {size_km} km box…");
-                if let Ok(mut pending) = self.vol3d.pending.lock() {
-                    pending.volume = Some(vol3d::empty_box());
-                }
                 ui.ctx().request_repaint();
             }
             if ui
@@ -31551,9 +31565,6 @@ impl ViewerApp {
                 self.vol3d.volume_key = None;
                 self.vol3d.resample_rx = None;
                 self.vol3d.status = format!("resampling {} km box…", size_km);
-                if let Ok(mut pending) = self.vol3d.pending.lock() {
-                    pending.volume = Some(vol3d::empty_box());
-                }
                 ui.ctx().request_repaint();
             }
             if self.vol3d.box_target_lonlat.is_some()
@@ -31566,9 +31577,6 @@ impl ViewerApp {
                 self.vol3d.volume_key = None;
                 self.vol3d.resample_rx = None;
                 self.vol3d.status = "resampling map-centered 3D box…".to_owned();
-                if let Ok(mut pending) = self.vol3d.pending.lock() {
-                    pending.volume = Some(vol3d::empty_box());
-                }
                 ui.ctx().request_repaint();
             }
             ui.separator();
@@ -31595,7 +31603,7 @@ impl ViewerApp {
 
         if self.vol3d.show_volume_controls || self.vol3d.show_floor_controls {
             ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
+            ui.vertical(|ui| {
                 if self.vol3d.show_volume_controls {
                     egui::Frame::group(ui.style()).show(ui, |ui| {
                         self.vol3d_volume_controls_body(
