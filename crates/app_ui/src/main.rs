@@ -31029,6 +31029,32 @@ impl ViewerApp {
     /// low-level floor PPI on the same footprint, and GPU direct-volume
     /// rendering. The floor, box, grid, and annotations all share one camera
     /// transform so the underlay remains locked to z=0 at every pane aspect.
+    fn show_vol3d_floating_window(&mut self, ctx: &egui::Context) {
+        let bounds = ctx.content_rect().shrink(8.0);
+        let min_size = egui::vec2(420.0, 340.0);
+        let max_size = egui::vec2(
+            bounds.width().max(min_size.x),
+            bounds.height().max(min_size.y),
+        );
+        let default_size = egui::vec2(
+            900.0_f32.min(max_size.x).max(min_size.x),
+            700.0_f32.min(max_size.y).max(min_size.y),
+        );
+        let mut open = self.vol3d.open;
+        egui::Window::new("Volume Explorer (3D)")
+            .open(&mut open)
+            .default_size(default_size)
+            .min_size(min_size)
+            .max_size(max_size)
+            .constrain_to(bounds)
+            .resizable(true)
+            .show(ctx, |ui| {
+                self.dock_toggle_row(ui, dock::WorkspacePane::Vol3d);
+                self.vol3d_pane_body(ui);
+            });
+        self.set_viewer_open(dock::WorkspacePane::Vol3d, open);
+    }
+
     fn vol3d_window(&mut self, ctx: &egui::Context) {
         if !self.vol3d.open {
             return;
@@ -31077,17 +31103,7 @@ impl ViewerApp {
                 if self.workspace.is_docked(dock::WorkspacePane::Vol3d) {
                     return;
                 }
-                let mut open = self.vol3d.open;
-                egui::Window::new("Volume Explorer (3D)")
-                    .open(&mut open)
-                    .default_size([900.0, 700.0])
-                    .min_size([520.0, 420.0])
-                    .resizable(true)
-                    .show(ctx, |ui| {
-                        self.dock_toggle_row(ui, dock::WorkspacePane::Vol3d);
-                        self.vol3d_pane_body(ui);
-                    });
-                self.set_viewer_open(dock::WorkspacePane::Vol3d, open);
+                self.show_vol3d_floating_window(ctx);
                 return;
             };
             let radar_lat = volume.site.latitude_deg;
@@ -31219,17 +31235,7 @@ impl ViewerApp {
         if self.workspace.is_docked(dock::WorkspacePane::Vol3d) {
             return;
         }
-        let mut open = self.vol3d.open;
-        egui::Window::new("Volume Explorer (3D)")
-            .open(&mut open)
-            .default_size([900.0, 700.0])
-            .min_size([520.0, 420.0])
-            .resizable(true)
-            .show(ctx, |ui| {
-                self.dock_toggle_row(ui, dock::WorkspacePane::Vol3d);
-                self.vol3d_pane_body(ui);
-            });
-        self.set_viewer_open(dock::WorkspacePane::Vol3d, open);
+        self.show_vol3d_floating_window(ctx);
     }
 
     /// 3D Volume Explorer body. Deep controls live in compact expandable
@@ -31569,7 +31575,7 @@ impl ViewerApp {
             if self.vol3d.resample_rx.is_some() {
                 ui.spinner();
             }
-            ui.weak(format!(
+            ui.add(egui::Label::new(egui::RichText::new(format!(
                 "{} {:.1}{} · {} · {} · {:.1}× Z",
                 vol3d_product.label(),
                 self.vol3d.threshold_dbz,
@@ -31577,9 +31583,13 @@ impl ViewerApp {
                 self.vol3d.floor_mode.label(),
                 self.vol3d.quality.label(),
                 self.vol3d.vertical_exaggeration,
-            ));
+            ))
+            .weak())
+            .truncate());
             if !self.vol3d.status.is_empty() {
-                ui.weak(&self.vol3d.status);
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&self.vol3d.status).weak()).truncate(),
+                );
             }
         });
 
