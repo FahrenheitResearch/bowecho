@@ -1,18 +1,13 @@
 //! 3D Volume Explorer: GPU direct volume rendering of the reflectivity
-//! volume — the GR2Analyst Volume Explorer approach (verified from
-//! GRLevelX's own documentation: translucent DVR with a user alpha
-//! transfer function, NOT marching cubes; docs/xsection-3d-spec.md).
+//! volume, with the lowest reflectivity sweep painted onto the floor as a
+//! spatial underlay.
 //!
-//! Pipeline: render2d::volume_box_resample builds a Cartesian box
-//! (~120 km square, 0..18 km) around the view center on a background
-//! thread → uploaded as a wgpu 3D texture (R8Unorm, dBZ normalized
-//! 0..80) → a WGSL fragment raymarcher composites front-to-back through
-//! an alpha transfer function (threshold + opacity over the live
-//! reflectivity colortable, uploaded as a 256×1 LUT).
-//!
-//! Rendering runs inside an egui-wgpu paint callback; resources are
-//! created once at app startup (eframe's custom-3D pattern) so the
-//! per-frame cost is one uniform write + one fullscreen-triangle draw.
+//! Pipeline: `render2d::volume_box_resample` builds a Cartesian volume around
+//! the current map center on a background thread. The same worker renders the
+//! lowest usable reflectivity sweep into an RGBA image covering that exact
+//! horizontal footprint. The volume is uploaded as an R8 3D texture and the
+//! floor as an RGBA 2D texture. A WGSL fragment shader composites the volume
+//! front-to-back, then places the floor behind it at z = 0.
 
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
@@ -20,6 +15,9 @@ use std::sync::{Arc, Mutex, mpsc};
 
 pub const BOX_N: usize = 192;
 pub const BOX_NZ: usize = 48;
+/// Independent floor resolution: sharper than the volume grid while still
+/// cheap to rebuild and upload once per scan.
+pub const FLOOR_N: usize = 512;
 pub const BOX_HALF_KM: f32 = 60.0;
 pub const BOX_TOP_M: f32 = 18_000.0;
 
@@ -31,6 +29,10 @@ pub struct Vol3d {
     pub dist: f32,
     pub threshold_dbz: f32,
     pub opacity: f32,
+    /// Paint the lowest usable reflectivity sweep onto the box floor.
+    pub show_floor: bool,
+    /// Draw-time alpha multiplier for the floor PPI.
+    pub floor_opacity: f32,
     pub resample_rx: Option<mpsc::Receiver<Option<VolumeBox>>>,
     /// (volume_time_ms, top REF elevation in tenths of a degree, center
     /// east/10km, center north/10km, box half km) — top-tilt inclusion
@@ -58,6 +60,10 @@ pub struct VolumeBox {
     pub data: Vec<u8>,
     pub n: usize,
     pub nz: usize,
+    /// RGBA rows run north-to-south, matching the ordinary 2D radar raster.
+    /// The shader flips its V coordinate because the volume's +Y axis is north.
+    pub floor_rgba: Option<Vec<u8>>,
+    pub floor_elevation_deg: Option<f32>,
 }
 
 impl Default for Vol3d {
@@ -69,6 +75,8 @@ impl Default for Vol3d {
             dist: 2.4,
             threshold_dbz: 35.0,
             opacity: 0.55,
+            show_floor: true,
+            floor_opacity: 0.82,
             resample_rx: None,
             volume_key: None,
             last_top_deg: 0.0,
@@ -91,7 +99,15 @@ pub fn normalize_box(values: &[f32], n: usize, nz: usize) -> VolumeBox {
             }
         })
         .collect();
-    VolumeBox { data, n, nz }
+    VolumeBox {
+        data,
+        n,
+        nz,
+        // Always upload a floor image with a new box so a rare raster
+        // failure clears the previous scan instead of leaving a stale PPI.
+        floor_rgba: Some(vec![0; FLOOR_N.saturating_mul(FLOOR_N).saturating_mul(4)]),
+        floor_elevation_deg: None,
+    }
 }
 
 const SHADER: &str = r#"
@@ -102,14 +118,21 @@ struct Uniforms {
     threshold: f32,
     opacity: f32,
     aspect: f32,
+    floor_opacity: f32,
+    show_floor: f32,
     _pad0: f32,
     _pad1: f32,
+    _pad2: f32,
+    _pad3: f32,
 };
+
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var t_volume: texture_3d<f32>;
 @group(0) @binding(2) var s_volume: sampler;
 @group(0) @binding(3) var t_lut: texture_2d<f32>;
 @group(0) @binding(4) var s_lut: sampler;
+@group(0) @binding(5) var t_floor: texture_2d<f32>;
+@group(0) @binding(6) var s_floor: sampler;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -127,19 +150,29 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
 
 const ZSPAN: f32 = 0.6;
 
-fn box_intersect(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {
+fn box_intersect(
+    ro: vec3<f32>,
+    rd: vec3<f32>,
+    bmin: vec3<f32>,
+    bmax: vec3<f32>
+) -> vec2<f32> {
     let inv = 1.0 / rd;
     let t0 = (bmin - ro) * inv;
     let t1 = (bmax - ro) * inv;
     let tmin = min(t0, t1);
     let tmax = max(t0, t1);
-    return vec2<f32>(max(max(tmin.x, tmin.y), tmin.z), min(min(tmax.x, tmax.y), tmax.z));
+    return vec2<f32>(
+        max(max(tmin.x, tmin.y), tmin.z),
+        min(min(tmax.x, tmax.y), tmax.z)
+    );
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let cy = cos(u.yaw); let sy = sin(u.yaw);
-    let cp = cos(u.pitch); let sp = sin(u.pitch);
+    let cy = cos(u.yaw);
+    let sy = sin(u.yaw);
+    let cp = cos(u.pitch);
+    let sp = sin(u.pitch);
     let center = vec3<f32>(0.0, 0.0, ZSPAN * 0.35);
     let eye = center + u.dist * vec3<f32>(cy * cp, sy * cp, sp);
     let fwd = normalize(center - eye);
@@ -147,32 +180,63 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let up = cross(right, fwd);
     let ndc = (in.uv * 2.0 - 1.0) * vec2<f32>(u.aspect, 1.0);
     let rd = normalize(fwd + 0.7 * (ndc.x * right + ndc.y * up));
+    let hit = box_intersect(
+        eye,
+        rd,
+        vec3<f32>(-1.0, -1.0, 0.0),
+        vec3<f32>(1.0, 1.0, ZSPAN)
+    );
 
-    let t = box_intersect(eye, rd, vec3<f32>(-1.0, -1.0, 0.0), vec3<f32>(1.0, 1.0, ZSPAN));
-    if (t.y <= max(t.x, 0.0)) {
-        return vec4<f32>(0.0);
-    }
-    let t0 = max(t.x, 0.0);
-    let STEPS = 160;
-    let dt = (t.y - t0) / f32(STEPS);
     var col = vec3<f32>(0.0);
     var acc = 0.0;
-    for (var i = 0; i < STEPS; i = i + 1) {
-        let p = eye + rd * (t0 + (f32(i) + 0.5) * dt);
-        let uvw = vec3<f32>((p.x + 1.0) * 0.5, (p.y + 1.0) * 0.5, p.z / ZSPAN);
-        let v = textureSampleLevel(t_volume, s_volume, uvw, 0.0).r;
-        if (v <= u.threshold) {
-            continue;
-        }
-        let c = textureSampleLevel(t_lut, s_lut, vec2<f32>(v, 0.5), 0.0);
-        var a = c.a * u.opacity * smoothstep(u.threshold, u.threshold + 0.08, v);
-        a = 1.0 - pow(1.0 - a, dt * 28.0);
-        col = col + (1.0 - acc) * a * c.rgb;
-        acc = acc + (1.0 - acc) * a;
-        if (acc > 0.97) {
-            break;
+
+    // Direct volume render, front-to-back. The floor is composited afterward,
+    // which places it physically behind every sampled echo for this camera.
+    if (hit.y > max(hit.x, 0.0)) {
+        let t0 = max(hit.x, 0.0);
+        let STEPS = 160;
+        let dt = (hit.y - t0) / f32(STEPS);
+        for (var i = 0; i < STEPS; i = i + 1) {
+            let p = eye + rd * (t0 + (f32(i) + 0.5) * dt);
+            let uvw = vec3<f32>(
+                (p.x + 1.0) * 0.5,
+                (p.y + 1.0) * 0.5,
+                p.z / ZSPAN
+            );
+            let v = textureSampleLevel(t_volume, s_volume, uvw, 0.0).r;
+            if (v <= u.threshold) {
+                continue;
+            }
+            let c = textureSampleLevel(t_lut, s_lut, vec2<f32>(v, 0.5), 0.0);
+            var a = c.a * u.opacity * smoothstep(u.threshold, u.threshold + 0.08, v);
+            a = 1.0 - pow(1.0 - a, dt * 28.0);
+            col = col + (1.0 - acc) * a * c.rgb;
+            acc = acc + (1.0 - acc) * a;
+            if (acc > 0.97) {
+                break;
+            }
         }
     }
+
+    // Lowest-tilt PPI underlay. The CPU image is conventional screen order
+    // (row 0 = north), so north (+Y) maps to V=0 here.
+    if (u.show_floor > 0.5 && abs(rd.z) > 0.00001) {
+        let floor_t = -eye.z / rd.z;
+        if (floor_t > 0.0) {
+            let p = eye + rd * floor_t;
+            if (abs(p.x) <= 1.0 && abs(p.y) <= 1.0) {
+                let floor_uv = vec2<f32>(
+                    (p.x + 1.0) * 0.5,
+                    (1.0 - p.y) * 0.5
+                );
+                let floor = textureSampleLevel(t_floor, s_floor, floor_uv, 0.0);
+                let floor_a = floor.a * u.floor_opacity;
+                col = col + (1.0 - acc) * floor_a * floor.rgb;
+                acc = acc + (1.0 - acc) * floor_a;
+            }
+        }
+    }
+
     return vec4<f32>(col, acc);
 }
 "#;
@@ -185,6 +249,7 @@ pub struct Vol3dResources {
     uniforms: wgpu::Buffer,
     volume_tex: wgpu::Texture,
     lut_tex: wgpu::Texture,
+    floor_tex: wgpu::Texture,
 }
 
 /// One-time GPU setup (eframe custom-3D pattern: call from the app
@@ -197,7 +262,7 @@ pub fn init_gpu(render_state: &egui_wgpu::RenderState) {
     });
     let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("vol3d-uniforms"),
-        size: 32,
+        size: 48,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -220,6 +285,20 @@ pub fn init_gpu(render_state: &egui_wgpu::RenderState) {
         size: wgpu::Extent3d {
             width: 256,
             height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let floor_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("vol3d-floor"),
+        size: wgpu::Extent3d {
+            width: FLOOR_N as u32,
+            height: FLOOR_N as u32,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -283,6 +362,22 @@ pub fn init_gpu(render_state: &egui_wgpu::RenderState) {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     });
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -311,6 +406,16 @@ pub fn init_gpu(render_state: &egui_wgpu::RenderState) {
             },
             wgpu::BindGroupEntry {
                 binding: 4,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(
+                    &floor_tex.create_view(&Default::default()),
+                ),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
                 resource: wgpu::BindingResource::Sampler(&sampler),
             },
         ],
@@ -355,6 +460,7 @@ pub fn init_gpu(render_state: &egui_wgpu::RenderState) {
             uniforms,
             volume_tex,
             lut_tex,
+            floor_tex,
         });
 }
 
@@ -367,6 +473,8 @@ pub struct Vol3dCallback {
     pub threshold01: f32,
     pub opacity: f32,
     pub aspect: f32,
+    pub show_floor: bool,
+    pub floor_opacity: f32,
     pub pending: Arc<Mutex<PendingUploads>>,
 }
 
@@ -382,17 +490,21 @@ impl egui_wgpu::CallbackTrait for Vol3dCallback {
         let Some(r) = resources.get::<Vol3dResources>() else {
             return Vec::new();
         };
-        let u: [f32; 8] = [
+        let u: [f32; 12] = [
             self.yaw,
             self.pitch,
             self.dist,
             self.threshold01,
             self.opacity,
             self.aspect,
+            self.floor_opacity,
+            if self.show_floor { 1.0 } else { 0.0 },
+            0.0,
+            0.0,
             0.0,
             0.0,
         ];
-        let mut bytes = [0u8; 32];
+        let mut bytes = [0u8; 48];
         for (i, v) in u.iter().enumerate() {
             bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
@@ -418,6 +530,27 @@ impl egui_wgpu::CallbackTrait for Vol3dCallback {
                         depth_or_array_layers: volume.nz as u32,
                     },
                 );
+                if let Some(floor_rgba) = volume.floor_rgba {
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &r.floor_tex,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &floor_rgba,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some((FLOOR_N * 4) as u32),
+                            rows_per_image: Some(FLOOR_N as u32),
+                        },
+                        wgpu::Extent3d {
+                            width: FLOOR_N as u32,
+                            height: FLOOR_N as u32,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
             }
             if let Some(lut) = pending.lut.take() {
                 queue.write_texture(

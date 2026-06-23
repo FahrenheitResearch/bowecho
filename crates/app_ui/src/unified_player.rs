@@ -551,7 +551,7 @@ impl UnifiedPlayerState {
                         .hint_text("KTLX,KINX,KFDR"),
                 )
                 .on_hover_text(
-                    "Comma or space separated radar IDs to add as live or timeline-synced overlay layers",
+                    "Comma or space separated radar IDs. If a loop is loaded, added overlays sync to that loop automatically.",
                 );
                 ui.label("Radius");
                 ui.add(
@@ -564,12 +564,15 @@ impl UnifiedPlayerState {
                 if stable_button(ui, "Find nearby", 92.0, true).clicked() {
                     action = Some(UnifiedPlayerAction::FindNearbySites);
                 }
-                if stable_button(ui, "Add mosaic", 104.0, true).clicked() {
+                if stable_button(ui, "Add/sync", 92.0, true)
+                    .on_hover_text("Add these radar overlays. Loaded loops are synced automatically.")
+                    .clicked()
+                {
                     action = Some(UnifiedPlayerAction::AddCoordinatedSitesAsOverlays);
                 }
-                if stable_button(ui, "Mosaic 5", 82.0, true)
+                if stable_button(ui, "Nearest 4", 86.0, true)
                     .on_hover_text(
-                        "Load the primary radar plus the nearest four radar overlays as a time-coordinated mosaic loop",
+                        "Fill the Sites box with nearby WSR-88D radars and add them as synced overlays for the loaded loop",
                     )
                     .clicked()
                 {
@@ -847,7 +850,7 @@ impl Default for UnifiedPlayerContext {
             low_sweep_filter_index: 0,
             low_sweep_filter_options: vec![
                 "all low".to_owned(),
-                "same level".to_owned(),
+                "same degree".to_owned(),
                 "base only".to_owned(),
             ],
             auto_sync_warnings: false,

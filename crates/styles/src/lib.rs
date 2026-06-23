@@ -47,7 +47,10 @@ pub struct StyleSettings {
     /// "snow-squall", "watch", "mesoscale-discussion", "local-storm-report",
     /// "special-weather", "text-polygon", "other") AND escalation subkeys
     /// ("tornado/catastrophic", "tornado/considerable",
-    ///  "severe-thunderstorm/destructive", "flash-flood/catastrophic").
+    ///  "severe-thunderstorm/considerable",
+    ///  "severe-thunderstorm/destructive", "flash-flood/considerable",
+    ///  "flash-flood/catastrophic", "flood/considerable",
+    ///  "flood/catastrophic").
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub hazards: BTreeMap<String, PolygonStyleOverride>,
     #[serde(skip_serializing_if = "is_default")]
@@ -472,8 +475,12 @@ pub const HAZARD_FAMILIES: &[&str] = &[
 pub const HAZARD_ESCALATIONS: &[&str] = &[
     "tornado/catastrophic",
     "tornado/considerable",
+    "severe-thunderstorm/considerable",
     "severe-thunderstorm/destructive",
+    "flash-flood/considerable",
     "flash-flood/catastrophic",
+    "flood/considerable",
+    "flood/catastrophic",
 ];
 
 impl Default for MapStyle {
@@ -494,9 +501,14 @@ pub fn default_hazard_stroke_color(key: &str) -> Rgba {
         "tornado/catastrophic" => [150, 50, 250, 255],
         "tornado/considerable" => [255, 64, 175, 255],
         "severe-thunderstorm" => [246, 183, 57, 255],
+        "severe-thunderstorm/considerable" => [255, 152, 42, 255],
         "severe-thunderstorm/destructive" => [252, 122, 28, 255],
-        "flash-flood" | "flash-flood/catastrophic" => [78, 218, 108, 255],
+        "flash-flood" => [78, 218, 108, 255],
+        "flash-flood/considerable" => [42, 224, 154, 255],
+        "flash-flood/catastrophic" => [22, 188, 126, 255],
         "flood" => [76, 190, 124, 255],
+        "flood/considerable" => [50, 205, 160, 255],
+        "flood/catastrophic" => [24, 160, 130, 255],
         "special-marine" => [70, 190, 238, 255],
         "snow-squall" => [170, 210, 255, 255],
         "watch" => [235, 92, 245, 255],
@@ -1170,6 +1182,24 @@ mod tests {
                 .hazard_polygon("severe thunderstorm", Some("DESTRUCTIVE"))
                 .stroke_color,
             [252, 122, 28, 255]
+        );
+        assert_eq!(
+            registry
+                .hazard_polygon("severe thunderstorm", Some("CONSIDERABLE"))
+                .stroke_color,
+            [255, 152, 42, 255]
+        );
+        assert_eq!(
+            registry
+                .hazard_polygon("flash flood", Some("CONSIDERABLE"))
+                .stroke_color,
+            [42, 224, 154, 255]
+        );
+        assert_eq!(
+            registry
+                .hazard_polygon("flood", Some("CATASTROPHIC"))
+                .stroke_color,
+            [24, 160, 130, 255]
         );
         assert_eq!(
             registry.hazard_polygon("tornado", None).stroke_color,

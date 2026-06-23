@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque, hash_map::DefaultHasher};
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
@@ -170,7 +171,7 @@ const LOOP_SPEED_PERCENT_OPTIONS: &[u16] =
 const BACKGROUND_ACTIVITY_REPAINT_MS: u64 = 250;
 const SATELLITE_MAP_LAYER_HOVER: &str =
     "Render the current frame as a layer under the radar (opacity in Custom)";
-const RADAR_OVERLAYS_EMPTY_HELP: &str = "No overlay radars yet. Add one from Custom > Add layer > Radar overlay, or Ctrl+right-click the map to add the nearest radar without leaving the map.";
+const RADAR_OVERLAYS_EMPTY_HELP: &str = "No overlay radars yet. Add one from Custom > Add layer > Radar overlay, or Ctrl+right-click the map to add the nearest radar. When a loop is loaded, WSR-88D overlays auto-sync to that loop.";
 const SECURITY_UNSIGNED_BUILD_TEXT: &str = "Windows Defender or SmartScreen may warn on unsigned or newly built executables. Use official GitHub release assets when possible; do not whitelist random copies.";
 const SECURITY_SIGNATURE_STATUS_TEXT: &str = "Signature status: not verified in-app. A future signed installer should be verified by Windows before launch.";
 const WGPU_TO_GLOW_FALLBACK_NOTICE: &str =
@@ -363,7 +364,7 @@ impl LowSweepLoopFilter {
 
     fn from_key(key: &str) -> Self {
         match key {
-            "same" => Self::SameLevel,
+            "same" | "same-level" | "same-elevation" | "same-degree" | "matched" => Self::SameLevel,
             "base" => Self::BaseOnly,
             _ => Self::All,
         }
@@ -380,7 +381,7 @@ impl LowSweepLoopFilter {
     fn label(self) -> &'static str {
         match self {
             Self::All => "all low",
-            Self::SameLevel => "same level",
+            Self::SameLevel => "same degree",
             Self::BaseOnly => "base only",
         }
     }
@@ -401,6 +402,10 @@ const LIVE_COMPLETE_TERMINAL_LOW_LEVEL_TILT_MIN_RADIALS: usize = 360;
 const LIVE_COMPLETE_TILT_MIN_RADIALS: usize = 360;
 const LIVE_COMPLETE_TILT_MIN_AZIMUTH_COVERAGE_DEG: f32 = 350.0;
 const LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG: f32 = 0.25;
+/// "Same degree" low-sweep mode groups repeated visits by their measured
+/// elevation inside each volume. The anchor is recomputed per volume, so a
+/// VCP change or antenna-angle drift between scans does not break the loop.
+const LOW_SWEEP_SAME_ELEVATION_TOLERANCE_DEG: f32 = 0.12;
 const HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM: usize = 6;
 
 /// International catalog-poll cadence. National open-data feeds publish on
@@ -3473,6 +3478,160 @@ struct HazardListRow {
     unacknowledged: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HazardListSort {
+    Priority,
+    Category,
+    Newest,
+    Oldest,
+    Expires,
+}
+
+impl HazardListSort {
+    const ALL: [Self; 5] = [
+        Self::Priority,
+        Self::Category,
+        Self::Newest,
+        Self::Oldest,
+        Self::Expires,
+    ];
+
+    fn from_key(key: &str) -> Self {
+        match key.trim().to_ascii_lowercase().as_str() {
+            "category" | "type" | "family" => Self::Category,
+            "newest" | "newest-first" | "age-new" => Self::Newest,
+            "oldest" | "oldest-first" | "age-old" => Self::Oldest,
+            "expires" | "expires-soon" | "expiration" => Self::Expires,
+            _ => Self::Priority,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Priority => "priority",
+            Self::Category => "category",
+            Self::Newest => "newest",
+            Self::Oldest => "oldest",
+            Self::Expires => "expires",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Priority => "Priority",
+            Self::Category => "Category",
+            Self::Newest => "Newest",
+            Self::Oldest => "Oldest",
+            Self::Expires => "Expires",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HazardListFilter {
+    All,
+    Tornado,
+    SevereThunderstorm,
+    FlashFlood,
+    Flood,
+    SpecialMarine,
+    SnowSquall,
+    Watch,
+    MesoscaleDiscussion,
+    SpecialWeather,
+    LocalStormReport,
+}
+
+impl HazardListFilter {
+    const ALL: [Self; 11] = [
+        Self::All,
+        Self::Tornado,
+        Self::SevereThunderstorm,
+        Self::FlashFlood,
+        Self::Flood,
+        Self::SpecialMarine,
+        Self::SnowSquall,
+        Self::Watch,
+        Self::MesoscaleDiscussion,
+        Self::SpecialWeather,
+        Self::LocalStormReport,
+    ];
+
+    fn from_key(key: &str) -> Self {
+        match key
+            .trim()
+            .to_ascii_lowercase()
+            .replace([' ', '-'], "_")
+            .as_str()
+        {
+            "tor" | "tornado" => Self::Tornado,
+            "svr" | "severe" | "severe_thunderstorm" => Self::SevereThunderstorm,
+            "ffw" | "flash_flood" => Self::FlashFlood,
+            "flood" => Self::Flood,
+            "smw" | "special_marine" => Self::SpecialMarine,
+            "sqw" | "snow_squall" => Self::SnowSquall,
+            "watch" | "watches" => Self::Watch,
+            "md" | "mesoscale_discussion" => Self::MesoscaleDiscussion,
+            "sps" | "special_weather" => Self::SpecialWeather,
+            "lsr" | "local_storm_report" => Self::LocalStormReport,
+            _ => Self::All,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Tornado => "tornado",
+            Self::SevereThunderstorm => "severe_thunderstorm",
+            Self::FlashFlood => "flash_flood",
+            Self::Flood => "flood",
+            Self::SpecialMarine => "special_marine",
+            Self::SnowSquall => "snow_squall",
+            Self::Watch => "watch",
+            Self::MesoscaleDiscussion => "mesoscale_discussion",
+            Self::SpecialWeather => "special_weather",
+            Self::LocalStormReport => "local_storm_report",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Tornado => "TOR",
+            Self::SevereThunderstorm => "SVR",
+            Self::FlashFlood => "Flash flood",
+            Self::Flood => "Flood",
+            Self::SpecialMarine => "Marine",
+            Self::SnowSquall => "Snow squall",
+            Self::Watch => "Watch",
+            Self::MesoscaleDiscussion => "MD",
+            Self::SpecialWeather => "SPS",
+            Self::LocalStormReport => "Reports",
+        }
+    }
+
+    fn family(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Tornado => Some("tornado"),
+            Self::SevereThunderstorm => Some("severe thunderstorm"),
+            Self::FlashFlood => Some("flash flood"),
+            Self::Flood => Some("flood"),
+            Self::SpecialMarine => Some("special marine"),
+            Self::SnowSquall => Some("snow squall"),
+            Self::Watch => Some("watch"),
+            Self::MesoscaleDiscussion => Some("mesoscale discussion"),
+            Self::SpecialWeather => Some("special weather"),
+            Self::LocalStormReport => Some("local storm report"),
+        }
+    }
+
+    fn matches_record(self, record: &HazardRecord) -> bool {
+        self.family()
+            .is_none_or(|family| record.event_family == family)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PerfTelemetry {
     decode: MetricSeries,
@@ -5583,7 +5742,7 @@ impl ViewerApp {
         match (us, intl) {
             (Some((index, us_d)), Some((_, intl_d))) if us_d <= intl_d => {
                 if let Some(site) = self.sites.get(index).cloned() {
-                    self.add_or_refresh_radar_layer(site, ctx);
+                    self.add_or_refresh_radar_layer_for_current_timeline(site, ctx);
                 }
             }
             (_, Some((intl_index, _))) => {
@@ -5596,10 +5755,30 @@ impl ViewerApp {
             }
             (Some((index, _)), None) => {
                 if let Some(site) = self.sites.get(index).cloned() {
-                    self.add_or_refresh_radar_layer(site, ctx);
+                    self.add_or_refresh_radar_layer_for_current_timeline(site, ctx);
                 }
             }
             (None, None) => {}
+        }
+    }
+
+    fn add_or_refresh_radar_layer_for_current_timeline(
+        &mut self,
+        site: RadarSite,
+        ctx: &egui::Context,
+    ) {
+        match self.coordinated_overlay_load_mode() {
+            CoordinatedOverlayLoadMode::Live => self.add_or_refresh_radar_layer(site, ctx),
+            CoordinatedOverlayLoadMode::ArchiveWindow {
+                start_utc,
+                end_utc,
+                max_frames,
+            } => {
+                self.add_or_refresh_radar_layer_archive_window(
+                    site, start_utc, end_utc, max_frames, ctx,
+                );
+                self.sync_radar_overlay_layers_to_timeline(ctx);
+            }
         }
     }
 
@@ -6066,17 +6245,23 @@ impl ViewerApp {
         let Some(frame) = layer.frame_history.get(index).cloned() else {
             return false;
         };
+        let retained_texture = layer.timeline_sync.then(|| layer.texture.clone()).flatten();
+        let retained_texture_key = retained_texture
+            .as_ref()
+            .and_then(|_| layer.texture_key.clone());
         layer.selected_frame_index = index;
         layer.selected_cut = None;
         layer.source_path = Some(frame.path);
         layer.load_timing = frame.timings;
         layer.volume = Some(frame.volume);
-        layer.texture = None;
-        layer.texture_key = None;
+        layer.texture = retained_texture;
+        layer.texture_key = retained_texture_key;
         layer.pending_render_key = None;
-        layer.render_ms = None;
-        layer.worker_ms = None;
-        layer.texture_ms = None;
+        if !layer.timeline_sync || layer.texture.is_none() {
+            layer.render_ms = None;
+            layer.worker_ms = None;
+            layer.texture_ms = None;
+        }
         true
     }
 
@@ -6084,13 +6269,19 @@ impl ViewerApp {
         if layer.selected_cut == Some(cut) {
             return false;
         }
+        let retained_texture = layer.timeline_sync.then(|| layer.texture.clone()).flatten();
+        let retained_texture_key = retained_texture
+            .as_ref()
+            .and_then(|_| layer.texture_key.clone());
         layer.selected_cut = Some(cut);
-        layer.texture = None;
-        layer.texture_key = None;
+        layer.texture = retained_texture;
+        layer.texture_key = retained_texture_key;
         layer.pending_render_key = None;
-        layer.render_ms = None;
-        layer.worker_ms = None;
-        layer.texture_ms = None;
+        if !layer.timeline_sync || layer.texture.is_none() {
+            layer.render_ms = None;
+            layer.worker_ms = None;
+            layer.texture_ms = None;
+        }
         true
     }
 
@@ -15124,7 +15315,7 @@ impl ViewerApp {
                         if fixed_action_button(ui, "Next", 58.0).clicked() {
                             self.sidebar_tab = SidebarTab::Severe;
                             if let Some(index) = self.first_unacknowledged_hazard_index() {
-                                self.focus_hazard_record(index);
+                                self.focus_hazard_record(index, ui.ctx());
                             }
                             ui.close();
                         }
@@ -15158,7 +15349,7 @@ impl ViewerApp {
                                             .on_hover_text(&row.hover);
                                         if response.clicked() {
                                             self.sidebar_tab = SidebarTab::Severe;
-                                            self.focus_hazard_record(row.index);
+                                            self.focus_hazard_record(row.index, ui.ctx());
                                             ui.close();
                                         }
                                     }
@@ -18121,6 +18312,15 @@ impl ViewerApp {
         });
         self.remembered_section(
             ui,
+            "settings_backup",
+            "Settings backup",
+            false,
+            |app, ui| {
+                app.settings_backup_section(ui, ctx);
+            },
+        );
+        self.remembered_section(
+            ui,
             "settings_performance",
             "Performance",
             false,
@@ -18145,6 +18345,137 @@ impl ViewerApp {
     /// Settings ▸ Model — the settings-class controls evicted from the
     /// Layers fold (ui-refresh proposal section 4 step 4): the app-wide
     /// master switch, the disk-retention policy, and a store-path readout.
+    fn settings_backup_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let _ = ctx;
+        ui.horizontal_wrapped(|ui| {
+            #[cfg(any(windows, target_os = "macos"))]
+            {
+                if fixed_action_button(ui, "Export config...", 112.0)
+                    .on_hover_text("Save the current config.json preferences to a backup file")
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("BowEcho config", &["json"])
+                        .set_file_name("bowecho-config.json")
+                        .set_title("Export BowEcho settings")
+                        .save_file()
+                {
+                    match std::fs::write(&path, self.app_settings.to_json()) {
+                        Ok(()) => self.status = format!("Exported settings to {}", path.display()),
+                        Err(error) => self.status = format!("Settings export failed: {error}"),
+                    }
+                }
+                if fixed_action_button(ui, "Import config...", 112.0)
+                    .on_hover_text(
+                        "Replace config.json from a backup; restart BowEcho so every setting rehydrates cleanly",
+                    )
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("BowEcho config", &["json"])
+                        .set_title("Import BowEcho settings")
+                        .pick_file()
+                {
+                    self.import_app_settings_from_path(&path);
+                    ctx.request_repaint();
+                }
+                if fixed_action_button(ui, "Export appearance...", 136.0)
+                    .on_hover_text("Save warning polygon, map, radar-age, and layer style overrides")
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("BowEcho styles", &["json"])
+                        .set_file_name("bowecho-styles.json")
+                        .set_title("Export BowEcho appearance")
+                        .save_file()
+                {
+                    self.export_styles_to_path(&path);
+                }
+                if fixed_action_button(ui, "Import appearance...", 136.0)
+                    .on_hover_text("Load warning polygon, map, radar-age, and layer style overrides")
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("BowEcho styles", &["json"])
+                        .set_title("Import BowEcho appearance")
+                        .pick_file()
+                {
+                    self.import_styles_from_path(&path, ctx);
+                }
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
+            {
+                ui.weak("Native settings backup dialogs need Windows/macOS.");
+            }
+        });
+        if let Some(path) = settings::AppSettings::config_path() {
+            ui.weak(format!("Config: {}", path.display()));
+        }
+        if let Some(path) = styles::styles_path() {
+            ui.weak(format!("Appearance: {}", path.display()));
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn import_app_settings_from_path(&mut self, path: &Path) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) => {
+                self.status = format!("Settings import failed: {error}");
+                return;
+            }
+        };
+        let imported = match serde_json::from_str::<settings::AppSettings>(&text) {
+            Ok(imported) => imported,
+            Err(error) => {
+                self.status = format!("Settings import failed: {error}");
+                return;
+            }
+        };
+        self.app_settings = imported;
+        match self.app_settings.save() {
+            Ok(()) => {
+                self.status =
+                    "Imported settings backup - restart BowEcho to apply every setting".to_owned();
+            }
+            Err(error) => {
+                self.status = format!("Imported settings in session; save failed: {error}")
+            }
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn export_styles_to_path(&mut self, path: &Path) {
+        let result = if self.styles_newer_schema {
+            styles::styles_path()
+                .ok_or_else(|| "no config directory".to_owned())
+                .and_then(|source| {
+                    std::fs::copy(source, path)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
+        } else {
+            styles::save_to_path(&self.style_settings, path)
+        };
+        match result {
+            Ok(()) => self.status = format!("Exported appearance to {}", path.display()),
+            Err(error) => self.status = format!("Appearance export failed: {error}"),
+        }
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    fn import_styles_from_path(&mut self, path: &Path, ctx: &egui::Context) {
+        let loaded = styles::load_from_path(path);
+        if loaded.newer_schema {
+            self.status =
+                "Appearance import skipped: file was written by a newer BowEcho".to_owned();
+            return;
+        }
+        self.style_settings = loaded.settings;
+        self.styles_newer_schema = false;
+        self.rebuild_style_registry();
+        self.save_styles();
+        self.status = "Imported appearance backup".to_owned();
+        ctx.request_repaint();
+    }
+
     fn model_settings_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if ui
             .checkbox(&mut self.model_enabled, "Model data")
@@ -20748,6 +21079,42 @@ impl ViewerApp {
                     ui.weak("No hazard polygons loaded");
                     return;
                 }
+                ui.horizontal(|ui| {
+                    ui.label("Type");
+                    let mut filter =
+                        HazardListFilter::from_key(&app.app_settings.current_alert_filter);
+                    egui::ComboBox::from_id_salt("current_alert_filter")
+                        .selected_text(filter.label())
+                        .width(104.0)
+                        .show_ui(ui, |ui| {
+                            for option in HazardListFilter::ALL {
+                                ui.selectable_value(&mut filter, option, option.label());
+                            }
+                        });
+                    if filter.key() != app.app_settings.current_alert_filter {
+                        app.app_settings.current_alert_filter = filter.key().to_owned();
+                        if let Some(family) = filter.family() {
+                            app.hidden_hazard_families.remove(family);
+                        }
+                        let _ = app.app_settings.save();
+                        ui.ctx().request_repaint();
+                    }
+
+                    ui.label("Sort");
+                    let mut sort = HazardListSort::from_key(&app.app_settings.current_alert_sort);
+                    egui::ComboBox::from_id_salt("current_alert_sort")
+                        .selected_text(sort.label())
+                        .width(112.0)
+                        .show_ui(ui, |ui| {
+                            for option in HazardListSort::ALL {
+                                ui.selectable_value(&mut sort, option, option.label());
+                            }
+                        });
+                    if sort.key() != app.app_settings.current_alert_sort {
+                        app.app_settings.current_alert_sort = sort.key().to_owned();
+                        let _ = app.app_settings.save();
+                    }
+                });
                 ui.weak(format!("{} shown of {} loaded", rows.len(), total));
                 if rows.is_empty() {
                     ui.weak("No alerts match the active filters");
@@ -20792,7 +21159,7 @@ impl ViewerApp {
                     },
                 );
                 if let Some(index) = focus_index
-                    && app.focus_hazard_record(index)
+                    && app.focus_hazard_record(index, ui.ctx())
                 {
                     ui.ctx().request_repaint();
                 }
@@ -21272,13 +21639,15 @@ impl ViewerApp {
         let Some(overlay) = &self.hazard_overlay else {
             return Vec::new();
         };
-        overlay
+        let filter = HazardListFilter::from_key(&self.app_settings.current_alert_filter);
+        let mut rows = overlay
             .records
             .iter()
             .enumerate()
             .filter(|(_, record)| {
                 self.hazard_record_visible(record) && hazard_points_renderable(&record.points)
             })
+            .filter(|(_, record)| filter.matches_record(record))
             .map(|(index, record)| HazardListRow {
                 index,
                 label: hazard_record_list_label(record),
@@ -21289,7 +21658,13 @@ impl ViewerApp {
                     .unacknowledged_hazard_event_ids
                     .contains(&record.event_id),
             })
-            .collect()
+            .collect::<Vec<_>>();
+        sort_hazard_list_rows(
+            &mut rows,
+            &overlay.records,
+            HazardListSort::from_key(&self.app_settings.current_alert_sort),
+        );
+        rows
     }
 
     fn unacknowledged_hazard_menu_groups(&self) -> Vec<(String, Vec<HazardListRow>)> {
@@ -21316,7 +21691,7 @@ impl ViewerApp {
         groups
     }
 
-    fn focus_hazard_record(&mut self, index: usize) -> bool {
+    fn focus_hazard_record(&mut self, index: usize, ctx: &egui::Context) -> bool {
         let Some((bbox, label)) = self
             .hazard_overlay
             .as_ref()
@@ -21333,7 +21708,20 @@ impl ViewerApp {
         self.center_map_on(lat, lon);
         self.map_scale = scale;
         self.clamp_map_center();
-        self.status = format!("Selected {label}");
+        let radar_label =
+            self.best_radar_candidates(lat, lon)
+                .into_iter()
+                .next()
+                .map(|candidate| {
+                    let label = candidate.label.clone();
+                    self.activate_beam_target(&candidate, ctx);
+                    label
+                });
+        self.status = if let Some(radar_label) = radar_label {
+            format!("Selected {label} - switched to {radar_label}")
+        } else {
+            format!("Selected {label}")
+        };
         true
     }
 
@@ -29072,6 +29460,63 @@ impl ViewerApp {
         }
     }
 
+    /// Render the lowest usable reflectivity sweep onto the exact horizontal
+    /// footprint of the 3D box. The ordinary viewport raster keeps native
+    /// polar-gate geometry and the user's REF palette; the shader lays this
+    /// RGBA image on z=0 behind the direct-volume render.
+    fn vol3d_floor_image(
+        volume: &RadarVolume,
+        center_east_km: f32,
+        center_north_km: f32,
+        half_km: f32,
+        color_tables: &ColorTableSet,
+    ) -> Option<(Vec<u8>, f32)> {
+        let n = vol3d::FLOOR_N;
+        if n < 2 || !half_km.is_finite() || half_km <= 0.0 {
+            return None;
+        }
+        let km_per_px = half_km * 2.0 / (n - 1) as f32;
+        let options = ViewportRasterOptions {
+            width: n as u32,
+            height: n as u32,
+            radar_x_px: 0.5 + (half_km - center_east_km) / km_per_px,
+            radar_y_px: 0.5 + (half_km + center_north_km) / km_per_px,
+            km_per_px_x: km_per_px,
+            km_per_px_y: km_per_px,
+            rotation_rad: 0.0,
+        };
+
+        let mut cuts = volume
+            .cuts
+            .iter()
+            .enumerate()
+            .filter(|(_, cut)| {
+                cut.elevation_deg.is_finite() && cut.moments.contains_key(&MomentType::Reflectivity)
+            })
+            .map(|(index, cut)| (index, cut.elevation_deg))
+            .collect::<Vec<_>>();
+        cuts.sort_by(|left, right| left.1.total_cmp(&right.1));
+
+        for (cut_index, elevation_deg) in cuts {
+            let Ok(cache) = ViewportMomentCache::new_with_color_tables(
+                volume,
+                cut_index,
+                MomentType::Reflectivity,
+                color_tables,
+            ) else {
+                continue;
+            };
+            let mut rgba = vec![0; n * n * 4];
+            if cache
+                .render_moment_rgba_into(volume, options, &mut rgba)
+                .is_ok()
+            {
+                return Some((rgba, elevation_deg));
+            }
+        }
+        None
+    }
+
     /// 3D Volume Explorer window: background box resample of the current
     /// volume around the view center, GPU raymarched via a glow paint
     /// callback (docs/xsection-3d-spec.md: GR2A-style direct volume
@@ -29118,6 +29563,9 @@ impl ViewerApp {
                     self.vol3d.resample_rx = Some(receiver);
                     self.vol3d.status = "resampling volume…".to_owned();
                     let half_km = self.vol3d.box_half_km;
+                    let floor_color_tables = self.render_color_tables_for_product(
+                        &DisplayProduct::Moment(MomentType::Reflectivity),
+                    );
                     let ctx_clone = ctx.clone();
                     thread::spawn(move || {
                         let result = render2d::volume_box_resample(
@@ -29129,7 +29577,21 @@ impl ViewerApp {
                             vol3d::BOX_NZ,
                             vol3d::BOX_TOP_M,
                         )
-                        .map(|values| vol3d::normalize_box(&values, vol3d::BOX_N, vol3d::BOX_NZ));
+                        .map(|values| {
+                            let mut volume_box =
+                                vol3d::normalize_box(&values, vol3d::BOX_N, vol3d::BOX_NZ);
+                            if let Some((rgba, elevation_deg)) = Self::vol3d_floor_image(
+                                &volume,
+                                center_east,
+                                center_north,
+                                half_km,
+                                &floor_color_tables,
+                            ) {
+                                volume_box.floor_rgba = Some(rgba);
+                                volume_box.floor_elevation_deg = Some(elevation_deg);
+                            }
+                            volume_box
+                        });
                         let _ = sender.send(result);
                         ctx_clone.request_repaint();
                     });
@@ -29144,12 +29606,22 @@ impl ViewerApp {
                     // off-storm (pan the map there + Re-center), nonzero
                     // with a black canvas means a GPU-side problem.
                     let echo_cells = volume_box.data.iter().filter(|&&b| b >= 64).count();
+                    let floor_label = volume_box
+                        .floor_elevation_deg
+                        .map(|elevation| format!(" - floor {elevation:.1} deg REF"))
+                        .unwrap_or_default();
                     self.vol3d.status = format!(
                         "{} km box · {} cells ≥20 dBZ",
                         (self.vol3d.box_half_km * 2.0) as i32,
                         echo_cells
                     );
-                    let table = self.color_tables.for_family(ColorTableFamily::Reflectivity);
+                    if !floor_label.is_empty() {
+                        self.vol3d.status.push_str(&floor_label);
+                    }
+                    let render_tables = self.render_color_tables_for_product(
+                        &DisplayProduct::Moment(MomentType::Reflectivity),
+                    );
+                    let table = render_tables.for_family(ColorTableFamily::Reflectivity);
                     let mut lut = [0u8; 256 * 4];
                     for (i, px) in lut.chunks_exact_mut(4).enumerate() {
                         let dbz = i as f32 / 255.0 * 80.0;
@@ -29197,6 +29669,15 @@ impl ViewerApp {
                 ui.add(egui::Slider::new(&mut self.vol3d.threshold_dbz, 0.0..=70.0).suffix(" dBZ"));
                 ui.label("Opacity");
                 ui.add(egui::Slider::new(&mut self.vol3d.opacity, 0.05..=1.0));
+                ui.checkbox(&mut self.vol3d.show_floor, "Floor PPI")
+                    .on_hover_text(
+                        "Paint the lowest usable reflectivity sweep onto the floor of the 3D box",
+                    );
+                ui.add_enabled(
+                    self.vol3d.show_floor,
+                    egui::Slider::new(&mut self.vol3d.floor_opacity, 0.05..=1.0)
+                        .text("floor alpha"),
+                );
                 let mut size_km = (self.vol3d.box_half_km * 2.0) as i32;
                 egui::ComboBox::from_id_salt("vol3d_size")
                     .selected_text(format!("{size_km} km"))
@@ -29240,6 +29721,8 @@ impl ViewerApp {
                         threshold01: self.vol3d.threshold_dbz / 80.0,
                         opacity: self.vol3d.opacity,
                         aspect: (rect.width() / rect.height().max(1.0)).max(0.1),
+                        show_floor: self.vol3d.show_floor,
+                        floor_opacity: self.vol3d.floor_opacity,
                         pending: Arc::clone(&self.vol3d.pending),
                     },
                 ));
@@ -38066,6 +38549,79 @@ fn sort_hazard_records(records: &mut [HazardRecord]) {
     });
 }
 
+fn sort_hazard_list_rows(
+    rows: &mut [HazardListRow],
+    records: &[HazardRecord],
+    sort: HazardListSort,
+) {
+    if sort == HazardListSort::Priority {
+        return;
+    }
+    rows.sort_by(|left, right| {
+        let Some(left_record) = records.get(left.index) else {
+            return Ordering::Greater;
+        };
+        let Some(right_record) = records.get(right.index) else {
+            return Ordering::Less;
+        };
+        match sort {
+            HazardListSort::Priority => Ordering::Equal,
+            HazardListSort::Category => hazard_family_order(&left_record.event_family)
+                .cmp(&hazard_family_order(&right_record.event_family))
+                .then_with(|| {
+                    hazard_record_threat_priority(right_record)
+                        .cmp(&hazard_record_threat_priority(left_record))
+                })
+                .then_with(|| left.label.cmp(&right.label)),
+            HazardListSort::Newest => compare_hazard_record_times_descending(
+                &left_record.valid_start,
+                &right_record.valid_start,
+            )
+            .then_with(|| left.label.cmp(&right.label)),
+            HazardListSort::Oldest => compare_hazard_record_times_ascending(
+                &left_record.valid_start,
+                &right_record.valid_start,
+            )
+            .then_with(|| left.label.cmp(&right.label)),
+            HazardListSort::Expires => compare_hazard_record_times_ascending(
+                &left_record.valid_end,
+                &right_record.valid_end,
+            )
+            .then_with(|| left.label.cmp(&right.label)),
+        }
+    });
+}
+
+fn compare_hazard_record_times_ascending(
+    left: &Option<String>,
+    right: &Option<String>,
+) -> Ordering {
+    match (
+        parse_hazard_record_time(left),
+        parse_hazard_record_time(right),
+    ) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn compare_hazard_record_times_descending(
+    left: &Option<String>,
+    right: &Option<String>,
+) -> Ordering {
+    match (
+        parse_hazard_record_time(left),
+        parse_hazard_record_time(right),
+    ) {
+        (Some(left), Some(right)) => right.cmp(&left),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
 fn hazard_record_threat_priority(record: &HazardRecord) -> u8 {
     let damage_priority = record
         .damage_threat
@@ -39727,10 +40283,14 @@ fn hazard_style_label(key: &str) -> String {
         "tornado/catastrophic" => "Tornado emergency".to_owned(),
         "tornado/considerable" => "PDS tornado".to_owned(),
         "severe-thunderstorm" => "Severe thunderstorm warning".to_owned(),
+        "severe-thunderstorm/considerable" => "Considerable severe thunderstorm".to_owned(),
         "severe-thunderstorm/destructive" => "Destructive severe thunderstorm".to_owned(),
         "flash-flood" => "Flash flood warning".to_owned(),
+        "flash-flood/considerable" => "Considerable flash flood".to_owned(),
         "flash-flood/catastrophic" => "Flash flood emergency".to_owned(),
         "flood" => "Flood warning".to_owned(),
+        "flood/considerable" => "Considerable flood".to_owned(),
+        "flood/catastrophic" => "Catastrophic flood".to_owned(),
         "special-marine" => "Special marine warning".to_owned(),
         "snow-squall" => "Snow squall warning".to_owned(),
         "watch" => "Watch polygons".to_owned(),
@@ -40286,58 +40846,80 @@ fn low_sweep_cuts_for_product(
         cut_start_time_utc(volume, *index).unwrap_or_else(|| volume.volume_time.with_timezone(&Utc))
     });
 
-    if filter == LowSweepLoopFilter::All || cuts.len() <= 1 {
-        return cuts;
-    }
-
-    // Reported antenna elevations are not exact nominal VCP angles. A base
-    // family can arrive as 0.44, 0.50, or 0.62 degrees across neighboring
-    // scans, so exact-angle filtering creates a visibly jumpy loop. Cluster
-    // by physical elevation first, then retain one complete family while
-    // preserving the original chronological cut order.
-    let mut by_elevation = cuts
-        .iter()
-        .filter_map(|index| {
-            volume
-                .cuts
-                .get(*index)
-                .map(|cut| (*index, cut.elevation_deg))
-                .filter(|(_, elevation)| elevation.is_finite())
-        })
-        .collect::<Vec<_>>();
-    by_elevation.sort_by(|left, right| left.1.total_cmp(&right.1));
-
-    let mut clusters: Vec<(f32, Vec<usize>)> = Vec::new();
-    for (cut_index, elevation) in by_elevation {
-        if let Some((mean, members)) = clusters.last_mut()
-            && (elevation - *mean).abs() <= LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG
-        {
-            let count = members.len() as f32;
-            *mean = (*mean * count + elevation) / (count + 1.0);
-            members.push(cut_index);
-        } else {
-            clusters.push((elevation, vec![cut_index]));
+    match filter {
+        LowSweepLoopFilter::All => {}
+        LowSweepLoopFilter::BaseOnly => {
+            if let Some(min_elevation) = cuts
+                .iter()
+                .filter_map(|index| volume.cuts.get(*index).map(|cut| cut.elevation_deg))
+                .filter(|elevation| elevation.is_finite())
+                .min_by(|a, b| a.total_cmp(b))
+            {
+                cuts.retain(|index| {
+                    volume.cuts.get(*index).is_some_and(|cut| {
+                        (cut.elevation_deg - min_elevation).abs()
+                            <= LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG
+                    })
+                });
+            }
+        }
+        LowSweepLoopFilter::SameLevel => {
+            cuts = same_elevation_low_sweep_cuts(volume, &cuts);
         }
     }
-    let Some((_, selected_members)) = (match filter {
-        LowSweepLoopFilter::All => None,
-        LowSweepLoopFilter::BaseOnly => clusters
-            .iter()
-            .min_by(|left, right| left.0.total_cmp(&right.0)),
-        LowSweepLoopFilter::SameLevel => clusters.iter().max_by(|left, right| {
-            left.1
-                .len()
-                .cmp(&right.1.len())
-                // For equal revisit counts, the lower family is the stable
-                // operational choice and matches users' base-tilt intuition.
-                .then_with(|| right.0.total_cmp(&left.0))
-        }),
-    }) else {
-        return cuts;
-    };
-    let selected = selected_members.iter().copied().collect::<BTreeSet<_>>();
-    cuts.retain(|cut| selected.contains(cut));
     cuts
+}
+
+/// Pick the dominant repeated elevation cluster independently for each
+/// volume. This preserves SAILS/MESO-SAILS repeats without assuming that the
+/// nominal base angle is identical in every VCP or scan.
+fn same_elevation_low_sweep_cuts(volume: &RadarVolume, cuts: &[usize]) -> Vec<usize> {
+    let elevations = cuts
+        .iter()
+        .filter_map(|index| {
+            let elevation = volume.cuts.get(*index)?.elevation_deg;
+            elevation.is_finite().then_some((*index, elevation))
+        })
+        .collect::<Vec<_>>();
+    if elevations.is_empty() {
+        return cuts.to_vec();
+    }
+
+    let mut best: Option<(usize, f32, f32)> = None;
+    for (_, anchor) in &elevations {
+        let mut count = 0usize;
+        let mut spread = 0.0f32;
+        for (_, elevation) in &elevations {
+            let delta = (*elevation - *anchor).abs();
+            if delta <= LOW_SWEEP_SAME_ELEVATION_TOLERANCE_DEG {
+                count += 1;
+                spread += delta;
+            }
+        }
+        let replace = best.is_none_or(|(best_count, best_spread, best_anchor)| {
+            count > best_count
+                || (count == best_count && spread < best_spread - f32::EPSILON)
+                || (count == best_count
+                    && (spread - best_spread).abs() <= f32::EPSILON
+                    && *anchor < best_anchor)
+        });
+        if replace {
+            best = Some((count, spread, *anchor));
+        }
+    }
+
+    let Some((_, _, anchor)) = best else {
+        return cuts.to_vec();
+    };
+    cuts.iter()
+        .copied()
+        .filter(|index| {
+            volume.cuts.get(*index).is_some_and(|cut| {
+                cut.elevation_deg.is_finite()
+                    && (cut.elevation_deg - anchor).abs() <= LOW_SWEEP_SAME_ELEVATION_TOLERANCE_DEG
+            })
+        })
+        .collect()
 }
 
 fn low_sweep_cuts_for_history_entry(
@@ -43027,12 +43609,16 @@ mod tests {
             ("tornado", Some("CATASTROPHIC"), (150, 50, 250)), // TOR EMERGENCY purple
             ("tornado", Some("CONSIDERABLE"), (255, 64, 175)), // PDS magenta
             ("tornado", None, (248, 62, 82)),
+            ("severe thunderstorm", Some("CONSIDERABLE"), (255, 152, 42)),
             ("severe thunderstorm", Some("DESTRUCTIVE"), (252, 122, 28)),
             ("severe thunderstorm", None, (246, 183, 57)),
             // Base family table.
             ("flash flood", None, (78, 218, 108)),
-            ("flash flood", Some("CATASTROPHIC"), (78, 218, 108)),
+            ("flash flood", Some("CONSIDERABLE"), (42, 224, 154)),
+            ("flash flood", Some("CATASTROPHIC"), (22, 188, 126)),
             ("flood", None, (76, 190, 124)),
+            ("flood", Some("CONSIDERABLE"), (50, 205, 160)),
+            ("flood", Some("CATASTROPHIC"), (24, 160, 130)),
             ("special marine", None, (70, 190, 238)),
             ("snow squall", None, (170, 210, 255)),
             ("watch", None, (235, 92, 245)),
@@ -47915,10 +48501,11 @@ mod tests {
     }
 
     #[test]
-    fn radar_overlay_timeline_sync_clears_stale_texture() {
+    fn radar_overlay_timeline_sync_retains_visible_texture_until_replacement_render() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
         app.selected_cut = 0;
+        let ctx = egui::Context::default();
         let first = Arc::new(test_reflectivity_sails_volume_with_radials(
             &[(0.5, 0)],
             720,
@@ -47949,19 +48536,29 @@ mod tests {
         layer.volume = Some(Arc::clone(&first));
         layer.frame_history = app.frame_history.clone();
         layer.selected_frame_index = 0;
-        layer.texture_key = Some(test_screen_texture_key(
+        let first_key = test_screen_texture_key(
             Arc::as_ptr(&first) as usize,
             0,
             app.selected_product.clone(),
+        );
+        layer.texture = Some(ctx.load_texture(
+            "overlay-old-frame",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            radar_texture_options(),
         ));
+        layer.texture_key = Some(first_key.clone());
         app.radar_layers.push(layer);
 
-        app.sync_radar_overlay_layers_to_timeline(&egui::Context::default());
+        app.sync_radar_overlay_layers_to_timeline(&ctx);
 
         assert_eq!(app.radar_layers[0].selected_frame_index, 1);
+        assert_eq!(app.radar_layers[0].selected_cut, Some(0));
+        assert!(app.radar_layers[0].texture.is_some());
+        assert_eq!(app.radar_layers[0].texture_key.as_ref(), Some(&first_key));
+        assert!(app.radar_layers[0].pending_render_key.is_none());
         assert!(
-            app.radar_layers[0].texture_key.is_none(),
-            "overlay timeline sync must not keep painting the old frame after changing frames"
+            !app.radar_overlay_screen_loop_textures_ready(),
+            "screen playback must wait for the matching overlay texture even while the old image stays visible"
         );
     }
 
@@ -49811,6 +50408,20 @@ mod tests {
             app.coordinated_overlay_status(2, app.coordinated_overlay_load_mode())
                 .contains("synced radar overlay loop")
         );
+    }
+
+    #[test]
+    fn adding_overlay_from_map_auto_syncs_to_loaded_loop() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.history_frame_limit = 7;
+        add_two_test_history_frames(&mut app);
+        let ctx = egui::Context::default();
+
+        app.add_or_refresh_radar_layer_for_current_timeline(RadarSite::new("KBBB"), &ctx);
+
+        let layer = app.radar_layers.first().expect("overlay layer");
+        assert!(layer.timeline_sync);
+        assert!(layer.load_receiver.is_some());
     }
 
     #[test]
@@ -52081,6 +52692,56 @@ mod tests {
     }
 
     #[test]
+    fn current_alert_rows_can_sort_by_category_or_age() {
+        let mut tor = test_hazard_record(
+            "KLSX.TO.W.0075",
+            "TOR 0075",
+            "tornado",
+            square_hazard_points(-90.0, 38.0, -89.0, 39.0),
+        );
+        tor.valid_start = Some("2026-06-21T23:24:00Z".to_owned());
+        let mut svr = test_hazard_record(
+            "KIND.SV.W.0063",
+            "SVR 0063",
+            "severe thunderstorm",
+            square_hazard_points(-87.0, 39.0, -86.0, 40.0),
+        );
+        svr.valid_start = Some("2026-06-21T23:31:00Z".to_owned());
+        let mut flood = test_hazard_record(
+            "KPAH.FF.W.0040",
+            "FFW 0040",
+            "flash flood",
+            square_hazard_points(-88.0, 37.0, -87.0, 38.0),
+        );
+        flood.valid_start = Some("2026-06-21T22:55:00Z".to_owned());
+        let mut app = test_viewer_app_with_hazards(vec![svr, flood, tor]);
+
+        app.app_settings.current_alert_sort = "category".to_owned();
+        let category_labels = app
+            .visible_hazard_list_rows()
+            .into_iter()
+            .map(|row| row.label.split(" · ").next().unwrap_or("").to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(category_labels, vec!["TOR 0075", "SVR 0063", "FFW 0040"]);
+
+        app.app_settings.current_alert_sort = "newest".to_owned();
+        let newest_labels = app
+            .visible_hazard_list_rows()
+            .into_iter()
+            .map(|row| row.label.split(" · ").next().unwrap_or("").to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(newest_labels, vec!["SVR 0063", "TOR 0075", "FFW 0040"]);
+
+        app.app_settings.current_alert_filter = "tornado".to_owned();
+        let tor_only = app
+            .visible_hazard_list_rows()
+            .into_iter()
+            .map(|row| row.label.split(" · ").next().unwrap_or("").to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(tor_only, vec!["TOR 0075"]);
+    }
+
+    #[test]
     fn event_loop_active_alert_shadows_stale_product_text_row() {
         let start = Instant::now();
         let window_start = Utc.with_ymd_and_hms(2026, 6, 21, 23, 0, 0).unwrap();
@@ -52262,14 +52923,44 @@ mod tests {
         app.map_center_lon = -90.0;
         app.map_scale = 80.0;
 
-        assert!(app.focus_hazard_record(0));
+        let ctx = egui::Context::default();
+        assert!(app.focus_hazard_record(0, &ctx));
 
         assert_eq!(app.selected_hazard_index, Some(0));
         assert!((app.map_center_lat - 34.5).abs() < 0.001);
         assert!((app.map_center_lon + 100.5).abs() < 0.001);
         assert!((app.map_scale - 360.0).abs() < 0.001);
         assert!(app.status.contains("TOR 1"));
-        assert!(!app.focus_hazard_record(99));
+        assert!(!app.focus_hazard_record(99, &ctx));
+    }
+
+    #[test]
+    fn current_alert_focus_switches_to_best_radar_near_warning() {
+        let warning = test_hazard_record(
+            "warning",
+            "TOR 1",
+            "tornado",
+            square_hazard_points(-97.6, 35.2, -97.2, 35.6),
+        );
+        let mut app = test_viewer_app_with_hazards(vec![warning]);
+        app.sites = vec![
+            RadarSite::new("KTLX").with_location(
+                Some("Twin Lakes".to_owned()),
+                Some(35.333),
+                Some(-97.277),
+            ),
+            RadarSite::new("KDDC").with_location(
+                Some("Dodge City".to_owned()),
+                Some(37.761),
+                Some(-99.969),
+            ),
+        ];
+
+        let ctx = egui::Context::default();
+        assert!(app.focus_hazard_record(0, &ctx));
+
+        assert_eq!(app.sites[app.selected_site_index].level2_id, "KTLX");
+        assert!(app.status.contains("switched to"));
     }
 
     #[test]
@@ -52329,7 +53020,8 @@ mod tests {
         assert_eq!(app.first_unacknowledged_hazard_index(), Some(1));
         assert!(app.visible_hazard_list_rows()[1].unacknowledged);
 
-        assert!(app.focus_hazard_record(1));
+        let ctx = egui::Context::default();
+        assert!(app.focus_hazard_record(1, &ctx));
 
         assert_eq!(app.selected_hazard_index, Some(1));
         assert!(!app.unacknowledged_hazard_event_ids.contains("new"));
@@ -55033,8 +55725,12 @@ mod tests {
     fn hazard_polygon_style_keys_cover_families_and_escalations() {
         assert!(hazard_style_key_known("tornado"));
         assert!(hazard_style_key_known("tornado/catastrophic"));
+        assert!(hazard_style_key_known("severe-thunderstorm/considerable"));
+        assert!(hazard_style_key_known("flash-flood/considerable"));
+        assert!(hazard_style_key_known("flood/catastrophic"));
         assert!(!hazard_style_key_known("not-a-real-polygon-family"));
         assert!(hazard_style_label("tornado/catastrophic").contains("emergency"));
+        assert!(hazard_style_label("flood/considerable").contains("Considerable"));
         assert_eq!(
             hazard_dash_label(styles::DashPattern::Dashed {
                 dash: 9.0,

@@ -145,6 +145,15 @@ pub struct AppSettings {
     /// warning families, keeping old configs sparse.
     #[serde(default)]
     pub alert_sound_families: Vec<String>,
+    /// Current-alert list sort mode in the Severe tab. Kept as a string so
+    /// older/newer builds can preserve unknown operator preferences.
+    #[serde(default = "default_current_alert_sort")]
+    pub current_alert_sort: String,
+    /// Current-alert list type filter in the Severe tab. "all" preserves
+    /// the existing family checkbox behavior; specific keys provide fast
+    /// one-control narrowing such as TOR-only newest-first.
+    #[serde(default = "default_current_alert_filter")]
+    pub current_alert_filter: String,
     /// Maximum SCIT storm cells fed into the storm-track associator each scan.
     /// Lower values reduce linear-mode clutter without touching radar render
     /// resolution or algorithm caches.
@@ -481,6 +490,8 @@ impl Default for AppSettings {
             alert_sound_enabled: false,
             alert_sound_path: String::new(),
             alert_sound_families: Vec::new(),
+            current_alert_sort: default_current_alert_sort(),
+            current_alert_filter: default_current_alert_filter(),
             storm_track_max_tracks: default_storm_track_max_tracks(),
             storm_track_min_dbz_tenths: default_storm_track_min_dbz_tenths(),
             product_hotkeys: default_product_hotkeys(),
@@ -585,6 +596,14 @@ fn default_bold_labels() -> bool {
 
 fn default_radar_label_style() -> String {
     "id-box".to_owned()
+}
+
+fn default_current_alert_sort() -> String {
+    "priority".to_owned()
+}
+
+fn default_current_alert_filter() -> String {
+    "all".to_owned()
 }
 
 /// Platform bowecho config root (`%APPDATA%\bowecho` on Windows, the
@@ -1203,6 +1222,21 @@ mod tests {
         let back = AppSettings::from_json(&s.to_json());
         assert!(!back.alert_flash_enabled);
         assert_eq!(back.alert_flash_families, vec!["flash flood".to_owned()]);
+    }
+
+    #[test]
+    fn current_alert_sort_defaults_to_priority_and_round_trips() {
+        assert_eq!(AppSettings::from_json("{}").current_alert_sort, "priority");
+        assert_eq!(AppSettings::from_json("{}").current_alert_filter, "all");
+
+        let s = AppSettings {
+            current_alert_sort: "newest".to_owned(),
+            current_alert_filter: "tornado".to_owned(),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&s.to_json());
+        assert_eq!(back.current_alert_sort, "newest");
+        assert_eq!(back.current_alert_filter, "tornado");
     }
 
     #[test]
