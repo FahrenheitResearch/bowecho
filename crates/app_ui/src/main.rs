@@ -31,6 +31,7 @@ use render2d::{
     viewport_sample_cache_storage_upper_bound, vil_density_grid, vil_grid,
 };
 use serde::Deserialize;
+use settings::{LoopSweepControl, SweepPolicy, SweepPolicyMode, SweepPolicySet, SweepProductGroup};
 
 mod annotate;
 mod basemap_data;
@@ -380,11 +381,157 @@ impl LowSweepLoopFilter {
 
     fn label(self) -> &'static str {
         match self {
-            Self::All => "all low",
-            Self::SameLevel => "same degree",
-            Self::BaseOnly => "base only",
+            Self::All => "All low tilts",
+            Self::SameLevel => "Same level",
+            Self::BaseOnly => "Base only",
         }
     }
+}
+
+fn legacy_sweep_policy(filter: LowSweepLoopFilter) -> SweepPolicy {
+    SweepPolicy {
+        mode: match filter {
+            LowSweepLoopFilter::All => SweepPolicyMode::AllLow,
+            LowSweepLoopFilter::SameLevel => SweepPolicyMode::SameLevel,
+            LowSweepLoopFilter::BaseOnly => SweepPolicyMode::BaseOnly,
+        },
+        ..SweepPolicy::default()
+    }
+}
+
+fn sweep_policy_mode_label(mode: SweepPolicyMode) -> &'static str {
+    match mode {
+        SweepPolicyMode::Off => "Off",
+        SweepPolicyMode::AllLow => "All low tilts",
+        SweepPolicyMode::BaseOnly => "Base only",
+        SweepPolicyMode::SameLevel => "Same level",
+        SweepPolicyMode::Range => "Custom range",
+    }
+}
+
+fn sweep_product_group_label(group: SweepProductGroup) -> &'static str {
+    match group {
+        SweepProductGroup::Reflectivity => "Reflectivity-like",
+        SweepProductGroup::Velocity => "Velocity-like",
+        SweepProductGroup::DualPol => "Dual-pol",
+        SweepProductGroup::Other => "Other products",
+    }
+}
+
+fn sweep_policy_from_set(
+    set: &SweepPolicySet,
+    group: SweepProductGroup,
+    fallback: SweepPolicy,
+) -> SweepPolicy {
+    set.product_groups
+        .get(&group)
+        .copied()
+        .unwrap_or(fallback)
+        .normalized()
+}
+
+const SWEEP_POLICY_MODES: [SweepPolicyMode; 5] = [
+    SweepPolicyMode::Off,
+    SweepPolicyMode::AllLow,
+    SweepPolicyMode::BaseOnly,
+    SweepPolicyMode::SameLevel,
+    SweepPolicyMode::Range,
+];
+
+fn sweep_policy_fallbacks(policy: SweepPolicy) -> BTreeMap<SweepProductGroup, SweepPolicy> {
+    SweepProductGroup::ALL
+        .into_iter()
+        .map(|group| (group, policy))
+        .collect()
+}
+
+fn resolved_sweep_policy_fallbacks(
+    set: &SweepPolicySet,
+    fallback: SweepPolicy,
+) -> BTreeMap<SweepProductGroup, SweepPolicy> {
+    SweepProductGroup::ALL
+        .into_iter()
+        .map(|group| (group, sweep_policy_from_set(set, group, fallback)))
+        .collect()
+}
+
+fn sweep_policy_rows_ui(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    set: &mut SweepPolicySet,
+    fallbacks: &BTreeMap<SweepProductGroup, SweepPolicy>,
+) -> bool {
+    let mut changed = false;
+    egui::Grid::new(id.with("grid"))
+        .num_columns(4)
+        .spacing([10.0, 5.0])
+        .show(ui, |ui| {
+            ui.strong("Product family");
+            ui.strong("Mode");
+            ui.strong("Minimum");
+            ui.strong("Maximum");
+            ui.end_row();
+
+            for (index, group) in SweepProductGroup::ALL.into_iter().enumerate() {
+                let fallback = fallbacks.get(&group).copied().unwrap_or_default();
+                let original = sweep_policy_from_set(set, group, fallback);
+                let mut policy = original;
+
+                ui.label(sweep_product_group_label(group));
+                egui::ComboBox::from_id_salt((id, "mode", index))
+                    .selected_text(sweep_policy_mode_label(policy.mode))
+                    .width(112.0)
+                    .show_ui(ui, |ui| {
+                        for mode in SWEEP_POLICY_MODES {
+                            ui.selectable_value(
+                                &mut policy.mode,
+                                mode,
+                                sweep_policy_mode_label(mode),
+                            );
+                        }
+                    });
+
+                if policy.mode == SweepPolicyMode::Range {
+                    let mut min_deg = policy.min_elevation_deg();
+                    let mut max_deg = policy.max_elevation_deg();
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut min_deg)
+                                .range(0.0..=90.0)
+                                .speed(0.05)
+                                .suffix("°"),
+                        )
+                        .changed()
+                    {
+                        policy.min_elevation_cdeg =
+                            (min_deg.clamp(0.0, 90.0) * 100.0).round() as u16;
+                    }
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut max_deg)
+                                .range(0.0..=90.0)
+                                .speed(0.05)
+                                .suffix("°"),
+                        )
+                        .changed()
+                    {
+                        policy.max_elevation_cdeg =
+                            (max_deg.clamp(0.0, 90.0) * 100.0).round() as u16;
+                    }
+                } else {
+                    ui.weak("—");
+                    ui.weak("—");
+                }
+                ui.end_row();
+
+                policy = policy.normalized();
+                if policy != original {
+                    set.product_groups.insert(group, policy);
+                    changed = true;
+                }
+            }
+        });
+    changed
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -440,6 +587,9 @@ const HAZARD_MAX_RENDER_EDGE_KM: f32 = 2_500.0;
 const HAZARD_GENERIC_ALERT_SPIKY_MIN_POINTS: usize = 8;
 const HAZARD_GENERIC_ALERT_SPIKY_PATH_RATIO: f32 = 1.6;
 const MAP_DRAG_DEAD_ZONE_PX: f32 = 3.0;
+const VOL3D_BOX_DRAG_MIN_PX: f32 = 12.0;
+const VOL3D_BOX_DRAG_MIN_HALF_KM: f32 = 5.0;
+const VOL3D_BOX_DRAG_MAX_HALF_KM: f32 = 240.0;
 const STORM_TRACK_CLICK_TOLERANCE_PX: f32 = 12.0;
 const COLOR_STATUS_SCROLL_HEIGHT: f32 = 34.0;
 const HAZARD_LIST_SCROLL_HEIGHT: f32 = 156.0;
@@ -1128,6 +1278,12 @@ fn dominant_site_id<'a>(volumes: impl Iterator<Item = &'a RadarVolume>) -> Optio
         .map(|(site_id, _)| site_id.to_owned())
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Vol3dMapBoxDrag {
+    start: egui::Pos2,
+    current: egui::Pos2,
+}
+
 struct ViewerApp {
     source_path: Option<PathBuf>,
     renderer_backend: &'static str,
@@ -1189,6 +1345,7 @@ struct ViewerApp {
     map_center_lon: f32,
     map_center_lat: f32,
     map_scale: f32,
+    vol3d_map_box_drag: Option<Vol3dMapBoxDrag>,
     place_search_query: String,
     radar_range_km: f32,
     load_timing: Option<LoadTimings>,
@@ -1480,6 +1637,9 @@ struct ViewerApp {
     /// Unified Player: v0.25 timeline/export front door for radar, warnings,
     /// reports, lightning, camera follow, and full-resolution media.
     unified_player: unified_player::UnifiedPlayerState,
+    /// Advanced product/pane sweep controls opened from the Unified Player's
+    /// compact Low sweeps row.
+    sweep_controls_open: bool,
     /// When set, warning visibility is evaluated against the currently
     /// displayed radar frame time so archive-loop warnings pop in/out.
     event_loop_hazard_window: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -2018,7 +2178,7 @@ struct LoopTimelineSummaryCacheKey {
     target: LoopTimelineTarget,
     frame_signature: u64,
     low_sweeps: bool,
-    filter: LowSweepLoopFilter,
+    policy: SweepPolicy,
     disabled_cuts: BTreeSet<LowSweepCutKey>,
     selected_product: DisplayProduct,
     active_pane: usize,
@@ -4278,7 +4438,7 @@ enum DerivedProduct {
     Posh,
     /// Probability of Hail, any size (Waldvogel et al. 1979), percent.
     Poh,
-    /// Mid-Altitude Radial Convergence ΔV (Schmocker et al. 1996), m/s.
+    /// Mid-Altitude Radial Convergence Î”V (Schmocker et al. 1996), m/s.
     Marc,
     /// Low-level gust proxy: |Vr| with beam < 1 km (Smith et al. 2004), m/s.
     GustProxy,
@@ -4431,6 +4591,18 @@ impl DisplayProduct {
             | Self::StormRelativeDealiasedVelocity => ColorTableFamily::Velocity,
             Self::Derived(d) => d.color_family(),
         }
+    }
+}
+
+fn sweep_product_group(product: &DisplayProduct) -> SweepProductGroup {
+    match product.base_moment() {
+        MomentType::Reflectivity => SweepProductGroup::Reflectivity,
+        MomentType::Velocity => SweepProductGroup::Velocity,
+        MomentType::DifferentialReflectivity
+        | MomentType::CorrelationCoefficient
+        | MomentType::DifferentialPhase
+        | MomentType::SpecificDifferentialPhase => SweepProductGroup::DualPol,
+        MomentType::SpectrumWidth | MomentType::Unknown(_) => SweepProductGroup::Other,
     }
 }
 
@@ -5154,6 +5326,7 @@ impl ViewerApp {
             map_center_lon,
             map_center_lat,
             map_scale: DEFAULT_MAP_SCALE,
+            vol3d_map_box_drag: None,
             place_search_query: String::new(),
             radar_range_km: DEFAULT_RADAR_RANGE_KM,
             load_timing: None,
@@ -5319,6 +5492,7 @@ impl ViewerApp {
             event_explorer: event_explorer::EventExplorerState::default(),
             event_loop_builder: event_loop_builder::EventLoopBuilderState::default(),
             unified_player: unified_player::UnifiedPlayerState::default(),
+            sweep_controls_open: false,
             event_loop_hazard_window: None,
             pending_event_loop_hazard_window: None,
             glm_enabled: restored_overlays.3,
@@ -6308,8 +6482,9 @@ impl ViewerApp {
             return;
         };
         let product = self.selected_product.clone();
-        let low_sweeps = self.app_settings.loop_low_sweeps;
-        let filter = self.low_sweep_loop_filter();
+        let policy = self.primary_sweep_policy_for_product(&product);
+        let use_sweep_policy =
+            self.app_settings.loop_low_sweeps && policy.mode != SweepPolicyMode::Off;
         let disabled_cuts = &self.low_sweep_disabled_cuts;
         let primary_elevation = self
             .volume
@@ -6324,11 +6499,11 @@ impl ViewerApp {
                 continue;
             }
 
-            let selection = if low_sweeps {
-                low_sweep_history_cut_at_or_before_near_elevation(
+            let selection = if use_sweep_policy {
+                sweep_history_cut_at_or_before_near_elevation(
                     &layer.frame_history,
                     &product,
-                    filter,
+                    policy,
                     disabled_cuts,
                     target_utc,
                     primary_elevation,
@@ -6344,24 +6519,12 @@ impl ViewerApp {
                     ))
                 })
             } else {
-                history_frame_index_at_or_before(
+                history_cut_at_or_before_near_elevation(
                     &layer.frame_history,
+                    &product,
                     target_utc,
-                    COORDINATED_RADAR_MAX_STALENESS_SECONDS,
+                    primary_elevation,
                 )
-                .and_then(|frame_index| {
-                    let frame = layer.frame_history.get(frame_index)?;
-                    let cut = primary_elevation
-                        .and_then(|elevation| {
-                            displayable_cut_nearest_elevation(
-                                frame.volume.as_ref(),
-                                &product,
-                                elevation,
-                            )
-                        })
-                        .or_else(|| best_cut_for_product(frame.volume.as_ref(), 0, &product))?;
-                    Some((frame_index, cut, frame.identity.scan_time_utc))
-                })
             };
 
             let Some((frame_index, cut, observation_time)) = selection else {
@@ -7453,16 +7616,19 @@ impl ViewerApp {
         let mut range: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
         if self.app_settings.loop_low_sweeps {
             let product = self.loop_timeline_product_for_target(target);
-            let filter = self.low_sweep_loop_filter();
+            let policy = self.sweep_policy_for_target_product(target, &product);
             for frame in frames {
                 let volume = frame.volume.as_ref();
-                let cuts = low_sweep_cuts_for_history_entry(
+                let cuts = sweep_cuts_for_history_entry(
                     frame,
                     &product,
-                    filter,
+                    policy,
                     &self.low_sweep_disabled_cuts,
                 );
                 if cuts.is_empty() {
+                    if policy.mode == SweepPolicyMode::Range {
+                        continue;
+                    }
                     extend_time_range(&mut range, volume.volume_time.with_timezone(&Utc));
                     continue;
                 }
@@ -7515,14 +7681,18 @@ impl ViewerApp {
         for frame in frames {
             frame_offsets.push(step_count);
             let count = if key.low_sweeps {
-                low_sweep_cuts_for_history_entry(
+                let cut_count = sweep_cuts_for_history_entry(
                     frame,
                     &product,
-                    key.filter,
+                    key.policy,
                     &self.low_sweep_disabled_cuts,
                 )
-                .len()
-                .max(1)
+                .len();
+                if cut_count == 0 && key.policy.mode == SweepPolicyMode::Range {
+                    0
+                } else {
+                    cut_count.max(1)
+                }
             } else {
                 1
             };
@@ -7530,22 +7700,37 @@ impl ViewerApp {
             step_count = step_count.saturating_add(count);
         }
 
-        let mut range: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
-        if let Some(first) = frames
-            .iter()
-            .min_by_key(|frame| frame.identity.scan_time_utc)
-        {
-            let low_sweep_product = key.low_sweeps.then_some(&product);
-            self.extend_loop_time_window_with_frame(first, low_sweep_product, &mut range);
-            if let Some(last) = frames
+        let summary_window = if key.low_sweeps && key.policy.mode == SweepPolicyMode::Range {
+            self.loaded_loop_time_window_for_target(target)
+        } else {
+            let mut range: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
+            if let Some(first) = frames
                 .iter()
-                .max_by_key(|frame| frame.identity.scan_time_utc)
-                && first.identity != last.identity
+                .min_by_key(|frame| frame.identity.scan_time_utc)
             {
-                self.extend_loop_time_window_with_frame(last, low_sweep_product, &mut range);
+                let low_sweep_product = key.low_sweeps.then_some(&product);
+                let low_sweep_policy = key.low_sweeps.then_some(key.policy);
+                self.extend_loop_time_window_with_frame(
+                    first,
+                    low_sweep_product,
+                    low_sweep_policy,
+                    &mut range,
+                );
+                if let Some(last) = frames
+                    .iter()
+                    .max_by_key(|frame| frame.identity.scan_time_utc)
+                    && first.identity != last.identity
+                {
+                    self.extend_loop_time_window_with_frame(
+                        last,
+                        low_sweep_product,
+                        low_sweep_policy,
+                        &mut range,
+                    );
+                }
             }
-        }
-        let summary_window = range.map(|(start, end)| (start, end + chrono::Duration::seconds(1)));
+            range.map(|(start, end)| (start, end + chrono::Duration::seconds(1)))
+        };
         let summary = LoopTimelineSummary {
             product,
             step_count,
@@ -7569,7 +7754,10 @@ impl ViewerApp {
             target,
             frame_signature: frame_history_signature(frames),
             low_sweeps: self.app_settings.loop_low_sweeps,
-            filter: self.low_sweep_loop_filter(),
+            policy: self.sweep_policy_for_target_product(
+                target,
+                &self.loop_timeline_product_for_target(target),
+            ),
             disabled_cuts: self.low_sweep_disabled_cuts.clone(),
             selected_product: self.selected_product.clone(),
             active_pane: self.active_pane,
@@ -7600,18 +7788,17 @@ impl ViewerApp {
         &self,
         frame: &FrameHistoryEntry,
         low_sweep_product: Option<&DisplayProduct>,
+        low_sweep_policy: Option<SweepPolicy>,
         range: &mut Option<(DateTime<Utc>, DateTime<Utc>)>,
     ) {
         let volume = frame.volume.as_ref();
-        if let Some(product) = low_sweep_product {
-            let cuts = low_sweep_cuts_for_history_entry(
-                frame,
-                product,
-                self.low_sweep_loop_filter(),
-                &self.low_sweep_disabled_cuts,
-            );
+        if let Some((product, policy)) = low_sweep_product.zip(low_sweep_policy) {
+            let cuts =
+                sweep_cuts_for_history_entry(frame, product, policy, &self.low_sweep_disabled_cuts);
             if cuts.is_empty() {
-                extend_time_range(range, volume.volume_time.with_timezone(&Utc));
+                if policy.mode != SweepPolicyMode::Range {
+                    extend_time_range(range, volume.volume_time.with_timezone(&Utc));
+                }
                 return;
             }
             for cut_index in cuts {
@@ -7798,9 +7985,22 @@ impl ViewerApp {
         if self.advance_history_loop_low_sweep(ctx) {
             return;
         }
-        let Some(next_index) = (!self.frame_history.is_empty())
-            .then_some((self.selected_frame_index + 1) % self.frame_history.len())
-        else {
+        let product = self.shared_low_sweep_driver_product();
+        let policy = self.primary_sweep_policy_for_product(&product);
+        let next_index =
+            if self.app_settings.loop_low_sweeps && policy.mode == SweepPolicyMode::Range {
+                next_frame_index_with_sweep_cuts(
+                    &self.frame_history,
+                    self.selected_frame_index,
+                    &product,
+                    policy,
+                    &self.low_sweep_disabled_cuts,
+                )
+            } else {
+                (!self.frame_history.is_empty())
+                    .then_some((self.selected_frame_index + 1) % self.frame_history.len())
+            };
+        let Some(next_index) = next_index else {
             self.history_playing = false;
             return;
         };
@@ -7814,10 +8014,22 @@ impl ViewerApp {
         if self.advance_extra_pane_history_loop_low_sweep(pane_slot, ctx) {
             return;
         }
-        let Some(next_index) = self.extra_panes.get(pane_slot).and_then(|pane| {
-            (!pane.frame_history.is_empty())
-                .then_some((pane.selected_frame_index + 1) % pane.frame_history.len())
-        }) else {
+        let next_index = self.extra_panes.get(pane_slot).and_then(|pane| {
+            let policy = self.extra_pane_sweep_policy_for_product(pane_slot, &pane.product);
+            if self.app_settings.loop_low_sweeps && policy.mode == SweepPolicyMode::Range {
+                next_frame_index_with_sweep_cuts(
+                    &pane.frame_history,
+                    pane.selected_frame_index,
+                    &pane.product,
+                    policy,
+                    &self.low_sweep_disabled_cuts,
+                )
+            } else {
+                (!pane.frame_history.is_empty())
+                    .then_some((pane.selected_frame_index + 1) % pane.frame_history.len())
+            }
+        });
+        let Some(next_index) = next_index else {
             if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
                 pane.history_playing = false;
             }
@@ -7839,16 +8051,18 @@ impl ViewerApp {
             return;
         };
         let product = self.shared_low_sweep_driver_product();
-        if !low_sweep_cuts_for_history_entry(
-            frame,
-            &product,
-            self.low_sweep_loop_filter(),
-            &self.low_sweep_disabled_cuts,
-        )
-        .is_empty()
-            && let Some(time_utc) = self.shared_low_sweep_time_for_rank(frame, &product, 0)
-            && self.set_shared_low_sweep_time(time_utc, ctx)
-        {
+        let policy = self.primary_sweep_policy_for_product(&product);
+        let cuts =
+            sweep_cuts_for_history_entry(frame, &product, policy, &self.low_sweep_disabled_cuts);
+        let time_utc = if let Some(cut) = cuts.first() {
+            cut_start_time_utc(frame.volume.as_ref(), *cut).unwrap_or(frame.identity.scan_time_utc)
+        } else if policy.mode == SweepPolicyMode::Off {
+            cut_start_time_utc(frame.volume.as_ref(), self.selected_cut)
+                .unwrap_or(frame.identity.scan_time_utc)
+        } else {
+            return;
+        };
+        if self.set_shared_low_sweep_time(time_utc, ctx) {
             self.maybe_sync_satellite_map_to_timeline(ctx);
             ctx.request_repaint();
         }
@@ -7862,10 +8076,10 @@ impl ViewerApp {
             return false;
         };
         let (product, current_cut) = self.shared_low_sweep_driver();
-        let cuts = low_sweep_cuts_for_history_entry(
+        let cuts = sweep_cuts_for_history_entry(
             frame,
             &product,
-            self.low_sweep_loop_filter(),
+            self.primary_sweep_policy_for_product(&product),
             &self.low_sweep_disabled_cuts,
         );
         let Some(position) = cuts.iter().position(|cut| *cut == current_cut) else {
@@ -7903,13 +8117,12 @@ impl ViewerApp {
         if !self.app_settings.loop_low_sweeps {
             return;
         }
-        let filter = self.low_sweep_loop_filter();
         let Some((next_cut, current_cut)) = self.extra_panes.get(pane_slot).and_then(|pane| {
             let frame = pane.frame_history.get(pane.selected_frame_index)?;
-            low_sweep_cuts_for_history_entry(
+            sweep_cuts_for_history_entry(
                 frame,
                 &pane.product,
-                filter,
+                self.extra_pane_sweep_policy_for_product(pane_slot, &pane.product),
                 &self.low_sweep_disabled_cuts,
             )
             .first()
@@ -7934,14 +8147,13 @@ impl ViewerApp {
         if !self.app_settings.loop_low_sweeps {
             return false;
         }
-        let filter = self.low_sweep_loop_filter();
         let Some((cuts, current)) = self.extra_panes.get(pane_slot).and_then(|pane| {
             let frame = pane.frame_history.get(pane.selected_frame_index)?;
             Some((
-                low_sweep_cuts_for_history_entry(
+                sweep_cuts_for_history_entry(
                     frame,
                     &pane.product,
-                    filter,
+                    self.extra_pane_sweep_policy_for_product(pane_slot, &pane.product),
                     &self.low_sweep_disabled_cuts,
                 ),
                 pane.cut.unwrap_or(self.selected_cut),
@@ -7969,6 +8181,12 @@ impl ViewerApp {
         let Some(pane) = self.extra_panes.get(pane_slot) else {
             return false;
         };
+        let policy = self.extra_pane_sweep_policy_for_product(pane_slot, &pane.product);
+        if self.app_settings.loop_low_sweeps && policy.mode == SweepPolicyMode::Range {
+            return self
+                .loop_timeline_summary_for_target(LoopTimelineTarget::ExtraPane(pane_slot))
+                .is_some_and(|summary| summary.step_count > 1);
+        }
         if pane.frame_history.len() > 1 {
             return true;
         }
@@ -7978,10 +8196,10 @@ impl ViewerApp {
         let Some(frame) = pane.frame_history.get(pane.selected_frame_index) else {
             return false;
         };
-        low_sweep_cuts_for_history_entry(
+        sweep_cuts_for_history_entry(
             frame,
             &pane.product,
-            self.low_sweep_loop_filter(),
+            self.extra_pane_sweep_policy_for_product(pane_slot, &pane.product),
             &self.low_sweep_disabled_cuts,
         )
         .len()
@@ -8050,19 +8268,19 @@ impl ViewerApp {
         &self,
         frames: &[FrameHistoryEntry],
         product: &DisplayProduct,
+        policy: SweepPolicy,
     ) -> Vec<LoopTimelineStep> {
         if frames.is_empty() {
             return Vec::new();
         }
         let use_low_sweeps = self.app_settings.loop_low_sweeps;
-        let filter = self.low_sweep_loop_filter();
         let mut steps = Vec::new();
         for (frame_index, frame) in frames.iter().enumerate() {
             if use_low_sweeps {
-                let cuts = low_sweep_cuts_for_history_entry(
+                let cuts = sweep_cuts_for_history_entry(
                     frame,
                     product,
-                    filter,
+                    policy,
                     &self.low_sweep_disabled_cuts,
                 );
                 if !cuts.is_empty() {
@@ -8073,6 +8291,9 @@ impl ViewerApp {
                             low_sweep_rank: Some(rank),
                         }
                     }));
+                    continue;
+                }
+                if policy.mode == SweepPolicyMode::Range {
                     continue;
                 }
             }
@@ -8089,12 +8310,19 @@ impl ViewerApp {
         match target {
             LoopTimelineTarget::Primary => {
                 let product = self.shared_low_sweep_driver_product();
-                self.loop_timeline_steps_for(&self.frame_history, &product)
+                let policy = self.primary_sweep_policy_for_product(&product);
+                self.loop_timeline_steps_for(&self.frame_history, &product, policy)
             }
             LoopTimelineTarget::ExtraPane(slot) => self
                 .extra_panes
                 .get(slot)
-                .map(|pane| self.loop_timeline_steps_for(&pane.frame_history, &pane.product))
+                .map(|pane| {
+                    self.loop_timeline_steps_for(
+                        &pane.frame_history,
+                        &pane.product,
+                        self.extra_pane_sweep_policy_for_product(slot, &pane.product),
+                    )
+                })
                 .unwrap_or_default(),
         }
     }
@@ -8128,11 +8356,12 @@ impl ViewerApp {
             }
         };
         let current_frame = frames.get(selected_frame_index)?;
+        let policy = self.sweep_policy_for_target_product(target, &product);
         if self.app_settings.loop_low_sweeps {
-            let cuts = low_sweep_cuts_for_history_entry(
+            let cuts = sweep_cuts_for_history_entry(
                 current_frame,
                 &product,
-                self.low_sweep_loop_filter(),
+                policy,
                 &self.low_sweep_disabled_cuts,
             );
             if let Some(current_rank) = cuts.iter().position(|cut| *cut == current_cut)
@@ -8149,22 +8378,27 @@ impl ViewerApp {
         // frame, so after the current frame's last accepted low sweep the next
         // observation is simply the first accepted cut (or scan time) in the
         // following frame. No full 1,500-step vector is rebuilt per repaint.
-        let next_frame = frames.get(selected_frame_index + 1)?;
-        if self.app_settings.loop_low_sweeps {
-            let next_cuts = low_sweep_cuts_for_history_entry(
-                next_frame,
-                &product,
-                self.low_sweep_loop_filter(),
-                &self.low_sweep_disabled_cuts,
-            );
-            if let Some(next_cut) = next_cuts.first().copied() {
-                return Some(
-                    cut_start_time_utc(next_frame.volume.as_ref(), next_cut)
-                        .unwrap_or(next_frame.identity.scan_time_utc),
+        for next_frame in frames.iter().skip(selected_frame_index + 1) {
+            if self.app_settings.loop_low_sweeps {
+                let next_cuts = sweep_cuts_for_history_entry(
+                    next_frame,
+                    &product,
+                    policy,
+                    &self.low_sweep_disabled_cuts,
                 );
+                if let Some(next_cut) = next_cuts.first().copied() {
+                    return Some(
+                        cut_start_time_utc(next_frame.volume.as_ref(), next_cut)
+                            .unwrap_or(next_frame.identity.scan_time_utc),
+                    );
+                }
+                if policy.mode == SweepPolicyMode::Range {
+                    continue;
+                }
             }
+            return Some(next_frame.identity.scan_time_utc);
         }
-        Some(next_frame.identity.scan_time_utc)
+        None
     }
 
     /// Continuous timeline time for camera follow. Radar data still changes
@@ -8355,11 +8589,15 @@ impl ViewerApp {
             return None;
         }
         let frame = self.frame_history.get(self.selected_frame_index)?;
-        let filter = self.low_sweep_loop_filter();
         let (product, current_cut) = self.shared_low_sweep_driver();
-        low_sweep_cuts_for_history_entry(frame, &product, filter, &self.low_sweep_disabled_cuts)
-            .iter()
-            .position(|cut| *cut == current_cut)
+        sweep_cuts_for_history_entry(
+            frame,
+            &product,
+            self.primary_sweep_policy_for_product(&product),
+            &self.low_sweep_disabled_cuts,
+        )
+        .iter()
+        .position(|cut| *cut == current_cut)
     }
 
     fn current_loop_timeline_low_sweep_rank_for_product(
@@ -8370,7 +8608,6 @@ impl ViewerApp {
         if !self.app_settings.loop_low_sweeps {
             return None;
         }
-        let filter = self.low_sweep_loop_filter();
         match target {
             LoopTimelineTarget::Primary => {
                 let frame = self.frame_history.get(self.selected_frame_index)?;
@@ -8380,10 +8617,10 @@ impl ViewerApp {
                 } else {
                     self.selected_cut
                 };
-                low_sweep_cuts_for_history_entry(
+                sweep_cuts_for_history_entry(
                     frame,
                     product,
-                    filter,
+                    self.primary_sweep_policy_for_product(product),
                     &self.low_sweep_disabled_cuts,
                 )
                 .iter()
@@ -8393,10 +8630,10 @@ impl ViewerApp {
                 let pane = self.extra_panes.get(slot)?;
                 let frame = pane.frame_history.get(pane.selected_frame_index)?;
                 let current_cut = pane.cut.unwrap_or(self.selected_cut);
-                low_sweep_cuts_for_history_entry(
+                sweep_cuts_for_history_entry(
                     frame,
                     product,
-                    filter,
+                    self.extra_pane_sweep_policy_for_product(slot, product),
                     &self.low_sweep_disabled_cuts,
                 )
                 .iter()
@@ -8412,10 +8649,10 @@ impl ViewerApp {
         let pane = self.extra_panes.get(pane_slot)?;
         let frame = pane.frame_history.get(pane.selected_frame_index)?;
         let current_cut = pane.cut.unwrap_or(self.selected_cut);
-        low_sweep_cuts_for_history_entry(
+        sweep_cuts_for_history_entry(
             frame,
             &pane.product,
-            self.low_sweep_loop_filter(),
+            self.extra_pane_sweep_policy_for_product(pane_slot, &pane.product),
             &self.low_sweep_disabled_cuts,
         )
         .iter()
@@ -8462,10 +8699,10 @@ impl ViewerApp {
         product: &DisplayProduct,
         rank: usize,
     ) -> Option<DateTime<Utc>> {
-        let cuts = low_sweep_cuts_for_history_entry(
+        let cuts = sweep_cuts_for_history_entry(
             frame,
             product,
-            self.low_sweep_loop_filter(),
+            self.primary_sweep_policy_for_product(product),
             &self.low_sweep_disabled_cuts,
         );
         let cut = cuts.get(rank).or_else(|| cuts.last()).copied()?;
@@ -8483,12 +8720,11 @@ impl ViewerApp {
         let Some(frame) = self.frame_history.get(self.selected_frame_index).cloned() else {
             return false;
         };
-        let filter = self.low_sweep_loop_filter();
         let mut changed = false;
-        if let Some(cut) = low_sweep_cut_at_or_before_in_frame(
+        if let Some(cut) = sweep_cut_at_or_before_in_frame(
             &frame,
             &self.selected_product,
-            filter,
+            self.primary_sweep_policy_for_product(&self.selected_product),
             &self.low_sweep_disabled_cuts,
             timeline_time,
         ) && self.selected_cut != cut
@@ -8511,20 +8747,21 @@ impl ViewerApp {
                 if !should_follow {
                     return None;
                 }
+                let policy = self.extra_pane_sweep_policy_for_product(slot, &pane.product);
                 if pane.owns_radar() {
-                    low_sweep_history_cut_at_or_before(
+                    sweep_history_cut_at_or_before(
                         &pane.frame_history,
                         &pane.product,
-                        filter,
+                        policy,
                         &self.low_sweep_disabled_cuts,
                         timeline_time,
                     )
                     .map(|(frame_index, cut)| (slot, Some(frame_index), cut))
                 } else {
-                    low_sweep_cut_at_or_before_in_frame(
+                    sweep_cut_at_or_before_in_frame(
                         &frame,
                         &pane.product,
-                        filter,
+                        policy,
                         &self.low_sweep_disabled_cuts,
                         timeline_time,
                     )
@@ -8571,13 +8808,16 @@ impl ViewerApp {
         if !self.app_settings.loop_low_sweeps {
             return false;
         }
-        let filter = self.low_sweep_loop_filter();
+        let policy = self
+            .extra_panes
+            .get(pane_slot)
+            .map(|pane| self.extra_pane_sweep_policy_for_product(pane_slot, &pane.product));
         let Some((cut, changed)) = self.extra_panes.get(pane_slot).and_then(|pane| {
             let frame = pane.frame_history.get(pane.selected_frame_index)?;
-            let cuts = low_sweep_cuts_for_history_entry(
+            let cuts = sweep_cuts_for_history_entry(
                 frame,
                 &pane.product,
-                filter,
+                policy?,
                 &self.low_sweep_disabled_cuts,
             );
             let cut = cuts.get(rank).or_else(|| cuts.last()).copied()?;
@@ -8594,7 +8834,7 @@ impl ViewerApp {
 
     fn shared_low_sweep_driver(&self) -> (DisplayProduct, usize) {
         let primary = (self.selected_product.clone(), self.selected_cut);
-        if !self.app_settings.loop_low_sweeps {
+        if !self.app_settings.loop_low_sweeps || self.advanced_sweep_control_enabled() {
             return primary;
         }
         if self.product_has_expanded_low_sweep_steps(&self.frame_history, &primary.0) {
@@ -8623,9 +8863,9 @@ impl ViewerApp {
         frames: &[FrameHistoryEntry],
         product: &DisplayProduct,
     ) -> bool {
-        let filter = self.low_sweep_loop_filter();
+        let policy = legacy_sweep_policy(self.low_sweep_loop_filter());
         frames.iter().any(|frame| {
-            low_sweep_cuts_for_history_entry(frame, product, filter, &self.low_sweep_disabled_cuts)
+            sweep_cuts_for_history_entry(frame, product, policy, &self.low_sweep_disabled_cuts)
                 .len()
                 > 1
         })
@@ -8636,6 +8876,13 @@ impl ViewerApp {
     }
 
     fn primary_history_loop_can_step(&self) -> bool {
+        let product = self.shared_low_sweep_driver_product();
+        let policy = self.primary_sweep_policy_for_product(&product);
+        if self.app_settings.loop_low_sweeps && policy.mode == SweepPolicyMode::Range {
+            return self
+                .loop_timeline_summary_for_target(LoopTimelineTarget::Primary)
+                .is_some_and(|summary| summary.step_count > 1);
+        }
         if self.frame_history.len() > 1 {
             return true;
         }
@@ -8645,14 +8892,54 @@ impl ViewerApp {
         let Some(frame) = self.frame_history.get(self.selected_frame_index) else {
             return false;
         };
-        low_sweep_cuts_for_history_entry(
-            frame,
-            &self.shared_low_sweep_driver_product(),
-            self.low_sweep_loop_filter(),
-            &self.low_sweep_disabled_cuts,
-        )
-        .len()
+        sweep_cuts_for_history_entry(frame, &product, policy, &self.low_sweep_disabled_cuts).len()
             > 1
+    }
+
+    fn advanced_sweep_control_enabled(&self) -> bool {
+        self.app_settings.loop_sweep_control.is_some()
+    }
+
+    fn primary_sweep_policy_for_product(&self, product: &DisplayProduct) -> SweepPolicy {
+        let fallback = legacy_sweep_policy(self.low_sweep_loop_filter());
+        let group = sweep_product_group(product);
+        self.app_settings
+            .loop_sweep_control
+            .as_ref()
+            .map(|control| sweep_policy_from_set(&control.primary, group, fallback))
+            .unwrap_or(fallback)
+    }
+
+    fn extra_pane_sweep_policy_for_product(
+        &self,
+        pane_slot: usize,
+        product: &DisplayProduct,
+    ) -> SweepPolicy {
+        let primary = self.primary_sweep_policy_for_product(product);
+        let Some(control) = self.app_settings.loop_sweep_control.as_ref() else {
+            return primary;
+        };
+        let Ok(pane_slot) = u8::try_from(pane_slot) else {
+            return primary;
+        };
+        control
+            .extra_pane_overrides
+            .get(&pane_slot)
+            .map(|set| sweep_policy_from_set(set, sweep_product_group(product), primary))
+            .unwrap_or(primary)
+    }
+
+    fn sweep_policy_for_target_product(
+        &self,
+        target: LoopTimelineTarget,
+        product: &DisplayProduct,
+    ) -> SweepPolicy {
+        match target {
+            LoopTimelineTarget::Primary => self.primary_sweep_policy_for_product(product),
+            LoopTimelineTarget::ExtraPane(slot) => {
+                self.extra_pane_sweep_policy_for_product(slot, product)
+            }
+        }
     }
 
     fn low_sweep_loop_filter(&self) -> LowSweepLoopFilter {
@@ -8664,12 +8951,12 @@ impl ViewerApp {
         ui: &mut egui::Ui,
         id_salt: impl std::hash::Hash,
         ctx: &egui::Context,
-        pane_slot: Option<usize>,
+        _pane_slot: Option<usize>,
     ) {
         let mut filter = self.low_sweep_loop_filter();
         egui::ComboBox::from_id_salt(id_salt)
             .selected_text(filter.label())
-            .width(78.0)
+            .width(108.0)
             .show_ui(ui, |ui| {
                 for option in LowSweepLoopFilter::ALL {
                     ui.selectable_value(&mut filter, option, option.label())
@@ -8688,13 +8975,11 @@ impl ViewerApp {
             });
         if filter.key() != self.app_settings.loop_low_sweep_filter {
             self.app_settings.loop_low_sweep_filter = filter.key().to_owned();
+            // Choosing the compact/simple mode is authoritative and returns
+            // every target to the legacy global behavior.
+            self.app_settings.loop_sweep_control = None;
             let _ = self.app_settings.save();
-            if let Some(slot) = pane_slot {
-                self.select_first_extra_pane_low_sweep_if_enabled(slot, ctx);
-            } else {
-                self.select_first_history_low_sweep_if_enabled(ctx);
-            }
-            ctx.request_repaint();
+            self.refresh_sweep_control_selection(ctx);
         }
     }
 
@@ -8705,9 +8990,9 @@ impl ViewerApp {
         let Some(frame) = self.frame_history.get(self.selected_frame_index) else {
             return;
         };
-        let filter = self.low_sweep_loop_filter();
+        let policy = self.primary_sweep_policy_for_product(&self.selected_product);
         let candidates =
-            low_sweep_cuts_for_product(frame.volume.as_ref(), &self.selected_product, filter);
+            sweep_cuts_for_product(frame.volume.as_ref(), &self.selected_product, policy);
         if candidates.len() <= 1 {
             return;
         }
@@ -8716,7 +9001,7 @@ impl ViewerApp {
         let mut changed = false;
         let mut reset_all = false;
         ui.horizontal_wrapped(|ui| {
-            ui.weak("Low cuts");
+            ui.weak("Sweep cuts");
             for cut in candidates {
                 let key = LowSweepCutKey::new(&identity, cut);
                 let mut enabled = !self.low_sweep_disabled_cuts.contains(&key);
@@ -8750,10 +9035,10 @@ impl ViewerApp {
             let Some(frame) = self.frame_history.get(self.selected_frame_index) else {
                 return;
             };
-            let enabled_cuts = low_sweep_cuts_for_history_entry(
+            let enabled_cuts = sweep_cuts_for_history_entry(
                 frame,
                 &self.selected_product,
-                filter,
+                policy,
                 &self.low_sweep_disabled_cuts,
             );
             if !enabled_cuts.contains(&self.selected_cut)
@@ -8780,8 +9065,8 @@ impl ViewerApp {
         let Some(frame) = pane.frame_history.get(pane.selected_frame_index) else {
             return;
         };
-        let filter = self.low_sweep_loop_filter();
-        let candidates = low_sweep_cuts_for_product(frame.volume.as_ref(), &pane.product, filter);
+        let policy = self.extra_pane_sweep_policy_for_product(pane_slot, &pane.product);
+        let candidates = sweep_cuts_for_product(frame.volume.as_ref(), &pane.product, policy);
         if candidates.len() <= 1 {
             return;
         }
@@ -8792,7 +9077,7 @@ impl ViewerApp {
         let mut changed = false;
         let mut reset_all = false;
         ui.horizontal_wrapped(|ui| {
-            ui.weak("Low cuts");
+            ui.weak("Sweep cuts");
             for cut in candidates {
                 let key = LowSweepCutKey::new(&identity, cut);
                 let mut enabled = !self.low_sweep_disabled_cuts.contains(&key);
@@ -8829,10 +9114,10 @@ impl ViewerApp {
             let Some(frame) = pane.frame_history.get(pane.selected_frame_index) else {
                 return;
             };
-            let enabled_cuts = low_sweep_cuts_for_history_entry(
+            let enabled_cuts = sweep_cuts_for_history_entry(
                 frame,
                 &product,
-                filter,
+                policy,
                 &self.low_sweep_disabled_cuts,
             );
             if !enabled_cuts.contains(&current)
@@ -9954,12 +10239,9 @@ impl ViewerApp {
             return Vec::new();
         };
         if self.app_settings.loop_low_sweeps {
-            let cuts = low_sweep_cuts_for_history_entry(
-                frame,
-                product,
-                self.low_sweep_loop_filter(),
-                &self.low_sweep_disabled_cuts,
-            );
+            let policy = self.primary_sweep_policy_for_product(product);
+            let cuts =
+                sweep_cuts_for_history_entry(frame, product, policy, &self.low_sweep_disabled_cuts);
             if !cuts.is_empty() {
                 return cuts
                     .into_iter()
@@ -9970,6 +10252,9 @@ impl ViewerApp {
                         low_sweep_rank: Some(rank),
                     })
                     .collect();
+            }
+            if policy.mode == SweepPolicyMode::Range {
+                return Vec::new();
             }
         }
         vec![LoopTimelineStep {
@@ -9990,9 +10275,6 @@ impl ViewerApp {
         let product = self.shared_low_sweep_driver_product();
         let mut frame_index = self.selected_frame_index.min(frame_count - 1);
         let mut frame_steps = self.primary_loop_steps_in_frame(frame_index, &product);
-        if frame_steps.is_empty() {
-            return Vec::new();
-        }
         let current_cut = self.shared_low_sweep_driver().1;
         let mut position = if frame_steps.len() == 1 && frame_steps[0].cut_index.is_none() {
             Some(0)
@@ -10004,21 +10286,23 @@ impl ViewerApp {
         let mut upcoming = Vec::with_capacity(limit);
 
         for _ in 0..limit {
-            let next_position = position.map_or(0, |position| position + 1);
-            if next_position >= frame_steps.len() {
-                frame_index = (frame_index + 1) % frame_count;
-                frame_steps = self.primary_loop_steps_in_frame(frame_index, &product);
-                if frame_steps.is_empty() {
+            let mut frames_checked = 0usize;
+            loop {
+                let next_position = position.map_or(0, |position| position + 1);
+                if next_position < frame_steps.len() {
+                    position = Some(next_position);
+                    upcoming.push(frame_steps[next_position]);
                     break;
                 }
-                position = Some(0);
-            } else {
-                position = Some(next_position);
+
+                frame_index = (frame_index + 1) % frame_count;
+                frame_steps = self.primary_loop_steps_in_frame(frame_index, &product);
+                position = None;
+                frames_checked += 1;
+                if frames_checked >= frame_count && frame_steps.is_empty() {
+                    return upcoming;
+                }
             }
-            let Some(position_index) = position else {
-                break;
-            };
-            upcoming.push(frame_steps[position_index]);
         }
         upcoming
     }
@@ -10030,10 +10314,10 @@ impl ViewerApp {
                 .cut_index
                 .and_then(|cut| cut_start_time_utc(frame.volume.as_ref(), cut))
                 .unwrap_or(frame.identity.scan_time_utc);
-            if let Some(cut) = low_sweep_cut_at_or_before_in_frame(
+            if let Some(cut) = sweep_cut_at_or_before_in_frame(
                 frame,
                 &self.selected_product,
-                self.low_sweep_loop_filter(),
+                self.primary_sweep_policy_for_product(&self.selected_product),
                 &self.low_sweep_disabled_cuts,
                 timeline_time,
             ) {
@@ -15199,6 +15483,7 @@ impl eframe::App for ViewerApp {
         self.radar_overlays_window(&ctx);
         self.satellite_window(&ctx);
         self.unified_player_window(&ctx);
+        self.sweep_control_window(&ctx);
         self.event_loop_builder_window(&ctx);
         self.vol3d_window(&ctx);
         self.wofs_window(&ctx);
@@ -15295,7 +15580,8 @@ impl ViewerApp {
                         self.farm.select_sensor(id);
                     }
                 }
-                let new_alert_count = self.unacknowledged_hazard_event_ids.len();
+                let groups = self.unacknowledged_hazard_menu_groups();
+                let new_alert_count = groups.iter().map(|(_, rows)| rows.len()).sum::<usize>();
                 if new_alert_count > 0 {
                     ui.ctx().request_repaint_after(Duration::from_millis(500));
                     let blink_on = ui.input(|input| (input.time * 2.0) as i64 % 2 == 0);
@@ -15309,18 +15595,17 @@ impl ViewerApp {
                     } else {
                         format!("{new_alert_count} NEW ALERTS")
                     };
-                    let groups = self.unacknowledged_hazard_menu_groups();
                     ui.menu_button(egui::RichText::new(label).strong().color(color), |ui| {
                         ui.set_min_width(330.0);
                         if fixed_action_button(ui, "Next", 58.0).clicked() {
                             self.sidebar_tab = SidebarTab::Severe;
                             if let Some(index) = self.first_unacknowledged_hazard_index() {
-                                self.focus_hazard_record(index, ui.ctx());
+                                self.focus_unacknowledged_hazard_record(index, ui.ctx());
                             }
                             ui.close();
                         }
                         if fixed_action_button(ui, "Ack all", 58.0).clicked() {
-                            self.acknowledge_all_visible_hazards();
+                            self.acknowledge_all_hazards();
                             ui.close();
                         }
                         ui.separator();
@@ -15349,7 +15634,10 @@ impl ViewerApp {
                                             .on_hover_text(&row.hover);
                                         if response.clicked() {
                                             self.sidebar_tab = SidebarTab::Severe;
-                                            self.focus_hazard_record(row.index, ui.ctx());
+                                            self.focus_unacknowledged_hazard_record(
+                                                row.index,
+                                                ui.ctx(),
+                                            );
                                             ui.close();
                                         }
                                     }
@@ -15895,6 +16183,14 @@ impl ViewerApp {
             loop_speed_percent: self.app_settings.loop_speed_percent,
             loop_speed_options: LOOP_SPEED_PERCENT_OPTIONS.to_vec(),
             low_sweeps_enabled: self.app_settings.loop_low_sweeps,
+            low_sweep_mode_label: sweep_policy_mode_label(
+                self.sweep_policy_for_target_product(
+                    target,
+                    &self.loop_timeline_product_for_target(target),
+                )
+                .mode,
+            )
+            .to_owned(),
             low_sweep_filter_index: LowSweepLoopFilter::ALL
                 .iter()
                 .position(|filter| *filter == self.low_sweep_loop_filter())
@@ -15962,6 +16258,173 @@ impl ViewerApp {
                 self.unified_player_body_full(ui, ctx);
             });
         self.unified_player.open = open;
+    }
+
+    fn sweep_control_window(&mut self, ctx: &egui::Context) {
+        if !self.sweep_controls_open {
+            return;
+        }
+
+        let legacy = legacy_sweep_policy(self.low_sweep_loop_filter());
+        let legacy_fallbacks = sweep_policy_fallbacks(legacy);
+        let mut control = self
+            .app_settings
+            .loop_sweep_control
+            .clone()
+            .unwrap_or_else(|| LoopSweepControl {
+                primary: SweepPolicySet {
+                    product_groups: legacy_fallbacks.clone(),
+                },
+                extra_pane_overrides: BTreeMap::new(),
+            });
+        let visible_panes = self
+            .extra_panes
+            .iter()
+            .take(self.grid_layout.panel_count().saturating_sub(1))
+            .enumerate()
+            .map(|(slot, pane)| (slot, pane.product.label().to_owned()))
+            .collect::<Vec<_>>();
+        let mut open = self.sweep_controls_open;
+        let mut changed = false;
+        let mut reset_simple = false;
+
+        egui::Window::new("Sweep Control")
+            .id(egui::Id::new("bowecho_sweep_control"))
+            .open(&mut open)
+            .default_width(620.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Primary supplies the loop timestamps. Each following pane selects the latest valid cut at or before that time inside its own policy.",
+                );
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button("All low tilts")
+                        .on_hover_text("Apply the easy-path mode to every primary product family")
+                        .clicked()
+                    {
+                        control.primary.product_groups = sweep_policy_fallbacks(SweepPolicy::default());
+                        changed = true;
+                    }
+                    if ui
+                        .button("Fire / smoke preset")
+                        .on_hover_text(
+                            "REF-like 1.10–1.50° and velocity-like 0.13–0.83°; following panes inherit by product",
+                        )
+                        .clicked()
+                    {
+                        control.primary.product_groups.insert(
+                            SweepProductGroup::Reflectivity,
+                            SweepPolicy::range_cdeg(110, 150),
+                        );
+                        control.primary.product_groups.insert(
+                            SweepProductGroup::Velocity,
+                            SweepPolicy::range_cdeg(13, 83),
+                        );
+                        changed = true;
+                    }
+                    if ui
+                        .button("Use simple defaults")
+                        .on_hover_text(
+                            "Remove advanced overrides and return to the compact Low sweeps mode",
+                        )
+                        .clicked()
+                    {
+                        reset_simple = true;
+                    }
+                });
+
+                ui.separator();
+                ui.heading("Primary");
+                ui.weak("Timeline driver");
+                let primary_rows_id = ui.make_persistent_id("primary_sweep_policy_rows");
+                changed |= sweep_policy_rows_ui(
+                    ui,
+                    primary_rows_id,
+                    &mut control.primary,
+                    &legacy_fallbacks,
+                );
+
+                for (slot, product_label) in &visible_panes {
+                    let Ok(pane_key) = u8::try_from(*slot) else {
+                        continue;
+                    };
+                    ui.separator();
+                    egui::CollapsingHeader::new(format!(
+                        "Pane {} — {product_label}",
+                        slot + 2
+                    ))
+                    .id_salt(("sweep_control_pane", slot))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let mut override_primary =
+                            control.extra_pane_overrides.contains_key(&pane_key);
+                        if ui
+                            .checkbox(&mut override_primary, "Override primary")
+                            .on_hover_text(
+                                "Off follows Primary by product; on stores independent product-family rules for this pane",
+                            )
+                            .changed()
+                        {
+                            if override_primary {
+                                let product_groups =
+                                    resolved_sweep_policy_fallbacks(&control.primary, legacy);
+                                control.extra_pane_overrides.insert(
+                                    pane_key,
+                                    SweepPolicySet { product_groups },
+                                );
+                            } else {
+                                control.extra_pane_overrides.remove(&pane_key);
+                            }
+                            changed = true;
+                        }
+
+                        if override_primary {
+                            let primary_fallbacks =
+                                resolved_sweep_policy_fallbacks(&control.primary, legacy);
+                            if let Some(set) = control.extra_pane_overrides.get_mut(&pane_key) {
+                                let pane_rows_id =
+                                    ui.make_persistent_id(("extra_sweep_policy_rows", slot));
+                                changed |= sweep_policy_rows_ui(
+                                    ui,
+                                    pane_rows_id,
+                                    set,
+                                    &primary_fallbacks,
+                                );
+                            }
+                        } else {
+                            ui.weak(
+                                "Following Primary; this pane holds the nearest valid at-or-before cut for its product.",
+                            );
+                        }
+                    });
+                }
+            });
+
+        self.sweep_controls_open = open;
+        if reset_simple {
+            self.app_settings.loop_sweep_control = None;
+            let _ = self.app_settings.save();
+            self.refresh_sweep_control_selection(ctx);
+            self.unified_player
+                .mark_status("Advanced sweep controls reset to simple defaults");
+        } else if changed {
+            self.app_settings.loop_sweep_control = Some(control);
+            let _ = self.app_settings.save();
+            self.refresh_sweep_control_selection(ctx);
+            self.unified_player
+                .mark_status("Advanced sweep controls updated");
+        }
+    }
+
+    fn refresh_sweep_control_selection(&mut self, ctx: &egui::Context) {
+        self.loop_timeline_summary_cache.borrow_mut().take();
+        self.select_first_history_low_sweep_if_enabled(ctx);
+        for slot in 0..self.grid_layout.panel_count().saturating_sub(1) {
+            self.select_first_extra_pane_low_sweep_if_enabled(slot, ctx);
+        }
+        self.sync_radar_overlay_layers_to_timeline(ctx);
+        ctx.request_repaint();
     }
 
     fn unified_player_pane_body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -16081,15 +16544,7 @@ impl ViewerApp {
             Some(unified_player::UnifiedPlayerAction::SetLowSweepsEnabled(enabled)) => {
                 self.app_settings.loop_low_sweeps = enabled;
                 let _ = self.app_settings.save();
-                match self.active_loop_timeline_target() {
-                    LoopTimelineTarget::Primary => {
-                        self.select_first_history_low_sweep_if_enabled(ctx)
-                    }
-                    LoopTimelineTarget::ExtraPane(slot) => {
-                        self.select_first_extra_pane_low_sweep_if_enabled(slot, ctx)
-                    }
-                }
-                ctx.request_repaint();
+                self.refresh_sweep_control_selection(ctx);
             }
             Some(unified_player::UnifiedPlayerAction::SetLowSweepFilter(index)) => {
                 let filter = LowSweepLoopFilter::ALL
@@ -16097,17 +16552,15 @@ impl ViewerApp {
                     .copied()
                     .unwrap_or_default();
                 self.app_settings.loop_low_sweep_filter = filter.key().to_owned();
+                self.app_settings.loop_sweep_control = None;
                 let _ = self.app_settings.save();
-                match self.active_loop_timeline_target() {
-                    LoopTimelineTarget::Primary => {
-                        self.select_first_history_low_sweep_if_enabled(ctx)
-                    }
-                    LoopTimelineTarget::ExtraPane(slot) => {
-                        self.select_first_extra_pane_low_sweep_if_enabled(slot, ctx)
-                    }
-                }
+                self.refresh_sweep_control_selection(ctx);
                 self.unified_player
                     .mark_status(format!("Low-sweep mode: {}", filter.label()));
+                ctx.request_repaint();
+            }
+            Some(unified_player::UnifiedPlayerAction::OpenSweepControls) => {
+                self.sweep_controls_open = true;
                 ctx.request_repaint();
             }
             Some(unified_player::UnifiedPlayerAction::SetAutoWarningSync(auto_sync)) => {
@@ -16792,6 +17245,12 @@ impl ViewerApp {
             {
                 self.set_selected_cut_preserving_texture(cut_index);
                 self.sync_following_extra_panes_to_current_low_sweep_rank(ctx);
+            } else if self.app_settings.loop_low_sweeps
+                && let Some(frame) = self.frame_history.get(step.frame_index)
+            {
+                let timeline_time = cut_start_time_utc(frame.volume.as_ref(), self.selected_cut)
+                    .unwrap_or(frame.identity.scan_time_utc);
+                self.set_shared_low_sweep_time(timeline_time, ctx);
             }
         }
         self.sync_active_timeline_side_effects(ctx);
@@ -21648,16 +22107,7 @@ impl ViewerApp {
                 self.hazard_record_visible(record) && hazard_points_renderable(&record.points)
             })
             .filter(|(_, record)| filter.matches_record(record))
-            .map(|(index, record)| HazardListRow {
-                index,
-                label: hazard_record_list_label(record),
-                family: record.event_family.clone(),
-                hover: hazard_record_list_hover(record),
-                selected: self.selected_hazard_index == Some(index),
-                unacknowledged: self
-                    .unacknowledged_hazard_event_ids
-                    .contains(&record.event_id),
-            })
+            .map(|(index, record)| self.hazard_list_row(index, record))
             .collect::<Vec<_>>();
         sort_hazard_list_rows(
             &mut rows,
@@ -21667,11 +22117,33 @@ impl ViewerApp {
         rows
     }
 
+    fn hazard_list_row(&self, index: usize, record: &HazardRecord) -> HazardListRow {
+        HazardListRow {
+            index,
+            label: hazard_record_list_label(record),
+            family: record.event_family.clone(),
+            hover: hazard_record_list_hover(record),
+            selected: self.selected_hazard_index == Some(index),
+            unacknowledged: self
+                .unacknowledged_hazard_event_ids
+                .contains(&record.event_id),
+        }
+    }
+
     fn unacknowledged_hazard_menu_groups(&self) -> Vec<(String, Vec<HazardListRow>)> {
-        let mut rows = self
-            .visible_hazard_list_rows()
-            .into_iter()
-            .filter(|row| row.unacknowledged)
+        let Some(overlay) = &self.hazard_overlay else {
+            return Vec::new();
+        };
+        let mut rows = overlay
+            .records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                self.unacknowledged_hazard_event_ids
+                    .contains(&record.event_id)
+                    && hazard_record_should_latch_attention(record)
+            })
+            .map(|(index, record)| self.hazard_list_row(index, record))
             .collect::<Vec<_>>();
         rows.sort_by(|left, right| {
             hazard_family_order(&left.family)
@@ -21740,10 +22212,22 @@ impl ViewerApp {
                 (self
                     .unacknowledged_hazard_event_ids
                     .contains(&record.event_id)
-                    && self.hazard_record_visible(record)
-                    && hazard_points_renderable(&record.points))
+                    && hazard_record_should_latch_attention(record))
                 .then_some(index)
             })
+    }
+
+    fn focus_unacknowledged_hazard_record(&mut self, index: usize, ctx: &egui::Context) -> bool {
+        if let Some(record) = self
+            .hazard_overlay
+            .as_ref()
+            .and_then(|overlay| overlay.records.get(index))
+        {
+            self.hidden_hazard_families.remove(&record.event_family);
+            self.app_settings.current_alert_filter = HazardListFilter::All.key().to_owned();
+            self.hazards_visible = true;
+        }
+        self.focus_hazard_record(index, ctx)
     }
 
     fn acknowledge_hazard_index(&mut self, index: usize) {
@@ -21755,6 +22239,10 @@ impl ViewerApp {
             self.unacknowledged_hazard_event_ids
                 .remove(&record.event_id);
         }
+    }
+
+    fn acknowledge_all_hazards(&mut self) {
+        self.unacknowledged_hazard_event_ids.clear();
     }
 
     fn acknowledge_all_visible_hazards(&mut self) {
@@ -22904,6 +23392,143 @@ impl ViewerApp {
         style_color32(self.style_registry.map().background_color)
     }
 
+    fn clamp_screen_position_to_rect(rect: egui::Rect, position: egui::Pos2) -> egui::Pos2 {
+        egui::pos2(
+            position.x.clamp(rect.left(), rect.right()),
+            position.y.clamp(rect.top(), rect.bottom()),
+        )
+    }
+
+    fn handle_vol3d_map_box_drag_input(
+        &mut self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        response: &egui::Response,
+        allowed: bool,
+    ) -> bool {
+        let shift_secondary_down = ui.input(|input| {
+            input.modifiers.shift && input.pointer.button_down(egui::PointerButton::Secondary)
+        });
+        let was_dragging = self.vol3d_map_box_drag.is_some();
+        let active_for_rect = self
+            .vol3d_map_box_drag
+            .is_some_and(|drag| rect.contains(drag.start));
+        if was_dragging && !active_for_rect {
+            return false;
+        }
+        if allowed && shift_secondary_down {
+            let pointer = ui
+                .input(|input| input.pointer.interact_pos().or(input.pointer.hover_pos()))
+                .map(|position| Self::clamp_screen_position_to_rect(rect, position));
+            if let Some(pointer) = pointer
+                && (was_dragging || response.hovered() || rect.contains(pointer))
+            {
+                if let Some(drag) = &mut self.vol3d_map_box_drag {
+                    drag.current = pointer;
+                } else {
+                    self.vol3d_map_box_drag = Some(Vol3dMapBoxDrag {
+                        start: pointer,
+                        current: pointer,
+                    });
+                }
+                ui.ctx().request_repaint();
+                return true;
+            }
+        }
+
+        if let Some(drag) = self.vol3d_map_box_drag.take() {
+            if allowed {
+                self.apply_vol3d_map_box_selection(rect, drag, ui.ctx());
+            }
+            ui.ctx().request_repaint();
+            return true;
+        }
+
+        false
+    }
+
+    fn draw_vol3d_map_box_drag(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let Some(drag) = self.vol3d_map_box_drag else {
+            return;
+        };
+        if !rect.contains(drag.start) {
+            return;
+        }
+        let start = Self::clamp_screen_position_to_rect(rect, drag.start);
+        let current = Self::clamp_screen_position_to_rect(rect, drag.current);
+        let selection = egui::Rect::from_two_pos(start, current);
+        if selection.width() < 1.0 || selection.height() < 1.0 {
+            return;
+        }
+        painter.rect_filled(
+            selection,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(68, 154, 255, 28),
+        );
+        painter.rect_stroke(
+            selection,
+            0.0,
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(112, 198, 255)),
+            egui::StrokeKind::Outside,
+        );
+        let km_per_px = 111.32 / self.map_scale.max(f32::EPSILON);
+        let box_km = (selection.width().max(selection.height()) * km_per_px).clamp(
+            VOL3D_BOX_DRAG_MIN_HALF_KM * 2.0,
+            VOL3D_BOX_DRAG_MAX_HALF_KM * 2.0,
+        );
+        painter.text(
+            selection.left_top() + egui::vec2(6.0, 6.0),
+            egui::Align2::LEFT_TOP,
+            format!("{box_km:.0} km 3D box"),
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_rgb(220, 240, 255),
+        );
+    }
+
+    fn apply_vol3d_map_box_selection(
+        &mut self,
+        rect: egui::Rect,
+        drag: Vol3dMapBoxDrag,
+        ctx: &egui::Context,
+    ) -> bool {
+        if self.volume.is_none() {
+            self.status = "Load radar data before selecting a 3D volume box".to_owned();
+            return false;
+        }
+        let start = Self::clamp_screen_position_to_rect(rect, drag.start);
+        let current = Self::clamp_screen_position_to_rect(rect, drag.current);
+        let selection = egui::Rect::from_two_pos(start, current);
+        if selection.width() < VOL3D_BOX_DRAG_MIN_PX || selection.height() < VOL3D_BOX_DRAG_MIN_PX {
+            return false;
+        }
+        let Some((radar_lat, radar_lon)) = self.radar_location() else {
+            self.status = "No radar location for 3D volume selection".to_owned();
+            return false;
+        };
+        let (center_lon, center_lat) = self.screen_to_lon_lat(rect, selection.center());
+        let km_per_px = 111.32 / self.map_scale.max(f32::EPSILON);
+        let half_km = (selection.width().max(selection.height()) * 0.5 * km_per_px)
+            .clamp(VOL3D_BOX_DRAG_MIN_HALF_KM, VOL3D_BOX_DRAG_MAX_HALF_KM);
+        let (east_km, north_km) = aeqd_forward_km(
+            radar_lat as f64,
+            radar_lon as f64,
+            center_lat as f64,
+            center_lon as f64,
+        );
+
+        self.vol3d.box_target_lonlat = Some((center_lat, center_lon));
+        self.vol3d.box_half_km = half_km;
+        self.vol3d.box_center_east_km = east_km as f32;
+        self.vol3d.box_center_north_km = north_km as f32;
+        self.vol3d.volume_key = None;
+        self.vol3d.resample_rx = None;
+        self.vol3d.status = format!("resampling selected {:.0} km 3D box...", half_km * 2.0);
+        self.clear_vol3d_texture();
+        self.open_viewer(dock::WorkspacePane::Vol3d);
+        ctx.request_repaint();
+        true
+    }
+
     fn single_pane_canvas(
         &mut self,
         ui: &mut egui::Ui,
@@ -22923,11 +23548,18 @@ impl ViewerApp {
         } else {
             false
         };
+        let vol3d_box_drag_owns_pointer = self.handle_vol3d_map_box_drag_input(
+            ui,
+            rect,
+            response,
+            !armed && !vrot_armed && !annotating && !cross_section_handle_owns_pointer,
+        );
 
         if !armed
             && !vrot_armed
             && !annotating
             && !cross_section_handle_owns_pointer
+            && !vol3d_box_drag_owns_pointer
             && response.dragged()
         {
             let delta = response.drag_delta();
@@ -22984,6 +23616,7 @@ impl ViewerApp {
         } else if !self.cross_section_armed
             && !self.vrot_tool_armed
             && !cross_section_handle_owns_pointer
+            && !vol3d_box_drag_owns_pointer
             && plain_context_menu_allowed(
                 ui.input(|input| input.modifiers),
                 self.app_settings.right_click_loads_nearest,
@@ -23133,6 +23766,7 @@ impl ViewerApp {
             && !self.vrot_tool_armed
             && !self.farm.drape.place_armed
             && !cross_section_handle_owns_pointer
+            && !vol3d_box_drag_owns_pointer
             && response.secondary_clicked()
             && let Some(pointer) = response.interact_pointer_pos()
         {
@@ -23166,6 +23800,7 @@ impl ViewerApp {
             && !vrot_armed
             && !annotating
             && !cross_section_handle_owns_pointer
+            && !vol3d_box_drag_owns_pointer
             && plain_click
             && response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
@@ -23315,6 +23950,7 @@ impl ViewerApp {
         self.draw_mode_chip(painter, rect);
         self.draw_raw_velocity_tag(painter, rect);
         self.draw_cross_section_line(painter, rect, response.hover_pos());
+        self.draw_vol3d_map_box_drag(painter, rect);
         self.draw_center_crosshair(painter, rect);
         self.draw_cursor_inspector(painter, rect, response.hover_pos());
         self.show_community_feed_menu(ui, rect);
@@ -23387,12 +24023,19 @@ impl ViewerApp {
             } else {
                 false
             };
+            let vol3d_box_drag_owns_pointer = self.handle_vol3d_map_box_drag_input(
+                ui,
+                cell,
+                &response,
+                !armed && !vrot_armed && !annotation_active && !cross_section_handle_owns_pointer,
+            );
 
             // Shared pan: dragging any cell moves every pane in sync.
             if !armed
                 && !vrot_armed
                 && !annotation_active
                 && !cross_section_handle_owns_pointer
+                && !vol3d_box_drag_owns_pointer
                 && response.dragged()
             {
                 let delta = response.drag_delta();
@@ -23468,6 +24111,7 @@ impl ViewerApp {
                 && !vrot_armed
                 && !annotation_active
                 && !cross_section_handle_owns_pointer
+                && !vol3d_box_drag_owns_pointer
                 && shift_held
                 && response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
@@ -23479,6 +24123,7 @@ impl ViewerApp {
                 && !vrot_armed
                 && !annotation_active
                 && !cross_section_handle_owns_pointer
+                && !vol3d_box_drag_owns_pointer
                 && alt_model_sounding
             {
                 let pointer = if modifiers.ctrl {
@@ -23497,6 +24142,7 @@ impl ViewerApp {
                 && !vrot_armed
                 && !annotation_active
                 && !cross_section_handle_owns_pointer
+                && !vol3d_box_drag_owns_pointer
                 && ctrl_best_radar
                 && response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
@@ -23518,6 +24164,7 @@ impl ViewerApp {
                 && !vrot_armed
                 && !annotation_active
                 && !cross_section_handle_owns_pointer
+                && !vol3d_box_drag_owns_pointer
                 && plain_click
                 && response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
@@ -23569,6 +24216,7 @@ impl ViewerApp {
                 && !vrot_armed
                 && !annotation_active
                 && !cross_section_handle_owns_pointer
+                && !vol3d_box_drag_owns_pointer
                 && response.secondary_clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
@@ -23632,6 +24280,7 @@ impl ViewerApp {
                 && !annotation_active
                 && !self.farm.drape.place_armed
                 && !cross_section_handle_owns_pointer
+                && !vol3d_box_drag_owns_pointer
                 && plain_context_menu_allowed(
                     modifiers,
                     self.app_settings.right_click_loads_nearest,
@@ -23786,6 +24435,7 @@ impl ViewerApp {
                 cell,
                 hovers.get(cell_index).copied().flatten(),
             );
+            self.draw_vol3d_map_box_drag(&cell_painter, cell);
             self.draw_center_crosshair(&cell_painter, cell);
             self.draw_vrot_tool(&cell_painter, cell);
             self.pane_info_bar(ui, &cell_painter, cell, cell_index, &pane_product, pane_cut);
@@ -26701,7 +27351,7 @@ impl ViewerApp {
                     *value = if delta.abs() > 0.05 { *delta } else { f32::NAN };
                     max_abs = max_abs.max(delta.abs());
                 }
-                delta_field.key.var = format!("{} (OA Δ)", field.key.var);
+                delta_field.key.var = format!("{} (OA Î”)", field.key.var);
                 delta_field.units = field.units.clone();
                 delta_field.style = None;
                 let span = max_abs.clamp(1.0, 8.0);
@@ -29460,97 +30110,235 @@ impl ViewerApp {
         }
     }
 
-    /// Render the lowest usable reflectivity sweep onto the exact horizontal
-    /// footprint of the 3D box. The ordinary viewport raster keeps native
-    /// polar-gate geometry and the user's REF palette; the shader lays this
-    /// RGBA image on z=0 behind the direct-volume render.
-    fn vol3d_floor_image(
-        volume: &RadarVolume,
-        center_east_km: f32,
-        center_north_km: f32,
-        half_km: f32,
-        color_tables: &ColorTableSet,
-    ) -> Option<(Vec<u8>, f32)> {
-        let n = vol3d::FLOOR_N;
-        if n < 2 || !half_km.is_finite() || half_km <= 0.0 {
-            return None;
+    fn vol3d_product_value_range(&self, product: &DisplayProduct) -> (f32, f32) {
+        let table = self.vol3d_color_table_for_product(product);
+        let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
+        for stop in table.stops() {
+            low = low.min(stop.value);
+            high = high.max(stop.value);
         }
-        let km_per_px = half_km * 2.0 / (n - 1) as f32;
-        let options = ViewportRasterOptions {
-            width: n as u32,
-            height: n as u32,
-            radar_x_px: 0.5 + (half_km - center_east_km) / km_per_px,
-            radar_y_px: 0.5 + (half_km + center_north_km) / km_per_px,
-            km_per_px_x: km_per_px,
-            km_per_px_y: km_per_px,
-            rotation_rad: 0.0,
-        };
-
-        let mut cuts = volume
-            .cuts
-            .iter()
-            .enumerate()
-            .filter(|(_, cut)| {
-                cut.elevation_deg.is_finite() && cut.moments.contains_key(&MomentType::Reflectivity)
-            })
-            .map(|(index, cut)| (index, cut.elevation_deg))
-            .collect::<Vec<_>>();
-        cuts.sort_by(|left, right| left.1.total_cmp(&right.1));
-
-        for (cut_index, elevation_deg) in cuts {
-            let Ok(cache) = ViewportMomentCache::new_with_color_tables(
-                volume,
-                cut_index,
-                MomentType::Reflectivity,
-                color_tables,
-            ) else {
-                continue;
-            };
-            let mut rgba = vec![0; n * n * 4];
-            if cache
-                .render_moment_rgba_into(volume, options, &mut rgba)
-                .is_ok()
-            {
-                return Some((rgba, elevation_deg));
-            }
+        if low.is_finite() && high.is_finite() && high > low {
+            (low, high)
+        } else {
+            (0.0, 80.0)
         }
-        None
     }
 
-    /// 3D Volume Explorer window: background box resample of the current
-    /// volume around the view center, GPU raymarched via a glow paint
-    /// callback (docs/xsection-3d-spec.md: GR2A-style direct volume
-    /// rendering with an alpha transfer function - not marching cubes).
+    fn vol3d_color_table_for_product(&self, product: &DisplayProduct) -> ColorTable {
+        let mut render_tables = self.color_tables.clone();
+        if let Some(table) = self.palette_product_overrides.get(product.label()) {
+            render_tables.set_family(product.color_family(), table.clone());
+        }
+        if self.flip_velocity_color_polarity && product.color_family() == ColorTableFamily::Velocity
+        {
+            let current = render_tables.for_family(ColorTableFamily::Velocity);
+            render_tables.set_family(
+                ColorTableFamily::Velocity,
+                current.mirrored_values(format!("{} (flipped)", current.name())),
+            );
+        }
+        render_tables.for_family(product.color_family()).clone()
+    }
+
+    fn vol3d_default_threshold(product: &DisplayProduct, value_min: f32, value_max: f32) -> f32 {
+        match product.color_family() {
+            ColorTableFamily::Reflectivity => 35.0_f32.clamp(value_min, value_max),
+            _ => value_min,
+        }
+    }
+
+    fn vol3d_interp_policy(moment: &MomentType) -> render2d::InterpPolicy {
+        match moment {
+            MomentType::Velocity => render2d::InterpPolicy::VelocityGuard,
+            MomentType::CorrelationCoefficient => render2d::InterpPolicy::CcGuard,
+            _ => render2d::InterpPolicy::LinearAngle,
+        }
+    }
+
+    fn normalized_vol3d_value(value: f32, value_min: f32, value_max: f32) -> f32 {
+        let span = (value_max - value_min).abs().max(f32::EPSILON);
+        ((value - value_min) / span).clamp(0.0, 1.0)
+    }
+
+    fn clear_vol3d_texture(&mut self) {
+        if let Ok(mut pending) = self.vol3d.pending.lock() {
+            pending.volume = Some(vol3d::empty_box());
+        }
+    }
+
+    fn vol3d_complete_source_volume_for(
+        &self,
+        volume: Arc<RadarVolume>,
+        moment: &MomentType,
+    ) -> Option<Arc<RadarVolume>> {
+        let current_identity = frame_identity_for_volume(volume.as_ref());
+        let matches_current = |frame: &&FrameHistoryEntry| {
+            frame.identity == current_identity || Arc::ptr_eq(&frame.volume, &volume)
+        };
+        let current_status = self
+            .selected_frame()
+            .filter(|frame| matches_current(frame))
+            .or_else(|| self.frame_history.iter().rev().find(matches_current))
+            .map(|frame| frame.status);
+        if current_status != Some(FrameStatus::LivePartial) {
+            return Some(volume);
+        }
+        let current_site = volume.site.id.as_str();
+        self.frame_history
+            .iter()
+            .rev()
+            .find(|candidate| {
+                candidate.status != FrameStatus::LivePartial
+                    && candidate.volume.site.id == current_site
+                    && candidate
+                        .volume
+                        .cuts
+                        .iter()
+                        .any(|cut| cut.moments.contains_key(moment))
+            })
+            .map(|candidate| Arc::clone(&candidate.volume))
+    }
+
+    fn update_vol3d_lut(
+        &mut self,
+        ctx: &egui::Context,
+        product: &DisplayProduct,
+        value_min: f32,
+        value_max: f32,
+    ) {
+        // Follow the active product palette, including per-product bindings
+        // and velocity polarity, but deliberately do not inherit the 2D
+        // display-threshold clamp: the 3D transfer function is independent.
+        let table = self.vol3d_color_table_for_product(product);
+        let mut lut = vec![0u8; 256 * 4];
+        for (index, pixel) in lut.chunks_exact_mut(4).enumerate() {
+            let fraction = index as f32 / 255.0;
+            let value = value_min + (value_max - value_min) * fraction;
+            pixel.copy_from_slice(&table.color_for_value(value));
+        }
+        let mut hasher = DefaultHasher::new();
+        lut.hash(&mut hasher);
+        let signature = hasher.finish();
+        if signature == self.vol3d.lut_signature {
+            return;
+        }
+        let pending = Arc::clone(&self.vol3d.pending);
+        let uploaded = if let Ok(mut pending) = pending.lock() {
+            pending.lut = Some(lut);
+            true
+        } else {
+            false
+        };
+        if uploaded {
+            self.vol3d.lut_signature = signature;
+            ctx.request_repaint();
+        }
+    }
+
+    /// 3D Volume Explorer window: background Cartesian resampling, a raw
+    /// low-level floor PPI on the same footprint, and GPU direct-volume
+    /// rendering. The floor, box, grid, and annotations all share one camera
+    /// transform so the underlay remains locked to z=0 at every pane aspect.
     fn vol3d_window(&mut self, ctx: &egui::Context) {
         if !self.vol3d.open {
             return;
         }
-        if let Some(volume) = self.volume.clone()
-            && let Some((radar_lat, radar_lon)) = self.radar_location()
-        {
-            let center_east =
-                (self.map_center_lon - radar_lon) * 111.32 * radar_lat.to_radians().cos();
-            let center_north = (self.map_center_lat - radar_lat) * 111.32;
+        let vol3d_product = self.selected_product.clone();
+        let vol3d_moment = vol3d_product.base_moment();
+        let product_label = vol3d_product.label().to_owned();
+        let (value_min, value_max) = self.vol3d_product_value_range(&vol3d_product);
+        if self.vol3d.product_label != product_label {
+            self.vol3d.product_label = product_label.clone();
+            self.vol3d.threshold_dbz =
+                Self::vol3d_default_threshold(&vol3d_product, value_min, value_max);
+            self.vol3d.floor_threshold_dbz = value_min;
+            self.vol3d.volume_key = None;
+            self.vol3d.resample_rx = None;
+            self.vol3d.status = format!("resampling {product_label} 3D volume…");
+            self.clear_vol3d_texture();
+            ctx.request_repaint();
+        }
+        self.update_vol3d_lut(ctx, &vol3d_product, value_min, value_max);
+
+        if let Some(current_volume) = self.volume.clone() {
+            if self
+                .vol3d
+                .volume_key
+                .as_ref()
+                .is_some_and(|(site_id, ..)| site_id != &current_volume.site.id)
+            {
+                self.vol3d.volume_key = None;
+                self.vol3d.resample_rx = None;
+                self.vol3d.last_top_deg = 0.0;
+                self.clear_vol3d_texture();
+            }
+            let Some(volume) =
+                self.vol3d_complete_source_volume_for(current_volume.clone(), &vol3d_moment)
+            else {
+                self.vol3d.volume_key = None;
+                self.vol3d.resample_rx = None;
+                self.vol3d.last_top_deg = 0.0;
+                self.vol3d.status = format!(
+                    "waiting for complete {} volume before 3D resample...",
+                    current_volume.site.id
+                );
+                self.clear_vol3d_texture();
+                ctx.request_repaint_after(Duration::from_millis(250));
+                if self.workspace.is_docked(dock::WorkspacePane::Vol3d) {
+                    return;
+                }
+                let mut open = self.vol3d.open;
+                egui::Window::new("Volume Explorer (3D)")
+                    .open(&mut open)
+                    .default_size([900.0, 700.0])
+                    .min_size([520.0, 420.0])
+                    .resizable(true)
+                    .show(ctx, |ui| {
+                        self.dock_toggle_row(ui, dock::WorkspacePane::Vol3d);
+                        self.vol3d_pane_body(ui);
+                    });
+                self.set_viewer_open(dock::WorkspacePane::Vol3d, open);
+                return;
+            };
+            let radar_lat = volume.site.latitude_deg;
+            let radar_lon = volume.site.longitude_deg;
+            let Some((radar_lat, radar_lon)) = radar_lat.zip(radar_lon) else {
+                return;
+            };
+            let (target_lat, target_lon) = self
+                .vol3d
+                .box_target_lonlat
+                .unwrap_or((self.map_center_lat, self.map_center_lon));
+            let (center_east, center_north) = aeqd_forward_km(
+                radar_lat as f64,
+                radar_lon as f64,
+                target_lat as f64,
+                target_lon as f64,
+            );
+            let center_east = center_east as f32;
+            let center_north = center_north as f32;
+            self.vol3d.box_center_east_km = center_east;
+            self.vol3d.box_center_north_km = center_north;
+
             // Vertical completeness gate: a live volume whose first chunks
-            // cover one sector of one tilt must NOT bake a fragment box
-            // (field report: corner-blob render mid-SAILS). Hold until the
-            // top tilt reaches the previous volume's top; the key includes
-            // the top so completion re-triggers.
+            // cover one sector of one tilt must not replace a complete box.
             let volume_top_deg = volume
                 .cuts
                 .iter()
-                .filter(|c| c.moments.contains_key(&MomentType::Reflectivity))
-                .map(|c| c.elevation_deg)
+                .filter(|cut| cut.moments.contains_key(&vol3d_moment))
+                .map(|cut| cut.elevation_deg)
                 .fold(0.0f32, f32::max);
             let vertically_ready = volume_top_deg + 0.3 >= self.vol3d.last_top_deg;
             let key = (
+                volume.site.id.clone(),
+                product_label.clone(),
                 volume.volume_time.timestamp_millis(),
                 (volume_top_deg * 10.0) as i32,
                 (center_east / 10.0) as i32,
                 (center_north / 10.0) as i32,
                 self.vol3d.box_half_km as i32,
             );
-            if self.vol3d.volume_key != Some(key) && self.vol3d.resample_rx.is_none() {
+            if self.vol3d.volume_key.as_ref() != Some(&key) && self.vol3d.resample_rx.is_none() {
                 if !vertically_ready {
                     self.vol3d.status = format!(
                         "live volume building (top {volume_top_deg:.1}° / {:.1}°)…",
@@ -29561,15 +30349,16 @@ impl ViewerApp {
                     self.vol3d.last_top_deg = volume_top_deg.max(self.vol3d.last_top_deg.min(20.0));
                     let (sender, receiver) = mpsc::channel();
                     self.vol3d.resample_rx = Some(receiver);
-                    self.vol3d.status = "resampling volume…".to_owned();
+                    self.vol3d.status = format!("resampling {product_label} volume + floor…");
                     let half_km = self.vol3d.box_half_km;
-                    let floor_color_tables = self.render_color_tables_for_product(
-                        &DisplayProduct::Moment(MomentType::Reflectivity),
-                    );
                     let ctx_clone = ctx.clone();
+                    let resample_moment = vol3d_moment.clone();
+                    let interp_policy = Self::vol3d_interp_policy(&resample_moment);
                     thread::spawn(move || {
-                        let result = render2d::volume_box_resample(
+                        let result = render2d::volume_box_resample_moment(
                             &volume,
+                            &resample_moment,
+                            interp_policy,
                             center_east,
                             center_north,
                             half_km,
@@ -29578,16 +30367,23 @@ impl ViewerApp {
                             vol3d::BOX_TOP_M,
                         )
                         .map(|values| {
-                            let mut volume_box =
-                                vol3d::normalize_box(&values, vol3d::BOX_N, vol3d::BOX_NZ);
-                            if let Some((rgba, elevation_deg)) = Self::vol3d_floor_image(
+                            let mut volume_box = vol3d::normalize_box_with_range(
+                                &values,
+                                vol3d::BOX_N,
+                                vol3d::BOX_NZ,
+                                value_min,
+                                value_max,
+                            );
+                            if let Some((floor_data, elevation_deg)) = vol3d::lowest_moment_floor(
                                 &volume,
+                                &resample_moment,
                                 center_east,
                                 center_north,
                                 half_km,
-                                &floor_color_tables,
+                                value_min,
+                                value_max,
                             ) {
-                                volume_box.floor_rgba = Some(rgba);
+                                volume_box.floor_data = Some(floor_data);
                                 volume_box.floor_elevation_deg = Some(elevation_deg);
                             }
                             volume_box
@@ -29598,39 +30394,23 @@ impl ViewerApp {
                 }
             }
         }
+
         if let Some(receiver) = &self.vol3d.resample_rx {
             match receiver.try_recv() {
                 Ok(Some(volume_box)) => {
                     self.vol3d.resample_rx = None;
-                    // >=20 dBZ cell count: zero means the box is centered
-                    // off-storm (pan the map there + Re-center), nonzero
-                    // with a black canvas means a GPU-side problem.
-                    let echo_cells = volume_box.data.iter().filter(|&&b| b >= 64).count();
+                    let echo_cells = volume_box.data.iter().filter(|&&value| value > 0).count();
                     let floor_label = volume_box
                         .floor_elevation_deg
-                        .map(|elevation| format!(" - floor {elevation:.1} deg REF"))
-                        .unwrap_or_default();
+                        .map(|elevation| format!(" · floor {elevation:.1}° {product_label}"))
+                        .unwrap_or_else(|| " · no floor sweep".to_owned());
                     self.vol3d.status = format!(
-                        "{} km box · {} cells ≥20 dBZ",
+                        "{product_label} {} km box · {} non-empty voxels{floor_label}",
                         (self.vol3d.box_half_km * 2.0) as i32,
                         echo_cells
                     );
-                    if !floor_label.is_empty() {
-                        self.vol3d.status.push_str(&floor_label);
-                    }
-                    let render_tables = self.render_color_tables_for_product(
-                        &DisplayProduct::Moment(MomentType::Reflectivity),
-                    );
-                    let table = render_tables.for_family(ColorTableFamily::Reflectivity);
-                    let mut lut = [0u8; 256 * 4];
-                    for (i, px) in lut.chunks_exact_mut(4).enumerate() {
-                        let dbz = i as f32 / 255.0 * 80.0;
-                        let c = table.color_for_value(dbz);
-                        px.copy_from_slice(&c);
-                    }
                     if let Ok(mut pending) = self.vol3d.pending.lock() {
                         pending.volume = Some(volume_box);
-                        pending.lut = Some(lut.to_vec());
                     }
                     ctx.request_repaint();
                 }
@@ -29639,17 +30419,21 @@ impl ViewerApp {
                     self.vol3d.status = "no volume data in the box".to_owned();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => self.vol3d.resample_rx = None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.vol3d.resample_rx = None;
+                    self.vol3d.status = "3D resample worker disconnected".to_owned();
+                }
             }
         }
+
         if self.workspace.is_docked(dock::WorkspacePane::Vol3d) {
-            return; // body renders as a workspace pane
+            return;
         }
         let mut open = self.vol3d.open;
         egui::Window::new("Volume Explorer (3D)")
             .open(&mut open)
-            .default_size([760.0, 620.0])
-            .min_size([420.0, 360.0])
+            .default_size([900.0, 700.0])
+            .min_size([520.0, 420.0])
             .resizable(true)
             .show(ctx, |ui| {
                 self.dock_toggle_row(ui, dock::WorkspacePane::Vol3d);
@@ -29658,177 +30442,577 @@ impl ViewerApp {
         self.set_viewer_open(dock::WorkspacePane::Vol3d, open);
     }
 
-    /// 3D Volume Explorer body (slider strip + wgpu raymarch paint
-    /// callback + wireframe box), window and pane alike — the callback
-    /// takes an explicit rect, so a pane `Ui` supplies it the same way
-    /// the window did (memo §2 item 6, Rerun precedent).
-    fn vol3d_pane_body(&mut self, ui: &mut egui::Ui) {
-        {
-            ui.horizontal(|ui| {
-                ui.label("Threshold");
-                ui.add(egui::Slider::new(&mut self.vol3d.threshold_dbz, 0.0..=70.0).suffix(" dBZ"));
-                ui.label("Opacity");
-                ui.add(egui::Slider::new(&mut self.vol3d.opacity, 0.05..=1.0));
-                ui.checkbox(&mut self.vol3d.show_floor, "Floor PPI")
-                    .on_hover_text(
-                        "Paint the lowest usable reflectivity sweep onto the floor of the 3D box",
+    /// 3D Volume Explorer body. Deep controls live in compact expandable
+    /// panels so nested combo boxes do not get closed by parent popup menus.
+    fn vol3d_inline_toolbar_controls_enabled() -> bool {
+        false
+    }
+
+    fn vol3d_volume_controls_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        top_km: f32,
+        value_min: f32,
+        value_max: f32,
+        value_suffix: &str,
+    ) {
+        ui.set_min_width(280.0);
+        ui.label(egui::RichText::new("Transfer function").strong());
+        let mut threshold = self.vol3d.threshold_dbz.clamp(value_min, value_max);
+        ui.add(
+            egui::Slider::new(&mut threshold, value_min..=value_max)
+                .suffix(value_suffix)
+                .text("threshold"),
+        )
+        .on_hover_text("Values at or below this product value are transparent");
+        self.vol3d.threshold_dbz = threshold;
+        ui.add(egui::Slider::new(&mut self.vol3d.opacity, 0.03..=1.0).text("sample opacity"));
+        ui.add(egui::Slider::new(&mut self.vol3d.density, 0.35..=2.5).text("density"))
+            .on_hover_text("How quickly samples accumulate into a solid echo body");
+        ui.add(egui::Slider::new(&mut self.vol3d.shading, 0.0..=1.0).text("lighting"))
+            .on_hover_text("Gradient lighting: 0 is flat palette color, 1 is strongest");
+        egui::ComboBox::from_id_salt("vol3d_quality_panel")
+            .selected_text(self.vol3d.quality.label())
+            .show_ui(ui, |ui| {
+                for quality in vol3d::Vol3dQuality::ALL {
+                    ui.selectable_value(
+                        &mut self.vol3d.quality,
+                        quality,
+                        format!("{} - {} steps", quality.label(), quality.steps()),
                     );
-                ui.add_enabled(
-                    self.vol3d.show_floor,
-                    egui::Slider::new(&mut self.vol3d.floor_opacity, 0.05..=1.0)
-                        .text("floor alpha"),
+                }
+            });
+        ui.separator();
+        ui.label(egui::RichText::new("Vertical clip").strong());
+        ui.add(
+            egui::Slider::new(
+                &mut self.vol3d.clip_bottom_km,
+                0.0..=(top_km - 0.5).max(0.0),
+            )
+            .suffix(" km")
+            .text("bottom"),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.vol3d.clip_top_km, 0.5..=top_km)
+                .suffix(" km")
+                .text("top"),
+        );
+        if self.vol3d.clip_top_km < self.vol3d.clip_bottom_km + 0.5 {
+            self.vol3d.clip_top_km = (self.vol3d.clip_bottom_km + 0.5).min(top_km);
+        }
+        if ui.button("Reset clip").clicked() {
+            self.vol3d.clip_bottom_km = 0.0;
+            self.vol3d.clip_top_km = top_km;
+        }
+    }
+
+    fn vol3d_floor_controls_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        value_min: f32,
+        value_max: f32,
+        value_suffix: &str,
+    ) {
+        ui.set_min_width(280.0);
+        ui.label(egui::RichText::new("Ground underlay").strong());
+        egui::ComboBox::from_id_salt("vol3d_floor_mode_panel")
+            .selected_text(self.vol3d.floor_mode.label())
+            .show_ui(ui, |ui| {
+                for mode in vol3d::FloorMode::ALL {
+                    ui.selectable_value(&mut self.vol3d.floor_mode, mode, mode.label());
+                }
+            });
+        let enabled = self.vol3d.floor_mode != vol3d::FloorMode::Off;
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.add(egui::Slider::new(&mut self.vol3d.floor_opacity, 0.02..=1.0).text("opacity"));
+            let mut floor_threshold = self.vol3d.floor_threshold_dbz.clamp(value_min, value_max);
+            ui.add(
+                egui::Slider::new(&mut floor_threshold, value_min..=value_max)
+                    .suffix(value_suffix)
+                    .text("threshold"),
+            );
+            self.vol3d.floor_threshold_dbz = floor_threshold;
+        });
+        ui.weak("Lowest tilt paints the best complete low-level PPI. Column max projects the visible 3D slab onto the ground.");
+    }
+
+    fn vol3d_pane_body(&mut self, ui: &mut egui::Ui) {
+        let top_km = self.vol3d.top_km();
+        let vol3d_product = self.selected_product.clone();
+        let vol3d_moment = vol3d_product.base_moment();
+        let (value_min, value_max) = self.vol3d_product_value_range(&vol3d_product);
+        let value_units = moment_units(&vol3d_moment);
+        let value_suffix = if value_units.is_empty() {
+            String::new()
+        } else {
+            format!(" {value_units}")
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.menu_button("Presets", |ui| {
+                ui.set_min_width(180.0);
+                if ui.button("Balanced").clicked() {
+                    self.vol3d.apply_balanced_preset();
+                    ui.close();
+                }
+                if ui.button("Storm structure").clicked() {
+                    self.vol3d.apply_structure_preset();
+                    ui.close();
+                }
+                if ui.button("Core isolation").clicked() {
+                    self.vol3d.apply_core_preset();
+                    ui.close();
+                }
+            });
+
+            if ui
+                .selectable_label(self.vol3d.show_volume_controls, "Volume")
+                .clicked()
+            {
+                self.vol3d.show_volume_controls = !self.vol3d.show_volume_controls;
+            }
+            if Self::vol3d_inline_toolbar_controls_enabled() && self.vol3d.show_volume_controls {
+                ui.vertical(|ui| {
+                ui.set_min_width(280.0);
+                ui.label(egui::RichText::new("Transfer function").strong());
+                let mut threshold = self.vol3d.threshold_dbz.clamp(value_min, value_max);
+                ui.add(
+                    egui::Slider::new(&mut threshold, value_min..=value_max)
+                        .suffix(value_suffix.as_str())
+                        .text("threshold"),
+                )
+                .on_hover_text("Values at or below this product value are transparent");
+                self.vol3d.threshold_dbz = threshold;
+                ui.add(
+                    egui::Slider::new(&mut self.vol3d.opacity, 0.03..=1.0).text("sample opacity"),
                 );
-                let mut size_km = (self.vol3d.box_half_km * 2.0) as i32;
-                egui::ComboBox::from_id_salt("vol3d_size")
-                    .selected_text(format!("{size_km} km"))
-                    .width(74.0)
+                ui.add(egui::Slider::new(&mut self.vol3d.density, 0.35..=2.5).text("density"))
+                    .on_hover_text("How quickly samples accumulate into a solid echo body");
+                ui.add(egui::Slider::new(&mut self.vol3d.shading, 0.0..=1.0).text("lighting"))
+                    .on_hover_text("Gradient lighting: 0 is flat palette color, 1 is strongest");
+                egui::ComboBox::from_id_salt("vol3d_quality")
+                    .selected_text(self.vol3d.quality.label())
                     .show_ui(ui, |ui| {
-                        for option in [120, 240, 360] {
-                            ui.selectable_value(&mut size_km, option, format!("{option} km"));
+                        for quality in vol3d::Vol3dQuality::ALL {
+                            ui.selectable_value(
+                                &mut self.vol3d.quality,
+                                quality,
+                                format!("{} · {} steps", quality.label(), quality.steps()),
+                            );
                         }
                     });
-                if (size_km as f32 / 2.0 - self.vol3d.box_half_km).abs() > 0.5 {
-                    self.vol3d.box_half_km = size_km as f32 / 2.0;
-                    self.vol3d.volume_key = None; // re-resample at the new size
+                ui.separator();
+                ui.label(egui::RichText::new("Vertical clip").strong());
+                ui.add(
+                    egui::Slider::new(
+                        &mut self.vol3d.clip_bottom_km,
+                        0.0..=(top_km - 0.5).max(0.0),
+                    )
+                    .suffix(" km")
+                    .text("bottom"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.vol3d.clip_top_km, 0.5..=top_km)
+                        .suffix(" km")
+                        .text("top"),
+                );
+                if self.vol3d.clip_top_km < self.vol3d.clip_bottom_km + 0.5 {
+                    self.vol3d.clip_top_km =
+                        (self.vol3d.clip_bottom_km + 0.5).min(top_km);
                 }
-                if ui
-                    .small_button("Re-center")
-                    .on_hover_text("Rebuild the box around the current view center")
-                    .clicked()
-                {
-                    self.vol3d.volume_key = None;
+                if ui.button("Reset clip").clicked() {
+                    self.vol3d.clip_bottom_km = 0.0;
+                    self.vol3d.clip_top_km = top_km;
                 }
-                ui.weak(&self.vol3d.status);
             });
-            let size = ui.available_size();
-            let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-            if response.dragged() {
-                let delta = response.drag_delta();
+            }
+
+            if ui
+                .selectable_label(self.vol3d.show_floor_controls, "Floor")
+                .clicked()
+            {
+                self.vol3d.show_floor_controls = !self.vol3d.show_floor_controls;
+            }
+            if Self::vol3d_inline_toolbar_controls_enabled() && self.vol3d.show_floor_controls {
+                ui.vertical(|ui| {
+                ui.set_min_width(280.0);
+                ui.label(egui::RichText::new("Ground underlay").strong());
+                egui::ComboBox::from_id_salt("vol3d_floor_mode")
+                    .selected_text(self.vol3d.floor_mode.label())
+                    .show_ui(ui, |ui| {
+                        for mode in vol3d::FloorMode::ALL {
+                            ui.selectable_value(&mut self.vol3d.floor_mode, mode, mode.label());
+                        }
+                    });
+                let enabled = self.vol3d.floor_mode != vol3d::FloorMode::Off;
+                ui.add_enabled_ui(enabled, |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.vol3d.floor_opacity, 0.02..=1.0)
+                            .text("opacity"),
+                    );
+                    let mut floor_threshold =
+                        self.vol3d.floor_threshold_dbz.clamp(value_min, value_max);
+                    ui.add(
+                        egui::Slider::new(&mut floor_threshold, value_min..=value_max)
+                            .suffix(value_suffix.as_str())
+                            .text("threshold"),
+                    );
+                    self.vol3d.floor_threshold_dbz = floor_threshold;
+                });
+                ui.separator();
+                ui.weak("Lowest tilt paints the best complete low-level PPI. Column max projects the visible 3D slab onto the ground.");
+            });
+            }
+
+            ui.menu_button("View", |ui| {
+                ui.set_min_width(280.0);
+                ui.add(
+                    egui::Slider::new(&mut self.vol3d.vertical_exaggeration, 0.5..=6.0)
+                        .suffix("×")
+                        .text("vertical exaggeration"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.vol3d.fov_scale, 0.42..=1.1)
+                        .text("field of view"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.vol3d.focus_height_km, 0.0..=top_km)
+                        .suffix(" km")
+                        .text("orbit focus"),
+                );
+                ui.checkbox(&mut self.vol3d.show_grid, "Floor grid");
+                ui.checkbox(&mut self.vol3d.show_box, "Bounding box");
+                ui.checkbox(&mut self.vol3d.show_labels, "Labels + radar marker");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Reset").clicked() {
+                        self.vol3d.reset_camera();
+                    }
+                    if ui.button("Top").clicked() {
+                        self.vol3d.top_view();
+                    }
+                    if ui.button("Low").clicked() {
+                        self.vol3d.low_view();
+                    }
+                });
+            });
+
+            let mut size_km = (self.vol3d.box_half_km * 2.0) as i32;
+            egui::ComboBox::from_id_salt("vol3d_size")
+                .selected_text(format!("{size_km} km box"))
+                .width(104.0)
+                .show_ui(ui, |ui| {
+                    for option in [120, 240, 360] {
+                        ui.selectable_value(&mut size_km, option, format!("{option} km"));
+                    }
+                });
+            if (size_km as f32 / 2.0 - self.vol3d.box_half_km).abs() > 0.5 {
+                self.vol3d.box_half_km = size_km as f32 / 2.0;
+                self.vol3d.volume_key = None;
+                self.vol3d.resample_rx = None;
+                self.vol3d.status = format!("resampling {size_km} km box…");
+                if let Ok(mut pending) = self.vol3d.pending.lock() {
+                    pending.volume = Some(vol3d::empty_box());
+                }
+                ui.ctx().request_repaint();
+            }
+            if ui
+                .small_button("Re-center")
+                .on_hover_text("Rebuild the Cartesian box around the current radar-map center")
+                .clicked()
+            {
+                self.vol3d.box_target_lonlat = Some((self.map_center_lat, self.map_center_lon));
+                self.vol3d.volume_key = None;
+                self.vol3d.resample_rx = None;
+                self.vol3d.status = format!("resampling {} km box…", size_km);
+                if let Ok(mut pending) = self.vol3d.pending.lock() {
+                    pending.volume = Some(vol3d::empty_box());
+                }
+                ui.ctx().request_repaint();
+            }
+            if self.vol3d.box_target_lonlat.is_some()
+                && ui
+                    .small_button("Follow map")
+                    .on_hover_text("Let the 3D box follow the current map center again")
+                    .clicked()
+            {
+                self.vol3d.box_target_lonlat = None;
+                self.vol3d.volume_key = None;
+                self.vol3d.resample_rx = None;
+                self.vol3d.status = "resampling map-centered 3D box…".to_owned();
+                if let Ok(mut pending) = self.vol3d.pending.lock() {
+                    pending.volume = Some(vol3d::empty_box());
+                }
+                ui.ctx().request_repaint();
+            }
+            ui.separator();
+            if self.vol3d.resample_rx.is_some() {
+                ui.spinner();
+            }
+            ui.weak(format!(
+                "{} {:.1}{} · {} · {} · {:.1}× Z",
+                vol3d_product.label(),
+                self.vol3d.threshold_dbz,
+                value_suffix,
+                self.vol3d.floor_mode.label(),
+                self.vol3d.quality.label(),
+                self.vol3d.vertical_exaggeration,
+            ));
+            if !self.vol3d.status.is_empty() {
+                ui.weak(&self.vol3d.status);
+            }
+        });
+
+        if self.vol3d.show_volume_controls || self.vol3d.show_floor_controls {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                if self.vol3d.show_volume_controls {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        self.vol3d_volume_controls_body(
+                            ui,
+                            top_km,
+                            value_min,
+                            value_max,
+                            value_suffix.as_str(),
+                        );
+                    });
+                }
+                if self.vol3d.show_floor_controls {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        self.vol3d_floor_controls_body(
+                            ui,
+                            value_min,
+                            value_max,
+                            value_suffix.as_str(),
+                        );
+                    });
+                }
+            });
+            ui.add_space(4.0);
+        }
+
+        let size = egui::vec2(
+            ui.available_width().max(96.0),
+            ui.available_height().max(96.0),
+        );
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+        let response = response.on_hover_text(
+            "Drag: orbit · Shift-drag: move orbit focus vertically · Wheel: zoom · Double-click: reset view",
+        );
+        if response.dragged() {
+            let (delta, shift) = ui.input(|input| (input.pointer.delta(), input.modifiers.shift));
+            if shift {
+                self.vol3d.focus_height_km =
+                    (self.vol3d.focus_height_km - delta.y * 0.03).clamp(0.0, top_km);
+            } else {
                 self.vol3d.yaw -= delta.x * 0.01;
-                self.vol3d.pitch = (self.vol3d.pitch + delta.y * 0.01).clamp(0.05, 1.45);
+                self.vol3d.pitch = (self.vol3d.pitch + delta.y * 0.01).clamp(0.03, 1.50);
             }
-            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-            if response.hovered() && scroll != 0.0 {
-                self.vol3d.dist = (self.vol3d.dist * (1.0 - scroll * 0.001)).clamp(1.2, 6.0);
+        }
+        if response.double_clicked() {
+            self.vol3d.reset_camera();
+        }
+        let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+        if response.hovered() && scroll != 0.0 {
+            self.vol3d.dist = (self.vol3d.dist * (-scroll * 0.0015).exp()).clamp(1.15, 7.5);
+        }
+        response.context_menu(|ui| {
+            if ui.button("Reset view").clicked() {
+                self.vol3d.reset_camera();
+                ui.close();
             }
-            ui.painter()
-                .add(eframe::egui_wgpu::Callback::new_paint_callback(
-                    rect,
-                    vol3d::Vol3dCallback {
-                        yaw: self.vol3d.yaw,
-                        pitch: self.vol3d.pitch,
-                        dist: self.vol3d.dist,
-                        threshold01: self.vol3d.threshold_dbz / 80.0,
-                        opacity: self.vol3d.opacity,
-                        aspect: (rect.width() / rect.height().max(1.0)).max(0.1),
-                        show_floor: self.vol3d.show_floor,
-                        floor_opacity: self.vol3d.floor_opacity,
-                        pending: Arc::clone(&self.vol3d.pending),
-                    },
-                ));
-            // Wireframe box (same camera math as the shader): always
-            // visible, shows orientation even before data arrives.
-            let project = |p: [f32; 3]| -> egui::Pos2 {
-                let (yaw, pitch, dist) = (self.vol3d.yaw, self.vol3d.pitch, self.vol3d.dist);
-                let (cy, sy) = (yaw.cos(), yaw.sin());
-                let (cp, sp) = (pitch.cos(), pitch.sin());
-                let zspan = 0.6f32;
-                let center = [0.0, 0.0, zspan * 0.35];
-                let eye = [
-                    center[0] + dist * cy * cp,
-                    center[1] + dist * sy * cp,
-                    center[2] + dist * sp,
-                ];
-                let fwd = {
-                    let v = [center[0] - eye[0], center[1] - eye[1], center[2] - eye[2]];
-                    let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-                    [v[0] / l, v[1] / l, v[2] / l]
-                };
-                let right = {
-                    let v = [fwd[1], -fwd[0], 0.0];
-                    let l = (v[0] * v[0] + v[1] * v[1]).sqrt().max(1e-6);
-                    [v[0] / l, v[1] / l, 0.0]
-                };
-                let up = [
-                    right[1] * fwd[2] - right[2] * fwd[1],
-                    right[2] * fwd[0] - right[0] * fwd[2],
-                    right[0] * fwd[1] - right[1] * fwd[0],
-                ];
-                let d = [p[0] - eye[0], p[1] - eye[1], p[2] - eye[2]];
-                let z = d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2];
-                let x = (d[0] * right[0] + d[1] * right[1] + d[2] * right[2]) / z / 0.7;
-                let y = (d[0] * up[0] + d[1] * up[1] + d[2] * up[2]) / z / 0.7;
-                let aspect = (rect.width() / rect.height().max(1.0)).max(0.1);
-                rect.center() + egui::vec2(x / aspect, -y) * (rect.width() * 0.5)
-            };
-            let zs = 0.6f32;
-            let corners = [
-                [-1.0, -1.0, 0.0],
-                [1.0, -1.0, 0.0],
-                [1.0, 1.0, 0.0],
-                [-1.0, 1.0, 0.0],
-                [-1.0, -1.0, zs],
-                [1.0, -1.0, zs],
-                [1.0, 1.0, zs],
-                [-1.0, 1.0, zs],
-            ];
-            let edges = [
-                (0, 1),
-                (1, 2),
-                (2, 3),
-                (3, 0),
-                (4, 5),
-                (5, 6),
-                (6, 7),
-                (7, 4),
-                (0, 4),
-                (1, 5),
-                (2, 6),
-                (3, 7),
-            ];
-            let stroke = egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(140, 150, 165, 110),
-            );
-            for (a, b) in edges {
-                ui.painter()
-                    .line_segment([project(corners[a]), project(corners[b])], stroke);
+            if ui.button("Top view").clicked() {
+                self.vol3d.top_view();
+                ui.close();
             }
-            // Floor grid every 20 km + height ticks: spatial reference.
+            if ui.button("Low-angle view").clicked() {
+                self.vol3d.low_view();
+                ui.close();
+            }
+            ui.separator();
+            ui.checkbox(&mut self.vol3d.show_grid, "Floor grid");
+            ui.checkbox(&mut self.vol3d.show_box, "Bounding box");
+        });
+
+        let (clip_low, clip_high) = self.vol3d.normalized_clip();
+        ui.painter()
+            .add(eframe::egui_wgpu::Callback::new_paint_callback(
+                rect,
+                vol3d::Vol3dCallback {
+                    yaw: self.vol3d.yaw,
+                    pitch: self.vol3d.pitch,
+                    dist: self.vol3d.dist,
+                    threshold01: Self::normalized_vol3d_value(
+                        self.vol3d.threshold_dbz,
+                        value_min,
+                        value_max,
+                    ),
+                    opacity: self.vol3d.opacity,
+                    aspect: (rect.width() / rect.height().max(1.0)).max(0.1),
+                    floor_opacity: self.vol3d.floor_opacity,
+                    floor_mode: self.vol3d.floor_mode,
+                    zspan: self.vol3d.zspan(),
+                    fov_scale: self.vol3d.fov_scale,
+                    quality: self.vol3d.quality,
+                    density: self.vol3d.density,
+                    shading: self.vol3d.shading,
+                    clip_low,
+                    clip_high,
+                    floor_threshold01: Self::normalized_vol3d_value(
+                        self.vol3d.floor_threshold_dbz,
+                        value_min,
+                        value_max,
+                    ),
+                    focus_height: self.vol3d.focus_height_fraction(),
+                    pending: Arc::clone(&self.vol3d.pending),
+                },
+            ));
+
+        // CPU annotations use Vol3d::project_point, the exact companion to
+        // the shader camera. In particular, both axes use viewport height in
+        // pixel space, which locks the grid and PPI to the same ground plane.
+        let project = |point: [f32; 3]| self.vol3d.project_point(rect, point);
+        let draw_segment = |a: [f32; 3], b: [f32; 3], stroke: egui::Stroke| {
+            if let (Some(a), Some(b)) = (project(a), project(b)) {
+                ui.painter().line_segment([a, b], stroke);
+            }
+        };
+        let zspan = self.vol3d.zspan();
+        let corners = [
+            [-1.0, -1.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [-1.0, 1.0, 0.0],
+            [-1.0, -1.0, zspan],
+            [1.0, -1.0, zspan],
+            [1.0, 1.0, zspan],
+            [-1.0, 1.0, zspan],
+        ];
+        let edges = [
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 0),
+            (4, 5),
+            (5, 6),
+            (6, 7),
+            (7, 4),
+            (0, 4),
+            (1, 5),
+            (2, 6),
+            (3, 7),
+        ];
+        let box_stroke = egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(145, 157, 175, 125),
+        );
+        if self.vol3d.show_box {
+            for (start, end) in edges {
+                draw_segment(corners[start], corners[end], box_stroke);
+            }
+        }
+
+        if self.vol3d.show_grid {
             let faint = egui::Stroke::new(
-                0.7,
-                egui::Color32::from_rgba_unmultiplied(120, 128, 142, 60),
+                0.75,
+                egui::Color32::from_rgba_unmultiplied(125, 138, 158, 65),
             );
-            let step = 20.0 / self.vol3d.box_half_km;
-            let mut g = -1.0 + step;
-            while g < 0.999 {
-                ui.painter()
-                    .line_segment([project([g, -1.0, 0.0]), project([g, 1.0, 0.0])], faint);
-                ui.painter()
-                    .line_segment([project([-1.0, g, 0.0]), project([1.0, g, 0.0])], faint);
-                g += step;
+            let axis = egui::Stroke::new(
+                0.9,
+                egui::Color32::from_rgba_unmultiplied(155, 169, 190, 90),
+            );
+            let grid_km = if self.vol3d.box_half_km <= 60.0 {
+                20.0
+            } else if self.vol3d.box_half_km <= 120.0 {
+                40.0
+            } else {
+                60.0
+            };
+            let step = grid_km / self.vol3d.box_half_km.max(1.0);
+            let mut offset = -1.0 + step;
+            while offset < 0.999 {
+                draw_segment([offset, -1.0, 0.0], [offset, 1.0, 0.0], faint);
+                draw_segment([-1.0, offset, 0.0], [1.0, offset, 0.0], faint);
+                offset += step;
             }
-            for km in [5.0f32, 10.0, 15.0] {
-                let z = km * 1000.0 / vol3d::BOX_TOP_M * zs;
-                ui.painter().line_segment(
-                    [project([-1.0, -1.0, z]), project([-0.93, -1.0, z])],
-                    stroke,
-                );
+            draw_segment([0.0, -1.0, 0.0], [0.0, 1.0, 0.0], axis);
+            draw_segment([-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], axis);
+        }
+
+        // Draw the active clip boundaries as horizontal outlines so a cutaway
+        // never looks like missing data with no explanation.
+        let clip_stroke = egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(110, 190, 235, 115),
+        );
+        for fraction in [clip_low, clip_high] {
+            if fraction > 0.001 && fraction < 0.999 {
+                let z = fraction * zspan;
+                draw_segment([-1.0, -1.0, z], [1.0, -1.0, z], clip_stroke);
+                draw_segment([1.0, -1.0, z], [1.0, 1.0, z], clip_stroke);
+                draw_segment([1.0, 1.0, z], [-1.0, 1.0, z], clip_stroke);
+                draw_segment([-1.0, 1.0, z], [-1.0, -1.0, z], clip_stroke);
+            }
+        }
+
+        if self.vol3d.show_labels {
+            for height_km in [5.0f32, 10.0, 15.0] {
+                if height_km > top_km {
+                    continue;
+                }
+                let z = height_km / top_km * zspan;
+                draw_segment([-1.0, -1.0, z], [-0.93, -1.0, z], box_stroke);
+                if let Some(position) = project([-1.10, -1.0, z]) {
+                    ui.painter().text(
+                        position,
+                        egui::Align2::CENTER_CENTER,
+                        format!("{height_km:.0} km"),
+                        egui::FontId::proportional(10.0),
+                        egui::Color32::from_rgb(176, 187, 204),
+                    );
+                }
+            }
+            if let Some(position) = project([0.0, 1.06, 0.0]) {
                 ui.painter().text(
-                    project([-1.12, -1.0, z]),
+                    position,
                     egui::Align2::CENTER_CENTER,
-                    format!("{km:.0} km"),
-                    egui::FontId::proportional(10.0),
-                    egui::Color32::from_rgb(170, 178, 190),
+                    "N",
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::from_rgb(213, 220, 232),
                 );
             }
-            ui.painter().text(
-                project([0.0, 1.05, 0.0]),
-                egui::Align2::CENTER_CENTER,
-                "N",
-                egui::FontId::proportional(12.0),
-                egui::Color32::from_rgb(200, 205, 215),
-            );
+            if let Some(position) = project([1.06, 0.0, 0.0]) {
+                ui.painter().text(
+                    position,
+                    egui::Align2::CENTER_CENTER,
+                    "E",
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::from_rgb(213, 220, 232),
+                );
+            }
+
+            let radar_x = -self.vol3d.box_center_east_km / self.vol3d.box_half_km.max(1.0);
+            let radar_y = -self.vol3d.box_center_north_km / self.vol3d.box_half_km.max(1.0);
+            if radar_x.abs() <= 1.0
+                && radar_y.abs() <= 1.0
+                && let Some(position) = project([radar_x, radar_y, 0.0])
+            {
+                ui.painter()
+                    .circle_filled(position, 3.5, egui::Color32::from_rgb(235, 238, 245));
+                ui.painter().circle_stroke(
+                    position,
+                    6.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 175, 235)),
+                );
+                if let Some(volume) = &self.volume {
+                    ui.painter().text(
+                        position + egui::vec2(8.0, -7.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        &volume.site.id,
+                        egui::FontId::proportional(10.0),
+                        egui::Color32::from_rgb(218, 226, 238),
+                    );
+                }
+            }
         }
     }
 
@@ -33748,7 +34932,7 @@ impl ViewerApp {
             return;
         };
         let label = custom_poll_entry_label(&entry);
-        self.status = format!("Polling {label} Â· custom feed");
+        self.status = format!("Polling {label} · custom feed");
         self.start_known_feed_poll(&entry.poll_url);
     }
 
@@ -33824,9 +35008,9 @@ impl ViewerApp {
             if is_hovered && !is_active {
                 let site_id = entry.site_id.trim();
                 let text = if site_id.is_empty() {
-                    format!("{label} Â· custom feed â€” click to live-poll")
+                    format!("{label} · custom feed — click to live-poll")
                 } else {
-                    format!("{site_id} {label} Â· custom feed â€” click to live-poll")
+                    format!("{site_id} {label} · custom feed — click to live-poll")
                 };
                 let width = 12.0 + text.chars().count() as f32 * 6.6;
                 let chip = egui::Rect::from_min_size(
@@ -40829,26 +42013,59 @@ fn displayable_cuts_for_product(volume: &RadarVolume, product: &DisplayProduct) 
         .collect()
 }
 
+#[cfg(test)]
 fn low_sweep_cuts_for_product(
     volume: &RadarVolume,
     product: &DisplayProduct,
     filter: LowSweepLoopFilter,
 ) -> Vec<usize> {
+    sweep_cuts_for_product(volume, product, legacy_sweep_policy(filter))
+}
+
+fn sweep_cuts_for_product(
+    volume: &RadarVolume,
+    product: &DisplayProduct,
+    policy: SweepPolicy,
+) -> Vec<usize> {
+    let policy = policy.normalized();
+    if policy.mode == SweepPolicyMode::Off {
+        return Vec::new();
+    }
+    let min_elevation = policy.min_elevation_deg();
+    let max_elevation = policy.max_elevation_deg();
     let mut cuts = (0..volume.cuts.len())
         .filter(|index| {
             volume.cuts.get(*index).is_some_and(|cut| {
-                is_complete_live_low_level_tilt_for_site(cut, &volume.site.id)
-                    && is_displayable_on_cut(volume, *index, product)
+                let complete = match policy.mode {
+                    SweepPolicyMode::Range => {
+                        is_complete_live_candidate_tilt_for_site(cut, &volume.site.id)
+                    }
+                    SweepPolicyMode::Off => false,
+                    SweepPolicyMode::AllLow
+                    | SweepPolicyMode::BaseOnly
+                    | SweepPolicyMode::SameLevel => {
+                        is_complete_live_low_level_tilt_for_site(cut, &volume.site.id)
+                    }
+                };
+                let in_range = policy.mode != SweepPolicyMode::Range
+                    || (cut.elevation_deg.is_finite()
+                        && cut.elevation_deg >= min_elevation
+                        && cut.elevation_deg <= max_elevation);
+                complete && in_range && is_displayable_on_cut(volume, *index, product)
             })
         })
         .collect::<Vec<_>>();
-    cuts.sort_by_key(|index| {
-        cut_start_time_utc(volume, *index).unwrap_or_else(|| volume.volume_time.with_timezone(&Utc))
+    cuts.sort_by(|left, right| {
+        let left_time = cut_start_time_utc(volume, *left)
+            .unwrap_or_else(|| volume.volume_time.with_timezone(&Utc));
+        let right_time = cut_start_time_utc(volume, *right)
+            .unwrap_or_else(|| volume.volume_time.with_timezone(&Utc));
+        left_time.cmp(&right_time).then_with(|| left.cmp(right))
     });
 
-    match filter {
-        LowSweepLoopFilter::All => {}
-        LowSweepLoopFilter::BaseOnly => {
+    match policy.mode {
+        SweepPolicyMode::Off | SweepPolicyMode::AllLow | SweepPolicyMode::Range => {}
+        SweepPolicyMode::BaseOnly => {
             if let Some(min_elevation) = cuts
                 .iter()
                 .filter_map(|index| volume.cuts.get(*index).map(|cut| cut.elevation_deg))
@@ -40863,7 +42080,7 @@ fn low_sweep_cuts_for_product(
                 });
             }
         }
-        LowSweepLoopFilter::SameLevel => {
+        SweepPolicyMode::SameLevel => {
             cuts = same_elevation_low_sweep_cuts(volume, &cuts);
         }
     }
@@ -40922,48 +42139,76 @@ fn same_elevation_low_sweep_cuts(volume: &RadarVolume, cuts: &[usize]) -> Vec<us
         .collect()
 }
 
+#[cfg(test)]
 fn low_sweep_cuts_for_history_entry(
     frame: &FrameHistoryEntry,
     product: &DisplayProduct,
     filter: LowSweepLoopFilter,
     disabled_cuts: &BTreeSet<LowSweepCutKey>,
 ) -> Vec<usize> {
-    low_sweep_cuts_for_volume_identity(
+    sweep_cuts_for_history_entry(frame, product, legacy_sweep_policy(filter), disabled_cuts)
+}
+
+fn sweep_cuts_for_history_entry(
+    frame: &FrameHistoryEntry,
+    product: &DisplayProduct,
+    policy: SweepPolicy,
+    disabled_cuts: &BTreeSet<LowSweepCutKey>,
+) -> Vec<usize> {
+    sweep_cuts_for_volume_identity(
         frame.volume.as_ref(),
         &frame.identity,
         product,
-        filter,
+        policy,
         disabled_cuts,
     )
 }
 
-fn low_sweep_cut_at_or_before_in_frame(
+fn next_frame_index_with_sweep_cuts(
+    frames: &[FrameHistoryEntry],
+    selected_frame_index: usize,
+    product: &DisplayProduct,
+    policy: SweepPolicy,
+    disabled_cuts: &BTreeSet<LowSweepCutKey>,
+) -> Option<usize> {
+    if frames.is_empty() {
+        return None;
+    }
+    (1..=frames.len())
+        .map(|offset| (selected_frame_index + offset) % frames.len())
+        .find(|index| {
+            !sweep_cuts_for_history_entry(&frames[*index], product, policy, disabled_cuts)
+                .is_empty()
+        })
+}
+
+fn sweep_cut_at_or_before_in_frame(
     frame: &FrameHistoryEntry,
     product: &DisplayProduct,
-    filter: LowSweepLoopFilter,
+    policy: SweepPolicy,
     disabled_cuts: &BTreeSet<LowSweepCutKey>,
     timeline_time: DateTime<Utc>,
 ) -> Option<usize> {
-    low_sweep_history_cut_at_or_before(
+    sweep_history_cut_at_or_before(
         std::slice::from_ref(frame),
         product,
-        filter,
+        policy,
         disabled_cuts,
         timeline_time,
     )
     .map(|(_, cut)| cut)
 }
 
-fn low_sweep_history_cut_at_or_before(
+fn sweep_history_cut_at_or_before(
     frames: &[FrameHistoryEntry],
     product: &DisplayProduct,
-    filter: LowSweepLoopFilter,
+    policy: SweepPolicy,
     disabled_cuts: &BTreeSet<LowSweepCutKey>,
     timeline_time: DateTime<Utc>,
 ) -> Option<(usize, usize)> {
     let mut best: Option<(DateTime<Utc>, usize, usize)> = None;
     for (frame_index, frame) in frames.iter().enumerate() {
-        for cut in low_sweep_cuts_for_history_entry(frame, product, filter, disabled_cuts) {
+        for cut in sweep_cuts_for_history_entry(frame, product, policy, disabled_cuts) {
             let cut_time = cut_start_time_utc(frame.volume.as_ref(), cut)
                 .unwrap_or(frame.identity.scan_time_utc);
             if cut_time <= timeline_time
@@ -40978,19 +42223,19 @@ fn low_sweep_history_cut_at_or_before(
     best.map(|(_, frame_index, cut)| (frame_index, cut))
 }
 
-fn low_sweep_history_cut_at_or_before_near_elevation(
+fn sweep_history_cut_at_or_before_near_elevation(
     frames: &[FrameHistoryEntry],
     product: &DisplayProduct,
-    filter: LowSweepLoopFilter,
+    policy: SweepPolicy,
     disabled_cuts: &BTreeSet<LowSweepCutKey>,
     timeline_time: DateTime<Utc>,
     target_elevation_deg: Option<f32>,
 ) -> Option<(usize, usize)> {
     let Some(target_elevation_deg) = target_elevation_deg else {
-        return low_sweep_history_cut_at_or_before(
+        return sweep_history_cut_at_or_before(
             frames,
             product,
-            filter,
+            policy,
             disabled_cuts,
             timeline_time,
         );
@@ -40999,7 +42244,7 @@ fn low_sweep_history_cut_at_or_before_near_elevation(
     let mut matched: Option<(DateTime<Utc>, f32, usize, usize)> = None;
     let mut fallback: Option<(DateTime<Utc>, usize, usize)> = None;
     for (frame_index, frame) in frames.iter().enumerate() {
-        for cut in low_sweep_cuts_for_history_entry(frame, product, filter, disabled_cuts) {
+        for cut in sweep_cuts_for_history_entry(frame, product, policy, disabled_cuts) {
             let cut_time = cut_start_time_utc(frame.volume.as_ref(), cut)
                 .unwrap_or(frame.identity.scan_time_utc);
             if cut_time > timeline_time {
@@ -41039,14 +42284,74 @@ fn low_sweep_history_cut_at_or_before_near_elevation(
         .or_else(|| fallback.map(|(_, frame_index, cut)| (frame_index, cut)))
 }
 
-fn low_sweep_cuts_for_volume_identity(
+fn history_cut_at_or_before_near_elevation(
+    frames: &[FrameHistoryEntry],
+    product: &DisplayProduct,
+    timeline_time: DateTime<Utc>,
+    target_elevation_deg: Option<f32>,
+) -> Option<(usize, usize, DateTime<Utc>)> {
+    let elevation_tolerance = LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG * 1.5;
+    let mut matched: Option<(DateTime<Utc>, f32, usize, usize)> = None;
+    let mut fallback: Option<(DateTime<Utc>, f32, usize, usize)> = None;
+
+    for (frame_index, frame) in frames.iter().enumerate() {
+        for cut in displayable_cuts_for_product(frame.volume.as_ref(), product) {
+            let observation_time = cut_start_time_utc(frame.volume.as_ref(), cut)
+                .unwrap_or(frame.identity.scan_time_utc);
+            if !coordinated_observation_is_usable(observation_time, timeline_time) {
+                continue;
+            }
+
+            let delta = frame
+                .volume
+                .cuts
+                .get(cut)
+                .and_then(|cut| {
+                    let target = target_elevation_deg?;
+                    cut.elevation_deg
+                        .is_finite()
+                        .then_some((cut.elevation_deg - target).abs())
+                })
+                .unwrap_or(f32::INFINITY);
+
+            if fallback
+                .as_ref()
+                .is_none_or(|(best_time, best_delta, _, _)| {
+                    observation_time > *best_time
+                        || (observation_time == *best_time && delta < *best_delta)
+                })
+            {
+                fallback = Some((observation_time, delta, frame_index, cut));
+            }
+
+            if delta > elevation_tolerance {
+                continue;
+            }
+            if matched
+                .as_ref()
+                .is_none_or(|(best_time, best_delta, _, _)| {
+                    observation_time > *best_time
+                        || (observation_time == *best_time && delta < *best_delta)
+                })
+            {
+                matched = Some((observation_time, delta, frame_index, cut));
+            }
+        }
+    }
+
+    matched
+        .or(fallback)
+        .map(|(observation_time, _, frame_index, cut)| (frame_index, cut, observation_time))
+}
+
+fn sweep_cuts_for_volume_identity(
     volume: &RadarVolume,
     identity: &FrameIdentity,
     product: &DisplayProduct,
-    filter: LowSweepLoopFilter,
+    policy: SweepPolicy,
     disabled_cuts: &BTreeSet<LowSweepCutKey>,
 ) -> Vec<usize> {
-    low_sweep_cuts_for_product(volume, product, filter)
+    sweep_cuts_for_product(volume, product, policy)
         .into_iter()
         .filter(|cut| !disabled_cuts.contains(&LowSweepCutKey::new(identity, *cut)))
         .collect()
@@ -42809,6 +44114,7 @@ fn coordinated_observation_is_usable(
     (0..=COORDINATED_RADAR_MAX_STALENESS_SECONDS).contains(&age_seconds)
 }
 
+#[cfg(test)]
 fn history_frame_index_at_or_before(
     history: &[FrameHistoryEntry],
     target_utc: DateTime<Utc>,
@@ -42822,29 +44128,6 @@ fn history_frame_index_at_or_before(
     (0..=max_staleness_seconds)
         .contains(&age_seconds)
         .then_some(index)
-}
-
-fn displayable_cut_nearest_elevation(
-    volume: &RadarVolume,
-    product: &DisplayProduct,
-    target_elevation_deg: f32,
-) -> Option<usize> {
-    displayable_cuts_for_product(volume, product)
-        .into_iter()
-        .filter(|cut| {
-            volume
-                .cuts
-                .get(*cut)
-                .is_some_and(|cut| cut.elevation_deg.is_finite())
-        })
-        .min_by(|left, right| {
-            let left_delta = volume.cuts[*left].elevation_deg - target_elevation_deg;
-            let right_delta = volume.cuts[*right].elevation_deg - target_elevation_deg;
-            left_delta
-                .abs()
-                .total_cmp(&right_delta.abs())
-                .then_with(|| left.cmp(right))
-        })
 }
 
 fn archive_frame_status(volume_time_utc: DateTime<Utc>, now_utc: DateTime<Utc>) -> FrameStatus {
@@ -45845,6 +47128,233 @@ mod tests {
     }
 
     #[test]
+    fn legacy_low_sweep_settings_keep_existing_global_filter_behavior() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_low_sweep_filter = "base".to_owned();
+        app.app_settings.loop_sweep_control = None;
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let volume = test_reflectivity_sails_volume_with_radials(
+            &[(0.10, 0), (0.95, 30_000), (0.11, 60_000)],
+            720,
+        );
+
+        assert_eq!(
+            app.primary_sweep_policy_for_product(&product).mode,
+            SweepPolicyMode::BaseOnly
+        );
+        assert_eq!(
+            sweep_cuts_for_product(
+                &volume,
+                &product,
+                app.primary_sweep_policy_for_product(&product),
+            ),
+            low_sweep_cuts_for_product(&volume, &product, LowSweepLoopFilter::BaseOnly)
+        );
+    }
+
+    #[test]
+    fn custom_low_sweep_ref_range_filters_inclusive_elevations() {
+        let volume = test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0), (1.2, 30_000), (1.45, 60_000), (2.4, 90_000)],
+            720,
+        );
+        let cuts = sweep_cuts_for_product(
+            &volume,
+            &DisplayProduct::Moment(MomentType::Reflectivity),
+            SweepPolicy::range_cdeg(110, 150),
+        );
+
+        assert_eq!(cuts, vec![1, 2]);
+    }
+
+    #[test]
+    fn custom_low_sweep_velocity_range_filters_inclusive_elevations() {
+        let volume =
+            test_velocity_sails_volume_with_radials(&[(0.5, 0), (1.2, 30_000), (1.5, 60_000)], 720);
+        let cuts = sweep_cuts_for_product(
+            &volume,
+            &DisplayProduct::Moment(MomentType::Velocity),
+            SweepPolicy::range_cdeg(13, 83),
+        );
+
+        assert_eq!(cuts, vec![0]);
+    }
+
+    #[test]
+    fn low_sweep_range_timeline_steps_use_sorted_cut_collection_times() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_low_sweeps = true;
+        app.app_settings.loop_sweep_control = Some(LoopSweepControl {
+            primary: SweepPolicySet {
+                product_groups: BTreeMap::from([(
+                    SweepProductGroup::Reflectivity,
+                    SweepPolicy::range_cdeg(110, 150),
+                )]),
+            },
+            extra_pane_overrides: BTreeMap::new(),
+        });
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.selected_cut = 1;
+        let volume = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(1.2, 60_000), (1.3, 0), (1.4, 30_000)],
+            720,
+        ));
+        app.volume = Some(Arc::clone(&volume));
+        app.frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from("range-cut-time-order"),
+            volume,
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        });
+
+        let steps = app.loop_timeline_steps_for_recording();
+        assert_eq!(
+            steps
+                .iter()
+                .filter_map(|step| step.cut_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 0]
+        );
+        let times = steps
+            .iter()
+            .map(|step| app.shared_low_sweep_time_for_step(*step).unwrap())
+            .collect::<Vec<_>>();
+        assert!(times.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
+    fn custom_low_sweep_range_skips_volumes_without_matching_cuts() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_low_sweeps = true;
+        app.app_settings.loop_sweep_control = Some(LoopSweepControl {
+            primary: SweepPolicySet {
+                product_groups: BTreeMap::from([(
+                    SweepProductGroup::Reflectivity,
+                    SweepPolicy::range_cdeg(110, 150),
+                )]),
+            },
+            extra_pane_overrides: BTreeMap::new(),
+        });
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+
+        let first = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0)],
+            720,
+        ));
+        let mut second = test_reflectivity_sails_volume_with_radials(&[(1.2, 30_000)], 720);
+        second.volume_time = first.volume_time + chrono::Duration::minutes(3);
+        let second = Arc::new(second);
+        app.volume = Some(Arc::clone(&first));
+        app.selected_frame_index = 0;
+        app.selected_cut = 0;
+        app.frame_history = [Arc::clone(&first), Arc::clone(&second)]
+            .into_iter()
+            .map(|volume| FrameHistoryEntry {
+                identity: frame_identity_for_volume(volume.as_ref()),
+                path: PathBuf::from(format!("range-skip-{}", volume.volume_time.timestamp())),
+                volume,
+                timings: None,
+                status: FrameStatus::LiveComplete,
+                source_label: "test".to_owned(),
+            })
+            .collect();
+
+        assert_eq!(
+            app.loop_timeline_steps_for_recording(),
+            vec![LoopTimelineStep {
+                frame_index: 1,
+                cut_index: Some(0),
+                low_sweep_rank: Some(0),
+            }]
+        );
+        assert_eq!(
+            next_frame_index_with_sweep_cuts(
+                &app.frame_history,
+                0,
+                &app.selected_product,
+                SweepPolicy::range_cdeg(110, 150),
+                &app.low_sweep_disabled_cuts,
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            app.upcoming_primary_loop_steps(1),
+            vec![LoopTimelineStep {
+                frame_index: 1,
+                cut_index: Some(0),
+                low_sweep_rank: Some(0),
+            }],
+            "prewarming must skip frames that have no cut inside the custom range"
+        );
+        let expected_time = cut_start_time_utc(second.as_ref(), 0).expect("cut collection time");
+        assert_eq!(
+            app.loaded_loop_summary_time_window_for_target(LoopTimelineTarget::Primary),
+            Some((expected_time, expected_time + chrono::Duration::seconds(1)))
+        );
+    }
+
+    #[test]
+    fn low_sweep_primary_and_extra_pane_ranges_select_independently() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_low_sweeps = true;
+        app.app_settings.grid_pane_count = 2;
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        app.app_settings.loop_sweep_control = Some(LoopSweepControl {
+            primary: SweepPolicySet {
+                product_groups: BTreeMap::from([(
+                    SweepProductGroup::Reflectivity,
+                    SweepPolicy::range_cdeg(110, 150),
+                )]),
+            },
+            extra_pane_overrides: BTreeMap::from([(
+                0,
+                SweepPolicySet {
+                    product_groups: BTreeMap::from([(
+                        SweepProductGroup::Velocity,
+                        SweepPolicy::range_cdeg(13, 83),
+                    )]),
+                },
+            )]),
+        });
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.selected_cut = 1;
+        app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
+        app.extra_panes[0].cut = Some(0);
+
+        let mut volume = test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0), (1.2, 30_000), (1.45, 60_000)],
+            720,
+        );
+        add_velocity_moments_to_volume(&mut volume);
+        let volume = Arc::new(volume);
+        app.volume = Some(Arc::clone(&volume));
+        app.frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from("different-pane-ranges"),
+            volume: Arc::clone(&volume),
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        });
+        let timeline_time = cut_start_time_utc(volume.as_ref(), 2).unwrap();
+
+        assert!(app.set_shared_low_sweep_time(timeline_time, &egui::Context::default()));
+        assert_eq!(app.selected_cut, 2);
+        assert_eq!(app.extra_panes[0].cut, Some(0));
+        assert_eq!(
+            app.primary_sweep_policy_for_product(&app.selected_product),
+            SweepPolicy::range_cdeg(110, 150)
+        );
+        assert_eq!(
+            app.extra_pane_sweep_policy_for_product(0, &app.extra_panes[0].product),
+            SweepPolicy::range_cdeg(13, 83)
+        );
+    }
+
+    #[test]
     fn low_sweep_timeline_summary_cache_survives_cut_changes() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.app_settings.loop_low_sweeps = true;
@@ -48337,6 +49847,85 @@ mod tests {
     }
 
     #[test]
+    fn loop_recording_waits_for_range_selected_primary_and_pane_textures() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_low_sweeps = true;
+        app.app_settings.grid_pane_count = 2;
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        app.app_settings.loop_sweep_control = Some(LoopSweepControl {
+            primary: SweepPolicySet {
+                product_groups: BTreeMap::from([(
+                    SweepProductGroup::Reflectivity,
+                    SweepPolicy::range_cdeg(110, 150),
+                )]),
+            },
+            extra_pane_overrides: BTreeMap::from([(
+                0,
+                SweepPolicySet {
+                    product_groups: BTreeMap::from([(
+                        SweepProductGroup::Velocity,
+                        SweepPolicy::range_cdeg(13, 83),
+                    )]),
+                },
+            )]),
+        });
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.selected_cut = 2;
+        app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
+        app.extra_panes[0].cut = Some(0);
+
+        let mut volume = test_reflectivity_sails_volume_with_radials(
+            &[(0.5, 0), (1.2, 30_000), (1.45, 60_000)],
+            720,
+        );
+        add_velocity_moments_to_volume(&mut volume);
+        let volume = Arc::new(volume);
+        let volume_ptr = Arc::as_ptr(&volume) as usize;
+        app.volume = Some(Arc::clone(&volume));
+        app.frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from("range-recording-readiness"),
+            volume,
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        });
+        let primary_key = TextureKey {
+            volume_ptr,
+            dealias_reference_volume_ptr: 0,
+            cut: 2,
+            product: DisplayProduct::Moment(MomentType::Reflectivity),
+            render_dealiased_velocity: false,
+            color_table_signature: 1,
+            storm_motion_key: (0, 0),
+            hail_levels_key: (32, 64),
+            smoothing: SmoothingMode::Native,
+            dealias_cascade: false,
+            gate_filter_decidbz: i16::MIN,
+            viewport: test_viewport_key(720, 480),
+        };
+        app.texture_key = Some(primary_key.clone());
+        app.extra_panes[0].texture_key = Some(TextureKey {
+            cut: 1,
+            product: DisplayProduct::Moment(MomentType::Velocity),
+            ..primary_key.clone()
+        });
+
+        assert!(
+            !app.loop_record_selected_textures_ready(LoopTimelineTarget::Primary),
+            "export must wait while the velocity pane still shows a cut outside its selected range"
+        );
+
+        app.extra_panes[0].texture_key = Some(TextureKey {
+            cut: 0,
+            product: DisplayProduct::Moment(MomentType::Velocity),
+            ..primary_key
+        });
+        assert!(app.loop_record_selected_textures_ready(LoopTimelineTarget::Primary));
+    }
+
+    #[test]
     fn loop_recording_waits_for_cloned_independent_pane_low_sweep_texture_match() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.app_settings.loop_low_sweeps = true;
@@ -48767,6 +50356,140 @@ mod tests {
             app.radar_layers[0].selected_cut,
             Some(0),
             "a newer 1.2-degree overlay cut must not replace the primary 0.5-degree family"
+        );
+    }
+
+    #[test]
+    fn coordinated_frame_overlay_velocity_does_not_show_future_cut() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_low_sweeps = false;
+        app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
+        app.selected_cut = 0;
+        let base = Utc.with_ymd_and_hms(2026, 6, 22, 12, 0, 0).unwrap();
+
+        let mut primary = test_velocity_sails_volume_with_radials(&[(0.50, 30_000)], 720);
+        primary.site = radar_core::RadarSite::new("KAAA");
+        primary.volume_time = base;
+        let primary = Arc::new(primary);
+        app.volume = Some(Arc::clone(&primary));
+        app.frame_history = vec![FrameHistoryEntry {
+            identity: frame_identity_for_volume(primary.as_ref()),
+            path: PathBuf::from("primary-vel-1200"),
+            volume: primary,
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "test".to_owned(),
+        }];
+
+        let mut previous = test_velocity_sails_volume_with_radials(&[(0.52, 30_000)], 720);
+        previous.site = radar_core::RadarSite::new("KBBB");
+        previous.volume_time = base - chrono::Duration::minutes(4);
+        let previous = Arc::new(previous);
+
+        let mut future_cut = test_velocity_sails_volume_with_radials(&[(0.50, 60_000)], 720);
+        future_cut.site = radar_core::RadarSite::new("KBBB");
+        future_cut.volume_time = base + chrono::Duration::seconds(20);
+        let future_cut = Arc::new(future_cut);
+
+        let mut layer = RadarOverlayLayer::new(59, RadarSite::new("KBBB"));
+        layer.timeline_sync = true;
+        layer.frame_history = [Arc::clone(&previous), Arc::clone(&future_cut)]
+            .into_iter()
+            .map(|volume| FrameHistoryEntry {
+                identity: frame_identity_for_volume(volume.as_ref()),
+                path: PathBuf::from(format!("overlay-vel-{}", volume.volume_time.timestamp())),
+                volume,
+                timings: None,
+                status: FrameStatus::Complete,
+                source_label: "test".to_owned(),
+            })
+            .collect();
+        app.radar_layers.push(layer);
+
+        app.sync_radar_overlay_layers_to_timeline(&egui::Context::default());
+
+        assert_eq!(app.radar_layers[0].selected_frame_index, 0);
+        assert_eq!(app.radar_layers[0].selected_cut, Some(0));
+        assert_eq!(
+            app.radar_layers[0]
+                .volume
+                .as_ref()
+                .map(|volume| volume.volume_time.with_timezone(&Utc)),
+            Some(base - chrono::Duration::minutes(4)),
+            "normal frame sync must key off the selected cut time, not only the scan start"
+        );
+    }
+
+    #[test]
+    fn coordinated_range_overlay_velocity_does_not_show_future_cut() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_low_sweeps = true;
+        app.app_settings.loop_sweep_control = Some(LoopSweepControl {
+            primary: SweepPolicySet {
+                product_groups: BTreeMap::from([(
+                    SweepProductGroup::Velocity,
+                    SweepPolicy::range_cdeg(13, 83),
+                )]),
+            },
+            extra_pane_overrides: BTreeMap::new(),
+        });
+        app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
+        app.selected_cut = 0;
+        let base = Utc.with_ymd_and_hms(2026, 6, 22, 12, 0, 0).unwrap();
+
+        let mut primary = test_velocity_sails_volume_with_radials(&[(0.50, 30_000)], 720);
+        primary.site = radar_core::RadarSite::new("KAAA");
+        primary.volume_time = base;
+        let primary = Arc::new(primary);
+        app.volume = Some(Arc::clone(&primary));
+        app.frame_history = vec![FrameHistoryEntry {
+            identity: frame_identity_for_volume(primary.as_ref()),
+            path: PathBuf::from("primary-range-vel-1200"),
+            volume: primary,
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "test".to_owned(),
+        }];
+
+        let mut previous = test_velocity_sails_volume_with_radials(&[(0.52, 30_000)], 720);
+        previous.site = radar_core::RadarSite::new("KBBB");
+        previous.volume_time = base - chrono::Duration::minutes(4);
+        let previous = Arc::new(previous);
+
+        let mut future_cut = test_velocity_sails_volume_with_radials(&[(0.50, 60_000)], 720);
+        future_cut.site = radar_core::RadarSite::new("KBBB");
+        future_cut.volume_time = base + chrono::Duration::seconds(20);
+        let future_cut = Arc::new(future_cut);
+
+        let mut layer = RadarOverlayLayer::new(60, RadarSite::new("KBBB"));
+        layer.timeline_sync = true;
+        layer.frame_history = [Arc::clone(&previous), Arc::clone(&future_cut)]
+            .into_iter()
+            .map(|volume| FrameHistoryEntry {
+                identity: frame_identity_for_volume(volume.as_ref()),
+                path: PathBuf::from(format!(
+                    "overlay-range-vel-{}",
+                    volume.volume_time.timestamp()
+                )),
+                volume,
+                timings: None,
+                status: FrameStatus::Complete,
+                source_label: "test".to_owned(),
+            })
+            .collect();
+        app.radar_layers.push(layer);
+
+        app.sync_radar_overlay_layers_to_timeline(&egui::Context::default());
+
+        assert_eq!(app.radar_layers[0].selected_frame_index, 0);
+        assert_eq!(app.radar_layers[0].selected_cut, Some(0));
+        assert_eq!(
+            app.radar_layers[0]
+                .volume
+                .as_ref()
+                .map(|volume| volume.volume_time.with_timezone(&Utc)),
+            Some(base - chrono::Duration::minutes(4)),
+            "range sync must never choose a cut collected after the primary timeline time"
         );
     }
 
@@ -53028,6 +54751,79 @@ mod tests {
     }
 
     #[test]
+    fn top_bar_new_alert_menu_includes_hidden_or_filtered_alerts() {
+        let existing = test_hazard_record(
+            "old",
+            "TOR 1",
+            "tornado",
+            square_hazard_points(-101.0, 34.0, -100.0, 35.0),
+        );
+        let added = test_hazard_record(
+            "new",
+            "SVR 2",
+            "severe thunderstorm",
+            square_hazard_points(-99.0, 34.0, -98.0, 35.0),
+        );
+        let mut app = test_viewer_app_with_hazards(vec![existing.clone()]);
+
+        assert!(app.install_hazard_result(Ok(test_hazard_overlay(vec![existing, added])), false));
+        app.hidden_hazard_families
+            .insert("severe thunderstorm".to_owned());
+        app.app_settings.current_alert_filter = HazardListFilter::Tornado.key().to_owned();
+
+        assert_eq!(app.visible_hazard_list_rows().len(), 1);
+        assert!(
+            app.visible_hazard_list_rows()
+                .iter()
+                .all(|row| row.family != "severe thunderstorm")
+        );
+
+        let groups = app.unacknowledged_hazard_menu_groups();
+        assert_eq!(groups.iter().map(|(_, rows)| rows.len()).sum::<usize>(), 1);
+        assert_eq!(groups[0].0, hazard_family_menu_label("severe thunderstorm"));
+        assert_eq!(app.first_unacknowledged_hazard_index(), Some(1));
+
+        let ctx = egui::Context::default();
+        assert!(app.focus_unacknowledged_hazard_record(1, &ctx));
+
+        assert_eq!(app.selected_hazard_index, Some(1));
+        assert_eq!(
+            app.app_settings.current_alert_filter,
+            HazardListFilter::All.key()
+        );
+        assert!(!app.hidden_hazard_families.contains("severe thunderstorm"));
+        assert!(!app.unacknowledged_hazard_event_ids.contains("new"));
+    }
+
+    #[test]
+    fn top_bar_ack_all_clears_hidden_unacknowledged_alerts() {
+        let warning = test_hazard_record(
+            "hidden",
+            "SVR 2",
+            "severe thunderstorm",
+            square_hazard_points(-99.0, 34.0, -98.0, 35.0),
+        );
+        let mut app = test_viewer_app_with_hazards(vec![warning]);
+        app.unacknowledged_hazard_event_ids
+            .insert("hidden".to_owned());
+        app.hidden_hazard_families
+            .insert("severe thunderstorm".to_owned());
+
+        assert!(app.visible_hazard_list_rows().is_empty());
+        assert_eq!(
+            app.unacknowledged_hazard_menu_groups()
+                .iter()
+                .map(|(_, rows)| rows.len())
+                .sum::<usize>(),
+            1
+        );
+
+        app.acknowledge_all_hazards();
+
+        assert!(app.unacknowledged_hazard_event_ids.is_empty());
+    }
+
+    #[test]
     fn event_loop_hazard_result_does_not_latch_new_alerts() {
         let existing = test_hazard_record(
             "old",
@@ -54242,6 +56038,7 @@ mod tests {
             map_center_lon: 0.0,
             map_center_lat: 0.0,
             map_scale: 100.0,
+            vol3d_map_box_drag: None,
             place_search_query: String::new(),
             radar_range_km: DEFAULT_RADAR_RANGE_KM,
             load_timing: None,
@@ -54407,6 +56204,7 @@ mod tests {
             event_explorer: event_explorer::EventExplorerState::default(),
             event_loop_builder: event_loop_builder::EventLoopBuilderState::default(),
             unified_player: unified_player::UnifiedPlayerState::default(),
+            sweep_controls_open: false,
             event_loop_hazard_window: None,
             pending_event_loop_hazard_window: None,
             glm_enabled: false,
@@ -55121,6 +56919,109 @@ mod tests {
         app.handle_plain_map_click(rect, &[(0, pointer)], &[], &[], &[], &[], pointer, &ctx);
 
         assert_eq!(app.status, "");
+    }
+
+    #[test]
+    fn map_box_selection_sets_custom_vol3d_target_and_scale() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let mut volume = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        volume.site = radar_core::RadarSite {
+            id: "KBOX".to_owned(),
+            name: Some("Test Radar".to_owned()),
+            latitude_deg: Some(35.0),
+            longitude_deg: Some(-97.0),
+            elevation_m: Some(300.0),
+        };
+        app.volume = Some(Arc::new(volume));
+        app.map_center_lat = 35.0;
+        app.map_center_lon = -97.0;
+        app.map_scale = 100.0;
+        let rect = test_map_rect();
+        let start = rect.center() + egui::vec2(-60.0, -40.0);
+        let current = rect.center() + egui::vec2(80.0, 50.0);
+        let selection = egui::Rect::from_two_pos(start, current);
+        let (expected_lon, expected_lat) = app.screen_to_lon_lat(rect, selection.center());
+        let expected_half_km = (selection.width().max(selection.height()) * 0.5 * 111.32
+            / app.map_scale)
+            .clamp(VOL3D_BOX_DRAG_MIN_HALF_KM, VOL3D_BOX_DRAG_MAX_HALF_KM);
+
+        assert!(app.apply_vol3d_map_box_selection(
+            rect,
+            Vol3dMapBoxDrag { start, current },
+            &egui::Context::default(),
+        ));
+
+        assert!(app.vol3d.open);
+        assert!((app.vol3d.box_half_km - expected_half_km).abs() < 0.01);
+        let (target_lat, target_lon) = app.vol3d.box_target_lonlat.expect("target locked");
+        assert!((target_lat - expected_lat).abs() < 1e-5);
+        assert!((target_lon - expected_lon).abs() < 1e-5);
+        assert!(app.vol3d.volume_key.is_none());
+        assert!(app.vol3d.status.contains("selected"));
+    }
+
+    #[test]
+    fn vol3d_uses_complete_same_site_volume_instead_of_live_partial() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 23, 4, 10, 0).unwrap();
+        let mut complete =
+            test_reflectivity_sails_volume_with_radials(&[(0.5, 0), (1.5, 60_000)], 720);
+        complete.site.id = "KTLX".to_owned();
+        complete.volume_time = scan_time;
+        let complete = Arc::new(complete);
+        let mut partial = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        partial.site.id = "KTLX".to_owned();
+        partial.volume_time = scan_time + chrono::Duration::minutes(3);
+        let partial = Arc::new(partial);
+        app.frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(complete.as_ref()),
+            path: PathBuf::from("KTLX-complete"),
+            volume: Arc::clone(&complete),
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        });
+        app.frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(partial.as_ref()),
+            path: PathBuf::from("KTLX-partial"),
+            volume: Arc::clone(&partial),
+            timings: None,
+            status: FrameStatus::LivePartial,
+            source_label: "test".to_owned(),
+        });
+        app.selected_frame_index = 1;
+        app.volume = Some(Arc::clone(&partial));
+
+        let source = app
+            .vol3d_complete_source_volume_for(Arc::clone(&partial), &MomentType::Reflectivity)
+            .expect("same-site complete fallback");
+        assert!(Arc::ptr_eq(&source, &complete));
+
+        app.selected_frame_index = 0;
+        let source = app
+            .vol3d_complete_source_volume_for(Arc::clone(&partial), &MomentType::Reflectivity)
+            .expect("same-site complete fallback even if selection lags");
+        assert!(Arc::ptr_eq(&source, &complete));
+        app.selected_frame_index = 1;
+
+        let mut other_site =
+            test_reflectivity_sails_volume_with_radials(&[(0.5, 0), (1.5, 60_000)], 720);
+        other_site.site.id = "KFDR".to_owned();
+        other_site.volume_time = scan_time;
+        let other_site = Arc::new(other_site);
+        app.frame_history[0] = FrameHistoryEntry {
+            identity: frame_identity_for_volume(other_site.as_ref()),
+            path: PathBuf::from("KFDR-complete"),
+            volume: other_site,
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        };
+        assert!(
+            app.vol3d_complete_source_volume_for(Arc::clone(&partial), &MomentType::Reflectivity)
+                .is_none(),
+            "3D should wait instead of borrowing a previous radar's volume"
+        );
     }
 
     #[test]

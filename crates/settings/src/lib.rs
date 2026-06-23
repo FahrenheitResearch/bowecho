@@ -12,6 +12,111 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+/// Product families used by the loop sweep controller. Keeping this model in
+/// `settings` lets the primary radar, extra panes, and coordinated overlays
+/// share one persisted policy without making the settings crate depend on UI
+/// or radar-rendering types.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepProductGroup {
+    #[default]
+    Reflectivity,
+    Velocity,
+    DualPol,
+    Other,
+}
+
+impl SweepProductGroup {
+    pub const ALL: [Self; 4] = [
+        Self::Reflectivity,
+        Self::Velocity,
+        Self::DualPol,
+        Self::Other,
+    ];
+}
+
+/// How a product family contributes cuts to an expanded radar timeline.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepPolicyMode {
+    /// Do not expand a volume into per-cut timeline steps for this family.
+    Off,
+    /// Preserve BowEcho's existing complete-low-tilt behavior.
+    #[default]
+    AllLow,
+    BaseOnly,
+    SameLevel,
+    /// Include complete, product-compatible cuts inside the inclusive range.
+    Range,
+}
+
+/// One product-family sweep rule. Elevations are stored in hundredths of a
+/// degree so `AppSettings` remains `Eq` and JSON round trips without float
+/// noise.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SweepPolicy {
+    pub mode: SweepPolicyMode,
+    pub min_elevation_cdeg: u16,
+    pub max_elevation_cdeg: u16,
+}
+
+impl SweepPolicy {
+    pub fn range_cdeg(min_elevation_cdeg: u16, max_elevation_cdeg: u16) -> Self {
+        Self {
+            mode: SweepPolicyMode::Range,
+            min_elevation_cdeg,
+            max_elevation_cdeg,
+        }
+        .normalized()
+    }
+
+    pub fn normalized(mut self) -> Self {
+        if self.min_elevation_cdeg > self.max_elevation_cdeg {
+            std::mem::swap(&mut self.min_elevation_cdeg, &mut self.max_elevation_cdeg);
+        }
+        self
+    }
+
+    pub fn min_elevation_deg(self) -> f32 {
+        f32::from(self.min_elevation_cdeg) / 100.0
+    }
+
+    pub fn max_elevation_deg(self) -> f32 {
+        f32::from(self.max_elevation_cdeg) / 100.0
+    }
+}
+
+impl Default for SweepPolicy {
+    fn default() -> Self {
+        Self {
+            mode: SweepPolicyMode::AllLow,
+            min_elevation_cdeg: 0,
+            max_elevation_cdeg: 140,
+        }
+    }
+}
+
+/// Product-family rules for one radar display target. Missing groups inherit
+/// from the caller's fallback (legacy global mode for Primary, Primary for an
+/// overriding extra pane).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SweepPolicySet {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub product_groups: BTreeMap<SweepProductGroup, SweepPolicy>,
+}
+
+/// Advanced loop sweep configuration. Missing extra-pane entries mean
+/// "Follow primary"; map keys are zero-based extra-pane slots (0 = Pane 2).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopSweepControl {
+    pub primary: SweepPolicySet,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_pane_overrides: BTreeMap<u8, SweepPolicySet>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -202,6 +307,12 @@ pub struct AppSettings {
     /// "base" keeps only the lowest elevation bucket to avoid TDWR/Sails jumps.
     #[serde(default = "default_loop_low_sweep_filter")]
     pub loop_low_sweep_filter: String,
+    /// Optional product- and pane-specific sweep rules. `None` is the legacy
+    /// v0.25.7 behavior driven only by `loop_low_sweeps` and
+    /// `loop_low_sweep_filter`; it is omitted from JSON so existing configs
+    /// remain byte-small and load unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_sweep_control: Option<LoopSweepControl>,
     /// During live updates, advance to each newly completed low-level sweep
     /// instead of waiting for a scan-separated low-level revisit.
     #[serde(default)]
@@ -501,6 +612,7 @@ impl Default for AppSettings {
             loop_speed_percent: default_loop_speed_percent(),
             loop_low_sweeps: false,
             loop_low_sweep_filter: default_loop_low_sweep_filter(),
+            loop_sweep_control: None,
             live_low_sweep_auto_advance: false,
             live_low_sweep_auto_advance_seconds: default_live_low_sweep_auto_advance_seconds(),
             show_center_crosshair: false,
@@ -874,6 +986,29 @@ mod tests {
             live_preload_frame_count: 6,
             loop_low_sweeps: true,
             loop_low_sweep_filter: "base".to_owned(),
+            loop_sweep_control: Some(LoopSweepControl {
+                primary: SweepPolicySet {
+                    product_groups: BTreeMap::from([
+                        (
+                            SweepProductGroup::Reflectivity,
+                            SweepPolicy::range_cdeg(110, 150),
+                        ),
+                        (SweepProductGroup::Velocity, SweepPolicy::range_cdeg(13, 83)),
+                    ]),
+                },
+                extra_pane_overrides: BTreeMap::from([(
+                    0,
+                    SweepPolicySet {
+                        product_groups: BTreeMap::from([(
+                            SweepProductGroup::DualPol,
+                            SweepPolicy {
+                                mode: SweepPolicyMode::BaseOnly,
+                                ..SweepPolicy::default()
+                            },
+                        )]),
+                    },
+                )]),
+            }),
             live_low_sweep_auto_advance: true,
             live_low_sweep_auto_advance_seconds: 30,
             show_center_crosshair: true,
@@ -977,6 +1112,7 @@ mod tests {
         assert_eq!(old.live_preload_frame_count, 5);
         assert!(!old.loop_low_sweeps);
         assert_eq!(old.loop_low_sweep_filter, "all");
+        assert_eq!(old.loop_sweep_control, None);
         assert!(!old.live_low_sweep_auto_advance);
         assert_eq!(
             old.live_low_sweep_auto_advance_seconds,
@@ -1002,9 +1138,61 @@ mod tests {
         assert_eq!(back.live_preload_frame_count, 4);
         assert!(back.loop_low_sweeps);
         assert_eq!(back.loop_low_sweep_filter, "base");
+        assert_eq!(back.loop_sweep_control, None);
         assert!(back.live_low_sweep_auto_advance);
         assert_eq!(back.live_low_sweep_auto_advance_seconds, 10);
         assert!(back.show_center_crosshair);
+    }
+
+    #[test]
+    fn legacy_low_sweep_config_defaults_to_current_behavior() {
+        let settings = AppSettings::from_json(
+            r#"{
+                "loop_low_sweeps": true,
+                "loop_low_sweep_filter": "same"
+            }"#,
+        );
+
+        assert!(settings.loop_low_sweeps);
+        assert_eq!(settings.loop_low_sweep_filter, "same");
+        assert_eq!(settings.loop_sweep_control, None);
+        assert!(
+            !settings.to_json().contains("loop_sweep_control"),
+            "legacy/default advanced state should stay sparse"
+        );
+    }
+
+    #[test]
+    fn advanced_low_sweep_control_round_trips_product_and_pane_ranges() {
+        let settings = AppSettings {
+            loop_low_sweeps: true,
+            loop_sweep_control: Some(LoopSweepControl {
+                primary: SweepPolicySet {
+                    product_groups: BTreeMap::from([(
+                        SweepProductGroup::Reflectivity,
+                        SweepPolicy::range_cdeg(110, 150),
+                    )]),
+                },
+                extra_pane_overrides: BTreeMap::from([(
+                    0,
+                    SweepPolicySet {
+                        product_groups: BTreeMap::from([(
+                            SweepProductGroup::Velocity,
+                            SweepPolicy::range_cdeg(13, 83),
+                        )]),
+                    },
+                )]),
+            }),
+            ..Default::default()
+        };
+
+        let json = settings.to_json();
+        let back = AppSettings::from_json(&json);
+
+        assert_eq!(back, settings);
+        assert!(json.contains("loop_sweep_control"));
+        assert!(json.contains("reflectivity"));
+        assert!(json.contains("velocity"));
     }
 
     #[test]

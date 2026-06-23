@@ -52,7 +52,7 @@ pub use volumetric::{
     mehs_grid, moment_cross_section, moment_cross_section_with_smoothing, poh_grid,
     reflectivity_cross_section, reflectivity_cross_section_with_smoothing, velocity_cross_section,
     velocity_cross_section_cached, velocity_cross_section_cached_with_smoothing, vil_density_grid,
-    vil_grid, volume_box_resample,
+    vil_grid, volume_box_resample, volume_box_resample_moment,
 };
 pub use wind::{gust_proxy_grid, marc_grid};
 

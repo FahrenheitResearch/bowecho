@@ -192,6 +192,20 @@ fn reflectivity_columns(volume: &RadarVolume) -> Vec<CutColumn<'_>> {
     cols
 }
 
+fn moment_columns<'a>(volume: &'a RadarVolume, moment: &MomentType) -> Vec<CutColumn<'a>> {
+    let mut cols: Vec<CutColumn<'_>> = volume
+        .cuts
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let g = c.moments.get(moment)?;
+            CutColumn::new(volume, i, g)
+        })
+        .collect();
+    cols.sort_by(|a, b| a.elevation_deg.total_cmp(&b.elevation_deg));
+    cols
+}
+
 /// Build an F32 output grid on the base tilt's geometry (NaN = no data).
 /// Public alias for sibling modules building products on a base geometry.
 pub(crate) fn f32_grid_like_pub(
@@ -806,10 +820,35 @@ pub fn volume_box_resample(
     nz: usize,
     top_m: f32,
 ) -> Option<Vec<f32>> {
+    volume_box_resample_moment(
+        volume,
+        &MomentType::Reflectivity,
+        InterpPolicy::LinearAngle,
+        center_east_km,
+        center_north_km,
+        half_km,
+        n,
+        nz,
+        top_m,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // box geometry is explicit by design
+pub fn volume_box_resample_moment(
+    volume: &RadarVolume,
+    moment: &MomentType,
+    policy: InterpPolicy,
+    center_east_km: f32,
+    center_north_km: f32,
+    half_km: f32,
+    n: usize,
+    nz: usize,
+    top_m: f32,
+) -> Option<Vec<f32>> {
     if n < 8 || nz < 4 || half_km <= 1.0 {
         return None;
     }
-    let cols = reflectivity_columns(volume);
+    let cols = moment_columns(volume, moment);
     if cols.is_empty() {
         return None;
     }
@@ -829,7 +868,7 @@ pub fn volume_box_resample(
                 }
                 for zi in 0..nz {
                     let z = f64::from(top_m) * zi as f64 / (nz - 1) as f64;
-                    if let Some(v) = interp_profile_xs(&prof, z, s, InterpPolicy::LinearAngle) {
+                    if let Some(v) = interp_profile_xs(&prof, z, s, policy) {
                         slab[zi * n + xi] = v;
                     }
                 }

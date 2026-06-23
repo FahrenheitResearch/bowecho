@@ -34,6 +34,7 @@ pub(crate) struct UnifiedPlayerContext {
     pub(crate) loop_speed_percent: u16,
     pub(crate) loop_speed_options: Vec<u16>,
     pub(crate) low_sweeps_enabled: bool,
+    pub(crate) low_sweep_mode_label: String,
     pub(crate) low_sweep_filter_index: usize,
     pub(crate) low_sweep_filter_options: Vec<String>,
     pub(crate) auto_sync_warnings: bool,
@@ -82,6 +83,7 @@ pub(crate) enum UnifiedPlayerAction {
     SetLoopSpeedPercent(u16),
     SetLowSweepsEnabled(bool),
     SetLowSweepFilter(usize),
+    OpenSweepControls,
     SetAutoWarningSync(bool),
     SyncWarningsToLoop,
     ReleaseWarningSync,
@@ -392,8 +394,8 @@ impl UnifiedPlayerState {
                         .low_sweep_filter_index
                         .min(context.low_sweep_filter_options.len() - 1);
                     egui::ComboBox::from_id_salt("unified_player_low_sweep_filter")
-                        .selected_text(&context.low_sweep_filter_options[filter_index])
-                        .width(92.0)
+                        .selected_text(&context.low_sweep_mode_label)
+                        .width(112.0)
                         .show_ui(ui, |ui| {
                             for (index, label) in
                                 context.low_sweep_filter_options.iter().enumerate()
@@ -404,6 +406,12 @@ impl UnifiedPlayerState {
                     if filter_index != context.low_sweep_filter_index {
                         action = Some(UnifiedPlayerAction::SetLowSweepFilter(filter_index));
                     }
+                }
+                if stable_button(ui, "⚙", 34.0, true)
+                    .on_hover_text("Product- and pane-specific sweep controls")
+                    .clicked()
+                {
+                    action = Some(UnifiedPlayerAction::OpenSweepControls);
                 }
             });
 
@@ -847,11 +855,12 @@ impl Default for UnifiedPlayerContext {
             loop_speed_percent: 100,
             loop_speed_options: vec![25, 50, 100, 200, 400, 800, 1600, 3200, 6400],
             low_sweeps_enabled: false,
+            low_sweep_mode_label: "All low tilts".to_owned(),
             low_sweep_filter_index: 0,
             low_sweep_filter_options: vec![
-                "all low".to_owned(),
-                "same degree".to_owned(),
-                "base only".to_owned(),
+                "All low tilts".to_owned(),
+                "Same level".to_owned(),
+                "Base only".to_owned(),
             ],
             auto_sync_warnings: false,
             warnings_synced_window: None,
