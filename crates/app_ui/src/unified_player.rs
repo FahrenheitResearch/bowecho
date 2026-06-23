@@ -313,8 +313,10 @@ impl UnifiedPlayerState {
                         action = Some(UnifiedPlayerAction::LoadLoop);
                     }
                 }
-                if stable_button(ui, "Load Window", 118.0, true)
-                    .on_hover_text("Load an archive/event loop covering the UTC range below")
+                if stable_button(ui, "Archive Window", 126.0, true)
+                    .on_hover_text(
+                        "Load a US/ORD archive loop for the explicit UTC start/end below; never routes to live/latest",
+                    )
                     .clicked()
                 {
                     if context.load_busy {
@@ -323,8 +325,10 @@ impl UnifiedPlayerState {
                         action = Some(UnifiedPlayerAction::LoadArchiveWindow);
                     }
                 }
-                if stable_button(ui, "Ending At", 96.0, true)
-                    .on_hover_text("Load an archive loop ending at the UTC time below")
+                if stable_button(ui, "Loop Ending At", 112.0, true)
+                    .on_hover_text(
+                        "Load an archive loop ending at the UTC time below (not a centered event loop)",
+                    )
                     .clicked()
                 {
                     if context.load_busy {

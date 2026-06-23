@@ -341,11 +341,27 @@ pub struct AppSettings {
     /// intentionally compress very long low-sweep exports.
     #[serde(default = "default_loop_record_speed_percent")]
     pub loop_record_speed_percent: u16,
-    /// Extra archive scans loaded on each side of a clicked tornado
-    /// track's window — context before touchdown and after lift (field
-    /// request: a short track otherwise loads only a handful of frames).
+    /// Legacy symmetric event-loop context. New configurations write the
+    /// explicit before/after fields below; keeping this value lets older JSON
+    /// (including custom non-default padding) migrate without losing intent.
     #[serde(default = "default_event_pad_frames")]
     pub event_pad_frames: u16,
+    /// Explicit scans before a clicked event/report/track window. `None`
+    /// inherits `event_pad_frames`, preserving old symmetric configurations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_before_scans: Option<u16>,
+    /// Explicit scans after a clicked event/report/track window. `None`
+    /// inherits `event_pad_frames`, preserving old symmetric configurations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_after_scans: Option<u16>,
+    /// Hard cap for an event-click archive loop. This is intentionally
+    /// independent of the Archive browser's manual `archive_frame_count`.
+    #[serde(default = "default_event_max_frames")]
+    pub event_max_frames: u16,
+    /// Automatically load valid-time warnings for the actual radar loop
+    /// window produced by an event click.
+    #[serde(default = "default_true")]
+    pub event_sync_warnings: bool,
     /// When a tornado track is clicked from the Event day layer, optionally
     /// kick a sounding-grade model ingest for the init covering that track
     /// time so skew-T soundings are ready without manual date/cycle math.
@@ -472,6 +488,10 @@ fn default_cross_section_smoothing() -> String {
 
 fn default_event_pad_frames() -> u16 {
     5
+}
+
+fn default_event_max_frames() -> u16 {
+    24
 }
 
 fn default_archive_frame_count() -> u16 {
@@ -627,6 +647,10 @@ impl Default for AppSettings {
             record_fps: default_record_fps(),
             loop_record_speed_percent: default_loop_record_speed_percent(),
             event_pad_frames: default_event_pad_frames(),
+            event_before_scans: None,
+            event_after_scans: None,
+            event_max_frames: default_event_max_frames(),
+            event_sync_warnings: true,
             event_track_auto_model: false,
             event_track_model_slug: default_model_slug(),
             event_track_camera_follow: true,
@@ -696,6 +720,18 @@ impl AppSettings {
 
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_owned())
+    }
+
+    /// Effective event-loop context before the event window. Old configs only
+    /// have `event_pad_frames`, so `None` deliberately inherits that value.
+    pub fn effective_event_before_scans(&self) -> u16 {
+        self.event_before_scans.unwrap_or(self.event_pad_frames)
+    }
+
+    /// Effective event-loop context after the event window. Old configs only
+    /// have `event_pad_frames`, so `None` deliberately inherits that value.
+    pub fn effective_event_after_scans(&self) -> u16 {
+        self.event_after_scans.unwrap_or(self.event_pad_frames)
     }
 
     pub fn add_favorite(&mut self, site: &str) {
@@ -1421,17 +1457,35 @@ mod tests {
     }
 
     #[test]
-    fn event_pad_frames_default_and_round_trip() {
+    fn event_archive_context_defaults_legacy_migration_and_round_trip() {
         let old = AppSettings::from_json("{}");
         assert_eq!(old.event_pad_frames, 5);
+        assert_eq!(old.effective_event_before_scans(), 5);
+        assert_eq!(old.effective_event_after_scans(), 5);
+        assert_eq!(old.event_max_frames, 24);
+        assert!(old.event_sync_warnings);
+
+        let legacy = AppSettings::from_json(r#"{"event_pad_frames":12}"#);
+        assert_eq!(legacy.effective_event_before_scans(), 12);
+        assert_eq!(legacy.effective_event_after_scans(), 12);
 
         let settings = AppSettings {
             event_pad_frames: 12,
+            event_before_scans: Some(3),
+            event_after_scans: Some(7),
+            event_max_frames: 36,
+            event_sync_warnings: false,
             ..Default::default()
         };
         let back = AppSettings::from_json(&settings.to_json());
 
         assert_eq!(back.event_pad_frames, 12);
+        assert_eq!(back.event_before_scans, Some(3));
+        assert_eq!(back.event_after_scans, Some(7));
+        assert_eq!(back.effective_event_before_scans(), 3);
+        assert_eq!(back.effective_event_after_scans(), 7);
+        assert_eq!(back.event_max_frames, 36);
+        assert!(!back.event_sync_warnings);
     }
 
     #[test]

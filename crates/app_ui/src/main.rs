@@ -147,7 +147,6 @@ const ALERT_SOUND_FAMILY_OPTIONS: &[(&str, &str)] = &[
 ];
 const PERF_SAMPLE_CAPACITY: usize = 96;
 const STALE_LATEST_DISPLAY_CLEAR_SECONDS: i64 = 15 * 60;
-const ARCHIVE_EVENT_CACHE_HIT_MAX_SECONDS: i64 = 10 * 60;
 const HISTORY_SIZE_OPTIONS: &[usize] = &[
     3, 5, 7, 10, 15, 20, 25, 30, 48, 72, 96, 128, 160, 200, 256, 384, 512, 768, 1000, 1500, 2000,
 ];
@@ -161,6 +160,7 @@ const DEFAULT_STORM_TRACK_MIN_DBZ: f32 = 35.0;
 const MIN_STORM_TRACK_MIN_DBZ: f32 = 30.0;
 const MAX_STORM_TRACK_MIN_DBZ: f32 = 65.0;
 pub(crate) const MAX_EVENT_PAD_FRAMES: u16 = 40;
+const DEFAULT_EVENT_MAX_FRAMES: usize = 24;
 /// Hard ceiling for the frame strip — deployment folders legitimately
 /// load 100+ volumes.
 const MAX_HISTORY_FRAME_LIMIT: usize = 2000;
@@ -2064,6 +2064,72 @@ fn archive_load_progress_row(ui: &mut egui::Ui, progress: &ArchiveLoadProgress) 
 struct ArchivePendingEvent {
     time_utc: DateTime<Utc>,
     label: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArchiveLoopSource {
+    EventPoint,
+    EventTrack,
+}
+
+impl ArchiveLoopSource {
+    fn progress_label(self) -> &'static str {
+        match self {
+            Self::EventPoint => "Event archive loop",
+            Self::EventTrack => "Tornado archive loop",
+        }
+    }
+}
+
+/// One US Level-II archive-loop request shared by event clicks and the
+/// operator Event Loop Builder. `start_utc..=end_utc` is the event's base
+/// window; before/after are scan counts, not guessed wall-clock minutes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArchiveLoopContext {
+    pub(crate) anchor_utc: DateTime<Utc>,
+    pub(crate) start_utc: DateTime<Utc>,
+    pub(crate) end_utc: DateTime<Utc>,
+    pub(crate) before_scans: usize,
+    pub(crate) after_scans: usize,
+    pub(crate) max_frames: usize,
+    pub(crate) source: ArchiveLoopSource,
+}
+
+impl ArchiveLoopContext {
+    pub(crate) fn event(
+        start_utc: DateTime<Utc>,
+        end_utc: DateTime<Utc>,
+        anchor_utc: DateTime<Utc>,
+        source: ArchiveLoopSource,
+        settings: &settings::AppSettings,
+    ) -> Self {
+        let end_utc = end_utc.max(start_utc);
+        Self {
+            anchor_utc: anchor_utc.clamp(start_utc, end_utc),
+            start_utc,
+            end_utc,
+            before_scans: usize::from(normalized_event_pad_frames(
+                settings.effective_event_before_scans(),
+            )),
+            after_scans: usize::from(normalized_event_pad_frames(
+                settings.effective_event_after_scans(),
+            )),
+            max_frames: normalized_event_max_frames(settings.event_max_frames),
+            source,
+        }
+    }
+
+    pub(crate) fn window_request(&self) -> data_source::Level2ArchiveWindowRequest {
+        data_source::Level2ArchiveWindowRequest {
+            start_utc: self.start_utc,
+            end_utc: self.end_utc,
+            anchor_utc: self.anchor_utc,
+            pad_scans: 0,
+            extra_start_scans: self.before_scans,
+            extra_end_scans: self.after_scans,
+            max_objects: self.max_frames.clamp(1, MAX_HISTORY_FRAME_LIMIT),
+        }
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -13230,8 +13296,8 @@ impl ViewerApp {
         // archive browsing shouldn't need a tab switch to play what it just
         // loaded.)
         ui.horizontal(|ui| {
-            ui.label("Fetch N scans").on_hover_text(
-                "Manual archive chips load this many scans ending at the chosen scan. SPC report jumps use this count centered on the nearest event scan.",
+            ui.label("Manual loop frames").on_hover_text(
+                "Archive-browser selections only: load this many scans ending at the chosen scan. Event clicks use the visible Event loop Before/After/Cap controls.",
             );
             if ui
                 .add(
@@ -13240,7 +13306,7 @@ impl ViewerApp {
                         .speed(0.2),
                 )
                 .on_hover_text(
-                    "Manual archive chips end at the clicked scan; SPC report jumps center this count on the event scan",
+                    "Manual archive chips end at the clicked scan. This does not change tornado/report event-loop context.",
                 )
                 .changed()
             {
@@ -13311,9 +13377,9 @@ impl ViewerApp {
         let previous_archive_load_loop = self.archive_load_loop;
         ui.horizontal(|ui| {
             ui.label("On click:");
-            ui.selectable_value(&mut self.archive_load_loop, true, "Loop")
-                .on_hover_text("Load a loop ending at the chosen scan");
-            ui.selectable_value(&mut self.archive_load_loop, false, "Single")
+            ui.selectable_value(&mut self.archive_load_loop, true, "Loop ending at scan")
+                .on_hover_text("Load Manual loop frames ending at the chosen archive scan");
+            ui.selectable_value(&mut self.archive_load_loop, false, "Single scan")
                 .on_hover_text("Load only the chosen scan");
         });
         if self.archive_load_loop != previous_archive_load_loop {
@@ -13370,7 +13436,7 @@ impl ViewerApp {
             if ui
                 .add_enabled(!fetching, egui::Button::new("Fetch"))
                 .on_hover_text(
-                    "SPC storm reports for this date (12Z–12Z). Click a report to jump to the lowest-beam radar and load the loop at that time.",
+                    "SPC storm reports for this date (12Z–12Z). Click a report to load the lowest-beam event archive loop with Event day Before/After/Cap context.",
                 )
                 .clicked()
             {
@@ -13408,7 +13474,9 @@ impl ViewerApp {
                                     egui::vec2(ui.available_width(), PANEL_BUTTON_HEIGHT),
                                     egui::Button::new(label),
                                 )
-                                .on_hover_text("Jump: lowest-beam radar + loop at this time")
+                                .on_hover_text(
+                                    "Jump: lowest-beam radar + event archive loop before/after this time",
+                                )
                                 .clicked()
                             {
                                 jump = Some(report.clone());
@@ -13483,45 +13551,21 @@ impl ViewerApp {
             .min_by(|a, b| a.1.total_cmp(&b.1))
     }
 
-    fn select_cached_event_frame(
-        &mut self,
-        site_id: &str,
-        target: DateTime<Utc>,
-        label: &str,
-        ctx: &egui::Context,
-    ) -> bool {
-        let best = self
-            .frame_history
-            .iter()
-            .enumerate()
-            .filter(|(_, frame)| frame.identity.site_id == site_id)
-            .map(|(index, frame)| {
-                let delta = frame
-                    .identity
-                    .scan_time_utc
-                    .signed_duration_since(target)
-                    .num_seconds()
-                    .abs();
-                (index, delta)
-            })
-            .min_by_key(|(_, delta)| *delta);
-        if let Some((index, delta)) = best
-            && delta <= ARCHIVE_EVENT_CACHE_HIT_MAX_SECONDS
-        {
-            self.history_playing = false;
-            self.browsing_history = true;
-            self.select_history_frame(index, false, ctx);
-            // A cache hit is immediate, not background work. Leaving a
-            // completed progress object here kept the global activity bar
-            // alive forever and made a successful click look stuck.
-            self.archive_load_progress = None;
-            self.status = format!(
-                "Selected cached {site_id} frame for {label} (within {}m)",
-                (delta + 59) / 60
-            );
-            return true;
+    fn configure_event_archive_warning_sync(&mut self) {
+        if self.app_settings.event_sync_warnings {
+            // Cancel any live/stale warning request so selecting the first
+            // decoded event frame can immediately request the actual archive
+            // loop window through the Unified Player sync path.
+            self.hazard_receiver = None;
+            self.pending_event_loop_hazard_window = None;
+            self.unified_player.auto_sync_warnings = true;
+            self.arm_unified_player_timeline_warning_sync();
+        } else {
+            // Do not leave a prior archive-warning window painted over a new
+            // event loop whose explicit setting says warnings are unsynced.
+            self.hazard_receiver = None;
+            self.switch_to_live_hazard_mode();
         }
-        false
     }
 
     fn jump_to_archive_event(
@@ -13536,77 +13580,36 @@ impl ViewerApp {
             self.status = "No radar within 460 km of that event".to_owned();
             return;
         };
-        let site_id = self.sites[site_index].level2_id.clone();
-        self.clear_camera_follow_targets();
         self.selected_site_index = site_index;
+        self.clear_camera_follow_targets();
         self.map_center_lat = lat;
         self.map_center_lon = lon;
         self.map_scale = self.map_scale.max(220.0);
-        self.selected_cut = 0;
-        if self.select_cached_event_frame(&site_id, time_utc, &label, ctx) {
-            return;
-        }
-        self.archive_date_input = time_utc.format("%Y-%m-%d").to_string();
-        self.archive_pending_event = Some(ArchivePendingEvent {
+        self.configure_event_archive_warning_sync();
+        let context = ArchiveLoopContext::event(
             time_utc,
-            label: label.clone(),
-        });
-        self.status = format!(
-            "Event jump: {label} - listing {site_id} {}",
-            time_utc.format("%Y-%m-%d")
+            time_utc,
+            time_utc,
+            ArchiveLoopSource::EventPoint,
+            &self.app_settings,
         );
-        self.start_archive_listing(ctx);
+        match self.start_archive_window_load(context, label.clone(), true, ctx) {
+            Ok(status) => self.status = format!("{status} · {label}"),
+            Err(err) => self.status = format!("Event jump failed for {label}: {err}"),
+        }
     }
 
     /// Event click: switch to the lowest-beam radar over the report, center
-    /// the map there, and queue an archive load of the volume nearest the
-    /// report time (fires when the listing lands).
+    /// the map there, and load a point-event archive loop with explicit scans
+    /// before AND after the report time. This never uses the live/latest path.
     fn jump_to_spc_report(&mut self, report: &SpcReport, ctx: &egui::Context) {
         let scale = if report.f_scale.is_empty() || report.f_scale == "UNK" {
             String::new()
         } else {
             format!("EF{} ", report.f_scale)
         };
-        let event_label = format!("{scale}{}, {}", report.location, report.state);
-        // Lowest beam over the report location (same rule as the
-        // right-click menu).
-        let best = self
-            .sites
-            .iter()
-            .enumerate()
-            .filter_map(|(index, site)| {
-                // WSR-88Ds only — TDWRs' short range / attenuation make
-                // them the wrong default for an event jump.
-                if site.level2_id.starts_with('T') {
-                    return None;
-                }
-                let (site_lat, site_lon) = site_location(site)?;
-                let distance_km = haversine_km(report.lat, report.lon, site_lat, site_lon);
-                (distance_km <= 460.0).then_some((index, distance_km))
-            })
-            .min_by(|a, b| a.1.total_cmp(&b.1));
-        let Some((site_index, _)) = best else {
-            self.status = "No radar within 460 km of that report".to_owned();
-            return;
-        };
-        let site_id = self.sites[site_index].level2_id.clone();
-        self.clear_camera_follow_targets();
-        self.selected_site_index = site_index;
-        self.map_center_lat = report.lat;
-        self.map_center_lon = report.lon;
-        self.map_scale = self.map_scale.max(220.0);
-        self.selected_cut = 0;
-        if self.select_cached_event_frame(&site_id, report.time_utc, &event_label, ctx) {
-            return;
-        }
-        // The report time's RADAR date can differ from the SPC file date
-        // (12Z convention) — list the report's own calendar date.
-        self.archive_date_input = report.time_utc.format("%Y-%m-%d").to_string();
-        self.archive_pending_event = Some(ArchivePendingEvent {
-            time_utc: report.time_utc,
-            label: event_label,
-        });
-        self.start_archive_listing(ctx);
+        let label = format!("{scale}{}, {}", report.location, report.state);
+        self.jump_to_archive_event(report.lat, report.lon, report.time_utc, label, ctx);
     }
 
     fn jump_to_storm_report(&mut self, report: &spc_layers::StormReport, ctx: &egui::Context) {
@@ -15096,6 +15099,158 @@ impl ViewerApp {
         });
         ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
         true
+    }
+
+    /// Shared US archive-window loader for event clicks and the Event Loop
+    /// Builder. Unlike the live/latest loader, this always replaces the
+    /// primary history with objects selected by `Level2ArchiveWindowRequest`,
+    /// so a same-site live frame cannot remain selected or leak into the loop.
+    pub(crate) fn start_archive_window_load(
+        &mut self,
+        context: ArchiveLoopContext,
+        load_label: String,
+        auto_play: bool,
+        ctx: &egui::Context,
+    ) -> Result<String, String> {
+        let Some(site) = self.selected_site().cloned() else {
+            return Err("No site selected".to_owned());
+        };
+
+        let replaced_active_load = self.load_receiver.take().is_some();
+        self.archive_load_progress = None;
+        self.pending_site_id = None;
+        self.live_refresh_skip_reason = None;
+        self.archive_list_receiver = None;
+        self.archive_load_after_listing = false;
+        self.archive_volumes = None;
+        self.archive_loaded_range = None;
+        self.archive_pending_event = None;
+        self.event_explorer.pending_range = None;
+        self.pending_debug_archive_case = None;
+        self.pending_data_pack_scene = None;
+        self.loaded_data_pack = None;
+        self.archive_date_input = context.start_utc.format("%Y-%m-%d").to_string();
+        self.history_playing = false;
+        self.browsing_history = false;
+        self.last_history_step = None;
+        self.selected_cut = 0;
+        self.realtime_level2_auto_refresh = false;
+        self.poll_active = false;
+        self.history_frame_limit = self
+            .history_frame_limit
+            .max(context.max_frames.min(MAX_HISTORY_FRAME_LIMIT));
+        self.clear_frame_history();
+        self.clear_displayed_volume_for_pending_load(ctx);
+        self.event_explorer.pending_autoplay = auto_play;
+        self.begin_primary_load_telemetry();
+
+        let site_id = site.level2_id.clone();
+        let request = context.window_request();
+        let progress_label = context.source.progress_label().to_owned();
+        let status = format!(
+            "{}: {site_id} {} to {} · before {} / after {} · cap {}",
+            context.source.progress_label(),
+            context.start_utc.format("%Y-%m-%d %H:%MZ"),
+            context.end_utc.format("%Y-%m-%d %H:%MZ"),
+            context.before_scans,
+            context.after_scans,
+            context.max_frames,
+        );
+        let progress = ArchiveLoadProgress::indeterminate(progress_label.clone(), status.clone());
+        self.status = status.clone();
+        self.archive_load_progress = Some(progress);
+        let (sender, receiver) = mpsc::channel();
+        self.load_receiver = Some(receiver);
+        self.pending_site_id = Some(site_id.clone());
+        let site_cache = cache_dir(&site_id);
+        let anchor_utc = context.anchor_utc;
+        let worker_site_id = site_id.clone();
+        let worker_label = load_label.clone();
+        thread::spawn(move || {
+            let total_start = Instant::now();
+            let site_id = worker_site_id;
+            let final_result = (|| -> Result<DecodedLoadBatch, String> {
+                send_archive_progress(
+                    &sender,
+                    &progress_label,
+                    format!("Listing {site_id} archive window"),
+                    0,
+                    0,
+                );
+                let selection = data_source::level2_objects_for_window(&site_id, &request)
+                    .map_err(|err| err.to_string())?;
+                let count = selection.objects.len();
+                send_archive_progress(
+                    &sender,
+                    &progress_label,
+                    format!("Queued {site_id} {count} archive scans"),
+                    0,
+                    count,
+                );
+                let decode_objects = selection
+                    .objects
+                    .into_iter()
+                    .enumerate()
+                    .collect::<Vec<_>>();
+                let known_frame_paths = BTreeSet::new();
+                let (mut decoded_frames, first_error) = load_archive_history_objects_parallel(
+                    ArchiveHistoryLoadContext {
+                        site_id: &site_id,
+                        progress_label: &progress_label,
+                        site_cache_dir: &site_cache,
+                        known_frame_paths: &known_frame_paths,
+                        archive_lookup_ms: None,
+                        total_start,
+                        sender: &sender,
+                        progress_done_start: 0,
+                        progress_total: count,
+                    },
+                    decode_objects,
+                );
+                decoded_frames.sort_by(|left, right| {
+                    frame_identity_for_volume(&left.volume)
+                        .cmp(&frame_identity_for_volume(&right.volume))
+                });
+                if decoded_frames.is_empty() {
+                    return Err(first_error.unwrap_or_else(|| {
+                        format!("no displayable {site_id} scans decoded for the archive window")
+                    }));
+                }
+                let selected_index = decoded_frames
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, decoded)| {
+                        decoded
+                            .volume
+                            .volume_time
+                            .with_timezone(&Utc)
+                            .signed_duration_since(anchor_utc)
+                            .num_milliseconds()
+                            .unsigned_abs()
+                    })
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+                Ok(DecodedLoadBatch {
+                    frames: decoded_frames,
+                    selected_index,
+                })
+            })();
+            let _ = sender.send(AsyncLoadResult {
+                label: worker_label,
+                update: AsyncLoadUpdate::Final(final_result),
+            });
+        });
+        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+
+        Ok(format!(
+            "{}{}",
+            if replaced_active_load {
+                "Replaced active radar load; "
+            } else {
+                ""
+            },
+            status
+        ))
     }
 
     fn start_event_loop_archive_radar_load(
@@ -44800,6 +44955,15 @@ pub(crate) fn normalized_event_pad_frames(count: u16) -> u16 {
     count.min(MAX_EVENT_PAD_FRAMES)
 }
 
+pub(crate) fn normalized_event_max_frames(count: u16) -> usize {
+    let count = usize::from(count);
+    if count == 0 {
+        DEFAULT_EVENT_MAX_FRAMES
+    } else {
+        count.clamp(1, MAX_HISTORY_FRAME_LIMIT)
+    }
+}
+
 fn frame_identity_for_volume(volume: &RadarVolume) -> FrameIdentity {
     FrameIdentity {
         site_id: volume.site.id.clone(),
@@ -57868,43 +58032,6 @@ mod tests {
     }
 
     #[test]
-    fn cached_event_frame_selection_does_not_leave_background_progress() {
-        let mut app = test_viewer_app_with_hazards(Vec::new());
-        let scan_time = Utc.with_ymd_and_hms(2011, 4, 27, 22, 15, 0).unwrap();
-        let volume = Arc::new(RadarVolume::new(
-            radar_core::RadarSite::new("KTLX"),
-            scan_time,
-        ));
-        app.frame_history.push(FrameHistoryEntry {
-            identity: frame_identity_for_volume(&volume),
-            path: PathBuf::from("archive://KTLX20110427_221500_V06"),
-            volume,
-            timings: None,
-            status: FrameStatus::Complete,
-            source_label: "archive KTLX".to_owned(),
-        });
-        app.archive_load_progress = Some(ArchiveLoadProgress {
-            label: "Archive loop".to_owned(),
-            detail: "stale previous job".to_owned(),
-            done: 1,
-            total: 5,
-        });
-
-        let selected = app.select_cached_event_frame(
-            "KTLX",
-            scan_time,
-            "Tuscaloosa",
-            &egui::Context::default(),
-        );
-
-        assert!(selected);
-        assert!(app.archive_load_progress.is_none());
-        assert!(app.active_background_activity().is_none());
-        assert_eq!(app.selected_frame_index, 0);
-        assert!(app.status.contains("Selected cached KTLX frame"));
-    }
-
-    #[test]
     fn background_activity_reports_model_ingest_status_without_panel() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let (_sender, receiver) = mpsc::channel();
@@ -58199,6 +58326,17 @@ mod tests {
             MAX_EVENT_PAD_FRAMES
         );
         assert_eq!(normalized_event_pad_frames(u16::MAX), MAX_EVENT_PAD_FRAMES);
+    }
+
+    #[test]
+    fn event_max_frames_defaults_and_clamps_to_history_capacity() {
+        assert_eq!(normalized_event_max_frames(0), DEFAULT_EVENT_MAX_FRAMES);
+        assert_eq!(normalized_event_max_frames(1), 1);
+        assert_eq!(normalized_event_max_frames(36), 36);
+        assert_eq!(
+            normalized_event_max_frames(u16::MAX),
+            MAX_HISTORY_FRAME_LIMIT
+        );
     }
 
     #[test]

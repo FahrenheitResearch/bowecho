@@ -565,15 +565,17 @@ fn level2_window_listing_dates(request: &Level2ArchiveWindowRequest) -> Vec<Naiv
     let end_utc = request.end_utc.max(request.start_utc);
     let start_date = request.start_utc.date_naive();
     let end_date = end_utc.date_naive();
-    // Context scans can live just outside the event's UTC dates. With any pad
-    // request, list one adjacent day on each side so midnight loops can still
-    // include the scan that began before/after the nominal event window.
-    let first_date = if request.pad_scans > 0 {
+    // Context scans can live just outside the event's UTC dates. List only
+    // the adjacent side(s) the request can actually consume; explicit
+    // asymmetric context must work at midnight even when legacy pad_scans=0.
+    let needs_previous_date = request.pad_scans > 0 || request.extra_start_scans > 0;
+    let needs_next_date = request.pad_scans > 0 || request.extra_end_scans > 0;
+    let first_date = if needs_previous_date {
         start_date.pred_opt().unwrap_or(start_date)
     } else {
         start_date
     };
-    let last_date = if request.pad_scans > 0 {
+    let last_date = if needs_next_date {
         end_date.succ_opt().unwrap_or(end_date)
     } else {
         end_date
@@ -617,6 +619,12 @@ pub fn select_level2_objects_for_window(
     start = start.saturating_sub(request.pad_scans + request.extra_start_scans);
     let end = (end + request.pad_scans + request.extra_end_scans).min(timed.len() - 1);
     if end + 1 - start > request.max_objects {
+        // Cap policy: keep the newest requested scans. For a one-point event
+        // this trims pre-event context first and preserves post-event scans.
+        // If the cap is smaller than anchor+after context, the anchor can fall
+        // out and selected_index intentionally becomes the first available
+        // post-anchor scan (nearest-time policy below), never a live/latest
+        // volume from outside this archive selection.
         start = end + 1 - request.max_objects;
     }
     let objects = timed[start..=end]
@@ -1811,7 +1819,54 @@ mod tests {
     }
 
     #[test]
-    fn archive_window_listing_dates_include_adjacent_days_for_padding() {
+    fn point_archive_window_keeps_after_context_when_capped() {
+        let objects = test_level2_objects(
+            "KTLX",
+            &[
+                "195500", "200000", "200500", "201000", "201500", "202000", "202500",
+            ],
+        );
+        let mut request = Level2ArchiveWindowRequest {
+            start_utc: test_time("20260609", "200700"),
+            end_utc: test_time("20260609", "200700"),
+            anchor_utc: test_time("20260609", "200700"),
+            pad_scans: 0,
+            extra_start_scans: 2,
+            extra_end_scans: 3,
+            max_objects: 4,
+        };
+
+        let selected = select_level2_objects_for_window(&objects, &request).expect("selection");
+        assert_eq!(
+            selected
+                .objects
+                .iter()
+                .filter_map(level2_object_time_utc)
+                .map(|time| time.format("%H%M%S").to_string())
+                .collect::<Vec<_>>(),
+            vec!["200500", "201000", "201500", "202000"]
+        );
+        assert_eq!(selected.selected_index, 0, "anchor scan stays selected");
+
+        request.max_objects = 2;
+        let selected = select_level2_objects_for_window(&objects, &request).expect("selection");
+        assert_eq!(
+            selected
+                .objects
+                .iter()
+                .filter_map(level2_object_time_utc)
+                .map(|time| time.format("%H%M%S").to_string())
+                .collect::<Vec<_>>(),
+            vec!["201500", "202000"]
+        );
+        assert_eq!(
+            selected.selected_index, 0,
+            "when the cap excludes the anchor, select the first post-anchor scan"
+        );
+    }
+
+    #[test]
+    fn archive_window_listing_dates_include_only_requested_context_days() {
         let mut request = Level2ArchiveWindowRequest {
             start_utc: test_time("20260610", "000200"),
             end_utc: test_time("20260610", "000700"),
@@ -1827,6 +1882,26 @@ mod tests {
             vec![NaiveDate::from_ymd_opt(2026, 6, 10).unwrap()]
         );
 
+        request.extra_start_scans = 1;
+        assert_eq!(
+            level2_window_listing_dates(&request),
+            vec![
+                NaiveDate::from_ymd_opt(2026, 6, 9).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 6, 10).unwrap(),
+            ]
+        );
+
+        request.extra_start_scans = 0;
+        request.extra_end_scans = 1;
+        assert_eq!(
+            level2_window_listing_dates(&request),
+            vec![
+                NaiveDate::from_ymd_opt(2026, 6, 10).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 6, 11).unwrap(),
+            ]
+        );
+
+        request.extra_end_scans = 0;
         request.pad_scans = 1;
         assert_eq!(
             level2_window_listing_dates(&request),

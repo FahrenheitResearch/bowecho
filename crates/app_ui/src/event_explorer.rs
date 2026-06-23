@@ -101,6 +101,24 @@ impl EventTrackHit {
     }
 }
 
+fn archive_loop_context_for_hit(
+    hit: &EventTrackHit,
+    settings: &settings::AppSettings,
+) -> crate::ArchiveLoopContext {
+    let point_event = hit.length_mi <= f32::EPSILON || hit.begin == hit.end;
+    let end_utc = if point_event {
+        hit.time_utc
+    } else {
+        hit.lift_time()
+    };
+    let source = if point_event {
+        crate::ArchiveLoopSource::EventPoint
+    } else {
+        crate::ArchiveLoopSource::EventTrack
+    };
+    crate::ArchiveLoopContext::event(hit.time_utc, end_utc, hit.time_utc, source, settings)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct EventTrackCameraFollow {
     pub label: String,
@@ -181,22 +199,6 @@ pub(crate) fn select_event_radar_indices(
     Some((primary, overlay))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct EventTrackLoadPlan {
-    load_primary_archive: bool,
-    overlay_index: Option<usize>,
-}
-
-fn event_track_load_plan(
-    primary_cache_hit: bool,
-    overlay_index: Option<usize>,
-) -> EventTrackLoadPlan {
-    EventTrackLoadPlan {
-        load_primary_archive: !primary_cache_hit,
-        overlay_index,
-    }
-}
-
 /// Estimated time the tornado lifted: begin time plus path length over
 /// the ~30 mph climatological translation speed (see
 /// [`TRACK_TRANSLATION_MPH`]), clamped to two hours.
@@ -212,6 +214,7 @@ pub(crate) fn estimated_track_end_time(begin: DateTime<Utc>, length_mi: f32) -> 
 /// "HH:MM:SS" display/sort label for an archive object key
 /// (KXXX20260609_235423_V06 -> "23:54:23"), the same convention the
 /// archive listing builds — labels sort chronologically within a date.
+#[cfg(test)]
 pub(crate) fn volume_time_label(key: &str) -> String {
     key.rsplit('/')
         .next()
@@ -382,7 +385,7 @@ impl crate::ViewerApp {
                 .to_string();
         }
         let mut load: Option<NaiveDate> = None;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.event_explorer.date_input)
                     .hint_text("YYYY-MM-DD")
@@ -416,26 +419,66 @@ impl crate::ViewerApp {
                 self.spc_data.fetched_at = None; // outlook follows again
                 ctx.request_repaint();
             }
-            // Track-click loop context (persisted): scans loaded beyond
-            // the track window on each side — short tracks otherwise
-            // land a loop of only a few frames (field request).
-            let mut pad = crate::normalized_event_pad_frames(self.app_settings.event_pad_frames);
-            ui.label("Track pad").on_hover_text(
-                "Tornado track clicks only. SPC report dots use the Archive Fetch N scans control.",
+            // Every event click uses one explicit archive-loop context model;
+            // these controls do not inherit the Archive browser's manual N.
+            let mut before = crate::normalized_event_pad_frames(
+                self.app_settings.effective_event_before_scans(),
+            );
+            let mut after = crate::normalized_event_pad_frames(
+                self.app_settings.effective_event_after_scans(),
+            );
+            let mut max_frames = crate::normalized_event_max_frames(
+                self.app_settings.event_max_frames,
+            ) as u16;
+            ui.label("Event loop").on_hover_text(
+                "Used by tornado tracks and point reports. Independent of Archive > Fetch N scans.",
             );
             ui.add(
-                egui::DragValue::new(&mut pad)
+                egui::DragValue::new(&mut before)
                     .range(0..=crate::MAX_EVENT_PAD_FRAMES)
                     .speed(0.1)
-                    .prefix("±")
+                    .prefix("Before ")
+                    .suffix(" scans"),
+            )
+            .on_hover_text("Archive scans before touchdown or the point-report time");
+            ui.add(
+                egui::DragValue::new(&mut after)
+                    .range(0..=crate::MAX_EVENT_PAD_FRAMES)
+                    .speed(0.1)
+                    .prefix("After ")
                     .suffix(" scans"),
             )
             .on_hover_text(
-                "Clicking a tornado track loads this many extra archive scans before \
-                 touchdown and after lift. SPC report dots use Archive > Fetch N scans instead.",
+                "Archive scans after lift or the point-report time; one-point events still load these post-event scans",
             );
-            if pad != self.app_settings.event_pad_frames {
-                self.app_settings.event_pad_frames = pad;
+            ui.add(
+                egui::DragValue::new(&mut max_frames)
+                    .range(1..=crate::MAX_HISTORY_FRAME_LIMIT as u16)
+                    .speed(1.0)
+                    .prefix("Cap ")
+                    .suffix(" frames"),
+            )
+            .on_hover_text(
+                "Maximum event-loop frames. When trimming a point event, post-event context is kept before older pre-event scans.",
+            );
+            if self.app_settings.event_before_scans != Some(before)
+                || self.app_settings.event_after_scans != Some(after)
+                || self.app_settings.event_max_frames != max_frames
+            {
+                self.app_settings.event_before_scans = Some(before);
+                self.app_settings.event_after_scans = Some(after);
+                self.app_settings.event_max_frames = max_frames;
+                let _ = self.app_settings.save();
+            }
+            let mut sync_warnings = self.app_settings.event_sync_warnings;
+            if ui
+                .checkbox(&mut sync_warnings, "Sync warnings")
+                .on_hover_text(
+                    "Load warning products for the actual archive loop window after the event radar frames land.",
+                )
+                .changed()
+            {
+                self.app_settings.event_sync_warnings = sync_warnings;
                 let _ = self.app_settings.save();
             }
             let mut camera_follow = self.app_settings.event_track_camera_follow;
@@ -726,11 +769,10 @@ impl crate::ViewerApp {
     }
 
     /// Track click: PRIMARY = the lowest-beam WSR-88D nearest the track
-    /// midpoint, loaded as an archive loop spanning the track window plus
-    /// `event_pad_frames` scans of context each side that auto-plays at
-    /// the lowest tilt; when the radar nearest the track END differs, it
-    /// loads as a second radar overlay at the event time. (The
-    /// `jump_to_spc_report` flow, generalized.)
+    /// midpoint, loaded through the shared US archive-window loader. A point
+    /// event has start=end=touchdown but still requests explicit post-event
+    /// scans; a surveyed track uses touchdown..lift plus separate before/after
+    /// context. This path never invokes live/latest loading.
     pub(crate) fn jump_to_event_track(&mut self, hit: &EventTrackHit, ctx: &egui::Context) {
         let eligible: Vec<(usize, f32, f32)> = self
             .sites
@@ -752,50 +794,41 @@ impl crate::ViewerApp {
             return;
         };
         self.selected_site_index = primary;
-        let primary_site_id = self.sites[primary].level2_id.clone();
         self.map_center_lat = (hit.begin.0 + hit.end.0) / 2.0;
         self.map_center_lon = (hit.begin.1 + hit.end.1) / 2.0;
         self.map_scale = self.map_scale.max(220.0);
-        let end_time = hit.lift_time();
         self.clear_camera_follow_targets();
         self.event_explorer.camera_follow = self
             .app_settings
             .event_track_camera_follow
             .then(|| EventTrackCameraFollow::from_hit(hit));
-        let primary_cache_hit =
-            self.select_cached_event_frame(&primary_site_id, hit.time_utc, &hit.label, ctx);
-        let load_plan = event_track_load_plan(primary_cache_hit, overlay);
-        if load_plan.load_primary_archive {
-            // The track time's RADAR date can differ from the SPC file date
-            // (12Z convention) — list the track's own calendar date.
-            self.archive_date_input = hit.time_utc.format("%Y-%m-%d").to_string();
-            self.event_explorer.pending_range = Some((hit.time_utc, end_time));
-            self.status = format!(
-                "Event jump: {} · loop {}–{}Z ±{} scans",
-                hit.label,
-                hit.time_utc.format("%H%M"),
-                end_time.format("%H%M"),
-                crate::normalized_event_pad_frames(self.app_settings.event_pad_frames),
-            );
-            self.start_archive_listing(ctx);
+        self.configure_event_archive_warning_sync();
+        let context = archive_loop_context_for_hit(hit, &self.app_settings);
+        let overlay_context = context.clone();
+        match self.start_archive_window_load(context, hit.label.clone(), true, ctx) {
+            Ok(status) => self.status = format!("{status} · {}", hit.label),
+            Err(err) => {
+                self.status = format!("Event jump failed for {}: {err}", hit.label);
+                return;
+            }
         }
-        if let Some(overlay_index) = load_plan.overlay_index
+        if let Some(overlay_index) = overlay
             && let Some(site) = self.sites.get(overlay_index).cloned()
         {
-            self.start_radar_layer_event_load(site, end_time, ctx);
+            self.start_radar_layer_event_load(site, &overlay_context, ctx);
         }
         if self.app_settings.event_track_auto_model {
             self.start_event_track_model_ingest(hit.time_utc, &hit.label, ctx);
         }
     }
 
-    /// Load ONE archive volume nearest `target` into a radar overlay
-    /// layer (the second radar of a track jump) — the overlay-layer
-    /// machinery with an archive object instead of the live latest.
+    /// Load the same archive context into the optional second radar. The
+    /// layer is timeline-synchronized and marked archive-owned immediately,
+    /// so the overlay refresh loop cannot replace it with a live/latest scan.
     pub(crate) fn start_radar_layer_event_load(
         &mut self,
         site: data_source::RadarSite,
-        target: DateTime<Utc>,
+        context: &crate::ArchiveLoopContext,
         ctx: &egui::Context,
     ) {
         let index = match self
@@ -822,60 +855,101 @@ impl crate::ViewerApp {
         };
         let layer = &mut self.radar_layers[index];
         layer.visible = true;
-        if layer.load_receiver.is_some() {
-            return;
-        }
+        layer.timeline_sync = true;
+        layer.load_receiver = None;
+        layer.frame_history.clear();
+        layer.selected_frame_index = 0;
+        layer.selected_cut = None;
+        layer.source_path = None;
+        layer.volume = None;
+        layer.texture = None;
+        layer.texture_key = None;
+        layer.pending_render_key = None;
+        layer.render_ms = None;
+        layer.worker_ms = None;
+        layer.texture_ms = None;
+
         let site_id = layer.site.level2_id.clone();
+        let request = context.window_request();
+        let anchor_utc = context.anchor_utc;
         let (sender, receiver) = mpsc::channel();
         layer.load_receiver = Some(receiver);
-        layer.status = format!("Loading {site_id} @ {}Z", target.format("%H%M"));
-        self.status = format!("Second radar {site_id} @ {}Z", target.format("%H%M"));
+        layer.status = format!(
+            "Loading synced {site_id} event loop · before {} / after {}",
+            context.before_scans, context.after_scans
+        );
         let site_cache = crate::cache_dir(&site_id);
         let worker_ctx = ctx.clone();
         thread::spawn(move || {
             let label = format!("L2 {site_id} event overlay");
-            let send_final = |result: Result<crate::DecodedLoadBatch, String>| {
-                let _ = sender.send(crate::AsyncLoadResult {
-                    label: label.clone(),
-                    update: crate::AsyncLoadUpdate::Final(result),
-                });
-                worker_ctx.request_repaint();
-            };
-            let objects = match data_source::level2_objects_for_date(&site_id, target.date_naive())
-            {
-                Ok(objects) => objects,
-                Err(err) => {
-                    send_final(Err(err.to_string()));
-                    return;
+            let result = (|| -> Result<crate::DecodedLoadBatch, String> {
+                let selection = data_source::level2_objects_for_window(&site_id, &request)
+                    .map_err(|err| err.to_string())?;
+                let count = selection.objects.len();
+                let total_start = Instant::now();
+                let known_frame_paths = BTreeSet::new();
+                let mut decoded_frames = Vec::with_capacity(count);
+                for (index, object) in selection.objects.into_iter().enumerate() {
+                    crate::send_archive_progress(
+                        &sender,
+                        "Event overlay loop",
+                        format!("Fetching {site_id} event scan"),
+                        index,
+                        count,
+                    );
+                    match crate::decode_archive_history_object(
+                        &site_id,
+                        object,
+                        &site_cache,
+                        &known_frame_paths,
+                        None,
+                        total_start,
+                        &sender,
+                        false,
+                        false,
+                    ) {
+                        Ok(Some(decoded)) => decoded_frames.push(decoded),
+                        Ok(None) => {}
+                        Err(err) => return Err(err),
+                    }
+                    crate::send_archive_progress(
+                        &sender,
+                        "Event overlay loop",
+                        format!("Decoded {site_id} event scan"),
+                        index + 1,
+                        count,
+                    );
                 }
-            };
-            let labels: Vec<String> = objects
-                .iter()
-                .map(|object| volume_time_label(&object.key))
-                .collect();
-            let target_label = target.format("%H:%M:%S").to_string();
-            let Some(nearest) = nearest_volume_index(&labels, &target_label) else {
-                send_final(Err(format!(
-                    "no archive volumes for {site_id} on {}",
-                    target.date_naive()
-                )));
-                return;
-            };
-            match crate::decode_archive_history_object(
-                &site_id,
-                objects[nearest].clone(),
-                &site_cache,
-                &BTreeSet::new(),
-                None,
-                Instant::now(),
-                &sender,
-                false,
-                true,
-            ) {
-                Ok(Some(decoded)) => send_final(Ok(crate::DecodedLoadBatch::single(decoded))),
-                Ok(None) => send_final(Err("event volume had no displayable products".to_owned())),
-                Err(err) => send_final(Err(err)),
-            }
+                decoded_frames.sort_by_key(|decoded| decoded.volume.volume_time);
+                if decoded_frames.is_empty() {
+                    return Err(format!(
+                        "no displayable {site_id} scans decoded for the event overlay"
+                    ));
+                }
+                let selected_index = decoded_frames
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, decoded)| {
+                        decoded
+                            .volume
+                            .volume_time
+                            .with_timezone(&Utc)
+                            .signed_duration_since(anchor_utc)
+                            .num_milliseconds()
+                            .unsigned_abs()
+                    })
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+                Ok(crate::DecodedLoadBatch {
+                    frames: decoded_frames,
+                    selected_index,
+                })
+            })();
+            let _ = sender.send(crate::AsyncLoadResult {
+                label,
+                update: crate::AsyncLoadUpdate::Final(result),
+            });
+            worker_ctx.request_repaint();
         });
         ctx.request_repaint_after(Duration::from_millis(crate::ACTIVE_LOAD_POLL_MS));
     }
@@ -955,35 +1029,6 @@ mod tests {
     }
 
     #[test]
-    fn event_track_load_plan_keeps_overlay_when_primary_is_cached() {
-        assert_eq!(
-            event_track_load_plan(true, Some(7)),
-            EventTrackLoadPlan {
-                load_primary_archive: false,
-                overlay_index: Some(7),
-            }
-        );
-        assert_eq!(
-            event_track_load_plan(true, None),
-            EventTrackLoadPlan {
-                load_primary_archive: false,
-                overlay_index: None,
-            }
-        );
-    }
-
-    #[test]
-    fn event_track_load_plan_lists_primary_when_cache_misses() {
-        assert_eq!(
-            event_track_load_plan(false, Some(3)),
-            EventTrackLoadPlan {
-                load_primary_archive: true,
-                overlay_index: Some(3),
-            }
-        );
-    }
-
-    #[test]
     fn track_end_time_scales_with_path_length_and_clamps() {
         let begin = Utc.with_ymd_and_hms(2011, 4, 27, 20, 5, 0).unwrap();
         // Zero-length: lifts immediately.
@@ -998,6 +1043,68 @@ mod tests {
             estimated_track_end_time(begin, 400.0),
             begin + ChronoDuration::minutes(120)
         );
+    }
+
+    #[test]
+    fn one_point_event_context_requests_post_event_scans() {
+        let time = Utc.with_ymd_and_hms(2026, 6, 14, 22, 0, 0).unwrap();
+        let hit = EventTrackHit {
+            begin: (35.0, -97.0),
+            end: (35.0, -97.0),
+            time_utc: time,
+            end_time_utc: Some(time + ChronoDuration::minutes(12)),
+            length_mi: 0.0,
+            label: "Point report".to_owned(),
+        };
+        let settings = settings::AppSettings {
+            event_before_scans: Some(3),
+            event_after_scans: Some(7),
+            event_max_frames: 18,
+            ..Default::default()
+        };
+
+        let context = archive_loop_context_for_hit(&hit, &settings);
+        let request = context.window_request();
+
+        assert_eq!(context.source, crate::ArchiveLoopSource::EventPoint);
+        assert_eq!(request.start_utc, time);
+        assert_eq!(
+            request.end_utc, time,
+            "point geometry forces a point window"
+        );
+        assert_eq!(request.extra_start_scans, 3);
+        assert_eq!(request.extra_end_scans, 7);
+        assert_eq!(request.max_objects, 18);
+    }
+
+    #[test]
+    fn surveyed_track_context_uses_touchdown_through_lift() {
+        let touchdown = Utc.with_ymd_and_hms(2026, 6, 14, 22, 0, 0).unwrap();
+        let lift = touchdown + ChronoDuration::minutes(22);
+        let hit = EventTrackHit {
+            begin: (35.0, -97.0),
+            end: (35.4, -96.6),
+            time_utc: touchdown,
+            end_time_utc: Some(lift),
+            length_mi: 12.0,
+            label: "Surveyed track".to_owned(),
+        };
+        let settings = settings::AppSettings {
+            event_before_scans: Some(5),
+            event_after_scans: Some(6),
+            event_max_frames: 24,
+            ..Default::default()
+        };
+
+        let context = archive_loop_context_for_hit(&hit, &settings);
+        let request = context.window_request();
+
+        assert_eq!(context.source, crate::ArchiveLoopSource::EventTrack);
+        assert_eq!(request.start_utc, touchdown);
+        assert_eq!(request.end_utc, lift);
+        assert_eq!(request.anchor_utc, touchdown);
+        assert_eq!(request.extra_start_scans, 5);
+        assert_eq!(request.extra_end_scans, 6);
     }
 
     fn labels(times: &[&str]) -> Vec<String> {
