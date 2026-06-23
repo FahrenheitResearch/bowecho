@@ -27,6 +27,8 @@ pub const FLOOR_N: usize = 512;
 pub const BOX_HALF_KM: f32 = 60.0;
 pub const BOX_TOP_M: f32 = 18_000.0;
 const MAX_SHADER_STEPS: usize = 256;
+const UNIFORM_FLOATS: usize = 24;
+const UNIFORM_BYTES: u64 = (UNIFORM_FLOATS * std::mem::size_of::<f32>()) as u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FloorMode {
@@ -62,6 +64,21 @@ pub enum Vol3dQuality {
     High,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Vol3dCameraMode {
+    Orbit,
+    Fly,
+}
+
+impl Vol3dCameraMode {
+    pub fn shader_value(self) -> f32 {
+        match self {
+            Self::Orbit => 0.0,
+            Self::Fly => 1.0,
+        }
+    }
+}
+
 impl Vol3dQuality {
     pub const ALL: [Self; 3] = [Self::Draft, Self::Balanced, Self::High];
 
@@ -88,6 +105,11 @@ pub struct Vol3d {
     pub yaw: f32,
     pub pitch: f32,
     pub dist: f32,
+    pub camera_mode: Vol3dCameraMode,
+    pub fly_x: f32,
+    pub fly_y: f32,
+    pub fly_z: f32,
+    pub fly_speed: f32,
     pub threshold_dbz: f32,
     pub opacity: f32,
     /// Optical-depth multiplier. Opacity controls each sample; density controls
@@ -160,6 +182,8 @@ pub struct VolumeBox {
     pub floor_elevation_deg: Option<f32>,
 }
 
+type CameraBasis = ([f32; 3], [f32; 3], [f32; 3], [f32; 3]);
+
 impl Default for Vol3d {
     fn default() -> Self {
         Self {
@@ -167,6 +191,11 @@ impl Default for Vol3d {
             yaw: 0.6,
             pitch: 0.45,
             dist: 2.4,
+            camera_mode: Vol3dCameraMode::Orbit,
+            fly_x: 0.0,
+            fly_y: -2.4,
+            fly_z: 1.0,
+            fly_speed: 1.2,
             threshold_dbz: 35.0,
             opacity: 0.55,
             density: 1.0,
@@ -209,7 +238,7 @@ impl Vol3d {
     /// `box_half_km`; therefore top_km / half_km is the physically correct
     /// height and the user multiplier is a stable exaggeration across sizes.
     pub fn zspan(&self) -> f32 {
-        (self.top_km() / self.box_half_km.max(1.0) * self.vertical_exaggeration).clamp(0.06, 1.6)
+        (self.top_km() / self.box_half_km.max(1.0) * self.vertical_exaggeration).clamp(0.06, 24.0)
     }
 
     pub fn focus_height_fraction(&self) -> f32 {
@@ -223,12 +252,122 @@ impl Vol3d {
         (low, high)
     }
 
+    pub fn orbit_distance(&self) -> f32 {
+        self.dist.max(self.zspan() * 0.45 + 1.25)
+    }
+
+    fn orbit_center(&self) -> [f32; 3] {
+        [0.0, 0.0, self.zspan() * self.focus_height_fraction()]
+    }
+
+    pub fn orbit_eye(&self) -> [f32; 3] {
+        let center = self.orbit_center();
+        let (cy, sy) = (self.yaw.cos(), self.yaw.sin());
+        let (cp, sp) = (self.pitch.cos(), self.pitch.sin());
+        let dist = self.orbit_distance();
+        [
+            center[0] + dist * cy * cp,
+            center[1] + dist * sy * cp,
+            center[2] + dist * sp,
+        ]
+    }
+
+    fn fly_forward(&self) -> [f32; 3] {
+        let (cy, sy) = (self.yaw.cos(), self.yaw.sin());
+        let (cp, sp) = (self.pitch.cos(), self.pitch.sin());
+        [-cy * cp, -sy * cp, -sp]
+    }
+
+    fn camera_basis(&self) -> Option<CameraBasis> {
+        let (eye, mut fwd) = match self.camera_mode {
+            Vol3dCameraMode::Orbit => {
+                let center = self.orbit_center();
+                let eye = self.orbit_eye();
+                (
+                    eye,
+                    [center[0] - eye[0], center[1] - eye[1], center[2] - eye[2]],
+                )
+            }
+            Vol3dCameraMode::Fly => ([self.fly_x, self.fly_y, self.fly_z], self.fly_forward()),
+        };
+        let fwd_len = (fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]).sqrt();
+        if !fwd_len.is_finite() || fwd_len <= 1.0e-6 {
+            return None;
+        }
+        for component in &mut fwd {
+            *component /= fwd_len;
+        }
+        let mut right = [fwd[1], -fwd[0], 0.0];
+        let right_len = (right[0] * right[0] + right[1] * right[1]).sqrt();
+        if !right_len.is_finite() || right_len <= 1.0e-6 {
+            return None;
+        }
+        right[0] /= right_len;
+        right[1] /= right_len;
+        let up = [
+            right[1] * fwd[2] - right[2] * fwd[1],
+            right[2] * fwd[0] - right[0] * fwd[2],
+            right[0] * fwd[1] - right[1] * fwd[0],
+        ];
+        Some((eye, fwd, right, up))
+    }
+
+    pub fn enter_orbit_mode(&mut self) {
+        self.camera_mode = Vol3dCameraMode::Orbit;
+        self.pitch = self.pitch.clamp(0.03, 1.50);
+    }
+
+    pub fn enter_fly_mode(&mut self) {
+        if self.camera_mode != Vol3dCameraMode::Fly {
+            let eye = self.orbit_eye();
+            self.fly_x = eye[0];
+            self.fly_y = eye[1];
+            self.fly_z = eye[2];
+        }
+        self.camera_mode = Vol3dCameraMode::Fly;
+        self.pitch = self.pitch.clamp(-1.45, 1.45);
+    }
+
+    pub fn reset_fly_eye_from_orbit(&mut self) {
+        let eye = self.orbit_eye();
+        self.fly_x = eye[0];
+        self.fly_y = eye[1];
+        self.fly_z = eye[2];
+    }
+
+    pub fn fly_dolly(&mut self, amount: f32) {
+        let fwd = self.fly_forward();
+        self.fly_x += fwd[0] * amount;
+        self.fly_y += fwd[1] * amount;
+        self.fly_z = (self.fly_z + fwd[2] * amount).clamp(-1.0, self.zspan() + 1.0);
+    }
+
+    pub fn apply_fly_movement(&mut self, strafe: f32, forward: f32, vertical: f32, dt: f32) {
+        if strafe == 0.0 && forward == 0.0 && vertical == 0.0 {
+            return;
+        }
+        let fwd = self.fly_forward();
+        let mut right = [fwd[1], -fwd[0], 0.0];
+        let right_len = (right[0] * right[0] + right[1] * right[1]).sqrt();
+        if right_len > 1.0e-6 {
+            right[0] /= right_len;
+            right[1] /= right_len;
+        }
+        let speed = self.fly_speed.max(0.05) * dt.max(0.0);
+        self.fly_x += (right[0] * strafe + fwd[0] * forward) * speed;
+        self.fly_y += (right[1] * strafe + fwd[1] * forward) * speed;
+        self.fly_z =
+            (self.fly_z + (fwd[2] * forward + vertical) * speed).clamp(-1.0, self.zspan() + 1.0);
+    }
+
     pub fn reset_camera(&mut self) {
         self.yaw = 0.6;
         self.pitch = 0.45;
         self.dist = 2.4;
         self.fov_scale = 0.7;
         self.focus_height_km = 6.0;
+        self.enter_orbit_mode();
+        self.reset_fly_eye_from_orbit();
     }
 
     pub fn top_view(&mut self) {
@@ -236,6 +375,7 @@ impl Vol3d {
         self.pitch = 1.50;
         self.dist = 2.45;
         self.focus_height_km = 0.0;
+        self.enter_orbit_mode();
     }
 
     pub fn low_view(&mut self) {
@@ -243,6 +383,7 @@ impl Vol3d {
         self.pitch = 0.20;
         self.dist = 2.7;
         self.focus_height_km = 4.0;
+        self.enter_orbit_mode();
     }
 
     pub fn apply_balanced_preset(&mut self) {
@@ -272,35 +413,7 @@ impl Vol3d {
     /// Exact CPU companion to the WGSL camera projection. Returning `None`
     /// avoids drawing annotation lines through the camera or behind it.
     pub fn project_point(&self, rect: egui::Rect, point: [f32; 3]) -> Option<egui::Pos2> {
-        let zspan = self.zspan();
-        let center = [0.0, 0.0, zspan * self.focus_height_fraction()];
-        let (cy, sy) = (self.yaw.cos(), self.yaw.sin());
-        let (cp, sp) = (self.pitch.cos(), self.pitch.sin());
-        let eye = [
-            center[0] + self.dist * cy * cp,
-            center[1] + self.dist * sy * cp,
-            center[2] + self.dist * sp,
-        ];
-        let mut fwd = [center[0] - eye[0], center[1] - eye[1], center[2] - eye[2]];
-        let fwd_len = (fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]).sqrt();
-        if !fwd_len.is_finite() || fwd_len <= 1.0e-6 {
-            return None;
-        }
-        for component in &mut fwd {
-            *component /= fwd_len;
-        }
-        let mut right = [fwd[1], -fwd[0], 0.0];
-        let right_len = (right[0] * right[0] + right[1] * right[1]).sqrt();
-        if !right_len.is_finite() || right_len <= 1.0e-6 {
-            return None;
-        }
-        right[0] /= right_len;
-        right[1] /= right_len;
-        let up = [
-            right[1] * fwd[2] - right[2] * fwd[1],
-            right[2] * fwd[0] - right[0] * fwd[2],
-            right[0] * fwd[1] - right[1] * fwd[0],
-        ];
+        let (eye, fwd, right, up) = self.camera_basis()?;
         let delta = [point[0] - eye[0], point[1] - eye[1], point[2] - eye[2]];
         let depth = delta[0] * fwd[0] + delta[1] * fwd[1] + delta[2] * fwd[2];
         if !depth.is_finite() || depth <= 1.0e-4 {
@@ -555,6 +668,11 @@ struct Uniforms {
     floor_threshold: f32,
 
     focus_height: f32,
+    camera_mode: f32,
+    fly_x: f32,
+    fly_y: f32,
+
+    fly_z: f32,
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
@@ -675,8 +793,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let cp = cos(u.pitch);
     let sp = sin(u.pitch);
     let center = vec3<f32>(0.0, 0.0, u.zspan * clamp(u.focus_height, 0.0, 1.0));
-    let eye = center + u.dist * vec3<f32>(cy * cp, sy * cp, sp);
-    let fwd = normalize(center - eye);
+    var eye = center + u.dist * vec3<f32>(cy * cp, sy * cp, sp);
+    var fwd = normalize(center - eye);
+    if (u.camera_mode > 0.5) {
+        eye = vec3<f32>(u.fly_x, u.fly_y, u.fly_z);
+        fwd = normalize(vec3<f32>(-cy * cp, -sy * cp, -sp));
+    }
     let right = normalize(cross(fwd, vec3<f32>(0.0, 0.0, 1.0)));
     let up = cross(right, fwd);
     let ndc = (in.uv * 2.0 - 1.0) * vec2<f32>(u.aspect, 1.0);
@@ -792,7 +914,7 @@ pub fn init_gpu(render_state: &egui_wgpu::RenderState) {
     });
     let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("vol3d-uniforms"),
-        size: 80,
+        size: UNIFORM_BYTES,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -1000,6 +1122,10 @@ pub struct Vol3dCallback {
     pub yaw: f32,
     pub pitch: f32,
     pub dist: f32,
+    pub camera_mode: Vol3dCameraMode,
+    pub fly_x: f32,
+    pub fly_y: f32,
+    pub fly_z: f32,
     pub threshold01: f32,
     pub opacity: f32,
     pub aspect: f32,
@@ -1029,7 +1155,7 @@ impl egui_wgpu::CallbackTrait for Vol3dCallback {
         let Some(resources) = resources.get::<Vol3dResources>() else {
             return Vec::new();
         };
-        let uniforms: [f32; 20] = [
+        let uniforms: [f32; UNIFORM_FLOATS] = [
             self.yaw,
             self.pitch,
             self.dist,
@@ -1047,11 +1173,15 @@ impl egui_wgpu::CallbackTrait for Vol3dCallback {
             self.clip_high,
             self.floor_threshold01,
             self.focus_height,
+            self.camera_mode.shader_value(),
+            self.fly_x,
+            self.fly_y,
+            self.fly_z,
             0.0,
             0.0,
             0.0,
         ];
-        let mut bytes = [0u8; 80];
+        let mut bytes = [0u8; UNIFORM_FLOATS * std::mem::size_of::<f32>()];
         for (index, value) in uniforms.iter().enumerate() {
             bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
         }
@@ -1166,10 +1296,42 @@ mod tests {
             vertical_exaggeration: 2.5,
             ..Default::default()
         };
-        for half_km in [60.0, 120.0, 180.0] {
+        for half_km in [10.0, 20.0, 60.0, 120.0, 180.0] {
             explorer.box_half_km = half_km;
             let recovered = explorer.zspan() * half_km / explorer.top_km();
             assert!((recovered - 2.5).abs() < 1.0e-4);
         }
+    }
+
+    #[test]
+    fn orbit_distance_backs_out_for_tall_selected_cell_boxes() {
+        let explorer = Vol3d {
+            box_half_km: 6.0,
+            vertical_exaggeration: 2.5,
+            dist: 1.2,
+            ..Default::default()
+        };
+
+        assert!(explorer.zspan() > 1.6);
+        assert!(explorer.orbit_distance() > explorer.dist);
+    }
+
+    #[test]
+    fn fly_camera_starts_from_orbit_eye_and_sees_box_center() {
+        let mut explorer = Vol3d::default();
+        let orbit_eye = explorer.orbit_eye();
+        explorer.enter_fly_mode();
+
+        assert_eq!(explorer.camera_mode, Vol3dCameraMode::Fly);
+        assert!((explorer.fly_x - orbit_eye[0]).abs() < 1.0e-5);
+        assert!((explorer.fly_y - orbit_eye[1]).abs() < 1.0e-5);
+        assert!((explorer.fly_z - orbit_eye[2]).abs() < 1.0e-5);
+
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        assert!(
+            explorer
+                .project_point(rect, explorer.orbit_center())
+                .is_some()
+        );
     }
 }

@@ -30665,6 +30665,37 @@ impl ViewerApp {
 
             ui.menu_button("View", |ui| {
                 ui.set_min_width(280.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(
+                            self.vol3d.camera_mode == vol3d::Vol3dCameraMode::Orbit,
+                            "Orbit",
+                        )
+                        .clicked()
+                    {
+                        self.vol3d.enter_orbit_mode();
+                    }
+                    if ui
+                        .selectable_label(
+                            self.vol3d.camera_mode == vol3d::Vol3dCameraMode::Fly,
+                            "Fly",
+                        )
+                        .clicked()
+                    {
+                        self.vol3d.enter_fly_mode();
+                    }
+                });
+                if self.vol3d.camera_mode == vol3d::Vol3dCameraMode::Fly {
+                    ui.add(
+                        egui::Slider::new(&mut self.vol3d.fly_speed, 0.2..=6.0)
+                            .text("fly speed"),
+                    );
+                    if ui.button("Set fly camera from orbit").clicked() {
+                        self.vol3d.reset_fly_eye_from_orbit();
+                    }
+                    ui.weak("Fly canvas: drag look, WASD move, Q/E vertical, wheel dolly");
+                    ui.separator();
+                }
                 ui.add(
                     egui::Slider::new(&mut self.vol3d.vertical_exaggeration, 0.5..=6.0)
                         .suffix("×")
@@ -30798,9 +30829,15 @@ impl ViewerApp {
         let response = response.on_hover_text(
             "Drag: orbit · Shift-drag: move orbit focus vertically · Wheel: zoom · Double-click: reset view",
         );
+        if response.clicked() {
+            response.request_focus();
+        }
         if response.dragged() {
             let (delta, shift) = ui.input(|input| (input.pointer.delta(), input.modifiers.shift));
-            if shift {
+            if self.vol3d.camera_mode == vol3d::Vol3dCameraMode::Fly {
+                self.vol3d.yaw -= delta.x * 0.006;
+                self.vol3d.pitch = (self.vol3d.pitch - delta.y * 0.006).clamp(-1.45, 1.45);
+            } else if shift {
                 self.vol3d.focus_height_km =
                     (self.vol3d.focus_height_km - delta.y * 0.03).clamp(0.0, top_km);
             } else {
@@ -30813,7 +30850,51 @@ impl ViewerApp {
         }
         let scroll = ui.input(|input| input.smooth_scroll_delta.y);
         if response.hovered() && scroll != 0.0 {
-            self.vol3d.dist = (self.vol3d.dist * (-scroll * 0.0015).exp()).clamp(1.15, 7.5);
+            if self.vol3d.camera_mode == vol3d::Vol3dCameraMode::Fly {
+                self.vol3d.fly_dolly(scroll * 0.004);
+            } else {
+                self.vol3d.dist = (self.vol3d.dist * (-scroll * 0.0015).exp()).clamp(1.15, 7.5);
+            }
+        }
+        if self.vol3d.camera_mode == vol3d::Vol3dCameraMode::Fly
+            && (response.hovered() || response.has_focus())
+        {
+            let (strafe, forward, vertical, dt, moving) = ui.input(|input| {
+                let mut strafe = 0.0;
+                let mut forward = 0.0;
+                let mut vertical = 0.0;
+                if input.key_down(egui::Key::A) {
+                    strafe -= 1.0;
+                }
+                if input.key_down(egui::Key::D) {
+                    strafe += 1.0;
+                }
+                if input.key_down(egui::Key::W) {
+                    forward += 1.0;
+                }
+                if input.key_down(egui::Key::S) {
+                    forward -= 1.0;
+                }
+                if input.key_down(egui::Key::Q) {
+                    vertical -= 1.0;
+                }
+                if input.key_down(egui::Key::E) {
+                    vertical += 1.0;
+                }
+                let speed_scale = if input.modifiers.shift { 2.5 } else { 1.0 };
+                let moving = strafe != 0.0 || forward != 0.0 || vertical != 0.0;
+                (
+                    strafe,
+                    forward,
+                    vertical,
+                    input.stable_dt.min(0.1) * speed_scale,
+                    moving,
+                )
+            });
+            if moving {
+                self.vol3d.apply_fly_movement(strafe, forward, vertical, dt);
+                ui.ctx().request_repaint();
+            }
         }
         response.context_menu(|ui| {
             if ui.button("Reset view").clicked() {
@@ -30840,7 +30921,11 @@ impl ViewerApp {
                 vol3d::Vol3dCallback {
                     yaw: self.vol3d.yaw,
                     pitch: self.vol3d.pitch,
-                    dist: self.vol3d.dist,
+                    dist: self.vol3d.orbit_distance(),
+                    camera_mode: self.vol3d.camera_mode,
+                    fly_x: self.vol3d.fly_x,
+                    fly_y: self.vol3d.fly_y,
+                    fly_z: self.vol3d.fly_z,
                     threshold01: Self::normalized_vol3d_value(
                         self.vol3d.threshold_dbz,
                         value_min,
