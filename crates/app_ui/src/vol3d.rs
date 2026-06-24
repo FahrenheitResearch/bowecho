@@ -27,7 +27,7 @@ pub const FLOOR_N: usize = 512;
 pub const BOX_HALF_KM: f32 = 60.0;
 pub const BOX_TOP_M: f32 = 18_000.0;
 const MAX_SHADER_STEPS: usize = 256;
-const UNIFORM_FLOATS: usize = 24;
+const UNIFORM_FLOATS: usize = 28;
 const UNIFORM_BYTES: u64 = (UNIFORM_FLOATS * std::mem::size_of::<f32>()) as u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +53,23 @@ impl FloorMode {
             Self::Off => 0.0,
             Self::LowestTilt => 1.0,
             Self::ColumnMax => 2.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Vol3dThresholdMode {
+    Above,
+    Below,
+    Outside,
+}
+
+impl Vol3dThresholdMode {
+    pub fn shader_value(self) -> f32 {
+        match self {
+            Self::Above => 0.0,
+            Self::Below => 1.0,
+            Self::Outside => 2.0,
         }
     }
 }
@@ -111,6 +128,7 @@ pub struct Vol3d {
     pub fly_z: f32,
     pub fly_speed: f32,
     pub threshold_dbz: f32,
+    pub threshold_mode: Vol3dThresholdMode,
     pub opacity: f32,
     /// Optical-depth multiplier. Opacity controls each sample; density controls
     /// how quickly repeated samples accumulate into a solid echo body.
@@ -121,6 +139,7 @@ pub struct Vol3d {
     pub floor_mode: FloorMode,
     pub floor_opacity: f32,
     pub floor_threshold_dbz: f32,
+    pub floor_threshold_mode: Vol3dThresholdMode,
     /// Purely visual vertical exaggeration. 1x preserves physical proportions
     /// for every box size; the default 2x matches the useful operational look
     /// of the original 120 km box without making larger boxes progressively
@@ -197,6 +216,7 @@ impl Default for Vol3d {
             fly_z: 1.0,
             fly_speed: 1.2,
             threshold_dbz: 35.0,
+            threshold_mode: Vol3dThresholdMode::Above,
             opacity: 0.55,
             density: 1.0,
             shading: 0.65,
@@ -204,6 +224,7 @@ impl Default for Vol3d {
             floor_mode: FloorMode::LowestTilt,
             floor_opacity: 0.82,
             floor_threshold_dbz: 0.0,
+            floor_threshold_mode: Vol3dThresholdMode::Above,
             vertical_exaggeration: 2.0,
             fov_scale: 0.7,
             focus_height_km: 6.0,
@@ -673,6 +694,11 @@ struct Uniforms {
     fly_y: f32,
 
     fly_z: f32,
+    threshold_high: f32,
+    threshold_mode: f32,
+    floor_threshold_high: f32,
+
+    floor_threshold_mode: f32,
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
@@ -786,6 +812,28 @@ fn column_max(uv: vec2<f32>) -> f32 {
     return maximum;
 }
 
+fn threshold_strength(value: f32, low: f32, high: f32, mode: f32, width: f32) -> f32 {
+    if (mode > 1.5) {
+        if (value <= low) {
+            return smoothstep(0.0, width, low - value);
+        }
+        if (value >= high) {
+            return smoothstep(0.0, width, value - high);
+        }
+        return -1.0;
+    }
+    if (mode > 0.5) {
+        if (value >= low) {
+            return -1.0;
+        }
+        return smoothstep(0.0, width, low - value);
+    }
+    if (value <= low) {
+        return -1.0;
+    }
+    return smoothstep(low, low + width, value);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let cy = cos(u.yaw);
@@ -830,13 +878,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 point.z / u.zspan
             );
             let value = textureSampleLevel(t_volume, s_volume, uvw, 0.0).r;
-            if (value <= u.threshold) {
+            let transfer = threshold_strength(
+                value,
+                u.threshold,
+                u.threshold_high,
+                u.threshold_mode,
+                0.08
+            );
+            if (transfer <= 0.0) {
                 continue;
             }
             let palette = textureSampleLevel(t_lut, s_lut, vec2<f32>(value, 0.5), 0.0);
-            var alpha = palette.a
-                * u.opacity
-                * smoothstep(u.threshold, u.threshold + 0.08, value);
+            var alpha = palette.a * u.opacity * transfer;
             alpha = 1.0 - pow(
                 max(1.0 - alpha, 0.0001),
                 dt * 28.0 * max(u.density, 0.05)
@@ -866,16 +919,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 if (u.floor_mode > 1.5) {
                     value = column_max(floor_uv);
                 }
-                if (value > u.floor_threshold) {
+                let floor_transfer = threshold_strength(
+                    value,
+                    u.floor_threshold,
+                    u.floor_threshold_high,
+                    u.floor_threshold_mode,
+                    0.04
+                );
+                if (floor_transfer > 0.0) {
                     let palette = textureSampleLevel(
                         t_lut,
                         s_lut,
                         vec2<f32>(value, 0.5),
                         0.0
                     );
-                    let alpha = palette.a
-                        * u.floor_opacity
-                        * smoothstep(u.floor_threshold, u.floor_threshold + 0.04, value);
+                    let alpha = palette.a * u.floor_opacity * floor_transfer;
                     color = color + (1.0 - accumulated) * alpha * palette.rgb;
                     accumulated = accumulated + (1.0 - accumulated) * alpha;
                 }
@@ -1127,6 +1185,8 @@ pub struct Vol3dCallback {
     pub fly_y: f32,
     pub fly_z: f32,
     pub threshold01: f32,
+    pub threshold_high01: f32,
+    pub threshold_mode: Vol3dThresholdMode,
     pub opacity: f32,
     pub aspect: f32,
     pub floor_opacity: f32,
@@ -1139,6 +1199,8 @@ pub struct Vol3dCallback {
     pub clip_low: f32,
     pub clip_high: f32,
     pub floor_threshold01: f32,
+    pub floor_threshold_high01: f32,
+    pub floor_threshold_mode: Vol3dThresholdMode,
     pub focus_height: f32,
     pub pending: Arc<Mutex<PendingUploads>>,
 }
@@ -1177,6 +1239,10 @@ impl egui_wgpu::CallbackTrait for Vol3dCallback {
             self.fly_x,
             self.fly_y,
             self.fly_z,
+            self.threshold_high01,
+            self.threshold_mode.shader_value(),
+            self.floor_threshold_high01,
+            self.floor_threshold_mode.shader_value(),
             0.0,
             0.0,
             0.0,

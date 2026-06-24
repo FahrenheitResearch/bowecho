@@ -4698,6 +4698,20 @@ fn sweep_product_group(product: &DisplayProduct) -> SweepProductGroup {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Vol3dProductDefaults {
+    threshold_mode: vol3d::Vol3dThresholdMode,
+    threshold: f32,
+    opacity: f32,
+    density: f32,
+    shading: f32,
+    quality: vol3d::Vol3dQuality,
+    floor_mode: vol3d::FloorMode,
+    floor_opacity: f32,
+    floor_threshold_mode: vol3d::Vol3dThresholdMode,
+    floor_threshold: f32,
+}
+
 fn manual_vrot_product_supported(product: &DisplayProduct) -> bool {
     matches!(
         product,
@@ -31213,10 +31227,231 @@ impl ViewerApp {
         render_tables.for_family(product.color_family()).clone()
     }
 
-    fn vol3d_default_threshold(product: &DisplayProduct, value_min: f32, value_max: f32) -> f32 {
-        match product.color_family() {
-            ColorTableFamily::Reflectivity => 35.0_f32.clamp(value_min, value_max),
-            _ => value_min,
+    fn vol3d_clamp_threshold(
+        mode: vol3d::Vol3dThresholdMode,
+        threshold: f32,
+        value_min: f32,
+        value_max: f32,
+    ) -> f32 {
+        match mode {
+            vol3d::Vol3dThresholdMode::Outside => threshold
+                .abs()
+                .clamp(0.0, value_min.abs().max(value_max.abs())),
+            _ => threshold.clamp(value_min, value_max),
+        }
+    }
+
+    fn vol3d_product_defaults(
+        product: &DisplayProduct,
+        value_min: f32,
+        value_max: f32,
+    ) -> Vol3dProductDefaults {
+        use vol3d::Vol3dThresholdMode::{Above, Below, Outside};
+        let mut defaults = match product.color_family() {
+            ColorTableFamily::Reflectivity => Vol3dProductDefaults {
+                threshold_mode: Above,
+                threshold: 35.0,
+                opacity: 0.48,
+                density: 0.90,
+                shading: 0.65,
+                quality: vol3d::Vol3dQuality::Balanced,
+                floor_mode: vol3d::FloorMode::LowestTilt,
+                floor_opacity: 0.76,
+                floor_threshold_mode: Above,
+                floor_threshold: 5.0,
+            },
+            ColorTableFamily::Velocity => Vol3dProductDefaults {
+                threshold_mode: Outside,
+                threshold: if product.is_storm_relative_velocity() {
+                    14.0
+                } else {
+                    18.0
+                },
+                opacity: 0.22,
+                density: 0.55,
+                shading: 0.88,
+                quality: vol3d::Vol3dQuality::High,
+                floor_mode: vol3d::FloorMode::LowestTilt,
+                floor_opacity: 0.62,
+                floor_threshold_mode: Outside,
+                floor_threshold: if product.is_storm_relative_velocity() {
+                    10.0
+                } else {
+                    14.0
+                },
+            },
+            ColorTableFamily::SpectrumWidth => Vol3dProductDefaults {
+                threshold_mode: Above,
+                threshold: 5.0,
+                opacity: 0.30,
+                density: 0.62,
+                shading: 0.78,
+                quality: vol3d::Vol3dQuality::High,
+                floor_mode: vol3d::FloorMode::LowestTilt,
+                floor_opacity: 0.68,
+                floor_threshold_mode: Above,
+                floor_threshold: 3.5,
+            },
+            ColorTableFamily::CorrelationCoefficient => Vol3dProductDefaults {
+                threshold_mode: Below,
+                threshold: 0.92,
+                opacity: 0.34,
+                density: 0.68,
+                shading: 0.82,
+                quality: vol3d::Vol3dQuality::High,
+                floor_mode: vol3d::FloorMode::LowestTilt,
+                floor_opacity: 0.70,
+                floor_threshold_mode: Below,
+                floor_threshold: 0.95,
+            },
+            ColorTableFamily::DifferentialReflectivity => Vol3dProductDefaults {
+                threshold_mode: Above,
+                threshold: 1.25,
+                opacity: 0.30,
+                density: 0.64,
+                shading: 0.86,
+                quality: vol3d::Vol3dQuality::High,
+                floor_mode: vol3d::FloorMode::LowestTilt,
+                floor_opacity: 0.66,
+                floor_threshold_mode: Above,
+                floor_threshold: 0.5,
+            },
+            ColorTableFamily::SpecificDifferentialPhase => Vol3dProductDefaults {
+                threshold_mode: Above,
+                threshold: 0.8,
+                opacity: 0.32,
+                density: 0.70,
+                shading: 0.82,
+                quality: vol3d::Vol3dQuality::High,
+                floor_mode: vol3d::FloorMode::LowestTilt,
+                floor_opacity: 0.66,
+                floor_threshold_mode: Above,
+                floor_threshold: 0.4,
+            },
+            ColorTableFamily::DifferentialPhase => Vol3dProductDefaults {
+                threshold_mode: Above,
+                threshold: 60.0,
+                opacity: 0.28,
+                density: 0.60,
+                shading: 0.80,
+                quality: vol3d::Vol3dQuality::Balanced,
+                floor_mode: vol3d::FloorMode::LowestTilt,
+                floor_opacity: 0.58,
+                floor_threshold_mode: Above,
+                floor_threshold: 35.0,
+            },
+            ColorTableFamily::AzimuthalShear => Vol3dProductDefaults {
+                threshold_mode: Outside,
+                threshold: 4.0,
+                opacity: 0.28,
+                density: 0.58,
+                shading: 0.88,
+                quality: vol3d::Vol3dQuality::High,
+                floor_mode: vol3d::FloorMode::LowestTilt,
+                floor_opacity: 0.62,
+                floor_threshold_mode: Outside,
+                floor_threshold: 3.0,
+            },
+            ColorTableFamily::EchoTops
+            | ColorTableFamily::Vil
+            | ColorTableFamily::VilDensity
+            | ColorTableFamily::HailSize
+            | ColorTableFamily::Probability
+            | ColorTableFamily::Generic => Vol3dProductDefaults {
+                threshold_mode: Above,
+                threshold: value_min + (value_max - value_min) * 0.35,
+                opacity: 0.34,
+                density: 0.70,
+                shading: 0.75,
+                quality: vol3d::Vol3dQuality::Balanced,
+                floor_mode: vol3d::FloorMode::LowestTilt,
+                floor_opacity: 0.62,
+                floor_threshold_mode: Above,
+                floor_threshold: value_min + (value_max - value_min) * 0.20,
+            },
+        };
+        defaults.threshold = Self::vol3d_clamp_threshold(
+            defaults.threshold_mode,
+            defaults.threshold,
+            value_min,
+            value_max,
+        );
+        defaults.floor_threshold = Self::vol3d_clamp_threshold(
+            defaults.floor_threshold_mode,
+            defaults.floor_threshold,
+            value_min,
+            value_max,
+        );
+        defaults
+    }
+
+    fn vol3d_threshold_slider_range(
+        mode: vol3d::Vol3dThresholdMode,
+        value_min: f32,
+        value_max: f32,
+    ) -> (f32, f32) {
+        match mode {
+            vol3d::Vol3dThresholdMode::Outside => (0.0, value_min.abs().max(value_max.abs())),
+            _ => (value_min, value_max),
+        }
+    }
+
+    fn vol3d_threshold_slider_label(mode: vol3d::Vol3dThresholdMode) -> &'static str {
+        match mode {
+            vol3d::Vol3dThresholdMode::Above => "threshold",
+            vol3d::Vol3dThresholdMode::Below => "max value",
+            vol3d::Vol3dThresholdMode::Outside => "min |value|",
+        }
+    }
+
+    fn vol3d_threshold_hover_text(mode: vol3d::Vol3dThresholdMode) -> &'static str {
+        match mode {
+            vol3d::Vol3dThresholdMode::Above => {
+                "Values at or below this product value are transparent"
+            }
+            vol3d::Vol3dThresholdMode::Below => {
+                "Values at or above this product value are transparent"
+            }
+            vol3d::Vol3dThresholdMode::Outside => {
+                "Values between the negative and positive magnitude are transparent"
+            }
+        }
+    }
+
+    fn vol3d_threshold_status_label(
+        product_label: &str,
+        mode: vol3d::Vol3dThresholdMode,
+        threshold: f32,
+        value_suffix: &str,
+    ) -> String {
+        match mode {
+            vol3d::Vol3dThresholdMode::Above => {
+                format!("{product_label} >= {threshold:.1}{value_suffix}")
+            }
+            vol3d::Vol3dThresholdMode::Below => {
+                format!("{product_label} <= {threshold:.2}{value_suffix}")
+            }
+            vol3d::Vol3dThresholdMode::Outside => {
+                format!("|{product_label}| >= {threshold:.1}{value_suffix}")
+            }
+        }
+    }
+
+    fn vol3d_shader_threshold_bounds(
+        mode: vol3d::Vol3dThresholdMode,
+        threshold: f32,
+        value_min: f32,
+        value_max: f32,
+    ) -> (f32, f32) {
+        match mode {
+            vol3d::Vol3dThresholdMode::Outside => (
+                Self::normalized_vol3d_value(-threshold.abs(), value_min, value_max),
+                Self::normalized_vol3d_value(threshold.abs(), value_min, value_max),
+            ),
+            _ => (
+                Self::normalized_vol3d_value(threshold, value_min, value_max),
+                -1.0,
+            ),
         }
     }
 
@@ -31317,9 +31552,18 @@ impl ViewerApp {
     ) {
         let product_label = product.label().to_owned();
         if self.vol3d.product_label != product_label {
+            let defaults = Self::vol3d_product_defaults(product, value_min, value_max);
             self.vol3d.product_label = product_label.clone();
-            self.vol3d.threshold_dbz = Self::vol3d_default_threshold(product, value_min, value_max);
-            self.vol3d.floor_threshold_dbz = value_min;
+            self.vol3d.threshold_mode = defaults.threshold_mode;
+            self.vol3d.threshold_dbz = defaults.threshold;
+            self.vol3d.opacity = defaults.opacity;
+            self.vol3d.density = defaults.density;
+            self.vol3d.shading = defaults.shading;
+            self.vol3d.quality = defaults.quality;
+            self.vol3d.floor_mode = defaults.floor_mode;
+            self.vol3d.floor_opacity = defaults.floor_opacity;
+            self.vol3d.floor_threshold_mode = defaults.floor_threshold_mode;
+            self.vol3d.floor_threshold_dbz = defaults.floor_threshold;
             self.vol3d.volume_key = None;
             self.vol3d.resample_rx = None;
             self.vol3d.last_top_deg = 0.0;
@@ -31582,13 +31826,17 @@ impl ViewerApp {
         ui.set_min_width(panel_width);
         ui.set_max_width(panel_width);
         ui.label(egui::RichText::new("Transfer function").strong());
-        let mut threshold = self.vol3d.threshold_dbz.clamp(value_min, value_max);
+        let (threshold_min, threshold_max) =
+            Self::vol3d_threshold_slider_range(self.vol3d.threshold_mode, value_min, value_max);
+        let mut threshold = self.vol3d.threshold_dbz.clamp(threshold_min, threshold_max);
         ui.add(
-            egui::Slider::new(&mut threshold, value_min..=value_max)
+            egui::Slider::new(&mut threshold, threshold_min..=threshold_max)
                 .suffix(value_suffix)
-                .text("threshold"),
+                .text(Self::vol3d_threshold_slider_label(
+                    self.vol3d.threshold_mode,
+                )),
         )
-        .on_hover_text("Values at or below this product value are transparent");
+        .on_hover_text(Self::vol3d_threshold_hover_text(self.vol3d.threshold_mode));
         self.vol3d.threshold_dbz = threshold;
         ui.add(egui::Slider::new(&mut self.vol3d.opacity, 0.03..=1.0).text("sample opacity"));
         ui.add(egui::Slider::new(&mut self.vol3d.density, 0.35..=2.5).text("density"))
@@ -31652,11 +31900,24 @@ impl ViewerApp {
         let enabled = self.vol3d.floor_mode != vol3d::FloorMode::Off;
         ui.add_enabled_ui(enabled, |ui| {
             ui.add(egui::Slider::new(&mut self.vol3d.floor_opacity, 0.02..=1.0).text("opacity"));
-            let mut floor_threshold = self.vol3d.floor_threshold_dbz.clamp(value_min, value_max);
+            let (floor_threshold_min, floor_threshold_max) = Self::vol3d_threshold_slider_range(
+                self.vol3d.floor_threshold_mode,
+                value_min,
+                value_max,
+            );
+            let mut floor_threshold = self
+                .vol3d
+                .floor_threshold_dbz
+                .clamp(floor_threshold_min, floor_threshold_max);
             ui.add(
-                egui::Slider::new(&mut floor_threshold, value_min..=value_max)
-                    .suffix(value_suffix)
-                    .text("threshold"),
+                egui::Slider::new(
+                    &mut floor_threshold,
+                    floor_threshold_min..=floor_threshold_max,
+                )
+                .suffix(value_suffix)
+                .text(Self::vol3d_threshold_slider_label(
+                    self.vol3d.floor_threshold_mode,
+                )),
             );
             self.vol3d.floor_threshold_dbz = floor_threshold;
         });
@@ -31709,13 +31970,18 @@ impl ViewerApp {
                 ui.vertical(|ui| {
                 ui.set_min_width(280.0);
                 ui.label(egui::RichText::new("Transfer function").strong());
-                let mut threshold = self.vol3d.threshold_dbz.clamp(value_min, value_max);
+                let (threshold_min, threshold_max) = Self::vol3d_threshold_slider_range(
+                    self.vol3d.threshold_mode,
+                    value_min,
+                    value_max,
+                );
+                let mut threshold = self.vol3d.threshold_dbz.clamp(threshold_min, threshold_max);
                 ui.add(
-                    egui::Slider::new(&mut threshold, value_min..=value_max)
+                    egui::Slider::new(&mut threshold, threshold_min..=threshold_max)
                         .suffix(value_suffix.as_str())
-                        .text("threshold"),
+                        .text(Self::vol3d_threshold_slider_label(self.vol3d.threshold_mode)),
                 )
-                .on_hover_text("Values at or below this product value are transparent");
+                .on_hover_text(Self::vol3d_threshold_hover_text(self.vol3d.threshold_mode));
                 self.vol3d.threshold_dbz = threshold;
                 ui.add(
                     egui::Slider::new(&mut self.vol3d.opacity, 0.03..=1.0).text("sample opacity"),
@@ -31784,12 +32050,25 @@ impl ViewerApp {
                         egui::Slider::new(&mut self.vol3d.floor_opacity, 0.02..=1.0)
                             .text("opacity"),
                     );
-                    let mut floor_threshold =
-                        self.vol3d.floor_threshold_dbz.clamp(value_min, value_max);
+                    let (floor_threshold_min, floor_threshold_max) =
+                        Self::vol3d_threshold_slider_range(
+                            self.vol3d.floor_threshold_mode,
+                            value_min,
+                            value_max,
+                        );
+                    let mut floor_threshold = self
+                        .vol3d
+                        .floor_threshold_dbz
+                        .clamp(floor_threshold_min, floor_threshold_max);
                     ui.add(
-                        egui::Slider::new(&mut floor_threshold, value_min..=value_max)
+                        egui::Slider::new(
+                            &mut floor_threshold,
+                            floor_threshold_min..=floor_threshold_max,
+                        )
                             .suffix(value_suffix.as_str())
-                            .text("threshold"),
+                            .text(Self::vol3d_threshold_slider_label(
+                                self.vol3d.floor_threshold_mode,
+                            )),
                     );
                     self.vol3d.floor_threshold_dbz = floor_threshold;
                 });
@@ -31905,11 +32184,15 @@ impl ViewerApp {
             if self.vol3d.resample_rx.is_some() {
                 ui.spinner();
             }
-            ui.add(egui::Label::new(egui::RichText::new(format!(
-                "{} {:.1}{} · {} · {} · {:.1}× Z",
+            let threshold_status = Self::vol3d_threshold_status_label(
                 vol3d_product.label(),
+                self.vol3d.threshold_mode,
                 self.vol3d.threshold_dbz,
-                value_suffix,
+                value_suffix.as_str(),
+            );
+            ui.add(egui::Label::new(egui::RichText::new(format!(
+                "{} · {} · {} · {:.1}× Z",
+                threshold_status,
                 self.vol3d.floor_mode.label(),
                 self.vol3d.quality.label(),
                 self.vol3d.vertical_exaggeration,
@@ -32045,6 +32328,18 @@ impl ViewerApp {
         });
 
         let (clip_low, clip_high) = self.vol3d.normalized_clip();
+        let (threshold01, threshold_high01) = Self::vol3d_shader_threshold_bounds(
+            self.vol3d.threshold_mode,
+            self.vol3d.threshold_dbz,
+            value_min,
+            value_max,
+        );
+        let (floor_threshold01, floor_threshold_high01) = Self::vol3d_shader_threshold_bounds(
+            self.vol3d.floor_threshold_mode,
+            self.vol3d.floor_threshold_dbz,
+            value_min,
+            value_max,
+        );
         ui.painter()
             .add(eframe::egui_wgpu::Callback::new_paint_callback(
                 rect,
@@ -32056,11 +32351,9 @@ impl ViewerApp {
                     fly_x: self.vol3d.fly_x,
                     fly_y: self.vol3d.fly_y,
                     fly_z: self.vol3d.fly_z,
-                    threshold01: Self::normalized_vol3d_value(
-                        self.vol3d.threshold_dbz,
-                        value_min,
-                        value_max,
-                    ),
+                    threshold01,
+                    threshold_high01,
+                    threshold_mode: self.vol3d.threshold_mode,
                     opacity: self.vol3d.opacity,
                     aspect: (rect.width() / rect.height().max(1.0)).max(0.1),
                     floor_opacity: self.vol3d.floor_opacity,
@@ -32072,11 +32365,9 @@ impl ViewerApp {
                     shading: self.vol3d.shading,
                     clip_low,
                     clip_high,
-                    floor_threshold01: Self::normalized_vol3d_value(
-                        self.vol3d.floor_threshold_dbz,
-                        value_min,
-                        value_max,
-                    ),
+                    floor_threshold01,
+                    floor_threshold_high01,
+                    floor_threshold_mode: self.vol3d.floor_threshold_mode,
                     focus_height: self.vol3d.focus_height_fraction(),
                     pending: Arc::clone(&self.vol3d.pending),
                 },
@@ -58927,7 +59218,56 @@ mod tests {
         assert_eq!(app.vol3d.product_label, "VEL");
         assert_eq!(app.vol3d.last_top_deg, 0.0);
         assert!(app.vol3d.volume_key.is_none());
+        assert_eq!(app.vol3d.threshold_mode, vol3d::Vol3dThresholdMode::Outside);
+        assert_eq!(
+            app.vol3d.floor_threshold_mode,
+            vol3d::Vol3dThresholdMode::Outside
+        );
+        assert_eq!(app.vol3d.quality, vol3d::Vol3dQuality::High);
         assert!(app.vol3d.status.contains("resampling VEL"));
+    }
+
+    #[test]
+    fn vol3d_velocity_defaults_use_symmetric_magnitude_threshold() {
+        let app = test_viewer_app_with_hazards(Vec::new());
+        let product = DisplayProduct::Moment(MomentType::Velocity);
+        let (value_min, value_max) = app.vol3d_product_value_range(&product);
+
+        let defaults = ViewerApp::vol3d_product_defaults(&product, value_min, value_max);
+        let (low, high) = ViewerApp::vol3d_shader_threshold_bounds(
+            defaults.threshold_mode,
+            defaults.threshold,
+            value_min,
+            value_max,
+        );
+        let zero = ViewerApp::normalized_vol3d_value(0.0, value_min, value_max);
+
+        assert_eq!(defaults.threshold_mode, vol3d::Vol3dThresholdMode::Outside);
+        assert!(defaults.threshold > 0.0);
+        assert!(low < zero && zero < high);
+        assert!(defaults.opacity < 0.35);
+        assert!(defaults.density < 0.8);
+    }
+
+    #[test]
+    fn vol3d_correlation_coefficient_defaults_render_low_values() {
+        let app = test_viewer_app_with_hazards(Vec::new());
+        let product = DisplayProduct::Moment(MomentType::CorrelationCoefficient);
+        let (value_min, value_max) = app.vol3d_product_value_range(&product);
+
+        let defaults = ViewerApp::vol3d_product_defaults(&product, value_min, value_max);
+        let (threshold, high) = ViewerApp::vol3d_shader_threshold_bounds(
+            defaults.threshold_mode,
+            defaults.threshold,
+            value_min,
+            value_max,
+        );
+
+        assert_eq!(defaults.threshold_mode, vol3d::Vol3dThresholdMode::Below);
+        assert!((0.80..=0.98).contains(&defaults.threshold));
+        assert!(threshold > 0.0 && threshold < 1.0);
+        assert!(high < 0.0);
+        assert_eq!(defaults.quality, vol3d::Vol3dQuality::High);
     }
 
     #[test]
