@@ -7452,7 +7452,7 @@ impl ViewerApp {
             self.volume.as_deref(),
             volume.as_ref(),
             same_volume,
-            !self.history_playing,
+            true,
         );
         let retained_texture_matches_previous = self
             .texture_key
@@ -7492,6 +7492,8 @@ impl ViewerApp {
                 texture_key.volume_ptr = next_volume_ptr;
                 texture_key.cut = self.selected_cut;
                 texture_key.product = self.selected_product.clone();
+            } else if !same_volume && let Some(texture_key) = &mut self.texture_key {
+                texture_key.volume_ptr = 0;
             }
             self.render_ms = None;
             self.worker_ms = None;
@@ -12688,7 +12690,7 @@ impl ViewerApp {
             pane.volume.as_deref(),
             volume.as_ref(),
             same_volume,
-            !pane.history_playing,
+            true,
         );
         let retained_texture_matches_previous = pane
             .texture_key
@@ -50935,8 +50937,13 @@ mod tests {
         app.maybe_advance_history_loop(&ctx);
         assert_eq!(app.selected_frame_index, 1);
         assert!(
-            app.texture_key.is_none(),
-            "active playback must not keep painting the previous frame while the next frame renders"
+            app.texture_key.is_some(),
+            "active playback should keep painting the previous same-site texture until the next frame renders"
+        );
+        assert_ne!(
+            app.texture_key.as_ref().map(|key| key.volume_ptr),
+            Some(Arc::as_ptr(&second) as usize),
+            "the retained key must not be considered ready for the newly selected frame"
         );
     }
 
@@ -51071,6 +51078,79 @@ mod tests {
         app.extra_panes[0].last_history_step = Some(Instant::now() - Duration::from_secs(5));
         app.maybe_advance_extra_pane_history_loops(&ctx);
         assert_eq!(app.extra_panes[0].selected_frame_index, 1);
+        assert!(
+            app.extra_panes[0].texture_key.is_some(),
+            "independent pane playback should retain the previous same-site texture while the next render lands"
+        );
+        assert_ne!(
+            app.extra_panes[0]
+                .texture_key
+                .as_ref()
+                .map(|key| key.volume_ptr),
+            Some(Arc::as_ptr(&second) as usize),
+            "the retained pane texture must not satisfy the newly selected frame"
+        );
+    }
+
+    #[test]
+    fn primary_playback_retains_following_split_pane_texture_while_next_product_renders() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_speed_percent = 400;
+        app.app_settings.grid_pane_count = 2;
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.selected_cut = 0;
+        let first = Arc::new(test_ref_then_velocity_volume());
+        let mut second_volume = test_ref_then_velocity_volume();
+        second_volume.volume_time += chrono::Duration::minutes(3);
+        let second = Arc::new(second_volume);
+        app.volume = Some(Arc::clone(&first));
+        app.frame_history = [Arc::clone(&first), Arc::clone(&second)]
+            .into_iter()
+            .map(|volume| FrameHistoryEntry {
+                identity: frame_identity_for_volume(volume.as_ref()),
+                path: PathBuf::from(format!(
+                    "split-pane-retain-product-{}",
+                    volume.volume_time.timestamp()
+                )),
+                volume,
+                timings: None,
+                status: FrameStatus::LiveComplete,
+                source_label: "test".to_owned(),
+            })
+            .collect();
+        app.history_playing = true;
+        app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        app.texture_key = Some(test_screen_texture_key(
+            Arc::as_ptr(&first) as usize,
+            0,
+            DisplayProduct::Moment(MomentType::Reflectivity),
+        ));
+        app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
+        app.extra_panes[0].cut = Some(1);
+        app.extra_panes[0].texture_key = Some(test_screen_texture_key(
+            Arc::as_ptr(&first) as usize,
+            1,
+            DisplayProduct::Moment(MomentType::Velocity),
+        ));
+        let ctx = egui::Context::default();
+
+        app.maybe_advance_history_loop(&ctx);
+
+        assert_eq!(app.selected_frame_index, 1);
+        assert!(
+            app.extra_panes[0].texture_key.is_some(),
+            "following panes must not blank RHO/ZDR/VEL textures during a primary frame step"
+        );
+        assert_ne!(
+            app.extra_panes[0]
+                .texture_key
+                .as_ref()
+                .map(|key| key.volume_ptr),
+            Some(Arc::as_ptr(&second) as usize),
+            "the retained following-pane texture should still make the readiness gate wait"
+        );
     }
 
     #[test]
