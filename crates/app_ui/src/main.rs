@@ -13302,8 +13302,8 @@ impl ViewerApp {
         // archive browsing shouldn't need a tab switch to play what it just
         // loaded.)
         ui.horizontal(|ui| {
-            ui.label("Manual loop frames").on_hover_text(
-                "Archive-browser selections only: load this many scans ending at the chosen scan. Event clicks use the visible Event loop Before/After/Cap controls.",
+            ui.label("Manual picker frames").on_hover_text(
+                "Archive-browser selections only: load this many scans ending at the chosen scan. Tornado/report clicks use Event day Track/report loop controls.",
             );
             if ui
                 .add(
@@ -13311,9 +13311,7 @@ impl ViewerApp {
                         .range(1..=MAX_ARCHIVE_FRAME_COUNT)
                         .speed(0.2),
                 )
-                .on_hover_text(
-                    "Manual archive chips end at the clicked scan. This does not change tornado/report event-loop context.",
-                )
+                .on_hover_text("Manual archive chips end at the clicked scan.")
                 .changed()
             {
                 self.persist_archive_controls();
@@ -13437,12 +13435,12 @@ impl ViewerApp {
         }
         ui.separator();
         ui.horizontal(|ui| {
-            ui.label("Tornadoes (SPC)");
+            ui.label("Tornado reports + tracks");
             let fetching = self.spc_receiver.is_some();
             if ui
                 .add_enabled(!fetching, egui::Button::new("Fetch"))
                 .on_hover_text(
-                    "SPC storm reports for this date (12Z–12Z). Click a report to load the lowest-beam event archive loop with Event day Before/After/Cap context.",
+                    "Fetch SPC tornado reports and pin the Event day track layer for this date. Click a report to load a centered archive loop.",
                 )
                 .clicked()
             {
@@ -13504,6 +13502,7 @@ impl ViewerApp {
             self.status = "Archive date must be YYYY-MM-DD".to_owned();
             return;
         };
+        self.pin_event_day_for_archive_date(date);
         let (sender, receiver) = mpsc::channel();
         self.spc_receiver = Some(receiver);
         self.spc_reports = None;
@@ -13519,6 +13518,12 @@ impl ViewerApp {
             let _ = sender.send(result);
             ctx.request_repaint();
         });
+    }
+
+    fn pin_event_day_for_archive_date(&mut self, date: NaiveDate) {
+        self.event_explorer.pin_day(date);
+        self.spc_reports_enabled = true;
+        self.spc_data.fetched_at = None;
     }
 
     fn poll_spc_reports(&mut self, ctx: &egui::Context) {
@@ -13600,7 +13605,12 @@ impl ViewerApp {
             &self.app_settings,
         );
         match self.start_archive_window_load(context, label.clone(), true, ctx) {
-            Ok(status) => self.status = format!("{status} · {label}"),
+            Ok(status) => {
+                self.status = format!("{status} · {label}");
+                if self.app_settings.event_track_auto_model {
+                    self.start_event_track_model_ingest(time_utc, &label, ctx);
+                }
+            }
             Err(err) => self.status = format!("Event jump failed for {label}: {err}"),
         }
     }
@@ -58434,6 +58444,23 @@ mod tests {
         arm_busy_primary_load(&mut app);
 
         assert!(app.data_pack_load_blocked());
+    }
+
+    #[test]
+    fn archive_tornado_fetch_pins_event_day_tracks() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let day = NaiveDate::from_ymd_opt(2024, 5, 6).unwrap();
+        app.spc_reports_enabled = false;
+        app.event_explorer.set_failed_for_test(day);
+        app.spc_data.fetched_at = Some(Instant::now());
+
+        app.pin_event_day_for_archive_date(day);
+
+        assert_eq!(app.event_explorer.pinned_day, Some(day));
+        assert_eq!(app.event_explorer.date_input, "2024-05-06");
+        assert!(app.spc_reports_enabled);
+        assert!(app.event_explorer.failed_day_for_test().is_none());
+        assert!(app.spc_data.fetched_at.is_none());
     }
 
     #[test]

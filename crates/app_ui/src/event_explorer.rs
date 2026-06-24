@@ -66,8 +66,24 @@ pub(crate) struct EventExplorerState {
 }
 
 impl EventExplorerState {
+    pub(crate) fn pin_day(&mut self, day: NaiveDate) {
+        self.date_input = day.format("%Y-%m-%d").to_string();
+        self.pinned_day = Some(day);
+        self.failed = None;
+    }
+
     pub(crate) fn fetching_day(&self) -> Option<NaiveDate> {
         self.fetch.as_ref().map(|(day, _)| *day)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_failed_for_test(&mut self, day: NaiveDate) {
+        self.failed = Some((day, Instant::now()));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failed_day_for_test(&self) -> Option<NaiveDate> {
+        self.failed.map(|(day, _)| day)
     }
 
     #[cfg(test)]
@@ -482,8 +498,8 @@ impl crate::ViewerApp {
             let mut max_frames = crate::normalized_event_max_frames(
                 self.app_settings.event_max_frames,
             ) as u16;
-            ui.label("Event loop").on_hover_text(
-                "Used by tornado tracks and point reports. Independent of Archive > Fetch N scans.",
+            ui.label("Track/report loop").on_hover_text(
+                "Used when you click a tornado track or storm report. Independent of the manual archive picker.",
             );
             ui.add(
                 egui::DragValue::new(&mut before)
@@ -550,8 +566,8 @@ impl crate::ViewerApp {
             let mut auto_model = self.app_settings.event_track_auto_model;
             let mut model_slug =
                 crate::normalize_event_track_model_slug(&self.app_settings.event_track_model_slug);
-            ui.checkbox(&mut auto_model, "Auto model").on_hover_text(
-                "Tornado track clicks only: download a sounding-grade HRRR/RAP run for the init covering the track time.",
+            ui.checkbox(&mut auto_model, "Auto model hour").on_hover_text(
+                "Track/report clicks: download a sounding-grade HRRR/RAP run for the model hour covering the event time.",
             );
             ui.add_enabled_ui(auto_model, |ui| {
                 egui::ComboBox::from_id_salt("event_track_auto_model_slug")

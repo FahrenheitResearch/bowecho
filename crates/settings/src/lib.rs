@@ -365,7 +365,7 @@ pub struct AppSettings {
     /// When a tornado track is clicked from the Event day layer, optionally
     /// kick a sounding-grade model ingest for the init covering that track
     /// time so skew-T soundings are ready without manual date/cycle math.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub event_track_auto_model: bool,
     /// Model slug for `event_track_auto_model`. Kept separate from the
     /// Download panel's general model pick because a user may prefer HRRR
@@ -651,7 +651,7 @@ impl Default for AppSettings {
             event_after_scans: None,
             event_max_frames: default_event_max_frames(),
             event_sync_warnings: true,
-            event_track_auto_model: false,
+            event_track_auto_model: true,
             event_track_model_slug: default_model_slug(),
             event_track_camera_follow: true,
             archive_load_loop: true,
@@ -1491,19 +1491,19 @@ mod tests {
     #[test]
     fn event_track_model_settings_default_and_round_trip() {
         let old = AppSettings::from_json("{}");
-        assert!(!old.event_track_auto_model);
+        assert!(old.event_track_auto_model);
         assert_eq!(old.event_track_model_slug, "hrrr");
         assert!(old.event_track_camera_follow);
 
         let settings = AppSettings {
-            event_track_auto_model: true,
+            event_track_auto_model: false,
             event_track_model_slug: "rap".to_owned(),
             event_track_camera_follow: false,
             ..Default::default()
         };
         let back = AppSettings::from_json(&settings.to_json());
 
-        assert!(back.event_track_auto_model);
+        assert!(!back.event_track_auto_model);
         assert_eq!(back.event_track_model_slug, "rap");
         assert!(!back.event_track_camera_follow);
     }
