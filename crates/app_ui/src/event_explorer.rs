@@ -217,14 +217,18 @@ impl EventTrackCameraFollow {
 }
 
 pub(crate) fn event_track_color(ef_label: &str) -> egui::Color32 {
+    let normalized = ef_label.trim().to_ascii_uppercase();
+    if normalized.contains("EF-U") || normalized.contains("EFU") || normalized == "UNK" {
+        return egui::Color32::from_rgb(192, 192, 192);
+    }
     match spc_layers::tornado_rating_index(ef_label) {
-        Some(0) => egui::Color32::from_rgb(83, 220, 95),
-        Some(1) => egui::Color32::from_rgb(248, 229, 68),
-        Some(2) => egui::Color32::from_rgb(255, 161, 43),
-        Some(3) => egui::Color32::from_rgb(240, 62, 48),
-        Some(4) => egui::Color32::from_rgb(211, 54, 238),
-        Some(5) => egui::Color32::from_rgb(255, 255, 255),
-        _ => egui::Color32::from_rgb(235, 51, 35),
+        Some(0) => egui::Color32::from_rgb(19, 170, 225),
+        Some(1) => egui::Color32::from_rgb(65, 173, 72),
+        Some(2) => egui::Color32::from_rgb(239, 229, 46),
+        Some(3) => egui::Color32::from_rgb(248, 172, 35),
+        Some(4) => egui::Color32::from_rgb(213, 26, 45),
+        Some(5) => egui::Color32::from_rgb(123, 49, 138),
+        _ => egui::Color32::from_rgb(192, 192, 192),
     }
 }
 
@@ -1090,15 +1094,15 @@ mod tests {
     fn event_track_color_uses_whole_track_ef_rating() {
         assert_eq!(
             event_track_color("EF0"),
-            egui::Color32::from_rgb(83, 220, 95)
+            egui::Color32::from_rgb(19, 170, 225)
         );
         assert_eq!(
             event_track_color("EF4"),
-            egui::Color32::from_rgb(211, 54, 238)
+            egui::Color32::from_rgb(213, 26, 45)
         );
         assert_eq!(
-            event_track_color("EF?"),
-            egui::Color32::from_rgb(235, 51, 35)
+            event_track_color("EF-U"),
+            egui::Color32::from_rgb(192, 192, 192)
         );
     }
 

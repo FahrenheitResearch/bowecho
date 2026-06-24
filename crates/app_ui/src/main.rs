@@ -1319,6 +1319,7 @@ struct ViewerApp {
     selected_frame_index: usize,
     low_sweep_disabled_cuts: BTreeSet<LowSweepCutKey>,
     manual_primary_cut_hold: Option<LowSweepCutKey>,
+    product_cut_memory: BTreeMap<String, usize>,
     loop_timeline_summary_cache: std::cell::RefCell<Option<LoopTimelineSummaryCache>>,
     /// Raster tile basemap (satellite/streets/topo) under the radar.
     tile_layer: std::cell::RefCell<tiles::TileLayer>,
@@ -5494,6 +5495,7 @@ impl ViewerApp {
             selected_frame_index: 0,
             low_sweep_disabled_cuts: BTreeSet::new(),
             manual_primary_cut_hold: None,
+            product_cut_memory: BTreeMap::new(),
             loop_timeline_summary_cache: std::cell::RefCell::new(None),
             tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(settings::tile_cache_dir())),
             basemap_style: tiles::TileStyle::DarkVector,
@@ -10034,19 +10036,7 @@ impl ViewerApp {
                     }
                 }
                 None => {
-                    if self.selected_product != product {
-                        if let Some(cut) = cut_for_user_product_switch(
-                            volume.as_ref(),
-                            self.selected_cut,
-                            &product,
-                        ) {
-                            self.selected_cut = cut;
-                        }
-                        self.selected_product = product;
-                        self.manual_primary_cut_hold = None;
-                        self.sanitize_selection();
-                        self.clear_texture();
-                    }
+                    self.switch_primary_product(volume.as_ref(), product);
                 }
             }
             return true;
@@ -10061,6 +10051,48 @@ impl ViewerApp {
             && self.active_pane >= 1
             && self.active_pane - 1 < self.extra_panes.len())
         .then(|| self.active_pane - 1)
+    }
+
+    fn remember_current_primary_product_cut(&mut self) {
+        if self.app_settings.remember_product_tilts {
+            self.product_cut_memory
+                .insert(self.selected_product.label().to_owned(), self.selected_cut);
+        }
+    }
+
+    fn preferred_primary_cut_for_product_switch(
+        &self,
+        volume: &RadarVolume,
+        product: &DisplayProduct,
+    ) -> Option<usize> {
+        if self.app_settings.remember_product_tilts {
+            if let Some(cut) = self
+                .product_cut_memory
+                .get(product.label())
+                .copied()
+                .filter(|cut| is_displayable_on_cut(volume, *cut, product))
+            {
+                return Some(cut);
+            }
+            return lowest_displayable_cut_for_product(volume, product);
+        }
+        cut_for_user_product_switch(volume, self.selected_cut, product)
+    }
+
+    fn switch_primary_product(&mut self, volume: &RadarVolume, product: DisplayProduct) -> bool {
+        let Some(next_cut) = self.preferred_primary_cut_for_product_switch(volume, &product) else {
+            return false;
+        };
+        if self.selected_product == product && self.selected_cut == next_cut {
+            return false;
+        }
+        self.remember_current_primary_product_cut();
+        self.selected_product = product;
+        self.selected_cut = next_cut;
+        self.manual_primary_cut_hold = None;
+        self.sanitize_selection();
+        self.clear_texture();
+        true
     }
 
     fn step_pane_product(&mut self, slot: usize, delta: isize) -> bool {
@@ -10134,26 +10166,15 @@ impl ViewerApp {
     }
 
     fn step_product(&mut self, delta: isize) -> bool {
-        let Some(volume) = self.volume.as_ref() else {
+        let Some(volume) = self.volume.clone() else {
             return false;
         };
-        let products = global_displayable_products(volume);
+        let products = global_displayable_products(volume.as_ref());
         let Some(next_product) = stepped_product(&products, &self.selected_product, delta).cloned()
         else {
             return false;
         };
-        let Some(next_cut) = cut_for_user_product_switch(volume, self.selected_cut, &next_product)
-        else {
-            return false;
-        };
-        if self.selected_product == next_product && self.selected_cut == next_cut {
-            return false;
-        }
-        self.selected_product = next_product;
-        self.selected_cut = next_cut;
-        self.manual_primary_cut_hold = None;
-        self.clear_texture();
-        true
+        self.switch_primary_product(volume.as_ref(), next_product)
     }
 
     fn step_tilt(&mut self, delta: isize) -> bool {
@@ -15740,7 +15761,7 @@ impl eframe::App for ViewerApp {
                         ui.allocate_rect(rect, egui::Sense::hover());
                     });
             }
-            if ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| p.y < 60.0)) {
+            if ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| p.y < 360.0)) {
                 egui::Area::new(egui::Id::new("chrome_controls"))
                     .fixed_pos(egui::pos2(12.0, 38.0))
                     .show(&ctx, |ui| {
@@ -16352,16 +16373,8 @@ impl ViewerApp {
     }
 
     fn set_primary_product_prefer(&mut self, product: DisplayProduct) {
-        if let Some(volume) = self.volume.as_deref() {
-            let cut = if is_displayable_on_cut(volume, self.selected_cut, &product) {
-                Some(self.selected_cut)
-            } else {
-                best_cut_for_product(volume, self.selected_cut, &product)
-            };
-            if let Some(cut) = cut {
-                self.selected_cut = cut;
-                self.selected_product = product;
-            }
+        if let Some(volume) = self.volume.clone() {
+            self.switch_primary_product(volume.as_ref(), product);
         } else {
             self.selected_product = product;
         }
@@ -20578,8 +20591,11 @@ impl ViewerApp {
         let product_buttons = global_displayable_products(volume)
             .into_iter()
             .map(|product| {
-                let target_cut =
-                    cut_for_user_product_switch(volume, editing_effective_cut, &product);
+                let target_cut = if editing_pane.is_none() {
+                    self.preferred_primary_cut_for_product_switch(volume, &product)
+                } else {
+                    cut_for_user_product_switch(volume, editing_effective_cut, &product)
+                };
                 (product, target_cut)
             })
             .collect::<Vec<_>>();
@@ -20601,6 +20617,22 @@ impl ViewerApp {
 
         // R3: PRODUCTS — hotkey-prefixed grid, contextual rows, color, threshold.
         Self::section_header(ui, "PRODUCTS");
+        if editing_pane.is_none() {
+            let mut remember_product_tilts = self.app_settings.remember_product_tilts;
+            if ui
+                .checkbox(&mut remember_product_tilts, "Remember tilt per product")
+                .on_hover_text(
+                    "On: REF, VEL, CC, ZDR, etc. keep their own last selected tilt. First switch to a product uses that product's lowest available tilt.",
+                )
+                .changed()
+            {
+                self.app_settings.remember_product_tilts = remember_product_tilts;
+                if !remember_product_tilts {
+                    self.product_cut_memory.clear();
+                }
+                let _ = self.app_settings.save();
+            }
+        }
         // Invert the hotkey map so each product button can show its key.
         let hotkey_for_label: std::collections::HashMap<String, String> = self
             .app_settings
@@ -20631,17 +20663,30 @@ impl ViewerApp {
                         self.extra_panes[slot].render_ms = None;
                         ctx.request_repaint();
                     } else {
-                        self.selected_product = product.clone();
-                        if let Some(cut_index) = target_cut {
-                            self.selected_cut = *cut_index;
-                        }
-                        self.manual_primary_cut_hold = None;
-                        self.clear_texture();
+                        self.switch_primary_product(volume, product.clone());
                         ctx.request_repaint();
                     }
                 }
             }
         });
+        let has_kdp = product_buttons.iter().any(|(product, _)| {
+            *product == DisplayProduct::Moment(MomentType::SpecificDifferentialPhase)
+        });
+        let has_dual_pol_source = volume.cuts.iter().any(|cut| {
+            cut.moments.contains_key(&MomentType::DifferentialPhase)
+                || cut
+                    .moments
+                    .contains_key(&MomentType::SpecificDifferentialPhase)
+                || cut
+                    .moments
+                    .contains_key(&MomentType::CorrelationCoefficient)
+                || cut
+                    .moments
+                    .contains_key(&MomentType::DifferentialReflectivity)
+        });
+        if !has_kdp && has_dual_pol_source {
+            ui.weak("KDP appears only when this decoded frame contains a KDP moment; many Level II scans provide PHI but not KDP.");
+        }
 
         // Contextual rows: exactly one family block at a time, gated on the
         // FOCUSED pane's product, so the tilt list below barely shifts.
@@ -31788,7 +31833,7 @@ impl ViewerApp {
             let (delta, shift) = ui.input(|input| (input.pointer.delta(), input.modifiers.shift));
             if self.vol3d.camera_mode == vol3d::Vol3dCameraMode::Fly {
                 self.vol3d.yaw -= delta.x * 0.006;
-                self.vol3d.pitch = (self.vol3d.pitch - delta.y * 0.006).clamp(-1.45, 1.45);
+                self.vol3d.pitch = (self.vol3d.pitch + delta.y * 0.006).clamp(-1.45, 1.45);
             } else if shift {
                 self.vol3d.focus_height_km =
                     (self.vol3d.focus_height_km - delta.y * 0.03).clamp(0.0, top_km);
@@ -34875,9 +34920,9 @@ impl ViewerApp {
             )
         } else {
             (
-                egui::Color32::from_rgb(198, 207, 214),
-                egui::Color32::from_rgba_unmultiplied(3, 5, 8, 210),
-                egui::Color32::from_rgb(118, 143, 158),
+                egui::Color32::WHITE,
+                egui::Color32::from_rgba_unmultiplied(3, 5, 8, 230),
+                egui::Color32::from_rgb(210, 222, 232),
             )
         };
         let zoomed = self.map_scale >= 190.0;
@@ -34889,9 +34934,9 @@ impl ViewerApp {
             }
             let (text_color, halo_color, dot_color) = if !bold && label.rank >= 7 {
                 (
-                    egui::Color32::from_rgb(218, 226, 232),
-                    egui::Color32::from_rgba_unmultiplied(3, 5, 8, 225),
-                    egui::Color32::from_rgb(144, 168, 182),
+                    egui::Color32::WHITE,
+                    egui::Color32::from_rgba_unmultiplied(3, 5, 8, 235),
+                    egui::Color32::from_rgb(205, 218, 230),
                 )
             } else {
                 (base_text_color, base_halo_color, base_dot_color)
@@ -35000,8 +35045,8 @@ impl ViewerApp {
         occupied: &mut Vec<egui::Rect>,
     ) {
         let font = egui::FontId::proportional(13.0);
-        let text_color = egui::Color32::from_rgba_unmultiplied(184, 199, 211, 205);
-        let halo_color = egui::Color32::from_rgba_unmultiplied(2, 4, 7, 210);
+        let text_color = egui::Color32::WHITE;
+        let halo_color = egui::Color32::from_rgba_unmultiplied(2, 4, 7, 235);
         for label in US_STATE_ANCHORS {
             let Some(name) = us_state_name(label.abbr) else {
                 continue;
@@ -48094,6 +48139,46 @@ mod tests {
     }
 
     #[test]
+    fn remember_product_tilts_restores_each_products_own_cut() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let mut volume = test_reflectivity_sails_volume_with_radials(
+            &[(0.50, 0), (1.20, 30_000), (0.70, 60_000)],
+            720,
+        );
+        add_velocity_moments_to_volume(&mut volume);
+        volume.cuts[1].moments.remove(&MomentType::Velocity);
+        app.volume = Some(Arc::new(volume));
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.selected_cut = 1;
+        app.app_settings.remember_product_tilts = true;
+
+        assert!(app.step_product(1));
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Velocity)
+        );
+        assert_eq!(
+            app.selected_cut, 0,
+            "first switch to VEL should use VEL's lowest available cut"
+        );
+
+        app.selected_cut = 2;
+        assert!(app.step_product(-1));
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Reflectivity)
+        );
+        assert_eq!(app.selected_cut, 1);
+
+        assert!(app.step_product(1));
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Velocity)
+        );
+        assert_eq!(app.selected_cut, 2);
+    }
+
+    #[test]
     fn synced_velocity_pane_does_not_flip_to_ref_on_ref_only_live_partial() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.volume = Some(Arc::new(test_ref_then_velocity_volume()));
@@ -57435,6 +57520,7 @@ mod tests {
             selected_frame_index: 0,
             low_sweep_disabled_cuts: BTreeSet::new(),
             manual_primary_cut_hold: None,
+            product_cut_memory: BTreeMap::new(),
             loop_timeline_summary_cache: std::cell::RefCell::new(None),
             tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(settings::tile_cache_dir())),
             basemap_style: tiles::TileStyle::DarkVector,
