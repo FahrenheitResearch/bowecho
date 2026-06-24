@@ -40,20 +40,26 @@ enum GuideSection {
     ModelData,
     Satellite,
     Archive,
+    Player,
     Tools,
+    Volume3d,
+    CaptureBrand,
     Shortcuts,
     Sources,
 }
 
 impl GuideSection {
-    const ALL: [GuideSection; 9] = [
+    const ALL: [GuideSection; 12] = [
         Self::GettingStarted,
         Self::Products,
         Self::Layers,
         Self::ModelData,
         Self::Satellite,
         Self::Archive,
+        Self::Player,
         Self::Tools,
+        Self::Volume3d,
+        Self::CaptureBrand,
         Self::Shortcuts,
         Self::Sources,
     ];
@@ -66,7 +72,10 @@ impl GuideSection {
             Self::ModelData => "Model data & soundings",
             Self::Satellite => "Satellite",
             Self::Archive => "Archive & events",
+            Self::Player => "Unified Player",
             Self::Tools => "Tools & inspector",
+            Self::Volume3d => "3D Volume",
+            Self::CaptureBrand => "Capture & brand",
             Self::Shortcuts => "Keyboard shortcuts",
             Self::Sources => "Data sources & credits",
         }
@@ -122,7 +131,10 @@ pub fn guide_window(ctx: &egui::Context, open: &mut bool) {
                             GuideSection::ModelData => model_data(ui),
                             GuideSection::Satellite => satellite(ui),
                             GuideSection::Archive => archive(ui),
+                            GuideSection::Player => unified_player(ui),
                             GuideSection::Tools => tools(ui),
+                            GuideSection::Volume3d => volume_3d(ui),
+                            GuideSection::CaptureBrand => capture_brand(ui),
                             GuideSection::Shortcuts => shortcuts(ui),
                             GuideSection::Sources => sources(ui),
                         }
@@ -276,7 +288,7 @@ fn getting_started(ui: &mut egui::Ui) {
         ui,
         "LOOP",
         "— after Load Loop: play/pause, step buttons, a scrub slider, and the frame cap \
-         (3\u{2013}30 frames).",
+         (compact controls; Unified Player supports up to 2000 frames, 64x playback, and exports).",
     );
 
     subhead(ui, "PANES & THE MAP");
@@ -547,6 +559,19 @@ fn layers(ui: &mut egui::Ui) {
     );
     action(
         ui,
+        "Radar labels",
+        "- switch site markers between compact IDs, full names, or hidden labels. Compact IDs \
+         are the clean default for busy zoomed-out maps and multi-radar review.",
+    );
+    action(
+        ui,
+        "Brand Kit",
+        "- changes the runtime identity used in the window title, screenshots, output paths, \
+         share cards, watermarks, links, and colors. It does not replace signing identity or \
+         installer metadata.",
+    );
+    action(
+        ui,
         "+ Add layer \u{25be}",
         "— the single front door for every map data type: radar overlays, model fields, \
          satellite, WoFS/FARM drapes, mesoanalysis composites, surface obs, placefiles. You \
@@ -584,8 +609,8 @@ fn model_data(ui: &mut egui::Ui) {
     ui.heading("Model data & soundings");
     para(
         ui,
-        "Model fields and skew-T soundings (HRRR over CONUS, GFS worldwide), layered \
-         straight onto the radar map. Enable the \
+        "Model fields and skew-T soundings (HRRR/RAP/RRFS-style CONUS workflows plus GFS \
+         worldwide), layered straight onto the radar map. Enable the \
          master switch first: \u{2699} Settings \u{25b8} Model \u{25b8} Model data (off = \
          pure radar app). Windows \u{25be} \u{25b8} Model data opens the Model window.",
     );
@@ -603,8 +628,8 @@ fn model_data(ui: &mut egui::Ui) {
         ui,
         "Download…",
         "— the full window: any init date/cycle, an hours spec (\"0-3\" or \"2,4,6\"), profile \
-         choice, with a live size estimate before you commit. Other models are listed but \
-         disabled until ingest supports them.",
+         choice, with a live size estimate before you commit. Model support depends on the \
+         local rusty-weather ingest/catalog build.",
     );
     action(
         ui,
@@ -666,6 +691,14 @@ fn model_data(ui: &mut egui::Ui) {
         "With \"Model value\" ticked in Inspector\u{2026}, the cursor card reads the model \
          field under the cursor — even while the map layer is hidden.",
     );
+    subhead(ui, "EVENT AUTO-LOAD");
+    para(
+        ui,
+        "Event-day tornado tracks and Archive tornado report clicks can auto-load the model \
+         run/hour closest to that event time. This is meant for fast post-event soundings: \
+         click the track/report, let the radar loop load, then Alt+click or Ctrl+Alt+hover \
+         for nearby profiles.",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -675,8 +708,9 @@ fn satellite(ui: &mut egui::Ui) {
     ui.heading("Satellite");
     para(
         ui,
-        "Windows \u{25be} \u{25b8} Satellite opens the GOES window: a live follow engine on \
-         top, a frame player below.",
+        "Windows \u{25be} \u{25b8} Satellite opens the satellite window: GOES live follow on \
+         top, other satellite sources below, and a frame player for anything written to the \
+         local satellite store.",
     );
 
     subhead(ui, "LIVE FOLLOW");
@@ -686,6 +720,15 @@ fn satellite(ui: &mut egui::Ui) {
          Meso 1, Meso 2), and any of the 16 ABI bands. Start polls the NOAA open-data bucket \
          at the sector's native cadence and keeps a rolling local store. BowEcho uses its own \
          sat store, so it can run alongside other tools without corrupting their caches.",
+    );
+
+    subhead(ui, "OTHER SATELLITE SOURCES");
+    para(
+        ui,
+        "Himawari-9 B13 can be loaded from NOAA public buckets for Asia/Pacific IR context. \
+         MTG/FCI discovery and local FCI file decode are wired, but live European FCI imagery \
+         still depends on EUMETSAT entitlement/credentials. Switching source, sector, or layer \
+         clears stale frames so late downloads from the old selection cannot flash onto the map.",
     );
 
     subhead(ui, "FRAME PLAYER");
@@ -701,6 +744,15 @@ fn satellite(ui: &mut egui::Ui) {
         "Show on radar map",
         "— puts the current frame under the radar as a map layer. Opacity and removal live in \
          the Custom tab's GOES row.",
+    );
+
+    subhead(ui, "LIGHTNING");
+    para(
+        ui,
+        "The Lightning layer is GOES GLM: BowEcho chooses East or West from the map longitude, \
+         fetches the newest granules first, age-fades flashes, and reads the rolling store for \
+         loaded radar loops. Live means the newest flash is inside the live-age gate; stale \
+         status means the layer is waiting for newer GLM files, not that radar data is broken.",
     );
 
     subhead(ui, "BAND PICKS");
@@ -738,8 +790,35 @@ fn archive(ui: &mut egui::Ui) {
         ui,
         "On click: Loop / Single",
         "— Loop loads a loop of volumes ending at the chosen scan (count set by Frames, \
-         1\u{2013}30); Single loads just that scan. +5 earlier extends a loaded loop further \
+         the current frame limit); Single loads just that scan. +5 earlier extends a loaded loop further \
          back in time.",
+    );
+
+    subhead(ui, "UNIFIED PLAYER WINDOWS");
+    para(
+        ui,
+        "For long loops, use Windows > Player. It can load latest frames, a recent loop, an \
+         archive window, or an archive window ending at a selected time. Frame limits go up \
+         to 2000, playback speed goes up to 64x, and warning/model/satellite/lightning sync \
+         options live with the timeline instead of being scattered through the sidebar.",
+    );
+
+    subhead(ui, "RADAR COVERAGE EXPLORER");
+    para(
+        ui,
+        "Data > Radar coverage is the provider-aware picker for international and research \
+         sources. It shows Live / Loop / Archive / Dual-pol / Experimental badges, lets you \
+         probe a site/time without loading data, and exposes native provider paths such as \
+         SMHI hour/day archive loading. Treat archive badges as capability evidence, not a \
+         promise that every country has deep history through BowEcho yet.",
+    );
+
+    subhead(ui, "DATA PACKS");
+    para(
+        ui,
+        "Data packs are ready-made review scenes for important dual-pol and debug cases. Load \
+         one to fetch the needed archive frames, apply the intended scene, then expand the \
+         window if you want more context.",
     );
 
     subhead(ui, "SPC TORNADO EVENTS");
@@ -747,14 +826,15 @@ fn archive(ui: &mut egui::Ui) {
         ui,
         "Tornadoes (SPC) \u{25b8} Fetch",
         "— pulls the SPC filtered tornado reports for the date (SPC's 12Z\u{2013}12Z \
-         convective day). Each report shows time, EF rating when rated, and location.",
+         convective day), pins the Event Day track layer, and shows EF-colored track lines \
+         where surveyed geometry exists.",
     );
     action(
         ui,
         "Click a report",
         "— BowEcho picks the radar with the lowest beam over the report location, centers the \
-         map there, and loads the loop at the report time. One click from \"tornado near X\" \
-         to the right radar at the right minute.",
+         map there, loads the loop at the report time, and can auto-load the matching model \
+         hour for soundings.",
     );
 
     subhead(ui, "EVENT EXPLORER");
@@ -792,7 +872,82 @@ fn archive(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Tools & inspector
+// 6. Unified Player
+
+fn unified_player(ui: &mut egui::Ui) {
+    ui.heading("Unified Player");
+    para(
+        ui,
+        "Windows > Player is the full loop workstation. It owns long radar loops, archive \
+         windows, low-sweep timelines, synced warnings/reports/lightning/models, multi-radar \
+         mosaics, camera follow, and loop export. Use it when the compact Radar-tab loop \
+         controls are too small for the job.",
+    );
+
+    subhead(ui, "LOADING");
+    action(
+        ui,
+        "Latest",
+        "- loads the freshest frame for the active site without changing the rest of the \
+         player setup.",
+    );
+    action(
+        ui,
+        "Loop",
+        "- loads the requested number of recent frames. The menu offers common sizes up to \
+         2000, and the numeric box accepts any value in that range.",
+    );
+    action(
+        ui,
+        "Archive window",
+        "- loads a UTC start/end window. Ending-at is the fastest way to say 'give me N \
+         frames ending at this time'.",
+    );
+    action(
+        ui,
+        "Add/sync",
+        "- adds nearby radar sites as timeline-owned overlays. Mosaic 5 can coordinate up to \
+         five sites and uses latest-at-or-before timing so sparse products hold their last \
+         real sweep instead of showing future data.",
+    );
+
+    subhead(ui, "LOW SWEEPS");
+    para(
+        ui,
+        "Low sweeps expands each volume into the real low-level cuts inside that scan. All \
+         low shows every low sweep, same degree follows matching physical elevation, and base \
+         only keeps the base tilt. This is useful for SAILS/MRLE-style rapid low-level cuts \
+         without pretending every product updates at the same instant.",
+    );
+
+    subhead(ui, "TIME-SYNCED LAYERS");
+    para(
+        ui,
+        "Warning sync, SPC reports, mPING, GLM lightning, satellite frames, and model fields \
+         can follow the player time. Archive warning sync is explicit so live warning mode \
+         stays live until you ask for historical warnings.",
+    );
+
+    subhead(ui, "CAMERA FOLLOW");
+    para(
+        ui,
+        "Storm-track follow can lock the map to a detected track. Manual camera keyframes let \
+         you place the center point on several frames and have BowEcho interpolate between \
+         them. Hide guides keeps storm/tornado guide lines out of clean captures while follow \
+         mode is active.",
+    );
+
+    subhead(ui, "EXPORT");
+    para(
+        ui,
+        "Loop record/export uses the player timeline rather than wall-clock speed. Use full \
+         resolution for release-quality video, and set export speed separately when you want \
+         a 1500-step loop to play back faster than real time.",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Tools & inspector
 
 fn tools(ui: &mut egui::Ui) {
     ui.heading("Tools & inspector");
@@ -904,7 +1059,103 @@ fn tools(ui: &mut egui::Ui) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Keyboard shortcuts
+// 8. 3D Volume
+
+fn volume_3d(ui: &mut egui::Ui) {
+    ui.heading("3D Volume");
+    para(
+        ui,
+        "Windows > 3D Volume opens the GPU volume renderer for the active radar volume. It is \
+         designed for storm-scale inspection, not as a replacement for the 2D warning map.",
+    );
+
+    subhead(ui, "CHOOSING A VOLUME");
+    para(
+        ui,
+        "Use the 3D window controls or draw/select a map box over the storm you want. BowEcho \
+         samples one complete same-site radar volume into a Cartesian 3D texture. If live data \
+         is still partial, the 3D view waits for a complete same-site volume instead of \
+         borrowing a different radar or resampling an incomplete scan.",
+    );
+
+    subhead(ui, "VIEW MODES");
+    action(
+        ui,
+        "Orbit",
+        "- default camera. Good for rotating around a storm cell and keeping spatial context.",
+    );
+    action(
+        ui,
+        "Fly",
+        "- drag to look, WASD to move, Q/E vertical, mouse wheel to dolly, Shift for faster \
+         movement. Useful for moving through or around tall exaggerated storm boxes.",
+    );
+
+    subhead(ui, "FLOOR PPI");
+    para(
+        ui,
+        "Floor PPI paints the lowest usable reflectivity sweep onto the floor of the 3D box. \
+         The floor uses the active reflectivity palette and has its own alpha slider, so you \
+         can keep ground context without hiding the volume.",
+    );
+
+    subhead(ui, "LIMITS");
+    para(
+        ui,
+        "The current 3D renderer is single-radar. True multi-radar 3D compositing needs a \
+         real composite grid and quality rules first.",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 9. Capture & brand
+
+fn capture_brand(ui: &mut egui::Ui) {
+    ui.heading("Capture & brand");
+
+    subhead(ui, "SCREENSHOTS");
+    para(
+        ui,
+        "Screenshot writes a PNG to Pictures/BowEcho and places a paste-ready image on the \
+         clipboard. Shift+F12 captures the map only; F12 captures the full app window. Map \
+         Only hides chrome for clean screenshots and recordings, and the top hover affordance \
+         brings the UI back if the tabs are hidden.",
+    );
+
+    subhead(ui, "VIDEO, GIF, WEBP");
+    para(
+        ui,
+        "Loop export records the current timeline deterministically, waiting for the intended \
+         radar texture and synced layers before writing each frame. MP4 is best for social \
+         video, WebP is the better compact animated image, and GIF remains useful when a site \
+         does not accept video.",
+    );
+
+    subhead(ui, "FREE RECORD");
+    para(
+        ui,
+        "Free record captures what BowEcho is drawing while you pan, scrub, inspect, or use \
+         soundings. It is separate from loop export: loop export records a data timeline, free \
+         record records your interaction with the app.",
+    );
+
+    subhead(ui, "BRAND KIT");
+    para(
+        ui,
+        "Settings > Brand Kit controls display name, links, palette, optional image assets, \
+         screenshot/loop filename prefix, output folder, and optional watermark/share-card \
+         overlays. The Generic preset is for non-BowEcho-branded builds; the default preset \
+         remains BowEcho.",
+    );
+    para(
+        ui,
+        "Brand Kit is runtime presentation only. App icon metadata, code signing identity, \
+         notarization, and installers are still release/build workflow concerns.",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. Keyboard shortcuts
 
 fn shortcuts(ui: &mut egui::Ui) {
     ui.heading("Keyboard shortcuts");
@@ -915,13 +1166,25 @@ fn shortcuts(ui: &mut egui::Ui) {
     );
 
     subhead(ui, "KEYS");
+    key_row(ui, "Space", "play / pause the loaded loop");
+    key_row(
+        ui,
+        "PgUp / PgDn",
+        "previous / next frame in the loaded loop",
+    );
     key_row(ui, "\u{2190} / \u{2192}", "previous / next product");
     key_row(ui, "\u{2191} / \u{2193}", "step up / down the tilt list");
+    key_row(ui, "G", "show / hide the lat-lon grid");
     key_row(
         ui,
         "1 \u{2026} 9, 0",
         "product hotkeys — defaults: 1 REF · 2 VEL · 3 SRV · 4 RHO · 5 ZDR · 6 SW · \
          7 CREF · 8 ET · 9 VIL · 0 VILD",
+    );
+    para(
+        ui,
+        "Product hotkeys can also use letters A-Z. Settings > Hotkeys shows the current map \
+         and config path; product buttons display their assigned key.",
     );
     key_row(
         ui,
@@ -973,10 +1236,15 @@ fn shortcuts(ui: &mut egui::Ui) {
          Clear wipes — annotations are geo-anchored and show up in \
          screenshots and recordings",
     );
+    subhead(ui, "3D FLY MODE");
+    key_row(ui, "drag", "look around in the 3D Volume Explorer");
+    key_row(ui, "W / A / S / D", "move through the 3D volume");
+    key_row(ui, "Q / E", "move down / up");
+    key_row(ui, "Shift", "move faster while held");
 }
 
 // ---------------------------------------------------------------------------
-// 8. Data sources & credits
+// 11. Data sources & credits
 
 fn sources(ui: &mut egui::Ui) {
     ui.heading("Data sources & credits");
@@ -989,6 +1257,13 @@ fn sources(ui: &mut egui::Ui) {
          accounts. The site directory comes from api.weather.gov/radar/stations.",
     );
 
+    para(
+        ui,
+        "International radar comes through provider adapters such as ORD, SMHI, KAIA, DMI, \
+         FMI, GeoSphere, DWD, SHMU, CHMI, and JMA/NICT where upstream data is available. \
+         Coverage and archive depth vary by country and provider.",
+    );
+
     subhead(ui, "HAZARDS & REPORTS");
     para(
         ui,
@@ -999,6 +1274,13 @@ fn sources(ui: &mut egui::Ui) {
          1999, 11th Conf. Applied Climatology).",
     );
 
+    para(
+        ui,
+        "Outlooks include official SPC GeoJSON plus raw SPC PTS fallback for faster issue \
+         detection, and ESTOFEX XML polygons for Europe. mPING reports and Spotter Network \
+         placefiles are optional map layers.",
+    );
+
     subhead(ui, "MODEL & SATELLITE");
     para(
         ui,
@@ -1006,6 +1288,13 @@ fn sources(ui: &mut egui::Ui) {
          local store by the \
          rusty-weather stack (rw-ingest / rw-ui); the native skew-T is verified against \
          sharprs. GOES-16/18/19 ABI imagery from NOAA open-data buckets via rw-sat.",
+    );
+
+    para(
+        ui,
+        "RAP/RRFS-style regional products, GOES GLM lightning, Himawari-9 B13, and MTG FCI \
+         discovery/local decode are also wired where the upstream source and credentials allow. \
+         MTG FCI live imagery still depends on EUMETSAT entitlement.",
     );
 
     subhead(ui, "BASEMAPS");
@@ -1066,7 +1355,11 @@ mod tests {
 
     #[test]
     fn guide_copy_mentions_current_navigation_and_repro_surfaces() {
+        assert_eq!(GuideSection::ALL.len(), 12);
         assert_eq!(GuideSection::Layers.label(), "Custom & layers");
+        assert_eq!(GuideSection::Player.label(), "Unified Player");
+        assert_eq!(GuideSection::Volume3d.label(), "3D Volume");
+        assert_eq!(GuideSection::CaptureBrand.label(), "Capture & brand");
         assert!(GUIDE_TOP_BAR_TEXT.contains("Map Only"));
         assert!(GUIDE_TOP_BAR_TEXT.contains("Workflows"));
         assert!(GUIDE_TOP_BAR_TEXT.contains("Radar overlays"));
@@ -1081,6 +1374,10 @@ mod tests {
         assert!(guide_src.contains("warning-polygon"));
         assert!(guide_src.contains("radar-age ring/marker arc/chip"));
         assert!(guide_src.contains("appearance profiles"));
+        assert!(guide_src.contains("Mosaic 5"));
+        assert!(guide_src.contains("GOES GLM"));
+        assert!(guide_src.contains("Floor PPI"));
+        assert!(guide_src.contains("Brand Kit"));
         let stale_color_tables = ["Settings", "\u{25b8}", "Color tables"].join(" ");
         assert!(!guide_src.contains(&stale_color_tables));
         let stale_link: String = ['"', 'L', 'a', 'y', 'e', 'r', 's', ':', ' ', 'N']
