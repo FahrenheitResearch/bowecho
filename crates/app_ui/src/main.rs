@@ -19145,8 +19145,8 @@ impl ViewerApp {
             }
             if ui.button("Reset preset").clicked() {
                 let preset = match edited.preset {
-                    settings::BrandPreset::CaliforniaWildfireTracking => {
-                        settings::BrandPreset::CaliforniaWildfireTracking
+                    settings::BrandPreset::GenericBrandedApp => {
+                        settings::BrandPreset::GenericBrandedApp
                     }
                     settings::BrandPreset::BowEcho | settings::BrandPreset::Custom => {
                         settings::BrandPreset::BowEcho
@@ -19159,7 +19159,7 @@ impl ViewerApp {
             }
         });
         ui.weak(
-            "The California Wildfire Tracking preset is a community partner skin. It ships no third-party logo/icon assets and does not claim official CAL FIRE ownership.",
+            "The generic branded preset is a neutral starter skin. Add your own identity, links, palette, logo/icon, watermark, and attribution before distributing a branded build.",
         );
 
         ui.separator();

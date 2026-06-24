@@ -418,8 +418,8 @@ mod tests {
         let mut brand = settings::BrandConfig::default();
         assert_eq!(window_title(&brand), "BowEcho");
 
-        brand.display_name = "California Wildfire Tracking".to_owned();
-        assert_eq!(window_title(&brand), "California Wildfire Tracking");
+        brand.display_name = "Generic Weather App".to_owned();
+        assert_eq!(window_title(&brand), "Generic Weather App");
     }
 
     #[test]
@@ -428,10 +428,7 @@ mod tests {
             github_latest_release_api_url("https://github.com/example/custom-app"),
             Some("https://api.github.com/repos/example/custom-app/releases/latest".to_owned())
         );
-        assert_eq!(
-            github_latest_release_api_url("https://www.cafire.org/"),
-            None
-        );
+        assert_eq!(github_latest_release_api_url("https://example.org/"), None);
         let brand = settings::BrandConfig {
             repo_url: "https://github.com/example/custom-app".to_owned(),
             releases_url: String::new(),

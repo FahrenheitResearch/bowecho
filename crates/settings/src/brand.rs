@@ -16,17 +16,17 @@ pub const DEFAULT_STORAGE_NAMESPACE: &str = "bowecho";
 pub enum BrandPreset {
     #[default]
     BowEcho,
-    CaliforniaWildfireTracking,
+    GenericBrandedApp,
     Custom,
 }
 
 impl BrandPreset {
-    pub const BUILT_INS: [Self; 2] = [Self::BowEcho, Self::CaliforniaWildfireTracking];
+    pub const BUILT_INS: [Self; 2] = [Self::BowEcho, Self::GenericBrandedApp];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::BowEcho => "BowEcho default",
-            Self::CaliforniaWildfireTracking => "California Wildfire Tracking",
+            Self::GenericBrandedApp => "Generic branded app",
             Self::Custom => "Custom",
         }
     }
@@ -102,18 +102,18 @@ impl Default for BrandPalette {
 }
 
 impl BrandPalette {
-    pub fn california_wildfire_tracking() -> Self {
+    pub fn generic_branded_app() -> Self {
         Self {
-            primary: "#F97316".to_owned(),
-            accent: "#FDBA2D".to_owned(),
-            danger: "#E53935".to_owned(),
-            warning: "#FFB300".to_owned(),
-            success: "#2E7D32".to_owned(),
-            surface: "#0B1117".to_owned(),
-            surface_alt: "#151E27".to_owned(),
+            primary: "#2F80ED".to_owned(),
+            accent: "#56CCF2".to_owned(),
+            danger: "#EB5757".to_owned(),
+            warning: "#F2C94C".to_owned(),
+            success: "#27AE60".to_owned(),
+            surface: "#101418".to_owned(),
+            surface_alt: "#182027".to_owned(),
             text: "#F8FAFC".to_owned(),
-            muted_text: "#A8B3BF".to_owned(),
-            outline: "#495866".to_owned(),
+            muted_text: "#AEB8C2".to_owned(),
+            outline: "#34414D".to_owned(),
         }
     }
 
@@ -298,45 +298,45 @@ impl BrandConfig {
                 preset: BrandPreset::Custom,
                 ..Self::default()
             },
-            BrandPreset::CaliforniaWildfireTracking => Self {
+            BrandPreset::GenericBrandedApp => Self {
                 schema: BRAND_KIT_SCHEMA,
                 preset,
-                display_name: "California Wildfire Tracking".to_owned(),
-                short_name: "CWT".to_owned(),
-                organization: "Community Wildfire Tracker".to_owned(),
-                tagline: "Stay Informed. Stay Prepared. Stay Safe.".to_owned(),
-                website_url: "https://www.cafire.org/".to_owned(),
+                display_name: "Generic Weather App".to_owned(),
+                short_name: "Weather App".to_owned(),
+                organization: "Your Organization".to_owned(),
+                tagline: "Operational weather intelligence".to_owned(),
+                website_url: String::new(),
                 repo_url: String::new(),
                 releases_url: String::new(),
-                support_url: "https://www.cafire.org/".to_owned(),
+                support_url: String::new(),
                 donate_url: String::new(),
                 contact_url: String::new(),
                 privacy_url: String::new(),
                 // The preset never relocates an existing installation. A user
                 // or distributor must separately opt in to this namespace.
                 use_custom_storage_namespace: false,
-                storage_namespace: "cwt".to_owned(),
-                screenshot_filename_prefix: "cwt".to_owned(),
-                output_folder_label: "California Wildfire Tracking".to_owned(),
-                palette: BrandPalette::california_wildfire_tracking(),
+                storage_namespace: "branded_weather_app".to_owned(),
+                screenshot_filename_prefix: "weather_app".to_owned(),
+                output_folder_label: "Generic Weather App".to_owned(),
+                palette: BrandPalette::generic_branded_app(),
                 assets: BrandAssets::default(),
                 features: BrandFeatureLabels {
                     radar: "Radar".to_owned(),
-                    map: "Fire Map".to_owned(),
+                    map: "Map".to_owned(),
                     warnings: "Alerts".to_owned(),
-                    evacuation: "Evacuation".to_owned(),
-                    air_quality: "Air Quality".to_owned(),
+                    evacuation: "Impacts".to_owned(),
+                    air_quality: "Environment".to_owned(),
                 },
                 sharing: ShareBranding {
                     watermark_enabled: true,
                     card_enabled: true,
                     layout: ShareLayout::Landscape16x9,
-                    title: "California Wildfire Tracking".to_owned(),
-                    subtitle: "Live fire map · Verified alerts · Community intelligence"
-                        .to_owned(),
-                    site_label: "cafire.org".to_owned(),
-                    source_footer: "Community partner skin. Data may include CAL FIRE, NIFC/IRWIN, ArcGIS/MODIS, AirFire/BlueSky. Not an official CAL FIRE app."
-                        .to_owned(),
+                    title: "Generic Weather App".to_owned(),
+                    subtitle: "Radar - Alerts - Operational context".to_owned(),
+                    site_label: "example.org".to_owned(),
+                    source_footer:
+                        "Generic branded preset. Configure identity, links, assets, and data attribution before distribution."
+                            .to_owned(),
                 },
             },
         }
@@ -363,9 +363,12 @@ impl BrandConfig {
             .trim()
             .to_ascii_lowercase();
         let mut brand = match requested.as_str() {
-            "cwt" | "california_wildfire_tracking" | "california-wildfire-tracking" => {
-                Self::preset(BrandPreset::CaliforniaWildfireTracking)
-            }
+            "generic"
+            | "generic_branded_app"
+            | "generic-branded-app"
+            | "branded"
+            | "branded_weather_app"
+            | "branded-weather-app" => Self::preset(BrandPreset::GenericBrandedApp),
             _ => Self::default(),
         };
         let namespace = std::env::var("BOWECHO_STORAGE_NAMESPACE")
@@ -417,7 +420,7 @@ impl BrandConfig {
 
     pub fn palette_fallback(&self) -> BrandPalette {
         match self.preset {
-            BrandPreset::CaliforniaWildfireTracking => BrandPalette::california_wildfire_tracking(),
+            BrandPreset::GenericBrandedApp => BrandPalette::generic_branded_app(),
             BrandPreset::BowEcho | BrandPreset::Custom => BrandPalette::default(),
         }
     }
@@ -576,11 +579,11 @@ mod tests {
 
     #[test]
     fn brand_kit_json_round_trips_all_fields_and_paths() {
-        let mut brand = BrandConfig::preset(BrandPreset::CaliforniaWildfireTracking);
+        let mut brand = BrandConfig::preset(BrandPreset::GenericBrandedApp);
         brand.preset = BrandPreset::Custom;
         brand.organization = "Example Operations".to_owned();
-        brand.repo_url = "https://github.com/example/cwt-desktop".to_owned();
-        brand.releases_url = "https://github.com/example/cwt-desktop/releases".to_owned();
+        brand.repo_url = "https://github.com/example/weather-desktop".to_owned();
+        brand.releases_url = "https://github.com/example/weather-desktop/releases".to_owned();
         brand.donate_url = "https://example.test/donate".to_owned();
         brand.contact_url = "mailto:ops@example.test".to_owned();
         brand.privacy_url = "https://example.test/privacy".to_owned();
@@ -605,36 +608,38 @@ mod tests {
     }
 
     #[test]
-    fn brand_cwt_preset_has_expected_identity_and_palette() {
-        let brand = BrandConfig::preset(BrandPreset::CaliforniaWildfireTracking);
-        assert_eq!(brand.display_name, "California Wildfire Tracking");
-        assert_eq!(brand.short_name, "CWT");
-        assert_eq!(brand.tagline, "Stay Informed. Stay Prepared. Stay Safe.");
-        assert_eq!(brand.filename_prefix(), "cwt");
-        assert_eq!(brand.storage_namespace, "cwt");
+    fn brand_generic_preset_has_expected_identity_palette_and_assets() {
+        let brand = BrandConfig::preset(BrandPreset::GenericBrandedApp);
+        assert_eq!(brand.display_name, "Generic Weather App");
+        assert_eq!(brand.short_name, "Weather App");
+        assert_eq!(brand.tagline, "Operational weather intelligence");
+        assert_eq!(brand.filename_prefix(), "weather_app");
+        assert_eq!(brand.storage_namespace, "branded_weather_app");
         assert!(!brand.use_custom_storage_namespace);
         assert_eq!(
             brand.palette,
             BrandPalette {
-                primary: "#F97316".to_owned(),
-                accent: "#FDBA2D".to_owned(),
-                danger: "#E53935".to_owned(),
-                warning: "#FFB300".to_owned(),
-                success: "#2E7D32".to_owned(),
-                surface: "#0B1117".to_owned(),
-                surface_alt: "#151E27".to_owned(),
+                primary: "#2F80ED".to_owned(),
+                accent: "#56CCF2".to_owned(),
+                danger: "#EB5757".to_owned(),
+                warning: "#F2C94C".to_owned(),
+                success: "#27AE60".to_owned(),
+                surface: "#101418".to_owned(),
+                surface_alt: "#182027".to_owned(),
                 text: "#F8FAFC".to_owned(),
-                muted_text: "#A8B3BF".to_owned(),
-                outline: "#495866".to_owned(),
+                muted_text: "#AEB8C2".to_owned(),
+                outline: "#34414D".to_owned(),
             }
         );
-        assert_eq!(brand.resolved_palette().primary, [249, 115, 22]);
-        assert_eq!(brand.features.map, "Fire Map");
+        assert_eq!(brand.resolved_palette().primary, [47, 128, 237]);
+        assert_eq!(brand.features.map, "Map");
+        assert_eq!(brand.features.evacuation, "Impacts");
+        assert_eq!(brand.assets, BrandAssets::default());
         assert!(
             brand
                 .sharing
                 .source_footer
-                .contains("Not an official CAL FIRE app")
+                .contains("Configure identity, links, assets")
         );
     }
 
