@@ -31308,6 +31308,29 @@ impl ViewerApp {
         }
     }
 
+    fn sync_vol3d_product_state(
+        &mut self,
+        product: &DisplayProduct,
+        value_min: f32,
+        value_max: f32,
+        ctx: Option<&egui::Context>,
+    ) {
+        let product_label = product.label().to_owned();
+        if self.vol3d.product_label != product_label {
+            self.vol3d.product_label = product_label.clone();
+            self.vol3d.threshold_dbz = Self::vol3d_default_threshold(product, value_min, value_max);
+            self.vol3d.floor_threshold_dbz = value_min;
+            self.vol3d.volume_key = None;
+            self.vol3d.resample_rx = None;
+            self.vol3d.last_top_deg = 0.0;
+            self.vol3d.status = format!("resampling {product_label} 3D volume...");
+            self.clear_vol3d_texture();
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
+            }
+        }
+    }
+
     /// 3D Volume Explorer window: background Cartesian resampling, a raw
     /// low-level floor PPI on the same footprint, and GPU direct-volume
     /// rendering. The floor, box, grid, and annotations all share one camera
@@ -31346,17 +31369,7 @@ impl ViewerApp {
         let vol3d_moment = vol3d_product.base_moment();
         let product_label = vol3d_product.label().to_owned();
         let (value_min, value_max) = self.vol3d_product_value_range(&vol3d_product);
-        if self.vol3d.product_label != product_label {
-            self.vol3d.product_label = product_label.clone();
-            self.vol3d.threshold_dbz =
-                Self::vol3d_default_threshold(&vol3d_product, value_min, value_max);
-            self.vol3d.floor_threshold_dbz = value_min;
-            self.vol3d.volume_key = None;
-            self.vol3d.resample_rx = None;
-            self.vol3d.status = format!("resampling {product_label} 3D volume…");
-            self.clear_vol3d_texture();
-            ctx.request_repaint();
-        }
+        self.sync_vol3d_product_state(&vol3d_product, value_min, value_max, Some(ctx));
         self.update_vol3d_lut(ctx, &vol3d_product, value_min, value_max);
 
         if let Some(current_volume) = self.volume.clone() {
@@ -31411,6 +31424,28 @@ impl ViewerApp {
 
             // Vertical completeness gate: a live volume whose first chunks
             // cover one sector of one tilt must not replace a complete box.
+            let product_cut_count = volume
+                .cuts
+                .iter()
+                .filter(|cut| cut.moments.contains_key(&vol3d_moment))
+                .count();
+            if product_cut_count == 0 {
+                self.vol3d.volume_key = None;
+                self.vol3d.resample_rx = None;
+                self.vol3d.last_top_deg = 0.0;
+                self.vol3d.status = format!(
+                    "waiting for {} data in {} before 3D resample...",
+                    vol3d_product.label(),
+                    volume.site.id
+                );
+                self.clear_vol3d_texture();
+                ctx.request_repaint_after(Duration::from_millis(250));
+                if self.workspace.is_docked(dock::WorkspacePane::Vol3d) {
+                    return;
+                }
+                self.show_vol3d_floating_window(ctx);
+                return;
+            }
             let volume_top_deg = volume
                 .cuts
                 .iter()
@@ -31422,6 +31457,7 @@ impl ViewerApp {
                 volume.site.id.clone(),
                 product_label.clone(),
                 volume.volume_time.timestamp_millis(),
+                Arc::as_ptr(&volume) as usize,
                 (volume_top_deg * 10.0) as i32,
                 (center_east / 10.0) as i32,
                 (center_north / 10.0) as i32,
@@ -31505,6 +31541,8 @@ impl ViewerApp {
                 }
                 Ok(None) => {
                     self.vol3d.resample_rx = None;
+                    self.vol3d.volume_key = None;
+                    self.clear_vol3d_texture();
                     self.vol3d.status = "no volume data in the box".to_owned();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -58873,6 +58911,23 @@ mod tests {
         assert!((target_lon - expected_lon).abs() < 1e-5);
         assert!(app.vol3d.volume_key.is_none());
         assert!(app.vol3d.status.contains("selected"));
+    }
+
+    #[test]
+    fn vol3d_product_switch_resets_vertical_completeness_gate() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.vol3d.product_label = "REF".to_owned();
+        app.vol3d.last_top_deg = 19.5;
+        app.vol3d.volume_key = Some(("KTLX".to_owned(), "REF".to_owned(), 1, 2, 195, 0, 0, 60));
+        let product = DisplayProduct::Moment(MomentType::Velocity);
+        let (value_min, value_max) = app.vol3d_product_value_range(&product);
+
+        app.sync_vol3d_product_state(&product, value_min, value_max, None);
+
+        assert_eq!(app.vol3d.product_label, "VEL");
+        assert_eq!(app.vol3d.last_top_deg, 0.0);
+        assert!(app.vol3d.volume_key.is_none());
+        assert!(app.vol3d.status.contains("resampling VEL"));
     }
 
     #[test]

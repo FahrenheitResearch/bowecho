@@ -137,13 +137,13 @@ pub struct Vol3d {
     pub show_box: bool,
     pub show_labels: bool,
     pub resample_rx: Option<mpsc::Receiver<Option<VolumeBox>>>,
-    /// (site id, product label, volume_time_ms, top product elevation in
-    /// tenths of a degree, center east/10km, center north/10km, box half km).
-    /// Top-tilt inclusion makes a completing live volume re-trigger the
-    /// resample.
-    pub volume_key: Option<(String, String, i64, i32, i32, i32, i32)>,
-    /// Top REF elevation of the last fully-built box. Live partial volumes do
-    /// not replace a complete box with a one-sector fragment.
+    /// (site id, product label, volume_time_ms, source volume pointer, top
+    /// product elevation in tenths of a degree, center east/10km, center
+    /// north/10km, box half km). Top-tilt and pointer inclusion make
+    /// completing/replaced live volumes re-trigger the resample.
+    pub volume_key: Option<(String, String, i64, usize, i32, i32, i32, i32)>,
+    /// Top product elevation of the last fully-built box. Live partial volumes
+    /// do not replace a complete box with a one-sector fragment.
     pub last_top_deg: f32,
     /// Box half-width, km (60/120/180 = 120/240/360 km boxes).
     pub box_half_km: f32,
