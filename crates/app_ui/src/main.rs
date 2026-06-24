@@ -382,9 +382,9 @@ impl LowSweepLoopFilter {
 
     fn label(self) -> &'static str {
         match self {
-            Self::All => "All low tilts",
-            Self::SameLevel => "Same level",
-            Self::BaseOnly => "Base only",
+            Self::All => "All complete low tilts",
+            Self::SameLevel => "Dominant low level",
+            Self::BaseOnly => "Lowest level only",
         }
     }
 }
@@ -402,10 +402,10 @@ fn legacy_sweep_policy(filter: LowSweepLoopFilter) -> SweepPolicy {
 
 fn sweep_policy_mode_label(mode: SweepPolicyMode) -> &'static str {
     match mode {
-        SweepPolicyMode::Off => "Off",
-        SweepPolicyMode::AllLow => "All low tilts",
-        SweepPolicyMode::BaseOnly => "Base only",
-        SweepPolicyMode::SameLevel => "Same level",
+        SweepPolicyMode::Off => "Scan only",
+        SweepPolicyMode::AllLow => "All complete low tilts",
+        SweepPolicyMode::BaseOnly => "Lowest level only",
+        SweepPolicyMode::SameLevel => "Dominant low level",
         SweepPolicyMode::Range => "Custom range",
     }
 }
@@ -549,11 +549,10 @@ const LIVE_COMPLETE_LOW_LEVEL_TILT_MIN_RADIALS: usize = 720;
 const LIVE_COMPLETE_TERMINAL_LOW_LEVEL_TILT_MIN_RADIALS: usize = 360;
 const LIVE_COMPLETE_TILT_MIN_RADIALS: usize = 360;
 const LIVE_COMPLETE_TILT_MIN_AZIMUTH_COVERAGE_DEG: f32 = 350.0;
+/// Group low-level families by their measured elevation inside each volume.
+/// The anchor is recomputed per volume, so VCP changes and antenna-angle drift
+/// between scans do not break the loop.
 const LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG: f32 = 0.25;
-/// "Same degree" low-sweep mode groups repeated visits by their measured
-/// elevation inside each volume. The anchor is recomputed per volume, so a
-/// VCP change or antenna-angle drift between scans does not break the loop.
-const LOW_SWEEP_SAME_ELEVATION_TOLERANCE_DEG: f32 = 0.12;
 const HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM: usize = 6;
 
 /// International catalog-poll cadence. National open-data feeds publish on
@@ -1663,7 +1662,7 @@ struct ViewerApp {
     /// reports, lightning, camera follow, and full-resolution media.
     unified_player: unified_player::UnifiedPlayerState,
     /// Advanced product/pane sweep controls opened from the Unified Player's
-    /// compact Low sweeps row.
+    /// compact in-scan low-sweeps row.
     sweep_controls_open: bool,
     /// When set, warning visibility is evaluated against the currently
     /// displayed radar frame time so archive-loop warnings pop in/out.
@@ -6783,6 +6782,7 @@ impl ViewerApp {
     }
 
     fn clear_displayed_volume_for_pending_load(&mut self, ctx: &egui::Context) {
+        self.remember_current_primary_product_cut();
         self.volume = None;
         self.load_timing = None;
         self.dealiased_readout_cache = None;
@@ -6802,6 +6802,7 @@ impl ViewerApp {
     }
 
     fn clear_frame_history(&mut self) {
+        self.remember_current_primary_product_cut();
         self.frame_history.clear();
         self.selected_frame_index = 0;
         self.low_sweep_disabled_cuts.clear();
@@ -6924,10 +6925,17 @@ impl ViewerApp {
                 });
             let previous_cut = self.selected_cut;
             let previous_product = self.selected_product.clone();
+            let require_selected_cut = self
+                .manual_primary_cut_hold
+                .as_ref()
+                .zip(self.frame_history.get(next_index))
+                .is_some_and(|(hold, frame)| hold.identity == frame.identity);
             if should_defer_live_partial_selection_for_active_product(
                 self.volume.as_deref(),
+                self.selected_cut,
                 &self.selected_product,
                 self.frame_history.get(next_index),
+                require_selected_cut,
             ) {
                 self.selected_frame_index = active_identity
                     .clone()
@@ -7487,7 +7495,7 @@ impl ViewerApp {
                 frame_status,
             );
         }
-        self.sanitize_selection();
+        self.sanitize_selection_for_volume_install(frame_status);
         if keep_existing_texture {
             self.pending_render_key = None;
             if retarget_existing_texture && let Some(texture_key) = &mut self.texture_key {
@@ -7556,6 +7564,18 @@ impl ViewerApp {
                 require_complete_live_cut,
             );
             if live_partial && !product_ready {
+                continue;
+            }
+            if live_partial
+                && require_complete_live_cut
+                && pane.cut.is_some()
+                && !is_displayable_on_live_candidate_cut(
+                    volume,
+                    previous_cut,
+                    &previous_product,
+                    true,
+                )
+            {
                 continue;
             }
 
@@ -9808,6 +9828,19 @@ impl ViewerApp {
     }
 
     fn sanitize_selection(&mut self) {
+        self.sanitize_selection_preserving_pending_pane_live_cuts(false);
+    }
+
+    fn sanitize_selection_for_volume_install(&mut self, frame_status: FrameStatus) {
+        self.sanitize_selection_preserving_pending_pane_live_cuts(
+            frame_status == FrameStatus::LivePartial && !self.display_live_chunk_updates,
+        );
+    }
+
+    fn sanitize_selection_preserving_pending_pane_live_cuts(
+        &mut self,
+        preserve_pending_following_live_partial_cuts: bool,
+    ) {
         let Some(volume) = &self.volume else {
             return;
         };
@@ -9821,6 +9854,18 @@ impl ViewerApp {
             if let Some(pane_volume) = pane.volume.clone().or_else(|| primary_volume.clone()) {
                 if !pane.owns_radar()
                     && !volume_has_displayable_product(pane_volume.as_ref(), &pane.product)
+                {
+                    continue;
+                }
+                if preserve_pending_following_live_partial_cuts
+                    && !pane.owns_radar()
+                    && let Some(cut) = pane.cut
+                    && !is_displayable_on_live_candidate_cut(
+                        pane_volume.as_ref(),
+                        cut,
+                        &pane.product,
+                        true,
+                    )
                 {
                     continue;
                 }
@@ -9986,7 +10031,7 @@ impl ViewerApp {
         if tilt_delta != 0 {
             let stepped = match self.focused_extra_pane() {
                 Some(slot) => self.step_pane_tilt(slot, tilt_delta),
-                None => self.step_tilt(tilt_delta),
+                None => self.step_tilt(tilt_delta, ctx),
             };
             if stepped {
                 ctx.request_repaint();
@@ -10054,7 +10099,11 @@ impl ViewerApp {
     }
 
     fn remember_current_primary_product_cut(&mut self) {
-        if self.app_settings.remember_product_tilts {
+        if self.app_settings.remember_product_tilts
+            && self.volume.as_deref().is_none_or(|volume| {
+                is_displayable_on_cut(volume, self.selected_cut, &self.selected_product)
+            })
+        {
             self.product_cut_memory
                 .insert(self.selected_product.label().to_owned(), self.selected_cut);
         }
@@ -10080,12 +10129,12 @@ impl ViewerApp {
     }
 
     fn switch_primary_product(&mut self, volume: &RadarVolume, product: DisplayProduct) -> bool {
+        if self.selected_product == product {
+            return false;
+        }
         let Some(next_cut) = self.preferred_primary_cut_for_product_switch(volume, &product) else {
             return false;
         };
-        if self.selected_product == product && self.selected_cut == next_cut {
-            return false;
-        }
         self.remember_current_primary_product_cut();
         self.selected_product = product;
         self.selected_cut = next_cut;
@@ -10177,20 +10226,17 @@ impl ViewerApp {
         self.switch_primary_product(volume.as_ref(), next_product)
     }
 
-    fn step_tilt(&mut self, delta: isize) -> bool {
-        let Some(volume) = self.volume.as_ref() else {
-            return false;
-        };
-        let cuts = displayable_cuts_for_product(volume, &self.selected_product);
-        let Some(next_cut) = stepped_cut(&cuts, self.selected_cut, delta) else {
+    fn step_tilt(&mut self, delta: isize, ctx: &egui::Context) -> bool {
+        let Some(next_cut) = self.volume.as_ref().and_then(|volume| {
+            let cuts = displayable_cuts_for_product(volume, &self.selected_product);
+            stepped_cut(&cuts, self.selected_cut, delta)
+        }) else {
             return false;
         };
         if self.selected_cut == next_cut {
             return false;
         }
-        self.selected_cut = next_cut;
-        self.sanitize_selection();
-        self.clear_texture();
+        self.select_primary_cut_manually(next_cut, ctx);
         true
     }
 
@@ -10460,6 +10506,43 @@ impl ViewerApp {
             .iter()
             .rev()
             .find(|frame| frame.status != FrameStatus::LivePartial)
+            .map(|frame| Arc::clone(&frame.volume))
+            .unwrap_or(volume)
+    }
+
+    fn display_source_volume_for_extra_pane_product(
+        &self,
+        pane_slot: usize,
+        product: &DisplayProduct,
+        volume: Arc<RadarVolume>,
+    ) -> Arc<RadarVolume> {
+        let Some(derived) = product.derived() else {
+            return volume;
+        };
+        if !derived.is_volume_wide() {
+            return volume;
+        }
+        let Some(pane) = self.extra_panes.get(pane_slot) else {
+            return volume;
+        };
+        let (frames, selected_index) = if pane.owns_radar() {
+            (pane.frame_history.as_slice(), pane.selected_frame_index)
+        } else {
+            (self.frame_history.as_slice(), self.selected_frame_index)
+        };
+        let Some(frame) = frames.get(selected_index) else {
+            return volume;
+        };
+        if frame.status != FrameStatus::LivePartial {
+            return volume;
+        }
+        frames
+            .iter()
+            .rev()
+            .find(|frame| {
+                frame.status != FrameStatus::LivePartial
+                    && frame.volume.site.id.eq_ignore_ascii_case(&volume.site.id)
+            })
             .map(|frame| Arc::clone(&frame.volume))
             .unwrap_or(volume)
     }
@@ -12495,8 +12578,10 @@ impl ViewerApp {
             let product = self.extra_panes[pane_slot].product.clone();
             if should_defer_live_partial_selection_for_active_product(
                 active_volume.as_deref(),
+                self.extra_panes[pane_slot].cut.unwrap_or(self.selected_cut),
                 &product,
                 self.extra_panes[pane_slot].frame_history.get(next_index),
+                self.extra_panes[pane_slot].cut.is_some(),
             ) {
                 if let Some(active_identity) = active_identity.clone()
                     && let Some(index) = self.extra_panes[pane_slot]
@@ -12845,6 +12930,16 @@ impl ViewerApp {
         else {
             return;
         };
+        let volume = self.display_source_volume_for_extra_pane_product(
+            pane_slot,
+            &product,
+            Arc::clone(&volume),
+        );
+        if let Some(explicit_cut) = pane_cut
+            && !is_displayable_on_cut(volume.as_ref(), explicit_cut, &product)
+        {
+            return;
+        }
         let preferred_cut = pane_cut.unwrap_or(self.selected_cut);
         let Some(cut) = display_cut_for_product(volume.as_ref(), preferred_cut, &product) else {
             return;
@@ -16680,7 +16775,7 @@ impl ViewerApp {
                 );
                 ui.horizontal_wrapped(|ui| {
                     if ui
-                        .button("All low tilts")
+                        .button("All complete low tilts")
                         .on_hover_text("Apply the easy-path mode to every primary product family")
                         .clicked()
                     {
@@ -16707,7 +16802,7 @@ impl ViewerApp {
                     if ui
                         .button("Use simple defaults")
                         .on_hover_text(
-                            "Remove advanced overrides and return to the compact Low sweeps mode",
+                            "Remove advanced overrides and return to the compact in-scan low-sweeps mode",
                         )
                         .clicked()
                     {
@@ -20620,9 +20715,9 @@ impl ViewerApp {
         if editing_pane.is_none() {
             let mut remember_product_tilts = self.app_settings.remember_product_tilts;
             if ui
-                .checkbox(&mut remember_product_tilts, "Remember tilt per product")
+                .checkbox(&mut remember_product_tilts, "Restore last tilt per product")
                 .on_hover_text(
-                    "On: REF, VEL, CC, ZDR, etc. keep their own last selected tilt. First switch to a product uses that product's lowest available tilt.",
+                    "On: REF, VEL, CC, ZDR, etc. restore their own last selected tilt. First switch to a product uses that product's lowest available tilt.",
                 )
                 .changed()
             {
@@ -21381,7 +21476,7 @@ impl ViewerApp {
             }
             let mut low_sweeps = self.app_settings.loop_low_sweeps;
             if ui
-                .checkbox(&mut low_sweeps, "Low sweeps")
+                .checkbox(&mut low_sweeps, "In-scan low sweeps")
                 .on_hover_text(
                     "During playback, step through complete low-level SAILS sweeps inside each scan",
                 )
@@ -21557,7 +21652,7 @@ impl ViewerApp {
             }
             let mut low_sweeps = self.app_settings.loop_low_sweeps;
             if ui
-                .checkbox(&mut low_sweeps, "Low sweeps")
+                .checkbox(&mut low_sweeps, "In-scan low sweeps")
                 .on_hover_text(
                     "During playback, step through complete low-level SAILS sweeps inside each scan",
                 )
@@ -38242,7 +38337,10 @@ fn site_is_terminal_radar(site: &RadarSite) -> bool {
 }
 
 fn site_id_is_terminal_radar(site_id: &str) -> bool {
-    site_id.starts_with('T')
+    site_id
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'T'))
 }
 
 fn site_marker_label(site: &RadarSite) -> String {
@@ -43345,23 +43443,24 @@ fn same_elevation_low_sweep_cuts(volume: &RadarVolume, cuts: &[usize]) -> Vec<us
         return cuts.to_vec();
     }
 
+    let tolerance = LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG;
     let mut best: Option<(usize, f32, f32)> = None;
     for (_, anchor) in &elevations {
         let mut count = 0usize;
         let mut spread = 0.0f32;
         for (_, elevation) in &elevations {
-            let delta = (*elevation - *anchor).abs();
-            if delta <= LOW_SWEEP_SAME_ELEVATION_TOLERANCE_DEG {
+            let delta = *elevation - *anchor;
+            if delta >= -f32::EPSILON && delta <= tolerance {
                 count += 1;
                 spread += delta;
             }
         }
         let replace = best.is_none_or(|(best_count, best_spread, best_anchor)| {
             count > best_count
-                || (count == best_count && spread < best_spread - f32::EPSILON)
                 || (count == best_count
-                    && (spread - best_spread).abs() <= f32::EPSILON
-                    && *anchor < best_anchor)
+                    && (*anchor < best_anchor - f32::EPSILON
+                        || ((*anchor - best_anchor).abs() <= f32::EPSILON
+                            && spread < best_spread - f32::EPSILON)))
         });
         if replace {
             best = Some((count, spread, *anchor));
@@ -43376,7 +43475,8 @@ fn same_elevation_low_sweep_cuts(volume: &RadarVolume, cuts: &[usize]) -> Vec<us
         .filter(|index| {
             volume.cuts.get(*index).is_some_and(|cut| {
                 cut.elevation_deg.is_finite()
-                    && (cut.elevation_deg - anchor).abs() <= LOW_SWEEP_SAME_ELEVATION_TOLERANCE_DEG
+                    && cut.elevation_deg >= anchor - f32::EPSILON
+                    && cut.elevation_deg <= anchor + tolerance
             })
         })
         .collect()
@@ -43924,6 +44024,7 @@ fn latest_newer_low_level_cut(
         return None;
     }
     let previous_time = cut_start_time_utc(previous_volume, previous_cut)?;
+    let previous_elevation_deg = previous_cut_data.elevation_deg;
 
     (0..volume.cuts.len())
         .filter(|cut_index| {
@@ -43932,7 +44033,8 @@ fn latest_newer_low_level_cut(
                     cut,
                     &volume.site.id,
                     allow_incomplete_live_chunk_advance,
-                )
+                ) && (cut.elevation_deg - previous_elevation_deg).abs()
+                    <= LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG
             }) && is_displayable_on_cut(volume, *cut_index, previous_product)
         })
         .filter_map(|cut_index| {
@@ -43946,8 +44048,10 @@ fn latest_newer_low_level_cut(
 
 fn should_defer_live_partial_selection_for_active_product(
     active_volume: Option<&RadarVolume>,
+    selected_cut: usize,
     selected_product: &DisplayProduct,
     candidate: Option<&FrameHistoryEntry>,
+    require_selected_cut: bool,
 ) -> bool {
     let Some(active_volume) = active_volume else {
         return false;
@@ -43957,16 +44061,30 @@ fn should_defer_live_partial_selection_for_active_product(
     };
     if candidate.status != FrameStatus::LivePartial
         || active_volume.site.id != candidate.identity.site_id
-        || !volume_has_displayable_product(active_volume, selected_product)
     {
         return false;
     }
 
-    !volume_has_displayable_product_with_live_filter(
-        candidate.volume.as_ref(),
-        selected_product,
-        true,
-    )
+    if require_selected_cut {
+        if !is_displayable_on_cut(active_volume, selected_cut, selected_product) {
+            return false;
+        }
+        !is_displayable_on_live_candidate_cut(
+            candidate.volume.as_ref(),
+            selected_cut,
+            selected_product,
+            true,
+        )
+    } else {
+        if !volume_has_displayable_product(active_volume, selected_product) {
+            return false;
+        }
+        !volume_has_displayable_product_with_live_filter(
+            candidate.volume.as_ref(),
+            selected_product,
+            true,
+        )
+    }
 }
 
 fn volume_has_displayable_product(volume: &RadarVolume, product: &DisplayProduct) -> bool {
@@ -48179,6 +48297,146 @@ mod tests {
     }
 
     #[test]
+    fn switching_to_current_product_does_not_restore_a_different_saved_tilt() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let mut volume = test_reflectivity_sails_volume_with_radials(
+            &[(0.50, 0), (1.20, 30_000), (0.70, 60_000)],
+            720,
+        );
+        add_velocity_moments_to_volume(&mut volume);
+        let volume = Arc::new(volume);
+        app.volume = Some(Arc::clone(&volume));
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.selected_cut = 2;
+        app.app_settings.remember_product_tilts = true;
+        app.product_cut_memory.insert("REF".to_owned(), 0);
+
+        assert!(!app.switch_primary_product(
+            volume.as_ref(),
+            DisplayProduct::Moment(MomentType::Reflectivity)
+        ));
+        assert_eq!(
+            app.selected_cut, 2,
+            "clicking or hotkeying the already-selected product must not jump to remembered/base tilt"
+        );
+    }
+
+    #[test]
+    fn keyboard_tilt_step_sets_the_same_manual_hold_as_clicking_a_tilt() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let volume = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.50, 0), (1.20, 30_000), (0.70, 60_000)],
+            720,
+        ));
+        let expected_identity = frame_identity_for_volume(volume.as_ref());
+        app.volume = Some(volume);
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.selected_cut = 0;
+        let ctx = egui::Context::default();
+
+        assert!(app.step_tilt(1, &ctx));
+
+        assert_eq!(app.selected_cut, 1);
+        assert_eq!(
+            app.manual_primary_cut_hold,
+            Some(LowSweepCutKey::new(&expected_identity, 1))
+        );
+        assert!(!app.history_playing);
+    }
+
+    #[test]
+    fn live_partial_defer_waits_for_the_selected_cut_not_any_product_cut() {
+        let active = test_velocity_sails_volume_with_radials(&[(0.50, 0), (0.50, 60_000)], 720);
+        let partial = test_velocity_sails_volume_with_radials(&[(0.50, 0)], 720);
+        let partial = Arc::new(partial);
+        let frame = FrameHistoryEntry {
+            identity: frame_identity_for_volume(partial.as_ref()),
+            path: PathBuf::from("partial"),
+            volume: partial,
+            timings: None,
+            status: FrameStatus::LivePartial,
+            source_label: "test".to_owned(),
+        };
+        let product = DisplayProduct::Moment(MomentType::Velocity);
+
+        assert!(!should_defer_live_partial_selection_for_active_product(
+            Some(&active),
+            0,
+            &product,
+            Some(&frame),
+            true,
+        ));
+        assert!(
+            should_defer_live_partial_selection_for_active_product(
+                Some(&active),
+                1,
+                &product,
+                Some(&frame),
+                true,
+            ),
+            "a live partial with VEL on cut 0 must not steal a user-held later VEL cut"
+        );
+        assert!(
+            !should_defer_live_partial_selection_for_active_product(
+                Some(&active),
+                1,
+                &product,
+                Some(&frame),
+                false,
+            ),
+            "ordinary next-scan live refresh may advance to a complete low VEL cut"
+        );
+    }
+
+    #[test]
+    fn extra_pane_missing_product_with_stale_texture_is_not_ready() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let volume = Arc::new(test_reflectivity_sails_volume_with_radials(
+            &[(0.50, 0)],
+            720,
+        ));
+        app.volume = Some(Arc::clone(&volume));
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
+        app.extra_panes[0].cut = Some(0);
+        app.extra_panes[0].texture_key = Some(test_screen_texture_key(
+            0,
+            0,
+            DisplayProduct::Moment(MomentType::Velocity),
+        ));
+
+        assert!(
+            !app.loop_record_extra_pane_texture_ready(0),
+            "a stale VEL/RHO/ZDR pane is not ready when the new partial only has REF"
+        );
+
+        app.extra_panes[0].texture_key = None;
+        assert!(app.loop_record_extra_pane_texture_ready(0));
+    }
+
+    #[test]
+    fn extra_pane_rendered_fallback_cut_does_not_satisfy_pinned_cut() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let volume = Arc::new(test_velocity_sails_volume_with_radials(&[(0.50, 0)], 720));
+        app.volume = Some(Arc::clone(&volume));
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
+        app.extra_panes[0].cut = Some(1);
+        app.extra_panes[0].texture_key = Some(test_screen_texture_key(
+            Arc::as_ptr(&volume) as usize,
+            0,
+            DisplayProduct::Moment(MomentType::Velocity),
+        ));
+
+        assert!(
+            !app.loop_record_extra_pane_texture_ready(0),
+            "a rendered cut-0 texture must not satisfy a pane pinned to cut 1"
+        );
+    }
+
+    #[test]
     fn synced_velocity_pane_does_not_flip_to_ref_on_ref_only_live_partial() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.volume = Some(Arc::new(test_ref_then_velocity_volume()));
@@ -48212,6 +48470,103 @@ mod tests {
             DisplayProduct::Moment(MomentType::Reflectivity)
         );
         assert_eq!(app.extra_panes[0].cut, Some(1));
+    }
+
+    #[test]
+    fn pinned_following_velocity_pane_waits_for_selected_live_partial_cut() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(Arc::new(test_velocity_sails_volume_with_radials(
+            &[(0.5, 0), (0.5, 60_000)],
+            720,
+        )));
+        app.selected_cut = 0;
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
+        app.extra_panes[0].cut = Some(1);
+        app.display_live_chunk_updates = false;
+
+        let ctx = egui::Context::default();
+        app.install_volume_arc(
+            Arc::new(test_velocity_sails_volume_with_radials(&[(0.5, 0)], 720)),
+            None,
+            false,
+            None,
+            FrameStatus::LivePartial,
+            &ctx,
+        );
+
+        assert_eq!(app.extra_panes[0].cut, Some(1));
+    }
+
+    #[test]
+    fn pinned_independent_velocity_pane_defers_live_partial_without_selected_cut() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        app.extra_panes[0].pinned_site_id = Some("KTLX".to_owned());
+        app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
+        app.extra_panes[0].cut = Some(1);
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+        let mut active = test_velocity_sails_volume_with_radials(&[(0.5, 0), (0.5, 60_000)], 720);
+        active.site.id = "KTLX".to_owned();
+        active.volume_time = scan_time;
+        let active = Arc::new(active);
+        app.extra_panes[0].volume = Some(Arc::clone(&active));
+        app.extra_panes[0].frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(active.as_ref()),
+            path: PathBuf::from("KTLX-active"),
+            volume: Arc::clone(&active),
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        });
+
+        let mut partial = test_velocity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        partial.site.id = "KTLX".to_owned();
+        partial.volume_time = scan_time + chrono::Duration::minutes(3);
+        let selected_identity = frame_identity_for_volume(&partial);
+        assert!(should_defer_live_partial_selection_for_active_product(
+            Some(active.as_ref()),
+            1,
+            &DisplayProduct::Moment(MomentType::Velocity),
+            Some(&FrameHistoryEntry {
+                identity: selected_identity.clone(),
+                path: PathBuf::from("KTLX-partial"),
+                volume: Arc::new(partial.clone()),
+                timings: None,
+                status: FrameStatus::LivePartial,
+                source_label: "test".to_owned(),
+            }),
+            true,
+        ));
+        let ctx = egui::Context::default();
+        let selected = app.install_extra_pane_decoded_load_batch(
+            0,
+            DecodedLoadBatch {
+                frames: vec![test_decoded_from_volume(
+                    PathBuf::from("KTLX-partial"),
+                    partial,
+                    FrameStatus::LivePartial,
+                )],
+                selected_index: 0,
+            },
+            true,
+            &ctx,
+        );
+
+        assert!(!selected);
+        assert_eq!(app.extra_panes[0].selected_frame_index, 0);
+        assert_eq!(app.extra_panes[0].cut, Some(1));
+        assert!(app.extra_panes[0].status.contains("Waiting for VEL"));
+        assert!(
+            app.extra_panes[0]
+                .frame_history
+                .iter()
+                .any(|frame| frame.identity == selected_identity),
+            "the partial should be retained in history while the visible pane waits"
+        );
     }
 
     #[test]
@@ -48284,6 +48639,8 @@ mod tests {
             test_reflectivity_sails_volume_with_radials(&[(0.5, 0), (0.5, 86_000)], 720);
         let short_lag =
             test_reflectivity_sails_volume_with_radials(&[(0.5, 0), (0.7, 30_000)], 720);
+        let later_low_companion =
+            test_reflectivity_sails_volume_with_radials(&[(0.5, 0), (1.3, 180_000)], 720);
         let high_tilt =
             test_reflectivity_sails_volume_with_radials(&[(0.5, 0), (1.8, 180_000)], 720);
 
@@ -48310,6 +48667,19 @@ mod tests {
                 false,
             ),
             (0, product.clone())
+        );
+        assert_eq!(
+            selection_for_installed_volume(
+                Some(&previous),
+                0,
+                &product,
+                &later_low_companion,
+                true,
+                false,
+                false,
+            ),
+            (0, product.clone()),
+            "live auto-advance should stay in the selected low-elevation family, not jump to a later 1.3 deg companion cut"
         );
         assert_eq!(
             selection_for_installed_volume(
@@ -48432,10 +48802,13 @@ mod tests {
     fn terminal_radar_complete_low_level_tilt_accepts_360_radials() {
         let mut terminal = test_velocity_sails_volume_with_radials(&[(0.5, 0)], 360);
         terminal.site.id = "TCVG".to_owned();
+        let mut terminal_lower = test_velocity_sails_volume_with_radials(&[(0.5, 0)], 360);
+        terminal_lower.site.id = "tcvg".to_owned();
         let mut nexrad = test_velocity_sails_volume_with_radials(&[(0.5, 0)], 360);
         nexrad.site.id = "KTLX".to_owned();
 
         assert!(live_partial_has_complete_low_level_tilt(&terminal));
+        assert!(live_partial_has_complete_low_level_tilt(&terminal_lower));
         assert!(!live_partial_has_complete_low_level_tilt(&nexrad));
     }
 
@@ -52039,6 +52412,27 @@ mod tests {
             low_sweep_cuts_for_product(&volume, &product, LowSweepLoopFilter::BaseOnly),
             vec![0, 2],
             "base-only remains the lowest family even when another family repeats more often"
+        );
+    }
+
+    #[test]
+    fn low_sweep_same_level_keeps_base_family_across_boundary_drift() {
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let volume = test_reflectivity_sails_volume_with_radials(
+            &[
+                (0.44, 0),
+                (0.75, 15_000),
+                (0.52, 30_000),
+                (0.81, 45_000),
+                (0.64, 60_000),
+            ],
+            720,
+        );
+
+        assert_eq!(
+            low_sweep_cuts_for_product(&volume, &product, LowSweepLoopFilter::SameLevel),
+            vec![0, 2, 4],
+            "0.44/0.52/0.64 should stay one low-level family while 0.75/0.81 are excluded"
         );
     }
 
@@ -59866,6 +60260,11 @@ mod tests {
         else {
             return;
         };
+        let volume = app.display_source_volume_for_extra_pane_product(
+            pane_slot,
+            &product,
+            Arc::clone(&volume),
+        );
         let Some(cut) = display_cut_for_product(volume.as_ref(), preferred_cut, &product) else {
             return;
         };

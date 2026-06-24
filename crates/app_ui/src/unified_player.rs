@@ -387,7 +387,7 @@ impl UnifiedPlayerState {
                 ui.separator();
                 let mut low_sweeps = context.low_sweeps_enabled;
                 if ui
-                    .checkbox(&mut low_sweeps, "Low sweeps")
+                    .checkbox(&mut low_sweeps, "In-scan low sweeps")
                     .on_hover_text("Step complete low-level SAILS/terminal sweeps inside each scan")
                     .changed()
                 {
@@ -859,12 +859,12 @@ impl Default for UnifiedPlayerContext {
             loop_speed_percent: 100,
             loop_speed_options: vec![25, 50, 100, 200, 400, 800, 1600, 3200, 6400],
             low_sweeps_enabled: false,
-            low_sweep_mode_label: "All low tilts".to_owned(),
+            low_sweep_mode_label: "All complete low tilts".to_owned(),
             low_sweep_filter_index: 0,
             low_sweep_filter_options: vec![
-                "All low tilts".to_owned(),
-                "Same level".to_owned(),
-                "Base only".to_owned(),
+                "All complete low tilts".to_owned(),
+                "Dominant low level".to_owned(),
+                "Lowest level only".to_owned(),
             ],
             auto_sync_warnings: false,
             warnings_synced_window: None,

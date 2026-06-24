@@ -610,10 +610,21 @@ impl ViewerApp {
             return true;
         };
         let preferred_cut = pane.cut.unwrap_or(self.selected_cut);
+        let volume = self.display_source_volume_for_extra_pane_product(
+            pane_slot,
+            &pane.product,
+            Arc::clone(&volume),
+        );
+        if let Some(explicit_cut) = pane.cut
+            && !crate::is_displayable_on_cut(volume.as_ref(), explicit_cut, &pane.product)
+            && crate::volume_has_displayable_product(volume.as_ref(), &pane.product)
+        {
+            return false;
+        }
         let Some(cut) =
             crate::display_cut_for_product(volume.as_ref(), preferred_cut, &pane.product)
         else {
-            return true;
+            return pane.texture_key.is_none() && pane.texture.is_none();
         };
         pane.texture_key.as_ref().is_some_and(|key| {
             key.volume_ptr == Arc::as_ptr(&volume) as usize
@@ -915,6 +926,7 @@ impl ViewerApp {
             None,
             Select(LoopTimelineTarget, LoopTimelineStep),
             Capture,
+            AbortRenderTimeout,
             AbortCaptureTimeout,
         }
         let action = {
@@ -935,11 +947,10 @@ impl ViewerApp {
                     }
                 }
                 RecorderPhase::WaitRender { waited, settle } => {
-                    if (renders_settled
+                    if renders_settled
                         && selected_textures_ready
                         && timeline_overlays_settled
-                        && time_layers_settled)
-                        || *waited > RECORD_RENDER_TIMEOUT_FRAMES
+                        && time_layers_settled
                     {
                         if *settle == 0 {
                             recorder.phase = RecorderPhase::AwaitScreenshot { waited: 0 };
@@ -948,6 +959,8 @@ impl ViewerApp {
                             *settle -= 1;
                             DriveAction::None
                         }
+                    } else if *waited > RECORD_RENDER_TIMEOUT_FRAMES {
+                        DriveAction::AbortRenderTimeout
                     } else {
                         *waited += 1;
                         DriveAction::None
@@ -967,6 +980,10 @@ impl ViewerApp {
             DriveAction::None => {}
             DriveAction::Select(target, step) => self.select_history_record_step(target, step, ctx),
             DriveAction::Capture => self.request_screenshot(ctx, CaptureKind::RecordFrame),
+            DriveAction::AbortRenderTimeout => {
+                self.abort_recording(ctx, "radar render timed out before frame was ready");
+                return;
+            }
             DriveAction::AbortCaptureTimeout => {
                 self.abort_recording(ctx, "screenshot capture timed out");
                 return;
