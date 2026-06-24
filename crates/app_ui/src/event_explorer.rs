@@ -36,6 +36,7 @@ const EVENT_RADAR_MAX_RANGE_KM: f32 = 460.0;
 /// 310-319, doi:10.1175/1520-0434(2004)019<0310:OTROTP>2.0.CO;2).
 const TRACK_TRANSLATION_MPH: f32 = 30.0;
 const TRACK_MAX_DURATION_MINUTES: i64 = 120;
+const TRACK_CAMERA_POST_SCAN_MINUTES: i64 = 5;
 /// A failed (transport, not 404) day fetch waits this long before an
 /// automatic retry — "never an error spam loop".
 const EVENT_FETCH_RETRY_SECONDS: u64 = 60;
@@ -89,6 +90,9 @@ pub(crate) struct EventTrackHit {
     pub end_time_utc: Option<DateTime<Utc>>,
     pub length_mi: f32,
     pub label: String,
+    pub ef_label: Option<String>,
+    pub width_yd: Option<f32>,
+    pub wind_estimate: Option<&'static str>,
 }
 
 impl EventTrackHit {
@@ -98,6 +102,25 @@ impl EventTrackHit {
     fn lift_time(&self) -> DateTime<Utc> {
         self.end_time_utc
             .unwrap_or_else(|| estimated_track_end_time(self.time_utc, self.length_mi))
+    }
+
+    fn detail_line(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(ef_label) = &self.ef_label {
+            parts.push(ef_label.clone());
+        }
+        if let Some(wind) = self.wind_estimate {
+            parts.push(format!("estimated {wind}"));
+        }
+        if self.length_mi > 0.0 {
+            parts.push(format!("{:.1} mi", self.length_mi));
+        }
+        if let Some(width_yd) = self.width_yd
+            && width_yd > 0.0
+        {
+            parts.push(format!("{width_yd:.0} yd wide"));
+        }
+        parts.join(" Â· ")
     }
 }
 
@@ -126,16 +149,27 @@ pub(crate) struct EventTrackCameraFollow {
     pub end: (f32, f32),
     pub start_utc: DateTime<Utc>,
     pub end_utc: DateTime<Utc>,
+    pub post_end_utc: DateTime<Utc>,
 }
 
 impl EventTrackCameraFollow {
-    pub(crate) fn from_hit(hit: &EventTrackHit) -> Self {
+    pub(crate) fn from_hit(hit: &EventTrackHit, after_scans: u16) -> Self {
+        let end_utc = hit.lift_time();
+        let post_end_utc = end_utc
+            + ChronoDuration::minutes(i64::from(after_scans) * TRACK_CAMERA_POST_SCAN_MINUTES);
+        let details = hit.detail_line();
+        let label = if details.is_empty() {
+            hit.label.clone()
+        } else {
+            format!("{} - {details}", hit.label)
+        };
         Self {
-            label: hit.label.clone(),
+            label,
             begin: hit.begin,
             end: hit.end,
             start_utc: hit.time_utc,
-            end_utc: hit.lift_time(),
+            end_utc,
+            post_end_utc,
         }
     }
 
@@ -151,12 +185,30 @@ impl EventTrackCameraFollow {
         let elapsed = time_utc
             .signed_duration_since(self.start_utc)
             .num_milliseconds()
-            .clamp(0, total as i64) as f32;
+            .clamp(
+                0,
+                self.post_end_utc
+                    .signed_duration_since(self.start_utc)
+                    .num_milliseconds()
+                    .max(total as i64),
+            ) as f32;
         let t = elapsed / total;
         (
             self.begin.0 + (self.end.0 - self.begin.0) * t,
             self.begin.1 + (self.end.1 - self.begin.1) * t,
         )
+    }
+}
+
+pub(crate) fn event_track_color(ef_label: &str) -> egui::Color32 {
+    match spc_layers::tornado_rating_index(ef_label) {
+        Some(0) => egui::Color32::from_rgb(83, 220, 95),
+        Some(1) => egui::Color32::from_rgb(248, 229, 68),
+        Some(2) => egui::Color32::from_rgb(255, 161, 43),
+        Some(3) => egui::Color32::from_rgb(240, 62, 48),
+        Some(4) => egui::Color32::from_rgb(211, 54, 238),
+        Some(5) => egui::Color32::from_rgb(255, 255, 255),
+        _ => egui::Color32::from_rgb(235, 51, 35),
     }
 }
 
@@ -595,7 +647,6 @@ impl crate::ViewerApp {
         let Some(data) = self.active_event_day_data() else {
             return;
         };
-        let track_color = egui::Color32::from_rgb(235, 51, 35);
         let halo = egui::Color32::from_rgba_unmultiplied(40, 0, 0, 170);
         let marker = self.style_registry.report_marker("tornado");
         let marker_color = crate::style_color32(marker.color);
@@ -610,6 +661,7 @@ impl crate::ViewerApp {
             .filter(|pos| rect.contains(*pos));
         let cull = rect.expand(400.0);
         for segment in &data.segments {
+            let track_color = event_track_color(&segment.ef_label);
             let a = self.lon_lat_to_screen(rect, segment.begin_lon, segment.begin_lat);
             match segment.end {
                 Some((end_lat, end_lon)) => {
@@ -739,6 +791,9 @@ impl crate::ViewerApp {
                     end_time_utc: segment.end_time_utc,
                     length_mi: segment.length_mi,
                     label: format!("{} {}", segment.ef_label, segment.location),
+                    ef_label: Some(segment.ef_label.clone()),
+                    width_yd: Some(segment.width_yd),
+                    wind_estimate: spc_layers::tornado_wind_estimate_label(&segment.ef_label),
                 },
             );
         }
@@ -762,6 +817,12 @@ impl crate::ViewerApp {
                     end_time_utc: None,
                     length_mi: 0.0,
                     label: report.location.clone(),
+                    ef_label: report.magnitude_label(),
+                    width_yd: None,
+                    wind_estimate: report
+                        .magnitude_label()
+                        .as_deref()
+                        .and_then(spc_layers::tornado_wind_estimate_label),
                 },
             );
         }
@@ -798,10 +859,13 @@ impl crate::ViewerApp {
         self.map_center_lon = (hit.begin.1 + hit.end.1) / 2.0;
         self.map_scale = self.map_scale.max(220.0);
         self.clear_camera_follow_targets();
-        self.event_explorer.camera_follow = self
-            .app_settings
-            .event_track_camera_follow
-            .then(|| EventTrackCameraFollow::from_hit(hit));
+        self.event_explorer.camera_follow =
+            self.app_settings.event_track_camera_follow.then(|| {
+                EventTrackCameraFollow::from_hit(
+                    hit,
+                    self.app_settings.effective_event_after_scans(),
+                )
+            });
         self.configure_event_archive_warning_sync();
         let context = archive_loop_context_for_hit(hit, &self.app_settings);
         let overlay_context = context.clone();
@@ -987,19 +1051,39 @@ mod tests {
             end: (36.0, -98.0),
             start_utc: start,
             end_utc: end,
+            post_end_utc: end + ChronoDuration::minutes(10),
         };
 
         assert_eq!(
             follow.position_at(start - ChronoDuration::minutes(5)),
             follow.begin
         );
+        let after_lift = follow.position_at(end + ChronoDuration::minutes(5));
+        assert!((after_lift.0 - 36.25).abs() < 0.001);
+        assert!((after_lift.1 + 97.5).abs() < 0.001);
         assert_eq!(
-            follow.position_at(end + ChronoDuration::minutes(5)),
-            follow.end
+            follow.position_at(end + ChronoDuration::minutes(20)),
+            (36.5, -97.0)
         );
         let midpoint = follow.position_at(start + ChronoDuration::minutes(10));
         assert!((midpoint.0 - 35.5).abs() < 0.001);
         assert!((midpoint.1 + 99.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn event_track_color_uses_whole_track_ef_rating() {
+        assert_eq!(
+            event_track_color("EF0"),
+            egui::Color32::from_rgb(83, 220, 95)
+        );
+        assert_eq!(
+            event_track_color("EF4"),
+            egui::Color32::from_rgb(211, 54, 238)
+        );
+        assert_eq!(
+            event_track_color("EF?"),
+            egui::Color32::from_rgb(235, 51, 35)
+        );
     }
 
     #[test]
@@ -1055,6 +1139,9 @@ mod tests {
             end_time_utc: Some(time + ChronoDuration::minutes(12)),
             length_mi: 0.0,
             label: "Point report".to_owned(),
+            ef_label: Some("EF1".to_owned()),
+            width_yd: None,
+            wind_estimate: Some("86-110 mph"),
         };
         let settings = settings::AppSettings {
             event_before_scans: Some(3),
@@ -1088,6 +1175,9 @@ mod tests {
             end_time_utc: Some(lift),
             length_mi: 12.0,
             label: "Surveyed track".to_owned(),
+            ef_label: Some("EF2".to_owned()),
+            width_yd: Some(500.0),
+            wind_estimate: Some("111-135 mph"),
         };
         let settings = settings::AppSettings {
             event_before_scans: Some(5),

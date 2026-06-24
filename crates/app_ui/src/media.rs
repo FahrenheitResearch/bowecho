@@ -1922,11 +1922,10 @@ mod tests {
         let time = chrono::Local
             .with_ymd_and_hms(2026, 6, 11, 5, 51, 9)
             .unwrap();
-        let brand =
-            settings::BrandConfig::preset(settings::BrandPreset::CaliforniaWildfireTracking);
+        let brand = settings::BrandConfig::preset(settings::BrandPreset::GenericBrandedApp);
         assert_eq!(
             capture_file_base(time, &brand.screenshot_filename_prefix),
-            "cwt_20260611_055109"
+            "weather_app_20260611_055109"
         );
     }
 

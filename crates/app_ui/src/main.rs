@@ -9862,6 +9862,7 @@ impl ViewerApp {
             DisplayProduct::Moment(MomentType::DifferentialReflectivity),
             DisplayProduct::Moment(MomentType::CorrelationCoefficient),
             DisplayProduct::Moment(MomentType::DifferentialPhase),
+            DisplayProduct::Moment(MomentType::SpecificDifferentialPhase),
         ];
         if let Some(product) = preferred
             .iter()
@@ -10019,7 +10020,7 @@ impl ViewerApp {
             match focused_slot {
                 Some(slot) => {
                     if self.extra_panes[slot].product != product {
-                        if let Some(cut) = best_cut_for_product(
+                        if let Some(cut) = cut_for_user_product_switch(
                             volume.as_ref(),
                             self.extra_panes[slot].cut.unwrap_or(self.selected_cut),
                             &product,
@@ -10032,12 +10033,15 @@ impl ViewerApp {
                 }
                 None => {
                     if self.selected_product != product {
-                        if let Some(cut) =
-                            best_cut_for_product(volume.as_ref(), self.selected_cut, &product)
-                        {
+                        if let Some(cut) = cut_for_user_product_switch(
+                            volume.as_ref(),
+                            self.selected_cut,
+                            &product,
+                        ) {
                             self.selected_cut = cut;
                         }
                         self.selected_product = product;
+                        self.manual_primary_cut_hold = None;
                         self.sanitize_selection();
                         self.clear_texture();
                     }
@@ -10075,7 +10079,7 @@ impl ViewerApp {
         if self.extra_panes[slot].product == next {
             return false;
         }
-        if let Some(cut) = best_cut_for_product(
+        if let Some(cut) = cut_for_user_product_switch(
             volume.as_ref(),
             self.extra_panes[slot].cut.unwrap_or(self.selected_cut),
             &next,
@@ -10136,7 +10140,8 @@ impl ViewerApp {
         else {
             return false;
         };
-        let Some(next_cut) = best_cut_for_product(volume, self.selected_cut, &next_product) else {
+        let Some(next_cut) = cut_for_user_product_switch(volume, self.selected_cut, &next_product)
+        else {
             return false;
         };
         if self.selected_product == next_product && self.selected_cut == next_cut {
@@ -10144,6 +10149,7 @@ impl ViewerApp {
         }
         self.selected_product = next_product;
         self.selected_cut = next_cut;
+        self.manual_primary_cut_hold = None;
         self.clear_texture();
         true
     }
@@ -15723,8 +15729,27 @@ impl eframe::App for ViewerApp {
                     });
             }
             if ctx.input(|i| i.pointer.hover_pos().is_some_and(|p| p.y < 60.0)) {
-                egui::Area::new(egui::Id::new("chrome_hint"))
+                egui::Area::new(egui::Id::new("chrome_controls"))
                     .fixed_pos(egui::pos2(12.0, 38.0))
+                    .show(&ctx, |ui| {
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_rgba_unmultiplied(10, 13, 18, 210))
+                            .corner_radius(4.0)
+                            .inner_margin(egui::Margin::symmetric(6, 4))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("Show UI").clicked() {
+                                        self.chrome_hidden = false;
+                                    }
+                                    self.windows_menu(ui);
+                                    ui.label(egui::RichText::new("Tab/Esc").size(12.0).color(
+                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150),
+                                    ));
+                                });
+                            });
+                    });
+                egui::Area::new(egui::Id::new("chrome_hint"))
+                    .fixed_pos(egui::pos2(12.0, 72.0))
                     .show(&ctx, |ui| {
                         ui.label(
                             egui::RichText::new("Tab — show UI")
@@ -20144,6 +20169,7 @@ impl ViewerApp {
             }
         });
         let mut jump_to_place: Option<PlaceSearchResult> = None;
+        let mut jump_to_radar_site: Option<usize> = None;
         let (place_search_lat, place_search_lon) = site_control_pane
             .and_then(|slot| {
                 self.extra_panes
@@ -20151,25 +20177,45 @@ impl ViewerApp {
                     .map(|pane| (pane.map_center_lat, pane.map_center_lon))
             })
             .unwrap_or((self.map_center_lat, self.map_center_lon));
+        let radar_results = radar_site_search_matches(&self.place_search_query, &self.sites, 5);
         let place_results = place_search_matches(
             &self.place_search_query,
             place_search_lat,
             place_search_lon,
-            5,
+            8,
         );
         ui.horizontal(|ui| {
             ui.label("Place");
             let edit_width = (ui.available_width() - 74.0).max(140.0);
             let response = ui.add_sized(
                 egui::vec2(edit_width, PANEL_BUTTON_HEIGHT),
-                egui::TextEdit::singleline(&mut self.place_search_query).hint_text("City or town"),
+                egui::TextEdit::singleline(&mut self.place_search_query)
+                    .hint_text("City, town, or radar ID"),
             );
             let submitted =
                 response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             if fixed_action_button(ui, "Go", 42.0).clicked() || submitted {
-                jump_to_place = place_results.first().copied();
+                if let Some((index, _)) = radar_results.first() {
+                    jump_to_radar_site = Some(*index);
+                } else {
+                    jump_to_place = place_results.first().copied();
+                }
             }
         });
+        if !radar_results.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = ROW_SPACING_X;
+                for (index, label) in &radar_results {
+                    if ui
+                        .small_button(label)
+                        .on_hover_text("Select and center this radar")
+                        .clicked()
+                    {
+                        jump_to_radar_site = Some(*index);
+                    }
+                }
+            });
+        }
         if !place_results.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = ROW_SPACING_X;
@@ -20188,6 +20234,26 @@ impl ViewerApp {
                     }
                 }
             });
+        }
+        if let Some(index) = jump_to_radar_site
+            && let Some(site) = self.sites.get(index).cloned()
+        {
+            if let Some(slot) = site_control_pane {
+                self.set_extra_pane_selected_site(slot, index);
+                self.center_extra_pane_on_site(slot, &site);
+            } else {
+                self.selected_site_index = index;
+                if primary_intl_source.is_some() {
+                    self.poll_active = false;
+                    self.poll_rx = None;
+                    self.intl_loop_rx = None;
+                    self.poll_last_file = None;
+                    self.poll_next = None;
+                    self.set_custom_url_poll_source();
+                }
+                self.center_selected_site();
+                self.status = format!("Selected {}", format_site_label(&site));
+            }
         }
         if let Some(result) = jump_to_place {
             if let Some(slot) = site_control_pane {
@@ -20500,11 +20566,8 @@ impl ViewerApp {
         let product_buttons = global_displayable_products(volume)
             .into_iter()
             .map(|product| {
-                let target_cut = if is_displayable_on_cut(volume, editing_effective_cut, &product) {
-                    Some(editing_effective_cut)
-                } else {
-                    best_cut_for_product(volume, editing_effective_cut, &product)
-                };
+                let target_cut =
+                    cut_for_user_product_switch(volume, editing_effective_cut, &product);
                 (product, target_cut)
             })
             .collect::<Vec<_>>();
@@ -20560,6 +20623,7 @@ impl ViewerApp {
                         if let Some(cut_index) = target_cut {
                             self.selected_cut = *cut_index;
                         }
+                        self.manual_primary_cut_hold = None;
                         self.clear_texture();
                         ctx.request_repaint();
                     }
@@ -27510,7 +27574,51 @@ impl ViewerApp {
         (panel_events, player_events)
     }
 
+    fn clear_satellite_display_for_spec_change(&mut self) {
+        self.sat_last_frame = None;
+        self.sat_run_listings.clear();
+        self.sat_player.set_runs(Vec::new());
+        self.sat_layer = None;
+        self.sat_layer_texture = None;
+        self.sat_layer_build_rx = None;
+        self.sat_layer_render_rx = None;
+        self.sat_map_inflight = None;
+        self.sat_map_pending = None;
+        self.sat_layer_generation = self.sat_layer_generation.wrapping_add(1);
+    }
+
+    fn satellite_run_key_matches_current_spec(&self, key: &rw_ui::SatRunKey) -> bool {
+        sat_worker::run_filters_for_spec(self.sat_panel.spec())
+            .map(|(model, prefixes)| {
+                key.model == model
+                    && prefixes
+                        .iter()
+                        .any(|prefix| key.run.starts_with(prefix.as_str()))
+            })
+            .unwrap_or(true)
+    }
+
+    fn satellite_runs_for_current_spec(
+        &self,
+        runs: Vec<rw_ui::SatRunListing>,
+    ) -> Vec<rw_ui::SatRunListing> {
+        let Ok((model, prefixes)) = sat_worker::run_filters_for_spec(self.sat_panel.spec()) else {
+            return runs;
+        };
+        runs.into_iter()
+            .filter(|run| {
+                run.key.model == model
+                    && prefixes
+                        .iter()
+                        .any(|prefix| run.key.run.starts_with(prefix.as_str()))
+            })
+            .collect()
+    }
+
     fn request_sat_map_frame(&mut self, key: rw_ui::SatRunKey, hhmm: u16) {
+        if !self.satellite_run_key_matches_current_spec(&key) {
+            return;
+        }
         self.sat_last_frame = Some((key.clone(), hhmm));
         if self.sat_layer_build_rx.is_some() || self.sat_map_inflight.is_some() {
             self.sat_map_pending = Some((key, hhmm));
@@ -27544,8 +27652,10 @@ impl ViewerApp {
         for event in panel_events {
             match event {
                 rw_ui::SatelliteEvent::SpecChanged(spec) => {
+                    self.clear_satellite_display_for_spec_change();
                     if let Some(sat) = &self.sat {
                         sat.send(sat_worker::SatRequest::Validate(spec));
+                        sat.send(sat_worker::SatRequest::Scan);
                     }
                 }
                 rw_ui::SatelliteEvent::StartRequested(spec) => {
@@ -27590,6 +27700,7 @@ impl ViewerApp {
                     self.sat_panel.set_spec_status(status)
                 }
                 sat_worker::SatResponse::Runs(runs) => {
+                    let runs = self.satellite_runs_for_current_spec(runs);
                     self.sat_run_listings = runs.clone();
                     self.sat_player.set_runs(runs);
                 }
@@ -27636,16 +27747,29 @@ impl ViewerApp {
                 }
                 sat_worker::SatResponse::DiskUsage(usage) => self.sat_panel.set_disk_usage(usage),
                 sat_worker::SatResponse::SelectFrame { key, hhmm } => {
+                    if !self.satellite_run_key_matches_current_spec(&key) {
+                        continue;
+                    }
                     self.sat_last_frame = Some((key.clone(), hhmm));
                     self.sat_player.select_frame(key.clone(), hhmm);
                     if let Some(sat) = &self.sat {
-                        sat.send(sat_worker::SatRequest::LoadFrame { key, hhmm });
+                        sat.send(sat_worker::SatRequest::LoadFrame {
+                            key: key.clone(),
+                            hhmm,
+                        });
+                    }
+                    if self.sat_map_follow
+                        && !self.satellite_map_frame_current_or_scheduled(&key, hhmm)
+                    {
+                        self.request_sat_map_frame(key, hhmm);
                     }
                 }
                 sat_worker::SatResponse::MapFrame(result) => match *result {
                     Ok(frame) => {
                         self.sat_map_inflight = None;
-                        self.install_sat_layer(frame);
+                        if self.satellite_run_key_matches_current_spec(&frame.key) {
+                            self.install_sat_layer(frame);
+                        }
                         self.flush_pending_sat_map_request();
                     }
                     Err(message) => {
@@ -27656,6 +27780,9 @@ impl ViewerApp {
                 },
                 sat_worker::SatResponse::Frame { key, hhmm, result } => match *result {
                     Ok(frame) => {
+                        if !self.satellite_run_key_matches_current_spec(&key) {
+                            continue;
+                        }
                         self.sat_last_frame = Some((key.clone(), hhmm));
                         let (frame, resized) = sat_player_frame_within_texture_limit(frame);
                         if let Some((old_size, new_size)) = resized {
@@ -27665,6 +27792,11 @@ impl ViewerApp {
                             ));
                         }
                         self.sat_player.set_frame(frame);
+                        if self.sat_map_follow
+                            && !self.satellite_map_frame_current_or_scheduled(&key, hhmm)
+                        {
+                            self.request_sat_map_frame(key, hhmm);
+                        }
                     }
                     Err(message) => {
                         if self.sat_player.selected_run() == Some(&key) {
@@ -31990,13 +32122,20 @@ impl ViewerApp {
                     {
                         painter.add(egui::Shape::mesh(mesh));
                     }
-                    if let Some(first) = screen.first() {
-                        painter.text(
-                            *first + egui::vec2(6.0, 6.0),
-                            egui::Align2::LEFT_TOP,
+                    let centroid = polygon_screen_centroid(&screen);
+                    let label_position = egui::pos2(
+                        centroid.x.clamp(rect.left() + 8.0, rect.right() - 8.0),
+                        centroid.y.clamp(rect.top() + 8.0, rect.bottom() - 8.0),
+                    );
+                    if rect.contains(label_position) {
+                        draw_halo_text(
+                            painter,
+                            label_position,
+                            egui::Align2::CENTER_CENTER,
                             &feature.label,
-                            egui::FontId::proportional(11.0),
+                            egui::FontId::proportional(12.0),
                             stroke_color,
+                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
                         );
                     }
                 }
@@ -34716,7 +34855,7 @@ impl ViewerApp {
         let bold = self.bold_labels;
         // GR2-style callouts: bold white with a heavy dark outline so a
         // meteorologist can read town names over a red core on stream.
-        let (text_color, halo_color, dot_color) = if bold {
+        let (base_text_color, base_halo_color, base_dot_color) = if bold {
             (
                 egui::Color32::WHITE,
                 egui::Color32::from_rgba_unmultiplied(0, 0, 0, 235),
@@ -34736,6 +34875,15 @@ impl ViewerApp {
             if label.rank > place_labels.max_rank || !bounds.contains(label.lon, label.lat) {
                 continue;
             }
+            let (text_color, halo_color, dot_color) = if !bold && label.rank >= 7 {
+                (
+                    egui::Color32::from_rgb(218, 226, 232),
+                    egui::Color32::from_rgba_unmultiplied(3, 5, 8, 225),
+                    egui::Color32::from_rgb(144, 168, 182),
+                )
+            } else {
+                (base_text_color, base_halo_color, base_dot_color)
+            };
             // Size tiers: bigger towns get bigger type (callout hierarchy);
             // the style registry's town scale multiplies every tier.
             let size = if bold {
@@ -34799,19 +34947,24 @@ impl ViewerApp {
         if self.app_settings.basemap_lightweight {
             return;
         }
-        if self.map_scale < 118.0 {
+        if self.map_scale < 55.0 {
             return;
         }
         let max_labels = if self.map_scale >= 220.0 { 72 } else { 36 };
         if us_detail_visible(bounds) {
-            self.draw_admin_label_set(
-                painter,
-                rect,
-                bounds,
-                basemap_data::BASEMAP_US_COUNTY_LABELS,
-                max_labels,
-                occupied,
-            );
+            if self.map_scale <= 360.0 {
+                self.draw_us_state_label_set(painter, rect, bounds, occupied);
+            }
+            if self.map_scale >= 118.0 {
+                self.draw_admin_label_set(
+                    painter,
+                    rect,
+                    bounds,
+                    basemap_data::BASEMAP_US_COUNTY_LABELS,
+                    max_labels,
+                    occupied,
+                );
+            }
         }
         for layer in REGIONAL_BASEMAP_LAYERS {
             if bounds.intersects_bbox(layer.bounds) {
@@ -34824,6 +34977,44 @@ impl ViewerApp {
                     occupied,
                 );
             }
+        }
+    }
+
+    fn draw_us_state_label_set(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        bounds: GeoBounds,
+        occupied: &mut Vec<egui::Rect>,
+    ) {
+        let font = egui::FontId::proportional(13.0);
+        let text_color = egui::Color32::from_rgba_unmultiplied(184, 199, 211, 205);
+        let halo_color = egui::Color32::from_rgba_unmultiplied(2, 4, 7, 210);
+        for label in US_STATE_ANCHORS {
+            let Some(name) = us_state_name(label.abbr) else {
+                continue;
+            };
+            if !bounds.contains(label.lon, label.lat) {
+                continue;
+            }
+            let position = self.lon_lat_to_screen(rect, label.lon, label.lat);
+            if !rect.expand(32.0).contains(position) {
+                continue;
+            }
+            let label_rect = centered_label_rect(position, name, font.size).expand(6.0);
+            if !rect.expand(80.0).intersects(label_rect) || overlaps_any(occupied, label_rect) {
+                continue;
+            }
+            draw_halo_text(
+                painter,
+                position,
+                egui::Align2::CENTER_CENTER,
+                name,
+                font.clone(),
+                text_color,
+                halo_color,
+            );
+            occupied.push(label_rect);
         }
     }
 
@@ -36973,6 +37164,51 @@ fn place_search_matches(
     results
 }
 
+fn radar_site_search_matches(
+    query: &str,
+    sites: &[RadarSite],
+    limit: usize,
+) -> Vec<(usize, String)> {
+    let compact = query
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if compact.len() < 2 || limit == 0 {
+        return Vec::new();
+    }
+    let no_k_query = compact.strip_prefix('K').unwrap_or(&compact);
+    let mut matches = sites
+        .iter()
+        .enumerate()
+        .filter_map(|(index, site)| {
+            let id = site.level2_id.to_ascii_uppercase();
+            let no_k_id = id.strip_prefix('K').unwrap_or(&id);
+            let score = if id == compact {
+                0
+            } else if no_k_id == no_k_query {
+                1
+            } else if id.starts_with(&compact) || no_k_id.starts_with(no_k_query) {
+                2
+            } else {
+                return None;
+            };
+            Some((score, index, format_site_label(site)))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    matches.truncate(limit);
+    matches
+        .into_iter()
+        .map(|(_, index, label)| (index, label))
+        .collect()
+}
+
 fn place_search_sources(country_filter: Option<&'static str>) -> Vec<PlaceSearchSource> {
     let mut sources = Vec::new();
     let include_us = country_filter.is_none();
@@ -37186,6 +37422,68 @@ const US_STATE_ANCHORS: &[UsStateAnchor] = &[
     UsStateAnchor { abbr: "MP", lon: 145.6, lat: 15.1 },
     UsStateAnchor { abbr: "AS", lon: -170.7, lat: -14.3 },
 ];
+
+fn us_state_name(abbr: &str) -> Option<&'static str> {
+    match abbr {
+        "AL" => Some("Alabama"),
+        "AK" => Some("Alaska"),
+        "AZ" => Some("Arizona"),
+        "AR" => Some("Arkansas"),
+        "CA" => Some("California"),
+        "CO" => Some("Colorado"),
+        "CT" => Some("Connecticut"),
+        "DE" => Some("Delaware"),
+        "DC" => Some("District of Columbia"),
+        "FL" => Some("Florida"),
+        "GA" => Some("Georgia"),
+        "HI" => Some("Hawaii"),
+        "ID" => Some("Idaho"),
+        "IL" => Some("Illinois"),
+        "IN" => Some("Indiana"),
+        "IA" => Some("Iowa"),
+        "KS" => Some("Kansas"),
+        "KY" => Some("Kentucky"),
+        "LA" => Some("Louisiana"),
+        "ME" => Some("Maine"),
+        "MD" => Some("Maryland"),
+        "MA" => Some("Massachusetts"),
+        "MI" => Some("Michigan"),
+        "MN" => Some("Minnesota"),
+        "MS" => Some("Mississippi"),
+        "MO" => Some("Missouri"),
+        "MT" => Some("Montana"),
+        "NE" => Some("Nebraska"),
+        "NV" => Some("Nevada"),
+        "NH" => Some("New Hampshire"),
+        "NJ" => Some("New Jersey"),
+        "NM" => Some("New Mexico"),
+        "NY" => Some("New York"),
+        "NC" => Some("North Carolina"),
+        "ND" => Some("North Dakota"),
+        "OH" => Some("Ohio"),
+        "OK" => Some("Oklahoma"),
+        "OR" => Some("Oregon"),
+        "PA" => Some("Pennsylvania"),
+        "RI" => Some("Rhode Island"),
+        "SC" => Some("South Carolina"),
+        "SD" => Some("South Dakota"),
+        "TN" => Some("Tennessee"),
+        "TX" => Some("Texas"),
+        "UT" => Some("Utah"),
+        "VT" => Some("Vermont"),
+        "VA" => Some("Virginia"),
+        "WA" => Some("Washington"),
+        "WV" => Some("West Virginia"),
+        "WI" => Some("Wisconsin"),
+        "WY" => Some("Wyoming"),
+        "PR" => Some("Puerto Rico"),
+        "VI" => Some("Virgin Islands"),
+        "GU" => Some("Guam"),
+        "MP" => Some("Northern Mariana Islands"),
+        "AS" => Some("American Samoa"),
+        _ => None,
+    }
+}
 
 #[rustfmt::skip]
 const US_STATE_QUERY_ALIASES: &[(&str, &str)] = &[
@@ -45230,6 +45528,36 @@ fn best_cut_for_product(
         .map(|(index, _)| index)
 }
 
+fn lowest_displayable_cut_for_product(
+    volume: &RadarVolume,
+    product: &DisplayProduct,
+) -> Option<usize> {
+    volume
+        .cuts
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| is_displayable_on_cut(volume, *index, product))
+        .min_by(|(left_index, left_cut), (right_index, right_cut)| {
+            left_cut
+                .elevation_deg
+                .total_cmp(&right_cut.elevation_deg)
+                .then_with(|| left_index.cmp(right_index))
+        })
+        .map(|(index, _)| index)
+}
+
+fn cut_for_user_product_switch(
+    volume: &RadarVolume,
+    current_cut: usize,
+    product: &DisplayProduct,
+) -> Option<usize> {
+    if is_displayable_on_cut(volume, current_cut, product) {
+        Some(current_cut)
+    } else {
+        lowest_displayable_cut_for_product(volume, product)
+    }
+}
+
 fn display_cut_for_product(
     volume: &RadarVolume,
     preferred_cut: usize,
@@ -47710,6 +48038,50 @@ mod tests {
     }
 
     #[test]
+    fn user_product_switch_falls_back_to_lowest_available_tilt() {
+        let product = DisplayProduct::Moment(MomentType::Velocity);
+        let mut volume = test_reflectivity_sails_volume_with_radials(
+            &[(0.50, 0), (1.20, 30_000), (0.70, 60_000)],
+            720,
+        );
+        add_velocity_moments_to_volume(&mut volume);
+        volume.cuts[1].moments.remove(&MomentType::Velocity);
+
+        assert_eq!(best_cut_for_product(&volume, 1, &product), Some(2));
+        assert_eq!(cut_for_user_product_switch(&volume, 1, &product), Some(0));
+    }
+
+    #[test]
+    fn primary_product_step_uses_lowest_available_tilt_and_clears_manual_hold() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let mut volume = test_reflectivity_sails_volume_with_radials(
+            &[(0.50, 0), (1.20, 30_000), (0.70, 60_000)],
+            720,
+        );
+        add_velocity_moments_to_volume(&mut volume);
+        volume.cuts[1].moments.remove(&MomentType::Velocity);
+        app.volume = Some(Arc::new(volume));
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.selected_cut = 1;
+        app.manual_primary_cut_hold = Some(LowSweepCutKey::new(
+            &FrameIdentity {
+                site_id: "TEST".to_owned(),
+                scan_time_utc: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            },
+            0,
+        ));
+
+        assert!(app.step_product(1));
+
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Velocity)
+        );
+        assert_eq!(app.selected_cut, 0);
+        assert!(app.manual_primary_cut_hold.is_none());
+    }
+
+    #[test]
     fn synced_velocity_pane_does_not_flip_to_ref_on_ref_only_live_partial() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.volume = Some(Arc::new(test_ref_then_velocity_volume()));
@@ -49029,6 +49401,7 @@ mod tests {
             end: (36.0, -96.0),
             start_utc: Utc.timestamp_opt(100, 0).single().unwrap(),
             end_utc: Utc.timestamp_opt(200, 0).single().unwrap(),
+            post_end_utc: Utc.timestamp_opt(200, 0).single().unwrap(),
         });
         app.handle_unified_player_action(
             Some(unified_player::UnifiedPlayerAction::ClearCameraFollow),
@@ -52050,6 +52423,46 @@ mod tests {
     }
 
     #[test]
+    fn satellite_run_scan_is_filtered_to_current_spec_family() {
+        let app = test_viewer_app_with_hazards(Vec::new());
+        let runs = vec![
+            test_sat_run("g19", "conus_c13_20260615", &[1750]),
+            test_sat_run("g19", "conus_c02_20260615", &[1750]),
+            test_sat_run("h9", "fulldisk_c13_20260615", &[1750]),
+        ];
+
+        let filtered = app.satellite_runs_for_current_spec(runs);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].key.model, "g19");
+        assert_eq!(filtered[0].key.run, "conus_c13_20260615");
+    }
+
+    #[test]
+    fn satellite_spec_change_clears_stale_map_and_player_state() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let old_key = rw_ui::SatRunKey {
+            model: "g19".to_owned(),
+            run: "conus_c13_20260615".to_owned(),
+        };
+        app.sat_last_frame = Some((old_key.clone(), 1755));
+        app.sat_run_listings = vec![test_sat_run("g19", "conus_c13_20260615", &[1755])];
+        app.sat_map_inflight = Some((old_key.clone(), 1755));
+        app.sat_map_pending = Some((old_key, 1800));
+        let generation = app.sat_layer_generation;
+
+        app.clear_satellite_display_for_spec_change();
+
+        assert!(app.sat_last_frame.is_none());
+        assert!(app.sat_run_listings.is_empty());
+        assert!(app.sat_map_inflight.is_none());
+        assert!(app.sat_map_pending.is_none());
+        assert!(app.sat_layer.is_none());
+        assert!(app.sat_layer_texture.is_none());
+        assert_ne!(app.sat_layer_generation, generation);
+    }
+
+    #[test]
     fn frame_work_cache_key_keeps_live_partial_replacements_distinct() {
         let identity = FrameIdentity {
             site_id: "KTLX".to_owned(),
@@ -54436,14 +54849,14 @@ mod tests {
         assert_eq!(MAX_HISTORY_FRAME_LIMIT, 2000);
     }
 
-    /// Golden parity: default SPC outlook styling (fill 36, stroke 230,
+    /// Golden parity: default SPC outlook styling (fill 58, stroke 230,
     /// width 2.0, published colors) and report markers (tornado red 5 px
     /// w/ black outline, wind blue 3.5, hail green 3.5, no outline).
     #[test]
     fn default_styles_pin_spc_constants() {
         let registry = styles::StyleRegistry::default();
         let spc = registry.spc();
-        assert_eq!(spc.outlook_fill_alpha, 36);
+        assert_eq!(spc.outlook_fill_alpha, 58);
         assert_eq!(spc.outlook_stroke_alpha, 230);
         assert_eq!(spc.outlook_stroke_width, 2.0);
         assert!(spc.use_spc_published_colors);
@@ -54993,6 +55406,37 @@ mod tests {
         assert!(!results.is_empty());
         assert_eq!(results[0].name, "Fort Worth");
         assert_eq!(results[0].match_score, 1);
+    }
+
+    #[test]
+    fn place_search_reaches_small_town_labels() {
+        let results = place_search_matches("forgan", 36.9, -100.5, 8);
+
+        assert!(
+            results.iter().any(|result| result.name == "Forgan"),
+            "expected Census town search results to include Forgan, got {results:?}"
+        );
+    }
+
+    #[test]
+    fn radar_site_search_accepts_full_or_short_level2_ids() {
+        let sites = vec![
+            data_source::RadarSite {
+                level2_id: "KFDR".to_owned(),
+                name: Some("Frederick".to_owned()),
+                latitude_deg: Some(34.36),
+                longitude_deg: Some(-98.98),
+            },
+            data_source::RadarSite {
+                level2_id: "KTLX".to_owned(),
+                name: Some("Oklahoma City".to_owned()),
+                latitude_deg: Some(35.33),
+                longitude_deg: Some(-97.28),
+            },
+        ];
+
+        assert_eq!(radar_site_search_matches("ktlx", &sites, 4)[0].0, 1);
+        assert_eq!(radar_site_search_matches("tlx", &sites, 4)[0].0, 1);
     }
 
     #[test]
@@ -57571,6 +58015,7 @@ mod tests {
             end: (36.0, -96.0),
             start_utc: Utc.timestamp_opt(100, 0).single().unwrap(),
             end_utc: Utc.timestamp_opt(200, 0).single().unwrap(),
+            post_end_utc: Utc.timestamp_opt(200, 0).single().unwrap(),
         });
         assert!(app.camera_follow_active());
         assert!(app.hide_camera_follow_guides());
@@ -57608,6 +58053,7 @@ mod tests {
             end: (36.0, -96.0),
             start_utc: Utc.timestamp_opt(100, 0).single().unwrap(),
             end_utc: Utc.timestamp_opt(200, 0).single().unwrap(),
+            post_end_utc: Utc.timestamp_opt(200, 0).single().unwrap(),
         });
         assert_eq!(
             app.camera_follow_status_label().as_deref(),

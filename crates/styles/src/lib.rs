@@ -540,7 +540,7 @@ impl Default for HazardGlobalStyle {
 impl Default for SpcStyle {
     fn default() -> Self {
         Self {
-            outlook_fill_alpha: 36,
+            outlook_fill_alpha: 58,
             outlook_stroke_alpha: 230,
             outlook_stroke_width: 2.0,
             use_spc_published_colors: true,

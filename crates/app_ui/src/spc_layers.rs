@@ -1149,6 +1149,9 @@ impl TornadoSegment {
             self.time_utc.format("%H%M"),
             self.location
         );
+        if let Some(wind) = tornado_wind_estimate_label(&self.ef_label) {
+            out.push_str(&format!("\nEF-scale wind estimate: {wind}"));
+        }
         if self.is_track() && self.length_mi > 0.0 {
             out.push_str(&format!(
                 "\n{:.1} mi path · {:.0} yd wide",
@@ -1157,6 +1160,27 @@ impl TornadoSegment {
         }
         out.push_str("\nClick: load the radar loop for this track");
         out
+    }
+}
+
+pub fn tornado_rating_index(label: &str) -> Option<u8> {
+    label
+        .chars()
+        .rev()
+        .find(|ch| ch.is_ascii_digit())
+        .and_then(|ch| ch.to_digit(10))
+        .and_then(|value| (value <= 5).then_some(value as u8))
+}
+
+pub fn tornado_wind_estimate_label(label: &str) -> Option<&'static str> {
+    match tornado_rating_index(label)? {
+        0 => Some("65-85 mph"),
+        1 => Some("86-110 mph"),
+        2 => Some("111-135 mph"),
+        3 => Some("136-165 mph"),
+        4 => Some("166-200 mph"),
+        5 => Some("201+ mph"),
+        _ => None,
     }
 }
 
@@ -2026,6 +2050,15 @@ VALID TIME 141200Z - 151200Z\n";
         let previous_rows = parse_wcm_torn_segments(previous, &csv);
         assert_eq!(previous_rows.len(), 1);
         assert_eq!(previous_rows[0].ef_label, "EF2");
+    }
+
+    #[test]
+    fn tornado_ef_labels_map_to_estimated_wind_ranges() {
+        assert_eq!(tornado_rating_index("EF4"), Some(4));
+        assert_eq!(tornado_rating_index("F2"), Some(2));
+        assert_eq!(tornado_rating_index("EF?"), None);
+        assert_eq!(tornado_wind_estimate_label("EF4"), Some("166-200 mph"));
+        assert_eq!(tornado_wind_estimate_label("EF5"), Some("201+ mph"));
     }
 
     #[test]

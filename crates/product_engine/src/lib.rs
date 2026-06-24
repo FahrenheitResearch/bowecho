@@ -29,6 +29,10 @@ pub fn base_products() -> Vec<ProductDescriptor> {
             "Correlation Coefficient",
         ),
         (MomentType::DifferentialPhase, "Differential Phase"),
+        (
+            MomentType::SpecificDifferentialPhase,
+            "Specific Differential Phase",
+        ),
     ]
     .into_iter()
     .map(|(moment, display_name)| ProductDescriptor {
@@ -46,5 +50,10 @@ mod tests {
     #[test]
     fn registry_includes_reflectivity() {
         assert!(base_products().iter().any(|product| product.id.0 == "REF"));
+    }
+
+    #[test]
+    fn registry_includes_specific_differential_phase() {
+        assert!(base_products().iter().any(|product| product.id.0 == "KDP"));
     }
 }

@@ -458,6 +458,10 @@ fn run_prefixes(spec: &SatFollowSpec) -> Result<(String, Vec<String>), String> {
     Ok((resolved.model, prefixes))
 }
 
+pub fn run_filters_for_spec(spec: &SatFollowSpec) -> Result<(String, Vec<String>), String> {
+    run_prefixes(spec)
+}
+
 /// Live on-disk footprint of the followed band(s): frame files only (the
 /// same accounting the rolling window budgets).
 fn disk_usage(store_root: &Path, model: &str, prefixes: &[String]) -> SatDiskUsage {
