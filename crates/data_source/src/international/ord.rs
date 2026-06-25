@@ -267,6 +267,30 @@ pub struct OrdArchivePlan {
     pub frame: FramePlan,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum OrdPlanQuality {
+    Other,
+    VelocityOnly,
+    ReflectivityOnly,
+    ReflectivityAndVelocity,
+}
+
+#[derive(Clone, Debug)]
+struct OrdFrameCandidate {
+    stamp: NaiveDateTime,
+    object_kind: ObjectKind,
+    quality: OrdPlanQuality,
+    frame: FramePlan,
+}
+
+#[derive(Clone, Debug)]
+struct OrdPlanCollection {
+    object_kind: ObjectKind,
+    newest_stamp: DateTime<Utc>,
+    quality: OrdPlanQuality,
+    plans: Vec<OrdArchivePlan>,
+}
+
 /// Build download plans for every complete scan anchored inside one UTC hour.
 ///
 /// The public CloudFerro archive uses the same key grammar as the live
@@ -291,6 +315,7 @@ pub fn archive_plans_for_hour(
     };
 
     let mut empty_kinds = Vec::new();
+    let mut collections = Vec::new();
     for kind in kinds {
         let mut keys = list_hour_keys_from_base(ARCHIVE_BUCKET_BASE, dir, site_id, kind, hour_utc)
             .map_err(|err| format!("ORD archive '{site_id}': {err}"))?;
@@ -305,9 +330,14 @@ pub fn archive_plans_for_hour(
         keys.extend(previous);
         let plans = archive_plans_from_keys(site_id, kind, &keys, hour_utc)?;
         if !plans.is_empty() {
-            return Ok(plans);
+            collections.push(plan_collection(site_id, kind, plans));
+        } else {
+            empty_kinds.push(kind.dir());
         }
-        empty_kinds.push(kind.dir());
+    }
+
+    if let Some(best) = best_plan_collection(collections) {
+        return Ok(best.plans);
     }
 
     Err(format!(
@@ -416,6 +446,7 @@ impl IntlProvider for OrdProvider {
         };
 
         let now = Utc::now();
+        let mut best: Option<OrdFrameCandidate> = None;
         for kind in kinds {
             for slot in 0..=HOUR_LOOKBACK_SLOTS {
                 let hour = now - chrono::Duration::hours(slot);
@@ -440,8 +471,14 @@ impl IntlProvider for OrdProvider {
                     list_hour_keys(dir, site_id, kind, hour - chrono::Duration::hours(1))
                         .map_err(|err| format!("ORD '{site_id}': {err}"))?;
                 all.extend(previous);
-                return plan_from_keys(site_id, kind, &all);
+                let candidate = plan_candidate_from_keys(site_id, kind, &all)?;
+                if ord_candidate_is_better(&candidate, best.as_ref()) {
+                    best = Some(candidate);
+                }
             }
+        }
+        if let Some(best) = best {
+            return Ok(best.frame);
         }
         Err(format!(
             "ORD: no files for site '{site_id}' in the last {HOUR_LOOKBACK_SLOTS} hours"
@@ -468,6 +505,7 @@ impl IntlProvider for OrdProvider {
 
         let now = truncate_to_utc_hour(Utc::now());
         let mut first_error = None;
+        let mut collections = Vec::new();
         for kind in kinds {
             let mut plans = Vec::new();
             for slot in 0..=RECENT_HOUR_LOOKBACK_SLOTS {
@@ -498,13 +536,18 @@ impl IntlProvider for OrdProvider {
             if !plans.is_empty() {
                 plans.sort_by_key(|plan| plan.stamp_utc);
                 plans.dedup_by(|left, right| left.frame.identity == right.frame.identity);
-                let skip = plans.len().saturating_sub(count);
-                return Ok(plans
-                    .into_iter()
-                    .skip(skip)
-                    .map(|plan| plan.frame)
-                    .collect());
+                collections.push(plan_collection(site_id, kind, plans));
             }
+        }
+
+        if let Some(best) = best_plan_collection(collections) {
+            let skip = best.plans.len().saturating_sub(count);
+            return Ok(best
+                .plans
+                .into_iter()
+                .skip(skip)
+                .map(|plan| plan.frame)
+                .collect());
         }
 
         Err(first_error
@@ -769,23 +812,42 @@ impl OrdFile {
 /// DWD grammar — site, anchor stamp, part count, FNV-1a of the key set —
 /// a pure function of the listing per the [`FramePlan`] stability
 /// contract.
+#[cfg(test)]
 fn plan_from_keys(site_id: &str, kind: ObjectKind, keys: &[String]) -> Result<FramePlan, String> {
     plan_from_keys_with_base(BUCKET_BASE, site_id, kind, keys)
 }
 
+fn plan_candidate_from_keys(
+    site_id: &str,
+    kind: ObjectKind,
+    keys: &[String],
+) -> Result<OrdFrameCandidate, String> {
+    plan_candidate_from_keys_with_base(BUCKET_BASE, site_id, kind, keys)
+}
+
+#[cfg(test)]
 fn plan_from_keys_with_base(
     bucket_base: &str,
     site_id: &str,
     kind: ObjectKind,
     keys: &[String],
 ) -> Result<FramePlan, String> {
+    Ok(plan_candidate_from_keys_with_base(bucket_base, site_id, kind, keys)?.frame)
+}
+
+fn plan_candidate_from_keys_with_base(
+    bucket_base: &str,
+    site_id: &str,
+    kind: ObjectKind,
+    keys: &[String],
+) -> Result<OrdFrameCandidate, String> {
     let files: Vec<OrdFile> = keys
         .iter()
         .filter_map(|key| OrdFile::parse(key, site_id))
         .collect();
     let anchor = select_frame_anchor(&files, kind)
         .ok_or_else(|| format!("ORD '{site_id}': no parseable volume keys in the listing"))?;
-    plan_from_files_for_anchor(bucket_base, site_id, kind, &files, anchor)
+    plan_candidate_from_files_for_anchor(bucket_base, site_id, kind, &files, anchor)
 }
 
 fn archive_plans_from_keys(
@@ -849,6 +911,16 @@ fn plan_from_files_for_anchor(
     files: &[OrdFile],
     anchor: NaiveDateTime,
 ) -> Result<FramePlan, String> {
+    Ok(plan_candidate_from_files_for_anchor(bucket_base, site_id, kind, files, anchor)?.frame)
+}
+
+fn plan_candidate_from_files_for_anchor(
+    bucket_base: &str,
+    site_id: &str,
+    kind: ObjectKind,
+    files: &[OrdFile],
+    anchor: NaiveDateTime,
+) -> Result<OrdFrameCandidate, String> {
     let mut chosen = choose_files_for_anchor(files, kind, anchor);
     if chosen.is_empty() {
         return Err(format!(
@@ -879,6 +951,7 @@ fn plan_from_files_for_anchor(
             .then(left.first_elevation().total_cmp(&right.first_elevation()))
             .then(left.key.cmp(&right.key))
     });
+    let quality = plan_quality_for_files(&chosen);
 
     let joined = chosen
         .iter()
@@ -891,7 +964,7 @@ fn plan_from_files_for_anchor(
             url: format!("{bucket_base}/{}", file.key),
         })
         .collect();
-    Ok(FramePlan {
+    let frame = FramePlan {
         identity: format!(
             "{site_id}_{}_p{}_h{:016x}",
             anchor.format("%Y%m%dT%H%M"),
@@ -900,6 +973,12 @@ fn plan_from_files_for_anchor(
         ),
         merge: parts.len() > 1,
         parts,
+    };
+    Ok(OrdFrameCandidate {
+        stamp: anchor,
+        object_kind: kind,
+        quality,
+        frame,
     })
 }
 
@@ -919,6 +998,93 @@ fn archive_chosen_files_are_complete(all_files: &[OrdFile], chosen: &[OrdFile]) 
         return chosen.iter().any(OrdFile::has_velocity);
     }
     true
+}
+
+fn plan_quality_for_files(files: &[OrdFile]) -> OrdPlanQuality {
+    let has_reflectivity = files.iter().any(OrdFile::has_reflectivity);
+    let has_velocity = files.iter().any(OrdFile::has_velocity);
+    match (
+        chosen_has_reflectivity_and_velocity(files),
+        has_reflectivity,
+        has_velocity,
+    ) {
+        (true, _, _) => OrdPlanQuality::ReflectivityAndVelocity,
+        (false, true, _) => OrdPlanQuality::ReflectivityOnly,
+        (false, false, true) => OrdPlanQuality::VelocityOnly,
+        (false, false, false) => OrdPlanQuality::Other,
+    }
+}
+
+fn frame_plan_quality(site_id: &str, frame: &FramePlan) -> OrdPlanQuality {
+    let files = frame
+        .parts
+        .iter()
+        .filter_map(|part| OrdFile::parse(&part.url, site_id))
+        .collect::<Vec<_>>();
+    plan_quality_for_files(&files)
+}
+
+fn plan_collection(
+    site_id: &str,
+    object_kind: ObjectKind,
+    plans: Vec<OrdArchivePlan>,
+) -> OrdPlanCollection {
+    let newest_stamp = plans
+        .last()
+        .map(|plan| plan.stamp_utc)
+        .expect("plan collections are created only for non-empty plan lists");
+    let quality = plans
+        .last()
+        .map(|plan| frame_plan_quality(site_id, &plan.frame))
+        .unwrap_or(OrdPlanQuality::Other);
+    OrdPlanCollection {
+        object_kind,
+        newest_stamp,
+        quality,
+        plans,
+    }
+}
+
+fn best_plan_collection(collections: Vec<OrdPlanCollection>) -> Option<OrdPlanCollection> {
+    collections.into_iter().max_by(compare_plan_collections)
+}
+
+fn compare_plan_collections(
+    left: &OrdPlanCollection,
+    right: &OrdPlanCollection,
+) -> std::cmp::Ordering {
+    left.quality
+        .cmp(&right.quality)
+        .then(left.newest_stamp.cmp(&right.newest_stamp))
+        // Prefer the more complete assembled PVOL lane only as a final
+        // deterministic tie. Product availability and freshness have already
+        // decided the meaningful cases.
+        .then(object_kind_tie_rank(left.object_kind).cmp(&object_kind_tie_rank(right.object_kind)))
+}
+
+fn ord_candidate_is_better(
+    candidate: &OrdFrameCandidate,
+    current: Option<&OrdFrameCandidate>,
+) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+    candidate
+        .quality
+        .cmp(&current.quality)
+        .then(candidate.stamp.cmp(&current.stamp))
+        .then(
+            object_kind_tie_rank(candidate.object_kind)
+                .cmp(&object_kind_tie_rank(current.object_kind)),
+        )
+        .is_gt()
+}
+
+fn object_kind_tie_rank(kind: ObjectKind) -> u8 {
+    match kind {
+        ObjectKind::Pvol => 1,
+        ObjectKind::Scan => 0,
+    }
 }
 
 fn select_frame_anchor(files: &[OrdFile], kind: ObjectKind) -> Option<NaiveDateTime> {
@@ -1216,6 +1382,71 @@ mod tests {
         assert!(!plan.merge);
         assert_eq!(plan.parts.len(), 1);
         assert!(plan.parts[0].url.contains("iedub@20260612T1445@"));
+    }
+
+    #[test]
+    fn ord_candidate_scoring_prefers_scan_reflectivity_over_pvol_velocity_only() {
+        let pvol_keys =
+            vec!["2026/06/25/IE/iedub/PVOL/iedub@20260625T1515@0.5_2.2_4.3@VRADH.h5".to_owned()];
+        let scan_keys = vec![
+            "2026/06/25/IE/iedub/SCAN/iedub@20260625T1530@0.5@TH.h5".to_owned(),
+            "2026/06/25/IE/iedub/SCAN/iedub@20260625T1531@2.9@TH.h5".to_owned(),
+            "2026/06/25/IE/iedub/SCAN/iedub@20260625T1531@4.0@TH.h5".to_owned(),
+        ];
+
+        let pvol = plan_candidate_from_keys("iedub", ObjectKind::Pvol, &pvol_keys).unwrap();
+        let scan = plan_candidate_from_keys("iedub", ObjectKind::Scan, &scan_keys).unwrap();
+
+        assert_eq!(pvol.quality, OrdPlanQuality::VelocityOnly);
+        assert_eq!(scan.quality, OrdPlanQuality::ReflectivityOnly);
+        assert!(
+            ord_candidate_is_better(&scan, Some(&pvol)),
+            "Dublin-style SCAN TH should win over PVOL VRADH so REF is available"
+        );
+        let best = best_plan_collection(vec![
+            plan_collection(
+                "iedub",
+                ObjectKind::Pvol,
+                vec![OrdArchivePlan {
+                    stamp_utc: DateTime::from_naive_utc_and_offset(pvol.stamp, Utc),
+                    object_kind: ObjectKind::Pvol.dir(),
+                    frame: pvol.frame.clone(),
+                }],
+            ),
+            plan_collection(
+                "iedub",
+                ObjectKind::Scan,
+                vec![OrdArchivePlan {
+                    stamp_utc: DateTime::from_naive_utc_and_offset(scan.stamp, Utc),
+                    object_kind: ObjectKind::Scan.dir(),
+                    frame: scan.frame.clone(),
+                }],
+            ),
+        ])
+        .expect("best collection");
+        assert_eq!(best.object_kind, ObjectKind::Scan);
+    }
+
+    #[test]
+    fn ord_candidate_scoring_keeps_complete_pvol_over_scan_reflectivity_only() {
+        let pvol_keys = vec![
+            "2026/06/25/NL/nlhrw/PVOL/nlhrw@20260625T1515@0.5_2.2_4.3@DBZH.h5".to_owned(),
+            "2026/06/25/NL/nlhrw/PVOL/nlhrw@20260625T1515@0.5_2.2_4.3@VRADH.h5".to_owned(),
+        ];
+        let scan_keys = vec![
+            "2026/06/25/NL/nlhrw/SCAN/nlhrw@20260625T1531@0.5@TH.h5".to_owned(),
+            "2026/06/25/NL/nlhrw/SCAN/nlhrw@20260625T1531@2.9@TH.h5".to_owned(),
+        ];
+
+        let pvol = plan_candidate_from_keys("nlhrw", ObjectKind::Pvol, &pvol_keys).unwrap();
+        let scan = plan_candidate_from_keys("nlhrw", ObjectKind::Scan, &scan_keys).unwrap();
+
+        assert_eq!(pvol.quality, OrdPlanQuality::ReflectivityAndVelocity);
+        assert_eq!(scan.quality, OrdPlanQuality::ReflectivityOnly);
+        assert!(
+            !ord_candidate_is_better(&scan, Some(&pvol)),
+            "a complete PVOL frame should remain preferred over REF-only SCAN"
+        );
     }
 
     #[test]
