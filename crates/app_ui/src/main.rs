@@ -880,10 +880,48 @@ fn configured_rayon_threads_from(value: Option<&str>) -> Option<usize> {
 }
 
 fn derive_default_products_in_place(volume: &mut RadarVolume) {
-    let _report = product_engine::derive_volume_in_place(
-        volume,
-        &product_engine::DerivationConfig::kdp_only(),
-    );
+    let config = derivation_config_for_volume(volume, [product_engine::DerivedSweepProduct::Kdp]);
+    let _report = product_engine::derive_volume_in_place(volume, &config);
+}
+
+fn derivation_config_for_volume(
+    volume: &RadarVolume,
+    products: impl IntoIterator<Item = product_engine::DerivedSweepProduct>,
+) -> product_engine::DerivationConfig {
+    product_engine::DerivationConfig::with_products(radar_band_for_volume(volume), products)
+}
+
+fn radar_band_for_volume(volume: &RadarVolume) -> product_engine::RadarBand {
+    if let Some(mhz) = volume.metadata.radar_frequency_mhz {
+        return radar_band_for_frequency_mhz(mhz);
+    }
+    let site_id = volume.site.id.trim().to_ascii_uppercase();
+    if site_id.starts_with('T') && site_id.len() == 4 {
+        product_engine::RadarBand::C
+    } else if site_id.contains("DOW")
+        || site_id.contains("RAXPOL")
+        || site_id.contains("COW")
+        || site_id.contains("NOXP")
+    {
+        product_engine::RadarBand::X
+    } else if volume
+        .metadata
+        .compression
+        .as_deref()
+        .is_some_and(|source| source.contains("odim") || source.contains("cfradial"))
+    {
+        product_engine::RadarBand::C
+    } else {
+        product_engine::RadarBand::S
+    }
+}
+
+fn radar_band_for_frequency_mhz(mhz: u32) -> product_engine::RadarBand {
+    match mhz {
+        8000..=12_000 => product_engine::RadarBand::X,
+        4000..=7999 => product_engine::RadarBand::C,
+        _ => product_engine::RadarBand::S,
+    }
 }
 
 fn derive_advanced_products_for_volume_cut_arc(
@@ -893,7 +931,10 @@ fn derive_advanced_products_for_volume_cut_arc(
     derive_advanced_products_for_volume_cut_arc_with_config(
         volume,
         cut_index,
-        product_engine::DerivationConfig::all_supported(),
+        derivation_config_for_volume(
+            volume.as_ref(),
+            product_engine::DerivedSweepProduct::ALL.iter().copied(),
+        ),
         "Advanced product derivation failed for this tilt",
     )
 }
@@ -906,9 +947,33 @@ fn derive_advanced_product_for_volume_cut_arc(
     derive_advanced_products_for_volume_cut_arc_with_config(
         volume,
         cut_index,
-        product_engine::DerivationConfig::with_products(product_engine::RadarBand::S, [product]),
+        derivation_config_for_volume(volume.as_ref(), [product]),
         "Advanced product derivation failed for the selected product",
     )
+}
+
+fn ensure_advanced_products_on_volume_cuts_arc(
+    mut volume: Arc<RadarVolume>,
+    requests: impl IntoIterator<Item = (DisplayProduct, usize, bool)>,
+) -> Arc<RadarVolume> {
+    for (product, preferred_cut, require_complete_live_cut) in requests {
+        if advanced_derived_product_for_display_product(&product).is_none() {
+            continue;
+        }
+        let Some(cut) = advanced_product_source_cut_with_live_filter(
+            volume.as_ref(),
+            preferred_cut,
+            &product,
+            require_complete_live_cut,
+        ) else {
+            continue;
+        };
+        let next = ensure_advanced_product_on_volume_cut_arc(Arc::clone(&volume), cut, &product);
+        if is_displayable_on_cut(next.as_ref(), cut, &product) {
+            volume = next;
+        }
+    }
+    volume
 }
 
 fn derive_advanced_products_for_volume_cut_arc_with_config(
@@ -970,6 +1035,100 @@ fn ensure_advanced_product_on_volume_cut_arc(
     derive_advanced_product_for_volume_cut_arc(&volume, cut_index, derived_product)
         .map(|(volume, _)| volume)
         .unwrap_or(volume)
+}
+
+fn advanced_derived_display_product(
+    product: product_engine::DerivedSweepProduct,
+) -> Option<DisplayProduct> {
+    (product != product_engine::DerivedSweepProduct::Kdp)
+        .then(|| DisplayProduct::Moment(product.moment_type()))
+}
+
+fn cut_has_moment_source(cut: &ElevationCut, moment: &MomentType) -> bool {
+    cut.moments
+        .get(moment)
+        .is_some_and(|grid| grid.radial_count() >= displayable_radial_threshold(cut.radials.len()))
+}
+
+fn cut_has_kdp_source(cut: &ElevationCut) -> bool {
+    cut_has_moment_source(cut, &MomentType::SpecificDifferentialPhase)
+        || cut_has_moment_source(cut, &MomentType::DifferentialPhase)
+}
+
+fn cut_has_advanced_product_sources(
+    cut: &ElevationCut,
+    product: product_engine::DerivedSweepProduct,
+) -> bool {
+    use product_engine::DerivedSweepProduct as Product;
+    match product {
+        Product::Kdp => cut_has_moment_source(cut, &MomentType::DifferentialPhase),
+        Product::FilteredDifferentialPhase | Product::KdpUncertainty => {
+            cut_has_moment_source(cut, &MomentType::DifferentialPhase)
+        }
+        Product::SpecificAttenuation
+        | Product::PathIntegratedAttenuation
+        | Product::SpecificDifferentialAttenuation
+        | Product::PathIntegratedDifferentialAttenuation
+        | Product::RainRateKdp
+        | Product::KdpTexture => cut_has_kdp_source(cut),
+        Product::CorrectedReflectivity => {
+            cut_has_moment_source(cut, &MomentType::Reflectivity) && cut_has_kdp_source(cut)
+        }
+        Product::CorrectedDifferentialReflectivity => {
+            cut_has_moment_source(cut, &MomentType::DifferentialReflectivity)
+                && cut_has_kdp_source(cut)
+        }
+        Product::RainRateReflectivity
+        | Product::LiquidWaterContent
+        | Product::HailKineticEnergy
+        | Product::ReflectivityTexture
+        | Product::ReflectivityRangeGradient => {
+            cut_has_moment_source(cut, &MomentType::Reflectivity)
+        }
+        Product::RainRateHybrid => {
+            cut_has_moment_source(cut, &MomentType::Reflectivity) || cut_has_kdp_source(cut)
+        }
+        Product::CircularDepolarizationRatio => {
+            cut_has_moment_source(cut, &MomentType::DifferentialReflectivity)
+                && cut_has_moment_source(cut, &MomentType::CorrelationCoefficient)
+        }
+        Product::LogCorrelationRatio | Product::CorrelationCoefficientTexture => {
+            cut_has_moment_source(cut, &MomentType::CorrelationCoefficient)
+        }
+        Product::VelocityTexture | Product::VelocityRangeGradient => {
+            cut_has_moment_source(cut, &MomentType::Velocity)
+        }
+        Product::SpectrumWidthTexture => cut_has_moment_source(cut, &MomentType::SpectrumWidth),
+        Product::DifferentialReflectivityTexture => {
+            cut_has_moment_source(cut, &MomentType::DifferentialReflectivity)
+        }
+        Product::DifferentialPhaseTexture => {
+            cut_has_moment_source(cut, &MomentType::DifferentialPhase)
+        }
+        Product::MeteorologicalQuality | Product::MeteorologicalGateMask => {
+            cut_has_moment_source(cut, &MomentType::CorrelationCoefficient)
+                || cut_has_moment_source(cut, &MomentType::Reflectivity)
+        }
+        Product::TdsConfidence => {
+            cut_has_moment_source(cut, &MomentType::Reflectivity)
+                && cut_has_moment_source(cut, &MomentType::CorrelationCoefficient)
+        }
+        Product::HailSignature => cut_has_moment_source(cut, &MomentType::Reflectivity),
+        Product::TurbulenceProxy => {
+            cut_has_moment_source(cut, &MomentType::SpectrumWidth)
+                || cut_has_moment_source(cut, &MomentType::Velocity)
+        }
+    }
+}
+
+fn volume_has_advanced_product_sources(
+    volume: &RadarVolume,
+    product: product_engine::DerivedSweepProduct,
+) -> bool {
+    volume
+        .cuts
+        .iter()
+        .any(|cut| cut_has_advanced_product_sources(cut, product))
 }
 
 fn preview_render_head_start(threads: usize) -> Duration {
@@ -1415,6 +1574,7 @@ struct ViewerApp {
     volume: Option<Arc<RadarVolume>>,
     selected_cut: usize,
     selected_product: DisplayProduct,
+    advanced_products_enabled: bool,
     frame_history: Vec<FrameHistoryEntry>,
     selected_frame_index: usize,
     low_sweep_disabled_cuts: BTreeSet<LowSweepCutKey>,
@@ -4769,6 +4929,16 @@ impl DisplayProduct {
         )
     }
 
+    fn is_signed_radial_velocity(&self) -> bool {
+        matches!(
+            self,
+            Self::Moment(MomentType::Velocity)
+                | Self::DealiasedVelocity
+                | Self::StormRelativeVelocity
+                | Self::StormRelativeDealiasedVelocity
+        )
+    }
+
     fn render_uses_dealiased_velocity(&self, unfold_plain_velocity: bool) -> bool {
         match self {
             Self::Moment(MomentType::Velocity) => unfold_plain_velocity,
@@ -5607,6 +5777,7 @@ impl ViewerApp {
             volume: None,
             selected_cut: 0,
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
+            advanced_products_enabled: false,
             frame_history: Vec::new(),
             selected_frame_index: 0,
             low_sweep_disabled_cuts: BTreeSet::new(),
@@ -6899,11 +7070,98 @@ impl ViewerApp {
         self.sample_cache_build_ms = None;
     }
 
+    fn displayable_products_for_picker(&self, volume: &RadarVolume) -> Vec<DisplayProduct> {
+        global_displayable_products_with_advanced(volume, self.advanced_products_enabled)
+    }
+
+    fn materialize_primary_advanced_product(
+        &mut self,
+        product: &DisplayProduct,
+        preferred_cut: usize,
+    ) -> Option<Arc<RadarVolume>> {
+        advanced_derived_product_for_display_product(product)?;
+        let active = self.volume.clone()?;
+        let cut = advanced_product_source_cut(active.as_ref(), preferred_cut, product)?;
+        let active_identity = frame_identity_for_volume(&active);
+        let volume = ensure_advanced_product_on_volume_cut_arc(Arc::clone(&active), cut, product);
+        if !is_displayable_on_cut(volume.as_ref(), cut, product) {
+            return None;
+        }
+        if !Arc::ptr_eq(&volume, &active) {
+            if let Some(frame) = self
+                .frame_history
+                .iter_mut()
+                .find(|frame| frame.identity == active_identity)
+            {
+                frame.volume = Arc::clone(&volume);
+            }
+            self.volume = Some(Arc::clone(&volume));
+        }
+        Some(volume)
+    }
+
+    fn materialize_pane_advanced_product(
+        &mut self,
+        slot: usize,
+        product: &DisplayProduct,
+        preferred_cut: usize,
+    ) -> Option<Arc<RadarVolume>> {
+        advanced_derived_product_for_display_product(product)?;
+        if self.extra_panes.get(slot).is_some_and(ViewPane::owns_radar) {
+            let active = self.extra_panes.get(slot)?.volume.clone()?;
+            let cut = advanced_product_source_cut(active.as_ref(), preferred_cut, product)?;
+            let active_identity = frame_identity_for_volume(&active);
+            let volume =
+                ensure_advanced_product_on_volume_cut_arc(Arc::clone(&active), cut, product);
+            if !is_displayable_on_cut(volume.as_ref(), cut, product) {
+                return None;
+            }
+            if !Arc::ptr_eq(&volume, &active)
+                && let Some(pane) = self.extra_panes.get_mut(slot)
+            {
+                if let Some(frame) = pane
+                    .frame_history
+                    .iter_mut()
+                    .find(|frame| frame.identity == active_identity)
+                {
+                    frame.volume = Arc::clone(&volume);
+                }
+                pane.volume = Some(Arc::clone(&volume));
+            }
+            Some(volume)
+        } else {
+            self.materialize_primary_advanced_product(product, preferred_cut)
+        }
+    }
+
+    fn materialize_active_following_advanced_products(&mut self) {
+        let mut requests = Vec::new();
+        requests.push((self.selected_product.clone(), self.selected_cut));
+        requests.extend(
+            self.extra_panes
+                .iter()
+                .filter(|pane| !pane.owns_radar())
+                .map(|pane| (pane.product.clone(), pane.cut.unwrap_or(self.selected_cut))),
+        );
+        for (product, preferred_cut) in requests {
+            let _ = self.materialize_primary_advanced_product(&product, preferred_cut);
+        }
+    }
+
+    fn materialize_extra_pane_advanced_product_at_cut(&mut self, slot: usize, cut: usize) -> bool {
+        let Some(product) = self.extra_panes.get(slot).map(|pane| pane.product.clone()) else {
+            return false;
+        };
+        self.materialize_pane_advanced_product(slot, &product, cut)
+            .is_some()
+    }
+
     fn derive_advanced_products_for_products_panel(
         &mut self,
         editing_pane: Option<usize>,
         ctx: &egui::Context,
     ) {
+        self.advanced_products_enabled = true;
         if let Some(slot) = editing_pane
             && self.extra_panes.get(slot).is_some_and(ViewPane::owns_radar)
         {
@@ -7601,8 +7859,27 @@ impl ViewerApp {
         let previous_cut = self.selected_cut;
         let previous_product = self.selected_product.clone();
         let previous_volume_for_panes = self.volume.clone();
-        let volume =
-            ensure_advanced_product_on_volume_cut_arc(volume, previous_cut, &previous_product);
+        let require_complete_live_cut =
+            frame_status == FrameStatus::LivePartial && !self.display_live_chunk_updates;
+        let mut advanced_requests = Vec::new();
+        advanced_requests.push((
+            previous_product.clone(),
+            previous_cut,
+            require_complete_live_cut,
+        ));
+        advanced_requests.extend(
+            self.extra_panes
+                .iter()
+                .filter(|pane| !pane.owns_radar())
+                .map(|pane| {
+                    (
+                        pane.product.clone(),
+                        pane.cut.unwrap_or(previous_cut),
+                        require_complete_live_cut,
+                    )
+                }),
+        );
+        let volume = ensure_advanced_products_on_volume_cuts_arc(volume, advanced_requests);
         let next_identity = frame_identity_for_volume(volume.as_ref());
         if self
             .manual_primary_cut_hold
@@ -7611,8 +7888,6 @@ impl ViewerApp {
         {
             self.manual_primary_cut_hold = None;
         }
-        let require_complete_live_cut =
-            frame_status == FrameStatus::LivePartial && !self.display_live_chunk_updates;
         let manual_hold_cut = self.manual_primary_cut_hold.as_ref().and_then(|hold| {
             (hold.identity == next_identity
                 && is_displayable_on_cut(volume.as_ref(), hold.cut_index, &previous_product))
@@ -7710,6 +7985,7 @@ impl ViewerApp {
                 frame_status,
             );
         }
+        self.materialize_active_following_advanced_products();
         self.sanitize_selection_for_volume_install(frame_status);
         if keep_existing_texture {
             self.pending_render_key = None;
@@ -7773,7 +8049,7 @@ impl ViewerApp {
                 })
                 .unwrap_or(previous_primary_cut);
 
-            let product_ready = volume_has_displayable_product_with_live_filter(
+            let product_ready = volume_can_materialize_product_with_live_filter(
                 volume,
                 &previous_product,
                 require_complete_live_cut,
@@ -7784,7 +8060,7 @@ impl ViewerApp {
             if live_partial
                 && require_complete_live_cut
                 && pane.cut.is_some()
-                && !is_displayable_on_live_candidate_cut(
+                && !can_materialize_product_on_live_candidate_cut(
                     volume,
                     previous_cut,
                     &previous_product,
@@ -8545,6 +8821,10 @@ impl ViewerApp {
     }
 
     fn set_selected_cut_preserving_texture(&mut self, cut: usize) {
+        let selected_product = self.selected_product.clone();
+        if advanced_derived_product_for_display_product(&selected_product).is_some() {
+            let _ = self.materialize_primary_advanced_product(&selected_product, cut);
+        }
         self.selected_cut = cut;
         self.pending_render_key = None;
         self.render_ms = None;
@@ -9235,6 +9515,9 @@ impl ViewerApp {
                 Self::set_pane_cut_preserving_texture(pane, cut);
                 changed = true;
             }
+            if self.materialize_extra_pane_advanced_product_at_cut(slot, cut) {
+                changed = true;
+            }
         }
         if changed {
             self.sync_radar_overlay_layers_to_timeline(ctx);
@@ -9269,8 +9552,11 @@ impl ViewerApp {
         }) else {
             return false;
         };
-        if changed && let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-            Self::set_pane_cut_preserving_texture(pane, cut);
+        if changed {
+            if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+                Self::set_pane_cut_preserving_texture(pane, cut);
+            }
+            let _ = self.materialize_extra_pane_advanced_product_at_cut(pane_slot, cut);
             ctx.request_repaint();
         }
         changed
@@ -10068,14 +10354,18 @@ impl ViewerApp {
         for pane in &mut self.extra_panes {
             if let Some(pane_volume) = pane.volume.clone().or_else(|| primary_volume.clone()) {
                 if !pane.owns_radar()
-                    && !volume_has_displayable_product(pane_volume.as_ref(), &pane.product)
+                    && !volume_can_materialize_product_with_live_filter(
+                        pane_volume.as_ref(),
+                        &pane.product,
+                        false,
+                    )
                 {
                     continue;
                 }
                 if preserve_pending_following_live_partial_cuts
                     && !pane.owns_radar()
                     && let Some(cut) = pane.cut
-                    && !is_displayable_on_live_candidate_cut(
+                    && !can_materialize_product_on_live_candidate_cut(
                         pane_volume.as_ref(),
                         cut,
                         &pane.product,
@@ -10087,16 +10377,23 @@ impl ViewerApp {
                 if let Some(cut) = pane.cut {
                     pane.cut = Some(cut.min(pane_volume.cuts.len().saturating_sub(1)));
                 }
-                if !is_displayable_on_cut(
+                if !can_materialize_product_on_cut(
                     pane_volume.as_ref(),
                     pane.cut.unwrap_or(self.selected_cut),
                     &pane.product,
                 ) {
-                    if let Some(cut) = best_cut_for_product(
+                    if let Some(cut) = advanced_product_source_cut(
                         pane_volume.as_ref(),
                         pane.cut.unwrap_or(self.selected_cut),
                         &pane.product,
-                    ) {
+                    )
+                    .or_else(|| {
+                        best_cut_for_product(
+                            pane_volume.as_ref(),
+                            pane.cut.unwrap_or(self.selected_cut),
+                            &pane.product,
+                        )
+                    }) {
                         pane.cut = Some(cut);
                     } else if pane.owns_radar()
                         && let Some(product) = global_displayable_products(pane_volume.as_ref())
@@ -10109,10 +10406,13 @@ impl ViewerApp {
                 }
             }
         }
-        if is_displayable_on_cut(volume, self.selected_cut, &self.selected_product) {
+        if can_materialize_product_on_cut(volume, self.selected_cut, &self.selected_product) {
             return;
         }
-        if let Some(cut) = best_cut_for_product(volume, self.selected_cut, &self.selected_product) {
+        if let Some(cut) =
+            advanced_product_source_cut(volume, self.selected_cut, &self.selected_product)
+                .or_else(|| best_cut_for_product(volume, self.selected_cut, &self.selected_product))
+        {
             self.selected_cut = cut;
             return;
         }
@@ -10145,6 +10445,10 @@ impl ViewerApp {
     fn select_primary_cut_manually(&mut self, cut: usize, ctx: &egui::Context) {
         self.history_playing = false;
         self.last_history_step = None;
+        let selected_product = self.selected_product.clone();
+        if advanced_derived_product_for_display_product(&selected_product).is_some() {
+            let _ = self.materialize_primary_advanced_product(&selected_product, cut);
+        }
         self.selected_cut = cut;
         self.sanitize_selection();
         self.manual_primary_cut_hold = self.volume.as_ref().and_then(|volume| {
@@ -10275,7 +10579,8 @@ impl ViewerApp {
             if !ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key)) {
                 continue;
             }
-            let Some(product) = global_displayable_products(&volume)
+            let Some(product) = self
+                .displayable_products_for_picker(volume.as_ref())
                 .into_iter()
                 .find(|product| product.label().eq_ignore_ascii_case(&label))
             else {
@@ -10283,23 +10588,12 @@ impl ViewerApp {
             };
             match focused_slot {
                 Some(slot) => {
-                    if self.extra_panes[slot].product != product {
-                        if let Some(cut) = cut_for_user_product_switch(
-                            volume.as_ref(),
-                            self.extra_panes[slot].cut.unwrap_or(self.selected_cut),
-                            &product,
-                        ) {
-                            self.extra_panes[slot].cut = Some(cut);
-                        }
-                        self.extra_panes[slot].product = product;
-                        self.extra_panes[slot].render_ms = None;
-                    }
+                    return self.switch_pane_product(slot, product);
                 }
                 None => {
-                    self.switch_primary_product(volume.as_ref(), product);
+                    return self.switch_primary_product(product);
                 }
             }
-            return true;
         }
         false
     }
@@ -10329,6 +10623,9 @@ impl ViewerApp {
         volume: &RadarVolume,
         product: &DisplayProduct,
     ) -> Option<usize> {
+        if let Some(cut) = advanced_product_source_cut(volume, self.selected_cut, product) {
+            return Some(cut);
+        }
         if self.app_settings.remember_product_tilts {
             if let Some(cut) = self
                 .product_cut_memory
@@ -10343,10 +10640,18 @@ impl ViewerApp {
         cut_for_user_product_switch(volume, self.selected_cut, product)
     }
 
-    fn switch_primary_product(&mut self, volume: &RadarVolume, product: DisplayProduct) -> bool {
+    fn switch_primary_product(&mut self, product: DisplayProduct) -> bool {
         if self.selected_product == product {
             return false;
         }
+        let Some(volume) = (if advanced_derived_product_for_display_product(&product).is_some() {
+            self.materialize_primary_advanced_product(&product, self.selected_cut)
+        } else {
+            self.volume.clone()
+        }) else {
+            return false;
+        };
+        let volume = volume.as_ref();
         let Some(next_cut) = self.preferred_primary_cut_for_product_switch(volume, &product) else {
             return false;
         };
@@ -10359,6 +10664,37 @@ impl ViewerApp {
         true
     }
 
+    fn switch_pane_product(&mut self, slot: usize, product: DisplayProduct) -> bool {
+        let Some(current_product) = self.extra_panes.get(slot).map(|pane| pane.product.clone())
+        else {
+            return false;
+        };
+        if current_product == product {
+            return false;
+        }
+        let preferred_cut = self.extra_panes[slot].cut.unwrap_or(self.selected_cut);
+        let Some(volume) = (if advanced_derived_product_for_display_product(&product).is_some() {
+            self.materialize_pane_advanced_product(slot, &product, preferred_cut)
+        } else {
+            self.extra_panes
+                .get(slot)
+                .and_then(|pane| pane.volume.clone())
+                .or_else(|| self.volume.clone())
+        }) else {
+            return false;
+        };
+        let Some(next_cut) = advanced_product_source_cut(volume.as_ref(), preferred_cut, &product)
+            .or_else(|| cut_for_user_product_switch(volume.as_ref(), preferred_cut, &product))
+        else {
+            return false;
+        };
+        let pane = &mut self.extra_panes[slot];
+        pane.product = product;
+        pane.cut = Some(next_cut);
+        pane.render_ms = None;
+        true
+    }
+
     fn step_pane_product(&mut self, slot: usize, delta: isize) -> bool {
         let Some(volume) = self
             .extra_panes
@@ -10368,25 +10704,24 @@ impl ViewerApp {
         else {
             return false;
         };
-        let products = global_displayable_products(volume.as_ref());
-        let Some(next) =
-            stepped_product(&products, &self.extra_panes[slot].product, delta).cloned()
-        else {
-            return false;
-        };
-        if self.extra_panes[slot].product == next {
+        let products = self.displayable_products_for_picker(volume.as_ref());
+        if products.is_empty() || delta == 0 {
             return false;
         }
-        if let Some(cut) = cut_for_user_product_switch(
-            volume.as_ref(),
-            self.extra_panes[slot].cut.unwrap_or(self.selected_cut),
-            &next,
-        ) {
-            self.extra_panes[slot].cut = Some(cut);
+        let step = delta.signum();
+        let current = products
+            .iter()
+            .position(|product| *product == self.extra_panes[slot].product)
+            .unwrap_or(0);
+        for offset in 1..=products.len() {
+            let next = (current as isize + step * offset as isize)
+                .rem_euclid(products.len() as isize) as usize;
+            let next_product = products[next].clone();
+            if self.switch_pane_product(slot, next_product) {
+                return true;
+            }
         }
-        self.extra_panes[slot].product = next;
-        self.extra_panes[slot].render_ms = None;
-        true
+        false
     }
 
     /// Step the focused pane's tilt, pinning it (independent of main).
@@ -10408,6 +10743,7 @@ impl ViewerApp {
         if Some(next_cut) == self.extra_panes[slot].cut {
             return false;
         }
+        let _ = self.materialize_extra_pane_advanced_product_at_cut(slot, next_cut);
         self.extra_panes[slot].cut = Some(next_cut);
         true
     }
@@ -10433,12 +10769,23 @@ impl ViewerApp {
         let Some(volume) = self.volume.clone() else {
             return false;
         };
-        let products = global_displayable_products(volume.as_ref());
-        let Some(next_product) = stepped_product(&products, &self.selected_product, delta).cloned()
-        else {
+        let products = self.displayable_products_for_picker(volume.as_ref());
+        if products.is_empty() || delta == 0 {
             return false;
-        };
-        self.switch_primary_product(volume.as_ref(), next_product)
+        }
+        let step = delta.signum();
+        let current = products
+            .iter()
+            .position(|product| *product == self.selected_product)
+            .unwrap_or(0);
+        for offset in 1..=products.len() {
+            let next = (current as isize + step * offset as isize)
+                .rem_euclid(products.len() as isize) as usize;
+            if self.switch_primary_product(products[next].clone()) {
+                return true;
+            }
+        }
+        false
     }
 
     fn step_tilt(&mut self, delta: isize, ctx: &egui::Context) -> bool {
@@ -11220,8 +11567,7 @@ impl ViewerApp {
         if let Some(table) = self.palette_product_overrides.get(product.label()) {
             color_tables.set_family(product.color_family(), table.clone());
         }
-        if self.flip_velocity_color_polarity && product.color_family() == ColorTableFamily::Velocity
-        {
+        if self.flip_velocity_color_polarity && product.is_signed_radial_velocity() {
             let current = color_tables.for_family(ColorTableFamily::Velocity);
             color_tables.set_family(
                 ColorTableFamily::Velocity,
@@ -11482,6 +11828,7 @@ impl ViewerApp {
                     request.previous_volume.as_deref(),
                     request.cut,
                     &base_moment,
+                    request.product.color_family(),
                     dealiased_velocity,
                     request.dealias_cascade,
                     gate_filter,
@@ -11496,11 +11843,12 @@ impl ViewerApp {
                 )
                 .map_err(|err| err.to_string())
             } else {
-                ViewportMomentCache::new_with_color_tables(
+                ViewportMomentCache::new_with_color_tables_for_family(
                     request.volume.as_ref(),
                     request.cut,
                     base_moment.clone(),
                     &request.color_tables,
+                    Some(request.product.color_family()),
                 )
                 .map_err(|err| err.to_string())
             }?;
@@ -12982,10 +13330,16 @@ impl ViewerApp {
         };
         let previous_cut = pane.cut.unwrap_or(main_cut);
         let previous_product = pane.product.clone();
-        let volume =
-            ensure_advanced_product_on_volume_cut_arc(volume, previous_cut, &previous_product);
         let require_complete_live_cut =
             frame_status == FrameStatus::LivePartial && !display_live_chunk_updates;
+        let volume = ensure_advanced_products_on_volume_cuts_arc(
+            volume,
+            [(
+                previous_product.clone(),
+                previous_cut,
+                require_complete_live_cut,
+            )],
+        );
         let (selected_cut, selected_product) =
             selection_for_installed_volume_with_low_sweep_min_seconds(
                 pane.volume.as_deref(),
@@ -12999,6 +13353,14 @@ impl ViewerApp {
                     low_level_min_seconds,
                 },
             );
+        let volume = ensure_advanced_products_on_volume_cuts_arc(
+            volume,
+            [(
+                selected_product.clone(),
+                selected_cut,
+                require_complete_live_cut,
+            )],
+        );
         let site_changed = pane
             .volume
             .as_ref()
@@ -16686,9 +17048,7 @@ impl ViewerApp {
     }
 
     fn set_primary_product_prefer(&mut self, product: DisplayProduct) {
-        if let Some(volume) = self.volume.clone() {
-            self.switch_primary_product(volume.as_ref(), product);
-        } else {
+        if !self.switch_primary_product(product.clone()) {
             self.selected_product = product;
         }
     }
@@ -20983,13 +21343,16 @@ impl ViewerApp {
         let editing_effective_cut =
             best_cut_for_product(volume, editing_cut, &editing_product).unwrap_or(editing_cut);
 
-        let product_buttons = global_displayable_products(volume)
+        let product_buttons = self
+            .displayable_products_for_picker(volume)
             .into_iter()
             .map(|product| {
                 let target_cut = if editing_pane.is_none() {
                     self.preferred_primary_cut_for_product_switch(volume, &product)
                 } else {
-                    cut_for_user_product_switch(volume, editing_effective_cut, &product)
+                    advanced_product_source_cut(volume, editing_effective_cut, &product).or_else(
+                        || cut_for_user_product_switch(volume, editing_effective_cut, &product),
+                    )
                 };
                 (product, target_cut)
             })
@@ -21036,7 +21399,7 @@ impl ViewerApp {
             .map(|(key, label)| (label.clone(), key.clone()))
             .collect();
         ui.horizontal_wrapped(|ui| {
-            for (product, target_cut) in &product_buttons {
+            for (product, _target_cut) in &product_buttons {
                 let selected = editing_product == *product;
                 let label = product.label();
                 let button_text = match hotkey_for_label.get(label) {
@@ -21049,17 +21412,13 @@ impl ViewerApp {
                 }
                 if response.clicked() {
                     if let Some(slot) = editing_pane {
-                        // Keep the old texture anchored while the new product
-                        // renders (the key's product change re-requests).
-                        self.extra_panes[slot].product = product.clone();
-                        if let Some(cut_index) = target_cut {
-                            self.extra_panes[slot].cut = Some(*cut_index);
+                        if self.switch_pane_product(slot, product.clone()) {
+                            ctx.request_repaint();
                         }
-                        self.extra_panes[slot].render_ms = None;
-                        ctx.request_repaint();
                     } else {
-                        self.switch_primary_product(volume, product.clone());
-                        ctx.request_repaint();
+                        if self.switch_primary_product(product.clone()) {
+                            ctx.request_repaint();
+                        }
                     }
                 }
             }
@@ -21112,7 +21471,7 @@ impl ViewerApp {
 
         // Contextual rows: exactly one family block at a time, gated on the
         // FOCUSED pane's product, so the tilt list below barely shifts.
-        if editing_product.color_family() == ColorTableFamily::Velocity {
+        if editing_product.is_signed_radial_velocity() {
             ui.horizontal(|ui| {
                 let plain_velocity =
                     matches!(editing_product, DisplayProduct::Moment(MomentType::Velocity));
@@ -21308,6 +21667,7 @@ impl ViewerApp {
                     }
                     ctx.request_repaint();
                 }
+                let unit_system = self.units();
                 if let Some(threshold) = self.display_thresholds.get_mut(&family_label) {
                     if threshold_range.is_some() {
                         let normalized = normalized_display_threshold(
@@ -21320,8 +21680,11 @@ impl ViewerApp {
                             ctx.request_repaint();
                         }
                     }
-                    let (units, unit_scale) =
-                        table_display_unit(&active_table_for_threshold, &editing_product);
+                    let (units, unit_scale) = table_display_unit(
+                        &active_table_for_threshold,
+                        &editing_product,
+                        unit_system,
+                    );
                     let mut display_threshold = *threshold / unit_scale;
                     let mut drag = egui::DragValue::new(&mut display_threshold)
                         .speed(0.5)
@@ -23262,7 +23625,8 @@ impl ViewerApp {
         );
 
         if let Some(volume) = self.volume.as_ref() {
-            let products = global_displayable_products(volume)
+            let products = self
+                .displayable_products_for_picker(volume)
                 .into_iter()
                 .map(|product| product.label().to_owned())
                 .collect::<Vec<_>>()
@@ -24082,6 +24446,7 @@ impl ViewerApp {
                     let display_unit = table_display_unit(
                         self.active_table_for_product(&readout.product),
                         &readout.product,
+                        self.units(),
                     );
                     format_cursor_readout(readout, self.units(), display_unit, self.time_zone())
                 } else {
@@ -25881,30 +26246,11 @@ impl ViewerApp {
         } else {
             0
         };
-        if step != 0
-            && let Some(volume) = self.volume.as_deref()
-        {
-            let products = global_displayable_products(volume);
-            if products.is_empty() {
-                return;
+        if step != 0 {
+            let slot = pane_index - 1;
+            if self.step_pane_product(slot, step) {
+                ui.ctx().request_repaint();
             }
-            let pane = &mut self.extra_panes[pane_index - 1];
-            let current = products
-                .iter()
-                .position(|product| *product == pane.product)
-                .unwrap_or(0);
-            let next = (current as isize + step).rem_euclid(products.len() as isize) as usize;
-            let next_product = products[next].clone();
-            let preferred_cut = pane.cut.unwrap_or(self.selected_cut);
-            let next_cut = best_cut_for_product(volume, preferred_cut, &next_product);
-            // Keep the old texture (and its anchor key) on screen while the
-            // new product renders — the request guard re-renders because the
-            // key's product differs.
-            pane.product = next_product;
-            if let Some(next_cut) = next_cut {
-                pane.cut = Some(next_cut);
-            }
-            pane.render_ms = None;
         }
     }
 
@@ -31525,8 +31871,7 @@ impl ViewerApp {
         if let Some(table) = self.palette_product_overrides.get(product.label()) {
             render_tables.set_family(product.color_family(), table.clone());
         }
-        if self.flip_velocity_color_polarity && product.color_family() == ColorTableFamily::Velocity
-        {
+        if self.flip_velocity_color_polarity && product.is_signed_radial_velocity() {
             let current = render_tables.for_family(ColorTableFamily::Velocity);
             render_tables.set_family(
                 ColorTableFamily::Velocity,
@@ -33791,8 +34136,7 @@ impl ViewerApp {
         product: &DisplayProduct,
         top_offset: f32,
     ) {
-        let velocity_family = product.color_family() == ColorTableFamily::Velocity;
-        if !velocity_family
+        if !product.is_signed_radial_velocity()
             || self.product_render_uses_dealiased_velocity(product)
             || self.volume.is_none()
         {
@@ -33986,7 +34330,7 @@ impl ViewerApp {
 
         // value ticks + units — both in the table's DECLARED unit space
         // (an mph velocity table ticks in mph under an mph chip).
-        let (unit_label, unit_scale) = table_display_unit(table, product);
+        let (unit_label, unit_scale) = table_display_unit(table, product, self.units());
         let label_color = egui::Color32::from_rgb(214, 220, 228);
         let font = egui::FontId::proportional(11.0);
         let decimals = if (vmax - vmin) / unit_scale < 5.0 {
@@ -34046,7 +34390,7 @@ impl ViewerApp {
 
         // Velocity radial arrow at the probed gate.
         if let Some(readout) = &readout
-            && readout.product.color_family() == ColorTableFamily::Velocity
+            && readout.product.is_signed_radial_velocity()
             && readout.value.is_finite()
             && let Some((radar_lat, radar_lon)) = self.radar_location()
         {
@@ -34082,6 +34426,7 @@ impl ViewerApp {
             let (units, unit_scale) = table_display_unit(
                 self.active_table_for_product(&readout.product),
                 &readout.product,
+                self.units(),
             );
             lines.push(format!(
                 "{} {:.1}{}{}",
@@ -34097,7 +34442,7 @@ impl ViewerApp {
                     .map(|n| format!(" · Nyq {n:.0}"))
                     .unwrap_or_default();
                 lines.push(format!("raw VEL {base:.1} m/s{nyquist}"));
-            } else if readout.product.base_moment() == MomentType::Velocity
+            } else if readout.product.is_signed_radial_velocity()
                 && let Some(nyquist) = readout.nyquist_velocity_mps
                 && readout.value.abs() >= nyquist * 0.75
             {
@@ -34449,7 +34794,7 @@ impl ViewerApp {
         // guard); CC → melting-layer-safe CC section; ZDR → linear-in-dB
         // section; plain REF and the reflectivity-derived volume products
         // (CREF/ET/VIL/VILD) → REF section; SW/PHI/KDP → hint.
-        let velocity = self.selected_product.base_moment() == MomentType::Velocity;
+        let velocity = self.selected_product.is_signed_radial_velocity();
         let cc = self.selected_product.base_moment() == MomentType::CorrelationCoefficient;
         let zdr = self.selected_product.base_moment() == MomentType::DifferentialReflectivity;
         let reflectivity = matches!(
@@ -34756,6 +35101,7 @@ impl ViewerApp {
                 let (unit_label, unit_scale) = table_display_unit(
                     self.active_table_for_product(&readout.product),
                     &readout.product,
+                    self.units(),
                 );
                 let value_line = format!(
                     "{} {:.1}{}{}",
@@ -38055,14 +38401,14 @@ fn coordinate_component_tokens(query: &str) -> Vec<CoordinateComponentToken> {
     for (index, ch) in query.char_indices() {
         if ch.is_ascii_alphanumeric() || ch == '+' || ch == '-' || ch == '.' {
             start.get_or_insert(index);
-        } else if let Some(token_start) = start.take() {
-            if let Some(component) = parse_coordinate_component(&query[token_start..index]) {
-                tokens.push(CoordinateComponentToken {
-                    component,
-                    start: token_start,
-                    end: index,
-                });
-            }
+        } else if let Some(token_start) = start.take()
+            && let Some(component) = parse_coordinate_component(&query[token_start..index])
+        {
+            tokens.push(CoordinateComponentToken {
+                component,
+                start: token_start,
+                end: index,
+            });
         }
     }
     if let Some(token_start) = start
@@ -39377,7 +39723,7 @@ fn velocity_vrot_probe(
     product: &DisplayProduct,
     storm_motion: StormMotion,
 ) -> Option<VrotProbe> {
-    if product.base_moment() != MomentType::Velocity {
+    if !product.is_signed_radial_velocity() {
         return None;
     }
     if grid.gate_range.gate_count == 0 || grid.radial_indices.is_empty() {
@@ -40361,6 +40707,14 @@ fn advanced_derived_color_family(moment: &MomentType) -> Option<ColorTableFamily
     }
 }
 
+fn display_product_is_rain_rate(product: &DisplayProduct) -> bool {
+    use product_engine::DerivedSweepProduct as Product;
+    matches!(
+        advanced_derived_product_for_display_product(product),
+        Some(Product::RainRateReflectivity | Product::RainRateKdp | Product::RainRateHybrid)
+    )
+}
+
 /// The display unit an internal-m/s product takes from the active color
 /// table: a velocity/SW table declared in kt or mph relabels AND rescales
 /// the readout, colorbar ticks, and unit chip — GR2A semantics, where the
@@ -40368,9 +40722,19 @@ fn advanced_derived_color_family(moment: &MomentType) -> Option<ColorTableFamily
 /// an mph table's editor said mph while the map readout stayed m/s).
 /// Returns (label, declared→internal factor — divide internal values by it
 /// for display). Non-m/s products and SI/unknown declarations are identity.
-fn table_display_unit(table: &ColorTable, product: &DisplayProduct) -> (&'static str, f32) {
+fn table_display_unit(
+    table: &ColorTable,
+    product: &DisplayProduct,
+    unit_system: units::Units,
+) -> (&'static str, f32) {
     if matches!(product, DisplayProduct::Derived(DerivedProduct::EchoTops)) {
         return ("kft", METERS_PER_KFT);
+    }
+    if display_product_is_rain_rate(product) {
+        return match unit_system {
+            units::Units::Imperial => ("in/hr", 25.4),
+            units::Units::Metric => ("mm/h", 1.0),
+        };
     }
     let base = product_units(product);
     if base != "m/s" {
@@ -40526,6 +40890,7 @@ fn build_preprocessed_plain_cache(
     previous_volume: Option<&RadarVolume>,
     cut_index: usize,
     moment: &MomentType,
+    family: ColorTableFamily,
     dealiased_velocity: bool,
     dealias_cascade: bool,
     gate_filter_dbz: Option<f32>,
@@ -40564,21 +40929,15 @@ fn build_preprocessed_plain_cache(
                     cut_index,
                     up.grid,
                     &up.row_azimuths_deg,
-                    color_family_for_moment(moment),
+                    family,
                     color_tables,
                 )
                 .map_err(|err| err.to_string());
             }
         }
     }
-    ViewportMomentCache::new_derived(
-        volume,
-        cut_index,
-        source,
-        color_family_for_moment(moment),
-        color_tables,
-    )
-    .map_err(|err| err.to_string())
+    ViewportMomentCache::new_derived(volume, cut_index, source, family, color_tables)
+        .map_err(|err| err.to_string())
 }
 
 fn build_derived_moment_cache(
@@ -41716,12 +42075,35 @@ fn product_order(available: &std::collections::BTreeSet<MomentType>) -> Vec<Disp
         }
     }
     for moment in available {
+        if advanced_derived_product_for_moment(moment).is_some() {
+            continue;
+        }
         let product = DisplayProduct::Moment(moment.clone());
         if !ordered.contains(&product) {
             ordered.push(product);
         }
     }
     ordered
+}
+
+fn retain_non_advanced_products(products: &mut Vec<DisplayProduct>) {
+    products.retain(|product| advanced_derived_product_for_display_product(product).is_none());
+}
+
+fn append_present_advanced_products(
+    products: &mut Vec<DisplayProduct>,
+    available: &std::collections::BTreeSet<MomentType>,
+) {
+    for product in product_engine::DerivedSweepProduct::ALL.iter().copied() {
+        let Some(display_product) = advanced_derived_display_product(product) else {
+            continue;
+        };
+        if available.contains(&display_product.base_moment())
+            && !products.contains(&display_product)
+        {
+            products.push(display_product);
+        }
+    }
 }
 
 fn global_displayable_products(volume: &RadarVolume) -> Vec<DisplayProduct> {
@@ -41740,6 +42122,38 @@ fn global_displayable_products(volume: &RadarVolume) -> Vec<DisplayProduct> {
     for d in DerivedProduct::ALL {
         if available.contains(&d.base_moment()) {
             products.push(DisplayProduct::Derived(d));
+        }
+    }
+    append_present_advanced_products(&mut products, &available);
+    products
+}
+
+fn global_displayable_products_with_advanced(
+    volume: &RadarVolume,
+    include_advanced_placeholders: bool,
+) -> Vec<DisplayProduct> {
+    let mut products = global_displayable_products(volume);
+    retain_non_advanced_products(&mut products);
+    if !include_advanced_placeholders {
+        let mut available = std::collections::BTreeSet::new();
+        for cut_index in 0..volume.cuts.len() {
+            available.extend(
+                displayable_products(volume, cut_index)
+                    .into_iter()
+                    .map(|product| product.base_moment()),
+            );
+        }
+        append_present_advanced_products(&mut products, &available);
+        return products;
+    }
+    for product in product_engine::DerivedSweepProduct::ALL.iter().copied() {
+        let Some(display_product) = advanced_derived_display_product(product) else {
+            continue;
+        };
+        if volume_has_displayable_product(volume, &display_product)
+            || volume_has_advanced_product_sources(volume, product)
+        {
+            products.push(display_product);
         }
     }
     products
@@ -44298,6 +44712,7 @@ fn displayable_products(volume: &RadarVolume, cut_index: usize) -> Vec<DisplayPr
             products.push(DisplayProduct::Derived(d));
         }
     }
+    append_present_advanced_products(&mut products, &available);
     products
 }
 
@@ -44333,7 +44748,7 @@ fn radial_collection_time_from_volume_time_utc(
 
 fn displayable_cuts_for_product(volume: &RadarVolume, product: &DisplayProduct) -> Vec<usize> {
     (0..volume.cuts.len())
-        .filter(|index| is_displayable_on_cut(volume, *index, product))
+        .filter(|index| can_materialize_product_on_cut(volume, *index, product))
         .collect()
 }
 
@@ -44375,7 +44790,7 @@ fn sweep_cuts_for_product(
                     || (cut.elevation_deg.is_finite()
                         && cut.elevation_deg >= min_elevation
                         && cut.elevation_deg <= max_elevation);
-                complete && in_range && is_displayable_on_cut(volume, *index, product)
+                complete && in_range && can_materialize_product_on_cut(volume, *index, product)
             })
         })
         .collect::<Vec<_>>();
@@ -44830,6 +45245,7 @@ fn product_hotkey_sort_key(name: &str) -> (u8, u8, String) {
     }
 }
 
+#[cfg(test)]
 fn stepped_product<'a>(
     products: &'a [DisplayProduct],
     current: &DisplayProduct,
@@ -44867,6 +45283,78 @@ fn is_displayable_on_cut(volume: &RadarVolume, cut_index: usize, product: &Displ
         return false;
     };
     grid.radial_count() >= displayable_radial_threshold(cut.radials.len())
+}
+
+fn can_materialize_product_on_cut(
+    volume: &RadarVolume,
+    cut_index: usize,
+    product: &DisplayProduct,
+) -> bool {
+    if is_displayable_on_cut(volume, cut_index, product) {
+        return true;
+    }
+    let Some(derived) = advanced_derived_product_for_display_product(product) else {
+        return false;
+    };
+    volume
+        .cuts
+        .get(cut_index)
+        .is_some_and(|cut| cut_has_advanced_product_sources(cut, derived))
+}
+
+fn advanced_product_source_cut(
+    volume: &RadarVolume,
+    current_cut: usize,
+    product: &DisplayProduct,
+) -> Option<usize> {
+    advanced_product_source_cut_with_live_filter(volume, current_cut, product, false)
+}
+
+fn advanced_product_source_cut_with_live_filter(
+    volume: &RadarVolume,
+    current_cut: usize,
+    product: &DisplayProduct,
+    require_complete_live_cut: bool,
+) -> Option<usize> {
+    advanced_derived_product_for_display_product(product)?;
+    if can_materialize_product_on_live_candidate_cut(
+        volume,
+        current_cut,
+        product,
+        require_complete_live_cut,
+    ) {
+        return Some(current_cut);
+    }
+    let current_elevation = volume.cuts.get(current_cut).map(|cut| cut.elevation_deg);
+    volume
+        .cuts
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            can_materialize_product_on_live_candidate_cut(
+                volume,
+                *index,
+                product,
+                require_complete_live_cut,
+            )
+        })
+        .min_by(|(left_index, left_cut), (right_index, right_cut)| {
+            let left_delta = current_elevation
+                .map(|elevation| (left_cut.elevation_deg - elevation).abs())
+                .unwrap_or(*left_index as f32);
+            let right_delta = current_elevation
+                .map(|elevation| (right_cut.elevation_deg - elevation).abs())
+                .unwrap_or(*right_index as f32);
+            left_delta
+                .total_cmp(&right_delta)
+                .then_with(|| {
+                    left_index
+                        .abs_diff(current_cut)
+                        .cmp(&right_index.abs_diff(current_cut))
+                })
+                .then_with(|| left_index.cmp(right_index))
+        })
+        .map(|(index, _)| index)
 }
 
 fn displayable_radial_threshold(cut_radials: usize) -> usize {
@@ -44963,7 +45451,7 @@ fn selection_for_installed_volume_with_low_sweep_min_seconds(
         return (next_cut, previous_product.clone());
     }
     if same_site
-        && is_displayable_on_live_candidate_cut(
+        && can_materialize_product_on_live_candidate_cut(
             volume,
             previous_cut,
             previous_product,
@@ -45018,7 +45506,7 @@ fn latest_newer_low_level_cut(
                     allow_incomplete_live_chunk_advance,
                 ) && (cut.elevation_deg - previous_elevation_deg).abs()
                     <= LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG
-            }) && is_displayable_on_cut(volume, *cut_index, previous_product)
+            }) && can_materialize_product_on_cut(volume, *cut_index, previous_product)
         })
         .filter_map(|cut_index| {
             let cut_time = cut_start_time_utc(volume, cut_index)?;
@@ -45049,20 +45537,21 @@ fn should_defer_live_partial_selection_for_active_product(
     }
 
     if require_selected_cut {
-        if !is_displayable_on_cut(active_volume, selected_cut, selected_product) {
+        if !can_materialize_product_on_cut(active_volume, selected_cut, selected_product) {
             return false;
         }
-        !is_displayable_on_live_candidate_cut(
+        !can_materialize_product_on_live_candidate_cut(
             candidate.volume.as_ref(),
             selected_cut,
             selected_product,
             true,
         )
     } else {
-        if !volume_has_displayable_product(active_volume, selected_product) {
+        if !volume_can_materialize_product_with_live_filter(active_volume, selected_product, false)
+        {
             return false;
         }
-        !volume_has_displayable_product_with_live_filter(
+        !volume_can_materialize_product_with_live_filter(
             candidate.volume.as_ref(),
             selected_product,
             true,
@@ -45081,6 +45570,21 @@ fn volume_has_displayable_product_with_live_filter(
 ) -> bool {
     (0..volume.cuts.len()).any(|cut_index| {
         is_displayable_on_live_candidate_cut(volume, cut_index, product, require_complete_live_cut)
+    })
+}
+
+fn volume_can_materialize_product_with_live_filter(
+    volume: &RadarVolume,
+    product: &DisplayProduct,
+    require_complete_live_cut: bool,
+) -> bool {
+    (0..volume.cuts.len()).any(|cut_index| {
+        can_materialize_product_on_live_candidate_cut(
+            volume,
+            cut_index,
+            product,
+            require_complete_live_cut,
+        )
     })
 }
 
@@ -45116,8 +45620,12 @@ fn best_cut_for_product_with_live_filter(
     product: &DisplayProduct,
     require_complete_live_cut: bool,
 ) -> Option<usize> {
-    if is_displayable_on_live_candidate_cut(volume, current_cut, product, require_complete_live_cut)
-    {
+    if can_materialize_product_on_live_candidate_cut(
+        volume,
+        current_cut,
+        product,
+        require_complete_live_cut,
+    ) {
         return Some(current_cut);
     }
     let current_elevation = volume.cuts.get(current_cut).map(|cut| cut.elevation_deg);
@@ -45126,7 +45634,12 @@ fn best_cut_for_product_with_live_filter(
         .iter()
         .enumerate()
         .filter(|(index, _)| {
-            is_displayable_on_live_candidate_cut(volume, *index, product, require_complete_live_cut)
+            can_materialize_product_on_live_candidate_cut(
+                volume,
+                *index,
+                product,
+                require_complete_live_cut,
+            )
         })
         .min_by(|(left_index, left_cut), (right_index, right_cut)| {
             let left_delta = current_elevation
@@ -45161,6 +45674,20 @@ fn is_displayable_on_live_candidate_cut(
             .cuts
             .get(cut_index)
             .is_some_and(|cut| is_complete_live_candidate_tilt_for_site(cut, &volume.site.id))
+}
+
+fn can_materialize_product_on_live_candidate_cut(
+    volume: &RadarVolume,
+    cut_index: usize,
+    product: &DisplayProduct,
+    require_complete_live_cut: bool,
+) -> bool {
+    can_materialize_product_on_cut(volume, cut_index, product)
+        && (!require_complete_live_cut
+            || volume
+                .cuts
+                .get(cut_index)
+                .is_some_and(|cut| is_complete_live_candidate_tilt_for_site(cut, &volume.site.id)))
 }
 
 fn is_complete_live_candidate_tilt_for_site(cut: &ElevationCut, site_id: &str) -> bool {
@@ -47385,7 +47912,7 @@ mod tests {
         )
         .expect("mph table parses");
         let product = DisplayProduct::Moment(MomentType::Velocity);
-        let (label, scale) = table_display_unit(&mph, &product);
+        let (label, scale) = table_display_unit(&mph, &product, units::Units::Imperial);
         assert_eq!(label, "mph");
         // Stops scaled into m/s at parse; display divides back to ±89.
         let vmax = mph.stops().last().expect("stops").value;
@@ -47398,10 +47925,38 @@ mod tests {
 
         let si = ColorTable::parse_gr_pal("SI VEL", "Color: -30 1 2 3\nColor: 30 4 5 6\n")
             .expect("si table parses");
-        assert_eq!(table_display_unit(&si, &product), ("m/s", 1.0));
+        assert_eq!(
+            table_display_unit(&si, &product, units::Units::Imperial),
+            ("m/s", 1.0)
+        );
         // Non-m/s products never rescale off the table's declaration.
         let dbz = DisplayProduct::Moment(MomentType::Reflectivity);
-        assert_eq!(table_display_unit(&mph, &dbz), ("dBZ", 1.0));
+        assert_eq!(
+            table_display_unit(&mph, &dbz, units::Units::Imperial),
+            ("dBZ", 1.0)
+        );
+    }
+
+    #[test]
+    fn rain_rate_display_units_follow_app_unit_preference() {
+        let table_set = ColorTableSet::default();
+        for derived in [
+            product_engine::DerivedSweepProduct::RainRateReflectivity,
+            product_engine::DerivedSweepProduct::RainRateKdp,
+            product_engine::DerivedSweepProduct::RainRateHybrid,
+        ] {
+            let product = DisplayProduct::Moment(derived.moment_type());
+            let table = table_set.for_family(product.color_family());
+            assert_eq!(product_units(&product), "mm/h");
+            assert_eq!(
+                table_display_unit(table, &product, units::Units::Metric),
+                ("mm/h", 1.0)
+            );
+            assert_eq!(
+                table_display_unit(table, &product, units::Units::Imperial),
+                ("in/hr", 25.4)
+            );
+        }
     }
 
     #[test]
@@ -47413,7 +47968,10 @@ mod tests {
         ] {
             assert_eq!(product.color_family(), ColorTableFamily::Probability);
             let table = table_set.for_family(product.color_family());
-            assert_eq!(table_display_unit(table, &product), ("%", 1.0));
+            assert_eq!(
+                table_display_unit(table, &product, units::Units::Imperial),
+                ("%", 1.0)
+            );
             assert_eq!(table.stops().first().map(|stop| stop.value), Some(0.0));
             assert_eq!(table.stops().last().map(|stop| stop.value), Some(100.0));
         }
@@ -47424,7 +47982,7 @@ mod tests {
         let table_set = ColorTableSet::default();
         let product = DisplayProduct::Derived(DerivedProduct::EchoTops);
         let table = table_set.for_family(product.color_family());
-        let (label, scale) = table_display_unit(table, &product);
+        let (label, scale) = table_display_unit(table, &product, units::Units::Imperial);
 
         assert_eq!(product_units(&product), "m");
         assert_eq!(label, "kft");
@@ -48476,6 +49034,7 @@ mod tests {
                 None,
                 0,
                 &MomentType::Reflectivity,
+                ColorTableFamily::Reflectivity,
                 false,
                 false,
                 None,
@@ -49309,10 +49868,7 @@ mod tests {
         app.app_settings.remember_product_tilts = true;
         app.product_cut_memory.insert("REF".to_owned(), 0);
 
-        assert!(!app.switch_primary_product(
-            volume.as_ref(),
-            DisplayProduct::Moment(MomentType::Reflectivity)
-        ));
+        assert!(!app.switch_primary_product(DisplayProduct::Moment(MomentType::Reflectivity)));
         assert_eq!(
             app.selected_cut, 2,
             "clicking or hotkeying the already-selected product must not jump to remembered/base tilt"
@@ -49383,6 +49939,51 @@ mod tests {
                 false,
             ),
             "ordinary next-scan live refresh may advance to a complete low VEL cut"
+        );
+    }
+
+    #[test]
+    fn live_partial_defer_accepts_uninserted_advanced_product_sources() {
+        let active = test_advanced_source_volume_with_radials(
+            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            720,
+            24,
+        );
+        let partial = Arc::new(test_advanced_source_volume_with_radials(
+            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH + chrono::Duration::minutes(1),
+            720,
+            24,
+        ));
+        let product = advanced_derived_display_product(
+            product_engine::DerivedSweepProduct::FilteredDifferentialPhase,
+        )
+        .expect("PHIF display product");
+        let frame = FrameHistoryEntry {
+            identity: frame_identity_for_volume(partial.as_ref()),
+            path: PathBuf::from("partial-phif-source"),
+            volume: Arc::clone(&partial),
+            timings: None,
+            status: FrameStatus::LivePartial,
+            source_label: "test".to_owned(),
+        };
+
+        assert!(
+            !is_displayable_on_cut(partial.as_ref(), 0, &product),
+            "the candidate intentionally has only source PHI, not inserted PHIF"
+        );
+        assert!(
+            can_materialize_product_on_live_candidate_cut(partial.as_ref(), 0, &product, true),
+            "live partial checks must accept source-compatible advanced products"
+        );
+        assert!(
+            !should_defer_live_partial_selection_for_active_product(
+                Some(&active),
+                0,
+                &product,
+                Some(&frame),
+                true,
+            ),
+            "a complete live cut with PHI sources should not be deferred just because PHIF is not inserted yet"
         );
     }
 
@@ -57071,15 +57672,23 @@ mod tests {
     }
 
     fn test_advanced_source_volume(volume_time: DateTime<Utc>) -> RadarVolume {
+        test_advanced_source_volume_with_radials(volume_time, 4, 24)
+    }
+
+    fn test_advanced_source_volume_with_radials(
+        volume_time: DateTime<Utc>,
+        radial_count: usize,
+        gate_count: usize,
+    ) -> RadarVolume {
         let gate_range = radar_core::GateRange {
             first_gate_m: 1000,
             gate_spacing_m: 500,
-            gate_count: 24,
+            gate_count,
         };
         let mut cut = ElevationCut::new(0.5, Some(1));
-        for radial in 0..4 {
+        for radial in 0..radial_count {
             cut.radials.push(radar_core::Radial {
-                azimuth_deg: radial as f32 * 90.0,
+                azimuth_deg: radial as f32 * 360.0 / radial_count.max(1) as f32,
                 elevation_deg: 0.5,
                 time_offset_ms: radial as i32 * 250,
                 gate_range: gate_range.clone(),
@@ -57132,6 +57741,101 @@ mod tests {
         assert!(products.contains(&phif), "{products:?}");
         assert_eq!(product_units(&phif), "deg");
         assert_eq!(phif.color_family(), ColorTableFamily::DifferentialPhase);
+    }
+
+    #[test]
+    fn advanced_product_picker_order_stays_stable_after_materializing_product() {
+        let volume = Arc::new(test_advanced_source_volume(Utc::now()));
+        let advanced_labels = |volume: &RadarVolume| {
+            global_displayable_products_with_advanced(volume, true)
+                .into_iter()
+                .filter(|product| advanced_derived_product_for_display_product(product).is_some())
+                .map(|product| product.label().to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let before = advanced_labels(volume.as_ref());
+        let (derived, inserted) = derive_advanced_product_for_volume_cut_arc(
+            &volume,
+            0,
+            product_engine::DerivedSweepProduct::FilteredDifferentialPhase,
+        )
+        .expect("derive PHIF");
+        let after = advanced_labels(derived.as_ref());
+
+        assert!(inserted > 0);
+        assert!(
+            before.first().is_some_and(|label| label == "PHIF"),
+            "{before:?}"
+        );
+        assert_eq!(
+            after, before,
+            "materializing PHIF must not move the advanced block while arrow-cycling"
+        );
+    }
+
+    #[test]
+    fn advanced_product_arrow_cycle_leaves_materialized_phif_cleanly() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(Arc::new(test_advanced_source_volume(Utc::now())));
+        app.advanced_products_enabled = true;
+        let phif = DisplayProduct::Moment(MomentType::Unknown("PHIF".to_owned()));
+
+        assert!(app.switch_primary_product(phif.clone()));
+        assert_eq!(app.selected_product, phif);
+        assert!(is_displayable_on_cut(
+            app.volume.as_ref().expect("volume"),
+            app.selected_cut,
+            &app.selected_product
+        ));
+
+        assert!(app.step_product(1));
+        assert_ne!(
+            app.selected_product, phif,
+            "stepping from PHIF should not sanitize back into the same product"
+        );
+        assert!(
+            is_displayable_on_cut(
+                app.volume.as_ref().expect("volume"),
+                app.selected_cut,
+                &app.selected_product
+            ),
+            "arrow cycle landed on non-displayable {} cut {}",
+            app.selected_product.label(),
+            app.selected_cut
+        );
+    }
+
+    #[test]
+    fn extra_pane_advanced_product_cycle_skips_unmaterializable_candidates() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(Arc::new(test_advanced_source_volume(Utc::now())));
+        app.advanced_products_enabled = true;
+        app.extra_panes.push(ViewPane::new(DisplayProduct::Moment(
+            MomentType::Reflectivity,
+        )));
+        let phif = DisplayProduct::Moment(MomentType::Unknown("PHIF".to_owned()));
+
+        assert!(app.switch_pane_product(0, phif.clone()));
+        assert_eq!(app.extra_panes[0].product, phif);
+
+        assert!(app.step_pane_product(0, 1));
+        let pane_product = app.extra_panes[0].product.clone();
+        let pane_cut = app.extra_panes[0].cut.expect("pane cut");
+        assert_ne!(
+            pane_product, phif,
+            "pane product stepping should not stay trapped on PHIF"
+        );
+        assert!(
+            is_displayable_on_cut(
+                app.volume.as_ref().expect("volume"),
+                pane_cut,
+                &pane_product
+            ),
+            "pane cycle landed on non-displayable {} cut {}",
+            pane_product.label(),
+            pane_cut
+        );
     }
 
     #[test]
@@ -59079,6 +59783,7 @@ mod tests {
             volume: None,
             selected_cut: 0,
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
+            advanced_products_enabled: false,
             frame_history: Vec::new(),
             selected_frame_index: 0,
             low_sweep_disabled_cuts: BTreeSet::new(),

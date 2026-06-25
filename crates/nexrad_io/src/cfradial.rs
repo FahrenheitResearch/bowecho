@@ -92,6 +92,7 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
     );
     volume.metadata.compression = Some("cfradial1-netcdf3".to_owned());
     volume.metadata.scan_mode = combined_scan_mode(&sweep_modes);
+    volume.metadata.radar_frequency_mhz = cfradial_radar_frequency_mhz(&file);
 
     // Ray times (seconds offset from time_coverage_start).
     let ray_seconds = read_f64s(&file, "time").ok();
@@ -296,6 +297,56 @@ fn parse_time_coverage_start(file: &Nc3File<'_>) -> Option<DateTime<Utc>> {
         .or_else(|_| NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S"))
         .ok()?;
     Some(Utc.from_utc_datetime(&naive))
+}
+
+fn cfradial_radar_frequency_mhz(file: &Nc3File<'_>) -> Option<u32> {
+    for name in [
+        "radar_frequency",
+        "frequency",
+        "frequency_ghz",
+        "instrument_frequency",
+    ] {
+        if let Some(value) = file.gattr_f64(name)
+            && let Some(mhz) = normalize_frequency_mhz(value)
+        {
+            return Some(mhz);
+        }
+    }
+    for name in ["radar_wavelength", "radar_wavelength_cm", "wavelength"] {
+        if let Some(value) = file.gattr_f64(name)
+            && let Some(mhz) = frequency_mhz_from_wavelength(value)
+        {
+            return Some(mhz);
+        }
+    }
+    None
+}
+
+fn normalize_frequency_mhz(value: f64) -> Option<u32> {
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    let mhz = if value > 1.0e6 {
+        value / 1.0e6
+    } else if value > 1000.0 {
+        value
+    } else {
+        value * 1000.0
+    };
+    (1000.0..=12_000.0)
+        .contains(&mhz)
+        .then_some(mhz.round() as u32)
+}
+
+fn frequency_mhz_from_wavelength(value: f64) -> Option<u32> {
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    let meters = if value > 1.0 { value / 100.0 } else { value };
+    let mhz = 299.792_458 / meters;
+    (1000.0..=12_000.0)
+        .contains(&mhz)
+        .then_some(mhz.round() as u32)
 }
 
 fn invalid(reason: impl Into<String>) -> NexradError {

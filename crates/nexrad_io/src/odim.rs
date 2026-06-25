@@ -69,6 +69,7 @@ pub fn decode_odim_h5_volume(bytes: &[u8]) -> Result<RadarVolume> {
         .or(Some("ODIM_H5".to_owned()));
     volume.metadata.compression = Some("odim-h5".to_owned());
     volume.metadata.scan_mode = Some(ScanMode::Ppi);
+    volume.metadata.radar_frequency_mhz = odim_radar_frequency_mhz(&file);
     let root_nyquist = attr_f64(&file, "/how", "NI");
 
     let mut dataset_names: Vec<String> = file
@@ -394,6 +395,51 @@ fn parse_datetime(file: &H5File<'_>, group: &str) -> Option<chrono::DateTime<Utc
 
 fn attr_f64(file: &H5File<'_>, path: &str, name: &str) -> Option<f64> {
     file.attr(path, name).as_ref().and_then(H5Attr::as_f64)
+}
+
+fn odim_radar_frequency_mhz(file: &H5File<'_>) -> Option<u32> {
+    for name in ["frequency", "freq", "radar_frequency", "radar_frequency_hz"] {
+        if let Some(value) = attr_f64(file, "/how", name)
+            && let Some(mhz) = normalize_frequency_mhz(value)
+        {
+            return Some(mhz);
+        }
+    }
+    for name in ["wavelength", "radar_wavelength", "wavelength_cm"] {
+        if let Some(value) = attr_f64(file, "/how", name)
+            && let Some(mhz) = frequency_mhz_from_wavelength(value)
+        {
+            return Some(mhz);
+        }
+    }
+    None
+}
+
+fn normalize_frequency_mhz(value: f64) -> Option<u32> {
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    let mhz = if value > 1.0e6 {
+        value / 1.0e6
+    } else if value > 1000.0 {
+        value
+    } else {
+        value * 1000.0
+    };
+    (1000.0..=12_000.0)
+        .contains(&mhz)
+        .then_some(mhz.round() as u32)
+}
+
+fn frequency_mhz_from_wavelength(value: f64) -> Option<u32> {
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    let meters = if value > 1.0 { value / 100.0 } else { value };
+    let mhz = 299.792_458 / meters;
+    (1000.0..=12_000.0)
+        .contains(&mhz)
+        .then_some(mhz.round() as u32)
 }
 
 fn invalid(reason: impl Into<String>) -> NexradError {

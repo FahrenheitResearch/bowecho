@@ -834,6 +834,10 @@ impl SweepParse {
                 .to_owned(),
             );
             volume.metadata.scan_mode = Some(scan_mode_from_radd(self.scan_mode));
+            volume.metadata.radar_frequency_mhz = self
+                .frequency_ghz
+                .filter(|frequency| frequency.is_finite() && *frequency > 0.0)
+                .map(|frequency| (frequency * 1000.0).round() as u32);
         } else if volume.site.id != self.instrument {
             return Err(invalid(
                 0,

@@ -744,6 +744,11 @@ pub struct VolumeMetadata {
     /// (`None` for formats that do not declare it, e.g. Archive II).
     #[serde(default)]
     pub scan_mode: Option<ScanMode>,
+    /// Transmit frequency rounded to MHz, when the source format declares it.
+    /// Used by downstream polarimetric derivations to choose S/C/X-band
+    /// coefficients without hard-coding every radar network.
+    #[serde(default)]
+    pub radar_frequency_mhz: Option<u32>,
 }
 
 /// Earth's mean radius (m).

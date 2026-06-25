@@ -308,6 +308,10 @@ impl<'a> Nc3File<'a> {
         self.gattrs.get(name).and_then(NcValue::as_str)
     }
 
+    pub fn gattr_f64(&self, name: &str) -> Option<f64> {
+        self.gattrs.get(name).and_then(NcValue::as_f64)
+    }
+
     /// Resolved dimension lengths of a variable (record dim → numrecs).
     pub fn var_dims(&self, var: &NcVar) -> Vec<usize> {
         var.dim_ids

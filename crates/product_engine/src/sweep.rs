@@ -765,7 +765,7 @@ pub fn derive_cut_in_place(
             DerivedSweepProduct::VelocityRangeGradient => cut
                 .moments
                 .get(&MomentType::Velocity)
-                .map(|source| range_gradient_grid(source, output_moment.clone())),
+                .map(|source| velocity_range_gradient_grid(cut, source, output_moment.clone())),
             DerivedSweepProduct::MeteorologicalQuality => {
                 meteorological_quality_grid(cut, output_moment.clone())
             }
@@ -880,7 +880,11 @@ fn derive_phase_bundle(cut: &ElevationCut, config: &KdpConfig) -> Option<PhaseBu
             original_valid[gate] = true;
         }
 
-        unwrap_phase_in_place(&mut values, config.phase_period_deg);
+        unwrap_phase_in_place(
+            &mut values,
+            config.phase_period_deg,
+            config.max_interpolated_gap_gates,
+        );
         fill_short_gaps_in_place(&mut values, config.max_interpolated_gap_gates);
         let values = hampel_filter(&values, config.hampel_half_window, config.hampel_sigma);
 
@@ -909,14 +913,13 @@ fn derive_phase_bundle(cut: &ElevationCut, config: &KdpConfig) -> Option<PhaseBu
             else {
                 continue;
             };
-            let kdp = (0.5 * fit.slope) as f32;
-            if !kdp.is_finite() || kdp < config.kdp_min_deg_km || kdp > config.kdp_max_deg_km {
-                continue;
-            }
             let index = row * gates + gate;
             filtered_values[index] = fit.intercept as f32;
-            kdp_values[index] = kdp;
-            uncertainty_values[index] = (0.5 * fit.slope_standard_error) as f32;
+            let kdp = (0.5 * fit.slope) as f32;
+            if kdp.is_finite() && kdp >= config.kdp_min_deg_km && kdp <= config.kdp_max_deg_km {
+                kdp_values[index] = kdp;
+                uncertainty_values[index] = (0.5 * fit.slope_standard_error) as f32;
+            }
         }
     }
 
@@ -953,17 +956,26 @@ fn regression_window_gates(config: &KdpConfig, spacing_km: f32) -> usize {
     gates
 }
 
-fn unwrap_phase_in_place(values: &mut [f32], period_deg: f32) {
+fn unwrap_phase_in_place(values: &mut [f32], period_deg: f32, max_gap: usize) {
     if !period_deg.is_finite() || period_deg <= 0.0 {
         return;
     }
     let mut previous = None::<f32>;
-    for value in values.iter_mut().filter(|value| value.is_finite()) {
+    let mut gap = 0usize;
+    for value in values.iter_mut() {
+        if !value.is_finite() {
+            gap = gap.saturating_add(1);
+            continue;
+        }
+        if gap > max_gap {
+            previous = None;
+        }
         if let Some(last) = previous {
             let wraps = ((*value - last) / period_deg).round();
             *value -= wraps * period_deg;
         }
         previous = Some(*value);
+        gap = 0;
     }
 }
 
@@ -1027,8 +1039,12 @@ fn hampel_filter(values: &[f32], half_window: usize, sigma_threshold: f32) -> Ve
             continue;
         };
         let robust_sigma = 1.4826 * mad;
-        if robust_sigma > 1.0e-4 && (value - median).abs() > sigma_threshold.max(0.0) * robust_sigma
-        {
+        let outlier = if robust_sigma > 1.0e-4 {
+            (value - median).abs() > sigma_threshold.max(0.0) * robust_sigma
+        } else {
+            (value - median).abs() > sigma_threshold.max(1.0)
+        };
+        if outlier {
             filtered[index] = median;
         }
     }
@@ -1711,6 +1727,33 @@ fn wrapped_delta(delta: f32, period: f32) -> f32 {
 }
 
 fn range_gradient_grid(source: &MomentGrid, moment: MomentType) -> MomentGrid {
+    range_gradient_grid_with_period(source, moment, |_| None)
+}
+
+fn velocity_range_gradient_grid(
+    cut: &ElevationCut,
+    source: &MomentGrid,
+    moment: MomentType,
+) -> MomentGrid {
+    range_gradient_grid_with_period(source, moment, |row| {
+        source
+            .radial_indices
+            .get(row)
+            .and_then(|radial_index| cut.radials.get(*radial_index))
+            .and_then(|radial| radial.nyquist_velocity_mps)
+            .map(|nyquist| 2.0 * nyquist.abs())
+            .filter(|period| *period > 0.0 && period.is_finite())
+    })
+}
+
+fn range_gradient_grid_with_period<F>(
+    source: &MomentGrid,
+    moment: MomentType,
+    period_for_row: F,
+) -> MomentGrid
+where
+    F: Fn(usize) -> Option<f32>,
+{
     let rows = source.radial_count();
     let gates = source.gate_range.gate_count;
     let spacing_km = source.gate_range.gate_spacing_m as f32 / 1000.0;
@@ -1719,6 +1762,7 @@ fn range_gradient_grid(source: &MomentGrid, moment: MomentType) -> MomentGrid {
         return f32_grid_like(source, moment, out);
     }
     for row in 0..rows {
+        let period = period_for_row(row);
         for gate in 0..gates {
             let left = (1..=2).find_map(|distance| {
                 gate.checked_sub(distance).and_then(|index| {
@@ -1738,17 +1782,22 @@ fn range_gradient_grid(source: &MomentGrid, moment: MomentType) -> MomentGrid {
             });
             let gradient = match (left, right) {
                 (Some((left_gate, left_value)), Some((right_gate, right_value))) => Some(
-                    (right_value - left_value) / ((right_gate - left_gate) as f32 * spacing_km),
+                    range_delta(left_value, right_value, period)
+                        / ((right_gate - left_gate) as f32 * spacing_km),
                 ),
                 (Some((left_gate, left_value)), None) => source
                     .scaled_value(row, gate)
                     .filter(|value| value.is_finite())
-                    .map(|center| (center - left_value) / ((gate - left_gate) as f32 * spacing_km)),
+                    .map(|center| {
+                        range_delta(left_value, center, period)
+                            / ((gate - left_gate) as f32 * spacing_km)
+                    }),
                 (None, Some((right_gate, right_value))) => source
                     .scaled_value(row, gate)
                     .filter(|value| value.is_finite())
                     .map(|center| {
-                        (right_value - center) / ((right_gate - gate) as f32 * spacing_km)
+                        range_delta(center, right_value, period)
+                            / ((right_gate - gate) as f32 * spacing_km)
                     }),
                 (None, None) => None,
             };
@@ -1760,6 +1809,13 @@ fn range_gradient_grid(source: &MomentGrid, moment: MomentType) -> MomentGrid {
         }
     }
     f32_grid_like(source, moment, out)
+}
+
+fn range_delta(left: f32, right: f32, period: Option<f32>) -> f32 {
+    let delta = right - left;
+    period
+        .map(|period| wrapped_delta(delta, period))
+        .unwrap_or(delta)
 }
 
 fn meteorological_quality_grid(cut: &ElevationCut, moment: MomentType) -> Option<MomentGrid> {
@@ -2069,10 +2125,20 @@ mod tests {
     #[test]
     fn unwraps_phase_crossing_zero() {
         let mut values = vec![350.0, 355.0, 2.0, 7.0, f32::NAN, 12.0];
-        unwrap_phase_in_place(&mut values, 360.0);
+        unwrap_phase_in_place(&mut values, 360.0, 8);
         assert!((values[2] - 362.0).abs() < 1.0e-5);
         assert!((values[3] - 367.0).abs() < 1.0e-5);
         assert!((values[5] - 372.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn unwrap_does_not_bridge_long_missing_phase_gap() {
+        let mut values = vec![350.0, 355.0, f32::NAN, f32::NAN, f32::NAN, 2.0, 7.0];
+        unwrap_phase_in_place(&mut values, 360.0, 2);
+        assert!((values[0] - 350.0).abs() < 1.0e-5);
+        assert!((values[1] - 355.0).abs() < 1.0e-5);
+        assert!((values[5] - 2.0).abs() < 1.0e-5);
+        assert!((values[6] - 7.0).abs() < 1.0e-5);
     }
 
     #[test]
@@ -2167,6 +2233,88 @@ mod tests {
         assert_eq!(
             cut.moments[&MomentType::SpecificDifferentialPhase].scaled_value(0, 5),
             Some(9.0)
+        );
+    }
+
+    #[test]
+    fn filtered_phase_survives_when_kdp_is_out_of_bounds() {
+        let gates = 101;
+        let spacing_m = 250;
+        let too_large_kdp = 30.0f32;
+        let phi = (0..gates)
+            .map(|gate| {
+                let range_km = gate as f32 * spacing_m as f32 / 1000.0;
+                (40.0 + 2.0 * too_large_kdp * range_km).rem_euclid(360.0)
+            })
+            .collect::<Vec<_>>();
+        let mut cut = cut_with_rows(1, gates, spacing_m);
+        cut.moments.insert(
+            MomentType::DifferentialPhase,
+            f32_grid(MomentType::DifferentialPhase, vec![phi], spacing_m),
+        );
+        cut.moments.insert(
+            MomentType::CorrelationCoefficient,
+            f32_grid(
+                MomentType::CorrelationCoefficient,
+                vec![vec![0.99; gates]],
+                spacing_m,
+            ),
+        );
+        cut.moments.insert(
+            MomentType::Reflectivity,
+            f32_grid(MomentType::Reflectivity, vec![vec![40.0; gates]], spacing_m),
+        );
+
+        let config = DerivationConfig::with_products(
+            RadarBand::S,
+            [
+                DerivedSweepProduct::Kdp,
+                DerivedSweepProduct::FilteredDifferentialPhase,
+            ],
+        );
+        let report = derive_cut_in_place(&mut cut, &config);
+        assert_eq!(report.inserted, vec!["KDP", "PHIF"]);
+        let phif = cut
+            .moments
+            .get(&DerivedSweepProduct::FilteredDifferentialPhase.moment_type())
+            .unwrap();
+        let kdp = cut
+            .moments
+            .get(&MomentType::SpecificDifferentialPhase)
+            .unwrap();
+        assert!(phif.scaled_value(0, 40).unwrap().is_finite());
+        assert!(kdp.scaled_value(0, 40).unwrap().is_nan());
+    }
+
+    #[test]
+    fn hampel_filter_removes_spike_in_flat_window() {
+        let values = vec![5.0, 5.0, 5.0, 50.0, 5.0, 5.0, 5.0];
+        let filtered = hampel_filter(&values, 3, 3.0);
+        assert_eq!(filtered[3], 5.0);
+    }
+
+    #[test]
+    fn velocity_range_gradient_uses_nyquist_wrapped_delta() {
+        let mut cut = cut_with_rows(1, 3, 1000);
+        cut.moments.insert(
+            MomentType::Velocity,
+            f32_grid(MomentType::Velocity, vec![vec![24.0, -24.0, -23.0]], 1000),
+        );
+        let config = DerivationConfig::with_products(
+            RadarBand::S,
+            [DerivedSweepProduct::VelocityRangeGradient],
+        );
+        let report = derive_cut_in_place(&mut cut, &config);
+        assert_eq!(report.inserted, vec!["VEL_GRAD_R"]);
+        let gradient = cut
+            .moments
+            .get(&DerivedSweepProduct::VelocityRangeGradient.moment_type())
+            .unwrap()
+            .scaled_value(0, 1)
+            .unwrap();
+        assert!(
+            (gradient - 1.5).abs() < 0.01,
+            "expected wrapped +1.5 m/s/km, got {gradient}"
         );
     }
 

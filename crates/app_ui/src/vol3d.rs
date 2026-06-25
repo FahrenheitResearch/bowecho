@@ -30,6 +30,8 @@ const MAX_SHADER_STEPS: usize = 256;
 const UNIFORM_FLOATS: usize = 28;
 const UNIFORM_BYTES: u64 = (UNIFORM_FLOATS * std::mem::size_of::<f32>()) as u64;
 
+pub type Vol3dVolumeKey = (String, String, i64, usize, i32, i32, i32, i32);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FloorMode {
     Off,
@@ -160,7 +162,7 @@ pub struct Vol3d {
     /// product elevation in tenths of a degree, center east/10km, center
     /// north/10km, box half km). Top-tilt and pointer inclusion make
     /// completing/replaced live volumes re-trigger the resample.
-    pub volume_key: Option<(String, String, i64, usize, i32, i32, i32, i32)>,
+    pub volume_key: Option<Vol3dVolumeKey>,
     /// Top product elevation of the last fully-built box. Live partial volumes
     /// do not replace a complete box with a one-sector fragment.
     pub last_top_deg: f32,

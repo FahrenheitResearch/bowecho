@@ -611,6 +611,16 @@ impl ViewportMomentCache {
         moment: MomentType,
         color_tables: &ColorTableSet,
     ) -> Result<Self> {
+        Self::new_with_color_tables_for_family(volume, cut_index, moment, color_tables, None)
+    }
+
+    pub fn new_with_color_tables_for_family(
+        volume: &RadarVolume,
+        cut_index: usize,
+        moment: MomentType,
+        color_tables: &ColorTableSet,
+        family: Option<ColorTableFamily>,
+    ) -> Result<Self> {
         let cut = volume
             .cuts
             .get(cut_index)
@@ -637,7 +647,11 @@ impl ViewportMomentCache {
                 .then(|| StormMotionBasis::new(cut, grid)),
             moment,
             row_lookup: AzimuthLookup::new(cut, grid),
-            color_lookup: CachedColorLookup::new(grid, color_tables),
+            color_lookup: CachedColorLookup::new_for_family(
+                grid,
+                color_tables,
+                family.unwrap_or_else(|| color_family_for_moment(&grid.moment)),
+            ),
             dealiased_grid: None,
         })
     }
