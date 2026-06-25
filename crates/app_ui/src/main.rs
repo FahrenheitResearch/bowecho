@@ -886,17 +886,45 @@ fn derive_default_products_in_place(volume: &mut RadarVolume) {
     );
 }
 
-fn derive_advanced_products_for_volume_arc(volume: &Arc<RadarVolume>) -> (Arc<RadarVolume>, usize) {
+fn derive_advanced_products_for_volume_cut_arc(
+    volume: &Arc<RadarVolume>,
+    cut_index: usize,
+) -> Result<(Arc<RadarVolume>, usize), String> {
+    if cut_index >= volume.cuts.len() {
+        return Ok((Arc::clone(volume), 0));
+    }
     let mut derived = volume.as_ref().clone();
-    let report = product_engine::derive_volume_in_place(
-        &mut derived,
-        &product_engine::DerivationConfig::all_supported(),
-    );
+    let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        product_engine::derive_cut_in_place(
+            &mut derived.cuts[cut_index],
+            &product_engine::DerivationConfig::all_supported(),
+        )
+    }))
+    .map_err(|_| "Advanced product derivation failed for this tilt".to_owned())?;
     let inserted = report.inserted.len();
-    if inserted == 0 {
+    Ok(if inserted == 0 {
         (Arc::clone(volume), 0)
     } else {
         (Arc::new(derived), inserted)
+    })
+}
+
+fn advanced_derivation_status(
+    inserted: usize,
+    changed: bool,
+    cut_index: usize,
+    label: &str,
+) -> String {
+    if !changed {
+        format!(
+            "Advanced products already present or unavailable for {label} tilt #{}",
+            cut_index + 1
+        )
+    } else {
+        format!(
+            "Derived {inserted} advanced products for {label} tilt #{}",
+            cut_index + 1
+        )
     }
 }
 
@@ -6842,93 +6870,83 @@ impl ViewerApp {
     }
 
     fn derive_advanced_products_for_primary(&mut self, ctx: &egui::Context) {
-        let active_identity = self
-            .volume
-            .as_ref()
-            .map(|volume| frame_identity_for_volume(volume));
-        let mut inserted = 0usize;
-        let mut changed_frames = 0usize;
-        for frame in &mut self.frame_history {
-            let (volume, count) = derive_advanced_products_for_volume_arc(&frame.volume);
-            if count > 0 {
-                frame.volume = volume;
-                inserted += count;
-                changed_frames += 1;
+        let Some(active) = self.volume.clone() else {
+            self.status = "Load radar data before deriving advanced products".to_owned();
+            return;
+        };
+        let cut_index = self.selected_cut.min(active.cuts.len().saturating_sub(1));
+        let active_identity = frame_identity_for_volume(&active);
+        match derive_advanced_products_for_volume_cut_arc(&active, cut_index) {
+            Ok((volume, inserted)) => {
+                let changed = inserted > 0;
+                if changed {
+                    if let Some(frame) = self
+                        .frame_history
+                        .iter_mut()
+                        .find(|frame| frame.identity == active_identity)
+                    {
+                        frame.volume = Arc::clone(&volume);
+                    }
+                    self.volume = Some(volume);
+                }
+                self.finish_advanced_derivation(inserted, changed, cut_index, "primary", ctx);
+            }
+            Err(message) => {
+                self.status = message;
+                ctx.request_repaint();
             }
         }
-        if let Some(identity) = active_identity.as_ref()
-            && let Some(frame) = self
-                .frame_history
-                .iter()
-                .find(|frame| &frame.identity == identity)
-        {
-            self.volume = Some(Arc::clone(&frame.volume));
-        } else if let Some(active) = self.volume.clone() {
-            let (volume, count) = derive_advanced_products_for_volume_arc(&active);
-            if count > 0 {
-                self.volume = Some(volume);
-                inserted += count;
-                changed_frames += 1;
-            }
-        }
-        self.finish_advanced_derivation(inserted, changed_frames, "primary", ctx);
     }
 
     fn derive_advanced_products_for_pane(&mut self, slot: usize, ctx: &egui::Context) {
         let Some(pane) = self.extra_panes.get_mut(slot) else {
             return;
         };
-        let active_identity = pane
-            .volume
-            .as_ref()
-            .map(|volume| frame_identity_for_volume(volume));
-        let mut inserted = 0usize;
-        let mut changed_frames = 0usize;
-        for frame in &mut pane.frame_history {
-            let (volume, count) = derive_advanced_products_for_volume_arc(&frame.volume);
-            if count > 0 {
-                frame.volume = volume;
-                inserted += count;
-                changed_frames += 1;
-            }
-        }
-        if let Some(identity) = active_identity.as_ref()
-            && let Some(frame) = pane
-                .frame_history
-                .iter()
-                .find(|frame| &frame.identity == identity)
-        {
-            pane.volume = Some(Arc::clone(&frame.volume));
-        } else if let Some(active) = pane.volume.clone() {
-            let (volume, count) = derive_advanced_products_for_volume_arc(&active);
-            if count > 0 {
-                pane.volume = Some(volume);
-                inserted += count;
-                changed_frames += 1;
-            }
-        }
-        pane.clear_texture();
-        pane.status = if inserted == 0 {
-            "Advanced derived products already present or unavailable".to_owned()
-        } else {
-            format!("Derived {inserted} advanced products on {changed_frames} frame(s)")
+        let Some(active) = pane.volume.clone() else {
+            pane.status = "Load radar data before deriving advanced products".to_owned();
+            return;
         };
-        ctx.request_repaint();
+        let cut_index = pane
+            .cut
+            .unwrap_or(self.selected_cut)
+            .min(active.cuts.len().saturating_sub(1));
+        let active_identity = frame_identity_for_volume(&active);
+        match derive_advanced_products_for_volume_cut_arc(&active, cut_index) {
+            Ok((volume, inserted)) => {
+                let changed = inserted > 0;
+                if changed {
+                    if let Some(frame) = pane
+                        .frame_history
+                        .iter_mut()
+                        .find(|frame| frame.identity == active_identity)
+                    {
+                        frame.volume = Arc::clone(&volume);
+                    }
+                    pane.volume = Some(volume);
+                    pane.clear_texture();
+                }
+                pane.status = advanced_derivation_status(inserted, changed, cut_index, "pane");
+                ctx.request_repaint();
+            }
+            Err(message) => {
+                pane.status = message;
+                ctx.request_repaint();
+            }
+        }
     }
 
     fn finish_advanced_derivation(
         &mut self,
         inserted: usize,
-        changed_frames: usize,
+        changed: bool,
+        cut_index: usize,
         label: &str,
         ctx: &egui::Context,
     ) {
-        self.clear_texture();
-        self.status = if inserted == 0 {
-            format!("Advanced derived products already present or unavailable for {label}")
-        } else {
-            format!("Derived {inserted} advanced products on {changed_frames} {label} frame(s)")
-        };
+        if changed {
+            self.clear_texture();
+        }
+        self.status = advanced_derivation_status(inserted, changed, cut_index, label);
         ctx.request_repaint();
     }
 
@@ -19146,6 +19164,20 @@ impl ViewerApp {
         {
             let _ = self.app_settings.save();
         }
+        if ui
+            .checkbox(
+                &mut self.app_settings.map_click_drops_coordinate_marker,
+                "Click empty map drops coordinate marker",
+            )
+            .on_hover_text(
+                "Off by default: normal map clicks do not leave markers. Turn on to drop \
+                 a lat/lon marker whenever a plain left-click misses warnings, reports, \
+                 tracks, and radar/feed markers.",
+            )
+            .changed()
+        {
+            let _ = self.app_settings.save();
+        }
         ui.horizontal(|ui| {
             ui.label("Workspace");
             if ui
@@ -20997,7 +21029,7 @@ impl ViewerApp {
         ui.horizontal_wrapped(|ui| {
             if fixed_action_button(ui, "Derive advanced", 126.0)
                 .on_hover_text(
-                    "Compute the extended dual-pol/sweep products for the loaded frame history. \
+                    "Compute extended dual-pol/sweep products for the current visible tilt only. \
                      KDP still derives automatically; this adds products like PHIF, RATE, \
                      REF_TEX, TDS_SCORE, HAIL_SCORE, and TURB when source moments are available.",
                 )
@@ -25003,7 +25035,8 @@ impl ViewerApp {
                     &raob_points,
                     pointer,
                     ui.ctx(),
-                ) {
+                ) && self.app_settings.map_click_drops_coordinate_marker
+                {
                     self.drop_coordinate_marker_at_screen_point(rect, pointer, ui.ctx());
                 }
             } else {
@@ -25425,7 +25458,7 @@ impl ViewerApp {
                         pointer,
                         ui.ctx(),
                     );
-                    if !handled {
+                    if !handled && self.app_settings.map_click_drops_coordinate_marker {
                         self.drop_coordinate_marker_at_screen_point(cell, pointer, ui.ctx());
                     }
                 } else if owns_cell_radar {
@@ -36629,7 +36662,7 @@ impl ViewerApp {
             pointer,
             ctx,
         );
-        if !marker_hit && !marker_handled {
+        if !marker_hit && !marker_handled && self.app_settings.map_click_drops_coordinate_marker {
             self.drop_coordinate_marker_at_screen_point(rect, pointer, ctx);
         }
     }
@@ -57028,7 +57061,8 @@ mod tests {
         let mut volume = RadarVolume::new(radar_core::RadarSite::new("TEST"), Utc::now());
         volume.cuts.push(cut);
 
-        let (derived, inserted) = derive_advanced_products_for_volume_arc(&Arc::new(volume));
+        let (derived, inserted) =
+            derive_advanced_products_for_volume_cut_arc(&Arc::new(volume), 0).expect("derive");
         let products = global_displayable_products(derived.as_ref());
         let phif = DisplayProduct::Moment(MomentType::Unknown("PHIF".to_owned()));
 
@@ -59870,6 +59904,7 @@ mod tests {
     #[test]
     fn plain_map_click_drops_coordinate_marker_on_empty_map() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.map_click_drops_coordinate_marker = true;
         app.map_center_lat = 35.0;
         app.map_center_lon = -97.0;
         app.map_scale = 180.0;
@@ -59889,6 +59924,21 @@ mod tests {
             coordinate_marker_coordinates(&marker)
         );
         assert!(app.status.starts_with("Dropped marker at "));
+    }
+
+    #[test]
+    fn plain_map_click_does_not_drop_coordinate_marker_by_default() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.map_center_lat = 35.0;
+        app.map_center_lon = -97.0;
+        let rect = test_map_rect();
+        let pointer = rect.center() + egui::vec2(42.0, -26.0);
+        let ctx = egui::Context::default();
+
+        app.handle_plain_map_click(rect, &[], &[], &[], &[], &[], pointer, &ctx);
+
+        assert_eq!(app.coordinate_marker, None);
+        assert_eq!(app.place_search_query, "");
     }
 
     #[test]

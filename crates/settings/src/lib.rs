@@ -222,6 +222,10 @@ pub struct AppSettings {
     /// radar").
     #[serde(default)]
     pub right_click_loads_nearest: bool,
+    /// Plain left-click on empty map space drops a coordinate marker.
+    /// Default off so normal map clicks do not leave accidental markers.
+    #[serde(default)]
+    pub map_click_drops_coordinate_marker: bool,
     /// Reflectivity gate filter threshold in deci-dBZ; None = off. Hides
     /// non-REF gates whose co-located reflectivity is weaker (GR2-style
     /// GateFilter).
@@ -624,6 +628,7 @@ impl Default for AppSettings {
             radar_label_style: default_radar_label_style(),
             show_hazard_labels: true,
             right_click_loads_nearest: false,
+            map_click_drops_coordinate_marker: false,
             gate_filter_decidbz: None,
             model_keep_runs: default_model_keep_runs(),
             perf_hud: false,
@@ -1192,6 +1197,7 @@ mod tests {
             startup_site: Some("KEAX".to_owned()),
             polling_interval_seconds: 30,
             perf_hud: true,
+            map_click_drops_coordinate_marker: true,
             alert_flash_enabled: false,
             alert_flash_families: vec!["tornado".to_owned()],
             alert_sound_enabled: true,
@@ -1289,6 +1295,19 @@ mod tests {
         assert_eq!(back.radar_label_style, "id-box");
         assert!(!back.show_hazard_labels);
         assert!(AppSettings::from_json("{}").show_hazard_labels);
+    }
+
+    #[test]
+    fn map_click_coordinate_marker_defaults_off_and_round_trips() {
+        assert!(!AppSettings::from_json("{}").map_click_drops_coordinate_marker);
+
+        let settings = AppSettings {
+            map_click_drops_coordinate_marker: true,
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+
+        assert!(back.map_click_drops_coordinate_marker);
     }
 
     #[test]
