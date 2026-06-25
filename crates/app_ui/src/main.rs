@@ -24993,16 +24993,18 @@ impl ViewerApp {
                     self.jump_to_event_track(&hit, ui.ctx());
                 } else if let Some(hit) = self.storm_track_at(rect, pointer) {
                     self.start_storm_track_follow(hit, ui.ctx());
-                } else {
-                    self.handle_marker_click(
-                        &site_points,
-                        &intl_points,
-                        &community_points,
-                        &custom_poll_points,
-                        &raob_points,
-                        pointer,
-                        ui.ctx(),
-                    );
+                } else if let Some(index) = self.hazard_at_position(rect, pointer) {
+                    self.select_hazard_index(index);
+                } else if !self.handle_marker_click(
+                    &site_points,
+                    &intl_points,
+                    &community_points,
+                    &custom_poll_points,
+                    &raob_points,
+                    pointer,
+                    ui.ctx(),
+                ) {
+                    self.drop_coordinate_marker_at_screen_point(rect, pointer, ui.ctx());
                 }
             } else {
                 self.handle_marker_click(
@@ -25049,19 +25051,6 @@ impl ViewerApp {
             // pick (the nearest site to a city is its TDWR, whose landing
             // volume then snapped selection back: "I select KCLE and it
             // goes back to the Txxx one").
-        }
-
-        if !armed
-            && !vrot_armed
-            && !annotating
-            && !cross_section_handle_owns_pointer
-            && !vol3d_box_drag_owns_pointer
-            && plain_click
-            && response.clicked()
-            && let Some(pointer) = response.interact_pointer_pos()
-            && let Some(index) = self.hazard_at_position(rect, pointer)
-        {
-            self.select_hazard_index(index);
         }
 
         // Armed: left-click places endpoint A then B (restart after both set);
@@ -25426,7 +25415,7 @@ impl ViewerApp {
                 && let Some(pointer) = response.interact_pointer_pos()
             {
                 if self.app_settings.independent_panels && cell_index > 0 {
-                    self.handle_extra_pane_marker_click(
+                    let handled = self.handle_extra_pane_marker_click(
                         cell_index - 1,
                         &site_points,
                         &intl_points,
@@ -25436,6 +25425,9 @@ impl ViewerApp {
                         pointer,
                         ui.ctx(),
                     );
+                    if !handled {
+                        self.drop_coordinate_marker_at_screen_point(cell, pointer, ui.ctx());
+                    }
                 } else if owns_cell_radar {
                     self.status =
                         "Focused pane owns its radar; use the pane SITE controls to retarget it"
@@ -25451,9 +25443,6 @@ impl ViewerApp {
                         pointer,
                         ui.ctx(),
                     );
-                }
-                if let Some(index) = self.hazard_at_position(cell, pointer) {
-                    self.select_hazard_index(index);
                 }
             }
 
@@ -36569,6 +36558,25 @@ impl ViewerApp {
         }
     }
 
+    fn drop_coordinate_marker_at_screen_point(
+        &mut self,
+        rect: egui::Rect,
+        pointer: egui::Pos2,
+        ctx: &egui::Context,
+    ) {
+        let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
+        let marker = CoordinateMarker {
+            lat: lat.clamp(-90.0, 90.0),
+            lon: normalize_lon(lon),
+            label: None,
+        };
+        let status_label = coordinate_marker_status_label(&marker);
+        self.place_search_query = coordinate_marker_coordinates(&marker);
+        self.coordinate_marker = Some(marker);
+        self.status = format!("Dropped marker at {status_label}");
+        ctx.request_repaint();
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_plain_map_click(
         &mut self,
@@ -36607,8 +36615,12 @@ impl ViewerApp {
                 self.start_storm_track_follow(hit, ctx);
                 return;
             }
+            if let Some(index) = self.hazard_at_position(rect, pointer) {
+                self.select_hazard_index(index);
+                return;
+            }
         }
-        self.handle_marker_click(
+        let marker_handled = self.handle_marker_click(
             site_points,
             intl_points,
             community_points,
@@ -36617,6 +36629,9 @@ impl ViewerApp {
             pointer,
             ctx,
         );
+        if !marker_hit && !marker_handled {
+            self.drop_coordinate_marker_at_screen_point(rect, pointer, ctx);
+        }
     }
 
     /// International site markers: the same visual grammar as
@@ -59850,6 +59865,30 @@ mod tests {
         app.handle_plain_map_click(rect, &[(0, pointer)], &[], &[], &[], &[], pointer, &ctx);
 
         assert_eq!(app.status, "");
+    }
+
+    #[test]
+    fn plain_map_click_drops_coordinate_marker_on_empty_map() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.map_center_lat = 35.0;
+        app.map_center_lon = -97.0;
+        app.map_scale = 180.0;
+        let rect = test_map_rect();
+        let pointer = rect.center() + egui::vec2(42.0, -26.0);
+        let (expected_lon, expected_lat) = app.screen_to_lon_lat(rect, pointer);
+        let ctx = egui::Context::default();
+
+        app.handle_plain_map_click(rect, &[], &[], &[], &[], &[], pointer, &ctx);
+
+        let marker = app.coordinate_marker.expect("empty click drops marker");
+        assert!((marker.lat - expected_lat).abs() < 0.001);
+        assert!((marker.lon - normalize_lon(expected_lon)).abs() < 0.001);
+        assert_eq!(marker.label, None);
+        assert_eq!(
+            app.place_search_query,
+            coordinate_marker_coordinates(&marker)
+        );
+        assert!(app.status.starts_with("Dropped marker at "));
     }
 
     #[test]
