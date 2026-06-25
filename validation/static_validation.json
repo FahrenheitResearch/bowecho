@@ -1,0 +1,41 @@
+{
+  "rust_source_files": [
+    "lib.rs",
+    "sweep.rs",
+    "temporal.rs",
+    "volume.rs"
+  ],
+  "line_counts": {
+    "lib.rs": 163,
+    "sweep.rs": 2298,
+    "temporal.rs": 345,
+    "volume.rs": 628
+  },
+  "delimiter_errors": {
+    "lib.rs": [],
+    "sweep.rs": [],
+    "temporal.rs": [],
+    "volume.rs": []
+  },
+  "trailing_whitespace_lines": {
+    "lib.rs": 0,
+    "sweep.rs": 0,
+    "temporal.rs": 0,
+    "volume.rs": 0
+  },
+  "tab_characters": {
+    "lib.rs": 0,
+    "sweep.rs": 0,
+    "temporal.rs": 0,
+    "volume.rs": 0
+  },
+  "derived_variant_count": 30,
+  "all_list_count": 30,
+  "all_list_matches_enum": true,
+  "product_id_count": 30,
+  "product_ids_unique": true,
+  "native_kdp_guard_present": true,
+  "kdp_half_derivative_present": true,
+  "physical_range_alignment_present": true,
+  "passed": true
+}

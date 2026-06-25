@@ -88,6 +88,7 @@ const CROSS_SECTION_HANDLE_HIT_PX: f32 = 20.0;
 const DEFAULT_STORM_MOTION_DIRECTION_DEG: f32 = 45.0;
 const DEFAULT_STORM_MOTION_SPEED_KT: f32 = 35.0;
 const KNOT_TO_MPS: f32 = 0.514_444;
+const METERS_PER_KFT: f32 = 304.8;
 const VROT_ROW_RADIUS: usize = 2;
 const VROT_GATE_RADIUS: usize = 4;
 const DERIVED_READOUT_FALLBACK_RADIUS: usize = 3;
@@ -878,6 +879,13 @@ fn configured_rayon_threads_from(value: Option<&str>) -> Option<usize> {
         .filter(|threads| *threads > 0)
 }
 
+fn derive_default_products_in_place(volume: &mut RadarVolume) {
+    let _report = product_engine::derive_volume_in_place(
+        volume,
+        &product_engine::DerivationConfig::kdp_only(),
+    );
+}
+
 fn preview_render_head_start(threads: usize) -> Duration {
     if threads <= LOW_CORE_PREVIEW_THREADS {
         Duration::from_millis(LOW_CORE_PREVIEW_RENDER_HEAD_START_MS)
@@ -908,6 +916,7 @@ fn decode_load_path_with_optional_preview(
             nexrad_io::decode_volume_from_bytes(&raw).map_err(|err| err.to_string())?;
         timings.decode_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
         volume.metadata.source_path = Some(path.display().to_string());
+        derive_default_products_in_place(&mut volume);
         return Ok(DecodedLoad {
             path,
             volume: Arc::new(volume),
@@ -930,6 +939,7 @@ fn decode_load_path_with_optional_preview(
         preview_timings.decode_ms = preview_ms;
         preview_timings.preview_ms = Some(preview_ms);
         preview.metadata.source_path = Some(preview_path.display().to_string());
+        derive_default_products_in_place(&mut preview);
         let sent = sender.send(AsyncLoadResult {
             label: preview_label.clone(),
             update: AsyncLoadUpdate::Preview(DecodedLoad {
@@ -968,6 +978,7 @@ fn decode_load_path_with_optional_preview(
     timings.decode_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
     timings.preview_ms = first_preview_ms;
     volume.metadata.source_path = Some(path.display().to_string());
+    derive_default_products_in_place(&mut volume);
     Ok(DecodedLoad {
         path,
         volume: Arc::new(volume),
@@ -1144,7 +1155,8 @@ fn decode_mobile_radar_batch(
                 volumes.retain(|entry| entry.volume.site.id == site_id);
             }
             timings.decode_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
-            for entry in volumes {
+            for mut entry in volumes {
+                derive_default_products_in_place(&mut entry.volume);
                 frames.push(DecodedLoad {
                     path: path.to_path_buf(),
                     volume: Arc::new(entry.volume),
@@ -1155,8 +1167,9 @@ fn decode_mobile_radar_batch(
             }
         }
         LocalRadarKind::DoradeSweep => {
-            let volume = nexrad_io::mobile_archive::decode_dorade_volume_for_path(path)
+            let mut volume = nexrad_io::mobile_archive::decode_dorade_volume_for_path(path)
                 .map_err(|err| err.to_string())?;
+            derive_default_products_in_place(&mut volume);
             timings.decode_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
             frames.push(DecodedLoad {
                 path: path.to_path_buf(),
@@ -1178,6 +1191,7 @@ fn decode_mobile_radar_batch(
             // the head window).
             let mut volume = nexrad_io::decode_supported_volume_bytes(&bytes)?;
             volume.metadata.source_path = Some(path.display().to_string());
+            derive_default_products_in_place(&mut volume);
             timings.decode_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
             frames.push(DecodedLoad {
                 path: path.to_path_buf(),
@@ -1266,6 +1280,7 @@ fn decode_local_radar_file_set(
         .collect::<Vec<_>>()
         .join(" + ");
     volume.metadata.source_path = Some(source_paths);
+    derive_default_products_in_place(&mut volume);
 
     let timings = LoadTimings {
         read_ms: Some(read_ms),
@@ -14928,6 +14943,7 @@ impl ViewerApp {
                     match nexrad_io::decode_supported_volume_bytes(&raw) {
                         Ok(mut volume) => {
                             volume.metadata.source_path = Some(url);
+                            derive_default_products_in_place(&mut volume);
                             let timings = LoadTimings {
                                 fetch_ms: Some(fetch_start.elapsed().as_secs_f32() * 1000.0),
                                 decode_ms: decode_start.elapsed().as_secs_f32() * 1000.0,
@@ -21007,14 +21023,17 @@ impl ViewerApp {
                             ctx.request_repaint();
                         }
                     }
-                    let units = product_units(&editing_product);
-                    let mut drag = egui::DragValue::new(threshold)
+                    let (units, unit_scale) =
+                        table_display_unit(&active_table_for_threshold, &editing_product);
+                    let mut display_threshold = *threshold / unit_scale;
+                    let mut drag = egui::DragValue::new(&mut display_threshold)
                         .speed(0.5)
                         .suffix(format!(" {units}"));
                     if let Some((min, max)) = threshold_range {
-                        drag = drag.range(min..=max);
+                        drag = drag.range((min / unit_scale)..=(max / unit_scale));
                     }
                     if ui.add(drag).changed() {
+                        *threshold = display_threshold * unit_scale;
                         ctx.request_repaint();
                     }
                 }
@@ -29406,7 +29425,8 @@ impl ViewerApp {
                         // router dispatches by magic bytes like the
                         // file-open path.
                         match nexrad_io::decode_supported_volume_bytes(&raw) {
-                            Ok(volume) => {
+                            Ok(mut volume) => {
+                                derive_default_products_in_place(&mut volume);
                                 return Ok(Some(PolledVolumeLoad {
                                     name: newest,
                                     dedupe_key,
@@ -39718,6 +39738,9 @@ fn product_units(product: &DisplayProduct) -> &'static str {
 /// Returns (label, declared→internal factor — divide internal values by it
 /// for display). Non-m/s products and SI/unknown declarations are identity.
 fn table_display_unit(table: &ColorTable, product: &DisplayProduct) -> (&'static str, f32) {
+    if matches!(product, DisplayProduct::Derived(DerivedProduct::EchoTops)) {
+        return ("kft", METERS_PER_KFT);
+    }
     let base = product_units(product);
     if base != "m/s" {
         return (base, 1.0);
@@ -44721,8 +44744,9 @@ fn fetch_assemble_intl_plan(
         };
         decoded.push(volume);
     }
-    let volume = assemble_intl_parts(plan.merge, decoded)
+    let mut volume = assemble_intl_parts(plan.merge, decoded)
         .map_err(|err| format!("{}: {err}", plan.identity))?;
+    derive_default_products_in_place(&mut volume);
     Ok((plan.identity.clone(), volume))
 }
 
@@ -46762,6 +46786,20 @@ mod tests {
             assert_eq!(table.stops().first().map(|stop| stop.value), Some(0.0));
             assert_eq!(table.stops().last().map(|stop| stop.value), Some(100.0));
         }
+    }
+
+    #[test]
+    fn echo_tops_display_in_kft_while_storing_meters() {
+        let table_set = ColorTableSet::default();
+        let product = DisplayProduct::Derived(DerivedProduct::EchoTops);
+        let table = table_set.for_family(product.color_family());
+        let (label, scale) = table_display_unit(table, &product);
+
+        assert_eq!(product_units(&product), "m");
+        assert_eq!(label, "kft");
+        assert_eq!(scale, METERS_PER_KFT);
+        assert_eq!(table.stops().first().map(|stop| stop.value), Some(1_500.0));
+        assert!(((18_288.0 / scale) - 60.0).abs() < 0.01);
     }
 
     /// User tables resolve by name even when their Product: header put

@@ -18,6 +18,7 @@ egui_tiles = { version = "0.15", features = ["serde"] }
 earcutr.workspace = true
 image = { workspace = true, features = ["gif"] }
 nexrad_io = { path = "../nexrad_io" }
+product_engine = { path = "../product_engine" }
 radar_core = { path = "../radar_core" }
 render2d = { path = "../render2d" }
 settings = { path = "../settings" }

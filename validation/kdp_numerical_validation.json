@@ -1,0 +1,26 @@
+{
+  "algorithm": "unwrap + <=2-gate interpolation + Hampel + 3 km Huber local slope; KDP=0.5*dPHIDP/dr",
+  "cases": {
+    "wrapped_linear_2_deg_per_km": {
+      "valid_gate_count": 181,
+      "median_deg_per_km": 2.0,
+      "bias_deg_per_km": 0.0,
+      "rmse_deg_per_km": 0.0,
+      "p95_abs_error_deg_per_km": 0.0
+    },
+    "noisy_spiky_gappy_1_5_deg_per_km": {
+      "valid_gate_count": 178,
+      "median_deg_per_km": 1.506893849438578,
+      "bias_deg_per_km": -0.005564589361415723,
+      "rmse_deg_per_km": 0.14068524936160934,
+      "p95_abs_error_deg_per_km": 0.2736934616393738
+    },
+    "flat_phase_0_deg_per_km": {
+      "valid_gate_count": 181,
+      "median_deg_per_km": 0.0002677779392891596,
+      "bias_deg_per_km": -0.0030573673617368784,
+      "rmse_deg_per_km": 0.049045267659905786,
+      "p95_abs_error_deg_per_km": 0.09639487465179443
+    }
+  }
+}

@@ -305,6 +305,7 @@ dependencies = [
  "flate2",
  "image",
  "nexrad_io",
+ "product_engine",
  "quick-xml",
  "radar_core",
  "rayon",

@@ -408,7 +408,7 @@ fn products(ui: &mut egui::Ui) {
     );
     product_entry(
         ui,
-        "ET — Echo tops (m, palette labeled in kft)",
+        "ET — Echo tops (kft)",
         "height of the highest beam with \u{2265}18.3 dBZ, 4/3-Earth beam geometry.",
         "reads low in the cone of silence right over the radar (no high tilts), and gets \
          coarse far out where tilt gaps widen.",
