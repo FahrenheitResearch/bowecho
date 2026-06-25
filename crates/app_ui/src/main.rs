@@ -886,6 +886,20 @@ fn derive_default_products_in_place(volume: &mut RadarVolume) {
     );
 }
 
+fn derive_advanced_products_for_volume_arc(volume: &Arc<RadarVolume>) -> (Arc<RadarVolume>, usize) {
+    let mut derived = volume.as_ref().clone();
+    let report = product_engine::derive_volume_in_place(
+        &mut derived,
+        &product_engine::DerivationConfig::all_supported(),
+    );
+    let inserted = report.inserted.len();
+    if inserted == 0 {
+        (Arc::clone(volume), 0)
+    } else {
+        (Arc::new(derived), inserted)
+    }
+}
+
 fn preview_render_head_start(threads: usize) -> Duration {
     if threads <= LOW_CORE_PREVIEW_THREADS {
         Duration::from_millis(LOW_CORE_PREVIEW_RENDER_HEAD_START_MS)
@@ -4693,7 +4707,8 @@ impl DisplayProduct {
 
     fn color_family(&self) -> ColorTableFamily {
         match self {
-            Self::Moment(moment) => color_family_for_moment(moment),
+            Self::Moment(moment) => advanced_derived_color_family(moment)
+                .unwrap_or_else(|| color_family_for_moment(moment)),
             Self::DealiasedVelocity
             | Self::StormRelativeVelocity
             | Self::StormRelativeDealiasedVelocity => ColorTableFamily::Velocity,
@@ -6810,6 +6825,111 @@ impl ViewerApp {
         self.worker_ms = None;
         self.texture_ms = None;
         self.sample_cache_build_ms = None;
+    }
+
+    fn derive_advanced_products_for_products_panel(
+        &mut self,
+        editing_pane: Option<usize>,
+        ctx: &egui::Context,
+    ) {
+        if let Some(slot) = editing_pane
+            && self.extra_panes.get(slot).is_some_and(ViewPane::owns_radar)
+        {
+            self.derive_advanced_products_for_pane(slot, ctx);
+        } else {
+            self.derive_advanced_products_for_primary(ctx);
+        }
+    }
+
+    fn derive_advanced_products_for_primary(&mut self, ctx: &egui::Context) {
+        let active_identity = self
+            .volume
+            .as_ref()
+            .map(|volume| frame_identity_for_volume(volume));
+        let mut inserted = 0usize;
+        let mut changed_frames = 0usize;
+        for frame in &mut self.frame_history {
+            let (volume, count) = derive_advanced_products_for_volume_arc(&frame.volume);
+            if count > 0 {
+                frame.volume = volume;
+                inserted += count;
+                changed_frames += 1;
+            }
+        }
+        if let Some(identity) = active_identity.as_ref()
+            && let Some(frame) = self
+                .frame_history
+                .iter()
+                .find(|frame| &frame.identity == identity)
+        {
+            self.volume = Some(Arc::clone(&frame.volume));
+        } else if let Some(active) = self.volume.clone() {
+            let (volume, count) = derive_advanced_products_for_volume_arc(&active);
+            if count > 0 {
+                self.volume = Some(volume);
+                inserted += count;
+                changed_frames += 1;
+            }
+        }
+        self.finish_advanced_derivation(inserted, changed_frames, "primary", ctx);
+    }
+
+    fn derive_advanced_products_for_pane(&mut self, slot: usize, ctx: &egui::Context) {
+        let Some(pane) = self.extra_panes.get_mut(slot) else {
+            return;
+        };
+        let active_identity = pane
+            .volume
+            .as_ref()
+            .map(|volume| frame_identity_for_volume(volume));
+        let mut inserted = 0usize;
+        let mut changed_frames = 0usize;
+        for frame in &mut pane.frame_history {
+            let (volume, count) = derive_advanced_products_for_volume_arc(&frame.volume);
+            if count > 0 {
+                frame.volume = volume;
+                inserted += count;
+                changed_frames += 1;
+            }
+        }
+        if let Some(identity) = active_identity.as_ref()
+            && let Some(frame) = pane
+                .frame_history
+                .iter()
+                .find(|frame| &frame.identity == identity)
+        {
+            pane.volume = Some(Arc::clone(&frame.volume));
+        } else if let Some(active) = pane.volume.clone() {
+            let (volume, count) = derive_advanced_products_for_volume_arc(&active);
+            if count > 0 {
+                pane.volume = Some(volume);
+                inserted += count;
+                changed_frames += 1;
+            }
+        }
+        pane.clear_texture();
+        pane.status = if inserted == 0 {
+            "Advanced derived products already present or unavailable".to_owned()
+        } else {
+            format!("Derived {inserted} advanced products on {changed_frames} frame(s)")
+        };
+        ctx.request_repaint();
+    }
+
+    fn finish_advanced_derivation(
+        &mut self,
+        inserted: usize,
+        changed_frames: usize,
+        label: &str,
+        ctx: &egui::Context,
+    ) {
+        self.clear_texture();
+        self.status = if inserted == 0 {
+            format!("Advanced derived products already present or unavailable for {label}")
+        } else {
+            format!("Derived {inserted} advanced products on {changed_frames} {label} frame(s)")
+        };
+        ctx.request_repaint();
     }
 
     fn clear_displayed_volume_for_pending_load(&mut self, ctx: &egui::Context) {
@@ -20334,7 +20454,7 @@ impl ViewerApp {
         let coordinate_candidate = coordinate_result
             .as_ref()
             .ok()
-            .and_then(|candidate| *candidate);
+            .and_then(|candidate| candidate.clone());
         let radar_results = if coordinate_candidate.is_some() || coordinate_result.is_err() {
             Vec::new()
         } else {
@@ -20362,7 +20482,7 @@ impl ViewerApp {
                 response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             if fixed_action_button(ui, "Go", 42.0).clicked() || submitted {
                 match &coordinate_result {
-                    Ok(Some(coordinate)) => jump_to_coordinate = Some(*coordinate),
+                    Ok(Some(coordinate)) => jump_to_coordinate = Some(coordinate.clone()),
                     Err(message) => self.status = message.clone(),
                     Ok(None) => {
                         if let Some((index, _)) = radar_results.first() {
@@ -20378,17 +20498,20 @@ impl ViewerApp {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = ROW_SPACING_X;
                 if ui
-                    .small_button(format!("Drop {}", coordinate_marker_label(coordinate)))
+                    .small_button(format!(
+                        "Drop {}",
+                        coordinate_marker_status_label(&coordinate)
+                    ))
                     .clicked()
                 {
                     jump_to_coordinate = Some(coordinate);
                 }
             });
         }
-        if let Some(marker) = self.coordinate_marker {
+        if let Some(marker) = &self.coordinate_marker {
             let mut clear_marker = false;
             ui.horizontal_wrapped(|ui| {
-                ui.weak(format!("Marker {}", coordinate_marker_label(marker)));
+                ui.weak(format!("Marker {}", coordinate_marker_status_label(marker)));
                 if ui.small_button("Clear").clicked() {
                     clear_marker = true;
                 }
@@ -20466,19 +20589,24 @@ impl ViewerApp {
             }
         }
         if let Some(coordinate) = jump_to_coordinate {
-            self.coordinate_marker = Some(coordinate);
+            self.coordinate_marker = Some(coordinate.clone());
             if let Some(slot) = site_control_pane {
                 if let Some(pane) = self.extra_panes.get_mut(slot) {
                     pane.map_center_lat = coordinate.lat.clamp(-85.0, 85.0);
                     pane.map_center_lon = normalize_lon(coordinate.lon);
                     pane.map_scale = pane.map_scale.max(420.0);
-                    pane.status =
-                        format!("Dropped marker at {}", coordinate_marker_label(coordinate));
+                    pane.status = format!(
+                        "Dropped marker at {}",
+                        coordinate_marker_status_label(&coordinate)
+                    );
                 }
             } else {
                 self.center_map_on(coordinate.lat, coordinate.lon);
                 self.map_scale = self.map_scale.max(420.0);
-                self.status = format!("Dropped marker at {}", coordinate_marker_label(coordinate));
+                self.status = format!(
+                    "Dropped marker at {}",
+                    coordinate_marker_status_label(&coordinate)
+                );
             }
         }
         // Favorites chip row (spec §1 RADAR ▸ SITE): each chip = one-click
@@ -20854,6 +20982,33 @@ impl ViewerApp {
                         ctx.request_repaint();
                     }
                 }
+            }
+        });
+        let advanced_visible_count = product_buttons
+            .iter()
+            .filter(|(product, _)| {
+                matches!(
+                    product,
+                    DisplayProduct::Moment(moment)
+                        if advanced_derived_product_for_moment(moment).is_some()
+                )
+            })
+            .count();
+        ui.horizontal_wrapped(|ui| {
+            if fixed_action_button(ui, "Derive advanced", 126.0)
+                .on_hover_text(
+                    "Compute the extended dual-pol/sweep products for the loaded frame history. \
+                     KDP still derives automatically; this adds products like PHIF, RATE, \
+                     REF_TEX, TDS_SCORE, HAIL_SCORE, and TURB when source moments are available.",
+                )
+                .clicked()
+            {
+                self.derive_advanced_products_for_products_panel(editing_pane, ctx);
+            }
+            if advanced_visible_count > 0 {
+                ui.weak(format!(
+                    "{advanced_visible_count} advanced products visible"
+                ));
             }
         });
         let has_kdp = product_buttons.iter().any(|(product, _)| {
@@ -36956,7 +37111,7 @@ impl ViewerApp {
     }
 
     fn draw_coordinate_marker(&self, painter: &egui::Painter, rect: egui::Rect) {
-        let Some(marker) = self.coordinate_marker else {
+        let Some(marker) = &self.coordinate_marker else {
             return;
         };
         let position = self.lon_lat_to_screen(rect, marker.lon, marker.lat);
@@ -37678,10 +37833,11 @@ struct PlaceSearchResult {
     source_rank: u8,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct CoordinateMarker {
     lat: f32,
     lon: f32,
+    label: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -37694,6 +37850,13 @@ enum CoordinateAxis {
 struct CoordinateComponent {
     value: f32,
     axis: Option<CoordinateAxis>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CoordinateComponentToken {
+    component: CoordinateComponent,
+    start: usize,
+    end: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -37775,20 +37938,47 @@ fn place_search_matches(
 }
 
 fn parse_coordinate_search_query(query: &str) -> Result<Option<CoordinateMarker>, String> {
-    let tokens = query
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '+' || ch == '-' || ch == '.'))
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-    if tokens.len() != 2 {
+    let tokens = coordinate_component_tokens(query);
+    if tokens.is_empty() {
         return Ok(None);
     }
-    let Some(first) = parse_coordinate_component(tokens[0]) else {
+    if tokens.len() == 1 {
         return Ok(None);
-    };
-    let Some(second) = parse_coordinate_component(tokens[1]) else {
-        return Ok(None);
-    };
-    resolve_coordinate_pair(first, second).map(Some)
+    }
+    if tokens.len() != 2 {
+        return Err("Enter one latitude/longitude pair".to_owned());
+    }
+    let mut marker = resolve_coordinate_pair(tokens[0].component, tokens[1].component)?;
+    marker.label = coordinate_label_from_query(query, &tokens);
+    Ok(Some(marker))
+}
+
+fn coordinate_component_tokens(query: &str) -> Vec<CoordinateComponentToken> {
+    let mut tokens = Vec::new();
+    let mut start = None::<usize>;
+    for (index, ch) in query.char_indices() {
+        if ch.is_ascii_alphanumeric() || ch == '+' || ch == '-' || ch == '.' {
+            start.get_or_insert(index);
+        } else if let Some(token_start) = start.take() {
+            if let Some(component) = parse_coordinate_component(&query[token_start..index]) {
+                tokens.push(CoordinateComponentToken {
+                    component,
+                    start: token_start,
+                    end: index,
+                });
+            }
+        }
+    }
+    if let Some(token_start) = start
+        && let Some(component) = parse_coordinate_component(&query[token_start..])
+    {
+        tokens.push(CoordinateComponentToken {
+            component,
+            start: token_start,
+            end: query.len(),
+        });
+    }
+    tokens
 }
 
 fn parse_coordinate_component(token: &str) -> Option<CoordinateComponent> {
@@ -37823,40 +38013,48 @@ fn resolve_coordinate_pair(
             Some(CoordinateMarker {
                 lat: first.value,
                 lon: second.value,
+                label: None,
             })
         }
         (Some(CoordinateAxis::Longitude), Some(CoordinateAxis::Latitude)) => {
             Some(CoordinateMarker {
                 lat: second.value,
                 lon: first.value,
+                label: None,
             })
         }
         (Some(CoordinateAxis::Latitude), None) => Some(CoordinateMarker {
             lat: first.value,
             lon: second.value,
+            label: None,
         }),
         (Some(CoordinateAxis::Longitude), None) => Some(CoordinateMarker {
             lat: second.value,
             lon: first.value,
+            label: None,
         }),
         (None, Some(CoordinateAxis::Latitude)) => Some(CoordinateMarker {
             lat: second.value,
             lon: first.value,
+            label: None,
         }),
         (None, Some(CoordinateAxis::Longitude)) => Some(CoordinateMarker {
             lat: first.value,
             lon: second.value,
+            label: None,
         }),
         (None, None) => {
             if valid_lat(first.value) && valid_lon(second.value) {
                 Some(CoordinateMarker {
                     lat: first.value,
                     lon: second.value,
+                    label: None,
                 })
             } else if valid_lon(first.value) && valid_lat(second.value) {
                 Some(CoordinateMarker {
                     lat: second.value,
                     lon: first.value,
+                    label: None,
                 })
             } else {
                 None
@@ -37874,7 +38072,42 @@ fn resolve_coordinate_pair(
     Ok(CoordinateMarker {
         lat: pair.lat,
         lon: normalize_lon(pair.lon),
+        label: pair.label,
     })
+}
+
+fn coordinate_label_from_query(
+    query: &str,
+    coordinate_tokens: &[CoordinateComponentToken],
+) -> Option<String> {
+    let mut pieces = Vec::new();
+    let mut cursor = 0usize;
+    for token in coordinate_tokens {
+        if cursor < token.start {
+            pieces.push(&query[cursor..token.start]);
+        }
+        cursor = token.end;
+    }
+    if cursor < query.len() {
+        pieces.push(&query[cursor..]);
+    }
+    clean_coordinate_label(&pieces.join(" "))
+}
+
+fn clean_coordinate_label(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_matches(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                ',' | ';' | ':' | '@' | '=' | '-' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+    });
+    let label = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if label.is_empty() {
+        None
+    } else {
+        Some(label.chars().take(48).collect())
+    }
 }
 
 fn valid_lat(value: f32) -> bool {
@@ -37885,8 +38118,23 @@ fn valid_lon(value: f32) -> bool {
     value.is_finite() && (-180.0..=180.0).contains(&value)
 }
 
-fn coordinate_marker_label(marker: CoordinateMarker) -> String {
+fn coordinate_marker_coordinates(marker: &CoordinateMarker) -> String {
     format!("{:.4}, {:.4}", marker.lat, marker.lon)
+}
+
+fn coordinate_marker_label(marker: &CoordinateMarker) -> String {
+    marker
+        .label
+        .clone()
+        .unwrap_or_else(|| coordinate_marker_coordinates(marker))
+}
+
+fn coordinate_marker_status_label(marker: &CoordinateMarker) -> String {
+    if let Some(label) = marker.label.as_deref() {
+        format!("{label} ({})", coordinate_marker_coordinates(marker))
+    } else {
+        coordinate_marker_coordinates(marker)
+    }
 }
 
 fn radar_site_search_matches(
@@ -39940,7 +40188,9 @@ fn moment_units(moment: &MomentType) -> &'static str {
         MomentType::CorrelationCoefficient => "rho",
         MomentType::DifferentialPhase => "deg",
         MomentType::SpecificDifferentialPhase => "deg/km",
-        MomentType::Unknown(_) => "",
+        MomentType::Unknown(_) => advanced_derived_product_for_moment(moment)
+            .map(product_engine::DerivedSweepProduct::units)
+            .unwrap_or(""),
     }
 }
 
@@ -39951,6 +40201,58 @@ fn product_units(product: &DisplayProduct) -> &'static str {
         | DisplayProduct::StormRelativeVelocity
         | DisplayProduct::StormRelativeDealiasedVelocity => "m/s",
         DisplayProduct::Derived(d) => d.units(),
+    }
+}
+
+fn advanced_derived_product_for_moment(
+    moment: &MomentType,
+) -> Option<product_engine::DerivedSweepProduct> {
+    let MomentType::Unknown(name) = moment else {
+        return None;
+    };
+    product_engine::DerivedSweepProduct::ALL
+        .iter()
+        .copied()
+        .find(|product| product.id().eq_ignore_ascii_case(name))
+}
+
+fn advanced_derived_color_family(moment: &MomentType) -> Option<ColorTableFamily> {
+    use product_engine::DerivedSweepProduct as Product;
+    match advanced_derived_product_for_moment(moment)? {
+        Product::FilteredDifferentialPhase | Product::DifferentialPhaseTexture => {
+            Some(ColorTableFamily::DifferentialPhase)
+        }
+        Product::KdpUncertainty | Product::KdpTexture => {
+            Some(ColorTableFamily::SpecificDifferentialPhase)
+        }
+        Product::SpecificAttenuation
+        | Product::PathIntegratedAttenuation
+        | Product::CorrectedReflectivity
+        | Product::ReflectivityTexture
+        | Product::ReflectivityRangeGradient => Some(ColorTableFamily::Reflectivity),
+        Product::SpecificDifferentialAttenuation
+        | Product::PathIntegratedDifferentialAttenuation
+        | Product::CorrectedDifferentialReflectivity
+        | Product::DifferentialReflectivityTexture => {
+            Some(ColorTableFamily::DifferentialReflectivity)
+        }
+        Product::RainRateReflectivity
+        | Product::RainRateKdp
+        | Product::RainRateHybrid
+        | Product::LiquidWaterContent
+        | Product::HailKineticEnergy
+        | Product::TurbulenceProxy => Some(ColorTableFamily::Vil),
+        Product::CircularDepolarizationRatio
+        | Product::LogCorrelationRatio
+        | Product::CorrelationCoefficientTexture
+        | Product::MeteorologicalQuality
+        | Product::MeteorologicalGateMask => Some(ColorTableFamily::CorrelationCoefficient),
+        Product::VelocityTexture | Product::VelocityRangeGradient => {
+            Some(ColorTableFamily::Velocity)
+        }
+        Product::SpectrumWidthTexture => Some(ColorTableFamily::SpectrumWidth),
+        Product::TdsConfidence | Product::HailSignature => Some(ColorTableFamily::Probability),
+        Product::Kdp => None,
     }
 }
 
@@ -56620,6 +56922,28 @@ mod tests {
     }
 
     #[test]
+    fn coordinate_search_accepts_label_before_coordinates() {
+        let marker = parse_coordinate_search_query("Barnsdall: 36.562, -96.161")
+            .expect("parse")
+            .expect("coordinate");
+
+        assert_eq!(marker.label.as_deref(), Some("Barnsdall"));
+        assert_eq!(coordinate_marker_label(&marker), "Barnsdall");
+        assert!(coordinate_marker_status_label(&marker).contains("36.5620"));
+    }
+
+    #[test]
+    fn coordinate_search_accepts_label_after_coordinates() {
+        let marker = parse_coordinate_search_query("36.562N 96.161W main circulation")
+            .expect("parse")
+            .expect("coordinate");
+
+        assert_eq!(marker.label.as_deref(), Some("main circulation"));
+        assert!((marker.lat - 36.562).abs() < 0.001);
+        assert!((marker.lon + 96.161).abs() < 0.001);
+    }
+
+    #[test]
     fn coordinate_search_accepts_unambiguous_lon_lat_order() {
         let marker = parse_coordinate_search_query("-97.516 35.467")
             .expect("parse")
@@ -56632,12 +56956,71 @@ mod tests {
     #[test]
     fn coordinate_search_ignores_plain_place_names() {
         assert_eq!(parse_coordinate_search_query("oklahoma city"), Ok(None));
+        assert_eq!(parse_coordinate_search_query("route 66"), Ok(None));
     }
 
     #[test]
     fn coordinate_search_rejects_out_of_range_pairs() {
         assert!(parse_coordinate_search_query("95, -200").is_err());
         assert!(parse_coordinate_search_query("35N 97N").is_err());
+    }
+
+    #[test]
+    fn advanced_product_derivation_exposes_engine_products() {
+        let gate_range = radar_core::GateRange {
+            first_gate_m: 1000,
+            gate_spacing_m: 500,
+            gate_count: 24,
+        };
+        let mut cut = ElevationCut::new(0.5, Some(1));
+        for radial in 0..4 {
+            cut.radials.push(radar_core::Radial {
+                azimuth_deg: radial as f32 * 90.0,
+                elevation_deg: 0.5,
+                time_offset_ms: radial as i32 * 250,
+                gate_range: gate_range.clone(),
+                nyquist_velocity_mps: None,
+                radial_status: None,
+            });
+        }
+        let cells = cut.radials.len() * gate_range.gate_count;
+        let radial_indices = (0..cut.radials.len()).collect::<Vec<_>>();
+        let grid = |moment: MomentType, values: Vec<f32>| MomentGrid {
+            moment,
+            gate_range: gate_range.clone(),
+            scale: 1.0,
+            offset: 0.0,
+            nodata: None,
+            range_folded: None,
+            radial_indices: radial_indices.clone(),
+            storage: MomentStorage::F32(values),
+        };
+        cut.moments.insert(
+            MomentType::Reflectivity,
+            grid(MomentType::Reflectivity, vec![35.0; cells]),
+        );
+        cut.moments.insert(
+            MomentType::CorrelationCoefficient,
+            grid(MomentType::CorrelationCoefficient, vec![0.97; cells]),
+        );
+        let phi_values = (0..cut.radials.len())
+            .flat_map(|_| (0..gate_range.gate_count).map(|gate| 20.0 + gate as f32 * 1.2))
+            .collect::<Vec<_>>();
+        cut.moments.insert(
+            MomentType::DifferentialPhase,
+            grid(MomentType::DifferentialPhase, phi_values),
+        );
+        let mut volume = RadarVolume::new(radar_core::RadarSite::new("TEST"), Utc::now());
+        volume.cuts.push(cut);
+
+        let (derived, inserted) = derive_advanced_products_for_volume_arc(&Arc::new(volume));
+        let products = global_displayable_products(derived.as_ref());
+        let phif = DisplayProduct::Moment(MomentType::Unknown("PHIF".to_owned()));
+
+        assert!(inserted > 0);
+        assert!(products.contains(&phif), "{products:?}");
+        assert_eq!(product_units(&phif), "deg");
+        assert_eq!(phif.color_family(), ColorTableFamily::DifferentialPhase);
     }
 
     #[test]
