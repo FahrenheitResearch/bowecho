@@ -36,6 +36,45 @@ usable reflectivity tilt.
 | **AzShr** Azimuthal shear | Local low-level shear on velocity/dealiased velocity | 1/s scale | Rotation signal; pair with velocity, SRV, and environmental context. |
 | **Div** Divergence | Local radial divergence/convergence | 1/s scale | Outflow, convergence, and boundary structure. |
 
+### Advanced on-demand sweep products
+
+The **Derive advanced** button in the PRODUCTS row computes additional
+per-tilt products for the current visible tilt. KDP remains automatic; these
+fields are intentionally on-demand so live loops do not precompute every
+diagnostic for every incoming scan.
+
+| Product | Method | Units | How to read it |
+|---|---|---|---|
+| **PHIF** Filtered differential phase | Smoothed/quality-controlled PHI field | deg | Inspect phase continuity before trusting KDP and attenuation products. |
+| **KDP_SD** KDP uncertainty | Robust retrieval spread/confidence proxy | deg/km | Higher values mean the KDP estimate is less stable. |
+| **AH** Specific attenuation | PHI/KDP-scaled horizontal attenuation | dB/km | Heavy-rain attenuation context along the beam. |
+| **PIA** Path-integrated attenuation | Integrated horizontal attenuation | dB | Beam-path attenuation load; high values warn that far-range REF may be depressed. |
+| **REFC** Corrected reflectivity | REF plus path attenuation correction | dBZ | Use as an aid in heavy rain, not as a replacement for multi-radar checks. |
+| **ADP** Specific differential attenuation | PHI/KDP-scaled differential attenuation | dB/km | ZDR attenuation context. |
+| **PIDA** Path-integrated differential attenuation | Integrated differential attenuation | dB | Beam-path ZDR correction context. |
+| **ZDRC** Corrected differential reflectivity | ZDR plus differential attenuation correction | dB | Helps preserve ZDR arcs/columns in heavy rain when phase quality is good. |
+| **RATE_Z** Z-R rain rate | Reflectivity-only rain-rate estimate | mm/h | Simple rate estimate; hail and attenuation can bias it. |
+| **RATE_KDP** KDP rain rate | KDP-based rain-rate estimate | mm/h | Better in heavy rain and hail-contaminated cores when KDP is stable. |
+| **RATE** Hybrid rain rate | Blended polarimetric rain-rate estimate | mm/h | Operator-friendly rain-rate field using the best available source. |
+| **LWC** Liquid water content proxy | Reflectivity-derived water-content proxy | g/m^3 | Heavy precipitation/loading context. |
+| **HKE** Hail kinetic-energy flux | Reflectivity-derived hail-energy proxy | J/(m^2 s) | Hail-core context; depends on sampling height and beam filling. |
+| **CDR** Circular depolarization ratio | Dual-pol depolarization diagnostic | dB | Hydrometeor/non-meteorological quality context. |
+| **L_RHO** Log correlation ratio | Log-scaled CC diagnostic | 1 | Expands low-CC structure for debris/hail/noise inspection. |
+| **REF_TEX** Reflectivity texture | Local REF variability | dB | Sharp cores, clutter/noise, and mixed hydrometeor texture. |
+| **VEL_TEX** Velocity texture | Local VEL variability | m/s | Shear/noise/turbulence context around couplets and boundaries. |
+| **SW_TEX** Spectrum-width texture | Local SW variability | m/s | Turbulence/noise structure. |
+| **ZDR_TEX** ZDR texture | Local ZDR variability | dB | Hail/mixed phase/noise context. |
+| **RHO_TEX** CC texture | Local CC variability | 1 | Debris, hail, biological, and mixed-phase texture context. |
+| **PHI_TEX** Differential-phase texture | Local PHI variability | deg | Phase quality and non-meteorological gate context. |
+| **KDP_TEX** KDP texture | Local KDP variability | deg/km | KDP quality/noise context. |
+| **REF_GRAD_R** Reflectivity range gradient | Along-radial REF gradient | dBZ/km | Sharp cores, boundaries, and attenuation gradients. |
+| **VEL_GRAD_R** Velocity range gradient | Along-radial velocity gradient | 10^-3/s | Radial shear/convergence context. |
+| **MET_QI** Meteorological quality | Quality score for meteorological gates | 1 | Higher confidence that gates are useful meteorological echoes. |
+| **MET_MASK** Meteorological gate mask | Thresholded meteorological quality | 1 | Quick quality-control mask. |
+| **TDS_SCORE** Tornadic debris diagnostic | REF/CC/ZDR style debris confidence score | % | Triage only; verify with raw REF, VEL/SRV, CC, ZDR, and scan height. |
+| **HAIL_SCORE** Dual-pol hail diagnostic | REF/ZDR/CC style hail confidence score | % | Hail triage; verify with raw products and environmental context. |
+| **TURB** Doppler turbulence proxy | Velocity/SW texture-style turbulence proxy | m/s | Turbulence and shear context; pair with SW and VEL texture. |
+
 ## Velocity dealiasing
 
 BowEcho includes velocity unfolding modes for folded velocity data. The

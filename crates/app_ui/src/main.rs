@@ -890,17 +890,41 @@ fn derive_advanced_products_for_volume_cut_arc(
     volume: &Arc<RadarVolume>,
     cut_index: usize,
 ) -> Result<(Arc<RadarVolume>, usize), String> {
+    derive_advanced_products_for_volume_cut_arc_with_config(
+        volume,
+        cut_index,
+        product_engine::DerivationConfig::all_supported(),
+        "Advanced product derivation failed for this tilt",
+    )
+}
+
+fn derive_advanced_product_for_volume_cut_arc(
+    volume: &Arc<RadarVolume>,
+    cut_index: usize,
+    product: product_engine::DerivedSweepProduct,
+) -> Result<(Arc<RadarVolume>, usize), String> {
+    derive_advanced_products_for_volume_cut_arc_with_config(
+        volume,
+        cut_index,
+        product_engine::DerivationConfig::with_products(product_engine::RadarBand::S, [product]),
+        "Advanced product derivation failed for the selected product",
+    )
+}
+
+fn derive_advanced_products_for_volume_cut_arc_with_config(
+    volume: &Arc<RadarVolume>,
+    cut_index: usize,
+    config: product_engine::DerivationConfig,
+    error_message: &str,
+) -> Result<(Arc<RadarVolume>, usize), String> {
     if cut_index >= volume.cuts.len() {
         return Ok((Arc::clone(volume), 0));
     }
     let mut derived = volume.as_ref().clone();
     let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        product_engine::derive_cut_in_place(
-            &mut derived.cuts[cut_index],
-            &product_engine::DerivationConfig::all_supported(),
-        )
+        product_engine::derive_cut_in_place(&mut derived.cuts[cut_index], &config)
     }))
-    .map_err(|_| "Advanced product derivation failed for this tilt".to_owned())?;
+    .map_err(|_| error_message.to_owned())?;
     let inserted = report.inserted.len();
     Ok(if inserted == 0 {
         (Arc::clone(volume), 0)
@@ -926,6 +950,26 @@ fn advanced_derivation_status(
             cut_index + 1
         )
     }
+}
+
+fn ensure_advanced_product_on_volume_cut_arc(
+    volume: Arc<RadarVolume>,
+    cut_index: usize,
+    product: &DisplayProduct,
+) -> Arc<RadarVolume> {
+    let Some(derived_product) = advanced_derived_product_for_display_product(product) else {
+        return volume;
+    };
+    if volume.cuts.is_empty() {
+        return volume;
+    }
+    let cut_index = cut_index.min(volume.cuts.len() - 1);
+    if is_displayable_on_cut(volume.as_ref(), cut_index, product) {
+        return volume;
+    }
+    derive_advanced_product_for_volume_cut_arc(&volume, cut_index, derived_product)
+        .map(|(volume, _)| volume)
+        .unwrap_or(volume)
 }
 
 fn preview_render_head_start(threads: usize) -> Duration {
@@ -7557,6 +7601,8 @@ impl ViewerApp {
         let previous_cut = self.selected_cut;
         let previous_product = self.selected_product.clone();
         let previous_volume_for_panes = self.volume.clone();
+        let volume =
+            ensure_advanced_product_on_volume_cut_arc(volume, previous_cut, &previous_product);
         let next_identity = frame_identity_for_volume(volume.as_ref());
         if self
             .manual_primary_cut_hold
@@ -12936,6 +12982,8 @@ impl ViewerApp {
         };
         let previous_cut = pane.cut.unwrap_or(main_cut);
         let previous_product = pane.product.clone();
+        let volume =
+            ensure_advanced_product_on_volume_cut_arc(volume, previous_cut, &previous_product);
         let require_complete_live_cut =
             frame_status == FrameStatus::LivePartial && !display_live_chunk_updates;
         let (selected_cut, selected_product) =
@@ -40264,6 +40312,15 @@ fn advanced_derived_product_for_moment(
         .find(|product| product.id().eq_ignore_ascii_case(name))
 }
 
+fn advanced_derived_product_for_display_product(
+    product: &DisplayProduct,
+) -> Option<product_engine::DerivedSweepProduct> {
+    match product {
+        DisplayProduct::Moment(moment) => advanced_derived_product_for_moment(moment),
+        _ => None,
+    }
+}
+
 fn advanced_derived_color_family(moment: &MomentType) -> Option<ColorTableFamily> {
     use product_engine::DerivedSweepProduct as Product;
     match advanced_derived_product_for_moment(moment)? {
@@ -57013,8 +57070,7 @@ mod tests {
         assert!(parse_coordinate_search_query("35N 97N").is_err());
     }
 
-    #[test]
-    fn advanced_product_derivation_exposes_engine_products() {
+    fn test_advanced_source_volume(volume_time: DateTime<Utc>) -> RadarVolume {
         let gate_range = radar_core::GateRange {
             first_gate_m: 1000,
             gate_spacing_m: 500,
@@ -57058,8 +57114,14 @@ mod tests {
             MomentType::DifferentialPhase,
             grid(MomentType::DifferentialPhase, phi_values),
         );
-        let mut volume = RadarVolume::new(radar_core::RadarSite::new("TEST"), Utc::now());
+        let mut volume = RadarVolume::new(radar_core::RadarSite::new("TEST"), volume_time);
         volume.cuts.push(cut);
+        volume
+    }
+
+    #[test]
+    fn advanced_product_derivation_exposes_engine_products() {
+        let volume = test_advanced_source_volume(Utc::now());
 
         let (derived, inserted) =
             derive_advanced_products_for_volume_cut_arc(&Arc::new(volume), 0).expect("derive");
@@ -57070,6 +57132,49 @@ mod tests {
         assert!(products.contains(&phif), "{products:?}");
         assert_eq!(product_units(&phif), "deg");
         assert_eq!(phif.color_family(), ColorTableFamily::DifferentialPhase);
+    }
+
+    #[test]
+    fn installed_volume_keeps_selected_advanced_product_by_deriving_cut() {
+        let ctx = egui::Context::default();
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let product = DisplayProduct::Moment(MomentType::Unknown("PHIF".to_owned()));
+        let initial = Arc::new(test_advanced_source_volume(
+            Utc.with_ymd_and_hms(2026, 6, 24, 22, 0, 0)
+                .single()
+                .unwrap(),
+        ));
+        let (derived, inserted) = derive_advanced_product_for_volume_cut_arc(
+            &initial,
+            0,
+            product_engine::DerivedSweepProduct::FilteredDifferentialPhase,
+        )
+        .expect("derive PHIF");
+        assert!(inserted > 0);
+        app.volume = Some(derived);
+        app.selected_cut = 0;
+        app.selected_product = product.clone();
+
+        let incoming = Arc::new(test_advanced_source_volume(
+            Utc.with_ymd_and_hms(2026, 6, 24, 22, 2, 0)
+                .single()
+                .unwrap(),
+        ));
+        assert!(!is_displayable_on_cut(incoming.as_ref(), 0, &product));
+
+        app.install_volume_arc(incoming, None, false, None, FrameStatus::LiveComplete, &ctx);
+
+        let installed = app.volume.as_ref().expect("installed volume");
+        assert_eq!(app.selected_product, product);
+        assert!(is_displayable_on_cut(
+            installed.as_ref(),
+            app.selected_cut,
+            &product
+        ));
+        assert!(
+            global_displayable_products(installed.as_ref()).contains(&product),
+            "product picker should still expose PHIF"
+        );
     }
 
     #[test]

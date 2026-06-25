@@ -390,6 +390,88 @@ fn products(ui: &mut egui::Ui) {
         "",
     );
 
+    subhead(ui, "ADVANCED ON-DEMAND SWEEP PRODUCTS");
+    para(
+        ui,
+        "The PRODUCTS row's Derive advanced button computes extra per-tilt products for the \
+         current visible tilt. KDP is still automatic; these products are computed only when \
+         requested, then stay selectable as live/loop frames advance.",
+    );
+    product_entry(
+        ui,
+        "PHIF / KDP_SD / PHI_TEX / KDP_TEX — Phase diagnostics",
+        "filtered differential phase, KDP uncertainty, and local texture of PHI/KDP.",
+        "use PHIF to inspect a smoother phase field, KDP_SD as confidence context, and \
+         texture fields to find noisy/mixed phase or non-meteorological gates.",
+        "",
+    );
+    product_entry(
+        ui,
+        "AH / PIA / REFC — Reflectivity attenuation correction",
+        "specific attenuation, path-integrated attenuation, and attenuation-corrected REF.",
+        "most useful where heavy rain attenuates the beam; verify against adjacent radars or \
+         higher tilts before treating corrected cores as ground truth.",
+        "",
+    );
+    product_entry(
+        ui,
+        "ADP / PIDA / ZDRC — ZDR attenuation correction",
+        "specific differential attenuation, path-integrated differential attenuation, and \
+         attenuation-corrected ZDR.",
+        "helps keep ZDR arcs/columns interpretable in heavy rain, but calibration and phase \
+         quality still dominate.",
+        "",
+    );
+    product_entry(
+        ui,
+        "RATE_Z / RATE_KDP / RATE — Rain-rate estimates",
+        "Z-R rain rate, KDP rain rate, and a hybrid polarimetric rain-rate field.",
+        "RATE is the most operator-friendly of the three; compare RATE_Z vs RATE_KDP when hail \
+         contamination or attenuation is suspected.",
+        "",
+    );
+    product_entry(
+        ui,
+        "LWC / HKE — Water and hail-loading proxies",
+        "radar liquid-water-content proxy and hail kinetic-energy flux from reflectivity.",
+        "diagnostic context for wet microbursts and hail cores; values depend strongly on \
+         sampling height and beam filling.",
+        "",
+    );
+    product_entry(
+        ui,
+        "CDR / L_RHO / MET_QI / MET_MASK — Hydrometeor quality diagnostics",
+        "circular depolarization ratio, log correlation ratio, meteorological gate quality, \
+         and a binary meteorological gate mask.",
+        "use these as quality-control context before trusting small dual-pol signatures.",
+        "",
+    );
+    product_entry(
+        ui,
+        "REF_TEX / VEL_TEX / SW_TEX / ZDR_TEX / RHO_TEX — Texture fields",
+        "local variability around each gate for reflectivity, velocity, spectrum width, ZDR, \
+         and CC.",
+        "texture highlights noisy gates, boundaries, turbulence, debris, and mixed phase; it is \
+         a signal amplifier, not a standalone diagnosis.",
+        "",
+    );
+    product_entry(
+        ui,
+        "REF_GRAD_R / VEL_GRAD_R / TURB — Radial gradients and turbulence",
+        "range-gradient proxies for REF/VEL plus a Doppler turbulence proxy.",
+        "use gradients to find sharp cores, gust fronts, and shear boundaries; pair TURB with \
+         SW and velocity texture.",
+        "",
+    );
+    product_entry(
+        ui,
+        "TDS_SCORE / HAIL_SCORE — Dual-pol diagnostic scores",
+        "compact percent-style scores for tornadic debris and hail signatures.",
+        "treat as triage: check the raw REF, VEL/SRV, CC, ZDR, warning context, and scan height \
+         before making a call.",
+        "",
+    );
+
     subhead(ui, "DERIVED PRODUCTS");
     para(
         ui,
