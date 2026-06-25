@@ -1386,6 +1386,7 @@ struct ViewerApp {
     map_scale: f32,
     vol3d_map_box_drag: Option<Vol3dMapBoxDrag>,
     place_search_query: String,
+    coordinate_marker: Option<CoordinateMarker>,
     radar_range_km: f32,
     load_timing: Option<LoadTimings>,
     active_load_started_at: Option<Instant>,
@@ -5562,6 +5563,7 @@ impl ViewerApp {
             map_scale: DEFAULT_MAP_SCALE,
             vol3d_map_box_drag: None,
             place_search_query: String::new(),
+            coordinate_marker: None,
             radar_range_km: DEFAULT_RADAR_RANGE_KM,
             load_timing: None,
             active_load_started_at: None,
@@ -20320,6 +20322,7 @@ impl ViewerApp {
         });
         let mut jump_to_place: Option<PlaceSearchResult> = None;
         let mut jump_to_radar_site: Option<usize> = None;
+        let mut jump_to_coordinate: Option<CoordinateMarker> = None;
         let (place_search_lat, place_search_lon) = site_control_pane
             .and_then(|slot| {
                 self.extra_panes
@@ -20327,31 +20330,74 @@ impl ViewerApp {
                     .map(|pane| (pane.map_center_lat, pane.map_center_lon))
             })
             .unwrap_or((self.map_center_lat, self.map_center_lon));
-        let radar_results = radar_site_search_matches(&self.place_search_query, &self.sites, 5);
-        let place_results = place_search_matches(
-            &self.place_search_query,
-            place_search_lat,
-            place_search_lon,
-            8,
-        );
+        let coordinate_result = parse_coordinate_search_query(&self.place_search_query);
+        let coordinate_candidate = coordinate_result
+            .as_ref()
+            .ok()
+            .and_then(|candidate| *candidate);
+        let radar_results = if coordinate_candidate.is_some() || coordinate_result.is_err() {
+            Vec::new()
+        } else {
+            radar_site_search_matches(&self.place_search_query, &self.sites, 5)
+        };
+        let place_results = if coordinate_candidate.is_some() || coordinate_result.is_err() {
+            Vec::new()
+        } else {
+            place_search_matches(
+                &self.place_search_query,
+                place_search_lat,
+                place_search_lon,
+                8,
+            )
+        };
         ui.horizontal(|ui| {
             ui.label("Place");
             let edit_width = (ui.available_width() - 74.0).max(140.0);
             let response = ui.add_sized(
                 egui::vec2(edit_width, PANEL_BUTTON_HEIGHT),
                 egui::TextEdit::singleline(&mut self.place_search_query)
-                    .hint_text("City, town, or radar ID"),
+                    .hint_text("City, town, radar ID, or lat lon"),
             );
             let submitted =
                 response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             if fixed_action_button(ui, "Go", 42.0).clicked() || submitted {
-                if let Some((index, _)) = radar_results.first() {
-                    jump_to_radar_site = Some(*index);
-                } else {
-                    jump_to_place = place_results.first().copied();
+                match &coordinate_result {
+                    Ok(Some(coordinate)) => jump_to_coordinate = Some(*coordinate),
+                    Err(message) => self.status = message.clone(),
+                    Ok(None) => {
+                        if let Some((index, _)) = radar_results.first() {
+                            jump_to_radar_site = Some(*index);
+                        } else {
+                            jump_to_place = place_results.first().copied();
+                        }
+                    }
                 }
             }
         });
+        if let Some(coordinate) = coordinate_candidate {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = ROW_SPACING_X;
+                if ui
+                    .small_button(format!("Drop {}", coordinate_marker_label(coordinate)))
+                    .clicked()
+                {
+                    jump_to_coordinate = Some(coordinate);
+                }
+            });
+        }
+        if let Some(marker) = self.coordinate_marker {
+            let mut clear_marker = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.weak(format!("Marker {}", coordinate_marker_label(marker)));
+                if ui.small_button("Clear").clicked() {
+                    clear_marker = true;
+                }
+            });
+            if clear_marker {
+                self.coordinate_marker = None;
+                self.status = "Coordinate marker cleared".to_owned();
+            }
+        }
         if !radar_results.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = ROW_SPACING_X;
@@ -20417,6 +20463,22 @@ impl ViewerApp {
                 self.center_map_on(result.lat, result.lon);
                 self.map_scale = self.map_scale.max(420.0);
                 self.status = format!("Centered map on {}", place_search_display_name(&result));
+            }
+        }
+        if let Some(coordinate) = jump_to_coordinate {
+            self.coordinate_marker = Some(coordinate);
+            if let Some(slot) = site_control_pane {
+                if let Some(pane) = self.extra_panes.get_mut(slot) {
+                    pane.map_center_lat = coordinate.lat.clamp(-85.0, 85.0);
+                    pane.map_center_lon = normalize_lon(coordinate.lon);
+                    pane.map_scale = pane.map_scale.max(420.0);
+                    pane.status =
+                        format!("Dropped marker at {}", coordinate_marker_label(coordinate));
+                }
+            } else {
+                self.center_map_on(coordinate.lat, coordinate.lon);
+                self.map_scale = self.map_scale.max(420.0);
+                self.status = format!("Dropped marker at {}", coordinate_marker_label(coordinate));
             }
         }
         // Favorites chip row (spec §1 RADAR ▸ SITE): each chip = one-click
@@ -24984,6 +25046,7 @@ impl ViewerApp {
         self.draw_raob_site_markers(painter, &raob_points, hovered_raob);
         self.draw_radar_layer_markers(painter, rect);
         self.draw_loaded_volume_marker(painter, rect);
+        self.draw_coordinate_marker(painter, rect);
         self.draw_colorbar(painter, rect);
         self.draw_mode_chip(painter, rect);
         self.draw_raw_velocity_tag(painter, rect);
@@ -25462,6 +25525,7 @@ impl ViewerApp {
             self.draw_raob_site_markers(&cell_painter, &raob_points, hovered_raob);
             self.draw_radar_layer_markers(&cell_painter, cell);
             self.draw_loaded_volume_marker(&cell_painter, cell);
+            self.draw_coordinate_marker(&cell_painter, cell);
             if cell_index == 0 {
                 self.draw_colorbar(&cell_painter, cell);
             } else if self.extra_panes[cell_index - 1].texture.is_some() {
@@ -36891,6 +36955,33 @@ impl ViewerApp {
         }
     }
 
+    fn draw_coordinate_marker(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let Some(marker) = self.coordinate_marker else {
+            return;
+        };
+        let position = self.lon_lat_to_screen(rect, marker.lon, marker.lat);
+        if !rect.expand(24.0).contains(position) {
+            return;
+        }
+
+        let fill = egui::Color32::from_rgb(255, 215, 72);
+        let outline = egui::Color32::from_rgb(15, 18, 24);
+        painter.circle_filled(position, 5.5, fill);
+        painter.circle_stroke(position, 8.5, egui::Stroke::new(2.0, outline));
+        painter.circle_stroke(
+            position,
+            11.0,
+            egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 245, 170)),
+        );
+        painter.text(
+            position + egui::vec2(12.0, -10.0),
+            egui::Align2::LEFT_CENTER,
+            coordinate_marker_label(marker),
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_rgb(255, 245, 210),
+        );
+    }
+
     fn loaded_volume_marker_should_draw_text(&self, site_id: &str) -> bool {
         let Some(site) = self.sites.get(self.selected_site_index) else {
             return true;
@@ -37587,6 +37678,24 @@ struct PlaceSearchResult {
     source_rank: u8,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CoordinateMarker {
+    lat: f32,
+    lon: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CoordinateAxis {
+    Latitude,
+    Longitude,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CoordinateComponent {
+    value: f32,
+    axis: Option<CoordinateAxis>,
+}
+
 #[derive(Clone, Copy)]
 struct PlaceSearchSource {
     labels: &'static [basemap_data::BasemapLabel],
@@ -37663,6 +37772,121 @@ fn place_search_matches(
         }
     }
     results
+}
+
+fn parse_coordinate_search_query(query: &str) -> Result<Option<CoordinateMarker>, String> {
+    let tokens = query
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '+' || ch == '-' || ch == '.'))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if tokens.len() != 2 {
+        return Ok(None);
+    }
+    let Some(first) = parse_coordinate_component(tokens[0]) else {
+        return Ok(None);
+    };
+    let Some(second) = parse_coordinate_component(tokens[1]) else {
+        return Ok(None);
+    };
+    resolve_coordinate_pair(first, second).map(Some)
+}
+
+fn parse_coordinate_component(token: &str) -> Option<CoordinateComponent> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let mut chars = token.chars();
+    let suffix = chars.next_back()?.to_ascii_uppercase();
+    let (number, axis) = match suffix {
+        'N' => (&token[..token.len() - 1], Some(CoordinateAxis::Latitude)),
+        'S' => (&token[..token.len() - 1], Some(CoordinateAxis::Latitude)),
+        'E' => (&token[..token.len() - 1], Some(CoordinateAxis::Longitude)),
+        'W' => (&token[..token.len() - 1], Some(CoordinateAxis::Longitude)),
+        _ => (token, None),
+    };
+    let mut value = number.parse::<f32>().ok()?;
+    if matches!(suffix, 'S' | 'W') {
+        value = -value.abs();
+    } else if matches!(suffix, 'N' | 'E') {
+        value = value.abs();
+    }
+    Some(CoordinateComponent { value, axis })
+}
+
+fn resolve_coordinate_pair(
+    first: CoordinateComponent,
+    second: CoordinateComponent,
+) -> Result<CoordinateMarker, String> {
+    let pair = match (first.axis, second.axis) {
+        (Some(CoordinateAxis::Latitude), Some(CoordinateAxis::Longitude)) => {
+            Some(CoordinateMarker {
+                lat: first.value,
+                lon: second.value,
+            })
+        }
+        (Some(CoordinateAxis::Longitude), Some(CoordinateAxis::Latitude)) => {
+            Some(CoordinateMarker {
+                lat: second.value,
+                lon: first.value,
+            })
+        }
+        (Some(CoordinateAxis::Latitude), None) => Some(CoordinateMarker {
+            lat: first.value,
+            lon: second.value,
+        }),
+        (Some(CoordinateAxis::Longitude), None) => Some(CoordinateMarker {
+            lat: second.value,
+            lon: first.value,
+        }),
+        (None, Some(CoordinateAxis::Latitude)) => Some(CoordinateMarker {
+            lat: second.value,
+            lon: first.value,
+        }),
+        (None, Some(CoordinateAxis::Longitude)) => Some(CoordinateMarker {
+            lat: first.value,
+            lon: second.value,
+        }),
+        (None, None) => {
+            if valid_lat(first.value) && valid_lon(second.value) {
+                Some(CoordinateMarker {
+                    lat: first.value,
+                    lon: second.value,
+                })
+            } else if valid_lon(first.value) && valid_lat(second.value) {
+                Some(CoordinateMarker {
+                    lat: second.value,
+                    lon: first.value,
+                })
+            } else {
+                None
+            }
+        }
+        (Some(CoordinateAxis::Latitude), Some(CoordinateAxis::Latitude))
+        | (Some(CoordinateAxis::Longitude), Some(CoordinateAxis::Longitude)) => None,
+    };
+    let Some(pair) = pair else {
+        return Err("Coordinates must be a latitude/longitude pair".to_owned());
+    };
+    if !valid_lat(pair.lat) || !valid_lon(pair.lon) {
+        return Err("Coordinates must be latitude -90..90 and longitude -180..180".to_owned());
+    }
+    Ok(CoordinateMarker {
+        lat: pair.lat,
+        lon: normalize_lon(pair.lon),
+    })
+}
+
+fn valid_lat(value: f32) -> bool {
+    value.is_finite() && (-90.0..=90.0).contains(&value)
+}
+
+fn valid_lon(value: f32) -> bool {
+    value.is_finite() && (-180.0..=180.0).contains(&value)
+}
+
+fn coordinate_marker_label(marker: CoordinateMarker) -> String {
+    format!("{:.4}, {:.4}", marker.lat, marker.lon)
 }
 
 fn radar_site_search_matches(
@@ -56376,6 +56600,47 @@ mod tests {
     }
 
     #[test]
+    fn coordinate_search_accepts_decimal_lat_lon() {
+        let marker = parse_coordinate_search_query("35.467, -97.516")
+            .expect("parse")
+            .expect("coordinate");
+
+        assert!((marker.lat - 35.467).abs() < 0.001);
+        assert!((marker.lon + 97.516).abs() < 0.001);
+    }
+
+    #[test]
+    fn coordinate_search_accepts_direction_suffixes() {
+        let marker = parse_coordinate_search_query("35.467N 97.516W")
+            .expect("parse")
+            .expect("coordinate");
+
+        assert!((marker.lat - 35.467).abs() < 0.001);
+        assert!((marker.lon + 97.516).abs() < 0.001);
+    }
+
+    #[test]
+    fn coordinate_search_accepts_unambiguous_lon_lat_order() {
+        let marker = parse_coordinate_search_query("-97.516 35.467")
+            .expect("parse")
+            .expect("coordinate");
+
+        assert!((marker.lat - 35.467).abs() < 0.001);
+        assert!((marker.lon + 97.516).abs() < 0.001);
+    }
+
+    #[test]
+    fn coordinate_search_ignores_plain_place_names() {
+        assert_eq!(parse_coordinate_search_query("oklahoma city"), Ok(None));
+    }
+
+    #[test]
+    fn coordinate_search_rejects_out_of_range_pairs() {
+        assert!(parse_coordinate_search_query("95, -200").is_err());
+        assert!(parse_coordinate_search_query("35N 97N").is_err());
+    }
+
+    #[test]
     fn place_search_labels_duplicate_names_with_state() {
         let results = place_search_matches("portland", 39.0, -98.0, 12);
 
@@ -58319,6 +58584,7 @@ mod tests {
             map_scale: 100.0,
             vol3d_map_box_drag: None,
             place_search_query: String::new(),
+            coordinate_marker: None,
             radar_range_km: DEFAULT_RADAR_RANGE_KM,
             load_timing: None,
             active_load_started_at: None,
