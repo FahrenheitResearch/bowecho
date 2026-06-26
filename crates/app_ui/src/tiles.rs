@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -112,23 +112,47 @@ pub fn zoom_for_km_per_px(km_per_px: f32, center_lat: f32, pixels_per_point: f32
 }
 
 type DecodedTile = (TileId, u32, u32, Vec<u8>);
+type TileCacheKey = (u8, TileId);
+
+struct TileEntry {
+    texture: egui::TextureHandle,
+    last_used: u64,
+}
+
+struct TileQueue {
+    jobs: Mutex<VecDeque<(TileStyle, TileId)>>,
+    wake: Condvar,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TilePollStats {
+    pub processed: usize,
+    pub installed: usize,
+    pub failed: usize,
+    pub deferred: bool,
+    pub elapsed_ms: f32,
+}
 
 /// Background fetch pool + texture cache. One instance per app.
 pub struct TileLayer {
-    textures: HashMap<(u8, TileId), egui::TextureHandle>,
-    lru: VecDeque<(u8, TileId)>,
-    pending: HashSet<(u8, TileId)>,
-    failed: HashMap<(u8, TileId), std::time::Instant>,
-    queue: Arc<Mutex<VecDeque<(TileStyle, TileId)>>>,
+    textures: HashMap<TileCacheKey, TileEntry>,
+    usage_generation: u64,
+    pending: HashSet<TileCacheKey>,
+    failed: HashMap<TileCacheKey, std::time::Instant>,
+    queue: Arc<TileQueue>,
     workers: Arc<AtomicUsize>,
     tx: mpsc::Sender<(u8, DecodedTile)>,
     rx: mpsc::Receiver<(u8, DecodedTile)>,
     cache_dir: Option<PathBuf>,
+    last_poll_stats: TilePollStats,
 }
 
 const MAX_TEXTURES: usize = 220;
 const MAX_WORKERS: usize = 4;
 const FAILURE_RETRY_SECS: u64 = 60;
+const MAX_TEXTURE_INSTALLS_PER_POLL: usize = 6;
+const MAX_TILE_RESULTS_PER_POLL: usize = 24;
+const TEXTURE_INSTALL_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
 
 fn style_slot(style: TileStyle) -> u8 {
     match style {
@@ -144,25 +168,48 @@ impl TileLayer {
         let (tx, rx) = mpsc::channel();
         Self {
             textures: HashMap::new(),
-            lru: VecDeque::new(),
+            usage_generation: 0,
             pending: HashSet::new(),
             failed: HashMap::new(),
-            queue: Arc::new(Mutex::new(VecDeque::new())),
+            queue: Arc::new(TileQueue {
+                jobs: Mutex::new(VecDeque::new()),
+                wake: Condvar::new(),
+            }),
             workers: Arc::new(AtomicUsize::new(0)),
             tx,
             rx,
             cache_dir,
+            last_poll_stats: TilePollStats::default(),
         }
     }
 
     /// Install decoded tiles arriving from workers. Returns true if any new
     /// texture landed (callers repaint).
     pub fn poll(&mut self, ctx: &egui::Context) -> bool {
-        let mut installed = false;
-        while let Ok((slot, (tile, width, height, rgba))) = self.rx.try_recv() {
+        self.poll_with_stats(ctx).installed > 0
+    }
+
+    pub fn last_poll_stats(&self) -> TilePollStats {
+        self.last_poll_stats
+    }
+
+    fn poll_with_stats(&mut self, ctx: &egui::Context) -> TilePollStats {
+        let mut stats = TilePollStats::default();
+        let started_at = std::time::Instant::now();
+        loop {
+            if tile_poll_budget_exhausted(stats.processed, stats.installed, started_at.elapsed()) {
+                stats.deferred = true;
+                ctx.request_repaint();
+                break;
+            }
+            let Ok((slot, (tile, width, height, rgba))) = self.rx.try_recv() else {
+                break;
+            };
+            stats.processed += 1;
             self.pending.remove(&(slot, tile));
             if rgba.is_empty() {
                 self.failed.insert((slot, tile), std::time::Instant::now());
+                stats.failed += 1;
                 continue;
             }
             let image =
@@ -173,41 +220,35 @@ impl TileLayer {
                 egui::TextureOptions::LINEAR,
             );
             let key = (slot, tile);
-            if self.textures.insert(key, texture).is_none() {
-                self.lru.push_back(key);
-            }
-            installed = true;
+            let last_used = self.next_usage_generation();
+            self.textures.insert(key, TileEntry { texture, last_used });
+            stats.installed += 1;
         }
-        while self.lru.len() > MAX_TEXTURES {
-            if let Some(old) = self.lru.pop_front() {
-                self.textures.remove(&old);
-            }
-        }
-        installed
+        self.trim_textures();
+        stats.elapsed_ms = started_at.elapsed().as_secs_f32() * 1000.0;
+        self.last_poll_stats = stats;
+        stats
     }
 
     pub fn texture(&mut self, style: TileStyle, tile: TileId) -> Option<&egui::TextureHandle> {
         let key = (style_slot(style), tile);
-        if self.textures.contains_key(&key) {
-            // Touch for LRU.
-            if let Some(index) = self.lru.iter().position(|entry| *entry == key) {
-                let entry = self.lru.remove(index).expect("lru entry");
-                self.lru.push_back(entry);
-            }
-            return self.textures.get(&key);
-        }
-        None
+        let last_used = self.next_usage_generation();
+        self.textures.get_mut(&key).map(|entry| {
+            entry.last_used = last_used;
+            &entry.texture
+        })
     }
 
     /// Drop in-memory tile state after the on-disk tile cache is cleared.
     pub fn clear_memory(&mut self) {
         self.textures.clear();
-        self.lru.clear();
+        self.usage_generation = 0;
         self.pending.clear();
         self.failed.clear();
-        if let Ok(mut queue) = self.queue.lock() {
+        if let Ok(mut queue) = self.queue.jobs.lock() {
             queue.clear();
         }
+        self.last_poll_stats = TilePollStats::default();
     }
 
     /// Queue a fetch for a missing tile (newest requests first).
@@ -233,7 +274,7 @@ impl TileLayer {
         }
         self.pending.insert(key);
         {
-            let mut queue = self.queue.lock().expect("tile queue");
+            let mut queue = self.queue.jobs.lock().expect("tile queue");
             queue.push_front((style, tile));
             while queue.len() > 96 {
                 if let Some((style, tile)) = queue.pop_back() {
@@ -242,6 +283,7 @@ impl TileLayer {
             }
         }
         self.spawn_workers();
+        self.queue.wake.notify_all();
     }
 
     fn spawn_workers(&self) {
@@ -256,9 +298,14 @@ impl TileLayer {
                     eprintln!("TILE WORKER START");
                 }
                 loop {
-                    let job = queue.lock().expect("tile queue").pop_front();
-                    let Some((style, tile)) = job else {
-                        break;
+                    let (style, tile) = {
+                        let mut guard = queue.jobs.lock().expect("tile queue");
+                        loop {
+                            if let Some(job) = guard.pop_front() {
+                                break job;
+                            }
+                            guard = queue.wake.wait(guard).expect("tile queue wake");
+                        }
                     };
                     let slot = style_slot(style);
                     let decoded = fetch_and_decode(style, tile, cache_dir.as_deref());
@@ -277,10 +324,41 @@ impl TileLayer {
                         break;
                     }
                 }
+                // Workers are normally persistent; this only runs if the UI
+                // receiver disappears during shutdown or tests.
                 workers.fetch_sub(1, Ordering::Relaxed);
             });
         }
     }
+
+    fn next_usage_generation(&mut self) -> u64 {
+        self.usage_generation = self.usage_generation.saturating_add(1);
+        self.usage_generation
+    }
+
+    fn trim_textures(&mut self) {
+        while self.textures.len() > MAX_TEXTURES {
+            let Some(oldest) = self
+                .textures
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.textures.remove(&oldest);
+        }
+    }
+}
+
+fn tile_poll_budget_exhausted(
+    processed: usize,
+    installed: usize,
+    elapsed: std::time::Duration,
+) -> bool {
+    processed >= MAX_TILE_RESULTS_PER_POLL
+        || installed >= MAX_TEXTURE_INSTALLS_PER_POLL
+        || (installed > 0 && elapsed >= TEXTURE_INSTALL_BUDGET)
 }
 
 fn fetch_and_decode(
@@ -330,5 +408,35 @@ mod tests {
         // Continental overview should be small.
         let zoom = zoom_for_km_per_px(8.0, 39.0, 1.0);
         assert!(zoom <= 6, "{zoom}");
+    }
+
+    #[test]
+    fn tile_poll_budget_limits_texture_install_bursts() {
+        assert!(!tile_poll_budget_exhausted(
+            0,
+            0,
+            std::time::Duration::from_secs(10)
+        ));
+        assert!(tile_poll_budget_exhausted(
+            MAX_TILE_RESULTS_PER_POLL,
+            0,
+            std::time::Duration::ZERO
+        ));
+        assert!(tile_poll_budget_exhausted(
+            0,
+            MAX_TEXTURE_INSTALLS_PER_POLL,
+            std::time::Duration::ZERO
+        ));
+        assert!(tile_poll_budget_exhausted(1, 1, TEXTURE_INSTALL_BUDGET));
+    }
+
+    #[test]
+    fn tile_usage_generation_is_monotonic_and_reset_on_clear() {
+        let mut layer = TileLayer::new(None);
+
+        assert_eq!(layer.next_usage_generation(), 1);
+        assert_eq!(layer.next_usage_generation(), 2);
+        layer.clear_memory();
+        assert_eq!(layer.next_usage_generation(), 1);
     }
 }

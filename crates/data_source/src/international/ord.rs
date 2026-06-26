@@ -67,6 +67,12 @@ const ARCHIVE_BUCKET_BASE: &str = "https://s3.waw3-1.cloudferro.com/openradar-ar
 /// stamp when its own stamp is inside this trailing window (same role as
 /// the DWD cycle window; ORD national cycles run 5 minutes or slower).
 const CYCLE_WINDOW_MINUTES: i64 = 5;
+/// Some ORD countries split product families across different directories.
+/// Dublin, for example, publishes SCAN reflectivity near hourly while PVOL
+/// carries VRADH every 15 minutes. A mixed REF+VEL frame may use the newest
+/// velocity file at or before the reflectivity anchor, bounded so stale
+/// Doppler data cannot silently ride along with newer reflectivity.
+const MIXED_SOURCE_MAX_AGE_MINUTES: i64 = 20;
 
 /// How many hourly key prefixes `latest` walks back from now before
 /// declaring a site silent (covers publication lag and short outages
@@ -316,6 +322,7 @@ pub fn archive_plans_for_hour(
 
     let mut empty_kinds = Vec::new();
     let mut collections = Vec::new();
+    let mut keys_by_kind = Vec::new();
     for kind in kinds {
         let mut keys = list_hour_keys_from_base(ARCHIVE_BUCKET_BASE, dir, site_id, kind, hour_utc)
             .map_err(|err| format!("ORD archive '{site_id}': {err}"))?;
@@ -328,12 +335,20 @@ pub fn archive_plans_for_hour(
         )
         .map_err(|err| format!("ORD archive '{site_id}': {err}"))?;
         keys.extend(previous);
+        keys.sort();
+        keys.dedup();
+        keys_by_kind.push((kind, keys.clone()));
         let plans = archive_plans_from_keys(site_id, kind, &keys, hour_utc)?;
         if !plans.is_empty() {
             collections.push(plan_collection(site_id, kind, plans));
         } else {
             empty_kinds.push(kind.dir());
         }
+    }
+    if let Some(collection) =
+        mixed_plan_collection_from_kind_keys(ARCHIVE_BUCKET_BASE, site_id, &keys_by_kind, hour_utc)?
+    {
+        collections.push(collection);
     }
 
     if let Some(best) = best_plan_collection(collections) {
@@ -447,7 +462,9 @@ impl IntlProvider for OrdProvider {
 
         let now = Utc::now();
         let mut best: Option<OrdFrameCandidate> = None;
+        let mut keys_by_kind = Vec::new();
         for kind in kinds {
+            let mut kind_keys = Vec::new();
             for slot in 0..=HOUR_LOOKBACK_SLOTS {
                 let hour = now - chrono::Duration::hours(slot);
                 // A transient listing failure must ERROR the tick, never
@@ -471,11 +488,23 @@ impl IntlProvider for OrdProvider {
                     list_hour_keys(dir, site_id, kind, hour - chrono::Duration::hours(1))
                         .map_err(|err| format!("ORD '{site_id}': {err}"))?;
                 all.extend(previous);
+                kind_keys.extend(all.iter().cloned());
                 let candidate = plan_candidate_from_keys(site_id, kind, &all)?;
                 if ord_candidate_is_better(&candidate, best.as_ref()) {
                     best = Some(candidate);
                 }
             }
+            if !kind_keys.is_empty() {
+                kind_keys.sort();
+                kind_keys.dedup();
+                keys_by_kind.push((kind, kind_keys));
+            }
+        }
+        if let Some(candidate) =
+            mixed_candidate_from_kind_keys(BUCKET_BASE, site_id, &keys_by_kind)?
+            && ord_candidate_is_better(&candidate, best.as_ref())
+        {
+            best = Some(candidate);
         }
         if let Some(best) = best {
             return Ok(best.frame);
@@ -506,8 +535,10 @@ impl IntlProvider for OrdProvider {
         let now = truncate_to_utc_hour(Utc::now());
         let mut first_error = None;
         let mut collections = Vec::new();
+        let mut keys_by_kind = Vec::new();
         for kind in kinds {
             let mut plans = Vec::new();
+            let mut kind_keys = Vec::new();
             for slot in 0..=RECENT_HOUR_LOOKBACK_SLOTS {
                 let hour = now - chrono::Duration::hours(slot);
                 let mut keys = match list_hour_keys(dir, site_id, kind, hour) {
@@ -526,6 +557,7 @@ impl IntlProvider for OrdProvider {
                         first_error.get_or_insert(err);
                     }
                 }
+                kind_keys.extend(keys.iter().cloned());
                 let mut hour_plans =
                     plans_from_keys_for_hour(BUCKET_BASE, site_id, kind, &keys, hour)?;
                 plans.append(&mut hour_plans);
@@ -538,6 +570,16 @@ impl IntlProvider for OrdProvider {
                 plans.dedup_by(|left, right| left.frame.identity == right.frame.identity);
                 collections.push(plan_collection(site_id, kind, plans));
             }
+            if !kind_keys.is_empty() {
+                kind_keys.sort();
+                kind_keys.dedup();
+                keys_by_kind.push((kind, kind_keys));
+            }
+        }
+        if let Some(collection) =
+            mixed_recent_plan_collection_from_kind_keys(BUCKET_BASE, site_id, &keys_by_kind)?
+        {
+            collections.push(collection);
         }
 
         if let Some(best) = best_plan_collection(collections) {
@@ -921,7 +963,17 @@ fn plan_candidate_from_files_for_anchor(
     files: &[OrdFile],
     anchor: NaiveDateTime,
 ) -> Result<OrdFrameCandidate, String> {
-    let mut chosen = choose_files_for_anchor(files, kind, anchor);
+    let chosen = choose_files_for_anchor(files, kind, anchor);
+    plan_candidate_from_chosen_files(bucket_base, site_id, kind, anchor, chosen)
+}
+
+fn plan_candidate_from_chosen_files(
+    bucket_base: &str,
+    site_id: &str,
+    kind: ObjectKind,
+    anchor: NaiveDateTime,
+    mut chosen: Vec<OrdFile>,
+) -> Result<OrdFrameCandidate, String> {
     if chosen.is_empty() {
         return Err(format!(
             "ORD '{site_id}': no files matched scan window anchored at {}",
@@ -979,6 +1031,305 @@ fn plan_candidate_from_files_for_anchor(
         object_kind: kind,
         quality,
         frame,
+    })
+}
+
+fn mixed_candidate_from_kind_keys(
+    bucket_base: &str,
+    site_id: &str,
+    keys_by_kind: &[(ObjectKind, Vec<String>)],
+) -> Result<Option<OrdFrameCandidate>, String> {
+    let mut best = None;
+    for (ref_kind, ref_keys, vel_kind, vel_keys) in mixed_key_pairs(keys_by_kind) {
+        if let Some(candidate) = mixed_ref_velocity_candidate_from_keys(
+            bucket_base,
+            site_id,
+            ref_kind,
+            ref_keys,
+            vel_kind,
+            vel_keys,
+        )? && ord_candidate_is_better(&candidate, best.as_ref())
+        {
+            best = Some(candidate);
+        }
+    }
+    Ok(best)
+}
+
+fn mixed_plan_collection_from_kind_keys(
+    bucket_base: &str,
+    site_id: &str,
+    keys_by_kind: &[(ObjectKind, Vec<String>)],
+    hour_utc: DateTime<Utc>,
+) -> Result<Option<OrdPlanCollection>, String> {
+    let mut plans = Vec::new();
+    for (ref_kind, ref_keys, vel_kind, vel_keys) in mixed_key_pairs(keys_by_kind) {
+        plans.extend(mixed_ref_velocity_plans_from_keys(
+            bucket_base,
+            site_id,
+            ref_kind,
+            ref_keys,
+            vel_kind,
+            vel_keys,
+            hour_utc,
+        )?);
+    }
+    Ok(plan_collection_from_mixed_plans(site_id, plans))
+}
+
+fn mixed_recent_plan_collection_from_kind_keys(
+    bucket_base: &str,
+    site_id: &str,
+    keys_by_kind: &[(ObjectKind, Vec<String>)],
+) -> Result<Option<OrdPlanCollection>, String> {
+    let mut plans = Vec::new();
+    for (ref_kind, ref_keys, vel_kind, vel_keys) in mixed_key_pairs(keys_by_kind) {
+        plans.extend(mixed_ref_velocity_plans_from_keys_unbounded(
+            bucket_base,
+            site_id,
+            ref_kind,
+            ref_keys,
+            vel_kind,
+            vel_keys,
+        )?);
+    }
+    Ok(plan_collection_from_mixed_plans(site_id, plans))
+}
+
+fn mixed_key_pairs(
+    keys_by_kind: &[(ObjectKind, Vec<String>)],
+) -> Vec<(ObjectKind, &[String], ObjectKind, &[String])> {
+    let keys_for = |kind| {
+        keys_by_kind
+            .iter()
+            .find(|(candidate, _)| *candidate == kind)
+            .map(|(_, keys)| keys.as_slice())
+            .unwrap_or(&[])
+    };
+    vec![
+        (
+            ObjectKind::Scan,
+            keys_for(ObjectKind::Scan),
+            ObjectKind::Pvol,
+            keys_for(ObjectKind::Pvol),
+        ),
+        (
+            ObjectKind::Pvol,
+            keys_for(ObjectKind::Pvol),
+            ObjectKind::Scan,
+            keys_for(ObjectKind::Scan),
+        ),
+    ]
+}
+
+fn mixed_ref_velocity_candidate_from_keys(
+    bucket_base: &str,
+    site_id: &str,
+    ref_kind: ObjectKind,
+    ref_keys: &[String],
+    vel_kind: ObjectKind,
+    vel_keys: &[String],
+) -> Result<Option<OrdFrameCandidate>, String> {
+    let ref_files = parse_ord_files_for_site(ref_keys, site_id);
+    let vel_files = parse_ord_files_for_site(vel_keys, site_id);
+    let mut anchors = reflectivity_anchors_desc(&ref_files);
+    for anchor in anchors.drain(..) {
+        if let Some(candidate) = mixed_ref_velocity_candidate_for_anchor(
+            bucket_base,
+            site_id,
+            ref_kind,
+            &ref_files,
+            vel_kind,
+            &vel_files,
+            anchor,
+        )? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn mixed_ref_velocity_plans_from_keys(
+    bucket_base: &str,
+    site_id: &str,
+    ref_kind: ObjectKind,
+    ref_keys: &[String],
+    vel_kind: ObjectKind,
+    vel_keys: &[String],
+    hour_utc: DateTime<Utc>,
+) -> Result<Vec<OrdArchivePlan>, String> {
+    let hour_start = hour_utc.naive_utc();
+    let hour_end = hour_start + chrono::Duration::hours(1);
+    mixed_ref_velocity_plans_from_keys_inner(
+        bucket_base,
+        site_id,
+        ref_kind,
+        ref_keys,
+        vel_kind,
+        vel_keys,
+        Some((hour_start, hour_end)),
+    )
+}
+
+fn mixed_ref_velocity_plans_from_keys_unbounded(
+    bucket_base: &str,
+    site_id: &str,
+    ref_kind: ObjectKind,
+    ref_keys: &[String],
+    vel_kind: ObjectKind,
+    vel_keys: &[String],
+) -> Result<Vec<OrdArchivePlan>, String> {
+    mixed_ref_velocity_plans_from_keys_inner(
+        bucket_base,
+        site_id,
+        ref_kind,
+        ref_keys,
+        vel_kind,
+        vel_keys,
+        None,
+    )
+}
+
+fn mixed_ref_velocity_plans_from_keys_inner(
+    bucket_base: &str,
+    site_id: &str,
+    ref_kind: ObjectKind,
+    ref_keys: &[String],
+    vel_kind: ObjectKind,
+    vel_keys: &[String],
+    hour_window: Option<(NaiveDateTime, NaiveDateTime)>,
+) -> Result<Vec<OrdArchivePlan>, String> {
+    let ref_files = parse_ord_files_for_site(ref_keys, site_id);
+    let vel_files = parse_ord_files_for_site(vel_keys, site_id);
+    let mut plans = Vec::new();
+    for anchor in reflectivity_anchors_desc(&ref_files) {
+        if let Some((start, end)) = hour_window
+            && (anchor < start || anchor >= end)
+        {
+            continue;
+        }
+        if let Some(candidate) = mixed_ref_velocity_candidate_for_anchor(
+            bucket_base,
+            site_id,
+            ref_kind,
+            &ref_files,
+            vel_kind,
+            &vel_files,
+            anchor,
+        )? {
+            plans.push(OrdArchivePlan {
+                stamp_utc: DateTime::from_naive_utc_and_offset(candidate.stamp, Utc),
+                object_kind: "SCAN+PVOL",
+                frame: candidate.frame,
+            });
+        }
+    }
+    plans.sort_by_key(|plan| plan.stamp_utc);
+    plans.dedup_by(|left, right| left.frame.identity == right.frame.identity);
+    Ok(plans)
+}
+
+fn mixed_ref_velocity_candidate_for_anchor(
+    bucket_base: &str,
+    site_id: &str,
+    ref_kind: ObjectKind,
+    ref_files: &[OrdFile],
+    vel_kind: ObjectKind,
+    vel_files: &[OrdFile],
+    anchor: NaiveDateTime,
+) -> Result<Option<OrdFrameCandidate>, String> {
+    let mut ref_chosen: Vec<OrdFile> = choose_files_for_anchor(ref_files, ref_kind, anchor)
+        .into_iter()
+        .filter(OrdFile::has_reflectivity)
+        .collect();
+    if ref_chosen.is_empty() {
+        return Ok(None);
+    }
+    let mut vel_chosen = choose_velocity_files_at_or_before_anchor(vel_files, vel_kind, anchor);
+    if vel_chosen.is_empty() {
+        return Ok(None);
+    }
+    ref_chosen.append(&mut vel_chosen);
+    if !chosen_has_reflectivity_and_velocity(&ref_chosen) {
+        return Ok(None);
+    }
+    Ok(Some(plan_candidate_from_chosen_files(
+        bucket_base,
+        site_id,
+        ref_kind,
+        anchor,
+        ref_chosen,
+    )?))
+}
+
+fn parse_ord_files_for_site(keys: &[String], site_id: &str) -> Vec<OrdFile> {
+    keys.iter()
+        .filter_map(|key| OrdFile::parse(key, site_id))
+        .collect()
+}
+
+fn reflectivity_anchors_desc(files: &[OrdFile]) -> Vec<NaiveDateTime> {
+    let mut anchors: Vec<NaiveDateTime> = files
+        .iter()
+        .filter(|file| file.has_reflectivity())
+        .map(|file| file.stamp)
+        .collect();
+    anchors.sort_unstable();
+    anchors.dedup();
+    anchors.reverse();
+    anchors
+}
+
+fn choose_velocity_files_at_or_before_anchor(
+    files: &[OrdFile],
+    kind: ObjectKind,
+    anchor: NaiveDateTime,
+) -> Vec<OrdFile> {
+    let oldest_allowed = anchor - chrono::Duration::minutes(MIXED_SOURCE_MAX_AGE_MINUTES);
+    let mut chosen = Vec::new();
+    for file in files {
+        if !file.has_velocity() || file.stamp < oldest_allowed || file.stamp > anchor {
+            continue;
+        }
+        let group = chosen.iter_mut().find(|other: &&mut OrdFile| match kind {
+            ObjectKind::Pvol => other.moments == file.moments,
+            ObjectKind::Scan => {
+                other.moments == file.moments && other.elevations == file.elevations
+            }
+        });
+        match group {
+            Some(other) => {
+                let newer = (file.stamp, file.elevation_count(), &file.key)
+                    > (other.stamp, other.elevation_count(), &other.key);
+                if newer {
+                    *other = file.clone();
+                }
+            }
+            None => chosen.push(file.clone()),
+        }
+    }
+    chosen
+}
+
+fn plan_collection_from_mixed_plans(
+    site_id: &str,
+    mut plans: Vec<OrdArchivePlan>,
+) -> Option<OrdPlanCollection> {
+    if plans.is_empty() {
+        return None;
+    }
+    plans.sort_by_key(|plan| plan.stamp_utc);
+    plans.dedup_by(|left, right| left.frame.identity == right.frame.identity);
+    let newest_stamp = plans.last()?.stamp_utc;
+    let quality = plans
+        .last()
+        .map(|plan| frame_plan_quality(site_id, &plan.frame))
+        .unwrap_or(OrdPlanQuality::Other);
+    Some(OrdPlanCollection {
+        object_kind: ObjectKind::Scan,
+        newest_stamp,
+        quality,
+        plans,
     })
 }
 
@@ -1385,9 +1736,12 @@ mod tests {
     }
 
     #[test]
-    fn ord_candidate_scoring_prefers_scan_reflectivity_over_pvol_velocity_only() {
-        let pvol_keys =
-            vec!["2026/06/25/IE/iedub/PVOL/iedub@20260625T1515@0.5_2.2_4.3@VRADH.h5".to_owned()];
+    fn dublin_mixed_frame_combines_scan_reflectivity_with_pvol_velocity() {
+        let pvol_keys = vec![
+            "2026/06/25/IE/iedub/PVOL/iedub@20260625T1515@0.5_2.2_4.3@VRADH.h5".to_owned(),
+            // Newer than the reflectivity anchor: must not be merged early.
+            "2026/06/25/IE/iedub/PVOL/iedub@20260625T1545@0.5_2.2_4.3@VRADH.h5".to_owned(),
+        ];
         let scan_keys = vec![
             "2026/06/25/IE/iedub/SCAN/iedub@20260625T1530@0.5@TH.h5".to_owned(),
             "2026/06/25/IE/iedub/SCAN/iedub@20260625T1531@2.9@TH.h5".to_owned(),
@@ -1399,10 +1753,46 @@ mod tests {
 
         assert_eq!(pvol.quality, OrdPlanQuality::VelocityOnly);
         assert_eq!(scan.quality, OrdPlanQuality::ReflectivityOnly);
-        assert!(
-            ord_candidate_is_better(&scan, Some(&pvol)),
-            "Dublin-style SCAN TH should win over PVOL VRADH so REF is available"
+        let mixed = mixed_candidate_from_kind_keys(
+            BUCKET_BASE,
+            "iedub",
+            &[
+                (ObjectKind::Pvol, pvol_keys.clone()),
+                (ObjectKind::Scan, scan_keys.clone()),
+            ],
+        )
+        .expect("mixed planning")
+        .expect("mixed frame");
+
+        assert_eq!(mixed.quality, OrdPlanQuality::ReflectivityAndVelocity);
+        assert_eq!(
+            mixed.stamp,
+            NaiveDateTime::parse_from_str("20260625T1531", "%Y%m%dT%H%M").unwrap()
         );
+        assert!(mixed.frame.merge);
+        assert!(
+            mixed
+                .frame
+                .parts
+                .iter()
+                .any(|part| part.url.contains("/SCAN/")
+                    && part.url.contains("iedub@20260625T1530@0.5@TH.h5"))
+        );
+        assert!(mixed.frame.parts.iter().any(|part| {
+            part.url.contains("/PVOL/")
+                && part
+                    .url
+                    .contains("iedub@20260625T1515@0.5_2.2_4.3@VRADH.h5")
+        }));
+        assert!(
+            !mixed
+                .frame
+                .parts
+                .iter()
+                .any(|part| part.url.contains("iedub@20260625T1545@")),
+            "future velocity must not be shown before its scan time"
+        );
+
         let best = best_plan_collection(vec![
             plan_collection(
                 "iedub",
@@ -1422,9 +1812,39 @@ mod tests {
                     frame: scan.frame.clone(),
                 }],
             ),
+            plan_collection_from_mixed_plans(
+                "iedub",
+                vec![OrdArchivePlan {
+                    stamp_utc: DateTime::from_naive_utc_and_offset(mixed.stamp, Utc),
+                    object_kind: "SCAN+PVOL",
+                    frame: mixed.frame.clone(),
+                }],
+            )
+            .expect("mixed collection"),
         ])
         .expect("best collection");
+        assert_eq!(best.quality, OrdPlanQuality::ReflectivityAndVelocity);
         assert_eq!(best.object_kind, ObjectKind::Scan);
+        assert_eq!(best.plans[0].object_kind, "SCAN+PVOL");
+    }
+
+    #[test]
+    fn dublin_mixed_frame_rejects_future_only_velocity() {
+        let pvol_keys =
+            vec!["2026/06/25/IE/iedub/PVOL/iedub@20260625T1545@0.5_2.2_4.3@VRADH.h5".to_owned()];
+        let scan_keys = vec![
+            "2026/06/25/IE/iedub/SCAN/iedub@20260625T1530@0.5@TH.h5".to_owned(),
+            "2026/06/25/IE/iedub/SCAN/iedub@20260625T1531@2.9@TH.h5".to_owned(),
+        ];
+
+        let mixed = mixed_candidate_from_kind_keys(
+            BUCKET_BASE,
+            "iedub",
+            &[(ObjectKind::Pvol, pvol_keys), (ObjectKind::Scan, scan_keys)],
+        )
+        .expect("mixed planning");
+
+        assert!(mixed.is_none());
     }
 
     #[test]

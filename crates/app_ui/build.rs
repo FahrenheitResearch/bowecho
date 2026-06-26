@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key)
@@ -22,6 +24,42 @@ fn expose_build_default(key: &str) {
     }
 }
 
+fn git_output(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!text.is_empty()).then_some(text)
+}
+
+fn expose_build_identity() {
+    let git = git_output(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            output
+                .status
+                .success()
+                .then(|| (!output.stdout.is_empty()).to_string())
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
+    let built_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-env-changed=PROFILE");
+    println!("cargo:rustc-env=BOWECHO_BUILD_GIT={git}");
+    println!("cargo:rustc-env=BOWECHO_BUILD_DIRTY={dirty}");
+    println!("cargo:rustc-env=BOWECHO_BUILD_PROFILE={profile}");
+    println!("cargo:rustc-env=BOWECHO_BUILD_UNIX={built_unix}");
+}
+
 fn main() {
     for key in [
         "BOWECHO_DEFAULT_BRAND",
@@ -39,6 +77,7 @@ fn main() {
     }
     expose_build_default("BOWECHO_DEFAULT_BRAND");
     expose_build_default("BOWECHO_STORAGE_NAMESPACE");
+    expose_build_identity();
 
     // Runtime Brand Kit changes can update UI/export branding and the launch
     // icon on the next run. VERSIONINFO and the embedded executable .ico are

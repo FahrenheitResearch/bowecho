@@ -150,6 +150,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item target\release\bowecho.exe "dist\${{ matrix.artifact_name }}.exe"
           Copy-Item target\release\bowecho.exe package\bowecho.exe
           Copy-Item README.md package\README.md
           Copy-Item LICENSE-MIT package\LICENSE-MIT
@@ -280,6 +281,8 @@ jobs:
         run: |
           set -euo pipefail
           ditto -c -k --sequesterRsrc --keepParent "BowEcho.app" "dist/${{ matrix.artifact_name }}.zip"
+          cp "BowEcho.app/Contents/MacOS/${BIN_NAME}" "dist/${{ matrix.artifact_name }}"
+          chmod +x "dist/${{ matrix.artifact_name }}"
 
       - name: Package Linux binary
         if: runner.os == 'Linux'
@@ -287,6 +290,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "dist" "package/${BIN_NAME}"
+          cp "target/release/${BIN_NAME}" "dist/${{ matrix.artifact_name }}"
+          chmod +x "dist/${{ matrix.artifact_name }}"
           cp "target/release/${BIN_NAME}" "package/${BIN_NAME}/${BIN_NAME}"
           cp README.md "package/${BIN_NAME}/README.md"
           cp LICENSE-MIT "package/${BIN_NAME}/LICENSE-MIT"

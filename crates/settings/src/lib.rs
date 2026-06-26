@@ -327,6 +327,11 @@ pub struct AppSettings {
     /// Remember the last selected tilt independently for each radar product.
     #[serde(default = "default_true")]
     pub remember_product_tilts: bool,
+    /// Show derived products in the product picker and keyboard product cycle.
+    /// Default on to preserve existing installs; users can hide CREF/ET/VIL
+    /// and computed advanced products when they want a raw-moment-only row.
+    #[serde(default = "default_true")]
+    pub show_derived_products: bool,
     /// During live updates, advance to each newly completed low-level sweep
     /// instead of waiting for a scan-separated low-level revisit.
     #[serde(default)]
@@ -650,6 +655,7 @@ impl Default for AppSettings {
             loop_low_sweep_filter: default_loop_low_sweep_filter(),
             loop_sweep_control: None,
             remember_product_tilts: true,
+            show_derived_products: true,
             live_low_sweep_auto_advance: false,
             live_low_sweep_auto_advance_seconds: default_live_low_sweep_auto_advance_seconds(),
             show_center_crosshair: false,
@@ -1231,6 +1237,7 @@ mod tests {
                     },
                 )]),
             }),
+            show_derived_products: false,
             live_low_sweep_auto_advance: true,
             live_low_sweep_auto_advance_seconds: 30,
             show_center_crosshair: true,
@@ -1349,6 +1356,7 @@ mod tests {
         assert_eq!(old.loop_low_sweep_filter, "all");
         assert_eq!(old.loop_sweep_control, None);
         assert!(old.remember_product_tilts);
+        assert!(old.show_derived_products);
         assert!(!old.live_low_sweep_auto_advance);
         assert_eq!(
             old.live_low_sweep_auto_advance_seconds,
@@ -1363,6 +1371,7 @@ mod tests {
             loop_low_sweeps: true,
             loop_low_sweep_filter: "base".to_owned(),
             remember_product_tilts: false,
+            show_derived_products: false,
             live_low_sweep_auto_advance: true,
             live_low_sweep_auto_advance_seconds: 10,
             show_center_crosshair: true,
@@ -1377,6 +1386,7 @@ mod tests {
         assert_eq!(back.loop_low_sweep_filter, "base");
         assert_eq!(back.loop_sweep_control, None);
         assert!(!back.remember_product_tilts);
+        assert!(!back.show_derived_products);
         assert!(back.live_low_sweep_auto_advance);
         assert_eq!(back.live_low_sweep_auto_advance_seconds, 10);
         assert!(back.show_center_crosshair);

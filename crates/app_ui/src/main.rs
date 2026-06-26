@@ -20,12 +20,12 @@ use eframe::egui;
 use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType, RadarVolume};
 use render2d::{
     CrossSectionSmoothing, ECHO_TOP_THRESHOLD_DBZ, StormCell, StormMotion,
-    StormRelativePaletteCache, StormTrack, StormTracker, TIME_GATE_S, ViewportMomentCache,
-    ViewportRasterOptions, ViewportSampleCache, VolumeDealiasCache, apply_reflectivity_gate_filter,
-    azimuthal_shear_grid, color_family_for_moment, composite_reflectivity_grid,
-    dealias_velocity_grid, dealias_velocity_grid_hybrid, detect_rotation_sites, echo_top_grid,
-    gust_proxy_grid, hail_grids, identify_storm_cells, marc_grid, mehs_grid,
-    moment_cross_section_with_smoothing, poh_grid, radial_divergence_grid,
+    StormRelativePaletteCache, StormTrack, StormTracker, TIME_GATE_S, ViewportGeometryCache,
+    ViewportMomentCache, ViewportRasterOptions, ViewportSampleCache, VolumeDealiasCache,
+    apply_reflectivity_gate_filter, azimuthal_shear_grid, color_family_for_moment,
+    composite_reflectivity_grid, dealias_velocity_grid, dealias_velocity_grid_hybrid,
+    detect_rotation_sites, echo_top_grid, gust_proxy_grid, hail_grids, identify_storm_cells,
+    marc_grid, mehs_grid, moment_cross_section_with_smoothing, poh_grid, radial_divergence_grid,
     reflectivity_cross_section_with_smoothing, smooth_moment_grid, storm_relative_velocity_mps,
     upsample_moment_grid, velocity_cross_section_cached_with_smoothing, viewport_rgba_buffer_len,
     viewport_sample_cache_storage_upper_bound, vil_density_grid, vil_grid,
@@ -113,8 +113,9 @@ const LOOP_PREWARM_INTERACTION_PAUSE_MS: u64 = 250;
 const LOOP_RENDER_WAIT_POLL_MS: u64 = 8;
 const LOW_CORE_PREVIEW_THREADS: usize = 4;
 const LOW_CORE_PREVIEW_RENDER_HEAD_START_MS: u64 = 8;
-const ACTIVE_LOAD_POLL_MS: u64 = 50;
-const RENDER_RESULT_POLL_MS: u64 = 50;
+const INTERACTIVE_POLL_REPAINT_MS: u64 = 16;
+const ACTIVE_LOAD_POLL_MS: u64 = INTERACTIVE_POLL_REPAINT_MS;
+const RENDER_RESULT_POLL_MS: u64 = INTERACTIVE_POLL_REPAINT_MS;
 const LOW_ZOOM_RENDER_BACKOFF_SCALE: f32 = 48.0;
 const LOW_ZOOM_RENDER_BACKOFF_MIN_MS: u64 = 2_000;
 const LOW_ZOOM_RENDER_BACKOFF_MIN_RENDER_MS: f32 = 80.0;
@@ -167,7 +168,7 @@ const DEFAULT_EVENT_MAX_FRAMES: usize = 24;
 const MAX_HISTORY_FRAME_LIMIT: usize = 2000;
 const HISTORY_LOOP_FRAME_MS: u64 = 700;
 const MAX_LOOP_SPEED_PERCENT: u16 = 6400;
-const MAX_LOOP_REPAINT_POLL_MS: u64 = 50;
+const MAX_LOOP_REPAINT_POLL_MS: u64 = INTERACTIVE_POLL_REPAINT_MS;
 /// Loop-speed picker steps, percent of the 700 ms baseline (¼× … 64×).
 const LOOP_SPEED_PERCENT_OPTIONS: &[u16] =
     &[25, 50, 75, 100, 150, 200, 300, 400, 800, 1600, 3200, 6400];
@@ -4294,6 +4295,11 @@ struct RenderWorkerSampleCache {
     cache: ViewportSampleCache,
 }
 
+struct RenderWorkerGeometryCache {
+    signature: RenderWorkerGeometryCacheSignature,
+    cache: ViewportGeometryCache,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RenderWorkerCachePolicy {
     threads: usize,
@@ -4436,6 +4442,14 @@ impl RenderWorkerCachePolicy {
         }
     }
 
+    fn geometry_cache_capacity(&self) -> usize {
+        self.sample_cache_capacity()
+    }
+
+    fn geometry_cache_bytes(&self) -> usize {
+        self.sample_cache_bytes() / 2
+    }
+
     fn direct_viewport_capacity(&self) -> usize {
         self.sample_cache_capacity().saturating_mul(2).max(1)
     }
@@ -4446,6 +4460,21 @@ impl RenderWorkerCachePolicy {
         }
         self.sample_cache_capacity()
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RenderWorkerGeometryCacheSignature {
+    site_hash: u64,
+    viewport: ViewportKey,
+    gate_first_m: i32,
+    gate_spacing_m: i32,
+    gate_count: usize,
+    radial_count: usize,
+    row_count: usize,
+    elevation_centideg: i16,
+    elevation_number: Option<u8>,
+    dealiased_velocity: bool,
+    radial_geometry_hash: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4537,6 +4566,43 @@ impl RenderWorkerSampleCacheSignature {
     }
 }
 
+impl RenderWorkerGeometryCacheSignature {
+    fn new(
+        request: &RenderRequest,
+        moment: &MomentType,
+        derived: Option<DerivedProduct>,
+    ) -> Option<Self> {
+        if derived.is_some() || request.smoothing.changes_grid_geometry() {
+            return None;
+        }
+        let cut = request.volume.cuts.get(request.cut)?;
+        let grid = cut.moments.get(moment)?;
+        let mut site_hasher = DefaultHasher::new();
+        request.volume.site.id.hash(&mut site_hasher);
+        let site_hash = site_hasher.finish();
+        let mut radial_hasher = DefaultHasher::new();
+        for radial_index in &grid.radial_indices {
+            radial_index.hash(&mut radial_hasher);
+            let radial = cut.radials.get(*radial_index)?;
+            ((radial.azimuth_deg * 100.0).round() as i32).hash(&mut radial_hasher);
+            ((radial.elevation_deg * 100.0).round() as i32).hash(&mut radial_hasher);
+        }
+        Some(Self {
+            site_hash,
+            viewport: request.key.viewport,
+            gate_first_m: grid.gate_range.first_gate_m,
+            gate_spacing_m: grid.gate_range.gate_spacing_m,
+            gate_count: grid.gate_range.gate_count,
+            radial_count: cut.radials.len(),
+            row_count: grid.radial_indices.len(),
+            elevation_centideg: (cut.elevation_deg * 100.0).round() as i16,
+            elevation_number: cut.elevation_number,
+            dealiased_velocity: request.render_dealiased_velocity,
+            radial_geometry_hash: radial_hasher.finish(),
+        })
+    }
+}
+
 fn spawn_render_worker() -> (
     mpsc::Sender<RenderRequest>,
     mpsc::Receiver<AsyncRenderResult>,
@@ -4575,6 +4641,7 @@ fn spawn_loop_prewarm_render_workers() -> (
             let mut reusable_pixels_signature: Option<RenderWorkerViewportSignature> = None;
             let mut moment_caches: Vec<RenderWorkerMomentCache> = Vec::new();
             let mut sample_caches: Vec<RenderWorkerSampleCache> = Vec::new();
+            let mut geometry_caches: Vec<RenderWorkerGeometryCache> = Vec::new();
             let mut last_direct_viewports: Vec<RenderWorkerViewportSignature> = Vec::new();
             loop {
                 let request = {
@@ -4594,6 +4661,7 @@ fn spawn_loop_prewarm_render_workers() -> (
                     &mut reusable_pixels_signature,
                     &mut moment_caches,
                     &mut sample_caches,
+                    &mut geometry_caches,
                     &mut last_direct_viewports,
                     cache_policy,
                 );
@@ -4649,6 +4717,7 @@ fn spawn_render_worker_with_mode(
         let mut reusable_pixels_signature: Option<RenderWorkerViewportSignature> = None;
         let mut moment_caches: Vec<RenderWorkerMomentCache> = Vec::new();
         let mut sample_caches: Vec<RenderWorkerSampleCache> = Vec::new();
+        let mut geometry_caches: Vec<RenderWorkerGeometryCache> = Vec::new();
         let mut last_direct_viewports: Vec<RenderWorkerViewportSignature> = Vec::new();
         // Queued requests, at most one per pane (newer replaces same-pane).
         // With a single pane this degenerates to exactly the old newest-only
@@ -4706,6 +4775,7 @@ fn spawn_render_worker_with_mode(
                 &mut reusable_pixels_signature,
                 &mut moment_caches,
                 &mut sample_caches,
+                &mut geometry_caches,
                 &mut last_direct_viewports,
                 cache_policy,
             );
@@ -7071,7 +7141,11 @@ impl ViewerApp {
     }
 
     fn displayable_products_for_picker(&self, volume: &RadarVolume) -> Vec<DisplayProduct> {
-        global_displayable_products_with_advanced(volume, self.advanced_products_enabled)
+        global_displayable_products_for_picker(
+            volume,
+            self.advanced_products_enabled,
+            self.app_settings.show_derived_products,
+        )
     }
 
     fn materialize_primary_advanced_product(
@@ -10351,6 +10425,8 @@ impl ViewerApp {
         }
         self.selected_cut = self.selected_cut.min(volume.cuts.len() - 1);
         let primary_volume = self.volume.clone();
+        let show_derived_products = self.app_settings.show_derived_products;
+        let advanced_products_enabled = self.advanced_products_enabled;
         for pane in &mut self.extra_panes {
             if let Some(pane_volume) = pane.volume.clone().or_else(|| primary_volume.clone()) {
                 if !pane.owns_radar()
@@ -10377,12 +10453,28 @@ impl ViewerApp {
                 if let Some(cut) = pane.cut {
                     pane.cut = Some(cut.min(pane_volume.cuts.len().saturating_sub(1)));
                 }
-                if !can_materialize_product_on_cut(
-                    pane_volume.as_ref(),
-                    pane.cut.unwrap_or(self.selected_cut),
-                    &pane.product,
-                ) {
-                    if let Some(cut) = advanced_product_source_cut(
+                let pane_product_visible =
+                    is_product_visible_in_picker(&pane.product, show_derived_products);
+                if !pane_product_visible
+                    || !can_materialize_product_on_cut(
+                        pane_volume.as_ref(),
+                        pane.cut.unwrap_or(self.selected_cut),
+                        &pane.product,
+                    )
+                {
+                    if !pane_product_visible {
+                        if let Some(product) = global_displayable_products_for_picker(
+                            pane_volume.as_ref(),
+                            advanced_products_enabled,
+                            show_derived_products,
+                        )
+                        .first()
+                        .cloned()
+                        {
+                            pane.product = product;
+                            pane.cut = Some(0);
+                        }
+                    } else if let Some(cut) = advanced_product_source_cut(
                         pane_volume.as_ref(),
                         pane.cut.unwrap_or(self.selected_cut),
                         &pane.product,
@@ -10396,9 +10488,13 @@ impl ViewerApp {
                     }) {
                         pane.cut = Some(cut);
                     } else if pane.owns_radar()
-                        && let Some(product) = global_displayable_products(pane_volume.as_ref())
-                            .first()
-                            .cloned()
+                        && let Some(product) = global_displayable_products_for_picker(
+                            pane_volume.as_ref(),
+                            advanced_products_enabled,
+                            show_derived_products,
+                        )
+                        .first()
+                        .cloned()
                     {
                         pane.product = product;
                         pane.cut = Some(0);
@@ -10406,12 +10502,17 @@ impl ViewerApp {
                 }
             }
         }
-        if can_materialize_product_on_cut(volume, self.selected_cut, &self.selected_product) {
+        if is_product_visible_in_picker(&self.selected_product, show_derived_products)
+            && can_materialize_product_on_cut(volume, self.selected_cut, &self.selected_product)
+        {
             return;
         }
-        if let Some(cut) =
-            advanced_product_source_cut(volume, self.selected_cut, &self.selected_product)
-                .or_else(|| best_cut_for_product(volume, self.selected_cut, &self.selected_product))
+        if is_product_visible_in_picker(&self.selected_product, show_derived_products)
+            && let Some(cut) =
+                advanced_product_source_cut(volume, self.selected_cut, &self.selected_product)
+                    .or_else(|| {
+                        best_cut_for_product(volume, self.selected_cut, &self.selected_product)
+                    })
         {
             self.selected_cut = cut;
             return;
@@ -10434,10 +10535,18 @@ impl ViewerApp {
             .cloned()
         {
             self.selected_product = product;
-        } else if let Some(product) = displayable_products(volume, self.selected_cut)
-            .first()
-            .cloned()
-        {
+        } else if let Some(product) = global_displayable_products_for_picker(
+            volume,
+            advanced_products_enabled,
+            show_derived_products,
+        )
+        .into_iter()
+        .find(|product| is_displayable_on_cut(volume, self.selected_cut, product))
+        .or_else(|| {
+            displayable_products(volume, self.selected_cut)
+                .into_iter()
+                .find(|product| is_product_visible_in_picker(product, show_derived_products))
+        }) {
             self.selected_product = product;
         }
     }
@@ -11456,17 +11565,35 @@ impl ViewerApp {
             .is_some_and(|until| Instant::now() < until)
     }
 
+    fn foreground_render_pressure_active(&self) -> bool {
+        self.pending_render_key.is_some()
+            || self.load_receiver.is_some()
+            || self.active_load_started_at.is_some()
+            || self
+                .extra_panes
+                .iter()
+                .any(|pane| pane.pending_render_key.is_some())
+            || self
+                .radar_layers
+                .iter()
+                .any(|layer| layer.pending_render_key.is_some())
+            || self.model_layer_build_rx.is_some()
+            || self.sat_layer_render_rx.is_some()
+            || self.vol3d.resample_rx.is_some()
+    }
+
     fn schedule_loop_render_prewarm(
         &mut self,
         ctx: &egui::Context,
         rect: egui::Rect,
         current_key: &TextureKey,
     ) {
-        if self.loop_prewarm_paused_for_interaction() || self.smooth_camera_follow_playback_active()
+        if self.loop_prewarm_paused_for_interaction()
+            || self.smooth_camera_follow_playback_active()
+            || self.foreground_render_pressure_active()
         {
-            // A followed camera gives each future step a different viewport.
-            // Prewarming them at the current center is almost guaranteed to
-            // miss and only competes with the selected native render.
+            // Followed-camera prewarm usually misses, and foreground render
+            // pressure should always win over speculative loop cache work.
             return;
         }
         self.ensure_loop_render_context(current_key);
@@ -11754,12 +11881,14 @@ impl ViewerApp {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_viewport_payload(
         request: &RenderRequest,
         reusable_pixels: &mut Vec<u8>,
         reusable_pixels_signature: &mut Option<RenderWorkerViewportSignature>,
         moment_caches: &mut Vec<RenderWorkerMomentCache>,
         sample_caches: &mut Vec<RenderWorkerSampleCache>,
+        geometry_caches: &mut Vec<RenderWorkerGeometryCache>,
         last_direct_viewports: &mut Vec<RenderWorkerViewportSignature>,
         cache_policy: RenderWorkerCachePolicy,
     ) -> Result<RenderedTexture, String> {
@@ -11899,6 +12028,8 @@ impl ViewerApp {
             request.key.smoothing,
             request.key.viewport,
         );
+        let geometry_cache_signature =
+            RenderWorkerGeometryCacheSignature::new(request, &base_moment, derived);
 
         let start = Instant::now();
         let mut sample_cache_build_ms = None;
@@ -11912,9 +12043,13 @@ impl ViewerApp {
             )?
         {
             let cache_build_start = Instant::now();
-            let built_sample_cache = cache
-                .build_sample_cache(request.volume.as_ref(), request.viewport_options)
-                .map_err(|err| err.to_string())?;
+            let built_sample_cache = Self::build_sample_cache_with_geometry_reuse(
+                cache,
+                request,
+                geometry_caches,
+                cache_policy,
+                geometry_cache_signature.as_ref(),
+            )?;
             sample_cache_build_ms = Some(cache_build_start.elapsed().as_secs_f32() * 1000.0);
             Self::insert_sample_cache(
                 sample_caches,
@@ -12355,6 +12490,99 @@ impl ViewerApp {
         true
     }
 
+    fn build_sample_cache_with_geometry_reuse(
+        cache: &ViewportMomentCache,
+        request: &RenderRequest,
+        geometry_caches: &mut Vec<RenderWorkerGeometryCache>,
+        cache_policy: RenderWorkerCachePolicy,
+        signature: Option<&RenderWorkerGeometryCacheSignature>,
+    ) -> Result<ViewportSampleCache, String> {
+        let Some(signature) = signature else {
+            return cache
+                .build_sample_cache(request.volume.as_ref(), request.viewport_options)
+                .map_err(|err| err.to_string());
+        };
+
+        if let Some(index) = Self::touch_geometry_cache(geometry_caches, signature) {
+            match cache.build_sample_cache_from_geometry_cache(
+                request.volume.as_ref(),
+                &geometry_caches[index].cache,
+            ) {
+                Ok(sample_cache) => return Ok(sample_cache),
+                Err(_) => {
+                    geometry_caches.remove(index);
+                }
+            }
+        }
+
+        let Ok(geometry_cache) =
+            cache.build_geometry_cache(request.volume.as_ref(), request.viewport_options)
+        else {
+            return cache
+                .build_sample_cache(request.volume.as_ref(), request.viewport_options)
+                .map_err(|err| err.to_string());
+        };
+        let sample_cache = cache
+            .build_sample_cache_from_geometry_cache(request.volume.as_ref(), &geometry_cache)
+            .or_else(|_| {
+                cache.build_sample_cache(request.volume.as_ref(), request.viewport_options)
+            })
+            .map_err(|err| err.to_string())?;
+        Self::insert_geometry_cache(
+            geometry_caches,
+            cache_policy,
+            signature.clone(),
+            geometry_cache,
+        );
+        Ok(sample_cache)
+    }
+
+    fn touch_geometry_cache(
+        geometry_caches: &mut Vec<RenderWorkerGeometryCache>,
+        signature: &RenderWorkerGeometryCacheSignature,
+    ) -> Option<usize> {
+        let index = geometry_caches
+            .iter()
+            .position(|cached| &cached.signature == signature)?;
+        let cached = geometry_caches.remove(index);
+        geometry_caches.push(cached);
+        Some(geometry_caches.len() - 1)
+    }
+
+    fn insert_geometry_cache(
+        geometry_caches: &mut Vec<RenderWorkerGeometryCache>,
+        cache_policy: RenderWorkerCachePolicy,
+        signature: RenderWorkerGeometryCacheSignature,
+        cache: ViewportGeometryCache,
+    ) {
+        geometry_caches.retain(|cached| cached.signature != signature);
+        geometry_caches.push(RenderWorkerGeometryCache { signature, cache });
+        Self::trim_geometry_caches(geometry_caches, cache_policy);
+    }
+
+    fn trim_geometry_caches(
+        geometry_caches: &mut Vec<RenderWorkerGeometryCache>,
+        cache_policy: RenderWorkerCachePolicy,
+    ) {
+        let capacity = cache_policy.geometry_cache_capacity();
+        let byte_budget = cache_policy.geometry_cache_bytes();
+        while geometry_caches.len() > capacity
+            || Self::geometry_cache_storage_bytes(geometry_caches) > byte_budget
+        {
+            if geometry_caches.is_empty() {
+                break;
+            }
+            geometry_caches.remove(0);
+        }
+    }
+
+    fn geometry_cache_storage_bytes(geometry_caches: &[RenderWorkerGeometryCache]) -> usize {
+        geometry_caches
+            .iter()
+            .map(|cached| cached.cache.storage_bytes())
+            .sum()
+    }
+
     fn insert_sample_cache(
         sample_caches: &mut Vec<RenderWorkerSampleCache>,
         cache_policy: RenderWorkerCachePolicy,
@@ -12581,6 +12809,8 @@ impl ViewerApp {
                 .map(PaneIntlSource::from_site),
             _ => None,
         };
+        let show_derived_products = self.app_settings.show_derived_products;
+        let advanced_products_enabled = self.advanced_products_enabled;
 
         let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
             return;
@@ -12610,10 +12840,31 @@ impl ViewerApp {
         }
         if let Some(volume) = primary_volume.as_deref() {
             let current_cut = pane.cut.unwrap_or(self.selected_cut);
-            if !is_displayable_on_cut(volume, current_cut, &pane.product) {
-                if let Some(cut) = best_cut_for_product(volume, current_cut, &pane.product) {
+            let pane_product_visible =
+                is_product_visible_in_picker(&pane.product, show_derived_products);
+            if !pane_product_visible || !is_displayable_on_cut(volume, current_cut, &pane.product) {
+                if !pane_product_visible {
+                    if let Some(product) = global_displayable_products_for_picker(
+                        volume,
+                        advanced_products_enabled,
+                        show_derived_products,
+                    )
+                    .first()
+                    .cloned()
+                    {
+                        pane.product = product;
+                        pane.cut = Some(0);
+                    }
+                } else if let Some(cut) = best_cut_for_product(volume, current_cut, &pane.product) {
                     pane.cut = Some(cut);
-                } else if let Some(product) = global_displayable_products(volume).first().cloned() {
+                } else if let Some(product) = global_displayable_products_for_picker(
+                    volume,
+                    advanced_products_enabled,
+                    show_derived_products,
+                )
+                .first()
+                .cloned()
+                {
                     pane.product = product;
                     pane.cut = Some(0);
                 }
@@ -16288,7 +16539,7 @@ impl eframe::App for ViewerApp {
             self.grid_layout = layout;
             self.sync_extra_panes();
         }
-        // Frame-time EMA (perf strip).
+        // Repaint-cadence EMA (perf strip).
         let dt_ms = ctx.input(|i| i.unstable_dt) * 1000.0;
         self.frame_ms_avg = if self.frame_ms_avg == 0.0 {
             dt_ms
@@ -17517,6 +17768,29 @@ impl ViewerApp {
         self.load_receiver.is_some() || self.intl_loop_rx.is_some()
     }
 
+    fn cancel_primary_radar_load_for_user_command(&mut self) -> bool {
+        let cancelled_primary = self.load_receiver.take().is_some();
+        let cancelled_intl_loop = self.intl_loop_rx.take().is_some();
+        let cancelled = cancelled_primary || cancelled_intl_loop;
+        if cancelled {
+            self.archive_load_progress = None;
+            self.intl_loop_frames = 0;
+            self.intl_loop_requested = 0;
+        }
+        cancelled
+    }
+
+    fn cancel_extra_pane_load_for_user_command(&mut self, pane_slot: usize) -> bool {
+        let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
+            return false;
+        };
+        let cancelled = pane.load_receiver.take().is_some();
+        if cancelled {
+            pane.archive_load_progress = None;
+        }
+        cancelled
+    }
+
     fn unified_player_satellite_frame_label(&self) -> Option<String> {
         self.sat_layer
             .as_ref()
@@ -18196,6 +18470,7 @@ impl ViewerApp {
     }
 
     fn load_latest_for_unified_player(&mut self, ctx: &egui::Context) {
+        let replaced = self.cancel_primary_radar_load_for_user_command();
         if self.unified_player_load_busy() {
             self.unified_player
                 .mark_status("Radar load already running");
@@ -18209,8 +18484,9 @@ impl ViewerApp {
         {
             self.start_intl_poll(provider_id.clone(), site_id.clone(), ctx);
             self.poll_next = None;
+            let prefix = if replaced { "Replacing load; " } else { "" };
             self.unified_player.mark_status(format!(
-                "Refreshing {} {}",
+                "{prefix}Refreshing {} {}",
                 intl_provider_label(&provider_id),
                 site_id
             ));
@@ -18218,10 +18494,16 @@ impl ViewerApp {
         }
         self.load_latest_level2_for_selected_site(ctx);
         self.remember_startup_site();
-        self.unified_player.mark_status("Loading latest radar");
+        if replaced {
+            self.unified_player
+                .mark_status("Replacing load; loading latest radar");
+        } else {
+            self.unified_player.mark_status("Loading latest radar");
+        }
     }
 
     fn load_loop_for_unified_player(&mut self, ctx: &egui::Context) {
+        let replaced = self.cancel_primary_radar_load_for_user_command();
         if self.unified_player_load_busy() {
             self.unified_player
                 .mark_status("Radar load already running");
@@ -18230,12 +18512,22 @@ impl ViewerApp {
         self.arm_unified_player_timeline_warning_sync();
         if self.intl_poll_owns_primary() || self.intl_source_owns_primary_display() {
             self.start_intl_loop_load(ctx);
-            self.unified_player
-                .mark_status("Loading international radar loop");
+            if replaced {
+                self.unified_player
+                    .mark_status("Replacing load; loading international radar loop");
+            } else {
+                self.unified_player
+                    .mark_status("Loading international radar loop");
+            }
         } else {
             self.load_loop_history_for_selected_site(ctx);
             self.remember_startup_site();
-            self.unified_player.mark_status("Loading radar loop");
+            if replaced {
+                self.unified_player
+                    .mark_status("Replacing load; loading radar loop");
+            } else {
+                self.unified_player.mark_status("Loading radar loop");
+            }
         }
     }
 
@@ -21091,28 +21383,23 @@ impl ViewerApp {
                     .position(|site| site.level2_id.eq_ignore_ascii_case(&fav))
             {
                 if let Some(slot) = site_control_pane {
+                    self.cancel_extra_pane_load_for_user_command(slot);
                     self.set_extra_pane_selected_site(slot, index);
-                    if self.extra_panes[slot].load_receiver.is_none()
-                        && let Some(site) = self.sites.get(index).cloned()
-                    {
+                    if let Some(site) = self.sites.get(index).cloned() {
                         self.start_extra_pane_latest_load(slot, site, ui.ctx());
                     }
                 } else {
+                    self.cancel_primary_radar_load_for_user_command();
                     self.selected_site_index = index;
-                    if self.load_receiver.is_none() {
-                        self.load_latest_level2_for_selected_site(ui.ctx());
-                        self.remember_startup_site();
-                    }
+                    self.load_latest_level2_for_selected_site(ui.ctx());
+                    self.remember_startup_site();
                 }
             }
         }
-        let target_load_busy = site_control_pane
-            .and_then(|slot| self.extra_panes.get(slot))
-            .map(|pane| pane.load_receiver.is_some())
-            .unwrap_or_else(|| self.load_receiver.is_some() || self.intl_loop_rx.is_some());
         ui.horizontal(|ui| {
-            if fixed_action_button(ui, "Load Latest", 88.0).clicked() && !target_load_busy {
+            if fixed_action_button(ui, "Load Latest", 88.0).clicked() {
                 if let Some(slot) = site_control_pane {
+                    self.cancel_extra_pane_load_for_user_command(slot);
                     if let Some(source) = pane_intl_source.as_ref()
                         && let Some(site) =
                             Self::find_intl_site(&source.provider_id, &source.site_id)
@@ -21125,6 +21412,7 @@ impl ViewerApp {
                     // An armed international poll owns the primary view —
                     // Latest forces a poll tick instead of yanking the view
                     // back to the last US site (field report).
+                    let replaced = self.cancel_primary_radar_load_for_user_command();
                     if let Some(source) = primary_intl_source.as_ref() {
                         self.start_intl_poll(
                             source.provider_id.clone(),
@@ -21133,7 +21421,8 @@ impl ViewerApp {
                         );
                         self.poll_next = None;
                         self.status = format!(
-                            "Refreshing {} {}",
+                            "{}Refreshing {} {}",
+                            if replaced { "Replacing load; " } else { "" },
                             intl_provider_label(&source.provider_id),
                             source.site_id
                         );
@@ -21151,9 +21440,9 @@ impl ViewerApp {
                      load loops; single-frame feeds start at newest scan and grow live",
                 )
                 .clicked()
-                && !target_load_busy
             {
                 if let Some(slot) = site_control_pane {
+                    self.cancel_extra_pane_load_for_user_command(slot);
                     if let Some(source) = pane_intl_source.as_ref()
                         && let Some(site) =
                             Self::find_intl_site(&source.provider_id, &source.site_id)
@@ -21163,6 +21452,7 @@ impl ViewerApp {
                         self.start_extra_pane_loop_load(slot, site, ui.ctx());
                     }
                 } else {
+                    self.cancel_primary_radar_load_for_user_command();
                     if self.intl_poll_owns_primary() || primary_intl_source.is_some() {
                         self.start_intl_loop_load(ui.ctx());
                     } else {
@@ -21389,6 +21679,20 @@ impl ViewerApp {
                     self.product_cut_memory.clear();
                 }
                 let _ = self.app_settings.save();
+            }
+            let mut show_derived_products = self.app_settings.show_derived_products;
+            if ui
+                .checkbox(&mut show_derived_products, "Show derived products")
+                .on_hover_text(
+                    "Off hides CREF, ET, VIL, AzShr, Div, and computed advanced products from this product row and product cycling.",
+                )
+                .changed()
+            {
+                self.app_settings.show_derived_products = show_derived_products;
+                self.sanitize_selection();
+                self.clear_texture();
+                let _ = self.app_settings.save();
+                ctx.request_repaint();
             }
         }
         // Invert the hotkey map so each product button can show its key.
@@ -23581,6 +23885,14 @@ impl ViewerApp {
         let _ = writeln!(text, "version: {}", env!("CARGO_PKG_VERSION"));
         let _ = writeln!(
             text,
+            "build: git={} dirty={} profile={} built_unix={}",
+            option_env!("BOWECHO_BUILD_GIT").unwrap_or("unknown"),
+            option_env!("BOWECHO_BUILD_DIRTY").unwrap_or("unknown"),
+            option_env!("BOWECHO_BUILD_PROFILE").unwrap_or("unknown"),
+            option_env!("BOWECHO_BUILD_UNIX").unwrap_or("unknown")
+        );
+        let _ = writeln!(
+            text,
             "target: {} {}",
             std::env::consts::OS,
             std::env::consts::ARCH
@@ -23712,7 +24024,7 @@ impl ViewerApp {
         if ui
             .checkbox(&mut perf_hud, "HUD overlay")
             .on_hover_text(
-                "Floating per-frame timing overlay on the map: FPS, volume decode, product render, layer raster, and time to first pixels for the last load. Persists across sessions.",
+                "Floating timing overlay on the map: repaint cadence, volume decode, product render, layer raster, and time to first pixels for the last load. Persists across sessions.",
             )
             .changed()
         {
@@ -23756,7 +24068,7 @@ impl ViewerApp {
             ui.label(format!("Decode {:.1} ms", load_timing.decode_ms));
             ui.label(format!("Load {:.1} ms", load_timing.total_ms));
         }
-        ui.label(format!("Frame {:.1} ms", self.frame_ms_avg));
+        ui.label(format!("Cadence {:.1} ms/repaint", self.frame_ms_avg));
         if let Some(layer_ms) = self.model_layer_render_ms {
             ui.label(format!("MdlLayer {layer_ms:.0} ms"));
         }
@@ -24199,6 +24511,18 @@ impl ViewerApp {
         if let Some(basemap_ms) = self.basemap_ms {
             ui.label(format!("Map {:.1} ms", basemap_ms));
         }
+        let tile_stats = self.tile_layer.borrow().last_poll_stats();
+        if tile_stats.processed > 0 || tile_stats.deferred {
+            let deferred = if tile_stats.deferred { " deferred" } else { "" };
+            ui.label(format!(
+                "Tiles {} processed, {} uploaded, {} failed in {:.1} ms{}",
+                tile_stats.processed,
+                tile_stats.installed,
+                tile_stats.failed,
+                tile_stats.elapsed_ms,
+                deferred
+            ));
+        }
 
         ui.add_space(6.0);
         self.perf_metric_readout(ui, "Decode", &self.perf.decode);
@@ -24307,21 +24631,24 @@ impl ViewerApp {
                         // Frame cadence (EMA of painted frames — egui is
                         // event-driven, so this is the cost of frames that
                         // actually ran, not a synthetic vsync rate).
-                        let fps = if self.frame_ms_avg > 0.0 {
+                        let cadence_hz = if self.frame_ms_avg > 0.0 {
                             1000.0 / self.frame_ms_avg
                         } else {
                             0.0
                         };
-                        let fps_color = if fps >= 55.0 {
+                        let cadence_color = if cadence_hz >= 55.0 {
                             FPS_GOOD
-                        } else if fps >= 30.0 {
+                        } else if cadence_hz >= 30.0 {
                             FPS_OK
                         } else {
                             FPS_BAD
                         };
                         ui.label(mono(
-                            format!("{fps:5.1} fps   {:5.1} ms/frame", self.frame_ms_avg),
-                            fps_color,
+                            format!(
+                                "cadence {cadence_hz:5.1} Hz   {:5.1} ms/repaint",
+                                self.frame_ms_avg
+                            ),
+                            cadence_color,
                         ));
 
                         // Volume decode: last volume + recent distribution.
@@ -35622,18 +35949,20 @@ impl ViewerApp {
                 {
                     continue;
                 }
+                let Some(texture_id) = layer.texture(style, tile).map(|texture| texture.id())
+                else {
+                    layer.request(style, tile);
+                    continue;
+                };
                 // Coarse 4-corner probe sizes the tile on screen and picks
                 // the mesh density: more cells the bigger the tile, so
                 // AEQD curvature bends the texture instead of shearing a
                 // single quad (same trick as the FARM/WoFS 8x8 drapes).
-                let probe: Vec<egui::Pos2> = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
-                    .iter()
-                    .map(|&(fx, fy)| {
-                        let (lon, lat) =
-                            tiles::tile_corner_lon_lat(tx as f64 + fx, ty as f64 + fy, zoom);
-                        self.lon_lat_to_screen(rect, lon as f32, lat as f32)
-                    })
-                    .collect();
+                let probe = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)].map(|(fx, fy)| {
+                    let (lon, lat) =
+                        tiles::tile_corner_lon_lat(tx as f64 + fx, ty as f64 + fy, zoom);
+                    self.lon_lat_to_screen(rect, lon as f32, lat as f32)
+                });
                 let span_px = {
                     let probe_bounds = egui::Rect::from_points(&probe);
                     probe_bounds.width().max(probe_bounds.height())
@@ -35646,6 +35975,7 @@ impl ViewerApp {
                     4
                 };
                 let mut vertices = Vec::with_capacity(((grid + 1) * (grid + 1)) as usize);
+                let mut mesh_bounds: Option<egui::Rect> = None;
                 for gy in 0..=grid {
                     for gx in 0..=grid {
                         let (fx, fy) = (
@@ -35654,10 +35984,12 @@ impl ViewerApp {
                         );
                         let (lon, lat) =
                             tiles::tile_corner_lon_lat(tx as f64 + fx, ty as f64 + fy, zoom);
-                        vertices.push((
-                            self.lon_lat_to_screen(rect, lon as f32, lat as f32),
-                            egui::pos2(fx as f32, fy as f32),
-                        ));
+                        let pos = self.lon_lat_to_screen(rect, lon as f32, lat as f32);
+                        mesh_bounds = Some(match mesh_bounds {
+                            Some(bounds) => bounds.union(egui::Rect::from_min_max(pos, pos)),
+                            None => egui::Rect::from_min_max(pos, pos),
+                        });
+                        vertices.push((pos, egui::pos2(fx as f32, fy as f32)));
                     }
                 }
                 if vertices
@@ -35668,37 +36000,35 @@ impl ViewerApp {
                 }
                 // Cull on the FULL mesh bounds — curved edges bow outside
                 // the corner hull, so 4-corner culling drops live tiles.
-                let positions: Vec<egui::Pos2> = vertices.iter().map(|(pos, _)| *pos).collect();
-                if !rect.intersects(egui::Rect::from_points(&positions)) {
+                let Some(mesh_bounds) = mesh_bounds else {
+                    continue;
+                };
+                if !rect.intersects(mesh_bounds) {
                     continue;
                 }
-                if let Some(texture) = layer.texture(style, tile) {
-                    let mut mesh = egui::epaint::Mesh::with_texture(texture.id());
-                    for (pos, uv) in &vertices {
-                        mesh.vertices.push(egui::epaint::Vertex {
-                            pos: *pos,
-                            uv: *uv,
-                            color: egui::Color32::WHITE,
-                        });
-                    }
-                    let stride = grid + 1;
-                    for gy in 0..grid {
-                        for gx in 0..grid {
-                            let i = gy * stride + gx;
-                            mesh.indices.extend_from_slice(&[
-                                i,
-                                i + 1,
-                                i + stride,
-                                i + 1,
-                                i + stride + 1,
-                                i + stride,
-                            ]);
-                        }
-                    }
-                    painter.add(egui::Shape::mesh(mesh));
-                } else {
-                    layer.request(style, tile);
+                let mut mesh = egui::epaint::Mesh::with_texture(texture_id);
+                for (pos, uv) in &vertices {
+                    mesh.vertices.push(egui::epaint::Vertex {
+                        pos: *pos,
+                        uv: *uv,
+                        color: egui::Color32::WHITE,
+                    });
                 }
+                let stride = grid + 1;
+                for gy in 0..grid {
+                    for gx in 0..grid {
+                        let i = gy * stride + gx;
+                        mesh.indices.extend_from_slice(&[
+                            i,
+                            i + 1,
+                            i + stride,
+                            i + 1,
+                            i + stride + 1,
+                            i + stride,
+                        ]);
+                    }
+                }
+                painter.add(egui::Shape::mesh(mesh));
             }
         }
         if let Some(attribution) = style.attribution() {
@@ -36008,7 +36338,10 @@ impl ViewerApp {
         let mut drawn = 0usize;
 
         for label in place_labels.labels {
-            if label.rank > place_labels.max_rank || !bounds.contains(label.lon, label.lat) {
+            if label.rank > place_labels.max_rank {
+                break;
+            }
+            if !bounds.contains(label.lon, label.lat) {
                 continue;
             }
             let (text_color, halo_color, dot_color) = if !bold && label.rank >= 7 {
@@ -42090,6 +42423,21 @@ fn retain_non_advanced_products(products: &mut Vec<DisplayProduct>) {
     products.retain(|product| advanced_derived_product_for_display_product(product).is_none());
 }
 
+fn is_hideable_derived_product(product: &DisplayProduct) -> bool {
+    matches!(product, DisplayProduct::Derived(_))
+        || advanced_derived_product_for_display_product(product).is_some()
+}
+
+fn is_product_visible_in_picker(product: &DisplayProduct, show_derived_products: bool) -> bool {
+    show_derived_products || !is_hideable_derived_product(product)
+}
+
+fn retain_picker_visible_products(products: &mut Vec<DisplayProduct>, show_derived_products: bool) {
+    if !show_derived_products {
+        products.retain(|product| !is_hideable_derived_product(product));
+    }
+}
+
 fn append_present_advanced_products(
     products: &mut Vec<DisplayProduct>,
     available: &std::collections::BTreeSet<MomentType>,
@@ -42156,6 +42504,17 @@ fn global_displayable_products_with_advanced(
             products.push(display_product);
         }
     }
+    products
+}
+
+fn global_displayable_products_for_picker(
+    volume: &RadarVolume,
+    include_advanced_placeholders: bool,
+    show_derived_products: bool,
+) -> Vec<DisplayProduct> {
+    let mut products =
+        global_displayable_products_with_advanced(volume, include_advanced_placeholders);
+    retain_picker_visible_products(&mut products, show_derived_products);
     products
 }
 
@@ -48406,6 +48765,107 @@ mod tests {
     }
 
     #[test]
+    fn geometry_cache_signature_reuses_only_matching_cut_geometry() {
+        fn volume_with_azimuth_offset(offset_deg: f32) -> Arc<RadarVolume> {
+            let mut volume = RadarVolume::new(
+                radar_core::RadarSite::new("KTLX"),
+                Utc.with_ymd_and_hms(2026, 6, 25, 21, 0, 0).unwrap(),
+            );
+            let gate_range = radar_core::GateRange {
+                first_gate_m: 250,
+                gate_spacing_m: 250,
+                gate_count: 3,
+            };
+            let mut cut = ElevationCut::new(0.5, Some(1));
+            cut.radials
+                .push(test_radial(0.0 + offset_deg, gate_range.clone()));
+            cut.radials
+                .push(test_radial(1.0 + offset_deg, gate_range.clone()));
+            let mut grid =
+                MomentGrid::new_u8(MomentType::Reflectivity, gate_range, 1.0, 0.0, None, None);
+            grid.radial_indices = vec![0, 1];
+            cut.moments.insert(MomentType::Reflectivity, grid);
+            volume.cuts.push(cut);
+            Arc::new(volume)
+        }
+
+        fn request_for(volume: Arc<RadarVolume>) -> RenderRequest {
+            let product = DisplayProduct::Moment(MomentType::Reflectivity);
+            let color_tables = ColorTableSet::default();
+            let color_table_signature = color_tables.signature_for_family(product.color_family());
+            let viewport_options = ViewportRasterOptions {
+                width: 320,
+                height: 240,
+                radar_x_px: 160.0,
+                radar_y_px: 120.0,
+                km_per_px_x: 1.0,
+                km_per_px_y: 1.0,
+                rotation_rad: 0.0,
+            };
+            RenderRequest {
+                key: TextureKey {
+                    volume_ptr: Arc::as_ptr(&volume) as usize,
+                    dealias_reference_volume_ptr: 0,
+                    cut: 0,
+                    product: product.clone(),
+                    render_dealiased_velocity: false,
+                    color_table_signature,
+                    storm_motion_key: (0, 0),
+                    hail_levels_key: (32, 64),
+                    smoothing: SmoothingMode::Native,
+                    dealias_cascade: false,
+                    gate_filter_decidbz: i16::MIN,
+                    viewport: test_viewport_key(320, 240),
+                },
+                pane: 0,
+                volume,
+                previous_volume: None,
+                cut: 0,
+                product,
+                render_dealiased_velocity: false,
+                plain_velocity_render_dealiased: false,
+                color_tables,
+                storm_motion: StormMotion {
+                    direction_deg: 0.0,
+                    speed_mps: 0.0,
+                },
+                hail_levels_m: (3200.0, 6400.0),
+                smoothing: SmoothingMode::Native,
+                dealias_cascade: false,
+                gate_filter_decidbz: i16::MIN,
+                viewport_options,
+                radar_range_km: DEFAULT_RADAR_RANGE_KM,
+            }
+        }
+
+        let first = request_for(volume_with_azimuth_offset(0.0));
+        let same = request_for(volume_with_azimuth_offset(0.0));
+        let shifted = request_for(volume_with_azimuth_offset(0.25));
+
+        let first_signature = RenderWorkerGeometryCacheSignature::new(
+            &first,
+            &MomentType::Reflectivity,
+            first.product.derived(),
+        )
+        .expect("geometry signature");
+        let same_signature = RenderWorkerGeometryCacheSignature::new(
+            &same,
+            &MomentType::Reflectivity,
+            same.product.derived(),
+        )
+        .expect("same geometry signature");
+        let shifted_signature = RenderWorkerGeometryCacheSignature::new(
+            &shifted,
+            &MomentType::Reflectivity,
+            shifted.product.derived(),
+        )
+        .expect("shifted geometry signature");
+
+        assert_eq!(first_signature, same_signature);
+        assert_ne!(first_signature, shifted_signature);
+    }
+
+    #[test]
     fn decoded_load_clone_shares_the_volume_allocation() {
         let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
         let decoded = test_decoded_live_partial(PathBuf::from("KTLX-live"), "KTLX", scan_time, 720);
@@ -48610,6 +49070,7 @@ mod tests {
         let mut reusable_signature = None;
         let mut moment_caches = Vec::new();
         let mut sample_caches = Vec::new();
+        let mut geometry_caches = Vec::new();
         let mut last_direct_viewports = Vec::new();
         let mut rendered_cache = Vec::new();
         let mut first_render_ms = Vec::new();
@@ -48636,6 +49097,7 @@ mod tests {
                 &mut reusable_signature,
                 &mut moment_caches,
                 &mut sample_caches,
+                &mut geometry_caches,
                 &mut last_direct_viewports,
                 cache_policy,
             )
@@ -57319,6 +57781,22 @@ mod tests {
     }
 
     #[test]
+    fn basemap_place_label_sources_are_rank_sorted() {
+        fn sorted(labels: &[basemap_data::BasemapLabel]) -> bool {
+            labels.windows(2).all(|pair| pair[0].rank <= pair[1].rank)
+        }
+
+        assert!(sorted(basemap_data::BASEMAP_WORLD_PLACE_LABELS));
+        assert!(sorted(basemap_data::BASEMAP_US_PLACE_LABELS));
+        assert!(sorted(basemap_towns::BASEMAP_US_TOWN_LABELS));
+        assert!(sorted(basemap_data::BASEMAP_US_COUNTY_LABELS));
+        for layer in REGIONAL_BASEMAP_LAYERS {
+            assert!(sorted(layer.admin_labels));
+            assert!(sorted(layer.place_labels));
+        }
+    }
+
+    #[test]
     fn basemap_suppresses_duplicate_natural_earth_conus_outline() {
         let duplicates: Vec<_> = basemap_data::BASEMAP_WORLD_COUNTRY_LINES
             .iter()
@@ -57803,6 +58281,58 @@ mod tests {
             "arrow cycle landed on non-displayable {} cut {}",
             app.selected_product.label(),
             app.selected_cut
+        );
+    }
+
+    #[test]
+    fn product_picker_can_hide_builtin_and_advanced_derived_products() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(Arc::new(test_advanced_source_volume(Utc::now())));
+        app.advanced_products_enabled = true;
+        let volume = app.volume.clone().expect("volume");
+
+        let visible = app.displayable_products_for_picker(volume.as_ref());
+        assert!(
+            visible
+                .iter()
+                .any(|product| matches!(product, DisplayProduct::Derived(_)))
+        );
+        assert!(
+            visible
+                .iter()
+                .any(|product| advanced_derived_product_for_display_product(product).is_some())
+        );
+
+        app.app_settings.show_derived_products = false;
+        let hidden = app.displayable_products_for_picker(volume.as_ref());
+
+        assert!(hidden.contains(&DisplayProduct::Moment(MomentType::Reflectivity)));
+        assert!(hidden.contains(&DisplayProduct::Moment(MomentType::DifferentialPhase)));
+        assert!(
+            !hidden
+                .iter()
+                .any(|product| matches!(product, DisplayProduct::Derived(_)))
+        );
+        assert!(
+            !hidden
+                .iter()
+                .any(|product| advanced_derived_product_for_display_product(product).is_some())
+        );
+    }
+
+    #[test]
+    fn hiding_derived_products_sanitizes_active_selection() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.volume = Some(Arc::new(test_ref_then_velocity_volume()));
+        app.selected_cut = 0;
+        app.selected_product = DisplayProduct::Derived(DerivedProduct::CompositeReflectivity);
+        app.app_settings.show_derived_products = false;
+
+        app.sanitize_selection();
+
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Reflectivity)
         );
     }
 
@@ -60963,6 +61493,32 @@ mod tests {
     fn arm_busy_primary_load(app: &mut ViewerApp) {
         let (_sender, receiver) = mpsc::channel::<AsyncLoadResult>();
         app.load_receiver = Some(receiver);
+    }
+
+    #[test]
+    fn explicit_primary_radar_command_cancels_stale_load_receivers() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let (_sender, receiver) = mpsc::channel::<AsyncLoadResult>();
+        let (_intl_sender, intl_receiver) = mpsc::channel::<IntlLoopFrameMessage>();
+        app.load_receiver = Some(receiver);
+        app.intl_loop_rx = Some(intl_receiver);
+        app.intl_loop_frames = 4;
+        app.intl_loop_requested = 12;
+        app.archive_load_progress = Some(ArchiveLoadProgress {
+            label: "Radar loop".to_owned(),
+            detail: "Fetching frames".to_owned(),
+            done: 2,
+            total: 12,
+        });
+
+        assert!(app.cancel_primary_radar_load_for_user_command());
+
+        assert!(app.load_receiver.is_none());
+        assert!(app.intl_loop_rx.is_none());
+        assert_eq!(app.intl_loop_frames, 0);
+        assert_eq!(app.intl_loop_requested, 0);
+        assert!(app.archive_load_progress.is_none());
+        assert!(!app.cancel_primary_radar_load_for_user_command());
     }
 
     #[test]
