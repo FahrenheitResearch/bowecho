@@ -619,6 +619,28 @@ impl ObPool {
             .unwrap_or(0)
     }
 
+    pub fn station_series(
+        &self,
+        station: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Vec<&SurfaceOb> {
+        self.by_station
+            .get(station)
+            .into_iter()
+            .flatten()
+            .filter(|ob| {
+                ob.time_utc
+                    .map(|time| time >= start && time <= end)
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    pub fn latest_station_ob(&self, station: &str) -> Option<&SurfaceOb> {
+        self.by_station.get(station).and_then(|list| list.last())
+    }
+
     /// Iterate one representative ob per station for `frame_time`.
     pub fn frame_obs(&self, frame_time: DateTime<Utc>) -> impl Iterator<Item = &SurfaceOb> {
         self.by_station
@@ -841,6 +863,38 @@ mod tests {
             pool.ob_at("KTST", t0 + chrono::Duration::hours(4))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn pool_returns_station_series_for_chart_window() {
+        use chrono::TimeZone;
+        let t0 = Utc.with_ymd_and_hms(2100, 1, 1, 12, 0, 0).unwrap();
+        let make = |minutes: i64, temp: f32| SurfaceOb {
+            elevation_m: None,
+            network: "METAR".into(),
+            station_id: "KTST".into(),
+            time_utc: Some(t0 + chrono::Duration::minutes(minutes)),
+            lat: 39.0,
+            lon: -94.0,
+            temp_c: Some(temp),
+            dewpoint_c: None,
+            wind_dir_deg: None,
+            wind_speed_kt: None,
+            wind_gust_kt: None,
+            altim_in_hg: None,
+            completeness: 1,
+        };
+        let mut pool = ObPool::new();
+        pool.by_station.insert(
+            "KTST".into(),
+            vec![make(-90, 8.0), make(-30, 10.0), make(0, 12.0)],
+        );
+
+        let series = pool.station_series("KTST", t0 - chrono::Duration::hours(1), t0);
+
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].temp_c, Some(10.0));
+        assert_eq!(series[1].temp_c, Some(12.0));
     }
 
     #[test]

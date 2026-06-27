@@ -24,7 +24,7 @@ use std::sync::{Condvar, Mutex};
 
 use bzip2::bufread::BzDecoder;
 use chrono::{DateTime, TimeZone, Utc};
-use flate2::read::GzDecoder;
+use flate2::read::{DeflateDecoder, GzDecoder};
 use radar_core::{
     GateRange, MomentGrid, MomentType, RadarSite, RadarVolume, Radial, RadialStatus, VcpInfo,
 };
@@ -36,6 +36,7 @@ const CONTROL_WORD_LEN: usize = 12;
 const MESSAGE_HEADER_LEN: usize = 16;
 const RECORD_BYTES: usize = 2432;
 const MSG_31_HEADER_LEN: usize = 72;
+const MSG_1_HEADER_LEN: usize = 100;
 const GENERIC_DATA_BLOCK_LEN: usize = 28;
 const VOLUME_CONSTANT_BLOCK_LEN: usize = 44;
 const RADIAL_CONSTANT_BLOCK_LEN: usize = 20;
@@ -46,6 +47,7 @@ const MAX_MESSAGE_31_MOMENTS: usize = 10;
 const BZIP_BLOCK_DECODE_CAPACITY_HINT: usize = RECORD_BYTES * 102;
 const GZIP_TRAILER_LEN: usize = 8;
 const MAX_GZIP_PREALLOC_RATIO: usize = 128;
+const ZIP_LOCAL_FILE_HEADER_LEN: usize = 30;
 
 pub type Result<T> = std::result::Result<T, NexradError>;
 
@@ -188,6 +190,12 @@ pub fn sniff_supported_volume_format(head: &[u8]) -> SupportedVolumeFormat {
 /// station call [`jma::decode_jma_tar_volumes`] with a `site_filter`
 /// directly instead of going through the router.
 pub fn decode_supported_volume_bytes(raw: &[u8]) -> std::result::Result<RadarVolume, String> {
+    let decoded_zip = if mobile_archive::looks_like_zip_bytes(raw) {
+        Some(decompress_zip_local_member_bytes(raw).map_err(|err| err.to_string())?)
+    } else {
+        None
+    };
+    let raw = decoded_zip.as_deref().unwrap_or(raw);
     let decoded_gzip = if raw.starts_with(&[0x1f, 0x8b]) {
         Some(decompress_gzip_bytes(raw).map_err(|err| err.to_string())?)
     } else {
@@ -208,6 +216,70 @@ pub fn decode_supported_volume_bytes(raw: &[u8]) -> std::result::Result<RadarVol
         SupportedVolumeFormat::NexradLevel2 => {
             decode_volume_from_bytes(raw).map_err(|err| err.to_string())
         }
+    }
+}
+
+/// Decode a single ZIP local-file record.
+///
+/// NCI THREDDS can serve one member inside a huge daily radar ZIP directly,
+/// but the response body is the member's ZIP local record rather than a
+/// complete central-directory ZIP archive. The regular `zip` crate quite
+/// reasonably rejects that stream; this small parser handles only the local
+/// record shape needed by single-member HTTP responses.
+fn decompress_zip_local_member_bytes(raw: &[u8]) -> Result<Vec<u8>> {
+    if raw.len() < ZIP_LOCAL_FILE_HEADER_LEN || &raw[..4] != b"PK\x03\x04" {
+        return Err(NexradError::Compression(
+            "not a ZIP local-file record".to_owned(),
+        ));
+    }
+    let flags = u16::from_le_bytes([raw[6], raw[7]]);
+    if flags & 0x0008 != 0 {
+        return Err(NexradError::Compression(
+            "ZIP local-file record uses a trailing data descriptor".to_owned(),
+        ));
+    }
+    if flags & 0x0001 != 0 {
+        return Err(NexradError::Compression(
+            "encrypted ZIP local-file record is unsupported".to_owned(),
+        ));
+    }
+    let method = u16::from_le_bytes([raw[8], raw[9]]);
+    let compressed_size = u32::from_le_bytes([raw[18], raw[19], raw[20], raw[21]]) as usize;
+    let uncompressed_size = u32::from_le_bytes([raw[22], raw[23], raw[24], raw[25]]) as usize;
+    let name_len = u16::from_le_bytes([raw[26], raw[27]]) as usize;
+    let extra_len = u16::from_le_bytes([raw[28], raw[29]]) as usize;
+    let data_start = ZIP_LOCAL_FILE_HEADER_LEN
+        .checked_add(name_len)
+        .and_then(|value| value.checked_add(extra_len))
+        .ok_or_else(|| NexradError::Compression("ZIP local-file header overflow".to_owned()))?;
+    let data_end = data_start.checked_add(compressed_size).ok_or_else(|| {
+        NexradError::Compression("ZIP local-file compressed size overflow".to_owned())
+    })?;
+    if data_end > raw.len() {
+        return Err(NexradError::Compression(format!(
+            "ZIP local-file data truncated: need {data_end} bytes, have {}",
+            raw.len()
+        )));
+    }
+    let compressed = &raw[data_start..data_end];
+    match method {
+        0 => Ok(compressed.to_vec()),
+        8 => {
+            let mut decoded = Vec::with_capacity(uncompressed_size);
+            DeflateDecoder::new(compressed)
+                .read_to_end(&mut decoded)
+                .map_err(|err| NexradError::Compression(format!("ZIP deflate member: {err}")))?;
+            if uncompressed_size != 0 && decoded.len() != uncompressed_size {
+                return Err(NexradError::Compression(format!(
+                    "ZIP deflate member decoded to {} bytes, expected {uncompressed_size}",
+                    decoded.len()
+                )));
+            }
+            Ok(decoded)
+        }
+        other => Err(NexradError::Compression(format!(
+            "unsupported ZIP compression method {other}"
+        ))),
     }
 }
 
@@ -562,6 +634,23 @@ pub fn decode_normalized_volume_bytes(
 
         volume.metadata.message_count += 1;
         match header.message_type {
+            1 => {
+                let message_end = header_offset + message_total_len;
+                if message_end > bytes.len() {
+                    if volume.metadata.decoded_radial_count > 0 {
+                        volume.metadata.skipped_message_count += 1;
+                        break;
+                    }
+                    return Err(NexradError::Truncated {
+                        what: "message 1 body",
+                        offset: header_offset,
+                        needed: message_total_len,
+                        available: bytes.len().saturating_sub(header_offset),
+                    });
+                }
+                let body = &bytes[header_offset + MESSAGE_HEADER_LEN..message_end];
+                parse_message_1(body, &header, &mut volume)?;
+            }
             31 => {
                 let message_end = header_offset + message_total_len;
                 if message_end > bytes.len() {
@@ -702,6 +791,36 @@ where
         volume.metadata.message_count += 1;
 
         match header.message_type {
+            1 => {
+                if let Err(err) = read_exact_into_buffer(
+                    reader,
+                    &mut body_buffer,
+                    body_len,
+                    "message 1 body",
+                    header_offset,
+                ) {
+                    if volume.metadata.decoded_radial_count > 0 {
+                        volume.metadata.skipped_message_count += 1;
+                        break;
+                    }
+                    return Err(err);
+                }
+                parse_message_1(&body_buffer, &header, &mut volume)?;
+                skip_record_padding(reader, record_len, prefix.len() + body_len, cursor)?;
+                if let Some(min_radials) = preview_min_radials
+                    && !preview_emitted
+                    && has_complete_displayable_cut(&volume, min_radials)
+                {
+                    preview_emitted = true;
+                    if stop_at_preview {
+                        return Ok(StreamDecodeResult {
+                            volume,
+                            stopped_at_preview: true,
+                        });
+                    }
+                    on_preview(volume.clone());
+                }
+            }
             31 => {
                 if let Err(err) = read_exact_into_buffer(
                     reader,
@@ -1207,6 +1326,41 @@ fn parse_bzip_block_volume(
         volume.metadata.message_count += 1;
 
         match header.message_type {
+            1 => {
+                let body = match cursor_reader.read_slice_or_copy(
+                    &mut body_buffer,
+                    body_len,
+                    "message 1 body",
+                    header_offset,
+                ) {
+                    Ok(body) => body,
+                    Err(err) => {
+                        if volume.metadata.decoded_radial_count > 0 {
+                            volume.metadata.skipped_message_count += 1;
+                            break;
+                        }
+                        return Err(err);
+                    }
+                };
+                parse_message_1(body, &header, &mut volume)?;
+                if let Some(min_radials) = preview_pending
+                    && has_complete_displayable_cut(&volume, min_radials)
+                {
+                    preview_pending = None;
+                    if stop_at_preview {
+                        return Ok(BlockParseOutcome {
+                            volume,
+                            stopped_at_preview: true,
+                        });
+                    }
+                    on_preview(&volume);
+                }
+                cursor_reader.skip_exact(
+                    record_len.saturating_sub(prefix.len() + body_len),
+                    "record padding",
+                    cursor + prefix.len() + body_len,
+                )?;
+            }
             31 => {
                 let body = match cursor_reader.read_slice_or_copy(
                     &mut body_buffer,
@@ -1424,6 +1578,184 @@ fn parse_message_5(body: &[u8], volume: &mut RadarVolume) {
             volume.vcp = Some(VcpInfo { pattern });
         }
     }
+}
+
+fn parse_message_1(
+    body: &[u8],
+    _message_header: &MessageHeader,
+    volume: &mut RadarVolume,
+) -> Result<()> {
+    require_len(body, 0, MSG_1_HEADER_LEN, "message 1 header")?;
+
+    let collect_ms = be_u32(body, 0);
+    let collect_date = be_u16(body, 4);
+    if volume.metadata.decoded_radial_count == 0 && collect_date > 0 {
+        volume.volume_time = nexrad_date_ms_to_datetime(u32::from(collect_date), collect_ms);
+    }
+
+    let azimuth_angle = legacy_binary_angle_deg(be_u16(body, 8));
+    let radial_status = RadialStatus::from(be_u16(body, 12) as u8);
+    let elevation_angle = legacy_binary_angle_deg(be_u16(body, 14));
+    let elevation_number = (be_u16(body, 16) as u8).max(1);
+
+    let reflectivity_range = GateRange {
+        first_gate_m: i32::from(be_i16(body, 18)),
+        gate_spacing_m: i32::from(be_u16(body, 22).max(1)),
+        gate_count: usize::from(be_u16(body, 26)),
+    };
+    let doppler_range = GateRange {
+        first_gate_m: i32::from(be_i16(body, 20)),
+        gate_spacing_m: i32::from(be_u16(body, 24).max(1)),
+        gate_count: usize::from(be_u16(body, 28)),
+    };
+    let reflectivity_pointer = usize::from(be_u16(body, 36));
+    let velocity_pointer = usize::from(be_u16(body, 38));
+    let spectrum_width_pointer = usize::from(be_u16(body, 40));
+    let velocity_resolution = be_u16(body, 42);
+
+    let vcp = be_u16(body, 44);
+    if vcp != 0 {
+        volume.vcp = Some(VcpInfo { pattern: vcp });
+    }
+    let nyquist_velocity_mps = match be_i16(body, 46) {
+        raw if raw > 0 => Some(raw as f32 / 100.0),
+        _ => None,
+    };
+
+    let reflectivity_row =
+        legacy_message_1_row(body, reflectivity_pointer, reflectivity_range.gate_count);
+    let velocity_row = legacy_message_1_row(body, velocity_pointer, doppler_range.gate_count);
+    let spectrum_width_row =
+        legacy_message_1_row(body, spectrum_width_pointer, doppler_range.gate_count);
+    if reflectivity_row.is_none() && velocity_row.is_none() && spectrum_width_row.is_none() {
+        volume.metadata.skipped_message_count += 1;
+        return Ok(());
+    }
+
+    let gate_range = if reflectivity_row.is_some() {
+        reflectivity_range.clone()
+    } else {
+        doppler_range.clone()
+    };
+    let radial = Radial {
+        azimuth_deg: azimuth_angle,
+        elevation_deg: elevation_angle,
+        time_offset_ms: collect_ms as i32,
+        gate_range,
+        nyquist_velocity_mps,
+        radial_status: Some(radial_status),
+    };
+
+    let starts_elevation = matches!(
+        radial_status,
+        RadialStatus::StartElevation
+            | RadialStatus::StartVolume
+            | RadialStatus::StartElevationLastCut
+    );
+    let last_cut_has_radials = volume
+        .cuts
+        .last()
+        .is_some_and(|cut| !cut.radials.is_empty());
+    let last_cut_matches = volume.cuts.last().is_some_and(|cut| {
+        cut.elevation_number == Some(elevation_number)
+            || (cut.elevation_deg - elevation_angle).abs() <= 0.05
+    });
+    let cut = if starts_elevation && last_cut_has_radials {
+        volume.push_cut(elevation_angle, Some(elevation_number))
+    } else if last_cut_matches {
+        volume
+            .cuts
+            .last_mut()
+            .expect("last cut existence was checked before borrowing")
+    } else {
+        volume.find_or_insert_cut(elevation_angle, Some(elevation_number))
+    };
+    if cut.radials.is_empty() {
+        cut.radials.reserve(ONE_DEGREE_RADIALS_PER_CUT);
+    }
+    let radial_index = cut.radials.len();
+    cut.radials.push(radial);
+
+    if let Some(row) = reflectivity_row {
+        let grid = legacy_u8_grid(
+            cut,
+            MomentType::Reflectivity,
+            reflectivity_range,
+            2.0,
+            66.0,
+            ONE_DEGREE_RADIALS_PER_CUT,
+        );
+        grid.push_u8_row_slice(radial_index, row)?;
+    }
+    if let Some(row) = velocity_row {
+        let grid = legacy_u8_grid(
+            cut,
+            MomentType::Velocity,
+            doppler_range.clone(),
+            legacy_message_1_velocity_scale(velocity_resolution),
+            129.0,
+            ONE_DEGREE_RADIALS_PER_CUT,
+        );
+        grid.push_u8_row_slice(radial_index, row)?;
+    }
+    if let Some(row) = spectrum_width_row {
+        let grid = legacy_u8_grid(
+            cut,
+            MomentType::SpectrumWidth,
+            doppler_range,
+            2.0,
+            2.0,
+            ONE_DEGREE_RADIALS_PER_CUT,
+        );
+        grid.push_u8_row_slice(radial_index, row)?;
+    }
+
+    volume.metadata.decoded_radial_count += 1;
+    Ok(())
+}
+
+fn legacy_u8_grid(
+    cut: &mut radar_core::ElevationCut,
+    moment: MomentType,
+    gate_range: GateRange,
+    scale: f32,
+    offset: f32,
+    expected_radials: usize,
+) -> &mut MomentGrid {
+    match cut.moments.entry(moment) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            let mut grid = MomentGrid::new_u8(
+                entry.key().clone(),
+                gate_range,
+                scale,
+                offset,
+                Some(0),
+                Some(1),
+            );
+            grid.reserve_rows(expected_radials);
+            entry.insert(grid)
+        }
+    }
+}
+
+fn legacy_message_1_row(body: &[u8], pointer: usize, gate_count: usize) -> Option<&[u8]> {
+    if pointer == 0 || gate_count == 0 {
+        return None;
+    }
+    body.get(pointer..pointer.checked_add(gate_count)?)
+}
+
+fn legacy_message_1_velocity_scale(velocity_resolution: u16) -> f32 {
+    match velocity_resolution {
+        2 => 2.0,
+        4 => 1.0,
+        _ => 2.0,
+    }
+}
+
+fn legacy_binary_angle_deg(raw: u16) -> f32 {
+    raw as f32 * 360.0 / 65_536.0
 }
 
 fn parse_message_31(
@@ -1784,7 +2116,7 @@ mod tests {
     use super::*;
     use bzip2::write::BzEncoder;
     use flate2::Compression;
-    use flate2::write::GzEncoder;
+    use flate2::write::{DeflateEncoder, GzEncoder};
     use std::io::Write;
 
     #[test]
@@ -1869,6 +2201,32 @@ mod tests {
     }
 
     #[test]
+    fn unwraps_zip_local_member_stream_without_central_directory() {
+        let payload = b"\x89HDF\r\n\x1a\nfake odim bytes";
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let name = b"2_20260624_235500.pvol.h5";
+        let mut zip = Vec::new();
+        zip.extend_from_slice(b"PK\x03\x04");
+        zip.extend_from_slice(&20u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&8u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(name);
+        zip.extend_from_slice(&compressed);
+
+        let decoded = decompress_zip_local_member_bytes(&zip).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
     fn parses_archive_volume_header() {
         let bytes = synthetic_archive(false);
         let header = parse_volume_header(&bytes).unwrap();
@@ -1940,6 +2298,66 @@ mod tests {
         assert_eq!(reflectivity.radial_count(), 1);
         assert_eq!(reflectivity.scaled_value(0, 1), Some(0.0));
         assert_eq!(reflectivity.scaled_value(0, 2), Some(7.0));
+    }
+
+    #[test]
+    fn decodes_legacy_message_1_reflectivity_and_velocity() {
+        let mut body = vec![0u8; 106];
+        body[0..4].copy_from_slice(&1_000u32.to_be_bytes());
+        body[4..6].copy_from_slice(&19_724u16.to_be_bytes());
+        body[8..10].copy_from_slice(&0u16.to_be_bytes());
+        body[12..14].copy_from_slice(&3u16.to_be_bytes());
+        body[14..16].copy_from_slice(&91u16.to_be_bytes());
+        body[16..18].copy_from_slice(&1u16.to_be_bytes());
+        body[18..20].copy_from_slice(&0i16.to_be_bytes());
+        body[20..22].copy_from_slice(&0i16.to_be_bytes());
+        body[22..24].copy_from_slice(&1000u16.to_be_bytes());
+        body[24..26].copy_from_slice(&250u16.to_be_bytes());
+        body[26..28].copy_from_slice(&3u16.to_be_bytes());
+        body[28..30].copy_from_slice(&3u16.to_be_bytes());
+        body[36..38].copy_from_slice(&100u16.to_be_bytes());
+        body[38..40].copy_from_slice(&103u16.to_be_bytes());
+        body[42..44].copy_from_slice(&2u16.to_be_bytes());
+        body[44..46].copy_from_slice(&31u16.to_be_bytes());
+        body[46..48].copy_from_slice(&1500i16.to_be_bytes());
+        body[100..103].copy_from_slice(&[0, 66, 86]);
+        body[103..106].copy_from_slice(&[129, 131, 127]);
+        let header = MessageHeader {
+            size_halfwords: ((MESSAGE_HEADER_LEN + body.len()) / 2) as u16,
+            channels: 0,
+            message_type: 1,
+            sequence_id: 1,
+            date: 19_724,
+            milliseconds: 1_000,
+            segments: 1,
+            segment_number: 1,
+        };
+        let mut volume = RadarVolume::new(RadarSite::new("KBPP"), DateTime::<Utc>::UNIX_EPOCH);
+
+        parse_message_1(&body, &header, &mut volume).unwrap();
+
+        assert_eq!(
+            volume.volume_time,
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 1).unwrap()
+        );
+        assert_eq!(volume.vcp, Some(VcpInfo { pattern: 31 }));
+        assert_eq!(volume.metadata.decoded_radial_count, 1);
+        assert_eq!(volume.cuts.len(), 1);
+        assert_eq!(volume.cuts[0].radials.len(), 1);
+        assert_eq!(volume.cuts[0].radials[0].nyquist_velocity_mps, Some(15.0));
+
+        let reflectivity = volume.cuts[0]
+            .moments
+            .get(&MomentType::Reflectivity)
+            .unwrap();
+        assert_eq!(reflectivity.scaled_value(0, 0), None);
+        assert_eq!(reflectivity.scaled_value(0, 1), Some(0.0));
+        assert_eq!(reflectivity.scaled_value(0, 2), Some(10.0));
+
+        let velocity = volume.cuts[0].moments.get(&MomentType::Velocity).unwrap();
+        assert_eq!(velocity.scaled_value(0, 0), Some(0.0));
+        assert_eq!(velocity.scaled_value(0, 1), Some(1.0));
+        assert_eq!(velocity.scaled_value(0, 2), Some(-1.0));
     }
 
     #[test]

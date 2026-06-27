@@ -1,7 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, VecDeque, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque, hash_map::DefaultHasher};
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -44,6 +44,7 @@ mod event_loop_builder;
 mod farm_live;
 mod fonts;
 mod glm_layer;
+mod grid_composites;
 mod guide;
 mod ingest_worker;
 mod italy_dpc;
@@ -63,6 +64,7 @@ mod skewt_native;
 mod sounding_panels;
 mod spc_layers;
 mod table_editor;
+mod taiwan_cwa;
 mod tiles;
 mod tor_tracks;
 mod ui_theme;
@@ -82,6 +84,8 @@ const DEFAULT_MAP_SCALE: f32 = 115.0;
 const MIN_MAP_SCALE: f32 = 7.0;
 const MAX_MAP_SCALE: f32 = 8_000.0;
 const DEFAULT_RADAR_RANGE_KM: f32 = 460.0;
+const SURFACE_OBS_LOOP_WINDOW_MS: i64 = 60 * 60 * 1000;
+const SURFACE_OBS_LOOP_PLAYBACK_MS: u128 = 30 * 1000;
 /// Top of the vertical cross-section (m above the radar) — shared by the
 /// compute and the panel's height-axis labels so they can't drift.
 const CROSS_SECTION_TOP_M: f32 = 18_000.0;
@@ -130,8 +134,13 @@ const MAX_SAT_PLAYER_TEXTURE_DIM: usize = 4096;
 /// recommends polling no more often than every 30 seconds; overlapping loads
 /// are already prevented by `hazard_receiver.is_some()`.
 const LIVE_HAZARD_REFRESH_SECONDS: u64 = 30;
+const MAX_ACTIVE_ALERT_ZONE_GEOMETRIES: usize = 320;
 const TIMELINE_REPORT_TRAILING_MINUTES: i64 = 90;
 const TIMELINE_REPORT_LEAD_SECONDS: i64 = 90;
+const MPING_DECLUTTER_REPORT_THRESHOLD: usize = 160;
+const MPING_DECLUTTER_CELL_PX: f32 = 24.0;
+const MPING_MAX_DRAWN_REPORTS: usize = 500;
+const MPING_LABEL_REPORT_LIMIT: usize = 80;
 const PRIMARY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 1;
 const OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 5;
 const MAX_RADAR_OVERLAY_LAYERS: usize = 10;
@@ -589,6 +598,11 @@ const HAZARD_MAX_RENDER_LAT_SPAN_DEG: f32 = 30.0;
 const HAZARD_MAX_RENDER_EDGE_KM: f32 = 2_500.0;
 const HAZARD_GENERIC_ALERT_SPIKY_MIN_POINTS: usize = 8;
 const HAZARD_GENERIC_ALERT_SPIKY_PATH_RATIO: f32 = 1.6;
+const HAZARD_HEAVY_LAYER_FILL_LIMIT: usize = 80;
+const SCREEN_POLYGON_MAX_SEGMENT_DIAGONAL_FRACTION: f32 = 0.35;
+const SCREEN_POLYGON_MIN_MAX_SEGMENT_PX: f32 = 110.0;
+const MAP_LAYER_RERENDER_PAN_PX: f32 = 0.5;
+const MAP_LAYER_RERENDER_ZOOM_RATIO: f32 = 0.001;
 const MAP_DRAG_DEAD_ZONE_PX: f32 = 3.0;
 const VOL3D_BOX_DRAG_MIN_PX: f32 = 12.0;
 const VOL3D_BOX_DRAG_MIN_HALF_KM: f32 = 5.0;
@@ -612,13 +626,20 @@ pub(crate) use ui_theme::{
     ROW_SPACING_X, SECTION_SEPARATOR_COLOR, SECTION_SPACING, SIDEBAR_DEFAULT_WIDTH,
     SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SUBHEAD_COLOR,
 };
-const DEFAULT_VISIBLE_HAZARD_FAMILIES: &[&str] =
-    &["tornado", "severe thunderstorm", "flash flood", "flood"];
+const DEFAULT_VISIBLE_HAZARD_FAMILIES: &[&str] = &[
+    "tornado",
+    "severe thunderstorm",
+    "flash flood",
+    "flood",
+    "fire weather",
+    "watch",
+];
 const HAZARD_FILTER_FAMILIES: &[(&str, &str)] = &[
     ("tornado", "TOR"),
     ("severe thunderstorm", "SVR"),
     ("flash flood", "FFW"),
     ("flood", "Flood"),
+    ("fire weather", "Fire Wx"),
     ("special marine", "SMW"),
     ("snow squall", "SQW"),
     ("watch", "Watch"),
@@ -1591,6 +1612,20 @@ struct ViewerApp {
     italy_dpc_latest_rx: Option<mpsc::Receiver<ItalyDpcLatestResult>>,
     italy_dpc_texture: Option<(egui::TextureHandle, u64, ModelLayerView)>,
     italy_dpc_render_rx: Option<mpsc::Receiver<ModelLayerRender>>,
+    /// Taiwan CWA O-A0059-001 gridded composite reflectivity overlay.
+    taiwan_cwa_layer: Option<TaiwanCwaMapLayer>,
+    taiwan_cwa_latest_rx: Option<mpsc::Receiver<TaiwanCwaLatestResult>>,
+    taiwan_cwa_texture: Option<(egui::TextureHandle, u64, ModelLayerView)>,
+    taiwan_cwa_render_rx: Option<mpsc::Receiver<ModelLayerRender>>,
+    /// Latest gridded radar composites converted into normal model-map layers.
+    grid_composite_rx: Option<
+        mpsc::Receiver<(
+            grid_composites::GridCompositeSource,
+            grid_composites::GridCompositeResult,
+        )>,
+    >,
+    grid_composite_loading: Option<grid_composites::GridCompositeSource>,
+    grid_composite_pending_field: Option<Arc<rw_ui::FieldData>>,
     bold_labels: bool,
     /// One-shot: force the Settings color-tables fold open (set by the
     /// product color row's "Edit…" jump).
@@ -1719,6 +1754,7 @@ struct ViewerApp {
     /// Floating inspector card at the cursor (Shift+click pins it to a spot).
     show_inspector_card: bool,
     pinned_inspector_lonlat: Option<(f32, f32)>,
+    pinned_obs_chart_station: Option<String>,
     /// Bumped on every hazard_overlay assignment — exact invalidation for the
     /// hazard shape cache (content proxies like record counts can alias).
     hazard_overlay_generation: u64,
@@ -1968,6 +2004,9 @@ struct ViewerApp {
     /// CLOSE (<=30 km) and FRESH (<=60 min) observation before the parcel
     /// math — SB CAPE from the real surface.
     obs_adjust_soundings: bool,
+    obs_hour_loop_enabled: bool,
+    obs_hour_loop_started_at: Instant,
+    obs_hour_loop_end_utc: DateTime<Utc>,
     surface_obs: obs::ObPool,
     obs_fetched_at: Option<Instant>,
     obs_rx: Option<mpsc::Receiver<std::result::Result<Vec<obs::SurfaceOb>, String>>>,
@@ -2008,6 +2047,9 @@ struct ViewerApp {
     native_sounding_rx: Option<NativeSoundingReceiver>,
     /// Which SoundingData the current/in-flight native build came from.
     native_sounding_src: Option<Arc<rw_ui::SoundingData>>,
+    /// Reusable Rusty Weather sounding scene for native-only sources such
+    /// as observed RAOBs.
+    native_sounding_panel: rw_ui::SoundingPanel,
     sounding_viewer_source: SoundingViewerSource,
     native_skewt_open: bool,
     /// Volumes fetched per archive loop load.
@@ -3475,13 +3517,38 @@ type StormCellsResult = (FrameWorkKey, Vec<StormCell>);
 type RotationMarkersResult = (FrameWorkKey, Vec<RotationMarker>);
 /// (grid hash, inverse LUT) for the decoupled model geolocation.
 type ModelLutEntry = (String, Arc<model_layer::InverseLut>);
-type NativeSoundingReceiver =
-    mpsc::Receiver<std::result::Result<(rustwx_sounding::NativeSounding, f32), String>>;
+type NativeSoundingResult = (
+    rustwx_sounding::NativeSounding,
+    f32,
+    Option<(rw_ui::SoundingData, rustwx_sounding::SoundingColumn)>,
+);
+type NativeSoundingReceiver = mpsc::Receiver<std::result::Result<NativeSoundingResult, String>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SoundingViewerSource {
     Model,
     NativeOnly,
+}
+
+#[derive(Clone)]
+struct ObsHistoryRow {
+    time_utc: DateTime<Utc>,
+    time_text: String,
+    age_min: i64,
+    temp_text: String,
+    dewpoint_text: String,
+    wind_text: String,
+    pressure_text: String,
+    network: String,
+}
+
+struct ObsHistoryData {
+    station_id: String,
+    network: String,
+    frame_time: DateTime<Utc>,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+    rows: Vec<ObsHistoryRow>,
 }
 
 /// (generation, view key, raster, render ms) from the model-layer render thread.
@@ -3492,6 +3559,7 @@ struct SatMapLayer {
     key: rw_ui::SatRunKey,
     hhmm: u16,
     image: Arc<egui::ColorImage>,
+    grid: Arc<rw_store::grid::GridFile>,
     lut: Arc<model_layer::InverseLut>,
     nx: usize,
     ny: usize,
@@ -3595,6 +3663,34 @@ type ItalyDpcLatestResult = (
     std::result::Result<italy_dpc::ItalyDpcRasterFrame, String>,
 );
 
+struct TaiwanCwaMapLayer {
+    visible: bool,
+    opacity: f32,
+    frame_time: Option<DateTime<Utc>>,
+    source_identity: Option<String>,
+    frame: Option<Arc<taiwan_cwa::TaiwanCwaRasterFrame>>,
+    last_refresh_attempt: Option<Instant>,
+    fetched_at: Option<Instant>,
+    error: Option<String>,
+}
+
+impl TaiwanCwaMapLayer {
+    fn new() -> Self {
+        Self {
+            visible: true,
+            opacity: 0.78,
+            frame_time: None,
+            source_identity: None,
+            frame: None,
+            last_refresh_attempt: None,
+            fetched_at: None,
+            error: None,
+        }
+    }
+}
+
+type TaiwanCwaLatestResult = std::result::Result<taiwan_cwa::TaiwanCwaRasterFrame, String>;
+
 /// One stacked model map layer: the layer data + its private texture and
 /// render channel (renders are independent; a slow layer never blocks the
 /// others). `id` is stable for UI rows; draw order = vec order.
@@ -3612,6 +3708,57 @@ struct ModelLayerView {
     center_lon: f32,
     map_scale: f32,
 }
+
+fn model_layer_view_needs_rerender(rendered: &ModelLayerView, current: &ModelLayerView) -> bool {
+    if !rendered.center_lat.is_finite()
+        || !rendered.center_lon.is_finite()
+        || !rendered.map_scale.is_finite()
+        || !current.center_lat.is_finite()
+        || !current.center_lon.is_finite()
+        || !current.map_scale.is_finite()
+        || rendered.map_scale <= 0.0
+        || current.map_scale <= 0.0
+    {
+        return true;
+    }
+    let zoom_delta = (current.map_scale / rendered.map_scale).ln().abs()
+        > (1.0 + MAP_LAYER_RERENDER_ZOOM_RATIO).ln();
+    if zoom_delta {
+        return true;
+    }
+    let (east_km, north_km) = aeqd_forward_km(
+        current.center_lat as f64,
+        current.center_lon as f64,
+        rendered.center_lat as f64,
+        rendered.center_lon as f64,
+    );
+    let pan_px = east_km.hypot(north_km) as f32 * current.map_scale / 111.32;
+    pan_px > MAP_LAYER_RERENDER_PAN_PX
+}
+
+fn default_model_layer_color_family(field: &rw_ui::FieldData) -> Option<ColorTableFamily> {
+    let model = field.key.hour.model.to_ascii_lowercase();
+    let var = field.key.var.to_ascii_lowercase();
+    let units = field.units.trim().to_ascii_lowercase();
+    if units == "dbz"
+        || model == "mrms"
+        || model == "eumetnet-opera"
+        || var.contains("reflectivity")
+        || var.contains("dbzh")
+        || var.contains("cref")
+    {
+        Some(ColorTableFamily::Reflectivity)
+    } else {
+        None
+    }
+}
+
+fn map_layer_rerender_deferred(ctx: &egui::Context) -> bool {
+    ctx.input(|input| {
+        input.pointer.any_down() || input.smooth_scroll_delta.length_sq() > f32::EPSILON
+    })
+}
+
 type OaResult = std::result::Result<(Arc<rw_ui::FieldData>, Arc<rw_ui::FieldData>, String), String>;
 /// Background derive/composite build: (field, status line) or error.
 type OaDeriveResult = std::result::Result<(Arc<rw_ui::FieldData>, String), String>;
@@ -4159,6 +4306,7 @@ enum HazardListFilter {
     SevereThunderstorm,
     FlashFlood,
     Flood,
+    FireWeather,
     SpecialMarine,
     SnowSquall,
     Watch,
@@ -4168,12 +4316,13 @@ enum HazardListFilter {
 }
 
 impl HazardListFilter {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::All,
         Self::Tornado,
         Self::SevereThunderstorm,
         Self::FlashFlood,
         Self::Flood,
+        Self::FireWeather,
         Self::SpecialMarine,
         Self::SnowSquall,
         Self::Watch,
@@ -4193,6 +4342,7 @@ impl HazardListFilter {
             "svr" | "severe" | "severe_thunderstorm" => Self::SevereThunderstorm,
             "ffw" | "flash_flood" => Self::FlashFlood,
             "flood" => Self::Flood,
+            "fire" | "fire_weather" | "fire_wx" | "red_flag" => Self::FireWeather,
             "smw" | "special_marine" => Self::SpecialMarine,
             "sqw" | "snow_squall" => Self::SnowSquall,
             "watch" | "watches" => Self::Watch,
@@ -4210,6 +4360,7 @@ impl HazardListFilter {
             Self::SevereThunderstorm => "severe_thunderstorm",
             Self::FlashFlood => "flash_flood",
             Self::Flood => "flood",
+            Self::FireWeather => "fire_weather",
             Self::SpecialMarine => "special_marine",
             Self::SnowSquall => "snow_squall",
             Self::Watch => "watch",
@@ -4226,6 +4377,7 @@ impl HazardListFilter {
             Self::SevereThunderstorm => "SVR",
             Self::FlashFlood => "Flash flood",
             Self::Flood => "Flood",
+            Self::FireWeather => "Fire Wx",
             Self::SpecialMarine => "Marine",
             Self::SnowSquall => "Snow squall",
             Self::Watch => "Watch",
@@ -4242,6 +4394,7 @@ impl HazardListFilter {
             Self::SevereThunderstorm => Some("severe thunderstorm"),
             Self::FlashFlood => Some("flash flood"),
             Self::Flood => Some("flood"),
+            Self::FireWeather => Some("fire weather"),
             Self::SpecialMarine => Some("special marine"),
             Self::SnowSquall => Some("snow squall"),
             Self::Watch => Some("watch"),
@@ -5970,6 +6123,13 @@ impl ViewerApp {
             italy_dpc_latest_rx: None,
             italy_dpc_texture: None,
             italy_dpc_render_rx: None,
+            taiwan_cwa_layer: None,
+            taiwan_cwa_latest_rx: None,
+            taiwan_cwa_texture: None,
+            taiwan_cwa_render_rx: None,
+            grid_composite_rx: None,
+            grid_composite_loading: None,
+            grid_composite_pending_field: None,
             open_color_tables_request: false,
             bold_labels: true,
             browsing_history: false,
@@ -6060,6 +6220,7 @@ impl ViewerApp {
             display_thresholds: BTreeMap::new(),
             show_inspector_card: true,
             pinned_inspector_lonlat: None,
+            pinned_obs_chart_station: None,
             hazard_overlay_generation: 0,
             grid_layout: restored_grid_layout,
             extra_panes: Vec::new(),
@@ -6190,6 +6351,9 @@ impl ViewerApp {
             obs_show_metar: restored_overlays.1,
             obs_show_mesonet: restored_overlays.2,
             obs_adjust_soundings: false,
+            obs_hour_loop_enabled: false,
+            obs_hour_loop_started_at: Instant::now(),
+            obs_hour_loop_end_utc: Utc::now(),
             surface_obs: obs::ObPool::new(),
             obs_fetched_at: None,
             obs_rx: None,
@@ -6215,6 +6379,7 @@ impl ViewerApp {
             native_sounding: None,
             native_sounding_rx: None,
             native_sounding_src: None,
+            native_sounding_panel: rw_ui::SoundingPanel::new(),
             sounding_viewer_source: SoundingViewerSource::NativeOnly,
             native_skewt_open: false,
             archive_frame_count: restored_archive_frame_count,
@@ -8428,6 +8593,18 @@ impl ViewerApp {
 
     fn displayed_timeline_time_utc(&self) -> Option<DateTime<Utc>> {
         self.loop_timeline_frame_time_utc(self.active_loop_timeline_target())
+    }
+
+    fn surface_obs_frame_time_utc(&self) -> DateTime<Utc> {
+        if self.obs_hour_loop_enabled {
+            let elapsed_ms =
+                self.obs_hour_loop_started_at.elapsed().as_millis() % SURFACE_OBS_LOOP_PLAYBACK_MS;
+            let frame_offset_ms = (elapsed_ms as i64 * SURFACE_OBS_LOOP_WINDOW_MS)
+                / SURFACE_OBS_LOOP_PLAYBACK_MS as i64;
+            return self.obs_hour_loop_end_utc
+                - chrono::Duration::milliseconds(SURFACE_OBS_LOOP_WINDOW_MS - frame_offset_ms);
+        }
+        self.displayed_timeline_time_utc().unwrap_or_else(Utc::now)
     }
 
     fn arm_unified_player_timeline_warning_sync(&mut self) {
@@ -11697,6 +11874,7 @@ impl ViewerApp {
             || self.model_layer_build_rx.is_some()
             || self.sat_layer_render_rx.is_some()
             || self.italy_dpc_render_rx.is_some()
+            || self.taiwan_cwa_render_rx.is_some()
             || self.vol3d.resample_rx.is_some()
     }
 
@@ -16671,12 +16849,17 @@ impl eframe::App for ViewerApp {
         }
         self.poll_sat_layer(&ctx);
         self.poll_italy_dpc_layer(&ctx);
+        self.poll_taiwan_cwa_layer(&ctx);
+        self.poll_grid_composite_layer(&ctx);
         self.poll_model_ingest(&ctx);
         // Drain the flexible-download worker every frame, not just while its
         // UI is visible — closing the Model window mid-download used to
         // stall progress reporting until reopened.
         self.pump_ingest_responses();
         self.poll_surface_obs(&ctx);
+        if self.obs_hour_loop_enabled {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
         if self.glm_enabled {
             let glm_read_window_ms = self.desired_glm_read_window_ms();
             let satellites = self.desired_glm_satellites();
@@ -19659,6 +19842,15 @@ impl ViewerApp {
                     {
                         app.add_italy_dpc_layer(ItalyDpcMapProduct::Vmi, ctx);
                     }
+                    if ui
+                        .button("Show Taiwan CWA Reflectivity")
+                        .on_hover_text(
+                            "Add Taiwan CWA O-A0059-001 numeric composite reflectivity",
+                        )
+                        .clicked()
+                    {
+                        app.add_taiwan_cwa_layer(ctx);
+                    }
                     ui.menu_button("Products", |ui| {
                         ui.set_min_width(220.0);
                         for product in ItalyDpcMapProduct::ALL {
@@ -19673,6 +19865,9 @@ impl ViewerApp {
                 });
                 if let Some(layer) = &app.italy_dpc_layer {
                     ui.weak(format!("Active: Italy DPC {}", layer.product.short_label()));
+                }
+                if app.taiwan_cwa_layer.is_some() {
+                    ui.weak("Active: Taiwan CWA Composite Reflectivity");
                 }
             },
         );
@@ -22921,9 +23116,19 @@ impl ViewerApp {
             .insert(family.label().to_owned(), table_name.clone());
         let _ = self.app_settings.save();
         self.clear_texture();
+        self.invalidate_model_layer_color_family(family);
         self.color_table_status =
             format!("Loaded {table_name} into {} ({summary})", family.label());
         ctx.request_repaint();
+    }
+
+    fn invalidate_model_layer_color_family(&mut self, family: ColorTableFamily) {
+        for slot in &mut self.model_layers {
+            if slot.layer.custom_color_family == Some(family) {
+                slot.layer.generation = slot.layer.generation.wrapping_add(1);
+                slot.texture = None;
+            }
+        }
     }
 
     /// Bind a table to ONE product (beats the family binding for it) and
@@ -23555,6 +23760,7 @@ impl ViewerApp {
             .remove(self.color_table_target.label());
         let _ = self.app_settings.save();
         self.clear_texture();
+        self.invalidate_model_layer_color_family(self.color_table_target);
         self.color_table_status = format!(
             "Reset {} to {table_name} ({summary})",
             self.color_table_target.label()
@@ -25003,6 +25209,16 @@ impl ViewerApp {
                 self.status_or_activity_label("Rendering Italy DPC layer"),
             ));
         }
+        if self.taiwan_cwa_latest_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                self.status_or_activity_label("Taiwan CWA composite"),
+            ));
+        }
+        if self.taiwan_cwa_render_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                self.status_or_activity_label("Rendering Taiwan CWA layer"),
+            ));
+        }
         if self.oa_rx.is_some() {
             return Some(BackgroundActivity::indeterminate(
                 self.status_or_activity_label("Analyzing observations"),
@@ -25856,6 +26072,7 @@ impl ViewerApp {
             self.map_scale,
         );
         self.draw_italy_dpc_layer(painter, rect);
+        self.draw_taiwan_cwa_layer(painter, rect);
         self.draw_graticule(painter, rect);
         let underlay_ms = basemap_start.elapsed().as_secs_f32() * 1000.0;
         self.request_radar_layer_renders(ui.ctx(), rect);
@@ -25880,6 +26097,7 @@ impl ViewerApp {
         self.draw_mping_reports(painter, rect);
         self.draw_glm(painter, rect);
         self.draw_surface_obs(painter, rect);
+        self.draw_surface_obs_clock(painter, rect);
         self.draw_vrot_tool(painter, rect);
         self.draw_placefiles(painter, rect);
         self.draw_map_annotations(painter, rect);
@@ -26564,6 +26782,7 @@ impl ViewerApp {
             self.draw_spc_outlooks(&cell_painter, cell);
             self.draw_upper_air_layer(&cell_painter, cell);
             self.draw_italy_dpc_layer(&cell_painter, cell);
+            self.draw_taiwan_cwa_layer(&cell_painter, cell);
             self.draw_graticule(&cell_painter, cell);
             if cell_index == 0 {
                 self.request_radar_layer_renders(&ctx, cell);
@@ -27118,13 +27337,15 @@ impl ViewerApp {
                         .map(|(lat, lon)| resolve(*lat, *lon, *anchor))
                         .collect();
                     if screen.iter().any(|p| visible.contains(*p)) {
-                        out.shapes.push(egui::Shape::line(
-                            screen,
+                        push_solid_open_line(
+                            &mut out.shapes,
+                            &screen,
                             egui::Stroke::new(
                                 *width * pf_style.line_width_scale,
                                 egui::Color32::from_rgb(color[0], color[1], color[2]),
                             ),
-                        ));
+                            rect,
+                        );
                     }
                 }
                 placefiles::PlacefileObject::Polygon {
@@ -27146,15 +27367,19 @@ impl ViewerApp {
                         1.5 * pf_style.line_width_scale,
                         egui::Color32::from_rgb(color[0], color[1], color[2]),
                     );
-                    if is_convex_screen_polygon(&screen) {
-                        out.shapes
-                            .push(egui::Shape::convex_polygon(screen, fill, stroke));
-                    } else {
-                        if let Some(mesh) = filled_polygon_mesh(&screen, fill) {
+                    let has_jump = screen_polyline_has_jump(&screen, true, rect);
+                    if !has_jump {
+                        if is_convex_screen_polygon(&screen) {
+                            out.shapes.push(egui::Shape::convex_polygon(
+                                screen.clone(),
+                                fill,
+                                egui::Stroke::new(0.0, egui::Color32::TRANSPARENT),
+                            ));
+                        } else if let Some(mesh) = filled_polygon_mesh(&screen, fill) {
                             out.shapes.push(egui::Shape::mesh(mesh));
                         }
-                        out.shapes.push(egui::Shape::closed_line(screen, stroke));
                     }
+                    push_solid_closed_line(&mut out.shapes, &screen, stroke, rect);
                 }
             }
         }
@@ -27631,6 +27856,36 @@ impl ViewerApp {
         }
     }
 
+    fn nearest_surface_ob_to_lonlat(
+        &self,
+        lon: f32,
+        lat: f32,
+        max_km: f32,
+    ) -> Option<obs::SurfaceOb> {
+        if !self.obs_enabled || self.surface_obs.is_empty() {
+            return None;
+        }
+        let frame_time = self.surface_obs_frame_time_utc();
+        self.surface_obs
+            .frame_obs(frame_time)
+            .filter(|ob| {
+                let is_metar = ob.network == "METAR";
+                (is_metar && self.obs_show_metar) || (!is_metar && self.obs_show_mesonet)
+            })
+            .filter_map(|ob| {
+                let distance_km = haversine_km(lat, lon, ob.lat, ob.lon);
+                (distance_km <= max_km).then_some((distance_km, ob))
+            })
+            .min_by(|left, right| left.0.total_cmp(&right.0))
+            .map(|(_, ob)| ob.clone())
+    }
+
+    fn pin_obs_history(&mut self, ob: &obs::SurfaceOb) {
+        self.pinned_obs_chart_station = Some(ob.station_id.clone());
+        self.pinned_inspector_lonlat = Some((ob.lon, ob.lat));
+        self.show_inspector_card = true;
+    }
+
     /// Context menu: the three lowest-beam radars over the clicked point.
     fn best_radar_context_menu(&mut self, ui: &mut egui::Ui) {
         let Some((lon, lat)) = self.context_menu_lonlat else {
@@ -27638,8 +27893,33 @@ impl ViewerApp {
             return;
         };
         let candidates = self.best_radar_candidates(lat, lon);
+        let nearest_ob = self.nearest_surface_ob_to_lonlat(lon, lat, 35.0);
         ui.label(format!("{lat:.3}, {lon:.3}"));
         ui.separator();
+        if let Some(ob) = nearest_ob.as_ref() {
+            ui.label("Surface ob:");
+            let label = if let Some(time_utc) = ob.time_utc {
+                format!(
+                    "{} {} - {}",
+                    ob.station_id,
+                    ob.network,
+                    self.time_zone().format_hm(time_utc)
+                )
+            } else {
+                format!("{} {}", ob.station_id, ob.network)
+            };
+            if ui.button(format!("Pin {label} 3h table")).clicked() {
+                self.pin_obs_history(ob);
+                ui.close();
+            }
+            if self.pinned_obs_chart_station.as_deref() == Some(ob.station_id.as_str())
+                && ui.button("Clear obs table").clicked()
+            {
+                self.pinned_obs_chart_station = None;
+                ui.close();
+            }
+            ui.separator();
+        }
         if candidates.is_empty() {
             ui.weak("No radar within 460 km");
             return;
@@ -27918,14 +28198,14 @@ impl ViewerApp {
             thread::spawn(move || {
                 let compute_start = Instant::now();
                 let result = build_native_sounding_adjusted(&data, adjust_ob)
-                    .map(|native| (native, compute_start.elapsed().as_secs_f32() * 1000.0));
+                    .map(|native| (native, compute_start.elapsed().as_secs_f32() * 1000.0, None));
                 let _ = sender.send(result);
                 ctx_clone.request_repaint();
             });
         }
         if let Some(receiver) = &self.native_sounding_rx {
             match receiver.try_recv() {
-                Ok(Ok((native, compute_ms))) => {
+                Ok(Ok((native, compute_ms, external_sounding))) => {
                     self.native_sounding_rx = None;
                     self.sounding_compute_ms = Some(compute_ms);
                     if self.hail_env_pending {
@@ -27956,6 +28236,10 @@ impl ViewerApp {
                         self.native_sounding = Some(Arc::new(native));
                         ctx.request_repaint();
                         return;
+                    }
+                    if let Some((data, column)) = external_sounding {
+                        self.native_sounding_panel.set_native_column(data, column);
+                        self.sounding_viewer_source = SoundingViewerSource::NativeOnly;
                     }
                     self.native_sounding = Some(Arc::new(native));
                     self.open_viewer(dock::WorkspacePane::Sounding);
@@ -28065,6 +28349,13 @@ impl ViewerApp {
             && dock.sounding_has_content()
         {
             dock.sounding_ui(ui);
+            return;
+        }
+
+        if self.sounding_viewer_source == SoundingViewerSource::NativeOnly
+            && self.native_sounding_panel.has_content()
+        {
+            self.native_sounding_panel.ui(ui);
             return;
         }
 
@@ -28480,6 +28771,10 @@ impl ViewerApp {
         if spec.date.is_empty() {
             spec.date = Utc::now().format("%Y%m%d").to_string();
         }
+        spec = normalize_model_download_spec(spec);
+        if self.download_panel.spec() != &spec {
+            self.download_panel.set_spec(spec.clone());
+        }
         sync_run_pickers(&mut self.download_panel, &spec);
         if let Some(worker) = &self.ingest {
             worker.send(ingest_worker::IngestRequest::Estimate(spec.clone()));
@@ -28494,6 +28789,10 @@ impl ViewerApp {
         for event in events {
             match event {
                 rw_ui::DownloadEvent::SpecChanged(spec) => {
+                    let spec = normalize_model_download_spec(spec);
+                    if self.download_panel.spec() != &spec {
+                        self.download_panel.set_spec(spec.clone());
+                    }
                     if spec.model != self.app_settings.model_slug {
                         // Model switch: persist the pick and snap date/cycle
                         // to the model's newest available run (cadences
@@ -28506,12 +28805,24 @@ impl ViewerApp {
                     ingest.send(ingest_worker::IngestRequest::Estimate(spec));
                 }
                 rw_ui::DownloadEvent::CheckAvailability(spec) => {
+                    let spec = normalize_model_download_spec(spec);
+                    if self.download_panel.spec() != &spec {
+                        self.download_panel.set_spec(spec.clone());
+                    }
                     ingest.send(ingest_worker::IngestRequest::Probe(spec));
                 }
                 rw_ui::DownloadEvent::LatestRequested(spec) => {
+                    let spec = normalize_model_download_spec(spec);
+                    if self.download_panel.spec() != &spec {
+                        self.download_panel.set_spec(spec.clone());
+                    }
                     ingest.send(ingest_worker::IngestRequest::Latest(spec));
                 }
                 rw_ui::DownloadEvent::StartRequested(spec) => {
+                    let spec = normalize_model_download_spec(spec);
+                    if self.download_panel.spec() != &spec {
+                        self.download_panel.set_spec(spec.clone());
+                    }
                     ingest.send(ingest_worker::IngestRequest::Start(spec));
                 }
                 rw_ui::DownloadEvent::CancelRequested => {
@@ -28531,16 +28842,27 @@ impl ViewerApp {
                         Err(message) => self.download_panel.set_spec_error(message),
                     },
                     ingest_worker::IngestResponse::Availability(view) => {
-                        self.download_panel.set_availability(view)
+                        if view.matches(self.download_panel.spec()) {
+                            self.download_panel.set_availability(view);
+                        }
                     }
-                    ingest_worker::IngestResponse::Latest { date, cycle } => {
+                    ingest_worker::IngestResponse::Latest { model, date, cycle } => {
+                        if model != self.download_panel.spec().model {
+                            continue;
+                        }
                         self.download_panel.set_latest(date, cycle);
-                        let spec = self.download_panel.spec().clone();
+                        let spec =
+                            normalize_model_download_spec(self.download_panel.spec().clone());
+                        if self.download_panel.spec() != &spec {
+                            self.download_panel.set_spec(spec.clone());
+                        }
                         sync_run_pickers(&mut self.download_panel, &spec);
                         ingest.send(ingest_worker::IngestRequest::Estimate(spec));
                     }
-                    ingest_worker::IngestResponse::LatestFailed(message) => {
-                        self.download_panel.set_probing_failed(message);
+                    ingest_worker::IngestResponse::LatestFailed { model, message } => {
+                        if model == self.download_panel.spec().model {
+                            self.download_panel.set_probing_failed(message);
+                        }
                     }
                     ingest_worker::IngestResponse::Started { hours } => {
                         self.download_panel.begin_run(&hours);
@@ -28796,7 +29118,7 @@ impl ViewerApp {
             .default_open(true)
             .show(ui, |ui| {
                 panel_events = self.sat_panel.ui(ui);
-                if fixed_action_button(ui, "Load loop", 82.0)
+                if fixed_action_button(ui, "Load live loop", 110.0)
                     .on_hover_text(
                         "One-shot current-hour GOES ingest for the selected satellite/sector/layer, then play it in the frame player.",
                     )
@@ -28806,6 +29128,7 @@ impl ViewerApp {
                 }
             });
         if load_goes_loop && let Some(sat) = &self.sat {
+            self.sat_map_follow = true;
             self.status = "Satellite: loading GOES loop".to_owned();
             self.sat_panel
                 .apply_note("GOES loop: queued current-hour ingest".to_string());
@@ -28845,9 +29168,9 @@ impl ViewerApp {
                                 ui.selectable_value(&mut self.himawari_band, band, label);
                             }
                         });
-                    if fixed_action_button(ui, "Load Full", 84.0)
+                    if fixed_action_button(ui, "Load live", 84.0)
                         .on_hover_text(
-                            "Download/decode all latest Himawari-9 full-disk segments for the selected IR/WV band",
+                            "Download/decode the latest Himawari-9 full-disk frame for the selected IR/WV band, then select it in the player.",
                         )
                         .clicked()
                     {
@@ -28865,6 +29188,7 @@ impl ViewerApp {
             && load_himawari
         {
             let band = self.himawari_band.clamp(7, 16);
+            self.sat_map_follow = true;
             self.status = format!("Satellite: loading latest Himawari-9 B{band:02}");
             self.sat_panel.apply_note(format!(
                 "Himawari: queued latest H9 B{band:02} full-disk ingest"
@@ -28935,6 +29259,9 @@ impl ViewerApp {
     }
 
     fn satellite_run_key_matches_current_spec(&self, key: &rw_ui::SatRunKey) -> bool {
+        if satellite_run_key_is_other_source(key) {
+            return true;
+        }
         sat_worker::run_filters_for_spec(self.sat_panel.spec())
             .map(|(model, prefixes)| {
                 key.model == model
@@ -28954,10 +29281,11 @@ impl ViewerApp {
         };
         runs.into_iter()
             .filter(|run| {
-                run.key.model == model
-                    && prefixes
-                        .iter()
-                        .any(|prefix| run.key.run.starts_with(prefix.as_str()))
+                satellite_run_key_is_other_source(&run.key)
+                    || run.key.model == model
+                        && prefixes
+                            .iter()
+                            .any(|prefix| run.key.run.starts_with(prefix.as_str()))
             })
             .collect()
     }
@@ -30525,40 +30853,7 @@ impl ViewerApp {
                     // ("Site:" lines). With exactly one site, poll
                     // <base>/<site>/ — the user pasted the server root
                     // (field case: a local JMA radar bridge).
-                    let root_listing = data_source::fetch_text(&format!("{base}/dir.list"));
-                    let (listing, prefix) = match &root_listing {
-                        Ok(listing)
-                            if !dir_list_volume_entries_newest_first(listing).is_empty() =>
-                        {
-                            (listing.clone(), String::new())
-                        }
-                        _ => {
-                            let sites = data_source::fetch_text(&format!("{base}/grlevel2.cfg"))
-                                .map(|cfg| grlevel2_cfg_sites(&cfg))
-                                .unwrap_or_default();
-                            match sites.as_slice() {
-                                [site] => {
-                                    let listing =
-                                        data_source::fetch_text(&format!("{base}/{site}/dir.list"))
-                                            .map_err(|e| format!("{site}/dir.list: {e}"))?;
-                                    (listing, format!("{site}/"))
-                                }
-                                [] => {
-                                    return Err(match root_listing {
-                                        Ok(_) => "dir.list: no data files listed".to_owned(),
-                                        Err(e) => format!("dir.list: {e}"),
-                                    });
-                                }
-                                multiple => {
-                                    return Err(format!(
-                                        "server hosts {} sites ({}) — append one to the URL",
-                                        multiple.len(),
-                                        multiple.join(", ")
-                                    ));
-                                }
-                            }
-                        }
-                    };
+                    let (listing, prefix) = gr2a_listing_with_prefix(&base)?;
                     let candidates = dir_list_volume_entry_records_newest_first(&listing);
                     if candidates.is_empty() {
                         return Err("empty dir.list".to_owned());
@@ -30588,6 +30883,7 @@ impl ViewerApp {
                         // file-open path.
                         match nexrad_io::decode_supported_volume_bytes(&raw) {
                             Ok(mut volume) => {
+                                apply_community_feed_metadata(&mut volume, &base);
                                 derive_default_products_in_place(&mut volume);
                                 return Ok(Some(PolledVolumeLoad {
                                     name: newest,
@@ -30707,27 +31003,35 @@ impl ViewerApp {
         self.native_sounding_rx = Some(receiver);
         self.native_sounding_src = None;
         self.sounding_viewer_source = SoundingViewerSource::NativeOnly;
+        self.native_sounding_panel.set_loading();
         self.open_viewer(dock::WorkspacePane::Sounding);
         self.status = format!("Fetching RAOB {}…", site.id);
         let ctx_clone = ctx.clone();
         let time_zone = self.time_zone();
         thread::spawn(move || {
             let compute_start = Instant::now();
-            let result =
-                (|| -> std::result::Result<(rustwx_sounding::NativeSounding, f32), String> {
-                    let (column, valid) = obs_soundings::fetch_raob_near(&site, when)?;
-                    let mut native = rustwx_sounding::NativeSounding::from_column(&column)
-                        .map_err(|e| e.to_string())?;
-                    let context = distance_km
-                        .map(|km| format!(" ({km:.0} km)"))
-                        .unwrap_or_default();
-                    native.metadata.station_id = format!(
-                        "{} RAOB {}{context}",
-                        site.id,
-                        time_zone.format_month_day_hour(valid)
-                    );
-                    Ok((native, compute_start.elapsed().as_secs_f32() * 1000.0))
-                })();
+            let result = (|| -> std::result::Result<NativeSoundingResult, String> {
+                let (column, valid) = obs_soundings::fetch_raob_near(&site, when)?;
+                let mut native = rustwx_sounding::NativeSounding::from_column(&column)
+                    .map_err(|e| e.to_string())?;
+                let context = distance_km
+                    .map(|km| format!(" ({km:.0} km)"))
+                    .unwrap_or_default();
+                native.metadata.station_id = format!(
+                    "{} RAOB {}{context}",
+                    site.id,
+                    time_zone.format_month_day_hour(valid)
+                );
+                native.metadata.latitude_deg = Some(f64::from(site.lat));
+                native.metadata.longitude_deg = Some(f64::from(site.lon));
+                let sounding_data =
+                    raob_column_to_rw_sounding_data(&site, valid, &column, context)?;
+                Ok((
+                    native,
+                    compute_start.elapsed().as_secs_f32() * 1000.0,
+                    Some((sounding_data, column)),
+                ))
+            })();
             let _ = sender.send(result);
             ctx_clone.request_repaint();
         });
@@ -31492,9 +31796,11 @@ impl ViewerApp {
                         {
                             let opacity = slot.layer.opacity;
                             let visible = slot.layer.visible;
+                            let custom_color_family = slot.layer.custom_color_family;
                             slot.layer = layer;
                             slot.layer.opacity = opacity;
                             slot.layer.visible = visible;
+                            slot.layer.custom_color_family = custom_color_family;
                             slot.texture = None;
                         } else {
                             let id = self.model_layer_generation;
@@ -31559,6 +31865,7 @@ impl ViewerApp {
                 key,
                 hhmm,
                 image: Arc::new(frame.image),
+                grid: Arc::clone(&existing.grid),
                 lut: Arc::clone(&existing.lut),
                 nx,
                 ny,
@@ -31595,6 +31902,7 @@ impl ViewerApp {
                         key: frame.key,
                         hhmm: frame.hhmm,
                         image: Arc::new(frame.image),
+                        grid: Arc::clone(&frame.grid),
                         lut: Arc::new(lut),
                         nx,
                         ny,
@@ -31786,6 +32094,177 @@ impl ViewerApp {
         }
     }
 
+    fn add_taiwan_cwa_layer(&mut self, ctx: &egui::Context) {
+        self.taiwan_cwa_layer = Some(TaiwanCwaMapLayer::new());
+        self.taiwan_cwa_latest_rx = None;
+        self.taiwan_cwa_render_rx = None;
+        self.taiwan_cwa_texture = None;
+        self.map_center_lat = 23.8;
+        self.map_center_lon = 121.0;
+        self.map_scale = 72.0;
+        self.start_taiwan_cwa_latest_refresh(ctx, true);
+        self.status = "Taiwan CWA: adding composite reflectivity".to_owned();
+        ctx.request_repaint();
+    }
+
+    fn start_taiwan_cwa_latest_refresh(&mut self, ctx: &egui::Context, force: bool) {
+        if self.taiwan_cwa_latest_rx.is_some() && !force {
+            return;
+        }
+        let Some(layer) = &mut self.taiwan_cwa_layer else {
+            return;
+        };
+        if !force
+            && let Some(last_attempt) = layer.last_refresh_attempt
+            && last_attempt.elapsed() < Duration::from_secs(60)
+        {
+            return;
+        }
+        layer.last_refresh_attempt = Some(Instant::now());
+        layer.error = None;
+        let (sender, receiver) = mpsc::channel();
+        self.taiwan_cwa_latest_rx = Some(receiver);
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            let result = taiwan_cwa::load_latest_frame();
+            let _ = sender.send(result);
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn poll_taiwan_cwa_layer(&mut self, ctx: &egui::Context) {
+        if let Some(receiver) = &self.taiwan_cwa_latest_rx {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    self.taiwan_cwa_latest_rx = None;
+                    if let Some(layer) = &mut self.taiwan_cwa_layer {
+                        match result {
+                            Ok(frame) => {
+                                let time = frame.time.format("%H:%MZ").to_string();
+                                layer.frame_time = Some(frame.time);
+                                layer.source_identity = Some(frame.identity.clone());
+                                layer.frame = Some(Arc::new(frame));
+                                layer.fetched_at = Some(Instant::now());
+                                layer.error = None;
+                                self.taiwan_cwa_texture = None;
+                                self.taiwan_cwa_render_rx = None;
+                                self.status = format!("Taiwan CWA: composite reflectivity {time}");
+                            }
+                            Err(err) => {
+                                layer.error = Some(compact_layer_status(&err, 80));
+                                self.status = format!("Taiwan CWA: {err}");
+                            }
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.taiwan_cwa_latest_rx = None,
+            }
+        }
+        if let Some(receiver) = &self.taiwan_cwa_render_rx {
+            match receiver.try_recv() {
+                Ok((generation, view, image, _ms)) => {
+                    self.taiwan_cwa_render_rx = None;
+                    if self
+                        .taiwan_cwa_layer
+                        .as_ref()
+                        .and_then(|layer| layer.frame.as_ref())
+                        .is_some_and(|frame| frame.generation == generation)
+                    {
+                        let texture = ctx.load_texture(
+                            format!("taiwan-cwa-layer-{generation}"),
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.taiwan_cwa_texture = Some((texture, generation, view));
+                    }
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.taiwan_cwa_render_rx = None,
+            }
+        }
+        if self
+            .taiwan_cwa_layer
+            .as_ref()
+            .is_some_and(|layer| layer.visible)
+            && self.taiwan_cwa_latest_rx.is_none()
+        {
+            self.start_taiwan_cwa_latest_refresh(ctx, false);
+        }
+    }
+
+    fn add_grid_composite_layer(
+        &mut self,
+        source: grid_composites::GridCompositeSource,
+        ctx: &egui::Context,
+    ) {
+        let (lat, lon, scale) = source.map_center();
+        self.map_center_lat = lat;
+        self.map_center_lon = lon;
+        self.map_scale = scale;
+        self.start_grid_composite_refresh(source, ctx, true);
+        self.status = format!("{}: fetching latest grid", source.short_label());
+        ctx.request_repaint();
+    }
+
+    fn start_grid_composite_refresh(
+        &mut self,
+        source: grid_composites::GridCompositeSource,
+        ctx: &egui::Context,
+        force: bool,
+    ) {
+        if self.grid_composite_rx.is_some() && !force {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.grid_composite_rx = Some(receiver);
+        self.grid_composite_loading = Some(source);
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            let result = grid_composites::load_latest_field(source);
+            let _ = sender.send((source, result));
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn poll_grid_composite_layer(&mut self, ctx: &egui::Context) {
+        if let Some(receiver) = &self.grid_composite_rx {
+            match receiver.try_recv() {
+                Ok((source, result)) => {
+                    self.grid_composite_rx = None;
+                    self.grid_composite_loading = None;
+                    match result {
+                        Ok(field) => {
+                            let field = Arc::new(field);
+                            self.status = format!("{}: latest grid ready", source.short_label());
+                            if self.model_layer_build_rx.is_some() {
+                                self.grid_composite_pending_field = Some(field);
+                            } else {
+                                self.start_model_layer_build(field, ctx);
+                            }
+                        }
+                        Err(err) => {
+                            self.status = format!("{}: {err}", source.short_label());
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.grid_composite_rx = None;
+                    self.grid_composite_loading = None;
+                }
+            }
+        }
+        if self.model_layer_build_rx.is_none()
+            && let Some(field) = self.grid_composite_pending_field.take()
+        {
+            self.start_model_layer_build(field, ctx);
+        }
+    }
+
     /// Draw the satellite layer (world-anchored; renders at viewport
     /// resolution on a background thread, exactly like the model layer).
     fn draw_sat_layer(&mut self, painter: &egui::Painter, rect: egui::Rect) {
@@ -31801,17 +32280,15 @@ impl ViewerApp {
             .as_ref()
             .filter(|(_, generation, _)| *generation == layer.generation);
         let needs_render = current
-            .map(|(_, _, have)| {
-                (have.center_lat - view.center_lat).abs() > 1e-4
-                    || (have.center_lon - view.center_lon).abs() > 1e-4
-                    || (have.map_scale - view.map_scale).abs() > 0.01
-            })
+            .map(|(_, _, have)| model_layer_view_needs_rerender(have, &view))
             .unwrap_or(true);
-        if needs_render && self.sat_layer_render_rx.is_none() {
+        let defer_render = map_layer_rerender_deferred(painter.ctx());
+        if needs_render && !defer_render && self.sat_layer_render_rx.is_none() {
             let (sender, receiver) = mpsc::channel();
             self.sat_layer_render_rx = Some(receiver);
             let generation = layer.generation;
             let image_src = Arc::clone(&layer.image);
+            let grid = Arc::clone(&layer.grid);
             let lut = Arc::clone(&layer.lut);
             let (nx, ny, flip) = (layer.nx, layer.ny, layer.flip_rows);
             let render_view = view;
@@ -31824,6 +32301,13 @@ impl ViewerApp {
                 let w = w_pts.max(8.0) as usize;
                 let h = h_pts.max(8.0) as usize;
                 let mut pixels = vec![egui::Color32::TRANSPARENT; w * h];
+                let sample_ctx = SatMapSampleCtx {
+                    image: image_src.as_ref(),
+                    grid: grid.as_ref(),
+                    nx,
+                    ny,
+                    flip_rows: flip,
+                };
                 for (i, px) in pixels.iter_mut().enumerate() {
                     let x = (i % w) as f64;
                     let y = (i / w) as f64;
@@ -31833,12 +32317,7 @@ impl ViewerApp {
                     let Some(index) = lut.lookup(lat as f32, lon as f32) else {
                         continue;
                     };
-                    let (row, col) = (index / nx, index % nx);
-                    if row >= ny {
-                        continue;
-                    }
-                    let image_row = if flip { ny - 1 - row } else { row };
-                    let color = image_src.pixels[image_row * nx + col];
+                    let color = sample_sat_map_color(&sample_ctx, index, lat as f32, lon as f32);
                     if color.a() > 0 {
                         *px = color;
                     }
@@ -31857,19 +32336,13 @@ impl ViewerApp {
             });
         }
         if let Some((texture, _, rendered)) = &self.sat_layer_texture {
-            let rendered_center =
-                self.lon_lat_to_screen(rect, rendered.center_lon, rendered.center_lat);
-            let zoom_ratio = self.map_scale / rendered.map_scale.max(0.001);
-            let half = egui::vec2(
-                rect.width() * 0.5 * zoom_ratio,
-                rect.height() * 0.5 * zoom_ratio,
-            );
-            let image_rect =
-                egui::Rect::from_min_max(rendered_center - half, rendered_center + half);
+            if model_layer_view_needs_rerender(rendered, &view) {
+                return;
+            }
             let opacity = (layer.opacity * 255.0) as u8;
             painter.image(
                 texture.id(),
-                image_rect,
+                rect,
                 egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                 egui::Color32::from_white_alpha(opacity),
             );
@@ -31904,6 +32377,7 @@ impl ViewerApp {
                         colormap: rw_ui::colormap::VIRIDIS,
                         opacity: initial_opacity,
                         visible: true,
+                        custom_color_family: default_model_layer_color_family(field.as_ref()),
                         generation,
                     }
                 })
@@ -31923,13 +32397,15 @@ impl ViewerApp {
         }
     }
 
-    /// Draw every model layer in stack order (each slot renders at HALF
-    /// resolution on its own background thread and re-anchors its stale
-    /// raster to the world during pans — the radar fast path is untouched).
+    /// Draw every model layer in stack order. Model/MRMS rasters are valid
+    /// only for the AEQD viewport they were rendered against; drawing an old
+    /// viewport through an affine rectangle makes continent-scale grids rotate
+    /// differently from the basemap. Instead, keep stale rasters hidden until
+    /// the matching viewport render arrives.
     fn draw_model_layers(&mut self, painter: &egui::Painter, rect: egui::Rect) {
         let view = self.model_layer_current_view();
-        let (map_center_lat, map_center_lon, map_scale) =
-            (self.map_center_lat, self.map_center_lon, self.map_scale);
+        let color_tables = self.color_tables.clone();
+        let defer_render = map_layer_rerender_deferred(painter.ctx());
         for slot in &mut self.model_layers {
             if !slot.layer.visible {
                 continue;
@@ -31939,13 +32415,9 @@ impl ViewerApp {
                 .as_ref()
                 .filter(|(_, generation, _)| *generation == slot.layer.generation);
             let needs_render = current
-                .map(|(_, _, have)| {
-                    (have.center_lat - view.center_lat).abs() > 1e-4
-                        || (have.center_lon - view.center_lon).abs() > 1e-4
-                        || (have.map_scale - view.map_scale).abs() > 0.01
-                })
+                .map(|(_, _, have)| model_layer_view_needs_rerender(have, &view))
                 .unwrap_or(true);
-            if needs_render && slot.render_rx.is_none() {
+            if needs_render && !defer_render && slot.render_rx.is_none() {
                 let (sender, receiver) = mpsc::channel();
                 slot.render_rx = Some(receiver);
                 let generation = slot.layer.generation;
@@ -31953,6 +32425,10 @@ impl ViewerApp {
                 let lut = Arc::clone(&slot.layer.lut);
                 let colormap = slot.layer.colormap;
                 let production = slot.layer.production.clone();
+                let custom_table = slot
+                    .layer
+                    .custom_color_family
+                    .map(|family| Arc::new(color_tables.for_family(family).clone()));
                 let render_view = view;
                 let center_lat = view.center_lat as f64;
                 let center_lon = view.center_lon as f64;
@@ -31960,26 +32436,31 @@ impl ViewerApp {
                 let (w_pts, h_pts) = (rect.width() as f64, rect.height() as f64);
                 thread::spawn(move || {
                     let render_start = Instant::now();
-                    let w = (w_pts / 2.0).max(8.0) as usize;
-                    let h = (h_pts / 2.0).max(8.0) as usize;
+                    let w = w_pts.max(8.0) as usize;
+                    let h = h_pts.max(8.0) as usize;
                     let mut pixels = vec![egui::Color32::TRANSPARENT; w * h];
                     let range = field.range;
                     for (i, px) in pixels.iter_mut().enumerate() {
                         let x = (i % w) as f64;
                         let y = (i / w) as f64;
-                        let east_km = (x - w as f64 / 2.0) * 2.0 * km_per_pt;
-                        let north_km = (h as f64 / 2.0 - y) * 2.0 * km_per_pt;
+                        let east_km = (x - w as f64 / 2.0) * km_per_pt;
+                        let north_km = (h as f64 / 2.0 - y) * km_per_pt;
                         let (lat, lon) = aeqd_inverse_km(center_lat, center_lon, east_km, north_km);
                         let Some(index) = lut.lookup(lat as f32, lon as f32) else {
                             continue;
                         };
-                        let Some(value) = field.values.get(index).copied() else {
+                        let Some(value) = model_layer::sample_field_value(
+                            field.as_ref(),
+                            index,
+                            lat as f32,
+                            lon as f32,
+                        ) else {
                             continue;
                         };
-                        if !value.is_finite() {
-                            continue;
-                        }
-                        if let Some(cmap) = &production {
+                        if let Some(table) = &custom_table {
+                            let [r, g, b, a] = table.sample(value).to_array();
+                            *px = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+                        } else if let Some(cmap) = &production {
                             let rgba = cmap.map(f64::from(value));
                             *px = egui::Color32::from_rgba_unmultiplied(
                                 rgba.r, rgba.g, rgba.b, rgba.a,
@@ -32003,30 +32484,13 @@ impl ViewerApp {
                 });
             }
             if let Some((texture, _, rendered)) = &slot.texture {
-                // World-anchor without &self (slot is mutably borrowed):
-                // same math as lon_lat_to_screen, inlined.
-                let (east_km, north_km) = aeqd_forward_km(
-                    map_center_lat as f64,
-                    map_center_lon as f64,
-                    rendered.center_lat as f64,
-                    rendered.center_lon as f64,
-                );
-                let px_per_km = map_scale / 111.32;
-                let rendered_center = egui::pos2(
-                    rect.center().x + east_km as f32 * px_per_km,
-                    rect.center().y - north_km as f32 * px_per_km,
-                );
-                let zoom_ratio = map_scale / rendered.map_scale.max(0.001);
-                let half = egui::vec2(
-                    rect.width() * 0.5 * zoom_ratio,
-                    rect.height() * 0.5 * zoom_ratio,
-                );
-                let image_rect =
-                    egui::Rect::from_min_max(rendered_center - half, rendered_center + half);
+                if model_layer_view_needs_rerender(rendered, &view) {
+                    continue;
+                }
                 let opacity = (slot.layer.opacity * 255.0) as u8;
                 painter.image(
                     texture.id(),
-                    image_rect,
+                    rect,
                     egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                     egui::Color32::from_white_alpha(opacity),
                 );
@@ -33943,24 +34407,15 @@ impl ViewerApp {
                     if !bbox.intersects(rect) {
                         continue;
                     }
-                    let ring_is_closed = screen
-                        .first()
-                        .zip(screen.last())
-                        .map(|(first, last)| first.distance(*last) <= 0.5)
-                        .unwrap_or(false);
                     let stroke = egui::Stroke::new(spc_style.outlook_stroke_width, stroke_color);
-                    if ring_is_closed {
-                        painter.add(egui::Shape::closed_line(screen.clone(), stroke));
-                    } else {
-                        painter.add(egui::Shape::line(screen.clone(), stroke));
-                    }
+                    draw_outlook_ring(painter, &screen, stroke, rect);
                     // Translucent interior wash: PROPER ear-clip tessellation
                     // (the warning-polygon path's own) — outlook rings are
                     // deeply concave, and a centroid fan sprays triangles
                     // across the map ("spokes" field report). The cleaner
                     // also absorbs SPC's unclosed/degenerate ring edge cases.
                     if feature.fill_enabled
-                        && ring_is_closed
+                        && !screen_polyline_has_jump(&screen, true, rect)
                         && let Some(mesh) = filled_polygon_mesh(&screen, fill)
                     {
                         painter.add(egui::Shape::mesh(mesh));
@@ -34031,7 +34486,7 @@ impl ViewerApp {
             if !screen_polygon_bbox_intersects(&outer_screen, rect) {
                 continue;
             }
-            draw_outlook_ring(painter, &outer_screen, stroke);
+            draw_outlook_ring(painter, &outer_screen, stroke, rect);
             let hole_screens = polygon
                 .holes
                 .iter()
@@ -34042,9 +34497,13 @@ impl ViewerApp {
                 })
                 .collect::<Vec<_>>();
             for hole in &hole_screens {
-                draw_outlook_ring(painter, hole, stroke);
+                draw_outlook_ring(painter, hole, stroke, rect);
             }
             if feature.fill_enabled
+                && !screen_polyline_has_jump(&outer_screen, true, rect)
+                && hole_screens
+                    .iter()
+                    .all(|hole| !screen_polyline_has_jump(hole, true, rect))
                 && let Some(mesh) =
                     filled_polygon_with_holes_mesh(&outer_screen, &hole_screens, fill)
             {
@@ -34172,16 +34631,53 @@ impl ViewerApp {
         let now = self
             .timeline_report_reference_time_utc()
             .unwrap_or_else(Utc::now);
-        let visible: Vec<(&mping::MpingReport, egui::Pos2)> = self
-            .mping_reports
-            .iter()
-            .filter(|report| self.mping_report_visible_for_timeline(report))
-            .filter_map(|report| {
+        let mut visible: Vec<(&mping::MpingReport, egui::Pos2)> = Vec::new();
+        let use_declutter = self.mping_reports.len() > MPING_DECLUTTER_REPORT_THRESHOLD
+            || (self.map_scale < 35.0 && self.mping_reports.len() > MPING_LABEL_REPORT_LIMIT);
+        let expanded_rect = rect.expand(8.0);
+        if use_declutter {
+            let mut cells: HashMap<(i32, i32), usize> = HashMap::new();
+            for report in self
+                .mping_reports
+                .iter()
+                .filter(|report| self.mping_report_visible_for_timeline(report))
+            {
                 let pos = self.lon_lat_to_screen(rect, report.lon, report.lat);
-                rect.expand(8.0).contains(pos).then_some((report, pos))
-            })
-            .collect();
-        let label_glyphs = visible.len() <= 120 && self.map_scale >= 18.0;
+                if !expanded_rect.contains(pos) {
+                    continue;
+                }
+                let cell_key = (
+                    (pos.x / MPING_DECLUTTER_CELL_PX).floor() as i32,
+                    (pos.y / MPING_DECLUTTER_CELL_PX).floor() as i32,
+                );
+                let priority = mping_draw_priority(report, now);
+                match cells.get(&cell_key).copied() {
+                    Some(index) if priority <= mping_draw_priority(visible[index].0, now) => {}
+                    Some(index) => {
+                        visible[index] = (report, pos);
+                    }
+                    None => {
+                        cells.insert(cell_key, visible.len());
+                        visible.push((report, pos));
+                    }
+                }
+            }
+        } else {
+            visible = self
+                .mping_reports
+                .iter()
+                .filter(|report| self.mping_report_visible_for_timeline(report))
+                .filter_map(|report| {
+                    let pos = self.lon_lat_to_screen(rect, report.lon, report.lat);
+                    expanded_rect.contains(pos).then_some((report, pos))
+                })
+                .collect();
+        }
+        if visible.len() > MPING_MAX_DRAWN_REPORTS {
+            visible.sort_by_key(|(report, _)| std::cmp::Reverse(mping_draw_priority(report, now)));
+            visible.truncate(MPING_MAX_DRAWN_REPORTS);
+        }
+        let label_glyphs = visible.len() <= MPING_LABEL_REPORT_LIMIT && self.map_scale >= 18.0;
         for (report, pos) in &visible {
             let age_min = (now - report.obtime).num_minutes().max(0) as f32;
             let alpha = if age_min <= 30.0 {
@@ -34306,7 +34802,7 @@ impl ViewerApp {
         }
         // TIME SYNC: obs scrub with the radar loop — each frame draws the
         // reports valid at ITS time, not "latest".
-        let frame_time = self.displayed_timeline_time_utc().unwrap_or_else(Utc::now);
+        let frame_time = self.surface_obs_frame_time_utc();
         let obs_style = self.style_registry.obs();
         let cell = obs_style.declutter_cell_px.max(8.0);
         let cols = (rect.width() / cell).ceil() as i32 + 1;
@@ -34440,6 +34936,151 @@ impl ViewerApp {
                 labels += 1;
             }
         }
+    }
+
+    fn draw_surface_obs_clock(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if !self.obs_enabled || self.surface_obs.is_empty() {
+            return;
+        }
+        let frame_time = self.surface_obs_frame_time_utc();
+        let mut bounds = self.visible_geo_bounds(rect);
+        let lat_margin = 0.75_f32.max(48.0 / self.map_scale.max(1.0));
+        let lon_margin = (lat_margin / self.lon_screen_scale()).min(20.0);
+        bounds.south = (bounds.south - lat_margin).clamp(-90.0, 90.0);
+        bounds.north = (bounds.north + lat_margin).clamp(-90.0, 90.0);
+        bounds.west = normalize_lon(bounds.west - lon_margin);
+        bounds.east = normalize_lon(bounds.east + lon_margin);
+        let ob_bounds = obs::ObBounds {
+            west: bounds.west,
+            south: bounds.south,
+            east: bounds.east,
+            north: bounds.north,
+        };
+        let reports: Vec<&obs::SurfaceOb> = self
+            .surface_obs
+            .frame_obs_in_bounds(frame_time, ob_bounds)
+            .filter(|ob| {
+                let is_metar = ob.network == "METAR";
+                (is_metar && self.obs_show_metar) || (!is_metar && self.obs_show_mesonet)
+            })
+            .filter(|ob| {
+                ob.time_utc
+                    .map(|time| (frame_time - time).num_minutes().abs() <= 60)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if reports.is_empty() {
+            return;
+        }
+        let newest = reports.iter().filter_map(|ob| ob.time_utc).max();
+        let newest_age = newest
+            .map(|time| (frame_time - time).num_minutes().max(0))
+            .unwrap_or(0);
+        let metar_count = reports.iter().filter(|ob| ob.network == "METAR").count();
+        let mesonet_count = reports.len().saturating_sub(metar_count);
+        let lines = [
+            format!("OBS {}", self.time_zone().format_hms(frame_time)),
+            format!("{} plots - newest {}m old", reports.len(), newest_age),
+            format!("{metar_count} METAR - {mesonet_count} mesonet"),
+        ];
+        let font = egui::FontId::monospace(12.0);
+        let text_color = egui::Color32::from_rgb(230, 235, 242);
+        let galleys: Vec<_> = lines
+            .iter()
+            .map(|line| painter.layout_no_wrap(line.clone(), font.clone(), text_color))
+            .collect();
+        let width = galleys.iter().map(|g| g.size().x).fold(0.0f32, f32::max) + 16.0;
+        let height = galleys.iter().map(|g| g.size().y + 2.0).sum::<f32>() + 10.0;
+        let card = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - width - 10.0, rect.top() + 10.0),
+            egui::vec2(width, height),
+        );
+        painter.rect_filled(
+            card,
+            5.0,
+            egui::Color32::from_rgba_unmultiplied(8, 11, 16, 208),
+        );
+        let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(64, 78, 96));
+        painter.line_segment([card.left_top(), card.right_top()], stroke);
+        painter.line_segment([card.right_top(), card.right_bottom()], stroke);
+        painter.line_segment([card.right_bottom(), card.left_bottom()], stroke);
+        painter.line_segment([card.left_bottom(), card.left_top()], stroke);
+        let mut y = card.top() + 5.0;
+        for galley in galleys {
+            let size = galley.size();
+            painter.galley(egui::pos2(card.left() + 8.0, y), galley, text_color);
+            y += size.y + 2.0;
+        }
+    }
+
+    fn obs_history_data(&self, station: &str, frame_time: DateTime<Utc>) -> Option<ObsHistoryData> {
+        if !self.obs_enabled || self.surface_obs.is_empty() {
+            return None;
+        }
+        let end_time = frame_time;
+        let start_time = frame_time - chrono::Duration::hours(3);
+        let time_zone = self.time_zone();
+        let unit_system = self.units();
+        let mut rows: Vec<ObsHistoryRow> = self
+            .surface_obs
+            .station_series(station, start_time, end_time)
+            .into_iter()
+            .filter_map(|ob| {
+                let time_utc = ob.time_utc?;
+                let temp_text = ob
+                    .temp_c
+                    .map(|value| units::format_station_temp_c(value, unit_system))
+                    .unwrap_or_else(|| "--".to_owned());
+                let dewpoint_text = ob
+                    .dewpoint_c
+                    .map(|value| units::format_station_temp_c(value, unit_system))
+                    .unwrap_or_else(|| "--".to_owned());
+                let wind_text = match (ob.wind_dir_deg, ob.wind_speed_kt) {
+                    (Some(_), Some(speed)) if speed < 2.5 => "calm".to_owned(),
+                    (Some(dir), Some(speed)) => {
+                        let gust = ob
+                            .wind_gust_kt
+                            .map(|value| format!("G{value:.0}"))
+                            .unwrap_or_default();
+                        format!("{dir:03.0}/{speed:.0}{gust}")
+                    }
+                    (None, Some(speed)) => format!("{speed:.0}kt"),
+                    _ => "--".to_owned(),
+                };
+                let pressure_text = ob
+                    .altim_in_hg
+                    .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| "--".to_owned());
+                Some(ObsHistoryRow {
+                    time_utc,
+                    time_text: time_zone.format_hm(time_utc),
+                    age_min: (frame_time - time_utc).num_minutes().max(0),
+                    temp_text,
+                    dewpoint_text,
+                    wind_text,
+                    pressure_text,
+                    network: ob.network.clone(),
+                })
+            })
+            .collect();
+        if rows.is_empty() {
+            return None;
+        }
+        rows.sort_by_key(|row| row.time_utc);
+        rows.reverse();
+        let network = self
+            .surface_obs
+            .latest_station_ob(station)
+            .map(|ob| ob.network.clone())
+            .unwrap_or_default();
+        Some(ObsHistoryData {
+            station_id: station.to_owned(),
+            network,
+            frame_time,
+            start_time,
+            end_time,
+            rows,
+        })
     }
 
     fn draw_center_crosshair(&self, painter: &egui::Painter, rect: egui::Rect) {
@@ -35163,6 +35804,11 @@ impl ViewerApp {
             painter.circle_filled(anchor, 3.0, egui::Color32::from_rgb(255, 226, 120));
             painter.circle_stroke(anchor, 5.0, egui::Stroke::new(1.2, egui::Color32::BLACK));
         }
+        let history_frame_time = self.surface_obs_frame_time_utc();
+        let obs_history = self
+            .pinned_obs_chart_station
+            .as_deref()
+            .and_then(|station| self.obs_history_data(station, history_frame_time));
 
         // Card lines (radar block only when a gate resolves).
         let mut lines = Vec::new();
@@ -35229,7 +35875,7 @@ impl ViewerApp {
         // Nearest surface ob under the cursor (within ~28 px) — the full
         // decoded report, with age.
         let ob_owns_card = if self.obs_enabled && !self.surface_obs.is_empty() {
-            let frame_time = self.displayed_timeline_time_utc().unwrap_or_else(Utc::now);
+            let frame_time = self.surface_obs_frame_time_utc();
             let mut best: Option<(f32, &obs::SurfaceOb)> = None;
             for ob in self.surface_obs.frame_obs(frame_time) {
                 let pos = self.lon_lat_to_screen(rect, ob.lon, ob.lat);
@@ -35324,6 +35970,21 @@ impl ViewerApp {
         if let Some(probe) = readout.as_ref().and_then(|readout| readout.vrot) {
             lines.push(format_vrot_card_line(probe, self.units()));
         }
+        if let Some(history) = &obs_history {
+            let network = if history.network.is_empty() {
+                "obs"
+            } else {
+                history.network.as_str()
+            };
+            lines.push(format!(
+                "{} {} 3h obs - {} reports",
+                history.station_id,
+                network,
+                history.rows.len()
+            ));
+        } else if let Some(station) = &self.pinned_obs_chart_station {
+            lines.push(format!("{station} 3h obs - no reports"));
+        }
         if pinned {
             lines.push("pinned — Shift+click to release".to_owned());
         }
@@ -35334,8 +35995,29 @@ impl ViewerApp {
             .iter()
             .map(|line| painter.layout_no_wrap(line.clone(), font.clone(), text_color))
             .collect();
-        let width = galleys.iter().map(|g| g.size().x).fold(0.0f32, f32::max) + 14.0;
-        let height = galleys.iter().map(|g| g.size().y + 2.0).sum::<f32>() + 10.0;
+        let max_history_rows = ((rect.height() - 130.0) / 13.5).clamp(4.0, 28.0) as usize;
+        let history_rows_shown = obs_history
+            .as_ref()
+            .map(|history| history.rows.len().min(max_history_rows))
+            .unwrap_or(0);
+        let history_has_more = obs_history
+            .as_ref()
+            .map(|history| history.rows.len() > history_rows_shown)
+            .unwrap_or(false);
+        let history_height = if history_rows_shown > 0 {
+            30.0 + history_rows_shown as f32 * 13.5 + if history_has_more { 13.5 } else { 0.0 }
+        } else {
+            0.0
+        };
+        let history_width = obs_history.as_ref().map(|_| 444.0).unwrap_or(0.0);
+        let width = (galleys.iter().map(|g| g.size().x).fold(0.0f32, f32::max) + 14.0)
+            .max(history_width + 14.0);
+        let history_extra = if history_height > 0.0 {
+            history_height + 8.0
+        } else {
+            0.0
+        };
+        let height = galleys.iter().map(|g| g.size().y + 2.0).sum::<f32>() + 10.0 + history_extra;
         let mut origin = anchor + egui::vec2(16.0, 14.0);
         if origin.x + width > rect.right() - 4.0 {
             origin.x = anchor.x - 16.0 - width;
@@ -35367,6 +36049,19 @@ impl ViewerApp {
             painter.galley(egui::pos2(card.left() + 7.0, y), galley, text_color);
             y += size.y + 2.0;
         }
+        if let Some(history) = &obs_history {
+            let history_rect = egui::Rect::from_min_size(
+                egui::pos2(card.left() + 7.0, y + 3.0),
+                egui::vec2(width - 14.0, history_height),
+            );
+            draw_obs_history_table(
+                painter,
+                history_rect,
+                history,
+                history_rows_shown,
+                self.units(),
+            );
+        }
     }
 
     /// Shift+click: pin the inspector to a geo point (or release a pin when
@@ -35376,11 +36071,13 @@ impl ViewerApp {
             let current = self.lon_lat_to_screen(rect, lon, lat);
             if current.distance(pointer) <= 14.0 {
                 self.pinned_inspector_lonlat = None;
+                self.pinned_obs_chart_station = None;
                 return;
             }
         }
         let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
         self.pinned_inspector_lonlat = Some((lon, lat));
+        self.pinned_obs_chart_station = None;
     }
 
     fn model_soundings_available(&self) -> bool {
@@ -36129,7 +36826,9 @@ impl ViewerApp {
             if points.len() < 3 {
                 continue;
             }
-            painter.add(egui::Shape::closed_line(points.clone(), stroke));
+            let mut shapes = Vec::new();
+            push_solid_closed_line(&mut shapes, &points, stroke, rect);
+            painter.extend(shapes);
         }
     }
 
@@ -36174,6 +36873,18 @@ impl ViewerApp {
             return out;
         };
         let bounds = self.visible_geo_bounds(rect).expand(0.05);
+        let visible_count = overlay
+            .records
+            .iter()
+            .filter(|record| {
+                self.hazard_record_visible_at_timeline_time(record, frame_time)
+                    && hazard_points_renderable(&record.points)
+                    && bounds.intersects_bbox(record.bbox)
+            })
+            .count();
+        let heavy_layer = visible_count > HAZARD_HEAVY_LAYER_FILL_LIMIT && self.map_scale < 240.0;
+        let mut label_rects = Vec::<egui::Rect>::new();
+        let mut labeled_events = BTreeSet::<String>::new();
         for (index, record) in overlay.records.iter().enumerate() {
             if !self.hazard_record_visible_at_timeline_time(record, frame_time)
                 || !hazard_points_renderable(&record.points)
@@ -36224,19 +36935,21 @@ impl ViewerApp {
                 ),
             );
             let solid = matches!(style.dash, styles::DashPattern::Solid);
-            let convex = is_convex_screen_polygon(&points);
-            if convex {
-                out.fill_shapes.push(egui::Shape::convex_polygon(
-                    points.clone(),
-                    fill,
-                    egui::Stroke::NONE,
-                ));
-            } else if let Some(mesh) = filled_polygon_mesh(&points, fill) {
-                out.fill_shapes.push(egui::Shape::mesh(mesh));
+            let has_screen_jump = screen_polyline_has_jump(&points, true, rect);
+            if (!heavy_layer || selected) && !has_screen_jump {
+                let convex = is_convex_screen_polygon(&points);
+                if convex {
+                    out.fill_shapes.push(egui::Shape::convex_polygon(
+                        points.clone(),
+                        fill,
+                        egui::Stroke::NONE,
+                    ));
+                } else if let Some(mesh) = filled_polygon_mesh(&points, fill) {
+                    out.fill_shapes.push(egui::Shape::mesh(mesh));
+                }
             }
             if solid {
-                out.outline_shapes
-                    .push(egui::Shape::closed_line(points.clone(), stroke));
+                push_solid_closed_line(&mut out.outline_shapes, &points, stroke, rect);
             } else {
                 match style.dash {
                     styles::DashPattern::Solid => unreachable!("solid handled above"),
@@ -36247,6 +36960,7 @@ impl ViewerApp {
                             stroke,
                             dash,
                             gap,
+                            rect,
                         );
                     }
                     styles::DashPattern::Dotted => {
@@ -36257,14 +36971,34 @@ impl ViewerApp {
                             stroke,
                             dot,
                             dot * 2.0,
+                            rect,
                         );
                     }
                 }
             }
-            let center = polygon_screen_centroid(&points);
-            if rect.expand(24.0).contains(center) && self.map_scale >= 62.0 {
-                out.labels
-                    .push((center, record.label.clone(), selected, index));
+            if (!heavy_layer || selected) && self.map_scale >= 62.0 {
+                let base_event_id = base_hazard_event_id(&record.event_id);
+                if (selected || !labeled_events.contains(base_event_id))
+                    && let Some(center) = hazard_visible_label_anchor(&points, rect)
+                {
+                    let label = hazard_map_label(record);
+                    let label_rect = hazard_label_screen_rect(
+                        center,
+                        &label,
+                        selected,
+                        global.label_font_px,
+                        global.label_font_selected_px,
+                    );
+                    let collides = !selected
+                        && label_rects
+                            .iter()
+                            .any(|existing| existing.expand(2.0).intersects(label_rect));
+                    if !collides {
+                        out.labels.push((center, label, selected, index));
+                        label_rects.push(label_rect);
+                        labeled_events.insert(base_event_id.to_owned());
+                    }
+                }
             }
         }
         out
@@ -36348,13 +37082,10 @@ impl ViewerApp {
             .as_ref()
             .filter(|(_, generation, _)| *generation == frame.generation);
         let needs_render = current
-            .map(|(_, _, have)| {
-                (have.center_lat - view.center_lat).abs() > 1e-4
-                    || (have.center_lon - view.center_lon).abs() > 1e-4
-                    || (have.map_scale - view.map_scale).abs() > 0.01
-            })
+            .map(|(_, _, have)| model_layer_view_needs_rerender(have, &view))
             .unwrap_or(true);
-        if needs_render && self.italy_dpc_render_rx.is_none() {
+        let defer_render = map_layer_rerender_deferred(painter.ctx());
+        if needs_render && !defer_render && self.italy_dpc_render_rx.is_none() {
             let (sender, receiver) = mpsc::channel();
             self.italy_dpc_render_rx = Some(receiver);
             let render_view = view;
@@ -36405,19 +37136,13 @@ impl ViewerApp {
             });
         }
         if let Some((texture, _, rendered)) = &self.italy_dpc_texture {
-            let rendered_center =
-                self.lon_lat_to_screen(rect, rendered.center_lon, rendered.center_lat);
-            let zoom_ratio = self.map_scale / rendered.map_scale.max(0.001);
-            let half = egui::vec2(
-                rect.width() * 0.5 * zoom_ratio,
-                rect.height() * 0.5 * zoom_ratio,
-            );
-            let image_rect =
-                egui::Rect::from_min_max(rendered_center - half, rendered_center + half);
+            if model_layer_view_needs_rerender(rendered, &view) {
+                return;
+            }
             let opacity = (layer_opacity.clamp(0.0, 1.0) * 255.0) as u8;
             painter.image(
                 texture.id(),
-                image_rect,
+                rect,
                 egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                 egui::Color32::from_white_alpha(opacity),
             );
@@ -36425,6 +37150,92 @@ impl ViewerApp {
                 egui::pos2(rect.left() + 6.0, rect.bottom() - 4.0),
                 egui::Align2::LEFT_BOTTOM,
                 "Radar-DPC CC-BY-SA · raw GeoTIFF",
+                egui::FontId::proportional(9.0),
+                egui::Color32::from_rgba_unmultiplied(230, 234, 238, 150),
+            );
+        }
+    }
+
+    fn draw_taiwan_cwa_layer(&mut self, painter: &egui::Painter, rect: egui::Rect) {
+        let Some((frame, layer_opacity)) = self.taiwan_cwa_layer.as_ref().and_then(|layer| {
+            layer
+                .visible
+                .then(|| {
+                    layer
+                        .frame
+                        .as_ref()
+                        .cloned()
+                        .map(|frame| (frame, layer.opacity))
+                })
+                .flatten()
+        }) else {
+            return;
+        };
+        let view = self.model_layer_current_view();
+        let current = self
+            .taiwan_cwa_texture
+            .as_ref()
+            .filter(|(_, generation, _)| *generation == frame.generation);
+        let needs_render = current
+            .map(|(_, _, have)| model_layer_view_needs_rerender(have, &view))
+            .unwrap_or(true);
+        let defer_render = map_layer_rerender_deferred(painter.ctx());
+        if needs_render && !defer_render && self.taiwan_cwa_render_rx.is_none() {
+            let (sender, receiver) = mpsc::channel();
+            self.taiwan_cwa_render_rx = Some(receiver);
+            let render_view = view;
+            let generation = frame.generation;
+            let frame = Arc::clone(&frame);
+            let center_lat = view.center_lat as f64;
+            let center_lon = view.center_lon as f64;
+            let km_per_pt = 111.32 / view.map_scale as f64;
+            let render_scale = taiwan_cwa::TAIWAN_CWA_RENDER_SCALE.clamp(0.25, 1.0) as f64;
+            let (w_pts, h_pts) = (rect.width() as f64, rect.height() as f64);
+            thread::spawn(move || {
+                let render_start = Instant::now();
+                let w = (w_pts * render_scale).max(8.0) as usize;
+                let h = (h_pts * render_scale).max(8.0) as usize;
+                let mut pixels = vec![egui::Color32::TRANSPARENT; w * h];
+                for (i, px) in pixels.iter_mut().enumerate() {
+                    let x = (i % w) as f64 / render_scale;
+                    let y = (i / w) as f64 / render_scale;
+                    let east_km = (x - w_pts / 2.0) * km_per_pt;
+                    let north_km = (h_pts / 2.0 - y) * km_per_pt;
+                    let (lat, lon) = aeqd_inverse_km(center_lat, center_lon, east_km, north_km);
+                    let color =
+                        taiwan_cwa::sample_reflectivity_color(&frame, lat as f32, lon as f32);
+                    if color.a() > 0 {
+                        *px = color;
+                    }
+                }
+                let image = egui::ColorImage {
+                    size: [w, h],
+                    source_size: egui::vec2(w as f32, h as f32),
+                    pixels,
+                };
+                let _ = sender.send((
+                    generation,
+                    render_view,
+                    image,
+                    render_start.elapsed().as_secs_f32() * 1000.0,
+                ));
+            });
+        }
+        if let Some((texture, _, rendered)) = &self.taiwan_cwa_texture {
+            if model_layer_view_needs_rerender(rendered, &view) {
+                return;
+            }
+            let opacity = (layer_opacity.clamp(0.0, 1.0) * 255.0) as u8;
+            painter.image(
+                texture.id(),
+                rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::from_white_alpha(opacity),
+            );
+            painter.text(
+                egui::pos2(rect.left() + 6.0, rect.bottom() - 18.0),
+                egui::Align2::LEFT_BOTTOM,
+                "Taiwan CWA O-A0059-001 · composite REF",
                 egui::FontId::proportional(9.0),
                 egui::Color32::from_rgba_unmultiplied(230, 234, 238, 150),
             );
@@ -40975,10 +41786,18 @@ fn live_hazard_record_is_current(record: &HazardRecord) -> bool {
 fn active_alert_event_ids(records: &[HazardRecord]) -> BTreeSet<String> {
     records
         .iter()
-        .filter(|record| record.action == "ALERT")
+        .filter(|record| hazard_record_is_weather_gov_alert(record))
         .filter(|record| live_hazard_record_is_current(record))
         .map(|record| base_hazard_event_id(&record.event_id).to_owned())
         .collect()
+}
+
+fn hazard_record_is_weather_gov_alert(record: &HazardRecord) -> bool {
+    record.action == "ALERT"
+        || record
+            .source_url
+            .as_deref()
+            .is_some_and(|url| url.contains("api.weather.gov/alerts"))
 }
 
 fn live_hazard_record_has_authoritative_source(
@@ -40986,7 +41805,7 @@ fn live_hazard_record_has_authoritative_source(
     active_alert_event_ids: &BTreeSet<String>,
 ) -> bool {
     !live_warning_requires_active_alert(record)
-        || (record.action == "ALERT"
+        || (hazard_record_is_weather_gov_alert(record)
             && active_alert_event_ids.contains(base_hazard_event_id(&record.event_id)))
 }
 
@@ -40995,7 +41814,7 @@ fn hazard_record_shadowed_by_active_alert(
     active_alert_event_ids: &BTreeSet<String>,
 ) -> bool {
     live_warning_requires_active_alert(record)
-        && record.action != "ALERT"
+        && !hazard_record_is_weather_gov_alert(record)
         && active_alert_event_ids.contains(base_hazard_event_id(&record.event_id))
 }
 
@@ -41006,6 +41825,7 @@ fn live_warning_requires_active_alert(record: &HazardRecord) -> bool {
             | "severe thunderstorm"
             | "flash flood"
             | "flood"
+            | "fire weather"
             | "special marine"
             | "snow squall"
     )
@@ -41050,6 +41870,20 @@ fn report_visible_at_timeline_time(
     let trail = chrono::Duration::minutes(TIMELINE_REPORT_TRAILING_MINUTES);
     let age = frame_time_utc - report_time_utc;
     age >= -lead && age <= trail
+}
+
+fn mping_draw_priority(report: &mping::MpingReport, now: DateTime<Utc>) -> i64 {
+    let category_score = match report.category.as_str() {
+        "Hail" | "Wind" | "Wind/Storm Damage" | "Storm Damage" | "Flood" => 5,
+        "Reduced Visibility" | "Winter Weather Impacts" => 3,
+        "Rain/Snow" => 2,
+        "None" => 0,
+        _ => 1,
+    };
+    let age_min = (now - report.obtime)
+        .num_minutes()
+        .clamp(0, TIMELINE_REPORT_TRAILING_MINUTES);
+    category_score * 1_000 + (TIMELINE_REPORT_TRAILING_MINUTES - age_min)
 }
 
 fn base_hazard_event_id(event_id: &str) -> &str {
@@ -41628,7 +42462,10 @@ fn table_display_unit(
     unit_system: units::Units,
 ) -> (&'static str, f32) {
     if matches!(product, DisplayProduct::Derived(DerivedProduct::EchoTops)) {
-        return ("kft", METERS_PER_KFT);
+        return match unit_system {
+            units::Units::Imperial => ("kft", METERS_PER_KFT),
+            units::Units::Metric => ("km", 1000.0),
+        };
     }
     if display_product_is_rain_rate(product) {
         return match unit_system {
@@ -41637,6 +42474,12 @@ fn table_display_unit(
         };
     }
     let base = product_units(product);
+    if base == "mm" {
+        return match unit_system {
+            units::Units::Imperial => ("in", 25.4),
+            units::Units::Metric => ("mm", 1.0),
+        };
+    }
     if base != "m/s" {
         return (base, 1.0);
     }
@@ -41644,14 +42487,21 @@ fn table_display_unit(
         .units()
         .map(str::trim)
         .filter(|units| !units.is_empty());
-    let Some(declared) = declared else {
-        return (base, 1.0);
-    };
-    match declared.to_ascii_lowercase().as_str() {
-        "kt" | "kts" | "knot" | "knots" => ("kt", color_tables::unit_scale_to_internal(declared)),
-        "mph" | "mi/h" => ("mph", color_tables::unit_scale_to_internal(declared)),
-        // m/s, mps, and unrecognized spellings stay SI (factor 1).
-        _ => (base, 1.0),
+    let declared_lower = declared.map(|units| (units, units.to_ascii_lowercase()));
+    match declared_lower {
+        Some((raw, lower)) if matches!(lower.as_str(), "kt" | "kts" | "knot" | "knots") => {
+            ("kt", color_tables::unit_scale_to_internal(raw))
+        }
+        Some((raw, lower)) if matches!(lower.as_str(), "mph" | "mi/h") => {
+            ("mph", color_tables::unit_scale_to_internal(raw))
+        }
+        Some((raw, lower)) if matches!(lower.as_str(), "km/h" | "kph" | "kmh") => {
+            ("km/h", color_tables::unit_scale_to_internal(raw))
+        }
+        _ => match unit_system {
+            units::Units::Imperial => ("mph", color_tables::unit_scale_to_internal("mph")),
+            units::Units::Metric => ("km/h", color_tables::unit_scale_to_internal("km/h")),
+        },
     }
 }
 
@@ -42640,10 +43490,93 @@ fn ingest_worker_model_options() -> Vec<rw_ui::ModelOption> {
 }
 
 fn bowecho_model_download_supported(model: rustwx_core::ModelId) -> bool {
-    matches!(
-        model,
-        rustwx_core::ModelId::Hrrr | rustwx_core::ModelId::Gfs | rustwx_core::ModelId::Rap
-    ) && rw_ingest::ingest_supported(model)
+    rw_ingest::ingest_supported(model)
+}
+
+fn model_download_cadence_hint(model: rustwx_core::ModelId, _cycle: u8) -> &'static str {
+    use rustwx_core::ModelId;
+    match model {
+        ModelId::Gfs => "hourly <=120, 3-hourly 123-384",
+        ModelId::Gefs => "3-hourly <=240, 6-hourly 246-384",
+        ModelId::Aigfs | ModelId::Aigefs => "6-hourly 000-384",
+        ModelId::Hgefs => "6-hourly 000-240",
+        ModelId::EcmwfOpenData => {
+            "00/12z: 3-hourly <=144 then 6-hourly <=360; 06/18z: 3-hourly <=144"
+        }
+        ModelId::Rap => "f000-f021 most cycles, f000-f051 at 03/09/15/21z",
+        ModelId::Nam => "hourly <=36, 3-hourly 39-84",
+        _ => "",
+    }
+}
+
+fn normalize_model_download_spec(mut spec: rw_ui::DownloadSpec) -> rw_ui::DownloadSpec {
+    let Ok(model) = spec.model.parse::<rustwx_core::ModelId>() else {
+        return spec;
+    };
+    if let Some(hours) = normalize_model_download_hours(model, spec.cycle, &spec.hours) {
+        spec.hours = hours;
+    }
+    spec
+}
+
+fn normalize_model_download_hours(
+    model: rustwx_core::ModelId,
+    cycle: u8,
+    hour_spec: &str,
+) -> Option<String> {
+    let supported = rustwx_models::supported_forecast_hours(model, cycle);
+    if supported.is_empty() {
+        return None;
+    }
+    let requested = rw_ingest::ingest_hour::parse_hours(hour_spec).ok()?;
+    if requested.iter().all(|hour| supported.contains(hour)) {
+        return None;
+    }
+
+    let mut normalized = Vec::new();
+    for token in hour_spec
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        if let Some((start, end)) = token.split_once('-') {
+            let start: u16 = start.trim().parse().ok()?;
+            let end: u16 = end.trim().parse().ok()?;
+            if start > end {
+                return None;
+            }
+            let before = normalized.len();
+            normalized.extend(
+                supported
+                    .iter()
+                    .copied()
+                    .filter(|hour| *hour >= start && *hour <= end),
+            );
+            if normalized.len() == before {
+                return None;
+            }
+        } else {
+            let hour: u16 = token.parse().ok()?;
+            if !supported.contains(&hour) {
+                return None;
+            }
+            normalized.push(hour);
+        }
+    }
+
+    normalized.sort_unstable();
+    normalized.dedup();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(
+            normalized
+                .iter()
+                .map(|hour| hour.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    }
 }
 
 /// Keep the download panel's cycle/source pickers + hours hint in sync
@@ -42660,9 +43593,143 @@ fn sync_run_pickers(download: &mut rw_ui::DownloadPanel, spec: &rw_ui::DownloadS
     let supported = rustwx_models::supported_forecast_hours(model, spec.cycle);
     match (supported.first(), supported.last()) {
         (Some(first), Some(last)) => {
-            download.set_hours_hint(format!("supported: {first}-{last} ({:02}z)", spec.cycle));
+            let cadence = model_download_cadence_hint(model, spec.cycle);
+            let hint = if cadence.is_empty() {
+                format!("supported: {first}-{last} ({:02}z)", spec.cycle)
+            } else {
+                format!("supported: {first}-{last} ({:02}z) - {cadence}", spec.cycle)
+            };
+            download.set_hours_hint(hint);
         }
         _ => download.set_hours_hint("no supported hours for this cycle".to_string()),
+    }
+}
+
+fn draw_obs_history_table(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    history: &ObsHistoryData,
+    max_rows: usize,
+    unit_system: units::Units,
+) {
+    if rect.width() < 220.0 || rect.height() < 44.0 || max_rows == 0 {
+        return;
+    }
+    painter.rect_filled(
+        rect,
+        3.0,
+        egui::Color32::from_rgba_unmultiplied(4, 7, 11, 190),
+    );
+    let border = egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 78));
+    painter.line_segment([rect.left_top(), rect.right_top()], border);
+    painter.line_segment([rect.right_top(), rect.right_bottom()], border);
+    painter.line_segment([rect.right_bottom(), rect.left_bottom()], border);
+    painter.line_segment([rect.left_bottom(), rect.left_top()], border);
+
+    let temp_unit = match unit_system {
+        units::Units::Imperial => "F",
+        units::Units::Metric => "C",
+    };
+    let font = egui::FontId::monospace(10.0);
+    let header_font = egui::FontId::monospace(10.5);
+    let header_color = egui::Color32::from_rgb(156, 213, 255);
+    let text_color = egui::Color32::from_rgb(225, 231, 238);
+    let weak_color = egui::Color32::from_rgb(150, 160, 172);
+    let left = rect.left() + 8.0;
+    let mut y = rect.top() + 6.0;
+    painter.text(
+        egui::pos2(left, y),
+        egui::Align2::LEFT_TOP,
+        format!(
+            "{} to {} - frame {}",
+            history.start_time.format("%H:%MZ"),
+            history.end_time.format("%H:%MZ"),
+            history.frame_time.format("%H:%MZ")
+        ),
+        header_font.clone(),
+        weak_color,
+    );
+    y += 13.0;
+    let columns = [
+        (0.0, "time"),
+        (72.0, "age"),
+        (112.0, "T"),
+        (144.0, "Td"),
+        (178.0, "wind"),
+        (250.0, "alt"),
+        (298.0, "src"),
+    ];
+    for (x, label) in columns {
+        painter.text(
+            egui::pos2(left + x, y),
+            egui::Align2::LEFT_TOP,
+            if label == "T" {
+                format!("T {temp_unit}")
+            } else if label == "Td" {
+                format!("Td {temp_unit}")
+            } else {
+                label.to_owned()
+            },
+            header_font.clone(),
+            header_color,
+        );
+    }
+    y += 13.0;
+    painter.line_segment(
+        [egui::pos2(left, y), egui::pos2(rect.right() - 8.0, y)],
+        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(80, 96, 118, 120)),
+    );
+    y += 3.0;
+    for row in history.rows.iter().take(max_rows) {
+        let color = if row.age_min > 75 {
+            weak_color
+        } else {
+            text_color
+        };
+        let fields = [
+            (0.0, row.time_text.as_str(), color),
+            (72.0, "", weak_color),
+            (
+                112.0,
+                row.temp_text.as_str(),
+                egui::Color32::from_rgb(244, 102, 92),
+            ),
+            (
+                144.0,
+                row.dewpoint_text.as_str(),
+                egui::Color32::from_rgb(92, 232, 134),
+            ),
+            (178.0, row.wind_text.as_str(), color),
+            (250.0, row.pressure_text.as_str(), color),
+            (298.0, row.network.as_str(), weak_color),
+        ];
+        for (x, value, field_color) in fields {
+            let text = if x == 72.0 {
+                format!("{}m", row.age_min)
+            } else {
+                value.to_owned()
+            };
+            painter.text(
+                egui::pos2(left + x, y),
+                egui::Align2::LEFT_TOP,
+                text,
+                font.clone(),
+                field_color,
+            );
+        }
+        y += 13.5;
+    }
+    if history.rows.len() > max_rows {
+        painter.text(
+            egui::pos2(left, y),
+            egui::Align2::LEFT_TOP,
+            format!(
+                "+{} older reports in this 3h window",
+                history.rows.len() - max_rows
+            ),
+            font,
+            weak_color,
+        );
     }
 }
 
@@ -42827,6 +43894,112 @@ fn build_native_sounding_adjusted(
     Ok(native)
 }
 
+fn raob_column_to_rw_sounding_data(
+    site: &obs_soundings::RaobSite,
+    valid: DateTime<Utc>,
+    column: &rustwx_sounding::SoundingColumn,
+    context: String,
+) -> std::result::Result<rw_ui::SoundingData, String> {
+    if column.pressure_hpa.len() < 2 {
+        return Err("RAOB column has too few levels for the native panel".to_owned());
+    }
+    let surface_value = |values: &[f64], name: &str| -> std::result::Result<f32, String> {
+        values
+            .first()
+            .copied()
+            .filter(|value| value.is_finite())
+            .map(|value| value as f32)
+            .ok_or_else(|| format!("RAOB column missing finite {name} at the surface"))
+    };
+    let psfc_hpa = surface_value(&column.pressure_hpa, "pressure")?;
+    let zsfc_m = surface_value(&column.height_m_msl, "height")?;
+    let tsfc_c = surface_value(&column.temperature_c, "temperature")?;
+    let tdsfc_c = surface_value(&column.dewpoint_c, "dewpoint")?;
+    let usfc_ms = surface_value(&column.u_ms, "u wind")?;
+    let vsfc_ms = surface_value(&column.v_ms, "v wind")?;
+
+    let mut levels_hpa = Vec::new();
+    let mut temperature_k = Vec::new();
+    let mut dewpoint_k = Vec::new();
+    let mut u_ms = Vec::new();
+    let mut v_ms = Vec::new();
+    let mut height_m = Vec::new();
+    for index in 1..column.pressure_hpa.len() {
+        let p = column.pressure_hpa[index];
+        let z = column.height_m_msl[index];
+        let t = column.temperature_c[index];
+        let td = column.dewpoint_c[index];
+        let u = column.u_ms[index];
+        let v = column.v_ms[index];
+        if !(p.is_finite()
+            && z.is_finite()
+            && t.is_finite()
+            && td.is_finite()
+            && u.is_finite()
+            && v.is_finite())
+        {
+            continue;
+        }
+        let rounded = p.round();
+        if !(1.0..=1100.0).contains(&rounded) {
+            continue;
+        }
+        let level = rounded as u16;
+        if levels_hpa.last().is_some_and(|&last| last == level) {
+            continue;
+        }
+        levels_hpa.push(level);
+        temperature_k.push((t + 273.15) as f32);
+        dewpoint_k.push((td + 273.15) as f32);
+        u_ms.push(u as f32);
+        v_ms.push(v as f32);
+        height_m.push(z as f32);
+    }
+    if levels_hpa.is_empty() {
+        return Err("RAOB column has no usable levels above the surface".to_owned());
+    }
+
+    let profile = |name: &str, units: &str, values: Vec<f32>| rw_ui::ProfileVar {
+        name: name.to_owned(),
+        units: units.to_owned(),
+        levels_hpa: levels_hpa.clone(),
+        values,
+    };
+    let surface = |name: &str, units: &str, value: f32| rw_ui::SurfaceSample {
+        name: name.to_owned(),
+        units: units.to_owned(),
+        value,
+    };
+    Ok(rw_ui::SoundingData {
+        hour: rw_ui::HourKey {
+            model: format!("{} RAOB", site.id),
+            run: format!("{}{}", valid.format("%Y-%m-%d %Hz"), context),
+            hour: 0,
+        },
+        fx: 0.0,
+        fy: 0.0,
+        lat: Some(site.lat),
+        lon: Some(site.lon),
+        vars: vec![
+            profile("temperature_iso", "K", temperature_k),
+            profile("dewpoint_iso", "K", dewpoint_k),
+            profile("u_iso", "m/s", u_ms),
+            profile("v_iso", "m/s", v_ms),
+            profile("height_iso", "m", height_m),
+        ],
+        surface: vec![
+            surface("temperature_2m", "K", tsfc_c + 273.15),
+            surface("dewpoint_2m", "K", tdsfc_c + 273.15),
+            surface("u_10m", "m/s", usfc_ms),
+            surface("v_10m", "m/s", vsfc_ms),
+            surface("surface_pressure", "Pa", psfc_hpa * 100.0),
+            surface("orography", "m", zsfc_m),
+            surface("mslp", "hPa", psfc_hpa),
+        ],
+        read_ms: 0.0,
+    })
+}
+
 /// Light-by-default download spec: sounding profile, NO heavy ECAPE.
 /// Heavy is ~5x the compute (all cores, minutes per hour on laptops) —
 /// it must be an informed opt-in, never the default a new user trips on
@@ -42839,7 +44012,7 @@ fn default_download_spec(model_slug: &str) -> rw_ui::DownloadSpec {
         .ok()
         .filter(|&model| bowecho_model_download_supported(model))
         .unwrap_or(rustwx_core::ModelId::Hrrr);
-    rw_ui::DownloadSpec {
+    normalize_model_download_spec(rw_ui::DownloadSpec {
         model: model.as_str().to_owned(),
         profile: "sounding".to_owned(),
         heavy: false,
@@ -42849,7 +44022,7 @@ fn default_download_spec(model_slug: &str) -> rw_ui::DownloadSpec {
         // (field report: os error 30 on model downloads).
         cache_dir: settings::model_cache_dir().to_string_lossy().into_owned(),
         ..rw_ui::DownloadSpec::default()
-    }
+    })
 }
 
 pub(crate) fn normalize_event_track_model_slug(model_slug: &str) -> String {
@@ -42957,9 +44130,9 @@ fn product_order(available: &std::collections::BTreeSet<MomentType>) -> Vec<Disp
     for moment in [
         MomentType::Reflectivity,
         MomentType::Velocity,
-        MomentType::SpectrumWidth,
-        MomentType::DifferentialReflectivity,
         MomentType::CorrelationCoefficient,
+        MomentType::DifferentialReflectivity,
+        MomentType::SpectrumWidth,
         MomentType::DifferentialPhase,
         MomentType::SpecificDifferentialPhase,
     ] {
@@ -42984,6 +44157,65 @@ fn product_order(available: &std::collections::BTreeSet<MomentType>) -> Vec<Disp
         }
     }
     ordered
+}
+
+fn picker_product_rank(product: &DisplayProduct) -> (u16, &str) {
+    let rank = match product {
+        DisplayProduct::Moment(MomentType::Reflectivity) => 10,
+        DisplayProduct::Moment(MomentType::Velocity) => 20,
+        DisplayProduct::DealiasedVelocity => 21,
+        DisplayProduct::StormRelativeVelocity => 30,
+        DisplayProduct::StormRelativeDealiasedVelocity => 31,
+        DisplayProduct::Moment(MomentType::CorrelationCoefficient) => 40,
+        DisplayProduct::Moment(MomentType::DifferentialReflectivity) => 50,
+        DisplayProduct::Moment(MomentType::SpectrumWidth) => 60,
+        DisplayProduct::Moment(MomentType::DifferentialPhase) => 70,
+        DisplayProduct::Moment(MomentType::SpecificDifferentialPhase) => 80,
+        DisplayProduct::Derived(DerivedProduct::CompositeReflectivity) => 100,
+        DisplayProduct::Derived(DerivedProduct::EchoTops) => 110,
+        DisplayProduct::Derived(DerivedProduct::Vil) => 120,
+        DisplayProduct::Derived(DerivedProduct::VilDensity) => 121,
+        DisplayProduct::Derived(DerivedProduct::Mehs) => 130,
+        DisplayProduct::Derived(DerivedProduct::Posh) => 131,
+        DisplayProduct::Derived(DerivedProduct::Poh) => 132,
+        DisplayProduct::Derived(DerivedProduct::Marc) => 140,
+        DisplayProduct::Derived(DerivedProduct::GustProxy) => 150,
+        DisplayProduct::Derived(DerivedProduct::AzimuthalShear) => 160,
+        DisplayProduct::Derived(DerivedProduct::Divergence) => 161,
+        DisplayProduct::Moment(MomentType::Unknown(name)) => match name.as_str() {
+            "PHIF" => 200,
+            "KDP_SD" => 201,
+            "AH" => 210,
+            "PIA" => 211,
+            "CREF" => 212,
+            "ADP" => 220,
+            "PIDA" => 221,
+            "ZDRC" => 222,
+            "RATE_Z" => 230,
+            "RATE_KDP" => 231,
+            "RATE" => 232,
+            "LWC" => 240,
+            "HKE" => 241,
+            "CDR" => 250,
+            "L_RHO" => 251,
+            "REF_TEX" => 260,
+            "VEL_TEX" => 261,
+            "SW_TEX" => 262,
+            "ZDR_TEX" => 263,
+            "RHO_TEX" => 264,
+            "PHI_TEX" => 265,
+            "KDP_TEX" => 266,
+            "REF_GRAD_R" => 270,
+            "VEL_GRAD_R" => 271,
+            "MET_QI" => 280,
+            "MET_MASK" => 281,
+            "TDS_SCORE" => 290,
+            "HAIL_SCORE" => 291,
+            "TURB" => 292,
+            _ => 900,
+        },
+    };
+    (rank, product.label())
 }
 
 fn retain_non_advanced_products(products: &mut Vec<DisplayProduct>) {
@@ -43082,6 +44314,7 @@ fn global_displayable_products_for_picker(
     let mut products =
         global_displayable_products_with_advanced(volume, include_advanced_placeholders);
     retain_picker_visible_products(&mut products, show_derived_products);
+    products.sort_by(|left, right| picker_product_rank(left).cmp(&picker_product_rank(right)));
     products
 }
 
@@ -43255,12 +44488,13 @@ fn load_weather_gov_active_alerts(query_time_utc: DateTime<Utc>) -> Result<SpcMd
         .map_err(|err| format!("Live hazard fetch failed: {err}"))?;
     let collection: WeatherAlertFeatureCollection = serde_json::from_str(&text)
         .map_err(|err| format!("Live hazard JSON parse failed: {err}"))?;
+    let zone_geometries = fetch_weather_alert_zone_geometries(&collection.features);
     let mut records = Vec::new();
     let mut parsed_items = 0usize;
     let mut error_count = 0usize;
 
     for feature in &collection.features {
-        match parse_weather_alert_feature(feature, query_time_utc) {
+        match parse_weather_alert_feature_with_zones(feature, query_time_utc, &zone_geometries) {
             Ok(mut feature_records) => {
                 if !feature_records.is_empty() {
                     parsed_items += 1;
@@ -43294,6 +44528,7 @@ fn build_live_hazard_overlay(
     dedupe_hazard_records(&mut records);
     records.retain(|record| {
         live_hazard_record_is_current(record)
+            && hazard_family_has_user_filter(&record.event_family)
             && live_hazard_record_has_authoritative_source(record, &active_alert_event_ids)
     });
     sort_hazard_records(&mut records);
@@ -43685,10 +44920,7 @@ fn merge_duplicate_hazard_record(
     if merged.lifecycle_status.is_none() {
         merged.lifecycle_status = fallback_source.lifecycle_status.clone();
     }
-    merged.lifecycle_status = preferred_lifecycle_status(
-        existing.lifecycle_status.as_deref(),
-        candidate.lifecycle_status.as_deref(),
-    );
+    merged.lifecycle_status = preferred_lifecycle_status_for_records(existing, candidate);
     if merged.severity.is_none() {
         merged.severity = fallback_source.severity.clone();
     }
@@ -43710,7 +44942,9 @@ fn merge_duplicate_hazard_record(
     if merged.damage_threat.is_none() {
         merged.damage_threat = fallback_source.damage_threat.clone();
     }
-    if let Some(alert_source) = authoritative_alert_source {
+    if let Some(tombstone) = authoritative_alert_tombstone_record(existing, candidate) {
+        merged.action = tombstone.action.clone();
+    } else if let Some(alert_source) = authoritative_alert_source {
         merged.action = alert_source.action.clone();
         if alert_source.tornado.is_some() {
             merged.tornado = alert_source.tornado.clone();
@@ -43735,8 +44969,24 @@ fn authoritative_active_alert_record<'a>(
 ) -> Option<&'a HazardRecord> {
     [left, right]
         .into_iter()
-        .filter(|record| record.action == "ALERT" && live_hazard_record_is_current(record))
+        .filter(|record| {
+            hazard_record_is_weather_gov_alert(record) && live_hazard_record_is_current(record)
+        })
         .max_by_key(|record| active_alert_authority_key(record))
+}
+
+fn authoritative_alert_tombstone_record<'a>(
+    left: &'a HazardRecord,
+    right: &'a HazardRecord,
+) -> Option<&'a HazardRecord> {
+    [left, right].into_iter().find(|record| {
+        hazard_record_is_weather_gov_alert(record)
+            && (matches!(record.action.as_str(), "CAN" | "EXP")
+                || matches!(
+                    record.lifecycle_status.as_deref(),
+                    Some("Canceled") | Some("Expired")
+                ))
+    })
 }
 
 fn active_alert_authority_key(record: &HazardRecord) -> (u8, i64) {
@@ -43785,6 +45035,28 @@ fn preferred_lifecycle_status(left: Option<&str>, right: Option<&str>) -> Option
         .flatten()
         .max_by_key(|status| lifecycle_status_priority(status))
         .map(str::to_owned)
+}
+
+fn preferred_lifecycle_status_for_records(
+    left: &HazardRecord,
+    right: &HazardRecord,
+) -> Option<String> {
+    [left, right]
+        .into_iter()
+        .find(|record| {
+            hazard_record_is_weather_gov_alert(record)
+                && matches!(
+                    record.lifecycle_status.as_deref(),
+                    Some("Canceled") | Some("Expired")
+                )
+        })
+        .and_then(|record| record.lifecycle_status.clone())
+        .or_else(|| {
+            preferred_lifecycle_status(
+                left.lifecycle_status.as_deref(),
+                right.lifecycle_status.as_deref(),
+            )
+        })
 }
 
 fn lifecycle_status_priority(status: &str) -> u8 {
@@ -44217,6 +45489,11 @@ struct WeatherAlertGeometry {
     coordinates: serde_json::Value,
 }
 
+#[derive(Debug, Deserialize)]
+struct WeatherZoneFeature {
+    geometry: Option<WeatherAlertGeometry>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct WeatherAlertProperties {
     id: Option<String>,
@@ -44236,24 +45513,34 @@ struct WeatherAlertProperties {
     onset: Option<String>,
     expires: Option<String>,
     ends: Option<String>,
+    #[serde(rename = "messageType")]
+    message_type: Option<String>,
+    #[serde(default, rename = "affectedZones")]
+    affected_zones: Vec<String>,
     #[serde(default)]
     parameters: BTreeMap<String, Vec<String>>,
 }
 
+#[cfg(test)]
 fn parse_weather_alert_feature(
     feature: &WeatherAlertFeature,
     query_time_utc: DateTime<Utc>,
 ) -> Result<Vec<HazardRecord>, String> {
-    let Some(geometry) = &feature.geometry else {
-        return Ok(Vec::new());
-    };
-    let rings = weather_alert_geometry_rings(geometry)?;
+    parse_weather_alert_feature_with_zones(feature, query_time_utc, &HashMap::new())
+}
+
+fn parse_weather_alert_feature_with_zones(
+    feature: &WeatherAlertFeature,
+    query_time_utc: DateTime<Utc>,
+    zone_geometries: &HashMap<String, Vec<Vec<HazardPoint>>>,
+) -> Result<Vec<HazardRecord>, String> {
     let event = feature
         .properties
         .event
         .as_deref()
         .unwrap_or("Weather Alert");
     let event_family = weather_alert_family(event);
+    let rings = weather_alert_feature_rings(feature, zone_geometries)?;
     let tags = parse_weather_alert_tags(&feature.properties.parameters);
     let valid_start = parse_alert_time(
         feature
@@ -44269,17 +45556,21 @@ fn parse_weather_alert_feature(
             .as_deref()
             .or(feature.properties.expires.as_deref()),
     );
+    let parsed_vtec = weather_alert_parameter(&feature.properties.parameters, "VTEC")
+        .and_then(|vtec| parse_vtec_alert(&vtec));
+    let action = parsed_vtec
+        .as_ref()
+        .map(|vtec| vtec.action.as_str())
+        .or_else(|| cap_message_type_action(feature.properties.message_type.as_deref()))
+        .unwrap_or("ALERT");
     let lifecycle_status =
-        hazard_lifecycle_status("ALERT", valid_start, valid_end, Some(query_time_utc));
+        hazard_lifecycle_status(action, valid_start, valid_end, Some(query_time_utc));
     let valid_start_text = valid_start.map(format_utc_seconds);
     let valid_end_text = valid_end.map(format_utc_seconds);
     let label = weather_alert_label(event, &event_family, &feature.properties.parameters, &tags);
-    let event_id = feature
-        .properties
-        .parameters
-        .get("VTEC")
-        .and_then(|values| values.first())
-        .and_then(|vtec| parse_vtec_alert_event_id(vtec))
+    let event_id = parsed_vtec
+        .as_ref()
+        .map(vtec_alert_event_id)
         .or_else(|| {
             feature
                 .properties
@@ -44325,7 +45616,7 @@ fn parse_weather_alert_feature(
                     label.clone()
                 },
                 event_family: event_family.clone(),
-                action: "ALERT".to_owned(),
+                action: action.to_owned(),
                 lifecycle_status: lifecycle_status.clone(),
                 office: office.clone(),
                 headline: headline.clone(),
@@ -44352,6 +45643,82 @@ fn parse_weather_alert_feature(
             })
         })
         .collect())
+}
+
+fn weather_alert_feature_rings(
+    feature: &WeatherAlertFeature,
+    zone_geometries: &HashMap<String, Vec<Vec<HazardPoint>>>,
+) -> Result<Vec<Vec<HazardPoint>>, String> {
+    let mut rings = match &feature.geometry {
+        Some(geometry) => weather_alert_geometry_rings(geometry)?,
+        None => Vec::new(),
+    };
+    if rings.is_empty() {
+        for zone_url in &feature.properties.affected_zones {
+            if let Some(zone_rings) = zone_geometries.get(zone_url) {
+                rings.extend(zone_rings.iter().cloned());
+            }
+        }
+    }
+    Ok(rings)
+}
+
+fn fetch_weather_alert_zone_geometries(
+    features: &[WeatherAlertFeature],
+) -> HashMap<String, Vec<Vec<HazardPoint>>> {
+    let mut zone_urls = BTreeSet::new();
+    for feature in features {
+        if feature.geometry.is_some() {
+            continue;
+        }
+        let event = feature
+            .properties
+            .event
+            .as_deref()
+            .unwrap_or("Weather Alert");
+        let event_family = weather_alert_family(event);
+        if !matches!(
+            event_family.as_str(),
+            "tornado"
+                | "severe thunderstorm"
+                | "flash flood"
+                | "flood"
+                | "fire weather"
+                | "special marine"
+                | "snow squall"
+                | "watch"
+                | "special weather"
+        ) {
+            continue;
+        }
+        for zone_url in &feature.properties.affected_zones {
+            if zone_url.starts_with("https://api.weather.gov/zones/") {
+                zone_urls.insert(zone_url.clone());
+            }
+        }
+    }
+
+    zone_urls
+        .into_iter()
+        .take(MAX_ACTIVE_ALERT_ZONE_GEOMETRIES)
+        .filter_map(|zone_url| {
+            fetch_weather_alert_zone_geometry(&zone_url)
+                .ok()
+                .filter(|rings| !rings.is_empty())
+                .map(|rings| (zone_url, rings))
+        })
+        .collect()
+}
+
+fn fetch_weather_alert_zone_geometry(zone_url: &str) -> Result<Vec<Vec<HazardPoint>>, String> {
+    let text = data_source::fetch_text(zone_url)
+        .map_err(|err| format!("NWS alert zone geometry fetch failed for {zone_url}: {err}"))?;
+    let zone: WeatherZoneFeature = serde_json::from_str(&text)
+        .map_err(|err| format!("NWS alert zone geometry parse failed for {zone_url}: {err}"))?;
+    let Some(geometry) = zone.geometry else {
+        return Ok(Vec::new());
+    };
+    weather_alert_geometry_rings(&geometry)
 }
 
 fn weather_alert_geometry_rings(
@@ -44409,7 +45776,11 @@ fn parse_polygon_coordinate_value(value: &serde_json::Value) -> Vec<Vec<HazardPo
 
 fn weather_alert_family(event: &str) -> String {
     let upper = event.to_ascii_uppercase();
-    if upper.contains("TORNADO") {
+    if upper.contains("RED FLAG") || upper.contains("FIRE WEATHER") {
+        "fire weather".to_owned()
+    } else if upper.contains("WATCH") {
+        "watch".to_owned()
+    } else if upper.contains("TORNADO") {
         "tornado".to_owned()
     } else if upper.contains("SEVERE THUNDERSTORM") {
         "severe thunderstorm".to_owned()
@@ -44421,8 +45792,6 @@ fn weather_alert_family(event: &str) -> String {
         "special marine".to_owned()
     } else if upper.contains("SNOW SQUALL") {
         "snow squall".to_owned()
-    } else if upper.contains("WATCH") {
-        "watch".to_owned()
     } else if upper.contains("SPECIAL WEATHER") {
         "special weather".to_owned()
     } else {
@@ -44523,6 +45892,21 @@ fn format_utc_seconds(time: DateTime<Utc>) -> String {
     time.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+fn cap_message_type_action(message_type: Option<&str>) -> Option<&'static str> {
+    match message_type?
+        .trim()
+        .to_ascii_uppercase()
+        .replace([' ', '-'], "_")
+        .as_str()
+    {
+        "ALERT" | "NEW" => Some("NEW"),
+        "UPDATE" | "UPDATED" | "CONTINUE" | "CONTINUED" => Some("CON"),
+        "CANCEL" | "CANCELED" | "CANCELLED" | "CANCELATION" | "CANCELLATION" => Some("CAN"),
+        "EXPIRE" | "EXPIRED" => Some("EXP"),
+        _ => None,
+    }
+}
+
 fn weather_alert_label(
     _event: &str,
     event_family: &str,
@@ -44543,6 +45927,7 @@ fn weather_alert_label(
         "severe thunderstorm" => "SVR",
         "flash flood" => "FFW",
         "flood" => "FLW",
+        "fire weather" => "FIRE",
         "special marine" => "SMW",
         "snow squall" => "SQW",
         "watch" => "WATCH",
@@ -44557,25 +45942,39 @@ fn weather_alert_label(
 }
 
 fn parse_vtec_alert_identity(vtec: &str) -> Option<(String, String)> {
-    let parts = vtec.trim_matches('/').split('.').collect::<Vec<_>>();
-    if parts.len() < 6 || parts.first().copied() != Some("O") {
-        return None;
-    }
-    Some((parts.get(3)?.to_string(), parts.get(5)?.to_string()))
+    let parsed = parse_vtec_alert(vtec)?;
+    Some((parsed.phenomenon, parsed.event_tracking_number))
 }
 
-fn parse_vtec_alert_event_id(vtec: &str) -> Option<String> {
-    let parts = vtec.trim_matches('/').split('.').collect::<Vec<_>>();
-    if parts.len() < 6 || parts.first().copied() != Some("O") {
+fn vtec_alert_event_id(vtec: &ParsedWarningVtec) -> String {
+    format!(
+        "{}.{}.{}.{}",
+        vtec.office, vtec.phenomenon, vtec.significance, vtec.event_tracking_number
+    )
+}
+
+fn parse_vtec_alert(value: &str) -> Option<ParsedWarningVtec> {
+    let token = value
+        .split_whitespace()
+        .find(|token| token.trim().starts_with("/O.") && token.trim().ends_with('/'))?;
+    let parts = token
+        .trim()
+        .trim_matches('/')
+        .split('.')
+        .collect::<Vec<_>>();
+    if parts.len() < 7 || parts.first().copied() != Some("O") {
         return None;
     }
-    Some(format!(
-        "{}.{}.{}.{}",
-        parts.get(2)?,
-        parts.get(3)?,
-        parts.get(4)?,
-        parts.get(5)?
-    ))
+    let times = parts[6].split('-').collect::<Vec<_>>();
+    Some(ParsedWarningVtec {
+        action: parts[1].to_owned(),
+        office: parts[2].to_owned(),
+        phenomenon: parts[3].to_owned(),
+        significance: parts[4].to_owned(),
+        event_tracking_number: parts[5].to_owned(),
+        start_time: times.first().and_then(|value| parse_vtec_time(value)),
+        end_time: times.get(1).and_then(|value| parse_vtec_time(value)),
+    })
 }
 
 fn collect_hazard_files(path: &Path) -> Result<Vec<PathBuf>, String> {
@@ -44751,24 +46150,11 @@ struct ParsedWarningTags {
 
 fn parse_warning_vtec_line(line: &str) -> Option<ParsedWarningVtec> {
     let trimmed = line.trim();
-    if !trimmed.starts_with("/O.") || !trimmed.ends_with('/') {
+    let parsed = parse_vtec_alert(trimmed)?;
+    if parsed.significance != "W" {
         return None;
     }
-    let content = trimmed.trim_matches('/');
-    let parts = content.split('.').collect::<Vec<_>>();
-    if parts.len() < 7 || parts.first().copied() != Some("O") || parts.get(4) != Some(&"W") {
-        return None;
-    }
-    let times = parts[6].split('-').collect::<Vec<_>>();
-    Some(ParsedWarningVtec {
-        action: parts[1].to_owned(),
-        office: parts[2].to_owned(),
-        phenomenon: parts[3].to_owned(),
-        significance: parts[4].to_owned(),
-        event_tracking_number: parts[5].to_owned(),
-        start_time: times.first().and_then(|value| parse_vtec_time(value)),
-        end_time: times.get(1).and_then(|value| parse_vtec_time(value)),
-    })
+    Some(parsed)
 }
 
 fn parse_vtec_time(value: &str) -> Option<DateTime<Utc>> {
@@ -45041,6 +46427,7 @@ fn hazard_family_from_phenomenon(phenomenon: &str) -> &'static str {
         "FF" => "flash flood",
         "MA" => "special marine",
         "SQ" => "snow squall",
+        "FW" => "fire weather",
         "FL" | "FA" => "flood",
         _ => "warning",
     }
@@ -45051,13 +46438,14 @@ fn hazard_family_order(family: &str) -> u8 {
         "tornado" => 0,
         "severe thunderstorm" => 1,
         "flash flood" => 2,
-        "special marine" => 3,
-        "snow squall" => 4,
-        "flood" => 5,
-        "watch" => 6,
-        "mesoscale discussion" => 7,
-        "local storm report" => 8,
-        "special weather" => 9,
+        "flood" => 3,
+        "fire weather" => 4,
+        "special marine" => 5,
+        "snow squall" => 6,
+        "watch" => 7,
+        "mesoscale discussion" => 8,
+        "local storm report" => 9,
+        "special weather" => 10,
         _ => 9,
     }
 }
@@ -45067,6 +46455,12 @@ fn hazard_family_menu_label(family: &str) -> String {
         .iter()
         .find_map(|(known_family, label)| (*known_family == family).then_some((*label).to_owned()))
         .unwrap_or_else(|| family.to_owned())
+}
+
+fn hazard_family_has_user_filter(family: &str) -> bool {
+    HAZARD_FILTER_FAMILIES
+        .iter()
+        .any(|(known_family, _)| *known_family == family)
 }
 
 fn hazard_label(
@@ -45096,6 +46490,7 @@ fn hazard_label(
             _ => "FFW",
         },
         "flood" => "FLW",
+        "fire weather" => "FIRE",
         "special marine" => "SMW",
         "snow squall" => "SQW",
         _ => "WRN",
@@ -45139,6 +46534,7 @@ fn hazard_style_label(key: &str) -> String {
         "flood" => "Flood warning".to_owned(),
         "flood/considerable" => "Considerable flood".to_owned(),
         "flood/catastrophic" => "Catastrophic flood".to_owned(),
+        "fire-weather" => "Fire weather warning/watch".to_owned(),
         "special-marine" => "Special marine warning".to_owned(),
         "snow-squall" => "Snow squall warning".to_owned(),
         "watch" => "Watch polygons".to_owned(),
@@ -45191,8 +46587,20 @@ fn push_dashed_closed_line(
     stroke: egui::Stroke,
     dash: f32,
     gap: f32,
+    rect: egui::Rect,
 ) {
     if points.len() < 2 {
+        return;
+    }
+    if screen_polyline_has_jump(points, true, rect) {
+        for chunk in screen_polyline_chunks(points, true, rect) {
+            shapes.extend(egui::Shape::dashed_line(
+                &chunk,
+                stroke,
+                dash.max(0.5),
+                gap.max(0.5),
+            ));
+        }
         return;
     }
     let mut closed = Vec::with_capacity(points.len() + 1);
@@ -45204,6 +46612,116 @@ fn push_dashed_closed_line(
         dash.max(0.5),
         gap.max(0.5),
     ));
+}
+
+fn push_solid_closed_line(
+    shapes: &mut Vec<egui::Shape>,
+    points: &[egui::Pos2],
+    stroke: egui::Stroke,
+    rect: egui::Rect,
+) {
+    if points.len() < 2 {
+        return;
+    }
+    if screen_polyline_has_jump(points, true, rect) {
+        shapes.extend(
+            screen_polyline_chunks(points, true, rect)
+                .into_iter()
+                .filter(|chunk| chunk.len() >= 2)
+                .map(|chunk| egui::Shape::line(chunk, stroke)),
+        );
+    } else {
+        shapes.push(egui::Shape::closed_line(points.to_vec(), stroke));
+    }
+}
+
+fn push_solid_open_line(
+    shapes: &mut Vec<egui::Shape>,
+    points: &[egui::Pos2],
+    stroke: egui::Stroke,
+    rect: egui::Rect,
+) {
+    if points.len() < 2 {
+        return;
+    }
+    if screen_polyline_has_jump(points, false, rect) {
+        shapes.extend(
+            screen_polyline_chunks(points, false, rect)
+                .into_iter()
+                .filter(|chunk| chunk.len() >= 2)
+                .map(|chunk| egui::Shape::line(chunk, stroke)),
+        );
+    } else {
+        shapes.push(egui::Shape::line(points.to_vec(), stroke));
+    }
+}
+
+fn screen_polyline_segment_limit_sq(rect: egui::Rect) -> f32 {
+    let diagonal = rect.width().hypot(rect.height());
+    let limit = (diagonal * SCREEN_POLYGON_MAX_SEGMENT_DIAGONAL_FRACTION)
+        .max(SCREEN_POLYGON_MIN_MAX_SEGMENT_PX);
+    limit * limit
+}
+
+fn screen_point_valid(point: egui::Pos2) -> bool {
+    point.x.is_finite() && point.y.is_finite()
+}
+
+fn screen_polyline_has_jump(points: &[egui::Pos2], closed: bool, rect: egui::Rect) -> bool {
+    if points.iter().any(|point| !screen_point_valid(*point)) {
+        return true;
+    }
+    let limit_sq = screen_polyline_segment_limit_sq(rect);
+    if points
+        .windows(2)
+        .any(|pair| pair[0].distance_sq(pair[1]) > limit_sq)
+    {
+        return true;
+    }
+    closed
+        && points
+            .first()
+            .zip(points.last())
+            .is_some_and(|(first, last)| first.distance_sq(*last) > limit_sq)
+}
+
+fn screen_polyline_chunks(
+    points: &[egui::Pos2],
+    closed: bool,
+    rect: egui::Rect,
+) -> Vec<Vec<egui::Pos2>> {
+    let limit_sq = screen_polyline_segment_limit_sq(rect);
+    let mut chunks = Vec::<Vec<egui::Pos2>>::new();
+    let mut current = Vec::<egui::Pos2>::new();
+    for point in points
+        .iter()
+        .copied()
+        .filter(|point| screen_point_valid(*point))
+    {
+        if let Some(previous) = current.last().copied()
+            && previous.distance_sq(point) > limit_sq
+        {
+            if current.len() >= 2 {
+                chunks.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+        }
+        current.push(point);
+    }
+    if current.len() >= 2 {
+        chunks.push(current);
+    }
+    if closed
+        && chunks.len() == 1
+        && let Some(chunk) = chunks.first_mut()
+        && let (Some(first), Some(last)) = (chunk.first().copied(), chunk.last().copied())
+        && last.distance_sq(first) <= limit_sq
+        && last.distance_sq(first) > 0.01
+    {
+        chunk.push(first);
+    }
+    chunks
 }
 
 fn hazard_fill_alpha(base_alpha: u8, selected: bool) -> u8 {
@@ -45261,11 +46779,17 @@ fn hazard_points_renderable(points: &[HazardPoint]) -> bool {
 }
 
 fn sanitize_weather_alert_ring(points: Vec<HazardPoint>, event_family: &str) -> Vec<HazardPoint> {
-    if event_family != "alert" || !generic_alert_ring_needs_hull(&points) {
+    if !weather_alert_family_uses_spiky_ring_sanitize(event_family)
+        || !generic_alert_ring_needs_hull(&points)
+    {
         return points;
     }
     let hull = hazard_convex_hull(&points);
     if hull.len() >= 3 { hull } else { points }
+}
+
+fn weather_alert_family_uses_spiky_ring_sanitize(event_family: &str) -> bool {
+    matches!(event_family, "alert" | "watch" | "flood" | "fire weather")
 }
 
 fn generic_alert_ring_needs_hull(points: &[HazardPoint]) -> bool {
@@ -45476,8 +47000,19 @@ fn screen_polygon_bbox_intersects(points: &[egui::Pos2], rect: egui::Rect) -> bo
     egui::Rect::from_min_max(egui::pos2(min_x, min_y), egui::pos2(max_x, max_y)).intersects(rect)
 }
 
-fn draw_outlook_ring(painter: &egui::Painter, screen: &[egui::Pos2], stroke: egui::Stroke) {
+fn draw_outlook_ring(
+    painter: &egui::Painter,
+    screen: &[egui::Pos2],
+    stroke: egui::Stroke,
+    rect: egui::Rect,
+) {
     if screen.len() < 2 {
+        return;
+    }
+    if screen_polyline_has_jump(screen, true, rect) {
+        for chunk in screen_polyline_chunks(screen, true, rect) {
+            painter.add(egui::Shape::line(chunk, stroke));
+        }
         return;
     }
     let ring_is_closed = screen
@@ -45598,6 +47133,118 @@ fn point_in_triangle(point: egui::Pos2, a: egui::Pos2, b: egui::Pos2, c: egui::P
     let has_negative = ab < -f32::EPSILON || bc < -f32::EPSILON || ca < -f32::EPSILON;
     let has_positive = ab > f32::EPSILON || bc > f32::EPSILON || ca > f32::EPSILON;
     !(has_negative && has_positive)
+}
+
+fn screen_polygon_contains_point(points: &[egui::Pos2], point: egui::Pos2) -> bool {
+    if points.len() < 3 || !screen_point_valid(point) {
+        return false;
+    }
+    let mut inside = false;
+    let mut previous = points[points.len() - 1];
+    for current in points.iter().copied() {
+        if !screen_point_valid(current) || !screen_point_valid(previous) {
+            previous = current;
+            continue;
+        }
+        let crosses = (current.y > point.y) != (previous.y > point.y);
+        if crosses {
+            let x_at_y = (previous.x - current.x) * (point.y - current.y)
+                / (previous.y - current.y)
+                + current.x;
+            if point.x < x_at_y {
+                inside = !inside;
+            }
+        }
+        previous = current;
+    }
+    inside
+}
+
+fn hazard_visible_label_anchor(points: &[egui::Pos2], rect: egui::Rect) -> Option<egui::Pos2> {
+    if points.len() < 3 {
+        return None;
+    }
+    let label_bounds = if rect.width() > 64.0 && rect.height() > 64.0 {
+        rect.shrink(16.0)
+    } else {
+        rect
+    };
+    let centroid = polygon_screen_centroid(points);
+    if label_bounds.contains(centroid) {
+        return Some(centroid);
+    }
+    let center = label_bounds.center();
+    if screen_polygon_contains_point(points, center) {
+        return Some(center);
+    }
+
+    let mut visible_sum = egui::Vec2::ZERO;
+    let mut visible_count = 0usize;
+    for point in points.iter().copied() {
+        if label_bounds.contains(point) {
+            visible_sum += point.to_vec2();
+            visible_count += 1;
+        }
+    }
+    if visible_count > 0 {
+        let scale = 1.0 / visible_count as f32;
+        return Some(egui::pos2(visible_sum.x * scale, visible_sum.y * scale));
+    }
+
+    let expanded = label_bounds.expand(8.0);
+    let mut best = None::<(egui::Pos2, f32)>;
+    let mut previous = points[points.len() - 1];
+    for current in points.iter().copied() {
+        if screen_point_valid(previous) && screen_point_valid(current) {
+            let candidate = closest_point_on_segment(center, previous, current);
+            let distance_sq = candidate.distance_sq(center);
+            if expanded.contains(candidate)
+                && best
+                    .as_ref()
+                    .is_none_or(|(_, best_distance)| distance_sq < *best_distance)
+            {
+                best = Some((candidate, distance_sq));
+            }
+        }
+        previous = current;
+    }
+    best.map(|(point, _)| point)
+}
+
+fn closest_point_on_segment(point: egui::Pos2, start: egui::Pos2, end: egui::Pos2) -> egui::Pos2 {
+    let segment = end - start;
+    let length_sq = segment.length_sq();
+    if length_sq <= f32::EPSILON {
+        return start;
+    }
+    let t = ((point - start).dot(segment) / length_sq).clamp(0.0, 1.0);
+    start + segment * t
+}
+
+fn hazard_label_screen_rect(
+    center: egui::Pos2,
+    label: &str,
+    selected: bool,
+    font_px: f32,
+    selected_font_px: f32,
+) -> egui::Rect {
+    let font_px = if selected { selected_font_px } else { font_px };
+    let width = label.chars().count() as f32 * font_px * 0.58 + 8.0;
+    let height = font_px + 6.0;
+    egui::Rect::from_center_size(center, egui::vec2(width, height))
+}
+
+fn hazard_map_label(record: &HazardRecord) -> String {
+    if !record.event_id.contains('#') {
+        return record.label.clone();
+    }
+    if let Some((base, suffix)) = record.label.rsplit_once(' ')
+        && suffix.chars().all(|character| character.is_ascii_digit())
+        && !base.trim().is_empty()
+    {
+        return base.to_owned();
+    }
+    record.label.clone()
 }
 
 fn polygon_screen_centroid(points: &[egui::Pos2]) -> egui::Pos2 {
@@ -46708,39 +48355,60 @@ fn dir_list_volume_entries_newest_first(listing: &str) -> Vec<String> {
 }
 
 fn dir_list_volume_entry_records_newest_first(listing: &str) -> Vec<DirListVolumeEntry> {
-    const METADATA_EXTENSIONS: &[&str] = &[
-        "json", "cfg", "txt", "html", "htm", "xml", "css", "js", "ini", "md", "php", "gis",
-    ];
     let mut entries: Vec<DirListVolumeEntry> = listing
         .lines()
         .filter_map(|line| {
             let mut parts = line.split_whitespace();
             let first = parts.next()?;
             let name = parts.last().unwrap_or(first);
-            if name.is_empty() || name.ends_with('/') {
-                return None;
-            }
-            let extension = name
-                .rsplit_once('.')
-                .map(|(_, extension)| extension.to_ascii_lowercase());
-            if matches!(extension, Some(e) if METADATA_EXTENSIONS.contains(&e.as_str())) {
-                return None;
-            }
             let signature = if first != name && first.chars().all(|ch| ch.is_ascii_digit()) {
                 format!("{first} {name}")
             } else {
                 name.to_owned()
             };
-            Some(DirListVolumeEntry {
-                name: name.to_owned(),
-                signature,
-            })
+            volume_entry_from_name(name, signature)
         })
         .collect();
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     entries.dedup();
     entries.reverse();
     entries
+}
+
+fn autoindex_volume_listing(html: &str) -> String {
+    data_source::international::listing::parse_autoindex(html)
+        .into_iter()
+        .filter(|entry| !entry.is_dir)
+        .filter_map(|entry| volume_entry_from_name(&entry.name, entry.name.clone()))
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn volume_entry_from_name(name: &str, signature: String) -> Option<DirListVolumeEntry> {
+    const METADATA_EXTENSIONS: &[&str] = &[
+        "json", "cfg", "txt", "html", "htm", "xml", "css", "js", "ini", "md", "php", "gis",
+    ];
+    if name.is_empty() || name.ends_with('/') {
+        return None;
+    }
+    let lower_name = name.to_ascii_lowercase();
+    if matches!(
+        lower_name.as_str(),
+        "dir.list" | "grlevel2.cfg" | "radars.gis"
+    ) {
+        return None;
+    }
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    if matches!(extension, Some(e) if METADATA_EXTENSIONS.contains(&e.as_str())) {
+        return None;
+    }
+    Some(DirListVolumeEntry {
+        name: name.to_owned(),
+        signature,
+    })
 }
 
 fn gr2a_listing_with_prefix(base: &str) -> Result<(String, String), String> {
@@ -46750,17 +48418,45 @@ fn gr2a_listing_with_prefix(base: &str) -> Result<(String, String), String> {
             Ok((listing.clone(), String::new()))
         }
         _ => {
+            let root_index = data_source::fetch_text(base).ok().map(|html| {
+                let listing = autoindex_volume_listing(&html);
+                (!dir_list_volume_entries_newest_first(&listing).is_empty()).then_some(listing)
+            });
+            if let Some(Some(listing)) = root_index {
+                return Ok((listing, String::new()));
+            }
+
             let sites = data_source::fetch_text(&format!("{base}/grlevel2.cfg"))
                 .map(|cfg| grlevel2_cfg_sites(&cfg))
                 .unwrap_or_default();
             match sites.as_slice() {
                 [site] => {
-                    let listing = data_source::fetch_text(&format!("{base}/{site}/dir.list"))
-                        .map_err(|err| format!("{site}/dir.list: {err}"))?;
-                    Ok((listing, format!("{site}/")))
+                    let site_base = format!("{base}/{site}");
+                    match data_source::fetch_text(&format!("{site_base}/dir.list")) {
+                        Ok(listing)
+                            if !dir_list_volume_entries_newest_first(&listing).is_empty() =>
+                        {
+                            Ok((listing, format!("{site}/")))
+                        }
+                        dir_list_result => {
+                            let index_listing = data_source::fetch_text(&site_base)
+                                .ok()
+                                .map(|html| autoindex_volume_listing(&html))
+                                .filter(|listing| {
+                                    !dir_list_volume_entries_newest_first(listing).is_empty()
+                                });
+                            if let Some(listing) = index_listing {
+                                return Ok((listing, format!("{site}/")));
+                            }
+                            Err(match dir_list_result {
+                                Ok(_) => format!("{site}/dir.list: no data files listed"),
+                                Err(err) => format!("{site}/dir.list: {err}"),
+                            })
+                        }
+                    }
                 }
                 [] => Err(match root_listing {
-                    Ok(_) => "dir.list: no data files listed".to_owned(),
+                    Ok(_) => "dir.list/directory index: no data files listed".to_owned(),
                     Err(err) => format!("dir.list: {err}"),
                 }),
                 multiple => Err(format!(
@@ -47474,6 +49170,36 @@ fn poll_urls_match(left: &str, right: &str) -> bool {
     normalized_poll_url(left).eq_ignore_ascii_case(&normalized_poll_url(right))
 }
 
+fn apply_community_feed_metadata(volume: &mut radar_core::RadarVolume, poll_url: &str) {
+    let poll_url = normalized_poll_url(poll_url);
+    let Some(feed) = data_source::community_feeds::community_feeds()
+        .iter()
+        .find(|feed| poll_urls_match(&poll_url, feed.poll_url))
+    else {
+        return;
+    };
+
+    if volume.site.id.trim().is_empty() {
+        volume.site.id = feed.id.to_owned();
+    }
+    if volume
+        .site
+        .name
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        volume.site.name = Some(feed.label.to_owned());
+    }
+    if volume.site.latitude_deg.is_none() {
+        volume.site.latitude_deg = Some(feed.latitude_deg);
+    }
+    if volume.site.longitude_deg.is_none() {
+        volume.site.longitude_deg = Some(feed.longitude_deg);
+    }
+}
+
 fn parse_coordinated_site_ids(input: &str) -> Vec<String> {
     let mut seen = BTreeSet::new();
     input
@@ -47790,6 +49516,10 @@ fn sat_map_request_matches(
     request
         .as_ref()
         .is_some_and(|(pending_key, pending_hhmm)| pending_key == key && *pending_hhmm == hhmm)
+}
+
+fn satellite_run_key_is_other_source(key: &rw_ui::SatRunKey) -> bool {
+    !matches!(key.model.as_str(), "g16" | "g17" | "g18" | "g19")
 }
 
 fn sat_run_family(run_name: &str) -> String {
@@ -48265,11 +49995,180 @@ fn sat_player_frame_within_texture_limit(mut frame: rw_ui::SatFrameImage) -> Sat
         ((old_size[0] as f32 * scale).round() as usize).clamp(1, MAX_SAT_PLAYER_TEXTURE_DIM),
         ((old_size[1] as f32 * scale).round() as usize).clamp(1, MAX_SAT_PLAYER_TEXTURE_DIM),
     ];
-    frame.image = resize_color_image_nearest(&frame.image, new_size);
+    frame.image = resize_color_image_linear(&frame.image, new_size);
     (frame, Some((old_size, new_size)))
 }
 
-fn resize_color_image_nearest(image: &egui::ColorImage, new_size: [usize; 2]) -> egui::ColorImage {
+struct SatMapSampleCtx<'a> {
+    image: &'a egui::ColorImage,
+    grid: &'a rw_store::grid::GridFile,
+    nx: usize,
+    ny: usize,
+    flip_rows: bool,
+}
+
+fn sample_sat_map_color(
+    ctx: &SatMapSampleCtx<'_>,
+    nearest_index: usize,
+    target_lat: f32,
+    target_lon: f32,
+) -> egui::Color32 {
+    let image = ctx.image;
+    let grid = ctx.grid;
+    let nx = ctx.nx;
+    let ny = ctx.ny;
+    let flip_rows = ctx.flip_rows;
+    if nx < 2
+        || ny < 2
+        || nearest_index >= nx.saturating_mul(ny)
+        || image.size != [nx, ny]
+        || grid.nx != nx
+        || grid.ny != ny
+        || grid.lat.len() != nx.saturating_mul(ny)
+        || grid.lon.len() != nx.saturating_mul(ny)
+        || image.pixels.len() != nx.saturating_mul(ny)
+    {
+        return nearest_sat_map_color(image, nearest_index, nx, ny, flip_rows);
+    }
+    let row = nearest_index / nx;
+    let col = nearest_index % nx;
+    if let Some(color) = sample_sat_map_candidate_cells(ctx, row, col, target_lat, target_lon, 1) {
+        return color;
+    }
+    if let Some(color) = sample_sat_map_candidate_cells(ctx, row, col, target_lat, target_lon, 3) {
+        return color;
+    }
+    nearest_sat_map_color(image, nearest_index, nx, ny, flip_rows)
+}
+
+fn sample_sat_map_candidate_cells(
+    ctx: &SatMapSampleCtx<'_>,
+    row: usize,
+    col: usize,
+    target_lat: f32,
+    target_lon: f32,
+    radius: usize,
+) -> Option<egui::Color32> {
+    let max_y0 = ctx.ny.saturating_sub(2);
+    let max_x0 = ctx.nx.saturating_sub(2);
+    let y_min = row.saturating_sub(radius).min(max_y0);
+    let y_max = row.saturating_add(radius).min(max_y0);
+    let x_min = col.saturating_sub(radius).min(max_x0);
+    let x_max = col.saturating_add(radius).min(max_x0);
+    for y0 in y_min..=y_max {
+        for x0 in x_min..=x_max {
+            if let Some(color) = sample_sat_map_cell(ctx, x0, y0, target_lat, target_lon) {
+                return Some(color);
+            }
+        }
+    }
+    None
+}
+
+fn sample_sat_map_cell(
+    ctx: &SatMapSampleCtx<'_>,
+    x0: usize,
+    y0: usize,
+    target_lat: f32,
+    target_lon: f32,
+) -> Option<egui::Color32> {
+    let image = ctx.image;
+    let grid = ctx.grid;
+    let nx = ctx.nx;
+    let ny = ctx.ny;
+    let flip_rows = ctx.flip_rows;
+    let i00 = y0 * nx + x0;
+    let i10 = i00 + 1;
+    let i01 = i00 + nx;
+    let i11 = i01 + 1;
+    let target_lon = f64::from(target_lon);
+    let target_lat = f64::from(target_lat);
+    let corners = [
+        (
+            model_layer::unwrap_lon_near(f64::from(*grid.lon.get(i00)?), target_lon),
+            f64::from(*grid.lat.get(i00)?),
+        ),
+        (
+            model_layer::unwrap_lon_near(f64::from(*grid.lon.get(i10)?), target_lon),
+            f64::from(*grid.lat.get(i10)?),
+        ),
+        (
+            model_layer::unwrap_lon_near(f64::from(*grid.lon.get(i01)?), target_lon),
+            f64::from(*grid.lat.get(i01)?),
+        ),
+        (
+            model_layer::unwrap_lon_near(f64::from(*grid.lon.get(i11)?), target_lon),
+            f64::from(*grid.lat.get(i11)?),
+        ),
+    ];
+    let (u, v) = model_layer::solve_bilinear_coords(corners, target_lon, target_lat)?;
+    if !((-0.08..=1.08).contains(&u) && (-0.08..=1.08).contains(&v)) {
+        return None;
+    }
+    let u = u.clamp(0.0, 1.0) as f32;
+    let v = v.clamp(0.0, 1.0) as f32;
+    let c00 = sat_map_grid_color(image, i00, nx, ny, flip_rows)?;
+    let c10 = sat_map_grid_color(image, i10, nx, ny, flip_rows)?;
+    let c01 = sat_map_grid_color(image, i01, nx, ny, flip_rows)?;
+    let c11 = sat_map_grid_color(image, i11, nx, ny, flip_rows)?;
+    Some(bilinear_color(c00, c10, c01, c11, u, v))
+}
+
+fn nearest_sat_map_color(
+    image: &egui::ColorImage,
+    index: usize,
+    nx: usize,
+    ny: usize,
+    flip_rows: bool,
+) -> egui::Color32 {
+    sat_map_grid_color(image, index, nx, ny, flip_rows).unwrap_or(egui::Color32::TRANSPARENT)
+}
+
+fn sat_map_grid_color(
+    image: &egui::ColorImage,
+    index: usize,
+    nx: usize,
+    ny: usize,
+    flip_rows: bool,
+) -> Option<egui::Color32> {
+    let row = index / nx;
+    let col = index % nx;
+    if row >= ny || col >= nx {
+        return None;
+    }
+    let image_row = if flip_rows { ny - 1 - row } else { row };
+    image.pixels.get(image_row * nx + col).copied()
+}
+
+fn bilinear_color(
+    c00: egui::Color32,
+    c10: egui::Color32,
+    c01: egui::Color32,
+    c11: egui::Color32,
+    u: f32,
+    v: f32,
+) -> egui::Color32 {
+    let weights = [(1.0 - u) * (1.0 - v), u * (1.0 - v), (1.0 - u) * v, u * v];
+    let colors = [c00, c10, c01, c11];
+    let mut r = 0.0;
+    let mut g = 0.0;
+    let mut b = 0.0;
+    let mut a = 0.0;
+    for (color, weight) in colors.into_iter().zip(weights) {
+        r += f32::from(color.r()) * weight;
+        g += f32::from(color.g()) * weight;
+        b += f32::from(color.b()) * weight;
+        a += f32::from(color.a()) * weight;
+    }
+    egui::Color32::from_rgba_unmultiplied(
+        r.round().clamp(0.0, 255.0) as u8,
+        g.round().clamp(0.0, 255.0) as u8,
+        b.round().clamp(0.0, 255.0) as u8,
+        a.round().clamp(0.0, 255.0) as u8,
+    )
+}
+
+fn resize_color_image_linear(image: &egui::ColorImage, new_size: [usize; 2]) -> egui::ColorImage {
     let old_size = image.size;
     if old_size == new_size {
         return image.clone();
@@ -48281,11 +50180,31 @@ fn resize_color_image_nearest(image: &egui::ColorImage, new_size: [usize; 2]) ->
     }
     let mut pixels = Vec::with_capacity(new_w * new_h);
     for y in 0..new_h {
-        let src_y = (y * old_h / new_h).min(old_h - 1);
-        let row = src_y * old_w;
+        let src_y = if new_h <= 1 {
+            0.0
+        } else {
+            y as f32 * (old_h - 1) as f32 / (new_h - 1) as f32
+        };
+        let y0 = src_y.floor() as usize;
+        let y1 = (y0 + 1).min(old_h - 1);
+        let v = src_y - y0 as f32;
         for x in 0..new_w {
-            let src_x = (x * old_w / new_w).min(old_w - 1);
-            pixels.push(image.pixels[row + src_x]);
+            let src_x = if new_w <= 1 {
+                0.0
+            } else {
+                x as f32 * (old_w - 1) as f32 / (new_w - 1) as f32
+            };
+            let x0 = src_x.floor() as usize;
+            let x1 = (x0 + 1).min(old_w - 1);
+            let u = src_x - x0 as f32;
+            pixels.push(bilinear_color(
+                image.pixels[y0 * old_w + x0],
+                image.pixels[y0 * old_w + x1],
+                image.pixels[y1 * old_w + x0],
+                image.pixels[y1 * old_w + x1],
+                u,
+                v,
+            ));
         }
     }
     egui::ColorImage::new([new_w, new_h], pixels)
@@ -48584,6 +50503,81 @@ mod tests {
     }
 
     #[test]
+    fn satellite_map_sampler_interpolates_source_pixels() {
+        let image = egui::ColorImage::new(
+            [2, 2],
+            vec![
+                egui::Color32::from_rgb(0, 0, 0),
+                egui::Color32::from_rgb(100, 0, 0),
+                egui::Color32::from_rgb(200, 0, 0),
+                egui::Color32::from_rgb(252, 0, 0),
+            ],
+        );
+        let grid = rw_store::grid::GridFile {
+            nx: 2,
+            ny: 2,
+            lat: vec![40.0, 40.0, 41.0, 41.0],
+            lon: vec![-100.0, -99.0, -100.0, -99.0],
+            projection: None,
+            hash: "sat-test".to_owned(),
+        };
+
+        let sample_ctx = SatMapSampleCtx {
+            image: &image,
+            grid: &grid,
+            nx: 2,
+            ny: 2,
+            flip_rows: false,
+        };
+        let color = sample_sat_map_color(&sample_ctx, 0, 40.5, -99.5);
+
+        assert!(
+            (i16::from(color.r()) - 138).abs() <= 1,
+            "expected midpoint red channel, got {color:?}"
+        );
+    }
+
+    #[test]
+    fn satellite_map_sampler_searches_nearby_cells_when_lut_neighbor_misses() {
+        let mut pixels = vec![egui::Color32::BLACK; 16];
+        for index in [10, 11, 14, 15] {
+            pixels[index] = egui::Color32::from_rgb(120, 0, 0);
+        }
+        let image = egui::ColorImage::new([4, 4], pixels);
+        let mut lat = Vec::new();
+        let mut lon = Vec::new();
+        for y in 0..4 {
+            for x in 0..4 {
+                lat.push(y as f32);
+                lon.push(x as f32);
+            }
+        }
+        let grid = rw_store::grid::GridFile {
+            nx: 4,
+            ny: 4,
+            lat,
+            lon,
+            projection: None,
+            hash: "sat-test".to_owned(),
+        };
+
+        let sample_ctx = SatMapSampleCtx {
+            image: &image,
+            grid: &grid,
+            nx: 4,
+            ny: 4,
+            flip_rows: false,
+        };
+        let color = sample_sat_map_color(&sample_ctx, 0, 2.5, 2.5);
+
+        assert_eq!(
+            color.r(),
+            120,
+            "should find the containing source cell instead of falling back to the wrong nearest pixel"
+        );
+    }
+
+    #[test]
     fn security_updates_copy_explains_unsigned_builds() {
         assert!(SECURITY_UNSIGNED_BUILD_TEXT.contains("Windows Defender"));
         assert!(SECURITY_UNSIGNED_BUILD_TEXT.contains("unsigned"));
@@ -48757,6 +50751,7 @@ mod tests {
             ("flood", None, (76, 190, 124)),
             ("flood", Some("CONSIDERABLE"), (50, 205, 160)),
             ("flood", Some("CATASTROPHIC"), (24, 160, 130)),
+            ("fire weather", None, (255, 126, 46)),
             ("special marine", None, (70, 190, 238)),
             ("snow squall", None, (170, 210, 255)),
             ("watch", None, (235, 92, 245)),
@@ -48870,7 +50865,20 @@ mod tests {
             .expect("si table parses");
         assert_eq!(
             table_display_unit(&si, &product, units::Units::Imperial),
-            ("m/s", 1.0)
+            ("mph", color_tables::unit_scale_to_internal("mph"))
+        );
+        assert_eq!(
+            table_display_unit(&si, &product, units::Units::Metric),
+            ("km/h", color_tables::unit_scale_to_internal("km/h"))
+        );
+        let kmh = ColorTable::parse_gr_pal(
+            "KMH VEL",
+            "Product: BV\nUnits: km/h\nColor: -120 1 2 3\nColor: 120 4 5 6\n",
+        )
+        .expect("km/h table parses");
+        assert_eq!(
+            table_display_unit(&kmh, &product, units::Units::Metric),
+            ("km/h", color_tables::unit_scale_to_internal("km/h"))
         );
         // Non-m/s products never rescale off the table's declaration.
         let dbz = DisplayProduct::Moment(MomentType::Reflectivity);
@@ -48930,8 +50938,29 @@ mod tests {
         assert_eq!(product_units(&product), "m");
         assert_eq!(label, "kft");
         assert_eq!(scale, METERS_PER_KFT);
+        assert_eq!(
+            table_display_unit(table, &product, units::Units::Metric),
+            ("km", 1000.0)
+        );
         assert_eq!(table.stops().first().map(|stop| stop.value), Some(1_500.0));
         assert!(((18_288.0 / scale) - 60.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn hail_size_display_units_follow_app_unit_preference() {
+        let table_set = ColorTableSet::default();
+        let product = DisplayProduct::Derived(DerivedProduct::Mehs);
+        let table = table_set.for_family(product.color_family());
+
+        assert_eq!(product_units(&product), "mm");
+        assert_eq!(
+            table_display_unit(table, &product, units::Units::Metric),
+            ("mm", 1.0)
+        );
+        assert_eq!(
+            table_display_unit(table, &product, units::Units::Imperial),
+            ("in", 25.4)
+        );
     }
 
     /// User tables resolve by name even when their Product: header put
@@ -52570,6 +54599,26 @@ mod tests {
     }
 
     #[test]
+    fn mping_declutter_priority_keeps_higher_impact_newer_reports() {
+        let now = Utc.timestamp_opt(1_900_000_000, 0).single().unwrap();
+        let report = |category: &str, minutes_old: i64| mping::MpingReport {
+            id: category.to_owned(),
+            lat: 35.0,
+            lon: -97.0,
+            obtime: now - chrono::Duration::minutes(minutes_old),
+            category: category.to_owned(),
+            description: category.to_owned(),
+            description_id: 1,
+        };
+        let old_hail = report("Hail", 60);
+        let new_rain = report("Rain/Snow", 1);
+        let new_hail = report("Hail", 1);
+
+        assert!(mping_draw_priority(&old_hail, now) > mping_draw_priority(&new_rain, now));
+        assert!(mping_draw_priority(&new_hail, now) > mping_draw_priority(&old_hail, now));
+    }
+
+    #[test]
     fn auto_warning_sync_predicate_tracks_visible_loaded_loop_coverage() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.unified_player.auto_sync_warnings = true;
@@ -55637,7 +57686,7 @@ mod tests {
     }
 
     #[test]
-    fn satellite_run_scan_is_filtered_to_current_spec_family() {
+    fn satellite_run_scan_keeps_current_goes_spec_and_other_sources() {
         let app = test_viewer_app_with_hazards(Vec::new());
         let runs = vec![
             test_sat_run("g19", "conus_c13_20260615", &[1750]),
@@ -55647,9 +57696,22 @@ mod tests {
 
         let filtered = app.satellite_runs_for_current_spec(runs);
 
-        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].key.model, "g19");
         assert_eq!(filtered[0].key.run, "conus_c13_20260615");
+        assert_eq!(filtered[1].key.model, "h9");
+        assert_eq!(filtered[1].key.run, "fulldisk_c13_20260615");
+    }
+
+    #[test]
+    fn other_satellite_source_frame_matches_without_goes_spec_filter() {
+        let app = test_viewer_app_with_hazards(Vec::new());
+        let key = rw_ui::SatRunKey {
+            model: "h9".to_owned(),
+            run: "fulldisk_c13_20260615".to_owned(),
+        };
+
+        assert!(app.satellite_run_key_matches_current_spec(&key));
     }
 
     #[test]
@@ -55785,11 +57847,33 @@ mod tests {
                 colormap: rw_ui::colormap::VIRIDIS,
                 opacity: 1.0,
                 visible: true,
+                custom_color_family: None,
                 generation: u64::from(hour) + 1,
             },
             texture: None,
             render_rx: None,
         }
+    }
+
+    #[test]
+    fn radar_composite_model_layers_default_to_reflectivity_color_family() {
+        let mut mrms = test_model_field("mrms", "latest", 0).as_ref().clone();
+        mrms.key.var = "mrms_reflectivity_lowest_altitude".to_owned();
+        mrms.units = "dBZ".to_owned();
+        let mut opera = test_model_field("eumetnet-opera", "latest", 0)
+            .as_ref()
+            .clone();
+        opera.key.var = "eumetnet_opera_dbzh_composite".to_owned();
+        opera.units = "dBZ".to_owned();
+
+        assert_eq!(
+            default_model_layer_color_family(&mrms),
+            Some(ColorTableFamily::Reflectivity)
+        );
+        assert_eq!(
+            default_model_layer_color_family(&opera),
+            Some(ColorTableFamily::Reflectivity)
+        );
     }
 
     #[test]
@@ -56516,6 +58600,25 @@ mod tests {
             "http://example.com/fwlx"
         ));
         assert_eq!(poll_url_name("http://example.com/poll/ARMOR/"), "ARMOR");
+    }
+
+    #[test]
+    fn community_feed_metadata_fills_blank_decoded_site() {
+        let feed = data_source::community_feeds::community_feeds()
+            .iter()
+            .find(|feed| feed.id == "KBPP")
+            .expect("KBPP feed exists");
+        let mut volume = radar_core::RadarVolume::new(
+            radar_core::RadarSite::new(""),
+            DateTime::<Utc>::UNIX_EPOCH,
+        );
+
+        apply_community_feed_metadata(&mut volume, feed.poll_url);
+
+        assert_eq!(volume.site.id, "KBPP");
+        assert_eq!(volume.site.name.as_deref(), Some("Bowman ARB"));
+        assert_eq!(volume.site.latitude_deg, Some(feed.latitude_deg));
+        assert_eq!(volume.site.longitude_deg, Some(feed.longitude_deg));
     }
 
     #[test]
@@ -57510,6 +59613,38 @@ mod tests {
         assert!(!volume.cuts.is_empty());
     }
 
+    #[test]
+    #[ignore = "network: hits the live North Dakota SWC Level II host"]
+    fn community_feed_live_poll_roundtrip_swc_kbpp() {
+        let feed = data_source::community_feeds::community_feeds()
+            .iter()
+            .find(|feed| feed.id == "KBPP")
+            .expect("KBPP in the community table");
+        let listing =
+            data_source::fetch_text(&format!("{}/dir.list", feed.poll_url)).expect("live dir.list");
+        let newest = newest_dir_list_entry(&listing).expect("non-empty dir.list");
+        println!("newest {} entry: {newest}", feed.id);
+        let raw = data_source::fetch_volume_bytes(&format!("{}/{newest}", feed.poll_url))
+            .expect("volume download");
+        let mut volume = nexrad_io::decode_supported_volume_bytes(&raw).expect("decode");
+        apply_community_feed_metadata(&mut volume, feed.poll_url);
+        println!(
+            "decoded {} at {}: {} cuts, {} radials",
+            volume.site.id,
+            volume.volume_time,
+            volume.cuts.len(),
+            volume.metadata.decoded_radial_count
+        );
+        assert_eq!(volume.site.id, "KBPP");
+        assert!(volume.site.latitude_deg.is_some());
+        assert!(volume.site.longitude_deg.is_some());
+        assert!(
+            !volume.cuts.is_empty(),
+            "legacy type 1 SWC feed should decode at least one cut"
+        );
+        assert!(volume.metadata.decoded_radial_count > 0);
+    }
+
     /// Live smoke of the full international poll pipeline (network):
     /// catalog -> plan -> download -> decode -> identity dedupe. Excluded
     /// from gates; run explicitly with
@@ -57628,6 +59763,27 @@ mod tests {
         assert_eq!(
             dir_list_volume_entries_newest_first("2389 KCRI_20260622_082432.bz2\n"),
             vec!["KCRI_20260622_082432.bz2".to_owned()]
+        );
+    }
+
+    #[test]
+    fn apache_autoindex_volume_listing_extracts_pollable_files() {
+        let html = r#"
+            <html><body><ul>
+            <li><a href="/raw/"> Parent Directory</a></li>
+            <li><a href="dir.list"> dir.list</a></li>
+            <li><a href="KXWA20260627_201954_V06.ar2v"> KXWA20260627_201954_V06.ar2v</a></li>
+            <li><a href="KXWA20260627_202427_V06.ar2v"> KXWA20260627_202427_V06.ar2v</a></li>
+            <li><a href="nested/"> nested/</a></li>
+            </ul></body></html>
+        "#;
+
+        assert_eq!(
+            dir_list_volume_entries_newest_first(&autoindex_volume_listing(html)),
+            vec![
+                "KXWA20260627_202427_V06.ar2v".to_owned(),
+                "KXWA20260627_201954_V06.ar2v".to_owned(),
+            ]
         );
     }
 
@@ -59129,6 +61285,226 @@ mod tests {
     }
 
     #[test]
+    fn weather_gov_alert_parser_uses_affected_zone_geometry_for_watch_alerts() {
+        let feature: WeatherAlertFeature = serde_json::from_value(serde_json::json!({
+            "id": "https://api.weather.gov/alerts/urn:oid:watch-zone",
+            "geometry": null,
+            "properties": {
+                "id": "urn:oid:watch-zone",
+                "event": "Severe Thunderstorm Watch",
+                "headline": "Severe Thunderstorm Watch issued June 27 by NWS Storm Prediction Center",
+                "areaDesc": "Test County",
+                "senderName": "NWS Storm Prediction Center",
+                "severity": "Severe",
+                "certainty": "Likely",
+                "urgency": "Expected",
+                "onset": "2026-06-27T18:00:00+00:00",
+                "expires": "2026-06-28T01:00:00+00:00",
+                "affectedZones": ["https://api.weather.gov/zones/forecast/TEST001"],
+                "parameters": {
+                    "VTEC": ["/O.NEW.KWNS.SV.A.0123.260627T1800Z-260628T0100Z/"]
+                }
+            }
+        }))
+        .expect("watch alert feature");
+        let mut zone_geometries = HashMap::new();
+        zone_geometries.insert(
+            "https://api.weather.gov/zones/forecast/TEST001".to_owned(),
+            vec![square_hazard_points(-98.0, 34.0, -97.0, 35.0)],
+        );
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 27, 19, 0, 0)
+            .single()
+            .expect("valid query time");
+
+        let records =
+            parse_weather_alert_feature_with_zones(&feature, query_time, &zone_geometries)
+                .expect("weather alert feature parse");
+
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.event_family, "watch");
+        assert_eq!(record.label, "SVR 0123");
+        assert_eq!(record.event_id, "KWNS.SV.A.0123");
+        assert_eq!(record.lifecycle_status.as_deref(), Some("Active"));
+        assert!(hazard_polygon_contains_point(
+            &record.points,
+            HazardPoint {
+                lon: -97.5,
+                lat: 34.5
+            }
+        ));
+    }
+
+    #[test]
+    fn weather_gov_alert_parser_classifies_fire_weather_alerts() {
+        let feature: WeatherAlertFeature = serde_json::from_value(serde_json::json!({
+            "id": "https://api.weather.gov/alerts/urn:oid:red-flag",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [-104.0, 36.0],
+                    [-103.0, 36.0],
+                    [-103.0, 37.0],
+                    [-104.0, 36.0]
+                ]]
+            },
+            "properties": {
+                "id": "urn:oid:red-flag",
+                "event": "Red Flag Warning",
+                "headline": "Red Flag Warning issued June 27",
+                "senderName": "NWS Amarillo TX",
+                "onset": "2026-06-27T18:00:00+00:00",
+                "expires": "2026-06-28T01:00:00+00:00",
+                "parameters": {
+                    "VTEC": ["/O.NEW.KAMA.FW.W.0007.260627T1800Z-260628T0100Z/"]
+                }
+            }
+        }))
+        .expect("fire weather alert feature");
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 27, 19, 0, 0)
+            .single()
+            .expect("valid query time");
+
+        let records =
+            parse_weather_alert_feature(&feature, query_time).expect("weather alert feature parse");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event_family, "fire weather");
+        assert_eq!(records[0].label, "FIRE 0007");
+    }
+
+    #[test]
+    fn weather_gov_alert_parser_marks_can_vtec_as_canceled() {
+        let feature: WeatherAlertFeature = serde_json::from_value(serde_json::json!({
+            "id": "https://api.weather.gov/alerts/urn:oid:flood-watch-cancel",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [-87.0, 39.0],
+                    [-86.0, 39.0],
+                    [-86.0, 40.0],
+                    [-87.0, 40.0],
+                    [-87.0, 39.0]
+                ]]
+            },
+            "properties": {
+                "id": "urn:oid:flood-watch-cancel",
+                "event": "Flood Watch",
+                "headline": "The Flood Watch has been cancelled.",
+                "description": "The Flood Watch has been cancelled and is no longer in effect.",
+                "senderName": "NWS Indianapolis IN",
+                "messageType": "Cancel",
+                "onset": "2026-06-27T16:00:00+00:00",
+                "expires": "2026-06-28T01:00:00+00:00",
+                "parameters": {
+                    "VTEC": ["/O.CAN.KIND.FA.A.0009.260627T1600Z-260628T0100Z/"]
+                }
+            }
+        }))
+        .expect("canceled flood watch feature");
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 27, 18, 0, 0)
+            .single()
+            .expect("valid query time");
+
+        let records =
+            parse_weather_alert_feature(&feature, query_time).expect("weather alert feature parse");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event_id, "KIND.FA.A.0009");
+        assert_eq!(records[0].action, "CAN");
+        assert_eq!(records[0].lifecycle_status.as_deref(), Some("Canceled"));
+
+        let overlay = build_live_hazard_overlay(
+            "NWS active alerts".to_owned(),
+            query_time,
+            1,
+            1,
+            0,
+            Instant::now(),
+            records,
+        );
+        assert!(overlay.records.is_empty());
+    }
+
+    #[test]
+    fn active_alert_cancel_tombstone_drops_matching_product_record() {
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 27, 18, 0, 0)
+            .single()
+            .expect("valid query time");
+        let mut canceled = test_hazard_record(
+            "KIND.FA.A.0009",
+            "FLW 0009",
+            "watch",
+            square_hazard_points(-87.0, 39.0, -86.0, 40.0),
+        );
+        canceled.action = "CAN".to_owned();
+        canceled.lifecycle_status = Some("Canceled".to_owned());
+        canceled.source_url = Some("https://api.weather.gov/alerts/urn:oid:cancel".to_owned());
+        let mut stale_product = test_hazard_record(
+            "KIND.FA.A.0009",
+            "FLW 0009",
+            "watch",
+            square_hazard_points(-88.0, 39.0, -87.0, 40.0),
+        );
+        stale_product.action = "CON".to_owned();
+        stale_product.lifecycle_status = Some("Active".to_owned());
+
+        let overlay = build_live_hazard_overlay(
+            "NWS active alerts".to_owned(),
+            query_time,
+            2,
+            2,
+            0,
+            Instant::now(),
+            vec![stale_product, canceled],
+        );
+
+        assert!(overlay.records.is_empty());
+    }
+
+    #[test]
+    fn weather_gov_alert_parser_uses_cap_message_type_cancel_without_vtec() {
+        let feature: WeatherAlertFeature = serde_json::from_value(serde_json::json!({
+            "id": "https://api.weather.gov/alerts/urn:oid:cancel-message-type",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [-97.0, 35.0],
+                    [-96.0, 35.0],
+                    [-96.0, 36.0],
+                    [-97.0, 36.0],
+                    [-97.0, 35.0]
+                ]]
+            },
+            "properties": {
+                "id": "urn:oid:cancel-message-type",
+                "event": "Flood Watch",
+                "headline": "The Flood Watch has been cancelled.",
+                "senderName": "NWS Test",
+                "messageType": "Cancel",
+                "onset": "2026-06-27T16:00:00+00:00",
+                "expires": "2026-06-28T01:00:00+00:00",
+                "parameters": {}
+            }
+        }))
+        .expect("cancel message-type feature");
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 27, 18, 0, 0)
+            .single()
+            .expect("valid query time");
+
+        let records =
+            parse_weather_alert_feature(&feature, query_time).expect("weather alert feature parse");
+
+        assert_eq!(records[0].action, "CAN");
+        assert_eq!(records[0].lifecycle_status.as_deref(), Some("Canceled"));
+    }
+
+    #[test]
     fn weather_gov_alert_parser_sanitizes_spiky_generic_alert_geometry() {
         let feature: WeatherAlertFeature = serde_json::from_value(serde_json::json!({
             "id": "https://api.weather.gov/alerts/urn:oid:marine-spike",
@@ -59185,6 +61561,62 @@ mod tests {
         assert_eq!(record.bbox, hazard_bbox(&record.points));
         assert!(hazard_points_renderable(&record.points));
         assert!(!generic_alert_ring_needs_hull(&record.points));
+    }
+
+    #[test]
+    fn weather_gov_alert_parser_sanitizes_spiky_watch_geometry() {
+        let feature: WeatherAlertFeature = serde_json::from_value(serde_json::json!({
+            "id": "https://api.weather.gov/alerts/urn:oid:watch-spike",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [-97.39, 26.90],
+                    [-97.36, 27.24],
+                    [-96.95, 26.79],
+                    [-97.30, 26.63],
+                    [-97.38, 26.89],
+                    [-97.31, 26.65],
+                    [-97.35, 26.70],
+                    [-97.32, 26.62],
+                    [-97.33, 26.62],
+                    [-97.33, 26.63],
+                    [-97.44, 26.59],
+                    [-97.58, 26.85],
+                    [-97.56, 26.84],
+                    [-97.57, 26.98],
+                    [-97.42, 27.25],
+                    [-97.39, 26.90]
+                ]]
+            },
+            "properties": {
+                "id": "urn:oid:watch-spike",
+                "event": "Flood Watch",
+                "headline": "Flood Watch issued June 27",
+                "senderName": "NWS Test",
+                "severity": "Moderate",
+                "certainty": "Likely",
+                "urgency": "Expected",
+                "onset": "2026-06-27T18:00:00+00:00",
+                "expires": "2026-06-28T01:00:00+00:00",
+                "parameters": {
+                    "VTEC": ["/O.NEW.KBRO.FA.A.0009.260627T1800Z-260628T0100Z/"]
+                }
+            }
+        }))
+        .expect("spiky watch feature");
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 27, 19, 0, 0)
+            .single()
+            .expect("valid query time");
+
+        let records =
+            parse_weather_alert_feature(&feature, query_time).expect("weather alert feature parse");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event_family, "watch");
+        assert!(records[0].points.len() < 15);
+        assert!(hazard_points_renderable(&records[0].points));
+        assert!(!generic_alert_ring_needs_hull(&records[0].points));
     }
 
     #[test]
@@ -60360,6 +62792,38 @@ mod tests {
     }
 
     #[test]
+    fn live_overlay_drops_generic_advisory_alert_polygons() {
+        let start = Instant::now();
+        let query_time = Utc
+            .with_ymd_and_hms(2026, 6, 27, 18, 0, 0)
+            .single()
+            .expect("valid query time");
+        let mut advisory = test_hazard_record(
+            "KPAH.HT.Y.0002",
+            "Heat Advisory",
+            "alert",
+            square_hazard_points(-89.0, 37.0, -88.0, 38.0),
+        );
+        advisory.action = "ALERT".to_owned();
+        advisory.lifecycle_status = Some("Active".to_owned());
+
+        let overlay = build_live_hazard_overlay(
+            "NWS active alerts".to_owned(),
+            query_time,
+            1,
+            1,
+            0,
+            start,
+            vec![advisory],
+        );
+
+        assert!(
+            overlay.records.is_empty(),
+            "generic advisories should not draw as unfilterable warning polygons"
+        );
+    }
+
+    #[test]
     fn active_alert_status_wins_over_expired_duplicate_text() {
         let start = Instant::now();
         let query_time = Utc
@@ -60609,6 +63073,76 @@ mod tests {
     }
 
     #[test]
+    fn screen_polyline_chunks_do_not_connect_projection_jumps() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(500.0, 400.0));
+        let points = vec![
+            egui::pos2(20.0, 20.0),
+            egui::pos2(40.0, 28.0),
+            egui::pos2(460.0, 360.0),
+            egui::pos2(480.0, 370.0),
+        ];
+
+        assert!(screen_polyline_has_jump(&points, false, rect));
+        let chunks = screen_polyline_chunks(&points, false, rect);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], vec![points[0], points[1]]);
+        assert_eq!(chunks[1], vec![points[2], points[3]]);
+    }
+
+    #[test]
+    fn hazard_visible_label_anchor_uses_view_center_inside_partial_polygon() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let points = vec![
+            egui::pos2(-300.0, 0.0),
+            egui::pos2(70.0, 0.0),
+            egui::pos2(70.0, 100.0),
+            egui::pos2(-300.0, 100.0),
+        ];
+
+        let anchor = hazard_visible_label_anchor(&points, rect).expect("visible label anchor");
+
+        assert_eq!(anchor, egui::pos2(50.0, 50.0));
+    }
+
+    #[test]
+    fn hazard_map_label_strips_multi_zone_suffix() {
+        let record = test_hazard_record(
+            "KLMK.FF.W.0062#3",
+            "FFW 0062 4",
+            "flash flood",
+            square_hazard_points(-87.0, 38.0, -86.0, 39.0),
+        );
+
+        assert_eq!(hazard_map_label(&record), "FFW 0062");
+    }
+
+    #[test]
+    fn hazard_overlay_labels_once_per_multi_zone_event() {
+        let rect = test_map_rect();
+        let mut first = test_hazard_record(
+            "KLMK.FF.W.0062#0",
+            "FFW 0062 1",
+            "flash flood",
+            square_hazard_points(-1.0, -1.0, -0.4, -0.4),
+        );
+        let mut second = test_hazard_record(
+            "KLMK.FF.W.0062#1",
+            "FFW 0062 2",
+            "flash flood",
+            square_hazard_points(0.2, 0.2, 0.8, 0.8),
+        );
+        first.source_url = Some("https://api.weather.gov/alerts/1".to_owned());
+        second.source_url = Some("https://api.weather.gov/alerts/1".to_owned());
+        let app = test_viewer_app_with_hazards(vec![first, second]);
+
+        let built = app.build_hazard_overlay_shapes(rect, None);
+
+        assert_eq!(built.labels.len(), 1);
+        assert_eq!(built.labels[0].1, "FFW 0062");
+    }
+
+    #[test]
     fn outlook_polygon_mesh_keeps_interior_ring_unfilled() {
         let outer = vec![
             egui::pos2(0.0, 0.0),
@@ -60638,6 +63172,28 @@ mod tests {
 
         assert!(contains(egui::pos2(1.0, 1.0)));
         assert!(!contains(egui::pos2(5.0, 5.0)));
+    }
+
+    #[test]
+    fn model_layer_view_reuses_raster_for_subpixel_pans() {
+        let rendered = ModelLayerView {
+            center_lat: 38.0,
+            center_lon: -97.0,
+            map_scale: 500.0,
+        };
+        let tiny_pan = ModelLayerView {
+            center_lat: 38.0,
+            center_lon: -96.999,
+            map_scale: 500.0,
+        };
+        let larger_pan = ModelLayerView {
+            center_lat: 38.0,
+            center_lon: -96.90,
+            map_scale: 500.0,
+        };
+
+        assert!(!model_layer_view_needs_rerender(&rendered, &tiny_pan));
+        assert!(model_layer_view_needs_rerender(&rendered, &larger_pan));
     }
 
     #[test]
@@ -60910,6 +63466,13 @@ mod tests {
             italy_dpc_latest_rx: None,
             italy_dpc_texture: None,
             italy_dpc_render_rx: None,
+            taiwan_cwa_layer: None,
+            taiwan_cwa_latest_rx: None,
+            taiwan_cwa_texture: None,
+            taiwan_cwa_render_rx: None,
+            grid_composite_rx: None,
+            grid_composite_loading: None,
+            grid_composite_pending_field: None,
             open_color_tables_request: false,
             bold_labels: true,
             browsing_history: false,
@@ -60999,6 +63562,7 @@ mod tests {
             display_thresholds: BTreeMap::new(),
             show_inspector_card: true,
             pinned_inspector_lonlat: None,
+            pinned_obs_chart_station: None,
             hazard_overlay_generation: 0,
             grid_layout: PanelLayout::One,
             extra_panes: Vec::new(),
@@ -61129,6 +63693,9 @@ mod tests {
             obs_show_metar: true,
             obs_show_mesonet: true,
             obs_adjust_soundings: false,
+            obs_hour_loop_enabled: false,
+            obs_hour_loop_started_at: Instant::now(),
+            obs_hour_loop_end_utc: Utc::now(),
             surface_obs: obs::ObPool::new(),
             obs_fetched_at: None,
             obs_rx: None,
@@ -61154,6 +63721,7 @@ mod tests {
             native_sounding: None,
             native_sounding_rx: None,
             native_sounding_src: None,
+            native_sounding_panel: rw_ui::SoundingPanel::new(),
             sounding_viewer_source: SoundingViewerSource::NativeOnly,
             native_skewt_open: false,
             archive_frame_count: 10,
@@ -62667,6 +65235,7 @@ mod tests {
         assert!(hazard_style_key_known("severe-thunderstorm/considerable"));
         assert!(hazard_style_key_known("flash-flood/considerable"));
         assert!(hazard_style_key_known("flood/catastrophic"));
+        assert!(hazard_style_key_known("fire-weather"));
         assert!(!hazard_style_key_known("not-a-real-polygon-family"));
         assert!(hazard_style_label("tornado/catastrophic").contains("emergency"));
         assert!(hazard_style_label("flood/considerable").contains("Considerable"));
@@ -62888,19 +65457,30 @@ mod tests {
     }
 
     #[test]
-    fn model_download_options_expose_rap_not_rrfs() {
+    fn model_download_options_expose_ingest_supported_models() {
         let options = ingest_worker_model_options();
 
-        assert!(
-            options
-                .iter()
-                .any(|option| option.slug == "rap" && option.enabled),
-            "RAP must be active in BowEcho's model download picker"
-        );
-        assert!(
-            !options.iter().any(|option| option.slug.starts_with("rrfs")),
-            "RRFS should stay hidden until BowEcho intentionally supports it"
-        );
+        for slug in [
+            "hrrr",
+            "hrrr-ak",
+            "rap",
+            "gfs",
+            "gdas",
+            "gefs",
+            "aigfs",
+            "aigefs",
+            "hgefs",
+            "ecmwf-open-data",
+            "nam",
+            "rrfs-a",
+        ] {
+            assert!(
+                options
+                    .iter()
+                    .any(|option| option.slug == slug && option.enabled),
+                "{slug} must be active in BowEcho's model download picker"
+            );
+        }
     }
 
     #[test]
@@ -63135,6 +65715,33 @@ mod tests {
                 d
             );
         }
+    }
+
+    #[test]
+    fn picker_product_order_follows_human_moment_order() {
+        let available = [
+            MomentType::Reflectivity,
+            MomentType::Velocity,
+            MomentType::SpectrumWidth,
+            MomentType::DifferentialReflectivity,
+            MomentType::CorrelationCoefficient,
+            MomentType::DifferentialPhase,
+            MomentType::SpecificDifferentialPhase,
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+
+        let labels = product_order(&available)
+            .into_iter()
+            .map(|product| product.label().to_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            vec![
+                "REF", "VEL", "DVEL", "SRV", "DSRV", "RHO", "ZDR", "SW", "PHI", "KDP"
+            ]
+        );
     }
 
     fn test_reflectivity_sails_volume(cuts: &[(f32, i32)]) -> RadarVolume {

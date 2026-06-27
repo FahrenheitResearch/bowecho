@@ -16,6 +16,10 @@ const ITALY_DPC_ORIGIN: &str = "https://radar.protezionecivile.it";
 const ITALY_DPC_WMTS_BASE: &str = "https://radar-geowebcache.protezionecivile.it/service/wmts";
 const ITALY_DPC_WMTS_MATRIX_SET: &str = "EPSG:900913";
 const ITALY_DPC_WMTS_FORMAT: &str = "image/png";
+const TAIWAN_CWA_DATASET_ID: &str = "O-A0059-001";
+const TAIWAN_CWA_DEFAULT_AUTHORIZATION: &str = "rdec-key-123-45678-011121314";
+const TAIWAN_CWA_FILE_API_BASE: &str = "https://opendata.cwa.gov.tw/fileapi/v1/opendataapi";
+const TAIWAN_CWA_HISTORY_API_BASE: &str = "https://opendata.cwa.gov.tw/historyapi/v1";
 
 /// The product family a gridded source contributes to BowEcho.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,6 +34,7 @@ pub enum GridProductKind {
     ConstantAltitudePpi,
     HailProbability,
     CellTracking,
+    RotationTracks,
     ThreeDimensionalComposite,
     VerticallyIntegratedLiquid,
     VerticalMaximumIntensity,
@@ -47,6 +52,7 @@ pub enum GridProductKind {
 pub enum GridCodec {
     OdimH5Grid,
     CloudOptimizedGeoTiff,
+    Grib2,
     GeoTiff,
     Hdf5Grid,
     NetcdfGrid,
@@ -570,7 +576,221 @@ struct ItalyDpcDownloadResponse {
     expires_seconds: Option<u32>,
 }
 
+/// Numeric Taiwan CWA composite reflectivity grid.
+///
+/// The official `O-A0059-001` payload is a lon/lat grid, not native polar
+/// site data. Values are stored with the lower-left point first, then
+/// west-to-east rows, then south-to-north rows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaiwanCwaRadarGrid {
+    pub time: DateTime<Utc>,
+    pub nx: usize,
+    pub ny: usize,
+    pub start_lon: f32,
+    pub start_lat: f32,
+    pub resolution_deg: f32,
+    pub units: String,
+    pub values: Vec<f32>,
+}
+
+impl TaiwanCwaRadarGrid {
+    pub fn value_at_source_xy(&self, x: usize, y: usize) -> Option<f32> {
+        (x < self.nx && y < self.ny).then(|| self.values[y * self.nx + x])
+    }
+
+    pub fn source_identity(&self) -> String {
+        format!(
+            "taiwan-cwa/{TAIWAN_CWA_DATASET_ID}/{}",
+            self.time.to_rfc3339()
+        )
+    }
+}
+
+pub fn taiwan_cwa_latest_radar_grid() -> Result<TaiwanCwaRadarGrid, String> {
+    let url = taiwan_cwa_latest_json_url();
+    let text = crate::fetch_text(&url).map_err(|err| format!("Taiwan CWA latest radar: {err}"))?;
+    parse_taiwan_cwa_latest_json(&text)
+}
+
+pub fn taiwan_cwa_latest_json_url() -> String {
+    format!(
+        "{TAIWAN_CWA_FILE_API_BASE}/{TAIWAN_CWA_DATASET_ID}?Authorization={}&format=JSON",
+        taiwan_cwa_authorization()
+    )
+}
+
+pub fn taiwan_cwa_history_metadata_url() -> String {
+    format!(
+        "{TAIWAN_CWA_HISTORY_API_BASE}/getMetadata/{TAIWAN_CWA_DATASET_ID}?Authorization={}",
+        taiwan_cwa_authorization()
+    )
+}
+
+fn taiwan_cwa_authorization() -> String {
+    std::env::var("CWA_AUTHORIZATION")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| TAIWAN_CWA_DEFAULT_AUTHORIZATION.to_owned())
+}
+
+pub fn parse_taiwan_cwa_latest_json(text: &str) -> Result<TaiwanCwaRadarGrid, String> {
+    let payload: TaiwanCwaLatestPayload = serde_json::from_str(text)
+        .map_err(|err| format!("Taiwan CWA latest radar JSON parse failed: {err}"))?;
+    let open_data = payload.cwaopendata;
+    if open_data.dataid.trim() != TAIWAN_CWA_DATASET_ID {
+        return Err(format!(
+            "Taiwan CWA latest radar: expected dataid {TAIWAN_CWA_DATASET_ID}, got {}",
+            open_data.dataid
+        ));
+    }
+    let params = open_data.dataset.dataset_info.parameter_set;
+    let nx = parse_usize_field("GridDimensionX", &params.grid_dimension_x)?;
+    let ny = parse_usize_field("GridDimensionY", &params.grid_dimension_y)?;
+    let expected = nx
+        .checked_mul(ny)
+        .ok_or_else(|| "Taiwan CWA latest radar grid dimensions overflow".to_owned())?;
+    let time = DateTime::parse_from_rfc3339(params.date_time.trim())
+        .map_err(|err| format!("Taiwan CWA DateTime parse failed: {err}"))?
+        .with_timezone(&Utc);
+    let values = parse_taiwan_cwa_values(&open_data.dataset.contents.content, expected)?;
+    Ok(TaiwanCwaRadarGrid {
+        time,
+        nx,
+        ny,
+        start_lon: parse_f32_field("StartPointLongitude", &params.start_point_longitude)?,
+        start_lat: parse_f32_field("StartPointLatitude", &params.start_point_latitude)?,
+        resolution_deg: parse_f32_field("GridResolution", &params.grid_resolution)?,
+        units: params.reflectivity.unwrap_or_else(|| "dBZ".to_owned()),
+        values,
+    })
+}
+
+pub fn parse_taiwan_cwa_history_product_urls(text: &str) -> Result<Vec<String>, String> {
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+
+    let mut reader = Reader::from_str(text);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut in_product_url = false;
+    let mut urls = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(event)) => {
+                in_product_url = event.name().as_ref().eq_ignore_ascii_case(b"ProductURL");
+            }
+            Ok(Event::Text(text)) if in_product_url => {
+                let value = text
+                    .decode()
+                    .map_err(|err| format!("Taiwan CWA metadata text decode failed: {err}"))?
+                    .trim()
+                    .to_owned();
+                if !value.is_empty() {
+                    urls.push(value);
+                }
+            }
+            Ok(Event::End(event)) => {
+                if event.name().as_ref().eq_ignore_ascii_case(b"ProductURL") {
+                    in_product_url = false;
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(err) => return Err(format!("Taiwan CWA metadata XML parse failed: {err}")),
+        }
+        buf.clear();
+    }
+    Ok(urls)
+}
+
+pub fn taiwan_cwa_is_nodata(value: f32) -> bool {
+    !value.is_finite() || (value + 99.0).abs() < 0.01 || (value + 999.0).abs() < 0.01
+}
+
+fn parse_taiwan_cwa_values(text: &str, expected: usize) -> Result<Vec<f32>, String> {
+    let mut values = Vec::with_capacity(expected);
+    for token in text.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let value = token
+            .parse::<f32>()
+            .map_err(|err| format!("Taiwan CWA grid value parse failed for '{token}': {err}"))?;
+        values.push(value);
+    }
+    if values.len() != expected {
+        return Err(format!(
+            "Taiwan CWA grid value count mismatch: got {}, expected {expected}",
+            values.len()
+        ));
+    }
+    Ok(values)
+}
+
+fn parse_f32_field(label: &str, value: &str) -> Result<f32, String> {
+    value
+        .trim()
+        .parse::<f32>()
+        .map_err(|err| format!("Taiwan CWA {label} parse failed for '{value}': {err}"))
+}
+
+fn parse_usize_field(label: &str, value: &str) -> Result<usize, String> {
+    value
+        .trim()
+        .parse::<usize>()
+        .map_err(|err| format!("Taiwan CWA {label} parse failed for '{value}': {err}"))
+}
+
+#[derive(Debug, Deserialize)]
+struct TaiwanCwaLatestPayload {
+    cwaopendata: TaiwanCwaOpenData,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaiwanCwaOpenData {
+    dataid: String,
+    dataset: TaiwanCwaDataset,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaiwanCwaDataset {
+    #[serde(rename = "datasetInfo")]
+    dataset_info: TaiwanCwaDatasetInfo,
+    contents: TaiwanCwaContents,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaiwanCwaDatasetInfo {
+    #[serde(rename = "parameterSet")]
+    parameter_set: TaiwanCwaParameterSet,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaiwanCwaParameterSet {
+    #[serde(rename = "StartPointLongitude")]
+    start_point_longitude: String,
+    #[serde(rename = "StartPointLatitude")]
+    start_point_latitude: String,
+    #[serde(rename = "GridResolution")]
+    grid_resolution: String,
+    #[serde(rename = "DateTime")]
+    date_time: String,
+    #[serde(rename = "GridDimensionX")]
+    grid_dimension_x: String,
+    #[serde(rename = "GridDimensionY")]
+    grid_dimension_y: String,
+    #[serde(rename = "Reflectivity")]
+    reflectivity: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaiwanCwaContents {
+    content: String,
+}
+
 const OPERA_CODECS: &[GridCodec] = &[GridCodec::OdimH5Grid, GridCodec::CloudOptimizedGeoTiff];
+const MRMS_CODECS: &[GridCodec] = &[GridCodec::Grib2];
 const ORD_API_CODECS: &[GridCodec] = &[
     GridCodec::EdrJson,
     GridCodec::ApiJson,
@@ -585,6 +805,7 @@ const ITALY_CODECS: &[GridCodec] = &[
     GridCodec::GeoReferencedImage,
     GridCodec::Zarr,
 ];
+const TAIWAN_CWA_CODECS: &[GridCodec] = &[GridCodec::ApiJson, GridCodec::GeoReferencedImage];
 const IMAGE_CODECS: &[GridCodec] = &[GridCodec::GeoReferencedImage];
 const METEOALARM_CODECS: &[GridCodec] = &[
     GridCodec::GeoJson,
@@ -652,6 +873,57 @@ const OPERA_PRODUCTS: &[GridProduct] = &[
         access: API_AND_MQTT,
         status: GridImplementationStatus::Catalogued,
         source_hint: "MeteoGate ORD API and notification service for metadata/archive refresh",
+    },
+];
+
+const MRMS_PRODUCTS: &[GridProduct] = &[
+    GridProduct {
+        slug: "mrms-composite-reflectivity",
+        label: "NOAA MRMS Composite Reflectivity",
+        kind: GridProductKind::ReflectivityComposite,
+        cadence_minutes: Some(2),
+        resolution_km: Some(1.0),
+        forecast_hours: None,
+        codecs: MRMS_CODECS,
+        access: OPEN_HTTP,
+        status: GridImplementationStatus::DecoderNeeded,
+        source_hint: "NOAA/NCEP MRMS public 2D GRIB2 grid; decoder/display layer not wired yet",
+    },
+    GridProduct {
+        slug: "mrms-merged-reflectivity-lowest-altitude",
+        label: "NOAA MRMS Merged Reflectivity Lowest Altitude",
+        kind: GridProductKind::ReflectivityComposite,
+        cadence_minutes: Some(2),
+        resolution_km: Some(1.0),
+        forecast_hours: None,
+        codecs: MRMS_CODECS,
+        access: OPEN_HTTP,
+        status: GridImplementationStatus::DecoderNeeded,
+        source_hint: "NOAA/NCEP MRMS public 2D GRIB2 grid; decoder/display layer not wired yet",
+    },
+    GridProduct {
+        slug: "mrms-precip-rate",
+        label: "NOAA MRMS Precipitation Rate",
+        kind: GridProductKind::RainRate,
+        cadence_minutes: Some(2),
+        resolution_km: Some(1.0),
+        forecast_hours: None,
+        codecs: MRMS_CODECS,
+        access: OPEN_HTTP,
+        status: GridImplementationStatus::DecoderNeeded,
+        source_hint: "NOAA/NCEP MRMS public 2D GRIB2 grid; decoder/display layer not wired yet",
+    },
+    GridProduct {
+        slug: "mrms-rotation-tracks",
+        label: "NOAA MRMS Rotation Tracks",
+        kind: GridProductKind::RotationTracks,
+        cadence_minutes: Some(2),
+        resolution_km: Some(1.0),
+        forecast_hours: None,
+        codecs: MRMS_CODECS,
+        access: OPEN_HTTP,
+        status: GridImplementationStatus::DecoderNeeded,
+        source_hint: "NOAA/NCEP MRMS azimuthal-shear/rotation-track family; decoder/display layer not wired yet",
     },
 ];
 
@@ -1148,6 +1420,19 @@ const ITALY_PRODUCTS: &[GridProduct] = &[
     },
 ];
 
+const TAIWAN_CWA_PRODUCTS: &[GridProduct] = &[GridProduct {
+    slug: "taiwan-cwa-composite-reflectivity",
+    label: "Taiwan CWA Composite Reflectivity",
+    kind: GridProductKind::ReflectivityComposite,
+    cadence_minutes: Some(10),
+    resolution_km: None,
+    forecast_hours: None,
+    codecs: TAIWAN_CWA_CODECS,
+    access: REST_API,
+    status: GridImplementationStatus::Fetchable,
+    source_hint: "CWA O-A0059-001 lon/lat numeric dBZ composite grid; not native polar site data",
+}];
+
 const AEMET_PRODUCTS: &[GridProduct] = &[GridProduct {
     slug: "aemet-lowest-elevation-reflectivity",
     label: "Spain AEMET Lowest-Elevation Reflectivity",
@@ -1196,6 +1481,13 @@ const GRID_PROVIDERS: &[StaticGridProductProvider] = &[
         products: OPERA_PRODUCTS,
     },
     StaticGridProductProvider {
+        id: "mrms",
+        label: "NOAA MRMS",
+        region: "United States",
+        docs_url: "https://www.nssl.noaa.gov/projects/mrms/",
+        products: MRMS_PRODUCTS,
+    },
+    StaticGridProductProvider {
         id: "metoffice-uk",
         label: "Met Office UK Radar",
         region: "United Kingdom",
@@ -1229,6 +1521,13 @@ const GRID_PROVIDERS: &[StaticGridProductProvider] = &[
         region: "Italy",
         docs_url: "https://dpc-radar.readthedocs.io/it/latest/api.html",
         products: ITALY_PRODUCTS,
+    },
+    StaticGridProductProvider {
+        id: "taiwan-cwa",
+        label: "Taiwan CWA",
+        region: "Taiwan",
+        docs_url: "https://opendata.cwa.gov.tw/",
+        products: TAIWAN_CWA_PRODUCTS,
     },
     StaticGridProductProvider {
         id: "aemet",
@@ -1295,6 +1594,10 @@ mod tests {
             "opera-rain-rate",
             "opera-accum-1h",
             "ord-api-mqtt-discovery",
+            "mrms-composite-reflectivity",
+            "mrms-merged-reflectivity-lowest-altitude",
+            "mrms-precip-rate",
+            "mrms-rotation-tracks",
             "uk-metoffice-rain-rate",
             "knmi-reflectivity-nowcast",
             "knmi-hail-probability",
@@ -1310,6 +1613,7 @@ mod tests {
             "italy-dpc-etm",
             "italy-dpc-poh",
             "italy-dpc-sites",
+            "taiwan-cwa-composite-reflectivity",
             "aemet-lowest-elevation-reflectivity",
             "ipma-precipitation-intensity",
             "meteoalarm-warnings",
@@ -1337,6 +1641,30 @@ mod tests {
                 .iter()
                 .any(|product| product.access.contains(&GridAccess::Mqtt))
         );
+    }
+
+    #[test]
+    fn mrms_products_are_catalogued_as_decoder_needed_grids() {
+        let mrms = grid_product_providers()
+            .iter()
+            .find(|provider| provider.id == "mrms")
+            .expect("MRMS provider");
+        assert!(mrms.products.len() >= 4);
+        assert!(
+            mrms.products
+                .iter()
+                .any(|product| product.kind == GridProductKind::ReflectivityComposite)
+        );
+        assert!(
+            mrms.products
+                .iter()
+                .any(|product| product.kind == GridProductKind::RotationTracks)
+        );
+        for product in mrms.products {
+            assert_eq!(product.status, GridImplementationStatus::DecoderNeeded);
+            assert!(product.codecs.contains(&GridCodec::Grib2));
+            assert!(product.access.contains(&GridAccess::OpenHttp));
+        }
     }
 
     #[test]
@@ -1370,6 +1698,78 @@ mod tests {
             "{}",
             sites.source_hint
         );
+    }
+
+    #[test]
+    fn taiwan_cwa_catalog_marks_reflectivity_composite_fetchable() {
+        let taiwan = grid_product_providers()
+            .iter()
+            .find(|provider| provider.id == "taiwan-cwa")
+            .expect("Taiwan CWA provider");
+        let product = taiwan
+            .products
+            .iter()
+            .find(|product| product.slug == "taiwan-cwa-composite-reflectivity")
+            .expect("Taiwan CWA reflectivity product");
+        assert_eq!(product.kind, GridProductKind::ReflectivityComposite);
+        assert_eq!(product.status, GridImplementationStatus::Fetchable);
+        assert!(product.codecs.contains(&GridCodec::ApiJson));
+        assert!(product.access.contains(&GridAccess::RestApi));
+        assert!(product.source_hint.contains("not native polar site data"));
+    }
+
+    #[test]
+    fn taiwan_cwa_latest_json_parser_maps_rows_and_nodata() {
+        let json = r#"{
+          "cwaopendata": {
+            "dataid": "O-A0059-001",
+            "dataset": {
+              "datasetInfo": {
+                "parameterSet": {
+                  "StartPointLongitude": "115.0",
+                  "StartPointLatitude": "18.0",
+                  "GridResolution": "0.0125",
+                  "DateTime": "2026-06-27T10:50:00+08:00",
+                  "GridDimensionX": "3",
+                  "GridDimensionY": "2",
+                  "Reflectivity": "dBZ"
+                }
+              },
+              "contents": {
+                "content": "1,2,-99,4,-999,6"
+              }
+            }
+          }
+        }"#;
+        let grid = parse_taiwan_cwa_latest_json(json).expect("parse Taiwan CWA JSON");
+        assert_eq!(grid.nx, 3);
+        assert_eq!(grid.ny, 2);
+        assert_eq!(grid.value_at_source_xy(0, 0), Some(1.0));
+        assert_eq!(grid.value_at_source_xy(2, 1), Some(6.0));
+        assert!(taiwan_cwa_is_nodata(grid.value_at_source_xy(2, 0).unwrap()));
+        assert!(taiwan_cwa_is_nodata(grid.value_at_source_xy(1, 1).unwrap()));
+        assert_eq!(
+            grid.time.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "2026-06-27T02:50:00Z"
+        );
+    }
+
+    #[test]
+    fn taiwan_cwa_history_metadata_parser_extracts_product_urls() {
+        let xml = r#"
+            <cwaopendata>
+              <dataset>
+                <resource>
+                  <ProductURL>https://opendata.cwa.gov.tw/historyapi/v1/getData/O-A0059-001/2026/06/27/10/50/00?Authorization=x</ProductURL>
+                </resource>
+                <resource><ProductURL> https://example.test/second </ProductURL></resource>
+              </dataset>
+            </cwaopendata>
+        "#;
+        let urls = parse_taiwan_cwa_history_product_urls(xml).expect("parse history URLs");
+        assert_eq!(urls.len(), 2);
+        assert!(urls[0].contains("/O-A0059-001/2026/06/27/10/50/00"));
+        assert_eq!(urls[1], "https://example.test/second");
     }
 
     #[test]

@@ -14,6 +14,8 @@ use rw_ui::FieldData;
 use rw_ui::colormap::Colormap;
 use std::sync::Arc;
 
+use color_tables::ColorTableFamily;
+
 /// Inverse geolocation: lat/lon bin → row-major grid index.
 pub struct InverseLut {
     lat0: f32,
@@ -205,13 +207,180 @@ pub struct ModelMapLayer {
     /// Hidden layers keep their data (inspector + soundings still read the
     /// store) but skip the map draw.
     pub visible: bool,
+    /// Optional BowEcho color-table family override. When absent, model
+    /// layers use Rusty Weather's production style, then generic ramp.
+    pub custom_color_family: Option<ColorTableFamily>,
     /// Bumped when field/LUT changes — keys the rendered texture.
     pub generation: u64,
+}
+
+/// Sample a model field at a screen-derived lat/lon. The LUT gives the
+/// nearest grid point cheaply; when the run grid is present, refine that to a
+/// fractional position inside a neighboring grid cell so map overlays render
+/// as continuous model fields instead of nearest-neighbor blocks.
+pub fn sample_field_value(
+    field: &FieldData,
+    nearest_index: usize,
+    lat: f32,
+    lon: f32,
+) -> Option<f32> {
+    if let Some(grid) = field.grid.as_ref()
+        && grid.nx == field.nx
+        && grid.ny == field.ny
+        && grid.lat.len() == field.values.len()
+        && grid.lon.len() == field.values.len()
+        && let Some(value) = sample_curvilinear_field(field, grid, nearest_index, lat, lon)
+    {
+        return Some(value);
+    }
+    field
+        .values
+        .get(nearest_index)
+        .copied()
+        .filter(|value| value.is_finite())
+}
+
+fn sample_curvilinear_field(
+    field: &FieldData,
+    grid: &rw_store::grid::GridFile,
+    nearest_index: usize,
+    lat: f32,
+    lon: f32,
+) -> Option<f32> {
+    if field.nx < 2 || field.ny < 2 || nearest_index >= field.values.len() {
+        return None;
+    }
+    let row = nearest_index / field.nx;
+    let col = nearest_index % field.nx;
+    let row_starts = neighboring_cell_starts(row, field.ny);
+    let col_starts = neighboring_cell_starts(col, field.nx);
+    for y0 in row_starts.into_iter().flatten() {
+        for x0 in col_starts.into_iter().flatten() {
+            if let Some(value) = sample_cell(field, grid, x0, y0, lat, lon) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn neighboring_cell_starts(index: usize, len: usize) -> [Option<usize>; 2] {
+    if len < 2 {
+        return [None, None];
+    }
+    let first = index.saturating_sub(1).min(len - 2);
+    let second = index.min(len - 2);
+    if first == second {
+        [Some(first), None]
+    } else {
+        [Some(first), Some(second)]
+    }
+}
+
+fn sample_cell(
+    field: &FieldData,
+    grid: &rw_store::grid::GridFile,
+    x0: usize,
+    y0: usize,
+    target_lat: f32,
+    target_lon: f32,
+) -> Option<f32> {
+    let nx = field.nx;
+    let i00 = y0 * nx + x0;
+    let i10 = i00 + 1;
+    let i01 = i00 + nx;
+    let i11 = i01 + 1;
+    let values = [
+        *field.values.get(i00)?,
+        *field.values.get(i10)?,
+        *field.values.get(i01)?,
+        *field.values.get(i11)?,
+    ];
+    if values.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let target_lon = f64::from(target_lon);
+    let target_lat = f64::from(target_lat);
+    let corners = [
+        (
+            unwrap_lon_near(f64::from(*grid.lon.get(i00)?), target_lon),
+            f64::from(*grid.lat.get(i00)?),
+        ),
+        (
+            unwrap_lon_near(f64::from(*grid.lon.get(i10)?), target_lon),
+            f64::from(*grid.lat.get(i10)?),
+        ),
+        (
+            unwrap_lon_near(f64::from(*grid.lon.get(i01)?), target_lon),
+            f64::from(*grid.lat.get(i01)?),
+        ),
+        (
+            unwrap_lon_near(f64::from(*grid.lon.get(i11)?), target_lon),
+            f64::from(*grid.lat.get(i11)?),
+        ),
+    ];
+    let (u, v) = solve_bilinear_coords(corners, target_lon, target_lat)?;
+    if !((-0.08..=1.08).contains(&u) && (-0.08..=1.08).contains(&v)) {
+        return None;
+    }
+    let u = u.clamp(0.0, 1.0) as f32;
+    let v = v.clamp(0.0, 1.0) as f32;
+    let top = values[0] * (1.0 - u) + values[1] * u;
+    let bottom = values[2] * (1.0 - u) + values[3] * u;
+    Some(top * (1.0 - v) + bottom * v)
+}
+
+pub(crate) fn solve_bilinear_coords(
+    corners: [(f64, f64); 4],
+    target_x: f64,
+    target_y: f64,
+) -> Option<(f64, f64)> {
+    let [(x00, y00), (x10, y10), (x01, y01), (x11, y11)] = corners;
+    let mut u = 0.5;
+    let mut v = 0.5;
+    for _ in 0..8 {
+        let one_u = 1.0 - u;
+        let one_v = 1.0 - v;
+        let x = one_u * one_v * x00 + u * one_v * x10 + one_u * v * x01 + u * v * x11;
+        let y = one_u * one_v * y00 + u * one_v * y10 + one_u * v * y01 + u * v * y11;
+        let rx = target_x - x;
+        let ry = target_y - y;
+        if rx.abs().max(ry.abs()) < 1e-6 {
+            return Some((u, v));
+        }
+        let dx_du = -one_v * x00 + one_v * x10 - v * x01 + v * x11;
+        let dx_dv = -one_u * x00 - u * x10 + one_u * x01 + u * x11;
+        let dy_du = -one_v * y00 + one_v * y10 - v * y01 + v * y11;
+        let dy_dv = -one_u * y00 - u * y10 + one_u * y01 + u * y11;
+        let det = dx_du * dy_dv - dx_dv * dy_du;
+        if det.abs() < 1e-12 {
+            return None;
+        }
+        let du = (rx * dy_dv - dx_dv * ry) / det;
+        let dv = (dx_du * ry - rx * dy_du) / det;
+        u += du;
+        v += dv;
+        if !u.is_finite() || !v.is_finite() || u.abs().max(v.abs()) > 3.0 {
+            return None;
+        }
+    }
+    Some((u, v))
+}
+
+pub(crate) fn unwrap_lon_near(mut lon: f64, target: f64) -> f64 {
+    while lon - target > 180.0 {
+        lon -= 360.0;
+    }
+    while lon - target < -180.0 {
+        lon += 360.0;
+    }
+    lon
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rw_store::grid::GridFile;
 
     #[test]
     fn lut_round_trips_a_regular_grid() {
@@ -266,5 +435,41 @@ mod tests {
         let query_lat = midpoint(i, i + 1, i + nx, i + nx + 1, &lat);
         let query_lon = midpoint(i, i + 1, i + nx, i + nx + 1, &lon);
         assert!(lut.lookup(query_lat, query_lon).is_some());
+    }
+
+    #[test]
+    fn model_field_sampler_interpolates_between_grid_cells() {
+        let grid = Arc::new(GridFile {
+            nx: 2,
+            ny: 2,
+            lat: vec![40.0, 40.0, 41.0, 41.0],
+            lon: vec![-100.0, -99.0, -100.0, -99.0],
+            projection: None,
+            hash: "test".to_owned(),
+        });
+        let field = FieldData {
+            key: rw_ui::FieldKey {
+                hour: rw_ui::HourKey {
+                    model: "gfs".to_owned(),
+                    run: "20260626_00z".to_owned(),
+                    hour: 0,
+                },
+                var: "temperature_2m".to_owned(),
+            },
+            units: "degF".to_owned(),
+            nx: 2,
+            ny: 2,
+            values: vec![10.0, 20.0, 30.0, 40.0],
+            range: Some((10.0, 40.0)),
+            grid: Some(grid),
+            lat_descending: false,
+            style: None,
+        };
+
+        let value = sample_field_value(&field, 0, 40.5, -99.5).expect("interpolated value");
+        assert!(
+            (value - 25.0).abs() < 1e-3,
+            "expected bilinear midpoint, got {value}"
+        );
     }
 }

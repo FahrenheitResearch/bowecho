@@ -43,6 +43,7 @@ use std::sync::{Mutex, OnceLock};
 use chrono::{DateTime, Datelike, Utc};
 use serde::Deserialize;
 
+mod australia_nci;
 mod chmi;
 mod dmi;
 mod dwd;
@@ -56,6 +57,7 @@ mod piemonte;
 mod shmu;
 mod smhi;
 
+pub use australia_nci::AustraliaNciProvider;
 pub use chmi::ChmiProvider;
 pub use dmi::DmiProvider;
 pub use dwd::DwdProvider;
@@ -200,6 +202,7 @@ pub trait IntlProvider: Send + Sync {
 pub fn intl_providers() -> Vec<Box<dyn IntlProvider>> {
     vec![
         Box::new(SmhiProvider::new()),
+        Box::new(AustraliaNciProvider::new()),
         Box::new(DmiProvider::new()),
         Box::new(GeoSphereProvider::new()),
         Box::new(FmiProvider::new()),
@@ -279,6 +282,14 @@ pub fn intl_provider_capabilities() -> Vec<IntlProviderCapability> {
                     "public ODIM HDF5 archive, roughly 2007-present",
                     "recent loop only",
                     "walk historical date prefixes",
+                ),
+                "australia-nci" => (
+                    true,
+                    true,
+                    "latest archived tarlist",
+                    "NCI rq0 ODIM HDF5 archive; daily tarlists and direct zip-member reads",
+                    "recent/archive loop from per-frame HDF5 members",
+                    "add date/window picker for deep historical events",
                 ),
                 "dmi" => (
                     false,
@@ -807,6 +818,7 @@ mod tests {
             ids,
             vec![
                 "smhi",
+                "australia-nci",
                 "dmi",
                 "geosphere",
                 "fmi",
@@ -882,6 +894,7 @@ mod tests {
             "Germany" => (47.2, 55.1, 5.8, 15.1),
             "Czechia" => (48.5, 51.1, 12.0, 18.9),
             "Italy" => (35.4, 47.3, 6.5, 18.8),
+            "Australia" => (-44.0, -10.0, 112.0, 154.5),
             // Japan incl. the southwest island arcs (Okinawa, Ishigaki).
             "Japan" => (24.0, 45.6, 122.5, 146.0),
             // EUMETNET ORD countries (France incl. Corsica).

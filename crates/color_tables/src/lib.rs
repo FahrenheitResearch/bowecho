@@ -1040,6 +1040,11 @@ pub fn builtin_catalog_for_family(family: ColorTableFamily) -> Vec<CatalogEntry>
                 &[],
             ),
             entry(
+                awips_wilson_edit_reflectivity_table(),
+                "Wilson AWIPS Dark .pal preset, preserving GR alpha/ramp semantics from the supplied table",
+                &[Badge::Classic],
+            ),
+            entry(
                 hail_core_reflectivity_table(),
                 "Extended high end: white and cyan flag 80+ dBZ hail spikes",
                 &[Badge::HighContrast],
@@ -1090,6 +1095,11 @@ pub fn builtin_catalog_for_family(family: ColorTableFamily) -> Vec<CatalogEntry>
                 radarscope_contrast_velocity_table(),
                 "RadarScope-style contrast curve with pale extreme bands",
                 &[],
+            ),
+            entry(
+                wdt_radarscope_velocity_table(),
+                "WDT/RadarScope velocity .pal preset, preserving kt scale and GR ramp semantics",
+                &[Badge::Classic],
             ),
             entry(
                 sign_check_velocity_table(),
@@ -1529,6 +1539,14 @@ pub fn dark_scope_reflectivity_table() -> ColorTable {
         .expect("built-in dark scope reflectivity color table is valid")
 }
 
+pub fn awips_wilson_edit_reflectivity_table() -> ColorTable {
+    ColorTable::parse_gr_pal(
+        "AWIPS Wilson Edit REF",
+        AWIPS_WILSON_EDIT_REFLECTIVITY_TABLE,
+    )
+    .expect("built-in AWIPS Wilson Edit reflectivity color table is valid")
+}
+
 pub fn tornado_debris_reflectivity_table() -> ColorTable {
     ColorTable::parse_stepped("Tornado Debris REF", TORNADO_DEBRIS_REFLECTIVITY_TABLE)
         .expect("built-in tornado debris reflectivity color table is valid")
@@ -1579,6 +1597,11 @@ pub fn radarscope_contrast_velocity_table() -> ColorTable {
         RADARSCOPE_CONTRAST_VELOCITY_TABLE,
     )
     .expect("built-in radarscope contrast velocity color table is valid")
+}
+
+pub fn wdt_radarscope_velocity_table() -> ColorTable {
+    ColorTable::parse_gr_pal("WDT RadarScope VEL", WDT_RADARSCOPE_VELOCITY_TABLE)
+        .expect("built-in WDT RadarScope velocity color table is valid")
 }
 
 pub fn sign_check_velocity_table() -> ColorTable {
@@ -1969,6 +1992,11 @@ fn unit_value_to_mps_scale(units: &str) -> f32 {
     match units.as_str() {
         "kt" | "kts" | "knot" | "knots" => KNOT_TO_MPS,
         "mph" | "mi/h" => MPH_TO_MPS,
+        "km/h" | "kph" | "kmh" => 1000.0 / 3600.0,
+        "ft" | "feet" => 0.3048,
+        "kft" | "kilofoot" | "kilofeet" => 304.8,
+        "km" => 1000.0,
+        "in" | "inch" | "inches" => 25.4,
         _ => 1.0,
     }
 }
@@ -2509,6 +2537,32 @@ color: 87.5 226 226 232
 color: 95 255 255 255
 "#;
 
+const AWIPS_WILSON_EDIT_REFLECTIVITY_TABLE: &str = r#"
+;
+; AWIPS Color Table by Karl Schneider
+;
+
+product: BR
+units: dBZ
+step: 5
+
+color4: -30 116 78 173 0 147 141 117 255
+color: -20 150 145 83 210 212 180
+color: -10 204 207 180 65 91 158
+color: 10 67 97 162 106 208 228
+color: 18 111 214 232 53 213 91
+color: 22 17 213 24 9 94 9
+color: 35 29 104 9 234 210 4
+color: 40 255 226 0 255 128 0
+color: 50 255 0 0 113 0 0
+color: 60 255 255 255 255 146 255
+color: 65 255 117 255 225 11 227
+color: 70 178 0 255 99 0 214
+color: 75 5 236 240 1 32 32
+color: 85 1 32 32
+color: 95 1 32 32
+"#;
+
 const TORNADO_DEBRIS_REFLECTIVITY_TABLE: &str = r#"
 product: BR
 units: dBZ
@@ -2719,6 +2773,33 @@ color: 50 255 255 238
 color: 56 255 232 190
 color: 62 255 204 134
 color: 70 255 242 202
+"#;
+
+const WDT_RADARSCOPE_VELOCITY_TABLE: &str = r#"
+units: KTS
+step: 20
+product: BV
+Scale:   1.9426
+
+color: 200 45 0 0
+color: 140 60 0 0
+color: 120 97 6 2
+color: 80 254 137 80
+color: 60 255 230 169 255 151 86
+color: 55 255 157 206 255 221 176
+color: 40 249 58 84 255 142 212
+color: 10 105 0 0 242 1 6
+color: 0 130 106 120 122 48 57
+color: -10 72 112 71 106 125 105
+color: -40 10 248 35 15 99 20
+color: -50 180 240 243 33 253 50
+color: -70 55 226 229 172 239 242
+color: -90 25 1 142 47 215 225
+color: -100 105 2 142 32 1 141
+color: -120 250 4 130 114 3 141
+color: -140 255 20 180
+color: -200 255 220 220
+RF: 123 0 200
 "#;
 
 const SIGN_CHECK_VELOCITY_TABLE: &str = r#"
@@ -3000,6 +3081,15 @@ mod tests {
         } else {
             value.to_bits() + 1
         })
+    }
+
+    #[test]
+    fn unit_scale_to_internal_covers_speed_height_and_hail_units() {
+        assert!((unit_scale_to_internal("km/h") - (1000.0 / 3600.0)).abs() < f32::EPSILON);
+        assert!((unit_scale_to_internal("kph") - (1000.0 / 3600.0)).abs() < f32::EPSILON);
+        assert!((unit_scale_to_internal("kft") - 304.8).abs() < f32::EPSILON);
+        assert!((unit_scale_to_internal("ft") - 0.3048).abs() < f32::EPSILON);
+        assert!((unit_scale_to_internal("in") - 25.4).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -3500,6 +3590,7 @@ mod tests {
                 "Analyst Classic REF",
                 "NWS Classic REF",
                 "Dark Scope REF",
+                "AWIPS Wilson Edit REF",
                 "Analyst Hail Core REF",
                 "Analyst Low Precip REF",
                 "Tornado Debris REF",
@@ -3515,6 +3606,7 @@ mod tests {
                 "Analyst Tornado VEL",
                 "Analyst Pro VEL",
                 "RadarScope Contrast VEL",
+                "WDT RadarScope VEL",
                 "Sign Check VEL",
                 "Couplet Pop VEL",
                 "GR2-ish Analyst VEL",

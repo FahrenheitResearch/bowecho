@@ -218,19 +218,19 @@ pub(crate) struct TableDraft {
 fn units_for_family(family: ColorTableFamily) -> &'static [&'static str] {
     match family {
         ColorTableFamily::Reflectivity => &["dBZ"],
-        ColorTableFamily::Velocity => &["kt", "m/s", "mph"],
-        ColorTableFamily::SpectrumWidth => &["m/s", "kt"],
+        ColorTableFamily::Velocity => &["kt", "m/s", "mph", "km/h"],
+        ColorTableFamily::SpectrumWidth => &["m/s", "kt", "mph", "km/h"],
         ColorTableFamily::CorrelationCoefficient => &[""],
         ColorTableFamily::DifferentialReflectivity => &["dB"],
         ColorTableFamily::EchoTops => &["m", "kft"],
         ColorTableFamily::Vil => &["kg/m^2"],
         ColorTableFamily::VilDensity => &["g/m^3"],
-        ColorTableFamily::HailSize => &["mm"],
+        ColorTableFamily::HailSize => &["mm", "in"],
         ColorTableFamily::Probability => &["%"],
         ColorTableFamily::AzimuthalShear => &["1e-3/s"],
         ColorTableFamily::DifferentialPhase => &["deg"],
         ColorTableFamily::SpecificDifferentialPhase => &["deg/km"],
-        ColorTableFamily::Generic => &["", "dBZ", "kt", "m/s"],
+        ColorTableFamily::Generic => &["", "dBZ", "kt", "m/s", "mph", "km/h", "kft"],
     }
 }
 
@@ -949,6 +949,7 @@ impl ViewerApp {
             self.ensure_table_editor_snapshot(family);
             self.color_tables.set_family(family, table);
             self.clear_texture();
+            self.invalidate_model_layer_color_family(family);
             ctx.request_repaint();
         }
     }
@@ -967,6 +968,7 @@ impl ViewerApp {
                     self.table_editor.snapshot = Some((old_family, old_table));
                 } else {
                     self.color_tables.set_family(old_family, old_table);
+                    self.invalidate_model_layer_color_family(old_family);
                     self.table_editor.snapshot =
                         Some((family, self.color_tables.for_family(family).clone()));
                 }
@@ -978,6 +980,7 @@ impl ViewerApp {
         if let Some((family, table)) = self.table_editor.snapshot.take() {
             self.color_tables.set_family(family, table);
             self.clear_texture();
+            self.invalidate_model_layer_color_family(family);
             ctx.request_repaint();
         }
     }

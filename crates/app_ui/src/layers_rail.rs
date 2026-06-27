@@ -12,6 +12,7 @@
 use std::time::{Duration, Instant};
 
 use chrono::TimeZone;
+use color_tables::ColorTableFamily;
 use eframe::egui;
 
 use crate::{
@@ -19,9 +20,9 @@ use crate::{
     LayerRowRemove, LayerRowSpec, LayerRowVis, OrdArchiveLoadMode, PlacefileSlot, PollSource,
     RadarSite, SidebarTab, ViewerApp, compact_layer_status, custom_poll_entry_label,
     custom_poll_entry_lat_lon, custom_poll_links_from_gis, dock, format_site_label,
-    glm_latest_age_minutes, glm_latest_is_live, glm_satellite_label, intl_provider_label,
-    layer_row, mesoanalysis, normalized_poll_url, oa_derived, parse_custom_poll_marker_inputs,
-    poll_url_name, poll_urls_match, spc_layers,
+    glm_latest_age_minutes, glm_latest_is_live, glm_satellite_label, grid_composites,
+    intl_provider_label, layer_row, mesoanalysis, normalized_poll_url, oa_derived,
+    parse_custom_poll_marker_inputs, poll_url_name, poll_urls_match, spc_layers,
 };
 
 impl ViewerApp {
@@ -31,6 +32,8 @@ impl ViewerApp {
         usize::from(self.volume.is_some())
             + self.radar_layers.len()
             + usize::from(self.italy_dpc_layer.is_some())
+            + usize::from(self.taiwan_cwa_layer.is_some())
+            + usize::from(self.grid_composite_loading.is_some())
             + usize::from(self.sat_layer.is_some())
             + self.model_layers.len()
             + usize::from(self.obs_enabled)
@@ -167,6 +170,13 @@ impl ViewerApp {
         let mut remove_layer: Option<u64> = None;
         let mut move_layer: Option<(u64, i64)> = None;
         let mut open_model_window = false;
+        #[derive(Clone, Copy)]
+        enum ModelColorAction {
+            Auto,
+            Use(ColorTableFamily),
+            Edit(ColorTableFamily),
+        }
+        let mut model_color_action: Option<(u64, ModelColorAction)> = None;
         // Freshness rides in the row hover now (proposal step 4) —
         // the fold's standalone freshness/ingest row is gone; deep
         // acquisition lives in the Model window's Download section.
@@ -177,17 +187,57 @@ impl ViewerApp {
             .map(|(model, run, hours)| format!("{model} {run} · {hours} hrs in store"))
             .unwrap_or_else(|| "no runs in store".to_owned());
         let model_row_count = self.model_layers.len();
+        let mut refresh_grid_composite: Option<grid_composites::GridCompositeSource> = None;
+        if let Some(source) = self.grid_composite_loading {
+            let name = source.short_label();
+            let _ = layer_row(
+                ui,
+                LayerRowSpec {
+                    vis: LayerRowVis::Badge {
+                        glyph: "○",
+                        hover: "Fetching latest gridded radar composite",
+                    },
+                    name,
+                    name_width: crate::NAME_W_WIDE,
+                    name_hover: source.label(),
+                    state: Some("loading"),
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.spinner();
+                },
+            );
+        }
         for slot in &mut self.model_layers {
             let id = slot.id;
             let layer = &mut slot.layer;
-            let name = format!("{} f{:02}", layer.field.key.var, layer.field.key.hour.hour);
-            let name_hover = format!(
-                "{} ({}) — layers draw bottom-to-top in list order\nNewest: {}",
-                layer.field.key.var, layer.field.units, newest_run_text
+            let grid_source =
+                grid_composites::GridCompositeSource::from_variable_slug(&layer.field.key.var);
+            let name = grid_source
+                .map(|source| source.short_label().to_owned())
+                .unwrap_or_else(|| {
+                    format!("{} f{:02}", layer.field.key.var, layer.field.key.hour.hour)
+                });
+            let name_hover = grid_source.map_or_else(
+                || {
+                    format!(
+                        "{} ({}) — layers draw bottom-to-top in list order\nNewest: {}",
+                        layer.field.key.var, layer.field.units, newest_run_text
+                    )
+                },
+                |source| {
+                    format!(
+                        "{} ({})\nLatest public grid composite; layers draw bottom-to-top in list order",
+                        source.label(),
+                        layer.field.units
+                    )
+                },
             );
             let mut order_delta: i8 = 0;
             let mut open_window = false;
             let mut remove_this = false;
+            let refreshable_source = grid_source;
+            let current_color_family = layer.custom_color_family;
             if layer_row(
                 ui,
                 LayerRowSpec {
@@ -219,7 +269,53 @@ impl ViewerApp {
                     }),
                     ..Default::default()
                 },
-                |_ui| {},
+                |ui| {
+                    if let Some(source) = refreshable_source
+                        && ui
+                            .small_button("Refresh")
+                            .on_hover_text("Fetch the latest gridded radar composite")
+                            .clicked()
+                    {
+                        refresh_grid_composite = Some(source);
+                    }
+                    ui.menu_button("Color", |ui| {
+                        if ui
+                            .selectable_label(current_color_family.is_none(), "Auto")
+                            .on_hover_text(
+                                "Use Rusty Weather's production style when available; otherwise use the generic ramp.",
+                            )
+                            .clicked()
+                        {
+                            model_color_action = Some((id, ModelColorAction::Auto));
+                            ui.close();
+                        }
+                        ui.separator();
+                        for family in ColorTableFamily::ALL {
+                            if ui
+                                .selectable_label(
+                                    current_color_family == Some(family),
+                                    family.label(),
+                                )
+                                .clicked()
+                            {
+                                model_color_action = Some((id, ModelColorAction::Use(family)));
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        let edit_family = current_color_family.unwrap_or(ColorTableFamily::Generic);
+                        if ui
+                            .button(format!("Edit {}", edit_family.label()))
+                            .on_hover_text("Open Custom > Appearance > Color tables for this family")
+                            .clicked()
+                        {
+                            model_color_action = Some((id, ModelColorAction::Edit(edit_family)));
+                            ui.close();
+                        }
+                    })
+                    .response
+                    .on_hover_text("Override this layer with an editable BowEcho color table");
+                },
             ) {
                 ctx.request_repaint();
             }
@@ -235,6 +331,40 @@ impl ViewerApp {
         }
         if open_model_window {
             self.open_viewer(dock::WorkspacePane::Model);
+        }
+        if let Some((id, action)) = model_color_action {
+            let edit_family = match action {
+                ModelColorAction::Edit(family) => Some(family),
+                _ => None,
+            };
+            if let Some(slot) = self.model_layers.iter_mut().find(|slot| slot.id == id) {
+                match action {
+                    ModelColorAction::Auto => {
+                        slot.layer.custom_color_family = None;
+                        self.status = format!(
+                            "{} follows automatic model colors",
+                            slot.layer.field.key.var
+                        );
+                    }
+                    ModelColorAction::Use(family) | ModelColorAction::Edit(family) => {
+                        slot.layer.custom_color_family = Some(family);
+                        self.status = format!(
+                            "{} uses {} color table",
+                            slot.layer.field.key.var,
+                            family.label()
+                        );
+                    }
+                }
+                slot.layer.generation = slot.layer.generation.wrapping_add(1);
+                slot.texture = None;
+                ctx.request_repaint();
+            }
+            if let Some(family) = edit_family {
+                self.request_color_table_manager(family);
+            }
+        }
+        if let Some(source) = refresh_grid_composite {
+            self.start_grid_composite_refresh(source, ctx, true);
         }
         if let Some(id) = remove_layer {
             self.model_layers.retain(|slot| slot.id != id);
@@ -355,6 +485,79 @@ impl ViewerApp {
             self.italy_dpc_latest_rx = None;
             self.italy_dpc_render_rx = None;
             self.italy_dpc_texture = None;
+            ctx.request_repaint();
+        }
+        let taiwan_loading =
+            self.taiwan_cwa_latest_rx.is_some() || self.taiwan_cwa_render_rx.is_some();
+        let mut taiwan_refresh = false;
+        let mut taiwan_remove = false;
+        if let Some(layer) = &mut self.taiwan_cwa_layer {
+            let frame_text = layer
+                .frame_time
+                .map(|time| time.format("%H:%MZ").to_string())
+                .unwrap_or_else(|| "latest".to_owned());
+            let state = if taiwan_loading {
+                "loading"
+            } else if layer.error.is_some() {
+                "stale"
+            } else if layer.frame_time.is_some() {
+                "live"
+            } else {
+                "loading"
+            };
+            let name_hover = if let Some(error) = &layer.error {
+                format!(
+                    "Taiwan CWA O-A0059-001 composite reflectivity\nLatest fetch error: {error}"
+                )
+            } else {
+                format!("Taiwan CWA O-A0059-001 composite reflectivity\nFrame: {frame_text}")
+            };
+            if layer_row(
+                ui,
+                LayerRowSpec {
+                    vis: LayerRowVis::Toggle {
+                        value: &mut layer.visible,
+                        hover: "Show Taiwan CWA composite reflectivity on the map",
+                    },
+                    name: "Taiwan CWA REF",
+                    name_width: crate::NAME_W_WIDE,
+                    name_hover: &name_hover,
+                    state: Some(state),
+                    opacity: Some(LayerRowOpacity::F32 {
+                        value: &mut layer.opacity,
+                        min: 0.05,
+                        hover: "Taiwan CWA raster opacity",
+                    }),
+                    gear: Some(LayerRowGear::Menu {
+                        hover: "Taiwan CWA layer options",
+                        content: Box::new(|ui| {
+                            if ui.button("Refresh latest").clicked() {
+                                taiwan_refresh = true;
+                                ui.close();
+                            }
+                        }),
+                    }),
+                    remove: Some(LayerRowRemove {
+                        hover: "Remove Taiwan CWA overlay",
+                        clicked: &mut taiwan_remove,
+                    }),
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.weak(frame_text);
+                },
+            ) {
+                ctx.request_repaint();
+            }
+        }
+        if taiwan_refresh {
+            self.start_taiwan_cwa_latest_refresh(ctx, true);
+        }
+        if taiwan_remove {
+            self.taiwan_cwa_layer = None;
+            self.taiwan_cwa_latest_rx = None;
+            self.taiwan_cwa_render_rx = None;
+            self.taiwan_cwa_texture = None;
             ctx.request_repaint();
         }
         let mut remove_sat_layer = false;
@@ -523,6 +726,9 @@ impl ViewerApp {
             let obs_show_metar = &mut self.obs_show_metar;
             let obs_show_mesonet = &mut self.obs_show_mesonet;
             let obs_adjust_soundings = &mut self.obs_adjust_soundings;
+            let obs_hour_loop_enabled = &mut self.obs_hour_loop_enabled;
+            let obs_hour_loop_started_at = &mut self.obs_hour_loop_started_at;
+            let obs_hour_loop_end_utc = &mut self.obs_hour_loop_end_utc;
             let obs_fetched_at = self.obs_fetched_at;
             let obs_station_count = self.surface_obs.station_count;
             let obs_fetching =
@@ -546,6 +752,28 @@ impl ViewerApp {
                                         .on_hover_text(
                                             "IEM RWIS road sensors + DCP/RAWS networks — denser but lower siting quality (road sensors read hot in sun); uncheck for strict-QC METAR-only",
                                         );
+                            if ui
+                                .checkbox(obs_hour_loop_enabled, "Loop latest hour")
+                                .on_hover_text(
+                                    "Animate the latest hour of surface observations in 30 seconds. METARs are usually hourly; mesonet/RWIS/RAWS reports are often denser.",
+                                )
+                                .changed()
+                            {
+                                if *obs_hour_loop_enabled {
+                                    *obs_hour_loop_started_at = Instant::now();
+                                    *obs_hour_loop_end_utc = chrono::Utc::now();
+                                }
+                                ui.ctx().request_repaint();
+                            }
+                            if *obs_hour_loop_enabled && ui.button("Restart obs loop").clicked() {
+                                *obs_hour_loop_started_at = Instant::now();
+                                *obs_hour_loop_end_utc = chrono::Utc::now();
+                                ui.ctx().request_repaint();
+                            }
+                            ui.separator();
+                            ui.weak("Station plot: red T, green Td, wind barb.");
+                            ui.weak("Dots: white METAR, amber mesonet.");
+                            ui.separator();
                             if ui
                                         .checkbox(obs_adjust_soundings, "Obs-adjusted soundings")
                                         .on_hover_text(
@@ -2268,6 +2496,8 @@ impl ViewerApp {
         ui.add_space(4.0);
         let mut add_site: Option<RadarSite> = None;
         let mut add_italy_dpc: Option<ItalyDpcMapProduct> = None;
+        let mut add_taiwan_cwa = false;
+        let mut add_grid_composite: Option<grid_composites::GridCompositeSource> = None;
         ui.menu_button("+ Add layer ▾", |ui| {
                     ui.menu_button("Radar overlay", |ui| {
                         ui.set_min_width(220.0);
@@ -2343,6 +2573,31 @@ impl ViewerApp {
                         .on_hover_text(
                             "Official Protezione Civile / Radar-DPC national gridded radar products",
                         );
+                        if ui.button("Taiwan CWA composite reflectivity").clicked() {
+                            add_taiwan_cwa = true;
+                            ui.close();
+                        }
+                        ui.menu_button("MRMS", |ui| {
+                            if ui.button("Lowest-altitude reflectivity").clicked() {
+                                add_grid_composite = Some(
+                                    grid_composites::GridCompositeSource::MrmsLowestAltitudeReflectivity,
+                                );
+                                ui.close();
+                            }
+                            if ui.button("Composite reflectivity").clicked() {
+                                add_grid_composite = Some(
+                                    grid_composites::GridCompositeSource::MrmsCompositeReflectivity,
+                                );
+                                ui.close();
+                            }
+                        })
+                        .response
+                        .on_hover_text("NOAA/NCEP MRMS latest public GRIB2 grids");
+                        if ui.button("EUMETNET OPERA DBZH composite").clicked() {
+                            add_grid_composite =
+                                Some(grid_composites::GridCompositeSource::EumetnetOperaDbzh);
+                            ui.close();
+                        }
                     })
                     .response
                     .on_hover_text("National and regional gridded/composite radar layers");
@@ -2485,6 +2740,12 @@ impl ViewerApp {
         }
         if let Some(product) = add_italy_dpc {
             self.add_italy_dpc_layer(product, ctx);
+        }
+        if add_taiwan_cwa {
+            self.add_taiwan_cwa_layer(ctx);
+        }
+        if let Some(source) = add_grid_composite {
+            self.add_grid_composite_layer(source, ctx);
         }
         // A composite picked from the menu becomes a layer immediately, even
         // while the Analysis (OA) section is collapsed (its own consumer

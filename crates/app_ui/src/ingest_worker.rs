@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use rustwx_core::{CycleSpec, ModelId, SourceId};
 use rustwx_models::supported_forecast_hours;
@@ -28,6 +29,8 @@ use rw_ingest::ingest_profile::IngestProfile;
 use rw_ingest::size_estimate::{Calibration, default_calibration_paths, estimate};
 use rw_ingest::{IngestConfig, IngestError, IngestEvent, IngestStage, parse_hours, throttle};
 use rw_ui::{AvailabilityView, DownloadSpec, DownloadStage, EstimateView, HourDoneView};
+
+const AVAILABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Requests from the UI thread.
 #[derive(Debug, Clone)]
@@ -49,10 +52,14 @@ pub enum IngestResponse {
     Estimate(Box<Result<EstimateView, String>>),
     Availability(AvailabilityView),
     Latest {
+        model: String,
         date: String,
         cycle: u8,
     },
-    LatestFailed(String),
+    LatestFailed {
+        model: String,
+        message: String,
+    },
     /// A run began over these hours.
     Started {
         hours: Vec<u16>,
@@ -91,11 +98,12 @@ impl IngestWorker {
         let (resp_tx, resp_rx) = channel::<IngestResponse>();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
+        let notify: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(notify);
         let thread = std::thread::Builder::new()
             .name("rw-ingest-worker".to_string())
             .spawn(move || {
                 throttle::set_current_thread_background_priority();
-                worker_loop(store_root, &req_rx, &resp_tx, &notify, &worker_cancel);
+                worker_loop(store_root, &req_rx, &resp_tx, notify, &worker_cancel);
             })
             .expect("spawn ingest worker thread");
         Self {
@@ -142,7 +150,7 @@ fn worker_loop(
     store_root: PathBuf,
     requests: &Receiver<IngestRequest>,
     responses: &Sender<IngestResponse>,
-    notify: &(impl Fn() + Send + Sync + 'static),
+    notify: Arc<dyn Fn() + Send + Sync + 'static>,
     cancel: &AtomicBool,
 ) {
     let mut state = WorkerState {
@@ -167,24 +175,79 @@ fn worker_loop(
                 // Probe requests, and a click means "look again" — a fresh
                 // run gains hours over a session, so a per-run cache would
                 // freeze the chips while the spinner claims a fresh result.
-                let view = probe_availability(&mut state, &spec);
-                if !send(IngestResponse::Availability(view)) {
-                    return;
-                }
+                spawn_probe_task(
+                    state.store_root.clone(),
+                    spec,
+                    responses.clone(),
+                    Arc::clone(&notify),
+                );
             }
             IngestRequest::Latest(spec) => {
-                let response = match find_latest(&spec) {
-                    Ok((date, cycle)) => IngestResponse::Latest { date, cycle },
-                    Err(message) => IngestResponse::LatestFailed(message),
-                };
-                if !send(response) {
-                    return;
-                }
+                spawn_latest_task(spec, responses.clone(), Arc::clone(&notify));
             }
             IngestRequest::Start(spec) => {
-                run_download(&mut state, &spec, responses, notify, cancel);
+                run_download(&mut state, &spec, responses, notify.as_ref(), cancel);
             }
         }
+    }
+}
+
+fn spawn_probe_task(
+    store_root: PathBuf,
+    spec: DownloadSpec,
+    responses: Sender<IngestResponse>,
+    notify: Arc<dyn Fn() + Send + Sync + 'static>,
+) {
+    let fallback = spec.clone();
+    let worker_responses = responses.clone();
+    let notify_on_fail = Arc::clone(&notify);
+    let spawn_result = std::thread::Builder::new()
+        .name("rw-ingest-probe".to_string())
+        .spawn(move || {
+            throttle::set_current_thread_background_priority();
+            let view = probe_availability_bounded(store_root, spec);
+            let _ = worker_responses.send(IngestResponse::Availability(view));
+            notify();
+        });
+    if let Err(err) = spawn_result {
+        let _ = responses.send(IngestResponse::Availability(AvailabilityView {
+            model: fallback.model,
+            date: fallback.date,
+            cycle: fallback.cycle,
+            candidates: Vec::new(),
+            available: Vec::new(),
+            note: Some(format!("availability probe could not start: {err}")),
+        }));
+        notify_on_fail();
+    }
+}
+
+fn spawn_latest_task(
+    spec: DownloadSpec,
+    responses: Sender<IngestResponse>,
+    notify: Arc<dyn Fn() + Send + Sync + 'static>,
+) {
+    let model = spec.model.clone();
+    let fallback_model = model.clone();
+    let worker_responses = responses.clone();
+    let notify_on_fail = Arc::clone(&notify);
+    let spawn_result = std::thread::Builder::new()
+        .name("rw-ingest-latest".to_string())
+        .spawn(move || {
+            throttle::set_current_thread_background_priority();
+            let response = match find_latest(&spec) {
+                Ok((date, cycle)) => IngestResponse::Latest { model, date, cycle },
+                Err(message) => IngestResponse::LatestFailed { model, message },
+            };
+            let _ = worker_responses.send(response);
+            notify();
+        });
+    if let Err(err) = spawn_result {
+        let _ = responses.send(IngestResponse::LatestFailed {
+            model: fallback_model,
+            message: format!("latest-run probe could not start: {err}"),
+        });
+        notify_on_fail();
     }
 }
 
@@ -223,8 +286,7 @@ fn resolve_spec(
 }
 
 fn bowecho_ingest_supported(model: ModelId) -> bool {
-    matches!(model, ModelId::Hrrr | ModelId::Gfs | ModelId::Rap)
-        && rw_ingest::ingest_supported(model)
+    rw_ingest::ingest_supported(model)
 }
 
 /// Source spec -> override: "auto" tries every catalog source in order.
@@ -312,6 +374,58 @@ pub fn format_time_hint(
 /// pair, GFS/RAP: single pressure-grid file); an hour is available when
 /// every product the profile needs exists. A pressure-only file (HRRR
 /// `prs`) is probed only when the profile reads isobaric data.
+fn probe_availability_bounded(store_root: PathBuf, spec: DownloadSpec) -> AvailabilityView {
+    let (tx, rx) = channel();
+    let fallback_spec = spec.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name("rw-ingest-probe-net".to_string())
+        .spawn(move || {
+            throttle::set_current_thread_background_priority();
+            let mut state = WorkerState {
+                store_root,
+                pool: None,
+            };
+            let _ = tx.send(probe_availability(&mut state, &spec));
+        });
+    if let Err(err) = spawn_result {
+        return fallback_availability_view(
+            &fallback_spec,
+            format!("availability probe could not start: {err}"),
+        );
+    }
+    rx.recv_timeout(AVAILABILITY_PROBE_TIMEOUT)
+        .unwrap_or_else(|_| {
+            fallback_availability_view(
+                &fallback_spec,
+                format!(
+                    "live availability probe timed out after {}s; showing supported forecast-hour slots. Download will still try upstream sources.",
+                    AVAILABILITY_PROBE_TIMEOUT.as_secs()
+                ),
+            )
+        })
+}
+
+fn fallback_availability_view(spec: &DownloadSpec, note: String) -> AvailabilityView {
+    let mut view = AvailabilityView {
+        model: spec.model.clone(),
+        date: spec.date.clone(),
+        cycle: spec.cycle,
+        candidates: Vec::new(),
+        available: Vec::new(),
+        note: Some(note),
+    };
+    let Ok((model, _, requested_hours, _)) = resolve_spec(spec) else {
+        return view;
+    };
+    let supported = supported_forecast_hours(model, spec.cycle);
+    view.available = requested_hours
+        .into_iter()
+        .filter(|hour| supported.contains(hour))
+        .collect();
+    view.candidates = supported;
+    view
+}
+
 fn probe_availability(state: &mut WorkerState, spec: &DownloadSpec) -> AvailabilityView {
     let mut view = AvailabilityView {
         model: spec.model.clone(),
@@ -330,6 +444,13 @@ fn probe_availability(state: &mut WorkerState, spec: &DownloadSpec) -> Availabil
     };
     let products = match probe_products(model, &profile) {
         Ok(products) => products,
+        Err(message) => {
+            view.note = Some(message);
+            return view;
+        }
+    };
+    let source = match source_override(spec) {
+        Ok(source) => source,
         Err(message) => {
             view.note = Some(message);
             return view;
@@ -362,21 +483,16 @@ fn probe_availability(state: &mut WorkerState, spec: &DownloadSpec) -> Availabil
         // ahead of the mirrors, and a cycle in that window (or an AWS
         // outage) must not read as absent (field request: upload time
         // matters).
-        let aws = run(Some(SourceId::Aws))?;
-        if aws.is_empty() {
-            run(None).map(|hours| (hours, true))
-        } else {
-            Ok((aws, false))
-        }
+        run(source)
     });
     match result {
-        Ok((available, walked_catalog)) => {
+        Ok(available) => {
             view.available = available;
-            view.note = Some(if walked_catalog {
-                "probed across the source catalog (cycle not on AWS yet)".to_owned()
-            } else {
-                "probed via AWS idx".to_owned()
-            });
+            let products = products.join(", ");
+            let source = source
+                .map(|source| source.to_string())
+                .unwrap_or_else(|| "auto catalog".to_string());
+            view.note = Some(format!("probed {products} via {source}"));
         }
         Err(err) => view.note = Some(format!("availability probe failed: {err}")),
     }
@@ -397,6 +513,33 @@ fn probe_products(model: ModelId, profile: &IngestProfile) -> Result<Vec<&'stati
         .collect())
 }
 
+fn all_ingest_products(model: ModelId) -> Result<Vec<&'static str>, String> {
+    let mut products = Vec::new();
+    for entry in rw_ingest::fetch_plan(model).map_err(|err| err.to_string())? {
+        if !products.iter().any(|seen| seen == &entry.product) {
+            products.push(entry.product);
+        }
+    }
+    if products.is_empty() {
+        return Err(format!("model '{model}' has no probeable ingest products"));
+    }
+    Ok(products)
+}
+
+fn latest_probe_hour(model: ModelId) -> u16 {
+    let summary = rustwx_models::model_summary(model);
+    for candidate in [6, 0, 3, 1] {
+        if summary
+            .cycle_hours_utc
+            .iter()
+            .any(|&cycle| rustwx_models::forecast_hour_supported(model, cycle, candidate))
+        {
+            return candidate;
+        }
+    }
+    0
+}
+
 /// Newest available run for the spec's model, walking back from the spec's
 /// date. Probes the whole source catalog (or the spec's pinned source):
 /// the engine prefers the newest cycle over source priority, so a run
@@ -409,8 +552,15 @@ fn find_latest(spec: &DownloadSpec) -> Result<(String, u8), String> {
         .parse()
         .map_err(|_| format!("unknown model '{}'", spec.model))?;
     let source = source_override(spec)?;
-    let latest = rustwx_models::latest_available_run(model, source, &spec.date)
-        .map_err(|err| format!("latest-run probe failed: {err}"))?;
+    let products = all_ingest_products(model)?;
+    let latest = rustwx_models::latest_available_run_for_products_at_forecast_hour(
+        model,
+        source,
+        &spec.date,
+        &products,
+        latest_probe_hour(model),
+    )
+    .map_err(|err| format!("latest-run probe failed: {err}"))?;
     Ok((latest.cycle.date_yyyymmdd, latest.cycle.hour_utc))
 }
 
@@ -556,7 +706,7 @@ fn run_download(
     state: &mut WorkerState,
     spec: &DownloadSpec,
     responses: &Sender<IngestResponse>,
-    notify: &(impl Fn() + Send + Sync + 'static),
+    notify: &(dyn Fn() + Send + Sync + 'static),
     cancel: &AtomicBool,
 ) {
     let send = |response: IngestResponse| {
@@ -750,7 +900,8 @@ mod tests {
         let latest = recv("latest");
         println!("latest -> {latest:?}");
         match &latest {
-            IngestResponse::Latest { date, cycle } => {
+            IngestResponse::Latest { model, date, cycle } => {
+                assert_eq!(model, "gfs");
                 gfs.date = date.clone();
                 gfs.cycle = *cycle;
             }
@@ -810,6 +961,19 @@ mod tests {
         assert!(
             message.contains("outside the supported range"),
             "got: {message}"
+        );
+    }
+
+    #[test]
+    fn availability_fallback_keeps_downloadable_requested_hours() {
+        let view = fallback_availability_view(&spec(), "probe timed out".to_string());
+        assert_eq!(view.model, "hrrr");
+        assert_eq!(view.available, vec![4, 5, 6]);
+        assert!(view.candidates.contains(&4));
+        assert!(
+            view.note
+                .as_deref()
+                .is_some_and(|note| note.contains("timed out"))
         );
     }
 
@@ -940,18 +1104,14 @@ mod tests {
     }
 
     #[test]
-    fn bowecho_worker_accepts_rap_and_rejects_rrfs_until_enabled() {
+    fn bowecho_worker_accepts_rap_and_rrfs_a() {
         let mut rap = spec();
         rap.model = "rap".to_owned();
         assert!(resolve_spec(&rap).is_ok());
 
         let mut rrfs = spec();
         rrfs.model = "rrfs-a".to_owned();
-        let err = resolve_spec(&rrfs).expect_err("RRFS is not a BowEcho model option yet");
-        assert!(
-            err.contains("not ingest-supported yet"),
-            "unexpected error: {err}"
-        );
+        assert!(resolve_spec(&rrfs).is_ok());
     }
 
     #[test]
@@ -1035,7 +1195,7 @@ mod tests {
         let mut first = spec();
         first.hours = "5x".to_string(); // parse failure -> "--hours" note
         let mut second = spec();
-        second.heavy = true; // invalid on sounding -> "named surface subset"
+        second.source = "not-a-source".to_string(); // source failure after resolve_spec
         worker.send(IngestRequest::Probe(first));
         worker.send(IngestRequest::Probe(second));
         let mut notes = Vec::new();
@@ -1051,11 +1211,13 @@ mod tests {
                 other => panic!("expected Availability, got {other:?}"),
             }
         }
-        assert!(notes[0].contains("--hours"), "got: {}", notes[0]);
         assert!(
-            notes[1].contains("named surface subset"),
-            "second probe must be fresh, not the first probe's cached view; got: {}",
-            notes[1]
+            notes.iter().any(|note| note.contains("--hours")),
+            "one probe should report the bad hours parse; got: {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("unknown source")),
+            "one probe should report the bad source override; got: {notes:?}"
         );
     }
 

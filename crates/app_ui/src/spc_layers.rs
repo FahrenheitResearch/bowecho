@@ -31,21 +31,42 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc};
 use eframe::egui;
 use std::time::Instant;
 
-pub const OUTLOOK_KINDS: [(&str, &str); 4] = [
+pub const OUTLOOK_KINDS: [(&str, &str); 11] = [
     ("cat", "Categorical"),
     ("torn", "Tornado %"),
     ("wind", "Wind %"),
     ("hail", "Hail %"),
+    ("cigtorn", "CIG Tor"),
+    ("cigwind", "CIG Wind"),
+    ("cighail", "CIG Hail"),
+    ("fire_wind", "Fire wind/RH"),
+    ("fire_dryt", "Fire dry T"),
+    ("wpc_ero", "WPC ERO"),
+    ("wpc_river_flood", "WPC river flood"),
 ];
-pub const DAY2_OUTLOOK_KINDS: [(&str, &str); 5] = [
+pub const DAY2_OUTLOOK_KINDS: [(&str, &str); 12] = [
     ("cat", "Categorical"),
     ("torn", "Tornado %"),
     ("wind", "Wind %"),
     ("hail", "Hail %"),
     ("prob", "Any Severe %"),
+    ("cigtorn", "CIG Tor"),
+    ("cigwind", "CIG Wind"),
+    ("cighail", "CIG Hail"),
+    ("fire_wind", "Fire wind/RH"),
+    ("fire_dryt", "Fire dry T"),
+    ("wpc_ero", "WPC ERO"),
+    ("wpc_river_flood", "WPC river flood"),
 ];
-pub const DAY3_OUTLOOK_KINDS: [(&str, &str); 2] =
-    [("cat", "Categorical"), ("prob", "Any Severe %")];
+pub const DAY3_OUTLOOK_KINDS: [(&str, &str); 7] = [
+    ("cat", "Categorical"),
+    ("prob", "Any Severe %"),
+    ("cigprob", "CIG Severe"),
+    ("fire_wind", "Fire wind/RH"),
+    ("fire_dryt", "Fire dry T"),
+    ("wpc_ero", "WPC ERO"),
+    ("wpc_river_flood", "WPC river flood"),
+];
 
 pub const ESTOFEX_OUTLOOK_KIND: &str = "estofex";
 
@@ -77,13 +98,32 @@ fn effective_spc_outlook_kind(day: u8, kind: &str) -> Option<&'static str> {
         (1, "torn") => Some("torn"),
         (1, "wind") => Some("wind"),
         (1, "hail") => Some("hail"),
+        (1, "cigtorn") => Some("cigtorn"),
+        (1, "cigwind") => Some("cigwind"),
+        (1, "cighail") => Some("cighail"),
+        (1, "fire_wind") => Some("fire_wind"),
+        (1, "fire_dryt") => Some("fire_dryt"),
+        (1, "wpc_ero") => Some("wpc_ero"),
+        (1, "wpc_river_flood") => Some("wpc_river_flood"),
         (2, "cat") => Some("cat"),
         (2, "torn") => Some("torn"),
         (2, "wind") => Some("wind"),
         (2, "hail") => Some("hail"),
         (2, "prob") => Some("prob"),
+        (2, "cigtorn") => Some("cigtorn"),
+        (2, "cigwind") => Some("cigwind"),
+        (2, "cighail") => Some("cighail"),
+        (2, "fire_wind") => Some("fire_wind"),
+        (2, "fire_dryt") => Some("fire_dryt"),
+        (2, "wpc_ero") => Some("wpc_ero"),
+        (2, "wpc_river_flood") => Some("wpc_river_flood"),
         (3, "cat") => Some("cat"),
         (3, "prob" | "torn" | "wind" | "hail") => Some("prob"),
+        (3, "cigprob" | "cigtorn" | "cigwind" | "cighail") => Some("cigprob"),
+        (3, "fire_wind") => Some("fire_wind"),
+        (3, "fire_dryt") => Some("fire_dryt"),
+        (3, "wpc_ero") => Some("wpc_ero"),
+        (3, "wpc_river_flood") => Some("wpc_river_flood"),
         _ => None,
     }
 }
@@ -227,6 +267,50 @@ fn hex_color(value: &str) -> egui::Color32 {
     egui::Color32::from_rgb(p(0), p(2), p(4))
 }
 
+fn outlook_property_str<'a>(props: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| props.get(*key).and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn outlook_color_from_properties(props: &serde_json::Value, stroke: bool) -> egui::Color32 {
+    if let Some(value) = outlook_property_str(props, &[if stroke { "stroke" } else { "fill" }]) {
+        return hex_color(value);
+    }
+    let label = outlook_property_str(props, &["LABEL", "label", "outlook", "product", "snippet"])
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let color = if label.contains("HIGH") {
+        "#FF00FF"
+    } else if label.contains("MODERATE") || label.contains("MDT") {
+        "#FF0000"
+    } else if label.contains("SLIGHT") || label.contains("SLGT") {
+        "#FFFF00"
+    } else if label.contains("MARGINAL") || label.contains("MRGL") {
+        "#00C853"
+    } else if label.contains("OCCURRING") {
+        "#E53935"
+    } else if label.contains("LIKELY") {
+        "#FB8C00"
+    } else if label.contains("POSSIBLE") {
+        "#FDD835"
+    } else if label.contains("EXTREME") || label.contains("EXTM") {
+        "#FF00FF"
+    } else if label.contains("CRITICAL") || label.contains("CRIT") {
+        "#FF0000"
+    } else if label.contains("ELEVATED") || label.contains("ELEV") {
+        "#FFBF80"
+    } else if label.contains("SCATTERED") || label.contains("SCT") {
+        "#FF7F00"
+    } else if label.contains("ISOLATED") || label.contains("ISO") {
+        "#C89BFF"
+    } else {
+        "#808080"
+    };
+    hex_color(color)
+}
+
 /// Parse one SPC outlook GeoJSON (Polygon/MultiPolygon features with
 /// LABEL/LABEL2/fill/stroke properties). Holes are dropped — v1 renders
 /// outlines plus a translucent fill; SPC donut-holes are rare and read
@@ -241,10 +325,25 @@ pub fn parse_outlook(text: &str) -> Vec<OutlookFeature> {
     };
     for feature in features {
         let props = &feature["properties"];
-        let label = props["LABEL"].as_str().unwrap_or("").to_owned();
-        let label2 = props["LABEL2"].as_str().unwrap_or("").to_owned();
-        let fill = hex_color(props["fill"].as_str().unwrap_or(""));
-        let stroke = hex_color(props["stroke"].as_str().unwrap_or(""));
+        let label =
+            outlook_property_str(props, &["LABEL", "label", "outlook", "snippet", "product"])
+                .unwrap_or("")
+                .to_owned();
+        let label2 = outlook_property_str(
+            props,
+            &[
+                "LABEL2",
+                "label2",
+                "product",
+                "valid_time",
+                "VALID_ISO",
+                "valid",
+            ],
+        )
+        .unwrap_or("")
+        .to_owned();
+        let fill = outlook_color_from_properties(props, false);
+        let stroke = outlook_color_from_properties(props, true);
         let geom = &feature["geometry"];
         let parse_ring = |ring: &serde_json::Value| -> Vec<(f32, f32)> {
             ring.as_array()
@@ -286,6 +385,29 @@ pub fn parse_outlook(text: &str) -> Vec<OutlookFeature> {
                     for poly in polys {
                         if let Some(polygon) = parse_polygon(poly) {
                             polygons.push(polygon);
+                        }
+                    }
+                }
+            }
+            Some("GeometryCollection") => {
+                if let Some(geometries) = geom["geometries"].as_array() {
+                    for geometry in geometries {
+                        match geometry["type"].as_str() {
+                            Some("Polygon") => {
+                                if let Some(polygon) = parse_polygon(&geometry["coordinates"]) {
+                                    polygons.push(polygon);
+                                }
+                            }
+                            Some("MultiPolygon") => {
+                                if let Some(polys) = geometry["coordinates"].as_array() {
+                                    for poly in polys {
+                                        if let Some(polygon) = parse_polygon(poly) {
+                                            polygons.push(polygon);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -429,6 +551,10 @@ fn live_pts_url(day: u8) -> Option<&'static str> {
         4..=8 => Some("https://tgftp.nws.noaa.gov/data/raw/wu/wuus48.kwns.pts.d48.txt"),
         _ => None,
     }
+}
+
+fn standard_spc_outlook_kind(kind: &str) -> bool {
+    matches!(kind, "cat" | "torn" | "wind" | "hail" | "prob")
 }
 
 fn pts_section_name(kind: &str) -> Option<&'static str> {
@@ -1381,6 +1507,51 @@ pub fn fetch_event_day(convective: NaiveDate) -> Result<EventDayData, String> {
 }
 
 fn live_outlook_urls(day: u8, kind: &str, now: DateTime<Utc>) -> Vec<String> {
+    match kind {
+        "cigtorn" | "cigwind" | "cighail" if matches!(day, 1 | 2) => {
+            return vec![format!(
+                "https://www.spc.noaa.gov/products/outlook/day{day}otlk_{kind}.lyr.geojson"
+            )];
+        }
+        "cigprob" if day == 3 => {
+            return vec![
+                "https://www.spc.noaa.gov/products/outlook/day3otlk_cigprob.lyr.geojson".to_owned(),
+            ];
+        }
+        "fire_wind" if matches!(day, 1 | 2) => {
+            return vec![format!(
+                "https://www.spc.noaa.gov/products/fire_wx/day{day}fw_windrh.lyr.geojson"
+            )];
+        }
+        "fire_dryt" if matches!(day, 1 | 2) => {
+            return vec![format!(
+                "https://www.spc.noaa.gov/products/fire_wx/day{day}fw_dryt.lyr.geojson"
+            )];
+        }
+        "fire_wind" if day >= 3 => {
+            return vec![format!(
+                "https://www.spc.noaa.gov/products/exper/fire_wx/day{day}fw_windrhcat.lyr.geojson"
+            )];
+        }
+        "fire_dryt" if day >= 3 => {
+            return vec![format!(
+                "https://www.spc.noaa.gov/products/exper/fire_wx/day{day}fw_drytcat.lyr.geojson"
+            )];
+        }
+        "wpc_ero" if (1..=5).contains(&day) => {
+            return vec![format!(
+                "https://mapservices.weather.noaa.gov/vector/rest/services/hazards/wpc_precip_hazards/MapServer/{}/query?where=1%3D1&outFields=*&returnGeometry=true&f=geojson",
+                day - 1
+            )];
+        }
+        "wpc_river_flood" => {
+            return vec![
+                "https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/sig_riv_fld_outlk/MapServer/0/query?where=1%3D1&outFields=*&returnGeometry=true&f=geojson"
+                    .to_owned(),
+            ];
+        }
+        _ => {}
+    }
     let live_url =
         format!("https://www.spc.noaa.gov/products/outlook/day{day}otlk_{kind}.lyr.geojson");
     if day == 1 && (1..12).contains(&now.hour()) {
@@ -1415,7 +1586,8 @@ pub fn fetch_spc(
     let now = Utc::now();
     let spc_kinds = effective_spc_outlook_kinds(day, outlook_kinds);
     let wants_estofex = outlook_kinds.contains(&ESTOFEX_OUTLOOK_KIND);
-    let live_pts = if archive_date.is_none() && !spc_kinds.is_empty() {
+    let wants_standard_spc = spc_kinds.iter().any(|kind| standard_spc_outlook_kind(kind));
+    let live_pts = if archive_date.is_none() && wants_standard_spc {
         live_pts_url(day).and_then(|url| data_source::fetch_text(url).ok())
     } else {
         None
@@ -1431,6 +1603,7 @@ pub fn fetch_spc(
             None => live_outlook_urls(day, kind, now)
                 .into_iter()
                 .find_map(|url| data_source::fetch_text(&url).ok()),
+            Some(_) if !standard_spc_outlook_kind(kind) => None,
             Some((y, m, d)) => ["2000", "1630", "1300", "1200", "0100"]
                 .iter()
                 .find_map(|issue| {
@@ -1480,6 +1653,7 @@ pub fn fetch_spc(
                 );
             }
             let overlay_pts = archive_date.is_none()
+                && standard_spc_outlook_kind(kind)
                 && live_pts_issue
                     .zip(geojson_issue)
                     .map(|(pts_issue, geojson_issue)| {
@@ -1499,8 +1673,10 @@ pub fn fetch_spc(
             let features = parse_outlook(&text);
             data.outlooks.push((kind.to_owned(), features));
         } else {
-            missing_geojson_outlook = true;
-            if archive_date.is_none() {
+            if standard_spc_outlook_kind(kind) {
+                missing_geojson_outlook = true;
+            }
+            if archive_date.is_none() && standard_spc_outlook_kind(kind) {
                 let pts_features = live_pts
                     .as_deref()
                     .map(|pts_text| parse_pts_outlook(pts_text, kind))
@@ -1515,7 +1691,7 @@ pub fn fetch_spc(
         data.estofex_issues = fetch_estofex_issues();
     }
     data.outlook_geojson_lagging = archive_date.is_none()
-        && !spc_kinds.is_empty()
+        && wants_standard_spc
         && live_pts_issue
             .map(|pts_issue| {
                 missing_geojson_outlook
@@ -1556,6 +1732,17 @@ mod tests {
         // Base colors, fully opaque — alphas are a draw-time style concern.
         assert_eq!(parsed[0].fill, egui::Color32::from_rgb(0xFF, 0xE0, 0x66));
         assert_eq!(parsed[0].stroke, egui::Color32::from_rgb(0xDD, 0xAA, 0x00));
+    }
+
+    #[test]
+    fn parses_wpc_outlook_features_without_spc_style_properties() {
+        let sample = r#"{"features":[{"properties":{"outlook":"Likely","product":"WPC river flood outlook","valid_time":"Sat Jun 27 2026"},"geometry":{"type":"Polygon","coordinates":[[[-95.0,40.0],[-94.0,40.0],[-94.0,41.0],[-95.0,40.0]]]}}]}"#;
+        let parsed = parse_outlook(sample);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].label, "Likely");
+        assert_eq!(parsed[0].label2, "WPC river flood outlook");
+        assert_eq!(parsed[0].fill, egui::Color32::from_rgb(0xFB, 0x8C, 0x00));
+        assert_eq!(parsed[0].rings[0].len(), 4);
     }
 
     #[test]
@@ -1646,6 +1833,29 @@ PROBABILISTIC OUTLOOK POINTS DAY 3\n\
                 Utc.with_ymd_and_hms(2026, 6, 16, 20, 0, 0).unwrap()
             ),
             vec!["https://www.spc.noaa.gov/products/outlook/day3otlk_prob.lyr.geojson"]
+        );
+    }
+
+    #[test]
+    fn new_outlook_sources_use_official_live_urls() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 27, 18, 0, 0).unwrap();
+        assert_eq!(
+            live_outlook_urls(1, "cigwind", now),
+            vec!["https://www.spc.noaa.gov/products/outlook/day1otlk_cigwind.lyr.geojson"]
+        );
+        assert_eq!(
+            live_outlook_urls(2, "fire_dryt", now),
+            vec!["https://www.spc.noaa.gov/products/fire_wx/day2fw_dryt.lyr.geojson"]
+        );
+        assert_eq!(
+            live_outlook_urls(3, "fire_wind", now),
+            vec!["https://www.spc.noaa.gov/products/exper/fire_wx/day3fw_windrhcat.lyr.geojson"]
+        );
+        assert_eq!(
+            live_outlook_urls(1, "wpc_ero", now),
+            vec![
+                "https://mapservices.weather.noaa.gov/vector/rest/services/hazards/wpc_precip_hazards/MapServer/0/query?where=1%3D1&outFields=*&returnGeometry=true&f=geojson"
+            ]
         );
     }
 
