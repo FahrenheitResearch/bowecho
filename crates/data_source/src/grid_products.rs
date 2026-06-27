@@ -7,6 +7,16 @@
 //! future decoders a typed target without pretending that every European
 //! product is a radar site.
 
+use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, REFERER};
+use serde::{Deserialize, Serialize};
+
+const ITALY_DPC_API_BASE: &str = "https://radar-api.protezionecivile.it";
+const ITALY_DPC_ORIGIN: &str = "https://radar.protezionecivile.it";
+const ITALY_DPC_WMTS_BASE: &str = "https://radar-geowebcache.protezionecivile.it/service/wmts";
+const ITALY_DPC_WMTS_MATRIX_SET: &str = "EPSG:900913";
+const ITALY_DPC_WMTS_FORMAT: &str = "image/png";
+
 /// The product family a gridded source contributes to BowEcho.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GridProductKind {
@@ -17,13 +27,17 @@ pub enum GridProductKind {
     Qpe,
     Nowcast,
     EchoTops,
+    ConstantAltitudePpi,
     HailProbability,
     CellTracking,
     ThreeDimensionalComposite,
+    VerticallyIntegratedLiquid,
     VerticalMaximumIntensity,
     HeavyRainDetection,
     Lightning,
     RadarStatus,
+    CloudCover,
+    Temperature,
     Warning,
     Discovery,
 }
@@ -33,6 +47,7 @@ pub enum GridProductKind {
 pub enum GridCodec {
     OdimH5Grid,
     CloudOptimizedGeoTiff,
+    GeoTiff,
     Hdf5Grid,
     NetcdfGrid,
     Zarr,
@@ -51,6 +66,8 @@ pub enum GridAccess {
     RestApi,
     EdrApi,
     Mqtt,
+    WebSocket,
+    WmsWmts,
     PortalDownload,
 }
 
@@ -60,6 +77,7 @@ pub enum GridAccess {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GridImplementationStatus {
     Catalogued,
+    Fetchable,
     DecoderNeeded,
 }
 
@@ -114,6 +132,444 @@ impl GridProductProvider for StaticGridProductProvider {
     }
 }
 
+/// One Italy DPC v2 REST-downloadable product.
+///
+/// These product type ids are the values accepted by
+/// `findLastProductByType` and `downloadProduct`. They are kept separate
+/// from the display catalog because a few DPC layers, such as `SITES`, are
+/// visible through WMTS/status paths but are not downloadable through the
+/// raw-file endpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ItalyDpcProductSpec {
+    pub product_type: &'static str,
+    pub slug: &'static str,
+}
+
+/// One Italy DPC WMTS layer available as a Web-Mercator PNG tile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ItalyDpcWmtsLayerSpec {
+    pub key: &'static str,
+    pub wmts_layer: &'static str,
+    pub style: &'static str,
+    pub product_type: Option<&'static str>,
+    pub product_slug: Option<&'static str>,
+}
+
+const ITALY_DPC_FETCHABLE_PRODUCTS: &[ItalyDpcProductSpec] = &[
+    ItalyDpcProductSpec {
+        product_type: "VMI",
+        slug: "italy-dpc-vmi",
+    },
+    ItalyDpcProductSpec {
+        product_type: "SRI",
+        slug: "italy-dpc-sri",
+    },
+    ItalyDpcProductSpec {
+        product_type: "SRT1",
+        slug: "italy-dpc-srt",
+    },
+    ItalyDpcProductSpec {
+        product_type: "CUM3",
+        slug: "italy-dpc-cum3",
+    },
+    ItalyDpcProductSpec {
+        product_type: "CUM6",
+        slug: "italy-dpc-cum6",
+    },
+    ItalyDpcProductSpec {
+        product_type: "CUM12",
+        slug: "italy-dpc-cum12",
+    },
+    ItalyDpcProductSpec {
+        product_type: "CUM24",
+        slug: "italy-dpc-cum24",
+    },
+    ItalyDpcProductSpec {
+        product_type: "CAPPI_1",
+        slug: "italy-dpc-cappi-1km",
+    },
+    ItalyDpcProductSpec {
+        product_type: "CAPPI_2",
+        slug: "italy-dpc-cappi-2km",
+    },
+    ItalyDpcProductSpec {
+        product_type: "CAPPI_3",
+        slug: "italy-dpc-cappi-3km",
+    },
+    ItalyDpcProductSpec {
+        product_type: "CAPPI_4",
+        slug: "italy-dpc-cappi-4km",
+    },
+    ItalyDpcProductSpec {
+        product_type: "CAPPI_5",
+        slug: "italy-dpc-cappi-5km",
+    },
+    ItalyDpcProductSpec {
+        product_type: "CAPPI_6",
+        slug: "italy-dpc-cappi-6km",
+    },
+    ItalyDpcProductSpec {
+        product_type: "CAPPI_7",
+        slug: "italy-dpc-cappi-7km",
+    },
+    ItalyDpcProductSpec {
+        product_type: "CAPPI_8",
+        slug: "italy-dpc-cappi-8km",
+    },
+    ItalyDpcProductSpec {
+        product_type: "CAPPI_9",
+        slug: "italy-dpc-cappi-9km",
+    },
+    ItalyDpcProductSpec {
+        product_type: "CAPPI_10",
+        slug: "italy-dpc-cappi-10km",
+    },
+    ItalyDpcProductSpec {
+        product_type: "VIL",
+        slug: "italy-dpc-vil",
+    },
+    ItalyDpcProductSpec {
+        product_type: "ETM",
+        slug: "italy-dpc-etm",
+    },
+    ItalyDpcProductSpec {
+        product_type: "POH",
+        slug: "italy-dpc-poh",
+    },
+    ItalyDpcProductSpec {
+        product_type: "IR_108",
+        slug: "italy-dpc-ir108",
+    },
+    ItalyDpcProductSpec {
+        product_type: "TEMP",
+        slug: "italy-dpc-temp",
+    },
+];
+
+const ITALY_DPC_WMTS_LAYERS: &[ItalyDpcWmtsLayerSpec] = &[
+    ItalyDpcWmtsLayerSpec {
+        key: "vmi",
+        wmts_layer: "radar:vmi",
+        style: "vmi",
+        product_type: Some("VMI"),
+        product_slug: Some("italy-dpc-vmi"),
+    },
+    ItalyDpcWmtsLayerSpec {
+        key: "sri",
+        wmts_layer: "radar:sri",
+        style: "sri",
+        product_type: Some("SRI"),
+        product_slug: Some("italy-dpc-sri"),
+    },
+    ItalyDpcWmtsLayerSpec {
+        key: "srt1",
+        wmts_layer: "radar:srt1",
+        style: "srt",
+        product_type: Some("SRT1"),
+        product_slug: Some("italy-dpc-srt"),
+    },
+    ItalyDpcWmtsLayerSpec {
+        key: "srt3",
+        wmts_layer: "radar:srt3",
+        style: "srt",
+        product_type: Some("CUM3"),
+        product_slug: Some("italy-dpc-cum3"),
+    },
+    ItalyDpcWmtsLayerSpec {
+        key: "srt6",
+        wmts_layer: "radar:srt6",
+        style: "srt",
+        product_type: Some("CUM6"),
+        product_slug: Some("italy-dpc-cum6"),
+    },
+    ItalyDpcWmtsLayerSpec {
+        key: "srt12",
+        wmts_layer: "radar:srt12",
+        style: "srt",
+        product_type: Some("CUM12"),
+        product_slug: Some("italy-dpc-cum12"),
+    },
+    ItalyDpcWmtsLayerSpec {
+        key: "srt24",
+        wmts_layer: "radar:srt24",
+        style: "srt",
+        product_type: Some("CUM24"),
+        product_slug: Some("italy-dpc-cum24"),
+    },
+    ItalyDpcWmtsLayerSpec {
+        key: "hrd",
+        wmts_layer: "radar:hrd",
+        style: "polygon",
+        product_type: None,
+        product_slug: Some("italy-dpc-heavy-rain"),
+    },
+    ItalyDpcWmtsLayerSpec {
+        key: "radardpc",
+        wmts_layer: "radar:radardpc",
+        style: "radardpc",
+        product_type: None,
+        product_slug: Some("italy-dpc-sites"),
+    },
+    ItalyDpcWmtsLayerSpec {
+        key: "ir108",
+        wmts_layer: "radar:ir108",
+        style: "ir108",
+        product_type: Some("IR_108"),
+        product_slug: Some("italy-dpc-ir108"),
+    },
+    ItalyDpcWmtsLayerSpec {
+        key: "temperature",
+        wmts_layer: "radar:temperature",
+        style: "temperature",
+        product_type: Some("TEMP"),
+        product_slug: Some("italy-dpc-temp"),
+    },
+];
+
+/// Italy DPC product types that BowEcho can plan through the v2 REST API.
+pub fn italy_dpc_fetchable_products() -> &'static [ItalyDpcProductSpec] {
+    ITALY_DPC_FETCHABLE_PRODUCTS
+}
+
+/// Italy DPC layers that can be fetched through the OGC WMTS endpoint.
+pub fn italy_dpc_wmts_layers() -> &'static [ItalyDpcWmtsLayerSpec] {
+    ITALY_DPC_WMTS_LAYERS
+}
+
+/// Build a DPC WMTS GetTile URL for an EPSG:900913/Web-Mercator tile.
+///
+/// Passing `None` for `time` intentionally requests DPC's current value for
+/// the layer. Renderers that cache tiles should pass an explicit product
+/// timestamp and include that timestamp in their cache key.
+pub fn italy_dpc_wmts_tile_url(
+    layer_key: &str,
+    zoom: u8,
+    tile_col: u32,
+    tile_row: u32,
+    time: Option<DateTime<Utc>>,
+) -> Result<String, String> {
+    let layer = italy_dpc_wmts_layer(layer_key)?;
+    let mut url = format!(
+        "{ITALY_DPC_WMTS_BASE}?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER={}&STYLE={}&TILEMATRIXSET={ITALY_DPC_WMTS_MATRIX_SET}&TILEMATRIX={ITALY_DPC_WMTS_MATRIX_SET}:{zoom}&TILEROW={tile_row}&TILECOL={tile_col}&FORMAT={ITALY_DPC_WMTS_FORMAT}",
+        layer.wmts_layer, layer.style
+    );
+    if let Some(time) = time {
+        url.push_str("&TIME=");
+        url.push_str(&format_italy_dpc_wmts_time(time));
+    }
+    Ok(url)
+}
+
+fn italy_dpc_wmts_layer(layer_key: &str) -> Result<&'static ItalyDpcWmtsLayerSpec, String> {
+    let key = layer_key.trim();
+    ITALY_DPC_WMTS_LAYERS
+        .iter()
+        .find(|layer| {
+            layer.key.eq_ignore_ascii_case(key)
+                || layer.wmts_layer.eq_ignore_ascii_case(key)
+                || layer
+                    .product_type
+                    .map(|product_type| product_type.eq_ignore_ascii_case(key))
+                    .unwrap_or(false)
+                || layer
+                    .product_slug
+                    .map(|slug| slug.eq_ignore_ascii_case(key))
+                    .unwrap_or(false)
+        })
+        .ok_or_else(|| format!("Italy DPC: unsupported WMTS layer '{layer_key}'"))
+}
+
+fn format_italy_dpc_wmts_time(time: DateTime<Utc>) -> String {
+    time.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// Latest timestamp metadata for one Italy DPC product.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ItalyDpcLatestProduct {
+    pub product_type: String,
+    pub product_time_millis: i64,
+    pub period: String,
+}
+
+impl ItalyDpcLatestProduct {
+    pub fn time_utc(&self) -> Option<DateTime<Utc>> {
+        Utc.timestamp_millis_opt(self.product_time_millis).single()
+    }
+}
+
+/// Download plan for one Italy DPC raw product file.
+///
+/// The URL is short-lived. Use `identity` for dedupe/cache keys because it is
+/// derived from the stable S3 bucket/key and ignores the expiring signature.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ItalyDpcDownloadPlan {
+    pub product_type: String,
+    pub product_time_millis: i64,
+    pub period: Option<String>,
+    pub bucket: String,
+    pub key: String,
+    pub url: String,
+    pub expires_seconds: Option<u32>,
+    pub identity: String,
+}
+
+/// Query the current DPC timestamp for a downloadable product type.
+pub fn italy_dpc_latest_product(product_type: &str) -> Result<ItalyDpcLatestProduct, String> {
+    let product_type = canonical_italy_dpc_product_type(product_type)?;
+    let url = format!(
+        "{ITALY_DPC_API_BASE}/findLastProductByType?type={product_type}&origin={ITALY_DPC_ORIGIN}"
+    );
+    let text =
+        crate::fetch_text(&url).map_err(|err| format!("Italy DPC latest {product_type}: {err}"))?;
+    parse_italy_dpc_latest_response(&text, product_type)
+}
+
+/// Request a short-lived raw-file URL for a known DPC product timestamp.
+pub fn italy_dpc_download_plan(
+    product_type: &str,
+    product_time_millis: i64,
+) -> Result<ItalyDpcDownloadPlan, String> {
+    let product_type = canonical_italy_dpc_product_type(product_type)?;
+    request_italy_dpc_download_plan(product_type, product_time_millis, None)
+}
+
+/// Query the latest timestamp, then request a short-lived raw-file URL.
+pub fn italy_dpc_latest_download_plan(product_type: &str) -> Result<ItalyDpcDownloadPlan, String> {
+    let latest = italy_dpc_latest_product(product_type)?;
+    request_italy_dpc_download_plan(
+        &latest.product_type,
+        latest.product_time_millis,
+        Some(latest.period),
+    )
+}
+
+fn request_italy_dpc_download_plan(
+    product_type: &str,
+    product_time_millis: i64,
+    period: Option<String>,
+) -> Result<ItalyDpcDownloadPlan, String> {
+    let client = crate::metadata_http_client();
+    let request = ItalyDpcDownloadRequest {
+        product_type,
+        product_date: product_time_millis,
+    };
+    let body = serde_json::to_string(&request)
+        .map_err(|err| format!("Italy DPC download {product_type}: JSON encode failed: {err}"))?;
+    let response = client
+        .post(format!("{ITALY_DPC_API_BASE}/downloadProduct"))
+        .header(ACCEPT, "application/json,*/*")
+        .header(CONTENT_TYPE, "application/json")
+        .header("origin", ITALY_DPC_ORIGIN)
+        .header(REFERER, format!("{ITALY_DPC_ORIGIN}/"))
+        .body(body)
+        .send()
+        .and_then(|response| response.error_for_status())
+        .map_err(|err| {
+            format!(
+                "Italy DPC download {product_type}: {}",
+                crate::reqwest_error_chain(&err)
+            )
+        })?
+        .text()
+        .map_err(|err| {
+            format!(
+                "Italy DPC download {product_type}: {}",
+                crate::reqwest_error_chain(&err)
+            )
+        })?;
+    let parsed = parse_italy_dpc_download_response(&response, product_type, product_time_millis)?;
+    Ok(ItalyDpcDownloadPlan {
+        product_type: product_type.to_owned(),
+        product_time_millis,
+        period,
+        identity: format!("italy-dpc/{}/{}", parsed.bucket, parsed.key),
+        bucket: parsed.bucket,
+        key: parsed.key,
+        url: parsed.url,
+        expires_seconds: parsed.expires_seconds,
+    })
+}
+
+fn canonical_italy_dpc_product_type(product_type: &str) -> Result<&'static str, String> {
+    ITALY_DPC_FETCHABLE_PRODUCTS
+        .iter()
+        .find(|spec| spec.product_type.eq_ignore_ascii_case(product_type.trim()))
+        .map(|spec| spec.product_type)
+        .ok_or_else(|| format!("Italy DPC: unsupported downloadable product type '{product_type}'"))
+}
+
+fn parse_italy_dpc_latest_response(
+    text: &str,
+    product_type: &str,
+) -> Result<ItalyDpcLatestProduct, String> {
+    let response: ItalyDpcLatestResponse = serde_json::from_str(text)
+        .map_err(|err| format!("Italy DPC latest {product_type}: JSON parse failed: {err}"))?;
+    if response.total == 0 || response.last_products.is_empty() {
+        return Err(format!(
+            "Italy DPC latest {product_type}: no product available"
+        ));
+    }
+    let latest = response
+        .last_products
+        .into_iter()
+        .find(|product| product.product_type.eq_ignore_ascii_case(product_type))
+        .ok_or_else(|| {
+            format!("Italy DPC latest {product_type}: response did not include requested product")
+        })?;
+    Ok(ItalyDpcLatestProduct {
+        product_type: product_type.to_owned(),
+        product_time_millis: latest.time,
+        period: latest.period,
+    })
+}
+
+fn parse_italy_dpc_download_response(
+    text: &str,
+    product_type: &str,
+    product_time_millis: i64,
+) -> Result<ItalyDpcDownloadResponse, String> {
+    let response: ItalyDpcDownloadResponse = serde_json::from_str(text)
+        .map_err(|err| format!("Italy DPC download {product_type}: JSON parse failed: {err}"))?;
+    if response.bucket.is_empty() || response.key.is_empty() || response.url.is_empty() {
+        return Err(format!(
+            "Italy DPC download {product_type}/{product_time_millis}: missing bucket, key, or url"
+        ));
+    }
+    Ok(response)
+}
+
+#[derive(Debug, Deserialize)]
+struct ItalyDpcLatestResponse {
+    total: usize,
+    #[serde(rename = "lastProducts", default)]
+    last_products: Vec<ItalyDpcLatestProductResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ItalyDpcLatestProductResponse {
+    #[serde(rename = "productType")]
+    product_type: String,
+    time: i64,
+    period: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ItalyDpcDownloadRequest<'a> {
+    #[serde(rename = "productType")]
+    product_type: &'a str,
+    #[serde(rename = "productDate")]
+    product_date: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ItalyDpcDownloadResponse {
+    bucket: String,
+    key: String,
+    url: String,
+    #[serde(rename = "expiresSeconds")]
+    expires_seconds: Option<u32>,
+}
+
 const OPERA_CODECS: &[GridCodec] = &[GridCodec::OdimH5Grid, GridCodec::CloudOptimizedGeoTiff];
 const ORD_API_CODECS: &[GridCodec] = &[
     GridCodec::EdrJson,
@@ -124,7 +580,11 @@ const HDF5_GRID: &[GridCodec] = &[GridCodec::Hdf5Grid];
 const KNMI_GRID: &[GridCodec] = &[GridCodec::Hdf5Grid, GridCodec::NetcdfGrid];
 const SWISS_GRID: &[GridCodec] = &[GridCodec::Hdf5Grid, GridCodec::NetcdfGrid];
 const RADOLAN_CODECS: &[GridCodec] = &[GridCodec::ApiJson, GridCodec::Hdf5Grid];
-const ITALY_CODECS: &[GridCodec] = &[GridCodec::GeoReferencedImage, GridCodec::Zarr];
+const ITALY_CODECS: &[GridCodec] = &[
+    GridCodec::GeoTiff,
+    GridCodec::GeoReferencedImage,
+    GridCodec::Zarr,
+];
 const IMAGE_CODECS: &[GridCodec] = &[GridCodec::GeoReferencedImage];
 const METEOALARM_CODECS: &[GridCodec] = &[
     GridCodec::GeoJson,
@@ -136,8 +596,13 @@ const BUCKET_AND_API: &[GridAccess] = &[GridAccess::AnonymousBucket, GridAccess:
 const API_AND_MQTT: &[GridAccess] = &[GridAccess::RestApi, GridAccess::Mqtt, GridAccess::EdrApi];
 const OPEN_BUCKET: &[GridAccess] = &[GridAccess::AnonymousBucket];
 const REST_API: &[GridAccess] = &[GridAccess::RestApi];
+const ITALY_DPC_ACCESS: &[GridAccess] = &[
+    GridAccess::RestApi,
+    GridAccess::WmsWmts,
+    GridAccess::WebSocket,
+];
+const ITALY_DPC_WMTS: &[GridAccess] = &[GridAccess::WmsWmts];
 const OPEN_HTTP: &[GridAccess] = &[GridAccess::OpenHttp];
-const PORTAL_DOWNLOAD: &[GridAccess] = &[GridAccess::PortalDownload];
 
 const OPERA_PRODUCTS: &[GridProduct] = &[
     GridProduct {
@@ -389,9 +854,9 @@ const ITALY_PRODUCTS: &[GridProduct] = &[
         resolution_km: None,
         forecast_hours: None,
         codecs: ITALY_CODECS,
-        access: PORTAL_DOWNLOAD,
-        status: GridImplementationStatus::DecoderNeeded,
-        source_hint: "Civil Protection national vertical maximum intensity composite",
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type VMI; raw GeoTIFF download plus WMTS tiles, composite not polar site data",
     },
     GridProduct {
         slug: "italy-dpc-sri",
@@ -401,21 +866,225 @@ const ITALY_PRODUCTS: &[GridProduct] = &[
         resolution_km: None,
         forecast_hours: None,
         codecs: ITALY_CODECS,
-        access: PORTAL_DOWNLOAD,
-        status: GridImplementationStatus::DecoderNeeded,
-        source_hint: "Civil Protection surface rainfall intensity composite",
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type SRI; surface rainfall-intensity GeoTIFF composite",
     },
     GridProduct {
         slug: "italy-dpc-srt",
-        label: "Italy DPC SRT",
+        label: "Italy DPC SRT 1h",
         kind: GridProductKind::Accumulation,
         cadence_minutes: Some(5),
         resolution_km: None,
         forecast_hours: None,
         codecs: ITALY_CODECS,
-        access: PORTAL_DOWNLOAD,
-        status: GridImplementationStatus::DecoderNeeded,
-        source_hint: "Civil Protection rainfall totals; 1/3/6/12/24h product family",
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type SRT1; one-hour radar/rain-gauge accumulation",
+    },
+    GridProduct {
+        slug: "italy-dpc-cum3",
+        label: "Italy DPC Accum 3h",
+        kind: GridProductKind::Accumulation,
+        cadence_minutes: Some(30),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type CUM3; 3-hour station-derived accumulation GeoTIFF",
+    },
+    GridProduct {
+        slug: "italy-dpc-cum6",
+        label: "Italy DPC Accum 6h",
+        kind: GridProductKind::Accumulation,
+        cadence_minutes: Some(30),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type CUM6; 6-hour station-derived accumulation GeoTIFF",
+    },
+    GridProduct {
+        slug: "italy-dpc-cum12",
+        label: "Italy DPC Accum 12h",
+        kind: GridProductKind::Accumulation,
+        cadence_minutes: Some(30),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type CUM12; 12-hour station-derived accumulation GeoTIFF",
+    },
+    GridProduct {
+        slug: "italy-dpc-cum24",
+        label: "Italy DPC Accum 24h",
+        kind: GridProductKind::Accumulation,
+        cadence_minutes: Some(30),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type CUM24; 24-hour station-derived accumulation GeoTIFF",
+    },
+    GridProduct {
+        slug: "italy-dpc-cappi-1km",
+        label: "Italy DPC CAPPI 1 km",
+        kind: GridProductKind::ConstantAltitudePpi,
+        cadence_minutes: Some(5),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type CAPPI_1; gridded constant-altitude reflectivity, not a native radar volume",
+    },
+    GridProduct {
+        slug: "italy-dpc-cappi-2km",
+        label: "Italy DPC CAPPI 2 km",
+        kind: GridProductKind::ConstantAltitudePpi,
+        cadence_minutes: Some(5),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type CAPPI_2; gridded constant-altitude reflectivity, not a native radar volume",
+    },
+    GridProduct {
+        slug: "italy-dpc-cappi-3km",
+        label: "Italy DPC CAPPI 3 km",
+        kind: GridProductKind::ConstantAltitudePpi,
+        cadence_minutes: Some(5),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type CAPPI_3; gridded constant-altitude reflectivity, not a native radar volume",
+    },
+    GridProduct {
+        slug: "italy-dpc-cappi-4km",
+        label: "Italy DPC CAPPI 4 km",
+        kind: GridProductKind::ConstantAltitudePpi,
+        cadence_minutes: Some(5),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type CAPPI_4; gridded constant-altitude reflectivity, not a native radar volume",
+    },
+    GridProduct {
+        slug: "italy-dpc-cappi-5km",
+        label: "Italy DPC CAPPI 5 km",
+        kind: GridProductKind::ConstantAltitudePpi,
+        cadence_minutes: Some(5),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type CAPPI_5; gridded constant-altitude reflectivity, not a native radar volume",
+    },
+    GridProduct {
+        slug: "italy-dpc-cappi-6km",
+        label: "Italy DPC CAPPI 6 km",
+        kind: GridProductKind::ConstantAltitudePpi,
+        cadence_minutes: Some(5),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type CAPPI_6; gridded constant-altitude reflectivity, not a native radar volume",
+    },
+    GridProduct {
+        slug: "italy-dpc-cappi-7km",
+        label: "Italy DPC CAPPI 7 km",
+        kind: GridProductKind::ConstantAltitudePpi,
+        cadence_minutes: Some(5),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type CAPPI_7; gridded constant-altitude reflectivity, not a native radar volume",
+    },
+    GridProduct {
+        slug: "italy-dpc-cappi-8km",
+        label: "Italy DPC CAPPI 8 km",
+        kind: GridProductKind::ConstantAltitudePpi,
+        cadence_minutes: Some(5),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type CAPPI_8; gridded constant-altitude reflectivity, not a native radar volume",
+    },
+    GridProduct {
+        slug: "italy-dpc-cappi-9km",
+        label: "Italy DPC CAPPI 9 km",
+        kind: GridProductKind::ConstantAltitudePpi,
+        cadence_minutes: Some(5),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type CAPPI_9; gridded constant-altitude reflectivity, not a native radar volume",
+    },
+    GridProduct {
+        slug: "italy-dpc-cappi-10km",
+        label: "Italy DPC CAPPI 10 km",
+        kind: GridProductKind::ConstantAltitudePpi,
+        cadence_minutes: Some(5),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type CAPPI_10; gridded constant-altitude reflectivity, not a native radar volume",
+    },
+    GridProduct {
+        slug: "italy-dpc-vil",
+        label: "Italy DPC VIL",
+        kind: GridProductKind::VerticallyIntegratedLiquid,
+        cadence_minutes: Some(5),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type VIL; gridded vertically integrated liquid product",
+    },
+    GridProduct {
+        slug: "italy-dpc-etm",
+        label: "Italy DPC Echo Top Map",
+        kind: GridProductKind::EchoTops,
+        cadence_minutes: Some(5),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type ETM; gridded echo-top map product",
+    },
+    GridProduct {
+        slug: "italy-dpc-poh",
+        label: "Italy DPC Probability of Hail",
+        kind: GridProductKind::HailProbability,
+        cadence_minutes: Some(5),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type POH; gridded hail-probability product",
     },
     GridProduct {
         slug: "italy-dpc-heavy-rain",
@@ -425,9 +1094,9 @@ const ITALY_PRODUCTS: &[GridProduct] = &[
         resolution_km: None,
         forecast_hours: None,
         codecs: ITALY_CODECS,
-        access: PORTAL_DOWNLOAD,
-        status: GridImplementationStatus::DecoderNeeded,
-        source_hint: "Civil Protection heavy rain detection product family",
+        access: ITALY_DPC_WMTS,
+        status: GridImplementationStatus::Catalogued,
+        source_hint: "DPC WMTS layer radar:hrd; live REST download endpoint returned no raw HRD file in 2026-06 probe",
     },
     GridProduct {
         slug: "italy-dpc-lightning",
@@ -437,21 +1106,45 @@ const ITALY_PRODUCTS: &[GridProduct] = &[
         resolution_km: None,
         forecast_hours: None,
         codecs: ITALY_CODECS,
-        access: PORTAL_DOWNLOAD,
-        status: GridImplementationStatus::DecoderNeeded,
-        source_hint: "Civil Protection lightning overlay product",
+        access: ITALY_DPC_WMTS,
+        status: GridImplementationStatus::Catalogued,
+        source_hint: "DPC platform lightning overlay; not exposed by the v2 raw-file endpoint in current docs/probe",
     },
     GridProduct {
-        slug: "italy-dpc-radar-status",
-        label: "Italy DPC Radar Status",
+        slug: "italy-dpc-sites",
+        label: "Italy DPC Radar Sites/Status",
         kind: GridProductKind::RadarStatus,
         cadence_minutes: Some(5),
         resolution_km: None,
         forecast_hours: None,
         codecs: ITALY_CODECS,
-        access: PORTAL_DOWNLOAD,
-        status: GridImplementationStatus::DecoderNeeded,
-        source_hint: "Civil Protection radar status overlay",
+        access: ITALY_DPC_WMTS,
+        status: GridImplementationStatus::Catalogued,
+        source_hint: "DPC WMTS layer radar:radardpc and REST type SITES metadata; not a polar site-volume provider",
+    },
+    GridProduct {
+        slug: "italy-dpc-ir108",
+        label: "Italy DPC MSG IR 10.8",
+        kind: GridProductKind::CloudCover,
+        cadence_minutes: Some(5),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type IR_108; companion satellite cloud-cover GeoTIFF",
+    },
+    GridProduct {
+        slug: "italy-dpc-temp",
+        label: "Italy DPC Temperature",
+        kind: GridProductKind::Temperature,
+        cadence_minutes: Some(60),
+        resolution_km: None,
+        forecast_hours: None,
+        codecs: ITALY_CODECS,
+        access: ITALY_DPC_ACCESS,
+        status: GridImplementationStatus::Fetchable,
+        source_hint: "DPC REST type TEMP; station-derived temperature GeoTIFF",
     },
 ];
 
@@ -534,7 +1227,7 @@ const GRID_PROVIDERS: &[StaticGridProductProvider] = &[
         id: "italy-dpc",
         label: "Italy DPC / ItaliaMeteo",
         region: "Italy",
-        docs_url: "https://www.agenziaitaliameteo.it/",
+        docs_url: "https://dpc-radar.readthedocs.io/it/latest/api.html",
         products: ITALY_PRODUCTS,
     },
     StaticGridProductProvider {
@@ -578,7 +1271,7 @@ pub fn grid_products()
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
 
@@ -612,6 +1305,11 @@ mod tests {
             "italy-dpc-vmi",
             "italy-dpc-sri",
             "italy-dpc-srt",
+            "italy-dpc-cappi-1km",
+            "italy-dpc-vil",
+            "italy-dpc-etm",
+            "italy-dpc-poh",
+            "italy-dpc-sites",
             "aemet-lowest-elevation-reflectivity",
             "ipma-precipitation-intensity",
             "meteoalarm-warnings",
@@ -639,5 +1337,185 @@ mod tests {
                 .iter()
                 .any(|product| product.access.contains(&GridAccess::Mqtt))
         );
+    }
+
+    #[test]
+    fn italy_dpc_catalog_marks_fetchable_products_without_creating_sites() {
+        let italy = grid_product_providers()
+            .iter()
+            .find(|provider| provider.id == "italy-dpc")
+            .expect("Italy DPC provider");
+        let slugs: BTreeSet<_> = italy.products.iter().map(|product| product.slug).collect();
+        for spec in italy_dpc_fetchable_products() {
+            let product = italy
+                .products
+                .iter()
+                .find(|product| product.slug == spec.slug)
+                .unwrap_or_else(|| panic!("{} missing from Italy catalog", spec.slug));
+            assert_eq!(product.status, GridImplementationStatus::Fetchable);
+            assert!(product.access.contains(&GridAccess::RestApi));
+            assert!(product.codecs.contains(&GridCodec::GeoTiff));
+        }
+        assert!(slugs.contains("italy-dpc-sites"));
+        let sites = italy
+            .products
+            .iter()
+            .find(|product| product.slug == "italy-dpc-sites")
+            .expect("DPC sites/status row");
+        assert_eq!(sites.status, GridImplementationStatus::Catalogued);
+        assert!(
+            sites
+                .source_hint
+                .contains("not a polar site-volume provider"),
+            "{}",
+            sites.source_hint
+        );
+    }
+
+    #[test]
+    fn italy_dpc_srt_and_cum_product_types_are_distinct() {
+        let fetchable: BTreeMap<_, _> = italy_dpc_fetchable_products()
+            .iter()
+            .map(|spec| (spec.product_type, spec.slug))
+            .collect();
+
+        assert_eq!(fetchable.get("SRT1"), Some(&"italy-dpc-srt"));
+        assert_eq!(fetchable.get("CUM12"), Some(&"italy-dpc-cum12"));
+        assert_eq!(fetchable.get("CUM24"), Some(&"italy-dpc-cum24"));
+        assert_ne!(fetchable.get("CUM12"), fetchable.get("CUM24"));
+    }
+
+    #[test]
+    fn italy_dpc_latest_response_parses_epoch_ms_and_period() {
+        let latest = parse_italy_dpc_latest_response(
+            r#"{
+                "total": 1,
+                "lastProducts": [{
+                    "productType": "VMI",
+                    "time": 1782498000000,
+                    "period": "PT5M"
+                }]
+            }"#,
+            "VMI",
+        )
+        .expect("latest response parses");
+
+        assert_eq!(latest.product_type, "VMI");
+        assert_eq!(latest.period, "PT5M");
+        assert_eq!(
+            latest.time_utc().expect("valid timestamp").to_rfc3339(),
+            "2026-06-26T18:20:00+00:00"
+        );
+    }
+
+    #[test]
+    fn italy_dpc_download_identity_uses_stable_bucket_key() {
+        let parsed = parse_italy_dpc_download_response(
+            r#"{
+                "bucket": "s3-prod-dpc-radar",
+                "key": "VMI/26-06-2026-18-20.tif",
+                "url": "https://s3-prod-dpc-radar.s3.eu-south-1.amazonaws.com/VMI/26-06-2026-18-20.tif?X-Amz-Signature=abc",
+                "expiresSeconds": 300
+            }"#,
+            "VMI",
+            1782498000000,
+        )
+        .expect("download response parses");
+        let plan = ItalyDpcDownloadPlan {
+            product_type: "VMI".to_owned(),
+            product_time_millis: 1782498000000,
+            period: Some("PT5M".to_owned()),
+            identity: format!("italy-dpc/{}/{}", parsed.bucket, parsed.key),
+            bucket: parsed.bucket,
+            key: parsed.key,
+            url: parsed.url,
+            expires_seconds: parsed.expires_seconds,
+        };
+
+        assert_eq!(
+            plan.identity,
+            "italy-dpc/s3-prod-dpc-radar/VMI/26-06-2026-18-20.tif"
+        );
+        assert!(
+            !plan.identity.contains("X-Amz"),
+            "identity must ignore expiring signature"
+        );
+        assert_eq!(plan.expires_seconds, Some(300));
+    }
+
+    #[test]
+    fn italy_dpc_product_type_validation_is_canonical_and_closed() {
+        assert_eq!(canonical_italy_dpc_product_type("vmi").unwrap(), "VMI");
+        assert_eq!(
+            canonical_italy_dpc_product_type(" CAPPI_10 ").unwrap(),
+            "CAPPI_10"
+        );
+        assert!(canonical_italy_dpc_product_type("SITES").is_err());
+        assert!(canonical_italy_dpc_product_type("../VMI").is_err());
+    }
+
+    #[test]
+    fn italy_dpc_wmts_tile_url_uses_official_web_mercator_parameters() {
+        let url = italy_dpc_wmts_tile_url("vmi", 5, 16, 11, None).expect("VMI WMTS URL");
+
+        assert!(url.starts_with("https://radar-geowebcache.protezionecivile.it/service/wmts?"));
+        assert!(url.contains("SERVICE=WMTS"));
+        assert!(url.contains("REQUEST=GetTile"));
+        assert!(url.contains("LAYER=radar:vmi"));
+        assert!(url.contains("STYLE=vmi"));
+        assert!(url.contains("TILEMATRIXSET=EPSG:900913"));
+        assert!(url.contains("TILEMATRIX=EPSG:900913:5"));
+        assert!(url.contains("TILEROW=11"));
+        assert!(url.contains("TILECOL=16"));
+        assert!(url.contains("FORMAT=image/png"));
+        assert!(
+            !url.contains("TIME="),
+            "omitting time requests DPC current value"
+        );
+    }
+
+    #[test]
+    fn italy_dpc_wmts_tile_url_accepts_product_aliases_and_styles() {
+        let url = italy_dpc_wmts_tile_url("CUM3", 8, 131, 89, None).expect("CUM3 WMTS URL");
+        assert!(url.contains("LAYER=radar:srt3"), "{url}");
+        assert!(
+            url.contains("STYLE=srt"),
+            "DPC SRT accumulation layers share the srt style: {url}"
+        );
+
+        let sites = italy_dpc_wmts_tile_url("italy-dpc-sites", 8, 131, 89, None)
+            .expect("radar site/status WMTS URL");
+        assert!(sites.contains("LAYER=radar:radardpc"), "{sites}");
+        assert!(sites.contains("STYLE=radardpc"), "{sites}");
+    }
+
+    #[test]
+    fn italy_dpc_wmts_tile_url_formats_optional_time_as_iso8601_millis() {
+        let time = Utc
+            .timestamp_millis_opt(1782498000000)
+            .single()
+            .expect("valid timestamp");
+        let url =
+            italy_dpc_wmts_tile_url("radar:vmi", 5, 16, 11, Some(time)).expect("timed WMTS URL");
+
+        assert!(url.contains("TIME=2026-06-26T18:20:00.000Z"), "{url}");
+        assert_eq!(format_italy_dpc_wmts_time(time), "2026-06-26T18:20:00.000Z");
+        assert!(italy_dpc_wmts_tile_url("regioni", 5, 16, 11, None).is_err());
+    }
+
+    /// Live DPC smoke test. It queries the latest VMI timestamp and asks the
+    /// REST API for a presigned GeoTIFF URL without downloading the file.
+    ///
+    /// Run manually with:
+    /// `cargo test -p data_source italy_dpc_live_latest_download_plan -- --ignored --nocapture`
+    #[test]
+    #[ignore = "live Italy DPC endpoint probe"]
+    fn italy_dpc_live_latest_download_plan() {
+        let plan = italy_dpc_latest_download_plan("VMI").expect("DPC VMI plan");
+        println!("{plan:?}");
+        assert_eq!(plan.product_type, "VMI");
+        assert!(plan.key.ends_with(".tif"));
+        assert!(plan.identity.contains(&plan.key));
+        assert!(!plan.identity.contains("X-Amz"));
     }
 }

@@ -1,10 +1,12 @@
 //! Surface observations layer — METAR station plots on the radar map.
 //!
 //! v1 source: aviationweather.gov's full METAR cache (one gzipped CSV,
-//! every reporting station, no API key, updated ~minutely). Source
-//! selection + QC thresholds follow the user's hrrr-mesoanalysis obs
-//! pipeline (github.com/FahrenheitResearch/hrrr-mesoanalysis); the IEM
-//! multi-network mesonet density (currents.json) is the planned v1.5.
+//! every reporting station, no API key, updated ~minutely), with the
+//! Iowa Environmental Mesonet's global ASOS/AWOS/METAR archive as a
+//! slower no-key history/backfill source. Source selection + QC
+//! thresholds follow the user's hrrr-mesoanalysis obs pipeline
+//! (github.com/FahrenheitResearch/hrrr-mesoanalysis); IEM multi-network
+//! mesonet density (currents.json) provides non-METAR CONUS density.
 //!
 //! Plots draw GR2A-style: temperature (red) upper-left, dewpoint
 //! (green) lower-left — °F, or °C when Settings ▸ Display ▸ Units is
@@ -12,10 +14,11 @@
 //! high zoom. A screen-grid declutter keeps roughly one station per
 //! cell, preferring fuller reports.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use std::io::Read;
 
 const METAR_CACHE_URL: &str = "https://aviationweather.gov/data/cache/metars.cache.csv.gz";
+const IEM_ASOS_URL: &str = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py";
 
 /// One decoded surface observation (units as plotted).
 #[derive(Clone, Debug)]
@@ -52,6 +55,20 @@ pub fn fetch_surface_obs() -> Result<Vec<SurfaceOb>, String> {
         .read_to_string(&mut text)
         .map_err(|err| format!("gunzip: {err}"))?;
     parse_metar_cache(&text)
+}
+
+/// Fetch the IEM global ASOS/AWOS/METAR archive for the trailing two
+/// hours. This is a single bounded CSV request (not per-station fanout)
+/// and intentionally excludes high-frequency one-minute ASOS reports so
+/// it behaves like a global METAR history/backfill source.
+pub fn fetch_iem_global_metar_obs() -> Result<Vec<SurfaceOb>, String> {
+    let url = format!(
+        "{IEM_ASOS_URL}?data=tmpf&data=dwpf&data=drct&data=sknt&data=gust&data=alti&data=metar\
+         &hours=2&tz=Etc%2FUTC&format=onlycomma&latlon=yes&elev=yes&missing=empty&trace=T\
+         &report_type=3&report_type=4"
+    );
+    let text = data_source::fetch_listing_text(&url).map_err(|err| err.to_string())?;
+    parse_iem_asos_csv(&text)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -288,6 +305,127 @@ fn parse_row(columns: &[&str], line: &str) -> Option<SurfaceOb> {
     })
 }
 
+fn parse_iem_asos_csv(text: &str) -> Result<Vec<SurfaceOb>, String> {
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let Some(header) = lines.next() else {
+        return Err("IEM ASOS CSV empty".to_owned());
+    };
+    if !header.starts_with("station,") {
+        return Err("IEM ASOS CSV header not found".to_owned());
+    }
+    let columns = header.split(',').collect::<Vec<_>>();
+    let mut obs = Vec::new();
+    for line in lines {
+        if let Some(ob) = parse_iem_asos_row(&columns, line) {
+            obs.push(ob);
+        }
+    }
+    Ok(obs)
+}
+
+fn parse_iem_asos_row(columns: &[&str], line: &str) -> Option<SurfaceOb> {
+    let fields = split_csv(line);
+    let get = |name: &str| -> Option<&str> {
+        let index = columns.iter().position(|c| *c == name)?;
+        fields.get(index).copied().filter(|v| !v.is_empty())
+    };
+    let f32_of = |name: &str| get(name).and_then(|v| v.parse::<f32>().ok());
+
+    let lat = f32_of("lat")?;
+    let lon = f32_of("lon")?;
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return None;
+    }
+    let f_to_c = |deg_f: f32| (deg_f - 32.0) * 5.0 / 9.0;
+    let temp_c = f32_of("tmpf")
+        .map(f_to_c)
+        .filter(|t| (-60.0..=55.0).contains(t));
+    let dewpoint_c = f32_of("dwpf")
+        .map(f_to_c)
+        .filter(|t| (-60.0..=40.0).contains(t));
+    let wind_dir_deg = f32_of("drct").filter(|d| (0.0..=360.0).contains(d));
+    let wind_speed_kt = f32_of("sknt").filter(|w| (0.0..250.0).contains(w));
+    let wind_gust_kt = f32_of("gust").filter(|w| (0.0..250.0).contains(w));
+    let altim_in_hg = f32_of("alti").filter(|a| (25.0..=33.0).contains(a));
+    let completeness = temp_c.is_some() as u8
+        + dewpoint_c.is_some() as u8
+        + wind_speed_kt.is_some() as u8
+        + altim_in_hg.is_some() as u8
+        + wind_gust_kt.is_some() as u8;
+    if completeness == 0 {
+        return None;
+    }
+    let time_utc = get("valid")
+        .and_then(parse_iem_valid_time)
+        .or_else(|| get("metar").and_then(parse_raw_metar_time));
+    let fallback_station = get("station").unwrap_or("?");
+    let station_id = station_id_from_raw_metar(get("metar").unwrap_or(""), fallback_station);
+    Some(SurfaceOb {
+        station_id,
+        time_utc,
+        lat,
+        lon,
+        temp_c,
+        dewpoint_c,
+        wind_dir_deg,
+        wind_speed_kt,
+        wind_gust_kt,
+        altim_in_hg,
+        completeness,
+        network: "METAR".to_owned(),
+        elevation_m: f32_of("elevation").filter(|e| (-430.0..=4500.0).contains(e)),
+    })
+}
+
+fn parse_iem_valid_time(value: &str) -> Option<DateTime<Utc>> {
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M"))
+        .ok()
+        .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+}
+
+fn station_id_from_raw_metar(raw: &str, fallback: &str) -> String {
+    let mut tokens = raw.split_whitespace();
+    let mut candidate = tokens.next().unwrap_or(fallback);
+    if matches!(candidate, "METAR" | "SPECI") {
+        candidate = tokens.next().unwrap_or(fallback);
+    }
+    if candidate == "COR" {
+        candidate = tokens.next().unwrap_or(fallback);
+    }
+    let candidate = candidate.trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+    if candidate.is_empty() {
+        fallback.to_ascii_uppercase()
+    } else {
+        candidate.to_ascii_uppercase()
+    }
+}
+
+fn parse_raw_metar_time(raw: &str) -> Option<DateTime<Utc>> {
+    let token = raw
+        .split_whitespace()
+        .find(|token| token.len() == 7 && token.ends_with('Z'))?;
+    let day = token.get(0..2)?.parse::<u32>().ok()?;
+    let hour = token.get(2..4)?.parse::<u32>().ok()?;
+    let minute = token.get(4..6)?.parse::<u32>().ok()?;
+    let now = Utc::now();
+    let mut candidates = Vec::new();
+    for month_offset in -1..=1 {
+        let date = now.date_naive();
+        let month0 = date.month0() as i32 + month_offset;
+        let year = date.year() + month0.div_euclid(12);
+        let month = month0.rem_euclid(12) as u32 + 1;
+        if let Some(candidate) = chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .and_then(|date| date.and_hms_opt(hour, minute, 0))
+        {
+            candidates.push(DateTime::<Utc>::from_naive_utc_and_offset(candidate, Utc));
+        }
+    }
+    candidates
+        .into_iter()
+        .min_by_key(|candidate| (now - *candidate).num_seconds().abs())
+}
+
 // ---- IEM multi-network mesonet density (v1.5 source) ----
 //
 // Iowa Environmental Mesonet currents.json per network — RWIS road
@@ -488,6 +626,26 @@ impl ObPool {
             .filter_map(move |station| self.ob_at(station, frame_time))
     }
 
+    /// Iterate one representative ob per station for `frame_time`, after a
+    /// cheap station-location cull. This avoids resolving/drawing dense
+    /// global obs pools for stations far outside the current map view.
+    pub fn frame_obs_in_bounds(
+        &self,
+        frame_time: DateTime<Utc>,
+        bounds: ObBounds,
+    ) -> impl Iterator<Item = &SurfaceOb> {
+        self.by_station.iter().filter_map(move |(station, list)| {
+            let latest = list.last()?;
+            if !lon_in_bounds(latest.lon, bounds.west, bounds.east)
+                || latest.lat < bounds.south
+                || latest.lat > bounds.north
+            {
+                return None;
+            }
+            self.ob_at(station, frame_time)
+        })
+    }
+
     pub fn stale_metars_in_bounds(
         &self,
         bounds: ObBounds,
@@ -536,6 +694,14 @@ impl ObPool {
     }
 }
 
+fn lon_in_bounds(lon: f32, west: f32, east: f32) -> bool {
+    if west <= east {
+        lon >= west && lon <= east
+    } else {
+        lon >= west || lon <= east
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +716,66 @@ mod tests {
         assert_eq!(ob.temp_c, Some(25.0));
         assert_eq!(ob.wind_gust_kt, Some(13.0));
         assert!(ob.completeness >= 4);
+    }
+
+    #[test]
+    fn parses_iem_global_metar_rows_and_normalizes_station_ids() {
+        use chrono::TimeZone;
+        let text = concat!(
+            "station,valid,lon,lat,elevation,tmpf,dwpf,drct,sknt,gust,alti,metar\n",
+            "OYE,2026-06-26 18:25,-90.4900,28.8700,-18.00,86.00,75.20,130.00,7.00,,30.13,KOYE 261825Z AUTO 13007KT 9SM 30/24 A3013 RMK A01\n",
+            "EYKA,2026-06-26 18:20,24.0848,54.9639,77.00,71.60,57.20,20.00,3.00,,30.12,EYKA 261820Z 02003KT CAVOK 22/14 Q1020\n",
+            "BAD,2026-06-26 18:20,199.0,54.0,10.00,70.00,50.00,20.00,3.00,,30.12,BAD 261820Z AUTO\n",
+        );
+        let obs = parse_iem_asos_csv(text).expect("IEM ASOS parse");
+        assert_eq!(obs.len(), 2, "QC drops the impossible longitude row");
+
+        let gulf = &obs[0];
+        assert_eq!(gulf.station_id, "KOYE");
+        assert_eq!(
+            gulf.time_utc,
+            Some(Utc.with_ymd_and_hms(2026, 6, 26, 18, 25, 0).unwrap())
+        );
+        assert!((gulf.temp_c.unwrap() - 30.0).abs() < 0.01);
+        assert!((gulf.dewpoint_c.unwrap() - 24.0).abs() < 0.01);
+        assert_eq!(gulf.wind_dir_deg, Some(130.0));
+        assert_eq!(gulf.wind_speed_kt, Some(7.0));
+        assert_eq!(gulf.altim_in_hg, Some(30.13));
+        assert_eq!(gulf.network, "METAR");
+
+        let lithuania = &obs[1];
+        assert_eq!(lithuania.station_id, "EYKA");
+        assert!((lithuania.temp_c.unwrap() - 22.0).abs() < 0.01);
+        assert_eq!(lithuania.elevation_m, Some(77.0));
+    }
+
+    #[test]
+    fn raw_metar_station_ids_skip_report_prefixes() {
+        assert_eq!(
+            station_id_from_raw_metar("METAR COR KOKC 261800Z 18010KT", "OKC"),
+            "KOKC"
+        );
+        assert_eq!(
+            station_id_from_raw_metar("SPECI CYOW 261801Z 24012KT", "YOW"),
+            "CYOW"
+        );
+        assert_eq!(station_id_from_raw_metar("", "dsm"), "DSM");
+    }
+
+    #[test]
+    #[ignore]
+    fn live_iem_global_metar_backfill_smoke() {
+        let obs = fetch_iem_global_metar_obs().expect("fetch IEM global METARs");
+        println!("IEM global METAR rows: {}", obs.len());
+        assert!(obs.len() > 1000, "unexpectedly sparse IEM METAR pull");
+        assert!(
+            obs.iter().any(|ob| ob.lon > -20.0 && ob.lon < 60.0),
+            "expected Europe/Africa longitude coverage"
+        );
+        assert!(
+            obs.iter().any(|ob| ob.lat < 0.0),
+            "expected Southern Hemisphere METAR coverage"
+        );
     }
 
     #[test]

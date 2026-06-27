@@ -153,6 +153,26 @@ impl ModelDataDock {
         self.latest_sounding.as_ref()
     }
 
+    /// Whether the reusable rw-ui sounding panel has model sounding content
+    /// ready for an external host pane/window.
+    pub fn sounding_has_content(&self) -> bool {
+        self.sounding.has_content()
+    }
+
+    /// Render the reusable rw-ui sounding panel outside the Model Data dock.
+    pub fn sounding_ui(&mut self, ui: &mut egui::Ui) {
+        self.handle_responses();
+        self.sounding.ui(ui);
+    }
+
+    pub fn sounding_view_state_json(&self) -> serde_json::Value {
+        self.sounding.view_state_json()
+    }
+
+    pub fn apply_sounding_view_state_json(&mut self, value: &serde_json::Value) -> bool {
+        self.sounding.apply_view_state_json(value)
+    }
+
     /// Newest (model, run, hour-count) in the store tree — freshness display.
     pub fn newest_run(&self) -> Option<(String, String, usize)> {
         let tree = self.tree.as_ref()?;

@@ -46,6 +46,7 @@ mod fonts;
 mod glm_layer;
 mod guide;
 mod ingest_worker;
+mod italy_dpc;
 mod layers_rail;
 mod media;
 mod mesoanalysis;
@@ -1585,6 +1586,11 @@ struct ViewerApp {
     /// Raster tile basemap (satellite/streets/topo) under the radar.
     tile_layer: std::cell::RefCell<tiles::TileLayer>,
     basemap_style: tiles::TileStyle,
+    /// Official Italy DPC gridded/composite radar overlay via raw GeoTIFF download.
+    italy_dpc_layer: Option<ItalyDpcMapLayer>,
+    italy_dpc_latest_rx: Option<mpsc::Receiver<ItalyDpcLatestResult>>,
+    italy_dpc_texture: Option<(egui::TextureHandle, u64, ModelLayerView)>,
+    italy_dpc_render_rx: Option<mpsc::Receiver<ModelLayerRender>>,
     bold_labels: bool,
     /// One-shot: force the Settings color-tables fold open (set by the
     /// product color row's "Edit…" jump).
@@ -1965,6 +1971,8 @@ struct ViewerApp {
     surface_obs: obs::ObPool,
     obs_fetched_at: Option<Instant>,
     obs_rx: Option<mpsc::Receiver<std::result::Result<Vec<obs::SurfaceOb>, String>>>,
+    iem_metar_fetched_at: Option<Instant>,
+    iem_metar_rx: Option<mpsc::Receiver<std::result::Result<Vec<obs::SurfaceOb>, String>>>,
     nws_obs_fetched_at: Option<Instant>,
     nws_obs_rx: Option<mpsc::Receiver<Vec<obs::SurfaceOb>>>,
     mesonet_fetched_at: Option<Instant>,
@@ -2000,6 +2008,7 @@ struct ViewerApp {
     native_sounding_rx: Option<NativeSoundingReceiver>,
     /// Which SoundingData the current/in-flight native build came from.
     native_sounding_src: Option<Arc<rw_ui::SoundingData>>,
+    sounding_viewer_source: SoundingViewerSource,
     native_skewt_open: bool,
     /// Volumes fetched per archive loop load.
     archive_frame_count: usize,
@@ -3468,6 +3477,13 @@ type RotationMarkersResult = (FrameWorkKey, Vec<RotationMarker>);
 type ModelLutEntry = (String, Arc<model_layer::InverseLut>);
 type NativeSoundingReceiver =
     mpsc::Receiver<std::result::Result<(rustwx_sounding::NativeSounding, f32), String>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoundingViewerSource {
+    Model,
+    NativeOnly,
+}
+
 /// (generation, view key, raster, render ms) from the model-layer render thread.
 /// GOES frame as a radar-map layer: palette-colored image + inverse
 /// geolocation (same world-anchored draw as the model layer; sat sits
@@ -3484,6 +3500,100 @@ struct SatMapLayer {
     visible: bool,
     generation: u64,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ItalyDpcMapProduct {
+    Vmi,
+    Sri,
+    Srt1,
+    Cum3,
+    Cum6,
+    Cum12,
+    Cum24,
+}
+
+impl ItalyDpcMapProduct {
+    const ALL: [Self; 7] = [
+        Self::Vmi,
+        Self::Sri,
+        Self::Srt1,
+        Self::Cum3,
+        Self::Cum6,
+        Self::Cum12,
+        Self::Cum24,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Vmi => "VMI reflectivity",
+            Self::Sri => "SRI rain rate",
+            Self::Srt1 => "SRT 1h radar/gauge accumulation",
+            Self::Cum3 => "3h cumulative rain-gauge accumulation",
+            Self::Cum6 => "6h cumulative rain-gauge accumulation",
+            Self::Cum12 => "12h cumulative rain-gauge accumulation",
+            Self::Cum24 => "24h cumulative rain-gauge accumulation",
+        }
+    }
+
+    fn short_label(self) -> &'static str {
+        match self {
+            Self::Vmi => "VMI",
+            Self::Sri => "SRI",
+            Self::Srt1 => "SRT 1h",
+            Self::Cum3 => "Accum 3h",
+            Self::Cum6 => "Accum 6h",
+            Self::Cum12 => "Accum 12h",
+            Self::Cum24 => "Accum 24h",
+        }
+    }
+
+    fn product_type(self) -> &'static str {
+        match self {
+            Self::Vmi => "VMI",
+            Self::Sri => "SRI",
+            Self::Srt1 => "SRT1",
+            Self::Cum3 => "CUM3",
+            Self::Cum6 => "CUM6",
+            Self::Cum12 => "CUM12",
+            Self::Cum24 => "CUM24",
+        }
+    }
+}
+
+struct ItalyDpcMapLayer {
+    product: ItalyDpcMapProduct,
+    visible: bool,
+    opacity: f32,
+    product_time_millis: Option<i64>,
+    period: Option<String>,
+    source_identity: Option<String>,
+    frame: Option<Arc<italy_dpc::ItalyDpcRasterFrame>>,
+    last_refresh_attempt: Option<Instant>,
+    fetched_at: Option<Instant>,
+    error: Option<String>,
+}
+
+impl ItalyDpcMapLayer {
+    fn new(product: ItalyDpcMapProduct) -> Self {
+        Self {
+            product,
+            visible: true,
+            opacity: 0.78,
+            product_time_millis: None,
+            period: None,
+            source_identity: None,
+            frame: None,
+            last_refresh_attempt: None,
+            fetched_at: None,
+            error: None,
+        }
+    }
+}
+
+type ItalyDpcLatestResult = (
+    ItalyDpcMapProduct,
+    std::result::Result<italy_dpc::ItalyDpcRasterFrame, String>,
+);
 
 /// One stacked model map layer: the layer data + its private texture and
 /// render channel (renders are independent; a slow layer never blocks the
@@ -5856,6 +5966,10 @@ impl ViewerApp {
             loop_timeline_summary_cache: std::cell::RefCell::new(None),
             tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(settings::tile_cache_dir())),
             basemap_style: tiles::TileStyle::DarkVector,
+            italy_dpc_layer: None,
+            italy_dpc_latest_rx: None,
+            italy_dpc_texture: None,
+            italy_dpc_render_rx: None,
             open_color_tables_request: false,
             bold_labels: true,
             browsing_history: false,
@@ -6079,6 +6193,8 @@ impl ViewerApp {
             surface_obs: obs::ObPool::new(),
             obs_fetched_at: None,
             obs_rx: None,
+            iem_metar_fetched_at: None,
+            iem_metar_rx: None,
             nws_obs_fetched_at: None,
             nws_obs_rx: None,
             mesonet_fetched_at: None,
@@ -6099,6 +6215,7 @@ impl ViewerApp {
             native_sounding: None,
             native_sounding_rx: None,
             native_sounding_src: None,
+            sounding_viewer_source: SoundingViewerSource::NativeOnly,
             native_skewt_open: false,
             archive_frame_count: restored_archive_frame_count,
             archive_loaded_range: None,
@@ -6192,7 +6309,7 @@ impl ViewerApp {
             .map(|mut entries| entries.next().is_some())
             .unwrap_or(false)
         {
-            app.model_dock = Some(model_data::ModelDataDock::new(&cc.egui_ctx, model_store));
+            app.model_dock = Some(app.new_model_data_dock(&cc.egui_ctx, model_store));
         }
         app
     }
@@ -11579,6 +11696,7 @@ impl ViewerApp {
                 .any(|layer| layer.pending_render_key.is_some())
             || self.model_layer_build_rx.is_some()
             || self.sat_layer_render_rx.is_some()
+            || self.italy_dpc_render_rx.is_some()
             || self.vol3d.resample_rx.is_some()
     }
 
@@ -16552,6 +16670,7 @@ impl eframe::App for ViewerApp {
             self.maybe_sync_satellite_map_to_timeline(&ctx);
         }
         self.poll_sat_layer(&ctx);
+        self.poll_italy_dpc_layer(&ctx);
         self.poll_model_ingest(&ctx);
         // Drain the flexible-download worker every frame, not just while its
         // UI is visible — closing the Model window mid-download used to
@@ -16801,6 +16920,7 @@ impl eframe::App for ViewerApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_sounding_view_state();
         if self.workspace.dirty {
             self.persist_workspace_layout();
         }
@@ -17973,7 +18093,7 @@ impl ViewerApp {
                             .map(|mut entries| entries.next().is_some())
                             .unwrap_or(false)
                         {
-                            self.model_dock = Some(model_data::ModelDataDock::new(ctx, store));
+                            self.model_dock = Some(self.new_model_data_dock(ctx, store));
                         }
                     }
                     self.maybe_sync_model_to_timeline(ctx);
@@ -19526,6 +19646,38 @@ impl ViewerApp {
         );
         self.remembered_section(
             ui,
+            "data_grid_composites",
+            "Grid / Composites",
+            true,
+            |app, ui| {
+                ui.weak("Official gridded radar layers that draw on the map.");
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button("Show Italy DPC VMI")
+                        .on_hover_text("Add the current Italian national VMI radar composite from the raw DPC GeoTIFF")
+                        .clicked()
+                    {
+                        app.add_italy_dpc_layer(ItalyDpcMapProduct::Vmi, ctx);
+                    }
+                    ui.menu_button("Products", |ui| {
+                        ui.set_min_width(220.0);
+                        for product in ItalyDpcMapProduct::ALL {
+                            if ui.button(product.label()).clicked() {
+                                app.add_italy_dpc_layer(product, ctx);
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Protezione Civile / Radar-DPC national raw GeoTIFF composites");
+                });
+                if let Some(layer) = &app.italy_dpc_layer {
+                    ui.weak(format!("Active: Italy DPC {}", layer.product.short_label()));
+                }
+            },
+        );
+        self.remembered_section(
+            ui,
             "data_ord_archive",
             "ORD per-site archive",
             true,
@@ -20764,7 +20916,7 @@ impl ViewerApp {
                     .map(|mut entries| entries.next().is_some())
                     .unwrap_or(false)
                 {
-                    self.model_dock = Some(model_data::ModelDataDock::new(ctx, store));
+                    self.model_dock = Some(self.new_model_data_dock(ctx, store));
                 }
             }
             ctx.request_repaint();
@@ -24841,6 +24993,16 @@ impl ViewerApp {
                 self.status_or_activity_label("Model ingest running"),
             ));
         }
+        if self.italy_dpc_latest_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                self.status_or_activity_label("Italy DPC raw GeoTIFF"),
+            ));
+        }
+        if self.italy_dpc_render_rx.is_some() {
+            return Some(BackgroundActivity::indeterminate(
+                self.status_or_activity_label("Rendering Italy DPC layer"),
+            ));
+        }
         if self.oa_rx.is_some() {
             return Some(BackgroundActivity::indeterminate(
                 self.status_or_activity_label("Analyzing observations"),
@@ -24982,7 +25144,11 @@ impl ViewerApp {
         if self.raob_sites_rx.is_some() {
             return Some(BackgroundActivity::indeterminate("Loading RAOB sites"));
         }
-        if self.obs_rx.is_some() || self.nws_obs_rx.is_some() || self.mesonet_rx.is_some() {
+        if self.obs_rx.is_some()
+            || self.iem_metar_rx.is_some()
+            || self.nws_obs_rx.is_some()
+            || self.mesonet_rx.is_some()
+        {
             return Some(BackgroundActivity::indeterminate("Loading surface obs"));
         }
         if self.native_sounding_rx.is_some() {
@@ -25167,6 +25333,9 @@ impl ViewerApp {
     /// Open/close flag for a dockable viewer (the pre-docking booleans —
     /// they stay the single source of truth for Hidden vs not).
     fn set_viewer_open(&mut self, pane: dock::WorkspacePane, open: bool) {
+        if pane == dock::WorkspacePane::Sounding && !open && self.native_skewt_open {
+            self.persist_sounding_view_state();
+        }
         if pane != dock::WorkspacePane::Map && self.viewer_open(pane) != open {
             // Tri-states persist with the layout (debounced).
             self.workspace.mark_dirty();
@@ -25234,6 +25403,17 @@ impl ViewerApp {
 
     /// Write the workspace layout (tree + tri-states + preferences) into
     /// config.json — only when the snapshot actually changed.
+    fn persist_sounding_view_state(&mut self) {
+        let Some(dock) = self.model_dock.as_ref() else {
+            return;
+        };
+        let value = dock.sounding_view_state_json();
+        if self.app_settings.sounding_view_state.as_ref() != Some(&value) {
+            self.app_settings.sounding_view_state = Some(value);
+            let _ = self.app_settings.save();
+        }
+    }
+
     fn persist_workspace_layout(&mut self) {
         self.workspace.dirty = false;
         let viewers: BTreeMap<dock::WorkspacePane, dock::ViewerMode> = dock::WorkspacePane::VIEWERS
@@ -25675,6 +25855,7 @@ impl ViewerApp {
             self.map_center_lon,
             self.map_scale,
         );
+        self.draw_italy_dpc_layer(painter, rect);
         self.draw_graticule(painter, rect);
         let underlay_ms = basemap_start.elapsed().as_secs_f32() * 1000.0;
         self.request_radar_layer_renders(ui.ctx(), rect);
@@ -26382,6 +26563,7 @@ impl ViewerApp {
             self.draw_basemap(&cell_painter, cell);
             self.draw_spc_outlooks(&cell_painter, cell);
             self.draw_upper_air_layer(&cell_painter, cell);
+            self.draw_italy_dpc_layer(&cell_painter, cell);
             self.draw_graticule(&cell_painter, cell);
             if cell_index == 0 {
                 self.request_radar_layer_renders(&ctx, cell);
@@ -27705,6 +27887,7 @@ impl ViewerApp {
             && self.native_sounding_rx.is_none()
         {
             self.native_sounding_src = Some(Arc::clone(&data));
+            self.sounding_viewer_source = SoundingViewerSource::Model;
             let (sender, receiver) = mpsc::channel();
             self.native_sounding_rx = Some(receiver);
             let ctx_clone = ctx.clone();
@@ -27877,6 +28060,14 @@ impl ViewerApp {
     /// Sounding body, window and pane alike. The docked pane outlives any
     /// single sounding, so it placeholder-prompts until one arrives.
     fn sounding_pane_body(&mut self, ui: &mut egui::Ui) {
+        if self.sounding_viewer_source == SoundingViewerSource::Model
+            && let Some(dock) = self.model_dock.as_mut()
+            && dock.sounding_has_content()
+        {
+            dock.sounding_ui(ui);
+            return;
+        }
+
         if let Some(sounding) = self.native_sounding.clone() {
             let size = ui.available_size();
             let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -27884,6 +28075,18 @@ impl ViewerApp {
         } else {
             ui.weak("No sounding yet — Alt-click the map (with model data) to launch one.");
         }
+    }
+
+    fn new_model_data_dock(
+        &self,
+        ctx: &egui::Context,
+        store_root: std::path::PathBuf,
+    ) -> model_data::ModelDataDock {
+        let mut dock = model_data::ModelDataDock::new(ctx, store_root);
+        if let Some(value) = self.app_settings.sounding_view_state.as_ref() {
+            dock.apply_sounding_view_state_json(value);
+        }
+        dock
     }
 
     fn radar_overlays_window(&mut self, ctx: &egui::Context) {
@@ -27935,7 +28138,7 @@ impl ViewerApp {
         }
         if self.model_dock.is_none() {
             let store_root = settings::model_store_dir();
-            self.model_dock = Some(model_data::ModelDataDock::new(ctx, store_root));
+            self.model_dock = Some(self.new_model_data_dock(ctx, store_root));
         }
         if self.workspace.is_docked(dock::WorkspacePane::Model) {
             return; // body renders as a workspace pane
@@ -28240,10 +28443,7 @@ impl ViewerApp {
         self.model_dock_open = true;
         self.model_download_open = true;
         if self.model_dock.is_none() {
-            self.model_dock = Some(model_data::ModelDataDock::new(
-                ctx,
-                settings::model_store_dir(),
-            ));
+            self.model_dock = Some(self.new_model_data_dock(ctx, settings::model_store_dir()));
         }
         self.ensure_ingest_worker_started(ctx);
         self.download_panel = rw_ui::DownloadPanel::new(spec.clone());
@@ -30505,6 +30705,8 @@ impl ViewerApp {
             .unwrap_or_else(Utc::now);
         let (sender, receiver) = mpsc::channel();
         self.native_sounding_rx = Some(receiver);
+        self.native_sounding_src = None;
+        self.sounding_viewer_source = SoundingViewerSource::NativeOnly;
         self.open_viewer(dock::WorkspacePane::Sounding);
         self.status = format!("Fetching RAOB {}…", site.id);
         let ctx_clone = ctx.clone();
@@ -30895,6 +31097,25 @@ impl ViewerApp {
                 ctx_clone.request_repaint();
             });
         }
+        // IEM global ASOS/AWOS/METAR archive: slower no-key history and
+        // cross-provider backfill for worldwide METARs.
+        if self.obs_enabled
+            && self.obs_show_metar
+            && self.iem_metar_rx.is_none()
+            && self
+                .iem_metar_fetched_at
+                .map(|at| at.elapsed() > Duration::from_secs(900))
+                .unwrap_or(true)
+        {
+            let (sender, receiver) = mpsc::channel();
+            self.iem_metar_rx = Some(receiver);
+            let ctx_clone = ctx.clone();
+            thread::spawn(move || {
+                let result = obs::fetch_iem_global_metar_obs();
+                let _ = sender.send(result);
+                ctx_clone.request_repaint();
+            });
+        }
         // Mesonet density (IEM RWIS+DCP): 10-minute cadence, same pool.
         if self.obs_enabled
             && self.mesonet_rx.is_none()
@@ -30941,6 +31162,32 @@ impl ViewerApp {
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => self.obs_rx = None,
+            }
+        }
+        if let Some(receiver) = &self.iem_metar_rx {
+            match receiver.try_recv() {
+                Ok(Ok(observations)) => {
+                    self.iem_metar_rx = None;
+                    self.iem_metar_fetched_at = Some(Instant::now());
+                    let updated = observations.len();
+                    if updated > 0 {
+                        self.surface_obs.merge(observations);
+                        self.status = format!(
+                            "Surface obs: {} stations (+{updated} IEM METAR rows)",
+                            self.surface_obs.station_count
+                        );
+                    }
+                    ctx.request_repaint();
+                }
+                Ok(Err(err)) => {
+                    self.iem_metar_rx = None;
+                    self.iem_metar_fetched_at = Some(Instant::now());
+                    if self.surface_obs.is_empty() {
+                        self.status = format!("IEM global METAR fetch failed: {err}");
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.iem_metar_rx = None,
             }
         }
         if let Some(receiver) = &self.nws_obs_rx {
@@ -31402,6 +31649,140 @@ impl ViewerApp {
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => self.sat_layer_render_rx = None,
             }
+        }
+    }
+
+    fn add_italy_dpc_layer(&mut self, product: ItalyDpcMapProduct, ctx: &egui::Context) {
+        self.italy_dpc_layer = Some(ItalyDpcMapLayer::new(product));
+        self.italy_dpc_latest_rx = None;
+        self.italy_dpc_render_rx = None;
+        self.italy_dpc_texture = None;
+        self.map_center_lat = 42.0;
+        self.map_center_lon = 12.5;
+        self.map_scale = 52.0;
+        self.start_italy_dpc_latest_refresh(ctx, true);
+        self.status = format!("Italy DPC: adding {} raw GeoTIFF", product.label());
+        ctx.request_repaint();
+    }
+
+    fn set_italy_dpc_product(&mut self, product: ItalyDpcMapProduct, ctx: &egui::Context) {
+        match &mut self.italy_dpc_layer {
+            Some(layer) if layer.product == product => {
+                layer.visible = true;
+            }
+            Some(layer) => {
+                *layer = ItalyDpcMapLayer::new(product);
+                self.italy_dpc_texture = None;
+                self.italy_dpc_render_rx = None;
+            }
+            None => {
+                self.italy_dpc_layer = Some(ItalyDpcMapLayer::new(product));
+                self.italy_dpc_texture = None;
+                self.italy_dpc_render_rx = None;
+            }
+        }
+        self.italy_dpc_latest_rx = None;
+        self.start_italy_dpc_latest_refresh(ctx, true);
+        self.status = format!("Italy DPC: switched to {} raw GeoTIFF", product.label());
+        ctx.request_repaint();
+    }
+
+    fn start_italy_dpc_latest_refresh(&mut self, ctx: &egui::Context, force: bool) {
+        if self.italy_dpc_latest_rx.is_some() && !force {
+            return;
+        }
+        let Some(layer) = &mut self.italy_dpc_layer else {
+            return;
+        };
+        if !force
+            && let Some(last_attempt) = layer.last_refresh_attempt
+            && last_attempt.elapsed() < Duration::from_secs(60)
+        {
+            return;
+        }
+        let product = layer.product;
+        layer.last_refresh_attempt = Some(Instant::now());
+        layer.error = None;
+        let (sender, receiver) = mpsc::channel();
+        self.italy_dpc_latest_rx = Some(receiver);
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            let result = italy_dpc::load_latest_frame(product.product_type());
+            let _ = sender.send((product, result));
+            ctx_clone.request_repaint();
+        });
+    }
+
+    fn poll_italy_dpc_layer(&mut self, ctx: &egui::Context) {
+        if let Some(receiver) = &self.italy_dpc_latest_rx {
+            match receiver.try_recv() {
+                Ok((product, result)) => {
+                    self.italy_dpc_latest_rx = None;
+                    if let Some(layer) = &mut self.italy_dpc_layer
+                        && layer.product == product
+                    {
+                        match result {
+                            Ok(frame) => {
+                                let time = chrono::Utc
+                                    .timestamp_millis_opt(frame.product_time_millis)
+                                    .single()
+                                    .map(|time| time.format("%H:%MZ").to_string())
+                                    .unwrap_or_else(|| "latest".to_owned());
+                                layer.product_time_millis = Some(frame.product_time_millis);
+                                layer.period = frame.period.clone();
+                                layer.source_identity = Some(frame.identity.clone());
+                                layer.frame = Some(Arc::new(frame));
+                                layer.fetched_at = Some(Instant::now());
+                                layer.error = None;
+                                self.italy_dpc_texture = None;
+                                self.italy_dpc_render_rx = None;
+                                self.status = format!(
+                                    "Italy DPC: {} raw GeoTIFF {time}",
+                                    layer.product.short_label()
+                                );
+                            }
+                            Err(err) => {
+                                layer.error = Some(compact_layer_status(&err, 80));
+                                self.status = format!("Italy DPC: {err}");
+                            }
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.italy_dpc_latest_rx = None,
+            }
+        }
+        if let Some(receiver) = &self.italy_dpc_render_rx {
+            match receiver.try_recv() {
+                Ok((generation, view, image, _ms)) => {
+                    self.italy_dpc_render_rx = None;
+                    if self
+                        .italy_dpc_layer
+                        .as_ref()
+                        .and_then(|layer| layer.frame.as_ref())
+                        .is_some_and(|frame| frame.generation == generation)
+                    {
+                        let texture = ctx.load_texture(
+                            format!("italy-dpc-layer-{generation}"),
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.italy_dpc_texture = Some((texture, generation, view));
+                    }
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => self.italy_dpc_render_rx = None,
+            }
+        }
+        if self
+            .italy_dpc_layer
+            .as_ref()
+            .is_some_and(|layer| layer.visible)
+            && self.italy_dpc_latest_rx.is_none()
+        {
+            self.start_italy_dpc_latest_refresh(ctx, false);
         }
     }
 
@@ -33934,37 +34315,79 @@ impl ViewerApp {
         let font_v = egui::FontId::proportional(obs_style.value_font_px);
         let font_id = egui::FontId::proportional(obs_style.small_font_px);
         // Fuller reports first so they win declutter cells.
-        let mut order: Vec<&obs::SurfaceOb> = self.surface_obs.frame_obs(frame_time).collect();
-        order.sort_by_key(|ob| std::cmp::Reverse(ob.completeness));
+        let looping = self.history_playing || self.browsing_history;
+        let plot_units = self.units();
+        let (max_candidates, max_full_plots, max_labels, max_dots) = if looping {
+            (3000usize, 150usize, 0usize, 500usize)
+        } else {
+            (5000usize, 400usize, 120usize, 1000usize)
+        };
+        let mut bounds = self.visible_geo_bounds(rect);
+        let lat_margin = 0.75_f32.max(48.0 / self.map_scale.max(1.0));
+        let lon_margin = (lat_margin / self.lon_screen_scale()).min(20.0);
+        bounds.south = (bounds.south - lat_margin).clamp(-90.0, 90.0);
+        bounds.north = (bounds.north + lat_margin).clamp(-90.0, 90.0);
+        bounds.west = normalize_lon(bounds.west - lon_margin);
+        bounds.east = normalize_lon(bounds.east + lon_margin);
+        let ob_bounds = obs::ObBounds {
+            west: bounds.west,
+            south: bounds.south,
+            east: bounds.east,
+            north: bounds.north,
+        };
+        let mut order: Vec<(&obs::SurfaceOb, egui::Pos2)> = self
+            .surface_obs
+            .frame_obs_in_bounds(frame_time, ob_bounds)
+            .filter(|ob| {
+                let is_metar = ob.network == "METAR";
+                (is_metar && self.obs_show_metar) || (!is_metar && self.obs_show_mesonet)
+            })
+            .filter(|ob| {
+                !looping
+                    || ob
+                        .time_utc
+                        .map(|t| (frame_time - t).num_minutes() <= 45)
+                        .unwrap_or(false)
+            })
+            .filter_map(|ob| {
+                let pos = self.lon_lat_to_screen(rect, ob.lon, ob.lat);
+                rect.expand(24.0).contains(pos).then_some((ob, pos))
+            })
+            .collect();
+        order.sort_by(|(left, _), (right, _)| {
+            right
+                .completeness
+                .cmp(&left.completeness)
+                .then_with(|| (right.network == "METAR").cmp(&(left.network == "METAR")))
+                .then_with(|| right.time_utc.cmp(&left.time_utc))
+                .then_with(|| left.station_id.cmp(&right.station_id))
+        });
         // During loop playback/scrubbing, stations draw only when their
         // report is FRESH relative to the frame (45 min) — stale reporters
         // freeze mid-loop and read as clutter. (A report-count rule here
         // previously hid hourly METARs for hours after launch — the
         // dedup'd pool accumulates them slowly. Field report fixed.)
-        let looping = self.history_playing || self.browsing_history;
-        let plot_units = self.units();
-        for ob in order {
+        let mut full_plots = 0usize;
+        let mut labels = 0usize;
+        let mut dots = 0usize;
+        for (ob, pos) in order.into_iter().take(max_candidates) {
             let is_metar = ob.network == "METAR";
-            if (is_metar && !self.obs_show_metar) || (!is_metar && !self.obs_show_mesonet) {
-                continue;
-            }
-            if looping
-                && let Some(t) = ob.time_utc
-                && (frame_time - t).num_minutes() > 45
-            {
-                continue;
-            }
-            let pos = self.lon_lat_to_screen(rect, ob.lon, ob.lat);
-            if !rect.expand(-10.0).contains(pos) {
-                continue;
-            }
             let key =
                 ((pos.y - rect.top()) / cell) as i32 * cols + ((pos.x - rect.left()) / cell) as i32;
-            let slot = taken.entry(key).or_insert(0);
-            if *slot >= 1 {
+            if taken.contains_key(&key) || full_plots >= max_full_plots {
+                if dots < max_dots {
+                    let dot = style_color32(if is_metar {
+                        obs_style.metar_dot
+                    } else {
+                        obs_style.mesonet_dot
+                    });
+                    painter.circle_filled(pos, 1.25, dot.gamma_multiply(0.55));
+                    dots += 1;
+                }
                 continue;
             }
-            *slot += 1;
+            taken.insert(key, 1);
+            full_plots += 1;
             // Station dot: white = METAR, amber = mesonet (source visible
             // at a glance).
             let dot = style_color32(if is_metar {
@@ -34006,7 +34429,7 @@ impl ViewerApp {
                     style_color32(obs_style.gust_color),
                 );
             }
-            if show_ids {
+            if show_ids && labels < max_labels {
                 painter.text(
                     pos + egui::vec2(0.0, 24.0),
                     egui::Align2::CENTER_CENTER,
@@ -34014,6 +34437,7 @@ impl ViewerApp {
                     font_id.clone(),
                     style_color32(obs_style.station_id_color),
                 );
+                labels += 1;
             }
         }
     }
@@ -35893,10 +36317,145 @@ impl ViewerApp {
             }
             return;
         }
+        let source = tiles::TileSource::Basemap(style);
+        self.draw_tile_source(
+            painter,
+            rect,
+            &source,
+            egui::Color32::WHITE,
+            style.attribution(),
+        );
+    }
+
+    fn draw_italy_dpc_layer(&mut self, painter: &egui::Painter, rect: egui::Rect) {
+        let Some((frame, layer_opacity)) = self.italy_dpc_layer.as_ref().and_then(|layer| {
+            layer
+                .visible
+                .then(|| {
+                    layer
+                        .frame
+                        .as_ref()
+                        .cloned()
+                        .map(|frame| (frame, layer.opacity))
+                })
+                .flatten()
+        }) else {
+            return;
+        };
+        let view = self.model_layer_current_view();
+        let current = self
+            .italy_dpc_texture
+            .as_ref()
+            .filter(|(_, generation, _)| *generation == frame.generation);
+        let needs_render = current
+            .map(|(_, _, have)| {
+                (have.center_lat - view.center_lat).abs() > 1e-4
+                    || (have.center_lon - view.center_lon).abs() > 1e-4
+                    || (have.map_scale - view.map_scale).abs() > 0.01
+            })
+            .unwrap_or(true);
+        if needs_render && self.italy_dpc_render_rx.is_none() {
+            let (sender, receiver) = mpsc::channel();
+            self.italy_dpc_render_rx = Some(receiver);
+            let render_view = view;
+            let generation = frame.generation;
+            let image_src = Arc::clone(&frame.image);
+            let lut = Arc::clone(&frame.lut);
+            let (nx, ny, flip) = (frame.nx, frame.ny, frame.flip_rows);
+            let center_lat = view.center_lat as f64;
+            let center_lon = view.center_lon as f64;
+            let km_per_pt = 111.32 / view.map_scale as f64;
+            let render_scale = italy_dpc::ITALY_DPC_RENDER_SCALE.clamp(0.25, 1.0) as f64;
+            let (w_pts, h_pts) = (rect.width() as f64, rect.height() as f64);
+            thread::spawn(move || {
+                let render_start = Instant::now();
+                let w = (w_pts * render_scale).max(8.0) as usize;
+                let h = (h_pts * render_scale).max(8.0) as usize;
+                let mut pixels = vec![egui::Color32::TRANSPARENT; w * h];
+                for (i, px) in pixels.iter_mut().enumerate() {
+                    let x = (i % w) as f64 / render_scale;
+                    let y = (i / w) as f64 / render_scale;
+                    let east_km = (x - w_pts / 2.0) * km_per_pt;
+                    let north_km = (h_pts / 2.0 - y) * km_per_pt;
+                    let (lat, lon) = aeqd_inverse_km(center_lat, center_lon, east_km, north_km);
+                    let Some(index) = lut.lookup(lat as f32, lon as f32) else {
+                        continue;
+                    };
+                    let (row, col) = (index / nx, index % nx);
+                    if row >= ny {
+                        continue;
+                    }
+                    let image_row = if flip { ny - 1 - row } else { row };
+                    let color = image_src.pixels[image_row * nx + col];
+                    if color.a() > 0 {
+                        *px = color;
+                    }
+                }
+                let image = egui::ColorImage {
+                    size: [w, h],
+                    source_size: egui::vec2(w as f32, h as f32),
+                    pixels,
+                };
+                let _ = sender.send((
+                    generation,
+                    render_view,
+                    image,
+                    render_start.elapsed().as_secs_f32() * 1000.0,
+                ));
+            });
+        }
+        if let Some((texture, _, rendered)) = &self.italy_dpc_texture {
+            let rendered_center =
+                self.lon_lat_to_screen(rect, rendered.center_lon, rendered.center_lat);
+            let zoom_ratio = self.map_scale / rendered.map_scale.max(0.001);
+            let half = egui::vec2(
+                rect.width() * 0.5 * zoom_ratio,
+                rect.height() * 0.5 * zoom_ratio,
+            );
+            let image_rect =
+                egui::Rect::from_min_max(rendered_center - half, rendered_center + half);
+            let opacity = (layer_opacity.clamp(0.0, 1.0) * 255.0) as u8;
+            painter.image(
+                texture.id(),
+                image_rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::from_white_alpha(opacity),
+            );
+            painter.text(
+                egui::pos2(rect.left() + 6.0, rect.bottom() - 4.0),
+                egui::Align2::LEFT_BOTTOM,
+                "Radar-DPC CC-BY-SA · raw GeoTIFF",
+                egui::FontId::proportional(9.0),
+                egui::Color32::from_rgba_unmultiplied(230, 234, 238, 150),
+            );
+        }
+    }
+
+    fn draw_tile_source(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        source: &tiles::TileSource,
+        tint: egui::Color32,
+        attribution: Option<&str>,
+    ) {
+        let tile_debug = std::env::var_os("BOWECHO_TILE_DEBUG").is_some();
         let pixels_per_point = painter.ctx().pixels_per_point().max(0.5);
         let km_per_px = 111.32 / self.map_scale;
-        let zoom = tiles::zoom_for_km_per_px(km_per_px, self.map_center_lat, pixels_per_point);
-        let bounds = self.visible_geo_bounds(rect);
+        let view_zoom = tiles::zoom_for_km_per_px(km_per_px, self.map_center_lat, pixels_per_point);
+        let zoom = source.stable_source_zoom().unwrap_or(view_zoom);
+        let mut bounds = self.visible_geo_bounds(rect);
+        if let Some((west, south, east, north)) = source.geo_clip_bounds() {
+            let Some(clipped) = bounds.intersect(GeoBounds {
+                west,
+                south,
+                east,
+                north,
+            }) else {
+                return;
+            };
+            bounds = clipped;
+        }
         let (x0, y0) = tiles::tile_coords(bounds.west as f64, bounds.north as f64, zoom);
         let (x1, y1) = tiles::tile_coords(bounds.east as f64, bounds.south as f64, zoom);
         let n = 1u32 << zoom;
@@ -35905,12 +36464,8 @@ impl ViewerApp {
         let (ty0, ty1) = (clamp_tile(y0), clamp_tile(y1));
         if tile_debug {
             eprintln!(
-                "TILES: style {} zoom {zoom} x {tx0}..{tx1} y {ty0}..{ty1} bounds W{:.2} E{:.2} S{:.2} N{:.2}",
-                style.key(),
-                bounds.west,
-                bounds.east,
-                bounds.south,
-                bounds.north
+                "TILES: view zoom {view_zoom} source zoom {zoom} x {tx0}..{tx1} y {ty0}..{ty1} bounds W{:.2} E{:.2} S{:.2} N{:.2}",
+                bounds.west, bounds.east, bounds.south, bounds.north
             );
         }
         // Hard cap so degenerate bounds never flood the queue.
@@ -35949,9 +36504,11 @@ impl ViewerApp {
                 {
                     continue;
                 }
-                let Some(texture_id) = layer.texture(style, tile).map(|texture| texture.id())
+                let Some(texture_id) = layer
+                    .texture_source(source, tile)
+                    .map(|texture| texture.id())
                 else {
-                    layer.request(style, tile);
+                    layer.request_source(source.clone(), tile);
                     continue;
                 };
                 // Coarse 4-corner probe sizes the tile on screen and picks
@@ -36011,7 +36568,7 @@ impl ViewerApp {
                     mesh.vertices.push(egui::epaint::Vertex {
                         pos: *pos,
                         uv: *uv,
-                        color: egui::Color32::WHITE,
+                        color: tint,
                     });
                 }
                 let stride = grid + 1;
@@ -36031,7 +36588,7 @@ impl ViewerApp {
                 painter.add(egui::Shape::mesh(mesh));
             }
         }
-        if let Some(attribution) = style.attribution() {
+        if let Some(attribution) = attribution {
             painter.text(
                 egui::pos2(rect.left() + 6.0, rect.bottom() - 4.0),
                 egui::Align2::LEFT_BOTTOM,
@@ -39403,6 +39960,16 @@ impl GeoBounds {
             east: self.east + degrees,
             north: self.north + degrees,
         }
+    }
+
+    fn intersect(self, other: Self) -> Option<Self> {
+        let bounds = Self {
+            west: self.west.max(other.west),
+            south: self.south.max(other.south),
+            east: self.east.min(other.east),
+            north: self.north.min(other.north),
+        };
+        (bounds.west < bounds.east && bounds.south < bounds.north).then_some(bounds)
     }
 
     fn contains(self, longitude_deg: f32, latitude_deg: f32) -> bool {
@@ -47742,6 +48309,23 @@ mod tests {
             .expect("system clock after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("bowecho-{label}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn italy_dpc_product_mapping_keeps_srt1_and_cum_windows_distinct() {
+        assert_eq!(ItalyDpcMapProduct::Srt1.product_type(), "SRT1");
+        assert_eq!(ItalyDpcMapProduct::Cum12.product_type(), "CUM12");
+        assert_eq!(ItalyDpcMapProduct::Cum24.product_type(), "CUM24");
+        assert_ne!(
+            ItalyDpcMapProduct::Cum12.product_type(),
+            ItalyDpcMapProduct::Cum24.product_type()
+        );
+        assert!(
+            ItalyDpcMapProduct::Cum24
+                .short_label()
+                .contains("Accum 24h")
+        );
+        assert!(ItalyDpcMapProduct::Cum12.label().contains("rain-gauge"));
     }
 
     /// Bolton (1980) round-trip sanity: saturated air dews at the air
@@ -60322,6 +60906,10 @@ mod tests {
             loop_timeline_summary_cache: std::cell::RefCell::new(None),
             tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(settings::tile_cache_dir())),
             basemap_style: tiles::TileStyle::DarkVector,
+            italy_dpc_layer: None,
+            italy_dpc_latest_rx: None,
+            italy_dpc_texture: None,
+            italy_dpc_render_rx: None,
             open_color_tables_request: false,
             bold_labels: true,
             browsing_history: false,
@@ -60544,6 +61132,8 @@ mod tests {
             surface_obs: obs::ObPool::new(),
             obs_fetched_at: None,
             obs_rx: None,
+            iem_metar_fetched_at: None,
+            iem_metar_rx: None,
             nws_obs_fetched_at: None,
             nws_obs_rx: None,
             mesonet_fetched_at: None,
@@ -60564,6 +61154,7 @@ mod tests {
             native_sounding: None,
             native_sounding_rx: None,
             native_sounding_src: None,
+            sounding_viewer_source: SoundingViewerSource::NativeOnly,
             native_skewt_open: false,
             archive_frame_count: 10,
             archive_loaded_range: None,

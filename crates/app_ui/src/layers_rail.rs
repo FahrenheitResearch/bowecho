@@ -11,12 +11,13 @@
 
 use std::time::{Duration, Instant};
 
+use chrono::TimeZone;
 use eframe::egui;
 
 use crate::{
-    GLM_LIVE_MAX_AGE_MINUTES, LayerRowGear, LayerRowOpacity, LayerRowOrder, LayerRowRemove,
-    LayerRowSpec, LayerRowVis, OrdArchiveLoadMode, PlacefileSlot, PollSource, RadarSite,
-    SidebarTab, ViewerApp, compact_layer_status, custom_poll_entry_label,
+    GLM_LIVE_MAX_AGE_MINUTES, ItalyDpcMapProduct, LayerRowGear, LayerRowOpacity, LayerRowOrder,
+    LayerRowRemove, LayerRowSpec, LayerRowVis, OrdArchiveLoadMode, PlacefileSlot, PollSource,
+    RadarSite, SidebarTab, ViewerApp, compact_layer_status, custom_poll_entry_label,
     custom_poll_entry_lat_lon, custom_poll_links_from_gis, dock, format_site_label,
     glm_latest_age_minutes, glm_latest_is_live, glm_satellite_label, intl_provider_label,
     layer_row, mesoanalysis, normalized_poll_url, oa_derived, parse_custom_poll_marker_inputs,
@@ -29,6 +30,7 @@ impl ViewerApp {
     pub(crate) fn rail_layer_count(&self) -> usize {
         usize::from(self.volume.is_some())
             + self.radar_layers.len()
+            + usize::from(self.italy_dpc_layer.is_some())
             + usize::from(self.sat_layer.is_some())
             + self.model_layers.len()
             + usize::from(self.obs_enabled)
@@ -255,6 +257,106 @@ impl ViewerApp {
         // (The model master switch + "Keep runs" retention policy
         // moved to Settings ▸ Model — proposal step 4: the fold holds
         // layers, not app policy.)
+        let dpc_loading = self.italy_dpc_latest_rx.is_some() || self.italy_dpc_render_rx.is_some();
+        let mut dpc_product_pick: Option<ItalyDpcMapProduct> = None;
+        let mut dpc_refresh = false;
+        let mut dpc_remove = false;
+        if let Some(layer) = &mut self.italy_dpc_layer {
+            let name = format!("Italy DPC {}", layer.product.short_label());
+            let frame_text = layer
+                .product_time_millis
+                .and_then(|millis| chrono::Utc.timestamp_millis_opt(millis).single())
+                .map(|time| time.format("%H:%MZ").to_string())
+                .unwrap_or_else(|| "latest".to_owned());
+            let state = if dpc_loading {
+                "loading"
+            } else if layer.error.is_some() {
+                "stale"
+            } else if layer.product_time_millis.is_some() {
+                "live"
+            } else {
+                "loading"
+            };
+            let name_hover = if let Some(error) = &layer.error {
+                format!(
+                    "Official Italy DPC {} raw GeoTIFF overlay\nLatest fetch error: {}",
+                    layer.product.label(),
+                    error
+                )
+            } else {
+                format!(
+                    "Official Italy DPC {} raw GeoTIFF overlay\nFrame: {}{}",
+                    layer.product.label(),
+                    frame_text,
+                    layer
+                        .period
+                        .as_deref()
+                        .map(|period| format!(" · {period}"))
+                        .unwrap_or_default()
+                )
+            };
+            let current_product = layer.product;
+            if layer_row(
+                ui,
+                LayerRowSpec {
+                    vis: LayerRowVis::Toggle {
+                        value: &mut layer.visible,
+                        hover: "Show Italy DPC raw radar/composite raster on the map",
+                    },
+                    name: &name,
+                    name_width: crate::NAME_W_WIDE,
+                    name_hover: &name_hover,
+                    state: Some(state),
+                    opacity: Some(LayerRowOpacity::F32 {
+                        value: &mut layer.opacity,
+                        min: 0.05,
+                        hover: "Italy DPC raw raster opacity",
+                    }),
+                    gear: Some(LayerRowGear::Menu {
+                        hover: "Italy DPC product and refresh",
+                        content: Box::new(|ui| {
+                            ui.set_min_width(190.0);
+                            for product in ItalyDpcMapProduct::ALL {
+                                if ui
+                                    .selectable_label(product == current_product, product.label())
+                                    .clicked()
+                                {
+                                    dpc_product_pick = Some(product);
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("Refresh latest").clicked() {
+                                dpc_refresh = true;
+                                ui.close();
+                            }
+                        }),
+                    }),
+                    remove: Some(LayerRowRemove {
+                        hover: "Remove Italy DPC overlay",
+                        clicked: &mut dpc_remove,
+                    }),
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.weak(frame_text);
+                },
+            ) {
+                ctx.request_repaint();
+            }
+        }
+        if let Some(product) = dpc_product_pick {
+            self.set_italy_dpc_product(product, ctx);
+        } else if dpc_refresh {
+            self.start_italy_dpc_latest_refresh(ctx, true);
+        }
+        if dpc_remove {
+            self.italy_dpc_layer = None;
+            self.italy_dpc_latest_rx = None;
+            self.italy_dpc_render_rx = None;
+            self.italy_dpc_texture = None;
+            ctx.request_repaint();
+        }
         let mut remove_sat_layer = false;
         let mut open_sat_window = false;
         if let Some(layer) = &mut self.sat_layer
@@ -2165,6 +2267,7 @@ impl ViewerApp {
         // windows' "Show on radar map" buttons.
         ui.add_space(4.0);
         let mut add_site: Option<RadarSite> = None;
+        let mut add_italy_dpc: Option<ItalyDpcMapProduct> = None;
         ui.menu_button("+ Add layer ▾", |ui| {
                     ui.menu_button("Radar overlay", |ui| {
                         ui.set_min_width(220.0);
@@ -2226,6 +2329,23 @@ impl ViewerApp {
                         }
                         ui.close();
                     }
+                    ui.menu_button("Grid / Composites", |ui| {
+                        ui.menu_button("Italy DPC radar", |ui| {
+                            ui.set_min_width(210.0);
+                            for product in ItalyDpcMapProduct::ALL {
+                                if ui.button(product.label()).clicked() {
+                                    add_italy_dpc = Some(product);
+                                    ui.close();
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Official Protezione Civile / Radar-DPC national gridded radar products",
+                        );
+                    })
+                    .response
+                    .on_hover_text("National and regional gridded/composite radar layers");
                     if ui
                         .button("SpotterNetwork (placefile)")
                         .on_hover_text(
@@ -2362,6 +2482,9 @@ impl ViewerApp {
                 });
         if let Some(site) = add_site {
             self.add_or_refresh_radar_layer(site, ctx);
+        }
+        if let Some(product) = add_italy_dpc {
+            self.add_italy_dpc_layer(product, ctx);
         }
         // A composite picked from the menu becomes a layer immediately, even
         // while the Analysis (OA) section is collapsed (its own consumer

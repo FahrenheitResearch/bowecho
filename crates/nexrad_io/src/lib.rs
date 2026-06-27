@@ -188,17 +188,23 @@ pub fn sniff_supported_volume_format(head: &[u8]) -> SupportedVolumeFormat {
 /// station call [`jma::decode_jma_tar_volumes`] with a `site_filter`
 /// directly instead of going through the router.
 pub fn decode_supported_volume_bytes(raw: &[u8]) -> std::result::Result<RadarVolume, String> {
-    match sniff_supported_volume_format(raw) {
+    let decoded_gzip = if raw.starts_with(&[0x1f, 0x8b]) {
+        Some(decompress_gzip_bytes(raw).map_err(|err| err.to_string())?)
+    } else {
+        None
+    };
+    let sniff_bytes = decoded_gzip.as_deref().unwrap_or(raw);
+    match sniff_supported_volume_format(sniff_bytes) {
         SupportedVolumeFormat::Dorade => {
-            dorade::decode_dorade_sweep_volume(raw).map_err(|err| err.to_string())
+            dorade::decode_dorade_sweep_volume(sniff_bytes).map_err(|err| err.to_string())
         }
         SupportedVolumeFormat::OdimH5 => {
-            odim::decode_odim_h5_volume(raw).map_err(|err| err.to_string())
+            odim::decode_odim_h5_volume(sniff_bytes).map_err(|err| err.to_string())
         }
         SupportedVolumeFormat::CfRadial => {
-            cfradial::decode_cfradial1_volume(raw).map_err(|err| err.to_string())
+            cfradial::decode_cfradial1_volume(sniff_bytes).map_err(|err| err.to_string())
         }
-        SupportedVolumeFormat::JmaGrib2Tar => jma::decode_jma_tar_first_station(raw),
+        SupportedVolumeFormat::JmaGrib2Tar => jma::decode_jma_tar_first_station(sniff_bytes),
         SupportedVolumeFormat::NexradLevel2 => {
             decode_volume_from_bytes(raw).map_err(|err| err.to_string())
         }

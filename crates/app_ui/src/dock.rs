@@ -34,11 +34,6 @@ const TREE_ID: &str = "bowecho_workspace_tree";
 /// Map-pane share of the root split when the first viewer docks.
 const MAP_SHARE_ON_FIRST_DOCK: f32 = 0.62;
 
-/// Sounding-pane share when it opens the dock area: a full-width bottom
-/// strip ~1/3 of the window tall (field request), where its 4:3 canvas
-/// reads at analyst size instead of letterboxing in a tall column.
-const SOUNDING_DOCK_SHARE: f32 = 0.34;
-
 /// Persisted-layout schema version (`AppSettings::workspace_layout`).
 const LAYOUT_VERSION: u32 = 1;
 
@@ -232,17 +227,10 @@ impl Workspace {
             self.mark_dirty();
             return;
         }
-        // No viewer tabs to join: open the dock area as a split. The
-        // Sounding's 4:3 canvas letterboxed badly in the tall right
-        // column (field report: "soundings need like 1/3rd the height
-        // window") — it docks as a full-width bottom strip instead;
-        // other viewers keep the right-hand split. Drag the divider to
-        // taste; shares persist in the saved layout.
-        let (direction, map_share) = if pane == WorkspacePane::Sounding {
-            (egui_tiles::LinearDir::Vertical, 1.0 - SOUNDING_DOCK_SHARE)
-        } else {
-            (egui_tiles::LinearDir::Horizontal, MAP_SHARE_ON_FIRST_DOCK)
-        };
+        // No viewer tabs to join: open the dock area as a right-hand
+        // split. Drag the divider or tab to taste; shares persist in the
+        // saved layout while the pane remains in the workspace.
+        let (direction, map_share) = (egui_tiles::LinearDir::Horizontal, MAP_SHARE_ON_FIRST_DOCK);
         let tabs_id = self.tree.tiles.insert_tab_tile(vec![child]);
         match self.tree.root {
             Some(old_root) => {

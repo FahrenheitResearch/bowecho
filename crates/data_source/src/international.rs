@@ -50,7 +50,9 @@ mod fmi;
 mod geosphere;
 mod kaia;
 pub mod listing;
+mod lombardia;
 mod ord;
+mod piemonte;
 mod shmu;
 mod smhi;
 
@@ -60,7 +62,9 @@ pub use dwd::DwdProvider;
 pub use fmi::FmiProvider;
 pub use geosphere::GeoSphereProvider;
 pub use kaia::KaiaEstoniaProvider;
+pub use lombardia::LombardiaProvider;
 pub use ord::{OrdArchivePlan, OrdProvider, archive_plan_nearest, archive_plans_for_hour};
+pub use piemonte::PiemonteProvider;
 pub use shmu::ShmuProvider;
 pub use smhi::{SmhiProvider, smhi_archive_plans_for_day};
 
@@ -202,6 +206,8 @@ pub fn intl_providers() -> Vec<Box<dyn IntlProvider>> {
         Box::new(ShmuProvider::new()),
         Box::new(DwdProvider::new()),
         Box::new(ChmiProvider::new()),
+        Box::new(PiemonteProvider::new()),
+        Box::new(LombardiaProvider::new()),
         Box::new(JmaProvider),
         Box::new(KaiaEstoniaProvider::new()),
         Box::new(OrdProvider::new()),
@@ -313,6 +319,22 @@ pub fn intl_provider_capabilities() -> Vec<IntlProviderCapability> {
                     "observed rolling ~89 hours",
                     "latest frame only",
                     "list recent ODIM volume files",
+                ),
+                "arpa-piemonte" => (
+                    true,
+                    false,
+                    "last hour",
+                    "rolling last hour of OPERA HDF5 volumes",
+                    "real in-app recent loop",
+                    "add historical/event access if ARPA exposes it",
+                ),
+                "arpa-lombardia" => (
+                    true,
+                    false,
+                    "rolling live window",
+                    "gzip-wrapped ODIM HDF5 product volumes",
+                    "real in-app recent loop",
+                    "add historical/event access if ARPA exposes it",
                 ),
                 "kaia" => (
                     true,
@@ -791,6 +813,8 @@ mod tests {
                 "shmu",
                 "dwd",
                 "chmi",
+                "arpa-piemonte",
+                "arpa-lombardia",
                 "jma",
                 "kaia",
                 "ord"
@@ -857,6 +881,7 @@ mod tests {
             "Slovakia" => (47.7, 49.7, 16.8, 22.6),
             "Germany" => (47.2, 55.1, 5.8, 15.1),
             "Czechia" => (48.5, 51.1, 12.0, 18.9),
+            "Italy" => (35.4, 47.3, 6.5, 18.8),
             // Japan incl. the southwest island arcs (Okinawa, Ishigaki).
             "Japan" => (24.0, 45.6, 122.5, 146.0),
             // EUMETNET ORD countries (France incl. Corsica).

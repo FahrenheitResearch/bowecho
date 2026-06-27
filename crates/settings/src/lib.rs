@@ -429,6 +429,10 @@ pub struct AppSettings {
     /// everything else in this file).
     #[serde(default)]
     pub workspace_layout: Option<serde_json::Value>,
+    /// Native model sounding view/layout/style state, built by rw-ui and
+    /// kept opaque here so settings stays independent of egui/rw-ui.
+    #[serde(default)]
+    pub sounding_view_state: Option<serde_json::Value>,
     /// Data-folder override: where caches and stores live (Level II
     /// cache, model/sat/GLM stores, tiles, georefs). Empty = platform
     /// default. Read once at startup; Settings says "restart to apply".
@@ -678,6 +682,7 @@ impl Default for AppSettings {
             intl_site: String::new(),
             farm_georefs: Vec::new(),
             workspace_layout: None,
+            sounding_view_state: None,
             data_dir: String::new(),
             sidebar_section_open: BTreeMap::new(),
             model_slug: default_model_slug(),
@@ -1572,6 +1577,20 @@ mod tests {
         assert_eq!(back, s);
         // Absent → None (older configs).
         assert_eq!(AppSettings::from_json("{}").workspace_layout, None);
+    }
+
+    #[test]
+    fn sounding_view_state_round_trips_as_opaque_json() {
+        let s = AppSettings {
+            sounding_view_state: Some(serde_json::json!({
+                "zooms": {"scene": 1.4},
+                "overlays": {"cape_cin_fill": true, "ml_parcel_style": "dotted"}
+            })),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&s.to_json());
+        assert_eq!(back, s);
+        assert_eq!(AppSettings::from_json("{}").sounding_view_state, None);
     }
 
     #[test]

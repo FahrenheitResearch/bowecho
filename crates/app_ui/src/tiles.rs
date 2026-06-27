@@ -23,7 +23,7 @@ pub struct TileId {
     pub y: u32,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TileStyle {
     DarkVector,
     Satellite,
@@ -83,6 +83,41 @@ impl TileStyle {
     pub const ALL: [TileStyle; 4] = [Self::DarkVector, Self::Satellite, Self::Streets, Self::Topo];
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TileSource {
+    Basemap(TileStyle),
+}
+
+impl TileSource {
+    pub fn stable_source_zoom(&self) -> Option<u8> {
+        // Scientific gridded products must not ride this presentation-tile
+        // pathway. Basemaps intentionally follow the viewport zoom.
+        None
+    }
+
+    pub fn geo_clip_bounds(&self) -> Option<(f32, f32, f32, f32)> {
+        None
+    }
+
+    fn key(&self) -> String {
+        match self {
+            Self::Basemap(style) => style.key().to_owned(),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Basemap(style) => style.key().to_owned(),
+        }
+    }
+
+    fn url(&self, tile: TileId) -> Option<String> {
+        match self {
+            Self::Basemap(style) => style.url(tile),
+        }
+    }
+}
+
 /// lon/lat → fractional tile coordinates at `zoom` (Web Mercator).
 pub fn tile_coords(lon: f64, lat: f64, zoom: u8) -> (f64, f64) {
     let n = (1u32 << zoom) as f64;
@@ -112,7 +147,7 @@ pub fn zoom_for_km_per_px(km_per_px: f32, center_lat: f32, pixels_per_point: f32
 }
 
 type DecodedTile = (TileId, u32, u32, Vec<u8>);
-type TileCacheKey = (u8, TileId);
+type TileCacheKey = (String, TileId);
 
 struct TileEntry {
     texture: egui::TextureHandle,
@@ -120,7 +155,7 @@ struct TileEntry {
 }
 
 struct TileQueue {
-    jobs: Mutex<VecDeque<(TileStyle, TileId)>>,
+    jobs: Mutex<VecDeque<(TileSource, TileId)>>,
     wake: Condvar,
 }
 
@@ -141,8 +176,8 @@ pub struct TileLayer {
     failed: HashMap<TileCacheKey, std::time::Instant>,
     queue: Arc<TileQueue>,
     workers: Arc<AtomicUsize>,
-    tx: mpsc::Sender<(u8, DecodedTile)>,
-    rx: mpsc::Receiver<(u8, DecodedTile)>,
+    tx: mpsc::Sender<(String, DecodedTile)>,
+    rx: mpsc::Receiver<(String, DecodedTile)>,
     cache_dir: Option<PathBuf>,
     last_poll_stats: TilePollStats,
 }
@@ -153,15 +188,6 @@ const FAILURE_RETRY_SECS: u64 = 60;
 const MAX_TEXTURE_INSTALLS_PER_POLL: usize = 6;
 const MAX_TILE_RESULTS_PER_POLL: usize = 24;
 const TEXTURE_INSTALL_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
-
-fn style_slot(style: TileStyle) -> u8 {
-    match style {
-        TileStyle::DarkVector => 0,
-        TileStyle::Satellite => 1,
-        TileStyle::Streets => 2,
-        TileStyle::Topo => 3,
-    }
-}
 
 impl TileLayer {
     pub fn new(cache_dir: Option<PathBuf>) -> Self {
@@ -202,24 +228,25 @@ impl TileLayer {
                 ctx.request_repaint();
                 break;
             }
-            let Ok((slot, (tile, width, height, rgba))) = self.rx.try_recv() else {
+            let Ok((source_key, (tile, width, height, rgba))) = self.rx.try_recv() else {
                 break;
             };
             stats.processed += 1;
-            self.pending.remove(&(slot, tile));
+            self.pending.remove(&(source_key.clone(), tile));
             if rgba.is_empty() {
-                self.failed.insert((slot, tile), std::time::Instant::now());
+                self.failed
+                    .insert((source_key, tile), std::time::Instant::now());
                 stats.failed += 1;
                 continue;
             }
             let image =
                 egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
             let texture = ctx.load_texture(
-                format!("tile-{slot}-{}-{}-{}", tile.zoom, tile.x, tile.y),
+                format!("tile-{source_key}-{}-{}-{}", tile.zoom, tile.x, tile.y),
                 image,
                 egui::TextureOptions::LINEAR,
             );
-            let key = (slot, tile);
+            let key = (source_key, tile);
             let last_used = self.next_usage_generation();
             self.textures.insert(key, TileEntry { texture, last_used });
             stats.installed += 1;
@@ -230,8 +257,12 @@ impl TileLayer {
         stats
     }
 
-    pub fn texture(&mut self, style: TileStyle, tile: TileId) -> Option<&egui::TextureHandle> {
-        let key = (style_slot(style), tile);
+    pub fn texture_source(
+        &mut self,
+        source: &TileSource,
+        tile: TileId,
+    ) -> Option<&egui::TextureHandle> {
+        let key = (source.key(), tile);
         let last_used = self.next_usage_generation();
         self.textures.get_mut(&key).map(|entry| {
             entry.last_used = last_used;
@@ -251,18 +282,17 @@ impl TileLayer {
         self.last_poll_stats = TilePollStats::default();
     }
 
-    /// Queue a fetch for a missing tile (newest requests first).
-    pub fn request(&mut self, style: TileStyle, tile: TileId) {
+    pub fn request_source(&mut self, source: TileSource, tile: TileId) {
         if std::env::var_os("BOWECHO_TILE_DEBUG").is_some() {
             eprintln!(
                 "TILE REQUEST: {}/{}/{}/{}",
-                style.key(),
+                source.label(),
                 tile.zoom,
                 tile.x,
                 tile.y
             );
         }
-        let key = (style_slot(style), tile);
+        let key = (source.key(), tile);
         if self.textures.contains_key(&key) || self.pending.contains(&key) {
             return;
         }
@@ -275,10 +305,10 @@ impl TileLayer {
         self.pending.insert(key);
         {
             let mut queue = self.queue.jobs.lock().expect("tile queue");
-            queue.push_front((style, tile));
+            queue.push_front((source, tile));
             while queue.len() > 96 {
-                if let Some((style, tile)) = queue.pop_back() {
-                    self.pending.remove(&(style_slot(style), tile));
+                if let Some((source, tile)) = queue.pop_back() {
+                    self.pending.remove(&(source.key(), tile));
                 }
             }
         }
@@ -298,7 +328,7 @@ impl TileLayer {
                     eprintln!("TILE WORKER START");
                 }
                 loop {
-                    let (style, tile) = {
+                    let (source, tile) = {
                         let mut guard = queue.jobs.lock().expect("tile queue");
                         loop {
                             if let Some(job) = guard.pop_front() {
@@ -307,12 +337,13 @@ impl TileLayer {
                             guard = queue.wake.wait(guard).expect("tile queue wake");
                         }
                     };
-                    let slot = style_slot(style);
-                    let decoded = fetch_and_decode(style, tile, cache_dir.as_deref());
+                    let source_key = source.key();
+                    let source_label = source.label();
+                    let decoded = fetch_and_decode(&source, tile, cache_dir.as_deref());
                     if std::env::var_os("BOWECHO_TILE_DEBUG").is_some() {
                         eprintln!(
                             "TILE WORKER: {}/{}/{}/{} -> {}",
-                            style.key(),
+                            source_label,
                             tile.zoom,
                             tile.x,
                             tile.y,
@@ -320,7 +351,7 @@ impl TileLayer {
                         );
                     }
                     let payload = decoded.unwrap_or((tile, 0, 0, Vec::new()));
-                    if tx.send((slot, payload)).is_err() {
+                    if tx.send((source_key, payload)).is_err() {
                         break;
                     }
                 }
@@ -342,7 +373,7 @@ impl TileLayer {
                 .textures
                 .iter()
                 .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| *key)
+                .map(|(key, _)| key.clone())
             else {
                 break;
             };
@@ -362,19 +393,19 @@ fn tile_poll_budget_exhausted(
 }
 
 fn fetch_and_decode(
-    style: TileStyle,
+    source: &TileSource,
     tile: TileId,
     cache_dir: Option<&std::path::Path>,
 ) -> Option<DecodedTile> {
     let cache_path = cache_dir.map(|dir| {
-        dir.join(style.key())
+        dir.join(source.key())
             .join(tile.zoom.to_string())
             .join(format!("{}_{}.bin", tile.x, tile.y))
     });
     let bytes = if let Some(path) = cache_path.as_ref().filter(|p| p.exists()) {
         std::fs::read(path).ok()?
     } else {
-        let url = style.url(tile)?;
+        let url = source.url(tile)?;
         let bytes = data_source::fetch_bytes(&url).ok()?;
         if let Some(path) = &cache_path {
             if let Some(parent) = path.parent() {
@@ -438,5 +469,21 @@ mod tests {
         assert_eq!(layer.next_usage_generation(), 2);
         layer.clear_memory();
         assert_eq!(layer.next_usage_generation(), 1);
+    }
+
+    #[test]
+    fn tile_source_is_basemap_only_after_dpc_raw_path() {
+        let basemap = TileSource::Basemap(TileStyle::Satellite);
+        assert_eq!(basemap.stable_source_zoom(), None);
+        assert_eq!(basemap.geo_clip_bounds(), None);
+        assert!(
+            basemap
+                .url(TileId {
+                    zoom: 5,
+                    x: 16,
+                    y: 11
+                })
+                .is_some()
+        );
     }
 }
