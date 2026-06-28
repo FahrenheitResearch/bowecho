@@ -295,19 +295,11 @@ const DEBUG_ARCHIVE_CASES: &[DebugArchiveCase] = &[
     },
 ];
 
-/// What a lowest-beam menu pick switches to (the ranking spans every
-/// pollable family, so the action differs per family).
+/// What a lowest-beam menu pick switches to.
 #[derive(Clone, Debug, PartialEq)]
 enum BeamTarget {
-    /// CONUS catalog index — select the site + load latest Level II.
+    /// Primary Level II catalog index: select the site and load latest.
     Conus(usize),
-    /// International provider site — starts its live poll.
-    Intl {
-        provider_id: String,
-        site_id: String,
-    },
-    /// US community research feed — starts its custom-URL poll.
-    Research { url: String },
 }
 
 /// One row of the lowest-beam ranking.
@@ -572,11 +564,7 @@ const HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM: usize = 6;
 /// 60 s, not the custom URL poll's 15 s dir.list cadence.
 const INTL_POLL_SECONDS: u64 = 60;
 const ACTIVE_ALERTS_URL: &str = "https://api.weather.gov/alerts/active?status=actual";
-#[cfg(test)]
-#[allow(dead_code)]
 const SPC_MD_INDEX_URL: &str = "https://www.spc.noaa.gov/products/md/";
-#[cfg(test)]
-#[allow(dead_code)]
 const SPC_PRODUCT_BASE_URL: &str = "https://www.spc.noaa.gov";
 const NWS_PRODUCT_API_BASE_URL: &str = "https://api.weather.gov/products/types";
 const HOT_TEXT_PRODUCT_TYPES: &[&str] = &["TOR", "SVR", "SVS", "FFW", "FFS", "SMW", "SQW"];
@@ -603,6 +591,11 @@ const SCREEN_POLYGON_MAX_SEGMENT_DIAGONAL_FRACTION: f32 = 0.35;
 const SCREEN_POLYGON_MIN_MAX_SEGMENT_PX: f32 = 110.0;
 const MAP_LAYER_RERENDER_PAN_PX: f32 = 0.5;
 const MAP_LAYER_RERENDER_ZOOM_RATIO: f32 = 0.001;
+const RADAR_OPERATIONAL_STATUS_CLICK_KM: f32 = 35.0;
+const RADAR_OPERATIONAL_STATUS_CACHE_SECONDS: u64 = 300;
+const RADAR_OPERATIONAL_STATUS_ERROR_SECONDS: u64 = 60;
+const RADAR_OPERATIONAL_STATUS_LOADING_SECONDS: u64 = 30;
+const RADAR_OPERATIONAL_STATUS_DISPLAY_ROWS: usize = 8;
 const MAP_DRAG_DEAD_ZONE_PX: f32 = 3.0;
 const VOL3D_BOX_DRAG_MIN_PX: f32 = 12.0;
 const VOL3D_BOX_DRAG_MIN_HALF_KM: f32 = 5.0;
@@ -626,14 +619,9 @@ pub(crate) use ui_theme::{
     ROW_SPACING_X, SECTION_SEPARATOR_COLOR, SECTION_SPACING, SIDEBAR_DEFAULT_WIDTH,
     SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SUBHEAD_COLOR,
 };
-const DEFAULT_VISIBLE_HAZARD_FAMILIES: &[&str] = &[
-    "tornado",
-    "severe thunderstorm",
-    "flash flood",
-    "flood",
-    "fire weather",
-    "watch",
-];
+const DEFAULT_VISIBLE_HAZARD_FAMILIES: &[&str] =
+    &["tornado", "severe thunderstorm", "flash flood", "flood"];
+const COMMUNITY_FEED_SITE_NAME_SUFFIX: &str = " (research feed)";
 const HAZARD_FILTER_FAMILIES: &[(&str, &str)] = &[
     ("tornado", "TOR"),
     ("severe thunderstorm", "SVR"),
@@ -1778,6 +1766,8 @@ struct ViewerApp {
     cross_section_armed: bool,
     /// Last right-click location (for the context menu's best-radar list).
     context_menu_lonlat: Option<(f32, f32)>,
+    radar_operational_status_cache: BTreeMap<String, RadarOperationalStatusCacheEntry>,
+    radar_operational_status_rx: Option<mpsc::Receiver<RadarOperationalStatusLoad>>,
     /// SPC storm reports for the archive date (tornado events browser).
     spc_reports: Option<Vec<SpcReport>>,
     spc_receiver: Option<mpsc::Receiver<std::result::Result<Vec<SpcReport>, String>>>,
@@ -3549,6 +3539,87 @@ struct ObsHistoryData {
     start_time: DateTime<Utc>,
     end_time: DateTime<Utc>,
     rows: Vec<ObsHistoryRow>,
+}
+
+#[derive(Clone, Debug)]
+struct RadarOperationalStatus {
+    site_id: String,
+    site_name: String,
+    alarm_summary: Option<String>,
+    mode: Option<String>,
+    rda_status: Option<String>,
+    operability_status: Option<String>,
+    rda_timestamp: Option<DateTime<Utc>>,
+    alarms: Vec<RadarOperationalAlarm>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RadarOperationalAlarm {
+    status: String,
+    message: String,
+    timestamp: Option<DateTime<Utc>>,
+}
+
+enum RadarOperationalStatusCacheEntry {
+    Loading {
+        started_at: Instant,
+    },
+    Ready {
+        status: RadarOperationalStatus,
+        fetched_at: Instant,
+    },
+    Error {
+        message: String,
+        fetched_at: Instant,
+    },
+}
+
+struct RadarOperationalStatusLoad {
+    site_id: String,
+    result: Result<RadarOperationalStatus, String>,
+}
+
+#[derive(Deserialize)]
+struct WeatherGovRadarStationResponse {
+    properties: WeatherGovRadarStationProperties,
+}
+
+#[derive(Deserialize)]
+struct WeatherGovRadarStationProperties {
+    id: Option<String>,
+    name: Option<String>,
+    rda: Option<WeatherGovRadarRda>,
+}
+
+#[derive(Deserialize)]
+struct WeatherGovRadarRda {
+    timestamp: Option<String>,
+    properties: Option<WeatherGovRadarRdaProperties>,
+}
+
+#[derive(Deserialize)]
+struct WeatherGovRadarRdaProperties {
+    #[serde(rename = "alarmSummary")]
+    alarm_summary: Option<String>,
+    mode: Option<String>,
+    status: Option<String>,
+    #[serde(rename = "operabilityStatus")]
+    operability_status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WeatherGovRadarAlarmsResponse {
+    #[serde(rename = "@graph", default)]
+    graph: Vec<WeatherGovRadarAlarmRecord>,
+}
+
+#[derive(Deserialize)]
+struct WeatherGovRadarAlarmRecord {
+    #[serde(rename = "stationId")]
+    station_id: Option<String>,
+    status: Option<String>,
+    message: Option<String>,
+    timestamp: Option<String>,
 }
 
 /// (generation, view key, raster, render ms) from the model-layer render thread.
@@ -6070,7 +6141,7 @@ impl ViewerApp {
                 slot
             })
             .collect();
-        let sites = data_source::fallback_sites();
+        let sites = site_catalog_with_community_feeds(data_source::fallback_sites());
         let selected_site_index = app_settings
             .startup_site
             .as_deref()
@@ -6230,6 +6301,8 @@ impl ViewerApp {
             hazard_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
             cross_section_armed: false,
             context_menu_lonlat: None,
+            radar_operational_status_cache: BTreeMap::new(),
+            radar_operational_status_rx: None,
             spc_reports: None,
             spc_receiver: None,
             archive_pending_event: None,
@@ -6496,16 +6569,22 @@ impl ViewerApp {
         self.event_loop_hazard_window = None;
         self.pending_event_loop_hazard_window = None;
         let query_time_utc = Utc::now();
+        let preview_records = self
+            .hazard_overlay
+            .as_ref()
+            .map(preview_retained_hazard_records)
+            .unwrap_or_default();
         let (sender, receiver) = mpsc::channel();
         self.hazard_receiver = Some(receiver);
         self.last_live_hazard_refresh = Some(Instant::now());
         self.hazard_status = "Loading live hazards".to_owned();
         thread::spawn(move || {
-            let result = load_live_hazard_overlay_with_preview(query_time_utc, |preview| {
-                let _ = sender.send(AsyncHazardResult {
-                    update: AsyncHazardUpdate::Preview(Ok(preview)),
+            let result =
+                load_live_hazard_overlay_with_preview(query_time_utc, preview_records, |preview| {
+                    let _ = sender.send(AsyncHazardResult {
+                        update: AsyncHazardUpdate::Preview(Ok(preview)),
+                    });
                 });
-            });
             let _ = sender.send(AsyncHazardResult {
                 update: AsyncHazardUpdate::Final(result),
             });
@@ -6736,50 +6815,10 @@ impl ViewerApp {
         pointer: egui::Pos2,
         ctx: &egui::Context,
     ) {
-        let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
-        let sq_deg = |site_lat: f32, site_lon: f32| {
-            let dx = (site_lon - lon) * lat.to_radians().cos();
-            let dy = site_lat - lat;
-            dx.mul_add(dx, dy * dy)
-        };
-        let us = self
-            .nearest_site_to_position(rect, pointer)
-            .and_then(|index| {
-                let site = self.sites.get(index)?;
-                let (site_lat, site_lon) = site_location(site)?;
-                Some((index, sq_deg(site_lat, site_lon)))
-            });
-        let intl = data_source::international::intl_static_sites()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, site)| {
-                let (Some(site_lat), Some(site_lon)) = (site.latitude_deg, site.longitude_deg)
-                else {
-                    return None;
-                };
-                Some((index, sq_deg(site_lat, site_lon)))
-            })
-            .min_by(|a, b| a.1.total_cmp(&b.1));
-        match (us, intl) {
-            (Some((index, us_d)), Some((_, intl_d))) if us_d <= intl_d => {
-                if let Some(site) = self.sites.get(index).cloned() {
-                    self.add_or_refresh_radar_layer_for_current_timeline(site, ctx);
-                }
-            }
-            (_, Some((intl_index, _))) => {
-                if let Some(intl_site) = data_source::international::intl_static_sites()
-                    .get(intl_index)
-                    .cloned()
-                {
-                    self.add_or_refresh_intl_radar_layer(&intl_site, ctx);
-                }
-            }
-            (Some((index, _)), None) => {
-                if let Some(site) = self.sites.get(index).cloned() {
-                    self.add_or_refresh_radar_layer_for_current_timeline(site, ctx);
-                }
-            }
-            (None, None) => {}
+        if let Some(index) = self.nearest_site_to_position(rect, pointer)
+            && let Some(site) = self.sites.get(index).cloned()
+        {
+            self.add_or_refresh_radar_layer_for_current_timeline(site, ctx);
         }
     }
 
@@ -6879,6 +6918,7 @@ impl ViewerApp {
     /// Ctrl+right-click on (or near) an international marker: add that
     /// site as a radar overlay layer, mirroring the US multi-radar flow
     /// (field request). Dedupe by provider/site; respects the layer cap.
+    #[allow(dead_code)]
     fn add_or_refresh_intl_radar_layer(
         &mut self,
         intl: &data_source::international::IntlSite,
@@ -10538,6 +10578,7 @@ impl ViewerApp {
                         sites
                     }
                 })
+                .map(site_catalog_with_community_feeds)
                 .map_err(|err| err.to_string());
             let _ = sender.send(AsyncSiteCatalogResult { result });
         });
@@ -10576,7 +10617,7 @@ impl ViewerApp {
             .selected_site()
             .map(|site| site.level2_id.clone())
             .or_else(|| self.volume.as_ref().map(|volume| volume.site.id.clone()));
-        self.sites = sites;
+        self.sites = site_catalog_with_community_feeds(sites);
         if let Some(site_id) = current_site_id
             && let Some(index) = self.sites.iter().position(|site| site.level2_id == site_id)
         {
@@ -13430,6 +13471,20 @@ impl ViewerApp {
         if pane_slot >= self.extra_panes.len() {
             return;
         }
+        if let Some(feed) = community_feed_for_site(&site) {
+            let status = format!(
+                "{} is a research feed; use the primary pane Load Latest/Loop for feed polling",
+                feed.id
+            );
+            if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+                pane.status = status.clone();
+                pane.pinned_site_id = Some(site.level2_id.clone());
+                pane.intl_source = None;
+            }
+            self.status = status;
+            ctx.request_repaint();
+            return;
+        }
         let site_id = site.level2_id.clone();
         if history_contains_other_site(&self.extra_panes[pane_slot].frame_history, &site_id) {
             self.extra_panes[pane_slot].clear_history();
@@ -14527,6 +14582,13 @@ impl ViewerApp {
             return;
         };
 
+        if let Some(feed) = community_feed_for_site(&site) {
+            self.status = format!("Polling {} · research feed", feed.id);
+            self.start_known_feed_poll(feed.poll_url);
+            ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+            return;
+        }
+
         self.start_latest_level2_load(site, ctx);
     }
 
@@ -14535,6 +14597,11 @@ impl ViewerApp {
             self.status = "No site selected".to_owned();
             return;
         };
+
+        if let Some(feed) = community_feed_for_site(&site) {
+            self.start_community_feed_loop(*feed, ctx);
+            return;
+        }
 
         self.start_latest_level2_load_with_mode(site, ctx, LatestLoadMode::Loop);
     }
@@ -16091,6 +16158,149 @@ impl ViewerApp {
         ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
     }
 
+    fn start_community_feed_loop(
+        &mut self,
+        feed: data_source::community_feeds::CommunityFeed,
+        ctx: &egui::Context,
+    ) {
+        self.realtime_level2_auto_refresh = false;
+        self.poll_active = false;
+        self.poll_rx = None;
+        self.poll_next = None;
+        self.poll_last_file = None;
+        self.poll_url = normalized_poll_url(feed.poll_url);
+        self.set_custom_url_poll_source();
+        self.clear_camera_follow_targets();
+        self.history_playing = false;
+        self.browsing_history = false;
+        self.last_history_step = None;
+        if history_contains_other_site(&self.frame_history, feed.id) {
+            self.clear_frame_history();
+        }
+        self.clear_displayed_volume_for_pending_load(ctx);
+        self.begin_primary_load_telemetry();
+
+        let frame_count = self.history_frame_limit.clamp(1, MAX_HISTORY_FRAME_LIMIT);
+        let (sender, receiver) = mpsc::channel();
+        self.load_receiver = Some(receiver);
+        self.pending_site_id = Some(feed.id.to_owned());
+        let progress = ArchiveLoadProgress {
+            label: format!("Research {} loop", feed.id),
+            detail: format!("Listing {} dir.list", feed.id),
+            done: 0,
+            total: 0,
+        };
+        self.status = progress.status_text();
+        self.archive_load_progress = Some(progress.clone());
+        let feed_id = feed.id.to_owned();
+        let feed_label = feed.label.to_owned();
+        let poll_url = normalized_poll_url(feed.poll_url);
+        let progress_label = progress.label.clone();
+        thread::spawn(move || {
+            let total_start = Instant::now();
+            let final_result = (|| -> Result<DecodedLoadBatch, String> {
+                send_archive_progress(
+                    &sender,
+                    &progress_label,
+                    format!("Listing {feed_id} dir.list"),
+                    0,
+                    0,
+                );
+                let (listing, prefix) = gr2a_listing_with_prefix(&poll_url)?;
+                let candidates = dir_list_volume_entries_newest_first(&listing);
+                if candidates.is_empty() {
+                    return Err(format!("{feed_id} research feed listed no radar files"));
+                }
+                let attempt_limit = frame_count.saturating_mul(3).max(frame_count);
+                let candidates = candidates
+                    .into_iter()
+                    .take(attempt_limit)
+                    .collect::<Vec<_>>();
+                send_archive_progress(
+                    &sender,
+                    &progress_label,
+                    format!("Queued {} {} candidates", feed_id, candidates.len()),
+                    0,
+                    candidates.len(),
+                );
+                let mut decoded_frames = Vec::new();
+                let mut failures = Vec::new();
+                for (index, entry) in candidates.into_iter().enumerate() {
+                    if decoded_frames.len() >= frame_count {
+                        break;
+                    }
+                    let name = format!("{prefix}{entry}");
+                    send_archive_progress(
+                        &sender,
+                        &progress_label,
+                        format!("Fetching {feed_id} {name}"),
+                        index,
+                        attempt_limit,
+                    );
+                    let url = format!("{poll_url}/{name}");
+                    let fetch_start = Instant::now();
+                    let raw = match data_source::fetch_volume_bytes(&url) {
+                        Ok(raw) => raw,
+                        Err(err) => {
+                            failures.push(format!("{name}: {err}"));
+                            continue;
+                        }
+                    };
+                    let decode_start = Instant::now();
+                    match nexrad_io::decode_supported_volume_bytes(&raw) {
+                        Ok(mut volume) => {
+                            apply_community_feed_metadata(&mut volume, &poll_url);
+                            derive_default_products_in_place(&mut volume);
+                            let timings = LoadTimings {
+                                fetch_ms: Some(fetch_start.elapsed().as_secs_f32() * 1000.0),
+                                decode_ms: decode_start.elapsed().as_secs_f32() * 1000.0,
+                                ..Default::default()
+                            };
+                            decoded_frames.push(DecodedLoad {
+                                path: PathBuf::from(format!("poll://{name}")),
+                                volume: Arc::new(volume),
+                                timings: timings.finish(total_start),
+                                status: FrameStatus::Complete,
+                                source_label: format!("research {feed_id}"),
+                            });
+                        }
+                        Err(err) => failures.push(format!("decode {name}: {err}")),
+                    }
+                    send_archive_progress(
+                        &sender,
+                        &progress_label,
+                        format!("Decoded {} of {}", decoded_frames.len(), frame_count),
+                        index + 1,
+                        attempt_limit,
+                    );
+                }
+                if decoded_frames.is_empty() {
+                    return Err(format!(
+                        "no usable {feed_id} research frames ({})",
+                        failures
+                            .last()
+                            .cloned()
+                            .unwrap_or_else(|| "all candidates skipped".to_owned())
+                    ));
+                }
+                decoded_frames.sort_by(|left, right| {
+                    frame_identity_for_volume(&left.volume)
+                        .cmp(&frame_identity_for_volume(&right.volume))
+                });
+                let selected_index = decoded_frames.len().saturating_sub(1);
+                Ok(DecodedLoadBatch {
+                    frames: decoded_frames,
+                    selected_index,
+                })
+            })();
+            let _ = sender.send(AsyncLoadResult {
+                label: format!("Research {feed_id} {feed_label} loop"),
+                update: AsyncLoadUpdate::Final(final_result),
+            });
+        });
+        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+    }
+
     fn data_pack_load_blocked(&self) -> bool {
         if self.intl_loop_rx.is_some()
             || self.pending_data_pack_scene.is_some()
@@ -16825,6 +17035,7 @@ impl eframe::App for ViewerApp {
         self.poll_tor_tracks(&ctx);
         self.poll_storm_tracks(&ctx);
         self.poll_placefiles(&ctx);
+        self.poll_radar_operational_status(&ctx);
         self.poll_archive_listing(&ctx);
         self.poll_ord_archive_listing(&ctx);
         self.poll_spc_reports(&ctx);
@@ -25979,7 +26190,6 @@ impl ViewerApp {
         );
 
         if !armed
-            && !vrot_armed
             && !annotating
             && !cross_section_handle_owns_pointer
             && !vol3d_box_drag_owns_pointer
@@ -26103,18 +26313,7 @@ impl ViewerApp {
         self.draw_map_annotations(painter, rect);
         self.basemap_ms = Some(underlay_ms + overlay_start.elapsed().as_secs_f32() * 1000.0);
 
-        let site_points = self
-            .sites
-            .iter()
-            .enumerate()
-            .filter_map(|(index, site)| {
-                let (latitude_deg, longitude_deg) = site_location(site)?;
-                let position = self.lon_lat_to_screen(rect, longitude_deg, latitude_deg);
-                rect.expand(18.0)
-                    .contains(position)
-                    .then_some((index, position))
-            })
-            .collect::<Vec<_>>();
+        let site_points = self.primary_level2_site_points(rect);
         let intl_points = self.intl_site_points(rect);
         let community_points = self.community_site_points(rect);
         let custom_poll_points = self.custom_poll_points(rect);
@@ -26425,6 +26624,7 @@ impl ViewerApp {
                 ui.id().with(("grid-pane", cell_index)),
                 egui::Sense::click_and_drag(),
             );
+            let pane_was_active = self.active_pane == cell_index;
 
             // Focus: the last-clicked pane is what the sidebar edits (the
             // main pane edits the whole bunch; extra panes edit themselves).
@@ -26447,9 +26647,9 @@ impl ViewerApp {
                 !armed && !vrot_armed && !annotation_active && !cross_section_handle_owns_pointer,
             );
 
-            // Shared pan: dragging any cell moves every pane in sync.
+            // Shared pan: dragging any cell moves every pane in sync. Vrot
+            // only owns click samples, not drag navigation.
             if !armed
-                && !vrot_armed
                 && !annotation_active
                 && !cross_section_handle_owns_pointer
                 && !vol3d_box_drag_owns_pointer
@@ -26500,18 +26700,7 @@ impl ViewerApp {
                 }
             }
 
-            let site_points = self
-                .sites
-                .iter()
-                .enumerate()
-                .filter_map(|(index, site)| {
-                    let (latitude_deg, longitude_deg) = site_location(site)?;
-                    let position = self.lon_lat_to_screen(cell, longitude_deg, latitude_deg);
-                    cell.expand(18.0)
-                        .contains(position)
-                        .then_some((index, position))
-                })
-                .collect::<Vec<_>>();
+            let site_points = self.primary_level2_site_points(cell);
             let intl_points = self.intl_site_points(cell);
             let community_points = self.community_site_points(cell);
             let custom_poll_points = self.custom_poll_points(cell);
@@ -26735,7 +26924,8 @@ impl ViewerApp {
                     self.cross_section_status = "Cross-section: click endpoint A then B".to_owned();
                 }
             } else if vrot_armed {
-                if response.clicked()
+                if pane_was_active
+                    && response.clicked()
                     && let Some(pointer) = response.interact_pointer_pos()
                 {
                     let (product, cut) = self
@@ -26743,7 +26933,7 @@ impl ViewerApp {
                         .unwrap_or_else(|| (self.selected_product.clone(), self.selected_cut));
                     self.add_vrot_tool_point(cell, pointer, &product, cut);
                 }
-                if response.secondary_clicked() {
+                if pane_was_active && response.secondary_clicked() {
                     self.vrot_points.clear();
                     self.status = "Vrot points cleared".to_owned();
                 }
@@ -26761,18 +26951,7 @@ impl ViewerApp {
             let pane_context = (cell_index > 0)
                 .then(|| self.begin_extra_pane_context(cell_index - 1))
                 .flatten();
-            let site_points = self
-                .sites
-                .iter()
-                .enumerate()
-                .filter_map(|(index, site)| {
-                    let (latitude_deg, longitude_deg) = site_location(site)?;
-                    let position = self.lon_lat_to_screen(cell, longitude_deg, latitude_deg);
-                    cell.expand(18.0)
-                        .contains(position)
-                        .then_some((index, position))
-                })
-                .collect::<Vec<_>>();
+            let site_points = self.primary_level2_site_points(cell);
             let intl_points = self.intl_site_points(cell);
             let (pane_product, pane_cut) = self
                 .pane_product_cut(cell_index)
@@ -27554,12 +27733,11 @@ impl ViewerApp {
         });
     }
 
-    /// Lowest-beam radar candidates for a geo point across EVERY pollable
-    /// family — CONUS WSR-88Ds, international providers, and US community
-    /// research feeds (field request: the nearest-radar menu "working with
-    /// international radars too") — sorted by 0.5° beam height ascending
-    /// (slant range → 4/3-Earth beam height; 0.5° is nominal for non-NEXRAD
-    /// sites whose lowest tilt we don't know, disclosed in the hover).
+    /// Lowest-beam radar candidates for a geo point across the primary
+    /// Level II site catalog, sorted by 0.5° beam height ascending (slant
+    /// range → 4/3-Earth beam height). Community/research feeds stay
+    /// explicit operator picks so Ctrl-click/right-click nearest does not
+    /// jump to non-NEXRAD feeds.
     /// Geometry only — the terrain-blockage version needs a coverage
     /// dataset. TDWRs (Txxx) have ~90 km range and C-band attenuation, so
     /// they list in their own menu section ([`tdwr_candidates`]) instead
@@ -27573,6 +27751,9 @@ impl ViewerApp {
             .iter()
             .enumerate()
             .filter_map(|(index, site)| {
+                if !site_is_primary_level2_catalog_site(site) {
+                    return None;
+                }
                 if site.level2_id.starts_with('T') {
                     return None;
                 }
@@ -27590,80 +27771,12 @@ impl ViewerApp {
                 })
             })
             .collect();
-        for site in data_source::international::intl_static_sites() {
-            let (Some(site_lat), Some(site_lon)) = (site.latitude_deg, site.longitude_deg) else {
-                continue;
-            };
-            let distance_km = haversine_km(lat, lon, site_lat, site_lon);
-            if distance_km > 460.0 {
-                continue;
-            }
-            candidates.push(BeamCandidate {
-                target: BeamTarget::Intl {
-                    provider_id: site.provider_id.to_owned(),
-                    site_id: site.site_id.clone(),
-                },
-                label: site.label.clone(),
-                origin: Some(intl_provider_label(site.provider_id)),
-                beam_m: beam_at(distance_km),
-                distance_km,
-            });
-        }
-        for marker in data_source::community_feeds::community_markers() {
-            // Clusters rank as ONE row that starts the first feed (the map
-            // marker keeps the full per-feed picker).
-            let Some(feed) = marker
-                .feed_indices
-                .first()
-                .and_then(|&index| data_source::community_feeds::community_feeds().get(index))
-            else {
-                continue;
-            };
-            let distance_km = haversine_km(lat, lon, marker.latitude_deg, marker.longitude_deg);
-            if distance_km > 460.0 {
-                continue;
-            }
-            candidates.push(BeamCandidate {
-                target: BeamTarget::Research {
-                    url: feed.poll_url.to_owned(),
-                },
-                label: marker.label.clone(),
-                origin: Some("research feed".to_owned()),
-                beam_m: beam_at(distance_km),
-                distance_km,
-            });
-        }
-        for entry in &self.app_settings.custom_poll_links {
-            if custom_poll_entry_matches_community_feed(entry) {
-                continue;
-            }
-            let Some((site_lat, site_lon)) = custom_poll_entry_lat_lon(entry) else {
-                continue;
-            };
-            let url = normalized_poll_url(&entry.poll_url);
-            if url.is_empty() {
-                continue;
-            }
-            let distance_km = haversine_km(lat, lon, site_lat, site_lon);
-            if distance_km > 460.0 {
-                continue;
-            }
-            candidates.push(BeamCandidate {
-                target: BeamTarget::Research { url },
-                label: custom_poll_entry_label(entry),
-                origin: Some("custom feed".to_owned()),
-                beam_m: beam_at(distance_km),
-                distance_km,
-            });
-        }
         candidates.sort_by(|a, b| a.beam_m.total_cmp(&b.beam_m));
         candidates
     }
 
-    /// Switch to a beam-ranked pick: CONUS sites select + load latest
-    /// Level II; international and research sites start their live poll
-    /// (the same paths as their map markers and pickers). Explicit picks
-    /// always win — every path replaces/clears the in-flight receivers.
+    /// Switch to a beam-ranked pick. Explicit picks always win: the
+    /// activation path replaces/clears in-flight receivers.
     fn activate_beam_target(&mut self, candidate: &BeamCandidate, ctx: &egui::Context) {
         if let Some(pane_slot) = self.independent_editing_pane() {
             self.activate_beam_target_for_extra_pane(pane_slot, candidate, ctx);
@@ -27674,17 +27787,6 @@ impl ViewerApp {
                 self.selected_site_index = *index;
                 let site = self.sites[*index].clone();
                 self.start_latest_level2_load(site, ctx);
-            }
-            BeamTarget::Intl {
-                provider_id,
-                site_id,
-            } => {
-                self.start_intl_poll(provider_id.clone(), site_id.clone(), ctx);
-                self.status = format!("Live-polling {}", candidate.label);
-            }
-            BeamTarget::Research { url } => {
-                self.start_known_feed_poll(url);
-                self.status = format!("Live-polling {}", candidate.label);
             }
         }
     }
@@ -27704,27 +27806,6 @@ impl ViewerApp {
                 self.start_extra_pane_latest_load(pane_slot, site, ctx);
                 true
             }
-            BeamTarget::Intl {
-                provider_id,
-                site_id,
-            } => {
-                let Some(site) = Self::find_intl_site(provider_id, site_id) else {
-                    return false;
-                };
-                self.start_extra_pane_intl_load(pane_slot, site, LatestLoadMode::User, ctx);
-                true
-            }
-            BeamTarget::Research { .. } => {
-                let status = format!(
-                    "{} is a live feed; independent panes currently load catalog Level II sites",
-                    candidate.label
-                );
-                if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-                    pane.status = status.clone();
-                }
-                self.status = status;
-                false
-            }
         }
     }
 
@@ -27739,6 +27820,9 @@ impl ViewerApp {
             .iter()
             .enumerate()
             .filter_map(|(index, site)| {
+                if !site_is_primary_level2_catalog_site(site) {
+                    return None;
+                }
                 if !site.level2_id.starts_with('T') {
                     return None;
                 }
@@ -27748,6 +27832,64 @@ impl ViewerApp {
             })
             .collect();
         candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
+        candidates
+    }
+
+    fn community_feed_candidates(
+        &self,
+        lat: f32,
+        lon: f32,
+        max_km: f32,
+    ) -> Vec<(data_source::community_feeds::CommunityFeed, f32)> {
+        let mut candidates = data_source::community_feeds::community_feeds()
+            .iter()
+            .filter_map(|feed| {
+                let distance_km = haversine_km(lat, lon, feed.latitude_deg, feed.longitude_deg);
+                (distance_km <= max_km).then_some((*feed, distance_km))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.1.total_cmp(&right.1));
+        candidates
+    }
+
+    fn intl_radar_candidates(
+        &self,
+        lat: f32,
+        lon: f32,
+        max_km: f32,
+    ) -> Vec<(data_source::international::IntlSite, f32)> {
+        let mut candidates = data_source::international::intl_static_sites()
+            .iter()
+            .filter_map(|site| {
+                let (Some(site_lat), Some(site_lon)) = (site.latitude_deg, site.longitude_deg)
+                else {
+                    return None;
+                };
+                let distance_km = haversine_km(lat, lon, site_lat, site_lon);
+                (distance_km <= max_km).then_some((site.clone(), distance_km))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.1.total_cmp(&right.1));
+        candidates
+    }
+
+    fn custom_poll_candidates(&self, lat: f32, lon: f32, max_km: f32) -> Vec<(usize, String, f32)> {
+        let mut candidates = self
+            .app_settings
+            .custom_poll_links
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                if custom_poll_entry_matches_community_feed(entry) {
+                    return None;
+                }
+                let (entry_lat, entry_lon) = custom_poll_entry_lat_lon(entry)?;
+                let distance_km = haversine_km(lat, lon, entry_lat, entry_lon);
+                (distance_km <= max_km)
+                    .then(|| (index, custom_poll_entry_label(entry), distance_km))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.2.total_cmp(&right.2));
         candidates
     }
 
@@ -27767,14 +27909,12 @@ impl ViewerApp {
         let label = candidate.label.clone();
         let beam_m = candidate.beam_m;
         self.activate_beam_target(&candidate, ctx);
-        if matches!(candidate.target, BeamTarget::Conus(_)) {
-            // Set AFTER the load kick so the user sees what happened (the
-            // load start overwrites self.status with "Loading latest L2 …").
-            self.status = format!(
-                "Switched to {label} — lowest beam {} at your click",
-                units::format_beam_height(beam_m, self.units())
-            );
-        }
+        // Set AFTER the load kick so the user sees what happened (the
+        // load start overwrites self.status with "Loading latest L2 …").
+        self.status = format!(
+            "Switched to {label} — lowest beam {} at your click",
+            units::format_beam_height(beam_m, self.units())
+        );
     }
 
     fn switch_extra_pane_to_best_radar_at(
@@ -27818,12 +27958,10 @@ impl ViewerApp {
         let label = candidate.label.clone();
         let distance_km = candidate.distance_km;
         self.activate_beam_target(&candidate, ctx);
-        if matches!(candidate.target, BeamTarget::Conus(_)) {
-            self.status = format!(
-                "Switched to {label} — closest radar ({})",
-                units::format_distance_km(distance_km, self.units())
-            );
-        }
+        self.status = format!(
+            "Switched to {label} — closest radar ({})",
+            units::format_distance_km(distance_km, self.units())
+        );
     }
 
     fn switch_extra_pane_to_nearest_radar_at(
@@ -27886,6 +28024,141 @@ impl ViewerApp {
         self.show_inspector_card = true;
     }
 
+    fn poll_radar_operational_status(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.radar_operational_status_rx else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(load) => {
+                let site_id = normalize_radar_station_id(&load.site_id)
+                    .unwrap_or_else(|| load.site_id.to_ascii_uppercase());
+                let entry = match load.result {
+                    Ok(status) => RadarOperationalStatusCacheEntry::Ready {
+                        status,
+                        fetched_at: Instant::now(),
+                    },
+                    Err(message) => RadarOperationalStatusCacheEntry::Error {
+                        message,
+                        fetched_at: Instant::now(),
+                    },
+                };
+                self.radar_operational_status_cache.insert(site_id, entry);
+                self.radar_operational_status_rx = None;
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.radar_operational_status_rx = None;
+            }
+        }
+    }
+
+    fn nearest_operational_status_site(&self, lat: f32, lon: f32) -> Option<(RadarSite, f32)> {
+        self.sites
+            .iter()
+            .filter(|site| site_is_primary_level2_catalog_site(site))
+            .filter(|site| normalize_radar_station_id(&site.level2_id).is_some())
+            .filter_map(|site| {
+                let (site_lat, site_lon) = site_location(site)?;
+                let distance_km = haversine_km(lat, lon, site_lat, site_lon);
+                (distance_km <= RADAR_OPERATIONAL_STATUS_CLICK_KM)
+                    .then_some((site.clone(), distance_km))
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+    }
+
+    fn ensure_radar_operational_status_fetch(&mut self, site: &RadarSite, ctx: &egui::Context) {
+        let Some(site_id) = normalize_radar_station_id(&site.level2_id) else {
+            return;
+        };
+        let now = Instant::now();
+        let should_fetch = match self.radar_operational_status_cache.get(&site_id) {
+            Some(RadarOperationalStatusCacheEntry::Ready { fetched_at, .. }) => {
+                now.duration_since(*fetched_at)
+                    > Duration::from_secs(RADAR_OPERATIONAL_STATUS_CACHE_SECONDS)
+            }
+            Some(RadarOperationalStatusCacheEntry::Error { fetched_at, .. }) => {
+                now.duration_since(*fetched_at)
+                    > Duration::from_secs(RADAR_OPERATIONAL_STATUS_ERROR_SECONDS)
+            }
+            Some(RadarOperationalStatusCacheEntry::Loading { started_at }) => {
+                now.duration_since(*started_at)
+                    > Duration::from_secs(RADAR_OPERATIONAL_STATUS_LOADING_SECONDS)
+            }
+            None => true,
+        };
+        if !should_fetch || self.radar_operational_status_rx.is_some() {
+            return;
+        }
+
+        self.radar_operational_status_cache.insert(
+            site_id.clone(),
+            RadarOperationalStatusCacheEntry::Loading { started_at: now },
+        );
+        let fallback_name = site.name.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.radar_operational_status_rx = Some(receiver);
+        thread::spawn(move || {
+            let result = fetch_radar_operational_status(&site_id, fallback_name.as_deref());
+            let _ = sender.send(RadarOperationalStatusLoad { site_id, result });
+        });
+        ctx.request_repaint_after(Duration::from_millis(250));
+    }
+
+    fn radar_operational_status_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        site: &RadarSite,
+        distance_km: f32,
+    ) {
+        let Some(site_id) = normalize_radar_station_id(&site.level2_id) else {
+            return;
+        };
+        self.ensure_radar_operational_status_fetch(site, ui.ctx());
+
+        ui.label(format!("Operational status: {}", format_site_label(site)));
+        if distance_km > 1.0 {
+            ui.weak(format!(
+                "nearest site, {} from click",
+                units::format_distance_km(distance_km, self.units())
+            ));
+        }
+
+        let mut refresh = false;
+        if let Some(entry) = self.radar_operational_status_cache.get(&site_id) {
+            match entry {
+                RadarOperationalStatusCacheEntry::Loading { .. } => {
+                    ui.weak("loading NWS radar alarms...");
+                    ui.ctx().request_repaint_after(Duration::from_millis(250));
+                }
+                RadarOperationalStatusCacheEntry::Error { message, .. } => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 140, 120),
+                        format!("status unavailable: {message}"),
+                    );
+                    refresh = ui.small_button("Retry").clicked();
+                }
+                RadarOperationalStatusCacheEntry::Ready { status, fetched_at } => {
+                    let age = Instant::now().duration_since(*fetched_at).as_secs();
+                    ui.horizontal(|ui| {
+                        ui.weak(format!("NWS radar API - cached {age}s"));
+                        if ui.small_button("Refresh").clicked() {
+                            refresh = true;
+                        }
+                    });
+                    draw_radar_operational_status_rows(ui, status);
+                }
+            }
+        } else {
+            ui.weak("status not requested yet");
+        }
+
+        if refresh {
+            self.radar_operational_status_cache.remove(&site_id);
+            self.ensure_radar_operational_status_fetch(site, ui.ctx());
+        }
+    }
+
     /// Context menu: the three lowest-beam radars over the clicked point.
     fn best_radar_context_menu(&mut self, ui: &mut egui::Ui) {
         let Some((lon, lat)) = self.context_menu_lonlat else {
@@ -27893,9 +28166,14 @@ impl ViewerApp {
             return;
         };
         let candidates = self.best_radar_candidates(lat, lon);
+        let operational_site = self.nearest_operational_status_site(lat, lon);
         let nearest_ob = self.nearest_surface_ob_to_lonlat(lon, lat, 35.0);
         ui.label(format!("{lat:.3}, {lon:.3}"));
         ui.separator();
+        if let Some((site, distance_km)) = operational_site.as_ref() {
+            self.radar_operational_status_menu(ui, site, *distance_km);
+            ui.separator();
+        }
         if let Some(ob) = nearest_ob.as_ref() {
             ui.label("Surface ob:");
             let label = if let Some(time_utc) = ob.time_utc {
@@ -27927,6 +28205,9 @@ impl ViewerApp {
         ui.label("Lowest beam here:");
         let units = self.units();
         let mut activate: Option<BeamCandidate> = None;
+        let mut picked_feed: Option<data_source::community_feeds::CommunityFeed> = None;
+        let mut picked_custom_feed: Option<usize> = None;
+        let mut picked_intl_site: Option<data_source::international::IntlSite> = None;
         for candidate in candidates.into_iter().take(4) {
             let mut row = format!(
                 "{} · {} · {}",
@@ -27937,14 +28218,11 @@ impl ViewerApp {
             if let Some(origin) = &candidate.origin {
                 row.push_str(&format!(" · {origin}"));
             }
-            let hover = match candidate.target {
-                BeamTarget::Conus(_) => "Switch to this site and load the latest volume",
-                _ => {
-                    "Start live-polling this feed (beam height assumes a \
-                     nominal 0.5° lowest tilt)"
-                }
-            };
-            if ui.button(row).on_hover_text(hover).clicked() {
+            if ui
+                .button(row)
+                .on_hover_text("Switch to this site and load the latest volume")
+                .clicked()
+            {
                 activate = Some(candidate);
                 ui.close();
             }
@@ -27978,6 +28256,65 @@ impl ViewerApp {
                 }
             }
         }
+        let research_feeds = self.community_feed_candidates(lat, lon, 460.0);
+        if !research_feeds.is_empty() {
+            ui.separator();
+            ui.label("Research feeds nearby:");
+            for (feed, distance_km) in research_feeds.into_iter().take(8) {
+                if ui
+                    .button(format!(
+                        "{} · {} · {}",
+                        feed.id,
+                        feed.label,
+                        units::format_distance_km(distance_km, units)
+                    ))
+                    .on_hover_text(format!("Poll {}", feed.poll_url))
+                    .clicked()
+                {
+                    picked_feed = Some(feed);
+                    ui.close();
+                }
+            }
+        }
+        let custom_feeds = self.custom_poll_candidates(lat, lon, 460.0);
+        if !custom_feeds.is_empty() {
+            ui.separator();
+            ui.label("Custom feeds nearby:");
+            for (index, label, distance_km) in custom_feeds.into_iter().take(6) {
+                if ui
+                    .button(format!(
+                        "{label} · {}",
+                        units::format_distance_km(distance_km, units)
+                    ))
+                    .on_hover_text("Start this saved custom feed")
+                    .clicked()
+                {
+                    picked_custom_feed = Some(index);
+                    ui.close();
+                }
+            }
+        }
+        let intl_sites = self.intl_radar_candidates(lat, lon, 700.0);
+        if !intl_sites.is_empty() {
+            ui.separator();
+            ui.label("International radars nearby:");
+            for (site, distance_km) in intl_sites.into_iter().take(8) {
+                let provider = intl_provider_label(site.provider_id);
+                if ui
+                    .button(format!(
+                        "{} · {} · {}",
+                        site.label,
+                        provider,
+                        units::format_distance_km(distance_km, units)
+                    ))
+                    .on_hover_text("Start this international radar feed")
+                    .clicked()
+                {
+                    picked_intl_site = Some(site);
+                    ui.close();
+                }
+            }
+        }
         if let Some(candidate) = activate {
             // No in-flight guard: the menu pick is explicit intent and must
             // win — every activation path replaces the in-flight receivers
@@ -27985,6 +28322,37 @@ impl ViewerApp {
             // volume snapped selection back).
             let ctx = ui.ctx().clone();
             self.activate_beam_target(&candidate, &ctx);
+        }
+        if let Some(feed) = picked_feed {
+            if let Some(index) = self.sites.iter().position(|site| {
+                site.level2_id.eq_ignore_ascii_case(feed.id)
+                    && community_feed_for_site(site).is_some()
+            }) {
+                self.selected_site_index = index;
+                self.remember_startup_site();
+            }
+            self.center_map_on(feed.latitude_deg, feed.longitude_deg);
+            let ctx = ui.ctx().clone();
+            self.start_known_feed_poll(feed.poll_url);
+            self.status = format!("Polling {} · research feed", feed.id);
+            ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+        }
+        if let Some(index) = picked_custom_feed {
+            self.start_custom_poll_link(index);
+            ui.ctx()
+                .request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+        }
+        if let Some(site) = picked_intl_site {
+            if let (Some(site_lat), Some(site_lon)) = (site.latitude_deg, site.longitude_deg) {
+                self.center_map_on(site_lat, site_lon);
+            }
+            let provider = site.provider_id.to_owned();
+            let site_id = site.site_id.clone();
+            let label = site.label.clone();
+            let ctx = ui.ctx().clone();
+            self.start_intl_poll(provider.clone(), site_id.clone(), &ctx);
+            self.status = format!("Polling {label} · {}", intl_provider_label(&provider));
+            ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
         }
     }
 
@@ -34450,7 +34818,9 @@ impl ViewerApp {
                 self.estofex_issue_id.as_deref(),
                 displayed_time,
             ) {
-                for feature in &issue.polygons {
+                let mut features = issue.polygons.iter().collect::<Vec<_>>();
+                features.sort_by_key(|feature| spc_layers::estofex_feature_draw_rank(feature));
+                for feature in features {
                     self.draw_estofex_outlook_feature(painter, rect, feature, spc_style);
                 }
             }
@@ -35140,6 +35510,7 @@ impl ViewerApp {
             let (lon_a, lat_a, v_a, h_a) = self.vrot_points[0];
             let (lon_b, lat_b, v_b, h_b) = self.vrot_points[1];
             let vrot_mps = (v_a.abs() + v_b.abs()) / 2.0;
+            let (velocity_unit, velocity_scale) = self.vrot_display_unit();
             let diameter_km = haversine_km(lat_a, lon_a, lat_b, lon_b);
             let diameter_nm = diameter_km * 0.539_957;
             let height_kft = ((h_a + h_b) / 2.0) * 3.280_84 / 1000.0;
@@ -35149,10 +35520,11 @@ impl ViewerApp {
             );
             let label = format!(
                 "Vrot {:.0} kt · dia {:.1} nm · {:.1} kft",
-                vrot_mps / KNOT_TO_MPS,
+                vrot_mps / velocity_scale,
                 diameter_nm,
                 height_kft
             );
+            let label = label.replace(" kt", &format!(" {velocity_unit}"));
             draw_heavy_halo_text(
                 painter,
                 mid + egui::vec2(0.0, -14.0),
@@ -35483,7 +35855,7 @@ impl ViewerApp {
                 }
             }
             if self.map_scale >= 120.0 {
-                let (velocity_scale, velocity_unit) = vrot_display_scale_unit(self.units());
+                let (velocity_unit, velocity_scale) = self.vrot_display_unit();
                 draw_halo_text(
                     painter,
                     position + egui::vec2(0.0, -14.0),
@@ -35653,6 +36025,19 @@ impl ViewerApp {
         self.palette_product_overrides
             .get(product.label())
             .unwrap_or_else(|| self.color_tables.for_family(product.color_family()))
+    }
+
+    fn vrot_display_unit(&self) -> (&'static str, f32) {
+        let velocity_product = if product_units(&self.selected_product) == "m/s" {
+            self.selected_product.clone()
+        } else {
+            DisplayProduct::Moment(MomentType::Velocity)
+        };
+        table_display_unit(
+            self.active_table_for_product(&velocity_product),
+            &velocity_product,
+            self.units(),
+        )
     }
 
     fn draw_colorbar_for_product(
@@ -35968,7 +36353,11 @@ impl ViewerApp {
             }
         }
         if let Some(probe) = readout.as_ref().and_then(|readout| readout.vrot) {
-            lines.push(format_vrot_card_line(probe, self.units()));
+            lines.push(format_vrot_card_line(
+                probe,
+                self.vrot_display_unit(),
+                self.units(),
+            ));
         }
         if let Some(history) = &obs_history {
             let network = if history.network.is_empty() {
@@ -36903,7 +37292,7 @@ impl ViewerApp {
             let selected = self.selected_hazard_index == Some(index);
             let style = self
                 .style_registry
-                .hazard_polygon(&record.event_family, record.damage_threat.as_deref());
+                .hazard_polygon(&record.event_family, hazard_record_style_threat(record));
             let global = self.style_registry.hazard_global();
             let color = style_color32(style.stroke_color);
             let base_alpha = style.fill_alpha.unwrap_or(global.fill_alpha);
@@ -38450,6 +38839,21 @@ impl ViewerApp {
     /// Indices key into [`data_source::international::intl_static_sites`],
     /// the providers' embedded tables: pure data, never the network, safe
     /// to walk on the UI thread every frame.
+    fn primary_level2_site_points(&self, rect: egui::Rect) -> Vec<(usize, egui::Pos2)> {
+        self.sites
+            .iter()
+            .enumerate()
+            .filter(|(_, site)| site_is_primary_level2_catalog_site(site))
+            .filter_map(|(index, site)| {
+                let (latitude_deg, longitude_deg) = site_location(site)?;
+                let position = self.lon_lat_to_screen(rect, longitude_deg, latitude_deg);
+                rect.expand(18.0)
+                    .contains(position)
+                    .then_some((index, position))
+            })
+            .collect()
+    }
+
     fn intl_site_points(&self, rect: egui::Rect) -> Vec<(usize, egui::Pos2)> {
         data_source::international::intl_static_sites()
             .iter()
@@ -39354,7 +39758,17 @@ impl ViewerApp {
 
     fn nearest_site_to_position(&self, rect: egui::Rect, position: egui::Pos2) -> Option<usize> {
         let (target_lon, target_lat) = self.screen_to_lon_lat(rect, position);
-        nearest_site_index(&self.sites, target_lat, target_lon)
+        self.sites
+            .iter()
+            .enumerate()
+            .filter(|(_, site)| site_is_primary_level2_catalog_site(site))
+            .filter_map(|(index, site)| {
+                let (latitude_deg, longitude_deg) = site_location(site)?;
+                let distance_km = haversine_km(target_lat, target_lon, latitude_deg, longitude_deg);
+                Some((index, distance_km))
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+            .map(|(index, _)| index)
     }
 
     /// Hover readout for derived products via a one-shot grid cache.
@@ -39574,11 +39988,15 @@ impl ViewerApp {
         self.status = match self.vrot_points.as_slice() {
             [_] => "Vrot point 1 set; click the opposite velocity max".to_owned(),
             [a, b] => {
-                let vrot_kt = ((a.2.abs() + b.2.abs()) / 2.0) / KNOT_TO_MPS;
+                let (velocity_unit, velocity_scale) = self.vrot_display_unit();
+                let vrot = ((a.2.abs() + b.2.abs()) / 2.0) / velocity_scale;
                 if a.2.signum() == b.2.signum() {
-                    format!("Vrot {:.0} kt; points have the same sign", vrot_kt)
+                    format!(
+                        "Vrot {:.0} {velocity_unit}; points have the same sign",
+                        vrot
+                    )
                 } else {
-                    format!("Vrot {:.0} kt set", vrot_kt)
+                    format!("Vrot {:.0} {velocity_unit} set", vrot)
                 }
             }
             _ => String::new(),
@@ -41238,6 +41656,47 @@ fn site_location(site: &RadarSite) -> Option<(f32, f32)> {
     Some((site.latitude_deg?, site.longitude_deg?))
 }
 
+fn community_feed_site(feed: &data_source::community_feeds::CommunityFeed) -> RadarSite {
+    RadarSite::new(feed.id).with_location(
+        Some(format!("{}{}", feed.label, COMMUNITY_FEED_SITE_NAME_SUFFIX)),
+        Some(feed.latitude_deg),
+        Some(feed.longitude_deg),
+    )
+}
+
+fn site_catalog_with_community_feeds(mut sites: Vec<RadarSite>) -> Vec<RadarSite> {
+    let mut existing = sites
+        .iter()
+        .map(|site| site.level2_id.to_ascii_uppercase())
+        .collect::<BTreeSet<_>>();
+    for feed in data_source::community_feeds::community_feeds() {
+        if existing.insert(feed.id.to_ascii_uppercase()) {
+            sites.push(community_feed_site(feed));
+        }
+    }
+    sites.sort_by(|left, right| left.level2_id.cmp(&right.level2_id));
+    sites
+}
+
+fn community_feed_for_site(
+    site: &RadarSite,
+) -> Option<&'static data_source::community_feeds::CommunityFeed> {
+    if !site
+        .name
+        .as_deref()
+        .is_some_and(|name| name.ends_with(COMMUNITY_FEED_SITE_NAME_SUFFIX))
+    {
+        return None;
+    }
+    data_source::community_feeds::community_feeds()
+        .iter()
+        .find(|feed| feed.id.eq_ignore_ascii_case(&site.level2_id))
+}
+
+fn site_is_primary_level2_catalog_site(site: &RadarSite) -> bool {
+    community_feed_for_site(site).is_none()
+}
+
 /// The marker in `points` nearest to `pointer` within the shared 12 px
 /// click/hover halo, with its distance — one hit test for the CONUS,
 /// international, and community marker sets.
@@ -41781,6 +42240,16 @@ fn live_hazard_record_is_current(record: &HazardRecord) -> bool {
         record.lifecycle_status.as_deref(),
         Some("Active") | Some("Pending")
     )
+}
+
+fn preview_retained_hazard_records(overlay: &HazardOverlay) -> Vec<HazardRecord> {
+    overlay
+        .records
+        .iter()
+        .filter(|record| record.event_family == "mesoscale discussion")
+        .filter(|record| live_hazard_record_is_current(record))
+        .cloned()
+        .collect()
 }
 
 fn active_alert_event_ids(records: &[HazardRecord]) -> BTreeSet<String> {
@@ -42903,15 +43372,23 @@ fn family_threshold_is_symmetric(family: ColorTableFamily) -> bool {
     )
 }
 
-fn vrot_display_scale_unit(unit_system: units::Units) -> (f32, &'static str) {
+fn vrot_display_scale_unit(display_unit: (&str, f32), unit_system: units::Units) -> (&str, f32) {
+    let (label, scale) = display_unit;
+    if matches!(label, "m/s" | "kt" | "mph" | "km/h") {
+        return (label, scale);
+    }
     match unit_system {
-        units::Units::Imperial => (KNOT_TO_MPS, "kt"),
-        units::Units::Metric => (1.0, "m/s"),
+        units::Units::Imperial => ("mph", color_tables::unit_scale_to_internal("mph")),
+        units::Units::Metric => ("km/h", color_tables::unit_scale_to_internal("km/h")),
     }
 }
 
-fn format_vrot_card_line(probe: VrotProbe, unit_system: units::Units) -> String {
-    let (velocity_scale, velocity_unit) = vrot_display_scale_unit(unit_system);
+fn format_vrot_card_line(
+    probe: VrotProbe,
+    display_unit: (&'static str, f32),
+    unit_system: units::Units,
+) -> String {
+    let (velocity_unit, velocity_scale) = vrot_display_scale_unit(display_unit, unit_system);
     format!(
         "Vrot {:.1} {velocity_unit} - dV {:.1} {velocity_unit} - sep {:.2} km",
         probe.vrot_mps / velocity_scale,
@@ -42945,7 +43422,8 @@ fn format_cursor_readout(
     let vrot = readout
         .vrot
         .map(|probe| {
-            let (velocity_scale, velocity_unit) = vrot_display_scale_unit(unit_system);
+            let (velocity_unit, velocity_scale) =
+                vrot_display_scale_unit(display_unit, unit_system);
             format!(
                 " Vrot {:.1} {velocity_unit} dV {:.1} {velocity_unit} sep {:.2} km in r{}/g{} {:05.1} {:.1} {velocity_unit} out r{}/g{} {:05.1} {:.1} {velocity_unit}",
                 probe.vrot_mps / velocity_scale,
@@ -44058,6 +44536,174 @@ fn haversine_km(lat_a: f32, lon_a: f32, lat_b: f32, lon_b: f32) -> f32 {
     2.0 * earth_radius_km * a.sqrt().atan2((1.0 - a).max(0.0).sqrt())
 }
 
+fn normalize_radar_station_id(site_id: &str) -> Option<String> {
+    let site_id = site_id.trim().to_ascii_uppercase();
+    (site_id.len() == 4 && site_id.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        .then_some(site_id)
+}
+
+fn fetch_radar_operational_status(
+    site_id: &str,
+    fallback_name: Option<&str>,
+) -> Result<RadarOperationalStatus, String> {
+    let site_id = normalize_radar_station_id(site_id)
+        .ok_or_else(|| format!("invalid radar station id '{site_id}'"))?;
+    let station_url = format!("https://api.weather.gov/radar/stations/{site_id}");
+    let alarms_url = format!("https://api.weather.gov/radar/stations/{site_id}/alarms");
+    let station_text = data_source::fetch_text(&station_url)
+        .map_err(|err| format!("station status fetch failed: {err}"))?;
+    let alarms_text = data_source::fetch_text(&alarms_url)
+        .map_err(|err| format!("station alarms fetch failed: {err}"))?;
+    parse_radar_operational_status(&site_id, fallback_name, &station_text, &alarms_text)
+}
+
+fn parse_radar_operational_status(
+    requested_site_id: &str,
+    fallback_name: Option<&str>,
+    station_text: &str,
+    alarms_text: &str,
+) -> Result<RadarOperationalStatus, String> {
+    let requested_site_id = normalize_radar_station_id(requested_site_id)
+        .ok_or_else(|| format!("invalid radar station id '{requested_site_id}'"))?;
+    let station: WeatherGovRadarStationResponse = serde_json::from_str(station_text)
+        .map_err(|err| format!("station status JSON parse failed: {err}"))?;
+    let alarms: WeatherGovRadarAlarmsResponse = serde_json::from_str(alarms_text)
+        .map_err(|err| format!("station alarms JSON parse failed: {err}"))?;
+
+    let rda = station.properties.rda;
+    let rda_properties = rda.as_ref().and_then(|rda| rda.properties.as_ref());
+    let station_id = station
+        .properties
+        .id
+        .as_deref()
+        .and_then(normalize_radar_station_id)
+        .unwrap_or(requested_site_id);
+    let site_name = station
+        .properties
+        .name
+        .as_deref()
+        .or(fallback_name)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(station_id.as_str())
+        .to_owned();
+    let rda_timestamp = rda
+        .as_ref()
+        .and_then(|rda| parse_radar_operational_timestamp(rda.timestamp.as_deref()));
+    let mut alarm_rows = alarms
+        .graph
+        .into_iter()
+        .filter(|alarm| {
+            alarm
+                .station_id
+                .as_deref()
+                .and_then(normalize_radar_station_id)
+                .is_none_or(|alarm_site| alarm_site == station_id)
+        })
+        .filter_map(|alarm| {
+            let message = alarm.message?.trim().to_owned();
+            if message.is_empty() {
+                return None;
+            }
+            Some(RadarOperationalAlarm {
+                status: alarm.status.unwrap_or_default(),
+                message,
+                timestamp: parse_radar_operational_timestamp(alarm.timestamp.as_deref()),
+            })
+        })
+        .collect::<Vec<_>>();
+    alarm_rows.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+
+    Ok(RadarOperationalStatus {
+        site_id: station_id,
+        site_name,
+        alarm_summary: rda_properties.and_then(|props| non_empty_string(&props.alarm_summary)),
+        mode: rda_properties.and_then(|props| non_empty_string(&props.mode)),
+        rda_status: rda_properties.and_then(|props| non_empty_string(&props.status)),
+        operability_status: rda_properties
+            .and_then(|props| non_empty_string(&props.operability_status)),
+        rda_timestamp,
+        alarms: alarm_rows,
+    })
+}
+
+fn parse_radar_operational_timestamp(value: Option<&str>) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value?)
+        .ok()
+        .map(|time| time.with_timezone(&Utc))
+}
+
+fn non_empty_string(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn draw_radar_operational_status_rows(ui: &mut egui::Ui, status: &RadarOperationalStatus) {
+    let rda_time = status
+        .rda_timestamp
+        .map(format_utc_seconds)
+        .unwrap_or_else(|| "time unknown".to_owned());
+    ui.monospace(format!("Radar: {} {}", status.site_id, status.site_name));
+    if let Some(alarm_summary) = &status.alarm_summary {
+        ui.monospace(format!("Alarm: {alarm_summary}"));
+    }
+    let mut state_parts = Vec::new();
+    if let Some(operability) = &status.operability_status {
+        state_parts.push(operability.as_str());
+    }
+    if let Some(mode) = &status.mode {
+        state_parts.push(mode.as_str());
+    }
+    if let Some(rda_status) = &status.rda_status {
+        state_parts.push(rda_status.as_str());
+    }
+    if !state_parts.is_empty() {
+        ui.weak(format!("{} - {rda_time}", state_parts.join(" | ")));
+    }
+
+    let alarms =
+        radar_operational_display_alarms(&status.alarms, RADAR_OPERATIONAL_STATUS_DISPLAY_ROWS);
+    if alarms.is_empty() {
+        ui.weak("No recent alarm messages");
+        return;
+    }
+    for alarm in alarms {
+        let timestamp = alarm
+            .timestamp
+            .map(format_utc_seconds)
+            .unwrap_or_else(|| "time unknown".to_owned());
+        let line = format!("{} ({timestamp})", alarm.message);
+        let response = ui.monospace(line);
+        if !alarm.status.trim().is_empty() {
+            response.on_hover_text(format!("status: {}", alarm.status));
+        }
+    }
+}
+
+fn radar_operational_display_alarms(
+    alarms: &[RadarOperationalAlarm],
+    limit: usize,
+) -> Vec<&RadarOperationalAlarm> {
+    let mut seen = BTreeSet::new();
+    let mut rows = Vec::new();
+    for alarm in alarms {
+        let key = (
+            alarm.message.trim().to_ascii_uppercase(),
+            alarm.status.trim().to_ascii_lowercase(),
+        );
+        if seen.insert(key) {
+            rows.push(alarm);
+            if rows.len() >= limit {
+                break;
+            }
+        }
+    }
+    rows
+}
+
 /// Fetch the latest configured GitHub release tag and return it iff it is
 /// newer than the running build. Invalid/non-GitHub repository URLs disable
 /// the check before this helper is called; network/parse errors stay silent.
@@ -44112,6 +44758,7 @@ fn parse_semver_triple(version: &str) -> Option<(u64, u64, u64)> {
     Some((triple[0], triple[1], triple[2]))
 }
 
+#[cfg(test)]
 fn nearest_site_index(sites: &[RadarSite], target_lat: f32, target_lon: f32) -> Option<usize> {
     sites
         .iter()
@@ -44325,6 +44972,7 @@ struct LiveHazardSourceMessage {
 
 fn load_live_hazard_overlay_with_preview<F>(
     query_time_utc: DateTime<Utc>,
+    preview_records: Vec<HazardRecord>,
     mut on_preview: F,
 ) -> Result<HazardOverlay, String>
 where
@@ -44338,17 +44986,57 @@ where
     // text-product path below.
     let start = Instant::now();
     let load = load_weather_gov_active_alerts(query_time_utc)?;
+    let mut scanned_items = load.scanned_items;
+    let mut parsed_items = load.parsed_items;
+    let mut error_count = load.error_count;
     let overlay = build_live_hazard_overlay(
         "NWS active alerts".to_owned(),
         query_time_utc,
-        load.scanned_items,
-        load.parsed_items,
-        load.error_count,
+        scanned_items,
+        parsed_items,
+        error_count,
         start,
         load.records,
     );
-    on_preview(overlay.clone());
-    Ok(overlay)
+    let mut preview_overlay = overlay.clone();
+    if !preview_records.is_empty() {
+        let mut preview_combined = preview_overlay.records;
+        preview_combined.extend(preview_records);
+        preview_overlay = build_live_hazard_overlay(
+            "NWS active alerts + cached SPC mesoscale discussions".to_owned(),
+            query_time_utc,
+            scanned_items,
+            parsed_items,
+            error_count,
+            start,
+            preview_combined,
+        );
+    }
+    on_preview(preview_overlay);
+
+    let mut records = overlay.records;
+    let source_label = match load_spc_mesoscale_discussions(query_time_utc) {
+        Ok(mut md_load) => {
+            scanned_items += md_load.scanned_items;
+            parsed_items += md_load.parsed_items;
+            error_count += md_load.error_count;
+            records.append(&mut md_load.records);
+            "NWS active alerts + SPC mesoscale discussions".to_owned()
+        }
+        Err(_) => {
+            error_count += 1;
+            "NWS active alerts (SPC MD unavailable)".to_owned()
+        }
+    };
+    Ok(build_live_hazard_overlay(
+        source_label,
+        query_time_utc,
+        scanned_items,
+        parsed_items,
+        error_count,
+        start,
+        records,
+    ))
 }
 
 fn load_event_loop_hazard_overlay_with_preview<F>(
@@ -45306,8 +45994,6 @@ fn nws_product_detail_cache() -> &'static Mutex<BTreeMap<String, NwsProductDetai
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
 fn load_spc_mesoscale_discussions(query_time_utc: DateTime<Utc>) -> Result<SpcMdLoad, String> {
     let index_html = data_source::fetch_text(SPC_MD_INDEX_URL)
         .map_err(|err| format!("SPC MD index fetch failed: {err}"))?;
@@ -45338,8 +46024,6 @@ fn load_spc_mesoscale_discussions(query_time_utc: DateTime<Utc>) -> Result<SpcMd
     })
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
 fn spc_md_product_links(index_html: &str) -> Vec<String> {
     let mut links = Vec::new();
     for part in index_html.split("href=\"").skip(1) {
@@ -45363,7 +46047,6 @@ fn spc_md_product_links(index_html: &str) -> Vec<String> {
     links
 }
 
-#[cfg(test)]
 fn parse_spc_md_product_page(
     source_url: &str,
     html: &str,
@@ -45382,6 +46065,7 @@ fn parse_spc_md_product_page(
     let concerning = strip_prefixed_line(&lines, "Concerning...");
     let valid = find_prefixed_line(&lines, "Valid ");
     let watch_probability = strip_prefixed_line(&lines, "Probability of Watch Issuance...");
+    let peak_tornado = find_prefixed_line(&lines, "MOST PROBABLE PEAK TORNADO INTENSITY...");
     let peak_wind = find_prefixed_line(&lines, "MOST PROBABLE PEAK WIND GUST...");
     let peak_hail = find_prefixed_line(&lines, "MOST PROBABLE PEAK HAIL SIZE...");
     let mut details = Vec::new();
@@ -45390,6 +46074,9 @@ fn parse_spc_md_product_page(
     }
     if let Some(watch_probability) = watch_probability {
         details.push(format!("Watch issuance {watch_probability}"));
+    }
+    if let Some(peak_tornado) = peak_tornado {
+        details.push(peak_tornado);
     }
     if let Some(peak_wind) = peak_wind {
         details.push(peak_wind);
@@ -45424,14 +46111,12 @@ fn parse_spc_md_product_page(
     })
 }
 
-#[cfg(test)]
 fn extract_preformatted_text(html: &str) -> Option<&str> {
     let start = html.find("<pre>")? + "<pre>".len();
     let end = html[start..].find("</pre>")? + start;
     Some(html[start..end].trim())
 }
 
-#[cfg(test)]
 fn strip_prefixed_line(lines: &[&str], prefix: &str) -> Option<String> {
     lines.iter().find_map(|line| {
         line.trim()
@@ -46538,6 +47223,8 @@ fn hazard_style_label(key: &str) -> String {
         "special-marine" => "Special marine warning".to_owned(),
         "snow-squall" => "Snow squall warning".to_owned(),
         "watch" => "Watch polygons".to_owned(),
+        "watch/tornado" => "Tornado watch".to_owned(),
+        "watch/severe-thunderstorm" => "Severe thunderstorm watch".to_owned(),
         "mesoscale-discussion" => "Mesoscale discussions".to_owned(),
         "local-storm-report" => "Local storm reports".to_owned(),
         "special-weather" => "Special weather statements".to_owned(),
@@ -46558,6 +47245,37 @@ fn hazard_style_resolved_polygon(
     }
 }
 
+fn hazard_record_style_threat(record: &HazardRecord) -> Option<&str> {
+    if record.event_family != "watch" {
+        return record.damage_threat.as_deref();
+    }
+    if hazard_record_text_contains(record, "TORNADO WATCH")
+        || record.event_id.to_ascii_uppercase().contains(".TO.A.")
+    {
+        return Some("tornado");
+    }
+    if hazard_record_text_contains(record, "SEVERE THUNDERSTORM WATCH")
+        || record.event_id.to_ascii_uppercase().contains(".SV.A.")
+    {
+        return Some("severe-thunderstorm");
+    }
+    record.damage_threat.as_deref()
+}
+
+fn hazard_record_text_contains(record: &HazardRecord, needle: &str) -> bool {
+    let needle = needle.to_ascii_uppercase();
+    [
+        Some(record.label.as_str()),
+        record.headline.as_deref(),
+        record.area.as_deref(),
+        record.motion.as_deref(),
+    ]
+    .into_iter()
+    .chain(record.details.iter().map(|detail| Some(detail.as_str())))
+    .flatten()
+    .any(|value| value.to_ascii_uppercase().contains(&needle))
+}
+
 fn hazard_dash_label(dash: styles::DashPattern) -> &'static str {
     match dash {
         styles::DashPattern::Solid => "Solid",
@@ -46574,7 +47292,7 @@ fn hazard_dash_label(dash: styles::DashPattern) -> &'static str {
 fn hazard_color(registry: &styles::StyleRegistry, record: &HazardRecord) -> egui::Color32 {
     style_color32(
         registry
-            .hazard_polygon(&record.event_family, record.damage_threat.as_deref())
+            .hazard_polygon(&record.event_family, hazard_record_style_threat(record))
             .stroke_color,
     )
 }
@@ -50377,32 +51095,18 @@ mod tests {
             .iter()
             .map(|candidate| candidate.label.as_str())
             .collect();
-        // The ranking now spans families: the Norman Testbed research pad
-        // (community static table, ~30 km out) outranks Fort Worth.
-        assert_eq!(labels, vec!["KTLX", "Norman Testbed", "KFWS"]);
+        // Research/community feeds stay explicit operator picks; the
+        // automatic lowest-beam ranking remains primary Level II only.
+        assert_eq!(labels, vec!["KTLX", "KFWS"]);
         assert_eq!(candidates[0].target, BeamTarget::Conus(2));
-        assert!(matches!(candidates[1].target, BeamTarget::Research { .. }));
-        assert_eq!(candidates[1].origin.as_deref(), Some("research feed"));
         // Sorted by 0.5° beam height ascending.
         assert!(candidates[0].beam_m < candidates[1].beam_m);
-        assert!(candidates[1].beam_m < candidates[2].beam_m);
-
-        // Over Europe the CONUS catalog is empty but the menu still ranks:
-        // Ängelholm's click point must offer SMHI's site first.
-        let europe = app.best_radar_candidates(56.4, 12.9);
-        assert!(!europe.is_empty(), "European click must find intl sites");
-        assert!(matches!(europe[0].target, BeamTarget::Intl { .. }));
-        assert!(
-            europe[0].label.contains("ngelholm"),
-            "nearest to the click: {}",
-            europe[0].label
-        );
     }
 
     #[test]
-    fn best_radar_candidates_include_custom_poll_links() {
+    fn best_radar_candidates_ignore_research_and_custom_poll_links() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.sites.clear();
+        app.sites = site_catalog_with_community_feeds(Vec::new());
         app.app_settings
             .custom_poll_links
             .push(settings::CustomPollLinkEntry {
@@ -50423,21 +51127,14 @@ mod tests {
             });
 
         let candidates = app.best_radar_candidates(35.4, -97.2);
-        let candidate = candidates
-            .iter()
-            .find(|candidate| candidate.label == "Private Furuno")
-            .expect("custom poll link participates in the best-radar menu");
-
-        assert_eq!(candidate.origin.as_deref(), Some("custom feed"));
-        assert!(matches!(
-            &candidate.target,
-            BeamTarget::Research { url } if url.as_str() == "http://198.51.100.9/fwlx"
-        ));
+        assert!(candidates.is_empty(), "research/custom feeds stay explicit");
         assert!(
             candidates
                 .iter()
-                .all(|candidate| candidate.label != "Link only"),
-            "link-only custom feeds should stay saved without claiming a map/range candidate"
+                .all(|candidate| candidate.label != "Norman Testbed"
+                    && candidate.label != "Private Furuno"
+                    && candidate.label != "Link only"),
+            "research/custom feeds stay explicit site/feed picks"
         );
     }
 
@@ -50755,6 +51452,8 @@ mod tests {
             ("special marine", None, (70, 190, 238)),
             ("snow squall", None, (170, 210, 255)),
             ("watch", None, (235, 92, 245)),
+            ("watch", Some("tornado"), (210, 82, 245)),
+            ("watch", Some("severe-thunderstorm"), (246, 183, 57)),
             ("mesoscale discussion", None, (95, 174, 255)),
             ("local storm report", None, (245, 245, 245)),
             ("special weather", None, (245, 220, 72)),
@@ -51315,9 +52014,20 @@ mod tests {
             DisplayTimeZone::Utc,
         );
 
-        assert!(formatted.contains("Vrot 40.8 kt dV 81.6 kt sep 1.25 km"));
-        assert!(formatted.contains("in r4/g100 210.5 -35.0 kt"));
-        assert!(formatted.contains("out r6/g103 212.0 46.7 kt"));
+        assert!(formatted.contains("Vrot 21.0 m/s dV 42.0 m/s sep 1.25 km"));
+        assert!(formatted.contains("in r4/g100 210.5 -18.0 m/s"));
+        assert!(formatted.contains("out r6/g103 212.0 24.0 m/s"));
+
+        let mph_scale = color_tables::unit_scale_to_internal("mph");
+        let mph = format_cursor_readout(
+            &readout,
+            units::Units::Imperial,
+            ("mph", mph_scale),
+            DisplayTimeZone::Utc,
+        );
+        assert!(mph.contains("Vrot 47.0 mph dV 94.0 mph sep 1.25 km"));
+        assert!(mph.contains("in r4/g100 210.5 -40.3 mph"));
+        assert!(mph.contains("out r6/g103 212.0 53.7 mph"));
 
         let metric = format_cursor_readout(
             &readout,
@@ -51351,11 +52061,15 @@ mod tests {
         };
 
         assert_eq!(
-            format_vrot_card_line(probe, units::Units::Imperial),
-            "Vrot 40.8 kt - dV 81.6 kt - sep 1.25 km"
+            format_vrot_card_line(
+                probe,
+                ("mph", color_tables::unit_scale_to_internal("mph")),
+                units::Units::Imperial
+            ),
+            "Vrot 47.0 mph - dV 94.0 mph - sep 1.25 km"
         );
         assert_eq!(
-            format_vrot_card_line(probe, units::Units::Metric),
+            format_vrot_card_line(probe, ("m/s", 1.0), units::Units::Metric),
             "Vrot 21.0 m/s - dV 42.0 m/s - sep 1.25 km"
         );
     }
@@ -58622,6 +59336,42 @@ mod tests {
     }
 
     #[test]
+    fn community_feeds_join_the_site_picker_without_becoming_nearest_radars() {
+        let sites = site_catalog_with_community_feeds(vec![RadarSite::new("KTLX").with_location(
+            Some("Oklahoma City".to_owned()),
+            Some(35.333),
+            Some(-97.278),
+        )]);
+        let kbpp = sites
+            .iter()
+            .find(|site| site.level2_id == "KBPP")
+            .expect("KBPP appears in the main site picker");
+
+        assert_eq!(
+            community_feed_for_site(kbpp).map(|feed| feed.poll_url),
+            Some("https://level2.swc.nd.gov/raw/KBPP")
+        );
+        assert!(!site_is_primary_level2_catalog_site(kbpp));
+
+        let index = nearest_site_index(&sites, 46.187, -103.428).expect("nearest raw coordinate");
+        assert_eq!(sites[index].level2_id, "KBPP");
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = sites;
+        assert!(
+            app.best_radar_candidates(46.187, -103.428)
+                .iter()
+                .all(|candidate| candidate.label != "KBPP"),
+            "research feeds must not win auto-nearest/lowest-beam picks"
+        );
+        assert!(
+            app.community_feed_candidates(46.187, -103.428, 460.0)
+                .iter()
+                .any(|(feed, _)| feed.id == "KBPP"),
+            "research feeds must still appear as explicit right-click choices"
+        );
+    }
+
+    #[test]
     fn coordinated_site_ids_parse_common_separators_and_dedupe() {
         assert_eq!(
             parse_coordinated_site_ids("tlx, kinx KFDR;ktlx"),
@@ -59937,6 +60687,14 @@ mod tests {
     fn default_hazard_filters_keep_only_core_warning_families_visible() {
         let hidden = default_hidden_hazard_families();
 
+        assert!(
+            hidden.contains("watch"),
+            "watches should be opt-in for a clean first-run map"
+        );
+        assert!(
+            hidden.contains("fire weather"),
+            "fire weather should be opt-in for a clean first-run map"
+        );
         for family in DEFAULT_VISIBLE_HAZARD_FAMILIES {
             assert!(
                 !hidden.contains(*family),
@@ -63300,6 +64058,30 @@ mod tests {
     }
 
     #[test]
+    fn hazard_refresh_preview_retains_existing_mesoscale_discussions() {
+        let overlay = test_hazard_overlay(vec![
+            test_hazard_record(
+                "spc-md-1357",
+                "MD 1357",
+                "mesoscale discussion",
+                square_hazard_points(-101.0, 36.0, -100.0, 37.0),
+            ),
+            test_hazard_record(
+                "KOUN.TO.W.0001",
+                "TOR 0001",
+                "tornado",
+                square_hazard_points(-98.0, 35.0, -97.0, 36.0),
+            ),
+        ]);
+
+        let retained = preview_retained_hazard_records(&overlay);
+
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].event_id, "spc-md-1357");
+        assert_eq!(retained[0].event_family, "mesoscale discussion");
+    }
+
+    #[test]
     fn spc_md_product_parser_extracts_compact_polygon_and_click_details() {
         let query_time = Utc
             .with_ymd_and_hms(2026, 6, 7, 19, 30, 0)
@@ -63328,6 +64110,12 @@ mod tests {
                 .details
                 .iter()
                 .any(|line| line.contains("Watch issuance 5 percent"))
+        );
+        assert!(
+            record
+                .details
+                .iter()
+                .any(|line| line.contains("MOST PROBABLE PEAK TORNADO INTENSITY...85-110 MPH"))
         );
         assert_eq!(record.points[0].lat, 36.37);
         assert_eq!(record.points[0].lon, -75.80);
@@ -63572,6 +64360,8 @@ mod tests {
             hazard_shape_cache: std::cell::RefCell::new(ShapeCache::new(8)),
             cross_section_armed: false,
             context_menu_lonlat: None,
+            radar_operational_status_cache: BTreeMap::new(),
+            radar_operational_status_rx: None,
             spc_reports: None,
             spc_receiver: None,
             archive_pending_event: None,
@@ -64370,6 +65160,97 @@ mod tests {
             ..Default::default()
         };
         assert!(!plain_map_click_allowed(shift, true));
+    }
+
+    #[test]
+    fn radar_operational_status_parser_reads_nws_alarm_messages() {
+        let station_json = r#"{
+            "properties": {
+                "id": "KUDX",
+                "name": "Rapid City",
+                "rda": {
+                    "timestamp": "2026-06-27T22:57:20+00:00",
+                    "properties": {
+                        "alarmSummary": "Tower/Utilities|Transmitter|Communication",
+                        "mode": "Operational",
+                        "status": "Standby",
+                        "operabilityStatus": "RDA - Inoperable"
+                    }
+                }
+            }
+        }"#;
+        let alarms_json = r#"{
+            "@graph": [
+                {
+                    "@type": "wx:RadarStationAlarm",
+                    "stationId": "KUDX",
+                    "status": "mandatory",
+                    "message": "TPS IS OFF-LINE",
+                    "timestamp": "2026-06-27T21:45:48+00:00"
+                },
+                {
+                    "@type": "wx:RadarStationAlarm",
+                    "stationId": "KUDX",
+                    "status": "cleared",
+                    "message": "GEN STARTING BATTERY VOLTAGE LOW",
+                    "timestamp": "2026-06-26T14:43:37+00:00"
+                }
+            ]
+        }"#;
+
+        let status =
+            parse_radar_operational_status("kudx", None, station_json, alarms_json).unwrap();
+
+        assert_eq!(status.site_id, "KUDX");
+        assert_eq!(status.site_name, "Rapid City");
+        assert_eq!(
+            status.alarm_summary.as_deref(),
+            Some("Tower/Utilities|Transmitter|Communication")
+        );
+        assert_eq!(status.mode.as_deref(), Some("Operational"));
+        assert_eq!(status.rda_status.as_deref(), Some("Standby"));
+        assert_eq!(
+            status.operability_status.as_deref(),
+            Some("RDA - Inoperable")
+        );
+        assert_eq!(status.alarms.len(), 2);
+        assert_eq!(status.alarms[0].message, "TPS IS OFF-LINE");
+        assert_eq!(status.alarms[0].status, "mandatory");
+        assert_eq!(
+            status.alarms[0]
+                .timestamp
+                .map(format_utc_seconds)
+                .as_deref(),
+            Some("2026-06-27T21:45:48Z")
+        );
+    }
+
+    #[test]
+    fn radar_operational_display_rows_dedupe_message_status_pairs() {
+        let timestamp = Utc.with_ymd_and_hms(2026, 6, 27, 21, 45, 48).unwrap();
+        let alarms = vec![
+            RadarOperationalAlarm {
+                status: "mandatory".to_owned(),
+                message: "TPS IS OFF-LINE".to_owned(),
+                timestamp: Some(timestamp),
+            },
+            RadarOperationalAlarm {
+                status: "mandatory".to_owned(),
+                message: "TPS IS OFF-LINE".to_owned(),
+                timestamp: Some(timestamp - chrono::Duration::minutes(5)),
+            },
+            RadarOperationalAlarm {
+                status: "cleared".to_owned(),
+                message: "TPS IS OFF-LINE".to_owned(),
+                timestamp: Some(timestamp - chrono::Duration::minutes(10)),
+            },
+        ];
+
+        let rows = radar_operational_display_alarms(&alarms, 8);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].status, "mandatory");
+        assert_eq!(rows[1].status, "cleared");
     }
 
     #[test]
@@ -65236,9 +66117,12 @@ mod tests {
         assert!(hazard_style_key_known("flash-flood/considerable"));
         assert!(hazard_style_key_known("flood/catastrophic"));
         assert!(hazard_style_key_known("fire-weather"));
+        assert!(hazard_style_key_known("watch/tornado"));
+        assert!(hazard_style_key_known("watch/severe-thunderstorm"));
         assert!(!hazard_style_key_known("not-a-real-polygon-family"));
         assert!(hazard_style_label("tornado/catastrophic").contains("emergency"));
         assert!(hazard_style_label("flood/considerable").contains("Considerable"));
+        assert!(hazard_style_label("watch/tornado").contains("Tornado watch"));
         assert_eq!(
             hazard_dash_label(styles::DashPattern::Dashed {
                 dash: 9.0,
@@ -65246,6 +66130,37 @@ mod tests {
             }),
             "Dashed"
         );
+    }
+
+    #[test]
+    fn watch_polygon_style_infers_tornado_and_severe_watch_subtypes() {
+        let mut tornado_watch = test_hazard_record(
+            "KWNS.TO.A.0123",
+            "WATCH 0123",
+            "watch",
+            square_hazard_points(-98.0, 34.0, -97.0, 35.0),
+        );
+        tornado_watch.headline = Some("Tornado Watch 123 remains in effect".to_owned());
+        let mut severe_watch = test_hazard_record(
+            "KWNS.SV.A.0124",
+            "WATCH 0124",
+            "watch",
+            square_hazard_points(-98.0, 34.0, -97.0, 35.0),
+        );
+        severe_watch.headline = Some("Severe Thunderstorm Watch 124".to_owned());
+        let generic_watch = test_hazard_record(
+            "KPAH.HT.Y.0002",
+            "WATCH",
+            "watch",
+            square_hazard_points(-98.0, 34.0, -97.0, 35.0),
+        );
+
+        assert_eq!(hazard_record_style_threat(&tornado_watch), Some("tornado"));
+        assert_eq!(
+            hazard_record_style_threat(&severe_watch),
+            Some("severe-thunderstorm")
+        );
+        assert_eq!(hazard_record_style_threat(&generic_watch), None);
     }
 
     #[test]
@@ -66268,6 +67183,7 @@ $$
                38487907 38427845 38227760 38097690 37967599 37867534
                37727542 37317567 36987586 36747583 36497571 36377580
 
+   MOST PROBABLE PEAK TORNADO INTENSITY...85-110 MPH
    MOST PROBABLE PEAK WIND GUST...UP TO 60 MPH
 </pre></body></html>"#;
 }

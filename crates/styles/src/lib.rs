@@ -482,6 +482,8 @@ pub const HAZARD_ESCALATIONS: &[&str] = &[
     "flash-flood/catastrophic",
     "flood/considerable",
     "flood/catastrophic",
+    "watch/tornado",
+    "watch/severe-thunderstorm",
 ];
 
 impl Default for MapStyle {
@@ -514,6 +516,8 @@ pub fn default_hazard_stroke_color(key: &str) -> Rgba {
         "special-marine" => [70, 190, 238, 255],
         "snow-squall" => [170, 210, 255, 255],
         "watch" => [235, 92, 245, 255],
+        "watch/tornado" => [210, 82, 245, 255],
+        "watch/severe-thunderstorm" => [246, 183, 57, 255],
         "mesoscale-discussion" => [95, 174, 255, 255],
         "local-storm-report" => [245, 245, 245, 255],
         "special-weather" => [245, 220, 72, 255],

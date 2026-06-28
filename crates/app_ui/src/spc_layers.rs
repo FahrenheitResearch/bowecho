@@ -795,6 +795,21 @@ fn estofex_label(risktype: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
+pub fn estofex_feature_draw_rank(feature: &OutlookFeature) -> u8 {
+    estofex_label_draw_rank(&feature.label)
+}
+
+fn estofex_label_draw_rank(label: &str) -> u8 {
+    match label {
+        "EU TSTM15" => 0,
+        "EU TSTM50" => 1,
+        "EU L1" => 2,
+        "EU L2" => 3,
+        "EU L3" => 4,
+        _ => u8::MAX,
+    }
+}
+
 fn attr_value(event: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
     event.attributes().flatten().find_map(|attr| {
         (attr.key.as_ref() == key)
@@ -931,6 +946,7 @@ fn parse_estofex_area_features_xml(text: &str) -> Vec<OutlookFeature> {
         }
     }
 
+    out.sort_by_key(estofex_feature_draw_rank);
     out
 }
 
@@ -1878,14 +1894,55 @@ PROBABILISTIC OUTLOOK POINTS DAY 3\n\
 "#;
         let parsed = parse_estofex_outlook_xml(sample);
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].label, "EU L2");
-        assert_eq!(parsed[0].label2, "ESTOFEX Level 2");
-        assert_eq!(parsed[0].fill, hex_color("#FF0000"));
-        assert_eq!(parsed[0].stroke, hex_color("#FF0000"));
+        assert_eq!(parsed[0].label, "EU TSTM15");
+        assert_eq!(parsed[0].stroke, hex_color("#FFFF00"));
+        assert_eq!(parsed[1].label, "EU L2");
+        assert_eq!(parsed[1].label2, "ESTOFEX Level 2");
+        assert_eq!(parsed[1].fill, hex_color("#FF0000"));
+        assert_eq!(parsed[1].stroke, hex_color("#FF0000"));
         assert!(parsed[0].fill_enabled);
         assert_eq!(parsed[0].rings[0].first(), parsed[0].rings[0].last());
-        assert_eq!(parsed[1].label, "EU TSTM15");
-        assert_eq!(parsed[1].stroke, hex_color("#FFFF00"));
+    }
+
+    #[test]
+    fn estofex_draw_order_puts_higher_levels_on_top() {
+        let sample = r#"
+<forecast>
+  <area risktype="level 3">
+    <point lat="45.0" lon="20.0"/>
+    <point lat="45.0" lon="21.0"/>
+    <point lat="46.0" lon="21.0"/>
+  </area>
+  <area risktype="level 1">
+    <point lat="45.0" lon="20.0"/>
+    <point lat="45.0" lon="22.0"/>
+    <point lat="47.0" lon="22.0"/>
+  </area>
+  <area risktype="50thunder">
+    <point lat="44.0" lon="19.0"/>
+    <point lat="44.0" lon="23.0"/>
+    <point lat="48.0" lon="23.0"/>
+  </area>
+  <area risktype="level 2">
+    <point lat="45.5" lon="20.5"/>
+    <point lat="45.5" lon="21.5"/>
+    <point lat="46.5" lon="21.5"/>
+  </area>
+  <area risktype="15thunder">
+    <point lat="43.0" lon="18.0"/>
+    <point lat="43.0" lon="24.0"/>
+    <point lat="49.0" lon="24.0"/>
+  </area>
+</forecast>
+"#;
+        let labels = parse_estofex_outlook_xml(sample)
+            .into_iter()
+            .map(|feature| feature.label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec!["EU TSTM15", "EU TSTM50", "EU L1", "EU L2", "EU L3"]
+        );
     }
 
     #[test]
