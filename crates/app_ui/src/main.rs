@@ -14442,14 +14442,15 @@ impl ViewerApp {
         self.sites.get(self.selected_site_index)
     }
 
-    /// Remember the just-loaded site as the startup site (best-effort persist).
+    /// Remember the just-loaded site as the startup site (best-effort
+    /// persist). Deliberately does NOT touch favorites — field feedback:
+    /// only the explicit star click favorites a site.
     fn remember_startup_site(&mut self) {
         let Some(id) = self.selected_site().map(|s| s.level2_id.clone()) else {
             return;
         };
         if self.app_settings.startup_site.as_deref() != Some(id.as_str()) {
             self.app_settings.startup_site = Some(id.clone());
-            self.app_settings.add_favorite(&id);
             let _ = self.app_settings.save();
         }
     }
@@ -66565,6 +66566,26 @@ mod tests {
         assert!(!app.workspace.dirty);
         assert!(app.workspace.last_edit.is_none());
         assert_eq!(app.status, "Workspace layout reset");
+    }
+
+    #[test]
+    fn loading_a_site_remembers_startup_but_never_auto_favorites() {
+        // Field feedback: "some actions make it automatically save radar;
+        // only save radar by clicking the star". Loading/selecting a site
+        // must update the startup site WITHOUT touching favorites.
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.favorites.clear();
+        app.sites = vec![RadarSite::new("KTLX")];
+        app.selected_site_index = 0;
+        let id = app.sites[0].level2_id.clone();
+
+        app.remember_startup_site();
+
+        assert_eq!(app.app_settings.startup_site.as_deref(), Some(id.as_str()));
+        assert!(
+            app.app_settings.favorites.is_empty(),
+            "favorites are star-click only"
+        );
     }
 
     #[test]
