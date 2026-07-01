@@ -27,15 +27,15 @@ page.
 Windows PowerShell:
 
 ```powershell
-Get-FileHash .\bowecho-windows-x64.zip -Algorithm SHA256
-Get-Content .\bowecho-windows-x64.zip.sha256
+Get-FileHash .\bowecho-windows-x64.exe -Algorithm SHA256
+Get-Content .\bowecho-windows-x64.exe.sha256
 ```
 
 macOS or Linux:
 
 ```sh
 shasum -a 256 bowecho-macos-apple-silicon.zip
-sha256sum bowecho-linux-x64.tar.gz
+sha256sum bowecho-linux-x64
 ```
 
 If a Windows executable is signed, Authenticode should report `Valid`:

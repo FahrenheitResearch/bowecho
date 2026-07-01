@@ -23,14 +23,14 @@ Grab the latest build from the **[Releases](../../releases)** page:
 
 | Platform | File |
 |---|---|
-| Windows x64 | `bowecho-windows-x64.zip` |
-| Windows ARM64 | `bowecho-windows-arm64.zip` |
+| Windows x64 | `bowecho-windows-x64.exe` (or `.zip` with licenses bundled) |
+| Windows ARM64 | `bowecho-windows-arm64.exe` |
 | macOS Apple Silicon | `bowecho-macos-apple-silicon.zip` |
 | macOS Intel | `bowecho-macos-intel.zip` |
-| Linux x64 | `bowecho-linux-x64.tar.gz` |
-| Linux ARM64 | `bowecho-linux-arm64.tar.gz` |
+| Linux x64 | `bowecho-linux-x64` |
+| Linux ARM64 | `bowecho-linux-arm64` |
 
-**Windows:** unzip and run `bowecho.exe` - that's it. The exe is fully
+**Windows:** download the `.exe` and run it - that's it. The exe is fully
 self-contained (no installer, no runtime dependencies). Windows builds are not
 yet code-signed, so SmartScreen may show "Windows protected your PC" the first
 time: click **More info -> Run anyway**.
@@ -44,7 +44,7 @@ time: click **More info -> Run anyway**.
 > repository (the full build log is public under the Actions tab), and each
 > asset ships with a `.sha256` checksum so you can verify your download is
 > byte-identical to what CI produced:
-> `Get-FileHash bowecho-windows-x64.zip` (PowerShell) and compare. If
+> `Get-FileHash bowecho-windows-x64.exe` (PowerShell) and compare. If
 > Defender quarantines it, restore + add an exclusion, or report the false
 > positive to Microsoft at
 > <https://www.microsoft.com/en-us/wdsi/filesubmission> — developer
@@ -57,8 +57,8 @@ still shows a first-run warning after a manual download, right-click the app
 and choose **Open** once (or run
 `xattr -d com.apple.quarantine BowEcho.app` in Terminal).
 
-**Linux:** untar and run `./bowecho` (needs X11/Wayland + OpenGL, standard on
-desktops).
+**Linux:** the download is the binary itself - `chmod +x bowecho-linux-x64 &&
+./bowecho-linux-x64` (needs X11/Wayland + OpenGL, standard on desktops).
 
 ## Trust and verification
 
@@ -67,7 +67,7 @@ this repository. Each downloadable asset is published with a `.sha256` file so
 users can verify that a local download matches the CI-built artifact.
 
 ```powershell
-Get-FileHash .\bowecho-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\bowecho-windows-x64.exe -Algorithm SHA256
 ```
 
 Compare the hash with the matching `.sha256` file on the release page. For
@@ -180,6 +180,27 @@ as a substitute for official National Weather Service warnings and guidance.
 During severe weather, follow your local NWS office and emergency management.
 
 ## Credits
+
+### Data sources
+
+- **NOAA / National Weather Service** — NEXRAD Level II radar, MRMS, GOES
+  imagery and GLM lightning, and SPC/WPC forecast products.
+- **EUMETNET OPERA** and the participating national meteorological
+  services — European weather radar via the OPERA Development Radar Data
+  (ORD) service. ORD radar data is licensed **CC BY 4.0**; BowEcho displays
+  it with attribution to OPERA and the originating national services.
+- National open-data radar feeds: **SMHI** (Sweden), **FMI** (Finland),
+  **DWD** (Germany), **DMI** (Denmark), **CHMI** (Czechia), **SHMÚ**
+  (Slovakia), **GeoSphere Austria**, the **Estonian Environment Agency**,
+  **JMA** (Japan — radar and Himawari satellite), Italy's **Dipartimento
+  della Protezione Civile** with the **ARPA Piemonte** and **ARPA
+  Lombardia** regional services, Taiwan's **Central Weather
+  Administration**, and Australia's **Bureau of Meteorology** (via NCI).
+- Crowd-sourced weather reports from **mPING** (NOAA National Severe Storms
+  Laboratory / University of Oklahoma). Convective outlooks from
+  **ESTOFEX**.
+
+### Contributed work
 
 - Annotation graphics vocabulary contributed by GBW Overlay —
   grayskieswx (YouTube). The map annotation tools' front glyphs, hatch

@@ -230,7 +230,7 @@ fn getting_started(ui: &mut egui::Ui) {
     action(
         ui,
         "Workflows \u{25be}",
-        "â€” applies one of the built-in operating setups: live severe, triple severe, \
+        "\u{2014} applies one of the built-in operating setups: live severe, triple severe, \
          velocity couplet, quad dual-pol, archive review, documentation, or model context. \
          The current workflow marker is only a label for the latest preset; manual tweaks \
          stay yours, Restore previous setup undoes the latest preset's setup changes, and Clear \
@@ -1341,9 +1341,15 @@ fn sources(ui: &mut egui::Ui) {
 
     para(
         ui,
-        "International radar comes through provider adapters such as ORD, SMHI, KAIA, DMI, \
-         FMI, GeoSphere, DWD, SHMU, CHMI, and JMA/NICT where upstream data is available. \
-         Coverage and archive depth vary by country and provider.",
+        "European radar is provided by EUMETNET OPERA and the participating national \
+         meteorological services via the OPERA Development Radar Data (ORD) service — \
+         ORD data is licensed CC BY 4.0 with attribution to OPERA and the originating \
+         national services. Additional national open-data feeds: SMHI (Sweden), FMI \
+         (Finland), DWD (Germany), DMI (Denmark), CHMI (Czechia), SHMU (Slovakia), \
+         GeoSphere Austria, the Estonian Environment Agency (KAIA), JMA/NICT (Japan), \
+         Italy's Protezione Civile with ARPA Piemonte and ARPA Lombardia, Taiwan CWA, \
+         and Australia's Bureau of Meteorology via NCI. Coverage and archive depth vary \
+         by country and provider.",
     );
 
     subhead(ui, "HAZARDS & REPORTS");
@@ -1359,8 +1365,8 @@ fn sources(ui: &mut egui::Ui) {
     para(
         ui,
         "Outlooks include official SPC GeoJSON plus raw SPC PTS fallback for faster issue \
-         detection, and ESTOFEX XML polygons for Europe. mPING reports and Spotter Network \
-         placefiles are optional map layers.",
+         detection, and ESTOFEX XML polygons for Europe. mPING crowd reports (NOAA NSSL / \
+         University of Oklahoma) and Spotter Network placefiles are optional map layers.",
     );
 
     subhead(ui, "MODEL & SATELLITE");
@@ -1384,6 +1390,16 @@ fn sources(ui: &mut egui::Ui) {
         ui,
         "The default dark vector basemap is built in (offline). Tile styles: imagery © Esri, \
          Maxar, Earthstar Geographics; Streets/Topo map tiles © Esri and contributors.",
+    );
+
+    subhead(ui, "CONTRIBUTED WORK");
+    para(
+        ui,
+        "Research-radar color tables (the \"research\" badge in the pickers) are ported \
+         from GURT V3 — the Graphic Utility Radar Toolkit by ambient330 (MIT license). \
+         The annotation tools' graphics vocabulary (front glyphs, hatch fills, \
+         warning-polygon styling) reimplements the GBW Overlay renderer by grayskieswx \
+         (YouTube), shared by the author for this purpose.",
     );
 
     subhead(ui, "RESEARCH");

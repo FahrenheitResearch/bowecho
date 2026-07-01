@@ -136,7 +136,7 @@ impl EventTrackHit {
         {
             parts.push(format!("{width_yd:.0} yd wide"));
         }
-        parts.join(" Â· ")
+        parts.join(" \u{00b7} ")
     }
 }
 
