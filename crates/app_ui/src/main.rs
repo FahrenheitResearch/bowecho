@@ -60,8 +60,6 @@ mod obs_soundings;
 mod placefiles;
 mod rhi;
 mod sat_worker;
-mod skewt_native;
-mod sounding_panels;
 mod spc_layers;
 mod table_editor;
 mod taiwan_cwa;
@@ -2050,7 +2048,6 @@ struct ViewerApp {
     sounding_compute_ms: Option<f32>,
     frame_ms_avg: f32,
     /// Native skew-T: sharprs-verified compute (background) + window.
-    native_sounding: Option<Arc<rustwx_sounding::NativeSounding>>,
     native_sounding_rx: Option<NativeSoundingReceiver>,
     /// Which SoundingData the current/in-flight native build came from.
     native_sounding_src: Option<Arc<rw_ui::SoundingData>>,
@@ -6577,7 +6574,6 @@ impl ViewerApp {
             model_layer_render_ms: None,
             sounding_compute_ms: None,
             frame_ms_avg: 0.0,
-            native_sounding: None,
             native_sounding_rx: None,
             native_sounding_src: None,
             native_sounding_panel: rw_ui::SoundingPanel::new(),
@@ -18131,7 +18127,11 @@ impl ViewerApp {
             // clickable — with no sounding yet the pane shows the Alt-click
             // how-to instead of the entry greying out mysteriously (field
             // report: "why is soundings greyed out").
-            let has_sounding = self.native_sounding.is_some();
+            let has_sounding = self
+                .model_dock
+                .as_ref()
+                .is_some_and(|dock| dock.sounding_has_content())
+                || self.native_sounding_panel.has_content();
             if ui
                 .selectable_label(self.viewer_open(dock::WorkspacePane::Sounding), "Sounding")
                 .on_hover_text(if has_sounding {
@@ -28833,7 +28833,7 @@ impl ViewerApp {
                 let compute_start = Instant::now();
                 // The adjusted display pair routes through set_native_column
                 // below, so the DISPLAYED skew-T shows the obs-adjusted
-                // profile — not just the hail-env/native fallback consumers.
+                // profile — not just the hail-env consumer.
                 let result = build_native_sounding_adjusted_with_display(&data, adjust_ob).map(
                     |(native, adjusted)| {
                         (
@@ -28877,7 +28877,6 @@ impl ViewerApp {
                                 self.status = format!("{model} profile lacks a 0°C/−20°C crossing");
                             }
                         }
-                        self.native_sounding = Some(Arc::new(native));
                         ctx.request_repaint();
                         return;
                     }
@@ -28885,7 +28884,6 @@ impl ViewerApp {
                         self.native_sounding_panel.set_native_column(data, column);
                         self.sounding_viewer_source = SoundingViewerSource::NativeOnly;
                     }
-                    self.native_sounding = Some(Arc::new(native));
                     self.open_viewer(dock::WorkspacePane::Sounding);
                     ctx.request_repaint();
                 }
@@ -28967,7 +28965,7 @@ impl ViewerApp {
     }
 
     fn sounding_window(&mut self, ctx: &egui::Context) {
-        // No native_sounding gate: the body placeholder explains how to
+        // No has-a-sounding gate: the body placeholder explains how to
         // launch one, which beats a window that silently refuses to open.
         if !self.native_skewt_open || self.workspace.is_docked(dock::WorkspacePane::Sounding) {
             return;
@@ -29003,13 +29001,7 @@ impl ViewerApp {
             return;
         }
 
-        if let Some(sounding) = self.native_sounding.clone() {
-            let size = ui.available_size();
-            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-            sounding_panels::draw_full(ui, rect, &sounding);
-        } else {
-            ui.weak("No sounding yet — Alt-click the map (with model data) to launch one.");
-        }
+        ui.weak("No sounding yet — Alt-click the map (with model data) to launch one.");
     }
 
     fn new_model_data_dock(
@@ -65895,7 +65887,6 @@ mod tests {
             model_layer_render_ms: None,
             sounding_compute_ms: None,
             frame_ms_avg: 0.0,
-            native_sounding: None,
             native_sounding_rx: None,
             native_sounding_src: None,
             native_sounding_panel: rw_ui::SoundingPanel::new(),
