@@ -61,12 +61,16 @@ and needs no credentials. Key pattern:
 https://unidata-nexrad-level2.s3.amazonaws.com/YYYY/MM/DD/SSSS/SSSSYYYYMMDD_HHMMSS_V06
 ```
 
+Older archive years (through the mid-2010s) carry a `.gz` suffix on the
+key and must be gunzipped to the raw `AR2V` file before benching.
+
 Suggested canonical volume — KTLX during the 2013-05-20 Moore, OK
 tornado (dense storm-scale returns, bzip2-chunked, exercises the
 dealiaser hard):
 
 ```
-curl -O https://unidata-nexrad-level2.s3.amazonaws.com/2013/05/20/KTLX/KTLX20130520_201643_V06
+curl -O https://unidata-nexrad-level2.s3.amazonaws.com/2013/05/20/KTLX/KTLX20130520_201643_V06.gz
+gunzip KTLX20130520_201643_V06.gz
 ```
 
 The bench itself never fetches anything; download the file first and
