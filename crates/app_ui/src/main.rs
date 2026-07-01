@@ -32524,6 +32524,7 @@ impl ViewerApp {
         layer.error = None;
         let (sender, receiver) = mpsc::channel();
         self.taiwan_cwa_latest_rx = Some(receiver);
+        self.status = "Taiwan CWA: fetching latest composite reflectivity".to_owned();
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
             let result = taiwan_cwa::load_latest_frame();
@@ -32564,7 +32565,7 @@ impl ViewerApp {
         }
         if let Some(receiver) = &self.taiwan_cwa_render_rx {
             match receiver.try_recv() {
-                Ok((generation, view, image, _ms)) => {
+                Ok((generation, view, image, ms)) => {
                     self.taiwan_cwa_render_rx = None;
                     if self
                         .taiwan_cwa_layer
@@ -32578,6 +32579,7 @@ impl ViewerApp {
                             egui::TextureOptions::LINEAR,
                         );
                         self.taiwan_cwa_texture = Some((texture, generation, view));
+                        self.status = format!("Taiwan CWA: rendered composite in {ms:.0} ms");
                     }
                     ctx.request_repaint();
                 }
@@ -37610,8 +37612,9 @@ impl ViewerApp {
             let center_lat = view.center_lat as f64;
             let center_lon = view.center_lon as f64;
             let km_per_pt = 111.32 / view.map_scale as f64;
-            let render_scale = taiwan_cwa::TAIWAN_CWA_RENDER_SCALE.clamp(0.25, 1.0) as f64;
             let (w_pts, h_pts) = (rect.width() as f64, rect.height() as f64);
+            let render_scale =
+                taiwan_cwa::render_scale_for_viewport(rect.width(), rect.height()) as f64;
             thread::spawn(move || {
                 let render_start = Instant::now();
                 let w = (w_pts * render_scale).max(8.0) as usize;
@@ -42999,6 +43002,14 @@ fn table_display_unit(
         Some((raw, lower)) if matches!(lower.as_str(), "km/h" | "kph" | "kmh") => {
             ("km/h", color_tables::unit_scale_to_internal(raw))
         }
+        Some((_raw, lower))
+            if matches!(
+                lower.as_str(),
+                "m/s" | "mps" | "ms-1" | "m s-1" | "meter/s" | "meters/s"
+            ) =>
+        {
+            ("m/s", 1.0)
+        }
         _ => match unit_system {
             units::Units::Imperial => ("mph", color_tables::unit_scale_to_internal("mph")),
             units::Units::Metric => ("km/h", color_tables::unit_scale_to_internal("km/h")),
@@ -47759,6 +47770,9 @@ fn draw_outlook_ring(
     if screen.len() < 2 {
         return;
     }
+    if draw_clipped_outlook_ring(painter, screen, stroke, rect) {
+        return;
+    }
     if screen_polyline_has_jump(screen, true, rect) {
         for chunk in screen_polyline_chunks(screen, true, rect) {
             painter.add(egui::Shape::line(chunk, stroke));
@@ -47775,6 +47789,79 @@ fn draw_outlook_ring(
     } else {
         painter.add(egui::Shape::line(screen.to_vec(), stroke));
     }
+}
+
+fn draw_clipped_outlook_ring(
+    painter: &egui::Painter,
+    screen: &[egui::Pos2],
+    stroke: egui::Stroke,
+    rect: egui::Rect,
+) -> bool {
+    if screen.len() < 2
+        || !screen
+            .iter()
+            .any(|point| !rect.expand(2.0).contains(*point))
+    {
+        return false;
+    }
+    let clip_rect = rect.expand(3.0);
+    let max_visible_len = rect.width().hypot(rect.height()) * 0.62;
+    let segment_count = screen.len().saturating_sub(1);
+    for index in 0..segment_count {
+        let a = screen[index];
+        let b = screen[(index + 1) % screen.len()];
+        if !screen_point_valid(a) || !screen_point_valid(b) {
+            continue;
+        }
+        let Some((ca, cb)) = clip_segment_to_rect(a, b, clip_rect) else {
+            continue;
+        };
+        if ca.distance(cb) > max_visible_len && !rect.contains(a) && !rect.contains(b) {
+            continue;
+        }
+        painter.line_segment([ca, cb], stroke);
+    }
+    true
+}
+
+fn clip_segment_to_rect(
+    a: egui::Pos2,
+    b: egui::Pos2,
+    rect: egui::Rect,
+) -> Option<(egui::Pos2, egui::Pos2)> {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let mut t0: f32 = 0.0;
+    let mut t1: f32 = 1.0;
+    for (p, q) in [
+        (-dx, a.x - rect.left()),
+        (dx, rect.right() - a.x),
+        (-dy, a.y - rect.top()),
+        (dy, rect.bottom() - a.y),
+    ] {
+        if p.abs() <= f32::EPSILON {
+            if q < 0.0 {
+                return None;
+            }
+            continue;
+        }
+        let r = q / p;
+        if p < 0.0 {
+            if r > t1 {
+                return None;
+            }
+            t0 = t0.max(r);
+        } else {
+            if r < t0 {
+                return None;
+            }
+            t1 = t1.min(r);
+        }
+    }
+    Some((
+        egui::pos2(a.x + t0 * dx, a.y + t0 * dy),
+        egui::pos2(a.x + t1 * dx, a.y + t1 * dy),
+    ))
 }
 
 fn cleaned_screen_polygon(points: &[egui::Pos2]) -> Vec<egui::Pos2> {
@@ -51610,6 +51697,21 @@ mod tests {
         assert_eq!(
             table_display_unit(&kmh, &product, units::Units::Metric),
             ("km/h", color_tables::unit_scale_to_internal("km/h"))
+        );
+        let mps = ColorTable::parse_gr_pal(
+            "MPS VEL",
+            "Product: BV\nUnits: m/s\nColor: -30 1 2 3\nColor: 30 4 5 6\n",
+        )
+        .expect("m/s table parses");
+        assert_eq!(
+            table_display_unit(&mps, &product, units::Units::Metric),
+            ("m/s", 1.0),
+            "explicit velocity-table m/s must not fall back to metric km/h"
+        );
+        assert_eq!(
+            table_display_unit(&mps, &product, units::Units::Imperial),
+            ("m/s", 1.0),
+            "explicit velocity-table m/s must override general imperial units too"
         );
         // Non-m/s products never rescale off the table's declaration.
         let dbz = DisplayProduct::Moment(MomentType::Reflectivity);
@@ -63905,6 +64007,20 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0], vec![points[0], points[1]]);
         assert_eq!(chunks[1], vec![points[2], points[3]]);
+    }
+
+    #[test]
+    fn clipped_outlook_segments_stay_inside_view() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let (a, b) = clip_segment_to_rect(egui::pos2(-50.0, 50.0), egui::pos2(150.0, 50.0), rect)
+            .expect("segment crosses rect");
+
+        assert_eq!(a, egui::pos2(0.0, 50.0));
+        assert_eq!(b, egui::pos2(100.0, 50.0));
+        assert!(
+            clip_segment_to_rect(egui::pos2(-50.0, -50.0), egui::pos2(-10.0, -10.0), rect)
+                .is_none()
+        );
     }
 
     #[test]

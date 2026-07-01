@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use eframe::egui;
 
 pub(crate) const TAIWAN_CWA_RENDER_SCALE: f32 = 1.0;
+const TAIWAN_CWA_RENDER_MAX_PIXELS: f32 = 900_000.0;
 
 #[derive(Clone)]
 pub(crate) struct TaiwanCwaRasterFrame {
@@ -28,6 +29,14 @@ pub(crate) struct TaiwanCwaRasterFrame {
 pub(crate) fn load_latest_frame() -> Result<TaiwanCwaRasterFrame, String> {
     let grid = data_source::grid_products::taiwan_cwa_latest_radar_grid()?;
     rasterize_grid(grid)
+}
+
+pub(crate) fn render_scale_for_viewport(width_pts: f32, height_pts: f32) -> f32 {
+    let area = (width_pts.max(1.0) * height_pts.max(1.0)).max(1.0);
+    (TAIWAN_CWA_RENDER_MAX_PIXELS / area)
+        .sqrt()
+        .min(TAIWAN_CWA_RENDER_SCALE)
+        .clamp(0.35, 1.0)
 }
 
 fn rasterize_grid(
@@ -234,5 +243,13 @@ mod tests {
             sample_reflectivity_color(&frame, 17.5, 115.0),
             egui::Color32::TRANSPARENT
         );
+    }
+
+    #[test]
+    fn taiwan_cwa_render_scale_caps_large_viewports() {
+        assert_eq!(render_scale_for_viewport(800.0, 600.0), 1.0);
+        let scale = render_scale_for_viewport(1920.0, 1080.0);
+        assert!(scale < 1.0);
+        assert!(scale >= 0.35);
     }
 }

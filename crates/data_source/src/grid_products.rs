@@ -608,7 +608,8 @@ impl TaiwanCwaRadarGrid {
 
 pub fn taiwan_cwa_latest_radar_grid() -> Result<TaiwanCwaRadarGrid, String> {
     let url = taiwan_cwa_latest_json_url();
-    let text = crate::fetch_text(&url).map_err(|err| format!("Taiwan CWA latest radar: {err}"))?;
+    let text = crate::fetch_listing_text(&url)
+        .map_err(|err| format!("Taiwan CWA latest radar download: {err}"))?;
     parse_taiwan_cwa_latest_json(&text)
 }
 
@@ -1752,6 +1753,16 @@ mod tests {
             grid.time.to_rfc3339_opts(SecondsFormat::Secs, true),
             "2026-06-27T02:50:00Z"
         );
+    }
+
+    #[test]
+    #[ignore = "live CWA endpoint smoke"]
+    fn taiwan_cwa_latest_live_smoke() {
+        let grid = taiwan_cwa_latest_radar_grid().expect("live Taiwan CWA latest grid");
+        assert_eq!(grid.units, "dBZ");
+        assert!(grid.nx > 100);
+        assert!(grid.ny > 100);
+        assert_eq!(grid.values.len(), grid.nx * grid.ny);
     }
 
     #[test]

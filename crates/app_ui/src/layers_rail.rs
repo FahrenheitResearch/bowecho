@@ -487,8 +487,8 @@ impl ViewerApp {
             self.italy_dpc_texture = None;
             ctx.request_repaint();
         }
-        let taiwan_loading =
-            self.taiwan_cwa_latest_rx.is_some() || self.taiwan_cwa_render_rx.is_some();
+        let taiwan_fetching = self.taiwan_cwa_latest_rx.is_some();
+        let taiwan_rendering = self.taiwan_cwa_render_rx.is_some();
         let mut taiwan_refresh = false;
         let mut taiwan_remove = false;
         if let Some(layer) = &mut self.taiwan_cwa_layer {
@@ -496,8 +496,10 @@ impl ViewerApp {
                 .frame_time
                 .map(|time| time.format("%H:%MZ").to_string())
                 .unwrap_or_else(|| "latest".to_owned());
-            let state = if taiwan_loading {
-                "loading"
+            let state = if taiwan_fetching {
+                "fetching"
+            } else if taiwan_rendering {
+                "rendering"
             } else if layer.error.is_some() {
                 "stale"
             } else if layer.frame_time.is_some() {

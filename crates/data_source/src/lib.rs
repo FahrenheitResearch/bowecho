@@ -933,18 +933,18 @@ fn latest_realtime_volume_from_chunks(
 
     grouped
         .into_iter()
-        .filter_map(|((volume_id, volume_time), mut chunks)| {
+        .map(|((volume_id, volume_time), mut chunks)| {
             chunks.sort_by_key(|chunk| chunk.chunk_id);
             let complete = chunks.last().is_some_and(|chunk| chunk.chunk_type.is_end());
             let total_size = chunks.iter().map(|chunk| chunk.object.size).sum();
-            Some(RealtimeLevel2Volume {
+            RealtimeLevel2Volume {
                 site: site.to_owned(),
                 volume_id,
                 volume_time,
                 chunks,
                 complete,
                 total_size,
-            })
+            }
         })
         .max_by(|left, right| {
             left.volume_time
