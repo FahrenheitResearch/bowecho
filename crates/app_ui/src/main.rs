@@ -143,6 +143,7 @@ const MPING_MAX_DRAWN_REPORTS: usize = 500;
 const MPING_LABEL_REPORT_LIMIT: usize = 80;
 const PRIMARY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 1;
 const OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 5;
+const REALTIME_LEVEL2_STALE_FALLBACK_SECONDS: i64 = 20 * 60;
 const MAX_RADAR_OVERLAY_LAYERS: usize = 10;
 const STORM_VIDEO_SYNC_TOTAL_RADARS: usize = 5;
 const STORM_VIDEO_SYNC_OVERLAY_RADARS: usize = STORM_VIDEO_SYNC_TOTAL_RADARS - 1;
@@ -2522,6 +2523,27 @@ fn record_realtime_level2_metadata(
     timings.realtime_volume_time_utc = Some(realtime.volume_time);
 }
 
+fn realtime_level2_is_stale_for_latest_load(
+    realtime: &data_source::RealtimeLevel2Volume,
+    now_utc: DateTime<Utc>,
+) -> bool {
+    now_utc
+        .signed_duration_since(realtime.volume_time)
+        .num_seconds()
+        > REALTIME_LEVEL2_STALE_FALLBACK_SECONDS
+}
+
+fn stale_realtime_fallback_reason(realtime: &data_source::RealtimeLevel2Volume) -> String {
+    format!(
+        "realtime chunks stale at {}",
+        format_utc_seconds(realtime.volume_time)
+    )
+}
+
+fn realtime_load_error_allows_archive_fallback(reason: &str) -> bool {
+    reason.starts_with("realtime chunks stale at ")
+}
+
 struct AsyncSiteCatalogResult {
     result: Result<Vec<RadarSite>, String>,
 }
@@ -3183,6 +3205,13 @@ fn spawn_latest_level2_load_worker(
                         Some(lookup_start.elapsed().as_secs_f32() * 1000.0);
                     realtime_timings.lookup_cache_hit = Some(false);
                     record_realtime_level2_metadata(&mut realtime_timings, &realtime);
+                    if realtime_level2_is_stale_for_latest_load(&realtime, Utc::now()) {
+                        realtime_timings.realtime_poll_end_utc = Some(Utc::now());
+                        return Err(RealtimeLoadError::with_timings(
+                            stale_realtime_fallback_reason(&realtime),
+                            realtime_timings.finish(total_start),
+                        ));
+                    }
 
                     let fetch_start = Instant::now();
                     let downloaded =
@@ -3278,7 +3307,10 @@ fn spawn_latest_level2_load_worker(
                     }
                     decoded_frames.push(decoded);
                 } else if let Err(err) = realtime_result {
-                    if mode == LatestLoadMode::AutoRefresh && current_source_path.is_some() {
+                    if mode == LatestLoadMode::AutoRefresh
+                        && current_source_path.is_some()
+                        && !realtime_load_error_allows_archive_fallback(&err.reason)
+                    {
                         return Ok(AsyncLoadUpdate::Unchanged {
                             timings: err.timings,
                             reason: err.reason,
@@ -60464,6 +60496,33 @@ mod tests {
             archive_fetch_count_for_latest_load(LatestLoadMode::AutoRefresh, 0, 7, true),
             None
         );
+    }
+
+    #[test]
+    fn stale_realtime_chunks_trigger_archive_fallback() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 1, 4, 50, 0).unwrap();
+        let fresh = data_source::RealtimeLevel2Volume {
+            site: "KTLX".to_owned(),
+            volume_id: 1,
+            volume_time: now - chrono::Duration::seconds(90),
+            chunks: Vec::new(),
+            complete: false,
+            total_size: 0,
+        };
+        let stale = data_source::RealtimeLevel2Volume {
+            volume_time: now
+                - chrono::Duration::seconds(REALTIME_LEVEL2_STALE_FALLBACK_SECONDS + 1),
+            ..fresh.clone()
+        };
+
+        assert!(!realtime_level2_is_stale_for_latest_load(&fresh, now));
+        assert!(realtime_level2_is_stale_for_latest_load(&stale, now));
+        assert!(realtime_load_error_allows_archive_fallback(
+            &stale_realtime_fallback_reason(&stale)
+        ));
+        assert!(!realtime_load_error_allows_archive_fallback(
+            "unchanged cache hit"
+        ));
     }
 
     #[test]

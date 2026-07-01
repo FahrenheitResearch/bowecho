@@ -33,6 +33,8 @@ const HTTP_USER_AGENT: &str = "bowecho (GR2Analyst-compatible placefile client)"
 const REALTIME_VOLUME_ID_MODULUS: u16 = 1000;
 const REALTIME_CHUNK_LIST_MAX_KEYS: usize = 1000;
 const REALTIME_CHUNK_DOWNLOAD_CONCURRENCY: usize = 8;
+const REALTIME_CHUNK_STALE_RESCAN_AGE_SECONDS: i64 = 20 * 60;
+const REALTIME_CHUNK_STALE_RESCAN_MAX_PAGES: usize = 80;
 const MIN_RECENT_LEVEL2_SITE_CATALOG_COUNT: usize = 100;
 /// How long the per-site active-volume-id prefix listing may be served from
 /// cache. Volume ids only change at volume rollover (every ~4-7 minutes), and
@@ -847,6 +849,13 @@ fn resolve_latest_realtime_volume(
     }
 
     if let Some(volume) = best_volume {
+        if realtime_volume_is_stale(&volume, Utc::now())
+            && let Ok(rescued) = latest_realtime_volume_by_chunk_scan(site)
+            && rescued.volume_time > volume.volume_time
+        {
+            completed_volume_cache().insert(rescued.clone());
+            return Ok((rescued, listing_was_cached));
+        }
         return Ok((volume, listing_was_cached));
     }
 
@@ -859,6 +868,31 @@ fn resolve_latest_realtime_volume(
                 prefix: site_prefix,
             })
         })
+}
+
+fn realtime_volume_is_stale(volume: &RealtimeLevel2Volume, now: DateTime<Utc>) -> bool {
+    now.signed_duration_since(volume.volume_time).num_seconds()
+        > REALTIME_CHUNK_STALE_RESCAN_AGE_SECONDS
+}
+
+fn latest_realtime_volume_by_chunk_scan(site: &str) -> Result<RealtimeLevel2Volume> {
+    let site_prefix = format!("{site}/");
+    let listing = list_s3_all_limited(
+        LEVEL2_CHUNKS_BUCKET,
+        &site_prefix,
+        None,
+        Some(REALTIME_CHUNK_LIST_MAX_KEYS),
+        REALTIME_CHUNK_STALE_RESCAN_MAX_PAGES,
+    )?;
+    let chunks = listing
+        .contents
+        .into_iter()
+        .filter(|object| object.size > 0)
+        .filter_map(parse_realtime_chunk_object);
+    latest_realtime_volume_from_chunks(site, chunks).ok_or_else(|| DataSourceError::NoObjects {
+        bucket: LEVEL2_CHUNKS_BUCKET.to_owned(),
+        prefix: site_prefix,
+    })
 }
 
 fn realtime_level2_volume_for_id(site: &str, volume_id: u16) -> Result<RealtimeLevel2Volume> {
@@ -875,27 +909,48 @@ fn realtime_level2_volume_for_id(site: &str, volume_id: u16) -> Result<RealtimeL
     .filter(|object| object.size > 0)
     .filter_map(parse_realtime_chunk_object)
     .collect::<Vec<_>>();
-    chunks.sort_by_key(|chunk| chunk.chunk_id);
+    chunks.retain(|chunk| chunk.volume_id == volume_id);
 
-    let Some(first_chunk) = chunks.first() else {
-        return Err(DataSourceError::NoObjects {
-            bucket: LEVEL2_CHUNKS_BUCKET.to_owned(),
-            prefix: volume_prefix,
-        });
-    };
-
-    let volume_time = first_chunk.volume_time;
-    let complete = chunks.last().is_some_and(|chunk| chunk.chunk_type.is_end());
-    let total_size = chunks.iter().map(|chunk| chunk.object.size).sum();
-
-    Ok(RealtimeLevel2Volume {
-        site: site.to_owned(),
-        volume_id,
-        volume_time,
-        chunks,
-        complete,
-        total_size,
+    latest_realtime_volume_from_chunks(site, chunks).ok_or_else(|| DataSourceError::NoObjects {
+        bucket: LEVEL2_CHUNKS_BUCKET.to_owned(),
+        prefix: volume_prefix,
     })
+}
+
+fn latest_realtime_volume_from_chunks(
+    site: &str,
+    chunks: impl IntoIterator<Item = RealtimeChunkObject>,
+) -> Option<RealtimeLevel2Volume> {
+    let mut grouped: BTreeMap<(u16, DateTime<Utc>), Vec<RealtimeChunkObject>> = BTreeMap::new();
+    for chunk in chunks {
+        if chunk.site == site {
+            grouped
+                .entry((chunk.volume_id, chunk.volume_time))
+                .or_default()
+                .push(chunk);
+        }
+    }
+
+    grouped
+        .into_iter()
+        .filter_map(|((volume_id, volume_time), mut chunks)| {
+            chunks.sort_by_key(|chunk| chunk.chunk_id);
+            let complete = chunks.last().is_some_and(|chunk| chunk.chunk_type.is_end());
+            let total_size = chunks.iter().map(|chunk| chunk.object.size).sum();
+            Some(RealtimeLevel2Volume {
+                site: site.to_owned(),
+                volume_id,
+                volume_time,
+                chunks,
+                complete,
+                total_size,
+            })
+        })
+        .max_by(|left, right| {
+            left.volume_time
+                .cmp(&right.volume_time)
+                .then_with(|| left.chunks.len().cmp(&right.chunks.len()))
+        })
 }
 
 pub fn download_realtime_volume(
@@ -1129,6 +1184,38 @@ fn list_s3_limited(
         .text()?;
     let parsed: S3ListingXml = quick_xml::de::from_str(&text)?;
     Ok(parsed.into())
+}
+
+fn list_s3_all_limited(
+    bucket: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    max_keys: Option<usize>,
+    max_pages: usize,
+) -> Result<S3Listing> {
+    let mut contents = Vec::new();
+    let mut common_prefixes = Vec::new();
+    let mut continuation_token = None;
+    for _ in 0..max_pages.max(1) {
+        let listing = list_s3_limited(
+            bucket,
+            prefix,
+            delimiter,
+            continuation_token.as_deref(),
+            max_keys,
+        )?;
+        contents.extend(listing.contents);
+        common_prefixes.extend(listing.common_prefixes);
+        continuation_token = listing.next_continuation_token;
+        if continuation_token.is_none() {
+            break;
+        }
+    }
+    Ok(S3Listing {
+        contents,
+        common_prefixes,
+        next_continuation_token: continuation_token,
+    })
 }
 
 fn realtime_volume_id_from_prefix(site: &str, prefix: &str) -> Option<u16> {
@@ -1527,6 +1614,8 @@ struct S3ListingXml {
     contents: Vec<S3ObjectXml>,
     #[serde(rename = "CommonPrefixes", default)]
     common_prefixes: Vec<CommonPrefixXml>,
+    #[serde(rename = "NextContinuationToken")]
+    next_continuation_token: Option<String>,
 }
 
 impl From<S3ListingXml> for S3Listing {
@@ -1534,6 +1623,7 @@ impl From<S3ListingXml> for S3Listing {
         Self {
             contents: value.contents.into_iter().map(Into::into).collect(),
             common_prefixes: value.common_prefixes.into_iter().map(Into::into).collect(),
+            next_continuation_token: value.next_continuation_token,
         }
     }
 }
@@ -1547,6 +1637,7 @@ struct CommonPrefix {
 struct S3Listing {
     contents: Vec<S3Object>,
     common_prefixes: Vec<CommonPrefix>,
+    next_continuation_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1976,6 +2067,81 @@ mod tests {
         assert_eq!(
             realtime_volume_candidate_ids_from_active_ids(&contiguous_ids),
             vec![628]
+        );
+    }
+
+    #[test]
+    fn realtime_chunk_scan_chooses_newer_volume_time_over_higher_stale_id() {
+        let chunks = [
+            "KLNX/423/20260629-112400-001-S",
+            "KLNX/423/20260629-112400-016-E",
+            "KLNX/393/20260701-050218-001-S",
+            "KLNX/393/20260701-050218-013-I",
+        ]
+        .into_iter()
+        .map(|key| {
+            parse_realtime_chunk_object(S3Object {
+                key: key.to_owned(),
+                size: 100,
+                last_modified: None,
+            })
+            .expect("valid chunk key")
+        })
+        .collect::<Vec<_>>();
+
+        let volume =
+            latest_realtime_volume_from_chunks("KLNX", chunks).expect("newest volume selected");
+
+        assert_eq!(volume.volume_id, 393);
+        assert_eq!(volume.volume_time.to_rfc3339(), "2026-07-01T05:02:18+00:00");
+        assert!(!volume.complete);
+        assert_eq!(volume.chunks.len(), 2);
+    }
+
+    #[test]
+    fn realtime_chunk_scan_does_not_mix_reused_volume_ids() {
+        let chunks = [
+            "KLNX/299/20260701-050218-001-S",
+            "KLNX/299/20260628-235652-055-E",
+        ]
+        .into_iter()
+        .map(|key| {
+            parse_realtime_chunk_object(S3Object {
+                key: key.to_owned(),
+                size: 100,
+                last_modified: None,
+            })
+            .expect("valid chunk key")
+        })
+        .collect::<Vec<_>>();
+
+        let volume =
+            latest_realtime_volume_from_chunks("KLNX", chunks).expect("newest volume selected");
+
+        assert_eq!(volume.volume_id, 299);
+        assert_eq!(volume.volume_time.to_rfc3339(), "2026-07-01T05:02:18+00:00");
+        assert_eq!(volume.chunks.len(), 1);
+        assert!(!volume.complete);
+    }
+
+    #[test]
+    #[ignore = "network: hits live Unidata realtime chunk bucket"]
+    fn latest_realtime_level2_volume_live_klnx() {
+        let volume =
+            latest_realtime_level2_volume_with_listing_ttl("KLNX", StdDuration::ZERO).unwrap();
+        println!(
+            "KLNX realtime id={} time={} chunks={} complete={}",
+            volume.volume_id,
+            volume.volume_time,
+            volume.chunks.len(),
+            volume.complete
+        );
+        assert!(
+            Utc::now()
+                .signed_duration_since(volume.volume_time)
+                .num_minutes()
+                < 20,
+            "resolver picked stale KLNX chunk volume {volume:?}"
         );
     }
 
