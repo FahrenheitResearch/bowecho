@@ -137,6 +137,11 @@ const LIVE_HAZARD_REFRESH_SECONDS: u64 = 30;
 const MAX_ACTIVE_ALERT_ZONE_GEOMETRIES: usize = 320;
 const TIMELINE_REPORT_TRAILING_MINUTES: i64 = 90;
 const TIMELINE_REPORT_LEAD_SECONDS: i64 = 90;
+/// A single loaded frame counts as the live edge (reports ungated) only
+/// when its scan time is at most this old; any operational feed refreshes
+/// well within it. Older single frames are historical views and gate
+/// reports at their own scan time.
+const TIMELINE_SINGLE_FRAME_LIVE_EDGE_MINUTES: i64 = 15;
 const MPING_DECLUTTER_REPORT_THRESHOLD: usize = 160;
 const MPING_DECLUTTER_CELL_PX: f32 = 24.0;
 const MPING_MAX_DRAWN_REPORTS: usize = 500;
@@ -590,6 +595,14 @@ const HAZARD_GENERIC_ALERT_SPIKY_PATH_RATIO: f32 = 1.6;
 const HAZARD_HEAVY_LAYER_FILL_LIMIT: usize = 80;
 const SCREEN_POLYGON_MAX_SEGMENT_DIAGONAL_FRACTION: f32 = 0.35;
 const SCREEN_POLYGON_MIN_MAX_SEGMENT_PX: f32 = 110.0;
+// Outlook-ring wraparound cull: ring neighbors project near each other, so
+// an edge whose UNCLIPPED screen length exceeds this multiple of the ring's
+// own typical spacing can only be a projection wraparound chord (a
+// far-hemisphere flip spans 100s-1000s of spacings; legitimate straight
+// border edges stay well under this). The diagonal cap is a belt-and-
+// suspenders bound for rings whose spacing is itself projection-inflated.
+const OUTLOOK_RING_WRAPAROUND_SPACING_MULTIPLE: f32 = 128.0;
+const OUTLOOK_RING_WRAPAROUND_MAX_DIAGONAL_MULTIPLE: f32 = 40.0;
 const MAP_LAYER_RERENDER_PAN_PX: f32 = 0.5;
 const MAP_LAYER_RERENDER_ZOOM_RATIO: f32 = 0.001;
 const RADAR_OPERATIONAL_STATUS_CLICK_KM: f32 = 35.0;
@@ -1615,6 +1628,12 @@ struct ViewerApp {
     >,
     grid_composite_loading: Option<grid_composites::GridCompositeSource>,
     grid_composite_pending_field: Option<Arc<rw_ui::FieldData>>,
+    /// Per-source frame time + refresh throttle for the rail rows.
+    grid_composite_status: Vec<grid_composites::GridCompositeStatus>,
+    /// True while a USER-initiated fetch (layer add / rail Refresh) is in
+    /// flight — only those write the global status bar; background 60-s
+    /// auto-refreshes report through the row's frame text instead.
+    grid_composite_announce_status: bool,
     bold_labels: bool,
     /// One-shot: force the Settings color-tables fold open (set by the
     /// product color row's "Edit…" jump).
@@ -3775,6 +3794,11 @@ struct TaiwanCwaMapLayer {
     last_refresh_attempt: Option<Instant>,
     fetched_at: Option<Instant>,
     error: Option<String>,
+    /// True while a USER-initiated load (layer add / rail refresh) is in
+    /// flight: only those may write the GLOBAL status bar. Background 60-s
+    /// auto-refreshes and pan/zoom re-renders report through the layer's
+    /// own rail state (fetching/rendering chips + hover) instead.
+    announce_status: bool,
 }
 
 impl TaiwanCwaMapLayer {
@@ -3788,6 +3812,7 @@ impl TaiwanCwaMapLayer {
             last_refresh_attempt: None,
             fetched_at: None,
             error: None,
+            announce_status: false,
         }
     }
 }
@@ -6233,6 +6258,8 @@ impl ViewerApp {
             grid_composite_rx: None,
             grid_composite_loading: None,
             grid_composite_pending_field: None,
+            grid_composite_status: Vec::new(),
+            grid_composite_announce_status: false,
             open_color_tables_request: false,
             bold_labels: true,
             browsing_history: false,
@@ -8307,7 +8334,21 @@ impl ViewerApp {
                     )
                 }),
         );
+        let source_volume = Arc::clone(&volume);
         let volume = ensure_advanced_products_on_volume_cuts_arc(volume, advanced_requests);
+        // Write the derived Arc back into the frame_history entry it came
+        // from (mirrors materialize_primary_advanced_product) so re-selecting
+        // the frame — every loop revolution — reuses the derived volume
+        // instead of deep-cloning + re-deriving, and volume_ptr-keyed loop
+        // render caches keep hitting across revolutions.
+        if !Arc::ptr_eq(&volume, &source_volume)
+            && let Some(frame) = self
+                .frame_history
+                .iter_mut()
+                .find(|frame| Arc::ptr_eq(&frame.volume, &source_volume))
+        {
+            frame.volume = Arc::clone(&volume);
+        }
         let next_identity = frame_identity_for_volume(volume.as_ref());
         if self
             .manual_primary_cut_hold
@@ -8984,7 +9025,17 @@ impl ViewerApp {
 
     fn timeline_report_reference_time_utc(&self) -> Option<DateTime<Utc>> {
         if self.loop_timeline_history_len(self.active_loop_timeline_target()) <= 1 {
-            return None;
+            // A single loaded HISTORICAL frame gates reports at its own scan
+            // time — otherwise it shows TODAY's live mPING/SPC reports over
+            // archive data. None (ungated live reports) stays for the
+            // genuine live view: a frame at the live edge.
+            let frame_time = self.displayed_timeline_time_utc()?;
+            if Utc::now() - frame_time
+                <= chrono::Duration::minutes(TIMELINE_SINGLE_FRAME_LIVE_EDGE_MINUTES)
+            {
+                return None;
+            }
+            return Some(frame_time);
         }
         self.displayed_timeline_time_utc()
     }
@@ -13966,6 +14017,7 @@ impl ViewerApp {
         let previous_product = pane.product.clone();
         let require_complete_live_cut =
             frame_status == FrameStatus::LivePartial && !display_live_chunk_updates;
+        let source_volume = Arc::clone(&volume);
         let volume = ensure_advanced_products_on_volume_cuts_arc(
             volume,
             [(
@@ -13995,6 +14047,16 @@ impl ViewerApp {
                 require_complete_live_cut,
             )],
         );
+        // Same write-back as the primary install: pane loop playback must
+        // derive each frame once, not once per revolution.
+        if !Arc::ptr_eq(&volume, &source_volume)
+            && let Some(frame) = pane
+                .frame_history
+                .iter_mut()
+                .find(|frame| Arc::ptr_eq(&frame.volume, &source_volume))
+        {
+            frame.volume = Arc::clone(&volume);
+        }
         let site_changed = pane
             .volume
             .as_ref()
@@ -14891,14 +14953,9 @@ impl ViewerApp {
     }
 
     fn best_archive_event_site_index(&self, lat: f32, lon: f32) -> Option<(usize, f32)> {
-        self.sites
-            .iter()
-            .enumerate()
-            .filter_map(|(index, site)| {
-                if site.level2_id.starts_with('T') {
-                    return None;
-                }
-                let (site_lat, site_lon) = site_location(site)?;
+        event_explorer::event_jump_eligible_sites(&self.sites)
+            .into_iter()
+            .filter_map(|(index, site_lat, site_lon)| {
                 let distance_km = haversine_km(lat, lon, site_lat, site_lon);
                 (distance_km <= 460.0).then_some((index, distance_km))
             })
@@ -27109,6 +27166,24 @@ impl ViewerApp {
         self.basemap_ms = Some(frame_start.elapsed().as_secs_f32() * 1000.0);
     }
 
+    /// Whether a grid cell's chip may claim LIVE. Radar-owning panes have no
+    /// auto-refresh at all (pane loads are User/Loop only), so they must not
+    /// inherit the PRIMARY Live flag: a pinned pane loaded once would show
+    /// "LIVE" although nothing will ever refresh it. Cell 0 (primary) and
+    /// following panes display the primary feed, so the primary flag is
+    /// their truth.
+    fn pane_chip_is_live(&self, pane_index: usize) -> bool {
+        if pane_index > 0
+            && self
+                .extra_panes
+                .get(pane_index - 1)
+                .is_some_and(ViewPane::owns_radar)
+        {
+            return false;
+        }
+        self.realtime_level2_auto_refresh
+    }
+
     /// Per-pane attribution bar for the multi-pane grid. It mirrors the
     /// single-pane scan/product context and keeps extra-pane product cycling.
     fn pane_info_bar(
@@ -27132,11 +27207,13 @@ impl ViewerApp {
             .get(cut)
             .map(|c| format!(" {:.1}°", c.elevation_deg))
             .unwrap_or_default();
-        let (_, accent, mode) = self.mode_chip_state().unwrap_or((
-            "ARCHIVE".to_owned(),
-            egui::Color32::from_rgb(132, 96, 24),
-            "ARCH",
-        ));
+        let (_, accent, mode) = self
+            .mode_chip_state_with_live(self.pane_chip_is_live(pane_index))
+            .unwrap_or((
+                "ARCHIVE".to_owned(),
+                egui::Color32::from_rgb(132, 96, 24),
+                "ARCH",
+            ));
         let candidates = [
             format!("{mode} {site_id} {}{tilt} · {scan_time}", product.label()),
             format!("{site_id} {}{tilt} · {scan_time}", product.label()),
@@ -28597,8 +28674,18 @@ impl ViewerApp {
                 .flatten();
             thread::spawn(move || {
                 let compute_start = Instant::now();
-                let result = build_native_sounding_adjusted(&data, adjust_ob)
-                    .map(|native| (native, compute_start.elapsed().as_secs_f32() * 1000.0, None));
+                // The adjusted display pair routes through set_native_column
+                // below, so the DISPLAYED skew-T shows the obs-adjusted
+                // profile — not just the hail-env/native fallback consumers.
+                let result = build_native_sounding_adjusted_with_display(&data, adjust_ob).map(
+                    |(native, adjusted)| {
+                        (
+                            native,
+                            compute_start.elapsed().as_secs_f32() * 1000.0,
+                            adjusted,
+                        )
+                    },
+                );
                 let _ = sender.send(result);
                 ctx_clone.request_repaint();
             });
@@ -32522,9 +32609,14 @@ impl ViewerApp {
         }
         layer.last_refresh_attempt = Some(Instant::now());
         layer.error = None;
+        // The global status bar is for user-initiated loads only; the 60-s
+        // auto-refresh reports through the rail's fetching state.
+        layer.announce_status = force;
         let (sender, receiver) = mpsc::channel();
         self.taiwan_cwa_latest_rx = Some(receiver);
-        self.status = "Taiwan CWA: fetching latest composite reflectivity".to_owned();
+        if force {
+            self.status = "Taiwan CWA: fetching latest composite reflectivity".to_owned();
+        }
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
             let result = taiwan_cwa::load_latest_frame();
@@ -32549,11 +32641,19 @@ impl ViewerApp {
                                 layer.error = None;
                                 self.taiwan_cwa_texture = None;
                                 self.taiwan_cwa_render_rx = None;
-                                self.status = format!("Taiwan CWA: composite reflectivity {time}");
+                                // Background refreshes stay off the global
+                                // status bar; the rail shows the frame time.
+                                if layer.announce_status {
+                                    self.status =
+                                        format!("Taiwan CWA: composite reflectivity {time}");
+                                }
                             }
                             Err(err) => {
                                 layer.error = Some(compact_layer_status(&err, 80));
-                                self.status = format!("Taiwan CWA: {err}");
+                                if layer.announce_status {
+                                    layer.announce_status = false;
+                                    self.status = format!("Taiwan CWA: {err}");
+                                }
                             }
                         }
                     }
@@ -32579,7 +32679,14 @@ impl ViewerApp {
                             egui::TextureOptions::LINEAR,
                         );
                         self.taiwan_cwa_texture = Some((texture, generation, view));
-                        self.status = format!("Taiwan CWA: rendered composite in {ms:.0} ms");
+                        // Announce render timing once per USER-initiated
+                        // load; pan/zoom re-renders update the rail only.
+                        if let Some(layer) = &mut self.taiwan_cwa_layer
+                            && layer.announce_status
+                        {
+                            layer.announce_status = false;
+                            self.status = format!("Taiwan CWA: rendered composite in {ms:.0} ms");
+                        }
                     }
                     ctx.request_repaint();
                 }
@@ -32620,9 +32727,11 @@ impl ViewerApp {
         if self.grid_composite_rx.is_some() && !force {
             return;
         }
+        grid_composites::note_refresh_attempt(&mut self.grid_composite_status, source);
         let (sender, receiver) = mpsc::channel();
         self.grid_composite_rx = Some(receiver);
         self.grid_composite_loading = Some(source);
+        self.grid_composite_announce_status = force;
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
             let result = grid_composites::load_latest_field(source);
@@ -32638,9 +32747,23 @@ impl ViewerApp {
                     self.grid_composite_rx = None;
                     self.grid_composite_loading = None;
                     match result {
-                        Ok(field) => {
-                            let field = Arc::new(field);
-                            self.status = format!("{}: latest grid ready", source.short_label());
+                        Ok(fetch) => {
+                            grid_composites::note_fetch_success(
+                                &mut self.grid_composite_status,
+                                source,
+                                fetch.valid_time,
+                                fetch.fetched_at_utc,
+                            );
+                            let field = Arc::new(fetch.field);
+                            if self.grid_composite_announce_status {
+                                let frame_text = grid_composites::frame_text_for(
+                                    &self.grid_composite_status,
+                                    source,
+                                )
+                                .unwrap_or_else(|| "latest".to_owned());
+                                self.status =
+                                    format!("{}: grid {frame_text} ready", source.short_label());
+                            }
                             if self.model_layer_build_rx.is_some() {
                                 self.grid_composite_pending_field = Some(field);
                             } else {
@@ -32648,7 +32771,9 @@ impl ViewerApp {
                             }
                         }
                         Err(err) => {
-                            self.status = format!("{}: {err}", source.short_label());
+                            if self.grid_composite_announce_status {
+                                self.status = format!("{}: {err}", source.short_label());
+                            }
                         }
                     }
                     ctx.request_repaint();
@@ -32664,6 +32789,26 @@ impl ViewerApp {
             && let Some(field) = self.grid_composite_pending_field.take()
         {
             self.start_model_layer_build(field, ctx);
+        }
+        // Same visible-layer auto-refresh gate as Italy DPC / Taiwan CWA:
+        // a layer labelled "latest" must not decay silently behind the
+        // manual Refresh button.
+        let next_refresh = grid_composites::next_auto_refresh_source(
+            self.model_layers
+                .iter()
+                .filter(|slot| slot.layer.visible)
+                .filter_map(|slot| {
+                    grid_composites::GridCompositeSource::from_variable_slug(
+                        &slot.layer.field.key.var,
+                    )
+                }),
+            &self.grid_composite_status,
+            Instant::now(),
+        );
+        if self.grid_composite_rx.is_none()
+            && let Some(source) = next_refresh
+        {
+            self.start_grid_composite_refresh(source, ctx, false);
         }
     }
 
@@ -36013,11 +36158,21 @@ impl ViewerApp {
     }
 
     fn mode_chip_state(&self) -> Option<(String, egui::Color32, &'static str)> {
+        self.mode_chip_state_with_live(self.realtime_level2_auto_refresh)
+    }
+
+    /// Chip derivation with an explicit liveness input: `self.volume` is the
+    /// pane's own volume inside a pane context swap, but the auto-refresh
+    /// flag is primary-only state the snapshot never carries — callers for
+    /// radar-owning panes must pass the PANE's refresh reality instead.
+    fn mode_chip_state_with_live(
+        &self,
+        live: bool,
+    ) -> Option<(String, egui::Color32, &'static str)> {
         let volume = self.volume.as_ref()?;
         let age = Utc::now() - volume.volume_time.with_timezone(&Utc);
         let age_seconds = age.num_seconds().max(0);
         let age_min = age_seconds / 60;
-        let live = self.realtime_level2_auto_refresh;
         let age_style = self.style_registry.radar_age();
         let fresh_bg = style_color32(age_style.fresh_color);
         let stale_bg = style_color32(age_style.stale_color);
@@ -44384,6 +44539,26 @@ fn build_native_sounding_adjusted(
     data: &rw_ui::SoundingData,
     adjust: Option<(f32, obs::SurfaceOb)>,
 ) -> std::result::Result<rustwx_sounding::NativeSounding, String> {
+    build_native_sounding_adjusted_with_display(data, adjust).map(|(native, _)| native)
+}
+
+/// `build_native_sounding_adjusted` plus, when the adjustment is applied,
+/// the adjusted `(SoundingData, SoundingColumn)` pair for the DISPLAYED
+/// skew-T panel: the v0.27.0 dock panel rebuilds its scene from RAW store
+/// data, so the toggle only reaches the screen through the
+/// `set_native_column` path (as the RAOB flow already does). The header
+/// carries the adjusting station so the displayed title never lies about
+/// the surface source.
+fn build_native_sounding_adjusted_with_display(
+    data: &rw_ui::SoundingData,
+    adjust: Option<(f32, obs::SurfaceOb)>,
+) -> std::result::Result<
+    (
+        rustwx_sounding::NativeSounding,
+        Option<(rw_ui::SoundingData, rustwx_sounding::SoundingColumn)>,
+    ),
+    String,
+> {
     // RH-only stores (GFS) get a synthesized dewpoint profile first.
     let synthesized = with_synthesized_dewpoint(data);
     let data = synthesized.as_ref().unwrap_or(data);
@@ -44405,14 +44580,19 @@ fn build_native_sounding_adjusted(
     }
     let mut native =
         rustwx_sounding::NativeSounding::from_column(&column).map_err(|err| err.to_string())?;
-    if let Some(tag) = tag {
+    if let Some(tag) = &tag {
         if native.metadata.station_id.is_empty() {
-            native.metadata.station_id = tag;
+            native.metadata.station_id = tag.clone();
         } else {
             native.metadata.station_id = format!("{} · {tag}", native.metadata.station_id);
         }
     }
-    Ok(native)
+    let adjusted_display = tag.map(|tag| {
+        let mut display_data = data.clone();
+        display_data.hour.run = format!("{} · {tag}", display_data.hour.run);
+        (display_data, column)
+    });
+    Ok((native, adjusted_display))
 }
 
 fn raob_column_to_rw_sounding_data(
@@ -47804,24 +47984,56 @@ fn draw_clipped_outlook_ring(
     {
         return false;
     }
+    for (ca, cb) in clipped_outlook_ring_segments(screen, rect) {
+        painter.line_segment([ca, cb], stroke);
+    }
+    true
+}
+
+/// Clip each ring edge to the viewport, keeping every plausible
+/// neighbor-to-neighbor edge and culling only projection wraparound chords.
+/// The cull threshold is the ring's OWN typical spacing (same length-outlier
+/// idea as `screen_polyline_has_jump`, but ring-relative instead of
+/// viewport-relative) so a legitimate outlook border edge that crosses the
+/// whole viewport at storm zoom is never dropped — only a far-hemisphere
+/// flip, enormous next to its ring's spacing, gets skipped.
+fn clipped_outlook_ring_segments(
+    screen: &[egui::Pos2],
+    rect: egui::Rect,
+) -> Vec<(egui::Pos2, egui::Pos2)> {
     let clip_rect = rect.expand(3.0);
-    let max_visible_len = rect.width().hypot(rect.height()) * 0.62;
     let segment_count = screen.len().saturating_sub(1);
+    let mut spacings: Vec<f32> = (0..segment_count)
+        .filter_map(|index| {
+            let (a, b) = (screen[index], screen[index + 1]);
+            (screen_point_valid(a) && screen_point_valid(b)).then(|| a.distance(b))
+        })
+        .collect();
+    spacings.sort_by(f32::total_cmp);
+    let typical_spacing = spacings
+        .get(spacings.len() / 2)
+        .copied()
+        .unwrap_or_default();
+    let diagonal = rect.width().hypot(rect.height());
+    let wraparound_len = (typical_spacing * OUTLOOK_RING_WRAPAROUND_SPACING_MULTIPLE)
+        .max(screen_polyline_segment_limit_sq(rect).sqrt())
+        .min(diagonal * OUTLOOK_RING_WRAPAROUND_MAX_DIAGONAL_MULTIPLE);
+    let mut segments = Vec::new();
     for index in 0..segment_count {
         let a = screen[index];
-        let b = screen[(index + 1) % screen.len()];
+        let b = screen[index + 1];
         if !screen_point_valid(a) || !screen_point_valid(b) {
             continue;
         }
         let Some((ca, cb)) = clip_segment_to_rect(a, b, clip_rect) else {
             continue;
         };
-        if ca.distance(cb) > max_visible_len && !rect.contains(a) && !rect.contains(b) {
+        if a.distance(b) > wraparound_len && !rect.contains(a) && !rect.contains(b) {
             continue;
         }
-        painter.line_segment([ca, cb], stroke);
+        segments.push((ca, cb));
     }
-    true
+    segments
 }
 
 fn clip_segment_to_rect(
@@ -51084,6 +51296,43 @@ mod tests {
         assert!(ItalyDpcMapProduct::Cum12.label().contains("rain-gauge"));
     }
 
+    #[test]
+    fn background_taiwan_cwa_refresh_does_not_hijack_the_global_status_bar() {
+        let ctx = egui::Context::default();
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let mut layer = TaiwanCwaMapLayer::new();
+        // Fresh attempt stamp keeps the poll's visible-layer gate from
+        // spawning a real network refresh inside the test.
+        layer.last_refresh_attempt = Some(Instant::now());
+        app.taiwan_cwa_layer = Some(layer);
+        app.status = "KTLX REF loaded".to_owned();
+
+        // Background 60-s auto-refresh completion (announce_status = false):
+        // the rail carries the result; the global status bar stays untouched.
+        let (sender, receiver) = mpsc::channel();
+        app.taiwan_cwa_latest_rx = Some(receiver);
+        sender.send(Err("listing throttled".to_owned())).unwrap();
+        app.poll_taiwan_cwa_layer(&ctx);
+
+        assert_eq!(app.status, "KTLX REF loaded");
+        let error = app
+            .taiwan_cwa_layer
+            .as_ref()
+            .and_then(|layer| layer.error.clone());
+        assert_eq!(error.as_deref(), Some("listing throttled"));
+
+        // User-initiated loads (layer add / rail refresh) still announce.
+        let layer = app.taiwan_cwa_layer.as_mut().expect("layer");
+        layer.announce_status = true;
+        layer.last_refresh_attempt = Some(Instant::now());
+        let (sender, receiver) = mpsc::channel();
+        app.taiwan_cwa_latest_rx = Some(receiver);
+        sender.send(Err("listing throttled".to_owned())).unwrap();
+        app.poll_taiwan_cwa_layer(&ctx);
+
+        assert_eq!(app.status, "Taiwan CWA: listing throttled");
+    }
+
     /// Bolton (1980) round-trip sanity: saturated air dews at the air
     /// temperature; the textbook 20 °C / 50% case lands at ≈9.3 °C.
     #[test]
@@ -51155,6 +51404,122 @@ mod tests {
         // No moisture at all: nothing to synthesize.
         let dry = data(vec![var("temperature_iso", "K", vec![1000], vec![293.15])]);
         assert!(with_synthesized_dewpoint(&dry).is_none());
+    }
+
+    /// The "Obs-adjusted soundings" toggle must reach the DISPLAYED skew-T:
+    /// the adjusted (data, column) pair feeds set_native_column, so the
+    /// panel's surface temperature equals the adjusting ob's and the header
+    /// names the station (v0.27.0 dock panel renders raw store data
+    /// otherwise, leaving the toggle a no-op on screen).
+    #[test]
+    fn obs_adjusted_sounding_reaches_the_displayed_panel() {
+        let levels = vec![1000u16, 925, 850, 700, 500, 400, 300, 250, 200];
+        let var = |name: &str, units: &str, values: Vec<f32>| rw_ui::ProfileVar {
+            name: name.to_owned(),
+            units: units.to_owned(),
+            levels_hpa: levels.clone(),
+            values,
+        };
+        let surface = |name: &str, units: &str, value: f32| rw_ui::SurfaceSample {
+            name: name.to_owned(),
+            units: units.to_owned(),
+            value,
+        };
+        let data = rw_ui::SoundingData {
+            hour: rw_ui::HourKey {
+                model: "hrrr".to_owned(),
+                run: "2026-06-24 22z".to_owned(),
+                hour: 1,
+            },
+            fx: 0.0,
+            fy: 0.0,
+            lat: Some(35.2),
+            lon: Some(-97.4),
+            vars: vec![
+                var(
+                    "temperature_iso",
+                    "K",
+                    vec![
+                        299.15, 295.15, 290.15, 281.15, 267.15, 258.15, 246.15, 236.15, 224.15,
+                    ],
+                ),
+                var(
+                    "dewpoint_iso",
+                    "K",
+                    vec![
+                        291.15, 289.15, 285.15, 271.15, 252.15, 242.15, 228.15, 220.15, 210.15,
+                    ],
+                ),
+                var(
+                    "u_iso",
+                    "m/s",
+                    vec![2.0, 5.0, 8.0, 12.0, 18.0, 22.0, 26.0, 28.0, 30.0],
+                ),
+                var(
+                    "v_iso",
+                    "m/s",
+                    vec![4.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 18.0, 19.0],
+                ),
+                var(
+                    "height_iso",
+                    "m",
+                    vec![
+                        110.0, 780.0, 1500.0, 3050.0, 5800.0, 7400.0, 9400.0, 10600.0, 12100.0,
+                    ],
+                ),
+            ],
+            surface: vec![
+                surface("temperature_2m", "K", 300.15),
+                surface("dewpoint_2m", "K", 292.15),
+                surface("u_10m", "m/s", 1.0),
+                surface("v_10m", "m/s", 3.0),
+                surface("surface_pressure", "Pa", 97_500.0),
+                surface("orography", "m", 380.0),
+            ],
+            read_ms: 0.0,
+        };
+        let ob = obs::SurfaceOb {
+            station_id: "KOUN".to_owned(),
+            time_utc: None,
+            lat: 35.24,
+            lon: -97.47,
+            temp_c: Some(33.0),
+            dewpoint_c: Some(21.5),
+            wind_dir_deg: Some(180.0),
+            wind_speed_kt: Some(20.0),
+            wind_gust_kt: None,
+            altim_in_hg: None,
+            completeness: 8,
+            network: "METAR".to_owned(),
+            elevation_m: None,
+        };
+
+        let (_, unadjusted) =
+            build_native_sounding_adjusted_with_display(&data, None).expect("plain build");
+        assert!(
+            unadjusted.is_none(),
+            "no adjustment => the dock's raw panel stays the display"
+        );
+
+        let (native, adjusted) =
+            build_native_sounding_adjusted_with_display(&data, Some((12.0, ob)))
+                .expect("adjusted build");
+        let (display_data, column) = adjusted.expect("adjusted display pair");
+
+        // The displayed panel re-renders from THIS column: its surface must
+        // be the adjusting ob's, not the model's.
+        assert_eq!(column.temperature_c[0], 33.0);
+        assert_eq!(column.dewpoint_c[0], 21.5);
+        assert!(
+            display_data.hour.run.contains("KOUN obs-adj 12km"),
+            "{}",
+            display_data.hour.run
+        );
+        assert!(
+            native.metadata.station_id.contains("KOUN obs-adj 12km"),
+            "{}",
+            native.metadata.station_id
+        );
     }
 
     #[test]
@@ -59506,6 +59871,26 @@ mod tests {
     }
 
     #[test]
+    fn event_and_report_jumps_never_target_research_feeds() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = site_catalog_with_community_feeds(vec![RadarSite::new("KTLX").with_location(
+            Some("Oklahoma City".to_owned()),
+            Some(35.333),
+            Some(-97.278),
+        )]);
+        // KBPP (Bowman ARB research feed, no archive) is the only radar
+        // near this point; the event picker must come up empty rather
+        // than send the archive loader at a live-only feed.
+        assert_eq!(app.best_archive_event_site_index(46.187, -103.428), None);
+        // Near Norman the co-located Testbed research feeds (DAN1, KCRI,
+        // ...) are nearest, but the archive-backed KTLX must win.
+        let (index, _) = app
+            .best_archive_event_site_index(35.24, -97.46)
+            .expect("KTLX within the lowest-beam radius");
+        assert_eq!(app.sites[index].level2_id, "KTLX");
+    }
+
+    #[test]
     fn coordinated_site_ids_parse_common_separators_and_dedupe() {
         assert_eq!(
             parse_coordinated_site_ids("tlx, kinx KFDR;ktlx"),
@@ -61012,6 +61397,38 @@ mod tests {
     }
 
     #[test]
+    fn owned_pane_chip_never_claims_live_from_the_primary_flag() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.realtime_level2_auto_refresh = true;
+        app.volume = Some(Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("KTLX"),
+            Utc::now() - chrono::Duration::seconds(30),
+        )));
+        app.extra_panes.push(ViewPane::new(DisplayProduct::Moment(
+            MomentType::Reflectivity,
+        )));
+        app.extra_panes.push(ViewPane::new(DisplayProduct::Moment(
+            MomentType::Reflectivity,
+        )));
+        app.extra_panes[0].pinned_site_id = Some("KEAX".to_owned());
+
+        // Cell 0 (primary) and the FOLLOWING pane display the primary feed,
+        // so the primary Live flag is their truth.
+        assert!(app.pane_chip_is_live(0));
+        assert!(app.pane_chip_is_live(2));
+        // The radar-owning pane never auto-refreshes: its chip must not
+        // inherit the primary flag.
+        assert!(!app.pane_chip_is_live(1));
+
+        // With its own liveness the chip shows the honest frame age instead.
+        let (label, _, kind) = app
+            .mode_chip_state_with_live(app.pane_chip_is_live(1))
+            .expect("owned pane chip");
+        assert_eq!(kind, "ARCH");
+        assert!(label.contains("0m old"), "{label}");
+    }
+
+    #[test]
     fn radar_age_glyph_arc_sweep_uses_red_threshold_and_clamps() {
         let now = Utc.with_ymd_and_hms(2026, 6, 7, 23, 0, 0).unwrap();
         let style = styles::RadarAgeStyle {
@@ -62068,6 +62485,92 @@ mod tests {
             global_displayable_products(installed.as_ref()).contains(&product),
             "product picker should still expose PHIF"
         );
+    }
+
+    #[test]
+    fn install_writes_derived_advanced_volume_back_into_frame_history() {
+        let ctx = egui::Context::default();
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.advanced_products_enabled = true;
+        let product = DisplayProduct::Moment(MomentType::Unknown("PHIF".to_owned()));
+        let source = Arc::new(test_advanced_source_volume(
+            Utc.with_ymd_and_hms(2026, 6, 24, 22, 0, 0)
+                .single()
+                .unwrap(),
+        ));
+        app.selected_cut = 0;
+        app.selected_product = product.clone();
+        app.frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(source.as_ref()),
+            path: PathBuf::from("loop-phif-2200"),
+            volume: Arc::clone(&source),
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "test".to_owned(),
+        });
+
+        app.select_history_frame(0, false, &ctx);
+
+        let installed = app.volume.clone().expect("installed volume");
+        assert!(
+            !Arc::ptr_eq(&installed, &source),
+            "install materializes PHIF into a new Arc"
+        );
+        assert!(is_displayable_on_cut(installed.as_ref(), 0, &product));
+        assert!(
+            Arc::ptr_eq(&app.frame_history[0].volume, &installed),
+            "derived Arc must replace the history entry so loop revolutions do not re-derive"
+        );
+
+        // Re-selecting the same frame reuses the derived Arc unchanged —
+        // no deep-clone + re-derivation per revolution.
+        app.select_history_frame(0, false, &ctx);
+        assert!(Arc::ptr_eq(
+            app.volume.as_ref().expect("volume"),
+            &installed
+        ));
+    }
+
+    #[test]
+    fn pane_install_writes_derived_advanced_volume_back_into_pane_history() {
+        let ctx = egui::Context::default();
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.advanced_products_enabled = true;
+        let product = DisplayProduct::Moment(MomentType::Unknown("PHIF".to_owned()));
+        let source = Arc::new(test_advanced_source_volume(
+            Utc.with_ymd_and_hms(2026, 6, 24, 22, 0, 0)
+                .single()
+                .unwrap(),
+        ));
+        app.extra_panes.push(ViewPane::new(product.clone()));
+        app.extra_panes[0].pinned_site_id = Some(source.site.id.clone());
+        app.extra_panes[0].cut = Some(0);
+        app.extra_panes[0].frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(source.as_ref()),
+            path: PathBuf::from("pane-loop-phif-2200"),
+            volume: Arc::clone(&source),
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "test".to_owned(),
+        });
+
+        app.select_extra_pane_history_frame(0, 0, &ctx);
+
+        let installed = app.extra_panes[0].volume.clone().expect("pane volume");
+        assert!(
+            !Arc::ptr_eq(&installed, &source),
+            "pane install materializes PHIF into a new Arc"
+        );
+        assert!(
+            Arc::ptr_eq(&app.extra_panes[0].frame_history[0].volume, &installed),
+            "derived Arc must replace the pane history entry so pane loops do not re-derive"
+        );
+
+        app.select_extra_pane_history_frame(0, 0, &ctx);
+        assert!(Arc::ptr_eq(
+            app.extra_panes[0].volume.as_ref().expect("pane volume"),
+            &installed
+        ));
     }
 
     #[test]
@@ -63455,6 +63958,68 @@ mod tests {
     }
 
     #[test]
+    fn single_historical_frame_gates_reports_at_its_scan_time() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let frame_time = Utc.with_ymd_and_hms(2024, 5, 20, 22, 0, 0).unwrap();
+        let frame_volume = Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("KTLX"),
+            frame_time,
+        ));
+        app.frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(frame_volume.as_ref()),
+            path: PathBuf::from("single-archive-frame"),
+            volume: Arc::clone(&frame_volume),
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "test".to_owned(),
+        });
+        app.volume = Some(frame_volume);
+
+        // One historical frame must NOT show today's live reports.
+        assert_eq!(app.timeline_report_reference_time_utc(), Some(frame_time));
+        let today = spc_layers::StormReport {
+            kind: spc_layers::ReportKind::Wind,
+            time_hhmm: "0000".to_owned(),
+            time_utc: Utc::now(),
+            lat: 35.0,
+            lon: -97.0,
+            magnitude: "65".to_owned(),
+            location: "today".to_owned(),
+            remark: String::new(),
+        };
+        let contemporary = spc_layers::StormReport {
+            time_hhmm: "2155".to_owned(),
+            time_utc: frame_time - chrono::Duration::minutes(5),
+            location: "contemporary".to_owned(),
+            ..today.clone()
+        };
+        assert!(!app.spc_report_visible_for_timeline(&today));
+        assert!(app.spc_report_visible_for_timeline(&contemporary));
+    }
+
+    #[test]
+    fn single_live_edge_frame_keeps_ungated_live_reports() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let frame_time = Utc::now() - chrono::Duration::minutes(3);
+        let frame_volume = Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("KTLX"),
+            frame_time,
+        ));
+        app.frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(frame_volume.as_ref()),
+            path: PathBuf::from("single-live-frame"),
+            volume: Arc::clone(&frame_volume),
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        });
+        app.volume = Some(frame_volume);
+
+        // Genuine live view: reports stay ungated.
+        assert_eq!(app.timeline_report_reference_time_utc(), None);
+    }
+
+    #[test]
     fn acknowledge_all_visible_hazards_clears_visible_new_rows_only() {
         let visible = test_hazard_record(
             "visible",
@@ -64024,6 +64589,48 @@ mod tests {
     }
 
     #[test]
+    fn clipped_outlook_ring_keeps_full_viewport_crossing_edges() {
+        // Storm zoom inside a huge outlook ring: one border edge crosses the
+        // whole viewport with both endpoints far offscreen. The old
+        // clipped-length-vs-viewport cull (0.62 x diagonal) dropped it.
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let screen = vec![
+            egui::pos2(-300.0, 50.0),
+            egui::pos2(400.0, 50.0),
+            egui::pos2(400.0, 700.0),
+            egui::pos2(-300.0, 700.0),
+            egui::pos2(-300.0, 50.0),
+        ];
+
+        let segments = clipped_outlook_ring_segments(&screen, rect);
+
+        assert_eq!(segments.len(), 1, "the crossing edge must be drawn");
+        let (a, b) = segments[0];
+        assert_eq!(a.y, 50.0);
+        assert_eq!(b.y, 50.0);
+        assert!(a.x <= rect.left() && b.x >= rect.right());
+    }
+
+    #[test]
+    fn clipped_outlook_ring_culls_projection_wraparound_chords() {
+        // Densely spaced offscreen ring plus one bogus far-hemisphere chord
+        // through the viewport: the chord is an enormous multiple of the
+        // ring's own spacing and must be skipped.
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let mut screen: Vec<egui::Pos2> = (0..40)
+            .map(|step| egui::pos2(-1000.0 + step as f32 * 10.0, 50.0))
+            .collect();
+        screen.push(egui::pos2(200_000.0, 50.0));
+
+        let segments = clipped_outlook_ring_segments(&screen, rect);
+
+        assert!(
+            segments.is_empty(),
+            "wraparound chord must not be drawn: {segments:?}"
+        );
+    }
+
+    #[test]
     fn hazard_visible_label_anchor_uses_view_center_inside_partial_polygon() {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
         let points = vec![
@@ -64436,6 +65043,8 @@ mod tests {
             grid_composite_rx: None,
             grid_composite_loading: None,
             grid_composite_pending_field: None,
+            grid_composite_status: Vec::new(),
+            grid_composite_announce_status: false,
             open_color_tables_request: false,
             bold_labels: true,
             browsing_history: false,

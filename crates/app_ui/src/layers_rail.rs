@@ -33,7 +33,7 @@ impl ViewerApp {
             + self.radar_layers.len()
             + usize::from(self.italy_dpc_layer.is_some())
             + usize::from(self.taiwan_cwa_layer.is_some())
-            + usize::from(self.grid_composite_loading.is_some())
+            + usize::from(self.grid_composite_placeholder_source().is_some())
             + usize::from(self.sat_layer.is_some())
             + self.model_layers.len()
             + usize::from(self.obs_enabled)
@@ -48,6 +48,18 @@ impl ViewerApp {
             + usize::from(self.wofs.drape_on_map)
             + usize::from(self.farm.drape.enabled)
             + self.placefile_slots.iter().filter(|s| s.enabled).count()
+    }
+
+    /// A grid composite fetch with no model-layer row yet (the first
+    /// fetch) — refreshes of an existing row show on that row instead of
+    /// flashing a second "loading" row every auto-refresh.
+    fn grid_composite_placeholder_source(&self) -> Option<grid_composites::GridCompositeSource> {
+        self.grid_composite_loading.filter(|source| {
+            !self.model_layers.iter().any(|slot| {
+                grid_composites::GridCompositeSource::from_variable_slug(&slot.layer.field.key.var)
+                    == Some(*source)
+            })
+        })
     }
 
     /// Weak uppercase group mini-header with a right-aligned action slot.
@@ -188,7 +200,7 @@ impl ViewerApp {
             .unwrap_or_else(|| "no runs in store".to_owned());
         let model_row_count = self.model_layers.len();
         let mut refresh_grid_composite: Option<grid_composites::GridCompositeSource> = None;
-        if let Some(source) = self.grid_composite_loading {
+        if let Some(source) = self.grid_composite_placeholder_source() {
             let name = source.short_label();
             let _ = layer_row(
                 ui,
@@ -218,6 +230,10 @@ impl ViewerApp {
                 .unwrap_or_else(|| {
                     format!("{} f{:02}", layer.field.key.var, layer.field.key.hour.hour)
                 });
+            let grid_frame_text = grid_source.and_then(|source| {
+                grid_composites::frame_text_for(&self.grid_composite_status, source)
+            });
+            let grid_fetching = grid_source.is_some() && grid_source == self.grid_composite_loading;
             let name_hover = grid_source.map_or_else(
                 || {
                     format!(
@@ -227,9 +243,10 @@ impl ViewerApp {
                 },
                 |source| {
                     format!(
-                        "{} ({})\nLatest public grid composite; layers draw bottom-to-top in list order",
+                        "{} ({})\nFrame: {}\nLatest public grid composite — auto-refreshes ~60 s while visible; layers draw bottom-to-top in list order",
                         source.label(),
-                        layer.field.units
+                        layer.field.units,
+                        grid_frame_text.as_deref().unwrap_or("pending first fetch"),
                     )
                 },
             );
@@ -251,6 +268,7 @@ impl ViewerApp {
                     // (field report).
                     name_width: crate::NAME_W_WIDE,
                     name_hover: &name_hover,
+                    state: grid_fetching.then_some("fetching"),
                     opacity: Some(LayerRowOpacity::F32 {
                         value: &mut layer.opacity,
                         min: 0.1,
@@ -267,9 +285,11 @@ impl ViewerApp {
                         hover: "Remove this layer",
                         clicked: &mut remove_this,
                     }),
-                    ..Default::default()
                 },
                 |ui| {
+                    if let Some(text) = &grid_frame_text {
+                        ui.weak(text.as_str());
+                    }
                     if let Some(source) = refreshable_source
                         && ui
                             .small_button("Refresh")
@@ -599,8 +619,25 @@ impl ViewerApp {
             self.open_viewer(dock::WorkspacePane::Satellite);
         }
         if remove_sat_layer {
+            // Remove must stick: while "Map follows player" is on, the
+            // timeline sync re-requests a map frame every update and the
+            // layer pops straight back — so removing the row also drops the
+            // follow linkage (with a status note) plus any pending map-frame
+            // work, mirroring clear_satellite_display_for_spec_change minus
+            // the run listings. sat_last_frame survives so the Sat window's
+            // "Show on radar map" can bring the layer right back.
+            if self.sat_map_follow {
+                self.sat_map_follow = false;
+                self.status =
+                    "Removed satellite layer · map no longer follows the satellite player"
+                        .to_owned();
+            }
             self.sat_layer = None;
             self.sat_layer_texture = None;
+            self.sat_layer_build_rx = None;
+            self.sat_layer_render_rx = None;
+            self.sat_map_inflight = None;
+            self.sat_map_pending = None;
             ctx.request_repaint();
         }
         // WoFS DRAPE — the row is born from the WoFS window's "Show on map"
@@ -1150,7 +1187,7 @@ impl ViewerApp {
                     },
                     name: "mPING",
                     name_width: crate::NAME_W_STD,
-                    name_hover: "Recent mPING public display reports: precipitation, hail, wind damage, flooding, visibility, and winter impacts",
+                    name_hover: "Recent mPING public display reports: precipitation, hail, wind damage, flooding, visibility, and winter impacts\nData courtesy of NOAA NSSL / University of Oklahoma",
                     ..Default::default()
                 },
                 |ui| {

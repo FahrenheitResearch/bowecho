@@ -245,6 +245,29 @@ pub(crate) fn point_segment_distance(point: egui::Pos2, a: egui::Pos2, b: egui::
     point.distance(a + ab * t)
 }
 
+/// Event-jump site eligibility over the catalog, pure for testing —
+/// archive-backed WSR-88Ds only: TDWRs' short range / attenuation make
+/// them the wrong default for an event jump, and community research
+/// feeds (KCRI, DAN1, KBPP, ...) serve live frames only, with no
+/// historical archive to load. Shared by the track picker below and the
+/// report/event picker (`best_archive_event_site_index`).
+pub(crate) fn event_jump_eligible_sites(
+    sites: &[data_source::RadarSite],
+) -> Vec<(usize, f32, f32)> {
+    sites
+        .iter()
+        .enumerate()
+        .filter_map(|(index, site)| {
+            if site.level2_id.starts_with('T') || !crate::site_is_primary_level2_catalog_site(site)
+            {
+                return None;
+            }
+            let (lat, lon) = crate::site_location(site)?;
+            Some((index, lat, lon))
+        })
+        .collect()
+}
+
 /// Dual-radar pick for a track, pure over a site list of
 /// `(catalog_index, lat, lon)`: PRIMARY = nearest site to the track
 /// MIDPOINT (within the lowest-beam radius), OVERLAY = nearest site to
@@ -855,20 +878,7 @@ impl crate::ViewerApp {
     /// scans; a surveyed track uses touchdown..lift plus separate before/after
     /// context. This path never invokes live/latest loading.
     pub(crate) fn jump_to_event_track(&mut self, hit: &EventTrackHit, ctx: &egui::Context) {
-        let eligible: Vec<(usize, f32, f32)> = self
-            .sites
-            .iter()
-            .enumerate()
-            .filter_map(|(index, site)| {
-                // WSR-88Ds only — TDWRs' short range / attenuation make
-                // them the wrong default for an event jump.
-                if site.level2_id.starts_with('T') {
-                    return None;
-                }
-                let (lat, lon) = crate::site_location(site)?;
-                Some((index, lat, lon))
-            })
-            .collect();
+        let eligible = event_jump_eligible_sites(&self.sites);
         let Some((primary, overlay)) = select_event_radar_indices(&eligible, hit.begin, hit.end)
         else {
             self.status = "No radar within 460 km of that track".to_owned();
@@ -1130,6 +1140,41 @@ mod tests {
             select_event_radar_indices(&sites, (60.0, -150.0), (60.0, -150.0)),
             None
         );
+    }
+
+    #[test]
+    fn event_jump_skips_research_feeds_even_when_nearest() {
+        let dan1 = data_source::community_feeds::community_feeds()
+            .iter()
+            .find(|feed| feed.id == "DAN1")
+            .expect("DAN1 research feed exists");
+        // DAN1 (Norman Testbed research feed, live frames only — no
+        // archive) sits right on the event; KTLX is farther but is the
+        // only archive-backed pick. The TDWR must stay excluded too.
+        let sites = vec![
+            crate::community_feed_site(dan1),
+            data_source::RadarSite::new("KTLX").with_location(
+                Some("Oklahoma City".to_owned()),
+                Some(35.333),
+                Some(-97.278),
+            ),
+            data_source::RadarSite::new("TOKC").with_location(
+                Some("Oklahoma City TDWR".to_owned()),
+                Some(35.276),
+                Some(-97.510),
+            ),
+        ];
+        let eligible = event_jump_eligible_sites(&sites);
+        assert_eq!(
+            eligible.len(),
+            1,
+            "research feed and TDWR are ineligible for event jumps"
+        );
+        let event = (dan1.latitude_deg, dan1.longitude_deg);
+        let (primary, overlay) =
+            select_event_radar_indices(&eligible, event, event).expect("KTLX in range");
+        assert_eq!(sites[primary].level2_id, "KTLX");
+        assert_eq!(overlay, None);
     }
 
     #[test]

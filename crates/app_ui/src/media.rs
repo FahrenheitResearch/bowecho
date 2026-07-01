@@ -32,6 +32,11 @@ const RECORD_SETTLE_FRAMES: u8 = 2;
 const RECORD_RENDER_TIMEOUT_FRAMES: u32 = 1_200;
 /// Updates to wait for the screenshot event before aborting the recording.
 const RECORD_CAPTURE_TIMEOUT_FRAMES: u32 = 600;
+/// Bounded depth of the capture -> encoder channel. Loop recording captures
+/// serially (at most one frame in flight), so it never fills; free recording
+/// drops frames past this depth instead of growing RAM without limit when
+/// the encoder falls behind the capture rate.
+const ENCODER_CHANNEL_DEPTH: usize = 8;
 /// Free/manual recordings are meant for panning, zooming, and scrubbing the UI.
 const DEFAULT_RECORD_FPS: u16 = 30;
 const RECORD_FPS_CHOICES: [u16; 5] = [10, 15, 24, 30, 60];
@@ -152,7 +157,7 @@ struct RecorderState {
     restore_cut: usize,
     restore_playing: bool,
     restore_browsing: bool,
-    frame_tx: mpsc::Sender<EncoderMsg>,
+    frame_tx: mpsc::SyncSender<EncoderMsg>,
     format: ResolvedRecordFormat,
 }
 
@@ -163,11 +168,13 @@ enum FreeRecorderPhase {
 
 struct FreeRecorderState {
     frames: usize,
+    /// Frames dropped because the encoder channel was full (encoder behind).
+    dropped: usize,
     phase: FreeRecorderPhase,
     next_capture_at: Instant,
     last_capture_at: Option<Instant>,
     frame_delay_ms: u32,
-    frame_tx: mpsc::Sender<EncoderMsg>,
+    frame_tx: mpsc::SyncSender<EncoderMsg>,
     format: ResolvedRecordFormat,
 }
 
@@ -412,10 +419,15 @@ impl ViewerApp {
             );
         } else if let Some(recorder) = &self.media.free_recorder {
             let show = !matches!(recorder.phase, FreeRecorderPhase::AwaitScreenshot { .. });
+            let label = if recorder.dropped > 0 {
+                format!("REC {} ({} dropped)", recorder.frames, recorder.dropped)
+            } else {
+                format!("REC {}", recorder.frames)
+            };
             ui.add_visible(
                 show,
                 egui::Label::new(
-                    egui::RichText::new(format!("REC {}", recorder.frames))
+                    egui::RichText::new(label)
                         .color(egui::Color32::from_rgb(235, 64, 52))
                         .strong(),
                 ),
@@ -855,6 +867,7 @@ impl ViewerApp {
         });
         self.media.free_recorder = Some(FreeRecorderState {
             frames: 0,
+            dropped: 0,
             phase: FreeRecorderPhase::Ready,
             next_capture_at: Instant::now(),
             last_capture_at: None,
@@ -1074,9 +1087,19 @@ impl ViewerApp {
                 )
             })
             .unwrap_or(1);
-        recorder.last_capture_at = Some(now);
-        let _ = recorder.frame_tx.send(EncoderMsg::Frame { image, repeat });
-        recorder.frames += 1;
+        match queue_free_frame(&recorder.frame_tx, image, repeat) {
+            FreeFrameQueue::Queued => {
+                recorder.last_capture_at = Some(now);
+                recorder.frames += 1;
+            }
+            // Encoder is behind; drop the frame rather than block the UI or
+            // queue unbounded RAM. Leaving `last_capture_at` alone lets the
+            // next queued frame's `repeat` cover the gap so the recording's
+            // duration stays honest.
+            FreeFrameQueue::Dropped => recorder.dropped += 1,
+            // Encoder thread already exited; it reports its own failure.
+            FreeFrameQueue::Gone => {}
+        }
         recorder.phase = FreeRecorderPhase::Ready;
         let frame_delay = Duration::from_millis(u64::from(recorder.frame_delay_ms));
         recorder.next_capture_at += frame_delay;
@@ -1127,12 +1150,25 @@ impl ViewerApp {
             return;
         };
         self.status = if recorder.frames == 0 {
-            let _ = recorder.frame_tx.send(EncoderMsg::Abort);
+            let _ = recorder.frame_tx.try_send(EncoderMsg::Abort);
             "Free recording cancelled (no frames captured)".to_owned()
         } else {
-            let _ = recorder.frame_tx.send(EncoderMsg::Finish);
+            // Deliver Finish without stalling the UI: if queued frames still
+            // fill the channel, hand the blocking send to a helper thread.
+            if let Err(mpsc::TrySendError::Full(_)) = recorder.frame_tx.try_send(EncoderMsg::Finish)
+            {
+                let frame_tx = recorder.frame_tx.clone();
+                thread::spawn(move || {
+                    let _ = frame_tx.send(EncoderMsg::Finish);
+                });
+            }
+            let dropped_note = if recorder.dropped > 0 {
+                format!(", {} dropped: encoder fell behind", recorder.dropped)
+            } else {
+                String::new()
+            };
             format!(
-                "Encoding {} free recording ({} frames) in the background...",
+                "Encoding {} free recording ({} frames{dropped_note}) in the background...",
                 recorder.format.label(),
                 recorder.frames
             )
@@ -1145,7 +1181,9 @@ impl ViewerApp {
         let Some(recorder) = self.media.free_recorder.take() else {
             return;
         };
-        let _ = recorder.frame_tx.send(EncoderMsg::Abort);
+        // If the channel is full, dropping the sender below aborts the
+        // encoder just the same (recv errors out and discards the output).
+        let _ = recorder.frame_tx.try_send(EncoderMsg::Abort);
         self.status = format!("Free recording aborted: {reason}");
         ctx.request_repaint();
     }
@@ -1263,9 +1301,12 @@ struct LoopEncodeJob {
 }
 
 /// Spawns the background encoder thread and returns its frame channel.
-/// Frames stream in as they are captured so memory stays bounded.
-fn spawn_loop_encoder(job: LoopEncodeJob) -> mpsc::Sender<EncoderMsg> {
-    let (frame_tx, frame_rx) = mpsc::channel::<EncoderMsg>();
+/// The channel is bounded so memory stays bounded even if the encoder falls
+/// behind the capture rate; free recording drops frames past the depth
+/// (see `queue_free_frame`) while loop recording's serial capture never
+/// queues more than one frame in practice.
+fn spawn_loop_encoder(job: LoopEncodeJob) -> mpsc::SyncSender<EncoderMsg> {
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<EncoderMsg>(ENCODER_CHANNEL_DEPTH);
     thread::spawn(move || {
         let message = run_loop_encoder(&job, &frame_rx);
         if let Some(message) = message {
@@ -1329,6 +1370,30 @@ fn drain_until_end(frame_rx: &mpsc::Receiver<EncoderMsg>) {
         if matches!(message, EncoderMsg::Finish | EncoderMsg::Abort) {
             return;
         }
+    }
+}
+
+/// Outcome of handing a captured free-recording frame to the encoder.
+enum FreeFrameQueue {
+    Queued,
+    /// Channel full: the encoder is behind, so the frame was dropped.
+    Dropped,
+    /// Encoder thread already exited (it reports its own failure).
+    Gone,
+}
+
+/// Queues a free-recording frame without ever blocking the UI thread: a
+/// blocking send while the encoder is behind would freeze the app, so a
+/// full channel drops the frame instead (the drop is counted and surfaced).
+fn queue_free_frame(
+    frame_tx: &mpsc::SyncSender<EncoderMsg>,
+    image: Arc<egui::ColorImage>,
+    repeat: usize,
+) -> FreeFrameQueue {
+    match frame_tx.try_send(EncoderMsg::Frame { image, repeat }) {
+        Ok(()) => FreeFrameQueue::Queued,
+        Err(mpsc::TrySendError::Full(_)) => FreeFrameQueue::Dropped,
+        Err(mpsc::TrySendError::Disconnected(_)) => FreeFrameQueue::Gone,
     }
 }
 
@@ -2223,5 +2288,35 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn free_frame_queue_drops_when_encoder_channel_is_full() {
+        // The stalled-encoder case: nothing consumes the channel. The first
+        // ENCODER_CHANNEL_DEPTH frames queue, every later one is dropped
+        // instead of blocking the UI thread or queueing unbounded RAM.
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<EncoderMsg>(ENCODER_CHANNEL_DEPTH);
+        for _ in 0..ENCODER_CHANNEL_DEPTH {
+            assert!(matches!(
+                queue_free_frame(&frame_tx, synthetic_frame(4, 4, 0), 1),
+                FreeFrameQueue::Queued
+            ));
+        }
+        assert!(matches!(
+            queue_free_frame(&frame_tx, synthetic_frame(4, 4, 0), 1),
+            FreeFrameQueue::Dropped
+        ));
+        // Once the encoder catches up on one frame, captures queue again.
+        assert!(matches!(frame_rx.try_recv(), Ok(EncoderMsg::Frame { .. })));
+        assert!(matches!(
+            queue_free_frame(&frame_tx, synthetic_frame(4, 4, 0), 1),
+            FreeFrameQueue::Queued
+        ));
+        // A dead encoder is not a "dropped frame": it reports its own failure.
+        drop(frame_rx);
+        assert!(matches!(
+            queue_free_frame(&frame_tx, synthetic_frame(4, 4, 0), 1),
+            FreeFrameQueue::Gone
+        ));
     }
 }

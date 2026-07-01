@@ -122,21 +122,28 @@ pub struct MergeReport {
 ///   per-product write times).
 /// - Cuts are matched by `elevation_deg` within
 ///   [`CUT_ELEVATION_MATCH_TOLERANCE_DEG`]; an incoming cut merges into the
-///   first existing cut inside the tolerance.
+///   first tolerance-matched cut with compatible radial geometry that does
+///   not already carry one of its moments (JMA 10-minute tars repeat a tilt
+///   twice, so repetition-2 velocity must land on the repetition-2 cut, not
+///   collide with repetition-1's), falling back to the first
+///   geometry-compatible match when every candidate collides.
 /// - A matched cut contributes its moment grids to the existing cut's
 ///   moment map. On a moment-type collision the first part wins and the
 ///   incoming grid is dropped (counted in
 ///   [`MergeReport::moment_collisions`]); otherwise the move is counted in
 ///   [`MergeReport::merged_moments`].
-/// - A matched cut whose radial geometry differs (radial count or per-radial
-///   azimuth beyond the same tolerance) is NOT merged: moment-grid rows index
+/// - An elevation-matched cut whose radial geometry (radial count or
+///   per-radial azimuth beyond the same tolerance) differs from every
+///   tolerance-matched candidate is NOT merged: moment-grid rows index
 ///   into the cut's radial list, so mixing azimuths would scramble the
 ///   display. Different gate ranges are allowed because every [`MomentGrid`]
 ///   carries its own [`GateRange`] and render/readout code uses the selected
 ///   grid's range. Rejected cuts are counted in [`MergeReport::skipped_geometry`].
 /// - Unmatched cuts are unioned in, and the final cut list is sorted by
 ///   elevation (stable: equal elevations keep first-part-then-arrival
-///   order).
+///   order) with `elevation_number` renumbered `1..=n` (parts carry
+///   per-file sweep numbers, so a merged ladder would otherwise repeat
+///   them).
 ///
 /// Never panics: malformed combinations come back as `Err` or as skip
 /// counters.
@@ -158,18 +165,44 @@ pub fn merge_radar_volumes(parts: Vec<RadarVolume>) -> Result<(RadarVolume, Merg
             base.volume_time = part.volume_time;
         }
         for cut in part.cuts {
-            let matched = base.cuts.iter_mut().find(|existing| {
-                (existing.elevation_deg - cut.elevation_deg).abs()
-                    <= CUT_ELEVATION_MATCH_TOLERANCE_DEG
-            });
-            let Some(existing) = matched else {
-                base.cuts.push(cut);
+            // Scan elevation-matched base cuts in order: JMA 10-minute tars
+            // carry two 5-minute repetitions of a tilt, so when the first
+            // match already holds an incoming moment the next matching cut
+            // is tried before declaring a collision (repetition-2 velocity
+            // must land on the repetition-2 cut, not be silently dropped).
+            let mut elevation_matched = false;
+            let mut target = None;
+            for (index, existing) in base.cuts.iter().enumerate() {
+                if (existing.elevation_deg - cut.elevation_deg).abs()
+                    > CUT_ELEVATION_MATCH_TOLERANCE_DEG
+                {
+                    continue;
+                }
+                elevation_matched = true;
+                if !cut_radials_match(existing, &cut) {
+                    continue;
+                }
+                if target.is_none() {
+                    target = Some(index);
+                }
+                if cut
+                    .moments
+                    .keys()
+                    .all(|moment| !existing.moments.contains_key(moment))
+                {
+                    target = Some(index);
+                    break;
+                }
+            }
+            let Some(index) = target else {
+                if elevation_matched {
+                    report.skipped_geometry += 1;
+                } else {
+                    base.cuts.push(cut);
+                }
                 continue;
             };
-            if !cut_radials_match(existing, &cut) {
-                report.skipped_geometry += 1;
-                continue;
-            }
+            let existing = &mut base.cuts[index];
             merge_radial_metadata(existing, &cut);
             for (moment, grid) in cut.moments {
                 match existing.moments.entry(moment) {
@@ -187,6 +220,12 @@ pub fn merge_radar_volumes(parts: Vec<RadarVolume>) -> Result<(RadarVolume, Merg
 
     base.cuts
         .sort_by(|a, b| a.elevation_deg.total_cmp(&b.elevation_deg));
+    // Parts carry per-file sweep numbers (JMA N5/N6 members each restart at
+    // 1), so renumber the merged ladder to keep tilt numbers unique and
+    // monotonic.
+    for (index, cut) in base.cuts.iter_mut().enumerate() {
+        cut.elevation_number = u8::try_from(index + 1).ok();
+    }
     Ok((base, report))
 }
 
@@ -1263,6 +1302,55 @@ mod tests {
         assert_eq!(report.merged_moments, 2);
         assert_eq!(report.moment_collisions, 0);
         assert_eq!(report.skipped_geometry, 0);
+    }
+
+    #[test]
+    fn merge_jma_repeated_tilts_keep_repetition_velocity_and_renumber() {
+        // JMA 10-minute tars: the reflectivity (N6) and velocity (N5) members
+        // each carry TWO 5-minute repetitions of the low tilt plus tilts the
+        // other member lacks, and each member numbers its own ladder from 1.
+        let mut ref_rep1 = merge_cut(0.5, MomentType::Reflectivity, 1.0);
+        ref_rep1.elevation_number = Some(1);
+        let mut ref_rep2 = merge_cut(0.5, MomentType::Reflectivity, 2.0);
+        ref_rep2.elevation_number = Some(2);
+        let mut ref_high = merge_cut(1.0, MomentType::Reflectivity, 3.0);
+        ref_high.elevation_number = Some(3);
+        let mut vel_rep1 = merge_cut(0.5, MomentType::Velocity, 10.0);
+        vel_rep1.elevation_number = Some(1);
+        let mut vel_rep2 = merge_cut(0.5, MomentType::Velocity, 20.0);
+        vel_rep2.elevation_number = Some(2);
+        let mut vel_only = merge_cut(4.5, MomentType::Velocity, 30.0);
+        vel_only.elevation_number = Some(3);
+        let n6 = merge_volume("RJTD0001", 1_000, vec![ref_rep1, ref_rep2, ref_high]);
+        let n5 = merge_volume("RJTD0001", 1_000, vec![vel_rep1, vel_rep2, vel_only]);
+        let (merged, report) = merge_radar_volumes(vec![n6, n5]).unwrap();
+
+        let elevations: Vec<f32> = merged.cuts.iter().map(|cut| cut.elevation_deg).collect();
+        assert_eq!(elevations, vec![0.5, 0.5, 1.0, 4.5]);
+        let numbers: Vec<Option<u8>> = merged.cuts.iter().map(|cut| cut.elevation_number).collect();
+        assert_eq!(
+            numbers,
+            vec![Some(1), Some(2), Some(3), Some(4)],
+            "merged ladder must be renumbered sequentially"
+        );
+        // Repetition-2 velocity must land on the repetition-2 cut instead of
+        // colliding with repetition-1's and being silently dropped.
+        assert_eq!(merged.cuts[0].moments[&MomentType::Velocity].scale, 10.0);
+        assert_eq!(merged.cuts[1].moments[&MomentType::Velocity].scale, 20.0);
+        assert_eq!(
+            merged.cuts[1].moments[&MomentType::Reflectivity].scale,
+            2.0,
+            "repetition-2 keeps its own reflectivity"
+        );
+        assert!(merged.cuts[3].moments.contains_key(&MomentType::Velocity));
+        assert_eq!(
+            report,
+            MergeReport {
+                merged_moments: 2,
+                skipped_geometry: 0,
+                moment_collisions: 0,
+            }
+        );
     }
 
     #[test]

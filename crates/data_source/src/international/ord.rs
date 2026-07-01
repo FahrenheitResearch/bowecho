@@ -73,6 +73,14 @@ const CYCLE_WINDOW_MINUTES: i64 = 5;
 /// velocity file at or before the reflectivity anchor, bounded so stale
 /// Doppler data cannot silently ride along with newer reflectivity.
 const MIXED_SOURCE_MAX_AGE_MINUTES: i64 = 20;
+/// How much older a complete REF+VEL frame may be and still outrank a
+/// newer reflectivity-only frame. Inside the window the completeness
+/// preference holds, so a cycle whose velocity split is still uploading
+/// (NO lags VRADH a minute; Dublin's PVOL velocity runs 15-minute
+/// cadence) does not flap through a velocity-less frame. Past it the
+/// newer frame wins outright: a velocity-lane outage must advance
+/// `latest` to fresh reflectivity, never pin it to an hours-old pair.
+const COMPLETE_FRAME_MAX_AGE_MINUTES: i64 = 20;
 
 /// How many hourly key prefixes `latest` walks back from now before
 /// declaring a site silent (covers publication lag and short outages
@@ -1420,6 +1428,20 @@ fn ord_candidate_is_better(
     let Some(current) = current else {
         return true;
     };
+    // Completeness outranks freshness only between near-same-time frames
+    // (the same-scan REF-only/REF+VEL flap guard); past the bounded
+    // window the newer frame wins outright, so a velocity-lane outage
+    // advances `latest` to fresh REF-only frames instead of pinning it
+    // to an hours-old complete pair. Reflectivity-bearing frames still
+    // beat velocity-only ones unconditionally: reflectivity is the
+    // primary display product (Dublin's 15-minute VRADH lane must not
+    // shadow its near-hourly reflectivity).
+    if quality_has_reflectivity(candidate.quality) == quality_has_reflectivity(current.quality)
+        && (candidate.stamp - current.stamp).abs()
+            > chrono::Duration::minutes(COMPLETE_FRAME_MAX_AGE_MINUTES)
+    {
+        return candidate.stamp > current.stamp;
+    }
     candidate
         .quality
         .cmp(&current.quality)
@@ -1429,6 +1451,13 @@ fn ord_candidate_is_better(
                 .cmp(&object_kind_tie_rank(current.object_kind)),
         )
         .is_gt()
+}
+
+fn quality_has_reflectivity(quality: OrdPlanQuality) -> bool {
+    matches!(
+        quality,
+        OrdPlanQuality::ReflectivityAndVelocity | OrdPlanQuality::ReflectivityOnly
+    )
 }
 
 fn object_kind_tie_rank(kind: ObjectKind) -> u8 {
@@ -1450,7 +1479,14 @@ fn select_frame_anchor(files: &[OrdFile], kind: ObjectKind) -> Option<NaiveDateT
         if chosen.is_empty() {
             continue;
         }
-        fallback.get_or_insert(anchor);
+        let newest = *fallback.get_or_insert(anchor);
+        // The complete-cycle preference reaches back at most
+        // [`COMPLETE_FRAME_MAX_AGE_MINUTES`] from the newest viable
+        // anchor: during a velocity-lane outage the frame must anchor on
+        // fresh reflectivity instead of an hours-old REF+VEL cycle.
+        if newest - anchor > chrono::Duration::minutes(COMPLETE_FRAME_MAX_AGE_MINUTES) {
+            break;
+        }
         if chosen_has_reflectivity_and_velocity(&chosen) {
             return Some(anchor);
         }
@@ -1867,6 +1903,92 @@ mod tests {
             !ord_candidate_is_better(&scan, Some(&pvol)),
             "a complete PVOL frame should remain preferred over REF-only SCAN"
         );
+    }
+
+    #[test]
+    fn fresh_reflectivity_only_candidate_outranks_hours_old_complete_frame() {
+        // Velocity-lane outage: the newest lookback slot yields DBZH-only
+        // cycles while the last complete DBZH+VRADH pair is three hours
+        // old. Freshness must win — completeness may not pin `latest` to
+        // hours-old data.
+        let elevs = "0.5_1.5_2.5_3.5_5.4_9.1_15.0_23.8";
+        let fresh_keys = vec![format!(
+            "2026/06/13/PL/plleg/PVOL/plleg@20260613T1951@{elevs}@DBZH.h5"
+        )];
+        let stale_keys = vec![
+            format!("2026/06/13/PL/plleg/PVOL/plleg@20260613T1651@{elevs}@DBZH.h5"),
+            format!("2026/06/13/PL/plleg/PVOL/plleg@20260613T1651@{elevs}@VRADH.h5"),
+        ];
+
+        let fresh = plan_candidate_from_keys("plleg", ObjectKind::Pvol, &fresh_keys).unwrap();
+        let stale = plan_candidate_from_keys("plleg", ObjectKind::Pvol, &stale_keys).unwrap();
+
+        assert_eq!(fresh.quality, OrdPlanQuality::ReflectivityOnly);
+        assert_eq!(stale.quality, OrdPlanQuality::ReflectivityAndVelocity);
+        assert!(
+            ord_candidate_is_better(&fresh, Some(&stale)),
+            "fresh REF-only must displace a three-hour-old REF+VEL frame"
+        );
+        assert!(
+            !ord_candidate_is_better(&stale, Some(&fresh)),
+            "an hours-old REF+VEL frame must not displace fresh reflectivity"
+        );
+    }
+
+    #[test]
+    fn same_cycle_still_prefers_the_complete_frame() {
+        // The completeness preference survives inside the flap window: at
+        // the same stamp REF+VEL beats REF-only, and a REF-only anchor one
+        // cycle newer still waits for the complete pair.
+        let elevs = "0.5_1.5_2.5_3.5_5.4_9.1_15.0_23.8";
+        let complete_keys = vec![
+            format!("2026/06/13/PL/plleg/PVOL/plleg@20260613T1651@{elevs}@DBZH.h5"),
+            format!("2026/06/13/PL/plleg/PVOL/plleg@20260613T1651@{elevs}@VRADH.h5"),
+        ];
+        let ref_only_same = vec![format!(
+            "2026/06/13/PL/plleg/PVOL/plleg@20260613T1651@{elevs}@DBZH.h5"
+        )];
+        let ref_only_next = vec![format!(
+            "2026/06/13/PL/plleg/PVOL/plleg@20260613T1656@{elevs}@DBZH.h5"
+        )];
+
+        let complete = plan_candidate_from_keys("plleg", ObjectKind::Pvol, &complete_keys).unwrap();
+        let same = plan_candidate_from_keys("plleg", ObjectKind::Pvol, &ref_only_same).unwrap();
+        let next = plan_candidate_from_keys("plleg", ObjectKind::Pvol, &ref_only_next).unwrap();
+
+        assert!(
+            ord_candidate_is_better(&complete, Some(&same)),
+            "REF+VEL beats REF-only at the same stamp"
+        );
+        assert!(!ord_candidate_is_better(&same, Some(&complete)));
+        assert!(
+            !ord_candidate_is_better(&next, Some(&complete)),
+            "a REF-only anchor one cycle newer must not flap past the complete pair"
+        );
+    }
+
+    #[test]
+    fn velocity_outage_listing_anchors_on_fresh_reflectivity() {
+        // Within one listing the anchor walk's complete-cycle preference
+        // is bounded the same way: DBZH cycles kept publishing after the
+        // VRADH lane stopped, so the frame anchors on the newest
+        // reflectivity, not the 90-minute-old complete pair.
+        let elevs = "0.5_1.5_2.5_3.5_5.4_9.1_15.0_23.8";
+        let keys = vec![
+            format!("2026/06/13/PL/plleg/PVOL/plleg@20260613T1651@{elevs}@DBZH.h5"),
+            format!("2026/06/13/PL/plleg/PVOL/plleg@20260613T1651@{elevs}@VRADH.h5"),
+            format!("2026/06/13/PL/plleg/PVOL/plleg@20260613T1721@{elevs}@DBZH.h5"),
+            format!("2026/06/13/PL/plleg/PVOL/plleg@20260613T1821@{elevs}@DBZH.h5"),
+        ];
+
+        let candidate = plan_candidate_from_keys("plleg", ObjectKind::Pvol, &keys).unwrap();
+
+        assert_eq!(candidate.quality, OrdPlanQuality::ReflectivityOnly);
+        assert_eq!(
+            candidate.stamp,
+            NaiveDateTime::parse_from_str("20260613T1821", "%Y%m%dT%H%M").unwrap()
+        );
+        assert!(candidate.frame.identity.starts_with("plleg_20260613T1821_"));
     }
 
     #[test]

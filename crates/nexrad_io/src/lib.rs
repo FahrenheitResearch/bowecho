@@ -1699,12 +1699,14 @@ fn parse_message_1(
         grid.push_u8_row_slice(radial_index, row)?;
     }
     if let Some(row) = spectrum_width_row {
+        // ICD 2620002 message 1 encodes SW like velocity at 0.5 m/s resolution:
+        // value = (code - 129) / 2, with code 0 below threshold and 1 range folded.
         let grid = legacy_u8_grid(
             cut,
             MomentType::SpectrumWidth,
             doppler_range,
             2.0,
-            2.0,
+            129.0,
             ONE_DEGREE_RADIALS_PER_CUT,
         );
         grid.push_u8_row_slice(radial_index, row)?;
@@ -2358,6 +2360,40 @@ mod tests {
         assert_eq!(velocity.scaled_value(0, 0), Some(0.0));
         assert_eq!(velocity.scaled_value(0, 1), Some(1.0));
         assert_eq!(velocity.scaled_value(0, 2), Some(-1.0));
+    }
+
+    #[test]
+    fn decodes_legacy_message_1_spectrum_width_with_velocity_offset() {
+        let mut body = vec![0u8; 103];
+        body[12..14].copy_from_slice(&3u16.to_be_bytes());
+        body[24..26].copy_from_slice(&250u16.to_be_bytes());
+        body[28..30].copy_from_slice(&3u16.to_be_bytes());
+        body[40..42].copy_from_slice(&100u16.to_be_bytes());
+        body[100..103].copy_from_slice(&[0, 133, 129]);
+        let header = MessageHeader {
+            size_halfwords: ((MESSAGE_HEADER_LEN + body.len()) / 2) as u16,
+            channels: 0,
+            message_type: 1,
+            sequence_id: 1,
+            date: 19_724,
+            milliseconds: 1_000,
+            segments: 1,
+            segment_number: 1,
+        };
+        let mut volume = RadarVolume::new(RadarSite::new("KCRI"), DateTime::<Utc>::UNIX_EPOCH);
+
+        parse_message_1(&body, &header, &mut volume).unwrap();
+
+        assert_eq!(volume.metadata.decoded_radial_count, 1);
+        let spectrum_width = volume.cuts[0]
+            .moments
+            .get(&MomentType::SpectrumWidth)
+            .unwrap();
+        // ICD 2620002: SW = (code - 129) / 2, so code 133 -> 2.0 m/s and code
+        // 129 -> 0.0 m/s. The old offset of 2.0 biased both by +63.5 m/s.
+        assert_eq!(spectrum_width.scaled_value(0, 0), None);
+        assert_eq!(spectrum_width.scaled_value(0, 1), Some(2.0));
+        assert_eq!(spectrum_width.scaled_value(0, 2), Some(0.0));
     }
 
     #[test]

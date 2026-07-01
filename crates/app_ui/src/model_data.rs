@@ -243,8 +243,13 @@ impl ModelDataDock {
             .send(StoreRequest::LoadSounding { hour, fx, fy });
     }
 
-    /// The hour key in the NEWEST run whose valid time is closest to
-    /// `target` — run slugs parse as "YYYYMMDD_HHz", valid = run + fhr.
+    /// The hour key in the NEWEST run COVERING `target` whose valid time
+    /// is closest to it — run slugs parse as "YYYYMMDD_HHz", valid =
+    /// run + fhr. Era guard: a run is only eligible when `target` falls
+    /// inside its plausible forecast coverage (init <= target <= init +
+    /// the model's max forecast horizon), so a mixed archive+live store
+    /// never pins a 2013 event time to today's run — or a live time to
+    /// an archived event's run. Returns None when no run covers `target`.
     /// Returns (key, valid time, run age at `target`).
     ///
     /// `preferred_model` pins the lookup to one model's runs (callers
@@ -261,8 +266,16 @@ impl ModelDataDock {
             Some(slug) => tree.models.iter().find(|entry| entry.model == slug)?,
             None => tree.models.first()?,
         };
-        let run = model.runs.last()?;
-        let run_time = model_run_time_utc(&run.run)?;
+        // Runs are sorted newest first (StoreTree contract), so the first
+        // run covering `target` is the newest eligible one.
+        let (run, run_time) = model.runs.iter().find_map(|run| {
+            let run_time = model_run_time_utc(&run.run)?;
+            let horizon = chrono::Duration::hours(model_max_forecast_horizon_hours(
+                &model.model,
+                chrono::Timelike::hour(&run_time) as u8,
+            ));
+            (run_time <= target && target <= run_time + horizon).then_some((run, run_time))
+        })?;
         let best = run.hours.iter().min_by_key(|hour| {
             (run_time + chrono::Duration::hours(hour.hour as i64) - target)
                 .num_seconds()
@@ -404,6 +417,23 @@ impl ModelDataDock {
     }
 }
 
+/// Max forecast horizon (hours past init) a stored run can plausibly
+/// cover — the last supported forecast hour from the model's ingest spec
+/// (`rustwx_models::supported_forecast_hours`). Unknown store slugs fall
+/// back to the longest built-in horizon (GFS/GEFS, 384 h) so the era
+/// guard still separates archive runs from live ones.
+fn model_max_forecast_horizon_hours(model: &str, cycle_hour_utc: u8) -> i64 {
+    model
+        .parse::<rustwx_core::ModelId>()
+        .ok()
+        .and_then(|id| {
+            rustwx_models::supported_forecast_hours(id, cycle_hour_utc)
+                .last()
+                .copied()
+        })
+        .map_or(384, i64::from)
+}
+
 fn model_run_time_utc(run: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let (date, cycle) = run.split_once('_')?;
     let naive = chrono::NaiveDate::parse_from_str(date, "%Y%m%d").ok()?;
@@ -426,5 +456,106 @@ mod tests {
             Some(chrono::Utc.with_ymd_and_hms(2026, 6, 18, 3, 0, 0).unwrap())
         );
         assert_eq!(model_run_time_utc("bad-run"), None);
+    }
+
+    #[test]
+    fn model_max_forecast_horizon_follows_the_ingest_spec() {
+        assert_eq!(model_max_forecast_horizon_hours("hrrr", 0), 48);
+        assert_eq!(model_max_forecast_horizon_hours("hrrr", 17), 18);
+        assert_eq!(model_max_forecast_horizon_hours("gfs", 12), 384);
+        // Unknown store slugs keep the era guard working via the fallback.
+        assert_eq!(model_max_forecast_horizon_hours("mystery-model", 0), 384);
+    }
+
+    /// StoreTree contract: runs sorted descending (newest first),
+    /// hours ascending — mirrors rw-ui's StoreView::enumerate.
+    fn tree_with_runs(model: &str, runs: &[(&str, &[u16])]) -> StoreTree {
+        StoreTree {
+            models: vec![rw_ui::ModelEntry {
+                model: model.to_owned(),
+                runs: runs
+                    .iter()
+                    .map(|(run, hours)| rw_ui::RunEntry {
+                        run: (*run).to_owned(),
+                        build: "test".to_owned(),
+                        writer_version: "test".to_owned(),
+                        nx: 2,
+                        ny: 2,
+                        hours: hours
+                            .iter()
+                            .map(|&hour| rw_ui::HourEntry {
+                                hour,
+                                file: format!("f{hour:03}.rws"),
+                                variable_count: 1,
+                                written_unix: 0,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            }],
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn era_guard_picks_the_run_covering_the_target_time() {
+        let ctx = egui::Context::default();
+        // Mixed store: today's live run alongside an archived event's run.
+        let dock = ModelDataDock::new_for_test(
+            &ctx,
+            tree_with_runs(
+                "hrrr",
+                &[("20260618_00z", &[0, 1, 2]), ("20130520_18z", &[0, 1, 2])],
+            ),
+        );
+
+        // Archive workflow: a 2013 event time must land in the 2013 run.
+        let event = chrono::Utc.with_ymd_and_hms(2013, 5, 20, 20, 5, 0).unwrap();
+        let (key, valid, run_age) = dock
+            .newest_hour_valid_near(event, Some("hrrr"))
+            .expect("2013 run covers the event time");
+        assert_eq!(key.run, "20130520_18z");
+        assert_eq!(key.hour, 2);
+        assert_eq!(
+            valid,
+            chrono::Utc.with_ymd_and_hms(2013, 5, 20, 20, 0, 0).unwrap()
+        );
+        assert_eq!(run_age, chrono::Duration::minutes(125));
+
+        // Live workflow: a current target must land in the live run, not
+        // the archived one.
+        let live = chrono::Utc.with_ymd_and_hms(2026, 6, 18, 1, 40, 0).unwrap();
+        let (key, _, _) = dock
+            .newest_hour_valid_near(live, Some("hrrr"))
+            .expect("live run covers the live time");
+        assert_eq!(key.run, "20260618_00z");
+        assert_eq!(key.hour, 2);
+
+        // A between-eras target is covered by neither run: never silently
+        // pin a run whose forecast horizon can't reach the target.
+        let uncovered = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        assert_eq!(dock.newest_hour_valid_near(uncovered, Some("hrrr")), None);
+    }
+
+    #[test]
+    fn era_guard_prefers_the_newest_covering_run() {
+        let ctx = egui::Context::default();
+        let dock = ModelDataDock::new_for_test(
+            &ctx,
+            tree_with_runs(
+                "hrrr",
+                &[
+                    ("20260618_00z", &[0, 1]),
+                    ("20260617_18z", &[0, 1, 2, 3, 4, 5, 6, 7]),
+                ],
+            ),
+        );
+        // Both runs cover 00:40z on the 18th; the newest one wins.
+        let target = chrono::Utc.with_ymd_and_hms(2026, 6, 18, 0, 40, 0).unwrap();
+        let (key, _, _) = dock
+            .newest_hour_valid_near(target, Some("hrrr"))
+            .expect("both runs cover the target");
+        assert_eq!(key.run, "20260618_00z");
+        assert_eq!(key.hour, 1);
     }
 }

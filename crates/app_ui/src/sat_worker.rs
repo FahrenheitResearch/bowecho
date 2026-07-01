@@ -21,8 +21,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{Timelike, Utc};
 use eframe::egui::{Color32, ColorImage};
+use rustwx_core::{GridShape, LatLonGrid};
 use rw_sat::composite::GoesAbiRgbCompositeStyle;
 use rw_sat::events::{SatError, SatEvent};
 use rw_sat::fci::{FciChannel, FciValueMode, assemble_fci_chunks};
@@ -41,10 +42,17 @@ use rw_sat::palette::{anchor_color, band_anchors};
 use rw_sat::s3::{
     Sector, bucket_for_satellite, build_agent, download_object, object_filename, object_url,
 };
-use rw_sat::store::{frame_file_name, run_day, selector_band, write_satellite_grid_frame};
+use rw_sat::store::{
+    SatelliteGridField, SatelliteGridScene, SatelliteProjection, WrittenFrame, frame_file_name,
+    run_day, selector_band, write_satellite_grid_frame,
+};
 use rw_sat::window::WindowConfig;
-use rw_store::grid::GridFile;
+use rw_store::format::RwsWriterInfo;
+use rw_store::grid::{GridFile, write_grid};
+use rw_store::lock::RunLock;
 use rw_store::reader::HourReader;
+use rw_store::run::{RwsHourEntry, RwsRunManifest};
+use rw_store::writer::HourWriter;
 use rw_ui::{
     SatDiskUsage, SatFollowSpec, SatFrameImage, SatLayerOption, SatRunKey, SatRunListing,
     SatSatelliteOption, SatSectorOption, StoreView, format_bytes,
@@ -824,6 +832,316 @@ fn download_label(key: &str) -> String {
     }
 }
 
+/// CF `sweep_angle_axis = "y"` scan-angle navigation for JMA AHI scenes.
+///
+/// Himawari HSD navigation is the CGMS normalized geostationary projection
+/// (LRIT/HRIT Global Specification, CGMS 03, Issue 2.6, 1999, §4.4), which
+/// PROJ/satpy express as `+proj=geos +sweep=y`; GOES-R ABI is `sweep=x`
+/// (GOES-R Product Definition and Users' Guide Vol. 3, §5.1.2.8). The two
+/// conventions apply the E-W/N-S gimbal rotations in opposite order, which
+/// moves ground points by ~5-15 km mid-disk and tens of km near the limb.
+/// The pinned rw-sat stamps Himawari scenes with the GOES convention, and
+/// its `SweepAngleAxis::Y` branch swaps the input angles (an image
+/// transpose, thousands of km off) instead of swapping the rotation order,
+/// so AHI meshes are navigated here instead — see the
+/// `rw_sat_sweep_y_branch_is_still_transposed_upstream` tripwire test.
+///
+/// Same ellipsoid-intersection quadratic as the GOES PUG, with the view
+/// vector assembled in sweep=y order (PROJ `geos` inverse, sweep=y branch):
+/// `Vy = tan(x)`, `Vz = tan(y) * hypot(1, Vy)`.
+fn ahi_scan_angles_to_lat_lon(
+    projection: &SatelliteProjection,
+    x_rad: f64,
+    y_rad: f64,
+) -> Option<(f32, f32)> {
+    let h = projection.perspective_point_height_m + projection.semi_major_axis_m;
+    let a = projection.semi_major_axis_m;
+    let b = projection.semi_minor_axis_m;
+    let lon0 = projection.longitude_of_projection_origin_deg;
+    if !h.is_finite() || !lon0.is_finite() || !x_rad.is_finite() || !y_rad.is_finite() {
+        return None;
+    }
+    if h <= 0.0 || a <= 0.0 || b <= 0.0 {
+        return None;
+    }
+
+    // Satellite -> ground view vector (x toward the earth center, y east,
+    // z north), assembled in the sweep=y decomposition cited above.
+    let v_y = x_rad.tan();
+    let v_z = y_rad.tan() * 1.0_f64.hypot(v_y);
+    let eq_to_pol = (a * a) / (b * b);
+
+    let a_var = 1.0 + v_y * v_y + eq_to_pol * v_z * v_z;
+    let b_var = -2.0 * h;
+    let c_var = h * h - a * a;
+    let discriminant = b_var * b_var - 4.0 * a_var * c_var;
+    if discriminant < 0.0 {
+        return None; // looking past the limb
+    }
+
+    let r_s = (-b_var - discriminant.sqrt()) / (2.0 * a_var);
+    if !r_s.is_finite() || r_s <= 0.0 {
+        return None;
+    }
+
+    let s_x = r_s;
+    let s_y = -r_s * v_y;
+    let s_z = r_s * v_z;
+
+    let latitude = (eq_to_pol * (s_z / (h - s_x).hypot(s_y))).atan();
+    let longitude = lon0.to_radians() - (s_y / (h - s_x)).atan();
+    let lat_deg = latitude.to_degrees();
+    let mut lon_deg = (longitude.to_degrees() + 180.0).rem_euclid(360.0) - 180.0;
+    if lon_deg == -180.0 {
+        lon_deg = 180.0;
+    }
+    if !lat_deg.is_finite() || !lon_deg.is_finite() {
+        return None;
+    }
+    Some((lat_deg as f32, lon_deg as f32))
+}
+
+/// `SatelliteGridScene::lat_lon_mesh` with the sweep=y navigation above
+/// (rows outer / columns inner, matching rw-sat's stored value order).
+fn ahi_lat_lon_mesh(scene: &SatelliteGridScene) -> (Vec<f32>, Vec<f32>) {
+    let len = scene.fixed_grid.nx.saturating_mul(scene.fixed_grid.ny);
+    let mut lat = Vec::with_capacity(len);
+    let mut lon = Vec::with_capacity(len);
+    for &y in &scene.fixed_grid.y_scan_rad {
+        for &x in &scene.fixed_grid.x_scan_rad {
+            match ahi_scan_angles_to_lat_lon(&scene.projection, x, y) {
+                Some((lat_value, lon_value)) => {
+                    lat.push(lat_value);
+                    lon.push(lon_value);
+                }
+                None => {
+                    lat.push(f32::NAN);
+                    lon.push(f32::NAN);
+                }
+            }
+        }
+    }
+    (lat, lon)
+}
+
+/// rw-store token sanitizer, byte-for-byte rw-sat's store convention so
+/// Himawari run dirs keep their established names.
+fn sanitize_store_token(value: &str) -> String {
+    let sanitized = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn coords_bit_identical(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+/// The generic `{"satellite": {...}}` frame selector rw-sat writes, except
+/// the projection block says `sweep_angle_axis = "y"` — the convention the
+/// stored mesh is actually navigated with (the HSD assembler stamps the
+/// GOES `"x"` on the scene).
+fn himawari_selector(field: &SatelliteGridField) -> serde_json::Value {
+    let scene = &field.scene;
+    let projection = serde_json::json!({
+        "perspective_point_height_m": scene.projection.perspective_point_height_m,
+        "semi_major_axis_m": scene.projection.semi_major_axis_m,
+        "semi_minor_axis_m": scene.projection.semi_minor_axis_m,
+        "longitude_of_projection_origin_deg":
+            scene.projection.longitude_of_projection_origin_deg,
+        "sweep_angle_axis": "y",
+    });
+    serde_json::json!({
+        "satellite": {
+            "provider": scene.provider,
+            "instrument": scene.instrument,
+            "satellite": scene.satellite,
+            "model": scene.model,
+            "product": scene.product,
+            "sector": scene.sector,
+            "band": scene.band,
+            "layer": scene.layer,
+            "source_variable": scene.source_variable,
+            "scan_start_utc": scene.start_time_utc.to_rfc3339(),
+            "scan_end_utc": scene.end_time_utc.to_rfc3339(),
+            "projection": projection,
+            "metadata": scene.metadata,
+        }
+    })
+}
+
+/// `rw_sat::store::write_satellite_grid_frame` with one change: the
+/// per-pixel lat/lon mesh — the store's geometry of record (the `.rwg`
+/// projection slot is `None`) — comes from the CF sweep=y navigation above.
+/// Everything else follows the documented rw-sat store contract: one
+/// `grid.rwg` per run dir shared by bit-identical grids, `t{HHMM}.rws`
+/// hour frames, a `run.json` manifest, and a fresh suffixed run dir when
+/// the fixed grid changes. Only `ingest_latest_himawari` writes h8/h9
+/// model dirs, so this fork's blast radius is Himawari alone; retire it
+/// for the upstream writer once rw-sat navigates sweep=y correctly (the
+/// tripwire test fires when that happens).
+fn write_himawari_grid_frame(
+    store_root: &Path,
+    field: &SatelliteGridField,
+    written_unix: u64,
+) -> Result<WrittenFrame, String> {
+    let scene = &field.scene;
+    let model = sanitize_store_token(&scene.model);
+    let sector = sanitize_store_token(&scene.sector);
+    let day = scene.start_time_utc.format("%Y%m%d").to_string();
+    let hhmm = (scene.start_time_utc.hour() * 100 + scene.start_time_utc.minute()) as u16;
+    let run_base = format!("{sector}_c{band:02}_{day}", band = scene.band);
+
+    let (nx, ny) = (scene.fixed_grid.nx, scene.fixed_grid.ny);
+    if field.values.len() != nx.saturating_mul(ny) {
+        return Err(format!(
+            "field length {} does not match grid {nx}x{ny}",
+            field.values.len()
+        ));
+    }
+    let (lat, lon) = ahi_lat_lon_mesh(scene);
+    let shape = GridShape::new(nx, ny).map_err(|err| err.to_string())?;
+    let grid = LatLonGrid::new(shape, lat, lon).map_err(|err| err.to_string())?;
+
+    // Reuse the run dir whose stored grid is bit-identical, else take the
+    // first free suffixed name — rw-sat's rule that keeps grid changes
+    // honest (a moved/rescaled grid opens a fresh run dir).
+    let model_dir = store_root.join(&model);
+    let mut candidates: Vec<String> = Vec::new();
+    if model_dir.is_dir() {
+        for entry in std::fs::read_dir(&model_dir).map_err(|err| err.to_string())? {
+            let entry = entry.map_err(|err| err.to_string())?;
+            let is_dir = entry.file_type().map_err(|err| err.to_string())?.is_dir();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if is_dir && (name == run_base || name.starts_with(&format!("{run_base}_"))) {
+                candidates.push(name);
+            }
+        }
+    }
+    candidates.sort();
+    let mut resolved: Option<(String, String)> = None;
+    for name in &candidates {
+        let grid_path = model_dir.join(name).join("grid.rwg");
+        if !grid_path.is_file() {
+            continue;
+        }
+        let existing = GridFile::open(&grid_path).map_err(|err| err.to_string())?;
+        if existing.nx == nx
+            && existing.ny == ny
+            && coords_bit_identical(&existing.lat, &grid.lat_deg)
+            && coords_bit_identical(&existing.lon, &grid.lon_deg)
+        {
+            resolved = Some((name.clone(), existing.hash));
+            break;
+        }
+    }
+    let created_run = resolved.is_none();
+    let (run_name, existing_grid_hash) = match resolved {
+        Some((name, hash)) => (name, Some(hash)),
+        None => {
+            let mut suffix = 1usize;
+            loop {
+                let name = if suffix == 1 {
+                    run_base.clone()
+                } else {
+                    format!("{run_base}_{suffix}")
+                };
+                if !candidates.contains(&name) {
+                    break (name, None);
+                }
+                suffix += 1;
+            }
+        }
+    };
+
+    let run_dir = model_dir.join(&run_name);
+    std::fs::create_dir_all(&run_dir).map_err(|err| err.to_string())?;
+    // Same 60 s frame lock rw-sat's writers hold.
+    let _lock =
+        RunLock::acquire(&run_dir, Duration::from_secs(60)).map_err(|err| err.to_string())?;
+
+    let grid_path = run_dir.join("grid.rwg");
+    let grid_hash = match existing_grid_hash {
+        Some(hash) => hash,
+        None => write_grid(&grid_path, &grid, None).map_err(|err| err.to_string())?,
+    };
+
+    let started = Instant::now();
+    let variable = field.variable_name.clone();
+    let selector = himawari_selector(field);
+    let writer_build = concat!("bowecho app_ui ", env!("CARGO_PKG_VERSION"));
+    let mut writer = HourWriter::new(&model, &run_name, hhmm, nx, ny, &grid_hash, writer_build);
+    writer
+        .add_surface2d(&variable, &field.units, selector, &field.values)
+        .map_err(|err| err.to_string())?;
+    let file_name = frame_file_name(hhmm);
+    let frame_path = run_dir.join(&file_name);
+    writer.finish(&frame_path).map_err(|err| err.to_string())?;
+    let encode_ms = started.elapsed().as_millis() as u64;
+    let bytes = std::fs::metadata(&frame_path)
+        .map_err(|err| err.to_string())?
+        .len();
+
+    let manifest_path = run_dir.join("run.json");
+    let writer_info = RwsWriterInfo {
+        name: "bowecho".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build: writer_build.to_string(),
+    };
+    let mut manifest = RwsRunManifest::load_or_new(
+        &manifest_path,
+        &model,
+        &run_name,
+        &grid_hash,
+        nx,
+        ny,
+        writer_info,
+    )
+    .map_err(|err| err.to_string())?;
+    manifest.register_hour(
+        hhmm,
+        RwsHourEntry {
+            file: file_name,
+            written_unix,
+            encode_ms,
+            variables: vec![variable.clone()],
+        },
+    );
+    manifest
+        .save(&manifest_path)
+        .map_err(|err| err.to_string())?;
+
+    Ok(WrittenFrame {
+        model,
+        run: run_name,
+        hhmm,
+        scan_time_utc: scene.start_time_utc,
+        path: frame_path,
+        bytes,
+        encode_ms,
+        grid_hash,
+        created_run,
+        variable,
+    })
+}
+
 fn ingest_latest_himawari(
     store_root: &Path,
     spec: &HimawariQuickSpec,
@@ -938,9 +1256,11 @@ fn ingest_latest_himawari(
     .map_err(|err| err.to_string())?;
     let nx = field.scene.fixed_grid.nx;
     let ny = field.scene.fixed_grid.ny;
+    // AHI is CF sweep_angle_axis "y": write through the local sweep=y
+    // writer so the stored mesh is real AHI navigation (rw-sat's writer
+    // navigates with the GOES "x" convention; see write_himawari_grid_frame).
     let frame =
-        write_satellite_grid_frame(store_root, &field, Utc::now().timestamp().max(0) as u64)
-            .map_err(|err| err.to_string())?;
+        write_himawari_grid_frame(store_root, &field, Utc::now().timestamp().max(0) as u64)?;
     for id in row_ids {
         send(SatResponse::FrameWritten {
             id,
@@ -1481,7 +1801,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use rw_sat::abi::{AbiFixedGrid, AbiSector, GoesAbiField, GoesAbiScene, GoesImagerProjection};
     use rw_sat::geostationary::SweepAngleAxis;
-    use rw_sat::store::write_band_frame;
+    use rw_sat::store::{read_frame, write_band_frame};
 
     fn spec() -> SatFollowSpec {
         SatFollowSpec::default()
@@ -1671,6 +1991,165 @@ mod tests {
         assert!(
             pixels[5].r() < 40,
             "warm end remains dark for map overlay transparency"
+        );
+    }
+
+    /// The `SatelliteGridField` shape rw-sat's HSD assembler produces for a
+    /// tiny Himawari-9 full-disk cutout. Projection constants follow the
+    /// JMA Himawari Standard Data User's Guide: satellite distance
+    /// 42164 km (height 35785.863 km above the 6378.137 km equator), GRS80
+    /// polar radius 6356.7523 km, sub-lon 140.7E. The assembler stamps the
+    /// GOES sweep axis (X) on the scene — the defect under test.
+    fn synthetic_ahi_field(hour: u32, minute: u32, x_scan_rad: Vec<f64>) -> SatelliteGridField {
+        let start = Utc.with_ymd_and_hms(2026, 6, 10, hour, minute, 0).unwrap();
+        let nx = x_scan_rad.len();
+        SatelliteGridField {
+            scene: SatelliteGridScene {
+                model: "h9".to_string(),
+                satellite: "Himawari-9".to_string(),
+                provider: "jma".to_string(),
+                instrument: "ahi".to_string(),
+                product: "AHI-L1b-FLDK".to_string(),
+                sector: "fulldisk".to_string(),
+                band: 13,
+                layer: "bt_c13".to_string(),
+                source_variable: "HSD count".to_string(),
+                start_time_utc: start,
+                end_time_utc: start + chrono::Duration::seconds(600),
+                projection: SatelliteProjection {
+                    perspective_point_height_m: 35_785_863.0,
+                    semi_major_axis_m: 6_378_137.0,
+                    semi_minor_axis_m: 6_356_752.3,
+                    longitude_of_projection_origin_deg: 140.7,
+                    sweep_angle_axis: SweepAngleAxis::X,
+                },
+                fixed_grid: AbiFixedGrid {
+                    nx,
+                    ny: 2,
+                    x_scan_rad,
+                    y_scan_rad: vec![0.12, 0.0],
+                },
+                metadata: serde_json::json!({"source_format": "himawari_standard_data"}),
+            },
+            variable_name: "ahi_bt_c13".to_string(),
+            units: "K".to_string(),
+            values: (0..nx * 2).map(|i| 210.0 + i as f32).collect(),
+        }
+    }
+
+    /// FIX R6: the stored Himawari mesh must be CF sweep=y navigation.
+    /// Reference points from pyproj 3.7.2 (`+proj=geos +h=35785863
+    /// +a=6378137 +b=6356752.3 +lon_0=140.7`) at scan angles x=0.04 rad,
+    /// y=0.12 rad:
+    ///   sweep=y -> 46.296691N 160.862374E  (JMA AHI convention)
+    ///   sweep=x -> 46.248876N 160.996382E  (GOES convention, ~10 km off —
+    ///                                       what the rw-sat writer bakes)
+    #[test]
+    fn himawari_frames_bake_a_cf_sweep_y_mesh() {
+        let dir = test_dir("ahi-sweep");
+        let field = synthetic_ahi_field(2, 0, vec![0.0, 0.04]);
+        let frame = write_himawari_grid_frame(&dir, &field, 7).expect("frame writes");
+        assert_eq!((frame.model.as_str(), frame.hhmm), ("h9", 200));
+
+        let grid = GridFile::open(&dir.join("h9").join(&frame.run).join("grid.rwg")).unwrap();
+        // Row 0 is y=0.12, so index 1 is (x=0.04, y=0.12).
+        let (lat, lon) = (f64::from(grid.lat[1]), f64::from(grid.lon[1]));
+        assert!(
+            (lat - 46.296691).abs() < 2e-3 && (lon - 160.862374).abs() < 2e-3,
+            "sweep=y reference, got {lat} {lon}"
+        );
+        // Index 2 is the sub-satellite point, identical in both conventions.
+        let (lat0, lon0) = (f64::from(grid.lat[2]), f64::from(grid.lon[2]));
+        assert!(
+            lat0.abs() < 1e-5 && (lon0 - 140.7).abs() < 1e-4,
+            "sub-satellite point, got {lat0} {lon0}"
+        );
+
+        // The stored selector labels the mesh honestly.
+        let stored = read_frame(&dir, &frame.model, &frame.run, frame.hhmm).unwrap();
+        assert_eq!(
+            stored.selector["satellite"]["projection"]["sweep_angle_axis"],
+            "y"
+        );
+
+        // The upstream writer bakes the GOES point for the same field —
+        // the pre-fix behavior this test exists to reject — and the store
+        // contract forks the run dir for the differing mesh.
+        let upstream = write_satellite_grid_frame(&dir, &field, 8).expect("upstream writes");
+        assert_ne!(upstream.run, frame.run, "different mesh -> forked run dir");
+        let old = GridFile::open(&dir.join("h9").join(&upstream.run).join("grid.rwg")).unwrap();
+        let (old_lat, old_lon) = (f64::from(old.lat[1]), f64::from(old.lon[1]));
+        assert!(
+            (old_lat - 46.248876).abs() < 2e-3 && (old_lon - 160.996382).abs() < 2e-3,
+            "rw-sat still navigates sweep=x, got {old_lat} {old_lon}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn himawari_writer_follows_the_store_contract() {
+        let dir = test_dir("ahi-store");
+        let first = write_himawari_grid_frame(&dir, &synthetic_ahi_field(2, 0, vec![0.0, 0.04]), 7)
+            .expect("first frame");
+        assert!(first.created_run);
+        let second =
+            write_himawari_grid_frame(&dir, &synthetic_ahi_field(2, 10, vec![0.0, 0.04]), 8)
+                .expect("second frame joins the run");
+        assert!(!second.created_run);
+        assert_eq!(second.run, first.run);
+        assert_eq!(
+            second.grid_hash, first.grid_hash,
+            "grid written once per run"
+        );
+
+        // A different fixed grid (e.g. another downsample) forks the run.
+        let moved =
+            write_himawari_grid_frame(&dir, &synthetic_ahi_field(2, 20, vec![0.0, 0.05]), 9)
+                .expect("changed grid writes");
+        assert!(moved.created_run);
+        assert_ne!(moved.run, first.run);
+
+        // The app's own reader accepts the frames end-to-end (grid-hash
+        // validation included) and the player sees one run per grid.
+        let runs = scan_runs(&dir);
+        assert_eq!(runs.len(), 2);
+        let mut state = WorkerState::default();
+        let key = SatRunKey {
+            model: first.model.clone(),
+            run: first.run.clone(),
+        };
+        let frame = load_frame(&mut state, &dir, &key, 210).expect("t0210 loads");
+        assert_eq!(frame.image.size, [2, 2]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Documents WHY `write_himawari_grid_frame` exists: the pinned rw-sat
+    /// navigates its `SweepAngleAxis::Y` branch by swapping the scan angles
+    /// (an image transpose), which is not CF sweep=y. When this test starts
+    /// FAILING, upstream rw-sat has fixed sweep=y: switch the Himawari
+    /// ingest back to `rw_sat::store::write_satellite_grid_frame` with the
+    /// scene projection set to `SweepAngleAxis::Y`, and retire the local
+    /// writer plus this tripwire.
+    #[test]
+    fn rw_sat_sweep_y_branch_is_still_transposed_upstream() {
+        use rw_sat::geostationary::scan_angles_to_lat_lon;
+        // Himawari-9: h = 42164 km - 6378.137 km, GRS80, sub-lon 140.7E.
+        let (h, a, b, lon0) = (35_785_863.0, 6_378_137.0, 6_356_752.3, 140.7);
+        let (lat_x, lon_x) =
+            scan_angles_to_lat_lon(h, a, b, lon0, SweepAngleAxis::X, 0.04, 0.12).unwrap();
+        assert!(
+            (f64::from(lat_x) - 46.248876).abs() < 1e-3
+                && (f64::from(lon_x) - 160.996382).abs() < 1e-3,
+            "rw-sat sweep=x no longer matches the GOES reference: {lat_x} {lon_x}"
+        );
+        let (lat_y, lon_y) =
+            scan_angles_to_lat_lon(h, a, b, lon0, SweepAngleAxis::Y, 0.04, 0.12).unwrap();
+        let true_sweep_y = (f64::from(lat_y) - 46.296691).abs() < 1e-3
+            && (f64::from(lon_y) - 160.862374).abs() < 1e-3;
+        assert!(
+            !true_sweep_y,
+            "rw-sat now implements CF sweep=y: retire write_himawari_grid_frame \
+             in favor of write_satellite_grid_frame + SweepAngleAxis::Y"
         );
     }
 

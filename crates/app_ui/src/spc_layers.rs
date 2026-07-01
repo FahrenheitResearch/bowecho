@@ -616,6 +616,15 @@ fn pts_label2(kind: &str, label: &str) -> String {
         "prob" => "Any Severe",
         _ => "Severe",
     };
+    // Same long names SPC's lyr.geojson publishes for these features
+    // (e.g. "10% Significant Tornado Risk", "Wind Conditional Intensity
+    // Group 1 Risk").
+    if label == "SIGN" {
+        return format!("10% Significant {product} Risk");
+    }
+    if let Some(group) = label.strip_prefix("CIG") {
+        return format!("{product} Conditional Intensity Group {group} Risk");
+    }
     let percent = label
         .parse::<f32>()
         .map(|value| format!("{:.0}", value * 100.0))
@@ -626,16 +635,32 @@ fn pts_label2(kind: &str, label: &str) -> String {
 fn pts_colors(kind: &str, label: &str) -> (egui::Color32, egui::Color32) {
     if kind == "cat" {
         categorical_colors(label)
+    } else if is_pts_hatched_label(label) {
+        // SPC's lyr.geojson styles SIGN and CIG areas gray-on-black
+        // (fill #888888, stroke #000000) — the hatched overlay.
+        (hex_color("#888888"), hex_color("#000000"))
     } else {
         probability_colors(label)
     }
+}
+
+/// SIGN (significant severe) and CIG1/CIG2/... (conditional intensity
+/// group) blocks share the probability sections in raw PTS text; each is
+/// its own hatched area, exactly like the SIGN/CIG features SPC's GeoJSON
+/// carries.
+fn is_pts_hatched_label(token: &str) -> bool {
+    token == "SIGN"
+        || token
+            .strip_prefix("CIG")
+            .map(|group| !group.is_empty() && group.chars().all(|ch| ch.is_ascii_digit()))
+            .unwrap_or(false)
 }
 
 fn is_pts_label(kind: &str, token: &str) -> bool {
     if kind == "cat" {
         matches!(token, "TSTM" | "MRGL" | "SLGT" | "ENH" | "MDT" | "HIGH")
     } else {
-        token.contains('.') && token.parse::<f32>().is_ok()
+        is_pts_hatched_label(token) || (token.contains('.') && token.parse::<f32>().is_ok())
     }
 }
 
@@ -727,7 +752,9 @@ fn close_pts_ring(mut ring: Vec<(f32, f32)>) -> Option<Vec<(f32, f32)>> {
 /// Parse raw SPC PTS point blocks. This is the fast live path: PTS products
 /// usually appear before SPC's direct GeoJSON. `99999999` splits separate
 /// rings, and each ring is closed before drawing so the layer can be filled
-/// until the official GeoJSON catches up.
+/// until the official GeoJSON catches up. SIGN and CIG1/CIG2/... tokens
+/// start their own hatched features — never extra rings of the previous
+/// probability contour — matching the GeoJSON representation.
 pub fn parse_pts_outlook(text: &str, kind: &str) -> Vec<OutlookFeature> {
     let Some(section_name) = pts_section_name(kind) else {
         return Vec::new();
@@ -759,7 +786,7 @@ pub fn parse_pts_outlook(text: &str, kind: &str) -> Vec<OutlookFeature> {
             let Some(builder) = builder.as_mut() else {
                 continue;
             };
-            if token == "99999999" || token.starts_with("CIG") {
+            if token == "99999999" {
                 builder.finish_ring();
             } else if let Some(point) = parse_pts_coord(token) {
                 builder.current.push(point);
@@ -1812,6 +1839,60 @@ PROBABILISTIC OUTLOOK POINTS DAY 3\n\
         assert_eq!(parsed[0].label, "0.05");
         assert_eq!(parsed[0].label2, "5% Wind Risk");
         assert_eq!(parsed[1].label, "0.15");
+    }
+
+    #[test]
+    fn raw_pts_sign_and_cig_blocks_become_their_own_features() {
+        // Live PTS products carry CIG1 conditional-intensity blocks (and
+        // older products the SIGN significant-severe block) inline in each
+        // probability section. Every labeled block starts a NEW feature —
+        // hatched areas must never fuse into the last probability contour
+        // (regression: they rendered as phantom rings of the top contour).
+        let sample = "WUUS01 KWNS 012007\n\
+PTSDY1\n\
+\n\
+VALID TIME 012000Z - 021200Z\n\
+\n\
+PROBABILISTIC OUTLOOK POINTS DAY 1\n\
+\n\
+... WIND ...\n\
+\n\
+0.05   30808083 30658239 31178351 30808083\n\
+0.15   36057492 35657601 35387761 36057492\n\
+SIGN   38127401 37457784 36518360 38127401\n\
+CIG1   42381367 43591322 44161215 42381367\n\
+CIG1   37409972 36630011 33460208 37409972\n\
+&&\n";
+
+        let parsed = parse_pts_outlook(sample, "wind");
+        assert_eq!(parsed.len(), 5);
+        // The 15% contour keeps ONLY its own ring.
+        assert_eq!(parsed[1].label, "0.15");
+        assert_eq!(parsed[1].rings.len(), 1);
+        assert_eq!(parsed[1].rings[0].len(), 4);
+        // SIGN and each CIG block land in their own group, styled the way
+        // SPC's lyr.geojson publishes them (gray fill, black stroke).
+        assert_eq!(parsed[2].label, "SIGN");
+        assert_eq!(parsed[2].label2, "10% Significant Wind Risk");
+        assert_eq!(
+            parsed[2].rings,
+            vec![vec![
+                (-74.01, 38.12),
+                (-77.84, 37.45),
+                (-83.60, 36.51),
+                (-74.01, 38.12),
+            ]]
+        );
+        assert_eq!(parsed[2].fill, egui::Color32::from_rgb(0x88, 0x88, 0x88));
+        assert_eq!(parsed[2].stroke, egui::Color32::from_rgb(0x00, 0x00, 0x00));
+        assert_eq!(parsed[3].label, "CIG1");
+        assert_eq!(parsed[3].label2, "Wind Conditional Intensity Group 1 Risk");
+        assert_eq!(parsed[3].rings.len(), 1);
+        // 42381367 sits west of 100W (implied leading "1": 113.67W).
+        assert_eq!(parsed[3].rings[0][0], (-113.67, 42.38));
+        assert_eq!(parsed[4].label, "CIG1");
+        assert_eq!(parsed[4].rings.len(), 1);
+        assert_eq!(parsed[4].rings[0][0], (-99.72, 37.40));
     }
 
     #[test]

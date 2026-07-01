@@ -30,6 +30,12 @@ use std::time::{Duration, Instant};
 /// retention does not mean the UI constantly loads seven days of lightning.
 const STORE_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const DEFAULT_READ_WINDOW: Duration = Duration::from_secs(60 * 60);
+/// Live-mode reads anchor to the wall clock. Snapping the live edge UP to
+/// this quantum keeps the memoized read range stable across repaints (~16 ms
+/// apart), so `pump_for_window` reuses the cached flashes instead of
+/// re-reading the store from disk at repaint rate; ingest events and the
+/// 10 s stale fallback still refresh the live edge promptly.
+const LIVE_READ_QUANTUM: Duration = Duration::from_secs(5);
 /// Manual refresh starts near the live edge instead of downloading the whole
 /// current UTC hour. Normal startup intentionally leaves the acquisition cutoff
 /// unset: the follow engine already processes newest-first, and avoiding a
@@ -220,19 +226,7 @@ impl GlmWorker {
             got_event = true;
         }
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let (mut t0, mut t1) = read_window_ms.unwrap_or_else(|| {
-            (
-                now_ms - (DEFAULT_READ_WINDOW.as_secs() as i64) * 1000,
-                now_ms,
-            )
-        });
-        if t1 < t0 {
-            std::mem::swap(&mut t0, &mut t1);
-        }
-        t1 = t1.min(now_ms);
-        if t1 < t0 {
-            t0 = t1;
-        }
+        let (t0, t1) = requested_read_range_ms(read_window_ms, now_ms);
         let requested_range = Some((t0, t1));
         let range_changed = self.last_read_range_ms != requested_range;
         let stale = self
@@ -273,9 +267,13 @@ impl GlmWorker {
             }
             self.fetched_at = Some(Instant::now());
         }
+        // The health check reads window.json (and may scan the store dir) on
+        // the UI thread, so keep it infrequent: the poisoned-store signature
+        // it repairs only appears after >10 min of drift (REPAIR_SEEN_AHEAD_MS),
+        // so a 60 s cadence loses nothing.
         let health_due = self
             .last_health_check
-            .map(|checked| checked.elapsed() > Duration::from_secs(5))
+            .map(|checked| checked.elapsed() > Duration::from_secs(60))
             .unwrap_or(true);
         if health_due {
             self.last_health_check = Some(Instant::now());
@@ -340,6 +338,33 @@ impl GlmWorker {
             last_read_range_ms,
         }
     }
+}
+
+/// Effective store read range for `pump_for_window`. Explicit loop windows
+/// pass through exactly (so a loop change re-keys the flash memo and forces
+/// an immediate re-read), while live mode derives a `DEFAULT_READ_WINDOW`
+/// range whose end is `now` rounded UP to `LIVE_READ_QUANTUM` — the range,
+/// and the disk read keyed on it, only changes when the window slides
+/// materially, never per repaint. The ceil keeps the true live edge inside
+/// the range, and the store holds no future flashes, so reading a few
+/// seconds past `now` is harmless.
+fn requested_read_range_ms(read_window_ms: Option<(i64, i64)>, now_ms: i64) -> (i64, i64) {
+    let quantum_ms = LIVE_READ_QUANTUM.as_millis() as i64;
+    let live_edge_ms = (now_ms.div_euclid(quantum_ms) + 1) * quantum_ms;
+    let (mut t0, mut t1) = read_window_ms.unwrap_or_else(|| {
+        (
+            live_edge_ms - (DEFAULT_READ_WINDOW.as_secs() as i64) * 1000,
+            live_edge_ms,
+        )
+    });
+    if t1 < t0 {
+        std::mem::swap(&mut t0, &mut t1);
+    }
+    t1 = t1.min(live_edge_ms);
+    if t1 < t0 {
+        t0 = t1;
+    }
+    (t0, t1)
 }
 
 /// Self-heal a poisoned GLM store: if a prior run recorded granule keys in
@@ -619,6 +644,92 @@ mod tests {
 
         assert!(repair_seen_only_manifest(&root, "goes18").is_none());
         assert!(sat_dir.join("window.json").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn glm_live_read_range_reuses_memo_across_repaints() {
+        let quantum_ms = LIVE_READ_QUANTUM.as_millis() as i64;
+        let base = 1_766_188_800_000_i64; // arbitrary UTC instant, quantum-aligned
+        assert_eq!(base % quantum_ms, 0);
+
+        // Two repaints ~16 ms apart inside one quantum must produce the same
+        // memo key, so pump_for_window reuses the cached flashes instead of
+        // re-reading the store from disk.
+        let first = requested_read_range_ms(None, base + 1);
+        let second = requested_read_range_ms(None, base + 17);
+
+        assert_eq!(first, second);
+        assert!(first.1 >= base + 17, "range must cover the live edge");
+        assert_eq!(
+            first.1 - first.0,
+            (DEFAULT_READ_WINDOW.as_secs() as i64) * 1000
+        );
+    }
+
+    #[test]
+    fn glm_live_read_range_advances_only_per_quantum() {
+        let quantum_ms = LIVE_READ_QUANTUM.as_millis() as i64;
+        let base = 1_766_188_800_000_i64;
+
+        let before = requested_read_range_ms(None, base + 1);
+        let after = requested_read_range_ms(None, base + quantum_ms + 1);
+
+        assert_eq!(after.0 - before.0, quantum_ms);
+        assert_eq!(after.1 - before.1, quantum_ms);
+    }
+
+    #[test]
+    fn glm_explicit_read_range_changes_rekey_the_memo() {
+        let now_ms = 1_766_188_800_000_i64;
+
+        // Loop windows pass through exactly (past ranges untouched), so a
+        // loop change invalidates the memo immediately.
+        assert_eq!(
+            requested_read_range_ms(Some((1_000, 2_000)), now_ms),
+            (1_000, 2_000)
+        );
+        assert_eq!(
+            requested_read_range_ms(Some((1_500, 2_500)), now_ms),
+            (1_500, 2_500)
+        );
+        // Reversed windows still normalize, future ends still clamp near live.
+        assert_eq!(
+            requested_read_range_ms(Some((2_000, 1_000)), now_ms),
+            (1_000, 2_000)
+        );
+        let (t0, t1) = requested_read_range_ms(Some((now_ms, now_ms + 3_600_000)), now_ms);
+        assert_eq!(t0, now_ms);
+        assert!(t1 <= now_ms + LIVE_READ_QUANTUM.as_millis() as i64);
+    }
+
+    #[test]
+    fn glm_pump_skips_disk_reread_between_repaints() {
+        let root =
+            std::env::temp_dir().join(format!("bowecho-glm-pump-memo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut worker = GlmWorker::new_for_test("goes19", None);
+        worker.store_root = root.clone();
+
+        worker.pump_for_window(None);
+        let first = worker
+            .last_read_range_ms
+            .expect("first pump records a range");
+        thread::sleep(Duration::from_millis(20)); // one repaint later
+        worker.pump_for_window(None);
+        let second = worker
+            .last_read_range_ms
+            .expect("second pump keeps a range");
+
+        // The memoized live range must be identical (cache reused) or advance
+        // by exactly one quantum if the sleep straddled a boundary — never
+        // slide with the wall clock per repaint.
+        let quantum_ms = LIVE_READ_QUANTUM.as_millis() as i64;
+        assert!(
+            second == first || second == (first.0 + quantum_ms, first.1 + quantum_ms),
+            "live read range slid per-repaint: {first:?} -> {second:?}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }
