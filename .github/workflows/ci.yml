@@ -27,6 +27,17 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
+      # Twice during the v0.22-v0.27 sprint a non-UTF-8-safe edit pipeline
+      # shipped mojibake into user-visible strings (guide, event explorer).
+      # Fail fast if the classic UTF-8-as-cp1252 byte sequences reappear.
+      - name: Mojibake guard
+        shell: bash
+        run: |
+          if git grep -nI -e 'â€' -e 'Â·' -e 'Â°' -e 'Ã©' -- 'crates/**' 'docs/**' 'README.md'; then
+            echo '::error::Mojibake byte sequences found - a file was edited with a non-UTF-8 tool.'
+            exit 1
+          fi
+
       - name: Test
         run: cargo test --workspace --all-targets
 

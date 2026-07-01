@@ -94,6 +94,18 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      # Fat LTO links the whole app in one LLVM pass; the hosted Windows
+      # runner's default commit limit is what OOM'd the v0.27.1 build and
+      # forced the thin-LTO downgrade. A larger pagefile lets the linker
+      # spill instead of dying, so shipped binaries keep full optimization.
+      - name: Expand Windows pagefile for fat-LTO link
+        if: runner.os == 'Windows'
+        uses: al-cheb/configure-pagefile-action@v1.4
+        with:
+          minimum-size: 16GB
+          maximum-size: 32GB
+          disk-root: "C:"
+
       - name: Build release binary
         run: cargo build --release -p app_ui --bin bowecho
 

@@ -28,15 +28,19 @@ tiff = "0.11.3"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [profile.release]
-lto = "thin"
-codegen-units = 16
+lto = "fat"
+codegen-units = 1
 strip = true
 # panic = "abort" is intentionally NOT set: app_ui isolates worker panics
 # with catch_unwind / thread joins, and abort would turn those contained
 # failures into full app crashes.
-# Thin LTO avoids rustc/LLVM out-of-memory failures on the large Windows app
-# link while keeping optimized release builds reproducible in CI.
+# Fat LTO / 1 CGU is the shipping profile: ~17% smaller binary and best
+# hot-loop codegen. The v0.27.1 thin-LTO downgrade worked around an
+# LLVM link OOM on the CI Windows runner; the release workflow now bumps
+# the runner pagefile instead so shipped binaries keep full optimization.
 
+# Local iteration profile only (never ships): thin LTO + incremental
+# brings the exe rebuild from ~10 min down to ~2 min on this codebase.
 [profile.release-fast]
 inherits = "release"
 lto = "thin"
