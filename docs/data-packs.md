@@ -25,11 +25,10 @@ the view, and starts the loop without manual archive hunting.
 4. For time-window packs, BowEcho lists every UTC date touched by the event
    window, parses Level II object times, and selects the padded/capped frame
    range with `data_source::level2_objects_for_window`.
-5. The selected objects decode into history frames.
-6. `timeline::plan_archive_window` builds the master frame list.
-7. If low-tilt mode is enabled, decoded cuts become low-level timeline frames
-   with `timeline::low_tilt_frames_for_volume`.
-8. BowEcho pauses live polling, applies the layout/view/overlays, selects the
+5. The selected objects decode into history frames (oldest first), which
+   are the master frame list; low-tilt mode filters playback to the
+   allowed low cuts inside the existing loop player.
+6. BowEcho pauses live polling, applies the layout/view/overlays, selects the
    requested frame, and starts playback when requested.
 
 ## Built-In V1 Packs

@@ -18,7 +18,7 @@
 use chrono::{Datelike, Days, NaiveDate, Utc};
 
 use super::{
-    FramePlan, IntlProvider, IntlSite, PlanPart, SiteCache, fetch_s3_style_listing,
+    FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames, SiteCache, fetch_s3_style_listing,
     s3_style_listing_url,
 };
 
@@ -123,7 +123,28 @@ impl IntlProvider for FmiProvider {
         ))
     }
 
-    fn recent(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
+    fn recent_source(&self) -> Option<&dyn RecentFrames> {
+        Some(self)
+    }
+
+    fn static_sites(&self) -> Vec<IntlSite> {
+        FMI_SITES
+            .iter()
+            .filter(|&&(.., active)| active)
+            .map(|&(code, label, latitude_deg, longitude_deg, _)| IntlSite {
+                provider_id: self.id(),
+                site_id: code.to_owned(),
+                label: label.to_owned(),
+                country: self.country(),
+                latitude_deg: Some(latitude_deg),
+                longitude_deg: Some(longitude_deg),
+            })
+            .collect()
+    }
+}
+
+impl RecentFrames for FmiProvider {
+    fn recent_frames(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
         validate_site_code(site_id)?;
         let count = count.max(1);
         // Oldest listed day first so the combined key list stays
@@ -157,21 +178,6 @@ impl IntlProvider for FmiProvider {
                 merge: false,
             })
             .collect())
-    }
-
-    fn static_sites(&self) -> Vec<IntlSite> {
-        FMI_SITES
-            .iter()
-            .filter(|&&(.., active)| active)
-            .map(|&(code, label, latitude_deg, longitude_deg, _)| IntlSite {
-                provider_id: self.id(),
-                site_id: code.to_owned(),
-                label: label.to_owned(),
-                country: self.country(),
-                latitude_deg: Some(latitude_deg),
-                longitude_deg: Some(longitude_deg),
-            })
-            .collect()
     }
 }
 

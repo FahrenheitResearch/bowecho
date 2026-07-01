@@ -133,8 +133,6 @@ pub struct AppSettings {
     pub favorites: Vec<String>,
     /// Live auto-refresh poll interval (seconds).
     pub polling_interval_seconds: u64,
-    /// Number of saved pane-layout slots.
-    pub saved_layout_slots: usize,
     /// Selected color table per family label (family.label() -> table name).
     /// Resolved on startup against built-ins ∪ user tables; a missing name
     /// (deleted .pal) falls back to the family default.
@@ -620,7 +618,6 @@ impl Default for AppSettings {
             startup_site: None,
             favorites: Vec::new(),
             polling_interval_seconds: 60,
-            saved_layout_slots: 8,
             palette_by_family: BTreeMap::new(),
             palette_by_product: BTreeMap::new(),
             style_profile: default_style_profile(),
@@ -1175,11 +1172,6 @@ mod tests {
     }
 
     #[test]
-    fn default_has_eight_layout_slots() {
-        assert_eq!(AppSettings::default().saved_layout_slots, 8);
-    }
-
-    #[test]
     fn screenshots_dir_prefers_override_then_pictures() {
         assert_eq!(
             screenshots_dir_from(
@@ -1595,10 +1587,13 @@ mod tests {
 
     #[test]
     fn unknown_or_missing_fields_fall_back_to_default() {
-        let s = AppSettings::from_json(r#"{ "startup_site": "KDMX", "bogus": 1 }"#);
+        // "saved_layout_slots" is a removed legacy key: old configs that
+        // still carry it must keep loading.
+        let s = AppSettings::from_json(
+            r#"{ "startup_site": "KDMX", "saved_layout_slots": 8, "bogus": 1 }"#,
+        );
         assert_eq!(s.startup_site.as_deref(), Some("KDMX"));
         assert_eq!(s.polling_interval_seconds, 60);
-        assert_eq!(s.saved_layout_slots, 8);
     }
 
     #[test]

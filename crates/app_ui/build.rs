@@ -91,42 +91,10 @@ fn main() {
         let icon = configured_icon(&default_icon);
         println!("cargo:rerun-if-changed={}", icon.display());
 
-        let preset = std::env::var("BOWECHO_DEFAULT_BRAND")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        let cwt = matches!(
-            preset.as_str(),
-            "cwt" | "california_wildfire_tracking" | "california-wildfire-tracking"
-        );
-        let display_name = env_or(
-            "BOWECHO_BRAND_DISPLAY_NAME",
-            if cwt {
-                "California Wildfire Tracking"
-            } else {
-                "BowEcho"
-            },
-        );
-        let short_name = env_or(
-            "BOWECHO_BRAND_SHORT_NAME",
-            if cwt { "CWT" } else { "BowEcho" },
-        );
-        let organization = env_or(
-            "BOWECHO_BRAND_ORGANIZATION",
-            if cwt {
-                "Community Wildfire Tracker"
-            } else {
-                "Fahrenheit Research"
-            },
-        );
-        let tagline = env_or(
-            "BOWECHO_BRAND_TAGLINE",
-            if cwt {
-                "Stay Informed. Stay Prepared. Stay Safe."
-            } else {
-                "fast NEXRAD Level II radar viewer"
-            },
-        );
+        let display_name = env_or("BOWECHO_BRAND_DISPLAY_NAME", "BowEcho");
+        let short_name = env_or("BOWECHO_BRAND_SHORT_NAME", "BowEcho");
+        let organization = env_or("BOWECHO_BRAND_ORGANIZATION", "Fahrenheit Research");
+        let tagline = env_or("BOWECHO_BRAND_TAGLINE", "fast NEXRAD Level II radar viewer");
         let exe_name = env_or("BOWECHO_EXE_NAME", "bowecho.exe");
         let internal_name = env_or("BOWECHO_INTERNAL_NAME", "bowecho");
         let copyright = env_or(

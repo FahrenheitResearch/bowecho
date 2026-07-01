@@ -55,9 +55,6 @@ pub(crate) struct EventExplorerState {
     fetch: Option<(NaiveDate, mpsc::Receiver<Result<EventDayData, String>>)>,
     /// Last transport failure, rate-limiting retries.
     failed: Option<(NaiveDate, Instant)>,
-    /// Track click armed an archive-listing load of this UTC window;
-    /// consumed when the listing lands.
-    pub pending_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
     /// One-shot: start the history loop when the range load installs.
     pub pending_autoplay: bool,
     /// Optional camera target for a clicked tornado track. Playback uses
@@ -258,8 +255,7 @@ pub(crate) fn event_jump_eligible_sites(
         .iter()
         .enumerate()
         .filter_map(|(index, site)| {
-            if site.level2_id.starts_with('T') || !crate::site_is_primary_level2_catalog_site(site)
-            {
+            if crate::site_is_tdwr(site) || !crate::site_is_primary_level2_catalog_site(site) {
                 return None;
             }
             let (lat, lon) = crate::site_location(site)?;
@@ -304,82 +300,6 @@ pub(crate) fn estimated_track_end_time(begin: DateTime<Utc>, length_mi: f32) -> 
         0
     };
     begin + ChronoDuration::minutes(minutes)
-}
-
-/// "HH:MM:SS" display/sort label for an archive object key
-/// (KXXX20260609_235423_V06 -> "23:54:23"), the same convention the
-/// archive listing builds — labels sort chronologically within a date.
-#[cfg(test)]
-pub(crate) fn volume_time_label(key: &str) -> String {
-    key.rsplit('/')
-        .next()
-        .and_then(|name| name.split('_').nth(1))
-        .filter(|t| t.len() == 6 && t.bytes().all(|b| b.is_ascii_digit()))
-        .map(|t| format!("{}:{}:{}", &t[0..2], &t[2..4], &t[4..6]))
-        .unwrap_or_else(|| "??".to_owned())
-}
-
-/// Index of the volume scanning at `target_label` — the LAST volume at
-/// or before it, or the first when the target precedes the day's first
-/// scan (the `archive_pending_event` rule, extracted).
-pub(crate) fn nearest_volume_index(labels: &[String], target_label: &str) -> Option<usize> {
-    if labels.is_empty() {
-        return None;
-    }
-    Some(
-        labels
-            .iter()
-            .position(|label| label.as_str() > target_label)
-            .unwrap_or(labels.len())
-            .saturating_sub(1),
-    )
-}
-
-/// The volume range covering a [start, end] window: from the volume
-/// scanning at the window start through the last volume inside it, plus
-/// `pad` scans of context each side (clamped to the day's listing — the
-/// user-set frames-before-touchdown/after-lift, default 5), capped at
-/// `cap` frames by advancing the start (keep the track's end — matches
-/// how the frame history trims oldest-first).
-pub(crate) fn range_volume_indices(
-    labels: &[String],
-    start_label: &str,
-    end_label: &str,
-    pad: usize,
-    cap: usize,
-) -> Option<(usize, usize)> {
-    if cap == 0 {
-        return None;
-    }
-    let end = nearest_volume_index(labels, end_label)?;
-    let start = nearest_volume_index(labels, start_label)?.min(end);
-    let mut start = start.saturating_sub(pad);
-    let end = (end + pad).min(labels.len().saturating_sub(1));
-    if end + 1 - start > cap {
-        start = end + 1 - cap;
-    }
-    Some((start, end))
-}
-
-/// Clamp a UTC window to one listed archive date's "HH:MM:SS" label
-/// space (the listing is per-date; a window edge on another calendar day
-/// clamps to that date's boundary).
-pub(crate) fn window_labels_for_date(
-    listed: NaiveDate,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-) -> (String, String) {
-    let start_label = if start.date_naive() < listed {
-        "00:00:00".to_owned()
-    } else {
-        start.format("%H:%M:%S").to_string()
-    };
-    let end_label = if end.date_naive() > listed {
-        "23:59:59".to_owned()
-    } else {
-        end.format("%H:%M:%S").to_string()
-    };
-    (start_label, end_label)
 }
 
 impl crate::ViewerApp {
@@ -1260,105 +1180,5 @@ mod tests {
         assert_eq!(request.anchor_utc, touchdown);
         assert_eq!(request.extra_start_scans, 5);
         assert_eq!(request.extra_end_scans, 6);
-    }
-
-    fn labels(times: &[&str]) -> Vec<String> {
-        times.iter().map(|t| (*t).to_owned()).collect()
-    }
-
-    #[test]
-    fn nearest_volume_index_picks_the_scan_covering_the_target() {
-        let list = labels(&["20:00:10", "20:05:40", "20:11:05"]);
-        // Exactly at, between, before-first, after-last.
-        assert_eq!(nearest_volume_index(&list, "20:05:40"), Some(1));
-        assert_eq!(nearest_volume_index(&list, "20:08:00"), Some(1));
-        assert_eq!(nearest_volume_index(&list, "19:00:00"), Some(0));
-        assert_eq!(nearest_volume_index(&list, "23:59:59"), Some(2));
-        assert_eq!(nearest_volume_index(&[], "20:00:00"), None);
-    }
-
-    #[test]
-    fn range_volume_indices_cover_the_window_and_cap_keeps_the_end() {
-        let list = labels(&[
-            "20:00:00", "20:05:00", "20:10:00", "20:15:00", "20:20:00", "20:25:00",
-        ]);
-        // Window 20:07–20:18: the volume scanning at the start (20:05)
-        // through the last inside (20:15).
-        assert_eq!(
-            range_volume_indices(&list, "20:07:00", "20:18:00", 0, 200),
-            Some((1, 3))
-        );
-        // Window edges off both ends of the day clamp to the listing.
-        assert_eq!(
-            range_volume_indices(&list, "00:00:00", "23:59:59", 0, 200),
-            Some((0, 5))
-        );
-        // Cap trims the START (keep the track's end).
-        assert_eq!(
-            range_volume_indices(&list, "00:00:00", "23:59:59", 0, 3),
-            Some((3, 5))
-        );
-        // Inverted/degenerate window collapses to one volume.
-        assert_eq!(
-            range_volume_indices(&list, "20:18:00", "20:07:00", 0, 200),
-            Some((1, 1))
-        );
-        assert_eq!(
-            range_volume_indices(&list, "20:07:00", "20:18:00", 0, 0),
-            None
-        );
-        assert_eq!(
-            range_volume_indices(&[], "20:07:00", "20:18:00", 0, 5),
-            None
-        );
-    }
-
-    #[test]
-    fn range_volume_indices_pad_extends_each_side_and_clamps() {
-        let list = labels(&[
-            "20:00:00", "20:05:00", "20:10:00", "20:15:00", "20:20:00", "20:25:00",
-        ]);
-        // Bare window covers (1..=3); one scan of context each side.
-        assert_eq!(
-            range_volume_indices(&list, "20:07:00", "20:18:00", 1, 200),
-            Some((0, 4))
-        );
-        // Pad clamps to the day's listing at both edges.
-        assert_eq!(
-            range_volume_indices(&list, "20:07:00", "20:18:00", 50, 200),
-            Some((0, 5))
-        );
-        // Cap still trims the padded START (keep the track's end).
-        assert_eq!(
-            range_volume_indices(&list, "20:07:00", "20:18:00", 50, 3),
-            Some((3, 5))
-        );
-    }
-
-    #[test]
-    fn window_labels_clamp_to_the_listed_date() {
-        let listed = NaiveDate::from_ymd_opt(2026, 6, 11).unwrap();
-        let start = Utc.with_ymd_and_hms(2026, 6, 11, 22, 50, 0).unwrap();
-        let end = Utc.with_ymd_and_hms(2026, 6, 12, 0, 20, 0).unwrap();
-        // End spills past midnight: clamp to the date's last second.
-        assert_eq!(
-            window_labels_for_date(listed, start, end),
-            ("22:50:00".to_owned(), "23:59:59".to_owned())
-        );
-        // Start on the previous date clamps to 00:00:00.
-        let listed_next = NaiveDate::from_ymd_opt(2026, 6, 12).unwrap();
-        assert_eq!(
-            window_labels_for_date(listed_next, start, end),
-            ("00:00:00".to_owned(), "00:20:00".to_owned())
-        );
-    }
-
-    #[test]
-    fn volume_label_parses_archive_keys() {
-        assert_eq!(
-            volume_time_label("2026/06/09/KEAX/KEAX20260609_235423_V06"),
-            "23:54:23"
-        );
-        assert_eq!(volume_time_label("garbage"), "??");
     }
 }

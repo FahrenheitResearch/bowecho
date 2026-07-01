@@ -14,7 +14,7 @@ use chrono::{DateTime, Days, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{FramePlan, IntlProvider, IntlSite, PlanPart, SiteCache};
+use super::{FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames, SiteCache};
 
 const QUERY_URL: &str = "https://avaandmed.keskkonnaportaal.ee/api/lists/active/items/query";
 const FILE_BASE: &str = "https://avaandmed.keskkonnaportaal.ee/api/lists/active";
@@ -91,17 +91,23 @@ impl IntlProvider for KaiaEstoniaProvider {
             .ok_or_else(|| format!("KAIA returned no VOL files for {site_id}"))
     }
 
-    fn recent(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
+    fn recent_source(&self) -> Option<&dyn RecentFrames> {
+        Some(self)
+    }
+
+    fn static_sites(&self) -> Vec<IntlSite> {
+        static_sites(self.id(), self.country())
+    }
+}
+
+impl RecentFrames for KaiaEstoniaProvider {
+    fn recent_frames(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
         let site = kaia_site(site_id)?;
         let since = Utc::now()
             .checked_sub_days(Days::new(LOOKBACK_DAYS))
             .unwrap_or_else(Utc::now);
         let entries = query_recent_entries(site, since)?;
         entries_to_plans(site, entries, count.max(1))
-    }
-
-    fn static_sites(&self) -> Vec<IntlSite> {
-        static_sites(self.id(), self.country())
     }
 }
 

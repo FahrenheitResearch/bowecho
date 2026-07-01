@@ -56,7 +56,7 @@ use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
 
 use super::listing::fnv1a64;
 use super::{
-    FramePlan, IntlProvider, IntlSite, PlanPart, SiteCache, fetch_s3_style_listing,
+    FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames, SiteCache, fetch_s3_style_listing,
     s3_style_listing_url,
 };
 
@@ -522,7 +522,33 @@ impl IntlProvider for OrdProvider {
         ))
     }
 
-    fn recent(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
+    fn recent_source(&self) -> Option<&dyn RecentFrames> {
+        Some(self)
+    }
+
+    fn static_sites(&self) -> Vec<IntlSite> {
+        ORD_SITES
+            .iter()
+            .filter_map(|&(code, label, latitude_deg, longitude_deg, _)| {
+                if site_superseded_by_native_provider(code) {
+                    return None;
+                }
+                let (_, _, country) = country_for_live_code(code)?;
+                Some(IntlSite {
+                    provider_id: self.id(),
+                    site_id: code.to_owned(),
+                    label: format!("{label} ({country})"),
+                    country,
+                    latitude_deg: Some(latitude_deg),
+                    longitude_deg: Some(longitude_deg),
+                })
+            })
+            .collect()
+    }
+}
+
+impl RecentFrames for OrdProvider {
+    fn recent_frames(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -605,26 +631,6 @@ impl IntlProvider for OrdProvider {
             .unwrap_or_else(|| {
                 format!("ORD: no recent files for site '{site_id}' in the 24-hour cache")
             }))
-    }
-
-    fn static_sites(&self) -> Vec<IntlSite> {
-        ORD_SITES
-            .iter()
-            .filter_map(|&(code, label, latitude_deg, longitude_deg, _)| {
-                if site_superseded_by_native_provider(code) {
-                    return None;
-                }
-                let (_, _, country) = country_for_live_code(code)?;
-                Some(IntlSite {
-                    provider_id: self.id(),
-                    site_id: code.to_owned(),
-                    label: format!("{label} ({country})"),
-                    country,
-                    latitude_deg: Some(latitude_deg),
-                    longitude_deg: Some(longitude_deg),
-                })
-            })
-            .collect()
     }
 }
 

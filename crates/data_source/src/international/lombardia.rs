@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::listing::{fnv1a64, join_url, parse_autoindex};
-use super::{FramePlan, IntlProvider, IntlSite, PlanPart};
+use super::{FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames};
 use crate::fetch_text;
 
 const ROOT: &str = "https://radarlive.arpalombardia.it/Volumi/";
@@ -86,15 +86,8 @@ impl IntlProvider for LombardiaProvider {
         frame_plan(site, &files, &stamp)
     }
 
-    fn recent(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
-        let site = lombardia_site(site_id)?;
-        let files = lombardia_product_files(site)?;
-        let mut stamps = common_stamps(&files);
-        let keep = count.max(1).min(stamps.len());
-        stamps
-            .drain(stamps.len().saturating_sub(keep)..)
-            .map(|stamp| frame_plan(site, &files, &stamp))
-            .collect::<Result<Vec<_>, _>>()
+    fn recent_source(&self) -> Option<&dyn RecentFrames> {
+        Some(self)
     }
 
     fn static_sites(&self) -> Vec<IntlSite> {
@@ -109,6 +102,19 @@ impl IntlProvider for LombardiaProvider {
                 longitude_deg: Some(site.longitude_deg),
             })
             .collect()
+    }
+}
+
+impl RecentFrames for LombardiaProvider {
+    fn recent_frames(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
+        let site = lombardia_site(site_id)?;
+        let files = lombardia_product_files(site)?;
+        let mut stamps = common_stamps(&files);
+        let keep = count.max(1).min(stamps.len());
+        stamps
+            .drain(stamps.len().saturating_sub(keep)..)
+            .map(|stamp| frame_plan(site, &files, &stamp))
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 

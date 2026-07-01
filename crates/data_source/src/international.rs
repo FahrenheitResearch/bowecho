@@ -132,6 +132,17 @@ pub struct FramePlan {
     pub merge: bool,
 }
 
+/// Rolling multi-frame `recent` support, for providers whose upstream
+/// catalog exposes more than the newest frame. Implemented on the provider
+/// type and handed back through [`IntlProvider::recent_source`], which is
+/// what routes [`IntlProvider::recent`] here and drives the derived
+/// [`IntlProvider::supports_recent`] capability.
+pub trait RecentFrames {
+    /// Same contract as [`IntlProvider::recent`]: up to `count` frames,
+    /// OLDEST FIRST, catalog probes only — never volume downloads.
+    fn recent_frames(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String>;
+}
+
 /// A national/agency radar feed adapter.
 ///
 /// Implementations must be cheap to construct and safe to share across the
@@ -167,13 +178,33 @@ pub trait IntlProvider: Send + Sync {
     /// (install order — the newest frame is last, and its identity is what
     /// the live poll dedupes against). Same cheapness contract as
     /// [`Self::latest`]: list/inspect the catalog, never download volume
-    /// bytes. Providers whose catalogs only expose the newest frame keep
-    /// this default (a one-frame "loop"); providers with a rolling archive
-    /// override it so the app's Load Loop works on international feeds the
-    /// way it does on US ones (field request).
+    /// bytes. Provided — never override: providers whose catalogs only
+    /// expose the newest frame inherit a one-frame "loop", and providers
+    /// with a rolling archive implement [`RecentFrames`] and hand it back
+    /// from [`Self::recent_source`] so the app's Load Loop works on
+    /// international feeds the way it does on US ones (field request).
     fn recent(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
-        let _ = count;
-        Ok(vec![self.latest(site_id)?])
+        match self.recent_source() {
+            Some(source) => source.recent_frames(site_id, count),
+            None => Ok(vec![self.latest(site_id)?]),
+        }
+    }
+
+    /// The provider's rolling-window loop implementation, when its upstream
+    /// catalog exposes more than the newest frame. THE single override
+    /// point for multi-frame Load Loop support: implement [`RecentFrames`]
+    /// on the provider type and return `Some(self)` here. Both
+    /// [`Self::recent`] and the derived [`Self::supports_recent`]
+    /// capability route through this method, so a provider cannot gain a
+    /// real loop without advertising it (nor advertise one it lacks).
+    fn recent_source(&self) -> Option<&dyn RecentFrames> {
+        None
+    }
+
+    /// Whether [`Self::recent`] returns a real multi-frame window. Derived
+    /// from [`Self::recent_source`] — never override.
+    fn supports_recent(&self) -> bool {
+        self.recent_source().is_some()
     }
 
     /// The provider's EMBEDDED site catalog: every currently operational
@@ -244,6 +275,9 @@ pub struct IntlProviderCapability {
     pub country: &'static str,
     pub visible_sites: usize,
     pub live: bool,
+    /// Derived from [`IntlProvider::supports_recent`] — `true` iff the
+    /// provider implements a real multi-frame [`IntlProvider::recent`]
+    /// (never hand-maintained, so it cannot go stale against the code).
     pub recent_loop: bool,
     pub archive_lookup: bool,
     pub current_window: &'static str,
@@ -259,134 +293,114 @@ pub fn intl_provider_capabilities() -> Vec<IntlProviderCapability> {
         .into_iter()
         .map(|provider| {
             let visible_sites = provider.static_sites().len();
-            let (
-                recent_loop,
-                archive_lookup,
-                current_window,
-                upstream_window,
-                bowecho_status,
-                next_unlock,
-            ) = match provider.id() {
-                "smhi" => (
-                    true,
-                    false,
-                    "dated tree, newest N frames",
-                    "year/month/day qcvol tree; observed 2025-2026 by site",
-                    "expanded: Load Loop walks the dated tree",
-                    "add arbitrary date/window picker",
-                ),
-                "fmi" => (
-                    true,
-                    false,
-                    "today + yesterday",
-                    "public ODIM HDF5 archive, roughly 2007-present",
-                    "recent loop only",
-                    "walk historical date prefixes",
-                ),
-                "australia-nci" => (
-                    true,
-                    true,
-                    "latest archived tarlist",
-                    "NCI rq0 ODIM HDF5 archive; daily tarlists and direct zip-member reads",
-                    "recent/archive loop from per-frame HDF5 members",
-                    "add date/window picker for deep historical events",
-                ),
-                "dmi" => (
-                    false,
-                    false,
-                    "latest only",
-                    "STAC date ranges with pagination",
-                    "latest frame only",
-                    "use STAC date-range queries",
-                ),
-                "geosphere" => (
-                    false,
-                    false,
-                    "latest only",
-                    "rolling ~3 days",
-                    "latest frame only",
-                    "list recent objects by prefix",
-                ),
-                "dwd" => (
-                    false,
-                    false,
-                    "latest only",
-                    "rolling ~2 days",
-                    "latest frame only",
-                    "walk timestamped sweep files",
-                ),
-                "shmu" => (
-                    false,
-                    false,
-                    "latest only",
-                    "observed rolling ~1 month",
-                    "latest frame only",
-                    "list dated directories",
-                ),
-                "chmi" => (
-                    false,
-                    false,
-                    "latest only",
-                    "observed rolling ~89 hours",
-                    "latest frame only",
-                    "list recent ODIM volume files",
-                ),
-                "arpa-piemonte" => (
-                    true,
-                    false,
-                    "last hour",
-                    "rolling last hour of OPERA HDF5 volumes",
-                    "real in-app recent loop",
-                    "add historical/event access if ARPA exposes it",
-                ),
-                "arpa-lombardia" => (
-                    true,
-                    false,
-                    "rolling live window",
-                    "gzip-wrapped ODIM HDF5 product volumes",
-                    "real in-app recent loop",
-                    "add historical/event access if ARPA exposes it",
-                ),
-                "kaia" => (
-                    true,
-                    false,
-                    "14 days",
-                    "historical repository likely deeper, not guaranteed",
-                    "real in-app recent archive",
-                    "probe longer retention",
-                ),
-                "ord" => (
-                    true,
-                    true,
-                    "rolling 24h + per-site archive lookup",
-                    "ORD single-site archive is partial/opportunistic; OPERA composites separate",
-                    "recent loop and date/hour lookup",
-                    "cache per-site coverage probes",
-                ),
-                "jma" => (
-                    false,
-                    false,
-                    "latest only",
-                    "NICT mirror recent operational tars",
-                    "latest frame only",
-                    "add tar directory scan if needed",
-                ),
-                _ => (
-                    false,
-                    false,
-                    "latest only",
-                    "unknown",
-                    "latest frame only",
-                    "provider-specific probe",
-                ),
-            };
+            let (archive_lookup, current_window, upstream_window, bowecho_status, next_unlock) =
+                match provider.id() {
+                    "smhi" => (
+                        false,
+                        "dated tree, newest N frames",
+                        "year/month/day qcvol tree; observed 2025-2026 by site",
+                        "expanded: Load Loop walks the dated tree",
+                        "add arbitrary date/window picker",
+                    ),
+                    "fmi" => (
+                        false,
+                        "today + yesterday",
+                        "public ODIM HDF5 archive, roughly 2007-present",
+                        "recent loop only",
+                        "walk historical date prefixes",
+                    ),
+                    "australia-nci" => (
+                        true,
+                        "latest archived tarlist",
+                        "NCI rq0 ODIM HDF5 archive; daily tarlists and direct zip-member reads",
+                        "recent/archive loop from per-frame HDF5 members",
+                        "add date/window picker for deep historical events",
+                    ),
+                    "dmi" => (
+                        false,
+                        "latest only",
+                        "STAC date ranges with pagination",
+                        "latest frame only",
+                        "use STAC date-range queries",
+                    ),
+                    "geosphere" => (
+                        false,
+                        "latest only",
+                        "rolling ~3 days",
+                        "latest frame only",
+                        "list recent objects by prefix",
+                    ),
+                    "dwd" => (
+                        false,
+                        "latest only",
+                        "rolling ~2 days",
+                        "latest frame only",
+                        "walk timestamped sweep files",
+                    ),
+                    "shmu" => (
+                        false,
+                        "latest only",
+                        "observed rolling ~1 month",
+                        "latest frame only",
+                        "list dated directories",
+                    ),
+                    "chmi" => (
+                        false,
+                        "latest only",
+                        "observed rolling ~89 hours",
+                        "latest frame only",
+                        "list recent ODIM volume files",
+                    ),
+                    "arpa-piemonte" => (
+                        false,
+                        "last hour",
+                        "rolling last hour of OPERA HDF5 volumes",
+                        "real in-app recent loop",
+                        "add historical/event access if ARPA exposes it",
+                    ),
+                    "arpa-lombardia" => (
+                        false,
+                        "rolling live window",
+                        "gzip-wrapped ODIM HDF5 product volumes",
+                        "real in-app recent loop",
+                        "add historical/event access if ARPA exposes it",
+                    ),
+                    "kaia" => (
+                        false,
+                        "14 days",
+                        "historical repository likely deeper, not guaranteed",
+                        "real in-app recent archive",
+                        "probe longer retention",
+                    ),
+                    "ord" => (
+                        true,
+                        "rolling 24h + per-site archive lookup",
+                        "ORD single-site archive is partial/opportunistic; OPERA composites separate",
+                        "recent loop and date/hour lookup",
+                        "cache per-site coverage probes",
+                    ),
+                    "jma" => (
+                        false,
+                        "latest only",
+                        "NICT mirror recent operational tars",
+                        "latest frame only",
+                        "add tar directory scan if needed",
+                    ),
+                    _ => (
+                        false,
+                        "latest only",
+                        "unknown",
+                        "latest frame only",
+                        "provider-specific probe",
+                    ),
+                };
             IntlProviderCapability {
                 provider_id: provider.id(),
                 provider_label: provider.label(),
                 country: provider.country(),
                 visible_sites,
                 live: true,
-                recent_loop,
+                recent_loop: provider.supports_recent(),
                 archive_lookup,
                 current_window,
                 upstream_window,
@@ -807,6 +821,55 @@ mod tests {
         }
     }
 
+    /// A provider with a rolling window: implements [`RecentFrames`] and
+    /// hands it back from `recent_source` — the one act that must both
+    /// route `recent()` and flip `supports_recent()`.
+    struct FakeLoopProvider;
+
+    impl RecentFrames for FakeLoopProvider {
+        fn recent_frames(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
+            Ok((0..count)
+                .map(|index| FramePlan {
+                    identity: format!("{site_id}_frame_{index}"),
+                    parts: vec![PlanPart {
+                        url: format!("https://example.invalid/{site_id}_frame_{index}.h5"),
+                    }],
+                    merge: false,
+                })
+                .collect())
+        }
+    }
+
+    impl IntlProvider for FakeLoopProvider {
+        fn id(&self) -> &'static str {
+            "fake-loop"
+        }
+
+        fn label(&self) -> &'static str {
+            "Fake Loop Provider"
+        }
+
+        fn country(&self) -> &'static str {
+            "Nowhere"
+        }
+
+        fn list_sites(&self) -> Result<Vec<IntlSite>, String> {
+            FakeProvider.list_sites()
+        }
+
+        fn latest(&self, site_id: &str) -> Result<FramePlan, String> {
+            FakeProvider.latest(site_id)
+        }
+
+        fn recent_source(&self) -> Option<&dyn RecentFrames> {
+            Some(self)
+        }
+
+        fn static_sites(&self) -> Vec<IntlSite> {
+            self.list_sites().unwrap_or_default()
+        }
+    }
+
     #[test]
     fn registry_lists_every_provider_with_unique_stable_ids() {
         let providers = intl_providers();
@@ -875,6 +938,77 @@ mod tests {
             .expect("ORD capability");
         assert!(ord.recent_loop);
         assert!(ord.archive_lookup);
+    }
+
+    /// The Load Loop capability is DERIVED, not hand-maintained:
+    /// implementing [`RecentFrames`] and returning it from `recent_source`
+    /// is the one act that both routes [`IntlProvider::recent`] to the
+    /// rolling window and flips the capability card, so the card can never
+    /// go stale against the code. The expected id set is the review
+    /// tripwire: a provider gaining or losing a real loop must show up
+    /// here deliberately.
+    #[test]
+    fn recent_loop_capability_is_derived_from_recent_source() {
+        let providers = intl_providers();
+        let capabilities = intl_provider_capabilities();
+        for provider in &providers {
+            let capability = capabilities
+                .iter()
+                .find(|capability| capability.provider_id == provider.id())
+                .unwrap_or_else(|| panic!("{}: missing capability card", provider.id()));
+            assert_eq!(
+                capability.recent_loop,
+                provider.supports_recent(),
+                "{}: capability card must mirror the provider",
+                provider.id()
+            );
+            assert_eq!(
+                provider.supports_recent(),
+                provider.recent_source().is_some(),
+                "{}: supports_recent must stay derived from recent_source",
+                provider.id()
+            );
+        }
+        let loop_ids = providers
+            .iter()
+            .filter(|provider| provider.supports_recent())
+            .map(|provider| provider.id())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            loop_ids,
+            BTreeSet::from([
+                "arpa-lombardia",
+                "arpa-piemonte",
+                "australia-nci",
+                "fmi",
+                "kaia",
+                "ord",
+                "smhi",
+            ])
+        );
+    }
+
+    /// Without a `recent_source`, `recent()` degrades to a one-frame loop
+    /// (exactly `latest`) and the provider reports no loop support.
+    #[test]
+    fn default_recent_is_a_single_frame_and_reports_no_loop_support() {
+        let provider = FakeProvider;
+        assert!(provider.recent_source().is_none());
+        assert!(!provider.supports_recent());
+        let plans = provider.recent("nwsit", 5).expect("single-frame fallback");
+        assert_eq!(plans, vec![provider.latest("nwsit").unwrap()]);
+    }
+
+    /// With a `recent_source`, `recent()` routes to the rolling window and
+    /// `supports_recent()` flips true — one override point, two effects.
+    #[test]
+    fn recent_source_routes_recent_and_flips_supports_recent_together() {
+        let provider = FakeLoopProvider;
+        assert!(provider.supports_recent());
+        let plans = provider.recent("nwsit", 2).expect("rolling window");
+        assert_eq!(plans.len(), 2, "must not fall back to a single frame");
+        assert_eq!(plans[0].identity, "nwsit_frame_0");
+        assert_eq!(plans[1].identity, "nwsit_frame_1");
     }
 
     /// Coordinate sanity for every provider's EMBEDDED catalog: each static

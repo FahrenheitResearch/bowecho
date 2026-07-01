@@ -185,7 +185,7 @@ const MAX_HISTORY_FRAME_LIMIT: usize = 2000;
 const HISTORY_LOOP_FRAME_MS: u64 = 700;
 const MAX_LOOP_SPEED_PERCENT: u16 = 6400;
 const MAX_LOOP_REPAINT_POLL_MS: u64 = INTERACTIVE_POLL_REPAINT_MS;
-/// Loop-speed picker steps, percent of the 700 ms baseline (¼× … 64×).
+/// Loop-speed picker steps, percent of the 700 ms baseline (0.25x … 64x).
 const LOOP_SPEED_PERCENT_OPTIONS: &[u16] =
     &[25, 50, 75, 100, 150, 200, 300, 400, 800, 1600, 3200, 6400];
 const BACKGROUND_ACTIVITY_REPAINT_MS: u64 = 250;
@@ -1791,9 +1791,6 @@ struct ViewerApp {
     /// SPC storm reports for the archive date (tornado events browser).
     spc_reports: Option<Vec<SpcReport>>,
     spc_receiver: Option<mpsc::Receiver<std::result::Result<Vec<SpcReport>, String>>>,
-    /// One-shot: after an event click, auto-load the loop centered on this
-    /// time once the archive listing lands.
-    archive_pending_event: Option<ArchivePendingEvent>,
     /// One-shot debug launcher focus: after the requested archive object
     /// lands, switch to the known product/cut/view for the repro case.
     pending_debug_archive_case: Option<DebugArchiveCase>,
@@ -2384,12 +2381,6 @@ fn archive_load_progress_row(ui: &mut egui::Ui, progress: &ArchiveLoadProgress) 
     }
 }
 
-#[derive(Clone, Debug)]
-struct ArchivePendingEvent {
-    time_utc: DateTime<Utc>,
-    label: String,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArchiveLoopSource {
     EventPoint,
@@ -2872,22 +2863,6 @@ fn history_archive_load_parallelism_for_threads(threads: usize) -> usize {
         5..=7 => 3,
         _ => HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM.min(threads),
     }
-}
-
-fn centered_archive_loop_range(
-    center: usize,
-    len: usize,
-    requested: usize,
-) -> Option<(usize, usize)> {
-    if len == 0 || requested == 0 || center >= len {
-        return None;
-    }
-    let total = requested.min(len).min(MAX_HISTORY_FRAME_LIMIT);
-    let before = total / 2;
-    let mut start = center.saturating_sub(before);
-    let end = (start + total - 1).min(len - 1);
-    start = end + 1 - total;
-    Some((start, end))
 }
 
 fn archive_object_scan_time_utc(object: &data_source::S3Object) -> Option<DateTime<Utc>> {
@@ -4010,6 +3985,22 @@ pub(crate) fn intl_provider_label(provider_id: &str) -> String {
         .find(|provider| provider.id() == provider_id)
         .map(|provider| provider.label().to_owned())
         .unwrap_or_else(|| provider_id.to_owned())
+}
+
+/// Comma-joined labels of every international provider with a real
+/// multi-frame recent catalog — derived from the provider registry's
+/// capability cards, so the Load Loop hover and the one-frame status
+/// hint can never go stale against the adapter code.
+fn intl_recent_loop_provider_labels() -> &'static str {
+    static LABELS: OnceLock<String> = OnceLock::new();
+    LABELS.get_or_init(|| {
+        data_source::international::intl_provider_capabilities()
+            .into_iter()
+            .filter(|capability| capability.recent_loop)
+            .map(|capability| capability.provider_label)
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
 }
 /// SPC fetch identity: (day, archive date) — refetch when it changes.
 type SpcFetchKey = (u8, Option<(i32, u32, u32)>);
@@ -6364,7 +6355,6 @@ impl ViewerApp {
             radar_operational_status_rx: None,
             spc_reports: None,
             spc_receiver: None,
-            archive_pending_event: None,
             pending_debug_archive_case: None,
             pending_data_pack_scene: None,
             data_pack_expanded: BTreeSet::new(),
@@ -10750,7 +10740,6 @@ impl ViewerApp {
                             self.pending_data_pack_scene = None;
                             self.live_refresh_skip_reason = Some(reason.clone());
                             self.status = format!("Current {} ({reason})", message.label);
-                            self.try_start_pending_archive_selection(ctx);
                             ctx.request_repaint_after(Duration::from_secs(1));
                             return;
                         }
@@ -10791,7 +10780,6 @@ impl ViewerApp {
                                         format!("Load failed for {}: {err}", message.label);
                                 }
                             }
-                            self.try_start_pending_archive_selection(ctx);
                             ctx.request_repaint();
                             return;
                         }
@@ -10813,7 +10801,6 @@ impl ViewerApp {
                     self.pending_debug_archive_case = None;
                     self.pending_data_pack_scene = None;
                     self.status = "L2 load worker disconnected".to_owned();
-                    self.try_start_pending_archive_selection(ctx);
                     return;
                 }
             }
@@ -15221,9 +15208,7 @@ impl ViewerApp {
         self.archive_volumes = None;
         self.archive_list_receiver = None;
         self.archive_load_after_listing = false;
-        self.archive_pending_event = None;
         self.pending_debug_archive_case = None;
-        self.event_explorer.pending_range = None;
         self.event_explorer.pending_autoplay = false;
         self.realtime_level2_auto_refresh = false;
         if self.poll_active {
@@ -15384,78 +15369,6 @@ impl ViewerApp {
         });
     }
 
-    fn try_start_pending_archive_selection(&mut self, ctx: &egui::Context) -> bool {
-        if let Some((window_start, window_end)) = self.event_explorer.pending_range {
-            let Some(volumes) = self.archive_volumes.as_ref() else {
-                return false;
-            };
-            let labels: Vec<String> = volumes.iter().map(|(_, label)| label.clone()).collect();
-            let listed =
-                chrono::NaiveDate::parse_from_str(self.archive_date_input.trim(), "%Y-%m-%d")
-                    .unwrap_or_else(|_| window_start.date_naive());
-            let (start_label, end_label) =
-                event_explorer::window_labels_for_date(listed, window_start, window_end);
-            let event_pad = usize::from(normalized_event_pad_frames(
-                self.app_settings.event_pad_frames,
-            ));
-            let Some((start, end)) = event_explorer::range_volume_indices(
-                &labels,
-                &start_label,
-                &end_label,
-                event_pad,
-                MAX_HISTORY_FRAME_LIMIT,
-            ) else {
-                return false;
-            };
-            self.selected_cut = 0;
-            if self.start_archive_range_load(start, end, ctx) {
-                self.event_explorer.pending_range = None;
-                self.event_explorer.pending_autoplay = true;
-                return true;
-            }
-            return false;
-        }
-
-        let Some(target) = self.archive_pending_event.clone() else {
-            return false;
-        };
-        let Some(volumes) = &self.archive_volumes else {
-            return false;
-        };
-        if volumes.is_empty() {
-            self.archive_pending_event = None;
-            self.status = format!(
-                "Archive: no volumes listed for {}",
-                target.time_utc.format("%Y-%m-%d")
-            );
-            return false;
-        }
-        let target_label = target.time_utc.format("%H:%M:%S").to_string();
-        let labels: Vec<String> = volumes.iter().map(|(_, label)| label.clone()).collect();
-        let Some(index) = event_explorer::nearest_volume_index(&labels, &target_label) else {
-            return false;
-        };
-        let requested = if self.archive_load_loop {
-            self.archive_frame_count.max(1)
-        } else {
-            1
-        };
-        let Some((start, end)) = centered_archive_loop_range(index, volumes.len(), requested)
-        else {
-            return false;
-        };
-        if self.start_archive_range_load_selecting(start, end, index, ctx) {
-            self.archive_pending_event = None;
-            self.status = format!(
-                "Event jump: {} @ {}",
-                target.label,
-                self.time_zone().format_hm(target.time_utc)
-            );
-            return true;
-        }
-        false
-    }
-
     fn poll_archive_listing(&mut self, ctx: &egui::Context) {
         let Some(receiver) = &self.archive_list_receiver else {
             return;
@@ -15481,84 +15394,7 @@ impl ViewerApp {
                     .collect();
                 self.status = format!("Archive: {} volumes listed", volumes.len());
                 self.archive_volumes = Some(volumes);
-                // Track jump: load the loop SPANNING the event window
-                // plus the user-set scans of context each side and
-                // auto-play it at the lowest tilt — "like it would have
-                // been live".
-                let event_pad = usize::from(normalized_event_pad_frames(
-                    self.app_settings.event_pad_frames,
-                ));
-                let pending_range = self.event_explorer.pending_range.as_ref().and_then(
-                    |(window_start, window_end)| {
-                        let window_start = *window_start;
-                        let window_end = *window_end;
-                        let volumes = self.archive_volumes.as_ref()?;
-                        let labels: Vec<String> =
-                            volumes.iter().map(|(_, label)| label.clone()).collect();
-                        let listed = chrono::NaiveDate::parse_from_str(
-                            self.archive_date_input.trim(),
-                            "%Y-%m-%d",
-                        )
-                        .unwrap_or_else(|_| window_start.date_naive());
-                        let (start_label, end_label) = event_explorer::window_labels_for_date(
-                            listed,
-                            window_start,
-                            window_end,
-                        );
-                        event_explorer::range_volume_indices(
-                            &labels,
-                            &start_label,
-                            &end_label,
-                            event_pad,
-                            MAX_HISTORY_FRAME_LIMIT,
-                        )
-                    },
-                );
-                if let Some((start, end)) = pending_range {
-                    self.selected_cut = 0;
-                    if self.start_archive_range_load(start, end, ctx) {
-                        self.event_explorer.pending_range = None;
-                        self.event_explorer.pending_autoplay = true;
-                    }
-                }
-                // Event jump: load a +/- loop centered on the nearest
-                // volume to the report time.
-                else if let Some(target) = self.archive_pending_event.clone() {
-                    if let Some(volumes) = &self.archive_volumes
-                        && !volumes.is_empty()
-                    {
-                        let target_label = target.time_utc.format("%H:%M:%S").to_string();
-                        let labels: Vec<String> =
-                            volumes.iter().map(|(_, label)| label.clone()).collect();
-                        if let Some(index) =
-                            event_explorer::nearest_volume_index(&labels, &target_label)
-                        {
-                            let requested = if self.archive_load_loop {
-                                self.archive_frame_count.max(1)
-                            } else {
-                                1
-                            };
-                            if let Some((start, end)) =
-                                centered_archive_loop_range(index, volumes.len(), requested)
-                            {
-                                self.status = format!(
-                                    "Event jump: {} @ {}",
-                                    target.label,
-                                    self.time_zone().format_hm(target.time_utc)
-                                );
-                                if self.start_archive_range_load_selecting(start, end, index, ctx) {
-                                    self.archive_pending_event = None;
-                                }
-                            }
-                        }
-                    } else {
-                        self.archive_pending_event = None;
-                        self.status = format!(
-                            "Archive: no volumes listed for {}",
-                            target.time_utc.format("%Y-%m-%d")
-                        );
-                    }
-                } else if self.archive_load_after_listing {
+                if self.archive_load_after_listing {
                     self.archive_load_after_listing = false;
                     if let Some(volumes) = &self.archive_volumes {
                         if volumes.is_empty() {
@@ -16684,8 +16520,6 @@ impl ViewerApp {
         self.archive_load_after_listing = false;
         self.archive_volumes = None;
         self.archive_loaded_range = None;
-        self.archive_pending_event = None;
-        self.event_explorer.pending_range = None;
         self.pending_debug_archive_case = None;
         self.pending_data_pack_scene = None;
         self.loaded_data_pack = None;
@@ -16843,7 +16677,6 @@ impl ViewerApp {
             self.poll_active = false;
         }
         self.realtime_level2_auto_refresh = false;
-        self.archive_pending_event = None;
         self.pending_debug_archive_case = None;
         self.clear_camera_follow_targets();
         self.archive_date_input = plan.start_utc.format("%Y-%m-%d").to_string();
@@ -18784,7 +18617,7 @@ impl ViewerApp {
         let mut candidates = self
             .sites
             .iter()
-            .filter(|site| !site.level2_id.starts_with('T'))
+            .filter(|site| site_is_primary_level2_catalog_site(site) && !site_is_tdwr(site))
             .filter(|site| Some(site.level2_id.as_str()) != primary_site_id)
             .filter_map(|site| {
                 let (site_lat, site_lon) = site_location(site)?;
@@ -18847,7 +18680,7 @@ impl ViewerApp {
         } = mode
         else {
             self.unified_player
-                .mark_status("Load a multi-frame radar loop before Sync 5");
+                .mark_status("Load a multi-frame radar loop before Mosaic 5");
             return;
         };
         let radius = self
@@ -22082,10 +21915,11 @@ impl ViewerApp {
                 }
             }
             if fixed_action_button(ui, "Load Loop", 82.0)
-                .on_hover_text(
-                    "Loop of recent scans. International feeds with recent catalogs (SMHI/FMI/KAIA/ORD) \
-                     load loops; single-frame feeds start at newest scan and grow live",
-                )
+                .on_hover_text(format!(
+                    "Loop of recent scans. International feeds with recent catalogs load loops \
+                     ({}); single-frame feeds start at newest scan and grow live",
+                    intl_recent_loop_provider_labels()
+                ))
                 .clicked()
             {
                 if let Some(slot) = site_control_pane {
@@ -23111,7 +22945,9 @@ impl ViewerApp {
                     }
                 })
                 .response
-                .on_hover_text("Loop speed for playback and recorded GIF/MP4 loops");
+                .on_hover_text(
+                    "Loop speed for on-screen playback. Recorded GIF/MP4 loops use the separate export speed in the record controls.",
+                );
             if speed != self.app_settings.loop_speed_percent {
                 self.app_settings.loop_speed_percent = speed;
                 let _ = self.app_settings.save();
@@ -23260,8 +23096,9 @@ impl ViewerApp {
             if selected_limit != self.history_frame_limit {
                 self.set_history_frame_limit(selected_limit, ctx);
             }
-            // Playback speed (field request) — also the GIF/MP4 frame
-            // timing, so a recording plays back exactly like the screen.
+            // Playback speed (field request) — screen-only. Recorded
+            // GIF/MP4 timing is pinned to real cadence with its own
+            // export-speed control in the record menu.
             let mut typed_limit = self.history_frame_limit;
             if ui
                 .add(
@@ -23286,7 +23123,7 @@ impl ViewerApp {
                 })
                 .response
                 .on_hover_text(
-                    "Loop speed — frames per step of the playback AND of recorded GIF/MP4 loops",
+                    "Loop speed for on-screen playback. Recorded GIF/MP4 loops use the separate export speed in the record controls.",
                 );
             if speed != self.app_settings.loop_speed_percent {
                 self.app_settings.loop_speed_percent = speed;
@@ -27863,7 +27700,7 @@ impl ViewerApp {
                 if !site_is_primary_level2_catalog_site(site) {
                     return None;
                 }
-                if site.level2_id.starts_with('T') {
+                if site_is_tdwr(site) {
                     return None;
                 }
                 let (site_lat, site_lon) = site_location(site)?;
@@ -27932,7 +27769,7 @@ impl ViewerApp {
                 if !site_is_primary_level2_catalog_site(site) {
                     return None;
                 }
-                if !site.level2_id.starts_with('T') {
+                if !site_is_tdwr(site) {
                     return None;
                 }
                 let (site_lat, site_lon) = site_location(site)?;
@@ -28573,7 +28410,9 @@ impl ViewerApp {
         if let Some(dock) = &mut self.model_dock {
             let Some((key, valid, run_age)) = dock.newest_hour_valid_near(target, Some(&lut_model))
             else {
-                self.status = "No model runs in the store (Fetch latest first)".to_owned();
+                // The lookup returns None for an empty store AND for the
+                // era guard's no-coverage case — report which one it was.
+                self.status = hail_env_no_hour_status(dock.newest_run().is_some()).to_owned();
                 return;
             };
             let stale_note = if run_age > chrono::Duration::hours(3) {
@@ -29806,6 +29645,21 @@ impl ViewerApp {
         }
     }
 
+    /// A worker map frame landed. Install it only while its request is
+    /// still remembered: removing the satellite layer (layers rail)
+    /// clears `sat_map_inflight`, so a response already in flight at
+    /// remove time must not resurrect the layer. A non-matching response
+    /// (superseded request) is dropped without touching the latch.
+    fn apply_sat_map_frame_response(&mut self, frame: sat_worker::SatMapFrame) {
+        if !sat_map_request_matches(&self.sat_map_inflight, &frame.key, frame.hhmm) {
+            return;
+        }
+        self.sat_map_inflight = None;
+        if self.satellite_run_key_matches_current_spec(&frame.key) {
+            self.install_sat_layer(frame);
+        }
+    }
+
     fn handle_satellite_events(
         &mut self,
         panel_events: Vec<rw_ui::SatelliteEvent>,
@@ -29928,10 +29782,7 @@ impl ViewerApp {
                 }
                 sat_worker::SatResponse::MapFrame(result) => match *result {
                     Ok(frame) => {
-                        self.sat_map_inflight = None;
-                        if self.satellite_run_key_matches_current_spec(&frame.key) {
-                            self.install_sat_layer(frame);
-                        }
+                        self.apply_sat_map_frame_response(frame);
                         self.flush_pending_sat_map_request();
                     }
                     Err(message) => {
@@ -30741,11 +30592,14 @@ impl ViewerApp {
             self.archive_load_progress = None;
             // One frame back = this provider's catalog only lists the
             // newest scan — say so instead of leaving a "loop" of one
-            // frame unexplained (full loops: SMHI Sweden, FMI Finland).
+            // frame unexplained, naming the providers whose catalogs do
+            // support full loops (derived from the registry).
             self.status = if self.intl_loop_frames <= 1 {
-                "This feed lists only its newest scan — the loop grows as new scans arrive \
-                 (full loops: SMHI Sweden, FMI Finland, KAIA Estonia, EUMETNET ORD)"
-                    .to_owned()
+                format!(
+                    "This feed lists only its newest scan — the loop grows as new scans arrive \
+                     (full loops: {})",
+                    intl_recent_loop_provider_labels()
+                )
             } else {
                 format!(
                     "International loop loaded ({} frames)",
@@ -34176,12 +34030,6 @@ impl ViewerApp {
         self.show_vol3d_floating_window(ctx);
     }
 
-    /// 3D Volume Explorer body. Deep controls live in compact expandable
-    /// panels so nested combo boxes do not get closed by parent popup menus.
-    fn vol3d_inline_toolbar_controls_enabled() -> bool {
-        false
-    }
-
     fn vol3d_control_panel_width(ui: &egui::Ui) -> f32 {
         ui.available_width().clamp(280.0, 360.0)
     }
@@ -34305,6 +34153,8 @@ impl ViewerApp {
         );
     }
 
+    /// 3D Volume Explorer body. Deep controls live in compact expandable
+    /// panels so nested combo boxes do not get closed by parent popup menus.
     fn vol3d_pane_body(&mut self, ui: &mut egui::Ui) {
         let top_km = self.vol3d.top_km();
         let vol3d_product = self.selected_product.clone();
@@ -34339,115 +34189,12 @@ impl ViewerApp {
             {
                 self.vol3d.show_volume_controls = !self.vol3d.show_volume_controls;
             }
-            if Self::vol3d_inline_toolbar_controls_enabled() && self.vol3d.show_volume_controls {
-                ui.vertical(|ui| {
-                ui.set_min_width(280.0);
-                ui.label(egui::RichText::new("Transfer function").strong());
-                let (threshold_min, threshold_max) = Self::vol3d_threshold_slider_range(
-                    self.vol3d.threshold_mode,
-                    value_min,
-                    value_max,
-                );
-                let mut threshold = self.vol3d.threshold_dbz.clamp(threshold_min, threshold_max);
-                ui.add(
-                    egui::Slider::new(&mut threshold, threshold_min..=threshold_max)
-                        .suffix(value_suffix.as_str())
-                        .text(Self::vol3d_threshold_slider_label(self.vol3d.threshold_mode)),
-                )
-                .on_hover_text(Self::vol3d_threshold_hover_text(self.vol3d.threshold_mode));
-                self.vol3d.threshold_dbz = threshold;
-                ui.add(
-                    egui::Slider::new(&mut self.vol3d.opacity, 0.03..=1.0).text("sample opacity"),
-                );
-                ui.add(egui::Slider::new(&mut self.vol3d.density, 0.35..=2.5).text("density"))
-                    .on_hover_text("How quickly samples accumulate into a solid echo body");
-                ui.add(egui::Slider::new(&mut self.vol3d.shading, 0.0..=1.0).text("lighting"))
-                    .on_hover_text("Gradient lighting: 0 is flat palette color, 1 is strongest");
-                egui::ComboBox::from_id_salt("vol3d_quality")
-                    .selected_text(self.vol3d.quality.label())
-                    .show_ui(ui, |ui| {
-                        for quality in vol3d::Vol3dQuality::ALL {
-                            ui.selectable_value(
-                                &mut self.vol3d.quality,
-                                quality,
-                                format!("{} · {} steps", quality.label(), quality.steps()),
-                            );
-                        }
-                    });
-                ui.separator();
-                ui.label(egui::RichText::new("Vertical clip").strong());
-                ui.add(
-                    egui::Slider::new(
-                        &mut self.vol3d.clip_bottom_km,
-                        0.0..=(top_km - 0.5).max(0.0),
-                    )
-                    .suffix(" km")
-                    .text("bottom"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut self.vol3d.clip_top_km, 0.5..=top_km)
-                        .suffix(" km")
-                        .text("top"),
-                );
-                if self.vol3d.clip_top_km < self.vol3d.clip_bottom_km + 0.5 {
-                    self.vol3d.clip_top_km =
-                        (self.vol3d.clip_bottom_km + 0.5).min(top_km);
-                }
-                if ui.button("Reset clip").clicked() {
-                    self.vol3d.clip_bottom_km = 0.0;
-                    self.vol3d.clip_top_km = top_km;
-                }
-            });
-            }
 
             if ui
                 .selectable_label(self.vol3d.show_floor_controls, "Floor")
                 .clicked()
             {
                 self.vol3d.show_floor_controls = !self.vol3d.show_floor_controls;
-            }
-            if Self::vol3d_inline_toolbar_controls_enabled() && self.vol3d.show_floor_controls {
-                ui.vertical(|ui| {
-                ui.set_min_width(280.0);
-                ui.label(egui::RichText::new("Ground underlay").strong());
-                egui::ComboBox::from_id_salt("vol3d_floor_mode")
-                    .selected_text(self.vol3d.floor_mode.label())
-                    .show_ui(ui, |ui| {
-                        for mode in vol3d::FloorMode::ALL {
-                            ui.selectable_value(&mut self.vol3d.floor_mode, mode, mode.label());
-                        }
-                    });
-                let enabled = self.vol3d.floor_mode != vol3d::FloorMode::Off;
-                ui.add_enabled_ui(enabled, |ui| {
-                    ui.add(
-                        egui::Slider::new(&mut self.vol3d.floor_opacity, 0.02..=1.0)
-                            .text("opacity"),
-                    );
-                    let (floor_threshold_min, floor_threshold_max) =
-                        Self::vol3d_threshold_slider_range(
-                            self.vol3d.floor_threshold_mode,
-                            value_min,
-                            value_max,
-                        );
-                    let mut floor_threshold = self
-                        .vol3d
-                        .floor_threshold_dbz
-                        .clamp(floor_threshold_min, floor_threshold_max);
-                    ui.add(
-                        egui::Slider::new(
-                            &mut floor_threshold,
-                            floor_threshold_min..=floor_threshold_max,
-                        )
-                            .suffix(value_suffix.as_str())
-                            .text(Self::vol3d_threshold_slider_label(
-                                self.vol3d.floor_threshold_mode,
-                            )),
-                    );
-                    self.vol3d.floor_threshold_dbz = floor_threshold;
-                });
-                ui.separator();
-                ui.weak("Lowest tilt paints the best complete low-level PPI. Column max projects the visible 3D slab onto the ground.");
-            });
             }
 
             ui.menu_button("View", |ui| {
@@ -34474,8 +34221,7 @@ impl ViewerApp {
                 });
                 if self.vol3d.camera_mode == vol3d::Vol3dCameraMode::Fly {
                     ui.add(
-                        egui::Slider::new(&mut self.vol3d.fly_speed, 0.2..=6.0)
-                            .text("fly speed"),
+                        egui::Slider::new(&mut self.vol3d.fly_speed, 0.2..=6.0).text("fly speed"),
                     );
                     if ui.button("Set fly camera from orbit").clicked() {
                         self.vol3d.reset_fly_eye_from_orbit();
@@ -34489,8 +34235,7 @@ impl ViewerApp {
                         .text("vertical exaggeration"),
                 );
                 ui.add(
-                    egui::Slider::new(&mut self.vol3d.fov_scale, 0.42..=1.1)
-                        .text("field of view"),
+                    egui::Slider::new(&mut self.vol3d.fov_scale, 0.42..=1.1).text("field of view"),
                 );
                 ui.add(
                     egui::Slider::new(&mut self.vol3d.focus_height_km, 0.0..=top_km)
@@ -34563,19 +34308,21 @@ impl ViewerApp {
                 self.vol3d.threshold_dbz,
                 value_suffix.as_str(),
             );
-            ui.add(egui::Label::new(egui::RichText::new(format!(
-                "{} · {} · {} · {:.1}× Z",
-                threshold_status,
-                self.vol3d.floor_mode.label(),
-                self.vol3d.quality.label(),
-                self.vol3d.vertical_exaggeration,
-            ))
-            .weak())
-            .truncate());
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "{} · {} · {} · {:.1}× Z",
+                        threshold_status,
+                        self.vol3d.floor_mode.label(),
+                        self.vol3d.quality.label(),
+                        self.vol3d.vertical_exaggeration,
+                    ))
+                    .weak(),
+                )
+                .truncate(),
+            );
             if !self.vol3d.status.is_empty() {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(&self.vol3d.status).weak()).truncate(),
-                );
+                ui.add(egui::Label::new(egui::RichText::new(&self.vol3d.status).weak()).truncate());
             }
         });
 
@@ -41887,6 +41634,15 @@ fn site_is_primary_level2_catalog_site(site: &RadarSite) -> bool {
     community_feed_for_site(site).is_none()
 }
 
+/// TDWR test for the Level II site catalog. The catalog (embedded from
+/// api.weather.gov/radar/stations) carries no radar-type flag, so
+/// terminal radars are recognized by their `Txxx` ids — with the one
+/// known exception spelled out: TJUA is San Juan's WSR-88D (S-band,
+/// full 460 km range) and only happens to share the T prefix.
+fn site_is_tdwr(site: &RadarSite) -> bool {
+    site.level2_id.starts_with('T') && !site.level2_id.eq_ignore_ascii_case("TJUA")
+}
+
 /// The marker in `points` nearest to `pointer` within the shared 12 px
 /// click/hover halo, with its distance — one hit test for the CONUS,
 /// international, and community marker sets.
@@ -44534,7 +44290,10 @@ fn with_synthesized_dewpoint(data: &rw_ui::SoundingData) -> Option<rw_ui::Soundi
 /// Build the native sounding, optionally swapping the model surface for
 /// a nearby fresh observation (T/Td clamped sane, wind kt -> m/s) before
 /// the sharprs parcel math runs — "obs-adjusted sounding". The title
-/// metadata records the adjusting station + distance.
+/// metadata records the adjusting station + distance. Production goes
+/// through the `_with_display` variant; this thin wrapper serves the
+/// ingest_worker end-to-end test.
+#[cfg(test)]
 fn build_native_sounding_adjusted(
     data: &rw_ui::SoundingData,
     adjust: Option<(f32, obs::SurfaceOb)>,
@@ -50201,7 +49960,6 @@ fn grlevel2_cfg_sites(cfg: &str) -> Vec<String> {
         .collect()
 }
 
-/// "1×", "2×", "½×" — the loop-speed combo's display text.
 fn normalized_poll_url(input: &str) -> String {
     let trimmed = input.trim().trim_end_matches('/');
     if trimmed.is_empty() {
@@ -50526,15 +50284,9 @@ fn custom_poll_url_for_gis_site(base_url: &str, site_id: &str, total_sites: usiz
     }
 }
 
-fn loop_speed_label(percent: u16) -> String {
-    match percent {
-        25 => "¼×".to_owned(),
-        50 => "½×".to_owned(),
-        75 => "¾×".to_owned(),
-        _ if percent.is_multiple_of(100) => format!("{}×", percent / 100),
-        _ => format!("{:.1}×", f32::from(percent) / 100.0),
-    }
-}
+// The pane toolbars and the player window show the same
+// loop_speed_percent setting; unified_player owns the one formatter.
+use unified_player::loop_speed_label;
 
 fn nearest_sat_frame_for_time(
     runs: &[rw_ui::SatRunListing],
@@ -50555,6 +50307,19 @@ fn nearest_sat_frame_for_time(
         }
     }
     best.map(|(run, hhmm, _)| (run.key.clone(), hhmm))
+}
+
+/// Status line when the hail-env model lookup finds no usable hour:
+/// distinguish runs-exist-but-none-covers-the-displayed-time (the era
+/// guard) from a genuinely empty store, so "Fetch latest" is only
+/// suggested when it would actually help.
+fn hail_env_no_hour_status(store_has_runs: bool) -> &'static str {
+    if store_has_runs {
+        "No model run covers the displayed time (store has runs for other days — \
+         Fetch latest or ingest the event day)"
+    } else {
+        "No model runs in the store (Fetch latest first)"
+    }
 }
 
 fn sat_map_request_matches(
@@ -51585,6 +51350,37 @@ mod tests {
         assert_eq!(candidates[0].target, BeamTarget::Conus(2));
         // Sorted by 0.5° beam height ascending.
         assert!(candidates[0].beam_m < candidates[1].beam_m);
+    }
+
+    #[test]
+    fn right_click_ranking_treats_tjua_as_wsr88d_not_tdwr() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![
+            RadarSite::new("TJUA").with_location(
+                Some("San Juan".to_owned()),
+                Some(18.1157),
+                Some(-66.0782),
+            ),
+            RadarSite::new("TSJU").with_location(
+                Some("San Juan TDWR".to_owned()),
+                Some(18.474),
+                Some(-66.179),
+            ),
+        ];
+
+        let candidates = app.best_radar_candidates(18.3, -66.1);
+        let labels: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["TJUA"]);
+
+        let tdwr_ids: Vec<String> = app
+            .tdwr_candidates(18.3, -66.1)
+            .into_iter()
+            .map(|(_, id, _)| id)
+            .collect();
+        assert_eq!(tdwr_ids, vec!["TSJU"]);
     }
 
     #[test]
@@ -53739,16 +53535,6 @@ mod tests {
             ),
             Some(&DisplayProduct::StormRelativeVelocity)
         );
-    }
-
-    #[test]
-    fn centered_archive_loop_range_centers_and_clamps() {
-        assert_eq!(centered_archive_loop_range(5, 10, 5), Some((3, 7)));
-        assert_eq!(centered_archive_loop_range(0, 10, 5), Some((0, 4)));
-        assert_eq!(centered_archive_loop_range(9, 10, 5), Some((5, 9)));
-        assert_eq!(centered_archive_loop_range(2, 4, 10), Some((0, 3)));
-        assert_eq!(centered_archive_loop_range(0, 0, 5), None);
-        assert_eq!(centered_archive_loop_range(10, 10, 5), None);
     }
 
     #[test]
@@ -58815,6 +58601,19 @@ mod tests {
     }
 
     #[test]
+    fn loop_speed_labels_match_the_unified_player_formatter() {
+        // One setting, one formatter (unified_player::loop_speed_label,
+        // re-exported here): pin the canonical strings for every combo.
+        assert_eq!(loop_speed_label(25), "0.25x");
+        assert_eq!(loop_speed_label(50), "0.50x");
+        assert_eq!(loop_speed_label(75), "0.75x");
+        assert_eq!(loop_speed_label(100), "1x");
+        assert_eq!(loop_speed_label(150), "1.50x");
+        assert_eq!(loop_speed_label(400), "4x");
+        assert_eq!(loop_speed_label(6400), "64x");
+    }
+
+    #[test]
     fn loop_speed_honors_super_long_loop_rates() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.app_settings.loop_speed_percent = 6400;
@@ -58949,6 +58748,93 @@ mod tests {
         assert!(app.sat_layer.is_none());
         assert!(app.sat_layer_texture.is_none());
         assert_ne!(app.sat_layer_generation, generation);
+    }
+
+    #[test]
+    fn sat_map_frame_landing_after_layer_removal_does_not_resurrect_the_layer() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        // "h9" bypasses the GOES spec filter, isolating the inflight latch.
+        let key = rw_ui::SatRunKey {
+            model: "h9".to_owned(),
+            run: "fulldisk_c13_20260615".to_owned(),
+        };
+        let frame = || sat_worker::SatMapFrame {
+            key: key.clone(),
+            hhmm: 1755,
+            image: egui::ColorImage::new([2, 2], vec![egui::Color32::WHITE; 4]),
+            grid: Arc::new(rw_store::grid::GridFile {
+                nx: 2,
+                ny: 2,
+                lat: vec![35.1, 35.1, 35.0, 35.0],
+                lon: vec![-97.1, -97.0, -97.1, -97.0],
+                projection: None,
+                hash: "test-grid".to_owned(),
+            }),
+            flip_rows: false,
+        };
+
+        // Layer removed while the request was in flight: the remove path
+        // cleared sat_map_inflight, so the landing frame must be dropped
+        // instead of resurrecting the layer.
+        app.sat_map_inflight = None;
+        app.apply_sat_map_frame_response(frame());
+        assert!(app.sat_layer.is_none());
+        assert!(
+            app.sat_layer_build_rx.is_none(),
+            "unwanted frame must not start a layer build"
+        );
+
+        // The same frame while still requested installs (starts the build).
+        app.sat_map_inflight = Some((key.clone(), 1755));
+        app.apply_sat_map_frame_response(frame());
+        assert!(app.sat_map_inflight.is_none(), "request consumed");
+        assert!(
+            app.sat_layer_build_rx.is_some(),
+            "wanted frame starts the layer build"
+        );
+    }
+
+    #[test]
+    fn hail_env_no_hour_status_distinguishes_no_coverage_from_empty_store() {
+        let ctx = egui::Context::default();
+        let dock = model_data::ModelDataDock::new_for_test(
+            &ctx,
+            rw_ui::StoreTree {
+                models: vec![rw_ui::ModelEntry {
+                    model: "hrrr".to_owned(),
+                    runs: vec![rw_ui::RunEntry {
+                        run: "20260618_00z".to_owned(),
+                        build: "test".to_owned(),
+                        writer_version: "test".to_owned(),
+                        nx: 2,
+                        ny: 2,
+                        hours: vec![rw_ui::HourEntry {
+                            hour: 0,
+                            file: "f000.rws".to_owned(),
+                            variable_count: 1,
+                            written_unix: 0,
+                        }],
+                    }],
+                }],
+                warnings: Vec::new(),
+            },
+        );
+
+        // Era-guard miss: the store has a run, but nothing covers 2020.
+        let uncovered = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        assert_eq!(dock.newest_hour_valid_near(uncovered, Some("hrrr")), None);
+        assert!(dock.newest_run().is_some());
+        assert_eq!(
+            hail_env_no_hour_status(dock.newest_run().is_some()),
+            "No model run covers the displayed time (store has runs for other days — \
+             Fetch latest or ingest the event day)"
+        );
+
+        // Genuinely empty store keeps the Fetch-latest suggestion.
+        assert_eq!(
+            hail_env_no_hour_status(false),
+            "No model runs in the store (Fetch latest first)"
+        );
     }
 
     #[test]
@@ -59972,6 +59858,51 @@ mod tests {
     }
 
     #[test]
+    fn mosaic_candidates_keep_tjua_wsr88d_but_skip_tdwrs_and_community_feeds() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let mut community = community_feed_site(
+            data_source::community_feeds::community_feeds()
+                .first()
+                .expect("at least one community feed"),
+        );
+        community.latitude_deg = Some(18.30);
+        community.longitude_deg = Some(-66.10);
+        app.sites = vec![
+            RadarSite::new("KAAA").with_location(
+                Some("Primary".to_owned()),
+                Some(18.20),
+                Some(-66.05),
+            ),
+            // San Juan's WSR-88D shares the TDWR id prefix but must stay
+            // mosaic-eligible.
+            RadarSite::new("TJUA").with_location(
+                Some("San Juan".to_owned()),
+                Some(18.1157),
+                Some(-66.0782),
+            ),
+            // The actual colocated San Juan TDWR.
+            RadarSite::new("TSJU").with_location(
+                Some("San Juan TDWR".to_owned()),
+                Some(18.474),
+                Some(-66.179),
+            ),
+            community,
+        ];
+        app.selected_site_index = 0;
+        app.map_center_lat = 18.20;
+        app.map_center_lon = -66.05;
+        app.unified_player.coordinated_site_radius_km = 100.0;
+
+        let site_ids = app
+            .nearby_coordinated_overlay_sites(STORM_VIDEO_SYNC_OVERLAY_RADARS)
+            .into_iter()
+            .map(|(_, site)| site.level2_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(site_ids, vec!["TJUA"]);
+    }
+
+    #[test]
     fn unified_player_coordinated_overlay_resolution_skips_primary_radar() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.sites = vec![
@@ -60851,6 +60782,39 @@ mod tests {
         // A saved selection from a build that shipped more providers must
         // not panic the picker — fall back to the raw id.
         assert_eq!(intl_provider_label("not-a-provider"), "not-a-provider");
+    }
+
+    #[test]
+    fn load_loop_capability_text_names_every_recent_capable_provider() {
+        let labels = intl_recent_loop_provider_labels();
+        for capability in data_source::international::intl_provider_capabilities() {
+            if capability.recent_loop {
+                assert!(
+                    labels.contains(capability.provider_label),
+                    "recent-capable provider {} missing from Load Loop capability text: {labels}",
+                    capability.provider_label
+                );
+            } else {
+                assert!(
+                    !labels.contains(capability.provider_label),
+                    "single-frame provider {} wrongly listed as loop-capable: {labels}",
+                    capability.provider_label
+                );
+            }
+        }
+        // Tripwire for the currently expected set — update alongside new
+        // provider recent() implementations.
+        for expected in [
+            "SMHI Sweden",
+            "FMI Finland",
+            "NCI Australia Radar",
+            "ARPA Lombardia Italy",
+            "ARPA Piemonte Italy",
+            "KAIA Estonia",
+            "EUMETNET ORD",
+        ] {
+            assert!(labels.contains(expected), "{expected} missing: {labels}");
+        }
     }
 
     /// Live smoke of one community research feed through the same pieces
@@ -65148,7 +65112,6 @@ mod tests {
             radar_operational_status_rx: None,
             spc_reports: None,
             spc_receiver: None,
-            archive_pending_event: None,
             pending_debug_archive_case: None,
             pending_data_pack_scene: None,
             data_pack_expanded: BTreeSet::new(),
@@ -66382,65 +66345,6 @@ mod tests {
         assert!(app.spc_reports_enabled);
         assert!(app.event_explorer.failed_day_for_test().is_none());
         assert!(app.spc_data.fetched_at.is_none());
-    }
-
-    #[test]
-    fn archive_report_jump_survives_busy_decode_when_listing_lands() {
-        let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.sites = vec![data_source::RadarSite {
-            level2_id: "KTLX".to_owned(),
-            name: None,
-            latitude_deg: Some(35.33),
-            longitude_deg: Some(-97.28),
-        }];
-        app.archive_date_input = "2011-04-27".to_owned();
-        app.archive_pending_event = Some(ArchivePendingEvent {
-            time_utc: Utc.with_ymd_and_hms(2011, 4, 27, 22, 15, 0).unwrap(),
-            label: "Tuscaloosa".to_owned(),
-        });
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(Ok(vec![test_archive_object("KTLX", "22:15:00")]))
-            .unwrap();
-        app.archive_list_receiver = Some(receiver);
-        arm_busy_primary_load(&mut app);
-
-        app.poll_archive_listing(&egui::Context::default());
-
-        assert!(app.archive_pending_event.is_some());
-        assert_eq!(app.status, "Wait for the current load to finish");
-    }
-
-    #[test]
-    fn archive_track_jump_survives_busy_decode_when_listing_lands() {
-        let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.sites = vec![data_source::RadarSite {
-            level2_id: "KTLX".to_owned(),
-            name: None,
-            latitude_deg: Some(35.33),
-            longitude_deg: Some(-97.28),
-        }];
-        app.archive_date_input = "2011-04-27".to_owned();
-        app.event_explorer.pending_range = Some((
-            Utc.with_ymd_and_hms(2011, 4, 27, 22, 10, 0).unwrap(),
-            Utc.with_ymd_and_hms(2011, 4, 27, 22, 20, 0).unwrap(),
-        ));
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(Ok(vec![
-                test_archive_object("KTLX", "22:10:00"),
-                test_archive_object("KTLX", "22:15:00"),
-                test_archive_object("KTLX", "22:20:00"),
-            ]))
-            .unwrap();
-        app.archive_list_receiver = Some(receiver);
-        arm_busy_primary_load(&mut app);
-
-        app.poll_archive_listing(&egui::Context::default());
-
-        assert!(app.event_explorer.pending_range.is_some());
-        assert!(!app.event_explorer.pending_autoplay);
-        assert_eq!(app.status, "Wait for the current load to finish");
     }
 
     #[test]

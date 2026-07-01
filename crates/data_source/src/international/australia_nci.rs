@@ -13,7 +13,7 @@
 
 use chrono::{Days, NaiveDate, NaiveDateTime, Utc};
 
-use super::{FramePlan, IntlProvider, IntlSite, PlanPart, SiteCache};
+use super::{FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames, SiteCache};
 
 const BASE: &str = "https://thredds.nci.org.au/thredds/fileServer/rq0";
 const SITE_LIST_URL: &str = "https://thredds.nci.org.au/thredds/fileServer/rq0/radar_site_list.csv";
@@ -205,7 +205,17 @@ impl IntlProvider for AustraliaNciProvider {
         })
     }
 
-    fn recent(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
+    fn recent_source(&self) -> Option<&dyn RecentFrames> {
+        Some(self)
+    }
+
+    fn static_sites(&self) -> Vec<IntlSite> {
+        static_sites()
+    }
+}
+
+impl RecentFrames for AustraliaNciProvider {
+    fn recent_frames(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
         validate_site_id(site_id)?;
         let count = count.clamp(1, MAX_RECENT_FRAMES);
         let mut frames = recent_frames(site_id, count);
@@ -217,10 +227,6 @@ impl IntlProvider for AustraliaNciProvider {
         frames.sort_by_key(|frame| frame.timestamp);
         let skip = frames.len().saturating_sub(count);
         Ok(frames[skip..].iter().map(frame_plan).collect())
-    }
-
-    fn static_sites(&self) -> Vec<IntlSite> {
-        static_sites()
     }
 }
 

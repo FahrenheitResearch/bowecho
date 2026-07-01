@@ -582,9 +582,9 @@ impl UnifiedPlayerState {
                 {
                     action = Some(UnifiedPlayerAction::AddCoordinatedSitesAsOverlays);
                 }
-                if stable_button(ui, "Nearest 4", 86.0, true)
+                if stable_button(ui, "Mosaic 5", 86.0, true)
                     .on_hover_text(
-                        "Fill the Sites box with nearby WSR-88D radars and add them as synced overlays for the loaded loop",
+                        "Fill the Sites box with the 4 nearest WSR-88D radars and add them as synced overlays for the loaded loop - a 5-site mosaic",
                     )
                     .clicked()
                 {
@@ -947,7 +947,9 @@ fn format_range(start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> Str
     }
 }
 
-fn loop_speed_label(percent: u16) -> String {
+/// The one loop-speed formatter: the unified player and the pane
+/// toolbars (main.rs) both render `loop_speed_percent` through this.
+pub(crate) fn loop_speed_label(percent: u16) -> String {
     if percent == 100 {
         "1x".to_owned()
     } else if percent > 100 && percent.is_multiple_of(100) {

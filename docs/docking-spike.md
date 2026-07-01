@@ -156,8 +156,8 @@ integration PRs should land on the integrated UI line.
   `{ "version": 1, "tree": ... }` for forward migration. Load is
   best-effort like everything else in `AppSettings` (parse failure →
   default layout), matching the existing `from_json` philosophy.
-- **`saved_layout_slots` (currently `usize = 8`, count only — no slot
-  storage exists yet)**: implement slots as
+- **Layout slots (no setting exists yet — the old count-only
+  `saved_layout_slots` field was removed as dead)**: implement slots as
   `Vec<SavedLayout { name: String, layout: serde_json::Value }>`; a slot
   is just a named tree snapshot. Because pane payloads serialize inside
   the tree, a slot intrinsically captures *which* soundings/viewers were
@@ -215,8 +215,8 @@ risk left. Suggested sequence (each independently shippable, gates green):
    (Hidden/Floating/Docked), default Floating. One window per commit.
 4. **PR4 — persistence (S):** `workspace_layout` in `AppSettings`
    (versioned), restore on startup, reset-to-default action.
-5. **PR5 — layout slots (S/M):** named slots UI backed by
-   `saved_layout_slots`; save/load/rename.
+5. **PR5 — layout slots (S/M):** named slots UI backed by a new
+   `Vec<SavedLayout>` setting; save/load/rename.
 6. **v2 (optional):** drag-out-to-float gesture; radar cells as a `Grid`
    container; sidebar as a pane.
 

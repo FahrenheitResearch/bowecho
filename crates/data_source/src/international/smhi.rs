@@ -17,7 +17,7 @@
 use chrono::{Datelike, NaiveDate};
 use serde::Deserialize;
 
-use super::{FramePlan, IntlProvider, IntlSite, PlanPart, SiteCache};
+use super::{FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames, SiteCache};
 
 const API_BASE: &str = "https://opendata-download-radar.smhi.se/api/version/latest";
 
@@ -111,12 +111,8 @@ impl IntlProvider for SmhiProvider {
         plan_from_qcvol_catalog(site_id, &json)
     }
 
-    fn recent(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
-        validate_area_key(site_id)?;
-        let url = format!("{API_BASE}/area/{site_id}/product/qcvol");
-        let json = crate::fetch_text(&url)
-            .map_err(|err| format!("SMHI qcvol catalog for '{site_id}' ({url}): {err}"))?;
-        recent_plans_from_qcvol_tree(site_id, &json, count.max(1))
+    fn recent_source(&self) -> Option<&dyn RecentFrames> {
+        Some(self)
     }
 
     fn static_sites(&self) -> Vec<IntlSite> {
@@ -131,6 +127,16 @@ impl IntlProvider for SmhiProvider {
                 longitude_deg: Some(longitude_deg),
             })
             .collect()
+    }
+}
+
+impl RecentFrames for SmhiProvider {
+    fn recent_frames(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
+        validate_area_key(site_id)?;
+        let url = format!("{API_BASE}/area/{site_id}/product/qcvol");
+        let json = crate::fetch_text(&url)
+            .map_err(|err| format!("SMHI qcvol catalog for '{site_id}' ({url}): {err}"))?;
+        recent_plans_from_qcvol_tree(site_id, &json, count.max(1))
     }
 }
 

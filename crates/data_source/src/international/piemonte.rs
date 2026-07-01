@@ -13,7 +13,7 @@
 //! the existing ODIM decoder sees the site geometry and all moments together.
 
 use super::listing::{join_url, parse_autoindex};
-use super::{FramePlan, IntlProvider, IntlSite, PlanPart};
+use super::{FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames};
 use crate::fetch_text;
 
 const BRIC_ROOT: &str = "https://www.arpa.piemonte.it/rischi_naturali/radar/bric/";
@@ -87,20 +87,8 @@ impl IntlProvider for PiemonteProvider {
         })
     }
 
-    fn recent(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
-        let site = piemonte_site(site_id)?;
-        let mut files = piemonte_volume_files(site)?;
-        files.sort();
-        let keep = count.max(1).min(files.len());
-        Ok(files
-            .into_iter()
-            .rev()
-            .take(keep)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(|file| frame_plan(site, file))
-            .collect())
+    fn recent_source(&self) -> Option<&dyn RecentFrames> {
+        Some(self)
     }
 
     fn static_sites(&self) -> Vec<IntlSite> {
@@ -115,6 +103,24 @@ impl IntlProvider for PiemonteProvider {
                 longitude_deg: Some(site.longitude_deg),
             })
             .collect()
+    }
+}
+
+impl RecentFrames for PiemonteProvider {
+    fn recent_frames(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
+        let site = piemonte_site(site_id)?;
+        let mut files = piemonte_volume_files(site)?;
+        files.sort();
+        let keep = count.max(1).min(files.len());
+        Ok(files
+            .into_iter()
+            .rev()
+            .take(keep)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|file| frame_plan(site, file))
+            .collect())
     }
 }
 

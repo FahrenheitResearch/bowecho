@@ -671,8 +671,9 @@ fn parse_pts_coord(token: &str) -> Option<(f32, f32)> {
     let lat = token[0..4].parse::<f32>().ok()? / 100.0;
     let mut lon = token[4..8].parse::<f32>().ok()? / 100.0;
     // SPC point strings omit the leading "1" for longitudes west of 100W
-    // (e.g. 31641340 = 31.64N, 113.40W).
-    if lon < 30.0 {
+    // (e.g. 31641340 = 31.64N, 113.40W); per the PTS spec, any parsed
+    // longitude below 55.00 had that leading "1" dropped.
+    if lon < 55.0 {
         lon += 100.0;
     }
     Some((-lon, lat))
@@ -1893,6 +1894,17 @@ CIG1   37409972 36630011 33460208 37409972\n\
         assert_eq!(parsed[4].label, "CIG1");
         assert_eq!(parsed[4].rings.len(), 1);
         assert_eq!(parsed[4].rings[0][0], (-99.72, 37.40));
+    }
+
+    #[test]
+    fn pts_coords_reconstruct_dropped_leading_1_up_to_55w() {
+        // Longitude digits below 5500 had a leading "1" dropped: 4490 is
+        // 144.90W (Gulf of Alaska marine areas), not 44.90W. A too-tight
+        // 30.00 threshold left 30.00-54.99 unfolded in the east Atlantic.
+        assert_eq!(parse_pts_coord("58804490"), Some((-144.90, 58.80)));
+        // 55.00 and above are literal longitudes east of 100W.
+        assert_eq!(parse_pts_coord("40185500"), Some((-55.00, 40.18)));
+        assert_eq!(parse_pts_coord("31641340"), Some((-113.40, 31.64)));
     }
 
     #[test]
