@@ -1,0 +1,11 @@
+[package]
+name = "bowecho-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+color_tables = { path = "../color_tables" }
+nexrad_io = { path = "../nexrad_io" }
+radar_core = { path = "../radar_core" }
+render2d = { path = "../render2d" }

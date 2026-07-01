@@ -740,6 +740,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bowecho-bench"
+version = "0.27.3"
+dependencies = [
+ "color_tables",
+ "nexrad_io",
+ "radar_core",
+ "render2d",
+]
+
+[[package]]
 name = "built"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

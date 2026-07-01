@@ -4098,6 +4098,17 @@ struct ViewPane {
     /// separate from `pinned_site_id` because those ids are not US Level-II
     /// catalog ids and should not be looked up in `self.sites`.
     intl_source: Option<PaneIntlSource>,
+    /// Per-pane auto-refresh — the pane analog of the primary's
+    /// `realtime_level2_auto_refresh`. Defaults on: independent panes exist
+    /// for storm-day multi-radar and users expect every pane to stay live.
+    live: bool,
+    /// Pane analog of the primary's `last_realtime_level2_refresh`,
+    /// pacing this pane's own live poll.
+    last_realtime_level2_refresh: Option<Instant>,
+    /// Arc address of the primary frame most recently mirrored into this
+    /// pane by the same-site dedupe (`follow_primary_volume_into_pane`),
+    /// so an unchanged primary volume is not re-installed every tick.
+    followed_primary_volume_ptr: Option<usize>,
     volume: Option<Arc<RadarVolume>>,
     source_path: Option<PathBuf>,
     load_timing: Option<LoadTimings>,
@@ -4127,6 +4138,9 @@ impl ViewPane {
             cut: None,
             pinned_site_id: None,
             intl_source: None,
+            live: true,
+            last_realtime_level2_refresh: None,
+            followed_primary_volume_ptr: None,
             volume: None,
             source_path: None,
             load_timing: None,
@@ -4168,6 +4182,71 @@ impl ViewPane {
         self.browsing_history = false;
         self.last_history_step = None;
         self.archive_load_progress = None;
+    }
+}
+
+/// What actually feeds a radar-owning pane, as the live poll tick sees it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaneLiveSource {
+    /// Nothing pollable: no source, a pinned id outside the US catalog
+    /// (e.g. an international/archive id inherited from the primary), or
+    /// a research feed the pane load path refuses anyway.
+    None,
+    /// Pinned US Level-II catalog site with its own feed.
+    UsSite,
+    /// Pinned to the same US site the PRIMARY is live-polling: reuse the
+    /// primary's decode instead of downloading the feed a second time.
+    SharedWithPrimary,
+    /// International provider frames.
+    Intl,
+}
+
+/// One live tick's verdict for one radar-owning pane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaneLiveAction {
+    Skip,
+    /// Spawn the pane's own latest-load worker.
+    Poll,
+    /// Mirror the primary's newest volume Arc into the pane.
+    FollowPrimary,
+}
+
+/// Extra panes poll on the overlay cadence (5 s), never the primary's 1 s
+/// chunk cadence: four independent panes at 1 s would quadruple S3 listing
+/// traffic for chunk freshness only the focused pane benefits from.
+/// International panes poll on the provider catalog cadence, matching the
+/// intl overlay feeds.
+fn pane_live_poll_cadence_seconds(source: PaneLiveSource) -> u64 {
+    match source {
+        PaneLiveSource::Intl => INTL_POLL_SECONDS,
+        _ => OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS,
+    }
+}
+
+/// Pure poll policy for one pane so it is testable without an event loop.
+/// Archive displays never reach `Poll`: archive/event loops only enter a
+/// pane by inheriting the primary's history, which also inherits the
+/// primary's Live flag (archive loads clear it — the same guard the
+/// primary poll relies on) and, for international archives, a pinned id
+/// that classifies as [`PaneLiveSource::None`].
+fn pane_live_poll_action(
+    live: bool,
+    source: PaneLiveSource,
+    load_in_flight: bool,
+    due: bool,
+) -> PaneLiveAction {
+    if !live || source == PaneLiveSource::None || load_in_flight {
+        return PaneLiveAction::Skip;
+    }
+    if source == PaneLiveSource::SharedWithPrimary {
+        // Push-based reuse of the primary's decode: no cadence and no S3
+        // traffic of its own — freshness rides the primary's own poll.
+        return PaneLiveAction::FollowPrimary;
+    }
+    if due {
+        PaneLiveAction::Poll
+    } else {
+        PaneLiveAction::Skip
     }
 }
 
@@ -6853,6 +6932,164 @@ impl ViewerApp {
         if !requested_repaint && !self.radar_layers.is_empty() {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
+    }
+
+    /// The US catalog site the PRIMARY view's own auto-refresh is polling
+    /// right now — the same ownership guards `maybe_refresh_realtime_level2`
+    /// applies (an armed URL/international poll or an international archive
+    /// display means the primary is not live-polling a catalog site).
+    fn primary_live_poll_site_id(&self) -> Option<&str> {
+        if !self.realtime_level2_auto_refresh {
+            return None;
+        }
+        if self.poll_active && self.poll_source_armed() {
+            return None;
+        }
+        if self.intl_source_owns_primary_display() {
+            return None;
+        }
+        self.selected_site().map(|site| site.level2_id.as_str())
+    }
+
+    fn extra_pane_live_source(&self, pane: &ViewPane) -> PaneLiveSource {
+        if pane.intl_source.is_some() {
+            return PaneLiveSource::Intl;
+        }
+        let Some(pinned) = pane.pinned_site_id.as_deref() else {
+            return PaneLiveSource::None;
+        };
+        // Strict catalog lookup: an id inherited from an international or
+        // archive primary display must not resolve to some other site's
+        // feed (extra_pane_selected_site_index's primary fallback would).
+        let Some(site) = self
+            .sites
+            .iter()
+            .find(|site| site.level2_id.eq_ignore_ascii_case(pinned))
+        else {
+            return PaneLiveSource::None;
+        };
+        if community_feed_for_site(site).is_some() {
+            // The pane load path refuses research feeds; polling one would
+            // only rewrite the pane status every tick.
+            return PaneLiveSource::None;
+        }
+        if self
+            .primary_live_poll_site_id()
+            .is_some_and(|id| id.eq_ignore_ascii_case(pinned))
+        {
+            PaneLiveSource::SharedWithPrimary
+        } else {
+            PaneLiveSource::UsSite
+        }
+    }
+
+    /// Live auto-refresh for radar-owning extra panes — the top field
+    /// complaint in independent multi-pane mode was every non-primary pane
+    /// sitting stale until a manual Load Latest.
+    fn maybe_refresh_extra_panes(&mut self, ctx: &egui::Context) {
+        let mut any_live_owner = false;
+        let mut spawned = false;
+        for pane_slot in 0..self.extra_panes.len() {
+            let action = {
+                let pane = &self.extra_panes[pane_slot];
+                if !pane.owns_radar() {
+                    continue;
+                }
+                let source = self.extra_pane_live_source(pane);
+                any_live_owner |= pane.live && source != PaneLiveSource::None;
+                let due = pane.last_realtime_level2_refresh.is_none_or(|last| {
+                    last.elapsed() >= Duration::from_secs(pane_live_poll_cadence_seconds(source))
+                });
+                pane_live_poll_action(pane.live, source, pane.load_receiver.is_some(), due)
+            };
+            match action {
+                PaneLiveAction::Skip => {}
+                PaneLiveAction::Poll => spawned |= self.spawn_extra_pane_live_poll(pane_slot, ctx),
+                PaneLiveAction::FollowPrimary => {
+                    self.follow_primary_volume_into_pane(pane_slot, ctx)
+                }
+            }
+        }
+        if !spawned && any_live_owner {
+            // Heartbeat: with playback/hazards/layers all quiet nothing else
+            // schedules repaints, and the due-check would stall until input.
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+    }
+
+    fn spawn_extra_pane_live_poll(&mut self, pane_slot: usize, ctx: &egui::Context) -> bool {
+        let Some(pane) = self.extra_panes.get(pane_slot) else {
+            return false;
+        };
+        if let Some(source) = pane.intl_source.clone() {
+            let Some(site) = Self::find_intl_site(&source.provider_id, &source.site_id) else {
+                return false;
+            };
+            self.start_extra_pane_intl_load(pane_slot, site, LatestLoadMode::AutoRefresh, ctx);
+            return true;
+        }
+        let Some(site) = pane
+            .pinned_site_id
+            .as_deref()
+            .and_then(|pinned| {
+                self.sites
+                    .iter()
+                    .find(|site| site.level2_id.eq_ignore_ascii_case(pinned))
+            })
+            .cloned()
+        else {
+            return false;
+        };
+        self.start_extra_pane_level2_load_with_mode(
+            pane_slot,
+            site,
+            LatestLoadMode::AutoRefresh,
+            ctx,
+        );
+        true
+    }
+
+    /// Same-site dedupe: a pane pinned to the site the PRIMARY is
+    /// live-polling mirrors the primary's newest decoded volume (an Arc
+    /// clone) instead of downloading and decoding the same feed twice.
+    /// The mirrored frame goes through the regular pane batch install, so
+    /// history upsert/trim and browsing/playback guards all apply.
+    fn follow_primary_volume_into_pane(&mut self, pane_slot: usize, ctx: &egui::Context) {
+        let Some(frame) = self.frame_history.last() else {
+            return;
+        };
+        let Some(pane) = self.extra_panes.get(pane_slot) else {
+            return;
+        };
+        let Some(pinned) = pane.pinned_site_id.as_deref() else {
+            return;
+        };
+        if !frame.identity.site_id.eq_ignore_ascii_case(pinned) {
+            // Primary site switch mid-flight: its history can hold the old
+            // site for a tick — never install another site's frames.
+            return;
+        }
+        let frame_ptr = Arc::as_ptr(&frame.volume) as usize;
+        if pane.followed_primary_volume_ptr == Some(frame_ptr) {
+            return;
+        }
+        let decoded = DecodedLoad {
+            path: frame.path.clone(),
+            volume: Arc::clone(&frame.volume),
+            timings: frame.timings.unwrap_or_default(),
+            status: frame.status,
+            source_label: frame.source_label.clone(),
+        };
+        if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+            pane.followed_primary_volume_ptr = Some(frame_ptr);
+            pane.last_realtime_level2_refresh = Some(Instant::now());
+        }
+        self.install_extra_pane_decoded_load_batch(
+            pane_slot,
+            DecodedLoadBatch::single(decoded),
+            true,
+            ctx,
+        );
     }
 
     /// Ctrl+right-click: overlay the nearest radar — US or international,
@@ -13218,11 +13455,19 @@ impl ViewerApp {
         };
         let show_derived_products = self.app_settings.show_derived_products;
         let advanced_products_enabled = self.advanced_products_enabled;
+        let primary_live = self.realtime_level2_auto_refresh;
 
         let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
             return;
         };
         pane.pinned_site_id = site_id.clone();
+        // An intl source here means the primary was live-polling it; a US
+        // history inherits the primary's Live flag, which archive/event
+        // loads clear — so an inherited archive loop stays an archive loop
+        // instead of being clobbered by this pane's live poll.
+        pane.live = intl_source.is_some() || primary_live;
+        pane.last_realtime_level2_refresh = None;
+        pane.followed_primary_volume_ptr = None;
         pane.intl_source = intl_source;
         pane.volume = primary_volume.clone();
         pane.source_path = source_path;
@@ -13323,6 +13568,8 @@ impl ViewerApp {
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
             pane.pinned_site_id = Some(site_id.clone());
             pane.intl_source = None;
+            pane.last_realtime_level2_refresh = None;
+            pane.followed_primary_volume_ptr = None;
             pane.volume = None;
             pane.source_path = None;
             pane.load_timing = None;
@@ -13330,7 +13577,11 @@ impl ViewerApp {
             pane.load_mode = None;
             pane.pending_site_id = None;
             pane.cut = None;
-            pane.status = format!("Pane radar set to {site_id}; click Load Latest");
+            pane.status = if pane.live {
+                format!("Pane radar set to {site_id}; live poll starting")
+            } else {
+                format!("Pane radar set to {site_id}; click Load Latest")
+            };
             pane.clear_history();
             pane.clear_texture();
         }
@@ -13381,6 +13632,9 @@ impl ViewerApp {
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
             pane.pinned_site_id = None;
             pane.intl_source = None;
+            pane.live = true;
+            pane.last_realtime_level2_refresh = None;
+            pane.followed_primary_volume_ptr = None;
             pane.volume = None;
             pane.source_path = None;
             pane.load_timing = None;
@@ -13431,6 +13685,25 @@ impl ViewerApp {
             .cloned()
     }
 
+    /// The installed international frame's provider identity for a pane —
+    /// the auto-refresh dedupe key. The install path records it as the
+    /// pane's `intl:{identity}` source path.
+    fn extra_pane_intl_frame_identity(
+        &self,
+        pane_slot: usize,
+        source: &PaneIntlSource,
+    ) -> Option<String> {
+        let pane = self.extra_panes.get(pane_slot)?;
+        if pane.intl_source.as_ref() != Some(source) {
+            return None;
+        }
+        pane.source_path
+            .as_ref()?
+            .to_str()?
+            .strip_prefix("intl:")
+            .map(str::to_owned)
+    }
+
     fn start_extra_pane_intl_load(
         &mut self,
         pane_slot: usize,
@@ -13452,6 +13725,12 @@ impl ViewerApp {
             )
         });
         let (sender, receiver) = mpsc::channel();
+        // Auto-refresh dedupes with the installed frame's provider identity —
+        // the same `fetch_intl_frame` mechanism the intl overlay feeds poll
+        // with — so an unchanged catalog costs a probe, not a download.
+        let last_identity = (mode == LatestLoadMode::AutoRefresh)
+            .then(|| self.extra_pane_intl_frame_identity(pane_slot, &source))
+            .flatten();
         {
             let pane = &mut self.extra_panes[pane_slot];
             if pane.intl_source.as_ref() != Some(&source) {
@@ -13467,13 +13746,18 @@ impl ViewerApp {
             pane.pending_site_id = Some(site_id.clone());
             pane.load_receiver = Some(receiver);
             pane.load_mode = Some(mode);
+            pane.last_realtime_level2_refresh = Some(Instant::now());
             pane.archive_load_progress = progress.clone();
-            pane.status = match &progress {
-                Some(progress) => progress.status_text(),
-                None => format!("Loading {label}"),
+            pane.status = match (&progress, mode) {
+                (Some(progress), _) => progress.status_text(),
+                (None, LatestLoadMode::AutoRefresh) => format!("Refreshing {label}"),
+                (None, _) => format!("Loading {label}"),
             };
         }
-        self.center_extra_pane_on_intl_site(pane_slot, &site);
+        if mode != LatestLoadMode::AutoRefresh {
+            // A background refresh must never yank the user's pan/zoom.
+            self.center_extra_pane_on_intl_site(pane_slot, &site);
+        }
         let history_frame_limit = self.history_frame_limit.max(2);
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
@@ -13489,22 +13773,23 @@ impl ViewerApp {
                 }
                 LatestLoadMode::User | LatestLoadMode::AutoRefresh => {
                     let start = Instant::now();
-                    let update = match fetch_intl_frame(&provider_id, &site_id, None) {
-                        Ok(Some((identity, volume))) => {
-                            AsyncLoadUpdate::Final(Ok(DecodedLoadBatch::single(DecodedLoad {
-                                path: PathBuf::from(format!("intl:{identity}")),
-                                volume: Arc::new(volume),
-                                timings: LoadTimings::default().finish(start),
-                                status: FrameStatus::LiveComplete,
-                                source_label: identity,
-                            })))
-                        }
-                        Ok(None) => AsyncLoadUpdate::Unchanged {
-                            timings: Some(LoadTimings::default().finish(start)),
-                            reason: "no new frame".to_owned(),
-                        },
-                        Err(err) => AsyncLoadUpdate::Final(Err(err)),
-                    };
+                    let update =
+                        match fetch_intl_frame(&provider_id, &site_id, last_identity.as_deref()) {
+                            Ok(Some((identity, volume))) => {
+                                AsyncLoadUpdate::Final(Ok(DecodedLoadBatch::single(DecodedLoad {
+                                    path: PathBuf::from(format!("intl:{identity}")),
+                                    volume: Arc::new(volume),
+                                    timings: LoadTimings::default().finish(start),
+                                    status: FrameStatus::LiveComplete,
+                                    source_label: identity,
+                                })))
+                            }
+                            Ok(None) => AsyncLoadUpdate::Unchanged {
+                                timings: Some(LoadTimings::default().finish(start)),
+                                reason: "no new frame".to_owned(),
+                            },
+                            Err(err) => AsyncLoadUpdate::Final(Err(err)),
+                        };
                     let _ = sender.send(AsyncLoadResult { label, update });
                 }
             }
@@ -13561,11 +13846,14 @@ impl ViewerApp {
         }
         let (sender, receiver) = mpsc::channel();
         let current_source_path = self.extra_panes[pane_slot].source_path.clone();
-        let known_frame_paths = if mode == LatestLoadMode::Loop {
-            self.current_extra_pane_history_paths(pane_slot)
-        } else {
-            BTreeSet::new()
-        };
+        // AutoRefresh mirrors the primary: known frames let the worker skip
+        // re-decoding scans the pane already holds.
+        let known_frame_paths =
+            if matches!(mode, LatestLoadMode::Loop | LatestLoadMode::AutoRefresh) {
+                self.current_extra_pane_history_paths(pane_slot)
+            } else {
+                BTreeSet::new()
+            };
         let current_frame_identity = self.extra_panes[pane_slot]
             .volume
             .as_ref()
@@ -13593,13 +13881,20 @@ impl ViewerApp {
             pane.pending_site_id = Some(site_id.clone());
             pane.load_receiver = Some(receiver);
             pane.load_mode = Some(mode);
+            pane.last_realtime_level2_refresh = Some(Instant::now());
             pane.archive_load_progress = progress.clone();
             pane.status = progress.as_ref().map_or_else(
-                || format!("Loading latest L2 {site_id}"),
+                || match mode {
+                    LatestLoadMode::AutoRefresh => format!("Refreshing L2 {site_id}"),
+                    _ => format!("Loading latest L2 {site_id}"),
+                },
                 ArchiveLoadProgress::status_text,
             );
         }
-        self.center_extra_pane_on_site(pane_slot, &site);
+        if mode != LatestLoadMode::AutoRefresh {
+            // A background refresh must never yank the user's pan/zoom.
+            self.center_extra_pane_on_site(pane_slot, &site);
+        }
         spawn_latest_level2_load_worker(
             site,
             mode,
@@ -16948,6 +17243,7 @@ impl eframe::App for ViewerApp {
             // Frozen while recording so history indices stay deterministic.
             self.maybe_refresh_realtime_level2(&ctx);
             self.maybe_refresh_radar_layers(&ctx);
+            self.maybe_refresh_extra_panes(&ctx);
         }
         self.maybe_refresh_live_hazards(&ctx);
         self.maybe_advance_history_loop(&ctx);
@@ -20203,6 +20499,15 @@ impl ViewerApp {
              cursor inspector, station plots, range circles). BowEcho is US-born so \
              imperial is the default — metric is this one click.",
         );
+        // "Where is m/s?" lands here first, so say where velocity units
+        // actually live when this setting does not govern them.
+        if let Some(note) = self.velocity_units_note_for_settings() {
+            ui.weak(note).on_hover_text(
+                "A velocity palette's declared Units: header (kt, mph, km/h, m/s) drives the \
+                 velocity readout, colorbar ticks, and unit chip — GR2Analyst semantics. Pick or \
+                 edit the table under Custom ▸ Color tables to change it.",
+            );
+        }
         ui.horizontal(|ui| {
             ui.label("Time zone");
             let current = self.time_zone();
@@ -21943,7 +22248,19 @@ impl ViewerApp {
                     }
                 }
             }
-            ui.checkbox(&mut self.realtime_level2_auto_refresh, "Live");
+            // Pane-targeted SITE controls get the PANE's own live flag: this
+            // checkbox used to silently toggle the PRIMARY radar's
+            // auto-refresh no matter which pane it claimed to control.
+            if let Some(pane) = site_control_pane.and_then(|slot| self.extra_panes.get_mut(slot)) {
+                ui.checkbox(&mut pane.live, "Live").on_hover_text(
+                    "Auto-refresh this pane's own radar (US sites on the overlay cadence, \
+                     international on the provider cadence). A pane on the primary's site \
+                     reuses the primary's data. The primary radar keeps its own Live control.",
+                );
+            } else {
+                ui.checkbox(&mut self.realtime_level2_auto_refresh, "Live")
+                    .on_hover_text("Auto-refresh the primary radar with the newest live data");
+            }
             ui.checkbox(&mut self.display_live_chunk_updates, "Chunks")
                 .on_hover_text(
                     "Display incomplete live chunk tilts before a full low-level tilt is available",
@@ -27004,20 +27321,20 @@ impl ViewerApp {
         self.basemap_ms = Some(frame_start.elapsed().as_secs_f32() * 1000.0);
     }
 
-    /// Whether a grid cell's chip may claim LIVE. Radar-owning panes have no
-    /// auto-refresh at all (pane loads are User/Loop only), so they must not
-    /// inherit the PRIMARY Live flag: a pinned pane loaded once would show
-    /// "LIVE" although nothing will ever refresh it. Cell 0 (primary) and
+    /// Whether a grid cell's chip may claim LIVE. Cell 0 (primary) and
     /// following panes display the primary feed, so the primary flag is
-    /// their truth.
+    /// their truth. A radar-owning pane runs its own auto-refresh
+    /// (`maybe_refresh_extra_panes`): LIVE iff the pane's own Live flag is
+    /// on AND its source actually feeds it — an id inherited from an
+    /// international/archive display classifies as no live source and the
+    /// chip stays an honest ARCHIVE.
     fn pane_chip_is_live(&self, pane_index: usize) -> bool {
-        if pane_index > 0
-            && self
-                .extra_panes
-                .get(pane_index - 1)
-                .is_some_and(ViewPane::owns_radar)
+        if let Some(pane) = pane_index
+            .checked_sub(1)
+            .and_then(|slot| self.extra_panes.get(slot))
+            && pane.owns_radar()
         {
-            return false;
+            return pane.live && self.extra_pane_live_source(pane) != PaneLiveSource::None;
         }
         self.realtime_level2_auto_refresh
     }
@@ -35965,16 +36282,29 @@ impl ViewerApp {
     }
 
     fn vrot_display_unit(&self) -> (&'static str, f32) {
-        let velocity_product = if product_units(&self.selected_product) == "m/s" {
-            self.selected_product.clone()
-        } else {
-            DisplayProduct::Moment(MomentType::Velocity)
-        };
+        let velocity_product = self.current_velocity_product();
         table_display_unit(
             self.active_table_for_product(&velocity_product),
             &velocity_product,
             self.units(),
         )
+    }
+
+    fn current_velocity_product(&self) -> DisplayProduct {
+        if product_units(&self.selected_product) == "m/s" {
+            self.selected_product.clone()
+        } else {
+            DisplayProduct::Moment(MomentType::Velocity)
+        }
+    }
+
+    /// The Settings ▸ Display units footnote, present only when it applies
+    /// (the current velocity product's table declares its own unit).
+    fn velocity_units_note_for_settings(&self) -> Option<String> {
+        let velocity_product = self.current_velocity_product();
+        let table = self.active_table_for_product(&velocity_product);
+        let unit = table_declared_velocity_unit(table, &velocity_product)?;
+        Some(velocity_units_settings_note(unit, table.name()))
     }
 
     fn draw_colorbar_for_product(
@@ -42927,6 +43257,34 @@ fn table_display_unit(
             units::Units::Metric => ("km/h", color_tables::unit_scale_to_internal("km/h")),
         },
     }
+}
+
+/// The display unit an m/s product is locked to when the active color table
+/// carries a recognized `Units:` declaration — i.e. the Settings unit system
+/// does NOT apply to it. None = undeclared table, velocity follows Settings.
+fn table_declared_velocity_unit(
+    table: &ColorTable,
+    product: &DisplayProduct,
+) -> Option<&'static str> {
+    if product_units(product) != "m/s" {
+        return None;
+    }
+    let (imperial, _) = table_display_unit(table, product, units::Units::Imperial);
+    let (metric, _) = table_display_unit(table, product, units::Units::Metric);
+    // A declared unit is unit-system-independent; the undeclared fallback
+    // (mph vs km/h) is not.
+    (imperial == metric).then_some(imperial)
+}
+
+/// Settings ▸ Display footnote answering "where is m/s?": velocity units
+/// come from the active velocity color table when the palette declares them
+/// (the table declaration is the source of truth; the Units setting is only
+/// the fallback for undeclared tables).
+fn velocity_units_settings_note(unit: &str, table_name: &str) -> String {
+    format!(
+        "Velocity display: {unit} — set by the active velocity color table ({table_name}); \
+         tables without declared units follow this setting."
+    )
 }
 
 /// Subdivide the map canvas into per-pane cell rects for a layout. `One`
@@ -51881,6 +52239,53 @@ mod tests {
             table_display_unit(&mph, &dbz, units::Units::Imperial),
             ("dBZ", 1.0)
         );
+    }
+
+    /// Settings ▸ Display answers "where is m/s?": when the active velocity
+    /// table declares its units, a footnote says the table governs; when it
+    /// does not, velocity follows the Units setting and no note appears.
+    #[test]
+    fn velocity_units_note_shows_only_when_the_table_declares_units() {
+        let product = DisplayProduct::Moment(MomentType::Velocity);
+        let kt = ColorTable::parse_gr_pal(
+            "KT VEL",
+            "Product: BV\nUnits: KTS\nColor: -89 12 24 36\nColor: 89 200 210 220\n",
+        )
+        .expect("kt table parses");
+        assert_eq!(table_declared_velocity_unit(&kt, &product), Some("kt"));
+        let mps = ColorTable::parse_gr_pal(
+            "MPS VEL",
+            "Product: BV\nUnits: m/s\nColor: -30 1 2 3\nColor: 30 4 5 6\n",
+        )
+        .expect("m/s table parses");
+        assert_eq!(table_declared_velocity_unit(&mps, &product), Some("m/s"));
+        // Undeclared table: the Units setting governs — no note.
+        let si = ColorTable::parse_gr_pal("SI VEL", "Color: -30 1 2 3\nColor: 30 4 5 6\n")
+            .expect("si table parses");
+        assert_eq!(table_declared_velocity_unit(&si, &product), None);
+        // Non-velocity products never claim the note.
+        let dbz = DisplayProduct::Moment(MomentType::Reflectivity);
+        assert_eq!(table_declared_velocity_unit(&kt, &dbz), None);
+
+        let note = velocity_units_settings_note("kt", "KT VEL");
+        assert!(note.contains("Velocity display: kt"), "{note}");
+        assert!(note.contains("KT VEL"), "{note}");
+        assert!(note.contains("follow this setting"), "{note}");
+
+        // App wiring: the note derives from the CURRENT velocity product's
+        // active table (per-product override included).
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
+        app.palette_product_overrides
+            .insert(product.label().to_owned(), kt);
+        let note = app
+            .velocity_units_note_for_settings()
+            .expect("declared table note");
+        assert!(note.contains("Velocity display: kt"), "{note}");
+        assert!(note.contains("KT VEL"), "{note}");
+        app.palette_product_overrides
+            .insert(product.label().to_owned(), si);
+        assert_eq!(app.velocity_units_note_for_settings(), None);
     }
 
     #[test]
@@ -61362,8 +61767,10 @@ mod tests {
     }
 
     #[test]
-    fn owned_pane_chip_never_claims_live_from_the_primary_flag() {
+    fn owned_pane_chip_tracks_the_panes_own_live_flag() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![RadarSite::new("KTLX"), RadarSite::new("KEAX")];
+        app.selected_site_index = 0;
         app.realtime_level2_auto_refresh = true;
         app.volume = Some(Arc::new(RadarVolume::new(
             radar_core::RadarSite::new("KTLX"),
@@ -61381,16 +61788,248 @@ mod tests {
         // so the primary Live flag is their truth.
         assert!(app.pane_chip_is_live(0));
         assert!(app.pane_chip_is_live(2));
-        // The radar-owning pane never auto-refreshes: its chip must not
-        // inherit the primary flag.
+        // Radar-owning panes auto-refresh themselves now: the chip is the
+        // PANE's own flag, in both directions.
+        assert!(app.pane_chip_is_live(1));
+        app.extra_panes[0].live = false;
         assert!(!app.pane_chip_is_live(1));
+        app.extra_panes[0].live = true;
+        app.realtime_level2_auto_refresh = false;
+        assert!(
+            app.pane_chip_is_live(1),
+            "pane's own poll does not depend on the primary flag"
+        );
 
-        // With its own liveness the chip shows the honest frame age instead.
+        // An inherited non-catalog id has no live feed behind it: the chip
+        // must not claim LIVE for a pane nothing will refresh.
+        app.extra_panes[0].pinned_site_id = Some("sella".to_owned());
+        assert!(!app.pane_chip_is_live(1));
         let (label, _, kind) = app
             .mode_chip_state_with_live(app.pane_chip_is_live(1))
             .expect("owned pane chip");
         assert_eq!(kind, "ARCH");
         assert!(label.contains("0m old"), "{label}");
+    }
+
+    #[test]
+    fn pane_live_poll_action_policy() {
+        // Due poll fires for a pane's own site and for international feeds.
+        assert_eq!(
+            pane_live_poll_action(true, PaneLiveSource::UsSite, false, true),
+            PaneLiveAction::Poll
+        );
+        assert_eq!(
+            pane_live_poll_action(true, PaneLiveSource::Intl, false, true),
+            PaneLiveAction::Poll
+        );
+        // Not due yet.
+        assert_eq!(
+            pane_live_poll_action(true, PaneLiveSource::UsSite, false, false),
+            PaneLiveAction::Skip
+        );
+        // An in-flight pane load owns the pane.
+        assert_eq!(
+            pane_live_poll_action(true, PaneLiveSource::UsSite, true, true),
+            PaneLiveAction::Skip
+        );
+        assert_eq!(
+            pane_live_poll_action(true, PaneLiveSource::SharedWithPrimary, true, true),
+            PaneLiveAction::Skip
+        );
+        // Live flag off — the pane checkbox is the user's pause, and the
+        // archive guard (archive loads clear the inherited flag).
+        assert_eq!(
+            pane_live_poll_action(false, PaneLiveSource::UsSite, false, true),
+            PaneLiveAction::Skip
+        );
+        // No pollable source: following pane, or an archive/international id
+        // inherited from the primary display.
+        assert_eq!(
+            pane_live_poll_action(true, PaneLiveSource::None, false, true),
+            PaneLiveAction::Skip
+        );
+        // Same site as the live primary: mirror its decode, cadence-free.
+        assert_eq!(
+            pane_live_poll_action(true, PaneLiveSource::SharedWithPrimary, false, true),
+            PaneLiveAction::FollowPrimary
+        );
+        assert_eq!(
+            pane_live_poll_action(true, PaneLiveSource::SharedWithPrimary, false, false),
+            PaneLiveAction::FollowPrimary
+        );
+        // Cadences: US panes poll on the overlay cadence, never the
+        // primary's chunk cadence; international on the provider cadence.
+        assert_eq!(
+            pane_live_poll_cadence_seconds(PaneLiveSource::UsSite),
+            OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS
+        );
+        assert_eq!(
+            pane_live_poll_cadence_seconds(PaneLiveSource::Intl),
+            INTL_POLL_SECONDS
+        );
+        assert!(
+            pane_live_poll_cadence_seconds(PaneLiveSource::UsSite)
+                > PRIMARY_REALTIME_LEVEL2_REFRESH_SECONDS
+        );
+    }
+
+    #[test]
+    fn extra_pane_live_source_dedupes_primary_site_and_rejects_foreign_ids() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![RadarSite::new("KTLX"), RadarSite::new("KEAX")];
+        app.selected_site_index = 0;
+        app.realtime_level2_auto_refresh = true;
+        let mut pane = ViewPane::new(DisplayProduct::Moment(MomentType::Reflectivity));
+
+        // Same site as the live-polling primary: reuse its decode.
+        pane.pinned_site_id = Some("KTLX".to_owned());
+        assert_eq!(
+            app.extra_pane_live_source(&pane),
+            PaneLiveSource::SharedWithPrimary
+        );
+        // Different catalog site: the pane polls its own feed.
+        pane.pinned_site_id = Some("KEAX".to_owned());
+        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::UsSite);
+        // Primary paused: same-site pane now owns its own polling.
+        app.realtime_level2_auto_refresh = false;
+        pane.pinned_site_id = Some("KTLX".to_owned());
+        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::UsSite);
+        app.realtime_level2_auto_refresh = true;
+        // An armed international poll owns the primary view, so the primary
+        // is NOT live-polling KTLX and the pane must fetch it itself.
+        app.poll_source = PollSource::Intl {
+            provider_id: "smhi".to_owned(),
+            site_id: "sella".to_owned(),
+        };
+        app.poll_active = true;
+        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::UsSite);
+        app.poll_active = false;
+        app.poll_source = PollSource::CustomUrl(String::new());
+        // A pinned id outside the US catalog (inherited from an
+        // international/archive display) has nothing to poll.
+        pane.pinned_site_id = Some("sella".to_owned());
+        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::None);
+        // International pane source polls the provider.
+        pane.pinned_site_id = None;
+        pane.intl_source = Some(PaneIntlSource {
+            provider_id: "smhi".to_owned(),
+            site_id: "sella".to_owned(),
+            label: "Sella".to_owned(),
+        });
+        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::Intl);
+        // A following pane has no source of its own.
+        pane.intl_source = None;
+        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::None);
+    }
+
+    #[test]
+    fn archive_primary_hands_panes_a_paused_live_flag() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![RadarSite::new("KTLX")];
+        app.selected_site_index = 0;
+        // Archive/event loads clear the primary auto-refresh flag; panes
+        // initialized from that display inherit the pause so the live poll
+        // can never clobber archive browsing.
+        app.realtime_level2_auto_refresh = false;
+        app.volume = Some(Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("KTLX"),
+            Utc.with_ymd_and_hms(2013, 5, 20, 20, 0, 0).unwrap(),
+        )));
+        app.extra_panes.push(ViewPane::new(DisplayProduct::Moment(
+            MomentType::Reflectivity,
+        )));
+        app.initialize_extra_pane_from_primary(0);
+        let pane = &app.extra_panes[0];
+        assert!(!pane.live);
+        assert_eq!(
+            pane_live_poll_action(
+                pane.live,
+                app.extra_pane_live_source(pane),
+                pane.load_receiver.is_some(),
+                true,
+            ),
+            PaneLiveAction::Skip
+        );
+
+        // A live primary hands panes a live flag — users expect every
+        // independent pane to keep updating.
+        app.realtime_level2_auto_refresh = true;
+        app.initialize_extra_pane_from_primary(0);
+        assert!(app.extra_panes[0].live);
+    }
+
+    #[test]
+    fn same_site_pane_follows_primary_volume_and_trims_history() {
+        fn ktlx_live_frame(minutes_ago: i64) -> FrameHistoryEntry {
+            let volume = Arc::new(RadarVolume::new(
+                radar_core::RadarSite::new("KTLX"),
+                Utc::now() - chrono::Duration::minutes(minutes_ago),
+            ));
+            FrameHistoryEntry {
+                identity: frame_identity_for_volume(volume.as_ref()),
+                path: PathBuf::from(format!("chunks-ktlx-{minutes_ago}")),
+                volume,
+                timings: None,
+                status: FrameStatus::LiveComplete,
+                source_label: "realtime L2 KTLX".to_owned(),
+            }
+        }
+
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.sites = vec![RadarSite::new("KTLX")];
+        app.selected_site_index = 0;
+        app.realtime_level2_auto_refresh = true;
+        app.history_frame_limit = 3;
+        app.frame_history.push(ktlx_live_frame(20));
+        app.extra_panes.push(ViewPane::new(DisplayProduct::Moment(
+            MomentType::Reflectivity,
+        )));
+        app.extra_panes[0].pinned_site_id = Some("KTLX".to_owned());
+
+        app.maybe_refresh_extra_panes(&ctx);
+        // The pane holds the PRIMARY's decode (same Arc): one download and
+        // one decode feed both panes.
+        assert_eq!(app.extra_panes[0].frame_history.len(), 1);
+        assert!(Arc::ptr_eq(
+            &app.extra_panes[0].frame_history[0].volume,
+            &app.frame_history[0].volume
+        ));
+        assert!(
+            app.extra_panes[0].load_receiver.is_none(),
+            "no worker spawned"
+        );
+
+        // An unchanged primary volume is not re-installed every tick.
+        app.extra_panes[0].status = "sentinel".to_owned();
+        app.maybe_refresh_extra_panes(&ctx);
+        assert_eq!(app.extra_panes[0].status, "sentinel");
+
+        // Each new primary install propagates within a tick, and the pane
+        // history trim applies on this install path too.
+        for minutes_ago in [15, 10, 5] {
+            app.frame_history.push(ktlx_live_frame(minutes_ago));
+            app.maybe_refresh_extra_panes(&ctx);
+        }
+        assert_eq!(app.frame_history.len(), 4);
+        assert_eq!(
+            app.extra_panes[0].frame_history.len(),
+            3,
+            "trimmed to limit"
+        );
+        let newest_primary = &app.frame_history.last().expect("primary frames").volume;
+        assert!(Arc::ptr_eq(
+            app.extra_panes[0].volume.as_ref().expect("pane volume"),
+            newest_primary
+        ));
+
+        // A pane with its Live checkbox off stays untouched.
+        app.extra_panes[0].live = false;
+        app.extra_panes[0].status = "paused".to_owned();
+        app.frame_history.push(ktlx_live_frame(1));
+        app.maybe_refresh_extra_panes(&ctx);
+        assert_eq!(app.extra_panes[0].status, "paused");
+        assert_eq!(app.extra_panes[0].frame_history.len(), 3);
     }
 
     #[test]
