@@ -24,6 +24,7 @@ Grab the latest build from the **[Releases](../../releases)** page:
 | Platform | File |
 |---|---|
 | Windows x64 | `bowecho-windows-x64.exe` (or `.zip` with licenses bundled) |
+| Windows x64, CPU from ~2015+ | `bowecho-windows-x64-v3.exe` (AVX2: ~20-30% faster radar rendering) |
 | Windows ARM64 | `bowecho-windows-arm64.exe` |
 | macOS Apple Silicon | `bowecho-macos-apple-silicon.zip` |
 | macOS Intel | `bowecho-macos-intel.zip` |

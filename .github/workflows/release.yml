@@ -58,6 +58,13 @@ jobs:
           - os: windows-latest
             artifact_name: bowecho-windows-x64
             package: windows
+          # AVX2 variant for ~2015+ CPUs: benched -21% on the dealiased
+          # velocity raster and -30% on reflectivity vs baseline x86-64
+          # (KTLX 2013-05-20 Moore volume, pixel-identical output).
+          - os: windows-latest
+            artifact_name: bowecho-windows-x64-v3
+            package: windows
+            rustflags: "-C target-cpu=x86-64-v3"
           - os: windows-11-arm
             artifact_name: bowecho-windows-arm64
             package: windows
@@ -107,6 +114,8 @@ jobs:
           disk-root: "C:"
 
       - name: Build release binary
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release -p app_ui --bin bowecho
 
       - name: Detect Windows signing secrets
