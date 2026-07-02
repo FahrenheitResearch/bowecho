@@ -72,6 +72,9 @@ mod upper_air;
 mod vol3d;
 mod wofs;
 mod wofs_georef;
+mod worker_slot;
+
+use worker_slot::{SlotMessage, SlotPoll, StreamSlot, StreamState, WorkerSlot};
 
 const MIN_DISPLAYABLE_RADIALS: usize = 180;
 const DEFAULT_MAP_SCALE: f32 = 115.0;
@@ -1634,12 +1637,12 @@ struct ViewerApp {
     basemap_style: tiles::TileStyle,
     /// Official Italy DPC gridded/composite radar overlay via raw GeoTIFF download.
     italy_dpc_layer: Option<ItalyDpcMapLayer>,
-    italy_dpc_latest_rx: Option<mpsc::Receiver<ItalyDpcLatestResult>>,
+    italy_dpc_latest_rx: WorkerSlot<ItalyDpcLatestResult>,
     italy_dpc_texture: Option<(egui::TextureHandle, u64, ModelLayerView)>,
     italy_dpc_render_rx: Option<mpsc::Receiver<ModelLayerRender>>,
     /// Taiwan CWA O-A0059-001 gridded composite reflectivity overlay.
     taiwan_cwa_layer: Option<TaiwanCwaMapLayer>,
-    taiwan_cwa_latest_rx: Option<mpsc::Receiver<TaiwanCwaLatestResult>>,
+    taiwan_cwa_latest_rx: WorkerSlot<TaiwanCwaLatestResult>,
     taiwan_cwa_texture: Option<(egui::TextureHandle, u64, ModelLayerView)>,
     taiwan_cwa_render_rx: Option<mpsc::Receiver<ModelLayerRender>>,
     /// Latest gridded radar composites converted into normal model-map layers.
@@ -1810,10 +1813,10 @@ struct ViewerApp {
     /// Last right-click location (for the context menu's best-radar list).
     context_menu_lonlat: Option<(f32, f32)>,
     radar_operational_status_cache: BTreeMap<String, RadarOperationalStatusCacheEntry>,
-    radar_operational_status_rx: Option<mpsc::Receiver<RadarOperationalStatusLoad>>,
+    radar_operational_status_rx: WorkerSlot<RadarOperationalStatusLoad>,
     /// SPC storm reports for the archive date (tornado events browser).
     spc_reports: Option<Vec<SpcReport>>,
-    spc_receiver: Option<mpsc::Receiver<std::result::Result<Vec<SpcReport>, String>>>,
+    spc_receiver: WorkerSlot<std::result::Result<Vec<SpcReport>, String>>,
     /// One-shot debug launcher focus: after the requested archive object
     /// lands, switch to the known product/cut/view for the repro case.
     pending_debug_archive_case: Option<DebugArchiveCase>,
@@ -1884,7 +1887,7 @@ struct ViewerApp {
     model_layer_generation: u64,
     /// SPC-style upper-air quicklook (height/temp contours + model wind barbs).
     upper_air_layer: Option<upper_air::UpperAirLayer>,
-    upper_air_rx: Option<mpsc::Receiver<UpperAirResult>>,
+    upper_air_rx: WorkerSlot<UpperAirResult>,
     /// Primary radar layer opacity (draw-time tint; no re-render).
     radar_opacity: f32,
     /// Background model ingest (rw-ingest library) in flight.
@@ -1948,7 +1951,7 @@ struct ViewerApp {
     /// thread).
     intl_picker_provider: String,
     intl_sites: Option<Vec<data_source::international::IntlSite>>,
-    intl_sites_rx: Option<mpsc::Receiver<IntlSiteListResult>>,
+    intl_sites_rx: WorkerSlot<IntlSiteListResult>,
     /// Radar Coverage Explorer: metadata-only capability probe state for
     /// international sources.
     coverage_provider_id: String,
@@ -1956,7 +1959,7 @@ struct ViewerApp {
     coverage_frame_count: usize,
     coverage_date_input: String,
     coverage_hour_input: String,
-    coverage_probe_rx: Option<mpsc::Receiver<IntlCoverageProbeResult>>,
+    coverage_probe_rx: WorkerSlot<IntlCoverageProbeResult>,
     coverage_probe_result: Option<IntlCoverageProbeResult>,
     /// ORD archive helper inputs: direct CloudFerro openradar-archive fetches
     /// for historical European ODIM split files.
@@ -1965,7 +1968,7 @@ struct ViewerApp {
     ord_archive_hour_input: String,
     ord_archive_minute_input: String,
     ord_archive_scans: Option<Vec<data_source::international::OrdArchivePlan>>,
-    ord_archive_list_rx: Option<mpsc::Receiver<OrdArchiveListResult>>,
+    ord_archive_list_rx: WorkerSlot<OrdArchiveListResult>,
     ord_archive_loaded_range: Option<(usize, usize)>,
     /// Community research-feed cluster picker: the marker index (into
     /// [`data_source::community_feeds::community_markers`]) whose stacked
@@ -2168,13 +2171,13 @@ struct ViewerApp {
     dealiased_readout_cache: Option<DealiasedReadoutCache>,
     /// One-shot startup release check (background thread, fails silently):
     /// the receiver delivers `Some(tag)` when GitHub has a newer release.
-    update_check_rx: Option<mpsc::Receiver<Option<String>>>,
+    update_check_rx: WorkerSlot<Option<String>>,
     /// Newer release tag (e.g. "v0.9.0") — shown as a top-bar link.
     update_available: Option<String>,
     /// In-app update install worker (download → SHA-256 → Authenticode →
     /// swap, all off the UI thread). Only Windows release builds ever start
     /// one — see [`self_update_asset`].
-    self_update_rx: Option<mpsc::Receiver<SelfUpdateEvent>>,
+    self_update_rx: StreamSlot<SelfUpdateEvent>,
     /// Where the in-app update install stands; drives the progress/error
     /// copy in Settings > security & updates.
     self_update_phase: SelfUpdatePhase,
@@ -6490,11 +6493,11 @@ impl ViewerApp {
             tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(settings::tile_cache_dir())),
             basemap_style: tiles::TileStyle::DarkVector,
             italy_dpc_layer: None,
-            italy_dpc_latest_rx: None,
+            italy_dpc_latest_rx: WorkerSlot::idle("italy-dpc-latest"),
             italy_dpc_texture: None,
             italy_dpc_render_rx: None,
             taiwan_cwa_layer: None,
-            taiwan_cwa_latest_rx: None,
+            taiwan_cwa_latest_rx: WorkerSlot::idle("taiwan-cwa-latest"),
             taiwan_cwa_texture: None,
             taiwan_cwa_render_rx: None,
             grid_composite_rx: None,
@@ -6603,9 +6606,9 @@ impl ViewerApp {
             cross_section_armed: false,
             context_menu_lonlat: None,
             radar_operational_status_cache: BTreeMap::new(),
-            radar_operational_status_rx: None,
+            radar_operational_status_rx: WorkerSlot::idle("radar-operational-status"),
             spc_reports: None,
-            spc_receiver: None,
+            spc_receiver: WorkerSlot::idle("spc-tornado-reports"),
             pending_debug_archive_case: None,
             pending_data_pack_scene: None,
             data_pack_expanded: BTreeSet::new(),
@@ -6641,7 +6644,7 @@ impl ViewerApp {
             model_layer_build_rx: None,
             model_layer_generation: 0,
             upper_air_layer: None,
-            upper_air_rx: None,
+            upper_air_rx: WorkerSlot::idle("upper-air-quicklook"),
             radar_opacity: initial_radar_opacity,
             model_ingest_rx: None,
             model_ingest_progress_rx: None,
@@ -6657,20 +6660,20 @@ impl ViewerApp {
             poll_source: PollSource::CustomUrl(restored_poll_url.clone()),
             intl_picker_provider: restored_intl_provider,
             intl_sites: None,
-            intl_sites_rx: None,
+            intl_sites_rx: WorkerSlot::idle("intl-site-list"),
             coverage_provider_id: "smhi".to_owned(),
             coverage_site_id: "angelholm".to_owned(),
             coverage_frame_count: DEFAULT_ARCHIVE_FRAME_COUNT,
             coverage_date_input: String::new(),
             coverage_hour_input: String::new(),
-            coverage_probe_rx: None,
+            coverage_probe_rx: WorkerSlot::idle("coverage-probe"),
             coverage_probe_result: None,
             ord_archive_site_input: String::new(),
             ord_archive_date_input: String::new(),
             ord_archive_hour_input: String::new(),
             ord_archive_minute_input: String::new(),
             ord_archive_scans: None,
-            ord_archive_list_rx: None,
+            ord_archive_list_rx: WorkerSlot::idle("ord-archive-list"),
             ord_archive_loaded_range: None,
             community_menu: None,
             poll_url: restored_poll_url,
@@ -6801,9 +6804,9 @@ impl ViewerApp {
             storm_motion_speed_kt: DEFAULT_STORM_MOTION_SPEED_KT,
             derived_readout_cache: None,
             dealiased_readout_cache: None,
-            update_check_rx: None,
+            update_check_rx: WorkerSlot::idle("update-check"),
             update_available: None,
-            self_update_rx: None,
+            self_update_rx: StreamSlot::idle("self-update"),
             self_update_phase: SelfUpdatePhase::Idle,
             media: media::MediaShare::with_record_fps(restored_record_fps),
             brand_assets: brand::BrandTextureCache::default(),
@@ -15364,7 +15367,7 @@ impl ViewerApp {
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Tornado reports + tracks");
-            let fetching = self.spc_receiver.is_some();
+            let fetching = self.spc_receiver.in_flight();
             if ui
                 .add_enabled(!fetching, egui::Button::new("Fetch"))
                 .on_hover_text(
@@ -15431,11 +15434,9 @@ impl ViewerApp {
             return;
         };
         self.pin_event_day_for_archive_date(date);
-        let (sender, receiver) = mpsc::channel();
-        self.spc_receiver = Some(receiver);
+        self.spc_receiver.cancel();
         self.spc_reports = None;
-        let ctx = ctx.clone();
-        thread::spawn(move || {
+        self.spc_receiver.spawn(ctx, move |tx| {
             let url = format!(
                 "https://www.spc.noaa.gov/climo/reports/{}_rpts_filtered_torn.csv",
                 date.format("%y%m%d")
@@ -15443,8 +15444,7 @@ impl ViewerApp {
             let result = data_source::fetch_text(&url)
                 .map(|text| parse_spc_tornado_csv(date, &text))
                 .map_err(|err| err.to_string());
-            let _ = sender.send(result);
-            ctx.request_repaint();
+            let _ = tx.send(result);
         });
     }
 
@@ -15455,23 +15455,17 @@ impl ViewerApp {
     }
 
     fn poll_spc_reports(&mut self, ctx: &egui::Context) {
-        let Some(receiver) = &self.spc_receiver else {
-            return;
-        };
-        match receiver.try_recv() {
-            Ok(Ok(reports)) => {
-                self.spc_receiver = None;
+        match self.spc_receiver.poll() {
+            SlotPoll::Ready(Ok(reports)) => {
                 self.status = format!("SPC: {} tornado reports", reports.len());
                 self.spc_reports = Some(reports);
                 ctx.request_repaint();
             }
-            Ok(Err(err)) => {
-                self.spc_receiver = None;
+            SlotPoll::Ready(Err(err)) => {
                 self.status = format!("SPC fetch failed: {err}");
                 ctx.request_repaint();
             }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => self.spc_receiver = None,
+            SlotPoll::Idle | SlotPoll::Pending | SlotPoll::Disconnected => {}
         }
     }
 
@@ -19721,7 +19715,7 @@ impl ViewerApp {
     /// blocks the UI, and every failure (offline, rate-limited, bad JSON) is
     /// silent — offline users must see nothing.
     fn start_update_check(&mut self, ctx: &egui::Context) {
-        if self.update_check_rx.is_some() {
+        if self.update_check_rx.in_flight() {
             return;
         }
         let Some(api_url) = brand::github_latest_release_api_url(&self.app_settings.brand.repo_url)
@@ -19729,30 +19723,15 @@ impl ViewerApp {
             self.update_available = None;
             return;
         };
-        let (sender, receiver) = mpsc::channel();
-        self.update_check_rx = Some(receiver);
-        let ctx = ctx.clone();
-        thread::spawn(move || {
-            let newer = fetch_newer_release_tag(&api_url);
-            let repaint = newer.is_some();
-            let _ = sender.send(newer);
-            if repaint {
-                ctx.request_repaint();
-            }
+        self.update_check_rx.spawn(ctx, move |tx| {
+            let _ = tx.send(fetch_newer_release_tag(&api_url));
         });
     }
 
     fn poll_update_check(&mut self) {
-        let Some(receiver) = &self.update_check_rx else {
-            return;
-        };
-        match receiver.try_recv() {
-            Ok(newer) => {
-                self.update_available = newer;
-                self.update_check_rx = None;
-            }
-            Err(mpsc::TryRecvError::Disconnected) => self.update_check_rx = None,
-            Err(mpsc::TryRecvError::Empty) => {}
+        match self.update_check_rx.poll() {
+            SlotPoll::Ready(newer) => self.update_available = newer,
+            SlotPoll::Idle | SlotPoll::Pending | SlotPoll::Disconnected => {}
         }
     }
 
@@ -19762,7 +19741,7 @@ impl ViewerApp {
     /// Everything runs off the UI thread; [`Self::poll_self_update`] applies
     /// the worker's progress events. Never called without an explicit click.
     fn start_self_update(&mut self, ctx: &egui::Context, tag: &str, asset: &str) {
-        if self.self_update_rx.is_some() {
+        if self.self_update_rx.in_flight() {
             return;
         }
         // Belt and braces with the button gate: exe replacement only ever
@@ -19789,71 +19768,51 @@ impl ViewerApp {
                 return;
             }
         };
-        let (sender, receiver) = mpsc::channel();
-        self.self_update_rx = Some(receiver);
         self.self_update_phase = SelfUpdatePhase::Downloading {
             received: 0,
             total: None,
         };
-        let ctx = ctx.clone();
-        thread::spawn(move || {
-            match run_self_update_worker(&asset_url, &exe, &sender, &ctx) {
+        self.self_update_rx.spawn(ctx, move |tx| {
+            // The worker body is §9-protected ("logic untouched"): it keeps
+            // its own sender/ctx signature and progress-throttled repaints.
+            match run_self_update_worker(&asset_url, &exe, tx.sender(), tx.ctx()) {
                 Ok(()) => {
                     // Relaunch happens in `main` after the event loop exits
                     // (see `relaunch_after_self_update`); the UI only needs
                     // to close the viewport when it sees this event.
                     let _ = SELF_UPDATE_RELAUNCH.set(exe);
-                    let _ = sender.send(SelfUpdateEvent::SwapComplete);
+                    let _ = tx.send(SelfUpdateEvent::SwapComplete);
                 }
                 Err(reason) => {
-                    let _ = sender.send(SelfUpdateEvent::Failed(reason));
+                    let _ = tx.send(SelfUpdateEvent::Failed(reason));
                 }
             }
-            ctx.request_repaint();
         });
     }
 
     fn poll_self_update(&mut self, ctx: &egui::Context) {
-        let Some(receiver) = &self.self_update_rx else {
-            return;
-        };
-        let mut done = false;
-        loop {
-            match receiver.try_recv() {
-                Ok(event) => {
-                    if matches!(event, SelfUpdateEvent::SwapComplete) {
-                        // The verified binary is already in place on disk;
-                        // shut down cleanly so `on_exit` persistence runs,
-                        // then `main` spawns the new executable.
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    if matches!(
-                        event,
-                        SelfUpdateEvent::SwapComplete | SelfUpdateEvent::Failed(_)
-                    ) {
-                        done = true;
-                    }
-                    self.self_update_phase =
-                        apply_self_update_event(&self.self_update_phase, &event);
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    // Worker vanished without a terminal event (panic):
-                    // report honestly instead of showing progress forever.
-                    if matches!(
-                        self.self_update_phase,
-                        SelfUpdatePhase::Downloading { .. } | SelfUpdatePhase::Verifying
-                    ) {
-                        self.self_update_phase =
-                            SelfUpdatePhase::Failed("update stopped unexpectedly".to_owned());
-                    }
-                    done = true;
-                    break;
-                }
+        // No budget: install events are tiny and the stream ends at the
+        // first terminal event, exactly like the pre-slot drain loop.
+        let (events, state) = self.self_update_rx.drain(Duration::MAX);
+        for event in events {
+            if matches!(event, SelfUpdateEvent::SwapComplete) {
+                // The verified binary is already in place on disk;
+                // shut down cleanly so `on_exit` persistence runs,
+                // then `main` spawns the new executable.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
+            self.self_update_phase = apply_self_update_event(&self.self_update_phase, &event);
         }
-        if done {
-            self.self_update_rx = None;
+        // Worker vanished without a terminal event (panic):
+        // report honestly instead of showing progress forever.
+        if state == StreamState::Disconnected
+            && matches!(
+                self.self_update_phase,
+                SelfUpdatePhase::Downloading { .. } | SelfUpdatePhase::Verifying
+            )
+        {
+            self.self_update_phase =
+                SelfUpdatePhase::Failed("update stopped unexpectedly".to_owned());
         }
     }
 
@@ -21241,7 +21200,7 @@ impl ViewerApp {
         if release_check_available {
             ui.weak(security_update_status_label(
                 self.update_available.as_deref(),
-                self.update_check_rx.is_some(),
+                self.update_check_rx.in_flight(),
             ));
         } else {
             ui.weak("Automatic update checks are not configured for this brand.");
@@ -21257,7 +21216,7 @@ impl ViewerApp {
                 self_update_asset(option_env!("BOWECHO_UPDATE_ASSET"), cfg!(windows))
                     .filter(|_| self_update_repo_allowed(&self.app_settings.brand.repo_url));
             if let (Some(tag), Some(asset)) = (self.update_available.clone(), update_asset) {
-                let installing = self.self_update_rx.is_some()
+                let installing = self.self_update_rx.in_flight()
                     || matches!(self.self_update_phase, SelfUpdatePhase::Restarting);
                 if ui
                     .add_enabled(!installing, egui::Button::new("Install update"))
@@ -21278,7 +21237,7 @@ impl ViewerApp {
             {
                 ctx.open_url(egui::OpenUrl::new_tab(releases_url));
             }
-            let checking = self.update_check_rx.is_some();
+            let checking = self.update_check_rx.in_flight();
             if ui
                 .add_enabled(
                     release_check_available && !checking,
@@ -21290,7 +21249,7 @@ impl ViewerApp {
                 self.start_update_check(ctx);
                 self.status = format!("Checking {display_name} releases");
             }
-            if checking || self.self_update_rx.is_some() {
+            if checking || self.self_update_rx.in_flight() {
                 ui.spinner();
             }
         });
@@ -21717,7 +21676,7 @@ impl ViewerApp {
             )));
             if update_source_changed {
                 self.update_available = None;
-                self.update_check_rx = None;
+                self.update_check_rx.cancel();
                 self.start_update_check(ctx);
             }
             if let Err(error) = self.app_settings.save() {
@@ -26071,7 +26030,7 @@ impl ViewerApp {
                 self.status_or_activity_label("Model ingest running"),
             ));
         }
-        if self.italy_dpc_latest_rx.is_some() {
+        if self.italy_dpc_latest_rx.in_flight() {
             return Some(BackgroundActivity::indeterminate(
                 self.status_or_activity_label("Italy DPC raw GeoTIFF"),
             ));
@@ -26081,7 +26040,7 @@ impl ViewerApp {
                 self.status_or_activity_label("Rendering Italy DPC layer"),
             ));
         }
-        if self.taiwan_cwa_latest_rx.is_some() {
+        if self.taiwan_cwa_latest_rx.in_flight() {
             return Some(BackgroundActivity::indeterminate(
                 self.status_or_activity_label("Taiwan CWA composite"),
             ));
@@ -26221,7 +26180,7 @@ impl ViewerApp {
                 "Refreshing mPING reports",
             ));
         }
-        if self.spc_receiver.is_some() {
+        if self.spc_receiver.in_flight() {
             return Some(BackgroundActivity::indeterminate("Loading SPC reports"));
         }
         if let Some(day) = self.event_explorer.fetching_day() {
@@ -26286,7 +26245,7 @@ impl ViewerApp {
         if self.site_catalog_receiver.is_some() {
             return Some(BackgroundActivity::indeterminate("Loading radar catalog"));
         }
-        if self.intl_sites_rx.is_some() {
+        if self.intl_sites_rx.in_flight() {
             let provider = self.intl_picker_provider.trim();
             return Some(BackgroundActivity::indeterminate(if provider.is_empty() {
                 "Loading international sites".to_owned()
@@ -28743,11 +28702,8 @@ impl ViewerApp {
     }
 
     fn poll_radar_operational_status(&mut self, ctx: &egui::Context) {
-        let Some(receiver) = &self.radar_operational_status_rx else {
-            return;
-        };
-        match receiver.try_recv() {
-            Ok(load) => {
+        match self.radar_operational_status_rx.poll() {
+            SlotPoll::Ready(load) => {
                 let site_id = normalize_radar_station_id(&load.site_id)
                     .unwrap_or_else(|| load.site_id.to_ascii_uppercase());
                 let entry = match load.result {
@@ -28761,13 +28717,9 @@ impl ViewerApp {
                     },
                 };
                 self.radar_operational_status_cache.insert(site_id, entry);
-                self.radar_operational_status_rx = None;
                 ctx.request_repaint();
             }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.radar_operational_status_rx = None;
-            }
+            SlotPoll::Idle | SlotPoll::Pending | SlotPoll::Disconnected => {}
         }
     }
 
@@ -28805,7 +28757,7 @@ impl ViewerApp {
             }
             None => true,
         };
-        if !should_fetch || self.radar_operational_status_rx.is_some() {
+        if !should_fetch || self.radar_operational_status_rx.in_flight() {
             return;
         }
 
@@ -28814,11 +28766,9 @@ impl ViewerApp {
             RadarOperationalStatusCacheEntry::Loading { started_at: now },
         );
         let fallback_name = site.name.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.radar_operational_status_rx = Some(receiver);
-        thread::spawn(move || {
+        self.radar_operational_status_rx.spawn(ctx, move |tx| {
             let result = fetch_radar_operational_status(&site_id, fallback_name.as_deref());
-            let _ = sender.send(RadarOperationalStatusLoad { site_id, result });
+            let _ = tx.send(RadarOperationalStatusLoad { site_id, result });
         });
         ctx.request_repaint_after(Duration::from_millis(250));
     }
@@ -29728,7 +29678,7 @@ impl ViewerApp {
                     let mut clear_upper_air = false;
                     ui.horizontal(|ui| {
                         ui.weak("SPC UA:");
-                        let busy = self.upper_air_rx.is_some();
+                        let busy = self.upper_air_rx.in_flight();
                         for level in upper_air::QUICKLOOK_LEVELS_HPA {
                             if ui
                                 .add_enabled(
@@ -31470,29 +31420,22 @@ impl ViewerApp {
         self.intl_picker_provider = provider_id.to_owned();
         self.intl_sites = None;
         let provider_id = provider_id.to_owned();
-        let (sender, receiver) = mpsc::channel();
-        self.intl_sites_rx = Some(receiver);
-        let ctx_clone = ctx.clone();
-        thread::spawn(move || {
+        self.intl_sites_rx.cancel();
+        self.intl_sites_rx.spawn(ctx, move |tx| {
             let result = data_source::international::intl_providers()
                 .into_iter()
                 .find(|provider| provider.id() == provider_id)
                 .map(|provider| provider.list_sites())
                 .unwrap_or_else(|| Err(format!("unknown international provider '{provider_id}'")));
-            let _ = sender.send((provider_id, result));
-            ctx_clone.request_repaint();
+            let _ = tx.send((provider_id, result));
         });
     }
 
     /// Drain the site-catalog fetch; an answer for a provider the user has
     /// since navigated away from is dropped.
     fn poll_intl_sites(&mut self) {
-        let Some(receiver) = &self.intl_sites_rx else {
-            return;
-        };
-        match receiver.try_recv() {
-            Ok((provider_id, result)) => {
-                self.intl_sites_rx = None;
+        match self.intl_sites_rx.poll() {
+            SlotPoll::Ready((provider_id, result)) => {
                 if provider_id != self.intl_picker_provider {
                     return;
                 }
@@ -31501,8 +31444,7 @@ impl ViewerApp {
                     Err(message) => self.status = format!("Poll: {message}"),
                 }
             }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => self.intl_sites_rx = None,
+            SlotPoll::Idle | SlotPoll::Pending | SlotPoll::Disconnected => {}
         }
     }
 
@@ -31516,25 +31458,18 @@ impl ViewerApp {
         let count = self.coverage_frame_count.clamp(1, MAX_HISTORY_FRAME_LIMIT);
         self.coverage_frame_count = count;
         self.coverage_probe_result = None;
-        let (sender, receiver) = mpsc::channel();
-        self.coverage_probe_rx = Some(receiver);
+        self.coverage_probe_rx.cancel();
         self.status = format!("Coverage probe: {provider_id}/{site_id}");
-        let ctx_clone = ctx.clone();
-        thread::spawn(move || {
+        self.coverage_probe_rx.spawn(ctx, move |tx| {
             let result = probe_intl_recent_coverage(&provider_id, &site_id, count);
-            let _ = sender.send(result);
-            ctx_clone.request_repaint();
+            let _ = tx.send(result);
         });
         ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
     }
 
     fn poll_coverage_probe(&mut self, ctx: &egui::Context) {
-        let Some(receiver) = &self.coverage_probe_rx else {
-            return;
-        };
-        match receiver.try_recv() {
-            Ok(result) => {
-                self.coverage_probe_rx = None;
+        match self.coverage_probe_rx.poll() {
+            SlotPoll::Ready(result) => {
                 self.status = match &result {
                     Ok(probe) => format!(
                         "Coverage probe: {} {} listed {}/{} frames",
@@ -31545,11 +31480,11 @@ impl ViewerApp {
                 self.coverage_probe_result = Some(result);
                 ctx.request_repaint();
             }
-            Err(mpsc::TryRecvError::Empty) => {
+            SlotPoll::Idle => {}
+            SlotPoll::Pending => {
                 ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
             }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.coverage_probe_rx = None;
+            SlotPoll::Disconnected => {
                 self.status = "Coverage probe worker disconnected".to_owned();
             }
         }
@@ -31811,42 +31746,34 @@ impl ViewerApp {
                     return;
                 }
             };
-        let (sender, receiver) = mpsc::channel();
-        self.ord_archive_list_rx = Some(receiver);
+        self.ord_archive_list_rx.cancel();
         self.ord_archive_scans = None;
         self.ord_archive_loaded_range = None;
         self.status = format!("ORD archive: listing {site_id} {date}");
-        let ctx_clone = ctx.clone();
-        thread::spawn(move || {
+        self.ord_archive_list_rx.spawn(ctx, move |tx| {
             let result = fetch_ord_archive_day_plans(&site_id, date);
-            let _ = sender.send(result);
-            ctx_clone.request_repaint();
+            let _ = tx.send(result);
         });
         ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
     }
 
     fn poll_ord_archive_listing(&mut self, ctx: &egui::Context) {
-        let Some(receiver) = &self.ord_archive_list_rx else {
-            return;
-        };
-        match receiver.try_recv() {
-            Ok(Ok(scans)) => {
-                self.ord_archive_list_rx = None;
+        match self.ord_archive_list_rx.poll() {
+            SlotPoll::Ready(Ok(scans)) => {
                 self.status = format!("ORD archive: {} scans listed", scans.len());
                 self.ord_archive_scans = Some(scans);
                 ctx.request_repaint();
             }
-            Ok(Err(err)) => {
-                self.ord_archive_list_rx = None;
+            SlotPoll::Ready(Err(err)) => {
                 self.ord_archive_scans = None;
                 self.status = format!("ORD archive listing failed: {err}");
                 ctx.request_repaint();
             }
-            Err(mpsc::TryRecvError::Empty) => {
+            SlotPoll::Idle => {}
+            SlotPoll::Pending => {
                 ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
             }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.ord_archive_list_rx = None;
+            SlotPoll::Disconnected => {
                 self.status = "ORD archive listing worker disconnected".to_owned();
             }
         }
@@ -32477,11 +32404,9 @@ impl ViewerApp {
         level_hpa: u16,
         ctx: &egui::Context,
     ) {
-        if self.upper_air_rx.is_some() {
+        if self.upper_air_rx.in_flight() {
             return;
         }
-        let (sender, receiver) = mpsc::channel();
-        self.upper_air_rx = Some(receiver);
         self.status = format!(
             "Upper-air quicklook: building {} {} F{:03} {} mb...",
             hour.model.to_uppercase(),
@@ -32489,33 +32414,25 @@ impl ViewerApp {
             hour.hour,
             level_hpa
         );
-        let ctx_clone = ctx.clone();
-        thread::spawn(move || {
+        self.upper_air_rx.spawn(ctx, move |tx| {
             rw_ingest::throttle::set_current_thread_background_priority();
             let result = upper_air::build_layer(settings::model_store_dir(), hour, level_hpa);
-            let _ = sender.send(result);
-            ctx_clone.request_repaint();
+            let _ = tx.send(result);
         });
     }
 
     fn poll_upper_air(&mut self, ctx: &egui::Context) {
-        let Some(receiver) = &self.upper_air_rx else {
-            return;
-        };
-        match receiver.try_recv() {
-            Ok(Ok(layer)) => {
-                self.upper_air_rx = None;
+        match self.upper_air_rx.poll() {
+            SlotPoll::Ready(Ok(layer)) => {
                 self.status = layer.summary.clone();
                 self.upper_air_layer = Some(layer);
                 ctx.request_repaint();
             }
-            Ok(Err(message)) => {
-                self.upper_air_rx = None;
+            SlotPoll::Ready(Err(message)) => {
                 self.status = format!("Upper-air quicklook failed: {message}");
                 ctx.request_repaint();
             }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => self.upper_air_rx = None,
+            SlotPoll::Idle | SlotPoll::Pending | SlotPoll::Disconnected => {}
         }
     }
 
@@ -33099,7 +33016,7 @@ impl ViewerApp {
 
     fn add_italy_dpc_layer(&mut self, product: ItalyDpcMapProduct, ctx: &egui::Context) {
         self.italy_dpc_layer = Some(ItalyDpcMapLayer::new(product));
-        self.italy_dpc_latest_rx = None;
+        self.italy_dpc_latest_rx.cancel();
         self.italy_dpc_render_rx = None;
         self.italy_dpc_texture = None;
         self.map_center_lat = 42.0;
@@ -33126,14 +33043,14 @@ impl ViewerApp {
                 self.italy_dpc_render_rx = None;
             }
         }
-        self.italy_dpc_latest_rx = None;
+        self.italy_dpc_latest_rx.cancel();
         self.start_italy_dpc_latest_refresh(ctx, true);
         self.status = format!("Italy DPC: switched to {} raw GeoTIFF", product.label());
         ctx.request_repaint();
     }
 
     fn start_italy_dpc_latest_refresh(&mut self, ctx: &egui::Context, force: bool) {
-        if self.italy_dpc_latest_rx.is_some() && !force {
+        if self.italy_dpc_latest_rx.in_flight() && !force {
             return;
         }
         let Some(layer) = &mut self.italy_dpc_layer else {
@@ -33148,55 +33065,50 @@ impl ViewerApp {
         let product = layer.product;
         layer.last_refresh_attempt = Some(Instant::now());
         layer.error = None;
-        let (sender, receiver) = mpsc::channel();
-        self.italy_dpc_latest_rx = Some(receiver);
-        let ctx_clone = ctx.clone();
-        thread::spawn(move || {
+        // A forced refresh replaces any in-flight fetch (drop-rx cancel),
+        // exactly like the pre-slot receiver swap.
+        self.italy_dpc_latest_rx.cancel();
+        self.italy_dpc_latest_rx.spawn(ctx, move |tx| {
             let result = italy_dpc::load_latest_frame(product.product_type());
-            let _ = sender.send((product, result));
-            ctx_clone.request_repaint();
+            let _ = tx.send((product, result));
         });
     }
 
     fn poll_italy_dpc_layer(&mut self, ctx: &egui::Context) {
-        if let Some(receiver) = &self.italy_dpc_latest_rx {
-            match receiver.try_recv() {
-                Ok((product, result)) => {
-                    self.italy_dpc_latest_rx = None;
-                    if let Some(layer) = &mut self.italy_dpc_layer
-                        && layer.product == product
-                    {
-                        match result {
-                            Ok(frame) => {
-                                let time = chrono::Utc
-                                    .timestamp_millis_opt(frame.product_time_millis)
-                                    .single()
-                                    .map(|time| time.format("%H:%MZ").to_string())
-                                    .unwrap_or_else(|| "latest".to_owned());
-                                layer.product_time_millis = Some(frame.product_time_millis);
-                                layer.period = frame.period.clone();
-                                layer.source_identity = Some(frame.identity.clone());
-                                layer.frame = Some(Arc::new(frame));
-                                layer.fetched_at = Some(Instant::now());
-                                layer.error = None;
-                                self.italy_dpc_texture = None;
-                                self.italy_dpc_render_rx = None;
-                                self.status = format!(
-                                    "Italy DPC: {} raw GeoTIFF {time}",
-                                    layer.product.short_label()
-                                );
-                            }
-                            Err(err) => {
-                                layer.error = Some(compact_layer_status(&err, 80));
-                                self.status = format!("Italy DPC: {err}");
-                            }
+        match self.italy_dpc_latest_rx.poll() {
+            SlotPoll::Ready((product, result)) => {
+                if let Some(layer) = &mut self.italy_dpc_layer
+                    && layer.product == product
+                {
+                    match result {
+                        Ok(frame) => {
+                            let time = chrono::Utc
+                                .timestamp_millis_opt(frame.product_time_millis)
+                                .single()
+                                .map(|time| time.format("%H:%MZ").to_string())
+                                .unwrap_or_else(|| "latest".to_owned());
+                            layer.product_time_millis = Some(frame.product_time_millis);
+                            layer.period = frame.period.clone();
+                            layer.source_identity = Some(frame.identity.clone());
+                            layer.frame = Some(Arc::new(frame));
+                            layer.fetched_at = Some(Instant::now());
+                            layer.error = None;
+                            self.italy_dpc_texture = None;
+                            self.italy_dpc_render_rx = None;
+                            self.status = format!(
+                                "Italy DPC: {} raw GeoTIFF {time}",
+                                layer.product.short_label()
+                            );
+                        }
+                        Err(err) => {
+                            layer.error = Some(compact_layer_status(&err, 80));
+                            self.status = format!("Italy DPC: {err}");
                         }
                     }
-                    ctx.request_repaint();
                 }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => self.italy_dpc_latest_rx = None,
+                ctx.request_repaint();
             }
+            SlotPoll::Idle | SlotPoll::Pending | SlotPoll::Disconnected => {}
         }
         if let Some(receiver) = &self.italy_dpc_render_rx {
             match receiver.try_recv() {
@@ -33225,7 +33137,7 @@ impl ViewerApp {
             .italy_dpc_layer
             .as_ref()
             .is_some_and(|layer| layer.visible)
-            && self.italy_dpc_latest_rx.is_none()
+            && !self.italy_dpc_latest_rx.in_flight()
         {
             self.start_italy_dpc_latest_refresh(ctx, false);
         }
@@ -33233,7 +33145,7 @@ impl ViewerApp {
 
     fn add_taiwan_cwa_layer(&mut self, ctx: &egui::Context) {
         self.taiwan_cwa_layer = Some(TaiwanCwaMapLayer::new());
-        self.taiwan_cwa_latest_rx = None;
+        self.taiwan_cwa_latest_rx.cancel();
         self.taiwan_cwa_render_rx = None;
         self.taiwan_cwa_texture = None;
         self.map_center_lat = 23.8;
@@ -33245,7 +33157,7 @@ impl ViewerApp {
     }
 
     fn start_taiwan_cwa_latest_refresh(&mut self, ctx: &egui::Context, force: bool) {
-        if self.taiwan_cwa_latest_rx.is_some() && !force {
+        if self.taiwan_cwa_latest_rx.in_flight() && !force {
             return;
         }
         let Some(layer) = &mut self.taiwan_cwa_layer else {
@@ -33262,56 +33174,54 @@ impl ViewerApp {
         // The global status bar is for user-initiated loads only; the 60-s
         // auto-refresh reports through the rail's fetching state.
         layer.announce_status = force;
-        let (sender, receiver) = mpsc::channel();
-        self.taiwan_cwa_latest_rx = Some(receiver);
+        // A forced refresh replaces any in-flight fetch (drop-rx cancel),
+        // exactly like the pre-slot receiver swap.
+        self.taiwan_cwa_latest_rx.cancel();
         if force {
             self.status = "Taiwan CWA: fetching latest composite reflectivity".to_owned();
         }
-        let ctx_clone = ctx.clone();
-        thread::spawn(move || {
+        // The job only fetches and sends: every status string above and in
+        // the drain below is written by the owner (spec §11.B.3 — the one
+        // permitted Phase-1 behavior change, pinned by
+        // `background_taiwan_cwa_refresh_does_not_hijack_the_global_status_bar`).
+        self.taiwan_cwa_latest_rx.spawn(ctx, move |tx| {
             let result = taiwan_cwa::load_latest_frame();
-            let _ = sender.send(result);
-            ctx_clone.request_repaint();
+            let _ = tx.send(result);
         });
     }
 
     fn poll_taiwan_cwa_layer(&mut self, ctx: &egui::Context) {
-        if let Some(receiver) = &self.taiwan_cwa_latest_rx {
-            match receiver.try_recv() {
-                Ok(result) => {
-                    self.taiwan_cwa_latest_rx = None;
-                    if let Some(layer) = &mut self.taiwan_cwa_layer {
-                        match result {
-                            Ok(frame) => {
-                                let time = frame.time.format("%H:%MZ").to_string();
-                                layer.frame_time = Some(frame.time);
-                                layer.source_identity = Some(frame.identity.clone());
-                                layer.frame = Some(Arc::new(frame));
-                                layer.fetched_at = Some(Instant::now());
-                                layer.error = None;
-                                self.taiwan_cwa_texture = None;
-                                self.taiwan_cwa_render_rx = None;
-                                // Background refreshes stay off the global
-                                // status bar; the rail shows the frame time.
-                                if layer.announce_status {
-                                    self.status =
-                                        format!("Taiwan CWA: composite reflectivity {time}");
-                                }
+        match self.taiwan_cwa_latest_rx.poll() {
+            SlotPoll::Ready(result) => {
+                if let Some(layer) = &mut self.taiwan_cwa_layer {
+                    match result {
+                        Ok(frame) => {
+                            let time = frame.time.format("%H:%MZ").to_string();
+                            layer.frame_time = Some(frame.time);
+                            layer.source_identity = Some(frame.identity.clone());
+                            layer.frame = Some(Arc::new(frame));
+                            layer.fetched_at = Some(Instant::now());
+                            layer.error = None;
+                            self.taiwan_cwa_texture = None;
+                            self.taiwan_cwa_render_rx = None;
+                            // Background refreshes stay off the global
+                            // status bar; the rail shows the frame time.
+                            if layer.announce_status {
+                                self.status = format!("Taiwan CWA: composite reflectivity {time}");
                             }
-                            Err(err) => {
-                                layer.error = Some(compact_layer_status(&err, 80));
-                                if layer.announce_status {
-                                    layer.announce_status = false;
-                                    self.status = format!("Taiwan CWA: {err}");
-                                }
+                        }
+                        Err(err) => {
+                            layer.error = Some(compact_layer_status(&err, 80));
+                            if layer.announce_status {
+                                layer.announce_status = false;
+                                self.status = format!("Taiwan CWA: {err}");
                             }
                         }
                     }
-                    ctx.request_repaint();
                 }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => self.taiwan_cwa_latest_rx = None,
+                ctx.request_repaint();
             }
+            SlotPoll::Idle | SlotPoll::Pending | SlotPoll::Disconnected => {}
         }
         if let Some(receiver) = &self.taiwan_cwa_render_rx {
             match receiver.try_recv() {
@@ -33348,7 +33258,7 @@ impl ViewerApp {
             .taiwan_cwa_layer
             .as_ref()
             .is_some_and(|layer| layer.visible)
-            && self.taiwan_cwa_latest_rx.is_none()
+            && !self.taiwan_cwa_latest_rx.in_flight()
         {
             self.start_taiwan_cwa_latest_refresh(ctx, false);
         }
@@ -45773,6 +45683,18 @@ enum SelfUpdateEvent {
     Failed(String),
 }
 
+/// The install worker streams progress into a [`StreamSlot`]; the slot stays
+/// busy until the outcome event lands (or the worker vanishes — see
+/// [`ViewerApp::poll_self_update`]'s honest-failure fallback).
+impl SlotMessage for SelfUpdateEvent {
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            SelfUpdateEvent::SwapComplete | SelfUpdateEvent::Failed(_)
+        )
+    }
+}
+
 /// UI-visible lifecycle of the in-app update install.
 #[derive(Clone, Debug, PartialEq)]
 enum SelfUpdatePhase {
@@ -52519,7 +52441,7 @@ mod tests {
         // Background 60-s auto-refresh completion (announce_status = false):
         // the rail carries the result; the global status bar stays untouched.
         let (sender, receiver) = mpsc::channel();
-        app.taiwan_cwa_latest_rx = Some(receiver);
+        app.taiwan_cwa_latest_rx.inject_for_test(receiver);
         sender.send(Err("listing throttled".to_owned())).unwrap();
         app.poll_taiwan_cwa_layer(&ctx);
 
@@ -52530,16 +52452,20 @@ mod tests {
             .and_then(|layer| layer.error.clone());
         assert_eq!(error.as_deref(), Some("listing throttled"));
 
-        // User-initiated loads (layer add / rail refresh) still announce.
+        // User-initiated loads (layer add / rail refresh) still announce:
+        // the WorkerSlot job only sends the result — this status string is
+        // written by the drain site (spec §11.B.3).
         let layer = app.taiwan_cwa_layer.as_mut().expect("layer");
         layer.announce_status = true;
         layer.last_refresh_attempt = Some(Instant::now());
         let (sender, receiver) = mpsc::channel();
-        app.taiwan_cwa_latest_rx = Some(receiver);
+        app.taiwan_cwa_latest_rx.inject_for_test(receiver);
         sender.send(Err("listing throttled".to_owned())).unwrap();
         app.poll_taiwan_cwa_layer(&ctx);
 
         assert_eq!(app.status, "Taiwan CWA: listing throttled");
+        // The Ready drain cleared the slot — no half-drained states.
+        assert!(!app.taiwan_cwa_latest_rx.in_flight());
     }
 
     /// Bolton (1980) round-trip sanity: saturated air dews at the air
@@ -60635,6 +60561,66 @@ mod tests {
         );
     }
 
+    /// Contract harness (v0.29 Phase 1): the same-site half of the
+    /// `install_polled_volume` rule table (the cross-site clear is pinned by
+    /// `polled_volume_drops_previous_site_history`). Same-site frames upsert
+    /// by identity without clearing; the cursor follows the feed unless the
+    /// user is looping — the `FollowNewestUnlessPlaying` selection policy the
+    /// Phase-4 engine must declare for the primary poll path.
+    #[test]
+    fn polled_volume_same_site_upserts_and_playing_loop_keeps_its_cursor() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
+
+        let first = test_decoded_live_partial(PathBuf::from("FWLX-0130"), "FWLX", scan_time, 10);
+        app.install_polled_volume("FWLX20260608_0130", first.volume, &ctx);
+        let second = test_decoded_live_partial(
+            PathBuf::from("FWLX-0133"),
+            "FWLX",
+            scan_time + chrono::Duration::minutes(3),
+            10,
+        );
+        app.install_polled_volume("FWLX20260608_0133", second.volume, &ctx);
+
+        // Same-site install appends and follows the feed.
+        assert_eq!(app.frame_history.len(), 2);
+        assert_eq!(app.selected_frame_index, 1);
+
+        // Re-polling an identical scan (same site + scan time) replaces the
+        // entry in place — never a duplicate loop frame.
+        let repeat = test_decoded_live_partial(
+            PathBuf::from("FWLX-0133-repeat"),
+            "FWLX",
+            scan_time + chrono::Duration::minutes(3),
+            10,
+        );
+        app.install_polled_volume("FWLX20260608_0133b", repeat.volume, &ctx);
+        assert_eq!(app.frame_history.len(), 2);
+        assert_eq!(
+            app.frame_history[1].path,
+            PathBuf::from("poll://FWLX20260608_0133b"),
+            "identity match replaces the stored entry"
+        );
+
+        // A playing loop holds its cursor: the live feed must not yank
+        // playback to the newest frame.
+        app.history_playing = true;
+        app.selected_frame_index = 0;
+        let third = test_decoded_live_partial(
+            PathBuf::from("FWLX-0136"),
+            "FWLX",
+            scan_time + chrono::Duration::minutes(6),
+            10,
+        );
+        app.install_polled_volume("FWLX20260608_0136", third.volume, &ctx);
+        assert_eq!(app.frame_history.len(), 3);
+        assert_eq!(
+            app.selected_frame_index, 0,
+            "playing loop keeps its cursor while the feed grows"
+        );
+    }
+
     #[test]
     fn custom_poll_links_matching_built_in_community_feeds_are_deduped() {
         let entry = settings::CustomPollLinkEntry {
@@ -61978,6 +61964,89 @@ mod tests {
         assert!(app.intl_source_owns_primary_display());
     }
 
+    /// Contract harness (v0.29 Phase 1, spec §11 Milestone A item 2): the
+    /// history-clear rule table for `start_intl_poll`, pinned so the Phase-4
+    /// `switch_policy(old, new)` extraction must reproduce it — an ACTIVE
+    /// same-site restart keeps the loop, every other switch pair clears.
+    #[test]
+    fn intl_poll_switch_keeps_active_same_site_history_and_clears_the_rest() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let seed_frame = |app: &mut ViewerApp, site: &str| {
+            let volume = Arc::new(RadarVolume::new(
+                radar_core::RadarSite::new(site),
+                Utc::now() - chrono::Duration::minutes(4),
+            ));
+            app.frame_history.push(FrameHistoryEntry {
+                identity: frame_identity_for_volume(&volume),
+                path: PathBuf::from(format!("intl:{site}")),
+                volume: Arc::clone(&volume),
+                timings: None,
+                status: FrameStatus::Complete,
+                source_label: format!("smhi {site}"),
+            });
+            app.volume = Some(volume);
+        };
+
+        // KEEP: restarting the poll for the SAME active intl site (the
+        // Start button after a pause-free re-pick) keeps the loop history…
+        app.poll_source = PollSource::Intl {
+            provider_id: "smhi".to_owned(),
+            site_id: "angelholm".to_owned(),
+        };
+        app.poll_active = true;
+        seed_frame(&mut app, "angelholm");
+        app.poll_last_file = Some("smhi/angelholm 2026-06-30T12:00Z".to_owned());
+        let (_load_sender, load_receiver) = mpsc::channel::<AsyncLoadResult>();
+        app.load_receiver = Some(load_receiver);
+        app.start_intl_poll("smhi".to_owned(), "angelholm".to_owned(), &ctx);
+        assert_eq!(
+            app.frame_history.len(),
+            1,
+            "same-site restart keeps history"
+        );
+        assert!(app.volume.is_some(), "displayed frame survives");
+        // …while the poll bookkeeping still resets: the dedupe key clears so
+        // the next tick installs, and an in-flight auto-refresh load (which
+        // would land after the first poll install and wipe it) is dropped.
+        assert_eq!(app.poll_last_file, None);
+        assert!(app.load_receiver.is_none());
+        assert!(app.poll_active);
+
+        // CLEAR: switching to a different site of the SAME provider.
+        app.start_intl_poll("smhi".to_owned(), "sella".to_owned(), &ctx);
+        assert!(
+            app.frame_history.is_empty(),
+            "cross-site intl switch clears the loop"
+        );
+        assert!(app.volume.is_none());
+
+        // CLEAR: same ids but the poll is NOT active (e.g. starting the
+        // live poll on a site currently shown as an archive display): the
+        // same-site guard requires an active poll, so this restarts fresh —
+        // and the previous site's in-flight loop stream is dropped with it.
+        seed_frame(&mut app, "sella");
+        app.poll_active = false;
+        let (_loop_sender, loop_receiver) = mpsc::channel::<IntlLoopFrameMessage>();
+        app.intl_loop_rx = Some(loop_receiver);
+        app.start_intl_poll("smhi".to_owned(), "sella".to_owned(), &ctx);
+        assert!(
+            app.frame_history.is_empty(),
+            "inactive same-site start clears (poll_active gates the keep)"
+        );
+        assert!(app.volume.is_none());
+        assert!(app.intl_loop_rx.is_none(), "old loop stream dropped");
+        assert!(app.poll_active);
+
+        // CLEAR: cross-provider switch for the same site id string.
+        seed_frame(&mut app, "sella");
+        app.start_intl_poll("dwd".to_owned(), "sella".to_owned(), &ctx);
+        assert!(
+            app.frame_history.is_empty(),
+            "cross-provider switch clears even with an identical site id"
+        );
+    }
+
     #[test]
     fn poll_source_settings_round_trip() {
         let mut settings = settings::AppSettings::default();
@@ -62010,6 +62079,59 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(PollSource::intl_from_settings(&blank), None);
+    }
+
+    /// Contract harness (v0.29 Phase 1, spec §11 Milestone A item 4): a
+    /// v0.28-shaped config.json parses field-for-field and survives a
+    /// save/load round trip. These are the on-disk encodings the v0.29 site
+    /// model (SiteRef::settings_key et al.) must keep parsing forever.
+    #[test]
+    fn v028_settings_encodings_round_trip() {
+        let raw = r#"{
+            "startup_site": "KEAX",
+            "favorites": ["KTLX", "TOKC", "KCRI"],
+            "poll_url": "http://example.com/dow8",
+            "intl_provider": "smhi",
+            "intl_site": "angelholm"
+        }"#;
+        let settings = settings::AppSettings::from_json(raw);
+        assert_eq!(settings.startup_site.as_deref(), Some("KEAX"));
+        assert_eq!(settings.favorites, vec!["KTLX", "TOKC", "KCRI"]);
+        assert_eq!(settings.poll_url, "http://example.com/dow8");
+        assert_eq!(settings.intl_provider, "smhi");
+        assert_eq!(settings.intl_site, "angelholm");
+
+        let restored = settings::AppSettings::from_json(&settings.to_json());
+        assert_eq!(restored, settings, "save/load round trip is lossless");
+    }
+
+    /// Contract harness (v0.29 Phase 1): CURRENT bare-key favorites
+    /// behavior, pinned — mixed case in, canonical uppercase stored,
+    /// case-insensitive membership and removal. Milestone C's uppercasing
+    /// fix exempts ONLY namespaced ':' keys (e.g. "intl:ord:deess", whose
+    /// intl site ids are case-significant lowercase); every bare-key cell
+    /// below must stay true after it lands. The namespaced cells belong to
+    /// the settings-crate tests, beside that fix.
+    #[test]
+    fn bare_favorite_keys_uppercase_on_add_v028_behavior() {
+        let mut settings = settings::AppSettings::default();
+        settings.add_favorite("ktlx");
+        assert_eq!(settings.favorites, vec!["KTLX"]);
+        // Duplicate detection is case-insensitive: no second entry.
+        settings.add_favorite("Ktlx");
+        assert_eq!(settings.favorites, vec!["KTLX"]);
+        assert!(settings.is_favorite("kTlX"));
+        assert!(!settings.is_favorite("KEAX"));
+
+        // The stored (uppercased) form is what round-trips through JSON.
+        settings.add_favorite("tokc");
+        let restored = settings::AppSettings::from_json(&settings.to_json());
+        assert_eq!(restored.favorites, vec!["KTLX", "TOKC"]);
+
+        // Removal matches case-insensitively against the stored form.
+        settings.remove_favorite("Tokc");
+        assert_eq!(settings.favorites, vec!["KTLX"]);
+        assert!(!settings.is_favorite("tokc"));
     }
 
     #[test]
@@ -63733,6 +63855,120 @@ mod tests {
         assert_eq!(kind, "LIVE");
     }
 
+    /// Contract harness (v0.29 Phase 1, spec §11 Milestone A item 1): the
+    /// full chip truth table for `mode_chip_state_with_live_and_stale_floor`
+    /// at floor = 0 (the US path) and floor = INTL_STALE_CHIP_FLOOR_SECONDS,
+    /// pinned cell by cell so the Phase-4 `LoopEngine::liveness()` port must
+    /// reproduce every label byte-for-byte.
+    #[test]
+    fn mode_chip_stale_floor_truth_table() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let volume_aged = |seconds: i64| {
+            Some(Arc::new(RadarVolume::new(
+                radar_core::RadarSite::new("KTLX"),
+                Utc::now() - chrono::Duration::seconds(seconds),
+            )))
+        };
+
+        // No volume -> no chip, regardless of liveness or floor.
+        app.volume = None;
+        assert!(
+            app.mode_chip_state_with_live_and_stale_floor(true, INTL_STALE_CHIP_FLOOR_SECONDS)
+                .is_none()
+        );
+
+        // live, age <= the user threshold (default 480 s): LIVE either way.
+        app.volume = volume_aged(60);
+        for floor in [0, INTL_STALE_CHIP_FLOOR_SECONDS] {
+            let (label, _, kind) = app
+                .mode_chip_state_with_live_and_stale_floor(true, floor)
+                .expect("fresh live chip");
+            assert_eq!((label.as_str(), kind), ("● LIVE", "LIVE"), "floor {floor}");
+        }
+
+        // live, age past the user threshold but inside the intl floor:
+        // floor 0 flags STALE with the minute count; the 1800 s floor
+        // rescues a routine international publish gap.
+        app.volume = volume_aged(600);
+        let (label, _, kind) = app
+            .mode_chip_state_with_live_and_stale_floor(true, 0)
+            .expect("stale live chip");
+        assert_eq!(kind, "STALE");
+        assert_eq!(label, "● LIVE · STALE 10m");
+        let (label, _, kind) = app
+            .mode_chip_state_with_live_and_stale_floor(true, INTL_STALE_CHIP_FLOOR_SECONDS)
+            .expect("floor-rescued live chip");
+        assert_eq!((label.as_str(), kind), ("● LIVE", "LIVE"));
+
+        // live, age past max(user, floor): STALE at both floors.
+        app.volume = volume_aged(2000);
+        let (label, _, kind) = app
+            .mode_chip_state_with_live_and_stale_floor(true, INTL_STALE_CHIP_FLOOR_SECONDS)
+            .expect("stale intl chip");
+        assert_eq!(kind, "STALE");
+        assert_eq!(label, "● LIVE · STALE 33m");
+
+        // A user threshold ABOVE the floor still wins — the floor is a
+        // floor, not an override.
+        let mut style_settings = styles::StyleSettings::default();
+        style_settings.radar_age.stale_chip_seconds = Some(3600);
+        app.style_registry = styles::StyleRegistry::from_settings(&style_settings);
+        let (label, _, kind) = app
+            .mode_chip_state_with_live_and_stale_floor(true, INTL_STALE_CHIP_FLOOR_SECONDS)
+            .expect("user-threshold live chip");
+        assert_eq!((label.as_str(), kind), ("● LIVE", "LIVE"));
+        app.style_registry =
+            styles::StyleRegistry::from_settings(&styles::StyleSettings::default());
+
+        // not live, age < 24 h: relative ARCHIVE, identical at both floors
+        // (the floor only moves the LIVE/STALE boundary, never the
+        // live/archive split).
+        app.volume = volume_aged(600);
+        for floor in [0, INTL_STALE_CHIP_FLOOR_SECONDS] {
+            let (label, _, kind) = app
+                .mode_chip_state_with_live_and_stale_floor(false, floor)
+                .expect("archive chip");
+            assert_eq!(kind, "ARCH", "floor {floor}");
+            assert_eq!(label, "ARCHIVE · 10m old", "floor {floor}");
+        }
+
+        // not live, age >= 24 h: dated ARCHIVE.
+        let old_time = Utc::now() - chrono::Duration::days(2);
+        app.volume = Some(Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("KTLX"),
+            old_time,
+        )));
+        let (label, _, kind) = app
+            .mode_chip_state_with_live_and_stale_floor(false, 0)
+            .expect("dated archive chip");
+        assert_eq!(kind, "ARCH");
+        assert_eq!(
+            label,
+            format!("ARCHIVE · {}", old_time.format("%Y-%m-%d %H:%MZ"))
+        );
+    }
+
+    #[test]
+    fn primary_mode_chip_flags_a_slow_intl_poll_stale_past_the_floor() {
+        // The intl display-owner route through `mode_chip_state`: liveness
+        // is `intl_poll_owns_primary()` and the stale boundary is the 1800 s
+        // floor — an armed active poll whose newest frame is 40 minutes old
+        // is a fault worth flagging even on intl cadences.
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.poll_source = PollSource::Intl {
+            provider_id: "ord".to_owned(),
+            site_id: "deess".to_owned(),
+        };
+        app.poll_active = true;
+        app.volume = Some(Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("deess"),
+            Utc::now() - chrono::Duration::seconds(2400),
+        )));
+        let (label, _, kind) = app.mode_chip_state().expect("stale intl chip");
+        assert_eq!(kind, "STALE");
+        assert_eq!(label, "● LIVE · STALE 40m");
+    }
+
     #[test]
     fn reset_view_centers_on_the_loaded_intl_volume() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
@@ -63869,6 +64105,54 @@ mod tests {
         assert!(label.contains("0m old"), "{label}");
     }
 
+    /// Contract harness (v0.29 Phase 1): pins the pane-0 fall-through in
+    /// `pane_chip_is_live` AS-IS. The grid chip for cell 0 answers with
+    /// `realtime_level2_auto_refresh` — primary-US state no international
+    /// path sets or clears — even when an international source owns the
+    /// primary display. This is the LAST LIVE R8 RESIDUE (the flag-vs-owner
+    /// disagreement bug class, spec §0/§3): `mode_chip_state` was already
+    /// taught to dispatch on the display owner, the grid chip was not.
+    /// Phase 4 replaces both with `LoopEngine::liveness()`, derived from the
+    /// engine's own feed. Until then the two known-wrong cells below are
+    /// CURRENT behavior — do not "fix" them here; delete this test when the
+    /// engine port lands.
+    #[test]
+    fn pane_zero_grid_chip_still_reads_the_us_auto_refresh_flag() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+
+        // Known-wrong cell 1: an intl ARCHIVE owns the display while the
+        // stale US flag is still set — the primary chip is honest ARCHIVE,
+        // the pane-0 grid chip claims LIVE off the US flag.
+        app.realtime_level2_auto_refresh = true;
+        app.set_intl_archive_primary_source("ord", "deess");
+        app.volume = Some(Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("deess"),
+            Utc::now() - chrono::Duration::days(365),
+        )));
+        let (_, _, kind) = app.mode_chip_state().expect("primary chip");
+        assert_eq!(kind, "ARCH", "the single-pane chip dispatches honestly");
+        assert!(
+            app.pane_chip_is_live(0),
+            "pane 0 falls through to the US auto-refresh flag (R8 residue)"
+        );
+
+        // Known-wrong cell 2, the converse: a streaming intl poll with the
+        // US flag off — the primary chip says LIVE, the pane-0 grid chip
+        // says not-live.
+        app.poll_active = true;
+        app.realtime_level2_auto_refresh = false;
+        app.volume = Some(Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("deess"),
+            Utc::now() - chrono::Duration::minutes(5),
+        )));
+        let (_, _, kind) = app.mode_chip_state().expect("primary chip");
+        assert_eq!(kind, "LIVE");
+        assert!(
+            !app.pane_chip_is_live(0),
+            "pane 0 ignores the intl poll's liveness (R8 residue)"
+        );
+    }
+
     #[test]
     fn pane_live_poll_action_policy() {
         // Due poll fires for a pane's own site and for international feeds.
@@ -63914,6 +64198,53 @@ mod tests {
         assert_eq!(
             pane_live_poll_action(true, PaneLiveSource::SharedWithPrimary, false, false),
             PaneLiveAction::FollowPrimary
+        );
+        // Contract-harness cells (v0.29 Phase 1): the remaining
+        // (source, primary-state) combinations, pinned so the Phase-4
+        // `LoopEngine::live_tick` port must reproduce every one.
+        // International panes obey the same not-due / in-flight gates.
+        assert_eq!(
+            pane_live_poll_action(true, PaneLiveSource::Intl, false, false),
+            PaneLiveAction::Skip
+        );
+        assert_eq!(
+            pane_live_poll_action(true, PaneLiveSource::Intl, true, true),
+            PaneLiveAction::Skip
+        );
+        // The live checkbox outranks EVERY source kind, including the
+        // cadence-free primary follow.
+        assert_eq!(
+            pane_live_poll_action(false, PaneLiveSource::Intl, false, true),
+            PaneLiveAction::Skip
+        );
+        assert_eq!(
+            pane_live_poll_action(false, PaneLiveSource::SharedWithPrimary, false, true),
+            PaneLiveAction::Skip
+        );
+        assert_eq!(
+            pane_live_poll_action(false, PaneLiveSource::None, false, true),
+            PaneLiveAction::Skip
+        );
+        // A sourceless pane skips regardless of the in-flight/due bits.
+        assert_eq!(
+            pane_live_poll_action(true, PaneLiveSource::None, true, true),
+            PaneLiveAction::Skip
+        );
+        assert_eq!(
+            pane_live_poll_action(true, PaneLiveSource::None, false, false),
+            PaneLiveAction::Skip
+        );
+        // Cadence fall-through: None and SharedWithPrimary share the US
+        // overlay cadence arm (SharedWithPrimary never polls, so the value
+        // is only a due-clock input; pinned so a refactor cannot silently
+        // put either on the 1 s chunk cadence).
+        assert_eq!(
+            pane_live_poll_cadence_seconds(PaneLiveSource::None),
+            OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS
+        );
+        assert_eq!(
+            pane_live_poll_cadence_seconds(PaneLiveSource::SharedWithPrimary),
+            OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS
         );
         // Cadences: US panes poll on the overlay cadence, never the
         // primary's chunk cadence; international on the provider cadence.
@@ -63975,9 +64306,137 @@ mod tests {
             label: "Sella".to_owned(),
         });
         assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::Intl);
+        // An international source outranks a lingering pinned US id — the
+        // intl check runs first (contract harness, v0.29 Phase 1).
+        pane.pinned_site_id = Some("KEAX".to_owned());
+        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::Intl);
+        pane.intl_source = None;
+        // Pinned-id catalog lookup and the primary dedupe are both
+        // case-insensitive.
+        pane.pinned_site_id = Some("keax".to_owned());
+        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::UsSite);
+        pane.pinned_site_id = Some("ktlx".to_owned());
+        assert_eq!(
+            app.extra_pane_live_source(&pane),
+            PaneLiveSource::SharedWithPrimary
+        );
+        // An armed custom-URL poll owns the primary view (the guard keys on
+        // `poll_url`, not the variant payload): the same-site pane must poll
+        // its own feed.
+        app.poll_active = true;
+        app.poll_url = "http://example.com/dow8".to_owned();
+        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::UsSite);
+        app.poll_active = false;
+        app.poll_url = String::new();
+        // An international ARCHIVE display owner (armed intl source, poll
+        // inactive) also means the primary is not live-polling KTLX.
+        app.set_intl_archive_primary_source("smhi", "sella");
+        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::UsSite);
+        app.poll_source = PollSource::CustomUrl(String::new());
+        // A research/community feed resolves in the catalog but the pane
+        // load path refuses it: no live source.
+        app.sites =
+            site_catalog_with_community_feeds(vec![RadarSite::new("KTLX"), RadarSite::new("KEAX")]);
+        pane.pinned_site_id = Some("KBPP".to_owned());
+        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::None);
         // A following pane has no source of its own.
+        pane.pinned_site_id = None;
         pane.intl_source = None;
         assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::None);
+    }
+
+    /// Contract harness (v0.29 Phase 1, spec §11 Milestone A item 2): the
+    /// pane half of the history-clear rule table. `start_extra_pane_intl_load`
+    /// keeps the pane's loop when the source is unchanged and clears the
+    /// pane's display state on ANY source change — the same keep/clear pairs
+    /// `switch_policy` centralizes in Phase 4.
+    #[test]
+    fn extra_pane_intl_load_clears_pane_history_only_on_source_change() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.extra_panes.push(ViewPane::new(DisplayProduct::Moment(
+            MomentType::Reflectivity,
+        )));
+        // Unknown provider id: the spawned worker fails its provider lookup
+        // immediately, so the test never touches the network — the state
+        // under test is all written synchronously before the spawn.
+        let intl_site = |id: &str| data_source::international::IntlSite {
+            provider_id: "zz-test",
+            site_id: id.to_owned(),
+            label: id.to_uppercase(),
+            country: "Testland",
+            latitude_deg: None,
+            longitude_deg: None,
+        };
+        let seed_pane = |pane: &mut ViewPane, site: &str| {
+            let volume = Arc::new(RadarVolume::new(
+                radar_core::RadarSite::new(site),
+                Utc::now() - chrono::Duration::minutes(4),
+            ));
+            pane.frame_history.push(FrameHistoryEntry {
+                identity: frame_identity_for_volume(&volume),
+                path: PathBuf::from(format!("intl:{site}")),
+                volume: Arc::clone(&volume),
+                timings: None,
+                status: FrameStatus::Complete,
+                source_label: format!("zz-test {site}"),
+            });
+            pane.volume = Some(volume);
+            pane.cut = Some(0);
+        };
+
+        // KEEP: reloading the SAME intl source leaves the pane loop alone.
+        app.extra_panes[0].intl_source = Some(PaneIntlSource::from_site(&intl_site("alpha")));
+        seed_pane(&mut app.extra_panes[0], "alpha");
+        app.start_extra_pane_intl_load(0, intl_site("alpha"), LatestLoadMode::User, &ctx);
+        let pane = &app.extra_panes[0];
+        assert_eq!(
+            pane.frame_history.len(),
+            1,
+            "same-source pane reload keeps history"
+        );
+        assert!(pane.volume.is_some());
+        assert_eq!(
+            pane.cut,
+            Some(0),
+            "tilt override survives a same-source load"
+        );
+        assert!(pane.load_receiver.is_some(), "load worker armed");
+
+        // CLEAR: a different site of the same provider resets the pane's
+        // display state (history, volume, tilt, texture) before the load.
+        app.start_extra_pane_intl_load(0, intl_site("beta"), LatestLoadMode::User, &ctx);
+        let pane = &app.extra_panes[0];
+        assert!(
+            pane.frame_history.is_empty(),
+            "cross-site pane load clears the pane loop"
+        );
+        assert!(pane.volume.is_none());
+        assert_eq!(pane.cut, None);
+        assert!(pane.pinned_site_id.is_none());
+        assert_eq!(
+            pane.intl_source
+                .as_ref()
+                .map(|source| source.site_id.as_str()),
+            Some("beta")
+        );
+
+        // CLEAR: a US-pinned pane switching to an international source (the
+        // previous intl_source is None, so it never matches).
+        app.extra_panes[0].intl_source = None;
+        app.extra_panes[0].pinned_site_id = Some("KTLX".to_owned());
+        seed_pane(&mut app.extra_panes[0], "KTLX");
+        app.start_extra_pane_intl_load(0, intl_site("alpha"), LatestLoadMode::User, &ctx);
+        let pane = &app.extra_panes[0];
+        assert!(
+            pane.frame_history.is_empty(),
+            "US-to-intl pane switch clears the pane loop"
+        );
+        assert!(pane.volume.is_none());
+        assert!(
+            pane.pinned_site_id.is_none(),
+            "the pinned US id is released to the intl source"
+        );
     }
 
     #[test]
@@ -67698,11 +68157,11 @@ mod tests {
             tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(settings::tile_cache_dir())),
             basemap_style: tiles::TileStyle::DarkVector,
             italy_dpc_layer: None,
-            italy_dpc_latest_rx: None,
+            italy_dpc_latest_rx: WorkerSlot::idle("italy-dpc-latest"),
             italy_dpc_texture: None,
             italy_dpc_render_rx: None,
             taiwan_cwa_layer: None,
-            taiwan_cwa_latest_rx: None,
+            taiwan_cwa_latest_rx: WorkerSlot::idle("taiwan-cwa-latest"),
             taiwan_cwa_texture: None,
             taiwan_cwa_render_rx: None,
             grid_composite_rx: None,
@@ -67810,9 +68269,9 @@ mod tests {
             cross_section_armed: false,
             context_menu_lonlat: None,
             radar_operational_status_cache: BTreeMap::new(),
-            radar_operational_status_rx: None,
+            radar_operational_status_rx: WorkerSlot::idle("radar-operational-status"),
             spc_reports: None,
-            spc_receiver: None,
+            spc_receiver: WorkerSlot::idle("spc-tornado-reports"),
             pending_debug_archive_case: None,
             pending_data_pack_scene: None,
             data_pack_expanded: BTreeSet::new(),
@@ -67848,7 +68307,7 @@ mod tests {
             model_layer_build_rx: None,
             model_layer_generation: 0,
             upper_air_layer: None,
-            upper_air_rx: None,
+            upper_air_rx: WorkerSlot::idle("upper-air-quicklook"),
             radar_opacity: 1.0,
             model_ingest_rx: None,
             model_ingest_progress_rx: None,
@@ -67876,20 +68335,20 @@ mod tests {
             poll_source: PollSource::CustomUrl(String::new()),
             intl_picker_provider: String::new(),
             intl_sites: None,
-            intl_sites_rx: None,
+            intl_sites_rx: WorkerSlot::idle("intl-site-list"),
             coverage_provider_id: "smhi".to_owned(),
             coverage_site_id: "angelholm".to_owned(),
             coverage_frame_count: DEFAULT_ARCHIVE_FRAME_COUNT,
             coverage_date_input: String::new(),
             coverage_hour_input: String::new(),
-            coverage_probe_rx: None,
+            coverage_probe_rx: WorkerSlot::idle("coverage-probe"),
             coverage_probe_result: None,
             ord_archive_site_input: String::new(),
             ord_archive_date_input: String::new(),
             ord_archive_hour_input: String::new(),
             ord_archive_minute_input: String::new(),
             ord_archive_scans: None,
-            ord_archive_list_rx: None,
+            ord_archive_list_rx: WorkerSlot::idle("ord-archive-list"),
             ord_archive_loaded_range: None,
             community_menu: None,
             spc_data: spc_layers::SpcData::default(),
@@ -68008,9 +68467,9 @@ mod tests {
             storm_motion_speed_kt: DEFAULT_STORM_MOTION_SPEED_KT,
             derived_readout_cache: None,
             dealiased_readout_cache: None,
-            update_check_rx: None,
+            update_check_rx: WorkerSlot::idle("update-check"),
             update_available: None,
-            self_update_rx: None,
+            self_update_rx: StreamSlot::idle("self-update"),
             self_update_phase: SelfUpdatePhase::Idle,
             media: media::MediaShare::default(),
             brand_assets: brand::BrandTextureCache::default(),
@@ -69189,14 +69648,14 @@ mod tests {
 
         let (_sender, receiver) = mpsc::channel::<IntlSiteListResult>();
         app.intl_picker_provider = "jma".to_owned();
-        app.intl_sites_rx = Some(receiver);
+        app.intl_sites_rx.inject_for_test(receiver);
         assert_eq!(
             app.active_background_activity(),
             Some(BackgroundActivity::indeterminate(
                 "Loading international sites: jma"
             ))
         );
-        app.intl_sites_rx = None;
+        app.intl_sites_rx.cancel();
 
         let (_sender, receiver) =
             mpsc::channel::<std::result::Result<placefiles::Placefile, String>>();

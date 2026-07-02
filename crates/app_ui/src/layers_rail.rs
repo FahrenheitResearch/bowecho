@@ -407,7 +407,8 @@ impl ViewerApp {
         // (The model master switch + "Keep runs" retention policy
         // moved to Settings ▸ Model — proposal step 4: the fold holds
         // layers, not app policy.)
-        let dpc_loading = self.italy_dpc_latest_rx.is_some() || self.italy_dpc_render_rx.is_some();
+        let dpc_loading =
+            self.italy_dpc_latest_rx.in_flight() || self.italy_dpc_render_rx.is_some();
         let mut dpc_product_pick: Option<ItalyDpcMapProduct> = None;
         let mut dpc_refresh = false;
         let mut dpc_remove = false;
@@ -502,12 +503,12 @@ impl ViewerApp {
         }
         if dpc_remove {
             self.italy_dpc_layer = None;
-            self.italy_dpc_latest_rx = None;
+            self.italy_dpc_latest_rx.cancel();
             self.italy_dpc_render_rx = None;
             self.italy_dpc_texture = None;
             ctx.request_repaint();
         }
-        let taiwan_fetching = self.taiwan_cwa_latest_rx.is_some();
+        let taiwan_fetching = self.taiwan_cwa_latest_rx.in_flight();
         let taiwan_rendering = self.taiwan_cwa_render_rx.is_some();
         let mut taiwan_refresh = false;
         let mut taiwan_remove = false;
@@ -577,7 +578,7 @@ impl ViewerApp {
         }
         if taiwan_remove {
             self.taiwan_cwa_layer = None;
-            self.taiwan_cwa_latest_rx = None;
+            self.taiwan_cwa_latest_rx.cancel();
             self.taiwan_cwa_render_rx = None;
             self.taiwan_cwa_texture = None;
             ctx.request_repaint();
@@ -2082,7 +2083,7 @@ impl ViewerApp {
             });
         }
 
-        let busy = self.coverage_probe_rx.is_some();
+        let busy = self.coverage_probe_rx.in_flight();
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(!busy, egui::Button::new("Probe"))
@@ -2250,7 +2251,7 @@ impl ViewerApp {
             })
             .response
             .on_hover_text("National feed providers, grouped by country");
-            if self.intl_sites_rx.is_some() {
+            if self.intl_sites_rx.in_flight() {
                 ui.spinner();
             }
             if let Some(sites) = &self.intl_sites {
@@ -2415,7 +2416,7 @@ impl ViewerApp {
                     .to_string();
                 self.start_ord_archive_day_listing(ctx);
             }
-            let listing = self.ord_archive_list_rx.is_some();
+            let listing = self.ord_archive_list_rx.in_flight();
             if ui
                 .add_enabled(!listing, egui::Button::new("List"))
                 .on_hover_text("List all complete ORD scans for this UTC date")
