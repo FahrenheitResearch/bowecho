@@ -52,12 +52,12 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, NaiveDateTime, Timelike, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 
 use super::listing::fnv1a64;
 use super::{
-    FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames, SiteCache, fetch_s3_style_listing,
-    s3_style_listing_url,
+    ArchiveFrames, FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames, SiteCache,
+    fetch_s3_style_listing, s3_style_listing_url,
 };
 
 const BUCKET_BASE: &str = "https://s3.waw3-1.cloudferro.com/openradar-24h";
@@ -526,6 +526,10 @@ impl IntlProvider for OrdProvider {
         Some(self)
     }
 
+    fn archive_source(&self) -> Option<&dyn ArchiveFrames> {
+        Some(self)
+    }
+
     fn static_sites(&self) -> Vec<IntlSite> {
         ORD_SITES
             .iter()
@@ -632,6 +636,89 @@ impl RecentFrames for OrdProvider {
                 format!("ORD: no recent files for site '{site_id}' in the 24-hour cache")
             }))
     }
+}
+
+impl ArchiveFrames for OrdProvider {
+    /// Fold [`archive_plans_for_hour`] over the 24 UTC hours of
+    /// `date_utc` — the immutable-archive-bucket wrapper. Hours that
+    /// error (silent hour, transient listing failure) are skipped and
+    /// the first error is reported only when the whole day yields
+    /// nothing, mirroring [`RecentFrames::recent_frames`] above.
+    fn day_plans(&self, site_id: &str, date_utc: NaiveDate) -> Result<Vec<FramePlan>, String> {
+        let day_start =
+            DateTime::<Utc>::from_naive_utc_and_offset(date_utc.and_time(NaiveTime::MIN), Utc);
+        let mut plans = Vec::new();
+        let mut first_error: Option<String> = None;
+        for hour in 0..24 {
+            match archive_plans_for_hour(site_id, day_start + chrono::Duration::hours(hour)) {
+                Ok(mut hour_plans) => plans.append(&mut hour_plans),
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                }
+            }
+        }
+        if plans.is_empty() {
+            return Err(first_error.unwrap_or_else(|| {
+                format!("ORD archive: no complete scans for {site_id} on {date_utc}")
+            }));
+        }
+        Ok(archive_frames_oldest_first(plans, usize::MAX))
+    }
+
+    /// Hour-granular override of the day-folding default: ORD's archive
+    /// keys carry per-scan stamps, so the window trims to the exact
+    /// `[start, end]` bounds instead of whole days.
+    fn window_plans(
+        &self,
+        site_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        max: usize,
+    ) -> Result<Vec<FramePlan>, String> {
+        if end < start {
+            return Err(format!("archive window end {end} precedes start {start}"));
+        }
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let mut plans = Vec::new();
+        let mut first_error: Option<String> = None;
+        let mut hour = truncate_to_utc_hour(start);
+        while hour <= end {
+            match archive_plans_for_hour(site_id, hour) {
+                Ok(mut hour_plans) => plans.append(&mut hour_plans),
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                }
+            }
+            hour += chrono::Duration::hours(1);
+        }
+        plans.retain(|plan| plan.stamp_utc >= start && plan.stamp_utc <= end);
+        if plans.is_empty() {
+            return Err(first_error.unwrap_or_else(|| {
+                format!(
+                    "ORD archive: no complete scans for {site_id} between {} and {}",
+                    start.format("%Y-%m-%d %H:%MZ"),
+                    end.format("%Y-%m-%d %H:%MZ")
+                )
+            }));
+        }
+        Ok(archive_frames_oldest_first(plans, max))
+    }
+}
+
+/// Archive plans -> frame plans: chronological, identity-deduped, capped
+/// to the NEWEST `max` while staying oldest-first (the same
+/// tail-of-the-window shape as [`RecentFrames::recent_frames`]).
+fn archive_frames_oldest_first(mut plans: Vec<OrdArchivePlan>, max: usize) -> Vec<FramePlan> {
+    plans.sort_by_key(|plan| plan.stamp_utc);
+    plans.dedup_by(|left, right| left.frame.identity == right.frame.identity);
+    let skip = plans.len().saturating_sub(max);
+    plans
+        .into_iter()
+        .skip(skip)
+        .map(|plan| plan.frame)
+        .collect()
 }
 
 /// Today and (for the midnight/outage window) the previous UTC day.
@@ -2211,6 +2298,44 @@ mod tests {
             hour.format("%Y%m%dT%H"),
         );
         assert_eq!(prefix, "2026/06/12/NL/nlhrw/PVOL/nlhrw@20260612T14");
+    }
+
+    /// The archive-lookup shaping shared by `day_plans`/`window_plans`:
+    /// chronological, identity-deduped, and capped to the NEWEST `max`
+    /// while staying oldest-first for loop installation.
+    #[test]
+    fn archive_frames_sort_dedupe_and_keep_the_newest_capped_tail() {
+        let plan = |minute: u32, identity: &str| OrdArchivePlan {
+            stamp_utc: utc_time(2026, 6, 9, 5, minute),
+            object_kind: ObjectKind::Pvol.dir(),
+            frame: FramePlan {
+                identity: identity.to_owned(),
+                parts: vec![PlanPart {
+                    url: format!("https://example.invalid/{identity}.h5"),
+                }],
+                merge: false,
+            },
+        };
+        let frames = archive_frames_oldest_first(
+            vec![
+                plan(30, "deess_0530"),
+                plan(10, "deess_0510"),
+                plan(10, "deess_0510"),
+                plan(20, "deess_0520"),
+                plan(0, "deess_0500"),
+            ],
+            3,
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.identity.as_str())
+                .collect::<Vec<_>>(),
+            vec!["deess_0510", "deess_0520", "deess_0530"],
+            "duplicate dropped, oldest trimmed by the cap, order oldest-first"
+        );
+        assert!(archive_frames_oldest_first(Vec::new(), 3).is_empty());
+        assert!(archive_frames_oldest_first(vec![plan(0, "deess_0500")], 0).is_empty());
     }
 
     /// Live bucket roundtrip across multiple newly-enabled countries:

@@ -17,7 +17,7 @@
 use chrono::{Datelike, NaiveDate};
 use serde::Deserialize;
 
-use super::{FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames, SiteCache};
+use super::{ArchiveFrames, FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames, SiteCache};
 
 const API_BASE: &str = "https://opendata-download-radar.smhi.se/api/version/latest";
 
@@ -115,6 +115,10 @@ impl IntlProvider for SmhiProvider {
         Some(self)
     }
 
+    fn archive_source(&self) -> Option<&dyn ArchiveFrames> {
+        Some(self)
+    }
+
     fn static_sites(&self) -> Vec<IntlSite> {
         SMHI_SITES
             .iter()
@@ -137,6 +141,15 @@ impl RecentFrames for SmhiProvider {
         let json = crate::fetch_text(&url)
             .map_err(|err| format!("SMHI qcvol catalog for '{site_id}' ({url}): {err}"))?;
         recent_plans_from_qcvol_tree(site_id, &json, count.max(1))
+    }
+}
+
+impl ArchiveFrames for SmhiProvider {
+    /// Verbatim wrap of [`smhi_archive_plans_for_day`]: one dated qcvol
+    /// day-catalog probe, plans oldest-first. Window lookups use the
+    /// trait's day-folding default — the dated tree is day-granular.
+    fn day_plans(&self, site_id: &str, date_utc: NaiveDate) -> Result<Vec<FramePlan>, String> {
+        smhi_archive_plans_for_day(site_id, date_utc)
     }
 }
 

@@ -4,6 +4,7 @@ pub mod community_feeds;
 mod embedded_sites;
 pub mod grid_products;
 pub mod international;
+pub mod sites;
 
 use std::collections::BTreeMap;
 use std::fs;

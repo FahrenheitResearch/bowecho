@@ -40,7 +40,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::Deserialize;
 
 mod australia_nci;
@@ -143,6 +143,71 @@ pub trait RecentFrames {
     fn recent_frames(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String>;
 }
 
+/// Historical archive lookup, for providers whose upstream exposes dated
+/// holdings beyond the rolling live window. Implemented on the provider
+/// type and handed back through [`IntlProvider::archive_source`], which is
+/// what drives the derived [`IntlProvider::supports_archive`] capability —
+/// the exact mirror of the proven [`RecentFrames`]/
+/// [`IntlProvider::recent_source`] pattern.
+pub trait ArchiveFrames {
+    /// All frames anchored on the UTC calendar date `date_utc` for
+    /// `site_id`, OLDEST FIRST. Same cheapness contract as
+    /// [`IntlProvider::recent`]: catalog probes only — never volume
+    /// downloads.
+    fn day_plans(&self, site_id: &str, date_utc: NaiveDate) -> Result<Vec<FramePlan>, String>;
+
+    /// Frames inside `[start, end]`, OLDEST FIRST, capped to the NEWEST
+    /// `max` (the frames nearest the window's end anchor — the
+    /// loop-ending-at-scan shape). Provided: folds [`Self::day_plans`]
+    /// over every UTC date the window touches. [`FramePlan`]s carry no
+    /// timestamp, so the default trims at day granularity plus the count
+    /// cap — boundary-date frames outside the window ride along;
+    /// hour-granular listers (ORD) override for tight windows. Days that
+    /// error are skipped and the first error is reported only when the
+    /// whole window yields nothing (a partial archive loop beats none).
+    fn window_plans(
+        &self,
+        site_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        max: usize,
+    ) -> Result<Vec<FramePlan>, String> {
+        if end < start {
+            return Err(format!("archive window end {end} precedes start {start}"));
+        }
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let mut plans = Vec::new();
+        let mut first_error: Option<String> = None;
+        let mut date = start.date_naive();
+        let last_date = end.date_naive();
+        loop {
+            match self.day_plans(site_id, date) {
+                Ok(mut day) => plans.append(&mut day),
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                }
+            }
+            if date >= last_date {
+                break;
+            }
+            match date.succ_opt() {
+                Some(next) => date = next,
+                None => break,
+            }
+        }
+        if plans.is_empty() {
+            return Err(first_error.unwrap_or_else(|| {
+                format!("no archive frames for '{site_id}' between {start} and {end}")
+            }));
+        }
+        plans.dedup_by(|left, right| left.identity == right.identity);
+        let skip = plans.len().saturating_sub(max);
+        Ok(plans.split_off(skip))
+    }
+}
+
 /// A national/agency radar feed adapter.
 ///
 /// Implementations must be cheap to construct and safe to share across the
@@ -205,6 +270,23 @@ pub trait IntlProvider: Send + Sync {
     /// from [`Self::recent_source`] — never override.
     fn supports_recent(&self) -> bool {
         self.recent_source().is_some()
+    }
+
+    /// The provider's historical archive implementation, when its upstream
+    /// exposes dated holdings. THE single override point for archive
+    /// lookup: implement [`ArchiveFrames`] on the provider type and return
+    /// `Some(self)` here. Both archive routing and the derived
+    /// [`Self::supports_archive`] capability go through this method, so a
+    /// provider cannot gain a real archive without advertising it (nor
+    /// advertise one it lacks).
+    fn archive_source(&self) -> Option<&dyn ArchiveFrames> {
+        None
+    }
+
+    /// Whether this provider offers historical archive lookup. Derived
+    /// from [`Self::archive_source`] — never override.
+    fn supports_archive(&self) -> bool {
+        self.archive_source().is_some()
     }
 
     /// The provider's EMBEDDED site catalog: every currently operational
@@ -279,6 +361,12 @@ pub struct IntlProviderCapability {
     /// provider implements a real multi-frame [`IntlProvider::recent`]
     /// (never hand-maintained, so it cannot go stale against the code).
     pub recent_loop: bool,
+    /// Derived from [`IntlProvider::supports_archive`] — `true` iff the
+    /// provider hands back a real [`ArchiveFrames`] from
+    /// [`IntlProvider::archive_source`] (never hand-maintained; the
+    /// parity audit caught the hand-kept flag lying in both directions —
+    /// SMHI false above its own working day loader, NCI true without a
+    /// dated lookup).
     pub archive_lookup: bool,
     pub current_window: &'static str,
     pub upstream_window: &'static str,
@@ -293,107 +381,93 @@ pub fn intl_provider_capabilities() -> Vec<IntlProviderCapability> {
         .into_iter()
         .map(|provider| {
             let visible_sites = provider.static_sites().len();
-            let (archive_lookup, current_window, upstream_window, bowecho_status, next_unlock) =
-                match provider.id() {
-                    "smhi" => (
-                        false,
-                        "dated tree, newest N frames",
-                        "year/month/day qcvol tree; observed 2025-2026 by site",
-                        "expanded: Load Loop walks the dated tree",
-                        "add arbitrary date/window picker",
-                    ),
-                    "fmi" => (
-                        false,
-                        "today + yesterday",
-                        "public ODIM HDF5 archive, roughly 2007-present",
-                        "recent loop only",
-                        "walk historical date prefixes",
-                    ),
-                    "australia-nci" => (
-                        true,
-                        "latest archived tarlist",
-                        "NCI rq0 ODIM HDF5 archive; daily tarlists and direct zip-member reads",
-                        "recent/archive loop from per-frame HDF5 members",
-                        "add date/window picker for deep historical events",
-                    ),
-                    "dmi" => (
-                        false,
-                        "newest N STAC items",
-                        "STAC date ranges with pagination",
-                        "recent loop from the STAC items query",
-                        "use STAC date-range queries for archive lookup",
-                    ),
-                    "geosphere" => (
-                        false,
-                        "newest N frames of the rolling window",
-                        "rolling ~3 days",
-                        "recent loop from the rolling listing",
-                        "add date/window picker over the rolling days",
-                    ),
-                    "dwd" => (
-                        false,
-                        "newest N 5-minute sweep cycles",
-                        "rolling ~2 days",
-                        "recent loop from timestamped sweep files",
-                        "add date/window picker over the rolling days",
-                    ),
-                    "shmu" => (
-                        false,
-                        "newest N frames, dated directories",
-                        "observed rolling ~1 month",
-                        "recent loop from the dated directories",
-                        "add arbitrary date/window picker",
-                    ),
-                    "chmi" => (
-                        false,
-                        "newest N frames of the rolling window",
-                        "observed rolling ~89 hours",
-                        "recent loop from the volume file listings",
-                        "add date/window picker over the rolling window",
-                    ),
-                    "arpa-piemonte" => (
-                        false,
-                        "last hour",
-                        "rolling last hour of OPERA HDF5 volumes",
-                        "real in-app recent loop",
-                        "add historical/event access if ARPA exposes it",
-                    ),
-                    "arpa-lombardia" => (
-                        false,
-                        "rolling live window",
-                        "gzip-wrapped ODIM HDF5 product volumes",
-                        "real in-app recent loop",
-                        "add historical/event access if ARPA exposes it",
-                    ),
-                    "kaia" => (
-                        false,
-                        "14 days",
-                        "historical repository likely deeper, not guaranteed",
-                        "real in-app recent archive",
-                        "probe longer retention",
-                    ),
-                    "ord" => (
-                        true,
-                        "rolling 24h + per-site archive lookup",
-                        "ORD single-site archive is partial/opportunistic; OPERA composites separate",
-                        "recent loop and date/hour lookup",
-                        "cache per-site coverage probes",
-                    ),
-                    "jma" => (
-                        false,
-                        "latest only",
-                        "NICT mirror recent operational tars",
-                        "latest frame only",
-                        "add tar directory scan if needed",
-                    ),
-                    _ => (
-                        false,
-                        "latest only",
-                        "unknown",
-                        "latest frame only",
-                        "provider-specific probe",
-                    ),
-                };
+            let (current_window, upstream_window, bowecho_status, next_unlock) = match provider.id()
+            {
+                "smhi" => (
+                    "dated tree: recent frames + whole-day archive",
+                    "year/month/day qcvol tree; observed 2025-2026 by site",
+                    "recent loop and day archive lookup from the dated tree",
+                    "arbitrary date/window picker over the dated tree",
+                ),
+                "fmi" => (
+                    "today + yesterday",
+                    "public ODIM HDF5 archive, roughly 2007-present",
+                    "recent loop only",
+                    "walk historical date prefixes",
+                ),
+                "australia-nci" => (
+                    "latest archived tarlist",
+                    "NCI rq0 ODIM HDF5 archive; daily tarlists and direct zip-member reads",
+                    "recent loop from the latest tarlist's per-frame HDF5 members",
+                    "wire dated tarlists into archive lookup",
+                ),
+                "dmi" => (
+                    "newest N STAC items",
+                    "STAC date ranges with pagination",
+                    "recent loop from the STAC items query",
+                    "use STAC date-range queries for archive lookup",
+                ),
+                "geosphere" => (
+                    "newest N frames of the rolling window",
+                    "rolling ~3 days",
+                    "recent loop from the rolling listing",
+                    "add date/window picker over the rolling days",
+                ),
+                "dwd" => (
+                    "newest N 5-minute sweep cycles",
+                    "rolling ~2 days",
+                    "recent loop from timestamped sweep files",
+                    "add date/window picker over the rolling days",
+                ),
+                "shmu" => (
+                    "newest N frames, dated directories",
+                    "observed rolling ~1 month",
+                    "recent loop from the dated directories",
+                    "add arbitrary date/window picker",
+                ),
+                "chmi" => (
+                    "newest N frames of the rolling window",
+                    "observed rolling ~89 hours",
+                    "recent loop from the volume file listings",
+                    "add date/window picker over the rolling window",
+                ),
+                "arpa-piemonte" => (
+                    "last hour",
+                    "rolling last hour of OPERA HDF5 volumes",
+                    "real in-app recent loop",
+                    "add historical/event access if ARPA exposes it",
+                ),
+                "arpa-lombardia" => (
+                    "rolling live window",
+                    "gzip-wrapped ODIM HDF5 product volumes",
+                    "real in-app recent loop",
+                    "add historical/event access if ARPA exposes it",
+                ),
+                "kaia" => (
+                    "14 days",
+                    "historical repository likely deeper, not guaranteed",
+                    "real in-app recent archive",
+                    "probe longer retention",
+                ),
+                "ord" => (
+                    "rolling 24h + per-site archive lookup",
+                    "ORD single-site archive is partial/opportunistic; OPERA composites separate",
+                    "recent loop and date/hour lookup",
+                    "cache per-site coverage probes",
+                ),
+                "jma" => (
+                    "latest only",
+                    "NICT mirror recent operational tars",
+                    "latest frame only",
+                    "add tar directory scan if needed",
+                ),
+                _ => (
+                    "latest only",
+                    "unknown",
+                    "latest frame only",
+                    "provider-specific probe",
+                ),
+            };
             IntlProviderCapability {
                 provider_id: provider.id(),
                 provider_label: provider.label(),
@@ -401,7 +475,7 @@ pub fn intl_provider_capabilities() -> Vec<IntlProviderCapability> {
                 visible_sites,
                 live: true,
                 recent_loop: provider.supports_recent(),
-                archive_lookup,
+                archive_lookup: provider.supports_archive(),
                 current_window,
                 upstream_window,
                 bowecho_status,
@@ -870,6 +944,61 @@ mod tests {
         }
     }
 
+    /// A provider with a dated archive: implements [`ArchiveFrames`] and
+    /// hands it back from `archive_source` — the one act that must both
+    /// route archive lookups and flip `supports_archive()`.
+    struct FakeArchiveProvider;
+
+    impl ArchiveFrames for FakeArchiveProvider {
+        fn day_plans(&self, site_id: &str, date_utc: NaiveDate) -> Result<Vec<FramePlan>, String> {
+            if site_id != "nwsit" {
+                return Err(format!("unknown site '{site_id}'"));
+            }
+            Ok((0..2)
+                .map(|index| {
+                    let stamp = date_utc.format("%Y%m%d");
+                    FramePlan {
+                        identity: format!("{site_id}_{stamp}_{index}"),
+                        parts: vec![PlanPart {
+                            url: format!("https://example.invalid/{site_id}_{stamp}_{index}.h5"),
+                        }],
+                        merge: false,
+                    }
+                })
+                .collect())
+        }
+    }
+
+    impl IntlProvider for FakeArchiveProvider {
+        fn id(&self) -> &'static str {
+            "fake-archive"
+        }
+
+        fn label(&self) -> &'static str {
+            "Fake Archive Provider"
+        }
+
+        fn country(&self) -> &'static str {
+            "Nowhere"
+        }
+
+        fn list_sites(&self) -> Result<Vec<IntlSite>, String> {
+            FakeProvider.list_sites()
+        }
+
+        fn latest(&self, site_id: &str) -> Result<FramePlan, String> {
+            FakeProvider.latest(site_id)
+        }
+
+        fn archive_source(&self) -> Option<&dyn ArchiveFrames> {
+            Some(self)
+        }
+
+        fn static_sites(&self) -> Vec<IntlSite> {
+            self.list_sites().unwrap_or_default()
+        }
+    }
+
     #[test]
     fn registry_lists_every_provider_with_unique_stable_ids() {
         let providers = intl_providers();
@@ -931,6 +1060,11 @@ mod tests {
             .expect("SMHI capability");
         assert!(smhi.recent_loop);
         assert!(smhi.current_window.contains("dated tree"));
+        assert!(
+            smhi.archive_lookup,
+            "SMHI's card goes honest-true: its day loader now routes \
+             through archive_source()"
+        );
 
         let ord = capabilities
             .iter()
@@ -938,6 +1072,17 @@ mod tests {
             .expect("ORD capability");
         assert!(ord.recent_loop);
         assert!(ord.archive_lookup);
+
+        let nci = capabilities
+            .iter()
+            .find(|capability| capability.provider_id == "australia-nci")
+            .expect("NCI capability");
+        assert!(
+            !nci.archive_lookup,
+            "NCI's card goes honest-false until a real ArchiveFrames impl \
+             lands over its dated tarlists"
+        );
+        assert!(nci.next_unlock.contains("archive lookup"));
     }
 
     /// The Load Loop capability is DERIVED, not hand-maintained:
@@ -1016,6 +1161,119 @@ mod tests {
         assert_eq!(plans.len(), 2, "must not fall back to a single frame");
         assert_eq!(plans[0].identity, "nwsit_frame_0");
         assert_eq!(plans[1].identity, "nwsit_frame_1");
+    }
+
+    /// Without an `archive_source`, a provider honestly reports no
+    /// archive lookup.
+    #[test]
+    fn default_archive_source_is_absent_and_reports_no_archive_support() {
+        let provider = FakeProvider;
+        assert!(provider.archive_source().is_none());
+        assert!(!provider.supports_archive());
+    }
+
+    /// With an `archive_source`, day lookups route to the dated archive
+    /// and `supports_archive()` flips true — one override point, two
+    /// effects (the [`RecentFrames`] pattern, mirrored).
+    #[test]
+    fn archive_source_routes_day_plans_and_flips_supports_archive_together() {
+        let provider = FakeArchiveProvider;
+        assert!(provider.supports_archive());
+        let date = NaiveDate::from_ymd_opt(2026, 6, 9).expect("date");
+        let plans = provider
+            .archive_source()
+            .expect("archive source")
+            .day_plans("nwsit", date)
+            .expect("day plans");
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| plan.identity.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nwsit_20260609_0", "nwsit_20260609_1"],
+            "oldest first"
+        );
+    }
+
+    /// The provided `window_plans` folds `day_plans` over every UTC date
+    /// the window touches, stays oldest-first, and caps to the NEWEST
+    /// `max` frames (the loop-ending-at-scan tail).
+    #[test]
+    fn default_window_plans_folds_days_oldest_first_and_caps_to_the_newest() {
+        use chrono::TimeZone;
+        let provider = FakeArchiveProvider;
+        let source = provider.archive_source().expect("archive source");
+        let start = Utc.with_ymd_and_hms(2026, 6, 9, 6, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 6, 10, 18, 0, 0).unwrap();
+
+        let plans = source
+            .window_plans("nwsit", start, end, 3)
+            .expect("window plans");
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| plan.identity.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nwsit_20260609_1", "nwsit_20260610_0", "nwsit_20260610_1"],
+            "two folded days, oldest trimmed by the cap"
+        );
+
+        assert!(
+            source
+                .window_plans("nwsit", start, end, 0)
+                .expect("empty cap")
+                .is_empty()
+        );
+        let err = source.window_plans("nwsit", end, start, 3).unwrap_err();
+        assert!(err.contains("precedes"), "unexpected error: {err}");
+        let err = source.window_plans("missing", start, end, 3).unwrap_err();
+        assert!(
+            err.contains("missing"),
+            "an all-error fold must surface the first day error: {err}"
+        );
+    }
+
+    /// The archive capability is DERIVED, not hand-maintained: handing an
+    /// [`ArchiveFrames`] back from `archive_source` is the one act that
+    /// both routes archive lookup and flips the capability card, so the
+    /// card can never go stale against the code (the parity audit caught
+    /// the hand-kept flag lying in both directions). The expected id set
+    /// is the review tripwire: a provider gaining or losing a real dated
+    /// archive must show up here deliberately.
+    #[test]
+    fn archive_capability_is_derived_from_archive_source() {
+        let providers = intl_providers();
+        let capabilities = intl_provider_capabilities();
+        for provider in &providers {
+            let capability = capabilities
+                .iter()
+                .find(|capability| capability.provider_id == provider.id())
+                .unwrap_or_else(|| panic!("{}: missing capability card", provider.id()));
+            assert_eq!(
+                capability.archive_lookup,
+                provider.supports_archive(),
+                "{}: capability card must mirror the provider",
+                provider.id()
+            );
+            assert_eq!(
+                provider.supports_archive(),
+                provider.archive_source().is_some(),
+                "{}: supports_archive must stay derived from archive_source",
+                provider.id()
+            );
+        }
+        let archive_ids = providers
+            .iter()
+            .filter(|provider| provider.supports_archive())
+            .map(|provider| provider.id())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            archive_ids,
+            BTreeSet::from(["ord", "smhi"]),
+            "FMI bucket walks, NCI tarlists, DMI STAC, and JMA dated tars \
+             are later pure adapter work — each flips its card by landing \
+             a real ArchiveFrames impl, and shows up here deliberately"
+        );
     }
 
     /// Coordinate sanity for every provider's EMBEDDED catalog: each static

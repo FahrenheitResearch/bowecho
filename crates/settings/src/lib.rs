@@ -762,18 +762,37 @@ impl AppSettings {
         self.event_after_scans.unwrap_or(self.event_pad_frames)
     }
 
+    /// Favorite keys come in two shapes (v0.29 spec §1.1): bare US site
+    /// ids (`"KTLX"`), which keep the historical uppercase-on-write /
+    /// case-insensitive-compare behavior byte-for-byte, and namespaced
+    /// `SiteRef` keys (`"intl:ord:deess"`, recognized by the `':'`),
+    /// which are stored VERBATIM and compared case-sensitively — ORD/SMHI
+    /// site ids are case-significant lowercase, so uppercasing would
+    /// corrupt them on write.
     pub fn add_favorite(&mut self, site: &str) {
-        if !self.favorites.iter().any(|s| s.eq_ignore_ascii_case(site)) {
+        if site.contains(':') {
+            if !self.favorites.iter().any(|s| s == site) {
+                self.favorites.push(site.to_owned());
+            }
+        } else if !self.favorites.iter().any(|s| s.eq_ignore_ascii_case(site)) {
             self.favorites.push(site.to_ascii_uppercase());
         }
     }
 
     pub fn remove_favorite(&mut self, site: &str) {
-        self.favorites.retain(|s| !s.eq_ignore_ascii_case(site));
+        if site.contains(':') {
+            self.favorites.retain(|s| s != site);
+        } else {
+            self.favorites.retain(|s| !s.eq_ignore_ascii_case(site));
+        }
     }
 
     pub fn is_favorite(&self, site: &str) -> bool {
-        self.favorites.iter().any(|s| s.eq_ignore_ascii_case(site))
+        if site.contains(':') {
+            self.favorites.iter().any(|s| s == site)
+        } else {
+            self.favorites.iter().any(|s| s.eq_ignore_ascii_case(site))
+        }
     }
 }
 
@@ -1724,5 +1743,74 @@ mod tests {
             AppSettings::from_json("not json {{"),
             AppSettings::default()
         );
+    }
+
+    /// v0.29 spec §1.1: namespaced `SiteRef` favorites (`':'`-keys) are
+    /// stored VERBATIM and compared case-sensitively — the old blanket
+    /// `to_ascii_uppercase()` would corrupt `"intl:ord:deess"` to
+    /// `"INTL:ORD:DEESS"` on the very first intl star, and ORD/SMHI site
+    /// ids are case-significant lowercase.
+    #[test]
+    fn namespaced_favorites_store_verbatim_and_compare_case_sensitively() {
+        let mut s = AppSettings::default();
+        s.add_favorite("intl:ord:deess");
+        assert_eq!(s.favorites, vec!["intl:ord:deess".to_owned()]);
+        assert!(s.is_favorite("intl:ord:deess"));
+        assert!(
+            !s.is_favorite("INTL:ORD:DEESS"),
+            "namespaced keys never case-fold"
+        );
+
+        s.add_favorite("intl:ord:deess"); // exact duplicate: no-op
+        assert_eq!(s.favorites.len(), 1);
+        s.add_favorite("intl:jma:TAKA"); // uppercase intl id survives
+        assert_eq!(
+            s.favorites,
+            vec!["intl:ord:deess".to_owned(), "intl:jma:TAKA".to_owned()]
+        );
+
+        s.remove_favorite("INTL:ORD:DEESS"); // wrong case: no-op
+        assert!(s.is_favorite("intl:ord:deess"));
+        s.remove_favorite("intl:ord:deess");
+        assert!(!s.is_favorite("intl:ord:deess"));
+        assert_eq!(s.favorites, vec!["intl:jma:TAKA".to_owned()]);
+    }
+
+    /// Bare keys keep the historical behavior byte-for-byte: uppercase on
+    /// write, case-insensitive compare and removal.
+    #[test]
+    fn bare_favorites_keep_the_uppercasing_behavior_exactly() {
+        let mut s = AppSettings::default();
+        s.add_favorite("ktlx");
+        assert_eq!(s.favorites, vec!["KTLX".to_owned()]);
+        assert!(s.is_favorite("kTlX"));
+        s.add_favorite("KTLX"); // dedupe, case-insensitive
+        assert_eq!(s.favorites.len(), 1);
+        s.remove_favorite("Ktlx");
+        assert!(s.favorites.is_empty());
+    }
+
+    /// Both favorite shapes coexist in one list and survive the JSON
+    /// round trip with case intact.
+    #[test]
+    fn mixed_favorites_round_trip_with_case_intact() {
+        let mut s = AppSettings::default();
+        s.add_favorite("ktlx");
+        s.add_favorite("intl:smhi:angelholm");
+        s.add_favorite("TOKC");
+        let back = AppSettings::from_json(&s.to_json());
+        assert_eq!(
+            back.favorites,
+            vec![
+                "KTLX".to_owned(),
+                "intl:smhi:angelholm".to_owned(),
+                "TOKC".to_owned()
+            ]
+        );
+        assert!(back.is_favorite("intl:smhi:angelholm"));
+        assert!(back.is_favorite("ktlx"));
+        // A bare query never matches a namespaced key and vice versa.
+        assert!(!back.is_favorite("angelholm"));
+        assert!(!back.is_favorite("intl:smhi:ANGELHOLM"));
     }
 }
