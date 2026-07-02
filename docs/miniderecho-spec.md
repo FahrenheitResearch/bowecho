@@ -860,3 +860,15 @@ anything · archive UI · iOS target work beyond the inert Cargo.toml block.
 **Deliverable:** PR series (ui_core extraction; settings helper; mini_ui skeleton), the acceptance
 evidence above, and a list of every anchor that had drifted (with corrected lines) for this spec's
 next revision.
+
+## 11a. M1 scope amendment (2026-07-02, owner feedback on M0)
+
+The owner's first M0 impression: "literally just the radar and zero
+basemap." Correct product signal — a radar app without a map does not
+read as an app. M1 therefore pulls forward from M4: **tile basemap on
+screen** (ui_core::tiles is already extracted and unused on screen;
+draw it under the radar with a miniderecho TileLayerConfig) and the
+**always-visible control bar** (the §UX "RadarScope bar": site,
+product, tilt, loop transport, GO LIVE). The M4 items that stay at M4:
+the 305k-line vector-basemap crate extraction (the tile raster serves
+until then), theme/token pass, branding/icon, release engineering.
