@@ -17,6 +17,10 @@ pub(crate) struct EventLoopBuilderState {
     end_time: String,
     time_zone: LoopTimeZone,
     site_id: String,
+    /// The last value `site_id` was auto-seeded/synced to. While the
+    /// field still equals this, it FOLLOWS display-owner changes; once
+    /// the user edits it away, their text is never clobbered.
+    seeded_site_id: String,
     site_label: String,
     include_radar: bool,
     include_warnings: bool,
@@ -40,6 +44,7 @@ impl Default for EventLoopBuilderState {
             end_time: String::new(),
             time_zone: LoopTimeZone::Utc,
             site_id: String::new(),
+            seeded_site_id: String::new(),
             site_label: String::new(),
             include_radar: true,
             include_warnings: true,
@@ -144,14 +149,29 @@ impl EventLoopBuilderState {
     }
 
     fn seed_from_context(&mut self, context: &EventLoopBuilderContext) {
-        if self.seeded {
+        if !self.seeded {
+            self.time_zone = LoopTimeZone::from_slug(&context.display_time_zone_slug);
+            self.use_selected(context);
+            self.set_range_ending(Utc::now());
+            self.seeded = true;
             return;
         }
-        self.time_zone = LoopTimeZone::from_slug(&context.display_time_zone_slug);
+        // The display owner changed after the first seed: an untouched
+        // site field follows it (field report: the builder still showed
+        // the Euro site after an explicit US pick released ownership).
+        // Only the SITE follows — the time range is the user's work in
+        // progress and never re-seeds.
+        if self.site_id == self.seeded_site_id && context.current_site_id != self.seeded_site_id {
+            self.use_selected(context);
+        }
+    }
+
+    /// Sync the site field to the display owner and resume following it
+    /// (shared by seeding and the "Use Selected" button).
+    fn use_selected(&mut self, context: &EventLoopBuilderContext) {
         self.site_id = context.current_site_id.clone();
+        self.seeded_site_id = context.current_site_id.clone();
         self.site_label = context.current_site_label.clone();
-        self.set_range_ending(Utc::now());
-        self.seeded = true;
     }
 
     fn ui(
@@ -264,8 +284,7 @@ impl EventLoopBuilderState {
             ui.label("Site");
             ui.add_sized([78.0, 22.0], egui::TextEdit::singleline(&mut self.site_id));
             if ui.button("Use Selected").clicked() {
-                self.site_id = context.current_site_id.clone();
-                self.site_label = context.current_site_label.clone();
+                self.use_selected(context);
             }
             ui.checkbox(&mut self.center_on_site, "Center");
         });
@@ -690,10 +709,44 @@ mod tests {
         assert_eq!(state.site_id, "angelholm");
         assert_eq!(state.site_label, "smhi angelholm");
 
-        // Seeding is once-per-window (unchanged mechanics): a later
-        // context does not stomp user edits.
+        // A later context never stomps a user-edited field.
         state.site_id = "kiruna".to_owned();
         state.seed_from_context(&us_context());
         assert_eq!(state.site_id, "kiruna");
+    }
+
+    /// Field report (v0.29.0-alpha.2 ownership fix follow-up): after a
+    /// Euro archive session, map-clicking KARX released display
+    /// ownership — but the builder still showed the Euro site, because
+    /// the one-shot `seeded` latch froze the field at first open. An
+    /// UNTOUCHED site field follows the display owner across owner
+    /// changes; a user-edited field is never clobbered.
+    #[test]
+    fn untouched_seed_follows_a_new_display_owner() {
+        let mut state = EventLoopBuilderState::default();
+        state.seed_from_context(&intl_context("ord", "bewid"));
+        assert_eq!(state.site_id, "bewid");
+
+        // Ownership returns to a US site: the untouched seed follows,
+        // label included.
+        state.seed_from_context(&EventLoopBuilderContext {
+            current_site_id: "KARX".to_owned(),
+            current_site_label: "KARX La Crosse".to_owned(),
+            ..us_context()
+        });
+        assert_eq!(state.site_id, "KARX");
+        assert_eq!(state.site_label, "KARX La Crosse");
+
+        // A user-edited field survives further owner changes...
+        state.site_id = "kiruna".to_owned();
+        state.seed_from_context(&intl_context("smhi", "angelholm"));
+        assert_eq!(state.site_id, "kiruna");
+
+        // ...and "Use Selected" re-syncs to the owner AND resumes
+        // following it afterwards.
+        state.use_selected(&intl_context("smhi", "angelholm"));
+        assert_eq!(state.site_id, "angelholm");
+        state.seed_from_context(&us_context());
+        assert_eq!(state.site_id, "KTLX");
     }
 }
