@@ -2297,6 +2297,7 @@ impl ViewerApp {
         // windows' "Show on radar map" buttons.
         ui.add_space(4.0);
         let mut add_site: Option<RadarSite> = None;
+        let mut add_intl_site: Option<data_source::international::IntlSite> = None;
         let mut add_italy_dpc: Option<ItalyDpcMapProduct> = None;
         let mut add_taiwan_cwa = false;
         let mut add_grid_composite: Option<grid_composites::GridCompositeSource> = None;
@@ -2307,8 +2308,10 @@ impl ViewerApp {
                             .id_salt("add_layer_site_list")
                             .max_height(300.0)
                             .show(ui, |ui| {
-                                // Favorites first (spec §2.4), then the
-                                // full alphabetical list.
+                                // Favorites first (spec §2.4) — BOTH
+                                // worlds (v0.29 Phase 3: `intl:` keys
+                                // resolve to intl overlay feeds) — then
+                                // the full alphabetical US list.
                                 let favorites: Vec<&RadarSite> = self
                                     .sites
                                     .iter()
@@ -2316,13 +2319,38 @@ impl ViewerApp {
                                         self.app_settings.is_favorite(&site.level2_id)
                                     })
                                     .collect();
-                                if !favorites.is_empty() {
+                                let intl_favorites: Vec<
+                                    data_source::international::IntlSite,
+                                > = self
+                                    .app_settings
+                                    .favorites
+                                    .iter()
+                                    .filter_map(|fav| {
+                                        match data_source::sites::SiteRef::parse_settings_key(fav) {
+                                            data_source::sites::SiteRef::Intl {
+                                                provider_id,
+                                                site_id,
+                                            } => Self::find_intl_site(&provider_id, &site_id),
+                                            data_source::sites::SiteRef::Us { .. } => None,
+                                        }
+                                    })
+                                    .collect();
+                                if !favorites.is_empty() || !intl_favorites.is_empty() {
                                     for site in favorites {
                                         if ui
                                             .button(format!("★ {}", format_site_label(site)))
                                             .clicked()
                                         {
                                             add_site = Some(site.clone());
+                                            ui.close();
+                                        }
+                                    }
+                                    for site in intl_favorites {
+                                        if ui
+                                            .button(format!("★ {}", site.label))
+                                            .clicked()
+                                        {
+                                            add_intl_site = Some(site);
                                             ui.close();
                                         }
                                     }
@@ -2539,6 +2567,9 @@ impl ViewerApp {
                 });
         if let Some(site) = add_site {
             self.add_or_refresh_radar_layer(site, ctx);
+        }
+        if let Some(site) = add_intl_site {
+            self.add_or_refresh_intl_radar_layer(&site, ctx);
         }
         if let Some(product) = add_italy_dpc {
             self.add_italy_dpc_layer(product, ctx);

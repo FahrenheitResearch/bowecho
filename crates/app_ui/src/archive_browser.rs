@@ -1159,11 +1159,17 @@ impl ViewerApp {
     /// provider archive window load.
     pub(crate) fn start_intl_event_loop_radar_load(
         &mut self,
-        provider_id: String,
         plan: crate::event_loop_builder::EventLoopRadarPlan,
         ctx: &egui::Context,
     ) -> String {
-        let site_id = plan.site_id.clone();
+        let SiteRef::Intl {
+            provider_id,
+            site_id,
+        } = plan.site.clone()
+        else {
+            // Callers dispatch on kind; stay total anyway.
+            return "US event loops build on the Level-II archive loader".to_owned();
+        };
         let replaced_active_load = self.load_receiver.take().is_some();
         if replaced_active_load {
             self.archive_load_progress = None;

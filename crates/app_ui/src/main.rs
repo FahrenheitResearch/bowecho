@@ -15,6 +15,7 @@ use chrono::{
     Utc, Weekday,
 };
 use color_tables::{ColorTable, ColorTableFamily, ColorTableSet, builtin_tables_for_family};
+use data_source::sites::{SiteKind, SiteRef};
 use data_source::{LEVEL2_ARCHIVE_BUCKET, RadarSite, RealtimeChunkType};
 use eframe::egui;
 use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType, RadarVolume};
@@ -303,22 +304,15 @@ const DEBUG_ARCHIVE_CASES: &[DebugArchiveCase] = &[
     },
 ];
 
-/// What a lowest-beam menu pick switches to.
-#[derive(Clone, Debug, PartialEq)]
-enum BeamTarget {
-    /// Primary Level II catalog index: select the site and load latest.
-    Conus(usize),
-    /// International static-catalog site: start (or retarget) the intl
-    /// poll — beam height at 0.5° is pure geometry, so intl sites rank
-    /// in the same lowest-beam list as WSR-88Ds (parity: international
-    /// radars are not second-class).
-    Intl(data_source::international::IntlSite),
-}
-
-/// One row of the lowest-beam ranking.
+/// One row of the lowest-beam ranking. Identity is a [`SiteRef`] — the
+/// v0.28 `BeamTarget::Conus(usize)` catalog index died in v0.29 Phase 3
+/// (string refs survive catalog reorder; kind decides the activation
+/// path). Beam height at 0.5° is pure geometry, so intl sites rank in
+/// the same lowest-beam list as WSR-88Ds (parity: international radars
+/// are not second-class).
 #[derive(Clone, Debug)]
 struct BeamCandidate {
-    target: BeamTarget,
+    site: data_source::sites::SiteRef,
     /// Row head: site id (CONUS) or site/marker label.
     label: String,
     /// Weak provenance suffix for non-CONUS rows ("SMHI Sweden",
@@ -2246,6 +2240,11 @@ struct IntlOverlayFeed {
     rx: Option<mpsc::Receiver<IntlFrameResult>>,
 }
 
+/// UI-side view of an international site selection (provider, site, and a
+/// display label). Since the v0.29 Phase-3 pin collapse this is NOT pane
+/// state — pane identity is `ViewPane::pin: Option<SiteRef>` — it is the
+/// label-carrying view the SITE controls build from a pin or the primary
+/// poll source.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PaneIntlSource {
     provider_id: String,
@@ -4281,13 +4280,14 @@ struct ViewPane {
     /// Independent tilt override; None = follow the main pane's tilt, so
     /// scrubbing the main tilt moves every un-pinned pane in sync.
     cut: Option<usize>,
-    /// None = follow the primary radar volume. Some(id) = this pane owns
-    /// its own latest-load source and map view.
-    pinned_site_id: Option<String>,
-    /// International provider/site source for independent panes. Kept
-    /// separate from `pinned_site_id` because those ids are not US Level-II
-    /// catalog ids and should not be looked up in `self.sites`.
-    intl_source: Option<PaneIntlSource>,
+    /// None = follow the primary radar volume. Some = this pane owns its
+    /// own source and map view — ONE identity for both worlds (v0.29
+    /// Phase 3): `SiteRef::Us` for Level-II catalog sites, `SiteRef::Intl`
+    /// for international registry sites. The old `pinned_site_id` +
+    /// `intl_source` pair could disagree (a lingering US id under an intl
+    /// source, the Follow-primary `None==None` combo no-op); one enum
+    /// makes those states unrepresentable.
+    pin: Option<SiteRef>,
     /// Per-pane auto-refresh — the pane analog of the primary's
     /// `realtime_level2_auto_refresh`. Defaults on: independent panes exist
     /// for storm-day multi-radar and users expect every pane to stay live.
@@ -4326,8 +4326,7 @@ impl ViewPane {
         Self {
             product,
             cut: None,
-            pinned_site_id: None,
-            intl_source: None,
+            pin: None,
             live: true,
             last_realtime_level2_refresh: None,
             followed_primary_volume_ptr: None,
@@ -4355,7 +4354,27 @@ impl ViewPane {
     }
 
     fn owns_radar(&self) -> bool {
-        self.pinned_site_id.is_some() || self.intl_source.is_some()
+        self.pin.is_some()
+    }
+
+    /// Pinned US Level-II id, if this pane's pin is a US-catalog site.
+    fn pinned_us_id(&self) -> Option<&str> {
+        match self.pin.as_ref()? {
+            SiteRef::Us { level2_id } => Some(level2_id),
+            SiteRef::Intl { .. } => None,
+        }
+    }
+
+    /// Pinned `(provider_id, site_id)`, if this pane's pin is an
+    /// international registry site.
+    fn pinned_intl(&self) -> Option<(&str, &str)> {
+        match self.pin.as_ref()? {
+            SiteRef::Us { .. } => None,
+            SiteRef::Intl {
+                provider_id,
+                site_id,
+            } => Some((provider_id, site_id)),
+        }
     }
 
     fn clear_texture(&mut self) {
@@ -6426,6 +6445,9 @@ impl ViewerApp {
         let data_dir = app_settings.data_dir.trim();
         settings::set_data_dir_override((!data_dir.is_empty()).then(|| PathBuf::from(data_dir)));
         let restored_poll_url = app_settings.poll_url.clone();
+        // The ONE persisted owner key restores intl sessions (armed, never
+        // auto-started); absent = the legacy CustomUrl seed.
+        let restored_primary_poll_source = restored_poll_source(&app_settings);
         // Re-arm the international picker on the last-used provider so the
         // saved site selection has its provider context back.
         let restored_intl_provider = app_settings.intl_provider.clone();
@@ -6672,7 +6694,7 @@ impl ViewerApp {
             vol3d: vol3d::Vol3d::default(),
             wofs: wofs::WofsState::default(),
             farm: restored_farm,
-            poll_source: PollSource::CustomUrl(restored_poll_url.clone()),
+            poll_source: restored_primary_poll_source,
             intl_picker_provider: restored_intl_provider,
             intl_sites: None,
             intl_sites_rx: WorkerSlot::idle("intl-site-list"),
@@ -7143,34 +7165,35 @@ impl ViewerApp {
     }
 
     fn extra_pane_live_source(&self, pane: &ViewPane) -> PaneLiveSource {
-        if pane.intl_source.is_some() {
-            return PaneLiveSource::Intl;
-        }
-        let Some(pinned) = pane.pinned_site_id.as_deref() else {
-            return PaneLiveSource::None;
-        };
-        // Strict catalog lookup: an id inherited from an international or
-        // archive primary display must not resolve to some other site's
-        // feed (extra_pane_selected_site_index's primary fallback would).
-        let Some(site) = self
-            .sites
-            .iter()
-            .find(|site| site.level2_id.eq_ignore_ascii_case(pinned))
-        else {
-            return PaneLiveSource::None;
-        };
-        if community_feed_for_site(site).is_some() {
-            // The pane load path refuses research feeds; polling one would
-            // only rewrite the pane status every tick.
-            return PaneLiveSource::None;
-        }
-        if self
-            .primary_live_poll_site_id()
-            .is_some_and(|id| id.eq_ignore_ascii_case(pinned))
-        {
-            PaneLiveSource::SharedWithPrimary
-        } else {
-            PaneLiveSource::UsSite
+        match pane.pin.as_ref() {
+            None => PaneLiveSource::None,
+            Some(SiteRef::Intl { .. }) => PaneLiveSource::Intl,
+            Some(SiteRef::Us { level2_id }) => {
+                // Strict catalog lookup: an id inherited from an
+                // international or archive primary display must not resolve
+                // to some other site's feed
+                // (extra_pane_selected_site_index's primary fallback would).
+                let Some(site) = self
+                    .sites
+                    .iter()
+                    .find(|site| site.level2_id.eq_ignore_ascii_case(level2_id))
+                else {
+                    return PaneLiveSource::None;
+                };
+                if us_site_kind(site) == SiteKind::Research {
+                    // The pane load path refuses research feeds; polling one
+                    // would only rewrite the pane status every tick.
+                    return PaneLiveSource::None;
+                }
+                if self
+                    .primary_live_poll_site_id()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(level2_id))
+                {
+                    PaneLiveSource::SharedWithPrimary
+                } else {
+                    PaneLiveSource::UsSite
+                }
+            }
         }
     }
 
@@ -7212,16 +7235,15 @@ impl ViewerApp {
         let Some(pane) = self.extra_panes.get(pane_slot) else {
             return false;
         };
-        if let Some(source) = pane.intl_source.clone() {
-            let Some(site) = Self::find_intl_site(&source.provider_id, &source.site_id) else {
+        if let Some((provider_id, site_id)) = pane.pinned_intl() {
+            let Some(site) = Self::find_intl_site(provider_id, site_id) else {
                 return false;
             };
             self.start_extra_pane_intl_load(pane_slot, site, LatestLoadMode::AutoRefresh, ctx);
             return true;
         }
         let Some(site) = pane
-            .pinned_site_id
-            .as_deref()
+            .pinned_us_id()
             .and_then(|pinned| {
                 self.sites
                     .iter()
@@ -7252,7 +7274,7 @@ impl ViewerApp {
         let Some(pane) = self.extra_panes.get(pane_slot) else {
             return;
         };
-        let Some(pinned) = pane.pinned_site_id.as_deref() else {
+        let Some(pinned) = pane.pinned_us_id() else {
             return;
         };
         if !frame.identity.site_id.eq_ignore_ascii_case(pinned) {
@@ -13642,7 +13664,67 @@ impl ViewerApp {
             self.extra_panes.push(ViewPane::new(next));
             if self.app_settings.independent_panels {
                 self.initialize_extra_pane_from_primary(slot);
+                // v0.29 Phase 3 startup restore: an explicitly pinned pane
+                // comes back pinned (bare legacy ids parse as US forever;
+                // `intl:{provider}:{site}` keys keep their case).
+                if let Some(pin) = u8::try_from(slot)
+                    .ok()
+                    .and_then(|slot| self.app_settings.extra_pane_pins.get(&slot))
+                    .map(|key| SiteRef::parse_settings_key(key))
+                {
+                    self.restore_extra_pane_pin(slot, &pin);
+                }
             }
+        }
+    }
+
+    /// Re-apply a persisted pane pin: the pane comes back pinned, cleared,
+    /// and centered exactly like the user's original pick — waiting on its
+    /// live poll / Load button, never auto-fetching at startup. Refs the
+    /// catalogs no longer know are skipped (the pane follows primary).
+    fn restore_extra_pane_pin(&mut self, pane_slot: usize, pin: &SiteRef) {
+        match pin {
+            SiteRef::Us { level2_id } => {
+                if let Some(index) = self
+                    .sites
+                    .iter()
+                    .position(|site| site.level2_id.eq_ignore_ascii_case(level2_id))
+                {
+                    self.set_extra_pane_selected_site(pane_slot, index);
+                }
+            }
+            SiteRef::Intl {
+                provider_id,
+                site_id,
+            } => {
+                if let Some(site) = Self::find_intl_site(provider_id, site_id) {
+                    self.set_extra_pane_intl_site(pane_slot, &site);
+                }
+            }
+        }
+    }
+
+    /// Persist a pane's explicit pin (settings-key encoding; a follow-
+    /// primary pane removes its entry). Called from explicit pin intents
+    /// only — combo picks, favorite chips, marker/beam picks — never from
+    /// load/install paths, so settings are not rewritten on every refresh.
+    fn remember_extra_pane_pin(&mut self, pane_slot: usize) {
+        let Ok(slot) = u8::try_from(pane_slot) else {
+            return;
+        };
+        let pin = self
+            .extra_panes
+            .get(pane_slot)
+            .and_then(|pane| pane.pin.as_ref());
+        let changed = match pin {
+            Some(pin) => {
+                let key = pin.settings_key();
+                self.app_settings.extra_pane_pins.insert(slot, key.clone()) != Some(key)
+            }
+            None => self.app_settings.extra_pane_pins.remove(&slot).is_some(),
+        };
+        if changed {
+            let _ = self.app_settings.save();
         }
     }
 
@@ -13692,17 +13774,18 @@ impl ViewerApp {
             .as_ref()
             .and_then(|volume| Some((volume.site.latitude_deg?, volume.site.longitude_deg?)))
             .or_else(|| selected_site.as_ref().and_then(site_location));
-        let intl_source = match (&self.poll_source, self.poll_active) {
+        let pin = match (&self.poll_source, self.poll_active) {
             (
                 PollSource::Intl {
                     provider_id,
                     site_id,
                 },
                 true,
-            ) => Self::find_intl_site(provider_id, site_id)
-                .as_ref()
-                .map(PaneIntlSource::from_site),
-            _ => None,
+            ) if Self::find_intl_site(provider_id, site_id).is_some() => Some(SiteRef::Intl {
+                provider_id: provider_id.clone(),
+                site_id: site_id.clone(),
+            }),
+            _ => site_id.clone().map(|level2_id| SiteRef::Us { level2_id }),
         };
         let show_derived_products = self.app_settings.show_derived_products;
         let advanced_products_enabled = self.advanced_products_enabled;
@@ -13711,15 +13794,14 @@ impl ViewerApp {
         let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
             return;
         };
-        pane.pinned_site_id = site_id.clone();
-        // An intl source here means the primary was live-polling it; a US
+        // An intl pin here means the primary was live-polling it; a US
         // history inherits the primary's Live flag, which archive/event
         // loads clear — so an inherited archive loop stays an archive loop
         // instead of being clobbered by this pane's live poll.
-        pane.live = intl_source.is_some() || primary_live;
+        pane.live = matches!(pin, Some(SiteRef::Intl { .. })) || primary_live;
+        pane.pin = pin;
         pane.last_realtime_level2_refresh = None;
         pane.followed_primary_volume_ptr = None;
-        pane.intl_source = intl_source;
         pane.volume = primary_volume.clone();
         pane.source_path = source_path;
         pane.load_timing = load_timing;
@@ -13790,10 +13872,12 @@ impl ViewerApp {
     fn extra_pane_selected_site_index(&self, pane_slot: usize) -> usize {
         self.extra_panes
             .get(pane_slot)
-            .and_then(|pane| {
-                pane.pinned_site_id
-                    .as_deref()
-                    .or_else(|| pane.volume.as_ref().map(|volume| volume.site.id.as_str()))
+            .and_then(|pane| match pane.pin.as_ref() {
+                Some(SiteRef::Us { level2_id }) => Some(level2_id.as_str()),
+                // An intl pin has no US-catalog index; callers that need a
+                // label must read the pin, never this primary fallback.
+                Some(SiteRef::Intl { .. }) => None,
+                None => pane.volume.as_ref().map(|volume| volume.site.id.as_str()),
             })
             .and_then(|site_id| {
                 self.sites
@@ -13808,17 +13892,19 @@ impl ViewerApp {
             return;
         };
         let site_id = site.level2_id.clone();
+        let pin = SiteRef::Us {
+            level2_id: site_id.clone(),
+        };
         let changed = self
             .extra_panes
             .get(pane_slot)
-            .and_then(|pane| pane.pinned_site_id.as_deref())
-            != Some(site_id.as_str());
+            .and_then(|pane| pane.pin.as_ref())
+            != Some(&pin);
         if !changed {
             return;
         }
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-            pane.pinned_site_id = Some(site_id.clone());
-            pane.intl_source = None;
+            pane.pin = Some(pin);
             pane.last_realtime_level2_refresh = None;
             pane.followed_primary_volume_ptr = None;
             pane.volume = None;
@@ -13837,6 +13923,49 @@ impl ViewerApp {
             pane.clear_texture();
         }
         self.center_extra_pane_on_site(pane_slot, &site);
+        self.remember_extra_pane_pin(pane_slot);
+    }
+
+    /// Intl mirror of [`Self::set_extra_pane_selected_site`]: pin the pane
+    /// to an international registry site (same clear-and-recenter rules).
+    fn set_extra_pane_intl_site(
+        &mut self,
+        pane_slot: usize,
+        site: &data_source::international::IntlSite,
+    ) {
+        let pin = SiteRef::Intl {
+            provider_id: site.provider_id.to_owned(),
+            site_id: site.site_id.clone(),
+        };
+        let changed = self
+            .extra_panes
+            .get(pane_slot)
+            .and_then(|pane| pane.pin.as_ref())
+            != Some(&pin);
+        if !changed {
+            return;
+        }
+        if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+            pane.pin = Some(pin);
+            pane.last_realtime_level2_refresh = None;
+            pane.followed_primary_volume_ptr = None;
+            pane.volume = None;
+            pane.source_path = None;
+            pane.load_timing = None;
+            pane.load_receiver = None;
+            pane.load_mode = None;
+            pane.pending_site_id = None;
+            pane.cut = None;
+            pane.status = if pane.live {
+                format!("Pane radar set to {}; live poll starting", site.label)
+            } else {
+                format!("Pane radar set to {}; click Load Latest", site.label)
+            };
+            pane.clear_history();
+            pane.clear_texture();
+        }
+        self.center_extra_pane_on_intl_site(pane_slot, site);
+        self.remember_extra_pane_pin(pane_slot);
     }
 
     fn extra_pane_display_volume(&self, pane_slot: usize) -> Option<Arc<RadarVolume>> {
@@ -13881,8 +14010,7 @@ impl ViewerApp {
 
     fn clear_extra_pane_radar(&mut self, pane_slot: usize) {
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-            pane.pinned_site_id = None;
-            pane.intl_source = None;
+            pane.pin = None;
             pane.live = true;
             pane.last_realtime_level2_refresh = None;
             pane.followed_primary_volume_ptr = None;
@@ -13939,13 +14067,9 @@ impl ViewerApp {
     /// The installed international frame's provider identity for a pane —
     /// the auto-refresh dedupe key. The install path records it as the
     /// pane's `intl:{identity}` source path.
-    fn extra_pane_intl_frame_identity(
-        &self,
-        pane_slot: usize,
-        source: &PaneIntlSource,
-    ) -> Option<String> {
+    fn extra_pane_intl_frame_identity(&self, pane_slot: usize, pin: &SiteRef) -> Option<String> {
         let pane = self.extra_panes.get(pane_slot)?;
-        if pane.intl_source.as_ref() != Some(source) {
+        if pane.pin.as_ref() != Some(pin) {
             return None;
         }
         pane.source_path
@@ -13965,10 +14089,13 @@ impl ViewerApp {
         if pane_slot >= self.extra_panes.len() {
             return;
         }
-        let source = PaneIntlSource::from_site(&site);
-        let provider_id = source.provider_id.clone();
-        let site_id = source.site_id.clone();
-        let label = source.label.clone();
+        let pin = SiteRef::Intl {
+            provider_id: site.provider_id.to_owned(),
+            site_id: site.site_id.clone(),
+        };
+        let provider_id = site.provider_id.to_owned();
+        let site_id = site.site_id.clone();
+        let label = site.label.clone();
         let progress = (mode == LatestLoadMode::Loop).then(|| {
             ArchiveLoadProgress::indeterminate(
                 format!("{label} loop"),
@@ -13980,11 +14107,11 @@ impl ViewerApp {
         // the same `fetch_intl_frame` mechanism the intl overlay feeds poll
         // with — so an unchanged catalog costs a probe, not a download.
         let last_identity = (mode == LatestLoadMode::AutoRefresh)
-            .then(|| self.extra_pane_intl_frame_identity(pane_slot, &source))
+            .then(|| self.extra_pane_intl_frame_identity(pane_slot, &pin))
             .flatten();
         {
             let pane = &mut self.extra_panes[pane_slot];
-            if pane.intl_source.as_ref() != Some(&source) {
+            if pane.pin.as_ref() != Some(&pin) {
                 pane.clear_history();
                 pane.volume = None;
                 pane.source_path = None;
@@ -13992,8 +14119,7 @@ impl ViewerApp {
                 pane.cut = None;
                 pane.clear_texture();
             }
-            pane.pinned_site_id = None;
-            pane.intl_source = Some(source);
+            pane.pin = Some(pin);
             pane.pending_site_id = Some(site_id.clone());
             pane.load_receiver = Some(receiver);
             pane.load_mode = Some(mode);
@@ -14008,6 +14134,9 @@ impl ViewerApp {
         if mode != LatestLoadMode::AutoRefresh {
             // A background refresh must never yank the user's pan/zoom.
             self.center_extra_pane_on_intl_site(pane_slot, &site);
+            // Explicit intl pane picks (marker/beam/Load) persist like
+            // explicit US picks; the auto-refresh tick never writes.
+            self.remember_extra_pane_pin(pane_slot);
         }
         let history_frame_limit = self.history_frame_limit.max(2);
         let ctx_clone = ctx.clone();
@@ -14084,8 +14213,9 @@ impl ViewerApp {
             );
             if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
                 pane.status = status.clone();
-                pane.pinned_site_id = Some(site.level2_id.clone());
-                pane.intl_source = None;
+                pane.pin = Some(SiteRef::Us {
+                    level2_id: site.level2_id.clone(),
+                });
             }
             self.status = status;
             ctx.request_repaint();
@@ -14127,8 +14257,9 @@ impl ViewerApp {
             .then(|| ArchiveLoadProgress::latest_loop_start(&site_id));
         {
             let pane = &mut self.extra_panes[pane_slot];
-            pane.pinned_site_id = Some(site_id.clone());
-            pane.intl_source = None;
+            pane.pin = Some(SiteRef::Us {
+                level2_id: site_id.clone(),
+            });
             pane.pending_site_id = Some(site_id.clone());
             pane.load_receiver = Some(receiver);
             pane.load_mode = Some(mode);
@@ -14624,7 +14755,16 @@ impl ViewerApp {
             pane.source_path = Some(source_path);
         }
         pane.load_timing = load_timing;
-        pane.pinned_site_id = Some(volume.site.id.clone());
+        // An intl pin keeps its identity through installs (its volumes
+        // carry provider site ids, not US-catalog ids); anything else is
+        // claimed for the installed volume's site — matching the old
+        // pinned-id write that the intl source used to outrank.
+        pane.pin = match pane.pin.take() {
+            pin @ Some(SiteRef::Intl { .. }) => pin,
+            _ => Some(SiteRef::Us {
+                level2_id: volume.site.id.clone(),
+            }),
+        };
         pane.volume = Some(Arc::clone(&volume));
         pane.pending_site_id = None;
         if site_changed
@@ -14981,11 +15121,20 @@ impl ViewerApp {
 
     fn reset_view(&mut self) {
         self.map_scale = DEFAULT_MAP_SCALE;
-        // Center on the current display owner: radar_location prefers the
-        // loaded volume's own site coordinates, so Reset View during an
-        // international session stays on that radar instead of snapping
-        // across the Atlantic to the stale US selection.
-        if let Some((latitude_deg, longitude_deg)) = self.radar_location() {
+        // Center on the current display owner: the loaded volume's own
+        // site coordinates first (Reset View during an international
+        // session stays on that radar instead of snapping across the
+        // Atlantic), then the OWNER's catalog coordinates (a restored
+        // intl session before its first poll still resets to ITS radar),
+        // then the selected US site.
+        let owner_location = self
+            .loaded_volume_location()
+            .or_else(|| {
+                data_source::sites::resolve(&self.display_owner_site())
+                    .and_then(|record| record.lat_lon)
+            })
+            .or_else(|| self.selected_site_location());
+        if let Some((latitude_deg, longitude_deg)) = owner_location {
             self.center_map_on(latitude_deg, longitude_deg);
         }
     }
@@ -15003,6 +15152,22 @@ impl ViewerApp {
         };
         if self.app_settings.startup_site.as_deref() != Some(id.as_str()) {
             self.app_settings.startup_site = Some(id.clone());
+            let _ = self.app_settings.save();
+        }
+        self.remember_display_owner();
+    }
+
+    /// Persist the primary display owner as ONE encoded settings key
+    /// (v0.29 Phase 3 §1.4: startup restore for intl sessions). Called at
+    /// every ownership transition; dedupes, and an ownerless state (no
+    /// site selected) is never written.
+    fn remember_display_owner(&mut self) {
+        let key = self.display_owner_site().settings_key();
+        if key.is_empty() {
+            return;
+        }
+        if self.app_settings.display_owner_site.as_deref() != Some(key.as_str()) {
+            self.app_settings.display_owner_site = Some(key);
             let _ = self.app_settings.save();
         }
     }
@@ -16851,12 +17016,16 @@ impl ViewerApp {
             self.pending_site_id = None;
             self.live_refresh_skip_reason = None;
         }
+        let SiteRef::Us { level2_id } = &plan.site else {
+            // Callers dispatch on kind; stay total anyway.
+            return "International event loops build on the intl archive loader".to_owned();
+        };
         let Some(site_index) = self
             .sites
             .iter()
-            .position(|site| site.level2_id.eq_ignore_ascii_case(&plan.site_id))
+            .position(|site| site.level2_id.eq_ignore_ascii_case(level2_id))
         else {
-            return format!("{} is not in the radar site catalog", plan.site_id);
+            return format!("{level2_id} is not in the radar site catalog");
         };
         let site = self.sites[site_index].clone();
         let site_id = site.level2_id.clone();
@@ -18124,9 +18293,10 @@ impl ViewerApp {
         };
         let action = self.event_loop_builder.show_window(ctx, builder_context);
         if let Some(event_loop_builder::EventLoopBuilderAction::BuildRadar(plan)) = action {
-            let status = match plan.intl_provider_id.clone() {
-                Some(provider_id) => self.start_intl_event_loop_radar_load(provider_id, plan, ctx),
-                None => self.start_event_loop_archive_radar_load(plan, ctx),
+            // Build dispatches on the plan site's KIND (v0.29 Phase 3).
+            let status = match &plan.site {
+                SiteRef::Intl { .. } => self.start_intl_event_loop_radar_load(plan, ctx),
+                SiteRef::Us { .. } => self.start_event_loop_archive_radar_load(plan, ctx),
             };
             self.event_loop_builder.mark_status(status);
         }
@@ -18834,19 +19004,25 @@ impl ViewerApp {
         let candidates = self.nearby_coordinated_overlay_sites(8);
         if candidates.is_empty() {
             self.unified_player
-                .mark_status(format!("No WSR-88D sites within {:.0} km", radius));
+                .mark_status(format!("No radar sites within {:.0} km", radius));
             return;
         }
+        // Both worlds encode as settings keys: bare US ids as ever,
+        // `intl:{provider}:{site}` case-preserved (the parser leaves
+        // `:`-keys verbatim).
         self.unified_player.coordinated_sites_input = candidates
             .iter()
-            .map(|(_, site)| site.level2_id.as_str())
+            .map(|(_, record)| record.site.settings_key())
             .collect::<Vec<_>>()
             .join(", ");
         self.unified_player
             .mark_status(format!("Found {} nearby radar sites", candidates.len()));
     }
 
-    fn nearby_coordinated_overlay_sites(&self, max_count: usize) -> Vec<(f32, RadarSite)> {
+    fn nearby_coordinated_overlay_sites(
+        &self,
+        max_count: usize,
+    ) -> Vec<(f32, data_source::sites::SiteRecord)> {
         let (lat, lon) = self
             .radar_location()
             .unwrap_or((self.map_center_lat, self.map_center_lon));
@@ -18854,19 +19030,28 @@ impl ViewerApp {
             .unified_player
             .coordinated_site_radius_km
             .clamp(25.0, 460.0);
-        let primary_site_id = self.selected_site().map(|site| site.level2_id.as_str());
-        let mut candidates = self
-            .sites
-            .iter()
-            .filter(|site| site_is_primary_level2_catalog_site(site) && !site_is_tdwr(site))
-            .filter(|site| Some(site.level2_id.as_str()) != primary_site_id)
-            .filter_map(|site| {
-                let (site_lat, site_lon) = site_location(site)?;
-                let distance_km = haversine_km(lat, lon, site_lat, site_lon);
-                (distance_km <= radius).then(|| (distance_km, site.clone()))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
+        // Primary exclusion by SiteRef equality: an INTL primary now
+        // excludes itself too (impossible under the old US-id compare).
+        let primary = self.display_owner_site();
+        let mut candidates: Vec<(f32, data_source::sites::SiteRecord)> =
+            data_source::sites::sites_near(lat, lon, radius)
+                .into_iter()
+                .filter_map(|(record, distance_km)| {
+                    // Union candidate pool, tagged by kind (v0.29 Phase 3):
+                    // archive-backed WSR-88Ds plus international sites
+                    // (listed for parity — window-loading limits are
+                    // Phase 4c). TDWRs' ~90 km range and research feeds'
+                    // live-only serving keep them out as ever.
+                    match record.kind {
+                        SiteKind::Wsr88d | SiteKind::Intl { .. } => {}
+                        SiteKind::Tdwr | SiteKind::Research => return None,
+                    }
+                    if record.site == primary {
+                        return None;
+                    }
+                    Some((distance_km, record))
+                })
+                .collect();
         candidates.truncate(max_count);
         candidates
     }
@@ -18880,20 +19065,43 @@ impl ViewerApp {
             return;
         }
         let mode = self.coordinated_overlay_load_mode();
-        let added = sites.len();
+        let mut added = 0usize;
+        let mut intl_window_skipped: Vec<String> = Vec::new();
         for site in sites {
-            match mode {
-                CoordinatedOverlayLoadMode::Live => self.add_or_refresh_radar_layer(site, ctx),
-                CoordinatedOverlayLoadMode::ArchiveWindow {
-                    start_utc,
-                    end_utc,
-                    max_frames,
-                } => self.add_or_refresh_radar_layer_archive_window(
-                    site, start_utc, end_utc, max_frames, ctx,
-                ),
+            match (site, mode) {
+                (CoordinatedOverlaySite::Us(site), CoordinatedOverlayLoadMode::Live) => {
+                    self.add_or_refresh_radar_layer(site, ctx);
+                    added += 1;
+                }
+                (
+                    CoordinatedOverlaySite::Us(site),
+                    CoordinatedOverlayLoadMode::ArchiveWindow {
+                        start_utc,
+                        end_utc,
+                        max_frames,
+                    },
+                ) => {
+                    self.add_or_refresh_radar_layer_archive_window(
+                        site, start_utc, end_utc, max_frames, ctx,
+                    );
+                    added += 1;
+                }
+                (CoordinatedOverlaySite::Intl(site), CoordinatedOverlayLoadMode::Live) => {
+                    self.add_or_refresh_intl_radar_layer(&site, ctx);
+                    added += 1;
+                }
+                (
+                    CoordinatedOverlaySite::Intl(site),
+                    CoordinatedOverlayLoadMode::ArchiveWindow { .. },
+                ) => {
+                    // Honest limit until the loop engine's per-source
+                    // window loaders land (spec Phase 4c): intl overlay
+                    // feeds serve the newest scan, not archive windows.
+                    intl_window_skipped.push(site.label.clone());
+                }
             }
         }
-        if missing.is_empty() && !skipped_primary {
+        if missing.is_empty() && !skipped_primary && intl_window_skipped.is_empty() {
             self.unified_player
                 .mark_status(self.coordinated_overlay_status(added, mode));
         } else {
@@ -18903,6 +19111,12 @@ impl ViewerApp {
             }
             if !missing.is_empty() {
                 details.push(format!("unknown site(s): {}", missing.join(", ")));
+            }
+            if !intl_window_skipped.is_empty() {
+                details.push(format!(
+                    "international sites serve newest scans only, skipped for archive windows: {}",
+                    intl_window_skipped.join(", ")
+                ));
             }
             self.unified_player.mark_status(format!(
                 "{}; {}",
@@ -18929,19 +19143,33 @@ impl ViewerApp {
             .coordinated_site_radius_km
             .clamp(25.0, 460.0);
         let candidates = self.nearby_coordinated_overlay_sites(STORM_VIDEO_SYNC_OVERLAY_RADARS);
-        if candidates.is_empty() {
+        // Archive-window sync loads US Level-II loops; intl candidates are
+        // listed in the pool but cannot window-load until the loop
+        // engine's per-source loaders land (spec Phase 4c).
+        let us_sites: Vec<RadarSite> = candidates
+            .iter()
+            .filter_map(|(_, record)| match &record.site {
+                SiteRef::Us { level2_id } => self
+                    .sites
+                    .iter()
+                    .find(|site| site.level2_id.eq_ignore_ascii_case(level2_id))
+                    .cloned(),
+                SiteRef::Intl { .. } => None,
+            })
+            .collect();
+        if us_sites.is_empty() {
             self.unified_player
                 .mark_status(format!("No WSR-88D sites within {:.0} km", radius));
             return;
         }
 
-        let selected_ids = candidates
+        let selected_ids = us_sites
             .iter()
-            .map(|(_, site)| site.level2_id.clone())
+            .map(|site| site.level2_id.clone())
             .collect::<BTreeSet<_>>();
-        self.unified_player.coordinated_sites_input = candidates
+        self.unified_player.coordinated_sites_input = us_sites
             .iter()
-            .map(|(_, site)| site.level2_id.as_str())
+            .map(|site| site.level2_id.as_str())
             .collect::<Vec<_>>()
             .join(", ");
         for layer in &mut self.radar_layers {
@@ -18949,7 +19177,7 @@ impl ViewerApp {
                 layer.visible = false;
             }
         }
-        for (_, site) in candidates {
+        for site in us_sites {
             self.add_or_refresh_radar_layer_archive_window(
                 site, start_utc, end_utc, max_frames, ctx,
             );
@@ -18993,31 +19221,47 @@ impl ViewerApp {
 
     fn resolve_unified_player_coordinated_overlay_sites(
         &self,
-    ) -> (Vec<RadarSite>, bool, Vec<String>, bool) {
+    ) -> (Vec<CoordinatedOverlaySite>, bool, Vec<String>, bool) {
         let site_ids = parse_coordinated_site_ids(&self.unified_player.coordinated_sites_input);
         if site_ids.is_empty() {
             return (Vec::new(), false, Vec::new(), false);
         }
-        let primary_site_id = self
-            .selected_site()
-            .map(|site| site.level2_id.to_ascii_uppercase());
+        // Every entry decodes to a SiteRef: bare US ids as ever, `intl:`
+        // settings keys case-preserved. The primary skip compares refs, so
+        // an intl primary skips itself too.
+        let primary = self.display_owner_site();
         let mut sites = Vec::new();
         let mut missing = Vec::new();
         let mut skipped_primary = false;
         for site_id in site_ids {
-            if primary_site_id.as_deref() == Some(site_id.as_str()) {
+            let site_ref = SiteRef::parse_settings_key(&site_id);
+            if site_ref == primary {
                 skipped_primary = true;
                 continue;
             }
-            if let Some(site) = self
-                .sites
-                .iter()
-                .find(|site| site.level2_id.eq_ignore_ascii_case(&site_id))
-                .cloned()
-            {
-                sites.push(site);
-            } else {
-                missing.push(site_id);
+            match &site_ref {
+                SiteRef::Us { level2_id } => {
+                    if let Some(site) = self
+                        .sites
+                        .iter()
+                        .find(|site| site.level2_id.eq_ignore_ascii_case(level2_id))
+                        .cloned()
+                    {
+                        sites.push(CoordinatedOverlaySite::Us(site));
+                    } else {
+                        missing.push(site_id);
+                    }
+                }
+                SiteRef::Intl {
+                    provider_id,
+                    site_id: intl_site_id,
+                } => {
+                    if let Some(site) = Self::find_intl_site(provider_id, intl_site_id) {
+                        sites.push(CoordinatedOverlaySite::Intl(site));
+                    } else {
+                        missing.push(site_id);
+                    }
+                }
             }
         }
         (sites, skipped_primary, missing, true)
@@ -19192,8 +19436,9 @@ impl ViewerApp {
         let max_frames = normalized_history_limit(self.history_frame_limit).max(1);
         let include_warnings = self.unified_player.auto_sync_warnings;
         Ok(event_loop_builder::EventLoopRadarPlan {
-            intl_provider_id: None,
-            site_id: site_id.clone(),
+            site: SiteRef::Us {
+                level2_id: site_id.clone(),
+            },
             start_utc,
             end_utc,
             max_frames,
@@ -21711,6 +21956,28 @@ impl ViewerApp {
         });
     }
 
+    /// Display label for a site pin: the US catalog row label, or the intl
+    /// record label with provider provenance, or — honest fallback — the
+    /// encoded key itself for refs the catalog does not know. Never the
+    /// primary's label (the v0.28 pane-combo mislabel).
+    fn site_pin_label(&self, pin: &SiteRef) -> String {
+        match pin {
+            SiteRef::Us { level2_id } => self
+                .sites
+                .iter()
+                .find(|site| site.level2_id.eq_ignore_ascii_case(level2_id))
+                .map(format_site_label)
+                .unwrap_or_else(|| level2_id.clone()),
+            SiteRef::Intl { .. } => match data_source::sites::resolve(pin) {
+                Some(record) => match &record.origin {
+                    Some(origin) => format!("{} ({})", record.label, origin),
+                    None => record.label,
+                },
+                None => pin.settings_key(),
+            },
+        }
+    }
+
     fn extra_pane_site_controls(
         &mut self,
         ui: &mut egui::Ui,
@@ -21720,20 +21987,10 @@ impl ViewerApp {
         let Some(pane) = self.extra_panes.get(pane_slot) else {
             return;
         };
-        let mut selected_site_id = pane.pinned_site_id.clone();
-        let selected_text = selected_site_id
-            .as_deref()
-            .and_then(|id| self.sites.iter().find(|site| site.level2_id == id))
-            .map(format_site_label)
-            .or_else(|| {
-                pane.intl_source.as_ref().map(|source| {
-                    format!(
-                        "{} ({})",
-                        source.label,
-                        intl_provider_label(&source.provider_id)
-                    )
-                })
-            })
+        let mut selected_pin = pane.pin.clone();
+        let selected_text = selected_pin
+            .as_ref()
+            .map(|pin| self.site_pin_label(pin))
             .unwrap_or_else(|| "Follow primary radar".to_owned());
         ui.horizontal(|ui| {
             ui.label("Pane radar");
@@ -21741,24 +21998,28 @@ impl ViewerApp {
                 .selected_text(selected_text)
                 .width((ui.available_width() - 156.0).max(150.0))
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut selected_site_id, None, "Follow primary radar");
+                    ui.selectable_value(&mut selected_pin, None, "Follow primary radar");
                     for site in &self.sites {
                         ui.selectable_value(
-                            &mut selected_site_id,
-                            Some(site.level2_id.clone()),
+                            &mut selected_pin,
+                            Some(SiteRef::Us {
+                                level2_id: site.level2_id.clone(),
+                            }),
                             format_site_label(site),
                         );
                     }
+                    intl_site_combo_section(ui, &mut selected_pin);
                 });
             let busy = self.extra_panes[pane_slot].load_receiver.is_some();
-            let selected_site = selected_site_id
-                .as_deref()
+            let selected_site = selected_pin
+                .as_ref()
+                .and_then(|pin| pin_us_id(pin))
                 .and_then(|id| self.sites.iter().find(|site| site.level2_id == id))
                 .cloned();
-            let selected_intl_site = self.extra_panes[pane_slot]
-                .intl_source
+            let selected_intl_site = selected_pin
                 .as_ref()
-                .and_then(|source| Self::find_intl_site(&source.provider_id, &source.site_id));
+                .and_then(|pin| pin_intl_ids(pin))
+                .and_then(|(provider_id, site_id)| Self::find_intl_site(provider_id, site_id));
             if fixed_action_button(ui, "Load", 48.0)
                 .on_hover_text("Load this radar only into the focused pane")
                 .clicked()
@@ -21783,24 +22044,40 @@ impl ViewerApp {
                 }
             }
         });
-        let previous = self.extra_panes[pane_slot].pinned_site_id.clone();
-        if selected_site_id != previous {
-            match selected_site_id {
-                Some(site_id) => {
+        let previous = self.extra_panes[pane_slot].pin.clone();
+        // One pin value per world: selecting "Follow primary radar" on an
+        // intl-pinned pane compares Some(Intl)!=None and releases the pane
+        // — the old pinned-id/None==None no-op is unrepresentable.
+        if selected_pin != previous {
+            match selected_pin {
+                Some(SiteRef::Us { level2_id }) => {
                     if let Some(site) = self
                         .sites
                         .iter()
-                        .find(|site| site.level2_id == site_id)
+                        .find(|site| site.level2_id == level2_id)
                         .cloned()
                     {
                         let pane = &mut self.extra_panes[pane_slot];
-                        pane.pinned_site_id = Some(site_id.clone());
-                        pane.intl_source = None;
-                        pane.status = format!("Pane radar set to {site_id}; click Load");
+                        pane.pin = Some(SiteRef::Us {
+                            level2_id: level2_id.clone(),
+                        });
+                        pane.status = format!("Pane radar set to {level2_id}; click Load");
                         self.center_extra_pane_on_site(pane_slot, &site);
+                        self.remember_extra_pane_pin(pane_slot);
                     }
                 }
-                None => self.clear_extra_pane_radar(pane_slot),
+                Some(SiteRef::Intl {
+                    provider_id,
+                    site_id,
+                }) => {
+                    if let Some(site) = Self::find_intl_site(&provider_id, &site_id) {
+                        self.set_extra_pane_intl_site(pane_slot, &site);
+                    }
+                }
+                None => {
+                    self.clear_extra_pane_radar(pane_slot);
+                    self.remember_extra_pane_pin(pane_slot);
+                }
             }
             ctx.request_repaint();
         }
@@ -21949,7 +22226,17 @@ impl ViewerApp {
         let site_control_pane = independent_pane;
         let pane_intl_source = site_control_pane
             .and_then(|slot| self.extra_panes.get(slot))
-            .and_then(|pane| pane.intl_source.clone());
+            .and_then(|pane| pane.pinned_intl())
+            .map(|(provider_id, site_id)| {
+                Self::find_intl_site(provider_id, site_id)
+                    .as_ref()
+                    .map(PaneIntlSource::from_site)
+                    .unwrap_or_else(|| PaneIntlSource {
+                        provider_id: provider_id.to_owned(),
+                        site_id: site_id.to_owned(),
+                        label: site_id.to_owned(),
+                    })
+            });
         let primary_intl_source =
             if site_control_pane.is_none() && self.intl_source_owns_primary_display() {
                 match &self.poll_source {
@@ -21976,17 +22263,34 @@ impl ViewerApp {
             .unwrap_or(self.selected_site_index);
         let original_site_index = selected_site_index;
         ui.horizontal(|ui| {
-            let selected_site_label = display_intl_source
+            // A pane-targeting SITE combo labels the PANE's own pin — honest
+            // even for ids outside the catalog (the old index fallback
+            // showed the PRIMARY's site under a foreign-pinned pane).
+            let pane_pin = site_control_pane
+                .and_then(|slot| self.extra_panes.get(slot))
+                .and_then(|pane| pane.pin.clone());
+            let selected_site_label = pane_pin
                 .as_ref()
-                .map(|source| {
-                    format!(
-                        "{} ({})",
-                        source.label,
-                        intl_provider_label(&source.provider_id)
-                    )
+                .map(|pin| self.site_pin_label(pin))
+                .or_else(|| {
+                    display_intl_source.as_ref().map(|source| {
+                        format!(
+                            "{} ({})",
+                            source.label,
+                            intl_provider_label(&source.provider_id)
+                        )
+                    })
                 })
                 .or_else(|| self.sites.get(selected_site_index).map(format_site_label))
                 .unwrap_or_else(|| "None".to_owned());
+            // Intl rows carry their own SiteRef binding beside the US index
+            // binding; the two worlds share the ONE grouped combo.
+            let mut intl_pick: Option<SiteRef> =
+                display_intl_source.as_ref().map(|source| SiteRef::Intl {
+                    provider_id: source.provider_id.clone(),
+                    site_id: source.site_id.clone(),
+                });
+            let original_intl_pick = intl_pick.clone();
             egui::ComboBox::from_id_salt("site_combo")
                 .selected_text(selected_site_label)
                 .width((ui.available_width() - 96.0).max(160.0))
@@ -21998,8 +22302,30 @@ impl ViewerApp {
                             format_site_label(site),
                         );
                     }
+                    intl_site_combo_section(ui, &mut intl_pick);
                 });
-            if selected_site_index != original_site_index {
+            if intl_pick != original_intl_pick
+                && let Some(SiteRef::Intl {
+                    provider_id,
+                    site_id,
+                }) = intl_pick
+                && let Some(site) = Self::find_intl_site(&provider_id, &site_id)
+            {
+                if let Some(slot) = site_control_pane {
+                    self.set_extra_pane_intl_site(slot, &site);
+                } else {
+                    // Primary intl picks load on pick — the same path as an
+                    // intl marker click or a beam-menu row.
+                    if let (Some(latitude_deg), Some(longitude_deg)) =
+                        (site.latitude_deg, site.longitude_deg)
+                    {
+                        self.center_map_on(latitude_deg, longitude_deg);
+                    }
+                    let ctx = ui.ctx().clone();
+                    self.start_intl_poll(provider_id, site_id, &ctx);
+                    ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+                }
+            } else if selected_site_index != original_site_index {
                 if let Some(slot) = site_control_pane {
                     self.set_extra_pane_selected_site(slot, selected_site_index);
                 } else {
@@ -22011,14 +22337,27 @@ impl ViewerApp {
                     }
                 }
             }
-            // ★ favorite toggle for the selected site — finally writing AND
-            // reading AppSettings::favorites (it was write-only for months).
-            if display_intl_source.is_none()
-                && let Some(site_id) = self
-                    .sites
-                    .get(selected_site_index)
-                    .map(|site| site.level2_id.clone())
-            {
+            // ★ favorite toggle for the selected site — BOTH worlds since
+            // v0.29 Phase 3: intl sites star as case-preserved
+            // `intl:{provider}:{site}` keys, US sites as bare ids forever.
+            let star_key = site_control_pane
+                .and_then(|slot| self.extra_panes.get(slot))
+                .and_then(|pane| pane.pin.as_ref().map(SiteRef::settings_key))
+                .or_else(|| {
+                    display_intl_source.as_ref().map(|source| {
+                        SiteRef::Intl {
+                            provider_id: source.provider_id.clone(),
+                            site_id: source.site_id.clone(),
+                        }
+                        .settings_key()
+                    })
+                })
+                .or_else(|| {
+                    self.sites
+                        .get(selected_site_index)
+                        .map(|site| site.level2_id.clone())
+                });
+            if let Some(site_id) = star_key {
                 let is_favorite = self.app_settings.is_favorite(&site_id);
                 let star = if is_favorite { "★" } else { "☆" };
                 if ui
@@ -22224,29 +22563,57 @@ impl ViewerApp {
         // Favorites chip row (spec §1 RADAR ▸ SITE): each chip = one-click
         // site switch + load-latest. Right-click removes the favorite.
         if !self.app_settings.favorites.is_empty() {
-            let mut switch_to: Option<String> = None;
+            let mut switch_to: Option<SiteRef> = None;
             let mut remove: Option<String> = None;
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = ROW_SPACING_X;
                 for fav in &self.app_settings.favorites {
+                    // Every stored key decodes to a SiteRef (v0.29 Phase 3):
+                    // bare legacy ids as US chips forever, `intl:` keys as
+                    // catalog-labeled international chips.
+                    let pin = SiteRef::parse_settings_key(fav);
+                    let chip_text = match &pin {
+                        SiteRef::Us { .. } => format!("★{fav}"),
+                        SiteRef::Intl { site_id, .. } => {
+                            let label = data_source::sites::resolve(&pin)
+                                .map(|record| record.label)
+                                .unwrap_or_else(|| site_id.clone());
+                            format!("★{label}")
+                        }
+                    };
                     let selected = if let Some(slot) = site_control_pane {
-                        self.extra_panes.get(slot).is_some_and(|pane| {
-                            pane.pinned_site_id
-                                .as_deref()
-                                .or_else(|| pane.volume.as_ref().map(|volume| volume.site.id.as_str()))
-                                .is_some_and(|site_id| site_id.eq_ignore_ascii_case(fav))
+                        self.extra_panes.get(slot).is_some_and(|pane| match &pin {
+                            SiteRef::Us { level2_id } => pane
+                                .pinned_us_id()
+                                .or_else(|| {
+                                    pane.volume.as_ref().map(|volume| volume.site.id.as_str())
+                                })
+                                .is_some_and(|site_id| site_id.eq_ignore_ascii_case(level2_id)),
+                            SiteRef::Intl { .. } => pane.pin.as_ref() == Some(&pin),
                         })
                     } else {
-                        self.selected_site()
-                            .is_some_and(|s| s.level2_id.eq_ignore_ascii_case(fav))
+                        match &pin {
+                            SiteRef::Us { level2_id } => {
+                                display_intl_source.is_none()
+                                    && self.selected_site().is_some_and(|s| {
+                                        s.level2_id.eq_ignore_ascii_case(level2_id)
+                                    })
+                            }
+                            SiteRef::Intl {
+                                provider_id,
+                                site_id,
+                            } => display_intl_source.as_ref().is_some_and(|source| {
+                                source.provider_id == *provider_id && source.site_id == *site_id
+                            }),
+                        }
                     };
                     let response = ui
-                        .selectable_label(selected, format!("★{fav}"))
+                        .selectable_label(selected, chip_text)
                         .on_hover_text(
                             "Switch to this site and load the latest volume (right-click: remove favorite)",
                         );
                     if response.clicked() {
-                        switch_to = Some(fav.clone());
+                        switch_to = Some(pin);
                     }
                     if response.secondary_clicked() {
                         remove = Some(fav.clone());
@@ -22256,23 +22623,59 @@ impl ViewerApp {
             if let Some(fav) = remove {
                 self.app_settings.remove_favorite(&fav);
                 let _ = self.app_settings.save();
-            } else if let Some(fav) = switch_to
-                && let Some(index) = self
-                    .sites
-                    .iter()
-                    .position(|site| site.level2_id.eq_ignore_ascii_case(&fav))
-            {
-                if let Some(slot) = site_control_pane {
-                    self.cancel_extra_pane_load_for_user_command(slot);
-                    self.set_extra_pane_selected_site(slot, index);
-                    if let Some(site) = self.sites.get(index).cloned() {
-                        self.start_extra_pane_latest_load(slot, site, ui.ctx());
+            } else if let Some(pin) = switch_to {
+                match pin {
+                    SiteRef::Us { level2_id } => {
+                        if let Some(index) = self
+                            .sites
+                            .iter()
+                            .position(|site| site.level2_id.eq_ignore_ascii_case(&level2_id))
+                        {
+                            if let Some(slot) = site_control_pane {
+                                self.cancel_extra_pane_load_for_user_command(slot);
+                                self.set_extra_pane_selected_site(slot, index);
+                                if let Some(site) = self.sites.get(index).cloned() {
+                                    self.start_extra_pane_latest_load(slot, site, ui.ctx());
+                                }
+                            } else {
+                                self.cancel_primary_radar_load_for_user_command();
+                                self.selected_site_index = index;
+                                self.load_latest_level2_for_selected_site(ui.ctx());
+                                self.remember_startup_site();
+                            }
+                        }
                     }
-                } else {
-                    self.cancel_primary_radar_load_for_user_command();
-                    self.selected_site_index = index;
-                    self.load_latest_level2_for_selected_site(ui.ctx());
-                    self.remember_startup_site();
+                    SiteRef::Intl {
+                        provider_id,
+                        site_id,
+                    } => {
+                        if let Some(site) = Self::find_intl_site(&provider_id, &site_id) {
+                            if let Some(slot) = site_control_pane {
+                                self.cancel_extra_pane_load_for_user_command(slot);
+                                self.start_extra_pane_intl_load(
+                                    slot,
+                                    site,
+                                    LatestLoadMode::User,
+                                    ui.ctx(),
+                                );
+                            } else {
+                                self.cancel_primary_radar_load_for_user_command();
+                                if let (Some(latitude_deg), Some(longitude_deg)) =
+                                    (site.latitude_deg, site.longitude_deg)
+                                {
+                                    self.center_map_on(latitude_deg, longitude_deg);
+                                }
+                                let ctx = ui.ctx().clone();
+                                self.start_intl_poll(provider_id, site_id, &ctx);
+                                ctx.request_repaint_after(Duration::from_millis(
+                                    ACTIVE_LOAD_POLL_MS,
+                                ));
+                            }
+                        } else {
+                            self.status =
+                                "Favorite site is not in the international catalog".to_owned();
+                        }
+                    }
                 }
             }
         }
@@ -28119,44 +28522,33 @@ impl ViewerApp {
         let beam_at = |distance_km: f32| {
             radar_core::beam_height_above_radar_m(distance_km as f64 * 1000.0, 0.5) as f32
         };
-        let mut candidates: Vec<BeamCandidate> = self
-            .sites
-            .iter()
-            .enumerate()
-            .filter_map(|(index, site)| {
-                if !site_is_primary_level2_catalog_site(site) {
-                    return None;
+        // ONE ranking over the union catalog (`sites_near`, v0.29 Phase 3):
+        // US and international sites compete on the same 460 km fence and
+        // the same 0.5° geometry — the lowest usable beam over Stockholm
+        // is an SMHI radar, not "no radar" (field report: the menu was
+        // dead across Europe/Australia/Japan). Explicit kind gate:
+        // research feeds stay operator picks; TDWRs rank in their own
+        // menu section.
+        let mut candidates: Vec<BeamCandidate> = data_source::sites::sites_near(lat, lon, 460.0)
+            .into_iter()
+            .filter_map(|(record, distance_km)| {
+                match record.kind {
+                    SiteKind::Wsr88d | SiteKind::Intl { .. } => {}
+                    SiteKind::Tdwr | SiteKind::Research => return None,
                 }
-                if site_is_tdwr(site) {
-                    return None;
-                }
-                let (site_lat, site_lon) = site_location(site)?;
-                let distance_km = haversine_km(lat, lon, site_lat, site_lon);
-                if distance_km > 460.0 {
-                    return None;
-                }
+                let label = match &record.site {
+                    SiteRef::Us { level2_id } => level2_id.clone(),
+                    SiteRef::Intl { .. } => record.label.clone(),
+                };
                 Some(BeamCandidate {
-                    target: BeamTarget::Conus(index),
-                    label: site.level2_id.clone(),
-                    origin: None,
+                    site: record.site,
+                    label,
+                    origin: record.origin,
                     beam_m: beam_at(distance_km),
                     distance_km,
                 })
             })
             .collect();
-        // International static-catalog sites compete in the same ranking
-        // (same 460 km fence, same 0.5° geometry): the lowest usable beam
-        // over Stockholm is an SMHI radar, not "no radar" (field report:
-        // the menu was dead across Europe/Australia/Japan).
-        candidates.extend(self.intl_radar_candidates(lat, lon, 460.0).into_iter().map(
-            |(site, distance_km)| BeamCandidate {
-                label: site.label.clone(),
-                origin: Some(intl_provider_label(site.provider_id)),
-                beam_m: beam_at(distance_km),
-                distance_km,
-                target: BeamTarget::Intl(site),
-            },
-        ));
         candidates.sort_by(|a, b| a.beam_m.total_cmp(&b.beam_m));
         candidates
     }
@@ -28168,18 +28560,32 @@ impl ViewerApp {
             self.activate_beam_target_for_extra_pane(pane_slot, candidate, ctx);
             return;
         }
-        match &candidate.target {
-            BeamTarget::Conus(index) => {
-                self.selected_site_index = *index;
-                let site = self.sites[*index].clone();
+        match &candidate.site {
+            SiteRef::Us { level2_id } => {
+                let Some(index) = self
+                    .sites
+                    .iter()
+                    .position(|site| site.level2_id.eq_ignore_ascii_case(level2_id))
+                else {
+                    self.status = format!("{level2_id} is not in the radar site catalog");
+                    return;
+                };
+                self.selected_site_index = index;
+                let site = self.sites[index].clone();
                 self.start_latest_level2_load(site, ctx);
             }
-            BeamTarget::Intl(site) => {
+            SiteRef::Intl {
+                provider_id,
+                site_id,
+            } => {
+                let Some(site) = Self::find_intl_site(provider_id, site_id) else {
+                    self.status = format!("{site_id} is not in the international catalog");
+                    return;
+                };
                 // Same path as the DATA-tab intl picker: center + poll.
                 if let (Some(site_lat), Some(site_lon)) = (site.latitude_deg, site.longitude_deg) {
                     self.center_map_on(site_lat, site_lon);
                 }
-                let site = site.clone();
                 self.start_intl_poll(site.provider_id.to_owned(), site.site_id.clone(), ctx);
                 self.status = format!(
                     "Polling {} · {}",
@@ -28197,19 +28603,30 @@ impl ViewerApp {
         candidate: &BeamCandidate,
         ctx: &egui::Context,
     ) -> bool {
-        match &candidate.target {
-            BeamTarget::Conus(index) => {
-                let Some(site) = self.sites.get(*index).cloned() else {
+        match &candidate.site {
+            SiteRef::Us { level2_id } => {
+                let Some(index) = self
+                    .sites
+                    .iter()
+                    .position(|site| site.level2_id.eq_ignore_ascii_case(level2_id))
+                else {
                     return false;
                 };
-                self.set_extra_pane_selected_site(pane_slot, *index);
+                let site = self.sites[index].clone();
+                self.set_extra_pane_selected_site(pane_slot, index);
                 self.start_extra_pane_latest_load(pane_slot, site, ctx);
                 true
             }
-            BeamTarget::Intl(site) => {
+            SiteRef::Intl {
+                provider_id,
+                site_id,
+            } => {
+                let Some(site) = Self::find_intl_site(provider_id, site_id) else {
+                    return false;
+                };
                 // Load into the pane being edited, exactly like an intl
                 // marker click there (User mode re-centers the pane).
-                self.start_extra_pane_intl_load(pane_slot, site.clone(), LatestLoadMode::User, ctx);
+                self.start_extra_pane_intl_load(pane_slot, site, LatestLoadMode::User, ctx);
                 true
             }
         }
@@ -28220,25 +28637,22 @@ impl ViewerApp {
     /// tilts (0.1-0.6°) but ~90 km Doppler range and rain attenuation
     /// (Vasiloff 2001 WAF; Istok et al. 2009, 25th IIPS), so they list
     /// separately instead of competing in the lowest-beam ranking.
-    fn tdwr_candidates(&self, lat: f32, lon: f32) -> Vec<(usize, String, f32)> {
-        let mut candidates: Vec<(usize, String, f32)> = self
-            .sites
-            .iter()
-            .enumerate()
-            .filter_map(|(index, site)| {
-                if !site_is_primary_level2_catalog_site(site) {
-                    return None;
+    fn tdwr_candidates(&self, lat: f32, lon: f32) -> Vec<(SiteRef, String, f32)> {
+        // Union-catalog query, nearest first; explicit kind gate keeps
+        // exactly the catalog-data TDWRs.
+        data_source::sites::sites_near(lat, lon, 120.0)
+            .into_iter()
+            .filter_map(|(record, distance_km)| {
+                match record.kind {
+                    SiteKind::Tdwr => {}
+                    SiteKind::Wsr88d | SiteKind::Research | SiteKind::Intl { .. } => return None,
                 }
-                if !site_is_tdwr(site) {
+                let SiteRef::Us { level2_id } = &record.site else {
                     return None;
-                }
-                let (site_lat, site_lon) = site_location(site)?;
-                let distance_km = haversine_km(lat, lon, site_lat, site_lon);
-                (distance_km <= 120.0).then(|| (index, site.level2_id.clone(), distance_km))
+                };
+                Some((record.site.clone(), level2_id.clone(), distance_km))
             })
-            .collect();
-        candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
-        candidates
+            .collect()
     }
 
     fn community_feed_candidates(
@@ -28459,7 +28873,12 @@ impl ViewerApp {
     fn nearest_operational_status_site(&self, lat: f32, lon: f32) -> Option<(RadarSite, f32)> {
         self.sites
             .iter()
-            .filter(|site| site_is_primary_level2_catalog_site(site))
+            // NWS operational status exists for the NEXRAD/TDWR program,
+            // not community research feeds (explicit kind gate).
+            .filter(|site| match us_site_kind(site) {
+                SiteKind::Wsr88d | SiteKind::Tdwr => true,
+                SiteKind::Research | SiteKind::Intl { .. } => false,
+            })
             .filter(|site| normalize_radar_station_id(&site.level2_id).is_some())
             .filter_map(|site| {
                 let (site_lat, site_lon) = site_location(site)?;
@@ -28637,7 +29056,7 @@ impl ViewerApp {
         if !tdwrs.is_empty() {
             ui.separator();
             ui.label("TDWR here:");
-            for (index, id, distance_km) in tdwrs.into_iter().take(2) {
+            for (site, id, distance_km) in tdwrs.into_iter().take(2) {
                 if ui
                     .button(format!(
                         "{id} · TDWR · {}",
@@ -28650,7 +29069,7 @@ impl ViewerApp {
                     .clicked()
                 {
                     activate = Some(BeamCandidate {
-                        target: BeamTarget::Conus(index),
+                        site,
                         label: id,
                         origin: None,
                         beam_m: 0.0,
@@ -28720,11 +29139,14 @@ impl ViewerApp {
                     .clicked()
                 {
                     activate = Some(BeamCandidate {
+                        site: SiteRef::Intl {
+                            provider_id: site.provider_id.to_owned(),
+                            site_id: site.site_id.clone(),
+                        },
                         label: site.label.clone(),
                         origin: Some(provider),
                         beam_m,
                         distance_km,
-                        target: BeamTarget::Intl(site),
                     });
                     ui.close();
                 }
@@ -30905,6 +31327,7 @@ impl ViewerApp {
         self.poll_last_file = None;
         self.poll_next = None;
         self.set_custom_url_poll_source();
+        self.remember_display_owner();
     }
 
     /// Pause/resume the international poll in place (the primary Live
@@ -30942,6 +31365,7 @@ impl ViewerApp {
         self.poll_next = None;
         self.poll_source.save_to_settings(&mut self.app_settings);
         let _ = self.app_settings.save();
+        self.remember_display_owner();
     }
 
     /// Load Loop for the active international feed: stream up to the
@@ -31221,6 +31645,7 @@ impl ViewerApp {
         self.poll_rx = None;
         self.poll_source.save_to_settings(&mut self.app_settings);
         let _ = self.app_settings.save();
+        self.remember_display_owner();
     }
 
     pub(crate) fn start_ord_archive_load(&mut self, mode: OrdArchiveLoadMode, ctx: &egui::Context) {
@@ -39077,7 +39502,12 @@ impl ViewerApp {
         self.sites
             .iter()
             .enumerate()
-            .filter(|(_, site)| site_is_primary_level2_catalog_site(site))
+            // Home-catalog markers: the NEXRAD/TDWR program. Research
+            // feeds draw their own marker pass (explicit kind gate).
+            .filter(|(_, site)| match us_site_kind(site) {
+                SiteKind::Wsr88d | SiteKind::Tdwr => true,
+                SiteKind::Research | SiteKind::Intl { .. } => false,
+            })
             .filter_map(|(index, site)| {
                 let (latitude_deg, longitude_deg) = site_location(site)?;
                 let position = self.lon_lat_to_screen(rect, longitude_deg, latitude_deg);
@@ -41912,17 +42342,98 @@ fn community_feed_for_site(
         .find(|feed| feed.id.eq_ignore_ascii_case(&site.level2_id))
 }
 
-fn site_is_primary_level2_catalog_site(site: &RadarSite) -> bool {
-    community_feed_for_site(site).is_none()
+/// [`SiteKind`] of a US-catalog [`RadarSite`], resolved against the one
+/// compiled-in catalog (`data_source::sites`) — the v0.29 Phase-3
+/// replacement for the deleted `site_is_tdwr` `'T'`-prefix heuristic and
+/// `site_is_primary_level2_catalog_site`. Classification is CATALOG DATA
+/// now (TJUA's WSR-88D exception, the TDWR table, community research
+/// feeds), so the JMA TAKA/TANE/TOJI prefix-leak class is gone for good.
+///
+/// Ids the catalog does not know (a brand-new site surfacing in an S3
+/// listing before the embedded table updates, test fixtures) classify as
+/// [`SiteKind::Wsr88d`] — the permissive default that keeps them
+/// selectable and rankable, matching how v0.28 treated any unknown
+/// non-`T` id. Mobile radars (DOW/COW) stay volume-only and never enter
+/// `self.sites`, so they never reach this gate.
+fn us_site_kind(site: &RadarSite) -> SiteKind {
+    data_source::sites::resolve(&SiteRef::Us {
+        level2_id: site.level2_id.clone(),
+    })
+    .map(|record| record.kind)
+    .unwrap_or(SiteKind::Wsr88d)
 }
 
-/// TDWR test for the Level II site catalog. The catalog (embedded from
-/// api.weather.gov/radar/stations) carries no radar-type flag, so
-/// terminal radars are recognized by their `Txxx` ids — with the one
-/// known exception spelled out: TJUA is San Juan's WSR-88D (S-band,
-/// full 460 km range) and only happens to share the T prefix.
-fn site_is_tdwr(site: &RadarSite) -> bool {
-    site.level2_id.starts_with('T') && !site.level2_id.eq_ignore_ascii_case("TJUA")
+/// The poll source a fresh session restores from the persisted display
+/// owner (v0.29 Phase 3 §1.4): a resolvable international owner re-arms
+/// its provider/site — poll NOT active, nothing auto-starts at startup,
+/// exactly the armed-resume posture the layers rail already offers — so
+/// the archive browser, Event Loop Builder, and Reset View all resume on
+/// the owner. Anything else (absent key, bare US id, stale intl ref)
+/// keeps the legacy CustomUrl seed. Pure over settings for testing.
+fn restored_poll_source(app_settings: &settings::AppSettings) -> PollSource {
+    if let Some(key) = app_settings.display_owner_site.as_deref()
+        && let SiteRef::Intl {
+            provider_id,
+            site_id,
+        } = SiteRef::parse_settings_key(key)
+        && data_source::sites::resolve(&SiteRef::Intl {
+            provider_id: provider_id.clone(),
+            site_id: site_id.clone(),
+        })
+        .is_some()
+    {
+        return PollSource::Intl {
+            provider_id,
+            site_id,
+        };
+    }
+    PollSource::CustomUrl(app_settings.poll_url.clone())
+}
+
+/// A resolved coordinated-overlay pick — the mosaic candidate pool spans
+/// both worlds (v0.29 Phase 3), and the add path dispatches on kind.
+enum CoordinatedOverlaySite {
+    Us(RadarSite),
+    Intl(data_source::international::IntlSite),
+}
+
+/// US level2 id of a [`SiteRef`], if it is a US ref.
+fn pin_us_id(pin: &SiteRef) -> Option<&str> {
+    match pin {
+        SiteRef::Us { level2_id } => Some(level2_id),
+        SiteRef::Intl { .. } => None,
+    }
+}
+
+/// `(provider_id, site_id)` of a [`SiteRef`], if it is an intl ref.
+fn pin_intl_ids(pin: &SiteRef) -> Option<(&str, &str)> {
+    match pin {
+        SiteRef::Us { .. } => None,
+        SiteRef::Intl {
+            provider_id,
+            site_id,
+        } => Some((provider_id, site_id)),
+    }
+}
+
+/// Grouped "International" section for a SITE combo (v0.29 Phase 3: both
+/// worlds in one picker): every provider's sites under a provenance
+/// header, in catalog/registry order, from the one union catalog.
+fn intl_site_combo_section(ui: &mut egui::Ui, selected: &mut Option<SiteRef>) {
+    let mut last_origin: Option<String> = None;
+    for record in data_source::sites::all_sites() {
+        let SiteKind::Intl { .. } = record.kind else {
+            continue;
+        };
+        if last_origin != record.origin {
+            ui.separator();
+            if let Some(origin) = record.origin.as_deref() {
+                ui.label(egui::RichText::new(origin).small().strong());
+            }
+            last_origin = record.origin.clone();
+        }
+        ui.selectable_value(selected, Some(record.site.clone()), record.label.clone());
+    }
 }
 
 /// What a Ctrl+right-click "add nearest radar overlay" resolves to.
@@ -41951,7 +42462,12 @@ fn nearest_overlay_dispatch(
     let us = sites
         .iter()
         .enumerate()
-        .filter(|(_, site)| site_is_primary_level2_catalog_site(site))
+        // Overlay adds accept the whole NEXRAD/TDWR program; research
+        // feeds stay explicit operator picks (explicit kind gate).
+        .filter(|(_, site)| match us_site_kind(site) {
+            SiteKind::Wsr88d | SiteKind::Tdwr => true,
+            SiteKind::Research | SiteKind::Intl { .. } => false,
+        })
         .filter_map(|(index, site)| {
             let (site_lat, site_lon) = site_location(site)?;
             let distance_km = haversine_km(lat, lon, site_lat, site_lon);
@@ -50739,6 +51255,13 @@ fn parse_coordinated_site_ids(input: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|site_id| !site_id.is_empty())
         .map(|site_id| {
+            // `intl:{provider}:{site}` settings keys are case-significant
+            // and pass through VERBATIM — the same corruption trap the
+            // favorites store fixed (spec §1.1); bare US ids keep the
+            // uppercase + K-prefix conveniences.
+            if site_id.contains(':') {
+                return site_id.to_owned();
+            }
             let mut site_id = site_id.to_ascii_uppercase();
             if site_id.len() == 3 && site_id.chars().all(|ch| ch.is_ascii_alphabetic()) {
                 site_id.insert(0, 'K');
@@ -52130,69 +52653,59 @@ mod tests {
         assert!(haversine_km(35.333, -97.278, 35.333, -97.278) < 0.001);
     }
 
+    /// v0.29 Phase 3: the ranking runs over the REAL union catalog
+    /// (`sites_near`), so the fixture is the compiled-in world itself —
+    /// `self.sites` no longer feeds it and `BeamTarget::Conus(usize)` is
+    /// gone. Next to Oklahoma City the nearest 88D (KTLX) ranks first by
+    /// beam height and the colocated TOKC TDWR never competes.
     #[test]
     fn best_radar_candidates_sorts_by_beam_and_skips_tdwrs() {
-        let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.sites = vec![
-            // Colocated TDWR: would win on beam height, must be excluded.
-            RadarSite::new("TTLX").with_location(
-                Some("TDWR right here".to_owned()),
-                Some(35.40),
-                Some(-97.20),
-            ),
-            RadarSite::new("KFWS").with_location(
-                Some("Fort Worth".to_owned()),
-                Some(32.573),
-                Some(-97.303),
-            ),
-            RadarSite::new("KTLX").with_location(
-                Some("Norman".to_owned()),
-                Some(35.333),
-                Some(-97.278),
-            ),
-            // Far beyond the 460 km fence.
-            RadarSite::new("KLOT").with_location(
-                Some("Chicago".to_owned()),
-                Some(41.604),
-                Some(-88.085),
-            ),
-        ];
-
+        let app = test_viewer_app_with_hazards(Vec::new());
         let candidates = app.best_radar_candidates(35.4, -97.2);
-        let labels: Vec<&str> = candidates
-            .iter()
-            .map(|candidate| candidate.label.as_str())
-            .collect();
-        // Research/community feeds stay explicit operator picks; the
-        // automatic lowest-beam ranking remains primary Level II only.
-        assert_eq!(labels, vec!["KTLX", "KFWS"]);
-        assert_eq!(candidates[0].target, BeamTarget::Conus(2));
+        assert!(!candidates.is_empty());
+        assert_eq!(candidates[0].label, "KTLX");
+        assert_eq!(
+            candidates[0].site,
+            SiteRef::Us {
+                level2_id: "KTLX".to_owned(),
+            },
+            "identity is a catalog-reorder-proof SiteRef, not an index"
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.label != "TOKC" && candidate.label != "TDAL"),
+            "TDWRs rank in their own menu section, never here"
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.distance_km <= 460.0),
+            "the 460 km fence holds"
+        );
         // Sorted by 0.5° beam height ascending.
-        assert!(candidates[0].beam_m < candidates[1].beam_m);
+        assert!(
+            candidates
+                .windows(2)
+                .all(|pair| pair[0].beam_m <= pair[1].beam_m)
+        );
     }
 
     #[test]
     fn right_click_ranking_treats_tjua_as_wsr88d_not_tdwr() {
-        let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.sites = vec![
-            RadarSite::new("TJUA").with_location(
-                Some("San Juan".to_owned()),
-                Some(18.1157),
-                Some(-66.0782),
-            ),
-            RadarSite::new("TSJU").with_location(
-                Some("San Juan TDWR".to_owned()),
-                Some(18.474),
-                Some(-66.179),
-            ),
-        ];
-
+        // Real catalog data: TJUA (San Juan's S-band WSR-88D) competes in
+        // the lowest-beam ranking; the colocated TSJU TDWR lists in its
+        // own section instead.
+        let app = test_viewer_app_with_hazards(Vec::new());
         let candidates = app.best_radar_candidates(18.3, -66.1);
-        let labels: Vec<&str> = candidates
-            .iter()
-            .map(|candidate| candidate.label.as_str())
-            .collect();
-        assert_eq!(labels, vec!["TJUA"]);
+        assert!(
+            candidates.iter().any(|candidate| candidate.label == "TJUA"),
+            "TJUA is a WSR-88D by catalog data"
+        );
+        assert!(
+            candidates.iter().all(|candidate| candidate.label != "TSJU"),
+            "the TDWR never competes in the beam ranking"
+        );
 
         let tdwr_ids: Vec<String> = app
             .tdwr_candidates(18.3, -66.1)
@@ -52226,13 +52739,23 @@ mod tests {
             });
 
         let candidates = app.best_radar_candidates(35.4, -97.2);
-        assert!(candidates.is_empty(), "research/custom feeds stay explicit");
         assert!(
-            candidates
-                .iter()
-                .all(|candidate| candidate.label != "Norman Testbed"
+            !candidates.is_empty(),
+            "the union catalog ranks real 88Ds here"
+        );
+        let research_ids: Vec<String> = data_source::community_feeds::community_feeds()
+            .iter()
+            .map(|feed| feed.id.to_owned())
+            .collect();
+        assert!(
+            candidates.iter().all(|candidate| {
+                !research_ids
+                    .iter()
+                    .any(|id| candidate.label.eq_ignore_ascii_case(id))
+                    && candidate.label != "Norman Testbed"
                     && candidate.label != "Private Furuno"
-                    && candidate.label != "Link only"),
+                    && candidate.label != "Link only"
+            }),
             "research/custom feeds stay explicit site/feed picks"
         );
     }
@@ -52259,7 +52782,7 @@ mod tests {
         assert!(
             candidates
                 .iter()
-                .all(|candidate| matches!(candidate.target, BeamTarget::Intl(_))),
+                .all(|candidate| matches!(candidate.site, SiteRef::Intl { .. })),
             "no US site is within 460 km of Stockholm"
         );
         assert!(
@@ -52282,20 +52805,17 @@ mod tests {
         );
 
         // A US site inside the same fence competes in ONE beam-sorted
-        // ranking: intl candidates are not a second-class side list.
-        app.sites.push(RadarSite::new("KFAK").with_location(
-            Some("Hypothetical Baltic 88D".to_owned()),
-            Some(58.0),
-            Some(20.0),
-        ));
-        let mixed = app.best_radar_candidates(59.65, 17.95);
+        // ranking: intl candidates are not a second-class side list. Real
+        // interleave (the Okinawa case the catalog tests also pin): JMA
+        // island-arc radars and Kadena AB's US-catalog RODN.
+        let mixed = app.best_radar_candidates(26.2, 127.8);
         assert!(
             mixed
                 .iter()
-                .any(|candidate| matches!(candidate.target, BeamTarget::Conus(_)))
+                .any(|candidate| matches!(candidate.site, SiteRef::Us { .. }))
                 && mixed
                     .iter()
-                    .any(|candidate| matches!(candidate.target, BeamTarget::Intl(_))),
+                    .any(|candidate| matches!(candidate.site, SiteRef::Intl { .. })),
             "US and intl compete in the same ranking"
         );
         assert!(
@@ -55472,7 +55992,9 @@ mod tests {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.grid_layout = PanelLayout::TwoVertical;
         app.sync_extra_panes();
-        app.extra_panes[0].pinned_site_id = Some("KTLX".to_owned());
+        app.extra_panes[0].pin = Some(SiteRef::Us {
+            level2_id: "KTLX".to_owned(),
+        });
         app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
         app.extra_panes[0].cut = Some(1);
         let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
@@ -56653,7 +57175,9 @@ mod tests {
                 source_label: "test".to_owned(),
             })
             .collect();
-        app.extra_panes[0].pinned_site_id = Some("KIND".to_owned());
+        app.extra_panes[0].pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
         app.extra_panes[0].cut = Some(1);
         app.extra_panes[0].volume = Some(first);
@@ -56964,7 +57488,12 @@ mod tests {
             .unified_player_archive_window_plan()
             .expect("archive window plan");
 
-        assert_eq!(plan.site_id, "KTLX");
+        assert_eq!(
+            plan.site,
+            SiteRef::Us {
+                level2_id: "KTLX".to_owned(),
+            }
+        );
         assert_eq!(plan.start_utc.to_rfc3339(), "2026-06-17T22:00:00+00:00");
         assert_eq!(plan.end_utc.to_rfc3339(), "2026-06-18T02:30:00+00:00");
         assert_eq!(plan.max_frames, 96);
@@ -57259,7 +57788,9 @@ mod tests {
         app.active_pane = 1;
         let base = Utc.with_ymd_and_hms(2026, 6, 17, 18, 0, 0).unwrap();
         let pane = &mut app.extra_panes[0];
-        pane.pinned_site_id = Some("KIND".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         pane.product = DisplayProduct::Moment(MomentType::Velocity);
         pane.cut = Some(0);
         for minutes in [0, 5] {
@@ -57930,7 +58461,9 @@ mod tests {
         let second = Arc::new(second);
 
         let pane = &mut app.extra_panes[0];
-        pane.pinned_site_id = Some("KIND".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         pane.product = DisplayProduct::StormRelativeDealiasedVelocity;
         pane.cut = Some(0);
         pane.volume = Some(Arc::clone(&first));
@@ -57992,7 +58525,9 @@ mod tests {
         let second = Arc::new(second);
 
         let pane = &mut app.extra_panes[0];
-        pane.pinned_site_id = Some("KIND".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         pane.product = DisplayProduct::Moment(MomentType::Velocity);
         pane.volume = Some(Arc::clone(&first));
         pane.frame_history = [first, second]
@@ -58038,7 +58573,9 @@ mod tests {
         let second = Arc::new(second);
 
         let pane = &mut app.extra_panes[0];
-        pane.pinned_site_id = Some("KIND".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         pane.product = DisplayProduct::StormRelativeDealiasedVelocity;
         pane.cut = Some(0);
         pane.volume = Some(Arc::clone(&first));
@@ -58102,7 +58639,9 @@ mod tests {
                 source_label: "test".to_owned(),
             })
             .collect();
-        app.extra_panes[0].pinned_site_id = Some("KIND".to_owned());
+        app.extra_panes[0].pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
         app.extra_panes[0].cut = Some(0);
         app.extra_panes[0].volume = Some(first);
@@ -58167,7 +58706,9 @@ mod tests {
                 source_label: "test".to_owned(),
             })
             .collect();
-        app.extra_panes[0].pinned_site_id = Some("KIND".to_owned());
+        app.extra_panes[0].pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
         app.extra_panes[0].cut = Some(0);
         app.extra_panes[0].volume = Some(first);
@@ -58242,7 +58783,9 @@ mod tests {
                 source_label: "test".to_owned(),
             })
             .collect();
-        app.extra_panes[0].pinned_site_id = Some("KIND".to_owned());
+        app.extra_panes[0].pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
         app.extra_panes[0].cut = Some(0);
         app.extra_panes[0].volume = Some(first);
@@ -58292,7 +58835,9 @@ mod tests {
         let second = Arc::new(second);
 
         let pane = &mut app.extra_panes[0];
-        pane.pinned_site_id = Some("KIND".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         pane.product = DisplayProduct::DealiasedVelocity;
         pane.cut = Some(0);
         pane.volume = Some(Arc::clone(&first));
@@ -58363,7 +58908,9 @@ mod tests {
             720,
         ));
         let pane = &mut app.extra_panes[0];
-        pane.pinned_site_id = Some("KIND".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         pane.product = DisplayProduct::StormRelativeVelocity;
         pane.cut = Some(0);
         pane.volume = Some(Arc::clone(&volume));
@@ -58408,7 +58955,9 @@ mod tests {
         volume.volume_time = scan_time;
         let volume = Arc::new(volume);
         let pane = &mut app.extra_panes[0];
-        pane.pinned_site_id = Some("KIND".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         pane.product = DisplayProduct::Moment(MomentType::Velocity);
         pane.cut = Some(0);
         pane.volume = Some(Arc::clone(&volume));
@@ -58467,7 +59016,9 @@ mod tests {
         let first_time = Utc.with_ymd_and_hms(2026, 6, 17, 18, 27, 0).unwrap();
         let second_time = first_time + chrono::Duration::minutes(3);
         let pane = &mut app.extra_panes[0];
-        pane.pinned_site_id = Some("KIND".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         pane.product = DisplayProduct::Moment(MomentType::Velocity);
         pane.cut = Some(0);
         for (index, time) in [first_time, second_time].into_iter().enumerate() {
@@ -58785,7 +59336,9 @@ mod tests {
         second.volume_time += chrono::Duration::minutes(3);
         let second = Arc::new(second);
         let pane = &mut app.extra_panes[0];
-        pane.pinned_site_id = Some("KIND".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         pane.product = DisplayProduct::Moment(MomentType::Velocity);
         pane.cut = Some(0);
         pane.volume = Some(Arc::clone(&first));
@@ -59074,7 +59627,9 @@ mod tests {
             status: FrameStatus::LiveComplete,
             source_label: "test".to_owned(),
         });
-        app.extra_panes[0].pinned_site_id = Some("KIND".to_owned());
+        app.extra_panes[0].pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         app.extra_panes[0].volume = Some(Arc::clone(&volume));
         app.extra_panes[0].frame_history = app.frame_history.clone();
         app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
@@ -59634,7 +60189,9 @@ mod tests {
             &[(0.5, 0), (0.5, 30_000)],
             720,
         ));
-        app.extra_panes[0].pinned_site_id = Some("KIND".to_owned());
+        app.extra_panes[0].pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         app.extra_panes[0].volume = Some(Arc::clone(&pane_volume));
         app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
         app.extra_panes[0].cut = Some(1);
@@ -61551,7 +62108,9 @@ mod tests {
             community_feed_for_site(kbpp).map(|feed| feed.poll_url),
             Some("https://level2.swc.nd.gov/raw/KBPP")
         );
-        assert!(!site_is_primary_level2_catalog_site(kbpp));
+        // Community feeds classify `Research` — the catalog-data
+        // replacement for the deleted `site_is_primary_level2_catalog_site`.
+        assert_eq!(us_site_kind(kbpp), SiteKind::Research);
 
         let index = nearest_site_index(&sites, 46.187, -103.428).expect("nearest raw coordinate");
         assert_eq!(sites[index].level2_id, "KBPP");
@@ -61568,6 +62127,28 @@ mod tests {
                 .iter()
                 .any(|(feed, _)| feed.id == "KBPP"),
             "research feeds must still appear as explicit right-click choices"
+        );
+    }
+
+    /// The one classification gate left in app_ui after the Phase-3
+    /// deletion of `site_is_tdwr`/`site_is_primary_level2_catalog_site`:
+    /// kinds come from catalog data, and ids the catalog does not know
+    /// default to `Wsr88d` (permissive — a brand-new site in an S3
+    /// listing stays selectable) even when they LOOK like TDWRs: the
+    /// `'T'`-prefix heuristic, and with it the JMA TAKA/TANE/TOJI leak
+    /// class, is gone.
+    #[test]
+    fn us_site_kind_classifies_from_catalog_data_with_permissive_default() {
+        let kind_of = |id: &str| us_site_kind(&RadarSite::new(id));
+        assert_eq!(kind_of("KTLX"), SiteKind::Wsr88d);
+        assert_eq!(kind_of("TOKC"), SiteKind::Tdwr);
+        assert_eq!(kind_of("TJUA"), SiteKind::Wsr88d, "catalog-data exception");
+        assert_eq!(kind_of("KCRI"), SiteKind::Research, "community feed");
+        assert_eq!(kind_of("KFAK"), SiteKind::Wsr88d, "unknown id stays usable");
+        assert_eq!(
+            kind_of("TAKA"),
+            SiteKind::Wsr88d,
+            "a T-prefixed UNKNOWN id no longer classifies TDWR by shape"
         );
     }
 
@@ -61597,79 +62178,78 @@ mod tests {
             parse_coordinated_site_ids("tlx, kinx KFDR;ktlx"),
             vec!["KTLX", "KINX", "KFDR"]
         );
+        // `intl:` settings keys pass through VERBATIM (case-significant
+        // provider site codes; the favorites-trap fix, spec §1.1).
+        assert_eq!(
+            parse_coordinated_site_ids("ktlx intl:smhi:angelholm INTL:ORD:DEESS"),
+            vec!["KTLX", "intl:smhi:angelholm", "INTL:ORD:DEESS"]
+        );
     }
 
+    /// v0.29 Phase 3: the candidate pool queries the REAL union catalog
+    /// (`sites_near`) — fixtures are the compiled-in world. Around the
+    /// selected KTLX the pool lists nearby 88Ds, never the primary itself,
+    /// never the colocated TOKC TDWR, never research feeds.
     #[test]
     fn unified_player_nearby_sites_exclude_primary_radar() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.sites = vec![
-            RadarSite::new("KAAA").with_location(
-                Some("Primary".to_owned()),
-                Some(35.0),
-                Some(-97.0),
-            ),
-            RadarSite::new("KBBB").with_location(
-                Some("Nearby".to_owned()),
-                Some(35.4),
-                Some(-97.2),
-            ),
-            RadarSite::new("TCCC").with_location(
-                Some("Terminal".to_owned()),
-                Some(35.2),
-                Some(-97.1),
-            ),
-            RadarSite::new("KDDD").with_location(Some("Far".to_owned()), Some(42.0), Some(-105.0)),
-        ];
+        app.sites = vec![RadarSite::new("KTLX").with_location(
+            Some("Norman".to_owned()),
+            Some(35.333),
+            Some(-97.278),
+        )];
         app.selected_site_index = 0;
-        app.map_center_lat = 35.0;
-        app.map_center_lon = -97.0;
-        app.unified_player.coordinated_site_radius_km = 100.0;
+        app.map_center_lat = 35.333;
+        app.map_center_lon = -97.278;
+        app.unified_player.coordinated_site_radius_km = 460.0;
 
         app.populate_unified_player_nearby_sites();
 
-        assert_eq!(app.unified_player.coordinated_sites_input, "KBBB");
+        let input = app.unified_player.coordinated_sites_input.clone();
+        let ids = parse_coordinated_site_ids(&input);
+        assert!(!ids.is_empty(), "real 88Ds surround Norman");
+        assert!(
+            !ids.iter().any(|id| id == "KTLX"),
+            "primary radar excluded: {input}"
+        );
+        assert!(
+            !ids.iter().any(|id| id == "TOKC"),
+            "TDWRs never fill mosaics: {input}"
+        );
+        assert!(
+            ids.iter().any(|id| id == "KVNX") || ids.iter().any(|id| id == "KINX"),
+            "nearby real 88Ds fill the pool: {input}"
+        );
     }
 
     #[test]
     fn nearby_coordinated_overlay_sites_returns_nearest_four_for_sync_five() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.sites = vec![
-            RadarSite::new("KAAA").with_location(
-                Some("Primary".to_owned()),
-                Some(35.0),
-                Some(-97.0),
-            ),
-            RadarSite::new("KFFF").with_location(Some("Fifth".to_owned()), Some(35.5), Some(-97.0)),
-            RadarSite::new("KDDD").with_location(Some("Third".to_owned()), Some(35.3), Some(-97.0)),
-            RadarSite::new("TGGG").with_location(
-                Some("Terminal".to_owned()),
-                Some(35.05),
-                Some(-97.0),
-            ),
-            RadarSite::new("KBBB").with_location(Some("First".to_owned()), Some(35.1), Some(-97.0)),
-            RadarSite::new("KEEE").with_location(
-                Some("Fourth".to_owned()),
-                Some(35.4),
-                Some(-97.0),
-            ),
-            RadarSite::new("KCCC").with_location(
-                Some("Second".to_owned()),
-                Some(35.2),
-                Some(-97.0),
-            ),
-        ];
+        app.sites = vec![RadarSite::new("KTLX").with_location(
+            Some("Norman".to_owned()),
+            Some(35.333),
+            Some(-97.278),
+        )];
         app.selected_site_index = 0;
-        app.map_center_lat = 35.0;
-        app.map_center_lon = -97.0;
-        app.unified_player.coordinated_site_radius_km = 100.0;
+        app.map_center_lat = 35.333;
+        app.map_center_lon = -97.278;
+        app.unified_player.coordinated_site_radius_km = 460.0;
 
-        let site_ids = app
-            .nearby_coordinated_overlay_sites(STORM_VIDEO_SYNC_OVERLAY_RADARS)
-            .into_iter()
-            .map(|(_, site)| site.level2_id)
-            .collect::<Vec<_>>();
-
-        assert_eq!(site_ids, vec!["KBBB", "KCCC", "KDDD", "KEEE"]);
+        let candidates = app.nearby_coordinated_overlay_sites(STORM_VIDEO_SYNC_OVERLAY_RADARS);
+        assert_eq!(candidates.len(), STORM_VIDEO_SYNC_OVERLAY_RADARS);
+        assert!(
+            candidates.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "nearest first"
+        );
+        assert!(
+            candidates.iter().all(|(_, record)| {
+                record.site
+                    != SiteRef::Us {
+                        level2_id: "KTLX".to_owned(),
+                    }
+            }),
+            "primary radar never fills its own mosaic"
+        );
     }
 
     #[test]
@@ -61711,7 +62291,7 @@ mod tests {
         let site_ids = app
             .nearby_coordinated_overlay_sites(STORM_VIDEO_SYNC_OVERLAY_RADARS)
             .into_iter()
-            .map(|(_, site)| site.level2_id)
+            .map(|(_, record)| record.site.settings_key())
             .collect::<Vec<_>>();
 
         assert_eq!(site_ids, vec!["TJUA"]);
@@ -61733,15 +62313,21 @@ mod tests {
             ),
         ];
         app.selected_site_index = 0;
-        app.unified_player.coordinated_sites_input = "aaa, bbb, kmissing".to_owned();
+        app.unified_player.coordinated_sites_input =
+            "aaa, bbb, kmissing, intl:smhi:angelholm".to_owned();
 
         let (sites, skipped_primary, missing, had_input) =
             app.resolve_unified_player_coordinated_overlay_sites();
 
         assert!(had_input);
         assert!(skipped_primary);
-        assert_eq!(sites.len(), 1);
-        assert_eq!(sites[0].level2_id, "KBBB");
+        assert_eq!(sites.len(), 2, "both worlds resolve into the pool");
+        assert!(matches!(&sites[0], CoordinatedOverlaySite::Us(site) if site.level2_id == "KBBB"));
+        assert!(matches!(
+            &sites[1],
+            CoordinatedOverlaySite::Intl(site)
+                if site.provider_id == "smhi" && site.site_id == "angelholm"
+        ));
         assert_eq!(missing, vec!["KMISSING"]);
     }
 
@@ -61801,7 +62387,9 @@ mod tests {
         app.history_frame_limit = 48;
         let base = Utc.with_ymd_and_hms(2026, 6, 17, 18, 0, 0).unwrap();
         let pane = &mut app.extra_panes[0];
-        pane.pinned_site_id = Some("KIND".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         pane.product = DisplayProduct::Moment(MomentType::Velocity);
         pane.cut = Some(0);
         for minutes in [0, 5] {
@@ -62322,8 +62910,10 @@ mod tests {
     fn intl_event_loop_build_preserves_site_case_end_to_end() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let plan = event_loop_builder::EventLoopRadarPlan {
-            intl_provider_id: Some("ord".to_owned()),
-            site_id: "deess".to_owned(),
+            site: SiteRef::Intl {
+                provider_id: "ord".to_owned(),
+                site_id: "deess".to_owned(),
+            },
             start_utc: Utc.with_ymd_and_hms(2026, 6, 15, 16, 30, 0).unwrap(),
             end_utc: Utc.with_ymd_and_hms(2026, 6, 15, 18, 30, 0).unwrap(),
             max_frames: 12,
@@ -62334,8 +62924,7 @@ mod tests {
             timeline_step_minutes: 5,
         };
 
-        let status =
-            app.start_intl_event_loop_radar_load("ord".to_owned(), plan, &egui::Context::default());
+        let status = app.start_intl_event_loop_radar_load(plan, &egui::Context::default());
 
         assert!(
             status.contains("event loop radar queued: deess 16:30Z to 18:30Z"),
@@ -63735,7 +64324,9 @@ mod tests {
         app.extra_panes.push(ViewPane::new(DisplayProduct::Moment(
             MomentType::Reflectivity,
         )));
-        app.extra_panes[0].pinned_site_id = Some("KEAX".to_owned());
+        app.extra_panes[0].pin = Some(SiteRef::Us {
+            level2_id: "KEAX".to_owned(),
+        });
 
         // Cell 0 (primary) and the FOLLOWING pane display the primary feed,
         // so the primary Live flag is their truth.
@@ -63755,7 +64346,9 @@ mod tests {
 
         // An inherited non-catalog id has no live feed behind it: the chip
         // must not claim LIVE for a pane nothing will refresh.
-        app.extra_panes[0].pinned_site_id = Some("sella".to_owned());
+        app.extra_panes[0].pin = Some(SiteRef::Us {
+            level2_id: "sella".to_owned(),
+        });
         assert!(!app.pane_chip_is_live(1));
         let (label, _, kind) = app
             .mode_chip_state_with_live(app.pane_chip_is_live(1))
@@ -63930,17 +64523,23 @@ mod tests {
         let mut pane = ViewPane::new(DisplayProduct::Moment(MomentType::Reflectivity));
 
         // Same site as the live-polling primary: reuse its decode.
-        pane.pinned_site_id = Some("KTLX".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "KTLX".to_owned(),
+        });
         assert_eq!(
             app.extra_pane_live_source(&pane),
             PaneLiveSource::SharedWithPrimary
         );
         // Different catalog site: the pane polls its own feed.
-        pane.pinned_site_id = Some("KEAX".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "KEAX".to_owned(),
+        });
         assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::UsSite);
         // Primary paused: same-site pane now owns its own polling.
         app.realtime_level2_auto_refresh = false;
-        pane.pinned_site_id = Some("KTLX".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "KTLX".to_owned(),
+        });
         assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::UsSite);
         app.realtime_level2_auto_refresh = true;
         // An armed international poll owns the primary view, so the primary
@@ -63955,26 +64554,28 @@ mod tests {
         app.poll_source = PollSource::CustomUrl(String::new());
         // A pinned id outside the US catalog (inherited from an
         // international/archive display) has nothing to poll.
-        pane.pinned_site_id = Some("sella".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "sella".to_owned(),
+        });
         assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::None);
         // International pane source polls the provider.
-        pane.pinned_site_id = None;
-        pane.intl_source = Some(PaneIntlSource {
+        pane.pin = Some(SiteRef::Intl {
             provider_id: "smhi".to_owned(),
             site_id: "sella".to_owned(),
-            label: "Sella".to_owned(),
         });
         assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::Intl);
-        // An international source outranks a lingering pinned US id — the
-        // intl check runs first (contract harness, v0.29 Phase 1).
-        pane.pinned_site_id = Some("KEAX".to_owned());
-        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::Intl);
-        pane.intl_source = None;
+        // The v0.28 "intl source outranks a lingering pinned US id" cell is
+        // UNREPRESENTABLE since the Phase-3 pin collapse: one `pin` field
+        // holds exactly one world, so there is nothing to outrank.
         // Pinned-id catalog lookup and the primary dedupe are both
         // case-insensitive.
-        pane.pinned_site_id = Some("keax".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "keax".to_owned(),
+        });
         assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::UsSite);
-        pane.pinned_site_id = Some("ktlx".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "ktlx".to_owned(),
+        });
         assert_eq!(
             app.extra_pane_live_source(&pane),
             PaneLiveSource::SharedWithPrimary
@@ -63996,11 +64597,12 @@ mod tests {
         // load path refuses it: no live source.
         app.sites =
             site_catalog_with_community_feeds(vec![RadarSite::new("KTLX"), RadarSite::new("KEAX")]);
-        pane.pinned_site_id = Some("KBPP".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "KBPP".to_owned(),
+        });
         assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::None);
         // A following pane has no source of its own.
-        pane.pinned_site_id = None;
-        pane.intl_source = None;
+        pane.pin = None;
         assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::None);
     }
 
@@ -64045,7 +64647,10 @@ mod tests {
         };
 
         // KEEP: reloading the SAME intl source leaves the pane loop alone.
-        app.extra_panes[0].intl_source = Some(PaneIntlSource::from_site(&intl_site("alpha")));
+        app.extra_panes[0].pin = Some(SiteRef::Intl {
+            provider_id: "zz-test".to_owned(),
+            site_id: "alpha".to_owned(),
+        });
         seed_pane(&mut app.extra_panes[0], "alpha");
         app.start_extra_pane_intl_load(0, intl_site("alpha"), LatestLoadMode::User, &ctx);
         let pane = &app.extra_panes[0];
@@ -64072,18 +64677,19 @@ mod tests {
         );
         assert!(pane.volume.is_none());
         assert_eq!(pane.cut, None);
-        assert!(pane.pinned_site_id.is_none());
         assert_eq!(
-            pane.intl_source
-                .as_ref()
-                .map(|source| source.site_id.as_str()),
-            Some("beta")
+            pane.pin,
+            Some(SiteRef::Intl {
+                provider_id: "zz-test".to_owned(),
+                site_id: "beta".to_owned(),
+            })
         );
 
         // CLEAR: a US-pinned pane switching to an international source (the
-        // previous intl_source is None, so it never matches).
-        app.extra_panes[0].intl_source = None;
-        app.extra_panes[0].pinned_site_id = Some("KTLX".to_owned());
+        // previous pin is a US ref, so the intl pin never matches).
+        app.extra_panes[0].pin = Some(SiteRef::Us {
+            level2_id: "KTLX".to_owned(),
+        });
         seed_pane(&mut app.extra_panes[0], "KTLX");
         app.start_extra_pane_intl_load(0, intl_site("alpha"), LatestLoadMode::User, &ctx);
         let pane = &app.extra_panes[0];
@@ -64093,9 +64699,185 @@ mod tests {
         );
         assert!(pane.volume.is_none());
         assert!(
-            pane.pinned_site_id.is_none(),
+            matches!(pane.pin, Some(SiteRef::Intl { .. })),
             "the pinned US id is released to the intl source"
         );
+    }
+
+    /// v0.29 Phase 3 §1.4 startup restore: the display owner persists as
+    /// ONE encoded settings key at every ownership transition, and a fresh
+    /// session re-arms an intl owner from it (poll inactive — nothing
+    /// auto-starts). Owner checkpoint: a full Ängelholm session resumes in
+    /// Sweden — display owner, archive dispatch, and Reset View included.
+    #[test]
+    fn intl_display_owner_persists_and_restores_the_session() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.set_intl_archive_primary_source("smhi", "angelholm");
+        assert_eq!(
+            app.app_settings.display_owner_site.as_deref(),
+            Some("intl:smhi:angelholm"),
+            "ownership TAKE persists the encoded key"
+        );
+
+        // Fresh session: the persisted key re-arms the intl poll source.
+        let restored = restored_poll_source(&app.app_settings);
+        assert!(
+            matches!(
+                &restored,
+                PollSource::Intl { provider_id, site_id }
+                    if provider_id == "smhi" && site_id == "angelholm"
+            ),
+            "restore re-arms the intl owner: {restored:?}"
+        );
+        let mut fresh = test_viewer_app_with_hazards(Vec::new());
+        fresh.sites = vec![RadarSite::new("KTLX").with_location(
+            Some("Norman".to_owned()),
+            Some(35.333),
+            Some(-97.278),
+        )];
+        fresh.selected_site_index = 0;
+        fresh.poll_source = restored;
+        fresh.poll_active = false;
+        assert_eq!(
+            fresh.display_owner_site(),
+            SiteRef::Intl {
+                provider_id: "smhi".to_owned(),
+                site_id: "angelholm".to_owned(),
+            },
+            "the restored session's display owner is the intl site"
+        );
+        // Reset View lands in Sweden even before the first poll installs
+        // a volume — never on the stale US selection.
+        fresh.reset_view();
+        assert!(
+            (fresh.map_center_lat - 56.3675).abs() < 0.05
+                && (fresh.map_center_lon - 12.8517).abs() < 0.05,
+            "Reset View follows the restored intl owner, got ({}, {})",
+            fresh.map_center_lat,
+            fresh.map_center_lon
+        );
+
+        // Releasing ownership back to the US persists the new owner.
+        fresh.release_intl_primary_display();
+        assert_eq!(
+            fresh.app_settings.display_owner_site.as_deref(),
+            Some("KTLX"),
+            "ownership RELEASE persists the US owner"
+        );
+
+        // Legacy settings without the key keep the CustomUrl seed.
+        let legacy = settings::AppSettings::default();
+        assert!(matches!(
+            restored_poll_source(&legacy),
+            PollSource::CustomUrl(url) if url.is_empty()
+        ));
+        // A stale intl key (site gone from the catalog) degrades to legacy.
+        let stale = settings::AppSettings {
+            display_owner_site: Some("intl:smhi:gone".to_owned()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            restored_poll_source(&stale),
+            PollSource::CustomUrl(_)
+        ));
+    }
+
+    /// v0.29 Phase 3 favorites parity: the star keys on the display owner's
+    /// `settings_key()`, so an international owner favorites as a
+    /// case-preserved `intl:` key that resolves back to its own catalog
+    /// label — and never shadows (or is shadowed by) a bare US id.
+    #[test]
+    fn intl_favorites_key_on_the_display_owner_and_resolve_labels() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.set_intl_archive_primary_source("smhi", "angelholm");
+        let owner = app.display_owner_site();
+        assert_eq!(owner.settings_key(), "intl:smhi:angelholm");
+
+        app.app_settings.add_favorite(&owner.settings_key());
+        assert!(app.app_settings.is_favorite("intl:smhi:angelholm"));
+        assert!(
+            !app.app_settings.is_favorite("ANGELHOLM"),
+            "an intl favorite never doubles as a bare US id"
+        );
+
+        // The chip row resolves the stored key through the one catalog.
+        let record =
+            data_source::sites::resolve(&SiteRef::parse_settings_key("intl:smhi:angelholm"))
+                .expect("Ängelholm resolves");
+        assert_eq!(record.label, "Ängelholm");
+        assert!(matches!(record.kind, SiteKind::Intl { .. }));
+
+        // Removal accepts the verbatim key (right-click chip path).
+        app.app_settings.remove_favorite("intl:smhi:angelholm");
+        assert!(!app.app_settings.is_favorite("intl:smhi:angelholm"));
+    }
+
+    /// v0.29 Phase 3: explicit pane pins persist as settings keys and a
+    /// fresh session's `sync_extra_panes` restores them — US pins as bare
+    /// legacy ids (forever), intl pins as case-preserved `intl:` keys.
+    /// Clearing back to Follow-primary removes the entry.
+    #[test]
+    fn explicit_pane_pins_persist_and_restore_across_sessions() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![RadarSite::new("KTLX"), RadarSite::new("KEAX")];
+        app.selected_site_index = 0;
+        app.app_settings.independent_panels = true;
+        app.extra_panes.push(ViewPane::new(DisplayProduct::Moment(
+            MomentType::Reflectivity,
+        )));
+
+        app.set_extra_pane_selected_site(0, 1);
+        assert_eq!(
+            app.app_settings.extra_pane_pins.get(&0).map(String::as_str),
+            Some("KEAX")
+        );
+
+        let angelholm = ViewerApp::find_intl_site("smhi", "angelholm")
+            .expect("SMHI Ängelholm is in the static catalog");
+        app.set_extra_pane_intl_site(0, &angelholm);
+        assert_eq!(
+            app.app_settings.extra_pane_pins.get(&0).map(String::as_str),
+            Some("intl:smhi:angelholm"),
+            "intl pins persist with case intact"
+        );
+
+        // Fresh session: the pin comes back through sync_extra_panes.
+        let mut restarted = test_viewer_app_with_hazards(Vec::new());
+        restarted.sites = vec![RadarSite::new("KTLX"), RadarSite::new("KEAX")];
+        restarted.app_settings.independent_panels = true;
+        restarted.app_settings.extra_pane_pins =
+            std::collections::BTreeMap::from([(0, "intl:smhi:angelholm".to_owned())]);
+        restarted.grid_layout = PanelLayout::TwoVertical;
+        restarted.sync_extra_panes();
+        assert_eq!(
+            restarted.extra_panes[0].pin,
+            Some(SiteRef::Intl {
+                provider_id: "smhi".to_owned(),
+                site_id: "angelholm".to_owned(),
+            }),
+            "the intl pane pin restores on restart"
+        );
+
+        // Bare legacy ids restore as US refs forever.
+        let mut legacy = test_viewer_app_with_hazards(Vec::new());
+        legacy.sites = vec![RadarSite::new("KTLX"), RadarSite::new("KEAX")];
+        legacy.app_settings.independent_panels = true;
+        legacy.app_settings.extra_pane_pins =
+            std::collections::BTreeMap::from([(0, "keax".to_owned())]);
+        legacy.grid_layout = PanelLayout::TwoVertical;
+        legacy.sync_extra_panes();
+        assert_eq!(
+            legacy.extra_panes[0].pin,
+            Some(SiteRef::Us {
+                level2_id: "KEAX".to_owned(),
+            }),
+            "bare ids restore as (uppercased) US pins"
+        );
+
+        // Releasing the pane back to Follow-primary removes the entry.
+        app.clear_extra_pane_radar(0);
+        app.remember_extra_pane_pin(0);
+        assert!(!app.app_settings.extra_pane_pins.contains_key(&0));
     }
 
     #[test]
@@ -64161,7 +64943,9 @@ mod tests {
         app.extra_panes.push(ViewPane::new(DisplayProduct::Moment(
             MomentType::Reflectivity,
         )));
-        app.extra_panes[0].pinned_site_id = Some("KTLX".to_owned());
+        app.extra_panes[0].pin = Some(SiteRef::Us {
+            level2_id: "KTLX".to_owned(),
+        });
 
         app.maybe_refresh_extra_panes(&ctx);
         // The pane holds the PRIMARY's decode (same Arc): one download and
@@ -65323,7 +66107,9 @@ mod tests {
                 .unwrap(),
         ));
         app.extra_panes.push(ViewPane::new(product.clone()));
-        app.extra_panes[0].pinned_site_id = Some(source.site.id.clone());
+        app.extra_panes[0].pin = Some(SiteRef::Us {
+            level2_id: source.site.id.clone(),
+        });
         app.extra_panes[0].cut = Some(0);
         app.extra_panes[0].frame_history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(source.as_ref()),
@@ -68396,7 +69182,9 @@ mod tests {
         app.volume = Some(Arc::new(test_volume_with_site_time("KILX", primary_time)));
         let pane_volume = Arc::new(test_volume_with_site_time("KIND", pane_time));
         let pane = &mut app.extra_panes[0];
-        pane.pinned_site_id = Some("KIND".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         pane.volume = Some(Arc::clone(&pane_volume));
         pane.frame_history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(pane_volume.as_ref()),
@@ -68448,7 +69236,9 @@ mod tests {
         app.map_center_lon = -86.5;
         let pane_volume = Arc::new(test_volume_with_site_time("KIND", pane_time));
         let pane = &mut app.extra_panes[0];
-        pane.pinned_site_id = Some("KIND".to_owned());
+        pane.pin = Some(SiteRef::Us {
+            level2_id: "KIND".to_owned(),
+        });
         pane.volume = Some(Arc::clone(&pane_volume));
         pane.frame_history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(pane_volume.as_ref()),

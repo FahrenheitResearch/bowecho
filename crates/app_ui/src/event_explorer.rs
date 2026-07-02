@@ -255,8 +255,14 @@ pub(crate) fn event_jump_eligible_sites(
         .iter()
         .enumerate()
         .filter_map(|(index, site)| {
-            if crate::site_is_tdwr(site) || !crate::site_is_primary_level2_catalog_site(site) {
-                return None;
+            // EXPLICIT kind filter (v0.29 spec §1.4): event/report data is
+            // US-only today, so `Wsr88d` is the honest-NA answer — if an
+            // ESWD-style source ever lands, this match is the one lever.
+            match crate::us_site_kind(site) {
+                data_source::sites::SiteKind::Wsr88d => {}
+                data_source::sites::SiteKind::Tdwr
+                | data_source::sites::SiteKind::Research
+                | data_source::sites::SiteKind::Intl { .. } => return None,
             }
             let (lat, lon) = crate::site_location(site)?;
             Some((index, lat, lon))

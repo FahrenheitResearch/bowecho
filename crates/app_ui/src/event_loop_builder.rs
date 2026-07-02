@@ -88,11 +88,11 @@ pub(crate) enum EventLoopBuilderAction {
 
 #[derive(Clone, Debug)]
 pub(crate) struct EventLoopRadarPlan {
-    /// `Some(provider_id)` routes the build to the international archive
-    /// loader; `None` is the US Level-II path (Phase 3 collapses this
-    /// pair into `site: SiteRef`).
-    pub(crate) intl_provider_id: Option<String>,
-    pub(crate) site_id: String,
+    /// The site the loop is built for — ONE identity for both worlds
+    /// (v0.29 Phase 3: the old `{intl_provider_id, site_id}` pair
+    /// collapsed). Build dispatches on the ref's kind; casing is settled
+    /// at construction (US uppercase, intl verbatim).
+    pub(crate) site: data_source::sites::SiteRef,
     pub(crate) start_utc: DateTime<Utc>,
     pub(crate) end_utc: DateTime<Utc>,
     pub(crate) max_frames: usize,
@@ -210,9 +210,13 @@ impl EventLoopBuilderState {
                 if build_response.clicked() {
                     match self.radar_plan(context) {
                         Ok(plan) => {
+                            let site_id = match &plan.site {
+                                data_source::sites::SiteRef::Us { level2_id } => level2_id,
+                                data_source::sites::SiteRef::Intl { site_id, .. } => site_id,
+                            };
                             self.status = format!(
                                 "Queued {} {} to {}",
-                                plan.site_id,
+                                site_id,
                                 plan.start_utc.format("%H:%MZ"),
                                 plan.end_utc.format("%H:%MZ")
                             );
@@ -344,20 +348,23 @@ impl EventLoopBuilderState {
     ) -> Result<EventLoopRadarPlan, String> {
         let preview = self.preview_from_inputs()?;
         self.preview = Some(preview.clone());
-        // US ids normalize uppercase as ever; international site codes
-        // are case-significant (`deess`) and pass through VERBATIM —
-        // the Phase-2 UI side of the settings-uppercasing fix.
-        let site_id = if context.intl_provider.is_some() {
-            self.site_id.trim().to_owned()
-        } else {
-            self.site_id.trim().to_ascii_uppercase()
-        };
-        if site_id.is_empty() {
+        if self.site_id.trim().is_empty() {
             return Err("Choose a radar site first".to_owned());
         }
+        // US ids normalize uppercase as ever; international site codes
+        // are case-significant (`deess`) and pass through VERBATIM —
+        // kind-aware casing settled at SiteRef construction.
+        let site = match &context.intl_provider {
+            Some(provider_id) => data_source::sites::SiteRef::Intl {
+                provider_id: provider_id.clone(),
+                site_id: self.site_id.trim().to_owned(),
+            },
+            None => data_source::sites::SiteRef::Us {
+                level2_id: self.site_id.trim().to_ascii_uppercase(),
+            },
+        };
         Ok(EventLoopRadarPlan {
-            intl_provider_id: context.intl_provider.clone(),
-            site_id,
+            site,
             start_utc: preview.start_utc,
             end_utc: preview.end_utc,
             max_frames: usize::from(self.max_radar_frames),
@@ -687,16 +694,27 @@ mod tests {
         let plan = state
             .radar_plan(&intl_context("ord", "deess"))
             .expect("intl plan");
-        assert_eq!(plan.site_id, "deess", "intl codes stay verbatim");
-        assert_eq!(plan.intl_provider_id.as_deref(), Some("ord"));
+        assert_eq!(
+            plan.site,
+            data_source::sites::SiteRef::Intl {
+                provider_id: "ord".to_owned(),
+                site_id: "deess".to_owned(),
+            },
+            "intl codes stay verbatim"
+        );
 
         let mut state = EventLoopBuilderState {
             site_id: "ktlx".to_owned(),
             ..EventLoopBuilderState::default()
         };
         let plan = state.radar_plan(&us_context()).expect("us plan");
-        assert_eq!(plan.site_id, "KTLX", "US ids keep uppercasing");
-        assert_eq!(plan.intl_provider_id, None);
+        assert_eq!(
+            plan.site,
+            data_source::sites::SiteRef::Us {
+                level2_id: "KTLX".to_owned(),
+            },
+            "US ids keep uppercasing"
+        );
     }
 
     /// Seeding follows the context (the display owner in main.rs), never

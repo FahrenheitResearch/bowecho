@@ -129,6 +129,13 @@ pub struct AppSettings {
     pub brand: BrandConfig,
     /// Site to load on startup (e.g. "KEAX"). None = built-in default.
     pub startup_site: Option<String>,
+    /// The primary display owner from the last session as ONE encoded
+    /// `SiteRef` settings key (`"KTLX"` | `"intl:smhi:angelholm"`, case
+    /// preserved for `:`-keys). Absent = pre-v0.29 behavior (bare
+    /// `startup_site` only; intl sessions resumed as a stale US site).
+    /// New key only — a v0.29 file opened by v0.28 ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_owner_site: Option<String>,
     /// Favorite site ids, in user order.
     pub favorites: Vec<String>,
     /// Live auto-refresh poll interval (seconds).
@@ -153,6 +160,13 @@ pub struct AppSettings {
     /// controls instead of always following the primary pane.
     #[serde(default)]
     pub independent_panels: bool,
+    /// Explicit per-pane site pins, keyed by zero-based extra-pane slot
+    /// (0 = Pane 2), encoded as `SiteRef` settings keys (`"KTLX"` |
+    /// `"intl:smhi:angelholm"`; bare ids parse as US forever, `:`-keys
+    /// keep their case). Absent = pre-v0.29 behavior (no pin restore).
+    /// New key only — a v0.29 file opened by v0.28 ignores it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_pane_pins: BTreeMap<u8, String>,
     /// Placefile URLs (GRLevelX-style overlays) with per-file enable flags.
     pub placefiles: Vec<PlacefileEntry>,
     /// Default overlay toggles, restored at startup (user request: "let
@@ -626,6 +640,7 @@ impl Default for AppSettings {
             overlay_spc_reports: false,
             overlay_mping_reports: false,
             startup_site: None,
+            display_owner_site: None,
             favorites: Vec::new(),
             polling_interval_seconds: 60,
             palette_by_family: BTreeMap::new(),
@@ -633,6 +648,7 @@ impl Default for AppSettings {
             style_profile: default_style_profile(),
             grid_pane_count: 1,
             independent_panels: false,
+            extra_pane_pins: BTreeMap::new(),
             placefiles: Vec::new(),
             basemap_style: default_basemap_style(),
             basemap_line_brightness_percent: default_basemap_line_brightness_percent(),
@@ -1542,6 +1558,56 @@ mod tests {
 
         assert!(back.independent_panels);
         assert_eq!(back.grid_pane_count, 4);
+    }
+
+    /// v0.29 Phase 3: the display owner persists as ONE encoded settings
+    /// key. Absent = legacy (None, nothing written); `:`-keys keep case.
+    #[test]
+    fn display_owner_site_defaults_absent_and_round_trips_with_case() {
+        let old = AppSettings::from_json("{}");
+        assert!(old.display_owner_site.is_none());
+        assert!(
+            !old.to_json().contains("display_owner_site"),
+            "legacy files stay byte-small: the absent owner is not written"
+        );
+
+        let settings = AppSettings {
+            display_owner_site: Some("intl:smhi:angelholm".to_owned()),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+        assert_eq!(
+            back.display_owner_site.as_deref(),
+            Some("intl:smhi:angelholm")
+        );
+    }
+
+    /// v0.29 Phase 3: explicit pane pins persist as `SiteRef` settings
+    /// keys. Absent key = legacy behavior (empty map, nothing written);
+    /// `:`-keys keep their case through a round trip.
+    #[test]
+    fn extra_pane_pins_default_empty_and_round_trip_with_case_intact() {
+        let old = AppSettings::from_json("{}");
+        assert!(old.extra_pane_pins.is_empty());
+        assert!(
+            !old.to_json().contains("extra_pane_pins"),
+            "legacy files stay byte-small: the empty map is not written"
+        );
+
+        let settings = AppSettings {
+            extra_pane_pins: BTreeMap::from([
+                (0, "KTLX".to_owned()),
+                (2, "intl:smhi:angelholm".to_owned()),
+            ]),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+        assert_eq!(back.extra_pane_pins, settings.extra_pane_pins);
+        assert_eq!(
+            back.extra_pane_pins.get(&2).map(String::as_str),
+            Some("intl:smhi:angelholm"),
+            "intl keys survive with case intact"
+        );
     }
 
     #[test]
