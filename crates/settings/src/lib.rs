@@ -861,6 +861,16 @@ pub fn storage_root_for_namespace(namespace: &str) -> Option<PathBuf> {
     config_dir().map(|dir| dir.join(namespace))
 }
 
+/// Config-document path for an explicitly named storage namespace — the
+/// settings home for second frontends (miniDerecho: B4,
+/// docs/miniderecho-spec.md §1). Additive: BowEcho's own settings document
+/// deliberately stays at `bowecho_config_dir()/config.json`
+/// ([`AppSettings::config_path`]), and this helper never reads the
+/// `BOWECHO_DATA_DIR` override.
+pub fn config_path_for_namespace(namespace: &str) -> Option<PathBuf> {
+    Some(storage_root_for_namespace(namespace)?.join("config.json"))
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StorageImportSummary {
     pub files_copied: usize,
@@ -1166,6 +1176,21 @@ mod tests {
     #[test]
     fn brand_default_stays_sparse_in_app_settings_json() {
         assert!(!AppSettings::default().to_json().contains("\"brand\""));
+    }
+
+    #[test]
+    fn config_path_for_namespace_lands_inside_that_namespace_root() {
+        let path = config_path_for_namespace("miniderecho").expect("config dir available in CI");
+        assert_eq!(
+            path,
+            storage_root_for_namespace("miniderecho")
+                .expect("namespace root")
+                .join("config.json")
+        );
+        // Never BowEcho's settings document (B4: the settings-document trap).
+        assert_ne!(AppSettings::config_path(), Some(path));
+        // Rejected namespaces resolve to nothing rather than a stray file.
+        assert_eq!(config_path_for_namespace("   "), None);
     }
 
     #[test]

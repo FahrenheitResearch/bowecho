@@ -23,6 +23,7 @@ radar_core = { path = "../radar_core" }
 render2d = { path = "../render2d" }
 settings = { path = "../settings" }
 styles = { path = "../styles" }
+ui_core = { path = "../ui_core" }
 serde.workspace = true
 serde_json.workspace = true
 quick-xml.workspace = true
@@ -32,6 +33,11 @@ quick-xml.workspace = true
 reqwest.workspace = true
 sha2 = "0.10"
 tiff.workspace = true
+
+[dev-dependencies]
+# B3 (docs/miniderecho-spec.md §1): the shared slots' `inject_for_test`
+# stays visible to this crate's tests after the ui_core extraction.
+ui_core = { path = "../ui_core", features = ["test-util"] }
 
 [[bin]]
 name = "bowecho"
