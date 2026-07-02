@@ -10,10 +10,16 @@
 //! BowEcho therefore never downloads the daily ZIP. It reads the small daily
 //! `*_tarlist.txt`, picks one or more HDF5 member names, and hands those direct
 //! member URLs to the existing ODIM decoder.
+//!
+//! The same dated tarlists are the archive catalog: [`ArchiveFrames`] folds
+//! them per UTC date, so any archived day is one tarlist probe away. NCI
+//! ingests BOM data roughly THREE DAYS behind real time BY DESIGN — frame
+//! identities and stamps are always the real data times (never fetch times),
+//! so the app's age chips report that delay honestly instead of hiding it.
 
-use chrono::{Days, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Days, NaiveDate, NaiveDateTime, Utc};
 
-use super::{FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames, SiteCache};
+use super::{ArchiveFrames, FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames, SiteCache};
 
 const BASE: &str = "https://thredds.nci.org.au/thredds/fileServer/rq0";
 const SITE_LIST_URL: &str = "https://thredds.nci.org.au/thredds/fileServer/rq0/radar_site_list.csv";
@@ -209,6 +215,10 @@ impl IntlProvider for AustraliaNciProvider {
         Some(self)
     }
 
+    fn archive_source(&self) -> Option<&dyn ArchiveFrames> {
+        Some(self)
+    }
+
     fn static_sites(&self) -> Vec<IntlSite> {
         static_sites()
     }
@@ -228,6 +238,107 @@ impl RecentFrames for AustraliaNciProvider {
         let skip = frames.len().saturating_sub(count);
         Ok(frames[skip..].iter().map(frame_plan).collect())
     }
+}
+
+impl ArchiveFrames for AustraliaNciProvider {
+    /// One dated-tarlist probe: every frame anchored on `date_utc`,
+    /// oldest first. NCI publishes ~3 days behind real time, so "today"
+    /// usually errors while any settled archive date lists in full — the
+    /// plan stamps stay the real data times either way.
+    fn day_plans(&self, site_id: &str, date_utc: NaiveDate) -> Result<Vec<FramePlan>, String> {
+        validate_site_id(site_id)?;
+        let frames = tarlist_frames(site_id, date_utc)?;
+        if frames.is_empty() {
+            return Err(format!(
+                "Australia NCI archive: no tarlist frames for site {site_id} on {date_utc}"
+            ));
+        }
+        Ok(archive_frames_oldest_first(frames, usize::MAX))
+    }
+
+    /// Minute-granular override of the day-folding default (the ORD
+    /// shape): tarlist rows carry per-scan stamps, so the window trims to
+    /// the exact `[start, end]` bounds instead of whole days. Days that
+    /// error (unpublished tail of the ~3-day ingest lag, transient fetch
+    /// failure) are skipped and the first error is reported only when the
+    /// whole window yields nothing (a partial archive loop beats none).
+    fn window_plans(
+        &self,
+        site_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        max: usize,
+    ) -> Result<Vec<FramePlan>, String> {
+        validate_site_id(site_id)?;
+        if end < start {
+            return Err(format!("archive window end {end} precedes start {start}"));
+        }
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        let mut frames = Vec::new();
+        let mut first_error: Option<String> = None;
+        let mut date = start.date_naive();
+        let last_date = end.date_naive();
+        loop {
+            match tarlist_frames(site_id, date) {
+                Ok(mut day) => frames.append(&mut day),
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                }
+            }
+            if date >= last_date {
+                break;
+            }
+            match date.succ_opt() {
+                Some(next) => date = next,
+                None => break,
+            }
+        }
+        let plans = archive_window_frames_oldest_first(frames, start, end, max);
+        if plans.is_empty() {
+            return Err(first_error.unwrap_or_else(|| {
+                format!(
+                    "Australia NCI archive: no tarlist frames for site {site_id} between {} and {}",
+                    start.format("%Y-%m-%d %H:%MZ"),
+                    end.format("%Y-%m-%d %H:%MZ")
+                )
+            }));
+        }
+        Ok(plans)
+    }
+}
+
+/// Tarlist stamps are UTC wall-clock (`{site}_{yyyymmdd}_{hhmmss}` file
+/// names on UTC date directories).
+fn frame_stamp_utc(frame: &TarlistFrame) -> DateTime<Utc> {
+    DateTime::<Utc>::from_naive_utc_and_offset(frame.timestamp, Utc)
+}
+
+/// Tarlist frames -> frame plans: chronological, identity-deduped (per
+/// site the tarlist file name IS the identity tail, see [`frame_plan`]),
+/// capped to the NEWEST `max` while staying oldest-first — the same
+/// tail-of-the-window shape as ORD's and SMHI's archive lookups.
+fn archive_frames_oldest_first(mut frames: Vec<TarlistFrame>, max: usize) -> Vec<FramePlan> {
+    frames.sort_by_key(|frame| frame.timestamp);
+    frames.dedup_by(|left, right| left.file_name == right.file_name);
+    let skip = frames.len().saturating_sub(max);
+    frames[skip..].iter().map(frame_plan).collect()
+}
+
+/// The pure window shaping behind [`ArchiveFrames::window_plans`]: trim
+/// to the exact `[start, end]` stamps, then sort/dedupe/cap-keep-newest.
+fn archive_window_frames_oldest_first(
+    mut frames: Vec<TarlistFrame>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    max: usize,
+) -> Vec<FramePlan> {
+    frames.retain(|frame| {
+        let stamp = frame_stamp_utc(frame);
+        stamp >= start && stamp <= end
+    });
+    archive_frames_oldest_first(frames, max)
 }
 
 fn static_sites() -> Vec<IntlSite> {
@@ -521,6 +632,177 @@ id,id_long,WIGOS,short_name,location,radar_type,postchange_start,prechange_end,s
         assert!(sites.len() > 60);
         assert!(sites.iter().any(|site| site.site_id == "2"));
         assert!(sites.iter().any(|site| site.site_id == "71"));
+    }
+
+    /// One TarlistFrame with the given `yyyymmdd_hhmmss` stamp, in the
+    /// same shape [`parse_tarlist`] produces for site 2.
+    fn tarlist_frame(stamp: &str) -> TarlistFrame {
+        let timestamp = NaiveDateTime::parse_from_str(stamp, "%Y%m%d_%H%M%S").expect("stamp");
+        TarlistFrame {
+            file_name: format!("2_{stamp}.pvol.h5"),
+            site_id: "2".to_owned(),
+            date: timestamp.date(),
+            timestamp,
+        }
+    }
+
+    /// The archive-lookup shaping shared by `day_plans`/`window_plans`:
+    /// chronological, identity-deduped, and capped to the NEWEST `max`
+    /// while staying oldest-first for loop installation. Identities are
+    /// the real data stamps (NCI runs ~3 days delayed by design, and the
+    /// age chips must be able to say so).
+    #[test]
+    fn archive_frames_sort_dedupe_and_keep_the_newest_capped_tail() {
+        let frames = archive_frames_oldest_first(
+            vec![
+                tarlist_frame("20260624_003000"),
+                tarlist_frame("20260624_001000"),
+                tarlist_frame("20260624_001000"),
+                tarlist_frame("20260624_002000"),
+                tarlist_frame("20260624_000000"),
+            ],
+            3,
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.identity.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "australia-nci_2_2_20260624_001000.pvol.h5",
+                "australia-nci_2_2_20260624_002000.pvol.h5",
+                "australia-nci_2_2_20260624_003000.pvol.h5",
+            ],
+            "duplicate dropped, oldest trimmed by the cap, order oldest-first"
+        );
+        assert!(archive_frames_oldest_first(Vec::new(), 3).is_empty());
+        assert!(archive_frames_oldest_first(vec![tarlist_frame("20260624_000000")], 0).is_empty());
+    }
+
+    /// The window override trims to exact stamps (minute-granular, not
+    /// whole days) before the shared sort/dedupe/cap shaping.
+    #[test]
+    fn archive_window_trims_to_exact_stamps_before_capping() {
+        let frames = vec![
+            tarlist_frame("20260624_235500"),
+            tarlist_frame("20260625_000000"),
+            tarlist_frame("20260625_000500"),
+            tarlist_frame("20260625_001000"),
+        ];
+        let start = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDateTime::parse_from_str("20260625_000000", "%Y%m%d_%H%M%S").unwrap(),
+            Utc,
+        );
+        let end = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDateTime::parse_from_str("20260625_000500", "%Y%m%d_%H%M%S").unwrap(),
+            Utc,
+        );
+        let plans = archive_window_frames_oldest_first(frames.clone(), start, end, 10);
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| plan.identity.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "australia-nci_2_2_20260625_000000.pvol.h5",
+                "australia-nci_2_2_20260625_000500.pvol.h5",
+            ],
+            "inclusive bounds, boundary-day frames outside the window dropped"
+        );
+        let capped = archive_window_frames_oldest_first(frames, start, end, 1);
+        assert_eq!(
+            capped
+                .iter()
+                .map(|plan| plan.identity.as_str())
+                .collect::<Vec<_>>(),
+            vec!["australia-nci_2_2_20260625_000500.pvol.h5"],
+            "cap keeps the NEWEST tail"
+        );
+    }
+
+    /// `archive_source` guards its inputs the same way `latest` does: a
+    /// corrupt saved site id can never be interpolated into a THREDDS
+    /// path, and a reversed window is a descriptive error.
+    #[test]
+    fn archive_lookup_validates_site_ids_and_window_bounds() {
+        let provider = AustraliaNciProvider::new();
+        let source = provider.archive_source().expect("NCI archive source");
+        let date = NaiveDate::from_ymd_opt(2026, 6, 24).expect("date");
+        let err = source.day_plans("../escape", date).unwrap_err();
+        assert!(err.contains("invalid site id"), "unexpected error: {err}");
+
+        let start = DateTime::<Utc>::from_naive_utc_and_offset(
+            date.and_hms_opt(6, 0, 0).expect("time"),
+            Utc,
+        );
+        let err = source
+            .window_plans("../escape", start, start, 4)
+            .unwrap_err();
+        assert!(err.contains("invalid site id"), "unexpected error: {err}");
+        let err = source
+            .window_plans("2", start, start - chrono::Duration::hours(1), 4)
+            .unwrap_err();
+        assert!(err.contains("precedes"), "unexpected error: {err}");
+        assert!(
+            source
+                .window_plans("2", start, start, 0)
+                .expect("zero cap")
+                .is_empty(),
+            "max == 0 is an empty answer, not a probe"
+        );
+    }
+
+    #[test]
+    #[ignore = "live NCI THREDDS dated-tarlist archive probe — run with --ignored"]
+    fn live_melbourne_archive_day_and_window_plans_are_dated_oldest_first() {
+        let provider = AustraliaNciProvider::new();
+        let source = provider.archive_source().expect("NCI archive source");
+        // NCI ingests BOM data ~3 days behind real time by design; probe a
+        // date safely past the publication lag.
+        let date = Utc::now()
+            .date_naive()
+            .checked_sub_days(Days::new(6))
+            .expect("date");
+        let plans = source.day_plans("2", date).expect("archive day plans");
+        println!("{} Melbourne plans for {date}", plans.len());
+        assert!(
+            plans.len() > 100,
+            "a settled Melbourne day lists hundreds of 5/6-minute volumes, got {}",
+            plans.len()
+        );
+        let stamp_prefix = format!("australia-nci_2_2_{}", date.format("%Y%m%d"));
+        assert!(
+            plans
+                .iter()
+                .all(|plan| plan.identity.starts_with(&stamp_prefix)),
+            "identities carry the real data date"
+        );
+        let identities: Vec<&str> = plans.iter().map(|plan| plan.identity.as_str()).collect();
+        let mut sorted = identities.clone();
+        sorted.sort_unstable();
+        assert_eq!(identities, sorted, "oldest first");
+        let again = source.day_plans("2", date).expect("repeat lookup");
+        assert_eq!(plans, again, "identity-stable across repeated lookups");
+
+        let start = DateTime::<Utc>::from_naive_utc_and_offset(
+            date.and_hms_opt(3, 0, 0).expect("time"),
+            Utc,
+        );
+        let window = source
+            .window_plans("2", start, start + chrono::Duration::hours(1), 4)
+            .expect("archive window plans");
+        assert!(
+            window.len() <= 4 && !window.is_empty(),
+            "capped window, got {}",
+            window.len()
+        );
+        assert!(
+            plans
+                .iter()
+                .filter(|plan| window.contains(plan))
+                .eq(window.iter()),
+            "window plans are the newest in-window tail of the day, in day order"
+        );
     }
 
     #[test]

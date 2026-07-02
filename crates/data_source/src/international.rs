@@ -396,10 +396,11 @@ pub fn intl_provider_capabilities() -> Vec<IntlProviderCapability> {
                     "walk historical date prefixes",
                 ),
                 "australia-nci" => (
-                    "latest archived tarlist",
+                    "dated tarlists: recent frames + day/window archive, ~3 days delayed",
                     "NCI rq0 ODIM HDF5 archive; daily tarlists and direct zip-member reads",
-                    "recent loop from the latest tarlist's per-frame HDF5 members",
-                    "wire dated tarlists into archive lookup",
+                    "recent loop and dated archive lookup from the daily tarlists; NCI \
+                     ingests BOM data ~3 days behind real time by design",
+                    "arbitrary date/window picker over the multi-year tarlists",
                 ),
                 "dmi" => (
                     "newest N STAC items",
@@ -1078,11 +1079,16 @@ mod tests {
             .find(|capability| capability.provider_id == "australia-nci")
             .expect("NCI capability");
         assert!(
-            !nci.archive_lookup,
-            "NCI's card goes honest-false until a real ArchiveFrames impl \
-             lands over its dated tarlists"
+            nci.archive_lookup,
+            "NCI's card goes honest-true: its dated tarlists now route \
+             through archive_source()"
         );
-        assert!(nci.next_unlock.contains("archive lookup"));
+        assert!(
+            nci.current_window.contains("~3 days delayed")
+                && nci.bowecho_status.contains("~3 days behind real time"),
+            "the card must keep saying NCI data runs ~3 days late BY DESIGN \
+             — the archive works, the delay is the upstream's honesty story"
+        );
     }
 
     /// The Load Loop capability is DERIVED, not hand-maintained:
@@ -1269,10 +1275,10 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             archive_ids,
-            BTreeSet::from(["ord", "smhi"]),
-            "FMI bucket walks, NCI tarlists, DMI STAC, and JMA dated tars \
-             are later pure adapter work — each flips its card by landing \
-             a real ArchiveFrames impl, and shows up here deliberately"
+            BTreeSet::from(["australia-nci", "ord", "smhi"]),
+            "FMI bucket walks, DMI STAC, and JMA dated tars are later pure \
+             adapter work — each flips its card by landing a real \
+             ArchiveFrames impl, and shows up here deliberately"
         );
     }
 
