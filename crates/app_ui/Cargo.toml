@@ -26,6 +26,11 @@ styles = { path = "../styles" }
 serde.workspace = true
 serde_json.workspace = true
 quick-xml.workspace = true
+# In-app updater (Settings > security): streaming release-asset download with
+# progress, hashing the streamed bytes for the SHA-256 gate that runs before
+# the Authenticode gate (docs/SIGNING.md).
+reqwest.workspace = true
+sha2 = "0.10"
 tiff.workspace = true
 
 [[bin]]
@@ -37,6 +42,16 @@ winresource = "0.1"
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 rfd.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# In-app updater signature gate: WinVerifyTrust (Authenticode) on the
+# downloaded release binary before it replaces the running executable.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    # WINTRUST_DATA itself is additionally gated behind Cryptography.
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
+] }
 
 # Model-data dock and satellite/model stack (rusty-weather).
 [dependencies.rw-ui]

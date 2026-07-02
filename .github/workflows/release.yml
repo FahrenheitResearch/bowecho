@@ -55,9 +55,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # update_asset bakes the exact release-asset name into the binary
+          # (BOWECHO_UPDATE_ASSET) so the in-app updater can only download
+          # the variant it is already running. Windows-only; builds without
+          # it (dev builds, other platforms) never offer in-app install.
           - os: windows-latest
             artifact_name: bowecho-windows-x64
             package: windows
+            update_asset: bowecho-windows-x64.exe
           # AVX2 variant for ~2015+ CPUs: benched -21% on the dealiased
           # velocity raster and -30% on reflectivity vs baseline x86-64
           # (KTLX 2013-05-20 Moore volume, pixel-identical output).
@@ -65,9 +70,11 @@ jobs:
             artifact_name: bowecho-windows-x64-v3
             package: windows
             rustflags: "-C target-cpu=x86-64-v3"
+            update_asset: bowecho-windows-x64-v3.exe
           - os: windows-11-arm
             artifact_name: bowecho-windows-arm64
             package: windows
+            update_asset: bowecho-windows-arm64.exe
           - os: ubuntu-24.04
             artifact_name: bowecho-linux-x64
             package: linux
@@ -116,6 +123,9 @@ jobs:
       - name: Build release binary
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
+          # In-app updater self-identification (empty for non-Windows
+          # matrix entries, which the code treats as "cannot self-update").
+          BOWECHO_UPDATE_ASSET: ${{ matrix.update_asset }}
         run: cargo build --release -p app_ui --bin bowecho
 
       - name: Detect Windows signing secrets

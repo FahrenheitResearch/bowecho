@@ -54,6 +54,44 @@ spctl --assess --type execute --verbose BowEcho.app
 codesign --verify --deep --strict --verbose=2 BowEcho.app
 ```
 
+## In-app updater verification chain (Windows)
+
+Since v0.28.2 the Windows builds can install updates from Settings >
+security & updates ("Install update"). The updater never runs without an
+explicit click, and it installs nothing that fails any link of this chain:
+
+1. **Variant self-identification (build time).** The release workflow bakes
+   the exact asset name each Windows binary ships as into that binary
+   (`BOWECHO_UPDATE_ASSET`, e.g. `bowecho-windows-x64-v3.exe`). The updater
+   can therefore only download the variant it is already running. Dev/local
+   builds and macOS/Linux builds have no baked name and never offer in-app
+   install — they keep the "Open releases" browser button.
+2. **Download over HTTPS (rustls).** The asset and its `.sha256` are fetched
+   from the GitHub release for the new tag, streamed to a temp file in the
+   same directory as the executable (same volume, so the final rename never
+   crosses filesystems).
+3. **Checksum gate.** The SHA-256 of the streamed bytes must match the
+   `.sha256` file CI published beside the asset. Mismatch or a malformed
+   checksum file deletes the download and reports the reason.
+4. **Authenticode gate.** `WinVerifyTrust` with the
+   `WINTRUST_ACTION_GENERIC_VERIFY_V2` policy must report a valid embedded
+   signature chaining to a trusted root — the same decision
+   `Get-AuthenticodeSignature` makes. Revocation is not fetched over the
+   network during this check (`WTD_REVOKE_NONE` plus cache-only URL
+   retrieval): the checksum pin against the release page is the primary
+   integrity gate, and a revocation-endpoint hiccup must not strand an
+   update midway. Any rejection deletes the download.
+5. **Atomic-ish swap and restart.** The running `bowecho.exe` is renamed to
+   `bowecho.exe.old` (renaming a running executable is legal on Windows),
+   the verified file is renamed into its place, and the app restarts itself
+   with the same arguments after a clean shutdown. If the second rename
+   fails, the original binary is renamed back. Leftover `.old` files are
+   cleaned up best-effort on later launches.
+
+Known limitation: the Authenticode gate verifies *a* trusted signature, not
+a pinned publisher identity. Pinning the expected signer is a candidate
+hardening if the signing identity ever stabilizes long-term.
+
 ## Windows signing setup
 
 Azure Trusted Signing is the preferred CI-friendly path.

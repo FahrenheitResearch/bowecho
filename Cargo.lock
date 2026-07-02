@@ -310,6 +310,7 @@ dependencies = [
  "radar_core",
  "rayon",
  "render2d",
+ "reqwest",
  "rfd",
  "rustwx-core",
  "rustwx-io",
@@ -325,9 +326,11 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "sha2",
  "sharprs",
  "styles",
  "tiff",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 
