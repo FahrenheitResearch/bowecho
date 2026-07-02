@@ -14,15 +14,26 @@ use std::thread;
 
 use eframe::egui;
 use radar_core::{MomentType, RadarVolume};
-use render2d::{ViewportMomentCache, ViewportRasterOptions, viewport_rgba_buffer_len};
+use render2d::{StormMotion, ViewportMomentCache, ViewportRasterOptions, viewport_rgba_buffer_len};
 
 /// Set to any value to log coalescing (M0 acceptance: "requests coalesced").
 const RENDER_DEBUG_ENV: &str = "MINIDERECHO_RENDER_DEBUG";
 
+/// What the lane renders (spec §3.9): a plain moment through
+/// `ViewportMomentCache::new`, the dealias family, or storm-relative
+/// velocity over a plain VEL cache. Color tables are the render2d/
+/// color_tables defaults (Analyst Velocity HD + house REF).
+#[derive(Clone, Debug, PartialEq)]
+pub enum RenderProduct {
+    Moment(MomentType),
+    DealiasedVelocity,
+    StormRelative { storm_motion: StormMotion },
+}
+
 pub struct RenderReq {
     pub volume: Arc<RadarVolume>,
     pub cut_index: usize,
-    pub moment: MomentType,
+    pub product: RenderProduct,
     pub options: ViewportRasterOptions,
     /// Caller-chosen identity for matching results to requests; stale
     /// results are dropped by key at the drain site.
@@ -95,7 +106,7 @@ fn worker_loop(
     ctx: egui::Context,
     hook: Option<TestHook>,
 ) {
-    let mut cache: Option<(usize, usize, MomentType, ViewportMomentCache)> = None;
+    let mut cache: Option<(usize, usize, RenderProduct, ViewportMomentCache)> = None;
     let mut recycled: Option<Vec<u8>> = None;
     let debug = std::env::var_os(RENDER_DEBUG_ENV).is_some();
     while let Ok(first) = req_rx.recv() {
@@ -130,20 +141,43 @@ fn drain_to_newest(first: RenderReq, rx: &mpsc::Receiver<RenderReq>) -> (RenderR
     (newest, skipped)
 }
 
+/// The `ViewportMomentCache` builder for a render product. The cache is
+/// keyed on `(volume Arc ptr, cut, product)` — a storm-relative render
+/// shares nothing with a dealiased one even on the same cut.
+fn build_cache(
+    volume: &RadarVolume,
+    cut_index: usize,
+    product: &RenderProduct,
+) -> render2d::Result<ViewportMomentCache> {
+    match product {
+        RenderProduct::Moment(moment) => {
+            ViewportMomentCache::new(volume, cut_index, moment.clone())
+        }
+        RenderProduct::DealiasedVelocity => {
+            ViewportMomentCache::new_dealiased_velocity(volume, cut_index)
+        }
+        // SRV subtracts the motion at render time over a plain VEL cache
+        // (the cache builds the storm-motion basis when moment == VEL).
+        RenderProduct::StormRelative { .. } => {
+            ViewportMomentCache::new(volume, cut_index, MomentType::Velocity)
+        }
+    }
+}
+
 fn render_one(
-    cache: &mut Option<(usize, usize, MomentType, ViewportMomentCache)>,
+    cache: &mut Option<(usize, usize, RenderProduct, ViewportMomentCache)>,
     recycled: &mut Option<Vec<u8>>,
     req: &RenderReq,
 ) -> RenderMsg {
     let volume_ptr = Arc::as_ptr(&req.volume) as usize;
     let cache_hit = matches!(
         cache,
-        Some((ptr, cut, moment, _))
-            if *ptr == volume_ptr && *cut == req.cut_index && *moment == req.moment
+        Some((ptr, cut, product, _))
+            if *ptr == volume_ptr && *cut == req.cut_index && *product == req.product
     );
     if !cache_hit {
-        match ViewportMomentCache::new(&req.volume, req.cut_index, req.moment.clone()) {
-            Ok(built) => *cache = Some((volume_ptr, req.cut_index, req.moment.clone(), built)),
+        match build_cache(&req.volume, req.cut_index, &req.product) {
+            Ok(built) => *cache = Some((volume_ptr, req.cut_index, req.product.clone(), built)),
             Err(error) => {
                 *cache = None;
                 return RenderMsg::Failed {
@@ -161,7 +195,17 @@ fn render_one(
     let mut pixels = recycled.take().unwrap_or_default();
     pixels.clear();
     pixels.resize(len, 0);
-    match moment_cache.render_moment_rgba_into(&req.volume, req.options, &mut pixels) {
+    let rendered = match &req.product {
+        RenderProduct::StormRelative { storm_motion } => moment_cache
+            .render_storm_relative_velocity_rgba_into(
+                &req.volume,
+                *storm_motion,
+                req.options,
+                &mut pixels,
+            ),
+        _ => moment_cache.render_moment_rgba_into(&req.volume, req.options, &mut pixels),
+    };
+    match rendered {
         Ok((width, height)) => RenderMsg::Done {
             key: req.key,
             width,
@@ -204,9 +248,17 @@ mod tests {
         }
         let mut reflectivity = MomentGrid::new_u8(
             MomentType::Reflectivity,
-            gate_range,
+            gate_range.clone(),
             1.0,
             0.0,
+            Some(0),
+            Some(1),
+        );
+        let mut velocity = MomentGrid::new_u8(
+            MomentType::Velocity,
+            gate_range,
+            2.0,
+            129.0,
             Some(0),
             Some(1),
         );
@@ -214,27 +266,35 @@ mod tests {
             reflectivity
                 .push_u8_row_slice(radial_index, &[20, 30, 40, 50, 60, 70])
                 .expect("reflectivity row");
+            velocity
+                .push_u8_row_slice(radial_index, &[100, 110, 120, 130, 140, 150])
+                .expect("velocity row");
         }
         cut.moments.insert(MomentType::Reflectivity, reflectivity);
+        cut.moments.insert(MomentType::Velocity, velocity);
         let mut volume = RadarVolume::new(RadarSite::new("TST"), Utc::now());
         volume.cuts.push(cut);
         Arc::new(volume)
+    }
+
+    fn options() -> ViewportRasterOptions {
+        ViewportRasterOptions {
+            width: 64,
+            height: 64,
+            radar_x_px: 32.0,
+            radar_y_px: 32.0,
+            km_per_px_x: 0.25,
+            km_per_px_y: 0.25,
+            rotation_rad: 0.0,
+        }
     }
 
     fn req(volume: &Arc<RadarVolume>, key: u64) -> RenderReq {
         RenderReq {
             volume: Arc::clone(volume),
             cut_index: 0,
-            moment: MomentType::Reflectivity,
-            options: ViewportRasterOptions {
-                width: 64,
-                height: 64,
-                radar_x_px: 32.0,
-                radar_y_px: 32.0,
-                km_per_px_x: 0.25,
-                km_per_px_y: 0.25,
-                rotation_rad: 0.0,
-            },
+            product: RenderProduct::Moment(MomentType::Reflectivity),
+            options: options(),
             key,
         }
     }
@@ -308,5 +368,72 @@ mod tests {
             started_rx.try_recv().is_err(),
             "requests 2/3 must never start"
         );
+    }
+
+    /// Every M1 render-product family produces a raster through the one
+    /// cache/recycle path (M1: DVEL via the dealias family, SRV via the
+    /// storm-relative render over a plain VEL cache).
+    #[test]
+    fn every_render_product_family_renders_through_the_shared_cache_path() {
+        let volume = test_volume();
+        let mut cache = None;
+        let mut recycled = None;
+        for (key, product) in [
+            (1, RenderProduct::Moment(MomentType::Reflectivity)),
+            (2, RenderProduct::Moment(MomentType::Velocity)),
+            (3, RenderProduct::DealiasedVelocity),
+            (
+                4,
+                RenderProduct::StormRelative {
+                    storm_motion: StormMotion {
+                        direction_deg: 45.0,
+                        speed_mps: 18.0,
+                    },
+                },
+            ),
+        ] {
+            let message = render_one(
+                &mut cache,
+                &mut recycled,
+                &RenderReq {
+                    volume: Arc::clone(&volume),
+                    cut_index: 0,
+                    product: product.clone(),
+                    options: options(),
+                    key,
+                },
+            );
+            match message {
+                RenderMsg::Done {
+                    key: got,
+                    width,
+                    height,
+                    pixels,
+                } => {
+                    assert_eq!(got, key);
+                    assert_eq!((width, height), (64, 64));
+                    assert_eq!(pixels.len(), 64 * 64 * 4);
+                    recycled = Some(pixels);
+                }
+                RenderMsg::Failed { error, .. } => panic!("{product:?} failed: {error}"),
+            }
+            // The cache is keyed on the product: each switch rebuilt it.
+            let (_, _, cached_product, _) = cache.as_ref().expect("cache populated");
+            assert_eq!(cached_product, &product);
+        }
+
+        // A missing base moment is a Failed message, not a panic.
+        let message = render_one(
+            &mut cache,
+            &mut recycled,
+            &RenderReq {
+                volume: Arc::clone(&volume),
+                cut_index: 0,
+                product: RenderProduct::Moment(MomentType::CorrelationCoefficient),
+                options: options(),
+                key: 9,
+            },
+        );
+        assert!(matches!(message, RenderMsg::Failed { key: 9, .. }));
     }
 }
