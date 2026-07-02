@@ -80,6 +80,10 @@ use sites_ui::{
     radar_site_search_matches, us_site_kind,
 };
 use ui_core::geo::{aeqd_forward_km, aeqd_inverse_km};
+use ui_core::render_service::{
+    DrainBudget, LaneId, PrewarmPool, RepaintDecision, loop_prewarm_inflight_limit,
+    loop_prewarm_worker_count, post_drain_repaint,
+};
 use ui_core::tiles;
 use ui_core::worker_slot::{SlotMessage, SlotPoll, StreamSlot, StreamState, WorkerSlot};
 
@@ -1690,8 +1694,10 @@ struct ViewerApp {
     render_receiver: mpsc::Receiver<AsyncRenderResult>,
     render_recycle_sender: mpsc::Sender<RenderRecycleBuffer>,
     pending_render_key: Option<TextureKey>,
-    loop_prewarm_sender: mpsc::Sender<RenderRequest>,
-    loop_prewarm_receiver: mpsc::Receiver<AsyncRenderResult>,
+    /// Shared prewarm pool (`LaneId::Prewarm`): channel plumbing lives in
+    /// `ui_core::render_service::PrewarmPool`; the render job stays here
+    /// (`spawn_loop_prewarm_render_workers`).
+    loop_prewarm: PrewarmPool<RenderRequest, AsyncRenderResult>,
     loop_render_cache: VecDeque<LoopRenderCacheEntry>,
     loop_render_cache_bytes: usize,
     loop_prewarm_inflight: Vec<TextureKey>,
@@ -5276,77 +5282,40 @@ fn spawn_overlay_render_worker() -> (
     spawn_render_worker_with_mode(RenderWorkerCacheMode::Overlay)
 }
 
-fn spawn_loop_prewarm_render_workers() -> (
-    mpsc::Sender<RenderRequest>,
-    mpsc::Receiver<AsyncRenderResult>,
-) {
-    let (request_sender, request_receiver) = mpsc::channel::<RenderRequest>();
-    let (result_sender, result_receiver) = mpsc::channel::<AsyncRenderResult>();
-    let request_receiver = Arc::new(Mutex::new(request_receiver));
+/// Thin adapter over `ui_core::render_service::PrewarmPool`: the channel
+/// plumbing moved to ui_core (Phase 4a); the worker body below is the
+/// pre-move render job, verbatim. `loop_prewarm_worker_count` /
+/// `loop_prewarm_inflight_limit` moved with it (imported at the top).
+fn spawn_loop_prewarm_render_workers() -> PrewarmPool<RenderRequest, AsyncRenderResult> {
     let worker_count = loop_prewarm_worker_count(effective_worker_threads());
-
-    for _ in 0..worker_count {
-        let request_receiver = Arc::clone(&request_receiver);
-        let result_sender = result_sender.clone();
-        thread::spawn(move || {
-            // Loop prewarm keys are normally one-shot across many volumes/cuts.
-            // The overlay policy keeps only one moment cache and a 6 MiB sample
-            // budget per worker instead of giving every prewarmer the primary
-            // worker's 64 MiB private cache budget.
-            let cache_policy = RenderWorkerCachePolicy::detect(RenderWorkerCacheMode::Overlay);
-            let mut reusable_pixels = Vec::new();
-            let mut reusable_pixels_signature: Option<RenderWorkerViewportSignature> = None;
-            let mut moment_caches: Vec<RenderWorkerMomentCache> = Vec::new();
-            let mut sample_caches: Vec<RenderWorkerSampleCache> = Vec::new();
-            let mut geometry_caches: Vec<RenderWorkerGeometryCache> = Vec::new();
-            let mut last_direct_viewports: Vec<RenderWorkerViewportSignature> = Vec::new();
-            loop {
-                let request = {
-                    let Ok(receiver) = request_receiver.lock() else {
-                        break;
-                    };
-                    receiver.recv()
-                };
-                let Ok(request) = request else {
-                    break;
-                };
-                let key = request.key.clone();
-                let pane = request.pane;
-                let result = ViewerApp::render_viewport_payload(
-                    &request,
-                    &mut reusable_pixels,
-                    &mut reusable_pixels_signature,
-                    &mut moment_caches,
-                    &mut sample_caches,
-                    &mut geometry_caches,
-                    &mut last_direct_viewports,
-                    cache_policy,
-                );
-                if result_sender
-                    .send(AsyncRenderResult { key, pane, result })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-    }
-
-    (request_sender, result_receiver)
-}
-
-fn loop_prewarm_worker_count(threads: usize) -> usize {
-    match threads {
-        0 | 1 => 1,
-        2..=4 => 2,
-        5..=8 => 3,
-        9..=16 => 4,
-        _ => 4,
-    }
-}
-
-fn loop_prewarm_inflight_limit(threads: usize) -> usize {
-    loop_prewarm_worker_count(threads).saturating_mul(2).max(2)
+    PrewarmPool::spawn(worker_count, || {
+        // Loop prewarm keys are normally one-shot across many volumes/cuts.
+        // The overlay policy keeps only one moment cache and a 6 MiB sample
+        // budget per worker instead of giving every prewarmer the primary
+        // worker's 64 MiB private cache budget.
+        let cache_policy = RenderWorkerCachePolicy::detect(RenderWorkerCacheMode::Overlay);
+        let mut reusable_pixels = Vec::new();
+        let mut reusable_pixels_signature: Option<RenderWorkerViewportSignature> = None;
+        let mut moment_caches: Vec<RenderWorkerMomentCache> = Vec::new();
+        let mut sample_caches: Vec<RenderWorkerSampleCache> = Vec::new();
+        let mut geometry_caches: Vec<RenderWorkerGeometryCache> = Vec::new();
+        let mut last_direct_viewports: Vec<RenderWorkerViewportSignature> = Vec::new();
+        move |request: RenderRequest| {
+            let key = request.key.clone();
+            let pane = request.pane;
+            let result = ViewerApp::render_viewport_payload(
+                &request,
+                &mut reusable_pixels,
+                &mut reusable_pixels_signature,
+                &mut moment_caches,
+                &mut sample_caches,
+                &mut geometry_caches,
+                &mut last_direct_viewports,
+                cache_policy,
+            );
+            AsyncRenderResult { key, pane, result }
+        }
+    })
 }
 
 fn loop_render_cache_budget_bytes_for_threads(threads: usize) -> usize {
@@ -6483,7 +6452,7 @@ impl ViewerApp {
             .and_then(site_location)
             .unwrap_or((35.33305, -97.27775));
         let (render_sender, render_receiver, render_recycle_sender) = spawn_render_worker();
-        let (loop_prewarm_sender, loop_prewarm_receiver) = spawn_loop_prewarm_render_workers();
+        let loop_prewarm = spawn_loop_prewarm_render_workers();
         let hazard_path_text = String::new();
         let loaded_styles = styles::load();
         let style_registry = styles::StyleRegistry::from_settings(&loaded_styles.settings);
@@ -6552,8 +6521,7 @@ impl ViewerApp {
             render_receiver,
             render_recycle_sender,
             pending_render_key: None,
-            loop_prewarm_sender,
-            loop_prewarm_receiver,
+            loop_prewarm,
             loop_render_cache: VecDeque::new(),
             loop_render_cache_bytes: 0,
             loop_prewarm_inflight: Vec::new(),
@@ -11813,20 +11781,40 @@ impl ViewerApp {
         true
     }
 
-    fn poll_async_render(&mut self, ctx: &egui::Context) {
-        let mut saw_message = false;
-        // Frame budget: each install does a ColorImage conversion + texture
-        // upload (~ms each); with several panes the drain is no longer one
-        // message deep. Spill the rest to the next frame past the budget.
-        let drain_start = Instant::now();
+    /// THE per-frame render-result drain (spec §4.2 step 1): one entry point
+    /// serving every lane, replacing the pre-4a `poll_async_render` /
+    /// `poll_loop_prewarm_renders` / `poll_radar_layer_renders` trio.
+    ///
+    /// Invariants (budget values and stop/repaint rules are pinned in
+    /// `ui_core::render_service` tests):
+    /// - Lane order is fixed to the pre-4a call order: Primary (extra panes
+    ///   ride the primary channel), then Prewarm, then Overlay.
+    /// - Each lane keeps its OWN budget clock; the budgets are per-lane and
+    ///   deliberately not normalized (Primary 12 ms, Prewarm 8 ms, Overlay
+    ///   12 ms shared across all overlay layers).
+    /// - The prewarm drain stays separate (NOT unified): it fills
+    ///   `loop_render_cache` instead of installing textures.
+    fn drain_render_lanes(&mut self, ctx: &egui::Context) {
+        self.drain_primary_render_lane(ctx);
+        self.poll_loop_prewarm_renders(ctx);
+        self.drain_overlay_render_lanes(ctx);
+    }
+
+    /// `LaneId::Primary` (+ extra panes riding the same channel, routed by
+    /// `message.pane`). Frame budget: each install does a ColorImage
+    /// conversion + texture upload (~ms each); with several panes the drain
+    /// is no longer one message deep. Spill the rest to the next frame past
+    /// the budget.
+    fn drain_primary_render_lane(&mut self, ctx: &egui::Context) {
+        let mut budget = DrainBudget::for_lane(LaneId::Primary);
         loop {
-            if saw_message && drain_start.elapsed() > Duration::from_millis(12) {
+            if budget.should_stop() {
                 ctx.request_repaint();
                 break;
             }
             match self.render_receiver.try_recv() {
                 Ok(message) => {
-                    saw_message = true;
+                    budget.note_message();
                     if message.pane != 0 {
                         self.install_pane_render_result(ctx, message);
                         continue;
@@ -11861,29 +11849,36 @@ impl ViewerApp {
                         pane.pending_render_key = None;
                     }
                     self.status = "Render worker disconnected".to_owned();
-                    saw_message = true;
+                    budget.note_message();
                     break;
                 }
             }
         }
-        if saw_message {
-            ctx.request_repaint();
-        } else if self.pending_render_key.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(RENDER_RESULT_POLL_MS));
+        match post_drain_repaint(budget.saw_message(), self.pending_render_key.is_some()) {
+            RepaintDecision::Now => ctx.request_repaint(),
+            RepaintDecision::PollSoon => {
+                ctx.request_repaint_after(Duration::from_millis(RENDER_RESULT_POLL_MS));
+            }
+            RepaintDecision::Idle => {}
         }
     }
 
+    /// `LaneId::Prewarm`: loop-cache fills from the shared prewarm pool.
+    /// Moved-verbatim drain (spec §6 migration row `loop_prewarm_receiver`),
+    /// NOT unified with the lanes above — results land in
+    /// `loop_render_cache`, installing directly only when a result is the
+    /// exact frame playback is waiting on. Never schedules a follow-up poll:
+    /// prewarm results are opportunistic.
     fn poll_loop_prewarm_renders(&mut self, ctx: &egui::Context) {
-        let mut saw_message = false;
-        let drain_start = Instant::now();
+        let mut budget = DrainBudget::for_lane(LaneId::Prewarm);
         loop {
-            if saw_message && drain_start.elapsed() > Duration::from_millis(8) {
+            if budget.should_stop() {
                 ctx.request_repaint();
                 break;
             }
-            match self.loop_prewarm_receiver.try_recv() {
+            match self.loop_prewarm.try_recv() {
                 Ok(message) => {
-                    saw_message = true;
+                    budget.note_message();
                     self.loop_prewarm_inflight.retain(|key| key != &message.key);
                     if message.pane != LOOP_PREWARM_RENDER_PANE {
                         continue;
@@ -11913,23 +11908,28 @@ impl ViewerApp {
                 }
             }
         }
-        if saw_message {
+        if budget.saw_message() {
             ctx.request_repaint();
         }
     }
 
-    fn poll_radar_layer_renders(&mut self, ctx: &egui::Context) {
-        let mut saw_message = false;
-        let drain_start = Instant::now();
+    /// `LaneId::Overlay`: until the Phase-4b pool flip every radar overlay
+    /// layer still owns its worker + channel, but the drain is one pass —
+    /// ONE budget clock shared across all layers, so a burst on one layer
+    /// spills every later layer to the next frame.
+    fn drain_overlay_render_lanes(&mut self, ctx: &egui::Context) {
+        // The overlay budget is per-pass (shared by every layer); the lane
+        // id passed here does not affect it.
+        let mut budget = DrainBudget::for_lane(LaneId::Overlay(0));
         for layer in &mut self.radar_layers {
             loop {
-                if saw_message && drain_start.elapsed() > Duration::from_millis(12) {
+                if budget.should_stop() {
                     ctx.request_repaint();
                     return;
                 }
                 match layer.render_receiver.try_recv() {
                     Ok(message) => {
-                        saw_message = true;
+                        budget.note_message();
                         let is_latest = layer.pending_render_key.as_ref() == Some(&message.key);
                         match message.result {
                             Ok(rendered) if is_latest => {
@@ -11961,21 +11961,24 @@ impl ViewerApp {
                     Err(mpsc::TryRecvError::Disconnected) => {
                         layer.pending_render_key = None;
                         layer.status = "Layer render worker disconnected".to_owned();
-                        saw_message = true;
+                        budget.note_message();
                         break;
                     }
                 }
             }
         }
 
-        if saw_message {
-            ctx.request_repaint();
-        } else if self
-            .radar_layers
-            .iter()
-            .any(|layer| layer.pending_render_key.is_some())
-        {
-            ctx.request_repaint_after(Duration::from_millis(RENDER_RESULT_POLL_MS));
+        match post_drain_repaint(
+            budget.saw_message(),
+            self.radar_layers
+                .iter()
+                .any(|layer| layer.pending_render_key.is_some()),
+        ) {
+            RepaintDecision::Now => ctx.request_repaint(),
+            RepaintDecision::PollSoon => {
+                ctx.request_repaint_after(Duration::from_millis(RENDER_RESULT_POLL_MS));
+            }
+            RepaintDecision::Idle => {}
         }
     }
 
@@ -12539,7 +12542,7 @@ impl ViewerApp {
             }
             request.pane = LOOP_PREWARM_RENDER_PANE;
             let key = request.key.clone();
-            if self.loop_prewarm_sender.send(request).is_ok() {
+            if self.loop_prewarm.send(request).is_ok() {
                 self.loop_prewarm_inflight.push(key);
             } else {
                 self.loop_prewarm_inflight.clear();
@@ -17282,9 +17285,7 @@ impl eframe::App for ViewerApp {
         self.poll_radar_layer_loads(&ctx);
         self.poll_intl_radar_layer_loads(&ctx);
         self.drain_intl_loop_load(&ctx);
-        self.poll_async_render(&ctx);
-        self.poll_loop_prewarm_renders(&ctx);
-        self.poll_radar_layer_renders(&ctx);
+        self.drain_render_lanes(&ctx);
         self.poll_async_hazards(&ctx);
         // Always polled here, NOT in top_bar: the restart handoff after a
         // verified update swap must not stall while chrome is hidden
@@ -54213,15 +54214,9 @@ mod tests {
         assert!(Arc::ptr_eq(&decoded.volume, &cloned.volume));
     }
 
-    #[test]
-    fn loop_prewarm_workers_scale_with_cpu_budget() {
-        assert_eq!(loop_prewarm_worker_count(1), 1);
-        assert_eq!(loop_prewarm_worker_count(4), 2);
-        assert_eq!(loop_prewarm_worker_count(8), 3);
-        assert_eq!(loop_prewarm_worker_count(16), 4);
-        assert_eq!(loop_prewarm_worker_count(32), 4);
-        assert_eq!(loop_prewarm_inflight_limit(32), 8);
-    }
+    // `loop_prewarm_workers_scale_with_cpu_budget` moved to
+    // `ui_core::render_service` with the functions it pins (Phase 4a);
+    // the ui_core tables cover a superset of the cases asserted here.
 
     #[test]
     fn loop_render_cache_budget_scales_with_cpu_budget() {
@@ -68645,8 +68640,7 @@ mod tests {
             render_receiver,
             render_recycle_sender,
             pending_render_key: None,
-            loop_prewarm_sender: mpsc::channel::<RenderRequest>().0,
-            loop_prewarm_receiver: mpsc::channel::<AsyncRenderResult>().1,
+            loop_prewarm: PrewarmPool::disconnected(),
             loop_render_cache: VecDeque::new(),
             loop_render_cache_bytes: 0,
             loop_prewarm_inflight: Vec::new(),
