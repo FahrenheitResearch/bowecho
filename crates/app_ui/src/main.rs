@@ -16721,6 +16721,7 @@ impl ViewerApp {
         self.last_history_step = None;
         self.selected_cut = 0;
         self.realtime_level2_auto_refresh = false;
+        self.release_intl_primary_display();
         self.poll_active = false;
         self.history_frame_limit = self
             .history_frame_limit
@@ -17031,6 +17032,11 @@ impl ViewerApp {
         mode: LatestLoadMode,
     ) {
         let site_id = site.level2_id.clone();
+        if mode != LatestLoadMode::AutoRefresh {
+            // An explicit US pick takes display ownership from an
+            // international owner (the auto-refresh tick never steals it).
+            self.release_intl_primary_display();
+        }
         let paused_poll = latest_load_pauses_poll(mode, self.poll_active);
         if paused_poll {
             // Explicit primary intent takes the view from the custom-URL
@@ -21999,12 +22005,7 @@ impl ViewerApp {
                 } else {
                     self.selected_site_index = selected_site_index;
                     if primary_intl_source.is_some() {
-                        self.poll_active = false;
-                        self.poll_rx = None;
-                        self.intl_loop_rx = None;
-                        self.poll_last_file = None;
-                        self.poll_next = None;
-                        self.set_custom_url_poll_source();
+                        self.release_intl_primary_display();
                         self.status = "Selected CONUS radar; Load Latest/Loop now target that site"
                             .to_owned();
                     }
@@ -22180,14 +22181,7 @@ impl ViewerApp {
                 self.center_extra_pane_on_site(slot, &site);
             } else {
                 self.selected_site_index = index;
-                if primary_intl_source.is_some() {
-                    self.poll_active = false;
-                    self.poll_rx = None;
-                    self.intl_loop_rx = None;
-                    self.poll_last_file = None;
-                    self.poll_next = None;
-                    self.set_custom_url_poll_source();
-                }
+                self.release_intl_primary_display();
                 self.center_selected_site();
                 self.status = format!("Selected {}", format_site_label(&site));
             }
@@ -30892,6 +30886,25 @@ impl ViewerApp {
             return false;
         }
         true
+    }
+
+    /// Release an international display owner back to the US machinery —
+    /// display ownership follows the primary load, so every explicit US
+    /// latest/loop/archive load calls this (not just the SITE combo and
+    /// search paths, whose scattered inline copies latched a Euro owner
+    /// across map-marker/beam/favorite/event picks). No-op under a
+    /// custom-URL/US owner, preserving that flow's pause-and-resume
+    /// contract (`poll_url` + `poll_last_file` survive explicit loads).
+    fn release_intl_primary_display(&mut self) {
+        if !self.intl_source_owns_primary_display() {
+            return;
+        }
+        self.poll_active = false;
+        self.poll_rx = None;
+        self.intl_loop_rx = None;
+        self.poll_last_file = None;
+        self.poll_next = None;
+        self.set_custom_url_poll_source();
     }
 
     /// Pause/resume the international poll in place (the primary Live
@@ -62139,6 +62152,98 @@ mod tests {
             },
             "empty intl ids never own the display (matches intl_source_owns_primary_display)"
         );
+    }
+
+    /// Field report (v0.29.0-alpha.2): load a Euro archive, then map-click
+    /// a US site — the radar switched but the player, Event Loop Builder,
+    /// and Load Latest all still targeted the Euro site, because only the
+    /// SITE combo/search paths released the `PollSource::Intl` latch.
+    /// Ownership must follow the primary load: every explicit US
+    /// latest/loop load releases an international display owner.
+    #[test]
+    fn explicit_us_latest_load_releases_an_intl_display_owner() {
+        use data_source::sites::SiteRef;
+
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![RadarSite::new("KTLX")];
+        app.selected_site_index = 0;
+        // A Swedish ARCHIVE session owns the display (poll inactive), with
+        // in-flight intl loop state that must not install under a new owner.
+        app.set_intl_archive_primary_source("smhi", "sella");
+        let (_sender, receiver) = mpsc::channel();
+        app.intl_loop_rx = Some(receiver);
+        app.poll_last_file = Some("sella_0.h5".to_owned());
+        app.poll_next = Some(Instant::now() + Duration::from_secs(60));
+        assert!(app.intl_source_owns_primary_display());
+
+        let site = app.sites[0].clone();
+        app.start_latest_level2_load(site, &egui::Context::default());
+
+        assert!(
+            !app.intl_source_owns_primary_display(),
+            "an explicit US latest load takes display ownership"
+        );
+        assert!(matches!(app.poll_source, PollSource::CustomUrl(_)));
+        assert!(app.intl_loop_rx.is_none(), "in-flight intl loop dropped");
+        assert_eq!(app.poll_last_file, None);
+        assert_eq!(app.poll_next, None);
+        assert_eq!(
+            app.display_owner_site(),
+            SiteRef::Us {
+                level2_id: "KTLX".to_owned()
+            },
+            "player/builder/browser seams now seed the US site"
+        );
+
+        // The auto-refresh tick must never steal ownership: it is skipped
+        // under an intl owner, and even if it fired, a silent steal would
+        // race the live poll.
+        app.set_intl_archive_primary_source("smhi", "sella");
+        let site = app.sites[0].clone();
+        app.start_latest_level2_load_with_mode(
+            site,
+            &egui::Context::default(),
+            LatestLoadMode::AutoRefresh,
+        );
+        assert!(
+            app.intl_source_owns_primary_display(),
+            "auto-refresh never releases an intl owner"
+        );
+    }
+
+    /// Same latch at the US archive seam: event-track/point jumps and the
+    /// Event Loop Builder's US Build route through
+    /// `start_archive_window_load`, which paused the poll but left the
+    /// intl owner latched.
+    #[test]
+    fn us_archive_window_load_releases_an_intl_display_owner() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![RadarSite::new("KTLX")];
+        app.selected_site_index = 0;
+        app.set_intl_archive_primary_source("ord", "plbrz");
+        assert!(app.intl_source_owns_primary_display());
+
+        let anchor = Utc.with_ymd_and_hms(2026, 6, 9, 5, 51, 0).unwrap();
+        let context = ArchiveLoopContext::event(
+            anchor,
+            anchor,
+            anchor,
+            ArchiveLoopSource::EventPoint,
+            &app.app_settings,
+        );
+        let result = app.start_archive_window_load(
+            context,
+            "ownership test".to_owned(),
+            false,
+            &egui::Context::default(),
+        );
+        assert!(result.is_ok());
+
+        assert!(
+            !app.intl_source_owns_primary_display(),
+            "a US archive-window load takes display ownership"
+        );
+        assert!(matches!(app.poll_source, PollSource::CustomUrl(_)));
     }
 
     /// Unified Player End-at, intl arms: a no-archive display owner (DWD)
