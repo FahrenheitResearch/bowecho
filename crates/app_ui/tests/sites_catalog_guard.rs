@@ -20,11 +20,15 @@ use std::path::{Path, PathBuf};
 
 /// (file, whitespace-normalized `self.sites` occurrences,
 /// `intl_static_sites(` occurrences) — measured at the Phase-3 migration
-/// commit. Files not listed must contain ZERO of either.
-const PINNED: [(&str, usize, usize); 3] = [
+/// commit, re-pinned at the `sites_ui.rs` extraction (site-domain
+/// helpers moved out of main.rs; `sites_ui.rs` is the ONE app_ui module
+/// deliberately allowed to iterate the raw catalogs). Files not listed
+/// must contain ZERO of either.
+const PINNED: [(&str, usize, usize); 4] = [
     ("event_explorer.rs", 2, 0),
     ("layers_rail.rs", 2, 2),
-    ("main.rs", 52, 11),
+    ("main.rs", 51, 9),
+    ("sites_ui.rs", 2, 3),
 ];
 
 fn rust_sources(dir: &Path, files: &mut Vec<PathBuf>) {

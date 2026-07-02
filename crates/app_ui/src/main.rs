@@ -62,6 +62,7 @@ mod obs_soundings;
 mod placefiles;
 mod rhi;
 mod sat_worker;
+mod sites_ui;
 mod spc_layers;
 mod table_editor;
 mod taiwan_cwa;
@@ -74,6 +75,10 @@ mod vol3d;
 mod wofs;
 mod wofs_georef;
 
+use sites_ui::{
+    BeamCandidate, NearestOverlayTarget, nearest_overlay_dispatch, pin_intl_ids, pin_us_id,
+    radar_site_search_matches, us_site_kind,
+};
 use ui_core::geo::{aeqd_forward_km, aeqd_inverse_km};
 use ui_core::tiles;
 use ui_core::worker_slot::{SlotMessage, SlotPoll, StreamSlot, StreamState, WorkerSlot};
@@ -303,24 +308,6 @@ const DEBUG_ARCHIVE_CASES: &[DebugArchiveCase] = &[
         preferred_cut: 5,
     },
 ];
-
-/// One row of the lowest-beam ranking. Identity is a [`SiteRef`] — the
-/// v0.28 `BeamTarget::Conus(usize)` catalog index died in v0.29 Phase 3
-/// (string refs survive catalog reorder; kind decides the activation
-/// path). Beam height at 0.5° is pure geometry, so intl sites rank in
-/// the same lowest-beam list as WSR-88Ds (parity: international radars
-/// are not second-class).
-#[derive(Clone, Debug)]
-struct BeamCandidate {
-    site: data_source::sites::SiteRef,
-    /// Row head: site id (CONUS) or site/marker label.
-    label: String,
-    /// Weak provenance suffix for non-CONUS rows ("SMHI Sweden",
-    /// "research feed"); None for the home catalog.
-    origin: Option<String>,
-    beam_m: f32,
-    distance_km: f32,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RadarLabelStyle {
@@ -14054,16 +14041,6 @@ impl ViewerApp {
         }
     }
 
-    fn find_intl_site(
-        provider_id: &str,
-        site_id: &str,
-    ) -> Option<data_source::international::IntlSite> {
-        data_source::international::intl_static_sites()
-            .iter()
-            .find(|site| site.provider_id == provider_id && site.site_id == site_id)
-            .cloned()
-    }
-
     /// The installed international frame's provider identity for a pane —
     /// the auto-refresh dedupe key. The install path records it as the
     /// pane's `intl:{identity}` source path.
@@ -22399,7 +22376,7 @@ impl ViewerApp {
             }
         });
         let mut jump_to_place: Option<PlaceSearchResult> = None;
-        let mut jump_to_radar_site: Option<usize> = None;
+        let mut jump_to_radar_site: Option<SiteRef> = None;
         let mut jump_to_coordinate: Option<CoordinateMarker> = None;
         let (place_search_lat, place_search_lon) = site_control_pane
             .and_then(|slot| {
@@ -22443,8 +22420,8 @@ impl ViewerApp {
                     Ok(Some(coordinate)) => jump_to_coordinate = Some(coordinate.clone()),
                     Err(message) => self.status = message.clone(),
                     Ok(None) => {
-                        if let Some((index, _)) = radar_results.first() {
-                            jump_to_radar_site = Some(*index);
+                        if let Some((site, _)) = radar_results.first() {
+                            jump_to_radar_site = Some(site.clone());
                         } else {
                             jump_to_place = place_results.first().copied();
                         }
@@ -22482,13 +22459,17 @@ impl ViewerApp {
         if !radar_results.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = ROW_SPACING_X;
-                for (index, label) in &radar_results {
-                    if ui
-                        .small_button(label)
-                        .on_hover_text("Select and center this radar")
-                        .clicked()
-                    {
-                        jump_to_radar_site = Some(*index);
+                for (site, label) in &radar_results {
+                    // Both worlds in one row set (v0.29 Phase 3 gate: site
+                    // search offers intl radars); the hover says what the
+                    // pick does, because the intl world has no
+                    // selected-but-idle state — picking it polls.
+                    let hover = match site {
+                        SiteRef::Us { .. } => "Select and center this radar",
+                        SiteRef::Intl { .. } => "Center this radar and start its live poll",
+                    };
+                    if ui.small_button(label).on_hover_text(hover).clicked() {
+                        jump_to_radar_site = Some(site.clone());
                     }
                 }
             });
@@ -22512,18 +22493,8 @@ impl ViewerApp {
                 }
             });
         }
-        if let Some(index) = jump_to_radar_site
-            && let Some(site) = self.sites.get(index).cloned()
-        {
-            if let Some(slot) = site_control_pane {
-                self.set_extra_pane_selected_site(slot, index);
-                self.center_extra_pane_on_site(slot, &site);
-            } else {
-                self.selected_site_index = index;
-                self.release_intl_primary_display();
-                self.center_selected_site();
-                self.status = format!("Selected {}", format_site_label(&site));
-            }
+        if let Some(pick) = jump_to_radar_site {
+            self.activate_site_search_pick(&pick, site_control_pane, ui.ctx());
         }
         if let Some(result) = jump_to_place {
             if let Some(slot) = site_control_pane {
@@ -28510,50 +28481,6 @@ impl ViewerApp {
         });
     }
 
-    /// Lowest-beam radar candidates for a geo point across the primary
-    /// Level II site catalog, sorted by 0.5° beam height ascending (slant
-    /// range → 4/3-Earth beam height). Community/research feeds stay
-    /// explicit operator picks so Ctrl-click/right-click nearest does not
-    /// jump to non-NEXRAD feeds.
-    /// Geometry only — the terrain-blockage version needs a coverage
-    /// dataset. TDWRs (Txxx) have ~90 km range and C-band attenuation, so
-    /// they list in their own menu section ([`tdwr_candidates`]) instead
-    /// of competing in this ranking.
-    fn best_radar_candidates(&self, lat: f32, lon: f32) -> Vec<BeamCandidate> {
-        let beam_at = |distance_km: f32| {
-            radar_core::beam_height_above_radar_m(distance_km as f64 * 1000.0, 0.5) as f32
-        };
-        // ONE ranking over the union catalog (`sites_near`, v0.29 Phase 3):
-        // US and international sites compete on the same 460 km fence and
-        // the same 0.5° geometry — the lowest usable beam over Stockholm
-        // is an SMHI radar, not "no radar" (field report: the menu was
-        // dead across Europe/Australia/Japan). Explicit kind gate:
-        // research feeds stay operator picks; TDWRs rank in their own
-        // menu section.
-        let mut candidates: Vec<BeamCandidate> = data_source::sites::sites_near(lat, lon, 460.0)
-            .into_iter()
-            .filter_map(|(record, distance_km)| {
-                match record.kind {
-                    SiteKind::Wsr88d | SiteKind::Intl { .. } => {}
-                    SiteKind::Tdwr | SiteKind::Research => return None,
-                }
-                let label = match &record.site {
-                    SiteRef::Us { level2_id } => level2_id.clone(),
-                    SiteRef::Intl { .. } => record.label.clone(),
-                };
-                Some(BeamCandidate {
-                    site: record.site,
-                    label,
-                    origin: record.origin,
-                    beam_m: beam_at(distance_km),
-                    distance_km,
-                })
-            })
-            .collect();
-        candidates.sort_by(|a, b| a.beam_m.total_cmp(&b.beam_m));
-        candidates
-    }
-
     /// Switch to a beam-ranked pick. Explicit picks always win: the
     /// activation path replaces/clears in-flight receivers.
     fn activate_beam_target(&mut self, candidate: &BeamCandidate, ctx: &egui::Context) {
@@ -28633,85 +28560,67 @@ impl ViewerApp {
         }
     }
 
-    /// Nearby TDWRs for the context menu's own section: Txxx sites by
-    /// ground distance. TDWRs are C-band terminal radars with very low
-    /// tilts (0.1-0.6°) but ~90 km Doppler range and rain attenuation
-    /// (Vasiloff 2001 WAF; Istok et al. 2009, 25th IIPS), so they list
-    /// separately instead of competing in the lowest-beam ranking.
-    fn tdwr_candidates(&self, lat: f32, lon: f32) -> Vec<(SiteRef, String, f32)> {
-        // Union-catalog query, nearest first; explicit kind gate keeps
-        // exactly the catalog-data TDWRs.
-        data_source::sites::sites_near(lat, lon, 120.0)
-            .into_iter()
-            .filter_map(|(record, distance_km)| {
-                match record.kind {
-                    SiteKind::Tdwr => {}
-                    SiteKind::Wsr88d | SiteKind::Research | SiteKind::Intl { .. } => return None,
-                }
-                let SiteRef::Us { level2_id } = &record.site else {
-                    return None;
-                };
-                Some((record.site.clone(), level2_id.clone(), distance_km))
-            })
-            .collect()
-    }
-
-    fn community_feed_candidates(
-        &self,
-        lat: f32,
-        lon: f32,
-        max_km: f32,
-    ) -> Vec<(data_source::community_feeds::CommunityFeed, f32)> {
-        let mut candidates = data_source::community_feeds::community_feeds()
-            .iter()
-            .filter_map(|feed| {
-                let distance_km = haversine_km(lat, lon, feed.latitude_deg, feed.longitude_deg);
-                (distance_km <= max_km).then_some((*feed, distance_km))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| left.1.total_cmp(&right.1));
-        candidates
-    }
-
-    fn intl_radar_candidates(
-        &self,
-        lat: f32,
-        lon: f32,
-        max_km: f32,
-    ) -> Vec<(data_source::international::IntlSite, f32)> {
-        let mut candidates = data_source::international::intl_static_sites()
-            .iter()
-            .filter_map(|site| {
-                let (Some(site_lat), Some(site_lon)) = (site.latitude_deg, site.longitude_deg)
+    /// Dispatch a SITE-panel search-row pick, both worlds (v0.29 Phase 3
+    /// gate: site search offers intl radars). A US row keeps the v0.28
+    /// behavior exactly — select + center + release an international
+    /// display owner, no load starts. An intl row mirrors the beam-target
+    /// intl arm: center + start the live poll (there is no
+    /// selected-but-idle state in that world); a pane pick loads into the
+    /// pane being edited.
+    fn activate_site_search_pick(
+        &mut self,
+        pick: &SiteRef,
+        pane_slot: Option<usize>,
+        ctx: &egui::Context,
+    ) {
+        match pick {
+            SiteRef::Us { level2_id } => {
+                let Some((index, site)) = self
+                    .sites
+                    .iter()
+                    .enumerate()
+                    .find(|(_, site)| site.level2_id.eq_ignore_ascii_case(level2_id))
+                    .map(|(index, site)| (index, site.clone()))
                 else {
-                    return None;
+                    return;
                 };
-                let distance_km = haversine_km(lat, lon, site_lat, site_lon);
-                (distance_km <= max_km).then_some((site.clone(), distance_km))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| left.1.total_cmp(&right.1));
-        candidates
-    }
-
-    fn custom_poll_candidates(&self, lat: f32, lon: f32, max_km: f32) -> Vec<(usize, String, f32)> {
-        let mut candidates = self
-            .app_settings
-            .custom_poll_links
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                if custom_poll_entry_matches_community_feed(entry) {
-                    return None;
+                if let Some(slot) = pane_slot {
+                    self.set_extra_pane_selected_site(slot, index);
+                    self.center_extra_pane_on_site(slot, &site);
+                } else {
+                    self.selected_site_index = index;
+                    self.release_intl_primary_display();
+                    self.center_selected_site();
+                    self.status = format!("Selected {}", format_site_label(&site));
                 }
-                let (entry_lat, entry_lon) = custom_poll_entry_lat_lon(entry)?;
-                let distance_km = haversine_km(lat, lon, entry_lat, entry_lon);
-                (distance_km <= max_km)
-                    .then(|| (index, custom_poll_entry_label(entry), distance_km))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| left.2.total_cmp(&right.2));
-        candidates
+            }
+            SiteRef::Intl {
+                provider_id,
+                site_id,
+            } => {
+                let Some(site) = Self::find_intl_site(provider_id, site_id) else {
+                    self.status = format!("{site_id} is not in the international catalog");
+                    return;
+                };
+                if let Some(slot) = pane_slot {
+                    // Same path as an intl beam/marker pick in the pane
+                    // being edited (User mode re-centers the pane).
+                    self.start_extra_pane_intl_load(slot, site, LatestLoadMode::User, ctx);
+                    return;
+                }
+                // Same path as the DATA-tab intl picker: center + poll.
+                if let (Some(site_lat), Some(site_lon)) = (site.latitude_deg, site.longitude_deg) {
+                    self.center_map_on(site_lat, site_lon);
+                }
+                self.start_intl_poll(site.provider_id.to_owned(), site.site_id.clone(), ctx);
+                self.status = format!(
+                    "Polling {} · {}",
+                    site.label,
+                    intl_provider_label(site.provider_id)
+                );
+                ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+            }
+        }
     }
 
     /// Ctrl+click: jump straight to the context menu's #1 pick — the
@@ -41352,51 +41261,6 @@ fn coordinate_marker_status_label(marker: &CoordinateMarker) -> String {
     }
 }
 
-fn radar_site_search_matches(
-    query: &str,
-    sites: &[RadarSite],
-    limit: usize,
-) -> Vec<(usize, String)> {
-    let compact = query
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect::<String>()
-        .to_ascii_uppercase();
-    if compact.len() < 2 || limit == 0 {
-        return Vec::new();
-    }
-    let no_k_query = compact.strip_prefix('K').unwrap_or(&compact);
-    let mut matches = sites
-        .iter()
-        .enumerate()
-        .filter_map(|(index, site)| {
-            let id = site.level2_id.to_ascii_uppercase();
-            let no_k_id = id.strip_prefix('K').unwrap_or(&id);
-            let score = if id == compact {
-                0
-            } else if no_k_id == no_k_query {
-                1
-            } else if id.starts_with(&compact) || no_k_id.starts_with(no_k_query) {
-                2
-            } else {
-                return None;
-            };
-            Some((score, index, format_site_label(site)))
-        })
-        .collect::<Vec<_>>();
-    matches.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.2.cmp(&right.2))
-            .then_with(|| left.1.cmp(&right.1))
-    });
-    matches.truncate(limit);
-    matches
-        .into_iter()
-        .map(|(_, index, label)| (index, label))
-        .collect()
-}
-
 fn place_search_sources(country_filter: Option<&'static str>) -> Vec<PlaceSearchSource> {
     let mut sources = Vec::new();
     let include_us = country_filter.is_none();
@@ -42347,27 +42211,6 @@ fn community_feed_for_site(
         .find(|feed| feed.id.eq_ignore_ascii_case(&site.level2_id))
 }
 
-/// [`SiteKind`] of a US-catalog [`RadarSite`], resolved against the one
-/// compiled-in catalog (`data_source::sites`) — the v0.29 Phase-3
-/// replacement for the deleted `site_is_tdwr` `'T'`-prefix heuristic and
-/// `site_is_primary_level2_catalog_site`. Classification is CATALOG DATA
-/// now (TJUA's WSR-88D exception, the TDWR table, community research
-/// feeds), so the JMA TAKA/TANE/TOJI prefix-leak class is gone for good.
-///
-/// Ids the catalog does not know (a brand-new site surfacing in an S3
-/// listing before the embedded table updates, test fixtures) classify as
-/// [`SiteKind::Wsr88d`] — the permissive default that keeps them
-/// selectable and rankable, matching how v0.28 treated any unknown
-/// non-`T` id. Mobile radars (DOW/COW) stay volume-only and never enter
-/// `self.sites`, so they never reach this gate.
-fn us_site_kind(site: &RadarSite) -> SiteKind {
-    data_source::sites::resolve(&SiteRef::Us {
-        level2_id: site.level2_id.clone(),
-    })
-    .map(|record| record.kind)
-    .unwrap_or(SiteKind::Wsr88d)
-}
-
 /// The poll source a fresh session restores from the persisted display
 /// owner (v0.29 Phase 3 §1.4): a resolvable international owner re-arms
 /// its provider/site — poll NOT active, nothing auto-starts at startup,
@@ -42402,25 +42245,6 @@ enum CoordinatedOverlaySite {
     Intl(data_source::international::IntlSite),
 }
 
-/// US level2 id of a [`SiteRef`], if it is a US ref.
-fn pin_us_id(pin: &SiteRef) -> Option<&str> {
-    match pin {
-        SiteRef::Us { level2_id } => Some(level2_id),
-        SiteRef::Intl { .. } => None,
-    }
-}
-
-/// `(provider_id, site_id)` of a [`SiteRef`], if it is an intl ref.
-fn pin_intl_ids(pin: &SiteRef) -> Option<(&str, &str)> {
-    match pin {
-        SiteRef::Us { .. } => None,
-        SiteRef::Intl {
-            provider_id,
-            site_id,
-        } => Some((provider_id, site_id)),
-    }
-}
-
 /// Grouped "International" section for a SITE combo (v0.29 Phase 3: both
 /// worlds in one picker): every provider's sites under a provenance
 /// header, in catalog/registry order, from the one union catalog.
@@ -42438,64 +42262,6 @@ fn intl_site_combo_section(ui: &mut egui::Ui, selected: &mut Option<SiteRef>) {
             last_origin = record.origin.clone();
         }
         ui.selectable_value(selected, Some(record.site.clone()), record.label.clone());
-    }
-}
-
-/// What a Ctrl+right-click "add nearest radar overlay" resolves to.
-#[derive(Clone, Debug, PartialEq)]
-enum NearestOverlayTarget {
-    /// Index into the primary US Level II site catalog.
-    Us(usize),
-    /// International static-catalog site.
-    Intl(data_source::international::IntlSite),
-}
-
-/// Overlay adds share the context menu's 460 km fence: a click with
-/// nothing in range must be an honest no-op, never a transatlantic layer.
-const NEAREST_OVERLAY_MAX_KM: f32 = 460.0;
-
-/// Pure v0.21 dispatch for Ctrl+right-click overlay adds: the nearest
-/// primary-catalog US site vs the nearest international site by ground
-/// distance, whichever is closer, both capped at
-/// [`NEAREST_OVERLAY_MAX_KM`]. `None` = nothing in range.
-fn nearest_overlay_dispatch(
-    sites: &[RadarSite],
-    intl_sites: &[data_source::international::IntlSite],
-    lat: f32,
-    lon: f32,
-) -> Option<NearestOverlayTarget> {
-    let us = sites
-        .iter()
-        .enumerate()
-        // Overlay adds accept the whole NEXRAD/TDWR program; research
-        // feeds stay explicit operator picks (explicit kind gate).
-        .filter(|(_, site)| match us_site_kind(site) {
-            SiteKind::Wsr88d | SiteKind::Tdwr => true,
-            SiteKind::Research | SiteKind::Intl { .. } => false,
-        })
-        .filter_map(|(index, site)| {
-            let (site_lat, site_lon) = site_location(site)?;
-            let distance_km = haversine_km(lat, lon, site_lat, site_lon);
-            (distance_km <= NEAREST_OVERLAY_MAX_KM).then_some((index, distance_km))
-        })
-        .min_by(|left, right| left.1.total_cmp(&right.1));
-    let intl = intl_sites
-        .iter()
-        .filter_map(|site| {
-            let (Some(site_lat), Some(site_lon)) = (site.latitude_deg, site.longitude_deg) else {
-                return None;
-            };
-            let distance_km = haversine_km(lat, lon, site_lat, site_lon);
-            (distance_km <= NEAREST_OVERLAY_MAX_KM).then_some((site, distance_km))
-        })
-        .min_by(|left, right| left.1.total_cmp(&right.1));
-    match (us, intl) {
-        (Some((index, us_km)), Some((_, intl_km))) if us_km <= intl_km => {
-            Some(NearestOverlayTarget::Us(index))
-        }
-        (Some((index, _)), None) => Some(NearestOverlayTarget::Us(index)),
-        (_, Some((site, _))) => Some(NearestOverlayTarget::Intl(site.clone())),
-        (None, None) => None,
     }
 }
 
@@ -52896,6 +52662,107 @@ mod tests {
             "No WSR-88D or international radar within 460 km of your click"
         );
         assert!(!app.poll_active);
+    }
+
+    /// A US search-row pick keeps the exact v0.28 semantics: select +
+    /// center + release an international display owner — and it must NOT
+    /// start a load (search picks arm the site; Load Latest/Loop act).
+    #[test]
+    fn site_search_us_pick_selects_and_releases_an_intl_display_owner() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![
+            RadarSite::new("KEAX").with_location(
+                Some("Kansas City".to_owned()),
+                Some(38.810),
+                Some(-94.264),
+            ),
+            RadarSite::new("KTLX").with_location(
+                Some("Oklahoma City".to_owned()),
+                Some(35.333),
+                Some(-97.278),
+            ),
+        ];
+        app.selected_site_index = 0;
+        app.set_intl_archive_primary_source("smhi", "sella");
+        assert!(app.intl_source_owns_primary_display());
+
+        app.activate_site_search_pick(
+            &SiteRef::Us {
+                level2_id: "KTLX".to_owned(),
+            },
+            None,
+            &egui::Context::default(),
+        );
+
+        assert_eq!(app.selected_site_index, 1);
+        assert!(
+            !app.intl_source_owns_primary_display(),
+            "a US search pick releases the intl display owner (the SITE \
+             search path was one of the original latch fixes)"
+        );
+        assert!(matches!(app.poll_source, PollSource::CustomUrl(_)));
+        assert!(
+            app.load_receiver.is_none(),
+            "search picks never start a load"
+        );
+        assert_eq!(app.status, "Selected KTLX Oklahoma City");
+        assert!((app.map_center_lat - 35.333).abs() < 0.01);
+        assert!((app.map_center_lon + 97.278).abs() < 0.01);
+    }
+
+    /// An intl search-row pick mirrors the beam-target intl arm: center
+    /// on the site and start its live poll (that world has no
+    /// selected-but-idle state). Unknown refs fail honestly.
+    #[test]
+    fn site_search_intl_pick_centers_and_starts_intl_poll() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![RadarSite::new("KTLX").with_location(
+            Some("Oklahoma City".to_owned()),
+            Some(35.333),
+            Some(-97.278),
+        )];
+        let ctx = egui::Context::default();
+
+        app.activate_site_search_pick(
+            &SiteRef::Intl {
+                provider_id: "smhi".to_owned(),
+                site_id: "angelholm".to_owned(),
+            },
+            None,
+            &ctx,
+        );
+
+        assert!(app.poll_active, "intl search pick must arm the poll");
+        assert!(
+            matches!(
+                &app.poll_source,
+                PollSource::Intl { provider_id, site_id }
+                    if provider_id == "smhi" && site_id == "angelholm"
+            ),
+            "intl search pick routes to the intl poller, got {:?}",
+            app.poll_source
+        );
+        assert!(
+            app.status.starts_with("Polling"),
+            "status reports the poll: {}",
+            app.status
+        );
+        let site = ViewerApp::find_intl_site("smhi", "angelholm").expect("catalog site");
+        assert!((app.map_center_lat - site.latitude_deg.expect("lat")).abs() < 0.01);
+        assert!((app.map_center_lon - site.longitude_deg.expect("lon")).abs() < 0.01);
+
+        // A stale/unknown intl ref reports honestly and never polls.
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.activate_site_search_pick(
+            &SiteRef::Intl {
+                provider_id: "smhi".to_owned(),
+                site_id: "gone".to_owned(),
+            },
+            None,
+            &ctx,
+        );
+        assert!(!app.poll_active);
+        assert_eq!(app.status, "gone is not in the international catalog");
     }
 
     #[test]
@@ -65781,8 +65648,12 @@ mod tests {
         );
     }
 
+    /// Was `radar_site_search_accepts_full_or_short_level2_ids` — same
+    /// matching contract (full "KTLX" and short "TLX" both hit), but rows
+    /// are now `SiteRef`s instead of US-catalog indices (v0.29 Phase 3:
+    /// index identity died with `BeamTarget::Conus`).
     #[test]
-    fn radar_site_search_accepts_full_or_short_level2_ids() {
+    fn radar_site_search_matches_full_or_short_us_ids_as_site_refs() {
         let sites = vec![
             data_source::RadarSite {
                 level2_id: "KFDR".to_owned(),
@@ -65798,8 +65669,69 @@ mod tests {
             },
         ];
 
-        assert_eq!(radar_site_search_matches("ktlx", &sites, 4)[0].0, 1);
-        assert_eq!(radar_site_search_matches("tlx", &sites, 4)[0].0, 1);
+        let ktlx = SiteRef::Us {
+            level2_id: "KTLX".to_owned(),
+        };
+        let full = radar_site_search_matches("ktlx", &sites, 4);
+        assert_eq!(full[0].0, ktlx);
+        assert_eq!(full[0].1, "KTLX Oklahoma City");
+        assert_eq!(radar_site_search_matches("tlx", &sites, 4)[0].0, ktlx);
+    }
+
+    /// v0.29 Phase 3 gate tripwire: site search offers intl radars. The
+    /// union catalog's international rows match by site id or picker
+    /// label (case-insensitive; catalog case is preserved in the
+    /// returned ref — the settings-uppercasing trap, spec §1.1), carry
+    /// the provider origin in the row label, and lose exact-tier ties to
+    /// a US id hit (the v0.28 ordering for the US world is unchanged).
+    #[test]
+    fn radar_site_search_offers_intl_radars() {
+        let sites = vec![data_source::RadarSite::new("KTLX").with_location(
+            Some("Oklahoma City".to_owned()),
+            Some(35.33),
+            Some(-97.28),
+        )];
+
+        let angelholm = SiteRef::Intl {
+            provider_id: "smhi".to_owned(),
+            site_id: "angelholm".to_owned(),
+        };
+        // Full-id match, uppercase query: the returned ref keeps the
+        // catalog's lowercase site id.
+        let by_id = radar_site_search_matches("ANGELHOLM", &sites, 4);
+        assert_eq!(by_id[0].0, angelholm);
+        assert!(
+            by_id[0].1.contains("SMHI"),
+            "intl rows carry provider provenance, got {:?}",
+            by_id[0].1
+        );
+        // Label-prefix match reaches the same site ("Ängelholm" compacts
+        // to NGELHOLM — the id, not the label, matches "ange").
+        assert!(
+            radar_site_search_matches("ange", &sites, 8)
+                .iter()
+                .any(|(site, _)| site == &angelholm),
+            "prefix queries must offer intl radars"
+        );
+        // ORD sites match by their ODIM code too (behel = Helchteren,
+        // Belgium — a country with no native provider, so ORD owns it).
+        let by_code = radar_site_search_matches("behel", &sites, 4);
+        assert_eq!(
+            by_code.first().map(|(site, _)| site),
+            Some(&SiteRef::Intl {
+                provider_id: "ord".to_owned(),
+                site_id: "behel".to_owned(),
+            }),
+            "ORD codes resolve to intl rows, got {by_code:?}"
+        );
+        // A US short-id exact hit stays ranked above intl prefix hits:
+        // "tlx" is the no-K exact for KTLX and only a prefix elsewhere.
+        assert_eq!(
+            radar_site_search_matches("tlx", &sites, 4)[0].0,
+            SiteRef::Us {
+                level2_id: "KTLX".to_owned()
+            }
+        );
     }
 
     #[test]
