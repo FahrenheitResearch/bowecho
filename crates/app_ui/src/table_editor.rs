@@ -214,7 +214,8 @@ pub(crate) struct TableDraft {
 }
 
 /// Family-appropriate `Units:` suggestions; the first is the seed
-/// default. Only kt/mph scale values — the rest are legend labels.
+/// default. Only kt/mph/km/h scale values (see `unit_value_to_mps_scale`)
+/// — the rest are legend labels.
 fn units_for_family(family: ColorTableFamily) -> &'static [&'static str] {
     match family {
         ColorTableFamily::Reflectivity => &["dBZ"],

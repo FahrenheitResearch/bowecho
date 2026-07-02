@@ -56,18 +56,11 @@ fn rasterize_grid(
         ));
     }
 
-    let mut lat = Vec::with_capacity(expected);
-    let mut lon = Vec::with_capacity(expected);
-    for image_row in 0..grid.ny {
-        let source_y = grid.ny - 1 - image_row;
-        let row_lat = grid.start_lat + source_y as f32 * grid.resolution_deg;
-        for x in 0..grid.nx {
-            lat.push(row_lat);
-            lon.push(grid.start_lon + x as f32 * grid.resolution_deg);
-        }
-    }
-
-    if lat.iter().all(|value| !value.is_finite()) || lon.iter().all(|value| !value.is_finite()) {
+    let any_finite_lat =
+        (0..grid.ny).any(|y| (grid.start_lat + y as f32 * grid.resolution_deg).is_finite());
+    let any_finite_lon =
+        (0..grid.nx).any(|x| (grid.start_lon + x as f32 * grid.resolution_deg).is_finite());
+    if !any_finite_lat || !any_finite_lon {
         return Err("Taiwan CWA composite has no usable geolocation".to_owned());
     }
     let identity = grid.source_identity();
@@ -243,6 +236,24 @@ mod tests {
             sample_reflectivity_color(&frame, 17.5, 115.0),
             egui::Color32::TRANSPARENT
         );
+    }
+
+    #[test]
+    fn taiwan_cwa_raster_rejects_non_finite_geolocation() {
+        let grid = data_source::grid_products::TaiwanCwaRadarGrid {
+            time: Utc.with_ymd_and_hms(2026, 6, 27, 2, 50, 0).unwrap(),
+            nx: 2,
+            ny: 2,
+            start_lon: f32::NAN,
+            start_lat: 18.0,
+            resolution_deg: 0.0125,
+            units: "dBZ".to_owned(),
+            values: vec![10.0, 20.0, 30.0, 40.0],
+        };
+        match rasterize_grid(grid) {
+            Ok(_) => panic!("non-finite longitude must be rejected"),
+            Err(err) => assert!(err.contains("no usable geolocation"), "{err}"),
+        }
     }
 
     #[test]

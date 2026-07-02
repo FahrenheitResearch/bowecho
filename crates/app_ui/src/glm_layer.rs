@@ -51,8 +51,11 @@ pub struct GlmWorker {
     pub status_rx: mpsc::Receiver<String>,
     pub last_status: String,
     /// Cached flashes for the current read window + the read parameters
-    /// that produced them.
-    pub flashes: Vec<rw_glm::Flash>,
+    /// that produced them. Kept sorted ascending by `time_unix_ms`
+    /// (`ingest_flashes` restores the invariant), so `frame_flashes` can
+    /// binary-search the trailing display window instead of scanning the
+    /// whole read window — which for a long loop can be a week of flashes.
+    flashes: Vec<rw_glm::Flash>,
     pub fetched_at: Option<Instant>,
     pub last_read_count: usize,
     pub last_read_error: Option<String>,
@@ -238,20 +241,19 @@ impl GlmWorker {
                 Ok(flashes) => {
                     self.last_read_count = flashes.len();
                     self.last_read_error = None;
-                    self.latest_flash_time_ms =
-                        flashes.iter().map(|flash| flash.time_unix_ms).max();
+                    self.ingest_flashes(flashes);
+                    self.latest_flash_time_ms = self.flashes.last().map(|flash| flash.time_unix_ms);
                     if got_event {
                         append_glm_debug(
                             &self.store_root,
                             &self.satellite,
                             format!(
                                 "read window {t0}..{t1} count={} latest={:?}",
-                                flashes.len(),
+                                self.flashes.len(),
                                 self.latest_flash_time_ms
                             ),
                         );
                     }
-                    self.flashes = flashes;
                     self.last_read_range_ms = requested_range;
                 }
                 Err(error) => {
@@ -299,22 +301,46 @@ impl GlmWorker {
         self.ignore_flashes_before_ms
     }
 
+    /// Install a fresh store read as the flash cache, restoring the
+    /// ascending-time invariant `frame_flashes` binary-searches on.
+    /// `rw_glm::read_flashes` already returns ascending time order (buckets
+    /// visited ascending, records sorted within each bucket by the store
+    /// writer), so the sort normally never runs — the O(n) sortedness check
+    /// guards against an upstream ordering change silently breaking the
+    /// range queries. Stable sort so equal-time flashes keep arrival order.
+    fn ingest_flashes(&mut self, mut flashes: Vec<rw_glm::Flash>) {
+        if !flashes.is_sorted_by_key(|flash| flash.time_unix_ms) {
+            flashes.sort_by_key(|flash| flash.time_unix_ms);
+        }
+        self.flashes = flashes;
+    }
+
     /// Flashes valid for a frame at `frame_ms`: trailing display window
     /// (`window_min` minutes, the style registry's `glm.window_minutes`),
     /// QC-filtered. Age returned as 0..1 (0 = newest).
+    ///
+    /// `flashes` is sorted ascending by time, so the window
+    /// `[frame_ms - window_ms, frame_ms]` is a contiguous slice located by
+    /// two binary searches — O(log n + matches) per repaint instead of a
+    /// linear scan of the whole read window.
     pub fn frame_flashes(
         &self,
         frame_ms: i64,
         window_min: i64,
     ) -> impl Iterator<Item = (&rw_glm::Flash, f32)> {
         let window_ms = window_min.max(1) * 60_000;
-        self.flashes.iter().filter_map(move |flash| {
+        let start = self
+            .flashes
+            .partition_point(|flash| flash.time_unix_ms < frame_ms.saturating_sub(window_ms));
+        let end = self
+            .flashes
+            .partition_point(|flash| flash.time_unix_ms <= frame_ms);
+        self.flashes[start..end].iter().filter_map(move |flash| {
             if flash.is_degraded() {
                 return None;
             }
             let age_ms = frame_ms - flash.time_unix_ms;
-            (age_ms >= 0 && age_ms <= window_ms)
-                .then_some((flash, age_ms as f32 / window_ms as f32))
+            Some((flash, age_ms as f32 / window_ms as f32))
         })
     }
 
@@ -701,6 +727,126 @@ mod tests {
         let (t0, t1) = requested_read_range_ms(Some((now_ms, now_ms + 3_600_000)), now_ms);
         assert_eq!(t0, now_ms);
         assert!(t1 <= now_ms + LIVE_READ_QUANTUM.as_millis() as i64);
+    }
+
+    fn test_flash(time_unix_ms: i64, flash_id: u32, degraded: bool) -> rw_glm::Flash {
+        rw_glm::Flash {
+            time_unix_ms,
+            lat: 35.0,
+            lon: -97.0,
+            energy: 1.0e-15,
+            area: 120.0,
+            flash_id,
+            flags: if degraded { 1 } else { 0 }, // bit 0 = degraded quality
+            duration_ms: 250,
+        }
+    }
+
+    /// The pre-index `frame_flashes` body: a linear scan of every cached
+    /// flash. Kept as the behavioral reference the indexed version must match.
+    fn linear_reference_selection(
+        flashes: &[rw_glm::Flash],
+        frame_ms: i64,
+        window_min: i64,
+    ) -> Vec<(u32, f32)> {
+        let window_ms = window_min.max(1) * 60_000;
+        flashes
+            .iter()
+            .filter_map(|flash| {
+                if flash.is_degraded() {
+                    return None;
+                }
+                let age_ms = frame_ms - flash.time_unix_ms;
+                (age_ms >= 0 && age_ms <= window_ms)
+                    .then_some((flash.flash_id, age_ms as f32 / window_ms as f32))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn glm_frame_flashes_indexed_matches_linear_scan_on_out_of_order_ingest() {
+        let frame_ms = 1_766_188_800_000_i64;
+        let window_min = 10_i64;
+        let window_ms = window_min * 60_000;
+        // Synthetic out-of-order set spanning both window edges exactly,
+        // interior hits, misses on both sides, a degraded flash inside the
+        // window, and a timestamp tie.
+        let raw = vec![
+            test_flash(frame_ms - window_ms / 2, 1, false), // interior hit
+            test_flash(frame_ms + 1, 2, false),             // after frame: miss
+            test_flash(frame_ms, 3, false),                 // at frame: hit, age 0
+            test_flash(frame_ms - window_ms, 4, false),     // oldest edge: hit, age 1
+            test_flash(frame_ms - window_ms - 1, 5, false), // too old: miss
+            test_flash(frame_ms - 90_000, 6, true),         // degraded inside: filtered
+            test_flash(frame_ms - 90_000, 7, false),        // tie with the degraded one
+            test_flash(frame_ms - window_ms * 3, 8, false), // deep history: miss
+        ];
+        let mut worker = GlmWorker::new_for_test("goes19", None);
+        worker.ingest_flashes(raw.clone());
+
+        // Ingest must restore the ascending-time invariant the binary search
+        // relies on — with the sort removed, partition_point on this
+        // out-of-order set returns wrong window bounds.
+        assert!(
+            worker.flashes.is_sorted_by_key(|flash| flash.time_unix_ms),
+            "ingest_flashes must leave the cache time-sorted"
+        );
+        assert_eq!(worker.flashes.len(), raw.len(), "ingest drops no flashes");
+
+        let indexed: Vec<(u32, f32)> = worker
+            .frame_flashes(frame_ms, window_min)
+            .map(|(flash, age)| (flash.flash_id, age))
+            .collect();
+        let reference = linear_reference_selection(&worker.flashes, frame_ms, window_min);
+
+        assert_eq!(
+            indexed, reference,
+            "indexed selection diverged from linear scan"
+        );
+        let ids: Vec<u32> = indexed.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![4, 1, 7, 3], "expected exact window membership");
+        assert_eq!(
+            indexed.first().unwrap().1,
+            1.0,
+            "oldest edge flash ages to 1.0"
+        );
+        assert_eq!(
+            indexed.last().unwrap().1,
+            0.0,
+            "frame-time flash ages to 0.0"
+        );
+    }
+
+    #[test]
+    fn glm_frame_flashes_indexed_matches_linear_scan_across_sweep() {
+        // Sweep frame times across a dense synthetic history (including
+        // duplicates and degraded flashes) so every partition boundary case
+        // gets exercised against the linear reference.
+        let base = 1_766_188_800_000_i64;
+        let mut raw = Vec::new();
+        for i in 0..500_i64 {
+            raw.push(test_flash(base + i * 7_000, i as u32, i % 11 == 0));
+            if i % 5 == 0 {
+                raw.push(test_flash(base + i * 7_000, 1000 + i as u32, false));
+            }
+        }
+        // Shuffle deterministically to force the ingest sort path.
+        raw.reverse();
+        raw.swap(3, 250);
+        let mut worker = GlmWorker::new_for_test("goes19", None);
+        worker.ingest_flashes(raw);
+
+        for step in [-2_i64, 0, 1, 137, 499] {
+            for offset in [-1_i64, 0, 1] {
+                let frame_ms = base + step * 7_000 + offset;
+                let indexed: Vec<(u32, f32)> = worker
+                    .frame_flashes(frame_ms, 5)
+                    .map(|(flash, age)| (flash.flash_id, age))
+                    .collect();
+                let reference = linear_reference_selection(&worker.flashes, frame_ms, 5);
+                assert_eq!(indexed, reference, "diverged at frame_ms={frame_ms}");
+            }
+        }
     }
 
     #[test]

@@ -42,6 +42,11 @@ const MIN_RECENT_LEVEL2_SITE_CATALOG_COUNT: usize = 100;
 /// TTL removes almost all 1 Hz prefix-list traffic without delaying rollover.
 const REALTIME_ACTIVE_IDS_LISTING_TTL: StdDuration = StdDuration::from_secs(10);
 const COMPLETED_VOLUME_CACHE_PER_SITE: usize = 8;
+/// How long a live (incomplete) volume's chunk listing may be served from
+/// cache. Dedupes the per-volume chunk LIST when several pollers watch the
+/// same site (primary pane at 1 s, live multi-panes and overlays at 5 s)
+/// while staying under the primary's 1 s cadence so it always re-lists.
+const REALTIME_LIVE_VOLUME_LISTING_TTL: StdDuration = StdDuration::from_millis(900);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RadarDataLevel {
@@ -774,8 +779,10 @@ pub fn latest_realtime_level2_volume(site: &str) -> Result<RealtimeLevel2Volume>
 
 /// Like [`latest_realtime_level2_volume`] with an explicit TTL for the
 /// per-site active-volume-id prefix listing. The live volume's chunk list is
-/// always fetched fresh; completed volumes are served from an immutable
-/// cache, since their chunk lists can never change again.
+/// memoized for at most `listing_ttl.min(REALTIME_LIVE_VOLUME_LISTING_TTL)`
+/// (pass [`StdDuration::ZERO`] to force fresh listings); completed volumes
+/// are served from an immutable cache, since their chunk lists can never
+/// change again.
 pub fn latest_realtime_level2_volume_with_listing_ttl(
     site: &str,
     listing_ttl: StdDuration,
@@ -798,6 +805,7 @@ fn resolve_latest_realtime_volume(
     listing_ttl: StdDuration,
 ) -> Result<(RealtimeLevel2Volume, bool)> {
     let site_prefix = format!("{site}/");
+    let live_listing_ttl = listing_ttl.min(REALTIME_LIVE_VOLUME_LISTING_TTL);
     let (active_ids, listing_was_cached) = match active_ids_cache().get(site, listing_ttl) {
         Some(ids) => (ids, true),
         None => {
@@ -826,7 +834,7 @@ fn resolve_latest_realtime_volume(
     for candidate_id in candidates {
         let volume = match completed_volume_cache().get(site, candidate_id) {
             Some(cached) => Ok(cached),
-            None => realtime_level2_volume_for_id(site, candidate_id)
+            None => realtime_level2_volume_for_id_memoized(site, candidate_id, live_listing_ttl)
                 .inspect(|volume| completed_volume_cache().insert(volume.clone())),
         };
         match volume {
@@ -859,7 +867,7 @@ fn resolve_latest_realtime_volume(
         return Ok((volume, listing_was_cached));
     }
 
-    realtime_level2_volume_for_id(site, volume_id)
+    realtime_level2_volume_for_id_memoized(site, volume_id, live_listing_ttl)
         .inspect(|volume| completed_volume_cache().insert(volume.clone()))
         .map(|volume| (volume, listing_was_cached))
         .map_err(|_| {
@@ -893,6 +901,23 @@ fn latest_realtime_volume_by_chunk_scan(site: &str) -> Result<RealtimeLevel2Volu
         bucket: LEVEL2_CHUNKS_BUCKET.to_owned(),
         prefix: site_prefix,
     })
+}
+
+/// [`realtime_level2_volume_for_id`] behind the short live-volume listing
+/// memo: within `max_age` of a fetch, pollers of the same (site, volume id)
+/// reuse the listing instead of issuing duplicate chunk LISTs. The lock is
+/// never held across the network fetch, so a race at most double-fetches;
+/// errors are never memoized.
+fn realtime_level2_volume_for_id_memoized(
+    site: &str,
+    volume_id: u16,
+    max_age: StdDuration,
+) -> Result<RealtimeLevel2Volume> {
+    if let Some(cached) = live_volume_listing_cache().get(site, volume_id, max_age) {
+        return Ok(cached);
+    }
+    realtime_level2_volume_for_id(site, volume_id)
+        .inspect(|volume| live_volume_listing_cache().insert(volume.clone()))
 }
 
 fn realtime_level2_volume_for_id(site: &str, volume_id: u16) -> Result<RealtimeLevel2Volume> {
@@ -1596,6 +1621,48 @@ fn completed_volume_cache() -> &'static CompletedVolumeCache {
     CACHE.get_or_init(CompletedVolumeCache::default)
 }
 
+/// Live (possibly incomplete) volume chunk listings keyed by (site, volume
+/// id). Unlike [`CompletedVolumeCache`] these listings can still grow, so an
+/// entry is only served while younger than the caller's TTL, which
+/// [`resolve_latest_realtime_volume`] caps at
+/// [`REALTIME_LIVE_VOLUME_LISTING_TTL`].
+#[derive(Default)]
+struct LiveVolumeListingCache {
+    entries: Mutex<BTreeMap<(String, u16), (RealtimeLevel2Volume, Instant)>>,
+}
+
+impl LiveVolumeListingCache {
+    fn get(
+        &self,
+        site: &str,
+        volume_id: u16,
+        max_age: StdDuration,
+    ) -> Option<RealtimeLevel2Volume> {
+        let entries = self.entries.lock().ok()?;
+        let (volume, fetched_at) = entries.get(&(site.to_owned(), volume_id))?;
+        (fetched_at.elapsed() < max_age).then(|| volume.clone())
+    }
+
+    fn insert(&self, volume: RealtimeLevel2Volume) {
+        if let Ok(mut entries) = self.entries.lock() {
+            // No entry is ever served past the cap TTL, so pruning here
+            // bounds the map to sites polled within the last TTL window.
+            entries.retain(|_, (_, fetched_at)| {
+                fetched_at.elapsed() < REALTIME_LIVE_VOLUME_LISTING_TTL
+            });
+            entries.insert(
+                (volume.site.clone(), volume.volume_id),
+                (volume, Instant::now()),
+            );
+        }
+    }
+}
+
+fn live_volume_listing_cache() -> &'static LiveVolumeListingCache {
+    static CACHE: OnceLock<LiveVolumeListingCache> = OnceLock::new();
+    CACHE.get_or_init(LiveVolumeListingCache::default)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct LatestObjectCacheKey {
     site: String,
@@ -1795,6 +1862,55 @@ mod tests {
         );
         let newest = COMPLETED_VOLUME_CACHE_PER_SITE as u16 + 2;
         assert_eq!(cache.get("KEAX", newest).map(|v| v.volume_id), Some(newest));
+    }
+
+    #[test]
+    fn live_volume_listing_cache_expires_by_ttl() {
+        let cache = LiveVolumeListingCache::default();
+        cache.insert(realtime_volume_fixture(7, false));
+        assert_eq!(
+            cache
+                .get("KEAX", 7, StdDuration::from_secs(60))
+                .map(|v| v.volume_id),
+            Some(7),
+            "live (incomplete) volumes must be memoizable"
+        );
+        // A zero max-age always re-lists.
+        assert!(cache.get("KEAX", 7, StdDuration::ZERO).is_none());
+    }
+
+    #[test]
+    fn live_volume_listing_cache_isolates_sites_and_volume_ids() {
+        let cache = LiveVolumeListingCache::default();
+        cache.insert(realtime_volume_fixture(7, false));
+        cache.insert(realtime_volume_fixture(8, true));
+        assert!(
+            cache.get("KTLX", 7, StdDuration::from_secs(60)).is_none(),
+            "cache leaked across sites"
+        );
+        assert!(
+            cache.get("KEAX", 9, StdDuration::from_secs(60)).is_none(),
+            "cache leaked across volume ids"
+        );
+        assert_eq!(
+            cache
+                .get("KEAX", 7, StdDuration::from_secs(60))
+                .map(|v| v.complete),
+            Some(false)
+        );
+        assert_eq!(
+            cache
+                .get("KEAX", 8, StdDuration::from_secs(60))
+                .map(|v| v.volume_id),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn live_volume_listing_ttl_stays_under_primary_poll_cadence() {
+        // The primary realtime poller ticks at 1 s and must never be served
+        // a memoized live listing across two of its own ticks.
+        assert!(REALTIME_LIVE_VOLUME_LISTING_TTL < StdDuration::from_secs(1));
     }
 
     #[test]

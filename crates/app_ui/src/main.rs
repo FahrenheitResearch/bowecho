@@ -1598,12 +1598,15 @@ struct ViewerApp {
     selected_cut: usize,
     selected_product: DisplayProduct,
     advanced_products_enabled: bool,
-    frame_history: Vec<FrameHistoryEntry>,
+    frame_history: FrameHistory,
     selected_frame_index: usize,
     low_sweep_disabled_cuts: BTreeSet<LowSweepCutKey>,
     manual_primary_cut_hold: Option<LowSweepCutKey>,
     product_cut_memory: BTreeMap<String, usize>,
-    loop_timeline_summary_cache: std::cell::RefCell<Option<LoopTimelineSummaryCache>>,
+    /// Per-target summary memo (primary + each pane), so Unified Player
+    /// queries against different targets stop evicting each other.
+    loop_timeline_summary_cache:
+        std::cell::RefCell<BTreeMap<LoopTimelineTarget, LoopTimelineSummaryCache>>,
     /// Raster tile basemap (satellite/streets/topo) under the radar.
     tile_layer: std::cell::RefCell<tiles::TileLayer>,
     basemap_style: tiles::TileStyle,
@@ -2602,16 +2605,148 @@ struct FrameHistoryEntry {
     source_label: String,
 }
 
+/// Monotonic source for [`FrameHistory`] generation stamps. Process-wide so
+/// a stamp value can never be reused by a different content snapshot: clones
+/// keep the stamp of the content they copied, and every mutation takes a
+/// fresh one. Equal stamps therefore guarantee equal contents, letting O(1)
+/// generation compares replace O(frames) re-hashing in cache keys.
+fn next_frame_history_generation() -> u64 {
+    static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `Vec<FrameHistoryEntry>` plus a generation stamp bumped on every mutable
+/// access, so the loop-timeline summary cache invalidates exactly when a
+/// history can have changed. `Deref` exposes the read-only Vec API; every
+/// mutation funnels through the bumping methods below (there is deliberately
+/// no `DerefMut`, so a forgotten bump is a compile error, not a stale cache).
+#[derive(Clone)]
+struct FrameHistory {
+    entries: Vec<FrameHistoryEntry>,
+    generation: u64,
+}
+
+impl FrameHistory {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            generation: next_frame_history_generation(),
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn bump_generation(&mut self) {
+        self.generation = next_frame_history_generation();
+    }
+
+    fn push(&mut self, entry: FrameHistoryEntry) {
+        self.bump_generation();
+        self.entries.push(entry);
+    }
+
+    fn remove(&mut self, index: usize) -> FrameHistoryEntry {
+        self.bump_generation();
+        self.entries.remove(index)
+    }
+
+    fn clear(&mut self) {
+        self.bump_generation();
+        self.entries.clear();
+    }
+
+    fn sort_by(&mut self, compare: impl FnMut(&FrameHistoryEntry, &FrameHistoryEntry) -> Ordering) {
+        self.bump_generation();
+        self.entries.sort_by(compare);
+    }
+
+    /// Mutable iteration bumps up front: callers may rewrite any entry
+    /// (upsert replace, advanced-product volume write-back), and a spurious
+    /// bump only costs one summary recompute — never a stale cache.
+    fn iter_mut(&mut self) -> std::slice::IterMut<'_, FrameHistoryEntry> {
+        self.bump_generation();
+        self.entries.iter_mut()
+    }
+}
+
+impl std::ops::Deref for FrameHistory {
+    type Target = Vec<FrameHistoryEntry>;
+
+    fn deref(&self) -> &Vec<FrameHistoryEntry> {
+        &self.entries
+    }
+}
+
+impl std::ops::Index<usize> for FrameHistory {
+    type Output = FrameHistoryEntry;
+
+    fn index(&self, index: usize) -> &FrameHistoryEntry {
+        &self.entries[index]
+    }
+}
+
+impl std::ops::IndexMut<usize> for FrameHistory {
+    fn index_mut(&mut self, index: usize) -> &mut FrameHistoryEntry {
+        self.bump_generation();
+        &mut self.entries[index]
+    }
+}
+
+impl From<Vec<FrameHistoryEntry>> for FrameHistory {
+    fn from(entries: Vec<FrameHistoryEntry>) -> Self {
+        Self {
+            entries,
+            generation: next_frame_history_generation(),
+        }
+    }
+}
+
+impl FromIterator<FrameHistoryEntry> for FrameHistory {
+    fn from_iter<I: IntoIterator<Item = FrameHistoryEntry>>(iter: I) -> Self {
+        Self::from(iter.into_iter().collect::<Vec<_>>())
+    }
+}
+
+impl<'a> IntoIterator for &'a FrameHistory {
+    type Item = &'a FrameHistoryEntry;
+    type IntoIter = std::slice::Iter<'a, FrameHistoryEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut FrameHistory {
+    type Item = &'a mut FrameHistoryEntry;
+    type IntoIter = std::slice::IterMut<'a, FrameHistoryEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LoopTimelineSummaryCacheKey {
     target: LoopTimelineTarget,
-    frame_signature: u64,
+    /// Generation stamp of the target's own frame history — the O(1)
+    /// stand-in for hashing every frame on every repaint.
+    frame_generation: u64,
     low_sweeps: bool,
     policy: SweepPolicy,
     disabled_cuts: BTreeSet<LowSweepCutKey>,
     selected_product: DisplayProduct,
+    /// A pane target's own product (its summary is driven by it);
+    /// `None` for the primary target.
+    pane_product: Option<DisplayProduct>,
     active_pane: usize,
     panel_count: usize,
+    /// `(owns_radar, product, history generation)` per extra pane —
+    /// populated only for the primary target while low-sweep looping
+    /// without advanced sweep control lets pane state steer the shared
+    /// driver product (`shared_low_sweep_driver_product`); empty otherwise
+    /// so pane mutations leave the other targets' cache entries alone.
     extra_panes: Vec<(bool, DisplayProduct, u64)>,
 }
 
@@ -2637,7 +2772,7 @@ struct LoopTimelineStep {
     low_sweep_rank: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum LoopTimelineTarget {
     Primary,
     ExtraPane(usize),
@@ -2659,6 +2794,10 @@ struct FrameIdentity {
     scan_time_utc: DateTime<Utc>,
 }
 
+/// Content hash of a frame history. Superseded in the summary cache key by
+/// `FrameHistory::generation` (O(1) per repaint); kept for the regression
+/// test pinning that a replaced volume Arc changes the signature.
+#[cfg(test)]
 fn frame_history_signature(frames: &[FrameHistoryEntry]) -> u64 {
     let mut hasher = DefaultHasher::new();
     frames.len().hash(&mut hasher);
@@ -3535,7 +3674,10 @@ type RotationMarkersResult = (FrameWorkKey, Vec<RotationMarker>);
 /// (grid hash, inverse LUT) for the decoupled model geolocation.
 type ModelLutEntry = (String, Arc<model_layer::InverseLut>);
 type NativeSoundingResult = (
-    rustwx_sounding::NativeSounding,
+    // `None` when the request needs no sharprs parcel math: after the v0.28
+    // legacy-renderer deletion the built NativeSounding's only consumer is
+    // the hail-environment extraction in poll_native_sounding.
+    Option<rustwx_sounding::NativeSounding>,
     f32,
     Option<(rw_ui::SoundingData, rustwx_sounding::SoundingColumn)>,
 );
@@ -4113,7 +4255,7 @@ struct ViewPane {
     volume: Option<Arc<RadarVolume>>,
     source_path: Option<PathBuf>,
     load_timing: Option<LoadTimings>,
-    frame_history: Vec<FrameHistoryEntry>,
+    frame_history: FrameHistory,
     selected_frame_index: usize,
     history_playing: bool,
     browsing_history: bool,
@@ -4145,7 +4287,7 @@ impl ViewPane {
             volume: None,
             source_path: None,
             load_timing: None,
-            frame_history: Vec::new(),
+            frame_history: FrameHistory::new(),
             selected_frame_index: 0,
             history_playing: false,
             browsing_history: false,
@@ -6310,12 +6452,12 @@ impl ViewerApp {
             selected_cut: 0,
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
             advanced_products_enabled: false,
-            frame_history: Vec::new(),
+            frame_history: FrameHistory::new(),
             selected_frame_index: 0,
             low_sweep_disabled_cuts: BTreeSet::new(),
             manual_primary_cut_hold: None,
             product_cut_memory: BTreeMap::new(),
-            loop_timeline_summary_cache: std::cell::RefCell::new(None),
+            loop_timeline_summary_cache: std::cell::RefCell::new(BTreeMap::new()),
             tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(settings::tile_cache_dir())),
             basemap_style: tiles::TileStyle::DarkVector,
             italy_dpc_layer: None,
@@ -9095,7 +9237,7 @@ impl ViewerApp {
         let key = self.loop_timeline_summary_cache_key(target)?;
         {
             let cache = self.loop_timeline_summary_cache.borrow();
-            if let Some(cached) = cache.as_ref()
+            if let Some(cached) = cache.get(&target)
                 && cached.key == key
             {
                 return Some(cached.summary.clone());
@@ -9167,10 +9309,20 @@ impl ViewerApp {
             frame_step_counts,
             summary_window,
         };
-        *self.loop_timeline_summary_cache.borrow_mut() = Some(LoopTimelineSummaryCache {
-            key,
-            summary: summary.clone(),
+        let mut cache = self.loop_timeline_summary_cache.borrow_mut();
+        // Bounded: one entry per live target — drop entries for panes that
+        // no longer exist.
+        cache.retain(|cached_target, _| match *cached_target {
+            LoopTimelineTarget::Primary => true,
+            LoopTimelineTarget::ExtraPane(slot) => slot < self.extra_panes.len(),
         });
+        cache.insert(
+            target,
+            LoopTimelineSummaryCache {
+                key,
+                summary: summary.clone(),
+            },
+        );
         Some(summary)
     }
 
@@ -9178,30 +9330,60 @@ impl ViewerApp {
         &self,
         target: LoopTimelineTarget,
     ) -> Option<LoopTimelineSummaryCacheKey> {
-        let frames = self.loop_timeline_frames_for_target(target)?;
-        Some(LoopTimelineSummaryCacheKey {
-            target,
-            frame_signature: frame_history_signature(frames),
-            low_sweeps: self.app_settings.loop_low_sweeps,
-            policy: self.sweep_policy_for_target_product(
-                target,
-                &self.loop_timeline_product_for_target(target),
+        let low_sweeps = self.app_settings.loop_low_sweeps;
+        let (frame_generation, pane_product, policy) = match target {
+            LoopTimelineTarget::Primary => (
+                self.frame_history.generation(),
+                None,
+                // Equal to the policy for the resolved shared-driver
+                // product without paying its O(frames) resolution here:
+                // with advanced sweep control the driver IS the selected
+                // product, and without it the primary policy ignores the
+                // product entirely (legacy fallback).
+                self.primary_sweep_policy_for_product(&self.selected_product),
             ),
-            disabled_cuts: self.low_sweep_disabled_cuts.clone(),
-            selected_product: self.selected_product.clone(),
-            active_pane: self.active_pane,
-            panel_count: self.grid_layout.panel_count(),
-            extra_panes: self
-                .extra_panes
+            LoopTimelineTarget::ExtraPane(slot) => {
+                let pane = self.extra_panes.get(slot)?;
+                (
+                    pane.frame_history.generation(),
+                    Some(pane.product.clone()),
+                    self.extra_pane_sweep_policy_for_product(slot, &pane.product),
+                )
+            }
+        };
+        // Only the primary summary reads pane state (through
+        // shared_low_sweep_driver_product), and only while low-sweep
+        // looping runs without advanced sweep control — capture pane
+        // structure on exactly that path so pane history mutations don't
+        // evict the primary entry otherwise.
+        let extra_panes = if target == LoopTimelineTarget::Primary
+            && low_sweeps
+            && !self.advanced_sweep_control_enabled()
+        {
+            self.extra_panes
                 .iter()
                 .map(|pane| {
                     (
                         pane.owns_radar(),
                         pane.product.clone(),
-                        frame_history_signature(&pane.frame_history),
+                        pane.frame_history.generation(),
                     )
                 })
-                .collect(),
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Some(LoopTimelineSummaryCacheKey {
+            target,
+            frame_generation,
+            low_sweeps,
+            policy,
+            disabled_cuts: self.low_sweep_disabled_cuts.clone(),
+            selected_product: self.selected_product.clone(),
+            pane_product,
+            active_pane: self.active_pane,
+            panel_count: self.grid_layout.panel_count(),
+            extra_panes,
         })
     }
 
@@ -18472,7 +18654,7 @@ impl ViewerApp {
     }
 
     fn refresh_sweep_control_selection(&mut self, ctx: &egui::Context) {
-        self.loop_timeline_summary_cache.borrow_mut().take();
+        self.loop_timeline_summary_cache.borrow_mut().clear();
         self.select_first_history_low_sweep_if_enabled(ctx);
         for slot in 0..self.grid_layout.panel_count().saturating_sub(1) {
             self.select_first_extra_pane_low_sweep_if_enabled(slot, ctx);
@@ -28861,20 +29043,23 @@ impl ViewerApp {
                         .min_by(|a, b| a.0.total_cmp(&b.0))
                 })
                 .flatten();
+            // The sharprs parcel math is only consumed by the hail-env
+            // H0/H−20 extraction below — a plain model click just needs the
+            // (possibly obs-adjusted) display column, so skip that build.
+            let build_profile = self.hail_env_pending;
             thread::spawn(move || {
                 let compute_start = Instant::now();
                 // The adjusted display pair routes through set_native_column
                 // below, so the DISPLAYED skew-T shows the obs-adjusted
                 // profile — not just the hail-env consumer.
-                let result = build_native_sounding_adjusted_with_display(&data, adjust_ob).map(
-                    |(native, adjusted)| {
+                let result = build_native_sounding_for_request(&data, adjust_ob, build_profile)
+                    .map(|(native, adjusted)| {
                         (
                             native,
                             compute_start.elapsed().as_secs_f32() * 1000.0,
                             adjusted,
                         )
-                    },
-                );
+                    });
                 let _ = sender.send(result);
                 ctx_clone.request_repaint();
             });
@@ -28884,7 +29069,9 @@ impl ViewerApp {
                 Ok(Ok((native, compute_ms, external_sounding))) => {
                     self.native_sounding_rx = None;
                     self.sounding_compute_ms = Some(compute_ms);
-                    if self.hail_env_pending {
+                    if self.hail_env_pending
+                        && let Some(native) = &native
+                    {
                         // Hail-environment request: extract H0/H−20 and keep
                         // the window closed.
                         self.hail_env_pending = false;
@@ -28912,6 +29099,11 @@ impl ViewerApp {
                         ctx.request_repaint();
                         return;
                     }
+                    // A profile-less result while hail_env_pending is set
+                    // means a plain display request was already in flight
+                    // when the hail-env request arrived: open the viewer as
+                    // asked and keep the request pending for the compute
+                    // spawned from the hail-env dock reply.
                     if let Some((data, column)) = external_sounding {
                         self.native_sounding_panel.set_native_column(data, column);
                         self.sounding_viewer_source = SoundingViewerSource::NativeOnly;
@@ -31710,7 +31902,7 @@ impl ViewerApp {
                 let sounding_data =
                     raob_column_to_rw_sounding_data(&site, valid, &column, context)?;
                 Ok((
-                    native,
+                    Some(native),
                     compute_start.elapsed().as_secs_f32() * 1000.0,
                     Some((sounding_data, column)),
                 ))
@@ -44688,7 +44880,10 @@ fn build_native_sounding_adjusted(
 /// data, so the toggle only reaches the screen through the
 /// `set_native_column` path (as the RAOB flow already does). The header
 /// carries the adjusting station so the displayed title never lies about
-/// the surface source.
+/// the surface source. Production now calls
+/// `build_native_sounding_for_request` directly (the profile build is
+/// gated on the hail-env consumer); this always-build shape serves tests.
+#[cfg(test)]
 fn build_native_sounding_adjusted_with_display(
     data: &rw_ui::SoundingData,
     adjust: Option<(f32, obs::SurfaceOb)>,
@@ -44699,6 +44894,32 @@ fn build_native_sounding_adjusted_with_display(
     ),
     String,
 > {
+    let (native, adjusted_display) = build_native_sounding_for_request(data, adjust, true)?;
+    Ok((
+        native.expect("build_profile=true always builds the sharprs sounding"),
+        adjusted_display,
+    ))
+}
+
+/// `build_native_sounding_for_request` output: the sharprs sounding (only
+/// when requested) plus the obs-adjusted display pair (only when adjusted).
+type NativeSoundingBuild = (
+    Option<rustwx_sounding::NativeSounding>,
+    Option<(rw_ui::SoundingData, rustwx_sounding::SoundingColumn)>,
+);
+
+/// Core builder behind a model-sounding request. `build_profile` gates the
+/// sharprs `NativeSounding::from_column` parcel math: after the v0.28
+/// legacy-renderer deletion its only consumer is the hail-environment
+/// H0/H−20 extraction in `poll_native_sounding`, so a plain model click
+/// (no hail-env request pending) skips that work. The (possibly
+/// obs-adjusted) DISPLAY pair is built either way — the displayed skew-T
+/// must not change with the skip.
+fn build_native_sounding_for_request(
+    data: &rw_ui::SoundingData,
+    adjust: Option<(f32, obs::SurfaceOb)>,
+    build_profile: bool,
+) -> std::result::Result<NativeSoundingBuild, String> {
     // RH-only stores (GFS) get a synthesized dewpoint profile first.
     let synthesized = with_synthesized_dewpoint(data);
     let data = synthesized.as_ref().unwrap_or(data);
@@ -44718,15 +44939,20 @@ fn build_native_sounding_adjusted_with_display(
         }
         tag = Some(format!("{} obs-adj {:.0}km", ob.station_id, distance_km));
     }
-    let mut native =
-        rustwx_sounding::NativeSounding::from_column(&column).map_err(|err| err.to_string())?;
-    if let Some(tag) = &tag {
-        if native.metadata.station_id.is_empty() {
-            native.metadata.station_id = tag.clone();
-        } else {
-            native.metadata.station_id = format!("{} · {tag}", native.metadata.station_id);
+    let native = if build_profile {
+        let mut native =
+            rustwx_sounding::NativeSounding::from_column(&column).map_err(|err| err.to_string())?;
+        if let Some(tag) = &tag {
+            if native.metadata.station_id.is_empty() {
+                native.metadata.station_id = tag.clone();
+            } else {
+                native.metadata.station_id = format!("{} · {tag}", native.metadata.station_id);
+            }
         }
-    }
+        Some(native)
+    } else {
+        None
+    };
     let adjusted_display = tag.map(|tag| {
         let mut display_data = data.clone();
         display_data.hour.run = format!("{} · {tag}", display_data.hour.run);
@@ -51562,13 +51788,7 @@ mod tests {
         assert!(with_synthesized_dewpoint(&dry).is_none());
     }
 
-    /// The "Obs-adjusted soundings" toggle must reach the DISPLAYED skew-T:
-    /// the adjusted (data, column) pair feeds set_native_column, so the
-    /// panel's surface temperature equals the adjusting ob's and the header
-    /// names the station (v0.27.0 dock panel renders raw store data
-    /// otherwise, leaving the toggle a no-op on screen).
-    #[test]
-    fn obs_adjusted_sounding_reaches_the_displayed_panel() {
+    fn test_model_sounding_data() -> rw_ui::SoundingData {
         let levels = vec![1000u16, 925, 850, 700, 500, 400, 300, 250, 200];
         let var = |name: &str, units: &str, values: Vec<f32>| rw_ui::ProfileVar {
             name: name.to_owned(),
@@ -51581,7 +51801,7 @@ mod tests {
             units: units.to_owned(),
             value,
         };
-        let data = rw_ui::SoundingData {
+        rw_ui::SoundingData {
             hour: rw_ui::HourKey {
                 model: "hrrr".to_owned(),
                 run: "2026-06-24 22z".to_owned(),
@@ -51633,8 +51853,11 @@ mod tests {
                 surface("orography", "m", 380.0),
             ],
             read_ms: 0.0,
-        };
-        let ob = obs::SurfaceOb {
+        }
+    }
+
+    fn test_adjusting_surface_ob() -> obs::SurfaceOb {
+        obs::SurfaceOb {
             station_id: "KOUN".to_owned(),
             time_utc: None,
             lat: 35.24,
@@ -51648,7 +51871,18 @@ mod tests {
             completeness: 8,
             network: "METAR".to_owned(),
             elevation_m: None,
-        };
+        }
+    }
+
+    /// The "Obs-adjusted soundings" toggle must reach the DISPLAYED skew-T:
+    /// the adjusted (data, column) pair feeds set_native_column, so the
+    /// panel's surface temperature equals the adjusting ob's and the header
+    /// names the station (v0.27.0 dock panel renders raw store data
+    /// otherwise, leaving the toggle a no-op on screen).
+    #[test]
+    fn obs_adjusted_sounding_reaches_the_displayed_panel() {
+        let data = test_model_sounding_data();
+        let ob = test_adjusting_surface_ob();
 
         let (_, unadjusted) =
             build_native_sounding_adjusted_with_display(&data, None).expect("plain build");
@@ -51676,6 +51910,78 @@ mod tests {
             "{}",
             native.metadata.station_id
         );
+    }
+
+    /// A plain model click (no hail-env request pending) must not pay for
+    /// the sharprs parcel math: after the v0.28 legacy-renderer deletion
+    /// nothing consumes the NativeSounding on that path. The obs-adjusted
+    /// DISPLAY pair must be identical with and without the skip.
+    #[test]
+    fn plain_model_sounding_request_skips_the_sharprs_profile_build() {
+        let data = test_model_sounding_data();
+        let ob = test_adjusting_surface_ob();
+
+        let (native, display) =
+            build_native_sounding_for_request(&data, None, false).expect("plain build");
+        assert!(
+            native.is_none(),
+            "no consumer for the sharprs profile on a plain model click"
+        );
+        assert!(display.is_none());
+
+        // Obs-adjusted display path untouched by the skip.
+        let (native, display) = build_native_sounding_for_request(&data, Some((12.0, ob)), false)
+            .expect("adjusted build");
+        assert!(native.is_none());
+        let (display_data, column) = display.expect("adjusted display pair");
+        assert_eq!(column.temperature_c[0], 33.0);
+        assert_eq!(column.dewpoint_c[0], 21.5);
+        assert!(
+            display_data.hour.run.contains("KOUN obs-adj 12km"),
+            "{}",
+            display_data.hour.run
+        );
+
+        // The hail-env path still gets its profile.
+        let (native, _) =
+            build_native_sounding_for_request(&data, None, true).expect("hail-env build");
+        assert!(native.is_some());
+    }
+
+    /// poll_native_sounding's hail-env consumer with the Option profile:
+    /// a result carrying a profile satisfies the request (H0/H−20 set,
+    /// pending cleared), while a raced profile-less plain result leaves the
+    /// request pending for the compute spawned from the hail-env reply.
+    #[test]
+    fn hail_env_request_consumes_profile_and_survives_plain_results() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+
+        // Raced plain result: no profile — the request stays pending.
+        app.hail_env_pending = true;
+        let (sender, receiver) = mpsc::channel();
+        app.native_sounding_rx = Some(receiver);
+        sender.send(Ok((None, 1.0, None))).expect("send plain");
+        app.poll_native_sounding(&ctx);
+        assert!(app.native_sounding_rx.is_none());
+        assert!(
+            app.hail_env_pending,
+            "a profile-less result must not satisfy the hail-env request"
+        );
+
+        // A result with a profile satisfies it without opening the viewer.
+        app.hail_freezing_level_km = 0.0;
+        app.hail_minus20_level_km = 0.0;
+        let (native, _) =
+            build_native_sounding_for_request(&test_model_sounding_data(), None, true)
+                .expect("hail-env build");
+        let (sender, receiver) = mpsc::channel();
+        app.native_sounding_rx = Some(receiver);
+        sender.send(Ok((native, 1.0, None))).expect("send hail env");
+        app.poll_native_sounding(&ctx);
+        assert!(!app.hail_env_pending);
+        assert!(app.hail_freezing_level_km > 0.0);
+        assert!(app.hail_minus20_level_km > app.hail_freezing_level_km);
     }
 
     #[test]
@@ -55230,7 +55536,7 @@ mod tests {
         let cached_key = app
             .loop_timeline_summary_cache
             .borrow()
-            .as_ref()
+            .get(&LoopTimelineTarget::Primary)
             .expect("summary cached")
             .key
             .clone();
@@ -55242,12 +55548,317 @@ mod tests {
         assert_eq!(
             app.loop_timeline_summary_cache
                 .borrow()
-                .as_ref()
+                .get(&LoopTimelineTarget::Primary)
                 .expect("summary remains cached")
                 .key,
             cached_key,
             "low-sweep cut changes should not invalidate the timeline summary"
         );
+    }
+
+    /// Every frame-history mutation path must invalidate the timeline
+    /// summary cache. The cache key carries the history's generation stamp
+    /// instead of an O(frames) content hash, so a mutation path that forgot
+    /// to bump the generation would show up here as a stale step count.
+    #[test]
+    fn loop_timeline_summary_cache_invalidates_on_history_mutations() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_low_sweeps = true;
+        app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
+        app.selected_cut = 0;
+        let base = Utc.with_ymd_and_hms(2026, 6, 9, 5, 0, 0).unwrap();
+        let single_cut = |minutes: i64| {
+            let mut volume = test_velocity_sails_volume_with_radials(&[(0.5, 0)], 720);
+            volume.volume_time = base + chrono::Duration::minutes(minutes);
+            Arc::new(volume)
+        };
+        let sails = |minutes: i64| {
+            let mut volume = test_velocity_sails_volume_with_radials(
+                &[(0.5, 0), (0.5, 30_000), (0.5, 60_000)],
+                720,
+            );
+            volume.volume_time = base + chrono::Duration::minutes(minutes);
+            Arc::new(volume)
+        };
+        let frame_for = |volume: &Arc<RadarVolume>, path: &str| FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from(path),
+            volume: Arc::clone(volume),
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        };
+        let primary_steps = |app: &ViewerApp| {
+            app.loop_timeline_summary_for_target(LoopTimelineTarget::Primary)
+                .expect("primary summary")
+                .step_count
+        };
+
+        // Push: a new frame extends the summary.
+        let first = single_cut(0);
+        app.frame_history.push(frame_for(&first, "gen-push-1"));
+        assert_eq!(primary_steps(&app), 1);
+        let second = sails(5);
+        app.frame_history.push(frame_for(&second, "gen-push-2"));
+        assert_eq!(
+            primary_steps(&app),
+            4,
+            "push must invalidate the cached summary"
+        );
+
+        // Upsert-replace (live poll refetch): same identity, new volume Arc.
+        let refetched = sails(0);
+        let refetched_identity = frame_identity_for_volume(refetched.as_ref());
+        if let Some(existing) = app
+            .frame_history
+            .iter_mut()
+            .find(|frame| frame.identity == refetched_identity)
+        {
+            *existing = frame_for(&refetched, "gen-upsert");
+        }
+        assert_eq!(
+            primary_steps(&app),
+            6,
+            "replacing an entry's volume Arc must invalidate the cached summary"
+        );
+
+        // Advanced-product write-back: the volume Arc is swapped in place.
+        let derived = single_cut(5);
+        if let Some(frame) = app
+            .frame_history
+            .iter_mut()
+            .find(|frame| Arc::ptr_eq(&frame.volume, &second))
+        {
+            frame.volume = Arc::clone(&derived);
+        }
+        assert_eq!(
+            primary_steps(&app),
+            4,
+            "in-place volume write-back must invalidate the cached summary"
+        );
+
+        // Trim: the history limit clamps no lower than HISTORY_SIZE_OPTIONS[0].
+        app.frame_history
+            .push(frame_for(&single_cut(10), "gen-push-3"));
+        app.frame_history
+            .push(frame_for(&single_cut(15), "gen-push-4"));
+        assert_eq!(primary_steps(&app), 6);
+        app.history_frame_limit = HISTORY_SIZE_OPTIONS[0];
+        app.trim_frame_history();
+        assert_eq!(
+            primary_steps(&app),
+            3,
+            "trim must invalidate the cached summary"
+        );
+
+        // Clear (the site-switch path).
+        app.clear_frame_history();
+        assert_eq!(
+            primary_steps(&app),
+            0,
+            "clear must invalidate the cached summary"
+        );
+    }
+
+    /// The summary cache is per-target: while low-sweep looping is off the
+    /// primary summary cannot read pane state, so pane history mutations
+    /// must invalidate only the pane entry (and primary mutations only the
+    /// primary entry) instead of thrashing a shared slot.
+    #[test]
+    fn loop_timeline_summary_cache_is_per_target() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_low_sweeps = false;
+        app.app_settings.grid_pane_count = 2;
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        let base = Utc.with_ymd_and_hms(2026, 6, 9, 5, 0, 0).unwrap();
+        let frame_at = |minutes: i64, path: &str| {
+            let volume = Arc::new(RadarVolume::new(
+                radar_core::RadarSite::new("KTLX"),
+                base + chrono::Duration::minutes(minutes),
+            ));
+            FrameHistoryEntry {
+                identity: frame_identity_for_volume(volume.as_ref()),
+                path: PathBuf::from(path),
+                volume,
+                timings: None,
+                status: FrameStatus::Complete,
+                source_label: "test".to_owned(),
+            }
+        };
+        let steps = |app: &ViewerApp, target: LoopTimelineTarget| {
+            app.loop_timeline_summary_for_target(target)
+                .expect("summary")
+                .step_count
+        };
+        let cached_key = |app: &ViewerApp, target: LoopTimelineTarget| {
+            app.loop_timeline_summary_cache
+                .borrow()
+                .get(&target)
+                .expect("cached entry")
+                .key
+                .clone()
+        };
+
+        app.frame_history.push(frame_at(0, "per-target-primary-1"));
+        app.frame_history.push(frame_at(5, "per-target-primary-2"));
+        app.extra_panes[0]
+            .frame_history
+            .push(frame_at(0, "per-target-pane-1"));
+        assert_eq!(steps(&app, LoopTimelineTarget::Primary), 2);
+        assert_eq!(steps(&app, LoopTimelineTarget::ExtraPane(0)), 1);
+        let primary_key = cached_key(&app, LoopTimelineTarget::Primary);
+
+        // Pane push: the pane entry invalidates, the primary entry survives.
+        app.extra_panes[0]
+            .frame_history
+            .push(frame_at(5, "per-target-pane-2"));
+        assert_eq!(
+            steps(&app, LoopTimelineTarget::ExtraPane(0)),
+            2,
+            "pane push must invalidate the pane summary"
+        );
+        assert_eq!(
+            cached_key(&app, LoopTimelineTarget::Primary),
+            primary_key,
+            "pane push must not evict the primary entry"
+        );
+
+        // Primary push: the primary entry invalidates, the pane survives.
+        let pane_key = cached_key(&app, LoopTimelineTarget::ExtraPane(0));
+        app.frame_history.push(frame_at(10, "per-target-primary-3"));
+        assert_eq!(steps(&app, LoopTimelineTarget::Primary), 3);
+        assert_eq!(
+            cached_key(&app, LoopTimelineTarget::ExtraPane(0)),
+            pane_key,
+            "primary push must not evict the pane entry"
+        );
+    }
+
+    /// While low-sweep looping runs WITHOUT advanced sweep control, the
+    /// primary summary can resolve its driver product from pane state
+    /// (shared_low_sweep_driver_product), so pane history mutations must be
+    /// part of the primary key — a stale hit there is wrong timeline gating,
+    /// which is worse than one recompute.
+    #[test]
+    fn low_sweep_primary_summary_key_tracks_pane_histories() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.loop_low_sweeps = true;
+        app.app_settings.grid_pane_count = 2;
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        let base = Utc.with_ymd_and_hms(2026, 6, 9, 5, 0, 0).unwrap();
+        let frame_at = |minutes: i64, path: &str| {
+            let volume = Arc::new(RadarVolume::new(
+                radar_core::RadarSite::new("KTLX"),
+                base + chrono::Duration::minutes(minutes),
+            ));
+            FrameHistoryEntry {
+                identity: frame_identity_for_volume(volume.as_ref()),
+                path: PathBuf::from(path),
+                volume,
+                timings: None,
+                status: FrameStatus::Complete,
+                source_label: "test".to_owned(),
+            }
+        };
+        app.frame_history.push(frame_at(0, "driver-primary-1"));
+
+        let before = app
+            .loop_timeline_summary_cache_key(LoopTimelineTarget::Primary)
+            .expect("primary key");
+        app.extra_panes[0]
+            .frame_history
+            .push(frame_at(0, "driver-pane-1"));
+        let after = app
+            .loop_timeline_summary_cache_key(LoopTimelineTarget::Primary)
+            .expect("primary key");
+        assert_ne!(
+            before, after,
+            "low-sweep looping: pane history changes can steer the shared driver product"
+        );
+
+        // With low-sweep looping off the driver never consults panes, so
+        // the primary key deliberately carries no pane state.
+        app.app_settings.loop_low_sweeps = false;
+        let before = app
+            .loop_timeline_summary_cache_key(LoopTimelineTarget::Primary)
+            .expect("primary key");
+        app.extra_panes[0]
+            .frame_history
+            .push(frame_at(5, "driver-pane-2"));
+        let after = app
+            .loop_timeline_summary_cache_key(LoopTimelineTarget::Primary)
+            .expect("primary key");
+        assert_eq!(
+            before, after,
+            "plain looping: pane histories are not part of the primary key"
+        );
+    }
+
+    /// History mutations keep the report-gating reference honest: pushes
+    /// move the gate to the displayed scan time and a site-switch clear
+    /// removes it (shapes mirror
+    /// single_historical_frame_gates_reports_at_its_scan_time).
+    #[test]
+    fn timeline_report_reference_follows_history_mutations() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let first_time = Utc.with_ymd_and_hms(2024, 5, 20, 22, 0, 0).unwrap();
+        let second_time = first_time + chrono::Duration::minutes(5);
+        let first_volume = Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("KTLX"),
+            first_time,
+        ));
+        let second_volume = Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("KTLX"),
+            second_time,
+        ));
+        let frame_for = |volume: &Arc<RadarVolume>, path: &str| FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from(path),
+            volume: Arc::clone(volume),
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "test".to_owned(),
+        };
+
+        app.frame_history
+            .push(frame_for(&first_volume, "gate-2200"));
+        app.volume = Some(Arc::clone(&first_volume));
+        app.timeline_reports_reference_utc = app.timeline_report_reference_time_utc();
+        assert_eq!(app.timeline_reports_reference_utc, Some(first_time));
+
+        app.frame_history
+            .push(frame_for(&second_volume, "gate-2205"));
+        app.volume = Some(Arc::clone(&second_volume));
+        app.selected_frame_index = 1;
+        app.timeline_reports_reference_utc = app.timeline_report_reference_time_utc();
+        assert_eq!(app.timeline_reports_reference_utc, Some(second_time));
+        let contemporary = spc_layers::StormReport {
+            kind: spc_layers::ReportKind::Wind,
+            time_hhmm: "2200".to_owned(),
+            time_utc: second_time - chrono::Duration::minutes(5),
+            lat: 35.0,
+            lon: -97.0,
+            magnitude: "65".to_owned(),
+            location: "contemporary".to_owned(),
+            remark: String::new(),
+        };
+        let stale = spc_layers::StormReport {
+            time_hhmm: "1800".to_owned(),
+            time_utc: second_time - chrono::Duration::minutes(TIMELINE_REPORT_TRAILING_MINUTES + 1),
+            location: "stale".to_owned(),
+            ..contemporary.clone()
+        };
+        assert!(app.spc_report_visible_for_timeline(&contemporary));
+        assert!(!app.spc_report_visible_for_timeline(&stale));
+
+        // Site switch: cleared history + no volume returns to ungated live
+        // reports.
+        app.clear_frame_history();
+        app.volume = None;
+        app.timeline_reports_reference_utc = app.timeline_report_reference_time_utc();
+        assert_eq!(app.timeline_reports_reference_utc, None);
     }
 
     #[test]
@@ -57578,7 +58189,7 @@ mod tests {
         );
         layer.visible = true;
         layer.volume = Some(Arc::clone(&first));
-        layer.frame_history = app.frame_history.clone();
+        layer.frame_history = app.frame_history.to_vec();
         layer.texture_key = Some(test_screen_texture_key(
             Arc::as_ptr(&second) as usize,
             0,
@@ -58073,7 +58684,7 @@ mod tests {
         layer.visible = true;
         layer.timeline_sync = true;
         layer.volume = Some(Arc::clone(&first));
-        layer.frame_history = app.frame_history.clone();
+        layer.frame_history = app.frame_history.to_vec();
         layer.selected_frame_index = 0;
         let first_key = test_screen_texture_key(
             Arc::as_ptr(&first) as usize,
@@ -58126,14 +58737,14 @@ mod tests {
         let base = Utc.with_ymd_and_hms(2026, 6, 22, 12, 0, 0).unwrap();
         let primary = Arc::new(test_volume_with_site_time("KAAA", base));
         app.volume = Some(Arc::clone(&primary));
-        app.frame_history = vec![FrameHistoryEntry {
+        app.frame_history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(primary.as_ref()),
             path: PathBuf::from("primary-1200"),
             volume: primary,
             timings: None,
             status: FrameStatus::Complete,
             source_label: "test".to_owned(),
-        }];
+        }]);
 
         let future = Arc::new(test_volume_with_site_time(
             "KBBB",
@@ -58173,14 +58784,14 @@ mod tests {
         let target = base + chrono::Duration::minutes(8);
         let primary = Arc::new(test_volume_with_site_time("KAAA", target));
         app.volume = Some(Arc::clone(&primary));
-        app.frame_history = vec![FrameHistoryEntry {
+        app.frame_history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(primary.as_ref()),
             path: PathBuf::from("primary-1208"),
             volume: primary,
             timings: None,
             status: FrameStatus::Complete,
             source_label: "test".to_owned(),
-        }];
+        }]);
 
         let overlay = Arc::new(test_volume_with_site_time("KBBB", base));
         let mut layer = RadarOverlayLayer::new(56, RadarSite::new("KBBB"));
@@ -58204,14 +58815,14 @@ mod tests {
             base + chrono::Duration::seconds(COORDINATED_RADAR_MAX_STALENESS_SECONDS + 1),
         ));
         app.volume = Some(Arc::clone(&stale_primary));
-        app.frame_history = vec![FrameHistoryEntry {
+        app.frame_history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(stale_primary.as_ref()),
             path: PathBuf::from("primary-stale"),
             volume: stale_primary,
             timings: None,
             status: FrameStatus::Complete,
             source_label: "test".to_owned(),
-        }];
+        }]);
         app.sync_radar_overlay_layers_to_timeline(&egui::Context::default());
         assert!(app.radar_layers[0].volume.is_none());
     }
@@ -58230,14 +58841,14 @@ mod tests {
         let primary = Arc::new(primary);
         app.selected_cut = 1;
         app.volume = Some(Arc::clone(&primary));
-        app.frame_history = vec![FrameHistoryEntry {
+        app.frame_history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(primary.as_ref()),
             path: PathBuf::from("primary-low-sweeps"),
             volume: primary,
             timings: None,
             status: FrameStatus::Complete,
             source_label: "test".to_owned(),
-        }];
+        }]);
 
         let mut overlay =
             test_reflectivity_sails_volume_with_radials(&[(0.62, 5_000), (0.44, 25_000)], 720);
@@ -58274,14 +58885,14 @@ mod tests {
         let primary = Arc::new(primary);
         app.selected_cut = 0;
         app.volume = Some(Arc::clone(&primary));
-        app.frame_history = vec![FrameHistoryEntry {
+        app.frame_history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(primary.as_ref()),
             path: PathBuf::from("primary-family"),
             volume: primary,
             timings: None,
             status: FrameStatus::Complete,
             source_label: "test".to_owned(),
-        }];
+        }]);
 
         let mut overlay =
             test_reflectivity_sails_volume_with_radials(&[(0.48, 5_000), (1.20, 25_000)], 720);
@@ -58322,14 +58933,14 @@ mod tests {
         primary.volume_time = base;
         let primary = Arc::new(primary);
         app.volume = Some(Arc::clone(&primary));
-        app.frame_history = vec![FrameHistoryEntry {
+        app.frame_history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(primary.as_ref()),
             path: PathBuf::from("primary-vel-1200"),
             volume: primary,
             timings: None,
             status: FrameStatus::Complete,
             source_label: "test".to_owned(),
-        }];
+        }]);
 
         let mut previous = test_velocity_sails_volume_with_radials(&[(0.52, 30_000)], 720);
         previous.site = radar_core::RadarSite::new("KBBB");
@@ -58392,14 +59003,14 @@ mod tests {
         primary.volume_time = base;
         let primary = Arc::new(primary);
         app.volume = Some(Arc::clone(&primary));
-        app.frame_history = vec![FrameHistoryEntry {
+        app.frame_history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(primary.as_ref()),
             path: PathBuf::from("primary-range-vel-1200"),
             volume: primary,
             timings: None,
             status: FrameStatus::Complete,
             source_label: "test".to_owned(),
-        }];
+        }]);
 
         let mut previous = test_velocity_sails_volume_with_radials(&[(0.52, 30_000)], 720);
         previous.site = radar_core::RadarSite::new("KBBB");
@@ -65683,12 +66294,12 @@ mod tests {
             selected_cut: 0,
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
             advanced_products_enabled: false,
-            frame_history: Vec::new(),
+            frame_history: FrameHistory::new(),
             selected_frame_index: 0,
             low_sweep_disabled_cuts: BTreeSet::new(),
             manual_primary_cut_hold: None,
             product_cut_memory: BTreeMap::new(),
-            loop_timeline_summary_cache: std::cell::RefCell::new(None),
+            loop_timeline_summary_cache: std::cell::RefCell::new(BTreeMap::new()),
             tile_layer: std::cell::RefCell::new(tiles::TileLayer::new(settings::tile_cache_dir())),
             basemap_style: tiles::TileStyle::DarkVector,
             italy_dpc_layer: None,
