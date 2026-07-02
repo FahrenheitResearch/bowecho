@@ -1,0 +1,43 @@
+[package]
+name = "mini_ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "miniderecho"
+path = "src/main.rs"
+
+[dependencies]
+chrono.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+cache = { path = "../cache" }
+color_tables = { path = "../color_tables" }
+data_source = { path = "../data_source" }
+nexrad_io = { path = "../nexrad_io" }
+radar_core = { path = "../radar_core" }
+render2d = { path = "../render2d" }
+settings = { path = "../settings" }
+ui_core = { path = "../ui_core" }
+
+# B1 (docs/miniderecho-spec.md §1): desktop mini matches BowEcho's glow
+# eframe exactly; the iOS leg is wgpu → Metal because glutin 0.32 has no
+# iOS context-creation route. The iOS block is inert on desktop targets and
+# exists so the M1 macOS tripwire (`cargo check --target aarch64-apple-ios
+# -p mini_ui`) exercises it.
+#
+# Forbidden dependencies (the iOS RAM firewall, spec §2): `app_ui`, any
+# `rw-*` / `rustwx-*` / `sharprs` rusty-weather crate, `rfd`. Enforced by
+# tests/dependency_firewall.rs.
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+eframe = { workspace = true }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+eframe = { version = "0.34.3", default-features = false, features = ["wgpu", "wayland"] }
+
+[dev-dependencies]
+# B3: the shared slots' `inject_for_test` is visible to this crate's tests.
+ui_core = { path = "../ui_core", features = ["test-util"] }
