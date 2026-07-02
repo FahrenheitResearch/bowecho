@@ -5,5 +5,6 @@
 //! first consumer, mini_ui second.
 
 pub mod geo;
+pub mod render_service;
 pub mod tiles;
 pub mod worker_slot;
