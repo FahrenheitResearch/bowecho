@@ -1962,6 +1962,10 @@ struct ViewerApp {
     mping_enabled: bool,
     mping_fetched_at: Option<Instant>,
     mping_rx: Option<mpsc::Receiver<std::result::Result<Vec<mping::MpingReport>, String>>>,
+    /// Per-repaint memo of [`Self::timeline_report_reference_time_utc`] —
+    /// refreshed once at the top of `update()`; the per-report visibility
+    /// filters read this instead of recomputing the O(history) key.
+    timeline_reports_reference_utc: Option<DateTime<Utc>>,
     /// Event Explorer: dated reports/tornado-track day cache + the
     /// pending track-click loop window (src/event_explorer.rs).
     event_explorer: event_explorer::EventExplorerState,
@@ -6526,6 +6530,7 @@ impl ViewerApp {
             mping_enabled: restored_overlays.7,
             mping_fetched_at: None,
             mping_rx: None,
+            timeline_reports_reference_utc: None,
             event_explorer: event_explorer::EventExplorerState::default(),
             event_loop_builder: event_loop_builder::EventLoopBuilderState::default(),
             unified_player: unified_player::UnifiedPlayerState::default(),
@@ -9263,13 +9268,17 @@ impl ViewerApp {
         self.displayed_timeline_time_utc()
     }
 
+    // The two per-report filters below read the per-repaint memo
+    // (`timeline_reports_reference_utc`) — never the O(history) compute —
+    // because draw paths call them once per report per frame.
+
     pub(crate) fn spc_report_visible_for_timeline(&self, report: &spc_layers::StormReport) -> bool {
-        self.timeline_report_reference_time_utc()
+        self.timeline_reports_reference_utc
             .is_none_or(|time| report_visible_at_timeline_time(report.time_utc, time))
     }
 
     fn mping_report_visible_for_timeline(&self, report: &mping::MpingReport) -> bool {
-        self.timeline_report_reference_time_utc()
+        self.timeline_reports_reference_utc
             .is_none_or(|time| report_visible_at_timeline_time(report.obtime, time))
     }
 
@@ -17256,6 +17265,13 @@ impl eframe::App for ViewerApp {
         self.poll_spc_reports(&ctx);
         self.poll_event_day(&ctx);
         self.poll_mping(&ctx);
+        // Reports gate at ONE reference time per repaint. Computing it is
+        // O(total history frames) (the loop-timeline summary key hashes
+        // every frame), so the per-report visibility filters read this
+        // memo — recomputing per report froze map drags with the mPING or
+        // SPC reports layer on. Worst staleness is one paint if playback
+        // advances later in this same pass; the next repaint self-corrects.
+        self.timeline_reports_reference_utc = self.timeline_report_reference_time_utc();
         // Apply deferred layout changes FIRST — before anything paints.
         if let Some(layout) = self.pending_grid_layout.take() {
             self.grid_layout = layout;
@@ -18245,7 +18261,7 @@ impl ViewerApp {
             warnings_need_sync,
             spc_reports_enabled: self.spc_reports_enabled,
             mping_enabled: self.mping_enabled,
-            reports_timeline_time_utc: self.timeline_report_reference_time_utc(),
+            reports_timeline_time_utc: self.timeline_reports_reference_utc,
             satellite_map_follow: self.sat_map_follow,
             satellite_frame_label: self.unified_player_satellite_frame_label(),
             satellite_run_count: self.sat_run_listings.len(),
@@ -20604,6 +20620,22 @@ impl ViewerApp {
             let _ = self.app_settings.save();
             ctx.request_repaint();
         }
+        ui.horizontal(|ui| {
+            ui.label("Scroll zoom speed");
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.app_settings.zoom_speed_percent, 50..=300)
+                        .suffix("%")
+                        .show_value(true),
+                )
+                .on_hover_text(
+                    "How far one scroll-wheel notch zooms the map. 100% is the classic feel; the default 150% zooms half again faster.",
+                )
+                .changed()
+            {
+                let _ = self.app_settings.save();
+            }
+        });
         if ui
             .checkbox(
                 &mut self.app_settings.basemap_lightweight,
@@ -26456,7 +26488,7 @@ impl ViewerApp {
             if scroll != 0.0 {
                 let pointer = ui.input(|input| input.pointer.hover_pos());
                 let before = pointer.map(|position| self.screen_to_lon_lat(rect, position));
-                let factor = (1.0_f32 + scroll / 600.0).clamp(0.75, 1.35);
+                let factor = scroll_zoom_factor(scroll, self.app_settings.zoom_speed_percent);
                 self.clear_camera_follow_targets();
                 self.pause_loop_prewarm_for_interaction();
                 self.map_scale = (self.map_scale * factor).clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
@@ -26914,7 +26946,7 @@ impl ViewerApp {
                 if scroll != 0.0 {
                     let pointer = ui.input(|input| input.pointer.hover_pos());
                     let before = pointer.map(|position| self.screen_to_lon_lat(cell, position));
-                    let factor = (1.0_f32 + scroll / 600.0).clamp(0.75, 1.35);
+                    let factor = scroll_zoom_factor(scroll, self.app_settings.zoom_speed_percent);
                     self.clear_camera_follow_targets();
                     self.pause_loop_prewarm_for_interaction();
                     self.map_scale = (self.map_scale * factor).clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
@@ -35234,9 +35266,7 @@ impl ViewerApp {
         if !self.mping_enabled || self.mping_reports.is_empty() {
             return;
         }
-        let now = self
-            .timeline_report_reference_time_utc()
-            .unwrap_or_else(Utc::now);
+        let now = self.timeline_reports_reference_utc.unwrap_or_else(Utc::now);
         let mut visible: Vec<(&mping::MpingReport, egui::Pos2)> = Vec::new();
         let use_declutter = self.mping_reports.len() > MPING_DECLUTTER_REPORT_THRESHOLD
             || (self.map_scale < 35.0 && self.mping_reports.len() > MPING_LABEL_REPORT_LIMIT);
@@ -50639,6 +50669,16 @@ fn custom_poll_url_for_gis_site(base_url: &str, site_id: &str, total_sites: usiz
 // loop_speed_percent setting; unified_player owns the one formatter.
 use unified_player::loop_speed_label;
 
+/// Scroll-wheel zoom factor for one input event. The clamped base is the
+/// classic per-notch step; `zoom_speed_percent` is applied as an exponent
+/// (log-zoom scaling), so 100 reproduces the classic feel exactly, 150
+/// (default) zooms half again faster, and zoom-in/zoom-out stay symmetric.
+fn scroll_zoom_factor(scroll: f32, zoom_speed_percent: u16) -> f32 {
+    let base = (1.0_f32 + scroll / 600.0).clamp(0.75, 1.35);
+    let speed = (f32::from(zoom_speed_percent) / 100.0).clamp(0.25, 4.0);
+    base.powf(speed)
+}
+
 fn nearest_sat_frame_for_time(
     runs: &[rw_ui::SatRunListing],
     preferred_key: Option<&rw_ui::SatRunKey>,
@@ -59012,6 +59052,26 @@ mod tests {
     }
 
     #[test]
+    fn scroll_zoom_speed_scales_the_classic_step() {
+        let classic = |scroll: f32| (1.0_f32 + scroll / 600.0).clamp(0.75, 1.35);
+        // 100% reproduces the classic per-notch factor exactly.
+        for scroll in [-300.0, -60.0, 60.0, 300.0] {
+            assert!((scroll_zoom_factor(scroll, 100) - classic(scroll)).abs() < 1e-6);
+        }
+        // 150% (the default) zooms strictly faster both directions.
+        assert!(scroll_zoom_factor(120.0, 150) > classic(120.0));
+        assert!(scroll_zoom_factor(-120.0, 150) < classic(-120.0));
+        // Symmetric in log-zoom space: in then out at the same speed
+        // lands back where it started.
+        let round_trip = scroll_zoom_factor(120.0, 150) * scroll_zoom_factor(-120.0, 150);
+        let classic_round_trip = classic(120.0) * classic(-120.0);
+        assert!((round_trip - classic_round_trip.powf(1.5)).abs() < 1e-4);
+        // Degenerate settings are clamped, never zero/negative/runaway.
+        assert!(scroll_zoom_factor(600.0, 0) > 1.0);
+        assert!(scroll_zoom_factor(600.0, u16::MAX) < 4.0);
+    }
+
+    #[test]
     fn loop_speed_honors_super_long_loop_rates() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.app_settings.loop_speed_percent = 6400;
@@ -64548,6 +64608,8 @@ mod tests {
             ..visible.clone()
         };
 
+        // The draw-path filters read the per-repaint memo update() refreshes.
+        app.timeline_reports_reference_utc = app.timeline_report_reference_time_utc();
         assert!(app.spc_report_visible_for_timeline(&visible));
         assert!(!app.spc_report_visible_for_timeline(&stale));
         assert!(!app.spc_report_visible_for_timeline(&future));
@@ -64589,6 +64651,7 @@ mod tests {
             location: "contemporary".to_owned(),
             ..today.clone()
         };
+        app.timeline_reports_reference_utc = app.timeline_report_reference_time_utc();
         assert!(!app.spc_report_visible_for_timeline(&today));
         assert!(app.spc_report_visible_for_timeline(&contemporary));
     }
@@ -65839,6 +65902,7 @@ mod tests {
             mping_enabled: false,
             mping_fetched_at: None,
             mping_rx: None,
+            timeline_reports_reference_utc: None,
             event_explorer: event_explorer::EventExplorerState::default(),
             event_loop_builder: event_loop_builder::EventLoopBuilderState::default(),
             unified_player: unified_player::UnifiedPlayerState::default(),

@@ -303,10 +303,16 @@ pub struct AppSettings {
     #[serde(default = "default_cross_section_smoothing")]
     pub cross_section_smoothing: String,
     /// Loop playback speed in percent of the 700 ms/frame baseline
-    /// (100 = baseline, 200 = twice as fast). Drives history playback AND
-    /// the GIF/MP4 recorder's frame timing, so exports match the screen.
+    /// (100 = baseline, 200 = twice as fast). Screen playback only —
+    /// media exports have their own speed control.
     #[serde(default = "default_loop_speed_percent")]
     pub loop_speed_percent: u16,
+    /// Scroll-wheel zoom speed in percent. 100 keeps the classic
+    /// pre-v0.28.1 step; the 150 default zooms half again faster (field
+    /// feedback). Applied as an exponent on the per-notch zoom factor so
+    /// the feel scales smoothly in log-zoom space.
+    #[serde(default = "default_zoom_speed_percent")]
+    pub zoom_speed_percent: u16,
     /// During loop playback, step through complete low-level SAILS/MESO-SAILS
     /// sweeps inside each volume before moving to the next volume. The loop
     /// frame count remains the scan/volume count shown in the UI.
@@ -504,6 +510,10 @@ fn default_event_pad_frames() -> u16 {
     5
 }
 
+fn default_zoom_speed_percent() -> u16 {
+    150
+}
+
 fn default_event_max_frames() -> u16 {
     24
 }
@@ -652,6 +662,7 @@ impl Default for AppSettings {
             smooth_display_mode: String::new(),
             cross_section_smoothing: default_cross_section_smoothing(),
             loop_speed_percent: default_loop_speed_percent(),
+            zoom_speed_percent: default_zoom_speed_percent(),
             loop_low_sweeps: false,
             loop_low_sweep_filter: default_loop_low_sweep_filter(),
             loop_sweep_control: None,
