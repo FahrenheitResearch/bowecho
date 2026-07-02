@@ -1,0 +1,16 @@
+[package]
+name = "ui_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+data_source = { path = "../data_source" }
+eframe.workspace = true
+image.workspace = true
+
+[features]
+# B3 (docs/miniderecho-spec.md §1): expose `inject_for_test` to dependents'
+# test builds. Dependents add `ui_core = { path = "../ui_core", features =
+# ["test-util"] }` under [dev-dependencies].
+test-util = []

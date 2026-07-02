@@ -330,6 +330,7 @@ dependencies = [
  "sharprs",
  "styles",
  "tiff",
+ "ui_core",
  "windows-sys 0.61.2",
  "winresource",
 ]
@@ -2934,6 +2935,25 @@ dependencies = [
  "wx-field",
  "wx-math",
  "wx-radar",
+]
+
+[[package]]
+name = "mini_ui"
+version = "0.28.2"
+dependencies = [
+ "cache",
+ "chrono",
+ "color_tables",
+ "data_source",
+ "eframe",
+ "image",
+ "nexrad_io",
+ "radar_core",
+ "render2d",
+ "serde",
+ "serde_json",
+ "settings",
+ "ui_core",
 ]
 
 [[package]]
@@ -5609,6 +5629,15 @@ dependencies = [
  "memoffset",
  "tempfile",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ui_core"
+version = "0.28.2"
+dependencies = [
+ "data_source",
+ "eframe",
+ "image",
 ]
 
 [[package]]
