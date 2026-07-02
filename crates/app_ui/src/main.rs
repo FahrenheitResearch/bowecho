@@ -28300,6 +28300,7 @@ impl ViewerApp {
                                 egui::Color32::from_rgb(color[0], color[1], color[2]),
                             ),
                             rect,
+                            0.0,
                         );
                     }
                 }
@@ -28322,7 +28323,7 @@ impl ViewerApp {
                         1.5 * pf_style.line_width_scale,
                         egui::Color32::from_rgb(color[0], color[1], color[2]),
                     );
-                    let has_jump = screen_polyline_has_jump(&screen, true, rect);
+                    let has_jump = screen_polyline_has_jump(&screen, true, rect, 0.0);
                     if !has_jump {
                         if is_convex_screen_polygon(&screen) {
                             out.shapes.push(egui::Shape::convex_polygon(
@@ -28334,7 +28335,7 @@ impl ViewerApp {
                             out.shapes.push(egui::Shape::mesh(mesh));
                         }
                     }
-                    push_solid_closed_line(&mut out.shapes, &screen, stroke, rect);
+                    push_solid_closed_line(&mut out.shapes, &screen, stroke, rect, 0.0);
                 }
             }
         }
@@ -35363,7 +35364,7 @@ impl ViewerApp {
                     // across the map ("spokes" field report). The cleaner
                     // also absorbs SPC's unclosed/degenerate ring edge cases.
                     if feature.fill_enabled
-                        && !screen_polyline_has_jump(&screen, true, rect)
+                        && !screen_polyline_has_jump(&screen, true, rect, 0.0)
                         && let Some(mesh) = filled_polygon_mesh(&screen, fill)
                     {
                         painter.add(egui::Shape::mesh(mesh));
@@ -35450,10 +35451,10 @@ impl ViewerApp {
                 draw_outlook_ring(painter, hole, stroke, rect);
             }
             if feature.fill_enabled
-                && !screen_polyline_has_jump(&outer_screen, true, rect)
+                && !screen_polyline_has_jump(&outer_screen, true, rect, 0.0)
                 && hole_screens
                     .iter()
-                    .all(|hole| !screen_polyline_has_jump(hole, true, rect))
+                    .all(|hole| !screen_polyline_has_jump(hole, true, rect, 0.0))
                 && let Some(mesh) =
                     filled_polygon_with_holes_mesh(&outer_screen, &hole_screens, fill)
             {
@@ -37874,7 +37875,8 @@ impl ViewerApp {
                 continue;
             }
             let mut shapes = Vec::new();
-            push_solid_closed_line(&mut shapes, &points, stroke, rect);
+            let legit_px = hazard_bbox_segment_allowance_px(record.bbox, self.map_scale);
+            push_solid_closed_line(&mut shapes, &points, stroke, rect, legit_px);
             painter.extend(shapes);
         }
     }
@@ -37982,7 +37984,8 @@ impl ViewerApp {
                 ),
             );
             let solid = matches!(style.dash, styles::DashPattern::Solid);
-            let has_screen_jump = screen_polyline_has_jump(&points, true, rect);
+            let legit_px = hazard_bbox_segment_allowance_px(record.bbox, self.map_scale);
+            let has_screen_jump = screen_polyline_has_jump(&points, true, rect, legit_px);
             if (!heavy_layer || selected) && !has_screen_jump {
                 let convex = is_convex_screen_polygon(&points);
                 if convex {
@@ -37996,7 +37999,7 @@ impl ViewerApp {
                 }
             }
             if solid {
-                push_solid_closed_line(&mut out.outline_shapes, &points, stroke, rect);
+                push_solid_closed_line(&mut out.outline_shapes, &points, stroke, rect, legit_px);
             } else {
                 match style.dash {
                     styles::DashPattern::Solid => unreachable!("solid handled above"),
@@ -38008,6 +38011,7 @@ impl ViewerApp {
                             dash,
                             gap,
                             rect,
+                            legit_px,
                         );
                     }
                     styles::DashPattern::Dotted => {
@@ -38019,6 +38023,7 @@ impl ViewerApp {
                             dot,
                             dot * 2.0,
                             rect,
+                            legit_px,
                         );
                     }
                 }
@@ -48588,12 +48593,13 @@ fn push_dashed_closed_line(
     dash: f32,
     gap: f32,
     rect: egui::Rect,
+    min_limit_px: f32,
 ) {
     if points.len() < 2 {
         return;
     }
-    if screen_polyline_has_jump(points, true, rect) {
-        for chunk in screen_polyline_chunks(points, true, rect) {
+    if screen_polyline_has_jump(points, true, rect, min_limit_px) {
+        for chunk in screen_polyline_chunks(points, true, rect, min_limit_px) {
             shapes.extend(egui::Shape::dashed_line(
                 &chunk,
                 stroke,
@@ -48619,13 +48625,14 @@ fn push_solid_closed_line(
     points: &[egui::Pos2],
     stroke: egui::Stroke,
     rect: egui::Rect,
+    min_limit_px: f32,
 ) {
     if points.len() < 2 {
         return;
     }
-    if screen_polyline_has_jump(points, true, rect) {
+    if screen_polyline_has_jump(points, true, rect, min_limit_px) {
         shapes.extend(
-            screen_polyline_chunks(points, true, rect)
+            screen_polyline_chunks(points, true, rect, min_limit_px)
                 .into_iter()
                 .filter(|chunk| chunk.len() >= 2)
                 .map(|chunk| egui::Shape::line(chunk, stroke)),
@@ -48640,13 +48647,14 @@ fn push_solid_open_line(
     points: &[egui::Pos2],
     stroke: egui::Stroke,
     rect: egui::Rect,
+    min_limit_px: f32,
 ) {
     if points.len() < 2 {
         return;
     }
-    if screen_polyline_has_jump(points, false, rect) {
+    if screen_polyline_has_jump(points, false, rect, min_limit_px) {
         shapes.extend(
-            screen_polyline_chunks(points, false, rect)
+            screen_polyline_chunks(points, false, rect, min_limit_px)
                 .into_iter()
                 .filter(|chunk| chunk.len() >= 2)
                 .map(|chunk| egui::Shape::line(chunk, stroke)),
@@ -48656,10 +48664,18 @@ fn push_solid_open_line(
     }
 }
 
-fn screen_polyline_segment_limit_sq(rect: egui::Rect) -> f32 {
+/// `min_limit_px` raises the jump limit for shapes whose LEGITIMATE
+/// edges can dwarf the viewport (a warning polygon zoomed far in);
+/// pass 0.0 for the plain viewport-relative limit. Callers with geo
+/// geometry derive it from the shape's own geographic size — a real
+/// edge can never out-run its bbox at the current scale, while a
+/// projection teleport (AEQD antipode wrap at world zoom) still
+/// exceeds it and trips the cull.
+fn screen_polyline_segment_limit_sq(rect: egui::Rect, min_limit_px: f32) -> f32 {
     let diagonal = rect.width().hypot(rect.height());
     let limit = (diagonal * SCREEN_POLYGON_MAX_SEGMENT_DIAGONAL_FRACTION)
-        .max(SCREEN_POLYGON_MIN_MAX_SEGMENT_PX);
+        .max(SCREEN_POLYGON_MIN_MAX_SEGMENT_PX)
+        .max(min_limit_px);
     limit * limit
 }
 
@@ -48667,11 +48683,16 @@ fn screen_point_valid(point: egui::Pos2) -> bool {
     point.x.is_finite() && point.y.is_finite()
 }
 
-fn screen_polyline_has_jump(points: &[egui::Pos2], closed: bool, rect: egui::Rect) -> bool {
+fn screen_polyline_has_jump(
+    points: &[egui::Pos2],
+    closed: bool,
+    rect: egui::Rect,
+    min_limit_px: f32,
+) -> bool {
     if points.iter().any(|point| !screen_point_valid(*point)) {
         return true;
     }
-    let limit_sq = screen_polyline_segment_limit_sq(rect);
+    let limit_sq = screen_polyline_segment_limit_sq(rect, min_limit_px);
     if points
         .windows(2)
         .any(|pair| pair[0].distance_sq(pair[1]) > limit_sq)
@@ -48689,8 +48710,9 @@ fn screen_polyline_chunks(
     points: &[egui::Pos2],
     closed: bool,
     rect: egui::Rect,
+    min_limit_px: f32,
 ) -> Vec<Vec<egui::Pos2>> {
-    let limit_sq = screen_polyline_segment_limit_sq(rect);
+    let limit_sq = screen_polyline_segment_limit_sq(rect, min_limit_px);
     let mut chunks = Vec::<Vec<egui::Pos2>>::new();
     let mut current = Vec::<egui::Pos2>::new();
     for point in points
@@ -48730,6 +48752,20 @@ fn hazard_fill_alpha(base_alpha: u8, selected: bool) -> u8 {
     } else {
         base_alpha
     }
+}
+
+/// Upper bound (px) on a LEGITIMATE hazard edge's on-screen length:
+/// the record's geographic bbox diagonal at the current scale plus
+/// slack for AEQD's local distortion. Feeds the jump cull's
+/// `min_limit_px` so zooming far into a warning polygon never falsely
+/// flags its edges as projection jumps (field report: outlines broke
+/// at extreme zoom), while true teleports still exceed it.
+fn hazard_bbox_segment_allowance_px(bbox: [f32; 4], map_scale: f32) -> f32 {
+    let mid_lat_cos = (((bbox[1] + bbox[3]) * 0.5).to_radians().cos()).max(0.2);
+    let width_km = (bbox[2] - bbox[0]).abs() * 111.32 * mid_lat_cos;
+    let height_km = (bbox[3] - bbox[1]).abs() * 111.32;
+    let px_per_km = map_scale / 111.32;
+    width_km.hypot(height_km) * px_per_km * 1.25 + 8.0
 }
 
 fn hazard_bbox(points: &[HazardPoint]) -> [f32; 4] {
@@ -49012,8 +49048,8 @@ fn draw_outlook_ring(
     if draw_clipped_outlook_ring(painter, screen, stroke, rect) {
         return;
     }
-    if screen_polyline_has_jump(screen, true, rect) {
-        for chunk in screen_polyline_chunks(screen, true, rect) {
+    if screen_polyline_has_jump(screen, true, rect, 0.0) {
+        for chunk in screen_polyline_chunks(screen, true, rect, 0.0) {
             painter.add(egui::Shape::line(chunk, stroke));
         }
         return;
@@ -49075,7 +49111,7 @@ fn clipped_outlook_ring_segments(
         .unwrap_or_default();
     let diagonal = rect.width().hypot(rect.height());
     let wraparound_len = (typical_spacing * OUTLOOK_RING_WRAPAROUND_SPACING_MULTIPLE)
-        .max(screen_polyline_segment_limit_sq(rect).sqrt())
+        .max(screen_polyline_segment_limit_sq(rect, 0.0).sqrt())
         .min(diagonal * OUTLOOK_RING_WRAPAROUND_MAX_DIAGONAL_MULTIPLE);
     let mut segments = Vec::new();
     for index in 0..segment_count {
@@ -65275,6 +65311,47 @@ mod tests {
         );
     }
 
+    /// Field report (v0.28.x): warning outlines BROKE when zoomed far
+    /// in — every legitimate edge crossing the screen exceeded the
+    /// viewport-relative jump limit, so the chunker dropped it and the
+    /// fill was suppressed. The jump limit now also scales with the
+    /// record's own geographic size: a real edge can never out-run its
+    /// bbox, while world-zoom projection teleports still trip the cull.
+    #[test]
+    fn zoomed_in_hazard_outline_and_fill_stay_continuous() {
+        let mut app = test_viewer_app_with_hazards(vec![test_hazard_record(
+            "TOR-1",
+            "TOR 1",
+            "tornado",
+            square_hazard_points(-0.5, -0.5, 0.5, 0.5),
+        )]);
+        app.map_center_lat = 0.0;
+        app.map_center_lon = 0.0;
+        // Zoomed "a ton": each 1-degree edge projects to ~20,000 px —
+        // far past the 0.35-diagonal viewport limit.
+        app.map_scale = 20_000.0;
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+
+        // The viewport-only metric still calls these edges jumps — the
+        // geo-aware allowance is what must keep the polygon whole.
+        let corners: Vec<egui::Pos2> = square_hazard_points(-0.5, -0.5, 0.5, 0.5)
+            .iter()
+            .map(|point| app.lon_lat_to_screen(rect, point.lon, point.lat))
+            .collect();
+        assert!(
+            screen_polyline_has_jump(&corners, true, rect, 0.0),
+            "fixture must exceed the viewport-only limit or it proves nothing"
+        );
+
+        let built = app.build_hazard_overlay_shapes(rect, None);
+        assert_eq!(built.fill_shapes.len(), 1, "fill must survive extreme zoom");
+        assert_eq!(
+            built.outline_shapes.len(),
+            1,
+            "outline must stay one unbroken closed line"
+        );
+    }
+
     #[test]
     fn unchanged_realtime_refresh_requires_cache_hit_and_same_path() {
         let current = Path::new("KTLX20260608_003703_RT081_V06");
@@ -68135,8 +68212,8 @@ mod tests {
             egui::pos2(480.0, 370.0),
         ];
 
-        assert!(screen_polyline_has_jump(&points, false, rect));
-        let chunks = screen_polyline_chunks(&points, false, rect);
+        assert!(screen_polyline_has_jump(&points, false, rect, 0.0));
+        let chunks = screen_polyline_chunks(&points, false, rect, 0.0);
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0], vec![points[0], points[1]]);
