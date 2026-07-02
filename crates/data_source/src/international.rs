@@ -318,38 +318,38 @@ pub fn intl_provider_capabilities() -> Vec<IntlProviderCapability> {
                     ),
                     "dmi" => (
                         false,
-                        "latest only",
+                        "newest N STAC items",
                         "STAC date ranges with pagination",
-                        "latest frame only",
-                        "use STAC date-range queries",
+                        "recent loop from the STAC items query",
+                        "use STAC date-range queries for archive lookup",
                     ),
                     "geosphere" => (
                         false,
-                        "latest only",
+                        "newest N frames of the rolling window",
                         "rolling ~3 days",
-                        "latest frame only",
-                        "list recent objects by prefix",
+                        "recent loop from the rolling listing",
+                        "add date/window picker over the rolling days",
                     ),
                     "dwd" => (
                         false,
-                        "latest only",
+                        "newest N 5-minute sweep cycles",
                         "rolling ~2 days",
-                        "latest frame only",
-                        "walk timestamped sweep files",
+                        "recent loop from timestamped sweep files",
+                        "add date/window picker over the rolling days",
                     ),
                     "shmu" => (
                         false,
-                        "latest only",
+                        "newest N frames, dated directories",
                         "observed rolling ~1 month",
-                        "latest frame only",
-                        "list dated directories",
+                        "recent loop from the dated directories",
+                        "add arbitrary date/window picker",
                     ),
                     "chmi" => (
                         false,
-                        "latest only",
+                        "newest N frames of the rolling window",
                         "observed rolling ~89 hours",
-                        "latest frame only",
-                        "list recent ODIM volume files",
+                        "recent loop from the volume file listings",
+                        "add date/window picker over the rolling window",
                     ),
                     "arpa-piemonte" => (
                         false,
@@ -980,11 +980,18 @@ mod tests {
                 "arpa-lombardia",
                 "arpa-piemonte",
                 "australia-nci",
+                "chmi",
+                "dmi",
+                "dwd",
                 "fmi",
+                "geosphere",
                 "kaia",
                 "ord",
+                "shmu",
                 "smhi",
-            ])
+            ]),
+            "JMA is the one intentional single-frame holdout (tar/stamp \
+             probing is its own task)"
         );
     }
 

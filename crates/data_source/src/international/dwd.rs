@@ -41,7 +41,7 @@
 use chrono::NaiveDateTime;
 
 use super::listing::{ListingEntry, fnv1a64, has_dir, join_url, parse_autoindex};
-use super::{FramePlan, IntlProvider, IntlSite, PlanPart};
+use super::{FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames};
 use crate::{fetch_listing_text, fetch_text};
 
 const DWD_SITES_ROOT: &str = "https://opendata.dwd.de/weather/radar/sites/";
@@ -145,6 +145,40 @@ impl DwdProvider {
             .iter()
             .filter(move |product| product.required || include_dual_pol)
     }
+
+    /// Fetch and parse the sweep listing of every included product (the
+    /// one catalog probe both `latest` and `recent` run). The first entry
+    /// is always the required `sweep_vol_z` listing with at least one
+    /// timestamped sweep — missing or empty required listings are errors —
+    /// so callers can anchor cycles on `products[0]`.
+    fn fetch_product_sweeps(&self, site_id: &str) -> Result<Vec<DwdProductSweeps>, String> {
+        let mut products = Vec::new();
+        for product in self.included_products() {
+            let resolved = match resolve_product_dir(site_id, product) {
+                Ok(resolved) => resolved,
+                Err(err) if product.required => return Err(err),
+                Err(_) => continue,
+            };
+            let sweeps = parse_dwd_sweeps(&resolved.entries, resolved.quantity);
+            if product.required && sweeps.is_empty() {
+                return Err(format!(
+                    "DWD {}/{site_id}: no timestamped '{}' sweep files in {}",
+                    product.dir, resolved.quantity, resolved.dir_url
+                ));
+            }
+            products.push(DwdProductSweeps {
+                dir: product.dir,
+                required: product.required,
+                dir_url: resolved.dir_url,
+                quantity: resolved.quantity,
+                sweeps,
+            });
+        }
+        if products.is_empty() {
+            return Err(format!("DWD: no products resolved for site '{site_id}'"));
+        }
+        Ok(products)
+    }
 }
 
 impl Default for DwdProvider {
@@ -203,68 +237,20 @@ impl IntlProvider for DwdProvider {
         if !is_safe_path_segment(site_id) {
             return Err(format!("DWD: invalid site id '{site_id}'"));
         }
-
-        let mut anchor: Option<NaiveDateTime> = None;
-        let mut parts: Vec<PlanPart> = Vec::new();
-        for product in self.included_products() {
-            let resolved = match resolve_product_dir(site_id, product) {
-                Ok(resolved) => resolved,
-                Err(err) if product.required => return Err(err),
-                Err(_) => continue,
-            };
-            let sweeps = parse_dwd_sweeps(&resolved.entries, resolved.quantity);
-            if product.required && sweeps.is_empty() {
-                return Err(format!(
-                    "DWD {}/{site_id}: no timestamped '{}' sweep files in {}",
-                    product.dir, resolved.quantity, resolved.dir_url
-                ));
-            }
-
-            // The base product (first required, sweep_vol_z) anchors the
-            // cycle for every other product.
-            if anchor.is_none() {
-                anchor = newest_complete_cycle_anchor(&sweeps);
-            }
-            let Some(anchor) = anchor else {
-                return Err(format!(
-                    "DWD {}/{site_id}: could not resolve a cycle anchor from {}",
-                    product.dir, resolved.dir_url
-                ));
-            };
-
-            let chosen = sweeps_in_cycle(&sweeps, anchor);
-            if product.required && chosen.is_empty() {
-                return Err(format!(
-                    "DWD {}/{site_id}: no '{}' sweeps inside the cycle ending {anchor} \
-                     ({} timestamped files inspected)",
-                    product.dir,
-                    resolved.quantity,
-                    sweeps.len()
-                ));
-            }
-            parts.extend(chosen.into_iter().map(|sweep| PlanPart {
-                url: join_url(&resolved.dir_url, &sweep.name),
-            }));
-        }
-
-        let Some(anchor) = anchor else {
-            return Err(format!("DWD: no products resolved for site '{site_id}'"));
+        let products = self.fetch_product_sweeps(site_id)?;
+        // The base product (first required, sweep_vol_z) anchors the cycle
+        // for every other product.
+        let Some(anchor) = cycle_anchors(&products[0].sweeps, 1).into_iter().next() else {
+            return Err(format!(
+                "DWD {}/{site_id}: could not resolve a cycle anchor from {}",
+                products[0].dir, products[0].dir_url
+            ));
         };
-        let joined = parts
-            .iter()
-            .map(|part| part.url.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok(FramePlan {
-            identity: format!(
-                "{site_id}_{}_p{}_h{:016x}",
-                anchor.format("%Y%m%d%H%M%S"),
-                parts.len(),
-                fnv1a64(&joined)
-            ),
-            parts,
-            merge: true,
-        })
+        assemble_cycle(site_id, anchor, &products)
+    }
+
+    fn recent_source(&self) -> Option<&dyn RecentFrames> {
+        Some(self)
     }
 
     fn static_sites(&self) -> Vec<IntlSite> {
@@ -280,6 +266,107 @@ impl IntlProvider for DwdProvider {
             })
             .collect()
     }
+}
+
+impl RecentFrames for DwdProvider {
+    fn recent_frames(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
+        if !is_safe_path_segment(site_id) {
+            return Err(format!("DWD: invalid site id '{site_id}'"));
+        }
+        let products = self.fetch_product_sweeps(site_id)?;
+        let anchors = cycle_anchors(&products[0].sweeps, count);
+        if anchors.is_empty() {
+            return Err(format!(
+                "DWD {}/{site_id}: could not resolve a cycle anchor from {}",
+                products[0].dir, products[0].dir_url
+            ));
+        }
+        let mut plans = Vec::with_capacity(anchors.len());
+        for (index, anchor) in anchors.iter().enumerate() {
+            match assemble_cycle(site_id, *anchor, &products) {
+                Ok(plan) => plans.push(plan),
+                // The newest cycle is the poll dedupe key: its failure is
+                // the loop's failure. An older, partially-retained cycle
+                // just shortens the loop.
+                Err(err) if index == 0 => return Err(err),
+                Err(_) => continue,
+            }
+        }
+        plans.reverse();
+        Ok(plans)
+    }
+}
+
+/// One fetched-and-parsed product sweep listing.
+struct DwdProductSweeps {
+    dir: &'static str,
+    required: bool,
+    dir_url: String,
+    quantity: &'static str,
+    sweeps: Vec<DwdSweepFile>,
+}
+
+/// Up to `count` cycle anchors, NEWEST FIRST: the distinct timestamps of
+/// the highest sweep index. Sweeps scan in ascending index order, so each
+/// such timestamp marks the end of one COMPLETE `vol5minng01` cycle (the
+/// next cycle's low sweeps may already be uploaded).
+/// `cycle_anchors(sweeps, 1)` is exactly the anchor `latest` uses.
+fn cycle_anchors(sweeps: &[DwdSweepFile], count: usize) -> Vec<NaiveDateTime> {
+    let Some(last_sweep) = sweeps.iter().map(|sweep| sweep.sweep).max() else {
+        return Vec::new();
+    };
+    let mut times: Vec<NaiveDateTime> = sweeps
+        .iter()
+        .filter(|sweep| sweep.sweep == last_sweep)
+        .map(|sweep| sweep.time)
+        .collect();
+    times.sort_unstable();
+    times.dedup();
+    times.reverse();
+    times.truncate(count.max(1));
+    times
+}
+
+/// Assemble the frame for the cycle ending at `anchor` from
+/// already-fetched product sweep listings (pure; unit-testable). Identity
+/// and part order are exactly what `latest` has always produced for its
+/// (newest) anchor.
+fn assemble_cycle(
+    site_id: &str,
+    anchor: NaiveDateTime,
+    products: &[DwdProductSweeps],
+) -> Result<FramePlan, String> {
+    let mut parts: Vec<PlanPart> = Vec::new();
+    for product in products {
+        let chosen = sweeps_in_cycle(&product.sweeps, anchor);
+        if product.required && chosen.is_empty() {
+            return Err(format!(
+                "DWD {}/{site_id}: no '{}' sweeps inside the cycle ending {anchor} \
+                 ({} timestamped files inspected)",
+                product.dir,
+                product.quantity,
+                product.sweeps.len()
+            ));
+        }
+        parts.extend(chosen.into_iter().map(|sweep| PlanPart {
+            url: join_url(&product.dir_url, &sweep.name),
+        }));
+    }
+    let joined = parts
+        .iter()
+        .map(|part| part.url.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(FramePlan {
+        identity: format!(
+            "{site_id}_{}_p{}_h{:016x}",
+            anchor.format("%Y%m%d%H%M%S"),
+            parts.len(),
+            fnv1a64(&joined)
+        ),
+        parts,
+        merge: true,
+    })
 }
 
 /// A product directory resolved down to the variant that actually carries
@@ -379,18 +466,6 @@ fn parse_dwd_sweeps(entries: &[ListingEntry], quantity: &str) -> Vec<DwdSweepFil
         .collect()
 }
 
-/// The newest timestamp of the highest sweep index: sweeps scan in
-/// ascending index order, so this marks the end of the most recent
-/// COMPLETE cycle (the next cycle's low sweeps may already be uploaded).
-fn newest_complete_cycle_anchor(sweeps: &[DwdSweepFile]) -> Option<NaiveDateTime> {
-    let last_sweep = sweeps.iter().map(|sweep| sweep.sweep).max()?;
-    sweeps
-        .iter()
-        .filter(|sweep| sweep.sweep == last_sweep)
-        .map(|sweep| sweep.time)
-        .max()
-}
-
 /// For every sweep index, the newest file whose start time falls inside
 /// the cycle ending at `anchor` (exclusive 5 minutes before, inclusive at
 /// the anchor), in ascending sweep order.
@@ -473,21 +548,28 @@ mod tests {
     }
 
     #[test]
-    fn anchor_is_newest_stamp_of_highest_sweep_index() {
+    fn anchors_are_newest_stamps_of_highest_sweep_index_newest_first() {
         let entries = parse_autoindex(Z_FILES);
         let th = parse_dwd_sweeps(&entries, "th");
+        assert_eq!(cycle_anchors(&th, 1), vec![timestamp("20260612064402")]);
+        // Every th_09 stamp in the trimmed capture ends one cycle; asking
+        // for more stops at the listing's oldest cycle.
         assert_eq!(
-            newest_complete_cycle_anchor(&th),
-            Some(timestamp("20260612064402"))
+            cycle_anchors(&th, 99),
+            vec![
+                timestamp("20260612064402"),
+                timestamp("20260612063902"),
+                timestamp("20260612063402"),
+            ]
         );
-        assert_eq!(newest_complete_cycle_anchor(&[]), None);
+        assert!(cycle_anchors(&[], 3).is_empty());
     }
 
     #[test]
     fn cycle_window_selects_one_file_per_sweep_of_the_complete_cycle() {
         let entries = parse_autoindex(Z_FILES);
         let th = parse_dwd_sweeps(&entries, "th");
-        let anchor = newest_complete_cycle_anchor(&th).expect("anchor");
+        let anchor = cycle_anchors(&th, 1).into_iter().next().expect("anchor");
         let chosen = sweeps_in_cycle(&th, anchor);
         assert_eq!(chosen.len(), 10, "all ten sweeps of the cycle");
         assert_eq!(
@@ -514,6 +596,88 @@ mod tests {
         assert_eq!(chosen.len(), 10);
         assert_eq!(chosen[0].time, timestamp("20260612064057"));
         assert_eq!(chosen[9].time, timestamp("20260612064402"));
+    }
+
+    /// The provider must advertise the real loop it now has (fails on the
+    /// old single-frame DwdProvider).
+    #[test]
+    fn provider_advertises_a_real_recent_loop() {
+        let provider = DwdProvider::new();
+        assert!(provider.recent_source().is_some());
+        assert!(provider.supports_recent());
+    }
+
+    fn fixture_products() -> Vec<DwdProductSweeps> {
+        vec![
+            DwdProductSweeps {
+                dir: "sweep_vol_z",
+                required: true,
+                dir_url: "https://opendata.dwd.de/weather/radar/sites/sweep_vol_z/asb/unfiltered/"
+                    .to_owned(),
+                quantity: "th",
+                sweeps: parse_dwd_sweeps(&parse_autoindex(Z_FILES), "th"),
+            },
+            DwdProductSweeps {
+                dir: "sweep_vol_v",
+                required: true,
+                dir_url: "https://opendata.dwd.de/weather/radar/sites/sweep_vol_v/asb/hdf5/\
+                          filter_polarimetric/"
+                    .to_owned(),
+                quantity: "vradh",
+                sweeps: parse_dwd_sweeps(&parse_autoindex(V_FILES), "vradh"),
+            },
+        ]
+    }
+
+    /// Older cycles assemble from the same listings with the same identity
+    /// grammar and part order as the newest one; a cycle the retention has
+    /// already lost a required product for errors (and the recent loop
+    /// drops it), so applying the recent walk to the fixtures yields two
+    /// loop frames, oldest first, ending on the `latest` frame.
+    #[test]
+    fn older_cycles_assemble_and_partial_cycles_drop_out() {
+        let products = fixture_products();
+        let anchors = cycle_anchors(&products[0].sweeps, 3);
+        assert_eq!(anchors.len(), 3);
+
+        let newest = assemble_cycle("asb", anchors[0], &products).expect("newest cycle");
+        assert!(newest.identity.starts_with("asb_20260612064402_p20_h"));
+        assert!(newest.merge);
+        assert_eq!(newest.parts.len(), 20, "10 th + 10 vradh sweeps");
+
+        let older = assemble_cycle("asb", anchors[1], &products).expect("older cycle");
+        assert!(older.identity.starts_with("asb_20260612063902_p20_h"));
+        assert_ne!(older.identity, newest.identity);
+        // Product-major (z before v), ascending sweep index inside each.
+        assert!(older.parts[0].url.contains("/sweep_vol_z/"));
+        assert!(older.parts[0].url.contains("_th_00-2026061206355700"));
+        assert!(older.parts[9].url.contains("_th_09-2026061206390200"));
+        assert!(older.parts[10].url.contains("/sweep_vol_v/"));
+        assert!(older.parts[10].url.contains("_vradh_00-2026061206355700"));
+        // Same upstream cycle -> same plan (dedupe key stability).
+        assert_eq!(
+            assemble_cycle("asb", anchors[1], &products).expect("older cycle again"),
+            older
+        );
+
+        // The oldest fixture cycle (ending 06:34:02) predates the velocity
+        // fixture's retention: required vradh is empty there.
+        let err = assemble_cycle("asb", anchors[2], &products).unwrap_err();
+        assert!(
+            err.contains("no 'vradh' sweeps inside the cycle ending"),
+            "unexpected error: {err}"
+        );
+
+        // The recent walk over these anchors: keep Ok frames, then reverse
+        // to oldest-first — the last frame is the `latest` frame.
+        let survivors: Vec<FramePlan> = anchors
+            .iter()
+            .filter_map(|anchor| assemble_cycle("asb", *anchor, &products).ok())
+            .rev()
+            .collect();
+        assert_eq!(survivors.len(), 2);
+        assert_eq!(survivors[0], older);
+        assert_eq!(survivors[1], newest);
     }
 
     #[test]

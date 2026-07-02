@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-use super::{FramePlan, IntlProvider, IntlSite, PlanPart, SiteCache};
+use super::{FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames, SiteCache};
 
 const ITEMS_URL: &str = "https://opendataapi.dmi.dk/v1/radardata/collections/volume/items";
 
@@ -28,6 +28,11 @@ const ITEMS_URL: &str = "https://opendataapi.dmi.dk/v1/radardata/collections/vol
 /// radars at a 5-minute cadence, so the newest 50 items span every active
 /// station several times over.
 const SITE_DISCOVERY_LIMIT: u32 = 50;
+
+/// Upper bound on one `recent` STAC query. At the 5-minute cadence 1000
+/// items span ~3.5 days — comfortably past any loop-history limit — while
+/// keeping the items response a single bounded page.
+const RECENT_ITEMS_LIMIT: usize = 1000;
 
 /// Station names from DMI's radar station list
 /// (dmi.dk/friedata/dokumentation/radar-data): the active network is
@@ -101,6 +106,10 @@ impl IntlProvider for DmiProvider {
         plan_from_items(site_id, &json)
     }
 
+    fn recent_source(&self) -> Option<&dyn RecentFrames> {
+        Some(self)
+    }
+
     fn static_sites(&self) -> Vec<IntlSite> {
         DMI_STATIONS
             .iter()
@@ -116,6 +125,18 @@ impl IntlProvider for DmiProvider {
                 },
             )
             .collect()
+    }
+}
+
+impl RecentFrames for DmiProvider {
+    fn recent_frames(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
+        validate_station_id(site_id)?;
+        let limit = count.clamp(1, RECENT_ITEMS_LIMIT);
+        let url =
+            format!("{ITEMS_URL}?stationId={site_id}&limit={limit}&sortorder=datetime%2CDESC");
+        let json = crate::fetch_text(&url)
+            .map_err(|err| format!("DMI volume items for station {site_id} ({url}): {err}"))?;
+        recent_plans_from_items(site_id, &json)
     }
 }
 
@@ -181,6 +202,37 @@ fn plan_from_items(station_id: &str, json: &str) -> Result<FramePlan, String> {
         .features
         .first()
         .ok_or_else(|| format!("DMI returned no volume items for station {station_id}"))?;
+    plan_from_feature(station_id, feature)
+}
+
+/// Plans for a `sortorder=datetime,DESC` items answer, reordered OLDEST
+/// FIRST per the [`RecentFrames`] contract. The newest item is the poll
+/// dedupe key, so a malformed newest item is an error (exactly as
+/// [`plan_from_items`] would report it); malformed OLDER items merely
+/// shorten the loop.
+fn recent_plans_from_items(station_id: &str, json: &str) -> Result<Vec<FramePlan>, String> {
+    let collection: FeatureCollection = serde_json::from_str(json)
+        .map_err(|err| format!("DMI volume items JSON parse failed: {err}"))?;
+    if collection.features.is_empty() {
+        return Err(format!(
+            "DMI returned no volume items for station {station_id}"
+        ));
+    }
+    let mut plans = Vec::with_capacity(collection.features.len());
+    for (index, feature) in collection.features.iter().enumerate() {
+        match plan_from_feature(station_id, feature) {
+            Ok(plan) => plans.push(plan),
+            Err(err) if index == 0 => return Err(err),
+            Err(_) => continue,
+        }
+    }
+    plans.reverse();
+    // Defensive: repeated feature ids would double-install one frame.
+    plans.dedup_by(|left, right| left.identity == right.identity);
+    Ok(plans)
+}
+
+fn plan_from_feature(station_id: &str, feature: &Feature) -> Result<FramePlan, String> {
     let href = feature
         .asset
         .as_ref()
@@ -304,6 +356,61 @@ mod tests {
         assert_eq!(station_label("06036", "dksin_x.vol.h5"), "Sindal");
         assert_eq!(station_label("99999", "dkxyz_x.vol.h5"), "DKXYZ");
         assert_eq!(station_label("99999", ""), "99999");
+    }
+
+    /// The provider must advertise the real loop it now has: `recent()`
+    /// routes through `recent_source` and the capability card derives from
+    /// it (fails on the old single-frame DmiProvider).
+    #[test]
+    fn provider_advertises_a_real_recent_loop() {
+        let provider = DmiProvider::new();
+        assert!(provider.recent_source().is_some());
+        assert!(provider.supports_recent());
+    }
+
+    /// A DESC items answer comes back OLDEST FIRST, with the newest item
+    /// LAST — its identity is what the live poll dedupes against, so it
+    /// must equal the plan `latest` builds from the same answer.
+    #[test]
+    fn recent_plans_reorder_desc_items_oldest_first_with_latest_identity_last() {
+        let plans = recent_plans_from_items("06177", ITEMS_FIXTURE).expect("plans parse");
+        assert_eq!(plans.len(), 3);
+        assert_eq!(plans[0].identity, "dksin_202606120635.vol.h5");
+        assert_eq!(plans[1].identity, "dkrom_202606120635.vol.h5");
+        assert_eq!(plans[2].identity, "dkste_202606120635.vol.h5");
+        assert!(plans.iter().all(|plan| !plan.merge));
+        assert!(
+            plans
+                .iter()
+                .all(|plan| plan.parts.len() == 1 && plan.parts[0].url.ends_with(&plan.identity))
+        );
+        // Newest recent frame == latest frame (poll dedupe key stability).
+        let latest = plan_from_items("06177", ITEMS_FIXTURE).expect("latest plan");
+        assert_eq!(plans.last(), Some(&latest));
+    }
+
+    #[test]
+    fn recent_plans_drop_malformed_older_items_but_reject_a_malformed_newest() {
+        // Older item without a data asset shortens the loop, no error.
+        let older_broken = r#"{"features":[
+            {"id":"dkste_202606120635.vol.h5","properties":{"stationId":"06177"},
+             "asset":{"data":{"href":"https://example.invalid/dkste_202606120635.vol.h5"}}},
+            {"id":"dkste_202606120630.vol.h5","properties":{"stationId":"06177"}}
+        ]}"#;
+        let plans = recent_plans_from_items("06177", older_broken).expect("plans parse");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].identity, "dkste_202606120635.vol.h5");
+
+        // The newest item is the dedupe key: broken newest is an error.
+        let newest_broken = r#"{"features":[
+            {"id":"dkste_202606120635.vol.h5","properties":{"stationId":"06177"}}
+        ]}"#;
+        let err = recent_plans_from_items("06177", newest_broken).unwrap_err();
+        assert!(err.contains("no data asset"), "unexpected error: {err}");
+
+        let err = recent_plans_from_items("06177", r#"{"type":"FeatureCollection","features":[]}"#)
+            .unwrap_err();
+        assert!(err.contains("no volume items"), "unexpected error: {err}");
     }
 
     #[test]

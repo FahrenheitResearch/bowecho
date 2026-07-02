@@ -3110,6 +3110,20 @@ pub fn dealias_velocity_grid(cut: &ElevationCut, source: &MomentGrid) -> MomentG
     dealias_velocity_grid_with_references(cut, source, None, None)
 }
 
+/// True when [`dealias_velocity_grid`] over this cut can only pass raw
+/// velocity through: no radial of the velocity grid carries a usable
+/// (finite, positive) Nyquist velocity, so every per-row Nyquist and the
+/// median fallback are unknown and no fold correction can ever apply
+/// (`v` is emitted unchanged). JMA is always in this state by design
+/// (staggered PRF, Nyquist left `None` — see `nexrad_io/src/jma.rs`);
+/// the occasional ODIM file omits `how/NI` too. The UI queries this so a
+/// product labeled "dealiased" can disclose the pass-through instead of
+/// silently rendering raw velocity under a dealiased label (data trust:
+/// the fold warning can never fire without a Nyquist).
+pub fn dealias_skipped_no_nyquist(cut: &ElevationCut, source: &MomentGrid) -> bool {
+    median_nyquist_mps(cut, source).is_none()
+}
+
 /// `dealias_velocity_grid` with an optional external wind reference: the
 /// resolver uses it for connected-group BRANCH selection and per-region
 /// verification (UNRAVEL-style checks, Louf et al. 2020). With `None` the
@@ -4354,6 +4368,44 @@ mod tests {
             .map(|gate| corrected.scaled_value(0, gate).expect("corrected gate"))
             .collect::<Vec<_>>();
         assert_eq!(values, vec![0.0, 5.0, 9.0, 11.0, 13.0]);
+    }
+
+    #[test]
+    fn dealias_skip_detection_reports_nyquist_less_feeds() {
+        // JMA-style feed: staggered PRF leaves Nyquist unset on every
+        // radial, so the "dealiased" grid is a pure pass-through and the
+        // UI must be able to disclose that.
+        let observed = vec![2.0f32, 4.0, 6.0, 8.0];
+        let rows_data: Vec<Vec<f32>> = (0..4).map(|_| observed.clone()).collect();
+        let (mut cut, grid) = test_velocity_grid_rows(rows_data);
+        for radial in &mut cut.radials {
+            radial.nyquist_velocity_mps = None;
+        }
+
+        assert!(
+            dealias_skipped_no_nyquist(&cut, &grid),
+            "no usable Nyquist on any radial must report the skip"
+        );
+        // The skip really is a pass-through: values come back as recorded.
+        let corrected = dealias_velocity_grid(&cut, &grid);
+        for (gate, value) in observed.iter().enumerate() {
+            assert_eq!(
+                corrected.scaled_value(1, gate),
+                Some(*value),
+                "gate {gate} must pass through unchanged"
+            );
+        }
+
+        // Any radial with a usable Nyquist flips the answer (the median
+        // fallback then covers Nyquist-less rows).
+        cut.radials[0].nyquist_velocity_mps = Some(20.0);
+        assert!(!dealias_skipped_no_nyquist(&cut, &grid));
+
+        // Non-finite / non-positive declarations are not usable Nyquists.
+        cut.radials[0].nyquist_velocity_mps = Some(0.0);
+        assert!(dealias_skipped_no_nyquist(&cut, &grid));
+        cut.radials[0].nyquist_velocity_mps = Some(f32::NAN);
+        assert!(dealias_skipped_no_nyquist(&cut, &grid));
     }
 
     #[test]

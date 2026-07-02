@@ -29,7 +29,7 @@ const GUIDE_DEBUG_CASES_TEXT: &str = "— one-click repro launchers for known ra
     issues. The built-ins include KBMX Tuscaloosa 2011 22:15Z and 22:19Z DVEL \
     scans, and they use the same archive loader as normal case review.";
 const GUIDE_CUSTOM_LAYER_ROW_LABEL: &str = "Layer row in Custom";
-const GUIDE_CUSTOM_OVERLAY_TEXT: &str = "add the nearest radar as an overlay layer. Manage overlays (opacity, refresh, promote, remove) in Custom.";
+const GUIDE_CUSTOM_OVERLAY_TEXT: &str = "add the nearest radar — US or international, whichever is closer — as an overlay layer. Manage overlays (opacity, refresh, promote, remove) in Custom.";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum GuideSection {
@@ -241,16 +241,27 @@ fn getting_started(ui: &mut egui::Ui) {
     action(
         ui,
         "Site dropdown",
-        "— Radar tab \u{25b8} SITE. Pick a site, then Load Latest (newest volume) or \
-         Load Loop (recent history). Center recenters the map on it. The site you load is \
-         remembered as the startup site for next launch.",
+        "— Radar tab \u{25b8} SITE lists the US NEXRAD network. Pick a site, then Load Latest \
+         (newest volume) or Load Loop (recent history). When an international feed owns the \
+         view, Load Latest / Load Loop target that feed instead: providers with recent \
+         catalogs load real loops, single-frame providers start at the newest scan and grow \
+         live. Center recenters the map on it. The site you load is remembered as the \
+         startup site for next launch.",
+    );
+    action(
+        ui,
+        "International radars",
+        "— the amber markers. Click one to live-poll that feed on the provider's cadence; \
+         Data \u{25b8} Radar coverage is the provider-aware picker, with archive access \
+         where a provider offers it.",
     );
     action(
         ui,
         "Right-click the map",
-        "— opens \"Lowest beam here\": the three WSR-88Ds whose 0.5° beam is lowest over that \
-         point (4/3-Earth geometry), with beam height and distance. One click switches there \
-         and loads the latest volume. Right-clicking also jumps to the nearest site directly.",
+        "— opens \"Lowest beam here\": the nearby radars — US and international alike — whose \
+         0.5° beam is lowest over that point (4/3-Earth geometry), with beam height and \
+         distance. One click switches there and loads (or live-polls) the latest data. \
+         Right-clicking also jumps to the nearest site directly.",
     );
     action(
         ui,
@@ -262,13 +273,16 @@ fn getting_started(ui: &mut egui::Ui) {
     action(
         ui,
         "Live",
-        "— tick it in SITE to auto-refresh from the real-time chunk feed. With Chunks on, \
-         partial tilts draw as they arrive instead of waiting for a complete low tilt.",
+        "— tick it in SITE to auto-refresh from the US NEXRAD real-time chunk feed. With \
+         Chunks on, partial tilts draw as they arrive instead of waiting for a complete low \
+         tilt. International sites go live by polling instead — click an amber marker or a \
+         right-click menu row and frames refresh on the provider's cadence.",
     );
     para(
         ui,
-        "The chip on the canvas always reads LIVE / ARCHIVE / STALE — you can never mistake an \
-         old frame for live data.",
+        "The chip on the canvas reads LIVE / ARCHIVE / STALE — the source mode and frame age, \
+         at a glance. The STALE threshold is tuned to US volume cadence, so slower \
+         international feeds can flag STALE while healthy.",
     );
 
     subhead(ui, "PRODUCTS, TILT, LOOP");
@@ -853,9 +867,11 @@ fn archive(ui: &mut egui::Ui) {
     ui.heading("Archive & events");
     para(
         ui,
-        "The Data tab's Archive section replays any day in the Level II record for the \
-         selected site — the loop transport sits at the top of the tab so you never switch \
-         tabs to play what you just loaded. Data also holds Live feeds (GR2A-style dir.list \
+        "The Data tab's Archive section replays any day in the US NEXRAD Level II record for \
+         the selected site — the loop transport sits at the top of the tab so you never switch \
+         tabs to play what you just loaded. This day browser is US Level II only; \
+         international archives live in Data \u{25b8} Radar coverage below, for the providers \
+         that expose history. Data also holds Live feeds (GR2A-style dir.list \
          polling for research/mobile radars), the Model store summary, and local file/folder \
          openers.",
     );
@@ -1055,15 +1071,18 @@ fn tools(ui: &mut egui::Ui) {
     action(
         ui,
         "Right-click the map",
-        "— the \"Lowest beam here\" menu: the three WSR-88Ds with the lowest 0.5° beam over \
+        "— the \"Lowest beam here\" menu: the nearby radars with the lowest 0.5° beam over \
          that point, each with beam height and distance (units per Settings ▸ Display); \
-         click to switch and load. Right-clicking also jumps to the nearest site directly.",
+         click to switch and load. TDWRs, research feeds, custom feeds, and international \
+         radars get their own rows, so the menu works over Europe or Japan the same as over \
+         CONUS. Right-clicking also jumps to the nearest site directly.",
     );
     action(
         ui,
         "Ctrl+right-click",
-        "— adds the nearest radar as an extra overlay layer instead of switching, for \
-         multi-radar mosaics. Manage overlays (opacity, refresh, promote, remove) in Custom.",
+        "— adds the nearest radar — US or international, whichever is closer — as an extra \
+         overlay layer instead of switching, for multi-radar mosaics. Manage overlays \
+         (opacity, refresh, promote, remove) in Custom.",
     );
 
     subhead(ui, "VROT TOOL");
@@ -1292,7 +1311,7 @@ fn shortcuts(ui: &mut egui::Ui) {
     key_row(
         ui,
         "right-click",
-        "\"Lowest beam here\" menu + jump to the nearest site",
+        "\"Lowest beam here\" menu (US + international radars) + jump to the nearest site",
     );
     key_row(ui, "Ctrl+right-click", GUIDE_CUSTOM_OVERLAY_TEXT);
     key_row(ui, "Shift+click", "pin / release the inspector card");
@@ -1482,5 +1501,38 @@ mod tests {
             .into_iter()
             .collect();
         assert!(!guide_src.contains(&stale_link));
+    }
+
+    /// International radars are not second-class: the guide's gesture and
+    /// archive copy must describe the US+international reality, and the
+    /// retired US-only absolutes must stay gone (parity audit, dishonest-NA
+    /// item 13).
+    #[test]
+    fn guide_copy_is_honest_about_international_radars() {
+        // Ctrl+right-click overlay dispatch picks the closer of US/intl.
+        assert!(GUIDE_CUSTOM_OVERLAY_TEXT.contains("US or international, whichever is closer"));
+        let guide_src = include_str!("guide.rs");
+        // The right-click beam menu ranks international sites too, and the
+        // shortcuts table says so.
+        assert!(guide_src.contains("US and international alike"));
+        assert!(guide_src.contains("US + international radars"));
+        // PICK A RADAR tells intl users how to find and live-poll sites.
+        assert!(guide_src.contains("amber markers"));
+        assert!(guide_src.contains("Radar coverage"));
+        assert!(guide_src.contains("provider's cadence"));
+        // Load Loop copy mirrors the derive-named provider hover in main.rs:
+        // recent-catalog providers loop, single-frame providers grow live.
+        assert!(guide_src.contains("single-frame providers start at the newest scan"));
+        // The Data-tab day browser is US Level II only — and says so.
+        assert!(guide_src.contains("US NEXRAD Level II"));
+        assert!(guide_src.contains("US Level II only"));
+        // Retired claims, assembled at runtime so this test file does not
+        // match itself: the beam menu is no longer 88D-only (old copy said
+        // exactly three of them), and the absolute chip promise was
+        // falsified by intl archive loads.
+        let old_beam_claim = ["three", "WSR-88Ds"].join(" ");
+        assert!(!guide_src.contains(&old_beam_claim));
+        let old_chip_claim = ["you can never", "mistake"].join(" ");
+        assert!(!guide_src.contains(&old_chip_claim));
     }
 }

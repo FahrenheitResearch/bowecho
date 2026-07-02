@@ -27,10 +27,10 @@
 //! skkoj dBZ, ...), so file names are always taken verbatim from the
 //! listing and matched by their 14-digit timestamp only.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::listing::{digit_run, fnv1a64, join_url, parse_autoindex};
-use super::{FramePlan, IntlProvider, IntlSite, PlanPart};
+use super::{FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames};
 use crate::fetch_text;
 
 const SHMU_VOLUME_ROOT: &str = "https://opendata.shmu.sk/meteorology/weather/radar/volume/";
@@ -102,82 +102,14 @@ impl IntlProvider for ShmuProvider {
     }
 
     fn latest(&self, site_id: &str) -> Result<FramePlan, String> {
-        if !is_safe_path_segment(site_id) {
-            return Err(format!("SHMU: invalid site id '{site_id}'"));
-        }
-        let site_url = format!("{SHMU_VOLUME_ROOT}{site_id}/");
-        let site_html = fetch_text(&site_url)
-            .map_err(|err| format!("SHMU product listing {site_url}: {err}"))?;
-        let products: Vec<String> = parse_autoindex(&site_html)
-            .into_iter()
-            .filter(|entry| entry.is_dir)
-            .map(|entry| entry.name)
-            .collect();
-        for required in REQUIRED_PRODUCTS {
-            if !products.iter().any(|product| product == required) {
-                return Err(format!(
-                    "SHMU site '{site_id}' is missing required product directory '{required}'"
-                ));
-            }
-        }
+        let mut plans = shmu_recent_plans(site_id, 1)?;
+        plans
+            .pop()
+            .ok_or_else(|| format!("SHMU site '{site_id}': no frames resolved"))
+    }
 
-        // Newest timestamp present in BOTH dBZ and V. The lookup is widened
-        // to the previous date directory when the newest date's
-        // intersection is empty (e.g. right after the UTC date rollover one
-        // product has already opened the new directory and the other has
-        // not).
-        let mut dbz = product_files_for_newest_date(site_id, "dBZ", 0)?;
-        let mut vel = product_files_for_newest_date(site_id, "V", 0)?;
-        let mut stamp = newest_common_stamp(&dbz, &vel);
-        if stamp.is_none() {
-            if let Ok(previous_dbz) = product_files_for_newest_date(site_id, "dBZ", 1) {
-                dbz.extend(previous_dbz);
-            }
-            if let Ok(previous_vel) = product_files_for_newest_date(site_id, "V", 1) {
-                vel.extend(previous_vel);
-            }
-            stamp = newest_common_stamp(&dbz, &vel);
-        }
-        let Some(stamp) = stamp else {
-            return Err(format!(
-                "SHMU site '{site_id}': no timestamp common to dBZ and V \
-                 ({} dBZ files, {} V files inspected)",
-                dbz.len(),
-                vel.len()
-            ));
-        };
-        let date = &stamp[..8];
-
-        let mut parts = vec![
-            PlanPart {
-                url: product_file_url(site_id, "dBZ", date, &dbz[&stamp]),
-            },
-            PlanPart {
-                url: product_file_url(site_id, "V", date, &vel[&stamp]),
-            },
-        ];
-        for product in OPTIONAL_PRODUCTS {
-            if !products.iter().any(|name| name == product) {
-                continue;
-            }
-            // Optional products lag the required pair by a file or two at
-            // times (live capture: KDP one stamp behind dBZ/V); they are
-            // merged in only when the exact timestamp exists.
-            let Ok(files) = product_files_for_date(site_id, product, date) else {
-                continue;
-            };
-            if let Some(name) = files.get(&stamp) {
-                parts.push(PlanPart {
-                    url: product_file_url(site_id, product, date, name),
-                });
-            }
-        }
-
-        Ok(FramePlan {
-            identity: plan_identity(site_id, &stamp, &parts),
-            parts,
-            merge: true,
-        })
+    fn recent_source(&self) -> Option<&dyn RecentFrames> {
+        Some(self)
     }
 
     fn static_sites(&self) -> Vec<IntlSite> {
@@ -193,6 +125,128 @@ impl IntlProvider for ShmuProvider {
             })
             .collect()
     }
+}
+
+impl RecentFrames for ShmuProvider {
+    fn recent_frames(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
+        shmu_recent_plans(site_id, count)
+    }
+}
+
+/// Up to `count` frames, OLDEST FIRST, from the dated product directories.
+/// With `count = 1` this is byte-for-byte the frame `latest` has always
+/// described (same stamp choice, part order, and identity), so the loop's
+/// newest frame stays the live poll's dedupe key.
+fn shmu_recent_plans(site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
+    if !is_safe_path_segment(site_id) {
+        return Err(format!("SHMU: invalid site id '{site_id}'"));
+    }
+    let count = count.max(1);
+    let site_url = format!("{SHMU_VOLUME_ROOT}{site_id}/");
+    let site_html =
+        fetch_text(&site_url).map_err(|err| format!("SHMU product listing {site_url}: {err}"))?;
+    let products: Vec<String> = parse_autoindex(&site_html)
+        .into_iter()
+        .filter(|entry| entry.is_dir)
+        .map(|entry| entry.name)
+        .collect();
+    for required in REQUIRED_PRODUCTS {
+        if !products.iter().any(|product| product == required) {
+            return Err(format!(
+                "SHMU site '{site_id}' is missing required product directory '{required}'"
+            ));
+        }
+    }
+
+    // Newest timestamps present in BOTH dBZ and V. The lookup is widened
+    // to the previous date directory when the newest date alone cannot
+    // fill the request (e.g. right after the UTC date rollover one product
+    // has already opened the new directory and the other has not, or the
+    // new directory is still too short for the requested loop).
+    let mut dbz = product_files_for_newest_date(site_id, "dBZ", 0)?;
+    let mut vel = product_files_for_newest_date(site_id, "V", 0)?;
+    if newest_common_stamps(&dbz, &vel, count).len() < count {
+        if let Ok(previous_dbz) = product_files_for_newest_date(site_id, "dBZ", 1) {
+            dbz.extend(previous_dbz);
+        }
+        if let Ok(previous_vel) = product_files_for_newest_date(site_id, "V", 1) {
+            vel.extend(previous_vel);
+        }
+    }
+    let stamps = newest_common_stamps(&dbz, &vel, count);
+    if stamps.is_empty() {
+        return Err(format!(
+            "SHMU site '{site_id}': no timestamp common to dBZ and V \
+             ({} dBZ files, {} V files inspected)",
+            dbz.len(),
+            vel.len()
+        ));
+    }
+
+    // Optional products: one date-merged stamp map per product present in
+    // the listing, each date directory fetched once. Optional products lag
+    // the required pair by a file or two at times (live capture: KDP one
+    // stamp behind dBZ/V); they merge in only where the exact timestamp
+    // exists, and a missing/unreachable optional directory never fails the
+    // frame.
+    let dates: BTreeSet<String> = stamps.iter().map(|stamp| stamp[..8].to_owned()).collect();
+    let mut optional: Vec<(&'static str, BTreeMap<String, String>)> = Vec::new();
+    for product in OPTIONAL_PRODUCTS {
+        if !products.iter().any(|name| name == product) {
+            continue;
+        }
+        let mut merged = BTreeMap::new();
+        for date in &dates {
+            if let Ok(files) = product_files_for_date(site_id, product, date) {
+                merged.extend(files);
+            }
+        }
+        optional.push((product, merged));
+    }
+
+    Ok(plans_from_stamp_maps(
+        site_id, &stamps, &dbz, &vel, &optional,
+    ))
+}
+
+/// Build one plan per stamp from prefetched stamp maps, OLDEST FIRST
+/// (pure; unit-testable). Part order per frame: dBZ (merge base), V, then
+/// optional products in [`OPTIONAL_PRODUCTS`] order where the stamp exists.
+fn plans_from_stamp_maps(
+    site_id: &str,
+    stamps_newest_first: &[String],
+    dbz: &BTreeMap<String, String>,
+    vel: &BTreeMap<String, String>,
+    optional: &[(&'static str, BTreeMap<String, String>)],
+) -> Vec<FramePlan> {
+    stamps_newest_first
+        .iter()
+        .rev()
+        .filter_map(|stamp| {
+            // Stamps are validated 14-digit runs, so [..8] is the date dir.
+            let date = stamp.get(..8)?;
+            let mut parts = vec![
+                PlanPart {
+                    url: product_file_url(site_id, "dBZ", date, dbz.get(stamp)?),
+                },
+                PlanPart {
+                    url: product_file_url(site_id, "V", date, vel.get(stamp)?),
+                },
+            ];
+            for (product, files) in optional {
+                if let Some(name) = files.get(stamp) {
+                    parts.push(PlanPart {
+                        url: product_file_url(site_id, product, date, name),
+                    });
+                }
+            }
+            Some(FramePlan {
+                identity: plan_identity(site_id, stamp, &parts),
+                parts,
+                merge: true,
+            })
+        })
+        .collect()
 }
 
 /// `{site}_{stamp}_p{N}_h{url-hash}`: stable for one upstream frame, and a
@@ -270,15 +324,18 @@ fn stamp_map(listing_html: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Newest timestamp present in both maps.
-fn newest_common_stamp(
+/// Newest `count` timestamps present in both maps, NEWEST FIRST.
+fn newest_common_stamps(
     dbz: &BTreeMap<String, String>,
     vel: &BTreeMap<String, String>,
-) -> Option<String> {
+    count: usize,
+) -> Vec<String> {
     dbz.keys()
         .rev()
-        .find(|stamp| vel.contains_key(*stamp))
+        .filter(|stamp| vel.contains_key(*stamp))
+        .take(count.max(1))
         .cloned()
+        .collect()
 }
 
 /// Site ids come back out of our own listings, but `latest` is a public
@@ -327,31 +384,95 @@ mod tests {
     }
 
     #[test]
-    fn stamp_maps_intersect_on_the_newest_common_timestamp() {
+    fn stamp_maps_intersect_on_the_newest_common_timestamps() {
         let dbz = stamp_map(DBZ_FILES);
         let vel = stamp_map(V_FILES);
         assert_eq!(dbz.len(), 8);
         assert_eq!(vel.len(), 8);
         assert_eq!(
-            newest_common_stamp(&dbz, &vel).as_deref(),
-            Some("20260612065000")
+            newest_common_stamps(&dbz, &vel, 1),
+            vec!["20260612065000".to_owned()]
         );
+        // NEWEST FIRST, capped at count.
+        assert_eq!(
+            newest_common_stamps(&dbz, &vel, 3),
+            vec![
+                "20260612065000".to_owned(),
+                "20260612064500".to_owned(),
+                "20260612064000".to_owned(),
+            ]
+        );
+        assert_eq!(newest_common_stamps(&dbz, &vel, 99).len(), 8);
         assert_eq!(dbz["20260612065000"], "T_PAGZ41_C_LZIB_20260612065000.hdf");
         assert_eq!(vel["20260612065000"], "T_PAHZ41_C_LZIB_20260612065000.hdf");
     }
 
     #[test]
-    fn common_stamp_ignores_products_that_lag() {
+    fn common_stamps_ignore_products_that_lag() {
         let mut dbz = BTreeMap::new();
         dbz.insert("20260612064500".to_owned(), "a.hdf".to_owned());
         dbz.insert("20260612065000".to_owned(), "b.hdf".to_owned());
         let mut vel = BTreeMap::new();
         vel.insert("20260612064500".to_owned(), "c.hdf".to_owned());
         assert_eq!(
-            newest_common_stamp(&dbz, &vel).as_deref(),
-            Some("20260612064500")
+            newest_common_stamps(&dbz, &vel, 5),
+            vec!["20260612064500".to_owned()]
         );
-        assert_eq!(newest_common_stamp(&dbz, &BTreeMap::new()), None);
+        assert!(newest_common_stamps(&dbz, &BTreeMap::new(), 5).is_empty());
+    }
+
+    /// The provider must advertise the real loop it now has (fails on the
+    /// old single-frame ShmuProvider).
+    #[test]
+    fn provider_advertises_a_real_recent_loop() {
+        let provider = ShmuProvider;
+        assert!(provider.recent_source().is_some());
+        assert!(provider.supports_recent());
+    }
+
+    /// Plans come back OLDEST FIRST with the newest frame LAST — and the
+    /// newest frame is exactly the single frame a count-1 (`latest`) build
+    /// produces, so the loop ends on the poll dedupe key.
+    #[test]
+    fn recent_plans_are_oldest_first_and_end_on_the_latest_frame() {
+        let dbz = stamp_map(DBZ_FILES);
+        let vel = stamp_map(V_FILES);
+        let stamps = newest_common_stamps(&dbz, &vel, 3);
+        let plans = plans_from_stamp_maps("skjav", &stamps, &dbz, &vel, &[]);
+        assert_eq!(plans.len(), 3);
+        assert!(plans[0].identity.starts_with("skjav_20260612064000_p2_h"));
+        assert!(plans[1].identity.starts_with("skjav_20260612064500_p2_h"));
+        assert!(plans[2].identity.starts_with("skjav_20260612065000_p2_h"));
+        assert!(plans.iter().all(|plan| plan.merge));
+        // dBZ is the merge base of every frame, V second.
+        for plan in &plans {
+            assert!(plan.parts[0].url.contains("/dBZ/"), "{}", plan.parts[0].url);
+            assert!(plan.parts[1].url.contains("/V/"), "{}", plan.parts[1].url);
+        }
+
+        let latest_stamps = newest_common_stamps(&dbz, &vel, 1);
+        let latest = plans_from_stamp_maps("skjav", &latest_stamps, &dbz, &vel, &[]);
+        assert_eq!(plans.last(), latest.first());
+    }
+
+    /// An optional product joins only the frames whose exact stamp it has;
+    /// the identity's part count/hash reflects that per frame.
+    #[test]
+    fn optional_products_join_only_their_own_stamps() {
+        let dbz = stamp_map(DBZ_FILES);
+        let vel = stamp_map(V_FILES);
+        let stamps = newest_common_stamps(&dbz, &vel, 2);
+        let mut zdr = BTreeMap::new();
+        zdr.insert(
+            "20260612065000".to_owned(),
+            "T_PAJZ41_C_LZIB_20260612065000.hdf".to_owned(),
+        );
+        let plans = plans_from_stamp_maps("skjav", &stamps, &dbz, &vel, &[("ZDR", zdr)]);
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].parts.len(), 2, "no ZDR at the older stamp");
+        assert_eq!(plans[1].parts.len(), 3, "ZDR joins the newest stamp");
+        assert!(plans[1].parts[2].url.contains("/ZDR/"));
+        assert!(plans[1].identity.starts_with("skjav_20260612065000_p3_h"));
     }
 
     #[test]

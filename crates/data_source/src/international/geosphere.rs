@@ -18,7 +18,8 @@
 use chrono::{Duration, Utc};
 
 use super::{
-    FramePlan, IntlProvider, IntlSite, PlanPart, fetch_s3_style_listing, s3_style_listing_url,
+    FramePlan, IntlProvider, IntlSite, PlanPart, RecentFrames, fetch_s3_style_listing,
+    s3_style_listing_url,
 };
 
 const DATAHUB_BASE: &str = "https://public.hub.geosphere.at/datahub";
@@ -78,52 +79,13 @@ impl IntlProvider for GeoSphereProvider {
     }
 
     fn latest(&self, site_id: &str) -> Result<FramePlan, String> {
-        if site_id != SITE_ID {
-            return Err(format!(
-                "GeoSphere: unknown site '{site_id}' (only '{SITE_ID}')"
-            ));
-        }
+        validate_site(site_id)?;
+        let keys = window_wxrhof_keys()?;
+        recent_plans(&keys, 1).pop().ok_or_else(no_frames_error) // unreachable: keys are non-empty
+    }
 
-        let now = Utc::now();
-        for hours in LOOKBACK_HOURS {
-            let start_stamp = (now - Duration::hours(hours)).format("%Y%m%d%H%M");
-            let mut start_after = format!("{FILE_PREFIX}WXRHOF_{start_stamp}.hdf");
-            let mut newest: Option<String> = None;
-
-            for _page in 0..MAX_LISTING_PAGES {
-                let url =
-                    s3_style_listing_url(DATAHUB_BASE, FILE_PREFIX, None, Some(&start_after), 1000);
-                let listing = fetch_s3_style_listing(&url)
-                    .map_err(|err| format!("GeoSphere Hochficht {err}"))?;
-                if let Some(page_newest) = newest_wxrhof_key(&listing.keys) {
-                    newest = Some(page_newest.to_owned());
-                }
-                let Some(last_key) = listing.keys.last() else {
-                    break;
-                };
-                if !listing.is_truncated {
-                    break;
-                }
-                start_after = last_key.clone();
-            }
-
-            if let Some(key) = newest {
-                let file_name = key.rsplit('/').next().unwrap_or(&key).to_owned();
-                return Ok(FramePlan {
-                    identity: file_name,
-                    parts: vec![PlanPart {
-                        url: format!("{DATAHUB_BASE}/{key}"),
-                    }],
-                    merge: false,
-                });
-            }
-        }
-
-        Err(format!(
-            "GeoSphere Hochficht listing returned no WXRHOF_*.hdf files in \
-             the last {} h",
-            LOOKBACK_HOURS[LOOKBACK_HOURS.len() - 1]
-        ))
+    fn recent_source(&self) -> Option<&dyn RecentFrames> {
+        Some(self)
     }
 
     fn static_sites(&self) -> Vec<IntlSite> {
@@ -138,19 +100,102 @@ impl IntlProvider for GeoSphereProvider {
     }
 }
 
-/// The newest `WXRHOF_*.hdf` key on a page. Keys carry zero-padded UTC
-/// stamps, so the lexicographic maximum is the chronological maximum;
-/// non-matching keys (sidecar files, anything else under the prefix) are
-/// ignored.
-fn newest_wxrhof_key(keys: &[String]) -> Option<&str> {
-    keys.iter()
-        .filter(|key| {
-            key.rsplit('/').next().is_some_and(|file_name| {
-                file_name.starts_with("WXRHOF_") && file_name.ends_with(".hdf")
-            })
-        })
-        .max_by(|left, right| left.cmp(right))
+impl RecentFrames for GeoSphereProvider {
+    fn recent_frames(&self, site_id: &str, count: usize) -> Result<Vec<FramePlan>, String> {
+        validate_site(site_id)?;
+        let keys = window_wxrhof_keys()?;
+        Ok(recent_plans(&keys, count))
+    }
+}
+
+fn validate_site(site_id: &str) -> Result<(), String> {
+    if site_id == SITE_ID {
+        Ok(())
+    } else {
+        Err(format!(
+            "GeoSphere: unknown site '{site_id}' (only '{SITE_ID}')"
+        ))
+    }
+}
+
+fn no_frames_error() -> String {
+    format!(
+        "GeoSphere Hochficht listing returned no WXRHOF_*.hdf files in \
+         the last {} h",
+        LOOKBACK_HOURS[LOOKBACK_HOURS.len() - 1]
+    )
+}
+
+/// Every `WXRHOF_*.hdf` key in the freshest lookback window that lists any:
+/// the paged `start-after` walk `latest` has always done, but keeping ALL
+/// matching keys instead of only the newest one. Guaranteed non-empty on
+/// `Ok`.
+fn window_wxrhof_keys() -> Result<Vec<String>, String> {
+    let now = Utc::now();
+    for hours in LOOKBACK_HOURS {
+        let start_stamp = (now - Duration::hours(hours)).format("%Y%m%d%H%M");
+        let mut start_after = format!("{FILE_PREFIX}WXRHOF_{start_stamp}.hdf");
+        let mut collected: Vec<String> = Vec::new();
+
+        for _page in 0..MAX_LISTING_PAGES {
+            let url =
+                s3_style_listing_url(DATAHUB_BASE, FILE_PREFIX, None, Some(&start_after), 1000);
+            let listing =
+                fetch_s3_style_listing(&url).map_err(|err| format!("GeoSphere Hochficht {err}"))?;
+            collected.extend(
+                listing
+                    .keys
+                    .iter()
+                    .filter(|key| is_wxrhof_key(key))
+                    .cloned(),
+            );
+            let Some(last_key) = listing.keys.last() else {
+                break;
+            };
+            if !listing.is_truncated {
+                break;
+            }
+            start_after = last_key.clone();
+        }
+
+        if !collected.is_empty() {
+            return Ok(collected);
+        }
+    }
+    Err(no_frames_error())
+}
+
+fn is_wxrhof_key(key: &str) -> bool {
+    key.rsplit('/')
+        .next()
+        .is_some_and(|file_name| file_name.starts_with("WXRHOF_") && file_name.ends_with(".hdf"))
+}
+
+/// Up to `count` plans for the newest `WXRHOF_*.hdf` keys, OLDEST FIRST
+/// (the [`RecentFrames`] contract). Keys carry zero-padded UTC stamps, so
+/// lexicographic order is chronological order; non-matching keys (sidecar
+/// files, anything else under the prefix) are ignored. Identity is the file
+/// name — precisely what `latest` uses, so the newest plan is the live
+/// poll's dedupe key.
+fn recent_plans(keys: &[String], count: usize) -> Vec<FramePlan> {
+    let mut keys: Vec<&str> = keys
+        .iter()
+        .filter(|key| is_wxrhof_key(key))
         .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let skip = keys.len().saturating_sub(count.max(1));
+    keys[skip..]
+        .iter()
+        .map(|key| FramePlan {
+            identity: key.rsplit('/').next().unwrap_or(key).to_owned(),
+            parts: vec![PlanPart {
+                url: format!("{DATAHUB_BASE}/{key}"),
+            }],
+            merge: false,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -167,28 +212,61 @@ mod tests {
         let listing = parse_s3_style_listing(RECENT_FIXTURE).expect("fixture parses");
         assert!(!listing.is_truncated);
         assert_eq!(listing.keys.len(), 4);
+        let newest = recent_plans(&listing.keys, 1);
+        assert_eq!(newest.len(), 1);
+        assert_eq!(newest[0].identity, "WXRHOF_202606120635.hdf");
         assert_eq!(
-            newest_wxrhof_key(&listing.keys),
-            Some("resources/radar_volumen_hochficht-v1-5min/filelisting/WXRHOF_202606120635.hdf")
+            newest[0].parts[0].url,
+            "https://public.hub.geosphere.at/datahub/resources/\
+             radar_volumen_hochficht-v1-5min/filelisting/WXRHOF_202606120635.hdf"
         );
     }
 
+    /// The provider must advertise the real loop it now has (fails on the
+    /// old single-frame GeoSphereProvider).
     #[test]
-    fn newest_key_selection_ignores_non_wxrhof_keys() {
+    fn provider_advertises_a_real_recent_loop() {
+        let provider = GeoSphereProvider::new();
+        assert!(provider.recent_source().is_some());
+        assert!(provider.supports_recent());
+    }
+
+    /// A rolling-window listing turns into plans OLDEST FIRST, newest last
+    /// (the loop-install order; the last identity is the poll dedupe key).
+    #[test]
+    fn recent_plans_keep_the_newest_count_keys_oldest_first() {
+        let listing = parse_s3_style_listing(RECENT_FIXTURE).expect("fixture parses");
+        let plans = recent_plans(&listing.keys, 3);
+        assert_eq!(plans.len(), 3);
+        let identities: Vec<&str> = plans.iter().map(|plan| plan.identity.as_str()).collect();
+        assert!(
+            identities.windows(2).all(|pair| pair[0] < pair[1]),
+            "plans must be oldest first: {identities:?}"
+        );
+        assert_eq!(identities.last(), Some(&"WXRHOF_202606120635.hdf"));
+        assert!(plans.iter().all(|plan| !plan.merge));
+        // Newest recent plan == the plan `latest` builds (dedupe key).
+        assert_eq!(
+            plans.last(),
+            recent_plans(&listing.keys, 1).first(),
+            "newest recent frame must equal the latest frame"
+        );
+        // Asking for more than exists returns everything, still ordered.
+        assert_eq!(recent_plans(&listing.keys, 99).len(), 4);
+    }
+
+    #[test]
+    fn recent_plans_ignore_non_wxrhof_keys() {
         let keys = vec![
             format!("{FILE_PREFIX}WXRHOF_202606120000.hdf"),
             format!("{FILE_PREFIX}ZZZ_999912312359.txt"),
             format!("{FILE_PREFIX}WXRHOF_202606120630.hdf"),
         ];
-        assert_eq!(
-            newest_wxrhof_key(&keys),
-            Some(format!("{FILE_PREFIX}WXRHOF_202606120630.hdf").as_str())
-        );
-        assert_eq!(newest_wxrhof_key(&[]), None);
-        assert_eq!(
-            newest_wxrhof_key(&[format!("{FILE_PREFIX}notes.txt")]),
-            None
-        );
+        let plans = recent_plans(&keys, 10);
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[1].identity, "WXRHOF_202606120630.hdf");
+        assert!(recent_plans(&[], 3).is_empty());
+        assert!(recent_plans(&[format!("{FILE_PREFIX}notes.txt")], 3).is_empty());
     }
 
     #[test]

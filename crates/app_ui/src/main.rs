@@ -189,7 +189,7 @@ const LOOP_SPEED_PERCENT_OPTIONS: &[u16] =
 const BACKGROUND_ACTIVITY_REPAINT_MS: u64 = 250;
 const SATELLITE_MAP_LAYER_HOVER: &str =
     "Render the current frame as a layer under the radar (opacity in Custom)";
-const RADAR_OVERLAYS_EMPTY_HELP: &str = "No overlay radars yet. Add one from Custom > Add layer > Radar overlay, or Ctrl+right-click the map to add the nearest radar. When a loop is loaded, WSR-88D overlays auto-sync to that loop.";
+const RADAR_OVERLAYS_EMPTY_HELP: &str = "No overlay radars yet. Add one from Custom > Add layer > Radar overlay, or Ctrl+right-click the map to add the nearest radar (US or international, whichever is closer). When a loop is loaded, WSR-88D overlays auto-sync to that loop; international overlays refresh live on their provider cadence.";
 const SECURITY_UNSIGNED_BUILD_TEXT: &str = "Official Windows release binaries are Authenticode-signed (Azure Trusted Signing). Windows Defender or SmartScreen may still warn on unsigned local builds or renamed copies. Use official GitHub release assets when possible; do not whitelist random copies.";
 const SECURITY_SIGNATURE_STATUS_TEXT: &str = "In-app updates install only after two checks pass on the downloaded file: it must match the SHA-256 the release published, and Windows (WinVerifyTrust) must report a valid Authenticode signature. Anything else is deleted and reported here.";
 const WGPU_TO_GLOW_FALLBACK_NOTICE: &str =
@@ -304,6 +304,11 @@ const DEBUG_ARCHIVE_CASES: &[DebugArchiveCase] = &[
 enum BeamTarget {
     /// Primary Level II catalog index: select the site and load latest.
     Conus(usize),
+    /// International static-catalog site: start (or retarget) the intl
+    /// poll — beam height at 0.5° is pure geometry, so intl sites rank
+    /// in the same lowest-beam list as WSR-88Ds (parity: international
+    /// radars are not second-class).
+    Intl(data_source::international::IntlSite),
 }
 
 /// One row of the lowest-beam ranking.
@@ -567,6 +572,12 @@ const HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM: usize = 6;
 /// 5-minute-ish schedules and each tick costs an upstream API round trip —
 /// 60 s, not the custom URL poll's 15 s dir.list cadence.
 const INTL_POLL_SECONDS: u64 = 60;
+/// Stale-threshold floor for the primary mode chip while an international
+/// poll owns the display: intl feeds publish on 5-15 minute cadences (vs
+/// the 480 s NEXRAD-tuned default), so a live intl chip flags STALE only
+/// past twice the slowest routine cadence — a normal publish gap must not
+/// read as a fault.
+const INTL_STALE_CHIP_FLOOR_SECONDS: i64 = 1800;
 const ACTIVE_ALERTS_URL: &str = "https://api.weather.gov/alerts/active?status=actual";
 const SPC_MD_INDEX_URL: &str = "https://www.spc.noaa.gov/products/md/";
 const SPC_PRODUCT_BASE_URL: &str = "https://www.spc.noaa.gov";
@@ -7257,17 +7268,34 @@ impl ViewerApp {
 
     /// Ctrl+right-click: overlay the nearest radar — US or international,
     /// whichever marker is geographically closer (field request: intl
-    /// multi-radar like CONUS).
+    /// multi-radar like CONUS). v0.21 behavior, restored after the v0.27.2
+    /// regression left the intl branch dead and the US branch uncapped
+    /// (Ctrl+right-click over Berlin silently added a transatlantic 88D).
     fn add_nearest_radar_overlay_at(
         &mut self,
         rect: egui::Rect,
         pointer: egui::Pos2,
         ctx: &egui::Context,
     ) {
-        if let Some(index) = self.nearest_site_to_position(rect, pointer)
-            && let Some(site) = self.sites.get(index).cloned()
-        {
-            self.add_or_refresh_radar_layer_for_current_timeline(site, ctx);
+        let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
+        match nearest_overlay_dispatch(
+            &self.sites,
+            data_source::international::intl_static_sites(),
+            lat,
+            lon,
+        ) {
+            Some(NearestOverlayTarget::Us(index)) => {
+                if let Some(site) = self.sites.get(index).cloned() {
+                    self.add_or_refresh_radar_layer_for_current_timeline(site, ctx);
+                }
+            }
+            Some(NearestOverlayTarget::Intl(site)) => {
+                self.add_or_refresh_intl_radar_layer(&site, ctx);
+            }
+            None => {
+                self.status =
+                    "No WSR-88D or international radar within 460 km to overlay".to_owned();
+            }
         }
     }
 
@@ -7367,7 +7395,6 @@ impl ViewerApp {
     /// Ctrl+right-click on (or near) an international marker: add that
     /// site as a radar overlay layer, mirroring the US multi-radar flow
     /// (field request). Dedupe by provider/site; respects the layer cap.
-    #[allow(dead_code)]
     fn add_or_refresh_intl_radar_layer(
         &mut self,
         intl: &data_source::international::IntlSite,
@@ -14937,7 +14964,13 @@ impl ViewerApp {
 
     fn reset_view(&mut self) {
         self.map_scale = DEFAULT_MAP_SCALE;
-        self.center_selected_site();
+        // Center on the current display owner: radar_location prefers the
+        // loaded volume's own site coordinates, so Reset View during an
+        // international session stays on that radar instead of snapping
+        // across the Atlantic to the stale US selection.
+        if let Some((latitude_deg, longitude_deg)) = self.radar_location() {
+            self.center_map_on(latitude_deg, longitude_deg);
+        }
     }
 
     fn selected_site(&self) -> Option<&RadarSite> {
@@ -22626,6 +22659,21 @@ impl ViewerApp {
                      international on the provider cadence). A pane on the primary's site \
                      reuses the primary's data. The primary radar keeps its own Live control.",
                 );
+            } else if self.intl_source_owns_primary_display() {
+                // The US auto-refresh flag is a no-op for an international
+                // primary: bind Live to the intl poll itself so the checkbox
+                // and the mode chip both tell the truth (pause/resume).
+                let mut live = self.poll_active;
+                if ui
+                    .checkbox(&mut live, "Live")
+                    .on_hover_text(
+                        "Pause/resume live polling of this international feed. Resuming an \
+                         archive display starts polling the site's newest scans.",
+                    )
+                    .changed()
+                {
+                    self.set_intl_poll_paused(!live);
+                }
             } else {
                 ui.checkbox(&mut self.realtime_level2_auto_refresh, "Live")
                     .on_hover_text("Auto-refresh the primary radar with the newest live data");
@@ -28404,6 +28452,19 @@ impl ViewerApp {
                 })
             })
             .collect();
+        // International static-catalog sites compete in the same ranking
+        // (same 460 km fence, same 0.5° geometry): the lowest usable beam
+        // over Stockholm is an SMHI radar, not "no radar" (field report:
+        // the menu was dead across Europe/Australia/Japan).
+        candidates.extend(self.intl_radar_candidates(lat, lon, 460.0).into_iter().map(
+            |(site, distance_km)| BeamCandidate {
+                label: site.label.clone(),
+                origin: Some(intl_provider_label(site.provider_id)),
+                beam_m: beam_at(distance_km),
+                distance_km,
+                target: BeamTarget::Intl(site),
+            },
+        ));
         candidates.sort_by(|a, b| a.beam_m.total_cmp(&b.beam_m));
         candidates
     }
@@ -28421,6 +28482,20 @@ impl ViewerApp {
                 let site = self.sites[*index].clone();
                 self.start_latest_level2_load(site, ctx);
             }
+            BeamTarget::Intl(site) => {
+                // Same path as the DATA-tab intl picker: center + poll.
+                if let (Some(site_lat), Some(site_lon)) = (site.latitude_deg, site.longitude_deg) {
+                    self.center_map_on(site_lat, site_lon);
+                }
+                let site = site.clone();
+                self.start_intl_poll(site.provider_id.to_owned(), site.site_id.clone(), ctx);
+                self.status = format!(
+                    "Polling {} · {}",
+                    site.label,
+                    intl_provider_label(site.provider_id)
+                );
+                ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+            }
         }
     }
 
@@ -28437,6 +28512,12 @@ impl ViewerApp {
                 };
                 self.set_extra_pane_selected_site(pane_slot, *index);
                 self.start_extra_pane_latest_load(pane_slot, site, ctx);
+                true
+            }
+            BeamTarget::Intl(site) => {
+                // Load into the pane being edited, exactly like an intl
+                // marker click there (User mode re-centers the pane).
+                self.start_extra_pane_intl_load(pane_slot, site.clone(), LatestLoadMode::User, ctx);
                 true
             }
         }
@@ -28532,7 +28613,8 @@ impl ViewerApp {
     /// the nearest/best radar, no menu round-trip).
     fn switch_to_best_radar_at(&mut self, lon: f32, lat: f32, ctx: &egui::Context) {
         let Some(candidate) = self.best_radar_candidates(lat, lon).into_iter().next() else {
-            self.status = "No radar within 460 km of your click".to_owned();
+            self.status =
+                "No WSR-88D or international radar within 460 km of your click".to_owned();
             return;
         };
         // Same switch action as the context menu buttons. An explicit pick
@@ -28559,7 +28641,8 @@ impl ViewerApp {
     ) {
         let Some(candidate) = self.best_radar_candidates(lat, lon).into_iter().next() else {
             if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-                pane.status = "No radar within 460 km of your click".to_owned();
+                pane.status =
+                    "No WSR-88D or international radar within 460 km of your click".to_owned();
             }
             return;
         };
@@ -28585,7 +28668,8 @@ impl ViewerApp {
             .into_iter()
             .min_by(|a, b| a.distance_km.total_cmp(&b.distance_km))
         else {
-            self.status = "No radar within 460 km of your click".to_owned();
+            self.status =
+                "No WSR-88D or international radar within 460 km of your click".to_owned();
             return;
         };
         let label = candidate.label.clone();
@@ -28610,7 +28694,8 @@ impl ViewerApp {
             .min_by(|a, b| a.distance_km.total_cmp(&b.distance_km))
         else {
             if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-                pane.status = "No radar within 460 km of your click".to_owned();
+                pane.status =
+                    "No WSR-88D or international radar within 460 km of your click".to_owned();
             }
             return;
         };
@@ -28831,16 +28916,19 @@ impl ViewerApp {
             }
             ui.separator();
         }
-        if candidates.is_empty() {
-            ui.weak("No radar within 460 km");
-            return;
-        }
-        ui.label("Lowest beam here:");
         let units = self.units();
         let mut activate: Option<BeamCandidate> = None;
         let mut picked_feed: Option<data_source::community_feeds::CommunityFeed> = None;
         let mut picked_custom_feed: Option<usize> = None;
-        let mut picked_intl_site: Option<data_source::international::IntlSite> = None;
+        // Each section below renders independently: an empty lowest-beam
+        // ranking must never hide the TDWR/research/custom/international
+        // rows (field report: the menu claimed "No radar within 460 km"
+        // across Europe while ODIM sites sat under the click).
+        if candidates.is_empty() {
+            ui.weak("No WSR-88D or international radar within 460 km");
+        } else {
+            ui.label("Lowest beam here:");
+        }
         for candidate in candidates.into_iter().take(4) {
             let mut row = format!(
                 "{} · {} · {}",
@@ -28933,17 +29021,28 @@ impl ViewerApp {
             ui.label("International radars nearby:");
             for (site, distance_km) in intl_sites.into_iter().take(8) {
                 let provider = intl_provider_label(site.provider_id);
+                // Beam height at 0.5° is pure geometry, so intl rows carry
+                // the same readout as the WSR-88D ranking above.
+                let beam_m =
+                    radar_core::beam_height_above_radar_m(distance_km as f64 * 1000.0, 0.5) as f32;
                 if ui
                     .button(format!(
-                        "{} · {} · {}",
+                        "{} · {} · {} · {}",
                         site.label,
                         provider,
+                        units::format_beam_height(beam_m, units),
                         units::format_distance_km(distance_km, units)
                     ))
                     .on_hover_text("Start this international radar feed")
                     .clicked()
                 {
-                    picked_intl_site = Some(site);
+                    activate = Some(BeamCandidate {
+                        label: site.label.clone(),
+                        origin: Some(provider),
+                        beam_m,
+                        distance_km,
+                        target: BeamTarget::Intl(site),
+                    });
                     ui.close();
                 }
             }
@@ -28974,18 +29073,6 @@ impl ViewerApp {
             self.start_custom_poll_link(index);
             ui.ctx()
                 .request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
-        }
-        if let Some(site) = picked_intl_site {
-            if let (Some(site_lat), Some(site_lon)) = (site.latitude_deg, site.longitude_deg) {
-                self.center_map_on(site_lat, site_lon);
-            }
-            let provider = site.provider_id.to_owned();
-            let site_id = site.site_id.clone();
-            let label = site.label.clone();
-            let ctx = ui.ctx().clone();
-            self.start_intl_poll(provider.clone(), site_id.clone(), &ctx);
-            self.status = format!("Polling {label} · {}", intl_provider_label(&provider));
-            ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
         }
     }
 
@@ -31116,6 +31203,26 @@ impl ViewerApp {
             return false;
         }
         true
+    }
+
+    /// Pause/resume the international poll in place (the primary Live
+    /// checkbox for an intl display owner). Pausing drops the in-flight
+    /// tick; resuming re-arms without clearing frame history — the dedupe
+    /// key survives, so an unchanged catalog costs one probe. Resuming an
+    /// archive display (`poll_last_file` = None) polls the newest scan
+    /// into the loop, which is the explicit "go live here" intent.
+    fn set_intl_poll_paused(&mut self, paused: bool) {
+        if !self.intl_source_owns_primary_display() {
+            return;
+        }
+        if paused {
+            self.poll_active = false;
+            self.poll_rx = None;
+        } else {
+            self.poll_active = true;
+            // Fire on the next tick, not a full cadence from now.
+            self.poll_next = None;
+        }
     }
 
     fn set_ord_archive_primary_source(&mut self, site_id: &str) {
@@ -36533,6 +36640,23 @@ impl ViewerApp {
         );
     }
 
+    /// True when the DISPLAYED cut's velocity feed carries no usable
+    /// Nyquist, making the render2d dealiaser a pure pass-through there
+    /// (JMA always — staggered PRF; occasional ODIM files missing
+    /// `how/NI`). Drives the "no Nyquist" honesty tag for DVEL/DSRV.
+    fn displayed_cut_dealias_skipped_no_nyquist(&self) -> bool {
+        let Some(volume) = self.volume.as_ref() else {
+            return false;
+        };
+        let Some(cut) = volume.cuts.get(self.selected_cut) else {
+            return false;
+        };
+        let Some(grid) = cut.moments.get(&MomentType::Velocity) else {
+            return false;
+        };
+        render2d::dealias_skipped_no_nyquist(cut, grid)
+    }
+
     fn draw_velocity_quality_tag_for_product(
         &self,
         painter: &egui::Painter,
@@ -36541,25 +36665,41 @@ impl ViewerApp {
         top_offset: f32,
         provider_id: Option<&str>,
     ) {
-        if self.product_render_uses_dealiased_velocity(product)
-            && matches!(provider_id, Some("ord"))
-            && self.volume.is_some()
-        {
-            let label = "VRADH dealiased locally";
-            let pos = egui::pos2(rect.left() + 10.0, rect.top() + top_offset);
-            let width = 16.0 + label.chars().count() as f32 * 7.2;
-            let chip = egui::Rect::from_min_size(pos, egui::vec2(width, 20.0));
-            painter.rect_filled(chip, 4.0, egui::Color32::from_rgb(44, 78, 108));
-            painter.text(
-                chip.center(),
-                egui::Align2::CENTER_CENTER,
-                label,
-                egui::FontId::proportional(12.0),
-                egui::Color32::from_rgb(228, 238, 248),
-            );
-        } else {
-            self.draw_raw_velocity_tag_for_product(painter, rect, product, top_offset);
+        if self.volume.is_none() {
+            return;
         }
+        let renders_dealiased = self.product_render_uses_dealiased_velocity(product);
+        let Some(tag) = velocity_quality_tag(
+            renders_dealiased,
+            product.is_signed_radial_velocity(),
+            renders_dealiased && self.displayed_cut_dealias_skipped_no_nyquist(),
+            provider_id,
+        ) else {
+            return;
+        };
+        let (bg, fg) = match tag {
+            VelocityQualityTag::DealiasedLocally => (
+                egui::Color32::from_rgb(44, 78, 108),
+                egui::Color32::from_rgb(228, 238, 248),
+            ),
+            // Warning palette: both mean "what you see is raw velocity".
+            VelocityQualityTag::NoNyquistPassThrough | VelocityQualityTag::RawFoldsPossible => (
+                egui::Color32::from_rgb(120, 70, 20),
+                egui::Color32::from_rgb(248, 238, 220),
+            ),
+        };
+        let label = tag.label();
+        let pos = egui::pos2(rect.left() + 10.0, rect.top() + top_offset);
+        let width = 16.0 + label.chars().count() as f32 * 7.2;
+        let chip = egui::Rect::from_min_size(pos, egui::vec2(width, 20.0));
+        painter.rect_filled(chip, 4.0, bg);
+        painter.text(
+            chip.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(12.0),
+            fg,
+        );
     }
 
     fn primary_velocity_provider_id(&self) -> Option<&str> {
@@ -36592,6 +36732,17 @@ impl ViewerApp {
     }
 
     fn mode_chip_state(&self) -> Option<(String, egui::Color32, &'static str)> {
+        // The PRIMARY chip follows the actual display owner. The US
+        // auto-refresh flag is meaningless for an international primary
+        // (no intl path sets or clears it): years-old ORD/SMHI archive
+        // frames used to read "LIVE · STALE Xm" and a streaming intl poll
+        // used to read "ARCHIVE".
+        if self.intl_source_owns_primary_display() {
+            return self.mode_chip_state_with_live_and_stale_floor(
+                self.intl_poll_owns_primary(),
+                INTL_STALE_CHIP_FLOOR_SECONDS,
+            );
+        }
         self.mode_chip_state_with_live(self.realtime_level2_auto_refresh)
     }
 
@@ -36603,6 +36754,19 @@ impl ViewerApp {
         &self,
         live: bool,
     ) -> Option<(String, egui::Color32, &'static str)> {
+        self.mode_chip_state_with_live_and_stale_floor(live, 0)
+    }
+
+    /// [`Self::mode_chip_state_with_live`] with a floor on the stale
+    /// threshold: international feeds publish on 5-15 minute cadences, so
+    /// a live intl chip only flags STALE past twice the slowest routine
+    /// cadence — a normal publish gap must never read as a fault (a user
+    /// stale threshold above the floor still wins).
+    fn mode_chip_state_with_live_and_stale_floor(
+        &self,
+        live: bool,
+        stale_floor_seconds: i64,
+    ) -> Option<(String, egui::Color32, &'static str)> {
         let volume = self.volume.as_ref()?;
         let age = Utc::now() - volume.volume_time.with_timezone(&Utc);
         let age_seconds = age.num_seconds().max(0);
@@ -36611,7 +36775,7 @@ impl ViewerApp {
         let fresh_bg = style_color32(age_style.fresh_color);
         let stale_bg = style_color32(age_style.stale_color);
         let archive_bg = style_color32(age_style.aging_color);
-        let stale_chip_seconds = age_style.stale_chip_seconds.max(0);
+        let stale_chip_seconds = age_style.stale_chip_seconds.max(0).max(stale_floor_seconds);
         // A live feed should refresh every few minutes; if it has not, flag stale.
         let state = if live && age_seconds <= stale_chip_seconds {
             ("● LIVE".to_owned(), fresh_bg, "LIVE")
@@ -40393,21 +40557,6 @@ impl ViewerApp {
         ));
     }
 
-    fn nearest_site_to_position(&self, rect: egui::Rect, position: egui::Pos2) -> Option<usize> {
-        let (target_lon, target_lat) = self.screen_to_lon_lat(rect, position);
-        self.sites
-            .iter()
-            .enumerate()
-            .filter(|(_, site)| site_is_primary_level2_catalog_site(site))
-            .filter_map(|(index, site)| {
-                let (latitude_deg, longitude_deg) = site_location(site)?;
-                let distance_km = haversine_km(target_lat, target_lon, latitude_deg, longitude_deg);
-                Some((index, distance_km))
-            })
-            .min_by(|left, right| left.1.total_cmp(&right.1))
-            .map(|(index, _)| index)
-    }
-
     /// Hover readout for derived products via a one-shot grid cache.
     fn derived_cursor_readout(
         &mut self,
@@ -42341,6 +42490,109 @@ fn site_is_primary_level2_catalog_site(site: &RadarSite) -> bool {
 /// full 460 km range) and only happens to share the T prefix.
 fn site_is_tdwr(site: &RadarSite) -> bool {
     site.level2_id.starts_with('T') && !site.level2_id.eq_ignore_ascii_case("TJUA")
+}
+
+/// What a Ctrl+right-click "add nearest radar overlay" resolves to.
+#[derive(Clone, Debug, PartialEq)]
+enum NearestOverlayTarget {
+    /// Index into the primary US Level II site catalog.
+    Us(usize),
+    /// International static-catalog site.
+    Intl(data_source::international::IntlSite),
+}
+
+/// Overlay adds share the context menu's 460 km fence: a click with
+/// nothing in range must be an honest no-op, never a transatlantic layer.
+const NEAREST_OVERLAY_MAX_KM: f32 = 460.0;
+
+/// Pure v0.21 dispatch for Ctrl+right-click overlay adds: the nearest
+/// primary-catalog US site vs the nearest international site by ground
+/// distance, whichever is closer, both capped at
+/// [`NEAREST_OVERLAY_MAX_KM`]. `None` = nothing in range.
+fn nearest_overlay_dispatch(
+    sites: &[RadarSite],
+    intl_sites: &[data_source::international::IntlSite],
+    lat: f32,
+    lon: f32,
+) -> Option<NearestOverlayTarget> {
+    let us = sites
+        .iter()
+        .enumerate()
+        .filter(|(_, site)| site_is_primary_level2_catalog_site(site))
+        .filter_map(|(index, site)| {
+            let (site_lat, site_lon) = site_location(site)?;
+            let distance_km = haversine_km(lat, lon, site_lat, site_lon);
+            (distance_km <= NEAREST_OVERLAY_MAX_KM).then_some((index, distance_km))
+        })
+        .min_by(|left, right| left.1.total_cmp(&right.1));
+    let intl = intl_sites
+        .iter()
+        .filter_map(|site| {
+            let (Some(site_lat), Some(site_lon)) = (site.latitude_deg, site.longitude_deg) else {
+                return None;
+            };
+            let distance_km = haversine_km(lat, lon, site_lat, site_lon);
+            (distance_km <= NEAREST_OVERLAY_MAX_KM).then_some((site, distance_km))
+        })
+        .min_by(|left, right| left.1.total_cmp(&right.1));
+    match (us, intl) {
+        (Some((index, us_km)), Some((_, intl_km))) if us_km <= intl_km => {
+            Some(NearestOverlayTarget::Us(index))
+        }
+        (Some((index, _)), None) => Some(NearestOverlayTarget::Us(index)),
+        (_, Some((site, _))) => Some(NearestOverlayTarget::Intl(site.clone())),
+        (None, None) => None,
+    }
+}
+
+/// Honesty tag for a velocity product render, drawn under the mode chip —
+/// the one spot where the displayed product's data quality must never lie.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VelocityQualityTag {
+    /// Product is labeled dealiased (DVEL/DSRV or unfolded VEL) but the
+    /// feed carries no Nyquist velocity, so the dealiaser was a pure
+    /// pass-through (JMA always by design — staggered PRF; occasional
+    /// ODIM files omit how/NI) and the fold warning can never fire.
+    NoNyquistPassThrough,
+    /// ORD ODIM velocity dealiased in-app (provenance chip).
+    DealiasedLocally,
+    /// Raw signed radial velocity render: folds possible.
+    RawFoldsPossible,
+}
+
+impl VelocityQualityTag {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoNyquistPassThrough => "no Nyquist in this feed — showing raw velocity",
+            Self::DealiasedLocally => "VRADH dealiased locally",
+            Self::RawFoldsPossible => "RAW VEL — folds possible",
+        }
+    }
+}
+
+/// Pure tag derivation (None = no tag). `dealias_skipped_no_nyquist` is
+/// the render2d query over the displayed cut's velocity grid; the
+/// pass-through disclosure outranks the ORD provenance chip because a
+/// "dealiased" label over raw data is the bigger lie.
+fn velocity_quality_tag(
+    renders_dealiased: bool,
+    is_signed_velocity: bool,
+    dealias_skipped_no_nyquist: bool,
+    provider_id: Option<&str>,
+) -> Option<VelocityQualityTag> {
+    if renders_dealiased {
+        if dealias_skipped_no_nyquist {
+            return Some(VelocityQualityTag::NoNyquistPassThrough);
+        }
+        if matches!(provider_id, Some("ord")) {
+            return Some(VelocityQualityTag::DealiasedLocally);
+        }
+        return None;
+    }
+    if is_signed_velocity {
+        return Some(VelocityQualityTag::RawFoldsPossible);
+    }
+    None
 }
 
 /// The marker in `points` nearest to `pointer` within the shared 12 px
@@ -52688,6 +52940,142 @@ mod tests {
                     && candidate.label != "Link only"),
             "research/custom feeds stay explicit site/feed picks"
         );
+    }
+
+    #[test]
+    fn best_radar_candidates_rank_intl_sites_with_beam_heights() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        // Europe-like layout: no US site within the 460 km fence of a
+        // Stockholm-area click, static intl catalog sites right there.
+        // Old behavior: the ranking came back EMPTY (US-catalog-only), the
+        // context menu early-returned "No radar within 460 km", and
+        // Ctrl+click did nothing across Europe/Australia/Japan.
+        app.sites = vec![RadarSite::new("KTLX").with_location(
+            Some("Norman".to_owned()),
+            Some(35.333),
+            Some(-97.278),
+        )];
+
+        let candidates = app.best_radar_candidates(59.65, 17.95);
+        assert!(
+            !candidates.is_empty(),
+            "intl sites must enter the lowest-beam ranking"
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| matches!(candidate.target, BeamTarget::Intl(_))),
+            "no US site is within 460 km of Stockholm"
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.distance_km <= 460.0),
+            "intl candidates honor the shared 460 km fence"
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.origin.is_some() && candidate.beam_m > 0.0),
+            "intl rows carry provider provenance and a real beam height"
+        );
+        assert!(
+            candidates
+                .windows(2)
+                .all(|pair| pair[0].beam_m <= pair[1].beam_m),
+            "ranking stays sorted by beam height ascending"
+        );
+
+        // A US site inside the same fence competes in ONE beam-sorted
+        // ranking: intl candidates are not a second-class side list.
+        app.sites.push(RadarSite::new("KFAK").with_location(
+            Some("Hypothetical Baltic 88D".to_owned()),
+            Some(58.0),
+            Some(20.0),
+        ));
+        let mixed = app.best_radar_candidates(59.65, 17.95);
+        assert!(
+            mixed
+                .iter()
+                .any(|candidate| matches!(candidate.target, BeamTarget::Conus(_)))
+                && mixed
+                    .iter()
+                    .any(|candidate| matches!(candidate.target, BeamTarget::Intl(_))),
+            "US and intl compete in the same ranking"
+        );
+        assert!(
+            mixed
+                .windows(2)
+                .all(|pair| pair[0].beam_m <= pair[1].beam_m),
+            "mixed ranking stays beam-sorted"
+        );
+    }
+
+    #[test]
+    fn switch_to_best_radar_over_europe_starts_intl_poll() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![RadarSite::new("KTLX").with_location(
+            Some("Norman".to_owned()),
+            Some(35.333),
+            Some(-97.278),
+        )];
+        let ctx = egui::Context::default();
+
+        // Ctrl+click over Stockholm: the lowest-beam pick is an intl site
+        // and must start the intl poll (old behavior: false status "No
+        // radar within 460 km of your click" and no load).
+        app.switch_to_best_radar_at(17.95, 59.65, &ctx);
+        assert!(app.poll_active, "intl pick must arm the poll");
+        assert!(
+            matches!(app.poll_source, PollSource::Intl { .. }),
+            "best-radar pick over Europe routes to the intl poller"
+        );
+        assert!(
+            app.status.starts_with("Switched to"),
+            "status reports the switch: {}",
+            app.status
+        );
+
+        // Mid-ocean: honest residual empty text names what was searched.
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = Vec::new();
+        app.switch_to_best_radar_at(-40.0, 45.0, &ctx);
+        assert_eq!(
+            app.status,
+            "No WSR-88D or international radar within 460 km of your click"
+        );
+        assert!(!app.poll_active);
+    }
+
+    #[test]
+    fn nearest_overlay_dispatch_picks_closer_family_with_distance_cap() {
+        let sites = vec![RadarSite::new("KTLX").with_location(
+            Some("Norman".to_owned()),
+            Some(35.333),
+            Some(-97.278),
+        )];
+        let intl = data_source::international::intl_static_sites();
+
+        // CONUS click: the US 88D wins.
+        assert_eq!(
+            nearest_overlay_dispatch(&sites, intl, 35.4, -97.2),
+            Some(NearestOverlayTarget::Us(0))
+        );
+        // Europe click: the intl site under the cursor wins (the v0.27.2
+        // regression consulted only the US catalog with no distance cap,
+        // silently adding a transatlantic 88D overlay here).
+        match nearest_overlay_dispatch(&sites, intl, 59.65, 17.95) {
+            Some(NearestOverlayTarget::Intl(site)) => {
+                assert!(
+                    site.latitude_deg.is_some() && site.longitude_deg.is_some(),
+                    "dispatch only considers located intl sites"
+                );
+            }
+            other => panic!("Europe click must dispatch to an intl overlay, got {other:?}"),
+        }
+        // Mid-Atlantic: nothing within 460 km — honest None, never a
+        // continent-away overlay.
+        assert_eq!(nearest_overlay_dispatch(&sites, intl, 45.0, -40.0), None);
     }
 
     #[test]
@@ -63294,6 +63682,146 @@ mod tests {
 
         assert_eq!(future_kind, "ARCH");
         assert!(future_label.contains("0m old"));
+    }
+
+    #[test]
+    fn primary_mode_chip_follows_intl_display_owner() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        // Years-old ORD archive frames while the stale US auto-refresh flag
+        // is still set: the chip must say ARCHIVE, never "LIVE · STALE"
+        // (the flag is primary-US state no intl path sets or clears).
+        app.realtime_level2_auto_refresh = true;
+        app.set_intl_archive_primary_source("ord", "deess");
+        app.volume = Some(Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("deess"),
+            Utc::now() - chrono::Duration::days(365),
+        )));
+        let (label, _, kind) = app.mode_chip_state().expect("intl archive chip");
+        assert_eq!(
+            kind, "ARCH",
+            "intl archive display must read ARCHIVE: {label}"
+        );
+
+        // A streaming intl poll reads LIVE regardless of the US flag.
+        app.poll_active = true;
+        app.realtime_level2_auto_refresh = false;
+        app.volume = Some(Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("deess"),
+            Utc::now() - chrono::Duration::minutes(9),
+        )));
+        let (label, _, kind) = app.mode_chip_state().expect("intl live chip");
+        assert_eq!(kind, "LIVE", "an armed active intl poll is LIVE: {label}");
+        // 9 minutes is a routine intl publish gap — the NEXRAD-tuned 480 s
+        // default must not flag a healthy feed STALE.
+        assert!(
+            !label.contains("STALE"),
+            "routine intl cadence is not a fault: {label}"
+        );
+
+        // The primary Live control pauses/resumes the intl poll in place.
+        let (_sender, receiver) = mpsc::channel::<Result<PolledVolumeLoad, String>>();
+        app.poll_rx = Some(receiver);
+        app.set_intl_poll_paused(true);
+        assert!(!app.poll_active);
+        assert!(app.poll_rx.is_none(), "pause drops the in-flight tick");
+        let (_, _, kind) = app.mode_chip_state().expect("paused intl chip");
+        assert_eq!(kind, "ARCH", "a paused intl poll must not claim LIVE");
+        app.set_intl_poll_paused(false);
+        assert!(app.poll_active);
+        assert!(app.poll_next.is_none(), "resume fires on the next tick");
+        let (_, _, kind) = app.mode_chip_state().expect("resumed intl chip");
+        assert_eq!(kind, "LIVE");
+    }
+
+    #[test]
+    fn reset_view_centers_on_the_loaded_intl_volume() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![RadarSite::new("KTLX").with_location(
+            Some("Norman".to_owned()),
+            Some(35.333),
+            Some(-97.278),
+        )];
+        app.selected_site_index = 0;
+        let mut site = radar_core::RadarSite::new("sekkr");
+        site.latitude_deg = Some(59.654);
+        site.longitude_deg = Some(17.947);
+        app.volume = Some(Arc::new(RadarVolume::new(site, Utc::now())));
+        app.map_center_lat = 45.0;
+        app.map_center_lon = 10.0;
+
+        app.reset_view();
+
+        // Old behavior read the stale US selected_site_index and snapped
+        // the map across the Atlantic mid-European-session.
+        assert!(
+            (app.map_center_lat - 59.654).abs() < 0.001
+                && (app.map_center_lon - 17.947).abs() < 0.001,
+            "Reset View must follow the loaded volume: {} {}",
+            app.map_center_lat,
+            app.map_center_lon
+        );
+
+        // Without a loaded volume the selected US site remains the anchor.
+        app.volume = None;
+        app.reset_view();
+        assert!(
+            (app.map_center_lat - 35.333).abs() < 0.001,
+            "no volume -> selected site fallback: {}",
+            app.map_center_lat
+        );
+    }
+
+    #[test]
+    fn velocity_quality_tag_discloses_nyquist_less_dealias() {
+        // DVEL/DSRV on a Nyquist-less feed (JMA always): a product labeled
+        // dealiased must disclose the pass-through instead of silently
+        // rendering raw velocity (old behavior: no tag at all).
+        assert_eq!(
+            velocity_quality_tag(true, true, true, None),
+            Some(VelocityQualityTag::NoNyquistPassThrough)
+        );
+        assert_eq!(
+            velocity_quality_tag(true, true, true, Some("ord")),
+            Some(VelocityQualityTag::NoNyquistPassThrough),
+            "the pass-through disclosure outranks the provenance chip"
+        );
+        assert_eq!(
+            VelocityQualityTag::NoNyquistPassThrough.label(),
+            "no Nyquist in this feed — showing raw velocity"
+        );
+        // Existing tags are preserved: ORD provenance, raw fold warning,
+        // silence for genuinely dealiased renders and non-velocity.
+        assert_eq!(
+            velocity_quality_tag(true, true, false, Some("ord")),
+            Some(VelocityQualityTag::DealiasedLocally)
+        );
+        assert_eq!(velocity_quality_tag(true, true, false, None), None);
+        assert_eq!(
+            velocity_quality_tag(false, true, false, None),
+            Some(VelocityQualityTag::RawFoldsPossible)
+        );
+        assert_eq!(velocity_quality_tag(false, false, false, None), None);
+
+        // The displayed-cut query wires the render2d skip detection to
+        // the active volume/cut.
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.selected_cut = 0;
+        let mut volume = test_aliased_velocity_volume();
+        for radial in &mut volume.cuts[0].radials {
+            radial.nyquist_velocity_mps = None;
+        }
+        app.volume = Some(Arc::new(volume));
+        assert!(
+            app.displayed_cut_dealias_skipped_no_nyquist(),
+            "JMA-style Nyquist-less cut must report the pass-through"
+        );
+        app.volume = Some(Arc::new(test_aliased_velocity_volume()));
+        assert!(
+            !app.displayed_cut_dealias_skipped_no_nyquist(),
+            "a feed with Nyquist dealiases for real — no disclosure tag"
+        );
+        app.volume = None;
+        assert!(!app.displayed_cut_dealias_skipped_no_nyquist());
     }
 
     #[test]
