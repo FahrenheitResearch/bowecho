@@ -43,3 +43,26 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # B5 (docs/miniderecho-spec.md §1): the iOS tripwire. Cross-checking
+  # aarch64-apple-ios from Windows/Linux hosts fails at the bzip2-sys/ring
+  # build scripts (they need an Apple SDK), so this leg runs on a macOS
+  # runner — long before any physical Mac session (spec §2 iOS boundary).
+  ios-tripwire:
+    name: iOS tripwire (mini_ui)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add the iOS target
+        run: rustup target add aarch64-apple-ios
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check mini_ui for aarch64-apple-ios
+        run: cargo check -p mini_ui --target aarch64-apple-ios
