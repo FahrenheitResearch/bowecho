@@ -160,7 +160,7 @@ The archive browser, the Event Loop Builder's Build button, and mosaic candidate
 Replaces the scattered `poll_source` + `poll_active` + `realtime_level2_auto_refresh` flag choreography whose disagreement is the R8 bug class:
 
 ```rust
-// crates/app_ui/src/loop_engine.rs
+// crates/ui_core/src/loop_engine.rs (CP-1: shared crate, pub - see §12a)
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FeedSource {
     /// Follow the newest data for a site on the source's cadence
@@ -197,7 +197,7 @@ The existing regression tests move onto it: `start_intl_poll`'s same-site-keep/c
 
 ---
 
-## 3. LoopEngine — `crates/app_ui/src/loop_engine.rs`
+## 3. LoopEngine — `crates/ui_core/src/loop_engine.rs` *(CP-1)*
 
 `FrameHistory` (:2653-2757), `FrameHistoryEntry` (:2628), `FrameIdentity` (:2821), and `next_frame_history_generation` (:2642) move here **verbatim**. The generation newtype is the invalidation spine; the bump discipline (every mutating accessor bumps, `iter_mut` bumps up front, no `DerefMut`) survives unchanged. Overlays upgrade from `Vec<FrameHistoryEntry>` (:2255) to the newtype — the spine finally reaches the overlay boundary.
 
@@ -205,7 +205,7 @@ The existing regression tests move onto it: `start_intl_poll`'s same-site-keep/c
 /// One "site + frame history + textures + poll cadence + playback" engine.
 /// Instantiated once for the primary view, once per extra pane, once per
 /// radar overlay layer. Differences are DECLARED POLICY, not divergent code.
-pub(crate) struct LoopEngine {
+pub struct LoopEngine { // CP-1: pub, lives in ui_core
     id: EngineId,                    // stable u64; also the render lane payload
     role: EngineRole,                // Primary | Pane { slot: u8 } | Overlay
     feed: FeedSource,
@@ -349,7 +349,7 @@ Two rules the type enforces: **(1)** a job never writes app state or the global 
 
 **YAGNI scope:** Phase 1 migrates only the verified low-risk one-shot slots (`update_check_rx` :2171, `self_update_rx` :2177, `intl_sites_rx` :1951, `coverage_probe_rx` :1959, `ord_archive_list_rx` :1968, `italy_dpc_latest_rx` :1637, `taiwan_cwa_latest_rx` :1642, `radar_operational_status_rx` :1813, `spc_receiver` :1816, `upper_air_rx` :1887). The remaining ~30 migrate opportunistically as their modules are touched — never a big-bang slot sweep. The engine-adjacent channels (`poll_rx`, `intl_loop_rx`, `load_receiver` family) migrate only inside Phase 4, with the engine.
 
-### 4.2 RenderService — `crates/app_ui/src/render_service.rs`
+### 4.2 RenderService — `crates/ui_core/src/render_service.rs` *(CP-1)*
 
 **Policy resolution** (the audit's "opposite worker policies"): the pane policy (shared, coalescing, bounded) is correct and wins; overlays keep their cache-mode isolation but stop owning threads. Adopted **in two separately-revertible steps** (ux-first's posture):
 
@@ -360,7 +360,7 @@ Two rules the type enforces: **(1)** a job never writes app state or the global 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) enum LaneId { Primary, Pane(u8), Overlay(u64), Prewarm }
 
-pub(crate) struct RenderService {
+pub struct RenderService { // CP-1: pub, lives in ui_core
     interactive: RenderPool,  // EXACTLY today's one coalescing worker, Primary cache mode
                               // (spawn_render_worker_with_mode :5336) — lanes Primary + Pane(n).
                               // Stays a separate single worker so overlay bursts can never
@@ -421,8 +421,8 @@ Playbook = layers_rail: sibling module in the same binary crate, `impl ViewerApp
 | 3 | `international.rs` additions | 1 | ArchiveFrames + archive_source() + derived supports_archive + ORD/SMHI impls + tripwire | ~250 new |
 | 4 | `archive_browser.rs` | 2 | NEW widget + ArchiveLister/ArchiveScanRow; absorbs archive_panel listing (~:14993-15188 region), ord_archive_section, SMHI coverage loaders; plan-batch fetcher family (`fetch_intl_frame_plan_batch` :51238 + ORD/SMHI one-offs + 4 US archive-worker bodies) | ~1,800 |
 | 5 | `sites_ui.rs` | 3 | BeamTarget/BeamCandidate/best_radar_candidates (:28426)/intl_radar_candidates (:28569)/nearest_site_to_position; favorites encode/decode; site search; the six gate callers rewritten as SiteKind matches; `site_is_primary_level2_catalog_site` + `site_is_tdwr` DELETED | ~1,800 |
-| 6 | `render_service.rs` | 4a/4b | spawn_render_worker family (:5239-5450), merge_render_request (:12735), RenderRequest/RenderedTexture/recycle types (:4433+), the three drains (:11790/:11850/:11895 — prewarm drain verbatim), LaneId | ~1,400 |
-| 7 | `loop_engine.rs` | 4c | FrameHistory/FrameIdentity/generation (verbatim), DecodedLoad/Batch (:2604-2625), trim/upsert/history_contains_other_site (:52024), FeedSource + switch_policy, LoopEngine struct + differential suite | ~1,300 |
+| 6 | `ui_core::render_service` (CP-1) | 4a/4b | spawn_render_worker family (:5239-5450), merge_render_request (:12735), RenderRequest/RenderedTexture/recycle types (:4433+), the three drains (:11790/:11850/:11895 — prewarm drain verbatim), LaneId | ~1,400 |
+| 7 | `ui_core::loop_engine` (CP-1) | 4c | FrameHistory/FrameIdentity/generation (verbatim), DecodedLoad/Batch (:2604-2625), trim/upsert/history_contains_other_site (:52024), FeedSource + switch_policy, LoopEngine struct + differential suite | ~1,300 |
 | 8 | `overlays.rs` | 4c | RadarOverlayLayer→OverlayView, add_or_refresh_* (:7356/:7398), start/poll_intl_radar_layer_loads, install_radar_layer_volume (:7747), timeline-sync selection | ~2,000 |
 | 9 | `panes.rs` | 4d | ViewPane→PaneView, maybe_refresh_extra_panes (:7163), extra_pane_live_source (:7128), follow_primary_volume_into_pane (:7231), start_extra_pane_intl_load (:13941), install_extra_pane_decoded_load_batch (:14284), pane context swap (:13832, kept — see risks), pane UI + tests (:63873+) | ~3,500 |
 | 10 | `primary_feed.rs` | 4e | poll_feed/drain_polled_volume/poll_source_armed/ownership predicates (:31132-31206), install_polled_volume (:31088), start_intl_poll (:31560), intl loop streaming | ~2,200 |
@@ -614,3 +614,18 @@ Deliverable: tag `v0.29.0-alpha.1` locally. Report: test-count delta, any anchor
 Release process for the program: each phase checkpoint = locally built
 release-fast exe for the owner (no GitHub releases); v0.29.0 is the next
 public tag.
+
+---
+
+## 12a. CP-1 amendment (2026-07-02, from the miniDerecho design panel)
+
+The miniDerecho feasibility check proved the original §6 destinations for
+`LoopEngine` (row 7) and `RenderService` (row 6) — `pub(crate)` modules
+inside `crates/app_ui` — would lock the second frontend out: `mini_ui`
+cannot depend on `app_ui` (the bin drags 12 `rw-*` git deps and its items
+are crate-private). **Amendment:** both land `pub` in the shared
+`crates/ui_core` crate (created by miniDerecho M0 Task 1, which also
+moves `worker_slot.rs`, `tiles.rs`, and the AEQD geo fns there). The
+Phase-4 fleet writes against `ui_core::{loop_engine, render_service}`
+from the start; nothing had been written against the old locations. Full
+rationale: docs/miniderecho-spec.md §CP-1.
