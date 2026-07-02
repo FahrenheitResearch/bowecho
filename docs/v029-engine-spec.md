@@ -615,6 +615,34 @@ Release process for the program: each phase checkpoint = locally built
 release-fast exe for the owner (no GitHub releases); v0.29.0 is the next
 public tag.
 
+### 12b. Owner decisions (2026-07-02, pre-Phase-4)
+
+4. **MAINTAINABILITY IS THE TOP GOAL of Phases 4-5.** The owner's model
+   budget for frontier-tier agents runs out soon; after v0.29 this code
+   will be maintained by weaker models with worse long-context handling.
+   Every Phase 4-5 decision biases accordingly:
+   - Prefer boring, explicit code over clever/compact code. A reader
+     holding ONE file in a small context window must be able to follow it.
+   - Extraction out of main.rs is a first-class deliverable, not a side
+     effect. When engine work touches a main.rs subsystem, prefer moving
+     it to a named module over editing it in place (sites_ui.rs is the
+     template). Track the main.rs line count at each phase checkpoint.
+   - Small pub(crate) surfaces, doc comments that state the invariant
+     (not the history), and tests that pin behavior so a weaker model
+     can refactor against them without understanding everything.
+   - When a spec choice trades runtime elegance against legibility,
+     legibility wins unless a measured perf gate says otherwise.
+5. **Loop UX (community input, via owner):** the beloved feature is the
+   EASY low-level sweep loop, and sweep policy must stay a visible easy
+   option — all-lowest-sweeps (fluid, SAILS-dense, but base-tilt-only)
+   vs a fixed ~1° range (steadier data, jumpier cadence) genuinely
+   trade off and neither is "right". Phase 4e's SelectionPolicy
+   (Off/AllLow/BaseOnly/Range) is the engine home for this; Phase 5's
+   bar surfaces it one click deep, not buried. **Synced warnings are
+   the killer feature**: LIVE and ARCHIVE modes arm warning sync by
+   default (the Phase-5 "sync defaults" line is a requirement, not a
+   suggestion).
+
 ---
 
 ## 12a. CP-1 amendment (2026-07-02, from the miniDerecho design panel)
