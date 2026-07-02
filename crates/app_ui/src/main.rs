@@ -34,6 +34,7 @@ use serde::Deserialize;
 use settings::{LoopSweepControl, SweepPolicy, SweepPolicyMode, SweepPolicySet, SweepProductGroup};
 
 mod annotate;
+mod archive_browser;
 mod basemap_data;
 mod basemap_towns;
 mod brand;
@@ -1969,19 +1970,16 @@ struct ViewerApp {
     coverage_provider_id: String,
     coverage_site_id: String,
     coverage_frame_count: usize,
-    coverage_date_input: String,
-    coverage_hour_input: String,
     coverage_probe_rx: WorkerSlot<IntlCoverageProbeResult>,
     coverage_probe_result: Option<IntlCoverageProbeResult>,
     /// ORD archive helper inputs: direct CloudFerro openradar-archive fetches
-    /// for historical European ODIM split files.
+    /// for historical European ODIM split files (exact-UTC loaders — the
+    /// Unified Player fills these; day browsing lives in the unified
+    /// archive browser).
     ord_archive_site_input: String,
     ord_archive_date_input: String,
     ord_archive_hour_input: String,
     ord_archive_minute_input: String,
-    ord_archive_scans: Option<Vec<data_source::international::OrdArchivePlan>>,
-    ord_archive_list_rx: WorkerSlot<OrdArchiveListResult>,
-    ord_archive_loaded_range: Option<(usize, usize)>,
     /// Community research-feed cluster picker: the marker index (into
     /// [`data_source::community_feeds::community_markers`]) whose stacked
     /// feeds are listed in a small map menu — the Norman Testbed marker,
@@ -2118,7 +2116,15 @@ struct ViewerApp {
     archive_date_input: String,
     archive_volumes: Option<Vec<(data_source::S3Object, String)>>,
     archive_list_receiver:
-        Option<mpsc::Receiver<std::result::Result<Vec<data_source::S3Object>, String>>>,
+        Option<mpsc::Receiver<std::result::Result<Vec<archive_browser::ArchiveScanRow>, String>>>,
+    /// International arm of the unified archive browser (spec §5): the
+    /// listed day's rows for the intl display owner, the loaded chip
+    /// range for "+N older", and the list-then-load-newest flag.
+    intl_archive_rows: Option<archive_browser::IntlArchiveDayListing>,
+    intl_archive_list_rx:
+        WorkerSlot<std::result::Result<archive_browser::IntlArchiveDayListing, String>>,
+    intl_archive_loaded_range: Option<(usize, usize)>,
+    intl_archive_load_after_listing: bool,
     /// GR2-style two-click Vrot tool: armed -> click max inbound, then max
     /// outbound; the card shows Vrot, couplet diameter, and beam height.
     vrot_tool_armed: bool,
@@ -2211,8 +2217,6 @@ enum IntlLoopFrameMessage {
     Progress(ArchiveLoadProgress),
     Frame(IntlLoopFrameResult),
 }
-type OrdArchiveListResult =
-    std::result::Result<Vec<data_source::international::OrdArchivePlan>, String>;
 type IntlCoverageProbeResult = std::result::Result<IntlCoverageProbe, String>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3033,7 +3037,6 @@ impl FrameStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OrdArchiveLoadMode {
     Nearest,
-    Hour,
 }
 
 fn history_archive_load_parallelism() -> usize {
@@ -6676,17 +6679,16 @@ impl ViewerApp {
             coverage_provider_id: "smhi".to_owned(),
             coverage_site_id: "angelholm".to_owned(),
             coverage_frame_count: DEFAULT_ARCHIVE_FRAME_COUNT,
-            coverage_date_input: String::new(),
-            coverage_hour_input: String::new(),
             coverage_probe_rx: WorkerSlot::idle("coverage-probe"),
             coverage_probe_result: None,
             ord_archive_site_input: String::new(),
             ord_archive_date_input: String::new(),
             ord_archive_hour_input: String::new(),
             ord_archive_minute_input: String::new(),
-            ord_archive_scans: None,
-            ord_archive_list_rx: WorkerSlot::idle("ord-archive-list"),
-            ord_archive_loaded_range: None,
+            intl_archive_rows: None,
+            intl_archive_list_rx: WorkerSlot::idle("intl-archive-list"),
+            intl_archive_loaded_range: None,
+            intl_archive_load_after_listing: false,
             community_menu: None,
             poll_url: restored_poll_url,
             custom_poll_label_input: String::new(),
@@ -15238,205 +15240,6 @@ impl ViewerApp {
         self.start_latest_level2_load_with_mode(site, ctx, LatestLoadMode::Loop);
     }
 
-    /// Archive tab: date navigation, the day's volumes, SPC tornado
-    /// events, and loop-size controls.
-    fn archive_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // (The loop transport renders above this section in the DATA tab —
-        // archive browsing shouldn't need a tab switch to play what it just
-        // loaded.)
-        ui.horizontal(|ui| {
-            ui.label("Manual picker frames").on_hover_text(
-                "Archive-browser selections only: load this many scans ending at the chosen scan. Tornado/report clicks use Event day Track/report loop controls.",
-            );
-            if ui
-                .add(
-                    egui::DragValue::new(&mut self.archive_frame_count)
-                        .range(1..=MAX_ARCHIVE_FRAME_COUNT)
-                        .speed(0.2),
-                )
-                .on_hover_text("Manual archive chips end at the clicked scan.")
-                .changed()
-            {
-                self.persist_archive_controls();
-                ctx.request_repaint();
-            }
-            if self.archive_loaded_range.is_some()
-                && ui
-                    .button("+5 older")
-                    .on_hover_text(
-                        "Prepend five older scans to the currently loaded archive loop only",
-                    )
-                    .clicked()
-            {
-                self.extend_archive_loop_earlier(5, ctx);
-            }
-        });
-        if self.archive_date_input.is_empty() {
-            self.archive_date_input = Utc::now().format("%Y-%m-%d").to_string();
-        }
-        ui.horizontal(|ui| {
-            // Day navigation: step the date and re-list immediately.
-            let mut step_days: i64 = 0;
-            if ui.small_button("◀").on_hover_text("Previous day").clicked() {
-                step_days = -1;
-            }
-            ui.add(
-                egui::TextEdit::singleline(&mut self.archive_date_input)
-                    .hint_text("YYYY-MM-DD")
-                    .desired_width(88.0),
-            );
-            if ui.small_button("▶").on_hover_text("Next day").clicked() {
-                step_days = 1;
-            }
-            if ui.small_button("Today").clicked() {
-                self.archive_date_input = Utc::now().format("%Y-%m-%d").to_string();
-                self.start_archive_listing(ctx);
-            }
-            if step_days != 0
-                && let Ok(date) =
-                    chrono::NaiveDate::parse_from_str(self.archive_date_input.trim(), "%Y-%m-%d")
-            {
-                let stepped = date + chrono::Duration::days(step_days);
-                self.archive_date_input = stepped.format("%Y-%m-%d").to_string();
-                self.start_archive_listing(ctx);
-            }
-            let listing = self.archive_list_receiver.is_some();
-            if ui
-                .add_enabled(!listing, egui::Button::new("List"))
-                .on_hover_text("List this UTC date's volumes for the selected site")
-                .clicked()
-            {
-                self.start_archive_listing(ctx);
-            }
-            if ui
-                .button("Load")
-                .on_hover_text(
-                    "Load the newest listed scan for this date. In Loop mode, loads Fetch N scans ending at that scan.",
-                )
-                .clicked()
-            {
-                self.start_archive_default_load(ctx);
-            }
-            if listing {
-                ui.spinner();
-            }
-        });
-        let previous_archive_load_loop = self.archive_load_loop;
-        ui.horizontal(|ui| {
-            ui.label("On click:");
-            ui.selectable_value(&mut self.archive_load_loop, true, "Loop ending at scan")
-                .on_hover_text("Load Manual loop frames ending at the chosen archive scan");
-            ui.selectable_value(&mut self.archive_load_loop, false, "Single scan")
-                .on_hover_text("Load only the chosen scan");
-        });
-        if self.archive_load_loop != previous_archive_load_loop {
-            self.persist_archive_controls();
-        }
-        if let Some(progress) = &self.archive_load_progress {
-            archive_load_progress_row(ui, progress);
-        }
-        if let Some(volumes) = &self.archive_volumes {
-            if volumes.is_empty() {
-                ui.weak("No volumes for that date");
-            } else {
-                ui.weak(format!("{} volumes (UTC)", volumes.len()));
-                let mut load_object: Option<usize> = None;
-                egui::ScrollArea::vertical()
-                    .id_salt("archive_volume_list")
-                    .max_height(190.0)
-                    .show(ui, |ui| {
-                        // Hour headers + wrapped minute chips.
-                        let mut index = 0usize;
-                        while index < volumes.len() {
-                            let hour = volumes[index].1.get(0..2).unwrap_or("??");
-                            ui.weak(format!("{hour} UTC"));
-                            ui.horizontal_wrapped(|ui| {
-                                while index < volumes.len()
-                                    && volumes[index].1.get(0..2).unwrap_or("??") == hour
-                                {
-                                    let minute_label =
-                                        volumes[index].1.get(3..8).unwrap_or(&volumes[index].1);
-                                    if ui
-                                        .add_sized(
-                                            egui::vec2(52.0, PANEL_BUTTON_HEIGHT),
-                                            egui::Button::new(minute_label),
-                                        )
-                                        .on_hover_text(&volumes[index].1)
-                                        .clicked()
-                                    {
-                                        load_object = Some(index);
-                                    }
-                                    index += 1;
-                                }
-                            });
-                        }
-                    });
-                if let Some(index) = load_object {
-                    self.start_archive_loop_load(index, ctx);
-                }
-            }
-        }
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("Tornado reports + tracks");
-            let fetching = self.spc_receiver.in_flight();
-            if ui
-                .add_enabled(!fetching, egui::Button::new("Fetch"))
-                .on_hover_text(
-                    "Fetch SPC tornado reports and pin the Event day track layer for this date. Click a report to load a centered archive loop.",
-                )
-                .clicked()
-            {
-                self.start_spc_fetch(ctx);
-            }
-            if fetching {
-                ui.spinner();
-            }
-        });
-        let mut jump: Option<SpcReport> = None;
-        if let Some(reports) = &self.spc_reports {
-            if reports.is_empty() {
-                ui.weak("No tornado reports for that date");
-            } else {
-                ui.weak(format!("{} tornado reports", reports.len()));
-                egui::ScrollArea::vertical()
-                    .id_salt("spc_report_list")
-                    .max_height(170.0)
-                    .show(ui, |ui| {
-                        for report in reports {
-                            let scale = if report.f_scale.is_empty() || report.f_scale == "UNK" {
-                                String::new()
-                            } else {
-                                format!("EF{} ", report.f_scale)
-                            };
-                            let label = format!(
-                                "{} {}{}, {}",
-                                self.time_zone().format_hm(report.time_utc),
-                                scale,
-                                report.location,
-                                report.state
-                            );
-                            if ui
-                                .add_sized(
-                                    egui::vec2(ui.available_width(), PANEL_BUTTON_HEIGHT),
-                                    egui::Button::new(label),
-                                )
-                                .on_hover_text(
-                                    "Jump: lowest-beam radar + event archive loop before/after this time",
-                                )
-                                .clicked()
-                            {
-                                jump = Some(report.clone());
-                            }
-                        }
-                    });
-            }
-        }
-        if let Some(report) = jump {
-            self.jump_to_spc_report(&report, ctx);
-        }
-    }
-
     /// Fetch SPC tornado reports for the archive date (background).
     fn start_spc_fetch(&mut self, ctx: &egui::Context) {
         let Ok(date) =
@@ -15587,147 +15390,6 @@ impl ViewerApp {
             .map(|(_, report)| report)
     }
 
-    /// Extend the loaded archive loop further back in time: decode `count`
-    /// volumes preceding the loaded range and let the (identity-sorted)
-    /// frame history slot them in order.
-    fn extend_archive_loop_earlier(&mut self, count: usize, ctx: &egui::Context) {
-        let Some(site) = self.selected_site().cloned() else {
-            return;
-        };
-        let Some(volumes) = &self.archive_volumes else {
-            return;
-        };
-        let Some((start, chosen)) = self.archive_loaded_range else {
-            return;
-        };
-        if start == 0 || self.load_receiver.is_some() {
-            return;
-        }
-        let new_start = start.saturating_sub(count);
-        let objects: Vec<data_source::S3Object> = volumes[new_start..start]
-            .iter()
-            .map(|(object, _)| object.clone())
-            .collect();
-        if objects.is_empty() {
-            return;
-        }
-        let total_frames = chosen - new_start + 1;
-        if total_frames > self.history_frame_limit {
-            self.history_frame_limit = total_frames;
-        }
-        self.archive_loaded_range = Some((new_start, chosen));
-        let site_id = site.level2_id.clone();
-        self.begin_primary_load_telemetry();
-        let (sender, receiver) = mpsc::channel();
-        self.load_receiver = Some(receiver);
-        self.pending_site_id = Some(site_id.clone());
-        let progress = ArchiveLoadProgress {
-            label: "Archive extend".to_owned(),
-            detail: format!("Queued {site_id} {} earlier scans", objects.len()),
-            done: 0,
-            total: objects.len(),
-        };
-        self.status = progress.status_text();
-        self.archive_load_progress = Some(progress);
-        let site_cache = cache_dir(&site.level2_id);
-        let known_frame_paths = self.current_history_paths();
-        thread::spawn(move || {
-            let total_start = Instant::now();
-            let mut decoded_frames = Vec::new();
-            let count = objects.len();
-            let progress_label = "Archive extend";
-            for (index, object) in objects.into_iter().enumerate() {
-                let object_name = object
-                    .key
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(&object.key)
-                    .to_owned();
-                send_archive_progress(
-                    &sender,
-                    progress_label,
-                    format!("Fetching {site_id} {object_name}"),
-                    index,
-                    count,
-                );
-                match decode_archive_history_object(
-                    &site_id,
-                    object,
-                    &site_cache,
-                    &known_frame_paths,
-                    None,
-                    total_start,
-                    &sender,
-                    false,
-                    true,
-                ) {
-                    Ok(Some(decoded)) => {
-                        let _ = sender.send(AsyncLoadResult {
-                            label: format!("L2 {site_id} archive extend"),
-                            update: AsyncLoadUpdate::History(
-                                DecodedLoadBatch {
-                                    frames: vec![decoded.clone()],
-                                    selected_index: 0,
-                                },
-                                false,
-                            ),
-                        });
-                        decoded_frames.push(decoded);
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        send_archive_progress(
-                            &sender,
-                            progress_label,
-                            format!("Failed {site_id} {object_name}"),
-                            index + 1,
-                            count,
-                        );
-                        let _ = sender.send(AsyncLoadResult {
-                            label: format!("L2 {site_id} archive extend"),
-                            update: AsyncLoadUpdate::Final(Err(err)),
-                        });
-                        return;
-                    }
-                }
-                send_archive_progress(
-                    &sender,
-                    progress_label,
-                    format!("Decoded {site_id} {object_name}"),
-                    index + 1,
-                    count,
-                );
-            }
-            let _ = sender.send(AsyncLoadResult {
-                label: format!("L2 {site_id} archive extend"),
-                update: AsyncLoadUpdate::Unchanged {
-                    timings: None,
-                    reason: format!("loop extended {} volumes earlier", decoded_frames.len()),
-                },
-            });
-        });
-        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
-    }
-
-    /// Kick a background listing of the archive date's volumes.
-    fn start_archive_default_load(&mut self, ctx: &egui::Context) {
-        if self.archive_list_receiver.is_some() {
-            self.archive_load_after_listing = true;
-            self.status = "Archive: will load when the listing finishes".to_owned();
-            ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
-            return;
-        }
-        if let Some(volumes) = &self.archive_volumes
-            && !volumes.is_empty()
-        {
-            let newest = volumes.len() - 1;
-            self.start_archive_loop_load(newest, ctx);
-            return;
-        }
-        self.archive_load_after_listing = true;
-        self.start_archive_listing(ctx);
-    }
-
     fn start_archive_loop_ending_at(
         &mut self,
         target_utc: DateTime<Utc>,
@@ -15875,106 +15537,6 @@ impl ViewerApp {
         });
         ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
         true
-    }
-
-    /// Kick a background listing of the archive date's volumes.
-    fn start_archive_listing(&mut self, ctx: &egui::Context) {
-        let Some(site) = self.selected_site().cloned() else {
-            self.status = "No site selected".to_owned();
-            return;
-        };
-        // Browsing the archive is explicit intent — same contract as
-        // explicit site loads: the URL poll must not stomp archive frames.
-        if self.poll_active {
-            self.poll_active = false;
-            self.status = "URL poll paused (archive browse)".to_owned();
-        }
-        let Ok(date) =
-            chrono::NaiveDate::parse_from_str(self.archive_date_input.trim(), "%Y-%m-%d")
-        else {
-            self.status = "Archive date must be YYYY-MM-DD".to_owned();
-            return;
-        };
-        let progress = ArchiveLoadProgress::listing(&site.level2_id, date);
-        self.status = progress.status_text();
-        self.archive_load_progress = Some(progress);
-        let (sender, receiver) = mpsc::channel();
-        self.archive_list_receiver = Some(receiver);
-        self.archive_volumes = None;
-        let site_id = site.level2_id.clone();
-        let ctx = ctx.clone();
-        thread::spawn(move || {
-            let result =
-                data_source::level2_objects_for_date(&site_id, date).map_err(|err| err.to_string());
-            let _ = sender.send(result);
-            ctx.request_repaint();
-        });
-    }
-
-    fn poll_archive_listing(&mut self, ctx: &egui::Context) {
-        let Some(receiver) = &self.archive_list_receiver else {
-            return;
-        };
-        match receiver.try_recv() {
-            Ok(Ok(objects)) => {
-                self.archive_list_receiver = None;
-                self.archive_load_progress = None;
-                let volumes: Vec<(data_source::S3Object, String)> = objects
-                    .into_iter()
-                    .map(|object| {
-                        // KXXX20260609_235423_V06 -> 23:54:23
-                        let label = object
-                            .key
-                            .rsplit('/')
-                            .next()
-                            .and_then(|name| name.split('_').nth(1))
-                            .filter(|t| t.len() == 6)
-                            .map(|t| format!("{}:{}:{}", &t[0..2], &t[2..4], &t[4..6]))
-                            .unwrap_or_else(|| "??".to_owned());
-                        (object, label)
-                    })
-                    .collect();
-                self.status = format!("Archive: {} volumes listed", volumes.len());
-                self.archive_volumes = Some(volumes);
-                if self.archive_load_after_listing {
-                    self.archive_load_after_listing = false;
-                    if let Some(volumes) = &self.archive_volumes {
-                        if volumes.is_empty() {
-                            self.status = "Archive: no volumes to load for that date".to_owned();
-                        } else {
-                            let newest = volumes.len() - 1;
-                            self.start_archive_loop_load(newest, ctx);
-                        }
-                    }
-                }
-                ctx.request_repaint();
-            }
-            Ok(Err(err)) => {
-                self.archive_list_receiver = None;
-                self.archive_load_progress = None;
-                self.archive_load_after_listing = false;
-                self.status = format!("Archive listing failed: {err}");
-                ctx.request_repaint();
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.archive_list_receiver = None;
-                self.archive_load_progress = None;
-                self.archive_load_after_listing = false;
-            }
-        }
-    }
-
-    /// Load a loop of archive volumes ending at the chosen index (the
-    /// chosen scan plus the preceding history-limit-1 scans), through the
-    /// normal decode/install pipeline.
-    fn start_archive_loop_load(&mut self, chosen: usize, ctx: &egui::Context) -> bool {
-        let limit = if self.archive_load_loop {
-            self.archive_frame_count.max(1)
-        } else {
-            1
-        };
-        self.start_archive_range_load(chosen.saturating_sub(limit - 1), chosen, ctx)
     }
 
     /// Load the archive volumes `start..=chosen` as a loop (a track
@@ -16268,9 +15830,97 @@ impl ViewerApp {
             }
         }
 
+        let mut intl_requested = None;
+        for pack in data_packs::INTL_ARCHIVE_DATA_PACKS {
+            let mut expanded = self.data_pack_expanded.contains(pack.id);
+            ui.separator();
+            ui.push_id(pack.id, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button(if expanded { "v" } else { ">" })
+                        .on_hover_text("Show pack details")
+                        .clicked()
+                    {
+                        expanded = !expanded;
+                    }
+                    ui.label(egui::RichText::new(pack.title).strong());
+                    ui.weak(format!(
+                        "{}/{} | {} to {}",
+                        pack.provider_id, pack.site_id, pack.start_utc, pack.end_utc
+                    ));
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Load"))
+                        .on_hover_text(
+                            "List the provider archive, download the pack window, and apply the review scene",
+                        )
+                        .clicked()
+                    {
+                        intl_requested = Some(*pack);
+                    }
+                });
+                if expanded {
+                    ui.indent("intl_data_pack_details", |ui| {
+                        ui.weak(pack.summary);
+                        ui.weak(format!(
+                            "Focus {:.3}, {:.3} | frames {}",
+                            pack.focus_lat, pack.focus_lon, pack.max_frames
+                        ));
+                    });
+                }
+            });
+            if expanded {
+                self.data_pack_expanded.insert(pack.id.to_owned());
+            } else {
+                self.data_pack_expanded.remove(pack.id);
+            }
+        }
+
         if let Some((pack, options, replace_history)) = requested {
             self.start_data_pack(pack, options, replace_history, ctx);
         }
+        if let Some(pack) = intl_requested {
+            self.start_intl_archive_data_pack(pack, ctx);
+        }
+    }
+
+    /// Load an international archive data pack: apply the scene (center +
+    /// scale), then run the pack window through the SAME
+    /// `archive_source()` window loader as the unified browser and the
+    /// Unified Player — no bespoke pack fetcher.
+    fn start_intl_archive_data_pack(
+        &mut self,
+        pack: data_packs::IntlArchiveDataPack,
+        ctx: &egui::Context,
+    ) {
+        if self.data_pack_load_blocked() {
+            self.status = "Wait for the current load to finish".to_owned();
+            return;
+        }
+        let (start_utc, end_utc) = match pack.window_utc() {
+            Ok(window) => window,
+            Err(err) => {
+                self.status = format!("Data pack is invalid: {err}");
+                return;
+            }
+        };
+        self.supersede_live_load_for_data_pack();
+        self.pending_data_pack_scene = None;
+        self.loaded_data_pack = None;
+        self.pending_debug_archive_case = None;
+        self.history_playing = false;
+        self.browsing_history = false;
+        self.center_map_on(pack.focus_lat, pack.focus_lon);
+        self.map_scale = pack.map_scale.clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
+        self.clamp_map_center();
+        self.start_intl_archive_window_load(
+            pack.provider_id.to_owned(),
+            pack.site_id.to_owned(),
+            start_utc,
+            end_utc,
+            pack.max_frames,
+            ctx,
+        );
+        self.event_explorer.pending_autoplay = true;
     }
 
     fn start_data_pack(
@@ -17506,7 +17156,7 @@ impl eframe::App for ViewerApp {
         self.poll_placefiles(&ctx);
         self.poll_radar_operational_status(&ctx);
         self.poll_archive_listing(&ctx);
-        self.poll_ord_archive_listing(&ctx);
+        self.poll_intl_archive_listing(&ctx);
         self.poll_spc_reports(&ctx);
         self.poll_event_day(&ctx);
         self.poll_mping(&ctx);
@@ -18432,19 +18082,46 @@ impl ViewerApp {
     }
 
     fn event_loop_builder_window(&mut self, ctx: &egui::Context) {
-        let (current_site_id, current_site_label) = self
-            .selected_site()
-            .map(|site| (site.level2_id.clone(), format_site_label(site)))
-            .unwrap_or_else(|| ("KTLX".to_owned(), "KTLX Norman".to_owned()));
+        // Seed and gate on the DISPLAY OWNER (spec Phase 2), never a
+        // stale US selected_site/KTLX fallback: an international owner
+        // seeds its own case-significant code, and an owner without an
+        // archive greys Build with the derived reason.
+        let owner = self.display_owner_site();
+        let (current_site_id, current_site_label, intl_provider) = match &owner {
+            data_source::sites::SiteRef::Us { .. } => {
+                let (id, label) = self
+                    .selected_site()
+                    .map(|site| (site.level2_id.clone(), format_site_label(site)))
+                    .unwrap_or_else(|| ("KTLX".to_owned(), "KTLX Norman".to_owned()));
+                (id, label, None)
+            }
+            data_source::sites::SiteRef::Intl {
+                provider_id,
+                site_id,
+            } => (
+                site_id.clone(),
+                format!("{} {site_id}", intl_provider_label(provider_id)),
+                Some(provider_id.clone()),
+            ),
+        };
+        let archive_unavailable_reason = match archive_browser::archive_access(&owner) {
+            archive_browser::ArchiveAccess::None { reason } => Some(reason),
+            _ => None,
+        };
         let builder_context = event_loop_builder::EventLoopBuilderContext {
             current_site_id,
             current_site_label,
+            intl_provider,
+            archive_unavailable_reason,
             display_time_zone_slug: self.time_zone().slug().to_owned(),
             loaded_radar_frames: self.frame_history.len(),
         };
         let action = self.event_loop_builder.show_window(ctx, builder_context);
         if let Some(event_loop_builder::EventLoopBuilderAction::BuildRadar(plan)) = action {
-            let status = self.start_event_loop_archive_radar_load(plan, ctx);
+            let status = match plan.intl_provider_id.clone() {
+                Some(provider_id) => self.start_intl_event_loop_radar_load(provider_id, plan, ctx),
+                None => self.start_event_loop_archive_radar_load(plan, ctx),
+            };
             self.event_loop_builder.mark_status(status);
         }
     }
@@ -19372,9 +19049,34 @@ impl ViewerApp {
                     "Loading ORD loop ending {}",
                     target_utc.format("%Y-%m-%d %H:%MZ")
                 ));
-            } else {
-                self.unified_player
-                    .mark_status("End-time archive loads are wired for US Level II and ORD");
+            } else if let PollSource::Intl {
+                provider_id,
+                site_id,
+            } = self.poll_source.clone()
+            {
+                // Every archive_source() provider (SMHI today) shares one
+                // generic End-at arm; no-archive providers surface the
+                // derived reason (spec §1.3) instead of a hardcoded list.
+                match archive_browser::archive_access(&self.display_owner_site()) {
+                    archive_browser::ArchiveAccess::None { reason } => {
+                        self.unified_player.mark_status(reason);
+                    }
+                    _ => {
+                        let count = normalized_archive_frame_count(self.history_frame_limit.max(1));
+                        let label = intl_provider_label(&provider_id);
+                        self.start_intl_archive_loop_ending_at(
+                            provider_id,
+                            site_id,
+                            target_utc,
+                            count,
+                            ctx,
+                        );
+                        self.unified_player.mark_status(format!(
+                            "Loading {label} loop ending {}",
+                            target_utc.format("%Y-%m-%d %H:%MZ")
+                        ));
+                    }
+                }
             }
             return;
         }
@@ -19423,10 +19125,43 @@ impl ViewerApp {
                     start_utc.format("%H:%MZ"),
                     end_utc.format("%H:%MZ")
                 ));
-            } else {
-                self.unified_player.mark_status(
-                    "Window archive loads are wired for US Level II and ORD archive sources",
-                );
+            } else if let PollSource::Intl {
+                provider_id,
+                site_id,
+            } = self.poll_source.clone()
+            {
+                // Generic archive_source() window arm (SMHI today);
+                // honest derived reason otherwise (spec §1.3).
+                match archive_browser::archive_access(&self.display_owner_site()) {
+                    archive_browser::ArchiveAccess::None { reason } => {
+                        self.unified_player.mark_status(reason);
+                    }
+                    _ => {
+                        let (start_utc, end_utc) = match self.unified_player.archive_window_utc() {
+                            Ok(window) => window,
+                            Err(err) => {
+                                self.unified_player.mark_status(err);
+                                return;
+                            }
+                        };
+                        let max_frames = normalized_history_limit(self.history_frame_limit).max(1);
+                        let label = intl_provider_label(&provider_id);
+                        let status_site = site_id.clone();
+                        self.start_intl_archive_window_load(
+                            provider_id,
+                            site_id,
+                            start_utc,
+                            end_utc,
+                            max_frames,
+                            ctx,
+                        );
+                        self.unified_player.mark_status(format!(
+                            "Loading {label} window {status_site} {} to {}",
+                            start_utc.format("%H:%MZ"),
+                            end_utc.format("%H:%MZ")
+                        ));
+                    }
+                }
             }
             return;
         }
@@ -19451,6 +19186,7 @@ impl ViewerApp {
         let max_frames = normalized_history_limit(self.history_frame_limit).max(1);
         let include_warnings = self.unified_player.auto_sync_warnings;
         Ok(event_loop_builder::EventLoopRadarPlan {
+            intl_provider_id: None,
             site_id: site_id.clone(),
             start_utc,
             end_utc,
@@ -20626,15 +20362,6 @@ impl ViewerApp {
                 if app.taiwan_cwa_layer.is_some() {
                     ui.weak("Active: Taiwan CWA Composite Reflectivity");
                 }
-            },
-        );
-        self.remembered_section(
-            ui,
-            "data_ord_archive",
-            "ORD per-site archive",
-            true,
-            |app, ui| {
-                app.ord_archive_section(ui, ctx);
             },
         );
         self.remembered_section(ui, "data_live_feeds", "Live feeds", true, |app, ui| {
@@ -31204,67 +30931,6 @@ impl ViewerApp {
         let _ = self.app_settings.save();
     }
 
-    pub(crate) fn start_smhi_coverage_archive_load(
-        &mut self,
-        hour: Option<u32>,
-        ctx: &egui::Context,
-    ) {
-        let site_id = self.coverage_site_id.trim().to_owned();
-        if self.coverage_provider_id != "smhi" || site_id.is_empty() {
-            self.status = "SMHI archive: choose an SMHI Sweden site".to_owned();
-            return;
-        }
-        if let Some(hour) = hour
-            && hour > 23
-        {
-            self.status = "SMHI archive hour must be 0-23".to_owned();
-            return;
-        }
-        let date = match NaiveDate::parse_from_str(self.coverage_date_input.trim(), "%Y-%m-%d") {
-            Ok(date) => date,
-            Err(_) => {
-                self.status = "SMHI archive date must be YYYY-MM-DD".to_owned();
-                return;
-            }
-        };
-        let count = self.coverage_frame_count.clamp(1, MAX_HISTORY_FRAME_LIMIT);
-        self.coverage_frame_count = count;
-        self.history_frame_limit = self.history_frame_limit.max(count);
-        let label = match hour {
-            Some(hour) => format!("SMHI {site_id} {date} {hour:02}Z"),
-            None => format!("SMHI {site_id} {date}"),
-        };
-        let replaced = self.load_receiver.take().is_some();
-        self.set_intl_archive_primary_source("smhi", &site_id);
-        self.intl_loop_rx = None;
-        self.intl_loop_requested = 0;
-        self.pending_site_id = Some(site_id.clone());
-        self.live_refresh_skip_reason = None;
-        self.clear_frame_history();
-        self.clear_displayed_volume_for_pending_load(ctx);
-
-        let (sender, receiver) = mpsc::channel();
-        self.load_receiver = Some(receiver);
-        self.archive_load_progress = Some(ArchiveLoadProgress {
-            label: label.clone(),
-            detail: "listing SMHI archive".to_owned(),
-            done: 0,
-            total: count,
-        });
-        self.status = if replaced {
-            format!("Replaced active load; {label} queued")
-        } else {
-            format!("{label} queued")
-        };
-        let worker_label = label.clone();
-        let ctx_clone = ctx.clone();
-        thread::spawn(move || {
-            fetch_smhi_archive_frame_batch(&site_id, date, hour, count, &worker_label, &sender);
-            ctx_clone.request_repaint();
-        });
-        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
-    }
-
     /// Load Loop for the active international feed: stream up to the
     /// frame-history limit of recent frames (provider catalogs permitting)
     /// through the shared poll install path, oldest first, so they land as
@@ -31569,12 +31235,6 @@ impl ViewerApp {
                     target_utc.format("%Y-%m-%d %H:%MZ")
                 )
             }
-            OrdArchiveLoadMode::Hour => {
-                format!(
-                    "ORD archive {site_id} {}",
-                    target_utc.format("%Y-%m-%d %HZ")
-                )
-            }
         };
         let replaced = self.load_receiver.take().is_some();
         self.set_ord_archive_primary_source(&site_id);
@@ -31641,7 +31301,7 @@ impl ViewerApp {
         self.live_refresh_skip_reason = None;
         self.clear_frame_history();
         self.clear_displayed_volume_for_pending_load(ctx);
-        self.ord_archive_loaded_range = None;
+        self.intl_archive_loaded_range = None;
 
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
@@ -31706,7 +31366,7 @@ impl ViewerApp {
         self.live_refresh_skip_reason = None;
         self.clear_frame_history();
         self.clear_displayed_volume_for_pending_load(ctx);
-        self.ord_archive_loaded_range = None;
+        self.intl_archive_loaded_range = None;
         if self.unified_player.auto_sync_warnings {
             self.hazards_visible = true;
             self.hazards_active_only = false;
@@ -31735,168 +31395,6 @@ impl ViewerApp {
                 start_utc,
                 end_utc,
                 max_frames,
-                &worker_label,
-                &sender,
-            );
-            ctx_clone.request_repaint();
-        });
-        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
-    }
-
-    pub(crate) fn start_ord_archive_day_listing(&mut self, ctx: &egui::Context) {
-        let site_id = self.ord_archive_site_input.trim().to_ascii_lowercase();
-        if site_id.is_empty() {
-            self.status = "ORD archive: enter a site code like plbrz".to_owned();
-            return;
-        }
-        let date =
-            match chrono::NaiveDate::parse_from_str(self.ord_archive_date_input.trim(), "%Y-%m-%d")
-            {
-                Ok(date) => date,
-                Err(_) => {
-                    self.status = "ORD archive date must be YYYY-MM-DD".to_owned();
-                    return;
-                }
-            };
-        self.ord_archive_list_rx.cancel();
-        self.ord_archive_scans = None;
-        self.ord_archive_loaded_range = None;
-        self.status = format!("ORD archive: listing {site_id} {date}");
-        self.ord_archive_list_rx.spawn(ctx, move |tx| {
-            let result = fetch_ord_archive_day_plans(&site_id, date);
-            let _ = tx.send(result);
-        });
-        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
-    }
-
-    fn poll_ord_archive_listing(&mut self, ctx: &egui::Context) {
-        match self.ord_archive_list_rx.poll() {
-            SlotPoll::Ready(Ok(scans)) => {
-                self.status = format!("ORD archive: {} scans listed", scans.len());
-                self.ord_archive_scans = Some(scans);
-                ctx.request_repaint();
-            }
-            SlotPoll::Ready(Err(err)) => {
-                self.ord_archive_scans = None;
-                self.status = format!("ORD archive listing failed: {err}");
-                ctx.request_repaint();
-            }
-            SlotPoll::Idle => {}
-            SlotPoll::Pending => {
-                ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
-            }
-            SlotPoll::Disconnected => {
-                self.status = "ORD archive listing worker disconnected".to_owned();
-            }
-        }
-    }
-
-    pub(crate) fn start_ord_archive_scan_load(&mut self, index: usize, ctx: &egui::Context) {
-        let Some(scans) = &self.ord_archive_scans else {
-            self.status = "ORD archive: list a date before loading".to_owned();
-            return;
-        };
-        if index >= scans.len() || self.load_receiver.is_some() {
-            return;
-        }
-        let start = (index + 1).saturating_sub(self.archive_frame_count.max(1));
-        let plans: Vec<_> = scans[start..=index].to_vec();
-        if plans.is_empty() {
-            return;
-        }
-        self.ord_archive_loaded_range = Some((start, index));
-        let site_id = self.ord_archive_site_input.trim().to_ascii_lowercase();
-        let label = format!(
-            "ORD archive {site_id} {}",
-            scans[index].stamp_utc.format("%Y-%m-%d %H:%MZ")
-        );
-        self.start_ord_archive_plan_batch(
-            site_id,
-            plans,
-            index - start,
-            Some((start, index)),
-            label,
-            ctx,
-        );
-    }
-
-    pub(crate) fn extend_ord_archive_loop_earlier(&mut self, count: usize, ctx: &egui::Context) {
-        let Some(scans) = &self.ord_archive_scans else {
-            return;
-        };
-        let Some((start, end)) = self.ord_archive_loaded_range else {
-            return;
-        };
-        if start == 0 || end >= scans.len() || self.load_receiver.is_some() {
-            return;
-        }
-        let new_start = start.saturating_sub(count);
-        let plans: Vec<_> = scans[new_start..=end].to_vec();
-        if plans.is_empty() {
-            return;
-        }
-        self.ord_archive_loaded_range = Some((new_start, end));
-        let site_id = self.ord_archive_site_input.trim().to_ascii_lowercase();
-        let label = format!(
-            "ORD archive {site_id} {}-{}Z",
-            scans[new_start].stamp_utc.format("%H:%M"),
-            scans[end].stamp_utc.format("%H:%M")
-        );
-        self.start_ord_archive_plan_batch(
-            site_id,
-            plans,
-            end - new_start,
-            Some((new_start, end)),
-            label,
-            ctx,
-        );
-    }
-
-    fn start_ord_archive_plan_batch(
-        &mut self,
-        site_id: String,
-        plans: Vec<data_source::international::OrdArchivePlan>,
-        selected_index: usize,
-        loaded_range: Option<(usize, usize)>,
-        label: String,
-        ctx: &egui::Context,
-    ) {
-        if plans.is_empty() {
-            self.status = "ORD archive: no scans selected".to_owned();
-            return;
-        }
-        let replaced = self.load_receiver.take().is_some();
-        self.set_ord_archive_primary_source(&site_id);
-        self.intl_loop_rx = None;
-        self.intl_loop_requested = 0;
-        self.pending_site_id = Some(site_id.clone());
-        self.live_refresh_skip_reason = None;
-        self.clear_frame_history();
-        self.clear_displayed_volume_for_pending_load(ctx);
-        self.ord_archive_loaded_range = loaded_range;
-
-        let total = plans.len();
-        let selected_index = selected_index.min(total.saturating_sub(1));
-        let (sender, receiver) = mpsc::channel();
-        self.load_receiver = Some(receiver);
-        self.archive_load_progress = Some(ArchiveLoadProgress {
-            label: label.clone(),
-            detail: "queued".to_owned(),
-            done: 0,
-            total,
-        });
-        self.status = if replaced {
-            format!("Replaced active load; {label} queued")
-        } else {
-            format!("{label} queued")
-        };
-        let worker_label = label.clone();
-        let ctx_clone = ctx.clone();
-        thread::spawn(move || {
-            fetch_ord_archive_plans_frame_batch(
-                &site_id,
-                plans,
-                selected_index,
                 &worker_label,
                 &sender,
             );
@@ -50845,9 +50343,6 @@ fn fetch_ord_archive_frame_batch(
             data_source::international::archive_plan_nearest(site_id, target_utc)
                 .map(|plan| vec![plan])
         }
-        OrdArchiveLoadMode::Hour => {
-            data_source::international::archive_plans_for_hour(site_id, target_utc)
-        }
     };
     let plans = match plans_result {
         Ok(plans) if !plans.is_empty() => plans,
@@ -51016,62 +50511,6 @@ fn fetch_ord_archive_day_plans(
         return Err(err);
     }
     Ok(scans)
-}
-
-fn fetch_smhi_archive_frame_batch(
-    site_id: &str,
-    date: NaiveDate,
-    hour: Option<u32>,
-    count: usize,
-    label: &str,
-    sender: &mpsc::Sender<AsyncLoadResult>,
-) {
-    let mut plans = match data_source::international::smhi_archive_plans_for_day(site_id, date) {
-        Ok(plans) => plans,
-        Err(err) => {
-            let _ = sender.send(AsyncLoadResult {
-                label: label.to_owned(),
-                update: AsyncLoadUpdate::Final(Err(err)),
-            });
-            return;
-        }
-    };
-    if let Some(hour) = hour {
-        plans.retain(|plan| smhi_identity_hour_utc(&plan.identity) == Some(hour));
-    }
-    if plans.is_empty() {
-        let detail = match hour {
-            Some(hour) => format!("SMHI archive: no scans for {site_id} {date} {hour:02}Z"),
-            None => format!("SMHI archive: no scans for {site_id} {date}"),
-        };
-        let _ = sender.send(AsyncLoadResult {
-            label: label.to_owned(),
-            update: AsyncLoadUpdate::Final(Err(detail)),
-        });
-        return;
-    }
-    let skip = plans.len().saturating_sub(count);
-    let plans: Vec<_> = plans.into_iter().skip(skip).collect();
-    let selected_index = plans.len().saturating_sub(1);
-    fetch_intl_frame_plan_batch(
-        site_id,
-        plans,
-        selected_index,
-        label,
-        "smhi-archive",
-        "SMHI archive",
-        sender,
-    );
-}
-
-fn smhi_identity_hour_utc(identity: &str) -> Option<u32> {
-    let stamp = identity.rsplit('_').next()?;
-    if stamp.len() != 12 || !stamp.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    NaiveDateTime::parse_from_str(stamp, "%Y%m%d%H%M")
-        .ok()
-        .map(|time| time.hour())
 }
 
 fn fetch_intl_frame_plan_batch(
@@ -62393,16 +61832,6 @@ mod tests {
     }
 
     #[test]
-    fn smhi_identity_hour_parser_filters_archive_hours() {
-        assert_eq!(
-            smhi_identity_hour_utc("radar_angelholm_qcvol_202606221735"),
-            Some(17)
-        );
-        assert_eq!(smhi_identity_hour_utc("radar_angelholm_qcvol_latest"), None);
-        assert_eq!(smhi_identity_hour_utc("not-smhi"), None);
-    }
-
-    #[test]
     fn custom_poll_marker_inputs_allow_link_only_entries() {
         let (lat_e6, lon_e6) =
             parse_custom_poll_marker_inputs("  ", "").expect("blank coordinates are link-only");
@@ -62572,36 +62001,54 @@ mod tests {
         assert!(app.loaded_volume_marker_should_draw_text("KPBZ"));
     }
 
-    #[test]
-    fn ord_archive_chip_load_uses_fetch_count_even_when_exact_load_is_single() {
-        let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.ord_archive_site_input = "plbrz".to_owned();
-        app.archive_frame_count = 10;
-        app.archive_load_loop = false;
-        app.ord_archive_scans = Some(
-            (0..12)
-                .map(|minute| {
-                    let stamp = Utc.with_ymd_and_hms(2026, 5, 30, 17, minute, 0).unwrap();
-                    data_source::international::OrdArchivePlan {
-                        stamp_utc: stamp,
-                        object_kind: "PVOL",
-                        frame: data_source::international::FramePlan {
-                            identity: format!("plbrz_{minute:02}"),
+    fn test_intl_archive_listing(
+        provider_id: &str,
+        site_id: &str,
+        scans: usize,
+    ) -> archive_browser::IntlArchiveDayListing {
+        archive_browser::IntlArchiveDayListing {
+            provider_id: provider_id.to_owned(),
+            site_id: site_id.to_owned(),
+            rows: (0..scans)
+                .map(|minute| archive_browser::ArchiveScanRow {
+                    time_utc: Utc
+                        .with_ymd_and_hms(2026, 5, 30, 17, minute as u32, 0)
+                        .unwrap(),
+                    load: archive_browser::ArchiveScanLoad::IntlPlan(
+                        data_source::international::FramePlan {
+                            identity: format!("{site_id}_{minute:02}"),
                             parts: vec![data_source::international::PlanPart {
                                 url: format!("https://example.invalid/{minute:02}.h5"),
                             }],
                             merge: false,
                         },
-                    }
+                    ),
                 })
                 .collect(),
-        );
+        }
+    }
 
-        app.start_ord_archive_scan_load(11, &egui::Context::default());
+    /// The unified browser gives every arm the US On-click contract:
+    /// Loop mode loads Fetch-N scans ending at the chip, Single mode
+    /// loads only the chip. (Conscious Phase-2 normalization — the old
+    /// ORD-only section loaded Fetch-N even in Single mode.)
+    #[test]
+    fn intl_archive_chip_load_honors_the_on_click_selector() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.poll_source = PollSource::Intl {
+            provider_id: "ord".to_owned(),
+            site_id: "plbrz".to_owned(),
+        };
+        app.archive_frame_count = 10;
+        app.archive_load_loop = true;
+        app.intl_archive_rows = Some(test_intl_archive_listing("ord", "plbrz", 12));
 
-        assert_eq!(app.ord_archive_loaded_range, Some((2, 11)));
+        app.start_intl_archive_chip_load(11, &egui::Context::default());
+
+        assert_eq!(app.intl_archive_loaded_range, Some((2, 11)));
         let progress = app.archive_load_progress.as_ref().expect("progress");
         assert_eq!(progress.total, 10);
+        assert!(progress.label.starts_with("ORD archive plbrz"));
         assert!(matches!(
             app.poll_source,
             PollSource::Intl {
@@ -62614,6 +62061,196 @@ mod tests {
             "archive display ownership must not start live polling"
         );
         assert!(app.intl_source_owns_primary_display());
+
+        // Single mode: the chip alone.
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.poll_source = PollSource::Intl {
+            provider_id: "smhi".to_owned(),
+            site_id: "angelholm".to_owned(),
+        };
+        app.archive_frame_count = 10;
+        app.archive_load_loop = false;
+        app.intl_archive_rows = Some(test_intl_archive_listing("smhi", "angelholm", 12));
+
+        app.start_intl_archive_chip_load(11, &egui::Context::default());
+
+        assert_eq!(app.intl_archive_loaded_range, Some((11, 11)));
+        let progress = app.archive_load_progress.as_ref().expect("progress");
+        assert_eq!(progress.total, 1);
+        assert!(progress.label.starts_with("SMHI archive angelholm"));
+    }
+
+    /// A listing made for a previous display owner must never load into a
+    /// new one — the rows are tagged with the owner they were listed FOR.
+    #[test]
+    fn intl_archive_chip_load_rejects_a_stale_listing_owner() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.poll_source = PollSource::Intl {
+            provider_id: "smhi".to_owned(),
+            site_id: "angelholm".to_owned(),
+        };
+        app.intl_archive_rows = Some(test_intl_archive_listing("ord", "plbrz", 3));
+
+        app.start_intl_archive_chip_load(2, &egui::Context::default());
+
+        assert!(app.load_receiver.is_none(), "no load may start");
+        assert_eq!(app.status, "Archive: list a date before loading");
+    }
+
+    /// The Phase-2 display-owner shim: the archive browser, Event Loop
+    /// Builder, and Unified Player arms all dispatch on this one
+    /// function (Phase 3 swaps its body for the real site model).
+    #[test]
+    fn display_owner_site_shim_follows_poll_source_ownership() {
+        use data_source::sites::SiteRef;
+
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![RadarSite::new("KTLX")];
+        app.selected_site_index = 0;
+        assert_eq!(
+            app.display_owner_site(),
+            SiteRef::Us {
+                level2_id: "KTLX".to_owned()
+            },
+            "custom-URL poll source leaves the US selected site as owner"
+        );
+
+        app.poll_source = PollSource::Intl {
+            provider_id: "ord".to_owned(),
+            site_id: "deess".to_owned(),
+        };
+        assert_eq!(
+            app.display_owner_site(),
+            SiteRef::Intl {
+                provider_id: "ord".to_owned(),
+                site_id: "deess".to_owned()
+            },
+            "an intl poll source owns the display even when not actively polling (archive loads)"
+        );
+
+        app.poll_source = PollSource::Intl {
+            provider_id: String::new(),
+            site_id: String::new(),
+        };
+        assert_eq!(
+            app.display_owner_site(),
+            SiteRef::Us {
+                level2_id: "KTLX".to_owned()
+            },
+            "empty intl ids never own the display (matches intl_source_owns_primary_display)"
+        );
+    }
+
+    /// Unified Player End-at, intl arms: a no-archive display owner (DWD)
+    /// surfaces the derived honest-grey reason; an archive_source()
+    /// owner (SMHI) routes down the generic provider arm; ORD keeps its
+    /// dedicated arm untouched.
+    #[test]
+    fn unified_player_end_at_dispatches_on_derived_archive_access() {
+        // DWD: honest reason, no load starts.
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.unified_player.end_date_input = "2026-06-15".to_owned();
+        app.unified_player.end_hour_input = "17".to_owned();
+        app.unified_player.end_minute_input = "30".to_owned();
+        app.poll_source = PollSource::Intl {
+            provider_id: "dwd".to_owned(),
+            site_id: "deess".to_owned(),
+        };
+        app.load_archive_loop_ending_at_for_unified_player(&egui::Context::default());
+        assert!(app.load_receiver.is_none(), "DWD must not start a load");
+        assert!(
+            app.unified_player
+                .status_text()
+                .contains("no archive adapter yet"),
+            "status must carry the derived reason, got: {}",
+            app.unified_player.status_text()
+        );
+
+        // SMHI: the generic archive_source() arm starts a provider load.
+        // (A nonexistent-but-valid-shaped site code keeps the detached
+        // worker's failure fast; dispatch state is synchronous.)
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.unified_player.end_date_input = "2026-06-15".to_owned();
+        app.unified_player.end_hour_input = "17".to_owned();
+        app.unified_player.end_minute_input = "30".to_owned();
+        app.poll_source = PollSource::Intl {
+            provider_id: "smhi".to_owned(),
+            site_id: "zzz99".to_owned(),
+        };
+        app.load_archive_loop_ending_at_for_unified_player(&egui::Context::default());
+        assert!(app.load_receiver.is_some(), "SMHI load must start");
+        let progress = app.archive_load_progress.as_ref().expect("progress");
+        assert!(
+            progress.label.starts_with("SMHI archive zzz99 loop near"),
+            "unexpected label: {}",
+            progress.label
+        );
+        assert!(!app.poll_active);
+        assert!(app.intl_source_owns_primary_display());
+
+        // ORD: the dedicated exact-load arm is byte-identical Phase-1
+        // behavior (fills the ORD exact-UTC inputs).
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.unified_player.end_date_input = "2026-06-15".to_owned();
+        app.unified_player.end_hour_input = "17".to_owned();
+        app.unified_player.end_minute_input = "30".to_owned();
+        app.poll_source = PollSource::Intl {
+            provider_id: "ord".to_owned(),
+            site_id: "zznot".to_owned(),
+        };
+        app.load_archive_loop_ending_at_for_unified_player(&egui::Context::default());
+        assert_eq!(app.ord_archive_site_input, "zznot");
+        assert_eq!(app.ord_archive_date_input, "2026-06-15");
+        let progress = app.archive_load_progress.as_ref().expect("progress");
+        assert!(
+            progress.label.starts_with("ORD archive zznot loop near"),
+            "unexpected label: {}",
+            progress.label
+        );
+    }
+
+    /// End-to-end case preservation (owner checkpoint: build an event
+    /// loop for `deess`): an intl Build plan keeps its case-significant
+    /// site code verbatim through the loader, becomes the display owner,
+    /// and honors the plan's autoplay.
+    #[test]
+    fn intl_event_loop_build_preserves_site_case_end_to_end() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let plan = event_loop_builder::EventLoopRadarPlan {
+            intl_provider_id: Some("ord".to_owned()),
+            site_id: "deess".to_owned(),
+            start_utc: Utc.with_ymd_and_hms(2026, 6, 15, 16, 30, 0).unwrap(),
+            end_utc: Utc.with_ymd_and_hms(2026, 6, 15, 18, 30, 0).unwrap(),
+            max_frames: 12,
+            auto_play: true,
+            center_on_site: false,
+            include_warnings: false,
+            include_models: false,
+            timeline_step_minutes: 5,
+        };
+
+        let status =
+            app.start_intl_event_loop_radar_load("ord".to_owned(), plan, &egui::Context::default());
+
+        assert!(
+            status.contains("event loop radar queued: deess 16:30Z to 18:30Z"),
+            "unexpected status: {status}"
+        );
+        assert!(matches!(
+            app.poll_source,
+            PollSource::Intl {
+                ref provider_id,
+                ref site_id
+            } if provider_id == "ord" && site_id == "deess"
+        ));
+        assert_eq!(
+            app.pending_site_id.as_deref(),
+            Some("deess"),
+            "site code must stay lowercase verbatim"
+        );
+        assert!(!app.poll_active);
+        assert!(app.event_explorer.pending_autoplay);
+        assert!(app.load_receiver.is_some());
     }
 
     #[test]
@@ -68256,17 +67893,16 @@ mod tests {
             coverage_provider_id: "smhi".to_owned(),
             coverage_site_id: "angelholm".to_owned(),
             coverage_frame_count: DEFAULT_ARCHIVE_FRAME_COUNT,
-            coverage_date_input: String::new(),
-            coverage_hour_input: String::new(),
             coverage_probe_rx: WorkerSlot::idle("coverage-probe"),
             coverage_probe_result: None,
             ord_archive_site_input: String::new(),
             ord_archive_date_input: String::new(),
             ord_archive_hour_input: String::new(),
             ord_archive_minute_input: String::new(),
-            ord_archive_scans: None,
-            ord_archive_list_rx: WorkerSlot::idle("ord-archive-list"),
-            ord_archive_loaded_range: None,
+            intl_archive_rows: None,
+            intl_archive_list_rx: WorkerSlot::idle("intl-archive-list"),
+            intl_archive_loaded_range: None,
+            intl_archive_load_after_listing: false,
             community_menu: None,
             spc_data: spc_layers::SpcData::default(),
             spc_outlooks_enabled: Vec::new(),

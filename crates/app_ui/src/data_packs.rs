@@ -222,6 +222,58 @@ pub(crate) const BUILT_IN_DATA_PACKS: &[BuiltInDataPack] = &[
     },
 ];
 
+/// A ready-made review scene over an international provider archive —
+/// the EU case of the one-archive-world unification (v0.29 spec Phase 2):
+/// it loads through the same `archive_source()` window path as the
+/// unified browser and the Unified Player, never a bespoke fetcher.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IntlArchiveDataPack {
+    pub(crate) id: &'static str,
+    pub(crate) title: &'static str,
+    pub(crate) summary: &'static str,
+    /// `data_source::international` provider id (`"ord"`).
+    pub(crate) provider_id: &'static str,
+    /// Provider-scoped, case-significant site code (`"plbrz"`).
+    pub(crate) site_id: &'static str,
+    pub(crate) start_utc: &'static str,
+    pub(crate) end_utc: &'static str,
+    pub(crate) focus_lat: f32,
+    pub(crate) focus_lon: f32,
+    pub(crate) map_scale: f32,
+    pub(crate) max_frames: usize,
+}
+
+impl IntlArchiveDataPack {
+    pub(crate) fn window_utc(self) -> Result<(DateTime<Utc>, DateTime<Utc>), String> {
+        let start_utc = parse_pack_time(self.start_utc)?;
+        let end_utc = parse_pack_time(self.end_utc)?;
+        if end_utc < start_utc {
+            return Err(format!("{} has an end before its start", self.title));
+        }
+        Ok((start_utc, end_utc))
+    }
+}
+
+/// EUMETNET ORD archive review scene. Window verified against the
+/// anonymous `openradar-archive` bucket on 2026-07-02: Brzuchania
+/// publishes complete DBZH+TH+VRADH PVOL scans on a 5-minute cadence
+/// across this window (CC BY 4.0 — OPERA and IMGW-PIB attribution).
+pub(crate) const INTL_ARCHIVE_DATA_PACKS: &[IntlArchiveDataPack] = &[IntlArchiveDataPack {
+    id: "ord-plbrz-archive-review",
+    title: "Brzuchania ORD Archive",
+    summary: "Two-hour EUMETNET ORD archive loop over Poland's Brzuchania radar — the \
+              international proof case for the unified archive loader (reflectivity + \
+              velocity split files merged per scan).",
+    provider_id: "ord",
+    site_id: "plbrz",
+    start_utc: "2026-06-15T16:30:00Z",
+    end_utc: "2026-06-15T18:30:00Z",
+    focus_lat: 50.3942,
+    focus_lon: 20.0832,
+    map_scale: 880.0,
+    max_frames: 24,
+}];
+
 pub(crate) const RESEARCH_FEED_DATA_PACKS: &[ResearchFeedDataPack] = &[ResearchFeedDataPack {
     id: "kcri-latest-20",
     title: "KCRI Latest 20",
@@ -256,7 +308,37 @@ mod tests {
             assert!(request.start_utc <= request.anchor_utc);
             assert!(request.anchor_utc <= request.end_utc);
             assert!(request.max_objects > 0);
-            assert!(pack.site_id.starts_with('K'));
+            // (The K-prefix assertion is gone: data packs are no longer
+            // a US-only concept — see INTL_ARCHIVE_DATA_PACKS.)
+        }
+    }
+
+    #[test]
+    fn intl_archive_packs_parse_to_valid_windows_over_archive_capable_providers() {
+        assert_eq!(INTL_ARCHIVE_DATA_PACKS.len(), 1);
+        for pack in INTL_ARCHIVE_DATA_PACKS {
+            let (start_utc, end_utc) = pack
+                .window_utc()
+                .unwrap_or_else(|err| panic!("{} should parse: {err}", pack.title));
+            assert!(start_utc < end_utc);
+            assert!(pack.max_frames > 0);
+            assert_eq!(
+                pack.site_id,
+                pack.site_id.to_lowercase(),
+                "intl site codes are case-significant lowercase"
+            );
+            // The pack must point at a provider whose derived capability
+            // says archive — the same gate the loaders use.
+            let provider = data_source::international::intl_providers()
+                .into_iter()
+                .find(|provider| provider.id() == pack.provider_id)
+                .unwrap_or_else(|| panic!("{}: unknown provider", pack.title));
+            assert!(
+                provider.supports_archive(),
+                "{}: provider '{}' has no archive source",
+                pack.title,
+                pack.provider_id
+            );
         }
     }
 

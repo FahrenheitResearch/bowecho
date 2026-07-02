@@ -867,11 +867,12 @@ fn archive(ui: &mut egui::Ui) {
     ui.heading("Archive & events");
     para(
         ui,
-        "The Data tab's Archive section replays any day in the US NEXRAD Level II record for \
-         the selected site — the loop transport sits at the top of the tab so you never switch \
-         tabs to play what you just loaded. This day browser is US Level II only; \
-         international archives live in Data \u{25b8} Radar coverage below, for the providers \
-         that expose history. Data also holds Live feeds (GR2A-style dir.list \
+        "The Data tab's Archive section follows the primary radar. For a US site it replays \
+         any day in the US NEXRAD Level II record — the loop transport sits at the top of the \
+         tab so you never switch tabs to play what you just loaded. For an international site \
+         whose provider exposes an archive (EUMETNET ORD, SMHI Sweden), the same browser lists \
+         that provider's holdings; providers without an archive say so with a reason instead \
+         of silently listing a US site. Data also holds Live feeds (GR2A-style dir.list \
          polling for research/mobile radars), the Model store summary, and local file/folder \
          openers.",
     );
@@ -906,9 +907,10 @@ fn archive(ui: &mut egui::Ui) {
         ui,
         "Data > Radar coverage is the provider-aware picker for international and research \
          sources. It shows Live / Loop / Archive / Dual-pol / Experimental badges, lets you \
-         probe a site/time without loading data, and exposes native provider paths such as \
-         SMHI hour/day archive loading. Treat archive badges as capability evidence, not a \
-         promise that every country has deep history through BowEcho yet.",
+         probe a site/time without loading data, and its Browse archive button points the \
+         Archive browser above at any archive-capable provider site. Treat archive badges as \
+         capability evidence, not a promise that every country has deep history through \
+         BowEcho yet.",
     );
 
     subhead(ui, "DATA PACKS");
@@ -1523,9 +1525,17 @@ mod tests {
         // Load Loop copy mirrors the derive-named provider hover in main.rs:
         // recent-catalog providers loop, single-frame providers grow live.
         assert!(guide_src.contains("single-frame providers start at the newest scan"));
-        // The Data-tab day browser is US Level II only — and says so.
+        // The Data-tab day browser is the unified archive world (v0.29
+        // Phase 2): US Level II AND archive-capable international
+        // providers, with honest greyed reasons for the rest — the old
+        // US-exclusivity claim (assembled below so this file cannot
+        // match itself) must stay gone.
         assert!(guide_src.contains("US NEXRAD Level II"));
-        assert!(guide_src.contains("US Level II only"));
+        assert!(guide_src.contains("EUMETNET ORD, SMHI Sweden"));
+        assert!(guide_src.contains("say so with a reason"));
+        assert!(guide_src.contains("Browse archive"));
+        let old_us_only_claim = ["US Level II", "only"].join(" ");
+        assert!(!guide_src.contains(&old_us_only_claim));
         // Retired claims, assembled at runtime so this test file does not
         // match itself: the beam menu is no longer 88D-only (old copy said
         // exactly three of them), and the absolute chip promise was

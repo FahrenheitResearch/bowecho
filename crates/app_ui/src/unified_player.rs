@@ -132,6 +132,12 @@ impl UnifiedPlayerState {
         self.status = status.into();
     }
 
+    /// Test hook: the archive arms' honest-grey reasons land here.
+    #[cfg(test)]
+    pub(crate) fn status_text(&self) -> &str {
+        &self.status
+    }
+
     pub(crate) fn archive_end_time_utc(&self) -> Result<DateTime<Utc>, String> {
         parse_utc_endpoint(
             &self.end_date_input,
@@ -315,7 +321,7 @@ impl UnifiedPlayerState {
                 }
                 if stable_button(ui, "Archive Window", 126.0, true)
                     .on_hover_text(
-                        "Load a US/ORD archive loop for the explicit UTC start/end below; never routes to live/latest",
+                        "Load an archive loop for the explicit UTC start/end below (US Level II, or the display owner's provider archive); never routes to live/latest",
                     )
                     .clicked()
                 {

@@ -58,8 +58,20 @@ impl Default for EventLoopBuilderState {
 
 #[derive(Clone, Debug)]
 pub(crate) struct EventLoopBuilderContext {
+    /// The display owner's site id (spec Phase 2): a US Level-II id, or
+    /// an international provider's case-significant site code (`deess`).
     pub(crate) current_site_id: String,
     pub(crate) current_site_label: String,
+    /// `Some(provider_id)` when the display owner is international —
+    /// Build produces an intl plan and site input stays verbatim
+    /// (lowercase ORD/SMHI codes are case-significant).
+    pub(crate) intl_provider: Option<String>,
+    /// `Some(reason)` when the display owner has no archive
+    /// ([`ArchiveAccess::None`]): Build greys and the hover text IS this
+    /// value (spec §1.3).
+    ///
+    /// [`ArchiveAccess::None`]: crate::archive_browser::ArchiveAccess::None
+    pub(crate) archive_unavailable_reason: Option<&'static str>,
     pub(crate) display_time_zone_slug: String,
     pub(crate) loaded_radar_frames: usize,
 }
@@ -71,6 +83,10 @@ pub(crate) enum EventLoopBuilderAction {
 
 #[derive(Clone, Debug)]
 pub(crate) struct EventLoopRadarPlan {
+    /// `Some(provider_id)` routes the build to the international archive
+    /// loader; `None` is the US Level-II path (Phase 3 collapses this
+    /// pair into `site: SiteRef`).
+    pub(crate) intl_provider_id: Option<String>,
     pub(crate) site_id: String,
     pub(crate) start_utc: DateTime<Utc>,
     pub(crate) end_utc: DateTime<Utc>,
@@ -161,12 +177,18 @@ impl EventLoopBuilderState {
                 if ui.button("Preview").clicked() {
                     self.refresh_preview();
                 }
-                let build_enabled = self.include_radar;
-                if ui
-                    .add_enabled(build_enabled, egui::Button::new("Build Radar Loop"))
-                    .clicked()
-                {
-                    match self.radar_plan() {
+                // The archive gate and its explanation are ONE value
+                // (spec §1.3): a display owner without an archive greys
+                // Build, and the hover text is the derived reason.
+                let build_enabled =
+                    self.include_radar && context.archive_unavailable_reason.is_none();
+                let mut build_response =
+                    ui.add_enabled(build_enabled, egui::Button::new("Build Radar Loop"));
+                if let Some(reason) = context.archive_unavailable_reason {
+                    build_response = build_response.on_disabled_hover_text(reason);
+                }
+                if build_response.clicked() {
+                    match self.radar_plan(context) {
                         Ok(plan) => {
                             self.status = format!(
                                 "Queued {} {} to {}",
@@ -297,14 +319,25 @@ impl EventLoopBuilderState {
         }
     }
 
-    fn radar_plan(&mut self) -> Result<EventLoopRadarPlan, String> {
+    fn radar_plan(
+        &mut self,
+        context: &EventLoopBuilderContext,
+    ) -> Result<EventLoopRadarPlan, String> {
         let preview = self.preview_from_inputs()?;
         self.preview = Some(preview.clone());
-        let site_id = self.site_id.trim().to_ascii_uppercase();
+        // US ids normalize uppercase as ever; international site codes
+        // are case-significant (`deess`) and pass through VERBATIM —
+        // the Phase-2 UI side of the settings-uppercasing fix.
+        let site_id = if context.intl_provider.is_some() {
+            self.site_id.trim().to_owned()
+        } else {
+            self.site_id.trim().to_ascii_uppercase()
+        };
         if site_id.is_empty() {
             return Err("Choose a radar site first".to_owned());
         }
         Ok(EventLoopRadarPlan {
+            intl_provider_id: context.intl_provider.clone(),
             site_id,
             start_utc: preview.start_utc,
             end_utc: preview.end_utc,
@@ -594,4 +627,73 @@ fn nth_weekday_of_month(year: i32, month: u32, weekday: Weekday, nth: u32) -> u3
     let target = weekday.num_days_from_sunday() as i32;
     let first_match = 1 + (target - first_weekday).rem_euclid(7) as u32;
     first_match + (nth.saturating_sub(1) * 7)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn us_context() -> EventLoopBuilderContext {
+        EventLoopBuilderContext {
+            current_site_id: "KTLX".to_owned(),
+            current_site_label: "KTLX Norman".to_owned(),
+            intl_provider: None,
+            archive_unavailable_reason: None,
+            display_time_zone_slug: "utc".to_owned(),
+            loaded_radar_frames: 0,
+        }
+    }
+
+    fn intl_context(provider_id: &str, site_id: &str) -> EventLoopBuilderContext {
+        EventLoopBuilderContext {
+            current_site_id: site_id.to_owned(),
+            current_site_label: format!("{provider_id} {site_id}"),
+            intl_provider: Some(provider_id.to_owned()),
+            archive_unavailable_reason: None,
+            display_time_zone_slug: "utc".to_owned(),
+            loaded_radar_frames: 0,
+        }
+    }
+
+    /// US ids keep their historical uppercase normalization; intl site
+    /// codes are case-significant and must pass through VERBATIM — the
+    /// UI side of the Phase-1C settings-uppercasing fix (lowercase ORD
+    /// codes like `deess` become buildable).
+    #[test]
+    fn radar_plan_preserves_intl_site_case_and_uppercases_us_ids() {
+        let mut state = EventLoopBuilderState {
+            site_id: " deess ".to_owned(),
+            ..EventLoopBuilderState::default()
+        };
+        let plan = state
+            .radar_plan(&intl_context("ord", "deess"))
+            .expect("intl plan");
+        assert_eq!(plan.site_id, "deess", "intl codes stay verbatim");
+        assert_eq!(plan.intl_provider_id.as_deref(), Some("ord"));
+
+        let mut state = EventLoopBuilderState {
+            site_id: "ktlx".to_owned(),
+            ..EventLoopBuilderState::default()
+        };
+        let plan = state.radar_plan(&us_context()).expect("us plan");
+        assert_eq!(plan.site_id, "KTLX", "US ids keep uppercasing");
+        assert_eq!(plan.intl_provider_id, None);
+    }
+
+    /// Seeding follows the context (the display owner in main.rs), never
+    /// a hardcoded US fallback: an international owner seeds its own
+    /// case-significant code.
+    #[test]
+    fn seeding_takes_the_display_owner_site_verbatim() {
+        let mut state = EventLoopBuilderState::default();
+        state.seed_from_context(&intl_context("smhi", "angelholm"));
+        assert_eq!(state.site_id, "angelholm");
+        assert_eq!(state.site_label, "smhi angelholm");
+
+        // Seeding is once-per-window (unchanged mechanics): a later
+        // context does not stomp user edits.
+        state.site_id = "kiruna".to_owned();
+        state.seed_from_context(&us_context());
+        assert_eq!(state.site_id, "kiruna");
+    }
 }

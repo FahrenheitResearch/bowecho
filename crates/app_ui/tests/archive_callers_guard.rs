@@ -17,9 +17,13 @@ use std::path::{Path, PathBuf};
 const GUARDED_SYMBOLS: [&str; 2] = ["level2_objects_for_date", "level2_objects_for_window"];
 
 /// Source files allowed to mention the guarded symbols, relative to the
-/// crate's `src/` directory (verified at branch point 07bbb9f: six call
-/// sites in main.rs, one in event_explorer.rs).
-const ALLOWED_FILES: [&str; 2] = ["event_explorer.rs", "main.rs"];
+/// crate's `src/` directory. Phase 2 landed `archive_browser.rs` — the
+/// unified widget's `ArchiveLister::Us` wraps both listers, and the
+/// browser's day-listing caller moved there from main.rs. The remaining
+/// main.rs callers are the US loaders the spec keeps unwrapped
+/// (loop-ending-at, event windows, track jumps); event_explorer.rs keeps
+/// its window lookup.
+const ALLOWED_FILES: [&str; 3] = ["archive_browser.rs", "event_explorer.rs", "main.rs"];
 
 fn rust_sources(dir: &Path, files: &mut Vec<PathBuf>) {
     let entries = std::fs::read_dir(dir)
