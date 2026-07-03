@@ -66,7 +66,7 @@ real code is finer-grained than those three names.
 shape). P4's replace-all is load-bearing for coordinated loops (comment at
 :7589-7593: never keep painting an unrelated previous frame) — model it as
 an explicit `clear + install_batch`, not as a fourth upsert mode.
-**Decision:** _(blank — owner/orchestrator)_
+**Decision:** ADOPT the recommendation. Engine `install_batch` = upsert+sort+trim; the overlay replace-all is modeled as explicit `clear + install_batch`, never a fourth upsert mode.
 
 ---
 
@@ -98,7 +98,7 @@ Complete frame with an old path under rule (c). Verify with a differential
 fixture before normalizing (the poll:// path always differs per tick, so
 rule (c) fires — the pinned test at :60427 stays green). This is a
 **consciously-normalize** candidate, not a SelectionPolicy.
-**Decision:** _(blank)_
+**Decision:** CONSCIOUSLY NORMALIZE to the P1/P2 3-tier rule, proven by a differential fixture over the polled path before merging (rule (c) must keep every current P3 caller winning).
 
 ---
 
@@ -130,7 +130,7 @@ before spawning (`start_ord_archive_window_load` :31715,
 the string exists to make the "every frame replaces the previous" failure
 mode visible, and a silent poll-side clear is exactly where that failure
 would hide. Keep wording greppable-identical.
-**Decision:** _(blank)_
+**Decision:** ADOPT. One engine guard; the polled path GAINS the `history reset (site change...)` diagnostic with greppable-identical wording.
 
 ---
 
@@ -154,7 +154,7 @@ ViewerApp keyed on an `InstallOutcome::ClearedCrossSite` — spec §3 already
 requires side effects to stay out of the engine. No behavior change needed,
 but the census note is: **P2 panes deliberately do NOT clear the shared
 loop-render caches** — do not "fix" that during the port.
-**Decision:** _(blank)_
+**Decision:** ADOPT. Engine owns history/cursor/playing; primary-only side effects stay in ViewerApp keyed on `InstallOutcome::ClearedCrossSite`. Panes deliberately keep NOT clearing shared loop-render caches.
 
 ---
 
@@ -191,7 +191,7 @@ owner-visible behavior; (b) `SelectAnchor` carries the
 the owner normalizes it into panes; (c) the backfill cursor-reposition (keep
 the DISPLAYED frame under the cursor after indices shift) is common to P1/P2
 and belongs in the engine, not the policy.
-**Decision:** _(blank)_
+**Decision:** ADOPT. SelectionPolicy carries the three variants with the fine print pinned in enum docs; FollowNewestUnlessPlaying keeps ignoring `browsing` (owner-visible today, stays); blank-display-overrides-browsing stays Primary-only.
 
 ---
 
@@ -224,7 +224,7 @@ role-specific select side effects (timeline sync, camera follow) — exactly
 the spec §3 "StepOutcome drives side effects" pattern applied to install.
 The `record_final_decode` flag is perf-telemetry plumbing, not policy: pass
 it through unchanged.
-**Decision:** _(blank)_
+**Decision:** ADOPT. `install_batch` returns InstallOutcome; select-time side effects (timeline sync, camera follow) stay role-specific in ViewerApp; record_final_decode passes through unchanged.
 
 ---
 
@@ -260,7 +260,7 @@ pinned tilt vs primary-cut fallback) is a genuine role difference and must
 be a policy parameter, not normalized. The US live-partial chain is
 byte-identical through Phase 4 (spec §9), so any restructuring here waits
 for 4e's differential gate anyway.
-**Decision:** _(blank)_
+**Decision:** ADOPT. require_selected_cut provenance is a SelectionPolicy parameter (genuine role difference); the US live-partial chain stays byte-identical until 4e's differential gate.
 
 ---
 
@@ -290,7 +290,7 @@ already adds a byte budget there): `install_batch` takes a
 they're delivering an archive loop; encode intent, not path prefixes.
 Pane trim reading the primary's limit is a real coupling to surface in
 `PaneView` construction (shared limits object), not silently copy.
-**Decision:** _(blank)_
+**Decision:** ADOPT. HistoryLimits gains grow_to_fit intent (callers state archive-loop intent; the `decoded_load_is_ord_archive_frame` path-sniffing heuristic dies); the pane-reads-primary-limit coupling surfaces as a shared limits object in PaneView construction.
 
 ---
 
@@ -323,7 +323,7 @@ mid-playback while the cursor holds" is a genuine UX oddity worth an owner
 call. If kept (likely), the engine's `install_frame` for
 `FollowNewestUnlessPlaying` must also surface "install display even when not
 selecting" — an outcome flag, so the display write stays in ViewerApp.
-**Decision:** _(blank)_
+**Decision:** OWNER DECIDED (2026-07-02): **LIVE WINS — keep today's behavior.** A polled feed's newest volume takes the display the moment it arrives, even mid-loop-playback (the cursor still holds). Now deliberate: the engine surfaces install-display-even-when-not-selecting as an outcome flag, ViewerApp does the display write, and a pinning test makes it un-regressable in either direction.
 
 ---
 
@@ -346,7 +346,7 @@ the three fetch-side schemes (path-set, dir.list signature, catalog
 identity) are provider facts, not divergences; keep them in the feed
 adapters. The Arc-ptr follow dedupe is pinned unchanged by spec §8
 (`followed_primary_volume_ptr` row).
-**Decision:** _(blank)_
+**Decision:** ADOPT. Dedupe schemes stay in the feed adapters as provider facts; engine carries one live.dedupe_key; Arc-ptr follow dedupe pinned unchanged.
 
 ---
 
@@ -374,7 +374,7 @@ never the global bar; strings are chosen by the owner at drain time. Keep
 every string greppable-identical during the port; fold the intl-arm
 `({label})` disconnect suffix into ONE wording when the overlay drains
 unify (trivial normalize, flag it in the PR).
-**Decision:** _(blank)_
+**Decision:** ADOPT. Engines get a LOCAL status string; the global bar stays a drain-time owner concern; all strings greppable-identical through the port; the intl disconnect-suffix wording folds to one form when the overlay drains unify (flagged in the commit).
 
 ---
 
@@ -400,7 +400,7 @@ overlay-history-derived caches cannot key on generation today.
 4c (replace-all becomes `clear()`+`push()`s or `From<Vec>` — every route
 bumps). Spec §9 pins the v0.28 bump discipline as build-on-never-weaken;
 the debug assertion harness (spec §3) should land with this change.
-**Decision:** _(blank)_
+**Decision:** ADOPT. Overlay history joins FrameHistory (every route bumps the generation); the debug assertion harness lands with this change; bump discipline is build-on-never-weaken.
 
 ---
 
@@ -427,7 +427,7 @@ would bite if overlay preloads were ever enabled.
 drain the P1/P2 semantics (install regardless, select per policy) and note
 it as a conscious normalize of dead behavior. Autoplay stays a drain-site
 (ViewerApp) concern driven by `InstallOutcome` — never engine-internal.
-**Decision:** _(blank)_
+**Decision:** ADOPT. Overlay drain gets the P1/P2 install-regardless semantics as a conscious normalize of dead behavior; autoplay stays a drain-site concern driven by InstallOutcome.
 
 ---
 
@@ -449,7 +449,7 @@ history-replacing preview.
 previews should be display-only in all roles (P4's replace is an artifact of
 overlay having no separate display-install path). Add a pinning test either
 way before 4c code lands.
-**Decision:** _(blank)_
+**Decision:** DECIDE NOW: previews are display-only in ALL roles (the overlay replace-through-history is an artifact, not intent). Pinning test lands BEFORE the 4c port changes the path.
 
 ---
 
@@ -482,7 +482,7 @@ names the blocker: FramePlans carry no timestamp, so the default can only
 day-trim + tail-cap). Until then this is a documented per-provider
 capability difference, not silent drift — it belongs in the coordinated-loop
 capability text, and the census marks it KEEP-with-comment for 4c.
-**Decision:** _(blank)_
+**Decision:** OWNER DECIDED (2026-07-02): **EVEN SAMPLING (edge-preserving) is the one rule** for over-cap archive windows. Implement wherever frame timestamps are derivable (ORD/SMHI/NCI identities all parse — see archive_browser::intl_plan_time_utc); a provider with genuinely unparseable stamps may fall back to newest-tail as a DOCUMENTED capability limit, not silent drift.
 
 ---
 
@@ -498,7 +498,7 @@ capability text, and the census marks it KEEP-with-comment for 4c.
 **Recommendation:** engine `InstallOutcome` supersedes the bools; the
 delegating shims (Phase 4e sub-stage ii) must preserve the exact
 true/false-per-arm mapping because drain status strings key on it (D11).
-**Decision:** _(blank)_
+**Decision:** ADOPT. InstallOutcome supersedes the bools; 4e's delegating shims preserve the exact true/false-per-arm mapping because status strings key on it.
 
 ---
 
