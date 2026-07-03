@@ -5,7 +5,8 @@
   "harness": "bowecho-bench --dealias (crates/bench/src/dealias_eval.rs), metric definitions per docs/dealias-v4-spec.md 10.2",
   "boundary_metric": "adjacent finite 4-neighbor pairs incl. azimuth wrap seam, |dv| > 1.2*min(N_row); reconciles the historical 21,458->196 figure: same field, this ruler measures region=264 on KEAX 055143 (spec 10.4)",
   "volumes": "unidata-nexrad-level2; see crates/bench/README.md",
-  "env_fixtures": "crates/bench/fixtures/dealias/env_*.json (RAP 0-h analyses)"
+  "env_fixtures": "crates/bench/fixtures/dealias/env_*.json (RAP 13-km 0-h analyses) and env_*_hrrr.json (HRRR 3-km 0-h analyses, crates/bench/py/hrrr_profile.py)",
+  "external_rows": "pyart-region (Helmus & Collis 2016, doi:10.5334/jors.119) and unravel (Louf et al. 2020, doi:10.1175/JTECH-D-19-0020.1) scored with the parity-validated Python metric port (crates/bench/py, see docs/dealias-external-baselines.md); v4-hrrr = v4 with HRRR 3-km 0-h analysis fixtures (env_*_hrrr.json; B-moore/E-ktlx12 predate the HRRR archive) \u2014 a resolution experiment, indistinguishable from v4(RAP), which is why production anchoring is RAP-only per amended spec s16; orpg-l3-spot = NOAA operational ORPG output spot checks from archived Level-III (quantitative N0U where public; qualitative RIDGE N0S renders for 2026). External runtimes are Python \u2014 apples/oranges vs Rust."
  },
  "cases": {
   "A-derecho": {
@@ -89,6 +90,59 @@
      "worst_tilt_ms": 29.3,
      "amortized": true,
      "deterministic": true
+    },
+    "pyart-region": {
+     "boundaries_lowest": 190,
+     "boundaries_volume": 2253,
+     "rms_env": 8.76,
+     "rms_harmonic": 5.78,
+     "percent_modified": 5.86,
+     "specks_lowest": 96,
+     "couplet_max_dv": 37.0,
+     "max_inbound": -64.8,
+     "multifold_gates": 0,
+     "multifold_speckle": 0,
+     "volume_ms_best": 13272.3,
+     "worst_tilt_ms": 780.7,
+     "amortized": true,
+     "deterministic": true,
+     "invented_gates_masked": 0,
+     "runtime_note": "Python (numpy/scipy/numba); apples/oranges vs Rust rows"
+    },
+    "unravel": {
+     "boundaries_lowest": 84,
+     "boundaries_volume": 465,
+     "rms_env": 8.72,
+     "rms_harmonic": 5.72,
+     "percent_modified": 5.86,
+     "specks_lowest": 54,
+     "couplet_max_dv": 37.0,
+     "max_inbound": -41.8,
+     "multifold_gates": 0,
+     "multifold_speckle": 0,
+     "volume_ms_best": 8253.7,
+     "worst_tilt_ms": 485.5,
+     "amortized": true,
+     "deterministic": true,
+     "invented_gates_masked": 0,
+     "runtime_note": "Python (numpy/scipy/numba); apples/oranges vs Rust rows"
+    },
+    "v4-hrrr": {
+     "boundaries_lowest": 257,
+     "boundaries_volume": 5077,
+     "rms_env": 8.94,
+     "rms_harmonic": 6.03,
+     "percent_modified": 5.81,
+     "specks_lowest": 84,
+     "couplet_max_dv": 39.8,
+     "max_inbound": -75.0,
+     "multifold_gates": 2,
+     "multifold_speckle": 2,
+     "volume_ms_best": 360.9,
+     "worst_tilt_ms": 21.2,
+     "amortized": true,
+     "deterministic": true,
+     "rms_env_note": "rms_env is vs the HRRR fixture, not the RAP fixture"
     }
    },
    "probes": {}
@@ -174,6 +228,59 @@
      "worst_tilt_ms": 12.6,
      "amortized": true,
      "deterministic": true
+    },
+    "pyart-region": {
+     "boundaries_lowest": 63,
+     "boundaries_volume": 1045,
+     "rms_env": 5.89,
+     "rms_harmonic": 4.42,
+     "percent_modified": 0.89,
+     "specks_lowest": 26,
+     "couplet_max_dv": 98.0,
+     "max_inbound": -58.7,
+     "multifold_gates": 0,
+     "multifold_speckle": 0,
+     "volume_ms_best": 2144.5,
+     "worst_tilt_ms": 153.2,
+     "amortized": true,
+     "deterministic": true,
+     "invented_gates_masked": 0,
+     "runtime_note": "Python (numpy/scipy/numba); apples/oranges vs Rust rows"
+    },
+    "unravel": {
+     "boundaries_lowest": 4,
+     "boundaries_volume": 117,
+     "rms_env": 5.62,
+     "rms_harmonic": 4.07,
+     "percent_modified": 0.9,
+     "specks_lowest": 4,
+     "couplet_max_dv": 40.5,
+     "max_inbound": -32.2,
+     "multifold_gates": 0,
+     "multifold_speckle": 0,
+     "volume_ms_best": 6171.1,
+     "worst_tilt_ms": 440.8,
+     "amortized": true,
+     "deterministic": true,
+     "invented_gates_masked": 0,
+     "runtime_note": "Python (numpy/scipy/numba); apples/oranges vs Rust rows"
+    },
+    "orpg-l3-spot": {
+     "boundaries_lowest": null,
+     "boundaries_volume": null,
+     "rms_env": null,
+     "rms_harmonic": null,
+     "percent_modified": null,
+     "specks_lowest": null,
+     "multifold_gates": null,
+     "multifold_speckle": null,
+     "volume_ms_best": null,
+     "worst_tilt_ms": null,
+     "couplet_max_dv": 65.0,
+     "max_inbound": -45.0,
+     "amortized": null,
+     "deterministic": null,
+     "note": "quantitative N0U (product 99), KTLX 2013-05-20 20:16Z, 0.5 deg tilt, 1 deg x 0.25 km"
     }
    },
    "probes": {}
@@ -259,6 +366,76 @@
      "worst_tilt_ms": 27.0,
      "amortized": true,
      "deterministic": true
+    },
+    "pyart-region": {
+     "boundaries_lowest": 92,
+     "boundaries_volume": 1389,
+     "rms_env": 13.89,
+     "rms_harmonic": 12.09,
+     "percent_modified": 14.03,
+     "specks_lowest": 52,
+     "couplet_max_dv": 39.0,
+     "max_inbound": -76.2,
+     "multifold_gates": 0,
+     "multifold_speckle": 0,
+     "volume_ms_best": 11904.6,
+     "worst_tilt_ms": 661.4,
+     "amortized": true,
+     "deterministic": true,
+     "invented_gates_masked": 0,
+     "runtime_note": "Python (numpy/scipy/numba); apples/oranges vs Rust rows"
+    },
+    "unravel": {
+     "boundaries_lowest": 17,
+     "boundaries_volume": 494,
+     "rms_env": 13.8,
+     "rms_harmonic": 11.98,
+     "percent_modified": 14.03,
+     "specks_lowest": 10,
+     "couplet_max_dv": 48.0,
+     "max_inbound": -66.2,
+     "multifold_gates": 0,
+     "multifold_speckle": 0,
+     "volume_ms_best": 10832.5,
+     "worst_tilt_ms": 601.8,
+     "amortized": true,
+     "deterministic": true,
+     "invented_gates_masked": 0,
+     "runtime_note": "Python (numpy/scipy/numba); apples/oranges vs Rust rows"
+    },
+    "v4-hrrr": {
+     "boundaries_lowest": 523,
+     "boundaries_volume": 19854,
+     "rms_env": 13.22,
+     "rms_harmonic": 12.17,
+     "percent_modified": 27.95,
+     "specks_lowest": 156,
+     "couplet_max_dv": 134.1,
+     "max_inbound": -155.1,
+     "multifold_gates": 83,
+     "multifold_speckle": 14,
+     "volume_ms_best": 350.0,
+     "worst_tilt_ms": 19.4,
+     "amortized": true,
+     "deterministic": true,
+     "rms_env_note": "rms_env is vs the HRRR fixture, not the RAP fixture"
+    },
+    "orpg-l3-spot": {
+     "boundaries_lowest": null,
+     "boundaries_volume": null,
+     "rms_env": null,
+     "rms_harmonic": null,
+     "percent_modified": null,
+     "specks_lowest": null,
+     "multifold_gates": null,
+     "multifold_speckle": null,
+     "volume_ms_best": null,
+     "worst_tilt_ms": null,
+     "couplet_max_dv": null,
+     "max_inbound": -65.0,
+     "amortized": null,
+     "deterministic": null,
+     "note": "quantitative N0U (product 99), KLIX 2021-08-29 16:32:52Z; -65.0 is at the product's encoding floor (7 gates saturated)"
     }
    },
    "probes": {}
@@ -344,6 +521,76 @@
      "worst_tilt_ms": 29.8,
      "amortized": true,
      "deterministic": true
+    },
+    "pyart-region": {
+     "boundaries_lowest": 101,
+     "boundaries_volume": 427,
+     "rms_env": 5.46,
+     "rms_harmonic": 4.5,
+     "percent_modified": 3.0,
+     "specks_lowest": 67,
+     "couplet_max_dv": 40.5,
+     "max_inbound": -61.5,
+     "multifold_gates": 0,
+     "multifold_speckle": 0,
+     "volume_ms_best": 5793.9,
+     "worst_tilt_ms": 340.8,
+     "amortized": true,
+     "deterministic": true,
+     "invented_gates_masked": 0,
+     "runtime_note": "Python (numpy/scipy/numba); apples/oranges vs Rust rows"
+    },
+    "unravel": {
+     "boundaries_lowest": 38,
+     "boundaries_volume": 161,
+     "rms_env": 5.25,
+     "rms_harmonic": 4.21,
+     "percent_modified": 2.98,
+     "specks_lowest": 30,
+     "couplet_max_dv": 41.5,
+     "max_inbound": -40.5,
+     "multifold_gates": 0,
+     "multifold_speckle": 0,
+     "volume_ms_best": 9405.3,
+     "worst_tilt_ms": 553.3,
+     "amortized": true,
+     "deterministic": true,
+     "invented_gates_masked": 0,
+     "runtime_note": "Python (numpy/scipy/numba); apples/oranges vs Rust rows"
+    },
+    "v4-hrrr": {
+     "boundaries_lowest": 140,
+     "boundaries_volume": 2314,
+     "rms_env": 6.17,
+     "rms_harmonic": 4.86,
+     "percent_modified": 2.9,
+     "specks_lowest": 53,
+     "couplet_max_dv": 48.5,
+     "max_inbound": -68.5,
+     "multifold_gates": 2,
+     "multifold_speckle": 2,
+     "volume_ms_best": 242.6,
+     "worst_tilt_ms": 14.3,
+     "amortized": true,
+     "deterministic": true,
+     "rms_env_note": "rms_env is vs the HRRR fixture, not the RAP fixture"
+    },
+    "orpg-l3-spot": {
+     "boundaries_lowest": null,
+     "boundaries_volume": null,
+     "rms_env": null,
+     "rms_harmonic": null,
+     "percent_modified": null,
+     "specks_lowest": null,
+     "couplet_max_dv": null,
+     "max_inbound": null,
+     "multifold_gates": null,
+     "multifold_speckle": null,
+     "volume_ms_best": null,
+     "worst_tilt_ms": null,
+     "amortized": null,
+     "deterministic": null,
+     "note": "qualitative branch read from the IEM-archived RIDGE N0S (storm-relative velocity) render MBX_N0S_202606092354.png; raw 2026 Level-III is not publicly archived (NCEI order-only)"
     }
    },
    "probes": {
@@ -366,6 +613,22 @@
     "v4-noenv": {
      "blob": "+13.3",
      "sector": "+7.0"
+    },
+    "pyart-region": {
+     "blob": "+12.1",
+     "sector": "+9.0"
+    },
+    "unravel": {
+     "blob": "+12.1",
+     "sector": "+9.0"
+    },
+    "v4-hrrr": {
+     "blob": "+13.3",
+     "sector": "+7.0"
+    },
+    "orpg-l3-spot": {
+     "blob": "AWAY (SRM render)",
+     "sector": "AWAY (SRM render)"
     }
    }
   },
@@ -450,6 +713,76 @@
      "worst_tilt_ms": 17.6,
      "amortized": true,
      "deterministic": true
+    },
+    "pyart-region": {
+     "boundaries_lowest": 48,
+     "boundaries_volume": 272,
+     "rms_env": 5.04,
+     "rms_harmonic": 4.3,
+     "percent_modified": 1.17,
+     "specks_lowest": 48,
+     "couplet_max_dv": 38.7,
+     "max_inbound": -55.7,
+     "multifold_gates": 0,
+     "multifold_speckle": 0,
+     "volume_ms_best": 6922.9,
+     "worst_tilt_ms": 407.2,
+     "amortized": true,
+     "deterministic": true,
+     "invented_gates_masked": 0,
+     "runtime_note": "Python (numpy/scipy/numba); apples/oranges vs Rust rows"
+    },
+    "unravel": {
+     "boundaries_lowest": 37,
+     "boundaries_volume": 100,
+     "rms_env": 4.85,
+     "rms_harmonic": 4.08,
+     "percent_modified": 1.16,
+     "specks_lowest": 30,
+     "couplet_max_dv": 46.0,
+     "max_inbound": -44.2,
+     "multifold_gates": 0,
+     "multifold_speckle": 0,
+     "volume_ms_best": 9017.0,
+     "worst_tilt_ms": 530.4,
+     "amortized": true,
+     "deterministic": true,
+     "invented_gates_masked": 0,
+     "runtime_note": "Python (numpy/scipy/numba); apples/oranges vs Rust rows"
+    },
+    "v4-hrrr": {
+     "boundaries_lowest": 97,
+     "boundaries_volume": 372,
+     "rms_env": 6.04,
+     "rms_harmonic": 4.68,
+     "percent_modified": 1.22,
+     "specks_lowest": 52,
+     "couplet_max_dv": 47.7,
+     "max_inbound": -60.2,
+     "multifold_gates": 0,
+     "multifold_speckle": 0,
+     "volume_ms_best": 215.3,
+     "worst_tilt_ms": 12.7,
+     "amortized": true,
+     "deterministic": true,
+     "rms_env_note": "rms_env is vs the HRRR fixture, not the RAP fixture"
+    },
+    "orpg-l3-spot": {
+     "boundaries_lowest": null,
+     "boundaries_volume": null,
+     "rms_env": null,
+     "rms_harmonic": null,
+     "percent_modified": null,
+     "specks_lowest": null,
+     "couplet_max_dv": null,
+     "max_inbound": null,
+     "multifold_gates": null,
+     "multifold_speckle": null,
+     "volume_ms_best": null,
+     "worst_tilt_ms": null,
+     "amortized": null,
+     "deterministic": null,
+     "note": "qualitative branch read from the IEM-archived RIDGE N0S (storm-relative velocity) render MBX_N0S_202606092340.png; raw 2026 Level-III is not publicly archived (NCEI order-only)"
     }
    },
    "probes": {
@@ -467,6 +800,18 @@
     },
     "v4-noenv": {
      "ctrl": "-34.0"
+    },
+    "pyart-region": {
+     "ctrl": "-20.0"
+    },
+    "unravel": {
+     "ctrl": "-20.7"
+    },
+    "v4-hrrr": {
+     "ctrl": "-34.0"
+    },
+    "orpg-l3-spot": {
+     "ctrl": "TOWARD (SRM render)"
     }
    }
   },
@@ -556,6 +901,62 @@
      "amortized": true,
      "deterministic": true,
      "correct_branch_percent": 95.25
+    },
+    "pyart-region": {
+     "boundaries_lowest": 1943,
+     "boundaries_volume": 1943,
+     "rms_env": 8.73,
+     "rms_harmonic": 5.75,
+     "percent_modified": 29.04,
+     "specks_lowest": 583,
+     "couplet_max_dv": 23.0,
+     "max_inbound": -50.8,
+     "multifold_gates": 146,
+     "multifold_speckle": 74,
+     "volume_ms_best": 7063.8,
+     "worst_tilt_ms": 7063.8,
+     "amortized": true,
+     "deterministic": true,
+     "invented_gates_masked": 0,
+     "runtime_note": "Python (numpy/scipy/numba); apples/oranges vs Rust rows",
+     "correct_branch_percent": 99.07
+    },
+    "unravel": {
+     "boundaries_lowest": 469,
+     "boundaries_volume": 469,
+     "rms_env": 15.91,
+     "rms_harmonic": 13.2,
+     "percent_modified": 40.76,
+     "specks_lowest": 187,
+     "couplet_max_dv": 24.0,
+     "max_inbound": -16.0,
+     "multifold_gates": 4255,
+     "multifold_speckle": 1353,
+     "volume_ms_best": 492.4,
+     "worst_tilt_ms": 492.4,
+     "amortized": true,
+     "deterministic": true,
+     "invented_gates_masked": 0,
+     "runtime_note": "Python (numpy/scipy/numba); apples/oranges vs Rust rows",
+     "correct_branch_percent": 28.25
+    },
+    "v4-hrrr": {
+     "boundaries_lowest": 19303,
+     "boundaries_volume": 19303,
+     "rms_env": 7.44,
+     "rms_harmonic": 5.97,
+     "percent_modified": 20.04,
+     "specks_lowest": 3621,
+     "couplet_max_dv": 44.0,
+     "max_inbound": -74.8,
+     "multifold_gates": 390,
+     "multifold_speckle": 78,
+     "volume_ms_best": 564.9,
+     "worst_tilt_ms": 564.9,
+     "amortized": true,
+     "deterministic": true,
+     "rms_env_note": "rms_env is vs the HRRR fixture, not the RAP fixture",
+     "correct_branch_percent": 83.35
     }
    },
    "probes": {},
@@ -647,6 +1048,44 @@
      "amortized": true,
      "deterministic": true,
      "correct_branch_percent": 77.01
+    },
+    "pyart-region": {
+     "boundaries_lowest": 800,
+     "boundaries_volume": 800,
+     "rms_env": 6.82,
+     "rms_harmonic": 4.22,
+     "percent_modified": 17.1,
+     "specks_lowest": 269,
+     "couplet_max_dv": 26.7,
+     "max_inbound": -44.5,
+     "multifold_gates": 9,
+     "multifold_speckle": 3,
+     "volume_ms_best": 1579.3,
+     "worst_tilt_ms": 1579.3,
+     "amortized": true,
+     "deterministic": true,
+     "invented_gates_masked": 0,
+     "runtime_note": "Python (numpy/scipy/numba); apples/oranges vs Rust rows",
+     "correct_branch_percent": 96.86
+    },
+    "unravel": {
+     "boundaries_lowest": 75,
+     "boundaries_volume": 75,
+     "rms_env": 6.21,
+     "rms_harmonic": 3.49,
+     "percent_modified": 16.42,
+     "specks_lowest": 33,
+     "couplet_max_dv": 23.0,
+     "max_inbound": -25.0,
+     "multifold_gates": 0,
+     "multifold_speckle": 0,
+     "volume_ms_best": 411.2,
+     "worst_tilt_ms": 411.2,
+     "amortized": true,
+     "deterministic": true,
+     "invented_gates_masked": 0,
+     "runtime_note": "Python (numpy/scipy/numba); apples/oranges vs Rust rows",
+     "correct_branch_percent": 92.63
     }
    },
    "probes": {},

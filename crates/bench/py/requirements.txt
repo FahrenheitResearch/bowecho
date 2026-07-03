@@ -1,0 +1,18 @@
+# External dealias baseline harness — pinned versions (validated 2026-07-02,
+# Windows 11 x64, Python 3.11.15).
+#
+# NOTE (Windows): the eccodes C library does not install from PyPI wheels on
+# native Windows; create the env with conda-forge instead (see README.md),
+# which provides eccodes 2.47.0 + python-eccodes.  On Linux/macOS this file
+# alone should suffice.
+arm-pyart==2.2.4
+numpy==2.4.6
+scipy==1.17.1
+numba==0.65.1
+matplotlib==3.11.0
+xarray==2026.4.0
+cfgrib==0.9.15.1
+requests==2.34.2
+# UNRAVEL (Louf et al. 2020, doi:10.1175/JTECH-D-19-0020.1) — not on PyPI
+# under this name; pinned to the exact commit used for the baseline rows:
+unravel @ git+https://github.com/vlouf/dealias@8e2fc63e95686c311b7e2efd9f99fb4c02305eac

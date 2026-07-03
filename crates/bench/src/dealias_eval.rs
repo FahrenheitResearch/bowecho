@@ -27,7 +27,7 @@
 //! README).
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
@@ -49,6 +49,10 @@ pub const DEALIAS_USAGE: &str = "usage: bowecho-bench --dealias --target <vol> [
   --iters <K>            timing iterations per engine (default 3, best-of)
   --case <name>          case label echoed in the output
   --json                 machine-readable output
+  --dump-fields <dir>    write decoded fields (f32-LE .bin + meta .json) per
+                         engine and velocity cut, plus raw / env-projection /
+                         rewrap-truth fields, for external metric-parity
+                         validation (crates/bench/py)
 
 Exits nonzero if any engine's output differs between two identical runs.";
 
@@ -114,6 +118,7 @@ pub struct DealiasArgs {
     iters: usize,
     case: String,
     json: bool,
+    dump_fields: Option<PathBuf>,
 }
 
 pub fn parse_dealias_args(args: &[String]) -> Result<DealiasArgs, String> {
@@ -126,6 +131,7 @@ pub fn parse_dealias_args(args: &[String]) -> Result<DealiasArgs, String> {
     let mut iters = DEFAULT_ITERS;
     let mut case = String::from("unnamed");
     let mut json = false;
+    let mut dump_fields = None;
 
     let mut index = 0;
     let value_of = |index: &mut usize, flag: &str| -> Result<String, String> {
@@ -169,6 +175,9 @@ pub fn parse_dealias_args(args: &[String]) -> Result<DealiasArgs, String> {
             }
             "--case" => case = value_of(&mut index, "--case")?,
             "--json" => json = true,
+            "--dump-fields" => {
+                dump_fields = Some(PathBuf::from(value_of(&mut index, "--dump-fields")?));
+            }
             other => return Err(format!("unknown --dealias option {other}")),
         }
         index += 1;
@@ -183,6 +192,7 @@ pub fn parse_dealias_args(args: &[String]) -> Result<DealiasArgs, String> {
         iters,
         case,
         json,
+        dump_fields,
     })
 }
 
@@ -672,6 +682,77 @@ fn probe_mean(cut: &ElevationCut, grid: &MomentGrid, field: &Field, probe: &Prob
     (count > 0).then(|| (sum / count as f64) as f32)
 }
 
+// ---- field dumps (external metric-parity validation) ----
+
+/// Raw per-row azimuths (`radial.azimuth_deg`, no wrapping) — the exact
+/// accessor the harmonic fit and env projection read.
+fn row_azimuths(cut: &ElevationCut, grid: &MomentGrid) -> Vec<f32> {
+    (0..grid.radial_count())
+        .map(|row| {
+            grid.radial_indices
+                .get(row)
+                .and_then(|&radial| cut.radials.get(radial))
+                .map(|radial| radial.azimuth_deg)
+                .unwrap_or(f32::NAN)
+        })
+        .collect()
+}
+
+/// Write `values` as little-endian f32, row-major — the layout
+/// `numpy.fromfile(dtype="<f4")` reads back directly.
+fn write_field_bin(path: &Path, values: &[f32]) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    fs::write(path, bytes).map_err(|err| format!("write {}: {err}", path.display()))
+}
+
+/// Dump one decoded field (`<label>_cutNN.bin` + `.json`).  JSON has no NaN
+/// literal, so non-finite azimuth/Nyquist entries become `null`.
+fn dump_field(
+    dir: &Path,
+    label: &str,
+    cut_index: usize,
+    cut: &ElevationCut,
+    grid: &MomentGrid,
+    field: &Field,
+    lowest: bool,
+) -> Result<(), String> {
+    let stem = format!("{label}_cut{cut_index:02}");
+    write_field_bin(&dir.join(format!("{stem}.bin")), &field.values)?;
+    let finite_or_null = |value: f32| {
+        if value.is_finite() {
+            serde_json::json!(value)
+        } else {
+            serde_json::Value::Null
+        }
+    };
+    let meta = serde_json::json!({
+        "label": label,
+        "cut_index": cut_index,
+        "elevation_deg": cut.elevation_deg,
+        "rows": field.rows,
+        "gates": field.gates,
+        "wraps": field.wraps,
+        "first_gate_m": grid.gate_range.first_gate_m,
+        "gate_spacing_m": grid.gate_range.gate_spacing_m,
+        "lowest": lowest,
+        "nyquist_mps": field.nyq.iter().copied().map(finite_or_null).collect::<Vec<_>>(),
+        "azimuth_deg": row_azimuths(cut, grid)
+            .iter()
+            .copied()
+            .map(finite_or_null)
+            .collect::<Vec<_>>(),
+    });
+    let path = dir.join(format!("{stem}.json"));
+    fs::write(
+        &path,
+        serde_json::to_string(&meta).expect("serializable meta"),
+    )
+    .map_err(|err| format!("write {}: {err}", path.display()))
+}
+
 // ---- engine drivers ----
 
 fn velocity_cuts(volume: &RadarVolume) -> Vec<usize> {
@@ -1051,6 +1132,53 @@ pub fn run_dealias(args: &DealiasArgs) -> Result<bool, String> {
         (volume, prior_volume, priors, None)
     };
 
+    // Field dumps for the external (Python) metric-parity harness.  A
+    // dedicated pass: every engine here is deterministic (enforced below),
+    // so re-running produces the grids the metrics were scored on.
+    if let Some(dir) = &args.dump_fields {
+        fs::create_dir_all(dir).map_err(|err| format!("create {}: {err}", dir.display()))?;
+        let cuts = velocity_cuts(&volume);
+        let lowest_cut = lowest_velocity_cut(&volume);
+        for &cut_index in &cuts {
+            let cut = &volume.cuts[cut_index];
+            let grid = cut.moments.get(&MomentType::Velocity).expect("velocity");
+            let field = decode_field(cut, grid);
+            let lowest = Some(cut_index) == lowest_cut;
+            dump_field(dir, "raw", cut_index, cut, grid, &field, lowest)?;
+            if lowest {
+                if let Some(profile) = profile {
+                    let projected = project_environmental_winds(profile, cut, grid);
+                    write_field_bin(&dir.join(format!("env_cut{cut_index:02}.bin")), &projected)?;
+                }
+                if let Some(truth_values) = &truth {
+                    write_field_bin(
+                        &dir.join(format!("truth_cut{cut_index:02}.bin")),
+                        truth_values,
+                    )?;
+                }
+            }
+        }
+        for &engine in &args.engines {
+            let run = run_engine(engine, &volume, prior_volume.as_ref(), &priors, profile);
+            for (slot, &cut_index) in cuts.iter().enumerate() {
+                let Some(grid) = run.grids[slot].as_ref() else {
+                    continue;
+                };
+                let cut = &volume.cuts[cut_index];
+                let field = decode_field(cut, grid);
+                dump_field(
+                    dir,
+                    engine.name(),
+                    cut_index,
+                    cut,
+                    grid,
+                    &field,
+                    Some(cut_index) == lowest_cut,
+                )?;
+            }
+        }
+    }
+
     let mut lines = Vec::new();
     let mut json_engines = Vec::new();
     let mut all_deterministic = true;
@@ -1265,6 +1393,8 @@ mod tests {
             "--case",
             "A",
             "--json",
+            "--dump-fields",
+            "dump-dir",
         ]
         .iter()
         .map(|s| (*s).to_owned())
@@ -1277,6 +1407,7 @@ mod tests {
         assert_eq!(parsed.rewrap, Some(12.0));
         assert_eq!(parsed.iters, 2);
         assert!(parsed.json);
+        assert_eq!(parsed.dump_fields, Some(PathBuf::from("dump-dir")));
         assert!(parse_dealias_args(&["--dealias".to_owned()]).is_err());
         assert!(
             parse_dealias_args(&["--target".to_owned(), "x".to_owned(), "--bogus".to_owned()])

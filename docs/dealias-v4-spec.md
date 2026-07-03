@@ -986,3 +986,38 @@ not-worse-than-hybrid on every case.
   deleted (its temporal idea lives on as v4's prior term), cascade goes
   with it (its only production consumer is hybrid) - the app returns to
   TWO engines: Region (fast honest fallback) and v4.
+
+
+## 17. External baselines (2026-07-02) - the SOTA question, measured
+
+Full table + method: docs/dealias-external-baselines.md (metric port
+cross-validated integer-exact against the Rust harness; both externals
+byte-deterministic). Findings that update this spec's directions:
+
+- **Py-ART region_dealias beats v4 on the boundary ruler on every real
+  case at equal reference RMS, and wins Case E outright (99.07% with NO
+  environmental input)** via its `centered` global-mean recentering.
+  That mechanism is the named STEAL for dealias_v4/solve.rs - highest
+  expected-value improvement on the promotion-gate list.
+- **UNRAVEL's low boundary counts are bought with storm-scale damage**:
+  Moore couplet smashed to 40.5 m/s (worst measured; v4 preserves
+  120.7), KEAX peak inbound clipped -78 to -41.8, Case E KEAX 28.25%
+  (catastrophic). v4's do-no-harm caps are vindicated - do not chase
+  UNRAVEL's boundary numbers by relaxing them.
+- **The KMBX blob is an OPEN PROBLEM FOR THE FIELD: NOAA's operational
+  ORPG fails it identically** (IEM-archived RIDGE render, 23:54Z: same
+  wrong AWAY branch; the 23:40Z control is correct). v4 ties the
+  operational state of the art there. The section-15 "2-D environmental
+  fields" remediation is REFUTED (an HRRR profile at the blob's own
+  lat/lon still endorses the wrong branch; the analysis cold pool is
+  ~100 m deep vs the 132 m beam). Remaining credible paths:
+  reflectivity/SNR pre-filtering before segmentation; radar-derived
+  low-level references.
+- 4DD is infeasible on native Windows (TRMM RSL has no Windows build);
+  documented, not pursued.
+
+Honest positioning until the steal lands: v4 is the only engine
+measured that combines competitive residual aliasing with couplet
+preservation, confidence output, determinism, and interactive runtime -
+"the best engine for storm analysis" is defensible; "best in existence"
+is not (Py-ART region holds the boundary crown).
