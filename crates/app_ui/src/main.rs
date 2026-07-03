@@ -57,6 +57,7 @@ mod guide;
 mod ingest_worker;
 mod italy_dpc;
 mod layers_rail;
+mod live_archive_bar;
 mod media;
 mod mesoanalysis;
 mod model_data;
@@ -2151,13 +2152,9 @@ struct ViewerApp {
     model_enabled: bool,
     /// Model store retention (newest N runs; 0 = unlimited).
     model_keep_runs: u8,
-    /// Flexible model download window (any init / specific hours).
+    /// One-shot flag: jump the model dock to its download controls on
+    /// the next frame (set by the Data-tab / layers-rail entry points).
     model_download_open: bool,
-    download_date: String,
-    download_cycle: u8,
-    download_hours: String,
-    /// 0 = sounding, 1 = full, 2 = view.
-    download_profile: u8,
     /// Perf meters for the model/sounding subsystems + frame time.
     model_layer_render_ms: Option<f32>,
     sounding_compute_ms: Option<f32>,
@@ -6425,10 +6422,6 @@ impl ViewerApp {
             model_ingest_progress_rx: None,
             model_ingest_cancel: None,
             model_download_open: false,
-            download_date: String::new(),
-            download_cycle: 0,
-            download_hours: "0-3".to_owned(),
-            download_profile: 0,
             vol3d: vol3d::Vol3d::default(),
             wofs: wofs::WofsState::default(),
             farm: restored_farm,
@@ -16662,6 +16655,11 @@ impl ViewerApp {
                 ui.add(egui::Image::new((texture.id(), source * scale)));
             }
             ui.heading(&display_name);
+            ui.separator();
+            // The two-button front (v0.29 Phase 5): LIVE | ARCHIVE, with
+            // the sweep menu one click deep and the Unified Player as the
+            // Advanced disclosure.
+            self.live_archive_bar_ui(ui);
             ui.separator();
             if fixed_action_button(ui, "Reset View", 90.0).clicked() {
                 self.reset_view();
@@ -28909,143 +28907,6 @@ impl ViewerApp {
                 );
             }
         }
-    }
-
-    #[allow(dead_code)]
-    fn spartan_download_window_retired(&mut self, ctx: &egui::Context) {
-        let mut open = false;
-        let mut start_request = false;
-        egui::Window::new("Model download (retired)")
-            .open(&mut open)
-            .default_size([340.0, 210.0])
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Date");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.download_date)
-                            .hint_text("YYYYMMDD")
-                            .desired_width(86.0),
-                    );
-                    ui.label("Cycle");
-                    ui.add(
-                        egui::DragValue::new(&mut self.download_cycle)
-                            .range(0..=23)
-                            .speed(0.1)
-                            .suffix("z"),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Hours");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.download_hours)
-                            .hint_text("0-3 or 2,4,6")
-                            .desired_width(86.0),
-                    )
-                    .on_hover_text("Forecast hours: N, N-M, or a comma list");
-                    ui.label("Profile");
-                    egui::ComboBox::from_id_salt("dl_profile")
-                        .selected_text(match self.download_profile {
-                            1 => "full",
-                            2 => "view",
-                            _ => "sounding",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.download_profile, 0, "sounding");
-                            ui.selectable_value(&mut self.download_profile, 1, "full");
-                            ui.selectable_value(&mut self.download_profile, 2, "view");
-                        });
-                });
-                // Live size estimate (calibrated).
-                match rw_ingest::ingest_hour::parse_hours(&self.download_hours) {
-                    Ok(hours) if !hours.is_empty() => {
-                        let profile = download_profile_for(self.download_profile);
-                        let estimate = rw_ingest::size_estimate::estimate(
-                            &profile,
-                            rustwx_core::ModelId::Hrrr,
-                            hours.len() as u16,
-                            &rw_ingest::size_estimate::Calibration::builtin_default(),
-                        );
-                        ui.weak(format!(
-                            "{} hours · store ~{:.0} MB · download ~{:.0} MB",
-                            hours.len(),
-                            estimate.store_bytes as f64 / 1.0e6,
-                            estimate.download_bytes as f64 / 1.0e6,
-                        ));
-                    }
-                    _ => {
-                        ui.weak("Hours: N, N-M, or comma list");
-                    }
-                }
-                if self.model_keep_runs > 0 {
-                    ui.weak(format!(
-                        "Retention keeps the newest {} runs — older downloads are cleaned at next launch (Keep runs 0 disables).",
-                        self.model_keep_runs
-                    ));
-                }
-                ui.horizontal(|ui| {
-                    let busy = self.model_ingest_rx.is_some();
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("Download"))
-                        .clicked()
-                    {
-                        start_request = true;
-                    }
-                    if busy {
-                        ui.spinner();
-                        ui.label(&self.status);
-                    }
-                });
-            });
-        self.model_download_open = open;
-        if start_request {
-            self.start_model_download(ctx);
-        }
-    }
-
-    /// Kick the flexible download (manual path: NO auto-prune here — the
-    /// startup retention pass owns cleanup, so a deliberately fetched old
-    /// init survives the session).
-    fn start_model_download(&mut self, ctx: &egui::Context) {
-        if self.model_ingest_rx.is_some() {
-            return;
-        }
-        let Ok(hours) = rw_ingest::ingest_hour::parse_hours(&self.download_hours) else {
-            self.status = "Bad hours spec (use N, N-M, or a comma list)".to_owned();
-            return;
-        };
-        if hours.is_empty() || self.download_date.len() != 8 {
-            self.status = "Need YYYYMMDD date and at least one hour".to_owned();
-            return;
-        }
-        let date = self.download_date.clone();
-        let cycle = self.download_cycle;
-        let profile_kind = self.download_profile;
-        let (sender, receiver) = mpsc::channel();
-        let (progress_tx, progress_rx) = mpsc::channel();
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.model_ingest_rx = Some(receiver);
-        self.model_ingest_progress_rx = Some(progress_rx);
-        self.model_ingest_cancel = Some(Arc::clone(&cancel));
-        self.status = format!("Downloading HRRR {date} {cycle:02}z…");
-        let ctx = ctx.clone();
-        thread::spawn(move || {
-            rw_ingest::throttle::set_current_thread_background_priority();
-            let pool = rw_ingest::throttle::build_background_pool(None);
-            let result = pool.install(|| {
-                run_model_download(
-                    &date,
-                    cycle,
-                    &hours,
-                    profile_kind,
-                    &cancel,
-                    &progress_tx,
-                    &ctx,
-                )
-            });
-            let _ = sender.send(result);
-            ctx.request_repaint();
-        });
     }
 
     /// Satellite window: GOES live-follow plus non-GOES ingest/discovery
@@ -43243,87 +43104,6 @@ fn draw_halo_text(
 }
 
 /// Profile selector for the download window (0 sounding / 1 full / 2 view).
-fn download_profile_for(kind: u8) -> rw_ingest::ingest_profile::IngestProfile {
-    match kind {
-        1 => rw_ingest::ingest_profile::IngestProfile::full(),
-        2 => rw_ingest::ingest_profile::IngestProfile::view(),
-        _ => rw_ingest::ingest_profile::IngestProfile::sounding(),
-    }
-}
-
-/// Manual download: explicit date/cycle/hours/profile. No pruning here —
-/// retention runs at startup/Fetch-latest so a deliberately fetched old
-/// init stays available for the session.
-fn run_model_download(
-    date: &str,
-    cycle_hour: u8,
-    hours: &[u16],
-    profile_kind: u8,
-    cancel: &std::sync::atomic::AtomicBool,
-    progress: &mpsc::Sender<String>,
-    ctx: &egui::Context,
-) -> std::result::Result<String, String> {
-    let store_dir = settings::model_store_dir();
-    let cache_dir = settings::model_cache_dir();
-    let store_str = store_dir.to_string_lossy();
-    let cache_str = cache_dir.to_string_lossy();
-    #[allow(non_snake_case)]
-    let STORE: &str = &store_str;
-    #[allow(non_snake_case)]
-    let CACHE: &str = &cache_str;
-    let cycle = rustwx_core::CycleSpec::new(date, cycle_hour).map_err(|err| err.to_string())?;
-    let profile = download_profile_for(profile_kind);
-    let run_slug = format!("{date}_{cycle_hour:02}z");
-    let progress_sink = std::sync::Mutex::new(progress.clone());
-    let ctx_sink = ctx.clone();
-    let on_event = move |event: rw_ingest::IngestEvent| {
-        if let rw_ingest::IngestEvent::StageStarted { hour, stage } = event
-            && let Ok(sender) = progress_sink.lock()
-        {
-            let _ = sender.send(format!("HRRR f{hour:02}: {stage:?}…"));
-            ctx_sink.request_repaint();
-        }
-    };
-    let config = rw_ingest::IngestConfig {
-        model: rustwx_core::ModelId::Hrrr,
-        cycle: &cycle,
-        source_override: None,
-        cache_root: std::path::Path::new(CACHE),
-        use_cache: true,
-        store_root: std::path::Path::new(STORE),
-        model_slug: "hrrr",
-        run_slug: &run_slug,
-        profile: &profile,
-        verify: false,
-        progress: &on_event,
-        cancel,
-    };
-    let mut stored = 0usize;
-    for &hour in hours {
-        match rw_ingest::ingest_hour_serial(&config, hour) {
-            Ok(_) => {
-                stored += 1;
-                let _ = progress.send(format!("HRRR {date} {cycle_hour:02}z f{hour:02} stored"));
-                ctx.request_repaint();
-            }
-            Err(rw_ingest::IngestError::Cancelled) => {
-                return Err(format!("cancelled ({stored} hours stored)"));
-            }
-            Err(err) => {
-                if stored == 0 {
-                    return Err(err.to_string());
-                }
-                return Ok(format!(
-                    "HRRR {date} {cycle_hour:02}z: {stored} hours stored (f{hour:02} failed: {err})"
-                ));
-            }
-        }
-    }
-    Ok(format!(
-        "HRRR {date} {cycle_hour:02}z: {stored} hours ingested"
-    ))
-}
-
 /// In-process one-click model ingest via the rw-ingest LIBRARY (typed
 /// per-stage progress + cooperative cancel; atomic writes mean cancel never
 /// leaves a partial hour). Freshest plausible init first — cycle cadence
@@ -45779,75 +45559,6 @@ struct SpcMdLoad {
     parsed_items: usize,
     error_count: usize,
     records: Vec<HazardRecord>,
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn fetch_hot_text_product_type(
-    product_type: &str,
-    query_time_utc: DateTime<Utc>,
-) -> Result<SpcMdLoad, String> {
-    let url = format!("{NWS_PRODUCT_API_BASE_URL}/{product_type}");
-    let text = data_source::fetch_text(&url)
-        .map_err(|err| format!("NWS {product_type} product list fetch failed: {err}"))?;
-    let collection: NwsProductCollection = serde_json::from_str(&text)
-        .map_err(|err| format!("NWS {product_type} product list parse failed: {err}"))?;
-    let summaries = select_hot_text_summaries(collection.products, query_time_utc);
-    let mut records = Vec::new();
-    let mut parsed_items = 0usize;
-    let mut error_count = 0usize;
-
-    let detail_results = thread::scope(|scope| {
-        let workers = summaries
-            .iter()
-            .map(|summary| scope.spawn(move || fetch_nws_product_detail(summary)))
-            .collect::<Vec<_>>();
-        workers
-            .into_iter()
-            .map(|worker| {
-                worker
-                    .join()
-                    .unwrap_or_else(|_| Err("NWS product detail worker panicked".to_owned()))
-            })
-            .collect::<Vec<_>>()
-    });
-
-    for (summary, detail_result) in summaries.iter().zip(detail_results) {
-        match detail_result {
-            Ok(detail) => {
-                let before = records.len();
-                let mut parsed = parse_hazard_records_from_text(
-                    Path::new(product_type),
-                    &detail.product_text,
-                    Some(query_time_utc),
-                );
-                for record in &mut parsed {
-                    record.source_url = Some(summary.url.clone());
-                    if record.headline.is_none() {
-                        record.headline = Some(detail.product_name.clone());
-                    }
-                    record.details.push(format!(
-                        "Issued {}",
-                        format_utc_seconds(detail.issuance_time)
-                    ));
-                }
-                records.append(&mut parsed);
-                if records.len() > before {
-                    parsed_items += 1;
-                }
-            }
-            Err(_) => {
-                error_count += 1;
-            }
-        }
-    }
-
-    Ok(SpcMdLoad {
-        scanned_items: summaries.len(),
-        parsed_items,
-        error_count,
-        records,
-    })
 }
 
 fn fetch_hot_text_product_type_for_window(
@@ -66902,7 +66613,7 @@ mod tests {
     /// the 4e stage-(iii) unify the primary chip derives from the NEWEST
     /// history frame (`LoopEngine::liveness`), so chip tests must put their
     /// aged volume on the frame strip, not just the display.
-    fn set_primary_chip_frame(app: &mut ViewerApp, volume: Arc<RadarVolume>) {
+    pub(crate) fn set_primary_chip_frame(app: &mut ViewerApp, volume: Arc<RadarVolume>) {
         app.primary.history.clear();
         app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
@@ -67119,10 +66830,6 @@ mod tests {
             model_ingest_progress_rx: None,
             model_ingest_cancel: None,
             model_download_open: false,
-            download_date: String::new(),
-            download_cycle: 0,
-            download_hours: "0-3".to_owned(),
-            download_profile: 0,
             vol3d: vol3d::Vol3d::default(),
             wofs: wofs::WofsState::default(),
             farm: farm_live::FarmState::default(),

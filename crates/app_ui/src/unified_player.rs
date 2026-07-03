@@ -69,7 +69,7 @@ pub(crate) struct UnifiedPlayerContext {
     pub(crate) docked: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum UnifiedPlayerAction {
     LoadLatest,
     LoadLoop,
@@ -132,8 +132,10 @@ impl UnifiedPlayerState {
         self.status = status.into();
     }
 
-    /// Test hook: the archive arms' honest-grey reasons land here.
-    #[cfg(test)]
+    /// The latest status line. Tests read the archive arms' honest-grey
+    /// reasons here, and the LIVE|ARCHIVE bar mirrors bar-initiated load
+    /// feedback into the global status bar (the player window may be
+    /// closed when the bar drives it).
     pub(crate) fn status_text(&self) -> &str {
         &self.status
     }
@@ -171,6 +173,20 @@ impl UnifiedPlayerState {
         self.end_date_input = time.format("%Y-%m-%d").to_string();
         self.end_hour_input = time.format("%H").to_string();
         self.end_minute_input = time.format("%M").to_string();
+    }
+
+    /// LIVE|ARCHIVE bar popover prefill (live_archive_bar.rs): the
+    /// compact ARCHIVE popover edits the SAME end-time fields this
+    /// player shows, so an empty set seeds from the given anchor
+    /// (displayed frame time, else now) exactly like
+    /// [`Self::ensure_time_inputs`]'s end half.
+    pub(crate) fn ensure_end_time_inputs(&mut self, anchor: DateTime<Utc>) {
+        if self.end_date_input.trim().is_empty()
+            || self.end_hour_input.trim().is_empty()
+            || self.end_minute_input.trim().is_empty()
+        {
+            self.set_end_time(anchor);
+        }
     }
 
     fn ensure_time_inputs(&mut self, context: &UnifiedPlayerContext) {

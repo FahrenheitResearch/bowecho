@@ -1,0 +1,125 @@
+# BowEcho v0.29.0 — One Radar World (DRAFT)
+
+> Status: draft, maintained through the v0.29 structural program
+> (`docs/v029-engine-spec.md`). Finalize into `docs/releases/v0.29.0.md`
+> when the tag is cut. No GitHub releases before v0.29.0 per the release
+> process in spec §12.
+
+v0.29 is a structural release: the machinery that was three drifting
+copies is now one, and a two-button front sits on top of it.
+
+## The two-button front
+
+The top bar now leads with **LIVE | ARCHIVE**:
+
+- **LIVE** — one click follows the current radar's newest data and
+  backfills a recent loop. US sites arm the real-time chunk feed;
+  international sites resume the provider poll. Works identically from
+  a US, European, or Australian session.
+- **ARCHIVE** — a compact UTC date/time popover loads a loop ending at
+  any moment in the record: the full US NEXRAD Level II archive, or an
+  international provider's own archive (EUMETNET ORD, SMHI Sweden,
+  Australia NCI today — the set is derived from provider capability,
+  not a hardcoded list). Providers without an archive grey the button
+  with the honest reason.
+- **Synced warnings arm by default in both modes.** Archive loops load
+  the warning polygons for their window; live loops keep the
+  authoritative current-warning refresh. Reports, lightning, satellite,
+  and model layers keep tracking the displayed frame as before.
+- **Sweeps** — the community's low-level sweep loops are one click deep,
+  by design: scan-only, all complete low tilts, dominant low level,
+  lowest level only, and the full per-product range editor. All-lowest
+  is fluid (SAILS-dense); a fixed range is steadier — both stay easy.
+- **Advanced** — the full Unified Player, unchanged. Every control that
+  existed before the bar still exists behind it.
+
+The lit segment derives from the same engine liveness verdict as the
+LIVE/ARCHIVE chip, so the bar can never disagree with the canvas.
+
+## One engine underneath
+
+- The primary view, extra panes, and radar overlays now run on ONE loop
+  engine (`ui_core::loop_engine`) with declared policies instead of
+  three hand-copied loops. Mode chips derive from the engine's
+  liveness — a live chip on an archive display is unrepresentable.
+- One site model: US and international radars are one `SiteRef` type.
+  Favorites, startup restore, search, beam rankings, and pane pins all
+  work identically for international sites (case-preserved settings
+  keys included).
+- One archive world: US Level II listings and provider archives browse
+  and load through the same widget, with capability cards derived from
+  the provider registry.
+- International staleness uses a cadence-aware floor
+  (`max(user, 1800 s, 2 × poll cadence)`), so a healthy 10-minute feed
+  is not flagged STALE by NEXRAD-tuned thresholds.
+
+## Analyst 3D velocity dealiasing (model-anchored)
+
+The dealiaser picker's "Analyst 3D (model-anchored)" slot now runs the
+v4.1 engine: all velocity tilts of the volume solved jointly, the
+previous volume as a temporal prior, and — for US CONUS sites — the
+absolute branch anchored to a RAP 0-hour analysis wind profile fetched
+in the background (`.idx`-subset byte-range fetch from the NOAA
+open-data mirror; ~18 MB per cycle, cached; renders never block on it).
+International and non-CONUS sites run without the model anchor, and the
+sidebar says which anchor the current volume actually has. The Region
+engine remains the fast default. The retired tilt-cascade and 3-D+time
+hybrid engines are deleted; their ideas live on inside v4.1.
+
+Honest positioning (measured, `docs/dealias-external-baselines.md`): v4
+is the only engine we measured that combines competitive residual
+aliasing with couplet preservation, confidence output, determinism, and
+interactive runtime. Py-ART's region dealiaser still holds the raw
+fold-boundary crown, and the KMBX-class isolated-blob case remains an
+open problem for the whole field — NOAA's operational ORPG fails it the
+same way.
+
+Method lineage, cited: Besag 1986 (ICM optimization, *J. R. Stat. Soc.
+B* 48); James & Houze 2001 (4DD sounding/environment initialization,
+*J. Atmos. Oceanic Technol.* 18); Helmus & Collis 2016 (Py-ART, *JORS*
+4); Feldmann et al. 2020 (R2D2 region-based unfolding,
+*J. Atmos. Oceanic Technol.* 37); Louf et al. 2020 (UNRAVEL repair
+gauntlet, *J. Atmos. Oceanic Technol.* 37); plus Jing & Wiener 1993 and
+Eilts & Smith 1990 for the region engine's foundations.
+
+## Smaller, more honest codebase
+
+- Dead subsystems removed after re-verification: the dormant MTG FCI
+  download/decode plumbing (the UI has said "not available" for
+  releases; now the code agrees), a retired model-download window and
+  its worker chain, and leftover dead test helpers. The guide's
+  satellite copy no longer overstates MTG support, and a new self-test
+  keeps the guide's archive-provider claims tied to the derived
+  capability set.
+- `crates/app_ui/src/main.rs` shrank below its Phase-5 start
+  (69,882 → 69,589 lines) while gaining the bar — the new surface lives
+  in its own module (`live_archive_bar.rs`).
+
+## Validation
+
+- `cargo test --workspace` green (see CI for the count at tag time)
+- `cargo fmt --all --check` / `cargo clippy --workspace --all-targets
+  -- -D warnings`
+- Differential suite: legacy loop/install/liveness behavior pinned
+  against the engine across fixture histories (KEAX 2026-06-09 derecho,
+  JMA merged repeated-elevation, ORD REF-only) × sweep policies ×
+  cursors.
+
+## Credits
+
+- Radar data: NOAA NEXRAD Level II; **EUMETNET OPERA** and the
+  participating national meteorological services via the Open Radar
+  Data programme (CC BY 4.0); SMHI Sweden; Australian Bureau of
+  Meteorology data via NCI; and every national service named on the
+  provider cards in Data ▸ Radar coverage.
+- Research-radar color tables ported from **GURT V3 — the Graphic
+  Utility Radar Toolkit by ambient330** (MIT license).
+- The annotation tools' graphics vocabulary reimplements the **GBW
+  Overlay** renderer by **grayskieswx** (YouTube), shared by the author
+  for this purpose.
+- **mPING** public reports courtesy of **NOAA National Severe Storms
+  Laboratory and the University of Oklahoma**.
+- Model data: NOAA HRRR, GFS, and RAP from the NOAA Open Data
+  Dissemination program.
+- Science citations for every derived product live in the in-app Guide
+  (Data sources & credits) and `docs/products-guide.md`.

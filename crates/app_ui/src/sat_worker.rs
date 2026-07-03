@@ -26,7 +26,6 @@ use eframe::egui::{Color32, ColorImage};
 use rustwx_core::{GridShape, LatLonGrid};
 use rw_sat::composite::GoesAbiRgbCompositeStyle;
 use rw_sat::events::{SatError, SatEvent};
-use rw_sat::fci::{FciChannel, FciValueMode, assemble_fci_chunks};
 use rw_sat::follow::FollowConfig;
 use rw_sat::goes::{GoesSatellite, parse_goes_abi_filename};
 use rw_sat::himawari::{
@@ -34,17 +33,13 @@ use rw_sat::himawari::{
     HimawariManifestSegment, HimawariProduct, HimawariSatellite, HimawariValueMode,
     assemble_hsd_segments, is_complete_segment_set, list_latest_segments, stage_download_manifest,
 };
-use rw_sat::mtg::{
-    EumetsatCredentials, MtgCollection, MtgSearchRequest, download_product, request_access_token,
-    search_products, unpack_package,
-};
 use rw_sat::palette::{anchor_color, band_anchors};
 use rw_sat::s3::{
     Sector, bucket_for_satellite, build_agent, download_object, object_filename, object_url,
 };
 use rw_sat::store::{
     SatelliteGridField, SatelliteGridScene, SatelliteProjection, WrittenFrame, frame_file_name,
-    run_day, selector_band, write_satellite_grid_frame,
+    run_day, selector_band,
 };
 use rw_sat::window::WindowConfig;
 use rw_store::format::RwsWriterInfo;
@@ -75,26 +70,6 @@ pub enum SatRequest {
     LoadFrameForMap { key: SatRunKey, hhmm: u16 },
     /// Download/decode the latest Himawari AHI frame into the shared sat store.
     IngestLatestHimawari(HimawariQuickSpec),
-    /// Public EUMETSAT OpenSearch discovery for MTG products.
-    #[allow(dead_code)]
-    DiscoverMtg {
-        collection: String,
-        minutes: i64,
-        count: usize,
-    },
-    /// Verify EUMETSAT credentials from session fields or process environment.
-    #[allow(dead_code)]
-    CheckMtgAuth {
-        validity_secs: u64,
-        consumer_key: Option<String>,
-        consumer_secret: Option<String>,
-    },
-    /// Download the latest credential-gated MTG FCI product and decode it.
-    #[allow(dead_code)]
-    DownloadLatestMtgFci(MtgFciDownloadSpec),
-    /// Decode local MTG FCI CHK-BODY NetCDF file(s) into the shared sat store.
-    #[allow(dead_code)]
-    IngestMtgFciLocal(MtgFciLocalSpec),
 }
 
 #[derive(Debug, Clone)]
@@ -116,25 +91,6 @@ impl Default for HimawariQuickSpec {
             downsample: 2,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct MtgFciLocalSpec {
-    pub paths: Vec<PathBuf>,
-    pub channel: String,
-    pub value: String,
-    pub downsample: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct MtgFciDownloadSpec {
-    pub collection: String,
-    pub minutes: i64,
-    pub channel: String,
-    pub value: String,
-    pub downsample: usize,
-    pub consumer_key: Option<String>,
-    pub consumer_secret: Option<String>,
 }
 
 /// A frame prepared for the map layer: the palette-colored image, the
@@ -1290,212 +1246,6 @@ fn ingest_latest_himawari(
     ))
 }
 
-fn discover_mtg(collection: &str, minutes: i64, count: usize) -> Result<String, String> {
-    let collection = MtgCollection::parse(collection)
-        .ok_or_else(|| format!("unknown MTG collection '{collection}'"))?;
-    let end = Utc::now();
-    let start = end - chrono::Duration::minutes(minutes.max(1));
-    let request = MtgSearchRequest::new(collection, start, end, count.max(1));
-    let agent = build_agent();
-    let result = search_products(&agent, &request).map_err(|err| err.to_string())?;
-    let first = result
-        .products
-        .first()
-        .map(|product| {
-            format!(
-                "{} {}",
-                product.date.as_deref().unwrap_or("(no time)"),
-                product.id
-            )
-        })
-        .unwrap_or_else(|| "no products".to_string());
-    Ok(format!(
-        "MTG {} discovery: {} shown of {}; newest {first}; download/decode requires an MTG FCI body file or EUMETSAT credentials",
-        collection.slug(),
-        result.products.len(),
-        result.total_results
-    ))
-}
-
-fn check_mtg_auth(
-    validity_secs: u64,
-    consumer_key: Option<&str>,
-    consumer_secret: Option<&str>,
-) -> Result<String, String> {
-    let credentials = mtg_credentials(consumer_key, consumer_secret)?;
-    let agent = build_agent();
-    let token = request_access_token(&agent, &credentials, validity_secs.max(60))
-        .map_err(|err| err.to_string())?;
-    Ok(format!(
-        "EUMETSAT auth OK: token acquired; expires in {}s",
-        token.expires_in
-    ))
-}
-
-fn mtg_credentials(
-    consumer_key: Option<&str>,
-    consumer_secret: Option<&str>,
-) -> Result<EumetsatCredentials, String> {
-    match (consumer_key, consumer_secret) {
-        (Some(key), Some(secret)) if !key.trim().is_empty() && !secret.trim().is_empty() => {
-            Ok(EumetsatCredentials::new(key.trim(), secret.trim()))
-        }
-        _ => EumetsatCredentials::from_env().map_err(|err| err.to_string()),
-    }
-}
-
-fn download_latest_mtg_fci(
-    store_root: &Path,
-    spec: &MtgFciDownloadSpec,
-) -> Result<(String, SatRunKey, u16), String> {
-    let collection = MtgCollection::parse(&spec.collection)
-        .ok_or_else(|| format!("unknown MTG collection '{}'", spec.collection))?;
-    let channel = FciChannel::parse(&spec.channel).ok_or_else(|| {
-        format!(
-            "unknown FCI channel '{}' (choices: {}; or c01..c16)",
-            spec.channel,
-            FciChannel::choices()
-        )
-    })?;
-    let mode = FciValueMode::parse(&spec.value).ok_or_else(|| {
-        format!(
-            "unknown FCI value '{}' (choices: brightness-temp, bt, radiance, reflectance, count)",
-            spec.value
-        )
-    })?;
-    let agent = build_agent();
-    let end = Utc::now();
-    let start = end - chrono::Duration::minutes(spec.minutes.max(1));
-    let request = MtgSearchRequest::new(collection, start, end, 1);
-    let search = search_products(&agent, &request).map_err(|err| err.to_string())?;
-    let product = search
-        .products
-        .first()
-        .ok_or_else(|| format!("MTG {} discovery returned no products", collection.slug()))?;
-    let product_id = product.id.clone();
-    let credentials = mtg_credentials(
-        spec.consumer_key.as_deref(),
-        spec.consumer_secret.as_deref(),
-    )?;
-    let token = request_access_token(&agent, &credentials, 3600).map_err(|err| err.to_string())?;
-    let source_root = store_root.join("sources").join("mtg");
-    let download_dir = source_root.join("downloads").join(collection.slug());
-    let downloaded = download_product(&agent, collection, &product_id, &token, &download_dir)
-        .map_err(|err| err.to_string())?;
-    let unpack_dir = source_root
-        .join("unpacked")
-        .join(collection.slug())
-        .join(format!(
-            "{}_{}",
-            Utc::now().format("%Y%m%dT%H%M%SZ"),
-            downloaded.filename
-        ));
-    let unpacked =
-        unpack_package(&downloaded.path, &unpack_dir, true).map_err(|err| err.to_string())?;
-    let paths = unpacked
-        .extracted
-        .iter()
-        .filter(|entry| is_netcdf_path(&entry.path))
-        .map(|entry| entry.path.clone())
-        .collect::<Vec<_>>();
-    if paths.is_empty() {
-        return Err(format!(
-            "downloaded {} but no NetCDF body files were extracted",
-            downloaded.path.display()
-        ));
-    }
-
-    let field = assemble_fci_chunks(&paths, channel, mode, spec.downsample.max(1))
-        .map_err(|err| err.to_string())?;
-    let nx = field.scene.fixed_grid.nx;
-    let ny = field.scene.fixed_grid.ny;
-    let frame =
-        write_satellite_grid_frame(store_root, &field, Utc::now().timestamp().max(0) as u64)
-            .map_err(|err| err.to_string())?;
-    let key = SatRunKey {
-        model: frame.model.clone(),
-        run: frame.run.clone(),
-    };
-    let hhmm = frame.hhmm;
-    Ok((
-        format!(
-            "MTG FCI downloaded/decode {} {}: {} NetCDF file(s), {}x{}, wrote {}/{}/t{:04}",
-            channel.name,
-            mode.slug(),
-            paths.len(),
-            nx,
-            ny,
-            frame.model,
-            frame.run,
-            frame.hhmm
-        ),
-        key,
-        hhmm,
-    ))
-}
-
-fn is_netcdf_path(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| {
-            let lower = name.to_ascii_lowercase();
-            lower.ends_with(".nc")
-                || lower.ends_with(".nc4")
-                || lower.ends_with(".nc4e")
-                || lower.ends_with(".netcdf")
-        })
-        .unwrap_or(false)
-}
-
-fn ingest_local_mtg_fci(
-    store_root: &Path,
-    spec: &MtgFciLocalSpec,
-) -> Result<(String, SatRunKey, u16), String> {
-    if spec.paths.is_empty() {
-        return Err("choose at least one MTG FCI CHK-BODY NetCDF file".to_string());
-    }
-    let channel = FciChannel::parse(&spec.channel).ok_or_else(|| {
-        format!(
-            "unknown FCI channel '{}' (choices: {}; or c01..c16)",
-            spec.channel,
-            FciChannel::choices()
-        )
-    })?;
-    let mode = FciValueMode::parse(&spec.value).ok_or_else(|| {
-        format!(
-            "unknown FCI value '{}' (choices: brightness-temp, bt, radiance, reflectance, count)",
-            spec.value
-        )
-    })?;
-    let field = assemble_fci_chunks(&spec.paths, channel, mode, spec.downsample.max(1))
-        .map_err(|err| err.to_string())?;
-    let nx = field.scene.fixed_grid.nx;
-    let ny = field.scene.fixed_grid.ny;
-    let frame =
-        write_satellite_grid_frame(store_root, &field, Utc::now().timestamp().max(0) as u64)
-            .map_err(|err| err.to_string())?;
-    let key = SatRunKey {
-        model: frame.model.clone(),
-        run: frame.run.clone(),
-    };
-    let hhmm = frame.hhmm;
-    Ok((
-        format!(
-            "MTG FCI {} {}: {} chunk(s), {}x{}, wrote {}/{}/t{:04}",
-            channel.name,
-            mode.slug(),
-            spec.paths.len(),
-            nx,
-            ny,
-            frame.model,
-            frame.run,
-            frame.hhmm
-        ),
-        key,
-        hhmm,
-    ))
-}
-
 fn worker_loop(
     store_root: PathBuf,
     requests: &Receiver<SatRequest>,
@@ -1550,82 +1300,6 @@ fn worker_loop(
                     }
                     Err(message) => {
                         send(SatResponse::Note(format!("Himawari failed: {message}")));
-                    }
-                }
-            }
-            SatRequest::DiscoverMtg {
-                collection,
-                minutes,
-                count,
-            } => {
-                send(SatResponse::Note(format!(
-                    "MTG: searching {collection} for the last {minutes} minutes"
-                )));
-                match discover_mtg(&collection, minutes, count) {
-                    Ok(summary) => {
-                        send(SatResponse::Note(summary));
-                    }
-                    Err(message) => {
-                        send(SatResponse::Note(format!(
-                            "MTG discovery failed: {message}"
-                        )));
-                    }
-                }
-            }
-            SatRequest::CheckMtgAuth {
-                validity_secs,
-                consumer_key,
-                consumer_secret,
-            } => {
-                send(SatResponse::Note(
-                    "EUMETSAT: requesting token from session/env credentials".to_string(),
-                ));
-                match check_mtg_auth(
-                    validity_secs,
-                    consumer_key.as_deref(),
-                    consumer_secret.as_deref(),
-                ) {
-                    Ok(summary) => {
-                        send(SatResponse::Note(summary));
-                    }
-                    Err(message) => {
-                        send(SatResponse::Note(format!(
-                            "EUMETSAT auth failed: {message}"
-                        )));
-                    }
-                }
-            }
-            SatRequest::DownloadLatestMtgFci(spec) => {
-                send(SatResponse::Note(format!(
-                    "MTG FCI: downloading latest {} from last {} minutes",
-                    spec.collection, spec.minutes
-                )));
-                match download_latest_mtg_fci(&store_root, &spec) {
-                    Ok((summary, key, hhmm)) => {
-                        send(SatResponse::Note(summary));
-                        send(SatResponse::Runs(scan_runs(&store_root)));
-                        send(SatResponse::SelectFrame { key, hhmm });
-                    }
-                    Err(message) => {
-                        send(SatResponse::Note(format!(
-                            "MTG FCI download failed: {message}"
-                        )));
-                    }
-                }
-            }
-            SatRequest::IngestMtgFciLocal(spec) => {
-                send(SatResponse::Note(format!(
-                    "MTG FCI: decoding {} local NetCDF file(s)",
-                    spec.paths.len()
-                )));
-                match ingest_local_mtg_fci(&store_root, &spec) {
-                    Ok((summary, key, hhmm)) => {
-                        send(SatResponse::Note(summary));
-                        send(SatResponse::Runs(scan_runs(&store_root)));
-                        send(SatResponse::SelectFrame { key, hhmm });
-                    }
-                    Err(message) => {
-                        send(SatResponse::Note(format!("MTG FCI failed: {message}")));
                     }
                 }
             }
@@ -1798,9 +1472,13 @@ fn worker_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The differential test against rw-sat's upstream writer uses it
+    // directly; production code writes through the local
+    // `write_himawari_grid_frame` fork above.
     use chrono::{TimeZone, Utc};
     use rw_sat::abi::{AbiFixedGrid, AbiSector, GoesAbiField, GoesAbiScene, GoesImagerProjection};
     use rw_sat::geostationary::SweepAngleAxis;
+    use rw_sat::store::write_satellite_grid_frame;
     use rw_sat::store::{read_frame, write_band_frame};
 
     fn spec() -> SatFollowSpec {

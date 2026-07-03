@@ -13,7 +13,11 @@ use eframe::egui;
 use crate::ui_theme::ACCENT_COLOR as KEY_COLOR;
 use crate::ui_theme::SUBHEAD_COLOR;
 
-const GUIDE_TOP_BAR_TEXT: &str = "The top bar holds one-shot actions on the left \
+const GUIDE_TOP_BAR_TEXT: &str = "The top bar leads with the LIVE | ARCHIVE control: \
+    LIVE follows the current radar's newest data and backfills a loop in one click; \
+    ARCHIVE loads a loop ending at any UTC date/time. Both arm synced warnings by \
+    default. Sweeps picks the low-level sweep loop mode one click deep, and Advanced \
+    opens the full Unified Player. One-shot actions follow \
     (Reset View, Reload, Map Only, Screenshot, Annotate) plus Workflows presets. \
     On the right, the Windows menu opens every data window (Model, Radar \
     overlays, Satellite, WoFS, FARM, 3D Volume, Sounding) beside this Guide. Status chips appear \
@@ -270,6 +274,13 @@ fn getting_started(ui: &mut egui::Ui) {
     );
 
     subhead(ui, "GO LIVE");
+    action(
+        ui,
+        "LIVE (top bar)",
+        "— one click: follow the current radar's newest data and backfill a recent loop. \
+         US sites arm the real-time chunk feed; international sites resume the provider \
+         poll. Synced warnings arm automatically.",
+    );
     action(
         ui,
         "Live",
@@ -828,9 +839,9 @@ fn satellite(ui: &mut egui::Ui) {
     subhead(ui, "OTHER SATELLITE SOURCES");
     para(
         ui,
-        "Himawari-9 B13 can be loaded from NOAA public buckets for Asia/Pacific IR context. \
-         MTG/FCI discovery and local FCI file decode are wired, but live European FCI imagery \
-         still depends on EUMETSAT entitlement/credentials. Switching source, sector, or layer \
+        "Himawari-9 IR/WV bands can be loaded from NOAA public buckets for Asia/Pacific \
+         context. MTG/European satellite imagery is not available in this build — it needs \
+         EUMETSAT entitlement the app cannot assume. Switching source, sector, or layer \
          clears stale frames so late downloads from the old selection cannot flash onto the map.",
     );
 
@@ -877,7 +888,8 @@ fn archive(ui: &mut egui::Ui) {
         "The Data tab's Archive section follows the primary radar. For a US site it replays \
          any day in the US NEXRAD Level II record — the loop transport sits at the top of the \
          tab so you never switch tabs to play what you just loaded. For an international site \
-         whose provider exposes an archive (EUMETNET ORD, SMHI Sweden), the same browser lists \
+         whose provider exposes an archive (EUMETNET ORD, SMHI Sweden, Australia NCI), the \
+         same browser lists \
          that provider's holdings; providers without an archive say so with a reason instead \
          of silently listing a US site. Data also holds Live feeds (GR2A-style dir.list \
          polling for research/mobile radars), the Model store summary, and local file/folder \
@@ -985,10 +997,12 @@ fn unified_player(ui: &mut egui::Ui) {
     ui.heading("Unified Player");
     para(
         ui,
-        "Windows > Player is the full loop workstation. It owns long radar loops, archive \
+        "The Unified Player is the Advanced disclosure of the top bar's LIVE | ARCHIVE \
+         control — the bar covers go-live and loop-ending-at in one click; open Advanced \
+         (or Windows > Unified Player) for everything else. It owns long radar loops, archive \
          windows, low-sweep timelines, synced warnings/reports/lightning/models, multi-radar \
-         mosaics, camera follow, and loop export. Use it when the compact Radar-tab loop \
-         controls are too small for the job.",
+         mosaics, camera follow, and loop export. Every control that existed before the bar \
+         still lives here.",
     );
 
     subhead(ui, "LOADING");
@@ -1403,14 +1417,16 @@ fn sources(ui: &mut egui::Ui) {
         "HRRR (NOAA High-Resolution Rapid Refresh) and GFS (0.25° global) ingested into a \
          local store by the \
          rusty-weather stack (rw-ingest / rw-ui); the native skew-T is verified against \
-         sharprs. GOES-16/18/19 ABI imagery from NOAA open-data buckets via rw-sat.",
+         sharprs. RAP (13 km) 0-hour analysis wind profiles are fetched per site from the \
+         NOAA open-data mirror to anchor the Analyst 3D dealiaser (CONUS sites). \
+         GOES-16/18/19 ABI imagery from NOAA open-data buckets via rw-sat.",
     );
 
     para(
         ui,
-        "RAP/RRFS-style regional products, GOES GLM lightning, Himawari-9 B13, and MTG FCI \
-         discovery/local decode are also wired where the upstream source and credentials allow. \
-         MTG FCI live imagery still depends on EUMETSAT entitlement.",
+        "GOES GLM lightning and Himawari-9 IR/WV full-disk frames are also wired from NOAA \
+         open-data buckets. MTG/European satellite imagery is not available in this build \
+         (EUMETSAT entitlement).",
     );
 
     subhead(ui, "BASEMAPS");
@@ -1493,6 +1509,13 @@ mod tests {
         assert!(GUIDE_TOP_BAR_TEXT.contains("Map Only"));
         assert!(GUIDE_TOP_BAR_TEXT.contains("Workflows"));
         assert!(GUIDE_TOP_BAR_TEXT.contains("Radar overlays"));
+        // The v0.29 two-button front: the bar leads the top-bar copy, the
+        // sweep menu is documented one click deep, synced warnings are the
+        // named default, and the Unified Player is its Advanced disclosure.
+        assert!(GUIDE_TOP_BAR_TEXT.contains("LIVE | ARCHIVE"));
+        assert!(GUIDE_TOP_BAR_TEXT.contains("synced warnings"));
+        assert!(GUIDE_TOP_BAR_TEXT.contains("Sweeps"));
+        assert!(GUIDE_TOP_BAR_TEXT.contains("Advanced"));
         let guide_src = include_str!("guide.rs");
         assert!(guide_src.contains("security and updates"));
         assert_eq!(GUIDE_PANES_LABEL, "Panes 1 / 2 / 3 / 4");
@@ -1542,7 +1565,7 @@ mod tests {
         // US-exclusivity claim (assembled below so this file cannot
         // match itself) must stay gone.
         assert!(guide_src.contains("US NEXRAD Level II"));
-        assert!(guide_src.contains("EUMETNET ORD, SMHI Sweden"));
+        assert!(guide_src.contains("EUMETNET ORD, SMHI Sweden, Australia NCI"));
         assert!(guide_src.contains("say so with a reason"));
         assert!(guide_src.contains("Browse archive"));
         let old_us_only_claim = ["US Level II", "only"].join(" ");
@@ -1555,5 +1578,43 @@ mod tests {
         assert!(!guide_src.contains(&old_beam_claim));
         let old_chip_claim = ["you can never", "mistake"].join(" ");
         assert!(!guide_src.contains(&old_chip_claim));
+    }
+
+    /// Trust-label tripwire (v0.29 Phase 5): the guide's archive-capable
+    /// provider name-drop must track the DERIVED capability set — the
+    /// same `supports_archive()` answer the capability cards, the archive
+    /// browser, and the Event Loop Builder gate on. A new archive adapter
+    /// flips its card automatically; this test makes the guide copy keep
+    /// up instead of quietly understating coverage.
+    #[test]
+    fn guide_archive_provider_names_track_the_derived_capability_set() {
+        let archive_ids: std::collections::BTreeSet<&str> =
+            data_source::international::intl_providers()
+                .iter()
+                .filter(|provider| provider.supports_archive())
+                .map(|provider| provider.id())
+                .collect();
+        assert_eq!(
+            archive_ids,
+            std::collections::BTreeSet::from(["australia-nci", "ord", "smhi"]),
+            "a provider gained/lost an archive adapter — update the guide's \
+             Archive section copy and this pin together"
+        );
+        let guide_src = include_str!("guide.rs");
+        assert!(guide_src.contains("EUMETNET ORD, SMHI Sweden, Australia NCI"));
+    }
+
+    /// The retired MTG plumbing (v0.29 Phase 5 deletion sweep) must stay
+    /// gone from the copy: the guide may say European imagery is NOT
+    /// available, never that FCI discovery/decode "are wired" (stale
+    /// claims assembled at runtime so this file cannot match itself).
+    #[test]
+    fn guide_copy_is_honest_about_retired_mtg_plumbing() {
+        let guide_src = include_str!("guide.rs");
+        let stale_wired_claim = ["FCI", "discovery/local decode"].join(" ");
+        assert!(!guide_src.contains(&stale_wired_claim));
+        let stale_decode_claim = ["decode are", "wired"].join(" ");
+        assert!(!guide_src.contains(&stale_decode_claim));
+        assert!(guide_src.contains("not available in this build"));
     }
 }
