@@ -968,7 +968,13 @@ not-worse-than-hybrid on every case.
 
 ## 16. Owner decisions (2026-07-02, post-verification)
 
-- **Environmental profiles are CONUS-only: HRRR first, RAP fallback. NO GFS.**
+- **Environmental profiles: RAP ONLY. NO GFS.** (Amended 2026-07-02 after
+  the HRRR rerun measured HRRR = RAP across the battery and refuted the
+  3-km-fixes-the-blob hypothesis: same boundary counts on every case,
+  blob probe unchanged. RAP wins on operations - ~10x smaller profile
+  fetches, domain covers Alaska WSR-88Ds where HRRR-CONUS does not, and
+  ONE model source is simpler to maintain per spec 12b. Original
+  decision was HRRR-first/RAP-fallback; superseded.)
   International radars run v4 without a profile (the no-env degradation
   path) or stay on the Region engine - the picker copy must be honest
   about which anchor a site actually gets. This also means the no-env
