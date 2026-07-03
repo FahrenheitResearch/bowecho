@@ -591,10 +591,12 @@ mod tests {
     /// `dir_list_signatures_keep_growing_same_name_pollable`) re-delivers
     /// the same identity under the SAME `poll://` path. Legacy P3
     /// replaced unconditionally; the normalized rule (b) refreshes
-    /// metadata only and keeps the OLD volume Arc in history (the display
-    /// still shows the new volume via the D9 unconditional install). This
-    /// test pins the ENGINE behavior so any resolution at the 4e gate is
-    /// a visible, deliberate change.
+    /// metadata only and keeps the OLD volume Arc in history — and since
+    /// the D9 `display_install` outcome indexes into that history, the
+    /// display holds the old volume too (measured by the 4e differential
+    /// suite, `install_diff_p3_growing_same_name_repoll_must_match_legacy_
+    /// replace` in app_ui). This test pins the ENGINE behavior so any
+    /// resolution at the 4e gate is a visible, deliberate change.
     #[test]
     fn same_path_same_status_repoll_refreshes_metadata_only_the_4e_growing_file_gap() {
         let mut engine = engine();

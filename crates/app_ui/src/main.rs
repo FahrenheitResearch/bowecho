@@ -40,6 +40,10 @@ mod basemap_data;
 mod basemap_towns;
 mod brand;
 mod data_packs;
+/// Phase 4e stage (ii): the differential suite gating the primary unify
+/// (spec §7 Phase 4e; tests only — see the module doc for the gate rules).
+#[cfg(test)]
+mod differential_4e;
 mod dock;
 mod event_explorer;
 mod event_loop_builder;
