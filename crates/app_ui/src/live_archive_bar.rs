@@ -930,6 +930,49 @@ mod tests {
         );
     }
 
+    /// The 1 s live auto-refresh fetch must not count as load-busy (it
+    /// greyed the popover's Load button for a slice of every second —
+    /// visible flashing); a user-commanded load still does.
+    #[test]
+    fn auto_refresh_fetch_is_not_load_busy() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        app.load_receiver = Some(receiver);
+        app.primary_load_is_auto_refresh = true;
+        assert!(
+            !app.unified_player_load_busy(),
+            "an auto-refresh fetch is not busy"
+        );
+        app.primary_load_is_auto_refresh = false;
+        assert!(app.unified_player_load_busy(), "a user load is busy");
+    }
+
+    /// Clicking "Load archive loop" while an auto-refresh fetch is in
+    /// flight supersedes the fetch (cancel-first, like Load Latest)
+    /// instead of tripping the producers' "load already running" guards
+    /// at random.
+    #[test]
+    fn archive_load_supersedes_an_in_flight_auto_refresh_fetch() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![RadarSite::new("KTLX")];
+        app.selected_site_index = 0;
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        app.load_receiver = Some(receiver);
+        app.primary_load_is_auto_refresh = true;
+
+        app.handle_live_archive_bar_action(
+            Some(LiveArchiveBarAction::LoadArchiveEndingAt),
+            &egui::Context::default(),
+        );
+
+        assert!(app.load_receiver.is_none(), "the fetch was cancelled");
+        assert!(
+            app.status.contains("End date must be YYYY-MM-DD"),
+            "the load proceeded to its own input validation: {}",
+            app.status
+        );
+    }
+
     /// An unknown typed site refuses the load outright — no site
     /// switch, no worker, no archive-mode side effects — with the input
     /// echoed honestly in the status bar.

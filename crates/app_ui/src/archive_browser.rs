@@ -1034,6 +1034,7 @@ impl ViewerApp {
         let selected_index = selected_index.min(total.saturating_sub(1));
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
         self.archive_load_progress = Some(ArchiveLoadProgress {
             label: label.clone(),
             detail: "queued".to_owned(),
@@ -1126,6 +1127,7 @@ impl ViewerApp {
 
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
         self.archive_load_progress = Some(ArchiveLoadProgress {
             label: label.clone(),
             detail: "listing provider archive".to_owned(),
@@ -1188,6 +1190,7 @@ impl ViewerApp {
 
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
         self.archive_load_progress = Some(ArchiveLoadProgress {
             label: label.clone(),
             detail: "listing provider archive".to_owned(),
@@ -1280,6 +1283,7 @@ impl ViewerApp {
         let label = format!("Event loop {site_id}");
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
         let progress = ArchiveLoadProgress::indeterminate(
             "Event loop radar",
             format!(
@@ -1354,6 +1358,7 @@ impl ViewerApp {
         self.begin_primary_load_telemetry();
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
         self.pending_site_id = Some(site_id.clone());
         let progress = ArchiveLoadProgress {
             label: "Archive extend".to_owned(),

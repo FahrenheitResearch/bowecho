@@ -1811,6 +1811,13 @@ struct ViewerApp {
     next_radar_layer_id: u64,
     site_catalog_receiver: Option<mpsc::Receiver<AsyncSiteCatalogResult>>,
     load_receiver: Option<mpsc::Receiver<AsyncLoadResult>>,
+    /// True while `load_receiver` was installed by the live auto-refresh
+    /// tick (`LatestLoadMode::AutoRefresh`) rather than a user command.
+    /// Only meaningful while `load_receiver` is `Some`: EVERY install
+    /// site stamps it, so it can never go stale. The Unified Player/bar
+    /// busy predicate ignores auto-refresh loads — they fire every
+    /// second on a live site and made every busy-greyed button flash.
+    primary_load_is_auto_refresh: bool,
     hazard_receiver: Option<mpsc::Receiver<AsyncHazardResult>>,
     pending_site_id: Option<String>,
     cursor_readout: Option<CursorReadout>,
@@ -6332,6 +6339,7 @@ impl ViewerApp {
             next_radar_layer_id: 1,
             site_catalog_receiver: None,
             load_receiver: None,
+            primary_load_is_auto_refresh: false,
             hazard_receiver: None,
             pending_site_id: None,
             cursor_readout: None,
@@ -14310,6 +14318,7 @@ impl ViewerApp {
         self.prepare_local_volume_load(&label);
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
 
         thread::spawn(move || {
             let total_start = Instant::now();
@@ -14331,6 +14340,7 @@ impl ViewerApp {
         self.prepare_local_volume_load(&label);
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
 
         thread::spawn(move || {
             let total_start = Instant::now();
@@ -14586,6 +14596,7 @@ impl ViewerApp {
         self.begin_primary_load_telemetry();
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
         self.pending_site_id = Some(site_id.clone());
         let progress = ArchiveLoadProgress {
             label: "Archive loop".to_owned(),
@@ -14758,6 +14769,7 @@ impl ViewerApp {
         self.archive_load_progress = Some(progress.clone());
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
         self.pending_site_id = Some(site_id.clone());
         let site_cache = cache_dir(&site_id);
         let object = case.object();
@@ -15154,6 +15166,7 @@ impl ViewerApp {
         self.archive_load_progress = Some(progress.clone());
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
         self.pending_site_id = Some(site_id.clone());
         let site_cache = cache_dir(&site_id);
         let pack_title = pack.title.to_owned();
@@ -15330,6 +15343,7 @@ impl ViewerApp {
         self.archive_load_progress = Some(progress.clone());
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
         self.pending_site_id = Some(pack.feed_id.to_owned());
         let pack_title = pack.title.to_owned();
         let progress_label = progress.label.clone();
@@ -15470,6 +15484,7 @@ impl ViewerApp {
             .clamp(1, MAX_HISTORY_FRAME_LIMIT);
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
         self.pending_site_id = Some(feed.id.to_owned());
         let progress = ArchiveLoadProgress {
             label: format!("Research {} loop", feed.id),
@@ -15751,6 +15766,7 @@ impl ViewerApp {
         self.begin_primary_load_telemetry();
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
         self.pending_site_id = Some(site_id.clone());
         let progress = ArchiveLoadProgress {
             label: if objects.len() == 1 {
@@ -15920,6 +15936,7 @@ impl ViewerApp {
         self.archive_load_progress = Some(progress);
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
         self.pending_site_id = Some(site_id.clone());
         let site_cache = cache_dir(&site_id);
         let anchor_utc = context.anchor_utc;
@@ -16079,6 +16096,7 @@ impl ViewerApp {
         self.begin_primary_load_telemetry();
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
         self.pending_site_id = Some(site_id.clone());
         let progress = ArchiveLoadProgress::indeterminate(
             "Event loop radar",
@@ -16237,6 +16255,7 @@ impl ViewerApp {
         }
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = mode == LatestLoadMode::AutoRefresh;
         self.pending_site_id = Some(site_id.clone());
         self.primary.live.last_refresh = Some(Instant::now());
         self.status = match mode {
@@ -17630,8 +17649,14 @@ impl ViewerApp {
             .unwrap_or_else(|| "No radar selected".to_owned())
     }
 
+    /// A primary load the Unified Player/bar should grey buttons for.
+    /// The live auto-refresh tick is deliberately NOT busy: it fires
+    /// every second on a live site (so counting it made every greyed
+    /// button flash), and user load commands supersede it via
+    /// `cancel_primary_radar_load_for_user_command` anyway.
     fn unified_player_load_busy(&self) -> bool {
-        self.load_receiver.is_some() || self.intl_loop_rx.is_some()
+        let user_load = self.load_receiver.is_some() && !self.primary_load_is_auto_refresh;
+        user_load || self.intl_loop_rx.is_some()
     }
 
     fn cancel_primary_radar_load_for_user_command(&mut self) -> bool {
@@ -18016,6 +18041,11 @@ impl ViewerApp {
     }
 
     fn load_archive_loop_ending_at_for_unified_player(&mut self, ctx: &egui::Context) {
+        // Like Load Latest: the user's command supersedes whatever is in
+        // flight — in particular the 1 s live auto-refresh fetch, which
+        // would otherwise trip the producers' "load already running"
+        // guards at random.
+        self.cancel_primary_radar_load_for_user_command();
         if self.unified_player_load_busy() {
             self.unified_player
                 .mark_status("Radar load already running");
@@ -30348,6 +30378,7 @@ impl ViewerApp {
 
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
         self.archive_load_progress = Some(ArchiveLoadProgress {
             label: label.clone(),
             detail: "listing archive bucket".to_owned(),
@@ -30406,6 +30437,7 @@ impl ViewerApp {
 
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
         self.archive_load_progress = Some(ArchiveLoadProgress {
             label: label.clone(),
             detail: "listing archive bucket".to_owned(),
@@ -30477,6 +30509,7 @@ impl ViewerApp {
 
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
+        self.primary_load_is_auto_refresh = false;
         self.archive_load_progress = Some(ArchiveLoadProgress {
             label: label.clone(),
             detail: "listing archive bucket".to_owned(),
@@ -66740,6 +66773,7 @@ mod tests {
             next_radar_layer_id: 1,
             site_catalog_receiver: None,
             load_receiver: None,
+            primary_load_is_auto_refresh: false,
             hazard_receiver: None,
             pending_site_id: None,
             cursor_readout: None,
