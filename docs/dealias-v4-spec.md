@@ -1097,3 +1097,32 @@ measured that combines competitive residual aliasing with couplet
 preservation, confidence output, determinism, and interactive runtime -
 "the best engine for storm analysis" is defensible; "best in existence"
 is not (Py-ART region holds the boundary crown).
+
+## 18. Case H: the Amory couplet (2026-07-03, OPEN on all engines)
+
+Owner field report (v0.29.0-rc). KGWX20230325_033846_V06 - the
+Amory/New Wren EF3 (the Rolling Fork supercell's second violent
+tornado, between Okolona and Aberdeen MS). Prior volume 033149; env
+fixture `env_kgwx.json` (RAP 04z, strong southerly LLJ: v = 22.7 m/s by
+300 m ARL). Also shipped as the "Amory EF3" in-app data pack
+(`amory-2023-kgwx`).
+
+**Failure signature:** on the 0.48-deg MESO-SAILS velocity tilts at
+03:42:09 (sweep 10) and 03:44:02 (sweep 17), the inbound (west) side of
+the tornado couplet is left ONE FOLD HIGH by every engine we have:
+the pinned probe (az 282 deg, 28 km) reads +13.2 m/s on region, v4, AND
+v4-noenv, where the true field is ~-35 m/s inbound (Nyquist 24.1;
+-35 + 2x24.1 = +13.2 - the exact one-fold signature). RadarScope's
+archived render of the same tilts unfolds this side correctly, so it is
+solvable. The ambient RAP wind is nearly cross-beam at that azimuth
+(radial component ~-2 m/s), which is why the environmental unary does
+not rescue it: the error is storm-scale (mesocyclone inflow), an order
+of magnitude beyond the ambient prior.
+
+Battery rows recorded in `docs/dealias-v4-baselines.json` under
+`H-amory` (region bnd_low 1672 / rmsE 27.3; v4 728 / 11.8; v4-noenv
+14,193 - the env anchor is load-bearing on this volume). Reproduction
+commands and the iteration workflow for whoever attacks this:
+`docs/dealias-iteration-guide.md`. Fix wanted on v4 first, region if it
+falls out; the do-no-harm rule of s16 applies - no other case's row may
+regress beyond noise.

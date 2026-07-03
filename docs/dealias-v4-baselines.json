@@ -6,7 +6,7 @@
   "boundary_metric": "adjacent finite 4-neighbor pairs incl. azimuth wrap seam, |dv| > 1.2*min(N_row); reconciles the historical 21,458->196 figure: same field, this ruler measures region=264 on KEAX 055143 (spec 10.4)",
   "volumes": "unidata-nexrad-level2; see crates/bench/README.md",
   "env_fixtures": "crates/bench/fixtures/dealias/env_*.json (RAP 13-km 0-h analyses) and env_*_hrrr.json (HRRR 3-km 0-h analyses, crates/bench/py/hrrr_profile.py)",
-  "external_rows": "pyart-region (Helmus & Collis 2016, doi:10.5334/jors.119) and unravel (Louf et al. 2020, doi:10.1175/JTECH-D-19-0020.1) scored with the parity-validated Python metric port (crates/bench/py, see docs/dealias-external-baselines.md); v4-hrrr = v4 with HRRR 3-km 0-h analysis fixtures (env_*_hrrr.json; B-moore/E-ktlx12 predate the HRRR archive) — a resolution experiment, indistinguishable from v4(RAP), which is why production anchoring is RAP-only per amended spec s16; orpg-l3-spot = NOAA operational ORPG output spot checks from archived Level-III (quantitative N0U where public; qualitative RIDGE N0S renders for 2026). External runtimes are Python — apples/oranges vs Rust.",
+  "external_rows": "pyart-region (Helmus & Collis 2016, doi:10.5334/jors.119) and unravel (Louf et al. 2020, doi:10.1175/JTECH-D-19-0020.1) scored with the parity-validated Python metric port (crates/bench/py, see docs/dealias-external-baselines.md); v4-hrrr = v4 with HRRR 3-km 0-h analysis fixtures (env_*_hrrr.json; B-moore/E-ktlx12 predate the HRRR archive) \u2014 a resolution experiment, indistinguishable from v4(RAP), which is why production anchoring is RAP-only per amended spec s16; orpg-l3-spot = NOAA operational ORPG output spot checks from archived Level-III (quantitative N0U where public; qualitative RIDGE N0S renders for 2026). External runtimes are Python \u2014 apples/oranges vs Rust.",
   "v41": "v4.1 rows (2026-07-02, same machine/harness): v4 with the Py-ART dealias_region_based network-reduction graft (Helmus & Collis 2016, doi:10.5334/jors.119) on the v1 vote-graph baseline - gap-bridged region edges resolved by weight-ordered aggregating merge with do-no-harm bridge gates, 'centered' group anchoring (measured no-op), couplet freeze, and the repair-echo confidence fix (REPAIR_CHANGED < temporal reference floor). v4 rows kept for history; v4.1-cold = no prior + no env. Mechanism write-up: docs/dealias-external-baselines.md section 7."
  },
  "cases": {
@@ -1497,6 +1497,64 @@
    },
    "probes": {},
    "mode": "MODE Case-E rewrap to Nyquist 12 m/s (single tilt, no priors)"
+  },
+  "H-amory": {
+   "_note": "KGWX20230325_033846 (Amory/New Wren EF3, prior 033149, env RAP 04z). OPEN FAILURE 2026-07-03, all engines: the inbound (west) side of the 03:42:09 and 03:44:02 0.48-deg SAILS couplets stays one fold high (probe 282deg/28km reads +13.2 on every engine; Nyquist 24.1, so true ~-35 inbound was left at -35+48.2). RadarScope's archive render unfolds it. Spec s18; probe pinned in crates/bench README. iters=1.",
+   "probe_couplet_282_28": {
+    "region": 13.2,
+    "v4": 13.2,
+    "v4-noenv": 13.2
+   },
+   "engines": {
+    "region": {
+     "boundaries_lowest": 1672,
+     "boundaries_volume": 13718,
+     "rms_env": 27.29,
+     "rms_harmonic": 13.67,
+     "percent_modified": 21.29,
+     "specks_lowest": 358,
+     "couplet_max_dv": 79.0,
+     "max_inbound": -110.0,
+     "multifold_gates": 137,
+     "multifold_speckle": 53,
+     "volume_ms_best": 160.8,
+     "worst_tilt_ms": 19.8,
+     "amortized": false,
+     "deterministic": true
+    },
+    "v4": {
+     "boundaries_lowest": 728,
+     "boundaries_volume": 6110,
+     "rms_env": 11.78,
+     "rms_harmonic": 8.46,
+     "percent_modified": 36.53,
+     "specks_lowest": 236,
+     "couplet_max_dv": 69.8,
+     "max_inbound": -94.5,
+     "multifold_gates": 43,
+     "multifold_speckle": 21,
+     "volume_ms_best": 485.1,
+     "worst_tilt_ms": 28.5,
+     "amortized": true,
+     "deterministic": true
+    },
+    "v4-noenv": {
+     "boundaries_lowest": 14193,
+     "boundaries_volume": 87872,
+     "rms_env": 19.03,
+     "rms_harmonic": 11.52,
+     "percent_modified": 33.56,
+     "specks_lowest": 2509,
+     "couplet_max_dv": 69.8,
+     "max_inbound": -94.5,
+     "multifold_gates": 288,
+     "multifold_speckle": 39,
+     "volume_ms_best": 615.8,
+     "worst_tilt_ms": 36.2,
+     "amortized": true,
+     "deterministic": true
+    }
+   }
   }
  }
 }

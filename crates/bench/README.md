@@ -137,6 +137,8 @@ curl -O $base/2026/06/09/KMBX/KMBX20260609_235423_V06   # D blob (target)
 curl -O $base/2026/06/09/KMBX/KMBX20260609_234726_V06   # D prior
 curl -O $base/2026/06/09/KMBX/KMBX20260609_234055_V06   # D positive control
 curl -O $base/2026/06/09/KMBX/KMBX20260609_233434_V06   # D control prior
+curl -O $base/2023/03/25/KGWX/KGWX20230325_033846_V06 # H Amory EF3 (target)
+curl -O $base/2023/03/25/KGWX/KGWX20230325_033149_V06 # H prior
 ```
 
 ### Environmental fixtures
@@ -147,3 +149,8 @@ site and volume time (provenance in each file's `source` field; AWS
 `noaa-rap-pds` for 2021/2026, NCEI historical archive for 2013).
 Heights are meters above radar level. Cases must also run WITHOUT the
 fixture to measure graceful degradation (spec §10.1).
+
+Case H probe (the open failure, spec §18): `--probe 282,28,couplet` on
+KGWX20230325_033846 must eventually read strongly negative (~-35 m/s
+inbound); every engine currently reads +13.2 (one fold high). Iteration
+workflow: `docs/dealias-iteration-guide.md`.

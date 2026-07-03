@@ -1,0 +1,192 @@
+{
+ "source": "RAP 13-km 0-h analysis 2023-03-25 04Z (noaa-rap-pds S3: rap.20230325/rap.t04z.awp130pgrbf00.grib2), nearest grid point to KGWX; heights ARL vs 179 m antenna ASL; 10-m wind pinned at 0.5 m ARL",
+ "site": "KGWX",
+ "valid_time": "2023-03-25T04:00:00Z",
+ "levels": [
+  {
+   "height_m_arl": 0.5,
+   "u_mps": 2.56,
+   "v_mps": 9.02
+  },
+  {
+   "height_m_arl": 79.6,
+   "u_mps": 4.05,
+   "v_mps": 17.91
+  },
+  {
+   "height_m_arl": 304.4,
+   "u_mps": 6.98,
+   "v_mps": 22.65
+  },
+  {
+   "height_m_arl": 533.8,
+   "u_mps": 8.85,
+   "v_mps": 25.43
+  },
+  {
+   "height_m_arl": 768.5,
+   "u_mps": 11.17,
+   "v_mps": 27.36
+  },
+  {
+   "height_m_arl": 1008.9,
+   "u_mps": 14.46,
+   "v_mps": 28.68
+  },
+  {
+   "height_m_arl": 1255.1,
+   "u_mps": 18.12,
+   "v_mps": 29.16
+  },
+  {
+   "height_m_arl": 1507.8,
+   "u_mps": 21.78,
+   "v_mps": 28.8
+  },
+  {
+   "height_m_arl": 1767.1,
+   "u_mps": 25.02,
+   "v_mps": 27.95
+  },
+  {
+   "height_m_arl": 2033.0,
+   "u_mps": 27.68,
+   "v_mps": 26.77
+  },
+  {
+   "height_m_arl": 2306.1,
+   "u_mps": 29.42,
+   "v_mps": 25.69
+  },
+  {
+   "height_m_arl": 2586.9,
+   "u_mps": 30.75,
+   "v_mps": 24.77
+  },
+  {
+   "height_m_arl": 2874.5,
+   "u_mps": 31.76,
+   "v_mps": 24.02
+  },
+  {
+   "height_m_arl": 3171.3,
+   "u_mps": 32.03,
+   "v_mps": 24.17
+  },
+  {
+   "height_m_arl": 3476.8,
+   "u_mps": 32.14,
+   "v_mps": 24.43
+  },
+  {
+   "height_m_arl": 3791.3,
+   "u_mps": 31.88,
+   "v_mps": 25.1
+  },
+  {
+   "height_m_arl": 4115.8,
+   "u_mps": 32.16,
+   "v_mps": 25.77
+  },
+  {
+   "height_m_arl": 4450.7,
+   "u_mps": 32.7,
+   "v_mps": 26.45
+  },
+  {
+   "height_m_arl": 4798.7,
+   "u_mps": 33.1,
+   "v_mps": 26.87
+  },
+  {
+   "height_m_arl": 5159.5,
+   "u_mps": 33.57,
+   "v_mps": 27.17
+  },
+  {
+   "height_m_arl": 5536.9,
+   "u_mps": 33.5,
+   "v_mps": 26.84
+  },
+  {
+   "height_m_arl": 5928.7,
+   "u_mps": 33.35,
+   "v_mps": 26.42
+  },
+  {
+   "height_m_arl": 6339.3,
+   "u_mps": 32.78,
+   "v_mps": 25.85
+  },
+  {
+   "height_m_arl": 6770.0,
+   "u_mps": 32.9,
+   "v_mps": 25.89
+  },
+  {
+   "height_m_arl": 7220.0,
+   "u_mps": 33.47,
+   "v_mps": 26.21
+  },
+  {
+   "height_m_arl": 7693.6,
+   "u_mps": 34.19,
+   "v_mps": 26.45
+  },
+  {
+   "height_m_arl": 8192.9,
+   "u_mps": 33.63,
+   "v_mps": 26.78
+  },
+  {
+   "height_m_arl": 8720.6,
+   "u_mps": 32.21,
+   "v_mps": 26.06
+  },
+  {
+   "height_m_arl": 9280.1,
+   "u_mps": 32.58,
+   "v_mps": 23.66
+  },
+  {
+   "height_m_arl": 9876.3,
+   "u_mps": 34.22,
+   "v_mps": 20.19
+  },
+  {
+   "height_m_arl": 10512.4,
+   "u_mps": 35.07,
+   "v_mps": 15.8
+  },
+  {
+   "height_m_arl": 11198.6,
+   "u_mps": 36.27,
+   "v_mps": 12.83
+  },
+  {
+   "height_m_arl": 11948.9,
+   "u_mps": 42.12,
+   "v_mps": 12.47
+  },
+  {
+   "height_m_arl": 12786.7,
+   "u_mps": 42.39,
+   "v_mps": 15.72
+  },
+  {
+   "height_m_arl": 13745.7,
+   "u_mps": 42.55,
+   "v_mps": 27.74
+  },
+  {
+   "height_m_arl": 14869.0,
+   "u_mps": 38.33,
+   "v_mps": 23.41
+  },
+  {
+   "height_m_arl": 16238.8,
+   "u_mps": 20.52,
+   "v_mps": 16.01
+  }
+ ]
+}
