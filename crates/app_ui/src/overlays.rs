@@ -2098,7 +2098,7 @@ mod tests {
         add_two_test_history_frames, test_decoded_from_volume,
         test_reflectivity_sails_volume_with_radials, test_screen_texture_key,
         test_velocity_sails_volume_with_radials, test_viewer_app_with_hazards,
-        test_viewport_signature, test_volume_with_site_time,
+        test_viewport_signature, test_volume_with_site_time, upsert_primary_history_frame,
     };
     use ui_core::loop_engine::OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS;
 
@@ -2227,8 +2227,8 @@ mod tests {
             test_volume_with_site_time("KTLX", base + chrono::Duration::minutes(5)),
             FrameStatus::LiveComplete,
         );
-        app.upsert_history_frame(primary_first);
-        app.upsert_history_frame(primary_second);
+        upsert_primary_history_frame(&mut app, primary_first);
+        upsert_primary_history_frame(&mut app, primary_second);
         app.primary
             .history
             .sort_by(|left, right| left.identity.cmp(&right.identity));

@@ -40,6 +40,18 @@
 //! will install in ViewerApp: display writes, status strings and the
 //! within-frame low-sweep walk stay CALLER-side (census D6/D11, engine
 //! advance.rs module doc), so the mirror reproduces exactly that caller.
+//!
+//! STAGE (iii) STATUS (the unify this suite gated): the GREEN cells
+//! landed — `install_decoded_load_batch` (P1), both screen-loop steppers,
+//! the primary trims, and the `mode_chip_state` family are delegating
+//! wrappers over the engine, so the "legacy" side of those tests now
+//! drives the unified path and each differential doubles as a
+//! wiring-fidelity pin. The two class-(c) cells below are still RED and
+//! `install_polled_volume` (P3) therefore remains a true legacy body —
+//! its differentials still compare two genuinely different
+//! implementations. Class-(b) pins were flipped to the landed normalize
+//! where the stage-(iii) commit made them true (empty-strip stepping,
+//! newest-frame chip age, the pane-0 R8 residue).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -59,8 +71,7 @@ use crate::{
     DecodedLoad, DecodedLoadBatch, DisplayProduct, EngineId, EngineRole, FeedSource, FrameHistory,
     FrameHistoryEntry, FrameStatus, InstallSelection, Liveness, LoadTimings, LoopEngine,
     LowSweepCutKey, SelectionPolicy, ViewerApp, frame_identity_for_volume,
-    next_frame_index_with_sweep_cuts, should_defer_live_partial_selection_for_active_product,
-    sweep_cuts_for_history_entry,
+    should_defer_live_partial_selection_for_active_product, sweep_cuts_for_history_entry,
 };
 
 /// The primary-role anchor-select policy (census D5b: the blank-display
@@ -573,18 +584,16 @@ fn advance_diff_ord_ref_only_all_policies_and_cursors_match_engine() {
 }
 
 /// The missing-moment dimension of the ORD fixture: a velocity product over
-/// a REF-only history leaves NOTHING steppable in Range mode. Pure-fn tier:
-/// `next_frame_index_with_sweep_cuts` (the exact function the legacy
-/// stepper calls) vs `advance_loop` — both must stop and clear `playing`.
+/// a REF-only history leaves NOTHING steppable in Range mode — the engine
+/// stepper must stop and clear `playing`. (Until stage (iii) this cell also
+/// drove the legacy pure fn `next_frame_index_with_sweep_cuts` side by
+/// side; that fn is deleted — `advance_loop` is the only stepper.)
 #[test]
 fn advance_diff_velocity_over_ref_only_history_stops_both_sides() {
     let fixture = ord_ref_only_fixture();
     let velocity = DisplayProduct::Moment(MomentType::Velocity);
     let policy = fixture.range_policy.normalized();
     let disabled: BTreeSet<LowSweepCutKey> = BTreeSet::new();
-
-    let legacy = next_frame_index_with_sweep_cuts(&fixture.frames, 0, &velocity, policy, &disabled);
-    assert_eq!(legacy, None, "legacy finds no steppable frame");
 
     let mut engine = LoopEngine::new(
         EngineId(42),
@@ -610,24 +619,25 @@ fn advance_diff_velocity_over_ref_only_history_stops_both_sides() {
     assert_eq!(engine.cursor.index, 0, "a stop never moves the cursor");
 }
 
-/// CLASS (b) — spec-decided normalize, pinned deliberately. The legacy
-/// plain-advance arm computes `(index + 1) % len` EAGERLY inside
-/// `.then_some(…)`, so calling `advance_primary_screen_loop` on an EMPTY
-/// strip panics with a divide-by-zero. This is latent, unreachable dead
-/// behavior in production (`maybe_advance_history_loop` gates on
-/// `history_playing`, which can never arm over an empty strip, and every
-/// clear resets it) — the pattern predates the 4e mechanical stage
-/// (verified against the stage-(i) diff: pure field-path rename). The
-/// engine's `advance_loop` returns `Stopped` for the same cell (spec §3 /
-/// engine advance.rs contract), which the companion edge test asserts.
-/// Pinned like the census-D13 "conscious normalize of dead behavior" rows.
+/// CLASS (b) — spec-decided normalize, LANDED at stage (iii). The legacy
+/// plain-advance arm computed `(index + 1) % len` eagerly, so stepping an
+/// EMPTY strip panicked with a divide-by-zero (latent, production-
+/// unreachable — `maybe_advance_history_loop` gates on `history_playing`).
+/// The unified stepper routes through `LoopEngine::advance_loop`, whose
+/// empty-strip cell is a graceful `Stopped` that clears `playing`; this
+/// test re-pins the landed behavior (it was `#[should_panic]` while the
+/// legacy body owned the path).
 #[test]
-#[should_panic(expected = "divisor of zero")]
-fn advance_diff_empty_history_legacy_latent_panic_is_pinned() {
+fn advance_diff_empty_history_now_stops_gracefully_normalize_landed() {
     let ctx = egui::Context::default();
     let mut app = test_viewer_app_with_hazards(Vec::new());
     app.primary.cursor.playing = true;
     app.advance_primary_screen_loop(&ctx);
+    assert!(
+        !app.primary.cursor.playing,
+        "an empty strip stops the loop instead of panicking (class-(b) landed)"
+    );
+    assert_eq!(app.primary.cursor.index, 0);
 }
 
 /// Edge cells: an empty history STOPS the engine (the graceful side of the
@@ -1521,9 +1531,10 @@ fn install_diff_p3_polled_entry_timings_field_must_match_legacy() {
 // ---------------------------------------------------------------------------
 
 /// The adoption-shape chip renderer: `engine.liveness()` → the exact legacy
-/// chip label/tag. This function IS what the stage-(ii) unify installs in
-/// place of the `mode_chip_state_with_live_and_stale_floor` age math; the
-/// truth-table tests below prove it cell for cell.
+/// chip label/tag. Stage (iii) installed exactly this shape as
+/// `ViewerApp::mode_chip_state` (over `liveness_with_live_flag` +
+/// `chip_for_liveness`); this INDEPENDENT copy keeps the truth-table tests
+/// a real differential — a drift in the app renderer fails the cells here.
 fn chip_from_engine(
     engine: &LoopEngine,
     user_stale_chip_seconds: i64,
@@ -1569,15 +1580,33 @@ fn engine_with_volume(role: EngineRole, feed: FeedSource, volume: &Arc<RadarVolu
     engine
 }
 
+/// Seed the app's display AND the matching single history frame. Since the
+/// stage-(iii) unify the primary chip derives from the NEWEST history frame
+/// (spec §3), so the app side of every chip cell must carry its aged volume
+/// on the frame strip, exactly like the engine side does.
+fn seed_primary_chip_frame(app: &mut ViewerApp, volume: &Arc<RadarVolume>) {
+    app.primary.history.push(FrameHistoryEntry {
+        identity: frame_identity_for_volume(volume),
+        path: PathBuf::from("liveness-cell"),
+        volume: Arc::clone(volume),
+        timings: None,
+        status: FrameStatus::Complete,
+        source_label: "liveness cell".to_owned(),
+    });
+    app.volume = Some(Arc::clone(volume));
+}
+
 /// Ages chosen mid-minute with ≥30 s margin from every boundary (user
 /// threshold 480 s, intl floor 1800 s, the 24 h dated-archive switch), so
 /// the two sides' independent `Utc::now()` reads can never straddle a
 /// boundary.
 const CHIP_AGES: [i64; 6] = [90, 630, 1230, 2430, 82_830, 90_030];
 
-/// The R8 truth table, Primary role, US feed (stage-(i) reality: the legacy
-/// US/custom-URL primary keeps `FeedSource::CustomUrl`): every (live, age)
-/// cell of `mode_chip_state` must equal the engine-derived chip.
+/// The R8 truth table, Primary role, US feed (the US/custom-URL primary
+/// keeps `FeedSource::CustomUrl` until the polled path unifies): every
+/// (live, age) cell of `mode_chip_state` — since stage (iii) itself a
+/// derivation over `LoopEngine::liveness_with_live_flag` — must equal the
+/// suite's independently-built engine chip, cell for cell.
 #[test]
 fn liveness_diff_primary_us_chip_truth_table_matches_engine_derivation() {
     for live in [true, false] {
@@ -1585,7 +1614,7 @@ fn liveness_diff_primary_us_chip_truth_table_matches_engine_derivation() {
             let mut app = test_viewer_app_with_hazards(Vec::new());
             app.primary.live.enabled = live;
             let volume = aged_volume("KEAX", age);
-            app.volume = Some(Arc::clone(&volume));
+            seed_primary_chip_frame(&mut app, &volume);
             let legacy = app
                 .mode_chip_state()
                 .map(|(label, _color, tag)| (label, tag));
@@ -1604,11 +1633,12 @@ fn liveness_diff_primary_us_chip_truth_table_matches_engine_derivation() {
     }
 }
 
-/// The R8 truth table, Primary role, international feed: the legacy chip
-/// routes through `intl_poll_owns_primary()` and the flat 1800 s floor; the
-/// engine derives the same cells from `Live(Intl)` + `live.enabled` + the
-/// cadence-aware floor (spec §12 owner decision 3 — `max(user, 1800,
-/// 2×60 s)` = 1800 for the intl catalog cadence, so the cells agree).
+/// The R8 truth table, Primary role, international feed: the unified chip
+/// bridges `intl_poll_owns_primary()` in as the live flag and derives the
+/// CADENCE-AWARE floor inside the engine (spec §12 owner decision 3 —
+/// `max(user, 1800, 2×60 s)` = 1800 at the intl catalog cadence, so the
+/// labels are byte-identical to the old flat-floor chip); the suite's
+/// engine side must reproduce every cell.
 #[test]
 fn liveness_diff_primary_intl_chip_floor_cells_match_engine() {
     let intl_feed = FeedSource::Live(SiteRef::Intl {
@@ -1621,7 +1651,7 @@ fn liveness_diff_primary_intl_chip_floor_cells_match_engine() {
             app.primary.feed = intl_feed.clone();
             app.poll_active = live; // intl_poll_owns_primary() = poll_active && armed
             let volume = aged_volume("deess", age);
-            app.volume = Some(Arc::clone(&volume));
+            seed_primary_chip_frame(&mut app, &volume);
             let legacy = app
                 .mode_chip_state()
                 .map(|(label, _color, tag)| (label, tag));
@@ -1657,26 +1687,29 @@ fn liveness_diff_none_cells_match() {
     );
 }
 
-/// CLASS (b) — spec-decided normalize, pinned deliberately (spec §3:
-/// `liveness()` derives from the NEWEST frame's age; the legacy chip ages
-/// the DISPLAYED volume). While a live feed is fresh but the user browses
-/// an old frame, legacy flags STALE off the displayed frame; the engine
-/// stays fresh off the newest. Both behaviors are asserted here so the
-/// switch at adoption is visible and un-regressable in either direction.
+/// CLASS (b) — spec-decided normalize, LANDED at stage (iii) (spec §3:
+/// `liveness()` derives from the NEWEST frame's age; the pre-unify chip
+/// aged the DISPLAYED volume and flagged a fresh feed STALE while the user
+/// browsed an old frame). Both the unified `mode_chip_state` and the
+/// suite's engine chip must now stay LIVE off the newest frame — pinned in
+/// both directions so neither side can drift back to displayed-frame
+/// aging.
 #[test]
 fn liveness_diff_displayed_vs_newest_age_is_the_spec_normalize() {
     let mut app = test_viewer_app_with_hazards(Vec::new());
     app.primary.live.enabled = true;
     let old_displayed = aged_volume("KEAX", 90_030); // ~25 h, browsed backward
     let fresh_newest = aged_volume("KEAX", 90);
-    app.volume = Some(Arc::clone(&old_displayed));
-    let legacy = app
+    seed_primary_chip_frame(&mut app, &old_displayed);
+    seed_primary_chip_frame(&mut app, &fresh_newest);
+    app.volume = Some(Arc::clone(&old_displayed)); // browsing the old frame
+    let unified = app
         .mode_chip_state()
         .map(|(label, _color, tag)| (label, tag));
     assert_eq!(
-        legacy.as_ref().map(|(_, tag)| *tag),
-        Some("STALE"),
-        "legacy ages the DISPLAYED volume"
+        unified,
+        Some(("● LIVE".to_owned(), "LIVE")),
+        "the unified chip ages the NEWEST frame, not the browsed display (normalize landed)"
     );
 
     let mut engine = engine_with_volume(
@@ -1696,18 +1729,17 @@ fn liveness_diff_displayed_vs_newest_age_is_the_spec_normalize() {
     assert_eq!(
         chip_from_engine(&engine, 480),
         Some(("● LIVE".to_owned(), "LIVE")),
-        "engine ages the NEWEST frame (spec §3) — the deliberate normalize at adoption"
+        "engine ages the NEWEST frame (spec §3)"
     );
 }
 
-/// CLASS (b) — spec-decided normalize, pinned deliberately (spec §3 retires
-/// `pane_chip_is_live`'s pane-0 fall-through, the last R8 residue; spec §8
-/// row `realtime_level2_auto_refresh`). For an international primary, the
-/// pane-0 grid chip still reads the US auto-refresh flag
-/// (`primary.live.enabled`, which no intl path sets), so it claims ARCHIVE
-/// while the primary chip honestly says LIVE. The engine cell derives LIVE.
-/// Both sides asserted so the residue's death at adoption is a visible
-/// change, not drift.
+/// CLASS (b) — spec-decided normalize, LANDED at stage (iii) (spec §3
+/// retired `pane_chip_is_live`'s pane-0 fall-through, the last R8 residue;
+/// spec §8 row `realtime_level2_auto_refresh`). For an international
+/// primary the pane-0 grid chip used to read the US auto-refresh flag and
+/// claim ARCHIVE while the primary chip honestly said LIVE; both now share
+/// the primary's display-owner-aware liveness, so the disagreement is
+/// unrepresentable. The engine cell must agree.
 #[test]
 fn liveness_diff_pane0_fallthrough_r8_residue_is_pinned_until_adoption() {
     let intl_feed = FeedSource::Live(SiteRef::Intl {
@@ -1719,15 +1751,15 @@ fn liveness_diff_pane0_fallthrough_r8_residue_is_pinned_until_adoption() {
     app.poll_active = true; // a genuinely live intl poll owns the primary
     app.primary.live.enabled = false; // the stale US flag — no intl path sets it
     let volume = aged_volume("deess", 90);
-    app.volume = Some(Arc::clone(&volume));
+    seed_primary_chip_frame(&mut app, &volume);
 
     let primary_tag = app.mode_chip_state().map(|(_, _, tag)| tag);
     assert_eq!(primary_tag, Some("LIVE"), "the primary chip is intl-aware");
     let pane0_tag = app.pane_mode_chip_state(0).map(|(_, _, tag)| tag);
     assert_eq!(
         pane0_tag,
-        Some("ARCH"),
-        "R8 residue: pane 0 falls through to the US auto-refresh flag"
+        Some("LIVE"),
+        "R8 residue dead: pane 0 shares the primary's display-owner liveness"
     );
 
     let mut engine = engine_with_volume(EngineRole::Primary, intl_feed, &volume);
@@ -1735,7 +1767,7 @@ fn liveness_diff_pane0_fallthrough_r8_residue_is_pinned_until_adoption() {
     assert_eq!(
         chip_from_engine(&engine, 480).map(|(_, tag)| tag),
         Some("LIVE"),
-        "the engine cell says LIVE — the residue dies when pane 0 reads engine liveness"
+        "the engine cell agrees with both chips"
     );
 }
 

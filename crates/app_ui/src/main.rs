@@ -96,9 +96,16 @@ use ui_core::geo::{aeqd_forward_km, aeqd_inverse_km};
 // sibling modules — compiling unchanged. Runtime behavior identical.
 pub(crate) use ui_core::loop_engine::{
     DecodedLoad, DecodedLoadBatch, FrameHistoryEntry, FrameIdentity, FrameStatus,
-    INTL_POLL_SECONDS, INTL_STALE_CHIP_FLOOR_SECONDS, LoadTimings, MAX_HISTORY_FRAME_LIMIT,
-    frame_history_entry_from_decoded, frame_identity_for_volume, frame_status_priority,
-    history_contains_other_site, live_partial_frame_has_new_data,
+    INTL_POLL_SECONDS, LoadTimings, MAX_HISTORY_FRAME_LIMIT, frame_identity_for_volume,
+    history_contains_other_site,
+};
+// Test-only survivors of the 4e stage-(iii) unify: the flat intl floor
+// constant (production chips derive the cadence-aware floor inside
+// `LoopEngine::liveness`) and the decoded→entry constructor (production
+// installs run inside `LoopEngine::install_batch`).
+#[cfg(test)]
+pub(crate) use ui_core::loop_engine::{
+    INTL_STALE_CHIP_FLOOR_SECONDS, frame_history_entry_from_decoded,
 };
 // The default frame limit is reached through the engine everywhere in
 // production code (4e stage (i): `normalized_history_limit` delegates to
@@ -118,7 +125,7 @@ pub(crate) use ui_core::loop_engine::FrameHistory;
 // its legacy plumbing until 4e.
 pub(crate) use ui_core::loop_engine::{
     ArchiveWindow, EngineId, EngineRole, FeedSource, HistoryLimits, InstallSelection, LiveAction,
-    Liveness, LoopEngine, SelectionPolicy,
+    Liveness, LoopEngine, SelectionPolicy, StepOutcome, SweepContext,
 };
 #[cfg(test)]
 use ui_core::render_service::overlay_pool_worker_target;
@@ -1673,16 +1680,22 @@ struct ViewerApp {
     /// `realtime_level2_auto_refresh`/`last_realtime_level2_refresh` →
     /// `primary.live.{enabled,last_refresh}`.
     ///
-    /// The legacy install/advance/liveness BODIES still own every
-    /// composite semantic (clears, upserts, trims, stepping, chip truth)
-    /// until stage (ii) re-routes them onto the engine methods behind the
-    /// differential gate — until then the engine-doc rule "composite ops
-    /// go through engine methods" is deliberately suspended for THIS
-    /// instance, and `primary.limits.byte_budget` is wired but inert.
+    /// Stage (iii) unified the differentially-proven bodies onto the
+    /// engine: batch install (`install_decoded_load_batch` →
+    /// `install_batch`), stepping (`advance_primary_screen_loop` →
+    /// `advance_loop`), trims (`trim_frame_history` →
+    /// `trim_history_to_limits`, which activates
+    /// `primary.limits.byte_budget`), and chip truth (`mode_chip_state` →
+    /// `liveness_with_live_flag`). The POLLED install
+    /// (`install_polled_volume`) stays a legacy body: its differential
+    /// cells are class-(c) RED (growing same-name re-poll volume-Arc
+    /// replacement; `timings: None` entries) awaiting an owner decision —
+    /// see `differential_4e.rs`.
     /// `poll_active` stays a loose feed-adjacent field below: its engine
-    /// home would be `live.enabled`, which this stage assigns to
+    /// home would be `live.enabled`, which stage (i) assigned to
     /// `realtime_level2_auto_refresh` per spec §8 — the two flags are
-    /// independent booleans today and merging them is stage-(ii) work.
+    /// independent booleans until the polled path unifies, bridged for
+    /// chip truth by `primary_chip_live_flag`.
     primary: LoopEngine,
     low_sweep_disabled_cuts: BTreeSet<LowSweepCutKey>,
     manual_primary_cut_hold: Option<LowSweepCutKey>,
@@ -7236,15 +7249,24 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
+    /// Drop the primary loop: engine-owned state through
+    /// [`LoopEngine::clear_history`] (history, cursor, playing/browsing,
+    /// step clock — census D4), then the PRIMARY-only blast radius the
+    /// census assigns to the caller.
     fn clear_frame_history(&mut self) {
         self.remember_current_primary_product_cut();
-        self.primary.history.clear();
-        self.primary.cursor.index = 0;
+        self.primary.clear_history();
+        self.clear_primary_loop_side_state();
+    }
+
+    /// The primary-only cross-site/clear blast radius (census D4): sweep
+    /// state, loop render cache, storm tracker + caches, rotation markers.
+    /// Split from [`Self::clear_frame_history`] so the engine install path
+    /// — which clears engine state itself — can run exactly this half when
+    /// its outcome reports a cross-site clear.
+    fn clear_primary_loop_side_state(&mut self) {
         self.low_sweep_disabled_cuts.clear();
         self.manual_primary_cut_hold = None;
-        self.primary.cursor.playing = false;
-        self.primary.cursor.browsing = false;
-        self.primary.cursor.last_step = None;
         self.clear_loop_render_cache();
         self.storm_tracker = StormTracker::default();
         self.storm_tracks_site.clear();
@@ -7278,6 +7300,15 @@ impl ViewerApp {
         );
     }
 
+    /// Primary batch install, on the ENGINE since Phase 4e stage (iii):
+    /// cross-site guard, 3-tier upsert, sort, trim, and cursor policy are
+    /// [`LoopEngine::install_batch`] (census D1-D8, differentially proven
+    /// in `differential_4e.rs`); this wrapper owns what the census assigns
+    /// to callers — the D8 grow intent, the D7 deferral predicate (primary
+    /// provenance: the manual cut hold), the D11 status strings
+    /// (greppable-identical), the D4 primary-only clear blast radius, and
+    /// the select side effects incl. `preserve_active_frame_cut`. Returns
+    /// the legacy bool: true only when the anchor got selected (D16).
     fn install_decoded_load_batch(
         &mut self,
         batch: DecodedLoadBatch,
@@ -7288,187 +7319,143 @@ impl ViewerApp {
         if batch.frames.is_empty() {
             return false;
         }
+        // Census D8: grow-to-fit is stated INTENT on the engine limits.
+        // Until the loaders state it themselves, this wrapper derives it
+        // from the two legacy triggers, in one place: an ORD archive loop
+        // (`ord-archive:` paths) and a folder/zip deployment auto-play
+        // (all-Local batch with the one-shot pending flag — the 7-frame
+        // default silently dropped most of a deployment; field report).
         let ord_archive_loop =
             batch.frames.len() > 1 && batch.frames.iter().all(decoded_load_is_ord_archive_frame);
-        if ord_archive_loop {
-            self.primary.limits.frame_limit = self
-                .primary
-                .limits
-                .frame_limit
-                .max(batch.frames.len())
-                .min(MAX_HISTORY_FRAME_LIMIT);
-        }
-        // Folder/zip deployment loads auto-play: grow the history limit to
-        // fit the whole sequence (the 7-frame default silently dropped
-        // most of a deployment — field report) and roll the loop.
         let local_autoplay = batch.frames.len() > 1
             && batch
                 .frames
                 .iter()
                 .all(|frame| frame.status == FrameStatus::Local)
             && std::mem::take(&mut self.pending_local_autoplay);
-        if local_autoplay {
-            self.primary.limits.frame_limit = self
-                .primary
-                .limits
-                .frame_limit
-                .max(batch.frames.len())
-                .min(MAX_HISTORY_FRAME_LIMIT);
-        }
         let selected_index = batch.selected_index.min(batch.frames.len() - 1);
         let selected_identity = frame_identity_for_volume(&batch.frames[selected_index].volume);
-        let active_identity = self
-            .volume
+        let active_volume = self.volume.clone();
+        let active_identity = active_volume
             .as_ref()
             .map(|volume| frame_identity_for_volume(volume.as_ref()));
-        let active_volume_ptr = self
-            .volume
+        let active_volume_ptr = active_volume
             .as_ref()
             .map(|volume| Arc::as_ptr(volume) as usize);
-        let selected_site_id = selected_identity.site_id.clone();
-        if self
-            .volume
+        let selected_cut = self.selected_cut;
+        let selected_product = self.selected_product.clone();
+        let manual_cut_hold_identity = self
+            .manual_primary_cut_hold
             .as_ref()
-            .is_some_and(|volume| volume.site.id != selected_site_id)
-            || history_contains_other_site(&self.primary.history, &selected_site_id)
-        {
-            // Diagnostic: a surprise clear here is the "every frame
-            // replaces the previous" failure mode — make it visible.
-            self.status = format!(
-                "history reset (site change to {selected_site_id}, had {} frames)",
-                self.primary.history.len()
-            );
-            self.clear_frame_history();
+            .map(|hold| hold.identity.clone());
+        let policy = if select_loaded_frame {
+            // Census D5b: the blank-display browsing escape is
+            // Primary-role-only.
+            SelectionPolicy::SelectAnchor {
+                blank_display_overrides_browsing: true,
+            }
+        } else {
+            SelectionPolicy::Backfill
+        };
+
+        self.primary.limits.grow_to_fit = ord_archive_loop || local_autoplay;
+        let outcome = self.primary.install_batch(
+            batch,
+            &policy,
+            active_volume.as_ref(),
+            // Census D7: the primary deferral predicate.
+            // `require_selected_cut` provenance is the manual cut hold
+            // matching the post-upsert anchor — a genuine role difference
+            // from the pane predicate, kept.
+            |anchor| {
+                should_defer_live_partial_selection_for_active_product(
+                    active_volume.as_deref(),
+                    selected_cut,
+                    &selected_product,
+                    Some(anchor),
+                    manual_cut_hold_identity.as_ref() == Some(&anchor.identity),
+                )
+            },
+        );
+        self.primary.limits.grow_to_fit = false;
+
+        if let Some(clear) = &outcome.cross_site_clear {
+            // Census D3/D4: the engine cleared its own loop state and
+            // reports the greppable-identical reset diagnostic; the
+            // PRIMARY-only blast radius runs here. (The product-cut memory
+            // write reads only display state the install never touches, so
+            // remembering after the engine clear equals the legacy
+            // remember-then-clear order.)
+            self.status = clear.diagnostic.clone();
+            self.remember_current_primary_product_cut();
+            self.clear_primary_loop_side_state();
         }
 
-        for decoded in batch.frames {
-            self.upsert_history_frame(decoded);
-        }
-        self.primary
-            .history
-            .sort_by(|left, right| left.identity.cmp(&right.identity));
-        self.trim_frame_history();
-
-        let display_is_blank = self.volume.is_none();
-        let should_select_loaded_frame = select_loaded_frame
-            && !self.primary.cursor.playing
-            && (!self.primary.cursor.browsing || display_is_blank);
-        if should_select_loaded_frame {
-            let next_index = self
-                .primary
-                .history
-                .iter()
-                .position(|frame| frame.identity == selected_identity)
-                .unwrap_or_else(|| self.primary.history.len().saturating_sub(1));
-            let preserve_active_frame_cut = active_identity.as_ref() == Some(&selected_identity)
-                && self.primary.history.get(next_index).is_some_and(|frame| {
-                    active_volume_ptr == Some(Arc::as_ptr(&frame.volume) as usize)
-                });
-            let previous_cut = self.selected_cut;
-            let previous_product = self.selected_product.clone();
-            let require_selected_cut = self
-                .manual_primary_cut_hold
-                .as_ref()
-                .zip(self.primary.history.get(next_index))
-                .is_some_and(|(hold, frame)| hold.identity == frame.identity);
-            if should_defer_live_partial_selection_for_active_product(
-                self.volume.as_deref(),
-                self.selected_cut,
-                &self.selected_product,
-                self.primary.history.get(next_index),
-                require_selected_cut,
-            ) {
-                self.primary.cursor.index = active_identity
-                    .clone()
-                    .and_then(|identity| {
-                        self.primary
-                            .history
-                            .iter()
-                            .position(|frame| frame.identity == identity)
-                    })
-                    .unwrap_or(self.primary.cursor.index);
+        match outcome.selection {
+            InstallSelection::SelectedAnchor { index } => {
+                // Census D5/D6 select side effects, Primary role: cut
+                // continuity when the anchor IS the active frame (same
+                // identity AND same volume Arc), first-low-sweep select
+                // otherwise, then timeline sync + camera follow inside
+                // `select_history_frame_with_options`.
+                let preserve_active_frame_cut = active_identity.as_ref()
+                    == Some(&selected_identity)
+                    && self.primary.history.get(index).is_some_and(|frame| {
+                        active_volume_ptr == Some(Arc::as_ptr(&frame.volume) as usize)
+                    });
+                let previous_cut = selected_cut;
+                let previous_product = selected_product;
+                let select_first_low_sweep = !preserve_active_frame_cut
+                    && active_identity.as_ref() != Some(&selected_identity);
+                self.select_history_frame_with_options(
+                    index,
+                    record_final_decode,
+                    select_first_low_sweep,
+                    ctx,
+                );
+                if preserve_active_frame_cut
+                    && let Some(volume) = self.volume.as_deref()
+                    && is_displayable_on_cut(volume, previous_cut, &previous_product)
+                {
+                    self.selected_product = previous_product;
+                    if self.selected_cut != previous_cut {
+                        self.set_selected_cut_preserving_texture(previous_cut);
+                    }
+                    ctx.request_repaint();
+                }
+                true
+            }
+            InstallSelection::DeferredLivePartial { anchor } => {
                 self.status = format!(
                     "Waiting for {} in {}",
                     self.selected_product.label(),
-                    selected_identity.site_id
+                    anchor.site_id
                 );
                 ctx.request_repaint();
-                return false;
+                false
             }
-            if display_is_blank {
-                self.primary.cursor.browsing = false;
-            }
-            let select_first_low_sweep =
-                !preserve_active_frame_cut && active_identity.as_ref() != Some(&selected_identity);
-            self.select_history_frame_with_options(
-                next_index,
-                record_final_decode,
-                select_first_low_sweep,
-                ctx,
-            );
-            if preserve_active_frame_cut
-                && let Some(volume) = self.volume.as_deref()
-                && is_displayable_on_cut(volume, previous_cut, &previous_product)
-            {
-                self.selected_product = previous_product;
-                if self.selected_cut != previous_cut {
-                    self.set_selected_cut_preserving_texture(previous_cut);
-                }
+            InstallSelection::Backfilled { .. } => {
+                self.status = format!("Backfilled {}", selected_identity.site_id);
                 ctx.request_repaint();
+                false
             }
-            true
-        } else if let Some(active_identity) = active_identity
-            && let Some(index) = self
-                .primary
-                .history
-                .iter()
-                .position(|frame| frame.identity == active_identity)
-        {
-            self.primary.cursor.index = index;
-            self.status = format!("Backfilled {}", selected_identity.site_id);
-            ctx.request_repaint();
-            false
-        } else {
-            ctx.request_repaint();
-            false
+            InstallSelection::NoFrames
+            | InstallSelection::FollowedNewest { .. }
+            | InstallSelection::HeldWhilePlaying { .. }
+            | InstallSelection::CursorUnchanged => {
+                ctx.request_repaint();
+                false
+            }
         }
     }
 
-    fn upsert_history_frame(&mut self, decoded: DecodedLoad) {
-        let frame = frame_history_entry_from_decoded(decoded);
-        let identity = frame.identity.clone();
-        if let Some(existing) = self
-            .primary
-            .history
-            .iter_mut()
-            .find(|candidate| candidate.identity == identity)
-        {
-            if live_partial_frame_has_new_data(&frame, existing) {
-                *existing = frame;
-            } else if frame.path == existing.path && frame.status == existing.status {
-                existing.timings = frame.timings;
-                existing.source_label = frame.source_label;
-            } else if frame_status_priority(frame.status) > frame_status_priority(existing.status)
-                || (frame_status_priority(frame.status) == frame_status_priority(existing.status)
-                    && frame.path != existing.path)
-            {
-                *existing = frame;
-            }
-        } else {
-            self.primary.history.push(frame);
-        }
-    }
-
+    /// Re-apply the primary frame limit: the trim itself lives in
+    /// [`LoopEngine::trim_history_to_limits`] (census D8 — normalize +
+    /// write-back, drop oldest-first, byte budget, cursor clamp) since 4e
+    /// stage (iii). Kept as the named call the not-yet-unified polled path
+    /// and the limit-edit sites share.
     fn trim_frame_history(&mut self) {
-        self.primary.limits.frame_limit = normalized_history_limit(self.primary.limits.frame_limit);
-        while self.primary.history.len() > self.primary.limits.frame_limit {
-            self.primary.history.remove(0);
-        }
-        self.primary.cursor.index = self
-            .primary
-            .cursor
-            .index
-            .min(self.primary.history.len().saturating_sub(1));
+        self.primary.trim_history_to_limits();
     }
 
     fn select_history_frame(
@@ -8760,6 +8747,19 @@ impl ViewerApp {
         }
     }
 
+    /// One PRIMARY loop step (v0.29 Phase 4e stage (iii)): the frame-index
+    /// math is [`LoopEngine::advance_loop`] — plain modulo, or the Range-
+    /// mode skip over cutless frames — proven index/cut-identical to the
+    /// legacy stepper by the differential suite (`differential_4e.rs`,
+    /// 3 fixtures × 5 policies × 4 cursors × 3 revolutions). The caller
+    /// keeps everything the engine deliberately does not own: the
+    /// within-frame low-sweep walk (runs FIRST and short-circuits the
+    /// frame advance), select side effects, pane fan-out, and the
+    /// can-step re-evaluation of `playing`.
+    ///
+    /// Deliberate normalize (class (b), pinned by the suite): stepping an
+    /// EMPTY strip now stops gracefully — the legacy body's eager
+    /// `% len` was a latent, production-unreachable divide-by-zero.
     fn advance_primary_screen_loop(&mut self, ctx: &egui::Context) {
         self.manual_primary_cut_hold = None;
         if self.advance_history_loop_low_sweep(ctx) {
@@ -8767,21 +8767,20 @@ impl ViewerApp {
         }
         let product = self.shared_low_sweep_driver_product();
         let policy = self.primary_sweep_policy_for_product(&product);
-        let next_index =
-            if self.app_settings.loop_low_sweeps && policy.mode == SweepPolicyMode::Range {
-                next_frame_index_with_sweep_cuts(
-                    &self.primary.history,
-                    self.primary.cursor.index,
-                    &product,
-                    policy,
-                    &self.low_sweep_disabled_cuts,
-                )
-            } else {
-                (!self.primary.history.is_empty())
-                    .then_some((self.primary.cursor.index + 1) % self.primary.history.len())
-            };
-        let Some(next_index) = next_index else {
-            self.primary.cursor.playing = false;
+        let range_mode = self.app_settings.loop_low_sweeps && policy.mode == SweepPolicyMode::Range;
+        // Disjoint field borrows: the predicate reads sweep-policy state
+        // while the engine mutates only its own cursor.
+        let disabled_cuts = &self.low_sweep_disabled_cuts;
+        let frame_has_cuts = |frame: &FrameHistoryEntry| {
+            !sweep_cuts_for_history_entry(frame, &product, policy, disabled_cuts).is_empty()
+        };
+        let outcome = self.primary.advance_loop(&SweepContext {
+            range_mode,
+            frame_has_cuts: &frame_has_cuts,
+        });
+        let StepOutcome::Stepped { index: next_index } = outcome else {
+            // Stopped: the engine cleared `cursor.playing` (the legacy
+            // no-steppable-frame arm).
             return;
         };
         self.select_history_frame_with_options(next_index, false, false, ctx);
@@ -8790,29 +8789,34 @@ impl ViewerApp {
         self.primary.cursor.playing = self.primary_history_loop_can_step();
     }
 
+    /// One EXTRA-PANE loop step: same engine stepper as the primary
+    /// ([`LoopEngine::advance_loop`], 4e stage (iii)), pane-side select and
+    /// timeline side effects kept caller-side.
     fn advance_extra_pane_screen_loop(&mut self, pane_slot: usize, ctx: &egui::Context) {
         if self.advance_extra_pane_history_loop_low_sweep(pane_slot, ctx) {
             return;
         }
-        let next_index = self.extra_panes.get(pane_slot).and_then(|pane| {
-            let policy = self.extra_pane_sweep_policy_for_product(pane_slot, &pane.product);
-            if self.app_settings.loop_low_sweeps && policy.mode == SweepPolicyMode::Range {
-                next_frame_index_with_sweep_cuts(
-                    &pane.engine.history,
-                    pane.engine.cursor.index,
-                    &pane.product,
-                    policy,
-                    &self.low_sweep_disabled_cuts,
-                )
-            } else {
-                (!pane.engine.history.is_empty())
-                    .then_some((pane.engine.cursor.index + 1) % pane.engine.history.len())
-            }
-        });
-        let Some(next_index) = next_index else {
-            if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-                pane.engine.cursor.playing = false;
-            }
+        let Some(product) = self
+            .extra_panes
+            .get(pane_slot)
+            .map(|pane| pane.product.clone())
+        else {
+            return;
+        };
+        let policy = self.extra_pane_sweep_policy_for_product(pane_slot, &product);
+        let range_mode = self.app_settings.loop_low_sweeps && policy.mode == SweepPolicyMode::Range;
+        let disabled_cuts = &self.low_sweep_disabled_cuts;
+        let frame_has_cuts = |frame: &FrameHistoryEntry| {
+            !sweep_cuts_for_history_entry(frame, &product, policy, disabled_cuts).is_empty()
+        };
+        let outcome = self.extra_panes[pane_slot]
+            .engine
+            .advance_loop(&SweepContext {
+                range_mode,
+                frame_has_cuts: &frame_has_cuts,
+            });
+        let StepOutcome::Stepped { index: next_index } = outcome else {
+            // Stopped: the pane engine cleared its playing flag.
             return;
         };
         self.select_extra_pane_history_frame(pane_slot, next_index, ctx);
@@ -26458,11 +26462,10 @@ impl ViewerApp {
     }
 
     /// Whether a grid cell's chip may claim LIVE. Cell 0 (primary) and
-    /// following panes display the primary feed, so the primary flag is
-    /// their truth (the pane-0 fall-through to
-    /// `realtime_level2_auto_refresh` is the R8 residue the PRIMARY port
-    /// retires at Phase 4e — panes cannot fix a primary chip). A
-    /// radar-owning pane runs its own auto-refresh
+    /// following panes display the primary feed, so the primary's
+    /// display-owner-aware flag is their truth (4e stage (iii) retired the
+    /// old fall-through to the bare US auto-refresh flag — the last live
+    /// R8 residue). A radar-owning pane runs its own auto-refresh
     /// (`maybe_refresh_extra_panes`): LIVE iff the pane ENGINE's Live
     /// toggle is on AND its source actually feeds it — an id inherited
     /// from an international/archive display classifies as no live source
@@ -26476,7 +26479,12 @@ impl ViewerApp {
             return pane.engine.live.enabled
                 && self.extra_pane_live_source(pane) != PaneLiveSource::None;
         }
-        self.primary.live.enabled
+        // Cell 0 and following panes display the primary feed, so the
+        // PRIMARY's liveness truth is theirs — the same display-owner-aware
+        // flag the primary chip derives from (4e stage (iii); the old
+        // fall-through to the bare US auto-refresh flag was the last live
+        // R8 residue, dead here).
+        self.primary_chip_live_flag()
     }
 
     /// The grid-cell chip for one pane. Radar-owning panes route through
@@ -26485,7 +26493,8 @@ impl ViewerApp {
     /// stale floor from the engine's feed and poll cadence (owner decision
     /// 3 — `max(user, 1800 s, 2 × cadence)` now governs panes; US panes
     /// keep floor 0, byte-identical strings). Cell 0 and following panes
-    /// keep the primary fall-through until the primary port (4e).
+    /// mirror the PRIMARY (4e stage (iii)): its display-owner-aware live
+    /// flag and the same cadence-aware floor from the primary's feed.
     fn pane_mode_chip_state(
         &self,
         pane_index: usize,
@@ -26502,7 +26511,11 @@ impl ViewerApp {
             );
             return self.mode_chip_state_with_live_and_stale_floor(live, stale_floor);
         }
-        self.mode_chip_state_with_live(live)
+        let stale_floor = ui_core::loop_engine::stale_floor_seconds(
+            &self.primary.feed,
+            self.primary.poll_cadence(),
+        );
+        self.mode_chip_state_with_live_and_stale_floor(live, stale_floor)
     }
 
     /// Per-pane attribution bar for the multi-pane grid. It mirrors the
@@ -35195,71 +35208,123 @@ impl ViewerApp {
         );
     }
 
-    fn mode_chip_state(&self) -> Option<(String, egui::Color32, &'static str)> {
-        // The PRIMARY chip follows the actual display owner. The US
-        // auto-refresh flag is meaningless for an international primary
-        // (no intl path sets or clears it): years-old ORD/SMHI archive
-        // frames used to read "LIVE · STALE Xm" and a streaming intl poll
-        // used to read "ARCHIVE".
+    /// The live flag the PRIMARY chip truth uses for the current display
+    /// owner. This is the ONE remaining bridge between the legacy
+    /// `poll_active` field and the engine's `live.enabled` (see the
+    /// `primary` field doc): an armed international owner's truth is the
+    /// poll flag (no intl path sets the US auto-refresh switch); every
+    /// other owner keeps the US/custom-URL flag, which stage (i) already
+    /// mapped onto `primary.live.enabled`. Dies when the polled install
+    /// path unifies (blocked on the class-(c) differential cells) and the
+    /// two flags merge.
+    fn primary_chip_live_flag(&self) -> bool {
         if self.intl_source_owns_primary_display() {
-            return self.mode_chip_state_with_live_and_stale_floor(
-                self.intl_poll_owns_primary(),
-                INTL_STALE_CHIP_FLOOR_SECONDS,
-            );
+            self.intl_poll_owns_primary()
+        } else {
+            self.primary.live.enabled
         }
-        self.mode_chip_state_with_live(self.primary.live.enabled)
     }
 
-    /// Chip derivation with an explicit liveness input: `self.volume` is the
-    /// pane's own volume inside a pane context swap, but the auto-refresh
-    /// flag is primary-only state the snapshot never carries — callers for
-    /// radar-owning panes must pass the PANE's refresh reality instead.
-    fn mode_chip_state_with_live(
-        &self,
-        live: bool,
-    ) -> Option<(String, egui::Color32, &'static str)> {
-        self.mode_chip_state_with_live_and_stale_floor(live, 0)
+    /// The PRIMARY mode chip, derived from the primary ENGINE's liveness
+    /// (v0.29 Phase 4e stage (iii), spec §3): feed variant + live flag +
+    /// NEWEST history frame age through
+    /// [`ui_core::loop_engine::LoopEngine::liveness_with_live_flag`], so
+    /// the chip can no longer disagree with engine state — an archive feed
+    /// structurally cannot read LIVE (the R8 class). The international
+    /// stale floor is now the CADENCE-AWARE `stale_floor_seconds` inside
+    /// the engine derivation (spec §12 owner decision 3), superseding the
+    /// flat `INTL_STALE_CHIP_FLOOR_SECONDS` call this fn used to make
+    /// (same 1800 s value at the 60 s intl catalog cadence — labels are
+    /// byte-identical).
+    ///
+    /// Deliberate normalize (pinned by the differential suite's
+    /// `liveness_diff_displayed_vs_newest_age_is_the_spec_normalize`): the
+    /// age is the NEWEST frame's, not the displayed frame's — browsing an
+    /// old frame of a fresh live feed reads LIVE, and an archive loop's
+    /// age readout follows the loop's newest scan.
+    fn mode_chip_state(&self) -> Option<(String, egui::Color32, &'static str)> {
+        let user_stale_chip_seconds = self.style_registry.radar_age().stale_chip_seconds;
+        let liveness = self.primary.liveness_with_live_flag(
+            Utc::now(),
+            user_stale_chip_seconds,
+            self.primary_chip_live_flag(),
+        )?;
+        let newest_time = self
+            .primary
+            .history
+            .last()
+            .map(|frame| frame.identity.scan_time_utc)?;
+        Some(self.chip_for_liveness(liveness, newest_time))
     }
 
-    /// [`Self::mode_chip_state_with_live`] with a floor on the stale
-    /// threshold: international feeds publish on 5-15 minute cadences, so
-    /// a live intl chip only flags STALE past twice the slowest routine
-    /// cadence — a normal publish gap must never read as a fault (a user
-    /// stale threshold above the floor still wins).
+    /// PANE-side chip derivation with explicit liveness + stale-floor
+    /// inputs: builds the same [`Liveness`] verdict from the DISPLAYED
+    /// volume's age — inside a pane context swap `self.volume` is the
+    /// pane's own volume, and the flag is the PANE's refresh reality
+    /// passed by the caller — then renders through the ONE chip renderer
+    /// so the strings cannot drift (census D11). The primary chip derives
+    /// from the engine in [`Self::mode_chip_state`] instead. The floor:
+    /// international feeds publish on 5-15 minute cadences, so a live intl
+    /// chip only flags STALE past twice the slowest routine cadence (a
+    /// user stale threshold above the floor still wins).
     fn mode_chip_state_with_live_and_stale_floor(
         &self,
         live: bool,
         stale_floor_seconds: i64,
     ) -> Option<(String, egui::Color32, &'static str)> {
         let volume = self.volume.as_ref()?;
-        let age = Utc::now() - volume.volume_time.with_timezone(&Utc);
-        let age_seconds = age.num_seconds().max(0);
-        let age_min = age_seconds / 60;
-        let age_style = self.style_registry.radar_age();
-        let fresh_bg = style_color32(age_style.fresh_color);
-        let stale_bg = style_color32(age_style.stale_color);
-        let archive_bg = style_color32(age_style.aging_color);
-        let stale_chip_seconds = age_style.stale_chip_seconds.max(0).max(stale_floor_seconds);
-        // A live feed should refresh every few minutes; if it has not, flag stale.
-        let state = if live && age_seconds <= stale_chip_seconds {
-            ("● LIVE".to_owned(), fresh_bg, "LIVE")
-        } else if live {
-            (format!("● LIVE · STALE {age_min}m"), stale_bg, "STALE")
+        let aged_time = volume.volume_time.with_timezone(&Utc);
+        let age_seconds = (Utc::now() - aged_time).num_seconds().max(0);
+        let stale_chip_seconds = self
+            .style_registry
+            .radar_age()
+            .stale_chip_seconds
+            .max(0)
+            .max(stale_floor_seconds);
+        let liveness = if live {
+            Liveness::Live {
+                age_seconds,
+                stale: age_seconds > stale_chip_seconds,
+            }
         } else {
-            let label = if age_seconds >= 24 * 60 * 60 {
-                format!(
-                    "ARCHIVE · {}",
-                    volume
-                        .volume_time
-                        .with_timezone(&Utc)
-                        .format("%Y-%m-%d %H:%MZ")
-                )
-            } else {
-                format!("ARCHIVE · {age_min}m old")
-            };
-            (label, archive_bg, "ARCH")
+            Liveness::Archive { age_seconds }
         };
-        Some(state)
+        Some(self.chip_for_liveness(liveness, aged_time))
+    }
+
+    /// The ONE mode-chip renderer over a [`Liveness`] verdict — every
+    /// string here is greppable-identical to the pre-4e chips (census
+    /// D11). `aged_time` is the frame the verdict's age was derived from
+    /// (dated ARCHIVE chips print it).
+    fn chip_for_liveness(
+        &self,
+        liveness: Liveness,
+        aged_time: DateTime<Utc>,
+    ) -> (String, egui::Color32, &'static str) {
+        let age_style = self.style_registry.radar_age();
+        match liveness {
+            Liveness::Live { stale: false, .. } => (
+                "● LIVE".to_owned(),
+                style_color32(age_style.fresh_color),
+                "LIVE",
+            ),
+            Liveness::Live {
+                age_seconds,
+                stale: true,
+            } => (
+                format!("● LIVE · STALE {}m", age_seconds / 60),
+                style_color32(age_style.stale_color),
+                "STALE",
+            ),
+            Liveness::Archive { age_seconds } => {
+                let label = if age_seconds >= 24 * 60 * 60 {
+                    format!("ARCHIVE · {}", aged_time.format("%Y-%m-%d %H:%MZ"))
+                } else {
+                    format!("ARCHIVE · {}m old", age_seconds / 60)
+                };
+                (label, style_color32(age_style.aging_color), "ARCH")
+            }
+        }
     }
 
     /// Paint an on-canvas color-scale legend for the active product, bottom-right.
@@ -48077,23 +48142,11 @@ fn sweep_cuts_for_history_entry(
     )
 }
 
-fn next_frame_index_with_sweep_cuts(
-    frames: &[FrameHistoryEntry],
-    selected_frame_index: usize,
-    product: &DisplayProduct,
-    policy: SweepPolicy,
-    disabled_cuts: &BTreeSet<LowSweepCutKey>,
-) -> Option<usize> {
-    if frames.is_empty() {
-        return None;
-    }
-    (1..=frames.len())
-        .map(|offset| (selected_frame_index + offset) % frames.len())
-        .find(|index| {
-            !sweep_cuts_for_history_entry(&frames[*index], product, policy, disabled_cuts)
-                .is_empty()
-        })
-}
+// `next_frame_index_with_sweep_cuts` (the shared stepper frame-index math)
+// died in the 4e stage-(iii) unify: both screen-loop steppers now advance
+// through `LoopEngine::advance_loop`, whose range-mode walk is the same
+// `1..=len` wrapping search (ui_core::loop_engine::advance, differentially
+// proven in differential_4e.rs).
 
 fn sweep_cut_at_or_before_in_frame(
     frame: &FrameHistoryEntry,
@@ -50054,9 +50107,9 @@ fn archive_frame_status(volume_time_utc: DateTime<Utc>, now_utc: DateTime<Utc>) 
 }
 
 // frame_status_priority, live_partial_frame_has_new_data, and
-// volume_total_radials moved VERBATIM to ui_core::loop_engine (the first
-// two re-exported above; volume_total_radials has no remaining local
-// caller).
+// volume_total_radials moved VERBATIM to ui_core::loop_engine; since the 4e
+// stage-(iii) unify their only app_ui caller (the legacy primary upsert)
+// is gone — the 3-tier upsert rules live in LoopEngine::install_batch.
 
 fn frame_status_text(
     frame: &FrameHistoryEntry,
@@ -54946,16 +54999,25 @@ mod tests {
                 low_sweep_rank: Some(0),
             }]
         );
-        assert_eq!(
-            next_frame_index_with_sweep_cuts(
-                &app.primary.history,
-                0,
-                &app.selected_product,
-                SweepPolicy::range_cdeg(110, 150),
-                &app.low_sweep_disabled_cuts,
-            ),
-            Some(1)
-        );
+        // The engine stepper (which replaced the deleted
+        // `next_frame_index_with_sweep_cuts` in the 4e unify) skips the
+        // cutless frame the same way.
+        {
+            let product = app.selected_product.clone();
+            let policy = SweepPolicy::range_cdeg(110, 150);
+            let disabled = app.low_sweep_disabled_cuts.clone();
+            let has_cuts = |frame: &FrameHistoryEntry| {
+                !sweep_cuts_for_history_entry(frame, &product, policy, &disabled).is_empty()
+            };
+            assert_eq!(
+                app.primary.advance_loop(&SweepContext {
+                    range_mode: true,
+                    frame_has_cuts: &has_cuts,
+                }),
+                StepOutcome::Stepped { index: 1 }
+            );
+            app.primary.cursor.index = 0;
+        }
         assert_eq!(
             app.upcoming_primary_loop_steps(1),
             vec![LoopTimelineStep {
@@ -58459,12 +58521,10 @@ mod tests {
     fn installing_new_site_batch_drops_previous_site_history() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
-        app.upsert_history_frame(test_decoded_live_partial(
-            PathBuf::from("KTLX-live"),
-            "KTLX",
-            scan_time,
-            10,
-        ));
+        upsert_primary_history_frame(
+            &mut app,
+            test_decoded_live_partial(PathBuf::from("KTLX-live"), "KTLX", scan_time, 10),
+        );
         app.primary.cursor.playing = true;
 
         let ctx = egui::Context::default();
@@ -58492,12 +58552,10 @@ mod tests {
     fn polled_volume_drops_previous_site_history() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
-        app.upsert_history_frame(test_decoded_live_partial(
-            PathBuf::from("KTLX-live"),
-            "KTLX",
-            scan_time,
-            10,
-        ));
+        upsert_primary_history_frame(
+            &mut app,
+            test_decoded_live_partial(PathBuf::from("KTLX-live"), "KTLX", scan_time, 10),
+        );
         app.volume = Some(Arc::clone(&app.primary.history[0].volume));
 
         let ctx = egui::Context::default();
@@ -58630,18 +58688,19 @@ mod tests {
     fn live_update_does_not_steal_selection_while_history_is_playing() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
-        app.upsert_history_frame(test_decoded_live_partial(
-            PathBuf::from("KTLX-0130"),
-            "KTLX",
-            scan_time,
-            10,
-        ));
-        app.upsert_history_frame(test_decoded_live_partial(
-            PathBuf::from("KTLX-0133"),
-            "KTLX",
-            scan_time + chrono::Duration::minutes(3),
-            10,
-        ));
+        upsert_primary_history_frame(
+            &mut app,
+            test_decoded_live_partial(PathBuf::from("KTLX-0130"), "KTLX", scan_time, 10),
+        );
+        upsert_primary_history_frame(
+            &mut app,
+            test_decoded_live_partial(
+                PathBuf::from("KTLX-0133"),
+                "KTLX",
+                scan_time + chrono::Duration::minutes(3),
+                10,
+            ),
+        );
         app.primary
             .history
             .sort_by(|left, right| left.identity.cmp(&right.identity));
@@ -58684,12 +58743,10 @@ mod tests {
         assert!(!app.primary.cursor.playing);
 
         let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
-        app.upsert_history_frame(test_decoded_live_partial(
-            PathBuf::from("KTLX-0130"),
-            "KTLX",
-            scan_time,
-            10,
-        ));
+        upsert_primary_history_frame(
+            &mut app,
+            test_decoded_live_partial(PathBuf::from("KTLX-0130"), "KTLX", scan_time, 10),
+        );
 
         assert!(!app.toggle_history_playback(&ctx));
         assert!(!app.primary.cursor.playing);
@@ -58823,18 +58880,19 @@ mod tests {
     fn loop_playback_toggle_updates_browse_state_like_play_button() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
-        app.upsert_history_frame(test_decoded_live_partial(
-            PathBuf::from("KTLX-0130"),
-            "KTLX",
-            scan_time,
-            10,
-        ));
-        app.upsert_history_frame(test_decoded_live_partial(
-            PathBuf::from("KTLX-0133"),
-            "KTLX",
-            scan_time + chrono::Duration::minutes(3),
-            10,
-        ));
+        upsert_primary_history_frame(
+            &mut app,
+            test_decoded_live_partial(PathBuf::from("KTLX-0130"), "KTLX", scan_time, 10),
+        );
+        upsert_primary_history_frame(
+            &mut app,
+            test_decoded_live_partial(
+                PathBuf::from("KTLX-0133"),
+                "KTLX",
+                scan_time + chrono::Duration::minutes(3),
+                10,
+            ),
+        );
         app.primary.cursor.index = 0;
         app.primary.cursor.browsing = true;
         let ctx = egui::Context::default();
@@ -59330,11 +59388,14 @@ mod tests {
                 base + chrono::Duration::minutes(minutes),
             );
             volume.metadata.source_path = Some(format!("KTLX-{minutes:02}"));
-            app.upsert_history_frame(test_decoded_from_volume(
-                PathBuf::from(format!("KTLX-{minutes:02}")),
-                volume,
-                FrameStatus::Complete,
-            ));
+            upsert_primary_history_frame(
+                &mut app,
+                test_decoded_from_volume(
+                    PathBuf::from(format!("KTLX-{minutes:02}")),
+                    volume,
+                    FrameStatus::Complete,
+                ),
+            );
             let index = app.primary.history.len() - 1;
             let key = cached_storm_key_for_frame(&app, index);
             insert_limited_frame_cache(
@@ -59365,11 +59426,10 @@ mod tests {
 
         let mut older = RadarVolume::new(radar_core::RadarSite::new("KTLX"), base);
         older.metadata.source_path = Some("KTLX-00".to_owned());
-        app.upsert_history_frame(test_decoded_from_volume(
-            PathBuf::from("KTLX-00"),
-            older,
-            FrameStatus::Complete,
-        ));
+        upsert_primary_history_frame(
+            &mut app,
+            test_decoded_from_volume(PathBuf::from("KTLX-00"), older, FrameStatus::Complete),
+        );
         app.primary
             .history
             .sort_by(|left, right| left.identity.cmp(&right.identity));
@@ -59407,16 +59467,14 @@ mod tests {
         first.volume_time = scan_time;
         let mut second = test_ref_then_velocity_volume();
         second.volume_time = scan_time + chrono::Duration::minutes(3);
-        app.upsert_history_frame(test_decoded_from_volume(
-            PathBuf::from("TEST-0130"),
-            first,
-            FrameStatus::Complete,
-        ));
-        app.upsert_history_frame(test_decoded_from_volume(
-            PathBuf::from("TEST-0133"),
-            second,
-            FrameStatus::Complete,
-        ));
+        upsert_primary_history_frame(
+            &mut app,
+            test_decoded_from_volume(PathBuf::from("TEST-0130"), first, FrameStatus::Complete),
+        );
+        upsert_primary_history_frame(
+            &mut app,
+            test_decoded_from_volume(PathBuf::from("TEST-0133"), second, FrameStatus::Complete),
+        );
         app.primary
             .history
             .sort_by(|left, right| left.identity.cmp(&right.identity));
@@ -61825,20 +61883,26 @@ mod tests {
         app.style_settings = style_settings.clone();
         app.style_registry = styles::StyleRegistry::from_settings(&style_settings);
         app.primary.live.enabled = true;
-        app.volume = Some(Arc::new(RadarVolume::new(
-            radar_core::RadarSite::new("KTLX"),
-            Utc::now() - chrono::Duration::seconds(10),
-        )));
+        set_primary_chip_frame(
+            &mut app,
+            Arc::new(RadarVolume::new(
+                radar_core::RadarSite::new("KTLX"),
+                Utc::now() - chrono::Duration::seconds(10),
+            )),
+        );
 
         let (_, live_bg, live_kind) = app.mode_chip_state().expect("live chip");
 
         assert_eq!(live_kind, "LIVE");
         assert_eq!(live_bg, egui::Color32::from_rgba_unmultiplied(1, 2, 3, 255));
 
-        app.volume = Some(Arc::new(RadarVolume::new(
-            radar_core::RadarSite::new("KTLX"),
-            Utc::now() - chrono::Duration::minutes(3),
-        )));
+        set_primary_chip_frame(
+            &mut app,
+            Arc::new(RadarVolume::new(
+                radar_core::RadarSite::new("KTLX"),
+                Utc::now() - chrono::Duration::minutes(3),
+            )),
+        );
         let (_, stale_bg, stale_kind) = app.mode_chip_state().expect("stale chip");
 
         assert_eq!(stale_kind, "STALE");
@@ -61857,10 +61921,13 @@ mod tests {
         );
 
         let old_time = Utc::now() - chrono::Duration::days(3) - chrono::Duration::minutes(17);
-        app.volume = Some(Arc::new(RadarVolume::new(
-            radar_core::RadarSite::new("KTLX"),
-            old_time,
-        )));
+        set_primary_chip_frame(
+            &mut app,
+            Arc::new(RadarVolume::new(
+                radar_core::RadarSite::new("KTLX"),
+                old_time,
+            )),
+        );
         let (old_label, _, old_kind) = app.mode_chip_state().expect("old archive chip");
 
         assert_eq!(old_kind, "ARCH");
@@ -61870,10 +61937,13 @@ mod tests {
             "old archive chip should not show a giant minute count: {old_label}"
         );
 
-        app.volume = Some(Arc::new(RadarVolume::new(
-            radar_core::RadarSite::new("KTLX"),
-            Utc::now() + chrono::Duration::minutes(5),
-        )));
+        set_primary_chip_frame(
+            &mut app,
+            Arc::new(RadarVolume::new(
+                radar_core::RadarSite::new("KTLX"),
+                Utc::now() + chrono::Duration::minutes(5),
+            )),
+        );
         let (future_label, _, future_kind) = app.mode_chip_state().expect("future archive chip");
 
         assert_eq!(future_kind, "ARCH");
@@ -61888,10 +61958,13 @@ mod tests {
         // (the flag is primary-US state no intl path sets or clears).
         app.primary.live.enabled = true;
         app.set_intl_archive_primary_source("ord", "deess");
-        app.volume = Some(Arc::new(RadarVolume::new(
-            radar_core::RadarSite::new("deess"),
-            Utc::now() - chrono::Duration::days(365),
-        )));
+        set_primary_chip_frame(
+            &mut app,
+            Arc::new(RadarVolume::new(
+                radar_core::RadarSite::new("deess"),
+                Utc::now() - chrono::Duration::days(365),
+            )),
+        );
         let (label, _, kind) = app.mode_chip_state().expect("intl archive chip");
         assert_eq!(
             kind, "ARCH",
@@ -61901,10 +61974,13 @@ mod tests {
         // A streaming intl poll reads LIVE regardless of the US flag.
         app.poll_active = true;
         app.primary.live.enabled = false;
-        app.volume = Some(Arc::new(RadarVolume::new(
-            radar_core::RadarSite::new("deess"),
-            Utc::now() - chrono::Duration::minutes(9),
-        )));
+        set_primary_chip_frame(
+            &mut app,
+            Arc::new(RadarVolume::new(
+                radar_core::RadarSite::new("deess"),
+                Utc::now() - chrono::Duration::minutes(9),
+            )),
+        );
         let (label, _, kind) = app.mode_chip_state().expect("intl live chip");
         assert_eq!(kind, "LIVE", "an armed active intl poll is LIVE: {label}");
         // 9 minutes is a routine intl publish gap — the NEXRAD-tuned 480 s
@@ -62034,10 +62110,13 @@ mod tests {
             site_id: "deess".to_owned(),
         });
         app.poll_active = true;
-        app.volume = Some(Arc::new(RadarVolume::new(
-            radar_core::RadarSite::new("deess"),
-            Utc::now() - chrono::Duration::seconds(2400),
-        )));
+        set_primary_chip_frame(
+            &mut app,
+            Arc::new(RadarVolume::new(
+                radar_core::RadarSite::new("deess"),
+                Utc::now() - chrono::Duration::seconds(2400),
+            )),
+        );
         let (label, _, kind) = app.mode_chip_state().expect("stale intl chip");
         assert_eq!(kind, "STALE");
         assert_eq!(label, "● LIVE · STALE 40m");
@@ -62175,57 +62254,66 @@ mod tests {
         });
         assert!(!app.pane_chip_is_live(1));
         let (label, _, kind) = app
-            .mode_chip_state_with_live(app.pane_chip_is_live(1))
+            .mode_chip_state_with_live_and_stale_floor(app.pane_chip_is_live(1), 0)
             .expect("owned pane chip");
         assert_eq!(kind, "ARCH");
         assert!(label.contains("0m old"), "{label}");
     }
 
-    /// Contract harness (v0.29 Phase 1): pins the pane-0 fall-through in
-    /// `pane_chip_is_live` AS-IS. The grid chip for cell 0 answers with
-    /// `realtime_level2_auto_refresh` — primary-US state no international
-    /// path sets or clears — even when an international source owns the
-    /// primary display. This is the LAST LIVE R8 RESIDUE (the flag-vs-owner
-    /// disagreement bug class, spec §0/§3): `mode_chip_state` was already
-    /// taught to dispatch on the display owner, the grid chip was not.
-    /// Phase 4 replaces both with `LoopEngine::liveness()`, derived from the
-    /// engine's own feed. Until then the two known-wrong cells below are
-    /// CURRENT behavior — do not "fix" them here; delete this test when the
-    /// engine port lands.
+    /// v0.29 Phase 4e stage (iii): the pane-0 grid chip now shares the
+    /// PRIMARY's display-owner-aware liveness truth — the last live R8
+    /// residue (pane 0 answering with the bare US auto-refresh flag while
+    /// an international source owned the display) is dead, and this test
+    /// replaces the Phase-1 pin of the known-wrong cells
+    /// (`pane_zero_grid_chip_still_reads_the_us_auto_refresh_flag`, which
+    /// its own doc said to delete when the engine port landed). The chip
+    /// class is untestable-to-reintroduce: both chips derive from the same
+    /// flag + feed, so they cannot disagree.
     #[test]
-    fn pane_zero_grid_chip_still_reads_the_us_auto_refresh_flag() {
+    fn pane_zero_grid_chip_shares_the_primary_display_owner_liveness() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
 
-        // Known-wrong cell 1: an intl ARCHIVE owns the display while the
-        // stale US flag is still set — the primary chip is honest ARCHIVE,
-        // the pane-0 grid chip claims LIVE off the US flag.
+        // Fixed cell 1: an intl ARCHIVE owns the display while the stale US
+        // flag is still set — BOTH chips read ARCHIVE now.
         app.primary.live.enabled = true;
         app.set_intl_archive_primary_source("ord", "deess");
-        app.volume = Some(Arc::new(RadarVolume::new(
-            radar_core::RadarSite::new("deess"),
-            Utc::now() - chrono::Duration::days(365),
-        )));
+        set_primary_chip_frame(
+            &mut app,
+            Arc::new(RadarVolume::new(
+                radar_core::RadarSite::new("deess"),
+                Utc::now() - chrono::Duration::days(365),
+            )),
+        );
         let (_, _, kind) = app.mode_chip_state().expect("primary chip");
         assert_eq!(kind, "ARCH", "the single-pane chip dispatches honestly");
         assert!(
-            app.pane_chip_is_live(0),
-            "pane 0 falls through to the US auto-refresh flag (R8 residue)"
+            !app.pane_chip_is_live(0),
+            "pane 0 mirrors the primary: an intl archive owner is not live"
         );
+        let (_, _, pane_kind) = app.pane_mode_chip_state(0).expect("pane-0 chip");
+        assert_eq!(pane_kind, "ARCH", "grid chip agrees with the primary chip");
 
-        // Known-wrong cell 2, the converse: a streaming intl poll with the
-        // US flag off — the primary chip says LIVE, the pane-0 grid chip
-        // says not-live.
+        // Fixed cell 2, the converse: a streaming intl poll with the US
+        // flag off — BOTH chips read LIVE.
         app.poll_active = true;
         app.primary.live.enabled = false;
-        app.volume = Some(Arc::new(RadarVolume::new(
-            radar_core::RadarSite::new("deess"),
-            Utc::now() - chrono::Duration::minutes(5),
-        )));
+        set_primary_chip_frame(
+            &mut app,
+            Arc::new(RadarVolume::new(
+                radar_core::RadarSite::new("deess"),
+                Utc::now() - chrono::Duration::minutes(5),
+            )),
+        );
         let (_, _, kind) = app.mode_chip_state().expect("primary chip");
         assert_eq!(kind, "LIVE");
         assert!(
-            !app.pane_chip_is_live(0),
-            "pane 0 ignores the intl poll's liveness (R8 residue)"
+            app.pane_chip_is_live(0),
+            "pane 0 mirrors the primary: a streaming intl poll is live"
+        );
+        let (_, _, pane_kind) = app.pane_mode_chip_state(0).expect("pane-0 chip");
+        assert_eq!(
+            pane_kind, "LIVE",
+            "grid chip agrees (intl floor keeps a 5-minute-old frame fresh)"
         );
     }
 
@@ -63195,13 +63283,14 @@ mod tests {
             .single()
             .expect("valid scan time");
 
-        app.upsert_history_frame(test_decoded_live_partial(
-            path.clone(),
-            "KTLX",
-            scan_time,
-            120,
-        ));
-        app.upsert_history_frame(test_decoded_live_partial(path, "KTLX", scan_time, 240));
+        upsert_primary_history_frame(
+            &mut app,
+            test_decoded_live_partial(path.clone(), "KTLX", scan_time, 120),
+        );
+        upsert_primary_history_frame(
+            &mut app,
+            test_decoded_live_partial(path, "KTLX", scan_time, 240),
+        );
 
         assert_eq!(app.primary.history.len(), 1);
         assert_eq!(
@@ -66531,6 +66620,37 @@ mod tests {
             status,
             source_label: format!("realtime L2 {site}"),
         }
+    }
+
+    /// Single-frame primary-history upsert through the ONE engine install
+    /// path (the legacy `upsert_history_frame` body died in the 4e
+    /// stage-(iii) unify): `KeepCursor` = upsert + sort + trim with no
+    /// selection or display side effects, which is exactly what these
+    /// tests used the legacy helper for.
+    pub(crate) fn upsert_primary_history_frame(app: &mut ViewerApp, decoded: DecodedLoad) {
+        let _ = app.primary.install_batch(
+            DecodedLoadBatch::single(decoded),
+            &SelectionPolicy::KeepCursor,
+            None,
+            |_| false,
+        );
+    }
+
+    /// Seed the primary display AND a single matching history frame. Since
+    /// the 4e stage-(iii) unify the primary chip derives from the NEWEST
+    /// history frame (`LoopEngine::liveness`), so chip tests must put their
+    /// aged volume on the frame strip, not just the display.
+    fn set_primary_chip_frame(app: &mut ViewerApp, volume: Arc<RadarVolume>) {
+        app.primary.history.clear();
+        app.primary.history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from("chip-frame"),
+            volume: Arc::clone(&volume),
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "chip frame".to_owned(),
+        });
+        app.volume = Some(volume);
     }
 
     pub(crate) fn test_volume_with_site_time(site: &str, scan_time: DateTime<Utc>) -> RadarVolume {

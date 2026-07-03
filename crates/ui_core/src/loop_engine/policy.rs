@@ -47,10 +47,10 @@ pub const PANE_HISTORY_BYTE_BUDGET: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 /// so its guard rail is sized for a ~100-frame super-res loop (~50-80
 /// MB/volume decoded ≈ 5-8 GB), four times the overlay/pane rail. Like the
 /// other budgets this stops pathological growth, not normal use: the user's
-/// frame limit governs first on every real machine. Wired at stage (i) but
-/// INERT until the stage-(ii) unify routes the primary's trims through
-/// [`LoopEngine::trim_history_to_limits`](super::LoopEngine) — the legacy
-/// `trim_frame_history` body never reads it.
+/// frame limit governs first on every real machine. Wired at stage (i),
+/// ACTIVE since stage (iii): every primary trim routes through
+/// [`LoopEngine::trim_history_to_limits`](super::LoopEngine) (app_ui's
+/// `trim_frame_history` is a delegating shim).
 pub const PRIMARY_HISTORY_BYTE_BUDGET: usize = 8 * 1024 * 1024 * 1024; // 8 GiB
 
 /// Frame-count and byte limits for one engine's history (census D8).

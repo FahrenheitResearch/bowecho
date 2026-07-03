@@ -355,7 +355,11 @@ impl LoopEngine {
     /// (legacy `trim_frame_history` semantics), drop oldest-first, then
     /// enforce the byte budget the same way — never dropping the last
     /// remaining frame — and clamp the cursor into range.
-    pub(super) fn trim_history_to_limits(&mut self) {
+    ///
+    /// `pub` since 4e stage (iii): the primary view's trims route through
+    /// here (its `trim_frame_history` is a delegating shim), which is what
+    /// activates the primary byte budget the stage-(i) wiring left inert.
+    pub fn trim_history_to_limits(&mut self) {
         self.limits.frame_limit = HistoryLimits::normalized_frame_limit(self.limits.frame_limit);
         while self.history.len() > self.limits.frame_limit {
             self.history.remove(0);

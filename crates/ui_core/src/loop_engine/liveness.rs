@@ -189,13 +189,32 @@ impl LoopEngine {
     /// legacy `mode_chip_state_with_live_and_stale_floor` clamp. Read-only:
     /// asserts the generation did not move (spec §3 harness).
     pub fn liveness(&self, now: DateTime<Utc>, user_stale_chip_seconds: i64) -> Option<Liveness> {
+        self.liveness_with_live_flag(now, user_stale_chip_seconds, self.live.enabled)
+    }
+
+    /// [`Self::liveness`] with the live flag supplied by the caller — the
+    /// Phase-4e stage-(iii) bridge for the PRIMARY view, whose custom-URL/
+    /// international poll flag (the legacy `poll_active` field) cannot merge
+    /// into `live.enabled` until the polled install path unifies (blocked on
+    /// the class-(c) differential cells; `live.enabled` is still the US
+    /// auto-refresh switch there, an independent boolean).
+    ///
+    /// The R8 invariant survives the override: `live` is ANDed with the feed
+    /// variant, so an `Archive`/`LocalFiles` feed can never read `Live`
+    /// whatever the caller passes. Every other input stays engine-own.
+    pub fn liveness_with_live_flag(
+        &self,
+        now: DateTime<Utc>,
+        user_stale_chip_seconds: i64,
+        live: bool,
+    ) -> Option<Liveness> {
         let generation_before = self.history.generation();
         let newest = self.history.last()?;
         let age_seconds = now
             .signed_duration_since(newest.identity.scan_time_utc)
             .num_seconds()
             .max(0);
-        let live_now = self.feed.is_live_variant() && self.live.enabled;
+        let live_now = self.feed.is_live_variant() && live;
         let result = if live_now {
             let threshold = user_stale_chip_seconds
                 .max(0)
@@ -369,6 +388,51 @@ mod tests {
                 age_seconds: 0,
                 stale: false
             })
+        );
+    }
+
+    /// The 4e stage-(iii) bridge: `liveness_with_live_flag` lets the caller
+    /// supply the live flag (the primary's un-merged `poll_active`), but the
+    /// feed variant still gates — an Archive feed can NEVER read Live, so
+    /// the override does not reopen the R8 seam.
+    #[test]
+    fn liveness_with_live_flag_override_cannot_make_an_archive_feed_live() {
+        // A live intl feed with the engine flag off but the bridge flag on
+        // reads Live — the poll_active bridge cell.
+        let (mut engine, now) =
+            engine_with_frame_age(EngineRole::Primary, FeedSource::Live(intl_site()), 60);
+        engine.live.enabled = false;
+        assert_eq!(
+            engine.liveness_with_live_flag(now, 480, true),
+            Some(Liveness::Live {
+                age_seconds: 60,
+                stale: false
+            })
+        );
+        assert_eq!(
+            engine.liveness_with_live_flag(now, 480, false),
+            Some(Liveness::Archive { age_seconds: 60 })
+        );
+
+        // The feed variant outranks the override: archive stays archive.
+        let (mut engine, now) = engine_with_frame_age(
+            EngineRole::Primary,
+            FeedSource::Archive {
+                site: us_site(),
+                window: ArchiveWindow {
+                    start_utc: Utc.with_ymd_and_hms(2026, 6, 9, 5, 0, 0).unwrap(),
+                    end_utc: Utc.with_ymd_and_hms(2026, 6, 9, 6, 0, 0).unwrap(),
+                    anchor_utc: None,
+                    max_frames: 20,
+                },
+            },
+            60,
+        );
+        engine.live.enabled = true;
+        assert_eq!(
+            engine.liveness_with_live_flag(now, 480, true),
+            Some(Liveness::Archive { age_seconds: 60 }),
+            "R8 invariant: an archive feed can never read Live"
         );
     }
 
