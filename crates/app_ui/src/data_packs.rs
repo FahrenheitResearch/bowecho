@@ -220,6 +220,27 @@ pub(crate) const BUILT_IN_DATA_PACKS: &[BuiltInDataPack] = &[
         max_frames: 18,
         layout: DataPackLayout::DualPolTornadoReview,
     },
+    // The SAME long-track supercell ~2.5 h after Rolling Fork: the
+    // Amory/New Wren EF3 between Okolona and Aberdeen MS, as seen by
+    // KGWX. Also the dealias battery's case H — the 0.48° velocity
+    // tilts at 03:42:09 and 03:44:02 under-unfold the inbound (west)
+    // side of the couplet (docs/dealias-v4-spec.md §18).
+    BuiltInDataPack {
+        id: "amory-2023-kgwx",
+        title: "Amory EF3",
+        summary: "KGWX velocity couplet from the Rolling Fork supercell's \
+                  second violent tornado, west of Amory.",
+        site_id: "KGWX",
+        start_utc: "2023-03-25T03:18:00Z",
+        end_utc: "2023-03-25T04:05:00Z",
+        anchor_utc: "2023-03-25T03:38:00Z",
+        focus_lat: 33.95,
+        focus_lon: -88.62,
+        map_scale: 880.0,
+        pad_scans: 2,
+        max_frames: 12,
+        layout: DataPackLayout::DualPolTornadoReview,
+    },
 ];
 
 /// A ready-made review scene over an international provider archive —
@@ -299,7 +320,7 @@ mod tests {
 
     #[test]
     fn built_in_data_packs_parse_to_valid_windows() {
-        assert_eq!(BUILT_IN_DATA_PACKS.len(), 6);
+        assert_eq!(BUILT_IN_DATA_PACKS.len(), 7);
 
         for pack in BUILT_IN_DATA_PACKS {
             let request = pack

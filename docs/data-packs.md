@@ -42,6 +42,7 @@ The first in-app pack set should stay dual-pol first:
 | Rochelle-Fairdale EF4 | KLOT | 2015-04-09 23:15-2015-04-10 01:00 | 00:13 | 42.100, -88.940 | REF, dealiased velocity, CC, ZDR |
 | Mayfield EF4 | KPAH | 2021-12-11 02:45-04:05 | 03:27 | 36.740, -88.640 | REF, dealiased velocity, CC, ZDR |
 | Rolling Fork EF4 | KDGX | 2023-03-25 00:50-02:15 | 01:07 | 32.906, -90.878 | REF, dealiased velocity, CC, ZDR |
+| Amory EF3 | KGWX | 2023-03-25 03:18-04:05 | 03:38 | 33.950, -88.620 | REF, dealiased velocity, CC, ZDR |
 
 Tuscaloosa 2011 remains an important velocity case, but it should not be in
 the first dual-pol set because KBMX had not been upgraded yet.
