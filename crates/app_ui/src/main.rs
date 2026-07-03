@@ -81,8 +81,9 @@ use sites_ui::{
 };
 use ui_core::geo::{aeqd_forward_km, aeqd_inverse_km};
 use ui_core::render_service::{
-    DrainBudget, LaneId, PrewarmPool, RepaintDecision, loop_prewarm_inflight_limit,
-    loop_prewarm_worker_count, post_drain_repaint,
+    DrainBudget, LaneId, OverlayPool, PrewarmPool, RenderRoute, RepaintDecision,
+    loop_prewarm_inflight_limit, loop_prewarm_worker_count, overlay_pool_worker_target,
+    post_drain_repaint, render_route_for,
 };
 use ui_core::tiles;
 use ui_core::worker_slot::{SlotMessage, SlotPoll, StreamSlot, StreamState, WorkerSlot};
@@ -1697,6 +1698,18 @@ struct ViewerApp {
     /// `ui_core::render_service::PrewarmPool`; the render job stays here
     /// (`spawn_loop_prewarm_render_workers`).
     loop_prewarm: PrewarmPool<RenderRequest, AsyncRenderResult>,
+    /// Shared overlay render pool (`LaneId::Overlay`, the Phase-4b flip): K
+    /// workers over one per-lane-coalescing queue replace the former
+    /// thread-per-layer overlay workers. Workers spawn on demand up to
+    /// `overlay_pool_worker_target` (`ensure_overlay_render_workers`).
+    overlay_render_pool: OverlayPool<RenderRequest, AsyncRenderResult>,
+    /// The overlay pool's ONE recycle channel (per-pool, as before per-layer):
+    /// consumed rgba buffers return here and pool workers pull the best match
+    /// before each render.
+    overlay_render_recycle_sender: mpsc::Sender<RenderRecycleBuffer>,
+    /// Receiver end of the overlay recycle channel, shared by every pool
+    /// worker (captured by `overlay_pool_render_job` at spawn time).
+    overlay_render_recycle_receiver: Arc<Mutex<mpsc::Receiver<RenderRecycleBuffer>>>,
     loop_render_cache: VecDeque<LoopRenderCacheEntry>,
     loop_render_cache_bytes: usize,
     loop_prewarm_inflight: Vec<TextureKey>,
@@ -2275,9 +2288,6 @@ struct RadarOverlayLayer {
     load_timing: Option<LoadTimings>,
     texture: Option<egui::TextureHandle>,
     texture_key: Option<TextureKey>,
-    render_sender: mpsc::Sender<RenderRequest>,
-    render_receiver: mpsc::Receiver<AsyncRenderResult>,
-    render_recycle_sender: mpsc::Sender<RenderRecycleBuffer>,
     pending_render_key: Option<TextureKey>,
     load_receiver: Option<mpsc::Receiver<AsyncLoadResult>>,
     status: String,
@@ -2291,8 +2301,9 @@ struct RadarOverlayLayer {
 }
 
 impl RadarOverlayLayer {
+    /// Since the Phase-4b pool flip a layer owns NO render worker: renders
+    /// go through `ViewerApp::overlay_render_pool` on `LaneId::Overlay(id)`.
     fn new(id: u64, site: RadarSite) -> Self {
-        let (render_sender, render_receiver, render_recycle_sender) = spawn_overlay_render_worker();
         let site_id = site.level2_id.clone();
         Self {
             id,
@@ -2307,9 +2318,6 @@ impl RadarOverlayLayer {
             load_timing: None,
             texture: None,
             texture_key: None,
-            render_sender,
-            render_receiver,
-            render_recycle_sender,
             pending_render_key: None,
             load_receiver: None,
             status: format!("Queued {site_id}"),
@@ -5287,12 +5295,75 @@ fn spawn_render_worker() -> (
     spawn_render_worker_with_mode(RenderWorkerCacheMode::Primary)
 }
 
-fn spawn_overlay_render_worker() -> (
-    mpsc::Sender<RenderRequest>,
-    mpsc::Receiver<AsyncRenderResult>,
-    mpsc::Sender<RenderRecycleBuffer>,
-) {
-    spawn_render_worker_with_mode(RenderWorkerCacheMode::Overlay)
+/// Job body for one shared-overlay-pool worker (the Phase-4b flip): the
+/// pre-4b per-layer worker's render path — Overlay cache policy, recycle
+/// buffer reuse — minus two pieces that moved or were dead:
+///
+/// - the queue/coalescing loop moved into `OverlayPool`'s per-lane queue
+///   (`ui_core::render_service::merge_lane_request`), and
+/// - the speculative sample/velocity cache warming tail, which was
+///   unreachable under `RenderWorkerCacheMode::Overlay` (pinned by
+///   `overlay_cache_policy_keeps_background_radars_lightweight`).
+///
+/// Worker-local caches live in the returned closure, exactly like the
+/// prewarm job above. All pool workers pull recycled buffers from the ONE
+/// shared receiver; the best-match heuristic is the pre-4b one, verbatim.
+fn overlay_pool_render_job(
+    recycle_receiver: Arc<Mutex<mpsc::Receiver<RenderRecycleBuffer>>>,
+) -> impl FnMut(RenderRequest) -> AsyncRenderResult {
+    let cache_policy = RenderWorkerCachePolicy::detect(RenderWorkerCacheMode::Overlay);
+    let mut reusable_pixels = Vec::new();
+    let mut reusable_pixels_signature: Option<RenderWorkerViewportSignature> = None;
+    let mut moment_caches: Vec<RenderWorkerMomentCache> = Vec::new();
+    let mut sample_caches: Vec<RenderWorkerSampleCache> = Vec::new();
+    let mut geometry_caches: Vec<RenderWorkerGeometryCache> = Vec::new();
+    let mut last_direct_viewports: Vec<RenderWorkerViewportSignature> = Vec::new();
+    move |request: RenderRequest| {
+        let requested_buffer_signature = RenderWorkerViewportSignature::new(
+            Arc::as_ptr(&request.volume) as usize,
+            request.key.dealias_reference_volume_ptr,
+            request.cut,
+            request.product.clone(),
+            request.product.base_moment(),
+            request.render_dealiased_velocity,
+            request.key.color_table_signature,
+            request.key.storm_motion_key,
+            request.key.hail_levels_key,
+            request.key.smoothing,
+            request.key.dealias_cascade,
+            request.key.gate_filter_decidbz,
+            request.key.viewport,
+        );
+        if let Ok(recycle_receiver) = recycle_receiver.lock() {
+            while let Ok(recycled) = recycle_receiver.try_recv() {
+                let recycled_matches =
+                    recycled.signature.as_ref() == Some(&requested_buffer_signature);
+                let current_matches =
+                    reusable_pixels_signature.as_ref() == Some(&requested_buffer_signature);
+                if reusable_pixels.is_empty()
+                    || (recycled_matches && !current_matches)
+                    || (recycled_matches == current_matches
+                        && recycled.rgba.capacity() > reusable_pixels.capacity())
+                {
+                    reusable_pixels = recycled.rgba;
+                    reusable_pixels_signature = recycled.signature;
+                }
+            }
+        }
+        let key = request.key.clone();
+        let lane = request.lane;
+        let result = ViewerApp::render_viewport_payload(
+            &request,
+            &mut reusable_pixels,
+            &mut reusable_pixels_signature,
+            &mut moment_caches,
+            &mut sample_caches,
+            &mut geometry_caches,
+            &mut last_direct_viewports,
+            cache_policy,
+        );
+        AsyncRenderResult { key, lane, result }
+    }
 }
 
 /// Thin adapter over `ui_core::render_service::PrewarmPool`: the channel
@@ -6466,6 +6537,9 @@ impl ViewerApp {
             .unwrap_or((35.33305, -97.27775));
         let (render_sender, render_receiver, render_recycle_sender) = spawn_render_worker();
         let loop_prewarm = spawn_loop_prewarm_render_workers();
+        let (overlay_render_recycle_sender, overlay_render_recycle_receiver) =
+            mpsc::channel::<RenderRecycleBuffer>();
+        let overlay_render_recycle_receiver = Arc::new(Mutex::new(overlay_render_recycle_receiver));
         let hazard_path_text = String::new();
         let loaded_styles = styles::load();
         let style_registry = styles::StyleRegistry::from_settings(&loaded_styles.settings);
@@ -6535,6 +6609,9 @@ impl ViewerApp {
             render_recycle_sender,
             pending_render_key: None,
             loop_prewarm,
+            overlay_render_pool: OverlayPool::new(),
+            overlay_render_recycle_sender,
+            overlay_render_recycle_receiver,
             loop_render_cache: VecDeque::new(),
             loop_render_cache_bytes: 0,
             loop_prewarm_inflight: Vec::new(),
@@ -11926,57 +12003,38 @@ impl ViewerApp {
         }
     }
 
-    /// `LaneId::Overlay`: until the Phase-4b pool flip every radar overlay
-    /// layer still owns its worker + channel, but the drain is one pass —
-    /// ONE budget clock shared across all layers, so a burst on one layer
-    /// spills every later layer to the next frame.
+    /// `LaneId::Overlay`: since the Phase-4b pool flip every radar overlay
+    /// layer renders through the ONE shared pool, so the drain is one pass
+    /// over the pool's single result channel, routing each result to its
+    /// layer by lane id. The budget is unchanged from 4a's pins: ONE clock
+    /// shared across all overlay layers, so a burst on one layer spills
+    /// every later result to the next frame.
     fn drain_overlay_render_lanes(&mut self, ctx: &egui::Context) {
         // The overlay budget is per-pass (shared by every layer); the lane
         // id passed here does not affect it.
         let mut budget = DrainBudget::for_lane(LaneId::Overlay(0));
-        for layer in &mut self.radar_layers {
-            loop {
-                if budget.should_stop() {
-                    ctx.request_repaint();
-                    return;
+        loop {
+            if budget.should_stop() {
+                ctx.request_repaint();
+                break;
+            }
+            match self.overlay_render_pool.try_recv() {
+                Ok(message) => {
+                    budget.note_message();
+                    self.install_overlay_render_result(ctx, message);
                 }
-                match layer.render_receiver.try_recv() {
-                    Ok(message) => {
-                        budget.note_message();
-                        let is_latest = layer.pending_render_key.as_ref() == Some(&message.key);
-                        match message.result {
-                            Ok(rendered) if is_latest => {
-                                layer.pending_render_key = None;
-                                Self::install_radar_layer_texture(
-                                    ctx,
-                                    layer,
-                                    message.key,
-                                    rendered,
-                                );
-                            }
-                            Ok(rendered) => {
-                                let _ = layer.render_recycle_sender.send(RenderRecycleBuffer {
-                                    rgba: rendered.rgba,
-                                    signature: Some(rendered.buffer_signature),
-                                });
-                            }
-                            Err(err) if is_latest => {
-                                layer.pending_render_key = None;
-                                layer.render_ms = None;
-                                layer.worker_ms = None;
-                                layer.texture_ms = None;
-                                layer.status = format!("Render failed: {err}");
-                            }
-                            Err(_) => {}
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Unreachable while the pool is alive (it keeps a result
+                    // sender for future workers); kept so a future pool
+                    // change fails loud instead of repaint-spinning.
+                    for layer in &mut self.radar_layers {
+                        if layer.pending_render_key.take().is_some() {
+                            layer.status = "Layer render worker disconnected".to_owned();
                         }
                     }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        layer.pending_render_key = None;
-                        layer.status = "Layer render worker disconnected".to_owned();
-                        budget.note_message();
-                        break;
-                    }
+                    budget.note_message();
+                    break;
                 }
             }
         }
@@ -11995,9 +12053,65 @@ impl ViewerApp {
         }
     }
 
+    /// Route one shared-pool result to its overlay layer by lane id. The
+    /// accept rules are the pre-4b per-layer drain arms, verbatim: latest-ok
+    /// installs, stale-ok recycles, latest-err clears pending + layer
+    /// status, stale-err drops. A retired lane (layer removed while its
+    /// render was in flight) misses the lookup and the buffer recycles.
+    fn install_overlay_render_result(&mut self, ctx: &egui::Context, message: AsyncRenderResult) {
+        let recycle = |rendered: RenderedTexture| {
+            let _ = self
+                .overlay_render_recycle_sender
+                .send(RenderRecycleBuffer {
+                    rgba: rendered.rgba,
+                    signature: Some(rendered.buffer_signature),
+                });
+        };
+        let LaneId::Overlay(layer_id) = message.lane else {
+            debug_assert!(false, "non-overlay lane result on the overlay pool");
+            if let Ok(rendered) = message.result {
+                recycle(rendered);
+            }
+            return;
+        };
+        let Some(layer) = self
+            .radar_layers
+            .iter_mut()
+            .find(|layer| layer.id == layer_id)
+        else {
+            if let Ok(rendered) = message.result {
+                recycle(rendered);
+            }
+            return;
+        };
+        let is_latest = layer.pending_render_key.as_ref() == Some(&message.key);
+        match message.result {
+            Ok(rendered) if is_latest => {
+                layer.pending_render_key = None;
+                Self::install_radar_layer_texture(
+                    ctx,
+                    layer,
+                    &self.overlay_render_recycle_sender,
+                    message.key,
+                    rendered,
+                );
+            }
+            Ok(rendered) => recycle(rendered),
+            Err(err) if is_latest => {
+                layer.pending_render_key = None;
+                layer.render_ms = None;
+                layer.worker_ms = None;
+                layer.texture_ms = None;
+                layer.status = format!("Render failed: {err}");
+            }
+            Err(_) => {}
+        }
+    }
+
     fn install_radar_layer_texture(
         ctx: &egui::Context,
         layer: &mut RadarOverlayLayer,
+        recycle_sender: &mpsc::Sender<RenderRecycleBuffer>,
         key: TextureKey,
         rendered: RenderedTexture,
     ) {
@@ -12038,7 +12152,7 @@ impl ViewerApp {
         layer.worker_ms = Some(worker_ms);
         layer.texture_ms = Some(texture_start.elapsed().as_secs_f32() * 1000.0);
         layer.radar_range_km = radar_range_km;
-        let _ = layer.render_recycle_sender.send(RenderRecycleBuffer {
+        let _ = recycle_sender.send(RenderRecycleBuffer {
             rgba,
             signature: Some(buffer_signature),
         });
@@ -12637,6 +12751,22 @@ impl ViewerApp {
         color_tables
     }
 
+    /// Grow the shared overlay pool to `overlay_pool_worker_target` for the
+    /// current layer count (K never shrinks; the bound is the prewarm sizing
+    /// table). Called only when there are overlay render requests to send,
+    /// so a session that never adds an overlay spawns no pool threads.
+    fn ensure_overlay_render_workers(&mut self) {
+        let target =
+            overlay_pool_worker_target(self.radar_layers.len(), effective_worker_threads());
+        if self.overlay_render_pool.worker_count() >= target {
+            return;
+        }
+        let recycle_receiver = Arc::clone(&self.overlay_render_recycle_receiver);
+        self.overlay_render_pool.ensure_workers(target, move || {
+            overlay_pool_render_job(Arc::clone(&recycle_receiver))
+        });
+    }
+
     fn request_radar_layer_renders(&mut self, ctx: &egui::Context, rect: egui::Rect) {
         self.sync_radar_overlay_layers_to_timeline(ctx);
         let smooth_follow = self.smooth_camera_follow_playback_active();
@@ -12744,10 +12874,17 @@ impl ViewerApp {
             }
         }
 
+        if !requests.is_empty() {
+            self.ensure_overlay_render_workers();
+        }
         for (index, request) in requests {
             if let Some(layer) = self.radar_layers.get_mut(index) {
                 let key = request.key.clone();
-                match layer.render_sender.send(request) {
+                // The routing policy for overlay lanes lives in ONE place:
+                // ui_core::render_service::render_route_for (the Phase-4b
+                // flip edited that map; its doc names the revert path).
+                debug_assert_eq!(render_route_for(request.lane), RenderRoute::OverlayPool);
+                match self.overlay_render_pool.submit(request.lane, request) {
                     Ok(()) => {
                         layer.pending_render_key = Some(key);
                         if layer.load_receiver.is_none() {
@@ -54631,6 +54768,190 @@ mod tests {
         }
     }
 
+    /// A realistic single-tilt overlay volume: full 720-radial ring, 1,200
+    /// gates of varied u8 reflectivity (a Level-II-class base tilt). Fresh
+    /// per iteration so every render is cache-cold, like a newly polled
+    /// overlay frame.
+    fn overlay_perf_volume(site: &str) -> Arc<RadarVolume> {
+        let gate_range = radar_core::GateRange {
+            first_gate_m: 2_125,
+            gate_spacing_m: 250,
+            gate_count: 1_200,
+        };
+        let mut volume = RadarVolume::new(radar_core::RadarSite::new(site), Utc::now());
+        let mut cut = ElevationCut::new(0.5, Some(1));
+        let mut grid = MomentGrid::new_u8(
+            MomentType::Reflectivity,
+            gate_range.clone(),
+            2.0,
+            66.0,
+            Some(0),
+            Some(1),
+        );
+        let mut row_values = vec![0u8; gate_range.gate_count];
+        for row in 0..720usize {
+            cut.radials
+                .push(test_radial(row as f32 * 0.5, gate_range.clone()));
+            for (gate, value) in row_values.iter_mut().enumerate() {
+                *value = (((row * 7 + gate * 3) % 180) + 40) as u8;
+            }
+            grid.push_u8_row_slice(row, &row_values)
+                .expect("reflectivity row");
+        }
+        cut.moments.insert(MomentType::Reflectivity, grid);
+        volume.cuts.push(cut);
+        Arc::new(volume)
+    }
+
+    fn overlay_perf_request(volume: Arc<RadarVolume>, lane: LaneId) -> RenderRequest {
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+        let color_tables = ColorTableSet::default();
+        let color_table_signature = color_tables.signature_for_family(product.color_family());
+        let mut request = khdc_profile_render_request(
+            volume,
+            0,
+            product,
+            color_tables,
+            color_table_signature,
+            khdc_profile_viewport(1920, 1080),
+        );
+        request.lane = lane;
+        request
+    }
+
+    /// Phase-4b gate measurement (spec §7 4b, §12 decision 1): overlay
+    /// submit-to-first-result latency through the shared `OverlayPool` vs
+    /// the pre-4b thread-per-layer workers, driving the SAME render job
+    /// (`RenderWorkerCacheMode::Overlay`) over identical cache-cold
+    /// synthetic volumes at a 1920x1080 viewport. Also runs the pool at the
+    /// low-core worker bound (`overlay_pool_worker_target(N, 4)` = 2) to
+    /// show the deliberate low-core serialization trade.
+    ///
+    /// Run in an optimized profile:
+    /// `cargo test --profile release-fast -p app_ui overlay_pool_first_pixels_smoke -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timed smoke; run manually in an optimized profile with --nocapture"]
+    fn overlay_pool_first_pixels_smoke() {
+        const OVERLAYS: usize = 4;
+        const ITERS: usize = 5;
+        let timeout = Duration::from_secs(30);
+
+        let sites: Vec<String> = (0..OVERLAYS).map(|index| format!("KX{index:02}")).collect();
+
+        // Arm A — pre-4b thread-per-layer: one Overlay-mode worker per
+        // layer, all requests dispatched at t0, arrival deltas recorded.
+        let mut per_layer_arrivals_ms: Vec<f32> = Vec::new();
+        for _ in 0..ITERS {
+            let workers: Vec<_> = (0..OVERLAYS)
+                .map(|_| spawn_render_worker_with_mode(RenderWorkerCacheMode::Overlay))
+                .collect();
+            let volumes: Vec<_> = sites.iter().map(|site| overlay_perf_volume(site)).collect();
+            let start = Instant::now();
+            for (index, (sender, _, _)) in workers.iter().enumerate() {
+                let request = overlay_perf_request(
+                    Arc::clone(&volumes[index]),
+                    LaneId::Overlay(index as u64),
+                );
+                sender.send(request).expect("worker alive");
+            }
+            let mut arrived = [false; OVERLAYS];
+            while arrived.iter().any(|done| !done) {
+                assert!(start.elapsed() < timeout, "per-layer arm timed out");
+                for (index, (_, receiver, _)) in workers.iter().enumerate() {
+                    if !arrived[index] && receiver.try_recv().is_ok() {
+                        arrived[index] = true;
+                        per_layer_arrivals_ms.push(start.elapsed().as_secs_f32() * 1000.0);
+                    }
+                }
+                thread::yield_now();
+            }
+        }
+
+        // Arm B/C — the shared pool at the real worker target and at the
+        // simulated low-core (4-thread) target.
+        let threads = effective_worker_threads();
+        let pool_arm = |worker_target: usize| -> Vec<f32> {
+            let mut arrivals_ms = Vec::new();
+            for _ in 0..ITERS {
+                let (_recycle_sender, recycle_receiver) = mpsc::channel::<RenderRecycleBuffer>();
+                let recycle_receiver = Arc::new(Mutex::new(recycle_receiver));
+                let mut pool: OverlayPool<RenderRequest, AsyncRenderResult> = OverlayPool::new();
+                pool.ensure_workers(worker_target, move || {
+                    overlay_pool_render_job(Arc::clone(&recycle_receiver))
+                });
+                let volumes: Vec<_> = sites.iter().map(|site| overlay_perf_volume(site)).collect();
+                let start = Instant::now();
+                for (index, volume) in volumes.iter().enumerate() {
+                    let request =
+                        overlay_perf_request(Arc::clone(volume), LaneId::Overlay(index as u64));
+                    pool.submit(request.lane, request).expect("pool alive");
+                }
+                let mut received = 0;
+                while received < OVERLAYS {
+                    assert!(start.elapsed() < timeout, "pool arm timed out");
+                    match pool.try_recv() {
+                        Ok(_) => {
+                            received += 1;
+                            arrivals_ms.push(start.elapsed().as_secs_f32() * 1000.0);
+                        }
+                        Err(_) => thread::yield_now(),
+                    }
+                }
+            }
+            arrivals_ms
+        };
+        let pool_target = overlay_pool_worker_target(OVERLAYS, threads);
+        let pool_arrivals_ms = pool_arm(pool_target);
+        let low_core_target = overlay_pool_worker_target(OVERLAYS, LOW_CORE_PREVIEW_THREADS);
+        let low_core_arrivals_ms = pool_arm(low_core_target);
+
+        // Single-overlay first pixels through the pool (the common case).
+        let single_arrivals_ms = {
+            let (_recycle_sender, recycle_receiver) = mpsc::channel::<RenderRecycleBuffer>();
+            let recycle_receiver = Arc::new(Mutex::new(recycle_receiver));
+            let mut pool: OverlayPool<RenderRequest, AsyncRenderResult> = OverlayPool::new();
+            pool.ensure_workers(overlay_pool_worker_target(1, threads), move || {
+                overlay_pool_render_job(Arc::clone(&recycle_receiver))
+            });
+            let mut arrivals_ms = Vec::new();
+            for iteration in 0..ITERS {
+                let volume = overlay_perf_volume(&format!("KS{iteration:02}"));
+                let start = Instant::now();
+                let request = overlay_perf_request(volume, LaneId::Overlay(0));
+                pool.submit(request.lane, request).expect("pool alive");
+                loop {
+                    assert!(start.elapsed() < timeout, "single arm timed out");
+                    if pool.try_recv().is_ok() {
+                        arrivals_ms.push(start.elapsed().as_secs_f32() * 1000.0);
+                        break;
+                    }
+                    thread::yield_now();
+                }
+            }
+            arrivals_ms
+        };
+
+        println!(
+            "overlay first-pixels smoke ({threads} threads, {OVERLAYS} overlays, {ITERS} iters, 1920x1080, cache-cold)"
+        );
+        println!(
+            "  pre-4b thread-per-layer ({OVERLAYS} workers): {}",
+            summarize_ms(&per_layer_arrivals_ms)
+        );
+        println!(
+            "  4b shared pool (target {pool_target} workers):  {}",
+            summarize_ms(&pool_arrivals_ms)
+        );
+        println!(
+            "  4b pool at low-core bound ({low_core_target} workers): {}",
+            summarize_ms(&low_core_arrivals_ms)
+        );
+        println!(
+            "  4b pool, single overlay:                {}",
+            summarize_ms(&single_arrivals_ms)
+        );
+    }
+
     fn summarize_ms(values: &[f32]) -> String {
         if values.is_empty() {
             return "n=0".to_owned();
@@ -54934,7 +55255,7 @@ mod tests {
     }
 
     #[test]
-    fn radar_overlay_layer_starts_visible_with_independent_workers() {
+    fn radar_overlay_layer_starts_visible_and_unrendered() {
         let site = RadarSite::new("KTLX");
         let layer = RadarOverlayLayer::new(7, site);
 
@@ -54946,6 +55267,96 @@ mod tests {
         assert!(layer.texture.is_none());
         assert!(layer.load_receiver.is_none());
         assert!(layer.pending_render_key.is_none());
+    }
+
+    /// Phase-4b pin: shared-pool overlay results route by lane id with the
+    /// pre-4b per-layer accept rules — latest-ok installs, stale-ok
+    /// recycles, latest-err clears pending + status, and a retired lane
+    /// (layer removed mid-flight) recycles instead of installing.
+    #[test]
+    fn overlay_pool_results_route_by_lane_with_pre_4b_accept_rules() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let (recycle_sender, recycle_receiver) = mpsc::channel::<RenderRecycleBuffer>();
+        app.overlay_render_recycle_sender = recycle_sender;
+        let ctx = egui::Context::default();
+        let product = DisplayProduct::Moment(MomentType::Reflectivity);
+
+        let mut layer = RadarOverlayLayer::new(9, RadarSite::new("KTLX"));
+        let pending_key = test_screen_texture_key(1, 0, product.clone());
+        layer.pending_render_key = Some(pending_key.clone());
+        app.radar_layers.push(layer);
+
+        let rendered = |width: usize, height: usize| RenderedTexture {
+            width,
+            height,
+            rgba: vec![0; width * height * 4],
+            buffer_signature: test_viewport_signature(width as u32),
+            render_ms: 1.0,
+            worker_ms: 1.0,
+            sample_cache_build_ms: None,
+            used_sample_cache: false,
+            radar_range_km: DEFAULT_RADAR_RANGE_KM,
+        };
+
+        // Retired lane: no layer with id 404 — the buffer must recycle and
+        // the live layer must stay untouched.
+        app.install_overlay_render_result(
+            &ctx,
+            AsyncRenderResult {
+                key: pending_key.clone(),
+                lane: LaneId::Overlay(404),
+                result: Ok(rendered(4, 4)),
+            },
+        );
+        assert!(recycle_receiver.try_recv().is_ok());
+        assert_eq!(
+            app.radar_layers[0].pending_render_key.as_ref(),
+            Some(&pending_key)
+        );
+
+        // Stale key for the live lane: recycle, never install.
+        app.install_overlay_render_result(
+            &ctx,
+            AsyncRenderResult {
+                key: test_screen_texture_key(2, 0, product.clone()),
+                lane: LaneId::Overlay(9),
+                result: Ok(rendered(4, 4)),
+            },
+        );
+        assert!(recycle_receiver.try_recv().is_ok());
+        assert!(app.radar_layers[0].texture.is_none());
+        assert_eq!(
+            app.radar_layers[0].pending_render_key.as_ref(),
+            Some(&pending_key)
+        );
+
+        // Latest key installs the texture and recycles the buffer after the
+        // upload.
+        app.install_overlay_render_result(
+            &ctx,
+            AsyncRenderResult {
+                key: pending_key.clone(),
+                lane: LaneId::Overlay(9),
+                result: Ok(rendered(720, 480)),
+            },
+        );
+        assert!(app.radar_layers[0].pending_render_key.is_none());
+        assert!(app.radar_layers[0].texture.is_some());
+        assert_eq!(app.radar_layers[0].texture_key.as_ref(), Some(&pending_key));
+        assert!(recycle_receiver.try_recv().is_ok());
+
+        // Latest-err clears pending and reports on the LAYER's status line.
+        app.radar_layers[0].pending_render_key = Some(pending_key.clone());
+        app.install_overlay_render_result(
+            &ctx,
+            AsyncRenderResult {
+                key: pending_key,
+                lane: LaneId::Overlay(9),
+                result: Err("boom".to_owned()),
+            },
+        );
+        assert!(app.radar_layers[0].pending_render_key.is_none());
+        assert_eq!(app.radar_layers[0].status, "Render failed: boom");
     }
 
     #[test]
@@ -68663,6 +69074,9 @@ mod tests {
             render_recycle_sender,
             pending_render_key: None,
             loop_prewarm: PrewarmPool::disconnected(),
+            overlay_render_pool: OverlayPool::new(),
+            overlay_render_recycle_sender: mpsc::channel().0,
+            overlay_render_recycle_receiver: Arc::new(Mutex::new(mpsc::channel().1)),
             loop_render_cache: VecDeque::new(),
             loop_render_cache_bytes: 0,
             loop_prewarm_inflight: Vec::new(),

@@ -5,7 +5,12 @@
 //! ([`LaneId`]), the per-lane drain budgets and stop rule ([`DrainBudget`]),
 //! the post-drain repaint policy ([`post_drain_repaint`]), the one documented
 //! routing-policy site ([`render_route_for`]), and the prewarm pool's channel
-//! plumbing ([`PrewarmPool`]). The render workers themselves (they render
+//! plumbing ([`PrewarmPool`]).
+//!
+//! **4b scope (step 2 — the overlay pool flip, its own revertible commit):**
+//! the shared overlay pool's channel plumbing ([`OverlayPool`], per-lane
+//! coalescing via [`merge_lane_request`]) and its worker bound
+//! ([`overlay_pool_worker_target`]). The render jobs themselves (they render
 //! app-typed `RenderRequest`s) still live in `app_ui` and migrate here in
 //! later Phase-4 slices; `app_ui` keeps thin typed adapters until then.
 //!
@@ -21,21 +26,23 @@
 //! - When the budget stops a drain mid-pass, the drain must request a repaint
 //!   (messages may still be queued); the app-side drains do this inline.
 
+use std::collections::VecDeque;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 /// One render-result stream, as the drains see it (spec §4.2).
 ///
 /// - `Primary` — the interactive primary view. Extra panes ride the SAME
-///   channel today (`RenderRequest.pane != 0`); they become `Pane(n)` lanes
-///   when the pane field migrates onto `LaneId` (Phase 4b+).
+///   channel (`RenderRequest.lane != Primary` routes to the pane installer);
+///   the legacy `pane: usize` field became this lane in Phase 4b slice 1
+///   (`Primary` = legacy pane 0, `Pane(n)` = legacy nonzero pane id `n`).
 /// - `Pane(n)` — extra view pane `n` (1-based, matching today's nonzero
 ///   `pane` ids: pane `n` renders into `extra_panes[n - 1]`).
-/// - `Overlay(id)` — one radar overlay layer. Until the 4b pool flip every
-///   overlay layer still owns its worker + channel; the id keys per-lane
-///   coalescing once the shared overlay pool lands.
+/// - `Overlay(id)` — one radar overlay layer. Since the 4b pool flip all
+///   overlay lanes share one [`OverlayPool`]; the id keys the pool's
+///   per-lane coalescing and routes results back to the layer.
 /// - `Prewarm` — speculative loop-cache renders. Its drain is NOT unified
 ///   with the other lanes: results land in the loop render cache instead of
 ///   installing textures (migration table §6, `loop_prewarm_receiver` row).
@@ -147,22 +154,48 @@ pub enum RenderRoute {
     /// The one coalescing interactive worker (Primary cache mode). Kept a
     /// single worker so overlay bursts can never starve the primary view.
     Interactive,
-    /// Until the Phase-4b pool flip, each overlay layer owns its own worker
-    /// (Overlay cache mode); 4b replaces these with one shared overlay pool.
+    /// Pre-4b routing: each overlay layer owned its own worker thread
+    /// (Overlay cache mode). No lane routes here since the Phase-4b flip;
+    /// the variant is kept as the documented revert target (see
+    /// [`render_route_for`]).
     OverlayOwned,
+    /// The shared overlay pool ([`OverlayPool`], Overlay cache mode):
+    /// K workers over one per-lane-coalescing queue (Phase-4b flip).
+    OverlayPool,
     /// The shared prewarm pool ([`PrewarmPool`], Overlay cache mode).
     Prewarm,
 }
 
 /// THE one documented render-routing policy site (spec §4.2 step 1). The
 /// pre-4a routing was implicit in which sender each call site held; new code
-/// consults this function, and the Phase-4b pool flip edits ONLY this map.
+/// consults this function, and the Phase-4b pool flip edited ONLY this map
+/// (plus the app-side worker ownership the map describes).
+///
+/// REVERT PATH for the Phase-4b overlay flip (spec §12 decision 1 — the
+/// flip is gated and individually revertible): `git revert` the single 4b
+/// flip commit. That commit is the only place that (a) changed the
+/// `Overlay` arm below from `RenderRoute::OverlayOwned` to
+/// `RenderRoute::OverlayPool`, and (b) replaced the per-layer
+/// `spawn_overlay_render_worker` fields on `RadarOverlayLayer` with the
+/// shared [`OverlayPool`] in `app_ui`. Reverting it restores
+/// thread-per-overlay exactly.
 pub fn render_route_for(lane: LaneId) -> RenderRoute {
     match lane {
         LaneId::Primary | LaneId::Pane(_) => RenderRoute::Interactive,
-        LaneId::Overlay(_) => RenderRoute::OverlayOwned,
+        LaneId::Overlay(_) => RenderRoute::OverlayPool,
         LaneId::Prewarm => RenderRoute::Prewarm,
     }
+}
+
+/// Worker count for the shared overlay pool (spec §4.2): never more workers
+/// than overlay layers, bounded by [`loop_prewarm_worker_count`] — the ONE
+/// thread-count sizing table (deliberately not a new table). On 2-4 core
+/// machines this caps overlay rendering at 2 threads where thread-per-layer
+/// used to run up to 10 (the overlay layer cap), which is what keeps the
+/// primary lane's worker and the UI thread from being starved at low core
+/// counts.
+pub fn overlay_pool_worker_target(overlay_layers: usize, threads: usize) -> usize {
+    overlay_layers.min(loop_prewarm_worker_count(threads))
 }
 
 /// Prewarm worker count for a machine with `threads` effective worker
@@ -271,6 +304,179 @@ impl<Req, Res> PrewarmPool<Req, Res> {
     }
 }
 
+/// Merge a request into a per-lane-coalescing queue: a newer request
+/// REPLACES the queued one for the SAME lane in place (keeping its queue
+/// position), and never displaces another lane's request. This is exactly
+/// `app_ui`'s `merge_render_request` discipline, lifted so the shared
+/// overlay pool queue and the interactive worker queue obey one rule.
+pub fn merge_lane_request<Req>(queue: &mut VecDeque<(LaneId, Req)>, lane: LaneId, request: Req) {
+    if let Some(slot) = queue.iter_mut().find(|(queued, _)| *queued == lane) {
+        slot.1 = request;
+    } else {
+        queue.push_back((lane, request));
+    }
+}
+
+struct OverlayQueue<Req> {
+    state: Mutex<OverlayQueueState<Req>>,
+    ready: Condvar,
+}
+
+struct OverlayQueueState<Req> {
+    queue: VecDeque<(LaneId, Req)>,
+    shutdown: bool,
+}
+
+/// The pool has no live queue: the mutex was poisoned (a worker panicked
+/// while holding it) or the pool is shutting down. The owner treats this
+/// like the old per-layer "render worker disconnected" send failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OverlayPoolClosed;
+
+/// The Phase-4b shared overlay render pool (spec §4.2 step 2): K workers
+/// over ONE queue with PER-LANE coalescing ([`merge_lane_request`]).
+///
+/// Why not [`PrewarmPool`]: prewarm requests are all distinct keys throttled
+/// by an in-flight limit, so its plain FIFO never needs to drop anything.
+/// Overlay requests are the opposite — during a zoom/pan burst each layer
+/// re-requests every frame, and a stale queued render must never win over a
+/// newer one. Pre-4b, each layer's own serial worker gave it a single
+/// newest-wins queue slot; the shared queue reproduces exactly that (one
+/// slot per lane), so layer A's pending request is never starved or
+/// replaced by layer B's, pinned by the tests below.
+///
+/// Contract:
+/// - Workers pop front (FIFO across lanes), run the job OUTSIDE the queue
+///   lock, and send the result; the owner drains results per frame.
+/// - Workers spawn lazily via [`OverlayPool::ensure_workers`] and are never
+///   torn down until the pool drops; the count only grows, bounded by the
+///   caller ([`overlay_pool_worker_target`]).
+/// - Results never report `Disconnected` while the pool is alive (the pool
+///   keeps a sender for future workers); worker death therefore cannot be
+///   observed on the result channel. The job must not panic — the app's
+///   render job returns `Result` for every failure it knows about.
+/// - Dropping the pool cancels cleanly: the shutdown flag + notify wakes
+///   every idle worker to exit; in-flight results fail their send and that
+///   worker exits.
+pub struct OverlayPool<Req, Res> {
+    queue: Arc<OverlayQueue<Req>>,
+    result_sender: mpsc::Sender<Res>,
+    result_receiver: mpsc::Receiver<Res>,
+    workers: usize,
+}
+
+impl<Req, Res> OverlayPool<Req, Res>
+where
+    Req: Send + 'static,
+    Res: Send + 'static,
+{
+    /// An empty pool with no workers. Submissions queue up (and coalesce)
+    /// until [`OverlayPool::ensure_workers`] spawns someone to serve them.
+    pub fn new() -> Self {
+        let (result_sender, result_receiver) = mpsc::channel::<Res>();
+        Self {
+            queue: Arc::new(OverlayQueue {
+                state: Mutex::new(OverlayQueueState {
+                    queue: VecDeque::new(),
+                    shutdown: false,
+                }),
+                ready: Condvar::new(),
+            }),
+            result_sender,
+            result_receiver,
+            workers: 0,
+        }
+    }
+
+    /// Workers spawned so far (monotonic).
+    pub fn worker_count(&self) -> usize {
+        self.workers
+    }
+
+    /// Spawn workers until `target` are alive. `make_job` runs ON each new
+    /// worker thread to build that worker's job closure (worker-local render
+    /// caches live in the closure), which is then called once per request —
+    /// the same factory shape as [`PrewarmPool::spawn`].
+    pub fn ensure_workers<Job, MakeJob>(&mut self, target: usize, make_job: MakeJob)
+    where
+        Job: FnMut(Req) -> Res,
+        MakeJob: Fn() -> Job + Clone + Send + 'static,
+    {
+        while self.workers < target {
+            let queue = Arc::clone(&self.queue);
+            let result_sender = self.result_sender.clone();
+            let make_job = make_job.clone();
+            thread::spawn(move || {
+                let mut job = make_job();
+                loop {
+                    let request = {
+                        let Ok(mut state) = queue.state.lock() else {
+                            break;
+                        };
+                        loop {
+                            if state.shutdown {
+                                return;
+                            }
+                            if let Some((_, request)) = state.queue.pop_front() {
+                                break request;
+                            }
+                            let Ok(next) = queue.ready.wait(state) else {
+                                return;
+                            };
+                            state = next;
+                        }
+                    };
+                    if result_sender.send(job(request)).is_err() {
+                        break;
+                    }
+                }
+            });
+            self.workers += 1;
+        }
+    }
+
+    /// Queue one request for `lane`, superseding the lane's queued older
+    /// request if one is still waiting ([`merge_lane_request`]).
+    pub fn submit(&self, lane: LaneId, request: Req) -> Result<(), OverlayPoolClosed> {
+        let Ok(mut state) = self.queue.state.lock() else {
+            return Err(OverlayPoolClosed);
+        };
+        if state.shutdown {
+            return Err(OverlayPoolClosed);
+        }
+        merge_lane_request(&mut state.queue, lane, request);
+        drop(state);
+        self.queue.ready.notify_one();
+        Ok(())
+    }
+
+    /// Non-blocking result poll, for the owner's per-frame drain. Never
+    /// `Disconnected` while the pool is alive (see the type doc).
+    pub fn try_recv(&self) -> Result<Res, mpsc::TryRecvError> {
+        self.result_receiver.try_recv()
+    }
+}
+
+impl<Req, Res> Default for OverlayPool<Req, Res>
+where
+    Req: Send + 'static,
+    Res: Send + 'static,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<Req, Res> Drop for OverlayPool<Req, Res> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.queue.state.lock() {
+            state.shutdown = true;
+            state.queue.clear();
+        }
+        self.queue.ready.notify_all();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,14 +544,114 @@ mod tests {
     }
 
     #[test]
-    fn render_routes_match_pre_4b_ownership() {
+    fn render_routes_match_post_4b_ownership() {
         assert_eq!(render_route_for(LaneId::Primary), RenderRoute::Interactive);
         assert_eq!(render_route_for(LaneId::Pane(1)), RenderRoute::Interactive);
+        // The Phase-4b flip: overlays share one pool. Reverting the flip
+        // commit puts this back to RenderRoute::OverlayOwned.
         assert_eq!(
             render_route_for(LaneId::Overlay(7)),
-            RenderRoute::OverlayOwned
+            RenderRoute::OverlayPool
         );
         assert_eq!(render_route_for(LaneId::Prewarm), RenderRoute::Prewarm);
+    }
+
+    #[test]
+    fn overlay_pool_worker_target_is_layers_capped_by_the_prewarm_table() {
+        // Low-core machines (2-4 threads): at most 2 overlay workers, even
+        // with a 4-overlay storm scene — thread-per-layer would have used 4.
+        assert_eq!(overlay_pool_worker_target(4, 2), 2);
+        assert_eq!(overlay_pool_worker_target(4, 4), 2);
+        // Mid/high core counts follow the prewarm table (3 at 8, 4 at 16+).
+        assert_eq!(overlay_pool_worker_target(4, 8), 3);
+        assert_eq!(overlay_pool_worker_target(4, 16), 4);
+        assert_eq!(overlay_pool_worker_target(10, 32), 4);
+        // Never more workers than layers; zero layers need zero workers.
+        assert_eq!(overlay_pool_worker_target(1, 16), 1);
+        assert_eq!(overlay_pool_worker_target(0, 16), 0);
+    }
+
+    #[test]
+    fn merge_lane_request_replaces_same_lane_in_place() {
+        let mut queue: VecDeque<(LaneId, u32)> = VecDeque::new();
+        merge_lane_request(&mut queue, LaneId::Overlay(1), 10);
+        merge_lane_request(&mut queue, LaneId::Overlay(2), 20);
+        // A newer request for lane 1 supersedes its queued older one and
+        // keeps its position — lane 2 is neither displaced nor delayed.
+        merge_lane_request(&mut queue, LaneId::Overlay(1), 11);
+        assert_eq!(
+            queue,
+            VecDeque::from([(LaneId::Overlay(1), 11), (LaneId::Overlay(2), 20)])
+        );
+        // A third lane queues behind both.
+        merge_lane_request(&mut queue, LaneId::Overlay(3), 30);
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue[2], (LaneId::Overlay(3), 30));
+    }
+
+    #[test]
+    fn overlay_pool_coalesces_per_lane_while_no_worker_is_free() {
+        // Submit before any worker exists: the queue must hold exactly one
+        // slot per lane, newest request winning within a lane.
+        let mut pool: OverlayPool<u32, (LaneId, u32)> = OverlayPool::new();
+        pool.submit(LaneId::Overlay(1), 1).expect("pool alive");
+        pool.submit(LaneId::Overlay(2), 2).expect("pool alive");
+        pool.submit(LaneId::Overlay(1), 3).expect("pool alive");
+
+        // One worker drains the queue in FIFO-across-lanes order.
+        pool.ensure_workers(1, || {
+            |request: u32| {
+                let lane = if request == 2 {
+                    LaneId::Overlay(2)
+                } else {
+                    LaneId::Overlay(1)
+                };
+                (lane, request)
+            }
+        });
+        assert_eq!(pool.worker_count(), 1);
+
+        let mut results = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while results.len() < 2 && Instant::now() < deadline {
+            match pool.try_recv() {
+                Ok(result) => results.push(result),
+                Err(mpsc::TryRecvError::Empty) => thread::yield_now(),
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        // Lane 1's stale request (1) never rendered; its newer request (3)
+        // kept lane 1's queue position ahead of lane 2's untouched request.
+        assert_eq!(
+            results,
+            vec![(LaneId::Overlay(1), 3), (LaneId::Overlay(2), 2)]
+        );
+    }
+
+    #[test]
+    fn overlay_pool_round_trips_across_workers_and_drops_cleanly() {
+        let mut pool: OverlayPool<u32, u32> = OverlayPool::new();
+        pool.ensure_workers(2, || |request: u32| request * 2);
+        pool.ensure_workers(2, || |request: u32| request * 2); // idempotent
+        assert_eq!(pool.worker_count(), 2);
+        for value in 0..4u32 {
+            pool.submit(LaneId::Overlay(u64::from(value)), value)
+                .expect("pool alive");
+        }
+        let mut results = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while results.len() < 4 && Instant::now() < deadline {
+            match pool.try_recv() {
+                Ok(result) => results.push(result),
+                Err(mpsc::TryRecvError::Empty) => thread::yield_now(),
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        results.sort_unstable();
+        assert_eq!(results, vec![0, 2, 4, 6]);
+        // Dropping the pool wakes idle workers to exit; the test completing
+        // without a hang is the assertion.
+        drop(pool);
     }
 
     #[test]
