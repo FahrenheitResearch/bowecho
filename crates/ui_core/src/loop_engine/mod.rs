@@ -20,14 +20,17 @@
 //! | `feed.rs` | `FeedSource`/`ArchiveWindow`, `switch_policy`, settings shims |
 //! | `policy.rs` | `SelectionPolicy` (census D5 fine print), `HistoryLimits` (D8), byte estimates |
 //! | `install.rs` | `install_frame`/`install_batch` (D1-D3, D6-D9, D12, D16), trims, `clear_history` |
+//! | `advance.rs` | `advance_loop`/`StepOutcome`/`SweepContext` — the ONE loop stepper |
 //! | `liveness.rs` | `Liveness`, cadence-aware stale floor, `poll_cadence` |
 
+mod advance;
 mod feed;
 mod frame_history;
 mod install;
 mod liveness;
 mod policy;
 
+pub use advance::{StepOutcome, SweepContext};
 pub use feed::{ArchiveWindow, FeedSource, SwitchAction, switch_policy};
 pub use frame_history::{
     DecodedLoad, DecodedLoadBatch, FrameHistory, FrameHistoryEntry, FrameIdentity, FrameStatus,
@@ -43,8 +46,8 @@ pub use liveness::{
 };
 pub use policy::{
     DEFAULT_HISTORY_FRAME_LIMIT, HistoryLimits, MAX_HISTORY_FRAME_LIMIT, MIN_HISTORY_FRAME_LIMIT,
-    OVERLAY_HISTORY_BYTE_BUDGET, PANE_HISTORY_BYTE_BUDGET, SelectionPolicy, estimated_entry_bytes,
-    estimated_volume_bytes,
+    OVERLAY_HISTORY_BYTE_BUDGET, PANE_HISTORY_BYTE_BUDGET, PRIMARY_HISTORY_BYTE_BUDGET,
+    SelectionPolicy, estimated_entry_bytes, estimated_volume_bytes,
 };
 
 use std::time::Instant;

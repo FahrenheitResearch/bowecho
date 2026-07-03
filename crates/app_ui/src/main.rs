@@ -91,11 +91,23 @@ use ui_core::geo::{aeqd_forward_km, aeqd_inverse_km};
 // re-exports keep every existing `crate::…` reference — main.rs and the
 // sibling modules — compiling unchanged. Runtime behavior identical.
 pub(crate) use ui_core::loop_engine::{
-    DEFAULT_HISTORY_FRAME_LIMIT, DecodedLoad, DecodedLoadBatch, FrameHistory, FrameHistoryEntry,
-    FrameIdentity, FrameStatus, INTL_POLL_SECONDS, INTL_STALE_CHIP_FLOOR_SECONDS, LoadTimings,
-    MAX_HISTORY_FRAME_LIMIT, frame_history_entry_from_decoded, frame_identity_for_volume,
-    frame_status_priority, history_contains_other_site, live_partial_frame_has_new_data,
+    DecodedLoad, DecodedLoadBatch, FrameHistoryEntry, FrameIdentity, FrameStatus,
+    INTL_POLL_SECONDS, INTL_STALE_CHIP_FLOOR_SECONDS, LoadTimings, MAX_HISTORY_FRAME_LIMIT,
+    frame_history_entry_from_decoded, frame_identity_for_volume, frame_status_priority,
+    history_contains_other_site, live_partial_frame_has_new_data,
 };
+// The default frame limit is reached through the engine everywhere in
+// production code (4e stage (i): `normalized_history_limit` delegates to
+// `HistoryLimits::normalized_frame_limit`); the bare name survives for the
+// tests that pin the default.
+#[cfg(test)]
+pub(crate) use ui_core::loop_engine::DEFAULT_HISTORY_FRAME_LIMIT;
+// `FrameHistory` itself is now reached only through `self.primary.history`
+// (Phase 4e stage (i) moved the loose primary `frame_history` field into
+// the engine); the type name survives as a crate re-export solely for the
+// test modules that build histories directly (main.rs + overlays.rs).
+#[cfg(test)]
+pub(crate) use ui_core::loop_engine::FrameHistory;
 // v0.29 Phase 4c overlay adoption + 4d pane adoption: radar overlay layers
 // were the FIRST view on the engine, extra panes the SECOND (spec §7
 // adoption order overlays → panes → primary). The primary path still runs
@@ -198,8 +210,10 @@ const PERF_SAMPLE_CAPACITY: usize = 96;
 const STALE_LATEST_DISPLAY_CLEAR_SECONDS: i64 = 15 * 60;
 // Invariant: HISTORY_SIZE_OPTIONS[0] must equal
 // ui_core::loop_engine::MIN_HISTORY_FRAME_LIMIT — `normalized_history_limit`
-// (here) and the engine's `HistoryLimits::normalized_frame_limit` clamp to
-// the same floor. DEFAULT/MAX moved to ui_core (re-exported above).
+// delegates to the engine's `HistoryLimits::normalized_frame_limit`, whose
+// floor is that constant (pinned by
+// `history_size_options_reach_96_without_changing_default`). DEFAULT/MAX
+// moved to ui_core (re-exported above).
 const HISTORY_SIZE_OPTIONS: &[usize] = &[
     3, 5, 7, 10, 15, 20, 25, 30, 48, 72, 96, 128, 160, 200, 256, 384, 512, 768, 1000, 1500, 2000,
 ];
@@ -1633,8 +1647,39 @@ struct ViewerApp {
     selected_cut: usize,
     selected_product: DisplayProduct,
     advanced_products_enabled: bool,
-    frame_history: FrameHistory,
-    selected_frame_index: usize,
+    /// The primary view's loop engine (`EngineRole::Primary`, `EngineId(0)`
+    /// — the session-monotonic layer/pane counter starts at 1, so 0 is
+    /// reserved for the primary forever).
+    ///
+    /// v0.29 Phase 4e stage (i) — MECHANICAL. The legacy loose fields moved
+    /// here as pure field-path renames (spec §8):
+    /// `frame_history` → `primary.history`;
+    /// `selected_frame_index`/`history_playing`/`browsing_history`/
+    /// `last_history_step` → `primary.cursor.{index,playing,browsing,last_step}`
+    /// (`browsing` = latched while the user examines an OLDER frame: live
+    /// loads keep backfilling but never steal the selection back to the
+    /// newest frame; cleared by clicking the newest frame, looping, or
+    /// loading a new site);
+    /// `history_frame_limit` → `primary.limits.frame_limit`;
+    /// `poll_source` → `primary.feed` (the `PollSource` enum died into
+    /// [`FeedSource`]: `CustomUrl` ↔ `CustomUrl`, `Intl` ↔
+    /// `Live(SiteRef::Intl)`; the primary feed is ONLY ever one of those
+    /// two variants until the stage-(ii) unify);
+    /// `poll_last_file` → `primary.live.dedupe_key`;
+    /// `realtime_level2_auto_refresh`/`last_realtime_level2_refresh` →
+    /// `primary.live.{enabled,last_refresh}`.
+    ///
+    /// The legacy install/advance/liveness BODIES still own every
+    /// composite semantic (clears, upserts, trims, stepping, chip truth)
+    /// until stage (ii) re-routes them onto the engine methods behind the
+    /// differential gate — until then the engine-doc rule "composite ops
+    /// go through engine methods" is deliberately suspended for THIS
+    /// instance, and `primary.limits.byte_budget` is wired but inert.
+    /// `poll_active` stays a loose feed-adjacent field below: its engine
+    /// home would be `live.enabled`, which this stage assigns to
+    /// `realtime_level2_auto_refresh` per spec §8 — the two flags are
+    /// independent booleans today and merging them is stage-(ii) work.
+    primary: LoopEngine,
     low_sweep_disabled_cuts: BTreeSet<LowSweepCutKey>,
     manual_primary_cut_hold: Option<LowSweepCutKey>,
     product_cut_memory: BTreeMap<String, usize>,
@@ -1674,13 +1719,6 @@ struct ViewerApp {
     /// One-shot: force the Settings color-tables fold open (set by the
     /// product color row's "Edit…" jump).
     open_color_tables_request: bool,
-    /// Latched while the user is examining an OLDER frame: live loads keep
-    /// backfilling but never steal the selection back to the newest frame.
-    /// Cleared by clicking the newest frame, looping, or loading a new site.
-    browsing_history: bool,
-    history_frame_limit: usize,
-    history_playing: bool,
-    last_history_step: Option<Instant>,
     color_tables: ColorTableSet,
     /// User .pal tables scanned from `settings::color_tables_dir()` ("My
     /// tables"): (family from the `Product:` header, parsed table).
@@ -1950,8 +1988,11 @@ struct ViewerApp {
     custom_poll_site_input: String,
     custom_poll_lat_input: String,
     custom_poll_lon_input: String,
+    /// True while the shared poller (custom-URL or intl — whichever
+    /// `primary.feed` names) is running. Feed-adjacent loose field through
+    /// Phase 4e stage (i); see the `primary` field doc for why it has not
+    /// merged into `primary.live.enabled` yet.
     poll_active: bool,
-    poll_last_file: Option<String>,
     poll_next: Option<Instant>,
     poll_rx: Option<mpsc::Receiver<PolledVolumeResult>>,
     /// In-flight international Load Loop: a stream of (identity, volume)
@@ -1965,10 +2006,6 @@ struct ViewerApp {
     /// Requested frame count for the in-flight international Load Loop,
     /// used to paint determinate progress while frames stream in.
     intl_loop_requested: usize,
-    /// What the poller follows when `poll_active`: the custom URL
-    /// (default) or an international provider/site from data_source's
-    /// registry. One poll, two sources — see [`PollSource`].
-    poll_source: PollSource,
     /// International picker state (DATA tab): the provider whose site list
     /// is shown, the fetched catalog, and the in-flight background fetch
     /// (site listings hit the provider's HTTP catalog — never the UI
@@ -2179,9 +2216,7 @@ struct ViewerApp {
     /// saving disabled to protect it.
     styles_newer_schema: bool,
     hidden_hazard_families: BTreeSet<String>,
-    realtime_level2_auto_refresh: bool,
     display_live_chunk_updates: bool,
-    last_realtime_level2_refresh: Option<Instant>,
     live_refresh_skip_reason: Option<String>,
     live_hazard_auto_refresh: bool,
     show_performance_stats: bool,
@@ -3785,64 +3820,29 @@ type IntlSiteListResult = (
     std::result::Result<Vec<data_source::international::IntlSite>, String>,
 );
 
-/// What the shared poller follows. There is ONE poll: both variants share
-/// `poll_active` / `poll_rx` / `poll_last_file` / `poll_next` and the
-/// `install_polled_volume` install path, so every ownership guard — the
-/// auto-refresh skip in `maybe_refresh_realtime_level2`, the explicit-load
-/// pauses, history upsert + follow — applies to both identically.
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum PollSource {
-    /// GR2A-style dir.list root polling (the original custom-URL poll).
-    /// The payload records the URL the poll was STARTED with (persistence
-    /// and source-change detection); the live tick keeps following the
-    /// `poll_url` text field exactly as it always has.
-    CustomUrl(String),
-    /// A `data_source::international` registry feed: provider id
-    /// ([`data_source::international::IntlProvider::id`]) + its
-    /// provider-scoped site id.
-    Intl {
-        provider_id: String,
-        site_id: String,
-    },
-}
+// What the shared poller follows lives in `self.primary.feed` (v0.29 Phase
+// 4e stage (i)): the legacy two-variant `PollSource` enum died into
+// `ui_core::loop_engine::FeedSource` — `CustomUrl` ↔ `CustomUrl`, `Intl` ↔
+// `Live(SiteRef::Intl)`; `save_to_settings`/`intl_from_settings` live on
+// `FeedSource` with the identical per-variant write/restore behavior.
+// There is still ONE poll: both variants share `poll_active` / `poll_rx` /
+// `primary.live.dedupe_key` / `poll_next` and the `install_polled_volume`
+// install path, so every ownership guard — the auto-refresh skip in
+// `maybe_refresh_realtime_level2`, the explicit-load pauses, history
+// upsert + follow — applies to both identically.
 
-impl PollSource {
-    /// Persist the selection, mirroring `poll_url`'s behavior: each variant
-    /// writes only its own settings fields, so switching sources never
-    /// forgets the other one.
-    fn save_to_settings(&self, settings: &mut settings::AppSettings) {
-        match self {
-            PollSource::CustomUrl(url) => settings.poll_url = url.clone(),
-            PollSource::Intl {
-                provider_id,
-                site_id,
-            } => {
-                settings.intl_provider = provider_id.clone();
-                settings.intl_site = site_id.clone();
-            }
-        }
-    }
-
-    /// Rebuild the last session's international selection — `None` until
-    /// the user has ever started an international poll (mirrors how a
-    /// restored `poll_url` arms Start without auto-starting).
-    fn intl_from_settings(settings: &settings::AppSettings) -> Option<PollSource> {
-        let provider_id = settings.intl_provider.trim();
-        let site_id = settings.intl_site.trim();
-        (!provider_id.is_empty() && !site_id.is_empty()).then(|| PollSource::Intl {
-            provider_id: provider_id.to_owned(),
-            site_id: site_id.to_owned(),
-        })
-    }
-}
-
-fn diagnostic_poll_source_label(source: &PollSource) -> String {
+fn diagnostic_poll_source_label(source: &FeedSource) -> String {
     match source {
-        PollSource::CustomUrl(url) => format!("custom {}", diagnostic_url_label(url)),
-        PollSource::Intl {
+        FeedSource::CustomUrl(url) => format!("custom {}", diagnostic_url_label(url)),
+        FeedSource::Live(SiteRef::Intl {
             provider_id,
             site_id,
-        } => format!("intl {provider_id}/{site_id}"),
+        }) => format!("intl {provider_id}/{site_id}"),
+        // Unreachable through Phase 4e stage (i): the primary feed is only
+        // ever CustomUrl or Live(Intl) until the stage-(ii) unify.
+        FeedSource::Live(SiteRef::Us { level2_id }) => format!("us {level2_id}"),
+        FeedSource::Archive { site, .. } => format!("archive {}", site.settings_key()),
+        FeedSource::LocalFiles { label } => format!("local {label}"),
     }
 }
 
@@ -4003,7 +4003,7 @@ struct RotationMarker {
 /// ← `live` (the per-pane auto-refresh toggle; defaults ON — independent
 /// panes exist for storm-day multi-radar), `engine.live.last_refresh` ←
 /// `last_realtime_level2_refresh`, `engine.status` ← `status`,
-/// `engine.limits` ← the silent `self.history_frame_limit` read in the
+/// `engine.limits` ← the silent `self.primary.limits.frame_limit` read in the
 /// deleted `trim_extra_pane_history` (census D8: the primary's limit is
 /// now passed explicitly at construction and re-passed at every install).
 ///
@@ -4053,7 +4053,7 @@ impl PaneView {
     /// session-monotonic `ViewerApp::next_radar_layer_id` counter (shared
     /// with overlay engines — EngineIds are never reused within a session);
     /// `limits` is the SHARED history-limits handoff (census D8): the
-    /// caller passes `HistoryLimits::pane(self.history_frame_limit)` so the
+    /// caller passes `HistoryLimits::pane(self.primary.limits.frame_limit)` so the
     /// pane visibly starts on the primary's frame limit instead of silently
     /// reading it at trim time.
     fn new(engine_id: u64, slot: usize, product: DisplayProduct, limits: HistoryLimits) -> Self {
@@ -6132,7 +6132,14 @@ impl ViewerApp {
         let restored_poll_url = app_settings.poll_url.clone();
         // The ONE persisted owner key restores intl sessions (armed, never
         // auto-started); absent = the legacy CustomUrl seed.
-        let restored_primary_poll_source = restored_poll_source(&app_settings);
+        let restored_primary_feed = restored_primary_feed(&app_settings);
+        // Phase 4e stage (i): the primary loop engine, on the restored
+        // feed. `live.enabled` mirrors the legacy
+        // `realtime_level2_auto_refresh: true` startup default (the US
+        // auto-refresh switch), NOT the feed variant — see the `primary`
+        // field doc.
+        let mut primary = LoopEngine::new(EngineId(0), EngineRole::Primary, restored_primary_feed);
+        primary.live.enabled = true;
         // Re-arm the international picker on the last-used provider so the
         // saved site selection has its provider context back.
         let restored_intl_provider = app_settings.intl_provider.clone();
@@ -6209,8 +6216,7 @@ impl ViewerApp {
             selected_cut: 0,
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
             advanced_products_enabled: false,
-            frame_history: FrameHistory::new(),
-            selected_frame_index: 0,
+            primary,
             low_sweep_disabled_cuts: BTreeSet::new(),
             manual_primary_cut_hold: None,
             product_cut_memory: BTreeMap::new(),
@@ -6232,10 +6238,6 @@ impl ViewerApp {
             grid_composite_announce_status: false,
             open_color_tables_request: false,
             bold_labels: true,
-            browsing_history: false,
-            history_frame_limit: DEFAULT_HISTORY_FRAME_LIMIT,
-            history_playing: false,
-            last_history_step: None,
             color_tables: ColorTableSet::default(),
             user_color_tables: Vec::new(),
             palette_product_overrides: BTreeMap::new(),
@@ -6384,7 +6386,6 @@ impl ViewerApp {
             vol3d: vol3d::Vol3d::default(),
             wofs: wofs::WofsState::default(),
             farm: restored_farm,
-            poll_source: restored_primary_poll_source,
             intl_picker_provider: restored_intl_provider,
             intl_sites: None,
             intl_sites_rx: WorkerSlot::idle("intl-site-list"),
@@ -6408,7 +6409,6 @@ impl ViewerApp {
             custom_poll_lat_input: String::new(),
             custom_poll_lon_input: String::new(),
             poll_active: false,
-            poll_last_file: None,
             poll_next: None,
             poll_rx: None,
             intl_loop_rx: None,
@@ -6516,9 +6516,7 @@ impl ViewerApp {
             style_registry,
             styles_newer_schema: loaded_styles.newer_schema,
             hidden_hazard_families: default_hidden_hazard_families(),
-            realtime_level2_auto_refresh: true,
             display_live_chunk_updates: false,
-            last_realtime_level2_refresh: None,
             live_refresh_skip_reason: None,
             live_hazard_auto_refresh: true,
             show_performance_stats: false,
@@ -6729,7 +6727,7 @@ impl ViewerApp {
     }
 
     fn maybe_refresh_realtime_level2(&mut self, ctx: &egui::Context) {
-        if !self.realtime_level2_auto_refresh {
+        if !self.primary.live.enabled {
             return;
         }
         // An active poll (custom URL or international) owns the primary
@@ -6739,12 +6737,17 @@ impl ViewerApp {
         // refresh via maybe_refresh_radar_layers; coordinated archive overlays
         // deliberately remain owned by their master timeline.
         if self.poll_active && self.poll_source_armed() {
-            self.live_refresh_skip_reason = Some(match &self.poll_source {
-                PollSource::CustomUrl(_) => "custom URL poll owns the primary view".to_owned(),
-                PollSource::Intl {
+            self.live_refresh_skip_reason = Some(match &self.primary.feed {
+                FeedSource::CustomUrl(_) => "custom URL poll owns the primary view".to_owned(),
+                FeedSource::Live(SiteRef::Intl {
                     provider_id,
                     site_id,
-                } => format!("international poll {provider_id}/{site_id} owns the primary view"),
+                }) => format!("international poll {provider_id}/{site_id} owns the primary view"),
+                // The primary feed is only ever CustomUrl or Live(Intl) in
+                // Phase 4e stage (i) (see the `primary` field doc); the
+                // remaining FeedSource variants arrive with the stage-(ii)
+                // unify.
+                other => diagnostic_poll_source_label(other),
             });
             // Keep a heartbeat: with hazards/layers/playback all off, no
             // other path schedules repaints, and the poller's 15 s
@@ -6753,12 +6756,15 @@ impl ViewerApp {
             return;
         }
         if self.intl_source_owns_primary_display() {
-            self.live_refresh_skip_reason = Some(match &self.poll_source {
-                PollSource::Intl {
+            self.live_refresh_skip_reason = Some(match &self.primary.feed {
+                FeedSource::Live(SiteRef::Intl {
                     provider_id,
                     site_id,
-                } => format!("international source {provider_id}/{site_id} owns the primary view"),
-                PollSource::CustomUrl(_) => "custom URL source owns the primary view".to_owned(),
+                }) => format!("international source {provider_id}/{site_id} owns the primary view"),
+                FeedSource::CustomUrl(_) => "custom URL source owns the primary view".to_owned(),
+                // Stage-(i) invariant: primary feed is CustomUrl or
+                // Live(Intl) only (see the `primary` field doc).
+                other => diagnostic_poll_source_label(other),
             });
             ctx.request_repaint_after(Duration::from_secs(1));
             return;
@@ -6774,11 +6780,9 @@ impl ViewerApp {
             return;
         }
         let refresh_interval = self.primary_realtime_refresh_interval();
-        let should_refresh = self
-            .last_realtime_level2_refresh
-            .is_none_or(|last_refresh| {
-                last_refresh.elapsed() >= Duration::from_secs(refresh_interval)
-            });
+        let should_refresh = self.primary.live.last_refresh.is_none_or(|last_refresh| {
+            last_refresh.elapsed() >= Duration::from_secs(refresh_interval)
+        });
         if !should_refresh {
             ctx.request_repaint_after(Duration::from_secs(1));
             return;
@@ -6796,7 +6800,7 @@ impl ViewerApp {
     /// applies (an armed URL/international poll or an international archive
     /// display means the primary is not live-polling a catalog site).
     fn primary_live_poll_site_id(&self) -> Option<&str> {
-        if !self.realtime_level2_auto_refresh {
+        if !self.primary.live.enabled {
             return None;
         }
         if self.poll_active && self.poll_source_armed() {
@@ -6819,10 +6823,10 @@ impl ViewerApp {
     /// primary gets its own engine to compare feeds with (Phase 4e).
     fn primary_live_site_ref(&self) -> Option<SiteRef> {
         if self.intl_poll_owns_primary()
-            && let PollSource::Intl {
+            && let FeedSource::Live(SiteRef::Intl {
                 provider_id,
                 site_id,
-            } = &self.poll_source
+            }) = &self.primary.feed
         {
             return Some(SiteRef::Intl {
                 provider_id: provider_id.clone(),
@@ -6955,7 +6959,7 @@ impl ViewerApp {
     /// pane batch install, so history upsert/trim and browsing/playback
     /// guards all apply.
     fn follow_primary_volume_into_pane(&mut self, pane_slot: usize, ctx: &egui::Context) {
-        let Some(frame) = self.frame_history.last() else {
+        let Some(frame) = self.primary.history.last() else {
             return;
         };
         let Some(pane) = self.extra_panes.get(pane_slot) else {
@@ -7040,7 +7044,8 @@ impl ViewerApp {
         }
         if !Arc::ptr_eq(&volume, &active) {
             if let Some(frame) = self
-                .frame_history
+                .primary
+                .history
                 .iter_mut()
                 .find(|frame| frame.identity == active_identity)
             {
@@ -7135,7 +7140,8 @@ impl ViewerApp {
                 let changed = inserted > 0;
                 if changed {
                     if let Some(frame) = self
-                        .frame_history
+                        .primary
+                        .history
                         .iter_mut()
                         .find(|frame| frame.identity == active_identity)
                     {
@@ -7228,13 +7234,13 @@ impl ViewerApp {
 
     fn clear_frame_history(&mut self) {
         self.remember_current_primary_product_cut();
-        self.frame_history.clear();
-        self.selected_frame_index = 0;
+        self.primary.history.clear();
+        self.primary.cursor.index = 0;
         self.low_sweep_disabled_cuts.clear();
         self.manual_primary_cut_hold = None;
-        self.history_playing = false;
-        self.browsing_history = false;
-        self.last_history_step = None;
+        self.primary.cursor.playing = false;
+        self.primary.cursor.browsing = false;
+        self.primary.cursor.last_step = None;
         self.clear_loop_render_cache();
         self.storm_tracker = StormTracker::default();
         self.storm_tracks_site.clear();
@@ -7281,8 +7287,10 @@ impl ViewerApp {
         let ord_archive_loop =
             batch.frames.len() > 1 && batch.frames.iter().all(decoded_load_is_ord_archive_frame);
         if ord_archive_loop {
-            self.history_frame_limit = self
-                .history_frame_limit
+            self.primary.limits.frame_limit = self
+                .primary
+                .limits
+                .frame_limit
                 .max(batch.frames.len())
                 .min(MAX_HISTORY_FRAME_LIMIT);
         }
@@ -7296,8 +7304,10 @@ impl ViewerApp {
                 .all(|frame| frame.status == FrameStatus::Local)
             && std::mem::take(&mut self.pending_local_autoplay);
         if local_autoplay {
-            self.history_frame_limit = self
-                .history_frame_limit
+            self.primary.limits.frame_limit = self
+                .primary
+                .limits
+                .frame_limit
                 .max(batch.frames.len())
                 .min(MAX_HISTORY_FRAME_LIMIT);
         }
@@ -7316,13 +7326,13 @@ impl ViewerApp {
             .volume
             .as_ref()
             .is_some_and(|volume| volume.site.id != selected_site_id)
-            || history_contains_other_site(&self.frame_history, &selected_site_id)
+            || history_contains_other_site(&self.primary.history, &selected_site_id)
         {
             // Diagnostic: a surprise clear here is the "every frame
             // replaces the previous" failure mode — make it visible.
             self.status = format!(
                 "history reset (site change to {selected_site_id}, had {} frames)",
-                self.frame_history.len()
+                self.primary.history.len()
             );
             self.clear_frame_history();
         }
@@ -7330,22 +7340,24 @@ impl ViewerApp {
         for decoded in batch.frames {
             self.upsert_history_frame(decoded);
         }
-        self.frame_history
+        self.primary
+            .history
             .sort_by(|left, right| left.identity.cmp(&right.identity));
         self.trim_frame_history();
 
         let display_is_blank = self.volume.is_none();
         let should_select_loaded_frame = select_loaded_frame
-            && !self.history_playing
-            && (!self.browsing_history || display_is_blank);
+            && !self.primary.cursor.playing
+            && (!self.primary.cursor.browsing || display_is_blank);
         if should_select_loaded_frame {
             let next_index = self
-                .frame_history
+                .primary
+                .history
                 .iter()
                 .position(|frame| frame.identity == selected_identity)
-                .unwrap_or_else(|| self.frame_history.len().saturating_sub(1));
+                .unwrap_or_else(|| self.primary.history.len().saturating_sub(1));
             let preserve_active_frame_cut = active_identity.as_ref() == Some(&selected_identity)
-                && self.frame_history.get(next_index).is_some_and(|frame| {
+                && self.primary.history.get(next_index).is_some_and(|frame| {
                     active_volume_ptr == Some(Arc::as_ptr(&frame.volume) as usize)
                 });
             let previous_cut = self.selected_cut;
@@ -7353,23 +7365,24 @@ impl ViewerApp {
             let require_selected_cut = self
                 .manual_primary_cut_hold
                 .as_ref()
-                .zip(self.frame_history.get(next_index))
+                .zip(self.primary.history.get(next_index))
                 .is_some_and(|(hold, frame)| hold.identity == frame.identity);
             if should_defer_live_partial_selection_for_active_product(
                 self.volume.as_deref(),
                 self.selected_cut,
                 &self.selected_product,
-                self.frame_history.get(next_index),
+                self.primary.history.get(next_index),
                 require_selected_cut,
             ) {
-                self.selected_frame_index = active_identity
+                self.primary.cursor.index = active_identity
                     .clone()
                     .and_then(|identity| {
-                        self.frame_history
+                        self.primary
+                            .history
                             .iter()
                             .position(|frame| frame.identity == identity)
                     })
-                    .unwrap_or(self.selected_frame_index);
+                    .unwrap_or(self.primary.cursor.index);
                 self.status = format!(
                     "Waiting for {} in {}",
                     self.selected_product.label(),
@@ -7379,7 +7392,7 @@ impl ViewerApp {
                 return false;
             }
             if display_is_blank {
-                self.browsing_history = false;
+                self.primary.cursor.browsing = false;
             }
             let select_first_low_sweep =
                 !preserve_active_frame_cut && active_identity.as_ref() != Some(&selected_identity);
@@ -7402,11 +7415,12 @@ impl ViewerApp {
             true
         } else if let Some(active_identity) = active_identity
             && let Some(index) = self
-                .frame_history
+                .primary
+                .history
                 .iter()
                 .position(|frame| frame.identity == active_identity)
         {
-            self.selected_frame_index = index;
+            self.primary.cursor.index = index;
             self.status = format!("Backfilled {}", selected_identity.site_id);
             ctx.request_repaint();
             false
@@ -7420,7 +7434,8 @@ impl ViewerApp {
         let frame = frame_history_entry_from_decoded(decoded);
         let identity = frame.identity.clone();
         if let Some(existing) = self
-            .frame_history
+            .primary
+            .history
             .iter_mut()
             .find(|candidate| candidate.identity == identity)
         {
@@ -7436,18 +7451,20 @@ impl ViewerApp {
                 *existing = frame;
             }
         } else {
-            self.frame_history.push(frame);
+            self.primary.history.push(frame);
         }
     }
 
     fn trim_frame_history(&mut self) {
-        self.history_frame_limit = normalized_history_limit(self.history_frame_limit);
-        while self.frame_history.len() > self.history_frame_limit {
-            self.frame_history.remove(0);
+        self.primary.limits.frame_limit = normalized_history_limit(self.primary.limits.frame_limit);
+        while self.primary.history.len() > self.primary.limits.frame_limit {
+            self.primary.history.remove(0);
         }
-        self.selected_frame_index = self
-            .selected_frame_index
-            .min(self.frame_history.len().saturating_sub(1));
+        self.primary.cursor.index = self
+            .primary
+            .cursor
+            .index
+            .min(self.primary.history.len().saturating_sub(1));
     }
 
     fn select_history_frame(
@@ -7466,12 +7483,12 @@ impl ViewerApp {
         select_first_low_sweep: bool,
         ctx: &egui::Context,
     ) {
-        let Some(frame) = self.frame_history.get(index).cloned() else {
+        let Some(frame) = self.primary.history.get(index).cloned() else {
             return;
         };
         self.record_first_data_if_needed();
-        self.selected_frame_index = index;
-        self.history_playing &= self.primary_history_loop_can_step();
+        self.primary.cursor.index = index;
+        self.primary.cursor.playing &= self.primary_history_loop_can_step();
         self.source_path = Some(frame.path.clone());
         self.install_volume_arc(
             Arc::clone(&frame.volume),
@@ -7842,7 +7859,8 @@ impl ViewerApp {
         // render caches keep hitting across revolutions.
         if !Arc::ptr_eq(&volume, &source_volume)
             && let Some(frame) = self
-                .frame_history
+                .primary
+                .history
                 .iter_mut()
                 .find(|frame| Arc::ptr_eq(&frame.volume, &source_volume))
         {
@@ -7870,7 +7888,7 @@ impl ViewerApp {
                 &self.selected_product,
                 volume.as_ref(),
                 VolumeSelectionPolicy {
-                    allow_low_level_auto_advance: !self.history_playing,
+                    allow_low_level_auto_advance: !self.primary.cursor.playing,
                     allow_incomplete_live_chunk_advance: self.display_live_chunk_updates,
                     require_complete_live_cut,
                     low_level_min_seconds: self.live_low_sweep_auto_advance_min_seconds(),
@@ -8059,7 +8077,7 @@ impl ViewerApp {
                     &previous_product,
                     volume,
                     VolumeSelectionPolicy {
-                        allow_low_level_auto_advance: !self.history_playing,
+                        allow_low_level_auto_advance: !self.primary.cursor.playing,
                         allow_incomplete_live_chunk_advance: self.display_live_chunk_updates,
                         require_complete_live_cut,
                         low_level_min_seconds,
@@ -8071,19 +8089,21 @@ impl ViewerApp {
     }
 
     fn selected_frame_status_text(&self) -> String {
-        self.frame_history
-            .get(self.selected_frame_index)
+        self.primary
+            .history
+            .get(self.primary.cursor.index)
             .map(|frame| frame_status_text(frame, Utc::now(), self.time_zone()))
             .unwrap_or_else(|| "No Level II frame loaded".to_owned())
     }
 
     fn selected_frame(&self) -> Option<&FrameHistoryEntry> {
-        self.frame_history.get(self.selected_frame_index)
+        self.primary.history.get(self.primary.cursor.index)
     }
 
     fn selected_frame_scan_time_utc(&self) -> Option<DateTime<Utc>> {
-        self.frame_history
-            .get(self.selected_frame_index)
+        self.primary
+            .history
+            .get(self.primary.cursor.index)
             .map(|frame| frame.identity.scan_time_utc)
             .or_else(|| {
                 self.volume
@@ -8132,7 +8152,7 @@ impl ViewerApp {
 
     fn loop_timeline_history_len(&self, target: LoopTimelineTarget) -> usize {
         match target {
-            LoopTimelineTarget::Primary => self.frame_history.len(),
+            LoopTimelineTarget::Primary => self.primary.history.len(),
             LoopTimelineTarget::ExtraPane(slot) => self
                 .extra_panes
                 .get(slot)
@@ -8143,7 +8163,7 @@ impl ViewerApp {
 
     fn loop_timeline_playing(&self, target: LoopTimelineTarget) -> bool {
         match target {
-            LoopTimelineTarget::Primary => self.history_playing,
+            LoopTimelineTarget::Primary => self.primary.cursor.playing,
             LoopTimelineTarget::ExtraPane(slot) => self
                 .extra_panes
                 .get(slot)
@@ -8185,7 +8205,7 @@ impl ViewerApp {
         target: LoopTimelineTarget,
     ) -> Option<&[FrameHistoryEntry]> {
         match target {
-            LoopTimelineTarget::Primary => Some(&self.frame_history),
+            LoopTimelineTarget::Primary => Some(&self.primary.history),
             LoopTimelineTarget::ExtraPane(slot) => self
                 .extra_panes
                 .get(slot)
@@ -8463,7 +8483,7 @@ impl ViewerApp {
         let low_sweeps = self.app_settings.loop_low_sweeps;
         let (frame_generation, pane_product, policy) = match target {
             LoopTimelineTarget::Primary => (
-                self.frame_history.generation(),
+                self.primary.history.generation(),
                 None,
                 // Equal to the policy for the resolved shared-driver
                 // product without paying its O(frames) resolution here:
@@ -8595,7 +8615,8 @@ impl ViewerApp {
     }
 
     fn current_history_paths(&self) -> BTreeSet<PathBuf> {
-        self.frame_history
+        self.primary
+            .history
             .iter()
             .map(|frame| frame.path.clone())
             .collect()
@@ -8661,7 +8682,7 @@ impl ViewerApp {
     }
 
     fn maybe_advance_history_loop(&mut self, ctx: &egui::Context) {
-        if !self.history_playing || !self.primary_history_loop_can_step() {
+        if !self.primary.cursor.playing || !self.primary_history_loop_can_step() {
             return;
         }
         let frame_ms = self.screen_loop_frame_ms();
@@ -8669,19 +8690,19 @@ impl ViewerApp {
             // Do not let time spent decoding/rendering count against this
             // frame's on-screen dwell. The current selection stays put until
             // its texture lands, so no timeline step can disappear visually.
-            self.last_history_step = None;
+            self.primary.cursor.last_step = None;
             ctx.request_repaint_after(Duration::from_millis(LOOP_RENDER_WAIT_POLL_MS));
             return;
         }
 
         let now = Instant::now();
-        match self.last_history_step {
-            None => self.last_history_step = Some(now),
+        match self.primary.cursor.last_step {
+            None => self.primary.cursor.last_step = Some(now),
             Some(last_step) if last_step.elapsed() >= Duration::from_millis(frame_ms) => {
                 self.advance_primary_screen_loop(ctx);
                 // The newly selected step gets its own complete dwell after
                 // its matching texture is ready.
-                self.last_history_step = None;
+                self.primary.cursor.last_step = None;
                 ctx.request_repaint_after(Duration::from_millis(LOOP_RENDER_WAIT_POLL_MS));
                 return;
             }
@@ -8745,24 +8766,24 @@ impl ViewerApp {
         let next_index =
             if self.app_settings.loop_low_sweeps && policy.mode == SweepPolicyMode::Range {
                 next_frame_index_with_sweep_cuts(
-                    &self.frame_history,
-                    self.selected_frame_index,
+                    &self.primary.history,
+                    self.primary.cursor.index,
                     &product,
                     policy,
                     &self.low_sweep_disabled_cuts,
                 )
             } else {
-                (!self.frame_history.is_empty())
-                    .then_some((self.selected_frame_index + 1) % self.frame_history.len())
+                (!self.primary.history.is_empty())
+                    .then_some((self.primary.cursor.index + 1) % self.primary.history.len())
             };
         let Some(next_index) = next_index else {
-            self.history_playing = false;
+            self.primary.cursor.playing = false;
             return;
         };
         self.select_history_frame_with_options(next_index, false, false, ctx);
         self.sync_owned_extra_panes_to_primary_timeline_frame(next_index, ctx);
         self.select_first_history_low_sweep_if_enabled(ctx);
-        self.history_playing = self.primary_history_loop_can_step();
+        self.primary.cursor.playing = self.primary_history_loop_can_step();
     }
 
     fn advance_extra_pane_screen_loop(&mut self, pane_slot: usize, ctx: &egui::Context) {
@@ -8802,7 +8823,7 @@ impl ViewerApp {
         if !self.app_settings.loop_low_sweeps {
             return;
         }
-        let Some(frame) = self.frame_history.get(self.selected_frame_index) else {
+        let Some(frame) = self.primary.history.get(self.primary.cursor.index) else {
             return;
         };
         let product = self.shared_low_sweep_driver_product();
@@ -8827,7 +8848,7 @@ impl ViewerApp {
         if !self.app_settings.loop_low_sweeps {
             return false;
         }
-        let Some(frame) = self.frame_history.get(self.selected_frame_index) else {
+        let Some(frame) = self.primary.history.get(self.primary.cursor.index) else {
             return false;
         };
         let (product, current_cut) = self.shared_low_sweep_driver();
@@ -8973,7 +8994,8 @@ impl ViewerApp {
 
     fn owned_extra_panes_matching_primary_frame(&self, frame_index: usize) -> Vec<usize> {
         let Some(primary_identity) = self
-            .frame_history
+            .primary
+            .history
             .get(frame_index)
             .map(|frame| frame.identity.clone())
         else {
@@ -8998,13 +9020,14 @@ impl ViewerApp {
         if !pane.owns_radar() {
             return true;
         }
-        if pane.engine.history.is_empty() || pane.engine.history.len() != self.frame_history.len() {
+        if pane.engine.history.is_empty() || pane.engine.history.len() != self.primary.history.len()
+        {
             return false;
         }
         pane.engine
             .history
             .iter()
-            .zip(self.frame_history.iter())
+            .zip(self.primary.history.iter())
             .all(|(pane_frame, primary_frame)| pane_frame.identity == primary_frame.identity)
     }
 
@@ -9014,7 +9037,8 @@ impl ViewerApp {
         ctx: &egui::Context,
     ) {
         let Some(target_utc) = self
-            .frame_history
+            .primary
+            .history
             .get(frame_index)
             .map(|frame| frame.identity.scan_time_utc)
         else {
@@ -9093,7 +9117,7 @@ impl ViewerApp {
             LoopTimelineTarget::Primary => {
                 let product = self.shared_low_sweep_driver_product();
                 let policy = self.primary_sweep_policy_for_product(&product);
-                self.loop_timeline_steps_for(&self.frame_history, &product, policy)
+                self.loop_timeline_steps_for(&self.primary.history, &product, policy)
             }
             LoopTimelineTarget::ExtraPane(slot) => self
                 .extra_panes
@@ -9121,8 +9145,8 @@ impl ViewerApp {
             LoopTimelineTarget::Primary => {
                 let (product, current_cut) = self.shared_low_sweep_driver();
                 (
-                    self.frame_history.as_slice(),
-                    self.selected_frame_index,
+                    self.primary.history.as_slice(),
+                    self.primary.cursor.index,
                     product,
                     current_cut,
                 )
@@ -9202,7 +9226,7 @@ impl ViewerApp {
             return Some(current_time);
         }
         let step_started = match target {
-            LoopTimelineTarget::Primary => self.last_history_step,
+            LoopTimelineTarget::Primary => self.primary.cursor.last_step,
             LoopTimelineTarget::ExtraPane(slot) => self
                 .extra_panes
                 .get(slot)
@@ -9247,7 +9271,7 @@ impl ViewerApp {
     fn loop_timeline_position_label(&self, target: LoopTimelineTarget) -> String {
         let frame_count = self.loop_timeline_history_len(target);
         let frame_index = match target {
-            LoopTimelineTarget::Primary => self.selected_frame_index,
+            LoopTimelineTarget::Primary => self.primary.cursor.index,
             LoopTimelineTarget::ExtraPane(slot) => self
                 .extra_panes
                 .get(slot)
@@ -9275,7 +9299,7 @@ impl ViewerApp {
     fn current_loop_timeline_step_index_for_target(&self, target: LoopTimelineTarget) -> usize {
         if !self.app_settings.loop_low_sweeps {
             return match target {
-                LoopTimelineTarget::Primary => self.selected_frame_index,
+                LoopTimelineTarget::Primary => self.primary.cursor.index,
                 LoopTimelineTarget::ExtraPane(slot) => self
                     .extra_panes
                     .get(slot)
@@ -9287,7 +9311,7 @@ impl ViewerApp {
             return 0;
         };
         let selected_frame_index = match target {
-            LoopTimelineTarget::Primary => self.selected_frame_index,
+            LoopTimelineTarget::Primary => self.primary.cursor.index,
             LoopTimelineTarget::ExtraPane(slot) => self
                 .extra_panes
                 .get(slot)
@@ -9321,7 +9345,7 @@ impl ViewerApp {
         }
         let (selected_frame_index, current_rank) = match target {
             LoopTimelineTarget::Primary => (
-                self.selected_frame_index,
+                self.primary.cursor.index,
                 self.current_shared_low_sweep_rank(),
             ),
             LoopTimelineTarget::ExtraPane(slot) => {
@@ -9358,7 +9382,7 @@ impl ViewerApp {
         if !self.app_settings.loop_low_sweeps {
             return;
         }
-        let Some(frame) = self.frame_history.get(self.selected_frame_index) else {
+        let Some(frame) = self.primary.history.get(self.primary.cursor.index) else {
             return;
         };
         let time_utc = cut_start_time_utc(frame.volume.as_ref(), self.selected_cut)
@@ -9370,7 +9394,7 @@ impl ViewerApp {
         if !self.app_settings.loop_low_sweeps {
             return None;
         }
-        let frame = self.frame_history.get(self.selected_frame_index)?;
+        let frame = self.primary.history.get(self.primary.cursor.index)?;
         let (product, current_cut) = self.shared_low_sweep_driver();
         sweep_cuts_for_history_entry(
             frame,
@@ -9392,7 +9416,7 @@ impl ViewerApp {
         }
         match target {
             LoopTimelineTarget::Primary => {
-                let frame = self.frame_history.get(self.selected_frame_index)?;
+                let frame = self.primary.history.get(self.primary.cursor.index)?;
                 let (driver_product, driver_cut) = self.shared_low_sweep_driver();
                 let current_cut = if driver_product == *product {
                     driver_cut
@@ -9445,7 +9469,7 @@ impl ViewerApp {
         if !self.app_settings.loop_low_sweeps {
             return false;
         }
-        let Some(frame) = self.frame_history.get(self.selected_frame_index) else {
+        let Some(frame) = self.primary.history.get(self.primary.cursor.index) else {
             return false;
         };
         let (product, _) = self.shared_low_sweep_driver();
@@ -9463,7 +9487,7 @@ impl ViewerApp {
     }
 
     fn shared_low_sweep_time_for_step(&self, step: LoopTimelineStep) -> Option<DateTime<Utc>> {
-        let frame = self.frame_history.get(step.frame_index)?;
+        let frame = self.primary.history.get(step.frame_index)?;
         if let Some(cut) = step.cut_index {
             return Some(
                 cut_start_time_utc(frame.volume.as_ref(), cut)
@@ -9499,7 +9523,7 @@ impl ViewerApp {
         if !self.app_settings.loop_low_sweeps {
             return false;
         }
-        let Some(frame) = self.frame_history.get(self.selected_frame_index).cloned() else {
+        let Some(frame) = self.primary.history.get(self.primary.cursor.index).cloned() else {
             return false;
         };
         let mut changed = false;
@@ -9625,7 +9649,7 @@ impl ViewerApp {
         if !self.app_settings.loop_low_sweeps || self.advanced_sweep_control_enabled() {
             return primary;
         }
-        if self.product_has_expanded_low_sweep_steps(&self.frame_history, &primary.0) {
+        if self.product_has_expanded_low_sweep_steps(&self.primary.history, &primary.0) {
             return primary;
         }
         for pane in self
@@ -9637,7 +9661,7 @@ impl ViewerApp {
             let frames = if pane.owns_radar() {
                 pane.engine.history.as_slice()
             } else {
-                self.frame_history.as_slice()
+                self.primary.history.as_slice()
             };
             if self.product_has_expanded_low_sweep_steps(frames, &pane.product) {
                 return (pane.product.clone(), pane.cut.unwrap_or(self.selected_cut));
@@ -9671,13 +9695,13 @@ impl ViewerApp {
                 .loop_timeline_summary_for_target(LoopTimelineTarget::Primary)
                 .is_some_and(|summary| summary.step_count > 1);
         }
-        if self.frame_history.len() > 1 {
+        if self.primary.history.len() > 1 {
             return true;
         }
         if !self.app_settings.loop_low_sweeps {
             return false;
         }
-        let Some(frame) = self.frame_history.get(self.selected_frame_index) else {
+        let Some(frame) = self.primary.history.get(self.primary.cursor.index) else {
             return false;
         };
         sweep_cuts_for_history_entry(frame, &product, policy, &self.low_sweep_disabled_cuts).len()
@@ -9775,7 +9799,7 @@ impl ViewerApp {
         if !self.app_settings.loop_low_sweeps {
             return;
         }
-        let Some(frame) = self.frame_history.get(self.selected_frame_index) else {
+        let Some(frame) = self.primary.history.get(self.primary.cursor.index) else {
             return;
         };
         let policy = self.primary_sweep_policy_for_product(&self.selected_product);
@@ -9820,7 +9844,7 @@ impl ViewerApp {
             changed = true;
         }
         if changed {
-            let Some(frame) = self.frame_history.get(self.selected_frame_index) else {
+            let Some(frame) = self.primary.history.get(self.primary.cursor.index) else {
                 return;
             };
             let enabled_cuts = sweep_cuts_for_history_entry(
@@ -9946,17 +9970,18 @@ impl ViewerApp {
             .volume
             .as_ref()
             .map(|volume| frame_identity_for_volume(volume.as_ref()));
-        self.history_frame_limit = normalized_history_limit(limit);
+        self.primary.limits.frame_limit = normalized_history_limit(limit);
         self.trim_frame_history();
         if let Some(identity) = active_identity
             && let Some(index) = self
-                .frame_history
+                .primary
+                .history
                 .iter()
                 .position(|frame| frame.identity == identity)
         {
-            self.selected_frame_index = index;
+            self.primary.cursor.index = index;
         } else {
-            self.selected_frame_index = self.frame_history.len().saturating_sub(1);
+            self.primary.cursor.index = self.primary.history.len().saturating_sub(1);
         }
         ctx.request_repaint();
     }
@@ -10338,13 +10363,13 @@ impl ViewerApp {
                                     // loop the moment it lands (the
                                     // local-deployment autoplay pattern).
                                     if std::mem::take(&mut self.event_explorer.pending_autoplay)
-                                        && self.frame_history.len() > 1
+                                        && self.primary.history.len() > 1
                                     {
-                                        self.history_playing = true;
-                                        self.last_history_step = None;
+                                        self.primary.cursor.playing = true;
+                                        self.primary.cursor.last_step = None;
                                         self.status = format!(
                                             "Event loop rolling — {} frames",
-                                            self.frame_history.len()
+                                            self.primary.history.len()
                                         );
                                     }
                                     self.pending_debug_archive_case = None;
@@ -10534,8 +10559,8 @@ impl ViewerApp {
     }
 
     fn select_primary_cut_manually(&mut self, cut: usize, ctx: &egui::Context) {
-        self.history_playing = false;
-        self.last_history_step = None;
+        self.primary.cursor.playing = false;
+        self.primary.cursor.last_step = None;
         let selected_product = self.selected_product.clone();
         if advanced_derived_product_for_display_product(&selected_product).is_some() {
             let _ = self.materialize_primary_advanced_product(&selected_product, cut);
@@ -10841,18 +10866,18 @@ impl ViewerApp {
 
     #[cfg(test)]
     fn step_history_frame(&mut self, delta: isize, ctx: &egui::Context) -> bool {
-        let frame_count = self.frame_history.len();
+        let frame_count = self.primary.history.len();
         if frame_count <= 1 {
             return false;
         }
         let next_index =
-            (self.selected_frame_index as isize + delta).rem_euclid(frame_count as isize) as usize;
-        if next_index == self.selected_frame_index {
+            (self.primary.cursor.index as isize + delta).rem_euclid(frame_count as isize) as usize;
+        if next_index == self.primary.cursor.index {
             return false;
         }
-        self.history_playing = false;
+        self.primary.cursor.playing = false;
         self.select_history_frame(next_index, false, ctx);
-        self.browsing_history = next_index + 1 < self.frame_history.len();
+        self.primary.cursor.browsing = next_index + 1 < self.primary.history.len();
         true
     }
 
@@ -11069,7 +11094,8 @@ impl ViewerApp {
         if frame.status != FrameStatus::LivePartial {
             return volume;
         }
-        self.frame_history
+        self.primary
+            .history
             .iter()
             .rev()
             .find(|frame| frame.status != FrameStatus::LivePartial)
@@ -11095,7 +11121,7 @@ impl ViewerApp {
         let (frames, selected_index) = if pane.owns_radar() {
             (pane.engine.history.as_slice(), pane.engine.cursor.index)
         } else {
-            (self.frame_history.as_slice(), self.selected_frame_index)
+            (self.primary.history.as_slice(), self.primary.cursor.index)
         };
         let Some(frame) = frames.get(selected_index) else {
             return volume;
@@ -11119,7 +11145,7 @@ impl ViewerApp {
         frame_index: usize,
         product: &DisplayProduct,
     ) -> Vec<LoopTimelineStep> {
-        let Some(frame) = self.frame_history.get(frame_index) else {
+        let Some(frame) = self.primary.history.get(frame_index) else {
             return Vec::new();
         };
         if self.app_settings.loop_low_sweeps {
@@ -11152,12 +11178,12 @@ impl ViewerApp {
     /// deliberately bounded by `limit`: rebuilding the full 1,500-step low-
     /// sweep timeline on every paint was a previous performance failure.
     fn upcoming_primary_loop_steps(&self, limit: usize) -> Vec<LoopTimelineStep> {
-        let frame_count = self.frame_history.len();
+        let frame_count = self.primary.history.len();
         if frame_count == 0 || limit == 0 {
             return Vec::new();
         }
         let product = self.shared_low_sweep_driver_product();
-        let mut frame_index = self.selected_frame_index.min(frame_count - 1);
+        let mut frame_index = self.primary.cursor.index.min(frame_count - 1);
         let mut frame_steps = self.primary_loop_steps_in_frame(frame_index, &product);
         let current_cut = self.shared_low_sweep_driver().1;
         let mut position = if frame_steps.len() == 1 && frame_steps[0].cut_index.is_none() {
@@ -11192,7 +11218,7 @@ impl ViewerApp {
     }
 
     fn primary_cut_for_loop_step(&self, step: LoopTimelineStep) -> Option<usize> {
-        let frame = self.frame_history.get(step.frame_index)?;
+        let frame = self.primary.history.get(step.frame_index)?;
         if self.app_settings.loop_low_sweeps {
             let timeline_time = step
                 .cut_index
@@ -11221,12 +11247,16 @@ impl ViewerApp {
         rect: egui::Rect,
         step: LoopTimelineStep,
     ) -> Option<RenderRequest> {
-        let frame = self.frame_history.get(step.frame_index)?;
+        let frame = self.primary.history.get(step.frame_index)?;
         let cut = self.primary_cut_for_loop_step(step)?;
         let previous_volume = (self.dealias_cascade
             && self.product_render_uses_dealiased_velocity(&self.selected_product))
         .then(|| {
-            previous_dealias_reference_volume(&self.frame_history, step.frame_index, &frame.volume)
+            previous_dealias_reference_volume(
+                &self.primary.history,
+                step.frame_index,
+                &frame.volume,
+            )
         })
         .flatten();
         self.primary_render_request_for_volume(
@@ -11248,8 +11278,8 @@ impl ViewerApp {
             && self.product_render_uses_dealiased_velocity(&self.selected_product))
         .then(|| {
             previous_dealias_reference_volume(
-                &self.frame_history,
-                self.selected_frame_index,
+                &self.primary.history,
+                self.primary.cursor.index,
                 &volume,
             )
         })
@@ -11499,7 +11529,7 @@ impl ViewerApp {
         if self.loop_prewarm_inflight.len() >= inflight_limit {
             return;
         }
-        let lookahead = if self.history_playing || self.media.loop_recording() {
+        let lookahead = if self.primary.cursor.playing || self.media.loop_recording() {
             LOOP_PREWARM_PLAYING_LOOKAHEAD_FRAMES
         } else {
             LOOP_PREWARM_IDLE_LOOKAHEAD_FRAMES
@@ -12516,7 +12546,7 @@ impl ViewerApp {
                 engine_id,
                 slot,
                 next,
-                HistoryLimits::pane(self.history_frame_limit),
+                HistoryLimits::pane(self.primary.limits.frame_limit),
             ));
             if self.app_settings.independent_panels {
                 self.initialize_extra_pane_from_primary(slot);
@@ -12617,9 +12647,11 @@ impl ViewerApp {
         let primary_volume = self.volume.clone();
         let source_path = self.source_path.clone();
         let load_timing = self.load_timing;
-        let frame_history = self.frame_history.clone();
+        let frame_history = self.primary.history.clone();
         let selected_frame_index = self
-            .selected_frame_index
+            .primary
+            .cursor
+            .index
             .min(frame_history.len().saturating_sub(1));
         let selected_site = self.selected_site().cloned();
         let site_id = primary_volume
@@ -12630,12 +12662,12 @@ impl ViewerApp {
             .as_ref()
             .and_then(|volume| Some((volume.site.latitude_deg?, volume.site.longitude_deg?)))
             .or_else(|| selected_site.as_ref().and_then(site_location));
-        let pin = match (&self.poll_source, self.poll_active) {
+        let pin = match (&self.primary.feed, self.poll_active) {
             (
-                PollSource::Intl {
+                FeedSource::Live(SiteRef::Intl {
                     provider_id,
                     site_id,
-                },
+                }),
                 true,
             ) if Self::find_intl_site(provider_id, site_id).is_some() => Some(SiteRef::Intl {
                 provider_id: provider_id.clone(),
@@ -12645,7 +12677,7 @@ impl ViewerApp {
         };
         let show_derived_products = self.app_settings.show_derived_products;
         let advanced_products_enabled = self.advanced_products_enabled;
-        let primary_live = self.realtime_level2_auto_refresh;
+        let primary_live = self.primary.live.enabled;
 
         let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
             return;
@@ -12665,7 +12697,7 @@ impl ViewerApp {
         pane.engine.cursor.index = selected_frame_index;
         pane.engine.cursor.playing = false;
         pane.engine.cursor.browsing =
-            self.browsing_history && selected_frame_index + 1 < pane.engine.history.len();
+            self.primary.cursor.browsing && selected_frame_index + 1 < pane.engine.history.len();
         pane.engine.cursor.last_step = None;
         pane.archive_load_progress = None;
         pane.load_receiver = None;
@@ -12984,7 +13016,7 @@ impl ViewerApp {
             // explicit US picks; the auto-refresh tick never writes.
             self.remember_extra_pane_pin(pane_slot);
         }
-        let history_frame_limit = self.history_frame_limit.max(2);
+        let history_frame_limit = self.primary.limits.frame_limit.max(2);
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
             match mode {
@@ -13094,10 +13126,12 @@ impl ViewerApp {
             0
         };
         let history_frame_limit = self
-            .history_frame_limit
+            .primary
+            .limits
+            .frame_limit
             .max(live_preload_frame_count.saturating_add(1));
         if live_preload_frame_count > 0 {
-            self.history_frame_limit = normalized_history_limit(history_frame_limit);
+            self.primary.limits.frame_limit = normalized_history_limit(history_frame_limit);
         }
         let progress = (mode == LatestLoadMode::Loop)
             .then(|| ArchiveLoadProgress::latest_loop_start(&site_id));
@@ -13299,7 +13333,7 @@ impl ViewerApp {
         // Census D8: the pane FOLLOWS the primary's frame limit — the
         // shared-limits coupling, re-passed at every install instead of a
         // silent read at trim time. The byte budget stays pane-local.
-        let shared_frame_limit = self.history_frame_limit;
+        let shared_frame_limit = self.primary.limits.frame_limit;
         let active_volume = self.extra_panes[pane_slot].volume.clone();
         let pane_cut = self.extra_panes[pane_slot].cut;
         let primary_cut = self.selected_cut;
@@ -13370,7 +13404,7 @@ impl ViewerApp {
     /// limit, then re-passes it to the pane engine — the explicit form of
     /// the deleted `trim_extra_pane_history`'s silent read.
     fn retrim_extra_pane_history_to_shared_limit(&mut self, pane_slot: usize) {
-        let shared_frame_limit = self.history_frame_limit;
+        let shared_frame_limit = self.primary.limits.frame_limit;
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
             pane.engine.set_frame_limit(shared_frame_limit);
         }
@@ -13717,8 +13751,8 @@ impl ViewerApp {
                         )
                     } else {
                         previous_dealias_reference_volume(
-                            &self.frame_history,
-                            self.selected_frame_index,
+                            &self.primary.history,
+                            self.primary.cursor.index,
                             &volume,
                         )
                     }
@@ -14033,8 +14067,8 @@ impl ViewerApp {
             .filter(|current| Arc::as_ptr(current) as usize == volume_ptr)
             .and_then(|current| {
                 previous_dealias_reference_volume(
-                    &self.frame_history,
-                    self.selected_frame_index,
+                    &self.primary.history,
+                    self.primary.cursor.index,
                     current,
                 )
             });
@@ -14107,8 +14141,8 @@ impl ViewerApp {
         // deployment (field report: "loads for a second and then goes
         // away; unchecking Live fixes it"). Pause it; re-checking Live
         // resumes the catalog site.
-        let paused_live = self.realtime_level2_auto_refresh;
-        self.realtime_level2_auto_refresh = false;
+        let paused_live = self.primary.live.enabled;
+        self.primary.live.enabled = false;
         self.begin_primary_load_telemetry();
         self.pending_site_id = Some(label.to_owned());
         self.status = format!("Loading {label}");
@@ -14389,14 +14423,14 @@ impl ViewerApp {
         self.archive_load_after_listing = false;
         self.pending_debug_archive_case = None;
         self.event_explorer.pending_autoplay = false;
-        self.realtime_level2_auto_refresh = false;
+        self.primary.live.enabled = false;
         if self.poll_active {
             self.poll_active = false;
         }
         let site_id = site.level2_id.clone();
         self.clear_frame_history();
-        if requested > self.history_frame_limit {
-            self.history_frame_limit = requested.min(MAX_HISTORY_FRAME_LIMIT);
+        if requested > self.primary.limits.frame_limit {
+            self.primary.limits.frame_limit = requested.min(MAX_HISTORY_FRAME_LIMIT);
         }
         self.begin_primary_load_telemetry();
         let (sender, receiver) = mpsc::channel();
@@ -14551,14 +14585,14 @@ impl ViewerApp {
         self.archive_volumes = None;
         self.archive_load_loop = false;
         self.pending_debug_archive_case = Some(case);
-        self.history_playing = false;
-        self.browsing_history = false;
-        self.realtime_level2_auto_refresh = false;
+        self.primary.cursor.playing = false;
+        self.primary.cursor.browsing = false;
+        self.primary.live.enabled = false;
         self.poll_active = false;
         self.center_map_on(case.center_lat, case.center_lon);
         self.map_scale = case.map_scale.clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
         self.clamp_map_center();
-        if history_contains_other_site(&self.frame_history, &site_id) {
+        if history_contains_other_site(&self.primary.history, &site_id) {
             self.clear_frame_history();
         }
         self.begin_primary_load_telemetry();
@@ -14697,7 +14731,7 @@ impl ViewerApp {
                         pack.site_id, pack.start_utc, pack.end_utc
                     ));
                     if loaded.is_some() {
-                        ui.weak(format!("{} frames", self.frame_history.len()));
+                        ui.weak(format!("{} frames", self.primary.history.len()));
                     }
                     if ui
                         .add_enabled(!busy, egui::Button::new("Load"))
@@ -14778,7 +14812,7 @@ impl ViewerApp {
                     ui.label(egui::RichText::new(pack.title).strong());
                     ui.weak(format!("{} | latest {} research frames", pack.feed_id, pack.frame_count));
                     if loaded.is_some() {
-                        ui.weak(format!("{} frames", self.frame_history.len()));
+                        ui.weak(format!("{} frames", self.primary.history.len()));
                     }
                     if ui
                         .add_enabled(!busy, egui::Button::new("Load"))
@@ -14882,8 +14916,8 @@ impl ViewerApp {
         self.pending_data_pack_scene = None;
         self.loaded_data_pack = None;
         self.pending_debug_archive_case = None;
-        self.history_playing = false;
-        self.browsing_history = false;
+        self.primary.cursor.playing = false;
+        self.primary.cursor.browsing = false;
         self.center_map_on(pack.focus_lat, pack.focus_lon);
         self.map_scale = pack.map_scale.clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
         self.clamp_map_center();
@@ -14934,19 +14968,23 @@ impl ViewerApp {
         self.archive_volumes = None;
         self.archive_load_loop = true;
         self.archive_frame_count = request.max_objects.clamp(1, MAX_HISTORY_FRAME_LIMIT);
-        self.history_frame_limit = self.history_frame_limit.max(self.archive_frame_count);
+        self.primary.limits.frame_limit = self
+            .primary
+            .limits
+            .frame_limit
+            .max(self.archive_frame_count);
         self.pending_data_pack_scene = Some(scene);
         self.pending_debug_archive_case = None;
-        self.history_playing = false;
-        self.browsing_history = false;
-        self.realtime_level2_auto_refresh = false;
+        self.primary.cursor.playing = false;
+        self.primary.cursor.browsing = false;
+        self.primary.live.enabled = false;
         self.poll_active = false;
         self.poll_rx = None;
         self.poll_next = None;
         self.intl_loop_rx = None;
         self.intl_loop_frames = 0;
         self.intl_loop_requested = 0;
-        if replace_history || history_contains_other_site(&self.frame_history, &site_id) {
+        if replace_history || history_contains_other_site(&self.primary.history, &site_id) {
             self.clear_frame_history();
             self.loaded_data_pack = None;
         }
@@ -15109,19 +15147,21 @@ impl ViewerApp {
         let scene = pack.scene();
         self.pending_data_pack_scene = Some(scene);
         self.pending_debug_archive_case = None;
-        self.history_playing = false;
-        self.browsing_history = false;
-        self.realtime_level2_auto_refresh = false;
+        self.primary.cursor.playing = false;
+        self.primary.cursor.browsing = false;
+        self.primary.live.enabled = false;
         self.poll_active = false;
         self.poll_rx = None;
         self.poll_next = None;
-        self.poll_last_file = None;
+        self.primary.live.dedupe_key = None;
         self.poll_url = normalized_poll_url(pack.poll_url);
         self.set_custom_url_poll_source();
         self.clear_frame_history();
         self.clear_displayed_volume_for_pending_load(ctx);
-        self.history_frame_limit = normalized_history_limit(
-            self.history_frame_limit
+        self.primary.limits.frame_limit = normalized_history_limit(
+            self.primary
+                .limits
+                .frame_limit
                 .max(pack.frame_count.min(MAX_HISTORY_FRAME_LIMIT)),
         );
         self.center_map_on(scene.focus_lat, scene.focus_lon);
@@ -15255,24 +15295,28 @@ impl ViewerApp {
         feed: data_source::community_feeds::CommunityFeed,
         ctx: &egui::Context,
     ) {
-        self.realtime_level2_auto_refresh = false;
+        self.primary.live.enabled = false;
         self.poll_active = false;
         self.poll_rx = None;
         self.poll_next = None;
-        self.poll_last_file = None;
+        self.primary.live.dedupe_key = None;
         self.poll_url = normalized_poll_url(feed.poll_url);
         self.set_custom_url_poll_source();
         self.clear_camera_follow_targets();
-        self.history_playing = false;
-        self.browsing_history = false;
-        self.last_history_step = None;
-        if history_contains_other_site(&self.frame_history, feed.id) {
+        self.primary.cursor.playing = false;
+        self.primary.cursor.browsing = false;
+        self.primary.cursor.last_step = None;
+        if history_contains_other_site(&self.primary.history, feed.id) {
             self.clear_frame_history();
         }
         self.clear_displayed_volume_for_pending_load(ctx);
         self.begin_primary_load_telemetry();
 
-        let frame_count = self.history_frame_limit.clamp(1, MAX_HISTORY_FRAME_LIMIT);
+        let frame_count = self
+            .primary
+            .limits
+            .frame_limit
+            .clamp(1, MAX_HISTORY_FRAME_LIMIT);
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
         self.pending_site_id = Some(feed.id.to_owned());
@@ -15404,7 +15448,7 @@ impl ViewerApp {
     }
 
     fn data_pack_can_supersede_current_load(&self) -> bool {
-        if self.realtime_level2_auto_refresh || self.poll_active {
+        if self.primary.live.enabled || self.poll_active {
             return true;
         }
         let status = self.status.as_str();
@@ -15418,7 +15462,7 @@ impl ViewerApp {
 
     fn supersede_live_load_for_data_pack(&mut self) {
         let can_supersede = self.data_pack_can_supersede_current_load();
-        self.realtime_level2_auto_refresh = false;
+        self.primary.live.enabled = false;
         self.poll_active = false;
         self.poll_rx = None;
         self.poll_next = None;
@@ -15475,34 +15519,34 @@ impl ViewerApp {
         self.sanitize_selection();
         self.clear_texture();
         self.clear_extra_pane_textures();
-        let loaded_poll_name = self.frame_history.last().and_then(|frame| {
+        let loaded_poll_name = self.primary.history.last().and_then(|frame| {
             frame
                 .path
                 .to_str()
                 .and_then(|path| path.strip_prefix("poll://"))
                 .map(str::to_owned)
         });
-        if scene.autoplay && self.frame_history.len() > 1 {
-            self.history_playing = true;
-            self.last_history_step = None;
+        if scene.autoplay && self.primary.history.len() > 1 {
+            self.primary.cursor.playing = true;
+            self.primary.cursor.last_step = None;
         }
         if let Some(poll_url) = scene.resume_poll_url {
             self.poll_url = normalized_poll_url(poll_url);
             self.set_custom_url_poll_source();
             self.poll_active = true;
             self.poll_rx = None;
-            self.poll_last_file = loaded_poll_name;
+            self.primary.live.dedupe_key = loaded_poll_name;
             self.poll_next = None;
-            self.history_playing = false;
-            self.browsing_history = false;
-            self.last_history_step = None;
+            self.primary.cursor.playing = false;
+            self.primary.cursor.browsing = false;
+            self.primary.cursor.last_step = None;
             self.app_settings.poll_url = self.poll_url.clone();
             let _ = self.app_settings.save();
         }
         self.status = format!(
             "Data pack loaded: {} - {} frames",
             scene.title,
-            self.frame_history.len()
+            self.primary.history.len()
         );
         self.loaded_data_pack = Some(data_packs::LoadedDataPack {
             id: scene.id,
@@ -15539,8 +15583,8 @@ impl ViewerApp {
         let total_frames = (end - start + 1).min(MAX_HISTORY_FRAME_LIMIT);
         let start = end + 1 - total_frames;
         let selected = selected.clamp(start, end);
-        if total_frames > self.history_frame_limit {
-            self.history_frame_limit = total_frames;
+        if total_frames > self.primary.limits.frame_limit {
+            self.primary.limits.frame_limit = total_frames;
         }
         self.archive_loaded_range = Some((start, end));
         let objects: Vec<(usize, data_source::S3Object)> = volumes[start..=end]
@@ -15549,10 +15593,10 @@ impl ViewerApp {
             .map(|(offset, (object, _))| (start + offset, object.clone()))
             .collect();
         let site_id = site.level2_id.clone();
-        if history_contains_other_site(&self.frame_history, &site_id) {
+        if history_contains_other_site(&self.primary.history, &site_id) {
             self.clear_frame_history();
         }
-        self.realtime_level2_auto_refresh = false;
+        self.primary.live.enabled = false;
         self.begin_primary_load_telemetry();
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
@@ -15691,15 +15735,17 @@ impl ViewerApp {
         self.pending_data_pack_scene = None;
         self.loaded_data_pack = None;
         self.archive_date_input = context.start_utc.format("%Y-%m-%d").to_string();
-        self.history_playing = false;
-        self.browsing_history = false;
-        self.last_history_step = None;
+        self.primary.cursor.playing = false;
+        self.primary.cursor.browsing = false;
+        self.primary.cursor.last_step = None;
         self.selected_cut = 0;
-        self.realtime_level2_auto_refresh = false;
+        self.primary.live.enabled = false;
         self.release_intl_primary_display();
         self.poll_active = false;
-        self.history_frame_limit = self
-            .history_frame_limit
+        self.primary.limits.frame_limit = self
+            .primary
+            .limits
+            .frame_limit
             .max(context.max_frames.min(MAX_HISTORY_FRAME_LIMIT));
         self.clear_frame_history();
         self.clear_displayed_volume_for_pending_load(ctx);
@@ -15848,7 +15894,7 @@ impl ViewerApp {
         if self.poll_active {
             self.poll_active = false;
         }
-        self.realtime_level2_auto_refresh = false;
+        self.primary.live.enabled = false;
         self.pending_debug_archive_case = None;
         self.clear_camera_follow_targets();
         self.archive_date_input = plan.start_utc.format("%Y-%m-%d").to_string();
@@ -15856,8 +15902,10 @@ impl ViewerApp {
         self.archive_list_receiver = None;
         self.archive_loaded_range = None;
         self.archive_load_loop = true;
-        self.history_frame_limit = self
-            .history_frame_limit
+        self.primary.limits.frame_limit = self
+            .primary
+            .limits
+            .frame_limit
             .max(plan.max_frames.min(MAX_HISTORY_FRAME_LIMIT));
         self.clear_frame_history();
         self.clear_displayed_volume_for_pending_load(ctx);
@@ -16026,11 +16074,11 @@ impl ViewerApp {
             self.clear_camera_follow_targets();
         }
         if mode == LatestLoadMode::User {
-            self.history_playing = false;
-            self.browsing_history = false;
-            self.last_history_step = None;
+            self.primary.cursor.playing = false;
+            self.primary.cursor.browsing = false;
+            self.primary.cursor.last_step = None;
         }
-        if history_contains_other_site(&self.frame_history, &site_id) {
+        if history_contains_other_site(&self.primary.history, &site_id) {
             self.clear_frame_history();
         }
         if mode == LatestLoadMode::User || self.volume.is_none() {
@@ -16039,7 +16087,7 @@ impl ViewerApp {
         let (sender, receiver) = mpsc::channel();
         self.load_receiver = Some(receiver);
         self.pending_site_id = Some(site_id.clone());
-        self.last_realtime_level2_refresh = Some(Instant::now());
+        self.primary.live.last_refresh = Some(Instant::now());
         self.status = match mode {
             LatestLoadMode::AutoRefresh => format!("Refreshing realtime L2 {site_id}"),
             LatestLoadMode::Loop => format!("Loading L2 loop {site_id}"),
@@ -16061,8 +16109,10 @@ impl ViewerApp {
             0
         };
         if live_preload_frame_count > 0 {
-            self.history_frame_limit = normalized_history_limit(
-                self.history_frame_limit
+            self.primary.limits.frame_limit = normalized_history_limit(
+                self.primary
+                    .limits
+                    .frame_limit
                     .max(live_preload_frame_count.saturating_add(1)),
             );
         }
@@ -16097,7 +16147,7 @@ impl ViewerApp {
             current_source_path,
             known_frame_paths,
             current_frame_identity,
-            self.history_frame_limit,
+            self.primary.limits.frame_limit,
             live_preload_frame_count,
             self.display_live_chunk_updates,
             sender,
@@ -16661,7 +16711,7 @@ impl ViewerApp {
                 self.show_storm_tracks = true;
                 self.show_inspector_card = true;
                 self.vrot_tool_armed = false;
-                self.realtime_level2_auto_refresh = true;
+                self.primary.live.enabled = true;
             }
             WorkflowPreset::TripleSevere => {
                 self.set_workflow_layout(PanelLayout::ThreeStacked);
@@ -16711,16 +16761,20 @@ impl ViewerApp {
                 self.archive_load_loop = true;
                 self.archive_frame_count =
                     self.archive_frame_count.max(DEFAULT_ARCHIVE_FRAME_COUNT);
-                self.history_frame_limit = self.history_frame_limit.max(self.archive_frame_count);
+                self.primary.limits.frame_limit = self
+                    .primary
+                    .limits
+                    .frame_limit
+                    .max(self.archive_frame_count);
                 self.app_settings.archive_load_loop = self.archive_load_loop;
                 self.app_settings.archive_frame_count = self.archive_frame_count as u16;
-                self.realtime_level2_auto_refresh = false;
+                self.primary.live.enabled = false;
                 self.poll_active = false;
                 self.hazards_visible = true;
                 self.hazards_active_only = false;
                 self.spc_outlooks_enabled = ["cat"].into_iter().map(str::to_owned).collect();
                 self.spc_reports_enabled = true;
-                self.history_playing = false;
+                self.primary.cursor.playing = false;
             }
             WorkflowPreset::Documentation => {
                 self.set_workflow_layout(PanelLayout::One);
@@ -16804,9 +16858,9 @@ impl ViewerApp {
             chrome_hidden: self.chrome_hidden,
             archive_load_loop: self.archive_load_loop,
             archive_frame_count: self.archive_frame_count,
-            history_frame_limit: self.history_frame_limit,
-            history_playing: self.history_playing,
-            realtime_level2_auto_refresh: self.realtime_level2_auto_refresh,
+            history_frame_limit: self.primary.limits.frame_limit,
+            history_playing: self.primary.cursor.playing,
+            realtime_level2_auto_refresh: self.primary.live.enabled,
             poll_active: self.poll_active,
         }
     }
@@ -16874,9 +16928,9 @@ impl ViewerApp {
         self.chrome_hidden = snapshot.chrome_hidden;
         self.archive_load_loop = snapshot.archive_load_loop;
         self.archive_frame_count = normalized_archive_frame_count(snapshot.archive_frame_count);
-        self.history_frame_limit = normalized_history_limit(snapshot.history_frame_limit);
-        self.history_playing = snapshot.history_playing;
-        self.realtime_level2_auto_refresh = snapshot.realtime_level2_auto_refresh;
+        self.primary.limits.frame_limit = normalized_history_limit(snapshot.history_frame_limit);
+        self.primary.cursor.playing = snapshot.history_playing;
+        self.primary.live.enabled = snapshot.realtime_level2_auto_refresh;
         self.poll_active = snapshot.poll_active;
         self.app_settings.archive_load_loop = self.archive_load_loop;
         self.app_settings.archive_frame_count = self.archive_frame_count as u16;
@@ -17097,7 +17151,7 @@ impl ViewerApp {
             intl_provider,
             archive_unavailable_reason,
             display_time_zone_slug: self.time_zone().slug().to_owned(),
-            loaded_radar_frames: self.frame_history.len(),
+            loaded_radar_frames: self.primary.history.len(),
         };
         let action = self.event_loop_builder.show_window(ctx, builder_context);
         if let Some(event_loop_builder::EventLoopBuilderAction::BuildRadar(plan)) = action {
@@ -17137,7 +17191,7 @@ impl ViewerApp {
             selected_time_utc: self.displayed_timeline_time_utc(),
             loop_start_utc,
             loop_end_utc,
-            history_frame_limit: self.history_frame_limit,
+            history_frame_limit: self.primary.limits.frame_limit,
             history_frame_limit_max: MAX_HISTORY_FRAME_LIMIT,
             history_frame_limit_options: HISTORY_SIZE_OPTIONS.to_vec(),
             loop_speed_percent: self.app_settings.loop_speed_percent,
@@ -17404,10 +17458,10 @@ impl ViewerApp {
     }
 
     fn unified_player_source_label(&self) -> String {
-        if let PollSource::Intl {
+        if let FeedSource::Live(SiteRef::Intl {
             provider_id,
             site_id,
-        } = &self.poll_source
+        }) = &self.primary.feed
             && !provider_id.is_empty()
             && !site_id.is_empty()
             && self.intl_source_owns_primary_display()
@@ -17819,10 +17873,10 @@ impl ViewerApp {
             }
         };
         if self.intl_source_owns_primary_display() {
-            if let PollSource::Intl {
+            if let FeedSource::Live(SiteRef::Intl {
                 provider_id,
                 site_id,
-            } = self.poll_source.clone()
+            }) = self.primary.feed.clone()
                 && provider_id == "ord"
             {
                 self.ord_archive_site_input = site_id;
@@ -17830,16 +17884,16 @@ impl ViewerApp {
                 self.ord_archive_hour_input = target_utc.format("%H").to_string();
                 self.ord_archive_minute_input = target_utc.format("%M").to_string();
                 self.archive_frame_count =
-                    normalized_archive_frame_count(self.history_frame_limit.max(1));
+                    normalized_archive_frame_count(self.primary.limits.frame_limit.max(1));
                 self.start_ord_archive_exact_load(ctx);
                 self.unified_player.mark_status(format!(
                     "Loading ORD loop ending {}",
                     target_utc.format("%Y-%m-%d %H:%MZ")
                 ));
-            } else if let PollSource::Intl {
+            } else if let FeedSource::Live(SiteRef::Intl {
                 provider_id,
                 site_id,
-            } = self.poll_source.clone()
+            }) = self.primary.feed.clone()
             {
                 // Every archive_source() provider (SMHI today) shares one
                 // generic End-at arm; no-archive providers surface the
@@ -17849,7 +17903,8 @@ impl ViewerApp {
                         self.unified_player.mark_status(reason);
                     }
                     _ => {
-                        let count = normalized_archive_frame_count(self.history_frame_limit.max(1));
+                        let count =
+                            normalized_archive_frame_count(self.primary.limits.frame_limit.max(1));
                         let label = intl_provider_label(&provider_id);
                         self.start_intl_archive_loop_ending_at(
                             provider_id,
@@ -17867,7 +17922,7 @@ impl ViewerApp {
             }
             return;
         }
-        let count = normalized_archive_frame_count(self.history_frame_limit.max(1));
+        let count = normalized_archive_frame_count(self.primary.limits.frame_limit.max(1));
         self.archive_frame_count = count;
         self.persist_archive_controls();
         if self.start_archive_loop_ending_at(target_utc, count, ctx) {
@@ -17886,10 +17941,10 @@ impl ViewerApp {
         }
         self.arm_unified_player_timeline_warning_sync();
         if self.intl_source_owns_primary_display() {
-            if let PollSource::Intl {
+            if let FeedSource::Live(SiteRef::Intl {
                 provider_id,
                 site_id,
-            } = self.poll_source.clone()
+            }) = self.primary.feed.clone()
                 && provider_id == "ord"
             {
                 let (start_utc, end_utc) = match self.unified_player.archive_window_utc() {
@@ -17899,7 +17954,7 @@ impl ViewerApp {
                         return;
                     }
                 };
-                let max_frames = normalized_history_limit(self.history_frame_limit).max(1);
+                let max_frames = normalized_history_limit(self.primary.limits.frame_limit).max(1);
                 self.start_ord_archive_window_load(
                     site_id.clone(),
                     start_utc,
@@ -17912,10 +17967,10 @@ impl ViewerApp {
                     start_utc.format("%H:%MZ"),
                     end_utc.format("%H:%MZ")
                 ));
-            } else if let PollSource::Intl {
+            } else if let FeedSource::Live(SiteRef::Intl {
                 provider_id,
                 site_id,
-            } = self.poll_source.clone()
+            }) = self.primary.feed.clone()
             {
                 // Generic archive_source() window arm (SMHI today);
                 // honest derived reason otherwise (spec §1.3).
@@ -17931,7 +17986,8 @@ impl ViewerApp {
                                 return;
                             }
                         };
-                        let max_frames = normalized_history_limit(self.history_frame_limit).max(1);
+                        let max_frames =
+                            normalized_history_limit(self.primary.limits.frame_limit).max(1);
                         let label = intl_provider_label(&provider_id);
                         let status_site = site_id.clone();
                         self.start_intl_archive_window_load(
@@ -17970,7 +18026,7 @@ impl ViewerApp {
         let Some(site_id) = self.selected_site().map(|site| site.level2_id.clone()) else {
             return Err("No site selected".to_owned());
         };
-        let max_frames = normalized_history_limit(self.history_frame_limit).max(1);
+        let max_frames = normalized_history_limit(self.primary.limits.frame_limit).max(1);
         let include_warnings = self.unified_player.auto_sync_warnings;
         Ok(event_loop_builder::EventLoopRadarPlan {
             site: SiteRef::Us {
@@ -17994,10 +18050,10 @@ impl ViewerApp {
                 .mark_status("Radar load already running");
             return;
         }
-        if let PollSource::Intl {
+        if let FeedSource::Live(SiteRef::Intl {
             provider_id,
             site_id,
-        } = self.poll_source.clone()
+        }) = self.primary.feed.clone()
             && self.intl_source_owns_primary_display()
         {
             self.start_intl_poll(provider_id.clone(), site_id.clone(), ctx);
@@ -18095,7 +18151,7 @@ impl ViewerApp {
             self.select_extra_pane_timeline_step(slot, step, ctx);
             return;
         }
-        self.history_playing = false;
+        self.primary.cursor.playing = false;
         self.select_history_frame_with_options(step.frame_index, false, false, ctx);
         if step.low_sweep_rank.is_some() {
             self.set_shared_low_sweep_step(step, ctx);
@@ -18110,7 +18166,7 @@ impl ViewerApp {
                 self.set_selected_cut_preserving_texture(cut_index);
                 self.sync_following_extra_panes_to_current_low_sweep_rank(ctx);
             } else if self.app_settings.loop_low_sweeps
-                && let Some(frame) = self.frame_history.get(step.frame_index)
+                && let Some(frame) = self.primary.history.get(step.frame_index)
             {
                 let timeline_time = cut_start_time_utc(frame.volume.as_ref(), self.selected_cut)
                     .unwrap_or(frame.identity.scan_time_utc);
@@ -18118,7 +18174,7 @@ impl ViewerApp {
             }
         }
         self.sync_active_timeline_side_effects(ctx);
-        self.browsing_history = step.frame_index + 1 < self.frame_history.len();
+        self.primary.cursor.browsing = step.frame_index + 1 < self.primary.history.len();
         ctx.request_repaint();
     }
 
@@ -20776,11 +20832,11 @@ impl ViewerApp {
             });
         let primary_intl_source =
             if site_control_pane.is_none() && self.intl_source_owns_primary_display() {
-                match &self.poll_source {
-                    PollSource::Intl {
+                match &self.primary.feed {
+                    FeedSource::Live(SiteRef::Intl {
                         provider_id,
                         site_id,
-                    } => Self::find_intl_site(provider_id, site_id)
+                    }) => Self::find_intl_site(provider_id, site_id)
                         .map(|site| PaneIntlSource::from_site(&site))
                         .or_else(|| {
                             Some(PaneIntlSource {
@@ -20789,7 +20845,10 @@ impl ViewerApp {
                                 label: site_id.to_ascii_uppercase(),
                             })
                         }),
-                    PollSource::CustomUrl(_) => None,
+                    // Only Live(Intl) reaches here (guarded by
+                    // intl_source_owns_primary_display above); the other
+                    // stage-(i) feed variants have no intl source.
+                    _ => None,
                 }
             } else {
                 None
@@ -21302,7 +21361,7 @@ impl ViewerApp {
                     self.set_intl_poll_paused(!live);
                 }
             } else {
-                ui.checkbox(&mut self.realtime_level2_auto_refresh, "Live")
+                ui.checkbox(&mut self.primary.live.enabled, "Live")
                     .on_hover_text("Auto-refresh the primary radar with the newest live data");
             }
             ui.checkbox(&mut self.display_live_chunk_updates, "Chunks")
@@ -22268,21 +22327,21 @@ impl ViewerApp {
             ui.weak(self.loop_timeline_position_label(LoopTimelineTarget::ExtraPane(
                 pane_slot,
             )));
-            let mut selected_limit = self.history_frame_limit;
+            let mut selected_limit = self.primary.limits.frame_limit;
             egui::ComboBox::from_id_salt(("pane_history_frame_limit", pane_slot))
-                .selected_text(format!("{}", self.history_frame_limit))
+                .selected_text(format!("{}", self.primary.limits.frame_limit))
                 .width(52.0)
                 .show_ui(ui, |ui| {
                     for limit in HISTORY_SIZE_OPTIONS {
                         ui.selectable_value(&mut selected_limit, *limit, format!("{limit} frames"));
                     }
                 });
-            if selected_limit != self.history_frame_limit {
-                self.history_frame_limit = normalized_history_limit(selected_limit);
+            if selected_limit != self.primary.limits.frame_limit {
+                self.primary.limits.frame_limit = normalized_history_limit(selected_limit);
                 self.retrim_extra_pane_history_to_shared_limit(pane_slot);
                 ctx.request_repaint();
             }
-            let mut typed_limit = self.history_frame_limit;
+            let mut typed_limit = self.primary.limits.frame_limit;
             if ui
                 .add(
                     egui::DragValue::new(&mut typed_limit)
@@ -22293,7 +22352,7 @@ impl ViewerApp {
                 .on_hover_text("Arbitrary frame request/keep limit for long loops")
                 .changed()
             {
-                self.history_frame_limit = normalized_history_limit(typed_limit);
+                self.primary.limits.frame_limit = normalized_history_limit(typed_limit);
                 self.retrim_extra_pane_history_to_shared_limit(pane_slot);
                 ctx.request_repaint();
             }
@@ -22406,12 +22465,12 @@ impl ViewerApp {
             self.extra_pane_frame_history_panel(ui, ctx, slot);
             return;
         }
-        if self.frame_history.is_empty() {
+        if self.primary.history.is_empty() {
             ui.weak("No loop — use Load Loop");
             return;
         }
 
-        let frame_count = self.frame_history.len();
+        let frame_count = self.primary.history.len();
         let can_play = self.primary_history_loop_can_step();
         let mut next_frame_index = None;
         let mut timeline_step_delta = None;
@@ -22424,7 +22483,7 @@ impl ViewerApp {
             {
                 timeline_step_delta = Some(-1);
             }
-            let play_label = if self.history_playing {
+            let play_label = if self.primary.cursor.playing {
                 "Pause"
             } else {
                 "Play"
@@ -22446,22 +22505,22 @@ impl ViewerApp {
                 timeline_step_delta = Some(1);
             }
             ui.weak(self.loop_timeline_position_label(LoopTimelineTarget::Primary));
-            let mut selected_limit = self.history_frame_limit;
+            let mut selected_limit = self.primary.limits.frame_limit;
             egui::ComboBox::from_id_salt("history_frame_limit")
-                .selected_text(format!("{}", self.history_frame_limit))
+                .selected_text(format!("{}", self.primary.limits.frame_limit))
                 .width(52.0)
                 .show_ui(ui, |ui| {
                     for limit in HISTORY_SIZE_OPTIONS {
                         ui.selectable_value(&mut selected_limit, *limit, format!("{limit} frames"));
                     }
                 });
-            if selected_limit != self.history_frame_limit {
+            if selected_limit != self.primary.limits.frame_limit {
                 self.set_history_frame_limit(selected_limit, ctx);
             }
             // Playback speed (field request) — screen-only. Recorded
             // GIF/MP4 timing is pinned to real cadence with its own
             // export-speed control in the record menu.
-            let mut typed_limit = self.history_frame_limit;
+            let mut typed_limit = self.primary.limits.frame_limit;
             if ui
                 .add(
                     egui::DragValue::new(&mut typed_limit)
@@ -22516,7 +22575,7 @@ impl ViewerApp {
             self.record_controls_ui_for_target(ui, Some(LoopTimelineTarget::Primary));
         });
 
-        let mut slider_index = self.selected_frame_index.min(frame_count - 1);
+        let mut slider_index = self.primary.cursor.index.min(frame_count - 1);
         let slider_response = ui
             .add_enabled_ui(frame_count > 1, |ui| {
                 ui.add_sized(
@@ -22541,9 +22600,9 @@ impl ViewerApp {
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     let time_zone = self.time_zone();
-                    for (index, frame) in self.frame_history.iter().enumerate() {
+                    for (index, frame) in self.primary.history.iter().enumerate() {
                         let label = compact_frame_label(frame, Utc::now(), time_zone);
-                        let selected = index == self.selected_frame_index;
+                        let selected = index == self.primary.cursor.index;
                         if ui
                             .add_sized(
                                 egui::vec2(72.0, PANEL_BUTTON_HEIGHT),
@@ -22565,11 +22624,11 @@ impl ViewerApp {
                 ctx,
             );
         } else if let Some(index) = next_frame_index {
-            self.history_playing = false;
+            self.primary.cursor.playing = false;
             self.select_history_frame(index, false, ctx);
             // Clicking an older frame latches browse mode (live loads no
             // longer steal the selection); clicking the newest releases it.
-            self.browsing_history = index + 1 < self.frame_history.len();
+            self.primary.cursor.browsing = index + 1 < self.primary.history.len();
         }
     }
 
@@ -22577,15 +22636,16 @@ impl ViewerApp {
         if !self.primary_history_loop_can_step() {
             return false;
         }
-        self.history_playing = !self.history_playing;
-        if self.history_playing {
+        self.primary.cursor.playing = !self.primary.cursor.playing;
+        if self.primary.cursor.playing {
             self.manual_primary_cut_hold = None;
-            self.browsing_history = false;
-            self.last_history_step = Some(Instant::now());
+            self.primary.cursor.browsing = false;
+            self.primary.cursor.last_step = Some(Instant::now());
             ctx.request_repaint();
         } else {
-            self.browsing_history = self.selected_frame_index + 1 < self.frame_history.len();
-            self.last_history_step = None;
+            self.primary.cursor.browsing =
+                self.primary.cursor.index + 1 < self.primary.history.len();
+            self.primary.cursor.last_step = None;
         }
         true
     }
@@ -23854,15 +23914,15 @@ impl ViewerApp {
         let _ = writeln!(
             text,
             "history: frames={} selected={}",
-            self.frame_history.len(),
-            self.selected_frame_index
+            self.primary.history.len(),
+            self.primary.cursor.index
         );
         let _ = writeln!(
             text,
             "poll: active={} source={} last={}",
             self.poll_active,
-            diagnostic_poll_source_label(&self.poll_source),
-            self.poll_last_file.as_deref().unwrap_or("-")
+            diagnostic_poll_source_label(&self.primary.feed),
+            self.primary.live.dedupe_key.as_deref().unwrap_or("-")
         );
         let _ = writeln!(
             text,
@@ -26412,7 +26472,7 @@ impl ViewerApp {
             return pane.engine.live.enabled
                 && self.extra_pane_live_source(pane) != PaneLiveSource::None;
         }
-        self.realtime_level2_auto_refresh
+        self.primary.live.enabled
     }
 
     /// The grid-cell chip for one pane. Radar-owning panes route through
@@ -26973,7 +27033,7 @@ impl ViewerApp {
         current_key: &FrameWorkKey,
         ctx: &egui::Context,
     ) -> bool {
-        let Some(current_index) = self.frame_history.iter().position(|frame| {
+        let Some(current_index) = self.primary.history.iter().position(|frame| {
             frame.identity == current_key.identity
                 && Arc::as_ptr(&frame.volume) as usize == current_key.volume_ptr
         }) else {
@@ -26981,7 +27041,8 @@ impl ViewerApp {
         };
         let site_id = current_key.identity.site_id.clone();
         let frames: Vec<(FrameWorkKey, FrameStatus)> = self
-            .frame_history
+            .primary
+            .history
             .iter()
             .take(current_index + 1)
             .filter(|frame| frame.identity.site_id == site_id)
@@ -29723,7 +29784,7 @@ impl ViewerApp {
             .volume
             .as_ref()
             .is_some_and(|active| active.site.id != identity.site_id)
-            || history_contains_other_site(&self.frame_history, &identity.site_id)
+            || history_contains_other_site(&self.primary.history, &identity.site_id)
         {
             self.clear_frame_history();
         }
@@ -29736,24 +29797,27 @@ impl ViewerApp {
             source_label: format!("polled {name}"),
         };
         if let Some(existing) = self
-            .frame_history
+            .primary
+            .history
             .iter_mut()
             .find(|candidate| candidate.identity == identity)
         {
             *existing = frame;
         } else {
-            self.frame_history.push(frame);
+            self.primary.history.push(frame);
         }
-        self.frame_history
+        self.primary
+            .history
             .sort_by(|left, right| left.identity.cmp(&right.identity));
         self.trim_frame_history();
         // Follow the feed unless the user is looping history.
-        if !self.history_playing {
-            self.selected_frame_index = self
-                .frame_history
+        if !self.primary.cursor.playing {
+            self.primary.cursor.index = self
+                .primary
+                .history
                 .iter()
                 .position(|frame| frame.identity == identity)
-                .unwrap_or_else(|| self.frame_history.len().saturating_sub(1));
+                .unwrap_or_else(|| self.primary.history.len().saturating_sub(1));
         }
         self.install_volume_arc(volume, None, true, None, FrameStatus::Complete, ctx);
     }
@@ -29762,25 +29826,32 @@ impl ViewerApp {
     /// under which an active poll owns the primary view. Extends the old
     /// `!poll_url.is_empty()` guard to the international source.
     fn poll_source_armed(&self) -> bool {
-        match &self.poll_source {
-            PollSource::CustomUrl(_) => !normalized_poll_url(&self.poll_url).is_empty(),
-            PollSource::Intl {
+        match &self.primary.feed {
+            FeedSource::CustomUrl(_) => !normalized_poll_url(&self.poll_url).is_empty(),
+            FeedSource::Live(SiteRef::Intl {
                 provider_id,
                 site_id,
-            } => !provider_id.is_empty() && !site_id.is_empty(),
+            }) => !provider_id.is_empty() && !site_id.is_empty(),
+            // Stage-(i) invariant: primary feed is CustomUrl or Live(Intl)
+            // only (see the `primary` field doc). Other variants land with
+            // the stage-(ii) unify and are un-armed here by definition.
+            _ => false,
         }
     }
 
     /// Drive whichever feed the poller follows. One dispatcher so the poll
-    /// stays singular: shared `poll_active`/`poll_rx`/`poll_last_file`,
+    /// stays singular: shared `poll_active`/`poll_rx`/`primary.live.dedupe_key`,
     /// shared install path, shared ownership guards.
     fn poll_feed(&mut self, ctx: &egui::Context) {
-        match self.poll_source.clone() {
-            PollSource::CustomUrl(_) => self.poll_custom_url(ctx),
-            PollSource::Intl {
+        match self.primary.feed.clone() {
+            FeedSource::CustomUrl(_) => self.poll_custom_url(ctx),
+            FeedSource::Live(SiteRef::Intl {
                 provider_id,
                 site_id,
-            } => self.poll_intl(&provider_id, &site_id, ctx),
+            }) => self.poll_intl(&provider_id, &site_id, ctx),
+            // Unreachable in stage (i): only armed CustomUrl/Live(Intl)
+            // feeds are polled (poll_source_armed gates the caller).
+            _ => {}
         }
     }
 
@@ -29793,7 +29864,7 @@ impl ViewerApp {
             match receiver.try_recv() {
                 Ok(Ok(load)) => {
                     self.poll_rx = None;
-                    self.poll_last_file = Some(load.dedupe_key.clone());
+                    self.primary.live.dedupe_key = Some(load.dedupe_key.clone());
                     self.status = format!("Polled: {}", load.name);
                     self.install_polled_volume(&load.name, load.volume, ctx);
                 }
@@ -29815,7 +29886,7 @@ impl ViewerApp {
     /// on a foreign radar loaded the previous US radar's loop).
     fn intl_poll_owns_primary(&self) -> bool {
         self.poll_active
-            && matches!(&self.poll_source, PollSource::Intl { .. })
+            && matches!(&self.primary.feed, FeedSource::Live(SiteRef::Intl { .. }))
             && self.poll_source_armed()
     }
 
@@ -29824,10 +29895,10 @@ impl ViewerApp {
     /// the primary display while keeping `poll_active = false` so current
     /// live data cannot overwrite historical frames.
     fn intl_source_owns_primary_display(&self) -> bool {
-        let PollSource::Intl {
+        let FeedSource::Live(SiteRef::Intl {
             provider_id,
             site_id,
-        } = &self.poll_source
+        }) = &self.primary.feed
         else {
             return false;
         };
@@ -29851,7 +29922,7 @@ impl ViewerApp {
         self.poll_active = false;
         self.poll_rx = None;
         self.intl_loop_rx = None;
-        self.poll_last_file = None;
+        self.primary.live.dedupe_key = None;
         self.poll_next = None;
         self.set_custom_url_poll_source();
         self.remember_display_owner();
@@ -29882,15 +29953,15 @@ impl ViewerApp {
     }
 
     fn set_intl_archive_primary_source(&mut self, provider_id: &str, site_id: &str) {
-        self.poll_source = PollSource::Intl {
+        self.primary.feed = FeedSource::Live(SiteRef::Intl {
             provider_id: provider_id.to_owned(),
             site_id: site_id.to_owned(),
-        };
+        });
         self.poll_active = false;
         self.poll_rx = None;
-        self.poll_last_file = None;
+        self.primary.live.dedupe_key = None;
         self.poll_next = None;
-        self.poll_source.save_to_settings(&mut self.app_settings);
+        self.primary.feed.save_to_settings(&mut self.app_settings);
         let _ = self.app_settings.save();
         self.remember_display_owner();
     }
@@ -29903,14 +29974,14 @@ impl ViewerApp {
         if self.intl_loop_rx.is_some() {
             return;
         }
-        let PollSource::Intl {
+        let FeedSource::Live(SiteRef::Intl {
             provider_id,
             site_id,
-        } = self.poll_source.clone()
+        }) = self.primary.feed.clone()
         else {
             return;
         };
-        let count = self.history_frame_limit.max(2);
+        let count = self.primary.limits.frame_limit.max(2);
         let (sender, receiver) = mpsc::channel();
         self.intl_loop_rx = Some(receiver);
         self.intl_loop_frames = 0;
@@ -29969,7 +30040,7 @@ impl ViewerApp {
             self.archive_load_progress = Some(progress);
         }
         for (identity, volume) in frames {
-            self.poll_last_file = Some(identity.clone());
+            self.primary.live.dedupe_key = Some(identity.clone());
             self.install_polled_volume(&identity, Arc::new(volume), ctx);
         }
         if let Some(message) = errors.last() {
@@ -29994,7 +30065,7 @@ impl ViewerApp {
                     self.intl_loop_frames
                 )
             };
-        } else if landed && let Some(name) = &self.poll_last_file {
+        } else if landed && let Some(name) = &self.primary.live.dedupe_key {
             self.status = format!("Intl loop: {name}");
         }
         if done {
@@ -30034,7 +30105,7 @@ impl ViewerApp {
             self.poll_next = Some(Instant::now() + Duration::from_secs(INTL_POLL_SECONDS));
             let provider_id = provider_id.to_owned();
             let site_id = site_id.to_owned();
-            let last = self.poll_last_file.clone();
+            let last = self.primary.live.dedupe_key.clone();
             let (sender, receiver) = mpsc::channel();
             self.poll_rx = Some(receiver);
             let ctx_clone = ctx.clone();
@@ -30148,8 +30219,8 @@ impl ViewerApp {
         // site and is dropped with it.
         let same_site = self.poll_active
             && matches!(
-                &self.poll_source,
-                PollSource::Intl { provider_id: p, site_id: s }
+                &self.primary.feed,
+                FeedSource::Live(SiteRef::Intl { provider_id: p, site_id: s })
                     if *p == provider_id && *s == site_id
             );
         if !same_site {
@@ -30157,12 +30228,12 @@ impl ViewerApp {
             self.intl_loop_rx = None;
             self.clear_displayed_volume_for_pending_load(ctx);
         }
-        self.poll_source = PollSource::Intl {
+        self.primary.feed = FeedSource::Live(SiteRef::Intl {
             provider_id,
             site_id,
-        };
+        });
         self.poll_active = true;
-        self.poll_last_file = None;
+        self.primary.live.dedupe_key = None;
         self.poll_next = None;
         // An auto-refresh load already in flight would land AFTER the
         // first poll install and wipe the polled frames — drop it.
@@ -30170,7 +30241,7 @@ impl ViewerApp {
         // A still-in-flight tick of the PREVIOUS source must not install
         // under the new one (its sender now writes into a closed channel).
         self.poll_rx = None;
-        self.poll_source.save_to_settings(&mut self.app_settings);
+        self.primary.feed.save_to_settings(&mut self.app_settings);
         let _ = self.app_settings.save();
         self.remember_display_owner();
     }
@@ -30316,7 +30387,7 @@ impl ViewerApp {
         self.ord_archive_minute_input = start_utc.format("%M").to_string();
         self.archive_frame_count = max_frames.min(MAX_ARCHIVE_FRAME_COUNT);
         self.archive_load_loop = true;
-        self.history_frame_limit = self.history_frame_limit.max(max_frames);
+        self.primary.limits.frame_limit = self.primary.limits.frame_limit.max(max_frames);
 
         let label = format!(
             "ORD archive {site_id} window {} to {}",
@@ -30381,7 +30452,7 @@ impl ViewerApp {
             .unwrap_or(true);
         if due && self.poll_rx.is_none() {
             self.poll_next = Some(Instant::now() + Duration::from_secs(15));
-            let last = self.poll_last_file.clone();
+            let last = self.primary.live.dedupe_key.clone();
             let (sender, receiver) = mpsc::channel();
             self.poll_rx = Some(receiver);
             let ctx_clone = ctx.clone();
@@ -30610,15 +30681,16 @@ impl ViewerApp {
     /// displayed radar time and never substitute current lightning.
     fn glm_display_time_ms(&self, now_ms: i64) -> i64 {
         let selected_is_live = self
-            .frame_history
-            .get(self.selected_frame_index)
+            .primary
+            .history
+            .get(self.primary.cursor.index)
             .is_some_and(|frame| {
                 matches!(
                     frame.status,
                     FrameStatus::LivePartial | FrameStatus::LiveComplete
                 )
             });
-        if selected_is_live && !self.browsing_history && !self.history_playing {
+        if selected_is_live && !self.primary.cursor.browsing && !self.primary.cursor.playing {
             now_ms
         } else {
             self.displayed_timeline_time_utc()
@@ -30632,7 +30704,7 @@ impl ViewerApp {
         let loop_window = self.loaded_loop_summary_time_window_for_target(target)?;
         let has_loop_context =
             self.loop_timeline_history_len(target) > 1 || self.loop_timeline_playing(target);
-        if !has_loop_context && !self.browsing_history {
+        if !has_loop_context && !self.primary.cursor.browsing {
             return None;
         }
         let display_window_ms =
@@ -32894,13 +32966,14 @@ impl ViewerApp {
         let current_status = self
             .selected_frame()
             .filter(|frame| matches_current(frame))
-            .or_else(|| self.frame_history.iter().rev().find(matches_current))
+            .or_else(|| self.primary.history.iter().rev().find(matches_current))
             .map(|frame| frame.status);
         if current_status != Some(FrameStatus::LivePartial) {
             return Some(volume);
         }
         let current_site = volume.site.id.as_str();
-        self.frame_history
+        self.primary
+            .history
             .iter()
             .rev()
             .find(|candidate| {
@@ -34286,7 +34359,7 @@ impl ViewerApp {
         let font_v = egui::FontId::proportional(obs_style.value_font_px);
         let font_id = egui::FontId::proportional(obs_style.small_font_px);
         // Fuller reports first so they win declutter cells.
-        let looping = self.history_playing || self.browsing_history;
+        let looping = self.primary.cursor.playing || self.primary.cursor.browsing;
         let plot_units = self.units();
         let (max_candidates, max_full_plots, max_labels, max_dots) = if looping {
             (3000usize, 150usize, 0usize, 500usize)
@@ -35091,9 +35164,11 @@ impl ViewerApp {
         if !self.intl_source_owns_primary_display() {
             return None;
         }
-        match &self.poll_source {
-            PollSource::Intl { provider_id, .. } => Some(provider_id.as_str()),
-            PollSource::CustomUrl(_) => None,
+        match &self.primary.feed {
+            FeedSource::Live(SiteRef::Intl { provider_id, .. }) => Some(provider_id.as_str()),
+            // Stage-(i) invariant: primary feed is CustomUrl or Live(Intl)
+            // only; neither carries an intl velocity provider here.
+            _ => None,
         }
     }
 
@@ -35128,7 +35203,7 @@ impl ViewerApp {
                 INTL_STALE_CHIP_FLOOR_SECONDS,
             );
         }
-        self.mode_chip_state_with_live(self.realtime_level2_auto_refresh)
+        self.mode_chip_state_with_live(self.primary.live.enabled)
     }
 
     /// Chip derivation with an explicit liveness input: `self.volume` is the
@@ -37832,8 +37907,8 @@ impl ViewerApp {
                 || volume_id.eq_ignore_ascii_case(&site.label);
         }
         matches!(
-            &self.poll_source,
-            PollSource::Intl { provider_id, site_id }
+            &self.primary.feed,
+            FeedSource::Live(SiteRef::Intl { provider_id, site_id })
                 if self.poll_active
                     && provider_id == site.provider_id
                     && site_id.eq_ignore_ascii_case(&site.site_id)
@@ -38469,7 +38544,7 @@ impl ViewerApp {
     /// any — `poll_url` is what the live tick reads, so a marker lights up
     /// exactly when its feed is the one being polled.
     fn active_community_poll_url(&self) -> Option<&str> {
-        (self.poll_active && matches!(self.poll_source, PollSource::CustomUrl(_)))
+        (self.poll_active && matches!(self.primary.feed, FeedSource::CustomUrl(_)))
             .then_some(self.poll_url.as_str())
     }
 
@@ -40835,7 +40910,7 @@ fn community_feed_for_site(
 /// the archive browser, Event Loop Builder, and Reset View all resume on
 /// the owner. Anything else (absent key, bare US id, stale intl ref)
 /// keeps the legacy CustomUrl seed. Pure over settings for testing.
-fn restored_poll_source(app_settings: &settings::AppSettings) -> PollSource {
+fn restored_primary_feed(app_settings: &settings::AppSettings) -> FeedSource {
     if let Some(key) = app_settings.display_owner_site.as_deref()
         && let SiteRef::Intl {
             provider_id,
@@ -40847,12 +40922,12 @@ fn restored_poll_source(app_settings: &settings::AppSettings) -> PollSource {
         })
         .is_some()
     {
-        return PollSource::Intl {
+        return FeedSource::Live(SiteRef::Intl {
             provider_id,
             site_id,
-        };
+        });
     }
-    PollSource::CustomUrl(app_settings.poll_url.clone())
+    FeedSource::CustomUrl(app_settings.poll_url.clone())
 }
 
 /// Grouped "International" section for a SITE combo (v0.29 Phase 3: both
@@ -49888,12 +49963,12 @@ fn sat_frame_distance_seconds(run_name: &str, hhmm: u16, target_utc: DateTime<Ut
 
 fn normalized_history_limit(limit: usize) -> usize {
     // Clamp, don't snap to presets: deployment loads raise the limit past
-    // the combo options, and trims must not collapse it back to 7.
-    if limit == 0 {
-        DEFAULT_HISTORY_FRAME_LIMIT
-    } else {
-        limit.clamp(HISTORY_SIZE_OPTIONS[0], MAX_HISTORY_FRAME_LIMIT)
-    }
+    // the combo options, and trims must not collapse it back to 7. The
+    // logic lives in the engine (Phase 4e stage (i)) so the legacy trims
+    // and `HistoryLimits` can never disagree; `HISTORY_SIZE_OPTIONS[0]`
+    // equals the engine's `MIN_HISTORY_FRAME_LIMIT` floor (pinned by
+    // `history_size_options_reach_96_without_changing_default`).
+    HistoryLimits::normalized_frame_limit(limit)
 }
 
 fn loop_repaint_poll_ms(frame_ms: u64) -> u64 {
@@ -51043,7 +51118,7 @@ mod tests {
         app.switch_to_best_radar_at(17.95, 59.65, &ctx);
         assert!(app.poll_active, "intl pick must arm the poll");
         assert!(
-            matches!(app.poll_source, PollSource::Intl { .. }),
+            matches!(app.primary.feed, FeedSource::Live(SiteRef::Intl { .. })),
             "best-radar pick over Europe routes to the intl poller"
         );
         assert!(
@@ -51099,7 +51174,7 @@ mod tests {
             "a US search pick releases the intl display owner (the SITE \
              search path was one of the original latch fixes)"
         );
-        assert!(matches!(app.poll_source, PollSource::CustomUrl(_)));
+        assert!(matches!(app.primary.feed, FeedSource::CustomUrl(_)));
         assert!(
             app.load_receiver.is_none(),
             "search picks never start a load"
@@ -51134,12 +51209,12 @@ mod tests {
         assert!(app.poll_active, "intl search pick must arm the poll");
         assert!(
             matches!(
-                &app.poll_source,
-                PollSource::Intl { provider_id, site_id }
+                &app.primary.feed,
+                FeedSource::Live(SiteRef::Intl { provider_id, site_id })
                     if provider_id == "smhi" && site_id == "angelholm"
             ),
             "intl search pick routes to the intl poller, got {:?}",
-            app.poll_source
+            app.primary.feed
         );
         assert!(
             app.status.starts_with("Polling"),
@@ -51663,9 +51738,9 @@ mod tests {
         app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
         app.selected_cut = 1;
         app.poll_active = true;
-        app.poll_source =
-            PollSource::CustomUrl("http://198.51.100.9/fwlx/dir.list?token=test".to_owned());
-        app.poll_last_file = Some("FWLX20260613_120000".to_owned());
+        app.primary.feed =
+            FeedSource::CustomUrl("http://198.51.100.9/fwlx/dir.list?token=test".to_owned());
+        app.primary.live.dedupe_key = Some("FWLX20260613_120000".to_owned());
         app.archive_load_progress = Some(ArchiveLoadProgress {
             label: "Archive loop".to_owned(),
             detail: "Decoded FWLX scan".to_owned(),
@@ -52889,7 +52964,7 @@ mod tests {
     ) -> String {
         let ctx = egui::Context::default();
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.frame_history = volumes
+        app.primary.history = volumes
             .iter()
             .enumerate()
             .map(|(index, volume)| FrameHistoryEntry {
@@ -52906,16 +52981,16 @@ mod tests {
                 source_label: "KHDC profile".to_owned(),
             })
             .collect();
-        app.history_frame_limit = volumes.len();
+        app.primary.limits.frame_limit = volumes.len();
         app.volume = volumes.first().cloned();
-        app.selected_frame_index = 0;
+        app.primary.cursor.index = 0;
         app.selected_product = product.clone();
         app.selected_cut = app
             .volume
             .as_ref()
             .and_then(|volume| best_cut_for_product(volume.as_ref(), 0, &product))
             .unwrap_or(0);
-        app.history_playing = true;
+        app.primary.cursor.playing = true;
         app.app_settings.loop_low_sweeps = low_sweeps;
         app.unified_player.auto_sync_warnings = false;
         app.hazards_visible = false;
@@ -52930,9 +53005,10 @@ mod tests {
             app.advance_primary_screen_loop(&ctx);
             let elapsed_ms = step_start.elapsed().as_secs_f32() * 1000.0;
             step_ms.push(elapsed_ms);
-            let selected_index = app.selected_frame_index;
+            let selected_index = app.primary.cursor.index;
             let scan_time = app
-                .frame_history
+                .primary
+                .history
                 .get(selected_index)
                 .map(|frame| frame.identity.scan_time_utc.to_rfc3339())
                 .unwrap_or_default();
@@ -53831,14 +53907,14 @@ mod tests {
 
         assert!(app.intl_source_owns_primary_display());
         assert!(matches!(
-            app.poll_source,
-            PollSource::Intl {
+            app.primary.feed,
+            FeedSource::Live(SiteRef::Intl {
                 ref provider_id,
                 ref site_id
-            } if provider_id == "ord" && site_id == "zzbad"
+            }) if provider_id == "ord" && site_id == "zzbad"
         ));
         assert_eq!(app.ord_archive_site_input, "zzbad");
-        assert_eq!(app.history_frame_limit, 12);
+        assert_eq!(app.primary.limits.frame_limit, 12);
         assert!(app.load_receiver.is_some());
 
         let receiver = app.load_receiver.take().expect("worker receiver");
@@ -54150,7 +54226,7 @@ mod tests {
             app.manual_primary_cut_hold,
             Some(LowSweepCutKey::new(&expected_identity, 1))
         );
-        assert!(!app.history_playing);
+        assert!(!app.primary.cursor.playing);
     }
 
     #[test]
@@ -54696,7 +54772,7 @@ mod tests {
             720,
         ));
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("loop-low-sweeps"),
             volume,
@@ -54708,14 +54784,14 @@ mod tests {
 
         assert_eq!(
             low_sweep_cuts_for_product(
-                app.frame_history[0].volume.as_ref(),
+                app.primary.history[0].volume.as_ref(),
                 &DisplayProduct::Moment(MomentType::Reflectivity),
                 LowSweepLoopFilter::All
             ),
             vec![0, 1, 2]
         );
         assert!(app.advance_history_loop_low_sweep(&ctx));
-        assert_eq!(app.selected_frame_index, 0);
+        assert_eq!(app.primary.cursor.index, 0);
         assert_eq!(app.selected_cut, 1);
         assert_eq!(app.texture_key.as_ref(), Some(&retained_texture_key));
         assert!(
@@ -54797,7 +54873,7 @@ mod tests {
             720,
         ));
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("range-cut-time-order"),
             volume,
@@ -54844,9 +54920,9 @@ mod tests {
         second.volume_time = first.volume_time + chrono::Duration::minutes(3);
         let second = Arc::new(second);
         app.volume = Some(Arc::clone(&first));
-        app.selected_frame_index = 0;
+        app.primary.cursor.index = 0;
         app.selected_cut = 0;
-        app.frame_history = [Arc::clone(&first), Arc::clone(&second)]
+        app.primary.history = [Arc::clone(&first), Arc::clone(&second)]
             .into_iter()
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
@@ -54868,7 +54944,7 @@ mod tests {
         );
         assert_eq!(
             next_frame_index_with_sweep_cuts(
-                &app.frame_history,
+                &app.primary.history,
                 0,
                 &app.selected_product,
                 SweepPolicy::range_cdeg(110, 150),
@@ -54928,7 +55004,7 @@ mod tests {
         add_velocity_moments_to_volume(&mut volume);
         let volume = Arc::new(volume);
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("different-pane-ranges"),
             volume: Arc::clone(&volume),
@@ -54962,7 +55038,7 @@ mod tests {
             720,
         ));
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("low-sweep-summary-cache"),
             volume,
@@ -55036,10 +55112,10 @@ mod tests {
 
         // Push: a new frame extends the summary.
         let first = single_cut(0);
-        app.frame_history.push(frame_for(&first, "gen-push-1"));
+        app.primary.history.push(frame_for(&first, "gen-push-1"));
         assert_eq!(primary_steps(&app), 1);
         let second = sails(5);
-        app.frame_history.push(frame_for(&second, "gen-push-2"));
+        app.primary.history.push(frame_for(&second, "gen-push-2"));
         assert_eq!(
             primary_steps(&app),
             4,
@@ -55050,7 +55126,8 @@ mod tests {
         let refetched = sails(0);
         let refetched_identity = frame_identity_for_volume(refetched.as_ref());
         if let Some(existing) = app
-            .frame_history
+            .primary
+            .history
             .iter_mut()
             .find(|frame| frame.identity == refetched_identity)
         {
@@ -55065,7 +55142,8 @@ mod tests {
         // Advanced-product write-back: the volume Arc is swapped in place.
         let derived = single_cut(5);
         if let Some(frame) = app
-            .frame_history
+            .primary
+            .history
             .iter_mut()
             .find(|frame| Arc::ptr_eq(&frame.volume, &second))
         {
@@ -55078,12 +55156,14 @@ mod tests {
         );
 
         // Trim: the history limit clamps no lower than HISTORY_SIZE_OPTIONS[0].
-        app.frame_history
+        app.primary
+            .history
             .push(frame_for(&single_cut(10), "gen-push-3"));
-        app.frame_history
+        app.primary
+            .history
             .push(frame_for(&single_cut(15), "gen-push-4"));
         assert_eq!(primary_steps(&app), 6);
-        app.history_frame_limit = HISTORY_SIZE_OPTIONS[0];
+        app.primary.limits.frame_limit = HISTORY_SIZE_OPTIONS[0];
         app.trim_frame_history();
         assert_eq!(
             primary_steps(&app),
@@ -55140,8 +55220,12 @@ mod tests {
                 .clone()
         };
 
-        app.frame_history.push(frame_at(0, "per-target-primary-1"));
-        app.frame_history.push(frame_at(5, "per-target-primary-2"));
+        app.primary
+            .history
+            .push(frame_at(0, "per-target-primary-1"));
+        app.primary
+            .history
+            .push(frame_at(5, "per-target-primary-2"));
         app.extra_panes[0]
             .engine
             .history
@@ -55168,7 +55252,9 @@ mod tests {
 
         // Primary push: the primary entry invalidates, the pane survives.
         let pane_key = cached_key(&app, LoopTimelineTarget::ExtraPane(0));
-        app.frame_history.push(frame_at(10, "per-target-primary-3"));
+        app.primary
+            .history
+            .push(frame_at(10, "per-target-primary-3"));
         assert_eq!(steps(&app, LoopTimelineTarget::Primary), 3);
         assert_eq!(
             cached_key(&app, LoopTimelineTarget::ExtraPane(0)),
@@ -55204,7 +55290,7 @@ mod tests {
                 source_label: "test".to_owned(),
             }
         };
-        app.frame_history.push(frame_at(0, "driver-primary-1"));
+        app.primary.history.push(frame_at(0, "driver-primary-1"));
 
         let before = app
             .loop_timeline_summary_cache_key(LoopTimelineTarget::Primary)
@@ -55266,16 +55352,18 @@ mod tests {
             source_label: "test".to_owned(),
         };
 
-        app.frame_history
+        app.primary
+            .history
             .push(frame_for(&first_volume, "gate-2200"));
         app.volume = Some(Arc::clone(&first_volume));
         app.timeline_reports_reference_utc = app.timeline_report_reference_time_utc();
         assert_eq!(app.timeline_reports_reference_utc, Some(first_time));
 
-        app.frame_history
+        app.primary
+            .history
             .push(frame_for(&second_volume, "gate-2205"));
         app.volume = Some(Arc::clone(&second_volume));
-        app.selected_frame_index = 1;
+        app.primary.cursor.index = 1;
         app.timeline_reports_reference_utc = app.timeline_report_reference_time_utc();
         assert_eq!(app.timeline_reports_reference_utc, Some(second_time));
         let contemporary = spc_layers::StormReport {
@@ -55342,7 +55430,7 @@ mod tests {
             720,
         ));
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("one-volume-low-sweep-prewarm"),
             volume,
@@ -55384,7 +55472,7 @@ mod tests {
             &[(0.5, 60_000), (0.5, 90_000)],
             720,
         ));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(first.as_ref()),
             path: PathBuf::from("prewarm-pause-1"),
             volume: first,
@@ -55392,7 +55480,7 @@ mod tests {
             status: FrameStatus::LiveComplete,
             source_label: "test".to_owned(),
         });
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(second.as_ref()),
             path: PathBuf::from("prewarm-pause-2"),
             volume: second,
@@ -55484,7 +55572,7 @@ mod tests {
         add_velocity_moments_to_volume(&mut volume);
         let volume = Arc::new(volume);
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("loop-low-sweeps-split-pane"),
             volume,
@@ -55536,7 +55624,7 @@ mod tests {
         let second = Arc::new(second);
 
         app.volume = Some(Arc::clone(&first));
-        app.frame_history = [Arc::clone(&first), Arc::clone(&second)]
+        app.primary.history = [Arc::clone(&first), Arc::clone(&second)]
             .into_iter()
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
@@ -55553,7 +55641,7 @@ mod tests {
         app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
         app.extra_panes[0].cut = Some(1);
         app.extra_panes[0].volume = Some(first);
-        app.extra_panes[0].engine.history = app.frame_history.clone();
+        app.extra_panes[0].engine.history = app.primary.history.clone();
 
         assert_eq!(
             app.shared_low_sweep_driver_product(),
@@ -55572,7 +55660,7 @@ mod tests {
             },
             &ctx,
         );
-        assert_eq!(app.selected_frame_index, 1);
+        assert_eq!(app.primary.cursor.index, 1);
         assert_eq!(app.selected_cut, 0);
         assert_eq!(
             app.extra_panes[0].engine.cursor.index, 0,
@@ -55602,7 +55690,7 @@ mod tests {
             &[(0.5, 0), (0.7, 30_000), (1.2, 55_000)],
             720,
         ));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("loop-record-low-sweeps"),
             volume,
@@ -55644,7 +55732,7 @@ mod tests {
             720,
         ));
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("one-frame-low-sweep-loop"),
             volume,
@@ -55652,20 +55740,20 @@ mod tests {
             status: FrameStatus::LiveComplete,
             source_label: "test".to_owned(),
         });
-        app.history_playing = true;
-        app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        app.primary.cursor.playing = true;
+        app.primary.cursor.last_step = Some(Instant::now() - Duration::from_secs(5));
         let ctx = egui::Context::default();
 
         advance_primary_screen_loop_for_test(&mut app, &ctx);
-        assert_eq!(app.selected_frame_index, 0);
+        assert_eq!(app.primary.cursor.index, 0);
         assert_eq!(app.selected_cut, 1);
-        assert!(app.history_playing);
+        assert!(app.primary.cursor.playing);
 
-        app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        app.primary.cursor.last_step = Some(Instant::now() - Duration::from_secs(5));
         advance_primary_screen_loop_for_test(&mut app, &ctx);
-        assert_eq!(app.selected_frame_index, 0);
+        assert_eq!(app.primary.cursor.index, 0);
         assert_eq!(app.selected_cut, 0);
-        assert!(app.history_playing);
+        assert!(app.primary.cursor.playing);
     }
 
     #[test]
@@ -55679,7 +55767,7 @@ mod tests {
             720,
         ));
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("unified-player-low-sweep-context"),
             volume,
@@ -55715,7 +55803,7 @@ mod tests {
             720,
         ));
         for volume in [first, second] {
-            app.frame_history.push(FrameHistoryEntry {
+            app.primary.history.push(FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
                 path: PathBuf::from(format!(
                     "low-sweep-position-label-{}",
@@ -55727,8 +55815,8 @@ mod tests {
                 source_label: "test".to_owned(),
             });
         }
-        app.volume = Some(Arc::clone(&app.frame_history[1].volume));
-        app.selected_frame_index = 1;
+        app.volume = Some(Arc::clone(&app.primary.history[1].volume));
+        app.primary.cursor.index = 1;
         let ctx = egui::Context::default();
 
         assert!(app.set_shared_low_sweep_rank(2, &ctx));
@@ -55750,7 +55838,7 @@ mod tests {
             720,
         ));
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("unified-player-warning-sync-low-sweep"),
             volume,
@@ -55771,7 +55859,7 @@ mod tests {
         app.hazards_visible = false;
         app.unified_player.auto_sync_warnings = true;
         add_two_test_history_frames(&mut app);
-        app.volume = Some(Arc::clone(&app.frame_history[0].volume));
+        app.volume = Some(Arc::clone(&app.primary.history[0].volume));
 
         let context = app.unified_player_context();
 
@@ -55787,10 +55875,10 @@ mod tests {
         app.hazards_visible = false;
         app.unified_player.auto_sync_warnings = true;
         add_two_test_history_frames(&mut app);
-        for frame in &mut app.frame_history {
+        for frame in &mut app.primary.history {
             frame.status = FrameStatus::Complete;
         }
-        app.volume = Some(Arc::clone(&app.frame_history[0].volume));
+        app.volume = Some(Arc::clone(&app.primary.history[0].volume));
 
         let context = app.unified_player_context();
 
@@ -55846,7 +55934,7 @@ mod tests {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.sites.push(RadarSite::new("KTLX"));
         app.selected_site_index = 0;
-        app.history_frame_limit = 96;
+        app.primary.limits.frame_limit = 96;
         app.unified_player.auto_sync_warnings = true;
         app.model_timeline_follow = true;
         app.unified_player.start_date_input = "2026-06-17".to_owned();
@@ -55884,7 +55972,7 @@ mod tests {
                 "KTLX",
                 base + chrono::Duration::minutes(minutes),
             ));
-            app.frame_history.push(FrameHistoryEntry {
+            app.primary.history.push(FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
                 path: PathBuf::from(format!("unified-player-record-{minutes}")),
                 volume,
@@ -55893,7 +55981,7 @@ mod tests {
                 source_label: "test".to_owned(),
             });
         }
-        app.volume = Some(Arc::clone(&app.frame_history[0].volume));
+        app.volume = Some(Arc::clone(&app.primary.history[0].volume));
 
         let context = app.unified_player_context();
 
@@ -56130,7 +56218,7 @@ mod tests {
             !app.should_auto_sync_timeline_warnings(),
             "live-follow histories must keep current warnings"
         );
-        for frame in &mut app.frame_history {
+        for frame in &mut app.primary.history {
             frame.status = FrameStatus::Complete;
         }
         assert!(app.should_auto_sync_timeline_warnings());
@@ -56214,7 +56302,7 @@ mod tests {
             720,
         ));
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("low-sweep-warning-sync"),
             volume,
@@ -56233,7 +56321,7 @@ mod tests {
         app.unified_player.auto_sync_warnings = true;
         app.hazards_visible = true;
         add_two_test_history_frames(&mut app);
-        for frame in &mut app.frame_history {
+        for frame in &mut app.primary.history {
             frame.status = FrameStatus::Complete;
         }
 
@@ -56296,7 +56384,7 @@ mod tests {
         let target = Utc.with_ymd_and_hms(2026, 6, 15, 17, 56, 0).unwrap();
         let volume = Arc::new(test_volume_with_site_time("KTLX", target));
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("sat-follow-queue-nearest"),
             volume,
@@ -56333,7 +56421,7 @@ mod tests {
             if index == 0 {
                 app.volume = Some(Arc::clone(&volume));
             }
-            app.frame_history.push(FrameHistoryEntry {
+            app.primary.history.push(FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
                 path: PathBuf::from(format!("sat-record-wait-{minutes}")),
                 volume,
@@ -56415,7 +56503,7 @@ mod tests {
             if index == 0 {
                 app.volume = Some(Arc::clone(&volume));
             }
-            app.frame_history.push(FrameHistoryEntry {
+            app.primary.history.push(FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
                 path: PathBuf::from(format!("model-record-wait-{minutes}")),
                 volume,
@@ -56462,7 +56550,7 @@ mod tests {
             720,
         ));
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("unified-player-low-sweep-next-prev"),
             volume,
@@ -56473,7 +56561,7 @@ mod tests {
         let ctx = egui::Context::default();
 
         app.select_relative_timeline_step(1, &ctx);
-        assert_eq!(app.selected_frame_index, 0);
+        assert_eq!(app.primary.cursor.index, 0);
         assert_eq!(app.selected_cut, 1);
         assert_eq!(app.current_loop_timeline_step_index(), 1);
 
@@ -56507,7 +56595,7 @@ mod tests {
             720,
         ));
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("active-pane-low-sweep-driver"),
             volume,
@@ -56539,7 +56627,7 @@ mod tests {
             720,
         ));
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("visible-pane-low-sweep-driver"),
             volume,
@@ -56580,7 +56668,7 @@ mod tests {
             720,
         ));
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("four-pane-visible-velocity-driver"),
             volume,
@@ -56622,7 +56710,7 @@ mod tests {
         let second = Arc::new(second);
         app.volume = Some(Arc::clone(&first));
         for volume in [first, second] {
-            app.frame_history.push(FrameHistoryEntry {
+            app.primary.history.push(FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
                 path: PathBuf::from(format!(
                     "split-pane-velocity-driver-{}",
@@ -56688,7 +56776,7 @@ mod tests {
         second.volume_time = scan_time + chrono::Duration::minutes(3);
         let second = Arc::new(second);
         app.volume = Some(Arc::clone(&first));
-        app.frame_history = [first, second]
+        app.primary.history = [first, second]
             .into_iter()
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
@@ -56702,18 +56790,18 @@ mod tests {
                 source_label: "test".to_owned(),
             })
             .collect();
-        app.history_playing = true;
+        app.primary.cursor.playing = true;
         let ctx = egui::Context::default();
 
-        app.last_history_step = None;
+        app.primary.cursor.last_step = None;
         advance_primary_screen_loop_for_test(&mut app, &ctx);
-        assert_eq!(app.selected_frame_index, 1);
+        assert_eq!(app.primary.cursor.index, 1);
         assert_eq!(app.extra_panes[0].cut, Some(0));
         assert_eq!(app.current_loop_timeline_step_index(), 1);
 
-        app.last_history_step = None;
+        app.primary.cursor.last_step = None;
         advance_primary_screen_loop_for_test(&mut app, &ctx);
-        assert_eq!(app.selected_frame_index, 1);
+        assert_eq!(app.primary.cursor.index, 1);
         assert_eq!(
             app.extra_panes[0].cut,
             Some(1),
@@ -56721,14 +56809,14 @@ mod tests {
         );
         assert_eq!(app.current_loop_timeline_step_index(), 2);
 
-        app.last_history_step = None;
+        app.primary.cursor.last_step = None;
         advance_primary_screen_loop_for_test(&mut app, &ctx);
         assert_eq!(app.extra_panes[0].cut, Some(2));
         assert_eq!(app.current_loop_timeline_step_index(), 3);
 
-        app.last_history_step = None;
+        app.primary.cursor.last_step = None;
         advance_primary_screen_loop_for_test(&mut app, &ctx);
-        assert_eq!(app.selected_frame_index, 0);
+        assert_eq!(app.primary.cursor.index, 0);
         assert_eq!(app.extra_panes[0].cut, Some(0));
         assert_eq!(app.current_loop_timeline_step_index(), 0);
     }
@@ -56752,7 +56840,7 @@ mod tests {
         volume.volume_time = scan_time;
         let volume = Arc::new(volume);
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("split-pane-manual-expanded"),
             volume,
@@ -56791,7 +56879,7 @@ mod tests {
         volume.volume_time = Utc.with_ymd_and_hms(2026, 6, 17, 18, 27, 0).unwrap();
         let volume = Arc::new(volume);
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("three-pane-visible-velocity-expanded"),
             volume,
@@ -56997,7 +57085,7 @@ mod tests {
         second.volume_time = scan_time + chrono::Duration::minutes(3);
         let second = Arc::new(second);
         app.volume = Some(Arc::clone(&first));
-        app.frame_history = [Arc::clone(&first), Arc::clone(&second)]
+        app.primary.history = [Arc::clone(&first), Arc::clone(&second)]
             .into_iter()
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
@@ -57017,22 +57105,22 @@ mod tests {
         app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
         app.extra_panes[0].cut = Some(0);
         app.extra_panes[0].volume = Some(first);
-        app.extra_panes[0].engine.history = app.frame_history.clone();
-        app.history_playing = true;
+        app.extra_panes[0].engine.history = app.primary.history.clone();
+        app.primary.cursor.playing = true;
         let ctx = egui::Context::default();
 
-        app.last_history_step = None;
+        app.primary.cursor.last_step = None;
         advance_primary_screen_loop_for_test(&mut app, &ctx);
-        assert_eq!(app.selected_frame_index, 1);
+        assert_eq!(app.primary.cursor.index, 1);
         assert_eq!(
             app.extra_panes[0].engine.cursor.index, 1,
             "cloned independent panes must move to the matching frame before low-sweep sync"
         );
         assert_eq!(app.extra_panes[0].cut, Some(0));
 
-        app.last_history_step = None;
+        app.primary.cursor.last_step = None;
         advance_primary_screen_loop_for_test(&mut app, &ctx);
-        assert_eq!(app.selected_frame_index, 1);
+        assert_eq!(app.primary.cursor.index, 1);
         assert_eq!(app.extra_panes[0].engine.cursor.index, 1);
         assert_eq!(
             app.extra_panes[0].cut,
@@ -57064,7 +57152,7 @@ mod tests {
         second.volume_time = scan_time + chrono::Duration::minutes(3);
         let second = Arc::new(second);
         app.volume = Some(Arc::clone(&first));
-        app.frame_history = [Arc::clone(&first), Arc::clone(&second)]
+        app.primary.history = [Arc::clone(&first), Arc::clone(&second)]
             .into_iter()
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
@@ -57084,7 +57172,7 @@ mod tests {
         app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
         app.extra_panes[0].cut = Some(0);
         app.extra_panes[0].volume = Some(first);
-        app.extra_panes[0].engine.history = app.frame_history.clone();
+        app.extra_panes[0].engine.history = app.primary.history.clone();
 
         assert_eq!(
             app.shared_low_sweep_driver_product(),
@@ -57141,7 +57229,7 @@ mod tests {
         second.volume_time = scan_time + chrono::Duration::minutes(3);
         let second = Arc::new(second);
         app.volume = Some(Arc::clone(&first));
-        app.frame_history = [Arc::clone(&first), Arc::clone(&second)]
+        app.primary.history = [Arc::clone(&first), Arc::clone(&second)]
             .into_iter()
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
@@ -57161,7 +57249,7 @@ mod tests {
         app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
         app.extra_panes[0].cut = Some(0);
         app.extra_panes[0].volume = Some(first);
-        app.extra_panes[0].engine.history = app.frame_history.clone();
+        app.extra_panes[0].engine.history = app.primary.history.clone();
 
         let ctx = egui::Context::default();
         app.select_history_record_step(
@@ -57174,7 +57262,7 @@ mod tests {
             &ctx,
         );
 
-        assert_eq!(app.selected_frame_index, 1);
+        assert_eq!(app.primary.cursor.index, 1);
         assert_eq!(app.extra_panes[0].engine.cursor.index, 1);
         assert_eq!(
             app.extra_panes[0].cut,
@@ -57445,7 +57533,7 @@ mod tests {
         let first = Arc::new(test_volume_with_site_time("KAAA", first_time));
         let second = Arc::new(test_volume_with_site_time("KAAA", second_time));
         app.volume = Some(Arc::clone(&first));
-        app.frame_history = [Arc::clone(&first), second]
+        app.primary.history = [Arc::clone(&first), second]
             .into_iter()
             .enumerate()
             .map(|(index, volume)| FrameHistoryEntry {
@@ -57457,9 +57545,9 @@ mod tests {
                 source_label: "test".to_owned(),
             })
             .collect();
-        app.selected_frame_index = 0;
-        app.history_playing = true;
-        app.last_history_step = Some(Instant::now() - Duration::from_millis(350));
+        app.primary.cursor.index = 0;
+        app.primary.cursor.playing = true;
+        app.primary.cursor.last_step = Some(Instant::now() - Duration::from_millis(350));
         app.manual_camera_path = ManualCameraPath {
             keyframes: vec![
                 ManualCameraKeyframe {
@@ -57564,7 +57652,7 @@ mod tests {
         second.volume_time += chrono::Duration::minutes(3);
         let second = Arc::new(second);
         app.volume = Some(Arc::clone(&first));
-        app.frame_history = [Arc::clone(&first), Arc::clone(&second)]
+        app.primary.history = [Arc::clone(&first), Arc::clone(&second)]
             .into_iter()
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
@@ -57578,8 +57666,8 @@ mod tests {
                 source_label: "test".to_owned(),
             })
             .collect();
-        app.history_playing = true;
-        app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        app.primary.cursor.playing = true;
+        app.primary.cursor.last_step = Some(Instant::now() - Duration::from_secs(5));
         app.texture_key = Some(test_screen_texture_key(
             Arc::as_ptr(&second) as usize,
             0,
@@ -57590,25 +57678,25 @@ mod tests {
         app.maybe_advance_history_loop(&ctx);
 
         assert_eq!(
-            app.selected_frame_index, 0,
+            app.primary.cursor.index, 0,
             "screen playback must hold selection while the visible texture belongs to another frame"
         );
         assert!(
-            app.last_history_step.is_none(),
+            app.primary.cursor.last_step.is_none(),
             "render wait time must not consume the selected frame's dwell"
         );
 
         mark_primary_screen_textures_ready(&mut app);
         app.maybe_advance_history_loop(&ctx);
         assert_eq!(
-            app.selected_frame_index, 0,
+            app.primary.cursor.index, 0,
             "a ready frame starts its dwell first"
         );
-        assert!(app.last_history_step.is_some());
+        assert!(app.primary.cursor.last_step.is_some());
 
-        app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        app.primary.cursor.last_step = Some(Instant::now() - Duration::from_secs(5));
         app.maybe_advance_history_loop(&ctx);
-        assert_eq!(app.selected_frame_index, 1);
+        assert_eq!(app.primary.cursor.index, 1);
         assert!(
             app.texture_key.is_some(),
             "active playback should keep painting the previous same-site texture until the next frame renders"
@@ -57634,7 +57722,7 @@ mod tests {
         second.volume_time += chrono::Duration::minutes(3);
         let second = Arc::new(second);
         app.volume = Some(Arc::clone(&first));
-        app.frame_history = [Arc::clone(&first), Arc::clone(&second)]
+        app.primary.history = [Arc::clone(&first), Arc::clone(&second)]
             .into_iter()
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
@@ -57648,8 +57736,8 @@ mod tests {
                 source_label: "test".to_owned(),
             })
             .collect();
-        app.history_playing = true;
-        app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        app.primary.cursor.playing = true;
+        app.primary.cursor.last_step = Some(Instant::now() - Duration::from_secs(5));
         mark_primary_screen_textures_ready(&mut app);
 
         let mut layer = OverlayView::new(
@@ -57662,7 +57750,7 @@ mod tests {
         );
         layer.visible = true;
         layer.volume = Some(Arc::clone(&first));
-        layer.engine.history = FrameHistory::from(app.frame_history.to_vec());
+        layer.engine.history = FrameHistory::from(app.primary.history.to_vec());
         layer.texture_key = Some(test_screen_texture_key(
             Arc::as_ptr(&second) as usize,
             0,
@@ -57674,11 +57762,11 @@ mod tests {
         app.maybe_advance_history_loop(&ctx);
 
         assert_eq!(
-            app.selected_frame_index, 0,
+            app.primary.cursor.index, 0,
             "screen playback must hold while a synced radar overlay is still painted on a stale frame"
         );
         assert!(
-            app.last_history_step.is_none(),
+            app.primary.cursor.last_step.is_none(),
             "overlay render wait time must not consume the selected frame's dwell"
         );
 
@@ -57688,12 +57776,12 @@ mod tests {
             app.selected_product.clone(),
         ));
         app.maybe_advance_history_loop(&ctx);
-        assert_eq!(app.selected_frame_index, 0);
-        assert!(app.last_history_step.is_some());
+        assert_eq!(app.primary.cursor.index, 0);
+        assert!(app.primary.cursor.last_step.is_some());
 
-        app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        app.primary.cursor.last_step = Some(Instant::now() - Duration::from_secs(5));
         app.maybe_advance_history_loop(&ctx);
-        assert_eq!(app.selected_frame_index, 1);
+        assert_eq!(app.primary.cursor.index, 1);
     }
 
     #[test]
@@ -57781,7 +57869,7 @@ mod tests {
         second_volume.volume_time += chrono::Duration::minutes(3);
         let second = Arc::new(second_volume);
         app.volume = Some(Arc::clone(&first));
-        app.frame_history = [Arc::clone(&first), Arc::clone(&second)]
+        app.primary.history = [Arc::clone(&first), Arc::clone(&second)]
             .into_iter()
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
@@ -57795,8 +57883,8 @@ mod tests {
                 source_label: "test".to_owned(),
             })
             .collect();
-        app.history_playing = true;
-        app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        app.primary.cursor.playing = true;
+        app.primary.cursor.last_step = Some(Instant::now() - Duration::from_secs(5));
         app.texture_key = Some(test_screen_texture_key(
             Arc::as_ptr(&first) as usize,
             0,
@@ -57813,7 +57901,7 @@ mod tests {
 
         app.maybe_advance_history_loop(&ctx);
 
-        assert_eq!(app.selected_frame_index, 1);
+        assert_eq!(app.primary.cursor.index, 1);
         assert!(
             app.extra_panes[0].texture_key.is_some(),
             "following panes must not blank RHO/ZDR/VEL textures during a primary frame step"
@@ -57845,7 +57933,7 @@ mod tests {
         ));
         let volume_ptr = Arc::as_ptr(&volume) as usize;
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("shared-split-low-sweep-record-texture"),
             volume,
@@ -57919,7 +58007,7 @@ mod tests {
         let volume = Arc::new(volume);
         let volume_ptr = Arc::as_ptr(&volume) as usize;
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("range-recording-readiness"),
             volume,
@@ -57991,7 +58079,7 @@ mod tests {
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         });
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("cloned-independent-low-sweep-record-texture"),
             volume: Arc::clone(&volume),
@@ -58003,7 +58091,7 @@ mod tests {
             level2_id: "KIND".to_owned(),
         });
         app.extra_panes[0].volume = Some(Arc::clone(&volume));
-        app.extra_panes[0].engine.history = app.frame_history.clone();
+        app.extra_panes[0].engine.history = app.primary.history.clone();
         app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
         app.extra_panes[0].cut = Some(1);
         app.extra_panes[0].texture_key = Some(TextureKey {
@@ -58373,7 +58461,7 @@ mod tests {
             scan_time,
             10,
         ));
-        app.history_playing = true;
+        app.primary.cursor.playing = true;
 
         let ctx = egui::Context::default();
         app.install_decoded_load_batch(
@@ -58391,9 +58479,9 @@ mod tests {
             &ctx,
         );
 
-        assert_eq!(app.frame_history.len(), 1);
-        assert_eq!(app.frame_history[0].identity.site_id, "KFTG");
-        assert!(!app.history_playing);
+        assert_eq!(app.primary.history.len(), 1);
+        assert_eq!(app.primary.history[0].identity.site_id, "KFTG");
+        assert!(!app.primary.cursor.playing);
     }
 
     #[test]
@@ -58406,7 +58494,7 @@ mod tests {
             scan_time,
             10,
         ));
-        app.volume = Some(Arc::clone(&app.frame_history[0].volume));
+        app.volume = Some(Arc::clone(&app.primary.history[0].volume));
 
         let ctx = egui::Context::default();
         let fwlx = test_decoded_live_partial(
@@ -58417,9 +58505,9 @@ mod tests {
         );
         app.install_polled_volume("FWLX20260608_0133", fwlx.volume, &ctx);
 
-        assert_eq!(app.frame_history.len(), 1);
-        assert_eq!(app.frame_history[0].identity.site_id, "FWLX");
-        assert_eq!(app.selected_frame_index, 0);
+        assert_eq!(app.primary.history.len(), 1);
+        assert_eq!(app.primary.history[0].identity.site_id, "FWLX");
+        assert_eq!(app.primary.cursor.index, 0);
     }
 
     #[test]
@@ -58444,7 +58532,8 @@ mod tests {
         app.install_polled_volume("FWLX20260608_0133", earlier.volume, &ctx);
 
         assert_eq!(
-            app.frame_history
+            app.primary
+                .history
                 .iter()
                 .map(|frame| frame.identity.scan_time_utc)
                 .collect::<Vec<_>>(),
@@ -58478,8 +58567,8 @@ mod tests {
         app.install_polled_volume("FWLX20260608_0133", second.volume, &ctx);
 
         // Same-site install appends and follows the feed.
-        assert_eq!(app.frame_history.len(), 2);
-        assert_eq!(app.selected_frame_index, 1);
+        assert_eq!(app.primary.history.len(), 2);
+        assert_eq!(app.primary.cursor.index, 1);
 
         // Re-polling an identical scan (same site + scan time) replaces the
         // entry in place — never a duplicate loop frame.
@@ -58490,17 +58579,17 @@ mod tests {
             10,
         );
         app.install_polled_volume("FWLX20260608_0133b", repeat.volume, &ctx);
-        assert_eq!(app.frame_history.len(), 2);
+        assert_eq!(app.primary.history.len(), 2);
         assert_eq!(
-            app.frame_history[1].path,
+            app.primary.history[1].path,
             PathBuf::from("poll://FWLX20260608_0133b"),
             "identity match replaces the stored entry"
         );
 
         // A playing loop holds its cursor: the live feed must not yank
         // playback to the newest frame.
-        app.history_playing = true;
-        app.selected_frame_index = 0;
+        app.primary.cursor.playing = true;
+        app.primary.cursor.index = 0;
         let third = test_decoded_live_partial(
             PathBuf::from("FWLX-0136"),
             "FWLX",
@@ -58508,9 +58597,9 @@ mod tests {
             10,
         );
         app.install_polled_volume("FWLX20260608_0136", third.volume, &ctx);
-        assert_eq!(app.frame_history.len(), 3);
+        assert_eq!(app.primary.history.len(), 3);
         assert_eq!(
-            app.selected_frame_index, 0,
+            app.primary.cursor.index, 0,
             "playing loop keeps its cursor while the feed grows"
         );
     }
@@ -58549,11 +58638,12 @@ mod tests {
             scan_time + chrono::Duration::minutes(3),
             10,
         ));
-        app.frame_history
+        app.primary
+            .history
             .sort_by(|left, right| left.identity.cmp(&right.identity));
-        app.selected_frame_index = 0;
-        app.volume = Some(Arc::clone(&app.frame_history[0].volume));
-        app.history_playing = true;
+        app.primary.cursor.index = 0;
+        app.volume = Some(Arc::clone(&app.primary.history[0].volume));
+        app.primary.cursor.playing = true;
 
         let ctx = egui::Context::default();
         app.install_decoded_load_batch(
@@ -58571,10 +58661,10 @@ mod tests {
             &ctx,
         );
 
-        assert!(app.history_playing);
-        assert_eq!(app.selected_frame_index, 0);
+        assert!(app.primary.cursor.playing);
+        assert_eq!(app.primary.cursor.index, 0);
         assert_eq!(
-            app.frame_history[app.selected_frame_index]
+            app.primary.history[app.primary.cursor.index]
                 .identity
                 .scan_time_utc,
             scan_time
@@ -58587,7 +58677,7 @@ mod tests {
         let ctx = egui::Context::default();
 
         assert!(!app.toggle_history_playback(&ctx));
-        assert!(!app.history_playing);
+        assert!(!app.primary.cursor.playing);
 
         let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
         app.upsert_history_frame(test_decoded_live_partial(
@@ -58598,7 +58688,7 @@ mod tests {
         ));
 
         assert!(!app.toggle_history_playback(&ctx));
-        assert!(!app.history_playing);
+        assert!(!app.primary.cursor.playing);
     }
 
     #[test]
@@ -58741,19 +58831,19 @@ mod tests {
             scan_time + chrono::Duration::minutes(3),
             10,
         ));
-        app.selected_frame_index = 0;
-        app.browsing_history = true;
+        app.primary.cursor.index = 0;
+        app.primary.cursor.browsing = true;
         let ctx = egui::Context::default();
 
         assert!(app.toggle_history_playback(&ctx));
-        assert!(app.history_playing);
-        assert!(!app.browsing_history);
-        assert!(app.last_history_step.is_some());
+        assert!(app.primary.cursor.playing);
+        assert!(!app.primary.cursor.browsing);
+        assert!(app.primary.cursor.last_step.is_some());
 
         assert!(app.toggle_history_playback(&ctx));
-        assert!(!app.history_playing);
+        assert!(!app.primary.cursor.playing);
         assert!(
-            app.browsing_history,
+            app.primary.cursor.browsing,
             "pausing on an older frame should preserve browse mode"
         );
     }
@@ -59185,6 +59275,16 @@ mod tests {
         assert!(HISTORY_SIZE_OPTIONS.contains(&96));
         assert_eq!(normalized_history_limit(0), DEFAULT_HISTORY_FRAME_LIMIT);
         assert_eq!(normalized_history_limit(96), 96);
+        // 4e stage (i): the legacy clamp delegates to the engine — the
+        // smallest combo choice must stay the engine's floor.
+        assert_eq!(
+            HISTORY_SIZE_OPTIONS[0],
+            ui_core::loop_engine::MIN_HISTORY_FRAME_LIMIT,
+            "HISTORY_SIZE_OPTIONS[0] is the legacy clamp floor; the engine's \
+             normalized_frame_limit must clamp identically"
+        );
+        assert_eq!(normalized_history_limit(1), HISTORY_SIZE_OPTIONS[0]);
+        assert_eq!(normalized_history_limit(5000), MAX_HISTORY_FRAME_LIMIT);
     }
 
     #[test]
@@ -59211,7 +59311,7 @@ mod tests {
     }
 
     fn cached_storm_key_for_frame(app: &ViewerApp, index: usize) -> FrameWorkKey {
-        let frame = &app.frame_history[index];
+        let frame = &app.primary.history[index];
         FrameWorkKey::new(&frame.volume, Arc::as_ptr(&frame.volume) as usize)
     }
 
@@ -59231,7 +59331,7 @@ mod tests {
                 volume,
                 FrameStatus::Complete,
             ));
-            let index = app.frame_history.len() - 1;
+            let index = app.primary.history.len() - 1;
             let key = cached_storm_key_for_frame(&app, index);
             insert_limited_frame_cache(
                 &mut app.storm_cells_cache,
@@ -59241,10 +59341,11 @@ mod tests {
                 ALGO_FRAME_CACHE_LIMIT,
             );
         }
-        app.frame_history
+        app.primary
+            .history
             .sort_by(|left, right| left.identity.cmp(&right.identity));
-        app.selected_frame_index = 1;
-        app.volume = Some(Arc::clone(&app.frame_history[1].volume));
+        app.primary.cursor.index = 1;
+        app.volume = Some(Arc::clone(&app.primary.history[1].volume));
         let newest_key = cached_storm_key_for_frame(&app, 1);
         let newest_cells = app.storm_cells_cache[&newest_key].clone();
 
@@ -59265,7 +59366,8 @@ mod tests {
             older,
             FrameStatus::Complete,
         ));
-        app.frame_history
+        app.primary
+            .history
             .sort_by(|left, right| left.identity.cmp(&right.identity));
         let older_key = cached_storm_key_for_frame(&app, 0);
         insert_limited_frame_cache(
@@ -59275,8 +59377,8 @@ mod tests {
             vec![test_storm_cell(0.0)],
             ALGO_FRAME_CACHE_LIMIT,
         );
-        app.selected_frame_index = 2;
-        app.volume = Some(Arc::clone(&app.frame_history[2].volume));
+        app.primary.cursor.index = 2;
+        app.volume = Some(Arc::clone(&app.primary.history[2].volume));
         let newest_key = cached_storm_key_for_frame(&app, 2);
         let newest_cells = app.storm_cells_cache[&newest_key].clone();
 
@@ -59311,29 +59413,30 @@ mod tests {
             second,
             FrameStatus::Complete,
         ));
-        app.frame_history
+        app.primary
+            .history
             .sort_by(|left, right| left.identity.cmp(&right.identity));
-        app.selected_frame_index = 0;
-        app.volume = Some(Arc::clone(&app.frame_history[0].volume));
-        app.history_playing = true;
-        app.browsing_history = true;
+        app.primary.cursor.index = 0;
+        app.volume = Some(Arc::clone(&app.primary.history[0].volume));
+        app.primary.cursor.playing = true;
+        app.primary.cursor.browsing = true;
         let ctx = egui::Context::default();
 
         assert!(app.step_history_frame(1, &ctx));
-        assert_eq!(app.selected_frame_index, 1);
-        assert!(!app.history_playing);
-        assert!(!app.browsing_history);
+        assert_eq!(app.primary.cursor.index, 1);
+        assert!(!app.primary.cursor.playing);
+        assert!(!app.primary.cursor.browsing);
 
         assert!(app.step_history_frame(-1, &ctx));
-        assert_eq!(app.selected_frame_index, 0);
-        assert!(app.browsing_history);
+        assert_eq!(app.primary.cursor.index, 0);
+        assert!(app.primary.cursor.browsing);
     }
 
     #[test]
     fn blank_browse_state_selects_loaded_latest_frame() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.browsing_history = true;
-        app.history_playing = false;
+        app.primary.cursor.browsing = true;
+        app.primary.cursor.playing = false;
         app.volume = None;
         app.selected_product = DisplayProduct::Moment(MomentType::Reflectivity);
 
@@ -59357,9 +59460,9 @@ mod tests {
         );
 
         assert!(selected);
-        assert!(!app.browsing_history);
+        assert!(!app.primary.cursor.browsing);
         assert!(app.volume.is_some());
-        assert_eq!(app.selected_frame_index, 0);
+        assert_eq!(app.primary.cursor.index, 0);
     }
 
     #[test]
@@ -59391,7 +59494,7 @@ mod tests {
         app.volume = Some(Arc::clone(&previous_frame.volume));
         app.selected_cut = 1;
         app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
-        app.frame_history.push(previous_frame);
+        app.primary.history.push(previous_frame);
 
         let mut next = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
         next.site.id = "KTLX".to_owned();
@@ -59425,7 +59528,7 @@ mod tests {
             Some(scan_time)
         );
         assert!(app.status.contains("Waiting for VEL"));
-        assert_eq!(app.frame_history.len(), 2);
+        assert_eq!(app.primary.history.len(), 2);
     }
 
     #[test]
@@ -59446,7 +59549,7 @@ mod tests {
         app.volume = Some(Arc::clone(&previous_frame.volume));
         app.selected_cut = 1;
         app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
-        app.frame_history.push(previous_frame);
+        app.primary.history.push(previous_frame);
 
         let mut next = test_velocity_sails_volume_with_radials(&[(0.5, 0)], 360);
         next.site.id = "KTLX".to_owned();
@@ -59474,9 +59577,9 @@ mod tests {
                 .map(|volume| volume.volume_time.with_timezone(&Utc)),
             Some(scan_time)
         );
-        assert_eq!(app.selected_frame_index, 0);
+        assert_eq!(app.primary.cursor.index, 0);
         assert!(app.status.contains("Waiting for VEL"));
-        assert_eq!(app.frame_history.len(), 2);
+        assert_eq!(app.primary.history.len(), 2);
     }
 
     #[test]
@@ -59497,7 +59600,7 @@ mod tests {
         app.volume = Some(Arc::clone(&previous_frame.volume));
         app.selected_cut = 1;
         app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
-        app.frame_history.push(previous_frame);
+        app.primary.history.push(previous_frame);
 
         let next_time = scan_time + chrono::Duration::minutes(3);
         let mut next = test_velocity_sails_volume_with_radials(&[(0.5, 0)], 720);
@@ -59526,7 +59629,7 @@ mod tests {
                 .map(|volume| volume.volume_time.with_timezone(&Utc)),
             Some(next_time)
         );
-        assert_eq!(app.selected_frame_index, 1);
+        assert_eq!(app.primary.cursor.index, 1);
         assert_eq!(
             app.selected_product,
             DisplayProduct::Moment(MomentType::Velocity)
@@ -59597,7 +59700,7 @@ mod tests {
             720,
         ));
         app.volume = Some(Arc::clone(&volume));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("manual-tilt"),
             volume,
@@ -59605,10 +59708,10 @@ mod tests {
             status: FrameStatus::LiveComplete,
             source_label: "test".to_owned(),
         });
-        app.selected_frame_index = 0;
+        app.primary.cursor.index = 0;
         app.selected_cut = 0;
-        app.history_playing = true;
-        app.last_history_step = Some(Instant::now() - Duration::from_secs(10));
+        app.primary.cursor.playing = true;
+        app.primary.cursor.last_step = Some(Instant::now() - Duration::from_secs(10));
         let ctx = egui::Context::default();
 
         app.select_primary_cut_manually(5, &ctx);
@@ -59621,7 +59724,7 @@ mod tests {
                 .map(|hold| hold.cut_index),
             Some(5)
         );
-        assert!(!app.history_playing);
+        assert!(!app.primary.cursor.playing);
     }
 
     #[test]
@@ -59741,7 +59844,7 @@ mod tests {
     #[test]
     fn active_url_poll_blocks_primary_auto_refresh() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.realtime_level2_auto_refresh = true;
+        app.primary.live.enabled = true;
         app.poll_active = true;
         app.poll_url = "http://example.com/wilu".to_owned();
         app.sites = vec![RadarSite::new("KTLX")];
@@ -59749,7 +59852,7 @@ mod tests {
         // A polled non-catalog frame: the old behavior cleared it every
         // tick (history_contains_other_site) and started a catalog load.
         let volume = Arc::new(test_aliased_velocity_volume());
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(&volume),
             path: PathBuf::from("poll://wilu"),
             volume,
@@ -59762,7 +59865,7 @@ mod tests {
         app.maybe_refresh_realtime_level2(&ctx);
 
         assert!(app.load_receiver.is_none());
-        assert_eq!(app.frame_history.len(), 1);
+        assert_eq!(app.primary.history.len(), 1);
         assert_eq!(
             app.live_refresh_skip_reason.as_deref(),
             Some("custom URL poll owns the primary view")
@@ -59771,7 +59874,7 @@ mod tests {
         // Stopping the poll releases the guard (the next tick may load).
         app.poll_active = false;
         app.live_refresh_skip_reason = None;
-        app.last_realtime_level2_refresh = Some(Instant::now());
+        app.primary.live.last_refresh = Some(Instant::now());
         app.maybe_refresh_realtime_level2(&ctx);
         assert_eq!(app.live_refresh_skip_reason, None);
     }
@@ -59782,12 +59885,12 @@ mod tests {
         // empty (the old guard keyed on poll_url and would have let the
         // auto-refresh stomp the polled frames).
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.realtime_level2_auto_refresh = true;
+        app.primary.live.enabled = true;
         app.poll_active = true;
-        app.poll_source = PollSource::Intl {
+        app.primary.feed = FeedSource::Live(SiteRef::Intl {
             provider_id: "smhi".to_owned(),
             site_id: "angelholm".to_owned(),
-        };
+        });
         assert!(app.poll_url.is_empty());
         app.sites = vec![RadarSite::new("KTLX")];
         app.selected_site_index = 0;
@@ -59802,12 +59905,12 @@ mod tests {
         );
 
         // An unarmed source (cleared selection) releases the guard.
-        app.poll_source = PollSource::Intl {
+        app.primary.feed = FeedSource::Live(SiteRef::Intl {
             provider_id: String::new(),
             site_id: String::new(),
-        };
+        });
         app.live_refresh_skip_reason = None;
-        app.last_realtime_level2_refresh = Some(Instant::now());
+        app.primary.live.last_refresh = Some(Instant::now());
         app.maybe_refresh_realtime_level2(&ctx);
         assert_eq!(app.live_refresh_skip_reason, None);
     }
@@ -59817,7 +59920,7 @@ mod tests {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let previous = Arc::new(test_aliased_velocity_volume());
         app.volume = Some(previous.clone());
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(&previous),
             path: PathBuf::from("poll://KTLX"),
             volume: previous,
@@ -59846,13 +59949,13 @@ mod tests {
         app.start_intl_poll("smhi".to_owned(), "angelholm".to_owned(), &ctx);
 
         assert!(app.volume.is_none());
-        assert!(app.frame_history.is_empty());
+        assert!(app.primary.history.is_empty());
         assert!(app.texture_key.is_none());
         assert!(app.load_receiver.is_none());
         assert!(app.poll_active);
         assert!(matches!(
-            app.poll_source,
-            PollSource::Intl { ref provider_id, ref site_id }
+            app.primary.feed,
+            FeedSource::Live(SiteRef::Intl { ref provider_id, ref site_id })
                 if provider_id == "smhi" && site_id == "angelholm"
         ));
         assert!(app.intl_source_owns_primary_display());
@@ -59871,7 +59974,7 @@ mod tests {
                 radar_core::RadarSite::new(site),
                 Utc::now() - chrono::Duration::minutes(4),
             ));
-            app.frame_history.push(FrameHistoryEntry {
+            app.primary.history.push(FrameHistoryEntry {
                 identity: frame_identity_for_volume(&volume),
                 path: PathBuf::from(format!("intl:{site}")),
                 volume: Arc::clone(&volume),
@@ -59884,18 +59987,18 @@ mod tests {
 
         // KEEP: restarting the poll for the SAME active intl site (the
         // Start button after a pause-free re-pick) keeps the loop history…
-        app.poll_source = PollSource::Intl {
+        app.primary.feed = FeedSource::Live(SiteRef::Intl {
             provider_id: "smhi".to_owned(),
             site_id: "angelholm".to_owned(),
-        };
+        });
         app.poll_active = true;
         seed_frame(&mut app, "angelholm");
-        app.poll_last_file = Some("smhi/angelholm 2026-06-30T12:00Z".to_owned());
+        app.primary.live.dedupe_key = Some("smhi/angelholm 2026-06-30T12:00Z".to_owned());
         let (_load_sender, load_receiver) = mpsc::channel::<AsyncLoadResult>();
         app.load_receiver = Some(load_receiver);
         app.start_intl_poll("smhi".to_owned(), "angelholm".to_owned(), &ctx);
         assert_eq!(
-            app.frame_history.len(),
+            app.primary.history.len(),
             1,
             "same-site restart keeps history"
         );
@@ -59903,14 +60006,14 @@ mod tests {
         // …while the poll bookkeeping still resets: the dedupe key clears so
         // the next tick installs, and an in-flight auto-refresh load (which
         // would land after the first poll install and wipe it) is dropped.
-        assert_eq!(app.poll_last_file, None);
+        assert_eq!(app.primary.live.dedupe_key, None);
         assert!(app.load_receiver.is_none());
         assert!(app.poll_active);
 
         // CLEAR: switching to a different site of the SAME provider.
         app.start_intl_poll("smhi".to_owned(), "sella".to_owned(), &ctx);
         assert!(
-            app.frame_history.is_empty(),
+            app.primary.history.is_empty(),
             "cross-site intl switch clears the loop"
         );
         assert!(app.volume.is_none());
@@ -59925,7 +60028,7 @@ mod tests {
         app.intl_loop_rx = Some(loop_receiver);
         app.start_intl_poll("smhi".to_owned(), "sella".to_owned(), &ctx);
         assert!(
-            app.frame_history.is_empty(),
+            app.primary.history.is_empty(),
             "inactive same-site start clears (poll_active gates the keep)"
         );
         assert!(app.volume.is_none());
@@ -59936,7 +60039,7 @@ mod tests {
         seed_frame(&mut app, "sella");
         app.start_intl_poll("dwd".to_owned(), "sella".to_owned(), &ctx);
         assert!(
-            app.frame_history.is_empty(),
+            app.primary.history.is_empty(),
             "cross-provider switch clears even with an identical site id"
         );
     }
@@ -59944,27 +60047,27 @@ mod tests {
     #[test]
     fn poll_source_settings_round_trip() {
         let mut settings = settings::AppSettings::default();
-        let intl = PollSource::Intl {
+        let intl = FeedSource::Live(SiteRef::Intl {
             provider_id: "smhi".to_owned(),
             site_id: "angelholm".to_owned(),
-        };
+        });
         intl.save_to_settings(&mut settings);
         // Mirrors poll_url: the selection survives the JSON config round
         // trip and rebuilds the same source for next session's Start.
         let restored = settings::AppSettings::from_json(&settings.to_json());
-        assert_eq!(PollSource::intl_from_settings(&restored), Some(intl));
+        assert_eq!(FeedSource::intl_from_settings(&restored), Some(intl));
 
         // Each variant writes only its own fields: starting a custom URL
         // poll must not forget the international selection (and vice
         // versa).
-        PollSource::CustomUrl("http://example.com/dow8".to_owned()).save_to_settings(&mut settings);
+        FeedSource::CustomUrl("http://example.com/dow8".to_owned()).save_to_settings(&mut settings);
         assert_eq!(settings.poll_url, "http://example.com/dow8");
         assert_eq!(settings.intl_provider, "smhi");
         assert_eq!(settings.intl_site, "angelholm");
 
         // No saved selection (or a blank one) -> nothing to resume.
         assert_eq!(
-            PollSource::intl_from_settings(&settings::AppSettings::default()),
+            FeedSource::intl_from_settings(&settings::AppSettings::default()),
             None
         );
         let blank = settings::AppSettings {
@@ -59972,7 +60075,7 @@ mod tests {
             intl_site: "angelholm".to_owned(),
             ..Default::default()
         };
-        assert_eq!(PollSource::intl_from_settings(&blank), None);
+        assert_eq!(FeedSource::intl_from_settings(&blank), None);
     }
 
     /// Contract harness (v0.29 Phase 1, spec §11 Milestone A item 4): a
@@ -60355,10 +60458,10 @@ mod tests {
     #[test]
     fn intl_archive_chip_load_honors_the_on_click_selector() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.poll_source = PollSource::Intl {
+        app.primary.feed = FeedSource::Live(SiteRef::Intl {
             provider_id: "ord".to_owned(),
             site_id: "plbrz".to_owned(),
-        };
+        });
         app.archive_frame_count = 10;
         app.archive_load_loop = true;
         app.intl_archive_rows = Some(test_intl_archive_listing("ord", "plbrz", 12));
@@ -60370,11 +60473,11 @@ mod tests {
         assert_eq!(progress.total, 10);
         assert!(progress.label.starts_with("ORD archive plbrz"));
         assert!(matches!(
-            app.poll_source,
-            PollSource::Intl {
+            app.primary.feed,
+            FeedSource::Live(SiteRef::Intl {
                 ref provider_id,
                 ref site_id
-            } if provider_id == "ord" && site_id == "plbrz"
+            }) if provider_id == "ord" && site_id == "plbrz"
         ));
         assert!(
             !app.poll_active,
@@ -60384,10 +60487,10 @@ mod tests {
 
         // Single mode: the chip alone.
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.poll_source = PollSource::Intl {
+        app.primary.feed = FeedSource::Live(SiteRef::Intl {
             provider_id: "smhi".to_owned(),
             site_id: "angelholm".to_owned(),
-        };
+        });
         app.archive_frame_count = 10;
         app.archive_load_loop = false;
         app.intl_archive_rows = Some(test_intl_archive_listing("smhi", "angelholm", 12));
@@ -60405,10 +60508,10 @@ mod tests {
     #[test]
     fn intl_archive_chip_load_rejects_a_stale_listing_owner() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.poll_source = PollSource::Intl {
+        app.primary.feed = FeedSource::Live(SiteRef::Intl {
             provider_id: "smhi".to_owned(),
             site_id: "angelholm".to_owned(),
-        };
+        });
         app.intl_archive_rows = Some(test_intl_archive_listing("ord", "plbrz", 3));
 
         app.start_intl_archive_chip_load(2, &egui::Context::default());
@@ -60435,10 +60538,10 @@ mod tests {
             "custom-URL poll source leaves the US selected site as owner"
         );
 
-        app.poll_source = PollSource::Intl {
+        app.primary.feed = FeedSource::Live(SiteRef::Intl {
             provider_id: "ord".to_owned(),
             site_id: "deess".to_owned(),
-        };
+        });
         assert_eq!(
             app.display_owner_site(),
             SiteRef::Intl {
@@ -60448,10 +60551,10 @@ mod tests {
             "an intl poll source owns the display even when not actively polling (archive loads)"
         );
 
-        app.poll_source = PollSource::Intl {
+        app.primary.feed = FeedSource::Live(SiteRef::Intl {
             provider_id: String::new(),
             site_id: String::new(),
-        };
+        });
         assert_eq!(
             app.display_owner_site(),
             SiteRef::Us {
@@ -60479,7 +60582,7 @@ mod tests {
         app.set_intl_archive_primary_source("smhi", "sella");
         let (_sender, receiver) = mpsc::channel();
         app.intl_loop_rx = Some(receiver);
-        app.poll_last_file = Some("sella_0.h5".to_owned());
+        app.primary.live.dedupe_key = Some("sella_0.h5".to_owned());
         app.poll_next = Some(Instant::now() + Duration::from_secs(60));
         assert!(app.intl_source_owns_primary_display());
 
@@ -60490,9 +60593,9 @@ mod tests {
             !app.intl_source_owns_primary_display(),
             "an explicit US latest load takes display ownership"
         );
-        assert!(matches!(app.poll_source, PollSource::CustomUrl(_)));
+        assert!(matches!(app.primary.feed, FeedSource::CustomUrl(_)));
         assert!(app.intl_loop_rx.is_none(), "in-flight intl loop dropped");
-        assert_eq!(app.poll_last_file, None);
+        assert_eq!(app.primary.live.dedupe_key, None);
         assert_eq!(app.poll_next, None);
         assert_eq!(
             app.display_owner_site(),
@@ -60550,7 +60653,7 @@ mod tests {
             !app.intl_source_owns_primary_display(),
             "a US archive-window load takes display ownership"
         );
-        assert!(matches!(app.poll_source, PollSource::CustomUrl(_)));
+        assert!(matches!(app.primary.feed, FeedSource::CustomUrl(_)));
     }
 
     /// Unified Player End-at, intl arms: a no-archive display owner (DWD)
@@ -60564,10 +60667,10 @@ mod tests {
         app.unified_player.end_date_input = "2026-06-15".to_owned();
         app.unified_player.end_hour_input = "17".to_owned();
         app.unified_player.end_minute_input = "30".to_owned();
-        app.poll_source = PollSource::Intl {
+        app.primary.feed = FeedSource::Live(SiteRef::Intl {
             provider_id: "dwd".to_owned(),
             site_id: "deess".to_owned(),
-        };
+        });
         app.load_archive_loop_ending_at_for_unified_player(&egui::Context::default());
         assert!(app.load_receiver.is_none(), "DWD must not start a load");
         assert!(
@@ -60585,10 +60688,10 @@ mod tests {
         app.unified_player.end_date_input = "2026-06-15".to_owned();
         app.unified_player.end_hour_input = "17".to_owned();
         app.unified_player.end_minute_input = "30".to_owned();
-        app.poll_source = PollSource::Intl {
+        app.primary.feed = FeedSource::Live(SiteRef::Intl {
             provider_id: "smhi".to_owned(),
             site_id: "zzz99".to_owned(),
-        };
+        });
         app.load_archive_loop_ending_at_for_unified_player(&egui::Context::default());
         assert!(app.load_receiver.is_some(), "SMHI load must start");
         let progress = app.archive_load_progress.as_ref().expect("progress");
@@ -60606,10 +60709,10 @@ mod tests {
         app.unified_player.end_date_input = "2026-06-15".to_owned();
         app.unified_player.end_hour_input = "17".to_owned();
         app.unified_player.end_minute_input = "30".to_owned();
-        app.poll_source = PollSource::Intl {
+        app.primary.feed = FeedSource::Live(SiteRef::Intl {
             provider_id: "ord".to_owned(),
             site_id: "zznot".to_owned(),
-        };
+        });
         app.load_archive_loop_ending_at_for_unified_player(&egui::Context::default());
         assert_eq!(app.ord_archive_site_input, "zznot");
         assert_eq!(app.ord_archive_date_input, "2026-06-15");
@@ -60650,11 +60753,11 @@ mod tests {
             "unexpected status: {status}"
         );
         assert!(matches!(
-            app.poll_source,
-            PollSource::Intl {
+            app.primary.feed,
+            FeedSource::Live(SiteRef::Intl {
                 ref provider_id,
                 ref site_id
-            } if provider_id == "ord" && site_id == "deess"
+            }) if provider_id == "ord" && site_id == "deess"
         ));
         assert_eq!(
             app.pending_site_id.as_deref(),
@@ -60705,11 +60808,11 @@ mod tests {
             "old US catalog index remains present"
         );
         assert!(matches!(
-            app.poll_source,
-            PollSource::Intl {
+            app.primary.feed,
+            FeedSource::Live(SiteRef::Intl {
                 ref provider_id,
                 ref site_id
-            } if provider_id == "ord" && site_id == "plbrz"
+            }) if provider_id == "ord" && site_id == "plbrz"
         ));
         assert!(!app.poll_active);
         assert!(app.intl_source_owns_primary_display());
@@ -60720,7 +60823,7 @@ mod tests {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.sites = vec![RadarSite::new("KTLX")];
         app.selected_site_index = 0;
-        app.realtime_level2_auto_refresh = true;
+        app.primary.live.enabled = true;
         app.set_ord_archive_primary_source("frtro");
 
         app.maybe_refresh_realtime_level2(&egui::Context::default());
@@ -60736,7 +60839,7 @@ mod tests {
     #[test]
     fn ord_archive_batch_grows_history_limit_to_fetch_count() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.history_frame_limit = 7;
+        app.primary.limits.frame_limit = 7;
         let frames: Vec<_> = (0..10)
             .map(|index| {
                 let stamp = Utc
@@ -60762,9 +60865,9 @@ mod tests {
         );
 
         assert!(selected);
-        assert_eq!(app.history_frame_limit, 10);
-        assert_eq!(app.frame_history.len(), 10);
-        assert_eq!(app.selected_frame_index, 9);
+        assert_eq!(app.primary.limits.frame_limit, 10);
+        assert_eq!(app.primary.history.len(), 10);
+        assert_eq!(app.primary.cursor.index, 9);
         assert_eq!(
             app.volume.as_ref().map(|volume| volume.volume_time),
             Some(Utc.with_ymd_and_hms(2026, 6, 15, 17, 45, 0).unwrap())
@@ -60903,16 +61006,16 @@ mod tests {
         let (_sender, receiver) = mpsc::channel();
         app.poll_rx = Some(receiver);
         app.poll_active = true;
-        app.poll_last_file = Some("KCRI_20260622_010000".to_owned());
+        app.primary.live.dedupe_key = Some("KCRI_20260622_010000".to_owned());
         app.poll_next = Some(Instant::now() + Duration::from_secs(60));
 
         app.start_known_feed_poll("https://mesonet-nexrad.agron.iastate.edu/level2/raw/KCRI");
 
         assert!(app.poll_rx.is_none());
-        assert_eq!(app.poll_last_file, None);
+        assert_eq!(app.primary.live.dedupe_key, None);
         assert_eq!(app.poll_next, None);
         assert!(app.poll_active);
-        assert!(matches!(app.poll_source, PollSource::CustomUrl(_)));
+        assert!(matches!(app.primary.feed, FeedSource::CustomUrl(_)));
     }
 
     #[test]
@@ -61075,7 +61178,7 @@ mod tests {
 
         assert!(app.poll_active);
         assert_eq!(app.poll_url, "http://192.0.2.8:8080/armor");
-        assert!(matches!(app.poll_source, PollSource::CustomUrl(_)));
+        assert!(matches!(app.primary.feed, FeedSource::CustomUrl(_)));
         assert_eq!(app.app_settings.poll_url, app.poll_url);
         assert!(app.status.contains("ARMOR"));
     }
@@ -61717,7 +61820,7 @@ mod tests {
         style_settings.radar_age.aging_color = Some([7, 8, 9, 255]);
         app.style_settings = style_settings.clone();
         app.style_registry = styles::StyleRegistry::from_settings(&style_settings);
-        app.realtime_level2_auto_refresh = true;
+        app.primary.live.enabled = true;
         app.volume = Some(Arc::new(RadarVolume::new(
             radar_core::RadarSite::new("KTLX"),
             Utc::now() - chrono::Duration::seconds(10),
@@ -61740,7 +61843,7 @@ mod tests {
             egui::Color32::from_rgba_unmultiplied(4, 5, 6, 255)
         );
 
-        app.realtime_level2_auto_refresh = false;
+        app.primary.live.enabled = false;
         let (_, archive_bg, archive_kind) = app.mode_chip_state().expect("archive chip");
 
         assert_eq!(archive_kind, "ARCH");
@@ -61779,7 +61882,7 @@ mod tests {
         // Years-old ORD archive frames while the stale US auto-refresh flag
         // is still set: the chip must say ARCHIVE, never "LIVE · STALE"
         // (the flag is primary-US state no intl path sets or clears).
-        app.realtime_level2_auto_refresh = true;
+        app.primary.live.enabled = true;
         app.set_intl_archive_primary_source("ord", "deess");
         app.volume = Some(Arc::new(RadarVolume::new(
             radar_core::RadarSite::new("deess"),
@@ -61793,7 +61896,7 @@ mod tests {
 
         // A streaming intl poll reads LIVE regardless of the US flag.
         app.poll_active = true;
-        app.realtime_level2_auto_refresh = false;
+        app.primary.live.enabled = false;
         app.volume = Some(Arc::new(RadarVolume::new(
             radar_core::RadarSite::new("deess"),
             Utc::now() - chrono::Duration::minutes(9),
@@ -61922,10 +62025,10 @@ mod tests {
         // floor — an armed active poll whose newest frame is 40 minutes old
         // is a fault worth flagging even on intl cadences.
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.poll_source = PollSource::Intl {
+        app.primary.feed = FeedSource::Live(SiteRef::Intl {
             provider_id: "ord".to_owned(),
             site_id: "deess".to_owned(),
-        };
+        });
         app.poll_active = true;
         app.volume = Some(Arc::new(RadarVolume::new(
             radar_core::RadarSite::new("deess"),
@@ -62032,7 +62135,7 @@ mod tests {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.sites = vec![RadarSite::new("KTLX"), RadarSite::new("KEAX")];
         app.selected_site_index = 0;
-        app.realtime_level2_auto_refresh = true;
+        app.primary.live.enabled = true;
         app.volume = Some(Arc::new(RadarVolume::new(
             radar_core::RadarSite::new("KTLX"),
             Utc::now() - chrono::Duration::seconds(30),
@@ -62055,7 +62158,7 @@ mod tests {
         app.extra_panes[0].engine.live.enabled = false;
         assert!(!app.pane_chip_is_live(1));
         app.extra_panes[0].engine.live.enabled = true;
-        app.realtime_level2_auto_refresh = false;
+        app.primary.live.enabled = false;
         assert!(
             app.pane_chip_is_live(1),
             "pane's own poll does not depend on the primary flag"
@@ -62092,7 +62195,7 @@ mod tests {
         // Known-wrong cell 1: an intl ARCHIVE owns the display while the
         // stale US flag is still set — the primary chip is honest ARCHIVE,
         // the pane-0 grid chip claims LIVE off the US flag.
-        app.realtime_level2_auto_refresh = true;
+        app.primary.live.enabled = true;
         app.set_intl_archive_primary_source("ord", "deess");
         app.volume = Some(Arc::new(RadarVolume::new(
             radar_core::RadarSite::new("deess"),
@@ -62109,7 +62212,7 @@ mod tests {
         // US flag off — the primary chip says LIVE, the pane-0 grid chip
         // says not-live.
         app.poll_active = true;
-        app.realtime_level2_auto_refresh = false;
+        app.primary.live.enabled = false;
         app.volume = Some(Arc::new(RadarVolume::new(
             radar_core::RadarSite::new("deess"),
             Utc::now() - chrono::Duration::minutes(5),
@@ -62133,7 +62236,7 @@ mod tests {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.sites = vec![RadarSite::new("KTLX"), RadarSite::new("KEAX")];
         app.selected_site_index = 0;
-        app.realtime_level2_auto_refresh = true;
+        app.primary.live.enabled = true;
         app.extra_panes
             .push(test_pane(DisplayProduct::Moment(MomentType::Reflectivity)));
         let now = Instant::now();
@@ -62152,18 +62255,18 @@ mod tests {
         });
         assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Poll);
         // Primary paused: same-site pane now owns its own polling.
-        app.realtime_level2_auto_refresh = false;
+        app.primary.live.enabled = false;
         app.extra_panes[0].pin = Some(SiteRef::Us {
             level2_id: "KTLX".to_owned(),
         });
         assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Poll);
-        app.realtime_level2_auto_refresh = true;
+        app.primary.live.enabled = true;
         // An armed international poll owns the primary view, so the primary
         // is NOT live-polling KTLX and the pane must fetch it itself.
-        app.poll_source = PollSource::Intl {
+        app.primary.feed = FeedSource::Live(SiteRef::Intl {
             provider_id: "smhi".to_owned(),
             site_id: "sella".to_owned(),
-        };
+        });
         app.poll_active = true;
         assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Poll);
         // ...while an intl pane pinned to that SAME armed intl poll now
@@ -62186,7 +62289,7 @@ mod tests {
         });
         assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Poll);
         app.poll_active = false;
-        app.poll_source = PollSource::CustomUrl(String::new());
+        app.primary.feed = FeedSource::CustomUrl(String::new());
         // A pinned id outside the US catalog (inherited from an
         // international/archive display) has nothing to poll.
         app.extra_panes[0].pin = Some(SiteRef::Us {
@@ -62267,7 +62370,7 @@ mod tests {
             site_id: "sella".to_owned(),
         });
         assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Poll);
-        app.poll_source = PollSource::CustomUrl(String::new());
+        app.primary.feed = FeedSource::CustomUrl(String::new());
         // A research/community feed resolves in the catalog but the pane
         // load path refuses it: no live source.
         app.sites =
@@ -62303,10 +62406,10 @@ mod tests {
         let ctx = egui::Context::default();
         app.extra_panes
             .push(test_pane(DisplayProduct::Moment(MomentType::Reflectivity)));
-        app.poll_source = PollSource::Intl {
+        app.primary.feed = FeedSource::Live(SiteRef::Intl {
             provider_id: "smhi".to_owned(),
             site_id: "angelholm".to_owned(),
-        };
+        });
         app.poll_active = true;
         // The primary's newest polled frame (intl volumes carry provider
         // site ids that need not match the registry id).
@@ -62314,7 +62417,7 @@ mod tests {
             radar_core::RadarSite::new("seang"),
             Utc::now() - chrono::Duration::minutes(5),
         ));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(&volume),
             path: PathBuf::from("poll://seang"),
             volume: Arc::clone(&volume),
@@ -62477,11 +62580,11 @@ mod tests {
         );
 
         // Fresh session: the persisted key re-arms the intl poll source.
-        let restored = restored_poll_source(&app.app_settings);
+        let restored = restored_primary_feed(&app.app_settings);
         assert!(
             matches!(
                 &restored,
-                PollSource::Intl { provider_id, site_id }
+                FeedSource::Live(SiteRef::Intl { provider_id, site_id })
                     if provider_id == "smhi" && site_id == "angelholm"
             ),
             "restore re-arms the intl owner: {restored:?}"
@@ -62493,7 +62596,7 @@ mod tests {
             Some(-97.278),
         )];
         fresh.selected_site_index = 0;
-        fresh.poll_source = restored;
+        fresh.primary.feed = restored;
         fresh.poll_active = false;
         assert_eq!(
             fresh.display_owner_site(),
@@ -62525,8 +62628,8 @@ mod tests {
         // Legacy settings without the key keep the CustomUrl seed.
         let legacy = settings::AppSettings::default();
         assert!(matches!(
-            restored_poll_source(&legacy),
-            PollSource::CustomUrl(url) if url.is_empty()
+            restored_primary_feed(&legacy),
+            FeedSource::CustomUrl(url) if url.is_empty()
         ));
         // A stale intl key (site gone from the catalog) degrades to legacy.
         let stale = settings::AppSettings {
@@ -62534,8 +62637,8 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            restored_poll_source(&stale),
-            PollSource::CustomUrl(_)
+            restored_primary_feed(&stale),
+            FeedSource::CustomUrl(_)
         ));
     }
 
@@ -62644,7 +62747,7 @@ mod tests {
         // Archive/event loads clear the primary auto-refresh flag; panes
         // initialized from that display inherit the pause so the live poll
         // can never clobber archive browsing.
-        app.realtime_level2_auto_refresh = false;
+        app.primary.live.enabled = false;
         app.volume = Some(Arc::new(RadarVolume::new(
             radar_core::RadarSite::new("KTLX"),
             Utc.with_ymd_and_hms(2013, 5, 20, 20, 0, 0).unwrap(),
@@ -62660,7 +62763,7 @@ mod tests {
 
         // A live primary hands panes a live flag — users expect every
         // independent pane to keep updating.
-        app.realtime_level2_auto_refresh = true;
+        app.primary.live.enabled = true;
         app.initialize_extra_pane_from_primary(0);
         assert!(app.extra_panes[0].engine.live.enabled);
     }
@@ -62686,9 +62789,9 @@ mod tests {
         let ctx = egui::Context::default();
         app.sites = vec![RadarSite::new("KTLX")];
         app.selected_site_index = 0;
-        app.realtime_level2_auto_refresh = true;
-        app.history_frame_limit = 3;
-        app.frame_history.push(ktlx_live_frame(20));
+        app.primary.live.enabled = true;
+        app.primary.limits.frame_limit = 3;
+        app.primary.history.push(ktlx_live_frame(20));
         app.extra_panes
             .push(test_pane(DisplayProduct::Moment(MomentType::Reflectivity)));
         app.extra_panes[0].pin = Some(SiteRef::Us {
@@ -62701,7 +62804,7 @@ mod tests {
         assert_eq!(app.extra_panes[0].engine.history.len(), 1);
         assert!(Arc::ptr_eq(
             &app.extra_panes[0].engine.history[0].volume,
-            &app.frame_history[0].volume
+            &app.primary.history[0].volume
         ));
         assert!(
             app.extra_panes[0].load_receiver.is_none(),
@@ -62716,16 +62819,16 @@ mod tests {
         // Each new primary install propagates within a tick, and the pane
         // history trim applies on this install path too.
         for minutes_ago in [15, 10, 5] {
-            app.frame_history.push(ktlx_live_frame(minutes_ago));
+            app.primary.history.push(ktlx_live_frame(minutes_ago));
             app.maybe_refresh_extra_panes(&ctx);
         }
-        assert_eq!(app.frame_history.len(), 4);
+        assert_eq!(app.primary.history.len(), 4);
         assert_eq!(
             app.extra_panes[0].engine.history.len(),
             3,
             "trimmed to limit"
         );
-        let newest_primary = &app.frame_history.last().expect("primary frames").volume;
+        let newest_primary = &app.primary.history.last().expect("primary frames").volume;
         assert!(Arc::ptr_eq(
             app.extra_panes[0].volume.as_ref().expect("pane volume"),
             newest_primary
@@ -62734,7 +62837,7 @@ mod tests {
         // A pane with its Live checkbox off stays untouched.
         app.extra_panes[0].engine.live.enabled = false;
         app.extra_panes[0].engine.status = "paused".to_owned();
-        app.frame_history.push(ktlx_live_frame(1));
+        app.primary.history.push(ktlx_live_frame(1));
         app.maybe_refresh_extra_panes(&ctx);
         assert_eq!(app.extra_panes[0].engine.status, "paused");
         assert_eq!(app.extra_panes[0].engine.history.len(), 3);
@@ -63096,9 +63199,9 @@ mod tests {
         ));
         app.upsert_history_frame(test_decoded_live_partial(path, "KTLX", scan_time, 240));
 
-        assert_eq!(app.frame_history.len(), 1);
+        assert_eq!(app.primary.history.len(), 1);
         assert_eq!(
-            app.frame_history[0].volume.metadata.decoded_radial_count,
+            app.primary.history[0].volume.metadata.decoded_radial_count,
             240
         );
     }
@@ -63917,7 +64020,7 @@ mod tests {
         ));
         app.selected_cut = 0;
         app.selected_product = product.clone();
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(source.as_ref()),
             path: PathBuf::from("loop-phif-2200"),
             volume: Arc::clone(&source),
@@ -63935,7 +64038,7 @@ mod tests {
         );
         assert!(is_displayable_on_cut(installed.as_ref(), 0, &product));
         assert!(
-            Arc::ptr_eq(&app.frame_history[0].volume, &installed),
+            Arc::ptr_eq(&app.primary.history[0].volume, &installed),
             "derived Arc must replace the history entry so loop revolutions do not re-derive"
         );
 
@@ -65221,7 +65324,7 @@ mod tests {
             &[(0.5, 0), (0.5, 60_000)],
             720,
         ));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("loop-cut-window"),
             volume,
@@ -65254,7 +65357,7 @@ mod tests {
         };
         app.low_sweep_disabled_cuts
             .insert(LowSweepCutKey::new(&frame.identity, 1));
-        app.frame_history.push(frame);
+        app.primary.history.push(frame);
 
         let (start, end) = app.loaded_loop_time_window().unwrap();
 
@@ -65273,7 +65376,7 @@ mod tests {
             &[(0.5, 0), (0.5, 60_000)],
             720,
         ));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("loop-cut-window"),
             volume,
@@ -65330,7 +65433,7 @@ mod tests {
             radar_core::RadarSite::new("KTLX"),
             frame_time,
         ));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(first_volume.as_ref()),
             path: PathBuf::from("loop-report-1355"),
             volume: first_volume,
@@ -65338,7 +65441,7 @@ mod tests {
             status: FrameStatus::LiveComplete,
             source_label: "test".to_owned(),
         });
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(frame_volume.as_ref()),
             path: PathBuf::from("loop-report-1400"),
             volume: Arc::clone(&frame_volume),
@@ -65386,7 +65489,7 @@ mod tests {
             radar_core::RadarSite::new("KTLX"),
             frame_time,
         ));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(frame_volume.as_ref()),
             path: PathBuf::from("single-archive-frame"),
             volume: Arc::clone(&frame_volume),
@@ -65427,7 +65530,7 @@ mod tests {
             radar_core::RadarSite::new("KTLX"),
             frame_time,
         ));
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(frame_volume.as_ref()),
             path: PathBuf::from("single-live-frame"),
             volume: Arc::clone(&frame_volume),
@@ -66449,6 +66552,16 @@ mod tests {
         let (_render_result_sender, render_receiver) = mpsc::channel::<AsyncRenderResult>();
         let (render_recycle_sender, _render_recycle_receiver) =
             mpsc::channel::<RenderRecycleBuffer>();
+        // Phase 4e stage (i): the test primary engine mirrors the legacy
+        // harness defaults — empty CustomUrl feed, live DISABLED (the old
+        // `realtime_level2_auto_refresh: false`, so tests opt in to live
+        // behavior explicitly).
+        let mut primary = LoopEngine::new(
+            EngineId(0),
+            EngineRole::Primary,
+            FeedSource::CustomUrl(String::new()),
+        );
+        primary.live.enabled = false;
         ViewerApp {
             source_path: None,
             renderer_backend: "test",
@@ -66457,8 +66570,7 @@ mod tests {
             selected_cut: 0,
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
             advanced_products_enabled: false,
-            frame_history: FrameHistory::new(),
-            selected_frame_index: 0,
+            primary,
             low_sweep_disabled_cuts: BTreeSet::new(),
             manual_primary_cut_hold: None,
             product_cut_memory: BTreeMap::new(),
@@ -66480,10 +66592,6 @@ mod tests {
             grid_composite_announce_status: false,
             open_color_tables_request: false,
             bold_labels: true,
-            browsing_history: false,
-            history_frame_limit: DEFAULT_HISTORY_FRAME_LIMIT,
-            history_playing: false,
-            last_history_step: None,
             color_tables: ColorTableSet::default(),
             user_color_tables: Vec::new(),
             palette_product_overrides: BTreeMap::new(),
@@ -66637,13 +66745,11 @@ mod tests {
             custom_poll_lat_input: String::new(),
             custom_poll_lon_input: String::new(),
             poll_active: false,
-            poll_last_file: None,
             poll_next: None,
             poll_rx: None,
             intl_loop_rx: None,
             intl_loop_frames: 0,
             intl_loop_requested: 0,
-            poll_source: PollSource::CustomUrl(String::new()),
             intl_picker_provider: String::new(),
             intl_sites: None,
             intl_sites_rx: WorkerSlot::idle("intl-site-list"),
@@ -66763,9 +66869,7 @@ mod tests {
             style_registry: styles::StyleRegistry::default(),
             styles_newer_schema: false,
             hidden_hazard_families: default_hidden_hazard_families(),
-            realtime_level2_auto_refresh: false,
             display_live_chunk_updates: false,
-            last_realtime_level2_refresh: None,
             live_refresh_skip_reason: None,
             live_hazard_auto_refresh: false,
             show_performance_stats: false,
@@ -67662,7 +67766,7 @@ mod tests {
         partial.site.id = "KTLX".to_owned();
         partial.volume_time = scan_time + chrono::Duration::minutes(3);
         let partial = Arc::new(partial);
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(complete.as_ref()),
             path: PathBuf::from("KTLX-complete"),
             volume: Arc::clone(&complete),
@@ -67670,7 +67774,7 @@ mod tests {
             status: FrameStatus::LiveComplete,
             source_label: "test".to_owned(),
         });
-        app.frame_history.push(FrameHistoryEntry {
+        app.primary.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(partial.as_ref()),
             path: PathBuf::from("KTLX-partial"),
             volume: Arc::clone(&partial),
@@ -67678,7 +67782,7 @@ mod tests {
             status: FrameStatus::LivePartial,
             source_label: "test".to_owned(),
         });
-        app.selected_frame_index = 1;
+        app.primary.cursor.index = 1;
         app.volume = Some(Arc::clone(&partial));
 
         let source = app
@@ -67686,19 +67790,19 @@ mod tests {
             .expect("same-site complete fallback");
         assert!(Arc::ptr_eq(&source, &complete));
 
-        app.selected_frame_index = 0;
+        app.primary.cursor.index = 0;
         let source = app
             .vol3d_complete_source_volume_for(Arc::clone(&partial), &MomentType::Reflectivity)
             .expect("same-site complete fallback even if selection lags");
         assert!(Arc::ptr_eq(&source, &complete));
-        app.selected_frame_index = 1;
+        app.primary.cursor.index = 1;
 
         let mut other_site =
             test_reflectivity_sails_volume_with_radials(&[(0.5, 0), (1.5, 60_000)], 720);
         other_site.site.id = "KFDR".to_owned();
         other_site.volume_time = scan_time;
         let other_site = Arc::new(other_site);
-        app.frame_history[0] = FrameHistoryEntry {
+        app.primary.history[0] = FrameHistoryEntry {
             identity: frame_identity_for_volume(other_site.as_ref()),
             path: PathBuf::from("KFDR-complete"),
             volume: other_site,
@@ -67788,14 +67892,14 @@ mod tests {
     fn data_pack_load_state_ignores_live_refresh_receiver() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         arm_busy_primary_load(&mut app);
-        app.realtime_level2_auto_refresh = true;
+        app.primary.live.enabled = true;
 
         assert!(!app.data_pack_load_blocked());
 
         app.supersede_live_load_for_data_pack();
 
         assert!(app.load_receiver.is_none());
-        assert!(!app.realtime_level2_auto_refresh);
+        assert!(!app.primary.live.enabled);
     }
 
     #[test]
@@ -68461,12 +68565,12 @@ mod tests {
         app.spc_reports_enabled = false;
         app.archive_load_loop = false;
         app.archive_frame_count = 3;
-        app.history_frame_limit = 7;
+        app.primary.limits.frame_limit = 7;
         app.app_settings.archive_load_loop = false;
         app.app_settings.archive_frame_count = 3;
-        app.realtime_level2_auto_refresh = true;
+        app.primary.live.enabled = true;
         app.poll_active = true;
-        app.history_playing = true;
+        app.primary.cursor.playing = true;
 
         app.apply_workflow_preset(WorkflowPreset::ArchiveReview, &ctx);
 
@@ -68474,8 +68578,8 @@ mod tests {
         assert_eq!(app.sidebar_tab, SidebarTab::Data);
         assert!(app.archive_load_loop);
         assert_eq!(app.archive_frame_count, DEFAULT_ARCHIVE_FRAME_COUNT);
-        assert_eq!(app.history_frame_limit, DEFAULT_ARCHIVE_FRAME_COUNT);
-        assert!(!app.realtime_level2_auto_refresh);
+        assert_eq!(app.primary.limits.frame_limit, DEFAULT_ARCHIVE_FRAME_COUNT);
+        assert!(!app.primary.live.enabled);
         assert!(!app.poll_active);
         assert!(app.hazards_visible);
         assert!(!app.hazards_active_only);
@@ -68512,12 +68616,12 @@ mod tests {
         assert!(!app.spc_reports_enabled);
         assert!(!app.archive_load_loop);
         assert_eq!(app.archive_frame_count, 3);
-        assert_eq!(app.history_frame_limit, 7);
+        assert_eq!(app.primary.limits.frame_limit, 7);
         assert!(!app.app_settings.archive_load_loop);
         assert_eq!(app.app_settings.archive_frame_count, 3);
-        assert!(app.realtime_level2_auto_refresh);
+        assert!(app.primary.live.enabled);
         assert!(app.poll_active);
-        assert!(app.history_playing);
+        assert!(app.primary.cursor.playing);
     }
 
     #[test]
@@ -68659,7 +68763,7 @@ mod tests {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.archive_load_loop = false;
         app.archive_frame_count = 1;
-        app.history_frame_limit = 3;
+        app.primary.limits.frame_limit = 3;
         app.app_settings.archive_load_loop = false;
         app.app_settings.archive_frame_count = 1;
         let ctx = egui::Context::default();
@@ -68668,7 +68772,7 @@ mod tests {
 
         assert!(app.archive_load_loop);
         assert_eq!(app.archive_frame_count, DEFAULT_ARCHIVE_FRAME_COUNT);
-        assert_eq!(app.history_frame_limit, DEFAULT_ARCHIVE_FRAME_COUNT);
+        assert_eq!(app.primary.limits.frame_limit, DEFAULT_ARCHIVE_FRAME_COUNT);
         assert!(app.app_settings.archive_load_loop);
         assert_eq!(
             app.app_settings.archive_frame_count,
@@ -68858,9 +68962,9 @@ mod tests {
             let volume = Arc::new(volume);
             if index == 0 {
                 app.volume = Some(Arc::clone(&volume));
-                app.selected_frame_index = 0;
+                app.primary.cursor.index = 0;
             }
-            app.frame_history.push(FrameHistoryEntry {
+            app.primary.history.push(FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
                 path: PathBuf::from(format!("timeline-warning-sync-{index}")),
                 volume,
@@ -69141,7 +69245,7 @@ mod tests {
 
     fn advance_primary_screen_loop_for_test(app: &mut ViewerApp, ctx: &egui::Context) {
         mark_primary_screen_textures_ready(app);
-        app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        app.primary.cursor.last_step = Some(Instant::now() - Duration::from_secs(5));
         app.maybe_advance_history_loop(ctx);
     }
 

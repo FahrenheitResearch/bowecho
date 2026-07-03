@@ -36,9 +36,22 @@ pub const OVERLAY_HISTORY_BYTE_BUDGET: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 /// coupling surfaced in `HistoryLimits::pane`), so like the overlay budget
 /// this is a guard rail against pathological growth, not a working limit —
 /// the same "full 40-frame super-res loop must fit" sizing. The primary
-/// itself stays unbudgeted until its own Phase-4e decision, which is why
-/// this is a separate constant and not a fraction of a primary budget.
+/// budget is a separate constant, not a fraction of this one, because the
+/// two roles' legitimate working sets differ (see
+/// [`PRIMARY_HISTORY_BYTE_BUDGET`]).
 pub const PANE_HISTORY_BYTE_BUDGET: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// Per-engine byte budget for the PRIMARY role (Phase 4e wiring of census
+/// D8). The primary legitimately holds the app's biggest loops — deployment
+/// folders load 100+ volumes and the player exposes the 2000-frame ceiling —
+/// so its guard rail is sized for a ~100-frame super-res loop (~50-80
+/// MB/volume decoded ≈ 5-8 GB), four times the overlay/pane rail. Like the
+/// other budgets this stops pathological growth, not normal use: the user's
+/// frame limit governs first on every real machine. Wired at stage (i) but
+/// INERT until the stage-(ii) unify routes the primary's trims through
+/// [`LoopEngine::trim_history_to_limits`](super::LoopEngine) — the legacy
+/// `trim_frame_history` body never reads it.
+pub const PRIMARY_HISTORY_BYTE_BUDGET: usize = 8 * 1024 * 1024 * 1024; // 8 GiB
 
 /// Frame-count and byte limits for one engine's history (census D8).
 ///
@@ -66,13 +79,14 @@ pub struct HistoryLimits {
 }
 
 impl HistoryLimits {
-    /// Limits for the primary view (Phase 4e): the user's frame limit, no
-    /// byte budget yet — budgeting the primary is a 4e decision made
-    /// against the differential suite, not here.
+    /// Limits for the primary view (Phase 4e): the user's frame limit plus
+    /// the primary guard-rail byte budget
+    /// ([`PRIMARY_HISTORY_BYTE_BUDGET`] — inert until the stage-(ii)
+    /// unify routes primary trims through the engine).
     pub fn primary(frame_limit: usize) -> Self {
         Self {
             frame_limit,
-            byte_budget: None,
+            byte_budget: Some(PRIMARY_HISTORY_BYTE_BUDGET),
             grow_to_fit: false,
         }
     }
@@ -217,15 +231,32 @@ mod tests {
     }
 
     /// The role constructors pin where the byte budget is WIRED today:
-    /// overlays got one at Phase 4c, panes at 4d; the primary stays
-    /// unbudgeted until its own Phase-4e decision.
+    /// overlays got one at Phase 4c, panes at 4d, the primary at 4e stage
+    /// (i) — sized 4× the secondary rails for its bigger legitimate loops.
     #[test]
-    fn overlay_and_pane_roles_get_byte_budgets_primary_does_not_yet() {
+    fn every_role_gets_a_byte_budget_primary_is_the_largest() {
         assert_eq!(
             HistoryLimits::overlay().byte_budget,
             Some(OVERLAY_HISTORY_BYTE_BUDGET)
         );
-        assert_eq!(HistoryLimits::primary(7).byte_budget, None);
+        assert_eq!(
+            HistoryLimits::primary(7).byte_budget,
+            Some(PRIMARY_HISTORY_BYTE_BUDGET)
+        );
+        // Compare the WIRED budgets (through the constructors, so the
+        // ordering claim tracks what engines actually get, and clippy's
+        // assertions_on_constants stays quiet).
+        let primary_budget = HistoryLimits::primary(7)
+            .byte_budget
+            .expect("primary budget wired at 4e stage (i)");
+        assert!(
+            primary_budget > HistoryLimits::pane(7).byte_budget.expect("pane budget")
+                && primary_budget
+                    > HistoryLimits::overlay()
+                        .byte_budget
+                        .expect("overlay budget"),
+            "the primary's legitimate working set is the largest"
+        );
         assert_eq!(
             HistoryLimits::pane(7).byte_budget,
             Some(PANE_HISTORY_BYTE_BUDGET)

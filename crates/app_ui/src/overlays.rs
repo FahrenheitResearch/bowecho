@@ -304,7 +304,7 @@ pub(crate) fn overlay_pool_render_job(
 
 impl ViewerApp {
     pub(crate) fn maybe_refresh_radar_layers(&mut self, ctx: &egui::Context) {
-        if !self.realtime_level2_auto_refresh {
+        if !self.primary.live.enabled {
             return;
         }
 
@@ -1843,7 +1843,7 @@ impl ViewerApp {
             return CoordinatedOverlayLoadMode::ArchiveWindow {
                 start_utc,
                 end_utc,
-                max_frames: normalized_history_limit(self.history_frame_limit).max(1),
+                max_frames: normalized_history_limit(self.primary.limits.frame_limit).max(1),
             };
         }
         CoordinatedOverlayLoadMode::Live
@@ -2229,7 +2229,8 @@ mod tests {
         );
         app.upsert_history_frame(primary_first);
         app.upsert_history_frame(primary_second);
-        app.frame_history
+        app.primary
+            .history
             .sort_by(|left, right| left.identity.cmp(&right.identity));
         app.select_history_frame(0, false, &ctx);
 
@@ -2324,8 +2325,8 @@ mod tests {
         second.volume_time += chrono::Duration::minutes(3);
         let second = Arc::new(second);
         app.volume = Some(Arc::clone(&second));
-        app.selected_frame_index = 1;
-        app.frame_history = [Arc::clone(&first), Arc::clone(&second)]
+        app.primary.cursor.index = 1;
+        app.primary.history = [Arc::clone(&first), Arc::clone(&second)]
             .into_iter()
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
@@ -2344,7 +2345,7 @@ mod tests {
         layer.visible = true;
         layer.timeline_sync = true;
         layer.volume = Some(Arc::clone(&first));
-        layer.engine.history = FrameHistory::from(app.frame_history.to_vec());
+        layer.engine.history = FrameHistory::from(app.primary.history.to_vec());
         layer.engine.cursor.index = 0;
         let first_key = test_screen_texture_key(
             Arc::as_ptr(&first) as usize,
@@ -2375,7 +2376,7 @@ mod tests {
     #[test]
     fn coordinated_archive_overlay_is_not_replaced_by_live_auto_refresh() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.realtime_level2_auto_refresh = true;
+        app.primary.live.enabled = true;
         let mut layer = OverlayView::new(54, RadarSite::new("KBBB"));
         layer.timeline_sync = true;
         layer.engine.live.last_refresh = Some(
@@ -2721,7 +2722,7 @@ mod tests {
         let base = Utc.with_ymd_and_hms(2026, 6, 22, 12, 0, 0).unwrap();
         let primary = Arc::new(test_volume_with_site_time("KAAA", base));
         app.volume = Some(Arc::clone(&primary));
-        app.frame_history = FrameHistory::from(vec![FrameHistoryEntry {
+        app.primary.history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(primary.as_ref()),
             path: PathBuf::from("primary-1200"),
             volume: primary,
@@ -2768,7 +2769,7 @@ mod tests {
         let target = base + chrono::Duration::minutes(8);
         let primary = Arc::new(test_volume_with_site_time("KAAA", target));
         app.volume = Some(Arc::clone(&primary));
-        app.frame_history = FrameHistory::from(vec![FrameHistoryEntry {
+        app.primary.history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(primary.as_ref()),
             path: PathBuf::from("primary-1208"),
             volume: primary,
@@ -2799,7 +2800,7 @@ mod tests {
             base + chrono::Duration::seconds(COORDINATED_RADAR_MAX_STALENESS_SECONDS + 1),
         ));
         app.volume = Some(Arc::clone(&stale_primary));
-        app.frame_history = FrameHistory::from(vec![FrameHistoryEntry {
+        app.primary.history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(stale_primary.as_ref()),
             path: PathBuf::from("primary-stale"),
             volume: stale_primary,
@@ -2825,7 +2826,7 @@ mod tests {
         let primary = Arc::new(primary);
         app.selected_cut = 1;
         app.volume = Some(Arc::clone(&primary));
-        app.frame_history = FrameHistory::from(vec![FrameHistoryEntry {
+        app.primary.history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(primary.as_ref()),
             path: PathBuf::from("primary-low-sweeps"),
             volume: primary,
@@ -2869,7 +2870,7 @@ mod tests {
         let primary = Arc::new(primary);
         app.selected_cut = 0;
         app.volume = Some(Arc::clone(&primary));
-        app.frame_history = FrameHistory::from(vec![FrameHistoryEntry {
+        app.primary.history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(primary.as_ref()),
             path: PathBuf::from("primary-family"),
             volume: primary,
@@ -2917,7 +2918,7 @@ mod tests {
         primary.volume_time = base;
         let primary = Arc::new(primary);
         app.volume = Some(Arc::clone(&primary));
-        app.frame_history = FrameHistory::from(vec![FrameHistoryEntry {
+        app.primary.history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(primary.as_ref()),
             path: PathBuf::from("primary-vel-1200"),
             volume: primary,
@@ -2987,7 +2988,7 @@ mod tests {
         primary.volume_time = base;
         let primary = Arc::new(primary);
         app.volume = Some(Arc::clone(&primary));
-        app.frame_history = FrameHistory::from(vec![FrameHistoryEntry {
+        app.primary.history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(primary.as_ref()),
             path: PathBuf::from("primary-range-vel-1200"),
             volume: primary,
@@ -3210,7 +3211,7 @@ mod tests {
     #[test]
     fn coordinated_overlay_mode_uses_archive_window_for_loaded_loop() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.history_frame_limit = 96;
+        app.primary.limits.frame_limit = 96;
         add_two_test_history_frames(&mut app);
         let (start_utc, end_utc) = app.loaded_loop_time_window().expect("loaded loop window");
 
@@ -3231,7 +3232,7 @@ mod tests {
     #[test]
     fn adding_overlay_from_map_auto_syncs_to_loaded_loop() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
-        app.history_frame_limit = 7;
+        app.primary.limits.frame_limit = 7;
         add_two_test_history_frames(&mut app);
         let ctx = egui::Context::default();
 
@@ -3250,7 +3251,7 @@ mod tests {
         app.grid_layout = PanelLayout::TwoVertical;
         app.sync_extra_panes();
         app.active_pane = 1;
-        app.history_frame_limit = 48;
+        app.primary.limits.frame_limit = 48;
         let base = Utc.with_ymd_and_hms(2026, 6, 17, 18, 0, 0).unwrap();
         let pane = &mut app.extra_panes[0];
         pane.pin = Some(SiteRef::Us {

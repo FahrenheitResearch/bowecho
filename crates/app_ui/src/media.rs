@@ -735,10 +735,10 @@ impl ViewerApp {
         }
         let (restore_index, restore_cut, restore_playing, restore_browsing) = match target {
             LoopTimelineTarget::Primary => (
-                self.selected_frame_index,
+                self.primary.cursor.index,
                 self.selected_cut,
-                self.history_playing,
-                self.browsing_history,
+                self.primary.cursor.playing,
+                self.primary.cursor.browsing,
             ),
             LoopTimelineTarget::ExtraPane(slot) => self
                 .extra_panes
@@ -752,10 +752,10 @@ impl ViewerApp {
                     )
                 })
                 .unwrap_or((
-                    self.selected_frame_index,
+                    self.primary.cursor.index,
                     self.selected_cut,
-                    self.history_playing,
-                    self.browsing_history,
+                    self.primary.cursor.playing,
+                    self.primary.cursor.browsing,
                 )),
         };
         self.maybe_auto_sync_timeline_warnings(ctx);
@@ -798,10 +798,10 @@ impl ViewerApp {
         });
         match target {
             LoopTimelineTarget::Primary => {
-                self.history_playing = false;
+                self.primary.cursor.playing = false;
                 // Latch browsing so an in-flight live load cannot steal the
                 // selection mid-recording.
-                self.browsing_history = true;
+                self.primary.cursor.browsing = true;
             }
             LoopTimelineTarget::ExtraPane(slot) => {
                 if let Some(pane) = self.extra_panes.get_mut(slot) {
@@ -1226,8 +1226,8 @@ impl ViewerApp {
         }
         let restore_index = recorder
             .restore_index
-            .min(self.frame_history.len().saturating_sub(1));
-        if !self.frame_history.is_empty() {
+            .min(self.primary.history.len().saturating_sub(1));
+        if !self.primary.history.is_empty() {
             self.select_history_frame(restore_index, false, ctx);
             if self
                 .volume
@@ -1238,8 +1238,9 @@ impl ViewerApp {
                 self.sync_following_extra_panes_to_current_low_sweep_rank(ctx);
             }
         }
-        self.history_playing = recorder.restore_playing && self.primary_history_loop_can_step();
-        self.browsing_history = if self.history_playing {
+        self.primary.cursor.playing =
+            recorder.restore_playing && self.primary_history_loop_can_step();
+        self.primary.cursor.browsing = if self.primary.cursor.playing {
             false
         } else {
             recorder.restore_browsing

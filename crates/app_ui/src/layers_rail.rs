@@ -13,12 +13,14 @@ use std::time::{Duration, Instant};
 
 use chrono::TimeZone;
 use color_tables::ColorTableFamily;
+use data_source::sites::SiteRef;
 use eframe::egui;
+use ui_core::loop_engine::FeedSource;
 
 use crate::{
     GLM_LIVE_MAX_AGE_MINUTES, ItalyDpcMapProduct, LayerRowGear, LayerRowOpacity, LayerRowOrder,
-    LayerRowRemove, LayerRowSpec, LayerRowVis, PlacefileSlot, PollSource, RadarSite, SidebarTab,
-    ViewerApp, compact_layer_status, custom_poll_entry_label, custom_poll_entry_lat_lon,
+    LayerRowRemove, LayerRowSpec, LayerRowVis, PlacefileSlot, RadarSite, SidebarTab, ViewerApp,
+    compact_layer_status, custom_poll_entry_label, custom_poll_entry_lat_lon,
     custom_poll_links_from_gis, dock, format_site_label, glm_latest_age_minutes,
     glm_latest_is_live, glm_satellite_label, grid_composites, intl_provider_label, layer_row,
     mesoanalysis, normalized_poll_url, oa_derived, parse_custom_poll_marker_inputs, poll_url_name,
@@ -118,7 +120,7 @@ impl ViewerApp {
             "loading"
         } else if self.volume.is_none() {
             "idle"
-        } else if self.realtime_level2_auto_refresh {
+        } else if self.primary.live.enabled {
             "live"
         } else {
             "loaded"
@@ -1586,7 +1588,7 @@ impl ViewerApp {
                     if ui.button(label).clicked() {
                         if self.poll_active {
                             self.poll_active = false;
-                            self.poll_last_file = None;
+                            self.primary.live.dedupe_key = None;
                             self.poll_next = None;
                         } else if normalized_poll_url(&self.poll_url).is_empty() {
                             self.status = "Poll URL: enter a URL or choose a saved link".to_owned();
@@ -1595,9 +1597,9 @@ impl ViewerApp {
                             self.start_known_feed_poll(&url);
                         }
                     }
-                    if self.poll_active && matches!(self.poll_source, PollSource::CustomUrl(_)) {
+                    if self.poll_active && matches!(self.primary.feed, FeedSource::CustomUrl(_)) {
                         ui.weak(
-                            self.poll_last_file
+                            self.primary.live.dedupe_key
                                 .as_deref()
                                 .unwrap_or("waiting for dir.list…"),
                         );
@@ -1717,7 +1719,7 @@ impl ViewerApp {
                             .map(|(lat, lon)| format!(" {lat:.3}, {lon:.3}"))
                             .unwrap_or_else(|| " no marker".to_owned());
                         let active = self.poll_active
-                            && matches!(self.poll_source, PollSource::CustomUrl(_))
+                            && matches!(self.primary.feed, FeedSource::CustomUrl(_))
                             && poll_urls_match(&self.poll_url, &entry.poll_url);
                         ui.horizontal(|ui| {
                             ui.colored_label(
@@ -1881,7 +1883,7 @@ impl ViewerApp {
     pub(crate) fn start_known_feed_poll(&mut self, url: &str) {
         let next_url = normalized_poll_url(url);
         let same_source = self.poll_active
-            && matches!(self.poll_source, PollSource::CustomUrl(_))
+            && matches!(self.primary.feed, FeedSource::CustomUrl(_))
             && poll_urls_match(&self.poll_url, &next_url);
         if !same_source {
             self.clear_frame_history();
@@ -1890,7 +1892,7 @@ impl ViewerApp {
         self.poll_url = next_url;
         self.set_custom_url_poll_source();
         self.poll_active = true;
-        self.poll_last_file = None;
+        self.primary.live.dedupe_key = None;
         self.poll_next = None;
         self.poll_rx = None;
         // An auto-refresh load already in flight would land AFTER the
@@ -1905,10 +1907,10 @@ impl ViewerApp {
     /// drops a still-in-flight tick so it can't install under the new one.
     pub(crate) fn set_custom_url_poll_source(&mut self) {
         self.poll_url = normalized_poll_url(&self.poll_url);
-        let source = PollSource::CustomUrl(self.poll_url.clone());
-        if self.poll_source != source {
+        let source = FeedSource::CustomUrl(self.poll_url.clone());
+        if self.primary.feed != source {
             self.poll_rx = None;
-            self.poll_source = source;
+            self.primary.feed = source;
         }
     }
 
@@ -2077,8 +2079,10 @@ impl ViewerApp {
                 && !self.coverage_provider_id.is_empty()
                 && !self.coverage_site_id.is_empty()
             {
-                self.history_frame_limit = self
-                    .history_frame_limit
+                self.primary.limits.frame_limit = self
+                    .primary
+                    .limits
+                    .frame_limit
                     .max(self.coverage_frame_count)
                     .min(crate::MAX_HISTORY_FRAME_LIMIT);
                 self.start_intl_poll(
@@ -2250,24 +2254,24 @@ impl ViewerApp {
                 });
             }
             let intl_polling =
-                self.poll_active && matches!(self.poll_source, PollSource::Intl { .. });
+                self.poll_active && matches!(self.primary.feed, FeedSource::Live(SiteRef::Intl { .. }));
             if intl_polling {
                 if ui.button("Stop").clicked() {
                     self.poll_active = false;
-                    self.poll_last_file = None;
+                    self.primary.live.dedupe_key = None;
                     self.poll_next = None;
                 }
                 // Same status grammar as the URL poll: the dedupe key of
                 // the installed frame (Polled:/Poll: live in self.status).
                 ui.weak(
-                    self.poll_last_file
+                    self.primary.live.dedupe_key
                         .as_deref()
                         .unwrap_or("waiting for catalog…"),
                 );
-            } else if let Some(PollSource::Intl {
+            } else if let Some(FeedSource::Live(SiteRef::Intl {
                 provider_id,
                 site_id,
-            }) = PollSource::intl_from_settings(&self.app_settings)
+            })) = FeedSource::intl_from_settings(&self.app_settings)
             {
                 // Resume the persisted selection (mirrors poll_url Start).
                 if ui

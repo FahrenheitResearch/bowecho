@@ -32,7 +32,7 @@ use ui_core::worker_slot::SlotPoll;
 
 use crate::{
     ACTIVE_LOAD_POLL_MS, ArchiveLoadProgress, AsyncLoadResult, AsyncLoadUpdate, DecodedLoadBatch,
-    MAX_ARCHIVE_FRAME_COUNT, MAX_HISTORY_FRAME_LIMIT, PANEL_BUTTON_HEIGHT, PollSource, SpcReport,
+    FeedSource, MAX_ARCHIVE_FRAME_COUNT, MAX_HISTORY_FRAME_LIMIT, PANEL_BUTTON_HEIGHT, SpcReport,
     ViewerApp, archive_load_progress_row, archive_object_scan_time_utc, cache_dir,
     decode_archive_history_object, fetch_intl_frame_plan_batch, intl_provider_label,
     send_archive_progress,
@@ -377,10 +377,10 @@ impl ViewerApp {
     /// dispatch seam in the archive world routes through here so that
     /// swap is a one-function change.
     pub(crate) fn display_owner_site(&self) -> SiteRef {
-        if let PollSource::Intl {
+        if let FeedSource::Live(SiteRef::Intl {
             provider_id,
             site_id,
-        } = &self.poll_source
+        }) = &self.primary.feed
             && !provider_id.is_empty()
             && !site_id.is_empty()
         {
@@ -1018,8 +1018,8 @@ impl ViewerApp {
             return;
         }
         let total_frames = plans.len().min(MAX_HISTORY_FRAME_LIMIT);
-        if total_frames > self.history_frame_limit {
-            self.history_frame_limit = total_frames;
+        if total_frames > self.primary.limits.frame_limit {
+            self.primary.limits.frame_limit = total_frames;
         }
         self.set_intl_archive_primary_source(&provider_id, &site_id);
         self.intl_loop_rx = None;
@@ -1100,7 +1100,7 @@ impl ViewerApp {
         self.archive_date_input = start_utc.format("%Y-%m-%d").to_string();
         self.archive_frame_count = max_frames.min(MAX_ARCHIVE_FRAME_COUNT);
         self.archive_load_loop = true;
-        self.history_frame_limit = self.history_frame_limit.max(max_frames);
+        self.primary.limits.frame_limit = self.primary.limits.frame_limit.max(max_frames);
 
         let label = format!(
             "{} archive {site_id} window {} to {}",
@@ -1169,7 +1169,7 @@ impl ViewerApp {
         self.archive_date_input = target_utc.format("%Y-%m-%d").to_string();
         self.archive_frame_count = count.min(MAX_ARCHIVE_FRAME_COUNT);
         self.archive_load_loop = true;
-        self.history_frame_limit = self.history_frame_limit.max(count);
+        self.primary.limits.frame_limit = self.primary.limits.frame_limit.max(count);
 
         let label = format!(
             "{} archive {site_id} loop near {}",
@@ -1247,7 +1247,7 @@ impl ViewerApp {
         {
             self.center_map_on(lat, lon);
         }
-        self.realtime_level2_auto_refresh = false;
+        self.primary.live.enabled = false;
         self.pending_debug_archive_case = None;
         self.clear_camera_follow_targets();
         self.hazards_visible = plan.include_warnings;
@@ -1266,7 +1266,7 @@ impl ViewerApp {
             self.model_dock_open = true;
         }
         let max_frames = plan.max_frames.clamp(1, MAX_HISTORY_FRAME_LIMIT);
-        self.history_frame_limit = self.history_frame_limit.max(max_frames);
+        self.primary.limits.frame_limit = self.primary.limits.frame_limit.max(max_frames);
         self.set_intl_archive_primary_source(&provider_id, &site_id);
         self.intl_loop_rx = None;
         self.intl_loop_requested = 0;
@@ -1346,8 +1346,8 @@ impl ViewerApp {
             return;
         }
         let total_frames = chosen - new_start + 1;
-        if total_frames > self.history_frame_limit {
-            self.history_frame_limit = total_frames;
+        if total_frames > self.primary.limits.frame_limit {
+            self.primary.limits.frame_limit = total_frames;
         }
         self.archive_loaded_range = Some((new_start, chosen));
         let site_id = site.level2_id.clone();

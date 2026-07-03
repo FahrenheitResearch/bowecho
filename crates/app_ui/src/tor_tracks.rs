@@ -153,7 +153,8 @@ impl crate::ViewerApp {
             .as_ref()
             .map(|volume| volume.site.id.clone())
             .or_else(|| {
-                self.frame_history
+                self.primary
+                    .history
                     .last()
                     .map(|frame| frame.identity.site_id.clone())
             });
@@ -169,7 +170,8 @@ impl crate::ViewerApp {
             self.tor_tracks.clear_frames();
         }
         let valid: Vec<(DateTime<Utc>, usize)> = self
-            .frame_history
+            .primary
+            .history
             .iter()
             .filter(|frame| frame.identity.site_id == active_site)
             .map(|frame| {
@@ -221,7 +223,8 @@ impl crate::ViewerApp {
         //    swath builds chronologically).
         if self.tor_tracks.job.is_none() {
             let next = self
-                .frame_history
+                .primary
+                .history
                 .iter()
                 .filter(|frame| {
                     frame.identity.site_id == active_site
@@ -274,8 +277,9 @@ impl crate::ViewerApp {
 
     /// Scan time of the frame the user is looking at (scrub position).
     fn tor_tracks_upto(&self) -> Option<DateTime<Utc>> {
-        self.frame_history
-            .get(self.selected_frame_index)
+        self.primary
+            .history
+            .get(self.primary.cursor.index)
             .map(|frame| frame.identity.scan_time_utc)
             .or_else(|| {
                 self.volume
@@ -467,7 +471,8 @@ impl crate::ViewerApp {
     pub(crate) fn tor_tracks_rail_rows(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         use crate::{LayerRowGear, LayerRowOpacity, LayerRowSpec, LayerRowVis, layer_row};
         let newest = self
-            .frame_history
+            .primary
+            .history
             .last()
             .map(|frame| frame.identity.scan_time_utc);
         let state = &mut self.tor_tracks;
