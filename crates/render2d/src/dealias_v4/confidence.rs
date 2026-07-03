@@ -24,8 +24,18 @@ const FULL_CONFIDENCE_MARGIN_MPS: f64 = 12.0;
 pub(crate) const INTERIOR_ONLY: u8 = 64;
 /// Gates snapped by the R1 despeckle.
 pub(crate) const SPECK_SNAPPED: u8 = 32;
-/// Ceiling for gates changed by R2–R4 repair modules.
-pub(crate) const REPAIR_CHANGED: u8 = 96;
+/// Ceiling for gates changed by R2–R4 repair modules.  Deliberately BELOW
+/// [`INTERIOR_ONLY`] (and the temporal reference floor in `mod.rs`): a gate
+/// heuristic repair had to move is LESS certain testimony for the next
+/// volume than one whose region was consistent all along.  When this sat
+/// above the temporal floor, a repair-moved sector re-anchored the next
+/// volume's R2 pass and the error replicated volume-to-volume (measured,
+/// KEAX A-derecho 2026-06-09: prior batch-cut bridge error → prior 1.2°
+/// repair chase → temporal reference → current 1.2° repair chase, +2.7k
+/// residual boundary pairs; breaking the echo cut the A volume total from
+/// 8.0k to 3.6k while the D no-env chain, which relies on interior-only
+/// temporal references, kept its fix).
+pub(crate) const REPAIR_CHANGED: u8 = 48;
 
 /// Confidence values parallel to a dealiased tilt grid, row-major
 /// `rows × gates` like the moment storage.

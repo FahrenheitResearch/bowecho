@@ -37,9 +37,9 @@
 //! discontinuous neighbor cannot reduce the residual-boundary objective, and
 //! the candidate filter keeps the ladder inside the interactive budget.
 
-const COUPLET_MAX_AZIMUTH_GATES: usize = 5;
-const COUPLET_MIN_DELTA_NYQUIST_FRAC: f32 = 1.4;
-const COUPLET_DILATE_GATES: usize = 2;
+pub(crate) const COUPLET_MAX_AZIMUTH_GATES: usize = 5;
+pub(crate) const COUPLET_MIN_DELTA_NYQUIST_FRAC: f32 = 1.4;
+pub(crate) const COUPLET_DILATE_GATES: usize = 2;
 /// Do-no-harm change cap per module, as a fraction of finite gates.
 const REPAIR_MAX_FRACTION: f64 = 0.15;
 /// R2 margins: `min(fixed, frac·2N)` keeps the pass live at low Nyquist

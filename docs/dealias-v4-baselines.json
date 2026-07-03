@@ -6,7 +6,8 @@
   "boundary_metric": "adjacent finite 4-neighbor pairs incl. azimuth wrap seam, |dv| > 1.2*min(N_row); reconciles the historical 21,458->196 figure: same field, this ruler measures region=264 on KEAX 055143 (spec 10.4)",
   "volumes": "unidata-nexrad-level2; see crates/bench/README.md",
   "env_fixtures": "crates/bench/fixtures/dealias/env_*.json (RAP 13-km 0-h analyses) and env_*_hrrr.json (HRRR 3-km 0-h analyses, crates/bench/py/hrrr_profile.py)",
-  "external_rows": "pyart-region (Helmus & Collis 2016, doi:10.5334/jors.119) and unravel (Louf et al. 2020, doi:10.1175/JTECH-D-19-0020.1) scored with the parity-validated Python metric port (crates/bench/py, see docs/dealias-external-baselines.md); v4-hrrr = v4 with HRRR 3-km 0-h analysis fixtures (env_*_hrrr.json; B-moore/E-ktlx12 predate the HRRR archive) \u2014 a resolution experiment, indistinguishable from v4(RAP), which is why production anchoring is RAP-only per amended spec s16; orpg-l3-spot = NOAA operational ORPG output spot checks from archived Level-III (quantitative N0U where public; qualitative RIDGE N0S renders for 2026). External runtimes are Python \u2014 apples/oranges vs Rust."
+  "external_rows": "pyart-region (Helmus & Collis 2016, doi:10.5334/jors.119) and unravel (Louf et al. 2020, doi:10.1175/JTECH-D-19-0020.1) scored with the parity-validated Python metric port (crates/bench/py, see docs/dealias-external-baselines.md); v4-hrrr = v4 with HRRR 3-km 0-h analysis fixtures (env_*_hrrr.json; B-moore/E-ktlx12 predate the HRRR archive) — a resolution experiment, indistinguishable from v4(RAP), which is why production anchoring is RAP-only per amended spec s16; orpg-l3-spot = NOAA operational ORPG output spot checks from archived Level-III (quantitative N0U where public; qualitative RIDGE N0S renders for 2026). External runtimes are Python — apples/oranges vs Rust.",
+  "v41": "v4.1 rows (2026-07-02, same machine/harness): v4 with the Py-ART dealias_region_based network-reduction graft (Helmus & Collis 2016, doi:10.5334/jors.119) on the v1 vote-graph baseline - gap-bridged region edges resolved by weight-ordered aggregating merge with do-no-harm bridge gates, 'centered' group anchoring (measured no-op), couplet freeze, and the repair-echo confidence fix (REPAIR_CHANGED < temporal reference floor). v4 rows kept for history; v4.1-cold = no prior + no env. Mechanism write-up: docs/dealias-external-baselines.md section 7."
  },
  "cases": {
   "A-derecho": {
@@ -143,6 +144,72 @@
      "amortized": true,
      "deterministic": true,
      "rms_env_note": "rms_env is vs the HRRR fixture, not the RAP fixture"
+    },
+    "v4.1": {
+     "boundaries_lowest": 258,
+     "boundaries_volume": 4199,
+     "rms_env": 8.77,
+     "rms_harmonic": 5.91,
+     "percent_modified": 5.83,
+     "specks_lowest": 86,
+     "couplet_max_dv": 39.8,
+     "max_inbound": -75.0,
+     "multifold_gates": 2,
+     "multifold_speckle": 2,
+     "volume_ms_best": 475.0,
+     "worst_tilt_ms": 27.9,
+     "amortized": true,
+     "deterministic": true
+    },
+    "v4.1-noenv": {
+     "boundaries_lowest": 405,
+     "boundaries_volume": 10589,
+     "rms_env": 8.95,
+     "rms_harmonic": 5.93,
+     "percent_modified": 6.23,
+     "specks_lowest": 122,
+     "couplet_max_dv": 39.8,
+     "max_inbound": -75.0,
+     "multifold_gates": 2,
+     "multifold_speckle": 2,
+     "volume_ms_best": 439.3,
+     "worst_tilt_ms": 25.8,
+     "amortized": true,
+     "deterministic": true
+    },
+    "v4.1-hrrr": {
+     "boundaries_lowest": 258,
+     "boundaries_volume": 4201,
+     "rms_env": 8.9,
+     "rms_harmonic": 5.91,
+     "percent_modified": 5.83,
+     "specks_lowest": 86,
+     "couplet_max_dv": 39.8,
+     "max_inbound": -75.0,
+     "multifold_gates": 2,
+     "multifold_speckle": 2,
+     "volume_ms_best": 470.7,
+     "worst_tilt_ms": 27.7,
+     "amortized": true,
+     "deterministic": true,
+     "rms_env_note": "rms_env is vs the HRRR fixture, not the RAP fixture"
+    },
+    "v4.1-cold": {
+     "boundaries_lowest": 428,
+     "boundaries_volume": 8602,
+     "rms_env": null,
+     "rms_harmonic": 5.92,
+     "percent_modified": 5.91,
+     "specks_lowest": 126,
+     "couplet_max_dv": 39.8,
+     "max_inbound": -118.5,
+     "multifold_gates": 107,
+     "multifold_speckle": 22,
+     "volume_ms_best": 371.6,
+     "worst_tilt_ms": 21.9,
+     "amortized": true,
+     "deterministic": true,
+     "note": "cold start: no temporal prior, no environmental profile"
     }
    },
    "probes": {}
@@ -281,6 +348,55 @@
      "amortized": null,
      "deterministic": null,
      "note": "quantitative N0U (product 99), KTLX 2013-05-20 20:16Z, 0.5 deg tilt, 1 deg x 0.25 km"
+    },
+    "v4.1": {
+     "boundaries_lowest": 96,
+     "boundaries_volume": 1630,
+     "rms_env": 5.97,
+     "rms_harmonic": 4.54,
+     "percent_modified": 0.9,
+     "specks_lowest": 27,
+     "couplet_max_dv": 120.7,
+     "max_inbound": -84.0,
+     "multifold_gates": 2,
+     "multifold_speckle": 1,
+     "volume_ms_best": 172.1,
+     "worst_tilt_ms": 12.3,
+     "amortized": true,
+     "deterministic": true
+    },
+    "v4.1-noenv": {
+     "boundaries_lowest": 205,
+     "boundaries_volume": 1892,
+     "rms_env": 6.93,
+     "rms_harmonic": 4.54,
+     "percent_modified": 0.92,
+     "specks_lowest": 53,
+     "couplet_max_dv": 120.7,
+     "max_inbound": -84.0,
+     "multifold_gates": 2,
+     "multifold_speckle": 1,
+     "volume_ms_best": 165.1,
+     "worst_tilt_ms": 11.8,
+     "amortized": true,
+     "deterministic": true
+    },
+    "v4.1-cold": {
+     "boundaries_lowest": 96,
+     "boundaries_volume": 1821,
+     "rms_env": null,
+     "rms_harmonic": 4.54,
+     "percent_modified": 0.88,
+     "specks_lowest": 27,
+     "couplet_max_dv": 120.7,
+     "max_inbound": -84.0,
+     "multifold_gates": 2,
+     "multifold_speckle": 1,
+     "volume_ms_best": 150.3,
+     "worst_tilt_ms": 10.7,
+     "amortized": true,
+     "deterministic": true,
+     "note": "cold start: no temporal prior, no environmental profile"
     }
    },
    "probes": {}
@@ -436,6 +552,72 @@
      "amortized": null,
      "deterministic": null,
      "note": "quantitative N0U (product 99), KLIX 2021-08-29 16:32:52Z; -65.0 is at the product's encoding floor (7 gates saturated)"
+    },
+    "v4.1": {
+     "boundaries_lowest": 450,
+     "boundaries_volume": 1901,
+     "rms_env": 13.82,
+     "rms_harmonic": 12.11,
+     "percent_modified": 28.01,
+     "specks_lowest": 140,
+     "couplet_max_dv": 134.1,
+     "max_inbound": -108.7,
+     "multifold_gates": 72,
+     "multifold_speckle": 14,
+     "volume_ms_best": 546.8,
+     "worst_tilt_ms": 30.4,
+     "amortized": true,
+     "deterministic": true
+    },
+    "v4.1-noenv": {
+     "boundaries_lowest": 365,
+     "boundaries_volume": 1403,
+     "rms_env": 13.95,
+     "rms_harmonic": 12.24,
+     "percent_modified": 28.03,
+     "specks_lowest": 139,
+     "couplet_max_dv": 134.1,
+     "max_inbound": -108.7,
+     "multifold_gates": 103,
+     "multifold_speckle": 20,
+     "volume_ms_best": 532.3,
+     "worst_tilt_ms": 29.6,
+     "amortized": true,
+     "deterministic": true
+    },
+    "v4.1-hrrr": {
+     "boundaries_lowest": 451,
+     "boundaries_volume": 1779,
+     "rms_env": 13.17,
+     "rms_harmonic": 12.11,
+     "percent_modified": 28.0,
+     "specks_lowest": 143,
+     "couplet_max_dv": 134.1,
+     "max_inbound": -108.7,
+     "multifold_gates": 72,
+     "multifold_speckle": 14,
+     "volume_ms_best": 539.0,
+     "worst_tilt_ms": 29.9,
+     "amortized": true,
+     "deterministic": true,
+     "rms_env_note": "rms_env is vs the HRRR fixture, not the RAP fixture"
+    },
+    "v4.1-cold": {
+     "boundaries_lowest": 350,
+     "boundaries_volume": 1553,
+     "rms_env": null,
+     "rms_harmonic": 12.26,
+     "percent_modified": 28.05,
+     "specks_lowest": 139,
+     "couplet_max_dv": 134.1,
+     "max_inbound": -108.7,
+     "multifold_gates": 103,
+     "multifold_speckle": 20,
+     "volume_ms_best": 497.9,
+     "worst_tilt_ms": 27.7,
+     "amortized": true,
+     "deterministic": true,
+     "note": "cold start: no temporal prior, no environmental profile"
     }
    },
    "probes": {}
@@ -591,6 +773,72 @@
      "amortized": null,
      "deterministic": null,
      "note": "qualitative branch read from the IEM-archived RIDGE N0S (storm-relative velocity) render MBX_N0S_202606092354.png; raw 2026 Level-III is not publicly archived (NCEI order-only)"
+    },
+    "v4.1": {
+     "boundaries_lowest": 140,
+     "boundaries_volume": 801,
+     "rms_env": 5.77,
+     "rms_harmonic": 4.84,
+     "percent_modified": 2.9,
+     "specks_lowest": 53,
+     "couplet_max_dv": 48.5,
+     "max_inbound": -68.5,
+     "multifold_gates": 2,
+     "multifold_speckle": 2,
+     "volume_ms_best": 316.0,
+     "worst_tilt_ms": 18.6,
+     "amortized": true,
+     "deterministic": true
+    },
+    "v4.1-noenv": {
+     "boundaries_lowest": 140,
+     "boundaries_volume": 1013,
+     "rms_env": 5.78,
+     "rms_harmonic": 4.85,
+     "percent_modified": 2.9,
+     "specks_lowest": 53,
+     "couplet_max_dv": 48.5,
+     "max_inbound": -75.0,
+     "multifold_gates": 2,
+     "multifold_speckle": 2,
+     "volume_ms_best": 281.4,
+     "worst_tilt_ms": 16.6,
+     "amortized": true,
+     "deterministic": true
+    },
+    "v4.1-hrrr": {
+     "boundaries_lowest": 140,
+     "boundaries_volume": 801,
+     "rms_env": 6.15,
+     "rms_harmonic": 4.84,
+     "percent_modified": 2.9,
+     "specks_lowest": 53,
+     "couplet_max_dv": 48.5,
+     "max_inbound": -68.5,
+     "multifold_gates": 2,
+     "multifold_speckle": 2,
+     "volume_ms_best": 300.2,
+     "worst_tilt_ms": 17.7,
+     "amortized": true,
+     "deterministic": true,
+     "rms_env_note": "rms_env is vs the HRRR fixture, not the RAP fixture"
+    },
+    "v4.1-cold": {
+     "boundaries_lowest": 140,
+     "boundaries_volume": 975,
+     "rms_env": null,
+     "rms_harmonic": 4.84,
+     "percent_modified": 2.9,
+     "specks_lowest": 53,
+     "couplet_max_dv": 48.5,
+     "max_inbound": -68.5,
+     "multifold_gates": 2,
+     "multifold_speckle": 2,
+     "volume_ms_best": 239.9,
+     "worst_tilt_ms": 14.1,
+     "amortized": true,
+     "deterministic": true,
+     "note": "cold start: no temporal prior, no environmental profile"
     }
    },
    "probes": {
@@ -629,6 +877,21 @@
     "orpg-l3-spot": {
      "blob": "AWAY (SRM render)",
      "sector": "AWAY (SRM render)"
+    },
+    "v4.1": {
+     "blob": "+13.3",
+     "sector": "+7.0"
+    },
+    "v4.1-noenv": {
+     "blob": "+13.3",
+     "sector": "+7.0"
+    },
+    "v4.1-hrrr": {
+     "blob": "+13.3",
+     "sector": "+7.0"
+    },
+    "v4.1-cold": {
+     "blob": "+13.3"
     }
    }
   },
@@ -783,6 +1046,55 @@
      "amortized": null,
      "deterministic": null,
      "note": "qualitative branch read from the IEM-archived RIDGE N0S (storm-relative velocity) render MBX_N0S_202606092340.png; raw 2026 Level-III is not publicly archived (NCEI order-only)"
+    },
+    "v4.1": {
+     "boundaries_lowest": 97,
+     "boundaries_volume": 374,
+     "rms_env": 5.4,
+     "rms_harmonic": 4.68,
+     "percent_modified": 1.22,
+     "specks_lowest": 52,
+     "couplet_max_dv": 47.7,
+     "max_inbound": -60.2,
+     "multifold_gates": 0,
+     "multifold_speckle": 0,
+     "volume_ms_best": 307.6,
+     "worst_tilt_ms": 18.1,
+     "amortized": true,
+     "deterministic": true
+    },
+    "v4.1-noenv": {
+     "boundaries_lowest": 110,
+     "boundaries_volume": 404,
+     "rms_env": 5.46,
+     "rms_harmonic": 4.73,
+     "percent_modified": 1.26,
+     "specks_lowest": 56,
+     "couplet_max_dv": 47.7,
+     "max_inbound": -79.7,
+     "multifold_gates": 0,
+     "multifold_speckle": 0,
+     "volume_ms_best": 302.9,
+     "worst_tilt_ms": 17.8,
+     "amortized": true,
+     "deterministic": true
+    },
+    "v4.1-hrrr": {
+     "boundaries_lowest": 97,
+     "boundaries_volume": 374,
+     "rms_env": 6.01,
+     "rms_harmonic": 4.68,
+     "percent_modified": 1.22,
+     "specks_lowest": 52,
+     "couplet_max_dv": 47.7,
+     "max_inbound": -60.2,
+     "multifold_gates": 0,
+     "multifold_speckle": 0,
+     "volume_ms_best": 307.2,
+     "worst_tilt_ms": 18.1,
+     "amortized": true,
+     "deterministic": true,
+     "rms_env_note": "rms_env is vs the HRRR fixture, not the RAP fixture"
     }
    },
    "probes": {
@@ -812,6 +1124,15 @@
     },
     "orpg-l3-spot": {
      "ctrl": "TOWARD (SRM render)"
+    },
+    "v4.1": {
+     "ctrl": "-34.0"
+    },
+    "v4.1-noenv": {
+     "ctrl": "-34.0"
+    },
+    "v4.1-hrrr": {
+     "ctrl": "-34.0"
     }
    }
   },
@@ -957,6 +1278,58 @@
      "deterministic": true,
      "rms_env_note": "rms_env is vs the HRRR fixture, not the RAP fixture",
      "correct_branch_percent": 83.35
+    },
+    "v4.1": {
+     "boundaries_lowest": 18217,
+     "boundaries_volume": 18217,
+     "rms_env": 7.08,
+     "rms_harmonic": 5.77,
+     "percent_modified": 19.89,
+     "specks_lowest": 3386,
+     "couplet_max_dv": 44.0,
+     "max_inbound": -74.8,
+     "multifold_gates": 387,
+     "multifold_speckle": 77,
+     "volume_ms_best": 1146.9,
+     "worst_tilt_ms": 1146.9,
+     "amortized": true,
+     "deterministic": true,
+     "correct_branch_percent": 83.57
+    },
+    "v4.1-noenv": {
+     "boundaries_lowest": 2695,
+     "boundaries_volume": 2695,
+     "rms_env": 8.63,
+     "rms_harmonic": 6.2,
+     "percent_modified": 27.91,
+     "specks_lowest": 682,
+     "couplet_max_dv": 44.0,
+     "max_inbound": -74.8,
+     "multifold_gates": 586,
+     "multifold_speckle": 121,
+     "volume_ms_best": 677.0,
+     "worst_tilt_ms": 677.0,
+     "amortized": true,
+     "deterministic": true,
+     "correct_branch_percent": 96.93
+    },
+    "v4.1-hrrr": {
+     "boundaries_lowest": 18400,
+     "boundaries_volume": 18400,
+     "rms_env": 7.34,
+     "rms_harmonic": 5.85,
+     "percent_modified": 20.58,
+     "specks_lowest": 3430,
+     "couplet_max_dv": 44.0,
+     "max_inbound": -74.8,
+     "multifold_gates": 387,
+     "multifold_speckle": 77,
+     "volume_ms_best": 1276.5,
+     "worst_tilt_ms": 1276.5,
+     "amortized": true,
+     "deterministic": true,
+     "correct_branch_percent": 84.19,
+     "rms_env_note": "rms_env is vs the HRRR fixture, not the RAP fixture"
     }
    },
    "probes": {},
@@ -1086,6 +1459,40 @@
      "invented_gates_masked": 0,
      "runtime_note": "Python (numpy/scipy/numba); apples/oranges vs Rust rows",
      "correct_branch_percent": 92.63
+    },
+    "v4.1": {
+     "boundaries_lowest": 2877,
+     "boundaries_volume": 2877,
+     "rms_env": 7.59,
+     "rms_harmonic": 4.84,
+     "percent_modified": 17.67,
+     "specks_lowest": 610,
+     "couplet_max_dv": 46.5,
+     "max_inbound": -43.5,
+     "multifold_gates": 104,
+     "multifold_speckle": 25,
+     "volume_ms_best": 263.7,
+     "worst_tilt_ms": 263.7,
+     "amortized": true,
+     "deterministic": true,
+     "correct_branch_percent": 95.52
+    },
+    "v4.1-noenv": {
+     "boundaries_lowest": 1054,
+     "boundaries_volume": 1054,
+     "rms_env": 9.31,
+     "rms_harmonic": 5.28,
+     "percent_modified": 16.19,
+     "specks_lowest": 308,
+     "couplet_max_dv": 46.5,
+     "max_inbound": -43.5,
+     "multifold_gates": 192,
+     "multifold_speckle": 25,
+     "volume_ms_best": 125.3,
+     "worst_tilt_ms": 125.3,
+     "amortized": true,
+     "deterministic": true,
+     "correct_branch_percent": 92.36
     }
    },
    "probes": {},

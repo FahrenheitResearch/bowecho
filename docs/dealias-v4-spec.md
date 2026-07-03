@@ -965,6 +965,39 @@ Case E >=99% met or the requirement renegotiated, the C upper-tilt
 volume-total regression fixed, and the no-env degradation chain made
 not-worse-than-hybrid on every case.
 
+**Promotion-gate status after v4.1 (2026-07-02, the Py-ART network-
+reduction graft — mechanism and full delta table in
+`docs/dealias-external-baselines.md` §7; `v4.1*` rows in
+`docs/dealias-v4-baselines.json`):**
+
+- **C upper-tilt volume-total regression: RESOLVED.** 19,715 → 1,901
+  (hybrid 11,174; lowest tilt 522 → 450). The no-env and cold arms fix it
+  too (19,658 → 1,403; 20,139 → 1,553).
+- **No-env degradation chain: PARTIALLY RESOLVED.** The catastrophic
+  member (D-blob no-env, 3,808 / 26,178) is dissolved: 140 / 1,013 —
+  better than hybrid (164 / 11,620) and equal to v4.1-with-env on the
+  boundary ruler. The no-env arm now beats hybrid on B/C/D volume totals
+  and D-control. Still worse than hybrid: B lowest tilt (205 vs 127) and
+  A volume total (10,589 vs 7,064). The verifier's wiring order
+  (environmental profiles before temporal caching) stands.
+- **Case E >= 99%: NOT met, materially closer.** Best is now the NO-ENV
+  arm: E-keax12 96.93% (was 95.25; env arm 82.73 → 83.57), E-ktlx12
+  92.36% no-env (was 77.01) / 95.52% env (was 93.52). Py-ART's 99.07
+  remains ahead; the remaining gap is no longer an environmental-anchor
+  failure but residual segmentation/merge decisions.
+- **D-blob: UNCHANGED** (+13.3 all engines, all arms) — reframed by §17 as
+  an open problem for the field (ORPG fails it identically); remediation
+  paths are reflectivity/SNR pre-filtering and radar-derived low-level
+  references, not model profiles.
+- New in v4.1, on the record: the repair-echo confidence fix
+  (REPAIR_CHANGED < temporal reference floor) breaks cross-volume error
+  replication measured on A's SAILS pair; couplet 120.7 preserved in every
+  arm; whole-2N/determinism/gate-count invariants re-verified (16/16 runs
+  byte-identical). Honest regressions: A cold-start volume total 5,301 →
+  8,602, and the synthetic single-tilt N = 12 solve roughly doubles
+  (571 → 1,147 ms on E-keax12) — the section-10.5 first-paint item, which
+  was already failing, worsens and still blocks live-feed wiring.
+
 
 ## 16. Owner decisions (2026-07-02, post-verification)
 

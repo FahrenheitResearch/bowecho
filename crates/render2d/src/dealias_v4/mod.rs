@@ -44,6 +44,7 @@
 mod confidence;
 mod env_profile;
 mod graph;
+mod merge;
 mod repair;
 mod solve;
 mod super_regions;
@@ -70,7 +71,9 @@ const TEMPORAL_ELEVATION_TOLERANCE_DEG: f32 = 0.40;
 const MAX_REFERENCE_ABS_VELOCITY_MPS: f32 = 160.0;
 /// Temporal reference gates below this confidence (≈ 64/255, the
 /// "interior-consistent only" level) fall through to vertical/environmental
-/// evidence in the repair reference stack.
+/// evidence in the repair reference stack.  `confidence::REPAIR_CHANGED`
+/// sits BELOW this floor by design — see its doc for the measured
+/// repair-echo failure this breaks.
 const REPAIR_TEMPORAL_MIN_CONFIDENCE: f32 = 0.25;
 /// Velocity-interval width (× Nyquist) for the segmentation hygiene split
 /// (Helmus & Collis 2016; spec §4f/§5.1).  N/2 matches `REGION_JOIN_FRAC`,
@@ -356,7 +359,7 @@ fn build_tilt_field(volume: &RadarVolume, cut_index: usize) -> TiltField {
         }
     }
 
-    let solve = region_core::solve_region_folds_split(
+    let solve = merge::solve_region_folds_merge(
         &observed,
         &nyq,
         rows,

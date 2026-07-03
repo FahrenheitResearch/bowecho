@@ -266,3 +266,117 @@ determinism, and interactive speed — and on the hardest case in the
 battery it ties the operational state of the art (everyone loses).  Steal
 Py-ART's global-mean anchor for the solve energy, keep the couplet mask,
 and re-run this table.
+
+## 7. v4.1 — the steal, landed and measured (2026-07-02)
+
+Follow-up to §6's "steal Py-ART's global-mean anchor … and re-run this
+table."  Engine rows `v4.1*` in `docs/dealias-v4-baselines.json` (same
+machine, same harness, best-of-3, all arms; `v4` rows kept for history).
+Implementation: `crates/render2d/src/dealias_v4/merge.rs` (+ a two-line
+confidence-ordering fix in `confidence.rs`).
+
+### 7.1 What was actually worth stealing (a correction to §6)
+
+§6 named Py-ART's `centered` global-mean recentering as the mechanism to
+steal.  Dissection against the battery (Py-ART itself rerun with
+`centered=False`, and the port rerun with the anchor rule swapped) showed
+**`centered` is a measured no-op on every case** — the dominant group's
+mean fold already rounds to zero, so the offset never fires.  The
+load-bearing mechanism in Py-ART `dealias_region_based` (Helmus & Collis
+2016, *J. Open Res. Softw.* 4(1):e25, doi:10.5334/jors.119; region lineage
+Jing & Wiener 1993, *JTECH* 10, 798–808) is its **gap-bridged region
+edges** (`skip_between_rays` / `skip_along_ray` = 100): when the adjacent
+gate is invalid, the nearest finite gate within ~100 gates still votes.
+Removing only that from Py-ART collapses E-ktlx12 96.86 → 77.60% and
+E-keax12 99.07 → 95.69% — statistically our own no-env numbers.  Bridges
+are the only relative evidence connecting isolated echo islands (F9) and
+quality-filtered swath crossings to the main field.
+
+### 7.2 The v4.1 mechanism
+
+1. **v1's vote graph keeps every relation it already resolves** (its exact
+   strongest-boundary-first union, cycles dropped).  A pure port that let
+   Py-ART's aggregation re-decide those seams under-unfolded a 15k-gate RIJ
+   sector on a KEAX batch cut (noise regions merge first and dilute the
+   seam mean), and the error propagated across tilts via the repair
+   gauntlet's vertical reference.
+2. **Py-ART's dynamic network reduction decides everything the vote graph
+   cannot connect**: pop the heaviest live relation, unfold the smaller
+   node by `round(mean Δv/2N)` over the *current* unfolded state of the
+   *aggregated* relation (parallel relations combine as the network
+   reduces), merge, repeat — fed by touching pairs plus the bridged gap
+   votes.
+3. **Two do-no-harm gates on bridge-dominated relations** (not in Py-ART;
+   both measured necessary at full Nyquist, both inert at N = 12):
+   *residual* — unfold only if the unfolded state lands within 18 m/s of
+   the relation mean (cross-gap shear is Nyquist-independent m/s physics;
+   a fold-unit ambiguity test is wrong at one end of the Nyquist range or
+   the other), and *corroboration* — ≥ 12 agreeing pairs (a lone speck's
+   bridges can read REAL near-2N shear as a decisive fold: measured 4.9k
+   near-zero KEAX gates unfolded into the upper jet at |v−env| 46 m/s, and
+   39 wrong-branch speck components on the Moore lowest tilt).  An
+   untrusted bridge welds without unwrapping.
+4. **Repair-echo break**: `REPAIR_CHANGED` confidence now ranks BELOW
+   "interior-consistent" and below the temporal reference floor — a gate
+   the previous volume's own repair moved may no longer anchor the next
+   volume's R2 patch pass.  This poison path (prior batch-cut error →
+   prior 1.2° repair chase → temporal reference → current 1.2° repair
+   chase) was measured to add +2.7k boundary pairs on A's SAILS pair, and
+   breaking it cut A's volume total below the shipped v4.
+5. `centered` group anchoring (kept as the no-evidence anchor) and the R0
+   couplet freeze extended to the baseline solve round out the composition.
+
+### 7.3 Delta table (v4 → v4.1, every arm; bnd low/vol unless noted)
+
+| case / arm | v4 | v4.1 | verdict |
+|---|---|---|---|
+| A env (RAP+prior) | 257 / 5059 | 258 / **4199** | vol −17%; low tie |
+| A no-env (prior) | 405 / 11189 | 405 / **10589** | vol −5% |
+| A HRRR | 257 / 5077 | 258 / 4201 | = RAP (again) |
+| A cold | 453 / 5301 | **428** / 8602 | low −6%; **vol +62% — shortfall** |
+| B env; couplet ΔV | 96 / 2986; 120.7 | 96 / **1630**; **120.7** | vol −45%; couplet held |
+| B no-env | 205 / 3173 | 205 / **1892** | vol −40% |
+| B cold | 96 / 3164 | 96 / **1821** | vol −42% |
+| C env | 522 / 19715 | **450 / 1901** | low −14%, vol −90% — the §15 C-regression item, closed |
+| C no-env | 428 / 19658 | **365 / 1403** | both huge |
+| C HRRR | 523 / 19854 | 451 / 1779 | = RAP |
+| C cold | 424 / 20139 | **350 / 1553** | both huge |
+| D-blob env | 140 / 2314 | 140 / **801** | vol −65%; probes +13.3/+7.0 unchanged (open problem, §6) |
+| D-blob no-env | **3808 / 26178** | **140 / 1013** | catastrophe dissolved |
+| D-blob cold | 140 / 826 | 140 / 975 | ~tie |
+| D-control env | 97 / 372; −34.0 ✓ | 97 / 374; −34.0 ✓ | parity held |
+| D-control no-env | 110 / 403 | 110 / 404 | parity held |
+| E-keax12 env, correct% | 82.73 | **83.57** | +0.8 |
+| E-keax12 no-env | 95.25 | **96.93** | +1.7 (Py-ART: 99.07) |
+| E-keax12 HRRR | 83.35 | 84.19 | +0.8 |
+| E-ktlx12 env | 93.52 | **95.52** | +2.0 |
+| E-ktlx12 no-env | 77.01 | **92.36** | **+15.4** (Py-ART: 96.86) |
+| KEAX volume runtime | 540 ms | **475 ms** | ≤ 650 budget |
+| E-keax12 single-tilt runtime | 571 ms | **1147 ms — shortfall** | synthetic N = 12 worst case; §10.5 first-paint item, already failing in v4, worsens |
+
+Determinism: all 16 runs byte-identical across the harness's double
+execution (exit-code gate).  Whole-2N moves only; no gates invented or
+deleted; region/cascade/hybrid untouched (their rows reproduce exactly).
+
+Honest shortfalls, on the record: A-cold volume total (8602 vs 5301 — the
+cold arm has no reference to break the repair-chase asymmetry); the
+synthetic single-tilt N = 12 runtime roughly doubles (merge machinery on a
+heavily segmented low-Nyquist sweep); E ≥ 99% still unmet (96.93 best vs
+Py-ART's 99.07); D-blob probe unchanged (ties the operational state of the
+art, §4/§6); the C max-inbound −108.7 / couplet 134.1 values remain the
+§15 isolated-island artifact class — do not cite them.
+
+### 7.4 Verdict update to §6
+
+With v4.1, the boundary gap to `pyart-region` on real cases is closed or
+reversed on the volume ruler (A 4199 vs 2253 still behind; B 1630 vs 1045
+behind; C 1901 vs 1389 behind; D-blob 801 vs 427 behind — but hybrid and
+shipped v4 are beaten everywhere, and the lowest-tilt counts now sit at
+region-engine level with couplet preservation Py-ART does not match:
+120.7 vs 98.0 on Moore).  Case E no-env moves from "catastrophically
+env-dependent" (77.01) to within 4.5 points of Py-ART with zero
+environmental input.  The graceful-degradation story materially changed:
+the no-env arm now BEATS hybrid on B/C/D volume totals and matches it on
+D-control — the "temporal prior without environment is dangerous" verifier
+finding is resolved on D (the catastrophic case) and reduced to a
+lowest-tilt gap on B (205 vs 127).
