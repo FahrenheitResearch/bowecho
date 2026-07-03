@@ -377,6 +377,33 @@ impl LoopEngine {
         self.cursor.index = self.cursor.index.min(self.history.len().saturating_sub(1));
     }
 
+    /// Re-apply a changed frame limit outside an install (census D8, the
+    /// shared-limits surface): the caller passes the limit — for panes,
+    /// the PRIMARY's — and the engine normalizes its own copy, trims
+    /// oldest-first (frames then bytes), and clamps the cursor. This is
+    /// the legacy trim-on-limit-change behavior for secondary views.
+    pub fn set_frame_limit(&mut self, frame_limit: usize) {
+        self.limits.frame_limit = frame_limit;
+        self.trim_history_to_limits();
+    }
+
+    /// Timeline-sync selection (spec §3, engine-common; panes are the first
+    /// consumer, Phase 4d): move the cursor to the NEWEST frame at-or-before
+    /// `t`. Histories are ascending by identity (census Appendix B) and a
+    /// cross-site guard keeps them single-site, so "newest at-or-before" is
+    /// the partition point on scan time. Returns the selected index; `None`
+    /// (cursor untouched) when the history is empty or every frame is after
+    /// `t`. Staleness budgets are caller policy — the overlay coordinated-
+    /// loop budget stays in overlays.rs.
+    pub fn select_frame_nearest(&mut self, t: chrono::DateTime<chrono::Utc>) -> Option<usize> {
+        let index = self
+            .history
+            .partition_point(|frame| frame.identity.scan_time_utc <= t)
+            .checked_sub(1)?;
+        self.cursor.index = index;
+        Some(index)
+    }
+
     /// Drop every frame and reset the engine-owned loop state (census D4:
     /// history, cursor, playing/browsing, step clock). Role-specific blast
     /// radius — storm caches, loop render cache, product-cut memory —
@@ -1029,6 +1056,45 @@ mod tests {
             |_| false,
         );
         assert_eq!(outcome.selection, InstallSelection::CursorUnchanged);
+    }
+
+    /// select_frame_nearest is at-or-before semantics on the ascending
+    /// history: exact hit selects it, between-frames selects the older,
+    /// before-all/no-frames leaves the cursor untouched and returns None.
+    #[test]
+    fn select_frame_nearest_picks_newest_at_or_before() {
+        let mut engine = engine();
+        let _ = engine.install_batch(
+            batch(vec![
+                decoded("KEAX", 10, "a"),
+                decoded("KEAX", 20, "b"),
+                decoded("KEAX", 30, "c"),
+            ]),
+            &SELECT_PRIMARY,
+            None,
+            |_| false,
+        );
+        let t = |minute: u32| Utc.with_ymd_and_hms(2026, 6, 9, 5, minute, 0).unwrap();
+
+        assert_eq!(engine.select_frame_nearest(t(20)), Some(1), "exact hit");
+        assert_eq!(engine.cursor.index, 1);
+        assert_eq!(
+            engine.select_frame_nearest(t(25)),
+            Some(1),
+            "between frames selects the older (at-or-before)"
+        );
+        assert_eq!(engine.select_frame_nearest(t(45)), Some(2), "after all");
+        assert_eq!(engine.cursor.index, 2);
+        assert_eq!(
+            engine.select_frame_nearest(t(5)),
+            None,
+            "before all frames: nothing at-or-before"
+        );
+        assert_eq!(engine.cursor.index, 2, "a miss leaves the cursor alone");
+
+        let mut empty = engine_for_pane();
+        assert_eq!(empty.select_frame_nearest(t(20)), None);
+        assert_eq!(empty.cursor.index, 0);
     }
 
     /// KeepCursor (overlay timeline-sync) never moves the cursor on

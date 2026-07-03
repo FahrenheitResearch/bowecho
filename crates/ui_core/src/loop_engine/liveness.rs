@@ -5,13 +5,43 @@
 //! `pane_chip_is_live`) is the whole-phase gate and derives from this at
 //! adoption time.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use data_source::sites::SiteRef;
 
 use super::feed::FeedSource;
 use super::{EngineRole, LoopEngine};
+
+/// One live tick's verdict for an engine (spec §3, Phase 4d): the
+/// generalization of the pure pane policy `pane_live_poll_action` that
+/// panes drove before adoption. `FollowPrimary` is the SharedWithPrimary
+/// dedupe — mirror the primary's decode instead of downloading the same
+/// feed twice — now uniform for US AND international feeds (parity QW9:
+/// the intl double-poll dies here).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveAction {
+    Skip,
+    /// Spawn this engine's own latest-load worker.
+    Poll,
+    /// Mirror the primary's newest volume Arc instead of polling.
+    FollowPrimary,
+}
+
+/// SiteRef equality for the live dedupe. US Level-II ids are
+/// case-insensitive on the wire and legacy pane pins may carry stray case
+/// (pinned by the ported `extra_pane_live_source` dedupe test's
+/// lowercase-pin cells); international provider/site ids are
+/// case-significant lowercase (spec §1) and compare exactly — including
+/// the provider, so two providers sharing a site-id string never dedupe.
+fn live_sites_match(own: &SiteRef, primary: &SiteRef) -> bool {
+    match (own, primary) {
+        (SiteRef::Us { level2_id: own }, SiteRef::Us { level2_id: primary }) => {
+            own.eq_ignore_ascii_case(primary)
+        }
+        _ => own == primary,
+    }
+}
 
 /// Stale-threshold floor for a live international feed, moved from app_ui
 /// (which re-imports it): intl feeds publish on 5-15 minute cadences (vs
@@ -96,6 +126,56 @@ impl LoopEngine {
             (_, FeedSource::CustomUrl(_)) => CUSTOM_URL_POLL_SECONDS,
         };
         Some(Duration::from_secs(seconds))
+    }
+
+    /// One live tick's verdict (spec §3; the engine port of the pure pane
+    /// policy `pane_live_poll_action`, its table pinned by
+    /// `live_tick_verdict_table_ports_the_pane_poll_policy` below). Gate
+    /// order is the legacy order and is load-bearing:
+    ///
+    /// 1. `!live.enabled` → Skip — the per-view Live toggle is the user's
+    ///    pause AND the archive guard (archive loads clear the flag).
+    /// 2. `!feed_pollable` → Skip — the OWNER's classification of "nothing
+    ///    to poll": no pin, an id outside the US catalog, or a research
+    ///    feed the load path refuses. App-side knowledge, passed in.
+    /// 3. `load_in_flight` → Skip — an in-flight load owns the view (this
+    ///    outranks FollowPrimary, exactly like the legacy policy).
+    /// 4. Same live site as the primary → FollowPrimary, cadence-free:
+    ///    freshness rides the primary's own poll. SiteRef equality via
+    ///    [`live_sites_match`] — uniform for US and intl, which is the
+    ///    Phase-4d "intl double-poll dies" deliverable. The primary is
+    ///    passed as its live-followed [`SiteRef`] until Phase 4e gives it
+    ///    an engine to compare feeds with directly.
+    /// 5. Otherwise Poll when due per [`Self::poll_cadence`] (a fresh
+    ///    engine with no `last_refresh` is immediately due), Skip when
+    ///    not. Feeds with no cadence (archive/local) never poll.
+    pub fn live_tick(
+        &self,
+        primary_live_site: Option<&SiteRef>,
+        feed_pollable: bool,
+        load_in_flight: bool,
+        now: Instant,
+    ) -> LiveAction {
+        if !self.live.enabled || !feed_pollable || load_in_flight {
+            return LiveAction::Skip;
+        }
+        if let (FeedSource::Live(own), Some(primary)) = (&self.feed, primary_live_site)
+            && live_sites_match(own, primary)
+        {
+            return LiveAction::FollowPrimary;
+        }
+        let Some(cadence) = self.poll_cadence() else {
+            return LiveAction::Skip;
+        };
+        let due = self
+            .live
+            .last_refresh
+            .is_none_or(|last| now.saturating_duration_since(last) >= cadence);
+        if due {
+            LiveAction::Poll
+        } else {
+            LiveAction::Skip
+        }
     }
 
     /// Liveness derived ONLY from engine-own state: feed variant,
@@ -320,6 +400,185 @@ mod tests {
             ),
             0
         );
+    }
+
+    /// Phase 4d port of the legacy `pane_live_poll_action_policy` table
+    /// (app_ui, deleted with the pure fn): every (live, source, in-flight,
+    /// due) cell reproduced through `live_tick`, plus the new intl
+    /// FollowPrimary cell that kills the intl double-poll. "source" maps
+    /// to (feed, feed_pollable, primary_live_site); "due" maps to
+    /// `live.last_refresh` against the engine cadence.
+    #[test]
+    fn live_tick_verdict_table_ports_the_pane_poll_policy() {
+        let now = Instant::now();
+        let due = None; // never refreshed -> immediately due
+        let not_due = Some(now); // refreshed this instant -> not due
+        let cell = |feed: FeedSource,
+                    enabled: bool,
+                    last_refresh: Option<Instant>,
+                    primary: Option<&SiteRef>,
+                    pollable: bool,
+                    in_flight: bool| {
+            let mut engine = LoopEngine::new(EngineId(4), EngineRole::Pane { slot: 0 }, feed);
+            engine.live.enabled = enabled;
+            engine.live.last_refresh = last_refresh;
+            engine.live_tick(primary, pollable, in_flight, now)
+        };
+        let ktlx = us_site_id("KTLX");
+        let us = |id: &str| FeedSource::Live(us_site_id(id));
+        let intl_feed = FeedSource::Live(intl_site());
+
+        // Due poll fires for a pane's own site and for international feeds.
+        assert_eq!(
+            cell(us("KEAX"), true, due, Some(&ktlx), true, false),
+            LiveAction::Poll
+        );
+        assert_eq!(
+            cell(intl_feed.clone(), true, due, Some(&ktlx), true, false),
+            LiveAction::Poll
+        );
+        // Not due yet.
+        assert_eq!(
+            cell(us("KEAX"), true, not_due, Some(&ktlx), true, false),
+            LiveAction::Skip
+        );
+        assert_eq!(
+            cell(intl_feed.clone(), true, not_due, Some(&ktlx), true, false),
+            LiveAction::Skip
+        );
+        // An in-flight load owns the view — even over FollowPrimary.
+        assert_eq!(
+            cell(us("KEAX"), true, due, Some(&ktlx), true, true),
+            LiveAction::Skip
+        );
+        assert_eq!(
+            cell(us("KTLX"), true, due, Some(&ktlx), true, true),
+            LiveAction::Skip
+        );
+        assert_eq!(
+            cell(intl_feed.clone(), true, due, Some(&ktlx), true, true),
+            LiveAction::Skip
+        );
+        // Live flag off — the user's pause and the archive guard — outranks
+        // EVERY source kind, including the cadence-free primary follow.
+        assert_eq!(
+            cell(us("KEAX"), false, due, Some(&ktlx), true, false),
+            LiveAction::Skip
+        );
+        assert_eq!(
+            cell(us("KTLX"), false, due, Some(&ktlx), true, false),
+            LiveAction::Skip
+        );
+        assert_eq!(
+            cell(intl_feed.clone(), false, due, Some(&ktlx), true, false),
+            LiveAction::Skip
+        );
+        // No pollable source (owner classification): skip regardless of the
+        // in-flight/due bits.
+        assert_eq!(
+            cell(us("KEAX"), true, due, Some(&ktlx), false, false),
+            LiveAction::Skip
+        );
+        assert_eq!(
+            cell(us("KEAX"), true, due, Some(&ktlx), false, true),
+            LiveAction::Skip
+        );
+        assert_eq!(
+            cell(us("KEAX"), true, not_due, Some(&ktlx), false, false),
+            LiveAction::Skip
+        );
+        // Same site as the live primary: mirror its decode, cadence-free
+        // (due or not) — US ids compare case-insensitively (legacy pins).
+        assert_eq!(
+            cell(us("KTLX"), true, due, Some(&ktlx), true, false),
+            LiveAction::FollowPrimary
+        );
+        assert_eq!(
+            cell(us("KTLX"), true, not_due, Some(&ktlx), true, false),
+            LiveAction::FollowPrimary
+        );
+        assert_eq!(
+            cell(us("ktlx"), true, due, Some(&ktlx), true, false),
+            LiveAction::FollowPrimary
+        );
+        // THE Phase-4d cell: an intl pane sharing the intl primary's site
+        // follows instead of double-polling (SiteRef equality, uniform).
+        let intl_primary = SiteRef::Intl {
+            provider_id: "smhi".to_owned(),
+            site_id: "angelholm".to_owned(),
+        };
+        assert_eq!(
+            cell(
+                intl_feed.clone(),
+                true,
+                due,
+                Some(&intl_primary),
+                true,
+                false
+            ),
+            LiveAction::FollowPrimary
+        );
+        // ...but the equality includes the provider: a cross-provider
+        // same-site-id string still polls its own feed.
+        let cross_provider = SiteRef::Intl {
+            provider_id: "dwd".to_owned(),
+            site_id: "angelholm".to_owned(),
+        };
+        assert_eq!(
+            cell(
+                intl_feed.clone(),
+                true,
+                due,
+                Some(&cross_provider),
+                true,
+                false
+            ),
+            LiveAction::Poll
+        );
+        // No primary live site (paused / custom-URL / intl archive owner):
+        // the same-site pane owns its own polling.
+        assert_eq!(
+            cell(us("KTLX"), true, due, None, true, false),
+            LiveAction::Poll
+        );
+        // Archive/local feeds never poll (no cadence).
+        let archive = FeedSource::Archive {
+            site: us_site_id("KTLX"),
+            window: ArchiveWindow {
+                start_utc: Utc.with_ymd_and_hms(2026, 6, 9, 5, 0, 0).unwrap(),
+                end_utc: Utc.with_ymd_and_hms(2026, 6, 9, 6, 0, 0).unwrap(),
+                anchor_utc: None,
+                max_frames: 20,
+            },
+        };
+        let mut engine = LoopEngine::new(EngineId(4), EngineRole::Pane { slot: 0 }, archive);
+        engine.live.enabled = true; // even force-armed, no cadence -> Skip
+        assert_eq!(engine.live_tick(None, true, false, now), LiveAction::Skip);
+
+        // Cadence pins (were `pane_live_poll_cadence_seconds`): US panes
+        // poll on the 5 s overlay cadence, never the primary's 1 s chunk
+        // cadence; international on the provider cadence.
+        let us_pane = LoopEngine::new(EngineId(4), EngineRole::Pane { slot: 0 }, us("KEAX"));
+        assert_eq!(
+            us_pane.poll_cadence(),
+            Some(Duration::from_secs(OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS))
+        );
+        let intl_pane = LoopEngine::new(EngineId(4), EngineRole::Pane { slot: 0 }, intl_feed);
+        assert_eq!(
+            intl_pane.poll_cadence(),
+            Some(Duration::from_secs(INTL_POLL_SECONDS))
+        );
+        let us_primary = LoopEngine::new(EngineId(4), EngineRole::Primary, us("KEAX"));
+        assert!(
+            us_pane.poll_cadence() > us_primary.poll_cadence(),
+            "US panes must poll slower than the primary's chunk cadence"
+        );
+    }
+
+    fn us_site_id(id: &str) -> SiteRef {
+        SiteRef::Us {
+            level2_id: id.to_owned(),
+        }
     }
 
     /// The (role, feed) cadence table from spec §3.

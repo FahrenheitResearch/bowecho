@@ -93,16 +93,16 @@ use ui_core::geo::{aeqd_forward_km, aeqd_inverse_km};
 pub(crate) use ui_core::loop_engine::{
     DEFAULT_HISTORY_FRAME_LIMIT, DecodedLoad, DecodedLoadBatch, FrameHistory, FrameHistoryEntry,
     FrameIdentity, FrameStatus, INTL_POLL_SECONDS, INTL_STALE_CHIP_FLOOR_SECONDS, LoadTimings,
-    MAX_HISTORY_FRAME_LIMIT, OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS,
-    frame_history_entry_from_decoded, frame_identity_for_volume, frame_status_priority,
-    history_contains_other_site, live_partial_frame_has_new_data,
+    MAX_HISTORY_FRAME_LIMIT, frame_history_entry_from_decoded, frame_identity_for_volume,
+    frame_status_priority, history_contains_other_site, live_partial_frame_has_new_data,
 };
-// v0.29 Phase 4c overlay adoption: radar overlay layers are the FIRST view
-// on the engine (spec §7 adoption order overlays → panes → primary). The
-// primary/pane paths still run their legacy plumbing until 4d/4e.
+// v0.29 Phase 4c overlay adoption + 4d pane adoption: radar overlay layers
+// were the FIRST view on the engine, extra panes the SECOND (spec §7
+// adoption order overlays → panes → primary). The primary path still runs
+// its legacy plumbing until 4e.
 pub(crate) use ui_core::loop_engine::{
-    ArchiveWindow, EngineId, EngineRole, FeedSource, InstallSelection, Liveness, LoopEngine,
-    SelectionPolicy,
+    ArchiveWindow, EngineId, EngineRole, FeedSource, HistoryLimits, InstallSelection, LiveAction,
+    Liveness, LoopEngine, SelectionPolicy,
 };
 #[cfg(test)]
 use ui_core::render_service::overlay_pool_worker_target;
@@ -1819,7 +1819,7 @@ struct ViewerApp {
     // Multi-pane grid: layout + the extra synchronized panes (pane 0 is the
     // primary view's own state above).
     grid_layout: PanelLayout,
-    extra_panes: Vec<ViewPane>,
+    extra_panes: Vec<PaneView>,
     /// The last-clicked pane (0 = main). The sidebar product picker and tilt
     /// list drive this pane: the main pane edits the whole bunch, an extra
     /// pane edits itself independently.
@@ -2247,7 +2247,7 @@ struct IntlCoverageProbe {
 
 /// UI-side view of an international site selection (provider, site, and a
 /// display label). Since the v0.29 Phase-3 pin collapse this is NOT pane
-/// state — pane identity is `ViewPane::pin: Option<SiteRef>` — it is the
+/// state — pane identity is `PaneView::pin: Option<SiteRef>` — it is the
 /// label-carrying view the SITE controls build from a pin or the primary
 /// poll source.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3988,7 +3988,34 @@ struct RotationMarker {
 /// (pan/zoom stay in sync by construction), the selected tilt, and the ONE
 /// render worker — renders are sequential on it, so total CPU parallelism
 /// stays bounded at the core count no matter how many panes are open.
-struct ViewPane {
+/// One extra view pane: a [`LoopEngine`] plus the display-side state the
+/// engine does not own (v0.29 Phase 4d — the spec §3 `PaneView` shape;
+/// panes are the SECOND engine adoption, after the 4c overlays). Textures
+/// and the load receiver stay view-side because the 4d engine core
+/// deliberately has no worker/texture slots — those arrive with the
+/// primary port (4e).
+///
+/// Engine-owned state, with the legacy `PaneView` field it replaced (for
+/// grep archaeology): `engine.history` ← `frame_history`,
+/// `engine.cursor.index` ← `selected_frame_index`, `engine.cursor.playing`
+/// ← `history_playing`, `engine.cursor.browsing` ← `browsing_history`,
+/// `engine.cursor.last_step` ← `last_history_step`, `engine.live.enabled`
+/// ← `live` (the per-pane auto-refresh toggle; defaults ON — independent
+/// panes exist for storm-day multi-radar), `engine.live.last_refresh` ←
+/// `last_realtime_level2_refresh`, `engine.status` ← `status`,
+/// `engine.limits` ← the silent `self.history_frame_limit` read in the
+/// deleted `trim_extra_pane_history` (census D8: the primary's limit is
+/// now passed explicitly at construction and re-passed at every install).
+///
+/// `engine.feed` MIRRORS `pin`: `Live(pin)` when pinned, the inert
+/// [`PaneView::follow_primary_feed`] placeholder when following. The one
+/// sync site is [`ViewerApp::extra_pane_live_action`], which re-derives the
+/// feed from the pin before every engine consultation — direct pin writes
+/// (loads, restores, tests) converge on the next tick, so the mirror can
+/// never drift for more than one frame.
+struct PaneView {
+    /// The pane's loop machine (`EngineRole::Pane { slot }`).
+    engine: LoopEngine,
     product: DisplayProduct,
     /// Independent tilt override; None = follow the main pane's tilt, so
     /// scrubbing the main tilt moves every un-pinned pane in sync.
@@ -4001,13 +4028,6 @@ struct ViewPane {
     /// source, the Follow-primary `None==None` combo no-op); one enum
     /// makes those states unrepresentable.
     pin: Option<SiteRef>,
-    /// Per-pane auto-refresh — the pane analog of the primary's
-    /// `realtime_level2_auto_refresh`. Defaults on: independent panes exist
-    /// for storm-day multi-radar and users expect every pane to stay live.
-    live: bool,
-    /// Pane analog of the primary's `last_realtime_level2_refresh`,
-    /// pacing this pane's own live poll.
-    last_realtime_level2_refresh: Option<Instant>,
     /// Arc address of the primary frame most recently mirrored into this
     /// pane by the same-site dedupe (`follow_primary_volume_into_pane`),
     /// so an unchanged primary volume is not re-installed every tick.
@@ -4015,16 +4035,10 @@ struct ViewPane {
     volume: Option<Arc<RadarVolume>>,
     source_path: Option<PathBuf>,
     load_timing: Option<LoadTimings>,
-    frame_history: FrameHistory,
-    selected_frame_index: usize,
-    history_playing: bool,
-    browsing_history: bool,
-    last_history_step: Option<Instant>,
     archive_load_progress: Option<ArchiveLoadProgress>,
     load_receiver: Option<mpsc::Receiver<AsyncLoadResult>>,
     load_mode: Option<LatestLoadMode>,
     pending_site_id: Option<String>,
-    status: String,
     map_center_lat: f32,
     map_center_lon: f32,
     map_scale: f32,
@@ -4034,28 +4048,41 @@ struct ViewPane {
     render_ms: Option<f32>,
 }
 
-impl ViewPane {
-    fn new(product: DisplayProduct) -> Self {
+impl PaneView {
+    /// A fresh pane following the primary. `engine_id` comes from the
+    /// session-monotonic `ViewerApp::next_radar_layer_id` counter (shared
+    /// with overlay engines — EngineIds are never reused within a session);
+    /// `limits` is the SHARED history-limits handoff (census D8): the
+    /// caller passes `HistoryLimits::pane(self.history_frame_limit)` so the
+    /// pane visibly starts on the primary's frame limit instead of silently
+    /// reading it at trim time.
+    fn new(engine_id: u64, slot: usize, product: DisplayProduct, limits: HistoryLimits) -> Self {
+        let mut engine = LoopEngine::new(
+            EngineId(engine_id),
+            EngineRole::Pane {
+                slot: u8::try_from(slot).unwrap_or(u8::MAX),
+            },
+            Self::follow_primary_feed(),
+        );
+        engine.limits = limits;
+        // The pane Live toggle defaults ON regardless of the (inert)
+        // follow-primary feed, so a first pin goes live immediately —
+        // the legacy `live: true` default.
+        engine.live.enabled = true;
+        engine.status = "Following primary radar".to_owned();
         Self {
+            engine,
             product,
             cut: None,
             pin: None,
-            live: true,
-            last_realtime_level2_refresh: None,
             followed_primary_volume_ptr: None,
             volume: None,
             source_path: None,
             load_timing: None,
-            frame_history: FrameHistory::new(),
-            selected_frame_index: 0,
-            history_playing: false,
-            browsing_history: false,
-            last_history_step: None,
             archive_load_progress: None,
             load_receiver: None,
             load_mode: None,
             pending_site_id: None,
-            status: "Following primary radar".to_owned(),
             map_center_lat: 0.0,
             map_center_lon: 0.0,
             map_scale: DEFAULT_MAP_SCALE,
@@ -4063,6 +4090,30 @@ impl ViewPane {
             texture_key: None,
             pending_render_key: None,
             render_ms: None,
+        }
+    }
+
+    /// The engine feed for an UNPINNED pane. Deliberately inert: it is not
+    /// a live variant, so an unpinned pane's engine structurally cannot
+    /// claim `Liveness::Live` and never produces a poll cadence — every
+    /// engine consultation is gated on `owns_radar()` anyway, and the chip
+    /// for following panes reads the primary's state until Phase 4e.
+    fn follow_primary_feed() -> FeedSource {
+        FeedSource::LocalFiles {
+            label: "following primary radar".to_owned(),
+        }
+    }
+
+    /// Re-derive `engine.feed` from `pin` (the mirror invariant on
+    /// [`PaneView`]). Called by `extra_pane_live_action` before every
+    /// engine consultation; cheap when already in sync.
+    fn sync_engine_feed_to_pin(&mut self) {
+        let want = match &self.pin {
+            Some(site) => FeedSource::Live(site.clone()),
+            None => Self::follow_primary_feed(),
+        };
+        if self.engine.feed != want {
+            self.engine.feed = want;
         }
     }
 
@@ -4097,17 +4148,22 @@ impl ViewPane {
         self.render_ms = None;
     }
 
+    /// The pane clear blast radius (census D4): the engine-owned loop
+    /// state PLUS the view-side load progress. Panes deliberately do NOT
+    /// clear shared loop-render caches or storm state — that is the
+    /// PRIMARY's clear, do not "fix" it here.
     fn clear_history(&mut self) {
-        self.frame_history.clear();
-        self.selected_frame_index = 0;
-        self.history_playing = false;
-        self.browsing_history = false;
-        self.last_history_step = None;
+        self.engine.clear_history();
         self.archive_load_progress = None;
     }
 }
 
 /// What actually feeds a radar-owning pane, as the live poll tick sees it.
+/// This is the OWNER-side classification (catalog lookups, research-feed
+/// refusal) feeding [`ui_core::loop_engine::LoopEngine::live_tick`]; the
+/// SharedWithPrimary dedupe that used to be a variant here is now SiteRef
+/// equality inside `live_tick` (Phase 4d — uniform for US and intl, the
+/// "intl double-poll dies" deliverable).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PaneLiveSource {
     /// Nothing pollable: no source, a pinned id outside the US catalog
@@ -4116,60 +4172,8 @@ enum PaneLiveSource {
     None,
     /// Pinned US Level-II catalog site with its own feed.
     UsSite,
-    /// Pinned to the same US site the PRIMARY is live-polling: reuse the
-    /// primary's decode instead of downloading the feed a second time.
-    SharedWithPrimary,
     /// International provider frames.
     Intl,
-}
-
-/// One live tick's verdict for one radar-owning pane.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PaneLiveAction {
-    Skip,
-    /// Spawn the pane's own latest-load worker.
-    Poll,
-    /// Mirror the primary's newest volume Arc into the pane.
-    FollowPrimary,
-}
-
-/// Extra panes poll on the overlay cadence (5 s), never the primary's 1 s
-/// chunk cadence: four independent panes at 1 s would quadruple S3 listing
-/// traffic for chunk freshness only the focused pane benefits from.
-/// International panes poll on the provider catalog cadence, matching the
-/// intl overlay feeds.
-fn pane_live_poll_cadence_seconds(source: PaneLiveSource) -> u64 {
-    match source {
-        PaneLiveSource::Intl => INTL_POLL_SECONDS,
-        _ => OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS,
-    }
-}
-
-/// Pure poll policy for one pane so it is testable without an event loop.
-/// Archive displays never reach `Poll`: archive/event loops only enter a
-/// pane by inheriting the primary's history, which also inherits the
-/// primary's Live flag (archive loads clear it — the same guard the
-/// primary poll relies on) and, for international archives, a pinned id
-/// that classifies as [`PaneLiveSource::None`].
-fn pane_live_poll_action(
-    live: bool,
-    source: PaneLiveSource,
-    load_in_flight: bool,
-    due: bool,
-) -> PaneLiveAction {
-    if !live || source == PaneLiveSource::None || load_in_flight {
-        return PaneLiveAction::Skip;
-    }
-    if source == PaneLiveSource::SharedWithPrimary {
-        // Push-based reuse of the primary's decode: no cadence and no S3
-        // traffic of its own — freshness rides the primary's own poll.
-        return PaneLiveAction::FollowPrimary;
-    }
-    if due {
-        PaneLiveAction::Poll
-    } else {
-        PaneLiveAction::Skip
-    }
 }
 
 struct PaneContextSnapshot {
@@ -6804,7 +6808,33 @@ impl ViewerApp {
         self.selected_site().map(|site| site.level2_id.as_str())
     }
 
-    fn extra_pane_live_source(&self, pane: &ViewPane) -> PaneLiveSource {
+    /// The site the PRIMARY view is live-following right now, as ONE
+    /// [`SiteRef`] — the pane-dedupe key (spec §3 `live_tick`:
+    /// SharedWithPrimary is SiteRef equality against the primary's feed,
+    /// uniform for US and international; parity QW9). `None` when the
+    /// primary is not live-following a site a pane could share: US
+    /// auto-refresh off, an armed custom-URL poll, or an international
+    /// ARCHIVE display owner (armed intl source with the poll inactive).
+    /// Built from the legacy `poll_source`/`poll_active` fields until the
+    /// primary gets its own engine to compare feeds with (Phase 4e).
+    fn primary_live_site_ref(&self) -> Option<SiteRef> {
+        if self.intl_poll_owns_primary()
+            && let PollSource::Intl {
+                provider_id,
+                site_id,
+            } = &self.poll_source
+        {
+            return Some(SiteRef::Intl {
+                provider_id: provider_id.clone(),
+                site_id: site_id.clone(),
+            });
+        }
+        self.primary_live_poll_site_id().map(|id| SiteRef::Us {
+            level2_id: id.to_owned(),
+        })
+    }
+
+    fn extra_pane_live_source(&self, pane: &PaneView) -> PaneLiveSource {
         match pane.pin.as_ref() {
             None => PaneLiveSource::None,
             Some(SiteRef::Intl { .. }) => PaneLiveSource::Intl,
@@ -6825,16 +6855,37 @@ impl ViewerApp {
                     // would only rewrite the pane status every tick.
                     return PaneLiveSource::None;
                 }
-                if self
-                    .primary_live_poll_site_id()
-                    .is_some_and(|id| id.eq_ignore_ascii_case(level2_id))
-                {
-                    PaneLiveSource::SharedWithPrimary
-                } else {
-                    PaneLiveSource::UsSite
-                }
+                PaneLiveSource::UsSite
             }
         }
+    }
+
+    /// One live tick's verdict for one pane, through the pane ENGINE
+    /// (Phase 4d): classification stays owner-side
+    /// ([`Self::extra_pane_live_source`] — catalog and research-feed
+    /// knowledge the engine cannot have), the verdict — pause gate,
+    /// in-flight gate, SharedWithPrimary SiteRef dedupe, cadence due-check
+    /// — is [`LoopEngine::live_tick`]. Also THE feed-sync site: the pane
+    /// engine's feed is re-derived from `pin` here, before every
+    /// consultation.
+    fn extra_pane_live_action(&mut self, pane_slot: usize, now: Instant) -> LiveAction {
+        let Some(pane) = self.extra_panes.get(pane_slot) else {
+            return LiveAction::Skip;
+        };
+        if !pane.owns_radar() {
+            return LiveAction::Skip;
+        }
+        let source = self.extra_pane_live_source(pane);
+        let load_in_flight = pane.load_receiver.is_some();
+        let primary_live_site = self.primary_live_site_ref();
+        let pane = &mut self.extra_panes[pane_slot];
+        pane.sync_engine_feed_to_pin();
+        pane.engine.live_tick(
+            primary_live_site.as_ref(),
+            source != PaneLiveSource::None,
+            load_in_flight,
+            now,
+        )
     }
 
     /// Live auto-refresh for radar-owning extra panes — the top field
@@ -6844,24 +6895,18 @@ impl ViewerApp {
         let mut any_live_owner = false;
         let mut spawned = false;
         for pane_slot in 0..self.extra_panes.len() {
-            let action = {
+            {
                 let pane = &self.extra_panes[pane_slot];
                 if !pane.owns_radar() {
                     continue;
                 }
-                let source = self.extra_pane_live_source(pane);
-                any_live_owner |= pane.live && source != PaneLiveSource::None;
-                let due = pane.last_realtime_level2_refresh.is_none_or(|last| {
-                    last.elapsed() >= Duration::from_secs(pane_live_poll_cadence_seconds(source))
-                });
-                pane_live_poll_action(pane.live, source, pane.load_receiver.is_some(), due)
-            };
-            match action {
-                PaneLiveAction::Skip => {}
-                PaneLiveAction::Poll => spawned |= self.spawn_extra_pane_live_poll(pane_slot, ctx),
-                PaneLiveAction::FollowPrimary => {
-                    self.follow_primary_volume_into_pane(pane_slot, ctx)
-                }
+                any_live_owner |= pane.engine.live.enabled
+                    && self.extra_pane_live_source(pane) != PaneLiveSource::None;
+            }
+            match self.extra_pane_live_action(pane_slot, Instant::now()) {
+                LiveAction::Skip => {}
+                LiveAction::Poll => spawned |= self.spawn_extra_pane_live_poll(pane_slot, ctx),
+                LiveAction::FollowPrimary => self.follow_primary_volume_into_pane(pane_slot, ctx),
             }
         }
         if !spawned && any_live_owner {
@@ -6903,10 +6948,12 @@ impl ViewerApp {
     }
 
     /// Same-site dedupe: a pane pinned to the site the PRIMARY is
-    /// live-polling mirrors the primary's newest decoded volume (an Arc
-    /// clone) instead of downloading and decoding the same feed twice.
-    /// The mirrored frame goes through the regular pane batch install, so
-    /// history upsert/trim and browsing/playback guards all apply.
+    /// live-following mirrors the primary's newest decoded volume (an Arc
+    /// clone) instead of downloading and decoding the same feed twice —
+    /// for US chunk feeds AND international polls (Phase 4d: the intl
+    /// double-poll dies here). The mirrored frame goes through the regular
+    /// pane batch install, so history upsert/trim and browsing/playback
+    /// guards all apply.
     fn follow_primary_volume_into_pane(&mut self, pane_slot: usize, ctx: &egui::Context) {
         let Some(frame) = self.frame_history.last() else {
             return;
@@ -6914,13 +6961,28 @@ impl ViewerApp {
         let Some(pane) = self.extra_panes.get(pane_slot) else {
             return;
         };
-        let Some(pinned) = pane.pinned_us_id() else {
-            return;
-        };
-        if !frame.identity.site_id.eq_ignore_ascii_case(pinned) {
-            // Primary site switch mid-flight: its history can hold the old
-            // site for a tick — never install another site's frames.
-            return;
+        match pane.pin.as_ref() {
+            Some(SiteRef::Us { level2_id }) => {
+                if !frame.identity.site_id.eq_ignore_ascii_case(level2_id) {
+                    // Primary site switch mid-flight: its history can hold
+                    // the old site for a tick — never install another
+                    // site's frames.
+                    return;
+                }
+            }
+            Some(pin @ SiteRef::Intl { .. }) => {
+                // Intl volumes carry provider site ids that need not match
+                // the registry id, so the pin cannot be compared against
+                // the frame identity. The equivalent guard is feed-level:
+                // the primary must STILL be live-polling this exact pin —
+                // and a cross-site intl poll switch clears the primary
+                // history at start (`switch_policy`), so the newest frame
+                // is that pin's by construction.
+                if self.primary_live_site_ref().as_ref() != Some(pin) {
+                    return;
+                }
+            }
+            None => return,
         }
         let frame_ptr = Arc::as_ptr(&frame.volume) as usize;
         if pane.followed_primary_volume_ptr == Some(frame_ptr) {
@@ -6935,7 +6997,7 @@ impl ViewerApp {
         };
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
             pane.followed_primary_volume_ptr = Some(frame_ptr);
-            pane.last_realtime_level2_refresh = Some(Instant::now());
+            pane.engine.live.last_refresh = Some(Instant::now());
         }
         self.install_extra_pane_decoded_load_batch(
             pane_slot,
@@ -6996,7 +7058,7 @@ impl ViewerApp {
         preferred_cut: usize,
     ) -> Option<Arc<RadarVolume>> {
         advanced_derived_product_for_display_product(product)?;
-        if self.extra_panes.get(slot).is_some_and(ViewPane::owns_radar) {
+        if self.extra_panes.get(slot).is_some_and(PaneView::owns_radar) {
             let active = self.extra_panes.get(slot)?.volume.clone()?;
             let cut = advanced_product_source_cut(active.as_ref(), preferred_cut, product)?;
             let active_identity = frame_identity_for_volume(&active);
@@ -7009,7 +7071,8 @@ impl ViewerApp {
                 && let Some(pane) = self.extra_panes.get_mut(slot)
             {
                 if let Some(frame) = pane
-                    .frame_history
+                    .engine
+                    .history
                     .iter_mut()
                     .find(|frame| frame.identity == active_identity)
                 {
@@ -7052,7 +7115,7 @@ impl ViewerApp {
     ) {
         self.advanced_products_enabled = true;
         if let Some(slot) = editing_pane
-            && self.extra_panes.get(slot).is_some_and(ViewPane::owns_radar)
+            && self.extra_panes.get(slot).is_some_and(PaneView::owns_radar)
         {
             self.derive_advanced_products_for_pane(slot, ctx);
         } else {
@@ -7094,7 +7157,7 @@ impl ViewerApp {
             return;
         };
         let Some(active) = pane.volume.clone() else {
-            pane.status = "Load radar data before deriving advanced products".to_owned();
+            pane.engine.status = "Load radar data before deriving advanced products".to_owned();
             return;
         };
         let cut_index = pane
@@ -7107,7 +7170,8 @@ impl ViewerApp {
                 let changed = inserted > 0;
                 if changed {
                     if let Some(frame) = pane
-                        .frame_history
+                        .engine
+                        .history
                         .iter_mut()
                         .find(|frame| frame.identity == active_identity)
                     {
@@ -7116,11 +7180,12 @@ impl ViewerApp {
                     pane.volume = Some(volume);
                     pane.clear_texture();
                 }
-                pane.status = advanced_derivation_status(inserted, changed, cut_index, "pane");
+                pane.engine.status =
+                    advanced_derivation_status(inserted, changed, cut_index, "pane");
                 ctx.request_repaint();
             }
             Err(message) => {
-                pane.status = message;
+                pane.engine.status = message;
                 ctx.request_repaint();
             }
         }
@@ -8031,8 +8096,9 @@ impl ViewerApp {
         match self.active_loop_timeline_target() {
             LoopTimelineTarget::Primary => self.selected_frame_scan_time_utc(),
             LoopTimelineTarget::ExtraPane(slot) => self.extra_panes.get(slot).and_then(|pane| {
-                pane.frame_history
-                    .get(pane.selected_frame_index)
+                pane.engine
+                    .history
+                    .get(pane.engine.cursor.index)
                     .map(|frame| frame.identity.scan_time_utc)
                     .or_else(|| {
                         pane.volume
@@ -8048,7 +8114,7 @@ impl ViewerApp {
             && self
                 .extra_panes
                 .get(slot)
-                .is_some_and(|pane| pane.owns_radar() && !pane.frame_history.is_empty())
+                .is_some_and(|pane| pane.owns_radar() && !pane.engine.history.is_empty())
         {
             LoopTimelineTarget::ExtraPane(slot)
         } else {
@@ -8070,7 +8136,7 @@ impl ViewerApp {
             LoopTimelineTarget::ExtraPane(slot) => self
                 .extra_panes
                 .get(slot)
-                .map(|pane| pane.frame_history.len())
+                .map(|pane| pane.engine.history.len())
                 .unwrap_or(0),
         }
     }
@@ -8081,7 +8147,7 @@ impl ViewerApp {
             LoopTimelineTarget::ExtraPane(slot) => self
                 .extra_panes
                 .get(slot)
-                .is_some_and(|pane| pane.history_playing),
+                .is_some_and(|pane| pane.engine.cursor.playing),
         }
     }
 
@@ -8123,7 +8189,7 @@ impl ViewerApp {
             LoopTimelineTarget::ExtraPane(slot) => self
                 .extra_panes
                 .get(slot)
-                .map(|pane| pane.frame_history.as_slice()),
+                .map(|pane| pane.engine.history.as_slice()),
         }
     }
 
@@ -8180,7 +8246,7 @@ impl ViewerApp {
             let status = format!("{frame_status} - {label}");
             self.status = status.clone();
             if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-                pane.status = status;
+                pane.engine.status = status;
             }
         }
         ctx.request_repaint();
@@ -8409,7 +8475,7 @@ impl ViewerApp {
             LoopTimelineTarget::ExtraPane(slot) => {
                 let pane = self.extra_panes.get(slot)?;
                 (
-                    pane.frame_history.generation(),
+                    pane.engine.history.generation(),
                     Some(pane.product.clone()),
                     self.extra_pane_sweep_policy_for_product(slot, &pane.product),
                 )
@@ -8430,7 +8496,7 @@ impl ViewerApp {
                     (
                         pane.owns_radar(),
                         pane.product.clone(),
-                        pane.frame_history.generation(),
+                        pane.engine.history.generation(),
                     )
                 })
                 .collect()
@@ -8632,19 +8698,19 @@ impl ViewerApp {
         let mut any_playing = false;
 
         for slot in 0..self.extra_panes.len() {
-            if !self.extra_panes[slot].history_playing
+            if !self.extra_panes[slot].engine.cursor.playing
                 || !self.extra_pane_history_loop_can_step(slot)
             {
                 continue;
             }
             any_playing = true;
             if !self.extra_pane_screen_loop_texture_ready(slot) {
-                self.extra_panes[slot].last_history_step = None;
+                self.extra_panes[slot].engine.cursor.last_step = None;
                 waiting_for_render = true;
                 continue;
             }
-            match self.extra_panes[slot].last_history_step {
-                None => self.extra_panes[slot].last_history_step = Some(now),
+            match self.extra_panes[slot].engine.cursor.last_step {
+                None => self.extra_panes[slot].engine.cursor.last_step = Some(now),
                 Some(last_step) if last_step.elapsed() >= Duration::from_millis(frame_ms) => {
                     steps.push(slot);
                 }
@@ -8655,7 +8721,7 @@ impl ViewerApp {
         for slot in steps.iter().copied() {
             self.advance_extra_pane_screen_loop(slot, ctx);
             if let Some(pane) = self.extra_panes.get_mut(slot) {
-                pane.last_history_step = None;
+                pane.engine.cursor.last_step = None;
             }
         }
 
@@ -8707,27 +8773,27 @@ impl ViewerApp {
             let policy = self.extra_pane_sweep_policy_for_product(pane_slot, &pane.product);
             if self.app_settings.loop_low_sweeps && policy.mode == SweepPolicyMode::Range {
                 next_frame_index_with_sweep_cuts(
-                    &pane.frame_history,
-                    pane.selected_frame_index,
+                    &pane.engine.history,
+                    pane.engine.cursor.index,
                     &pane.product,
                     policy,
                     &self.low_sweep_disabled_cuts,
                 )
             } else {
-                (!pane.frame_history.is_empty())
-                    .then_some((pane.selected_frame_index + 1) % pane.frame_history.len())
+                (!pane.engine.history.is_empty())
+                    .then_some((pane.engine.cursor.index + 1) % pane.engine.history.len())
             }
         });
         let Some(next_index) = next_index else {
             if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-                pane.history_playing = false;
+                pane.engine.cursor.playing = false;
             }
             return;
         };
         self.select_extra_pane_history_frame(pane_slot, next_index, ctx);
         let can_keep_playing = self.extra_pane_history_loop_can_step(pane_slot);
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-            pane.history_playing = can_keep_playing;
+            pane.engine.cursor.playing = can_keep_playing;
         }
         self.sync_extra_pane_timeline_side_effects(pane_slot, ctx);
     }
@@ -8811,7 +8877,7 @@ impl ViewerApp {
             return;
         }
         let Some((next_cut, current_cut)) = self.extra_panes.get(pane_slot).and_then(|pane| {
-            let frame = pane.frame_history.get(pane.selected_frame_index)?;
+            let frame = pane.engine.history.get(pane.engine.cursor.index)?;
             sweep_cuts_for_history_entry(
                 frame,
                 &pane.product,
@@ -8841,7 +8907,7 @@ impl ViewerApp {
             return false;
         }
         let Some((cuts, current)) = self.extra_panes.get(pane_slot).and_then(|pane| {
-            let frame = pane.frame_history.get(pane.selected_frame_index)?;
+            let frame = pane.engine.history.get(pane.engine.cursor.index)?;
             Some((
                 sweep_cuts_for_history_entry(
                     frame,
@@ -8880,13 +8946,13 @@ impl ViewerApp {
                 .loop_timeline_summary_for_target(LoopTimelineTarget::ExtraPane(pane_slot))
                 .is_some_and(|summary| summary.step_count > 1);
         }
-        if pane.frame_history.len() > 1 {
+        if pane.engine.history.len() > 1 {
             return true;
         }
         if !self.app_settings.loop_low_sweeps {
             return false;
         }
-        let Some(frame) = pane.frame_history.get(pane.selected_frame_index) else {
+        let Some(frame) = pane.engine.history.get(pane.engine.cursor.index) else {
             return false;
         };
         sweep_cuts_for_history_entry(
@@ -8899,7 +8965,7 @@ impl ViewerApp {
             > 1
     }
 
-    fn set_pane_cut_preserving_texture(pane: &mut ViewPane, cut: usize) {
+    fn set_pane_cut_preserving_texture(pane: &mut PaneView, cut: usize) {
         pane.cut = Some(cut);
         pane.pending_render_key = None;
         pane.render_ms = None;
@@ -8919,7 +8985,8 @@ impl ViewerApp {
             .filter_map(|(slot, pane)| {
                 (pane.owns_radar()
                     && pane
-                        .frame_history
+                        .engine
+                        .history
                         .get(frame_index)
                         .is_some_and(|frame| frame.identity == primary_identity))
                 .then_some(slot)
@@ -8927,14 +8994,15 @@ impl ViewerApp {
             .collect()
     }
 
-    fn extra_pane_participates_in_primary_timeline(&self, pane: &ViewPane) -> bool {
+    fn extra_pane_participates_in_primary_timeline(&self, pane: &PaneView) -> bool {
         if !pane.owns_radar() {
             return true;
         }
-        if pane.frame_history.is_empty() || pane.frame_history.len() != self.frame_history.len() {
+        if pane.engine.history.is_empty() || pane.engine.history.len() != self.frame_history.len() {
             return false;
         }
-        pane.frame_history
+        pane.engine
+            .history
             .iter()
             .zip(self.frame_history.iter())
             .all(|(pane_frame, primary_frame)| pane_frame.identity == primary_frame.identity)
@@ -8945,14 +9013,35 @@ impl ViewerApp {
         frame_index: usize,
         ctx: &egui::Context,
     ) {
+        let Some(target_utc) = self
+            .frame_history
+            .get(frame_index)
+            .map(|frame| frame.identity.scan_time_utc)
+        else {
+            return;
+        };
         let slots = self.owned_extra_panes_matching_primary_frame(frame_index);
         for slot in slots {
             let needs_select = self
                 .extra_panes
                 .get(slot)
-                .is_some_and(|pane| pane.selected_frame_index != frame_index);
-            if needs_select {
-                self.select_extra_pane_history_frame(slot, frame_index, ctx);
+                .is_some_and(|pane| pane.engine.cursor.index != frame_index);
+            if !needs_select {
+                continue;
+            }
+            // Engine-common timeline-sync selection (spec §3; panes are the
+            // first consumer, Phase 4d): newest frame at-or-before the
+            // primary frame's time. Under the identity-match gate above
+            // this lands on exactly the index the legacy index-copy picked
+            // — the pane frame at `frame_index` carries the primary
+            // frame's identity and pane histories are ascending and
+            // single-site — so behavior is unchanged.
+            let selected = self
+                .extra_panes
+                .get_mut(slot)
+                .and_then(|pane| pane.engine.select_frame_nearest(target_utc));
+            if let Some(index) = selected {
+                self.select_extra_pane_history_frame(slot, index, ctx);
             }
         }
     }
@@ -9011,7 +9100,7 @@ impl ViewerApp {
                 .get(slot)
                 .map(|pane| {
                     self.loop_timeline_steps_for(
-                        &pane.frame_history,
+                        &pane.engine.history,
                         &pane.product,
                         self.extra_pane_sweep_policy_for_product(slot, &pane.product),
                     )
@@ -9041,8 +9130,8 @@ impl ViewerApp {
             LoopTimelineTarget::ExtraPane(slot) => {
                 let pane = self.extra_panes.get(slot)?;
                 (
-                    pane.frame_history.as_slice(),
-                    pane.selected_frame_index,
+                    pane.engine.history.as_slice(),
+                    pane.engine.cursor.index,
                     pane.product.clone(),
                     pane.cut.unwrap_or(self.selected_cut),
                 )
@@ -9117,7 +9206,7 @@ impl ViewerApp {
             LoopTimelineTarget::ExtraPane(slot) => self
                 .extra_panes
                 .get(slot)
-                .and_then(|pane| pane.last_history_step),
+                .and_then(|pane| pane.engine.cursor.last_step),
         };
         let Some(step_started) = step_started else {
             return Some(current_time);
@@ -9162,7 +9251,7 @@ impl ViewerApp {
             LoopTimelineTarget::ExtraPane(slot) => self
                 .extra_panes
                 .get(slot)
-                .map(|pane| pane.selected_frame_index)
+                .map(|pane| pane.engine.cursor.index)
                 .unwrap_or(0),
         };
         let frame_label = format!(
@@ -9190,7 +9279,7 @@ impl ViewerApp {
                 LoopTimelineTarget::ExtraPane(slot) => self
                     .extra_panes
                     .get(slot)
-                    .map(|pane| pane.selected_frame_index)
+                    .map(|pane| pane.engine.cursor.index)
                     .unwrap_or(0),
             };
         }
@@ -9202,7 +9291,7 @@ impl ViewerApp {
             LoopTimelineTarget::ExtraPane(slot) => self
                 .extra_panes
                 .get(slot)
-                .map(|pane| pane.selected_frame_index)
+                .map(|pane| pane.engine.cursor.index)
                 .unwrap_or(0),
         };
         let step_count = summary
@@ -9239,7 +9328,7 @@ impl ViewerApp {
                 let selected = self
                     .extra_panes
                     .get(slot)
-                    .map(|pane| pane.selected_frame_index)
+                    .map(|pane| pane.engine.cursor.index)
                     .unwrap_or(0);
                 (selected, self.current_extra_pane_low_sweep_rank(slot))
             }
@@ -9321,7 +9410,7 @@ impl ViewerApp {
             }
             LoopTimelineTarget::ExtraPane(slot) => {
                 let pane = self.extra_panes.get(slot)?;
-                let frame = pane.frame_history.get(pane.selected_frame_index)?;
+                let frame = pane.engine.history.get(pane.engine.cursor.index)?;
                 let current_cut = pane.cut.unwrap_or(self.selected_cut);
                 sweep_cuts_for_history_entry(
                     frame,
@@ -9340,7 +9429,7 @@ impl ViewerApp {
             return None;
         }
         let pane = self.extra_panes.get(pane_slot)?;
-        let frame = pane.frame_history.get(pane.selected_frame_index)?;
+        let frame = pane.engine.history.get(pane.engine.cursor.index)?;
         let current_cut = pane.cut.unwrap_or(self.selected_cut);
         sweep_cuts_for_history_entry(
             frame,
@@ -9443,7 +9532,7 @@ impl ViewerApp {
                 let policy = self.extra_pane_sweep_policy_for_product(slot, &pane.product);
                 if pane.owns_radar() {
                     sweep_history_cut_at_or_before(
-                        &pane.frame_history,
+                        &pane.engine.history,
                         &pane.product,
                         policy,
                         &self.low_sweep_disabled_cuts,
@@ -9467,7 +9556,7 @@ impl ViewerApp {
                 let needs_select = self
                     .extra_panes
                     .get(slot)
-                    .is_some_and(|pane| pane.selected_frame_index != frame_index);
+                    .is_some_and(|pane| pane.engine.cursor.index != frame_index);
                 if needs_select {
                     self.select_extra_pane_history_frame_with_options(
                         slot,
@@ -9509,7 +9598,7 @@ impl ViewerApp {
             .get(pane_slot)
             .map(|pane| self.extra_pane_sweep_policy_for_product(pane_slot, &pane.product));
         let Some((cut, changed)) = self.extra_panes.get(pane_slot).and_then(|pane| {
-            let frame = pane.frame_history.get(pane.selected_frame_index)?;
+            let frame = pane.engine.history.get(pane.engine.cursor.index)?;
             let cuts = sweep_cuts_for_history_entry(
                 frame,
                 &pane.product,
@@ -9546,7 +9635,7 @@ impl ViewerApp {
             .filter(|pane| self.extra_pane_participates_in_primary_timeline(pane))
         {
             let frames = if pane.owns_radar() {
-                pane.frame_history.as_slice()
+                pane.engine.history.as_slice()
             } else {
                 self.frame_history.as_slice()
             };
@@ -9761,7 +9850,7 @@ impl ViewerApp {
         let Some(pane) = self.extra_panes.get(pane_slot) else {
             return;
         };
-        let Some(frame) = pane.frame_history.get(pane.selected_frame_index) else {
+        let Some(frame) = pane.engine.history.get(pane.engine.cursor.index) else {
             return;
         };
         let policy = self.extra_pane_sweep_policy_for_product(pane_slot, &pane.product);
@@ -9810,7 +9899,7 @@ impl ViewerApp {
             let Some(pane) = self.extra_panes.get(pane_slot) else {
                 return;
             };
-            let Some(frame) = pane.frame_history.get(pane.selected_frame_index) else {
+            let Some(frame) = pane.engine.history.get(pane.engine.cursor.index) else {
                 return;
             };
             let enabled_cuts = sweep_cuts_for_history_entry(
@@ -9840,14 +9929,14 @@ impl ViewerApp {
         let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
             return false;
         };
-        pane.history_playing = !pane.history_playing;
-        if pane.history_playing {
-            pane.browsing_history = false;
-            pane.last_history_step = Some(Instant::now());
+        pane.engine.cursor.playing = !pane.engine.cursor.playing;
+        if pane.engine.cursor.playing {
+            pane.engine.cursor.browsing = false;
+            pane.engine.cursor.last_step = Some(Instant::now());
             ctx.request_repaint();
         } else {
-            pane.browsing_history = pane.selected_frame_index + 1 < pane.frame_history.len();
-            pane.last_history_step = None;
+            pane.engine.cursor.browsing = pane.engine.cursor.index + 1 < pane.engine.history.len();
+            pane.engine.cursor.last_step = None;
         }
         true
     }
@@ -11004,7 +11093,7 @@ impl ViewerApp {
             return volume;
         };
         let (frames, selected_index) = if pane.owns_radar() {
-            (pane.frame_history.as_slice(), pane.selected_frame_index)
+            (pane.engine.history.as_slice(), pane.engine.cursor.index)
         } else {
             (self.frame_history.as_slice(), self.selected_frame_index)
         };
@@ -12419,7 +12508,16 @@ impl ViewerApp {
                 .cloned()
                 .unwrap_or(DisplayProduct::Moment(MomentType::Reflectivity));
             let slot = self.extra_panes.len();
-            self.extra_panes.push(ViewPane::new(next));
+            let engine_id = self.next_radar_layer_id;
+            self.next_radar_layer_id = self.next_radar_layer_id.saturating_add(1);
+            // Census D8: the pane starts on the PRIMARY's frame limit — the
+            // shared-limits handoff, passed explicitly at construction.
+            self.extra_panes.push(PaneView::new(
+                engine_id,
+                slot,
+                next,
+                HistoryLimits::pane(self.history_frame_limit),
+            ));
             if self.app_settings.independent_panels {
                 self.initialize_extra_pane_from_primary(slot);
                 // v0.29 Phase 3 startup restore: an explicitly pinned pane
@@ -12556,19 +12654,19 @@ impl ViewerApp {
         // history inherits the primary's Live flag, which archive/event
         // loads clear — so an inherited archive loop stays an archive loop
         // instead of being clobbered by this pane's live poll.
-        pane.live = matches!(pin, Some(SiteRef::Intl { .. })) || primary_live;
+        pane.engine.live.enabled = matches!(pin, Some(SiteRef::Intl { .. })) || primary_live;
         pane.pin = pin;
-        pane.last_realtime_level2_refresh = None;
+        pane.engine.live.last_refresh = None;
         pane.followed_primary_volume_ptr = None;
         pane.volume = primary_volume.clone();
         pane.source_path = source_path;
         pane.load_timing = load_timing;
-        pane.frame_history = frame_history;
-        pane.selected_frame_index = selected_frame_index;
-        pane.history_playing = false;
-        pane.browsing_history =
-            self.browsing_history && selected_frame_index + 1 < pane.frame_history.len();
-        pane.last_history_step = None;
+        pane.engine.history = frame_history;
+        pane.engine.cursor.index = selected_frame_index;
+        pane.engine.cursor.playing = false;
+        pane.engine.cursor.browsing =
+            self.browsing_history && selected_frame_index + 1 < pane.engine.history.len();
+        pane.engine.cursor.last_step = None;
         pane.archive_load_progress = None;
         pane.load_receiver = None;
         pane.load_mode = None;
@@ -12615,7 +12713,7 @@ impl ViewerApp {
                 pane.cut = Some(current_cut);
             }
         }
-        pane.status = site_id
+        pane.engine.status = site_id
             .map(|id| {
                 if primary_volume.is_some() {
                     format!("Independent pane loaded from {id}")
@@ -12663,7 +12761,7 @@ impl ViewerApp {
         }
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
             pane.pin = Some(pin);
-            pane.last_realtime_level2_refresh = None;
+            pane.engine.live.last_refresh = None;
             pane.followed_primary_volume_ptr = None;
             pane.volume = None;
             pane.source_path = None;
@@ -12672,7 +12770,7 @@ impl ViewerApp {
             pane.load_mode = None;
             pane.pending_site_id = None;
             pane.cut = None;
-            pane.status = if pane.live {
+            pane.engine.status = if pane.engine.live.enabled {
                 format!("Pane radar set to {site_id}; live poll starting")
             } else {
                 format!("Pane radar set to {site_id}; click Load Latest")
@@ -12705,7 +12803,7 @@ impl ViewerApp {
         }
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
             pane.pin = Some(pin);
-            pane.last_realtime_level2_refresh = None;
+            pane.engine.live.last_refresh = None;
             pane.followed_primary_volume_ptr = None;
             pane.volume = None;
             pane.source_path = None;
@@ -12714,7 +12812,7 @@ impl ViewerApp {
             pane.load_mode = None;
             pane.pending_site_id = None;
             pane.cut = None;
-            pane.status = if pane.live {
+            pane.engine.status = if pane.engine.live.enabled {
                 format!("Pane radar set to {}; live poll starting", site.label)
             } else {
                 format!("Pane radar set to {}; click Load Latest", site.label)
@@ -12769,8 +12867,8 @@ impl ViewerApp {
     fn clear_extra_pane_radar(&mut self, pane_slot: usize) {
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
             pane.pin = None;
-            pane.live = true;
-            pane.last_realtime_level2_refresh = None;
+            pane.engine.live.enabled = true;
+            pane.engine.live.last_refresh = None;
             pane.followed_primary_volume_ptr = None;
             pane.volume = None;
             pane.source_path = None;
@@ -12779,7 +12877,7 @@ impl ViewerApp {
             pane.load_mode = None;
             pane.pending_site_id = None;
             pane.clear_history();
-            pane.status = "Following primary radar".to_owned();
+            pane.engine.status = "Following primary radar".to_owned();
             pane.cut = None;
             pane.clear_texture();
         }
@@ -12871,9 +12969,9 @@ impl ViewerApp {
             pane.pending_site_id = Some(site_id.clone());
             pane.load_receiver = Some(receiver);
             pane.load_mode = Some(mode);
-            pane.last_realtime_level2_refresh = Some(Instant::now());
+            pane.engine.live.last_refresh = Some(Instant::now());
             pane.archive_load_progress = progress.clone();
-            pane.status = match (&progress, mode) {
+            pane.engine.status = match (&progress, mode) {
                 (Some(progress), _) => progress.status_text(),
                 (None, LatestLoadMode::AutoRefresh) => format!("Refreshing {label}"),
                 (None, _) => format!("Loading {label}"),
@@ -12960,7 +13058,7 @@ impl ViewerApp {
                 feed.id
             );
             if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-                pane.status = status.clone();
+                pane.engine.status = status.clone();
                 pane.pin = Some(SiteRef::Us {
                     level2_id: site.level2_id.clone(),
                 });
@@ -12970,7 +13068,7 @@ impl ViewerApp {
             return;
         }
         let site_id = site.level2_id.clone();
-        if history_contains_other_site(&self.extra_panes[pane_slot].frame_history, &site_id) {
+        if history_contains_other_site(&self.extra_panes[pane_slot].engine.history, &site_id) {
             self.extra_panes[pane_slot].clear_history();
         }
         let (sender, receiver) = mpsc::channel();
@@ -13011,9 +13109,9 @@ impl ViewerApp {
             pane.pending_site_id = Some(site_id.clone());
             pane.load_receiver = Some(receiver);
             pane.load_mode = Some(mode);
-            pane.last_realtime_level2_refresh = Some(Instant::now());
+            pane.engine.live.last_refresh = Some(Instant::now());
             pane.archive_load_progress = progress.clone();
-            pane.status = progress.as_ref().map_or_else(
+            pane.engine.status = progress.as_ref().map_or_else(
                 || match mode {
                     LatestLoadMode::AutoRefresh => format!("Refreshing L2 {site_id}"),
                     _ => format!("Loading latest L2 {site_id}"),
@@ -13047,17 +13145,17 @@ impl ViewerApp {
         let frame_count = self
             .extra_panes
             .get(pane_slot)
-            .map(|pane| pane.frame_history.len())
+            .map(|pane| pane.engine.history.len())
             .unwrap_or_default();
         if frame_count <= 1 {
             return false;
         }
         let frame_ms = self.screen_loop_frame_ms();
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-            pane.history_playing = true;
-            pane.browsing_history = false;
-            pane.last_history_step = None;
-            pane.status = format!("Playing {frame_count} frames");
+            pane.engine.cursor.playing = true;
+            pane.engine.cursor.browsing = false;
+            pane.engine.cursor.last_step = None;
+            pane.engine.status = format!("Playing {frame_count} frames");
         }
         ctx.request_repaint_after(Duration::from_millis(loop_repaint_poll_ms(frame_ms)));
         true
@@ -13077,7 +13175,7 @@ impl ViewerApp {
                         match message.update {
                             AsyncLoadUpdate::ArchiveProgress(progress) => {
                                 let pane = &mut self.extra_panes[pane_slot];
-                                pane.status = progress.status_text();
+                                pane.engine.status = progress.status_text();
                                 pane.archive_load_progress = Some(progress);
                                 ctx.request_repaint_after(Duration::from_millis(
                                     ACTIVE_LOAD_POLL_MS,
@@ -13085,7 +13183,7 @@ impl ViewerApp {
                             }
                             AsyncLoadUpdate::Preview(decoded) => {
                                 self.install_extra_pane_volume(pane_slot, decoded, ctx);
-                                self.extra_panes[pane_slot].status =
+                                self.extra_panes[pane_slot].engine.status =
                                     format!("Preview {}", message.label);
                             }
                             AsyncLoadUpdate::History(batch, select_frame) => {
@@ -13105,7 +13203,8 @@ impl ViewerApp {
                                 if let Some(timings) = timings {
                                     pane.load_timing = Some(timings);
                                 }
-                                pane.status = format!("Current {} ({reason})", message.label);
+                                pane.engine.status =
+                                    format!("Current {} ({reason})", message.label);
                                 if load_mode == Some(LatestLoadMode::Loop) {
                                     self.start_extra_pane_history_loop_if_ready(pane_slot, ctx);
                                 }
@@ -13129,24 +13228,24 @@ impl ViewerApp {
                                                 pane_slot, ctx,
                                             )
                                         {
-                                            self.extra_panes[pane_slot].status = format!(
+                                            self.extra_panes[pane_slot].engine.status = format!(
                                                 "Playing {frame_count} frames for {}",
                                                 message.label
                                             );
                                         } else if !selected {
-                                            self.extra_panes[pane_slot].status = if frame_count > 1
-                                            {
-                                                format!(
-                                                    "Loaded {frame_count} frames for {}",
-                                                    message.label
-                                                )
-                                            } else {
-                                                format!("Loaded {}", message.label)
-                                            };
+                                            self.extra_panes[pane_slot].engine.status =
+                                                if frame_count > 1 {
+                                                    format!(
+                                                        "Loaded {frame_count} frames for {}",
+                                                        message.label
+                                                    )
+                                                } else {
+                                                    format!("Loaded {}", message.label)
+                                                };
                                         }
                                     }
                                     Err(err) => {
-                                        self.extra_panes[pane_slot].status =
+                                        self.extra_panes[pane_slot].engine.status =
                                             format!("Load failed for {}: {err}", message.label);
                                     }
                                 }
@@ -13169,7 +13268,7 @@ impl ViewerApp {
                         pane.load_mode = None;
                         pane.pending_site_id = None;
                         pane.archive_load_progress = None;
-                        pane.status = "Pane L2 load worker disconnected".to_owned();
+                        pane.engine.status = "Pane L2 load worker disconnected".to_owned();
                         break;
                     }
                 }
@@ -13177,6 +13276,13 @@ impl ViewerApp {
         }
     }
 
+    /// Pane batch install, on the ENGINE since Phase 4d: cross-site guard,
+    /// 3-tier upsert, sort, trim, and cursor policy are
+    /// [`LoopEngine::install_batch`] (census D1-D8); this wrapper owns what
+    /// the census assigns to callers — the D8 shared-limits handoff, the D7
+    /// deferral predicate (pane provenance: `pane.cut.is_some()`), the D11
+    /// status strings (greppable-identical), and the select side effects.
+    /// Returns the legacy bool: true only when the anchor got selected.
     fn install_extra_pane_decoded_load_batch(
         &mut self,
         pane_slot: usize,
@@ -13188,148 +13294,94 @@ impl ViewerApp {
             return false;
         }
         let selected_index = batch.selected_index.min(batch.frames.len() - 1);
-        let selected_identity = frame_identity_for_volume(&batch.frames[selected_index].volume);
-        let selected_site_id = selected_identity.site_id.clone();
-        let active_identity = self.extra_panes[pane_slot]
-            .volume
-            .as_ref()
-            .map(|volume| frame_identity_for_volume(volume.as_ref()));
-        let should_reset = self.extra_panes[pane_slot]
-            .volume
-            .as_ref()
-            .is_some_and(|volume| volume.site.id != selected_site_id)
-            || history_contains_other_site(
-                &self.extra_panes[pane_slot].frame_history,
-                &selected_site_id,
-            );
-        if should_reset {
-            let old_len = self.extra_panes[pane_slot].frame_history.len();
-            let pane = &mut self.extra_panes[pane_slot];
-            pane.status =
-                format!("history reset (site change to {selected_site_id}, had {old_len} frames)");
-            pane.clear_history();
-        }
-
-        for decoded in batch.frames {
-            self.extra_pane_upsert_history_frame(pane_slot, decoded);
-        }
-        if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-            pane.frame_history
-                .sort_by(|left, right| left.identity.cmp(&right.identity));
-        }
-        self.trim_extra_pane_history(pane_slot);
-
-        let should_select_loaded_frame = {
-            let pane = &self.extra_panes[pane_slot];
-            select_loaded_frame && !pane.history_playing && !pane.browsing_history
+        let selected_site_id =
+            frame_identity_for_volume(&batch.frames[selected_index].volume).site_id;
+        // Census D8: the pane FOLLOWS the primary's frame limit — the
+        // shared-limits coupling, re-passed at every install instead of a
+        // silent read at trim time. The byte budget stays pane-local.
+        let shared_frame_limit = self.history_frame_limit;
+        let active_volume = self.extra_panes[pane_slot].volume.clone();
+        let pane_cut = self.extra_panes[pane_slot].cut;
+        let primary_cut = self.selected_cut;
+        let product = self.extra_panes[pane_slot].product.clone();
+        let policy = if select_loaded_frame {
+            // Census D5b: panes have NO blank-display browsing escape.
+            SelectionPolicy::SelectAnchor {
+                blank_display_overrides_browsing: false,
+            }
+        } else {
+            SelectionPolicy::Backfill
         };
-        if should_select_loaded_frame {
-            let next_index = self.extra_panes[pane_slot]
-                .frame_history
-                .iter()
-                .position(|frame| frame.identity == selected_identity)
-                .unwrap_or_else(|| {
-                    self.extra_panes[pane_slot]
-                        .frame_history
-                        .len()
-                        .saturating_sub(1)
-                });
-            let active_volume = self.extra_panes[pane_slot].volume.clone();
-            let product = self.extra_panes[pane_slot].product.clone();
-            if should_defer_live_partial_selection_for_active_product(
-                active_volume.as_deref(),
-                self.extra_panes[pane_slot].cut.unwrap_or(self.selected_cut),
-                &product,
-                self.extra_panes[pane_slot].frame_history.get(next_index),
-                self.extra_panes[pane_slot].cut.is_some(),
-            ) {
-                if let Some(active_identity) = active_identity.clone()
-                    && let Some(index) = self.extra_panes[pane_slot]
-                        .frame_history
-                        .iter()
-                        .position(|frame| frame.identity == active_identity)
-                {
-                    self.extra_panes[pane_slot].selected_frame_index = index;
-                }
-                self.extra_panes[pane_slot].status = format!(
-                    "Waiting for {} in {}",
-                    product.label(),
-                    selected_identity.site_id
-                );
+
+        let pane = &mut self.extra_panes[pane_slot];
+        pane.engine.limits.frame_limit = shared_frame_limit;
+        let outcome = pane.engine.install_batch(
+            batch,
+            &policy,
+            active_volume.as_ref(),
+            // Census D7: the pane deferral predicate.
+            // `require_selected_cut` provenance is the pane's pinned tilt
+            // (`pane.cut.is_some()`), with the primary's cut as the
+            // current-cut fallback — a genuine role difference, kept.
+            |anchor| {
+                should_defer_live_partial_selection_for_active_product(
+                    active_volume.as_deref(),
+                    pane_cut.unwrap_or(primary_cut),
+                    &product,
+                    Some(anchor),
+                    pane_cut.is_some(),
+                )
+            },
+        );
+        if let Some(clear) = &outcome.cross_site_clear {
+            // Census D3/D4: the greppable-identical reset diagnostic; the
+            // pane-side blast radius also drops the load progress.
+            pane.engine.status = clear.diagnostic.clone();
+            pane.archive_load_progress = None;
+        }
+        match outcome.selection {
+            InstallSelection::SelectedAnchor { index } => {
+                self.select_extra_pane_history_frame(pane_slot, index, ctx);
+                true
+            }
+            InstallSelection::DeferredLivePartial { anchor } => {
+                self.extra_panes[pane_slot].engine.status =
+                    format!("Waiting for {} in {}", product.label(), anchor.site_id);
                 ctx.request_repaint();
-                return false;
+                false
             }
-            self.select_extra_pane_history_frame(pane_slot, next_index, ctx);
-            true
-        } else if let Some(active_identity) = active_identity
-            && let Some(index) = self.extra_panes[pane_slot]
-                .frame_history
-                .iter()
-                .position(|frame| frame.identity == active_identity)
-        {
-            self.extra_panes[pane_slot].selected_frame_index = index;
-            self.extra_panes[pane_slot].status =
-                format!("Backfilled {}", selected_identity.site_id);
-            ctx.request_repaint();
-            false
-        } else {
-            ctx.request_repaint();
-            false
+            InstallSelection::Backfilled { .. } => {
+                self.extra_panes[pane_slot].engine.status =
+                    format!("Backfilled {selected_site_id}");
+                ctx.request_repaint();
+                false
+            }
+            InstallSelection::NoFrames
+            | InstallSelection::FollowedNewest { .. }
+            | InstallSelection::HeldWhilePlaying { .. }
+            | InstallSelection::CursorUnchanged => {
+                ctx.request_repaint();
+                false
+            }
         }
     }
 
-    fn extra_pane_upsert_history_frame(&mut self, pane_slot: usize, decoded: DecodedLoad) {
-        let identity = frame_identity_for_volume(&decoded.volume);
-        let frame = FrameHistoryEntry {
-            identity: identity.clone(),
-            path: decoded.path,
-            volume: decoded.volume,
-            timings: Some(decoded.timings),
-            status: decoded.status,
-            source_label: decoded.source_label,
-        };
-        let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
-            return;
-        };
-        if let Some(existing) = pane
-            .frame_history
-            .iter_mut()
-            .find(|candidate| candidate.identity == identity)
-        {
-            if live_partial_frame_has_new_data(&frame, existing) {
-                *existing = frame;
-            } else if frame.path == existing.path && frame.status == existing.status {
-                existing.timings = frame.timings;
-                existing.source_label = frame.source_label;
-            } else if frame_status_priority(frame.status) > frame_status_priority(existing.status)
-                || (frame_status_priority(frame.status) == frame_status_priority(existing.status)
-                    && frame.path != existing.path)
-            {
-                *existing = frame;
-            }
-        } else {
-            pane.frame_history.push(frame);
+    /// Census D8: a pane frame-limit edit writes the SHARED (primary)
+    /// limit, then re-passes it to the pane engine — the explicit form of
+    /// the deleted `trim_extra_pane_history`'s silent read.
+    fn retrim_extra_pane_history_to_shared_limit(&mut self, pane_slot: usize) {
+        let shared_frame_limit = self.history_frame_limit;
+        if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
+            pane.engine.set_frame_limit(shared_frame_limit);
         }
-    }
-
-    fn trim_extra_pane_history(&mut self, pane_slot: usize) {
-        let limit = normalized_history_limit(self.history_frame_limit);
-        let Some(pane) = self.extra_panes.get_mut(pane_slot) else {
-            return;
-        };
-        while pane.frame_history.len() > limit {
-            pane.frame_history.remove(0);
-        }
-        pane.selected_frame_index = pane
-            .selected_frame_index
-            .min(pane.frame_history.len().saturating_sub(1));
     }
 
     fn current_extra_pane_history_paths(&self, pane_slot: usize) -> BTreeSet<PathBuf> {
         self.extra_panes
             .get(pane_slot)
             .map(|pane| {
-                pane.frame_history
+                pane.engine
+                    .history
                     .iter()
                     .map(|frame| frame.path.clone())
                     .collect()
@@ -13356,17 +13408,17 @@ impl ViewerApp {
         let Some(frame) = self
             .extra_panes
             .get(pane_slot)
-            .and_then(|pane| pane.frame_history.get(index))
+            .and_then(|pane| pane.engine.history.get(index))
             .cloned()
         else {
             return;
         };
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-            pane.selected_frame_index = index;
+            pane.engine.cursor.index = index;
         }
         let can_keep_playing = self.extra_pane_history_loop_can_step(pane_slot);
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-            pane.history_playing &= can_keep_playing;
+            pane.engine.cursor.playing &= can_keep_playing;
         }
         self.install_extra_pane_volume_arc(
             pane_slot,
@@ -13381,14 +13433,14 @@ impl ViewerApp {
         }
         let status = self.extra_pane_selected_frame_status_text(pane_slot);
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-            pane.status = status;
+            pane.engine.status = status;
         }
     }
 
     fn extra_pane_selected_frame_status_text(&self, pane_slot: usize) -> String {
         self.extra_panes
             .get(pane_slot)
-            .and_then(|pane| pane.frame_history.get(pane.selected_frame_index))
+            .and_then(|pane| pane.engine.history.get(pane.engine.cursor.index))
             .map(|frame| frame_status_text(frame, Utc::now(), self.time_zone()))
             .unwrap_or_else(|| "No Level II frame loaded".to_owned())
     }
@@ -13445,7 +13497,7 @@ impl ViewerApp {
                 &previous_product,
                 volume.as_ref(),
                 VolumeSelectionPolicy {
-                    allow_low_level_auto_advance: !pane.history_playing,
+                    allow_low_level_auto_advance: !pane.engine.cursor.playing,
                     allow_incomplete_live_chunk_advance: display_live_chunk_updates,
                     require_complete_live_cut,
                     low_level_min_seconds,
@@ -13463,7 +13515,8 @@ impl ViewerApp {
         // derive each frame once, not once per revolution.
         if !Arc::ptr_eq(&volume, &source_volume)
             && let Some(frame) = pane
-                .frame_history
+                .engine
+                .history
                 .iter_mut()
                 .find(|frame| Arc::ptr_eq(&frame.volume, &source_volume))
         {
@@ -13658,8 +13711,8 @@ impl ViewerApp {
                 self.extra_panes.get(pane_slot).and_then(|pane| {
                     if pane.owns_radar() {
                         previous_dealias_reference_volume(
-                            &pane.frame_history,
-                            pane.selected_frame_index,
+                            &pane.engine.history,
+                            pane.engine.cursor.index,
                             &volume,
                         )
                     } else {
@@ -18077,7 +18130,7 @@ impl ViewerApp {
     ) {
         self.pause_loop_prewarm_for_interaction();
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-            pane.history_playing = false;
+            pane.engine.cursor.playing = false;
         }
         self.select_extra_pane_history_frame_with_options(pane_slot, step.frame_index, false, ctx);
         if let Some(rank) = step.low_sweep_rank {
@@ -18094,7 +18147,7 @@ impl ViewerApp {
         }
         self.sync_extra_pane_timeline_side_effects(pane_slot, ctx);
         if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-            pane.browsing_history = step.frame_index + 1 < pane.frame_history.len();
+            pane.engine.cursor.browsing = step.frame_index + 1 < pane.engine.history.len();
         }
         ctx.request_repaint();
     }
@@ -20545,7 +20598,7 @@ impl ViewerApp {
                         pane.pin = Some(SiteRef::Us {
                             level2_id: level2_id.clone(),
                         });
-                        pane.status = format!("Pane radar set to {level2_id}; click Load");
+                        pane.engine.status = format!("Pane radar set to {level2_id}; click Load");
                         self.center_extra_pane_on_site(pane_slot, &site);
                         self.remember_extra_pane_pin(pane_slot);
                     }
@@ -20565,7 +20618,7 @@ impl ViewerApp {
             }
             ctx.request_repaint();
         }
-        ui.weak(&self.extra_panes[pane_slot].status);
+        ui.weak(&self.extra_panes[pane_slot].engine.status);
     }
 
     fn extra_pane_status_ui(&self, ui: &mut egui::Ui, pane_slot: usize) {
@@ -20591,7 +20644,7 @@ impl ViewerApp {
                 .on_hover_text(format!(
                     "Site {site}\nStart {volume_time}\nVCP {vcp}\n{cut_count} cuts, {decoded_radials} radials"
                 ));
-            if let Some(frame) = pane.frame_history.get(pane.selected_frame_index)
+            if let Some(frame) = pane.engine.history.get(pane.engine.cursor.index)
                 && frame.identity.site_id == site
                 && let Some(readout) = live_chunk_readout(frame, Utc::now(), time_zone)
             {
@@ -20603,7 +20656,7 @@ impl ViewerApp {
                 .show(ui, |ui| {
                     ui.label(format!("Site {site}"));
                     ui.label(format!("Start {volume_time}"));
-                    if let Some(frame) = pane.frame_history.get(pane.selected_frame_index)
+                    if let Some(frame) = pane.engine.history.get(pane.engine.cursor.index)
                         && frame.identity.site_id == site
                     {
                         ui.label(format!("Status {}", frame.status.label()));
@@ -20612,7 +20665,7 @@ impl ViewerApp {
                     ui.label(format!("{cut_count} cuts, {decoded_radials} radials"));
                 });
         } else {
-            ui.label(&pane.status);
+            ui.label(&pane.engine.status);
         }
     }
 
@@ -21009,7 +21062,8 @@ impl ViewerApp {
                     pane.map_center_lat = result.lat.clamp(-85.0, 85.0);
                     pane.map_center_lon = normalize_lon(result.lon);
                     pane.map_scale = pane.map_scale.max(420.0);
-                    pane.status = format!("Centered map on {}", place_search_display_name(&result));
+                    pane.engine.status =
+                        format!("Centered map on {}", place_search_display_name(&result));
                 }
             } else {
                 self.center_map_on(result.lat, result.lon);
@@ -21024,7 +21078,7 @@ impl ViewerApp {
                     pane.map_center_lat = coordinate.lat.clamp(-85.0, 85.0);
                     pane.map_center_lon = normalize_lon(coordinate.lon);
                     pane.map_scale = pane.map_scale.max(420.0);
-                    pane.status = format!(
+                    pane.engine.status = format!(
                         "Dropped marker at {}",
                         coordinate_marker_status_label(&coordinate)
                     );
@@ -21227,7 +21281,7 @@ impl ViewerApp {
             // checkbox used to silently toggle the PRIMARY radar's
             // auto-refresh no matter which pane it claimed to control.
             if let Some(pane) = site_control_pane.and_then(|slot| self.extra_panes.get_mut(slot)) {
-                ui.checkbox(&mut pane.live, "Live").on_hover_text(
+                ui.checkbox(&mut pane.engine.live.enabled, "Live").on_hover_text(
                     "Auto-refresh this pane's own radar (US sites on the overlay cadence, \
                      international on the provider cadence). A pane on the primary's site \
                      reuses the primary's data. The primary radar keeps its own Live control.",
@@ -22173,16 +22227,16 @@ impl ViewerApp {
         let Some(pane) = self.extra_panes.get(pane_slot) else {
             return;
         };
-        if pane.frame_history.is_empty() {
+        if pane.engine.history.is_empty() {
             ui.weak("No loop - use Load Loop");
             return;
         }
 
-        let frame_count = pane.frame_history.len();
-        let selected_frame_index = pane.selected_frame_index.min(frame_count - 1);
-        let history_playing = pane.history_playing;
+        let frame_count = pane.engine.history.len();
+        let selected_frame_index = pane.engine.cursor.index.min(frame_count - 1);
+        let history_playing = pane.engine.cursor.playing;
         let can_play = self.extra_pane_history_loop_can_step(pane_slot);
-        let frames = pane.frame_history.clone();
+        let frames = pane.engine.history.clone();
         let mut next_frame_index = None;
         let mut timeline_step_delta = None;
         ui.horizontal(|ui| {
@@ -22225,7 +22279,7 @@ impl ViewerApp {
                 });
             if selected_limit != self.history_frame_limit {
                 self.history_frame_limit = normalized_history_limit(selected_limit);
-                self.trim_extra_pane_history(pane_slot);
+                self.retrim_extra_pane_history_to_shared_limit(pane_slot);
                 ctx.request_repaint();
             }
             let mut typed_limit = self.history_frame_limit;
@@ -22240,7 +22294,7 @@ impl ViewerApp {
                 .changed()
             {
                 self.history_frame_limit = normalized_history_limit(typed_limit);
-                self.trim_extra_pane_history(pane_slot);
+                self.retrim_extra_pane_history_to_shared_limit(pane_slot);
                 ctx.request_repaint();
             }
             let mut speed = self.app_settings.loop_speed_percent;
@@ -22340,8 +22394,8 @@ impl ViewerApp {
             );
         } else if let Some(index) = next_frame_index {
             if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-                pane.history_playing = false;
-                pane.browsing_history = index + 1 < pane.frame_history.len();
+                pane.engine.cursor.playing = false;
+                pane.engine.cursor.browsing = index + 1 < pane.engine.history.len();
             }
             self.select_extra_pane_history_frame(pane_slot, index, ctx);
         }
@@ -24660,7 +24714,7 @@ impl ViewerApp {
                 });
             }
             if pane.load_receiver.is_some() {
-                let status = pane.status.trim();
+                let status = pane.engine.status.trim();
                 return Some(BackgroundActivity::indeterminate(if status.is_empty() {
                     format!("Pane {} loading Level II", slot + 2)
                 } else {
@@ -25877,7 +25931,7 @@ impl ViewerApp {
                 && self
                     .extra_panes
                     .get(cell_index - 1)
-                    .is_some_and(ViewPane::owns_radar);
+                    .is_some_and(PaneView::owns_radar);
             let pane_context = (cell_index > 0)
                 .then(|| self.begin_extra_pane_context(cell_index - 1))
                 .flatten();
@@ -26341,20 +26395,50 @@ impl ViewerApp {
 
     /// Whether a grid cell's chip may claim LIVE. Cell 0 (primary) and
     /// following panes display the primary feed, so the primary flag is
-    /// their truth. A radar-owning pane runs its own auto-refresh
-    /// (`maybe_refresh_extra_panes`): LIVE iff the pane's own Live flag is
-    /// on AND its source actually feeds it — an id inherited from an
-    /// international/archive display classifies as no live source and the
-    /// chip stays an honest ARCHIVE.
+    /// their truth (the pane-0 fall-through to
+    /// `realtime_level2_auto_refresh` is the R8 residue the PRIMARY port
+    /// retires at Phase 4e — panes cannot fix a primary chip). A
+    /// radar-owning pane runs its own auto-refresh
+    /// (`maybe_refresh_extra_panes`): LIVE iff the pane ENGINE's Live
+    /// toggle is on AND its source actually feeds it — an id inherited
+    /// from an international/archive display classifies as no live source
+    /// and the chip stays an honest ARCHIVE.
     fn pane_chip_is_live(&self, pane_index: usize) -> bool {
         if let Some(pane) = pane_index
             .checked_sub(1)
             .and_then(|slot| self.extra_panes.get(slot))
             && pane.owns_radar()
         {
-            return pane.live && self.extra_pane_live_source(pane) != PaneLiveSource::None;
+            return pane.engine.live.enabled
+                && self.extra_pane_live_source(pane) != PaneLiveSource::None;
         }
         self.realtime_level2_auto_refresh
+    }
+
+    /// The grid-cell chip for one pane. Radar-owning panes route through
+    /// the pane ENGINE (Phase 4d): liveness truth from
+    /// [`Self::pane_chip_is_live`] plus the CADENCE-AWARE international
+    /// stale floor from the engine's feed and poll cadence (owner decision
+    /// 3 — `max(user, 1800 s, 2 × cadence)` now governs panes; US panes
+    /// keep floor 0, byte-identical strings). Cell 0 and following panes
+    /// keep the primary fall-through until the primary port (4e).
+    fn pane_mode_chip_state(
+        &self,
+        pane_index: usize,
+    ) -> Option<(String, egui::Color32, &'static str)> {
+        let live = self.pane_chip_is_live(pane_index);
+        if let Some(pane) = pane_index
+            .checked_sub(1)
+            .and_then(|slot| self.extra_panes.get(slot))
+            && pane.owns_radar()
+        {
+            let stale_floor = ui_core::loop_engine::stale_floor_seconds(
+                &pane.engine.feed,
+                pane.engine.poll_cadence(),
+            );
+            return self.mode_chip_state_with_live_and_stale_floor(live, stale_floor);
+        }
+        self.mode_chip_state_with_live(live)
     }
 
     /// Per-pane attribution bar for the multi-pane grid. It mirrors the
@@ -26380,13 +26464,11 @@ impl ViewerApp {
             .get(cut)
             .map(|c| format!(" {:.1}°", c.elevation_deg))
             .unwrap_or_default();
-        let (_, accent, mode) = self
-            .mode_chip_state_with_live(self.pane_chip_is_live(pane_index))
-            .unwrap_or((
-                "ARCHIVE".to_owned(),
-                egui::Color32::from_rgb(132, 96, 24),
-                "ARCH",
-            ));
+        let (_, accent, mode) = self.pane_mode_chip_state(pane_index).unwrap_or((
+            "ARCHIVE".to_owned(),
+            egui::Color32::from_rgb(132, 96, 24),
+            "ARCH",
+        ));
         let candidates = [
             format!("{mode} {site_id} {}{tilt} · {scan_time}", product.label()),
             format!("{site_id} {}{tilt} · {scan_time}", product.label()),
@@ -27192,7 +27274,7 @@ impl ViewerApp {
     ) {
         let Some(candidate) = self.best_radar_candidates(lat, lon).into_iter().next() else {
             if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-                pane.status =
+                pane.engine.status =
                     "No WSR-88D or international radar within 460 km of your click".to_owned();
             }
             return;
@@ -27205,7 +27287,7 @@ impl ViewerApp {
                 units::format_beam_height(beam_m, self.units())
             );
             if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-                pane.status = status;
+                pane.engine.status = status;
             }
         }
     }
@@ -27245,7 +27327,7 @@ impl ViewerApp {
             .min_by(|a, b| a.distance_km.total_cmp(&b.distance_km))
         else {
             if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-                pane.status =
+                pane.engine.status =
                     "No WSR-88D or international radar within 460 km of your click".to_owned();
             }
             return;
@@ -27258,7 +27340,7 @@ impl ViewerApp {
                 units::format_distance_km(distance_km, self.units())
             );
             if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-                pane.status = status;
+                pane.engine.status = status;
             }
         }
     }
@@ -38171,7 +38253,7 @@ impl ViewerApp {
                     marker.label
                 );
                 if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-                    pane.status = status.clone();
+                    pane.engine.status = status.clone();
                 }
                 self.status = status;
                 true
@@ -38187,7 +38269,7 @@ impl ViewerApp {
                     "{label} is a live feed; independent panes currently load catalog Level II sites"
                 );
                 if let Some(pane) = self.extra_panes.get_mut(pane_slot) {
-                    pane.status = status.clone();
+                    pane.engine.status = status.clone();
                 }
                 self.status = status;
                 true
@@ -54288,7 +54370,7 @@ mod tests {
         active.volume_time = scan_time;
         let active = Arc::new(active);
         app.extra_panes[0].volume = Some(Arc::clone(&active));
-        app.extra_panes[0].frame_history.push(FrameHistoryEntry {
+        app.extra_panes[0].engine.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(active.as_ref()),
             path: PathBuf::from("KTLX-active"),
             volume: Arc::clone(&active),
@@ -54331,12 +54413,13 @@ mod tests {
         );
 
         assert!(!selected);
-        assert_eq!(app.extra_panes[0].selected_frame_index, 0);
+        assert_eq!(app.extra_panes[0].engine.cursor.index, 0);
         assert_eq!(app.extra_panes[0].cut, Some(1));
-        assert!(app.extra_panes[0].status.contains("Waiting for VEL"));
+        assert!(app.extra_panes[0].engine.status.contains("Waiting for VEL"));
         assert!(
             app.extra_panes[0]
-                .frame_history
+                .engine
+                .history
                 .iter()
                 .any(|frame| frame.identity == selected_identity),
             "the partial should be retained in history while the visible pane waits"
@@ -55060,7 +55143,8 @@ mod tests {
         app.frame_history.push(frame_at(0, "per-target-primary-1"));
         app.frame_history.push(frame_at(5, "per-target-primary-2"));
         app.extra_panes[0]
-            .frame_history
+            .engine
+            .history
             .push(frame_at(0, "per-target-pane-1"));
         assert_eq!(steps(&app, LoopTimelineTarget::Primary), 2);
         assert_eq!(steps(&app, LoopTimelineTarget::ExtraPane(0)), 1);
@@ -55068,7 +55152,8 @@ mod tests {
 
         // Pane push: the pane entry invalidates, the primary entry survives.
         app.extra_panes[0]
-            .frame_history
+            .engine
+            .history
             .push(frame_at(5, "per-target-pane-2"));
         assert_eq!(
             steps(&app, LoopTimelineTarget::ExtraPane(0)),
@@ -55125,7 +55210,8 @@ mod tests {
             .loop_timeline_summary_cache_key(LoopTimelineTarget::Primary)
             .expect("primary key");
         app.extra_panes[0]
-            .frame_history
+            .engine
+            .history
             .push(frame_at(0, "driver-pane-1"));
         let after = app
             .loop_timeline_summary_cache_key(LoopTimelineTarget::Primary)
@@ -55142,7 +55228,8 @@ mod tests {
             .loop_timeline_summary_cache_key(LoopTimelineTarget::Primary)
             .expect("primary key");
         app.extra_panes[0]
-            .frame_history
+            .engine
+            .history
             .push(frame_at(5, "driver-pane-2"));
         let after = app
             .loop_timeline_summary_cache_key(LoopTimelineTarget::Primary)
@@ -55466,7 +55553,7 @@ mod tests {
         app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
         app.extra_panes[0].cut = Some(1);
         app.extra_panes[0].volume = Some(first);
-        app.extra_panes[0].frame_history = app.frame_history.clone();
+        app.extra_panes[0].engine.history = app.frame_history.clone();
 
         assert_eq!(
             app.shared_low_sweep_driver_product(),
@@ -55488,7 +55575,7 @@ mod tests {
         assert_eq!(app.selected_frame_index, 1);
         assert_eq!(app.selected_cut, 0);
         assert_eq!(
-            app.extra_panes[0].selected_frame_index, 0,
+            app.extra_panes[0].engine.cursor.index, 0,
             "velocity must hold the previous volume instead of jumping to a future sweep"
         );
         assert_eq!(app.extra_panes[0].cut, Some(1));
@@ -55502,7 +55589,7 @@ mod tests {
             },
             &ctx,
         );
-        assert_eq!(app.extra_panes[0].selected_frame_index, 1);
+        assert_eq!(app.extra_panes[0].engine.cursor.index, 1);
         assert_eq!(app.extra_panes[0].cut, Some(2));
     }
 
@@ -56086,7 +56173,7 @@ mod tests {
             if minutes == 0 {
                 pane.volume = Some(Arc::clone(&volume));
             }
-            pane.frame_history.push(FrameHistoryEntry {
+            pane.engine.history.push(FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
                 path: PathBuf::from(format!("independent-warning-sync-{minutes}")),
                 volume,
@@ -56752,7 +56839,7 @@ mod tests {
         pane.product = DisplayProduct::StormRelativeDealiasedVelocity;
         pane.cut = Some(0);
         pane.volume = Some(Arc::clone(&first));
-        pane.frame_history = [first, second]
+        pane.engine.history = [first, second]
             .into_iter()
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
@@ -56766,21 +56853,21 @@ mod tests {
                 source_label: "test".to_owned(),
             })
             .collect();
-        pane.history_playing = true;
+        pane.engine.cursor.playing = true;
         let ctx = egui::Context::default();
 
-        app.extra_panes[0].last_history_step = None;
+        app.extra_panes[0].engine.cursor.last_step = None;
         advance_extra_pane_screen_loops_for_test(&mut app, &ctx);
-        assert_eq!(app.extra_panes[0].selected_frame_index, 1);
+        assert_eq!(app.extra_panes[0].engine.cursor.index, 1);
         assert_eq!(app.extra_panes[0].cut, Some(0));
         assert_eq!(
             app.current_loop_timeline_step_index_for_target(LoopTimelineTarget::ExtraPane(0)),
             1
         );
 
-        app.extra_panes[0].last_history_step = None;
+        app.extra_panes[0].engine.cursor.last_step = None;
         advance_extra_pane_screen_loops_for_test(&mut app, &ctx);
-        assert_eq!(app.extra_panes[0].selected_frame_index, 1);
+        assert_eq!(app.extra_panes[0].engine.cursor.index, 1);
         assert_eq!(
             app.extra_panes[0].cut,
             Some(1),
@@ -56815,7 +56902,7 @@ mod tests {
         });
         pane.product = DisplayProduct::Moment(MomentType::Velocity);
         pane.volume = Some(Arc::clone(&first));
-        pane.frame_history = [first, second]
+        pane.engine.history = [first, second]
             .into_iter()
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
@@ -56864,7 +56951,7 @@ mod tests {
         pane.product = DisplayProduct::StormRelativeDealiasedVelocity;
         pane.cut = Some(0);
         pane.volume = Some(Arc::clone(&first));
-        pane.frame_history = [first, second]
+        pane.engine.history = [first, second]
             .into_iter()
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
@@ -56878,14 +56965,14 @@ mod tests {
                 source_label: "test".to_owned(),
             })
             .collect();
-        pane.history_playing = true;
-        pane.last_history_step = None;
+        pane.engine.cursor.playing = true;
+        pane.engine.cursor.last_step = None;
         let ctx = egui::Context::default();
 
         advance_extra_pane_screen_loops_for_test(&mut app, &ctx);
-        assert_eq!(app.extra_panes[0].selected_frame_index, 1);
+        assert_eq!(app.extra_panes[0].engine.cursor.index, 1);
         assert_eq!(app.extra_panes[0].cut, Some(0));
-        assert!(app.extra_panes[0].history_playing);
+        assert!(app.extra_panes[0].engine.cursor.playing);
     }
 
     #[test]
@@ -56930,7 +57017,7 @@ mod tests {
         app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
         app.extra_panes[0].cut = Some(0);
         app.extra_panes[0].volume = Some(first);
-        app.extra_panes[0].frame_history = app.frame_history.clone();
+        app.extra_panes[0].engine.history = app.frame_history.clone();
         app.history_playing = true;
         let ctx = egui::Context::default();
 
@@ -56938,7 +57025,7 @@ mod tests {
         advance_primary_screen_loop_for_test(&mut app, &ctx);
         assert_eq!(app.selected_frame_index, 1);
         assert_eq!(
-            app.extra_panes[0].selected_frame_index, 1,
+            app.extra_panes[0].engine.cursor.index, 1,
             "cloned independent panes must move to the matching frame before low-sweep sync"
         );
         assert_eq!(app.extra_panes[0].cut, Some(0));
@@ -56946,7 +57033,7 @@ mod tests {
         app.last_history_step = None;
         advance_primary_screen_loop_for_test(&mut app, &ctx);
         assert_eq!(app.selected_frame_index, 1);
-        assert_eq!(app.extra_panes[0].selected_frame_index, 1);
+        assert_eq!(app.extra_panes[0].engine.cursor.index, 1);
         assert_eq!(
             app.extra_panes[0].cut,
             Some(1),
@@ -56997,7 +57084,7 @@ mod tests {
         app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
         app.extra_panes[0].cut = Some(0);
         app.extra_panes[0].volume = Some(first);
-        app.extra_panes[0].frame_history = app.frame_history.clone();
+        app.extra_panes[0].engine.history = app.frame_history.clone();
 
         assert_eq!(
             app.shared_low_sweep_driver_product(),
@@ -57074,7 +57161,7 @@ mod tests {
         app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
         app.extra_panes[0].cut = Some(0);
         app.extra_panes[0].volume = Some(first);
-        app.extra_panes[0].frame_history = app.frame_history.clone();
+        app.extra_panes[0].engine.history = app.frame_history.clone();
 
         let ctx = egui::Context::default();
         app.select_history_record_step(
@@ -57088,7 +57175,7 @@ mod tests {
         );
 
         assert_eq!(app.selected_frame_index, 1);
-        assert_eq!(app.extra_panes[0].selected_frame_index, 1);
+        assert_eq!(app.extra_panes[0].engine.cursor.index, 1);
         assert_eq!(
             app.extra_panes[0].cut,
             Some(2),
@@ -57127,7 +57214,7 @@ mod tests {
         pane.cut = Some(0);
         pane.volume = Some(Arc::clone(&first));
         for volume in [first, second] {
-            pane.frame_history.push(FrameHistoryEntry {
+            pane.engine.history.push(FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
                 path: PathBuf::from(format!(
                     "independent-pane-low-sweep-{}",
@@ -57199,7 +57286,7 @@ mod tests {
         pane.product = DisplayProduct::StormRelativeVelocity;
         pane.cut = Some(0);
         pane.volume = Some(Arc::clone(&volume));
-        pane.frame_history.push(FrameHistoryEntry {
+        pane.engine.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("independent-pane-unified-player"),
             volume,
@@ -57246,8 +57333,8 @@ mod tests {
         pane.product = DisplayProduct::Moment(MomentType::Velocity);
         pane.cut = Some(0);
         pane.volume = Some(Arc::clone(&volume));
-        pane.selected_frame_index = 0;
-        pane.frame_history.push(FrameHistoryEntry {
+        pane.engine.cursor.index = 0;
+        pane.engine.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(volume.as_ref()),
             path: PathBuf::from("focused-pane-low-sweep-playback-camera"),
             volume,
@@ -57314,7 +57401,7 @@ mod tests {
             if index == 0 {
                 pane.volume = Some(Arc::clone(&volume));
             }
-            pane.frame_history.push(FrameHistoryEntry {
+            pane.engine.history.push(FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
                 path: PathBuf::from(format!("focused-pane-frame-playback-camera-{index}")),
                 volume,
@@ -57344,7 +57431,7 @@ mod tests {
         app.select_extra_pane_history_frame(0, 1, &ctx);
         app.sync_extra_pane_timeline_side_effects(0, &ctx);
 
-        assert_eq!(app.extra_panes[0].selected_frame_index, 1);
+        assert_eq!(app.extra_panes[0].engine.cursor.index, 1);
         assert_eq!(app.displayed_timeline_time_utc(), Some(second_time));
         assert!((app.map_center_lat - 40.0).abs() < 1e-5);
         assert!((app.map_center_lon + 80.0).abs() < 1e-5);
@@ -57627,7 +57714,7 @@ mod tests {
         pane.product = DisplayProduct::Moment(MomentType::Velocity);
         pane.cut = Some(0);
         pane.volume = Some(Arc::clone(&first));
-        pane.frame_history = [Arc::clone(&first), Arc::clone(&second)]
+        pane.engine.history = [Arc::clone(&first), Arc::clone(&second)]
             .into_iter()
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
@@ -57641,8 +57728,8 @@ mod tests {
                 source_label: "test".to_owned(),
             })
             .collect();
-        pane.history_playing = true;
-        pane.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        pane.engine.cursor.playing = true;
+        pane.engine.cursor.last_step = Some(Instant::now() - Duration::from_secs(5));
         pane.texture_key = Some(test_screen_texture_key(
             Arc::as_ptr(&second) as usize,
             0,
@@ -57653,19 +57740,19 @@ mod tests {
         app.maybe_advance_extra_pane_history_loops(&ctx);
 
         assert_eq!(
-            app.extra_panes[0].selected_frame_index, 0,
+            app.extra_panes[0].engine.cursor.index, 0,
             "independent pane playback must hold while its selected texture is stale"
         );
-        assert!(app.extra_panes[0].last_history_step.is_none());
+        assert!(app.extra_panes[0].engine.cursor.last_step.is_none());
 
         mark_extra_pane_screen_texture_ready(&mut app, 0);
         app.maybe_advance_extra_pane_history_loops(&ctx);
-        assert_eq!(app.extra_panes[0].selected_frame_index, 0);
-        assert!(app.extra_panes[0].last_history_step.is_some());
+        assert_eq!(app.extra_panes[0].engine.cursor.index, 0);
+        assert!(app.extra_panes[0].engine.cursor.last_step.is_some());
 
-        app.extra_panes[0].last_history_step = Some(Instant::now() - Duration::from_secs(5));
+        app.extra_panes[0].engine.cursor.last_step = Some(Instant::now() - Duration::from_secs(5));
         app.maybe_advance_extra_pane_history_loops(&ctx);
-        assert_eq!(app.extra_panes[0].selected_frame_index, 1);
+        assert_eq!(app.extra_panes[0].engine.cursor.index, 1);
         assert!(
             app.extra_panes[0].texture_key.is_some(),
             "independent pane playback should retain the previous same-site texture while the next render lands"
@@ -57916,7 +58003,7 @@ mod tests {
             level2_id: "KIND".to_owned(),
         });
         app.extra_panes[0].volume = Some(Arc::clone(&volume));
-        app.extra_panes[0].frame_history = app.frame_history.clone();
+        app.extra_panes[0].engine.history = app.frame_history.clone();
         app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
         app.extra_panes[0].cut = Some(1);
         app.extra_panes[0].texture_key = Some(TextureKey {
@@ -58519,7 +58606,7 @@ mod tests {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.app_settings.independent_panels = true;
         app.extra_panes
-            .push(ViewPane::new(DisplayProduct::DealiasedVelocity));
+            .push(test_pane(DisplayProduct::DealiasedVelocity));
         let (sender, receiver) = mpsc::channel::<AsyncLoadResult>();
         app.extra_panes[0].load_receiver = Some(receiver);
         app.extra_panes[0].load_mode = Some(LatestLoadMode::Loop);
@@ -58557,18 +58644,18 @@ mod tests {
         let pane = &app.extra_panes[0];
         assert!(pane.load_receiver.is_none());
         assert!(pane.load_mode.is_none());
-        assert_eq!(pane.frame_history.len(), 2);
-        assert_eq!(pane.selected_frame_index, 1);
-        assert!(pane.history_playing);
-        assert!(!pane.browsing_history);
-        assert!(pane.status.contains("Playing 2 frames"));
+        assert_eq!(pane.engine.history.len(), 2);
+        assert_eq!(pane.engine.cursor.index, 1);
+        assert!(pane.engine.cursor.playing);
+        assert!(!pane.engine.cursor.browsing);
+        assert!(pane.engine.status.contains("Playing 2 frames"));
     }
 
     #[test]
     fn independent_pane_frame_step_preserves_zoom_for_same_site_loop() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.extra_panes
-            .push(ViewPane::new(DisplayProduct::DealiasedVelocity));
+            .push(test_pane(DisplayProduct::DealiasedVelocity));
         let ctx = egui::Context::default();
         let scan_time = Utc.with_ymd_and_hms(2026, 6, 8, 1, 30, 0).unwrap();
         let mut first = test_ref_then_velocity_volume();
@@ -58624,7 +58711,7 @@ mod tests {
 
         app.select_extra_pane_history_frame(0, 1, &ctx);
 
-        assert_eq!(app.extra_panes[0].selected_frame_index, 1);
+        assert_eq!(app.extra_panes[0].engine.cursor.index, 1);
         assert!((app.extra_panes[0].map_center_lat - 35.91).abs() < 0.001);
         assert!((app.extra_panes[0].map_center_lon + 96.82).abs() < 0.001);
         assert_eq!(app.extra_panes[0].map_scale, 980.0);
@@ -61950,12 +62037,10 @@ mod tests {
             radar_core::RadarSite::new("KTLX"),
             Utc::now() - chrono::Duration::seconds(30),
         )));
-        app.extra_panes.push(ViewPane::new(DisplayProduct::Moment(
-            MomentType::Reflectivity,
-        )));
-        app.extra_panes.push(ViewPane::new(DisplayProduct::Moment(
-            MomentType::Reflectivity,
-        )));
+        app.extra_panes
+            .push(test_pane(DisplayProduct::Moment(MomentType::Reflectivity)));
+        app.extra_panes
+            .push(test_pane(DisplayProduct::Moment(MomentType::Reflectivity)));
         app.extra_panes[0].pin = Some(SiteRef::Us {
             level2_id: "KEAX".to_owned(),
         });
@@ -61967,9 +62052,9 @@ mod tests {
         // Radar-owning panes auto-refresh themselves now: the chip is the
         // PANE's own flag, in both directions.
         assert!(app.pane_chip_is_live(1));
-        app.extra_panes[0].live = false;
+        app.extra_panes[0].engine.live.enabled = false;
         assert!(!app.pane_chip_is_live(1));
-        app.extra_panes[0].live = true;
+        app.extra_panes[0].engine.live.enabled = true;
         app.realtime_level2_auto_refresh = false;
         assert!(
             app.pane_chip_is_live(1),
@@ -62037,142 +62122,41 @@ mod tests {
         );
     }
 
+    /// Phase-4d port of `extra_pane_live_source_dedupes_primary_site_and_
+    /// rejects_foreign_ids`: the same (pin, primary-state) cells, asserted
+    /// through the pane ENGINE's verdict (`extra_pane_live_action` ->
+    /// `LoopEngine::live_tick`) now that the SharedWithPrimary dedupe is
+    /// SiteRef equality inside the engine. Classification-only cells keep
+    /// asserting `extra_pane_live_source` (None/UsSite/Intl).
     #[test]
-    fn pane_live_poll_action_policy() {
-        // Due poll fires for a pane's own site and for international feeds.
-        assert_eq!(
-            pane_live_poll_action(true, PaneLiveSource::UsSite, false, true),
-            PaneLiveAction::Poll
-        );
-        assert_eq!(
-            pane_live_poll_action(true, PaneLiveSource::Intl, false, true),
-            PaneLiveAction::Poll
-        );
-        // Not due yet.
-        assert_eq!(
-            pane_live_poll_action(true, PaneLiveSource::UsSite, false, false),
-            PaneLiveAction::Skip
-        );
-        // An in-flight pane load owns the pane.
-        assert_eq!(
-            pane_live_poll_action(true, PaneLiveSource::UsSite, true, true),
-            PaneLiveAction::Skip
-        );
-        assert_eq!(
-            pane_live_poll_action(true, PaneLiveSource::SharedWithPrimary, true, true),
-            PaneLiveAction::Skip
-        );
-        // Live flag off — the pane checkbox is the user's pause, and the
-        // archive guard (archive loads clear the inherited flag).
-        assert_eq!(
-            pane_live_poll_action(false, PaneLiveSource::UsSite, false, true),
-            PaneLiveAction::Skip
-        );
-        // No pollable source: following pane, or an archive/international id
-        // inherited from the primary display.
-        assert_eq!(
-            pane_live_poll_action(true, PaneLiveSource::None, false, true),
-            PaneLiveAction::Skip
-        );
-        // Same site as the live primary: mirror its decode, cadence-free.
-        assert_eq!(
-            pane_live_poll_action(true, PaneLiveSource::SharedWithPrimary, false, true),
-            PaneLiveAction::FollowPrimary
-        );
-        assert_eq!(
-            pane_live_poll_action(true, PaneLiveSource::SharedWithPrimary, false, false),
-            PaneLiveAction::FollowPrimary
-        );
-        // Contract-harness cells (v0.29 Phase 1): the remaining
-        // (source, primary-state) combinations, pinned so the Phase-4
-        // `LoopEngine::live_tick` port must reproduce every one.
-        // International panes obey the same not-due / in-flight gates.
-        assert_eq!(
-            pane_live_poll_action(true, PaneLiveSource::Intl, false, false),
-            PaneLiveAction::Skip
-        );
-        assert_eq!(
-            pane_live_poll_action(true, PaneLiveSource::Intl, true, true),
-            PaneLiveAction::Skip
-        );
-        // The live checkbox outranks EVERY source kind, including the
-        // cadence-free primary follow.
-        assert_eq!(
-            pane_live_poll_action(false, PaneLiveSource::Intl, false, true),
-            PaneLiveAction::Skip
-        );
-        assert_eq!(
-            pane_live_poll_action(false, PaneLiveSource::SharedWithPrimary, false, true),
-            PaneLiveAction::Skip
-        );
-        assert_eq!(
-            pane_live_poll_action(false, PaneLiveSource::None, false, true),
-            PaneLiveAction::Skip
-        );
-        // A sourceless pane skips regardless of the in-flight/due bits.
-        assert_eq!(
-            pane_live_poll_action(true, PaneLiveSource::None, true, true),
-            PaneLiveAction::Skip
-        );
-        assert_eq!(
-            pane_live_poll_action(true, PaneLiveSource::None, false, false),
-            PaneLiveAction::Skip
-        );
-        // Cadence fall-through: None and SharedWithPrimary share the US
-        // overlay cadence arm (SharedWithPrimary never polls, so the value
-        // is only a due-clock input; pinned so a refactor cannot silently
-        // put either on the 1 s chunk cadence).
-        assert_eq!(
-            pane_live_poll_cadence_seconds(PaneLiveSource::None),
-            OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS
-        );
-        assert_eq!(
-            pane_live_poll_cadence_seconds(PaneLiveSource::SharedWithPrimary),
-            OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS
-        );
-        // Cadences: US panes poll on the overlay cadence, never the
-        // primary's chunk cadence; international on the provider cadence.
-        assert_eq!(
-            pane_live_poll_cadence_seconds(PaneLiveSource::UsSite),
-            OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS
-        );
-        assert_eq!(
-            pane_live_poll_cadence_seconds(PaneLiveSource::Intl),
-            INTL_POLL_SECONDS
-        );
-        assert!(
-            pane_live_poll_cadence_seconds(PaneLiveSource::UsSite)
-                > PRIMARY_REALTIME_LEVEL2_REFRESH_SECONDS
-        );
-    }
-
-    #[test]
-    fn extra_pane_live_source_dedupes_primary_site_and_rejects_foreign_ids() {
+    fn pane_live_action_dedupes_primary_site_and_rejects_foreign_ids() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.sites = vec![RadarSite::new("KTLX"), RadarSite::new("KEAX")];
         app.selected_site_index = 0;
         app.realtime_level2_auto_refresh = true;
-        let mut pane = ViewPane::new(DisplayProduct::Moment(MomentType::Reflectivity));
+        app.extra_panes
+            .push(test_pane(DisplayProduct::Moment(MomentType::Reflectivity)));
+        let now = Instant::now();
 
         // Same site as the live-polling primary: reuse its decode.
-        pane.pin = Some(SiteRef::Us {
+        app.extra_panes[0].pin = Some(SiteRef::Us {
             level2_id: "KTLX".to_owned(),
         });
         assert_eq!(
-            app.extra_pane_live_source(&pane),
-            PaneLiveSource::SharedWithPrimary
+            app.extra_pane_live_action(0, now),
+            LiveAction::FollowPrimary
         );
         // Different catalog site: the pane polls its own feed.
-        pane.pin = Some(SiteRef::Us {
+        app.extra_panes[0].pin = Some(SiteRef::Us {
             level2_id: "KEAX".to_owned(),
         });
-        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::UsSite);
+        assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Poll);
         // Primary paused: same-site pane now owns its own polling.
         app.realtime_level2_auto_refresh = false;
-        pane.pin = Some(SiteRef::Us {
+        app.extra_panes[0].pin = Some(SiteRef::Us {
             level2_id: "KTLX".to_owned(),
         });
-        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::UsSite);
+        assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Poll);
         app.realtime_level2_auto_refresh = true;
         // An armed international poll owns the primary view, so the primary
         // is NOT live-polling KTLX and the pane must fetch it itself.
@@ -62181,61 +62165,203 @@ mod tests {
             site_id: "sella".to_owned(),
         };
         app.poll_active = true;
-        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::UsSite);
+        assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Poll);
+        // ...while an intl pane pinned to that SAME armed intl poll now
+        // FOLLOWS it — the Phase-4d dedupe cell (fails on the pre-4d tree,
+        // which classified every intl pin as its own poll).
+        app.extra_panes[0].pin = Some(SiteRef::Intl {
+            provider_id: "smhi".to_owned(),
+            site_id: "sella".to_owned(),
+        });
+        assert_eq!(
+            app.extra_pane_live_action(0, now),
+            LiveAction::FollowPrimary,
+            "intl pane sharing the intl primary's site must not double-poll"
+        );
+        // The equality includes the provider: cross-provider same-site-id
+        // strings still poll their own feed.
+        app.extra_panes[0].pin = Some(SiteRef::Intl {
+            provider_id: "dwd".to_owned(),
+            site_id: "sella".to_owned(),
+        });
+        assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Poll);
         app.poll_active = false;
         app.poll_source = PollSource::CustomUrl(String::new());
         // A pinned id outside the US catalog (inherited from an
         // international/archive display) has nothing to poll.
-        pane.pin = Some(SiteRef::Us {
+        app.extra_panes[0].pin = Some(SiteRef::Us {
             level2_id: "sella".to_owned(),
         });
-        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::None);
+        assert_eq!(
+            app.extra_pane_live_source(&app.extra_panes[0]),
+            PaneLiveSource::None
+        );
+        assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Skip);
         // International pane source polls the provider.
-        pane.pin = Some(SiteRef::Intl {
+        app.extra_panes[0].pin = Some(SiteRef::Intl {
             provider_id: "smhi".to_owned(),
             site_id: "sella".to_owned(),
         });
-        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::Intl);
+        assert_eq!(
+            app.extra_pane_live_source(&app.extra_panes[0]),
+            PaneLiveSource::Intl
+        );
+        assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Poll);
         // The v0.28 "intl source outranks a lingering pinned US id" cell is
         // UNREPRESENTABLE since the Phase-3 pin collapse: one `pin` field
         // holds exactly one world, so there is nothing to outrank.
         // Pinned-id catalog lookup and the primary dedupe are both
         // case-insensitive.
-        pane.pin = Some(SiteRef::Us {
+        app.extra_panes[0].pin = Some(SiteRef::Us {
             level2_id: "keax".to_owned(),
         });
-        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::UsSite);
-        pane.pin = Some(SiteRef::Us {
+        assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Poll);
+        app.extra_panes[0].pin = Some(SiteRef::Us {
             level2_id: "ktlx".to_owned(),
         });
         assert_eq!(
-            app.extra_pane_live_source(&pane),
-            PaneLiveSource::SharedWithPrimary
+            app.extra_pane_live_action(0, now),
+            LiveAction::FollowPrimary
         );
+        // An in-flight pane load owns the pane, even over FollowPrimary.
+        let (_sender, receiver) = mpsc::channel::<AsyncLoadResult>();
+        app.extra_panes[0].load_receiver = Some(receiver);
+        assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Skip);
+        app.extra_panes[0].load_receiver = None;
+        // The pane Live toggle is the user's pause: off skips everything.
+        app.extra_panes[0].engine.live.enabled = false;
+        assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Skip);
+        app.extra_panes[0].engine.live.enabled = true;
+        // Not due yet: a fresh refresh stamp skips a would-be Poll (5 s US
+        // pane cadence via the engine)...
+        app.extra_panes[0].pin = Some(SiteRef::Us {
+            level2_id: "KEAX".to_owned(),
+        });
+        app.extra_panes[0].engine.live.last_refresh = Some(now);
+        assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Skip);
+        // ...but never gates the cadence-free FollowPrimary.
+        app.extra_panes[0].pin = Some(SiteRef::Us {
+            level2_id: "KTLX".to_owned(),
+        });
+        assert_eq!(
+            app.extra_pane_live_action(0, now),
+            LiveAction::FollowPrimary
+        );
+        app.extra_panes[0].engine.live.last_refresh = None;
         // An armed custom-URL poll owns the primary view (the guard keys on
         // `poll_url`, not the variant payload): the same-site pane must poll
         // its own feed.
         app.poll_active = true;
         app.poll_url = "http://example.com/dow8".to_owned();
-        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::UsSite);
+        assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Poll);
         app.poll_active = false;
         app.poll_url = String::new();
         // An international ARCHIVE display owner (armed intl source, poll
-        // inactive) also means the primary is not live-polling KTLX.
+        // inactive) also means the primary is not live-polling KTLX...
         app.set_intl_archive_primary_source("smhi", "sella");
-        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::UsSite);
+        assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Poll);
+        // ...and an intl pane pinned to that ARCHIVE owner polls itself
+        // too: there is no live primary feed to ride.
+        app.extra_panes[0].pin = Some(SiteRef::Intl {
+            provider_id: "smhi".to_owned(),
+            site_id: "sella".to_owned(),
+        });
+        assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Poll);
         app.poll_source = PollSource::CustomUrl(String::new());
         // A research/community feed resolves in the catalog but the pane
         // load path refuses it: no live source.
         app.sites =
             site_catalog_with_community_feeds(vec![RadarSite::new("KTLX"), RadarSite::new("KEAX")]);
-        pane.pin = Some(SiteRef::Us {
+        app.extra_panes[0].pin = Some(SiteRef::Us {
             level2_id: "KBPP".to_owned(),
         });
-        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::None);
+        assert_eq!(
+            app.extra_pane_live_source(&app.extra_panes[0]),
+            PaneLiveSource::None
+        );
+        assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Skip);
         // A following pane has no source of its own.
-        pane.pin = None;
-        assert_eq!(app.extra_pane_live_source(&pane), PaneLiveSource::None);
+        app.extra_panes[0].pin = None;
+        assert_eq!(
+            app.extra_pane_live_source(&app.extra_panes[0]),
+            PaneLiveSource::None
+        );
+        assert_eq!(app.extra_pane_live_action(0, now), LiveAction::Skip);
+    }
+
+    /// THE Phase-4d dedupe deliverable, end to end ("intl double-poll
+    /// dies", spec §7 4d + migration row `extra_pane_live_source`): with an
+    /// intl PRIMARY poll active on a site and a pane pinned to the SAME
+    /// site, the tick verdict is FollowPrimary and the follow mirrors the
+    /// primary's newest volume Arc into the pane — one download, one
+    /// decode. FAILS ON THE PRE-4D TREE, which classified every intl pin
+    /// as its own poll (verdict Poll = a second provider download) and
+    /// whose follow path refused non-US pins outright.
+    #[test]
+    fn intl_pane_pinned_to_the_intl_primary_site_follows_instead_of_double_polling() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.extra_panes
+            .push(test_pane(DisplayProduct::Moment(MomentType::Reflectivity)));
+        app.poll_source = PollSource::Intl {
+            provider_id: "smhi".to_owned(),
+            site_id: "angelholm".to_owned(),
+        };
+        app.poll_active = true;
+        // The primary's newest polled frame (intl volumes carry provider
+        // site ids that need not match the registry id).
+        let volume = Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("seang"),
+            Utc::now() - chrono::Duration::minutes(5),
+        ));
+        app.frame_history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(&volume),
+            path: PathBuf::from("poll://seang"),
+            volume: Arc::clone(&volume),
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "polled seang".to_owned(),
+        });
+        app.extra_panes[0].pin = Some(SiteRef::Intl {
+            provider_id: "smhi".to_owned(),
+            site_id: "angelholm".to_owned(),
+        });
+
+        assert_eq!(
+            app.extra_pane_live_action(0, Instant::now()),
+            LiveAction::FollowPrimary,
+            "same intl site as the intl primary: ONE download"
+        );
+        app.follow_primary_volume_into_pane(0, &ctx);
+        assert_eq!(app.extra_panes[0].engine.history.len(), 1);
+        assert!(
+            Arc::ptr_eq(&app.extra_panes[0].engine.history[0].volume, &volume),
+            "the pane mirrors the primary's decode (Arc clone), not a refetch"
+        );
+        assert_eq!(
+            app.extra_panes[0].followed_primary_volume_ptr,
+            Some(Arc::as_ptr(&volume) as usize),
+            "the Arc-ptr dedupe key is recorded so the next tick skips"
+        );
+        // A cross-site intl pin must NOT mirror this primary.
+        app.extra_panes[0].pin = Some(SiteRef::Intl {
+            provider_id: "smhi".to_owned(),
+            site_id: "sella".to_owned(),
+        });
+        app.extra_panes[0].followed_primary_volume_ptr = None;
+        app.extra_panes[0].engine.clear_history();
+        // The earlier mirror stamped last_refresh; clear it so the verdict
+        // under test is the dedupe, not the cadence.
+        app.extra_panes[0].engine.live.last_refresh = None;
+        assert_eq!(
+            app.extra_pane_live_action(0, Instant::now()),
+            LiveAction::Poll
+        );
+        app.follow_primary_volume_into_pane(0, &ctx);
+        assert!(
+            app.extra_panes[0].engine.history.is_empty(),
+            "the feed-level guard refuses a mismatched intl pin"
+        );
     }
 
     /// Contract harness (v0.29 Phase 1, spec §11 Milestone A item 2): the
@@ -62247,9 +62373,8 @@ mod tests {
     fn extra_pane_intl_load_clears_pane_history_only_on_source_change() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let ctx = egui::Context::default();
-        app.extra_panes.push(ViewPane::new(DisplayProduct::Moment(
-            MomentType::Reflectivity,
-        )));
+        app.extra_panes
+            .push(test_pane(DisplayProduct::Moment(MomentType::Reflectivity)));
         // Unknown provider id: the spawned worker fails its provider lookup
         // immediately, so the test never touches the network — the state
         // under test is all written synchronously before the spawn.
@@ -62261,12 +62386,12 @@ mod tests {
             latitude_deg: None,
             longitude_deg: None,
         };
-        let seed_pane = |pane: &mut ViewPane, site: &str| {
+        let seed_pane = |pane: &mut PaneView, site: &str| {
             let volume = Arc::new(RadarVolume::new(
                 radar_core::RadarSite::new(site),
                 Utc::now() - chrono::Duration::minutes(4),
             ));
-            pane.frame_history.push(FrameHistoryEntry {
+            pane.engine.history.push(FrameHistoryEntry {
                 identity: frame_identity_for_volume(&volume),
                 path: PathBuf::from(format!("intl:{site}")),
                 volume: Arc::clone(&volume),
@@ -62287,7 +62412,7 @@ mod tests {
         app.start_extra_pane_intl_load(0, intl_site("alpha"), LatestLoadMode::User, &ctx);
         let pane = &app.extra_panes[0];
         assert_eq!(
-            pane.frame_history.len(),
+            pane.engine.history.len(),
             1,
             "same-source pane reload keeps history"
         );
@@ -62304,7 +62429,7 @@ mod tests {
         app.start_extra_pane_intl_load(0, intl_site("beta"), LatestLoadMode::User, &ctx);
         let pane = &app.extra_panes[0];
         assert!(
-            pane.frame_history.is_empty(),
+            pane.engine.history.is_empty(),
             "cross-site pane load clears the pane loop"
         );
         assert!(pane.volume.is_none());
@@ -62326,7 +62451,7 @@ mod tests {
         app.start_extra_pane_intl_load(0, intl_site("alpha"), LatestLoadMode::User, &ctx);
         let pane = &app.extra_panes[0];
         assert!(
-            pane.frame_history.is_empty(),
+            pane.engine.history.is_empty(),
             "US-to-intl pane switch clears the pane loop"
         );
         assert!(pane.volume.is_none());
@@ -62454,9 +62579,8 @@ mod tests {
         app.sites = vec![RadarSite::new("KTLX"), RadarSite::new("KEAX")];
         app.selected_site_index = 0;
         app.app_settings.independent_panels = true;
-        app.extra_panes.push(ViewPane::new(DisplayProduct::Moment(
-            MomentType::Reflectivity,
-        )));
+        app.extra_panes
+            .push(test_pane(DisplayProduct::Moment(MomentType::Reflectivity)));
 
         app.set_extra_pane_selected_site(0, 1);
         assert_eq!(
@@ -62525,27 +62649,20 @@ mod tests {
             radar_core::RadarSite::new("KTLX"),
             Utc.with_ymd_and_hms(2013, 5, 20, 20, 0, 0).unwrap(),
         )));
-        app.extra_panes.push(ViewPane::new(DisplayProduct::Moment(
-            MomentType::Reflectivity,
-        )));
+        app.extra_panes
+            .push(test_pane(DisplayProduct::Moment(MomentType::Reflectivity)));
         app.initialize_extra_pane_from_primary(0);
-        let pane = &app.extra_panes[0];
-        assert!(!pane.live);
+        assert!(!app.extra_panes[0].engine.live.enabled);
         assert_eq!(
-            pane_live_poll_action(
-                pane.live,
-                app.extra_pane_live_source(pane),
-                pane.load_receiver.is_some(),
-                true,
-            ),
-            PaneLiveAction::Skip
+            app.extra_pane_live_action(0, Instant::now()),
+            LiveAction::Skip
         );
 
         // A live primary hands panes a live flag — users expect every
         // independent pane to keep updating.
         app.realtime_level2_auto_refresh = true;
         app.initialize_extra_pane_from_primary(0);
-        assert!(app.extra_panes[0].live);
+        assert!(app.extra_panes[0].engine.live.enabled);
     }
 
     #[test]
@@ -62572,9 +62689,8 @@ mod tests {
         app.realtime_level2_auto_refresh = true;
         app.history_frame_limit = 3;
         app.frame_history.push(ktlx_live_frame(20));
-        app.extra_panes.push(ViewPane::new(DisplayProduct::Moment(
-            MomentType::Reflectivity,
-        )));
+        app.extra_panes
+            .push(test_pane(DisplayProduct::Moment(MomentType::Reflectivity)));
         app.extra_panes[0].pin = Some(SiteRef::Us {
             level2_id: "KTLX".to_owned(),
         });
@@ -62582,9 +62698,9 @@ mod tests {
         app.maybe_refresh_extra_panes(&ctx);
         // The pane holds the PRIMARY's decode (same Arc): one download and
         // one decode feed both panes.
-        assert_eq!(app.extra_panes[0].frame_history.len(), 1);
+        assert_eq!(app.extra_panes[0].engine.history.len(), 1);
         assert!(Arc::ptr_eq(
-            &app.extra_panes[0].frame_history[0].volume,
+            &app.extra_panes[0].engine.history[0].volume,
             &app.frame_history[0].volume
         ));
         assert!(
@@ -62593,9 +62709,9 @@ mod tests {
         );
 
         // An unchanged primary volume is not re-installed every tick.
-        app.extra_panes[0].status = "sentinel".to_owned();
+        app.extra_panes[0].engine.status = "sentinel".to_owned();
         app.maybe_refresh_extra_panes(&ctx);
-        assert_eq!(app.extra_panes[0].status, "sentinel");
+        assert_eq!(app.extra_panes[0].engine.status, "sentinel");
 
         // Each new primary install propagates within a tick, and the pane
         // history trim applies on this install path too.
@@ -62605,7 +62721,7 @@ mod tests {
         }
         assert_eq!(app.frame_history.len(), 4);
         assert_eq!(
-            app.extra_panes[0].frame_history.len(),
+            app.extra_panes[0].engine.history.len(),
             3,
             "trimmed to limit"
         );
@@ -62616,12 +62732,12 @@ mod tests {
         ));
 
         // A pane with its Live checkbox off stays untouched.
-        app.extra_panes[0].live = false;
-        app.extra_panes[0].status = "paused".to_owned();
+        app.extra_panes[0].engine.live.enabled = false;
+        app.extra_panes[0].engine.status = "paused".to_owned();
         app.frame_history.push(ktlx_live_frame(1));
         app.maybe_refresh_extra_panes(&ctx);
-        assert_eq!(app.extra_panes[0].status, "paused");
-        assert_eq!(app.extra_panes[0].frame_history.len(), 3);
+        assert_eq!(app.extra_panes[0].engine.status, "paused");
+        assert_eq!(app.extra_panes[0].engine.history.len(), 3);
     }
 
     #[test]
@@ -63719,9 +63835,8 @@ mod tests {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.volume = Some(Arc::new(test_advanced_source_volume(Utc::now())));
         app.advanced_products_enabled = true;
-        app.extra_panes.push(ViewPane::new(DisplayProduct::Moment(
-            MomentType::Reflectivity,
-        )));
+        app.extra_panes
+            .push(test_pane(DisplayProduct::Moment(MomentType::Reflectivity)));
         let phif = DisplayProduct::Moment(MomentType::Unknown("PHIF".to_owned()));
 
         assert!(app.switch_pane_product(0, phif.clone()));
@@ -63844,12 +63959,12 @@ mod tests {
                 .single()
                 .unwrap(),
         ));
-        app.extra_panes.push(ViewPane::new(product.clone()));
+        app.extra_panes.push(test_pane(product.clone()));
         app.extra_panes[0].pin = Some(SiteRef::Us {
             level2_id: source.site.id.clone(),
         });
         app.extra_panes[0].cut = Some(0);
-        app.extra_panes[0].frame_history.push(FrameHistoryEntry {
+        app.extra_panes[0].engine.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(source.as_ref()),
             path: PathBuf::from("pane-loop-phif-2200"),
             volume: Arc::clone(&source),
@@ -63866,7 +63981,7 @@ mod tests {
             "pane install materializes PHIF into a new Arc"
         );
         assert!(
-            Arc::ptr_eq(&app.extra_panes[0].frame_history[0].volume, &installed),
+            Arc::ptr_eq(&app.extra_panes[0].engine.history[0].volume, &installed),
             "derived Arc must replace the pane history entry so pane loops do not re-derive"
         );
 
@@ -66318,6 +66433,17 @@ mod tests {
         volume
     }
 
+    /// A pane for tests: engine id 0 / slot 0 (tests never assert lane
+    /// routing off these) on the default shared frame limit.
+    pub(crate) fn test_pane(product: DisplayProduct) -> PaneView {
+        PaneView::new(
+            0,
+            0,
+            product,
+            HistoryLimits::pane(DEFAULT_HISTORY_FRAME_LIMIT),
+        )
+    }
+
     pub(crate) fn test_viewer_app_with_hazards(records: Vec<HazardRecord>) -> ViewerApp {
         let (render_sender, _render_request_receiver) = mpsc::channel::<RenderRequest>();
         let (_render_result_sender, render_receiver) = mpsc::channel::<AsyncRenderResult>();
@@ -66926,7 +67052,7 @@ mod tests {
             level2_id: "KIND".to_owned(),
         });
         pane.volume = Some(Arc::clone(&pane_volume));
-        pane.frame_history.push(FrameHistoryEntry {
+        pane.engine.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(pane_volume.as_ref()),
             path: PathBuf::from("manual-camera-independent-pane"),
             volume: pane_volume,
@@ -66980,7 +67106,7 @@ mod tests {
             level2_id: "KIND".to_owned(),
         });
         pane.volume = Some(Arc::clone(&pane_volume));
-        pane.frame_history.push(FrameHistoryEntry {
+        pane.engine.history.push(FrameHistoryEntry {
             identity: frame_identity_for_volume(pane_volume.as_ref()),
             path: PathBuf::from("manual-camera-keyframe-independent-pane"),
             volume: pane_volume,
@@ -69024,12 +69150,12 @@ mod tests {
             .extra_panes
             .iter()
             .enumerate()
-            .filter_map(|(slot, pane)| pane.history_playing.then_some(slot))
+            .filter_map(|(slot, pane)| pane.engine.cursor.playing.then_some(slot))
             .collect::<Vec<_>>();
         for slot in playing_slots {
             mark_extra_pane_screen_texture_ready(app, slot);
             if let Some(pane) = app.extra_panes.get_mut(slot) {
-                pane.last_history_step = Some(Instant::now() - Duration::from_secs(5));
+                pane.engine.cursor.last_step = Some(Instant::now() - Duration::from_secs(5));
             }
         }
         app.maybe_advance_extra_pane_history_loops(ctx);

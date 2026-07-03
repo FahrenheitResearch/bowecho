@@ -31,6 +31,15 @@ pub const MIN_HISTORY_FRAME_LIMIT: usize = 3;
 /// decoded) fits. The adoption stage may tune it against telemetry.
 pub const OVERLAY_HISTORY_BYTE_BUDGET: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 
+/// Per-engine byte budget for the PANE role (Phase 4d wiring of census D8).
+/// A pane's working set mirrors the primary's frame limit (the shared-limits
+/// coupling surfaced in `HistoryLimits::pane`), so like the overlay budget
+/// this is a guard rail against pathological growth, not a working limit —
+/// the same "full 40-frame super-res loop must fit" sizing. The primary
+/// itself stays unbudgeted until its own Phase-4e decision, which is why
+/// this is a separate constant and not a fraction of a primary budget.
+pub const PANE_HISTORY_BYTE_BUDGET: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+
 /// Frame-count and byte limits for one engine's history (census D8).
 ///
 /// Invariants:
@@ -68,13 +77,17 @@ impl HistoryLimits {
         }
     }
 
-    /// Limits for an extra pane (Phase 4d): mirrors the primary's limit at
-    /// construction. The legacy pane trim reads the PRIMARY's limit live;
-    /// 4d surfaces that coupling explicitly when panes adopt the engine.
+    /// Limits for an extra pane (Phase 4d, census D8): `frame_limit` is the
+    /// PRIMARY's limit, passed explicitly at `PaneView` construction and
+    /// re-passed at every pane install — the pane FOLLOWS the primary's
+    /// frame limit (the legacy `trim_extra_pane_history` coupling, now a
+    /// visible parameter instead of a silent field read) and never writes
+    /// back to it (each pane normalizes its own copy). The byte budget is
+    /// pane-local ([`PANE_HISTORY_BYTE_BUDGET`]).
     pub fn pane(frame_limit: usize) -> Self {
         Self {
             frame_limit,
-            byte_budget: None,
+            byte_budget: Some(PANE_HISTORY_BYTE_BUDGET),
             grow_to_fit: false,
         }
     }
@@ -204,15 +217,24 @@ mod tests {
     }
 
     /// The role constructors pin where the byte budget is WIRED today:
-    /// overlays get one (Phase 4c), primary/pane do not yet (4d/4e).
+    /// overlays got one at Phase 4c, panes at 4d; the primary stays
+    /// unbudgeted until its own Phase-4e decision.
     #[test]
-    fn overlay_role_gets_a_byte_budget_primary_and_pane_do_not_yet() {
+    fn overlay_and_pane_roles_get_byte_budgets_primary_does_not_yet() {
         assert_eq!(
             HistoryLimits::overlay().byte_budget,
             Some(OVERLAY_HISTORY_BYTE_BUDGET)
         );
         assert_eq!(HistoryLimits::primary(7).byte_budget, None);
-        assert_eq!(HistoryLimits::pane(7).byte_budget, None);
+        assert_eq!(
+            HistoryLimits::pane(7).byte_budget,
+            Some(PANE_HISTORY_BYTE_BUDGET)
+        );
+        assert_eq!(
+            HistoryLimits::pane(7).frame_limit,
+            7,
+            "the pane frame limit IS the primary's, passed explicitly (census D8)"
+        );
         assert_eq!(
             HistoryLimits::overlay().frame_limit,
             MAX_HISTORY_FRAME_LIMIT,

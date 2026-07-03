@@ -37,12 +37,14 @@ pub use frame_history::{
 };
 pub use install::{CrossSiteClear, InstallOutcome, InstallSelection};
 pub use liveness::{
-    CUSTOM_URL_POLL_SECONDS, INTL_POLL_SECONDS, INTL_STALE_CHIP_FLOOR_SECONDS, Liveness,
-    OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS, PRIMARY_LIVE_CHUNK_POLL_SECONDS, stale_floor_seconds,
+    CUSTOM_URL_POLL_SECONDS, INTL_POLL_SECONDS, INTL_STALE_CHIP_FLOOR_SECONDS, LiveAction,
+    Liveness, OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS, PRIMARY_LIVE_CHUNK_POLL_SECONDS,
+    stale_floor_seconds,
 };
 pub use policy::{
     DEFAULT_HISTORY_FRAME_LIMIT, HistoryLimits, MAX_HISTORY_FRAME_LIMIT, MIN_HISTORY_FRAME_LIMIT,
-    OVERLAY_HISTORY_BYTE_BUDGET, SelectionPolicy, estimated_entry_bytes, estimated_volume_bytes,
+    OVERLAY_HISTORY_BYTE_BUDGET, PANE_HISTORY_BYTE_BUDGET, SelectionPolicy, estimated_entry_bytes,
+    estimated_volume_bytes,
 };
 
 use std::time::Instant;

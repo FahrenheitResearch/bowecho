@@ -745,10 +745,10 @@ impl ViewerApp {
                 .get(slot)
                 .map(|pane| {
                     (
-                        pane.selected_frame_index,
+                        pane.engine.cursor.index,
                         pane.cut.unwrap_or(self.selected_cut),
-                        pane.history_playing,
-                        pane.browsing_history,
+                        pane.engine.cursor.playing,
+                        pane.engine.cursor.browsing,
                     )
                 })
                 .unwrap_or((
@@ -805,8 +805,8 @@ impl ViewerApp {
             }
             LoopTimelineTarget::ExtraPane(slot) => {
                 if let Some(pane) = self.extra_panes.get_mut(slot) {
-                    pane.history_playing = false;
-                    pane.browsing_history = true;
+                    pane.engine.cursor.playing = false;
+                    pane.engine.cursor.browsing = true;
                 }
             }
         }
@@ -1196,13 +1196,13 @@ impl ViewerApp {
                 .map(|pane| {
                     recorder
                         .restore_index
-                        .min(pane.frame_history.len().saturating_sub(1))
+                        .min(pane.engine.history.len().saturating_sub(1))
                 })
                 .unwrap_or(0);
             if self
                 .extra_panes
                 .get(slot)
-                .is_some_and(|pane| !pane.frame_history.is_empty())
+                .is_some_and(|pane| !pane.engine.history.is_empty())
             {
                 self.select_extra_pane_history_frame(slot, restore_index, ctx);
                 let can_restore_playing = self.extra_pane_history_loop_can_step(slot);
@@ -1214,8 +1214,8 @@ impl ViewerApp {
                     {
                         Self::set_pane_cut_preserving_texture(pane, recorder.restore_cut);
                     }
-                    pane.history_playing = recorder.restore_playing && can_restore_playing;
-                    pane.browsing_history = if pane.history_playing {
+                    pane.engine.cursor.playing = recorder.restore_playing && can_restore_playing;
+                    pane.engine.cursor.browsing = if pane.engine.cursor.playing {
                         false
                     } else {
                         recorder.restore_browsing

@@ -2100,9 +2100,11 @@ mod tests {
         test_velocity_sails_volume_with_radials, test_viewer_app_with_hazards,
         test_viewport_signature, test_volume_with_site_time,
     };
+    use ui_core::loop_engine::OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS;
+
     use crate::{
-        FrameHistory, OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS, community_feed_site,
-        frame_history_entry_from_decoded, frame_identity_for_volume,
+        FrameHistory, community_feed_site, frame_history_entry_from_decoded,
+        frame_identity_for_volume,
     };
 
     #[test]
@@ -3264,7 +3266,7 @@ mod tests {
             if minutes == 0 {
                 pane.volume = Some(Arc::clone(&volume));
             }
-            pane.frame_history.push(FrameHistoryEntry {
+            pane.engine.history.push(FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
                 path: PathBuf::from(format!("coordinated-independent-window-{minutes}")),
                 volume,
