@@ -22,12 +22,16 @@ use std::path::{Path, PathBuf};
 /// `intl_static_sites(` occurrences) — measured at the Phase-3 migration
 /// commit, re-pinned at the `sites_ui.rs` extraction (site-domain
 /// helpers moved out of main.rs; `sites_ui.rs` is the ONE app_ui module
-/// deliberately allowed to iterate the raw catalogs). Files not listed
-/// must contain ZERO of either.
-const PINNED: [(&str, usize, usize); 4] = [
+/// deliberately allowed to iterate the raw catalogs), re-pinned again at
+/// the Phase-4d `overlays.rs` extraction (the overlay family's four
+/// `self.sites` lookups and one `intl_static_sites()` dispatch moved
+/// VERBATIM out of main.rs — totals unchanged). Files not listed must
+/// contain ZERO of either.
+const PINNED: [(&str, usize, usize); 5] = [
     ("event_explorer.rs", 2, 0),
     ("layers_rail.rs", 2, 2),
-    ("main.rs", 51, 9),
+    ("main.rs", 47, 8),
+    ("overlays.rs", 4, 1),
     ("sites_ui.rs", 2, 3),
 ];
 

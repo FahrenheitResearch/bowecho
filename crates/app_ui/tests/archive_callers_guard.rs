@@ -22,8 +22,15 @@ const GUARDED_SYMBOLS: [&str; 2] = ["level2_objects_for_date", "level2_objects_f
 /// browser's day-listing caller moved there from main.rs. The remaining
 /// main.rs callers are the US loaders the spec keeps unwrapped
 /// (loop-ending-at, event windows, track jumps); event_explorer.rs keeps
-/// its window lookup.
-const ALLOWED_FILES: [&str; 3] = ["archive_browser.rs", "event_explorer.rs", "main.rs"];
+/// its window lookup. The Phase-4d extraction moved the overlay
+/// archive-window worker body (day-listing caller unchanged) VERBATIM
+/// from main.rs into `overlays.rs` — a file move, not a new caller.
+const ALLOWED_FILES: [&str; 4] = [
+    "archive_browser.rs",
+    "event_explorer.rs",
+    "main.rs",
+    "overlays.rs",
+];
 
 fn rust_sources(dir: &Path, files: &mut Vec<PathBuf>) {
     let entries = std::fs::read_dir(dir)
