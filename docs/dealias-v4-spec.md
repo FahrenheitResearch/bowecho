@@ -964,3 +964,19 @@ reflectivity/SNR pre-filtering - apply_reflectivity_gate_filter exists),
 Case E >=99% met or the requirement renegotiated, the C upper-tilt
 volume-total regression fixed, and the no-env degradation chain made
 not-worse-than-hybrid on every case.
+
+
+## 16. Owner decisions (2026-07-02, post-verification)
+
+- **Environmental profiles are CONUS-only: HRRR first, RAP fallback. NO GFS.**
+  International radars run v4 without a profile (the no-env degradation
+  path) or stay on the Region engine - the picker copy must be honest
+  about which anchor a site actually gets. This also means the no-env
+  path's Case-C-class upper-tilt behavior matters for intl users; weigh
+  that when deciding whether v4 is offered for intl sites at wiring time.
+- Wiring order stands as the verifier required: environmental profiles
+  land BEFORE temporal caching, never the reverse.
+- Product direction after v4 wires and survives field use: hybrid is
+  deleted (its temporal idea lives on as v4's prior term), cascade goes
+  with it (its only production consumer is hybrid) - the app returns to
+  TWO engines: Region (fast honest fallback) and v4.
