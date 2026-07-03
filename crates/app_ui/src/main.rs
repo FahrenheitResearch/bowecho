@@ -123,7 +123,6 @@ const HIGH_END_LOOP_RENDER_CACHE_BYTES: usize = 512 * 1024 * 1024;
 /// entire history while playback is paused or running.
 const LOOP_PREWARM_PLAYING_LOOKAHEAD_FRAMES: usize = 24;
 const LOOP_PREWARM_IDLE_LOOKAHEAD_FRAMES: usize = 4;
-const LOOP_PREWARM_RENDER_PANE: usize = usize::MAX;
 const LOOP_PREWARM_INTERACTION_PAUSE_MS: u64 = 250;
 /// While playback is waiting for the selected native-resolution texture, poll
 /// the render worker promptly instead of advancing the timeline past it.
@@ -3702,8 +3701,9 @@ fn spawn_latest_level2_load_worker(
 
 struct AsyncRenderResult {
     key: TextureKey,
-    /// Which view pane requested this render (0 = the primary view).
-    pane: usize,
+    /// Which render lane requested this render (`LaneId::Primary` = the
+    /// primary view; `Pane(n)` = extra pane `n`, 1-based).
+    lane: LaneId,
     result: Result<RenderedTexture, String>,
 }
 
@@ -4462,10 +4462,10 @@ struct PaneContextSnapshot {
 
 struct RenderRequest {
     key: TextureKey,
-    /// Which view pane this render is for (0 = the primary view). The worker
-    /// coalesces queued requests per pane: a newer request replaces the queued
-    /// one for the SAME pane only, so one pane's traffic can't starve another.
-    pane: usize,
+    /// Which render lane this render is for (`ui_core::render_service::LaneId`).
+    /// Queued requests coalesce per lane: a newer request replaces the queued
+    /// one for the SAME lane only, so one lane's traffic can't starve another.
+    lane: LaneId,
     volume: Arc<RadarVolume>,
     /// Strictly older same-site volume used by the hybrid 3-D + temporal
     /// dealiaser. Kept as an Arc so background/prewarm workers never borrow
@@ -4994,6 +4994,19 @@ impl RenderWorkerCachePolicy {
         self.min_entries = self.min_entries.max((pane + 1).min(4));
     }
 
+    /// [`Self::note_pane`] over a render lane, with the LaneId mapping
+    /// (`Primary` = legacy pane 0, `Pane(n)` = legacy pane `n`). Overlay and
+    /// prewarm lanes count as pane 0: their workers render one layer's frame
+    /// at a time and never grow the multi-pane cache floor (pre-4b behavior,
+    /// where overlay requests carried pane 0).
+    fn note_lane(&mut self, lane: LaneId) {
+        let pane = match lane {
+            LaneId::Primary | LaneId::Overlay(_) | LaneId::Prewarm => 0,
+            LaneId::Pane(pane) => usize::from(pane),
+        };
+        self.note_pane(pane);
+    }
+
     fn should_speculatively_warm_sample_cache(&self, rendered: &RenderedTexture) -> bool {
         if self.mode == RenderWorkerCacheMode::Overlay {
             return false;
@@ -5302,7 +5315,7 @@ fn spawn_loop_prewarm_render_workers() -> PrewarmPool<RenderRequest, AsyncRender
         let mut last_direct_viewports: Vec<RenderWorkerViewportSignature> = Vec::new();
         move |request: RenderRequest| {
             let key = request.key.clone();
-            let pane = request.pane;
+            let lane = request.lane;
             let result = ViewerApp::render_viewport_payload(
                 &request,
                 &mut reusable_pixels,
@@ -5313,7 +5326,7 @@ fn spawn_loop_prewarm_render_workers() -> PrewarmPool<RenderRequest, AsyncRender
                 &mut last_direct_viewports,
                 cache_policy,
             );
-            AsyncRenderResult { key, pane, result }
+            AsyncRenderResult { key, lane, result }
         }
     })
 }
@@ -5345,9 +5358,9 @@ fn spawn_render_worker_with_mode(
         let mut sample_caches: Vec<RenderWorkerSampleCache> = Vec::new();
         let mut geometry_caches: Vec<RenderWorkerGeometryCache> = Vec::new();
         let mut last_direct_viewports: Vec<RenderWorkerViewportSignature> = Vec::new();
-        // Queued requests, at most one per pane (newer replaces same-pane).
-        // With a single pane this degenerates to exactly the old newest-only
-        // coalescing; with several panes no pane's request is dropped.
+        // Queued requests, at most one per lane (newer replaces same-lane).
+        // With a single lane this degenerates to exactly the old newest-only
+        // coalescing; with several lanes no lane's request is dropped.
         let mut deferred_requests: VecDeque<RenderRequest> = VecDeque::new();
         loop {
             if deferred_requests.is_empty() {
@@ -5393,8 +5406,8 @@ fn spawn_render_worker_with_mode(
             }
 
             let key = request.key.clone();
-            let pane = request.pane;
-            cache_policy.note_pane(pane);
+            let lane = request.lane;
+            cache_policy.note_lane(lane);
             let result = ViewerApp::render_viewport_payload(
                 &request,
                 &mut reusable_pixels,
@@ -5416,7 +5429,7 @@ fn spawn_render_worker_with_mode(
                 )
             });
             if result_sender
-                .send(AsyncRenderResult { key, pane, result })
+                .send(AsyncRenderResult { key, lane, result })
                 .is_err()
             {
                 break;
@@ -11801,7 +11814,7 @@ impl ViewerApp {
     }
 
     /// `LaneId::Primary` (+ extra panes riding the same channel, routed by
-    /// `message.pane`). Frame budget: each install does a ColorImage
+    /// `message.lane`). Frame budget: each install does a ColorImage
     /// conversion + texture upload (~ms each); with several panes the drain
     /// is no longer one message deep. Spill the rest to the next frame past
     /// the budget.
@@ -11815,7 +11828,7 @@ impl ViewerApp {
             match self.render_receiver.try_recv() {
                 Ok(message) => {
                     budget.note_message();
-                    if message.pane != 0 {
+                    if message.lane != LaneId::Primary {
                         self.install_pane_render_result(ctx, message);
                         continue;
                     }
@@ -11880,7 +11893,7 @@ impl ViewerApp {
                 Ok(message) => {
                     budget.note_message();
                     self.loop_prewarm_inflight.retain(|key| key != &message.key);
-                    if message.pane != LOOP_PREWARM_RENDER_PANE {
+                    if message.lane != LaneId::Prewarm {
                         continue;
                     }
                     let context_matches = self.loop_render_context.as_ref().is_some_and(|ctx| {
@@ -12319,7 +12332,7 @@ impl ViewerApp {
         };
         Some(RenderRequest {
             key,
-            pane: 0,
+            lane: LaneId::Primary,
             volume,
             previous_volume,
             cut,
@@ -12540,7 +12553,7 @@ impl ViewerApp {
             {
                 continue;
             }
-            request.pane = LOOP_PREWARM_RENDER_PANE;
+            request.lane = LaneId::Prewarm;
             let key = request.key.clone();
             if self.loop_prewarm.send(request).is_ok() {
                 self.loop_prewarm_inflight.push(key);
@@ -12706,7 +12719,7 @@ impl ViewerApp {
                 index,
                 RenderRequest {
                     key,
-                    pane: 0,
+                    lane: LaneId::Overlay(layer.id),
                     volume,
                     previous_volume: None,
                     cut,
@@ -12759,10 +12772,10 @@ impl ViewerApp {
     }
 
     /// Merge a request into the worker queue: a newer request replaces the
-    /// queued one for the SAME pane (the old newest-only coalescing,
-    /// per-pane), and never displaces other panes' requests.
+    /// queued one for the SAME lane (the old newest-only coalescing,
+    /// per-lane), and never displaces other lanes' requests.
     fn merge_render_request(queue: &mut VecDeque<RenderRequest>, request: RenderRequest) {
-        if let Some(slot) = queue.iter_mut().find(|queued| queued.pane == request.pane) {
+        if let Some(slot) = queue.iter_mut().find(|queued| queued.lane == request.lane) {
             *slot = request;
         } else {
             queue.push_back(request);
@@ -12770,7 +12783,7 @@ impl ViewerApp {
     }
 
     /// Drain everything currently waiting on the channel into the worker
-    /// queue (per-pane coalescing). Returns whether anything arrived.
+    /// queue (per-lane coalescing). Returns whether anything arrived.
     fn queue_newer_render_requests(
         receiver: &mpsc::Receiver<RenderRequest>,
         queue: &mut VecDeque<RenderRequest>,
@@ -14773,9 +14786,13 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
-    /// Route a render result for an extra pane (1-based index) to its texture.
+    /// Route a render result for an extra pane (`LaneId::Pane(n)`, 1-based)
+    /// to its texture.
     fn install_pane_render_result(&mut self, ctx: &egui::Context, message: AsyncRenderResult) {
-        let Some(pane_slot) = message.pane.checked_sub(1) else {
+        let LaneId::Pane(pane_number) = message.lane else {
+            return;
+        };
+        let Some(pane_slot) = usize::from(pane_number).checked_sub(1) else {
             return;
         };
         if pane_slot >= self.extra_panes.len() {
@@ -14810,7 +14827,7 @@ impl ViewerApp {
                         pane.texture = Some(ctx.load_texture(
                             format!(
                                 "pane{}-{}-{}x{}",
-                                message.pane,
+                                pane_number,
                                 message.key.product.label(),
                                 message.key.viewport.width,
                                 message.key.viewport.height
@@ -14843,6 +14860,11 @@ impl ViewerApp {
     /// volume, geo transform, tilt, and render worker with the primary view.
     fn request_pane_render(&mut self, ctx: &egui::Context, rect: egui::Rect, pane_number: usize) {
         let Some(pane_slot) = pane_number.checked_sub(1) else {
+            return;
+        };
+        // Lane ids are 1-based pane numbers; the grid tops out at 4 panes,
+        // so the u8 conversion cannot fail in practice.
+        let Ok(pane_lane) = u8::try_from(pane_number) else {
             return;
         };
         let Some(volume) = self.extra_pane_display_volume(pane_slot) else {
@@ -14953,7 +14975,7 @@ impl ViewerApp {
             .unwrap_or(DEFAULT_RADAR_RANGE_KM);
         let request = RenderRequest {
             key: key.clone(),
-            pane: pane_number,
+            lane: LaneId::Pane(pane_lane),
             volume,
             previous_volume,
             cut,
@@ -54157,7 +54179,7 @@ mod tests {
                     gate_filter_decidbz: i16::MIN,
                     viewport: test_viewport_key(320, 240),
                 },
-                pane: 0,
+                lane: LaneId::Primary,
                 volume,
                 previous_volume: None,
                 cut: 0,
@@ -54588,7 +54610,7 @@ mod tests {
                 gate_filter_decidbz: i16::MIN,
                 viewport: viewport_key,
             },
-            pane: 0,
+            lane: LaneId::Primary,
             volume,
             previous_volume: None,
             cut,
@@ -55183,7 +55205,7 @@ mod tests {
                 gate_filter_decidbz: i16::MIN,
                 viewport: test_viewport_key(1320, 820),
             },
-            pane: 0,
+            lane: LaneId::Primary,
             volume,
             previous_volume: None,
             cut: 0,
@@ -71334,6 +71356,20 @@ mod tests {
         let mut overlay = test_overlay_cache_policy(12);
         overlay.note_pane(3);
         assert_eq!(overlay.sample_cache_capacity(), 1);
+    }
+
+    #[test]
+    fn note_lane_maps_lanes_onto_the_legacy_pane_floor() {
+        // Pane(n) grows the multi-pane cache floor exactly like the legacy
+        // nonzero pane id n; Primary/Overlay/Prewarm are legacy pane 0 (the
+        // floor stays at the single-pane minimum).
+        let mut policy = test_cache_policy(12);
+        policy.note_lane(LaneId::Primary);
+        policy.note_lane(LaneId::Overlay(7));
+        policy.note_lane(LaneId::Prewarm);
+        assert_eq!(policy.min_entries, 1);
+        policy.note_lane(LaneId::Pane(3));
+        assert_eq!(policy.min_entries, 4);
     }
 
     fn test_rendered_texture_with_size(
