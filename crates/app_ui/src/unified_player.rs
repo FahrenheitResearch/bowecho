@@ -11,6 +11,9 @@ pub(crate) struct UnifiedPlayerState {
     pub(crate) end_date_input: String,
     pub(crate) end_hour_input: String,
     pub(crate) end_minute_input: String,
+    /// The ARCHIVE popover's site override (live_archive_bar.rs). Scoped
+    /// to one popover session: empty = load the currently loaded radar.
+    pub(crate) archive_site_input: String,
     pub(crate) coordinated_sites_input: String,
     pub(crate) coordinated_site_radius_km: f32,
     status: String,
@@ -120,6 +123,7 @@ impl Default for UnifiedPlayerState {
             end_date_input: String::new(),
             end_hour_input: String::new(),
             end_minute_input: String::new(),
+            archive_site_input: String::new(),
             coordinated_sites_input: String::new(),
             coordinated_site_radius_km: 230.0,
             status: String::new(),

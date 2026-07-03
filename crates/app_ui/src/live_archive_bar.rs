@@ -25,6 +25,7 @@
 //! `maybe_auto_sync_timeline_warnings` reconciliation.
 
 use chrono::{DateTime, Utc};
+use data_source::sites::SiteRef;
 use eframe::egui;
 
 use crate::LIVE_COLOR;
@@ -151,6 +152,53 @@ pub(crate) fn sweep_quick_mode_player_actions(mode: SweepQuickMode) -> Vec<Unifi
     }
 }
 
+/// The ARCHIVE popover's typed site override, resolved against the US
+/// Level-II catalog by [`typed_site_status`]. Scope is deliberately
+/// US-only: international archive loads need a provider and stay on the
+/// loaded-radar path (click the site first).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TypedSiteStatus {
+    /// Field empty, or it names the current US display owner: the load
+    /// follows the loaded radar — today's behavior, the 90% case.
+    FollowsOwner,
+    /// A US catalog site different from the display owner: the load
+    /// switches to it first, through the same path as a site-search
+    /// pick (which releases an intl display owner correctly).
+    ValidUs { level2_id: String },
+    /// Not in the US catalog: Load is disabled with this input echoed
+    /// in the reason.
+    Unknown { input: String },
+}
+
+/// Resolve the popover's typed site field against the ONE union catalog
+/// (`data_source::sites::resolve` — the Phase-3 rule; never iterate the
+/// raw site list). `us_owner_id` is the display owner's Level-II ID
+/// when a US site owns the display, `None` when an international site
+/// does (any valid typed US ID is then a switch).
+pub(crate) fn typed_site_status(input: &str, us_owner_id: Option<&str>) -> TypedSiteStatus {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return TypedSiteStatus::FollowsOwner;
+    }
+    if us_owner_id.is_some_and(|owner| owner.eq_ignore_ascii_case(trimmed)) {
+        return TypedSiteStatus::FollowsOwner;
+    }
+    match data_source::sites::resolve(&SiteRef::Us {
+        level2_id: trimmed.to_owned(),
+    }) {
+        Some(record) => match record.site {
+            SiteRef::Us { level2_id } => TypedSiteStatus::ValidUs { level2_id },
+            // A Us probe only resolves to a Us record; refuse defensively.
+            SiteRef::Intl { .. } => TypedSiteStatus::Unknown {
+                input: trimmed.to_owned(),
+            },
+        },
+        None => TypedSiteStatus::Unknown {
+            input: trimmed.to_owned(),
+        },
+    }
+}
+
 /// Everything the bar renders from — assembled read-only by
 /// `ViewerApp::live_archive_bar_context`.
 pub(crate) struct LiveArchiveBarContext {
@@ -168,6 +216,13 @@ pub(crate) struct LiveArchiveBarContext {
     pub(crate) frames_max: usize,
     /// Popover end-time seed: displayed frame time, else now.
     pub(crate) default_end_utc: DateTime<Utc>,
+    /// Hint shown in the empty site field: the display owner's ID
+    /// (an empty field means "that radar").
+    pub(crate) owner_site_hint: String,
+    /// The typed site-override verdict — derived by the SAME rule the
+    /// dispatch re-applies ([`typed_site_status`]), so button state and
+    /// load behavior cannot disagree.
+    pub(crate) typed_site: TypedSiteStatus,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,50 +287,88 @@ pub(crate) fn bar_ui(
     } else {
         egui::RichText::new("ARCHIVE ▾")
     };
-    ui.menu_button(archive_text, |ui| {
-        ui.set_min_width(240.0);
-        ui.label(egui::RichText::new("Loop ending at (UTC)").strong());
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut player.end_date_input)
-                    .desired_width(88.0)
-                    .hint_text("YYYY-MM-DD"),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut player.end_hour_input)
-                    .desired_width(26.0)
-                    .hint_text("HH"),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut player.end_minute_input)
-                    .desired_width(26.0)
-                    .hint_text("MM"),
-            );
-        });
-        ui.horizontal(|ui| {
-            ui.label("Frames");
-            let mut frames = context.frames;
-            if ui
-                .add(
-                    egui::DragValue::new(&mut frames)
-                        .range(1..=context.frames_max)
-                        .speed(1.0),
+    // The popover holds text fields, so it must NOT use the default menu
+    // close behavior (CloseOnClick): egui closes such a menu on any
+    // click INSIDE it too, and a click into a TextEdit counts — the
+    // popup vanished the moment you clicked a field (only drag-selecting
+    // text survived, because a drag is not a click). CloseOnClickOutside
+    // keeps it open while editing; Load/Browse still close it
+    // explicitly via `ui.close()`.
+    let (archive_button, archive_menu) = egui::containers::menu::MenuButton::new(archive_text)
+        .config(
+            egui::containers::menu::MenuConfig::new()
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+        )
+        .ui(ui, |ui| {
+            ui.set_min_width(240.0);
+            ui.label(egui::RichText::new("Loop ending at (UTC)").strong());
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut player.end_date_input)
+                        .desired_width(88.0)
+                        .hint_text("YYYY-MM-DD"),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut player.end_hour_input)
+                        .desired_width(26.0)
+                        .hint_text("HH"),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut player.end_minute_input)
+                        .desired_width(26.0)
+                        .hint_text("MM"),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Site");
+                ui.add(
+                    egui::TextEdit::singleline(&mut player.archive_site_input)
+                        .desired_width(56.0)
+                        .hint_text(context.owner_site_hint.as_str()),
                 )
-                .on_hover_text("Loop length: scans ending at the time above")
-                .changed()
-            {
-                action = Some(LiveArchiveBarAction::SetFrames(frames));
-            }
-        });
-        match context.archive_reason {
-            Some(reason) => {
+                .on_hover_text(
+                    "Which radar to load. Empty = the loaded radar; type a \
+                     US site ID (KEAX, TOKC, …) to load a different one.",
+                );
+                ui.label("Frames");
+                let mut frames = context.frames;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut frames)
+                            .range(1..=context.frames_max)
+                            .speed(1.0),
+                    )
+                    .on_hover_text("Loop length: scans ending at the time above")
+                    .changed()
+                {
+                    action = Some(LiveArchiveBarAction::SetFrames(frames));
+                }
+            });
+            // Three honest Load states: an unknown typed site refuses
+            // with the input echoed; the owner's derived no-archive
+            // reason (spec §1.3) gates ONLY loads that follow the owner
+            // — a valid typed US site always has the Level-II archive.
+            let typed_unknown_reason = match &context.typed_site {
+                TypedSiteStatus::Unknown { input } => {
+                    Some(format!("{input} is not in the US site catalog"))
+                }
+                TypedSiteStatus::FollowsOwner | TypedSiteStatus::ValidUs { .. } => None,
+            };
+            let owner_reason = match &context.typed_site {
+                TypedSiteStatus::FollowsOwner => context.archive_reason,
+                TypedSiteStatus::ValidUs { .. } | TypedSiteStatus::Unknown { .. } => None,
+            };
+            if let Some(reason) = typed_unknown_reason {
+                ui.add_enabled(false, egui::Button::new("Load archive loop"))
+                    .on_disabled_hover_text(&reason);
+                ui.weak(&reason);
+            } else if let Some(reason) = owner_reason {
                 // Honest grey (spec §1.3): the derived capability reason
                 // IS the disabled explanation.
                 ui.add_enabled(false, egui::Button::new("Load archive loop"))
                     .on_disabled_hover_text(reason);
                 ui.weak(reason);
-            }
-            None => {
+            } else {
                 let load = ui
                     .add_enabled(!context.load_busy, egui::Button::new("Load archive loop"))
                     .on_hover_text(
@@ -288,23 +381,27 @@ pub(crate) fn bar_ui(
                     ui.close();
                 }
             }
-        }
-        ui.separator();
-        if ui
-            .button("Browse archive days…")
-            .on_hover_text(
-                "The full archive browser (Data tab): day listings, hour chips, \
-                 tornado-report jumps",
-            )
-            .clicked()
-        {
-            action = Some(LiveArchiveBarAction::BrowseArchiveDays);
-            ui.close();
-        }
-        ui.weak(&context.owner_label);
-    })
-    .response
-    .on_hover_text("Load a fixed past loop for the current radar");
+            ui.separator();
+            if ui
+                .button("Browse archive days…")
+                .on_hover_text(
+                    "The full archive browser (Data tab): day listings, hour chips, \
+                     tornado-report jumps",
+                )
+                .clicked()
+            {
+                action = Some(LiveArchiveBarAction::BrowseArchiveDays);
+                ui.close();
+            }
+            ui.weak(&context.owner_label);
+        });
+    archive_button.on_hover_text("Load a fixed past loop for the current radar");
+    if archive_menu.is_none() {
+        // Popover closed: the site override is popover-scoped — an
+        // empty field follows whatever radar is loaded (the 90% case),
+        // so leftover text must not silently redirect a later load.
+        player.archive_site_input.clear();
+    }
 
     ui.menu_button("Sweeps ▾", |ui| {
         ui.set_min_width(200.0);
@@ -363,7 +460,6 @@ use crate::{
     FeedSource, LowSweepLoopFilter, MAX_HISTORY_FRAME_LIMIT, SidebarTab, ViewerApp,
     archive_browser, dock,
 };
-use data_source::sites::SiteRef;
 
 impl ViewerApp {
     // -----------------------------------------------------------------
@@ -406,7 +502,26 @@ impl ViewerApp {
             frames: self.primary.limits.frame_limit,
             frames_max: MAX_HISTORY_FRAME_LIMIT,
             default_end_utc: self.displayed_timeline_time_utc().unwrap_or_else(Utc::now),
+            owner_site_hint: match self.display_owner_site() {
+                SiteRef::Us { level2_id } => level2_id,
+                SiteRef::Intl { site_id, .. } => site_id,
+            },
+            typed_site: self.live_archive_bar_typed_site(),
         }
+    }
+
+    /// The popover's typed site override, resolved against the catalog —
+    /// used by the context (button state) AND the dispatch (load
+    /// behavior), so the two cannot disagree.
+    fn live_archive_bar_typed_site(&self) -> TypedSiteStatus {
+        let us_owner_id = match self.display_owner_site() {
+            SiteRef::Us { level2_id } => Some(level2_id),
+            SiteRef::Intl { .. } => None,
+        };
+        typed_site_status(
+            &self.unified_player.archive_site_input,
+            us_owner_id.as_deref(),
+        )
     }
 
     pub(crate) fn live_archive_bar_ui(&mut self, ui: &mut egui::Ui) {
@@ -427,6 +542,21 @@ impl ViewerApp {
     fn arm_live_archive_bar_sync_defaults(&mut self) {
         self.unified_player.auto_sync_warnings = true;
         self.arm_unified_player_timeline_warning_sync();
+    }
+
+    /// The bar's ARCHIVE load tail: arm the sync defaults, run the
+    /// player's "Loop Ending At" dispatch verbatim (US Level-II, ORD's
+    /// edge-preserving loader, the generic provider-archive arm, and
+    /// the honest-grey reason all live there already), and mirror the
+    /// player's feedback into the global status bar — the player window
+    /// may be closed while the bar drives it.
+    fn load_archive_ending_at_from_bar(&mut self, ctx: &egui::Context) {
+        self.arm_live_archive_bar_sync_defaults();
+        self.load_archive_loop_ending_at_for_unified_player(ctx);
+        let player_status = self.unified_player.status_text().to_owned();
+        if !player_status.is_empty() {
+            self.status = player_status;
+        }
     }
 
     /// One-click LIVE (spec Phase 5): re-arm the display owner's live
@@ -483,17 +613,26 @@ impl ViewerApp {
                 self.go_live_from_bar(ctx);
             }
             Some(LiveArchiveBarAction::LoadArchiveEndingAt) => {
-                self.arm_live_archive_bar_sync_defaults();
-                // The player's "Loop Ending At" dispatch, verbatim: US
-                // Level-II, ORD's edge-preserving loader, the generic
-                // provider-archive arm, and the honest-grey reason all
-                // live there already.
-                self.load_archive_loop_ending_at_for_unified_player(ctx);
-                // The player window may be closed while the bar drives
-                // it: mirror its feedback into the global status bar.
-                let player_status = self.unified_player.status_text().to_owned();
-                if !player_status.is_empty() {
-                    self.status = player_status;
+                match self.live_archive_bar_typed_site() {
+                    TypedSiteStatus::Unknown { input } => {
+                        // Unreachable through the UI (the Load button
+                        // greys), but the dispatch stays honest on its
+                        // own: refuse rather than load the wrong radar.
+                        self.status = format!("{input} is not in the US site catalog");
+                    }
+                    TypedSiteStatus::ValidUs { level2_id } => {
+                        // Switch first, through the SAME path as a
+                        // site-search pick (it releases an intl display
+                        // owner correctly), then load. The override is
+                        // one-shot: the field clears, and the loaded
+                        // radar IS this site afterwards.
+                        self.activate_site_search_pick(&SiteRef::Us { level2_id }, None, ctx);
+                        self.unified_player.archive_site_input.clear();
+                        self.load_archive_ending_at_from_bar(ctx);
+                    }
+                    TypedSiteStatus::FollowsOwner => {
+                        self.load_archive_ending_at_from_bar(ctx);
+                    }
                 }
             }
             Some(LiveArchiveBarAction::SetFrames(frames)) => {
@@ -711,6 +850,112 @@ mod tests {
             "player feedback mirrors into the global status bar: {}",
             app.status
         );
+    }
+
+    /// The typed site override resolves by one pure rule against the
+    /// union catalog (empty or owner-matching input follows the loaded
+    /// radar; a catalog match is a switch, canonical-cased; anything
+    /// else is refused) — the same rule gates the Load button and the
+    /// dispatch.
+    #[test]
+    fn typed_site_override_resolution_table() {
+        assert_eq!(
+            typed_site_status("", Some("KTLX")),
+            TypedSiteStatus::FollowsOwner,
+            "empty follows the loaded radar"
+        );
+        assert_eq!(
+            typed_site_status("  ktlx ", Some("KTLX")),
+            TypedSiteStatus::FollowsOwner,
+            "naming the owner (any case) is not a switch"
+        );
+        assert_eq!(
+            typed_site_status(" keax ", Some("KTLX")),
+            TypedSiteStatus::ValidUs {
+                level2_id: "KEAX".to_owned()
+            },
+            "a catalog match resolves to the canonical ID"
+        );
+        assert_eq!(
+            typed_site_status("ktlx", None),
+            TypedSiteStatus::ValidUs {
+                level2_id: "KTLX".to_owned()
+            },
+            "with an intl display owner, any valid US ID is a switch"
+        );
+        assert_eq!(
+            typed_site_status("XXXX", Some("KTLX")),
+            TypedSiteStatus::Unknown {
+                input: "XXXX".to_owned()
+            },
+            "unknown IDs are refused, echoing the input"
+        );
+    }
+
+    /// Typing an adjacent radar into the ARCHIVE popover switches the
+    /// selection FIRST — through the same path as a site-search pick —
+    /// then runs the normal archive load for it; the override is
+    /// one-shot (the field clears). Empty end-time inputs keep the load
+    /// on its validation error, so no worker spawns.
+    #[test]
+    fn typed_site_archive_load_switches_the_site_first() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![RadarSite::new("KTLX"), RadarSite::new("KEAX")];
+        app.selected_site_index = 0;
+        app.unified_player.archive_site_input = "keax".to_owned();
+
+        app.handle_live_archive_bar_action(
+            Some(LiveArchiveBarAction::LoadArchiveEndingAt),
+            &egui::Context::default(),
+        );
+
+        assert_eq!(
+            app.selected_site().map(|site| site.level2_id.clone()),
+            Some("KEAX".to_owned()),
+            "the load targets the typed site"
+        );
+        assert!(
+            app.unified_player.archive_site_input.is_empty(),
+            "the override is one-shot"
+        );
+        assert!(
+            app.unified_player.auto_sync_warnings,
+            "the archive entry still arms the sync defaults"
+        );
+        assert!(app.load_receiver.is_none(), "invalid inputs spawn nothing");
+        assert!(
+            app.status.contains("End date must be YYYY-MM-DD"),
+            "the load ran (and failed validation) for the new site: {}",
+            app.status
+        );
+    }
+
+    /// An unknown typed site refuses the load outright — no site
+    /// switch, no worker, no archive-mode side effects — with the input
+    /// echoed honestly in the status bar.
+    #[test]
+    fn typed_site_archive_load_refuses_an_unknown_site() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sites = vec![RadarSite::new("KTLX")];
+        app.selected_site_index = 0;
+        app.unified_player.archive_site_input = "XXXX".to_owned();
+
+        app.handle_live_archive_bar_action(
+            Some(LiveArchiveBarAction::LoadArchiveEndingAt),
+            &egui::Context::default(),
+        );
+
+        assert_eq!(
+            app.selected_site().map(|site| site.level2_id.clone()),
+            Some("KTLX".to_owned()),
+            "no switch"
+        );
+        assert!(app.load_receiver.is_none(), "no load spawns");
+        assert!(
+            !app.unified_player.auto_sync_warnings,
+            "a refused load does not enter archive mode"
+        );
+        assert_eq!(app.status, "XXXX is not in the US site catalog");
     }
 
     /// §12b owner decision 5, the LIVE arm: one click re-arms the intl
