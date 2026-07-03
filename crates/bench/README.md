@@ -97,12 +97,16 @@ over `mean` when the machine is noisy.
 ## Dealias eval battery (`--dealias`)
 
 The second mode runs the dealias-engine battery from
-`docs/dealias-v4-spec.md` §10: every engine (region / cascade / hybrid /
-v4 / v4-noenv) on one case volume, with residual fold-boundary pairs,
+`docs/dealias-v4-spec.md` §10: every engine (region / v4 / v4-noenv) on
+one case volume, with residual fold-boundary pairs,
 reference RMS (environmental + Browning & Wexler harmonic), % gates
 branch-modified, isolated speck count, 5×5-gate branch spot-checks,
 best-of-N runtime, and a two-run byte-identical determinism gate
 (nonzero exit on drift).
+
+The `cascade` and `hybrid` engines (and their battery arms) were removed
+at v0.29.0 (dealias-v4 spec §16); `docs/dealias-v4-baselines.json` keeps
+their historical rows.
 
 ```
 bowecho-bench --dealias --target KEAX20260609_055143_V06 \

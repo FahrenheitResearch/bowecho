@@ -63,11 +63,12 @@ use super_regions::{SUPERREGION_MIN_GATES, TiltSuperRegions, build_super_regions
 
 /// Temporal priors older than this are more likely to represent a different
 /// storm structure than a useful continuity constraint (same constant as the
-/// hybrid engine).
+/// retired hybrid engine, removed at v0.29.0).
 const TEMPORAL_MAX_AGE_SECONDS: i64 = 15 * 60;
 /// Match the same nominal elevation between consecutive volumes.
 const TEMPORAL_ELEVATION_TOLERANCE_DEG: f32 = 0.40;
-/// Reject physically implausible reference samples (same as hybrid).
+/// Reject physically implausible reference samples (same as the retired
+/// hybrid engine).
 const MAX_REFERENCE_ABS_VELOCITY_MPS: f32 = 160.0;
 /// Temporal reference gates below this confidence (≈ 64/255, the
 /// "interior-consistent only" level) fall through to vertical/environmental
@@ -289,7 +290,8 @@ pub fn dealias_volume_v4(
     }
 }
 
-/// Drop-in per-cut convenience mirroring `dealias_velocity_grid_hybrid`.
+/// Drop-in per-cut convenience mirroring the retired
+/// `dealias_velocity_grid_hybrid` signature (removed at v0.29.0).
 /// Runs the volume solve internally — callers that need more than one tilt
 /// should hold a [`V4VolumeSolution`] instead (one solve serves all tilts).
 pub fn dealias_velocity_grid_v4(

@@ -4,7 +4,7 @@
 // raw==dealiased positive amid negatives is a missed unfold.
 // usage: dealias_blob_probe <l2-file>
 use radar_core::{MomentType, RadarVolume};
-use render2d::{dealias_velocity_grid, dealias_velocity_grid_cascade};
+use render2d::dealias_velocity_grid;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).ok_or("usage: <l2>")?;
@@ -18,12 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .min_by(|a, b| a.1.elevation_deg.total_cmp(&b.1.elevation_deg))
         .ok_or("no velocity")?;
     let velocity = cut.moments.get(&MomentType::Velocity).unwrap();
-    let dealiased = if std::env::var_os("BOWECHO_CASCADE").is_some() {
-        eprintln!("(cascade engine)");
-        dealias_velocity_grid_cascade(&volume, index).expect("cascade")
-    } else {
-        dealias_velocity_grid(cut, velocity)
-    };
+    let dealiased = dealias_velocity_grid(cut, velocity);
     let rows = dealiased.radial_count();
     let gates = dealiased.gate_range.gate_count;
     let spacing = dealiased.gate_range.gate_spacing_m.max(1) as f64;

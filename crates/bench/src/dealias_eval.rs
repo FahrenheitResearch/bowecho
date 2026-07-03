@@ -1,8 +1,11 @@
 //! `--dealias` mode: the dealias-engine eval battery (dealias-v4 spec §10).
 //!
-//! Runs every requested engine (region / cascade / hybrid / v4 / v4-noenv)
-//! on one target volume (+ optional temporal-prior volume + optional
-//! environmental-wind fixture) and prints the §10.2 metric set per engine:
+//! Runs every requested engine (region / v4 / v4-noenv) on one target volume
+//! (+ optional temporal-prior volume + optional environmental-wind fixture)
+//! and prints the §10.2 metric set per engine. The `cascade` and `hybrid`
+//! battery arms were removed at v0.29.0 with the engines themselves
+//! (dealias-v4 spec §16); `docs/dealias-v4-baselines.json` keeps their
+//! historical rows for the record:
 //!
 //! 1. residual fold-boundary pairs (lowest velocity tilt + volume total) —
 //!    adjacent finite 4-neighbor pairs, azimuth wrap seam included, with
@@ -34,8 +37,7 @@ use chrono::{DateTime, Utc};
 use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType, RadarVolume};
 use render2d::{
     EnvWindLevel, EnvironmentalWindProfile, TemporalPrior, dealias_velocity_grid,
-    dealias_velocity_grid_cascade, dealias_velocity_grid_hybrid, dealias_volume_v4,
-    fit_range_band_reference, project_environmental_winds,
+    dealias_volume_v4, fit_range_band_reference, project_environmental_winds,
 };
 
 pub const DEALIAS_USAGE: &str = "usage: bowecho-bench --dealias --target <vol> [options]
@@ -43,7 +45,7 @@ pub const DEALIAS_USAGE: &str = "usage: bowecho-bench --dealias --target <vol> [
   --target <file>        Level-II target volume (required)
   --prior <file>         previous volume for the temporal prior
   --env <file.json>      EnvironmentalWindProfile fixture
-  --engines a,b,c        subset of region,cascade,hybrid,v4,v4-noenv
+  --engines a,b,c        subset of region,v4,v4-noenv
   --probe az,km[,label]  5x5-gate mean spot check (repeatable)
   --rewrap <N>           synthetic low-Nyquist Case E at Nyquist N m/s
   --iters <K>            timing iterations per engine (default 3, best-of)
@@ -63,8 +65,6 @@ const DEFAULT_ITERS: usize = 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
     Region,
-    Cascade,
-    Hybrid,
     V4,
     V4NoEnv,
 }
@@ -73,8 +73,6 @@ impl Engine {
     fn name(self) -> &'static str {
         match self {
             Engine::Region => "region",
-            Engine::Cascade => "cascade",
-            Engine::Hybrid => "hybrid",
             Engine::V4 => "v4",
             Engine::V4NoEnv => "v4-noenv",
         }
@@ -83,22 +81,18 @@ impl Engine {
     fn parse(name: &str) -> Result<Self, String> {
         match name {
             "region" => Ok(Engine::Region),
-            "cascade" => Ok(Engine::Cascade),
-            "hybrid" => Ok(Engine::Hybrid),
             "v4" => Ok(Engine::V4),
             "v4-noenv" => Ok(Engine::V4NoEnv),
+            "cascade" | "hybrid" => Err(format!(
+                "engine {name:?} was removed at v0.29.0 (dealias-v4 spec §16); \
+                 docs/dealias-v4-baselines.json keeps its historical rows"
+            )),
             other => Err(format!("unknown engine {other:?}")),
         }
     }
 }
 
-const ALL_ENGINES: [Engine; 5] = [
-    Engine::Region,
-    Engine::Cascade,
-    Engine::Hybrid,
-    Engine::V4,
-    Engine::V4NoEnv,
-];
+const ALL_ENGINES: [Engine; 3] = [Engine::Region, Engine::V4, Engine::V4NoEnv];
 
 #[derive(Clone, Debug)]
 pub struct Probe {
@@ -788,7 +782,6 @@ struct EngineRun {
 fn run_engine(
     engine: Engine,
     volume: &RadarVolume,
-    prior: Option<&RadarVolume>,
     priors: &PriorSolutions,
     environment: Option<&EnvironmentalWindProfile>,
 ) -> EngineRun {
@@ -821,7 +814,7 @@ fn run_engine(
                 diagnostics: Some(solution.diagnostics().clone()),
             }
         }
-        Engine::Region | Engine::Cascade | Engine::Hybrid => {
+        Engine::Region => {
             let mut grids = Vec::with_capacity(cuts.len());
             let mut volume_ms = 0.0;
             let mut worst_tilt_ms = 0.0f64;
@@ -830,12 +823,7 @@ fn run_engine(
                 let cut = &volume.cuts[cut_index];
                 let grid = cut.moments.get(&MomentType::Velocity).expect("velocity");
                 let started = Instant::now();
-                let output = match engine {
-                    Engine::Region => Some(dealias_velocity_grid(cut, grid)),
-                    Engine::Cascade => dealias_velocity_grid_cascade(volume, cut_index),
-                    Engine::Hybrid => dealias_velocity_grid_hybrid(volume, cut_index, prior),
-                    _ => unreachable!(),
-                };
+                let output = Some(dealias_velocity_grid(cut, grid));
                 let elapsed = started.elapsed().as_secs_f64() * 1000.0;
                 volume_ms += elapsed;
                 let superres = grid.radial_count() >= 600;
@@ -891,7 +879,6 @@ struct PriorSolutions {
 fn evaluate_engine(
     engine: Engine,
     volume: &RadarVolume,
-    prior: Option<&RadarVolume>,
     priors: &PriorSolutions,
     environment: Option<&EnvironmentalWindProfile>,
     probes: &[Probe],
@@ -904,7 +891,7 @@ fn evaluate_engine(
     // Timing: best-of-N.
     let mut best: Option<EngineRun> = None;
     for _ in 0..iters.max(1) {
-        let run = run_engine(engine, volume, prior, priors, environment);
+        let run = run_engine(engine, volume, priors, environment);
         if best
             .as_ref()
             .is_none_or(|current| run.volume_ms < current.volume_ms)
@@ -914,7 +901,7 @@ fn evaluate_engine(
     }
     let timed = best.expect("at least one run");
     // Determinism: one more run, byte-compare all grids.
-    let second = run_engine(engine, volume, prior, priors, environment);
+    let second = run_engine(engine, volume, priors, environment);
     let deterministic =
         timed
             .grids
@@ -1092,8 +1079,7 @@ pub fn run_dealias(args: &DealiasArgs) -> Result<bool, String> {
     let profile = environment.as_ref().map(|(profile, _)| profile);
 
     // Pre-solve the temporal prior ONCE per env variant with v4 (the app
-    // flow caches the previous solution); hybrid receives the bare volume
-    // as it always has.
+    // flow caches the previous solution).
     let priors = PriorSolutions {
         with_env: prior_volume
             .as_ref()
@@ -1106,31 +1092,26 @@ pub fn run_dealias(args: &DealiasArgs) -> Result<bool, String> {
     let lowest = lowest_velocity_cut(&volume).ok_or("volume has no velocity cut")?;
 
     // Case E: replace the working volume with the rewrapped single tilt.
-    let (volume, prior_volume, priors, truth): (
-        RadarVolume,
-        Option<RadarVolume>,
-        PriorSolutions,
-        Option<Vec<f32>>,
-    ) = if let Some(nyquist) = args.rewrap {
-        let truth_solution = dealias_volume_v4(
-            &volume,
-            priors.with_env.as_ref().map(TemporalPrior::Solution),
-            profile,
-        );
-        let truth_grid = truth_solution
-            .tilt_grid(lowest)
-            .ok_or("v4 produced no grid for the lowest velocity cut")?;
-        let truth_field = decode_field(&volume.cuts[lowest], truth_grid);
-        let synthetic = build_rewrapped_volume(&volume, lowest, &truth_field.values, nyquist);
-        (
-            synthetic,
-            None,
-            PriorSolutions::default(),
-            Some(truth_field.values),
-        )
-    } else {
-        (volume, prior_volume, priors, None)
-    };
+    let (volume, priors, truth): (RadarVolume, PriorSolutions, Option<Vec<f32>>) =
+        if let Some(nyquist) = args.rewrap {
+            let truth_solution = dealias_volume_v4(
+                &volume,
+                priors.with_env.as_ref().map(TemporalPrior::Solution),
+                profile,
+            );
+            let truth_grid = truth_solution
+                .tilt_grid(lowest)
+                .ok_or("v4 produced no grid for the lowest velocity cut")?;
+            let truth_field = decode_field(&volume.cuts[lowest], truth_grid);
+            let synthetic = build_rewrapped_volume(&volume, lowest, &truth_field.values, nyquist);
+            (
+                synthetic,
+                PriorSolutions::default(),
+                Some(truth_field.values),
+            )
+        } else {
+            (volume, priors, None)
+        };
 
     // Field dumps for the external (Python) metric-parity harness.  A
     // dedicated pass: every engine here is deterministic (enforced below),
@@ -1159,7 +1140,7 @@ pub fn run_dealias(args: &DealiasArgs) -> Result<bool, String> {
             }
         }
         for &engine in &args.engines {
-            let run = run_engine(engine, &volume, prior_volume.as_ref(), &priors, profile);
+            let run = run_engine(engine, &volume, &priors, profile);
             for (slot, &cut_index) in cuts.iter().enumerate() {
                 let Some(grid) = run.grids[slot].as_ref() else {
                     continue;
@@ -1186,7 +1167,6 @@ pub fn run_dealias(args: &DealiasArgs) -> Result<bool, String> {
         let report = evaluate_engine(
             engine,
             &volume,
-            prior_volume.as_ref(),
             &priors,
             profile,
             &args.probes,

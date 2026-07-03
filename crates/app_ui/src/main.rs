@@ -20,15 +20,16 @@ use data_source::{LEVEL2_ARCHIVE_BUCKET, RadarSite, RealtimeChunkType};
 use eframe::egui;
 use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType, RadarVolume};
 use render2d::{
-    CrossSectionSmoothing, ECHO_TOP_THRESHOLD_DBZ, StormCell, StormMotion,
-    StormRelativePaletteCache, StormTrack, StormTracker, TIME_GATE_S, ViewportGeometryCache,
-    ViewportMomentCache, ViewportRasterOptions, ViewportSampleCache, VolumeDealiasCache,
-    apply_reflectivity_gate_filter, azimuthal_shear_grid, color_family_for_moment,
-    composite_reflectivity_grid, dealias_velocity_grid, dealias_velocity_grid_hybrid,
-    detect_rotation_sites, echo_top_grid, gust_proxy_grid, hail_grids, identify_storm_cells,
-    marc_grid, mehs_grid, moment_cross_section_with_smoothing, poh_grid, radial_divergence_grid,
-    reflectivity_cross_section_with_smoothing, smooth_moment_grid, storm_relative_velocity_mps,
-    upsample_moment_grid, velocity_cross_section_cached_with_smoothing, viewport_rgba_buffer_len,
+    CrossSectionSmoothing, ECHO_TOP_THRESHOLD_DBZ, EnvironmentalWindProfile, StormCell,
+    StormMotion, StormRelativePaletteCache, StormTrack, StormTracker, TIME_GATE_S,
+    ViewportGeometryCache, ViewportMomentCache, ViewportRasterOptions, ViewportSampleCache,
+    VolumeDealiasCache, apply_reflectivity_gate_filter, azimuthal_shear_grid,
+    color_family_for_moment, composite_reflectivity_grid, dealias_velocity_grid,
+    dealias_velocity_grid_v4, detect_rotation_sites, echo_top_grid, gust_proxy_grid, hail_grids,
+    identify_storm_cells, marc_grid, mehs_grid, moment_cross_section_with_smoothing, poh_grid,
+    radial_divergence_grid, reflectivity_cross_section_with_smoothing, smooth_moment_grid,
+    storm_relative_velocity_mps, upsample_moment_grid,
+    velocity_cross_section_cached_with_smoothing, viewport_rgba_buffer_len,
     viewport_sample_cache_storage_upper_bound, vil_density_grid, vil_grid,
 };
 use serde::Deserialize;
@@ -40,6 +41,7 @@ mod basemap_data;
 mod basemap_towns;
 mod brand;
 mod data_packs;
+mod dealias_env;
 /// Phase 4e stage (ii): the differential suite gating the primary unify
 /// (spec §7 Phase 4e; tests only — see the module doc for the gate rules).
 #[cfg(test)]
@@ -1847,11 +1849,17 @@ struct ViewerApp {
     tor_tracks: tor_tracks::TorTracksState,
     /// Reflectivity gate filter threshold (dBZ); None = off.
     gate_filter_dbz: Option<f32>,
-    /// Velocity dealias engine: false = same-cut region solver; true = hybrid
-    /// 3-D + temporal branch selection using the previous matching tilt and
-    /// neighboring current-volume velocity tilts, with the cascade wind fit as
-    /// a conservative fallback.
+    /// Velocity dealias engine: false = same-cut region solver; true = the
+    /// model-anchored v4 whole-volume engine (all velocity tilts solved
+    /// jointly, previous-volume temporal prior, RAP wind anchor when
+    /// available). The field keeps its pre-v0.29 name — any state saved
+    /// while it selected the retired hybrid engine maps forward to v4,
+    /// which replaced it (dealias-v4 spec §16).
     dealias_cascade: bool,
+    /// RAP 0-h analysis wind profiles per (site, cycle) for the v4 engine's
+    /// absolute-branch anchor (CONUS only; intl sites run without one).
+    /// Background worker + session cache; pumped by `poll_dealias_env`.
+    dealias_env: dealias_env::DealiasEnvCache,
     /// Display smoothing mode (worker-side, cached): Native (default —
     /// super-res gates are the app's identity), Soften (GR2-style polar
     /// binomial kernel), or Interpolated (bilinear polar upsampling).
@@ -2644,8 +2652,9 @@ fn frame_history_signature(frames: &[FrameHistoryEntry]) -> u64 {
     hasher.finish()
 }
 
-/// Previous same-site volume used by the hybrid 3-D + temporal velocity
-/// dealiaser.  The reference is strictly older than the target scan; duplicate
+/// Previous same-site volume used as the model-anchored (v4) velocity
+/// dealiaser's temporal prior (the same selection the retired hybrid engine
+/// used).  The reference is strictly older than the target scan; duplicate
 /// live-partial/full objects for the same volume are not treated as a temporal
 /// observation.
 fn previous_dealias_reference_volume(
@@ -4208,10 +4217,15 @@ struct RenderRequest {
     /// one for the SAME lane only, so one lane's traffic can't starve another.
     lane: LaneId,
     volume: Arc<RadarVolume>,
-    /// Strictly older same-site volume used by the hybrid 3-D + temporal
-    /// dealiaser. Kept as an Arc so background/prewarm workers never borrow
-    /// mutable UI history.
+    /// Strictly older same-site volume used by the model-anchored (v4)
+    /// dealiaser's temporal prior. Kept as an Arc so background/prewarm
+    /// workers never borrow mutable UI history.
     previous_volume: Option<Arc<RadarVolume>>,
+    /// RAP 0-h analysis wind profile at the radar site (CONUS only) — the
+    /// v4 engine's absolute Nyquist-branch anchor. None until the
+    /// background fetch lands, and always None for intl sites (the engine's
+    /// graceful no-env path). Identity is `key.dealias_env_ptr`.
+    dealias_env: Option<Arc<EnvironmentalWindProfile>>,
     cut: usize,
     product: DisplayProduct,
     render_dealiased_velocity: bool,
@@ -4223,7 +4237,9 @@ struct RenderRequest {
     /// (cached) — binomial soften or bilinear upsample — and renders it
     /// through the unchanged fast path.
     smoothing: SmoothingMode,
-    /// Velocity dealias engine (false = region, true = hybrid 3-D + time).
+    /// Velocity dealias engine (false = region, true = the model-anchored
+    /// v4 whole-volume engine; the field keeps its historical name for
+    /// forward-compat with the retired hybrid engine's toggle).
     dealias_cascade: bool,
     /// Gate filter threshold in deci-dBZ; i16::MIN = off.
     gate_filter_decidbz: i16,
@@ -4304,6 +4320,10 @@ struct LoopRenderContextKey {
     hail_levels_key: (i16, i16),
     smoothing: SmoothingMode,
     dealias_cascade: bool,
+    // `dealias_env_ptr` is deliberately absent, like the reference-volume
+    // pointer: both are per-frame DATA identity (the full TextureKey keys
+    // cached rasters by them); a landing RAP profile must not read as a
+    // whole-loop context change for frames near a cycle boundary.
     gate_filter_decidbz: i16,
     viewport: ViewportKey,
 }
@@ -4332,7 +4352,10 @@ struct RenderRecycleBuffer {
 struct DealiasedReadoutCache {
     volume_ptr: usize,
     reference_volume_ptr: usize,
+    dealias_env_ptr: usize,
     cut_index: usize,
+    /// True when the grid came from the model-anchored v4 engine (the
+    /// field keeps its pre-v0.29 name).
     hybrid: bool,
     grid: Arc<MomentGrid>,
 }
@@ -4677,6 +4700,7 @@ fn percentile_index(len: usize, percentile: usize) -> usize {
 struct RenderWorkerMomentCache {
     volume_ptr: usize,
     reference_volume_ptr: usize,
+    dealias_env_ptr: usize,
     cut: usize,
     moment: MomentType,
     dealiased_velocity: bool,
@@ -4898,6 +4922,7 @@ struct RenderWorkerGeometryCacheSignature {
 struct RenderWorkerViewportSignature {
     volume_ptr: usize,
     reference_volume_ptr: usize,
+    dealias_env_ptr: usize,
     cut: usize,
     product: DisplayProduct,
     moment: MomentType,
@@ -4916,6 +4941,7 @@ impl RenderWorkerViewportSignature {
     fn new(
         volume_ptr: usize,
         reference_volume_ptr: usize,
+        dealias_env_ptr: usize,
         cut: usize,
         product: DisplayProduct,
         moment: MomentType,
@@ -4931,6 +4957,7 @@ impl RenderWorkerViewportSignature {
         Self {
             volume_ptr,
             reference_volume_ptr,
+            dealias_env_ptr,
             cut,
             product,
             moment,
@@ -5111,6 +5138,7 @@ fn spawn_render_worker_with_mode(
             let requested_buffer_signature = RenderWorkerViewportSignature::new(
                 Arc::as_ptr(&request.volume) as usize,
                 request.key.dealias_reference_volume_ptr,
+                request.key.dealias_env_ptr,
                 request.cut,
                 request.product.clone(),
                 request.product.base_moment(),
@@ -6335,6 +6363,7 @@ impl ViewerApp {
             tor_tracks: tor_tracks::TorTracksState::default(),
             gate_filter_dbz: None,
             dealias_cascade: false,
+            dealias_env: dealias_env::DealiasEnvCache::default(),
             display_smoothing: SmoothingMode::Native,
             hail_freezing_level_km: 3.2,
             hail_minus20_level_km: 6.4,
@@ -11332,9 +11361,17 @@ impl ViewerApp {
         } else {
             0
         };
+        let dealias_env = (self.dealias_cascade && render_dealiased_velocity)
+            .then(|| self.dealias_env_profile_for_volume(volume.as_ref()))
+            .flatten();
+        let dealias_env_ptr = dealias_env
+            .as_ref()
+            .map(|profile| Arc::as_ptr(profile) as usize)
+            .unwrap_or(0);
         let key = TextureKey {
             volume_ptr: Arc::as_ptr(&volume) as usize,
             dealias_reference_volume_ptr,
+            dealias_env_ptr,
             cut,
             product: self.selected_product.clone(),
             render_dealiased_velocity,
@@ -11351,6 +11388,7 @@ impl ViewerApp {
             lane: LaneId::Primary,
             volume,
             previous_volume,
+            dealias_env,
             cut,
             product: self.selected_product.clone(),
             render_dealiased_velocity,
@@ -11703,6 +11741,7 @@ impl ViewerApp {
 
         let volume_ptr = Arc::as_ptr(&request.volume) as usize;
         let reference_volume_ptr = request.key.dealias_reference_volume_ptr;
+        let dealias_env_ptr = request.key.dealias_env_ptr;
         let base_moment = request.product.base_moment();
         let dealiased_velocity = request.render_dealiased_velocity;
         let derived = request.product.derived();
@@ -11720,6 +11759,7 @@ impl ViewerApp {
             moment_caches,
             volume_ptr,
             reference_volume_ptr,
+            dealias_env_ptr,
             cache_cut,
             &base_moment,
             dealiased_velocity,
@@ -11757,6 +11797,7 @@ impl ViewerApp {
                 build_preprocessed_plain_cache(
                     request.volume.as_ref(),
                     request.previous_volume.as_deref(),
+                    request.dealias_env.as_deref(),
                     request.cut,
                     &base_moment,
                     request.product.color_family(),
@@ -11789,6 +11830,7 @@ impl ViewerApp {
                 RenderWorkerMomentCache {
                     volume_ptr,
                     reference_volume_ptr,
+                    dealias_env_ptr,
                     cut: cache_cut,
                     moment: base_moment.clone(),
                     dealiased_velocity,
@@ -11809,6 +11851,7 @@ impl ViewerApp {
         let viewport_signature = RenderWorkerViewportSignature::new(
             volume_ptr,
             reference_volume_ptr,
+            dealias_env_ptr,
             request.cut,
             request.product.clone(),
             base_moment.clone(),
@@ -12027,6 +12070,7 @@ impl ViewerApp {
         let viewport_signature = RenderWorkerViewportSignature::new(
             volume_ptr,
             request.key.dealias_reference_volume_ptr,
+            request.key.dealias_env_ptr,
             request.cut,
             request.product.clone(),
             request.product.base_moment(),
@@ -12055,6 +12099,7 @@ impl ViewerApp {
             moment_caches,
             viewport_signature.volume_ptr,
             viewport_signature.reference_volume_ptr,
+            viewport_signature.dealias_env_ptr,
             viewport_signature.cut,
             &viewport_signature.moment,
             request.render_dealiased_velocity,
@@ -12124,6 +12169,7 @@ impl ViewerApp {
             moment_caches,
             volume_ptr,
             0,
+            0,
             cut,
             &MomentType::Velocity,
             velocity_render_dealiased,
@@ -12158,6 +12204,7 @@ impl ViewerApp {
                 RenderWorkerMomentCache {
                     volume_ptr,
                     reference_volume_ptr: 0,
+                    dealias_env_ptr: 0,
                     cut,
                     moment: MomentType::Velocity,
                     dealiased_velocity: velocity_render_dealiased,
@@ -12189,6 +12236,7 @@ impl ViewerApp {
         let Some(moment_index) = Self::touch_moment_cache(
             moment_caches,
             volume_ptr,
+            0,
             0,
             cut,
             &MomentType::Velocity,
@@ -12229,6 +12277,7 @@ impl ViewerApp {
         moment_caches: &mut Vec<RenderWorkerMomentCache>,
         volume_ptr: usize,
         reference_volume_ptr: usize,
+        dealias_env_ptr: usize,
         cut: usize,
         moment: &MomentType,
         dealiased_velocity: bool,
@@ -12241,6 +12290,7 @@ impl ViewerApp {
         let index = moment_caches.iter().position(|cached| {
             cached.volume_ptr == volume_ptr
                 && cached.reference_volume_ptr == reference_volume_ptr
+                && cached.dealias_env_ptr == dealias_env_ptr
                 && cached.cut == cut
                 && cached.moment == *moment
                 && cached.dealiased_velocity == dealiased_velocity
@@ -12263,6 +12313,7 @@ impl ViewerApp {
         moment_caches.retain(|cached| {
             cached.volume_ptr != cache.volume_ptr
                 || cached.reference_volume_ptr != cache.reference_volume_ptr
+                || cached.dealias_env_ptr != cache.dealias_env_ptr
                 || cached.cut != cache.cut
                 || cached.moment != cache.moment
                 || cached.dealiased_velocity != cache.dealiased_velocity
@@ -13775,9 +13826,17 @@ impl ViewerApp {
         } else {
             0
         };
+        let dealias_env = (self.dealias_cascade && render_dealiased_velocity)
+            .then(|| self.dealias_env_profile_for_volume(volume.as_ref()))
+            .flatten();
+        let dealias_env_ptr = dealias_env
+            .as_ref()
+            .map(|profile| Arc::as_ptr(profile) as usize)
+            .unwrap_or(0);
         let key = TextureKey {
             volume_ptr: Arc::as_ptr(&volume) as usize,
             dealias_reference_volume_ptr,
+            dealias_env_ptr,
             cut,
             product: product.clone(),
             render_dealiased_velocity,
@@ -13828,6 +13887,7 @@ impl ViewerApp {
             lane: LaneId::Pane(pane_lane),
             volume,
             previous_volume,
+            dealias_env,
             cut,
             product,
             render_dealiased_velocity,
@@ -14063,6 +14123,81 @@ impl ViewerApp {
         }
     }
 
+    /// The freshest cached RAP profile for this volume's site + scan time
+    /// (spec §16: RAP only, CONUS only — None is the engine's graceful
+    /// no-env path, which every international site takes). Pure cache
+    /// read; the background fetch is driven by [`Self::poll_dealias_env`].
+    pub(crate) fn dealias_env_profile_for_volume(
+        &self,
+        volume: &RadarVolume,
+    ) -> Option<Arc<EnvironmentalWindProfile>> {
+        self.dealias_env
+            .profile_for(&volume.site.id, volume.volume_time)
+    }
+
+    /// Once per frame: keep RAP profile fetches flowing for every volume
+    /// the model-anchored engine is currently dealiasing, and fold landed
+    /// profiles into the render caches. Fetches run on the module's worker
+    /// thread — this never blocks the UI, and rendering proceeds without
+    /// the anchor until a profile lands (TextureKey.dealias_env_ptr flips,
+    /// so affected rasters re-render exactly once).
+    fn poll_dealias_env(&mut self, ctx: &egui::Context) {
+        if !self.dealias_cascade {
+            return;
+        }
+        let now = Utc::now();
+        // The primary displayed volume + any extra pane's volume whose
+        // product renders dealiased velocity.
+        let mut wanted: Vec<Arc<RadarVolume>> = Vec::new();
+        if self.product_render_uses_dealiased_velocity(&self.selected_product)
+            && let Some(volume) = &self.volume
+        {
+            wanted.push(Arc::clone(volume));
+        }
+        for pane_slot in 0..self.extra_panes.len() {
+            let Some(product) = self
+                .extra_panes
+                .get(pane_slot)
+                .map(|pane| pane.product.clone())
+            else {
+                continue;
+            };
+            if self.product_render_uses_dealiased_velocity(&product)
+                && let Some(volume) = self.extra_pane_display_volume(pane_slot)
+            {
+                wanted.push(volume);
+            }
+        }
+        for volume in wanted {
+            let site = &volume.site;
+            let (Some(latitude_deg), Some(longitude_deg)) = (site.latitude_deg, site.longitude_deg)
+            else {
+                continue;
+            };
+            self.dealias_env.ensure_requested(
+                &site.id,
+                latitude_deg,
+                longitude_deg,
+                site.elevation_m,
+                volume.volume_time,
+                now,
+            );
+        }
+        if self.dealias_env.pump() {
+            // A profile landed: dealiased renders keyed without it are
+            // stale. The env pointer in TextureKey does the precise
+            // invalidation; this clears the visible textures + readout so
+            // the re-render happens now rather than on the next key check.
+            self.dealiased_readout_cache = None;
+            self.clear_texture();
+            ctx.request_repaint();
+        } else if self.dealias_env.any_pending() {
+            // Keep the UI ticking while a fetch is in flight so the landed
+            // profile is folded in promptly even on an idle map.
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
     fn dealiased_velocity_readout_grid(
         &mut self,
         volume: &RadarVolume,
@@ -14088,9 +14223,18 @@ impl ViewerApp {
         } else {
             0
         };
+        let dealias_env = self
+            .dealias_cascade
+            .then(|| self.dealias_env_profile_for_volume(volume))
+            .flatten();
+        let dealias_env_ptr = dealias_env
+            .as_ref()
+            .map(|profile| Arc::as_ptr(profile) as usize)
+            .unwrap_or(0);
         if let Some(cache) = &self.dealiased_readout_cache
             && cache.volume_ptr == volume_ptr
             && cache.reference_volume_ptr == reference_volume_ptr
+            && cache.dealias_env_ptr == dealias_env_ptr
             && cache.cut_index == cut_index
             && cache.hybrid == self.dealias_cascade
         {
@@ -14100,13 +14244,19 @@ impl ViewerApp {
         let cut = volume.cuts.get(cut_index)?;
         let source_grid = cut.moments.get(&MomentType::Velocity)?;
         let grid = Arc::new(if self.dealias_cascade {
-            dealias_velocity_grid_hybrid(volume, cut_index, previous_volume.as_deref())?
+            dealias_velocity_grid_v4(
+                volume,
+                cut_index,
+                previous_volume.as_deref(),
+                dealias_env.as_deref(),
+            )?
         } else {
             dealias_velocity_grid(cut, source_grid)
         });
         self.dealiased_readout_cache = Some(DealiasedReadoutCache {
             volume_ptr,
             reference_volume_ptr,
+            dealias_env_ptr,
             cut_index,
             hybrid: self.dealias_cascade,
             grid,
@@ -16279,6 +16429,7 @@ impl eframe::App for ViewerApp {
         self.poll_coverage_probe(&ctx);
         self.poll_raob_sites(&ctx);
         self.poll_native_sounding(&ctx);
+        self.poll_dealias_env(&ctx);
         if self.tile_layer.borrow_mut().poll(&ctx) {
             ctx.request_repaint();
         }
@@ -21709,7 +21860,7 @@ impl ViewerApp {
                 ui.add_enabled_ui(engine_applies, |ui| {
                     egui::ComboBox::from_id_salt("dealias_engine")
                         .selected_text(if self.dealias_cascade {
-                            "3D + time (beta)"
+                            "Analyst 3D"
                         } else {
                             "Region"
                         })
@@ -21718,17 +21869,17 @@ impl ViewerApp {
                             engine_changed |= ui
                                 .selectable_value(&mut self.dealias_cascade, false, "Region")
                                 .on_hover_text(
-                                    "Fast same-tilt region unfolding. Good fallback, but an isolated connected group's absolute Nyquist branch can be ambiguous.",
+                                    "Fast same-tilt region unfolding (the default). Good fallback, but an isolated connected group's absolute Nyquist branch can be ambiguous.",
                                 )
                                 .changed();
                             engine_changed |= ui
                                 .selectable_value(
                                     &mut self.dealias_cascade,
                                     true,
-                                    "3D + time (beta)",
+                                    "Analyst 3D (model-anchored)",
                                 )
                                 .on_hover_text(
-                                    "Hybrid branch selection: region unfolding plus the previous volume's matching elevation, nearby current-volume velocity tilts, and the cascade wind fit. Designed for folded 1-3 degree tilts and live partial volumes.",
+                                    "Whole-volume branch optimization: all velocity tilts solved jointly, using the previous volume and a RAP model wind profile at the radar site when available (US CONUS sites; fetched in the background). International sites run without the model anchor. Slower than Region; replaces the old 3D + time engine.",
                                 )
                                 .changed();
                         });
@@ -21748,6 +21899,42 @@ impl ViewerApp {
                     ctx.request_repaint();
                 }
             });
+            // Honest anchor state for the model-anchored engine: which
+            // branch reference the CURRENT volume actually gets (12b
+            // loop-UX doctrine — never imply a model anchor that isn't
+            // there; intl/no-profile runs are the engine's no-env path).
+            let engine_applies = editing_product.uses_dealiased_velocity()
+                || (matches!(
+                    editing_product,
+                    DisplayProduct::Moment(MomentType::Velocity)
+                ) && self.unfold_velocity_display);
+            if self.dealias_cascade && engine_applies {
+                let status = match self.volume.as_deref() {
+                    Some(volume) => match self.dealias_env_profile_for_volume(volume) {
+                        Some(profile) => format!(
+                            "RAP anchor: {} analysis",
+                            profile.valid_time.format("%H:%MZ")
+                        ),
+                        None if !dealias_env::site_in_rap_conus_box(
+                            volume.site.latitude_deg.unwrap_or(f32::NAN),
+                            volume.site.longitude_deg.unwrap_or(f32::NAN),
+                        ) =>
+                        {
+                            "RAP anchor: n/a outside CONUS — dealiasing without a model anchor"
+                                .to_owned()
+                        }
+                        None if self.dealias_env.any_pending() => {
+                            "RAP anchor: fetching…".to_owned()
+                        }
+                        None => match self.dealias_env.last_error() {
+                            Some(error) => format!("RAP anchor unavailable: {error}"),
+                            None => "RAP anchor: not loaded yet".to_owned(),
+                        },
+                    },
+                    None => "RAP anchor: no volume loaded".to_owned(),
+                };
+                ui.weak(status);
+            }
         }
         if editing_product.is_storm_relative_velocity() {
             ui.horizontal(|ui| {
@@ -40677,10 +40864,14 @@ fn cross_section_smoothing_label(smoothing: CrossSectionSmoothing) -> &'static s
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TextureKey {
     volume_ptr: usize,
-    /// Previous-volume identity participates only in hybrid dealiased renders.
-    /// It prevents a newly available temporal reference from reusing an older
-    /// region-only texture for the same current volume.
+    /// Previous-volume identity participates only in model-anchored (v4)
+    /// dealiased renders. It prevents a newly available temporal reference
+    /// from reusing an older region-only texture for the same current volume.
     dealias_reference_volume_ptr: usize,
+    /// RAP profile identity (Arc pointer; 0 = none), same contract as the
+    /// previous-volume pointer above: when the background profile fetch
+    /// lands, renders produced without the model anchor stop matching.
+    dealias_env_ptr: usize,
     cut: usize,
     product: DisplayProduct,
     render_dealiased_velocity: bool,
@@ -40696,6 +40887,7 @@ struct TextureKey {
 fn texture_keys_match_data_and_style(left: &TextureKey, right: &TextureKey) -> bool {
     left.volume_ptr == right.volume_ptr
         && left.dealias_reference_volume_ptr == right.dealias_reference_volume_ptr
+        && left.dealias_env_ptr == right.dealias_env_ptr
         && left.cut == right.cut
         && left.product == right.product
         && left.render_dealiased_velocity == right.render_dealiased_velocity
@@ -42506,15 +42698,21 @@ fn detect_rotation_markers_for_volume(
         .collect()
 }
 
-/// Preprocessed plain/dealiased moment: optional cascade dealias, optional
-/// reflectivity gate filter (GR2-style GateFilter), optional smoothing
-/// (binomial soften OR bilinear upsample) — in that order — rendered via
-/// the derived-cache entry. Each combination is keyed separately, so the
-/// per-frame fast path is untouched.
+/// Preprocessed plain/dealiased moment: optional model-anchored (v4)
+/// dealias, optional reflectivity gate filter (GR2-style GateFilter),
+/// optional smoothing (binomial soften OR bilinear upsample) — in that
+/// order — rendered via the derived-cache entry. Each combination is keyed
+/// separately, so the per-frame fast path is untouched.
+///
+/// `dealias_env` is the RAP site profile (None until the background fetch
+/// lands, always None for intl sites); `previous_volume` feeds the same
+/// temporal prior the retired hybrid engine used (spec §15: v4 runs
+/// per-volume — no cross-volume solution caching in v0.29.0).
 #[allow(clippy::too_many_arguments)]
 fn build_preprocessed_plain_cache(
     volume: &RadarVolume,
     previous_volume: Option<&RadarVolume>,
+    dealias_env: Option<&EnvironmentalWindProfile>,
     cut_index: usize,
     moment: &MomentType,
     family: ColorTableFamily,
@@ -42533,8 +42731,8 @@ fn build_preprocessed_plain_cache(
         .get(moment)
         .ok_or_else(|| format!("moment {moment:?} missing"))?;
     let mut source = if dealiased_velocity && dealias_cascade {
-        dealias_velocity_grid_hybrid(volume, cut_index, previous_volume)
-            .ok_or_else(|| "hybrid 3-D + temporal dealias failed".to_owned())?
+        dealias_velocity_grid_v4(volume, cut_index, previous_volume, dealias_env)
+            .ok_or_else(|| "model-anchored 3-D dealias failed".to_owned())?
     } else if dealiased_velocity {
         dealias_velocity_grid(cut, grid)
     } else {
@@ -52375,7 +52573,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_dealias_reference_uses_the_last_complete_older_scan() {
+    fn dealias_temporal_reference_uses_the_last_complete_older_scan() {
         let start = Utc.with_ymd_and_hms(2026, 6, 22, 0, 0, 0).unwrap();
         let older = Arc::new(test_volume_with_site_time("KTEST", start));
         let partial = Arc::new(test_volume_with_site_time(
@@ -52438,6 +52636,44 @@ mod tests {
         assert!((readout.value - 11.0).abs() < 0.01, "{readout:?}");
         assert_eq!(readout.raw, None);
         assert!(app.dealiased_readout_cache.is_some());
+    }
+
+    /// Forward-compat pin for the v0.29.0 engine swap: the `dealias_cascade`
+    /// bool kept its name, and `true` now routes the readout (and renders)
+    /// through the model-anchored v4 engine — per-volume, previous-volume
+    /// prior optional, NO environmental profile required (the intl/no-env
+    /// path). The cache must key the v4 grid separately from region output.
+    #[test]
+    fn dealias_cascade_true_routes_readout_through_the_v4_engine() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let volume = Arc::new(test_aliased_velocity_volume());
+        app.volume = Some(Arc::clone(&volume));
+        app.selected_cut = 0;
+        app.selected_product = DisplayProduct::DealiasedVelocity;
+        app.dealias_cascade = true;
+
+        let grid = app
+            .dealiased_velocity_readout_grid(volume.as_ref(), 0)
+            .expect("v4 readout grid");
+        let expected = dealias_velocity_grid_v4(volume.as_ref(), 0, None, None)
+            .expect("v4 solves the synthetic volume");
+        assert_eq!(
+            grid.as_ref(),
+            &expected,
+            "cascade=true must serve the v4 engine's grid"
+        );
+        let cache = app.dealiased_readout_cache.as_ref().expect("cache");
+        assert!(cache.hybrid, "cache records the engine choice");
+        assert_eq!(cache.dealias_env_ptr, 0, "no profile fetched in tests");
+
+        // Flipping back to Region must not serve the v4 grid from cache.
+        app.dealias_cascade = false;
+        let region_grid = app
+            .dealiased_velocity_readout_grid(volume.as_ref(), 0)
+            .expect("region readout grid");
+        let cut = &volume.cuts[0];
+        let source = cut.moments.get(&MomentType::Velocity).expect("velocity");
+        assert_eq!(region_grid.as_ref(), &dealias_velocity_grid(cut, source));
     }
 
     #[test]
@@ -52676,6 +52912,7 @@ mod tests {
                 key: TextureKey {
                     volume_ptr: Arc::as_ptr(&volume) as usize,
                     dealias_reference_volume_ptr: 0,
+                    dealias_env_ptr: 0,
                     cut: 0,
                     product: product.clone(),
                     render_dealiased_velocity: false,
@@ -52690,6 +52927,7 @@ mod tests {
                 lane: LaneId::Primary,
                 volume,
                 previous_volume: None,
+                dealias_env: None,
                 cut: 0,
                 product,
                 render_dealiased_velocity: false,
@@ -53108,6 +53346,7 @@ mod tests {
             key: TextureKey {
                 volume_ptr: Arc::as_ptr(&volume) as usize,
                 dealias_reference_volume_ptr: 0,
+                dealias_env_ptr: 0,
                 cut,
                 product: product.clone(),
                 render_dealiased_velocity: product.render_uses_dealiased_velocity(false),
@@ -53122,6 +53361,7 @@ mod tests {
             lane: LaneId::Primary,
             volume,
             previous_volume: None,
+            dealias_env: None,
             cut,
             product: product.clone(),
             render_dealiased_velocity: product.render_uses_dealiased_velocity(false),
@@ -53389,6 +53629,7 @@ mod tests {
         let first_pixels = RenderWorkerViewportSignature::new(
             10,
             0,
+            0,
             1,
             DisplayProduct::Moment(MomentType::Reflectivity),
             MomentType::Reflectivity,
@@ -53403,6 +53644,7 @@ mod tests {
         );
         let second_pixels = RenderWorkerViewportSignature::new(
             10,
+            0,
             0,
             1,
             DisplayProduct::Moment(MomentType::Reflectivity),
@@ -53452,6 +53694,7 @@ mod tests {
         let viewport_signature = |smoothing: SmoothingMode| {
             RenderWorkerViewportSignature::new(
                 10,
+                0,
                 0,
                 1,
                 DisplayProduct::Moment(MomentType::Reflectivity),
@@ -53542,6 +53785,7 @@ mod tests {
         let render = |smoothing: SmoothingMode| {
             let cache = build_preprocessed_plain_cache(
                 &volume,
+                None,
                 None,
                 0,
                 &MomentType::Reflectivity,
@@ -53774,6 +54018,7 @@ mod tests {
             key: TextureKey {
                 volume_ptr: Arc::as_ptr(&volume) as usize,
                 dealias_reference_volume_ptr: 0,
+                dealias_env_ptr: 0,
                 cut: 0,
                 product: DisplayProduct::Moment(MomentType::Reflectivity),
                 render_dealiased_velocity: false,
@@ -53788,6 +54033,7 @@ mod tests {
             lane: LaneId::Primary,
             volume,
             previous_volume: None,
+            dealias_env: None,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Reflectivity),
             render_dealiased_velocity: false,
@@ -54811,6 +55057,7 @@ mod tests {
         let retained_texture_key = TextureKey {
             volume_ptr: 42,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Reflectivity),
             render_dealiased_velocity: false,
@@ -55464,6 +55711,7 @@ mod tests {
         let first = TextureKey {
             volume_ptr: 42,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Velocity),
             render_dealiased_velocity: false,
@@ -55557,6 +55805,7 @@ mod tests {
         let current_key = TextureKey {
             volume_ptr: 42,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Reflectivity),
             render_dealiased_velocity: false,
@@ -57682,6 +57931,7 @@ mod tests {
         let pending_key = TextureKey {
             volume_ptr: 42,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Reflectivity),
             render_dealiased_velocity: false,
@@ -58010,6 +58260,7 @@ mod tests {
         let current_key = TextureKey {
             volume_ptr,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut: 1,
             product: DisplayProduct::Moment(MomentType::Velocity),
             render_dealiased_velocity: false,
@@ -58084,6 +58335,7 @@ mod tests {
         let primary_key = TextureKey {
             volume_ptr,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut: 2,
             product: DisplayProduct::Moment(MomentType::Reflectivity),
             render_dealiased_velocity: false,
@@ -58134,6 +58386,7 @@ mod tests {
         app.texture_key = Some(TextureKey {
             volume_ptr,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Reflectivity),
             render_dealiased_velocity: false,
@@ -58163,6 +58416,7 @@ mod tests {
         app.extra_panes[0].texture_key = Some(TextureKey {
             volume_ptr,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Velocity),
             render_dealiased_velocity: false,
@@ -58183,6 +58437,7 @@ mod tests {
         app.extra_panes[0].texture_key = Some(TextureKey {
             volume_ptr,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut: 1,
             product: DisplayProduct::Moment(MomentType::Velocity),
             render_dealiased_velocity: false,
@@ -58213,6 +58468,7 @@ mod tests {
         app.texture_key = Some(TextureKey {
             volume_ptr: Arc::as_ptr(&new_volume) as usize,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut: 0,
             product: app.selected_product.clone(),
             render_dealiased_velocity: false,
@@ -58246,6 +58502,7 @@ mod tests {
         layer.texture_key = Some(TextureKey {
             volume_ptr: Arc::as_ptr(&old_volume) as usize,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut: 0,
             product: app.selected_product.clone(),
             render_dealiased_velocity: false,
@@ -58267,6 +58524,7 @@ mod tests {
         app.radar_layers[0].texture_key = Some(TextureKey {
             volume_ptr: Arc::as_ptr(&new_volume) as usize,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut: 0,
             product: app.selected_product.clone(),
             render_dealiased_velocity: false,
@@ -58296,6 +58554,7 @@ mod tests {
         app.texture_key = Some(TextureKey {
             volume_ptr: primary_ptr,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Velocity),
             render_dealiased_velocity: false,
@@ -58320,6 +58579,7 @@ mod tests {
         app.extra_panes[0].texture_key = Some(TextureKey {
             volume_ptr: Arc::as_ptr(&pane_volume) as usize,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Velocity),
             render_dealiased_velocity: false,
@@ -58848,6 +59108,7 @@ mod tests {
         app.extra_panes[0].texture_key = Some(TextureKey {
             volume_ptr: old_volume_ptr,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut: app.extra_panes[0].cut.unwrap_or(0),
             product: app.extra_panes[0].product.clone(),
             render_dealiased_velocity: false,
@@ -59995,6 +60256,7 @@ mod tests {
         app.texture_key = Some(TextureKey {
             volume_ptr: 1,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut: 0,
             product: app.selected_product.clone(),
             render_dealiased_velocity: false,
@@ -66795,6 +67057,7 @@ mod tests {
             tor_tracks: tor_tracks::TorTracksState::default(),
             gate_filter_dbz: None,
             dealias_cascade: false,
+            dealias_env: dealias_env::DealiasEnvCache::default(),
             display_smoothing: SmoothingMode::Native,
             hail_freezing_level_km: 3.2,
             hail_minus20_level_km: 6.4,
@@ -67171,6 +67434,7 @@ mod tests {
         let retained_texture_key = TextureKey {
             volume_ptr: 42,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut: 0,
             product: DisplayProduct::Moment(MomentType::Reflectivity),
             render_dealiased_velocity: false,
@@ -69264,6 +69528,7 @@ mod tests {
         RenderWorkerViewportSignature::new(
             1,
             0,
+            0,
             width as usize,
             DisplayProduct::Moment(MomentType::Velocity),
             MomentType::Velocity,
@@ -69298,6 +69563,7 @@ mod tests {
         TextureKey {
             volume_ptr,
             dealias_reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
             cut,
             render_dealiased_velocity: product.render_uses_dealiased_velocity(false),
             product,
@@ -69453,6 +69719,7 @@ mod tests {
             rgba: Vec::new(),
             buffer_signature: RenderWorkerViewportSignature::new(
                 1,
+                0,
                 0,
                 1,
                 DisplayProduct::Moment(MomentType::Velocity),

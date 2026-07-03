@@ -342,10 +342,17 @@ fn products(ui: &mut egui::Ui) {
          the beam only; flow across the beam is invisible.",
         "keep Unfold VEL on. Raw velocity folds at the Nyquist speed and a folded gate reads \
          as a fake opposite-direction couplet — the inspector warns on near-Nyquist gates. \
-         Unfolding uses a region-based dealiaser; a tilt-cascade engine (beta) is selectable \
-         for VCPs with high-Nyquist upper tilts.",
-        "Dealiasing: Jing & Wiener 1993 (JTECH 10); Feldmann et al. 2020, R2D2 \
-         (JTECH-D-20-0054.1); Helmus & Collis 2016 (Py-ART).",
+         Two dealias engines: Region (default) unfolds each tilt from boundary evidence — \
+         fast and honest, but an isolated echo's absolute branch can be ambiguous. \
+         Analyst 3D (model-anchored) solves all velocity tilts of the volume jointly, adds \
+         the previous volume as a temporal prior, and — for US CONUS sites — anchors the \
+         absolute branch to a RAP analysis wind profile fetched in the background; \
+         international sites run it without the model anchor. Slower than Region.",
+        "Region: Jing & Wiener 1993 (JTECH 10); Feldmann et al. 2020, R2D2 \
+         (JTECH-D-20-0054.1); Helmus & Collis 2016 (Py-ART, JORS). Analyst 3D adds: \
+         Eilts & Smith 1990 (JTECH 7, environmental wind constraints); James & Houze 2001 \
+         (JTECH 18, 4DD sounding initialization); Louf et al. 2020 (JTECH 37, UNRAVEL \
+         repair checks).",
     );
     product_entry(
         ui,
@@ -1450,6 +1457,10 @@ fn sources(ui: &mut egui::Ui) {
          34, 415\u{2013}434 — LLSD shear/divergence.",
         "Jing & Wiener 1993, JTECH 10; Feldmann et al. 2020 (R2D2, JTECH-D-20-0054.1); \
          Helmus & Collis 2016 (Py-ART, JORS) — region-based velocity dealiasing.",
+        "Eilts & Smith 1990, JTECH 7, 118\u{2013}128 — environmental wind constraints; \
+         James & Houze 2001, JTECH 18, 1674\u{2013}1683 — 4DD sounding initialization; \
+         Louf et al. 2020, JTECH 37 — UNRAVEL reference checks (the Analyst 3D \
+         model-anchored dealiaser).",
         "Johnson et al. 1998, Wea. Forecasting 13, 263\u{2013}276 — SCIT storm tracking.",
         "Stumpf et al. 1998, Wea. Forecasting 13, 304\u{2013}326 — mesocyclone detection; \
          Mitchell et al. 1998, Wea. Forecasting 13, 352\u{2013}366 — TVS detection.",

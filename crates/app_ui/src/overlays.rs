@@ -258,6 +258,7 @@ pub(crate) fn overlay_pool_render_job(
         let requested_buffer_signature = RenderWorkerViewportSignature::new(
             Arc::as_ptr(&request.volume) as usize,
             request.key.dealias_reference_volume_ptr,
+            request.key.dealias_env_ptr,
             request.cut,
             request.product.clone(),
             request.product.base_moment(),
@@ -1440,9 +1441,21 @@ impl ViewerApp {
             let color_table_signature = color_tables.signature_for_family(product.color_family());
             let render_dealiased_velocity = self.product_render_uses_dealiased_velocity(&product);
             let smoothing = self.smoothing_for_product(&product);
+            // Same read-only RAP-profile lookup as the primary/pane request
+            // builders; overlay sites without a fetched profile (the usual
+            // case — fetches follow the DISPLAYED site) run v4's no-env path,
+            // exactly like the always-None previous_volume below.
+            let dealias_env = (self.dealias_cascade && render_dealiased_velocity)
+                .then(|| self.dealias_env_profile_for_volume(volume.as_ref()))
+                .flatten();
+            let dealias_env_ptr = dealias_env
+                .as_ref()
+                .map(|profile| Arc::as_ptr(profile) as usize)
+                .unwrap_or(0);
             let key = TextureKey {
                 volume_ptr: Arc::as_ptr(&volume) as usize,
                 dealias_reference_volume_ptr: 0,
+                dealias_env_ptr,
                 cut,
                 product: product.clone(),
                 render_dealiased_velocity,
@@ -1490,6 +1503,7 @@ impl ViewerApp {
                     lane: LaneId::Overlay(layer.engine.id.0),
                     volume,
                     previous_volume: None,
+                    dealias_env,
                     cut,
                     product,
                     render_dealiased_velocity,

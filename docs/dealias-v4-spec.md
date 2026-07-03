@@ -1020,6 +1020,49 @@ reduction graft — mechanism and full delta table in
   with it (its only production consumer is hybrid) - the app returns to
   TWO engines: Region (fast honest fallback) and v4.
 
+**Wiring record (2026-07-03, v0.29.0):**
+
+- Environmental profiles are LIVE: `crates/app_ui/src/dealias_env.rs`
+  fetches the RAP 0-h analysis (`awp130pgrb` f00, `noaa-rap-pds` AWS
+  mirror) via the existing rusty-weather stack — `rustwx_models` URL
+  resolution + `rustwx_io::fetch_bytes_with_cache` `.idx`-subset
+  byte-range fetch (UGRD/VGRD/HGT records only) into the same cache root
+  the model-data ingest uses. Profiles cache per (site, cycle) for the
+  session; fetches run on one background thread and never block
+  rendering (renders proceed no-env until the profile lands, then the
+  `dealias_env_ptr` in the render keys invalidates exactly the affected
+  rasters). Cycle choice: nearest published cycle to the displayed
+  volume time (live or archive), sequential fallback across cycles
+  within the engine's 3 h staleness guard.
+- CONUS only, per the decision above: a bounding-box pre-gate plus a
+  20 km nearest-grid-point guard; non-CONUS and international sites run
+  the no-env path, and the sidebar shows which anchor the current volume
+  actually has.
+- The picker slot formerly labeled "3D + time (beta)" is now
+  "Analyst 3D (model-anchored)" and runs v4.1. The in-memory engine
+  toggle keeps its historical name (`dealias_cascade`) so any state that
+  selected the retired hybrid engine maps forward to v4. (The bool was
+  never persisted to settings files; nothing on disk needed migration.)
+- `hybrid.rs` (950 lines) and `cascade.rs` (251 lines) are DELETED from
+  render2d, with the hybrid-only dense-reference pass in the region
+  resolver (~150 lines). Two survivors, both still consumed:
+  `fit_range_band_reference` (moved into `render2d/src/lib.rs`; feeds
+  the battery's `rms_harmonic` metric and the region engine's
+  external-reference mode) and `dealias_velocity_grid_with_reference`
+  (the region engine's public external-reference entry).
+- The bench battery's `cascade`/`hybrid` arms are removed; requesting
+  them now errors with a pointer here. `docs/dealias-v4-baselines.json`
+  keeps their historical rows for the record — do not delete them.
+- Per §15's ordering law, cross-volume `V4VolumeSolution` reuse
+  (temporal solution caching) remains OUT OF SCOPE for v0.29.0: the app
+  calls `dealias_velocity_grid_v4` per volume with the same
+  previous-volume argument the hybrid call sites passed, plus the
+  environmental profile. Known cost, stated honestly: the per-cut entry
+  point runs a whole-volume solve, so first render of each additional
+  tilt of one volume re-solves (~150-550 ms on battery volumes); the
+  render caches absorb repeats. The amortized per-volume solution cache
+  is the natural post-v0.29.0 follow-up alongside temporal caching.
+
 
 ## 17. External baselines (2026-07-02) - the SOTA question, measured
 

@@ -8,12 +8,10 @@ use std::ops::Range;
 use std::path::Path;
 
 pub use color_tables::{ColorSampler, ColorTable, ColorTableFamily, ColorTableSet};
-mod cascade;
 mod cells;
 mod dealias_v4;
 mod detect;
 mod gate_filter;
-mod hybrid;
 mod interpolate;
 mod region_core;
 mod rhi;
@@ -23,7 +21,6 @@ mod tracking;
 pub mod tracks;
 mod volumetric;
 pub mod wind;
-pub use cascade::{dealias_velocity_grid_cascade, fit_range_band_reference};
 pub use cells::{StormCell, identify_storm_cells};
 pub use dealias_v4::{
     ConfidenceGrid, EnvWindLevel, EnvironmentalWindProfile, TemporalPrior, V4Diagnostics,
@@ -33,7 +30,6 @@ pub use detect::{
     RotationSite, RotationStrength, detect_rotation_sites, rotation_features_per_tilt,
 };
 pub use gate_filter::apply_reflectivity_gate_filter;
-pub use hybrid::dealias_velocity_grid_hybrid;
 use image::{ImageBuffer, ImageError, Rgba};
 pub use interpolate::{
     INTERP_MAX_FACTOR, INTERP_MAX_GRID_BYTES, INTERP_TARGET_AZIMUTH_DEG,
@@ -3063,7 +3059,10 @@ fn color_for_raw(grid: &MomentGrid, sampler: &ColorSampler, raw: u16) -> [u8; 4]
 /// unfolded (fold 0); (5) apply and despeckle.
 /// Per-range-band zeroth-harmonic wind reference (Browning & Wexler 1968):
 /// v̂(az) = a·cos(az) + b·sin(az), fitted per band of gates. Supplied to the
-/// fold resolver as EXTERNAL evidence by the tilt-cascade engine.
+/// fold resolver as EXTERNAL evidence via
+/// [`dealias_velocity_grid_with_reference`]; the bench eval battery fits it
+/// on each engine's own output for the `rms_harmonic` metric (dealias-v4
+/// spec §10.2).
 pub struct RangeBandReference {
     pub band_gates: usize,
     pub fits: Vec<Option<(f32, f32)>>,
@@ -3077,43 +3076,87 @@ impl RangeBandReference {
     }
 }
 
-/// A local velocity reference already mapped onto the target cut's polar
-/// lattice.  `NaN` means no trustworthy reference for that gate.  The hybrid
-/// engine builds this once, then the region solver performs O(1) lookups while
-/// deciding whole-region Nyquist branches.
-pub(crate) struct DenseVelocityReference {
-    rows: usize,
-    gates: usize,
-    values: Vec<f32>,
-}
+/// Gates per range band for the reference fit.
+pub(crate) const REFERENCE_BAND_GATES: usize = 16;
+const FIT_MIN_SAMPLES: u32 = 48;
+const FIT_MIN_SECTORS: u32 = 5; // of 12 × 30° azimuth sectors
+/// Outlier trim for the second fit pass (m/s).
+const FIT_TRIM_MPS: f32 = 12.0;
 
-impl DenseVelocityReference {
-    pub(crate) fn new(rows: usize, gates: usize, values: Vec<f32>) -> Option<Self> {
-        let total = rows.checked_mul(gates)?;
-        if total == 0 || values.len() != total || !values.iter().any(|value| value.is_finite()) {
-            return None;
+/// Fit the per-range-band zeroth harmonic v(az) = a·cos(az) + b·sin(az) on a
+/// (dealiased) velocity grid. Two passes: fit, then refit excluding outliers.
+/// (Browning & Wexler 1968; formerly the tilt-cascade engine's reference fit
+/// — the cascade and hybrid engines were removed at v0.29.0, superseded by
+/// the model-anchored `dealias_v4` engine.)
+pub fn fit_range_band_reference(cut: &ElevationCut, grid: &MomentGrid) -> RangeBandReference {
+    let rows = grid.radial_count();
+    let gates = grid.gate_range.gate_count;
+    let bands = gates.div_ceil(REFERENCE_BAND_GATES).max(1);
+    let azimuth = |row: usize| -> Option<f32> {
+        grid.radial_indices
+            .get(row)
+            .and_then(|&i| cut.radials.get(i))
+            .map(|r| r.azimuth_deg)
+    };
+
+    let mut fits: Vec<Option<(f32, f32)>> = vec![None; bands];
+    for pass in 0..2 {
+        let mut acc = vec![[0.0f64; 6]; bands]; // cc, cs, ss, cv, sv, n
+        let mut sectors = vec![0u16; bands];
+        for row in 0..rows {
+            let Some(az_deg) = azimuth(row) else {
+                continue;
+            };
+            let az = (az_deg as f64).to_radians();
+            let (sin_az, cos_az) = (az.sin(), az.cos());
+            let sector_bit = 1u16 << ((az_deg.rem_euclid(360.0) / 30.0) as u32 % 12);
+            for gate in 0..gates {
+                let Some(v) = grid.scaled_value(row, gate).filter(|v| v.is_finite()) else {
+                    continue;
+                };
+                let band = gate / REFERENCE_BAND_GATES;
+                if pass == 1
+                    && let Some((a, b)) = fits[band]
+                {
+                    let predicted = a * cos_az as f32 + b * sin_az as f32;
+                    if (v - predicted).abs() > FIT_TRIM_MPS {
+                        continue;
+                    }
+                }
+                let entry = &mut acc[band];
+                entry[0] += cos_az * cos_az;
+                entry[1] += cos_az * sin_az;
+                entry[2] += sin_az * sin_az;
+                entry[3] += cos_az * v as f64;
+                entry[4] += sin_az * v as f64;
+                entry[5] += 1.0;
+                sectors[band] |= sector_bit;
+            }
         }
-        Some(Self {
-            rows,
-            gates,
-            values,
-        })
+        for band in 0..bands {
+            let entry = &acc[band];
+            if (entry[5] as u32) < FIT_MIN_SAMPLES || sectors[band].count_ones() < FIT_MIN_SECTORS {
+                fits[band] = None;
+                continue;
+            }
+            let det = entry[0] * entry[2] - entry[1] * entry[1];
+            if det.abs() < 1e-6 {
+                fits[band] = None;
+                continue;
+            }
+            let a = (entry[3] * entry[2] - entry[4] * entry[1]) / det;
+            let b = (entry[4] * entry[0] - entry[3] * entry[1]) / det;
+            fits[band] = Some((a as f32, b as f32));
+        }
     }
-
-    #[inline]
-    fn eval(&self, row: usize, gate: usize) -> Option<f32> {
-        if row >= self.rows || gate >= self.gates {
-            return None;
-        }
-        self.values
-            .get(row * self.gates + gate)
-            .copied()
-            .filter(|value| value.is_finite())
+    RangeBandReference {
+        band_gates: REFERENCE_BAND_GATES,
+        fits,
     }
 }
 
 pub fn dealias_velocity_grid(cut: &ElevationCut, source: &MomentGrid) -> MomentGrid {
-    dealias_velocity_grid_with_references(cut, source, None, None)
+    dealias_velocity_grid_with_reference(cut, source, None)
 }
 
 /// True when [`dealias_velocity_grid`] over this cut can only pass raw
@@ -3138,18 +3181,6 @@ pub fn dealias_velocity_grid_with_reference(
     cut: &ElevationCut,
     source: &MomentGrid,
     reference: Option<&RangeBandReference>,
-) -> MomentGrid {
-    dealias_velocity_grid_with_references(cut, source, reference, None)
-}
-
-/// Internal superset used by the hybrid engine: the broad harmonic reference
-/// is applied first, then the dense spatial/temporal field may make only
-/// decisive whole-region branch corrections.
-pub(crate) fn dealias_velocity_grid_with_references(
-    cut: &ElevationCut,
-    source: &MomentGrid,
-    reference: Option<&RangeBandReference>,
-    dense_reference: Option<&DenseVelocityReference>,
 ) -> MomentGrid {
     let rows = source.radial_count();
     let gate_count = source.gate_range.gate_count;
@@ -3176,15 +3207,7 @@ pub(crate) fn dealias_velocity_grid_with_references(
     }
 
     let azimuths = radial_azimuths(cut, source);
-    let folds = region_based_dealias_folds(
-        &observed,
-        &nyq,
-        rows,
-        gate_count,
-        &azimuths,
-        reference,
-        dense_reference,
-    );
+    let folds = region_based_dealias_folds(&observed, &nyq, rows, gate_count, &azimuths, reference);
 
     let mut corrected = vec![DEALIASED_VELOCITY_NODATA; total];
     #[allow(clippy::needless_range_loop)]
@@ -3218,20 +3241,6 @@ pub(crate) fn dealias_velocity_grid_with_references(
         storage: MomentStorage::U16(corrected),
     }
 }
-
-/// Dense spatial/temporal references are intentionally conservative: a whole
-/// connected group moves only when the alternate Nyquist branch wins by a
-/// large, well-separated margin.
-const DENSE_REFERENCE_MIN_GROUP_SAMPLES: u64 = 32;
-const DENSE_REFERENCE_MIN_REGION_SAMPLES: u32 = 16;
-const DENSE_REFERENCE_MIN_GROUP_COVERAGE: f64 = 0.15;
-const DENSE_REFERENCE_MIN_REGION_COVERAGE: f64 = 0.20;
-const DENSE_REFERENCE_GROUP_IMPROVEMENT_MPS: f64 = 5.0;
-const DENSE_REFERENCE_REGION_IMPROVEMENT_MPS: f64 = 6.0;
-const DENSE_REFERENCE_GROUP_RATIO: f64 = 0.75;
-const DENSE_REFERENCE_REGION_RATIO: f64 = 0.68;
-const DENSE_REFERENCE_MIN_SEPARATION_MPS: f64 = 2.0;
-const DENSE_REFERENCE_LOSS_CAP_MPS: f64 = 40.0;
 
 fn radial_azimuths(cut: &ElevationCut, grid: &MomentGrid) -> Vec<f32> {
     grid.radial_indices
@@ -3268,7 +3277,7 @@ fn sweep_wraps(azimuths: &[f32]) -> bool {
 /// Core region-based fold solver. Returns the integer Nyquist fold for every
 /// gate (0 where unknown / no data). Steps 1–4 (segmentation, vote graph,
 /// strongest-first resolution, anchoring) live in [`region_core`]; this
-/// wrapper applies the optional external-reference passes (5b/5c).
+/// wrapper applies the optional external-reference pass (5b).
 fn region_based_dealias_folds(
     observed: &[f32],
     nyq: &[f32],
@@ -3276,7 +3285,6 @@ fn region_based_dealias_folds(
     gates: usize,
     azimuths: &[f32],
     reference: Option<&RangeBandReference>,
-    dense_reference: Option<&DenseVelocityReference>,
 ) -> Vec<i32> {
     let total = rows.saturating_mul(gates);
     let mut folds = vec![0i32; total];
@@ -3298,12 +3306,12 @@ fn region_based_dealias_folds(
         return folds;
     }
 
-    // ---- 5b. external-reference checks (tilt-cascade engine only) ----
+    // ---- 5b. external-reference checks (optional caller reference) ----
     // Boundary votes lock RELATIVE folds, but each connected group's absolute
     // branch — and any vote-graph misbranch — needs independent evidence.
-    // A clean reference from the (less aliased, higher Nyquist) tilt above
-    // supplies it: choose each group's branch against the reference, then
-    // re-test each region individually and override only when decisive.
+    // A clean external harmonic reference supplies it: choose each group's
+    // branch against the reference, then re-test each region individually and
+    // override only when decisive.
     if let Some(reference) = reference {
         let mut row_trig = vec![(0.0f32, 0.0f32); rows];
         for row in 0..rows {
@@ -3394,141 +3402,6 @@ fn region_based_dealias_folds(
             if best_slot != 1 && *best_cost < 0.6 * current {
                 let dg = best_slot as i32 - 1;
                 region_fold[rid] = (region_fold[rid] + dg)
-                    .clamp(-region_core::REGION_MAX_FOLD, region_core::REGION_MAX_FOLD);
-            }
-        }
-    }
-
-    // ---- 5c. dense spatial/temporal branch refinement ----
-    // Unlike the broad wind fit above, this reference is local to each target
-    // gate.  It can therefore preserve a compact mesocyclone while still
-    // resolving the absolute Nyquist branch.  Changes are deliberately
-    // conservative: first shift an entire connected vote-graph group, then
-    // permit a single-region repair only when it wins decisively.
-    if let Some(reference) = dense_reference {
-        // The compact vote-graph group ids come from `solve_region_folds`
-        // (assigned in region-id order, exactly the mapping this pass used to
-        // build itself).  Avoiding a HashMap lookup for every gate is
-        // important on 1M+ gate super-resolution sweeps.
-        let mut group_total = vec![0u64; group_count];
-        for rid in 0..region_count {
-            group_total[region_group[rid] as usize] += region_size[rid] as u64;
-        }
-
-        let mut group_cost = vec![[0.0f64; 5]; group_total.len()];
-        let mut group_covered = vec![0u64; group_total.len()];
-        for (row, n) in nyq.iter().copied().enumerate().take(rows) {
-            if !n.is_finite() || n <= 0.0 {
-                continue;
-            }
-            for gate in 0..gates {
-                let idx = row * gates + gate;
-                let rid = region_of[idx];
-                if rid == u32::MAX {
-                    continue;
-                }
-                let Some(predicted) = reference.eval(row, gate) else {
-                    continue;
-                };
-                let rid = rid as usize;
-                let group = region_group[rid] as usize;
-                group_covered[group] += 1;
-                let current_fold = region_fold[rid];
-                for (slot, delta) in (-2i32..=2).enumerate() {
-                    let unfolded = observed[idx] + (current_fold + delta) as f32 * 2.0 * n;
-                    group_cost[group][slot] +=
-                        ((unfolded - predicted).abs() as f64).min(DENSE_REFERENCE_LOSS_CAP_MPS);
-                }
-            }
-        }
-
-        let mut group_adjustment = vec![0i32; group_total.len()];
-        for group in 0..group_total.len() {
-            let covered = group_covered[group];
-            let total_gates = group_total[group];
-            if covered < DENSE_REFERENCE_MIN_GROUP_SAMPLES
-                || total_gates == 0
-                || (covered as f64) < DENSE_REFERENCE_MIN_GROUP_COVERAGE * total_gates as f64
-            {
-                continue;
-            }
-            let costs = &group_cost[group];
-            let mut order = [0usize, 1, 2, 3, 4];
-            order.sort_by(|left, right| costs[*left].total_cmp(&costs[*right]));
-            let best_slot = order[0];
-            if best_slot == 2 {
-                continue;
-            }
-            let samples = covered as f64;
-            let best_average = costs[best_slot] / samples;
-            let current_average = costs[2] / samples;
-            let second_average = costs[order[1]] / samples;
-            if current_average - best_average >= DENSE_REFERENCE_GROUP_IMPROVEMENT_MPS
-                && best_average <= DENSE_REFERENCE_GROUP_RATIO * current_average
-                && second_average - best_average >= DENSE_REFERENCE_MIN_SEPARATION_MPS
-            {
-                group_adjustment[group] = best_slot as i32 - 2;
-            }
-        }
-        if group_adjustment.iter().any(|delta| *delta != 0) {
-            for rid in 0..region_count {
-                let delta = group_adjustment[region_group[rid] as usize];
-                if delta != 0 {
-                    region_fold[rid] = (region_fold[rid] + delta)
-                        .clamp(-region_core::REGION_MAX_FOLD, region_core::REGION_MAX_FOLD);
-                }
-            }
-        }
-
-        let mut region_cost = vec![[0.0f64; 3]; region_count];
-        let mut region_covered = vec![0u32; region_count];
-        for (row, n) in nyq.iter().copied().enumerate().take(rows) {
-            if !n.is_finite() || n <= 0.0 {
-                continue;
-            }
-            for gate in 0..gates {
-                let idx = row * gates + gate;
-                let rid = region_of[idx];
-                if rid == u32::MAX {
-                    continue;
-                }
-                let Some(predicted) = reference.eval(row, gate) else {
-                    continue;
-                };
-                let rid = rid as usize;
-                region_covered[rid] += 1;
-                let current_fold = region_fold[rid];
-                for (slot, delta) in (-1i32..=1).enumerate() {
-                    let unfolded = observed[idx] + (current_fold + delta) as f32 * 2.0 * n;
-                    region_cost[rid][slot] +=
-                        ((unfolded - predicted).abs() as f64).min(DENSE_REFERENCE_LOSS_CAP_MPS);
-                }
-            }
-        }
-        for rid in 0..region_count {
-            let covered = region_covered[rid];
-            if covered < DENSE_REFERENCE_MIN_REGION_SAMPLES
-                || (covered as f64) < DENSE_REFERENCE_MIN_REGION_COVERAGE * region_size[rid] as f64
-            {
-                continue;
-            }
-            let costs = &region_cost[rid];
-            let mut order = [0usize, 1, 2];
-            order.sort_by(|left, right| costs[*left].total_cmp(&costs[*right]));
-            let best_slot = order[0];
-            if best_slot == 1 {
-                continue;
-            }
-            let samples = covered as f64;
-            let best_average = costs[best_slot] / samples;
-            let current_average = costs[1] / samples;
-            let second_average = costs[order[1]] / samples;
-            if current_average - best_average >= DENSE_REFERENCE_REGION_IMPROVEMENT_MPS
-                && best_average <= DENSE_REFERENCE_REGION_RATIO * current_average
-                && second_average - best_average >= DENSE_REFERENCE_MIN_SEPARATION_MPS
-            {
-                let delta = best_slot as i32 - 1;
-                region_fold[rid] = (region_fold[rid] + delta)
                     .clamp(-region_core::REGION_MAX_FOLD, region_core::REGION_MAX_FOLD);
             }
         }
@@ -4294,6 +4167,99 @@ mod tests {
 
         assert_eq!(corrected.scaled_value(2, 3), Some(11.0));
         assert_eq!(corrected.scaled_value(2, 4), Some(13.0));
+    }
+
+    /// Build a full 360° velocity tilt whose TRUE field is a uniform wind
+    /// (radial component = speed·cos(az − dir)), wrapped into ±nyquist.
+    /// (Ported from the retired cascade engine's test fixture.)
+    fn tilt_with_uniform_wind(
+        elevation: f32,
+        speed: f32,
+        toward_deg: f32,
+        nyquist: f32,
+        rows: usize,
+        gates: usize,
+    ) -> ElevationCut {
+        let gate_range = GateRange {
+            first_gate_m: 1000,
+            gate_spacing_m: 250,
+            gate_count: gates,
+        };
+        let mut cut = ElevationCut::new(elevation, None);
+        let mut data = vec![f32::NAN; rows * gates];
+        for row in 0..rows {
+            let az = row as f32 * (360.0 / rows as f32);
+            cut.radials.push(Radial {
+                azimuth_deg: az,
+                elevation_deg: elevation,
+                time_offset_ms: 0,
+                gate_range: gate_range.clone(),
+                nyquist_velocity_mps: Some(nyquist),
+                radial_status: None,
+            });
+            let true_v = speed * ((az - toward_deg).to_radians()).cos();
+            let mut wrapped = true_v;
+            while wrapped > nyquist {
+                wrapped -= 2.0 * nyquist;
+            }
+            while wrapped < -nyquist {
+                wrapped += 2.0 * nyquist;
+            }
+            for gate in 0..gates {
+                data[row * gates + gate] = wrapped;
+            }
+        }
+        cut.moments.insert(
+            MomentType::Velocity,
+            MomentGrid {
+                moment: MomentType::Velocity,
+                gate_range,
+                scale: 1.0,
+                offset: 0.0,
+                nodata: None,
+                range_folded: None,
+                radial_indices: (0..rows).collect(),
+                storage: MomentStorage::F32(data),
+            },
+        );
+        cut
+    }
+
+    /// Pins the two v0.29.0 survivors of the retired cascade/hybrid engines:
+    /// [`fit_range_band_reference`] (also the bench battery's `rms_harmonic`
+    /// metric input) and the region engine's external-reference branch
+    /// selection ([`dealias_velocity_grid_with_reference`]).
+    #[test]
+    fn external_harmonic_reference_selects_the_absolute_branch() {
+        // 35 m/s wind. Clean tilt: Nyquist 40 — no aliasing, honest fit.
+        // Target tilt: Nyquist 20 — large sectors wrap (|v| up to 35), the
+        // regime where a same-sweep reference is circular.
+        let clean = tilt_with_uniform_wind(2.4, 35.0, 180.0, 40.0, 360, 200);
+        let clean_grid = clean.moments.get(&MomentType::Velocity).unwrap();
+        let reference = fit_range_band_reference(&clean, clean_grid);
+        assert!(
+            reference.fits.iter().filter(|fit| fit.is_some()).count() > 0,
+            "clean uniform wind must produce usable band fits"
+        );
+
+        let target = tilt_with_uniform_wind(0.5, 35.0, 180.0, 20.0, 360, 200);
+        let target_grid = target.moments.get(&MomentType::Velocity).unwrap();
+        let dealiased =
+            dealias_velocity_grid_with_reference(&target, target_grid, Some(&reference));
+        let mut worst = 0.0f32;
+        for row in 0..360 {
+            let az = row as f32;
+            let truth = 35.0 * ((az - 180.0).to_radians()).cos();
+            for gate in (0..200).step_by(7) {
+                if let Some(v) = dealiased.scaled_value(row, gate).filter(|v| v.is_finite()) {
+                    worst = worst.max((v - truth).abs());
+                }
+            }
+        }
+        assert!(
+            worst < 2.0,
+            "external reference should recover the true field everywhere; worst error {worst} m/s"
+        );
     }
 
     #[test]
