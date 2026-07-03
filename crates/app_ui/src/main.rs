@@ -80,6 +80,24 @@ use sites_ui::{
     radar_site_search_matches, us_site_kind,
 };
 use ui_core::geo::{aeqd_forward_km, aeqd_inverse_km};
+// v0.29 Phase 4c: the FrameHistory family moved VERBATIM into the shared
+// engine crate (spec §8 row "FrameHistory + generation fn + …"); these
+// re-exports keep every existing `crate::…` reference — main.rs and the
+// sibling modules — compiling unchanged. Runtime behavior identical.
+pub(crate) use ui_core::loop_engine::{
+    DEFAULT_HISTORY_FRAME_LIMIT, DecodedLoad, DecodedLoadBatch, FrameHistory, FrameHistoryEntry,
+    FrameIdentity, FrameStatus, INTL_POLL_SECONDS, INTL_STALE_CHIP_FLOOR_SECONDS, LoadTimings,
+    MAX_HISTORY_FRAME_LIMIT, OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS,
+    frame_history_entry_from_decoded, frame_identity_for_volume, frame_status_priority,
+    history_contains_other_site, live_partial_frame_has_new_data,
+};
+// v0.29 Phase 4c overlay adoption: radar overlay layers are the FIRST view
+// on the engine (spec §7 adoption order overlays → panes → primary). The
+// primary/pane paths still run their legacy plumbing until 4d/4e.
+pub(crate) use ui_core::loop_engine::{
+    ArchiveWindow, EngineId, EngineRole, FeedSource, InstallSelection, Liveness, LoopEngine,
+    SelectionPolicy,
+};
 use ui_core::render_service::{
     DrainBudget, LaneId, OverlayPool, PrewarmPool, RenderRoute, RepaintDecision,
     loop_prewarm_inflight_limit, loop_prewarm_worker_count, overlay_pool_worker_target,
@@ -159,7 +177,9 @@ const MPING_DECLUTTER_CELL_PX: f32 = 24.0;
 const MPING_MAX_DRAWN_REPORTS: usize = 500;
 const MPING_LABEL_REPORT_LIMIT: usize = 80;
 const PRIMARY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 1;
-const OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS: u64 = 5;
+// OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS moved to ui_core::loop_engine
+// (re-exported above): the engine's pane/overlay cadence cell derives
+// from the same constant.
 const REALTIME_LEVEL2_STALE_FALLBACK_SECONDS: i64 = 20 * 60;
 const MAX_RADAR_OVERLAY_LAYERS: usize = 10;
 const STORM_VIDEO_SYNC_TOTAL_RADARS: usize = 5;
@@ -177,10 +197,13 @@ const ALERT_SOUND_FAMILY_OPTIONS: &[(&str, &str)] = &[
 ];
 const PERF_SAMPLE_CAPACITY: usize = 96;
 const STALE_LATEST_DISPLAY_CLEAR_SECONDS: i64 = 15 * 60;
+// Invariant: HISTORY_SIZE_OPTIONS[0] must equal
+// ui_core::loop_engine::MIN_HISTORY_FRAME_LIMIT — `normalized_history_limit`
+// (here) and the engine's `HistoryLimits::normalized_frame_limit` clamp to
+// the same floor. DEFAULT/MAX moved to ui_core (re-exported above).
 const HISTORY_SIZE_OPTIONS: &[usize] = &[
     3, 5, 7, 10, 15, 20, 25, 30, 48, 72, 96, 128, 160, 200, 256, 384, 512, 768, 1000, 1500, 2000,
 ];
-const DEFAULT_HISTORY_FRAME_LIMIT: usize = 7;
 const DEFAULT_ARCHIVE_FRAME_COUNT: usize = 10;
 const MAX_ARCHIVE_FRAME_COUNT: usize = MAX_HISTORY_FRAME_LIMIT;
 const MAX_LIVE_PRELOAD_FRAME_COUNT: usize = 10;
@@ -191,9 +214,6 @@ const MIN_STORM_TRACK_MIN_DBZ: f32 = 30.0;
 const MAX_STORM_TRACK_MIN_DBZ: f32 = 65.0;
 pub(crate) const MAX_EVENT_PAD_FRAMES: u16 = 40;
 const DEFAULT_EVENT_MAX_FRAMES: usize = 24;
-/// Hard ceiling for the frame strip — deployment folders legitimately
-/// load 100+ volumes.
-const MAX_HISTORY_FRAME_LIMIT: usize = 2000;
 const HISTORY_LOOP_FRAME_MS: u64 = 700;
 const MAX_LOOP_SPEED_PERCENT: u16 = 6400;
 const MAX_LOOP_REPAINT_POLL_MS: u64 = INTERACTIVE_POLL_REPAINT_MS;
@@ -557,16 +577,9 @@ const LIVE_COMPLETE_TILT_MIN_AZIMUTH_COVERAGE_DEG: f32 = 350.0;
 const LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG: f32 = 0.25;
 const HISTORY_ARCHIVE_LOAD_MAX_PARALLELISM: usize = 6;
 
-/// International catalog-poll cadence. National open-data feeds publish on
-/// 5-minute-ish schedules and each tick costs an upstream API round trip —
-/// 60 s, not the custom URL poll's 15 s dir.list cadence.
-const INTL_POLL_SECONDS: u64 = 60;
-/// Stale-threshold floor for the primary mode chip while an international
-/// poll owns the display: intl feeds publish on 5-15 minute cadences (vs
-/// the 480 s NEXRAD-tuned default), so a live intl chip flags STALE only
-/// past twice the slowest routine cadence — a normal publish gap must not
-/// read as a fault.
-const INTL_STALE_CHIP_FLOOR_SECONDS: i64 = 1800;
+// INTL_POLL_SECONDS and INTL_STALE_CHIP_FLOOR_SECONDS moved to
+// ui_core::loop_engine (re-exported above): the engine's intl cadence cell
+// and cadence-aware stale floor derive from the same constants.
 const ACTIVE_ALERTS_URL: &str = "https://api.weather.gov/alerts/active?status=actual";
 const SPC_MD_INDEX_URL: &str = "https://www.spc.noaa.gov/products/md/";
 const SPC_PRODUCT_BASE_URL: &str = "https://www.spc.noaa.gov";
@@ -1736,7 +1749,7 @@ struct ViewerApp {
     sites: Vec<RadarSite>,
     selected_site_index: usize,
     app_settings: settings::AppSettings,
-    radar_layers: Vec<RadarOverlayLayer>,
+    radar_layers: Vec<OverlayView>,
     radar_overlays_open: bool,
     next_radar_layer_id: u64,
     site_catalog_receiver: Option<mpsc::Receiver<AsyncSiteCatalogResult>>,
@@ -2233,17 +2246,10 @@ struct IntlCoverageProbe {
     elapsed_ms: u128,
 }
 
-/// An overlay layer's international source: refreshed from the provider
-/// registry's catalog probe + identity dedupe instead of the US Level-II
-/// chain (field request: Ctrl+right-click multi-radar for intl sites).
-struct IntlOverlayFeed {
-    provider_id: String,
-    site_id: String,
-    /// Last installed FramePlan identity — poll-style dedupe, so an
-    /// unchanged frame costs one catalog probe and zero downloads.
-    last_identity: Option<String>,
-    rx: Option<mpsc::Receiver<IntlFrameResult>>,
-}
+// v0.29 Phase 4c: `IntlOverlayFeed` dissolved into the overlay engine
+// (spec §8 row "IntlOverlayFeed"): provider/site → `engine.feed`,
+// `last_identity` → `engine.live.dedupe_key`, `rx` → `OverlayView::intl_rx`
+// (view-side until the engine grows worker slots at the pane/primary ports).
 
 /// UI-side view of an international site selection (provider, site, and a
 /// display label). Since the v0.29 Phase-3 pin collapse this is NOT pane
@@ -2267,16 +2273,27 @@ impl PaneIntlSource {
     }
 }
 
-struct RadarOverlayLayer {
-    id: u64,
+/// One radar overlay layer: a [`LoopEngine`] plus the display-side state
+/// the engine does not own (v0.29 Phase 4c — the spec §3 `OverlayView`
+/// shape; overlays are the FIRST engine adoption, spec §7). Textures and
+/// the load/poll receivers stay view-side because the 4c engine core
+/// deliberately has no worker/texture slots — those arrive with the
+/// pane/primary ports (4d/4e).
+///
+/// Engine-owned state, with the legacy field it replaced (for grep
+/// archaeology): `engine.history` ← `frame_history: Vec<FrameHistoryEntry>`
+/// (now on the generation spine, census D12), `engine.cursor.index` ←
+/// `selected_frame_index`, `engine.status` ← `status`, `engine.id.0` ←
+/// `id`, `engine.live.last_refresh` ← `last_realtime_level2_refresh`,
+/// `engine.feed` + `engine.live.dedupe_key` ← `IntlOverlayFeed`.
+struct OverlayView {
+    engine: LoopEngine,
     site: RadarSite,
-    /// `Some` = this layer follows an international feed; `None` = US
-    /// Level-II via `start_radar_layer_load`.
-    intl_feed: Option<IntlOverlayFeed>,
+    /// In-flight international catalog-probe fetch — the intl analog of
+    /// `load_receiver` (was `IntlOverlayFeed::rx`).
+    intl_rx: Option<mpsc::Receiver<IntlFrameResult>>,
     source_path: Option<PathBuf>,
     volume: Option<Arc<RadarVolume>>,
-    frame_history: Vec<FrameHistoryEntry>,
-    selected_frame_index: usize,
     /// True only for overlays loaded by the Unified Player's coordinated
     /// archive-loop actions. Ordinary live/manual overlays keep their own
     /// newest frame and are not forced onto an archive cursor.
@@ -2290,8 +2307,6 @@ struct RadarOverlayLayer {
     texture_key: Option<TextureKey>,
     pending_render_key: Option<TextureKey>,
     load_receiver: Option<mpsc::Receiver<AsyncLoadResult>>,
-    status: String,
-    last_realtime_level2_refresh: Option<Instant>,
     opacity: u8,
     visible: bool,
     radar_range_km: f32,
@@ -2300,19 +2315,36 @@ struct RadarOverlayLayer {
     texture_ms: Option<f32>,
 }
 
-impl RadarOverlayLayer {
-    /// Since the Phase-4b pool flip a layer owns NO render worker: renders
-    /// go through `ViewerApp::overlay_render_pool` on `LaneId::Overlay(id)`.
+impl OverlayView {
+    /// A US Level-II overlay layer following `site` live. Since the
+    /// Phase-4b pool flip a layer owns NO render worker: renders go
+    /// through `ViewerApp::overlay_render_pool` on `LaneId::Overlay(id)`.
     fn new(id: u64, site: RadarSite) -> Self {
-        let site_id = site.level2_id.clone();
+        let feed = FeedSource::Live(data_source::sites::SiteRef::Us {
+            level2_id: site.level2_id.clone(),
+        });
+        Self::with_feed(id, site, feed)
+    }
+
+    /// An international overlay layer following `provider_id`/`site_id`
+    /// live (`site` carries the display label + coordinates).
+    fn new_intl(id: u64, site: RadarSite, provider_id: String, site_id: String) -> Self {
+        let feed = FeedSource::Live(data_source::sites::SiteRef::Intl {
+            provider_id,
+            site_id,
+        });
+        Self::with_feed(id, site, feed)
+    }
+
+    fn with_feed(id: u64, site: RadarSite, feed: FeedSource) -> Self {
+        let mut engine = LoopEngine::new(EngineId(id), EngineRole::Overlay, feed);
+        engine.status = format!("Queued {}", site.level2_id);
         Self {
-            id,
+            engine,
             site,
-            intl_feed: None,
+            intl_rx: None,
             source_path: None,
             volume: None,
-            frame_history: Vec::new(),
-            selected_frame_index: 0,
             timeline_sync: false,
             selected_cut: None,
             load_timing: None,
@@ -2320,8 +2352,6 @@ impl RadarOverlayLayer {
             texture_key: None,
             pending_render_key: None,
             load_receiver: None,
-            status: format!("Queued {site_id}"),
-            last_realtime_level2_refresh: None,
             opacity: DEFAULT_RADAR_OVERLAY_ALPHA,
             visible: true,
             radar_range_km: DEFAULT_RADAR_RANGE_KM,
@@ -2331,11 +2361,60 @@ impl RadarOverlayLayer {
         }
     }
 
+    /// The provider/site pair when this layer follows an international
+    /// source — live OR archive-window (a Mosaic ORD loop is still an
+    /// international layer for refresh/promote routing).
+    fn intl_site_ref(&self) -> Option<(&str, &str)> {
+        match &self.engine.feed {
+            FeedSource::Live(data_source::sites::SiteRef::Intl {
+                provider_id,
+                site_id,
+            })
+            | FeedSource::Archive {
+                site:
+                    data_source::sites::SiteRef::Intl {
+                        provider_id,
+                        site_id,
+                    },
+                ..
+            } => Some((provider_id.as_str(), site_id.as_str())),
+            _ => None,
+        }
+    }
+
+    fn is_intl(&self) -> bool {
+        self.intl_site_ref().is_some()
+    }
+
     fn radar_location(&self) -> Option<(f32, f32)> {
         self.volume
             .as_ref()
             .and_then(|volume| Some((volume.site.latitude_deg?, volume.site.longitude_deg?)))
             .or_else(|| site_location(&self.site))
+    }
+}
+
+/// The overlay layer's state chip (Layers rail). Strings are the legacy
+/// chip vocabulary, greppable-identical (census D11); the live-vs-queued
+/// truth derives from [`LoopEngine::liveness`] — an engine with any frame
+/// on a live feed reads "live" exactly where the legacy `volume.is_some()`
+/// check did. `displaying` covers the one gap liveness cannot see: a
+/// census-D14 display-only preview (volume painted, history still empty)
+/// kept the legacy chip "live" and still does.
+fn overlay_state_chip(
+    loading: bool,
+    timeline_sync: bool,
+    liveness: Option<Liveness>,
+    displaying: bool,
+) -> &'static str {
+    if loading {
+        "loading"
+    } else if timeline_sync {
+        "timeline"
+    } else if liveness.is_some() || displaying {
+        "live"
+    } else {
+        "queued"
     }
 }
 
@@ -2517,35 +2596,7 @@ enum LatestLoadMode {
     AutoRefresh,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct LoadTimings {
-    total_ms: f32,
-    lookup_ms: Option<f32>,
-    lookup_cache_hit: Option<bool>,
-    fetch_ms: Option<f32>,
-    fetch_cache_hit: Option<bool>,
-    read_ms: Option<f32>,
-    decode_ms: f32,
-    preview_ms: Option<f32>,
-    realtime_poll_start_utc: Option<DateTime<Utc>>,
-    realtime_poll_end_utc: Option<DateTime<Utc>>,
-    realtime_volume_id: Option<u16>,
-    realtime_chunk_count: Option<usize>,
-    realtime_last_chunk_id: Option<u16>,
-    realtime_last_chunk_type: Option<RealtimeChunkType>,
-    realtime_complete: Option<bool>,
-    realtime_total_size: Option<u64>,
-    realtime_assembled_size: Option<u64>,
-    realtime_last_modified_utc: Option<DateTime<Utc>>,
-    realtime_volume_time_utc: Option<DateTime<Utc>>,
-}
-
-impl LoadTimings {
-    fn finish(mut self, total_start: Instant) -> Self {
-        self.total_ms = total_start.elapsed().as_secs_f32() * 1000.0;
-        self
-    }
-}
+// LoadTimings moved VERBATIM to ui_core::loop_engine (re-exported above).
 
 #[derive(Clone, Debug)]
 struct RealtimeLoadError {
@@ -2618,161 +2669,9 @@ enum AsyncHazardUpdate {
     Final(Result<HazardOverlay, String>),
 }
 
-#[derive(Clone)]
-struct DecodedLoad {
-    path: PathBuf,
-    volume: Arc<RadarVolume>,
-    timings: LoadTimings,
-    status: FrameStatus,
-    source_label: String,
-}
-
-#[derive(Clone)]
-struct DecodedLoadBatch {
-    frames: Vec<DecodedLoad>,
-    selected_index: usize,
-}
-
-impl DecodedLoadBatch {
-    fn single(decoded: DecodedLoad) -> Self {
-        Self {
-            frames: vec![decoded],
-            selected_index: 0,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct FrameHistoryEntry {
-    identity: FrameIdentity,
-    path: PathBuf,
-    volume: Arc<RadarVolume>,
-    timings: Option<LoadTimings>,
-    status: FrameStatus,
-    source_label: String,
-}
-
-/// Monotonic source for [`FrameHistory`] generation stamps. Process-wide so
-/// a stamp value can never be reused by a different content snapshot: clones
-/// keep the stamp of the content they copied, and every mutation takes a
-/// fresh one. Equal stamps therefore guarantee equal contents, letting O(1)
-/// generation compares replace O(frames) re-hashing in cache keys.
-fn next_frame_history_generation() -> u64 {
-    static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// `Vec<FrameHistoryEntry>` plus a generation stamp bumped on every mutable
-/// access, so the loop-timeline summary cache invalidates exactly when a
-/// history can have changed. `Deref` exposes the read-only Vec API; every
-/// mutation funnels through the bumping methods below (there is deliberately
-/// no `DerefMut`, so a forgotten bump is a compile error, not a stale cache).
-#[derive(Clone)]
-struct FrameHistory {
-    entries: Vec<FrameHistoryEntry>,
-    generation: u64,
-}
-
-impl FrameHistory {
-    fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            generation: next_frame_history_generation(),
-        }
-    }
-
-    fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    fn bump_generation(&mut self) {
-        self.generation = next_frame_history_generation();
-    }
-
-    fn push(&mut self, entry: FrameHistoryEntry) {
-        self.bump_generation();
-        self.entries.push(entry);
-    }
-
-    fn remove(&mut self, index: usize) -> FrameHistoryEntry {
-        self.bump_generation();
-        self.entries.remove(index)
-    }
-
-    fn clear(&mut self) {
-        self.bump_generation();
-        self.entries.clear();
-    }
-
-    fn sort_by(&mut self, compare: impl FnMut(&FrameHistoryEntry, &FrameHistoryEntry) -> Ordering) {
-        self.bump_generation();
-        self.entries.sort_by(compare);
-    }
-
-    /// Mutable iteration bumps up front: callers may rewrite any entry
-    /// (upsert replace, advanced-product volume write-back), and a spurious
-    /// bump only costs one summary recompute — never a stale cache.
-    fn iter_mut(&mut self) -> std::slice::IterMut<'_, FrameHistoryEntry> {
-        self.bump_generation();
-        self.entries.iter_mut()
-    }
-}
-
-impl std::ops::Deref for FrameHistory {
-    type Target = Vec<FrameHistoryEntry>;
-
-    fn deref(&self) -> &Vec<FrameHistoryEntry> {
-        &self.entries
-    }
-}
-
-impl std::ops::Index<usize> for FrameHistory {
-    type Output = FrameHistoryEntry;
-
-    fn index(&self, index: usize) -> &FrameHistoryEntry {
-        &self.entries[index]
-    }
-}
-
-impl std::ops::IndexMut<usize> for FrameHistory {
-    fn index_mut(&mut self, index: usize) -> &mut FrameHistoryEntry {
-        self.bump_generation();
-        &mut self.entries[index]
-    }
-}
-
-impl From<Vec<FrameHistoryEntry>> for FrameHistory {
-    fn from(entries: Vec<FrameHistoryEntry>) -> Self {
-        Self {
-            entries,
-            generation: next_frame_history_generation(),
-        }
-    }
-}
-
-impl FromIterator<FrameHistoryEntry> for FrameHistory {
-    fn from_iter<I: IntoIterator<Item = FrameHistoryEntry>>(iter: I) -> Self {
-        Self::from(iter.into_iter().collect::<Vec<_>>())
-    }
-}
-
-impl<'a> IntoIterator for &'a FrameHistory {
-    type Item = &'a FrameHistoryEntry;
-    type IntoIter = std::slice::Iter<'a, FrameHistoryEntry>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.entries.iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a mut FrameHistory {
-    type Item = &'a mut FrameHistoryEntry;
-    type IntoIter = std::slice::IterMut<'a, FrameHistoryEntry>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter_mut()
-    }
-}
+// DecodedLoad, DecodedLoadBatch, FrameHistoryEntry, the generation-stamped
+// FrameHistory (no-DerefMut bump discipline intact), and FrameIdentity moved
+// VERBATIM to ui_core::loop_engine (re-exported above; spec §8).
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LoopTimelineSummaryCacheKey {
@@ -2833,12 +2732,6 @@ enum CoordinatedOverlayLoadMode {
         end_utc: DateTime<Utc>,
         max_frames: usize,
     },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct FrameIdentity {
-    site_id: String,
-    scan_time_utc: DateTime<Utc>,
 }
 
 /// Content hash of a frame history. Superseded in the summary cache key by
@@ -3010,28 +2903,8 @@ fn insert_limited_frame_cache<T>(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FrameStatus {
-    Local,
-    Preview,
-    LivePartial,
-    LiveComplete,
-    Complete,
-    Stale,
-}
-
-impl FrameStatus {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Preview => "preview",
-            Self::LivePartial => "live partial",
-            Self::LiveComplete => "live complete",
-            Self::Complete => "complete",
-            Self::Stale => "stale",
-        }
-    }
-}
+// FrameStatus (with its label() ladder) moved VERBATIM to
+// ui_core::loop_engine (re-exported above).
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OrdArchiveLoadMode {
@@ -7160,28 +7033,31 @@ impl ViewerApp {
                 // loop and discards its synchronized history.
                 continue;
             }
-            // International layers refresh on the intl poll cadence via
-            // the provider catalog probe — never the US Level-II chain.
-            if let Some(feed) = &layer.intl_feed {
-                if feed.rx.is_none() {
-                    let refresh_after = Duration::from_secs(INTL_POLL_SECONDS)
-                        + Duration::from_millis((index as u64 % 8) * 350);
-                    if layer
-                        .last_realtime_level2_refresh
-                        .is_none_or(|last_refresh| last_refresh.elapsed() >= refresh_after)
-                    {
-                        Self::start_intl_radar_layer_load(layer, ctx);
-                        requested_repaint = true;
-                    }
-                }
+            // Cadence from the engine's (role, feed) table (spec §3):
+            // 5 s for a US overlay chunk refresh, 60 s for an international
+            // catalog probe, None for archive/local feeds (a fixed record
+            // is structurally incapable of refresh). Same values as the
+            // pre-engine constants — the TABLE is what moved.
+            let Some(cadence) = layer.engine.poll_cadence() else {
+                continue;
+            };
+            let refresh_after = cadence + Duration::from_millis((index as u64 % 8) * 350);
+            let should_refresh = layer
+                .engine
+                .live
+                .last_refresh
+                .is_none_or(|last_refresh| last_refresh.elapsed() >= refresh_after);
+            if !should_refresh {
                 continue;
             }
-            let refresh_after = Duration::from_secs(OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS)
-                + Duration::from_millis((index as u64 % 8) * 350);
-            let should_refresh = layer
-                .last_realtime_level2_refresh
-                .is_none_or(|last_refresh| last_refresh.elapsed() >= refresh_after);
-            if should_refresh {
+            // International layers refresh via the provider catalog probe —
+            // never the US Level-II chain.
+            if layer.is_intl() {
+                if layer.intl_rx.is_none() {
+                    Self::start_intl_radar_layer_load(layer, ctx);
+                    requested_repaint = true;
+                }
+            } else {
                 Self::start_radar_layer_load(layer, LatestLoadMode::AutoRefresh, ctx);
                 requested_repaint = true;
             }
@@ -7413,6 +7289,17 @@ impl ViewerApp {
             layer.visible = true;
             layer.timeline_sync = false;
             layer.selected_cut = None;
+            // GO LIVE is an explicit feed switch (spec §2). Same-site
+            // live→live keeps the loop; archive→live clears the engine's
+            // loop state (the incoming latest replaces it wholesale either
+            // way — legacy replace-all). The DISPLAY deliberately survives:
+            // same-site refresh keeps the existing texture until the
+            // replacement render lands (pinned legacy behavior).
+            let _ = layer
+                .engine
+                .set_feed(FeedSource::Live(data_source::sites::SiteRef::Us {
+                    level2_id: site.level2_id.clone(),
+                }));
             if layer.load_receiver.is_none() {
                 Self::start_radar_layer_load(layer, LatestLoadMode::User, ctx);
             }
@@ -7431,7 +7318,7 @@ impl ViewerApp {
 
         let id = self.next_radar_layer_id;
         self.next_radar_layer_id = self.next_radar_layer_id.saturating_add(1);
-        let mut layer = RadarOverlayLayer::new(id, site.clone());
+        let mut layer = OverlayView::new(id, site.clone());
         Self::start_radar_layer_load(&mut layer, LatestLoadMode::User, ctx);
         self.status = format!("Added overlay {}", site.level2_id);
         self.radar_layers.push(layer);
@@ -7468,7 +7355,7 @@ impl ViewerApp {
 
         let id = self.next_radar_layer_id;
         self.next_radar_layer_id = self.next_radar_layer_id.saturating_add(1);
-        let mut layer = RadarOverlayLayer::new(id, site.clone());
+        let mut layer = OverlayView::new(id, site.clone());
         Self::start_radar_layer_archive_window_load(
             &mut layer, start_utc, end_utc, max_frames, ctx,
         );
@@ -7485,19 +7372,22 @@ impl ViewerApp {
         ctx: &egui::Context,
     ) {
         if let Some(index) = self.radar_layers.iter().position(|layer| {
-            layer.intl_feed.as_ref().is_some_and(|feed| {
-                feed.provider_id == intl.provider_id && feed.site_id == intl.site_id
-            })
+            layer.intl_site_ref() == Some((intl.provider_id, intl.site_id.as_str()))
         }) {
             let layer = &mut self.radar_layers[index];
             layer.visible = true;
             layer.timeline_sync = false;
             layer.selected_cut = None;
-            if layer
-                .intl_feed
-                .as_ref()
-                .is_some_and(|feed| feed.rx.is_none())
-            {
+            // GO LIVE is an explicit feed switch (spec §2): a same-site
+            // live restart keeps the loop; a Mosaic archive window on this
+            // site switches back to live and clears the engine loop state.
+            let _ = layer
+                .engine
+                .set_feed(FeedSource::Live(data_source::sites::SiteRef::Intl {
+                    provider_id: intl.provider_id.to_owned(),
+                    site_id: intl.site_id.clone(),
+                }));
+            if layer.intl_rx.is_none() {
                 Self::start_intl_radar_layer_load(layer, ctx);
             }
             self.status = format!("Refreshing overlay {}", layer.site.level2_id);
@@ -7521,31 +7411,28 @@ impl ViewerApp {
             latitude_deg: intl.latitude_deg,
             longitude_deg: intl.longitude_deg,
         };
-        let mut layer = RadarOverlayLayer::new(id, site);
-        layer.intl_feed = Some(IntlOverlayFeed {
-            provider_id: intl.provider_id.to_owned(),
-            site_id: intl.site_id.clone(),
-            last_identity: None,
-            rx: None,
-        });
+        let mut layer =
+            OverlayView::new_intl(id, site, intl.provider_id.to_owned(), intl.site_id.clone());
         Self::start_intl_radar_layer_load(&mut layer, ctx);
         self.status = format!("Added overlay {}", intl.label);
         self.radar_layers.push(layer);
     }
 
     /// One catalog-probe + download for an international overlay layer —
-    /// the layer-side analog of one intl poll tick.
-    fn start_intl_radar_layer_load(layer: &mut RadarOverlayLayer, ctx: &egui::Context) {
-        let Some(feed) = &mut layer.intl_feed else {
+    /// the layer-side analog of one intl poll tick. The dedupe key is the
+    /// engine's (`live.dedupe_key`, was `IntlOverlayFeed::last_identity`):
+    /// an unchanged frame costs one catalog probe and zero downloads.
+    fn start_intl_radar_layer_load(layer: &mut OverlayView, ctx: &egui::Context) {
+        let Some((provider_id, site_id)) = layer.intl_site_ref() else {
             return;
         };
+        let provider_id = provider_id.to_owned();
+        let site_id = site_id.to_owned();
         let (sender, receiver) = mpsc::channel();
-        feed.rx = Some(receiver);
-        layer.last_realtime_level2_refresh = Some(Instant::now());
-        let provider_id = feed.provider_id.clone();
-        let site_id = feed.site_id.clone();
-        let last_identity = feed.last_identity.clone();
-        layer.status = format!("Loading {}", layer.site.level2_id);
+        layer.intl_rx = Some(receiver);
+        layer.engine.live.last_refresh = Some(Instant::now());
+        let last_identity = layer.engine.live.dedupe_key.clone();
+        layer.engine.status = format!("Loading {}", layer.site.level2_id);
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
             let result = fetch_intl_frame(&provider_id, &site_id, last_identity.as_deref());
@@ -7561,10 +7448,7 @@ impl ViewerApp {
         let mut saw_message = false;
         for layer in &mut self.radar_layers {
             let message = {
-                let Some(feed) = &layer.intl_feed else {
-                    continue;
-                };
-                let Some(receiver) = &feed.rx else {
+                let Some(receiver) = &layer.intl_rx else {
                     continue;
                 };
                 match receiver.try_recv() {
@@ -7575,13 +7459,10 @@ impl ViewerApp {
             };
             saw_message = true;
             let label = layer.site.level2_id.clone();
-            let Some(feed) = &mut layer.intl_feed else {
-                continue;
-            };
-            feed.rx = None;
+            layer.intl_rx = None;
             match message {
                 Some(Ok(Some((identity, volume)))) => {
-                    feed.last_identity = Some(identity.clone());
+                    layer.engine.live.dedupe_key = Some(identity.clone());
                     Self::install_radar_layer_volume(
                         layer,
                         DecodedLoad {
@@ -7592,11 +7473,16 @@ impl ViewerApp {
                             source_label: identity,
                         },
                     );
-                    layer.status = format!("Loaded {label}");
+                    layer.engine.status = format!("Loaded {label}");
                 }
-                Some(Ok(None)) => layer.status = format!("Current {label}"),
-                Some(Err(err)) => layer.status = format!("Load failed for {label}: {err}"),
-                None => layer.status = format!("Layer load worker disconnected ({label})"),
+                Some(Ok(None)) => layer.engine.status = format!("Current {label}"),
+                Some(Err(err)) => {
+                    layer.engine.status = format!("Load failed for {label}: {err}");
+                }
+                // Census D11: the intl arm's `({label})` disconnect suffix
+                // deliberately keeps its wording drift until the two overlay
+                // drains unify (the decision folds it in THAT commit).
+                None => layer.engine.status = format!("Layer load worker disconnected ({label})"),
             }
         }
         if saw_message {
@@ -7604,18 +7490,24 @@ impl ViewerApp {
         }
     }
 
-    fn start_radar_layer_load(
-        layer: &mut RadarOverlayLayer,
-        mode: LatestLoadMode,
-        ctx: &egui::Context,
-    ) {
+    fn start_radar_layer_load(layer: &mut OverlayView, mode: LatestLoadMode, ctx: &egui::Context) {
         layer.timeline_sync = false;
         layer.selected_cut = None;
         let site_id = layer.site.level2_id.clone();
+        // The ONE feed-switch entry point (spec §2). AutoRefresh ticks are
+        // same-site live→live (KeepHistory); the User arm detaching a
+        // timeline overlay is archive→live (ClearAll of engine loop state;
+        // the display survives until the replacement install, pinned by
+        // same_site_refresh_keeps_existing_texture_until_replacement_render).
+        let _ = layer
+            .engine
+            .set_feed(FeedSource::Live(data_source::sites::SiteRef::Us {
+                level2_id: site_id.clone(),
+            }));
         let (sender, receiver) = mpsc::channel();
         layer.load_receiver = Some(receiver);
-        layer.last_realtime_level2_refresh = Some(Instant::now());
-        layer.status = if mode == LatestLoadMode::AutoRefresh {
+        layer.engine.live.last_refresh = Some(Instant::now());
+        layer.engine.status = if mode == LatestLoadMode::AutoRefresh {
             format!("Refreshing {site_id}")
         } else {
             format!("Loading {site_id}")
@@ -7638,20 +7530,33 @@ impl ViewerApp {
     }
 
     fn start_radar_layer_archive_window_load(
-        layer: &mut RadarOverlayLayer,
+        layer: &mut OverlayView,
         start_utc: DateTime<Utc>,
         end_utc: DateTime<Utc>,
         max_frames: usize,
         ctx: &egui::Context,
     ) {
         // Coordinated loops must never keep painting an unrelated previous or
-        // final frame while their archive window is loading. Clear the old
-        // display and rebuild the history from the requested window; cached
-        // files are still read from NVMe, they are simply not skipped as
-        // "already present" in an in-memory history we just replaced.
+        // final frame while their archive window is loading. The feed switch
+        // (any→Archive = ClearAll, spec §2) clears the engine-owned loop
+        // state; the display-side clears below are the CALLER's half of the
+        // switch contract. Cached files are still read from NVMe, they are
+        // simply not skipped as "already present" in an in-memory history we
+        // just replaced.
+        let site_id = layer.site.level2_id.clone();
+        let max_frames = max_frames.clamp(1, MAX_HISTORY_FRAME_LIMIT);
         layer.timeline_sync = true;
-        layer.frame_history.clear();
-        layer.selected_frame_index = 0;
+        let _ = layer.engine.set_feed(FeedSource::Archive {
+            site: data_source::sites::SiteRef::Us {
+                level2_id: site_id.clone(),
+            },
+            window: ArchiveWindow {
+                start_utc,
+                end_utc,
+                anchor_utc: None,
+                max_frames,
+            },
+        });
         layer.selected_cut = None;
         layer.source_path = None;
         layer.volume = None;
@@ -7662,18 +7567,16 @@ impl ViewerApp {
         layer.worker_ms = None;
         layer.texture_ms = None;
 
-        let site_id = layer.site.level2_id.clone();
         let (sender, receiver) = mpsc::channel();
         layer.load_receiver = Some(receiver);
-        layer.last_realtime_level2_refresh = Some(Instant::now());
-        layer.status = format!(
+        layer.engine.live.last_refresh = Some(Instant::now());
+        layer.engine.status = format!(
             "Loading synced {site_id} {} to {}",
             start_utc.format("%H:%MZ"),
             end_utc.format("%H:%MZ")
         );
         let site_cache = cache_dir(&site_id);
         let known_frame_paths = BTreeSet::new();
-        let max_frames = max_frames.clamp(1, MAX_HISTORY_FRAME_LIMIT);
         thread::spawn(move || {
             let total_start = Instant::now();
             let label = format!("Overlay loop {site_id}");
@@ -7760,6 +7663,137 @@ impl ViewerApp {
         ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
     }
 
+    /// Mosaic/coordinated archive window for an INTERNATIONAL overlay
+    /// layer (v0.29 Phase 4c: coordinated loads work PER-SOURCE — spec §7
+    /// 4c, "Mosaic near Copenhagen loads ORD sites as overlay layers").
+    /// Callers gate on `archive_browser::archive_access` and only route
+    /// `ArchiveAccess::Provider` sites here; the rest grey honestly.
+    /// Field arguments, not `IntlSite`: callers hold either an `IntlSite`
+    /// (coordinated input) or a union-catalog `SiteRecord` (Mosaic) and
+    /// both carry exactly these.
+    #[allow(clippy::too_many_arguments)]
+    fn add_or_refresh_intl_radar_layer_archive_window(
+        &mut self,
+        provider_id: &str,
+        site_id: &str,
+        label: &str,
+        latitude_deg: Option<f32>,
+        longitude_deg: Option<f32>,
+        start_utc: DateTime<Utc>,
+        end_utc: DateTime<Utc>,
+        max_frames: usize,
+        ctx: &egui::Context,
+    ) {
+        if let Some(index) = self
+            .radar_layers
+            .iter()
+            .position(|layer| layer.intl_site_ref() == Some((provider_id, site_id)))
+        {
+            let layer = &mut self.radar_layers[index];
+            layer.visible = true;
+            Self::start_intl_radar_layer_archive_window_load(
+                layer, start_utc, end_utc, max_frames, ctx,
+            );
+            self.status = format!("Loading synced overlay loop {}", layer.site.level2_id);
+            return;
+        }
+
+        if self.radar_layers.len() >= MAX_RADAR_OVERLAY_LAYERS {
+            let remove_index = self
+                .radar_layers
+                .iter()
+                .position(|layer| !layer.visible)
+                .unwrap_or(0);
+            self.radar_layers.remove(remove_index);
+        }
+
+        let id = self.next_radar_layer_id;
+        self.next_radar_layer_id = self.next_radar_layer_id.saturating_add(1);
+        let site = RadarSite {
+            level2_id: label.to_owned(),
+            name: Some(format!("{provider_id}/{site_id}")),
+            latitude_deg,
+            longitude_deg,
+        };
+        let mut layer = OverlayView::new_intl(id, site, provider_id.to_owned(), site_id.to_owned());
+        Self::start_intl_radar_layer_archive_window_load(
+            &mut layer, start_utc, end_utc, max_frames, ctx,
+        );
+        self.status = format!("Added synced overlay loop {label}");
+        self.radar_layers.push(layer);
+    }
+
+    /// Archive-window load for an international overlay layer through the
+    /// provider's `archive_source()` — the intl sibling of
+    /// `start_radar_layer_archive_window_load`. It shares the same drain
+    /// (`poll_radar_layer_loads`: ArchiveProgress + Final arms) and the
+    /// archive_browser worker body, whose window thinning applies census
+    /// D15 even sampling wherever frame stamps parse.
+    fn start_intl_radar_layer_archive_window_load(
+        layer: &mut OverlayView,
+        start_utc: DateTime<Utc>,
+        end_utc: DateTime<Utc>,
+        max_frames: usize,
+        ctx: &egui::Context,
+    ) {
+        let Some((provider_id, site_id)) = layer
+            .intl_site_ref()
+            .map(|(provider, site)| (provider.to_owned(), site.to_owned()))
+        else {
+            return;
+        };
+        let label_site = layer.site.level2_id.clone();
+        let max_frames = max_frames.clamp(1, MAX_HISTORY_FRAME_LIMIT);
+        // Same switch contract as the US arm: any→Archive clears the
+        // engine loop state; the display-side clears are the caller's half.
+        layer.timeline_sync = true;
+        let _ = layer.engine.set_feed(FeedSource::Archive {
+            site: data_source::sites::SiteRef::Intl {
+                provider_id: provider_id.clone(),
+                site_id: site_id.clone(),
+            },
+            window: ArchiveWindow {
+                start_utc,
+                end_utc,
+                anchor_utc: None,
+                max_frames,
+            },
+        });
+        layer.selected_cut = None;
+        layer.source_path = None;
+        layer.volume = None;
+        layer.texture = None;
+        layer.texture_key = None;
+        layer.pending_render_key = None;
+        layer.render_ms = None;
+        layer.worker_ms = None;
+        layer.texture_ms = None;
+
+        let (sender, receiver) = mpsc::channel();
+        layer.load_receiver = Some(receiver);
+        layer.engine.live.last_refresh = Some(Instant::now());
+        layer.engine.status = format!(
+            "Loading synced {label_site} {} to {}",
+            start_utc.format("%H:%MZ"),
+            end_utc.format("%H:%MZ")
+        );
+        let worker_label = format!("Overlay loop {label_site}");
+        let ctx_clone = ctx.clone();
+        thread::spawn(move || {
+            archive_browser::fetch_intl_archive_window_batch(
+                &provider_id,
+                &site_id,
+                start_utc,
+                end_utc,
+                max_frames,
+                &worker_label,
+                &sender,
+            );
+            ctx_clone.request_repaint();
+        });
+        ctx.request_repaint_after(Duration::from_millis(ACTIVE_LOAD_POLL_MS));
+    }
+
     fn poll_radar_layer_loads(&mut self, ctx: &egui::Context) {
         let mut saw_message = false;
         for layer in &mut self.radar_layers {
@@ -7769,16 +7803,42 @@ impl ViewerApp {
                         saw_message = true;
                         match message.update {
                             AsyncLoadUpdate::ArchiveProgress(progress) => {
-                                layer.status = progress.status_text();
+                                layer.engine.status = progress.status_text();
                             }
                             AsyncLoadUpdate::Preview(decoded) => {
-                                Self::install_radar_layer_volume(layer, decoded);
-                                layer.status = format!("Preview {}", message.label);
+                                // Census D14 (decided): previews are
+                                // DISPLAY-ONLY in every role — they never
+                                // enter the engine history.
+                                Self::install_radar_layer_preview(layer, decoded);
+                                layer.engine.status = format!("Preview {}", message.label);
                             }
                             AsyncLoadUpdate::History(batch, select_frame) => {
                                 if select_frame {
                                     Self::install_radar_layer_history(layer, batch);
-                                    layer.status = format!("Loaded {}", message.label);
+                                    layer.engine.status = format!("Loaded {}", message.label);
+                                } else {
+                                    // Census D13 (conscious normalize of dead
+                                    // behavior): a no-select backfill batch
+                                    // INSTALLS with the P1/P2 semantics —
+                                    // upsert into the existing history, no
+                                    // selection — instead of being silently
+                                    // dropped. Overlay workers never send it
+                                    // today (live_preload_frame_count = 0,
+                                    // pinned by live_preload_only_applies_
+                                    // to_explicit_latest_loads).
+                                    let active = layer.volume.clone();
+                                    let outcome = layer.engine.install_batch(
+                                        batch,
+                                        &SelectionPolicy::Backfill,
+                                        active.as_ref(),
+                                        |_| false,
+                                    );
+                                    if let Some(clear) = outcome.cross_site_clear {
+                                        // Census D3: the engine's cross-site
+                                        // diagnostic surfaces on the layer's
+                                        // local status, greppable-identical.
+                                        layer.engine.status = clear.diagnostic;
+                                    }
                                 }
                             }
                             AsyncLoadUpdate::Unchanged { timings, reason } => {
@@ -7786,7 +7846,8 @@ impl ViewerApp {
                                     layer.load_timing = Some(timings);
                                 }
                                 layer.load_receiver = None;
-                                layer.status = format!("Current {} ({reason})", message.label);
+                                layer.engine.status =
+                                    format!("Current {} ({reason})", message.label);
                                 break;
                             }
                             AsyncLoadUpdate::Final(result) => {
@@ -7794,10 +7855,10 @@ impl ViewerApp {
                                 match result {
                                     Ok(batch) => {
                                         Self::install_radar_layer_history(layer, batch);
-                                        layer.status = format!("Loaded {}", message.label);
+                                        layer.engine.status = format!("Loaded {}", message.label);
                                     }
                                     Err(err) => {
-                                        layer.status =
+                                        layer.engine.status =
                                             format!("Load failed for {}: {err}", message.label);
                                     }
                                 }
@@ -7808,7 +7869,7 @@ impl ViewerApp {
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         layer.load_receiver = None;
-                        layer.status = "Layer load worker disconnected".to_owned();
+                        layer.engine.status = "Layer load worker disconnected".to_owned();
                         saw_message = true;
                         break;
                     }
@@ -7828,49 +7889,77 @@ impl ViewerApp {
         }
     }
 
-    fn install_radar_layer_volume(layer: &mut RadarOverlayLayer, decoded: DecodedLoad) {
+    fn install_radar_layer_volume(layer: &mut OverlayView, decoded: DecodedLoad) {
         Self::install_radar_layer_history(layer, DecodedLoadBatch::single(decoded));
     }
 
-    fn install_radar_layer_history(layer: &mut RadarOverlayLayer, batch: DecodedLoadBatch) {
+    /// The legacy overlay REPLACE-ALL install, spelled per census D1 as an
+    /// explicit `clear_history()` + one engine `install_batch` — never a
+    /// fourth upsert mode. Selection policy per call-site role (census D5):
+    /// a plain overlay selects the batch anchor (`SelectAnchor`, no
+    /// blank-display escape — that is Primary-only); a coordinated
+    /// timeline overlay holds its cursor (`KeepCursor`) and lets
+    /// `sync_radar_overlay_layers_to_timeline` re-select by time in the
+    /// same drain pass.
+    fn install_radar_layer_history(layer: &mut OverlayView, batch: DecodedLoadBatch) {
         if batch.frames.is_empty() {
             return;
         }
-        let selected_index = batch
-            .selected_index
-            .min(batch.frames.len().saturating_sub(1));
-        let selected_identity = batch
-            .frames
-            .get(selected_index)
-            .map(|decoded| frame_identity_for_volume(&decoded.volume));
-        layer.frame_history = batch
-            .frames
-            .into_iter()
-            .map(frame_history_entry_from_decoded)
-            .collect();
-        layer
-            .frame_history
-            .sort_by(|left, right| left.identity.cmp(&right.identity));
-        let selected_index = selected_identity
-            .and_then(|identity| {
-                layer
-                    .frame_history
-                    .iter()
-                    .position(|frame| frame.identity == identity)
-            })
-            .unwrap_or_else(|| selected_index.min(layer.frame_history.len().saturating_sub(1)));
-        Self::select_radar_layer_history_frame(layer, selected_index);
+        layer.engine.clear_history();
+        let policy = if layer.timeline_sync {
+            SelectionPolicy::KeepCursor
+        } else {
+            SelectionPolicy::SelectAnchor {
+                blank_display_overrides_browsing: false,
+            }
+        };
+        // Replace-all makes the cross-site guard trivially quiet (census D3
+        // row P4): the history was just cleared and no active volume is
+        // passed. The guard's live overlay surface is the D13 backfill arm
+        // in `poll_radar_layer_loads`.
+        let outcome = layer.engine.install_batch(batch, &policy, None, |_| false);
+        if let Some(clear) = outcome.cross_site_clear {
+            layer.engine.status = clear.diagnostic;
+        }
+        if let InstallSelection::SelectedAnchor { index } = outcome.selection {
+            Self::select_radar_layer_history_frame(layer, index);
+        }
     }
 
-    fn select_radar_layer_history_frame(layer: &mut RadarOverlayLayer, index: usize) -> bool {
-        let Some(frame) = layer.frame_history.get(index).cloned() else {
+    /// Census D14 (decided 2026-07-02): previews are DISPLAY-ONLY in every
+    /// role. This writes the view's display state — exactly the display
+    /// half of [`Self::select_radar_layer_history_frame`] — and never
+    /// touches `engine.history` (the legacy overlay preview replaced the
+    /// whole history, an artifact of the overlay having had no separate
+    /// display-install path).
+    fn install_radar_layer_preview(layer: &mut OverlayView, decoded: DecodedLoad) {
+        let retained_texture = layer.timeline_sync.then(|| layer.texture.clone()).flatten();
+        let retained_texture_key = retained_texture
+            .as_ref()
+            .and_then(|_| layer.texture_key.clone());
+        layer.selected_cut = None;
+        layer.source_path = Some(decoded.path);
+        layer.load_timing = Some(decoded.timings);
+        layer.volume = Some(decoded.volume);
+        layer.texture = retained_texture;
+        layer.texture_key = retained_texture_key;
+        layer.pending_render_key = None;
+        if !layer.timeline_sync || layer.texture.is_none() {
+            layer.render_ms = None;
+            layer.worker_ms = None;
+            layer.texture_ms = None;
+        }
+    }
+
+    fn select_radar_layer_history_frame(layer: &mut OverlayView, index: usize) -> bool {
+        let Some(frame) = layer.engine.history.get(index).cloned() else {
             return false;
         };
         let retained_texture = layer.timeline_sync.then(|| layer.texture.clone()).flatten();
         let retained_texture_key = retained_texture
             .as_ref()
             .and_then(|_| layer.texture_key.clone());
-        layer.selected_frame_index = index;
+        layer.engine.cursor.index = index;
         layer.selected_cut = None;
         layer.source_path = Some(frame.path);
         layer.load_timing = frame.timings;
@@ -7886,7 +7975,7 @@ impl ViewerApp {
         true
     }
 
-    fn set_radar_layer_selected_cut(layer: &mut RadarOverlayLayer, cut: usize) -> bool {
+    fn set_radar_layer_selected_cut(layer: &mut OverlayView, cut: usize) -> bool {
         if layer.selected_cut == Some(cut) {
             return false;
         }
@@ -7906,7 +7995,7 @@ impl ViewerApp {
         true
     }
 
-    fn clear_radar_layer_timeline_display(layer: &mut RadarOverlayLayer) -> bool {
+    fn clear_radar_layer_timeline_display(layer: &mut OverlayView) -> bool {
         let changed = layer.volume.is_some()
             || layer.texture.is_some()
             || layer.texture_key.is_some()
@@ -7948,7 +8037,7 @@ impl ViewerApp {
 
             let selection = if use_sweep_policy {
                 sweep_history_cut_at_or_before_near_elevation(
-                    &layer.frame_history,
+                    &layer.engine.history,
                     &product,
                     policy,
                     disabled_cuts,
@@ -7956,7 +8045,7 @@ impl ViewerApp {
                     primary_elevation,
                 )
                 .and_then(|(frame_index, cut)| {
-                    let frame = layer.frame_history.get(frame_index)?;
+                    let frame = layer.engine.history.get(frame_index)?;
                     let observation_time = cut_start_time_utc(frame.volume.as_ref(), cut)
                         .unwrap_or(frame.identity.scan_time_utc);
                     coordinated_observation_is_usable(observation_time, target_utc).then_some((
@@ -7967,7 +8056,7 @@ impl ViewerApp {
                 })
             } else {
                 history_cut_at_or_before_near_elevation(
-                    &layer.frame_history,
+                    &layer.engine.history,
                     &product,
                     target_utc,
                     primary_elevation,
@@ -7978,7 +8067,7 @@ impl ViewerApp {
                 if Self::clear_radar_layer_timeline_display(layer) {
                     changed = true;
                 }
-                layer.status = format!(
+                layer.engine.status = format!(
                     "No {} scan at-or-before {}",
                     layer.site.level2_id,
                     target_utc.format("%H:%M:%SZ")
@@ -7989,9 +8078,9 @@ impl ViewerApp {
             let selected_volume_matches = layer
                 .volume
                 .as_ref()
-                .zip(layer.frame_history.get(frame_index))
+                .zip(layer.engine.history.get(frame_index))
                 .is_some_and(|(selected, frame)| Arc::ptr_eq(selected, &frame.volume));
-            if (layer.selected_frame_index != frame_index || !selected_volume_matches)
+            if (layer.engine.cursor.index != frame_index || !selected_volume_matches)
                 && Self::select_radar_layer_history_frame(layer, frame_index)
             {
                 changed = true;
@@ -7999,11 +8088,11 @@ impl ViewerApp {
             if Self::set_radar_layer_selected_cut(layer, cut) {
                 changed = true;
             }
-            layer.status = format!(
+            layer.engine.status = format!(
                 "Synced {} {}/{} · {}",
                 layer.site.level2_id,
                 frame_index + 1,
-                layer.frame_history.len(),
+                layer.engine.history.len(),
                 observation_time.format("%H:%M:%SZ")
             );
         }
@@ -12030,7 +12119,7 @@ impl ViewerApp {
                     // change fails loud instead of repaint-spinning.
                     for layer in &mut self.radar_layers {
                         if layer.pending_render_key.take().is_some() {
-                            layer.status = "Layer render worker disconnected".to_owned();
+                            layer.engine.status = "Layer render worker disconnected".to_owned();
                         }
                     }
                     budget.note_message();
@@ -12077,7 +12166,7 @@ impl ViewerApp {
         let Some(layer) = self
             .radar_layers
             .iter_mut()
-            .find(|layer| layer.id == layer_id)
+            .find(|layer| layer.engine.id.0 == layer_id)
         else {
             if let Ok(rendered) = message.result {
                 recycle(rendered);
@@ -12102,7 +12191,7 @@ impl ViewerApp {
                 layer.render_ms = None;
                 layer.worker_ms = None;
                 layer.texture_ms = None;
-                layer.status = format!("Render failed: {err}");
+                layer.engine.status = format!("Render failed: {err}");
             }
             Err(_) => {}
         }
@@ -12110,7 +12199,7 @@ impl ViewerApp {
 
     fn install_radar_layer_texture(
         ctx: &egui::Context,
-        layer: &mut RadarOverlayLayer,
+        layer: &mut OverlayView,
         recycle_sender: &mpsc::Sender<RenderRecycleBuffer>,
         key: TextureKey,
         rendered: RenderedTexture,
@@ -12137,7 +12226,7 @@ impl ViewerApp {
             layer.texture = Some(ctx.load_texture(
                 format!(
                     "radar-layer-{}-{}-{}-{}x{}",
-                    layer.id,
+                    layer.engine.id.0,
                     key.cut,
                     key.product.label(),
                     key.viewport.width,
@@ -12157,7 +12246,7 @@ impl ViewerApp {
             signature: Some(buffer_signature),
         });
         if layer.load_receiver.is_none() {
-            layer.status = "Rendered".to_owned();
+            layer.engine.status = "Rendered".to_owned();
         }
     }
 
@@ -12849,7 +12938,7 @@ impl ViewerApp {
                 index,
                 RenderRequest {
                     key,
-                    lane: LaneId::Overlay(layer.id),
+                    lane: LaneId::Overlay(layer.engine.id.0),
                     volume,
                     previous_volume: None,
                     cut,
@@ -12888,12 +12977,12 @@ impl ViewerApp {
                     Ok(()) => {
                         layer.pending_render_key = Some(key);
                         if layer.load_receiver.is_none() {
-                            layer.status = "Rendering".to_owned();
+                            layer.engine.status = "Rendering".to_owned();
                         }
                     }
                     Err(_) => {
                         layer.pending_render_key = None;
-                        layer.status = "Layer render worker disconnected".to_owned();
+                        layer.engine.status = "Layer render worker disconnected".to_owned();
                     }
                 }
             }
@@ -19175,9 +19264,10 @@ impl ViewerApp {
                 .into_iter()
                 .filter_map(|(record, distance_km)| {
                     // Union candidate pool, tagged by kind (v0.29 Phase 3):
-                    // archive-backed WSR-88Ds plus international sites
-                    // (listed for parity — window-loading limits are
-                    // Phase 4c). TDWRs' ~90 km range and research feeds'
+                    // archive-backed WSR-88Ds plus international sites —
+                    // archive-capable providers window-load per source
+                    // (Phase 4c); the rest grey "newest scan only" at
+                    // dispatch. TDWRs' ~90 km range and research feeds'
                     // live-only serving keep them out as ever.
                     match record.kind {
                         SiteKind::Wsr88d | SiteKind::Intl { .. } => {}
@@ -19229,12 +19319,41 @@ impl ViewerApp {
                 }
                 (
                     CoordinatedOverlaySite::Intl(site),
-                    CoordinatedOverlayLoadMode::ArchiveWindow { .. },
+                    CoordinatedOverlayLoadMode::ArchiveWindow {
+                        start_utc,
+                        end_utc,
+                        max_frames,
+                    },
                 ) => {
-                    // Honest limit until the loop engine's per-source
-                    // window loaders land (spec Phase 4c): intl overlay
-                    // feeds serve the newest scan, not archive windows.
-                    intl_window_skipped.push(site.label.clone());
+                    // Per-source window loads (v0.29 Phase 4c): providers
+                    // with an archive_source() window-load like US sites;
+                    // the rest keep the honest newest-scan-only limit. The
+                    // gate and the greyed reason are the SAME derived
+                    // capability call (spec §1.3 ArchiveAccess).
+                    let site_ref = data_source::sites::SiteRef::Intl {
+                        provider_id: site.provider_id.to_owned(),
+                        site_id: site.site_id.clone(),
+                    };
+                    match archive_browser::archive_access(&site_ref) {
+                        archive_browser::ArchiveAccess::Level2S3
+                        | archive_browser::ArchiveAccess::Provider => {
+                            self.add_or_refresh_intl_radar_layer_archive_window(
+                                site.provider_id,
+                                &site.site_id,
+                                &site.label,
+                                site.latitude_deg,
+                                site.longitude_deg,
+                                start_utc,
+                                end_utc,
+                                max_frames,
+                                ctx,
+                            );
+                            added += 1;
+                        }
+                        archive_browser::ArchiveAccess::None { .. } => {
+                            intl_window_skipped.push(site.label.clone());
+                        }
+                    }
                 }
             }
         }
@@ -19280,33 +19399,79 @@ impl ViewerApp {
             .coordinated_site_radius_km
             .clamp(25.0, 460.0);
         let candidates = self.nearby_coordinated_overlay_sites(STORM_VIDEO_SYNC_OVERLAY_RADARS);
-        // Archive-window sync loads US Level-II loops; intl candidates are
-        // listed in the pool but cannot window-load until the loop
-        // engine's per-source loaders land (spec Phase 4c).
-        let us_sites: Vec<RadarSite> = candidates
-            .iter()
-            .filter_map(|(_, record)| match &record.site {
-                SiteRef::Us { level2_id } => self
-                    .sites
-                    .iter()
-                    .find(|site| site.level2_id.eq_ignore_ascii_case(level2_id))
-                    .cloned(),
-                SiteRef::Intl { .. } => None,
-            })
-            .collect();
-        if us_sites.is_empty() {
-            self.unified_player
-                .mark_status(format!("No WSR-88D sites within {:.0} km", radius));
+        // Per-source archive-window loads (v0.29 Phase 4c): US Level-II
+        // loops as ever, plus every international candidate whose provider
+        // has an archive_source() (ORD, SMHI, …). Providers without one
+        // stay honestly out, named with the derived reason below.
+        /// One archive-capable international Mosaic candidate — fields
+        /// straight off the union catalog's SiteRecord, never a raw
+        /// provider-registry iteration.
+        struct IntlWindowCandidate {
+            provider_id: String,
+            site_id: String,
+            label: String,
+            lat_lon: Option<(f32, f32)>,
+        }
+        let mut us_sites: Vec<RadarSite> = Vec::new();
+        let mut intl_sites: Vec<IntlWindowCandidate> = Vec::new();
+        let mut newest_only: Vec<String> = Vec::new();
+        for (_, record) in &candidates {
+            match &record.site {
+                SiteRef::Us { level2_id } => {
+                    if let Some(site) = self
+                        .sites
+                        .iter()
+                        .find(|site| site.level2_id.eq_ignore_ascii_case(level2_id))
+                        .cloned()
+                    {
+                        us_sites.push(site);
+                    }
+                }
+                SiteRef::Intl {
+                    provider_id,
+                    site_id,
+                } => match archive_browser::archive_access(&record.site) {
+                    archive_browser::ArchiveAccess::Level2S3
+                    | archive_browser::ArchiveAccess::Provider => {
+                        intl_sites.push(IntlWindowCandidate {
+                            provider_id: provider_id.clone(),
+                            site_id: site_id.clone(),
+                            label: record.label.clone(),
+                            lat_lon: record.lat_lon,
+                        });
+                    }
+                    archive_browser::ArchiveAccess::None { .. } => {
+                        // Single-frame provider: no archive window to load —
+                        // honest "newest scan only" instead of a ghost frame
+                        // over the archive loop.
+                        newest_only.push(record.label.clone());
+                    }
+                },
+            }
+        }
+        if us_sites.is_empty() && intl_sites.is_empty() {
+            self.unified_player.mark_status(format!(
+                "No loop-capable radar sites within {:.0} km",
+                radius
+            ));
             return;
         }
 
         let selected_ids = us_sites
             .iter()
             .map(|site| site.level2_id.clone())
+            .chain(intl_sites.iter().map(|site| site.label.clone()))
             .collect::<BTreeSet<_>>();
         self.unified_player.coordinated_sites_input = us_sites
             .iter()
-            .map(|site| site.level2_id.as_str())
+            .map(|site| site.level2_id.clone())
+            .chain(intl_sites.iter().map(|site| {
+                data_source::sites::SiteRef::Intl {
+                    provider_id: site.provider_id.clone(),
+                    site_id: site.site_id.clone(),
+                }
+                .settings_key()
+            }))
             .collect::<Vec<_>>()
             .join(", ");
         for layer in &mut self.radar_layers {
@@ -19319,9 +19484,28 @@ impl ViewerApp {
                 site, start_utc, end_utc, max_frames, ctx,
             );
         }
+        for site in intl_sites {
+            self.add_or_refresh_intl_radar_layer_archive_window(
+                &site.provider_id,
+                &site.site_id,
+                &site.label,
+                site.lat_lon.map(|(lat, _)| lat),
+                site.lat_lon.map(|(_, lon)| lon),
+                start_utc,
+                end_utc,
+                max_frames,
+                ctx,
+            );
+        }
         self.sync_radar_overlay_layers_to_timeline(ctx);
         let total = selected_ids.len() + 1;
-        let status = format!("Loading {total} synced radar sites for storm video");
+        let mut status = format!("Loading {total} synced radar sites for storm video");
+        if !newest_only.is_empty() {
+            status = format!(
+                "{status}; newest scan only (no provider archive): {}",
+                newest_only.join(", ")
+            );
+        }
         self.status = status.clone();
         self.unified_player.mark_status(status);
     }
@@ -24422,17 +24606,33 @@ impl ViewerApp {
         let mut refresh_index = None;
         let mut promote_site = None;
         let min_overlay_alpha = self.style_registry.drapes().min_overlay_alpha;
+        let stale_chip_seconds = self.style_registry.radar_age().stale_chip_seconds;
+        let now_utc = Utc::now();
         for (index, layer) in self.radar_layers.iter_mut().enumerate() {
-            let state = if layer.load_receiver.is_some() {
-                "loading"
-            } else if layer.timeline_sync {
-                "timeline"
-            } else if layer.volume.is_some() {
-                "live"
-            } else {
-                "queued"
-            };
-            let mut details = vec![layer.status.clone()];
+            // Census D11: the chip STRINGS stay greppable-identical; the
+            // live-vs-queued truth now derives from engine.liveness() — one
+            // derivation with the cadence-aware international stale floor
+            // (spec §12 owner decision 3), superseding the flat
+            // INTL_STALE_CHIP_FLOOR_SECONDS for OVERLAYS. The primary chip
+            // keeps the flat constant until its own port (Phase 4e).
+            let liveness = layer.engine.liveness(now_utc, stale_chip_seconds);
+            let state = overlay_state_chip(
+                layer.load_receiver.is_some(),
+                layer.timeline_sync,
+                liveness,
+                layer.volume.is_some(),
+            );
+            let mut details = vec![layer.engine.status.clone()];
+            if let Some(Liveness::Live {
+                age_seconds,
+                stale: true,
+            }) = liveness
+            {
+                details.push(format!(
+                    "newest scan {}m old — stale for a live feed",
+                    age_seconds / 60
+                ));
+            }
             if layer.timeline_sync {
                 details.push(
                     "Owned by the Unified Player timeline; live refresh is paused".to_owned(),
@@ -24537,7 +24737,22 @@ impl ViewerApp {
         if let Some(index) = refresh_index
             && let Some(layer) = self.radar_layers.get_mut(index)
         {
-            if layer.intl_feed.is_some() {
+            if let Some((provider_id, site_id)) = layer
+                .intl_site_ref()
+                .map(|(provider, site)| (provider.to_owned(), site.to_owned()))
+            {
+                // Detach-and-go-live for an international layer: the same
+                // explicit feed switch as the US arm (a Mosaic archive
+                // window on this layer clears; a plain live restart keeps).
+                layer.timeline_sync = false;
+                layer.selected_cut = None;
+                let _ =
+                    layer
+                        .engine
+                        .set_feed(FeedSource::Live(data_source::sites::SiteRef::Intl {
+                            provider_id,
+                            site_id,
+                        }));
                 Self::start_intl_radar_layer_load(layer, ctx);
             } else {
                 Self::start_radar_layer_load(layer, LatestLoadMode::User, ctx);
@@ -24551,13 +24766,16 @@ impl ViewerApp {
         if let Some(site) = promote_site {
             // An international overlay promotes to the primary by starting
             // its live poll (the intl analog of a latest-volume load).
-            if let Some(feed) = self
+            if let Some((provider_id, site_id)) = self
                 .radar_layers
                 .iter()
                 .find(|layer| layer.site.level2_id == site.level2_id)
-                .and_then(|layer| layer.intl_feed.as_ref())
+                .and_then(|layer| {
+                    layer
+                        .intl_site_ref()
+                        .map(|(provider, site)| (provider.to_owned(), site.to_owned()))
+                })
             {
-                let (provider_id, site_id) = (feed.provider_id.clone(), feed.site_id.clone());
                 self.start_intl_poll(provider_id, site_id, ctx);
                 self.status = format!("Live-polling {}", site.level2_id);
             } else {
@@ -26354,13 +26572,7 @@ impl ViewerApp {
         let overlay_loads = self
             .radar_layers
             .iter()
-            .filter(|layer| {
-                layer.load_receiver.is_some()
-                    || layer
-                        .intl_feed
-                        .as_ref()
-                        .is_some_and(|feed| feed.rx.is_some())
-            })
+            .filter(|layer| layer.load_receiver.is_some() || layer.intl_rx.is_some())
             .count();
         if overlay_loads > 0 {
             return Some(BackgroundActivity::indeterminate(if overlay_loads == 1 {
@@ -51656,24 +51868,8 @@ pub(crate) fn normalized_event_max_frames(count: u16) -> usize {
     }
 }
 
-fn frame_identity_for_volume(volume: &RadarVolume) -> FrameIdentity {
-    FrameIdentity {
-        site_id: volume.site.id.clone(),
-        scan_time_utc: volume.volume_time.with_timezone(&Utc),
-    }
-}
-
-fn frame_history_entry_from_decoded(decoded: DecodedLoad) -> FrameHistoryEntry {
-    let identity = frame_identity_for_volume(&decoded.volume);
-    FrameHistoryEntry {
-        identity,
-        path: decoded.path,
-        volume: decoded.volume,
-        timings: Some(decoded.timings),
-        status: decoded.status,
-        source_label: decoded.source_label,
-    }
-}
+// frame_identity_for_volume and frame_history_entry_from_decoded moved
+// VERBATIM to ui_core::loop_engine (re-exported above).
 
 fn coordinated_observation_is_usable(
     observation_time: DateTime<Utc>,
@@ -51711,31 +51907,10 @@ fn archive_frame_status(volume_time_utc: DateTime<Utc>, now_utc: DateTime<Utc>) 
     }
 }
 
-fn frame_status_priority(status: FrameStatus) -> u8 {
-    match status {
-        FrameStatus::Preview => 0,
-        FrameStatus::LivePartial => 1,
-        FrameStatus::Complete | FrameStatus::Stale => 2,
-        FrameStatus::LiveComplete | FrameStatus::Local => 3,
-    }
-}
-
-fn live_partial_frame_has_new_data(
-    incoming: &FrameHistoryEntry,
-    existing: &FrameHistoryEntry,
-) -> bool {
-    incoming.status == FrameStatus::LivePartial
-        && existing.status == FrameStatus::LivePartial
-        && incoming.path == existing.path
-        && (incoming.volume.metadata.decoded_radial_count
-            > existing.volume.metadata.decoded_radial_count
-            || volume_total_radials(incoming.volume.as_ref())
-                > volume_total_radials(existing.volume.as_ref()))
-}
-
-fn volume_total_radials(volume: &RadarVolume) -> usize {
-    volume.cuts.iter().map(|cut| cut.radials.len()).sum()
-}
+// frame_status_priority, live_partial_frame_has_new_data, and
+// volume_total_radials moved VERBATIM to ui_core::loop_engine (the first
+// two re-exported above; volume_total_radials has no remaining local
+// caller).
 
 fn frame_status_text(
     frame: &FrameHistoryEntry,
@@ -51797,11 +51972,8 @@ fn compact_frame_label(
     )
 }
 
-fn history_contains_other_site(history: &[FrameHistoryEntry], site_id: &str) -> bool {
-    history
-        .iter()
-        .any(|frame| frame.identity.site_id != site_id)
-}
+// history_contains_other_site moved VERBATIM to ui_core::loop_engine
+// (re-exported above).
 
 fn short_frame_status_label(
     status: FrameStatus,
@@ -55257,9 +55429,9 @@ mod tests {
     #[test]
     fn radar_overlay_layer_starts_visible_and_unrendered() {
         let site = RadarSite::new("KTLX");
-        let layer = RadarOverlayLayer::new(7, site);
+        let layer = OverlayView::new(7, site);
 
-        assert_eq!(layer.id, 7);
+        assert_eq!(layer.engine.id, EngineId(7));
         assert_eq!(layer.site.level2_id, "KTLX");
         assert!(layer.visible);
         assert_eq!(layer.opacity, DEFAULT_RADAR_OVERLAY_ALPHA);
@@ -55281,7 +55453,7 @@ mod tests {
         let ctx = egui::Context::default();
         let product = DisplayProduct::Moment(MomentType::Reflectivity);
 
-        let mut layer = RadarOverlayLayer::new(9, RadarSite::new("KTLX"));
+        let mut layer = OverlayView::new(9, RadarSite::new("KTLX"));
         let pending_key = test_screen_texture_key(1, 0, product.clone());
         layer.pending_render_key = Some(pending_key.clone());
         app.radar_layers.push(layer);
@@ -55356,7 +55528,7 @@ mod tests {
             },
         );
         assert!(app.radar_layers[0].pending_render_key.is_none());
-        assert_eq!(app.radar_layers[0].status, "Render failed: boom");
+        assert_eq!(app.radar_layers[0].engine.status, "Render failed: boom");
     }
 
     #[test]
@@ -55380,7 +55552,7 @@ mod tests {
             .sort_by(|left, right| left.identity.cmp(&right.identity));
         app.select_history_frame(0, false, &ctx);
 
-        let mut layer = RadarOverlayLayer::new(42, RadarSite::new("KOUN"));
+        let mut layer = OverlayView::new(42, RadarSite::new("KOUN"));
         layer.timeline_sync = true;
         ViewerApp::install_radar_layer_history(
             &mut layer,
@@ -55407,13 +55579,13 @@ mod tests {
         app.select_history_frame(1, false, &ctx);
 
         let layer = &app.radar_layers[0];
-        assert_eq!(layer.frame_history.len(), 2);
-        assert_eq!(layer.selected_frame_index, 1);
+        assert_eq!(layer.engine.history.len(), 2);
+        assert_eq!(layer.engine.cursor.index, 1);
         assert_eq!(
             layer.volume.as_ref().map(|volume| volume.volume_time),
             Some(base + chrono::Duration::minutes(5))
         );
-        assert!(layer.status.contains("Synced KOUN 2/2"));
+        assert!(layer.engine.status.contains("Synced KOUN 2/2"));
     }
 
     #[test]
@@ -59611,7 +59783,7 @@ mod tests {
         app.last_history_step = Some(Instant::now() - Duration::from_secs(5));
         mark_primary_screen_textures_ready(&mut app);
 
-        let mut layer = RadarOverlayLayer::new(
+        let mut layer = OverlayView::new(
             9,
             RadarSite::new("KBBB").with_location(
                 Some("Overlay".to_owned()),
@@ -59621,7 +59793,7 @@ mod tests {
         );
         layer.visible = true;
         layer.volume = Some(Arc::clone(&first));
-        layer.frame_history = app.frame_history.to_vec();
+        layer.engine.history = FrameHistory::from(app.frame_history.to_vec());
         layer.texture_key = Some(test_screen_texture_key(
             Arc::as_ptr(&second) as usize,
             0,
@@ -60030,7 +60202,7 @@ mod tests {
             viewport: test_viewport_key(720, 480),
         });
 
-        let mut layer = RadarOverlayLayer::new(
+        let mut layer = OverlayView::new(
             3,
             RadarSite::new("KBBB").with_location(
                 Some("Overlay".to_owned()),
@@ -60040,14 +60212,14 @@ mod tests {
         );
         layer.visible = true;
         layer.volume = Some(Arc::clone(&new_volume));
-        layer.frame_history = vec![FrameHistoryEntry {
+        layer.engine.history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(new_volume.as_ref()),
             path: PathBuf::from("overlay-new-frame"),
             volume: Arc::clone(&new_volume),
             timings: None,
             status: FrameStatus::Complete,
             source_label: "test".to_owned(),
-        }];
+        }]);
         layer.texture_key = Some(TextureKey {
             volume_ptr: Arc::as_ptr(&old_volume) as usize,
             dealias_reference_volume_ptr: 0,
@@ -60116,12 +60288,12 @@ mod tests {
             })
             .collect();
 
-        let mut layer = RadarOverlayLayer::new(4, RadarSite::new("KBBB"));
+        let mut layer = OverlayView::new(4, RadarSite::new("KBBB"));
         layer.visible = true;
         layer.timeline_sync = true;
         layer.volume = Some(Arc::clone(&first));
-        layer.frame_history = app.frame_history.to_vec();
-        layer.selected_frame_index = 0;
+        layer.engine.history = FrameHistory::from(app.frame_history.to_vec());
+        layer.engine.cursor.index = 0;
         let first_key = test_screen_texture_key(
             Arc::as_ptr(&first) as usize,
             0,
@@ -60137,7 +60309,7 @@ mod tests {
 
         app.sync_radar_overlay_layers_to_timeline(&ctx);
 
-        assert_eq!(app.radar_layers[0].selected_frame_index, 1);
+        assert_eq!(app.radar_layers[0].engine.cursor.index, 1);
         assert_eq!(app.radar_layers[0].selected_cut, Some(0));
         assert!(app.radar_layers[0].texture.is_some());
         assert_eq!(app.radar_layers[0].texture_key.as_ref(), Some(&first_key));
@@ -60152,9 +60324,9 @@ mod tests {
     fn coordinated_archive_overlay_is_not_replaced_by_live_auto_refresh() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.realtime_level2_auto_refresh = true;
-        let mut layer = RadarOverlayLayer::new(54, RadarSite::new("KBBB"));
+        let mut layer = OverlayView::new(54, RadarSite::new("KBBB"));
         layer.timeline_sync = true;
-        layer.last_realtime_level2_refresh = Some(
+        layer.engine.live.last_refresh = Some(
             Instant::now() - Duration::from_secs(OVERLAY_REALTIME_LEVEL2_REFRESH_SECONDS + 10),
         );
         app.radar_layers.push(layer);
@@ -60163,6 +60335,330 @@ mod tests {
 
         assert!(app.radar_layers[0].load_receiver.is_none());
         assert!(app.radar_layers[0].timeline_sync);
+    }
+
+    /// Census D14 pinning test (decided 2026-07-02, landed WITH the 4c
+    /// overlay port): previews are DISPLAY-ONLY in every role. The overlay
+    /// Preview drain arm paints the layer's display but NEVER enters the
+    /// engine history — the legacy path replaced the whole history with
+    /// the preview frame, an untested artifact the census retired.
+    #[test]
+    fn overlay_preview_is_display_only_and_never_enters_history() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let base = Utc.with_ymd_and_hms(2026, 6, 17, 18, 0, 0).unwrap();
+        let mut layer = OverlayView::new(11, RadarSite::new("KTLX"));
+        let (sender, receiver) = mpsc::channel();
+        layer.load_receiver = Some(receiver);
+        app.radar_layers.push(layer);
+
+        sender
+            .send(AsyncLoadResult {
+                label: "L2 KTLX".to_owned(),
+                update: AsyncLoadUpdate::Preview(test_decoded_from_volume(
+                    PathBuf::from("overlay-preview"),
+                    test_volume_with_site_time("KTLX", base),
+                    FrameStatus::Preview,
+                )),
+            })
+            .expect("drain still armed");
+        app.poll_radar_layer_loads(&ctx);
+
+        let layer = &app.radar_layers[0];
+        assert!(layer.volume.is_some(), "the preview paints the display");
+        assert_eq!(layer.source_path, Some(PathBuf::from("overlay-preview")));
+        assert!(
+            layer.engine.history.is_empty(),
+            "census D14: a preview never enters the frame history"
+        );
+        assert_eq!(layer.engine.status, "Preview L2 KTLX");
+    }
+
+    /// Census D13 (conscious normalize of dead behavior): a History batch
+    /// with select_frame=false INSTALLS into the existing overlay history
+    /// (P1/P2 semantics — upsert, no selection, display untouched) instead
+    /// of being silently dropped; and the census-D3 cross-site diagnostic
+    /// surfaces on the layer's LOCAL status line, greppable-identical,
+    /// where the engine outcome reports it.
+    #[test]
+    fn overlay_no_select_history_batch_installs_and_surfaces_cross_site_diagnostic() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let base = Utc.with_ymd_and_hms(2026, 6, 17, 18, 0, 0).unwrap();
+        let mut layer = OverlayView::new(12, RadarSite::new("KTLX"));
+        let (sender, receiver) = mpsc::channel();
+        layer.load_receiver = Some(receiver);
+        app.radar_layers.push(layer);
+
+        sender
+            .send(AsyncLoadResult {
+                label: "L2 KTLX".to_owned(),
+                update: AsyncLoadUpdate::History(
+                    DecodedLoadBatch {
+                        frames: vec![
+                            test_decoded_from_volume(
+                                PathBuf::from("KTLX-1800"),
+                                test_volume_with_site_time("KTLX", base),
+                                FrameStatus::Complete,
+                            ),
+                            test_decoded_from_volume(
+                                PathBuf::from("KTLX-1805"),
+                                test_volume_with_site_time(
+                                    "KTLX",
+                                    base + chrono::Duration::minutes(5),
+                                ),
+                                FrameStatus::Complete,
+                            ),
+                        ],
+                        selected_index: 1,
+                    },
+                    false,
+                ),
+            })
+            .expect("drain still armed");
+        app.poll_radar_layer_loads(&ctx);
+        {
+            let layer = &app.radar_layers[0];
+            assert_eq!(
+                layer.engine.history.len(),
+                2,
+                "census D13: the no-select batch installs instead of dropping"
+            );
+            assert!(layer.volume.is_none(), "no selection: display untouched");
+        }
+
+        // Cross-site arm: the displayed volume belongs to another site, so
+        // the ONE engine guard fires before install (census D3).
+        app.radar_layers[0].volume = Some(Arc::new(test_volume_with_site_time("KAAA", base)));
+        let (sender, receiver) = mpsc::channel();
+        app.radar_layers[0].load_receiver = Some(receiver);
+        sender
+            .send(AsyncLoadResult {
+                label: "L2 KBBB".to_owned(),
+                update: AsyncLoadUpdate::History(
+                    DecodedLoadBatch {
+                        frames: vec![test_decoded_from_volume(
+                            PathBuf::from("KBBB-1810"),
+                            test_volume_with_site_time(
+                                "KBBB",
+                                base + chrono::Duration::minutes(10),
+                            ),
+                            FrameStatus::Complete,
+                        )],
+                        selected_index: 0,
+                    },
+                    false,
+                ),
+            })
+            .expect("drain still armed");
+        app.poll_radar_layer_loads(&ctx);
+        let layer = &app.radar_layers[0];
+        assert_eq!(
+            layer.engine.status, "history reset (site change to KBBB, had 2 frames)",
+            "the D3 diagnostic wording stays greppable-identical"
+        );
+        assert_eq!(layer.engine.history.len(), 1);
+        assert_eq!(layer.engine.history[0].identity.site_id, "KBBB");
+    }
+
+    /// Census D12: overlay history joined the generation spine — the
+    /// overlay install routes bump the engine generation, and the
+    /// replace-all stays replace-all (census D1: one frame per live tick
+    /// via explicit clear + install, never an accumulating upsert).
+    #[test]
+    fn overlay_installs_bump_the_engine_generation_and_replace_all() {
+        let base = Utc.with_ymd_and_hms(2026, 6, 17, 18, 0, 0).unwrap();
+        let mut layer = OverlayView::new(13, RadarSite::new("KTLX"));
+        let before = layer.engine.history.generation();
+        ViewerApp::install_radar_layer_volume(
+            &mut layer,
+            test_decoded_from_volume(
+                PathBuf::from("tick-1"),
+                test_volume_with_site_time("KTLX", base),
+                FrameStatus::LiveComplete,
+            ),
+        );
+        assert_ne!(
+            layer.engine.history.generation(),
+            before,
+            "census D12: the install route bumps the generation"
+        );
+        assert_eq!(layer.engine.history.len(), 1);
+        assert_eq!(layer.engine.cursor.index, 0);
+        assert!(layer.volume.is_some(), "plain install selects the anchor");
+
+        ViewerApp::install_radar_layer_volume(
+            &mut layer,
+            test_decoded_from_volume(
+                PathBuf::from("tick-2"),
+                test_volume_with_site_time("KTLX", base + chrono::Duration::minutes(5)),
+                FrameStatus::LiveComplete,
+            ),
+        );
+        assert_eq!(
+            layer.engine.history.len(),
+            1,
+            "census D1: the live overlay tick is replace-all (clear + install)"
+        );
+        assert_eq!(
+            layer.engine.history[0].path,
+            PathBuf::from("tick-2"),
+            "the new tick replaced the old frame wholesale"
+        );
+    }
+
+    /// The overlay state chip keeps the legacy strings (census D11) while
+    /// deriving live-vs-queued from engine.liveness() — including the
+    /// cadence-aware international stale floor (spec §12 owner decision 3)
+    /// that supersedes the flat INTL_STALE_CHIP_FLOOR_SECONDS for overlays.
+    #[test]
+    fn overlay_state_chip_truth_table_derives_from_liveness() {
+        assert_eq!(overlay_state_chip(true, false, None, false), "loading");
+        assert_eq!(overlay_state_chip(false, true, None, false), "timeline");
+        assert_eq!(overlay_state_chip(false, false, None, false), "queued");
+        let live = Some(Liveness::Live {
+            age_seconds: 60,
+            stale: false,
+        });
+        assert_eq!(overlay_state_chip(false, false, live, true), "live");
+        // A stale live feed still reads "live" in the rail (legacy truth
+        // was volume-driven); the hover detail carries the staleness.
+        let stale = Some(Liveness::Live {
+            age_seconds: 4000,
+            stale: true,
+        });
+        assert_eq!(overlay_state_chip(false, false, stale, true), "live");
+        // Census D14 display-only preview: volume painted, history empty.
+        assert_eq!(overlay_state_chip(false, false, None, true), "live");
+
+        // The floor itself comes from the ENGINE: 20 minutes old on an
+        // intl overlay feed is fresh (1800 s floor beats a 480 s user
+        // threshold); 40 minutes is stale even for intl.
+        let now = Utc.with_ymd_and_hms(2026, 6, 17, 18, 0, 0).unwrap();
+        let mut layer = OverlayView::new_intl(
+            14,
+            RadarSite::new("Ängelholm"),
+            "smhi".to_owned(),
+            "angelholm".to_owned(),
+        );
+        let volume = Arc::new(test_volume_with_site_time(
+            "angelholm",
+            now - chrono::Duration::minutes(20),
+        ));
+        layer.engine.history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from("intl:fresh"),
+            volume,
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "intl".to_owned(),
+        });
+        assert_eq!(
+            layer.engine.liveness(now, 480),
+            Some(Liveness::Live {
+                age_seconds: 1200,
+                stale: false
+            }),
+            "the intl cadence floor keeps a 20-minute frame fresh"
+        );
+        assert_eq!(
+            layer
+                .engine
+                .liveness(now + chrono::Duration::minutes(20), 480),
+            Some(Liveness::Live {
+                age_seconds: 2400,
+                stale: true
+            }),
+            "past the floor a live intl overlay is honestly stale"
+        );
+    }
+
+    /// v0.29 Phase 4c coordinated loads work PER-SOURCE: an
+    /// archive-capable international site (ORD here) window-loads as a
+    /// coordinated timeline overlay through its provider archive_source();
+    /// the engine feed IS the archive window, and re-issuing the window
+    /// dedupes onto the same layer.
+    #[test]
+    fn intl_overlay_archive_window_load_sets_archive_feed_and_timeline_sync() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        // Through the ONE union catalog (Phase 3), never the raw registry.
+        let record = data_source::sites::all_sites()
+            .find(|record| {
+                matches!(
+                    &record.site,
+                    data_source::sites::SiteRef::Intl { provider_id, .. } if provider_id == "ord"
+                )
+            })
+            .expect("ORD sites in the union catalog");
+        let data_source::sites::SiteRef::Intl {
+            provider_id,
+            site_id,
+        } = record.site.clone()
+        else {
+            unreachable!("filtered to Intl above");
+        };
+        let start = Utc.with_ymd_and_hms(2026, 6, 9, 5, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 6, 9, 6, 0, 0).unwrap();
+
+        let (lat, lon) = (
+            record.lat_lon.map(|(lat, _)| lat),
+            record.lat_lon.map(|(_, lon)| lon),
+        );
+        app.add_or_refresh_intl_radar_layer_archive_window(
+            &provider_id,
+            &site_id,
+            &record.label,
+            lat,
+            lon,
+            start,
+            end,
+            20,
+            &ctx,
+        );
+        {
+            let layer = app.radar_layers.last().expect("layer added");
+            assert!(
+                layer.timeline_sync,
+                "coordinated overlays are timeline-owned"
+            );
+            assert!(layer.load_receiver.is_some(), "window worker armed");
+            assert!(
+                matches!(
+                    &layer.engine.feed,
+                    FeedSource::Archive {
+                        site: data_source::sites::SiteRef::Intl { provider_id, .. },
+                        window,
+                    } if provider_id == "ord"
+                        && window.start_utc == start
+                        && window.end_utc == end
+                        && window.max_frames == 20
+                ),
+                "the engine feed IS the archive window"
+            );
+            assert!(layer.engine.status.starts_with("Loading synced"));
+            assert!(
+                layer.engine.poll_cadence().is_none(),
+                "an archive overlay structurally cannot poll"
+            );
+        }
+
+        app.add_or_refresh_intl_radar_layer_archive_window(
+            &provider_id,
+            &site_id,
+            &record.label,
+            lat,
+            lon,
+            start,
+            end,
+            20,
+            &ctx,
+        );
+        assert_eq!(
+            app.radar_layers.len(),
+            1,
+            "re-issuing the window dedupes onto the same layer"
+        );
     }
 
     #[test]
@@ -60186,17 +60682,17 @@ mod tests {
             "KBBB",
             base + chrono::Duration::minutes(5),
         ));
-        let mut layer = RadarOverlayLayer::new(55, RadarSite::new("KBBB"));
+        let mut layer = OverlayView::new(55, RadarSite::new("KBBB"));
         layer.timeline_sync = true;
         layer.volume = Some(Arc::clone(&future));
-        layer.frame_history = vec![FrameHistoryEntry {
+        layer.engine.history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(future.as_ref()),
             path: PathBuf::from("overlay-final-1205"),
             volume: Arc::clone(&future),
             timings: None,
             status: FrameStatus::Complete,
             source_label: "test".to_owned(),
-        }];
+        }]);
         layer.texture_key = Some(test_screen_texture_key(
             Arc::as_ptr(&future) as usize,
             0,
@@ -60230,16 +60726,16 @@ mod tests {
         }]);
 
         let overlay = Arc::new(test_volume_with_site_time("KBBB", base));
-        let mut layer = RadarOverlayLayer::new(56, RadarSite::new("KBBB"));
+        let mut layer = OverlayView::new(56, RadarSite::new("KBBB"));
         layer.timeline_sync = true;
-        layer.frame_history = vec![FrameHistoryEntry {
+        layer.engine.history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(overlay.as_ref()),
             path: PathBuf::from("overlay-1200"),
             volume: Arc::clone(&overlay),
             timings: None,
             status: FrameStatus::Complete,
             source_label: "test".to_owned(),
-        }];
+        }]);
         app.radar_layers.push(layer);
 
         app.sync_radar_overlay_layers_to_timeline(&egui::Context::default());
@@ -60291,16 +60787,16 @@ mod tests {
         overlay.site = radar_core::RadarSite::new("KBBB");
         overlay.volume_time = base;
         let overlay = Arc::new(overlay);
-        let mut layer = RadarOverlayLayer::new(57, RadarSite::new("KBBB"));
+        let mut layer = OverlayView::new(57, RadarSite::new("KBBB"));
         layer.timeline_sync = true;
-        layer.frame_history = vec![FrameHistoryEntry {
+        layer.engine.history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(overlay.as_ref()),
             path: PathBuf::from("overlay-low-sweeps"),
             volume: overlay,
             timings: None,
             status: FrameStatus::Complete,
             source_label: "test".to_owned(),
-        }];
+        }]);
         app.radar_layers.push(layer);
 
         app.sync_radar_overlay_layers_to_timeline(&egui::Context::default());
@@ -60335,16 +60831,16 @@ mod tests {
         overlay.site = radar_core::RadarSite::new("KBBB");
         overlay.volume_time = base;
         let overlay = Arc::new(overlay);
-        let mut layer = RadarOverlayLayer::new(58, RadarSite::new("KBBB"));
+        let mut layer = OverlayView::new(58, RadarSite::new("KBBB"));
         layer.timeline_sync = true;
-        layer.frame_history = vec![FrameHistoryEntry {
+        layer.engine.history = FrameHistory::from(vec![FrameHistoryEntry {
             identity: frame_identity_for_volume(overlay.as_ref()),
             path: PathBuf::from("overlay-family"),
             volume: overlay,
             timings: None,
             status: FrameStatus::Complete,
             source_label: "test".to_owned(),
-        }];
+        }]);
         app.radar_layers.push(layer);
 
         app.sync_radar_overlay_layers_to_timeline(&egui::Context::default());
@@ -60388,9 +60884,9 @@ mod tests {
         future_cut.volume_time = base + chrono::Duration::seconds(20);
         let future_cut = Arc::new(future_cut);
 
-        let mut layer = RadarOverlayLayer::new(59, RadarSite::new("KBBB"));
+        let mut layer = OverlayView::new(59, RadarSite::new("KBBB"));
         layer.timeline_sync = true;
-        layer.frame_history = [Arc::clone(&previous), Arc::clone(&future_cut)]
+        layer.engine.history = [Arc::clone(&previous), Arc::clone(&future_cut)]
             .into_iter()
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
@@ -60405,7 +60901,7 @@ mod tests {
 
         app.sync_radar_overlay_layers_to_timeline(&egui::Context::default());
 
-        assert_eq!(app.radar_layers[0].selected_frame_index, 0);
+        assert_eq!(app.radar_layers[0].engine.cursor.index, 0);
         assert_eq!(app.radar_layers[0].selected_cut, Some(0));
         assert_eq!(
             app.radar_layers[0]
@@ -60458,9 +60954,9 @@ mod tests {
         future_cut.volume_time = base + chrono::Duration::seconds(20);
         let future_cut = Arc::new(future_cut);
 
-        let mut layer = RadarOverlayLayer::new(60, RadarSite::new("KBBB"));
+        let mut layer = OverlayView::new(60, RadarSite::new("KBBB"));
         layer.timeline_sync = true;
-        layer.frame_history = [Arc::clone(&previous), Arc::clone(&future_cut)]
+        layer.engine.history = [Arc::clone(&previous), Arc::clone(&future_cut)]
             .into_iter()
             .map(|volume| FrameHistoryEntry {
                 identity: frame_identity_for_volume(volume.as_ref()),
@@ -60478,7 +60974,7 @@ mod tests {
 
         app.sync_radar_overlay_layers_to_timeline(&egui::Context::default());
 
-        assert_eq!(app.radar_layers[0].selected_frame_index, 0);
+        assert_eq!(app.radar_layers[0].engine.cursor.index, 0);
         assert_eq!(app.radar_layers[0].selected_cut, Some(0));
         assert_eq!(
             app.radar_layers[0]

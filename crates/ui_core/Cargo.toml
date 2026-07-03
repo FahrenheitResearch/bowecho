@@ -5,9 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono.workspace = true
 data_source = { path = "../data_source" }
 eframe.workspace = true
 image.workspace = true
+radar_core = { path = "../radar_core" }
+settings = { path = "../settings" }
 
 [features]
 # B3 (docs/miniderecho-spec.md §1): expose `inject_for_test` to dependents'

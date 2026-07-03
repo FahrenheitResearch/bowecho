@@ -133,10 +133,13 @@ impl ArchiveLister {
         }
     }
 
-    /// Scans inside `[start, end]`, capped to the newest `max`, oldest
-    /// first. The US arm wraps `level2_objects_for_window` (anchor = the
-    /// window end — the loop-ending-at-window shape); the intl arm is
-    /// `ArchiveFrames::window_plans`. Blocking — run on a worker.
+    /// Scans inside `[start, end]`, thinned to `max`, oldest first. The US
+    /// arm wraps `level2_objects_for_window` (anchor = the window end —
+    /// the loop-ending-at-window shape, edge-preserving upstream); the
+    /// intl arm lists everything through `ArchiveFrames::window_plans` and
+    /// then applies [`limit_intl_rows_for_window`] — census D15's ONE
+    /// thinning rule (evenly-spaced, both edges kept) wherever frame
+    /// stamps parse. Blocking — run on a worker.
     pub(crate) fn list_window(
         &self,
         start_utc: DateTime<Utc>,
@@ -165,13 +168,72 @@ impl ArchiveLister {
                 provider_id,
                 site_id,
             } => {
+                // Uncapped listing (catalog probes only, so this is cheap):
+                // the provider default would newest-tail-cap at `max` and
+                // drop the window's START edge first — the thinning rule
+                // belongs here, where identity stamps can be parsed.
                 let plans = intl_archive_source(provider_id, |archive| {
-                    archive.window_plans(site_id, start_utc, end_utc, max)
+                    archive.window_plans(site_id, start_utc, end_utc, usize::MAX)
                 })?;
-                Ok(intl_rows_from_plans(plans, start_utc.date_naive()))
+                let rows = intl_rows_from_plans(plans, start_utc.date_naive());
+                Ok(limit_intl_rows_for_window(rows, start_utc, end_utc, max))
             }
         }
     }
+}
+
+/// Census D15 (owner decision, 2026-07-02): **even sampling is the one
+/// rule** for over-cap archive windows. Wherever every row's identity
+/// stamp parses ([`intl_plan_time_utc`] — the ORD/SMHI/NCI grammars), the
+/// rows are retained to the exact `[start, end]` window and thinned by
+/// evenly-spaced sampling that always keeps BOTH window edges — the same
+/// `slot * last / (max - 1)` shape as the US event-loop limiter and the
+/// ORD Unified-Player limiter (`limit_ord_archive_plans_for_window`).
+///
+/// A provider whose stamps do NOT all parse falls back to the legacy
+/// newest-tail cap (`window_plans`' documented day-granular shape) — a
+/// DOCUMENTED capability limit for stampless grammars, not silent drift.
+fn limit_intl_rows_for_window(
+    mut rows: Vec<ArchiveScanRow>,
+    start_utc: DateTime<Utc>,
+    end_utc: DateTime<Utc>,
+    max: usize,
+) -> Vec<ArchiveScanRow> {
+    let max = max.max(1);
+    let all_stamps_parse = rows.iter().all(|row| match &row.load {
+        ArchiveScanLoad::IntlPlan(plan) => intl_plan_time_utc(&plan.identity).is_some(),
+        // US rows cannot appear on the intl arm; treat them as parseable
+        // rather than degrading the whole listing.
+        ArchiveScanLoad::UsObject(_) => true,
+    });
+    if !all_stamps_parse {
+        // Newest-tail fallback: keep the last `max`, oldest first.
+        if rows.len() > max {
+            rows.drain(..rows.len() - max);
+        }
+        return rows;
+    }
+    rows.retain(|row| row.time_utc >= start_utc && row.time_utc <= end_utc);
+    rows.sort_by(|left, right| left.time_utc.cmp(&right.time_utc));
+    if rows.len() <= max {
+        return rows;
+    }
+    if max == 1 {
+        // A one-frame "window" is the newest scan (the window's anchor
+        // end), matching the ORD/US single-frame arms.
+        return rows.into_iter().rev().take(1).collect();
+    }
+    let last = rows.len() - 1;
+    let mut selected = Vec::with_capacity(max);
+    let mut last_index = None;
+    for slot in 0..max {
+        let index = slot * last / (max - 1);
+        if last_index != Some(index) {
+            selected.push(rows[index].clone());
+            last_index = Some(index);
+        }
+    }
+    selected
 }
 
 /// Run `job` against a provider's archive source, with the derived-
@@ -1488,9 +1550,13 @@ impl ViewerApp {
 }
 
 /// Worker body for intl archive-window loads: list through
-/// `window_plans`, then stream the plans through the one generalized
-/// plan-batch fetcher.
-fn fetch_intl_archive_window_batch(
+/// `window_plans` (thinned per census D15 — see
+/// [`limit_intl_rows_for_window`]), then stream the plans through the one
+/// generalized plan-batch fetcher. Shared by the PRIMARY Unified-Player
+/// window load and the Phase-4c coordinated OVERLAY window load
+/// (`start_intl_radar_layer_archive_window_load`), which is why it is
+/// `pub(crate)`.
+pub(crate) fn fetch_intl_archive_window_batch(
     provider_id: &str,
     site_id: &str,
     start_utc: DateTime<Utc>,
@@ -1627,6 +1693,97 @@ mod tests {
             }],
             merge: false,
         }
+    }
+
+    /// Census D15 (owner decision 2026-07-02): over-cap intl archive
+    /// windows thin by EVENLY-SPACED sampling that keeps BOTH window
+    /// edges, wherever the identity stamps parse — the ORD grammar here.
+    /// Rows stamped outside `[start, end]` (day-fold ride-alongs) drop.
+    #[test]
+    fn intl_window_rows_thin_evenly_and_keep_both_edges_when_stamps_parse() {
+        let start = Utc.with_ymd_and_hms(2026, 6, 9, 5, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 6, 9, 6, 0, 0).unwrap();
+        // 13 in-window scans on a 5-minute cadence, plus one day-fold
+        // ride-along BEFORE the window start.
+        let mut plans: Vec<FramePlan> = vec![plan(&format!(
+            "deess_{}_p1_hride",
+            (start - chrono::Duration::minutes(30)).format("%Y%m%dT%H%M")
+        ))];
+        plans.extend((0..13).map(|i| {
+            plan(&format!(
+                "deess_{}_p1_h{i:03}",
+                (start + chrono::Duration::minutes(5 * i)).format("%Y%m%dT%H%M")
+            ))
+        }));
+        let rows = intl_rows_from_plans(plans, start.date_naive());
+
+        let limited = limit_intl_rows_for_window(rows, start, end, 5);
+        let minutes: Vec<i64> = limited
+            .iter()
+            .map(|row| (row.time_utc - start).num_minutes())
+            .collect();
+        assert_eq!(
+            minutes,
+            vec![0, 15, 30, 45, 60],
+            "evenly spaced, exact-window retain, START and END edges kept"
+        );
+    }
+
+    /// Census D15 fallback arm: a provider whose stamps do NOT parse keeps
+    /// the legacy newest-tail cap — a DOCUMENTED capability limit for
+    /// stampless grammars, not silent drift.
+    #[test]
+    fn intl_window_rows_fall_back_to_newest_tail_for_unparseable_stamps() {
+        let start = Utc.with_ymd_and_hms(2026, 6, 9, 5, 0, 0).unwrap();
+        let end = start + chrono::Duration::hours(1);
+        let rows: Vec<ArchiveScanRow> = (0..6)
+            .map(|i| ArchiveScanRow {
+                time_utc: start + chrono::Duration::minutes(5 * i),
+                load: ArchiveScanLoad::IntlPlan(plan(&format!("mystery-scan-{i}"))),
+            })
+            .collect();
+        let limited = limit_intl_rows_for_window(rows, start, end, 3);
+        let minutes: Vec<i64> = limited
+            .iter()
+            .map(|row| (row.time_utc - start).num_minutes())
+            .collect();
+        assert_eq!(
+            minutes,
+            vec![15, 20, 25],
+            "newest-tail: the window START edge drops first (legacy shape)"
+        );
+    }
+
+    /// D15 edge cases: an under-cap window passes through untouched, and
+    /// a one-frame cap keeps the NEWEST scan (the window's end anchor).
+    #[test]
+    fn intl_window_row_limit_edge_cases() {
+        let start = Utc.with_ymd_and_hms(2026, 6, 9, 5, 0, 0).unwrap();
+        let end = start + chrono::Duration::hours(1);
+        let rows: Vec<ArchiveScanRow> = (0..3)
+            .map(|i| {
+                let time = start + chrono::Duration::minutes(10 * i);
+                ArchiveScanRow {
+                    time_utc: time,
+                    load: ArchiveScanLoad::IntlPlan(plan(&format!(
+                        "deess_{}_p1_hedge",
+                        time.format("%Y%m%dT%H%M")
+                    ))),
+                }
+            })
+            .collect();
+        assert_eq!(
+            limit_intl_rows_for_window(rows.clone(), start, end, 10).len(),
+            3,
+            "under the cap nothing thins"
+        );
+        let newest = limit_intl_rows_for_window(rows, start, end, 1);
+        assert_eq!(newest.len(), 1);
+        assert_eq!(
+            (newest[0].time_utc - start).num_minutes(),
+            20,
+            "max=1 keeps the newest scan"
+        );
     }
 
     /// Pixel-identity contract for the US arm: row assembly + the

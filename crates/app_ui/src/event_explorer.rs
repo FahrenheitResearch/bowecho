@@ -869,16 +869,31 @@ impl crate::ViewerApp {
                 let id = self.next_radar_layer_id;
                 self.next_radar_layer_id = self.next_radar_layer_id.saturating_add(1);
                 self.radar_layers
-                    .push(crate::RadarOverlayLayer::new(id, site.clone()));
+                    .push(crate::OverlayView::new(id, site.clone()));
                 self.radar_layers.len() - 1
             }
         };
         let layer = &mut self.radar_layers[index];
+        let site_id = layer.site.level2_id.clone();
+        let request = context.window_request();
+        let anchor_utc = context.anchor_utc;
         layer.visible = true;
         layer.timeline_sync = true;
         layer.load_receiver = None;
-        layer.frame_history.clear();
-        layer.selected_frame_index = 0;
+        // v0.29 Phase 4c: the archive-ownership switch is the engine feed
+        // switch (any→Archive = ClearAll of engine loop state, spec §2);
+        // the display-side clears below stay the caller's half.
+        let _ = layer.engine.set_feed(crate::FeedSource::Archive {
+            site: data_source::sites::SiteRef::Us {
+                level2_id: site_id.clone(),
+            },
+            window: crate::ArchiveWindow {
+                start_utc: request.start_utc,
+                end_utc: request.end_utc,
+                anchor_utc: Some(anchor_utc),
+                max_frames: request.max_objects,
+            },
+        });
         layer.selected_cut = None;
         layer.source_path = None;
         layer.volume = None;
@@ -889,12 +904,9 @@ impl crate::ViewerApp {
         layer.worker_ms = None;
         layer.texture_ms = None;
 
-        let site_id = layer.site.level2_id.clone();
-        let request = context.window_request();
-        let anchor_utc = context.anchor_utc;
         let (sender, receiver) = mpsc::channel();
         layer.load_receiver = Some(receiver);
-        layer.status = format!(
+        layer.engine.status = format!(
             "Loading synced {site_id} event loop · before {} / after {}",
             context.before_scans, context.after_scans
         );
