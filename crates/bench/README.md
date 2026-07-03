@@ -93,3 +93,53 @@ BOWECHO_BENCH_FILE=KTLX20130520_201643_V06 \
 Benchmark discipline: compare builds with the same profile
 (`--release`), same file, same machine, on AC power, and prefer `min`
 over `mean` when the machine is noisy.
+
+## Dealias eval battery (`--dealias`)
+
+The second mode runs the dealias-engine battery from
+`docs/dealias-v4-spec.md` §10: every engine (region / cascade / hybrid /
+v4 / v4-noenv) on one case volume, with residual fold-boundary pairs,
+reference RMS (environmental + Browning & Wexler harmonic), % gates
+branch-modified, isolated speck count, 5×5-gate branch spot-checks,
+best-of-N runtime, and a two-run byte-identical determinism gate
+(nonzero exit on drift).
+
+```
+bowecho-bench --dealias --target KEAX20260609_055143_V06 \
+  --prior KEAX20260609_054454_V06 \
+  --env crates/bench/fixtures/dealias/env_keax.json \
+  --probe 339,20,blob --iters 3 [--json]
+```
+
+`--rewrap 12` runs the synthetic low-Nyquist Case E instead: the lowest
+velocity tilt's accepted v4 output becomes exact truth, re-wrapped to
+±12 m/s and presented as a single-tilt cold-start volume; engines are
+scored on % correct-branch gates (|v − truth| < 6 m/s).
+
+### Case volumes (bench never fetches — download first)
+
+All from the public `unidata-nexrad-level2` mirror (2013 keys carry
+`.gz`; gunzip first):
+
+```
+base=https://unidata-nexrad-level2.s3.amazonaws.com
+curl -O $base/2026/06/09/KEAX/KEAX20260609_055143_V06   # A derecho (target)
+curl -O $base/2026/06/09/KEAX/KEAX20260609_054454_V06   # A prior
+curl -O $base/2013/05/20/KTLX/KTLX20130520_201643_V06.gz # B Moore EF5 (target)
+curl -O $base/2013/05/20/KTLX/KTLX20130520_201229_V06.gz # B prior
+curl -O $base/2021/08/29/KLIX/KLIX20210829_163252_V06   # C Ida eyewall (target)
+curl -O $base/2021/08/29/KLIX/KLIX20210829_162629_V06   # C prior
+curl -O $base/2026/06/09/KMBX/KMBX20260609_235423_V06   # D blob (target)
+curl -O $base/2026/06/09/KMBX/KMBX20260609_234726_V06   # D prior
+curl -O $base/2026/06/09/KMBX/KMBX20260609_234055_V06   # D positive control
+curl -O $base/2026/06/09/KMBX/KMBX20260609_233434_V06   # D control prior
+```
+
+### Environmental fixtures
+
+`fixtures/dealias/env_*.json` are `EnvironmentalWindProfile` fixtures
+hand-extracted once from archived RAP 13-km 0-h analyses at each radar
+site and volume time (provenance in each file's `source` field; AWS
+`noaa-rap-pds` for 2021/2026, NCEI historical archive for 2013).
+Heights are meters above radar level. Cases must also run WITHOUT the
+fixture to measure graceful degradation (spec §10.1).

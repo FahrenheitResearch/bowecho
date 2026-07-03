@@ -10,10 +10,12 @@ use std::path::Path;
 pub use color_tables::{ColorSampler, ColorTable, ColorTableFamily, ColorTableSet};
 mod cascade;
 mod cells;
+mod dealias_v4;
 mod detect;
 mod gate_filter;
 mod hybrid;
 mod interpolate;
+mod region_core;
 mod rhi;
 mod shear;
 mod smooth;
@@ -23,6 +25,10 @@ mod volumetric;
 pub mod wind;
 pub use cascade::{dealias_velocity_grid_cascade, fit_range_band_reference};
 pub use cells::{StormCell, identify_storm_cells};
+pub use dealias_v4::{
+    ConfidenceGrid, EnvWindLevel, EnvironmentalWindProfile, TemporalPrior, V4Diagnostics,
+    V4VolumeSolution, dealias_velocity_grid_v4, dealias_volume_v4, project_environmental_winds,
+};
 pub use detect::{
     RotationSite, RotationStrength, detect_rotation_sites, rotation_features_per_tilt,
 };
@@ -3213,17 +3219,6 @@ pub(crate) fn dealias_velocity_grid_with_references(
     }
 }
 
-/// Fraction of the Nyquist interval below which two adjacent gates are assumed
-/// to belong to the same (unfolded) region. Comfortably below 1.0 so a true
-/// fold (a jump of ~2·Nyquist) always lands on a region boundary.
-const REGION_JOIN_FRAC: f32 = 0.5;
-/// Hard cap on the integer fold count applied to any region.
-const REGION_MAX_FOLD: i32 = 5;
-/// Minimum shared-boundary support for an inter-region fold to be trusted.
-/// One is enough: region interiors are already coherent, so a single boundary
-/// pair is a valid estimate, and because edges resolve strongest-first a lone
-/// spurious contact only ever resolves last (as a no-op cycle).
-const REGION_EDGE_MIN_SUPPORT: u32 = 1;
 /// Dense spatial/temporal references are intentionally conservative: a whole
 /// connected group moves only when the alternate Nyquist branch wins by a
 /// large, well-separated margin.
@@ -3237,98 +3232,6 @@ const DENSE_REFERENCE_GROUP_RATIO: f64 = 0.75;
 const DENSE_REFERENCE_REGION_RATIO: f64 = 0.68;
 const DENSE_REFERENCE_MIN_SEPARATION_MPS: f64 = 2.0;
 const DENSE_REFERENCE_LOSS_CAP_MPS: f64 = 40.0;
-
-/// Plain union-find for connected-component region labelling.
-struct UnionFind {
-    parent: Vec<u32>,
-    rank: Vec<u8>,
-}
-
-impl UnionFind {
-    fn new(n: usize) -> Self {
-        Self {
-            parent: (0..n as u32).collect(),
-            rank: vec![0; n],
-        }
-    }
-
-    fn find(&mut self, mut x: u32) -> u32 {
-        while self.parent[x as usize] != x {
-            let parent = self.parent[x as usize];
-            self.parent[x as usize] = self.parent[parent as usize]; // path halving
-            x = self.parent[x as usize];
-        }
-        x
-    }
-
-    fn union(&mut self, a: u32, b: u32) {
-        let (ra, rb) = (self.find(a), self.find(b));
-        if ra == rb {
-            return;
-        }
-        let (ra, rb) = if self.rank[ra as usize] < self.rank[rb as usize] {
-            (rb, ra)
-        } else {
-            (ra, rb)
-        };
-        self.parent[rb as usize] = ra;
-        if self.rank[ra as usize] == self.rank[rb as usize] {
-            self.rank[ra as usize] += 1;
-        }
-    }
-}
-
-/// Union-find that also tracks an integer fold offset to the group root, so we
-/// can accumulate "region B is k Nyquist intervals above region A" relations
-/// and solve them all consistently (a weighted/potential DSU).
-struct FoldUnionFind {
-    parent: Vec<u32>,
-    rank: Vec<u8>,
-    /// fold[x] = k[x] - k[parent[x]]
-    offset: Vec<i32>,
-}
-
-impl FoldUnionFind {
-    fn new(n: usize) -> Self {
-        Self {
-            parent: (0..n as u32).collect(),
-            rank: vec![0; n],
-            offset: vec![0; n],
-        }
-    }
-
-    /// Returns (root, k[x] - k[root]).
-    fn find(&mut self, x: u32) -> (u32, i32) {
-        let mut node = x;
-        let mut total = 0;
-        while self.parent[node as usize] != node {
-            total += self.offset[node as usize];
-            node = self.parent[node as usize];
-        }
-        (node, total)
-    }
-
-    /// Enforce k[b] - k[a] = rel by merging the two groups.
-    fn union(&mut self, a: u32, b: u32, rel: i32) {
-        let (ra, oa) = self.find(a);
-        let (rb, ob) = self.find(b);
-        if ra == rb {
-            return;
-        }
-        // k[rb] - k[ra] = rel + oa - ob
-        let delta = rel + oa - ob;
-        if self.rank[ra as usize] < self.rank[rb as usize] {
-            self.parent[ra as usize] = rb;
-            self.offset[ra as usize] = -delta;
-        } else {
-            self.parent[rb as usize] = ra;
-            self.offset[rb as usize] = delta;
-            if self.rank[ra as usize] == self.rank[rb as usize] {
-                self.rank[ra as usize] += 1;
-            }
-        }
-    }
-}
 
 fn radial_azimuths(cut: &ElevationCut, grid: &MomentGrid) -> Vec<f32> {
     grid.radial_indices
@@ -3363,7 +3266,9 @@ fn sweep_wraps(azimuths: &[f32]) -> bool {
 }
 
 /// Core region-based fold solver. Returns the integer Nyquist fold for every
-/// gate (0 where unknown / no data).
+/// gate (0 where unknown / no data). Steps 1–4 (segmentation, vote graph,
+/// strongest-first resolution, anchoring) live in [`region_core`]; this
+/// wrapper applies the optional external-reference passes (5b/5c).
 fn region_based_dealias_folds(
     observed: &[f32],
     nyq: &[f32],
@@ -3375,187 +3280,22 @@ fn region_based_dealias_folds(
 ) -> Vec<i32> {
     let total = rows.saturating_mul(gates);
     let mut folds = vec![0i32; total];
-    // Union-find nodes are indexed by `idx as u32`; bail (no unfolding) rather
-    // than truncate if a grid were ever absurdly large. Real sweeps are ~1.3M
-    // gates, far under u32::MAX.
-    if total == 0 || observed.len() != total || total > u32::MAX as usize {
+    if total == 0 || observed.len() != total {
         return folds;
     }
 
-    let same_region = |a: usize, b: usize, n: f32| -> bool {
-        n.is_finite()
-            && observed[a].is_finite()
-            && observed[b].is_finite()
-            && (observed[a] - observed[b]).abs() <= REGION_JOIN_FRAC * n
-    };
-
-    // ---- 1. label connected regions ----
-    let mut labels = UnionFind::new(total);
-    let wrap = sweep_wraps(azimuths);
-    for row in 0..rows {
-        let row_n = nyq[row];
-        for gate in 0..gates {
-            let idx = row * gates + gate;
-            if !observed[idx].is_finite() {
-                continue;
-            }
-            if gate + 1 < gates && same_region(idx, idx + 1, row_n) {
-                labels.union(idx as u32, (idx + 1) as u32);
-            }
-            if row + 1 < rows {
-                let down = (row + 1) * gates + gate;
-                let n = row_n.min(nyq[row + 1]);
-                if same_region(idx, down, n) {
-                    labels.union(idx as u32, down as u32);
-                }
-            }
-        }
-    }
-    if wrap {
-        let n = nyq[rows - 1].min(nyq[0]);
-        for gate in 0..gates {
-            let a = (rows - 1) * gates + gate;
-            let b = gate;
-            if same_region(a, b, n) {
-                labels.union(a as u32, b as u32);
-            }
-        }
-    }
-
-    // Compact region ids + sizes.
-    let mut region_of = vec![u32::MAX; total];
-    let mut region_size: Vec<u32> = Vec::new();
-    for idx in 0..total {
-        if !observed[idx].is_finite() {
-            continue;
-        }
-        let root = labels.find(idx as u32);
-        let rid = &mut region_of[root as usize];
-        if *rid == u32::MAX {
-            *rid = region_size.len() as u32;
-            region_size.push(0);
-        }
-        let rid = *rid;
-        region_of[idx] = rid;
-        region_size[rid as usize] += 1;
-    }
+    let region_core::RegionSolve {
+        region_of,
+        region_size,
+        mut region_fold,
+        region_offset,
+        region_group,
+        group_count,
+        ..
+    } = region_core::solve_region_folds(observed, nyq, rows, gates, azimuths);
     let region_count = region_size.len();
     if region_count == 0 {
         return folds;
-    }
-
-    // ---- 2. accumulate inter-region fold votes over shared boundaries ----
-    // key: (lo_region, hi_region) -> map fold -> count, where fold f means
-    // k[hi] = k[lo] + f, f = round((v_lo - v_hi) / (2·Nyquist)).
-    let mut edges: std::collections::HashMap<(u32, u32), std::collections::HashMap<i32, u32>> =
-        std::collections::HashMap::new();
-    let mut vote = |ra: u32, va: f32, rb: u32, vb: f32, n: f32| {
-        if ra == rb || !n.is_finite() {
-            return;
-        }
-        let (lo, vlo, hi, vhi) = if ra < rb {
-            (ra, va, rb, vb)
-        } else {
-            (rb, vb, ra, va)
-        };
-        let f = ((vlo - vhi) / (2.0 * n)).round() as i32;
-        if f.abs() > 2 * REGION_MAX_FOLD {
-            return;
-        }
-        *edges.entry((lo, hi)).or_default().entry(f).or_insert(0) += 1;
-    };
-    for row in 0..rows {
-        let row_n = nyq[row];
-        for gate in 0..gates {
-            let idx = row * gates + gate;
-            let ra = region_of[idx];
-            if ra == u32::MAX {
-                continue;
-            }
-            if gate + 1 < gates {
-                let rb = region_of[idx + 1];
-                if rb != u32::MAX {
-                    vote(ra, observed[idx], rb, observed[idx + 1], row_n);
-                }
-            }
-            if row + 1 < rows {
-                let down = (row + 1) * gates + gate;
-                let rb = region_of[down];
-                if rb != u32::MAX {
-                    vote(
-                        ra,
-                        observed[idx],
-                        rb,
-                        observed[down],
-                        row_n.min(nyq[row + 1]),
-                    );
-                }
-            }
-        }
-    }
-    if wrap {
-        let n = nyq[rows - 1].min(nyq[0]);
-        for gate in 0..gates {
-            let a = (rows - 1) * gates + gate;
-            let b = gate;
-            let (ra, rb) = (region_of[a], region_of[b]);
-            if ra != u32::MAX && rb != u32::MAX {
-                vote(ra, observed[a], rb, observed[b], n);
-            }
-        }
-    }
-
-    // ---- 3. resolve folds, strongest shared boundary first ----
-    let mut resolved: Vec<((u32, u32), i32, u32)> = edges
-        .into_iter()
-        .filter_map(|(key, votes)| {
-            let total_support: u32 = votes.values().sum();
-            // Tied vote counts must resolve deterministically (HashMap
-            // iteration order varies per instance): prefer the smaller
-            // |fold|, then the smaller fold.
-            let (fold, support) = votes.into_iter().max_by_key(|(fold, count)| {
-                (
-                    *count,
-                    std::cmp::Reverse(fold.abs()),
-                    std::cmp::Reverse(*fold),
-                )
-            })?;
-            (support >= REGION_EDGE_MIN_SUPPORT).then_some((key, fold, total_support))
-        })
-        .collect();
-    // Strongest boundary first; tie-break on the (unique) region pair so the
-    // union order — and therefore the unfolded field — is reproducible.
-    resolved.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-
-    let mut dsu = FoldUnionFind::new(region_count);
-    for ((lo, hi), fold, _) in resolved {
-        dsu.union(lo, hi, fold);
-    }
-
-    // ---- 4. anchor each connected group so its largest region is unfolded ----
-    // For every group root, remember the offset of the biggest region in it.
-    let mut anchor_offset: std::collections::HashMap<u32, (u32, i32)> =
-        std::collections::HashMap::new();
-    for rid in 0..region_count as u32 {
-        let (root, off) = dsu.find(rid);
-        let size = region_size[rid as usize];
-        anchor_offset
-            .entry(root)
-            .and_modify(|(best_size, best_off)| {
-                if size > *best_size {
-                    *best_size = size;
-                    *best_off = off;
-                }
-            })
-            .or_insert((size, off));
-    }
-
-    // ---- 5. per-gate fold = (region offset) - (anchor offset of its group) ----
-    let mut region_fold = vec![0i32; region_count];
-    for rid in 0..region_count as u32 {
-        let (root, off) = dsu.find(rid);
-        let anchor = anchor_offset.get(&root).map(|(_, o)| *o).unwrap_or(0);
-        region_fold[rid as usize] = (off - anchor).clamp(-REGION_MAX_FOLD, REGION_MAX_FOLD);
     }
 
     // ---- 5b. external-reference checks (tilt-cascade engine only) ----
@@ -3570,9 +3310,8 @@ fn region_based_dealias_folds(
             let az = azimuths[row].to_radians();
             row_trig[row] = (az.sin(), az.cos());
         }
-        // Group branch: cost per (root, g) for g ∈ −2..=+2.
-        let mut group_cost: std::collections::HashMap<u32, ([f64; 5], u64, u64)> =
-            std::collections::HashMap::new();
+        // Group branch: cost per (group, g) for g ∈ −2..=+2.
+        let mut group_cost = vec![([0.0f64; 5], 0u64, 0u64); group_count];
         for (row, n) in nyq.iter().copied().enumerate().take(rows) {
             if !n.is_finite() || n <= 0.0 {
                 continue;
@@ -3584,8 +3323,8 @@ fn region_based_dealias_folds(
                 if rid == u32::MAX {
                     continue;
                 }
-                let (root, off) = dsu.find(rid);
-                let entry = group_cost.entry(root).or_insert(([0.0; 5], 0, 0));
+                let off = region_offset[rid as usize];
+                let entry = &mut group_cost[region_group[rid as usize] as usize];
                 entry.2 += 1;
                 let Some(predicted) = reference.eval(sin_az, cos_az, gate) else {
                     continue;
@@ -3598,7 +3337,7 @@ fn region_based_dealias_folds(
                 }
             }
         }
-        for (root, (costs, covered, total_gates)) in &group_cost {
+        for (group, (costs, covered, total_gates)) in group_cost.iter().enumerate() {
             if *total_gates == 0 || (*covered as f64) < 0.5 * *total_gates as f64 {
                 continue;
             }
@@ -3608,11 +3347,10 @@ fn region_based_dealias_folds(
                 .min_by(|a, b| a.1.total_cmp(b.1))
                 .expect("five branches");
             let branch = best_slot as i32 - 2;
-            for rid in 0..region_count as u32 {
-                let (r, off) = dsu.find(rid);
-                if r == *root {
-                    region_fold[rid as usize] =
-                        (off + branch).clamp(-REGION_MAX_FOLD, REGION_MAX_FOLD);
+            for rid in 0..region_count {
+                if region_group[rid] as usize == group {
+                    region_fold[rid] = (region_offset[rid] + branch)
+                        .clamp(-region_core::REGION_MAX_FOLD, region_core::REGION_MAX_FOLD);
                 }
             }
         }
@@ -3655,7 +3393,8 @@ fn region_based_dealias_folds(
                 .expect("three slots");
             if best_slot != 1 && *best_cost < 0.6 * current {
                 let dg = best_slot as i32 - 1;
-                region_fold[rid] = (region_fold[rid] + dg).clamp(-REGION_MAX_FOLD, REGION_MAX_FOLD);
+                region_fold[rid] = (region_fold[rid] + dg)
+                    .clamp(-region_core::REGION_MAX_FOLD, region_core::REGION_MAX_FOLD);
             }
         }
     }
@@ -3667,22 +3406,13 @@ fn region_based_dealias_folds(
     // conservative: first shift an entire connected vote-graph group, then
     // permit a single-region repair only when it wins decisively.
     if let Some(reference) = dense_reference {
-        // Resolve the vote-graph roots once per REGION, then use compact
-        // integer group ids in the per-gate pass.  Avoiding a HashMap lookup
-        // for every gate is important on 1M+ gate super-resolution sweeps.
-        let mut root_to_group: std::collections::HashMap<u32, usize> =
-            std::collections::HashMap::new();
-        let mut region_group = vec![0usize; region_count];
-        let mut group_total: Vec<u64> = Vec::new();
-        for rid in 0..region_count as u32 {
-            let (root, _) = dsu.find(rid);
-            let group = *root_to_group.entry(root).or_insert_with(|| {
-                let group = group_total.len();
-                group_total.push(0);
-                group
-            });
-            region_group[rid as usize] = group;
-            group_total[group] += region_size[rid as usize] as u64;
+        // The compact vote-graph group ids come from `solve_region_folds`
+        // (assigned in region-id order, exactly the mapping this pass used to
+        // build itself).  Avoiding a HashMap lookup for every gate is
+        // important on 1M+ gate super-resolution sweeps.
+        let mut group_total = vec![0u64; group_count];
+        for rid in 0..region_count {
+            group_total[region_group[rid] as usize] += region_size[rid] as u64;
         }
 
         let mut group_cost = vec![[0.0f64; 5]; group_total.len()];
@@ -3701,7 +3431,7 @@ fn region_based_dealias_folds(
                     continue;
                 };
                 let rid = rid as usize;
-                let group = region_group[rid];
+                let group = region_group[rid] as usize;
                 group_covered[group] += 1;
                 let current_fold = region_fold[rid];
                 for (slot, delta) in (-2i32..=2).enumerate() {
@@ -3742,10 +3472,10 @@ fn region_based_dealias_folds(
         }
         if group_adjustment.iter().any(|delta| *delta != 0) {
             for rid in 0..region_count {
-                let delta = group_adjustment[region_group[rid]];
+                let delta = group_adjustment[region_group[rid] as usize];
                 if delta != 0 {
-                    region_fold[rid] =
-                        (region_fold[rid] + delta).clamp(-REGION_MAX_FOLD, REGION_MAX_FOLD);
+                    region_fold[rid] = (region_fold[rid] + delta)
+                        .clamp(-region_core::REGION_MAX_FOLD, region_core::REGION_MAX_FOLD);
                 }
             }
         }
@@ -3798,8 +3528,8 @@ fn region_based_dealias_folds(
                 && second_average - best_average >= DENSE_REFERENCE_MIN_SEPARATION_MPS
             {
                 let delta = best_slot as i32 - 1;
-                region_fold[rid] =
-                    (region_fold[rid] + delta).clamp(-REGION_MAX_FOLD, REGION_MAX_FOLD);
+                region_fold[rid] = (region_fold[rid] + delta)
+                    .clamp(-region_core::REGION_MAX_FOLD, region_core::REGION_MAX_FOLD);
             }
         }
     }

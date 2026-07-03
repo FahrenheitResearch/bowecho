@@ -1,0 +1,177 @@
+{
+ "source": "RAP 13-km 0-h analysis 2013-05-20 20Z (NCEI historical: rap_130_20130520_2000_000.grb2), nearest grid point to KTLX; heights converted to ARL (station 370 m + 20 m antenna)",
+ "site": "KTLX",
+ "valid_time": "2013-05-20T20:00:00Z",
+ "levels": [
+  {
+   "height_m_arl": 93.6,
+   "u_mps": -3.02,
+   "v_mps": 2.26
+  },
+  {
+   "height_m_arl": 328.8,
+   "u_mps": -1.32,
+   "v_mps": 4.6
+  },
+  {
+   "height_m_arl": 569.0,
+   "u_mps": 0.67,
+   "v_mps": 6.2
+  },
+  {
+   "height_m_arl": 814.2,
+   "u_mps": 2.57,
+   "v_mps": 7.56
+  },
+  {
+   "height_m_arl": 1065.0,
+   "u_mps": 4.45,
+   "v_mps": 8.6
+  },
+  {
+   "height_m_arl": 1321.4,
+   "u_mps": 6.04,
+   "v_mps": 9.71
+  },
+  {
+   "height_m_arl": 1584.2,
+   "u_mps": 7.16,
+   "v_mps": 10.77
+  },
+  {
+   "height_m_arl": 1853.4,
+   "u_mps": 8.73,
+   "v_mps": 11.8
+  },
+  {
+   "height_m_arl": 2128.7,
+   "u_mps": 10.69,
+   "v_mps": 13.01
+  },
+  {
+   "height_m_arl": 2411.8,
+   "u_mps": 13.57,
+   "v_mps": 15.21
+  },
+  {
+   "height_m_arl": 2703.3,
+   "u_mps": 15.14,
+   "v_mps": 18.03
+  },
+  {
+   "height_m_arl": 3002.4,
+   "u_mps": 16.06,
+   "v_mps": 20.34
+  },
+  {
+   "height_m_arl": 3310.6,
+   "u_mps": 16.28,
+   "v_mps": 21.13
+  },
+  {
+   "height_m_arl": 3628.3,
+   "u_mps": 17.7,
+   "v_mps": 20.38
+  },
+  {
+   "height_m_arl": 3954.9,
+   "u_mps": 19.85,
+   "v_mps": 18.73
+  },
+  {
+   "height_m_arl": 4293.6,
+   "u_mps": 22.25,
+   "v_mps": 17.3
+  },
+  {
+   "height_m_arl": 4641.8,
+   "u_mps": 24.78,
+   "v_mps": 15.86
+  },
+  {
+   "height_m_arl": 5005.0,
+   "u_mps": 24.97,
+   "v_mps": 15.49
+  },
+  {
+   "height_m_arl": 5379.6,
+   "u_mps": 25.02,
+   "v_mps": 15.06
+  },
+  {
+   "height_m_arl": 5770.7,
+   "u_mps": 23.79,
+   "v_mps": 14.71
+  },
+  {
+   "height_m_arl": 6177.9,
+   "u_mps": 23.48,
+   "v_mps": 13.84
+  },
+  {
+   "height_m_arl": 6601.6,
+   "u_mps": 23.99,
+   "v_mps": 12.79
+  },
+  {
+   "height_m_arl": 7046.6,
+   "u_mps": 26.08,
+   "v_mps": 11.33
+  },
+  {
+   "height_m_arl": 7514.6,
+   "u_mps": 28.37,
+   "v_mps": 10.03
+  },
+  {
+   "height_m_arl": 8008.2,
+   "u_mps": 29.96,
+   "v_mps": 9.04
+  },
+  {
+   "height_m_arl": 8529.8,
+   "u_mps": 30.45,
+   "v_mps": 8.2
+  },
+  {
+   "height_m_arl": 9083.0,
+   "u_mps": 29.79,
+   "v_mps": 7.65
+  },
+  {
+   "height_m_arl": 9672.2,
+   "u_mps": 29.03,
+   "v_mps": 7.71
+  },
+  {
+   "height_m_arl": 10304.8,
+   "u_mps": 30.09,
+   "v_mps": 9.5
+  },
+  {
+   "height_m_arl": 10988.9,
+   "u_mps": 32.29,
+   "v_mps": 11.56
+  },
+  {
+   "height_m_arl": 11743.7,
+   "u_mps": 29.66,
+   "v_mps": 14.17
+  },
+  {
+   "height_m_arl": 12597.4,
+   "u_mps": 21.81,
+   "v_mps": 14.59
+  },
+  {
+   "height_m_arl": 13584.9,
+   "u_mps": 15.47,
+   "v_mps": 10.56
+  },
+  {
+   "height_m_arl": 14738.0,
+   "u_mps": 9.72,
+   "v_mps": 5.95
+  }
+ ]
+}

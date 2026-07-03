@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
+mod dealias_eval;
+
 use color_tables::ColorTableSet;
 use radar_core::{MomentType, RadarVolume};
 use render2d::{
@@ -497,6 +499,28 @@ fn json_escape(value: &str) -> String {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The dealias eval battery is a separate mode with its own flag set.
+    if args.iter().any(|arg| arg == "--dealias") {
+        let parsed = match dealias_eval::parse_dealias_args(&args) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                eprintln!("error: {err}");
+                eprintln!("{}", dealias_eval::DEALIAS_USAGE);
+                return ExitCode::from(2);
+            }
+        };
+        return match dealias_eval::run_dealias(&parsed) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => {
+                eprintln!("error: an engine's output differed between two identical runs");
+                ExitCode::FAILURE
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let command = match parse_args(&args) {
         Ok(command) => command,
         Err(err) => {

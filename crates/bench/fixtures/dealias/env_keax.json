@@ -1,0 +1,182 @@
+{
+ "source": "RAP 13-km 0-h analysis 2026-06-09 06Z (noaa-rap-pds S3: rap.20260609/rap.t06z.awp130pgrbf00.grib2), nearest grid point to KEAX; heights converted to ARL (station 303 m + 20 m antenna)",
+ "site": "KEAX",
+ "valid_time": "2026-06-09T06:00:00Z",
+ "levels": [
+  {
+   "height_m_arl": 10.4,
+   "u_mps": -0.7,
+   "v_mps": 1.25
+  },
+  {
+   "height_m_arl": 239.8,
+   "u_mps": 1.7,
+   "v_mps": 6.22
+  },
+  {
+   "height_m_arl": 475.1,
+   "u_mps": 5.02,
+   "v_mps": 9.07
+  },
+  {
+   "height_m_arl": 715.3,
+   "u_mps": 6.76,
+   "v_mps": 10.3
+  },
+  {
+   "height_m_arl": 960.4,
+   "u_mps": 6.87,
+   "v_mps": 9.55
+  },
+  {
+   "height_m_arl": 1211.0,
+   "u_mps": 5.59,
+   "v_mps": 7.36
+  },
+  {
+   "height_m_arl": 1467.5,
+   "u_mps": 4.38,
+   "v_mps": 5.41
+  },
+  {
+   "height_m_arl": 1730.5,
+   "u_mps": 4.05,
+   "v_mps": 4.46
+  },
+  {
+   "height_m_arl": 2000.5,
+   "u_mps": 5.29,
+   "v_mps": 5.05
+  },
+  {
+   "height_m_arl": 2278.0,
+   "u_mps": 7.04,
+   "v_mps": 6.39
+  },
+  {
+   "height_m_arl": 2563.7,
+   "u_mps": 8.42,
+   "v_mps": 7.02
+  },
+  {
+   "height_m_arl": 2858.6,
+   "u_mps": 9.03,
+   "v_mps": 6.4
+  },
+  {
+   "height_m_arl": 3163.4,
+   "u_mps": 8.75,
+   "v_mps": 4.47
+  },
+  {
+   "height_m_arl": 3475.4,
+   "u_mps": 8.51,
+   "v_mps": 2.63
+  },
+  {
+   "height_m_arl": 3797.7,
+   "u_mps": 8.54,
+   "v_mps": 2.16
+  },
+  {
+   "height_m_arl": 4128.7,
+   "u_mps": 8.14,
+   "v_mps": 2.33
+  },
+  {
+   "height_m_arl": 4470.1,
+   "u_mps": 7.14,
+   "v_mps": 3.39
+  },
+  {
+   "height_m_arl": 4822.6,
+   "u_mps": 5.28,
+   "v_mps": 4.6
+  },
+  {
+   "height_m_arl": 5186.5,
+   "u_mps": 2.53,
+   "v_mps": 5.8
+  },
+  {
+   "height_m_arl": 5565.2,
+   "u_mps": 2.69,
+   "v_mps": 8.24
+  },
+  {
+   "height_m_arl": 5957.7,
+   "u_mps": 4.06,
+   "v_mps": 11.15
+  },
+  {
+   "height_m_arl": 6368.7,
+   "u_mps": 7.11,
+   "v_mps": 14.04
+  },
+  {
+   "height_m_arl": 6799.3,
+   "u_mps": 9.32,
+   "v_mps": 16.06
+  },
+  {
+   "height_m_arl": 7250.0,
+   "u_mps": 11.03,
+   "v_mps": 16.73
+  },
+  {
+   "height_m_arl": 7724.8,
+   "u_mps": 12.72,
+   "v_mps": 15.54
+  },
+  {
+   "height_m_arl": 8226.4,
+   "u_mps": 14.09,
+   "v_mps": 13.89
+  },
+  {
+   "height_m_arl": 8757.9,
+   "u_mps": 15.92,
+   "v_mps": 10.75
+  },
+  {
+   "height_m_arl": 9324.0,
+   "u_mps": 18.76,
+   "v_mps": 6.88
+  },
+  {
+   "height_m_arl": 9931.0,
+   "u_mps": 19.53,
+   "v_mps": 3.64
+  },
+  {
+   "height_m_arl": 10582.7,
+   "u_mps": 19.94,
+   "v_mps": 0.85
+  },
+  {
+   "height_m_arl": 11287.4,
+   "u_mps": 25.32,
+   "v_mps": -2.5
+  },
+  {
+   "height_m_arl": 12064.2,
+   "u_mps": 28.5,
+   "v_mps": -4.45
+  },
+  {
+   "height_m_arl": 12941.9,
+   "u_mps": 24.35,
+   "v_mps": 0.92
+  },
+  {
+   "height_m_arl": 13926.6,
+   "u_mps": 12.59,
+   "v_mps": 4.27
+  },
+  {
+   "height_m_arl": 15051.1,
+   "u_mps": 5.21,
+   "v_mps": 7.42
+  }
+ ]
+}
