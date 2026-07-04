@@ -20887,12 +20887,13 @@ impl ViewerApp {
                 .on_hover_text(format!(
                     "Site {site}\nStart {volume_time}\nVCP {vcp}\n{cut_count} cuts, {decoded_radials} radials"
                 ));
-            if let Some(frame) = pane.engine.history.get(pane.engine.cursor.index)
-                && frame.identity.site_id == site
-                && let Some(readout) = live_chunk_readout(frame, Utc::now(), time_zone)
-            {
-                ui.weak(readout);
-            }
+            let chunk_readout = pane
+                .engine
+                .history
+                .get(pane.engine.cursor.index)
+                .filter(|frame| frame.identity.site_id == site)
+                .and_then(|frame| live_chunk_readout(frame, Utc::now(), time_zone));
+            live_chunk_readout_row(ui, chunk_readout);
             egui::CollapsingHeader::new("Volume details")
                 .id_salt(("pane_volume_details", pane_slot))
                 .default_open(false)
@@ -21669,12 +21670,11 @@ impl ViewerApp {
                 .on_hover_text(format!(
                     "Site {site}\nStart {volume_time}\nVCP {vcp}\n{cut_count} cuts, {decoded_radials} radials"
                 ));
-                if let Some(frame) = self.selected_frame()
-                    && frame.identity.site_id == site
-                    && let Some(readout) = live_chunk_readout(frame, Utc::now(), time_zone)
-                {
-                    ui.weak(readout);
-                }
+                let chunk_readout = self
+                    .selected_frame()
+                    .filter(|frame| frame.identity.site_id == site)
+                    .and_then(|frame| live_chunk_readout(frame, Utc::now(), time_zone));
+                live_chunk_readout_row(ui, chunk_readout);
                 egui::CollapsingHeader::new("Volume details")
                     .default_open(false)
                     .show(ui, |ui| {
@@ -50101,6 +50101,20 @@ fn live_chunk_readout(
     ))
 }
 
+/// Render the live-chunk readout as a fixed one-line row.
+///
+/// [`live_chunk_readout`] only returns `Some` for the live partial frame;
+/// every past frame yields `None`. Drawing the line only when present made it
+/// appear for the latest frame and vanish while looping or scrubbing, which
+/// changed the RADAR panel's height and shifted every control below it — a
+/// field-reported source of misclicks (v0.28.x). This ALWAYS occupies exactly
+/// one truncated line (the readout when present, a blank placeholder
+/// otherwise), so the panel geometry never moves between frames.
+fn live_chunk_readout_row(ui: &mut egui::Ui, readout: Option<String>) -> egui::Response {
+    let text = readout.unwrap_or_else(|| " ".to_owned());
+    ui.add(egui::Label::new(egui::RichText::new(text).weak()).truncate())
+}
+
 fn compact_frame_label(
     frame: &FrameHistoryEntry,
     now_utc: DateTime<Utc>,
@@ -50592,6 +50606,43 @@ mod tests {
                 .contains("Accum 24h")
         );
         assert!(ItalyDpcMapProduct::Cum12.label().contains("rain-gauge"));
+    }
+
+    /// The live-chunk readout row must reserve the SAME height whether or
+    /// not there is a readout to show. The line only exists for the live
+    /// partial frame, so before the fix it appeared for the latest frame
+    /// and vanished while looping/scrubbing — moving every control below it
+    /// and causing misclicks (field report). Measured through a real egui
+    /// layout pass.
+    #[test]
+    fn live_chunk_readout_row_reserves_a_stable_height() {
+        fn measure(readout: Option<String>) -> f32 {
+            let ctx = egui::Context::default();
+            let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 400.0));
+            let mut height = 0.0_f32;
+            // Two passes: the first settles the default font atlas so the
+            // second pass's galley metrics are trustworthy.
+            for _ in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                };
+                let _ = ctx.run_ui(input, |ui| {
+                    height = live_chunk_readout_row(ui, readout.clone()).rect.height();
+                });
+            }
+            height
+        }
+
+        let with_readout = measure(Some(
+            "last chunk 23:57:10Z age 3s chunks 66 id 66 intermediate".to_owned(),
+        ));
+        let without = measure(None);
+        assert!(with_readout > 0.0, "the row always occupies a line");
+        assert!(
+            (with_readout - without).abs() < 0.5,
+            "live and past frames must reserve the same height: {with_readout} vs {without}"
+        );
     }
 
     #[test]
