@@ -2424,6 +2424,34 @@ fn archive_load_progress_row(ui: &mut egui::Ui, progress: &ArchiveLoadProgress) 
     }
 }
 
+/// The archive/backfill progress bar in a FIXED-height slot.
+///
+/// The bar/spinner only exists while a load is in flight. Drawing it
+/// conditionally reflowed every control below it: a loop or preload backfill
+/// finishing WHILE the user was looping or dragging the slider made the
+/// "loading frames" bar vanish, shifting the whole sidebar up and causing
+/// misclicks (field report, v0.28.x). This slot keeps its height whether or
+/// not a load is running, so nothing below it ever moves. The bar itself is
+/// unchanged (still [`archive_load_progress_row`]); only its presence is now
+/// height-neutral.
+fn archive_load_progress_slot(
+    ui: &mut egui::Ui,
+    progress: Option<&ArchiveLoadProgress>,
+) -> egui::Response {
+    let row_height = ui.spacing().interact_size.y;
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), row_height),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_min_height(row_height);
+            if let Some(progress) = progress {
+                archive_load_progress_row(ui, progress);
+            }
+        },
+    )
+    .response
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArchiveLoopSource {
     EventPoint,
@@ -20868,9 +20896,7 @@ impl ViewerApp {
         let Some(pane) = self.extra_panes.get(pane_slot) else {
             return;
         };
-        if let Some(progress) = &pane.archive_load_progress {
-            archive_load_progress_row(ui, progress);
-        }
+        archive_load_progress_slot(ui, pane.archive_load_progress.as_ref());
         if let Some(volume) = &pane.volume {
             let site = volume.site.id.clone();
             let time_zone = self.time_zone();
@@ -21651,9 +21677,7 @@ impl ViewerApp {
         if let Some(slot) = site_control_pane {
             self.extra_pane_status_ui(ui, slot);
         } else {
-            if let Some(progress) = &self.archive_load_progress {
-                archive_load_progress_row(ui, progress);
-            }
+            archive_load_progress_slot(ui, self.archive_load_progress.as_ref());
             if let Some(volume) = &self.volume {
                 let site = volume.site.id.clone();
                 let time_zone = self.time_zone();
@@ -50642,6 +50666,46 @@ mod tests {
         assert!(
             (with_readout - without).abs() < 0.5,
             "live and past frames must reserve the same height: {with_readout} vs {without}"
+        );
+    }
+
+    /// The archive/backfill progress slot must reserve the SAME height
+    /// whether a load is running (bar or spinner) or not. A loop/preload
+    /// backfill finishing mid-interaction used to make the bar vanish and
+    /// shift every control below it — the reported misclick source.
+    #[test]
+    fn archive_load_progress_slot_height_is_stable() {
+        fn measure(progress: Option<ArchiveLoadProgress>) -> f32 {
+            let ctx = egui::Context::default();
+            let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 400.0));
+            let mut height = 0.0_f32;
+            for _ in 0..2 {
+                let input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                };
+                let _ = ctx.run_ui(input, |ui| {
+                    height = archive_load_progress_slot(ui, progress.as_ref())
+                        .rect
+                        .height();
+                });
+            }
+            height
+        }
+
+        let determinate = ArchiveLoadProgress {
+            label: "L2 loop".to_owned(),
+            detail: "loading".to_owned(),
+            done: 3,
+            total: 7,
+        };
+        let bar = measure(Some(determinate));
+        let spinner = measure(Some(ArchiveLoadProgress::latest_loop_start("KTLX")));
+        let idle = measure(None);
+        assert!(idle > 0.0, "the slot always reserves its height");
+        assert!(
+            (bar - idle).abs() < 0.5 && (spinner - idle).abs() < 0.5,
+            "loading and idle must reserve the same height: bar {bar} spinner {spinner} idle {idle}"
         );
     }
 
