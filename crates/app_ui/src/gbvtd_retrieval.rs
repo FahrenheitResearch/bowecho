@@ -214,6 +214,19 @@ impl crate::ViewerApp {
         {
             self.run_gbvtd_retrieval();
         }
+        if (self.gbvtd.result.is_some()
+            || self.gbvtd.seed_lonlat.is_some()
+            || self.gbvtd.place_mode)
+            && ui
+                .button("✖ Clear")
+                .on_hover_text("Remove the TC-winds overlay (center, ring, label) and reset.")
+                .clicked()
+        {
+            self.gbvtd.result = None;
+            self.gbvtd.seed_lonlat = None;
+            self.gbvtd.place_mode = false;
+            self.gbvtd.status.clear();
+        }
         if !self.gbvtd.status.is_empty() {
             ui.separator();
             ui.label(&self.gbvtd.status);

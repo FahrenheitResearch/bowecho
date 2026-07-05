@@ -8066,6 +8066,35 @@ impl ViewerApp {
         self.volume = Some(volume);
         self.dealiased_readout_cache = None;
         self.selected_cut = selected_cut;
+        // Env-gated trace (BOWECHO_TRACE_PRODUCT): pinpoint which install turns
+        // a velocity display into reflectivity and on what kind of frame. The
+        // frame_status tells partial (live poll) from complete (loaded frame).
+        if std::env::var_os("BOWECHO_TRACE_PRODUCT").is_some()
+            && matches!(
+                self.selected_product,
+                DisplayProduct::Moment(MomentType::Velocity)
+                    | DisplayProduct::DealiasedVelocity
+                    | DisplayProduct::StormRelativeVelocity
+                    | DisplayProduct::StormRelativeDealiasedVelocity
+            )
+            && matches!(
+                selected_product,
+                DisplayProduct::Moment(MomentType::Reflectivity)
+            )
+        {
+            let line = format!(
+                "FLIP vel->refl @install_volume_arc status={frame_status:?} playing={} pending={:?} cut={selected_cut}\n",
+                self.primary.cursor.playing, self.pending_product_restore,
+            );
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(std::env::temp_dir().join("bowecho_product_trace.log"))
+            {
+                use std::io::Write;
+                let _ = file.write_all(line.as_bytes());
+            }
+        }
         self.selected_product = selected_product;
         let installed_volume = self.volume.clone();
         if let Some(installed_volume) = installed_volume {
@@ -30170,16 +30199,31 @@ impl ViewerApp {
             .history
             .sort_by(|left, right| left.identity.cmp(&right.identity));
         self.trim_frame_history();
-        // Follow the feed unless the user is looping history.
-        if !self.primary.cursor.playing {
+        // Follow the feed unless the user is looping history. When the loop is
+        // playing, the cursor sits on an older frame; do NOT yank the display
+        // to the newest polled volume — a reflectivity-only live partial (split
+        // velocity/CD sweeps not yet in) would flip selected_product to
+        // reflectivity. The newest frame is already in history, so the playing
+        // loop reaches it on its own step (where product resolution recovers).
+        let cursor_shows_this = if !self.primary.cursor.playing {
             self.primary.cursor.index = self
                 .primary
                 .history
                 .iter()
                 .position(|frame| frame.identity == identity)
                 .unwrap_or_else(|| self.primary.history.len().saturating_sub(1));
+            true
+        } else {
+            self.primary
+                .history
+                .get(self.primary.cursor.index)
+                .is_some_and(|frame| frame.identity == identity)
+        };
+        if cursor_shows_this {
+            self.install_volume_arc(volume, None, true, None, FrameStatus::Complete, ctx);
+        } else {
+            ctx.request_repaint();
         }
-        self.install_volume_arc(volume, None, true, None, FrameStatus::Complete, ctx);
     }
 
     /// True when the active poll source is fully specified — the condition
