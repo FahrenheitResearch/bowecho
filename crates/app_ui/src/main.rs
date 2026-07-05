@@ -21904,7 +21904,9 @@ impl ViewerApp {
         // it lives just below the moment buttons rather than in the picker —
         // clicking it opens the TC Winds panel and arms click-to-place on the
         // eye (primary pane only; a single-Doppler retrieval is site-relative).
-        if editing_pane.is_none() {
+        // A derived/computed product, so it honors "Show derived products"
+        // (the overlays-panel toggle still reaches it when this row is hidden).
+        if editing_pane.is_none() && self.app_settings.show_derived_products {
             ui.horizontal_wrapped(|ui| {
                 let label = if self.gbvtd.place_mode {
                     "🌀 TC Winds — click the eye…"

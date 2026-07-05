@@ -2,8 +2,8 @@
 //!
 //! Runs [`render2d::gbvtd`] on the currently displayed radar volume: dealiases
 //! the lowest velocity cut, then retrieves the storm center, radius of maximum
-//! wind, and the axisymmetric tangential/radial wind profile about the map
-//! center (the user pans the eye to the middle of the view). The retrieved
+//! wind, and the axisymmetric tangential/radial wind profile about a
+//! user-clicked center (the user clicks the eye on the radar). The retrieved
 //! center + RMW ring are drawn on the radar map, with a wind-profile readout.
 //!
 //! Method: Lee, Jou, Chang & Deng 1999 (Mon. Wea. Rev. 127) + Lee & Marks 2000
@@ -53,7 +53,8 @@ fn intensity_label(kt: f32) -> &'static str {
 
 impl crate::ViewerApp {
     /// Retrieve the TC circulation on the displayed volume, seeding the center
-    /// search from the current map center.
+    /// search from the user-clicked eye (`seed_lonlat`), or the map center as a
+    /// fallback when nothing has been placed yet.
     pub fn run_gbvtd_retrieval(&mut self) {
         self.gbvtd.result = None;
         let Some(volume) = self.volume.clone() else {
@@ -107,7 +108,7 @@ impl crate::ViewerApp {
             }
             None => {
                 self.gbvtd.status =
-                    "No circulation found — pan the eye to the map center and retry.".to_owned();
+                    "No circulation found — click closer to the eye and retry.".to_owned();
             }
         }
     }
