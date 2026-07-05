@@ -4689,7 +4689,8 @@ impl DealiasGridCache {
         }
         let bytes = moment_grid_cache_bytes(&grid);
         self.bytes += bytes;
-        self.entries.push_back(DealiasGridEntry { key, grid, bytes });
+        self.entries
+            .push_back(DealiasGridEntry { key, grid, bytes });
         while self.bytes > self.budget_bytes && self.entries.len() > 1 {
             let Some(front) = self.entries.pop_front() else {
                 break;
@@ -4728,7 +4729,11 @@ fn dealias_grid_cache_budget_bytes() -> usize {
 /// dealiased at most once. LRU-bounded so a long loop cannot grow it forever.
 fn dealias_grid_cache() -> &'static Mutex<DealiasGridCache> {
     static CACHE: OnceLock<Mutex<DealiasGridCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(DealiasGridCache::with_budget(dealias_grid_cache_budget_bytes())))
+    CACHE.get_or_init(|| {
+        Mutex::new(DealiasGridCache::with_budget(
+            dealias_grid_cache_budget_bytes(),
+        ))
+    })
 }
 
 /// Return the memoized dealiased grid for `key`, computing it via `compute`
@@ -15209,7 +15214,7 @@ impl ViewerApp {
                 let _ = sender.send(AsyncLoadResult {
                     label: format!("L2 {site_id} archive"),
                     update: AsyncLoadUpdate::Final(Err(
-                        first_error.unwrap_or_else(|| "no archive volumes decoded".to_owned()),
+                        first_error.unwrap_or_else(|| "no archive volumes decoded".to_owned())
                     )),
                 });
             } else {
@@ -30591,31 +30596,20 @@ impl ViewerApp {
             .history
             .sort_by(|left, right| left.identity.cmp(&right.identity));
         self.trim_frame_history();
-        // Follow the feed unless the user is looping history. When the loop is
-        // playing, the cursor sits on an older frame; do NOT yank the display
-        // to the newest polled volume — a reflectivity-only live partial (split
-        // velocity/CD sweeps not yet in) would flip selected_product to
-        // reflectivity. The newest frame is already in history, so the playing
-        // loop reaches it on its own step (where product resolution recovers).
-        let cursor_shows_this = if !self.primary.cursor.playing {
+        // Follow the feed unless the user is looping history (the cursor holds
+        // while playing — census D5a). The display still takes the newest
+        // volume (census D9, "LIVE WINS"); if it is a reflectivity-only live
+        // partial the product falls back for that frame only and
+        // `pending_product_restore` restores it on the next loop step.
+        if !self.primary.cursor.playing {
             self.primary.cursor.index = self
                 .primary
                 .history
                 .iter()
                 .position(|frame| frame.identity == identity)
                 .unwrap_or_else(|| self.primary.history.len().saturating_sub(1));
-            true
-        } else {
-            self.primary
-                .history
-                .get(self.primary.cursor.index)
-                .is_some_and(|frame| frame.identity == identity)
-        };
-        if cursor_shows_this {
-            self.install_volume_arc(volume, None, true, None, FrameStatus::Complete, ctx);
-        } else {
-            ctx.request_repaint();
         }
+        self.install_volume_arc(volume, None, true, None, FrameStatus::Complete, ctx);
     }
 
     /// True when the active poll source is fully specified — the condition
@@ -53709,12 +53703,18 @@ mod tests {
         let entry_bytes = 1024 * 1024; // 1 MiB per grid.
         let mut cache = DealiasGridCache::with_budget(3 * entry_bytes + entry_bytes / 2);
         for cut in 0..3 {
-            cache.insert(region_key(0x1000, cut), Arc::new(dealias_grid_of_bytes(entry_bytes)));
+            cache.insert(
+                region_key(0x1000, cut),
+                Arc::new(dealias_grid_of_bytes(entry_bytes)),
+            );
         }
         assert_eq!(cache.len(), 3);
         // Touch the oldest so it becomes most-recent, then overflow the budget.
         assert!(cache.get(&region_key(0x1000, 0)).is_some());
-        cache.insert(region_key(0x1000, 3), Arc::new(dealias_grid_of_bytes(entry_bytes)));
+        cache.insert(
+            region_key(0x1000, 3),
+            Arc::new(dealias_grid_of_bytes(entry_bytes)),
+        );
 
         assert!(cache.total_bytes() <= cache.budget_bytes);
         // cut 1 was the least-recently-used → evicted; cut 0 (just touched) stays.
@@ -53728,7 +53728,10 @@ mod tests {
     #[test]
     fn dealias_grid_cache_keeps_single_oversized_entry() {
         let mut cache = DealiasGridCache::with_budget(1024);
-        cache.insert(region_key(0x1000, 0), Arc::new(dealias_grid_of_bytes(8 * 1024 * 1024)));
+        cache.insert(
+            region_key(0x1000, 0),
+            Arc::new(dealias_grid_of_bytes(8 * 1024 * 1024)),
+        );
         assert_eq!(cache.len(), 1);
         assert!(cache.get(&region_key(0x1000, 0)).is_some());
     }
