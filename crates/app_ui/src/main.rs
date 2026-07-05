@@ -2177,6 +2177,9 @@ struct ViewerApp {
     sat_run_listings: Vec<rw_ui::SatRunListing>,
     show_satellite: bool,
     himawari_band: u8,
+    /// Selected GOES ABI RGB composite style slug for the one-shot
+    /// true/natural-color ingest (`natural_color`, `geocolor`, ...).
+    goes_composite_style: String,
     /// In-app Guide window (reference docs, opened on demand — never forced).
     show_guide: bool,
     /// Session marker for the last workflow preset the user applied. It is
@@ -6858,6 +6861,7 @@ impl ViewerApp {
             sat_run_listings: Vec::new(),
             show_satellite: false,
             himawari_band: 13,
+            goes_composite_style: "natural_color".to_string(),
             show_guide: false,
             current_workflow: None,
             previous_workflow_snapshot: None,
@@ -29903,6 +29907,13 @@ impl ViewerApp {
             .find(|(band, _)| *band == self.himawari_band)
             .map(|(_, label)| *label)
             .unwrap_or("B13 Clean IR 10.4");
+        let mut load_composite = false;
+        let composite_options = sat_worker::goes_composite_style_options();
+        let selected_composite_label = composite_options
+            .iter()
+            .find(|(slug, _)| slug == &self.goes_composite_style)
+            .map(|(_, label)| label.clone())
+            .unwrap_or_else(|| "GeoColor · C01+C02+C03".to_string());
         egui::CollapsingHeader::new("Other satellite sources")
             .default_open(true)
             .show(ui, |ui| {
@@ -29923,6 +29934,29 @@ impl ViewerApp {
                         .clicked()
                     {
                         load_himawari = true;
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("GOES RGB");
+                    egui::ComboBox::from_id_salt("goes_composite_style")
+                        .selected_text(selected_composite_label)
+                        .width(210.0)
+                        .show_ui(ui, |ui| {
+                            for (slug, label) in &composite_options {
+                                ui.selectable_value(
+                                    &mut self.goes_composite_style,
+                                    slug.clone(),
+                                    label,
+                                );
+                            }
+                        });
+                    if fixed_action_button(ui, "Load true-color", 120.0)
+                        .on_hover_text(
+                            "Fetch the ABI bands the selected RGB composite needs for the current GOES satellite/sector, co-register + compose true/natural color, and select it in the player + map. NaturalColor/GeoColor render dark at night.",
+                        )
+                        .clicked()
+                    {
+                        load_composite = true;
                     }
                 });
                 ui.weak(
@@ -29946,6 +29980,25 @@ impl ViewerApp {
                 ..sat_worker::HimawariQuickSpec::default()
             };
             sat.send(sat_worker::SatRequest::IngestLatestHimawari(spec));
+        }
+        if let Some(sat) = &self.sat
+            && load_composite
+        {
+            let base = self.sat_panel.spec().clone();
+            let style = self.goes_composite_style.clone();
+            self.sat_map_follow = true;
+            self.status = format!("Satellite: composing GOES {} {style}", base.sector);
+            self.sat_panel.apply_note(format!(
+                "GOES composite: queued {} {} {style}",
+                base.satellite, base.sector
+            ));
+            let composite = sat_worker::GoesCompositeSpec {
+                satellite: base.satellite,
+                sector: base.sector,
+                style,
+                ..sat_worker::GoesCompositeSpec::default()
+            };
+            sat.send(sat_worker::SatRequest::IngestLatestGoesComposite(composite));
         }
         ui.separator();
         if self.sat_last_frame.is_some() || self.sat_layer.is_some() {
@@ -30007,7 +30060,7 @@ impl ViewerApp {
     }
 
     fn satellite_run_key_matches_current_spec(&self, key: &rw_ui::SatRunKey) -> bool {
-        if satellite_run_key_is_other_source(key) {
+        if satellite_run_key_is_other_source(key) || satellite_run_key_is_composite(key) {
             return true;
         }
         sat_worker::run_filters_for_spec(self.sat_panel.spec())
@@ -30030,6 +30083,7 @@ impl ViewerApp {
         runs.into_iter()
             .filter(|run| {
                 satellite_run_key_is_other_source(&run.key)
+                    || satellite_run_key_is_composite(&run.key)
                     || run.key.model == model
                         && prefixes
                             .iter()
@@ -50856,6 +50910,13 @@ fn satellite_run_key_is_other_source(key: &rw_ui::SatRunKey) -> bool {
     !matches!(key.model.as_str(), "g16" | "g17" | "g18" | "g19")
 }
 
+/// True/natural-color RGB composite runs (`<sector>_rgb_<style>_<YYYYMMDD>`)
+/// are shown in the player/map regardless of the follow spec's band filter —
+/// they belong to a GOES model dir but carry no single `c<band>` prefix.
+fn satellite_run_key_is_composite(key: &rw_ui::SatRunKey) -> bool {
+    key.run.contains("_rgb_")
+}
+
 fn sat_run_family(run_name: &str) -> String {
     let mut saw_day = false;
     run_name
@@ -68833,6 +68894,7 @@ mod tests {
             sat_run_listings: Vec::new(),
             show_satellite: false,
             himawari_band: 13,
+            goes_composite_style: "natural_color".to_string(),
             show_guide: false,
             current_workflow: None,
             previous_workflow_snapshot: None,

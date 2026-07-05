@@ -21,10 +21,11 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use chrono::{Timelike, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use eframe::egui::{Color32, ColorImage};
 use rustwx_core::{GridShape, LatLonGrid};
-use rw_sat::composite::GoesAbiRgbCompositeStyle;
+use rw_sat::abi::{GoesAbiField, GoesAbiScene, read_goes_abi_field};
+use rw_sat::composite::{GoesAbiRgbCompositeStyle, compose_rgb_pixels, values_on_base_grid};
 use rw_sat::events::{SatError, SatEvent};
 use rw_sat::follow::FollowConfig;
 use rw_sat::goes::{GoesSatellite, parse_goes_abi_filename};
@@ -35,11 +36,12 @@ use rw_sat::himawari::{
 };
 use rw_sat::palette::{anchor_color, band_anchors};
 use rw_sat::s3::{
-    Sector, bucket_for_satellite, build_agent, download_object, object_filename, object_url,
+    S3Object, Sector, abi_filename_product_matches_request, band_hour_prefix, bucket_for_satellite,
+    build_agent, download_object, list_s3_objects, object_filename, object_url,
 };
 use rw_sat::store::{
-    SatelliteGridField, SatelliteGridScene, SatelliteProjection, WrittenFrame, frame_file_name,
-    run_day, selector_band,
+    SatelliteGridField, SatelliteGridScene, SatelliteProjection, WrittenFrame, downsample_field,
+    frame_file_name, run_day, sector_slug, selector_band,
 };
 use rw_sat::window::WindowConfig;
 use rw_store::format::RwsWriterInfo;
@@ -70,6 +72,40 @@ pub enum SatRequest {
     LoadFrameForMap { key: SatRunKey, hhmm: u16 },
     /// Download/decode the latest Himawari AHI frame into the shared sat store.
     IngestLatestHimawari(HimawariQuickSpec),
+    /// Fetch the ABI bands a composite needs (co-registered by scan time),
+    /// compose a true/natural-color RGB, and write it as one composite frame.
+    IngestLatestGoesComposite(GoesCompositeSpec),
+}
+
+/// One-shot GOES ABI RGB-composite ingest request (Track D true-color path).
+/// The composite's required bands are derived from `style`; every band of the
+/// latest scan that has ALL of them is fetched, co-registered onto the base
+/// channel's fixed grid, and composed per-pixel through rw-sat's
+/// [`compose_rgb_pixels`].
+#[derive(Debug, Clone)]
+pub struct GoesCompositeSpec {
+    /// Satellite slug (`goes19`, `goes18`, `goes16`).
+    pub satellite: String,
+    /// Sector slug (`conus`, `fulldisk`, `meso1`, `meso2`).
+    pub sector: String,
+    /// Composite style slug (`natural_color`, `geocolor`, ...).
+    pub style: String,
+    /// Per-band decimation stride applied on ingest (keeps hi-res C02 sane).
+    pub downsample: usize,
+    /// How far back to scan hour prefixes for the latest all-band scan.
+    pub lookback_minutes: i64,
+}
+
+impl Default for GoesCompositeSpec {
+    fn default() -> Self {
+        Self {
+            satellite: "goes19".to_string(),
+            sector: "conus".to_string(),
+            style: "natural_color".to_string(),
+            downsample: 4,
+            lookback_minutes: 180,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +339,35 @@ pub fn layer_options() -> Vec<SatLayerOption> {
     options
 }
 
+/// The RGB composite styles offered by the one-shot true-color ingest, as
+/// `(slug, label)` for a UI picker. Every `GoesAbiRgbCompositeStyle` is
+/// ingestable (its required bands are fetched co-registered on demand), so
+/// this mirrors [`GoesAbiRgbCompositeStyle::ALL`] with the daytime
+/// natural-color recipe first.
+pub fn goes_composite_style_options() -> Vec<(String, String)> {
+    let mut styles = vec![GoesAbiRgbCompositeStyle::NaturalColor];
+    for style in GoesAbiRgbCompositeStyle::ALL {
+        if style != GoesAbiRgbCompositeStyle::NaturalColor {
+            styles.push(style);
+        }
+    }
+    styles
+        .into_iter()
+        .map(|style| {
+            let bands = style
+                .required_channels()
+                .iter()
+                .map(|band| format!("C{band:02}"))
+                .collect::<Vec<_>>()
+                .join("+");
+            (
+                style.slug().to_string(),
+                format!("{} · {bands}", style.title()),
+            )
+        })
+        .collect()
+}
+
 /// Layer slug -> the ABI bands it follows, plus a description for the
 /// summary line. Bands: "c13"; composites by slug ("geocolor").
 fn resolve_layer(layer: &str) -> Result<(Vec<u8>, String), String> {
@@ -467,6 +532,20 @@ fn disk_usage(store_root: &Path, model: &str, prefixes: &[String]) -> SatDiskUsa
 /// Title for one sat run: `g19 · conus C13 · 2026-06-10` (with the
 /// `_2` grid-move suffix kept visible).
 fn run_title(model: &str, run: &str) -> String {
+    // Composite RGB runs are `<sector>_rgb_<style>_<YYYYMMDD>[_<k>]`.
+    if run.contains("_rgb_") {
+        let day = run_day(run)
+            .map(|day| day.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        for style in GoesAbiRgbCompositeStyle::ALL {
+            let marker = format!("_rgb_{}_", style.slug());
+            if let Some(pos) = run.find(&marker) {
+                let sector = &run[..pos];
+                return format!("{model} · {sector} {} · {day}", style.title());
+            }
+        }
+        return format!("{model} · {run}");
+    }
     let mut tokens = run.split('_');
     let sector = tokens.next().unwrap_or(run);
     let band = tokens
@@ -583,14 +662,9 @@ fn load_colored_frame(
     let reader =
         HourReader::open(&run_dir.join(frame_file_name(hhmm))).map_err(|err| err.to_string())?;
     let meta = reader.meta();
-    let variable = meta
-        .variables
-        .iter()
-        .find(|var| var.kind == "surface2d")
-        .ok_or_else(|| format!("{key}/t{hhmm:04} holds no 2D variable"))?;
-    let band = selector_band(&variable.selector, &variable.name)
-        .ok_or_else(|| format!("{key}/t{hhmm:04} selector carries no band"))?;
 
+    // Grid facts (cached per run) plus the frame/run grid-hash agreement
+    // check — required for both the single-band and composite render paths.
     let grid_key = (key.model.clone(), key.run.clone());
     if !state.grids.contains_key(&grid_key) {
         let grid = GridFile::open(&run_dir.join("grid.rwg")).map_err(|err| err.to_string())?;
@@ -609,11 +683,36 @@ fn load_colored_frame(
             meta.grid_hash, grid.hash
         ));
     }
-
+    let flip_rows = grid.flip_rows;
     let (nx, ny) = (meta.nx, meta.ny);
-    let name = variable.name.clone();
-    let values = reader.read_full_2d(&name).map_err(|err| err.to_string())?;
-    let pixels = render_sat_pixels(&name, band, &values, nx, ny, grid.flip_rows, map_overlay);
+
+    // Composite (true/natural-color) frames carry three baked RGB planes
+    // instead of a single band; render them straight to Color32.
+    let is_composite = meta.variables.iter().any(|var| var.name == COMPOSITE_R_VAR);
+    let pixels = if is_composite {
+        let r = reader
+            .read_full_2d(COMPOSITE_R_VAR)
+            .map_err(|err| err.to_string())?;
+        let g = reader
+            .read_full_2d(COMPOSITE_G_VAR)
+            .map_err(|err| err.to_string())?;
+        let b = reader
+            .read_full_2d(COMPOSITE_B_VAR)
+            .map_err(|err| err.to_string())?;
+        render_composite_pixels(&r, &g, &b, nx, ny, flip_rows)
+    } else {
+        let variable = meta
+            .variables
+            .iter()
+            .find(|var| var.kind == "surface2d")
+            .ok_or_else(|| format!("{key}/t{hhmm:04} holds no 2D variable"))?;
+        let band = selector_band(&variable.selector, &variable.name)
+            .ok_or_else(|| format!("{key}/t{hhmm:04} selector carries no band"))?;
+        let name = variable.name.clone();
+        let values = reader.read_full_2d(&name).map_err(|err| err.to_string())?;
+        render_sat_pixels(&name, band, &values, nx, ny, flip_rows, map_overlay)
+    };
+
     Ok(ColoredSatFrame {
         frame: SatFrameImage {
             key: key.clone(),
@@ -622,6 +721,45 @@ fn load_colored_frame(
             read_ms: started.elapsed().as_secs_f32() * 1000.0,
         },
     })
+}
+
+/// Store variable names for a baked GOES ABI RGB composite frame: three
+/// f32 planes in `[0, 255]` (NaN = transparent / off-earth / night).
+const COMPOSITE_R_VAR: &str = "rgb_r";
+const COMPOSITE_G_VAR: &str = "rgb_g";
+const COMPOSITE_B_VAR: &str = "rgb_b";
+
+/// Render three baked RGB planes to `Color32`. A pixel is transparent when
+/// any channel is non-finite (the composite stored a `TRANSPARENT` pixel);
+/// otherwise it is opaque true color. Row flipping matches
+/// [`render_sat_pixels`] so composites and single-band frames share the
+/// map/player geometry.
+fn render_composite_pixels(
+    r: &[f32],
+    g: &[f32],
+    b: &[f32],
+    nx: usize,
+    ny: usize,
+    flip_rows: bool,
+) -> Vec<Color32> {
+    let mut pixels = Vec::with_capacity(nx * ny);
+    for image_row in 0..ny {
+        let grid_row = if flip_rows { ny - 1 - image_row } else { image_row };
+        for col in 0..nx {
+            let idx = grid_row * nx + col;
+            let (rv, gv, bv) = (r[idx], g[idx], b[idx]);
+            if !(rv.is_finite() && gv.is_finite() && bv.is_finite()) {
+                pixels.push(Color32::TRANSPARENT);
+                continue;
+            }
+            pixels.push(Color32::from_rgb(
+                rv.round().clamp(0.0, 255.0) as u8,
+                gv.round().clamp(0.0, 255.0) as u8,
+                bv.round().clamp(0.0, 255.0) as u8,
+            ));
+        }
+    }
+    pixels
 }
 
 fn render_sat_pixels(
@@ -1274,6 +1412,410 @@ fn ingest_latest_himawari(
     ))
 }
 
+/// ABI scan mode token in the open-data filenames (mode 6 since 2019; mode
+/// 3 is the legacy contingency schedule). A mode flip degrades to editing
+/// this constant, mirroring rw-sat's follow engine.
+const GOES_ABI_SCAN_MODE: u8 = 6;
+
+/// Newest scan start time for which EVERY required band has an object under
+/// the recent hour prefixes, plus that scan's per-band object. All 16 ABI
+/// channels of one scan share the same filename `s` timestamp, so the scan
+/// keys line up exactly across bands (no fuzzy time matching needed).
+fn latest_common_scan(
+    bucket: &str,
+    abi_product: &str,
+    satellite: &GoesSatellite,
+    bands: &[u8],
+    hours: &[DateTime<Utc>],
+) -> Result<(DateTime<Utc>, HashMap<u8, S3Object>), String> {
+    let agent = build_agent();
+    let mut per_band: HashMap<u8, HashMap<DateTime<Utc>, S3Object>> = HashMap::new();
+    for &band in bands {
+        let mut scans: HashMap<DateTime<Utc>, S3Object> = HashMap::new();
+        for hour in hours {
+            let prefix = band_hour_prefix(abi_product, satellite, GOES_ABI_SCAN_MODE, band, *hour);
+            let objects =
+                list_s3_objects(&agent, bucket, &prefix, None).map_err(|err| err.to_string())?;
+            for object in objects {
+                if !object.key.ends_with(".nc") {
+                    continue;
+                }
+                let Ok(parsed) = parse_goes_abi_filename(object_filename(&object.key)) else {
+                    continue;
+                };
+                if parsed.channel != Some(band)
+                    || !abi_filename_product_matches_request(&parsed.product, abi_product)
+                {
+                    continue;
+                }
+                scans.insert(parsed.start_time_utc, object);
+            }
+        }
+        if scans.is_empty() {
+            return Err(format!(
+                "no recent GOES {abi_product} C{band:02} objects in the last {} hour prefix(es)",
+                hours.len()
+            ));
+        }
+        per_band.insert(band, scans);
+    }
+
+    let base = bands[0];
+    let mut candidates: Vec<DateTime<Utc>> = per_band[&base].keys().copied().collect();
+    candidates.sort_unstable();
+    for scan in candidates.into_iter().rev() {
+        if bands.iter().all(|band| per_band[band].contains_key(&scan)) {
+            let objects = bands
+                .iter()
+                .map(|band| (*band, per_band[band][&scan].clone()))
+                .collect();
+            return Ok((scan, objects));
+        }
+    }
+    Err("no scan time yet has every band the composite needs".to_string())
+}
+
+/// Download the ABI bands a composite needs (the latest scan that has all of
+/// them), co-register them onto the base channel's fixed grid, compose the
+/// RGB per pixel through rw-sat, and write one composite frame into the sat
+/// store. This is the Track D true/natural-color ingest — the single-band
+/// enhanced-IR/visible path already lives in [`render_sat_pixels`].
+///
+/// Recipes and per-pixel math are rw-sat's [`compose_rgb_pixels`]; GeoColor /
+/// NaturalColor here are the daytime pseudo-true-color visible composites
+/// (CIRA/CIMSS "GeoColor" lineage; night renders dark/transparent).
+fn ingest_latest_goes_composite(
+    store_root: &Path,
+    spec: &GoesCompositeSpec,
+    send: &impl Fn(SatResponse) -> bool,
+) -> Result<String, String> {
+    let style = GoesAbiRgbCompositeStyle::parse(&spec.style)
+        .ok_or_else(|| format!("unknown composite style '{}'", spec.style))?;
+    let bucket = bucket_for_satellite(&spec.satellite).map_err(|err| err.to_string())?;
+    let sector =
+        Sector::parse(&spec.sector).ok_or_else(|| format!("unknown sector '{}'", spec.sector))?;
+    let satellite = GoesSatellite::parse(&spec.satellite);
+    let abi_product = sector.abi_product();
+    let bands = style.required_channels().to_vec();
+    let base_channel = style.base_channel();
+    let downsample = spec.downsample.max(1);
+    let cache_dir = store_root.join("cache");
+
+    // Recent hour prefixes to scan for the newest all-band scan.
+    let now = Utc::now();
+    let hour_span = (spec.lookback_minutes.max(20) / 60) + 2;
+    let hours: Vec<DateTime<Utc>> = (0..hour_span)
+        .map(|i| now - chrono::Duration::hours(i))
+        .collect();
+
+    let (scan_start, objects) =
+        latest_common_scan(&bucket, abi_product, &satellite, &bands, &hours)?;
+
+    // Download + decode + decimate every required band.
+    let agent = build_agent();
+    let mut fields: HashMap<u8, GoesAbiField> = HashMap::with_capacity(bands.len());
+    for &band in &bands {
+        let object = &objects[&band];
+        send(SatResponse::DownloadStarted {
+            id: object.key.clone(),
+            label: download_label(&object.key),
+            bytes: object.size_bytes,
+        });
+        let started = Instant::now();
+        let downloaded = download_object(&agent, &bucket, &cache_dir, object, true)
+            .map_err(|err| err.to_string())?;
+        send(SatResponse::DownloadDone {
+            id: object.key.clone(),
+            ms: started.elapsed().as_millis(),
+            cache_hit: downloaded.cache_hit,
+        });
+        let field = read_goes_abi_field(&downloaded.path, "CMI").map_err(|err| err.to_string())?;
+        fields.insert(band, downsample_field(field, downsample));
+    }
+
+    // Base grid = the (decimated) base channel; resample every band onto it,
+    // then compose per pixel.
+    let base_scene = fields
+        .get(&base_channel)
+        .ok_or_else(|| format!("composite base channel C{base_channel:02} was not fetched"))?
+        .scene
+        .clone();
+    let (nx, ny) = (base_scene.fixed_grid.nx, base_scene.fixed_grid.ny);
+    let len = nx.saturating_mul(ny);
+    let mut planes: HashMap<u8, Vec<f32>> = HashMap::with_capacity(bands.len());
+    for (&band, field) in &fields {
+        let values = values_on_base_grid(field, &base_scene).map_err(|err| err.to_string())?;
+        planes.insert(band, values);
+    }
+    let rgba = compose_rgb_pixels(style, &planes, len).map_err(|err| err.to_string())?;
+
+    // Split into three f32 planes (NaN = transparent / off-earth / night).
+    let (mut r, mut g, mut b) = (
+        Vec::with_capacity(len),
+        Vec::with_capacity(len),
+        Vec::with_capacity(len),
+    );
+    for pixel in &rgba {
+        if pixel[3] == 0 {
+            r.push(f32::NAN);
+            g.push(f32::NAN);
+            b.push(f32::NAN);
+        } else {
+            r.push(f32::from(pixel[0]));
+            g.push(f32::from(pixel[1]));
+            b.push(f32::from(pixel[2]));
+        }
+    }
+
+    let frame = write_goes_composite_frame(
+        store_root,
+        &base_scene,
+        style,
+        &r,
+        &g,
+        &b,
+        Utc::now().timestamp().max(0) as u64,
+    )?;
+
+    for object in objects.values() {
+        send(SatResponse::FrameWritten {
+            id: object.key.clone(),
+            run: frame.run.clone(),
+            hhmm: frame.hhmm,
+            bytes: frame.bytes,
+            encode_ms: frame.encode_ms,
+        });
+    }
+    send(SatResponse::Runs(scan_runs(store_root)));
+    send(SatResponse::SelectFrame {
+        key: SatRunKey {
+            model: frame.model.clone(),
+            run: frame.run.clone(),
+        },
+        hhmm: frame.hhmm,
+    });
+
+    let lit = rgba.iter().filter(|pixel| pixel[3] != 0).count();
+    Ok(format!(
+        "GOES {} {} {}: scan {} · {} band(s) · {}x{} · {:.0}% lit · wrote {}/{}/t{:04}",
+        satellite.as_str(),
+        sector.slug(),
+        style.title(),
+        scan_start.format("%Y-%m-%d %H:%MZ"),
+        bands.len(),
+        nx,
+        ny,
+        100.0 * lit as f64 / len.max(1) as f64,
+        frame.model,
+        frame.run,
+        frame.hhmm
+    ))
+}
+
+/// The generic satellite selector for a baked RGB composite frame: base band
+/// on the GOES fixed-grid projection (sweep=x), plus a `composite` block
+/// naming the style and its source bands.
+fn composite_selector(scene: &GoesAbiScene, style: GoesAbiRgbCompositeStyle) -> serde_json::Value {
+    let projection = &scene.projection;
+    let sweep = match projection.sweep_angle_axis {
+        rw_sat::geostationary::SweepAngleAxis::X => "x",
+        rw_sat::geostationary::SweepAngleAxis::Y => "y",
+    };
+    let bands = style
+        .required_channels()
+        .iter()
+        .map(|band| serde_json::json!(band))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "satellite": {
+            "provider": "noaa",
+            "instrument": "abi",
+            "satellite": scene.satellite.as_str(),
+            "product": scene.product,
+            "band": style.base_channel(),
+            "layer": format!("rgb_{}", style.slug()),
+            "source_variable": "CMI",
+            "composite": {
+                "style": style.slug(),
+                "title": style.title(),
+                "bands": bands,
+            },
+            "scan_start_utc": scene.start_time_utc.to_rfc3339(),
+            "scan_end_utc": scene.end_time_utc.to_rfc3339(),
+            "projection": {
+                "perspective_point_height_m": projection.perspective_point_height_m,
+                "semi_major_axis_m": projection.semi_major_axis_m,
+                "semi_minor_axis_m": projection.semi_minor_axis_m,
+                "longitude_of_projection_origin_deg":
+                    projection.longitude_of_projection_origin_deg,
+                "sweep_angle_axis": sweep,
+            },
+        }
+    })
+}
+
+/// Write a baked RGB composite as one store frame: three `rgb_r/g/b` f32
+/// planes on the GOES per-pixel lat/lon mesh, following the same store
+/// contract as [`write_band_frame`] (grid.rwg shared by bit-identical grids,
+/// `t{HHMM}.rws`, a `run.json` manifest, fresh suffixed run dir on a grid
+/// change). Composite runs are `<sector>_rgb_<style>_<YYYYMMDD>`.
+#[allow(clippy::too_many_arguments)]
+fn write_goes_composite_frame(
+    store_root: &Path,
+    scene: &GoesAbiScene,
+    style: GoesAbiRgbCompositeStyle,
+    r: &[f32],
+    g: &[f32],
+    b: &[f32],
+    written_unix: u64,
+) -> Result<WrittenFrame, String> {
+    let model = scene.satellite.as_str().to_ascii_lowercase();
+    let sector = sector_slug(&scene.sector);
+    let day = scene.start_time_utc.format("%Y%m%d").to_string();
+    let hhmm = (scene.start_time_utc.hour() * 100 + scene.start_time_utc.minute()) as u16;
+    let run_base = format!("{sector}_rgb_{}_{day}", style.slug());
+
+    let (nx, ny) = (scene.fixed_grid.nx, scene.fixed_grid.ny);
+    let expected = nx.saturating_mul(ny);
+    if r.len() != expected || g.len() != expected || b.len() != expected {
+        return Err(format!(
+            "composite plane length mismatch for grid {nx}x{ny}: r={} g={} b={}",
+            r.len(),
+            g.len(),
+            b.len()
+        ));
+    }
+    let (lat, lon) = scene.lat_lon_mesh();
+    let shape = GridShape::new(nx, ny).map_err(|err| err.to_string())?;
+    let grid = LatLonGrid::new(shape, lat, lon).map_err(|err| err.to_string())?;
+
+    // Reuse the run dir whose stored grid is bit-identical, else the next
+    // free suffix — the store rule that keeps grid changes honest.
+    let model_dir = store_root.join(&model);
+    let mut candidates: Vec<String> = Vec::new();
+    if model_dir.is_dir() {
+        for entry in std::fs::read_dir(&model_dir).map_err(|err| err.to_string())? {
+            let entry = entry.map_err(|err| err.to_string())?;
+            let is_dir = entry.file_type().map_err(|err| err.to_string())?.is_dir();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if is_dir && (name == run_base || name.starts_with(&format!("{run_base}_"))) {
+                candidates.push(name);
+            }
+        }
+    }
+    candidates.sort();
+    let mut resolved: Option<(String, String)> = None;
+    for name in &candidates {
+        let grid_path = model_dir.join(name).join("grid.rwg");
+        if !grid_path.is_file() {
+            continue;
+        }
+        let existing = GridFile::open(&grid_path).map_err(|err| err.to_string())?;
+        if existing.nx == nx
+            && existing.ny == ny
+            && coords_bit_identical(&existing.lat, &grid.lat_deg)
+            && coords_bit_identical(&existing.lon, &grid.lon_deg)
+        {
+            resolved = Some((name.clone(), existing.hash));
+            break;
+        }
+    }
+    let created_run = resolved.is_none();
+    let (run_name, existing_grid_hash) = match resolved {
+        Some((name, hash)) => (name, Some(hash)),
+        None => {
+            let mut suffix = 1usize;
+            loop {
+                let name = if suffix == 1 {
+                    run_base.clone()
+                } else {
+                    format!("{run_base}_{suffix}")
+                };
+                if !candidates.contains(&name) {
+                    break (name, None);
+                }
+                suffix += 1;
+            }
+        }
+    };
+
+    let run_dir = model_dir.join(&run_name);
+    std::fs::create_dir_all(&run_dir).map_err(|err| err.to_string())?;
+    let _lock =
+        RunLock::acquire(&run_dir, Duration::from_secs(60)).map_err(|err| err.to_string())?;
+
+    let grid_path = run_dir.join("grid.rwg");
+    let grid_hash = match existing_grid_hash {
+        Some(hash) => hash,
+        None => write_grid(&grid_path, &grid, None).map_err(|err| err.to_string())?,
+    };
+
+    let started = Instant::now();
+    let selector = composite_selector(scene, style);
+    let writer_build = concat!("bowecho app_ui ", env!("CARGO_PKG_VERSION"));
+    let mut writer = HourWriter::new(&model, &run_name, hhmm, nx, ny, &grid_hash, writer_build);
+    writer
+        .add_surface2d(COMPOSITE_R_VAR, "rgb8", selector, r)
+        .map_err(|err| err.to_string())?;
+    writer
+        .add_surface2d(COMPOSITE_G_VAR, "rgb8", serde_json::Value::Null, g)
+        .map_err(|err| err.to_string())?;
+    writer
+        .add_surface2d(COMPOSITE_B_VAR, "rgb8", serde_json::Value::Null, b)
+        .map_err(|err| err.to_string())?;
+    let file_name = frame_file_name(hhmm);
+    let frame_path = run_dir.join(&file_name);
+    writer.finish(&frame_path).map_err(|err| err.to_string())?;
+    let encode_ms = started.elapsed().as_millis() as u64;
+    let bytes = std::fs::metadata(&frame_path)
+        .map_err(|err| err.to_string())?
+        .len();
+
+    let manifest_path = run_dir.join("run.json");
+    let writer_info = RwsWriterInfo {
+        name: "bowecho".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build: writer_build.to_string(),
+    };
+    let mut manifest = RwsRunManifest::load_or_new(
+        &manifest_path,
+        &model,
+        &run_name,
+        &grid_hash,
+        nx,
+        ny,
+        writer_info,
+    )
+    .map_err(|err| err.to_string())?;
+    manifest.register_hour(
+        hhmm,
+        RwsHourEntry {
+            file: file_name,
+            written_unix,
+            encode_ms,
+            variables: vec![
+                COMPOSITE_R_VAR.to_string(),
+                COMPOSITE_G_VAR.to_string(),
+                COMPOSITE_B_VAR.to_string(),
+            ],
+        },
+    );
+    manifest.save(&manifest_path).map_err(|err| err.to_string())?;
+
+    Ok(WrittenFrame {
+        model,
+        run: run_name,
+        hhmm,
+        scan_time_utc: scene.start_time_utc,
+        path: frame_path,
+        bytes,
+        encode_ms,
+        grid_hash,
+        created_run,
+        variable: COMPOSITE_R_VAR.to_string(),
+    })
+}
+
 fn worker_loop(
     store_root: PathBuf,
     requests: &Receiver<SatRequest>,
@@ -1328,6 +1870,23 @@ fn worker_loop(
                     }
                     Err(message) => {
                         send(SatResponse::Note(format!("Himawari failed: {message}")));
+                    }
+                }
+            }
+            SatRequest::IngestLatestGoesComposite(spec) => {
+                send(SatResponse::Note(format!(
+                    "GOES composite: locating latest {} {} {}",
+                    spec.satellite, spec.sector, spec.style
+                )));
+                match ingest_latest_goes_composite(&store_root, &spec, &send) {
+                    Ok(summary) => {
+                        send(SatResponse::Note(summary));
+                        send(SatResponse::Runs(scan_runs(&store_root)));
+                    }
+                    Err(message) => {
+                        send(SatResponse::Note(format!(
+                            "GOES composite failed: {message}"
+                        )));
                     }
                 }
             }
@@ -1907,6 +2466,186 @@ mod tests {
             std::fs::create_dir_all(parent).expect("proof png parent directory");
         }
         image.save(&out).expect("proof png writes");
+    }
+
+    /// A co-registered visible scene (reflectance factor 0..1) with a
+    /// vegetation pixel, a bright cloud, dark water, and an off-earth NaN.
+    fn composite_visible_field(nx: usize, ny: usize, band: u8, values: Vec<f32>) -> GoesAbiField {
+        let mut field = synthetic_field(nx, ny, 18, 51, band);
+        field.units = Some("1".to_string());
+        field.values = values;
+        field
+    }
+
+    #[test]
+    fn composite_natural_color_round_trips_and_greens_vegetation() {
+        let dir = test_dir("composite");
+        let (nx, ny) = (2usize, 2usize);
+        // Row-major: [0] vegetation, [1] bright cloud, [2] dark water,
+        // [3] off-earth (NaN in the NIR band -> transparent composite).
+        let c01 = composite_visible_field(nx, ny, 1, vec![0.04, 0.85, 0.03, 0.05]);
+        let c02 = composite_visible_field(nx, ny, 2, vec![0.06, 0.88, 0.04, 0.05]);
+        let c03 = composite_visible_field(nx, ny, 3, vec![0.50, 0.90, 0.05, f32::NAN]);
+        let style = GoesAbiRgbCompositeStyle::NaturalColor;
+        let base_scene = c02.scene.clone();
+        let len = nx * ny;
+
+        let mut planes: HashMap<u8, Vec<f32>> = HashMap::new();
+        planes.insert(1, values_on_base_grid(&c01, &base_scene).unwrap());
+        planes.insert(2, values_on_base_grid(&c02, &base_scene).unwrap());
+        planes.insert(3, values_on_base_grid(&c03, &base_scene).unwrap());
+        let rgba = compose_rgb_pixels(style, &planes, len).expect("compose");
+
+        let (mut r, mut g, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        for pixel in &rgba {
+            if pixel[3] == 0 {
+                r.push(f32::NAN);
+                g.push(f32::NAN);
+                b.push(f32::NAN);
+            } else {
+                r.push(f32::from(pixel[0]));
+                g.push(f32::from(pixel[1]));
+                b.push(f32::from(pixel[2]));
+            }
+        }
+        let frame = write_goes_composite_frame(&dir, &base_scene, style, &r, &g, &b, 1).unwrap();
+        assert_eq!(frame.model, "g19");
+        assert!(
+            frame.run.contains("_rgb_natural_color_"),
+            "composite run naming: {}",
+            frame.run
+        );
+        assert!(frame.created_run);
+
+        // Load back through the exact player path (composite branch).
+        let mut state = WorkerState::default();
+        let key = SatRunKey {
+            model: frame.model.clone(),
+            run: frame.run.clone(),
+        };
+        let loaded = load_frame(&mut state, &dir, &key, frame.hhmm).expect("composite loads");
+        assert_eq!(loaded.image.size, [nx, ny]);
+
+        // Vegetation pixel: opaque, green channel dominant (the natural-color
+        // green synthesized from NIR/red/blue).
+        let veg = loaded.image.pixels[0];
+        assert_eq!(veg.a(), 255, "lit composite pixel is opaque");
+        assert!(
+            veg.g() > veg.r() && veg.g() > veg.b(),
+            "vegetation renders green, not garbage: {veg:?}"
+        );
+        // Bright cloud: opaque and near-neutral bright.
+        let cloud = loaded.image.pixels[1];
+        assert_eq!(cloud.a(), 255);
+        assert!(
+            cloud.r() > 150 && cloud.g() > 150 && cloud.b() > 150,
+            "cloud is bright: {cloud:?}"
+        );
+        // Off-earth pixel (NaN band) is transparent.
+        assert_eq!(
+            loaded.image.pixels[3].a(),
+            0,
+            "off-earth composite pixel is transparent"
+        );
+
+        // The stored frame is self-describing as a composite.
+        let stored = rw_sat::store::read_frame(&dir, &frame.model, &frame.run, frame.hhmm).unwrap();
+        assert_eq!(
+            stored.selector["satellite"]["composite"]["style"],
+            "natural_color"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn composite_run_titles_and_filters_recognize_rgb_runs() {
+        let title = run_title("g19", "conus_rgb_natural_color_20260705");
+        assert!(
+            title.contains("GeoColor") && title.contains("2026-07-05"),
+            "composite title: {title}"
+        );
+        // NaturalColor's title is GeoColor (daytime pseudo-true-color).
+        let geo = run_title("g18", "fulldisk_rgb_geocolor_20260705");
+        assert!(geo.contains("GeoColor"), "geocolor title: {geo}");
+    }
+
+    #[test]
+    fn composite_style_options_lead_with_natural_color() {
+        let options = goes_composite_style_options();
+        assert_eq!(options.len(), GoesAbiRgbCompositeStyle::ALL.len());
+        assert_eq!(options[0].0, "natural_color");
+        assert!(options[0].1.contains("C01+C02+C03"), "{}", options[0].1);
+        // Every offered slug parses back to a real style.
+        for (slug, _) in &options {
+            assert!(GoesAbiRgbCompositeStyle::parse(slug).is_some(), "slug {slug}");
+        }
+    }
+
+    /// End-to-end proof against LIVE GOES open data: fetch the composite's
+    /// bands, compose, store, load back, and export a PNG. Gated behind
+    /// `BOWECHO_SAT_COMPOSITE_PROOF_PNG` so CI stays offline; run it to prove
+    /// the natural-color path on real imagery (never synthetic-only).
+    #[test]
+    fn export_goes_composite_proof_png_when_env_is_set() {
+        let Some(out) = std::env::var_os("BOWECHO_SAT_COMPOSITE_PROOF_PNG") else {
+            return;
+        };
+        let store = std::env::var_os("BOWECHO_SAT_COMPOSITE_PROOF_STORE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("bowecho-composite-proof-store"));
+        std::fs::create_dir_all(&store).expect("proof store dir");
+        let spec = GoesCompositeSpec {
+            satellite: std::env::var("BOWECHO_SAT_COMPOSITE_SAT")
+                .unwrap_or_else(|_| "goes19".to_string()),
+            sector: std::env::var("BOWECHO_SAT_COMPOSITE_SECTOR")
+                .unwrap_or_else(|_| "conus".to_string()),
+            style: std::env::var("BOWECHO_SAT_COMPOSITE_STYLE")
+                .unwrap_or_else(|_| "natural_color".to_string()),
+            downsample: std::env::var("BOWECHO_SAT_COMPOSITE_DOWNSAMPLE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(6usize),
+            lookback_minutes: 240,
+        };
+        let sink = |response: SatResponse| {
+            if let SatResponse::Note(message) = &response {
+                eprintln!("COMPOSITE note: {message}");
+            }
+            true
+        };
+        let summary =
+            ingest_latest_goes_composite(&store, &spec, &sink).expect("live composite ingest");
+        eprintln!("COMPOSITE {summary}");
+
+        let runs = scan_runs(&store);
+        let run = runs
+            .iter()
+            .find(|run| run.key.run.contains("_rgb_"))
+            .expect("a composite run was written");
+        let hhmm = *run.frames.last().expect("composite run has a frame");
+        let mut state = WorkerState::default();
+        let frame = load_frame(&mut state, &store, &run.key, hhmm).expect("proof frame loads");
+
+        let mut rgba = Vec::with_capacity(frame.image.pixels.len() * 4);
+        for pixel in &frame.image.pixels {
+            rgba.extend_from_slice(&[pixel.r(), pixel.g(), pixel.b(), pixel.a()]);
+        }
+        let image = image::RgbaImage::from_raw(
+            frame.image.size[0] as u32,
+            frame.image.size[1] as u32,
+            rgba,
+        )
+        .expect("proof image dimensions match");
+        if let Some(parent) = PathBuf::from(&out).parent() {
+            std::fs::create_dir_all(parent).expect("proof png parent directory");
+        }
+        image.save(&out).expect("composite proof png writes");
+        eprintln!(
+            "COMPOSITE proof PNG {}x{} -> {}",
+            frame.image.size[0],
+            frame.image.size[1],
+            PathBuf::from(&out).display()
+        );
     }
 
     /// Deterministic synthetic hurricane IR brightness-temperature field
