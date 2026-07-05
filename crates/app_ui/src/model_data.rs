@@ -8,8 +8,8 @@
 
 use eframe::egui;
 use rw_ui::{
-    FieldViewerEvent, FieldViewerPanel, HourKey, PlotViewerPanel, RunBrowserPanel, SoundingPanel,
-    StoreRequest, StoreResponse, StoreTree, StoreView, StoreWorker,
+    ColorTableEditorPanel, FieldViewerEvent, FieldViewerPanel, HourKey, PlotViewerPanel,
+    RunBrowserPanel, SoundingPanel, StoreRequest, StoreResponse, StoreTree, StoreView, StoreWorker,
 };
 use std::path::PathBuf;
 
@@ -32,6 +32,12 @@ pub struct ModelDataDock {
     /// window when `show_plot_viewer` is set.
     plot_viewer: PlotViewerPanel,
     show_plot_viewer: bool,
+    /// v0.2.3 user-editable model field-plot color tables (rw-ui). Distinct
+    /// from the radar-side table editor: this edits the STYLE OVERRIDES the
+    /// store worker resolves palettes through. Edits are pushed to the worker
+    /// and the current field reloaded so the new palette shows.
+    color_tables: ColorTableEditorPanel,
+    show_color_tables: bool,
 }
 
 impl ModelDataDock {
@@ -53,6 +59,22 @@ impl ModelDataDock {
             map_request: None,
             plot_viewer: PlotViewerPanel::new(),
             show_plot_viewer: false,
+            color_tables: ColorTableEditorPanel::new(),
+            show_color_tables: false,
+        }
+    }
+
+    /// Push edited color-table style overrides to the store worker and reload
+    /// the current field so the new palette shows (mirrors the rusty-weather
+    /// reference host). The `StyleOverridesApplied` ack is a no-op — the reload
+    /// is what repaints.
+    fn apply_color_table_changes(&mut self) {
+        let settings = self.color_tables.settings().clone().normalized();
+        self.worker.send(StoreRequest::SetStyleOverrides(settings));
+        self.plot_viewer.clear();
+        if let Some(field) = self.viewer.wanted_field() {
+            self.viewer.set_loading(&field.var);
+            self.worker.send(StoreRequest::LoadField(field));
         }
     }
 
@@ -120,8 +142,9 @@ impl ModelDataDock {
                 StoreResponse::Sounding(_, Err(message)) => {
                     self.sounding.set_error(message);
                 }
-                // v0.2.3: style-override application acknowledgement — BowEcho
-                // does not yet drive the editable color-table UI (follow-up).
+                // v0.2.3: worker ack that the style overrides were applied.
+                // No-op by design — `apply_color_table_changes` already
+                // reloads the field, and that reload is what repaints.
                 StoreResponse::StyleOverridesApplied => {}
             }
         }
@@ -412,6 +435,11 @@ impl ModelDataDock {
                              pipeline. Shift-drag a box on the field viewer to plot a custom \
                              domain; drag a selection corner to rotate.",
                         );
+                    ui.toggle_value(&mut self.show_color_tables, "🎨 Color tables")
+                        .on_hover_text(
+                            "Edit model field-plot color tables: bind a product to a palette, \
+                             edit its levels and colors; the field reloads with your palette.",
+                        );
                 });
             }
             match self.viewer.ui(ui) {
@@ -458,6 +486,30 @@ impl ModelDataDock {
                 });
             if !open {
                 self.show_plot_viewer = false;
+            }
+        }
+
+        // v0.2.3 editable color tables. `current_field()` borrows `self.viewer`
+        // for the panel, so it is scoped and dropped BEFORE apply — which
+        // reloads the field and thus needs `self.viewer` mutably.
+        if self.show_color_tables {
+            let mut open = true;
+            let mut changed = false;
+            {
+                let field = self.viewer.current_field();
+                egui::Window::new("🎨 Color tables")
+                    .open(&mut open)
+                    .default_size([520.0, 520.0])
+                    .show(ui.ctx(), |ui| {
+                        self.color_tables.ui(ui, field);
+                        changed = self.color_tables.take_changed();
+                    });
+            }
+            if changed {
+                self.apply_color_table_changes();
+            }
+            if !open {
+                self.show_color_tables = false;
             }
         }
     }
