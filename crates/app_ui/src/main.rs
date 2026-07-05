@@ -51,6 +51,7 @@ mod event_explorer;
 mod event_loop_builder;
 mod farm_live;
 mod fonts;
+mod gbvtd_retrieval;
 mod glm_layer;
 mod grid_composites;
 mod guide;
@@ -1985,6 +1986,7 @@ struct ViewerApp {
     upper_air_layer: Option<upper_air::UpperAirLayer>,
     upper_air_rx: WorkerSlot<UpperAirResult>,
     tropical: tropical::TropicalState,
+    gbvtd: gbvtd_retrieval::GbvtdState,
     /// Primary radar layer opacity (draw-time tint; no re-render).
     radar_opacity: f32,
     /// Background model ingest (rw-ingest library) in flight.
@@ -6456,6 +6458,7 @@ impl ViewerApp {
             upper_air_layer: None,
             upper_air_rx: WorkerSlot::idle("upper-air-quicklook"),
             tropical: tropical::TropicalState::default(),
+            gbvtd: gbvtd_retrieval::GbvtdState::default(),
             radar_opacity: initial_radar_opacity,
             model_ingest_rx: None,
             model_ingest_progress_rx: None,
@@ -16411,6 +16414,12 @@ impl eframe::App for ViewerApp {
                 ctx.request_repaint();
             }
         }
+        if self.gbvtd.panel_open {
+            egui::Window::new("🌀 TC Winds (GBVTD)")
+                .default_width(320.0)
+                .default_pos(egui::pos2(60.0, 110.0))
+                .show(&ctx, |ui| self.gbvtd_panel_ui(ui));
+        }
         self.poll_event_day(&ctx);
         self.poll_mping(&ctx);
         // Reports gate at ONE reference time per repaint. Computing it is
@@ -19796,6 +19805,16 @@ impl ViewerApp {
             .changed()
         {
             let _ = self.app_settings.save();
+            ctx.request_repaint();
+        }
+        if ui
+            .selectable_label(self.gbvtd.panel_open, "🌀 TC winds (GBVTD)")
+            .on_hover_text(
+                "Single-Doppler tropical-cyclone wind retrieval on the loaded radar volume: center the eye and retrieve the storm center, radius of maximum wind, and tangential/radial wind profile (Lee et al. 1999).",
+            )
+            .clicked()
+        {
+            self.gbvtd.panel_open = !self.gbvtd.panel_open;
             ctx.request_repaint();
         }
         if ui
@@ -25965,6 +25984,7 @@ impl ViewerApp {
         self.draw_tor_tracks(painter, rect);
         self.draw_hazard_overlays(painter, rect);
         self.draw_tropical(painter, rect);
+        self.draw_gbvtd(painter, rect);
         self.draw_rotation_markers(painter, rect);
         if !self.hide_camera_follow_guides() {
             self.draw_storm_tracks(painter, rect);
@@ -26649,6 +26669,7 @@ impl ViewerApp {
             self.draw_tor_tracks(&cell_painter, cell);
             self.draw_hazard_overlays(&cell_painter, cell);
             self.draw_tropical(&cell_painter, cell);
+            self.draw_gbvtd(&cell_painter, cell);
             self.draw_rotation_markers(&cell_painter, cell);
             if !self.hide_camera_follow_guides() {
                 self.draw_storm_tracks(&cell_painter, cell);
@@ -67085,6 +67106,7 @@ mod tests {
             upper_air_layer: None,
             upper_air_rx: WorkerSlot::idle("upper-air-quicklook"),
             tropical: tropical::TropicalState::default(),
+            gbvtd: gbvtd_retrieval::GbvtdState::default(),
             radar_opacity: 1.0,
             model_ingest_rx: None,
             model_ingest_progress_rx: None,

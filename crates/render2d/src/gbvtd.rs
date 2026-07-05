@@ -203,6 +203,18 @@ fn fit_ring(
     })
 }
 
+/// A ring only counts toward the RMW / peak wind / center score if it is a
+/// physically plausible RMW (not a tiny, under-sampled inner ring the center
+/// search can game into a spurious peak) and well sampled around its
+/// circumference. On real data a 6 km, 17-sample inner ring produced a bogus
+/// 93 m/s peak; this rejects that class of artifact.
+const MIN_CORE_RADIUS_KM: f32 = 10.0;
+const MIN_CORE_SAMPLES: usize = 30;
+
+fn ring_is_core_candidate(ring: &RingFit) -> bool {
+    ring.radius_km >= MIN_CORE_RADIUS_KM && ring.samples >= MIN_CORE_SAMPLES && ring.vt > 0.0
+}
+
 /// Retrieve the axisymmetric circulation about a KNOWN center, over the given
 /// radii (km). `n_azimuths` ring samples (72 = every 5°) is a good default.
 pub fn retrieve_axisymmetric(
@@ -218,8 +230,8 @@ pub fn retrieve_axisymmetric(
         .collect();
     let (rmw_km, vt_max) = rings
         .iter()
+        .filter(|ring| ring_is_core_candidate(ring))
         .max_by(|a, b| a.vt.total_cmp(&b.vt))
-        .filter(|best| best.vt > 0.0)
         .map(|best| (Some(best.radius_km), Some(best.vt)))
         .unwrap_or((None, None));
     TcCirculation {
@@ -249,23 +261,28 @@ pub fn find_center_and_retrieve(
     for iy in -steps..=steps {
         for ix in -steps..=steps {
             let center = (guess_km.0 + ix as f32 * step, guess_km.1 + iy as f32 * step);
-            let mut vt_max = f32::NEG_INFINITY;
+            let mut score = f32::NEG_INFINITY;
             let mut rings = Vec::with_capacity(radii_km.len());
             for &r in radii_km {
                 if let Some(fit) = fit_ring(&sampler, center, r, 72) {
-                    vt_max = vt_max.max(fit.vt);
+                    if ring_is_core_candidate(&fit) {
+                        score = score.max(fit.vt);
+                    }
                     rings.push(fit);
                 }
             }
-            if rings.len() < radii_km.len() / 2 || vt_max <= 0.0 {
+            // Require both adequate coverage and a plausible, well-sampled core
+            // ring; otherwise this center is not a real circulation.
+            if rings.len() < radii_km.len() / 2 || score <= 0.0 {
                 continue;
             }
-            if vt_max > best_score {
-                best_score = vt_max;
+            if score > best_score {
+                best_score = score;
                 let best_ring = rings
                     .iter()
+                    .filter(|ring| ring_is_core_candidate(ring))
                     .max_by(|a, b| a.vt.total_cmp(&b.vt))
-                    .expect("non-empty");
+                    .expect("score>0 implies a core candidate exists");
                 best = Some(TcCirculation {
                     center_km: center,
                     rmw_km: Some(best_ring.radius_km),
@@ -390,5 +407,51 @@ mod tests {
             center
         );
         assert!(circ.vt_max.unwrap() > 44.0, "vt_max = {:?}", circ.vt_max);
+    }
+
+    /// Real-data check: dealias a genuine hurricane volume and retrieve its
+    /// circulation. Env-gated on a Level-II path (e.g. the KLIX Hurricane Ida
+    /// landfall volume). Prints the retrieval so it can be sanity-checked
+    /// against the known storm; never verify GBVTD on synthetic data alone.
+    #[test]
+    fn gbvtd_on_real_hurricane_volume() {
+        let Some(path) = std::env::var_os("BOWECHO_GBVTD_VOLUME") else {
+            return;
+        };
+        let volume =
+            nexrad_io::decode_volume_from_path(std::path::Path::new(&path)).expect("decode volume");
+        let (cut_index, cut) = volume
+            .cuts
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.moments.contains_key(&radar_core::MomentType::Velocity))
+            .min_by(|a, b| a.1.elevation_deg.total_cmp(&b.1.elevation_deg))
+            .expect("a velocity cut");
+        let velocity = cut.moments.get(&radar_core::MomentType::Velocity).unwrap();
+        let dealiased = crate::dealias_velocity_grid(cut, velocity);
+        let field = PolarVelocityField::from_dealiased_velocity(cut, &dealiased);
+
+        let guess_x: f32 = std::env::var("BOWECHO_GBVTD_GUESS_X")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-36.0);
+        let guess_y: f32 = std::env::var("BOWECHO_GBVTD_GUESS_Y")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-137.0);
+        let radii: Vec<f32> = (6..=100).step_by(4).map(|r| r as f32).collect();
+        let circ = find_center_and_retrieve(&field, (guess_x, guess_y), 40.0, 3.0, &radii)
+            .expect("a circulation");
+
+        eprintln!(
+            "GBVTD real: cut {cut_index} ({:.2} deg) center=({:.1},{:.1}) km RMW={:?} VT_max={:?} m/s",
+            cut.elevation_deg, circ.center_km.0, circ.center_km.1, circ.rmw_km, circ.vt_max
+        );
+        for ring in &circ.rings {
+            eprintln!(
+                "  r={:>4.0} km  VT={:>6.1}  VR={:>6.1}  n={:>3}  rms={:.1}",
+                ring.radius_km, ring.vt, ring.vr, ring.samples, ring.rms
+            );
+        }
     }
 }
