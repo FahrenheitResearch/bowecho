@@ -26,6 +26,7 @@ styles = { path = "../styles" }
 ui_core = { path = "../ui_core" }
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 quick-xml.workspace = true
 # In-app updater (Settings > security): streaming release-asset download with
 # progress, hashing the streamed bytes for the SHA-256 gate that runs before
@@ -107,3 +108,19 @@ rev = "edb9d277cce7fe1cfa1080d159053c583ca07b6a"
 [dependencies.rw-store]
 git = "https://github.com/FahrenheitResearch/rusty-weather"
 rev = "edb9d277cce7fe1cfa1080d159053c583ca07b6a"
+
+# WRF/NetCDF local ingest (rusty-weather v0.2.3 Feature 2 — WRF/GUI soundings).
+# `netcrust` is the pure-Rust NetCDF/HDF5 reader; it is already pulled
+# transitively (rw-glm, rw-sat) and its `hdf5-reader` is pinned by the
+# workspace-root `[patch.crates-io]`. `wrf-core` computes WRF diagnostics and
+# destaggered 3D fields for the isobaric sounding volumes. Both feed
+# `rw_store::write_hour_from_fields_with_derived`, so imported WRF runs sound
+# through the existing ModelDataDock skew-T path.
+[dependencies.netcrust]
+git = "https://github.com/FahrenheitResearch/rusty-weather"
+rev = "edb9d277cce7fe1cfa1080d159053c583ca07b6a"
+
+[dependencies.wrf-core]
+git = "https://github.com/FahrenheitResearch/wrf-rust.git"
+rev = "f05758d9b8ea0132ea8b9767882396cbc5b2cfac"
+package = "wrf-core"

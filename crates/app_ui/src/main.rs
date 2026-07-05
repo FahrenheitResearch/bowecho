@@ -59,6 +59,7 @@ mod ingest_worker;
 mod italy_dpc;
 mod layers_rail;
 mod live_archive_bar;
+mod local_import;
 mod media;
 mod mesoanalysis;
 mod model_data;
@@ -84,6 +85,8 @@ mod upper_air;
 mod vol3d;
 mod wofs;
 mod wofs_georef;
+mod wrf_process;
+mod wrf_volumes;
 
 use sites_ui::{BeamCandidate, pin_intl_ids, pin_us_id, radar_site_search_matches, us_site_kind};
 #[cfg(test)]

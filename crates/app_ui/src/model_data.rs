@@ -14,9 +14,31 @@ use rw_ui::{
 };
 use std::path::PathBuf;
 
+/// A running local WRF/NetCDF ingest, spawned from the dock's import controls.
+/// Both variants write into the same model store the dock browses, so a
+/// finished import is picked up by [`ModelDataDock::rescan`] and its runs then
+/// sound through the existing skew-T path.
+enum ImportJob {
+    /// Light path (`local_import`): 2D surface fields + isobaric sounding
+    /// volumes. Handles raw `wrfout`, post-processed climate wrfout, and plain
+    /// NetCDF. Sends one final `Result<summary, error>`.
+    Local(crate::local_import::LocalImportTask),
+    /// Full path (`wrf_process`): the complete 2D diagnostic set (CAPE/severe/
+    /// etc.) plus sounding volumes via `wrf-core`. Streams progress messages
+    /// then a `Done`.
+    Process(crate::wrf_process::WrfProcessTask),
+}
+
 pub struct ModelDataDock {
     worker: StoreWorker,
+    /// egui context, kept so a background import can request repaints while it
+    /// runs (its worker threads have no repaint hook of their own).
+    repaint: egui::Context,
     store_root: PathBuf,
+    /// Running local WRF/NetCDF import, if any (drained in `poll_import`).
+    import_job: Option<ImportJob>,
+    /// Last import status line shown under the import controls.
+    import_message: Option<String>,
     tree: Option<StoreTree>,
     browser: RunBrowserPanel,
     viewer: FieldViewerPanel,
@@ -50,7 +72,10 @@ impl ModelDataDock {
         worker.send(StoreRequest::Enumerate);
         Self {
             worker,
+            repaint: ctx.clone(),
             store_root,
+            import_job: None,
+            import_message: None,
             tree: None,
             browser: RunBrowserPanel::new(),
             viewer: FieldViewerPanel::new(),
@@ -93,6 +118,7 @@ impl ModelDataDock {
     /// Drain worker responses into panel state (mirrors the rusty-weather
     /// reference host).
     fn handle_responses(&mut self) {
+        self.poll_import();
         while let Some(response) = self.worker.try_recv() {
             match response {
                 StoreResponse::Tree(tree) => {
@@ -242,6 +268,185 @@ impl ModelDataDock {
         self.worker.send(StoreRequest::Enumerate);
     }
 
+    /// Drain a running local WRF/NetCDF import. On completion the store is
+    /// re-scanned so the new run appears in the browser (and thus sounds).
+    /// Called every frame from `handle_responses` — including via `pump`, so
+    /// an import finishes and refreshes even while the dock window is closed.
+    fn poll_import(&mut self) {
+        // What to do once the borrow of `import_job` is released. `rescan` is
+        // set on any completion so a partially-written run still shows.
+        enum PollResult {
+            Idle,
+            Progress(String),
+            Finished { message: String },
+        }
+
+        let result = match self.import_job.as_ref() {
+            None => PollResult::Idle,
+            Some(ImportJob::Local(task)) => match task.rx.try_recv() {
+                Ok(Ok(summary)) => PollResult::Finished {
+                    message: format!(
+                        "Imported {} hour(s) from {} file(s) → run “{}” ({} variables)",
+                        summary.hours_written,
+                        summary.files_seen,
+                        summary.run,
+                        summary.variables.len()
+                    ),
+                },
+                Ok(Err(error)) => PollResult::Finished {
+                    message: format!("Import failed: {error}"),
+                },
+                Err(std::sync::mpsc::TryRecvError::Empty) => PollResult::Progress(String::new()),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => PollResult::Finished {
+                    message: "Import worker stopped unexpectedly".to_string(),
+                },
+            },
+            Some(ImportJob::Process(task)) => {
+                let mut latest = None;
+                let mut done = None;
+                loop {
+                    match task.rx.try_recv() {
+                        Ok(crate::wrf_process::WrfProcessMessage::Progress(message)) => {
+                            latest = Some(message);
+                        }
+                        Ok(crate::wrf_process::WrfProcessMessage::Done(outcome)) => {
+                            done = Some(outcome);
+                            break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            done = Some(Err("WRF worker stopped unexpectedly".to_string()));
+                            break;
+                        }
+                    }
+                }
+                match done {
+                    Some(Ok(summary)) => PollResult::Finished {
+                        message: format!(
+                            "Processed {} WRF hour(s) from {} file(s) → run “{}” ({} variables)",
+                            summary.hours_written,
+                            summary.files_seen,
+                            summary.run,
+                            summary.variables.len()
+                        ),
+                    },
+                    Some(Err(error)) => PollResult::Finished {
+                        message: format!("WRF processing failed: {error}"),
+                    },
+                    None => match latest {
+                        Some(message) => PollResult::Progress(message),
+                        None => PollResult::Progress(String::new()),
+                    },
+                }
+            }
+        };
+
+        match result {
+            PollResult::Idle => {}
+            PollResult::Progress(message) => {
+                if !message.is_empty() {
+                    self.import_message = Some(message);
+                }
+                // No repaint hook on the import worker thread — keep the UI
+                // ticking so progress and completion show promptly.
+                self.repaint.request_repaint();
+            }
+            PollResult::Finished { message } => {
+                self.import_message = Some(message);
+                self.import_job = None;
+                self.rescan();
+            }
+        }
+    }
+
+    /// Import controls (WRF/NetCDF folder pickers + status), rendered in the
+    /// dock's left "Runs" column. Spawns the ingest onto a worker thread;
+    /// `poll_import` finishes it and re-scans the store.
+    fn import_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("Import");
+            if self.import_job.is_some() {
+                ui.spinner();
+            }
+        });
+        self.import_pickers(ui);
+        if let Some(message) = &self.import_message {
+            ui.label(egui::RichText::new(message).small().weak());
+        }
+    }
+
+    /// Native folder pickers that spawn the ingest (rfd is Windows/macOS-only,
+    /// matching the rest of the app's local-file UI).
+    #[cfg(any(windows, target_os = "macos"))]
+    fn import_pickers(&mut self, ui: &mut egui::Ui) {
+        let busy = self.import_job.is_some();
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!busy, egui::Button::new("📥 WRF/NetCDF folder…"))
+                .on_hover_text(
+                    "Read a folder of WRF/NetCDF files into the model store: 2D surface \
+                     fields plus skew-T sounding volumes. Each file becomes one forecast \
+                     hour. Handles raw wrfout, post-processed climate wrfout, and plain \
+                     NetCDF. Click a point in the field viewer afterwards to sound it.",
+                )
+                .clicked()
+                && let Some(dir) = rfd::FileDialog::new()
+                    .set_title("Choose a WRF/NetCDF folder to import")
+                    .pick_folder()
+            {
+                let files = crate::local_import::supported_files_in_folder(&dir);
+                if files.is_empty() {
+                    self.import_message =
+                        Some(format!("No WRF/NetCDF files under {}", dir.display()));
+                } else {
+                    let count = files.len();
+                    let task =
+                        crate::local_import::spawn_import_paths(files, self.store_root.clone());
+                    self.import_message = Some(format!("Importing {count} file(s)…"));
+                    self.import_job = Some(ImportJob::Local(task));
+                }
+            }
+
+            if ui
+                .add_enabled(!busy, egui::Button::new("🛠 WRF full diagnostics…"))
+                .on_hover_text(
+                    "Heavier ingest for raw wrfout files: compute the full 2D diagnostic \
+                     set (CAPE / severe / etc.) plus sounding volumes via wrf-core. Slower \
+                     on large CONUS grids.",
+                )
+                .clicked()
+                && let Some(dir) = rfd::FileDialog::new()
+                    .set_title("Choose a WRF folder to process")
+                    .pick_folder()
+            {
+                let files = crate::wrf_process::wrf_files_in_folder(&dir);
+                if files.is_empty() {
+                    self.import_message = Some(format!("No WRF files under {}", dir.display()));
+                } else {
+                    let count = files.len();
+                    let task = crate::wrf_process::spawn_process_paths(
+                        files,
+                        self.store_root.clone(),
+                        crate::wrf_process::WrfProcessOptions::default(),
+                    );
+                    self.import_message = Some(format!("Processing {count} WRF file(s)…"));
+                    self.import_job = Some(ImportJob::Process(task));
+                }
+            }
+        });
+    }
+
+    /// Non-desktop fallback: native folder dialogs (rfd) are unavailable, so
+    /// there is nothing to pick here.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn import_pickers(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new("Folder import needs Windows or macOS.")
+                .small()
+                .weak(),
+        );
+    }
+
     /// Step the selected forecast hour within the current run; the viewer
     /// re-requests its current variable automatically when the hour lands.
     pub fn step_hour(&mut self, delta: i64) {
@@ -388,6 +593,8 @@ impl ModelDataDock {
                         .small()
                         .weak(),
                 );
+                ui.separator();
+                self.import_controls(ui);
                 ui.separator();
                 let mut picked = None;
                 match &self.tree {
