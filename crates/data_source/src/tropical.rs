@@ -194,6 +194,56 @@ pub struct TropicalCyclone {
     pub geometry_url: Option<String>,
 }
 
+impl TropicalCyclone {
+    pub fn max_wind_mph(&self) -> Option<f32> {
+        self.max_wind_kt.map(|kt| kt / KT_PER_MPH)
+    }
+
+    pub fn max_wind_kmh(&self) -> Option<f32> {
+        self.max_wind_kt.map(|kt| kt / KT_PER_KMH)
+    }
+
+    /// Max sustained wind across the units meteorologists read, e.g.
+    /// "145 kt · 167 mph · 269 km/h". None when wind is unknown.
+    pub fn wind_summary(&self) -> Option<String> {
+        let kt = self.max_wind_kt?;
+        Some(format!(
+            "{:.0} kt · {:.0} mph · {:.0} km/h",
+            kt,
+            kt / KT_PER_MPH,
+            kt / KT_PER_KMH
+        ))
+    }
+
+    /// Minimum central pressure, e.g. "965 mb".
+    pub fn pressure_summary(&self) -> Option<String> {
+        self.min_pressure_mb.map(|mb| format!("{mb:.0} mb"))
+    }
+
+    /// Motion toward a heading, e.g. "NNW (340°) at 12 kt". None when either
+    /// component is unknown.
+    pub fn motion_summary(&self) -> Option<String> {
+        let dir = self.movement_dir_deg?;
+        let speed = self.movement_speed_kt?;
+        Some(format!(
+            "{} ({:.0}°) at {:.0} kt",
+            compass_16(dir),
+            dir,
+            speed
+        ))
+    }
+}
+
+/// 16-point compass label for a bearing in degrees (0° = N, clockwise).
+pub fn compass_16(deg: f32) -> &'static str {
+    const POINTS: [&str; 16] = [
+        "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW",
+        "NW", "NNW",
+    ];
+    let idx = ((deg.rem_euclid(360.0) / 22.5).round() as usize) % 16;
+    POINTS[idx]
+}
+
 pub const KT_PER_KMH: f32 = 0.539_957;
 pub const KT_PER_MPH: f32 = 0.868_976;
 
@@ -721,6 +771,37 @@ mod tests {
                 .iter()
                 .any(|s| s.source == Source::Gdacs && s.basin == Basin::Atlantic)
         );
+    }
+
+    #[test]
+    fn display_helpers_format_vitals() {
+        let bavi = parse_gdacs_event_list(GDACS_LIST)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "Bavi")
+            .unwrap();
+        let wind = bavi.wind_summary().expect("wind");
+        assert!(
+            wind.contains("kt") && wind.contains("mph") && wind.contains("km/h"),
+            "{wind}"
+        );
+        assert!(wind.starts_with("145 kt"), "{wind}");
+
+        let alberto = parse_nhc_current_storms(NHC).unwrap().pop().unwrap();
+        assert_eq!(alberto.pressure_summary().as_deref(), Some("968 mb"));
+        assert_eq!(
+            alberto.motion_summary().as_deref(),
+            Some("NNW (340°) at 12 kt")
+        );
+    }
+
+    #[test]
+    fn compass_16_bins() {
+        assert_eq!(compass_16(0.0), "N");
+        assert_eq!(compass_16(45.0), "NE");
+        assert_eq!(compass_16(315.0), "NW");
+        assert_eq!(compass_16(340.0), "NNW");
+        assert_eq!(compass_16(359.0), "N");
     }
 
     #[test]
