@@ -456,6 +456,10 @@ pub struct AppSettings {
     /// kept opaque here so settings stays independent of egui/rw-ui.
     #[serde(default)]
     pub sounding_view_state: Option<serde_json::Value>,
+    /// User-edited model field-plot color tables (rw-ui `StyleOverrideSettings`,
+    /// serialized). Kept opaque here for the same reason as the sounding state.
+    #[serde(default)]
+    pub model_style_overrides: Option<serde_json::Value>,
     /// Data-folder override: where caches and stores live (Level II
     /// cache, model/sat/GLM stores, tiles, georefs). Empty = platform
     /// default. Read once at startup; Settings says "restart to apply".
@@ -713,6 +717,7 @@ impl Default for AppSettings {
             farm_georefs: Vec::new(),
             workspace_layout: None,
             sounding_view_state: None,
+            model_style_overrides: None,
             data_dir: String::new(),
             sidebar_section_open: BTreeMap::new(),
             model_slug: default_model_slug(),

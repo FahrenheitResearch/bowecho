@@ -16713,6 +16713,7 @@ impl eframe::App for ViewerApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.persist_sounding_view_state();
+        self.persist_model_style_overrides();
         if self.workspace.dirty {
             self.persist_workspace_layout();
         }
@@ -25565,6 +25566,19 @@ impl ViewerApp {
         }
     }
 
+    /// Persist the model field-plot color-table overrides when they change
+    /// (same opaque-JSON pattern as the sounding view state).
+    fn persist_model_style_overrides(&mut self) {
+        let Some(dock) = self.model_dock.as_ref() else {
+            return;
+        };
+        let value = dock.style_overrides_json();
+        if self.app_settings.model_style_overrides.as_ref() != Some(&value) {
+            self.app_settings.model_style_overrides = Some(value);
+            let _ = self.app_settings.save();
+        }
+    }
+
     fn persist_workspace_layout(&mut self) {
         self.workspace.dirty = false;
         let viewers: BTreeMap<dock::WorkspacePane, dock::ViewerMode> = dock::WorkspacePane::VIEWERS
@@ -28554,6 +28568,9 @@ impl ViewerApp {
         if let Some(value) = self.app_settings.sounding_view_state.as_ref() {
             dock.apply_sounding_view_state_json(value);
         }
+        if let Some(value) = self.app_settings.model_style_overrides.as_ref() {
+            dock.apply_style_overrides_json(value);
+        }
         dock
     }
 
@@ -28855,6 +28872,9 @@ impl ViewerApp {
             if let Some(dock) = &mut self.model_dock {
                 dock.ui(ui);
             }
+            // Persist any color-table edits made this frame (no-op unless they
+            // actually changed — cheap while the model window is open).
+            self.persist_model_style_overrides();
         }
         events
     }

@@ -10,6 +10,7 @@ use eframe::egui;
 use rw_ui::{
     ColorTableEditorPanel, FieldViewerEvent, FieldViewerPanel, HourKey, PlotViewerPanel,
     RunBrowserPanel, SoundingPanel, StoreRequest, StoreResponse, StoreTree, StoreView, StoreWorker,
+    StyleOverrideSettings,
 };
 use std::path::PathBuf;
 
@@ -205,6 +206,27 @@ impl ModelDataDock {
 
     pub fn apply_sounding_view_state_json(&mut self, value: &serde_json::Value) -> bool {
         self.sounding.apply_view_state_json(value)
+    }
+
+    /// Serialize the current model field-plot color-table overrides for
+    /// persistence (opaque JSON; kept in app settings like the sounding state).
+    pub fn style_overrides_json(&self) -> serde_json::Value {
+        serde_json::to_value(self.color_tables.settings()).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Restore persisted color-table overrides: load them into the editor and
+    /// push them to the store worker so field palettes resolve through them.
+    /// Returns false on malformed JSON (older/newer schema) — left at defaults.
+    pub fn apply_style_overrides_json(&mut self, value: &serde_json::Value) -> bool {
+        match serde_json::from_value::<StyleOverrideSettings>(value.clone()) {
+            Ok(settings) => {
+                self.color_tables.set_settings(settings.clone());
+                self.worker
+                    .send(StoreRequest::SetStyleOverrides(settings.normalized()));
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Newest (model, run, hour-count) in the store tree — freshness display.
