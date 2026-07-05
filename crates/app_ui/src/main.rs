@@ -633,6 +633,14 @@ const HAZARD_MAX_RENDER_EDGE_KM: f32 = 2_500.0;
 const HAZARD_GENERIC_ALERT_SPIKY_MIN_POINTS: usize = 8;
 const HAZARD_GENERIC_ALERT_SPIKY_PATH_RATIO: f32 = 1.6;
 const HAZARD_HEAVY_LAYER_FILL_LIMIT: usize = 80;
+/// Per-polygon projected-vertex ceiling for the O(n^2) ear-clip fill. A
+/// coastline-traced polygon — an Alaska marine SPS (e.g. around PACG), or a
+/// big multi-county watch union — can carry thousands of vertices and drop
+/// the whole map to single-digit FPS while its fill mesh re-uploads every
+/// frame. Above this count we skip ONLY the fill and let the existing outline
+/// path draw the ring unaltered. The overwhelming majority of warning polygons
+/// are well under this and are completely unchanged (fill and all).
+const HAZARD_FILL_VERTEX_LIMIT: usize = 600;
 const SCREEN_POLYGON_MAX_SEGMENT_DIAGONAL_FRACTION: f32 = 0.35;
 const SCREEN_POLYGON_MIN_MAX_SEGMENT_PX: f32 = 110.0;
 // Outlook-ring wraparound cull: ring neighbors project near each other, so
@@ -36877,7 +36885,15 @@ impl ViewerApp {
             let solid = matches!(style.dash, styles::DashPattern::Solid);
             let legit_px = hazard_bbox_segment_allowance_px(record.bbox, self.map_scale);
             let has_screen_jump = screen_polyline_has_jump(&points, true, rect, legit_px);
-            if (!heavy_layer || selected) && !has_screen_jump {
+            // Perf edge case: a coastline-traced polygon (an Alaska marine SPS,
+            // or a big multi-county watch union) can carry thousands of
+            // vertices, and the fill is an O(n^2) ear-clip plus a huge per-frame
+            // mesh. Above the limit we skip ONLY the fill and let the existing,
+            // jump-aware outline path draw the ring verbatim — no geometry is
+            // altered, so nothing new can self-intersect. Normal polygons (the
+            // overwhelming majority) are well under the limit and unchanged.
+            let fill_ok = points.len() <= HAZARD_FILL_VERTEX_LIMIT;
+            if (!heavy_layer || selected) && !has_screen_jump && fill_ok {
                 let convex = is_convex_screen_polygon(&points);
                 if convex {
                     out.fill_shapes.push(egui::Shape::convex_polygon(
