@@ -285,7 +285,10 @@ impl crate::ViewerApp {
         }
         if let Some(circ) = &self.gbvtd.result {
             ui.separator();
-            ui.label("Axisymmetric profile (VT tangential, VR radial; −VR = inflow):");
+            ui.label(
+                "Profile: VT axisymmetric tangential, VR radial (−VR = inflow), \
+                 VT1 = wavenumber-1 asymmetry amplitude @ phase:",
+            );
             egui::ScrollArea::vertical()
                 .max_height(240.0)
                 .show(ui, |ui| {
@@ -294,6 +297,8 @@ impl crate::ViewerApp {
                         ui.label("VT m/s");
                         ui.label("VT kt");
                         ui.label("VR m/s");
+                        ui.label("VT1 m/s");
+                        ui.label("VT1 °");
                         ui.label("n");
                         ui.end_row();
                         for ring in &circ.rings {
@@ -301,6 +306,8 @@ impl crate::ViewerApp {
                             ui.label(format!("{:.0}", ring.vt));
                             ui.label(format!("{:.0}", ring.vt * MS_TO_KT));
                             ui.label(format!("{:.0}", ring.vr));
+                            ui.label(format!("{:.0}", ring.vt1_amp));
+                            ui.label(format!("{:.0}", ring.vt1_phase_deg));
                             ui.label(format!("{}", ring.samples));
                             ui.end_row();
                         }

@@ -36,7 +36,8 @@ pub struct PolarVelocityField {
     pub values: Vec<f32>,
 }
 
-/// The axisymmetric fit on one radius ring.
+/// The GBVTD fit on one radius ring: axisymmetric (wavenumber-0) tangential and
+/// radial wind, plus the wavenumber-1 tangential asymmetry.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RingFit {
     pub radius_km: f32,
@@ -45,8 +46,24 @@ pub struct RingFit {
     pub vt: f32,
     /// Axisymmetric radial wind (m/s); positive = outflow.
     pub vr: f32,
+    /// Wavenumber-1 tangential-wind Fourier terms (m/s): the ring tangential
+    /// wind is modeled as `VT(θ) = vt + vt1_cos·cos θ + vt1_sin·sin θ`, where θ
+    /// is the GBVTD mathematical angle measured around the storm center from the
+    /// radar→center axis (see `fit_ring`). These capture the storm's wavenumber-1
+    /// asymmetry (e.g. a stronger eyewall on one side; Lee et al. 1999, §4).
+    pub vt1_cos: f32,
+    pub vt1_sin: f32,
+    /// Wavenumber-1 tangential asymmetry amplitude, `hypot(vt1_cos, vt1_sin)`
+    /// (m/s): 0 for a purely axisymmetric vortex.
+    pub vt1_amp: f32,
+    /// Phase of the wavenumber-1 tangential maximum, degrees in [-180, 180),
+    /// `atan2(vt1_sin, vt1_cos)`, measured from the radar→center axis toward the
+    /// GBVTD-positive (mathematically counter-clockwise) direction.
+    pub vt1_phase_deg: f32,
     pub samples: usize,
-    /// RMS Doppler residual of the fit (m/s).
+    /// RMS Doppler residual of the axisymmetric (wavenumber-0) fit (m/s). The
+    /// wavenumber-1 asymmetry is fit as a diagnostic on top of this and does not
+    /// change `rms`, `vt`, or `vr`, so RMW / peak-wind gating is unchanged.
     pub rms: f32,
 }
 
@@ -164,7 +181,16 @@ fn fit_ring(
 ) -> Option<RingFit> {
     let (mut saa, mut sac, mut scc, mut sad, mut scd) = (0.0f64, 0.0, 0.0, 0.0, 0.0);
     let mut samples = 0usize;
-    let mut resid_terms: Vec<(f64, f64, f64)> = Vec::with_capacity(n_azimuths);
+    // Per accepted sample: (a, c, d, a·cos θ, a·sin θ). The last two are the
+    // wavenumber-1 tangential design columns (fit additively after the
+    // axisymmetric solve, below); θ is the GBVTD mathematical angle.
+    let mut resid_terms: Vec<(f64, f64, f64, f64, f64)> = Vec::with_capacity(n_azimuths);
+    // GBVTD mathematical angle θ is measured around the storm center from the
+    // radar→center axis: θ = β − φ₀, φ₀ = atan2(center_y, center_x). Referencing
+    // θ to this axis makes the wavenumber-1 phase physically meaningful and keeps
+    // the asymmetry basis (below) orthogonal to the axisymmetric VT0/VR0 basis in
+    // the R≪R_center limit (Lee et al. 1999, §4).
+    let phi0 = center_km.1.atan2(center_km.0);
     for k in 0..n_azimuths {
         let beta = std::f32::consts::TAU * k as f32 / n_azimuths as f32;
         let (sb, cb) = beta.sin_cos();
@@ -188,12 +214,16 @@ fn fit_ring(
         // given beam, but subtracting it removes the dominant VT bias.
         let env = wind_ms.0 * f64::from(bx) + wind_ms.1 * f64::from(by);
         let d = f64::from(vd) - env;
+        // Wavenumber-1 tangential-asymmetry basis at the GBVTD math angle
+        // (beta - phi0), fit as a secondary least-squares below.
+        let (st, ct) = (beta - phi0).sin_cos();
+        let (ac, as_) = (a * f64::from(ct), a * f64::from(st));
         saa += a * a;
         sac += a * c;
         scc += c * c;
         sad += a * d;
         scd += c * d;
-        resid_terms.push((a, c, d));
+        resid_terms.push((a, c, d, ac, as_));
         samples += 1;
     }
     if samples < 8 {
@@ -219,15 +249,48 @@ fn fit_ring(
     }
     let vt = (sad * scc - scd * sac) / det;
     let vr = (saa * scd - sac * sad) / det;
+
+    // Wavenumber-1 tangential asymmetry, fit ADDITIVELY on top of the
+    // axisymmetric solution: model VT(θ) = vt + VTc·cos θ + VTs·sin θ. Because
+    // the asymmetry columns a·cos θ and a·sin θ project onto different Doppler
+    // azimuthal harmonics than the axisymmetric a (VT0) and c (VR0) columns —
+    // wavenumber 0/2 vs wavenumber 1 in the R≪R_center limit — solving them
+    // against the axisymmetric residual recovers the same VTc/VTs as a joint fit
+    // while leaving `vt`, `vr`, and `rms` (hence all RMW/peak-wind gating)
+    // byte-for-byte unchanged. This is the Lee et al. 1999 harmonic
+    // decomposition carried to wavenumber 1. NOTE: VTs (the along-axis component)
+    // aliases with any uniform environmental wind; storm-motion / mean-wind
+    // removal in the axisymmetric solve de-aliases it.
+    let (mut vt1_cos, mut vt1_sin) = (0.0f64, 0.0f64);
+    let (mut m11, mut m12, mut m22, mut r1, mut r2) = (0.0f64, 0.0, 0.0, 0.0, 0.0);
     let mut sse = 0.0f64;
-    for (a, c, d) in &resid_terms {
-        let e = a * vt + c * vr - d;
+    for (a, c, d, ac, as_) in &resid_terms {
+        let e = a * vt + c * vr - d; // axisymmetric residual (model − obs)
         sse += e * e;
+        let target = -e; // obs − axisymmetric model
+        m11 += ac * ac;
+        m12 += ac * as_;
+        m22 += as_ * as_;
+        r1 += ac * target;
+        r2 += as_ * target;
     }
+    // Only report an asymmetry when the wavenumber-1 basis is observable and its
+    // 2x2 normal matrix is well conditioned (a partial arc collapses it); else
+    // leave the ring purely axisymmetric.
+    let det2 = m11 * m22 - m12 * m12;
+    if m11 > 0.0 && m22 > 0.0 && det2 / (m11 * m22) >= MIN_ASYMMETRY_CONDITION {
+        vt1_cos = (r1 * m22 - r2 * m12) / det2;
+        vt1_sin = (m11 * r2 - m12 * r1) / det2;
+    }
+    let (vt1_cos, vt1_sin) = (vt1_cos as f32, vt1_sin as f32);
     Some(RingFit {
         radius_km,
         vt: vt as f32,
         vr: vr as f32,
+        vt1_cos,
+        vt1_sin,
+        vt1_amp: vt1_cos.hypot(vt1_sin),
+        vt1_phase_deg: vt1_sin.atan2(vt1_cos).to_degrees(),
         samples,
         rms: (sse / samples as f64).sqrt() as f32,
     })
@@ -246,6 +309,10 @@ const MIN_CORE_SAMPLES: usize = 43;
 /// fit (see `fit_ring`). Tuned on real PGUA volumes, not synthetic-only.
 const MIN_TANGENTIAL_OBSERVABILITY: f64 = 0.08;
 const MIN_RING_CONDITION: f64 = 0.20;
+/// Conditioning floor for the wavenumber-1 tangential 2x2 normal matrix (see
+/// `fit_ring`). A full ring gives ~1 (its off-diagonal ~0); a partial arc drives
+/// it toward 0. Below this, the asymmetry is not observable and is reported 0.
+const MIN_ASYMMETRY_CONDITION: f64 = 0.05;
 /// Physical + quality gates so a bad-center or far-range-folded ring cannot be
 /// reported as a real RMW. VT_MAX ≈ 204 kt sits above any observed tangential
 /// wind but well below the absurd near-radar blow-up; the RMS gates reject
@@ -423,6 +490,56 @@ mod tests {
         }
     }
 
+    /// Like [`synthetic_vortex`] but with an imposed wavenumber-1 tangential
+    /// asymmetry: the tangential wind is scaled by `1 + (asym_amp/vt) · cos(θ −
+    /// phase)`, θ = GBVTD math angle about the center from the radar→center axis.
+    /// This is the field the retrieval must decompose back into VT0 and the
+    /// wavenumber-1 (VTc, VTs) terms.
+    fn synthetic_vortex_asym(
+        center_km: (f32, f32),
+        rmw_km: f32,
+        vt_max: f32,
+        asym_amp: f32,
+        asym_phase_deg: f32,
+    ) -> PolarVelocityField {
+        let n_radials = 720;
+        let gate_count = 1000;
+        let first_gate_m = 0.0f32;
+        let gate_spacing_m = 250.0f32;
+        let phi0 = center_km.1.atan2(center_km.0);
+        let phase = asym_phase_deg.to_radians();
+        let azimuths_deg: Vec<f32> = (0..n_radials).map(|i| i as f32 * 0.5).collect();
+        let mut values = vec![f32::NAN; n_radials * gate_count];
+        for (row, &az) in azimuths_deg.iter().enumerate() {
+            let (sa, ca) = az.to_radians().sin_cos();
+            let (bx, by) = (sa, ca);
+            for gate in 0..gate_count {
+                let range_km = (first_gate_m + gate as f32 * gate_spacing_m) / 1000.0;
+                let (gx, gy) = (range_km * sa, range_km * ca);
+                let (dx, dy) = (gx - center_km.0, gy - center_km.1);
+                let r = (dx * dx + dy * dy).sqrt();
+                if r < 0.5 {
+                    continue;
+                }
+                let beta = dy.atan2(dx);
+                let (sb, cb) = beta.sin_cos();
+                // Axisymmetric magnitude plus wavenumber-1 asymmetry at this
+                // GBVTD angle θ = beta − phi0.
+                let vt =
+                    rankine_vt(r, rmw_km, vt_max) + asym_amp * (beta - phi0 - phase).cos();
+                let (wx, wy) = (vt * -sb, vt * cb);
+                values[row * gate_count + gate] = wx * bx + wy * by;
+            }
+        }
+        PolarVelocityField {
+            azimuths_deg,
+            first_gate_m,
+            gate_spacing_m,
+            gate_count,
+            values,
+        }
+    }
+
     #[test]
     fn retrieves_rankine_profile_at_true_center() {
         let center = (0.0, 120.0); // 120 km north of the radar
@@ -487,6 +604,64 @@ mod tests {
         assert!(circ.vt_max.unwrap() > 44.0, "vt_max = {:?}", circ.vt_max);
     }
 
+    #[test]
+    fn recovers_imposed_wavenumber1_asymmetry() {
+        let center = (0.0, 130.0); // 130 km north of the radar
+        let (rmw, vtmax) = (25.0f32, 50.0f32);
+        let (amp, phase_deg) = (15.0f32, 40.0f32);
+        let field = synthetic_vortex_asym(center, rmw, vtmax, amp, phase_deg);
+        let radii: Vec<f32> = (15..=60).step_by(5).map(|r| r as f32).collect();
+
+        let circ = retrieve_axisymmetric(&field, center, &radii, 180);
+
+        // The axisymmetric peak is still recovered — the wavenumber-1 term does
+        // not leak into VT0 (it lives in different Doppler harmonics).
+        assert!(
+            (circ.vt_max.unwrap() - vtmax).abs() < 3.0,
+            "vt_max = {:?} (asymmetry leaked into VT0)",
+            circ.vt_max
+        );
+
+        // Every well-fit ring recovers the imposed asymmetry amplitude & phase.
+        let mut checked = 0;
+        for ring in &circ.rings {
+            if !ring_is_core_candidate(ring) {
+                continue;
+            }
+            assert!(
+                (ring.vt1_amp - amp).abs() < 3.0,
+                "r={} km: VT1 amp {} vs imposed {}",
+                ring.radius_km,
+                ring.vt1_amp,
+                amp
+            );
+            let dphase = angular_distance_deg(ring.vt1_phase_deg, phase_deg);
+            assert!(
+                dphase < 15.0,
+                "r={} km: VT1 phase {} vs imposed {} (Δ {:.1}°)",
+                ring.radius_km,
+                ring.vt1_phase_deg,
+                phase_deg,
+                dphase
+            );
+            checked += 1;
+        }
+        assert!(checked >= 3, "only {checked} rings checked");
+
+        // Control: a purely axisymmetric vortex of the same core retrieves a
+        // near-zero wavenumber-1 amplitude (no spurious asymmetry).
+        let sym = synthetic_vortex_asym(center, rmw, vtmax, 0.0, 0.0);
+        let sym_circ = retrieve_axisymmetric(&sym, center, &radii, 180);
+        for ring in &sym_circ.rings {
+            assert!(
+                ring.vt1_amp < 3.0,
+                "spurious asymmetry at r={} km: amp {}",
+                ring.radius_km,
+                ring.vt1_amp
+            );
+        }
+    }
+
     /// Real-data check: dealias a genuine hurricane volume and retrieve its
     /// circulation. Env-gated on a Level-II path (e.g. the KLIX Hurricane Ida
     /// landfall volume). Prints the retrieval so it can be sanity-checked
@@ -539,8 +714,31 @@ mod tests {
         );
         for ring in &circ.rings {
             eprintln!(
-                "  r={:>4.0} km  VT={:>6.1}  VR={:>6.1}  n={:>3}  rms={:.1}",
-                ring.radius_km, ring.vt, ring.vr, ring.samples, ring.rms
+                "  r={:>4.0} km  VT={:>6.1}  VR={:>6.1}  VT1={:>5.1} @ {:>6.0}°  n={:>3}  rms={:.1}",
+                ring.radius_km,
+                ring.vt,
+                ring.vr,
+                ring.vt1_amp,
+                ring.vt1_phase_deg,
+                ring.samples,
+                ring.rms
+            );
+        }
+        // Report the wavenumber-1 asymmetry at the RMW (the eyewall) — the
+        // headline number for storm asymmetry / motion-relative structure.
+        if let Some(rmw) = circ.rmw_km
+            && let Some(ring) = circ
+                .rings
+                .iter()
+                .min_by(|a, b| (a.radius_km - rmw).abs().total_cmp(&(b.radius_km - rmw).abs()))
+        {
+            eprintln!(
+                "GBVTD asymmetry at RMW ({:.0} km): wavenumber-1 VT amp = {:.1} m/s ({:.1}% of VT0={:.1}), phase {:.0}°",
+                ring.radius_km,
+                ring.vt1_amp,
+                100.0 * ring.vt1_amp / ring.vt.max(0.1),
+                ring.vt,
+                ring.vt1_phase_deg,
             );
         }
     }
