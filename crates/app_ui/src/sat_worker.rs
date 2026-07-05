@@ -533,7 +533,6 @@ struct WorkerState {
 
 struct ColoredSatFrame {
     frame: SatFrameImage,
-    band: u8,
 }
 
 /// Frame + run grid for the radar-map layer (one GridFile open per call;
@@ -544,8 +543,7 @@ fn load_frame_for_map(
     key: &SatRunKey,
     hhmm: u16,
 ) -> Result<SatMapFrame, String> {
-    let mut colored = load_colored_frame(state, store_root, key, hhmm)?;
-    apply_ir_map_overlay_alpha(&mut colored.frame.image, colored.band);
+    let colored = load_colored_frame(state, store_root, key, hhmm, true)?;
     let run_dir = store_root.join(&key.model).join(&key.run);
     let grid = GridFile::open(&run_dir.join("grid.rwg")).map_err(|err| err.to_string())?;
     let flip_rows = state
@@ -570,7 +568,7 @@ fn load_frame(
     key: &SatRunKey,
     hhmm: u16,
 ) -> Result<SatFrameImage, String> {
-    load_colored_frame(state, store_root, key, hhmm).map(|colored| colored.frame)
+    load_colored_frame(state, store_root, key, hhmm, false).map(|colored| colored.frame)
 }
 
 fn load_colored_frame(
@@ -578,6 +576,7 @@ fn load_colored_frame(
     store_root: &Path,
     key: &SatRunKey,
     hhmm: u16,
+    map_overlay: bool,
 ) -> Result<ColoredSatFrame, String> {
     let started = Instant::now();
     let run_dir = store_root.join(&key.model).join(&key.run);
@@ -614,7 +613,7 @@ fn load_colored_frame(
     let (nx, ny) = (meta.nx, meta.ny);
     let name = variable.name.clone();
     let values = reader.read_full_2d(&name).map_err(|err| err.to_string())?;
-    let pixels = render_sat_pixels(&name, band, &values, nx, ny, grid.flip_rows);
+    let pixels = render_sat_pixels(band, &values, nx, ny, grid.flip_rows, map_overlay);
     Ok(ColoredSatFrame {
         frame: SatFrameImage {
             key: key.clone(),
@@ -622,25 +621,24 @@ fn load_colored_frame(
             image: ColorImage::new([nx, ny], pixels),
             read_ms: started.elapsed().as_secs_f32() * 1000.0,
         },
-        band,
     })
 }
 
 fn render_sat_pixels(
-    variable_name: &str,
     band: u8,
     values: &[f32],
     nx: usize,
     ny: usize,
     flip_rows: bool,
+    map_overlay: bool,
 ) -> Vec<Color32> {
-    if himawari_dynamic_ir(variable_name, band)
-        && let Some((lo, hi)) = finite_percentile_range(values, 0.02, 0.98)
-    {
-        return render_stretched_ir_pixels(values, nx, ny, flip_rows, lo, hi);
-    }
-
-    let anchors = band_anchors(band);
+    // Longwave-window IR (13/14/15) gets the enhanced rainbow; every other
+    // band keeps its production palette (water vapor, shortwave, visible
+    // grayscale). This is why Himawari IR is no longer black-and-white: it now
+    // flows through the same Kelvin false-color path GOES always used, rather
+    // than the old grayscale percentile stretch.
+    let anchors = enhanced_anchors_for_band(band).unwrap_or_else(|| band_anchors(band));
+    let ir_band = (7..=16).contains(&band);
     let mut pixels = Vec::with_capacity(nx * ny);
     for image_row in 0..ny {
         let grid_row = if flip_rows {
@@ -650,82 +648,60 @@ fn render_sat_pixels(
         };
         for &value in &values[grid_row * nx..(grid_row + 1) * nx] {
             let [r, g, b, a] = anchor_color(value, anchors);
-            pixels.push(Color32::from_rgba_unmultiplied(r, g, b, a));
+            // The radar-map overlay fades warm cloud/surface (by brightness
+            // temperature) so radar shows through; the full-screen player
+            // keeps each palette's own alpha.
+            let alpha = if map_overlay && ir_band {
+                bt_overlay_alpha(value)
+            } else {
+                a
+            };
+            pixels.push(Color32::from_rgba_unmultiplied(r, g, b, alpha));
         }
     }
     pixels
 }
 
-fn himawari_dynamic_ir(variable_name: &str, band: u8) -> bool {
-    variable_name.starts_with("ahi_bt_") && (7..=16).contains(&band)
+/// Enhanced-IR "rainbow" enhancement over brightness temperature (Kelvin),
+/// applied to the longwave window bands (13/14/15) on BOTH GOES ABI and
+/// Himawari AHI. Warm surface/low cloud reads grayscale; cold cloud tops light
+/// up green → yellow → orange → red → dark, with the magenta/white overshoot
+/// tips — the classic tropical/severe IR look (CIMSS-style). Anchors are
+/// (Kelvin, [r,g,b]); °C is shown for reference (K = °C + 273.15).
+const ENHANCED_IR: rw_sat::palette::Anchors = &[
+    (173.0, [255, 255, 255]),  // -100 C: coldest overshoot
+    (183.0, [232, 84, 232]),   //  -90 C: magenta
+    (193.0, [188, 188, 188]),  //  -80 C: light gray
+    (203.0, [70, 8, 8]),       //  -70 C: very dark red
+    (213.0, [226, 26, 26]),    //  -60 C: red
+    (223.0, [245, 148, 28]),   //  -50 C: orange
+    (233.0, [246, 240, 42]),   //  -40 C: yellow
+    (243.0, [48, 200, 66]),    //  -30 C: green (cold-cloud onset)
+    (253.0, [120, 150, 120]),  //  -20 C: gray-green transition
+    (263.0, [205, 205, 205]),  //  -10 C: light gray
+    (273.15, [245, 245, 245]), //   0 C: white
+    (293.0, [96, 96, 96]),     //  +20 C: gray
+    (313.0, [46, 26, 14]),     //  +40 C: dark brown (warm surface)
+    (330.0, [8, 5, 4]),        //  +57 C: near black
+];
+
+/// Longwave-window bands get the enhanced rainbow; every other band keeps its
+/// specialized production palette (water vapor 8-10, shortwave 7, visible 1-6).
+fn enhanced_anchors_for_band(band: u8) -> Option<rw_sat::palette::Anchors> {
+    matches!(band, 13..=15).then_some(ENHANCED_IR)
 }
 
-fn finite_percentile_range(values: &[f32], low: f32, high: f32) -> Option<(f32, f32)> {
-    let mut finite = values
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .collect::<Vec<_>>();
-    if finite.is_empty() {
-        return None;
+/// Radar-map-overlay alpha from brightness temperature: warm (> +5 C) fully
+/// transparent so radar/basemap shows through; cold storm tops (< -40 C)
+/// nearly opaque. Replaces the old luminance proxy, which mis-fired once IR is
+/// in color (saturated hues have low luminance).
+fn bt_overlay_alpha(bt: f32) -> u8 {
+    if !bt.is_finite() {
+        return 0;
     }
-    finite.sort_by(|a, b| a.total_cmp(b));
-    let last = finite.len() - 1;
-    let low_idx = ((last as f32) * low.clamp(0.0, 1.0)).round() as usize;
-    let high_idx = ((last as f32) * high.clamp(0.0, 1.0)).round() as usize;
-    let lo = finite[low_idx.min(last)];
-    let hi = finite[high_idx.max(low_idx).min(last)];
-    if hi > lo {
-        Some((lo, hi))
-    } else {
-        Some((lo, lo + 1.0))
-    }
-}
-
-fn render_stretched_ir_pixels(
-    values: &[f32],
-    nx: usize,
-    ny: usize,
-    flip_rows: bool,
-    lo: f32,
-    hi: f32,
-) -> Vec<Color32> {
-    let span = (hi - lo).max(1.0);
-    let mut pixels = Vec::with_capacity(nx * ny);
-    for image_row in 0..ny {
-        let grid_row = if flip_rows {
-            ny - 1 - image_row
-        } else {
-            image_row
-        };
-        for &value in &values[grid_row * nx..(grid_row + 1) * nx] {
-            if !value.is_finite() {
-                pixels.push(Color32::TRANSPARENT);
-                continue;
-            }
-            let cold = (1.0 - ((value - lo) / span).clamp(0.0, 1.0)).powf(0.75);
-            let shade = (cold * 245.0 + 10.0).round() as u8;
-            let blue = ((shade as f32) * 1.08).min(255.0).round() as u8;
-            pixels.push(Color32::from_rgba_unmultiplied(shade, shade, blue, 255));
-        }
-    }
-    pixels
-}
-
-fn apply_ir_map_overlay_alpha(image: &mut ColorImage, band: u8) {
-    if !(7..=16).contains(&band) {
-        return;
-    }
-    for pixel in &mut image.pixels {
-        if pixel.a() == 0 {
-            continue;
-        }
-        let luminance = 0.2126 * f32::from(pixel.r())
-            + 0.7152 * f32::from(pixel.g())
-            + 0.0722 * f32::from(pixel.b());
-        let alpha = ((luminance - 28.0) / (190.0 - 28.0) * 230.0).clamp(0.0, 230.0) as u8;
-        *pixel = Color32::from_rgba_unmultiplied(pixel.r(), pixel.g(), pixel.b(), alpha);
-    }
+    const WARM: f32 = 278.0; // +5 C
+    const COLD: f32 = 233.0; // -40 C
+    (((WARM - bt) / (WARM - COLD)).clamp(0.0, 1.0) * 235.0) as u8
 }
 
 /// Map one follow-engine event into panel-ready responses. `current_key`
@@ -1640,10 +1616,14 @@ mod tests {
         // The synthetic grid stores north first (y scan angles descend), so
         // rows are NOT flipped: pixel 0 is the NaN we planted -> transparent.
         assert_eq!(frame.image.pixels[0].a(), 0, "NaN renders transparent");
-        // A 200 K pixel on the clean-IR ramp is bright and opaque.
-        let bright = frame.image.pixels[1];
-        assert_eq!(bright.a(), 255);
-        assert!(bright.r() > 200, "cold pixel is bright: {bright:?}");
+        // A cold band-13 pixel is colorized (enhanced-IR rainbow) and opaque —
+        // grayscale would have r == g == b.
+        let cold = frame.image.pixels[1];
+        assert_eq!(cold.a(), 255);
+        assert!(
+            !(cold.r() == cold.g() && cold.g() == cold.b()),
+            "band-13 IR is colorized, not grayscale: {cold:?}"
+        );
         assert_eq!(state.grids.len(), 1, "grid facts cached per run");
 
         // Second frame of the same run reuses the cached grid info.
@@ -1657,18 +1637,28 @@ mod tests {
     }
 
     #[test]
-    fn himawari_bt_uses_dynamic_stretch_for_narrow_warm_ranges() {
-        let values = vec![f32::NAN, 326.0, 327.0, 328.0, 329.0, 330.0];
-        let pixels = render_sat_pixels("ahi_bt_c13", 13, &values, 3, 2, false);
+    fn himawari_ir_is_colorized_not_grayscale() {
+        // Kelvin brightness temps: NaN, warm surface, a -60 C top, a -40 C top.
+        let values = vec![f32::NAN, 300.0, 213.0, 233.0];
+        let pixels = render_sat_pixels(13, &values, 4, 1, false, false);
 
         assert_eq!(pixels[0].a(), 0, "NaN stays transparent");
+        // -60 C cloud top is RED in the enhancement — proof it is colorized,
+        // not the old grayscale stretch (which was r == g == b).
+        let cold = pixels[2];
         assert!(
-            pixels[1].r() > 200,
-            "cold end of a narrow Himawari BT range is made visible"
+            cold.r() > 180 && cold.g() < 90 && cold.b() < 90,
+            "cold top is red: {cold:?}"
         );
         assert!(
-            pixels[5].r() < 40,
-            "warm end remains dark for map overlay transparency"
+            !(cold.r() == cold.g() && cold.g() == cold.b()),
+            "IR is no longer grayscale"
+        );
+        // -40 C is yellow.
+        let yellow = pixels[3];
+        assert!(
+            yellow.r() > 180 && yellow.g() > 180 && yellow.b() < 110,
+            "yellow: {yellow:?}"
         );
     }
 
@@ -1868,27 +1858,25 @@ mod tests {
     }
 
     #[test]
-    fn ir_map_overlay_alpha_makes_warm_dark_pixels_transparent() {
-        let mut image = ColorImage::new(
-            [3, 1],
-            vec![
-                Color32::from_rgba_unmultiplied(5, 5, 5, 255),
-                Color32::from_rgba_unmultiplied(120, 120, 120, 255),
-                Color32::from_rgba_unmultiplied(245, 245, 245, 255),
-            ],
-        );
+    fn ir_map_overlay_alpha_fades_warm_by_temperature() {
+        // Kelvin: warm surface, mid cloud, cold storm top.
+        let values = vec![290.0, 255.0, 210.0];
+        let overlay = render_sat_pixels(13, &values, 3, 1, false, true);
 
-        apply_ir_map_overlay_alpha(&mut image, 13);
-
-        assert_eq!(image.pixels[0].a(), 0, "warm black IR surface clears");
-        assert!(
-            image.pixels[1].a() > 0 && image.pixels[1].a() < image.pixels[2].a(),
-            "middle cloud shade is semi-transparent"
+        assert_eq!(
+            overlay[0].a(),
+            0,
+            "warm (+17 C) clears so radar shows through"
         );
         assert!(
-            image.pixels[2].a() > 200,
-            "cold bright cloud top stays visible"
+            overlay[1].a() > 0 && overlay[1].a() < overlay[2].a(),
+            "mid cloud is semi-transparent"
         );
+        assert!(overlay[2].a() > 200, "cold storm top (-63 C) stays visible");
+
+        // The full-screen player keeps the palette opaque (no BT fade).
+        let player = render_sat_pixels(13, &values, 3, 1, false, false);
+        assert!(player[0].a() > 200, "player keeps warm pixels opaque");
     }
 
     #[test]
