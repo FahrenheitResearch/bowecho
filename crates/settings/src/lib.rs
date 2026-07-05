@@ -332,6 +332,13 @@ pub struct AppSettings {
     /// the feel scales smoothly in log-zoom space.
     #[serde(default = "default_zoom_speed_percent")]
     pub zoom_speed_percent: u16,
+    /// Primary radar-history memory budget, in GiB. Big super-res loops (a
+    /// Cat-5 hurricane at 0.5°/250 m can run ~60-100 MB per decoded volume)
+    /// otherwise silently trim to whatever fits the default 8 GiB. Raising
+    /// this lets high-RAM machines hold longer loops; lowering it protects
+    /// small machines. Clamped to the offered choices (4/8/16/24/32).
+    #[serde(default = "default_radar_history_budget_gib")]
+    pub radar_history_budget_gib: u16,
     /// During loop playback, step through complete low-level SAILS/MESO-SAILS
     /// sweeps inside each volume before moving to the next volume. The loop
     /// frame count remains the scan/volume count shown in the UI.
@@ -533,6 +540,12 @@ fn default_zoom_speed_percent() -> u16 {
     150
 }
 
+/// Default primary radar-history memory budget in GiB (matches the engine's
+/// historical `PRIMARY_HISTORY_BYTE_BUDGET`). See `radar_history_budget_gib`.
+fn default_radar_history_budget_gib() -> u16 {
+    8
+}
+
 fn default_event_max_frames() -> u16 {
     24
 }
@@ -685,6 +698,7 @@ impl Default for AppSettings {
             cross_section_smoothing: default_cross_section_smoothing(),
             loop_speed_percent: default_loop_speed_percent(),
             zoom_speed_percent: default_zoom_speed_percent(),
+            radar_history_budget_gib: default_radar_history_budget_gib(),
             loop_low_sweeps: false,
             loop_low_sweep_filter: default_loop_low_sweep_filter(),
             loop_sweep_control: None,

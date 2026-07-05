@@ -235,6 +235,16 @@ const HISTORY_SIZE_OPTIONS: &[usize] = &[
 ];
 const DEFAULT_ARCHIVE_FRAME_COUNT: usize = 10;
 const MAX_ARCHIVE_FRAME_COUNT: usize = MAX_HISTORY_FRAME_LIMIT;
+/// Primary radar-history memory budgets offered in Settings ▸ Memory (GiB).
+/// 8 is the historical default; higher lets high-RAM machines hold long
+/// super-res loops, lower protects small machines (#20).
+const RADAR_HISTORY_BUDGET_CHOICES_GIB: [u16; 5] = [4, 8, 16, 24, 32];
+/// Convert a stored radar-history budget (GiB) to bytes for
+/// `HistoryLimits::byte_budget`, clamped to a sane range so a hand-edited
+/// config can neither starve the loop (min 2 GiB) nor overcommit absurdly.
+fn radar_history_budget_bytes(gib: u16) -> usize {
+    (gib.clamp(2, 64) as usize) * 1024 * 1024 * 1024
+}
 const MAX_LIVE_PRELOAD_FRAME_COUNT: usize = 10;
 const STORM_TRACK_MAX_TRACK_OPTIONS: &[usize] = &[8, 12, 16, 24, 32];
 const DEFAULT_STORM_TRACK_MAX_TRACKS: usize = 16;
@@ -1670,6 +1680,14 @@ struct ViewerApp {
     volume: Option<Arc<RadarVolume>>,
     selected_cut: usize,
     selected_product: DisplayProduct,
+    /// Set only while the effective product is a *transient fallback*: when a
+    /// frame can't show the selected product (e.g. a truncated velocity-less
+    /// frame forces reflectivity), this remembers what to restore. The next
+    /// frame that CAN show it restores it and clears this. `None` in the
+    /// normal case, so the per-frame product resolution is unchanged unless a
+    /// fallback actually happened — which is what stops a single data-poor
+    /// frame from permanently hijacking the loop's product.
+    pending_product_restore: Option<DisplayProduct>,
     advanced_products_enabled: bool,
     /// The primary view's loop engine (`EngineRole::Primary`, `EngineId(0)`
     /// — the session-monotonic layer/pane counter starts at 1, so 0 is
@@ -6229,6 +6247,11 @@ impl ViewerApp {
         // field doc.
         let mut primary = LoopEngine::new(EngineId(0), EngineRole::Primary, restored_primary_feed);
         primary.live.enabled = true;
+        // Honor the user's configurable radar-history memory budget (#20: big
+        // super-res loops were silently trimmed by the fixed 8 GiB default).
+        primary.limits.byte_budget = Some(radar_history_budget_bytes(
+            app_settings.radar_history_budget_gib,
+        ));
         // Re-arm the international picker on the last-used provider so the
         // saved site selection has its provider context back.
         let restored_intl_provider = app_settings.intl_provider.clone();
@@ -6304,6 +6327,7 @@ impl ViewerApp {
             volume: None,
             selected_cut: 0,
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
+            pending_product_restore: None,
             advanced_products_enabled: false,
             primary,
             low_sweep_disabled_cuts: BTreeSet::new(),
@@ -7942,13 +7966,23 @@ impl ViewerApp {
                 && is_displayable_on_cut(volume.as_ref(), hold.cut_index, &previous_product))
             .then_some(hold.cut_index)
         });
+        // Seed the product resolution from a pending fallback-restore if one is
+        // in flight, otherwise the effective product (the unchanged normal
+        // case — `pending_product_restore` is `None` unless a frame already
+        // forced a fallback). This lets a lone velocity-less frame fall back
+        // for that frame only, then restore the product on the next frame that
+        // can show it, instead of the fallback sticking for the whole loop.
+        let seed_product = self
+            .pending_product_restore
+            .clone()
+            .unwrap_or_else(|| self.selected_product.clone());
         let (selected_cut, selected_product) = if let Some(cut) = manual_hold_cut {
             (cut, previous_product.clone())
         } else {
             selection_for_installed_volume_with_low_sweep_min_seconds(
                 self.volume.as_deref(),
                 self.selected_cut,
-                &self.selected_product,
+                &seed_product,
                 volume.as_ref(),
                 VolumeSelectionPolicy {
                     allow_low_level_auto_advance: !self.primary.cursor.playing,
@@ -7958,6 +7992,14 @@ impl ViewerApp {
                 },
             )
         };
+        // Fallback-restore bookkeeping: resolving to the seed satisfies any
+        // pending restore; resolving to a *different* product means the frame
+        // couldn't show the seed, so remember it for a later capable frame.
+        if selected_product == seed_product {
+            self.pending_product_restore = None;
+        } else {
+            self.pending_product_restore = Some(seed_product);
+        }
         let catalog_index = self
             .sites
             .iter()
@@ -10066,6 +10108,20 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
+    /// Apply a new radar-history memory budget (#20): persist it, push it into
+    /// the primary engine, and re-trim (lowering it drops oldest frames now;
+    /// raising it just makes room for the next load).
+    fn set_radar_history_budget(&mut self, gib: u16, ctx: &egui::Context) {
+        if self.app_settings.radar_history_budget_gib == gib {
+            return;
+        }
+        self.app_settings.radar_history_budget_gib = gib;
+        self.primary.limits.byte_budget = Some(radar_history_budget_bytes(gib));
+        self.trim_frame_history();
+        let _ = self.app_settings.save();
+        ctx.request_repaint();
+    }
+
     fn persist_archive_controls(&mut self) {
         self.archive_frame_count = normalized_archive_frame_count(self.archive_frame_count);
         let count = self.archive_frame_count as u16;
@@ -10853,6 +10909,8 @@ impl ViewerApp {
         };
         self.remember_current_primary_product_cut();
         self.selected_product = product;
+        // An explicit user choice supersedes any in-flight fallback recovery.
+        self.pending_product_restore = None;
         self.selected_cut = next_cut;
         self.manual_primary_cut_hold = None;
         self.sanitize_selection();
@@ -17125,6 +17183,8 @@ impl ViewerApp {
     fn restore_workflow_snapshot(&mut self, snapshot: WorkflowSnapshot) {
         self.selected_cut = snapshot.selected_cut;
         self.selected_product = snapshot.selected_product;
+        // A restored session starts from its saved product, not mid-fallback.
+        self.pending_product_restore = None;
         self.pending_grid_layout = None;
         self.grid_layout = snapshot.grid_layout;
         self.app_settings.grid_pane_count = snapshot.grid_layout.panel_count();
@@ -22880,6 +22940,41 @@ impl ViewerApp {
                 .changed()
             {
                 self.set_history_frame_limit(typed_limit, ctx);
+            }
+            // Radar-history memory budget (#20): huge super-res loops trim to
+            // fit. Sits next to the frame-limit combo, exactly where "loaded
+            // 200, only see 93" happens — with an honest cap indicator.
+            let mut budget_gib = self.app_settings.radar_history_budget_gib;
+            let used_bytes = self.primary.history_bytes();
+            let budget_bytes = radar_history_budget_bytes(budget_gib);
+            let frames = self.primary.history.len();
+            let ram_capped = frames < self.primary.limits.frame_limit
+                && used_bytes as f64 > budget_bytes as f64 * 0.9;
+            egui::ComboBox::from_id_salt("radar_history_budget")
+                .selected_text(format!("{budget_gib} GiB"))
+                .width(64.0)
+                .show_ui(ui, |ui| {
+                    for gib in RADAR_HISTORY_BUDGET_CHOICES_GIB {
+                        ui.selectable_value(&mut budget_gib, gib, format!("{gib} GiB RAM"));
+                    }
+                })
+                .response
+                .on_hover_text(format!(
+                    "Radar-history memory budget. Large super-res loops (a Cat-5 \
+                     hurricane runs ~60-100 MB per decoded volume) trim oldest-first \
+                     to fit. Using {:.1} / {budget_gib} GiB across {frames} frames.",
+                    used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                ));
+            if budget_gib != self.app_settings.radar_history_budget_gib {
+                self.set_radar_history_budget(budget_gib, ctx);
+            }
+            if ram_capped {
+                ui.weak("⚠ RAM cap").on_hover_text(format!(
+                    "Showing {frames} of the up-to-{} frames you requested — the rest \
+                     were trimmed to fit the {budget_gib} GiB memory budget. Raise the \
+                     budget (dropdown at left) to keep more.",
+                    self.primary.limits.frame_limit
+                ));
             }
             let mut speed = self.app_settings.loop_speed_percent;
             egui::ComboBox::from_id_salt("loop_speed")
@@ -54787,6 +54882,73 @@ mod tests {
         assert_eq!(app.extra_panes[0].cut, Some(1));
     }
 
+    /// Regression: a lone velocity-less frame (a truncated partial with only
+    /// reflectivity) used to PERMANENTLY pin the loop to reflectivity, because
+    /// the per-frame fallback was written back as the active product and the
+    /// next frame inherited it. `pending_product_restore` remembers the seed
+    /// across the fallback so velocity restores on the next capable frame.
+    #[test]
+    fn velocity_restores_after_a_lone_velocityless_frame() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+
+        // Start on a full volume (reflectivity + velocity cuts) and pick velocity.
+        app.volume = Some(Arc::new(test_ref_then_velocity_volume()));
+        app.selected_cut = 0;
+        assert!(app.switch_primary_product(DisplayProduct::Moment(MomentType::Velocity)));
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Velocity)
+        );
+        assert!(
+            app.pending_product_restore.is_none(),
+            "no fallback yet, so nothing pending"
+        );
+        app.primary.cursor.playing = true; // playing the loop, as in the report
+
+        // Step onto a velocity-less partial: display falls back for THIS frame.
+        app.install_volume_arc(
+            Arc::new(test_reflectivity_sails_volume_with_radials(
+                &[(0.5, 0)],
+                720,
+            )),
+            None,
+            false,
+            None,
+            FrameStatus::Complete,
+            &ctx,
+        );
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Reflectivity),
+            "a velocity-less frame shows reflectivity for that frame only"
+        );
+        assert_eq!(
+            app.pending_product_restore,
+            Some(DisplayProduct::Moment(MomentType::Velocity)),
+            "the fallback remembers velocity to restore"
+        );
+
+        // Step back onto a full frame: velocity restores (pre-fix: stuck reflectivity).
+        app.install_volume_arc(
+            Arc::new(test_ref_then_velocity_volume()),
+            None,
+            false,
+            None,
+            FrameStatus::Complete,
+            &ctx,
+        );
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Velocity),
+            "velocity restores once a frame can show it again"
+        );
+        assert!(
+            app.pending_product_restore.is_none(),
+            "restore satisfied, nothing pending"
+        );
+    }
+
     #[test]
     fn pinned_independent_velocity_pane_defers_live_partial_without_selected_cut() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
@@ -67009,6 +67171,7 @@ mod tests {
             volume: None,
             selected_cut: 0,
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
+            pending_product_restore: None,
             advanced_products_enabled: false,
             primary,
             low_sweep_disabled_cuts: BTreeSet::new(),
