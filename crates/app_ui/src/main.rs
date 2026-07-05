@@ -4290,6 +4290,15 @@ struct PaneView {
     /// The pane's loop machine (`EngineRole::Pane { slot }`).
     engine: LoopEngine,
     product: DisplayProduct,
+    /// Pane-local mirror of `ViewerApp::pending_product_restore`: when a
+    /// velocity-less frame forces this pane to fall back to reflectivity for
+    /// that frame only (a live-partial / stale / not-yet-complete velocity
+    /// cut), the pane's chosen product is remembered here so the next frame
+    /// that CAN show it restores it. Without this a following/owned velocity
+    /// pane that hit one velocity-less frame stuck on reflectivity for the
+    /// rest of the loop (the fallback was written back as `product` and every
+    /// later frame inherited it), while the primary already recovered.
+    pending_product_restore: Option<DisplayProduct>,
     /// Independent tilt override; None = follow the main pane's tilt, so
     /// scrubbing the main tilt moves every un-pinned pane in sync.
     cut: Option<usize>,
@@ -4346,6 +4355,7 @@ impl PaneView {
         Self {
             engine,
             product,
+            pending_product_restore: None,
             cut: None,
             pin: None,
             followed_primary_volume_ptr: None,
@@ -8289,8 +8299,18 @@ impl ViewerApp {
                 .iter()
                 .filter(|pane| !pane.owns_radar())
                 .map(|pane| {
+                    // Pre-derive the pane's INTENDED product — a pending
+                    // fallback-restore if one is in flight, else its current
+                    // product — so a frame that can finally show it lets an
+                    // advanced velocity (dealiased / storm-relative) pane
+                    // restore instead of staying on the reflectivity it fell
+                    // back to.
+                    let product = pane
+                        .pending_product_restore
+                        .clone()
+                        .unwrap_or_else(|| pane.product.clone());
                     (
-                        pane.product.clone(),
+                        product,
                         pane.cut.unwrap_or(previous_cut),
                         require_complete_live_cut,
                     )
@@ -8519,18 +8539,29 @@ impl ViewerApp {
                 continue;
             }
             let previous_product = pane.product.clone();
+            // Seed the resolution from a pending fallback-restore if one is in
+            // flight (a prior primary install couldn't show this pane's chosen
+            // product), otherwise the pane's current product. Mirrors the
+            // primary's `pending_product_restore`: a lone velocity-less frame
+            // falls the pane back for THAT frame, then the next capable frame
+            // restores it — so a following velocity pane stays velocity across
+            // the whole loop instead of sticking on reflectivity.
+            let seed_product = pane
+                .pending_product_restore
+                .clone()
+                .unwrap_or_else(|| previous_product.clone());
             let previous_cut = pane
                 .cut
                 .or_else(|| {
                     previous_volume.and_then(|previous| {
-                        best_cut_for_product(previous, previous_primary_cut, &previous_product)
+                        best_cut_for_product(previous, previous_primary_cut, &seed_product)
                     })
                 })
                 .unwrap_or(previous_primary_cut);
 
             let product_ready = volume_can_materialize_product_with_live_filter(
                 volume,
-                &previous_product,
+                &seed_product,
                 require_complete_live_cut,
             );
             if live_partial && !product_ready {
@@ -8542,7 +8573,7 @@ impl ViewerApp {
                 && !can_materialize_product_on_live_candidate_cut(
                     volume,
                     previous_cut,
-                    &previous_product,
+                    &seed_product,
                     true,
                 )
             {
@@ -8555,11 +8586,16 @@ impl ViewerApp {
                 && let Some(cut) = best_cut_for_product_with_live_filter(
                     volume,
                     previous_cut,
-                    &previous_product,
+                    &seed_product,
                     require_complete_live_cut,
                 )
             {
+                // The seed product has a cut on the new site: adopt it,
+                // restoring it if a prior fallback had swapped the pane onto
+                // reflectivity, and clear the now-satisfied pending restore.
                 pane.cut = Some(cut);
+                pane.product = seed_product;
+                pane.pending_product_restore = None;
                 continue;
             }
 
@@ -8567,7 +8603,7 @@ impl ViewerApp {
                 selection_for_installed_volume_with_low_sweep_min_seconds(
                     previous_volume,
                     previous_cut,
-                    &previous_product,
+                    &seed_product,
                     volume,
                     VolumeSelectionPolicy {
                         allow_low_level_auto_advance: !self.primary.cursor.playing,
@@ -8577,6 +8613,15 @@ impl ViewerApp {
                     },
                 );
             pane.cut = Some(selected_cut);
+            // Fallback-restore bookkeeping (mirrors the primary): resolving to
+            // the seed satisfies any pending restore; resolving to a different
+            // product means this frame couldn't show the seed, so remember it
+            // for a later capable frame instead of losing the intent.
+            if selected_product == seed_product {
+                pane.pending_product_restore = None;
+            } else {
+                pane.pending_product_restore = Some(seed_product);
+            }
             pane.product = selected_product;
         }
     }
@@ -11332,6 +11377,8 @@ impl ViewerApp {
         };
         let pane = &mut self.extra_panes[slot];
         pane.product = product;
+        // An explicit user choice supersedes any in-flight fallback recovery.
+        pane.pending_product_restore = None;
         pane.cut = Some(next_cut);
         pane.render_ms = None;
         true
@@ -13278,6 +13325,10 @@ impl ViewerApp {
         // instead of being clobbered by this pane's live poll.
         pane.engine.live.enabled = matches!(pin, Some(SiteRef::Intl { .. })) || primary_live;
         pane.pin = pin;
+        // Fresh owned-pane start: drop any fallback recovery inherited from
+        // the pane's previous (following) life so a stale seed can't override
+        // the product this pane resolves for its new radar.
+        pane.pending_product_restore = None;
         pane.engine.live.last_refresh = None;
         pane.followed_primary_volume_ptr = None;
         pane.volume = primary_volume.clone();
@@ -14103,13 +14154,24 @@ impl ViewerApp {
         };
         let previous_cut = pane.cut.unwrap_or(main_cut);
         let previous_product = pane.product.clone();
+        // Seed the resolution from a pending fallback-restore if one is in
+        // flight, otherwise the pane's current product. Same intent-
+        // preservation as the primary install: a lone velocity-less frame
+        // (live-partial / stale / not-yet-complete velocity cut) falls the
+        // pane back to reflectivity for THAT frame only, remembering the
+        // chosen product so the next capable frame restores it — an owned
+        // velocity pane stays velocity across the whole loop.
+        let seed_product = pane
+            .pending_product_restore
+            .clone()
+            .unwrap_or_else(|| previous_product.clone());
         let require_complete_live_cut =
             frame_status == FrameStatus::LivePartial && !display_live_chunk_updates;
         let source_volume = Arc::clone(&volume);
         let volume = ensure_advanced_products_on_volume_cuts_arc(
             volume,
             [(
-                previous_product.clone(),
+                seed_product.clone(),
                 previous_cut,
                 require_complete_live_cut,
             )],
@@ -14118,7 +14180,7 @@ impl ViewerApp {
             selection_for_installed_volume_with_low_sweep_min_seconds(
                 pane.volume.as_deref(),
                 previous_cut,
-                &previous_product,
+                &seed_product,
                 volume.as_ref(),
                 VolumeSelectionPolicy {
                     allow_low_level_auto_advance: !pane.engine.cursor.playing,
@@ -14127,6 +14189,16 @@ impl ViewerApp {
                     low_level_min_seconds,
                 },
             );
+        // Fallback-restore bookkeeping (mirrors the primary): resolving to the
+        // seed satisfies any pending restore; resolving to a different product
+        // means this frame couldn't show the seed, so remember it for a later
+        // capable frame instead of losing the pane's intent for the rest of
+        // the loop.
+        if selected_product == seed_product {
+            pane.pending_product_restore = None;
+        } else {
+            pane.pending_product_restore = Some(seed_product);
+        }
         let volume = ensure_advanced_products_on_volume_cuts_arc(
             volume,
             [(
@@ -17618,6 +17690,8 @@ impl ViewerApp {
         self.sync_extra_panes();
         for (pane, pane_snapshot) in self.extra_panes.iter_mut().zip(snapshot.extra_panes) {
             pane.product = pane_snapshot.product;
+            // A restored pane starts from its saved product, not mid-fallback.
+            pane.pending_product_restore = None;
             pane.cut = pane_snapshot.cut;
             pane.render_ms = None;
         }
@@ -17716,6 +17790,8 @@ impl ViewerApp {
         self.sync_extra_panes();
         for (pane, product) in self.extra_panes.iter_mut().zip(products.iter()) {
             pane.product = product.clone();
+            // Explicit workflow product = fresh intent, not mid-fallback.
+            pane.pending_product_restore = None;
             pane.cut = None;
             pane.render_ms = None;
         }
@@ -55664,6 +55740,252 @@ mod tests {
             app.pending_product_restore.is_none(),
             "restore satisfied, nothing pending"
         );
+    }
+
+    /// Regression (dual-pane, the reported bug): the RIGHT pane — a FOLLOWING
+    /// velocity pane driven off the primary's installs — used to show the last
+    /// stretch of a velocity loop as reflectivity. One velocity-less frame
+    /// flipped `pane.product` to reflectivity and every later frame inherited
+    /// it, while the primary already recovered via `pending_product_restore`.
+    /// The pane-local restore keeps the pane on velocity across the whole loop.
+    #[test]
+    fn following_velocity_pane_restores_after_a_lone_velocityless_frame() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        // A following pane (no pin) on velocity while the primary shows
+        // reflectivity — the classic dual-pane setup.
+        app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
+        assert!(!app.extra_panes[0].owns_radar());
+        app.primary.cursor.playing = true; // looping, as in the report
+
+        // Full frame: the pane resolves to velocity, nothing pending.
+        app.install_volume_arc(
+            Arc::new(test_ref_then_velocity_volume()),
+            None,
+            false,
+            None,
+            FrameStatus::Complete,
+            &ctx,
+        );
+        assert_eq!(
+            app.extra_panes[0].product,
+            DisplayProduct::Moment(MomentType::Velocity),
+        );
+        assert!(app.extra_panes[0].pending_product_restore.is_none());
+
+        // Velocity-less frame: the pane displays reflectivity for THIS frame,
+        // but remembers velocity to restore (pre-fix: silently overwritten).
+        app.install_volume_arc(
+            Arc::new(test_reflectivity_sails_volume_with_radials(
+                &[(0.5, 0)],
+                720,
+            )),
+            None,
+            false,
+            None,
+            FrameStatus::Complete,
+            &ctx,
+        );
+        assert_eq!(
+            app.extra_panes[0].product,
+            DisplayProduct::Moment(MomentType::Reflectivity),
+            "a velocity-less frame falls the pane back for that frame only",
+        );
+        assert_eq!(
+            app.extra_panes[0].pending_product_restore,
+            Some(DisplayProduct::Moment(MomentType::Velocity)),
+            "the fallback remembers velocity to restore",
+        );
+
+        // Next full frame: velocity restores (pre-fix: stuck on reflectivity
+        // for the rest of the loop).
+        app.install_volume_arc(
+            Arc::new(test_ref_then_velocity_volume()),
+            None,
+            false,
+            None,
+            FrameStatus::Complete,
+            &ctx,
+        );
+        assert_eq!(
+            app.extra_panes[0].product,
+            DisplayProduct::Moment(MomentType::Velocity),
+            "the following velocity pane returns to velocity, never sticks on reflectivity",
+        );
+        assert!(app.extra_panes[0].pending_product_restore.is_none());
+    }
+
+    /// Regression: same fix on the OWNED-pane code path
+    /// (`install_extra_pane_volume_arc`), which an independent-radar pane
+    /// steps through during its own loop. The pane starts already parked on a
+    /// full same-site volume (as it would be mid-loop) so the resolution can
+    /// preserve/restore the chosen product.
+    #[test]
+    fn owned_velocity_pane_restores_after_a_lone_velocityless_frame() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        app.extra_panes[0].pin = Some(SiteRef::Us {
+            level2_id: "TEST".to_owned(),
+        });
+        app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
+        // Already showing velocity on the velocity cut of a full same-site
+        // volume — the state an owned velocity pane holds mid-loop.
+        app.extra_panes[0].cut = Some(1);
+        app.extra_panes[0].volume = Some(Arc::new(test_ref_then_velocity_volume()));
+        assert!(app.extra_panes[0].owns_radar());
+
+        // Velocity-less frame: display falls back, velocity is remembered.
+        app.install_extra_pane_volume_arc(
+            0,
+            Arc::new(test_reflectivity_sails_volume_with_radials(
+                &[(0.5, 0)],
+                720,
+            )),
+            None,
+            None,
+            FrameStatus::Complete,
+            &ctx,
+        );
+        assert_eq!(
+            app.extra_panes[0].product,
+            DisplayProduct::Moment(MomentType::Reflectivity),
+            "a velocity-less frame falls the pane back for that frame only",
+        );
+        assert_eq!(
+            app.extra_panes[0].pending_product_restore,
+            Some(DisplayProduct::Moment(MomentType::Velocity)),
+        );
+
+        // Next full frame: velocity restores.
+        app.install_extra_pane_volume_arc(
+            0,
+            Arc::new(test_ref_then_velocity_volume()),
+            None,
+            None,
+            FrameStatus::Complete,
+            &ctx,
+        );
+        assert_eq!(
+            app.extra_panes[0].product,
+            DisplayProduct::Moment(MomentType::Velocity),
+            "the owned velocity pane never sticks on reflectivity",
+        );
+        assert!(app.extra_panes[0].pending_product_restore.is_none());
+    }
+
+    /// REAL-DATA proof (ignored; not run in CI). Drives a following velocity
+    /// pane through actual PGUA Level-II volumes — the live Cat-5 typhoon
+    /// BAVI-26 scans — mixing velocity-complete volumes with a velocity-less
+    /// partial chunk, and asserts the pane returns to velocity instead of
+    /// sticking on reflectivity. Point `BOWECHO_PGUA_DIR` at a folder of V06
+    /// files (its `.chunks` subfolder is scanned for velocity-less partials)
+    /// and run with `cargo test -p app_ui --bin bowecho -- --ignored
+    /// following_velocity_pane_restores_on_real_pgua_volumes --nocapture`.
+    #[test]
+    #[ignore = "requires local real PGUA Level-II cache (BOWECHO_PGUA_DIR)"]
+    fn following_velocity_pane_restores_on_real_pgua_volumes() {
+        let dir = std::env::var("BOWECHO_PGUA_DIR").unwrap_or_else(|_| {
+            r"C:\Users\drew\AppData\Local\BowEcho\cache\level2\PGUA".to_owned()
+        });
+        let dir = PathBuf::from(dir);
+        let velocity = |volume: &RadarVolume| {
+            volume
+                .cuts
+                .iter()
+                .any(|cut| cut.moments_available().contains(&MomentType::Velocity))
+        };
+
+        // A velocity-complete full volume (top-level V06 files).
+        let mut full_paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .expect("read PGUA dir")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_file())
+            .collect();
+        full_paths.sort();
+        let full = full_paths
+            .iter()
+            .find_map(|path| {
+                let volume = nexrad_io::decode_volume_from_path(path).ok()?;
+                velocity(&volume).then_some(volume)
+            })
+            .expect("a velocity-complete PGUA volume");
+
+        // A velocity-less frame: prefer a real partial chunk with no velocity;
+        // fall back to a top-level volume that happens to lack velocity.
+        let chunks_dir = dir.join(".chunks");
+        let velocityless = std::fs::read_dir(&chunks_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_file())
+            .chain(full_paths.iter().cloned())
+            .find_map(|path| {
+                let volume = nexrad_io::decode_volume_from_path(&path).ok()?;
+                (!velocity(&volume)).then_some(volume)
+            })
+            .expect("a velocity-less PGUA frame (partial chunk)");
+
+        eprintln!(
+            "REAL PGUA: full site={} cuts={} (velocity), velocity-less cuts={}",
+            full.site.id,
+            full.cuts.len(),
+            velocityless.cuts.len(),
+        );
+
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        app.extra_panes[0].product = DisplayProduct::Moment(MomentType::Velocity);
+        app.primary.cursor.playing = true;
+
+        app.install_volume_arc(
+            Arc::new(full.clone()),
+            None,
+            false,
+            None,
+            FrameStatus::Complete,
+            &ctx,
+        );
+        assert_eq!(
+            app.extra_panes[0].product,
+            DisplayProduct::Moment(MomentType::Velocity),
+            "pane resolves to velocity on a real velocity-complete volume",
+        );
+
+        app.install_volume_arc(
+            Arc::new(velocityless),
+            None,
+            false,
+            None,
+            FrameStatus::Complete,
+            &ctx,
+        );
+        assert_eq!(
+            app.extra_panes[0].pending_product_restore,
+            Some(DisplayProduct::Moment(MomentType::Velocity)),
+            "the real velocity-less frame remembers velocity to restore",
+        );
+
+        app.install_volume_arc(
+            Arc::new(full),
+            None,
+            false,
+            None,
+            FrameStatus::Complete,
+            &ctx,
+        );
+        assert_eq!(
+            app.extra_panes[0].product,
+            DisplayProduct::Moment(MomentType::Velocity),
+            "velocity restores on real data — pane never sticks on reflectivity",
+        );
+        assert!(app.extra_panes[0].pending_product_restore.is_none());
+        eprintln!("REAL PGUA: following velocity pane stayed velocity across the loop");
     }
 
     #[test]
