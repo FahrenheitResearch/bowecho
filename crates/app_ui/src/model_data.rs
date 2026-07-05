@@ -8,8 +8,8 @@
 
 use eframe::egui;
 use rw_ui::{
-    FieldViewerEvent, FieldViewerPanel, HourKey, RunBrowserPanel, SoundingPanel, StoreRequest,
-    StoreResponse, StoreTree, StoreView, StoreWorker,
+    FieldViewerEvent, FieldViewerPanel, HourKey, PlotViewerPanel, RunBrowserPanel, SoundingPanel,
+    StoreRequest, StoreResponse, StoreTree, StoreView, StoreWorker,
 };
 use std::path::PathBuf;
 
@@ -26,6 +26,12 @@ pub struct ModelDataDock {
     latest_sounding: Option<std::sync::Arc<rw_ui::SoundingData>>,
     /// One-shot: the user asked to put the current field on the radar map.
     map_request: Option<std::sync::Arc<rw_ui::FieldData>>,
+    /// v0.2.3 custom-domain plot viewer: renders the selected field through
+    /// rusty-weather's native plot pipeline over a user-chosen domain (shift-
+    /// drag a box on the field viewer, or rotate a corner). Shown as a floating
+    /// window when `show_plot_viewer` is set.
+    plot_viewer: PlotViewerPanel,
+    show_plot_viewer: bool,
 }
 
 impl ModelDataDock {
@@ -45,6 +51,8 @@ impl ModelDataDock {
             latest_field: None,
             latest_sounding: None,
             map_request: None,
+            plot_viewer: PlotViewerPanel::new(),
+            show_plot_viewer: false,
         }
     }
 
@@ -398,6 +406,12 @@ impl ModelDataDock {
                     {
                         self.map_request = self.latest_field.clone();
                     }
+                    ui.toggle_value(&mut self.show_plot_viewer, "🗺 Native plot")
+                        .on_hover_text(
+                            "Render the selected field through rusty-weather's native plot \
+                             pipeline. Shift-drag a box on the field viewer to plot a custom \
+                             domain; drag a selection corner to rotate.",
+                        );
                 });
             }
             match self.viewer.ui(ui) {
@@ -414,14 +428,38 @@ impl ModelDataDock {
                             .send(StoreRequest::LoadSounding { hour, fx, fy });
                     }
                 }
-                // v0.2.3: custom-domain plot events (arbitrary field domains /
-                // rotation) — not yet wired into BowEcho's map (follow-up for
-                // the arbitrary-plot work).
-                Some(FieldViewerEvent::DomainSelected(_))
-                | Some(FieldViewerEvent::DomainRotationChanged { .. }) => {}
+                // v0.2.3 custom-domain plot: shift-drag a box on the field
+                // viewer to select an arbitrary plot domain, or drag a corner
+                // to rotate it. Open the native plot viewer and retarget it.
+                Some(FieldViewerEvent::DomainSelected(domain)) => {
+                    self.show_plot_viewer = true;
+                    self.plot_viewer.set_active_domain(domain);
+                }
+                Some(FieldViewerEvent::DomainRotationChanged { rotation_deg }) => {
+                    self.show_plot_viewer = true;
+                    self.plot_viewer.set_active_domain_rotation(rotation_deg);
+                }
                 None => {}
             }
         });
+
+        // v0.2.3 custom-domain native plot, as a floating window. Rendered
+        // after the field viewer so a domain selected this frame shows at once.
+        // `current_field()` borrows `self.viewer` immutably while the closure
+        // holds `&mut self.plot_viewer` — disjoint fields, so this is sound.
+        if self.show_plot_viewer {
+            let field = self.viewer.current_field();
+            let mut open = true;
+            egui::Window::new("🗺 Native plot")
+                .open(&mut open)
+                .default_size([560.0, 440.0])
+                .show(ui.ctx(), |ui| {
+                    self.plot_viewer.ui(ui, field);
+                });
+            if !open {
+                self.show_plot_viewer = false;
+            }
+        }
     }
 }
 
