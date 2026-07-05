@@ -110,9 +110,7 @@ impl crate::ViewerApp {
                 let vt = circ.vt_max.unwrap_or(0.0);
                 let kt = vt * MS_TO_KT;
                 let rmw = circ.rmw_km.unwrap_or(0.0);
-                let motion = motion_note
-                    .map(|n| format!("  · {n}"))
-                    .unwrap_or_default();
+                let motion = motion_note.map(|n| format!("  · {n}")).unwrap_or_default();
                 self.gbvtd.status = format!(
                     "{} — peak {vt:.0} m/s ({kt:.0} kt) at RMW {rmw:.0} km  [{:.2}° tilt]{motion}",
                     intensity_label(kt),
@@ -160,7 +158,10 @@ impl crate::ViewerApp {
         let (sin_d, cos_d) = dir.to_radians().sin_cos();
         (
             ((speed_ms * sin_d) as f64, (speed_ms * cos_d) as f64),
-            Some(format!("de-aliased with {} motion {speed_kt:.0} kt", storm.name)),
+            Some(format!(
+                "de-aliased with {} motion {speed_kt:.0} kt",
+                storm.name
+            )),
         )
     }
 

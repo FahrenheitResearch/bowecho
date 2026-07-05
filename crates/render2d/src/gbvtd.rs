@@ -529,8 +529,9 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
         let radii: Vec<f32> = (6..=100).step_by(4).map(|r| r as f32).collect();
-        let circ = find_center_and_retrieve(&field, (guess_x, guess_y), 40.0, 3.0, &radii, (um, vm))
-            .expect("a circulation");
+        let circ =
+            find_center_and_retrieve(&field, (guess_x, guess_y), 40.0, 3.0, &radii, (um, vm))
+                .expect("a circulation");
 
         eprintln!(
             "GBVTD real: cut {cut_index} ({:.2} deg) wind=({um:.1},{vm:.1}) m/s center=({:.1},{:.1}) km RMW={:?} VT_max={:?} m/s",
