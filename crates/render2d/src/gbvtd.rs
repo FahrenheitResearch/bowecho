@@ -454,4 +454,128 @@ mod tests {
             );
         }
     }
+
+    /// Real-data audit (env-gated): decode every volume in a directory and
+    /// tally moment presence. Explains the PGUA loop bugs — velocity-less
+    /// frames force the sticky reflectivity fallback, and empty / no-moment
+    /// frames are dropped from the loop history. Point BOWECHO_PGUA_DIR at the
+    /// on-disk cache (e.g. %LOCALAPPDATA%\BowEcho\cache\level2\PGUA).
+    #[test]
+    fn pgua_frame_moment_audit() {
+        let Some(dir) = std::env::var_os("BOWECHO_PGUA_DIR") else {
+            return;
+        };
+        use radar_core::MomentType;
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file())
+            .collect();
+        entries.sort();
+
+        // Replica of ui_core::loop_engine::policy::estimated_volume_bytes,
+        // to test the 8 GiB primary byte-budget hypothesis for the 200->93
+        // frame drop without adding a ui_core dependency to render2d.
+        fn est_volume_bytes(volume: &radar_core::RadarVolume) -> usize {
+            let mut bytes = std::mem::size_of::<radar_core::RadarVolume>();
+            for cut in &volume.cuts {
+                bytes += std::mem::size_of_val(cut);
+                bytes += cut.radials.len() * std::mem::size_of::<radar_core::Radial>();
+                for grid in cut.moments.values() {
+                    bytes += std::mem::size_of_val(grid);
+                    bytes += grid.radial_indices.len() * std::mem::size_of::<usize>();
+                    bytes += grid.storage.len() * usize::from(grid.storage.word_size_bits() / 8);
+                }
+            }
+            bytes
+        }
+
+        let (mut total, mut empty_cuts, mut with_vel, mut without_vel, mut no_disp) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut decode_fail = 0usize;
+        let mut times = std::collections::BTreeSet::new();
+        let mut velless: Vec<String> = Vec::new();
+        let mut sizes: Vec<(i64, usize)> = Vec::new();
+
+        for path in &entries {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let volume = match nexrad_io::decode_volume_from_path(path) {
+                Ok(v) => v,
+                Err(_) => {
+                    decode_fail += 1;
+                    continue;
+                }
+            };
+            total += 1;
+            let ts = volume.volume_time.timestamp();
+            times.insert(ts);
+            sizes.push((ts, est_volume_bytes(&volume)));
+            let n_ref = volume
+                .cuts
+                .iter()
+                .filter(|c| c.moments.contains_key(&MomentType::Reflectivity))
+                .count();
+            let n_vel = volume
+                .cuts
+                .iter()
+                .filter(|c| c.moments.contains_key(&MomentType::Velocity))
+                .count();
+            if volume.cuts.is_empty() {
+                empty_cuts += 1;
+            }
+            if n_vel > 0 {
+                with_vel += 1;
+            } else {
+                without_vel += 1;
+                if velless.len() < 50 {
+                    velless.push(format!(
+                        "{name}  cuts={} ref={} vel={}",
+                        volume.cuts.len(),
+                        n_ref,
+                        n_vel
+                    ));
+                }
+            }
+            if n_ref == 0 && n_vel == 0 {
+                no_disp += 1;
+            }
+        }
+
+        eprintln!("=== PGUA MOMENT AUDIT ({} files) ===", entries.len());
+        eprintln!("decoded ok:         {total}");
+        eprintln!("decode failures:    {decode_fail}");
+        eprintln!("unique scan times:  {}", times.len());
+        eprintln!("empty cuts:         {empty_cuts}");
+        eprintln!("WITH velocity:      {with_vel}");
+        eprintln!("WITHOUT velocity:   {without_vel}");
+        eprintln!("no displayable:     {no_disp}");
+        eprintln!("--- velocity-less frames (up to 50) ---");
+        for line in &velless {
+            eprintln!("  {line}");
+        }
+
+        // Byte-budget test: newest-first, how many fit in the 8 GiB primary
+        // budget (the trim drops oldest first, keeps newest).
+        sizes.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+        const GIB8: usize = 8 * 1024 * 1024 * 1024;
+        let total_bytes: usize = sizes.iter().map(|(_, b)| *b).sum();
+        let avg_mb = if total > 0 {
+            (total_bytes / total) as f64 / (1024.0 * 1024.0)
+        } else {
+            0.0
+        };
+        let mut acc = 0usize;
+        let mut fit = 0usize;
+        for (_, b) in &sizes {
+            if acc + b > GIB8 {
+                break;
+            }
+            acc += b;
+            fit += 1;
+        }
+        eprintln!("--- byte-budget (8 GiB primary) ---");
+        eprintln!("avg decoded/frame:  {avg_mb:.1} MB");
+        eprintln!("total decoded:      {:.1} GB", total_bytes as f64 / 1e9);
+        eprintln!("newest frames that fit in 8 GiB: {fit}");
+    }
 }
