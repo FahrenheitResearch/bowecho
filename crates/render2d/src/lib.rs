@@ -13,6 +13,7 @@ mod dealias_pyart;
 mod dealias_v4;
 mod detect;
 mod gate_filter;
+mod gbvtd;
 mod interpolate;
 mod region_core;
 mod rhi;
@@ -32,6 +33,9 @@ pub use detect::{
     RotationSite, RotationStrength, detect_rotation_sites, rotation_features_per_tilt,
 };
 pub use gate_filter::apply_reflectivity_gate_filter;
+pub use gbvtd::{
+    PolarVelocityField, RingFit, TcCirculation, find_center_and_retrieve, retrieve_axisymmetric,
+};
 use image::{ImageBuffer, ImageError, Rgba};
 pub use interpolate::{
     INTERP_MAX_FACTOR, INTERP_MAX_GRID_BYTES, INTERP_TARGET_AZIMUTH_DEG,
