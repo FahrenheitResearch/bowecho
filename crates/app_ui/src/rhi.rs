@@ -62,8 +62,16 @@ impl RhiPanel {
         selected_cut: usize,
         product_moment: &MomentType,
         color_tables: &ColorTableSet,
+        dealias_engine: crate::DealiasEngine,
     ) {
-        self.update_texture(ui.ctx(), volume, selected_cut, product_moment, color_tables);
+        self.update_texture(
+            ui.ctx(),
+            volume,
+            selected_cut,
+            product_moment,
+            color_tables,
+            dealias_engine,
+        );
         ui.horizontal(|ui| {
             ui.strong("RHI");
             ui.separator();
@@ -153,6 +161,7 @@ impl RhiPanel {
         selected_cut: usize,
         product_moment: &MomentType,
         color_tables: &ColorTableSet,
+        dealias_engine: crate::DealiasEngine,
     ) {
         let Some(cut) = volume
             .cuts
@@ -187,6 +196,9 @@ impl RhiPanel {
         selected_cut.hash(&mut hasher);
         moment.short_name().hash(&mut hasher);
         color_tables.signature_for_family(family).hash(&mut hasher);
+        // The selected dealias engine changes the velocity panel — key it in
+        // so switching engines on the map re-renders the RHI too.
+        dealias_engine.hash(&mut hasher);
         let signature = hasher.finish();
         if self.signature == Some(signature) && self.texture.is_some() {
             return;
@@ -196,10 +208,22 @@ impl RhiPanel {
             return; // unreachable: moment chosen from cut.moments above
         };
         // Velocity panels show dealiased velocity, matching the map and
-        // cross-section displays.
+        // cross-section displays — through the same engine the user selected.
+        // Analyst 3D here runs the whole-volume v4 solve for this cut WITHOUT
+        // the previous-volume / RAP prior the map fetches (the RHI has no
+        // access to them), falling back to the Region solver if v4 declines.
         let dealiased;
         let grid = if moment == MomentType::Velocity {
-            dealiased = render2d::dealias_velocity_grid(cut, grid);
+            dealiased = match dealias_engine {
+                crate::DealiasEngine::Analyst3d => {
+                    render2d::dealias_velocity_grid_v4(volume, selected_cut, None, None)
+                        .unwrap_or_else(|| render2d::dealias_velocity_grid(cut, grid))
+                }
+                crate::DealiasEngine::RegionGlobal => {
+                    render2d::dealias_velocity_grid_pyart_region(cut, grid)
+                }
+                crate::DealiasEngine::Region => render2d::dealias_velocity_grid(cut, grid),
+            };
             &dealiased
         } else {
             grid

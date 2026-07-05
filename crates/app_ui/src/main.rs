@@ -25,11 +25,11 @@ use render2d::{
     ViewportGeometryCache, ViewportMomentCache, ViewportRasterOptions, ViewportSampleCache,
     VolumeDealiasCache, apply_reflectivity_gate_filter, azimuthal_shear_grid,
     color_family_for_moment, composite_reflectivity_grid, dealias_velocity_grid,
-    dealias_velocity_grid_v4, detect_rotation_sites, echo_top_grid, gust_proxy_grid, hail_grids,
-    identify_storm_cells, marc_grid, mehs_grid, moment_cross_section_with_smoothing, poh_grid,
-    radial_divergence_grid, reflectivity_cross_section_with_smoothing, smooth_moment_grid,
-    storm_relative_velocity_mps, upsample_moment_grid,
-    velocity_cross_section_cached_with_smoothing, viewport_rgba_buffer_len,
+    dealias_velocity_grid_pyart_region, dealias_velocity_grid_v4, detect_rotation_sites,
+    echo_top_grid, gust_proxy_grid, hail_grids, identify_storm_cells, marc_grid, mehs_grid,
+    moment_cross_section_with_smoothing, poh_grid, radial_divergence_grid,
+    reflectivity_cross_section_with_smoothing, smooth_moment_grid, storm_relative_velocity_mps,
+    upsample_moment_grid, velocity_cross_section_cached_with_smoothing, viewport_rgba_buffer_len,
     viewport_sample_cache_storage_upper_bound, vil_density_grid, vil_grid,
 };
 use serde::Deserialize;
@@ -1857,13 +1857,13 @@ struct ViewerApp {
     tor_tracks: tor_tracks::TorTracksState,
     /// Reflectivity gate filter threshold (dBZ); None = off.
     gate_filter_dbz: Option<f32>,
-    /// Velocity dealias engine: false = same-cut region solver; true = the
-    /// model-anchored v4 whole-volume engine (all velocity tilts solved
-    /// jointly, previous-volume temporal prior, RAP wind anchor when
-    /// available). The field keeps its pre-v0.29 name — any state saved
-    /// while it selected the retired hybrid engine maps forward to v4,
-    /// which replaced it (dealias-v4 spec §16).
-    dealias_cascade: bool,
+    /// Velocity dealias engine (see [`DealiasEngine`]): `Region` (default,
+    /// fast same-tilt solver), `RegionGlobal` (Rust Py-ART region port,
+    /// same-tilt), or `Analyst3d` (model-anchored v4 whole-volume engine —
+    /// all velocity tilts solved jointly with a previous-volume temporal
+    /// prior and a RAP wind anchor when available). Only `Analyst3d` uses
+    /// the temporal/model inputs (dealias-v4 spec §16).
+    dealias_engine: DealiasEngine,
     /// RAP 0-h analysis wind profiles per (site, cycle) for the v4 engine's
     /// absolute-branch anchor (CONUS only; intl sites run without one).
     /// Background worker + session cache; pumped by `poll_dealias_env`.
@@ -4269,10 +4269,10 @@ struct RenderRequest {
     /// (cached) — binomial soften or bilinear upsample — and renders it
     /// through the unchanged fast path.
     smoothing: SmoothingMode,
-    /// Velocity dealias engine (false = region, true = the model-anchored
-    /// v4 whole-volume engine; the field keeps its historical name for
-    /// forward-compat with the retired hybrid engine's toggle).
-    dealias_cascade: bool,
+    /// Velocity dealias engine for this render (see [`DealiasEngine`]):
+    /// `Region`, `RegionGlobal`, or `Analyst3d`. Carried into the cache key
+    /// so switching engines re-renders.
+    dealias_engine: DealiasEngine,
     /// Gate filter threshold in deci-dBZ; i16::MIN = off.
     gate_filter_decidbz: i16,
     viewport_options: ViewportRasterOptions,
@@ -4351,7 +4351,7 @@ struct LoopRenderContextKey {
     storm_motion_key: (i16, i16),
     hail_levels_key: (i16, i16),
     smoothing: SmoothingMode,
-    dealias_cascade: bool,
+    dealias_engine: DealiasEngine,
     // `dealias_env_ptr` is deliberately absent, like the reference-volume
     // pointer: both are per-frame DATA identity (the full TextureKey keys
     // cached rasters by them); a landing RAP profile must not read as a
@@ -4369,7 +4369,7 @@ impl LoopRenderContextKey {
             storm_motion_key: key.storm_motion_key,
             hail_levels_key: key.hail_levels_key,
             smoothing: key.smoothing,
-            dealias_cascade: key.dealias_cascade,
+            dealias_engine: key.dealias_engine,
             gate_filter_decidbz: key.gate_filter_decidbz,
             viewport: key.viewport,
         }
@@ -4386,9 +4386,9 @@ struct DealiasedReadoutCache {
     reference_volume_ptr: usize,
     dealias_env_ptr: usize,
     cut_index: usize,
-    /// True when the grid came from the model-anchored v4 engine (the
-    /// field keeps its pre-v0.29 name).
-    hybrid: bool,
+    /// Which engine produced `grid`; switching engines invalidates this
+    /// readout cache so the cursor readout matches the rendered image.
+    dealias_engine: DealiasEngine,
     grid: Arc<MomentGrid>,
 }
 
@@ -4738,7 +4738,7 @@ struct RenderWorkerMomentCache {
     dealiased_velocity: bool,
     derived: Option<DerivedProduct>,
     smoothing: SmoothingMode,
-    dealias_cascade: bool,
+    dealias_engine: DealiasEngine,
     gate_filter_decidbz: i16,
     color_table_signature: u64,
     cache: ViewportMomentCache,
@@ -4963,7 +4963,7 @@ struct RenderWorkerViewportSignature {
     storm_motion_key: (i16, i16),
     hail_levels_key: (i16, i16),
     smoothing: SmoothingMode,
-    dealias_cascade: bool,
+    dealias_engine: DealiasEngine,
     gate_filter_decidbz: i16,
     viewport: ViewportKey,
 }
@@ -4982,7 +4982,7 @@ impl RenderWorkerViewportSignature {
         storm_motion_key: (i16, i16),
         hail_levels_key: (i16, i16),
         smoothing: SmoothingMode,
-        dealias_cascade: bool,
+        dealias_engine: DealiasEngine,
         gate_filter_decidbz: i16,
         viewport: ViewportKey,
     ) -> Self {
@@ -4998,7 +4998,7 @@ impl RenderWorkerViewportSignature {
             storm_motion_key,
             hail_levels_key,
             smoothing,
-            dealias_cascade,
+            dealias_engine,
             gate_filter_decidbz,
             viewport,
         }
@@ -5179,7 +5179,7 @@ fn spawn_render_worker_with_mode(
                 request.key.storm_motion_key,
                 request.key.hail_levels_key,
                 request.key.smoothing,
-                request.key.dealias_cascade,
+                request.key.dealias_engine,
                 request.key.gate_filter_decidbz,
                 request.key.viewport,
             );
@@ -6395,7 +6395,7 @@ impl ViewerApp {
             show_rotation_markers: true,
             tor_tracks: tor_tracks::TorTracksState::default(),
             gate_filter_dbz: None,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             dealias_env: dealias_env::DealiasEnvCache::default(),
             display_smoothing: SmoothingMode::Native,
             hail_freezing_level_km: 3.2,
@@ -11315,7 +11315,7 @@ impl ViewerApp {
     ) -> Option<RenderRequest> {
         let frame = self.primary.history.get(step.frame_index)?;
         let cut = self.primary_cut_for_loop_step(step)?;
-        let previous_volume = (self.dealias_cascade
+        let previous_volume = (self.dealias_engine == DealiasEngine::Analyst3d
             && self.product_render_uses_dealiased_velocity(&self.selected_product))
         .then(|| {
             previous_dealias_reference_volume(
@@ -11340,7 +11340,7 @@ impl ViewerApp {
         rect: egui::Rect,
     ) -> Option<RenderRequest> {
         let volume = self.volume.clone()?;
-        let previous_volume = (self.dealias_cascade
+        let previous_volume = (self.dealias_engine == DealiasEngine::Analyst3d
             && self.product_render_uses_dealiased_velocity(&self.selected_product))
         .then(|| {
             previous_dealias_reference_volume(
@@ -11382,15 +11382,17 @@ impl ViewerApp {
         let render_dealiased_velocity =
             self.product_render_uses_dealiased_velocity(&self.selected_product);
         let smoothing = self.smoothing_for_product(&self.selected_product);
-        let dealias_reference_volume_ptr = if self.dealias_cascade && render_dealiased_velocity {
-            previous_volume
-                .as_ref()
-                .map(|reference| Arc::as_ptr(reference) as usize)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let dealias_env = (self.dealias_cascade && render_dealiased_velocity)
+        let dealias_reference_volume_ptr =
+            if self.dealias_engine == DealiasEngine::Analyst3d && render_dealiased_velocity {
+                previous_volume
+                    .as_ref()
+                    .map(|reference| Arc::as_ptr(reference) as usize)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+        let dealias_env = (self.dealias_engine == DealiasEngine::Analyst3d
+            && render_dealiased_velocity)
             .then(|| self.dealias_env_profile_for_volume(volume.as_ref()))
             .flatten();
         let dealias_env_ptr = dealias_env
@@ -11408,7 +11410,7 @@ impl ViewerApp {
             storm_motion_key: self.storm_motion_key(),
             hail_levels_key: self.hail_levels_key(),
             smoothing,
-            dealias_cascade: self.dealias_cascade,
+            dealias_engine: self.dealias_engine,
             gate_filter_decidbz: self.gate_filter_key(),
             viewport: viewport_key,
         };
@@ -11426,7 +11428,7 @@ impl ViewerApp {
             storm_motion: self.current_storm_motion(),
             hail_levels_m: self.hail_levels_m(),
             smoothing,
-            dealias_cascade: self.dealias_cascade,
+            dealias_engine: self.dealias_engine,
             gate_filter_decidbz: self.gate_filter_key(),
             viewport_options,
             radar_range_km: self
@@ -11794,7 +11796,7 @@ impl ViewerApp {
             dealiased_velocity,
             derived,
             request.smoothing,
-            request.dealias_cascade,
+            request.dealias_engine,
             request.gate_filter_decidbz,
             color_table_signature,
         )
@@ -11817,12 +11819,13 @@ impl ViewerApp {
                 )
             } else if request.smoothing != SmoothingMode::Native
                 || gate_filter.is_some()
-                || (dealiased_velocity && request.dealias_cascade)
+                || (dealiased_velocity && request.dealias_engine != DealiasEngine::Region)
             {
-                // Preprocessed display (gate filter / smoothing / cascade
-                // dealias): build the grid ONCE (cached by this very moment
-                // cache) and render it through the existing fast path —
-                // pans stay full speed.
+                // Preprocessed display (gate filter / smoothing / a non-Region
+                // dealias engine — Analyst 3D or Region Global): build the grid
+                // ONCE (cached by this very moment cache) and render it through
+                // the existing fast path — pans stay full speed. (Native-smooth
+                // Region dealiasing takes the fast per-tilt path below.)
                 build_preprocessed_plain_cache(
                     request.volume.as_ref(),
                     request.previous_volume.as_deref(),
@@ -11831,7 +11834,7 @@ impl ViewerApp {
                     &base_moment,
                     request.product.color_family(),
                     dealiased_velocity,
-                    request.dealias_cascade,
+                    request.dealias_engine,
                     gate_filter,
                     request.smoothing,
                     &request.color_tables,
@@ -11865,7 +11868,7 @@ impl ViewerApp {
                     dealiased_velocity,
                     derived,
                     smoothing: request.smoothing,
-                    dealias_cascade: request.dealias_cascade,
+                    dealias_engine: request.dealias_engine,
                     gate_filter_decidbz: request.gate_filter_decidbz,
                     color_table_signature,
                     cache,
@@ -11889,7 +11892,7 @@ impl ViewerApp {
             request.key.storm_motion_key,
             request.key.hail_levels_key,
             request.key.smoothing,
-            request.key.dealias_cascade,
+            request.key.dealias_engine,
             request.key.gate_filter_decidbz,
             request.key.viewport,
         );
@@ -12108,7 +12111,7 @@ impl ViewerApp {
             request.key.storm_motion_key,
             request.key.hail_levels_key,
             request.key.smoothing,
-            request.key.dealias_cascade,
+            request.key.dealias_engine,
             request.key.gate_filter_decidbz,
             request.key.viewport,
         );
@@ -12134,7 +12137,7 @@ impl ViewerApp {
             request.render_dealiased_velocity,
             request.product.derived(),
             request.key.smoothing,
-            request.key.dealias_cascade,
+            request.key.dealias_engine,
             request.key.gate_filter_decidbz,
             viewport_signature.color_table_signature,
         ) else {
@@ -12204,7 +12207,7 @@ impl ViewerApp {
             velocity_render_dealiased,
             None,
             SmoothingMode::Native,
-            false,
+            DealiasEngine::Region,
             i16::MIN,
             velocity_color_table_signature,
         )
@@ -12239,7 +12242,7 @@ impl ViewerApp {
                     dealiased_velocity: velocity_render_dealiased,
                     derived: None,
                     smoothing: SmoothingMode::Native,
-                    dealias_cascade: false,
+                    dealias_engine: DealiasEngine::Region,
                     gate_filter_decidbz: i16::MIN,
                     color_table_signature: velocity_color_table_signature,
                     cache,
@@ -12272,7 +12275,7 @@ impl ViewerApp {
             velocity_render_dealiased,
             None,
             SmoothingMode::Native,
-            false,
+            DealiasEngine::Region,
             i16::MIN,
             velocity_color_table_signature,
         ) else {
@@ -12312,7 +12315,7 @@ impl ViewerApp {
         dealiased_velocity: bool,
         derived: Option<DerivedProduct>,
         smoothing: SmoothingMode,
-        dealias_cascade: bool,
+        dealias_engine: DealiasEngine,
         gate_filter_decidbz: i16,
         color_table_signature: u64,
     ) -> Option<usize> {
@@ -12325,7 +12328,7 @@ impl ViewerApp {
                 && cached.dealiased_velocity == dealiased_velocity
                 && cached.derived == derived
                 && cached.smoothing == smoothing
-                && cached.dealias_cascade == dealias_cascade
+                && cached.dealias_engine == dealias_engine
                 && cached.gate_filter_decidbz == gate_filter_decidbz
                 && cached.color_table_signature == color_table_signature
         })?;
@@ -12348,7 +12351,7 @@ impl ViewerApp {
                 || cached.dealiased_velocity != cache.dealiased_velocity
                 || cached.derived != cache.derived
                 || cached.smoothing != cache.smoothing
-                || cached.dealias_cascade != cache.dealias_cascade
+                || cached.dealias_engine != cache.dealias_engine
                 || cached.gate_filter_decidbz != cache.gate_filter_decidbz
         });
         moment_caches.push(cache);
@@ -13828,7 +13831,8 @@ impl ViewerApp {
         let color_table_signature = color_tables.signature_for_family(product.color_family());
         let render_dealiased_velocity = self.product_render_uses_dealiased_velocity(&product);
         let smoothing = self.smoothing_for_product(&product);
-        let previous_volume = (self.dealias_cascade && render_dealiased_velocity)
+        let previous_volume = (self.dealias_engine == DealiasEngine::Analyst3d
+            && render_dealiased_velocity)
             .then(|| {
                 self.extra_panes.get(pane_slot).and_then(|pane| {
                     if pane.owns_radar() {
@@ -13847,15 +13851,17 @@ impl ViewerApp {
                 })
             })
             .flatten();
-        let dealias_reference_volume_ptr = if self.dealias_cascade && render_dealiased_velocity {
-            previous_volume
-                .as_ref()
-                .map(|reference| Arc::as_ptr(reference) as usize)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let dealias_env = (self.dealias_cascade && render_dealiased_velocity)
+        let dealias_reference_volume_ptr =
+            if self.dealias_engine == DealiasEngine::Analyst3d && render_dealiased_velocity {
+                previous_volume
+                    .as_ref()
+                    .map(|reference| Arc::as_ptr(reference) as usize)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+        let dealias_env = (self.dealias_engine == DealiasEngine::Analyst3d
+            && render_dealiased_velocity)
             .then(|| self.dealias_env_profile_for_volume(volume.as_ref()))
             .flatten();
         let dealias_env_ptr = dealias_env
@@ -13873,7 +13879,7 @@ impl ViewerApp {
             storm_motion_key: self.storm_motion_key(),
             hail_levels_key: self.hail_levels_key(),
             smoothing,
-            dealias_cascade: self.dealias_cascade,
+            dealias_engine: self.dealias_engine,
             gate_filter_decidbz: self.gate_filter_key(),
             viewport: viewport_key,
         };
@@ -13925,7 +13931,7 @@ impl ViewerApp {
             storm_motion: self.current_storm_motion(),
             hail_levels_m: self.hail_levels_m(),
             smoothing,
-            dealias_cascade: self.dealias_cascade,
+            dealias_engine: self.dealias_engine,
             gate_filter_decidbz: self.gate_filter_key(),
             viewport_options,
             radar_range_km,
@@ -14171,7 +14177,7 @@ impl ViewerApp {
     /// the anchor until a profile lands (TextureKey.dealias_env_ptr flips,
     /// so affected rasters re-render exactly once).
     fn poll_dealias_env(&mut self, ctx: &egui::Context) {
-        if !self.dealias_cascade {
+        if self.dealias_engine != DealiasEngine::Analyst3d {
             return;
         }
         let now = Utc::now();
@@ -14244,7 +14250,7 @@ impl ViewerApp {
                     current,
                 )
             });
-        let reference_volume_ptr = if self.dealias_cascade {
+        let reference_volume_ptr = if self.dealias_engine == DealiasEngine::Analyst3d {
             previous_volume
                 .as_ref()
                 .map(|reference| Arc::as_ptr(reference) as usize)
@@ -14252,8 +14258,7 @@ impl ViewerApp {
         } else {
             0
         };
-        let dealias_env = self
-            .dealias_cascade
+        let dealias_env = (self.dealias_engine == DealiasEngine::Analyst3d)
             .then(|| self.dealias_env_profile_for_volume(volume))
             .flatten();
         let dealias_env_ptr = dealias_env
@@ -14265,29 +14270,29 @@ impl ViewerApp {
             && cache.reference_volume_ptr == reference_volume_ptr
             && cache.dealias_env_ptr == dealias_env_ptr
             && cache.cut_index == cut_index
-            && cache.hybrid == self.dealias_cascade
+            && cache.dealias_engine == self.dealias_engine
         {
             return Some(Arc::clone(&cache.grid));
         }
 
         let cut = volume.cuts.get(cut_index)?;
         let source_grid = cut.moments.get(&MomentType::Velocity)?;
-        let grid = Arc::new(if self.dealias_cascade {
-            dealias_velocity_grid_v4(
+        let grid = Arc::new(match self.dealias_engine {
+            DealiasEngine::Analyst3d => dealias_velocity_grid_v4(
                 volume,
                 cut_index,
                 previous_volume.as_deref(),
                 dealias_env.as_deref(),
-            )?
-        } else {
-            dealias_velocity_grid(cut, source_grid)
+            )?,
+            DealiasEngine::RegionGlobal => dealias_velocity_grid_pyart_region(cut, source_grid),
+            DealiasEngine::Region => dealias_velocity_grid(cut, source_grid),
         });
         self.dealiased_readout_cache = Some(DealiasedReadoutCache {
             volume_ptr,
             reference_volume_ptr,
             dealias_env_ptr,
             cut_index,
-            hybrid: self.dealias_cascade,
+            dealias_engine: self.dealias_engine,
             grid,
         });
         self.dealiased_readout_cache
@@ -16615,6 +16620,7 @@ impl eframe::App for ViewerApp {
                         self.selected_cut,
                         &moment,
                         &self.color_tables,
+                        self.dealias_engine,
                     )
                 });
         }
@@ -21911,23 +21917,37 @@ impl ViewerApp {
                 let mut engine_changed = false;
                 ui.add_enabled_ui(engine_applies, |ui| {
                     egui::ComboBox::from_id_salt("dealias_engine")
-                        .selected_text(if self.dealias_cascade {
-                            "Analyst 3D"
-                        } else {
-                            "Region"
+                        .selected_text(match self.dealias_engine {
+                            DealiasEngine::Region => "Region",
+                            DealiasEngine::RegionGlobal => "Region Global",
+                            DealiasEngine::Analyst3d => "Analyst 3D",
                         })
-                        .width(104.0)
+                        .width(128.0)
                         .show_ui(ui, |ui| {
                             engine_changed |= ui
-                                .selectable_value(&mut self.dealias_cascade, false, "Region")
+                                .selectable_value(
+                                    &mut self.dealias_engine,
+                                    DealiasEngine::Region,
+                                    "Region",
+                                )
                                 .on_hover_text(
                                     "Fast same-tilt region unfolding (the default). Good fallback, but an isolated connected group's absolute Nyquist branch can be ambiguous.",
                                 )
                                 .changed();
                             engine_changed |= ui
                                 .selectable_value(
-                                    &mut self.dealias_cascade,
-                                    true,
+                                    &mut self.dealias_engine,
+                                    DealiasEngine::RegionGlobal,
+                                    "Region Global",
+                                )
+                                .on_hover_text(
+                                    "Global fold optimization across the whole sweep: every connected velocity region is unfolded jointly by a weighted region-network merge. Same-tilt only (no model or temporal anchor). Slower than Region, but resolves ambiguous folds far more cleanly.",
+                                )
+                                .changed();
+                            engine_changed |= ui
+                                .selectable_value(
+                                    &mut self.dealias_engine,
+                                    DealiasEngine::Analyst3d,
                                     "Analyst 3D (model-anchored)",
                                 )
                                 .on_hover_text(
@@ -21960,7 +21980,7 @@ impl ViewerApp {
                     editing_product,
                     DisplayProduct::Moment(MomentType::Velocity)
                 ) && self.unfold_velocity_display);
-            if self.dealias_cascade && engine_applies {
+            if self.dealias_engine == DealiasEngine::Analyst3d && engine_applies {
                 let status = match self.volume.as_deref() {
                     Some(volume) => match self.dealias_env_profile_for_volume(volume) {
                         Some(profile) => format!(
@@ -40711,6 +40731,29 @@ struct CrossSectionReadout {
 /// Display smoothing mode (Settings ▸ Display ▸ Smoothing). Persisted as a
 /// string in `AppSettings::smooth_display_mode`; the legacy
 /// `smooth_display` bool maps to `Soften` so old configs keep their look.
+/// Which velocity-dealias engine the viewer runs. All three produce a
+/// dealiased VEL/DVEL/DSRV grid; they differ in method and cost:
+/// - `Region`: the fast same-tilt BowEcho region solver (the default).
+/// - `RegionGlobal`: a Rust port of Py-ART's `dealias_region_based`
+///   per-sweep core — same-tilt, no volume/model/temporal evidence.
+/// - `Analyst3d`: the model-anchored v4 engine (whole-volume branch
+///   optimization; uses the previous volume + a RAP wind profile).
+///
+/// Only `Analyst3d` consumes the previous volume and RAP env profile;
+/// `Region` and `RegionGlobal` are pure same-tilt engines. This enum is
+/// carried through every render/readout cache key so switching engines
+/// invalidates cached textures and readouts.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+enum DealiasEngine {
+    /// Fast same-tilt region unfolding — the app's default.
+    #[default]
+    Region,
+    /// Rust port of Py-ART `dealias_region_based` (same-tilt).
+    RegionGlobal,
+    /// Model-anchored whole-volume v4 engine.
+    Analyst3d,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum SmoothingMode {
     /// Raw gates, nearest-gate rendering — the app's identity.
@@ -40797,7 +40840,7 @@ struct TextureKey {
     storm_motion_key: (i16, i16),
     hail_levels_key: (i16, i16),
     smoothing: SmoothingMode,
-    dealias_cascade: bool,
+    dealias_engine: DealiasEngine,
     gate_filter_decidbz: i16,
     viewport: ViewportKey,
 }
@@ -40813,7 +40856,7 @@ fn texture_keys_match_data_and_style(left: &TextureKey, right: &TextureKey) -> b
         && left.storm_motion_key == right.storm_motion_key
         && left.hail_levels_key == right.hail_levels_key
         && left.smoothing == right.smoothing
-        && left.dealias_cascade == right.dealias_cascade
+        && left.dealias_engine == right.dealias_engine
         && left.gate_filter_decidbz == right.gate_filter_decidbz
 }
 
@@ -42635,7 +42678,7 @@ fn build_preprocessed_plain_cache(
     moment: &MomentType,
     family: ColorTableFamily,
     dealiased_velocity: bool,
-    dealias_cascade: bool,
+    dealias_engine: DealiasEngine,
     gate_filter_dbz: Option<f32>,
     smoothing: SmoothingMode,
     color_tables: &ColorTableSet,
@@ -42648,11 +42691,15 @@ fn build_preprocessed_plain_cache(
         .moments
         .get(moment)
         .ok_or_else(|| format!("moment {moment:?} missing"))?;
-    let mut source = if dealiased_velocity && dealias_cascade {
-        dealias_velocity_grid_v4(volume, cut_index, previous_volume, dealias_env)
-            .ok_or_else(|| "model-anchored 3-D dealias failed".to_owned())?
-    } else if dealiased_velocity {
-        dealias_velocity_grid(cut, grid)
+    let mut source = if dealiased_velocity {
+        match dealias_engine {
+            DealiasEngine::Analyst3d => {
+                dealias_velocity_grid_v4(volume, cut_index, previous_volume, dealias_env)
+                    .ok_or_else(|| "model-anchored 3-D dealias failed".to_owned())?
+            }
+            DealiasEngine::RegionGlobal => dealias_velocity_grid_pyart_region(cut, grid),
+            DealiasEngine::Region => dealias_velocity_grid(cut, grid),
+        }
     } else {
         grid.clone()
     };
@@ -52497,19 +52544,19 @@ mod tests {
         assert!(app.dealiased_readout_cache.is_some());
     }
 
-    /// Forward-compat pin for the v0.29.0 engine swap: the `dealias_cascade`
-    /// bool kept its name, and `true` now routes the readout (and renders)
-    /// through the model-anchored v4 engine — per-volume, previous-volume
-    /// prior optional, NO environmental profile required (the intl/no-env
-    /// path). The cache must key the v4 grid separately from region output.
+    /// Pin for the v0.29 three-engine `DealiasEngine`: `Analyst3d` routes the
+    /// readout (and renders) through the model-anchored v4 engine —
+    /// per-volume, previous-volume prior optional, NO environmental profile
+    /// required (the intl/no-env path). The cache must key the v4 grid
+    /// separately from region output, and flipping engines must invalidate it.
     #[test]
-    fn dealias_cascade_true_routes_readout_through_the_v4_engine() {
+    fn analyst3d_engine_routes_readout_through_the_v4_engine() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let volume = Arc::new(test_aliased_velocity_volume());
         app.volume = Some(Arc::clone(&volume));
         app.selected_cut = 0;
         app.selected_product = DisplayProduct::DealiasedVelocity;
-        app.dealias_cascade = true;
+        app.dealias_engine = DealiasEngine::Analyst3d;
 
         let grid = app
             .dealiased_velocity_readout_grid(volume.as_ref(), 0)
@@ -52519,20 +52566,54 @@ mod tests {
         assert_eq!(
             grid.as_ref(),
             &expected,
-            "cascade=true must serve the v4 engine's grid"
+            "Analyst3d must serve the v4 engine's grid"
         );
         let cache = app.dealiased_readout_cache.as_ref().expect("cache");
-        assert!(cache.hybrid, "cache records the engine choice");
+        assert_eq!(
+            cache.dealias_engine,
+            DealiasEngine::Analyst3d,
+            "cache records the engine choice"
+        );
         assert_eq!(cache.dealias_env_ptr, 0, "no profile fetched in tests");
 
         // Flipping back to Region must not serve the v4 grid from cache.
-        app.dealias_cascade = false;
+        app.dealias_engine = DealiasEngine::Region;
         let region_grid = app
             .dealiased_velocity_readout_grid(volume.as_ref(), 0)
             .expect("region readout grid");
         let cut = &volume.cuts[0];
         let source = cut.moments.get(&MomentType::Velocity).expect("velocity");
         assert_eq!(region_grid.as_ref(), &dealias_velocity_grid(cut, source));
+    }
+
+    /// Pin for the third engine: `RegionGlobal` routes the readout through the
+    /// region-global solver (`dealias_velocity_grid_pyart_region`, the Rust
+    /// Py-ART region port — a same-tilt engine with no previous volume and no
+    /// RAP profile), and the cache invalidates when switching off it.
+    #[test]
+    fn region_global_engine_routes_readout_through_the_region_solver() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let volume = Arc::new(test_aliased_velocity_volume());
+        app.volume = Some(Arc::clone(&volume));
+        app.selected_cut = 0;
+        app.selected_product = DisplayProduct::DealiasedVelocity;
+        app.dealias_engine = DealiasEngine::RegionGlobal;
+
+        let grid = app
+            .dealiased_velocity_readout_grid(volume.as_ref(), 0)
+            .expect("region-global readout grid");
+        let cut = &volume.cuts[0];
+        let source = cut.moments.get(&MomentType::Velocity).expect("velocity");
+        assert_eq!(
+            grid.as_ref(),
+            &dealias_velocity_grid_pyart_region(cut, source),
+            "RegionGlobal must serve the region-global solver's grid"
+        );
+        let cache = app.dealiased_readout_cache.as_ref().expect("cache");
+        assert_eq!(cache.dealias_engine, DealiasEngine::RegionGlobal);
+        // Same-tilt engine: no temporal/model anchor is fetched.
+        assert_eq!(cache.reference_volume_ptr, 0, "no previous-volume prior");
+        assert_eq!(cache.dealias_env_ptr, 0, "no RAP profile");
     }
 
     #[test]
@@ -52779,7 +52860,7 @@ mod tests {
                     storm_motion_key: (0, 0),
                     hail_levels_key: (32, 64),
                     smoothing: SmoothingMode::Native,
-                    dealias_cascade: false,
+                    dealias_engine: DealiasEngine::Region,
                     gate_filter_decidbz: i16::MIN,
                     viewport: test_viewport_key(320, 240),
                 },
@@ -52798,7 +52879,7 @@ mod tests {
                 },
                 hail_levels_m: (3200.0, 6400.0),
                 smoothing: SmoothingMode::Native,
-                dealias_cascade: false,
+                dealias_engine: DealiasEngine::Region,
                 gate_filter_decidbz: i16::MIN,
                 viewport_options,
                 radar_range_km: DEFAULT_RADAR_RANGE_KM,
@@ -53213,7 +53294,7 @@ mod tests {
                 storm_motion_key: (0, 0),
                 hail_levels_key: (32, 64),
                 smoothing: SmoothingMode::Native,
-                dealias_cascade: false,
+                dealias_engine: DealiasEngine::Region,
                 gate_filter_decidbz: i16::MIN,
                 viewport: viewport_key,
             },
@@ -53232,7 +53313,7 @@ mod tests {
             },
             hail_levels_m: (3200.0, 6400.0),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport_options,
             radar_range_km,
@@ -53497,7 +53578,7 @@ mod tests {
             (0, 0),
             (32, 64),
             SmoothingMode::Native,
-            false,
+            DealiasEngine::Region,
             i16::MIN,
             viewport,
         );
@@ -53513,7 +53594,7 @@ mod tests {
             (0, 0),
             (32, 64),
             SmoothingMode::Native,
-            false,
+            DealiasEngine::Region,
             i16::MIN,
             viewport,
         );
@@ -53563,7 +53644,7 @@ mod tests {
                 (0, 0),
                 (32, 64),
                 smoothing,
-                false,
+                DealiasEngine::Region,
                 i16::MIN,
                 ViewportKey {
                     width: 800,
@@ -53650,7 +53731,7 @@ mod tests {
                 &MomentType::Reflectivity,
                 ColorTableFamily::Reflectivity,
                 false,
-                false,
+                DealiasEngine::Region,
                 None,
                 smoothing,
                 &color_tables,
@@ -53885,7 +53966,7 @@ mod tests {
                 storm_motion_key: (450, 350),
                 hail_levels_key: (32, 64),
                 smoothing: SmoothingMode::Native,
-                dealias_cascade: false,
+                dealias_engine: DealiasEngine::Region,
                 gate_filter_decidbz: i16::MIN,
                 viewport: test_viewport_key(1320, 820),
             },
@@ -53900,7 +53981,7 @@ mod tests {
             color_tables,
             hail_levels_m: (3200.0, 6400.0),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             storm_motion: StormMotion {
                 direction_deg: 45.0,
@@ -54924,7 +55005,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         };
@@ -55578,7 +55659,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         };
@@ -55672,7 +55753,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         };
@@ -57798,7 +57879,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         };
@@ -58127,7 +58208,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         };
@@ -58202,7 +58283,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         };
@@ -58253,7 +58334,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         });
@@ -58283,7 +58364,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         });
@@ -58304,7 +58385,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         });
@@ -58335,7 +58416,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         });
@@ -58369,7 +58450,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         });
@@ -58391,7 +58472,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         });
@@ -58421,7 +58502,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         });
@@ -58446,7 +58527,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         });
@@ -58975,7 +59056,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         });
@@ -60123,7 +60204,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(100, 100),
         });
@@ -66916,7 +66997,7 @@ mod tests {
             show_rotation_markers: true,
             tor_tracks: tor_tracks::TorTracksState::default(),
             gate_filter_dbz: None,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             dealias_env: dealias_env::DealiasEnvCache::default(),
             display_smoothing: SmoothingMode::Native,
             hail_freezing_level_km: 3.2,
@@ -67298,7 +67379,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         };
@@ -69393,7 +69474,7 @@ mod tests {
             (0, 0),
             (32, 64),
             SmoothingMode::Native,
-            false,
+            DealiasEngine::Region,
             i16::MIN,
             test_viewport_key(width, 100),
         )
@@ -69427,7 +69508,7 @@ mod tests {
             storm_motion_key: (0, 0),
             hail_levels_key: (32, 64),
             smoothing: SmoothingMode::Native,
-            dealias_cascade: false,
+            dealias_engine: DealiasEngine::Region,
             gate_filter_decidbz: i16::MIN,
             viewport: test_viewport_key(720, 480),
         }
@@ -69585,7 +69666,7 @@ mod tests {
                 (0, 0),
                 (32, 64),
                 SmoothingMode::Native,
-                false,
+                DealiasEngine::Region,
                 i16::MIN,
                 test_viewport_key(width, height),
             ),

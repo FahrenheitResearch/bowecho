@@ -9,6 +9,7 @@ use std::path::Path;
 
 pub use color_tables::{ColorSampler, ColorTable, ColorTableFamily, ColorTableSet};
 mod cells;
+mod dealias_pyart;
 mod dealias_v4;
 mod detect;
 mod gate_filter;
@@ -22,6 +23,7 @@ pub mod tracks;
 mod volumetric;
 pub mod wind;
 pub use cells::{StormCell, identify_storm_cells};
+pub use dealias_pyart::dealias_velocity_grid_pyart_region;
 pub use dealias_v4::{
     ConfidenceGrid, EnvWindLevel, EnvironmentalWindProfile, TemporalPrior, V4Diagnostics,
     V4VolumeSolution, dealias_velocity_grid_v4, dealias_volume_v4, project_environmental_winds,

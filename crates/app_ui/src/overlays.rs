@@ -38,10 +38,10 @@ use ui_core::render_service::{
 use crate::sites_ui::{NearestOverlayTarget, nearest_overlay_dispatch};
 use crate::{
     ACTIVE_LOAD_POLL_MS, ArchiveHistoryLoadContext, ArchiveWindow, AsyncLoadResult,
-    AsyncLoadUpdate, AsyncRenderResult, DEFAULT_RADAR_RANGE_KM, DecodedLoad, DecodedLoadBatch,
-    DisplayProduct, EngineId, EngineRole, FeedSource, FrameHistoryEntry, FrameStatus,
-    InstallSelection, IntlFrameResult, LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG, LatestLoadMode,
-    Liveness, LoadTimings, LoopEngine, LowSweepCutKey, MAX_HISTORY_FRAME_LIMIT,
+    AsyncLoadUpdate, AsyncRenderResult, DEFAULT_RADAR_RANGE_KM, DealiasEngine, DecodedLoad,
+    DecodedLoadBatch, DisplayProduct, EngineId, EngineRole, FeedSource, FrameHistoryEntry,
+    FrameStatus, InstallSelection, IntlFrameResult, LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG,
+    LatestLoadMode, Liveness, LoadTimings, LoopEngine, LowSweepCutKey, MAX_HISTORY_FRAME_LIMIT,
     MAX_RADAR_OVERLAY_LAYERS, RENDER_RESULT_POLL_MS, RenderRecycleBuffer, RenderRequest,
     RenderWorkerCacheMode, RenderWorkerCachePolicy, RenderWorkerGeometryCache,
     RenderWorkerMomentCache, RenderWorkerSampleCache, RenderWorkerViewportSignature,
@@ -267,7 +267,7 @@ pub(crate) fn overlay_pool_render_job(
             request.key.storm_motion_key,
             request.key.hail_levels_key,
             request.key.smoothing,
-            request.key.dealias_cascade,
+            request.key.dealias_engine,
             request.key.gate_filter_decidbz,
             request.key.viewport,
         );
@@ -1445,7 +1445,8 @@ impl ViewerApp {
             // builders; overlay sites without a fetched profile (the usual
             // case — fetches follow the DISPLAYED site) run v4's no-env path,
             // exactly like the always-None previous_volume below.
-            let dealias_env = (self.dealias_cascade && render_dealiased_velocity)
+            let dealias_env = (self.dealias_engine == DealiasEngine::Analyst3d
+                && render_dealiased_velocity)
                 .then(|| self.dealias_env_profile_for_volume(volume.as_ref()))
                 .flatten();
             let dealias_env_ptr = dealias_env
@@ -1463,7 +1464,7 @@ impl ViewerApp {
                 storm_motion_key: self.storm_motion_key(),
                 hail_levels_key: self.hail_levels_key(),
                 smoothing,
-                dealias_cascade: self.dealias_cascade,
+                dealias_engine: self.dealias_engine,
                 gate_filter_decidbz: self.gate_filter_key(),
                 viewport: viewport_key,
             };
@@ -1512,7 +1513,7 @@ impl ViewerApp {
                     storm_motion: self.current_storm_motion(),
                     hail_levels_m: self.hail_levels_m(),
                     smoothing,
-                    dealias_cascade: self.dealias_cascade,
+                    dealias_engine: self.dealias_engine,
                     gate_filter_decidbz: self.gate_filter_key(),
                     viewport_options,
                     radar_range_km,

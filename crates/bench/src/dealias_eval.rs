@@ -37,7 +37,8 @@ use chrono::{DateTime, Utc};
 use radar_core::{ElevationCut, MomentGrid, MomentStorage, MomentType, RadarVolume};
 use render2d::{
     EnvWindLevel, EnvironmentalWindProfile, TemporalPrior, dealias_velocity_grid,
-    dealias_volume_v4, fit_range_band_reference, project_environmental_winds,
+    dealias_velocity_grid_pyart_region, dealias_volume_v4, fit_range_band_reference,
+    project_environmental_winds,
 };
 
 pub const DEALIAS_USAGE: &str = "usage: bowecho-bench --dealias --target <vol> [options]
@@ -45,7 +46,7 @@ pub const DEALIAS_USAGE: &str = "usage: bowecho-bench --dealias --target <vol> [
   --target <file>        Level-II target volume (required)
   --prior <file>         previous volume for the temporal prior
   --env <file.json>      EnvironmentalWindProfile fixture
-  --engines a,b,c        subset of region,v4,v4-noenv
+  --engines a,b,c        subset of region,region-pyart,v4,v4-noenv
   --probe az,km[,label]  5x5-gate mean spot check (repeatable)
   --rewrap <N>           synthetic low-Nyquist Case E at Nyquist N m/s
   --iters <K>            timing iterations per engine (default 3, best-of)
@@ -65,6 +66,7 @@ const DEFAULT_ITERS: usize = 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
     Region,
+    RegionPyart,
     V4,
     V4NoEnv,
 }
@@ -73,6 +75,7 @@ impl Engine {
     fn name(self) -> &'static str {
         match self {
             Engine::Region => "region",
+            Engine::RegionPyart => "region-pyart",
             Engine::V4 => "v4",
             Engine::V4NoEnv => "v4-noenv",
         }
@@ -81,6 +84,7 @@ impl Engine {
     fn parse(name: &str) -> Result<Self, String> {
         match name {
             "region" => Ok(Engine::Region),
+            "region-pyart" | "pyart-rs" | "pyart-region-rs" => Ok(Engine::RegionPyart),
             "v4" => Ok(Engine::V4),
             "v4-noenv" => Ok(Engine::V4NoEnv),
             "cascade" | "hybrid" => Err(format!(
@@ -824,6 +828,36 @@ fn run_engine(
                 let grid = cut.moments.get(&MomentType::Velocity).expect("velocity");
                 let started = Instant::now();
                 let output = Some(dealias_velocity_grid(cut, grid));
+                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                volume_ms += elapsed;
+                let superres = grid.radial_count() >= 600;
+                // Prefer the worst SUPER-RES tilt; fall back to any tilt.
+                if (superres && (!worst_is_superres || elapsed > worst_tilt_ms))
+                    || (!worst_is_superres && elapsed > worst_tilt_ms)
+                {
+                    worst_tilt_ms = elapsed;
+                    worst_is_superres = superres;
+                }
+                grids.push(output);
+            }
+            EngineRun {
+                grids,
+                volume_ms,
+                worst_tilt_ms,
+                amortized: false,
+                diagnostics: None,
+            }
+        }
+        Engine::RegionPyart => {
+            let mut grids = Vec::with_capacity(cuts.len());
+            let mut volume_ms = 0.0;
+            let mut worst_tilt_ms = 0.0f64;
+            let mut worst_is_superres = false;
+            for &cut_index in &cuts {
+                let cut = &volume.cuts[cut_index];
+                let grid = cut.moments.get(&MomentType::Velocity).expect("velocity");
+                let started = Instant::now();
+                let output = Some(dealias_velocity_grid_pyart_region(cut, grid));
                 let elapsed = started.elapsed().as_secs_f64() * 1000.0;
                 volume_ms += elapsed;
                 let superres = grid.radial_count() >= 600;
