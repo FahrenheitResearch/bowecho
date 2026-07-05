@@ -112,6 +112,9 @@ impl ModelDataDock {
                 StoreResponse::Sounding(_, Err(message)) => {
                     self.sounding.set_error(message);
                 }
+                // v0.2.3: style-override application acknowledgement — BowEcho
+                // does not yet drive the editable color-table UI (follow-up).
+                StoreResponse::StyleOverridesApplied => {}
             }
         }
     }
@@ -411,6 +414,11 @@ impl ModelDataDock {
                             .send(StoreRequest::LoadSounding { hour, fx, fy });
                     }
                 }
+                // v0.2.3: custom-domain plot events (arbitrary field domains /
+                // rotation) — not yet wired into BowEcho's map (follow-up for
+                // the arbitrary-plot work).
+                Some(FieldViewerEvent::DomainSelected(_))
+                | Some(FieldViewerEvent::DomainRotationChanged { .. }) => {}
                 None => {}
             }
         });
