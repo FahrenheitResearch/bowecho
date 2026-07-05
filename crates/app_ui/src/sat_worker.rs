@@ -1857,6 +1857,86 @@ mod tests {
         image.save(&out).expect("proof png writes");
     }
 
+    /// Deterministic synthetic hurricane IR brightness-temperature field
+    /// (Kelvin): warm ocean, a warm eye, a very cold eyewall with embedded
+    /// overshoots, a cold CDO, and log-spiral rainbands. Lets the enhanced-IR
+    /// color table be verified/benched offline without live satellite data.
+    fn synthetic_hurricane_bt(nx: usize, ny: usize) -> Vec<f32> {
+        let (cx, cy) = (nx as f32 / 2.0, ny as f32 / 2.0);
+        let mut values = vec![f32::NAN; nx * ny];
+        for y in 0..ny {
+            for x in 0..nx {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                let r = (dx * dx + dy * dy).sqrt();
+                let theta = dy.atan2(dx);
+                let mut bt = if r < 16.0 {
+                    278.0 - (16.0 - r) * 0.3 // warm subsident eye
+                } else if r < 44.0 {
+                    198.0 // deep-convective eyewall
+                } else if r < 130.0 {
+                    212.0 + (r - 44.0) * 0.14 // central dense overcast, warming out
+                } else if r < 215.0 {
+                    236.0 + (r - 130.0) * 0.22
+                } else {
+                    (256.0 + (r - 215.0) * 0.4).min(292.0) // ambient ocean
+                };
+                // Log-spiral rainbands, strongest in the mid annulus.
+                if r > 55.0 && r < 245.0 {
+                    let phase = 2.0 * theta - 3.4 * (r * 0.01 + 1.0).ln();
+                    let band = phase.sin().max(0.0);
+                    bt -= band * 24.0 * ((245.0 - r) / 190.0).clamp(0.0, 1.0);
+                }
+                // Cold overshoot cells embedded in the eyewall.
+                if (20.0..44.0).contains(&r)
+                    && (x as f32 * 0.55).sin() * (y as f32 * 0.5).cos() > 0.8
+                {
+                    bt -= 14.0;
+                }
+                // Fine texture (deterministic).
+                bt += (((x * 131 + y * 197) % 101) as f32 - 50.0) * 0.06;
+                values[y * nx + x] = bt.clamp(178.0, 300.0);
+            }
+        }
+        values
+    }
+
+    #[test]
+    fn synth_hurricane_ir_proof() {
+        let Some(out) = std::env::var_os("BOWECHO_SAT_SYNTH_PNG") else {
+            return;
+        };
+        let (nx, ny) = (512usize, 512usize);
+        let bt = synthetic_hurricane_bt(nx, ny);
+
+        let started = std::time::Instant::now();
+        let pixels = render_sat_pixels(13, &bt, nx, ny, false, false);
+        let render_ms = started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("enhanced-IR render of {nx}x{ny} took {render_ms:.2} ms");
+
+        // Compose the hurricane above a 173..320 K color-bar strip.
+        let bar_h = 28usize;
+        let out_h = ny + bar_h;
+        let mut rgba = vec![0u8; nx * out_h * 4];
+        for (i, pixel) in pixels.iter().enumerate() {
+            rgba[i * 4..i * 4 + 4].copy_from_slice(&[pixel.r(), pixel.g(), pixel.b(), 255]);
+        }
+        for row in 0..bar_h {
+            for x in 0..nx {
+                let k = 320.0 - (x as f32 / nx as f32) * (320.0 - 173.0);
+                let [r, g, b, _] = rw_sat::palette::anchor_color(k, ENHANCED_IR);
+                let idx = ((ny + row) * nx + x) * 4;
+                rgba[idx..idx + 4].copy_from_slice(&[r, g, b, 255]);
+            }
+        }
+        let img =
+            image::RgbaImage::from_raw(nx as u32, out_h as u32, rgba).expect("proof image dims");
+        if let Some(parent) = PathBuf::from(&out).parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        img.save(&out).expect("synth proof png writes");
+    }
+
     #[test]
     fn ir_map_overlay_alpha_fades_warm_by_temperature() {
         // Kelvin: warm surface, mid cloud, cold storm top.
