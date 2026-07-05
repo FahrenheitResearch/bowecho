@@ -184,8 +184,21 @@ fn fit_ring(
     }
     // Solve the 2x2 normal equations for (VT, VR).
     let det = saa * scc - sac * sac;
-    if det.abs() < 1e-6 {
-        return None; // degenerate (e.g. radar effectively at infinity)
+    // Conditioning / observability gates (Lee et al. 1999): the VT basis
+    // vector a(β) vanishes as a ring approaches the radar, so near-radar or
+    // narrow-arc rings make the VT column collapse and VT explode (dividing by
+    // a near-zero det). `mean_a2` is the tangential observability; `rho` is the
+    // 2x2 normal-matrix conditioning in [0,1] (~1 for a full orthogonal ring,
+    // →0 near the radar or on a partial arc). This replaces the old, far too
+    // loose `det.abs() < 1e-6` and kills the ~3500 kt off-eye artifact.
+    let mean_a2 = saa / samples as f64;
+    let rho = if saa > 0.0 && scc > 0.0 {
+        det / (saa * scc)
+    } else {
+        0.0
+    };
+    if mean_a2 < MIN_TANGENTIAL_OBSERVABILITY || rho < MIN_RING_CONDITION {
+        return None;
     }
     let vt = (sad * scc - scd * sac) / det;
     let vr = (saa * scd - sac * sad) / det;
@@ -209,10 +222,36 @@ fn fit_ring(
 /// circumference. On real data a 6 km, 17-sample inner ring produced a bogus
 /// 93 m/s peak; this rejects that class of artifact.
 const MIN_CORE_RADIUS_KM: f32 = 10.0;
-const MIN_CORE_SAMPLES: usize = 30;
+/// ~0.6 azimuthal coverage of the 72-sample ring: a partially-sampled far-range
+/// ring loses basis orthogonality and inflates VT, so reject it.
+const MIN_CORE_SAMPLES: usize = 43;
+/// Tangential observability and normal-matrix conditioning floors for a ring
+/// fit (see `fit_ring`). Tuned on real PGUA volumes, not synthetic-only.
+const MIN_TANGENTIAL_OBSERVABILITY: f64 = 0.08;
+const MIN_RING_CONDITION: f64 = 0.20;
+/// Physical + quality gates so a bad-center or far-range-folded ring cannot be
+/// reported as a real RMW. VT_MAX ≈ 204 kt sits above any observed tangential
+/// wind but well below the absurd near-radar blow-up; the RMS gates reject
+/// rings the wavenumber-0 model barely explains (Lee et al. 1999).
+const VT_MAX_PHYSICAL_MPS: f32 = 105.0;
+/// Loose absolute RMS cap — only to reject truly garbage rings. On real data
+/// the wavenumber-0 model leaves a substantial residual (the environmental
+/// wind is not yet removed), so the eyewall itself can sit near ~20 m/s RMS;
+/// the physical work is done by the `rms <= MAX_RMS_TO_VT * vt` ratio gate.
+const MAX_CORE_RMS_MPS: f32 = 35.0;
+const MAX_RMS_TO_VT: f32 = 0.5;
+/// A single radar cannot GBVTD a storm sitting on top of it, and the analysis
+/// ring must stay well inside the radar→center distance (Lee et al. 1999).
+const MIN_CENTER_RANGE_KM: f32 = 25.0;
+const MAX_RADIUS_FRACTION: f32 = 0.7;
 
 fn ring_is_core_candidate(ring: &RingFit) -> bool {
-    ring.radius_km >= MIN_CORE_RADIUS_KM && ring.samples >= MIN_CORE_SAMPLES && ring.vt > 0.0
+    ring.radius_km >= MIN_CORE_RADIUS_KM
+        && ring.samples >= MIN_CORE_SAMPLES
+        && ring.vt > 0.0
+        && ring.vt <= VT_MAX_PHYSICAL_MPS
+        && ring.rms <= MAX_CORE_RMS_MPS
+        && ring.rms <= MAX_RMS_TO_VT * ring.vt
 }
 
 /// Retrieve the axisymmetric circulation about a KNOWN center, over the given
@@ -228,9 +267,11 @@ pub fn retrieve_axisymmetric(
         .iter()
         .filter_map(|&r| fit_ring(&sampler, center_km, r, n_azimuths))
         .collect();
+    let r_center = (center_km.0 * center_km.0 + center_km.1 * center_km.1).sqrt();
+    let max_radius = MAX_RADIUS_FRACTION * r_center;
     let (rmw_km, vt_max) = rings
         .iter()
-        .filter(|ring| ring_is_core_candidate(ring))
+        .filter(|ring| ring_is_core_candidate(ring) && ring.radius_km <= max_radius)
         .max_by(|a, b| a.vt.total_cmp(&b.vt))
         .map(|best| (Some(best.radius_km), Some(best.vt)))
         .unwrap_or((None, None));
@@ -261,9 +302,20 @@ pub fn find_center_and_retrieve(
     for iy in -steps..=steps {
         for ix in -steps..=steps {
             let center = (guess_km.0 + ix as f32 * step, guess_km.1 + iy as f32 * step);
+            // A single radar cannot GBVTD a storm sitting on top of it, and the
+            // analysis rings must stay well inside the radar→center distance.
+            let r_center = (center.0 * center.0 + center.1 * center.1).sqrt();
+            if r_center < MIN_CENTER_RANGE_KM {
+                continue;
+            }
+            let max_radius = MAX_RADIUS_FRACTION * r_center;
+            let eligible = radii_km.iter().filter(|&&r| r <= max_radius).count();
             let mut score = f32::NEG_INFINITY;
-            let mut rings = Vec::with_capacity(radii_km.len());
+            let mut rings = Vec::with_capacity(eligible);
             for &r in radii_km {
+                if r > max_radius {
+                    continue;
+                }
                 if let Some(fit) = fit_ring(&sampler, center, r, 72) {
                     if ring_is_core_candidate(&fit) {
                         score = score.max(fit.vt);
@@ -273,7 +325,7 @@ pub fn find_center_and_retrieve(
             }
             // Require both adequate coverage and a plausible, well-sampled core
             // ring; otherwise this center is not a real circulation.
-            if rings.len() < radii_km.len() / 2 || score <= 0.0 {
+            if eligible < 3 || rings.len() < eligible / 2 || score <= 0.0 {
                 continue;
             }
             if score > best_score {

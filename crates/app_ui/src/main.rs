@@ -16510,10 +16510,15 @@ impl eframe::App for ViewerApp {
             }
         }
         if self.gbvtd.panel_open {
+            // Local `open` so the title-bar [✕] can close the panel without a
+            // double borrow of `self` (the body closure also borrows self).
+            let mut open = true;
             egui::Window::new("🌀 TC Winds (GBVTD)")
                 .default_width(320.0)
                 .default_pos(egui::pos2(60.0, 110.0))
+                .open(&mut open)
                 .show(&ctx, |ui| self.gbvtd_panel_ui(ui));
+            self.gbvtd.panel_open = open;
         }
         self.poll_event_day(&ctx);
         self.poll_mping(&ctx);
