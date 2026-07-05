@@ -15183,54 +15183,34 @@ impl ViewerApp {
                 0,
                 count,
             );
-            let mut decoded_frames = Vec::with_capacity(count);
-            for (index, object) in objects.into_iter().enumerate() {
-                let object_name = object
-                    .key
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(&object.key)
-                    .to_owned();
-                send_archive_progress(
-                    &sender,
-                    &progress.label,
-                    format!("Fetching {site_id} {object_name}"),
-                    index,
-                    count,
-                );
-                match decode_archive_history_object(
-                    &site_id,
-                    object,
-                    &site_cache,
-                    &known_frame_paths,
-                    None,
+            // Decode the loop's frames in parallel (bounded by
+            // `history_archive_load_parallelism`, itself capped at the
+            // machine's worker threads) instead of one scan at a time. The
+            // shared helper streams each decoded frame back via
+            // `AsyncLoadUpdate::History` as it finishes and drives the
+            // N/total progress bar, so a 256-frame loop paints and reports
+            // live rather than sitting blank until every scan is decoded.
+            let decode_objects = objects.into_iter().enumerate().collect::<Vec<_>>();
+            let (mut decoded_frames, first_error) = load_archive_history_objects_parallel(
+                ArchiveHistoryLoadContext {
+                    site_id: &site_id,
+                    progress_label: &progress.label,
+                    site_cache_dir: &site_cache,
+                    known_frame_paths: &known_frame_paths,
+                    archive_lookup_ms: None,
                     total_start,
-                    &sender,
-                    false,
-                    true,
-                ) {
-                    Ok(Some(decoded)) => decoded_frames.push(decoded),
-                    Ok(None) => {}
-                    Err(err) => {
-                        let _ = sender.send(AsyncLoadResult {
-                            label: format!("L2 {site_id} archive"),
-                            update: AsyncLoadUpdate::Final(Err(err)),
-                        });
-                        return;
-                    }
-                }
-                send_archive_progress(
-                    &sender,
-                    &progress.label,
-                    format!("Decoded {site_id} {object_name}"),
-                    index + 1,
-                    count,
-                );
-            }
+                    sender: &sender,
+                    progress_done_start: 0,
+                    progress_total: count,
+                },
+                decode_objects,
+            );
             if decoded_frames.is_empty() {
                 let _ = sender.send(AsyncLoadResult {
                     label: format!("L2 {site_id} archive"),
-                    update: AsyncLoadUpdate::Final(Err("no archive volumes decoded".to_owned())),
+                    update: AsyncLoadUpdate::Final(Err(
+                        first_error.unwrap_or_else(|| "no archive volumes decoded".to_owned()),
+                    )),
                 });
             } else {
                 decoded_frames.sort_by(|left, right| {
