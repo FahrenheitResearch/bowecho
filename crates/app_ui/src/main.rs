@@ -7783,7 +7783,22 @@ impl ViewerApp {
             .manual_primary_cut_hold
             .as_ref()
             .map(|hold| hold.identity.clone());
-        let policy = if select_loaded_frame {
+        // Background live auto-refresh must NOT yank the display while a
+        // history loop is playing. The newest realtime volume is often a
+        // reflectivity-only Stale/live partial (typhoon-latency archive
+        // fallback); selecting it here would flip `selected_product` to
+        // reflectivity for a frame — the BAVI-26 field trace
+        // `FLIP vel->refl @install_volume_arc status=Stale playing=true
+        // pending=Some(Velocity) cut=0`. Upsert it into history via
+        // `Backfill` instead: the playing loop reaches the new frame on its
+        // own step, where `pending_product_restore` restores velocity. This
+        // is the batch-route twin of `install_polled_volume`'s explicit
+        // playing guard (the polled/international route). Live follow-newest
+        // when NOT playing is unchanged (still selects the newest frame), so
+        // the non-looping live view keeps up with the feed.
+        let auto_refresh_while_playing =
+            self.primary_load_is_auto_refresh && self.primary.cursor.playing;
+        let policy = if select_loaded_frame && !auto_refresh_while_playing {
             // Census D5b: the blank-display browsing escape is
             // Primary-role-only.
             SelectionPolicy::SelectAnchor {
@@ -59926,6 +59941,85 @@ mod tests {
                 .identity
                 .scan_time_utc,
             scan_time
+        );
+    }
+
+    /// Regression (BAVI-26 live report, trace
+    /// `FLIP vel->refl @install_volume_arc status=Stale playing=true
+    /// pending=Some(Velocity) cut=0`): while a velocity history loop is
+    /// PLAYING, the US live auto-refresh installs the newest realtime volume
+    /// — often a reflectivity-only Stale partial. That install must UPSERT
+    /// the frame into history but must NEVER pull the display onto it: the
+    /// displayed volume and `selected_product` stay put (velocity), and the
+    /// playing loop reaches the new frame on its own step. This pins the
+    /// same "don't clobber the display while playing" guard the polled route
+    /// already has (`polled_volume_same_site_upserts_and_playing_loop_keeps_
+    /// its_cursor`) onto the US catalog auto-refresh batch route.
+    #[test]
+    fn auto_refresh_install_does_not_flip_velocity_while_playing() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let t0 = Utc.with_ymd_and_hms(2026, 6, 9, 5, 40, 0).unwrap();
+
+        // Two velocity-capable frames form the playing loop.
+        let mut first = test_ref_then_velocity_volume();
+        first.volume_time = t0;
+        let mut second = test_ref_then_velocity_volume();
+        second.volume_time = t0 + chrono::Duration::minutes(4);
+        upsert_primary_history_frame(
+            &mut app,
+            test_decoded_from_volume(PathBuf::from("TEST-0540"), first, FrameStatus::Complete),
+        );
+        upsert_primary_history_frame(
+            &mut app,
+            test_decoded_from_volume(PathBuf::from("TEST-0544"), second, FrameStatus::Complete),
+        );
+
+        // Display the OLDER frame with velocity selected, loop playing.
+        app.primary.cursor.index = 0;
+        let cursor_volume = Arc::clone(&app.primary.history[0].volume);
+        app.volume = Some(Arc::clone(&cursor_volume));
+        app.selected_cut = 1;
+        app.selected_product = DisplayProduct::Moment(MomentType::Velocity);
+        app.primary.cursor.playing = true;
+        // The load in flight is the background live auto-refresh tick.
+        app.primary_load_is_auto_refresh = true;
+
+        // Auto-refresh delivers a reflectivity-only Stale newest frame.
+        let mut newest = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        newest.volume_time = t0 + chrono::Duration::minutes(8);
+        app.install_decoded_load_batch(
+            DecodedLoadBatch {
+                frames: vec![test_decoded_from_volume(
+                    PathBuf::from("TEST-0548"),
+                    newest,
+                    FrameStatus::Stale,
+                )],
+                selected_index: 0,
+            },
+            true,
+            true,
+            &ctx,
+        );
+
+        // The newest frame is in history, but the display never moved.
+        assert_eq!(app.primary.history.len(), 3, "newest frame upserted");
+        assert!(app.primary.cursor.playing, "loop keeps playing");
+        assert_eq!(app.primary.cursor.index, 0, "cursor holds on its frame");
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Velocity),
+            "auto-refresh install must NOT flip the display to reflectivity"
+        );
+        assert!(
+            app.pending_product_restore.is_none(),
+            "no fallback was forced: the display never touched the refl-only frame"
+        );
+        assert!(
+            app.volume
+                .as_ref()
+                .is_some_and(|volume| Arc::ptr_eq(volume, &cursor_volume)),
+            "displayed volume stays on the cursor frame, not the newest partial"
         );
     }
 
