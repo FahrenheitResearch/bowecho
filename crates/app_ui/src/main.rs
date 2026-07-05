@@ -1256,6 +1256,141 @@ fn preview_render_head_start(threads: usize) -> Duration {
     }
 }
 
+/// Total decoded-volume cache budget: a cap on the ESTIMATED resident bytes
+/// (`ui_core::loop_engine::estimated_volume_bytes`, the same metric the
+/// radar-history budget trims against) held across the LRU. A Cat-5 super-res
+/// PGUA volume decodes to ~60-100 MB, so ~2 GiB holds a comfortable working
+/// set (~20-30 volumes) and LRU-evicts the oldest. This is IN ADDITION to the
+/// display history, but the two share `Arc`s for co-resident frames, so the
+/// only extra cost is volumes that have been trimmed out of the display yet
+/// are still cached for a fast re-load.
+const DECODED_VOLUME_CACHE_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// Count of ACTUAL bzip2+parse decodes performed by
+/// [`decode_load_path_with_optional_preview`] (cache MISSES only). A cache hit
+/// does not bump it. Read by tests to prove a second pass over the same loop
+/// re-decodes nothing.
+static DECODED_VOLUME_DECODE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn note_volume_decoded() {
+    DECODED_VOLUME_DECODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn decoded_volume_decode_count() -> u64 {
+    DECODED_VOLUME_DECODE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+struct CachedVolumeEntry {
+    volume: Arc<RadarVolume>,
+    bytes: usize,
+    last_used: u64,
+}
+
+/// Persistent, bounded (LRU) cache of decoded NEXRAD Level 2 volumes keyed by
+/// canonicalized on-disk path. The loop/archive load path consults it BEFORE
+/// re-reading + bzip2-decoding a file, so re-loading the same loop (e.g. the
+/// same 256 cached PGUA files after a history trim or a navigate-away/back) is
+/// an `Arc` clone per frame instead of a fresh read+bzip2+parse. Distinct from
+/// the display frame history (which trims to the RAM budget): this survives
+/// trims/reloads. Live/realtime partial volumes are NOT cached — their
+/// on-disk file is re-assembled under the same path as chunks arrive.
+struct DecodedVolumeCache {
+    entries: HashMap<PathBuf, CachedVolumeEntry>,
+    total_bytes: usize,
+    byte_budget: usize,
+    clock: u64,
+}
+
+impl DecodedVolumeCache {
+    fn new(byte_budget: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            total_bytes: 0,
+            byte_budget,
+            clock: 0,
+        }
+    }
+
+    fn tick(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
+    /// Fetch a cached volume, marking it most-recently-used. `None` on miss.
+    fn get(&mut self, key: &Path) -> Option<Arc<RadarVolume>> {
+        let now = self.tick();
+        let entry = self.entries.get_mut(key)?;
+        entry.last_used = now;
+        Some(Arc::clone(&entry.volume))
+    }
+
+    /// Insert (or refresh) a decoded volume, then LRU-evict until the total
+    /// estimated bytes fit the budget. Never evicts the just-inserted key.
+    fn insert(&mut self, key: PathBuf, volume: Arc<RadarVolume>) {
+        let bytes = ui_core::loop_engine::estimated_volume_bytes(&volume);
+        let now = self.tick();
+        if let Some(previous) = self.entries.insert(
+            key.clone(),
+            CachedVolumeEntry {
+                volume,
+                bytes,
+                last_used: now,
+            },
+        ) {
+            self.total_bytes = self.total_bytes.saturating_sub(previous.bytes);
+        }
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.evict_to_budget(&key);
+    }
+
+    fn evict_to_budget(&mut self, keep: &Path) {
+        while self.total_bytes > self.byte_budget && self.entries.len() > 1 {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .filter(|(path, _)| path.as_path() != keep)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&victim) {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+}
+
+fn decoded_volume_cache() -> &'static Mutex<DecodedVolumeCache> {
+    static CACHE: OnceLock<Mutex<DecodedVolumeCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(DecodedVolumeCache::new(DECODED_VOLUME_CACHE_BUDGET_BYTES)))
+}
+
+/// Canonicalized cache key for a path, falling back to the raw path if it
+/// can't be canonicalized (should not happen for a just-downloaded frame, but
+/// keeps the cache best-effort rather than fallible).
+fn decoded_volume_cache_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn cache_decoded_volume(key: PathBuf, volume: &Arc<RadarVolume>) {
+    if let Ok(mut cache) = decoded_volume_cache().lock() {
+        cache.insert(key, Arc::clone(volume));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_load_path_with_optional_preview(
     path: PathBuf,
@@ -1266,7 +1401,31 @@ fn decode_load_path_with_optional_preview(
     preview_enabled: bool,
     status: FrameStatus,
     source_label: String,
+    use_decoded_cache: bool,
 ) -> Result<DecodedLoad, String> {
+    // Decoded-volume cache (loop/archive re-load fast path): a previously
+    // decoded file returns as an `Arc` clone instead of a fresh
+    // read+bzip2+parse. Live/realtime partial volumes pass
+    // `use_decoded_cache = false` because the same on-disk path is
+    // re-assembled as more chunks arrive.
+    let cache_key = use_decoded_cache.then(|| decoded_volume_cache_key(&path));
+    if let Some(key) = cache_key.as_ref()
+        && let Some(volume) = decoded_volume_cache()
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(key))
+    {
+        timings.read_ms = Some(0.0);
+        timings.decode_ms = 0.0;
+        return Ok(DecodedLoad {
+            path,
+            volume,
+            timings: timings.finish(total_start),
+            status,
+            source_label,
+        });
+    }
+
     let read_start = Instant::now();
     let raw = std::fs::read(&path)
         .map_err(|err| format!("I/O error reading {}: {err}", path.display()))?;
@@ -1276,12 +1435,17 @@ fn decode_load_path_with_optional_preview(
         let decode_start = Instant::now();
         let mut volume =
             nexrad_io::decode_volume_from_bytes(&raw).map_err(|err| err.to_string())?;
+        note_volume_decoded();
         timings.decode_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
         volume.metadata.source_path = Some(path.display().to_string());
         derive_default_products_in_place(&mut volume);
+        let volume = Arc::new(volume);
+        if let Some(key) = cache_key {
+            cache_decoded_volume(key, &volume);
+        }
         return Ok(DecodedLoad {
             path,
-            volume: Arc::new(volume),
+            volume,
             timings: timings.finish(total_start),
             status,
             source_label,
@@ -1337,13 +1501,18 @@ fn decode_load_path_with_optional_preview(
     } else {
         nexrad_io::decode_volume_from_bytes(&raw).map_err(|err| err.to_string())?
     };
+    note_volume_decoded();
     timings.decode_ms = decode_start.elapsed().as_secs_f32() * 1000.0;
     timings.preview_ms = first_preview_ms;
     volume.metadata.source_path = Some(path.display().to_string());
     derive_default_products_in_place(&mut volume);
+    let volume = Arc::new(volume);
+    if let Some(key) = cache_key {
+        cache_decoded_volume(key, &volume);
+    }
     Ok(DecodedLoad {
         path,
-        volume: Arc::new(volume),
+        volume,
         timings: timings.finish(total_start),
         status,
         source_label,
@@ -3066,6 +3235,7 @@ fn decode_archive_history_object(
         preview,
         FrameStatus::Complete,
         format!("archive L2 {site_id}"),
+        true,
     )?;
     decoded.status =
         archive_frame_status(decoded.volume.volume_time.with_timezone(&Utc), Utc::now());
@@ -3288,6 +3458,10 @@ fn spawn_latest_level2_load_worker(
                             FrameStatus::LivePartial
                         },
                         format!("realtime L2 {site_id}"),
+                        // Live partial volumes are re-assembled under the same
+                        // on-disk path as chunks arrive, so they must never be
+                        // served from the decoded-volume cache.
+                        false,
                     )
                     .map_err(|err| {
                         let mut timings = decode_timings;
@@ -14719,6 +14893,7 @@ impl ViewerApp {
                         should_preview_loads(),
                         FrameStatus::Local,
                         format!("local {label}"),
+                        true,
                     )
                     .map(DecodedLoadBatch::single),
                 }
@@ -51179,6 +51354,151 @@ mod tests {
             .expect("system clock after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("bowecho-{label}-{}-{nanos}", std::process::id()))
+    }
+
+    /// A minimal decoded volume whose estimated bytes are dominated by
+    /// `gates` bytes of moment storage — enough to exercise the byte-budgeted
+    /// LRU without a real bzip2 decode.
+    fn synthetic_volume(gates: usize) -> Arc<RadarVolume> {
+        let mut volume = RadarVolume::new(radar_core::RadarSite::new("KEAX"), chrono::Utc::now());
+        let mut cut = ElevationCut::new(0.5, Some(1));
+        let gate_range = radar_core::GateRange {
+            first_gate_m: 0,
+            gate_spacing_m: 250,
+            gate_count: gates.max(1),
+        };
+        let mut grid = MomentGrid::new_u8(
+            MomentType::Reflectivity,
+            gate_range,
+            2.0,
+            66.0,
+            Some(0),
+            Some(1),
+        );
+        if let MomentStorage::U8(values) = &mut grid.storage {
+            values.resize(gates, 0u8);
+        }
+        cut.moments.insert(MomentType::Reflectivity, grid);
+        volume.cuts.push(cut);
+        Arc::new(volume)
+    }
+
+    /// A cache hit returns the SAME `Arc` that was inserted — proof that the
+    /// re-load reuses the decoded volume instead of re-decoding it.
+    #[test]
+    fn decoded_volume_cache_serves_a_hit_as_the_same_arc() {
+        let mut cache = DecodedVolumeCache::new(DECODED_VOLUME_CACHE_BUDGET_BYTES);
+        let key = PathBuf::from("/frames/a");
+        let volume = synthetic_volume(1000);
+        cache.insert(key.clone(), Arc::clone(&volume));
+        let hit = cache.get(&key).expect("cached volume");
+        assert!(
+            Arc::ptr_eq(&hit, &volume),
+            "a hit must clone the cached Arc, not produce a fresh decode"
+        );
+        assert!(cache.get(Path::new("/frames/missing")).is_none());
+    }
+
+    /// Over budget, the cache evicts the least-recently-USED entry (not merely
+    /// the oldest-inserted): touching A after inserting B must make B the
+    /// victim when C arrives.
+    #[test]
+    fn decoded_volume_cache_lru_evicts_least_recently_used() {
+        let one_bytes = ui_core::loop_engine::estimated_volume_bytes(&synthetic_volume(1_000_000));
+        // Budget holds two of these volumes but not three.
+        let mut cache = DecodedVolumeCache::new(one_bytes * 2 + one_bytes / 2);
+        let a = PathBuf::from("/frames/a");
+        let b = PathBuf::from("/frames/b");
+        let c = PathBuf::from("/frames/c");
+        cache.insert(a.clone(), synthetic_volume(1_000_000));
+        cache.insert(b.clone(), synthetic_volume(1_000_000));
+        // Touch A so B is now the least-recently-used entry.
+        assert!(cache.get(&a).is_some());
+        cache.insert(c.clone(), synthetic_volume(1_000_000));
+        assert!(cache.get(&a).is_some(), "recently-touched A survives");
+        assert!(cache.get(&c).is_some(), "just-inserted C survives");
+        assert!(cache.get(&b).is_none(), "LRU victim B was evicted");
+        assert_eq!(cache.len(), 2);
+        assert!(cache.total_bytes() <= one_bytes * 2 + one_bytes / 2);
+    }
+
+    /// REAL-DATA proof (run: `cargo test -p app_ui --release -- --ignored
+    /// real_pgua`): decode a real PGUA loop twice through the actual load
+    /// worker. The second pass must re-decode NOTHING — every frame comes back
+    /// as the exact same cached `Arc`. Ignored by default because it depends on
+    /// the on-disk BowEcho cache from a live session.
+    #[test]
+    #[ignore = "reads the real on-disk PGUA level2 cache; run with --ignored"]
+    fn real_pgua_loop_second_pass_is_all_cache_hits() {
+        let dir = Path::new(r"C:\Users\drew\AppData\Local\BowEcho\cache\level2\PGUA");
+        if !dir.is_dir() {
+            eprintln!("skipping: {} not present", dir.display());
+            return;
+        }
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .expect("read PGUA cache dir")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.contains("_V06"))
+            })
+            .collect();
+        paths.sort();
+        // ~24 * ~60 MB decoded fits the 2 GiB budget with no eviction, so the
+        // whole set stays resident across both passes.
+        paths.truncate(24);
+        assert!(paths.len() >= 2, "need at least a couple real PGUA volumes");
+
+        let (tx, _rx) = mpsc::channel::<AsyncLoadResult>();
+        let decode = |path: &Path| {
+            decode_load_path_with_optional_preview(
+                path.to_path_buf(),
+                "pgua-cache-test",
+                Instant::now(),
+                LoadTimings::default(),
+                &tx,
+                false,
+                FrameStatus::Complete,
+                "pgua-cache-test".to_owned(),
+                true,
+            )
+            .expect("decode real PGUA volume")
+        };
+
+        let before_first = decoded_volume_decode_count();
+        let first_start = Instant::now();
+        let first: Vec<Arc<RadarVolume>> = paths.iter().map(|path| decode(path).volume).collect();
+        let first_ms = first_start.elapsed().as_secs_f64() * 1000.0;
+        let first_delta = decoded_volume_decode_count() - before_first;
+
+        let before_second = decoded_volume_decode_count();
+        let second_start = Instant::now();
+        let second: Vec<Arc<RadarVolume>> = paths.iter().map(|path| decode(path).volume).collect();
+        let second_ms = second_start.elapsed().as_secs_f64() * 1000.0;
+        let second_delta = decoded_volume_decode_count() - before_second;
+
+        assert!(
+            first_delta >= 1,
+            "first pass must actually decode (delta {first_delta})"
+        );
+        assert_eq!(
+            second_delta, 0,
+            "second pass over the same loop must be all cache hits, re-decoded {second_delta}"
+        );
+        for (before, after) in first.iter().zip(second.iter()) {
+            assert!(
+                Arc::ptr_eq(before, after),
+                "second-pass frame must be the SAME cached Arc, not a re-decode"
+            );
+        }
+        eprintln!(
+            "PGUA re-load {} frames: pass1 {first_ms:.0} ms ({first_delta} decodes), \
+             pass2 {second_ms:.0} ms ({second_delta} decodes)",
+            paths.len()
+        );
     }
 
     #[test]
