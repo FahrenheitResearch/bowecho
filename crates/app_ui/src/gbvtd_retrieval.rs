@@ -19,6 +19,11 @@ use render2d::{
 
 const KM_PER_DEG_LAT: f32 = 111.0;
 const MS_TO_KT: f32 = 1.943_844;
+const KT_TO_MS: f32 = 0.514_444;
+/// Only borrow a tropical cyclone's motion vector when its center is within
+/// this range of the radar — beyond it the storm isn't the one on the scope and
+/// its motion is irrelevant to this retrieval (a NEXRAD sees to ~230 km).
+const MAX_TC_MOTION_RANGE_KM: f32 = 400.0;
 
 #[derive(Default)]
 pub struct GbvtdState {
@@ -93,13 +98,23 @@ impl crate::ViewerApp {
         let guess_y = (seed_lat - lat0) * KM_PER_DEG_LAT;
         let radii: Vec<f32> = (8..=110).step_by(4).map(|r| r as f32).collect();
 
-        match find_center_and_retrieve(&field, (guess_x, guess_y), 32.0, 3.0, &radii) {
+        // Single-Doppler GBVTD cannot separate the environmental (storm-motion)
+        // wind from the vortex; left in, it aliases and biases the retrieved VT
+        // downward (e.g. a Cat-5 reads ~98 kt). Feed the nearest active TC's
+        // best-track motion vector so `fit_ring` can remove it and de-alias VT
+        // back toward true intensity. (0,0) => unchanged behavior.
+        let (wind_ms, motion_note) = self.nearest_tc_motion_ms(lon0, lat0);
+
+        match find_center_and_retrieve(&field, (guess_x, guess_y), 32.0, 3.0, &radii, wind_ms) {
             Some(circ) => {
                 let vt = circ.vt_max.unwrap_or(0.0);
                 let kt = vt * MS_TO_KT;
                 let rmw = circ.rmw_km.unwrap_or(0.0);
+                let motion = motion_note
+                    .map(|n| format!("  · {n}"))
+                    .unwrap_or_default();
                 self.gbvtd.status = format!(
-                    "{} — peak {vt:.0} m/s ({kt:.0} kt) at RMW {rmw:.0} km  [{:.2}° tilt]",
+                    "{} — peak {vt:.0} m/s ({kt:.0} kt) at RMW {rmw:.0} km  [{:.2}° tilt]{motion}",
                     intensity_label(kt),
                     cut.elevation_deg
                 );
@@ -111,6 +126,42 @@ impl crate::ViewerApp {
                     "No circulation found — click closer to the eye and retry.".to_owned();
             }
         }
+    }
+
+    /// Environmental (storm-motion) wind (Um east, Vm north, m/s) taken from the
+    /// nearest active tropical cyclone to the radar site, plus a short note for
+    /// the status line. Returns `((0,0), None)` when no storm is close enough or
+    /// its motion is unknown — GBVTD then runs unchanged.
+    ///
+    /// `movement_dir_deg` is the heading the storm moves TOWARD (0° = N,
+    /// clockwise), so the east/north components are `speed·sin θ` / `speed·cos θ`.
+    fn nearest_tc_motion_ms(&self, lon0: f32, lat0: f32) -> ((f64, f64), Option<String>) {
+        let cos_lat = lat0.to_radians().cos().max(0.01);
+        let range_km2 = |lon: f32, lat: f32| -> f32 {
+            let dx = (lon - lon0) * KM_PER_DEG_LAT * cos_lat;
+            let dy = (lat - lat0) * KM_PER_DEG_LAT;
+            dx * dx + dy * dy
+        };
+        let Some(storm) = self.tropical.storms.iter().min_by(|a, b| {
+            range_km2(a.position.lon, a.position.lat)
+                .total_cmp(&range_km2(b.position.lon, b.position.lat))
+        }) else {
+            return ((0.0, 0.0), None);
+        };
+        if range_km2(storm.position.lon, storm.position.lat)
+            > MAX_TC_MOTION_RANGE_KM * MAX_TC_MOTION_RANGE_KM
+        {
+            return ((0.0, 0.0), None);
+        }
+        let (Some(dir), Some(speed_kt)) = (storm.movement_dir_deg, storm.movement_speed_kt) else {
+            return ((0.0, 0.0), None);
+        };
+        let speed_ms = speed_kt * KT_TO_MS;
+        let (sin_d, cos_d) = dir.to_radians().sin_cos();
+        (
+            ((speed_ms * sin_d) as f64, (speed_ms * cos_d) as f64),
+            Some(format!("de-aliased with {} motion {speed_kt:.0} kt", storm.name)),
+        )
     }
 
     /// Arm click-to-place: the next radar click drops the center seed on the

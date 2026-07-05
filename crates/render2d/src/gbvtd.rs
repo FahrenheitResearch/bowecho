@@ -145,11 +145,22 @@ fn angular_distance_deg(a: f32, b: f32) -> f32 {
 /// Least-squares fit the ring-constant (VT, VR) on one radius ring about
 /// `center_km`, sampling `n_azimuths` evenly around it. Returns None if too
 /// few valid samples or the geometry is degenerate.
+///
+/// `wind_ms` is an EXTERNAL uniform environmental wind (Um east, Vm north, m/s)
+/// — in practice the storm-motion vector from the tropical layer. A single
+/// Doppler radar cannot separate this environmental flow from the vortex's own
+/// tangential/radial wind: it aliases into the fit and biases the retrieved VT
+/// *downward* (a data-driven fit for it collapses the vortex, so it must come
+/// from outside). We remove it here by subtracting its beam-projected component
+/// (`bx*Um + by*Vm`) from every Doppler sample before the VT/VR accumulation,
+/// which de-aliases VT back up toward best-track intensity. Pass `(0.0, 0.0)`
+/// for the unbiased/no-motion case (leaves behavior unchanged).
 fn fit_ring(
     sampler: &Sampler<'_>,
     center_km: (f32, f32),
     radius_km: f32,
     n_azimuths: usize,
+    wind_ms: (f64, f64),
 ) -> Option<RingFit> {
     let (mut saa, mut sac, mut scc, mut sad, mut scd) = (0.0f64, 0.0, 0.0, 0.0, 0.0);
     let mut samples = 0usize;
@@ -170,7 +181,13 @@ fn fit_ring(
         let (bx, by) = (px / rho, py / rho);
         let a = f64::from((-sb) * bx + cb * by); // VT coefficient
         let c = f64::from(cb * bx + sb * by); // VR coefficient
-        let d = f64::from(vd);
+        // Remove the beam-projected external environmental (storm-motion) wind
+        // that single-Doppler GBVTD cannot separate from the vortex (see the
+        // fn doc): the uniform flow (Um, Vm) contributes `Um*bx + Vm*by` to
+        // this beam's Doppler velocity. Only ~half the motion projects on any
+        // given beam, but subtracting it removes the dominant VT bias.
+        let env = wind_ms.0 * f64::from(bx) + wind_ms.1 * f64::from(by);
+        let d = f64::from(vd) - env;
         saa += a * a;
         sac += a * c;
         scc += c * c;
@@ -256,16 +273,20 @@ fn ring_is_core_candidate(ring: &RingFit) -> bool {
 
 /// Retrieve the axisymmetric circulation about a KNOWN center, over the given
 /// radii (km). `n_azimuths` ring samples (72 = every 5°) is a good default.
+/// `wind_ms` is the external environmental (storm-motion) wind removed from
+/// each Doppler sample; pass `(0.0, 0.0)` when none is available (see
+/// [`fit_ring`]).
 pub fn retrieve_axisymmetric(
     field: &PolarVelocityField,
     center_km: (f32, f32),
     radii_km: &[f32],
     n_azimuths: usize,
+    wind_ms: (f64, f64),
 ) -> TcCirculation {
     let sampler = field.sampler();
     let rings: Vec<RingFit> = radii_km
         .iter()
-        .filter_map(|&r| fit_ring(&sampler, center_km, r, n_azimuths))
+        .filter_map(|&r| fit_ring(&sampler, center_km, r, n_azimuths, wind_ms))
         .collect();
     let r_center = (center_km.0 * center_km.0 + center_km.1 * center_km.1).sqrt();
     let max_radius = MAX_RADIUS_FRACTION * r_center;
@@ -287,12 +308,16 @@ pub fn retrieve_axisymmetric(
 /// (± `search_km`, step `step_km`) for the center that maximizes the peak
 /// axisymmetric tangential wind, then retrieve about it. Returns None if no
 /// candidate yields a usable circulation.
+/// `wind_ms` is the external environmental (storm-motion) wind (Um east, Vm
+/// north, m/s) removed from every Doppler sample before fitting; pass
+/// `(0.0, 0.0)` when no storm motion is available (see [`fit_ring`]).
 pub fn find_center_and_retrieve(
     field: &PolarVelocityField,
     guess_km: (f32, f32),
     search_km: f32,
     step_km: f32,
     radii_km: &[f32],
+    wind_ms: (f64, f64),
 ) -> Option<TcCirculation> {
     let sampler = field.sampler();
     let step = step_km.max(0.5);
@@ -316,7 +341,7 @@ pub fn find_center_and_retrieve(
                 if r > max_radius {
                     continue;
                 }
-                if let Some(fit) = fit_ring(&sampler, center, r, 72) {
+                if let Some(fit) = fit_ring(&sampler, center, r, 72, wind_ms) {
                     if ring_is_core_candidate(&fit) {
                         score = score.max(fit.vt);
                     }
@@ -405,7 +430,8 @@ mod tests {
         let field = synthetic_vortex(center, rmw, vtmax);
         let radii: Vec<f32> = (10..=80).step_by(5).map(|r| r as f32).collect();
 
-        let circ = retrieve_axisymmetric(&field, center, &radii, 144);
+        // No environmental wind in the synthetic vortex.
+        let circ = retrieve_axisymmetric(&field, center, &radii, 144, (0.0, 0.0));
 
         // Peak tangential wind and RMW are recovered.
         assert!(
@@ -448,8 +474,8 @@ mod tests {
 
         // Start the search 8 km off in both axes.
         let guess = (center.0 + 8.0, center.1 - 8.0);
-        let circ =
-            find_center_and_retrieve(&field, guess, 12.0, 2.0, &radii).expect("center found");
+        let circ = find_center_and_retrieve(&field, guess, 12.0, 2.0, &radii, (0.0, 0.0))
+            .expect("center found");
 
         assert!(
             (circ.center_km.0 - center.0).abs() <= 3.0
@@ -491,12 +517,23 @@ mod tests {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(-137.0);
+        // External storm-motion (environmental) wind, m/s, Um east / Vm north.
+        // Defaults to none; set BOWECHO_GBVTD_UM / _VM to de-alias VT with a
+        // best-track motion vector (e.g. BAVI moving WNW: Um=-6, Vm=3).
+        let um: f64 = std::env::var("BOWECHO_GBVTD_UM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let vm: f64 = std::env::var("BOWECHO_GBVTD_VM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
         let radii: Vec<f32> = (6..=100).step_by(4).map(|r| r as f32).collect();
-        let circ = find_center_and_retrieve(&field, (guess_x, guess_y), 40.0, 3.0, &radii)
+        let circ = find_center_and_retrieve(&field, (guess_x, guess_y), 40.0, 3.0, &radii, (um, vm))
             .expect("a circulation");
 
         eprintln!(
-            "GBVTD real: cut {cut_index} ({:.2} deg) center=({:.1},{:.1}) km RMW={:?} VT_max={:?} m/s",
+            "GBVTD real: cut {cut_index} ({:.2} deg) wind=({um:.1},{vm:.1}) m/s center=({:.1},{:.1}) km RMW={:?} VT_max={:?} m/s",
             cut.elevation_deg, circ.center_km.0, circ.center_km.1, circ.rmw_km, circ.vt_max
         );
         for ring in &circ.rings {
