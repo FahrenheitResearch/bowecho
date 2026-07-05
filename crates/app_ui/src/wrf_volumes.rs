@@ -191,7 +191,9 @@ pub fn interpolate_iso_volumes(
     // few metres above ground, close enough to anchor the sounding surface.
     let level0 = |data: &[f64]| -> Vec<f32> { (0..cells).map(|c| data[c] as f32).collect() };
     let surface = SurfaceFallback {
-        surface_pressure_pa: (0..cells).map(|c| (pressure_hpa[c] * 100.0) as f32).collect(),
+        surface_pressure_pa: (0..cells)
+            .map(|c| (pressure_hpa[c] * 100.0) as f32)
+            .collect(),
         temperature_2m_k: level0(temp_k),
         dewpoint_2m_k: level0(dewpoint_k),
         u_10m: level0(u_ms),

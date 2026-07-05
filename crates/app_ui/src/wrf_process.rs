@@ -627,8 +627,20 @@ fn fill_missing_surface(
         ),
     ];
     for (name, selector, units, values) in entries {
-        if !fields.canonical.iter().any(|(existing, _)| existing == name) {
-            push_canonical_values(fields, grid, projection.clone(), name, selector, units, values);
+        if !fields
+            .canonical
+            .iter()
+            .any(|(existing, _)| existing == name)
+        {
+            push_canonical_values(
+                fields,
+                grid,
+                projection.clone(),
+                name,
+                selector,
+                units,
+                values,
+            );
         }
     }
 }

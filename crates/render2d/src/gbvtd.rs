@@ -525,8 +525,7 @@ mod tests {
                 let (sb, cb) = beta.sin_cos();
                 // Axisymmetric magnitude plus wavenumber-1 asymmetry at this
                 // GBVTD angle θ = beta − phi0.
-                let vt =
-                    rankine_vt(r, rmw_km, vt_max) + asym_amp * (beta - phi0 - phase).cos();
+                let vt = rankine_vt(r, rmw_km, vt_max) + asym_amp * (beta - phi0 - phase).cos();
                 let (wx, wy) = (vt * -sb, vt * cb);
                 values[row * gate_count + gate] = wx * bx + wy * by;
             }
@@ -612,7 +611,7 @@ mod tests {
         let field = synthetic_vortex_asym(center, rmw, vtmax, amp, phase_deg);
         let radii: Vec<f32> = (15..=60).step_by(5).map(|r| r as f32).collect();
 
-        let circ = retrieve_axisymmetric(&field, center, &radii, 180);
+        let circ = retrieve_axisymmetric(&field, center, &radii, 180, (0.0, 0.0));
 
         // The axisymmetric peak is still recovered — the wavenumber-1 term does
         // not leak into VT0 (it lives in different Doppler harmonics).
@@ -651,7 +650,7 @@ mod tests {
         // Control: a purely axisymmetric vortex of the same core retrieves a
         // near-zero wavenumber-1 amplitude (no spurious asymmetry).
         let sym = synthetic_vortex_asym(center, rmw, vtmax, 0.0, 0.0);
-        let sym_circ = retrieve_axisymmetric(&sym, center, &radii, 180);
+        let sym_circ = retrieve_axisymmetric(&sym, center, &radii, 180, (0.0, 0.0));
         for ring in &sym_circ.rings {
             assert!(
                 ring.vt1_amp < 3.0,
@@ -727,10 +726,11 @@ mod tests {
         // Report the wavenumber-1 asymmetry at the RMW (the eyewall) — the
         // headline number for storm asymmetry / motion-relative structure.
         if let Some(rmw) = circ.rmw_km
-            && let Some(ring) = circ
-                .rings
-                .iter()
-                .min_by(|a, b| (a.radius_km - rmw).abs().total_cmp(&(b.radius_km - rmw).abs()))
+            && let Some(ring) = circ.rings.iter().min_by(|a, b| {
+                (a.radius_km - rmw)
+                    .abs()
+                    .total_cmp(&(b.radius_km - rmw).abs())
+            })
         {
             eprintln!(
                 "GBVTD asymmetry at RMW ({:.0} km): wavenumber-1 VT amp = {:.1} m/s ({:.1}% of VT0={:.1}), phase {:.0}°",

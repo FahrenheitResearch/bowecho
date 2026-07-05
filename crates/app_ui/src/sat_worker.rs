@@ -744,7 +744,11 @@ fn render_composite_pixels(
 ) -> Vec<Color32> {
     let mut pixels = Vec::with_capacity(nx * ny);
     for image_row in 0..ny {
-        let grid_row = if flip_rows { ny - 1 - image_row } else { image_row };
+        let grid_row = if flip_rows {
+            ny - 1 - image_row
+        } else {
+            image_row
+        };
         for col in 0..nx {
             let idx = grid_row * nx + col;
             let (rv, gv, bv) = (r[idx], g[idx], b[idx]);
@@ -1800,7 +1804,9 @@ fn write_goes_composite_frame(
             ],
         },
     );
-    manifest.save(&manifest_path).map_err(|err| err.to_string())?;
+    manifest
+        .save(&manifest_path)
+        .map_err(|err| err.to_string())?;
 
     Ok(WrittenFrame {
         model,
@@ -2577,7 +2583,10 @@ mod tests {
         assert!(options[0].1.contains("C01+C02+C03"), "{}", options[0].1);
         // Every offered slug parses back to a real style.
         for (slug, _) in &options {
-            assert!(GoesAbiRgbCompositeStyle::parse(slug).is_some(), "slug {slug}");
+            assert!(
+                GoesAbiRgbCompositeStyle::parse(slug).is_some(),
+                "slug {slug}"
+            );
         }
     }
 

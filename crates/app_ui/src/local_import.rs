@@ -190,9 +190,12 @@ fn import_paths(paths: &[PathBuf], store_root: &Path) -> Result<LocalImportSumma
         // Volume planes come from wrf-core, the 2D grid from netcrust; if they
         // ever disagree on grid size, drop volumes rather than fail the hour.
         let grid_cells = fields.grid.shape.len();
-        let volumes_match = iso_volumes
-            .iter()
-            .all(|volume| volume.levels.iter().all(|(_, plane)| plane.len() == grid_cells));
+        let volumes_match = iso_volumes.iter().all(|volume| {
+            volume
+                .levels
+                .iter()
+                .all(|(_, plane)| plane.len() == grid_cells)
+        });
         let volume_inputs = if volumes_match {
             iso_volumes
                 .iter()
@@ -845,7 +848,12 @@ fn fill_missing_surface(fields: &mut ImportedWrfFields, surface: SurfaceFallback
         ),
     ];
     for (name, selector, units, values) in entries {
-        if values.len() != cells || fields.canonical.iter().any(|(existing, _)| existing == name) {
+        if values.len() != cells
+            || fields
+                .canonical
+                .iter()
+                .any(|(existing, _)| existing == name)
+        {
             continue;
         }
         if let Ok(field) = SelectedField2D::new(selector, units, fields.grid.clone(), values) {
@@ -966,7 +974,15 @@ pub(crate) fn try_postprocessed_wrf(
         ),
     ];
     for (name, selector, units, values) in surface_entries {
-        push_computed(&mut canonical, &grid, projection.clone(), name, selector, units, values)?;
+        push_computed(
+            &mut canonical,
+            &grid,
+            projection.clone(),
+            name,
+            selector,
+            units,
+            values,
+        )?;
     }
 
     Ok(Some((canonical, volumes)))
