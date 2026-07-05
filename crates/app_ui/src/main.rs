@@ -75,6 +75,7 @@ mod spc_layers;
 mod table_editor;
 mod taiwan_cwa;
 mod tor_tracks;
+mod tropical;
 mod ui_theme;
 mod unified_player;
 mod units;
@@ -1983,6 +1984,7 @@ struct ViewerApp {
     /// SPC-style upper-air quicklook (height/temp contours + model wind barbs).
     upper_air_layer: Option<upper_air::UpperAirLayer>,
     upper_air_rx: WorkerSlot<UpperAirResult>,
+    tropical: tropical::TropicalState,
     /// Primary radar layer opacity (draw-time tint; no re-render).
     radar_opacity: f32,
     /// Background model ingest (rw-ingest library) in flight.
@@ -6453,6 +6455,7 @@ impl ViewerApp {
             model_layer_generation: 0,
             upper_air_layer: None,
             upper_air_rx: WorkerSlot::idle("upper-air-quicklook"),
+            tropical: tropical::TropicalState::default(),
             radar_opacity: initial_radar_opacity,
             model_ingest_rx: None,
             model_ingest_progress_rx: None,
@@ -16394,6 +16397,20 @@ impl eframe::App for ViewerApp {
         self.poll_archive_listing(&ctx);
         self.poll_intl_archive_listing(&ctx);
         self.poll_spc_reports(&ctx);
+        self.tropical.maybe_refresh(&ctx);
+        self.tropical.poll();
+        if self.app_settings.show_tropical {
+            self.tropical.drive_geometry(&ctx);
+            egui::Window::new("🌀 Tropical Cyclones")
+                .default_width(300.0)
+                .default_pos(egui::pos2(60.0, 90.0))
+                .show(&ctx, |ui| self.tropical.cards_ui(ui));
+            if let Some((lon, lat)) = self.tropical.focus_request.take() {
+                self.map_center_lon = lon;
+                self.map_center_lat = lat;
+                ctx.request_repaint();
+            }
+        }
         self.poll_event_day(&ctx);
         self.poll_mping(&ctx);
         // Reports gate at ONE reference time per repaint. Computing it is
@@ -19766,6 +19783,16 @@ impl ViewerApp {
         if ui
             .checkbox(&mut self.app_settings.show_lat_lon_grid, "Lat/lon grid")
             .on_hover_text("Show basemap latitude/longitude grid lines and labels. Hotkey: G")
+            .changed()
+        {
+            let _ = self.app_settings.save();
+            ctx.request_repaint();
+        }
+        if ui
+            .checkbox(&mut self.app_settings.show_tropical, "Tropical cyclones")
+            .on_hover_text(
+                "Show active hurricanes/typhoons worldwide (NHC + GDACS): a storm-card panel with wind, pressure, and motion, plus each storm's position, forecast track, and cone of uncertainty on the map.",
+            )
             .changed()
         {
             let _ = self.app_settings.save();
@@ -25937,6 +25964,7 @@ impl ViewerApp {
         self.draw_basemap_overlay(painter, rect);
         self.draw_tor_tracks(painter, rect);
         self.draw_hazard_overlays(painter, rect);
+        self.draw_tropical(painter, rect);
         self.draw_rotation_markers(painter, rect);
         if !self.hide_camera_follow_guides() {
             self.draw_storm_tracks(painter, rect);
@@ -26620,6 +26648,7 @@ impl ViewerApp {
             self.draw_basemap_overlay(&cell_painter, cell);
             self.draw_tor_tracks(&cell_painter, cell);
             self.draw_hazard_overlays(&cell_painter, cell);
+            self.draw_tropical(&cell_painter, cell);
             self.draw_rotation_markers(&cell_painter, cell);
             if !self.hide_camera_follow_guides() {
                 self.draw_storm_tracks(&cell_painter, cell);
@@ -67055,6 +67084,7 @@ mod tests {
             model_layer_generation: 0,
             upper_air_layer: None,
             upper_air_rx: WorkerSlot::idle("upper-air-quicklook"),
+            tropical: tropical::TropicalState::default(),
             radar_opacity: 1.0,
             model_ingest_rx: None,
             model_ingest_progress_rx: None,

@@ -188,6 +188,11 @@ pub struct AppSettings {
     /// the displayed radar time.
     #[serde(default)]
     pub overlay_raob: bool,
+    /// Draw the tropical-cyclone layer: active storm positions, forecast
+    /// track, and cone of uncertainty (NHC CurrentStorms.json + GDACS).
+    /// Default off.
+    #[serde(default)]
+    pub show_tropical: bool,
     /// Enabled outlook kinds ("cat", "torn", "wind", "hail", "estofex").
     #[serde(default)]
     pub overlay_spc_outlooks: Vec<String>,
@@ -636,6 +641,7 @@ impl Default for AppSettings {
             overlay_glm: false,
             glm_show_last_minutes: default_glm_show_last_minutes(),
             overlay_raob: false,
+            show_tropical: false,
             overlay_spc_outlooks: Vec::new(),
             overlay_spc_reports: false,
             overlay_mping_reports: false,
