@@ -381,6 +381,13 @@ impl LoopEngine {
         self.cursor.index = self.cursor.index.min(self.history.len().saturating_sub(1));
     }
 
+    /// Estimated resident bytes of the whole frame history — the same metric
+    /// the byte budget trims against ([`estimated_entry_bytes`]). Exposed so
+    /// the UI can show live memory use against the configurable budget.
+    pub fn history_bytes(&self) -> usize {
+        self.history.iter().map(estimated_entry_bytes).sum()
+    }
+
     /// Re-apply a changed frame limit outside an install (census D8, the
     /// shared-limits surface): the caller passes the limit — for panes,
     /// the PRIMARY's — and the engine normalizes its own copy, trims
