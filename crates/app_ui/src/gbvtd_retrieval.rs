@@ -23,7 +23,16 @@ const MS_TO_KT: f32 = 1.943_844;
 #[derive(Default)]
 pub struct GbvtdState {
     pub panel_open: bool,
+    /// Armed: the next left-click on the radar sets the center seed (the
+    /// hurricane eye). Cleared on click. This is the ONLY sensible way to
+    /// seed a single-Doppler retrieval — the center must be near the eye,
+    /// and the eye is wherever the user sees it, not the screen middle.
+    pub place_mode: bool,
     result: Option<TcCirculation>,
+    /// User-placed center seed (lon, lat). When set, the retrieval searches
+    /// around here instead of the map center; drawn as a faint marker so the
+    /// click and the snapped center are both visible.
+    seed_lonlat: Option<(f32, f32)>,
     /// Radar site (lon, lat) the current `result` is referenced to.
     site_lonlat: Option<(f32, f32)>,
     status: String,
@@ -71,10 +80,16 @@ impl crate::ViewerApp {
         let dealiased = dealias_velocity_grid(cut, velocity);
         let field = PolarVelocityField::from_dealiased_velocity(cut, &dealiased);
 
-        // Map center -> radar-relative km (x east, y north).
+        // Seed the center search from the user's clicked eye when they
+        // placed one; otherwise fall back to the map center (the old
+        // behavior). Convert lon/lat -> radar-relative km (x east, y north).
+        let (seed_lon, seed_lat) = self
+            .gbvtd
+            .seed_lonlat
+            .unwrap_or((self.map_center_lon, self.map_center_lat));
         let cos_lat = lat0.to_radians().cos().max(0.01);
-        let guess_x = (self.map_center_lon - lon0) * KM_PER_DEG_LAT * cos_lat;
-        let guess_y = (self.map_center_lat - lat0) * KM_PER_DEG_LAT;
+        let guess_x = (seed_lon - lon0) * KM_PER_DEG_LAT * cos_lat;
+        let guess_y = (seed_lat - lat0) * KM_PER_DEG_LAT;
         let radii: Vec<f32> = (8..=110).step_by(4).map(|r| r as f32).collect();
 
         match find_center_and_retrieve(&field, (guess_x, guess_y), 32.0, 3.0, &radii) {
@@ -97,8 +112,30 @@ impl crate::ViewerApp {
         }
     }
 
+    /// Arm click-to-place: the next radar click drops the center seed on the
+    /// eye. Also opens the panel so the readout is visible.
+    pub fn arm_gbvtd_place_mode(&mut self) {
+        self.gbvtd.panel_open = true;
+        self.gbvtd.place_mode = true;
+        self.gbvtd.status = "Click the hurricane eye on the radar to place the center.".to_owned();
+    }
+
+    /// Place the center seed at a clicked (lon, lat) and run the retrieval.
+    /// Called by the canvas when `place_mode` is armed and the user clicks.
+    pub fn place_gbvtd_seed(&mut self, lon: f32, lat: f32) {
+        self.gbvtd.seed_lonlat = Some((lon, lat));
+        self.gbvtd.place_mode = false;
+        self.run_gbvtd_retrieval();
+    }
+
     /// Draw the retrieved center + RMW ring on the radar map.
     pub fn draw_gbvtd(&self, painter: &egui::Painter, rect: egui::Rect) {
+        // Show the raw clicked seed (faint magenta dot) so the user can see
+        // their click versus where the simplex snapped the center to.
+        if let Some((lon, lat)) = self.gbvtd.seed_lonlat {
+            let seed = self.lon_lat_to_screen(rect, lon, lat);
+            painter.circle_filled(seed, 3.0, egui::Color32::from_rgb(230, 90, 230));
+        }
         let (Some(circ), Some((lon0, lat0))) = (&self.gbvtd.result, self.gbvtd.site_lonlat) else {
             return;
         };
@@ -150,8 +187,30 @@ impl crate::ViewerApp {
     /// GBVTD control + wind-profile readout panel.
     pub fn gbvtd_panel_ui(&mut self, ui: &mut egui::Ui) {
         ui.label("Single-Doppler TC wind retrieval (GBVTD, Lee et al. 1999).");
-        ui.label("Pan so the eye sits at the map center, then:");
-        if ui.button("🌀 Retrieve TC winds").clicked() {
+        let place_button = if self.gbvtd.place_mode {
+            ui.add(
+                egui::Button::new("📍 Click the eye on the radar…")
+                    .fill(egui::Color32::from_rgb(120, 40, 120)),
+            )
+        } else {
+            ui.button("📍 Set center — click the eye")
+        };
+        place_button
+            .on_hover_text(
+                "The center must sit near the eye. Click where the eye is on the radar; \
+                 the simplex snaps to the nearby wind maximum. Placing the seed on the \
+                 radar site instead of the eye is what produces a bogus giant ring.",
+            )
+            .clicked()
+            .then(|| self.arm_gbvtd_place_mode());
+        if self.gbvtd.seed_lonlat.is_some()
+            && ui
+                .button("🌀 Re-run at current center")
+                .on_hover_text(
+                    "Recompute using the already-placed center (e.g. after stepping frames).",
+                )
+                .clicked()
+        {
             self.run_gbvtd_retrieval();
         }
         if !self.gbvtd.status.is_empty() {

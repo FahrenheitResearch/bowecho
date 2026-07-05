@@ -21892,6 +21892,31 @@ impl ViewerApp {
                 }
             }
         });
+        // Retrieval product: GBVTD hurricane winds. Not a raster moment, so
+        // it lives just below the moment buttons rather than in the picker —
+        // clicking it opens the TC Winds panel and arms click-to-place on the
+        // eye (primary pane only; a single-Doppler retrieval is site-relative).
+        if editing_pane.is_none() {
+            ui.horizontal_wrapped(|ui| {
+                let label = if self.gbvtd.place_mode {
+                    "🌀 TC Winds — click the eye…"
+                } else {
+                    "🌀 TC Winds (GBVTD)"
+                };
+                if ui
+                    .selectable_label(self.gbvtd.panel_open, label)
+                    .on_hover_text(
+                        "Single-Doppler hurricane wind retrieval (Lee et al. 1999). Opens the \
+                         TC Winds panel and arms click-to-place: click the hurricane eye on the \
+                         radar to drop the center, then read peak wind / RMW / category.",
+                    )
+                    .clicked()
+                {
+                    self.arm_gbvtd_place_mode();
+                    ctx.request_repaint();
+                }
+            });
+        }
         let advanced_visible_count = product_buttons
             .iter()
             .filter(|(product, _)| {
@@ -25878,10 +25903,29 @@ impl ViewerApp {
             !armed && !vrot_armed && !annotating && !cross_section_handle_owns_pointer,
         );
 
+        // GBVTD click-to-place: when armed, the next left-click on the radar
+        // drops the hurricane-eye center seed and runs the retrieval. It owns
+        // the pointer so the same click does not also pan or drop a marker.
+        let gbvtd_placing = self.gbvtd.place_mode
+            && !armed
+            && !vrot_armed
+            && !annotating
+            && !cross_section_handle_owns_pointer
+            && !vol3d_box_drag_owns_pointer;
+        if gbvtd_placing
+            && response.clicked()
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
+            self.place_gbvtd_seed(lon, lat);
+            ui.ctx().request_repaint();
+        }
+
         if !armed
             && !annotating
             && !cross_section_handle_owns_pointer
             && !vol3d_box_drag_owns_pointer
+            && !gbvtd_placing
             && response.dragged()
         {
             let delta = response.drag_delta();
@@ -26020,6 +26064,7 @@ impl ViewerApp {
             && !vrot_armed
             && !annotating
             && !cross_section_handle_owns_pointer
+            && !gbvtd_placing
             && shift_held
             && response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
@@ -26032,6 +26077,7 @@ impl ViewerApp {
             && !vrot_armed
             && !annotating
             && !cross_section_handle_owns_pointer
+            && !gbvtd_placing
             && plain_click
             && response.clicked()
             && let Some(pointer) = response.interact_pointer_pos()
