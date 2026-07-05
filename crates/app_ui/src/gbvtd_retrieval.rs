@@ -110,11 +110,16 @@ impl crate::ViewerApp {
                 let vt = circ.vt_max.unwrap_or(0.0);
                 let kt = vt * MS_TO_KT;
                 let rmw = circ.rmw_km.unwrap_or(0.0);
+                // Peak wavenumber-1 (eyewall) tangential asymmetry across the
+                // retrieved rings, so the status quantifies at a glance how
+                // lopsided the vortex is (0 = purely axisymmetric).
+                let asym = circ.rings.iter().map(|r| r.vt1_amp).fold(0.0f32, f32::max);
                 let motion = motion_note.map(|n| format!("  · {n}")).unwrap_or_default();
                 self.gbvtd.status = format!(
-                    "{} — peak {vt:.0} m/s ({kt:.0} kt) at RMW {rmw:.0} km  [{:.2}° tilt]{motion}",
+                    "{} — peak {vt:.0} m/s ({kt:.0} kt) at RMW {rmw:.0} km  [{:.2}° tilt]  · WN-1 asym {asym:.0} m/s ({:.0} kt){motion}",
                     intensity_label(kt),
-                    cut.elevation_deg
+                    cut.elevation_deg,
+                    asym * MS_TO_KT,
                 );
                 self.gbvtd.result = Some(circ);
                 self.gbvtd.site_lonlat = Some((lon0, lat0));
@@ -213,6 +218,36 @@ impl crate::ViewerApp {
                 ring,
                 egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 210, 40)),
             ));
+
+            // Mark the strongest-eyewall azimuth: the wavenumber-1 tangential
+            // maximum on the RMW ring. The stored phase is the GBVTD math angle
+            // θ measured from the radar→center axis (φ₀ = atan2(cy, cx)), so the
+            // map azimuth of the peak is β = φ₀ + vt1_phase.
+            if let Some(rmw_ring) = circ
+                .rings
+                .iter()
+                .min_by(|a, b| {
+                    (a.radius_km - rmw)
+                        .abs()
+                        .total_cmp(&(b.radius_km - rmw).abs())
+                })
+                .filter(|r| r.vt1_amp > 0.0)
+            {
+                let phi0 = circ.center_km.1.atan2(circ.center_km.0);
+                let (sb, cb) = (phi0 + rmw_ring.vt1_phase_deg.to_radians()).sin_cos();
+                let tip = to_screen(circ.center_km.0 + rmw * cb, circ.center_km.1 + rmw * sb);
+                let hub = to_screen(circ.center_km.0, circ.center_km.1);
+                let cyan = egui::Color32::from_rgb(0, 220, 220);
+                painter.line_segment([hub, tip], egui::Stroke::new(1.5, cyan));
+                painter.circle_filled(tip, 4.0, cyan);
+                painter.text(
+                    tip + egui::vec2(6.0, -6.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("asym {:.0} kt", rmw_ring.vt1_amp * MS_TO_KT),
+                    egui::FontId::proportional(11.0),
+                    cyan,
+                );
+            }
         }
 
         let center = to_screen(circ.center_km.0, circ.center_km.1);
@@ -298,6 +333,7 @@ impl crate::ViewerApp {
                         ui.label("VT kt");
                         ui.label("VR m/s");
                         ui.label("VT1 m/s");
+                        ui.label("VT1 kt");
                         ui.label("VT1 °");
                         ui.label("n");
                         ui.end_row();
@@ -307,6 +343,7 @@ impl crate::ViewerApp {
                             ui.label(format!("{:.0}", ring.vt * MS_TO_KT));
                             ui.label(format!("{:.0}", ring.vr));
                             ui.label(format!("{:.0}", ring.vt1_amp));
+                            ui.label(format!("{:.0}", ring.vt1_amp * MS_TO_KT));
                             ui.label(format!("{:.0}", ring.vt1_phase_deg));
                             ui.label(format!("{}", ring.samples));
                             ui.end_row();
