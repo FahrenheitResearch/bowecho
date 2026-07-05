@@ -1868,6 +1868,20 @@ struct ViewerApp {
     /// fallback actually happened — which is what stops a single data-poor
     /// frame from permanently hijacking the loop's product.
     pending_product_restore: Option<DisplayProduct>,
+    /// True for the single `install_volume_arc` call of a PLAYING loop step
+    /// (`advance_primary_screen_loop` sets it around
+    /// `select_history_frame_with_options`). When a loop step lands on a frame
+    /// that cannot materialize the selected velocity product, the install
+    /// resolves the frame DOWN to a reflectivity fallback and stashes the
+    /// intent in `pending_product_restore`; pushing that reflectivity frame to
+    /// the display is the ~1-frame velocity->reflectivity flash seen live on
+    /// BAVI-26. While this flag is set, `install_volume_arc` HOLDS the prior
+    /// velocity frame's display for that one step instead (the cursor already
+    /// advanced and the frame is in history, so time keeps moving and the next
+    /// velocity-capable frame installs normally). Scoped to the loop-advance
+    /// path so the polled "LIVE WINS" install (census D9) and manual frame
+    /// selection still show the newest/selected frame even on a fallback.
+    loop_step_hold_display_on_product_fallback: bool,
     advanced_products_enabled: bool,
     /// The primary view's loop engine (`EngineRole::Primary`, `EngineId(0)`
     /// — the session-monotonic layer/pane counter starts at 1, so 0 is
@@ -6682,6 +6696,7 @@ impl ViewerApp {
             selected_cut: 0,
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
             pending_product_restore: None,
+            loop_step_hold_display_on_product_fallback: false,
             advanced_products_enabled: false,
             primary,
             low_sweep_disabled_cuts: BTreeSet::new(),
@@ -8374,10 +8389,48 @@ impl ViewerApp {
         // Fallback-restore bookkeeping: resolving to the seed satisfies any
         // pending restore; resolving to a *different* product means the frame
         // couldn't show the seed, so remember it for a later capable frame.
-        if selected_product == seed_product {
-            self.pending_product_restore = None;
-        } else {
+        let installed_is_product_fallback = selected_product != seed_product;
+        // The jarring case this fix targets: the user's selected intent is a
+        // velocity product but the frame can only show reflectivity (a
+        // velocity-less partial). NARROW to exactly that — a reflectivity
+        // primary that falls back to velocity (e.g. a velocity-only frame) is
+        // an unrelated, non-jarring fallback that must still install normally.
+        let seed_is_velocity = matches!(
+            seed_product,
+            DisplayProduct::Moment(MomentType::Velocity)
+                | DisplayProduct::DealiasedVelocity
+                | DisplayProduct::StormRelativeVelocity
+                | DisplayProduct::StormRelativeDealiasedVelocity
+        );
+        if installed_is_product_fallback {
             self.pending_product_restore = Some(seed_product);
+        } else {
+            self.pending_product_restore = None;
+        }
+        let velocity_fell_back_to_reflectivity = seed_is_velocity
+            && matches!(
+                selected_product,
+                DisplayProduct::Moment(MomentType::Reflectivity)
+            );
+        // Flash-free loop step (see the field doc on
+        // `loop_step_hold_display_on_product_fallback`): a PLAYING loop that
+        // just stepped onto a frame which cannot materialize the selected
+        // velocity product resolved it DOWN to a reflectivity fallback (above)
+        // and stashed the velocity intent in `pending_product_restore`. Do NOT
+        // push that one reflectivity frame to the display — hold the prior
+        // velocity frame for this single step. The cursor already advanced and
+        // the derived frame is in history (written back above), so the loop
+        // keeps time and the next velocity-capable frame installs normally.
+        // `self.volume.is_some()` guards the very first frame (nothing to hold,
+        // so show the fallback). Only the loop-advance path sets the flag, so
+        // the polled "LIVE WINS" install (census D9) and manual frame selection
+        // still take the newest/selected frame even when it falls back.
+        if velocity_fell_back_to_reflectivity
+            && self.loop_step_hold_display_on_product_fallback
+            && self.volume.is_some()
+        {
+            ctx.request_repaint();
+            return;
         }
         let catalog_index = self
             .sites
@@ -9330,7 +9383,13 @@ impl ViewerApp {
             // no-steppable-frame arm).
             return;
         };
+        // Hold the prior velocity display (instead of flashing reflectivity)
+        // if this step lands on a frame that can't materialize the selected
+        // velocity product — see `loop_step_hold_display_on_product_fallback`.
+        // Scoped tightly to this one install: set before, clear after.
+        self.loop_step_hold_display_on_product_fallback = true;
         self.select_history_frame_with_options(next_index, false, false, ctx);
+        self.loop_step_hold_display_on_product_fallback = false;
         self.sync_owned_extra_panes_to_primary_timeline_frame(next_index, ctx);
         self.select_first_history_low_sweep_if_enabled(ctx);
         self.primary.cursor.playing = self.primary_history_loop_can_step();
@@ -55988,6 +56047,107 @@ mod tests {
         eprintln!("REAL PGUA: following velocity pane stayed velocity across the loop");
     }
 
+    /// The flash-free companion to the restore regression above: while a
+    /// velocity history loop is PLAYING, stepping onto a frame that cannot
+    /// materialize velocity (a truncated reflectivity-only partial) must NOT
+    /// flash reflectivity for that one step. `advance_primary_screen_loop`
+    /// holds the prior velocity frame's display (`self.volume` +
+    /// `selected_product` stay put) while the cursor advances, then the next
+    /// velocity-capable frame restores the velocity display. Drives the real
+    /// loop-advance path (advance_primary_screen_loop ->
+    /// select_history_frame_with_options -> install_volume_arc) — the exact
+    /// path BAVI-26 flashed on live.
+    #[test]
+    fn playing_velocity_loop_holds_display_over_velocityless_frame() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.app_settings.loop_low_sweeps = false; // plain modulo advance
+        app.sat_map_follow = false;
+        app.model_timeline_follow = false;
+
+        // Frames 0 and 2 carry velocity; frame 1 is reflectivity-only.
+        let t0 = Utc.with_ymd_and_hms(2026, 6, 9, 5, 40, 0).unwrap();
+        let mut vel0 = test_ref_then_velocity_volume();
+        vel0.volume_time = t0;
+        let vel0 = Arc::new(vel0);
+        let mut refl_only = test_reflectivity_sails_volume_with_radials(&[(0.5, 0)], 720);
+        refl_only.volume_time = t0 + chrono::Duration::minutes(4);
+        let refl_only = Arc::new(refl_only);
+        let mut vel2 = test_ref_then_velocity_volume();
+        vel2.volume_time = t0 + chrono::Duration::minutes(8);
+        let vel2 = Arc::new(vel2);
+
+        app.primary.history = [
+            (PathBuf::from("vel-0540"), Arc::clone(&vel0)),
+            (PathBuf::from("refl-0544"), Arc::clone(&refl_only)),
+            (PathBuf::from("vel-0548"), Arc::clone(&vel2)),
+        ]
+        .into_iter()
+        .map(|(path, volume)| FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path,
+            volume,
+            timings: None,
+            status: FrameStatus::Complete,
+            source_label: "hold-test".to_owned(),
+        })
+        .collect();
+        app.primary.limits.frame_limit = 3;
+
+        // Display the first (velocity-capable) frame with velocity selected.
+        app.primary.cursor.index = 0;
+        app.volume = Some(Arc::clone(&vel0));
+        app.selected_cut = 0;
+        assert!(app.switch_primary_product(DisplayProduct::Moment(MomentType::Velocity)));
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Velocity)
+        );
+        assert!(app.pending_product_restore.is_none());
+        app.primary.cursor.playing = true;
+
+        // Step onto the reflectivity-only frame: the display HOLDS on the prior
+        // velocity frame (no reflectivity flash) while the cursor advances.
+        app.advance_primary_screen_loop(&ctx);
+        assert_eq!(app.primary.cursor.index, 1, "the cursor advanced");
+        assert!(app.primary.cursor.playing, "the loop keeps playing");
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Velocity),
+            "held: the display never flashed reflectivity"
+        );
+        assert!(
+            app.volume
+                .as_ref()
+                .is_some_and(|volume| Arc::ptr_eq(volume, &vel0)),
+            "held: the displayed volume stays on the prior velocity frame"
+        );
+        assert_eq!(
+            app.pending_product_restore,
+            Some(DisplayProduct::Moment(MomentType::Velocity)),
+            "the held step remembers velocity to restore"
+        );
+
+        // Step onto the next velocity-capable frame: velocity restores normally.
+        app.advance_primary_screen_loop(&ctx);
+        assert_eq!(app.primary.cursor.index, 2, "the cursor advanced again");
+        assert_eq!(
+            app.selected_product,
+            DisplayProduct::Moment(MomentType::Velocity),
+            "velocity restores on the next capable frame"
+        );
+        assert!(
+            app.volume
+                .as_ref()
+                .is_some_and(|volume| Arc::ptr_eq(volume, &vel2)),
+            "recovered: the display is now the new velocity frame"
+        );
+        assert!(
+            app.pending_product_restore.is_none(),
+            "recovery satisfied, nothing pending"
+        );
+    }
+
     #[test]
     fn pinned_independent_velocity_pane_defers_live_partial_without_selected_cut() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
@@ -68290,6 +68450,7 @@ mod tests {
             selected_cut: 0,
             selected_product: DisplayProduct::Moment(MomentType::Reflectivity),
             pending_product_restore: None,
+            loop_step_hold_display_on_product_fallback: false,
             advanced_products_enabled: false,
             primary,
             low_sweep_disabled_cuts: BTreeSet::new(),
