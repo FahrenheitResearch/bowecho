@@ -156,8 +156,11 @@ pub struct ForecastPoint {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StormGeometry {
     pub centroid: Option<GeoPoint>,
-    /// Best-track + forecast track, concatenated in order.
-    pub track: Vec<GeoPoint>,
+    /// Track polylines (past + forecast). GDACS delivers the track as many
+    /// short, independently-oriented segments, so these are kept SEPARATE (not
+    /// concatenated) — flattening them into one polyline zigzags and draws
+    /// spurious connecting lines. Each inner Vec is one drawable segment.
+    pub track: Vec<Vec<GeoPoint>>,
     /// Cone-of-uncertainty outer ring.
     pub cone: Vec<GeoPoint>,
 }
@@ -566,7 +569,12 @@ pub fn parse_gdacs_geometry(json: &str) -> Result<StormGeometry, String> {
     }
 
     lines.sort_by_key(|(index, _)| *index);
-    let track = lines.into_iter().flat_map(|(_, points)| points).collect();
+    // Keep each GDACS segment as its own polyline (see StormGeometry::track).
+    let track = lines
+        .into_iter()
+        .map(|(_, points)| points)
+        .filter(|points| points.len() >= 2)
+        .collect();
     Ok(StormGeometry {
         centroid,
         track,

@@ -326,9 +326,14 @@ impl crate::ViewerApp {
                     jump_px,
                 );
             }
-            if geom.track.len() >= 2 {
-                let line: Vec<egui::Pos2> = geom
-                    .track
+            // Draw each GDACS track segment on its own — they are short,
+            // independently-oriented pieces; joining them into one polyline
+            // zigzags and crosses the map with spurious connecting lines.
+            for segment in &geom.track {
+                if segment.len() < 2 {
+                    continue;
+                }
+                let line: Vec<egui::Pos2> = segment
                     .iter()
                     .map(|p| self.lon_lat_to_screen(rect, p.lon, p.lat))
                     .collect();
