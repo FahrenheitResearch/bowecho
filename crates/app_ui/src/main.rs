@@ -176,14 +176,17 @@ const HIGH_END_LOOP_RENDER_CACHE_BYTES: usize = 512 * 1024 * 1024;
 /// Byte budget for the shared dealiased-velocity grid memo
 /// ([`dealias_grid_cache`]). A dealiased super-res velocity tilt is ~1.7 MB
 /// (measured on live PGUA: 720 radials × 1192 gates, 16-bit storage; F32
-/// grids from other feeds are ~2× that), so the high-end budget covers a full
-/// ~200-frame super-res loop at one cut without re-running the ~200 ms
-/// dealiaser on replay; smaller tiers keep the hottest recent frames via LRU.
-/// These grids are a few percent of the raw volumes the radar-history budget
-/// already holds (~60-100 MB each), so the extra footprint is safe.
-const LOW_END_DEALIAS_GRID_CACHE_BYTES: usize = 64 * 1024 * 1024;
-const MID_RANGE_DEALIAS_GRID_CACHE_BYTES: usize = 192 * 1024 * 1024;
-const HIGH_END_DEALIAS_GRID_CACHE_BYTES: usize = 384 * 1024 * 1024;
+/// grids from other feeds are ~2× that). Sized so a full LONG super-res loop
+/// (the player loads 256+ frames; the ceiling is 2000) is dealiased ONCE and
+/// reused on every replay and product toggle, instead of the old 384 MiB tier
+/// that held only ~200 grids and re-ran the ~200 ms dealiaser after a few
+/// passes ("fast for 4 loops then slow again"). These grids are a few percent
+/// of the raw volumes the radar-history budget already holds (~60-100 MB
+/// each), so even the high-end 3 GiB (~1800 grids) is a safe fraction; smaller
+/// tiers keep the hottest recent frames via LRU.
+const LOW_END_DEALIAS_GRID_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const MID_RANGE_DEALIAS_GRID_CACHE_BYTES: usize = 1024 * 1024 * 1024;
+const HIGH_END_DEALIAS_GRID_CACHE_BYTES: usize = 3 * 1024 * 1024 * 1024;
 /// Keep prewarming a sliding working set instead of eventually rasterizing the
 /// entire history while playback is paused or running.
 const LOOP_PREWARM_PLAYING_LOOKAHEAD_FRAMES: usize = 24;
