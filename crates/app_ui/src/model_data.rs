@@ -381,6 +381,33 @@ impl ModelDataDock {
     fn import_pickers(&mut self, ui: &mut egui::Ui) {
         let busy = self.import_job.is_some();
         ui.horizontal_wrapped(|ui| {
+            // Single-file import — the common case; no need to point at a whole
+            // folder / batch. `spawn_import_paths` already takes a path list, so
+            // a one-element vec imports exactly the chosen file.
+            if ui
+                .add_enabled(!busy, egui::Button::new("📄 WRF/NetCDF file…"))
+                .on_hover_text(
+                    "Import a SINGLE WRF/NetCDF file into the model store (one forecast \
+                     hour). Handles raw wrfout, post-processed climate wrfout, and plain \
+                     NetCDF. Click a point in the field viewer afterwards to sound it.",
+                )
+                .clicked()
+                && let Some(file) = rfd::FileDialog::new()
+                    .set_title("Choose a WRF/NetCDF file to import")
+                    .pick_file()
+            {
+                let name = file
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| file.display().to_string());
+                let task = crate::local_import::spawn_import_paths(
+                    vec![file],
+                    self.store_root.clone(),
+                );
+                self.import_message = Some(format!("Importing {name}…"));
+                self.import_job = Some(ImportJob::Local(task));
+            }
+
             if ui
                 .add_enabled(!busy, egui::Button::new("📥 WRF/NetCDF folder…"))
                 .on_hover_text(
