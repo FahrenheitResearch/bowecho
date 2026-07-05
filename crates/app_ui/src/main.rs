@@ -173,6 +173,17 @@ const HIGH_END_SAMPLE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const LOW_END_LOOP_RENDER_CACHE_BYTES: usize = 96 * 1024 * 1024;
 const MID_RANGE_LOOP_RENDER_CACHE_BYTES: usize = 384 * 1024 * 1024;
 const HIGH_END_LOOP_RENDER_CACHE_BYTES: usize = 512 * 1024 * 1024;
+/// Byte budget for the shared dealiased-velocity grid memo
+/// ([`dealias_grid_cache`]). A dealiased super-res velocity tilt is ~1.7 MB
+/// (measured on live PGUA: 720 radials × 1192 gates, 16-bit storage; F32
+/// grids from other feeds are ~2× that), so the high-end budget covers a full
+/// ~200-frame super-res loop at one cut without re-running the ~200 ms
+/// dealiaser on replay; smaller tiers keep the hottest recent frames via LRU.
+/// These grids are a few percent of the raw volumes the radar-history budget
+/// already holds (~60-100 MB each), so the extra footprint is safe.
+const LOW_END_DEALIAS_GRID_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const MID_RANGE_DEALIAS_GRID_CACHE_BYTES: usize = 192 * 1024 * 1024;
+const HIGH_END_DEALIAS_GRID_CACHE_BYTES: usize = 384 * 1024 * 1024;
 /// Keep prewarming a sliding working set instead of eventually rasterizing the
 /// entire history while playback is paused or running.
 const LOOP_PREWARM_PLAYING_LOOKAHEAD_FRAMES: usize = 24;
@@ -4420,6 +4431,160 @@ struct DealiasedReadoutCache {
     /// readout cache so the cursor readout matches the rendered image.
     dealias_engine: DealiasEngine,
     grid: Arc<MomentGrid>,
+}
+
+/// Identity of one dealiased velocity tilt. The `volume_ptr` invalidates the
+/// entry automatically when the source volume is replaced (a new `Arc`
+/// address); `reference_volume_ptr`/`dealias_env_ptr` are the previous volume
+/// and RAP profile the `Analyst3d` engine consumes (both `0` for the pure
+/// same-tilt `Region`/`RegionGlobal` engines), so switching any input yields a
+/// distinct key rather than a stale hit.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct DealiasGridKey {
+    volume_ptr: usize,
+    reference_volume_ptr: usize,
+    dealias_env_ptr: usize,
+    cut_index: usize,
+    engine: DealiasEngine,
+}
+
+impl DealiasGridKey {
+    /// Key for the pure same-tilt engines (`Region`/`RegionGlobal`): they read
+    /// only this volume's own tilt, so the reference/env pointers are `0`.
+    fn same_tilt(volume_ptr: usize, cut_index: usize, engine: DealiasEngine) -> Self {
+        Self {
+            volume_ptr,
+            reference_volume_ptr: 0,
+            dealias_env_ptr: 0,
+            cut_index,
+            engine,
+        }
+    }
+}
+
+struct DealiasGridEntry {
+    key: DealiasGridKey,
+    grid: Arc<MomentGrid>,
+    bytes: usize,
+}
+
+/// Approximate resident size of a dealiased grid, for the cache byte budget.
+fn moment_grid_cache_bytes(grid: &MomentGrid) -> usize {
+    let word_bytes = usize::from(grid.storage.word_size_bits()) / 8;
+    grid.storage.len() * word_bytes.max(1)
+        + grid.radial_indices.len() * std::mem::size_of::<usize>()
+        + std::mem::size_of::<MomentGrid>()
+}
+
+/// Byte-bounded LRU memo of dealiased velocity grids. `front` is the
+/// least-recently-used entry, `back` the most-recent; a hit moves its entry to
+/// the back so a full-loop working set survives while stale tilts age out.
+/// Linear scan is fine: lookups happen on render-cache misses (a handful per
+/// frame), never per pixel, and the entry count stays in the low hundreds.
+struct DealiasGridCache {
+    entries: VecDeque<DealiasGridEntry>,
+    bytes: usize,
+    budget_bytes: usize,
+}
+
+impl DealiasGridCache {
+    fn with_budget(budget_bytes: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            bytes: 0,
+            budget_bytes,
+        }
+    }
+
+    /// Return the cached grid for `key`, promoting it to most-recently-used.
+    fn get(&mut self, key: &DealiasGridKey) -> Option<Arc<MomentGrid>> {
+        let pos = self.entries.iter().position(|entry| entry.key == *key)?;
+        let entry = self.entries.remove(pos)?;
+        let grid = Arc::clone(&entry.grid);
+        self.entries.push_back(entry);
+        Some(grid)
+    }
+
+    /// Store `grid` under `key` (most-recently-used), then evict oldest entries
+    /// until within the byte budget. The just-inserted entry is never evicted.
+    fn insert(&mut self, key: DealiasGridKey, grid: Arc<MomentGrid>) {
+        if let Some(pos) = self.entries.iter().position(|entry| entry.key == key)
+            && let Some(old) = self.entries.remove(pos)
+        {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+        }
+        let bytes = moment_grid_cache_bytes(&grid);
+        self.bytes += bytes;
+        self.entries.push_back(DealiasGridEntry { key, grid, bytes });
+        while self.bytes > self.budget_bytes && self.entries.len() > 1 {
+            let Some(front) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(front.bytes);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn total_bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+fn dealias_grid_cache_budget_bytes() -> usize {
+    match effective_worker_threads() {
+        0..=7 => LOW_END_DEALIAS_GRID_CACHE_BYTES,
+        8..=15 => MID_RANGE_DEALIAS_GRID_CACHE_BYTES,
+        _ => HIGH_END_DEALIAS_GRID_CACHE_BYTES,
+    }
+}
+
+/// Process-wide memo of dealiased velocity grids. The three dealiasers
+/// (`dealias_velocity_grid`, `dealias_velocity_grid_pyart_region`,
+/// `dealias_velocity_grid_v4`) cost ~200 ms/tilt (measured: 219 ms on a live
+/// PGUA super-res velocity cut); without this, replaying a loop or toggling a
+/// product back to dealiased velocity re-runs them on every frame. Shared
+/// across ALL render workers (primary, panes, overlay, and the
+/// one-shot loop-prewarm pool whose Overlay policy keeps only one moment cache)
+/// plus the UI-thread cursor readout, so a given (volume, cut, engine) tilt is
+/// dealiased at most once. LRU-bounded so a long loop cannot grow it forever.
+fn dealias_grid_cache() -> &'static Mutex<DealiasGridCache> {
+    static CACHE: OnceLock<Mutex<DealiasGridCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(DealiasGridCache::with_budget(dealias_grid_cache_budget_bytes())))
+}
+
+/// Return the memoized dealiased grid for `key`, computing it via `compute`
+/// only on a miss. The dealias runs WITHOUT the cache lock held (~200 ms would
+/// otherwise serialize every render worker); a concurrent duplicate compute is
+/// harmless and dedups to a single shared `Arc` on insert. `compute` returns
+/// `None` when the tilt cannot be dealiased (e.g. `Analyst3d` failure), which
+/// is not cached.
+fn cached_dealias_grid(
+    key: DealiasGridKey,
+    compute: impl FnOnce() -> Option<MomentGrid>,
+) -> Option<Arc<MomentGrid>> {
+    if let Some(hit) = dealias_grid_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(&key)
+    {
+        return Some(hit);
+    }
+    let grid = Arc::new(compute()?);
+    let mut cache = dealias_grid_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    // Another worker may have computed the same key while we were unlocked;
+    // prefer its entry so every caller shares one Arc.
+    if let Some(existing) = cache.get(&key) {
+        return Some(existing);
+    }
+    cache.insert(key, Arc::clone(&grid));
+    Some(grid)
 }
 
 #[derive(Clone, Debug)]
@@ -11941,12 +12106,33 @@ impl ViewerApp {
                     &request.color_tables,
                 )
             } else if dealiased_velocity {
-                ViewportMomentCache::new_dealiased_velocity_with_color_tables(
-                    request.volume.as_ref(),
-                    request.cut,
-                    &request.color_tables,
-                )
-                .map_err(|err| err.to_string())
+                // Region native fast path. Memoize the dealiased grid (shared
+                // with the other engines' path and the readout) so replay /
+                // toggles reuse it instead of re-running the dealiaser.
+                let key = DealiasGridKey::same_tilt(volume_ptr, request.cut, DealiasEngine::Region);
+                match cached_dealias_grid(key, || {
+                    let cut = request.volume.cuts.get(request.cut)?;
+                    let source = cut.moments.get(&MomentType::Velocity)?;
+                    Some(dealias_velocity_grid(cut, source))
+                }) {
+                    Some(grid) => {
+                        ViewportMomentCache::new_dealiased_velocity_from_grid_with_color_tables(
+                            request.volume.as_ref(),
+                            request.cut,
+                            (*grid).clone(),
+                            &request.color_tables,
+                        )
+                        .map_err(|err| err.to_string())
+                    }
+                    // Missing cut/velocity moment — let the original path
+                    // surface the precise RenderError.
+                    None => ViewportMomentCache::new_dealiased_velocity_with_color_tables(
+                        request.volume.as_ref(),
+                        request.cut,
+                        &request.color_tables,
+                    )
+                    .map_err(|err| err.to_string()),
+                }
             } else {
                 ViewportMomentCache::new_with_color_tables_for_family(
                     request.volume.as_ref(),
@@ -12315,11 +12501,29 @@ impl ViewerApp {
         .is_none()
         {
             let cache = if velocity_render_dealiased {
-                ViewportMomentCache::new_dealiased_velocity_with_color_tables(
-                    request.volume.as_ref(),
-                    cut,
-                    &request.color_tables,
-                )
+                // Prefetch warms a Region-dealiased velocity tilt; reuse the
+                // shared dealias memo so it costs nothing when the tilt was
+                // already dealiased for the displayed frame.
+                let key = DealiasGridKey::same_tilt(volume_ptr, cut, DealiasEngine::Region);
+                match cached_dealias_grid(key, || {
+                    let elevation_cut = request.volume.cuts.get(cut)?;
+                    let source = elevation_cut.moments.get(&MomentType::Velocity)?;
+                    Some(dealias_velocity_grid(elevation_cut, source))
+                }) {
+                    Some(grid) => {
+                        ViewportMomentCache::new_dealiased_velocity_from_grid_with_color_tables(
+                            request.volume.as_ref(),
+                            cut,
+                            (*grid).clone(),
+                            &request.color_tables,
+                        )
+                    }
+                    None => ViewportMomentCache::new_dealiased_velocity_with_color_tables(
+                        request.volume.as_ref(),
+                        cut,
+                        &request.color_tables,
+                    ),
+                }
             } else {
                 ViewportMomentCache::new_with_color_tables(
                     request.volume.as_ref(),
@@ -14378,16 +14582,29 @@ impl ViewerApp {
 
         let cut = volume.cuts.get(cut_index)?;
         let source_grid = cut.moments.get(&MomentType::Velocity)?;
-        let grid = Arc::new(match self.dealias_engine {
+        // L1 (single-entry) miss: consult the shared render/readout dealias
+        // memo (L2) before recomputing. The render workers populate it too, so
+        // scrubbing/looping reuses their grids instead of re-dealiasing here.
+        let engine = self.dealias_engine;
+        let key = DealiasGridKey {
+            volume_ptr,
+            reference_volume_ptr,
+            dealias_env_ptr,
+            cut_index,
+            engine,
+        };
+        let grid = cached_dealias_grid(key, || match engine {
             DealiasEngine::Analyst3d => dealias_velocity_grid_v4(
                 volume,
                 cut_index,
                 previous_volume.as_deref(),
                 dealias_env.as_deref(),
-            )?,
-            DealiasEngine::RegionGlobal => dealias_velocity_grid_pyart_region(cut, source_grid),
-            DealiasEngine::Region => dealias_velocity_grid(cut, source_grid),
-        });
+            ),
+            DealiasEngine::RegionGlobal => {
+                Some(dealias_velocity_grid_pyart_region(cut, source_grid))
+            }
+            DealiasEngine::Region => Some(dealias_velocity_grid(cut, source_grid)),
+        })?;
         self.dealiased_readout_cache = Some(DealiasedReadoutCache {
             volume_ptr,
             reference_volume_ptr,
@@ -42970,14 +43187,38 @@ fn build_preprocessed_plain_cache(
         .get(moment)
         .ok_or_else(|| format!("moment {moment:?} missing"))?;
     let mut source = if dealiased_velocity {
-        match dealias_engine {
+        // Memoize the dealiased grid so a loop replay / product toggle does not
+        // re-run the ~200 ms dealiaser per frame. Only Analyst3d reads the
+        // previous volume + RAP profile; the pure engines key those as 0.
+        let (reference_volume_ptr, dealias_env_ptr) = if dealias_engine == DealiasEngine::Analyst3d
+        {
+            (
+                previous_volume
+                    .map(|reference| reference as *const RadarVolume as usize)
+                    .unwrap_or(0),
+                dealias_env
+                    .map(|profile| profile as *const EnvironmentalWindProfile as usize)
+                    .unwrap_or(0),
+            )
+        } else {
+            (0, 0)
+        };
+        let key = DealiasGridKey {
+            volume_ptr: volume as *const RadarVolume as usize,
+            reference_volume_ptr,
+            dealias_env_ptr,
+            cut_index,
+            engine: dealias_engine,
+        };
+        let dealiased = cached_dealias_grid(key, || match dealias_engine {
             DealiasEngine::Analyst3d => {
                 dealias_velocity_grid_v4(volume, cut_index, previous_volume, dealias_env)
-                    .ok_or_else(|| "model-anchored 3-D dealias failed".to_owned())?
             }
-            DealiasEngine::RegionGlobal => dealias_velocity_grid_pyart_region(cut, grid),
-            DealiasEngine::Region => dealias_velocity_grid(cut, grid),
-        }
+            DealiasEngine::RegionGlobal => Some(dealias_velocity_grid_pyart_region(cut, grid)),
+            DealiasEngine::Region => Some(dealias_velocity_grid(cut, grid)),
+        })
+        .ok_or_else(|| "model-anchored 3-D dealias failed".to_owned())?;
+        (*dealiased).clone()
     } else {
         grid.clone()
     };
@@ -53086,6 +53327,95 @@ mod tests {
         assert_eq!(high.sample_cache_capacity(), 6);
         assert_eq!(high.moment_cache_capacity(), 6);
         assert_eq!(high.sample_cache_bytes(), HIGH_END_SAMPLE_CACHE_BYTES);
+    }
+
+    fn dealias_grid_of_bytes(target_bytes: usize) -> MomentGrid {
+        // One F32 row; gate_count chosen so the grid's cache size is ~target.
+        let base = std::mem::size_of::<MomentGrid>() + std::mem::size_of::<usize>();
+        let gate_count = target_bytes.saturating_sub(base) / 4;
+        MomentGrid {
+            moment: MomentType::Velocity,
+            gate_range: radar_core::GateRange {
+                first_gate_m: 250,
+                gate_spacing_m: 250,
+                gate_count,
+            },
+            scale: 1.0,
+            offset: 0.0,
+            nodata: None,
+            range_folded: None,
+            radial_indices: vec![0],
+            storage: MomentStorage::F32(vec![0.0; gate_count]),
+        }
+    }
+
+    fn region_key(volume_ptr: usize, cut: usize) -> DealiasGridKey {
+        DealiasGridKey::same_tilt(volume_ptr, cut, DealiasEngine::Region)
+    }
+
+    /// The dealiaser runs at most once per (volume, cut, engine): repeated
+    /// lookups of the same key (a loop replay / product toggle) reuse the grid.
+    #[test]
+    fn dealias_grid_cache_memoizes_per_key() {
+        use std::cell::Cell;
+        let mut cache = DealiasGridCache::with_budget(64 * 1024 * 1024);
+        let computes = Cell::new(0usize);
+        // Mirrors `cached_dealias_grid`'s get-else-compute-insert on a local
+        // instance (the production helper uses a process-global mutex).
+        let get_or = |cache: &mut DealiasGridCache, key: DealiasGridKey| {
+            if let Some(hit) = cache.get(&key) {
+                return hit;
+            }
+            computes.set(computes.get() + 1);
+            let grid = Arc::new(dealias_grid_of_bytes(4096));
+            cache.insert(key, Arc::clone(&grid));
+            grid
+        };
+        let key = region_key(0x1000, 2);
+        for _ in 0..5 {
+            let _ = get_or(&mut cache, key);
+        }
+        assert_eq!(computes.get(), 1, "same key must dealias exactly once");
+
+        // A different cut / engine / volume is a distinct computation.
+        let _ = get_or(&mut cache, region_key(0x1000, 3));
+        let _ = get_or(&mut cache, region_key(0x2000, 2));
+        let _ = get_or(
+            &mut cache,
+            DealiasGridKey::same_tilt(0x1000, 2, DealiasEngine::RegionGlobal),
+        );
+        assert_eq!(computes.get(), 4);
+    }
+
+    /// The cache is byte-bounded: over-budget inserts evict oldest-first, and a
+    /// recently-used entry survives eviction (LRU, not FIFO).
+    #[test]
+    fn dealias_grid_cache_evicts_lru_over_budget() {
+        let entry_bytes = 1024 * 1024; // 1 MiB per grid.
+        let mut cache = DealiasGridCache::with_budget(3 * entry_bytes + entry_bytes / 2);
+        for cut in 0..3 {
+            cache.insert(region_key(0x1000, cut), Arc::new(dealias_grid_of_bytes(entry_bytes)));
+        }
+        assert_eq!(cache.len(), 3);
+        // Touch the oldest so it becomes most-recent, then overflow the budget.
+        assert!(cache.get(&region_key(0x1000, 0)).is_some());
+        cache.insert(region_key(0x1000, 3), Arc::new(dealias_grid_of_bytes(entry_bytes)));
+
+        assert!(cache.total_bytes() <= cache.budget_bytes);
+        // cut 1 was the least-recently-used → evicted; cut 0 (just touched) stays.
+        assert!(cache.get(&region_key(0x1000, 1)).is_none());
+        assert!(cache.get(&region_key(0x1000, 0)).is_some());
+        assert!(cache.get(&region_key(0x1000, 3)).is_some());
+    }
+
+    /// A single over-budget grid is still cached (the just-inserted entry is
+    /// never the eviction victim).
+    #[test]
+    fn dealias_grid_cache_keeps_single_oversized_entry() {
+        let mut cache = DealiasGridCache::with_budget(1024);
+        cache.insert(region_key(0x1000, 0), Arc::new(dealias_grid_of_bytes(8 * 1024 * 1024)));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(&region_key(0x1000, 0)).is_some());
     }
 
     #[test]

@@ -696,6 +696,38 @@ impl ViewportMomentCache {
         }
 
         let dealiased_grid = dealias_velocity_grid(cut, source_grid);
+        Self::new_dealiased_velocity_from_grid_with_color_tables(
+            volume,
+            cut_index,
+            dealiased_grid,
+            color_tables,
+        )
+    }
+
+    /// Like [`Self::new_dealiased_velocity_with_color_tables`] but reuses a
+    /// velocity grid that was ALREADY dealiased (e.g. served from a per-volume
+    /// memo) instead of running the region dealiaser again. Identical result;
+    /// it just skips the ~100 ms dealias so loop replay / product toggles do
+    /// not recompute it per frame.
+    pub fn new_dealiased_velocity_from_grid_with_color_tables(
+        volume: &RadarVolume,
+        cut_index: usize,
+        dealiased_grid: MomentGrid,
+        color_tables: &ColorTableSet,
+    ) -> Result<Self> {
+        let cut = volume
+            .cuts
+            .get(cut_index)
+            .ok_or(RenderError::CutOutOfRange {
+                index: cut_index,
+                cut_count: volume.cuts.len(),
+            })?;
+        if dealiased_grid.radial_indices.is_empty() {
+            return Err(RenderError::EmptyMoment {
+                cut_index,
+                moment: MomentType::Velocity,
+            });
+        }
         Ok(Self {
             volume_ptr: volume as *const RadarVolume as usize,
             cut_index,
