@@ -1282,6 +1282,22 @@ fn decoded_volume_decode_count() -> u64 {
     DECODED_VOLUME_DECODE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Count of ACTUAL velocity dealias runs performed by [`cached_dealias_grid`]
+/// (shared-memo cache MISSES only). A cache hit does not bump it. Read by tests
+/// to prove the primary render and a following/pinned pane render the SAME
+/// dealiased tilt without re-running the ~200 ms region dealiaser twice.
+static DEALIAS_GRID_COMPUTE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn note_dealias_grid_computed() {
+    DEALIAS_GRID_COMPUTE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn dealias_grid_compute_count() -> u64 {
+    DEALIAS_GRID_COMPUTE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 struct CachedVolumeEntry {
     volume: Arc<RadarVolume>,
     bytes: usize,
@@ -4777,6 +4793,11 @@ fn cached_dealias_grid(
     {
         return Some(hit);
     }
+    // Count actual dealias runs (cache misses). Relaxed is fine: this is a
+    // diagnostic tally, never a synchronization signal. Lets tests assert a
+    // given (volume, cut, engine) tilt is dealiased at most once across the
+    // primary AND every pane, which is the whole point of the shared memo.
+    note_dealias_grid_computed();
     let grid = Arc::new(compute()?);
     let mut cache = dealias_grid_cache()
         .lock()
@@ -14418,31 +14439,28 @@ impl ViewerApp {
         }
     }
 
-    /// Request a render for an extra pane (1-based), mirroring
-    /// request_texture_render but reading the pane's product. Shares the
-    /// volume, geo transform, tilt, and render worker with the primary view.
-    fn request_pane_render(&mut self, ctx: &egui::Context, rect: egui::Rect, pane_number: usize) {
-        let Some(pane_slot) = pane_number.checked_sub(1) else {
-            return;
-        };
+    /// Build the [`RenderRequest`] for an extra pane (1-based) WITHOUT sending
+    /// it — the pure half of [`Self::request_pane_render`]. Split out so the
+    /// pane/primary render inputs (volume `Arc`, dealias reference/env
+    /// pointers, cut, engine) can be compared directly in tests: they must
+    /// match for the shared dealias-grid memo to hit instead of re-dealiasing
+    /// the same tilt once per pane.
+    fn extra_pane_render_request(
+        &self,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        pane_number: usize,
+    ) -> Option<RenderRequest> {
+        let pane_slot = pane_number.checked_sub(1)?;
         // Lane ids are 1-based pane numbers; the grid tops out at 4 panes,
         // so the u8 conversion cannot fail in practice.
-        let Ok(pane_lane) = u8::try_from(pane_number) else {
-            return;
-        };
-        let Some(volume) = self.extra_pane_display_volume(pane_slot) else {
-            return;
-        };
-        let Some((viewport_options, viewport_key)) = self.viewport_raster_options(ctx, rect) else {
-            return;
-        };
-        let Some((product, pane_cut)) = self
+        let pane_lane = u8::try_from(pane_number).ok()?;
+        let volume = self.extra_pane_display_volume(pane_slot)?;
+        let (viewport_options, viewport_key) = self.viewport_raster_options(ctx, rect)?;
+        let (product, pane_cut) = self
             .extra_panes
             .get(pane_slot)
-            .map(|p| (p.product.clone(), p.cut))
-        else {
-            return;
-        };
+            .map(|p| (p.product.clone(), p.cut))?;
         let volume = self.display_source_volume_for_extra_pane_product(
             pane_slot,
             &product,
@@ -14451,12 +14469,10 @@ impl ViewerApp {
         if let Some(explicit_cut) = pane_cut
             && !is_displayable_on_cut(volume.as_ref(), explicit_cut, &product)
         {
-            return;
+            return None;
         }
         let preferred_cut = pane_cut.unwrap_or(self.selected_cut);
-        let Some(cut) = display_cut_for_product(volume.as_ref(), preferred_cut, &product) else {
-            return;
-        };
+        let cut = display_cut_for_product(volume.as_ref(), preferred_cut, &product)?;
         let color_tables = self.render_color_tables_for_product(&product);
         let color_table_signature = color_tables.signature_for_family(product.color_family());
         let render_dealiased_velocity = self.product_render_uses_dealiased_velocity(&product);
@@ -14513,6 +14529,40 @@ impl ViewerApp {
             gate_filter_decidbz: self.gate_filter_key(),
             viewport: viewport_key,
         };
+        let radar_range_km = selected_grid_range_km_for(volume.as_ref(), cut, &product)
+            .unwrap_or(DEFAULT_RADAR_RANGE_KM);
+        Some(RenderRequest {
+            key,
+            lane: LaneId::Pane(pane_lane),
+            volume,
+            previous_volume,
+            dealias_env,
+            cut,
+            product,
+            render_dealiased_velocity,
+            plain_velocity_render_dealiased: self.unfold_velocity_display,
+            color_tables,
+            storm_motion: self.current_storm_motion(),
+            hail_levels_m: self.hail_levels_m(),
+            smoothing,
+            dealias_engine: self.dealias_engine,
+            gate_filter_decidbz: self.gate_filter_key(),
+            viewport_options,
+            radar_range_km,
+        })
+    }
+
+    /// Request a render for an extra pane (1-based), mirroring
+    /// request_texture_render but reading the pane's product. Shares the
+    /// volume, geo transform, tilt, and render worker with the primary view.
+    fn request_pane_render(&mut self, ctx: &egui::Context, rect: egui::Rect, pane_number: usize) {
+        let Some(pane_slot) = pane_number.checked_sub(1) else {
+            return;
+        };
+        let Some(request) = self.extra_pane_render_request(ctx, rect, pane_number) else {
+            return;
+        };
+        let key = request.key.clone();
         let smooth_follow = self.smooth_camera_follow_playback_active();
         {
             let pane = &mut self.extra_panes[pane_slot];
@@ -14545,27 +14595,6 @@ impl ViewerApp {
                 return;
             }
         }
-        let radar_range_km = selected_grid_range_km_for(volume.as_ref(), cut, &product)
-            .unwrap_or(DEFAULT_RADAR_RANGE_KM);
-        let request = RenderRequest {
-            key: key.clone(),
-            lane: LaneId::Pane(pane_lane),
-            volume,
-            previous_volume,
-            dealias_env,
-            cut,
-            product,
-            render_dealiased_velocity,
-            plain_velocity_render_dealiased: self.unfold_velocity_display,
-            color_tables,
-            storm_motion: self.current_storm_motion(),
-            hail_levels_m: self.hail_levels_m(),
-            smoothing,
-            dealias_engine: self.dealias_engine,
-            gate_filter_decidbz: self.gate_filter_key(),
-            viewport_options,
-            radar_range_km,
-        };
         match self.render_sender.send(request) {
             Ok(()) => {
                 self.extra_panes[pane_slot].pending_render_key = Some(key);
@@ -59583,6 +59612,220 @@ mod tests {
                 .map(|key| key.volume_ptr),
             Some(Arc::as_ptr(&second) as usize),
             "the retained pane texture must not satisfy the newly selected frame"
+        );
+    }
+
+    /// A single-velocity-tilt volume carrying real site coordinates, so the
+    /// viewport helpers (which need `radar_location`) resolve and the full
+    /// primary/pane render-request builders run in a headless test.
+    fn test_dealias_pane_volume() -> RadarVolume {
+        let mut volume = test_ref_then_velocity_volume();
+        // PGUA (Andersen AFB, Guam) — the live BAVI-26 site.
+        volume.site.latitude_deg = Some(13.454);
+        volume.site.longitude_deg = Some(144.808);
+        volume.site.elevation_m = Some(80.0);
+        volume
+    }
+
+    /// Regression for the dual-pane re-dealias: when the primary AND an extra
+    /// pane both render dealiased velocity on the SAME displayed frame + tilt,
+    /// their render requests must carry the SAME dealias-memo identity
+    /// (volume `Arc` pointer, reference/env pointers, cut, engine). If they
+    /// diverge the pane misses the shared grid memo and re-runs the ~200 ms
+    /// region dealiaser. Covered for both a following pane and an
+    /// independent-panels (owns-radar) pane.
+    #[test]
+    fn extra_pane_dealiased_velocity_matches_primary_dealias_key() {
+        for independent in [false, true] {
+            let mut app = test_viewer_app_with_hazards(Vec::new());
+            app.dealias_engine = DealiasEngine::Region;
+            app.app_settings.independent_panels = independent;
+            app.app_settings.grid_pane_count = 2;
+            app.selected_product = DisplayProduct::DealiasedVelocity;
+            app.selected_cut = 1;
+            let v = Arc::new(test_dealias_pane_volume());
+            app.map_center_lat = v.site.latitude_deg.unwrap();
+            app.map_center_lon = v.site.longitude_deg.unwrap();
+            app.volume = Some(Arc::clone(&v));
+            app.primary.history.push(FrameHistoryEntry {
+                identity: frame_identity_for_volume(v.as_ref()),
+                path: PathBuf::from("pane-dealias-key"),
+                volume: Arc::clone(&v),
+                timings: None,
+                status: FrameStatus::LiveComplete,
+                source_label: "test".to_owned(),
+            });
+            app.primary.cursor.index = 0;
+            app.grid_layout = PanelLayout::TwoVertical;
+            app.sync_extra_panes();
+            app.extra_panes[0].product = DisplayProduct::DealiasedVelocity;
+            app.extra_panes[0].cut = None;
+
+            let ctx = egui::Context::default();
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 480.0));
+            let primary = app
+                .primary_render_request_for_current(&ctx, rect)
+                .expect("primary dealiased-velocity request");
+            let pane = app
+                .extra_pane_render_request(&ctx, rect, 1)
+                .expect("pane dealiased-velocity request");
+
+            assert!(
+                primary.render_dealiased_velocity && pane.render_dealiased_velocity,
+                "independent={independent}: both requests must render dealiased velocity"
+            );
+            // These five fields are exactly the DealiasGridKey the render
+            // worker derives; equal here == the pane hits the shared memo.
+            assert_eq!(
+                primary.key.volume_ptr, pane.key.volume_ptr,
+                "independent={independent}: pane must reuse the primary's volume Arc"
+            );
+            assert_eq!(
+                primary.key.dealias_reference_volume_ptr, pane.key.dealias_reference_volume_ptr,
+                "independent={independent}: dealias reference pointer must match"
+            );
+            assert_eq!(
+                primary.key.dealias_env_ptr, pane.key.dealias_env_ptr,
+                "independent={independent}: dealias env pointer must match"
+            );
+            assert_eq!(
+                primary.key.cut, pane.key.cut,
+                "independent={independent}: pane must render the same tilt as primary"
+            );
+            assert_eq!(
+                primary.key.dealias_engine, pane.key.dealias_engine,
+                "independent={independent}: dealias engine must match"
+            );
+        }
+    }
+
+    /// End-to-end proof on REAL PGUA (BAVI-26) volumes that opening a dual
+    /// pane on a dealiased-velocity view does NOT re-run the region dealiaser:
+    /// the primary render dealiases the tilt once, and the pane render — even
+    /// through a SEPARATE render-worker moment-cache — reuses the shared grid
+    /// memo (zero extra dealias computes).
+    ///
+    /// Ignored by default (needs the on-disk PGUA cache). Run with:
+    ///   cargo test -p app_ui pgua_dual_pane_reuses_dealias_memo -- --ignored --nocapture
+    /// Override the directory with BOWECHO_PGUA_DUALPANE_DIR.
+    #[test]
+    #[ignore = "reads real on-disk PGUA level-II volumes"]
+    fn pgua_dual_pane_reuses_dealias_memo() {
+        let dir = std::env::var("BOWECHO_PGUA_DUALPANE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| cache_dir("PGUA"));
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|err| panic!("read PGUA cache {}: {err}", dir.display()))
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("PGUA") && name.ends_with("_V06"))
+            })
+            .collect();
+        files.sort();
+        let file = files
+            .last()
+            .unwrap_or_else(|| panic!("no PGUA *_V06 volumes in {}", dir.display()));
+        let raw =
+            std::fs::read(file).unwrap_or_else(|err| panic!("read {}: {err}", file.display()));
+        let volume = Arc::new(
+            nexrad_io::decode_volume_from_bytes(&raw)
+                .unwrap_or_else(|err| panic!("decode {}: {err}", file.display())),
+        );
+        // Lowest tilt that carries a velocity moment.
+        let cut = (0..volume.cuts.len())
+            .find(|&index| {
+                volume.cuts[index]
+                    .moments
+                    .contains_key(&MomentType::Velocity)
+            })
+            .expect("a velocity tilt in the PGUA volume");
+        eprintln!(
+            "PGUA {} cuts={} velocity cut={cut}",
+            file.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+            volume.cuts.len()
+        );
+
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.dealias_engine = DealiasEngine::Region;
+        app.app_settings.grid_pane_count = 2;
+        app.selected_product = DisplayProduct::DealiasedVelocity;
+        app.selected_cut = cut;
+        app.map_center_lat = volume.site.latitude_deg.unwrap_or_default();
+        app.map_center_lon = volume.site.longitude_deg.unwrap_or_default();
+        app.volume = Some(Arc::clone(&volume));
+        app.primary.history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: file.clone(),
+            volume: Arc::clone(&volume),
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        });
+        app.primary.cursor.index = 0;
+        app.grid_layout = PanelLayout::TwoVertical;
+        app.sync_extra_panes();
+        app.extra_panes[0].product = DisplayProduct::DealiasedVelocity;
+        app.extra_panes[0].cut = None;
+
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 900.0));
+        let primary = app
+            .primary_render_request_for_current(&ctx, rect)
+            .expect("primary dealiased-velocity request");
+        let pane = app
+            .extra_pane_render_request(&ctx, rect, 1)
+            .expect("pane dealiased-velocity request");
+        assert_eq!(primary.key.volume_ptr, pane.key.volume_ptr);
+        assert_eq!(primary.key.cut, pane.key.cut);
+
+        let policy = test_cache_policy(effective_worker_threads());
+        let render = |request: &RenderRequest| {
+            // FRESH per-worker caches each call: this is the whole point — the
+            // pane's small moment-cache LRU cannot hold the primary's grid, so
+            // reuse must come from the process-wide dealias memo.
+            let mut pixels = Vec::new();
+            let mut signature = None;
+            let mut moment_caches = Vec::new();
+            let mut sample_caches = Vec::new();
+            let mut geometry_caches = Vec::new();
+            let mut direct_viewports = Vec::new();
+            ViewerApp::render_viewport_payload(
+                request,
+                &mut pixels,
+                &mut signature,
+                &mut moment_caches,
+                &mut sample_caches,
+                &mut geometry_caches,
+                &mut direct_viewports,
+                policy,
+            )
+            .expect("render");
+        };
+
+        let before = dealias_grid_compute_count();
+        render(&primary);
+        let after_primary = dealias_grid_compute_count();
+        render(&pane);
+        let after_pane = dealias_grid_compute_count();
+
+        eprintln!(
+            "dealias computes: primary=+{} pane=+{}",
+            after_primary - before,
+            after_pane - after_primary
+        );
+        assert_eq!(
+            after_primary - before,
+            1,
+            "primary should dealias the tilt exactly once"
+        );
+        assert_eq!(
+            after_pane - after_primary,
+            0,
+            "the pane must reuse the shared dealias memo, not re-dealias the tilt"
         );
     }
 
