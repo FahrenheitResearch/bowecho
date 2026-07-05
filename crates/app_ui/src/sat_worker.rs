@@ -613,7 +613,7 @@ fn load_colored_frame(
     let (nx, ny) = (meta.nx, meta.ny);
     let name = variable.name.clone();
     let values = reader.read_full_2d(&name).map_err(|err| err.to_string())?;
-    let pixels = render_sat_pixels(band, &values, nx, ny, grid.flip_rows, map_overlay);
+    let pixels = render_sat_pixels(&name, band, &values, nx, ny, grid.flip_rows, map_overlay);
     Ok(ColoredSatFrame {
         frame: SatFrameImage {
             key: key.clone(),
@@ -625,6 +625,7 @@ fn load_colored_frame(
 }
 
 fn render_sat_pixels(
+    variable_name: &str,
     band: u8,
     values: &[f32],
     nx: usize,
@@ -632,13 +633,20 @@ fn render_sat_pixels(
     flip_rows: bool,
     map_overlay: bool,
 ) -> Vec<Color32> {
-    // Longwave-window IR (13/14/15) gets the enhanced rainbow; every other
-    // band keeps its production palette (water vapor, shortwave, visible
-    // grayscale). This is why Himawari IR is no longer black-and-white: it now
-    // flows through the same Kelvin false-color path GOES always used, rather
-    // than the old grayscale percentile stretch.
-    let anchors = enhanced_anchors_for_band(band).unwrap_or_else(|| band_anchors(band));
+    // Himawari AHI brightness-temperature bands are NOT stored in the Kelvin
+    // domain GOES uses: `ahi_bt_c13` lands ~326-330 (verified from a real
+    // full-disk frame), not ~190-310 K, so a fixed-temperature table clamps
+    // the whole disk to the warm/dark end and it renders black. Auto-stretch
+    // Himawari's real range (p2..p98) through the enhanced-IR color ramp
+    // instead -- the old grayscale intent, now in color. GOES longwave window
+    // (13-15) IS real Kelvin, so it keeps the physically-anchored fixed
+    // enhancement. Every other band uses its production palette.
+    let dynamic = (variable_name.starts_with("ahi_bt_") && (7..=16).contains(&band))
+        .then(|| finite_percentile_range(values, 0.02, 0.98))
+        .flatten();
+    let static_anchors = enhanced_anchors_for_band(band).unwrap_or_else(|| band_anchors(band));
     let ir_band = (7..=16).contains(&band);
+
     let mut pixels = Vec::with_capacity(nx * ny);
     for image_row in 0..ny {
         let grid_row = if flip_rows {
@@ -647,19 +655,63 @@ fn render_sat_pixels(
             image_row
         };
         for &value in &values[grid_row * nx..(grid_row + 1) * nx] {
-            let [r, g, b, a] = anchor_color(value, anchors);
-            // The radar-map overlay fades warm cloud/surface (by brightness
-            // temperature) so radar shows through; the full-screen player
-            // keeps each palette's own alpha.
-            let alpha = if map_overlay && ir_band {
-                bt_overlay_alpha(value)
+            if let Some((lo, hi)) = dynamic {
+                if !value.is_finite() {
+                    pixels.push(Color32::TRANSPARENT);
+                    continue;
+                }
+                // norm: 0 = coldest (low value), 1 = warmest; mapped onto the
+                // colorful part of the enhancement.
+                let norm = ((value - lo) / (hi - lo)).clamp(0.0, 1.0);
+                let pseudo_k = DYN_COLD_K + norm * (DYN_WARM_K - DYN_COLD_K);
+                let [r, g, b, _] = anchor_color(pseudo_k, ENHANCED_IR);
+                let alpha = if map_overlay {
+                    ((1.0 - norm) * 235.0) as u8 // cold=opaque, warm=clear
+                } else {
+                    255
+                };
+                pixels.push(Color32::from_rgba_unmultiplied(r, g, b, alpha));
             } else {
-                a
-            };
-            pixels.push(Color32::from_rgba_unmultiplied(r, g, b, alpha));
+                let [r, g, b, a] = anchor_color(value, static_anchors);
+                let alpha = if map_overlay && ir_band {
+                    bt_overlay_alpha(value)
+                } else {
+                    a
+                };
+                pixels.push(Color32::from_rgba_unmultiplied(r, g, b, alpha));
+            }
         }
     }
     pixels
+}
+
+/// Coldest/warmest pseudo-Kelvin the Himawari dynamic stretch maps its
+/// auto-detected value range onto, i.e. the colorful span of [`ENHANCED_IR`].
+const DYN_COLD_K: f32 = 200.0;
+const DYN_WARM_K: f32 = 292.0;
+
+/// Robust value range over the given finite percentiles (auto-contrast for a
+/// band whose values are not in a fixed physical domain).
+fn finite_percentile_range(values: &[f32], low: f32, high: f32) -> Option<(f32, f32)> {
+    let mut finite = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    if finite.is_empty() {
+        return None;
+    }
+    finite.sort_by(|a, b| a.total_cmp(b));
+    let last = finite.len() - 1;
+    let low_idx = ((last as f32) * low.clamp(0.0, 1.0)).round() as usize;
+    let high_idx = ((last as f32) * high.clamp(0.0, 1.0)).round() as usize;
+    let lo = finite[low_idx.min(last)];
+    let hi = finite[high_idx.max(low_idx).min(last)];
+    if hi > lo {
+        Some((lo, hi))
+    } else {
+        Some((lo, lo + 1.0))
+    }
 }
 
 /// Enhanced-IR "rainbow" enhancement over brightness temperature (Kelvin),
@@ -1640,7 +1692,7 @@ mod tests {
     fn himawari_ir_is_colorized_not_grayscale() {
         // Kelvin brightness temps: NaN, warm surface, a -60 C top, a -40 C top.
         let values = vec![f32::NAN, 300.0, 213.0, 233.0];
-        let pixels = render_sat_pixels(13, &values, 4, 1, false, false);
+        let pixels = render_sat_pixels("cmi_c13", 13, &values, 4, 1, false, false);
 
         assert_eq!(pixels[0].a(), 0, "NaN stays transparent");
         // -60 C cloud top is RED in the enhancement — proof it is colorized,
@@ -1902,6 +1954,66 @@ mod tests {
     }
 
     #[test]
+    fn print_frame_value_stats() {
+        let Some(store) = std::env::var_os("BOWECHO_SAT_STATS_STORE") else {
+            return;
+        };
+        let model = std::env::var("BOWECHO_SAT_STATS_MODEL").unwrap();
+        let run = std::env::var("BOWECHO_SAT_STATS_RUN").unwrap();
+        let hhmm: u16 = std::env::var("BOWECHO_SAT_STATS_HHMM")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let run_dir = PathBuf::from(store).join(&model).join(&run);
+        let reader = HourReader::open(&run_dir.join(frame_file_name(hhmm))).unwrap();
+        let meta = reader.meta();
+        let variable = meta
+            .variables
+            .iter()
+            .find(|v| v.kind == "surface2d")
+            .unwrap();
+        let band = selector_band(&variable.selector, &variable.name).unwrap();
+        let name = variable.name.clone();
+        let values = reader.read_full_2d(&name).unwrap();
+        let mut finite: Vec<f32> = values.iter().copied().filter(|v| v.is_finite()).collect();
+        finite.sort_by(|a, b| a.total_cmp(b));
+        let n = finite.len();
+        let pct = |p: f32| finite[(((n - 1) as f32) * p) as usize];
+        eprintln!(
+            "STATS {model}/{run} band={band} var={name} finite={n}/{} min={:.2} p1={:.2} p50={:.2} p99={:.2} max={:.2} mean={:.2}",
+            values.len(),
+            finite[0],
+            pct(0.01),
+            pct(0.50),
+            pct(0.99),
+            finite[n - 1],
+            finite.iter().sum::<f32>() / n as f32
+        );
+    }
+
+    #[test]
+    fn himawari_bt_out_of_kelvin_domain_still_colorizes() {
+        // Real Himawari ahi_bt_c13 lands ~326-330, NOT Kelvin BT — verified
+        // from a live full-disk frame. It must auto-stretch and colorize, not
+        // render black (the regression this fixes).
+        let values = vec![f32::NAN, 326.0, 327.5, 328.0, 329.0, 330.0];
+        let pixels = render_sat_pixels("ahi_bt_c13", 13, &values, 3, 2, false, false);
+
+        assert_eq!(pixels[0].a(), 0, "NaN stays transparent");
+        let cold = pixels[1]; // 326 -> coldest -> colorful
+        let warm = pixels[5]; // 330 -> warmest
+        assert_ne!(cold, warm, "the range is stretched, not flat/black");
+        assert!(
+            u16::from(cold.r()) + u16::from(cold.g()) + u16::from(cold.b()) > 120,
+            "coldest cloud is not black: {cold:?}"
+        );
+        assert!(
+            !(cold.r() == cold.g() && cold.g() == cold.b()),
+            "colorized, not grayscale: {cold:?}"
+        );
+    }
+
+    #[test]
     fn synth_hurricane_ir_proof() {
         let Some(out) = std::env::var_os("BOWECHO_SAT_SYNTH_PNG") else {
             return;
@@ -1910,7 +2022,7 @@ mod tests {
         let bt = synthetic_hurricane_bt(nx, ny);
 
         let started = std::time::Instant::now();
-        let pixels = render_sat_pixels(13, &bt, nx, ny, false, false);
+        let pixels = render_sat_pixels("cmi_c13", 13, &bt, nx, ny, false, false);
         let render_ms = started.elapsed().as_secs_f64() * 1000.0;
         eprintln!("enhanced-IR render of {nx}x{ny} took {render_ms:.2} ms");
 
@@ -1941,7 +2053,7 @@ mod tests {
     fn ir_map_overlay_alpha_fades_warm_by_temperature() {
         // Kelvin: warm surface, mid cloud, cold storm top.
         let values = vec![290.0, 255.0, 210.0];
-        let overlay = render_sat_pixels(13, &values, 3, 1, false, true);
+        let overlay = render_sat_pixels("cmi_c13", 13, &values, 3, 1, false, true);
 
         assert_eq!(
             overlay[0].a(),
@@ -1955,7 +2067,7 @@ mod tests {
         assert!(overlay[2].a() > 200, "cold storm top (-63 C) stays visible");
 
         // The full-screen player keeps the palette opaque (no BT fade).
-        let player = render_sat_pixels(13, &values, 3, 1, false, false);
+        let player = render_sat_pixels("cmi_c13", 13, &values, 3, 1, false, false);
         assert!(player[0].a() > 200, "player keeps warm pixels opaque");
     }
 
