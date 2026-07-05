@@ -1,0 +1,30 @@
+{
+  "activeStorms": [
+    {
+      "id": "al012026",
+      "binNumber": "AT1",
+      "name": "Alberto",
+      "classification": "HU",
+      "intensity": "85",
+      "pressure": "968",
+      "latitude": "24.5N",
+      "longitude": "88.9W",
+      "latitudeNumeric": 24.5,
+      "longitudeNumeric": -88.9,
+      "movementDir": 340,
+      "movementSpeed": 12,
+      "lastUpdate": "2026-06-19T21:00:00.000Z",
+      "publicAdvisory": {
+        "advNum": "12",
+        "issuance": "2026-06-19T21:00:00.000Z",
+        "url": "https://www.nhc.noaa.gov/text/refresh/MIATCPAT1+shtml/192100.shtml"
+      },
+      "forecastTrack": {
+        "kmzFile": "https://www.nhc.noaa.gov/storm_graphics/api/AL012026_TRACK_latest.kmz"
+      },
+      "trackCone": {
+        "kmzFile": "https://www.nhc.noaa.gov/storm_graphics/api/AL012026_CONE_latest.kmz"
+      }
+    }
+  ]
+}

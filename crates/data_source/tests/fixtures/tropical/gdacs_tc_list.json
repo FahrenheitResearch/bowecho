@@ -1,0 +1,77 @@
+{
+ "type": "FeatureCollection",
+ "features": [
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     148.9,
+     12.9
+    ]
+   },
+   "properties": {
+    "eventtype": "TC",
+    "eventid": 1001279,
+    "episodeid": 17,
+    "eventname": "BAVI-26",
+    "name": "Tropical Cyclone BAVI-26",
+    "description": "Tropical Cyclone BAVI-26",
+    "htmldescription": "Red Tropical Cyclone BAVI-26 in Guam, Northern Mariana Islands from: 01 Jul 2026  to: 05 Jul 2026 .",
+    "alertlevel": "Red",
+    "fromdate": "2026-07-01T00:00:00",
+    "todate": "2026-07-05T00:00:00",
+    "iscurrent": "true",
+    "country": "Guam, Northern Mariana Islands",
+    "severitydata": {
+     "severity": 268.5168,
+     "severitytext": "Hurricane/Typhoon > 74 mph (maximum wind speed of 269 km/h)",
+     "severityunit": "km/h"
+    },
+    "source": "JTWC",
+    "url": {
+     "geometry": "https://www.gdacs.org/gdacsapi/api/polygons/getgeometry?eventtype=TC&eventid=1001279&episodeid=17",
+     "report": "https://www.gdacs.org/report.aspx?eventid=1001279&episodeid=17&eventtype=TC",
+     "details": "https://www.gdacs.org/gdacsapi/api/events/geteventdata?eventtype=TC&eventid=1001279"
+    },
+    "datemodified": "2026-07-05T07:05:12"
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     107.9,
+     21.6
+    ]
+   },
+   "properties": {
+    "eventtype": "TC",
+    "eventid": 1001281,
+    "episodeid": 13,
+    "eventname": "MAYSAK-26",
+    "name": "Tropical Cyclone MAYSAK-26",
+    "description": "Tropical Cyclone MAYSAK-26",
+    "htmldescription": "Orange Tropical Cyclone MAYSAK-26 in Viet Nam, China, Laos from: 01 Jul 2026  to: 04 Jul 2026 .",
+    "alertlevel": "Orange",
+    "fromdate": "2026-07-01T18:00:00",
+    "todate": "2026-07-04T18:00:00",
+    "iscurrent": "true",
+    "country": "Viet Nam, China, Laos",
+    "severitydata": {
+     "severity": 92.592,
+     "severitytext": "Tropical Storm (maximum wind speed of 93 km/h)",
+     "severityunit": "km/h"
+    },
+    "source": "JTWC",
+    "url": {
+     "geometry": "https://www.gdacs.org/gdacsapi/api/polygons/getgeometry?eventtype=TC&eventid=1001281&episodeid=13",
+     "report": "https://www.gdacs.org/report.aspx?eventid=1001281&episodeid=13&eventtype=TC",
+     "details": "https://www.gdacs.org/gdacsapi/api/events/geteventdata?eventtype=TC&eventid=1001281"
+    },
+    "datemodified": "2026-07-04T22:01:20"
+   }
+  }
+ ]
+}
