@@ -111,7 +111,9 @@ impl HimawariCompositeStyle {
 
     pub fn parse(value: &str) -> Option<Self> {
         let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
-        Self::ALL.into_iter().find(|style| style.slug() == normalized)
+        Self::ALL
+            .into_iter()
+            .find(|style| style.slug() == normalized)
     }
 
     /// AHI bands the composite fetches (co-registered onto the base band's
@@ -1634,8 +1636,10 @@ fn decode_ahi_raw_counts(path: &Path) -> Result<(Vec<f32>, usize), String> {
         .calibration
         .as_ref()
         .ok_or("AHI HSD segment is missing calibration block #5")?;
-    let (error_count, outside_count) =
-        (calibration.error_pixel_count, calibration.outside_scan_count);
+    let (error_count, outside_count) = (
+        calibration.error_pixel_count,
+        calibration.outside_scan_count,
+    );
     let cols = usize::from(header.data.columns);
     let lines = usize::from(header.data.lines);
     let pixels = cols.saturating_mul(lines);
@@ -1647,7 +1651,10 @@ fn decode_ahi_raw_counts(path: &Path) -> Result<(Vec<f32>, usize), String> {
             bytes.len()
         ));
     }
-    let little = matches!(header.byte_order, rw_sat::himawari::HimawariByteOrder::Little);
+    let little = matches!(
+        header.byte_order,
+        rw_sat::himawari::HimawariByteOrder::Little
+    );
     let mut values = Vec::with_capacity(pixels);
     for i in 0..pixels {
         let o = data_start + i * 2;
@@ -2209,7 +2216,8 @@ fn ingest_latest_himawari_composite(
     // Fetch + assemble each band as raw counts on its native grid, keeping the
     // per-band calibration for the reflectance conversion.
     let mut fields: HashMap<u8, SatelliteGridField> = HashMap::with_capacity(bands.len());
-    let mut calibrations: HashMap<u8, HimawariCalibrationInfo> = HashMap::with_capacity(bands.len());
+    let mut calibrations: HashMap<u8, HimawariCalibrationInfo> =
+        HashMap::with_capacity(bands.len());
     for &band in bands {
         let objects = pick
             .by_band
@@ -2784,7 +2792,9 @@ fn worker_loop(
                     spec.satellite,
                     spec.style,
                     spec.segment_start,
-                    spec.segment_start.saturating_add(spec.segment_count).saturating_sub(1)
+                    spec.segment_start
+                        .saturating_add(spec.segment_count)
+                        .saturating_sub(1)
                 )));
                 match ingest_latest_himawari_composite(&store_root, &spec, &send) {
                     Ok(summary) => {
@@ -3943,11 +3953,12 @@ mod tests {
             "cloud is bright: {cloud:?}"
         );
         let ocean = loaded.image.pixels[2];
-        assert_eq!(ocean.a(), 255, "dark ocean stays opaque (not a transparent hole)");
-        assert!(
-            ocean.b() > ocean.r(),
-            "dark ocean skews blue: {ocean:?}"
+        assert_eq!(
+            ocean.a(),
+            255,
+            "dark ocean stays opaque (not a transparent hole)"
         );
+        assert!(ocean.b() > ocean.r(), "dark ocean skews blue: {ocean:?}");
         assert_eq!(
             loaded.image.pixels[3].a(),
             0,

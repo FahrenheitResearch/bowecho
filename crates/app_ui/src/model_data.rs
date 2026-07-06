@@ -400,10 +400,8 @@ impl ModelDataDock {
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| file.display().to_string());
-                let task = crate::local_import::spawn_import_paths(
-                    vec![file],
-                    self.store_root.clone(),
-                );
+                let task =
+                    crate::local_import::spawn_import_paths(vec![file], self.store_root.clone());
                 self.import_message = Some(format!("Importing {name}…"));
                 self.import_job = Some(ImportJob::Local(task));
             }
