@@ -287,6 +287,20 @@ pub struct AppSettings {
     /// system sound.
     #[serde(default)]
     pub radar_update_sound_path: String,
+    /// Live warning/hazard auto-refresh cadence, in seconds. Drives how often
+    /// the Severe tab re-fetches NWS active alerts (and any custom warning
+    /// feed). Default 30 s matches the NWS Alerts Web Service polling
+    /// guidance; the use site clamps to a small floor so a fast local/relay
+    /// feed can poll more aggressively (e.g. during a landfalling cyclone).
+    #[serde(default = "default_warning_refresh_seconds")]
+    pub warning_refresh_seconds: u64,
+    /// Optional user-supplied warning-feed URL polled alongside the NWS active
+    /// alerts on the live cadence and merged into the hazards layer. Accepts
+    /// the NWS CAP/GeoJSON alert FeatureCollection shape (identical to
+    /// api.weather.gov/alerts/active) or the NWS text/VTEC + lat/lon polygon
+    /// format. Empty = disabled.
+    #[serde(default)]
+    pub warning_provider_url: String,
     /// Current-alert list sort mode in the Severe tab. Kept as a string so
     /// older/newer builds can preserve unknown operator preferences.
     #[serde(default = "default_current_alert_sort")]
@@ -649,6 +663,10 @@ fn default_model_keep_runs() -> u8 {
     2
 }
 
+fn default_warning_refresh_seconds() -> u64 {
+    30
+}
+
 fn default_style_profile() -> String {
     "BowEcho default".to_owned()
 }
@@ -703,6 +721,8 @@ impl Default for AppSettings {
             alert_sound_families: Vec::new(),
             radar_update_sound_enabled: false,
             radar_update_sound_path: String::new(),
+            warning_refresh_seconds: default_warning_refresh_seconds(),
+            warning_provider_url: String::new(),
             current_alert_sort: default_current_alert_sort(),
             current_alert_filter: default_current_alert_filter(),
             storm_track_max_tracks: default_storm_track_max_tracks(),
@@ -1313,6 +1333,8 @@ mod tests {
             alert_sound_enabled: true,
             alert_sound_path: "C:\\alerts\\tor.wav".to_owned(),
             alert_sound_families: vec!["tornado".to_owned(), "severe thunderstorm".to_owned()],
+            warning_refresh_seconds: 10,
+            warning_provider_url: "https://relay.example.org/warnings.geojson".to_owned(),
             archive_load_loop: false,
             archive_frame_count: 17,
             live_preload_frame_count: 6,
@@ -1368,6 +1390,26 @@ mod tests {
         let back = AppSettings::from_json(&s.to_json());
         assert_eq!(back, s);
         assert_eq!(back.favorites, vec!["KTWX".to_owned()]);
+    }
+
+    #[test]
+    fn warning_feed_settings_default_and_round_trip() {
+        // Old configs (no keys) keep the historical 30 s cadence and an
+        // empty custom feed.
+        assert_eq!(AppSettings::from_json("{}").warning_refresh_seconds, 30);
+        assert!(AppSettings::from_json("{}").warning_provider_url.is_empty());
+
+        let settings = AppSettings {
+            warning_refresh_seconds: 5,
+            warning_provider_url: "https://relay.example.org/cap.json".to_owned(),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+        assert_eq!(back.warning_refresh_seconds, 5);
+        assert_eq!(
+            back.warning_provider_url,
+            "https://relay.example.org/cap.json"
+        );
     }
 
     #[test]

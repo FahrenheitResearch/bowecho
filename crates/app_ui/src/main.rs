@@ -227,10 +227,13 @@ const ALGO_FRAME_CACHE_LIMIT: usize = 96;
 /// preview frames can be 10000 px wide, so cap the player preview well
 /// below the hard limit before egui uploads it.
 const MAX_SAT_PLAYER_TEXTURE_DIM: usize = 4096;
-/// Current NWS alerts are one lightweight request. The NWS Alerts Web Service
-/// recommends polling no more often than every 30 seconds; overlapping loads
-/// are already prevented by `hazard_receiver.is_some()`.
-const LIVE_HAZARD_REFRESH_SECONDS: u64 = 30;
+/// Floor for the operator-configurable warning refresh cadence
+/// (`AppSettings::warning_refresh_seconds`, default 30 s per the NWS Alerts
+/// Web Service polling guidance). A custom or relayed feed (e.g. a
+/// landfalling-cyclone ops relay) can poll faster than 30 s, but not so fast
+/// it hammers the endpoint or starves the UI thread. Overlapping loads are
+/// still blocked by `hazard_receiver.is_some()`.
+const MIN_LIVE_HAZARD_REFRESH_SECONDS: u64 = 5;
 const MAX_ACTIVE_ALERT_ZONE_GEOMETRIES: usize = 320;
 const TIMELINE_REPORT_TRAILING_MINUTES: i64 = 90;
 const TIMELINE_REPORT_LEAD_SECONDS: i64 = 90;
@@ -7408,17 +7411,23 @@ impl ViewerApp {
             .as_ref()
             .map(preview_retained_hazard_records)
             .unwrap_or_default();
+        let custom_provider_url =
+            custom_warning_provider_url(&self.app_settings.warning_provider_url);
         let (sender, receiver) = mpsc::channel();
         self.hazard_receiver = Some(receiver);
         self.last_live_hazard_refresh = Some(Instant::now());
         self.hazard_status = "Loading live hazards".to_owned();
         thread::spawn(move || {
-            let result =
-                load_live_hazard_overlay_with_preview(query_time_utc, preview_records, |preview| {
+            let result = load_live_hazard_overlay_with_preview(
+                query_time_utc,
+                preview_records,
+                custom_provider_url,
+                |preview| {
                     let _ = sender.send(AsyncHazardResult {
                         update: AsyncHazardUpdate::Preview(Ok(preview)),
                     });
-                });
+                },
+            );
             let _ = sender.send(AsyncHazardResult {
                 update: AsyncHazardUpdate::Final(result),
             });
@@ -7517,13 +7526,25 @@ impl ViewerApp {
         ctx.request_repaint_after(Duration::from_millis(25));
     }
 
+    /// Operator-configurable live warning refresh cadence
+    /// (`AppSettings::warning_refresh_seconds`), clamped to a sane floor so a
+    /// fast custom/relay feed cannot hammer the endpoint or starve the UI.
+    fn live_hazard_refresh_interval(&self) -> Duration {
+        Duration::from_secs(
+            self.app_settings
+                .warning_refresh_seconds
+                .max(MIN_LIVE_HAZARD_REFRESH_SECONDS),
+        )
+    }
+
     fn maybe_refresh_live_hazards(&mut self, ctx: &egui::Context) {
         if !self.live_hazard_auto_refresh || self.hazard_receiver.is_some() {
             return;
         }
-        let should_refresh = self.last_live_hazard_refresh.is_none_or(|last_refresh| {
-            last_refresh.elapsed() >= Duration::from_secs(LIVE_HAZARD_REFRESH_SECONDS)
-        });
+        let refresh_interval = self.live_hazard_refresh_interval();
+        let should_refresh = self
+            .last_live_hazard_refresh
+            .is_none_or(|last_refresh| last_refresh.elapsed() >= refresh_interval);
         if should_refresh {
             self.load_live_hazards(ctx);
         } else {
@@ -25253,6 +25274,60 @@ impl ViewerApp {
                 ui.ctx().request_repaint();
             }
         });
+        self.remembered_section(
+            ui,
+            "severe_warning_feed",
+            "Warning feed",
+            false,
+            |app, ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Auto-refresh every").on_hover_text(
+                        "How often BowEcho re-fetches live warnings (NWS active alerts plus any \
+                     custom feed). NWS guidance is 30 s; a fast local or relay feed can poll \
+                     down to 5 s.",
+                    );
+                    let mut secs = app
+                        .app_settings
+                        .warning_refresh_seconds
+                        .max(MIN_LIVE_HAZARD_REFRESH_SECONDS);
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut secs)
+                                .range(MIN_LIVE_HAZARD_REFRESH_SECONDS..=600)
+                                .suffix(" s"),
+                        )
+                        .changed()
+                    {
+                        app.app_settings.warning_refresh_seconds =
+                            secs.max(MIN_LIVE_HAZARD_REFRESH_SECONDS);
+                        let _ = app.app_settings.save();
+                        ui.ctx().request_repaint();
+                    }
+                });
+                ui.label("Custom provider (poll URL)").on_hover_text(
+                "Optional http(s) URL BowEcho polls alongside NWS active alerts and merges into \
+                 the warnings layer. Accepts the NWS CAP/GeoJSON alert FeatureCollection (same \
+                 shape as api.weather.gov/alerts/active) or the NWS text/VTEC + lat/lon polygon \
+                 format.",
+            );
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut app.app_settings.warning_provider_url)
+                        .desired_width(260.0)
+                        .hint_text("https://host/warnings.geojson"),
+                );
+                if response.lost_focus() {
+                    let _ = app.app_settings.save();
+                }
+                if !app.app_settings.warning_provider_url.trim().is_empty()
+                    && custom_warning_provider_url(&app.app_settings.warning_provider_url).is_none()
+                {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 170, 80),
+                        "Provider URL must start with http:// or https://",
+                    );
+                }
+            },
+        );
         self.remembered_section(ui, "severe_local_file", "Local file", false, |app, ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut app.hazard_path_text)
@@ -46214,6 +46289,7 @@ struct LiveHazardSourceMessage {
 fn load_live_hazard_overlay_with_preview<F>(
     query_time_utc: DateTime<Utc>,
     preview_records: Vec<HazardRecord>,
+    custom_provider_url: Option<String>,
     mut on_preview: F,
 ) -> Result<HazardOverlay, String>
 where
@@ -46269,7 +46345,7 @@ where
             "NWS active alerts (SPC MD unavailable)".to_owned()
         }
     };
-    Ok(build_live_hazard_overlay(
+    let mut overlay = build_live_hazard_overlay(
         source_label,
         query_time_utc,
         scanned_items,
@@ -46277,7 +46353,136 @@ where
         error_count,
         start,
         records,
-    ))
+    );
+
+    // Optional operator-supplied warning feed (poll-URL style, like the radar
+    // `poll_url`): fetch, parse, and merge into the same hazards layer. The
+    // custom feed is its own authoritative source, so its records bypass the
+    // NWS active-alert corroboration filter that `build_live_hazard_overlay`
+    // applies to the reconstructed-text path.
+    if let Some(url) = custom_provider_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        match load_custom_warning_provider(url, query_time_utc) {
+            Ok(load) => {
+                overlay.scanned_items += load.scanned_items;
+                overlay.parsed_items += load.parsed_items;
+                overlay.error_count += load.error_count;
+                if merge_custom_provider_records(&mut overlay, load.records) > 0 {
+                    overlay.source_label =
+                        format!("{} + custom warning feed", overlay.source_label);
+                }
+            }
+            Err(_) => {
+                overlay.error_count += 1;
+                overlay.source_label =
+                    format!("{} (custom warning feed unavailable)", overlay.source_label);
+            }
+        }
+        overlay.load_ms = start.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    Ok(overlay)
+}
+
+/// Normalize the configured custom warning-feed URL: trim, drop empties, and
+/// require an `http(s)` scheme so an accidental local path or bare word does
+/// not become a network fetch.
+fn custom_warning_provider_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        Some(trimmed.to_owned())
+    } else {
+        None
+    }
+}
+
+/// Fetch and parse a user-supplied warning feed. Accepts the NWS CAP/GeoJSON
+/// alert `FeatureCollection` shape (identical to api.weather.gov/alerts/active)
+/// first, falling back to the NWS text/VTEC + lat/lon polygon format that the
+/// Local-file loader uses. Reuses the existing hazard record model and parsers
+/// so a custom feed renders exactly like the built-in warnings layer.
+fn load_custom_warning_provider(
+    url: &str,
+    query_time_utc: DateTime<Utc>,
+) -> Result<SpcMdLoad, String> {
+    let text = data_source::fetch_text(url)
+        .map_err(|err| format!("Custom warning feed fetch failed: {err}"))?;
+
+    // CAP/GeoJSON FeatureCollection: richest form — carries geometry, VTEC,
+    // lifecycle, tags, headline. A custom feed is expected to carry its own
+    // polygon geometry, so zone lookups are intentionally skipped (empty map)
+    // to keep the fetch hermetic and avoid surprise api.weather.gov calls.
+    if let Ok(collection) = serde_json::from_str::<WeatherAlertFeatureCollection>(&text)
+        && !collection.features.is_empty()
+    {
+        let zone_geometries = HashMap::new();
+        let mut records = Vec::new();
+        let mut parsed_items = 0usize;
+        let mut error_count = 0usize;
+        for feature in &collection.features {
+            match parse_weather_alert_feature_with_zones(feature, query_time_utc, &zone_geometries)
+            {
+                Ok(mut feature_records) => {
+                    if !feature_records.is_empty() {
+                        parsed_items += 1;
+                        records.append(&mut feature_records);
+                    }
+                }
+                Err(_) => error_count += 1,
+            }
+        }
+        return Ok(SpcMdLoad {
+            scanned_items: collection.features.len(),
+            parsed_items,
+            error_count,
+            records,
+        });
+    }
+
+    // Fall back to the NWS text / VTEC / lat-lon polygon format (the same
+    // parser the Local-file loader uses).
+    let path = Path::new("custom-warning-feed");
+    let records = parse_hazard_records_from_text(path, &text, Some(query_time_utc));
+    if records.is_empty() {
+        return Err("Custom warning feed returned no parseable warnings".to_owned());
+    }
+    let parsed_items = records.len();
+    Ok(SpcMdLoad {
+        scanned_items: parsed_items,
+        parsed_items,
+        error_count: 0,
+        records,
+    })
+}
+
+/// Merge custom-provider records into an already-built live overlay. Keeps only
+/// user-enabled families and renderable geometry (mirroring the display-time
+/// filter, which tolerates `None` lifecycle), then dedupes and re-sorts against
+/// the existing records. Returns the number of records actually added.
+fn merge_custom_provider_records(
+    overlay: &mut HazardOverlay,
+    custom_records: Vec<HazardRecord>,
+) -> usize {
+    let mut custom_records = custom_records;
+    custom_records.retain(|record| {
+        hazard_family_has_user_filter(&record.event_family)
+            && hazard_points_renderable(&record.points)
+    });
+    if custom_records.is_empty() {
+        return 0;
+    }
+    let before = overlay.records.len();
+    let mut combined = std::mem::take(&mut overlay.records);
+    combined.extend(custom_records);
+    dedupe_hazard_records(&mut combined);
+    sort_hazard_records(&mut combined);
+    let added = combined.len().saturating_sub(before);
+    overlay.polygon_records = combined.len();
+    overlay.records = combined;
+    added
 }
 
 fn load_event_loop_hazard_overlay_with_preview<F>(
@@ -69983,6 +70188,148 @@ mod tests {
 
     fn test_map_rect() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 1000.0))
+    }
+
+    fn empty_live_overlay(records: Vec<HazardRecord>) -> HazardOverlay {
+        let polygon_records = records.len();
+        HazardOverlay {
+            source_label: "NWS active alerts".to_owned(),
+            query_time_utc: None,
+            scanned_items: 0,
+            parsed_items: 0,
+            polygon_records,
+            error_count: 0,
+            load_ms: 0.0,
+            records,
+        }
+    }
+
+    #[test]
+    fn live_hazard_refresh_interval_clamps_to_floor() {
+        // A too-fast (or zero) configured cadence is clamped up to the floor
+        // so a custom feed cannot hammer the endpoint or starve the UI thread.
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.warning_refresh_seconds = 1;
+        assert_eq!(
+            app.live_hazard_refresh_interval(),
+            Duration::from_secs(MIN_LIVE_HAZARD_REFRESH_SECONDS)
+        );
+        app.app_settings.warning_refresh_seconds = 45;
+        assert_eq!(app.live_hazard_refresh_interval(), Duration::from_secs(45));
+    }
+
+    #[test]
+    fn custom_warning_provider_url_requires_http_scheme() {
+        assert_eq!(
+            custom_warning_provider_url("  https://host/a.geojson  ").as_deref(),
+            Some("https://host/a.geojson")
+        );
+        assert_eq!(
+            custom_warning_provider_url("http://host/a").as_deref(),
+            Some("http://host/a")
+        );
+        assert!(custom_warning_provider_url("").is_none());
+        assert!(custom_warning_provider_url("   ").is_none());
+        assert!(custom_warning_provider_url("C:/warnings.json").is_none());
+        assert!(custom_warning_provider_url("ftp://host/a").is_none());
+    }
+
+    #[test]
+    fn merge_custom_provider_records_appends_new_and_dedupes() {
+        let mut overlay = empty_live_overlay(vec![test_hazard_record(
+            "KOUN.TO.W.0001",
+            "existing tornado",
+            "tornado",
+            square_hazard_points(-98.0, 35.0, -97.0, 36.0),
+        )]);
+        // One duplicate of the existing record + one brand-new custom record.
+        let custom = vec![
+            test_hazard_record(
+                "KOUN.TO.W.0001",
+                "existing tornado",
+                "tornado",
+                square_hazard_points(-98.0, 35.0, -97.0, 36.0),
+            ),
+            test_hazard_record(
+                "CUSTOM.SV.W.0009",
+                "custom svr",
+                "severe thunderstorm",
+                square_hazard_points(-96.0, 34.0, -95.0, 35.0),
+            ),
+        ];
+        let added = merge_custom_provider_records(&mut overlay, custom);
+        assert_eq!(added, 1, "only the brand-new record should be added");
+        assert_eq!(overlay.records.len(), 2);
+        assert_eq!(overlay.polygon_records, 2);
+        assert!(
+            overlay
+                .records
+                .iter()
+                .any(|record| record.event_id == "CUSTOM.SV.W.0009")
+        );
+    }
+
+    #[test]
+    fn merge_custom_provider_records_drops_degenerate_geometry() {
+        let mut overlay = empty_live_overlay(Vec::new());
+        // Fewer than three points is not a renderable polygon.
+        let degenerate = vec![test_hazard_record(
+            "CUSTOM.SV.W.0010",
+            "bad",
+            "severe thunderstorm",
+            vec![HazardPoint {
+                lon: -97.0,
+                lat: 35.0,
+            }],
+        )];
+        assert_eq!(merge_custom_provider_records(&mut overlay, degenerate), 0);
+        assert!(overlay.records.is_empty());
+    }
+
+    #[test]
+    fn merge_custom_provider_records_drops_unknown_family() {
+        let mut overlay = empty_live_overlay(Vec::new());
+        let unknown = vec![test_hazard_record(
+            "CUSTOM.ZZ.W.0011",
+            "mystery",
+            "not-a-real-family",
+            square_hazard_points(-96.0, 34.0, -95.0, 35.0),
+        )];
+        assert_eq!(merge_custom_provider_records(&mut overlay, unknown), 0);
+        assert!(overlay.records.is_empty());
+    }
+
+    #[test]
+    #[ignore = "network: hits the live NWS active-alerts CAP/GeoJSON feed"]
+    fn load_custom_warning_provider_parses_live_nws_geojson() {
+        // Real-data proof: the NWS active-alerts endpoint is itself a live
+        // CAP/GeoJSON FeatureCollection, so it exercises the exact custom-feed
+        // parse path an operator's alternate feed would hit. Merging the parsed
+        // records into a live overlay must yield renderable, user-filtered
+        // warning polygons.
+        let query_time_utc = Utc::now();
+        let load = load_custom_warning_provider(ACTIVE_ALERTS_URL, query_time_utc)
+            .expect("live NWS active-alerts custom-feed parse");
+        println!(
+            "custom feed: scanned={} parsed={} errors={} records={}",
+            load.scanned_items,
+            load.parsed_items,
+            load.error_count,
+            load.records.len()
+        );
+        assert!(load.scanned_items > 0, "feed returned no features");
+        let mut overlay = empty_live_overlay(Vec::new());
+        let added = merge_custom_provider_records(&mut overlay, load.records);
+        println!("merged {added} custom warning polygons into the overlay");
+        assert_eq!(added, overlay.records.len());
+        assert!(
+            overlay
+                .records
+                .iter()
+                .all(|record| hazard_points_renderable(&record.points)
+                    && hazard_family_has_user_filter(&record.event_family)),
+            "every merged custom record is renderable and in a known family"
+        );
     }
 
     fn test_storm_volume(scan_time: DateTime<Utc>) -> RadarVolume {
