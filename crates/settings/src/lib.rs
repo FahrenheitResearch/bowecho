@@ -193,6 +193,12 @@ pub struct AppSettings {
     /// Default off.
     #[serde(default)]
     pub show_tropical: bool,
+    /// Show the NWS radar operational-status panel: the selected US
+    /// NEXRAD/TDWR radar's RDA health (operational / degraded / DOWN) and
+    /// operator alarm messages, from api.weather.gov/radar/stations. A DOWN
+    /// radar is also badged on its map marker. Default off.
+    #[serde(default)]
+    pub show_radar_status: bool,
     /// Enabled outlook kinds ("cat", "torn", "wind", "hail", "estofex").
     #[serde(default)]
     pub overlay_spc_outlooks: Vec<String>,
@@ -693,6 +699,7 @@ impl Default for AppSettings {
             glm_show_last_minutes: default_glm_show_last_minutes(),
             overlay_raob: false,
             show_tropical: false,
+            show_radar_status: false,
             overlay_spc_outlooks: Vec::new(),
             overlay_spc_reports: false,
             overlay_mping_reports: false,

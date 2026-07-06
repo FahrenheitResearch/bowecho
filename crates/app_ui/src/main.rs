@@ -916,6 +916,10 @@ const RADAR_OPERATIONAL_STATUS_CACHE_SECONDS: u64 = 300;
 const RADAR_OPERATIONAL_STATUS_ERROR_SECONDS: u64 = 60;
 const RADAR_OPERATIONAL_STATUS_LOADING_SECONDS: u64 = 30;
 const RADAR_OPERATIONAL_STATUS_DISPLAY_ROWS: usize = 8;
+/// NWS canonical radar page (per-station operational status + imagery). The
+/// machine feed we consume is `api.weather.gov/radar/stations`; this is the
+/// human "link out" surfaced next to the in-app status.
+const RADAR_STATUS_PAGE_URL: &str = "https://radar.weather.gov/";
 const MAP_DRAG_DEAD_ZONE_PX: f32 = 3.0;
 const VOL3D_BOX_DRAG_MIN_PX: f32 = 12.0;
 const VOL3D_BOX_DRAG_MIN_HALF_KM: f32 = 5.0;
@@ -4084,6 +4088,42 @@ struct RadarOperationalAlarm {
     status: String,
     message: String,
     timestamp: Option<DateTime<Utc>>,
+}
+
+/// Coarse operational health of a NEXRAD/TDWR radar, derived from the NWS
+/// RDA status fields + active alarms. Drives the panel/menu status chip and
+/// the map-marker DOWN badge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RadarHealth {
+    /// RDA on-line and operating; no active alarms.
+    Operational,
+    /// Still operating but flagged for maintenance or carrying active alarms.
+    Degraded,
+    /// RDA inoperable, or not in an operating control status (Start-Up /
+    /// Standby / Offline) — not producing usable base data.
+    Down,
+    /// No RDA status published for the site.
+    Unknown,
+}
+
+impl RadarHealth {
+    fn label(self) -> &'static str {
+        match self {
+            RadarHealth::Operational => "OPERATIONAL",
+            RadarHealth::Degraded => "DEGRADED",
+            RadarHealth::Down => "DOWN",
+            RadarHealth::Unknown => "STATUS UNKNOWN",
+        }
+    }
+
+    fn color(self) -> egui::Color32 {
+        match self {
+            RadarHealth::Operational => egui::Color32::from_rgb(70, 190, 110),
+            RadarHealth::Degraded => egui::Color32::from_rgb(240, 170, 60),
+            RadarHealth::Down => egui::Color32::from_rgb(232, 66, 66),
+            RadarHealth::Unknown => egui::Color32::GRAY,
+        }
+    }
 }
 
 enum RadarOperationalStatusCacheEntry {
@@ -17468,6 +17508,20 @@ impl eframe::App for ViewerApp {
                 ctx.request_repaint();
             }
         }
+        if self.app_settings.show_radar_status {
+            // Local `open` mirrors the [✕] into the persisted setting without a
+            // double borrow of `self` (the body closure also borrows self).
+            let mut open = true;
+            egui::Window::new("📡 Radar Status")
+                .default_width(320.0)
+                .default_pos(egui::pos2(60.0, 130.0))
+                .open(&mut open)
+                .show(&ctx, |ui| self.radar_status_panel_ui(ui));
+            if !open {
+                self.app_settings.show_radar_status = false;
+                let _ = self.app_settings.save();
+            }
+        }
         if self.gbvtd.panel_open {
             // Local `open` so the title-bar [✕] can close the panel without a
             // double borrow of `self` (the body closure also borrows self).
@@ -20872,6 +20926,18 @@ impl ViewerApp {
             .checkbox(&mut self.app_settings.show_tropical, "Tropical cyclones")
             .on_hover_text(
                 "Show active hurricanes/typhoons worldwide (NHC + GDACS): a storm-card panel with wind, pressure, and motion, plus each storm's position, forecast track, and cone of uncertainty on the map.",
+            )
+            .changed()
+        {
+            let _ = self.app_settings.save();
+            ctx.request_repaint();
+        }
+        if ui
+            .checkbox(&mut self.app_settings.show_radar_status, "Radar status / outages")
+            .on_hover_text(
+                "Show the selected US NEXRAD/TDWR radar's live operational status from the NWS \
+                 (api.weather.gov/radar/stations): operational / degraded / DOWN, plus radar-operator \
+                 alarm messages. A radar reporting DOWN is also badged red on its map marker.",
             )
             .changed()
         {
@@ -29172,6 +29238,94 @@ impl ViewerApp {
             self.radar_operational_status_cache.remove(&site_id);
             self.ensure_radar_operational_status_fetch(site, ui.ctx());
         }
+    }
+
+    /// The "📡 Radar Status" panel body: the currently selected radar's live
+    /// NWS operational status (RDA health chip + operator alarm messages),
+    /// auto-fetched. Only US NEXRAD/TDWR sites are in the NWS radar API; for
+    /// anything else (international, research feeds) it says so and links out.
+    fn radar_status_panel_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(
+                "NWS RDA operational status + operator alarm messages \
+                 (api.weather.gov/radar/stations).",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(4.0);
+
+        let Some(site) = self.selected_site().cloned() else {
+            ui.weak("No radar selected.");
+            return;
+        };
+        let is_us_program = matches!(us_site_kind(&site), SiteKind::Wsr88d | SiteKind::Tdwr);
+        if !is_us_program || normalize_radar_station_id(&site.level2_id).is_none() {
+            ui.label(format!("Selected radar: {}", format_site_label(&site)));
+            ui.weak(
+                "Live operational status is published by the NWS/ROC for US \
+                 NEXRAD (WSR-88D) and TDWR radars only.",
+            );
+            if ui.link("Open NWS radar page ↗").clicked() {
+                ui.ctx()
+                    .open_url(egui::OpenUrl::new_tab(RADAR_STATUS_PAGE_URL));
+            }
+            return;
+        }
+
+        self.ensure_radar_operational_status_fetch(&site, ui.ctx());
+        let Some(site_id) = normalize_radar_station_id(&site.level2_id) else {
+            return;
+        };
+
+        let mut refresh = false;
+        match self.radar_operational_status_cache.get(&site_id) {
+            Some(RadarOperationalStatusCacheEntry::Loading { .. }) | None => {
+                ui.weak(format!("Loading NWS radar alarms for {site_id}…"));
+                ui.ctx().request_repaint_after(Duration::from_millis(250));
+            }
+            Some(RadarOperationalStatusCacheEntry::Error { message, .. }) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 140, 120),
+                    format!("Status unavailable: {message}"),
+                );
+                refresh = ui.button("Retry").clicked();
+            }
+            Some(RadarOperationalStatusCacheEntry::Ready { status, fetched_at }) => {
+                let age = Instant::now().duration_since(*fetched_at).as_secs();
+                draw_radar_operational_status_rows(ui, status);
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.weak(format!("NWS radar API · cached {age}s"));
+                    if ui.small_button("Refresh").clicked() {
+                        refresh = true;
+                    }
+                });
+            }
+        }
+        if ui.link("NWS radar page ↗").clicked() {
+            ui.ctx()
+                .open_url(egui::OpenUrl::new_tab(RADAR_STATUS_PAGE_URL));
+        }
+        if refresh {
+            self.radar_operational_status_cache.remove(&site_id);
+            self.ensure_radar_operational_status_fetch(&site, ui.ctx());
+        }
+    }
+
+    /// Map-marker DOWN badge color for a site whose NWS status is cached and
+    /// classifies as [`RadarHealth::Down`]; `None` otherwise (status not
+    /// fetched, still loading, errored, or the radar is up/degraded). Cheap
+    /// cache lookup — safe to call per marker during paint.
+    fn site_operational_down_badge(&self, site: &RadarSite) -> Option<egui::Color32> {
+        let site_id = normalize_radar_station_id(&site.level2_id)?;
+        let RadarOperationalStatusCacheEntry::Ready { status, .. } =
+            self.radar_operational_status_cache.get(&site_id)?
+        else {
+            return None;
+        };
+        matches!(radar_operational_health(status).0, RadarHealth::Down)
+            .then(|| RadarHealth::Down.color())
     }
 
     /// Context menu: the three lowest-beam radars over the clicked point.
@@ -39281,6 +39435,14 @@ impl ViewerApp {
                     egui::Stroke::new(1.5, egui::Color32::from_rgb(236, 246, 255)),
                 );
             }
+            // Red ring on any radar the NWS reports DOWN (only sites whose
+            // status has been fetched — the selected site auto-fetches while
+            // the Radar Status panel is open, clicked sites via the menu).
+            if self.app_settings.show_radar_status
+                && let Some(badge) = self.site_operational_down_badge(site)
+            {
+                painter.circle_stroke(*position, radius + 3.5, egui::Stroke::new(2.0, badge));
+            }
         }
 
         let mut occupied = Vec::with_capacity(site_points.len().min(48));
@@ -45839,13 +46001,85 @@ fn non_empty_string(value: &Option<String>) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Classify a radar's operational health from the NWS RDA fields + active
+/// alarm summary, returning the health bucket and a short human reason.
+///
+/// Grounded in the live `api.weather.gov/radar/stations` value space
+/// (sampled 2026-07 across all 208 reporting sites): `operabilityStatus` is
+/// one of {`RDA - On-line`, `RDA - Maintenance Action Required`, `RDA -
+/// Maintenance Action Mandatory`, `RDA - Inoperable`}; `status` (RDA control
+/// state) is {`Operate`, `Start-Up`, …}; `alarmSummary` is pipe-delimited
+/// categories or `No Alarms`.
+fn radar_operational_health(status: &RadarOperationalStatus) -> (RadarHealth, Option<String>) {
+    let operability = status.operability_status.as_deref().unwrap_or("").trim();
+    let rda_status = status.rda_status.as_deref().unwrap_or("").trim();
+    let operability_lc = operability.to_ascii_lowercase();
+    let rda_status_lc = rda_status.to_ascii_lowercase();
+
+    // Operating = RDA in an active control state. Absent status is treated as
+    // operating so a site that only publishes a nominal operabilityStatus is
+    // not falsely flagged DOWN.
+    let operating = rda_status_lc.is_empty()
+        || rda_status_lc.contains("operate")
+        || rda_status_lc.contains("operational");
+
+    // DOWN: RDA reports itself inoperable, or is not actively operating
+    // (Start-Up / Standby / Offline / Restart) — no usable base data.
+    if operability_lc.contains("inoperable") || !operating {
+        let reason = if !operability.is_empty() {
+            operability.to_owned()
+        } else {
+            format!("RDA status: {rda_status}")
+        };
+        return (RadarHealth::Down, Some(reason));
+    }
+
+    // DEGRADED: still operating but flagged for maintenance, or carrying an
+    // active alarm summary.
+    let alarm = status
+        .alarm_summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty() && !summary.eq_ignore_ascii_case("No Alarms"));
+    if operability_lc.contains("maintenance") || alarm.is_some() {
+        let reason = alarm
+            .map(str::to_owned)
+            .or_else(|| (!operability.is_empty()).then(|| operability.to_owned()));
+        return (RadarHealth::Degraded, reason);
+    }
+
+    if operability.is_empty() && rda_status.is_empty() {
+        (RadarHealth::Unknown, None)
+    } else {
+        (RadarHealth::Operational, None)
+    }
+}
+
+/// The colored health chip ("DOWN" / "DEGRADED" / …) shared by the status
+/// panel and the best-radar context menu.
+fn draw_radar_health_chip(ui: &mut egui::Ui, health: RadarHealth) {
+    ui.label(
+        egui::RichText::new(format!(" {} ", health.label()))
+            .small()
+            .strong()
+            .background_color(health.color().gamma_multiply(0.35))
+            .color(health.color()),
+    );
+}
+
 fn draw_radar_operational_status_rows(ui: &mut egui::Ui, status: &RadarOperationalStatus) {
     let rda_time = status
         .rda_timestamp
         .map(format_utc_seconds)
         .unwrap_or_else(|| "time unknown".to_owned());
-    ui.monospace(format!("Radar: {} {}", status.site_id, status.site_name));
-    if let Some(alarm_summary) = &status.alarm_summary {
+    let (health, reason) = radar_operational_health(status);
+    ui.horizontal(|ui| {
+        draw_radar_health_chip(ui, health);
+        ui.monospace(format!("{} {}", status.site_id, status.site_name));
+    });
+    if let Some(reason) = reason {
+        ui.colored_label(health.color(), reason);
+    } else if let Some(alarm_summary) = &status.alarm_summary {
         ui.monospace(format!("Alarm: {alarm_summary}"));
     }
     let mut state_parts = Vec::new();
@@ -71265,6 +71499,83 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].status, "mandatory");
         assert_eq!(rows[1].status, "cleared");
+    }
+
+    /// Health classifier pinned to the LIVE `api.weather.gov/radar/stations`
+    /// value space (sampled 2026-07 across all 208 reporting sites).
+    #[test]
+    fn radar_operational_health_classifies_live_nws_value_space() {
+        fn status(
+            operability: Option<&str>,
+            rda_status: Option<&str>,
+            alarm_summary: Option<&str>,
+        ) -> RadarOperationalStatus {
+            RadarOperationalStatus {
+                site_id: "TEST".to_owned(),
+                site_name: "Test".to_owned(),
+                alarm_summary: alarm_summary.map(str::to_owned),
+                mode: Some("Operational".to_owned()),
+                rda_status: rda_status.map(str::to_owned),
+                operability_status: operability.map(str::to_owned),
+                rda_timestamp: None,
+                alarms: Vec::new(),
+            }
+        }
+
+        // KUDX: on-line + Operate + No Alarms -> OPERATIONAL.
+        assert_eq!(
+            radar_operational_health(&status(
+                Some("RDA - On-line"),
+                Some("Operate"),
+                Some("No Alarms"),
+            )),
+            (RadarHealth::Operational, None),
+        );
+        // KPUX: maintenance required, still operating -> DEGRADED (reason =
+        // the active alarm summary).
+        assert_eq!(
+            radar_operational_health(&status(
+                Some("RDA - Maintenance Action Required"),
+                Some("Operate"),
+                Some("Tower/Utilities"),
+            )),
+            (RadarHealth::Degraded, Some("Tower/Utilities".to_owned())),
+        );
+        // KILX: maintenance mandatory, still operating -> DEGRADED.
+        assert_eq!(
+            radar_operational_health(&status(
+                Some("RDA - Maintenance Action Mandatory"),
+                Some("Operate"),
+                Some("Tower/Utilities"),
+            ))
+            .0,
+            RadarHealth::Degraded,
+        );
+        // PGUA (the live Guam typhoon radar): inoperable + Start-Up -> DOWN.
+        assert_eq!(
+            radar_operational_health(&status(
+                Some("RDA - Inoperable"),
+                Some("Start-Up"),
+                Some("Tower/Utilities|Transmitter|Receiver"),
+            )),
+            (RadarHealth::Down, Some("RDA - Inoperable".to_owned())),
+        );
+        // KIWX: maintenance but RDA control status Start-Up -> DOWN (not
+        // producing base data even though flagged only "maintenance").
+        assert_eq!(
+            radar_operational_health(&status(
+                Some("RDA - Maintenance Action Required"),
+                Some("Start-Up"),
+                Some("Tower/Utilities"),
+            ))
+            .0,
+            RadarHealth::Down,
+        );
+        // No RDA fields published at all -> UNKNOWN.
+        assert_eq!(
+            radar_operational_health(&status(None, None, None)),
+            (RadarHealth::Unknown, None),
+        );
     }
 
     #[test]
