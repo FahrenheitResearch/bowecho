@@ -176,20 +176,35 @@ const HIGH_END_SAMPLE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const LOW_END_LOOP_RENDER_CACHE_BYTES: usize = 96 * 1024 * 1024;
 const MID_RANGE_LOOP_RENDER_CACHE_BYTES: usize = 384 * 1024 * 1024;
 const HIGH_END_LOOP_RENDER_CACHE_BYTES: usize = 512 * 1024 * 1024;
-/// Byte budget for the shared dealiased-velocity grid memo
-/// ([`dealias_grid_cache`]). A dealiased super-res velocity tilt is ~1.7 MB
-/// (measured on live PGUA: 720 radials × 1192 gates, 16-bit storage; F32
-/// grids from other feeds are ~2× that). Sized so a full LONG super-res loop
-/// (the player loads 256+ frames; the ceiling is 2000) is dealiased ONCE and
-/// reused on every replay and product toggle, instead of the old 384 MiB tier
-/// that held only ~200 grids and re-ran the ~200 ms dealiaser after a few
-/// passes ("fast for 4 loops then slow again"). These grids are a few percent
-/// of the raw volumes the radar-history budget already holds (~60-100 MB
-/// each), so even the high-end 3 GiB (~1800 grids) is a safe fraction; smaller
-/// tiers keep the hottest recent frames via LRU.
+/// Per-machine FLOOR for the shared dealiased-velocity grid memo
+/// ([`dealias_grid_cache`]). The ACTUAL budget scales with the user's
+/// radar-history RAM budget (see [`dealias_grid_cache_budget_bytes`]); these
+/// thread-derived tiers only keep a beefy machine from ever dropping below a
+/// useful working set even when the history budget is set small.
+///
+/// A dealiased super-res velocity tilt is ~1.7 MB (measured on live PGUA: 720
+/// radials × 1192 gates, 16-bit storage; F32 grids from other feeds are ~2×
+/// that). The bug this fixes: the budget used to be a FIXED tier (256 MiB /
+/// 1 GiB / 3 GiB) chosen by core count alone, so a machine that loaded a long
+/// super-res loop (the player loads 256+ frames; ceiling 2000) into a large
+/// radar-history budget still capped the grid memo at the small tier — the
+/// loop tail evicted and re-ran the ~200 ms dealiaser every pass ("works then
+/// re-dealiases toward the end", worst in dual-pane where two tilts compete
+/// for the same tier). These grids are a few percent of the raw volumes the
+/// history budget already holds (~60-100 MB each), so a memo sized to a small
+/// fraction of that budget holds one grid PER loaded frame PER active tilt.
 const LOW_END_DEALIAS_GRID_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MID_RANGE_DEALIAS_GRID_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 const HIGH_END_DEALIAS_GRID_CACHE_BYTES: usize = 3 * 1024 * 1024 * 1024;
+/// Fraction (as a divisor) of the radar-history RAM budget the dealiased-grid
+/// memo may use PER active dealias pane. A dealiased tilt is ~2-6% of the raw
+/// volume it derives from, so one grid per history frame costs a small slice
+/// of the history budget; 1/8 (12.5%) covers the worst case (F32 grids on
+/// small intl volumes) with margin. The memo never actually allocates up to
+/// this cap — resident bytes are bounded by the real grids (frames × tilts) —
+/// so a generous cap simply guarantees the whole loaded loop stays memoized
+/// instead of the tail thrashing.
+const DEALIAS_GRID_BUDGET_HISTORY_DIVISOR: usize = 8;
 /// Keep prewarming a sliding working set instead of eventually rasterizing the
 /// entire history while playback is paused or running.
 const LOOP_PREWARM_PLAYING_LOOKAHEAD_FRAMES: usize = 24;
@@ -4740,6 +4755,20 @@ impl DealiasGridCache {
         self.bytes += bytes;
         self.entries
             .push_back(DealiasGridEntry { key, grid, bytes });
+        self.evict_to_budget();
+    }
+
+    /// Retarget the byte budget (the user changed the radar-history budget or
+    /// the pane count). Growing keeps every entry; shrinking evicts the oldest
+    /// down to the new cap. Idempotent, so cheap to call on every settings sync.
+    fn set_budget(&mut self, budget_bytes: usize) {
+        self.budget_bytes = budget_bytes;
+        self.evict_to_budget();
+    }
+
+    /// Drop least-recently-used entries until within budget, always keeping at
+    /// least the most-recent one so a single oversized grid still caches.
+    fn evict_to_budget(&mut self) {
         while self.bytes > self.budget_bytes && self.entries.len() > 1 {
             let Some(front) = self.entries.pop_front() else {
                 break;
@@ -4759,12 +4788,38 @@ impl DealiasGridCache {
     }
 }
 
-fn dealias_grid_cache_budget_bytes() -> usize {
+/// Per-machine floor for the grid memo (see the tier consts): a beefy machine
+/// never drops below a useful working set even with a small history budget.
+fn dealias_grid_cache_tier_floor_bytes() -> usize {
     match effective_worker_threads() {
         0..=7 => LOW_END_DEALIAS_GRID_CACHE_BYTES,
         8..=15 => MID_RANGE_DEALIAS_GRID_CACHE_BYTES,
         _ => HIGH_END_DEALIAS_GRID_CACHE_BYTES,
     }
+}
+
+/// Byte budget for the shared dealiased-grid memo, scaled to the user's
+/// radar-history RAM budget so it can hold one dealiased grid PER loaded frame
+/// PER active dealias pane — the whole loaded loop stays memoized instead of
+/// the tail re-dealiasing under LRU eviction. `active_dealias_panes` is the
+/// pane count (primary + extras, 1..=4); floored at the per-machine tier.
+fn dealias_grid_cache_budget_bytes(history_budget_gib: u16, active_dealias_panes: usize) -> usize {
+    let panes = active_dealias_panes.max(1);
+    let scaled = radar_history_budget_bytes(history_budget_gib)
+        / DEALIAS_GRID_BUDGET_HISTORY_DIVISOR
+        * panes;
+    scaled.max(dealias_grid_cache_tier_floor_bytes())
+}
+
+/// Retarget the process-wide grid memo's budget from the current settings.
+/// Called at startup and whenever the radar-history budget or pane count
+/// changes; growing is free, shrinking evicts the oldest grids down to the cap.
+fn set_dealias_grid_cache_budget(history_budget_gib: u16, active_dealias_panes: usize) {
+    let budget = dealias_grid_cache_budget_bytes(history_budget_gib, active_dealias_panes);
+    dealias_grid_cache()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .set_budget(budget);
 }
 
 /// Process-wide memo of dealiased velocity grids. The three dealiasers
@@ -4779,8 +4834,12 @@ fn dealias_grid_cache_budget_bytes() -> usize {
 fn dealias_grid_cache() -> &'static Mutex<DealiasGridCache> {
     static CACHE: OnceLock<Mutex<DealiasGridCache>> = OnceLock::new();
     CACHE.get_or_init(|| {
+        // Initialised lazily (possibly from a background worker before settings
+        // are known) at the default history budget for a single pane;
+        // `set_dealias_grid_cache_budget` rescales it once the app knows the
+        // user's real budget and pane count.
         Mutex::new(DealiasGridCache::with_budget(
-            dealias_grid_cache_budget_bytes(),
+            dealias_grid_cache_budget_bytes(settings::default_radar_history_budget_gib(), 1),
         ))
     })
 }
@@ -6650,6 +6709,15 @@ impl ViewerApp {
         primary.limits.byte_budget = Some(radar_history_budget_bytes(
             app_settings.radar_history_budget_gib,
         ));
+        // Size the shared dealiased-grid memo to the same RAM the user gave the
+        // radar-history loop, scaled by pane count, so a fully loaded
+        // dealiased-velocity loop is dealiased ONCE per tilt and never
+        // re-dealiased on the tail by LRU eviction (dual-pane tail re-dealias
+        // bug). Rescaled by `set_radar_history_budget`/`sync_extra_panes`.
+        set_dealias_grid_cache_budget(
+            app_settings.radar_history_budget_gib,
+            app_settings.grid_pane_count,
+        );
         // Re-arm the international picker on the last-used provider so the
         // saved site selection has its provider context back.
         let restored_intl_provider = app_settings.intl_provider.clone();
@@ -10640,6 +10708,9 @@ impl ViewerApp {
         }
         self.app_settings.radar_history_budget_gib = gib;
         self.primary.limits.byte_budget = Some(radar_history_budget_bytes(gib));
+        // Keep the dealiased-grid memo sized to the (new) history budget so a
+        // longer loop still stays fully memoized.
+        set_dealias_grid_cache_budget(gib, self.app_settings.grid_pane_count);
         self.trim_frame_history();
         let _ = self.app_settings.save();
         ctx.request_repaint();
@@ -13237,6 +13308,13 @@ impl ViewerApp {
         self.active_pane = self
             .active_pane
             .min(self.grid_layout.panel_count().saturating_sub(1));
+        // Rescale the dealiased-grid memo for the current pane count: a dual/
+        // quad-pane loop can hold one grid per frame per pane, so a
+        // dealiased-velocity pane never re-dealiases the loop tail.
+        set_dealias_grid_cache_budget(
+            self.app_settings.radar_history_budget_gib,
+            self.grid_layout.panel_count(),
+        );
         let wanted = self.grid_layout.panel_count().saturating_sub(1);
         if self.extra_panes.len() > wanted {
             self.extra_panes.truncate(wanted);
@@ -14491,7 +14569,14 @@ impl ViewerApp {
             && render_dealiased_velocity)
             .then(|| {
                 self.extra_panes.get(pane_slot).and_then(|pane| {
-                    if pane.owns_radar() {
+                    // The reference must come from the SAME history that
+                    // produced `volume` (see `extra_pane_display_volume`): an
+                    // owns-radar pane whose own frame hasn't loaded yet renders
+                    // the PRIMARY's fallback volume, so it must also read the
+                    // primary's history/cursor — otherwise its Analyst3d
+                    // reference pointer diverges from the primary's key and the
+                    // pane re-dealiases the very tilt the primary just did.
+                    if pane.owns_radar() && pane.volume.is_some() {
                         previous_dealias_reference_volume(
                             &pane.engine.history,
                             pane.engine.cursor.index,
@@ -53965,6 +54050,300 @@ mod tests {
         );
         assert_eq!(cache.len(), 1);
         assert!(cache.get(&region_key(0x1000, 0)).is_some());
+    }
+
+    /// The grid-memo budget scales linearly with BOTH the radar-history RAM
+    /// budget and the active pane count, floored at the per-machine tier. This
+    /// is the fix for the dual-pane tail re-dealias: the budget follows the
+    /// size of the loaded loop instead of a fixed core-count tier.
+    #[test]
+    fn dealias_grid_cache_budget_scales_with_history_and_panes() {
+        let floor = dealias_grid_cache_tier_floor_bytes();
+        // A 2 GiB history budget yields exactly the 256 MiB floor (or the higher
+        // machine tier), never below it.
+        assert_eq!(dealias_grid_cache_budget_bytes(2, 1), floor);
+        // Above the floor (32 GiB / 8 = 4 GiB exceeds every tier) the budget is
+        // linear in the history budget AND the pane count.
+        let base = dealias_grid_cache_budget_bytes(32, 1);
+        assert!(base > floor, "32 GiB history must exceed the machine floor");
+        assert_eq!(
+            dealias_grid_cache_budget_bytes(64, 1),
+            2 * base,
+            "doubling the history budget doubles the grid memo"
+        );
+        assert_eq!(
+            dealias_grid_cache_budget_bytes(32, 2),
+            2 * base,
+            "a second dealias pane doubles the grid memo"
+        );
+        // Zero panes is clamped to one (never a zero budget).
+        assert_eq!(dealias_grid_cache_budget_bytes(32, 0), base);
+    }
+
+    /// `set_budget` grows without evicting and shrinks oldest-first — so raising
+    /// the history budget keeps the whole loop, and lowering it trims to the cap.
+    #[test]
+    fn dealias_grid_cache_set_budget_grows_and_shrinks() {
+        let entry = 1024 * 1024;
+        let mut cache = DealiasGridCache::with_budget(2 * entry);
+        for cut in 0..2 {
+            cache.insert(
+                region_key(0x1000, cut),
+                Arc::new(dealias_grid_of_bytes(entry)),
+            );
+        }
+        assert_eq!(cache.len(), 2);
+        // Grow: four more grids all fit — nothing evicted.
+        cache.set_budget(8 * entry);
+        for cut in 2..6 {
+            cache.insert(
+                region_key(0x1000, cut),
+                Arc::new(dealias_grid_of_bytes(entry)),
+            );
+        }
+        assert_eq!(cache.len(), 6);
+        // Shrink to ~2 grids: evict oldest-first, recent frames survive.
+        cache.set_budget(2 * entry + entry / 2);
+        assert!(cache.total_bytes() <= cache.budget_bytes);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&region_key(0x1000, 5)).is_some());
+        assert!(cache.get(&region_key(0x1000, 4)).is_some());
+        assert!(cache.get(&region_key(0x1000, 0)).is_none());
+    }
+
+    /// Regression for the dual-pane "works then re-dealiases toward the end of
+    /// the loop" bug. Proves (1) the OLD fixed low-end tier is smaller than a
+    /// realistic 256-frame dual-pane loop while the history-scaled budget is
+    /// not, and (2) on a real cache an undersized memo re-dealiases the loop
+    /// TAIL on replay while a loop-sized memo does not. Mirrors
+    /// `cached_dealias_grid`'s get-else-compute-insert with a grid PER frame
+    /// PER pane.
+    #[test]
+    fn dealias_memo_retains_full_dual_pane_loop_after_budget_scaling() {
+        // ~1.7 MiB per live-PGUA dealiased velocity tilt (measured on PGUA).
+        const LIVE_GRID_BYTES: usize = 1_700_000;
+        const FRAMES: usize = 256;
+        const PANES: usize = 2;
+        let live_loop_bytes = FRAMES * PANES * LIVE_GRID_BYTES; // ~870 MiB.
+        // The old fixed low-end tier could not hold the loop → tail eviction →
+        // re-dealias (the reported bug); the scaled budget can.
+        assert!(
+            LOW_END_DEALIAS_GRID_CACHE_BYTES < live_loop_bytes,
+            "the old fixed low-end tier is smaller than a 256-frame dual-pane loop"
+        );
+        assert!(
+            dealias_grid_cache_budget_bytes(8, PANES) >= live_loop_bytes,
+            "the history-scaled budget holds the whole dual-pane loop"
+        );
+
+        // Mechanism check on a real cache (small grids to stay light).
+        const SIM_GRID_BYTES: usize = 256 * 1024;
+        let cuts = [0usize, 1usize];
+        fn get_or(
+            cache: &mut DealiasGridCache,
+            key: DealiasGridKey,
+            bytes: usize,
+            computes: &mut usize,
+        ) {
+            if cache.get(&key).is_some() {
+                return;
+            }
+            *computes += 1;
+            cache.insert(key, Arc::new(dealias_grid_of_bytes(bytes)));
+        }
+        let replay_recomputes = |budget: usize| -> usize {
+            let mut cache = DealiasGridCache::with_budget(budget);
+            let mut computes = 0usize;
+            // Warm the memo with two full forward passes...
+            for _ in 0..2 {
+                for frame in 0..FRAMES {
+                    let vptr = 0x10_0000 + frame * 0x1000;
+                    for &cut in &cuts {
+                        get_or(
+                            &mut cache,
+                            region_key(vptr, cut),
+                            SIM_GRID_BYTES,
+                            &mut computes,
+                        );
+                    }
+                }
+            }
+            // ...then measure recomputes on a THIRD (steady-state) pass.
+            let before = computes;
+            for frame in 0..FRAMES {
+                let vptr = 0x10_0000 + frame * 0x1000;
+                for &cut in &cuts {
+                    get_or(
+                        &mut cache,
+                        region_key(vptr, cut),
+                        SIM_GRID_BYTES,
+                        &mut computes,
+                    );
+                }
+            }
+            computes - before
+        };
+        let sim_loop_bytes = FRAMES * PANES * SIM_GRID_BYTES;
+        // Undersized (a quarter of the loop): the tail thrashes.
+        assert!(
+            replay_recomputes(sim_loop_bytes / 4) > 0,
+            "an undersized memo re-dealiases the loop tail on replay"
+        );
+        // Sized to the loop (with headroom): zero replay recompute, tail included.
+        assert_eq!(
+            replay_recomputes(sim_loop_bytes * 2),
+            0,
+            "a loop-sized memo replays with no tail re-dealias"
+        );
+    }
+
+    /// End-to-end proof on REAL PGUA (BAVI-26) volumes that a dual-pane
+    /// dealiased-velocity LOOP, replayed, does not re-run the region dealiaser
+    /// on ANY frame — including the loop tail — once the grid memo is sized to
+    /// the radar-history budget. Also reproduces the bug on real grids: an
+    /// undersized memo re-dealiases on replay.
+    ///
+    /// Ignored by default (needs the on-disk PGUA cache). Run with:
+    ///   cargo test -p app_ui pgua_dual_pane_dealias_loop_no_tail_recompute -- --ignored --nocapture
+    /// Override the directory with BOWECHO_PGUA_DUALPANE_DIR and the frame cap
+    /// with BOWECHO_PGUA_LOOP_FRAMES (default 64; set 256 for the full loop).
+    #[test]
+    #[ignore = "reads real on-disk PGUA level-II volumes"]
+    fn pgua_dual_pane_dealias_loop_no_tail_recompute() {
+        let dir = std::env::var("BOWECHO_PGUA_DUALPANE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| cache_dir("PGUA"));
+        let cap: usize = std::env::var("BOWECHO_PGUA_LOOP_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|err| panic!("read PGUA cache {}: {err}", dir.display()))
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("PGUA") && name.ends_with("_V06"))
+            })
+            .collect();
+        files.sort();
+        files.truncate(cap);
+        assert!(
+            files.len() >= 8,
+            "need several PGUA volumes for a loop, found {} in {}",
+            files.len(),
+            dir.display()
+        );
+
+        // Decode all frames up front and hold the Arcs, so their pointers (the
+        // memo key) stay distinct and alive for the whole loop — exactly like
+        // the radar-history ring the player loops over. Each frame carries its
+        // OWN lowest velocity tilt (real PGUA volumes vary in cut layout, and
+        // some partial frames lack velocity entirely — those are skipped).
+        let frames: Vec<(Arc<RadarVolume>, usize)> = files
+            .iter()
+            .filter_map(|file| {
+                let raw = std::fs::read(file)
+                    .unwrap_or_else(|err| panic!("read {}: {err}", file.display()));
+                let volume = Arc::new(
+                    nexrad_io::decode_volume_from_bytes(&raw)
+                        .unwrap_or_else(|err| panic!("decode {}: {err}", file.display())),
+                );
+                let cut = (0..volume.cuts.len()).find(|&index| {
+                    volume.cuts[index]
+                        .moments
+                        .contains_key(&MomentType::Velocity)
+                })?;
+                Some((volume, cut))
+            })
+            .collect();
+        assert!(
+            frames.len() >= 8,
+            "need several PGUA velocity frames for a loop, found {}",
+            frames.len()
+        );
+
+        // Real dealias of the first tilt → measure the grid's resident bytes.
+        let grid_bytes = {
+            let (volume, cut) = &frames[0];
+            let sample_cut = &volume.cuts[*cut];
+            let grid = sample_cut.moments.get(&MomentType::Velocity).unwrap();
+            moment_grid_cache_bytes(&dealias_velocity_grid(sample_cut, grid))
+        };
+        let panes = 2usize; // primary + one following pane, both dealiased velocity, SAME tilt.
+        let loop_bytes = frames.len() * grid_bytes; // shared key across panes → one grid/frame.
+        eprintln!(
+            "PGUA loop: frames={} grid_bytes={grid_bytes} loop=~{} MiB; \
+             old LOW_END tier={} MiB holds ~{} grids; scaled(8,2)={} MiB",
+            frames.len(),
+            loop_bytes / (1024 * 1024),
+            LOW_END_DEALIAS_GRID_CACHE_BYTES / (1024 * 1024),
+            LOW_END_DEALIAS_GRID_CACHE_BYTES / grid_bytes.max(1),
+            dealias_grid_cache_budget_bytes(8, panes) / (1024 * 1024),
+        );
+
+        // Build the exact render-path key for a Region-engine dealiased-velocity
+        // tilt and run the real dealiaser through the shared process-wide memo.
+        let dealias_frame = |volume: &Arc<RadarVolume>, cut: usize| {
+            let key =
+                DealiasGridKey::same_tilt(Arc::as_ptr(volume) as usize, cut, DealiasEngine::Region);
+            let frame_cut = &volume.cuts[cut];
+            let grid = frame_cut.moments.get(&MomentType::Velocity).unwrap();
+            cached_dealias_grid(key, || Some(dealias_velocity_grid(frame_cut, grid)))
+                .expect("region dealias");
+        };
+        let step_loop = || {
+            for (volume, cut) in &frames {
+                dealias_frame(volume, *cut); // primary pane
+                dealias_frame(volume, *cut); // following pane, SAME tilt/key
+            }
+        };
+
+        // ---- FIX: budget scaled to the history budget + pane count ----
+        set_dealias_grid_cache_budget(8, panes);
+        let before = dealias_grid_compute_count();
+        step_loop(); // pass 1: dealias each tilt exactly once
+        let after_pass1 = dealias_grid_compute_count();
+        step_loop(); // pass 2 (replay): must be all hits, tail included
+        let after_pass2 = dealias_grid_compute_count();
+        eprintln!(
+            "scaled budget: pass1=+{} pass2=+{}",
+            after_pass1 - before,
+            after_pass2 - after_pass1
+        );
+        assert_eq!(
+            after_pass1 - before,
+            frames.len() as u64,
+            "pass 1 dealiases each tilt once (the pane shares the primary's grid)"
+        );
+        assert_eq!(
+            after_pass2 - after_pass1,
+            0,
+            "pass 2 replay must be 100% cache hits across the WHOLE loop, tail included"
+        );
+
+        // ---- REPRO on real grids: an undersized memo (old tier < loop) ----
+        // Shrink so only half the loop fits, then replay: the tail re-dealiases.
+        dealias_grid_cache()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .set_budget(loop_bytes / 2);
+        let before_repro = dealias_grid_compute_count();
+        step_loop();
+        let after_repro = dealias_grid_compute_count();
+        eprintln!(
+            "undersized budget (half the loop): replay recomputes=+{}",
+            after_repro - before_repro
+        );
+        assert!(
+            after_repro - before_repro > 0,
+            "sanity: a memo smaller than the loop re-dealiases on replay (the bug)"
+        );
+
+        // Restore a sane budget for any later tests sharing the process.
+        set_dealias_grid_cache_budget(8, panes);
     }
 
     #[test]

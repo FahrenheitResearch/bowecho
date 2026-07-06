@@ -546,7 +546,7 @@ fn default_zoom_speed_percent() -> u16 {
 
 /// Default primary radar-history memory budget in GiB (matches the engine's
 /// historical `PRIMARY_HISTORY_BYTE_BUDGET`). See `radar_history_budget_gib`.
-fn default_radar_history_budget_gib() -> u16 {
+pub fn default_radar_history_budget_gib() -> u16 {
     8
 }
 
