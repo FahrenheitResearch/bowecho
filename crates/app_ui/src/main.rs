@@ -9004,35 +9004,6 @@ impl ViewerApp {
         self.volume = Some(volume);
         self.dealiased_readout_cache = None;
         self.selected_cut = selected_cut;
-        // Env-gated trace (BOWECHO_TRACE_PRODUCT): pinpoint which install turns
-        // a velocity display into reflectivity and on what kind of frame. The
-        // frame_status tells partial (live poll) from complete (loaded frame).
-        if std::env::var_os("BOWECHO_TRACE_PRODUCT").is_some()
-            && matches!(
-                self.selected_product,
-                DisplayProduct::Moment(MomentType::Velocity)
-                    | DisplayProduct::DealiasedVelocity
-                    | DisplayProduct::StormRelativeVelocity
-                    | DisplayProduct::StormRelativeDealiasedVelocity
-            )
-            && matches!(
-                selected_product,
-                DisplayProduct::Moment(MomentType::Reflectivity)
-            )
-        {
-            let line = format!(
-                "FLIP vel->refl @install_volume_arc status={frame_status:?} playing={} pending={:?} cut={selected_cut}\n",
-                self.primary.cursor.playing, self.pending_product_restore,
-            );
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(std::env::temp_dir().join("bowecho_product_trace.log"))
-            {
-                use std::io::Write;
-                let _ = file.write_all(line.as_bytes());
-            }
-        }
         self.selected_product = selected_product;
         let installed_volume = self.volume.clone();
         if let Some(installed_volume) = installed_volume {
@@ -22283,96 +22254,12 @@ impl ViewerApp {
         }
     }
 
-    fn radar_controls_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // The sidebar edits the FOCUSED pane: the main pane (or 1x1) edits the
-        // shared state everyone follows; a focused extra pane edits itself.
-        // (Volume-free — hoisted above the volume gate.)
-        let editing_pane: Option<usize> = (self.grid_layout != PanelLayout::One
-            && self.active_pane >= 1
-            && self.active_pane - 1 < self.extra_panes.len())
-        .then(|| self.active_pane - 1);
-        let independent_pane = self.independent_editing_pane();
-        let editing_product = editing_pane
-            .map(|slot| self.extra_panes[slot].product.clone())
-            .unwrap_or_else(|| self.selected_product.clone());
-        let editing_cut = editing_pane
-            .and_then(|slot| self.extra_panes[slot].cut)
-            .unwrap_or(self.selected_cut);
-
-        // R0: panes row + editing-pane context, above everything it affects.
-        let mut independent_toggle: Option<bool> = None;
-        ui.horizontal(|ui| {
-            ui.label("Panes");
-            for (layout, label, hover) in [
-                (PanelLayout::One, "1", "Single pane"),
-                (
-                    PanelLayout::TwoVertical,
-                    "2",
-                    "Two panes side by side (synced)",
-                ),
-                (
-                    PanelLayout::ThreeStacked,
-                    "3",
-                    "Three panes: large primary plus two stacked comparison panes",
-                ),
-                (
-                    PanelLayout::FourGrid,
-                    "4",
-                    "Quad grid — REF / VEL / CC / ZDR (synced)",
-                ),
-            ] {
-                if ui
-                    .selectable_label(self.grid_layout == layout, label)
-                    .on_hover_text(hover)
-                    .clicked()
-                    && self.grid_layout != layout
-                {
-                    // Defer: textures from the outgoing layout may already
-                    // be in this frame's paint list (Metal aborts on
-                    // freed-texture references).
-                    self.pending_grid_layout = Some(layout);
-                    self.app_settings.grid_pane_count = layout.panel_count();
-                    let _ = self.app_settings.save();
-                    ctx.request_repaint();
-                }
-            }
-            ui.separator();
-            let mut independent = self.app_settings.independent_panels;
-            if ui
-                .checkbox(&mut independent, "Independent")
-                .on_hover_text(
-                    "Selected extra panes own their radar source, loop history, pan/zoom, products, and tilts",
-                )
-                .changed()
-            {
-                independent_toggle = Some(independent);
-            }
-        });
-        if let Some(enabled) = independent_toggle {
-            self.set_independent_panels(enabled, ctx);
-        }
-        if let Some(slot) = editing_pane {
-            if independent_pane == Some(slot) {
-                ui.colored_label(
-                    ACCENT_COLOR,
-                    format!(
-                        "Independent pane {} - SITE, products, tilt, and loop controls target this pane",
-                        slot + 2
-                    ),
-                );
-            } else {
-                ui.colored_label(
-                    ACCENT_COLOR,
-                    format!(
-                        "Editing pane {} — click the main (top-left) pane to edit all",
-                        slot + 2
-                    ),
-                );
-                self.extra_pane_site_controls(ui, ctx, slot);
-            }
-        }
-
-        // R1: SITE — pick, load, live state, one-line status.
+    /// SITE — site pick, load, live state, and the one-line status row.
+    /// Extracted from `radar_controls_panel` so it renders on BOTH sides
+    /// of the volume gate: with no volume it is the only way to pick the
+    /// first site; with a volume it sits below PRODUCTS/TILT (owner's
+    /// layout — LOOP on top, SITE below products).
+    fn radar_site_section(&mut self, ui: &mut egui::Ui, independent_pane: Option<usize>) {
         Self::section_header(ui, "SITE");
         let site_control_pane = independent_pane;
         let pane_intl_source = site_control_pane
@@ -23060,8 +22947,104 @@ impl ViewerApp {
                 ui.label(&self.status);
             }
         }
+    }
 
-        // R2: layer/customization state lives in the Custom tab now; RADAR
+    fn radar_controls_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // The sidebar edits the FOCUSED pane: the main pane (or 1x1) edits the
+        // shared state everyone follows; a focused extra pane edits itself.
+        // (Volume-free — hoisted above the volume gate.)
+        let editing_pane: Option<usize> = (self.grid_layout != PanelLayout::One
+            && self.active_pane >= 1
+            && self.active_pane - 1 < self.extra_panes.len())
+        .then(|| self.active_pane - 1);
+        let independent_pane = self.independent_editing_pane();
+        let editing_product = editing_pane
+            .map(|slot| self.extra_panes[slot].product.clone())
+            .unwrap_or_else(|| self.selected_product.clone());
+        let editing_cut = editing_pane
+            .and_then(|slot| self.extra_panes[slot].cut)
+            .unwrap_or(self.selected_cut);
+
+        // Panes row + editing-pane context, above everything it affects.
+        let mut independent_toggle: Option<bool> = None;
+        ui.horizontal(|ui| {
+            ui.label("Panes");
+            for (layout, label, hover) in [
+                (PanelLayout::One, "1", "Single pane"),
+                (
+                    PanelLayout::TwoVertical,
+                    "2",
+                    "Two panes side by side (synced)",
+                ),
+                (
+                    PanelLayout::ThreeStacked,
+                    "3",
+                    "Three panes: large primary plus two stacked comparison panes",
+                ),
+                (
+                    PanelLayout::FourGrid,
+                    "4",
+                    "Quad grid — REF / VEL / CC / ZDR (synced)",
+                ),
+            ] {
+                if ui
+                    .selectable_label(self.grid_layout == layout, label)
+                    .on_hover_text(hover)
+                    .clicked()
+                    && self.grid_layout != layout
+                {
+                    // Defer: textures from the outgoing layout may already
+                    // be in this frame's paint list (Metal aborts on
+                    // freed-texture references).
+                    self.pending_grid_layout = Some(layout);
+                    self.app_settings.grid_pane_count = layout.panel_count();
+                    let _ = self.app_settings.save();
+                    ctx.request_repaint();
+                }
+            }
+            ui.separator();
+            let mut independent = self.app_settings.independent_panels;
+            if ui
+                .checkbox(&mut independent, "Independent")
+                .on_hover_text(
+                    "Selected extra panes own their radar source, loop history, pan/zoom, products, and tilts",
+                )
+                .changed()
+            {
+                independent_toggle = Some(independent);
+            }
+        });
+        if let Some(enabled) = independent_toggle {
+            self.set_independent_panels(enabled, ctx);
+        }
+        if let Some(slot) = editing_pane {
+            if independent_pane == Some(slot) {
+                ui.colored_label(
+                    ACCENT_COLOR,
+                    format!(
+                        "Independent pane {} - SITE, products, tilt, and loop controls target this pane",
+                        slot + 2
+                    ),
+                );
+            } else {
+                ui.colored_label(
+                    ACCENT_COLOR,
+                    format!(
+                        "Editing pane {} — click the main (top-left) pane to edit all",
+                        slot + 2
+                    ),
+                );
+                self.extra_pane_site_controls(ui, ctx, slot);
+            }
+        }
+
+        // LOOP — hoisted to the top of the tab (owner layout): loop
+        // controls reachable without scrolling. frame_history_panel
+        // handles the no-loop empty state itself.
+        Self::section_header(ui, "LOOP");
+        self.frame_history_panel(ui, ctx);
+
+        // Layer/customization state lives in the Custom tab now; RADAR
         // keeps a one-line link-row so the count stays visible from ops.
         let layer_count = self.rail_layer_count();
         if ui
@@ -23084,6 +23067,9 @@ impl ViewerApp {
             })
             .or_else(|| self.volume.clone());
         let Some(volume) = active_volume else {
+            // No volume yet: SITE must still render — it is how the
+            // first site gets picked. Everything below needs a volume.
+            self.radar_site_section(ui, independent_pane);
             return;
         };
         let volume = volume.as_ref();
@@ -23120,7 +23106,7 @@ impl ViewerApp {
             })
             .collect::<Vec<_>>();
 
-        // R3: PRODUCTS — hotkey-prefixed grid, contextual rows, color, threshold.
+        // PRODUCTS — hotkey-prefixed grid, contextual rows, color, threshold.
         Self::section_header(ui, "PRODUCTS");
         if editing_pane.is_none() {
             let mut remember_product_tilts = self.app_settings.remember_product_tilts;
@@ -23574,7 +23560,7 @@ impl ViewerApp {
             });
         });
 
-        // R4: TILT — stable position, at most one contextual block above it.
+        // TILT — stable position, at most one contextual block above it.
         Self::section_header(ui, "TILT");
         ui.horizontal(|ui| {
             ui.weak("↑/↓");
@@ -23637,11 +23623,11 @@ impl ViewerApp {
                 }
             });
 
-        // R5: LOOP.
-        Self::section_header(ui, "LOOP");
-        self.frame_history_panel(ui, ctx);
+        // SITE — below PRODUCTS/TILT (owner layout: LOOP on top, SITE
+        // below products).
+        self.radar_site_section(ui, independent_pane);
 
-        // R6: ALGORITHMS.
+        // ALGORITHMS.
         Self::section_header(ui, "ALGORITHMS");
         if ui
             .checkbox(&mut self.show_rotation_markers, "Rotation markers")
@@ -23808,7 +23794,7 @@ impl ViewerApp {
                 });
             });
 
-        // R7: TOOLS.
+        // TOOLS.
         Self::section_header(ui, "TOOLS");
         let mut show_center_crosshair = self.app_settings.show_center_crosshair;
         if ui
