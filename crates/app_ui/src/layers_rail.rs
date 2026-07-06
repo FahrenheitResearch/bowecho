@@ -309,7 +309,7 @@ impl ViewerApp {
                         if ui
                             .selectable_label(current_color_family.is_none(), "Auto")
                             .on_hover_text(
-                                "Use Rusty Weather's production style when available; otherwise use the generic ramp.",
+                                "Automatic model colors: WRF/model fields use Solarpower07's WRF-Runner palettes (reflectivity · temp · dew point · wind · precip · RH · CAPE), otherwise Rusty Weather's production style, then a generic ramp.",
                             )
                             .clicked()
                         {

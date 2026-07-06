@@ -1,5 +1,15 @@
 //! Fast color table parsing and sampling for radar renderers.
 
+/// Solarpower07 WRF-Runner colormaps ported for model/WRF map layers.
+/// See [`solar::solar_model_field_table`]; credit Solarpower07 (handle only,
+/// credit pending per project policy).
+pub mod solar;
+
+pub use solar::{
+    solar_cape_table, solar_model_field_table, solar_reflectivity_table,
+    solar_relative_humidity_table, solar_vorticity_table,
+};
+
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::fmt::Write as _;
@@ -1068,6 +1078,11 @@ pub fn builtin_catalog_for_family(family: ColorTableFamily) -> Vec<CatalogEntry>
                 gurt_reflectivity_table(),
                 "GURT V3 research ramp by ambient330 — full -20..70 dBZ span with no clear-air cutoff, for attenuation-shifted X-band/DOW work",
                 &[Badge::Research],
+            ),
+            entry(
+                solar_reflectivity_table(),
+                "Solarpower07 WRF-Runner \"PW Style\" dBZ ladder (ported) — the WRF/model-side default; clear air below 5 dBZ transparent",
+                &[],
             ),
         ],
         ColorTableFamily::Velocity => vec![
@@ -3596,6 +3611,7 @@ mod tests {
                 "Tornado Debris REF",
                 "Clean Light REF",
                 "GURT Reflectivity",
+                "Solar PW Reflectivity",
             ]
         );
         assert_eq!(

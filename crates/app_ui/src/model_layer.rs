@@ -14,7 +14,7 @@ use rw_ui::FieldData;
 use rw_ui::colormap::Colormap;
 use std::sync::Arc;
 
-use color_tables::ColorTableFamily;
+use color_tables::{ColorTable, ColorTableFamily};
 
 /// Inverse geolocation: lat/lon bin → row-major grid index.
 pub struct InverseLut {
@@ -210,6 +210,13 @@ pub struct ModelMapLayer {
     /// Optional BowEcho color-table family override. When absent, model
     /// layers use Rusty Weather's production style, then generic ramp.
     pub custom_color_family: Option<ColorTableFamily>,
+    /// Solarpower07 WRF-Runner palette resolved from the field's name + units
+    /// (see [`color_tables::solar_model_field_table`]). For WRF/local model
+    /// fields this is the layer's default look; for downloaded models it only
+    /// fills in where Rusty Weather has no production style, replacing the
+    /// generic ramp. Ranks below an explicit `custom_color_family` override.
+    /// Credit: Solarpower07 (handle only, credit pending per project policy).
+    pub model_table: Option<Arc<ColorTable>>,
     /// Bumped when field/LUT changes — keys the rendered texture.
     pub generation: u64,
 }

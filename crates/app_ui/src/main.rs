@@ -4385,10 +4385,26 @@ fn model_layer_view_needs_rerender(rendered: &ModelLayerView, current: &ModelLay
     pan_px > MAP_LAYER_RERENDER_PAN_PX
 }
 
+/// Whether a field came from a locally-ingested WRF/NetCDF run (store model
+/// slug `wrf`, per `wrf_process` / `local_import`). Such fields get Solar's
+/// WRF-Runner palettes by default via [`solar_model_field_table`].
+fn is_local_wrf_field(field: &rw_ui::FieldData) -> bool {
+    let model = field.key.hour.model.to_ascii_lowercase();
+    model == "wrf" || model.starts_with("wrf")
+}
+
 fn default_model_layer_color_family(field: &rw_ui::FieldData) -> Option<ColorTableFamily> {
     let model = field.key.hour.model.to_ascii_lowercase();
     let var = field.key.var.to_ascii_lowercase();
     let units = field.units.trim().to_ascii_lowercase();
+    // Locally-ingested WRF reflectivity is colored by Solar's "PW Style" via
+    // the model-table path (`solar_model_field_table`), so don't claim it for
+    // the radar reflectivity family here. Real radar composites (MRMS/OPERA
+    // and any downloaded dBZ model field) still bind to the radar table so
+    // they match the radar overlay pixel-for-pixel.
+    if is_local_wrf_field(field) {
+        return None;
+    }
     if units == "dbz"
         || model == "mrms"
         || model == "eumetnet-opera"
@@ -4397,6 +4413,27 @@ fn default_model_layer_color_family(field: &rw_ui::FieldData) -> Option<ColorTab
         || var.contains("cref")
     {
         Some(ColorTableFamily::Reflectivity)
+    } else {
+        None
+    }
+}
+
+/// Resolve the Solarpower07 WRF-Runner palette a model layer should use, or
+/// `None` to keep the field's production style / generic ramp.
+///
+/// WRF/local fields always take their Solar palette (it's the intended look).
+/// Downloaded-model fields only take one when Rusty Weather supplied no
+/// production style — turning the generic viridis fallback into a sensible,
+/// unit-aware table. Ranks below an explicit `custom_color_family` override.
+///
+/// CREDIT: Solarpower07 (see `color_tables::solar`).
+fn model_layer_solar_table(
+    field: &rw_ui::FieldData,
+    has_production: bool,
+) -> Option<Arc<ColorTable>> {
+    let table = color_tables::solar_model_field_table(&field.key.var, &field.units)?;
+    if is_local_wrf_field(field) || !has_production {
+        Some(Arc::new(table))
     } else {
         None
     }
@@ -33147,6 +33184,8 @@ impl ViewerApp {
                             style.colormap_options,
                         ))
                     });
+                    slot.layer.model_table =
+                        model_layer_solar_table(latest.as_ref(), slot.layer.production.is_some());
                     slot.layer.field = Arc::clone(&latest);
                     slot.layer.generation = slot.layer.generation.wrapping_add(1);
                     slot.texture = None;
@@ -33823,6 +33862,7 @@ impl ViewerApp {
                             style.colormap_options,
                         ))
                     });
+                    let model_table = model_layer_solar_table(field.as_ref(), production.is_some());
                     model_layer::ModelMapLayer {
                         field: Arc::clone(&field),
                         lut: Arc::new(lut),
@@ -33831,6 +33871,7 @@ impl ViewerApp {
                         opacity: initial_opacity,
                         visible: true,
                         custom_color_family: default_model_layer_color_family(field.as_ref()),
+                        model_table,
                         generation,
                     }
                 })
@@ -33882,6 +33923,9 @@ impl ViewerApp {
                     .layer
                     .custom_color_family
                     .map(|family| Arc::new(color_tables.for_family(family).clone()));
+                // Solar WRF-Runner palette (when resolved): ranks below an
+                // explicit family override but above production / generic.
+                let model_table = slot.layer.model_table.clone();
                 let render_view = view;
                 let center_lat = view.center_lat as f64;
                 let center_lon = view.center_lon as f64;
@@ -33911,6 +33955,9 @@ impl ViewerApp {
                             continue;
                         };
                         if let Some(table) = &custom_table {
+                            let [r, g, b, a] = table.sample(value).to_array();
+                            *px = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
+                        } else if let Some(table) = &model_table {
                             let [r, g, b, a] = table.sample(value).to_array();
                             *px = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
                         } else if let Some(cmap) = &production {
@@ -63512,6 +63559,7 @@ mod tests {
                 opacity: 1.0,
                 visible: true,
                 custom_color_family: None,
+                model_table: None,
                 generation: u64::from(hour) + 1,
             },
             texture: None,
@@ -63538,6 +63586,215 @@ mod tests {
             default_model_layer_color_family(&opera),
             Some(ColorTableFamily::Reflectivity)
         );
+    }
+
+    #[test]
+    fn wrf_fields_take_solar_palettes_not_the_generic_default() {
+        // Locally-ingested WRF reflectivity is NOT claimed by the radar family
+        // (it flows to Solar's PW Style), while its Solar table resolves.
+        let mut refl = test_model_field("wrf", "20260519_00z", 0).as_ref().clone();
+        refl.key.var = "composite_reflectivity".to_owned();
+        refl.units = "dBZ".to_owned();
+        assert_eq!(default_model_layer_color_family(&refl), None);
+        assert!(model_layer_solar_table(&refl, false).is_some());
+
+        // Temperature/dew point/wind/precip all resolve to a Solar table even
+        // with no production style (the case that used to fall to viridis).
+        for (var, units) in [
+            ("temperature_2m", "K"),
+            ("dewpoint_2m", "K"),
+            ("wind_speed_10m", "m/s"),
+            ("apcp", "kg/m^2"),
+            ("relative_humidity_2m", "%"),
+            ("sbcape", "J/kg"),
+        ] {
+            let mut field = test_model_field("wrf", "20260519_00z", 0).as_ref().clone();
+            field.key.var = var.to_owned();
+            field.units = units.to_owned();
+            assert!(
+                model_layer_solar_table(&field, false).is_some(),
+                "expected Solar palette for WRF {var}"
+            );
+        }
+    }
+
+    #[test]
+    fn downloaded_model_keeps_production_style_but_gains_solar_fallback() {
+        // A downloaded HRRR field WITH a production style keeps it (Solar does
+        // not override), but the SAME field with no style takes the Solar
+        // fallback instead of the generic ramp.
+        let mut field = test_model_field("hrrr", "20260519_00z", 0).as_ref().clone();
+        field.key.var = "temperature_2m".to_owned();
+        field.units = "degF".to_owned();
+        assert!(model_layer_solar_table(&field, true).is_none());
+        assert!(model_layer_solar_table(&field, false).is_some());
+    }
+
+    /// REAL-DATA verification (ignored in CI — needs a wrfout on disk). Point
+    /// `BOWECHO_WRF_TEST_FILE` at a raw wrfout and run:
+    ///
+    /// ```text
+    /// BOWECHO_WRF_TEST_FILE=".../wrfout_d02_2026-05-19_00_00_00" \
+    ///   cargo test -p app_ui --bin bowecho -- --ignored --nocapture wrf_real
+    /// ```
+    ///
+    /// It pulls each field through `wrf-core` (the SAME reader the WRF ingest
+    /// uses), resolves the Solar palette exactly as `model_layer_solar_table`
+    /// would, samples the real values into a PNG per field (written next to the
+    /// wrfout under `bowecho_solar_verify/`), and asserts each field renders in
+    /// its Solar palette instead of the generic default.
+    #[test]
+    #[ignore = "needs a real wrfout via BOWECHO_WRF_TEST_FILE"]
+    fn wrf_real_fields_render_in_solar_palettes() {
+        let path = std::env::var("BOWECHO_WRF_TEST_FILE")
+            .expect("set BOWECHO_WRF_TEST_FILE to a wrfout path");
+        let file = wrf_core::WrfFile::open(&path).expect("open wrfout");
+        let out_dir = std::path::Path::new(&path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("bowecho_solar_verify");
+        std::fs::create_dir_all(&out_dir).expect("make output dir");
+
+        // (getvar name, store var name the app writes, forced units or None).
+        let fields: &[(&str, &str, Option<&str>)] = &[
+            ("maxdbz", "composite_reflectivity", Some("dBZ")),
+            ("t2", "temperature_2m", Some("K")),
+            ("dp2m", "dewpoint_2m", Some("K")),
+            ("wspd10", "wind_speed_10m", Some("m/s")),
+            ("rh2m", "relative_humidity_2m", Some("%")),
+            ("pw", "pwat", None),
+            ("sbcape", "sbcape", None),
+        ];
+
+        for &(getvar_name, store_name, forced_units) in fields {
+            let opts = wrf_core::ComputeOpts {
+                units: forced_units.map(str::to_owned),
+                ..Default::default()
+            };
+            let output = match wrf_core::getvar(&file, getvar_name, Some(0), &opts) {
+                Ok(output) => output,
+                Err(err) => {
+                    eprintln!("[skip] {getvar_name}: {err}");
+                    continue;
+                }
+            };
+            let (ny, nx) = match output.shape.as_slice() {
+                [ny, nx] => (*ny, *nx),
+                [1, ny, nx] => (*ny, *nx),
+                other => panic!("{getvar_name}: unexpected shape {other:?}"),
+            };
+            let units = forced_units.unwrap_or(&output.units).to_owned();
+            let values: Vec<f32> = output
+                .data
+                .iter()
+                .map(|&v| {
+                    if !v.is_finite() || v.abs() >= 1.0e30 {
+                        f32::NAN
+                    } else {
+                        v as f32
+                    }
+                })
+                .collect();
+
+            // Resolve the palette exactly as the map layer would.
+            let field = rw_ui::FieldData {
+                key: rw_ui::FieldKey {
+                    hour: rw_ui::HourKey {
+                        model: "wrf".to_owned(),
+                        run: "verify".to_owned(),
+                        hour: 0,
+                    },
+                    var: store_name.to_owned(),
+                },
+                units: units.clone(),
+                nx,
+                ny,
+                values: values.clone(),
+                range: None,
+                grid: None,
+                lat_descending: true,
+                style: None,
+            };
+            let table = model_layer_solar_table(&field, false)
+                .unwrap_or_else(|| panic!("{store_name} ({units}) must resolve a Solar palette"));
+
+            // Field stats over finite values.
+            let finite: Vec<f32> = values.iter().copied().filter(|v| v.is_finite()).collect();
+            let (mut lo, mut hi, mut sum) = (f32::INFINITY, f32::NEG_INFINITY, 0.0f64);
+            for &v in &finite {
+                lo = lo.min(v);
+                hi = hi.max(v);
+                sum += f64::from(v);
+            }
+            let mean = sum / finite.len().max(1) as f64;
+
+            // Render to PNG (row 0 at top).
+            let mut img = image::RgbaImage::new(nx as u32, ny as u32);
+            let mut opaque = 0u64;
+            let mut colors = std::collections::HashSet::new();
+            for (i, &v) in values.iter().enumerate() {
+                let [r, g, b, a] = table.sample(v).to_array();
+                if a > 0 {
+                    opaque += 1;
+                    colors.insert([r, g, b]);
+                }
+                let (x, y) = ((i % nx) as u32, (i / nx) as u32);
+                img.put_pixel(x, y, image::Rgba([r, g, b, a]));
+            }
+            let png = out_dir.join(format!("{store_name}.png"));
+            img.save(&png).expect("write png");
+            eprintln!(
+                "{store_name:>22} [{units:>6}] {nx}x{ny}  min={lo:.2} mean={mean:.2} max={hi:.2}  \
+                 opaque={:.0}%  distinct_colors={}  -> {}",
+                100.0 * opaque as f64 / values.len() as f64,
+                colors.len(),
+                png.display()
+            );
+
+            // A field that actually varies must produce a genuine multi-color
+            // Solar ramp, not a flat/blank default. A near-constant field
+            // (e.g. reflectivity all -30 dBZ at model init) legitimately paints
+            // nothing / one color — report it but don't fail on missing weather.
+            if hi - lo > 1.0e-3 {
+                assert!(opaque > 0, "{store_name}: varies but nothing painted");
+                assert!(
+                    colors.len() >= 4,
+                    "{store_name}: only {} distinct colors — palette not applied",
+                    colors.len()
+                );
+            } else {
+                eprintln!("    (near-constant field — no weather to render)");
+            }
+        }
+
+        // Spot-check the exact Solar anchor colors on the reflectivity + temp
+        // tables (unit-aware) so the mapping is provably faithful.
+        let refl = color_tables::solar_reflectivity_table();
+        assert_eq!(refl.sample(41.0).to_array()[..3], [0xee, 0xb2, 0x47]); // 40-42.5 bin
+        let temp = model_layer_solar_table(
+            &rw_ui::FieldData {
+                key: rw_ui::FieldKey {
+                    hour: rw_ui::HourKey {
+                        model: "wrf".to_owned(),
+                        run: "verify".to_owned(),
+                        hour: 0,
+                    },
+                    var: "temperature_2m".to_owned(),
+                },
+                units: "K".to_owned(),
+                nx: 1,
+                ny: 1,
+                values: vec![273.15],
+                range: None,
+                grid: None,
+                lat_descending: true,
+                style: None,
+            },
+            false,
+        )
+        .expect("temp table");
+        // 273.15 K == 32 °F -> Solar's freezing teal anchor #0F4454.
+        assert_eq!(temp.sample(273.15).to_array()[..3], [0x0f, 0x44, 0x54]);
     }
 
     #[test]
