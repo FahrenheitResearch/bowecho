@@ -846,8 +846,7 @@ fn build_synthetic_from_paths(
             let volume = build_synthetic_volume_reporting(&fields, valid_time, config, &progress);
             notes.push(format!(
                 "{name} time {timeidx}: {} radials from {}",
-                volume.metadata.decoded_radial_count,
-                fields.ref_source
+                volume.metadata.decoded_radial_count, fields.ref_source
             ));
             volumes.push(Arc::new(volume));
         }
@@ -1180,18 +1179,33 @@ mod tests {
         let path = PathBuf::from(path);
         let t0 = Instant::now();
         let file = WrfFile::open(&path).expect("open real wrfout");
-        eprintln!("[prof] open {:.2}s  dims {}x{}x{} nt={}", t0.elapsed().as_secs_f64(), file.nx, file.ny, file.nz, file.nt);
+        eprintln!(
+            "[prof] open {:.2}s  dims {}x{}x{} nt={}",
+            t0.elapsed().as_secs_f64(),
+            file.nx,
+            file.ny,
+            file.nz,
+            file.nt
+        );
         let config = SyntheticRadarConfig::default();
 
         let tr = Instant::now();
         let fields = read_wrf_radar_fields(&file, 0, config.prefer_refl_10cm).expect("read fields");
-        eprintln!("[prof] read_wrf_radar_fields {:.2}s  refl_source={}", tr.elapsed().as_secs_f64(), fields.ref_source);
+        eprintln!(
+            "[prof] read_wrf_radar_fields {:.2}s  refl_source={}",
+            tr.elapsed().as_secs_f64(),
+            fields.ref_source
+        );
 
         let time = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
         let tb = Instant::now();
         let volume = build_synthetic_volume(&fields, time, &config);
-        eprintln!("[prof] build_synthetic_volume {:.2}s  cuts={} radials={}",
-            tb.elapsed().as_secs_f64(), volume.cuts.len(), volume.metadata.decoded_radial_count);
+        eprintln!(
+            "[prof] build_synthetic_volume {:.2}s  cuts={} radials={}",
+            tb.elapsed().as_secs_f64(),
+            volume.cuts.len(),
+            volume.metadata.decoded_radial_count
+        );
         eprintln!("[prof] TOTAL {:.2}s", t0.elapsed().as_secs_f64());
     }
 

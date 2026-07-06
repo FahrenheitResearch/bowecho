@@ -1401,7 +1401,9 @@ mod tests {
     #[test]
     fn planned_store_fields_track_the_group_selection() {
         // Default: core + diagnostics + raw (no heavy eCAPE).
-        let default_plan = WrfProcessOptions::default().normalized().planned_store_fields();
+        let default_plan = WrfProcessOptions::default()
+            .normalized()
+            .planned_store_fields();
         assert!(default_plan.iter().any(|name| name == "temperature_2m"));
         assert!(default_plan.iter().any(|name| name == "temperature_iso"));
         assert!(default_plan.iter().any(|name| name == "sbcape"));
