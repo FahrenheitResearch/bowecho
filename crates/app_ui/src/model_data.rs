@@ -27,6 +27,12 @@ enum ImportJob {
     /// etc.) plus sounding volumes via `wrf-core`. Streams progress messages
     /// then a `Done`.
     Process(crate::wrf_process::WrfProcessTask),
+    /// Synthetic-radar path (`wrf_radar`): forward-model each WRF forecast time
+    /// into a simulated `RadarVolume` (REF + Vr). Unlike the other two, its
+    /// result is NOT written to the model store — it is handed back to the app
+    /// (via [`ModelDataDock::take_synthetic_radar`]) to LOOP in the radar
+    /// viewer. Streams progress messages then a `Done`.
+    SyntheticRadar(crate::wrf_radar::SyntheticRadarTask),
 }
 
 pub struct ModelDataDock {
@@ -37,6 +43,9 @@ pub struct ModelDataDock {
     store_root: PathBuf,
     /// Running local WRF/NetCDF import, if any (drained in `poll_import`).
     import_job: Option<ImportJob>,
+    /// Finished synthetic-radar volumes waiting for the app to install them in
+    /// the loop engine (one-shot, drained by [`Self::take_synthetic_radar`]).
+    synthetic_radar_result: Option<crate::wrf_radar::SyntheticRadarOutput>,
     /// Last import status line shown under the import controls.
     import_message: Option<String>,
     tree: Option<StoreTree>,
@@ -75,6 +84,7 @@ impl ModelDataDock {
             repaint: ctx.clone(),
             store_root,
             import_job: None,
+            synthetic_radar_result: None,
             import_message: None,
             tree: None,
             browser: RunBrowserPanel::new(),
@@ -279,6 +289,12 @@ impl ModelDataDock {
             Idle,
             Progress(String),
             Finished { message: String },
+            /// A synthetic-radar job finished: its volumes go to the app to
+            /// loop, not to the store, so this carries the output out.
+            FinishedSynthetic {
+                message: String,
+                output: crate::wrf_radar::SyntheticRadarOutput,
+            },
         }
 
         let result = match self.import_job.as_ref() {
@@ -339,6 +355,44 @@ impl ModelDataDock {
                     },
                 }
             }
+            Some(ImportJob::SyntheticRadar(task)) => {
+                let mut latest = None;
+                let mut done = None;
+                loop {
+                    match task.rx.try_recv() {
+                        Ok(crate::wrf_radar::SyntheticRadarMessage::Progress(message)) => {
+                            latest = Some(message);
+                        }
+                        Ok(crate::wrf_radar::SyntheticRadarMessage::Done(outcome)) => {
+                            done = Some(outcome);
+                            break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            done = Some(Err(
+                                "Synthetic-radar worker stopped unexpectedly".to_string()
+                            ));
+                            break;
+                        }
+                    }
+                }
+                match done {
+                    Some(Ok(output)) => PollResult::FinishedSynthetic {
+                        message: format!(
+                            "Simulated {} radar frame(s) from WRF — looping in the radar view",
+                            output.volumes.len()
+                        ),
+                        output,
+                    },
+                    Some(Err(error)) => PollResult::Finished {
+                        message: format!("Synthetic radar failed: {error}"),
+                    },
+                    None => match latest {
+                        Some(message) => PollResult::Progress(message),
+                        None => PollResult::Progress(String::new()),
+                    },
+                }
+            }
         };
 
         match result {
@@ -356,7 +410,25 @@ impl ModelDataDock {
                 self.import_job = None;
                 self.rescan();
             }
+            PollResult::FinishedSynthetic { message, output } => {
+                self.import_message = Some(message);
+                self.import_job = None;
+                // Hand the simulated volumes to the app (drained in
+                // `poll_model_layer`); nothing was written to the store, so no
+                // rescan.
+                self.synthetic_radar_result = Some(output);
+                self.repaint.request_repaint();
+            }
         }
+    }
+
+    /// One-shot: take finished synthetic-radar volumes for the app to install
+    /// into the loop engine. Returns `(status label, one volume per WRF time)`.
+    pub fn take_synthetic_radar(
+        &mut self,
+    ) -> Option<(String, Vec<std::sync::Arc<radar_core::RadarVolume>>)> {
+        let output = self.synthetic_radar_result.take()?;
+        Some((output.label, output.volumes))
     }
 
     /// Import controls (WRF/NetCDF folder pickers + status), rendered in the
@@ -457,6 +529,35 @@ impl ModelDataDock {
                     self.import_message = Some(format!("Processing {count} WRF file(s)…"));
                     self.import_job = Some(ImportJob::Process(task));
                 }
+            }
+
+            // Synthetic radar: forward-model the WRF hydrometeors + winds into
+            // a SIMULATED radar volume (REF + Vr) that loops in the radar view.
+            // Picks a single wrfout (its forecast times each become a frame);
+            // a raw wrfout is required (it needs the hydrometeor mixing ratios).
+            if ui
+                .add_enabled(!busy, egui::Button::new("📡 WRF → simulated radar…"))
+                .on_hover_text(
+                    "Turn a raw wrfout into a SIMULATED NEXRAD-style scan: the model's \
+                     3-D reflectivity and winds are sampled onto a polar volume (REF + \
+                     radial velocity) that renders and LOOPS in the radar view — colormaps, \
+                     cross-sections, GBVTD and all. Each forecast time becomes a frame.",
+                )
+                .clicked()
+                && let Some(file) = rfd::FileDialog::new()
+                    .set_title("Choose a raw wrfout to simulate radar from")
+                    .pick_file()
+            {
+                let name = file
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| file.display().to_string());
+                let task = crate::wrf_radar::spawn_synthetic_radar(
+                    vec![file],
+                    crate::wrf_radar::SyntheticRadarConfig::default(),
+                );
+                self.import_message = Some(format!("Simulating radar from {name}…"));
+                self.import_job = Some(ImportJob::SyntheticRadar(task));
             }
         });
     }

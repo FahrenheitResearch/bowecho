@@ -87,6 +87,7 @@ mod vol3d;
 mod wofs;
 mod wofs_georef;
 mod wrf_process;
+mod wrf_radar;
 mod wrf_volumes;
 
 use sites_ui::{BeamCandidate, pin_intl_ids, pin_us_id, radar_site_search_matches, us_site_kind};
@@ -8325,6 +8326,64 @@ impl ViewerApp {
                 false
             }
         }
+    }
+
+    /// Install a WRF "synthetic radar" forecast as a looping frame sequence:
+    /// one simulated [`RadarVolume`] per forecast time, rolled through the same
+    /// loop engine / render / dealias / GBVTD paths as a real scan. Mirrors the
+    /// local-deployment autoplay contract (grow history to fit, pause live/poll
+    /// so a tick can't stomp the loop, roll it) — no new file format, no store
+    /// write; the frames are handed straight to `install_decoded_load_batch`.
+    fn install_synthetic_radar_volumes(
+        &mut self,
+        label: String,
+        volumes: Vec<Arc<RadarVolume>>,
+        ctx: &egui::Context,
+    ) {
+        if volumes.is_empty() {
+            self.status = "Simulated radar produced no frames".to_owned();
+            return;
+        }
+        // Explicit intent, exactly like opening local files: take the view from
+        // any active URL poll and Live auto-refresh so the next tick cannot
+        // stomp the freshly-installed loop.
+        self.poll_active = false;
+        self.primary.live.enabled = false;
+        self.pending_local_autoplay = true;
+        self.primary_load_is_auto_refresh = false;
+        self.load_receiver = None;
+
+        let frame_count = volumes.len();
+        let frames: Vec<DecodedLoad> = volumes
+            .into_iter()
+            .enumerate()
+            .map(|(index, volume)| {
+                let stamp = volume.volume_time.format("%Y%m%d_%H%M%S").to_string();
+                DecodedLoad {
+                    // Stable, unique dedupe/refresh key per forecast frame.
+                    path: PathBuf::from(format!("wrf-synth://{}/{index:04}_{stamp}", volume.site.id)),
+                    volume,
+                    timings: LoadTimings::default(),
+                    status: FrameStatus::Local,
+                    source_label: format!("simulated WRF {stamp}"),
+                }
+            })
+            .collect();
+        let batch = DecodedLoadBatch {
+            selected_index: 0,
+            frames,
+        };
+        self.primary.feed = FeedSource::LocalFiles {
+            label: label.clone(),
+        };
+        self.install_decoded_load_batch(batch, true, true, ctx);
+        // Roll the forecast as a loop (the local-deployment autoplay pattern).
+        if self.primary.history.len() > 1 {
+            self.primary.cursor.playing = true;
+            self.primary.cursor.last_step = None;
+        }
+        self.status = format!("Simulated WRF radar loop — {frame_count} frame(s)");
+        ctx.request_repaint();
     }
 
     /// Re-apply the primary frame limit: the trim itself lives in
@@ -33087,6 +33146,16 @@ impl ViewerApp {
             .and_then(|dock| dock.take_map_request());
         if let Some(field) = map_request {
             self.start_model_layer_build(field, ctx);
+        }
+        // Simulated-radar-from-WRF: finished synthetic volumes are installed
+        // into the loop engine so the model forecast plays like a real scan
+        // sequence (no store write — these are radar frames, not model fields).
+        let synthetic_radar = self
+            .model_dock
+            .as_mut()
+            .and_then(|dock| dock.take_synthetic_radar());
+        if let Some((label, volumes)) = synthetic_radar {
+            self.install_synthetic_radar_volumes(label, volumes, ctx);
         }
         if let Some(receiver) = &self.model_layer_build_rx {
             match receiver.try_recv() {
