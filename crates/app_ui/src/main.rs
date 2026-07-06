@@ -8370,7 +8370,10 @@ impl ViewerApp {
                 let stamp = volume.volume_time.format("%Y%m%d_%H%M%S").to_string();
                 DecodedLoad {
                     // Stable, unique dedupe/refresh key per forecast frame.
-                    path: PathBuf::from(format!("wrf-synth://{}/{index:04}_{stamp}", volume.site.id)),
+                    path: PathBuf::from(format!(
+                        "wrf-synth://{}/{index:04}_{stamp}",
+                        volume.site.id
+                    )),
                     volume,
                     timings: LoadTimings::default(),
                     status: FrameStatus::Local,

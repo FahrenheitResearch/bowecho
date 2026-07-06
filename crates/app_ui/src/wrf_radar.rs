@@ -36,13 +36,15 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use radar_core::{
-    ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, Radial, RadarSite, RadarVolume,
+    ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, RadarSite, RadarVolume, Radial,
     ScanMode, VolumeMetadata, beam_ground_range_m, beam_height_above_radar_m,
 };
 use rayon::prelude::*;
 use wrf_core::{ComputeOpts, WrfFile, getvar};
 
-use crate::model_layer::{InverseLut, neighboring_cell_starts, solve_bilinear_coords, unwrap_lon_near};
+use crate::model_layer::{
+    InverseLut, neighboring_cell_starts, solve_bilinear_coords, unwrap_lon_near,
+};
 use ui_core::geo::aeqd_inverse_km;
 
 /// Default WSR-88D-like elevation ladder (deg). Covers the low tilts that
@@ -531,7 +533,12 @@ fn horizontal_stencil(fields: &WrfRadarFields, lat: f32, lon: f32) -> Option<[(u
     let ny = fields.ny;
     let nearest = fields.lut.lookup(lat, lon)?;
     if nx < 2 || ny < 2 {
-        return Some([(nearest, 1.0), (nearest, 0.0), (nearest, 0.0), (nearest, 0.0)]);
+        return Some([
+            (nearest, 1.0),
+            (nearest, 0.0),
+            (nearest, 0.0),
+            (nearest, 0.0),
+        ]);
     }
     let row = nearest / nx;
     let col = nearest % nx;
@@ -544,10 +551,22 @@ fn horizontal_stencil(fields: &WrfRadarFields, lat: f32, lon: f32) -> Option<[(u
             let i01 = i00 + nx;
             let i11 = i01 + 1;
             let corners = [
-                (unwrap_lon_near(f64::from(fields.lon[i00]), target_lon), f64::from(fields.lat[i00])),
-                (unwrap_lon_near(f64::from(fields.lon[i10]), target_lon), f64::from(fields.lat[i10])),
-                (unwrap_lon_near(f64::from(fields.lon[i01]), target_lon), f64::from(fields.lat[i01])),
-                (unwrap_lon_near(f64::from(fields.lon[i11]), target_lon), f64::from(fields.lat[i11])),
+                (
+                    unwrap_lon_near(f64::from(fields.lon[i00]), target_lon),
+                    f64::from(fields.lat[i00]),
+                ),
+                (
+                    unwrap_lon_near(f64::from(fields.lon[i10]), target_lon),
+                    f64::from(fields.lat[i10]),
+                ),
+                (
+                    unwrap_lon_near(f64::from(fields.lon[i01]), target_lon),
+                    f64::from(fields.lat[i01]),
+                ),
+                (
+                    unwrap_lon_near(f64::from(fields.lon[i11]), target_lon),
+                    f64::from(fields.lat[i11]),
+                ),
             ];
             let Some((uu, vv)) = solve_bilinear_coords(corners, target_lon, target_lat) else {
                 continue;
@@ -565,13 +584,23 @@ fn horizontal_stencil(fields: &WrfRadarFields, lat: f32, lon: f32) -> Option<[(u
             ]);
         }
     }
-    Some([(nearest, 1.0), (nearest, 0.0), (nearest, 0.0), (nearest, 0.0)])
+    Some([
+        (nearest, 1.0),
+        (nearest, 0.0),
+        (nearest, 0.0),
+        (nearest, 0.0),
+    ])
 }
 
 /// Bracket a target MSL height in a WRF column (height increases with model
 /// level index k). Returns the lower level and the linear weight, or `None`
 /// when the target is below the lowest level (below terrain) or above the top.
-fn bracket_height(fields: &WrfRadarFields, cells: usize, col: usize, z: f32) -> Option<(usize, f32)> {
+fn bracket_height(
+    fields: &WrfRadarFields,
+    cells: usize,
+    col: usize,
+    z: f32,
+) -> Option<(usize, f32)> {
     let nz = fields.nz;
     let h0 = fields.height_msl[col];
     let htop = fields.height_msl[(nz - 1) * cells + col];
@@ -711,8 +740,7 @@ fn build_synthetic_from_paths(
                 .unwrap_or_else(|| {
                     // No parsable Times entry — keep frames distinct so the
                     // loop engine does not collapse them into one identity.
-                    let base = DateTime::<Utc>::from_timestamp(0, 0)
-                        .expect("epoch is valid")
+                    let base = DateTime::<Utc>::from_timestamp(0, 0).expect("epoch is valid")
                         + chrono::Duration::hours(i64::from(fallback_index));
                     fallback_index += 1;
                     base
@@ -732,7 +760,10 @@ fn build_synthetic_from_paths(
         return Err(if notes.is_empty() {
             "WRF produced no simulated radar volumes".to_string()
         } else {
-            format!("WRF produced no simulated radar volumes: {}", notes.join("; "))
+            format!(
+                "WRF produced no simulated radar volumes: {}",
+                notes.join("; ")
+            )
         });
     }
     Ok(SyntheticRadarOutput {
@@ -761,7 +792,9 @@ mod tests {
             expected
         );
         assert_eq!(
-            parse_wrf_time(" 2026-05-19_00:00:00 ").unwrap().to_rfc3339(),
+            parse_wrf_time(" 2026-05-19_00:00:00 ")
+                .unwrap()
+                .to_rfc3339(),
             expected
         );
         assert!(parse_wrf_time("not-a-time").is_none());
@@ -776,7 +809,10 @@ mod tests {
         let (sin_az, cos_az) = (az_rad.sin(), az_rad.cos());
         let (u, v, w) = (12.0f32, 0.0, 0.0);
         let vr = u * sin_az * 1.0 + v * cos_az * 1.0 + w * 0.0;
-        assert!((vr - 12.0).abs() < 1e-3, "east wind due-east beam Vr = {vr}");
+        assert!(
+            (vr - 12.0).abs() < 1e-3,
+            "east wind due-east beam Vr = {vr}"
+        );
 
         // Straight-up beam (el=90°) sees only w.
         let el_rad: f32 = 90f32.to_radians();
@@ -855,7 +891,10 @@ mod tests {
                 }
             }
         }
-        assert!(finite_ref > 100, "expected many finite REF gates, got {finite_ref}");
+        assert!(
+            finite_ref > 100,
+            "expected many finite REF gates, got {finite_ref}"
+        );
 
         // Radial nearest az=90° (due east): near-ground gates blow away from
         // the radar at ~+10 m/s.
@@ -963,8 +1002,7 @@ mod tests {
                         );
                         let east_km = ground * az_rad.sin() / 1000.0;
                         let north_km = ground * az_rad.cos() / 1000.0;
-                        let (glat, glon) =
-                            aeqd_inverse_km(site_lat, site_lon, east_km, north_km);
+                        let (glat, glon) = aeqd_inverse_km(site_lat, site_lon, east_km, north_km);
                         let dist = haversine_km(
                             glat,
                             glon,
@@ -1028,8 +1066,7 @@ mod tests {
         let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
         let dphi = (lat2 - lat1).to_radians();
         let dlam = (lon2 - lon1).to_radians();
-        let a =
-            (dphi / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dlam / 2.0).sin().powi(2);
+        let a = (dphi / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dlam / 2.0).sin().powi(2);
         2.0 * r * a.sqrt().asin()
     }
 }
