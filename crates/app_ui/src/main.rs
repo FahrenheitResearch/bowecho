@@ -52895,7 +52895,10 @@ mod tests {
             map_scale,
             rect,
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150)),
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150),
+            ),
         );
         let mesh_count = shapes
             .iter()
@@ -52905,7 +52908,10 @@ mod tests {
             .iter()
             .filter(|s| matches!(s, egui::Shape::Path(_)))
             .count();
-        assert_eq!(mesh_count, 1, "cone fill mesh should be present (was culled)");
+        assert_eq!(
+            mesh_count, 1,
+            "cone fill mesh should be present (was culled)"
+        );
         assert!(outline_count >= 1, "cone outline should be present");
     }
 
@@ -52948,7 +52954,10 @@ mod tests {
             map_scale,
             rect,
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150)),
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150),
+            ),
         );
         // No fill across the antipode.
         assert!(

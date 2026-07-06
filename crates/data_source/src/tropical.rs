@@ -1653,7 +1653,10 @@ REMARKS:
             geom.cone.len()
         );
         let west = geom.cone.iter().fold(f32::INFINITY, |m, p| m.min(p.lon));
-        let east = geom.cone.iter().fold(f32::NEG_INFINITY, |m, p| m.max(p.lon));
+        let east = geom
+            .cone
+            .iter()
+            .fold(f32::NEG_INFINITY, |m, p| m.max(p.lon));
         assert!(east - west > 20.0, "cone spans a wide longitude range");
         assert!(!geom.track.is_empty(), "track segments present");
     }
