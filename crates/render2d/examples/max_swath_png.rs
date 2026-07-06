@@ -10,7 +10,9 @@
 use std::path::PathBuf;
 
 use radar_core::MomentType;
-use render2d::{RasterOptions, SwathAggregation, base_tilt_cut, max_value_swath, render_moment_png};
+use render2d::{
+    RasterOptions, SwathAggregation, base_tilt_cut, max_value_swath, render_moment_png,
+};
 
 fn main() {
     let mut args = std::env::args_os().skip(1);
@@ -55,11 +57,7 @@ fn main() {
     };
 
     // Newest single frame, base reflectivity — the "current scan" reference.
-    let newest = refs
-        .iter()
-        .max_by_key(|v| v.volume_time)
-        .copied()
-        .unwrap();
+    let newest = refs.iter().max_by_key(|v| v.volume_time).copied().unwrap();
     if let Some(cut) = base_tilt_cut(newest, &MomentType::Reflectivity) {
         let out = out_dir.join("single_frame_ref.png");
         render_moment_png(newest, cut, MomentType::Reflectivity, &out, options).unwrap();
@@ -67,8 +65,8 @@ fn main() {
     }
 
     // Max-REF swath over the whole loop.
-    let swath = max_value_swath(&refs, MomentType::Reflectivity, SwathAggregation::Max)
-        .expect("swath");
+    let swath =
+        max_value_swath(&refs, MomentType::Reflectivity, SwathAggregation::Max).expect("swath");
     report_coverage("REF swath", &swath, &MomentType::Reflectivity);
     let out = out_dir.join("max_ref_swath.png");
     render_moment_png(&swath, 0, MomentType::Reflectivity, &out, options).unwrap();

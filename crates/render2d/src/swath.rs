@@ -117,7 +117,12 @@ pub fn max_value_swath(
         a.grid
             .radial_count()
             .cmp(&b.grid.radial_count())
-            .then(a.grid.gate_range.gate_count.cmp(&b.grid.gate_range.gate_count))
+            .then(
+                a.grid
+                    .gate_range
+                    .gate_count
+                    .cmp(&b.grid.gate_range.gate_count),
+            )
             .then(max_range_m(a.grid).total_cmp(&max_range_m(b.grid)))
     })?;
 
@@ -143,14 +148,7 @@ pub fn max_value_swath(
 
     let mut values = vec![f32::NAN; nrows * gate_count];
     for tilt in &tilts {
-        accumulate_tilt(
-            &mut values,
-            tilt,
-            &target,
-            &slot_to_row,
-            nrows,
-            aggregation,
-        );
+        accumulate_tilt(&mut values, tilt, &target, &slot_to_row, nrows, aggregation);
     }
 
     // Everything in the swath is finite-or-NaN; NaN gates render transparent.
@@ -245,9 +243,9 @@ fn accumulate_tilt(
         let Some(radial) = tilt.cut.radials.get(radial_index) else {
             continue;
         };
-        let slot =
-            ((radial.azimuth_deg.rem_euclid(360.0) / (360.0 / AZ_SLOTS as f32)).round() as usize)
-                % AZ_SLOTS;
+        let slot = ((radial.azimuth_deg.rem_euclid(360.0) / (360.0 / AZ_SLOTS as f32)).round()
+            as usize)
+            % AZ_SLOTS;
         let target_row = slot_to_row.get(slot).copied().unwrap_or(0);
         if target_row >= nrows {
             continue;
@@ -326,7 +324,14 @@ mod tests {
         }
         // Scale 2.0, offset 66: dBZ = (raw - 66) / 2 ... but here we invert so
         // the test can request an exact dBZ. raw = dBZ*2 + 66. nodata = 0.
-        let mut grid = MomentGrid::new_u8(moment.clone(), gate_range(gate_count), 2.0, 66.0, Some(0), Some(1));
+        let mut grid = MomentGrid::new_u8(
+            moment.clone(),
+            gate_range(gate_count),
+            2.0,
+            66.0,
+            Some(0),
+            Some(1),
+        );
         for r in 0..nrows {
             let row: Vec<u8> = (0..gate_count).map(|g| sample(r, g)).collect();
             grid.push_row(r, MomentRow::U8(row)).unwrap();
@@ -398,9 +403,12 @@ mod tests {
         let b = volume_with(MomentType::Velocity, 4, 2, 200, |_r, g| {
             if g == 1 { raw(12.0) } else { 0 }
         });
-        let swath =
-            max_value_swath(&[&a, &b], MomentType::Velocity, SwathAggregation::MaxMagnitude)
-                .unwrap();
+        let swath = max_value_swath(
+            &[&a, &b],
+            MomentType::Velocity,
+            SwathAggregation::MaxMagnitude,
+        )
+        .unwrap();
         let grid = &swath.cuts[0].moments[&MomentType::Velocity];
         let v = grid.scaled_value(0, 1).unwrap();
         assert!((v - (-30.0)).abs() < 0.6, "expected -30 m/s, got {v}");
@@ -432,9 +440,18 @@ mod tests {
                 radial_status: None,
             });
         }
-        let mut vgrid = MomentGrid::new_u8(MomentType::Velocity, gate_range(2), 2.0, 66.0, Some(0), Some(1));
+        let mut vgrid = MomentGrid::new_u8(
+            MomentType::Velocity,
+            gate_range(2),
+            2.0,
+            66.0,
+            Some(0),
+            Some(1),
+        );
         for r in 0..4 {
-            vgrid.push_row(r, MomentRow::U8(vec![(10.0f32 * 2.0 + 66.0) as u8, 0])).unwrap();
+            vgrid
+                .push_row(r, MomentRow::U8(vec![(10.0f32 * 2.0 + 66.0) as u8, 0]))
+                .unwrap();
         }
         vel_cut.moments.insert(MomentType::Velocity, vgrid);
         volume.cuts.push(vel_cut);

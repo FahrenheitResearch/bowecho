@@ -25,7 +25,6 @@ pub mod tracks;
 mod volumetric;
 pub mod wind;
 pub use cells::{StormCell, identify_storm_cells};
-pub use swath::{SwathAggregation, base_tilt_cut, max_value_swath};
 pub use dealias_pyart::dealias_velocity_grid_pyart_region;
 pub use dealias_v4::{
     ConfidenceGrid, EnvWindLevel, EnvironmentalWindProfile, TemporalPrior, V4Diagnostics,
@@ -54,6 +53,7 @@ pub use rhi::{
 };
 pub use shear::{azimuthal_shear_grid, radial_divergence_grid};
 pub use smooth::smooth_moment_grid;
+pub use swath::{SwathAggregation, base_tilt_cut, max_value_swath};
 use thiserror::Error;
 pub use tracking::{StormTrack, StormTracker, TIME_GATE_S};
 pub use volumetric::{

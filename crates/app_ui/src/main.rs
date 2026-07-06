@@ -45352,7 +45352,10 @@ fn draw_obs_history_timeline(
     // Time axis (the "time bar") with start / end / frame labels.
     let axis_y = rows_bottom + 2.0;
     painter.line_segment(
-        [egui::pos2(plot_left, axis_y), egui::pos2(plot_right, axis_y)],
+        [
+            egui::pos2(plot_left, axis_y),
+            egui::pos2(plot_right, axis_y),
+        ],
         egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(80, 96, 118, 120)),
     );
     let axis_font = egui::FontId::monospace(9.0);

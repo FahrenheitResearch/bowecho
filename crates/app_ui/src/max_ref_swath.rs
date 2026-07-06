@@ -366,7 +366,9 @@ fn raster_swath_texture(
     )
     .ok()?;
     let mut pixels = vec![0u8; viewport_rgba_buffer_len(options)];
-    let (width, height) = cache.render_moment_rgba_into(volume, options, &mut pixels).ok()?;
+    let (width, height) = cache
+        .render_moment_rgba_into(volume, options, &mut pixels)
+        .ok()?;
     let image = radar_color_image_from_rgba([width as usize, height as usize], &pixels);
     Some(ctx.load_texture(
         match moment {

@@ -827,7 +827,10 @@ mod tests {
         assert!(series.len() >= 2, "series should carry the pooled reports");
         // Times strictly ascending (the sparkline assumes it).
         for pair in series.windows(2) {
-            assert!(pair[0].time_utc <= pair[1].time_utc, "series must be sorted");
+            assert!(
+                pair[0].time_utc <= pair[1].time_utc,
+                "series must be sorted"
+            );
         }
         // At least one numeric channel present per report -> something to plot.
         assert!(
@@ -840,7 +843,9 @@ mod tests {
         for ob in &series {
             println!(
                 "  {} T={:?} Td={:?} wind={:?} alt={:?}",
-                ob.time_utc.map(|t| t.format("%H:%MZ").to_string()).unwrap_or_default(),
+                ob.time_utc
+                    .map(|t| t.format("%H:%MZ").to_string())
+                    .unwrap_or_default(),
                 ob.temp_c,
                 ob.dewpoint_c,
                 ob.wind_speed_kt,
