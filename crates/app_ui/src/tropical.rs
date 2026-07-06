@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use data_source::tropical::{self, Category, StormGeometry, TropicalCyclone};
 use eframe::egui;
 use ui_core::worker_slot::{SlotPoll, WorkerSlot};
@@ -27,9 +27,72 @@ pub const TROPICAL_REFRESH_SECONDS: u64 = 600;
 /// one, so a slow/unavailable source (GDACS can lag) doesn't leave the panel
 /// falsely showing "no active" for a full [`TROPICAL_REFRESH_SECONDS`] window.
 pub const TROPICAL_RETRY_SECONDS: u64 = 20;
+/// Age after which a cached storm geometry is refetched even without a newer
+/// advisory time in the storms list — the backstop that keeps a long-running
+/// session's forecast track honest (one extra fetch per storm per hour). NHC
+/// reissues the TCM every 6 h; GDACS episodes bump their storm id, which
+/// evicts+refetches on its own.
+pub const TROPICAL_GEOMETRY_MAX_AGE_SECONDS: u64 = 3600;
 
 type StormsResult = std::result::Result<Vec<TropicalCyclone>, String>;
-type GeometryResult = std::result::Result<(String, StormGeometry), String>;
+type GeometryResult = std::result::Result<GeometryFetch, String>;
+
+/// One finished geometry fetch: which storm, the `advisory_time` its storms-
+/// list record carried when the fetch was SPAWNED (so a later, newer advisory
+/// marks the entry stale), and the parsed geometry.
+struct GeometryFetch {
+    id: String,
+    advisory_time: Option<DateTime<Utc>>,
+    geometry: StormGeometry,
+}
+
+/// A cached [`StormGeometry`] plus the freshness bookkeeping that decides when
+/// [`TropicalState::drive_geometry`] refetches it. NHC storm ids are stable
+/// for the storm's whole life (`nhc:al142024`), so without this the first TCM
+/// ever fetched would be pinned until app exit while NHC issues a new
+/// forecast every 6 h — the current-position glyph kept moving but the
+/// forecast dots/line/radii went days stale (audit #2).
+pub struct StormGeometryEntry {
+    pub geometry: StormGeometry,
+    /// When the fetch completed (drives the age-based refetch backstop).
+    fetched_at: Instant,
+    /// The storm's advisory time as of the fetch; `None` when the source
+    /// didn't carry one.
+    advisory_time: Option<DateTime<Utc>>,
+}
+
+impl StormGeometryEntry {
+    /// Whether this entry should be refetched: the storms list now carries a
+    /// newer advisory than the one this geometry was fetched under, or the
+    /// entry has outlived [`TROPICAL_GEOMETRY_MAX_AGE_SECONDS`].
+    fn is_stale(&self, current_advisory: Option<DateTime<Utc>>, now: Instant) -> bool {
+        let newer_advisory = match (self.advisory_time, current_advisory) {
+            (Some(cached), Some(current)) => current > cached,
+            // The storms list learned an advisory time this fetch never saw.
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        newer_advisory
+            || now.saturating_duration_since(self.fetched_at)
+                >= Duration::from_secs(TROPICAL_GEOMETRY_MAX_AGE_SECONDS)
+    }
+}
+
+/// The next storm whose geometry needs (re)fetching: it has a geometry URL and
+/// either no cached entry yet or a stale one. Pure so the refetch policy is
+/// unit-tested without a network.
+fn storm_needing_geometry<'a>(
+    storms: &'a [TropicalCyclone],
+    geometry: &HashMap<String, StormGeometryEntry>,
+    now: Instant,
+) -> Option<&'a TropicalCyclone> {
+    storms.iter().find(|storm| {
+        storm.geometry_url.is_some()
+            && geometry
+                .get(&storm.id)
+                .is_none_or(|entry| entry.is_stale(storm.advisory_time, now))
+    })
+}
 
 /// All state for the tropical layer, owned by `ViewerApp.tropical`.
 pub struct TropicalState {
@@ -37,8 +100,9 @@ pub struct TropicalState {
     geometry_rx: WorkerSlot<GeometryResult>,
     /// Active storms, strongest first (the merge sorts them).
     pub storms: Vec<TropicalCyclone>,
-    /// Per-storm track/cone, keyed by storm id, filled by the 2nd fetch.
-    pub geometry: HashMap<String, StormGeometry>,
+    /// Per-storm track/cone (+ fetch freshness), keyed by storm id, filled by
+    /// the 2nd fetch and refetched when stale.
+    pub geometry: HashMap<String, StormGeometryEntry>,
     /// Short human status for the panel header.
     pub status: String,
     /// Result of the most recent completed fetch: `None` until the first one
@@ -114,19 +178,27 @@ impl TropicalState {
             }
             SlotPoll::Idle | SlotPoll::Pending | SlotPoll::Disconnected => {}
         }
-        if let SlotPoll::Ready(Ok((id, geom))) = self.geometry_rx.poll() {
-            self.geometry.insert(id, geom);
+        if let SlotPoll::Ready(Ok(fetch)) = self.geometry_rx.poll() {
+            self.geometry.insert(
+                fetch.id,
+                StormGeometryEntry {
+                    geometry: fetch.geometry,
+                    fetched_at: Instant::now(),
+                    advisory_time: fetch.advisory_time,
+                },
+            );
         }
         // Mirror each storm's parsed forecast points onto its record so
         // `TropicalCyclone.forecast` is populated for the overlay/hover. The
         // geometry map is the transport (filled by the 2nd fetch); a fresh
         // storms list arrives with empty forecasts, so re-attach every poll.
         for storm in &mut self.storms {
-            if let Some(geom) = self.geometry.get(&storm.id) {
+            if let Some(entry) = self.geometry.get(&storm.id) {
+                let geom = &entry.geometry;
                 if storm.forecast != geom.forecast {
                     storm.forecast = geom.forecast.clone();
                 }
-                // The analysis-point wind radii (JTWC) ride alongside the
+                // The analysis-point wind radii (JTWC/NHC) ride alongside the
                 // forecast; re-attach so the overlay's wind rose + danger area
                 // survive a fresh storms-list swap.
                 if storm.current_wind_radii != geom.current_wind_radii {
@@ -136,19 +208,18 @@ impl TropicalState {
         }
     }
 
-    /// Progressively fetch missing track/cone geometry, one storm at a time.
-    /// Call each frame while the layer is visible.
+    /// Progressively fetch missing or stale track/cone geometry, one storm at
+    /// a time. Call each frame while the layer is visible. A failed refetch
+    /// keeps the previous (stale) geometry on screen and simply tries again.
     pub fn drive_geometry(&mut self, ctx: &egui::Context) {
         if self.geometry_rx.in_flight() {
             return;
         }
-        let next = self
-            .storms
-            .iter()
-            .find(|storm| storm.geometry_url.is_some() && !self.geometry.contains_key(&storm.id));
+        let next = storm_needing_geometry(&self.storms, &self.geometry, Instant::now());
         if let Some(storm) = next {
             let id = storm.id.clone();
             let source = storm.source;
+            let advisory_time = storm.advisory_time;
             let url = storm.geometry_url.clone().expect("checked is_some");
             // JTWC per-point forecast intensity for West-Pacific/Indian/Southern
             // storms (None for NHC basins, which carry it in their own TCM).
@@ -163,7 +234,11 @@ impl TropicalState {
                             forecast_url.as_deref(),
                         )
                     })
-                    .map(|geom| (id, geom));
+                    .map(|geometry| GeometryFetch {
+                        id,
+                        advisory_time,
+                        geometry,
+                    });
                 let _ = tx.send(result);
             });
         }
@@ -381,7 +456,12 @@ impl crate::ViewerApp {
 
         let mut shapes: Vec<egui::Shape> = Vec::new();
         for storm in &self.tropical.storms {
-            let Some(geom) = self.tropical.geometry.get(&storm.id) else {
+            let Some(geom) = self
+                .tropical
+                .geometry
+                .get(&storm.id)
+                .map(|entry| &entry.geometry)
+            else {
                 continue;
             };
             // Storms with official JTWC wind radii (West Pacific / Indian Ocean /
@@ -695,5 +775,134 @@ fn draw_forecast_tooltip(
         let advance = galley.size().y;
         painter.galley(egui::pos2(origin.x + pad, y), galley, egui::Color32::WHITE);
         y += advance;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use data_source::tropical::{Basin, GeoPoint, Source, WindRadii};
+
+    fn advisory(hour: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2024, 10, 8, hour, 0, 0).unwrap()
+    }
+
+    fn test_storm(id: &str, advisory_time: Option<DateTime<Utc>>) -> TropicalCyclone {
+        TropicalCyclone {
+            id: id.to_owned(),
+            name: "Milton".to_owned(),
+            basin: Basin::Atlantic,
+            source: Source::Nhc,
+            classification: "Hurricane".to_owned(),
+            category: None,
+            position: GeoPoint {
+                lon: -87.5,
+                lat: 22.7,
+            },
+            max_wind_kt: Some(145.0),
+            gust_kt: None,
+            min_pressure_mb: None,
+            movement_dir_deg: None,
+            movement_speed_kt: None,
+            advisory_time,
+            alert_level: None,
+            affected_areas: None,
+            forecast: Vec::new(),
+            current_wind_radii: Vec::new(),
+            cone: Vec::new(),
+            report_url: None,
+            geometry_url: Some("https://www.nhc.noaa.gov/text/MIATCMAT4.shtml".to_owned()),
+            forecast_url: None,
+        }
+    }
+
+    fn entry(advisory_time: Option<DateTime<Utc>>, fetched_at: Instant) -> StormGeometryEntry {
+        StormGeometryEntry {
+            geometry: StormGeometry::default(),
+            fetched_at,
+            advisory_time,
+        }
+    }
+
+    /// Audit #2 regression: the stable NHC id (`nhc:al142024`) used to pin the
+    /// first TCM fetched for the storm's whole life; a fresh storms list with
+    /// a NEWER advisory time must mark the cached geometry stale.
+    #[test]
+    fn geometry_refetches_when_storm_advisory_is_newer() {
+        let now = Instant::now();
+        let mut geometry = HashMap::new();
+        geometry.insert("nhc:al142024".to_owned(), entry(Some(advisory(15)), now));
+        let storms = vec![test_storm("nhc:al142024", Some(advisory(21)))];
+        let picked = storm_needing_geometry(&storms, &geometry, now)
+            .expect("newer advisory forces a refetch");
+        assert_eq!(picked.id, "nhc:al142024");
+    }
+
+    #[test]
+    fn geometry_fresh_entry_is_not_refetched() {
+        let now = Instant::now();
+        let mut geometry = HashMap::new();
+        geometry.insert("nhc:al142024".to_owned(), entry(Some(advisory(21)), now));
+        // Same advisory as cached, entry just fetched: nothing to do.
+        let storms = vec![test_storm("nhc:al142024", Some(advisory(21)))];
+        assert!(storm_needing_geometry(&storms, &geometry, now).is_none());
+        // An OLDER advisory in the list (feed hiccup) must not refetch either.
+        let storms = vec![test_storm("nhc:al142024", Some(advisory(15)))];
+        assert!(storm_needing_geometry(&storms, &geometry, now).is_none());
+    }
+
+    /// The age backstop refetches even when the feed's advisory time never
+    /// moves (or is absent on both sides).
+    #[test]
+    fn geometry_refetches_after_max_age_backstop() {
+        let fetched_at = Instant::now();
+        let mut geometry = HashMap::new();
+        geometry.insert("nhc:al142024".to_owned(), entry(None, fetched_at));
+        let storms = vec![test_storm("nhc:al142024", None)];
+
+        let just_before = fetched_at + Duration::from_secs(TROPICAL_GEOMETRY_MAX_AGE_SECONDS - 1);
+        assert!(storm_needing_geometry(&storms, &geometry, just_before).is_none());
+
+        let at_age = fetched_at + Duration::from_secs(TROPICAL_GEOMETRY_MAX_AGE_SECONDS);
+        assert!(storm_needing_geometry(&storms, &geometry, at_age).is_some());
+    }
+
+    #[test]
+    fn geometry_missing_entry_is_fetched_and_urlless_storms_are_skipped() {
+        let now = Instant::now();
+        let geometry = HashMap::new();
+        let mut no_url = test_storm("gdacs:1:1", None);
+        no_url.geometry_url = None;
+        let storms = vec![no_url, test_storm("nhc:al142024", Some(advisory(21)))];
+        let picked = storm_needing_geometry(&storms, &geometry, now).expect("uncached storm");
+        assert_eq!(picked.id, "nhc:al142024");
+    }
+
+    /// A cached entry fetched before the source published any advisory time
+    /// goes stale as soon as the storms list carries one.
+    #[test]
+    fn geometry_refetches_when_advisory_first_appears() {
+        let now = Instant::now();
+        let mut geometry = HashMap::new();
+        geometry.insert("nhc:al142024".to_owned(), entry(None, now));
+        let storms = vec![test_storm("nhc:al142024", Some(advisory(21)))];
+        assert!(storm_needing_geometry(&storms, &geometry, now).is_some());
+    }
+
+    /// Audit #3 companion: a storm whose forecast points carry NHC TCM radii
+    /// flips the renderer to the wind-rose + danger-area path.
+    #[test]
+    fn nhc_radii_flip_the_wind_rose_render_path() {
+        let mut storm = test_storm("nhc:al142024", None);
+        assert!(!storm_has_wind_radii(&storm), "bare storm: no radii");
+        storm.current_wind_radii = vec![WindRadii {
+            kt: 34,
+            ne_nm: 70.0,
+            se_nm: 80.0,
+            sw_nm: 80.0,
+            nw_nm: 120.0,
+        }];
+        assert!(storm_has_wind_radii(&storm));
     }
 }

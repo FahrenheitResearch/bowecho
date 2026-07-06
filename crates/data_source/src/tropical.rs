@@ -162,9 +162,10 @@ pub struct ForecastPoint {
     pub max_wind_kt: Option<f32>,
     /// The 34/50/64-kt quadrant wind radii at this point, when the issuing
     /// center provides them. JTWC Tropical Cyclone Warnings carry them under
-    /// each forecast time; NHC/GDACS forecast points currently leave this empty.
-    /// Ordered exactly as parsed (JTWC text lists them strongest-first: 64, 50,
-    /// 34 kt). See [`WindRadii`].
+    /// each forecast time, and NHC's TCM carries them under each
+    /// `FORECAST/OUTLOOK VALID` block; GDACS forecast points leave this empty.
+    /// Ordered exactly as parsed (both bulletins list them strongest-first:
+    /// 64, 50, 34 kt). See [`WindRadii`].
     pub wind_radii: Vec<WindRadii>,
 }
 
@@ -363,10 +364,11 @@ pub struct StormGeometry {
     /// the parsed forecast up to [`TropicalCyclone::forecast`]; see the parsers
     /// below for exactly what each source supplies.
     pub forecast: Vec<ForecastPoint>,
-    /// The 34/50/64-kt wind radii at the CURRENT (analysis) position, when the
-    /// JTWC warning's `WARNING POSITION` / `PRESENT WIND DISTRIBUTION` block
-    /// carries them (empty for GDACS/NHC-only storms). Lets the current-position
-    /// glyph draw its wind rose and anchors the 34-kt danger area at the storm.
+    /// The 34/50/64-kt wind radii at the CURRENT (analysis) position, from a
+    /// JTWC warning's `PRESENT WIND DISTRIBUTION` block or an NHC TCM's
+    /// `MAX SUSTAINED WINDS` block (empty for GDACS-only storms). Lets the
+    /// current-position glyph draw its wind rose and anchors the 34-kt danger
+    /// area at the storm.
     pub current_wind_radii: Vec<WindRadii>,
 }
 
@@ -641,15 +643,19 @@ fn nhc_classification_label(code: &str) -> String {
 /// Parse the official forecast track from an NHC Tropical Cyclone
 /// Forecast/Advisory (a.k.a. TCM / "FORECAST/ADVISORY", WMO header e.g.
 /// `MIATCMAT4`). Each forecast point is a `FORECAST VALID`/`OUTLOOK VALID` line
-/// (`DD/HHMMZ  LATn  LONw`) immediately followed by a `MAX WIND nnn KT` line, so
-/// NHC carries per-point **valid time, position, and max sustained wind (kt)** —
-/// exactly what the Saffir–Simpson color ramp needs.
+/// (`DD/HHMMZ  LATn  LONw`) followed by a `MAX WIND nnn KT` line and the
+/// `34/50/64 KT... nnNE nnSE nnSW nnNW.` quadrant wind-radii lines, so NHC
+/// carries per-point **valid time, position, max sustained wind (kt), and
+/// 34/50/64-kt quadrant wind radii** — everything the Saffir–Simpson color
+/// ramp and the wind-rose / 34-kt danger-area rendering need.
 ///
 /// This is NHC's machine-readable forecast product (linked from
 /// `CurrentStorms.json` as `forecastAdvisory.url`); we parse the fixed columnar
 /// bulletin text, never the human advisory web page. Product/format reference:
 /// NHC "Tropical Cyclone Forecast/Advisory" description,
-/// <https://www.nhc.noaa.gov/help/tcm.shtml>.
+/// <https://www.nhc.noaa.gov/help/tcm.shtml>; the quadrant wind-radii record
+/// follows the ATCF convention (Sampson & Schrader 2000, *BAMS* 81(6),
+/// doi:10.1175/1520-0477(2000)081<1231:TATCFS>2.3.CO;2).
 pub fn parse_nhc_forecast_advisory(text: &str) -> Vec<ForecastPoint> {
     let issued = nhc_issuance_date(text);
     let lines: Vec<&str> = text.lines().collect();
@@ -665,24 +671,102 @@ pub fn parse_nhc_forecast_advisory(text: &str) -> Vec<ForecastPoint> {
         let Some((position, valid_time)) = parse_nhc_valid_line(rest, issued) else {
             continue;
         };
-        // The `MAX WIND` line is the next non-empty line (look a couple ahead to
-        // tolerate a stray blank line).
-        let max_wind_kt = lines
+        // This point's block runs to the next blank line or the next
+        // FORECAST/OUTLOOK header, so one block's wind + radii can never bleed
+        // into the next (the TCM separates every block with a blank line).
+        let block = nhc_block_after(&lines, i);
+        let max_wind_kt = block.iter().find_map(|l| parse_nhc_max_wind(l.trim()));
+        let wind_radii = block
             .iter()
-            .skip(i + 1)
-            .take(3)
-            .find_map(|l| parse_nhc_max_wind(l.trim()));
+            .filter_map(|l| parse_nhc_radii_line(l))
+            .collect();
         out.push(ForecastPoint {
             position,
             valid_time,
             max_wind_kt,
-            // NHC's TCM carries per-point wind radii too, but in a different
-            // columnar layout; not parsed here (the JTWC path drives the
-            // wind-radii/danger-area rendering).
-            wind_radii: Vec::new(),
+            wind_radii,
         });
     }
     out
+}
+
+/// The lines belonging to the block that starts after line `i`: everything up
+/// to (excluding) the first blank line or the next `FORECAST VALID` /
+/// `OUTLOOK VALID` header.
+fn nhc_block_after<'a>(lines: &'a [&'a str], i: usize) -> &'a [&'a str] {
+    let end = lines[i + 1..]
+        .iter()
+        .position(|l| {
+            let t = l.trim();
+            t.is_empty() || t.starts_with("FORECAST VALID") || t.starts_with("OUTLOOK VALID")
+        })
+        .map(|offset| i + 1 + offset)
+        .unwrap_or(lines.len());
+    &lines[i + 1..end]
+}
+
+/// Parse the current-position (analysis) wind radii from an NHC TCM — the
+/// `34/50/64 KT` quadrant lines directly under `MAX SUSTAINED WINDS`, valid at
+/// the advisory's `CENTER LOCATED NEAR` position. Empty when the storm carries
+/// no radii (below 34 kt). The block is bounded at the first blank line, and
+/// [`parse_nhc_radii_line`] gates on the 34/50/64-kt thresholds, so the
+/// adjacent `12 FT SEAS..` line (same columnar shape, different quantity) is
+/// never mistaken for wind radii.
+pub fn parse_nhc_current_radii(text: &str) -> Vec<WindRadii> {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(start) = lines
+        .iter()
+        .position(|l| l.trim().starts_with("MAX SUSTAINED WINDS"))
+    else {
+        return Vec::new();
+    };
+    nhc_block_after(&lines, start)
+        .iter()
+        .filter_map(|l| parse_nhc_radii_line(l))
+        .collect()
+}
+
+/// Parse one TCM quadrant wind-radii line, e.g. `64 KT....... 25NE  25SE  25SW
+/// 25NW.` (analysis block) or `34 KT...100NE 100SE  80SW 120NW.` (forecast
+/// block — note the dots can abut the first radius with no space). Radii are
+/// nautical miles; a `0` radius means no reach in that quadrant. None unless
+/// the threshold is one of the ATCF 34/50/64-kt set AND all four quadrants are
+/// present — which also rejects `MAX WIND 145 KT...` and `12 FT SEAS..` lines.
+fn parse_nhc_radii_line(line: &str) -> Option<WindRadii> {
+    let (kt_tok, rest) = line.trim().split_once(char::is_whitespace)?;
+    let kt = kt_tok.parse::<u16>().ok()?;
+    if !matches!(kt, 34 | 50 | 64) {
+        return None;
+    }
+    let quads = rest
+        .trim_start()
+        .strip_prefix("KT")?
+        .trim_start_matches('.');
+    let (mut ne, mut se, mut sw, mut nw) = (None, None, None, None);
+    for tok in quads.split_whitespace() {
+        let tok = tok.trim_end_matches('.');
+        let Some(at) = tok.len().checked_sub(2) else {
+            continue;
+        };
+        let (value, quadrant) = tok.split_at(at);
+        let Ok(nm) = value.trim().parse::<f32>() else {
+            continue;
+        };
+        match quadrant {
+            "NE" => ne = Some(nm),
+            "SE" => se = Some(nm),
+            "SW" => sw = Some(nm),
+            "NW" => nw = Some(nm),
+            _ => {}
+        }
+    }
+    Some(WindRadii {
+        kt,
+        ne_nm: ne?,
+        se_nm: se?,
+        sw_nm: sw?,
+        nw_nm: nw?,
+    })
 }
 
 /// Pull the issuance `(year, month, day)` from the TCM datestamp line, e.g.
@@ -1478,23 +1562,55 @@ pub const NHC_CURRENT_STORMS_URL: &str = "https://www.nhc.noaa.gov/CurrentStorms
 pub const GDACS_TC_LIST_URL: &str =
     "https://www.gdacs.org/gdacsapi/api/events/geteventlist/EVENTS4APP?eventtypes=TC";
 
-/// Combine NHC and GDACS into one deduplicated list: NHC is authoritative for
+/// Two source records whose positions sit within this great-circle distance
+/// (km) describe the SAME storm. GDACS positions can lag NHC's by several
+/// hours (a 15-kt storm covers ~330 km in 12 h), while two DISTINCT active
+/// cyclones essentially never get this close — direct interaction (the
+/// Fujiwhara regime) already begins near ~1300 km separation.
+const DUPLICATE_STORM_KM: f32 = 500.0;
+
+/// Great-circle (haversine) distance in km between two points, on the same
+/// sphere the rest of this module uses ([`EARTH_RADIUS_KM`]).
+fn great_circle_km(a: GeoPoint, b: GeoPoint) -> f32 {
+    let (phi1, phi2) = (a.lat.to_radians(), b.lat.to_radians());
+    let half_dphi = (b.lat - a.lat).to_radians() / 2.0;
+    let half_dlam = (normalize_lon(b.lon - a.lon)).to_radians() / 2.0;
+    let s = half_dphi.sin().powi(2) + phi1.cos() * phi2.cos() * half_dlam.sin().powi(2);
+    2.0 * EARTH_RADIUS_KM * s.sqrt().clamp(-1.0, 1.0).asin()
+}
+
+/// Whether a GDACS record duplicates one of the NHC storms: a matching (real)
+/// name, or a position within [`DUPLICATE_STORM_KM`]. The name check skips the
+/// GDACS "Unnamed" placeholder so two sourceless invests never alias.
+fn duplicates_nhc_storm(gdacs: &TropicalCyclone, nhc: &[TropicalCyclone]) -> bool {
+    nhc.iter().any(|official| {
+        let name_match = !gdacs.name.is_empty()
+            && !gdacs.name.eq_ignore_ascii_case("unnamed")
+            && gdacs.name.eq_ignore_ascii_case(&official.name);
+        name_match || great_circle_km(gdacs.position, official.position) <= DUPLICATE_STORM_KM
+    })
+}
+
+/// Combine NHC and GDACS into one deduplicated list. NHC is authoritative for
 /// the basins it covers (Atlantic, East/Central Pacific — it carries wind AND
-/// pressure), so GDACS storms in those basins are dropped to avoid doubles;
-/// GDACS supplies every other basin (West Pacific, Indian Ocean, Southern
-/// Hemisphere). Kept pure so the merge is unit-tested without a network.
+/// pressure), so a GDACS record of the SAME storm (matched per storm by name
+/// or position proximity) is dropped in favor of NHC's. Every other GDACS
+/// storm is kept — including one in an NHC basin with no NHC counterpart:
+/// GDACS supplies the West Pacific/Indian Ocean/Southern Hemisphere, and it is
+/// also the only witness to an Atlantic/E-Pac storm while NHC is down or has
+/// not initiated advisories (the old per-BASIN filter threw those away and
+/// recreated the false "quiet across every basin" that commit f090287 fixed).
+/// Kept pure so the merge is unit-tested without a network.
 pub fn merge_sources(
     nhc: Vec<TropicalCyclone>,
     gdacs: Vec<TropicalCyclone>,
 ) -> Vec<TropicalCyclone> {
-    let nhc_basins = |basin: Basin| {
-        matches!(
-            basin,
-            Basin::Atlantic | Basin::EastPacific | Basin::CentralPacific
-        )
-    };
+    let kept_gdacs: Vec<TropicalCyclone> = gdacs
+        .into_iter()
+        .filter(|storm| !duplicates_nhc_storm(storm, &nhc))
+        .collect();
     let mut merged = nhc;
-    merged.extend(gdacs.into_iter().filter(|storm| !nhc_basins(storm.basin)));
+    merged.extend(kept_gdacs);
     // Strongest first — that is the ordering the storm list wants.
     merged.sort_by(|a, b| {
         b.max_wind_kt
@@ -1516,34 +1632,7 @@ pub fn fetch_active_cyclones(
         fetch_text(client, NHC_CURRENT_STORMS_URL).and_then(|body| parse_nhc_current_storms(&body));
     let gdacs =
         fetch_text(client, GDACS_TC_LIST_URL).and_then(|body| parse_gdacs_event_list(&body));
-
-    let mut storms = match (nhc, gdacs) {
-        (Ok(nhc), Ok(gdacs)) => merge_sources(nhc, gdacs),
-        // A partial failure must NOT masquerade as "no active cyclones". Trust a
-        // single surviving source only when it actually reports storms; when it
-        // is EMPTY we cannot distinguish "genuinely quiet" from "the source that
-        // carried the storms is down" — GDACS is the only feed for the West
-        // Pacific (e.g. the live BAVI-26 typhoon), while NHC covers just the
-        // Atlantic/E-Pac. Surface the failure so the caller retries instead of
-        // showing a false all-clear.
-        (Ok(nhc), Err(_)) if !nhc.is_empty() => nhc,
-        (Ok(_), Err(gdacs_err)) => {
-            return Err(format!(
-                "GDACS unavailable (NHC reports no Atlantic/E-Pac storms): {gdacs_err}"
-            ));
-        }
-        (Err(_), Ok(gdacs)) if !gdacs.is_empty() => merge_sources(Vec::new(), gdacs),
-        (Err(nhc_err), Ok(_)) => {
-            return Err(format!(
-                "NHC unavailable (GDACS reports no storms): {nhc_err}"
-            ));
-        }
-        (Err(nhc_err), Err(gdacs_err)) => {
-            return Err(format!(
-                "both sources failed — NHC: {nhc_err}; GDACS: {gdacs_err}"
-            ));
-        }
-    };
+    let mut storms = combine_source_results(nhc, gdacs)?;
     // Best-effort: match active JTWC warnings to GDACS storms so each carries a
     // forecast_url for real per-point West-Pacific intensity (a JTWC outage
     // silently leaves the honest GDACS-only fallback in place).
@@ -1553,9 +1642,44 @@ pub fn fetch_active_cyclones(
     Ok(storms)
 }
 
+/// Combine the two per-source fetch results into one storm list. A partial
+/// failure must NOT masquerade as "no active cyclones": a single surviving
+/// source is trusted only when it actually reports storms — when it is EMPTY
+/// we cannot distinguish "genuinely quiet" from "the source that carried the
+/// storms is down" (GDACS is the only feed for the West Pacific, NHC covers
+/// just the Atlantic/E-Pac), so the failure is surfaced and the caller keeps
+/// retrying instead of showing a false all-clear. When NHC is DOWN, EVERY
+/// GDACS storm is kept — including those in NHC's own basins (there is no NHC
+/// record to dedupe against; the old per-basin filter silently discarded a
+/// GDACS-tracked Atlantic hurricane during an NHC outage, producing exactly
+/// the false "Quiet across every basin" this failover exists to prevent).
+/// Kept pure so every failover arm is unit-tested without a network.
+pub fn combine_source_results(
+    nhc: Result<Vec<TropicalCyclone>, String>,
+    gdacs: Result<Vec<TropicalCyclone>, String>,
+) -> Result<Vec<TropicalCyclone>, String> {
+    match (nhc, gdacs) {
+        (Ok(nhc), Ok(gdacs)) => Ok(merge_sources(nhc, gdacs)),
+        (Ok(nhc), Err(_)) if !nhc.is_empty() => Ok(nhc),
+        (Ok(_), Err(gdacs_err)) => Err(format!(
+            "GDACS unavailable (NHC reports no Atlantic/E-Pac storms): {gdacs_err}"
+        )),
+        // NHC down, GDACS reporting: merge with an empty NHC list, which keeps
+        // every GDACS storm (nothing to duplicate) and applies the wind sort.
+        (Err(_), Ok(gdacs)) if !gdacs.is_empty() => Ok(merge_sources(Vec::new(), gdacs)),
+        (Err(nhc_err), Ok(_)) => Err(format!(
+            "NHC unavailable (GDACS reports no storms): {nhc_err}"
+        )),
+        (Err(nhc_err), Err(gdacs_err)) => Err(format!(
+            "both sources failed — NHC: {nhc_err}; GDACS: {gdacs_err}"
+        )),
+    }
+}
+
 /// Fetch one storm's forecast geometry from its `geometry_url`, parsed per
 /// source: GDACS `getgeometry` yields track + cone + forecast points; the NHC
-/// forecast-advisory (TCM) yields forecast points (with per-point wind) only.
+/// forecast-advisory (TCM) yields forecast points (with per-point wind AND
+/// 34/50/64-kt quadrant wind radii) plus the analysis-position radii.
 ///
 /// `forecast_url` is the optional JTWC Tropical Cyclone Warning for a
 /// GDACS-covered storm: when present and parseable, its per-point forecast
@@ -1586,10 +1710,21 @@ pub fn fetch_storm_geometry(
             }
             Ok(geometry)
         }
-        Source::Nhc => Ok(StormGeometry {
-            forecast: parse_nhc_forecast_advisory(&body),
-            ..StormGeometry::default()
-        }),
+        Source::Nhc => Ok(nhc_geometry_from_forecast_advisory(&body)),
+    }
+}
+
+/// Build an NHC storm's geometry from its Forecast/Advisory (TCM) text: the
+/// per-point forecast track (position, valid time, max wind, quadrant wind
+/// radii) plus the analysis-block 34/50/64-kt radii at the current position.
+/// Cone and past track stay empty (no GIS product is fetched); the wind-radii
+/// rose + 34-kt danger-area renderer gives NHC storms their footprint on the
+/// map, exactly as it does for JTWC-matched West-Pacific storms.
+pub fn nhc_geometry_from_forecast_advisory(text: &str) -> StormGeometry {
+    StormGeometry {
+        forecast: parse_nhc_forecast_advisory(text),
+        current_wind_radii: parse_nhc_current_radii(text),
+        ..StormGeometry::default()
     }
 }
 
@@ -2011,21 +2146,180 @@ REMARKS:
     }
 
     #[test]
-    fn merge_prefers_nhc_in_its_basins_and_sorts_by_wind() {
+    fn merge_keeps_both_sources_and_sorts_by_wind() {
         let nhc = parse_nhc_current_storms(NHC).unwrap(); // Atlantic "Alberto"
         let gdacs = parse_gdacs_event_list(GDACS_LIST).unwrap(); // W Pacific BAVI + MAYSAK
         let merged = merge_sources(nhc, gdacs);
-        // NHC Atlantic storm kept; both W-Pacific GDACS storms kept (different basin).
+        // NHC Atlantic storm kept; both W-Pacific GDACS storms kept (no dupes).
         assert_eq!(merged.len(), 3);
         // Strongest first: BAVI (~145 kt) leads.
         assert_eq!(merged[0].name, "Bavi");
         assert!(merged[0].max_wind_kt.unwrap() >= merged[1].max_wind_kt.unwrap());
-        // No GDACS storm survived in an NHC basin.
+    }
+
+    /// Minimal hand-built record for the merge/failover tests (the committed
+    /// fixtures carry no GDACS storm inside an NHC basin).
+    fn synthetic_storm(
+        id: &str,
+        name: &str,
+        source: Source,
+        lon: f32,
+        lat: f32,
+        wind_kt: f32,
+    ) -> TropicalCyclone {
+        TropicalCyclone {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            basin: Basin::from_lon_lat(lon, lat),
+            source,
+            classification: "Tropical Cyclone".to_owned(),
+            category: Some(Category::from_wind_kt(wind_kt)),
+            position: GeoPoint { lon, lat },
+            max_wind_kt: Some(wind_kt),
+            gust_kt: None,
+            min_pressure_mb: None,
+            movement_dir_deg: None,
+            movement_speed_kt: None,
+            advisory_time: None,
+            alert_level: None,
+            affected_areas: None,
+            forecast: Vec::new(),
+            current_wind_radii: Vec::new(),
+            cone: Vec::new(),
+            report_url: None,
+            geometry_url: None,
+            forecast_url: None,
+        }
+    }
+
+    #[test]
+    fn merge_dedupes_per_storm_not_per_basin() {
+        // Audit #1: a legitimate GDACS-tracked Atlantic system with NO NHC
+        // counterpart (NHC hasn't initiated advisories) must survive the
+        // merge — the old per-basin filter silently discarded it.
+        let nhc = parse_nhc_current_storms(NHC).unwrap(); // Alberto, 24.5N 88.9W
+        let oscar = synthetic_storm("gdacs:900001:3", "Oscar", Source::Gdacs, -60.0, 30.0, 90.0);
+        let mut gdacs = parse_gdacs_event_list(GDACS_LIST).unwrap();
+        gdacs.push(oscar);
+        let merged = merge_sources(nhc, gdacs);
+        assert_eq!(merged.len(), 4, "Alberto + BAVI + MAYSAK + Oscar");
         assert!(
-            !merged
-                .iter()
-                .any(|s| s.source == Source::Gdacs && s.basin == Basin::Atlantic)
+            merged.iter().any(|s| s.name == "Oscar"
+                && s.source == Source::Gdacs
+                && s.basin == Basin::Atlantic),
+            "non-duplicate GDACS storm in an NHC basin survives: {merged:?}"
         );
+    }
+
+    #[test]
+    fn merge_drops_gdacs_duplicate_by_name() {
+        // GDACS's record of the SAME hurricane, position drifted well past the
+        // proximity gate — the (case-insensitive) name still identifies it.
+        let nhc = parse_nhc_current_storms(NHC).unwrap();
+        let dup = synthetic_storm(
+            "gdacs:900002:1",
+            "ALBERTO",
+            Source::Gdacs,
+            -70.0,
+            35.0,
+            80.0,
+        );
+        let merged = merge_sources(nhc, vec![dup]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].source, Source::Nhc, "the NHC record wins");
+    }
+
+    #[test]
+    fn merge_drops_gdacs_duplicate_by_position() {
+        // Same storm under a placeholder name: caught by position proximity.
+        // An unrelated far-away placeholder must NOT alias (names don't match
+        // and "Unnamed" is excluded from name matching anyway).
+        let nhc = parse_nhc_current_storms(NHC).unwrap(); // Alberto, 24.5N 88.9W
+        let near_dup = synthetic_storm(
+            "gdacs:900003:1",
+            "Unnamed",
+            Source::Gdacs,
+            -88.5,
+            24.8,
+            80.0,
+        );
+        let far_invest = synthetic_storm(
+            "gdacs:900004:1",
+            "Unnamed",
+            Source::Gdacs,
+            -30.0,
+            20.0,
+            45.0,
+        );
+        let merged = merge_sources(nhc, vec![near_dup, far_invest]);
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert!(merged.iter().any(|s| s.id == "gdacs:900004:1"));
+        assert!(!merged.iter().any(|s| s.id == "gdacs:900003:1"));
+    }
+
+    #[test]
+    fn combine_keeps_all_gdacs_storms_when_nhc_is_down() {
+        // Audit #1 regression: during an NHC outage, GDACS's record of an
+        // Atlantic hurricane is the only witness. The old code ran the
+        // per-basin filter anyway and returned Ok(vec![]) — a false
+        // "Quiet across every basin" that also reset the aggressive retry.
+        let atlantic = synthetic_storm(
+            "gdacs:900005:2",
+            "Milton",
+            Source::Gdacs,
+            -87.5,
+            25.0,
+            120.0,
+        );
+        let wpac = synthetic_storm("gdacs:900006:4", "Bavi", Source::Gdacs, 145.0, 14.3, 145.0);
+        let out = combine_source_results(Err("NHC HTTP 503".to_owned()), Ok(vec![atlantic, wpac]))
+            .expect("a reporting GDACS alone is trusted");
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(
+            out.iter()
+                .any(|s| s.name == "Milton" && s.basin == Basin::Atlantic),
+            "the NHC-basin storm survives the NHC outage: {out:?}"
+        );
+        // Strongest first still applies on the failover path.
+        assert_eq!(out[0].name, "Bavi");
+    }
+
+    #[test]
+    fn combine_failover_arms_never_fake_an_all_clear() {
+        let nhc = || parse_nhc_current_storms(NHC).unwrap(); // 1 storm
+        let gdacs = || parse_gdacs_event_list(GDACS_LIST).unwrap(); // 2 storms
+        // Both ok -> merged.
+        assert_eq!(
+            combine_source_results(Ok(nhc()), Ok(gdacs()))
+                .unwrap()
+                .len(),
+            3
+        );
+        // NHC ok + reporting, GDACS down -> NHC's storms survive.
+        let out = combine_source_results(Ok(nhc()), Err("GDACS down".to_owned())).unwrap();
+        assert_eq!(out.len(), 1);
+        // A surviving-but-EMPTY source cannot prove "quiet" -> error (retry).
+        assert!(combine_source_results(Ok(Vec::new()), Err("GDACS down".to_owned())).is_err());
+        assert!(combine_source_results(Err("NHC down".to_owned()), Ok(Vec::new())).is_err());
+        // Both down -> error carrying both causes.
+        let err = combine_source_results(Err("NHC down".to_owned()), Err("GDACS down".to_owned()))
+            .unwrap_err();
+        assert!(
+            err.contains("NHC down") && err.contains("GDACS down"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn empty_nhc_feed_does_not_hide_gdacs_atlantic_storm() {
+        // NHC responding but with no active systems listed yet; GDACS already
+        // carries the storm. The merge keeps it (nothing to duplicate).
+        let atlantic =
+            synthetic_storm("gdacs:900007:1", "Nadine", Source::Gdacs, -80.0, 27.0, 70.0);
+        let merged =
+            combine_source_results(Ok(Vec::new()), Ok(vec![atlantic])).expect("both sources ok");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "Nadine");
     }
 
     #[test]
@@ -2264,6 +2558,175 @@ REMARKS:
         );
         // Latitude band brackets the track (14°N current → 26°N day-5).
         assert!(south < 13.0 && north > 27.0, "lat band {south}..{north}");
+    }
+
+    #[test]
+    fn nhc_tcm_parses_per_point_wind_radii() {
+        // Audit #3 regression: the TCM's quadrant radii were deliberately
+        // skipped, so NHC storms rendered as bare dots. Exact values from the
+        // real Milton (AL142024) Forecast/Advisory #15 fixture.
+        let fc = parse_nhc_forecast_advisory(NHC_TCM);
+        assert_eq!(fc.len(), 8);
+
+        // First point (09/0600Z): all three thresholds, strongest-first.
+        let first = &fc[0];
+        assert_eq!(
+            first.wind_radii.iter().map(|r| r.kt).collect::<Vec<_>>(),
+            vec![64, 50, 34]
+        );
+        let r64 = first.wind_radii.iter().find(|r| r.kt == 64).unwrap();
+        assert_eq!(
+            (r64.ne_nm, r64.se_nm, r64.sw_nm, r64.nw_nm),
+            (30.0, 25.0, 25.0, 30.0)
+        );
+        let r50 = first.wind_radii.iter().find(|r| r.kt == 50).unwrap();
+        assert_eq!(
+            (r50.ne_nm, r50.se_nm, r50.sw_nm, r50.nw_nm),
+            (60.0, 50.0, 45.0, 50.0)
+        );
+        let r34 = first.wind_radii.iter().find(|r| r.kt == 34).unwrap();
+        assert_eq!(
+            (r34.ne_nm, r34.se_nm, r34.sw_nm, r34.nw_nm),
+            (100.0, 100.0, 80.0, 120.0),
+            "the dots-abut-the-radius form `34 KT...100NE` parses"
+        );
+
+        // 11/0600Z (65 kt, weakening): the 64-kt threshold is genuinely gone.
+        assert_eq!(
+            fc[4].wind_radii.iter().map(|r| r.kt).collect::<Vec<_>>(),
+            vec![50, 34]
+        );
+
+        // Day-5 outlook point: 34-kt only, with a genuine zero NE radius.
+        let last = fc.last().unwrap();
+        assert_eq!(
+            last.wind_radii.iter().map(|r| r.kt).collect::<Vec<_>>(),
+            vec![34]
+        );
+        let l34 = &last.wind_radii[0];
+        assert_eq!(
+            (l34.ne_nm, l34.se_nm, l34.sw_nm, l34.nw_nm),
+            (0.0, 120.0, 120.0, 120.0)
+        );
+
+        // Per-block scoping: the 34-kt NE radius really varies point-to-point,
+        // so one block's radii must never bleed into the next.
+        let ne34: Vec<f32> = fc
+            .iter()
+            .map(|p| p.wind_radii.iter().find(|r| r.kt == 34).unwrap().ne_nm)
+            .collect();
+        assert_eq!(
+            ne34,
+            vec![100.0, 160.0, 230.0, 240.0, 270.0, 180.0, 130.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn nhc_current_radii_parses_analysis_block_and_skips_seas() {
+        let radii = parse_nhc_current_radii(NHC_TCM);
+        // Exactly the three wind thresholds — the `12 FT SEAS..` line (same
+        // columnar layout, different quantity) must NOT be read as wind radii.
+        assert_eq!(
+            radii.iter().map(|r| r.kt).collect::<Vec<_>>(),
+            vec![64, 50, 34]
+        );
+        let r64 = radii.iter().find(|r| r.kt == 64).unwrap();
+        assert_eq!(
+            (r64.ne_nm, r64.se_nm, r64.sw_nm, r64.nw_nm),
+            (25.0, 25.0, 25.0, 25.0)
+        );
+        let r50 = radii.iter().find(|r| r.kt == 50).unwrap();
+        assert_eq!(
+            (r50.ne_nm, r50.se_nm, r50.sw_nm, r50.nw_nm),
+            (40.0, 40.0, 40.0, 40.0)
+        );
+        let r34 = radii.iter().find(|r| r.kt == 34).unwrap();
+        assert_eq!(
+            (r34.ne_nm, r34.se_nm, r34.sw_nm, r34.nw_nm),
+            (70.0, 80.0, 80.0, 120.0)
+        );
+    }
+
+    #[test]
+    fn nhc_geometry_carries_radii_end_to_end() {
+        // What `fetch_storm_geometry(Source::Nhc, ..)` now returns for Milton:
+        // per-point + analysis radii, so the existing wind-rose and 34-kt
+        // danger-area renderer lights up for NHC storms exactly like the JTWC
+        // path (they used to draw as bare dots on a thin line).
+        let geom = nhc_geometry_from_forecast_advisory(NHC_TCM);
+        assert_eq!(geom.forecast.len(), 8);
+        assert!(!geom.current_wind_radii.is_empty());
+        assert!(
+            geom.forecast
+                .iter()
+                .all(|p| p.wind_radii.iter().any(|r| r.kt == 34)),
+            "every Milton forecast point carries a 34-kt gale radius"
+        );
+        // And the 34-kt danger area actually forms from those inputs (the
+        // overlay's gate): current position 22.7N 87.5W + forecast points.
+        let current_center = GeoPoint {
+            lon: -87.5,
+            lat: 22.7,
+        };
+        let points = std::iter::once((current_center, geom.current_wind_radii.as_slice())).chain(
+            geom.forecast
+                .iter()
+                .map(|p| (p.position, p.wind_radii.as_slice())),
+        );
+        let hull = danger_area_34kt(points);
+        assert!(
+            hull.len() >= 4 && hull.first() == hull.last(),
+            "closed danger-area hull"
+        );
+    }
+
+    /// Live end-to-end smoke check against the real feeds (network; run
+    /// manually: `cargo test -p data_source --release -- --ignored live_tropical`).
+    /// Fetches + merges NHC/GDACS/JTWC and then every storm's geometry, so a
+    /// live format drift in any product is caught before it ships.
+    #[test]
+    #[ignore]
+    fn live_tropical_feeds_end_to_end() {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("BowEcho tropical layer (github.com/FahrenheitResearch/bowecho)")
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("client");
+        let storms = fetch_active_cyclones(&client).expect("fetch+merge live sources");
+        println!("{} active tropical cyclone(s):", storms.len());
+        for storm in &storms {
+            println!(
+                "  {} [{}] {:?} {:.0} kt at ({:.1}, {:.1}) geometry_url={} jtwc={}",
+                storm.name,
+                storm.source.label(),
+                storm.basin,
+                storm.max_wind_kt.unwrap_or(0.0),
+                storm.position.lon,
+                storm.position.lat,
+                storm.geometry_url.is_some(),
+                storm.forecast_url.is_some(),
+            );
+        }
+        for storm in &storms {
+            let Some(url) = storm.geometry_url.as_deref() else {
+                continue;
+            };
+            let geom =
+                fetch_storm_geometry(&client, storm.source, url, storm.forecast_url.as_deref())
+                    .unwrap_or_else(|err| panic!("geometry fetch for {}: {err}", storm.name));
+            println!(
+                "  {}: {} forecast pts ({} with radii), {} current radii, cone {} pts, {} track segs",
+                storm.name,
+                geom.forecast.len(),
+                geom.forecast
+                    .iter()
+                    .filter(|p| !p.wind_radii.is_empty())
+                    .count(),
+                geom.current_wind_radii.len(),
+                geom.cone.len(),
+                geom.track.len(),
+            );
+        }
     }
 
     #[test]

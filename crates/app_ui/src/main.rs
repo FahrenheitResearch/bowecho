@@ -17577,10 +17577,22 @@ impl eframe::App for ViewerApp {
         self.tropical.poll();
         if self.app_settings.show_tropical {
             self.tropical.drive_geometry(&ctx);
-            egui::Window::new("🌀 Tropical Cyclones")
-                .default_width(300.0)
-                .default_pos(egui::pos2(60.0, 90.0))
-                .show(&ctx, |ui| self.tropical.cards_ui(ui));
+            if self.app_settings.show_tropical_panel {
+                // Local `open` mirrors the [✕] into the persisted setting
+                // without a double borrow of `self` (the body closure also
+                // borrows self). Closing the cards window keeps the map
+                // overlay — the two are controlled independently.
+                let mut open = true;
+                egui::Window::new("🌀 Tropical Cyclones")
+                    .default_width(300.0)
+                    .default_pos(egui::pos2(60.0, 90.0))
+                    .open(&mut open)
+                    .show(&ctx, |ui| self.tropical.cards_ui(ui));
+                if !open {
+                    self.app_settings.show_tropical_panel = false;
+                    let _ = self.app_settings.save();
+                }
+            }
             if let Some((lon, lat)) = self.tropical.focus_request.take() {
                 self.map_center_lon = lon;
                 self.map_center_lat = lat;
@@ -21005,12 +21017,30 @@ impl ViewerApp {
         if ui
             .checkbox(&mut self.app_settings.show_tropical, "Tropical cyclones")
             .on_hover_text(
-                "Show active hurricanes/typhoons worldwide (NHC + GDACS): a storm-card panel with wind, pressure, and motion, plus each storm's position, forecast track, and cone of uncertainty on the map.",
+                "Show active hurricanes/typhoons worldwide (NHC + GDACS + JTWC): a storm-card panel with wind, pressure, and motion, plus each storm's position, forecast track with per-point intensity, and official 34/50/64-kt wind radii with the gale danger area (NHC and JTWC storms) or the cone of uncertainty (other basins) on the map. Draws nothing when no storms are active.",
             )
             .changed()
         {
             let _ = self.app_settings.save();
             ctx.request_repaint();
+        }
+        if self.app_settings.show_tropical {
+            ui.indent("tropical_panel_toggle", |ui| {
+                if ui
+                    .checkbox(
+                        &mut self.app_settings.show_tropical_panel,
+                        "Storm cards window",
+                    )
+                    .on_hover_text(
+                        "Show the floating storm-cards window listing each active storm's vitals. \
+                         The map overlay stays on either way; the window's [✕] unchecks this.",
+                    )
+                    .changed()
+                {
+                    let _ = self.app_settings.save();
+                    ctx.request_repaint();
+                }
+            });
         }
         if ui
             .checkbox(&mut self.app_settings.show_radar_status, "Radar status / outages")

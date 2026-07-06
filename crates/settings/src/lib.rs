@@ -189,10 +189,17 @@ pub struct AppSettings {
     #[serde(default)]
     pub overlay_raob: bool,
     /// Draw the tropical-cyclone layer: active storm positions, forecast
-    /// track, and cone of uncertainty (NHC CurrentStorms.json + GDACS).
-    /// Default off.
-    #[serde(default)]
+    /// track, quadrant wind radii / 34-kt danger area (NHC + JTWC), and cone
+    /// of uncertainty (GDACS basins). Default ON — the map layer draws
+    /// nothing when no storms are active, so a quiet globe costs nothing.
+    #[serde(default = "default_true")]
     pub show_tropical: bool,
+    /// Show the floating tropical storm-cards window while the tropical layer
+    /// is on. Separate from `show_tropical` so the window's title-bar [✕]
+    /// (mirrored here, like `show_radar_status`) closes just the cards without
+    /// killing the map overlay.
+    #[serde(default = "default_true")]
+    pub show_tropical_panel: bool,
     /// Show the NWS radar operational-status panel: the selected US
     /// NEXRAD/TDWR radar's RDA health (operational / degraded / DOWN) and
     /// operator alarm messages, from api.weather.gov/radar/stations. A DOWN
@@ -705,7 +712,8 @@ impl Default for AppSettings {
             overlay_glm: false,
             glm_show_last_minutes: default_glm_show_last_minutes(),
             overlay_raob: false,
-            show_tropical: false,
+            show_tropical: true,
+            show_tropical_panel: true,
             show_radar_status: false,
             overlay_spc_outlooks: Vec::new(),
             overlay_spc_reports: false,
@@ -1472,6 +1480,28 @@ mod tests {
         assert_eq!(back.radar_label_style, "id-box");
         assert!(!back.show_hazard_labels);
         assert!(AppSettings::from_json("{}").show_hazard_labels);
+    }
+
+    #[test]
+    fn tropical_layer_defaults_on_and_panel_flag_round_trips() {
+        // Audit #4: the marquee tropical layer used to be default-off and its
+        // cards window had no close button. The layer (and its cards window)
+        // now default ON — including for a pre-existing settings file that
+        // predates the keys — and the window's [✕] persists into
+        // `show_tropical_panel` without touching the map overlay toggle.
+        assert!(AppSettings::default().show_tropical);
+        assert!(AppSettings::default().show_tropical_panel);
+        assert!(AppSettings::from_json("{}").show_tropical);
+        assert!(AppSettings::from_json("{}").show_tropical_panel);
+
+        let settings = AppSettings {
+            show_tropical: true,
+            show_tropical_panel: false, // cards window closed via [✕]
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+        assert!(back.show_tropical);
+        assert!(!back.show_tropical_panel);
     }
 
     #[test]
