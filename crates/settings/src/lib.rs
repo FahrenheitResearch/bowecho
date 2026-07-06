@@ -503,6 +503,13 @@ pub struct AppSettings {
     /// serialized). Kept opaque here for the same reason as the sounding state.
     #[serde(default)]
     pub model_style_overrides: Option<serde_json::Value>,
+    /// Last-used WRF "full diagnostics" processing selection (which product
+    /// groups + optional only/skip field filters). Opaque JSON built by
+    /// app_ui's model dock, kept UI-crate-free here like the two states above.
+    /// `None` (older configs) restores today's default: process everything but
+    /// heavy eCAPE.
+    #[serde(default)]
+    pub wrf_process_options: Option<serde_json::Value>,
     /// Data-folder override: where caches and stores live (Level II
     /// cache, model/sat/GLM stores, tiles, georefs). Empty = platform
     /// default. Read once at startup; Settings says "restart to apply".
@@ -779,6 +786,7 @@ impl Default for AppSettings {
             workspace_layout: None,
             sounding_view_state: None,
             model_style_overrides: None,
+            wrf_process_options: None,
             data_dir: String::new(),
             sidebar_section_open: BTreeMap::new(),
             model_slug: default_model_slug(),
@@ -1798,6 +1806,25 @@ mod tests {
         let back = AppSettings::from_json(&s.to_json());
         assert_eq!(back, s);
         assert_eq!(AppSettings::from_json("{}").sounding_view_state, None);
+    }
+
+    #[test]
+    fn wrf_process_options_round_trips_as_opaque_json() {
+        let s = AppSettings {
+            wrf_process_options: Some(serde_json::json!({
+                "core_fields": true,
+                "diagnostics": false,
+                "heavy_ecape": false,
+                "raw_extras": false,
+                "only_text": "sbcape, srh",
+                "skip_text": ""
+            })),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&s.to_json());
+        assert_eq!(back, s);
+        // Absent → None: older configs restore today's default behavior.
+        assert_eq!(AppSettings::from_json("{}").wrf_process_options, None);
     }
 
     #[test]

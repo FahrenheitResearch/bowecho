@@ -35,6 +35,74 @@ enum ImportJob {
     SyntheticRadar(crate::wrf_radar::SyntheticRadarTask),
 }
 
+/// Editable + persisted state for the WRF "full diagnostics" processing-
+/// options popover. The four booleans mirror [`crate::wrf_process::
+/// WrfProcessOptions`] product groups; `only_text`/`skip_text` are the raw,
+/// user-typed field filters (comma/space separated) kept as strings so they
+/// round-trip through settings exactly and remain editable. Serialized opaque
+/// into `AppSettings::wrf_process_options` (same pattern as the sounding view
+/// state), so an older config with no entry restores today's defaults.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct WrfProcessUiState {
+    #[serde(default = "wrf_default_true")]
+    core_fields: bool,
+    #[serde(default = "wrf_default_true")]
+    diagnostics: bool,
+    #[serde(default)]
+    heavy_ecape: bool,
+    #[serde(default = "wrf_default_true")]
+    raw_extras: bool,
+    #[serde(default)]
+    only_text: String,
+    #[serde(default)]
+    skip_text: String,
+}
+
+fn wrf_default_true() -> bool {
+    true
+}
+
+impl Default for WrfProcessUiState {
+    fn default() -> Self {
+        // Matches `WrfProcessOptions::default()`: everything but heavy eCAPE.
+        Self {
+            core_fields: true,
+            diagnostics: true,
+            heavy_ecape: false,
+            raw_extras: true,
+            only_text: String::new(),
+            skip_text: String::new(),
+        }
+    }
+}
+
+impl WrfProcessUiState {
+    /// Build the backend options from the current UI selection. `only`/`skip`
+    /// pass through as single raw strings; `WrfProcessOptions::normalized`
+    /// (called inside `spawn_process_paths`) splits and cleans the tokens.
+    /// Only consumed by the desktop import UI, hence the dead-code allowance
+    /// for headless/non-rfd targets.
+    #[allow(dead_code)]
+    fn to_options(&self) -> crate::wrf_process::WrfProcessOptions {
+        let field_filter = |text: &str| {
+            if text.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![text.to_string()]
+            }
+        };
+        crate::wrf_process::WrfProcessOptions {
+            core_fields: self.core_fields,
+            diagnostics: self.diagnostics,
+            heavy_ecape: self.heavy_ecape,
+            raw_extras: self.raw_extras,
+            only: field_filter(&self.only_text),
+            skip: field_filter(&self.skip_text),
+        }
+        .normalized()
+    }
+}
+
 pub struct ModelDataDock {
     worker: StoreWorker,
     /// egui context, kept so a background import can request repaints while it
@@ -70,6 +138,11 @@ pub struct ModelDataDock {
     /// and the current field reloaded so the new palette shows.
     color_tables: ColorTableEditorPanel,
     show_color_tables: bool,
+    /// User's WRF full-diagnostics processing selection (product groups +
+    /// only/skip field filters). Edited in the import area's options popover,
+    /// applied when the "WRF full diagnostics…" import launches, and persisted
+    /// to settings so it survives restarts.
+    wrf_options: WrfProcessUiState,
 }
 
 impl ModelDataDock {
@@ -97,6 +170,7 @@ impl ModelDataDock {
             show_plot_viewer: false,
             color_tables: ColorTableEditorPanel::new(),
             show_color_tables: false,
+            wrf_options: WrfProcessUiState::default(),
         }
     }
 
@@ -259,6 +333,26 @@ impl ModelDataDock {
                 self.color_tables.set_settings(settings.clone());
                 self.worker
                     .send(StoreRequest::SetStyleOverrides(settings.normalized()));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Serialize the current WRF full-diagnostics processing selection for
+    /// persistence (opaque JSON in `AppSettings::wrf_process_options`, same as
+    /// the sounding/style states).
+    pub fn wrf_process_options_json(&self) -> serde_json::Value {
+        serde_json::to_value(&self.wrf_options).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Restore a persisted WRF processing selection into the import popover.
+    /// Returns false on malformed JSON (older/newer schema) — the selection is
+    /// left at today's defaults, so a bad entry never breaks the import.
+    pub fn apply_wrf_process_options_json(&mut self, value: &serde_json::Value) -> bool {
+        match serde_json::from_value::<WrfProcessUiState>(value.clone()) {
+            Ok(state) => {
+                self.wrf_options = state;
                 true
             }
             Err(_) => false,
@@ -507,9 +601,10 @@ impl ModelDataDock {
             if ui
                 .add_enabled(!busy, egui::Button::new("🛠 WRF full diagnostics…"))
                 .on_hover_text(
-                    "Heavier ingest for raw wrfout files: compute the full 2D diagnostic \
-                     set (CAPE / severe / etc.) plus sounding volumes via wrf-core. Slower \
-                     on large CONUS grids.",
+                    "Heavier ingest for raw wrfout files: compute the 2D diagnostic set \
+                     (CAPE / severe / etc.) plus sounding volumes via wrf-core. Slower on \
+                     large CONUS grids. Use “Fields ▾” below to choose exactly which product \
+                     groups / fields to process — the default writes everything but heavy eCAPE.",
                 )
                 .clicked()
                 && let Some(dir) = rfd::FileDialog::new()
@@ -521,10 +616,13 @@ impl ModelDataDock {
                     self.import_message = Some(format!("No WRF files under {}", dir.display()));
                 } else {
                     let count = files.len();
+                    // Honor the user's product-group / only-skip selection
+                    // instead of always processing the full default set.
+                    let options = self.wrf_options.to_options();
                     let task = crate::wrf_process::spawn_process_paths(
                         files,
                         self.store_root.clone(),
-                        crate::wrf_process::WrfProcessOptions::default(),
+                        options,
                     );
                     self.import_message = Some(format!("Processing {count} WRF file(s)…"));
                     self.import_job = Some(ImportJob::Process(task));
@@ -560,6 +658,119 @@ impl ModelDataDock {
                 self.import_job = Some(ImportJob::SyntheticRadar(task));
             }
         });
+        // Product selector for the "WRF full diagnostics…" import above. The
+        // light single-file/folder path (`local_import`) writes a FIXED 2D-
+        // surface + isobaric-sounding set with no options struct, so it is not
+        // wired here; if per-field selection is ever wanted there too, this same
+        // popover could drive a `local_import` options argument.
+        self.wrf_options_panel(ui);
+    }
+
+    /// Collapsible options popover for the heavy WRF ingest: toggle the product
+    /// GROUPS (core / diagnostics / heavy eCAPE / raw extras) and optionally
+    /// narrow with free-text ONLY / SKIP field filters, then a live preview of
+    /// exactly which store fields the selection will write. Edits mutate
+    /// `self.wrf_options`, which the "WRF full diagnostics…" button reads and
+    /// `persist_wrf_process_options` (app side) saves.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn wrf_options_panel(&mut self, ui: &mut egui::Ui) {
+        let busy = self.import_job.is_some();
+        let opts = &mut self.wrf_options;
+        egui::CollapsingHeader::new("🛠 WRF full-diagnostics fields")
+            .id_salt("wrf_full_diag_fields")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Pick what the “WRF full diagnostics…” import writes. Toggle product \
+                         groups, and/or narrow to specific fields with the filters below.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_enabled_ui(!busy, |ui| {
+                    ui.checkbox(&mut opts.core_fields, "Core surface fields + sounding")
+                        .on_hover_text(
+                            "T2/Td2/RH, 10 m winds, MSLP, surface pressure, PWAT, composite \
+                             reflectivity, UH, precip, terrain — plus the isobaric sounding \
+                             volumes that feed the skew-T.",
+                        );
+                    ui.checkbox(&mut opts.diagnostics, "Severe / thermo diagnostics")
+                        .on_hover_text(
+                            "getvar 2D diagnostics: CAPE/CIN, SRH, bulk shear, STP/SCP/EHI, \
+                             LCL/LFC/EL, and the rest of the severe suite.",
+                        );
+                    ui.checkbox(&mut opts.heavy_ecape, "Heavy eCAPE (slow)")
+                        .on_hover_text(
+                            "Entrainment-CAPE family (sbeCAPE/mleCAPE/mueCAPE, eCAPE-STP/EHI/SCP). \
+                             Off by default — noticeably slower on large grids.",
+                        );
+                    ui.checkbox(&mut opts.raw_extras, "Raw model extras")
+                        .on_hover_text(
+                            "Raw wrfout fields pulled verbatim: PBLH, surface fluxes (HFX/LH), \
+                             radiation (SWDOWN/GLW/OLR), skin/sea-surface temps, snow/graupel.",
+                        );
+                    ui.horizontal(|ui| {
+                        ui.label("Only:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut opts.only_text)
+                                .hint_text("e.g. sbcape, srh, shear")
+                                .desired_width(200.0),
+                        )
+                        .on_hover_text(
+                            "Optional allow-list: process ONLY fields whose name matches one of \
+                             these tokens (comma/space separated). Empty = no restriction.",
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Skip:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut opts.skip_text)
+                                .hint_text("e.g. ecape, olr")
+                                .desired_width(200.0),
+                        )
+                        .on_hover_text(
+                            "Optional deny-list: drop any field whose name matches one of these \
+                             tokens (comma/space separated). Applied after Only.",
+                        );
+                    });
+                    if ui
+                        .button("Reset to defaults")
+                        .on_hover_text("Everything but heavy eCAPE — the classic import.")
+                        .clicked()
+                    {
+                        *opts = WrfProcessUiState::default();
+                    }
+                });
+
+                // Live preview of the resulting store fields, so the user sees
+                // the selection is narrowed (not the full default set).
+                let planned = opts.to_options().planned_store_fields();
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!("{} field(s) will be written", planned.len()))
+                        .small()
+                        .strong(),
+                );
+                if planned.is_empty() {
+                    ui.label(
+                        egui::RichText::new(
+                            "Nothing selected — enable a group or widen the Only filter.",
+                        )
+                        .small()
+                        .color(egui::Color32::from_rgb(0xd0, 0x8a, 0x30)),
+                    );
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("wrf_planned_fields")
+                        .max_height(110.0)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(planned.join(", ")).small().weak(),
+                            );
+                        });
+                }
+            });
     }
 
     /// Non-desktop fallback: native folder dialogs (rfd) are unavailable, so

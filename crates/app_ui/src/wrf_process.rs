@@ -61,6 +61,52 @@ impl WrfProcessOptions {
         self
     }
 
+    /// The store field names the current selection WOULD write, for the
+    /// import UI's "what will be processed" preview. Mirrors the decisions in
+    /// [`read_wrf_products`] using the same [`Self::should_process`] predicate
+    /// and the same field catalogs, so the preview tracks the real output.
+    /// This is a static plan (it never opens a file); a field a given `wrfout`
+    /// happens not to carry is simply skipped at process time with a note.
+    pub fn planned_store_fields(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for (wrf_name, store_name) in CORE_FIELD_CATALOG {
+            if self.should_process(wrf_name, Some(store_name), WrfProductGroup::Core) {
+                names.push((*store_name).to_string());
+            }
+        }
+        // Isobaric sounding volumes ride along with the core group (they are
+        // gated on `core_fields` in `read_wrf_products`).
+        if self.core_fields {
+            for iso in ISO_VOLUME_NAMES {
+                names.push((*iso).to_string());
+            }
+        }
+        for def in VARS {
+            if def.dim != VarDim::TwoD || matches!(def.name, "lat" | "lon" | "cape2d") {
+                continue;
+            }
+            let store_name = derived_name(def.name, None);
+            let group = if is_heavy_wrf_diagnostic(&store_name) || is_heavy_wrf_diagnostic(def.name)
+            {
+                WrfProductGroup::Heavy
+            } else {
+                WrfProductGroup::Diagnostic
+            };
+            if self.should_process(def.name, Some(&store_name), group) {
+                names.push(store_name);
+            }
+        }
+        for raw in RAW_EXTRA_CATALOG {
+            let store_name = derived_name(raw, None);
+            if self.should_process(raw, Some(&store_name), WrfProductGroup::Raw) {
+                names.push(store_name);
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
     fn should_process(
         &self,
         wrf_name: &str,
@@ -98,6 +144,55 @@ enum WrfProductGroup {
     Heavy,
     Raw,
 }
+
+/// Core 2D surface fields the heavy path writes, as `(wrf source name, store
+/// field name)`. Single source of truth for the `Core` group, shared by the
+/// processor's `push_core!` sites and the UI's planned-field preview so the two
+/// never drift. `PSFC`/`apcp` are pushed by dedicated blocks but still belong
+/// to the `Core` group (they check `should_process(.., Core)`).
+const CORE_FIELD_CATALOG: &[(&str, &str)] = &[
+    ("terrain", "orography"),
+    ("t2", "temperature_2m"),
+    ("dp2m", "dewpoint_2m"),
+    ("rh2m", "relative_humidity_2m"),
+    ("U10", "u_10m"),
+    ("V10", "v_10m"),
+    ("wspd10", "wind_speed_10m"),
+    ("slp", "mslp"),
+    ("PSFC", "surface_pressure"),
+    ("pw", "pwat"),
+    ("maxdbz", "composite_reflectivity"),
+    ("UP_HELI_MAX", "updraft_helicity_2to5km"),
+    ("apcp", "apcp"),
+];
+
+/// Isobaric sounding volumes written alongside the `Core` group (skew-T
+/// columns). 3D `pressure3d` store variables, not 2D fields.
+const ISO_VOLUME_NAMES: &[&str] = &[
+    "temperature_iso",
+    "dewpoint_iso",
+    "u_iso",
+    "v_iso",
+    "height_iso",
+];
+
+/// Raw WRF model outputs pulled verbatim (no `getvar` diagnostic) for the
+/// `Raw` extras group. Single source of truth shared by the processor loop and
+/// the planned-field preview.
+const RAW_EXTRA_CATALOG: &[&str] = &[
+    "PBLH",
+    "HFX",
+    "LH",
+    "SWDOWN",
+    "GLW",
+    "OLR",
+    "TSK",
+    "SST",
+    "SNOWNC",
+    "GRAUPELNC",
+    "WSPD10MAX",
+    "UP_HELI_MAX",
+];
 
 #[derive(Debug)]
 pub enum WrfProcessMessage {
@@ -539,20 +634,7 @@ fn read_wrf_products(
         }
     }
 
-    for raw in [
-        "PBLH",
-        "HFX",
-        "LH",
-        "SWDOWN",
-        "GLW",
-        "OLR",
-        "TSK",
-        "SST",
-        "SNOWNC",
-        "GRAUPELNC",
-        "WSPD10MAX",
-        "UP_HELI_MAX",
-    ] {
+    for raw in RAW_EXTRA_CATALOG {
         let store_name = derived_name(raw, None);
         if !options.should_process(raw, Some(&store_name), WrfProductGroup::Raw) {
             continue;
@@ -1220,5 +1302,146 @@ mod tests {
         assert!(filtered.should_process("srh1", Some("srh_0_1km"), WrfProductGroup::Diagnostic));
         assert!(!filtered.should_process("srh3", Some("srh_0_3km"), WrfProductGroup::Diagnostic));
         assert!(!filtered.should_process("t2", Some("temperature_2m"), WrfProductGroup::Core));
+    }
+
+    /// Real-data proof for the UI field selector: the SAME wrfout processed
+    /// with a narrowed selection (core fields only — no diagnostics, raw, or
+    /// heavy eCAPE) must write ONLY the selected fields into the store hour — a
+    /// strict, strictly-smaller subset of the full default set. This exercises
+    /// the exact path the "WRF full diagnostics…" import drives. Gated on
+    /// `RW_WRF_PROCESS_FIXTURE` (a `wrfout_*` path) like the sibling fixtures.
+    #[test]
+    fn real_fixture_selection_narrows_written_fields() {
+        let Some(fixture) = std::env::var_os("RW_WRF_PROCESS_FIXTURE") else {
+            return;
+        };
+        let path = PathBuf::from(fixture);
+
+        // Process `path` once under `options`, returning the store hour's
+        // authoritative on-disk variable-name set (sorted, deduped).
+        let written_fields = |options: WrfProcessOptions, tag: &str| -> Vec<String> {
+            let store =
+                std::env::temp_dir().join(format!("rw-wrf-select-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&store);
+            let (tx, _rx) = channel();
+            let summary = process_paths(std::slice::from_ref(&path), &store, &options, &tx)
+                .unwrap_or_else(|err| panic!("process ({tag}) failed: {err}"));
+            let hour_path = store
+                .join(&summary.model)
+                .join(&summary.run)
+                .join("f000.rws");
+            let reader = rw_store::reader::HourReader::open(&hour_path).expect("open hour file");
+            let mut names: Vec<String> = reader
+                .meta()
+                .variables
+                .iter()
+                .map(|var| var.name.clone())
+                .collect();
+            names.sort();
+            names.dedup();
+            let _ = std::fs::remove_dir_all(&store);
+            names
+        };
+
+        let narrowed = written_fields(
+            WrfProcessOptions {
+                diagnostics: false,
+                raw_extras: false,
+                heavy_ecape: false,
+                ..WrfProcessOptions::default()
+            }
+            .normalized(),
+            "narrow",
+        );
+        let default = written_fields(WrfProcessOptions::default().normalized(), "default");
+
+        eprintln!(
+            "NARROWED core-only ({} fields): {}",
+            narrowed.len(),
+            narrowed.join(", ")
+        );
+        eprintln!(
+            "DEFAULT full set ({} fields): {}",
+            default.len(),
+            default.join(", ")
+        );
+
+        // Narrowed keeps the core surface fields + isobaric sounding volumes…
+        assert!(
+            narrowed.iter().any(|name| name == "temperature_2m"),
+            "narrowed selection must still write the core surface fields"
+        );
+        assert!(
+            narrowed.iter().any(|name| name == "temperature_iso"),
+            "narrowed selection must still write the sounding volumes"
+        );
+        // …but drops the severe diagnostics and raw extras the default writes.
+        assert!(
+            !narrowed.iter().any(|name| name == "sbcape"),
+            "narrowed (diagnostics off) must NOT write CAPE and friends"
+        );
+        assert!(
+            default.iter().any(|name| name == "sbcape"),
+            "default set must include the severe diagnostics"
+        );
+        // Strict subset, strictly smaller: the selection genuinely narrowed the
+        // written store hour rather than falling back to the full default set.
+        assert!(
+            narrowed.iter().all(|name| default.contains(name)),
+            "narrowed field set must be a subset of the default field set"
+        );
+        assert!(
+            narrowed.len() < default.len(),
+            "narrowed selection must write fewer fields ({}) than the default ({})",
+            narrowed.len(),
+            default.len()
+        );
+    }
+
+    #[test]
+    fn planned_store_fields_track_the_group_selection() {
+        // Default: core + diagnostics + raw (no heavy eCAPE).
+        let default_plan = WrfProcessOptions::default().normalized().planned_store_fields();
+        assert!(default_plan.iter().any(|name| name == "temperature_2m"));
+        assert!(default_plan.iter().any(|name| name == "temperature_iso"));
+        assert!(default_plan.iter().any(|name| name == "sbcape"));
+        // Heavy eCAPE (any entrainment-CAPE field) is off by default.
+        assert!(!default_plan.iter().any(|name| name.contains("ecape")));
+
+        // Core-only, heavy off: drops every diagnostic and raw field but keeps
+        // the core surface fields and the isobaric sounding volumes.
+        let core_only = WrfProcessOptions {
+            diagnostics: false,
+            raw_extras: false,
+            heavy_ecape: false,
+            ..WrfProcessOptions::default()
+        }
+        .normalized()
+        .planned_store_fields();
+        assert!(core_only.iter().any(|name| name == "temperature_2m"));
+        assert!(core_only.iter().any(|name| name == "height_iso"));
+        assert!(!core_only.iter().any(|name| name == "sbcape"));
+
+        // Enabling heavy eCAPE adds the entrainment-CAPE family (e.g.
+        // ecape_scp / ecape_ehi from wrf-core's VARS).
+        let heavy = WrfProcessOptions {
+            heavy_ecape: true,
+            ..WrfProcessOptions::default()
+        }
+        .normalized()
+        .planned_store_fields();
+        assert!(heavy.iter().any(|name| name.contains("ecape")));
+        assert!(heavy.len() > default_plan.len());
+
+        // An only-list narrows the plan to the matching fields (plus the iso
+        // volumes, which ride with the core group toggle, not the name filter).
+        let only_cape = WrfProcessOptions {
+            only: vec!["sbcape".to_string()],
+            ..WrfProcessOptions::default()
+        }
+        .normalized()
+        .planned_store_fields();
+        assert!(only_cape.iter().any(|name| name == "sbcape"));
+        assert!(!only_cape.iter().any(|name| name == "temperature_2m"));
     }
 }

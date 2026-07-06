@@ -17932,6 +17932,7 @@ impl eframe::App for ViewerApp {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.persist_sounding_view_state();
         self.persist_model_style_overrides();
+        self.persist_wrf_process_options();
         if self.workspace.dirty {
             self.persist_workspace_layout();
         }
@@ -26969,6 +26970,20 @@ impl ViewerApp {
         }
     }
 
+    /// Persist the WRF full-diagnostics processing selection when it changes,
+    /// so the chosen product groups / field filters survive restarts (same
+    /// opaque-JSON pattern as the sounding and style states).
+    fn persist_wrf_process_options(&mut self) {
+        let Some(dock) = self.model_dock.as_ref() else {
+            return;
+        };
+        let value = dock.wrf_process_options_json();
+        if self.app_settings.wrf_process_options.as_ref() != Some(&value) {
+            self.app_settings.wrf_process_options = Some(value);
+            let _ = self.app_settings.save();
+        }
+    }
+
     fn persist_workspace_layout(&mut self) {
         self.workspace.dirty = false;
         let viewers: BTreeMap<dock::WorkspacePane, dock::ViewerMode> = dock::WorkspacePane::VIEWERS
@@ -30052,6 +30067,9 @@ impl ViewerApp {
         if let Some(value) = self.app_settings.model_style_overrides.as_ref() {
             dock.apply_style_overrides_json(value);
         }
+        if let Some(value) = self.app_settings.wrf_process_options.as_ref() {
+            dock.apply_wrf_process_options_json(value);
+        }
         dock
     }
 
@@ -30356,6 +30374,9 @@ impl ViewerApp {
             // Persist any color-table edits made this frame (no-op unless they
             // actually changed — cheap while the model window is open).
             self.persist_model_style_overrides();
+            // Same for the WRF full-diagnostics field selection (product groups
+            // + only/skip filters edited in the import options popover).
+            self.persist_wrf_process_options();
         }
         events
     }
