@@ -15,7 +15,7 @@
 //! Scales/definitions: Saffir–Simpson by 1-min max sustained wind (kt); the
 //! West Pacific "(Super) Typhoon" labels map onto the same wind thresholds.
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use serde::Deserialize;
 
 /// A lon/lat point in degrees (east/north positive), matching the app's other
@@ -163,6 +163,11 @@ pub struct StormGeometry {
     pub track: Vec<Vec<GeoPoint>>,
     /// Cone-of-uncertainty outer ring.
     pub cone: Vec<GeoPoint>,
+    /// Official forecast track points (position + valid time + per-point max
+    /// wind, where the office provides it). This is the transport that carries
+    /// the parsed forecast up to [`TropicalCyclone::forecast`]; see the parsers
+    /// below for exactly what each source supplies.
+    pub forecast: Vec<ForecastPoint>,
 }
 
 /// One active tropical cyclone, source-agnostic.
@@ -331,6 +336,11 @@ struct NhcStorm {
     last_update: Option<String>,
     #[serde(default)]
     public_advisory: Option<NhcProduct>,
+    /// The Tropical Cyclone Forecast/Advisory (TCM) product — the machine-
+    /// readable forecast track WITH per-point max wind. Its `url` is a stable
+    /// "latest" bulletin, e.g. `.../text/MIATCMAT1.shtml`.
+    #[serde(default)]
+    forecast_advisory: Option<NhcProduct>,
 }
 
 #[derive(Deserialize)]
@@ -389,7 +399,9 @@ fn nhc_to_cyclone(storm: NhcStorm) -> TropicalCyclone {
         forecast: Vec::new(),
         cone: Vec::new(),
         report_url: storm.public_advisory.and_then(|advisory| advisory.url),
-        geometry_url: None,
+        // The forecast-advisory (TCM) URL is fetched on the second pass and
+        // parsed into `forecast` by `parse_nhc_forecast_advisory`.
+        geometry_url: storm.forecast_advisory.and_then(|advisory| advisory.url),
     }
 }
 
@@ -406,6 +418,152 @@ fn nhc_classification_label(code: &str) -> String {
         _ => "Tropical Cyclone",
     }
     .to_owned()
+}
+
+// ---------------------------------------------------------------------------
+// NHC Tropical Cyclone Forecast/Advisory (TCM) — per-point forecast + intensity
+// ---------------------------------------------------------------------------
+
+/// Parse the official forecast track from an NHC Tropical Cyclone
+/// Forecast/Advisory (a.k.a. TCM / "FORECAST/ADVISORY", WMO header e.g.
+/// `MIATCMAT4`). Each forecast point is a `FORECAST VALID`/`OUTLOOK VALID` line
+/// (`DD/HHMMZ  LATn  LONw`) immediately followed by a `MAX WIND nnn KT` line, so
+/// NHC carries per-point **valid time, position, and max sustained wind (kt)** —
+/// exactly what the Saffir–Simpson color ramp needs.
+///
+/// This is NHC's machine-readable forecast product (linked from
+/// `CurrentStorms.json` as `forecastAdvisory.url`); we parse the fixed columnar
+/// bulletin text, never the human advisory web page. Product/format reference:
+/// NHC "Tropical Cyclone Forecast/Advisory" description,
+/// <https://www.nhc.noaa.gov/help/tcm.shtml>.
+pub fn parse_nhc_forecast_advisory(text: &str) -> Vec<ForecastPoint> {
+    let issued = nhc_issuance_date(text);
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    for (i, raw) in lines.iter().enumerate() {
+        let line = raw.trim();
+        let Some(rest) = line
+            .strip_prefix("FORECAST VALID ")
+            .or_else(|| line.strip_prefix("OUTLOOK VALID "))
+        else {
+            continue;
+        };
+        let Some((position, valid_time)) = parse_nhc_valid_line(rest, issued) else {
+            continue;
+        };
+        // The `MAX WIND` line is the next non-empty line (look a couple ahead to
+        // tolerate a stray blank line).
+        let max_wind_kt = lines
+            .iter()
+            .skip(i + 1)
+            .take(3)
+            .find_map(|l| parse_nhc_max_wind(l.trim()));
+        out.push(ForecastPoint {
+            position,
+            valid_time,
+            max_wind_kt,
+        });
+    }
+    out
+}
+
+/// Pull the issuance `(year, month, day)` from the TCM datestamp line, e.g.
+/// `2100 UTC TUE OCT 08 2024`. The forecast lines carry only a day-of-month, so
+/// this reference resolves the real month/year across month/year rollover.
+fn nhc_issuance_date(text: &str) -> Option<(i32, u32, u32)> {
+    for line in text.lines() {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        if toks.len() < 6 || toks[1] != "UTC" {
+            continue;
+        }
+        let month = month_from_abbrev(toks[toks.len() - 3]);
+        let day = toks[toks.len() - 2].parse::<u32>();
+        let year = toks[toks.len() - 1].parse::<i32>();
+        if let (Some(month), Ok(day), Ok(year)) = (month, day, year) {
+            return Some((year, month, day));
+        }
+    }
+    None
+}
+
+fn month_from_abbrev(abbrev: &str) -> Option<u32> {
+    Some(match abbrev.to_ascii_uppercase().as_str() {
+        "JAN" => 1,
+        "FEB" => 2,
+        "MAR" => 3,
+        "APR" => 4,
+        "MAY" => 5,
+        "JUN" => 6,
+        "JUL" => 7,
+        "AUG" => 8,
+        "SEP" => 9,
+        "OCT" => 10,
+        "NOV" => 11,
+        "DEC" => 12,
+        _ => return None,
+    })
+}
+
+/// Parse `09/0600Z 23.8N  86.4W` (optionally `...INLAND` / `...OVER WATER`).
+fn parse_nhc_valid_line(
+    rest: &str,
+    issued: Option<(i32, u32, u32)>,
+) -> Option<(GeoPoint, Option<DateTime<Utc>>)> {
+    let mut toks = rest.split_whitespace();
+    let time_tok = toks.next()?;
+    let lat_tok = toks.next()?;
+    let lon_tok = toks.next()?;
+    let lat = parse_signed_coord(lat_tok, 'N', 'S')?;
+    // A trailing "...INLAND"/"...POST-TROP" rides on the longitude token.
+    let lon_clean = lon_tok.split("...").next().unwrap_or(lon_tok);
+    let lon = parse_signed_coord(lon_clean, 'E', 'W')?;
+    let valid_time = parse_tcm_time(time_tok, issued);
+    Some((GeoPoint { lon, lat }, valid_time))
+}
+
+/// `23.8N` -> +23.8, `86.4W` -> -86.4 (direction is the trailing letter).
+fn parse_signed_coord(tok: &str, positive: char, negative: char) -> Option<f32> {
+    let dir = tok.chars().last()?;
+    let magnitude: f32 = tok[..tok.len() - dir.len_utf8()].parse().ok()?;
+    if dir == positive {
+        Some(magnitude)
+    } else if dir == negative {
+        Some(-magnitude)
+    } else {
+        None
+    }
+}
+
+/// `09/0600Z` + the issuance `(year, month, day)` -> a UTC instant. TCM forecast
+/// times only ever run FORWARD from issuance (out to day 5), so a day-of-month
+/// below the issuance day means the track crossed into the next month/year.
+fn parse_tcm_time(tok: &str, issued: Option<(i32, u32, u32)>) -> Option<DateTime<Utc>> {
+    let (year, month, issue_day) = issued?;
+    let stamp = tok.trim_end_matches('Z');
+    let (day_s, hhmm_s) = stamp.split_once('/')?;
+    let day: u32 = day_s.parse().ok()?;
+    let hhmm: u32 = hhmm_s.parse().ok()?;
+    let (mut y, mut m) = (year, month);
+    if day < issue_day {
+        if m == 12 {
+            m = 1;
+            y += 1;
+        } else {
+            m += 1;
+        }
+    }
+    let date = NaiveDate::from_ymd_opt(y, m, day)?;
+    let time = NaiveTime::from_hms_opt(hhmm / 100, hhmm % 100, 0)?;
+    Some(date.and_time(time).and_utc())
+}
+
+/// `MAX WIND 145 KT...GUSTS 175 KT.` -> `145`.
+fn parse_nhc_max_wind(line: &str) -> Option<f32> {
+    line.strip_prefix("MAX WIND")?
+        .split_whitespace()
+        .next()?
+        .parse::<f32>()
+        .ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +609,13 @@ struct GdacsProps {
     url: Option<GdacsUrls>,
     #[serde(default, rename = "Class")]
     class: Option<String>,
+    /// On `getgeometry` forecast points: `MMDDHHMM` valid-time stamp (no year).
+    #[serde(default)]
+    key: Option<String>,
+    /// On `getgeometry` forecast points: the analysis ("current") time —
+    /// identical across a storm's points, so it is the past/forecast pivot.
+    #[serde(default)]
+    todate: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -539,9 +704,18 @@ fn gdacs_to_cyclone(feature: GdacsFeature) -> Option<TropicalCyclone> {
     })
 }
 
-/// Parse a GDACS `getgeometry` FeatureCollection into a storm's track + cone.
-/// Track segments are `Line_Line_<n>` (concatenated in order); the cone is
+/// Parse a GDACS `getgeometry` FeatureCollection into a storm's track, cone, and
+/// forecast points. Track segments are `Line_Line_<n>`; the cone is
 /// `Poly_Cones`; the current center is `Point_Centroid`.
+///
+/// The forecast track is delivered as `Point_Polygon_Point_<n>` features — one
+/// per 6/12-hourly track point (past AND future), each a small wind-radii circle
+/// whose center is the track position, with a `key` (`MMDDHHMM`) valid-time
+/// stamp and a `todate` analysis time. GDACS repeats only the storm's *current*
+/// severity on every point (not a per-point forecast), so forecast points get
+/// `max_wind_kt = None` and are colored by the storm's current category. We keep
+/// the points strictly AFTER the analysis time (the forecast; earlier points are
+/// the observed past already drawn as `Line_Line` segments).
 pub fn parse_gdacs_geometry(json: &str) -> Result<StormGeometry, String> {
     let parsed: GdacsCollection =
         serde_json::from_str(json).map_err(|err| format!("GDACS geometry parse: {err}"))?;
@@ -549,6 +723,9 @@ pub fn parse_gdacs_geometry(json: &str) -> Result<StormGeometry, String> {
     let mut centroid = None;
     let mut cone = Vec::new();
     let mut lines: Vec<(u32, Vec<GeoPoint>)> = Vec::new();
+    // (index, center, MMDDHHMM key); the year comes from `reference` below.
+    let mut point_stamps: Vec<(u32, GeoPoint, String)> = Vec::new();
+    let mut reference: Option<DateTime<Utc>> = None;
 
     for feature in &parsed.features {
         let Some(class) = feature.properties.class.as_deref() else {
@@ -565,6 +742,15 @@ pub fn parse_gdacs_geometry(json: &str) -> Result<StormGeometry, String> {
             && let Ok(index) = index.parse::<u32>()
         {
             lines.push((index, geojson_line(geometry)));
+        } else if let Some(index) = class.strip_prefix("Point_Polygon_Point_")
+            && let Ok(index) = index.parse::<u32>()
+            && let Some(center) = geojson_polygon_centroid(geometry)
+            && let Some(key) = feature.properties.key.as_deref()
+        {
+            if reference.is_none() {
+                reference = feature.properties.todate.as_deref().and_then(parse_time);
+            }
+            point_stamps.push((index, center, key.to_owned()));
         }
     }
 
@@ -575,11 +761,64 @@ pub fn parse_gdacs_geometry(json: &str) -> Result<StormGeometry, String> {
         .map(|(_, points)| points)
         .filter(|points| points.len() >= 2)
         .collect();
+
+    let forecast = gdacs_forecast_points(point_stamps, reference);
+
     Ok(StormGeometry {
         centroid,
         track,
         cone,
+        forecast,
     })
+}
+
+/// Resolve `MMDDHHMM` stamps against the analysis time and keep the forecast
+/// (strictly-future) points, in chronological order.
+fn gdacs_forecast_points(
+    mut point_stamps: Vec<(u32, GeoPoint, String)>,
+    reference: Option<DateTime<Utc>>,
+) -> Vec<ForecastPoint> {
+    let Some(reference) = reference else {
+        return Vec::new();
+    };
+    point_stamps.sort_by_key(|(index, _, _)| *index);
+    point_stamps
+        .into_iter()
+        .filter_map(|(_, center, key)| {
+            let valid_time = gdacs_key_time(&key, reference)?;
+            (valid_time > reference).then_some(ForecastPoint {
+                position: center,
+                valid_time: Some(valid_time),
+                max_wind_kt: None,
+            })
+        })
+        .collect()
+}
+
+/// `MMDDHHMM` + the analysis time -> a UTC instant. The stamp carries no year;
+/// every point sits within a few days of the analysis time, so we pick the year
+/// (prev/this/next) that lands the point closest to it — correct on either side
+/// of a New-Year boundary.
+fn gdacs_key_time(key: &str, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if key.len() != 8 {
+        return None;
+    }
+    let month: u32 = key.get(0..2)?.parse().ok()?;
+    let day: u32 = key.get(2..4)?.parse().ok()?;
+    let hour: u32 = key.get(4..6)?.parse().ok()?;
+    let minute: u32 = key.get(6..8)?.parse().ok()?;
+    let time = NaiveTime::from_hms_opt(hour, minute, 0)?;
+    let base = reference.year();
+    [base - 1, base, base + 1]
+        .into_iter()
+        .filter_map(|year| {
+            let dt = NaiveDate::from_ymd_opt(year, month, day)?
+                .and_time(time)
+                .and_utc();
+            Some(((dt - reference).num_seconds().abs(), dt))
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, dt)| dt)
 }
 
 // ---- GeoJSON coordinate extraction (tolerant of lon/lat f64 nesting) -------
@@ -614,6 +853,25 @@ fn geojson_polygon_outer(geometry: &serde_json::Value) -> Vec<GeoPoint> {
         .and_then(|ring| ring.as_array())
         .map(|array| array.iter().filter_map(coord_pair).collect())
         .unwrap_or_default()
+}
+
+/// The centroid of a polygon's outer ring (mean of its vertices). GDACS delivers
+/// each forecast track point as a small wind-radii circle; its center is the
+/// track position. The closing vertex duplicates the first, but on a many-vertex
+/// ring that bias is far below plotting resolution.
+fn geojson_polygon_centroid(geometry: &serde_json::Value) -> Option<GeoPoint> {
+    let ring = geojson_polygon_outer(geometry);
+    if ring.is_empty() {
+        return None;
+    }
+    let count = ring.len() as f64;
+    let (sum_lon, sum_lat) = ring.iter().fold((0.0_f64, 0.0_f64), |(lon, lat), point| {
+        (lon + point.lon as f64, lat + point.lat as f64)
+    });
+    Some(GeoPoint {
+        lon: (sum_lon / count) as f32,
+        lat: (sum_lat / count) as f32,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -671,12 +929,22 @@ pub fn fetch_active_cyclones(
     }
 }
 
-/// Fetch one storm's track/cone geometry from its `geometry_url` (GDACS).
+/// Fetch one storm's forecast geometry from its `geometry_url`, parsed per
+/// source: GDACS `getgeometry` yields track + cone + forecast points; the NHC
+/// forecast-advisory (TCM) yields forecast points (with per-point wind) only.
 pub fn fetch_storm_geometry(
     client: &reqwest::blocking::Client,
+    source: Source,
     url: &str,
 ) -> Result<StormGeometry, String> {
-    parse_gdacs_geometry(&fetch_text(client, url)?)
+    let body = fetch_text(client, url)?;
+    match source {
+        Source::Gdacs => parse_gdacs_geometry(&body),
+        Source::Nhc => Ok(StormGeometry {
+            forecast: parse_nhc_forecast_advisory(&body),
+            ..StormGeometry::default()
+        }),
+    }
 }
 
 fn fetch_text(client: &reqwest::blocking::Client, url: &str) -> Result<String, String> {
@@ -697,6 +965,14 @@ mod tests {
     const NHC: &str = include_str!("../tests/fixtures/tropical/nhc_active_storms.json");
     const GDACS_LIST: &str = include_str!("../tests/fixtures/tropical/gdacs_tc_list.json");
     const GDACS_GEOM: &str = include_str!("../tests/fixtures/tropical/gdacs_bavi_geometry.json");
+    // Real products captured live for the forecast-dot feature:
+    //  - a trimmed BAVI-26 `getgeometry` carrying `Point_Polygon_Point_*`
+    //    forecast points (real centers/keys/`todate`, minimal rings), and
+    //  - Hurricane Milton's actual Forecast/Advisory (TCM) #15 (AL142024).
+    const GDACS_FCST: &str =
+        include_str!("../tests/fixtures/tropical/gdacs_bavi_forecast_geometry.json");
+    const NHC_TCM: &str =
+        include_str!("../tests/fixtures/tropical/nhc_milton_forecast_advisory.txt");
 
     #[test]
     fn nhc_parses_storm_vitals() {
@@ -752,6 +1028,135 @@ mod tests {
         assert!((centroid.lon - 148.9).abs() < 1.0);
         assert!(!geometry.track.is_empty(), "track points present");
         assert!(geometry.cone.len() >= 3, "cone is a polygon ring");
+    }
+
+    #[test]
+    fn nhc_tcm_parses_forecast_points_with_intensity() {
+        // Milton (AL142024) advisory 15, issued 2100 UTC TUE OCT 08 2024.
+        let fc = parse_nhc_forecast_advisory(NHC_TCM);
+        // 6 `FORECAST VALID` (to day 3) + 2 `OUTLOOK VALID` (days 4–5).
+        assert_eq!(fc.len(), 8, "forecast + outlook points");
+
+        // First point: FORECAST VALID 09/0600Z 23.8N 86.4W / MAX WIND 145 KT.
+        let first = &fc[0];
+        assert!((first.position.lat - 23.8).abs() < 1e-3);
+        assert!(
+            (first.position.lon + 86.4).abs() < 1e-3,
+            "W longitude is negative"
+        );
+        assert_eq!(first.max_wind_kt, Some(145.0));
+        assert_eq!(
+            first.max_wind_kt.map(Category::from_wind_kt),
+            Some(Category::Five)
+        );
+        let expect = NaiveDate::from_ymd_opt(2024, 10, 9)
+            .unwrap()
+            .and_hms_opt(6, 0, 0)
+            .unwrap()
+            .and_utc();
+        assert_eq!(first.valid_time, Some(expect));
+
+        // Per-point intensity really varies (the whole point of the feature):
+        // 145 → 130 → 110 → 75 kt, i.e. Cat 5 → 4 → 3 → 1.
+        assert_eq!(
+            fc[1].max_wind_kt.map(Category::from_wind_kt),
+            Some(Category::Four)
+        );
+        assert_eq!(
+            fc[2].max_wind_kt.map(Category::from_wind_kt),
+            Some(Category::Three)
+        );
+        assert_eq!(
+            fc[3].max_wind_kt.map(Category::from_wind_kt),
+            Some(Category::One)
+        );
+        assert_eq!(
+            fc[5].max_wind_kt.map(Category::from_wind_kt),
+            Some(Category::TropicalStorm)
+        );
+
+        // Valid times are strictly increasing.
+        for pair in fc.windows(2) {
+            assert!(pair[0].valid_time.unwrap() < pair[1].valid_time.unwrap());
+        }
+    }
+
+    #[test]
+    fn nhc_tcm_time_rolls_over_month_and_year() {
+        // Synthetic edge check only: a late-December advisory whose forecast
+        // days wrap into January of the next year (no live storm exercises it).
+        let text = "\
+0300 UTC WED DEC 31 2025
+FORECAST VALID 31/1200Z 25.0N 70.0W
+MAX WIND 60 KT...GUSTS 75 KT.
+FORECAST VALID 02/0000Z 28.0N 68.0W
+MAX WIND 50 KT...GUSTS 65 KT.
+";
+        let fc = parse_nhc_forecast_advisory(text);
+        assert_eq!(fc.len(), 2);
+        assert_eq!(
+            fc[0].valid_time,
+            NaiveDate::from_ymd_opt(2025, 12, 31)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .map(|dt| dt.and_utc())
+        );
+        assert_eq!(
+            fc[1].valid_time,
+            NaiveDate::from_ymd_opt(2026, 1, 2)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .map(|dt| dt.and_utc())
+        );
+    }
+
+    #[test]
+    fn gdacs_geometry_extracts_forecast_points() {
+        let geom = parse_gdacs_geometry(GDACS_FCST).expect("parse");
+        // Still yields the observed pieces.
+        let centroid = geom.centroid.expect("centroid");
+        assert!((centroid.lon - 145.0).abs() < 0.5 && (centroid.lat - 14.3).abs() < 0.5);
+        assert!(!geom.track.is_empty());
+        assert!(geom.cone.len() >= 3);
+
+        // Analysis time is 2026-07-06T00:00Z; only strictly-later points are
+        // forecast, so past points 18/19 and the current point 20 drop out and
+        // 21/22/28 remain, in chronological order.
+        assert_eq!(geom.forecast.len(), 3, "future-only");
+        let f0 = &geom.forecast[0];
+        assert!((f0.position.lon - 142.5).abs() < 1e-2);
+        assert!((f0.position.lat - 15.1).abs() < 1e-2);
+        assert_eq!(
+            f0.valid_time,
+            NaiveDate::from_ymd_opt(2026, 7, 6)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .map(|dt| dt.and_utc())
+        );
+        // GDACS repeats only the current severity, so there is no honest
+        // per-point forecast wind — left None (dot inherits current category).
+        assert!(geom.forecast.iter().all(|p| p.max_wind_kt.is_none()));
+
+        let last = geom.forecast.last().unwrap();
+        assert!((last.position.lon - 122.4).abs() < 1e-2);
+        assert_eq!(
+            last.valid_time,
+            NaiveDate::from_ymd_opt(2026, 7, 11)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .map(|dt| dt.and_utc())
+        );
+
+        let reference = NaiveDate::from_ymd_opt(2026, 7, 6)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        assert!(
+            geom.forecast
+                .iter()
+                .all(|p| p.valid_time.unwrap() > reference)
+        );
     }
 
     #[test]

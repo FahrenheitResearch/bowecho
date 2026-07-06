@@ -1,0 +1,358 @@
+{
+ "type": "FeatureCollection",
+ "features": [
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Point",
+    "coordinates": [
+     145.0,
+     14.3
+    ]
+   },
+   "properties": {
+    "Class": "Point_Centroid",
+    "eventname": "BAVI-26",
+    "eventid": 1001279,
+    "episodeid": 21,
+    "alertlevel": "Red"
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       145.0,
+       14.05
+      ],
+      [
+       145.009,
+       14.0502
+      ],
+      [
+       145.018,
+       14.0506
+      ],
+      [
+       145.027,
+       14.0514
+      ],
+      [
+       145.0359,
+       14.0524
+      ],
+      [
+       145.0448,
+       14.0538
+      ]
+     ]
+    ]
+   },
+   "properties": {
+    "Class": "Poly_Cones",
+    "eventname": "BAVI-26"
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "LineString",
+    "coordinates": [
+     [
+      126.2,
+      21.7
+     ],
+     [
+      122.4,
+      25.9
+     ]
+    ]
+   },
+   "properties": {
+    "Class": "Line_Line_0",
+    "eventname": "BAVI-26"
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "LineString",
+    "coordinates": [
+     [
+      129.7,
+      18.6
+     ],
+     [
+      126.2,
+      21.7
+     ]
+    ]
+   },
+   "properties": {
+    "Class": "Line_Line_1",
+    "eventname": "BAVI-26"
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       146.9,
+       13.67
+      ],
+      [
+       146.93,
+       13.7
+      ],
+      [
+       146.9,
+       13.73
+      ],
+      [
+       146.87,
+       13.7
+      ],
+      [
+       146.9,
+       13.67
+      ]
+     ]
+    ]
+   },
+   "properties": {
+    "Class": "Point_Polygon_Point_18",
+    "eventname": "BAVI-26",
+    "key": "07051200",
+    "polygonlabel": "05/07 12:00 UTC",
+    "todate": "2026-07-06T00:00:00",
+    "featuretype": "PointRadii",
+    "severitydata": {
+     "severity": 287.0352,
+     "severitytext": "Hurricane/Typhoon > 74 mph (maximum wind speed of 287 km/h)",
+     "severityunit": "km/h"
+    }
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       146.1,
+       13.97
+      ],
+      [
+       146.13,
+       14.0
+      ],
+      [
+       146.1,
+       14.03
+      ],
+      [
+       146.07,
+       14.0
+      ],
+      [
+       146.1,
+       13.97
+      ]
+     ]
+    ]
+   },
+   "properties": {
+    "Class": "Point_Polygon_Point_19",
+    "eventname": "BAVI-26",
+    "key": "07051800",
+    "polygonlabel": "05/07 18:00 UTC",
+    "todate": "2026-07-06T00:00:00",
+    "featuretype": "PointRadii",
+    "severitydata": {
+     "severity": 287.0352,
+     "severitytext": "Hurricane/Typhoon > 74 mph (maximum wind speed of 287 km/h)",
+     "severityunit": "km/h"
+    }
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       145.0,
+       14.27
+      ],
+      [
+       145.03,
+       14.3
+      ],
+      [
+       145.0,
+       14.33
+      ],
+      [
+       144.97,
+       14.3
+      ],
+      [
+       145.0,
+       14.27
+      ]
+     ]
+    ]
+   },
+   "properties": {
+    "Class": "Point_Polygon_Point_20",
+    "eventname": "BAVI-26",
+    "key": "07060000",
+    "polygonlabel": "06/07 00:00 UTC",
+    "todate": "2026-07-06T00:00:00",
+    "featuretype": "PointRadii",
+    "severitydata": {
+     "severity": 287.0352,
+     "severitytext": "Hurricane/Typhoon > 74 mph (maximum wind speed of 287 km/h)",
+     "severityunit": "km/h"
+    }
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       142.5,
+       15.07
+      ],
+      [
+       142.53,
+       15.1
+      ],
+      [
+       142.5,
+       15.13
+      ],
+      [
+       142.47,
+       15.1
+      ],
+      [
+       142.5,
+       15.07
+      ]
+     ]
+    ]
+   },
+   "properties": {
+    "Class": "Point_Polygon_Point_21",
+    "eventname": "BAVI-26",
+    "key": "07061200",
+    "polygonlabel": "06/07 12:00 UTC",
+    "todate": "2026-07-06T00:00:00",
+    "featuretype": "PointRadii",
+    "severitydata": {
+     "severity": 287.0352,
+     "severitytext": "Hurricane/Typhoon > 74 mph (maximum wind speed of 287 km/h)",
+     "severityunit": "km/h"
+    }
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       139.7,
+       15.77
+      ],
+      [
+       139.73,
+       15.8
+      ],
+      [
+       139.7,
+       15.83
+      ],
+      [
+       139.67,
+       15.8
+      ],
+      [
+       139.7,
+       15.77
+      ]
+     ]
+    ]
+   },
+   "properties": {
+    "Class": "Point_Polygon_Point_22",
+    "eventname": "BAVI-26",
+    "key": "07070000",
+    "polygonlabel": "07/07 00:00 UTC",
+    "todate": "2026-07-06T00:00:00",
+    "featuretype": "PointRadii",
+    "severitydata": {
+     "severity": 287.0352,
+     "severitytext": "Hurricane/Typhoon > 74 mph (maximum wind speed of 287 km/h)",
+     "severityunit": "km/h"
+    }
+   }
+  },
+  {
+   "type": "Feature",
+   "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+     [
+      [
+       122.4,
+       25.87
+      ],
+      [
+       122.43,
+       25.9
+      ],
+      [
+       122.4,
+       25.93
+      ],
+      [
+       122.37,
+       25.9
+      ],
+      [
+       122.4,
+       25.87
+      ]
+     ]
+    ]
+   },
+   "properties": {
+    "Class": "Point_Polygon_Point_28",
+    "eventname": "BAVI-26",
+    "key": "07110000",
+    "polygonlabel": "11/07 00:00 UTC",
+    "todate": "2026-07-06T00:00:00",
+    "featuretype": "PointRadii",
+    "severitydata": {
+     "severity": 287.0352,
+     "severitytext": "Hurricane/Typhoon > 74 mph (maximum wind speed of 287 km/h)",
+     "severityunit": "km/h"
+    }
+   }
+  }
+ ]
+}

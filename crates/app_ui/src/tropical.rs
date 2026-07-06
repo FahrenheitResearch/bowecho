@@ -95,6 +95,17 @@ impl TropicalState {
         if let SlotPoll::Ready(Ok((id, geom))) = self.geometry_rx.poll() {
             self.geometry.insert(id, geom);
         }
+        // Mirror each storm's parsed forecast points onto its record so
+        // `TropicalCyclone.forecast` is populated for the overlay/hover. The
+        // geometry map is the transport (filled by the 2nd fetch); a fresh
+        // storms list arrives with empty forecasts, so re-attach every poll.
+        for storm in &mut self.storms {
+            if let Some(geom) = self.geometry.get(&storm.id)
+                && storm.forecast != geom.forecast
+            {
+                storm.forecast = geom.forecast.clone();
+            }
+        }
     }
 
     /// Progressively fetch missing track/cone geometry, one storm at a time.
@@ -109,10 +120,11 @@ impl TropicalState {
             .find(|storm| storm.geometry_url.is_some() && !self.geometry.contains_key(&storm.id));
         if let Some(storm) = next {
             let id = storm.id.clone();
+            let source = storm.source;
             let url = storm.geometry_url.clone().expect("checked is_some");
             self.geometry_rx.spawn(ctx, move |tx| {
                 let result = tropical_http_client()
-                    .and_then(|client| tropical::fetch_storm_geometry(&client, &url))
+                    .and_then(|client| tropical::fetch_storm_geometry(&client, source, &url))
                     .map(|geom| (id, geom));
                 let _ = tx.send(result);
             });
@@ -346,8 +358,67 @@ impl crate::ViewerApp {
                 );
             }
         }
-        painter.extend(shapes);
+        // Forecast track: a thin line joining the current position to each
+        // official forecast point, drawn under the dots.
+        let mut forecast_lines: Vec<egui::Shape> = Vec::new();
+        for storm in &self.tropical.storms {
+            if storm.forecast.is_empty() {
+                continue;
+            }
+            let mut path: Vec<egui::Pos2> = Vec::with_capacity(storm.forecast.len() + 1);
+            path.push(self.lon_lat_to_screen(rect, storm.position.lon, storm.position.lat));
+            for point in &storm.forecast {
+                path.push(self.lon_lat_to_screen(rect, point.position.lon, point.position.lat));
+            }
+            crate::push_solid_open_line(
+                &mut forecast_lines,
+                &path,
+                egui::Stroke::new(
+                    1.5,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170),
+                ),
+                rect,
+                jump_px,
+            );
+        }
+        painter.extend(forecast_lines);
 
+        // Forecast dots, colored by each point's Saffir–Simpson category (NHC
+        // carries per-point wind; GDACS points inherit the storm's current
+        // category). Track the dot nearest the cursor for a stats tooltip.
+        let hover = painter
+            .ctx()
+            .pointer_hover_pos()
+            .filter(|p| rect.contains(*p));
+        let mut nearest: Option<(f32, egui::Pos2, Vec<String>, egui::Color32)> = None;
+        for storm in &self.tropical.storms {
+            for point in &storm.forecast {
+                let pos = self.lon_lat_to_screen(rect, point.position.lon, point.position.lat);
+                if !rect.expand(40.0).contains(pos) {
+                    continue;
+                }
+                let category = point
+                    .max_wind_kt
+                    .map(Category::from_wind_kt)
+                    .or(storm.category);
+                let color = category_color(category);
+                painter.circle_filled(pos, 5.0, color);
+                painter.circle_stroke(pos, 5.0, egui::Stroke::new(1.5, egui::Color32::BLACK));
+                if let Some(hp) = hover {
+                    let dist = hp.distance(pos);
+                    if dist <= 9.0 && nearest.as_ref().is_none_or(|(best, ..)| dist < *best) {
+                        nearest = Some((
+                            dist,
+                            pos,
+                            forecast_tooltip_lines(storm, point, category),
+                            color,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Current-position glyph (drawn last so it sits above the forecast).
         for storm in &self.tropical.storms {
             let pos = self.lon_lat_to_screen(rect, storm.position.lon, storm.position.lat);
             if !rect.expand(60.0).contains(pos) {
@@ -366,5 +437,75 @@ impl crate::ViewerApp {
                 egui::Color32::BLACK,
             );
         }
+
+        if let Some((_, anchor, lines, accent)) = nearest {
+            draw_forecast_tooltip(painter, anchor, &lines, accent);
+        }
+    }
+}
+
+/// The hover-stats lines for one forecast point: valid time (UTC + viewer
+/// local), max wind (kt + mph) where the office gives it, and the category.
+fn forecast_tooltip_lines(
+    storm: &TropicalCyclone,
+    point: &tropical::ForecastPoint,
+    category: Option<Category>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(valid) = point.valid_time {
+        let local = valid.with_timezone(&chrono::Local);
+        lines.push(format!(
+            "{}  ({} local)",
+            valid.format("%a %d %b %H:%MZ"),
+            local.format("%H:%M")
+        ));
+    }
+    match point.max_wind_kt {
+        Some(kt) => lines.push(format!(
+            "{:.0} kt · {:.0} mph",
+            kt,
+            kt / tropical::KT_PER_MPH
+        )),
+        None => lines.push("intensity: storm's current estimate".to_owned()),
+    }
+    if let Some(category) = category {
+        lines.push(category.label(storm.basin));
+    }
+    lines
+}
+
+/// A small dark stats card anchored at a forecast dot.
+fn draw_forecast_tooltip(
+    painter: &egui::Painter,
+    anchor: egui::Pos2,
+    lines: &[String],
+    accent: egui::Color32,
+) {
+    let font = egui::FontId::proportional(12.0);
+    let galleys: Vec<_> = lines
+        .iter()
+        .map(|line| painter.layout_no_wrap(line.clone(), font.clone(), egui::Color32::WHITE))
+        .collect();
+    let pad = 6.0;
+    let width = galleys.iter().map(|g| g.size().x).fold(0.0_f32, f32::max) + pad * 2.0;
+    let height = galleys.iter().map(|g| g.size().y).sum::<f32>() + pad * 2.0;
+    let origin = anchor + egui::vec2(12.0, -height - 8.0);
+    let panel = egui::Rect::from_min_size(origin, egui::vec2(width, height));
+    painter.rect_filled(
+        panel,
+        4.0,
+        egui::Color32::from_rgba_unmultiplied(12, 15, 20, 235),
+    );
+    painter.rect_stroke(
+        panel,
+        4.0,
+        egui::Stroke::new(1.0, accent),
+        egui::StrokeKind::Outside,
+    );
+    let mut y = origin.y + pad;
+    for galley in galleys {
+        let advance = galley.size().y;
+        painter.galley(egui::pos2(origin.x + pad, y), galley, egui::Color32::WHITE);
+        y += advance;
     }
 }
