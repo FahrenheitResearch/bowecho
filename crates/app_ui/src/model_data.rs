@@ -644,7 +644,9 @@ impl ModelDataDock {
         enum PollResult {
             Idle,
             Progress(String),
-            Finished { message: String },
+            Finished {
+                message: String,
+            },
             /// A synthetic-radar job finished: its volumes go to the app to
             /// loop, not to the store, so this carries the output out.
             FinishedSynthetic {
@@ -1321,9 +1323,7 @@ impl ModelDataDock {
                         .id_salt("wrf_planned_fields")
                         .max_height(110.0)
                         .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(planned.join(", ")).small().weak(),
-                            );
+                            ui.label(egui::RichText::new(planned.join(", ")).small().weak());
                         });
                 }
             });
