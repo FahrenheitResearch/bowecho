@@ -1,0 +1,101 @@
+# WRF full-diagnostics import on large grids — crash forensics + memory fix
+
+**Scope:** the "Process WRF" full-diagnostics import (`crates/app_ui/src/wrf_process.rs`
+→ `read_wrf_products` → ~80 `wrf-core` `getvar` diagnostics), FABLE_BACKLOG issue #9.
+Investigated 2026-07-06 on the real Enderlin 250 m wrfouts
+(`wrfout_d03_*`, 800×800×79 ≈ 50.5 M cells, ~2 GB each).
+
+## Symptom as reported
+
+The default full-diagnostics pass on the 2 GB Enderlin file "aborts `0xffffffff`
+at ~5.9 GB working set" on a 64 GB machine; the live release app also died
+mid-import.
+
+## What the investigation established (real data, release builds)
+
+1. **The import completes.** An instrumented release run
+   (`wrf_process::tests::optional_real_fixture_default_import_instrumented`,
+   env-gated on `RW_WRF_CRASH_FIXTURE`, per-diagnostic progress to stderr) of the
+   exact dock-button path on `wrfout_d03_2025-06-21_02_15_00` finished in
+   **274.9 s** on a quiet machine, wrote **117 variables** (all core fields +
+   `*_iso` sounding volumes + the full severe-diagnostic suite), exit 0. The
+   2.50 GB `05_15_00` derecho file (the family the live app was loading)
+   also completes.
+2. **`0xffffffff` is not a Rust failure code.** Probed on this exact
+   toolchain (MSVC): `std::process::abort` and allocation failure exit
+   `0xC0000409`, stack overflow exits `0xC00000FD`, a plain panic exits `101`,
+   and a panic on a non-main thread doesn't kill the process at all. The ONLY
+   mechanism that produces `0xffffffff` is `std::process::exit(-1)` /
+   `TerminateProcess(h, -1)` — i.e. an **external kill**. No `process::exit`
+   is reachable from the import path in this workspace, wrf-core, ecape-rs, or
+   the rusty-weather crates (grep-verified). The observed abort matches an
+   agent-tool timeout killing a **debug-profile** run (debug is 20–40× slower:
+   ~2–3 h for this pass; at a 10-minute kill a debug run sits mid-CAPE-suite at
+   ~5.5–6.2 GB — exactly the reported "~5.9 GB").
+3. **The real defect is the peak working set**, which is what melted the
+   machine and set up the RAM-contention app crash (backlog #2): peak
+   **8.87 GB for a 2 GB file** (measured 1 s sampling). Root cause:
+   `wrf-core`'s `WrfFile` memoizes every 3-D **f64** intermediate (~400 MB
+   each at 50.5 M cells — full pressure, theta, temperature, geopotential,
+   height MSL/AGL, QVAPOR, destaggered U/V, …) and only evicts when the
+   *timestep changes* (`prepare_cache_for_time`, `compute.rs:137`). Its
+   `clear_cache()` (`file.rs:407-415`) claims it is "called automatically
+   after each getvar call" — **nothing calls it, anywhere**. The ~4.5 GB cache
+   is still resident during the end-of-hour store write, where the global peak
+   landed.
+
+## Fixes in this app (wrf_process.rs, wrf_volumes.rs)
+
+- `read_wrf_products` now calls `file.clear_cache()` after the last `getvar`
+  of the hour (post iso-volumes, pre store-write), releasing the ~5 GB of
+  3-D intermediates before `write_hour_from_fields_with_derived` runs.
+  Measured on the Enderlin file: working set falls 8.8 GB → ~1 GB at that
+  point instead of riding through the write; zero recompute cost.
+- `build_iso_volumes` no longer duplicates its biggest arrays: the `uvmet`
+  U/V halves are split zero-copy (`split_off`) instead of `to_vec`-ing both
+  halves while the 800 MB source was alive, and the dewpoint °C→K conversion
+  is done in place instead of allocating a second ~400 MB array. Measured
+  global peak: **8.87 GB → 8.24 GB**.
+- **Anti-fix, measured and rejected:** clearing the cache *before* the
+  volume build more than DOUBLED the peak (18.3 GB) — every volume read then
+  recomputes its whole dependency chain (staggered reads, destaggering,
+  theta→T…) with multi-hundred-MB transients stacking on the re-growing
+  cache. The cache must stay warm through the volume build.
+- Every diagnostic (and the iso-volume builder) is wrapped in
+  `isolate_panics` (`catch_unwind`): a panic inside wrf-core/ecape-rs on a
+  pathological grid or profile now degrades to a per-field
+  "`panicked computing <name>: …`" note instead of unwinding the
+  `rw-ui-wrf-process` worker and losing the whole import.
+- The remaining ~8 GB peak is cache-dominated (mid-diagnostics ~7.9 GB floor)
+  and can only be lowered upstream — see below.
+
+## Upstream patch wrf-rust should take (FahrenheitResearch/wrf-rust @ f05758d)
+
+`crates/wrf-core/src/file.rs:407-415` — `WrfFile::clear_cache`'s doc comment
+says it is "Called automatically after each `getvar` call so that 3-D
+intermediates (full_pressure, temperature, etc.) do not persist beyond the
+computation that needed them". That call does not exist. Either:
+
+- **(a) preferred:** bound the cache — track per-entry byte size in
+  `cached_or_compute` (`file.rs:419-436`) and evict oldest entries beyond a
+  budget (a few fields' worth, e.g. `3 * nz * ny * nx * 8` bytes), so a
+  50-diagnostic pass on a 50 M-cell grid stays a few hundred MB above its
+  transient floor instead of accumulating every intermediate; or
+- **(b) minimal:** make `compute::getvar` honour the documented contract by
+  releasing non-reusable intermediates, or fix the doc comment and document
+  that long multi-`getvar` sessions must call `clear_cache()` between hours
+  (what this app now does).
+
+Also worth noting upstream: `VarOutput.data` is `Vec<f64>` — every 2-D
+diagnostic hands back 8-byte floats that all consumers here immediately
+narrow to f32; an f32 output mode would halve both cache and transient sizes.
+
+## Operational guidance
+
+- Debug builds of this path are ~20–40× slower (hours, all cores pinned) —
+  never run the 250 m import under `cargo test` without `--release`/
+  `--profile release-fast`; tool-driven runs will hit their timeout and get
+  killed with exit `0xffffffff`, which looks like (but is not) a crash.
+- The repro/regression harness lives in `wrf_process.rs`
+  (`optional_real_fixture_default_import_instrumented`); point
+  `RW_WRF_CRASH_FIXTURE` at any wrfout and run with `--nocapture`.

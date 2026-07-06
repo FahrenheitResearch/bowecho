@@ -106,11 +106,15 @@ pub fn build_iso_volumes(
 
     // Earth-relative winds. `uvmet` returns [u_earth.., v_earth..]
     // (2 * nz * cells); fall back to grid-relative ua/va if it is unavailable
-    // or the interleaved layout is unexpected.
+    // or the interleaved layout is unexpected. Split without copying: on a
+    // 50 M-cell grid the two halves are ~400 MB each, and `to_vec`-ing them
+    // while the 800 MB source was still alive measurably spiked the peak
+    // working set of the whole import.
     let (u_wind, v_wind) = match read("uvmet") {
         Ok(uvmet) if uvmet.data.len() == 2 * nz * cells => {
-            let (u, v) = uvmet.data.split_at(nz * cells);
-            (u.to_vec(), v.to_vec())
+            let mut u = uvmet.data;
+            let v = u.split_off(nz * cells);
+            (u, v)
         }
         _ => {
             let ua = read("ua")?;
@@ -122,8 +126,12 @@ pub fn build_iso_volumes(
     };
 
     // Dewpoint arrives in degC from wrf-core's `td`; the shared interpolator
-    // works in Kelvin like every other field.
-    let dewpoint_k: Vec<f64> = td.data.iter().map(|value| value + 273.15).collect();
+    // works in Kelvin like every other field. Convert in place — a separate
+    // Kelvin copy is another ~400 MB on large grids.
+    let mut dewpoint_k = td.data;
+    for value in &mut dewpoint_k {
+        *value += 273.15;
+    }
     Ok(interpolate_iso_volumes(
         &pressure.data,
         &temp.data,

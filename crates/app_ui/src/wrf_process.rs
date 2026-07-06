@@ -648,8 +648,22 @@ fn read_wrf_products(
     // height_iso) so imported WRF runs produce skew-T soundings like the
     // downloaded models. Failure here never fails the hour — the 2D fields
     // still write; only the sounding is unavailable.
+    //
+    // NOTE: wrf-core's per-timestep intermediate cache (see the clear below)
+    // must stay WARM through this block. The volume build re-getvars
+    // pressure/temp/td/height/uvmet; with the cache populated by the
+    // diagnostics above those are cheap copies (measured peak 8.85 GB on the
+    // 800x800x79 Enderlin grid). Clearing the cache first was measured to
+    // more than DOUBLE the peak (18.3 GB): every read then recomputes its
+    // whole dependency chain (staggered reads, destaggering, theta->T, …)
+    // with multi-hundred-MB transients stacking on the re-growing cache.
     if options.core_fields {
-        match build_iso_volumes(file, timeidx, shape.len()) {
+        // Isolated for the same reason as `compute_var`: the volume builder's
+        // `getvar` reads must degrade to a note, not kill the hour.
+        let volumes_result = isolate_panics("isobaric volumes", || {
+            build_iso_volumes(file, timeidx, shape.len())
+        });
+        match volumes_result {
             Ok((volumes, surface)) => {
                 fields.volumes = volumes;
                 // Split wrf3d files (CONUS404 / GDEX CONUS-II) omit PSFC (and
@@ -662,6 +676,21 @@ fn read_wrf_products(
                 .push(format!("WRF isobaric sounding volumes unavailable: {err}")),
         }
     }
+
+    // Release wrf-core's per-timestep intermediate cache before the caller
+    // writes the hour to the store. `getvar` memoizes every 3-D f64
+    // intermediate (pressure, theta, temperature, geopotential, heights,
+    // QVAPOR, destaggered winds, …) inside `WrfFile` and only evicts when the
+    // *timestep changes* (`prepare_cache_for_time`); its `clear_cache` is
+    // never invoked upstream despite its doc comment. On a 250 m Enderlin
+    // grid (800x800x79 ≈ 50.5 M cells, ~400 MB per cached field) that cache
+    // holds ~5 GB. Dropping it here — after the hour's last `getvar`, before
+    // `write_hour_from_fields_with_derived` — releases that memory for the
+    // write phase and beyond at zero recompute cost (measured: working set
+    // fell 8.8 GB -> 1.3 GB at this point instead of riding the write).
+    // catch_unwind: if a caught diagnostic panic above poisoned the cache
+    // mutex, clearing would re-panic; a stuck cache must not fail the hour.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| file.clear_cache()));
 
     Ok(fields)
 }
@@ -839,7 +868,30 @@ fn compute_var(
         units: units.map(str::to_string),
         ..ComputeOpts::default()
     };
-    getvar(file, name, Some(timeidx), &opts).map_err(|err| err.to_string())
+    // Isolate each diagnostic: a panic inside wrf-core (or a crate it calls
+    // into, e.g. ecape-rs) on a pathological grid/profile must cost that ONE
+    // field — recorded as a note — not the whole multi-minute import. Without
+    // this, the unwind kills the rw-ui-wrf-process worker and the entire
+    // import dies with "WRF worker stopped unexpectedly".
+    isolate_panics(name, || {
+        getvar(file, name, Some(timeidx), &opts).map_err(|err| err.to_string())
+    })
+}
+
+/// Run `f`, converting a panic into an `Err` naming `what`, so one failing
+/// field computation degrades to a per-field note instead of unwinding the
+/// import worker thread. Inputs are shared references (plus `WrfFile`'s
+/// internal mutex, which poisons — and is then handled — rather than being
+/// observed broken), so `AssertUnwindSafe` is sound here.
+fn isolate_panics<T>(what: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|msg| (*msg).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        Err(format!("panicked computing {what}: {message}"))
+    })
 }
 
 fn total_precip(file: &WrfFile, timeidx: usize, cells: usize) -> Option<Vec<f32>> {
@@ -1277,6 +1329,95 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// Instrumented harness for the large-grid full-diagnostics "crash"
+    /// (FABLE_BACKLOG #9): runs the DEFAULT full-diagnostics import — the
+    /// exact path the "Process WRF" dock button drives, including the same
+    /// `spawn_process_paths` worker-thread configuration — on the wrfout named
+    /// by `RW_WRF_CRASH_FIXTURE`, forwarding every Progress message to stderr
+    /// with a timestamp so any abort pinpoints WHICH diagnostic died. Run with
+    /// `--nocapture` and stderr captured to a file. Env-gated like the sibling
+    /// fixtures; heavy — release builds only on large grids.
+    ///
+    /// Findings from the 2026-07-06 investigation (Enderlin 250 m,
+    /// 800x800x79): the import COMPLETES in optimized builds (~275 s,
+    /// 117 variables) — the reported `0xffffffff` abort was an external
+    /// kill (only `process::exit(-1)`-style termination yields that code on
+    /// this toolchain; a Rust abort/alloc-failure is 0xC0000409, a stack
+    /// overflow 0xC00000FD, a panic 101), i.e. a tool-timeout kill of a
+    /// 20-40x-slower debug run — not an in-process bug. See
+    /// docs/wrf-import-large-grids.md.
+    #[test]
+    fn optional_real_fixture_default_import_instrumented() {
+        let Some(fixture) = std::env::var_os("RW_WRF_CRASH_FIXTURE") else {
+            return;
+        };
+        let store = std::env::temp_dir().join(format!("rw-wrf-crash-repro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        let start = std::time::Instant::now();
+        let task = spawn_process_paths(
+            vec![PathBuf::from(fixture)],
+            store.clone(),
+            WrfProcessOptions::default(),
+        );
+        loop {
+            match task.rx.recv() {
+                Ok(WrfProcessMessage::Progress(line)) => {
+                    eprintln!("[{:9.2?}] {line}", start.elapsed());
+                }
+                Ok(WrfProcessMessage::Done(result)) => {
+                    let summary = result.expect("default full-diagnostics import should succeed");
+                    eprintln!(
+                        "[{:9.2?}] DONE: {} hour(s), {} variables: {}",
+                        start.elapsed(),
+                        summary.hours_written,
+                        summary.variables.len(),
+                        summary.variables.join(", ")
+                    );
+                    for note in &summary.notes {
+                        eprintln!("[note] {note}");
+                    }
+                    assert!(summary.hours_written >= 1);
+                    assert!(summary.variables.iter().any(|name| name == "sbcape"));
+                    break;
+                }
+                // Disconnected without Done == the worker thread panicked
+                // (a process-fatal abort never reaches this arm).
+                Err(err) => panic!(
+                    "[{:9.2?}] worker died without Done (panic in worker): {err}",
+                    start.elapsed()
+                ),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn isolate_panics_converts_panic_to_error_and_passes_results_through() {
+        assert_eq!(
+            isolate_panics("field_ok", || Ok::<_, String>(7)),
+            Ok(7),
+            "successful computations must pass through untouched"
+        );
+        assert_eq!(
+            isolate_panics("field_err", || Err::<(), _>("no such var".to_string())),
+            Err("no such var".to_string()),
+            "ordinary errors must pass through untouched"
+        );
+        let caught = isolate_panics::<()>("sbcape", || panic!("index out of bounds: 42"));
+        assert_eq!(
+            caught,
+            Err("panicked computing sbcape: index out of bounds: 42".to_string()),
+            "a panicking diagnostic must degrade to a named per-field error"
+        );
+        let caught_string =
+            isolate_panics::<()>("srh3", || std::panic::panic_any("boom".to_string()));
+        assert_eq!(
+            caught_string,
+            Err("panicked computing srh3: boom".to_string()),
+            "String payloads must be extracted too"
+        );
     }
 
     #[test]
