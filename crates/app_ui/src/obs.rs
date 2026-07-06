@@ -800,6 +800,55 @@ mod tests {
         );
     }
 
+    /// End-to-end proof for the station-history timeline on REAL data:
+    /// fetch the live global METAR window, pool it, then pull the busiest
+    /// station's multi-report series — the numeric temp/dewpoint/wind/
+    /// pressure track the sparkline draws. Needs >=2 timestamps so a line
+    /// (not a lone dot) renders.
+    #[test]
+    #[ignore]
+    fn live_station_series_feeds_timeline() {
+        let mut pool = ObPool::new();
+        pool.merge(fetch_iem_global_metar_obs().expect("fetch IEM global METARs"));
+        // Busiest reporter in the pooled window.
+        let (station, count) = pool
+            .by_station
+            .iter()
+            .map(|(id, list)| (id.clone(), list.len()))
+            .max_by_key(|(_, n)| *n)
+            .expect("pool has at least one station");
+        println!("busiest station {station}: {count} reports in window");
+        assert!(
+            count >= 2,
+            "expected a sub-hourly reporter with >=2 obs for a timeline line"
+        );
+        let now = Utc::now();
+        let series = pool.station_series(&station, now - chrono::Duration::hours(3), now);
+        assert!(series.len() >= 2, "series should carry the pooled reports");
+        // Times strictly ascending (the sparkline assumes it).
+        for pair in series.windows(2) {
+            assert!(pair[0].time_utc <= pair[1].time_utc, "series must be sorted");
+        }
+        // At least one numeric channel present per report -> something to plot.
+        assert!(
+            series.iter().all(|ob| ob.temp_c.is_some()
+                || ob.dewpoint_c.is_some()
+                || ob.wind_speed_kt.is_some()
+                || ob.altim_in_hg.is_some()),
+            "every pooled report should have a plottable value"
+        );
+        for ob in &series {
+            println!(
+                "  {} T={:?} Td={:?} wind={:?} alt={:?}",
+                ob.time_utc.map(|t| t.format("%H:%MZ").to_string()).unwrap_or_default(),
+                ob.temp_c,
+                ob.dewpoint_c,
+                ob.wind_speed_kt,
+                ob.altim_in_hg
+            );
+        }
+    }
+
     #[test]
     fn parses_nws_latest_observation_units() {
         let value = serde_json::json!({

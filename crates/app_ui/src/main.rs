@@ -4049,6 +4049,13 @@ struct ObsHistoryRow {
     wind_text: String,
     pressure_text: String,
     network: String,
+    // Raw numeric values (SI-ish: °C, knots, inHg) for the sparkline
+    // timeline; the *_text fields above stay for the readout table.
+    temp_c: Option<f32>,
+    dewpoint_c: Option<f32>,
+    wind_speed_kt: Option<f32>,
+    wind_gust_kt: Option<f32>,
+    altim_in_hg: Option<f32>,
 }
 
 struct ObsHistoryData {
@@ -29194,12 +29201,12 @@ impl ViewerApp {
             } else {
                 format!("{} {}", ob.station_id, ob.network)
             };
-            if ui.button(format!("Pin {label} 3h table")).clicked() {
+            if ui.button(format!("Pin {label} 3h timeline")).clicked() {
                 self.pin_obs_history(ob);
                 ui.close();
             }
             if self.pinned_obs_chart_station.as_deref() == Some(ob.station_id.as_str())
-                && ui.button("Clear obs table").clicked()
+                && ui.button("Clear obs timeline").clicked()
             {
                 self.pinned_obs_chart_station = None;
                 ui.close();
@@ -36157,6 +36164,11 @@ impl ViewerApp {
                     wind_text,
                     pressure_text,
                     network: ob.network.clone(),
+                    temp_c: ob.temp_c,
+                    dewpoint_c: ob.dewpoint_c,
+                    wind_speed_kt: ob.wind_speed_kt,
+                    wind_gust_kt: ob.wind_gust_kt,
+                    altim_in_hg: ob.altim_in_hg,
                 })
             })
             .collect();
@@ -37245,7 +37257,11 @@ impl ViewerApp {
             .iter()
             .map(|line| painter.layout_no_wrap(line.clone(), font.clone(), text_color))
             .collect();
-        let max_history_rows = ((rect.height() - 130.0) / 13.5).clamp(4.0, 28.0) as usize;
+        // Graphical timeline strip (temp/dewpoint/wind/pressure sparklines
+        // plus a frame-time scrubber marker) rides above the text table.
+        let timeline_height = if obs_history.is_some() { 92.0 } else { 0.0 };
+        let max_history_rows =
+            ((rect.height() - 130.0 - timeline_height) / 13.5).clamp(4.0, 28.0) as usize;
         let history_rows_shown = obs_history
             .as_ref()
             .map(|history| history.rows.len().min(max_history_rows))
@@ -37262,8 +37278,8 @@ impl ViewerApp {
         let history_width = obs_history.as_ref().map(|_| 444.0).unwrap_or(0.0);
         let width = (galleys.iter().map(|g| g.size().x).fold(0.0f32, f32::max) + 14.0)
             .max(history_width + 14.0);
-        let history_extra = if history_height > 0.0 {
-            history_height + 8.0
+        let history_extra = if obs_history.is_some() {
+            history_height + timeline_height + 12.0
         } else {
             0.0
         };
@@ -37300,17 +37316,28 @@ impl ViewerApp {
             y += size.y + 2.0;
         }
         if let Some(history) = &obs_history {
-            let history_rect = egui::Rect::from_min_size(
-                egui::pos2(card.left() + 7.0, y + 3.0),
-                egui::vec2(width - 14.0, history_height),
-            );
-            draw_obs_history_table(
-                painter,
-                history_rect,
-                history,
-                history_rows_shown,
-                self.units(),
-            );
+            let mut strip_top = y + 3.0;
+            if timeline_height > 0.0 {
+                let timeline_rect = egui::Rect::from_min_size(
+                    egui::pos2(card.left() + 7.0, strip_top),
+                    egui::vec2(width - 14.0, timeline_height),
+                );
+                draw_obs_history_timeline(painter, timeline_rect, history, self.units());
+                strip_top = timeline_rect.bottom() + 4.0;
+            }
+            if history_height > 0.0 {
+                let history_rect = egui::Rect::from_min_size(
+                    egui::pos2(card.left() + 7.0, strip_top),
+                    egui::vec2(width - 14.0, history_height),
+                );
+                draw_obs_history_table(
+                    painter,
+                    history_rect,
+                    history,
+                    history_rows_shown,
+                    self.units(),
+                );
+            }
         }
     }
 
@@ -44915,6 +44942,281 @@ fn sync_run_pickers(download: &mut rw_ui::DownloadPanel, spec: &rw_ui::DownloadS
         }
         _ => download.set_hours_hint("no supported hours for this cycle".to_string()),
     }
+}
+
+/// One sparkline series in an obs-history band: points (ascending time) + colour.
+type ObsSparkSeries<'a> = (&'a [(DateTime<Utc>, f32)], egui::Color32);
+
+/// Compact graphical history strip for a pinned surface station: stacked
+/// sparklines of temperature/dewpoint, wind, and pressure across the 3 h
+/// window, all sharing one time axis (the "time bar"). A bright vertical
+/// marker sits at the currently displayed radar-frame time and slides as
+/// you scan an archived loop — the obs "scrubber". Every report is a dot;
+/// the report nearest the frame time is filled and read out on the right.
+fn draw_obs_history_timeline(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    history: &ObsHistoryData,
+    unit_system: units::Units,
+) {
+    if rect.width() < 220.0 || rect.height() < 60.0 {
+        return;
+    }
+    painter.rect_filled(
+        rect,
+        3.0,
+        egui::Color32::from_rgba_unmultiplied(4, 7, 11, 190),
+    );
+    let border = egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 62, 78));
+    painter.line_segment([rect.left_top(), rect.right_top()], border);
+    painter.line_segment([rect.right_top(), rect.right_bottom()], border);
+    painter.line_segment([rect.right_bottom(), rect.left_bottom()], border);
+    painter.line_segment([rect.left_bottom(), rect.left_top()], border);
+
+    // Time -> x across the fixed [start, end] window (guard a zero span).
+    let start = history.start_time;
+    let end = history.end_time.max(start + chrono::Duration::seconds(1));
+    let span_s = (end - start).num_seconds().max(1) as f32;
+    let label_w = 34.0_f32; // left gutter for the row label
+    let value_w = 52.0_f32; // right gutter for the frame readout
+    let plot_left = rect.left() + label_w;
+    let plot_right = rect.right() - value_w;
+    let plot_w = (plot_right - plot_left).max(10.0);
+    let x_of = |time: DateTime<Utc>| -> f32 {
+        let frac = ((time - start).num_seconds() as f32 / span_s).clamp(0.0, 1.0);
+        plot_left + frac * plot_w
+    };
+
+    let axis_h = 12.0_f32;
+    let rows_top = rect.top() + 4.0;
+    let rows_bottom = rect.bottom() - axis_h;
+    let row_gap = 3.0_f32;
+    let row_h = ((rows_bottom - rows_top) - row_gap * 2.0) / 3.0;
+
+    // Faint hour gridlines spanning the bands — a light "time bar".
+    {
+        use chrono::Timelike;
+        let grid_stroke =
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(70, 84, 104, 55));
+        let mut tick = start
+            .with_minute(0)
+            .and_then(|t| t.with_second(0))
+            .and_then(|t| t.with_nanosecond(0))
+            .unwrap_or(start);
+        if tick < start {
+            tick += chrono::Duration::hours(1);
+        }
+        while tick <= end {
+            let x = x_of(tick);
+            painter.line_segment(
+                [egui::pos2(x, rows_top), egui::pos2(x, rows_bottom)],
+                grid_stroke,
+            );
+            tick += chrono::Duration::hours(1);
+        }
+    }
+
+    // Numeric series (ascending time). Rows are stored newest-first.
+    let series_of = |extract: &dyn Fn(&ObsHistoryRow) -> Option<f32>| -> Vec<(DateTime<Utc>, f32)> {
+        let mut pts: Vec<(DateTime<Utc>, f32)> = history
+            .rows
+            .iter()
+            .filter_map(|row| Some((row.time_utc, extract(row)?)))
+            .collect();
+        pts.sort_by_key(|(time, _)| *time);
+        pts
+    };
+    let temp_pts = series_of(&|row| {
+        row.temp_c.map(|c| match unit_system {
+            units::Units::Imperial => c * 9.0 / 5.0 + 32.0,
+            units::Units::Metric => c,
+        })
+    });
+    let dew_pts = series_of(&|row| {
+        row.dewpoint_c.map(|c| match unit_system {
+            units::Units::Imperial => c * 9.0 / 5.0 + 32.0,
+            units::Units::Metric => c,
+        })
+    });
+    let wind_pts = series_of(&|row| row.wind_speed_kt);
+    let gust_pts = series_of(&|row| row.wind_gust_kt);
+    let pres_pts = series_of(&|row| row.altim_in_hg);
+
+    let frame_time = history.frame_time;
+    let nearest = |pts: &[(DateTime<Utc>, f32)]| -> Option<(DateTime<Utc>, f32)> {
+        pts.iter()
+            .copied()
+            .min_by_key(|(time, _)| (frame_time - *time).num_seconds().abs())
+    };
+
+    // Draw one band: sparkline(s) sharing a y-scale, with a nearest-frame
+    // dot + right-gutter readout per series.
+    let draw_band = |band_top: f32,
+                     series: &[ObsSparkSeries<'_>],
+                     label: &str,
+                     decimals: usize,
+                     suffix: &str| {
+        let band_bottom = band_top + row_h;
+        let band_mid = (band_top + band_bottom) * 0.5;
+        painter.line_segment(
+            [
+                egui::pos2(plot_left, band_bottom),
+                egui::pos2(plot_right, band_bottom),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(70, 84, 104, 90)),
+        );
+        painter.text(
+            egui::pos2(rect.left() + 4.0, band_mid),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::monospace(9.5),
+            egui::Color32::from_rgb(156, 213, 255),
+        );
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for (pts, _) in series {
+            for (_, value) in pts.iter() {
+                lo = lo.min(*value);
+                hi = hi.max(*value);
+            }
+        }
+        if !lo.is_finite() || !hi.is_finite() {
+            painter.text(
+                egui::pos2(plot_right + 4.0, band_mid),
+                egui::Align2::LEFT_CENTER,
+                "--",
+                egui::FontId::monospace(9.5),
+                egui::Color32::from_rgb(150, 160, 172),
+            );
+            return;
+        }
+        let pad = ((hi - lo) * 0.15).max(0.5);
+        let lo = lo - pad;
+        let hi = hi + pad;
+        let usable_h = (row_h - 3.0).max(2.0);
+        let y_of = |value: f32| -> f32 {
+            let frac = ((value - lo) / (hi - lo).max(1e-3)).clamp(0.0, 1.0);
+            band_bottom - 1.5 - frac * usable_h
+        };
+        let series_n = series.len();
+        for (idx, (pts, color)) in series.iter().enumerate() {
+            if pts.is_empty() {
+                continue;
+            }
+            if pts.len() >= 2 {
+                let poly: Vec<egui::Pos2> = pts
+                    .iter()
+                    .map(|(time, value)| egui::pos2(x_of(*time), y_of(*value)))
+                    .collect();
+                painter.add(egui::Shape::line(poly, egui::Stroke::new(1.4, *color)));
+            }
+            for (time, value) in pts.iter() {
+                painter.circle_filled(egui::pos2(x_of(*time), y_of(*value)), 1.2, *color);
+            }
+            if let Some((time, value)) = nearest(pts) {
+                let point = egui::pos2(x_of(time), y_of(value));
+                painter.circle_filled(point, 2.6, *color);
+                painter.circle_stroke(point, 2.6, egui::Stroke::new(0.8, egui::Color32::BLACK));
+                let dy = if series_n <= 1 {
+                    0.0
+                } else {
+                    (idx as f32 - (series_n as f32 - 1.0) * 0.5) * 10.0
+                };
+                painter.text(
+                    egui::pos2(plot_right + 4.0, band_mid + dy),
+                    egui::Align2::LEFT_CENTER,
+                    format!("{value:.decimals$}{suffix}"),
+                    egui::FontId::monospace(9.5),
+                    *color,
+                );
+            }
+        }
+    };
+
+    let band0 = rows_top;
+    let band1 = rows_top + row_h + row_gap;
+    let band2 = rows_top + 2.0 * (row_h + row_gap);
+    let temp_color = egui::Color32::from_rgb(244, 102, 92);
+    let dew_color = egui::Color32::from_rgb(92, 232, 134);
+    let wind_color = egui::Color32::from_rgb(120, 200, 240);
+    let gust_color = egui::Color32::from_rgb(240, 186, 96);
+    let pres_color = egui::Color32::from_rgb(235, 196, 120);
+    let temp_unit = match unit_system {
+        units::Units::Imperial => "F",
+        units::Units::Metric => "C",
+    };
+    draw_band(
+        band0,
+        &[
+            (temp_pts.as_slice(), temp_color),
+            (dew_pts.as_slice(), dew_color),
+        ],
+        "T/Td",
+        0,
+        temp_unit,
+    );
+    draw_band(
+        band1,
+        &[
+            (wind_pts.as_slice(), wind_color),
+            (gust_pts.as_slice(), gust_color),
+        ],
+        "wind",
+        0,
+        "kt",
+    );
+    draw_band(band2, &[(pres_pts.as_slice(), pres_color)], "pres", 2, "");
+
+    // Frame-time scrubber marker across the bands + a downward apex.
+    let marker_x = x_of(frame_time);
+    let marker_color = egui::Color32::from_rgb(255, 226, 120);
+    painter.line_segment(
+        [
+            egui::pos2(marker_x, rows_top),
+            egui::pos2(marker_x, rows_bottom + 1.0),
+        ],
+        egui::Stroke::new(1.4, marker_color),
+    );
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(marker_x - 3.0, rows_top),
+            egui::pos2(marker_x + 3.0, rows_top),
+            egui::pos2(marker_x, rows_top + 4.0),
+        ],
+        marker_color,
+        egui::Stroke::NONE,
+    ));
+
+    // Time axis (the "time bar") with start / end / frame labels.
+    let axis_y = rows_bottom + 2.0;
+    painter.line_segment(
+        [egui::pos2(plot_left, axis_y), egui::pos2(plot_right, axis_y)],
+        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(80, 96, 118, 120)),
+    );
+    let axis_font = egui::FontId::monospace(9.0);
+    let weak = egui::Color32::from_rgb(150, 160, 172);
+    painter.text(
+        egui::pos2(plot_left, axis_y + 1.0),
+        egui::Align2::LEFT_TOP,
+        start.format("%H:%MZ").to_string(),
+        axis_font.clone(),
+        weak,
+    );
+    painter.text(
+        egui::pos2(plot_right, axis_y + 1.0),
+        egui::Align2::RIGHT_TOP,
+        end.format("%H:%MZ").to_string(),
+        axis_font.clone(),
+        weak,
+    );
+    let frame_label_x = marker_x.clamp(plot_left + 22.0, plot_right - 22.0);
+    painter.text(
+        egui::pos2(frame_label_x, axis_y + 1.0),
+        egui::Align2::CENTER_TOP,
+        frame_time.format("%H:%MZ").to_string(),
+        axis_font,
+        marker_color,
+    );
 }
 
 fn draw_obs_history_table(
