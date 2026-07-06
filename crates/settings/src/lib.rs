@@ -278,6 +278,15 @@ pub struct AppSettings {
     /// warning families, keeping old configs sparse.
     #[serde(default)]
     pub alert_sound_families: Vec<String>,
+    /// Play a short "radar updated" cue (a whoosh) when the primary live
+    /// radar installs a new frame. Opt-in, default off so existing installs
+    /// stay quiet; reuses the warning alert-sound playback path.
+    #[serde(default)]
+    pub radar_update_sound_enabled: bool,
+    /// Optional custom `.wav` for the radar-updated cue. Empty = platform
+    /// system sound.
+    #[serde(default)]
+    pub radar_update_sound_path: String,
     /// Current-alert list sort mode in the Severe tab. Kept as a string so
     /// older/newer builds can preserve unknown operator preferences.
     #[serde(default = "default_current_alert_sort")]
@@ -692,6 +701,8 @@ impl Default for AppSettings {
             alert_sound_enabled: false,
             alert_sound_path: String::new(),
             alert_sound_families: Vec::new(),
+            radar_update_sound_enabled: false,
+            radar_update_sound_path: String::new(),
             current_alert_sort: default_current_alert_sort(),
             current_alert_filter: default_current_alert_filter(),
             storm_track_max_tracks: default_storm_track_max_tracks(),
@@ -1820,6 +1831,22 @@ mod tests {
         assert!(back.alert_sound_enabled);
         assert_eq!(back.alert_sound_path, "C:\\alerts\\warn.wav");
         assert_eq!(back.alert_sound_families, vec!["tornado".to_owned()]);
+    }
+
+    #[test]
+    fn radar_update_sound_settings_default_quiet_and_round_trip() {
+        let old = AppSettings::from_json("{}");
+        assert!(!old.radar_update_sound_enabled);
+        assert!(old.radar_update_sound_path.is_empty());
+
+        let s = AppSettings {
+            radar_update_sound_enabled: true,
+            radar_update_sound_path: "C:\\alerts\\whoosh.wav".to_owned(),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&s.to_json());
+        assert!(back.radar_update_sound_enabled);
+        assert_eq!(back.radar_update_sound_path, "C:\\alerts\\whoosh.wav");
     }
 
     #[test]

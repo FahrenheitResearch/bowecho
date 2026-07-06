@@ -349,6 +349,218 @@ mod alert_audio {
     }
 }
 
+/// How often the background warning watcher polls NWS active alerts. A modest
+/// fixed cadence — tighter than the foreground 30 s refresh so a minimized
+/// window still cues quickly, but slow enough to never busy-loop or hammer
+/// the API. The watcher sleeps this long between polls (no CPU spin).
+const ALERT_WATCH_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Snapshot of the alert-sound settings the background watcher reads each
+/// cycle. The foreground copies the current settings here every frame so
+/// runtime Settings edits (enable, custom WAV, family filter) take effect on
+/// the watcher's next poll without any cross-thread signalling.
+#[derive(Clone, Default)]
+struct AlertWatchConfig {
+    enabled: bool,
+    sound_path: String,
+    families: Vec<String>,
+}
+
+/// Cross-thread dedupe so the foreground refresh and the background watcher
+/// never double-play the same new warning: whichever notices a warning first
+/// CLAIMS its event id here; the other sees the claim and stays silent.
+#[derive(Default)]
+struct AlertSoundGate {
+    sounded_ids: BTreeSet<String>,
+}
+
+impl AlertSoundGate {
+    /// Record that `event_id` has been sounded. Returns `true` only the FIRST
+    /// time, so exactly one player emits the cue for a given warning.
+    fn claim(&mut self, event_id: &str) -> bool {
+        self.sounded_ids.insert(event_id.to_owned())
+    }
+
+    /// Forget warnings that are no longer active so the set stays bounded and
+    /// a re-issued id (rare, after expiry) can sound again.
+    fn retain_active(&mut self, active_ids: &BTreeSet<String>) {
+        self.sounded_ids.retain(|id| active_ids.contains(id));
+    }
+}
+
+/// Shared handle to the focus-independent background warning watcher. Cloned
+/// into the worker thread and kept on the app; `config` is written by the UI,
+/// `gate` dedupes playback across the two paths, `shutdown` stops the thread
+/// on exit.
+#[derive(Clone)]
+struct AlertWatchHandle {
+    config: Arc<Mutex<AlertWatchConfig>>,
+    gate: Arc<Mutex<AlertSoundGate>>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Default for AlertWatchHandle {
+    fn default() -> Self {
+        Self {
+            config: Arc::new(Mutex::new(AlertWatchConfig::default())),
+            gate: Arc::new(Mutex::new(AlertSoundGate::default())),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+impl AlertWatchHandle {
+    /// Build a handle AND spawn its background watcher thread. Used by the
+    /// live app; tests use [`Default`] so they never spawn a network thread.
+    fn spawned() -> Self {
+        let handle = Self::default();
+        spawn_alert_sound_watcher(handle.clone());
+        handle
+    }
+
+    /// Copy the current alert-sound settings into the shared config so the
+    /// watcher's next poll honors runtime Settings edits.
+    fn sync_config(&self, enabled: bool, sound_path: &str, families: &[String]) {
+        if let Ok(mut config) = self.config.lock() {
+            config.enabled = enabled;
+            config.sound_path = sound_path.to_owned();
+            config.families = families.to_vec();
+        }
+    }
+
+    /// Claim `sound_ids` in the shared dedupe gate; returns `true` if AT LEAST
+    /// one had not been sounded yet (so the foreground plays a warning the
+    /// background watcher has not already announced, and never re-plays one).
+    fn claim_any(&self, sound_ids: &[String]) -> bool {
+        match self.gate.lock() {
+            Ok(mut gate) => {
+                let mut claimed = false;
+                for id in sound_ids {
+                    claimed |= gate.claim(id);
+                }
+                claimed
+            }
+            // A poisoned lock must never silence a warning: fail toward alerting.
+            Err(_) => true,
+        }
+    }
+}
+
+/// Spawn the background warning watcher. THIS is the safety-critical part of
+/// the "keep alerting while minimized" feature: eframe throttles (and, when
+/// no repaint is scheduled, fully parks) the update loop while the window is
+/// minimized/unfocused, so the foreground hazard refresh alone can miss a new
+/// tornado warning until the user clicks the app. This thread runs the poll +
+/// new-warning detection + alert-sound playback on its OWN fixed schedule,
+/// entirely independent of window focus or repaint scheduling. It sleeps
+/// `ALERT_WATCH_INTERVAL` between polls, so it never busy-loops, and only does
+/// network work when the operator has opted into the alert sound.
+fn spawn_alert_sound_watcher(handle: AlertWatchHandle) {
+    thread::spawn(move || {
+        // The watcher keeps its OWN baseline of the last active-alert overlay
+        // so "new since last poll" is computed independently of the UI. The
+        // first successful poll only establishes the baseline, so warnings
+        // already active at launch never blast a backlog of cues.
+        let mut previous: Option<HazardOverlay> = None;
+        while !handle.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            let config = handle
+                .config
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+            if config.enabled {
+                // A failed poll keeps the last baseline and simply retries next
+                // cycle (transient network errors must not drop warnings).
+                if let Ok(overlay) = load_live_alert_watch_overlay(Utc::now()) {
+                    if let Some(prev) = &previous {
+                        let new_ids = new_soundable_warning_ids(prev, &overlay, &config.families);
+                        let mut claimed_new = false;
+                        let active_ids = overlay
+                            .records
+                            .iter()
+                            .map(|record| record.event_id.clone())
+                            .collect::<BTreeSet<_>>();
+                        if let Ok(mut gate) = handle.gate.lock() {
+                            for id in &new_ids {
+                                claimed_new |= gate.claim(id);
+                            }
+                            gate.retain_active(&active_ids);
+                        }
+                        if claimed_new {
+                            let _ = alert_audio::play(&config.sound_path);
+                        }
+                    }
+                    previous = Some(overlay);
+                }
+            } else {
+                // Disabled: drop the baseline so re-enabling establishes a
+                // fresh one (no backlog blast) and clear the dedupe set.
+                previous = None;
+                if let Ok(mut gate) = handle.gate.lock() {
+                    gate.sounded_ids.clear();
+                }
+            }
+            thread::sleep(ALERT_WATCH_INTERVAL);
+        }
+    });
+}
+
+/// A short label for a configured sound file: its file name, or "System
+/// alert" when empty (the platform default sound).
+fn sound_path_label(sound_path: &str) -> String {
+    let path = sound_path.trim();
+    if path.is_empty() {
+        return "System alert".to_owned();
+    }
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| path.to_owned())
+}
+
+/// Fetch the current NWS active-alert overlay for the background watcher.
+/// Uses ONLY the authoritative active-alerts endpoint (no SPC mesoscale
+/// discussion enrichment) so the background poll stays lightweight; the alert
+/// sound only ever fires for latchable warning families anyway.
+fn load_live_alert_watch_overlay(query_time_utc: DateTime<Utc>) -> Result<HazardOverlay, String> {
+    let start = Instant::now();
+    let load = load_weather_gov_active_alerts(query_time_utc)?;
+    Ok(build_live_hazard_overlay(
+        "NWS active alerts (alert watch)".to_owned(),
+        query_time_utc,
+        load.scanned_items,
+        load.parsed_items,
+        load.error_count,
+        start,
+        load.records,
+    ))
+}
+
+/// New (not present in `previous`) warnings in `incoming` that both qualify
+/// for attention and belong to a sound-enabled family — the exact gate the
+/// foreground [`ViewerApp::soundable_new_ids`] applies, hoisted to a free
+/// function so the background watcher and the UI share one source of truth.
+fn new_soundable_warning_ids(
+    previous: &HazardOverlay,
+    incoming: &HazardOverlay,
+    families: &[String],
+) -> Vec<String> {
+    let existing = previous
+        .records
+        .iter()
+        .map(|record| record.event_id.as_str())
+        .collect::<BTreeSet<_>>();
+    incoming
+        .records
+        .iter()
+        .filter(|record| !existing.contains(record.event_id.as_str()))
+        .filter(|record| hazard_record_should_latch_attention(record))
+        .filter(|record| alert_family_enabled(families, &record.event_family))
+        .map(|record| record.event_id.clone())
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug)]
 struct DebugArchiveCase {
     label: &'static str,
@@ -2520,6 +2732,16 @@ struct ViewerApp {
     /// a session latch for live documentation: it survives auto-refreshes but
     /// clears when the user selects the warning row/polygon.
     unacknowledged_hazard_event_ids: BTreeSet<String>,
+    /// Focus-independent background warning watcher (see
+    /// [`spawn_alert_sound_watcher`]): polls NWS active alerts and plays the
+    /// configured alert sound on a NEW qualifying warning even when the window
+    /// is minimized/unfocused, when eframe throttles the foreground update
+    /// loop. `gate` dedupes so a warning cues exactly once across both paths.
+    alert_watch: AlertWatchHandle,
+    /// Baseline scan time for the optional "radar updated" cue: the newest
+    /// primary frame already announced. `None` until the first frame seeds it,
+    /// so enabling the cue mid-session never fires for already-loaded data.
+    last_radar_sound_frame_time: Option<DateTime<Utc>>,
     storm_motion_direction_deg: f32,
     storm_motion_speed_kt: f32,
     /// One-shot derived-grid readout cache. Computed on first hover over a
@@ -7105,6 +7327,8 @@ impl ViewerApp {
             last_live_hazard_refresh: None,
             selected_hazard_index: None,
             unacknowledged_hazard_event_ids: BTreeSet::new(),
+            alert_watch: AlertWatchHandle::spawned(),
+            last_radar_sound_frame_time: None,
             storm_motion_direction_deg: DEFAULT_STORM_MOTION_DIRECTION_DEG,
             storm_motion_speed_kt: DEFAULT_STORM_MOTION_SPEED_KT,
             derived_readout_cache: None,
@@ -10812,21 +11036,31 @@ impl ViewerApp {
         }
     }
 
-    fn alert_sound_should_play_for_new_ids(
+    /// The subset of `new_attention_ids` that should trigger the warning
+    /// alert sound: enabled, qualifying for attention, and in a sound-enabled
+    /// family. Mirrors the free [`new_soundable_warning_ids`] the background
+    /// watcher uses, so both playback paths agree on WHAT sounds.
+    fn soundable_new_ids(
         &self,
         overlay: &HazardOverlay,
         new_attention_ids: &[String],
-    ) -> bool {
-        self.app_settings.alert_sound_enabled
-            && !new_attention_ids.is_empty()
-            && overlay.records.iter().any(|record| {
-                new_attention_ids.contains(&record.event_id)
-                    && hazard_record_should_latch_attention(record)
-                    && alert_family_enabled(
-                        &self.app_settings.alert_sound_families,
-                        &record.event_family,
-                    )
+    ) -> Vec<String> {
+        if !self.app_settings.alert_sound_enabled {
+            return Vec::new();
+        }
+        overlay
+            .records
+            .iter()
+            .filter(|record| new_attention_ids.contains(&record.event_id))
+            .filter(|record| hazard_record_should_latch_attention(record))
+            .filter(|record| {
+                alert_family_enabled(
+                    &self.app_settings.alert_sound_families,
+                    &record.event_family,
+                )
             })
+            .map(|record| record.event_id.clone())
+            .collect()
     }
 
     fn visual_alert_event_ids(
@@ -10854,6 +11088,38 @@ impl ViewerApp {
 
     fn trigger_alert_sound(&self) {
         let _ = alert_audio::play(&self.app_settings.alert_sound_path);
+    }
+
+    /// Optional "radar updated" cue: a short whoosh when the primary LIVE
+    /// radar gains a newer scan. Keyed on the newest scan time in history
+    /// (not the displayed frame), so loop playback replaying older frames
+    /// never fires it.
+    fn maybe_play_radar_update_sound(&mut self) {
+        let newest = self
+            .primary
+            .history
+            .iter()
+            .map(|frame| frame.identity.scan_time_utc)
+            .max();
+        if self.radar_update_sound_due_for(newest) {
+            let _ = alert_audio::play(&self.app_settings.radar_update_sound_path);
+        }
+    }
+
+    /// Advance the radar-sound baseline to `newest` and report whether it just
+    /// stepped to a strictly newer LIVE frame with the cue enabled — the
+    /// side-effect-free core of [`Self::maybe_play_radar_update_sound`]. The
+    /// baseline is ALWAYS advanced (even when the cue is off or the feed is
+    /// not live) so enabling it mid-session never blasts for already-loaded
+    /// data, and it only reports due on a genuinely newer frame.
+    fn radar_update_sound_due_for(&mut self, newest: Option<DateTime<Utc>>) -> bool {
+        let Some(newest) = newest else {
+            return false;
+        };
+        let previous = self.last_radar_sound_frame_time.replace(newest);
+        self.app_settings.radar_update_sound_enabled
+            && self.primary.live.enabled
+            && previous.is_some_and(|prev| newest > prev)
     }
 
     fn install_hazard_result(
@@ -10909,8 +11175,7 @@ impl ViewerApp {
                 } else {
                     Vec::new()
                 };
-                let play_alert_sound =
-                    self.alert_sound_should_play_for_new_ids(&overlay, &new_attention_ids);
+                let sound_ids = self.soundable_new_ids(&overlay, &new_attention_ids);
                 let visual_alert_ids = self.visual_alert_event_ids(&overlay, &new_attention_ids);
                 let selected_event_id = self
                     .selected_hazard_record()
@@ -10939,7 +11204,10 @@ impl ViewerApp {
                         &overlay,
                         &mut self.unacknowledged_hazard_event_ids,
                     );
-                    if play_alert_sound {
+                    // Dedupe against the background watcher so a new warning
+                    // cues exactly once: only play here for ids the watcher
+                    // has not already claimed (and never re-play one).
+                    if !sound_ids.is_empty() && self.alert_watch.claim_any(&sound_ids) {
                         self.trigger_alert_sound();
                     }
                 } else if suppress_alert_latches {
@@ -17130,6 +17398,15 @@ impl eframe::App for ViewerApp {
             self.maybe_refresh_extra_panes(&ctx);
         }
         self.maybe_refresh_live_hazards(&ctx);
+        // Push the current alert-sound settings to the background watcher so it
+        // keeps alerting on new warnings even while this loop is throttled
+        // (minimized/unfocused), and cue the optional radar-updated whoosh.
+        self.alert_watch.sync_config(
+            self.app_settings.alert_sound_enabled,
+            &self.app_settings.alert_sound_path,
+            &self.app_settings.alert_sound_families,
+        );
+        self.maybe_play_radar_update_sound();
         self.maybe_advance_history_loop(&ctx);
         self.maybe_advance_extra_pane_history_loops(&ctx);
         self.maybe_apply_continuous_camera_follow(&ctx);
@@ -17451,6 +17728,11 @@ impl eframe::App for ViewerApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Stop the background alert watcher so it does not fetch during
+        // shutdown (the process would kill it anyway, but this is tidy).
+        self.alert_watch
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.persist_sounding_view_state();
         self.persist_model_style_overrides();
         if self.workspace.dirty {
@@ -20680,15 +20962,11 @@ impl ViewerApp {
 
     /// Settings ▸ Debug cases — tiny repro launchers for known radar bugs.
     fn alert_sound_path_label(&self) -> String {
-        let path = self.app_settings.alert_sound_path.trim();
-        if path.is_empty() {
-            return "System alert".to_owned();
-        }
-        Path::new(path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_owned)
-            .unwrap_or_else(|| path.to_owned())
+        sound_path_label(&self.app_settings.alert_sound_path)
+    }
+
+    fn radar_update_sound_path_label(&self) -> String {
+        sound_path_label(&self.app_settings.radar_update_sound_path)
     }
 
     /// Settings: visual and audible warning latches, family-scoped.
@@ -20792,6 +21070,56 @@ impl ViewerApp {
             if self.app_settings.alert_sound_families.is_empty() {
                 ui.weak("All supported warning types are enabled.");
             }
+        });
+        ui.separator();
+        if ui
+            .checkbox(
+                &mut self.app_settings.radar_update_sound_enabled,
+                "Play sound when the radar updates",
+            )
+            .on_hover_text(
+                "Opt-in short cue when the primary live radar installs a new frame; keeps playing while the window is minimized",
+            )
+            .changed()
+        {
+            let _ = self.app_settings.save();
+        }
+        ui.add_enabled_ui(self.app_settings.radar_update_sound_enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Sound");
+                ui.weak(self.radar_update_sound_path_label());
+                #[cfg(any(windows, target_os = "macos"))]
+                if ui
+                    .button("Choose WAV…")
+                    .on_hover_text("Pick a custom .wav file; empty uses the platform system sound")
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .set_title(format!(
+                            "Choose {} radar-updated sound",
+                            self.app_settings.brand.resolved_display_name()
+                        ))
+                        .add_filter("WAV audio", &["wav"])
+                        .pick_file()
+                {
+                    self.app_settings.radar_update_sound_path = path.display().to_string();
+                    let _ = self.app_settings.save();
+                }
+                if ui
+                    .button("System")
+                    .on_hover_text("Use the platform system sound")
+                    .clicked()
+                {
+                    self.app_settings.radar_update_sound_path.clear();
+                    let _ = self.app_settings.save();
+                }
+                if ui
+                    .button("Test")
+                    .on_hover_text("Play the selected radar-updated sound once")
+                    .clicked()
+                {
+                    let _ = alert_audio::play(&self.app_settings.radar_update_sound_path);
+                }
+            });
         });
     }
 
@@ -25868,6 +26196,17 @@ impl ViewerApp {
     fn request_repaint_for_background_activity(&self, ctx: &egui::Context) {
         if self.active_background_activity().is_some() {
             ctx.request_repaint_after(Duration::from_millis(BACKGROUND_ACTIVITY_REPAINT_MS));
+        }
+        // Keep-alive: while a live warning watch or live radar poll is armed,
+        // ALWAYS keep a repaint scheduled so the update loop never parks. A
+        // parked loop stops running the foreground refresh (visual flash,
+        // radar-updated cue) while the window is minimized/unfocused — eframe
+        // still paints an invisible window when a repaint is due, throttled to
+        // ~100 ms, so this cadence never busy-loops. (The safety-critical
+        // ALERT SOUND has its own focus-independent watcher thread and does
+        // not depend on this keep-alive.)
+        if self.live_hazard_auto_refresh || self.primary.live.enabled {
+            ctx.request_repaint_after(Duration::from_secs(1));
         }
     }
 
@@ -68168,12 +68507,102 @@ mod tests {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let ids = vec!["tor".to_owned(), "ffw".to_owned()];
 
-        assert!(!app.alert_sound_should_play_for_new_ids(&overlay, &ids));
+        assert!(app.soundable_new_ids(&overlay, &ids).is_empty());
 
         app.app_settings.alert_sound_enabled = true;
         app.app_settings.alert_sound_families = vec!["tornado".to_owned()];
-        assert!(app.alert_sound_should_play_for_new_ids(&overlay, &ids));
-        assert!(!app.alert_sound_should_play_for_new_ids(&overlay, &["ffw".to_owned()]));
+        assert_eq!(
+            app.soundable_new_ids(&overlay, &ids),
+            vec!["tor".to_owned()],
+            "only the tornado (a sound-enabled family) should sound"
+        );
+        assert!(
+            app.soundable_new_ids(&overlay, &["ffw".to_owned()])
+                .is_empty(),
+            "flash flood is not in the enabled family set"
+        );
+    }
+
+    #[test]
+    fn new_soundable_warning_ids_flags_only_new_qualifying_sound_families() {
+        let existing_tor = test_hazard_record(
+            "tor-old",
+            "TOR 0",
+            "tornado",
+            square_hazard_points(-103.0, 34.0, -102.0, 35.0),
+        );
+        let new_tor = test_hazard_record(
+            "tor-new",
+            "TOR 1",
+            "tornado",
+            square_hazard_points(-101.0, 34.0, -100.0, 35.0),
+        );
+        let new_ffw = test_hazard_record(
+            "ffw-new",
+            "FFW 2",
+            "flash flood",
+            square_hazard_points(-99.0, 34.0, -98.0, 35.0),
+        );
+        let previous = test_hazard_overlay(vec![existing_tor.clone()]);
+        let incoming = test_hazard_overlay(vec![existing_tor, new_tor, new_ffw]);
+
+        // Empty family filter = all supported warning families: both the new
+        // tornado and the new flash flood qualify (in record order); the
+        // pre-existing tornado never re-sounds.
+        let all = new_soundable_warning_ids(&previous, &incoming, &[]);
+        assert_eq!(all, vec!["tor-new".to_owned(), "ffw-new".to_owned()]);
+
+        // Narrowed to tornado only: just the new tornado.
+        let tor_only = new_soundable_warning_ids(&previous, &incoming, &["tornado".to_owned()]);
+        assert_eq!(tor_only, vec!["tor-new".to_owned()]);
+
+        // A baseline that already contains everything yields nothing new.
+        assert!(new_soundable_warning_ids(&incoming, &incoming, &[]).is_empty());
+    }
+
+    #[test]
+    fn alert_sound_gate_claims_each_id_once_and_prunes_expired() {
+        let mut gate = AlertSoundGate::default();
+        assert!(gate.claim("tor-1"), "first sight of an id sounds");
+        assert!(!gate.claim("tor-1"), "same id never re-sounds");
+        assert!(gate.claim("tor-2"));
+
+        // Only currently-active ids are retained; an expired id can sound
+        // again if it is somehow re-issued later.
+        let active: BTreeSet<String> = ["tor-2".to_owned()].into_iter().collect();
+        gate.retain_active(&active);
+        assert!(!gate.claim("tor-2"), "still active, already sounded");
+        assert!(gate.claim("tor-1"), "expired then reclaimable");
+    }
+
+    #[test]
+    fn radar_update_sound_due_only_on_newer_live_frame_when_enabled() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.app_settings.radar_update_sound_enabled = true;
+        app.primary.live.enabled = true;
+
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 5, 0, 0, 0).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 7, 5, 0, 5, 0).unwrap();
+
+        // First observation only seeds the baseline — no backlog blast.
+        assert!(!app.radar_update_sound_due_for(Some(t0)));
+        // A strictly newer live frame is due.
+        assert!(app.radar_update_sound_due_for(Some(t1)));
+        // The same frame again is not.
+        assert!(!app.radar_update_sound_due_for(Some(t1)));
+
+        // Disabled cue advances the baseline but never reports due.
+        app.app_settings.radar_update_sound_enabled = false;
+        let t2 = Utc.with_ymd_and_hms(2026, 7, 5, 0, 10, 0).unwrap();
+        assert!(!app.radar_update_sound_due_for(Some(t2)));
+        // Re-enabling with no newer frame does not fire for already-seen data.
+        app.app_settings.radar_update_sound_enabled = true;
+        assert!(!app.radar_update_sound_due_for(Some(t2)));
+
+        // Not-live never fires even on a newer frame.
+        app.primary.live.enabled = false;
+        let t3 = Utc.with_ymd_and_hms(2026, 7, 5, 0, 15, 0).unwrap();
+        assert!(!app.radar_update_sound_due_for(Some(t3)));
     }
 
     #[test]
@@ -69470,6 +69899,8 @@ mod tests {
             last_live_hazard_refresh: None,
             selected_hazard_index: None,
             unacknowledged_hazard_event_ids: BTreeSet::new(),
+            alert_watch: AlertWatchHandle::default(),
+            last_radar_sound_frame_time: None,
             storm_motion_direction_deg: DEFAULT_STORM_MOTION_DIRECTION_DEG,
             storm_motion_speed_kt: DEFAULT_STORM_MOTION_SPEED_KT,
             derived_readout_cache: None,
