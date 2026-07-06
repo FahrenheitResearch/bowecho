@@ -233,7 +233,10 @@ pub struct ModelMapLayer {
     /// (see [`color_tables::solar_model_field_table`]). For WRF/local model
     /// fields this is the layer's default look; for downloaded models it only
     /// fills in where Rusty Weather has no production style, replacing the
-    /// generic ramp. Ranks below an explicit `custom_color_family` override.
+    /// generic ramp. Ranks below an explicit `custom_color_family` override,
+    /// and is left `None` when the 🎨 color-table editor binds a user palette
+    /// to the product — the user's table arrives compiled into `production`,
+    /// which must then win (user override → Solar → production → generic).
     /// Credit: Solarpower07 (handle only, credit pending per project policy).
     pub model_table: Option<Arc<ColorTable>>,
     /// Bumped when field/LUT changes — keys the rendered texture.

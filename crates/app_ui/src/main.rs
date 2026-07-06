@@ -4536,19 +4536,64 @@ fn default_model_layer_color_family(field: &rw_ui::FieldData) -> Option<ColorTab
 /// Resolve the Solarpower07 WRF-Runner palette a model layer should use, or
 /// `None` to keep the field's production style / generic ramp.
 ///
-/// WRF/local fields always take their Solar palette (it's the intended look).
-/// Downloaded-model fields only take one when Rusty Weather supplied no
-/// production style — turning the generic viridis fallback into a sensible,
-/// unit-aware table. Ranks below an explicit `custom_color_family` override.
+/// WRF/local fields take their Solar palette by default (it's the intended
+/// look). Downloaded-model fields only take one when Rusty Weather supplied
+/// no production style — turning the generic viridis fallback into a
+/// sensible, unit-aware table. Ranks below an explicit `custom_color_family`
+/// override.
+///
+/// `user_override` — whether the 🎨 Color-tables editor binds a user palette
+/// to this field ([`model_data::user_style_override_active`]). The store
+/// worker compiles that binding INTO `field.style` (= the layer's production
+/// colormap), so when it is set Solar must yield or the user's edit would be
+/// silently repainted over. Effective precedence: user override → Solar
+/// model table → production → generic ramp.
 ///
 /// CREDIT: Solarpower07 (see `color_tables::solar`).
 fn model_layer_solar_table(
     field: &rw_ui::FieldData,
     has_production: bool,
+    user_override: bool,
 ) -> Option<Arc<ColorTable>> {
+    if user_override {
+        return None;
+    }
     let table = color_tables::solar_model_field_table(&field.key.var, &field.units)?;
     if is_local_wrf_field(field) || !has_production {
         Some(Arc::new(table))
+    } else {
+        None
+    }
+}
+
+/// Single source of truth for the on-screen color a model layer gives
+/// `value`: BowEcho family override → Solar model table → rusty-weather
+/// production style (which carries any 🎨 user-bound palette) → generic
+/// normalized ramp. Both `draw_model_layers`' raster loop and the inspector
+/// color chip resolve through this, so the chip can never drift from the
+/// painted pixel.
+fn model_layer_value_color(
+    custom_table: Option<&ColorTable>,
+    model_table: Option<&ColorTable>,
+    production: Option<&rustwx_render::LeveledColormap>,
+    range: Option<(f32, f32)>,
+    generic: rw_ui::colormap::Colormap,
+    value: f32,
+) -> Option<egui::Color32> {
+    if let Some(table) = custom_table {
+        let [r, g, b, a] = table.sample(value).to_array();
+        Some(egui::Color32::from_rgba_unmultiplied(r, g, b, a))
+    } else if let Some(table) = model_table {
+        let [r, g, b, a] = table.sample(value).to_array();
+        Some(egui::Color32::from_rgba_unmultiplied(r, g, b, a))
+    } else if let Some(cmap) = production {
+        let rgba = cmap.map(f64::from(value));
+        Some(egui::Color32::from_rgba_unmultiplied(
+            rgba.r, rgba.g, rgba.b, rgba.a,
+        ))
+    } else if let Some((vmin, vmax)) = range {
+        let t = rw_ui::colormap::normalize(value, vmin, vmax);
+        Some(generic.sample(t))
     } else {
         None
     }
@@ -33536,6 +33581,13 @@ impl ViewerApp {
         }
         if let Some(latest) = swap {
             let mut needs_rebuild = false;
+            // A 🎨 user-bound palette arrives compiled into `latest.style`
+            // (the production colormap): drop the Solar table so it shows
+            // instead of being repainted over. Unbinding restores Solar.
+            let user_override = self
+                .model_dock
+                .as_ref()
+                .is_some_and(|dock| dock.user_style_override_for(latest.as_ref()));
             for slot in &mut self.model_layers {
                 if slot.layer.field.key.var != latest.key.var {
                     continue;
@@ -33551,8 +33603,11 @@ impl ViewerApp {
                             style.colormap_options,
                         ))
                     });
-                    slot.layer.model_table =
-                        model_layer_solar_table(latest.as_ref(), slot.layer.production.is_some());
+                    slot.layer.model_table = model_layer_solar_table(
+                        latest.as_ref(),
+                        slot.layer.production.is_some(),
+                        user_override,
+                    );
                     slot.layer.field = Arc::clone(&latest);
                     slot.layer.generation = slot.layer.generation.wrapping_add(1);
                     slot.texture = None;
@@ -34217,6 +34272,14 @@ impl ViewerApp {
         self.model_layer_build_rx = Some(receiver);
         let generation = self.model_layer_generation + 1;
         let initial_opacity = self.style_registry.drapes().model_opacity;
+        // 🎨 user-bound palette: the worker already compiled it into
+        // `field.style` (the production colormap below), so Solar must yield
+        // for the user's edit to reach the map (resolved here — the editor
+        // settings live on the dock, not in the build thread).
+        let user_override = self
+            .model_dock
+            .as_ref()
+            .is_some_and(|dock| dock.user_style_override_for(field.as_ref()));
         let ctx_clone = ctx.clone();
         thread::spawn(move || {
             let layer = field.grid.as_ref().and_then(|grid| {
@@ -34229,7 +34292,11 @@ impl ViewerApp {
                             style.colormap_options,
                         ))
                     });
-                    let model_table = model_layer_solar_table(field.as_ref(), production.is_some());
+                    let model_table = model_layer_solar_table(
+                        field.as_ref(),
+                        production.is_some(),
+                        user_override,
+                    );
                     model_layer::ModelMapLayer {
                         field: Arc::clone(&field),
                         lut: Arc::new(lut),
@@ -34321,20 +34388,17 @@ impl ViewerApp {
                         ) else {
                             continue;
                         };
-                        if let Some(table) = &custom_table {
-                            let [r, g, b, a] = table.sample(value).to_array();
-                            *px = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
-                        } else if let Some(table) = &model_table {
-                            let [r, g, b, a] = table.sample(value).to_array();
-                            *px = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
-                        } else if let Some(cmap) = &production {
-                            let rgba = cmap.map(f64::from(value));
-                            *px = egui::Color32::from_rgba_unmultiplied(
-                                rgba.r, rgba.g, rgba.b, rgba.a,
-                            );
-                        } else if let Some((vmin, vmax)) = range {
-                            let t = rw_ui::colormap::normalize(value, vmin, vmax);
-                            *px = colormap.sample(t);
+                        // Shared resolver — the inspector chip samples the
+                        // SAME function, so chip color == painted color.
+                        if let Some(color) = model_layer_value_color(
+                            custom_table.as_deref(),
+                            model_table.as_deref(),
+                            production.as_deref(),
+                            range,
+                            colormap,
+                            value,
+                        ) {
+                            *px = color;
                         }
                     }
                     let image = egui::ColorImage {
@@ -38253,9 +38317,14 @@ impl ViewerApp {
         None
     }
 
-    /// The on-screen color a model layer paints for `value`, replicating
-    /// [`Self::draw_model_layers`]: BowEcho palette override, else the
-    /// rusty-weather production style, else the generic normalized ramp.
+    /// The on-screen color a model layer paints for `value`. Resolves through
+    /// [`model_layer_value_color`] — the SAME function
+    /// [`Self::draw_model_layers`]' raster loop paints with (BowEcho palette
+    /// override → Solar model table → production style → generic ramp) — so
+    /// the chip cannot drift from the painted pixel. (Historically this
+    /// re-implemented the precedence and skipped `model_table`, so for WRF
+    /// layers the chip showed the production color while the map painted
+    /// Solar.)
     fn model_layer_color_for_value(
         &self,
         layer: &model_layer::ModelMapLayer,
@@ -38264,23 +38333,18 @@ impl ViewerApp {
         if !value.is_finite() {
             return None;
         }
-        if let Some(family) = layer.custom_color_family {
-            Some(
-                self.color_tables
-                    .for_family(family)
-                    .sample(value)
-                    .to_array(),
-            )
-        } else if let Some(cmap) = &layer.production {
-            let rgba = cmap.map(f64::from(value));
-            Some([rgba.r, rgba.g, rgba.b, rgba.a])
-        } else if let Some((vmin, vmax)) = layer.field.range {
-            let t = rw_ui::colormap::normalize(value, vmin, vmax);
-            let c = layer.colormap.sample(t);
-            Some([c.r(), c.g(), c.b(), c.a()])
-        } else {
-            None
-        }
+        let custom_table = layer
+            .custom_color_family
+            .map(|family| self.color_tables.for_family(family));
+        model_layer_value_color(
+            custom_table,
+            layer.model_table.as_deref(),
+            layer.production.as_deref(),
+            layer.field.range,
+            layer.colormap,
+            value,
+        )
+        .map(|color| color.to_array())
     }
 
     /// Shift+click: pin the inspector to a geo point (or release a pin when
@@ -64458,7 +64522,7 @@ mod tests {
         refl.key.var = "composite_reflectivity".to_owned();
         refl.units = "dBZ".to_owned();
         assert_eq!(default_model_layer_color_family(&refl), None);
-        assert!(model_layer_solar_table(&refl, false).is_some());
+        assert!(model_layer_solar_table(&refl, false, false).is_some());
 
         // Temperature/dew point/wind/precip all resolve to a Solar table even
         // with no production style (the case that used to fall to viridis).
@@ -64474,7 +64538,7 @@ mod tests {
             field.key.var = var.to_owned();
             field.units = units.to_owned();
             assert!(
-                model_layer_solar_table(&field, false).is_some(),
+                model_layer_solar_table(&field, false, false).is_some(),
                 "expected Solar palette for WRF {var}"
             );
         }
@@ -64488,8 +64552,133 @@ mod tests {
         let mut field = test_model_field("hrrr", "20260519_00z", 0).as_ref().clone();
         field.key.var = "temperature_2m".to_owned();
         field.units = "degF".to_owned();
-        assert!(model_layer_solar_table(&field, true).is_none());
-        assert!(model_layer_solar_table(&field, false).is_some());
+        assert!(model_layer_solar_table(&field, true, false).is_none());
+        assert!(model_layer_solar_table(&field, false, false).is_some());
+    }
+
+    /// Audit #11: a 🎨 user-bound palette is compiled into the field's
+    /// production style by the store worker, so Solar must yield to it —
+    /// user override → Solar → production → generic. Untouched WRF fields
+    /// (no binding) keep Solar; this fails on the old two-arg resolver,
+    /// which reinstalled Solar over every WRF production style.
+    #[test]
+    fn user_bound_palette_beats_solar_for_wrf_fields() {
+        let mut field = test_model_field("wrf", "20260519_00z", 0).as_ref().clone();
+        field.key.var = "temperature_2m".to_owned();
+        field.units = "K".to_owned();
+        // Untouched WRF field: Solar outranks the production style.
+        assert!(model_layer_solar_table(&field, true, false).is_some());
+        // User-bound palette: Solar yields, so the production colormap
+        // (= the user's table) is what the paint chain reaches.
+        assert!(model_layer_solar_table(&field, true, true).is_none());
+        assert!(model_layer_solar_table(&field, false, true).is_none());
+    }
+
+    /// Audit #11 wiring: the dock detects an editor binding exactly like the
+    /// store worker's `style_for_store_variable` (same candidates, same
+    /// bound-table lookup), including the persisted-settings restore path.
+    #[test]
+    fn dock_reports_user_style_override_for_bound_products() {
+        let ctx = egui::Context::default();
+        let mut dock = model_data::ModelDataDock::new_for_test(
+            &ctx,
+            test_model_store_tree("wrf", "20260519_00z", &[0]),
+        );
+        let mut field = test_model_field("wrf", "20260519_00z", 0).as_ref().clone();
+        field.key.var = "temperature_2m".to_owned();
+        field.units = "K".to_owned();
+        assert!(!dock.user_style_override_for(&field));
+
+        let mut settings = rw_ui::StyleOverrideSettings::default();
+        settings.upsert_table(rw_ui::UserColorTable::simple("My temp", "My temp", "K"));
+        settings.bind_product(&rw_ui::normalize_product_key("temperature_2m"), "My temp");
+        assert!(
+            dock.apply_style_overrides_json(
+                &serde_json::to_value(&settings).expect("serialize overrides")
+            ),
+            "restore path must accept the settings"
+        );
+
+        assert!(dock.user_style_override_for(&field));
+        // Other variables stay untouched (they keep Solar).
+        let mut other = field.clone();
+        other.key.var = "dewpoint_2m".to_owned();
+        assert!(!dock.user_style_override_for(&other));
+    }
+
+    /// Audit #9: the inspector color chip must report the SAME color the map
+    /// raster paints. For a WRF layer the raster uses the Solar model table,
+    /// which the chip historically skipped (it fell through to the
+    /// production style) — this pins chip == painted == Solar, not
+    /// production.
+    #[test]
+    fn inspector_chip_matches_painted_color_for_solar_wrf_layer() {
+        let app = test_viewer_app_with_hazards(Vec::new());
+        let mut field = test_model_field("wrf", "20260519_00z", 0).as_ref().clone();
+        field.key.var = "temperature_2m".to_owned();
+        field.units = "K".to_owned();
+        field.range = Some((250.0, 310.0));
+        let field = Arc::new(field);
+
+        // A flat-red production style that CANNOT be mistaken for Solar.
+        let production_style = rw_ui::UserColorTable {
+            name: "flat red".into(),
+            title: "flat red".into(),
+            display_units: "K".into(),
+            convert: rw_ui::UserUnitConvert::None,
+            legend_mode: rw_ui::UserLegendMode::Stepped,
+            extend: rw_ui::UserExtendMode::Both,
+            mask_below: None,
+            tick_step: None,
+            levels: vec![200.0, 350.0],
+            colors: vec![[255, 0, 0, 255]],
+        }
+        .to_store_style("flat red", "K")
+        .expect("production style");
+
+        let mut slot = test_model_layer("wrf", "20260519_00z", 0);
+        slot.layer.field = Arc::clone(&field);
+        slot.layer.production = Some(Arc::new(rustwx_render::build_colormap(
+            &production_style.scale,
+            production_style.colormap_options,
+        )));
+        slot.layer.model_table = model_layer_solar_table(field.as_ref(), true, false);
+        assert!(
+            slot.layer.model_table.is_some(),
+            "WRF temperature must resolve a Solar table"
+        );
+
+        let value = 273.15_f32;
+        let chip = app
+            .model_layer_color_for_value(&slot.layer, value)
+            .expect("chip color");
+        let painted = model_layer_value_color(
+            None,
+            slot.layer.model_table.as_deref(),
+            slot.layer.production.as_deref(),
+            slot.layer.field.range,
+            slot.layer.colormap,
+            value,
+        )
+        .expect("painted color");
+        assert_eq!(
+            chip,
+            painted.to_array(),
+            "chip must equal the painted pixel"
+        );
+        // 273.15 K == 32 °F → Solar's freezing teal anchor #0F4454 — and
+        // decidedly NOT the production red the old chip reported.
+        assert_eq!(chip[..3], [0x0f, 0x44, 0x54]);
+        assert_ne!(chip[..3], [255, 0, 0]);
+
+        // With a user override active the Solar table is not installed, and
+        // chip == painted == the user's production red.
+        slot.layer.model_table = model_layer_solar_table(field.as_ref(), true, true);
+        assert!(slot.layer.model_table.is_none());
+        let chip = app
+            .model_layer_color_for_value(&slot.layer, value)
+            .expect("chip color");
+        assert_eq!(chip[..3], [255, 0, 0]);
     }
 
     /// REAL-DATA verification (ignored in CI — needs a wrfout on disk). Point
@@ -64577,7 +64766,7 @@ mod tests {
                 lat_descending: true,
                 style: None,
             };
-            let table = model_layer_solar_table(&field, false)
+            let table = model_layer_solar_table(&field, false, false)
                 .unwrap_or_else(|| panic!("{store_name} ({units}) must resolve a Solar palette"));
 
             // Field stats over finite values.
@@ -64653,10 +64842,245 @@ mod tests {
                 style: None,
             },
             false,
+            false,
         )
         .expect("temp table");
         // 273.15 K == 32 °F -> Solar's freezing teal anchor #0F4454.
         assert_eq!(temp.sample(273.15).to_array()[..3], [0x0f, 0x44, 0x54]);
+    }
+
+    /// REAL-DATA verification for audit fixes #9 + #11 (ignored in CI —
+    /// needs a wrfout on disk). Run in RELEASE:
+    ///
+    /// ```text
+    /// BOWECHO_WRF_TEST_FILE=".../wrfout_d01_2026-05-18_18_06_00" \
+    ///   cargo test -p app_ui --bin bowecho --profile release-fast -- \
+    ///   --ignored --nocapture wrf_real_chip_and_user_override
+    /// ```
+    ///
+    /// Pulls REAL 2 m temperature through `wrf-core` and renders it through
+    /// the exact map-layer resolution chain, writing proof PNGs to
+    /// `BOWECHO_PROOF_DIR` (default `bowecho_proof_9_11/` next to the
+    /// wrfout):
+    ///   1_solar_painted.png — untouched WRF field, the raster the map paints
+    ///     (Solar palette);
+    ///   2_solar_chip.png — the SAME field with every pixel resolved through
+    ///     the inspector chip; asserted byte-identical to 1 (#9 — the old
+    ///     chip fell through to production/generic here);
+    ///   3_user_override.png — a 🎨 user-bound palette resolved through the
+    ///     REAL `style_for_store_variable` chain; asserted to differ from 1
+    ///     and to keep chip == painted (#11 — the old resolver repainted
+    ///     this with Solar).
+    #[test]
+    #[ignore = "needs a real wrfout via BOWECHO_WRF_TEST_FILE"]
+    fn wrf_real_chip_and_user_override_render() {
+        let path = std::env::var("BOWECHO_WRF_TEST_FILE")
+            .expect("set BOWECHO_WRF_TEST_FILE to a wrfout path");
+        let file = wrf_core::WrfFile::open(&path).expect("open wrfout");
+        let out_dir = std::env::var("BOWECHO_PROOF_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::Path::new(&path)
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join("bowecho_proof_9_11")
+            });
+        std::fs::create_dir_all(&out_dir).expect("make proof dir");
+
+        let opts = wrf_core::ComputeOpts {
+            units: Some("K".to_owned()),
+            ..Default::default()
+        };
+        let output = wrf_core::getvar(&file, "t2", Some(0), &opts).expect("t2");
+        let (ny, nx) = match output.shape.as_slice() {
+            [ny, nx] => (*ny, *nx),
+            [1, ny, nx] => (*ny, *nx),
+            other => panic!("t2: unexpected shape {other:?}"),
+        };
+        let values: Vec<f32> = output
+            .data
+            .iter()
+            .map(|&v| {
+                if !v.is_finite() || v.abs() >= 1.0e30 {
+                    f32::NAN
+                } else {
+                    v as f32
+                }
+            })
+            .collect();
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &v in values.iter().filter(|v| v.is_finite()) {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        assert!(lo.is_finite() && hi > lo, "t2 must vary: {lo}..{hi}");
+        let field = Arc::new(rw_ui::FieldData {
+            key: rw_ui::FieldKey {
+                hour: rw_ui::HourKey {
+                    model: "wrf".to_owned(),
+                    run: "proof".to_owned(),
+                    hour: 0,
+                },
+                var: "temperature_2m".to_owned(),
+            },
+            units: "K".to_owned(),
+            nx,
+            ny,
+            values,
+            range: Some((lo, hi)),
+            grid: None,
+            lat_descending: true,
+            style: None,
+        });
+
+        let app = test_viewer_app_with_hazards(Vec::new());
+        let mut slot = test_model_layer("wrf", "proof", 0);
+        slot.layer.field = Arc::clone(&field);
+
+        // Raster exactly as `draw_model_layers` paints it (shared resolver).
+        let paint_raster = |layer: &model_layer::ModelMapLayer| -> Vec<[u8; 4]> {
+            layer
+                .field
+                .values
+                .iter()
+                .map(|&v| {
+                    if !v.is_finite() {
+                        return [0, 0, 0, 0];
+                    }
+                    model_layer_value_color(
+                        None,
+                        layer.model_table.as_deref(),
+                        layer.production.as_deref(),
+                        layer.field.range,
+                        layer.colormap,
+                        v,
+                    )
+                    .map(|c| c.to_array())
+                    .unwrap_or([0, 0, 0, 0])
+                })
+                .collect()
+        };
+        // The same raster with every pixel through the inspector chip.
+        let chip_raster = |layer: &model_layer::ModelMapLayer| -> Vec<[u8; 4]> {
+            layer
+                .field
+                .values
+                .iter()
+                .map(|&v| {
+                    app.model_layer_color_for_value(layer, v)
+                        .unwrap_or([0, 0, 0, 0])
+                })
+                .collect()
+        };
+        let write_png = |name: &str, pixels: &[[u8; 4]]| {
+            let mut img = image::RgbaImage::new(nx as u32, ny as u32);
+            for (i, px) in pixels.iter().enumerate() {
+                img.put_pixel(
+                    (i % nx) as u32,
+                    (i / nx) as u32,
+                    image::Rgba([px[0], px[1], px[2], px[3]]),
+                );
+            }
+            let path = out_dir.join(name);
+            img.save(&path).expect("write proof png");
+            eprintln!("wrote {}", path.display());
+        };
+        let distinct = |pixels: &[[u8; 4]]| {
+            pixels
+                .iter()
+                .filter(|px| px[3] > 0)
+                .map(|px| [px[0], px[1], px[2]])
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        };
+
+        // --- #9: untouched WRF field. Solar paints; chip == painted pixel.
+        slot.layer.production = None;
+        slot.layer.model_table = model_layer_solar_table(field.as_ref(), false, false);
+        assert!(slot.layer.model_table.is_some(), "WRF t2 resolves Solar");
+        let solar_painted = paint_raster(&slot.layer);
+        let solar_chip = chip_raster(&slot.layer);
+        assert_eq!(
+            solar_painted, solar_chip,
+            "#9: every chip pixel must equal the painted pixel"
+        );
+        assert!(
+            distinct(&solar_painted) >= 4,
+            "Solar raster must be a real multi-color ramp"
+        );
+        write_png("1_solar_painted.png", &solar_painted);
+        write_png("2_solar_chip.png", &solar_chip);
+
+        // --- #11: bind a user palette exactly as the 🎨 editor does, then
+        // resolve the style through the REAL worker chain.
+        let mut settings = rw_ui::StyleOverrideSettings::default();
+        settings.upsert_table(rw_ui::UserColorTable {
+            name: "Proof magma".into(),
+            title: "Proof magma".into(),
+            display_units: "K".into(),
+            convert: rw_ui::UserUnitConvert::None,
+            legend_mode: rw_ui::UserLegendMode::Stepped,
+            extend: rw_ui::UserExtendMode::Both,
+            mask_below: None,
+            tick_step: None,
+            levels: vec![
+                f64::from(lo),
+                f64::from(lo) + f64::from(hi - lo) * 0.25,
+                f64::from(lo) + f64::from(hi - lo) * 0.5,
+                f64::from(lo) + f64::from(hi - lo) * 0.75,
+                f64::from(hi),
+            ],
+            colors: vec![
+                [30, 0, 60, 255],
+                [140, 20, 120, 255],
+                [230, 80, 60, 255],
+                [255, 200, 40, 255],
+            ],
+        });
+        settings.bind_product(
+            &rw_ui::normalize_product_key("temperature_2m"),
+            "Proof magma",
+        );
+        assert!(
+            model_data::user_style_override_active(&settings, &field),
+            "#11: the binding must register as a user override"
+        );
+        let style = settings
+            .style_for_store_variable("temperature_2m", &serde_json::Value::Null, "K", None)
+            .expect("user style resolves through the worker chain");
+        slot.layer.production = Some(Arc::new(rustwx_render::build_colormap(
+            &style.scale,
+            style.colormap_options,
+        )));
+        slot.layer.model_table = model_layer_solar_table(
+            field.as_ref(),
+            true,
+            model_data::user_style_override_active(&settings, &field),
+        );
+        assert!(
+            slot.layer.model_table.is_none(),
+            "#11: Solar must yield to the user binding"
+        );
+        let user_painted = paint_raster(&slot.layer);
+        let user_chip = chip_raster(&slot.layer);
+        assert_eq!(
+            user_painted, user_chip,
+            "#11/#9: chip must follow the user override too"
+        );
+        assert_ne!(
+            user_painted, solar_painted,
+            "#11: the user palette must actually change the raster"
+        );
+        assert!(
+            distinct(&user_painted) >= 4,
+            "user raster must show the bound ramp"
+        );
+        write_png("3_user_override.png", &user_painted);
+        eprintln!(
+            "t2 {nx}x{ny} range {lo:.1}..{hi:.1} K; solar colors={}, user colors={}",
+            distinct(&solar_painted),
+            distinct(&user_painted)
+        );
     }
 
     #[test]

@@ -560,6 +560,16 @@ impl ModelDataDock {
         self.sounding.apply_view_state_json(value)
     }
 
+    /// Whether the 🎨 Color-tables editor currently binds a USER palette to
+    /// this field — i.e. `field.style` (and thus the map layer's production
+    /// colormap) IS the user's table, not the operational default. The map
+    /// layer resolution uses this to rank the user's palette above the
+    /// built-in Solar WRF tables: user override → Solar → production →
+    /// generic. See [`user_style_override_active`].
+    pub fn user_style_override_for(&self, field: &rw_ui::FieldData) -> bool {
+        user_style_override_active(self.color_tables.settings(), field)
+    }
+
     /// Serialize the current model field-plot color-table overrides for
     /// persistence (opaque JSON; kept in app settings like the sounding state).
     pub fn style_overrides_json(&self) -> serde_json::Value {
@@ -1560,7 +1570,9 @@ impl ModelDataDock {
                     ui.toggle_value(&mut self.show_color_tables, "🎨 Color tables")
                         .on_hover_text(
                             "Edit model field-plot color tables: bind a product to a palette, \
-                             edit its levels and colors; the field reloads with your palette.",
+                             edit its levels and colors; the field reloads with your palette — \
+                             in the dock viewer AND on the radar-map layer, where your binding \
+                             outranks the built-in Solar WRF palettes.",
                         );
                 });
             }
@@ -1664,6 +1676,31 @@ fn model_run_time_utc(run: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     ))
 }
 
+/// Whether these 🎨 editor settings bind an explicit user palette to
+/// `field`'s product — mirroring the lookup the store worker performs in
+/// `StyleOverrideSettings::style_for_store_variable` when it resolves
+/// `FieldData::style`: candidate product keys → bound table → the table
+/// compiles to a usable style. When this returns true, `field.style` IS the
+/// user's table, so the map layer must let its production colormap win over
+/// the built-in Solar WRF palette (audit #11: user edits were silently
+/// repainted with Solar).
+///
+/// The editor keys bindings by the field's var name
+/// (`normalize_product_key(field.key.var)`), which the candidate list always
+/// contains; the worker-side stored selector only ADDS derived-slug aliases
+/// the editor UI cannot create, so a `Null` selector resolves every binding
+/// this app can produce.
+pub(crate) fn user_style_override_active(
+    settings: &StyleOverrideSettings,
+    field: &rw_ui::FieldData,
+) -> bool {
+    let candidates =
+        rw_ui::style_overrides::product_candidates(&field.key.var, &serde_json::Value::Null);
+    settings
+        .bound_table_for_candidates(&candidates)
+        .is_some_and(|(_, table)| table.to_store_style(&field.key.var, &field.units).is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1676,6 +1713,62 @@ mod tests {
             Some(chrono::Utc.with_ymd_and_hms(2026, 6, 18, 3, 0, 0).unwrap())
         );
         assert_eq!(model_run_time_utc("bad-run"), None);
+    }
+
+    fn override_test_field(var: &str) -> rw_ui::FieldData {
+        rw_ui::FieldData {
+            key: rw_ui::FieldKey {
+                hour: HourKey {
+                    model: "wrf".to_owned(),
+                    run: "20260519_00z".to_owned(),
+                    hour: 0,
+                },
+                var: var.to_owned(),
+            },
+            units: "K".to_owned(),
+            nx: 1,
+            ny: 1,
+            values: vec![273.15],
+            range: Some((273.15, 273.15)),
+            grid: None,
+            lat_descending: true,
+            style: None,
+        }
+    }
+
+    /// Audit #11: detection of a 🎨 editor binding must mirror the store
+    /// worker's `style_for_store_variable` lookup — bound product wins,
+    /// unbound products don't, the `wrf_`-stripped alias matches, and a
+    /// deleted table leaves no dangling override.
+    #[test]
+    fn color_table_editor_binding_is_a_user_override() {
+        let mut settings = StyleOverrideSettings::default();
+        let field = override_test_field("temperature_2m");
+        assert!(!user_style_override_active(&settings, &field));
+
+        // Bind a user table to the product exactly as the editor does
+        // (keyed by the normalized var name).
+        settings.upsert_table(rw_ui::UserColorTable::simple("My temp", "My temp", "K"));
+        settings.bind_product(&rw_ui::normalize_product_key("temperature_2m"), "My temp");
+        assert!(user_style_override_active(&settings, &field));
+
+        // A different variable stays on its default (keeps Solar).
+        assert!(!user_style_override_active(
+            &settings,
+            &override_test_field("dewpoint_2m")
+        ));
+
+        // Worker parity: a binding on the `wrf_`-stripped alias also
+        // resolves for the prefixed store variable.
+        settings.bind_product("srh1", "My temp");
+        assert!(user_style_override_active(
+            &settings,
+            &override_test_field("wrf_srh1")
+        ));
+
+        // Deleting the table prunes its bindings — no dangling override.
+        settings.remove_table("My temp");
+        assert!(!user_style_override_active(&settings, &field));
     }
 
     #[test]
