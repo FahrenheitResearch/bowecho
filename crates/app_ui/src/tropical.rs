@@ -395,6 +395,12 @@ impl crate::ViewerApp {
                 );
             }
         }
+        // Paint the cone of uncertainty + observed track (built above) BEFORE
+        // the forecast overlay so the dots/line sit on top. (Regression guard:
+        // this `painter.extend(shapes)` was dropped when the forecast overlay
+        // was added, which silently hid the cone and past track.)
+        painter.extend(shapes);
+
         // Forecast track: a thin line joining the current position to each
         // official forecast point, drawn under the dots.
         let mut forecast_lines: Vec<egui::Shape> = Vec::new();
