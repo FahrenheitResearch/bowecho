@@ -2634,6 +2634,11 @@ struct ViewerApp {
     inspector_show_range_az: bool,
     inspector_show_beam: bool,
     inspector_show_model: bool,
+    /// Field Loupe: circular GPU magnifier at the cursor (also toggled on by
+    /// holding Shift). Inspired by Solarpower07's WRF-Runner loupe.
+    inspector_show_loupe: bool,
+    /// Color swatch + `#RRGGBB` chip on the inspector card's value line.
+    inspector_show_hex: bool,
     /// Inverse geolocation for the latest model grid, INDEPENDENT of any
     /// map layer — powers Alt+click soundings and the model hover readout
     /// without requiring "Show on radar map" first. Keyed by grid hash.
@@ -7330,6 +7335,10 @@ impl ViewerApp {
             inspector_show_range_az: true,
             inspector_show_beam: true,
             inspector_show_model: true,
+            // Loupe is off by default (a Shift-hold magnifier); the hex chip
+            // rides the card whenever a value resolves.
+            inspector_show_loupe: false,
+            inspector_show_hex: true,
             model_lut: None,
             model_lut_rx: None,
             model_enabled: true,
@@ -23778,6 +23787,14 @@ impl ViewerApp {
             ui.checkbox(&mut self.inspector_show_range_az, "Range / azimuth / tilt");
             ui.checkbox(&mut self.inspector_show_beam, "Beam height");
             ui.checkbox(&mut self.inspector_show_model, "Model value");
+            ui.checkbox(&mut self.inspector_show_hex, "Color swatch + hex")
+                .on_hover_text(
+                    "Show the sampled field color as a chip plus its #RRGGBB value on the card.",
+                );
+            ui.checkbox(&mut self.inspector_show_loupe, "Field loupe")
+                .on_hover_text(
+                    "Circular GPU magnifier at the cursor showing the pixelated field, its value, color and coordinates. Hold Shift to summon it momentarily even when this is off. Loupe design inspired by Solarpower07's WRF-Runner.",
+                );
         });
         ui.checkbox(&mut self.show_inspector_card, "Inspector card")
             .on_hover_text(
@@ -37291,12 +37308,13 @@ impl ViewerApp {
             .as_deref()
             .and_then(|station| self.obs_history_data(station, history_frame_time));
 
-        // Card lines (radar block only when a gate resolves).
+        // Card lines. The coordinate line is ALWAYS shown (Solarpower07's
+        // loupe convention: N/S + E/W); `swatches` pins a color chip to a
+        // line index so the field's color rides next to its #RRGGBB value.
         let mut lines = Vec::new();
-        if readout.is_none() {
-            let (lon, lat) = self.screen_to_lon_lat(rect, anchor);
-            lines.push(format!("{lat:.3}, {lon:.3}"));
-        }
+        let mut swatches: Vec<(usize, egui::Color32)> = Vec::new();
+        let (cursor_lon, cursor_lat) = self.screen_to_lon_lat(rect, anchor);
+        lines.push(format_lat_lon(cursor_lat, cursor_lon));
         if let Some(readout) = &readout {
             // Value in the active table's declared unit space (an mph
             // velocity table reads out mph) — the SI diagnostics below
@@ -37313,6 +37331,19 @@ impl ViewerApp {
                 if units.is_empty() { "" } else { " " },
                 units
             ));
+            // Color chip + hex from the SAME palette the raster is painted
+            // with (value → table color, never a framebuffer read). A
+            // transparent sample (below display threshold) contributes no
+            // chip — the gate reads out but paints nothing.
+            if self.inspector_show_hex {
+                let c = self
+                    .active_table_for_product(&readout.product)
+                    .color_for_value(readout.value);
+                if c[3] > 0 {
+                    swatches.push((lines.len(), egui::Color32::from_rgb(c[0], c[1], c[2])));
+                    lines.push(hex_rgb_line(c));
+                }
+            }
             if !self.inspector_show_raw_vel {
             } else if let Some(base) = readout.base_value {
                 let nyquist = readout
@@ -37400,6 +37431,12 @@ impl ViewerApp {
                 // was smothering it).
                 let at = lines.len().min(1);
                 lines.insert(at, line);
+                // Keep color chips anchored to their (now shifted) lines.
+                for swatch in &mut swatches {
+                    if swatch.0 >= at {
+                        swatch.0 += 1;
+                    }
+                }
             }
             ob_matched
         } else {
@@ -37412,8 +37449,11 @@ impl ViewerApp {
         // field when no layer produced a value.
         let _ = ob_owns_card;
         if self.model_enabled && self.inspector_show_model {
-            let (lon, lat) = self.screen_to_lon_lat(rect, anchor);
             let mut shown = false;
+            // The topmost model layer contributes the color chip, but only
+            // when no radar gate already owns the value line (then the chip
+            // above matches the radar raster, not the model raster).
+            let mut model_chip: Option<(usize, egui::Color32)> = None;
             for slot in self
                 .model_layers
                 .iter()
@@ -37421,13 +37461,25 @@ impl ViewerApp {
                 .filter(|slot| slot.layer.visible)
             {
                 let field = &slot.layer.field;
-                if let Some(index) = slot.layer.lut.lookup(lat, lon)
+                if let Some(index) = slot.layer.lut.lookup(cursor_lat, cursor_lon)
                     && let Some(value) = field.values.get(index).copied()
                     && value.is_finite()
                 {
                     lines.push(format!("{} {:.1} {}", field.key.var, value, field.units));
+                    if model_chip.is_none()
+                        && readout.is_none()
+                        && self.inspector_show_hex
+                        && let Some(c) = self.model_layer_color_for_value(&slot.layer, value)
+                        && c[3] > 0
+                    {
+                        model_chip = Some((lines.len(), egui::Color32::from_rgb(c[0], c[1], c[2])));
+                        lines.push(hex_rgb_line(c));
+                    }
                     shown = true;
                 }
+            }
+            if let Some(chip) = model_chip {
+                swatches.push(chip);
             }
             if !shown
                 && let Some((_, lut)) = &self.model_lut
@@ -37435,7 +37487,7 @@ impl ViewerApp {
                     .model_dock
                     .as_ref()
                     .and_then(|dock| dock.latest_field())
-                && let Some(index) = lut.lookup(lat, lon)
+                && let Some(index) = lut.lookup(cursor_lat, cursor_lon)
                 && let Some(value) = field.values.get(index).copied()
                 && value.is_finite()
             {
@@ -37533,9 +37585,24 @@ impl ViewerApp {
         painter.line_segment([card.right_bottom(), card.left_bottom()], border);
         painter.line_segment([card.left_bottom(), card.left_top()], border);
         let mut y = card.top() + 5.0;
-        for galley in galleys {
+        for (idx, galley) in galleys.into_iter().enumerate() {
             let size = galley.size();
             painter.galley(egui::pos2(card.left() + 7.0, y), galley, text_color);
+            // Color chip in the reserved left gutter of a #RRGGBB line.
+            if let Some((_, color)) = swatches.iter().find(|(line, _)| *line == idx) {
+                let chip = 11.0;
+                let chip_rect = egui::Rect::from_min_size(
+                    egui::pos2(card.left() + 8.0, y + (size.y - chip) * 0.5),
+                    egui::vec2(chip, chip),
+                );
+                painter.rect_filled(chip_rect, 2.0, *color);
+                painter.rect_stroke(
+                    chip_rect,
+                    2.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(20)),
+                    egui::StrokeKind::Outside,
+                );
+            }
             y += size.y + 2.0;
         }
         if let Some(history) = &obs_history {
@@ -37561,6 +37628,227 @@ impl ViewerApp {
                     self.units(),
                 );
             }
+        }
+        // Field Loupe: circular GPU magnifier at the focus point. Drawn last
+        // so it rides above the card when the two overlap.
+        self.draw_cursor_loupe(painter, rect, anchor, readout.is_some());
+    }
+
+    /// A circular, pixelated GPU magnifier ("Field Loupe") anchored at the
+    /// cursor — inspired by Solarpower07's WRF-Runner loupe.
+    ///
+    /// Fully native and GPU-resident: it builds ONE [`egui::Mesh`] triangle-fan
+    /// over a disk and gives each vertex a texture UV computed by inverting the
+    /// exact same raster transform the field is drawn with — the planar-ENU
+    /// radar raster (rotate about the radar pivot + [`anchored_radar_texture_rect`])
+    /// or the full-viewport model raster. The GPU then samples the field texture
+    /// that is already uploaded, so there is NO CPU per-pixel loop and NO
+    /// framebuffer / `getImageData`-style readback. The NEAREST sampler
+    /// ([`radar_texture_options`]) supplies the pixelated look for free.
+    ///
+    /// Shown when the `inspector_show_loupe` toggle is on OR Shift is held.
+    fn draw_cursor_loupe(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        anchor: egui::Pos2,
+        radar_has_gate: bool,
+    ) {
+        let shift_held = painter.ctx().input(|input| input.modifiers.shift);
+        if !(self.inspector_show_loupe || shift_held) {
+            return;
+        }
+        if !rect.contains(anchor) {
+            return;
+        }
+        let Some(source) = self.loupe_source(painter.ctx(), rect, anchor, radar_has_gate) else {
+            return;
+        };
+
+        // Disk geometry. MAGNIFY is the loupe's optical zoom: a rim vertex at
+        // screen offset `d` from the loupe center samples the field at
+        // `focus + d / MAGNIFY`, so a small patch around the focus fills the
+        // whole disk (the "scaled toward the cursor by 1/zoom" mapping).
+        const RADIUS: f32 = 70.0;
+        const MAGNIFY: f32 = 6.0;
+        const RIM: usize = 72;
+        let focus = anchor;
+
+        // Edge-clamp: float the disk above the cursor, flip below if it would
+        // clip the top, then keep the whole disk inside the pane.
+        let margin = RADIUS + 6.0;
+        let mut center = egui::pos2(anchor.x, anchor.y - (RADIUS + 34.0));
+        if center.y - RADIUS < rect.top() + 4.0 {
+            center.y = anchor.y + (RADIUS + 34.0);
+        }
+        center.x = center.x.clamp(rect.left() + margin, rect.right() - margin);
+        center.y = center.y.clamp(rect.top() + margin, rect.bottom() - margin);
+
+        let to_uv = |q: egui::Pos2| -> egui::Pos2 {
+            source.screen_to_uv(loupe_sample_screen(focus, center, q, MAGNIFY))
+        };
+        let tint = egui::Color32::WHITE;
+        let mut mesh = egui::epaint::Mesh::with_texture(source.texture_id);
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: center,
+            uv: to_uv(center),
+            color: tint,
+        });
+        for i in 0..RIM {
+            let theta = std::f32::consts::TAU * i as f32 / RIM as f32;
+            let q = center + RADIUS * egui::vec2(theta.cos(), theta.sin());
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: q,
+                uv: to_uv(q),
+                color: tint,
+            });
+        }
+        for i in 0..RIM {
+            let a = 1 + i as u32;
+            let b = 1 + ((i + 1) % RIM) as u32;
+            mesh.indices.extend_from_slice(&[0, a, b]);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+
+        // Ring (dark halo + bright rim) and a center crosshair marking the
+        // exact focus gate/point.
+        painter.circle_stroke(
+            center,
+            RADIUS,
+            egui::Stroke::new(3.0, egui::Color32::from_rgb(12, 15, 20)),
+        );
+        painter.circle_stroke(
+            center,
+            RADIUS,
+            egui::Stroke::new(1.4, egui::Color32::from_rgb(232, 238, 246)),
+        );
+        let cross = 8.0;
+        let cross_stroke = egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 190),
+        );
+        painter.line_segment(
+            [
+                center - egui::vec2(cross, 0.0),
+                center + egui::vec2(cross, 0.0),
+            ],
+            cross_stroke,
+        );
+        painter.line_segment(
+            [
+                center - egui::vec2(0.0, cross),
+                center + egui::vec2(0.0, cross),
+            ],
+            cross_stroke,
+        );
+    }
+
+    /// The field texture the loupe magnifies under the cursor, with the exact
+    /// screen→UV inverse to sample it. Radar wins when a gate resolves under
+    /// the cursor (it draws on top); otherwise the topmost visible model layer
+    /// the value line is reading takes over, falling back to the radar raster.
+    fn loupe_source(
+        &self,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        anchor: egui::Pos2,
+        radar_has_gate: bool,
+    ) -> Option<LoupeSource> {
+        let (lon, lat) = self.screen_to_lon_lat(rect, anchor);
+        let radar = self.loupe_radar_source(ctx, rect);
+        let model = self.loupe_model_source(rect, lat, lon);
+        match (radar_has_gate, radar, model) {
+            (true, Some(radar), _) => Some(radar),
+            (_, _, Some(model)) => Some(model),
+            (_, Some(radar), None) => Some(radar),
+            _ => None,
+        }
+    }
+
+    /// The primary radar raster + its screen→UV inverse (mirrors
+    /// [`Self::draw_radar_layer`] so the loupe samples exactly what is drawn).
+    fn loupe_radar_source(&self, ctx: &egui::Context, rect: egui::Rect) -> Option<LoupeSource> {
+        let texture = self.texture.as_ref()?;
+        let key = self.texture_key.as_ref()?;
+        let (radar_lat, radar_lon) = self.radar_location()?;
+        let image_rect = self.radar_texture_rect(ctx, rect, radar_lat, radar_lon, key);
+        let baked = pane_or_key_rotation_rad(&self.texture_key);
+        let angle = self.aeqd_north_angle(rect, radar_lat, radar_lon) - baked;
+        let pivot = self.lon_lat_to_screen(rect, radar_lon, radar_lat);
+        Some(LoupeSource {
+            texture_id: texture.id(),
+            kind: LoupeKind::Rotated {
+                image_rect,
+                pivot,
+                angle,
+            },
+        })
+    }
+
+    /// The topmost visible model layer whose rendered texture matches the
+    /// current view AND resolves a finite value at the cursor. That texture
+    /// is painted 1:1 across the pane, so its screen→UV inverse is a plain
+    /// normalization within `rect`.
+    fn loupe_model_source(&self, rect: egui::Rect, lat: f32, lon: f32) -> Option<LoupeSource> {
+        if !self.model_enabled {
+            return None;
+        }
+        let view = self.model_layer_current_view();
+        for slot in self.model_layers.iter().rev().filter(|s| s.layer.visible) {
+            let Some((texture, generation, rendered)) = slot.texture.as_ref() else {
+                continue;
+            };
+            if *generation != slot.layer.generation
+                || model_layer_view_needs_rerender(rendered, &view)
+            {
+                continue;
+            }
+            let Some(index) = slot.layer.lut.lookup(lat, lon) else {
+                continue;
+            };
+            let Some(value) =
+                model_layer::sample_field_value(slot.layer.field.as_ref(), index, lat, lon)
+            else {
+                continue;
+            };
+            if !value.is_finite() {
+                continue;
+            }
+            return Some(LoupeSource {
+                texture_id: texture.id(),
+                kind: LoupeKind::Rect { rect },
+            });
+        }
+        None
+    }
+
+    /// The on-screen color a model layer paints for `value`, replicating
+    /// [`Self::draw_model_layers`]: BowEcho palette override, else the
+    /// rusty-weather production style, else the generic normalized ramp.
+    fn model_layer_color_for_value(
+        &self,
+        layer: &model_layer::ModelMapLayer,
+        value: f32,
+    ) -> Option<[u8; 4]> {
+        if !value.is_finite() {
+            return None;
+        }
+        if let Some(family) = layer.custom_color_family {
+            Some(
+                self.color_tables
+                    .for_family(family)
+                    .sample(value)
+                    .to_array(),
+            )
+        } else if let Some(cmap) = &layer.production {
+            let rgba = cmap.map(f64::from(value));
+            Some([rgba.r, rgba.g, rgba.b, rgba.a])
+        } else if let Some((vmin, vmax)) = layer.field.range {
+            let t = rw_ui::colormap::normalize(value, vmin, vmax);
+            let c = layer.colormap.sample(t);
+            Some([c.r(), c.g(), c.b(), c.a()])
+        } else {
+            None
         }
     }
 
@@ -42559,6 +42847,86 @@ fn pane_or_key_rotation_rad(key: &Option<TextureKey>) -> f32 {
     key.as_ref()
         .map(|key| key.viewport.rotation_mrad as f32 / 1000.0)
         .unwrap_or(0.0)
+}
+
+/// The field texture the Field Loupe magnifies plus the inverse of the raster
+/// transform used to draw it (screen position → texture UV). Both variants
+/// invert an existing forward transform exactly, so the loupe samples the same
+/// pixels the field already draws — no CPU pixel work.
+#[derive(Clone, Copy)]
+struct LoupeSource {
+    texture_id: egui::TextureId,
+    kind: LoupeKind,
+}
+
+#[derive(Clone, Copy)]
+enum LoupeKind {
+    /// Planar-ENU radar raster: an axis-aligned `image_rect` (UV 0..1) rotated
+    /// by `angle` about `pivot`, exactly as [`paint_rotated_image`] draws it.
+    Rotated {
+        image_rect: egui::Rect,
+        pivot: egui::Pos2,
+        angle: f32,
+    },
+    /// Full-viewport model raster painted 1:1 across `rect` with UV 0..1.
+    Rect { rect: egui::Rect },
+}
+
+impl LoupeSource {
+    /// Screen position → texture UV, the inverse of the raster's forward map.
+    /// UVs outside 0..1 are fine: the NEAREST sampler clamps to the texture
+    /// edge (transparent at the radar raster boundary), so the loupe degrades
+    /// gracefully at the coverage edge instead of wrapping.
+    fn screen_to_uv(&self, screen: egui::Pos2) -> egui::Pos2 {
+        match self.kind {
+            LoupeKind::Rotated {
+                image_rect,
+                pivot,
+                angle,
+            } => {
+                // Forward: screen = pivot + R(angle) · (axis − pivot).
+                // Inverse: axis = pivot + R(−angle) · (screen − pivot).
+                let (sin, cos) = angle.sin_cos();
+                let d = screen - pivot;
+                let axis = pivot + egui::vec2(d.x * cos + d.y * sin, -d.x * sin + d.y * cos);
+                egui::pos2(
+                    (axis.x - image_rect.left()) / image_rect.width().max(f32::EPSILON),
+                    (axis.y - image_rect.top()) / image_rect.height().max(f32::EPSILON),
+                )
+            }
+            LoupeKind::Rect { rect } => egui::pos2(
+                (screen.x - rect.left()) / rect.width().max(f32::EPSILON),
+                (screen.y - rect.top()) / rect.height().max(f32::EPSILON),
+            ),
+        }
+    }
+}
+
+/// The screen position a loupe rim point samples: offsets from the loupe
+/// `center` shrink by `1/magnify` toward the `focus`, so a small patch around
+/// the focus fills the whole disk (the loupe's optical zoom — "scaled toward
+/// the cursor by 1/zoom"). At the center point this returns the focus exactly.
+fn loupe_sample_screen(
+    focus: egui::Pos2,
+    center: egui::Pos2,
+    point: egui::Pos2,
+    magnify: f32,
+) -> egui::Pos2 {
+    focus + (point - center) / magnify.max(f32::EPSILON)
+}
+
+/// Coordinate line in Solarpower07's loupe convention: absolute degrees with a
+/// hemisphere letter, e.g. `39.322N, 83.959W`.
+fn format_lat_lon(lat: f32, lon: f32) -> String {
+    let ns = if lat >= 0.0 { 'N' } else { 'S' };
+    let ew = if lon >= 0.0 { 'E' } else { 'W' };
+    format!("{:.3}{}, {:.3}{}", lat.abs(), ns, lon.abs(), ew)
+}
+
+/// `#RRGGBB` card line for a sampled color, with a 3-space gutter reserved for
+/// the color chip drawn over it.
+fn hex_rgb_line(rgba: [u8; 4]) -> String {
+    format!("   #{:02X}{:02X}{:02X}", rgba[0], rgba[1], rgba[2])
 }
 
 fn paint_rotated_image(
@@ -70359,6 +70727,523 @@ mod tests {
     }
 
     #[test]
+    fn loupe_coordinate_line_uses_hemisphere_letters() {
+        // Solarpower07 loupe convention: absolute degrees + N/S, E/W.
+        assert_eq!(format_lat_lon(39.322, -83.959), "39.322N, 83.959W");
+        assert_eq!(format_lat_lon(-33.865, 151.209), "33.865S, 151.209E");
+        assert_eq!(format_lat_lon(0.0, 0.0), "0.000N, 0.000E");
+    }
+
+    #[test]
+    fn loupe_hex_line_reserves_chip_gutter_and_pins_value_color() {
+        // A value → the SAME palette color the raster paints, then #RRGGBB.
+        let table = color_tables::ColorTable::new(
+            "loupe-test",
+            vec![
+                color_tables::ColorStop {
+                    value: 20.0,
+                    color: color_tables::Rgba8::opaque(35, 120, 200),
+                    end_color: None,
+                },
+                color_tables::ColorStop {
+                    value: 50.0,
+                    color: color_tables::Rgba8::opaque(210, 40, 40),
+                    end_color: None,
+                },
+            ],
+        )
+        .expect("valid loupe test table");
+
+        // value <= first stop resolves to the first stop's exact color.
+        let rgba = table.color_for_value(15.0);
+        assert_eq!(rgba, [35, 120, 200, 255]);
+        assert_eq!(hex_rgb_line(rgba), "   #2378C8");
+
+        // exact hit on the upper stop.
+        assert_eq!(hex_rgb_line(table.color_for_value(50.0)), "   #D22828");
+    }
+
+    #[test]
+    fn loupe_rect_source_normalizes_screen_within_pane() {
+        // Full-viewport model raster: screen → uv is a plain normalization.
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(200.0, 100.0));
+        let source = LoupeSource {
+            texture_id: egui::TextureId::default(),
+            kind: LoupeKind::Rect { rect },
+        };
+        let uv = source.screen_to_uv(egui::pos2(60.0, 70.0));
+        assert!((uv.x - 0.25).abs() < 1e-5, "uv.x={}", uv.x);
+        assert!((uv.y - 0.5).abs() < 1e-5, "uv.y={}", uv.y);
+        // Corners map to the UV corners.
+        let tl = source.screen_to_uv(rect.left_top());
+        assert!(tl.x.abs() < 1e-5 && tl.y.abs() < 1e-5);
+        let br = source.screen_to_uv(rect.right_bottom());
+        assert!((br.x - 1.0).abs() < 1e-5 && (br.y - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn loupe_rotated_source_inverts_the_radar_raster_transform() {
+        // The rotated inverse must exactly undo paint_rotated_image's forward
+        // map so the loupe samples the gate actually drawn under the cursor.
+        let image_rect =
+            egui::Rect::from_min_size(egui::pos2(-40.0, -30.0), egui::vec2(160.0, 120.0));
+        let pivot = egui::pos2(25.0, 15.0);
+        let angle = 0.37_f32;
+        let source = LoupeSource {
+            texture_id: egui::TextureId::default(),
+            kind: LoupeKind::Rotated {
+                image_rect,
+                pivot,
+                angle,
+            },
+        };
+        // Forward transform (mirror of paint_rotated_image): uv → axis → rotate.
+        let (sin, cos) = angle.sin_cos();
+        let forward = |u: f32, v: f32| -> egui::Pos2 {
+            let axis = egui::pos2(
+                image_rect.left() + u * image_rect.width(),
+                image_rect.top() + v * image_rect.height(),
+            );
+            let d = axis - pivot;
+            pivot + egui::vec2(d.x * cos - d.y * sin, d.x * sin + d.y * cos)
+        };
+        for &(u, v) in &[(0.0, 0.0), (1.0, 0.0), (0.3, 0.8), (0.5, 0.5), (1.0, 1.0)] {
+            let screen = forward(u, v);
+            let uv = source.screen_to_uv(screen);
+            assert!(
+                (uv.x - u).abs() < 1e-3 && (uv.y - v).abs() < 1e-3,
+                "round trip failed for ({u},{v}): got ({},{})",
+                uv.x,
+                uv.y
+            );
+        }
+    }
+
+    #[test]
+    fn loupe_magnification_shrinks_offsets_toward_focus() {
+        // Center vertex samples the focus exactly; a rim offset shrinks by 1/M.
+        let focus = egui::pos2(50.0, 50.0);
+        let center = egui::pos2(30.0, 30.0);
+        assert_eq!(loupe_sample_screen(focus, center, center, 6.0), focus);
+        let rim = center + egui::vec2(60.0, 0.0);
+        let sampled = loupe_sample_screen(focus, center, rim, 6.0);
+        // 60 px on the disk → 10 px around the focus (6× optical zoom).
+        assert!((sampled.x - 60.0).abs() < 1e-4, "x={}", sampled.x);
+        assert!((sampled.y - 50.0).abs() < 1e-4, "y={}", sampled.y);
+    }
+
+    // ---------- REAL-DATA loupe verification (ignored by default) ----------
+    // These render a REAL Level-II volume and a REAL model field, drive the
+    // SHIPPED loupe transform (`LoupeSource::screen_to_uv` + `loupe_sample_screen`)
+    // over the real texture pixels, and write PNGs for visual inspection.
+    // Run with:
+    //   cargo test -p app_ui loupe_magnifies_real -- --ignored --nocapture
+    // Output dir: $BOWECHO_LOUPE_OUT (default: the system temp dir).
+
+    /// NEAREST-sample the field texture at a screen position exactly as the
+    /// GPU sampler does for the loupe mesh: invert the raster transform to a
+    /// UV, then floor to a texel (matching `radar_texture_options` NEAREST).
+    fn loupe_nearest_texel(
+        texture: &image::RgbaImage,
+        source: &LoupeSource,
+        screen: egui::Pos2,
+    ) -> image::Rgba<u8> {
+        let uv = source.screen_to_uv(screen);
+        let (tw, th) = (texture.width(), texture.height());
+        let px = (uv.x * tw as f32).floor();
+        let py = (uv.y * th as f32).floor();
+        if px >= 0.0 && py >= 0.0 && (px as u32) < tw && (py as u32) < th {
+            *texture.get_pixel(px as u32, py as u32)
+        } else {
+            image::Rgba([0, 0, 0, 0])
+        }
+    }
+
+    /// The un-magnified "screen" render: the texture painted through the SAME
+    /// transform the loupe inverts. A wrong inverse would garble this image.
+    fn loupe_screen_image(
+        texture: &image::RgbaImage,
+        source: &LoupeSource,
+        out_w: u32,
+        out_h: u32,
+    ) -> image::RgbaImage {
+        let mut out = image::RgbaImage::from_pixel(out_w, out_h, image::Rgba([10, 12, 16, 255]));
+        for y in 0..out_h {
+            for x in 0..out_w {
+                let texel = loupe_nearest_texel(
+                    texture,
+                    source,
+                    egui::pos2(x as f32 + 0.5, y as f32 + 0.5),
+                );
+                if texel[3] > 0 {
+                    out.put_pixel(x, y, texel);
+                }
+            }
+        }
+        out
+    }
+
+    /// The circular magnified disk, built the SAME way `draw_cursor_loupe`
+    /// builds its GPU mesh: each disk point maps back through
+    /// `loupe_sample_screen` then `screen_to_uv`, then NEAREST-samples.
+    /// Returns the disk image and the number of distinct source texels shown
+    /// (proves it is really magnifying a neighborhood, not a flat fill).
+    fn loupe_disk_image(
+        texture: &image::RgbaImage,
+        source: &LoupeSource,
+        focus: egui::Pos2,
+        radius: f32,
+        magnify: f32,
+    ) -> (image::RgbaImage, usize) {
+        let size = (radius * 2.0).ceil() as u32 + 2;
+        let center = egui::pos2(size as f32 / 2.0, size as f32 / 2.0);
+        let mut out = image::RgbaImage::from_pixel(size, size, image::Rgba([16, 18, 24, 255]));
+        let mut seen = std::collections::HashSet::new();
+        for y in 0..size {
+            for x in 0..size {
+                let q = egui::pos2(x as f32 + 0.5, y as f32 + 0.5);
+                if q.distance(center) > radius {
+                    continue;
+                }
+                let screen = loupe_sample_screen(focus, center, q, magnify);
+                let uv = source.screen_to_uv(screen);
+                let px = (uv.x * texture.width() as f32).floor() as i64;
+                let py = (uv.y * texture.height() as f32).floor() as i64;
+                seen.insert((px, py));
+                let texel = loupe_nearest_texel(texture, source, screen);
+                if texel[3] > 0 {
+                    out.put_pixel(x, y, texel);
+                }
+            }
+        }
+        (out, seen.len())
+    }
+
+    fn loupe_out_dir() -> PathBuf {
+        std::env::var("BOWECHO_LOUPE_OUT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir())
+    }
+
+    #[test]
+    #[ignore = "renders a REAL KEAX Level-II volume and writes loupe PNGs"]
+    fn loupe_magnifies_real_keax_reflectivity() {
+        let file = std::env::var("BOWECHO_LOUPE_KEAX")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| cache_dir("KEAX").join("KEAX20260609_025238_V06"));
+        let raw =
+            std::fs::read(&file).unwrap_or_else(|err| panic!("read {}: {err}", file.display()));
+        let volume = nexrad_io::decode_volume_from_bytes(&raw)
+            .unwrap_or_else(|err| panic!("decode {}: {err}", file.display()));
+        let cut_index = (0..volume.cuts.len())
+            .filter(|&index| {
+                volume.cuts[index]
+                    .moments
+                    .get(&MomentType::Reflectivity)
+                    .is_some_and(|grid| !grid.radial_indices.is_empty())
+            })
+            .min_by(|&a, &b| {
+                volume.cuts[a]
+                    .elevation_deg
+                    .total_cmp(&volume.cuts[b].elevation_deg)
+            })
+            .expect("KEAX volume has a reflectivity cut");
+
+        // The app's `self.texture`: a viewport raster of the lowest tilt.
+        let (w, h) = (900u32, 700u32);
+        let opts = ViewportRasterOptions {
+            width: w,
+            height: h,
+            radar_x_px: w as f32 * 0.5,
+            radar_y_px: h as f32 * 0.5,
+            km_per_px_x: 0.55,
+            km_per_px_y: 0.55,
+            rotation_rad: 0.0,
+        };
+        let texture = render2d::render_moment_viewport_image(
+            &volume,
+            cut_index,
+            MomentType::Reflectivity,
+            opts,
+        )
+        .expect("viewport reflectivity raster");
+        let (tw, th) = (texture.width(), texture.height());
+
+        // The radar raster is planar-ENU rotated by the AEQD convergence at
+        // DRAW time — exercise the ROTATED loupe inverse on real pixels.
+        let angle = 0.06_f32;
+        let source = LoupeSource {
+            texture_id: egui::TextureId::default(),
+            kind: LoupeKind::Rotated {
+                image_rect: egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(tw as f32, th as f32),
+                ),
+                pivot: egui::pos2(opts.radar_x_px, opts.radar_y_px),
+                angle,
+            },
+        };
+
+        let screen = loupe_screen_image(&texture, &source, tw, th);
+
+        // Cursor = strongest-echo screen pixel (warm reflectivity core).
+        let mut focus = egui::pos2(tw as f32 / 2.0, th as f32 / 2.0);
+        let mut best = i32::MIN;
+        for y in 0..th {
+            for x in 0..tw {
+                let p = screen.get_pixel(x, y);
+                if p[3] == 0 {
+                    continue;
+                }
+                let warmth = 2 * p[0] as i32 - p[2] as i32;
+                if warmth > best {
+                    best = warmth;
+                    focus = egui::pos2(x as f32 + 0.5, y as f32 + 0.5);
+                }
+            }
+        }
+        assert!(
+            best > i32::MIN,
+            "no opaque reflectivity echo in real KEAX raster"
+        );
+
+        // Readout at the cursor, in TEXTURE (planar-ENU) space.
+        let uv = source.screen_to_uv(focus);
+        let tex = egui::pos2(uv.x * tw as f32, uv.y * th as f32);
+        let east_km = (tex.x - opts.radar_x_px) * opts.km_per_px_x;
+        let north_km = (opts.radar_y_px - tex.y) * opts.km_per_px_y;
+        let range_km = east_km.hypot(north_km);
+        let mut azimuth = east_km.atan2(north_km).to_degrees();
+        if azimuth < 0.0 {
+            azimuth += 360.0;
+        }
+        let cut = &volume.cuts[cut_index];
+        let grid = cut.moments.get(&MomentType::Reflectivity).unwrap();
+        let (radar_lat, radar_lon) = (
+            volume.site.latitude_deg.unwrap(),
+            volume.site.longitude_deg.unwrap(),
+        );
+        let (lat, lon) = aeqd_inverse_km(
+            radar_lat as f64,
+            radar_lon as f64,
+            east_km as f64,
+            north_km as f64,
+        );
+        let table = ColorTableSet::default()
+            .for_family(ColorTableFamily::Reflectivity)
+            .clone();
+        let dbz = nearest_grid_row(cut, grid, azimuth)
+            .and_then(|(row, _)| gate_for_range(grid, range_km).map(|gate| (row, gate)))
+            .and_then(|(row, gate)| grid.scaled_value(row, gate))
+            .filter(|value| value.is_finite());
+        let hex = dbz
+            .map(|value| hex_rgb_line(table.color_for_value(value)))
+            .unwrap_or_else(|| "   (no data)".to_owned());
+
+        // Loupe center samples EXACTLY the focused screen texel.
+        let (disk, distinct) = loupe_disk_image(&texture, &source, focus, 70.0, 6.0);
+        let center_texel = loupe_nearest_texel(&texture, &source, focus);
+        assert_eq!(
+            center_texel,
+            *screen.get_pixel(focus.x as u32, focus.y as u32),
+            "loupe center must sample the gate under the cursor"
+        );
+        assert!(
+            center_texel[3] > 0,
+            "loupe center should sit on an opaque echo"
+        );
+        assert!(
+            distinct >= 16,
+            "loupe must magnify a real neighborhood, saw {distinct} distinct texels"
+        );
+
+        let out = loupe_out_dir();
+        screen.save(out.join("keax_loupe_screen.png")).unwrap();
+        texture.save(out.join("keax_texture.png")).unwrap();
+        disk.save(out.join("keax_loupe_disk.png")).unwrap();
+        eprintln!(
+            "KEAX {} tilt {:.2}° cursor=({:.0},{:.0}) → {} @ {:.1} km {:03.0}° | REF {}{} | {} | disk texels={} | PNGs in {}",
+            volume.site.id,
+            cut.elevation_deg,
+            focus.x,
+            focus.y,
+            format_lat_lon(lat as f32, lon as f32),
+            range_km,
+            azimuth,
+            dbz.map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| "n/a".into()),
+            dbz.map(|_| " dBZ").unwrap_or(""),
+            hex.trim_start(),
+            distinct,
+            out.display()
+        );
+    }
+
+    #[test]
+    #[ignore = "renders a REAL model field from the rusty-weather store and writes loupe PNGs"]
+    fn loupe_magnifies_real_hrrr_model_field() {
+        let root = std::env::var("BOWECHO_LOUPE_STORE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(r"C:\Users\drew\rusty-weather\store"));
+        if !root.exists() {
+            eprintln!("skip: no model store at {}", root.display());
+            return;
+        }
+        let view = rw_ui::StoreView::new(&root);
+        let tree = view.enumerate();
+        let model = tree
+            .models
+            .iter()
+            .find(|m| m.model == "hrrr")
+            .or_else(|| tree.models.first())
+            .expect("at least one model in the store");
+        let run = model.runs.first().expect("a run (newest first)");
+        let hour = run.hours.first().map(|h| h.hour).unwrap_or(0);
+        let reader = view
+            .open_hour(&model.model, &run.run, hour)
+            .expect("open hour file");
+        let var = reader
+            .meta()
+            .variables
+            .iter()
+            .find(|v| v.levels_hpa.is_empty())
+            .expect("a 2D (surface) variable");
+        let values = reader.read_full_2d(&var.name).expect("read 2D field");
+        let grid = match view.open_grid(&model.model, &run.run) {
+            Ok(grid) => grid,
+            Err(err) => {
+                eprintln!("skip: no readable grid.rwg: {err}");
+                return;
+            }
+        };
+        let lut = model_layer::InverseLut::build(&grid.lat, &grid.lon).expect("inverse LUT");
+        let (vmin, vmax) = rw_ui::colormap::finite_min_max(&values).expect("finite field range");
+        let colormap = rw_ui::colormap::Colormap::default();
+
+        // View centered on the grid, scaled so the field fills the pane —
+        // the same AEQD screen frame `draw_model_layers` renders into.
+        let (mut lat_min, mut lat_max) = (f32::INFINITY, f32::NEG_INFINITY);
+        let (mut lon_min, mut lon_max) = (f32::INFINITY, f32::NEG_INFINITY);
+        for (&la, &lo) in grid.lat.iter().zip(grid.lon.iter()) {
+            if la.is_finite() && lo.is_finite() {
+                lat_min = lat_min.min(la);
+                lat_max = lat_max.max(la);
+                lon_min = lon_min.min(lo);
+                lon_max = lon_max.max(lo);
+            }
+        }
+        let center_lat = (lat_min + lat_max) * 0.5;
+        let center_lon = (lon_min + lon_max) * 0.5;
+        let (mw, mh) = (900u32, 700u32);
+        let km_per_pt = ((lat_max - lat_min) as f64 * 111.32 / mh as f64) * 1.08;
+
+        // Render the model texture EXACTLY as draw_model_layers does:
+        // aeqd_inverse → LUT → value → colormap.sample(normalize(...)).
+        let mut texture = image::RgbaImage::from_pixel(mw, mh, image::Rgba([0, 0, 0, 0]));
+        for y in 0..mh {
+            for x in 0..mw {
+                let east_km = (x as f64 - mw as f64 / 2.0) * km_per_pt;
+                let north_km = (mh as f64 / 2.0 - y as f64) * km_per_pt;
+                let (lat, lon) =
+                    aeqd_inverse_km(center_lat as f64, center_lon as f64, east_km, north_km);
+                let Some(index) = lut.lookup(lat as f32, lon as f32) else {
+                    continue;
+                };
+                let Some(&value) = values.get(index) else {
+                    continue;
+                };
+                if !value.is_finite() {
+                    continue;
+                }
+                let t = rw_ui::colormap::normalize(value, vmin, vmax);
+                let c = colormap.sample(t);
+                texture.put_pixel(x, y, image::Rgba([c.r(), c.g(), c.b(), 255]));
+            }
+        }
+
+        // Model rasters are painted 1:1 across the pane → the Rect loupe kind.
+        let source = LoupeSource {
+            texture_id: egui::TextureId::default(),
+            kind: LoupeKind::Rect {
+                rect: egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(mw as f32, mh as f32),
+                ),
+            },
+        };
+
+        // Cursor = strongest-value opaque pixel (visible gradient to magnify).
+        let mut focus = egui::pos2(mw as f32 / 2.0, mh as f32 / 2.0);
+        let mut best = f32::NEG_INFINITY;
+        for y in 0..mh {
+            for x in 0..mw {
+                if texture.get_pixel(x, y)[3] == 0 {
+                    continue;
+                }
+                let east_km = (x as f64 - mw as f64 / 2.0) * km_per_pt;
+                let north_km = (mh as f64 / 2.0 - y as f64) * km_per_pt;
+                let (lat, lon) =
+                    aeqd_inverse_km(center_lat as f64, center_lon as f64, east_km, north_km);
+                if let Some(index) = lut.lookup(lat as f32, lon as f32)
+                    && let Some(&value) = values.get(index)
+                    && value.is_finite()
+                    && value > best
+                {
+                    best = value;
+                    focus = egui::pos2(x as f32 + 0.5, y as f32 + 0.5);
+                }
+            }
+        }
+        assert!(
+            best > f32::NEG_INFINITY,
+            "no finite model values under the pane"
+        );
+
+        // Readout at the cursor.
+        let east_km = (focus.x as f64 - mw as f64 / 2.0) * km_per_pt;
+        let north_km = (mh as f64 / 2.0 - focus.y as f64) * km_per_pt;
+        let (lat, lon) = aeqd_inverse_km(center_lat as f64, center_lon as f64, east_km, north_km);
+        let index = lut
+            .lookup(lat as f32, lon as f32)
+            .expect("cursor over grid");
+        let value = values[index];
+        let c = colormap.sample(rw_ui::colormap::normalize(value, vmin, vmax));
+        let hex = hex_rgb_line([c.r(), c.g(), c.b(), 255]);
+
+        let (disk, distinct) = loupe_disk_image(&texture, &source, focus, 70.0, 6.0);
+        assert_eq!(
+            loupe_nearest_texel(&texture, &source, focus),
+            *texture.get_pixel(focus.x as u32, focus.y as u32),
+            "model loupe center must sample the field point under the cursor"
+        );
+        assert!(
+            distinct >= 16,
+            "model loupe must magnify a real neighborhood, saw {distinct}"
+        );
+
+        let out = loupe_out_dir();
+        texture.save(out.join("hrrr_texture.png")).unwrap();
+        disk.save(out.join("hrrr_loupe_disk.png")).unwrap();
+        eprintln!(
+            "HRRR {}/{} f{:03} var={} [{}] cursor=({:.0},{:.0}) → {} | {} {:.1} {} | {} | disk texels={} | PNGs in {}",
+            model.model,
+            run.run,
+            hour,
+            var.name,
+            var.units,
+            focus.x,
+            focus.y,
+            format_lat_lon(lat as f32, lon as f32),
+            var.name,
+            value,
+            var.units,
+            hex.trim_start(),
+            distinct,
+            out.display()
+        );
+    }
+
+    #[test]
     fn hazard_refresh_selection_matches_event_id_in_new_overlay() {
         let records = vec![
             test_hazard_record(
@@ -70881,6 +71766,10 @@ mod tests {
             inspector_show_range_az: true,
             inspector_show_beam: true,
             inspector_show_model: true,
+            // Loupe is off by default (a Shift-hold magnifier); the hex chip
+            // rides the card whenever a value resolves.
+            inspector_show_loupe: false,
+            inspector_show_hex: true,
             model_lut: None,
             model_lut_rx: None,
             model_enabled: true,
