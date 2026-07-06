@@ -160,6 +160,191 @@ pub struct ForecastPoint {
     pub position: GeoPoint,
     pub valid_time: Option<DateTime<Utc>>,
     pub max_wind_kt: Option<f32>,
+    /// The 34/50/64-kt quadrant wind radii at this point, when the issuing
+    /// center provides them. JTWC Tropical Cyclone Warnings carry them under
+    /// each forecast time; NHC/GDACS forecast points currently leave this empty.
+    /// Ordered exactly as parsed (JTWC text lists them strongest-first: 64, 50,
+    /// 34 kt). See [`WindRadii`].
+    pub wind_radii: Vec<WindRadii>,
+}
+
+/// One wind-threshold's 4-quadrant reach, the ATCF/JTWC wind-radii record: the
+/// maximum radius (nautical miles) at which sustained winds of at least `kt` are
+/// expected in each geographic quadrant (NE/SE/SW/NW). JTWC warnings report
+/// these at 34, 50 and 64 kt for the analysis and every forecast time; a
+/// threshold is omitted once the storm is below it, and a single radius given
+/// with no quadrant qualifier means all four quadrants are equal. Radii are kept
+/// in nautical miles exactly as the bulletin states them (1 NM = 1.852 km, see
+/// [`KM_PER_NM`]).
+///
+/// Format reference: the ATCF Tropical Cyclone Warning / JTWC product
+/// descriptions, <https://www.metoc.navy.mil/jtwc/jtwc.html>; the ATCF b-deck /
+/// warning wind-radii convention (Sampson & Schrader 2000, *BAMS* 81(6),
+/// "The Automated Tropical Cyclone Forecasting System (Version 3.2)",
+/// doi:10.1175/1520-0477(2000)081<1231:TATCFS>2.3.CO;2).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindRadii {
+    /// The wind threshold this radius set describes (34, 50 or 64 kt).
+    pub kt: u16,
+    pub ne_nm: f32,
+    pub se_nm: f32,
+    pub sw_nm: f32,
+    pub nw_nm: f32,
+}
+
+/// Kilometres per nautical mile (the unit JTWC/ATCF wind radii are reported in).
+pub const KM_PER_NM: f32 = 1.852;
+
+impl WindRadii {
+    /// The quadrant radius (NM) toward a compass `bearing_deg` (0° = true N,
+    /// clockwise). Quadrant boundaries follow the ATCF convention: NE spans
+    /// [0°,90°), SE [90°,180°), SW [180°,270°), NW [270°,360°).
+    pub fn radius_nm_at(&self, bearing_deg: f32) -> f32 {
+        let b = bearing_deg.rem_euclid(360.0);
+        if b < 90.0 {
+            self.ne_nm
+        } else if b < 180.0 {
+            self.se_nm
+        } else if b < 270.0 {
+            self.sw_nm
+        } else {
+            self.nw_nm
+        }
+    }
+
+    /// The largest of the four quadrant radii (NM). Zero when the record is
+    /// empty (no quadrant carried a radius).
+    pub fn max_nm(&self) -> f32 {
+        self.ne_nm.max(self.se_nm).max(self.sw_nm).max(self.nw_nm)
+    }
+}
+
+/// Earth radius (km) matching the app's azimuthal-equidistant projection, where
+/// 1° = 111.32 km (see `ui_core::geo::aeqd_forward_km`), so a wind-radii ring
+/// built here lines up exactly with `lon_lat_to_screen` after projection.
+const EARTH_RADIUS_KM: f32 = 111.32 * 180.0 / std::f32::consts::PI;
+
+/// Great-circle destination from `origin`, a `distance_km` along a compass
+/// `bearing_deg` (0° = true N, clockwise). The standard spherical "direct"
+/// (destination-point) formula on a sphere of radius [`EARTH_RADIUS_KM`].
+pub fn destination_point(origin: GeoPoint, bearing_deg: f32, distance_km: f32) -> GeoPoint {
+    let ang = distance_km / EARTH_RADIUS_KM; // angular distance (radians)
+    let (phi1, lam1) = (origin.lat.to_radians(), origin.lon.to_radians());
+    let theta = bearing_deg.to_radians();
+    let (sin_ang, cos_ang) = ang.sin_cos();
+    let (sin_phi1, cos_phi1) = phi1.sin_cos();
+    let phi2 = (sin_phi1 * cos_ang + cos_phi1 * sin_ang * theta.cos())
+        .clamp(-1.0, 1.0)
+        .asin();
+    let lam2 = lam1 + (theta.sin() * sin_ang * cos_phi1).atan2(cos_ang - sin_phi1 * phi2.sin());
+    GeoPoint {
+        lon: normalize_lon(lam2.to_degrees()),
+        lat: phi2.to_degrees(),
+    }
+}
+
+/// Build the closed geographic outline of one wind-radii threshold about
+/// `center`: four quarter-circle arcs (NE/SE/SW/NW), each at its own quadrant
+/// radius, joined by the short radial steps at the cardinal bearings — the
+/// classic ATCF/JTWC "wind rose". `steps_per_quadrant` samples each arc (≥1);
+/// the returned ring is closed (last point repeats the first). Empty when every
+/// quadrant radius is zero. Pure geographic points (NM → km great-circle
+/// offsets); the caller projects them with `lon_lat_to_screen`.
+pub fn wind_radii_ring(
+    center: GeoPoint,
+    radii: &WindRadii,
+    steps_per_quadrant: usize,
+) -> Vec<GeoPoint> {
+    if radii.max_nm() <= 0.0 {
+        return Vec::new();
+    }
+    let steps = steps_per_quadrant.max(1);
+    let mut ring = Vec::with_capacity(steps * 4 + 5);
+    // (arc start bearing, quadrant radius NM); each arc sweeps 90°.
+    let quads = [
+        (0.0f32, radii.ne_nm),
+        (90.0, radii.se_nm),
+        (180.0, radii.sw_nm),
+        (270.0, radii.nw_nm),
+    ];
+    for (start, r_nm) in quads {
+        let r_km = r_nm.max(0.0) * KM_PER_NM;
+        for s in 0..=steps {
+            let bearing = start + 90.0 * (s as f32 / steps as f32);
+            ring.push(destination_point(center, bearing, r_km));
+        }
+    }
+    if let Some(&first) = ring.first() {
+        ring.push(first);
+    }
+    ring
+}
+
+/// The convex hull (Andrew's monotone chain, in the lon/lat plane) of a set of
+/// geographic points, returned counter-clockwise and closed (first vertex
+/// repeated). Fewer than three distinct points are returned unchanged. Used to
+/// wrap the 34-kt "wind danger area" envelope around every 34-kt wind-radii ring
+/// along the track. Operating in the lon/lat plane is exact enough for a
+/// single-basin storm well away from a pole or the antimeridian (the West
+/// Pacific warnings this serves sit near 120–150°E).
+pub fn convex_hull(points: &[GeoPoint]) -> Vec<GeoPoint> {
+    let mut pts: Vec<GeoPoint> = points.to_vec();
+    pts.sort_by(|a, b| {
+        a.lon
+            .total_cmp(&b.lon)
+            .then_with(|| a.lat.total_cmp(&b.lat))
+    });
+    pts.dedup_by(|a, b| a.lon == b.lon && a.lat == b.lat);
+    if pts.len() < 3 {
+        return pts;
+    }
+    // Cross product of OA×OB (z component); >0 ⇒ counter-clockwise turn.
+    let cross = |o: GeoPoint, a: GeoPoint, b: GeoPoint| {
+        (a.lon - o.lon) * (b.lat - o.lat) - (a.lat - o.lat) * (b.lon - o.lon)
+    };
+    let mut lower: Vec<GeoPoint> = Vec::new();
+    for &p in &pts {
+        while lower.len() >= 2 && cross(lower[lower.len() - 2], lower[lower.len() - 1], p) <= 0.0 {
+            lower.pop();
+        }
+        lower.push(p);
+    }
+    let mut upper: Vec<GeoPoint> = Vec::new();
+    for &p in pts.iter().rev() {
+        while upper.len() >= 2 && cross(upper[upper.len() - 2], upper[upper.len() - 1], p) <= 0.0 {
+            upper.pop();
+        }
+        upper.push(p);
+    }
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    if let Some(&first) = lower.first() {
+        lower.push(first);
+    }
+    lower
+}
+
+/// The 34-kt "wind danger area" (a.k.a. the USN ship-avoidance swath): a closed
+/// geographic ring enclosing every 34-kt wind-radii rose along the storm's
+/// track. A faithful, always-simple approximation of the stepped JTWC danger
+/// area — the convex hull of the sampled 34-kt rings at the current position and
+/// each forecast time, which is a conservative outer envelope of the region
+/// where ≥34-kt (gale-force) winds are forecast. Empty when no point carries a
+/// 34-kt radius. Pure geographic points; the caller projects them.
+pub fn danger_area_34kt<'a>(
+    points: impl Iterator<Item = (GeoPoint, &'a [WindRadii])>,
+) -> Vec<GeoPoint> {
+    let mut hull_input: Vec<GeoPoint> = Vec::new();
+    for (center, radii) in points {
+        if let Some(r34) = radii.iter().find(|r| r.kt == 34) {
+            hull_input.extend(wind_radii_ring(center, r34, 6));
+        }
+    }
+    if hull_input.len() < 3 {
+        return Vec::new();
+    }
+    convex_hull(&hull_input)
 }
 
 /// A storm's track/cone geometry (from GDACS `getgeometry`, or NHC GIS later).
@@ -178,6 +363,11 @@ pub struct StormGeometry {
     /// the parsed forecast up to [`TropicalCyclone::forecast`]; see the parsers
     /// below for exactly what each source supplies.
     pub forecast: Vec<ForecastPoint>,
+    /// The 34/50/64-kt wind radii at the CURRENT (analysis) position, when the
+    /// JTWC warning's `WARNING POSITION` / `PRESENT WIND DISTRIBUTION` block
+    /// carries them (empty for GDACS/NHC-only storms). Lets the current-position
+    /// glyph draw its wind rose and anchors the 34-kt danger area at the storm.
+    pub current_wind_radii: Vec<WindRadii>,
 }
 
 /// One active tropical cyclone, source-agnostic.
@@ -205,6 +395,10 @@ pub struct TropicalCyclone {
     /// Land areas at risk (GDACS `country`), if any.
     pub affected_areas: Option<String>,
     pub forecast: Vec<ForecastPoint>,
+    /// The 34/50/64-kt wind radii at the current position (from a matched JTWC
+    /// warning's analysis block); empty otherwise. Mirrored from
+    /// [`StormGeometry::current_wind_radii`] by the overlay layer.
+    pub current_wind_radii: Vec<WindRadii>,
     pub cone: Vec<GeoPoint>,
     /// A human report page to open externally (never scraped).
     pub report_url: Option<String>,
@@ -413,6 +607,7 @@ fn nhc_to_cyclone(storm: NhcStorm) -> TropicalCyclone {
         alert_level: None,
         affected_areas: None,
         forecast: Vec::new(),
+        current_wind_radii: Vec::new(),
         cone: Vec::new(),
         report_url: storm.public_advisory.and_then(|advisory| advisory.url),
         // The forecast-advisory (TCM) URL is fetched on the second pass and
@@ -481,6 +676,10 @@ pub fn parse_nhc_forecast_advisory(text: &str) -> Vec<ForecastPoint> {
             position,
             valid_time,
             max_wind_kt,
+            // NHC's TCM carries per-point wind radii too, but in a different
+            // columnar layout; not parsed here (the JTWC path drives the
+            // wind-radii/danger-area rendering).
+            wind_radii: Vec::new(),
         });
     }
     out
@@ -721,41 +920,173 @@ pub fn attach_jtwc_forecast_urls(storms: &mut [TropicalCyclone], refs: &[JtwcWar
 /// (`wpNNyyweb.txt`) — the West-Pacific/Indian-Ocean analogue of NHC's TCM.
 /// Under `FORECASTS:` (and its `EXTENDED`/`LONG RANGE OUTLOOK` continuations)
 /// each point is a `NN HRS, VALID AT:` header, then a `DDHHMMZ --- LATn LONe`
-/// position line, then a `MAX SUSTAINED WINDS - nnn KT` line — carrying
-/// per-point **valid time, position, and max sustained wind (kt)**, exactly
-/// what the Saffir–Simpson color ramp needs. The current `WARNING POSITION`
-/// (analysis) point is intentionally excluded (only forecast points are
-/// returned). Format reference: JTWC product descriptions,
-/// <https://www.metoc.navy.mil/jtwc/jtwc.html>.
+/// position line, a `MAX SUSTAINED WINDS - nnn KT` line, then the `RADIUS OF
+/// 034/050/064 KT WINDS - ...` quadrant wind-radii blocks — carrying per-point
+/// **valid time, position, max sustained wind (kt), and 34/50/64-kt quadrant
+/// wind radii**, exactly what the Saffir–Simpson color ramp and the JTWC
+/// wind-rose / danger-area rendering need. The current `WARNING POSITION`
+/// (analysis) point is intentionally excluded here (only forecast points are
+/// returned); its radii come from [`parse_jtwc_current_radii`]. Format
+/// reference: JTWC product descriptions,
+/// <https://www.metoc.navy.mil/jtwc/jtwc.html>, and the ATCF warning wind-radii
+/// convention (Sampson & Schrader 2000, *BAMS* 81(6), 1231–1240).
 pub fn parse_jtwc_forecast_warning(text: &str) -> Vec<ForecastPoint> {
     let issued = jtwc_issuance_date(text);
     let lines: Vec<&str> = text.lines().collect();
+    // Each forecast point is a block that opens with a "NN HRS, VALID AT:"
+    // header and runs until the next such header (or the trailing REMARKS
+    // narrative). Slicing on the headers keeps every block's position, wind and
+    // wind radii self-contained — one block never reads the next block's radii.
+    let headers: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.trim().ends_with("HRS, VALID AT:"))
+        .map(|(i, _)| i)
+        .collect();
+    // The last forecast block ends at the standalone "REMARKS:" line so it does
+    // not swallow the free-text narrative (which itself mentions "... NM ...").
+    let forecast_end = headers
+        .last()
+        .and_then(|&last| {
+            lines
+                .iter()
+                .enumerate()
+                .skip(last + 1)
+                .find(|(_, l)| l.trim() == "REMARKS:")
+                .map(|(i, _)| i)
+        })
+        .unwrap_or(lines.len());
+
     let mut out = Vec::new();
-    for (i, raw) in lines.iter().enumerate() {
-        // A forecast block starts with e.g. "12 HRS, VALID AT:".
-        if !raw.trim().ends_with("HRS, VALID AT:") {
-            continue;
-        }
-        // Position line is the next line that parses as `DDHHMMZ --- lat lon`.
-        let Some((position, valid_time)) = lines
+    for (k, &start) in headers.iter().enumerate() {
+        let end = headers.get(k + 1).copied().unwrap_or(forecast_end);
+        let block = &lines[start + 1..end];
+        // Position line is the first `DDHHMMZ --- lat lon` in the block.
+        let Some((position, valid_time)) = block
             .iter()
-            .skip(i + 1)
-            .take(3)
             .find_map(|l| parse_jtwc_valid_line(l.trim(), issued))
         else {
             continue;
         };
-        // Intensity is the first `MAX SUSTAINED WINDS` line of this block.
-        let max_wind_kt = lines
-            .iter()
-            .skip(i + 1)
-            .take(6)
-            .find_map(|l| parse_jtwc_max_wind(l.trim()));
+        // Intensity is the block's first `MAX SUSTAINED WINDS` line.
+        let max_wind_kt = block.iter().find_map(|l| parse_jtwc_max_wind(l.trim()));
+        // The 34/50/64-kt quadrant wind radii under this forecast time.
+        let wind_radii = parse_wind_radii_lines(block);
         out.push(ForecastPoint {
             position,
             valid_time,
             max_wind_kt,
+            wind_radii,
         });
+    }
+    out
+}
+
+/// Parse the current-position (analysis) wind radii from a JTWC warning's
+/// `PRESENT WIND DISTRIBUTION` block — the 34/50/64-kt radii valid at the
+/// `WARNING POSITION`. Empty when the block is absent (below 34 kt, or an older
+/// bulletin without it). Bounded to the analysis block (up to `FORECASTS:` /
+/// the first forecast header) so the forecast blocks' radii are not folded in.
+/// See [`parse_jtwc_forecast_warning`] for the per-forecast-time radii.
+pub fn parse_jtwc_current_radii(text: &str) -> Vec<WindRadii> {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(start) = lines
+        .iter()
+        .position(|l| l.trim().starts_with("PRESENT WIND DISTRIBUTION"))
+    else {
+        return Vec::new();
+    };
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, l)| {
+            let t = l.trim();
+            t == "FORECASTS:" || t.ends_with("HRS, VALID AT:")
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(lines.len());
+    parse_wind_radii_lines(&lines[start + 1..end])
+}
+
+/// A compass quadrant a wind-radii value applies to. `All` is the ATCF
+/// single-radius form: a radius given with no quadrant qualifier is symmetric.
+#[derive(Clone, Copy)]
+enum Quadrant {
+    Ne,
+    Se,
+    Sw,
+    Nw,
+    All,
+}
+
+/// The `kt` threshold of a `RADIUS OF nnn KT WINDS ...` header line, else None.
+fn radius_header_kt(line: &str) -> Option<u16> {
+    // "RADIUS OF 064 KT WINDS - ..." → the first token after the prefix is the
+    // threshold (leading zeros parse fine).
+    line.trim()
+        .strip_prefix("RADIUS OF")?
+        .split_whitespace()
+        .next()?
+        .parse::<u16>()
+        .ok()
+}
+
+/// Parse `... nnn NM <QUADRANT>` on a wind-radii line into `(radius_nm,
+/// quadrant)`. The radius is the number immediately BEFORE the `NM` token (so a
+/// header line's leading `064 KT` threshold is never mistaken for the radius);
+/// the quadrant is the word after `NM` (absent ⇒ the symmetric single-radius
+/// form). None when the line carries no `NM` radius.
+fn parse_quadrant_radius(line: &str) -> Option<(f32, Quadrant)> {
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    let nm_at = toks.iter().position(|t| *t == "NM")?;
+    let radius = toks.get(nm_at.checked_sub(1)?)?.parse::<f32>().ok()?;
+    let quadrant = match toks.get(nm_at + 1).map(|t| t.to_ascii_uppercase()) {
+        Some(q) if q.starts_with("NORTHEAST") => Quadrant::Ne,
+        Some(q) if q.starts_with("SOUTHEAST") => Quadrant::Se,
+        Some(q) if q.starts_with("SOUTHWEST") => Quadrant::Sw,
+        Some(q) if q.starts_with("NORTHWEST") => Quadrant::Nw,
+        _ => Quadrant::All,
+    };
+    Some((radius, quadrant))
+}
+
+/// Parse a slice of JTWC warning lines into its wind-radii thresholds. A
+/// `RADIUS OF nnn KT WINDS - rrr NM <QUADRANT>` header opens a new threshold;
+/// its own radius plus the following three quadrant lines fill NE/SE/SW/NW (a
+/// single symmetric radius fills all four). Lines outside a `RADIUS OF` group
+/// carry no quadrant radius and are ignored, so headers, `VECTOR TO ...`, and
+/// separators are skipped. The slice MUST be scoped to one point's block (the
+/// callers bound it), so an unrelated "... NM ..." elsewhere cannot bleed in.
+fn parse_wind_radii_lines(lines: &[&str]) -> Vec<WindRadii> {
+    let mut out: Vec<WindRadii> = Vec::new();
+    for raw in lines {
+        let line = raw.trim();
+        if let Some(kt) = radius_header_kt(line) {
+            out.push(WindRadii {
+                kt,
+                ne_nm: 0.0,
+                se_nm: 0.0,
+                sw_nm: 0.0,
+                nw_nm: 0.0,
+            });
+        }
+        if let Some(current) = out.last_mut()
+            && let Some((nm, quadrant)) = parse_quadrant_radius(line)
+        {
+            match quadrant {
+                Quadrant::Ne => current.ne_nm = nm,
+                Quadrant::Se => current.se_nm = nm,
+                Quadrant::Sw => current.sw_nm = nm,
+                Quadrant::Nw => current.nw_nm = nm,
+                Quadrant::All => {
+                    current.ne_nm = nm;
+                    current.se_nm = nm;
+                    current.sw_nm = nm;
+                    current.nw_nm = nm;
+                }
+            }
+        }
     }
     out
 }
@@ -951,6 +1282,7 @@ fn gdacs_to_cyclone(feature: GdacsFeature) -> Option<TropicalCyclone> {
         alert_level: props.alertlevel,
         affected_areas: props.country.filter(|country| !country.is_empty()),
         forecast: Vec::new(),
+        current_wind_radii: Vec::new(),
         cone: Vec::new(),
         report_url: urls.report,
         geometry_url: urls.geometry,
@@ -1028,6 +1360,9 @@ pub fn parse_gdacs_geometry(json: &str) -> Result<StormGeometry, String> {
         track,
         cone,
         forecast,
+        // Filled from the matched JTWC warning by `fetch_storm_geometry`; GDACS
+        // getgeometry alone carries no analysis-point wind radii.
+        current_wind_radii: Vec::new(),
     })
 }
 
@@ -1049,6 +1384,8 @@ fn gdacs_forecast_points(
                 position: center,
                 valid_time: Some(valid_time),
                 max_wind_kt: None,
+                // GDACS getgeometry gives no per-point wind radii.
+                wind_radii: Vec::new(),
             })
         })
         .collect()
@@ -1242,6 +1579,9 @@ pub fn fetch_storm_geometry(
                 let jtwc = parse_jtwc_forecast_warning(&warning);
                 if !jtwc.is_empty() {
                     geometry.forecast = jtwc;
+                    // The analysis-point 34/50/64-kt radii anchor the wind-rose
+                    // and danger-area rendering at the storm's current position.
+                    geometry.current_wind_radii = parse_jtwc_current_radii(&warning);
                 }
             }
             Ok(geometry)
@@ -1732,6 +2072,218 @@ REMARKS:
         assert_eq!(
             Category::Three.label(Basin::WestPacific),
             "Category 3 Typhoon"
+        );
+    }
+
+    #[test]
+    fn jtwc_warning_parses_per_point_wind_radii() {
+        let fc = parse_jtwc_forecast_warning(JTWC_WARNING);
+        assert_eq!(fc.len(), 8);
+
+        // First forecast point (12 HRS, 061200Z --- 15.1N 142.5E) carries all
+        // three thresholds, in the bulletin's strongest-first order (64,50,34).
+        let first = &fc[0];
+        assert_eq!(
+            first.wind_radii.iter().map(|r| r.kt).collect::<Vec<_>>(),
+            vec![64, 50, 34]
+        );
+        let r64 = first.wind_radii.iter().find(|r| r.kt == 64).unwrap();
+        assert_eq!(
+            (r64.ne_nm, r64.se_nm, r64.sw_nm, r64.nw_nm),
+            (60.0, 60.0, 40.0, 60.0)
+        );
+        let r50 = first.wind_radii.iter().find(|r| r.kt == 50).unwrap();
+        assert_eq!(
+            (r50.ne_nm, r50.se_nm, r50.sw_nm, r50.nw_nm),
+            (110.0, 90.0, 90.0, 110.0)
+        );
+        let r34 = first.wind_radii.iter().find(|r| r.kt == 34).unwrap();
+        assert_eq!(
+            (r34.ne_nm, r34.se_nm, r34.sw_nm, r34.nw_nm),
+            (260.0, 230.0, 190.0, 230.0),
+            "34-kt gale radii tightest/asymmetric at the strong early point"
+        );
+
+        // Last point (120 HRS, 110000Z --- 25.9N 122.4E): the 34-kt field has
+        // fanned wide on the NE/SE side and shrunk on the SW/NW side.
+        let last = fc.last().unwrap();
+        let l34 = last.wind_radii.iter().find(|r| r.kt == 34).unwrap();
+        assert_eq!(
+            (l34.ne_nm, l34.se_nm, l34.sw_nm, l34.nw_nm),
+            (290.0, 270.0, 190.0, 130.0)
+        );
+
+        // The block-slicing must NOT bleed one point's radii into another: the
+        // 64-kt SW radius really does step 40 → 50 → 60 across the first three
+        // forecast times (proves per-block scoping).
+        let sw64: Vec<f32> = fc
+            .iter()
+            .take(3)
+            .map(|p| p.wind_radii.iter().find(|r| r.kt == 64).unwrap().sw_nm)
+            .collect();
+        assert_eq!(sw64, vec![40.0, 50.0, 60.0]);
+    }
+
+    #[test]
+    fn jtwc_current_radii_parses_analysis_block() {
+        // PRESENT WIND DISTRIBUTION at WARNING POSITION 060000Z --- 14.3N 145.0E.
+        let radii = parse_jtwc_current_radii(JTWC_WARNING);
+        // Exactly the three thresholds — the "POSITION ACCURATE TO WITHIN 020
+        // NM" line (which precedes the PRESENT WIND DISTRIBUTION block, before
+        // any RADIUS OF header) is NOT mistaken for a fourth wind radius.
+        assert_eq!(
+            radii.iter().map(|r| r.kt).collect::<Vec<_>>(),
+            vec![64, 50, 34]
+        );
+        let r64 = radii.iter().find(|r| r.kt == 64).unwrap();
+        assert_eq!(
+            (r64.ne_nm, r64.se_nm, r64.sw_nm, r64.nw_nm),
+            (60.0, 50.0, 50.0, 60.0)
+        );
+        let r34 = radii.iter().find(|r| r.kt == 34).unwrap();
+        assert_eq!(
+            (r34.ne_nm, r34.se_nm, r34.sw_nm, r34.nw_nm),
+            (270.0, 245.0, 200.0, 230.0)
+        );
+    }
+
+    #[test]
+    fn wind_radii_single_radius_form_is_symmetric() {
+        // Synthetic edge check: the ATCF single-radius form (no quadrant word)
+        // means all four quadrants equal — no live BAVI point exercises it.
+        let lines = ["RADIUS OF 034 KT WINDS - 100 NM"];
+        let radii = parse_wind_radii_lines(&lines);
+        assert_eq!(radii.len(), 1);
+        let r = radii[0];
+        assert_eq!(
+            (r.kt, r.ne_nm, r.se_nm, r.sw_nm, r.nw_nm),
+            (34, 100.0, 100.0, 100.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn destination_point_offsets_by_bearing() {
+        let center = GeoPoint {
+            lon: 142.5,
+            lat: 15.1,
+        };
+        let d_km = 111.32; // exactly 1° of latitude
+        // Due north: +1° lat, longitude essentially unchanged.
+        let n = destination_point(center, 0.0, d_km);
+        assert!((n.lat - 16.1).abs() < 0.02, "north lat={}", n.lat);
+        assert!((n.lon - 142.5).abs() < 0.02, "north lon={}", n.lon);
+        // Due east: latitude ~unchanged, longitude grows by 1°/cos(lat).
+        let e = destination_point(center, 90.0, d_km);
+        assert!((e.lat - 15.1).abs() < 0.02, "east lat={}", e.lat);
+        let expect_dlon = 1.0 / 15.1_f32.to_radians().cos();
+        assert!(
+            (e.lon - (142.5 + expect_dlon)).abs() < 0.03,
+            "east lon={} expect~{}",
+            e.lon,
+            142.5 + expect_dlon
+        );
+    }
+
+    #[test]
+    fn wind_radii_ring_reaches_each_quadrant_radius() {
+        let center = GeoPoint {
+            lon: 142.5,
+            lat: 15.1,
+        };
+        // Distinct radii per quadrant so we can tell them apart on the ring.
+        let radii = WindRadii {
+            kt: 34,
+            ne_nm: 260.0,
+            se_nm: 200.0,
+            sw_nm: 100.0,
+            nw_nm: 150.0,
+        };
+        let ring = wind_radii_ring(center, &radii, 8);
+        assert!(
+            ring.len() > 30 && ring.first() == ring.last(),
+            "closed ring"
+        );
+
+        // Northeast reach (bearing 45): both lon and lat above center, and the
+        // great-circle distance ≈ 260 NM.
+        let ne = destination_point(center, 45.0, radii.ne_nm * KM_PER_NM);
+        assert!(ne.lon > center.lon && ne.lat > center.lat);
+        // Southwest is the tightest quadrant here (100 NM), so its farthest ring
+        // point sits closer to the center than the NE farthest point.
+        let sw = destination_point(center, 225.0, radii.sw_nm * KM_PER_NM);
+        assert!(sw.lon < center.lon && sw.lat < center.lat);
+        let ne_span = (ne.lon - center.lon).hypot(ne.lat - center.lat);
+        let sw_span = (sw.lon - center.lon).hypot(sw.lat - center.lat);
+        assert!(
+            ne_span > sw_span,
+            "NE (260 NM) reaches farther than SW (100 NM)"
+        );
+
+        // Empty radii ⇒ empty ring.
+        let none = WindRadii {
+            kt: 34,
+            ne_nm: 0.0,
+            se_nm: 0.0,
+            sw_nm: 0.0,
+            nw_nm: 0.0,
+        };
+        assert!(wind_radii_ring(center, &none, 8).is_empty());
+    }
+
+    #[test]
+    fn danger_area_envelopes_the_whole_34kt_track() {
+        // Build the 34-kt danger area from BAVI's analysis + forecast radii —
+        // the same inputs the overlay feeds it. It must fan NW from Guam
+        // (~145°E) toward Taiwan/the Philippine Sea (~122°E), enclosing every
+        // 34-kt gale field along the way.
+        let current = parse_jtwc_current_radii(JTWC_WARNING);
+        let fc = parse_jtwc_forecast_warning(JTWC_WARNING);
+        let current_center = GeoPoint {
+            lon: 145.0,
+            lat: 14.3,
+        }; // WARNING POSITION
+        let points = std::iter::once((current_center, current.as_slice()))
+            .chain(fc.iter().map(|p| (p.position, p.wind_radii.as_slice())));
+        let hull = danger_area_34kt(points);
+
+        assert!(
+            hull.len() >= 4 && hull.first() == hull.last(),
+            "closed hull"
+        );
+        let west = hull.iter().fold(f32::INFINITY, |m, p| m.min(p.lon));
+        let east = hull.iter().fold(f32::NEG_INFINITY, |m, p| m.max(p.lon));
+        let south = hull.iter().fold(f32::INFINITY, |m, p| m.min(p.lat));
+        let north = hull.iter().fold(f32::NEG_INFINITY, |m, p| m.max(p.lat));
+        assert!(
+            east - west > 20.0,
+            "danger area spans the basin: {west}..{east}"
+        );
+        assert!(
+            east > 148.0 && west < 120.0,
+            "reaches from Guam-ward ({east}) to Taiwan-ward ({west})"
+        );
+        // Latitude band brackets the track (14°N current → 26°N day-5).
+        assert!(south < 13.0 && north > 27.0, "lat band {south}..{north}");
+    }
+
+    #[test]
+    fn jtwc_enrichment_carries_radii_end_to_end() {
+        // The GDACS getgeometry forecast points carry no radii; the matched JTWC
+        // warning supplies both per-point and current radii, exactly as
+        // `fetch_storm_geometry` wires them.
+        let mut geometry = parse_gdacs_geometry(GDACS_FCST).unwrap();
+        assert!(geometry.current_wind_radii.is_empty());
+        assert!(geometry.forecast.iter().all(|p| p.wind_radii.is_empty()));
+
+        geometry.forecast = parse_jtwc_forecast_warning(JTWC_WARNING);
+        geometry.current_wind_radii = parse_jtwc_current_radii(JTWC_WARNING);
+        assert!(!geometry.current_wind_radii.is_empty());
+        assert!(
+            geometry
+                .forecast
+                .iter()
+                .all(|p| p.wind_radii.iter().any(|r| r.kt == 34)),
+            "every forecast point has a 34-kt gale radius"
         );
     }
 }

@@ -122,10 +122,16 @@ impl TropicalState {
         // geometry map is the transport (filled by the 2nd fetch); a fresh
         // storms list arrives with empty forecasts, so re-attach every poll.
         for storm in &mut self.storms {
-            if let Some(geom) = self.geometry.get(&storm.id)
-                && storm.forecast != geom.forecast
-            {
-                storm.forecast = geom.forecast.clone();
+            if let Some(geom) = self.geometry.get(&storm.id) {
+                if storm.forecast != geom.forecast {
+                    storm.forecast = geom.forecast.clone();
+                }
+                // The analysis-point wind radii (JTWC) ride alongside the
+                // forecast; re-attach so the overlay's wind rose + danger area
+                // survive a fresh storms-list swap.
+                if storm.current_wind_radii != geom.current_wind_radii {
+                    storm.current_wind_radii = geom.current_wind_radii.clone();
+                }
             }
         }
     }
@@ -378,7 +384,16 @@ impl crate::ViewerApp {
             let Some(geom) = self.tropical.geometry.get(&storm.id) else {
                 continue;
             };
-            if geom.cone.len() >= 3 {
+            // Storms with official JTWC wind radii (West Pacific / Indian Ocean /
+            // Southern Hemisphere) render the authentic JTWC product — the
+            // 34-kt wind danger area + per-point wind rose — instead of the
+            // generic GDACS cone (drawing both would stack two overlapping
+            // envelopes). GDACS-only storms keep the cone.
+            let has_radii = storm_has_wind_radii(storm);
+            if has_radii {
+                self.push_danger_area_shapes(&mut shapes, rect, storm);
+            }
+            if geom.cone.len() >= 3 && !has_radii {
                 let ring: Vec<egui::Pos2> = geom
                     .cone
                     .iter()
@@ -452,6 +467,16 @@ impl crate::ViewerApp {
         }
         painter.extend(forecast_lines);
 
+        // JTWC wind-radii "rose": at the current position and each forecast
+        // point, the 34-kt (outer/faint), 50-kt and 64-kt (inner/bright)
+        // per-quadrant arcs, drawn under the dots. Only storms carrying radii
+        // (West-Pacific etc.) contribute; the danger area already drew below.
+        let mut radii_shapes: Vec<egui::Shape> = Vec::new();
+        for storm in &self.tropical.storms {
+            self.push_wind_radii_shapes(&mut radii_shapes, rect, storm);
+        }
+        painter.extend(radii_shapes);
+
         // Forecast dots, colored by each point's Saffir–Simpson category. NHC
         // (TCM) and JTWC-matched West-Pacific/Indian/Southern storms carry real
         // per-point max wind; any point still lacking it inherits the storm's
@@ -511,6 +536,99 @@ impl crate::ViewerApp {
         if let Some((_, anchor, lines, accent)) = nearest {
             draw_forecast_tooltip(painter, anchor, &lines, accent);
         }
+    }
+
+    /// The 34-kt wind danger area (USN ship-avoidance swath): a translucent
+    /// teal fill + red outline enclosing every 34-kt gale field along the
+    /// track. Built in geographic space (great-circle quadrant offsets) then
+    /// projected, reusing `crate::cone_overlay_shapes` so the same wide-shape
+    /// jump-cull allowance keeps a basin-spanning envelope from being culled.
+    fn push_danger_area_shapes(
+        &self,
+        shapes: &mut Vec<egui::Shape>,
+        rect: egui::Rect,
+        storm: &TropicalCyclone,
+    ) {
+        let points = std::iter::once((storm.position, storm.current_wind_radii.as_slice())).chain(
+            storm
+                .forecast
+                .iter()
+                .map(|p| (p.position, p.wind_radii.as_slice())),
+        );
+        let hull = tropical::danger_area_34kt(points);
+        if hull.len() < 3 {
+            return;
+        }
+        let ring: Vec<egui::Pos2> = hull
+            .iter()
+            .map(|p| self.lon_lat_to_screen(rect, p.lon, p.lat))
+            .collect();
+        shapes.extend(crate::cone_overlay_shapes(
+            &ring,
+            cone_bbox_deg(&hull),
+            self.map_scale,
+            rect,
+            egui::Color32::from_rgba_unmultiplied(30, 200, 190, 28),
+            egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(235, 70, 70, 190)),
+        ));
+    }
+
+    /// Per-quadrant 34/50/64-kt wind-radii arcs at the current position and each
+    /// forecast point. Each threshold is a closed "wind rose" outline built from
+    /// its NE/SE/SW/NW radii via great-circle offsets, then projected. The
+    /// per-ring jump limit is derived from the ring's own geographic bbox so it
+    /// survives at any zoom (as the cone does).
+    fn push_wind_radii_shapes(
+        &self,
+        shapes: &mut Vec<egui::Shape>,
+        rect: egui::Rect,
+        storm: &TropicalCyclone,
+    ) {
+        let sets = std::iter::once((storm.position, &storm.current_wind_radii))
+            .chain(storm.forecast.iter().map(|p| (p.position, &p.wind_radii)));
+        for (center, radii_set) in sets {
+            for radii in radii_set {
+                let geo_ring = tropical::wind_radii_ring(center, radii, 8);
+                if geo_ring.len() < 3 {
+                    continue;
+                }
+                let ring: Vec<egui::Pos2> = geo_ring
+                    .iter()
+                    .map(|p| self.lon_lat_to_screen(rect, p.lon, p.lat))
+                    .collect();
+                let jump = crate::cone_segment_jump_limit_px(
+                    cone_bbox_deg(&geo_ring),
+                    self.map_scale,
+                    rect,
+                );
+                crate::push_solid_closed_line(
+                    shapes,
+                    &ring,
+                    egui::Stroke::new(1.2, wind_radii_color(radii.kt)),
+                    rect,
+                    jump,
+                );
+            }
+        }
+    }
+}
+
+/// Whether a storm carries official quadrant wind radii (a matched JTWC
+/// warning), which switches its overlay from the generic GDACS cone to the
+/// authentic wind-rose + 34-kt danger-area rendering.
+fn storm_has_wind_radii(storm: &TropicalCyclone) -> bool {
+    !storm.current_wind_radii.is_empty() || storm.forecast.iter().any(|p| !p.wind_radii.is_empty())
+}
+
+/// Stroke color for a JTWC wind-radii threshold — the magenta family the JTWC
+/// warning graphic uses: brightest hot-pink for the tight 64-kt hurricane-force
+/// core, softer magenta for 50-kt storm force, and a faint violet for the wide
+/// 34-kt gale ring (kept faint so the danger area and dots stay readable).
+fn wind_radii_color(kt: u16) -> egui::Color32 {
+    match kt {
+        64 => egui::Color32::from_rgba_unmultiplied(255, 60, 130, 235),
+        50 => egui::Color32::from_rgba_unmultiplied(255, 110, 205, 205),
+        _ => egui::Color32::from_rgba_unmultiplied(210, 150, 235, 150),
     }
 }
 
