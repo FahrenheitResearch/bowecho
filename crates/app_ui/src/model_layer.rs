@@ -27,7 +27,19 @@ pub struct InverseLut {
     index: Vec<u32>,
 }
 
-const MIN_BIN_DEG: f32 = 0.03;
+/// Hard floor on the bin size — degenerate-data guard only (~11 m). The real
+/// lower bound comes from [`MAX_LUT_BINS`]; a fixed coarse floor here is what
+/// quantized 250 m WRF grids into ~3.3 km blocks (the old 0.03° floor made
+/// every gate in a bucket resolve to ONE model cell, and the sampler's local
+/// 3x3 stencil search could never reach the true cell from a seed ~7 cells
+/// away — giant constant wedges on the synthetic radar).
+const MIN_BIN_DEG: f32 = 0.0001;
+/// Total-bin budget for the inverse index (u32 each, ~64 MB worst case).
+/// Small fine grids (250 m WRF: ~0.7 M bins) index at native spacing; huge
+/// domains (full-disk satellite) are budget-limited to roughly the same bin
+/// size the old fixed 0.03° floor produced, so their memory profile is
+/// unchanged.
+const MAX_LUT_BINS: f32 = 16_000_000.0;
 const HOLE_FILL_PASSES: usize = 3;
 
 impl InverseLut {
@@ -71,7 +83,14 @@ impl InverseLut {
         let spacing = shape
             .and_then(|(nx, ny)| shaped_grid_spacing(lat, lon, nx, ny))
             .unwrap_or_else(|| consecutive_spacing(lat, lon).unwrap_or(MIN_BIN_DEG));
-        let bin = (spacing * if shape.is_some() { 1.25 } else { 1.1 }).max(MIN_BIN_DEG);
+        // Bin = the grid's own spacing, floored by the total-bin budget so a
+        // huge domain cannot allocate an unbounded index. The budget floor —
+        // not a fixed degree floor — is what lets a 250 m grid index at native
+        // resolution while a full-disk satellite grid stays ~64 MB.
+        let budget_floor = (((lat_max - lat_min) * (lon_max - lon_min)) / MAX_LUT_BINS).sqrt();
+        let bin = (spacing * if shape.is_some() { 1.25 } else { 1.1 })
+            .max(budget_floor)
+            .max(MIN_BIN_DEG);
         let width = (((lon_max - lon_min) / bin).ceil() as usize + 1).min(8192);
         let height = (((lat_max - lat_min) / bin).ceil() as usize + 1).min(8192);
         let mut index = vec![u32::MAX; width * height];
