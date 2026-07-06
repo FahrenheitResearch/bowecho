@@ -18182,6 +18182,7 @@ impl eframe::App for ViewerApp {
         self.persist_sounding_view_state();
         self.persist_model_style_overrides();
         self.persist_wrf_process_options();
+        self.persist_wrf_synth_radar();
         if self.workspace.dirty {
             self.persist_workspace_layout();
         }
@@ -27266,6 +27267,20 @@ impl ViewerApp {
         }
     }
 
+    /// Persist the virtual-radar placement/range selection when it changes,
+    /// so the chosen site mode / range survives restarts (same opaque-JSON
+    /// pattern as the WRF processing selection above).
+    fn persist_wrf_synth_radar(&mut self) {
+        let Some(dock) = self.model_dock.as_ref() else {
+            return;
+        };
+        let value = dock.wrf_synth_radar_json();
+        if self.app_settings.wrf_synth_radar.as_ref() != Some(&value) {
+            self.app_settings.wrf_synth_radar = Some(value);
+            let _ = self.app_settings.save();
+        }
+    }
+
     fn persist_workspace_layout(&mut self) {
         self.workspace.dirty = false;
         let viewers: BTreeMap<dock::WorkspacePane, dock::ViewerMode> = dock::WorkspacePane::VIEWERS
@@ -30396,6 +30411,9 @@ impl ViewerApp {
         if let Some(value) = self.app_settings.wrf_process_options.as_ref() {
             dock.apply_wrf_process_options_json(value);
         }
+        if let Some(value) = self.app_settings.wrf_synth_radar.as_ref() {
+            dock.apply_wrf_synth_radar_json(value);
+        }
         dock
     }
 
@@ -30703,6 +30721,8 @@ impl ViewerApp {
             // Same for the WRF full-diagnostics field selection (product groups
             // + only/skip filters edited in the import options popover).
             self.persist_wrf_process_options();
+            // And the virtual-radar placement/range (site popover edits).
+            self.persist_wrf_synth_radar();
         }
         events
     }

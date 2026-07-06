@@ -517,6 +517,13 @@ pub struct AppSettings {
     /// heavy eCAPE.
     #[serde(default)]
     pub wrf_process_options: Option<serde_json::Value>,
+    /// Last-used virtual-radar placement + range for the WRF "simulated
+    /// radar" import (domain centre / explicit lat-lon / real site id, plus
+    /// max-range and gate-spacing overrides). Opaque JSON built by app_ui's
+    /// model dock, exactly like `wrf_process_options` above. `None` (older
+    /// configs) restores today's default: domain centre, 230 km / 250 m.
+    #[serde(default)]
+    pub wrf_synth_radar: Option<serde_json::Value>,
     /// Data-folder override: where caches and stores live (Level II
     /// cache, model/sat/GLM stores, tiles, georefs). Empty = platform
     /// default. Read once at startup; Settings says "restart to apply".
@@ -795,6 +802,7 @@ impl Default for AppSettings {
             sounding_view_state: None,
             model_style_overrides: None,
             wrf_process_options: None,
+            wrf_synth_radar: None,
             data_dir: String::new(),
             sidebar_section_open: BTreeMap::new(),
             model_slug: default_model_slug(),
@@ -1855,6 +1863,24 @@ mod tests {
         assert_eq!(back, s);
         // Absent → None: older configs restore today's default behavior.
         assert_eq!(AppSettings::from_json("{}").wrf_process_options, None);
+    }
+
+    #[test]
+    fn wrf_synth_radar_round_trips_as_opaque_json() {
+        let s = AppSettings {
+            wrf_synth_radar: Some(serde_json::json!({
+                "placement": "nexrad_site",
+                "site_id_text": "KTLX",
+                "max_range_km": 460.0,
+                "auto_gate_spacing": true
+            })),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&s.to_json());
+        assert_eq!(back, s);
+        // Absent → None: older configs restore today's default placement
+        // (domain centre, 230 km / 250 m).
+        assert_eq!(AppSettings::from_json("{}").wrf_synth_radar, None);
     }
 
     #[test]

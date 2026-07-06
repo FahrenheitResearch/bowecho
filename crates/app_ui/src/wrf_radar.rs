@@ -366,9 +366,17 @@ pub fn build_synthetic_volume_reporting(
     let site_lon = config
         .site_lon_deg
         .unwrap_or_else(|| fields.lon[center] as f64);
-    let antenna_msl = config
-        .antenna_msl_m
-        .unwrap_or_else(|| fields.terrain_m[center] as f64 + DEFAULT_TOWER_M);
+    let antenna_msl = config.antenna_msl_m.unwrap_or_else(|| {
+        // Default antenna height: MODEL terrain under the ANTENNA plus a
+        // short tower — a virtual site placed off-centre (explicit lat/lon
+        // or a real NEXRAD id) must stand on its own ground, not the domain
+        // centre's. A site outside the domain falls back to centre terrain.
+        let site_cell = fields
+            .lut
+            .lookup(site_lat as f32, site_lon as f32)
+            .unwrap_or(center);
+        fields.terrain_m[site_cell] as f64 + DEFAULT_TOWER_M
+    });
 
     let naz = config.azimuth_count.max(1);
     let spacing = config.gate_spacing_m.max(1.0);
@@ -782,7 +790,9 @@ fn build_synthetic_from_paths(
         .filter(|path| crate::wrf_process::is_supported_wrf_file(path))
         .cloned()
         .collect();
-    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    // Multi-select / folder picks arrive in arbitrary order: sort by the WRF
+    // valid time parsed from the filename so the loop plays in model time.
+    files.sort_by_cached_key(|path| wrf_time_sort_key(path));
     if files.is_empty() {
         return Err("No supported WRF files selected".to_string());
     }
@@ -790,7 +800,8 @@ fn build_synthetic_from_paths(
     let mut volumes = Vec::new();
     let mut notes = Vec::new();
     let mut fallback_index = 0u32;
-    for path in &files {
+    let file_total = files.len();
+    for (file_index, path) in files.iter().enumerate() {
         let _ = tx.send(SyntheticRadarMessage::Progress(format!(
             "Opening WRF {}",
             display_name(path)
@@ -808,11 +819,17 @@ fn build_synthetic_from_paths(
         for timeidx in 0..nt {
             // Stream fine-grained stage labels for this frame so the UI shows
             // steady progress instead of a multi-second (or, in a debug build,
-            // multi-minute) freeze with no feedback.
-            let frame_prefix = if nt > 1 {
-                format!("Simulating {name} (time {}/{nt}): ", timeidx + 1)
-            } else {
-                format!("Simulating {name}: ")
+            // multi-minute) freeze with no feedback. Multi-file loops lead
+            // with "file 2/5: …" so the owner sees the loop building.
+            let frame_prefix = match (file_total > 1, nt > 1) {
+                (true, true) => format!(
+                    "file {}/{file_total} ({name}, time {}/{nt}): ",
+                    file_index + 1,
+                    timeidx + 1
+                ),
+                (true, false) => format!("file {}/{file_total} ({name}): ", file_index + 1),
+                (false, true) => format!("Simulating {name} (time {}/{nt}): ", timeidx + 1),
+                (false, false) => format!("Simulating {name}: "),
             };
             let progress = |stage: &str| {
                 let _ = tx.send(SyntheticRadarMessage::Progress(format!(
@@ -862,6 +879,10 @@ fn build_synthetic_from_paths(
             )
         });
     }
+    // The loop keys on the volume's own scan time: sort on it so frames play
+    // in valid-time order even when a filename stamp and the file's internal
+    // `Times` disagree (stable — equal times keep the filename order).
+    volumes.sort_by_key(|volume| volume.volume_time);
     Ok(SyntheticRadarOutput {
         label: label.to_string(),
         volumes,
@@ -876,9 +897,204 @@ fn display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// Multi-file loop ordering key: the WRF valid time parsed from the filename
+/// (`wrfout_d03_2025-06-21_01_30_00` → `"20250621013000"`), then the bare
+/// filename as the tiebreak/fallback — so a shuffled multi-select or a folder
+/// pick always builds (and reports "file k/n" progress) in model-time order.
+/// Files without a parsable stamp sort together by name, ahead of nothing.
+fn wrf_time_sort_key(path: &Path) -> (String, String) {
+    let name = display_name(path);
+    (
+        crate::wrf_process::parse_wrf_timestamp(&name).unwrap_or_default(),
+        name,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_file_sort_key_orders_by_parsed_wrf_time() {
+        // Shuffled pick order (what rfd multi-select hands back) must sort by
+        // the model time embedded in the name, not the pick order.
+        let mut paths = [
+            PathBuf::from(r"C:\run\wrfout_d03_2025-06-21_02_15_00"),
+            PathBuf::from(r"C:\run\wrfout_d03_2025-06-21_01_30_00"),
+            PathBuf::from(r"C:\run\wrfout_d03_2025-06-21_02_30_00"),
+            PathBuf::from(r"C:\run\wrfout_d03_2025-06-21_02_00_00"),
+            PathBuf::from(r"C:\run\wrfout_d03_2025-06-21_01_45_00"),
+        ];
+        paths.sort_by_cached_key(|path| wrf_time_sort_key(path));
+        let names: Vec<String> = paths.iter().map(|path| display_name(path)).collect();
+        assert_eq!(
+            names,
+            vec![
+                "wrfout_d03_2025-06-21_01_30_00",
+                "wrfout_d03_2025-06-21_01_45_00",
+                "wrfout_d03_2025-06-21_02_00_00",
+                "wrfout_d03_2025-06-21_02_15_00",
+                "wrfout_d03_2025-06-21_02_30_00",
+            ]
+        );
+
+        // Colon-form stamps sort identically; unstamped names fall back to
+        // filename order without panicking.
+        let colon = wrf_time_sort_key(Path::new("wrfout_d02_2025-06-21_01:45:00"));
+        let underscore = wrf_time_sort_key(Path::new("wrfout_d03_2025-06-21_01_45_00"));
+        assert_eq!(colon.0, underscore.0);
+        assert_eq!(colon.0, "20250621014500");
+        let plain = wrf_time_sort_key(Path::new("some_model_output.nc"));
+        assert!(plain.0.is_empty());
+        assert_eq!(plain.1, "some_model_output.nc");
+    }
+
+    /// REAL-data proof for the multi-frame loop path (project rule: prove on
+    /// real data). Gated on `BOWECHO_WRF_RADAR_MULTI_FIXTURE` = a `;`-joined
+    /// list of real wrfout paths (e.g. the five Enderlin tornado files).
+    /// Deliberately feeds the paths in REVERSED order, then asserts:
+    ///  - one volume per file, in strictly ascending scan time;
+    ///  - per-file progress streamed ("file 2/5 … building tilt …");
+    ///  - the volumes install into the real loop engine as one batch, land in
+    ///    time order, and the loop cursor advances through all frames and
+    ///    wraps — the exact contract `install_synthetic_radar_volumes` relies
+    ///    on. Run in RELEASE (`cargo test -p app_ui --release … -- --nocapture`).
+    #[test]
+    fn real_multi_file_loop_builds_time_ordered_frames_and_advances() {
+        use ui_core::loop_engine::{
+            DecodedLoad, DecodedLoadBatch, EngineId, EngineRole, FeedSource, FrameStatus,
+            LoadTimings, LoopEngine, SelectionPolicy, StepOutcome, SweepContext,
+        };
+
+        let Some(raw) = std::env::var_os("BOWECHO_WRF_RADAR_MULTI_FIXTURE") else {
+            return;
+        };
+        let raw = raw.to_string_lossy().into_owned();
+        let mut paths: Vec<PathBuf> = raw
+            .split(';')
+            .filter(|part| !part.trim().is_empty())
+            .map(PathBuf::from)
+            .collect();
+        assert!(
+            paths.len() >= 2,
+            "need at least two real wrfout paths, got {}",
+            paths.len()
+        );
+        // Hand the worker the WRONG order on purpose: the sort must fix it.
+        paths.reverse();
+        let expected_frames = paths.len();
+
+        let config = SyntheticRadarConfig::default();
+        let (tx, rx) = channel();
+        let output = build_synthetic_from_paths(&paths, &config, "multi-file test", &tx)
+            .expect("build synthetic volumes from real multi-file fixture");
+        drop(tx);
+
+        // One frame per file, strictly ascending in scan time.
+        assert_eq!(output.volumes.len(), expected_frames, "one volume per file");
+        let times: Vec<DateTime<Utc>> = output
+            .volumes
+            .iter()
+            .map(|volume| volume.volume_time)
+            .collect();
+        eprintln!("[multi] frame times: {times:?}");
+        for pair in times.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "scan times must strictly ascend: {pair:?}"
+            );
+        }
+        // Every frame carries real echo (these are tornado-hour files).
+        for volume in &output.volumes {
+            assert!(
+                volume.metadata.decoded_radial_count > 0,
+                "frame {} has no radials",
+                volume.volume_time
+            );
+        }
+
+        // Per-file progress streamed in sorted order.
+        let progress: Vec<String> = std::iter::from_fn(|| match rx.try_recv() {
+            Ok(SyntheticRadarMessage::Progress(message)) => Some(message),
+            _ => None,
+        })
+        .collect();
+        let marker = format!("file 2/{expected_frames}");
+        assert!(
+            progress
+                .iter()
+                .any(|message| message.contains(&marker) && message.contains("building tilt")),
+            "expected a '{marker} … building tilt …' progress line, got: {progress:?}"
+        );
+
+        // Feed the whole Vec to the real loop engine exactly like
+        // `install_synthetic_radar_volumes` does, then advance the loop.
+        let mut engine = LoopEngine::new(
+            EngineId(1),
+            EngineRole::Primary,
+            FeedSource::LocalFiles {
+                label: "wrf-synth multi-file test".to_owned(),
+            },
+        );
+        engine.limits.grow_to_fit = true;
+        let frames: Vec<DecodedLoad> = output
+            .volumes
+            .iter()
+            .enumerate()
+            .map(|(index, volume)| {
+                let stamp = volume.volume_time.format("%Y%m%d_%H%M%S").to_string();
+                DecodedLoad {
+                    path: PathBuf::from(format!(
+                        "wrf-synth://{}/{index:04}_{stamp}",
+                        volume.site.id
+                    )),
+                    volume: Arc::clone(volume),
+                    timings: LoadTimings::default(),
+                    status: FrameStatus::Local,
+                    source_label: format!("simulated WRF {stamp}"),
+                }
+            })
+            .collect();
+        let outcome = engine.install_batch(
+            DecodedLoadBatch {
+                frames,
+                selected_index: 0,
+            },
+            &SelectionPolicy::SelectAnchor {
+                blank_display_overrides_browsing: true,
+            },
+            None,
+            |_anchor| false,
+        );
+        assert!(
+            outcome.cross_site_clear.is_none(),
+            "one shared site id: the cross-site guard must not clear"
+        );
+        assert_eq!(engine.history.len(), expected_frames, "all frames install");
+        let installed: Vec<DateTime<Utc>> = engine
+            .history
+            .iter()
+            .map(|entry| entry.identity.scan_time_utc)
+            .collect();
+        assert_eq!(installed, times, "history holds the frames in time order");
+
+        // The loop advances through every frame and wraps back to 0.
+        engine.cursor.playing = true;
+        let mut sequence = Vec::new();
+        for _ in 0..expected_frames {
+            match engine.advance_loop(&SweepContext::PLAIN) {
+                StepOutcome::Stepped { index } => sequence.push(index),
+                StepOutcome::Stopped => panic!("a populated loop must never stop"),
+            }
+        }
+        let expected_sequence: Vec<usize> = (1..expected_frames).chain([0]).collect();
+        assert_eq!(sequence, expected_sequence, "loop advances then wraps");
+        assert!(engine.cursor.playing);
+        eprintln!(
+            "[multi] {} frames installed in time order; loop stepped {sequence:?}",
+            engine.history.len()
+        );
+    }
 
     #[test]
     fn parses_wrf_times_with_colon_or_underscore() {

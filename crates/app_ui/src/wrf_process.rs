@@ -1041,7 +1041,11 @@ fn process_run_name(files: &[PathBuf]) -> String {
     }
 }
 
-fn parse_wrf_timestamp(name: &str) -> Option<String> {
+/// Extract a sortable `YYYYMMDDHHMMSS` stamp from a wrfout-style filename
+/// (`wrfout_d03_2025-06-21_01_30_00` / `..._01:30:00`). Shared with
+/// `wrf_radar`'s multi-file loop ordering, which must sort frames by model
+/// time rather than raw filename.
+pub(crate) fn parse_wrf_timestamp(name: &str) -> Option<String> {
     for token in name.split(['.', '/', '\\']) {
         let bytes = token.as_bytes();
         if bytes.len() < 19 {
