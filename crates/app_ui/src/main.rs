@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque, hash_map::DefaultH
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1607,14 +1607,40 @@ fn dealias_grid_compute_count() -> u64 {
     DEALIAS_GRID_COMPUTE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Identity of the on-disk bytes a cached decode came from: file size +
+/// mtime, both from ONE `metadata()` call. The decoded-volume cache is keyed
+/// by path, but a path's bytes can change under it — `download_object`
+/// re-downloads to the SAME path when the on-disk size stops matching the S3
+/// object, and a local Archive II file can be overwritten and re-opened — so
+/// a path hit must also prove the entry still describes the current bytes.
+/// A mismatch is a miss that evicts the stale entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileContentStamp {
+    len: u64,
+    /// `None` when the filesystem cannot report an mtime; `None == None`
+    /// then degrades validation to size-only rather than never hitting.
+    modified: Option<std::time::SystemTime>,
+}
+
+fn file_content_stamp(path: &Path) -> Option<FileContentStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileContentStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
 struct CachedVolumeEntry {
     volume: Arc<RadarVolume>,
+    /// Stamp of the file the decode came from, checked on every hit.
+    stamp: FileContentStamp,
     bytes: usize,
     last_used: u64,
 }
 
 /// Persistent, bounded (LRU) cache of decoded NEXRAD Level 2 volumes keyed by
-/// canonicalized on-disk path. The loop/archive load path consults it BEFORE
+/// canonicalized on-disk path + validated against the file's
+/// [`FileContentStamp`]. The loop/archive load path consults it BEFORE
 /// re-reading + bzip2-decoding a file, so re-loading the same loop (e.g. the
 /// same 256 cached PGUA files after a history trim or a navigate-away/back) is
 /// an `Arc` clone per frame instead of a fresh read+bzip2+parse. Distinct from
@@ -1644,8 +1670,18 @@ impl DecodedVolumeCache {
     }
 
     /// Fetch a cached volume, marking it most-recently-used. `None` on miss.
-    fn get(&mut self, key: &Path) -> Option<Arc<RadarVolume>> {
+    /// `stamp` is the file's CURRENT on-disk identity: a cached decode of
+    /// different bytes (stamp mismatch) or of a file that no longer exists
+    /// (`stamp == None`) is stale — evicted here, so the caller re-decodes.
+    fn get(&mut self, key: &Path, stamp: Option<FileContentStamp>) -> Option<Arc<RadarVolume>> {
         let now = self.tick();
+        let matches = stamp == Some(self.entries.get(key)?.stamp);
+        if !matches {
+            if let Some(stale) = self.entries.remove(key) {
+                self.total_bytes = self.total_bytes.saturating_sub(stale.bytes);
+            }
+            return None;
+        }
         let entry = self.entries.get_mut(key)?;
         entry.last_used = now;
         Some(Arc::clone(&entry.volume))
@@ -1653,13 +1689,14 @@ impl DecodedVolumeCache {
 
     /// Insert (or refresh) a decoded volume, then LRU-evict until the total
     /// estimated bytes fit the budget. Never evicts the just-inserted key.
-    fn insert(&mut self, key: PathBuf, volume: Arc<RadarVolume>) {
+    fn insert(&mut self, key: PathBuf, stamp: FileContentStamp, volume: Arc<RadarVolume>) {
         let bytes = ui_core::loop_engine::estimated_volume_bytes(&volume);
         let now = self.tick();
         if let Some(previous) = self.entries.insert(
             key.clone(),
             CachedVolumeEntry {
                 volume,
+                stamp,
                 bytes,
                 last_used: now,
             },
@@ -1710,9 +1747,16 @@ fn decoded_volume_cache_key(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn cache_decoded_volume(key: PathBuf, volume: &Arc<RadarVolume>) {
+/// Insert a decoded volume into the process-wide cache. `stamp` is the
+/// file's identity captured BEFORE the bytes were read — `None` (the file
+/// vanished between the lookup and the read) skips caching entirely rather
+/// than storing an entry that could never be validated.
+fn cache_decoded_volume(key: PathBuf, stamp: Option<FileContentStamp>, volume: &Arc<RadarVolume>) {
+    let Some(stamp) = stamp else {
+        return;
+    };
     if let Ok(mut cache) = decoded_volume_cache().lock() {
-        cache.insert(key, Arc::clone(volume));
+        cache.insert(key, stamp, Arc::clone(volume));
     }
 }
 
@@ -1732,13 +1776,17 @@ fn decode_load_path_with_optional_preview(
     // decoded file returns as an `Arc` clone instead of a fresh
     // read+bzip2+parse. Live/realtime partial volumes pass
     // `use_decoded_cache = false` because the same on-disk path is
-    // re-assembled as more chunks arrive.
+    // re-assembled as more chunks arrive. The (size, mtime) stamp — one
+    // metadata() call — guards the path-keyed hit against a file whose bytes
+    // changed under the same path (S3 size-mismatch re-download, or a local
+    // file overwritten and re-opened): a mismatch re-decodes.
     let cache_key = use_decoded_cache.then(|| decoded_volume_cache_key(&path));
+    let cache_stamp = cache_key.as_ref().and_then(|_| file_content_stamp(&path));
     if let Some(key) = cache_key.as_ref()
         && let Some(volume) = decoded_volume_cache()
             .lock()
             .ok()
-            .and_then(|mut cache| cache.get(key))
+            .and_then(|mut cache| cache.get(key, cache_stamp))
     {
         timings.read_ms = Some(0.0);
         timings.decode_ms = 0.0;
@@ -1766,7 +1814,7 @@ fn decode_load_path_with_optional_preview(
         derive_default_products_in_place(&mut volume);
         let volume = Arc::new(volume);
         if let Some(key) = cache_key {
-            cache_decoded_volume(key, &volume);
+            cache_decoded_volume(key, cache_stamp, &volume);
         }
         return Ok(DecodedLoad {
             path,
@@ -1833,7 +1881,7 @@ fn decode_load_path_with_optional_preview(
     derive_default_products_in_place(&mut volume);
     let volume = Arc::new(volume);
     if let Some(key) = cache_key {
-        cache_decoded_volume(key, &volume);
+        cache_decoded_volume(key, cache_stamp, &volume);
     }
     Ok(DecodedLoad {
         path,
@@ -5054,15 +5102,24 @@ struct DealiasedReadoutCache {
     /// Which engine produced `grid`; switching engines invalidates this
     /// readout cache so the cursor readout matches the rendered image.
     dealias_engine: DealiasEngine,
+    /// Attests the pointer fields above still identify the grid's inputs —
+    /// same defense as the shared [`DealiasGridCache`]: a readout for a
+    /// history-trimmed volume must not survive into an address-recycled
+    /// successor (checked on lookup in `dealiased_velocity_readout_grid`).
+    witness: DealiasGridWitness,
     grid: Arc<MomentGrid>,
 }
 
-/// Identity of one dealiased velocity tilt. The `volume_ptr` invalidates the
-/// entry automatically when the source volume is replaced (a new `Arc`
-/// address); `reference_volume_ptr`/`dealias_env_ptr` are the previous volume
-/// and RAP profile the `Analyst3d` engine consumes (both `0` for the pure
-/// same-tilt `Region`/`RegionGlobal` engines), so switching any input yields a
-/// distinct key rather than a stale hit.
+/// Identity of one dealiased velocity tilt. The raw addresses distinguish
+/// inputs cheaply, but an address alone is NOT an identity: a dropped
+/// volume's allocation can be recycled by a later `Arc` (the volume-ptr ABA
+/// the texture path defends against by poisoning keys in
+/// `install_decoded_volume`). Every cache entry therefore also carries a
+/// [`DealiasGridWitness`] that attests these addresses still point at the
+/// inputs the grid was computed from. `reference_volume_ptr`/
+/// `dealias_env_ptr` are the previous volume and RAP profile the `Analyst3d`
+/// engine consumes (both `0` for the pure same-tilt `Region`/`RegionGlobal`
+/// engines), so switching any input yields a distinct key.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct DealiasGridKey {
     volume_ptr: usize,
@@ -5086,8 +5143,67 @@ impl DealiasGridKey {
     }
 }
 
+/// Liveness witness for the raw addresses in a [`DealiasGridKey`]. Each
+/// `Weak` does two jobs. (1) `strong_count() == 0` proves an input was
+/// dropped, so its entry is a miss that gets evicted instead of silently
+/// serving a dead volume's grid. (2) Holding the `Weak` keeps the dropped
+/// input's `ArcInner` allocation resident (its weak count stays > 0), so no
+/// NEW `Arc` can ever land at the recycled address while the entry exists —
+/// the volume-ptr ABA stale hit is structurally impossible, not merely
+/// unlikely. The pinned shell is only the counters + the struct itself (the
+/// volume's heap payload is freed when the last strong ref drops), so the
+/// retained bytes per dead entry are negligible and reclaimed by
+/// [`DealiasGridCache::purge_dead`].
+#[derive(Clone)]
+struct DealiasGridWitness {
+    volume: Weak<RadarVolume>,
+    reference_volume: Option<Weak<RadarVolume>>,
+    dealias_env: Option<Weak<EnvironmentalWindProfile>>,
+}
+
+impl DealiasGridWitness {
+    /// Witness for the pure same-tilt engines (`Region`/`RegionGlobal`),
+    /// mirroring [`DealiasGridKey::same_tilt`]'s zeroed anchor pointers.
+    fn same_tilt(volume: &Arc<RadarVolume>) -> Self {
+        Self {
+            volume: Arc::downgrade(volume),
+            reference_volume: None,
+            dealias_env: None,
+        }
+    }
+
+    /// Witness including the `Analyst3d` anchors; pass `None` for an anchor
+    /// whose key pointer is `0`.
+    fn with_anchors(
+        volume: &Arc<RadarVolume>,
+        reference_volume: Option<&Arc<RadarVolume>>,
+        dealias_env: Option<&Arc<EnvironmentalWindProfile>>,
+    ) -> Self {
+        Self {
+            volume: Arc::downgrade(volume),
+            reference_volume: reference_volume.map(Arc::downgrade),
+            dealias_env: dealias_env.map(Arc::downgrade),
+        }
+    }
+
+    /// All attested inputs still alive? At most three atomic loads —
+    /// allocation-free, cheap enough for every cache hit.
+    fn alive(&self) -> bool {
+        self.volume.strong_count() > 0
+            && self
+                .reference_volume
+                .as_ref()
+                .is_none_or(|weak| weak.strong_count() > 0)
+            && self
+                .dealias_env
+                .as_ref()
+                .is_none_or(|weak| weak.strong_count() > 0)
+    }
+}
+
 struct DealiasGridEntry {
     key: DealiasGridKey,
+    witness: DealiasGridWitness,
     grid: Arc<MomentGrid>,
     bytes: usize,
 }
@@ -5121,8 +5237,17 @@ impl DealiasGridCache {
     }
 
     /// Return the cached grid for `key`, promoting it to most-recently-used.
+    /// A key match whose witness reports a dropped input is NOT a hit: the
+    /// addresses in the key no longer identify the grid's inputs, so the
+    /// stale entry is evicted and the caller recomputes.
     fn get(&mut self, key: &DealiasGridKey) -> Option<Arc<MomentGrid>> {
         let pos = self.entries.iter().position(|entry| entry.key == *key)?;
+        if !self.entries[pos].witness.alive() {
+            if let Some(dead) = self.entries.remove(pos) {
+                self.bytes = self.bytes.saturating_sub(dead.bytes);
+            }
+            return None;
+        }
         let entry = self.entries.remove(pos)?;
         let grid = Arc::clone(&entry.grid);
         self.entries.push_back(entry);
@@ -5131,7 +5256,11 @@ impl DealiasGridCache {
 
     /// Store `grid` under `key` (most-recently-used), then evict oldest entries
     /// until within the byte budget. The just-inserted entry is never evicted.
-    fn insert(&mut self, key: DealiasGridKey, grid: Arc<MomentGrid>) {
+    /// Also purges entries for dropped volumes: this runs on the miss path
+    /// right after a ~200 ms dealias, so the linear scan is free by
+    /// comparison, and orphaned grids stop piling up toward the byte cap.
+    fn insert(&mut self, key: DealiasGridKey, witness: DealiasGridWitness, grid: Arc<MomentGrid>) {
+        self.purge_dead();
         if let Some(pos) = self.entries.iter().position(|entry| entry.key == key)
             && let Some(old) = self.entries.remove(pos)
         {
@@ -5139,8 +5268,12 @@ impl DealiasGridCache {
         }
         let bytes = moment_grid_cache_bytes(&grid);
         self.bytes += bytes;
-        self.entries
-            .push_back(DealiasGridEntry { key, grid, bytes });
+        self.entries.push_back(DealiasGridEntry {
+            key,
+            witness,
+            grid,
+            bytes,
+        });
         self.evict_to_budget();
     }
 
@@ -5149,7 +5282,24 @@ impl DealiasGridCache {
     /// down to the new cap. Idempotent, so cheap to call on every settings sync.
     fn set_budget(&mut self, budget_bytes: usize) {
         self.budget_bytes = budget_bytes;
+        // Prefer reclaiming grids of dropped volumes over evicting live ones.
+        self.purge_dead();
         self.evict_to_budget();
+    }
+
+    /// Drop every entry whose witness reports a dropped input (grids for
+    /// volumes long trimmed from history / replaced by live polling).
+    fn purge_dead(&mut self) {
+        let mut freed = 0usize;
+        self.entries.retain(|entry| {
+            if entry.witness.alive() {
+                true
+            } else {
+                freed += entry.bytes;
+                false
+            }
+        });
+        self.bytes = self.bytes.saturating_sub(freed);
     }
 
     /// Drop least-recently-used entries until within budget, always keeping at
@@ -5235,11 +5385,37 @@ fn dealias_grid_cache() -> &'static Mutex<DealiasGridCache> {
 /// otherwise serialize every render worker); a concurrent duplicate compute is
 /// harmless and dedups to a single shared `Arc` on insert. `compute` returns
 /// `None` when the tilt cannot be dealiased (e.g. `Analyst3d` failure), which
-/// is not cached.
+/// is not cached. `witness` must attest the very `Arc`s whose addresses are
+/// in `key`; it is stored with the entry so a later lookup can prove the
+/// addresses still identify these inputs.
 fn cached_dealias_grid(
     key: DealiasGridKey,
+    witness: DealiasGridWitness,
     compute: impl FnOnce() -> Option<MomentGrid>,
 ) -> Option<Arc<MomentGrid>> {
+    debug_assert_eq!(
+        witness.volume.as_ptr() as usize,
+        key.volume_ptr,
+        "witness must attest the keyed volume"
+    );
+    debug_assert_eq!(
+        witness
+            .reference_volume
+            .as_ref()
+            .map(|weak| weak.as_ptr() as usize)
+            .unwrap_or(0),
+        key.reference_volume_ptr,
+        "witness must attest the keyed reference volume"
+    );
+    debug_assert_eq!(
+        witness
+            .dealias_env
+            .as_ref()
+            .map(|weak| weak.as_ptr() as usize)
+            .unwrap_or(0),
+        key.dealias_env_ptr,
+        "witness must attest the keyed environment profile"
+    );
     if let Some(hit) = dealias_grid_cache()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
@@ -5261,7 +5437,7 @@ fn cached_dealias_grid(
     if let Some(existing) = cache.get(&key) {
         return Some(existing);
     }
-    cache.insert(key, Arc::clone(&grid));
+    cache.insert(key, witness, Arc::clone(&grid));
     Some(grid)
 }
 
@@ -12995,9 +13171,9 @@ impl ViewerApp {
                 // the existing fast path — pans stay full speed. (Native-smooth
                 // Region dealiasing takes the fast per-tilt path below.)
                 build_preprocessed_plain_cache(
-                    request.volume.as_ref(),
-                    request.previous_volume.as_deref(),
-                    request.dealias_env.as_deref(),
+                    &request.volume,
+                    request.previous_volume.as_ref(),
+                    request.dealias_env.as_ref(),
                     request.cut,
                     &base_moment,
                     request.product.color_family(),
@@ -13012,7 +13188,8 @@ impl ViewerApp {
                 // with the other engines' path and the readout) so replay /
                 // toggles reuse it instead of re-running the dealiaser.
                 let key = DealiasGridKey::same_tilt(volume_ptr, request.cut, DealiasEngine::Region);
-                match cached_dealias_grid(key, || {
+                let witness = DealiasGridWitness::same_tilt(&request.volume);
+                match cached_dealias_grid(key, witness, || {
                     let cut = request.volume.cuts.get(request.cut)?;
                     let source = cut.moments.get(&MomentType::Velocity)?;
                     Some(dealias_velocity_grid(cut, source))
@@ -13407,7 +13584,8 @@ impl ViewerApp {
                 // shared dealias memo so it costs nothing when the tilt was
                 // already dealiased for the displayed frame.
                 let key = DealiasGridKey::same_tilt(volume_ptr, cut, DealiasEngine::Region);
-                match cached_dealias_grid(key, || {
+                let witness = DealiasGridWitness::same_tilt(&request.volume);
+                match cached_dealias_grid(key, witness, || {
                     let elevation_cut = request.volume.cuts.get(cut)?;
                     let source = elevation_cut.moments.get(&MomentType::Velocity)?;
                     Some(dealias_velocity_grid(elevation_cut, source))
@@ -15489,10 +15667,10 @@ impl ViewerApp {
 
     fn dealiased_velocity_readout_grid(
         &mut self,
-        volume: &RadarVolume,
+        volume: &Arc<RadarVolume>,
         cut_index: usize,
     ) -> Option<Arc<MomentGrid>> {
-        let volume_ptr = volume as *const RadarVolume as usize;
+        let volume_ptr = Arc::as_ptr(volume) as usize;
         let previous_volume = self
             .volume
             .as_ref()
@@ -15504,7 +15682,8 @@ impl ViewerApp {
                     current,
                 )
             });
-        let reference_volume_ptr = if self.dealias_engine == DealiasEngine::Analyst3d {
+        let anchored = self.dealias_engine == DealiasEngine::Analyst3d;
+        let reference_volume_ptr = if anchored {
             previous_volume
                 .as_ref()
                 .map(|reference| Arc::as_ptr(reference) as usize)
@@ -15512,19 +15691,27 @@ impl ViewerApp {
         } else {
             0
         };
-        let dealias_env = (self.dealias_engine == DealiasEngine::Analyst3d)
+        let dealias_env = anchored
             .then(|| self.dealias_env_profile_for_volume(volume))
             .flatten();
         let dealias_env_ptr = dealias_env
             .as_ref()
             .map(|profile| Arc::as_ptr(profile) as usize)
             .unwrap_or(0);
+        // The witness proves the pointer identities below still name these
+        // exact inputs (a dead witness means an address was recycled).
+        let witness = DealiasGridWitness::with_anchors(
+            volume,
+            anchored.then_some(previous_volume.as_ref()).flatten(),
+            dealias_env.as_ref(),
+        );
         if let Some(cache) = &self.dealiased_readout_cache
             && cache.volume_ptr == volume_ptr
             && cache.reference_volume_ptr == reference_volume_ptr
             && cache.dealias_env_ptr == dealias_env_ptr
             && cache.cut_index == cut_index
             && cache.dealias_engine == self.dealias_engine
+            && cache.witness.alive()
         {
             return Some(Arc::clone(&cache.grid));
         }
@@ -15542,7 +15729,7 @@ impl ViewerApp {
             cut_index,
             engine,
         };
-        let grid = cached_dealias_grid(key, || match engine {
+        let grid = cached_dealias_grid(key, witness.clone(), || match engine {
             DealiasEngine::Analyst3d => dealias_velocity_grid_v4(
                 volume,
                 cut_index,
@@ -15560,6 +15747,7 @@ impl ViewerApp {
             dealias_env_ptr,
             cut_index,
             dealias_engine: self.dealias_engine,
+            witness,
             grid,
         });
         self.dealiased_readout_cache
@@ -41671,7 +41859,7 @@ impl ViewerApp {
         let source_grid = cut.moments.get(&base_moment)?;
         let dealiased_grid = selected_product
             .uses_dealiased_velocity()
-            .then(|| self.dealiased_velocity_readout_grid(volume.as_ref(), selected_cut))
+            .then(|| self.dealiased_velocity_readout_grid(&volume, selected_cut))
             .flatten();
         let grid = dealiased_grid.as_deref().unwrap_or(source_grid);
         let (radar_lat, radar_lon) = self.loaded_volume_location()?;
@@ -44941,12 +45129,14 @@ fn detect_rotation_markers_for_volume(
 /// `dealias_env` is the RAP site profile (None until the background fetch
 /// lands, always None for intl sites); `previous_volume` feeds the same
 /// temporal prior the retired hybrid engine used (spec §15: v4 runs
-/// per-volume — no cross-volume solution caching in v0.29.0).
+/// per-volume — no cross-volume solution caching in v0.29.0). The inputs
+/// arrive as `Arc`s so the dealias memo can witness them (see
+/// [`DealiasGridWitness`]).
 #[allow(clippy::too_many_arguments)]
 fn build_preprocessed_plain_cache(
-    volume: &RadarVolume,
-    previous_volume: Option<&RadarVolume>,
-    dealias_env: Option<&EnvironmentalWindProfile>,
+    volume: &Arc<RadarVolume>,
+    previous_volume: Option<&Arc<RadarVolume>>,
+    dealias_env: Option<&Arc<EnvironmentalWindProfile>>,
     cut_index: usize,
     moment: &MomentType,
     family: ColorTableFamily,
@@ -44968,30 +45158,38 @@ fn build_preprocessed_plain_cache(
         // Memoize the dealiased grid so a loop replay / product toggle does not
         // re-run the ~200 ms dealiaser per frame. Only Analyst3d reads the
         // previous volume + RAP profile; the pure engines key those as 0.
-        let (reference_volume_ptr, dealias_env_ptr) = if dealias_engine == DealiasEngine::Analyst3d
-        {
+        let anchored = dealias_engine == DealiasEngine::Analyst3d;
+        let (reference_volume_ptr, dealias_env_ptr) = if anchored {
             (
                 previous_volume
-                    .map(|reference| reference as *const RadarVolume as usize)
+                    .map(|reference| Arc::as_ptr(reference) as usize)
                     .unwrap_or(0),
                 dealias_env
-                    .map(|profile| profile as *const EnvironmentalWindProfile as usize)
+                    .map(|profile| Arc::as_ptr(profile) as usize)
                     .unwrap_or(0),
             )
         } else {
             (0, 0)
         };
         let key = DealiasGridKey {
-            volume_ptr: volume as *const RadarVolume as usize,
+            volume_ptr: Arc::as_ptr(volume) as usize,
             reference_volume_ptr,
             dealias_env_ptr,
             cut_index,
             engine: dealias_engine,
         };
-        let dealiased = cached_dealias_grid(key, || match dealias_engine {
-            DealiasEngine::Analyst3d => {
-                dealias_velocity_grid_v4(volume, cut_index, previous_volume, dealias_env)
-            }
+        let witness = DealiasGridWitness::with_anchors(
+            volume,
+            anchored.then_some(previous_volume).flatten(),
+            anchored.then_some(dealias_env).flatten(),
+        );
+        let dealiased = cached_dealias_grid(key, witness, || match dealias_engine {
+            DealiasEngine::Analyst3d => dealias_velocity_grid_v4(
+                volume,
+                cut_index,
+                previous_volume.map(|reference| reference.as_ref()),
+                dealias_env.map(|profile| profile.as_ref()),
+            ),
             DealiasEngine::RegionGlobal => Some(dealias_velocity_grid_pyart_region(cut, grid)),
             DealiasEngine::Region => Some(dealias_velocity_grid(cut, grid)),
         })
@@ -53822,6 +54020,14 @@ mod tests {
         Arc::new(volume)
     }
 
+    /// A stable stamp for tests whose files never change on disk.
+    fn test_stamp(len: u64) -> FileContentStamp {
+        FileContentStamp {
+            len,
+            modified: Some(std::time::SystemTime::UNIX_EPOCH),
+        }
+    }
+
     /// A cache hit returns the SAME `Arc` that was inserted — proof that the
     /// re-load reuses the decoded volume instead of re-decoding it.
     #[test]
@@ -53829,13 +54035,94 @@ mod tests {
         let mut cache = DecodedVolumeCache::new(DECODED_VOLUME_CACHE_BUDGET_BYTES);
         let key = PathBuf::from("/frames/a");
         let volume = synthetic_volume(1000);
-        cache.insert(key.clone(), Arc::clone(&volume));
-        let hit = cache.get(&key).expect("cached volume");
+        cache.insert(key.clone(), test_stamp(64), Arc::clone(&volume));
+        let hit = cache
+            .get(&key, Some(test_stamp(64)))
+            .expect("cached volume");
         assert!(
             Arc::ptr_eq(&hit, &volume),
             "a hit must clone the cached Arc, not produce a fresh decode"
         );
-        assert!(cache.get(Path::new("/frames/missing")).is_none());
+        assert!(
+            cache
+                .get(Path::new("/frames/missing"), Some(test_stamp(64)))
+                .is_none()
+        );
+    }
+
+    /// #13 regression: the cache is keyed by PATH, but the same path's bytes
+    /// can change under it (S3 size-mismatch re-download; a local file
+    /// overwritten and re-opened). A hit whose (size, mtime) stamp no longer
+    /// matches the file must MISS and evict, so the caller re-decodes the new
+    /// bytes. On the old path-only cache this lookup silently served the
+    /// stale decode of the overwritten file.
+    #[test]
+    fn decoded_volume_cache_stamp_mismatch_misses_and_evicts() {
+        let mut cache = DecodedVolumeCache::new(DECODED_VOLUME_CACHE_BUDGET_BYTES);
+        let key = PathBuf::from("/frames/a");
+        cache.insert(key.clone(), test_stamp(64), synthetic_volume(1000));
+
+        // Same size, later mtime (local overwrite): stale.
+        let rewritten = FileContentStamp {
+            len: 64,
+            modified: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+        };
+        assert!(
+            cache.get(&key, Some(rewritten)).is_none(),
+            "an overwritten file (same size, new mtime) must not serve the old decode"
+        );
+        assert_eq!(cache.len(), 0, "the stale entry is evicted");
+        assert_eq!(cache.total_bytes(), 0, "its bytes are reclaimed");
+
+        // Different size (the S3 re-download trigger): stale.
+        cache.insert(key.clone(), test_stamp(64), synthetic_volume(1000));
+        assert!(
+            cache.get(&key, Some(test_stamp(128))).is_none(),
+            "a resized file must not serve the old decode"
+        );
+        assert_eq!(cache.len(), 0);
+
+        // File vanished (metadata unreadable): stale.
+        cache.insert(key.clone(), test_stamp(64), synthetic_volume(1000));
+        assert!(
+            cache.get(&key, None).is_none(),
+            "an unreadable file must not serve the old decode"
+        );
+        assert_eq!(cache.len(), 0);
+    }
+
+    /// #13 regression on a REAL file: overwriting the bytes under a path
+    /// changes its [`FileContentStamp`], which is what flips the cache lookup
+    /// from hit to miss. Uses actual filesystem metadata, not synthetic stamps.
+    #[test]
+    fn file_content_stamp_changes_when_file_is_overwritten() {
+        let path = std::env::temp_dir().join(format!(
+            "bowecho_stamp_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"first contents").expect("write first");
+        let first = file_content_stamp(&path).expect("stamp first");
+
+        std::fs::write(&path, b"second, longer contents").expect("overwrite");
+        let second = file_content_stamp(&path).expect("stamp second");
+        assert_ne!(
+            first, second,
+            "overwriting a file with different bytes must change its stamp"
+        );
+
+        // Unchanged file: the stamp is stable, so real hits still hit.
+        let third = file_content_stamp(&path).expect("stamp third");
+        assert_eq!(second, third, "an untouched file keeps a stable stamp");
+
+        std::fs::remove_file(&path).ok();
+        assert!(
+            file_content_stamp(&path).is_none(),
+            "a missing file has no stamp"
+        );
     }
 
     /// Over budget, the cache evicts the least-recently-USED entry (not merely
@@ -53849,14 +54136,23 @@ mod tests {
         let a = PathBuf::from("/frames/a");
         let b = PathBuf::from("/frames/b");
         let c = PathBuf::from("/frames/c");
-        cache.insert(a.clone(), synthetic_volume(1_000_000));
-        cache.insert(b.clone(), synthetic_volume(1_000_000));
+        cache.insert(a.clone(), test_stamp(64), synthetic_volume(1_000_000));
+        cache.insert(b.clone(), test_stamp(64), synthetic_volume(1_000_000));
         // Touch A so B is now the least-recently-used entry.
-        assert!(cache.get(&a).is_some());
-        cache.insert(c.clone(), synthetic_volume(1_000_000));
-        assert!(cache.get(&a).is_some(), "recently-touched A survives");
-        assert!(cache.get(&c).is_some(), "just-inserted C survives");
-        assert!(cache.get(&b).is_none(), "LRU victim B was evicted");
+        assert!(cache.get(&a, Some(test_stamp(64))).is_some());
+        cache.insert(c.clone(), test_stamp(64), synthetic_volume(1_000_000));
+        assert!(
+            cache.get(&a, Some(test_stamp(64))).is_some(),
+            "recently-touched A survives"
+        );
+        assert!(
+            cache.get(&c, Some(test_stamp(64))).is_some(),
+            "just-inserted C survives"
+        );
+        assert!(
+            cache.get(&b, Some(test_stamp(64))).is_none(),
+            "LRU victim B was evicted"
+        );
         assert_eq!(cache.len(), 2);
         assert!(cache.total_bytes() <= one_bytes * 2 + one_bytes / 2);
     }
@@ -53937,6 +54233,89 @@ mod tests {
             "PGUA re-load {} frames: pass1 {first_ms:.0} ms ({first_delta} decodes), \
              pass2 {second_ms:.0} ms ({second_delta} decodes)",
             paths.len()
+        );
+    }
+
+    /// REAL-DATA proof of the #13 fix (run: `cargo test -p app_ui --release
+    /// -- --ignored real_pgua_overwritten`): decode a real PGUA volume, then
+    /// overwrite the file IN PLACE with a different real PGUA volume — the
+    /// exact shape of `download_object`'s size-mismatch re-download — and
+    /// decode the same path again. The old path-keyed cache served the FIRST
+    /// volume's decode for the new bytes; the stamped cache must re-decode
+    /// and return the second volume.
+    #[test]
+    #[ignore = "reads the real on-disk PGUA level2 cache; run with --ignored"]
+    fn real_pgua_overwritten_file_under_same_path_re_decodes() {
+        let dir = Path::new(r"C:\Users\drew\AppData\Local\BowEcho\cache\level2\PGUA");
+        if !dir.is_dir() {
+            eprintln!("skipping: {} not present", dir.display());
+            return;
+        }
+        let mut sources: Vec<PathBuf> = std::fs::read_dir(dir)
+            .expect("read PGUA cache dir")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.contains("_V06"))
+            })
+            .collect();
+        sources.sort();
+        assert!(sources.len() >= 2, "need two real PGUA volumes");
+        let (source_a, source_b) = (&sources[0], &sources[1]);
+
+        let scratch =
+            std::env::temp_dir().join(format!("bowecho_overwrite_test_{}_V06", std::process::id()));
+        let (tx, _rx) = mpsc::channel::<AsyncLoadResult>();
+        let decode = || {
+            decode_load_path_with_optional_preview(
+                scratch.clone(),
+                "pgua-overwrite-test",
+                Instant::now(),
+                LoadTimings::default(),
+                &tx,
+                false,
+                FrameStatus::Complete,
+                "pgua-overwrite-test".to_owned(),
+                true,
+            )
+            .expect("decode real PGUA volume")
+        };
+
+        std::fs::copy(source_a, &scratch).expect("stage volume A");
+        let first = decode();
+        let warm = decode();
+        assert!(
+            Arc::ptr_eq(&first.volume, &warm.volume),
+            "unchanged file must still hit the cache (same Arc)"
+        );
+
+        // Overwrite the SAME path with different real bytes.
+        std::fs::copy(source_b, &scratch).expect("overwrite with volume B");
+        let before = decoded_volume_decode_count();
+        let third = decode();
+        let redecodes = decoded_volume_decode_count() - before;
+        std::fs::remove_file(&scratch).ok();
+
+        // `>= 1` keeps the count robust to other tests decoding concurrently;
+        // the Arc/scan-time assertions below are the stale-serve detectors.
+        assert!(
+            redecodes >= 1,
+            "overwritten bytes under the same path must force a re-decode"
+        );
+        assert!(
+            !Arc::ptr_eq(&first.volume, &third.volume),
+            "the re-decode must not return the stale cached volume"
+        );
+        assert_ne!(
+            first.volume.volume_time, third.volume.volume_time,
+            "the served volume must be the NEW file's scan, not the old one's"
+        );
+        eprintln!(
+            "overwrite re-decode OK: {} -> {}",
+            first.volume.volume_time, third.volume.volume_time
         );
     }
 
@@ -55837,7 +56216,7 @@ mod tests {
         app.dealias_engine = DealiasEngine::Analyst3d;
 
         let grid = app
-            .dealiased_velocity_readout_grid(volume.as_ref(), 0)
+            .dealiased_velocity_readout_grid(&volume, 0)
             .expect("v4 readout grid");
         let expected = dealias_velocity_grid_v4(volume.as_ref(), 0, None, None)
             .expect("v4 solves the synthetic volume");
@@ -55857,7 +56236,7 @@ mod tests {
         // Flipping back to Region must not serve the v4 grid from cache.
         app.dealias_engine = DealiasEngine::Region;
         let region_grid = app
-            .dealiased_velocity_readout_grid(volume.as_ref(), 0)
+            .dealiased_velocity_readout_grid(&volume, 0)
             .expect("region readout grid");
         let cut = &volume.cuts[0];
         let source = cut.moments.get(&MomentType::Velocity).expect("velocity");
@@ -55878,7 +56257,7 @@ mod tests {
         app.dealias_engine = DealiasEngine::RegionGlobal;
 
         let grid = app
-            .dealiased_velocity_readout_grid(volume.as_ref(), 0)
+            .dealiased_velocity_readout_grid(&volume, 0)
             .expect("region-global readout grid");
         let cut = &volume.cuts[0];
         let source = cut.moments.get(&MomentType::Velocity).expect("velocity");
@@ -56112,12 +56491,24 @@ mod tests {
         DealiasGridKey::same_tilt(volume_ptr, cut, DealiasEngine::Region)
     }
 
+    /// A minimal live volume whose `Weak` keeps synthetic-keyed test entries
+    /// alive. The fake key addresses need not match the anchor:
+    /// `DealiasGridCache` itself checks only liveness — key/witness coherence
+    /// is a `cached_dealias_grid` debug assertion on the production seam.
+    fn witness_anchor() -> Arc<RadarVolume> {
+        Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("TEST"),
+            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+        ))
+    }
+
     /// The dealiaser runs at most once per (volume, cut, engine): repeated
     /// lookups of the same key (a loop replay / product toggle) reuse the grid.
     #[test]
     fn dealias_grid_cache_memoizes_per_key() {
         use std::cell::Cell;
         let mut cache = DealiasGridCache::with_budget(64 * 1024 * 1024);
+        let anchor = witness_anchor();
         let computes = Cell::new(0usize);
         // Mirrors `cached_dealias_grid`'s get-else-compute-insert on a local
         // instance (the production helper uses a process-global mutex).
@@ -56127,7 +56518,11 @@ mod tests {
             }
             computes.set(computes.get() + 1);
             let grid = Arc::new(dealias_grid_of_bytes(4096));
-            cache.insert(key, Arc::clone(&grid));
+            cache.insert(
+                key,
+                DealiasGridWitness::same_tilt(&anchor),
+                Arc::clone(&grid),
+            );
             grid
         };
         let key = region_key(0x1000, 2);
@@ -56152,9 +56547,11 @@ mod tests {
     fn dealias_grid_cache_evicts_lru_over_budget() {
         let entry_bytes = 1024 * 1024; // 1 MiB per grid.
         let mut cache = DealiasGridCache::with_budget(3 * entry_bytes + entry_bytes / 2);
+        let anchor = witness_anchor();
         for cut in 0..3 {
             cache.insert(
                 region_key(0x1000, cut),
+                DealiasGridWitness::same_tilt(&anchor),
                 Arc::new(dealias_grid_of_bytes(entry_bytes)),
             );
         }
@@ -56163,6 +56560,7 @@ mod tests {
         assert!(cache.get(&region_key(0x1000, 0)).is_some());
         cache.insert(
             region_key(0x1000, 3),
+            DealiasGridWitness::same_tilt(&anchor),
             Arc::new(dealias_grid_of_bytes(entry_bytes)),
         );
 
@@ -56178,12 +56576,123 @@ mod tests {
     #[test]
     fn dealias_grid_cache_keeps_single_oversized_entry() {
         let mut cache = DealiasGridCache::with_budget(1024);
+        let anchor = witness_anchor();
         cache.insert(
             region_key(0x1000, 0),
+            DealiasGridWitness::same_tilt(&anchor),
             Arc::new(dealias_grid_of_bytes(8 * 1024 * 1024)),
         );
         assert_eq!(cache.len(), 1);
         assert!(cache.get(&region_key(0x1000, 0)).is_some());
+    }
+
+    /// #12 regression (validate-on-get): an entry whose source volume has
+    /// been DROPPED must be a miss that evicts the entry — never a hit. On
+    /// the old pointer-only cache this lookup returned the dead volume's
+    /// grid, which a recycled `Arc` allocation could then claim as its own
+    /// (wrong dealiased velocities painted on the new volume's geometry).
+    #[test]
+    fn dealias_grid_cache_dead_volume_entry_misses_and_evicts() {
+        let mut cache = DealiasGridCache::with_budget(64 * 1024 * 1024);
+        let volume = witness_anchor();
+        let key = region_key(Arc::as_ptr(&volume) as usize, 0);
+        cache.insert(
+            key,
+            DealiasGridWitness::same_tilt(&volume),
+            Arc::new(dealias_grid_of_bytes(4096)),
+        );
+        assert!(cache.get(&key).is_some(), "live volume must hit");
+
+        drop(volume);
+        assert!(
+            cache.get(&key).is_none(),
+            "a dead volume's entry must MISS: its address no longer names the volume"
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "the dead entry is evicted by the failed get"
+        );
+        assert_eq!(cache.total_bytes(), 0, "its bytes are reclaimed");
+    }
+
+    /// #12 regression (orphan retention): grids for dropped volumes must not
+    /// pile up until the multi-GiB byte budget evicts them — the next insert
+    /// purges every dead entry. On the old cache, orphans survived every
+    /// insert until LRU eviction.
+    #[test]
+    fn dealias_grid_cache_insert_purges_orphaned_dead_entries() {
+        let entry_bytes = 1024 * 1024;
+        let mut cache = DealiasGridCache::with_budget(1024 * 1024 * 1024);
+        let live = witness_anchor();
+        let dead = witness_anchor();
+        cache.insert(
+            region_key(Arc::as_ptr(&live) as usize, 0),
+            DealiasGridWitness::same_tilt(&live),
+            Arc::new(dealias_grid_of_bytes(entry_bytes)),
+        );
+        cache.insert(
+            region_key(Arc::as_ptr(&dead) as usize, 0),
+            DealiasGridWitness::same_tilt(&dead),
+            Arc::new(dealias_grid_of_bytes(entry_bytes)),
+        );
+        let bytes_with_both = cache.total_bytes();
+        drop(dead);
+
+        // Far below budget, so only the purge (not LRU eviction) can remove it.
+        let newcomer = witness_anchor();
+        cache.insert(
+            region_key(Arc::as_ptr(&newcomer) as usize, 0),
+            DealiasGridWitness::same_tilt(&newcomer),
+            Arc::new(dealias_grid_of_bytes(entry_bytes)),
+        );
+        assert_eq!(
+            cache.len(),
+            2,
+            "the dropped volume's grid is purged on insert, live entries stay"
+        );
+        assert!(
+            cache.total_bytes() <= bytes_with_both,
+            "purged bytes are reclaimed from the budget accounting"
+        );
+        assert!(
+            cache
+                .get(&region_key(Arc::as_ptr(&live) as usize, 0))
+                .is_some(),
+            "live entry survives the purge"
+        );
+    }
+
+    /// #12 regression (ABA prevention): while a dead volume's entry lives,
+    /// its `Weak` witness keeps the volume's `ArcInner` allocation resident,
+    /// so NO new `Arc<RadarVolume>` can be handed the recycled address — the
+    /// stale-hit is structurally impossible. On the old witness-less cache
+    /// the freed allocation was immediately reusable (same size class), and
+    /// the first same-key lookup for the new volume served the dead one's
+    /// grid.
+    #[test]
+    fn dealias_grid_cache_witness_pins_dead_volume_address_against_reuse() {
+        let mut cache = DealiasGridCache::with_budget(64 * 1024 * 1024);
+        let volume = witness_anchor();
+        let recycled_addr = Arc::as_ptr(&volume) as usize;
+        cache.insert(
+            region_key(recycled_addr, 0),
+            DealiasGridWitness::same_tilt(&volume),
+            Arc::new(dealias_grid_of_bytes(4096)),
+        );
+        drop(volume);
+
+        // Every allocation here is the same size class as the dropped volume;
+        // allocate-and-drop repeatedly to give the allocator every chance to
+        // hand the old block back. It cannot: the cache entry's Weak pins it.
+        for _ in 0..512 {
+            let candidate = witness_anchor();
+            assert_ne!(
+                Arc::as_ptr(&candidate) as usize,
+                recycled_addr,
+                "a new volume must never land at an address the memo still keys"
+            );
+        }
     }
 
     /// The grid-memo budget scales linearly with BOTH the radar-history RAM
@@ -56220,9 +56729,11 @@ mod tests {
     fn dealias_grid_cache_set_budget_grows_and_shrinks() {
         let entry = 1024 * 1024;
         let mut cache = DealiasGridCache::with_budget(2 * entry);
+        let anchor = witness_anchor();
         for cut in 0..2 {
             cache.insert(
                 region_key(0x1000, cut),
+                DealiasGridWitness::same_tilt(&anchor),
                 Arc::new(dealias_grid_of_bytes(entry)),
             );
         }
@@ -56232,6 +56743,7 @@ mod tests {
         for cut in 2..6 {
             cache.insert(
                 region_key(0x1000, cut),
+                DealiasGridWitness::same_tilt(&anchor),
                 Arc::new(dealias_grid_of_bytes(entry)),
             );
         }
@@ -56276,6 +56788,7 @@ mod tests {
         fn get_or(
             cache: &mut DealiasGridCache,
             key: DealiasGridKey,
+            witness: &DealiasGridWitness,
             bytes: usize,
             computes: &mut usize,
         ) {
@@ -56283,8 +56796,10 @@ mod tests {
                 return;
             }
             *computes += 1;
-            cache.insert(key, Arc::new(dealias_grid_of_bytes(bytes)));
+            cache.insert(key, witness.clone(), Arc::new(dealias_grid_of_bytes(bytes)));
         }
+        let anchor = witness_anchor();
+        let witness = DealiasGridWitness::same_tilt(&anchor);
         let replay_recomputes = |budget: usize| -> usize {
             let mut cache = DealiasGridCache::with_budget(budget);
             let mut computes = 0usize;
@@ -56296,6 +56811,7 @@ mod tests {
                         get_or(
                             &mut cache,
                             region_key(vptr, cut),
+                            &witness,
                             SIM_GRID_BYTES,
                             &mut computes,
                         );
@@ -56310,6 +56826,7 @@ mod tests {
                     get_or(
                         &mut cache,
                         region_key(vptr, cut),
+                        &witness,
                         SIM_GRID_BYTES,
                         &mut computes,
                     );
@@ -56425,8 +56942,10 @@ mod tests {
                 DealiasGridKey::same_tilt(Arc::as_ptr(volume) as usize, cut, DealiasEngine::Region);
             let frame_cut = &volume.cuts[cut];
             let grid = frame_cut.moments.get(&MomentType::Velocity).unwrap();
-            cached_dealias_grid(key, || Some(dealias_velocity_grid(frame_cut, grid)))
-                .expect("region dealias");
+            cached_dealias_grid(key, DealiasGridWitness::same_tilt(volume), || {
+                Some(dealias_velocity_grid(frame_cut, grid))
+            })
+            .expect("region dealias");
         };
         let step_loop = || {
             for (volume, cut) in &frames {
@@ -57381,6 +57900,7 @@ mod tests {
         }
         cut.moments.insert(MomentType::Reflectivity, grid);
         volume.cuts.push(cut);
+        let volume = Arc::new(volume);
 
         let options = ViewportRasterOptions {
             width: 240,
