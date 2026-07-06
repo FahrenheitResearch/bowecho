@@ -1277,6 +1277,11 @@ mod tests {
     //  - Hurricane Milton's actual Forecast/Advisory (TCM) #15 (AL142024).
     const GDACS_FCST: &str =
         include_str!("../tests/fixtures/tropical/gdacs_bavi_forecast_geometry.json");
+    // BAVI-26's live `getgeometry` with the (large) impact polygons trimmed —
+    // its real 218-vertex cone spans ~27° of longitude (Guam → Philippine Sea),
+    // the wide, partly-off-screen cone the app_ui overlay must still draw.
+    const GDACS_WIDE_CONE: &str =
+        include_str!("../tests/fixtures/tropical/gdacs_bavi_wide_cone_geometry.json");
     const NHC_TCM: &str =
         include_str!("../tests/fixtures/tropical/nhc_milton_forecast_advisory.txt");
     // Real JTWC products captured live for the West-Pacific per-point intensity
@@ -1634,6 +1639,23 @@ REMARKS:
                 .iter()
                 .all(|p| p.valid_time.unwrap() > reference)
         );
+    }
+
+    #[test]
+    fn gdacs_geometry_extracts_wide_cone() {
+        // The real BAVI cone is a large ring; the app_ui overlay relies on it
+        // being delivered intact (it derives the on-screen jump limit from the
+        // cone's own geographic span).
+        let geom = parse_gdacs_geometry(GDACS_WIDE_CONE).expect("parse");
+        assert!(
+            geom.cone.len() >= 200,
+            "real wide cone ring: {} vertices",
+            geom.cone.len()
+        );
+        let west = geom.cone.iter().fold(f32::INFINITY, |m, p| m.min(p.lon));
+        let east = geom.cone.iter().fold(f32::NEG_INFINITY, |m, p| m.max(p.lon));
+        assert!(east - west > 20.0, "cone spans a wide longitude range");
+        assert!(!geom.track.is_empty(), "track segments present");
     }
 
     #[test]

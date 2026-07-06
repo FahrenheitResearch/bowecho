@@ -268,6 +268,24 @@ impl TropicalState {
     }
 }
 
+/// Geographic bounding box `[west, south, east, north]` (degrees) of a cone
+/// ring, feeding `crate::cone_segment_jump_limit_px`.
+fn cone_bbox_deg(cone: &[data_source::tropical::GeoPoint]) -> [f32; 4] {
+    let mut bbox = [
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    for point in cone {
+        bbox[0] = bbox[0].min(point.lon);
+        bbox[1] = bbox[1].min(point.lat);
+        bbox[2] = bbox[2].max(point.lon);
+        bbox[3] = bbox[3].max(point.lat);
+    }
+    bbox
+}
+
 fn vital(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(format!("{label}: ")).weak());
@@ -366,24 +384,22 @@ impl crate::ViewerApp {
                     .iter()
                     .map(|p| self.lon_lat_to_screen(rect, p.lon, p.lat))
                     .collect();
-                if !crate::screen_polyline_has_jump(&ring, true, rect, jump_px)
-                    && let Some(mesh) = crate::filled_polygon_mesh(
-                        &ring,
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
-                    )
-                {
-                    shapes.push(egui::Shape::mesh(mesh));
-                }
-                crate::push_solid_closed_line(
-                    &mut shapes,
+                // The cone's jump limit is derived from its OWN geographic size
+                // (not the viewport) so a wide, partly-off-screen cone still
+                // draws instead of being culled all-or-nothing; only genuine
+                // antimeridian teleports still trip the cull. See
+                // `crate::cone_overlay_shapes`.
+                shapes.extend(crate::cone_overlay_shapes(
                     &ring,
+                    cone_bbox_deg(&geom.cone),
+                    self.map_scale,
+                    rect,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
                     egui::Stroke::new(
                         1.0,
                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150),
                     ),
-                    rect,
-                    jump_px,
-                );
+                ));
             }
             // Draw each GDACS track segment on its own — they are short,
             // independently-oriented pieces; joining them into one polyline

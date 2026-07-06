@@ -49409,6 +49409,48 @@ fn hazard_bbox_segment_allowance_px(bbox: [f32; 4], map_scale: f32) -> f32 {
     width_km.hypot(height_km) * px_per_km * 1.25 + 8.0
 }
 
+/// Jump limit (px) for a tropical cone-of-uncertainty's edges. A legitimate
+/// cone edge can never out-run the cone's own geographic bbox at the current
+/// scale, so derive the limit from that bbox (the same allowance hazard
+/// polygons use) rather than the plain viewport. Without this a wide,
+/// partly-off-screen cone (e.g. Super Typhoon BAVI-26's 27°-of-longitude cone
+/// viewed zoomed-in near Guam) trips the all-or-nothing jump cull the instant
+/// one coarse far-end edge projects longer than the viewport, and the ENTIRE
+/// cone vanishes — fill and outline both. A genuine AEQD antimeridian/antipode
+/// teleport still dwarfs the bbox allowance, so it is still culled. The
+/// viewport floor keeps a small near-center cone free to span the view.
+fn cone_segment_jump_limit_px(cone_bbox_deg: [f32; 4], map_scale: f32, rect: egui::Rect) -> f32 {
+    hazard_bbox_segment_allowance_px(cone_bbox_deg, map_scale).max(rect.width().max(rect.height()))
+}
+
+/// Build a storm cone's translucent fill mesh + outline from its already-
+/// projected screen ring. Split out of `draw_tropical` so the wide /
+/// partly-off-screen culling behavior is unit-testable without a live painter.
+/// `cone_bbox_deg` is the cone ring's geographic bbox `[west, south, east,
+/// north]`; it (with `map_scale`) sets the per-edge jump limit so a real cone
+/// survives at any zoom while a true projection teleport is still dropped.
+fn cone_overlay_shapes(
+    ring: &[egui::Pos2],
+    cone_bbox_deg: [f32; 4],
+    map_scale: f32,
+    rect: egui::Rect,
+    fill: egui::Color32,
+    outline: egui::Stroke,
+) -> Vec<egui::Shape> {
+    let mut shapes = Vec::new();
+    if ring.len() < 3 {
+        return shapes;
+    }
+    let jump_px = cone_segment_jump_limit_px(cone_bbox_deg, map_scale, rect);
+    if !screen_polyline_has_jump(ring, true, rect, jump_px)
+        && let Some(mesh) = filled_polygon_mesh(ring, fill)
+    {
+        shapes.push(egui::Shape::mesh(mesh));
+    }
+    push_solid_closed_line(&mut shapes, ring, outline, rect, jump_px);
+    shapes
+}
+
 fn hazard_bbox(points: &[HazardPoint]) -> [f32; 4] {
     let mut west = f32::INFINITY;
     let mut south = f32::INFINITY;
@@ -52768,6 +52810,164 @@ fn radar_rgba_is_premultiplied_compatible(rgba: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Project a lon/lat to screen exactly as `ViewerApp::lon_lat_to_screen`
+    /// does (AEQD forward about the map center, scaled to px), without a full
+    /// app — lets the cone-culling tests use the real projection.
+    fn project_lon_lat(
+        center_lat: f32,
+        center_lon: f32,
+        map_scale: f32,
+        rect: egui::Rect,
+        lon: f32,
+        lat: f32,
+    ) -> egui::Pos2 {
+        let (east_km, north_km) =
+            aeqd_forward_km(center_lat as f64, center_lon as f64, lat as f64, lon as f64);
+        let px_per_km = map_scale / 111.32;
+        egui::pos2(
+            rect.center().x + east_km as f32 * px_per_km,
+            rect.center().y - north_km as f32 * px_per_km,
+        )
+    }
+
+    fn ring_bbox_deg(cone: &[data_source::tropical::GeoPoint]) -> [f32; 4] {
+        let mut bbox = [
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        for p in cone {
+            bbox[0] = bbox[0].min(p.lon);
+            bbox[1] = bbox[1].min(p.lat);
+            bbox[2] = bbox[2].max(p.lon);
+            bbox[3] = bbox[3].max(p.lat);
+        }
+        bbox
+    }
+
+    /// Regression: Super Typhoon BAVI-26's wide West-Pacific cone of uncertainty
+    /// must still draw (fill mesh + outline) when zoomed in near Guam, where its
+    /// far, coarsely-sampled edges project longer than the viewport. Before the
+    /// fix the whole cone was culled all-or-nothing by the viewport-sized jump
+    /// limit. Real data: the storm's live GDACS `getgeometry` (impact polygons
+    /// trimmed), a 218-vertex cone spanning ~27° of longitude.
+    #[test]
+    fn wide_west_pacific_cone_draws_when_partly_offscreen() {
+        const BAVI_WIDE_CONE: &str = include_str!(
+            "../../data_source/tests/fixtures/tropical/gdacs_bavi_wide_cone_geometry.json"
+        );
+        let geom = data_source::tropical::parse_gdacs_geometry(BAVI_WIDE_CONE).expect("parse");
+        assert!(
+            geom.cone.len() >= 200,
+            "expected the real wide cone ring, got {} vertices",
+            geom.cone.len()
+        );
+        let bbox = ring_bbox_deg(&geom.cone);
+        assert!(
+            bbox[2] - bbox[0] > 20.0,
+            "cone should span a wide longitude range: {bbox:?}"
+        );
+
+        // Zoomed in near Guam — exactly the view the field bug reported.
+        let (center_lat, center_lon) = (13.4_f32, 144.8_f32);
+        let map_scale = 500.0_f32;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        let ring: Vec<egui::Pos2> = geom
+            .cone
+            .iter()
+            .map(|p| project_lon_lat(center_lat, center_lon, map_scale, rect, p.lon, p.lat))
+            .collect();
+
+        // Precondition (the bug): the old viewport-sized limit culls the cone.
+        let viewport_limit = rect.width().max(rect.height());
+        assert!(
+            screen_polyline_has_jump(&ring, true, rect, viewport_limit),
+            "the plain viewport limit would cull this cone — that was the bug"
+        );
+
+        // The fix: a bbox-derived limit keeps every legitimate edge in bounds,
+        // so the cone yields a fill mesh AND a continuous outline.
+        let shapes = cone_overlay_shapes(
+            &ring,
+            bbox,
+            map_scale,
+            rect,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150)),
+        );
+        let mesh_count = shapes
+            .iter()
+            .filter(|s| matches!(s, egui::Shape::Mesh(_)))
+            .count();
+        let outline_count = shapes
+            .iter()
+            .filter(|s| matches!(s, egui::Shape::Path(_)))
+            .count();
+        assert_eq!(mesh_count, 1, "cone fill mesh should be present (was culled)");
+        assert!(outline_count >= 1, "cone outline should be present");
+    }
+
+    /// Do not regress the antimeridian/antipode protection: a small, distinct
+    /// cone sitting near the AEQD antipode of the map center (e.g. an Atlantic
+    /// storm while the view is centered on Guam) projects with enormous
+    /// teleporting edges and must still be culled — no fill, and its outline
+    /// must not draw a spurious line across the whole map.
+    #[test]
+    fn far_antipode_cone_is_still_culled() {
+        let (center_lat, center_lon) = (13.4_f32, 144.8_f32);
+        let map_scale = 500.0_f32;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+        // A small ~4°×3° cone centered on Guam's antipode (~ -13.4, -35.2).
+        let (alat, alon) = (-13.4_f32, -35.2_f32);
+        let cone: Vec<data_source::tropical::GeoPoint> = (0..24)
+            .map(|i| {
+                let theta = std::f32::consts::TAU * i as f32 / 24.0;
+                data_source::tropical::GeoPoint {
+                    lon: alon + 2.0 * theta.cos(),
+                    lat: alat + 1.5 * theta.sin(),
+                }
+            })
+            .collect();
+        let bbox = ring_bbox_deg(&cone);
+        let ring: Vec<egui::Pos2> = cone
+            .iter()
+            .map(|p| project_lon_lat(center_lat, center_lon, map_scale, rect, p.lon, p.lat))
+            .collect();
+        // The bbox-derived limit is modest for this small cone, so its
+        // antipode-stretched edges still trip the jump cull.
+        let jump_px = cone_segment_jump_limit_px(bbox, map_scale, rect);
+        assert!(
+            screen_polyline_has_jump(&ring, true, rect, jump_px),
+            "an antipode cone must still register a projection jump"
+        );
+        let shapes = cone_overlay_shapes(
+            &ring,
+            bbox,
+            map_scale,
+            rect,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150)),
+        );
+        // No fill across the antipode.
+        assert!(
+            !shapes.iter().any(|s| matches!(s, egui::Shape::Mesh(_))),
+            "antipode cone must not produce a fill mesh"
+        );
+        // Any outline pieces that survive are short chunks, never one line that
+        // spans the viewport (the spurious cross-map line we guard against).
+        for shape in &shapes {
+            if let egui::Shape::Path(path) = shape {
+                for pair in path.points.windows(2) {
+                    assert!(
+                        pair[0].distance(pair[1]) <= jump_px,
+                        "no outline chunk may span a projection teleport"
+                    );
+                }
+            }
+        }
+    }
 
     fn unique_test_dir(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
