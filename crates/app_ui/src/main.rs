@@ -29978,6 +29978,7 @@ impl ViewerApp {
         }
         ui.separator();
         let mut load_himawari = false;
+        let mut load_himawari_composite = false;
         const HIMAWARI_IR_BANDS: &[(u8, &str)] = &[
             (7, "B07 Shortwave IR 3.9"),
             (8, "B08 Upper WV 6.2"),
@@ -30022,6 +30023,14 @@ impl ViewerApp {
                         .clicked()
                     {
                         load_himawari = true;
+                    }
+                    if fixed_action_button(ui, "True color", 90.0)
+                        .on_hover_text(
+                            "Fetch the co-registered Himawari-9 visible bands (B01/B02/B03) for the west-Pacific tropics, compose AHI true color (real 0.51 µm green — no synthesized green), and select it in the player + map. Daytime only; heavier than an IR band.",
+                        )
+                        .clicked()
+                    {
+                        load_himawari_composite = true;
                     }
                 });
                 ui.horizontal_wrapped(|ui| {
@@ -30068,6 +30077,18 @@ impl ViewerApp {
                 ..sat_worker::HimawariQuickSpec::default()
             };
             sat.send(sat_worker::SatRequest::IngestLatestHimawari(spec));
+        }
+        if let Some(sat) = &self.sat
+            && load_himawari_composite
+        {
+            self.sat_map_follow = true;
+            self.status = "Satellite: composing Himawari-9 AHI true color".to_owned();
+            self.sat_panel.apply_note(
+                "Himawari composite: queued latest H9 AHI true-color (B01/B02/B03)".to_string(),
+            );
+            sat.send(sat_worker::SatRequest::IngestLatestHimawariComposite(
+                sat_worker::HimawariCompositeSpec::default(),
+            ));
         }
         if let Some(sat) = &self.sat
             && load_composite

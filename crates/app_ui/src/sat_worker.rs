@@ -24,15 +24,18 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Timelike, Utc};
 use eframe::egui::{Color32, ColorImage};
 use rustwx_core::{GridShape, LatLonGrid};
-use rw_sat::abi::{GoesAbiField, GoesAbiScene, read_goes_abi_field};
-use rw_sat::composite::{GoesAbiRgbCompositeStyle, compose_rgb_pixels, values_on_base_grid};
+use rw_sat::abi::{AbiFixedGrid, GoesAbiField, GoesAbiScene, read_goes_abi_field};
+use rw_sat::composite::{
+    GoesAbiRgbCompositeStyle, bilinear_f32, bracket_axis, compose_rgb_pixels, values_on_base_grid,
+};
 use rw_sat::events::{SatError, SatEvent};
 use rw_sat::follow::FollowConfig;
 use rw_sat::goes::{GoesSatellite, parse_goes_abi_filename};
 use rw_sat::himawari::{
-    HIMAWARI_DOWNLOAD_MANIFEST_SCHEMA, HimawariDownloadManifest, HimawariLatestRequest,
-    HimawariManifestSegment, HimawariProduct, HimawariSatellite, HimawariValueMode,
-    assemble_hsd_segments, is_complete_segment_set, list_latest_segments, stage_download_manifest,
+    HIMAWARI_DOWNLOAD_MANIFEST_SCHEMA, HimawariCalibrationInfo, HimawariDownloadManifest,
+    HimawariLatestRequest, HimawariManifestSegment, HimawariProduct, HimawariSatellite,
+    HimawariValueMode, assemble_hsd_segments, inspect_hsd_file, is_complete_segment_set,
+    list_latest_segments, parse_segment_name, stage_download_manifest,
 };
 use rw_sat::palette::{anchor_color, band_anchors};
 use rw_sat::s3::{
@@ -75,6 +78,101 @@ pub enum SatRequest {
     /// Fetch the ABI bands a composite needs (co-registered by scan time),
     /// compose a true/natural-color RGB, and write it as one composite frame.
     IngestLatestGoesComposite(GoesCompositeSpec),
+    /// Fetch the co-registered Himawari AHI visible bands (B01/B02/B03),
+    /// compose an AHI true-color RGB, and write it as one composite frame —
+    /// the Himawari analogue of [`SatRequest::IngestLatestGoesComposite`].
+    IngestLatestHimawariComposite(HimawariCompositeSpec),
+}
+
+/// Himawari AHI visible RGB-composite recipe. Unlike GOES ABI (which lacks a
+/// native green band and must synthesize one), AHI has a real 0.51 µm green
+/// (B02), so true color is a direct band assignment: R = B03 (0.64 µm red),
+/// G = B02 (0.51 µm green), B = B01 (0.47 µm blue). See the JMA Himawari
+/// Standard Data User's Guide (v1.3) §4 for the AHI band table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HimawariCompositeStyle {
+    TrueColor,
+}
+
+impl HimawariCompositeStyle {
+    pub const ALL: [HimawariCompositeStyle; 1] = [Self::TrueColor];
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::TrueColor => "true_color",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::TrueColor => "AHI True Color",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+        Self::ALL.into_iter().find(|style| style.slug() == normalized)
+    }
+
+    /// AHI bands the composite fetches (co-registered onto the base band's
+    /// grid), ordered blue → green → red.
+    pub fn required_bands(self) -> &'static [u8] {
+        match self {
+            Self::TrueColor => &[1, 2, 3],
+        }
+    }
+
+    /// Band whose (1 km) fixed grid the composite is rendered on. B01/B02 are
+    /// 1 km; B03 is 0.5 km and is resampled down onto this base.
+    pub fn base_band(self) -> u8 {
+        match self {
+            Self::TrueColor => 1,
+        }
+    }
+
+    /// `(red_band, green_band, blue_band)` display assignment.
+    pub fn rgb_bands(self) -> (u8, u8, u8) {
+        match self {
+            Self::TrueColor => (3, 2, 1),
+        }
+    }
+}
+
+/// One-shot Himawari AHI visible RGB-composite ingest request (the AHI
+/// analogue of [`GoesCompositeSpec`]). AHI full-disk visible bands are huge
+/// (B03 is 22000×22000 at 0.5 km), so the fetch is bounded to a contiguous
+/// range of full-disk segments — `segment_start`..`segment_start+segment_count`
+/// (1-based, of 10) — which defaults to the tropical band that covers the
+/// west-Pacific tropics (Guam / PGUA).
+#[derive(Debug, Clone)]
+pub struct HimawariCompositeSpec {
+    /// Himawari satellite slug (`h9`, `h8`).
+    pub satellite: String,
+    /// Composite style slug (`true_color`).
+    pub style: String,
+    /// First full-disk segment to fetch (1-based, S01 = north limb).
+    pub segment_start: u8,
+    /// Number of contiguous segments to fetch.
+    pub segment_count: u8,
+    /// How far back to scan 10-min slots for the latest all-band scan.
+    pub lookback_minutes: i64,
+    /// Per-band decimation stride applied on ingest.
+    pub downsample: usize,
+}
+
+impl Default for HimawariCompositeSpec {
+    fn default() -> Self {
+        // S04-S05 of the full disk span roughly +20 N .. 0, covering the
+        // west-Pacific tropics and Guam (13.5 N) — where the live typhoon sits.
+        Self {
+            satellite: "h9".to_string(),
+            style: "true_color".to_string(),
+            segment_start: 4,
+            segment_count: 2,
+            lookback_minutes: 180,
+            downsample: 4,
+        }
+    }
 }
 
 /// One-shot GOES ABI RGB-composite ingest request (Track D true-color path).
@@ -538,6 +636,13 @@ fn run_title(model: &str, run: &str) -> String {
             .map(|day| day.format("%Y-%m-%d").to_string())
             .unwrap_or_default();
         for style in GoesAbiRgbCompositeStyle::ALL {
+            let marker = format!("_rgb_{}_", style.slug());
+            if let Some(pos) = run.find(&marker) {
+                let sector = &run[..pos];
+                return format!("{model} · {sector} {} · {day}", style.title());
+            }
+        }
+        for style in HimawariCompositeStyle::ALL {
             let marker = format!("_rgb_{}_", style.slug());
             if let Some(pos) = run.find(&marker) {
                 let sector = &run[..pos];
@@ -1416,6 +1521,783 @@ fn ingest_latest_himawari(
     ))
 }
 
+/// AHI full-disk scans arrive every 10 minutes; round `now` down to the slot.
+/// (Local mirror of rw-sat's private `round_down_scan_time`.)
+fn round_down_ahi_scan_time(time: DateTime<Utc>, cadence_minutes: i64) -> DateTime<Utc> {
+    let cadence = cadence_minutes.max(1) as u32;
+    let minute = time.minute() - (time.minute() % cadence);
+    time.with_second(0)
+        .and_then(|t| t.with_nanosecond(0))
+        .and_then(|t| t.with_minute(minute))
+        .unwrap_or(time)
+}
+
+/// The picked scan's per-band segment objects (the subrange the composite
+/// fetches), all sharing one scan time.
+struct HimawariScanPick {
+    scan_time: DateTime<Utc>,
+    prefix: String,
+    /// band -> its segment objects, ordered by segment index.
+    by_band: HashMap<u8, Vec<S3Object>>,
+}
+
+/// Newest AHI full-disk scan for which EVERY required visible band has all of
+/// segments `seg_start..seg_start+seg_count` present. All bands of one scan
+/// share the same `HS_H09_<date>_<time>` filename timestamp, so the scan keys
+/// line up exactly across bands (mirrors GOES [`latest_common_scan`]).
+fn latest_himawari_visible_scan(
+    satellite: HimawariSatellite,
+    bands: &[u8],
+    seg_start: u8,
+    seg_count: u8,
+    lookback_minutes: i64,
+) -> Result<HimawariScanPick, String> {
+    let agent = build_agent();
+    let product = HimawariProduct::AhiL1bFldk;
+    let cadence = product.cadence_minutes();
+    let lookback = lookback_minutes.max(cadence);
+    let mut scan_time = round_down_ahi_scan_time(Utc::now(), cadence);
+    let stop = scan_time - chrono::Duration::minutes(lookback);
+    let wanted: Vec<u8> = (seg_start..seg_start.saturating_add(seg_count)).collect();
+
+    while scan_time >= stop {
+        let prefix = product.scan_prefix(scan_time);
+        let objects = list_s3_objects(&agent, satellite.bucket(), &prefix, None)
+            .map_err(|err| err.to_string())?;
+        let mut by_band: HashMap<u8, Vec<(u8, S3Object)>> = HashMap::new();
+        for object in objects {
+            let Some(name) = parse_segment_name(object_filename(&object.key)) else {
+                continue;
+            };
+            if name.satellite != satellite
+                || name.scan_time != scan_time
+                || !bands.contains(&name.band)
+                || !wanted.contains(&name.segment_index)
+            {
+                continue;
+            }
+            by_band
+                .entry(name.band)
+                .or_default()
+                .push((name.segment_index, object));
+        }
+        let complete = bands.iter().all(|band| {
+            by_band.get(band).is_some_and(|segs| {
+                let mut idxs: Vec<u8> = segs.iter().map(|(idx, _)| *idx).collect();
+                idxs.sort_unstable();
+                idxs.dedup();
+                idxs == wanted
+            })
+        });
+        if complete {
+            let mut out: HashMap<u8, Vec<S3Object>> = HashMap::new();
+            for (band, mut segs) in by_band {
+                segs.sort_by_key(|(idx, _)| *idx);
+                out.insert(band, segs.into_iter().map(|(_, object)| object).collect());
+            }
+            return Ok(HimawariScanPick {
+                scan_time,
+                prefix,
+                by_band: out,
+            });
+        }
+        scan_time -= chrono::Duration::minutes(cadence);
+    }
+
+    Err(format!(
+        "no {} AHI scan in the last {} min has bands {:?} for segments S{:02}..S{:02}",
+        satellite.slug(),
+        lookback,
+        bands,
+        seg_start,
+        seg_start.saturating_add(seg_count).saturating_sub(1)
+    ))
+}
+
+/// Read one staged AHI HSD segment's true raw counts (as f32), NaN at error /
+/// off-disk pixels — returning `(values_row_major, columns)`.
+///
+/// This bypasses rw-sat's `HimawariValueMode::Count`, which right-shifts every
+/// value by `bits_per_pixel - valid_bits_per_pixel` (5 for the visible bands).
+/// That shift assumes the count is stored LEFT-justified, but the NOAA-hosted
+/// HSD files store it RIGHT-justified (a live H09 B01 segment holds raw values
+/// like 19/20/110 — not multiples of 32), so rw-sat's count comes out 32× too
+/// small and clouds render black. The JMA HSD User's Guide (v1.3) §4 stores the
+/// `valid_bits_per_pixel`-bit count in the low bits, so the raw 16-bit value IS
+/// the count (outside the error/outside-scan sentinels). Verified on live data:
+/// with this read a Cat-5 eyewall reaches reflectance ~1 (white); rw-sat's
+/// shifted count capped the whole disk near black.
+fn decode_ahi_raw_counts(path: &Path) -> Result<(Vec<f32>, usize), String> {
+    let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
+    let header = rw_sat::himawari::parse_hsd_header(&bytes).map_err(|err| err.to_string())?;
+    let calibration = header
+        .calibration
+        .as_ref()
+        .ok_or("AHI HSD segment is missing calibration block #5")?;
+    let (error_count, outside_count) =
+        (calibration.error_pixel_count, calibration.outside_scan_count);
+    let cols = usize::from(header.data.columns);
+    let lines = usize::from(header.data.lines);
+    let pixels = cols.saturating_mul(lines);
+    let data_start = header.total_header_length as usize;
+    if bytes.len() < data_start + pixels * 2 {
+        return Err(format!(
+            "AHI HSD data block short: need {} bytes, have {}",
+            data_start + pixels * 2,
+            bytes.len()
+        ));
+    }
+    let little = matches!(header.byte_order, rw_sat::himawari::HimawariByteOrder::Little);
+    let mut values = Vec::with_capacity(pixels);
+    for i in 0..pixels {
+        let o = data_start + i * 2;
+        let raw = if little {
+            u16::from_le_bytes([bytes[o], bytes[o + 1]])
+        } else {
+            u16::from_be_bytes([bytes[o], bytes[o + 1]])
+        };
+        values.push(if raw == error_count || raw == outside_count {
+            f32::NAN
+        } else {
+            f32::from(raw)
+        });
+    }
+    Ok((values, cols))
+}
+
+/// Assemble true raw counts from a band's staged segments onto rw-sat's
+/// downsampled grid — segments sorted by sequence number, concatenated
+/// row-major, then stride-`downsample` subsampled exactly as rw-sat's
+/// `assemble_hsd_segments` + `downsample_satellite_field` do, so the values
+/// line up 1:1 with the [`SatelliteGridField`] grid we keep for geolocation.
+fn ahi_true_counts_on_grid(paths: &[PathBuf], downsample: usize) -> Result<Vec<f32>, String> {
+    let mut segments: Vec<(u8, Vec<f32>, usize)> = Vec::with_capacity(paths.len());
+    for path in paths {
+        let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
+        let header = rw_sat::himawari::parse_hsd_header(&bytes).map_err(|err| err.to_string())?;
+        let sequence = header
+            .segment
+            .as_ref()
+            .map(|segment| segment.sequence_number)
+            .unwrap_or(0);
+        let (values, cols) = decode_ahi_raw_counts(path)?;
+        segments.push((sequence, values, cols));
+    }
+    segments.sort_by_key(|(sequence, _, _)| *sequence);
+    let nx = segments
+        .first()
+        .map(|(_, _, cols)| *cols)
+        .ok_or("no AHI segments to assemble")?;
+    let mut full: Vec<f32> = Vec::new();
+    for (_, values, cols) in &segments {
+        if *cols != nx {
+            return Err("inconsistent AHI segment width".to_string());
+        }
+        full.extend_from_slice(values);
+    }
+    let ny = if nx == 0 { 0 } else { full.len() / nx };
+    let step = downsample.max(1);
+    if step == 1 {
+        return Ok(full);
+    }
+    let xs: Vec<usize> = (0..nx).step_by(step).collect();
+    let ys: Vec<usize> = (0..ny).step_by(step).collect();
+    let mut out = Vec::with_capacity(xs.len().saturating_mul(ys.len()));
+    for &y in &ys {
+        for &x in &xs {
+            out.push(full[y * nx + x]);
+        }
+    }
+    Ok(out)
+}
+
+/// Download one band's staged segments and assemble them into a raw-count
+/// [`SatelliteGridField`], returning the band's HSD calibration alongside. The
+/// grid/scene (geolocation) comes from rw-sat's `assemble_hsd_segments`; the
+/// values are replaced with the *true* raw counts from [`ahi_true_counts_on_grid`]
+/// (see [`decode_ahi_raw_counts`] for why rw-sat's own counts are unusable).
+/// Reflectance is derived downstream via [`ahi_counts_to_reflectance`].
+#[allow(clippy::too_many_arguments)]
+fn fetch_himawari_band_counts(
+    satellite: HimawariSatellite,
+    scan_time: DateTime<Utc>,
+    prefix: &str,
+    band: u8,
+    objects: &[S3Object],
+    cache_root: &Path,
+    source_root: &Path,
+    downsample: usize,
+    send: &impl Fn(SatResponse) -> bool,
+) -> Result<(SatelliteGridField, HimawariCalibrationInfo), String> {
+    let agent = build_agent();
+    let manifest_dir = source_root.join("manifest");
+    let raw_dir = source_root.join("raw");
+    std::fs::create_dir_all(&manifest_dir).map_err(|err| err.to_string())?;
+
+    let mut manifest_segments = Vec::with_capacity(objects.len());
+    let mut total_bytes = 0_u64;
+    for object in objects {
+        let name = parse_segment_name(object_filename(&object.key))
+            .ok_or_else(|| format!("unparseable Himawari key {}", object.key))?;
+        send(SatResponse::DownloadStarted {
+            id: object.key.clone(),
+            label: format!(
+                "{} B{:02} S{:02}/{:02}",
+                satellite.platform(),
+                name.band,
+                name.segment_index,
+                name.segment_count
+            ),
+            bytes: object.size_bytes,
+        });
+        let started = Instant::now();
+        let downloaded = download_object(&agent, satellite.bucket(), cache_root, object, true)
+            .map_err(|err| err.to_string())?;
+        send(SatResponse::DownloadDone {
+            id: object.key.clone(),
+            ms: started.elapsed().as_millis(),
+            cache_hit: downloaded.cache_hit,
+        });
+        total_bytes = total_bytes.saturating_add(object.size_bytes);
+        manifest_segments.push(HimawariManifestSegment {
+            band: name.band,
+            segment_index: name.segment_index,
+            segment_count: name.segment_count,
+            product: name.product.clone(),
+            resolution: name.resolution.clone(),
+            key: object.key.clone(),
+            url: object_url(satellite.bucket(), &object.key),
+            last_modified: object.last_modified.clone(),
+            size_bytes: object.size_bytes,
+            cache_path: downloaded.path.display().to_string(),
+            cache_hit: downloaded.cache_hit,
+        });
+    }
+
+    let manifest_path = manifest_dir.join(format!(
+        "{}_ahi-l1b-fldk_b{band:02}_{}.json",
+        satellite.slug(),
+        scan_time.format("%Y%m%dT%H%M%SZ")
+    ));
+    let manifest = HimawariDownloadManifest {
+        schema: HIMAWARI_DOWNLOAD_MANIFEST_SCHEMA.to_string(),
+        satellite: satellite.slug().to_string(),
+        platform: satellite.platform().to_string(),
+        bucket: satellite.bucket().to_string(),
+        product: HimawariProduct::AhiL1bFldk.slug().to_string(),
+        scan_time_utc: scan_time.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        prefix: prefix.to_string(),
+        band,
+        segments_downloaded: manifest_segments.len(),
+        segments_available: manifest_segments.len(),
+        source_complete: true,
+        allow_partial: false,
+        total_downloaded_bytes: total_bytes,
+        cache_root: cache_root.display().to_string(),
+        segments: manifest_segments,
+    };
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).map_err(|err| err.to_string())?,
+    )
+    .map_err(|err| err.to_string())?;
+
+    let staged =
+        stage_download_manifest(&manifest_path, &raw_dir).map_err(|err| err.to_string())?;
+    let paths = staged
+        .segments
+        .iter()
+        .map(|segment| PathBuf::from(&segment.raw_path))
+        .collect::<Vec<_>>();
+    // rw-sat's assemble gives us the correct grid/scene (geolocation), but its
+    // Count values are right-shifted (see decode_ahi_raw_counts); replace them
+    // with the true raw counts read on the same downsampled grid.
+    let mut field = assemble_hsd_segments(&paths, HimawariValueMode::Count, downsample.max(1))
+        .map_err(|err| err.to_string())?;
+    let true_counts = ahi_true_counts_on_grid(&paths, downsample.max(1))?;
+    if true_counts.len() != field.values.len() {
+        return Err(format!(
+            "AHI B{band:02} true-count length {} does not match the assembled grid {}",
+            true_counts.len(),
+            field.values.len()
+        ));
+    }
+    field.values = true_counts;
+    let header = inspect_hsd_file(&paths[0]).map_err(|err| err.to_string())?;
+    let calibration = header
+        .calibration
+        .ok_or_else(|| format!("AHI B{band:02} HSD header carries no calibration block #5"))?;
+    Ok((field, calibration))
+}
+
+/// Convert AHI raw counts to reflectance (albedo) using the HSD visible
+/// calibration (JMA HSD User's Guide §4.3): radiance = `slope · count +
+/// intercept`, reflectance = `c' · radiance`, where `c'` is the block-5
+/// count-to-albedo coefficient (`planck_or_albedo_coefficients[0]`; verified
+/// ≈ 0.00156 for a live H09 B01 segment). Non-finite counts (error / off-disk
+/// pixels) stay NaN → transparent; negative radiance (dark ocean / night)
+/// clamps to 0 → opaque near-black.
+fn ahi_counts_to_reflectance(counts: &[f32], calibration: &HimawariCalibrationInfo) -> Vec<f32> {
+    let slope = calibration.count_to_radiance_slope;
+    let intercept = calibration.count_to_radiance_intercept;
+    let cprime = calibration.planck_or_albedo_coefficients[0];
+    counts
+        .iter()
+        .map(|&count| {
+            if !count.is_finite() {
+                return f32::NAN;
+            }
+            let radiance = slope * f64::from(count) + intercept;
+            ((radiance * cprime).max(0.0)) as f32
+        })
+        .collect()
+}
+
+/// Whether two AHI fixed grids are the same scan-angle mesh (identity
+/// resample). Mirrors rw-sat composite's `same_fixed_grid`.
+fn same_ahi_fixed_grid(a: &AbiFixedGrid, b: &AbiFixedGrid) -> bool {
+    a.nx == b.nx
+        && a.ny == b.ny
+        && a.x_scan_rad.len() == b.x_scan_rad.len()
+        && a.y_scan_rad.len() == b.y_scan_rad.len()
+        && a.x_scan_rad
+            .iter()
+            .zip(&b.x_scan_rad)
+            .all(|(p, q)| (p - q).abs() <= 1.0e-12)
+        && a.y_scan_rad
+            .iter()
+            .zip(&b.y_scan_rad)
+            .all(|(p, q)| (p - q).abs() <= 1.0e-12)
+}
+
+/// Resample a band's values onto the base band's fixed grid (bilinear in
+/// scan-angle space; identity when the grids already match). This is how the
+/// 0.5 km B03 red lands on the 1 km base and vice versa — the AHI counterpart
+/// of rw-sat's [`values_on_base_grid`], which is typed to GOES scenes only.
+fn resample_ahi_to_base(
+    src_grid: &AbiFixedGrid,
+    src_values: &[f32],
+    base_grid: &AbiFixedGrid,
+) -> Vec<f32> {
+    if same_ahi_fixed_grid(src_grid, base_grid) {
+        return src_values.to_vec();
+    }
+    let x_map: Vec<Option<(usize, usize, f32)>> = base_grid
+        .x_scan_rad
+        .iter()
+        .map(|&value| bracket_axis(&src_grid.x_scan_rad, value))
+        .collect();
+    let y_map: Vec<Option<(usize, usize, f32)>> = base_grid
+        .y_scan_rad
+        .iter()
+        .map(|&value| bracket_axis(&src_grid.y_scan_rad, value))
+        .collect();
+    let mut out = vec![f32::NAN; base_grid.nx.saturating_mul(base_grid.ny)];
+    for (j, y_bracket) in y_map.iter().enumerate() {
+        let Some((j0, j1, fy)) = *y_bracket else {
+            continue;
+        };
+        for (i, x_bracket) in x_map.iter().enumerate() {
+            let Some((i0, i1, fx)) = *x_bracket else {
+                continue;
+            };
+            let idx = |yy: usize, xx: usize| yy * src_grid.nx + xx;
+            out[j * base_grid.nx + i] = bilinear_f32(
+                src_values[idx(j0, i0)],
+                src_values[idx(j0, i1)],
+                src_values[idx(j1, i0)],
+                src_values[idx(j1, i1)],
+                fx,
+                fy,
+            );
+        }
+    }
+    out
+}
+
+/// Reflectance (0..~1) → display channel byte, matching GOES `visible_component`
+/// (gamma 2.2 over 0..1). Kept as f32 so it drops straight into the shared
+/// `rgb_r/g/b` composite planes.
+fn ahi_visible_component(reflectance: f32) -> f32 {
+    let scaled = reflectance.clamp(0.0, 1.0).powf(1.0 / 2.2);
+    (scaled * 255.0).round().clamp(0.0, 255.0)
+}
+
+/// The three baked composite planes `(rgb_r, rgb_g, rgb_b)` (NaN = transparent).
+type CompositePlanes = (Vec<f32>, Vec<f32>, Vec<f32>);
+
+/// Compose AHI true color from per-band reflectance planes (all already on the
+/// base grid). Any band non-finite at a pixel → transparent; otherwise each
+/// display channel is the gamma-mapped reflectance of its assigned band. The
+/// three returned planes are the same `rgb_r/g/b` f32 layout the GOES
+/// composite path introduced (NaN = transparent).
+fn compose_ahi_true_color(
+    style: HimawariCompositeStyle,
+    planes: &HashMap<u8, Vec<f32>>,
+    len: usize,
+) -> Result<CompositePlanes, String> {
+    let (red_band, green_band, blue_band) = style.rgb_bands();
+    let red = planes
+        .get(&red_band)
+        .ok_or_else(|| format!("missing B{red_band:02} plane"))?;
+    let green = planes
+        .get(&green_band)
+        .ok_or_else(|| format!("missing B{green_band:02} plane"))?;
+    let blue = planes
+        .get(&blue_band)
+        .ok_or_else(|| format!("missing B{blue_band:02} plane"))?;
+    if red.len() < len || green.len() < len || blue.len() < len {
+        return Err("AHI composite plane shorter than the base grid".to_string());
+    }
+    let (mut r, mut g, mut b) = (
+        Vec::with_capacity(len),
+        Vec::with_capacity(len),
+        Vec::with_capacity(len),
+    );
+    for idx in 0..len {
+        let (rv, gv, bv) = (red[idx], green[idx], blue[idx]);
+        if rv.is_finite() && gv.is_finite() && bv.is_finite() {
+            r.push(ahi_visible_component(rv));
+            g.push(ahi_visible_component(gv));
+            b.push(ahi_visible_component(bv));
+        } else {
+            r.push(f32::NAN);
+            g.push(f32::NAN);
+            b.push(f32::NAN);
+        }
+    }
+    Ok((r, g, b))
+}
+
+/// The generic satellite selector for a baked AHI RGB-composite frame: the
+/// base band on the AHI sweep=y projection, plus a `composite` block naming
+/// the style and its source bands (mirrors [`composite_selector`] and
+/// [`himawari_selector`]).
+fn himawari_composite_selector(
+    scene: &SatelliteGridScene,
+    style: HimawariCompositeStyle,
+) -> serde_json::Value {
+    let (red_band, green_band, blue_band) = style.rgb_bands();
+    let projection = serde_json::json!({
+        "perspective_point_height_m": scene.projection.perspective_point_height_m,
+        "semi_major_axis_m": scene.projection.semi_major_axis_m,
+        "semi_minor_axis_m": scene.projection.semi_minor_axis_m,
+        "longitude_of_projection_origin_deg":
+            scene.projection.longitude_of_projection_origin_deg,
+        "sweep_angle_axis": "y",
+    });
+    serde_json::json!({
+        "satellite": {
+            "provider": scene.provider,
+            "instrument": scene.instrument,
+            "satellite": scene.satellite,
+            "model": scene.model,
+            "product": scene.product,
+            "sector": scene.sector,
+            "band": style.base_band(),
+            "layer": format!("rgb_{}", style.slug()),
+            "source_variable": "HSD count",
+            "composite": {
+                "style": style.slug(),
+                "title": style.title(),
+                "bands": [red_band, green_band, blue_band],
+            },
+            "scan_start_utc": scene.start_time_utc.to_rfc3339(),
+            "scan_end_utc": scene.end_time_utc.to_rfc3339(),
+            "projection": projection,
+        }
+    })
+}
+
+/// Write a baked AHI RGB composite as one store frame: three `rgb_r/g/b` f32
+/// planes on the AHI sweep=y per-pixel mesh (see [`ahi_lat_lon_mesh`] for why
+/// AHI is navigated locally, not through rw-sat's GOES-convention writer),
+/// following the same store contract as [`write_himawari_grid_frame`] /
+/// [`write_goes_composite_frame`]. Composite runs are
+/// `<sector>_rgb_<style>_<YYYYMMDD>`.
+#[allow(clippy::too_many_arguments)]
+fn write_himawari_composite_frame(
+    store_root: &Path,
+    scene: &SatelliteGridScene,
+    style: HimawariCompositeStyle,
+    r: &[f32],
+    g: &[f32],
+    b: &[f32],
+    written_unix: u64,
+) -> Result<WrittenFrame, String> {
+    let model = sanitize_store_token(&scene.model);
+    let sector = sanitize_store_token(&scene.sector);
+    let day = scene.start_time_utc.format("%Y%m%d").to_string();
+    let hhmm = (scene.start_time_utc.hour() * 100 + scene.start_time_utc.minute()) as u16;
+    let run_base = format!("{sector}_rgb_{}_{day}", style.slug());
+
+    let (nx, ny) = (scene.fixed_grid.nx, scene.fixed_grid.ny);
+    let expected = nx.saturating_mul(ny);
+    if r.len() != expected || g.len() != expected || b.len() != expected {
+        return Err(format!(
+            "composite plane length mismatch for grid {nx}x{ny}: r={} g={} b={}",
+            r.len(),
+            g.len(),
+            b.len()
+        ));
+    }
+    let (lat, lon) = ahi_lat_lon_mesh(scene);
+    let shape = GridShape::new(nx, ny).map_err(|err| err.to_string())?;
+    let grid = LatLonGrid::new(shape, lat, lon).map_err(|err| err.to_string())?;
+
+    // Reuse the run dir whose stored grid is bit-identical, else take the
+    // first free suffixed name — the store rule that keeps grid changes honest.
+    let model_dir = store_root.join(&model);
+    let mut candidates: Vec<String> = Vec::new();
+    if model_dir.is_dir() {
+        for entry in std::fs::read_dir(&model_dir).map_err(|err| err.to_string())? {
+            let entry = entry.map_err(|err| err.to_string())?;
+            let is_dir = entry.file_type().map_err(|err| err.to_string())?.is_dir();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if is_dir && (name == run_base || name.starts_with(&format!("{run_base}_"))) {
+                candidates.push(name);
+            }
+        }
+    }
+    candidates.sort();
+    let mut resolved: Option<(String, String)> = None;
+    for name in &candidates {
+        let grid_path = model_dir.join(name).join("grid.rwg");
+        if !grid_path.is_file() {
+            continue;
+        }
+        let existing = GridFile::open(&grid_path).map_err(|err| err.to_string())?;
+        if existing.nx == nx
+            && existing.ny == ny
+            && coords_bit_identical(&existing.lat, &grid.lat_deg)
+            && coords_bit_identical(&existing.lon, &grid.lon_deg)
+        {
+            resolved = Some((name.clone(), existing.hash));
+            break;
+        }
+    }
+    let created_run = resolved.is_none();
+    let (run_name, existing_grid_hash) = match resolved {
+        Some((name, hash)) => (name, Some(hash)),
+        None => {
+            let mut suffix = 1usize;
+            loop {
+                let name = if suffix == 1 {
+                    run_base.clone()
+                } else {
+                    format!("{run_base}_{suffix}")
+                };
+                if !candidates.contains(&name) {
+                    break (name, None);
+                }
+                suffix += 1;
+            }
+        }
+    };
+
+    let run_dir = model_dir.join(&run_name);
+    std::fs::create_dir_all(&run_dir).map_err(|err| err.to_string())?;
+    let _lock =
+        RunLock::acquire(&run_dir, Duration::from_secs(60)).map_err(|err| err.to_string())?;
+
+    let grid_path = run_dir.join("grid.rwg");
+    let grid_hash = match existing_grid_hash {
+        Some(hash) => hash,
+        None => write_grid(&grid_path, &grid, None).map_err(|err| err.to_string())?,
+    };
+
+    let started = Instant::now();
+    let selector = himawari_composite_selector(scene, style);
+    let writer_build = concat!("bowecho app_ui ", env!("CARGO_PKG_VERSION"));
+    let mut writer = HourWriter::new(&model, &run_name, hhmm, nx, ny, &grid_hash, writer_build);
+    writer
+        .add_surface2d(COMPOSITE_R_VAR, "rgb8", selector, r)
+        .map_err(|err| err.to_string())?;
+    writer
+        .add_surface2d(COMPOSITE_G_VAR, "rgb8", serde_json::Value::Null, g)
+        .map_err(|err| err.to_string())?;
+    writer
+        .add_surface2d(COMPOSITE_B_VAR, "rgb8", serde_json::Value::Null, b)
+        .map_err(|err| err.to_string())?;
+    let file_name = frame_file_name(hhmm);
+    let frame_path = run_dir.join(&file_name);
+    writer.finish(&frame_path).map_err(|err| err.to_string())?;
+    let encode_ms = started.elapsed().as_millis() as u64;
+    let bytes = std::fs::metadata(&frame_path)
+        .map_err(|err| err.to_string())?
+        .len();
+
+    let manifest_path = run_dir.join("run.json");
+    let writer_info = RwsWriterInfo {
+        name: "bowecho".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build: writer_build.to_string(),
+    };
+    let mut manifest = RwsRunManifest::load_or_new(
+        &manifest_path,
+        &model,
+        &run_name,
+        &grid_hash,
+        nx,
+        ny,
+        writer_info,
+    )
+    .map_err(|err| err.to_string())?;
+    manifest.register_hour(
+        hhmm,
+        RwsHourEntry {
+            file: file_name,
+            written_unix,
+            encode_ms,
+            variables: vec![
+                COMPOSITE_R_VAR.to_string(),
+                COMPOSITE_G_VAR.to_string(),
+                COMPOSITE_B_VAR.to_string(),
+            ],
+        },
+    );
+    manifest
+        .save(&manifest_path)
+        .map_err(|err| err.to_string())?;
+
+    Ok(WrittenFrame {
+        model,
+        run: run_name,
+        hhmm,
+        scan_time_utc: scene.start_time_utc,
+        path: frame_path,
+        bytes,
+        encode_ms,
+        grid_hash,
+        created_run,
+        variable: COMPOSITE_R_VAR.to_string(),
+    })
+}
+
+/// Fetch the co-registered AHI visible bands the composite needs (the newest
+/// scan that has the requested full-disk segment range for all of them),
+/// convert each to reflectance, resample onto the base band's grid, compose
+/// AHI true color per pixel, and write one composite frame into the sat store.
+/// This is the Himawari counterpart of [`ingest_latest_goes_composite`]; it
+/// reuses the same `rgb_r/g/b` frame storage so the frames play through the
+/// existing composite render path.
+fn ingest_latest_himawari_composite(
+    store_root: &Path,
+    spec: &HimawariCompositeSpec,
+    send: &impl Fn(SatResponse) -> bool,
+) -> Result<String, String> {
+    let satellite = HimawariSatellite::parse(&spec.satellite)
+        .ok_or_else(|| format!("unknown Himawari satellite '{}'", spec.satellite))?;
+    let style = HimawariCompositeStyle::parse(&spec.style)
+        .ok_or_else(|| format!("unknown Himawari composite style '{}'", spec.style))?;
+    let bands = style.required_bands();
+    let base_band = style.base_band();
+    let seg_start = spec.segment_start.clamp(1, 10);
+    let seg_count = spec.segment_count.clamp(1, 11 - seg_start);
+    let downsample = spec.downsample.max(1);
+    let cache_root = store_root.join("cache");
+    let source_root = store_root.join("sources").join("himawari");
+
+    let pick = latest_himawari_visible_scan(
+        satellite,
+        bands,
+        seg_start,
+        seg_count,
+        spec.lookback_minutes.max(10),
+    )?;
+
+    // Fetch + assemble each band as raw counts on its native grid, keeping the
+    // per-band calibration for the reflectance conversion.
+    let mut fields: HashMap<u8, SatelliteGridField> = HashMap::with_capacity(bands.len());
+    let mut calibrations: HashMap<u8, HimawariCalibrationInfo> = HashMap::with_capacity(bands.len());
+    for &band in bands {
+        let objects = pick
+            .by_band
+            .get(&band)
+            .ok_or_else(|| format!("the picked scan is missing AHI B{band:02}"))?;
+        let (field, calibration) = fetch_himawari_band_counts(
+            satellite,
+            pick.scan_time,
+            &pick.prefix,
+            band,
+            objects,
+            &cache_root,
+            &source_root,
+            downsample,
+            send,
+        )?;
+        fields.insert(band, field);
+        calibrations.insert(band, calibration);
+    }
+
+    // Base grid = the base band's (1 km) grid; resample every band's
+    // reflectance onto it, then compose true color per pixel.
+    let base_scene = fields
+        .get(&base_band)
+        .ok_or_else(|| format!("composite base band B{base_band:02} was not fetched"))?
+        .scene
+        .clone();
+    let base_grid = base_scene.fixed_grid.clone();
+    let (nx, ny) = (base_grid.nx, base_grid.ny);
+    let len = nx.saturating_mul(ny);
+
+    let mut planes: HashMap<u8, Vec<f32>> = HashMap::with_capacity(bands.len());
+    for &band in bands {
+        let field = &fields[&band];
+        let reflectance = ahi_counts_to_reflectance(&field.values, &calibrations[&band]);
+        let on_base = resample_ahi_to_base(&field.scene.fixed_grid, &reflectance, &base_grid);
+        planes.insert(band, on_base);
+    }
+    let (r, g, b) = compose_ahi_true_color(style, &planes, len)?;
+
+    let frame = write_himawari_composite_frame(
+        store_root,
+        &base_scene,
+        style,
+        &r,
+        &g,
+        &b,
+        Utc::now().timestamp().max(0) as u64,
+    )?;
+
+    for objects in pick.by_band.values() {
+        for object in objects {
+            send(SatResponse::FrameWritten {
+                id: object.key.clone(),
+                run: frame.run.clone(),
+                hhmm: frame.hhmm,
+                bytes: frame.bytes,
+                encode_ms: frame.encode_ms,
+            });
+        }
+    }
+    send(SatResponse::Runs(scan_runs(store_root)));
+    send(SatResponse::SelectFrame {
+        key: SatRunKey {
+            model: frame.model.clone(),
+            run: frame.run.clone(),
+        },
+        hhmm: frame.hhmm,
+    });
+
+    let lit = r.iter().filter(|value| value.is_finite()).count();
+    Ok(format!(
+        "Himawari {} {} {}: scan {} · S{:02}..S{:02} · {}x{} · {:.0}% lit · wrote {}/{}/t{:04}",
+        satellite.platform(),
+        base_scene.sector,
+        style.title(),
+        pick.scan_time.format("%Y-%m-%d %H:%MZ"),
+        seg_start,
+        seg_start + seg_count - 1,
+        nx,
+        ny,
+        100.0 * lit as f64 / len.max(1) as f64,
+        frame.model,
+        frame.run,
+        frame.hhmm
+    ))
+}
+
 /// ABI scan mode token in the open-data filenames (mode 6 since 2019; mode
 /// 3 is the legacy contingency schedule). A mode flip degrades to editing
 /// this constant, mirroring rw-sat's follow engine.
@@ -1892,6 +2774,26 @@ fn worker_loop(
                     Err(message) => {
                         send(SatResponse::Note(format!(
                             "GOES composite failed: {message}"
+                        )));
+                    }
+                }
+            }
+            SatRequest::IngestLatestHimawariComposite(spec) => {
+                send(SatResponse::Note(format!(
+                    "Himawari composite: locating latest {} {} (S{:02}..S{:02})",
+                    spec.satellite,
+                    spec.style,
+                    spec.segment_start,
+                    spec.segment_start.saturating_add(spec.segment_count).saturating_sub(1)
+                )));
+                match ingest_latest_himawari_composite(&store_root, &spec, &send) {
+                    Ok(summary) => {
+                        send(SatResponse::Note(summary));
+                        send(SatResponse::Runs(scan_runs(&store_root)));
+                    }
+                    Err(message) => {
+                        send(SatResponse::Note(format!(
+                            "Himawari composite failed: {message}"
                         )));
                     }
                 }
@@ -2934,5 +3836,242 @@ mod tests {
             other => panic!("expected Runs, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Himawari AHI true-color composite ----------------------------------
+
+    fn synthetic_visible_calibration(
+        slope: f64,
+        intercept: f64,
+        cprime: f64,
+    ) -> HimawariCalibrationInfo {
+        HimawariCalibrationInfo {
+            band_number: 1,
+            central_wavelength_um: 0.47,
+            valid_bits_per_pixel: 11,
+            error_pixel_count: 65535,
+            outside_scan_count: 65534,
+            count_to_radiance_slope: slope,
+            count_to_radiance_intercept: intercept,
+            planck_or_albedo_coefficients: [cprime, 0.0, 0.0],
+            inverse_planck_coefficients: None,
+            physical_constants: None,
+        }
+    }
+
+    #[test]
+    fn himawari_composite_style_round_trips_and_assigns_true_color_bands() {
+        for style in HimawariCompositeStyle::ALL {
+            assert_eq!(HimawariCompositeStyle::parse(style.slug()), Some(style));
+        }
+        // True color assigns R=B03 (red) G=B02 (real green) B=B01 (blue),
+        // base grid = B01 (1 km); fetches all three visible bands.
+        let style = HimawariCompositeStyle::TrueColor;
+        assert_eq!(style.rgb_bands(), (3, 2, 1));
+        assert_eq!(style.base_band(), 1);
+        assert_eq!(style.required_bands(), &[1, 2, 3]);
+        assert_eq!(
+            HimawariCompositeStyle::parse("true-color"),
+            Some(HimawariCompositeStyle::TrueColor)
+        );
+        assert_eq!(HimawariCompositeStyle::parse("nope"), None);
+    }
+
+    #[test]
+    fn ahi_counts_convert_to_reflectance_and_clamp_dark() {
+        // radiance = 0.1*count - 1.0; reflectance = 0.01*radiance.
+        let calibration = synthetic_visible_calibration(0.1, -1.0, 0.01);
+        let counts = vec![f32::NAN, 5.0, 20.0, 100.0];
+        let reflectance = ahi_counts_to_reflectance(&counts, &calibration);
+        assert!(reflectance[0].is_nan(), "error/off-disk stays NaN");
+        // count 5 -> radiance -0.5 -> negative -> clamps to 0 (opaque near-black).
+        assert_eq!(reflectance[1], 0.0);
+        // count 20 -> radiance 1.0 -> reflectance 0.01.
+        assert!((reflectance[2] - 0.01).abs() < 1e-6, "{}", reflectance[2]);
+        // count 100 -> radiance 9.0 -> reflectance 0.09.
+        assert!((reflectance[3] - 0.09).abs() < 1e-6, "{}", reflectance[3]);
+    }
+
+    #[test]
+    fn ahi_true_color_round_trips_and_greens_vegetation() {
+        let dir = test_dir("ahi-composite");
+        // 2x2 AHI scene (sweep=y mesh), row-major reflectance:
+        // [0] vegetation, [1] bright cloud, [2] dark ocean, [3] off-earth.
+        let scene = synthetic_ahi_field(2, 0, vec![0.0, 0.04]).scene;
+        let (nx, ny) = (scene.fixed_grid.nx, scene.fixed_grid.ny);
+        let len = nx * ny;
+        assert_eq!(len, 4);
+
+        let style = HimawariCompositeStyle::TrueColor;
+        let mut planes: HashMap<u8, Vec<f32>> = HashMap::new();
+        // B03 red, B02 green, B01 blue (off-earth = NaN in blue).
+        planes.insert(3, vec![0.10, 0.90, 0.02, 0.05]);
+        planes.insert(2, vec![0.22, 0.90, 0.03, 0.05]);
+        planes.insert(1, vec![0.08, 0.90, 0.06, f32::NAN]);
+        let (r, g, b) = compose_ahi_true_color(style, &planes, len).expect("compose");
+
+        let frame = write_himawari_composite_frame(&dir, &scene, style, &r, &g, &b, 1).unwrap();
+        assert_eq!(frame.model, "h9");
+        assert!(
+            frame.run.contains("_rgb_true_color_"),
+            "composite run naming: {}",
+            frame.run
+        );
+        assert!(frame.created_run);
+
+        // Load back through the exact player path (composite branch). The AHI
+        // mesh stores north-first (y descends), so rows are NOT flipped and
+        // pixel index == compose index.
+        let mut state = WorkerState::default();
+        let key = SatRunKey {
+            model: frame.model.clone(),
+            run: frame.run.clone(),
+        };
+        let loaded = load_frame(&mut state, &dir, &key, frame.hhmm).expect("composite loads");
+        assert_eq!(loaded.image.size, [nx, ny]);
+
+        let veg = loaded.image.pixels[0];
+        assert_eq!(veg.a(), 255, "lit composite pixel is opaque");
+        assert!(
+            veg.g() > veg.r() && veg.g() > veg.b(),
+            "vegetation renders green (real B02 green): {veg:?}"
+        );
+        let cloud = loaded.image.pixels[1];
+        assert_eq!(cloud.a(), 255);
+        assert!(
+            cloud.r() > 150 && cloud.g() > 150 && cloud.b() > 150,
+            "cloud is bright: {cloud:?}"
+        );
+        let ocean = loaded.image.pixels[2];
+        assert_eq!(ocean.a(), 255, "dark ocean stays opaque (not a transparent hole)");
+        assert!(
+            ocean.b() > ocean.r(),
+            "dark ocean skews blue: {ocean:?}"
+        );
+        assert_eq!(
+            loaded.image.pixels[3].a(),
+            0,
+            "off-earth composite pixel is transparent"
+        );
+
+        // Self-describing: composite style + AHI sweep=y projection.
+        let stored = rw_sat::store::read_frame(&dir, &frame.model, &frame.run, frame.hhmm).unwrap();
+        assert_eq!(
+            stored.selector["satellite"]["composite"]["style"],
+            "true_color"
+        );
+        assert_eq!(
+            stored.selector["satellite"]["projection"]["sweep_angle_axis"],
+            "y"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ahi_composite_run_title_is_recognized() {
+        let title = run_title("h9", "fulldisk_s04_05of10_rgb_true_color_20260705");
+        assert!(
+            title.contains("AHI True Color") && title.contains("2026-07-05"),
+            "AHI composite title: {title}"
+        );
+    }
+
+    #[test]
+    fn ahi_resample_is_identity_on_matching_grid() {
+        let grid = AbiFixedGrid {
+            nx: 2,
+            ny: 2,
+            x_scan_rad: vec![0.0, 0.04],
+            y_scan_rad: vec![0.12, 0.0],
+        };
+        let values = vec![1.0, 2.0, 3.0, 4.0];
+        let out = resample_ahi_to_base(&grid, &values, &grid);
+        assert_eq!(out, values, "same grid resamples to identity");
+    }
+
+    /// End-to-end proof against LIVE Himawari open data: fetch the visible
+    /// bands, compose AHI true color, store, load back, and export a PNG.
+    /// Gated behind `BOWECHO_SAT_HIMAWARI_COMPOSITE_PROOF_PNG` so CI stays
+    /// offline; run it to prove the natural/true-color path on real imagery
+    /// (never synthetic-only). Daytime scans only (visible bands).
+    #[test]
+    fn export_himawari_composite_proof_png_when_env_is_set() {
+        let Some(out) = std::env::var_os("BOWECHO_SAT_HIMAWARI_COMPOSITE_PROOF_PNG") else {
+            return;
+        };
+        let store = std::env::var_os("BOWECHO_SAT_HIMAWARI_COMPOSITE_PROOF_STORE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("bowecho-ahi-composite-proof-store"));
+        std::fs::create_dir_all(&store).expect("proof store dir");
+        let env_usize = |key: &str, default: usize| {
+            std::env::var(key)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+        let spec = HimawariCompositeSpec {
+            satellite: std::env::var("BOWECHO_SAT_HIMAWARI_COMPOSITE_SAT")
+                .unwrap_or_else(|_| "h9".to_string()),
+            style: "true_color".to_string(),
+            segment_start: env_usize("BOWECHO_SAT_HIMAWARI_COMPOSITE_SEG_START", 4) as u8,
+            segment_count: env_usize("BOWECHO_SAT_HIMAWARI_COMPOSITE_SEG_COUNT", 2) as u8,
+            lookback_minutes: 240,
+            downsample: env_usize("BOWECHO_SAT_HIMAWARI_COMPOSITE_DOWNSAMPLE", 6),
+        };
+        let sink = |response: SatResponse| {
+            if let SatResponse::Note(message) = &response {
+                eprintln!("AHI COMPOSITE note: {message}");
+            }
+            true
+        };
+        let summary = ingest_latest_himawari_composite(&store, &spec, &sink)
+            .expect("live AHI composite ingest");
+        eprintln!("AHI COMPOSITE {summary}");
+
+        let runs = scan_runs(&store);
+        let run = runs
+            .iter()
+            .find(|run| run.key.run.contains("_rgb_true_color_"))
+            .expect("an AHI composite run was written");
+        let hhmm = *run.frames.last().expect("composite run has a frame");
+        let mut state = WorkerState::default();
+        let frame = load_frame(&mut state, &store, &run.key, hhmm).expect("proof frame loads");
+
+        let (mut lit, mut rsum, mut gsum, mut bsum) = (0u64, 0u64, 0u64, 0u64);
+        let mut rgba = Vec::with_capacity(frame.image.pixels.len() * 4);
+        for pixel in &frame.image.pixels {
+            rgba.extend_from_slice(&[pixel.r(), pixel.g(), pixel.b(), pixel.a()]);
+            if pixel.a() > 0 {
+                lit += 1;
+                rsum += u64::from(pixel.r());
+                gsum += u64::from(pixel.g());
+                bsum += u64::from(pixel.b());
+            }
+        }
+        assert!(lit > 0, "the true-color frame has lit pixels");
+        eprintln!(
+            "AHI COMPOSITE {}x{} lit={lit} mean rgb=({:.1},{:.1},{:.1})",
+            frame.image.size[0],
+            frame.image.size[1],
+            rsum as f64 / lit as f64,
+            gsum as f64 / lit as f64,
+            bsum as f64 / lit as f64,
+        );
+        let image = image::RgbaImage::from_raw(
+            frame.image.size[0] as u32,
+            frame.image.size[1] as u32,
+            rgba,
+        )
+        .expect("proof image dimensions match");
+        if let Some(parent) = PathBuf::from(&out).parent() {
+            std::fs::create_dir_all(parent).expect("proof png parent directory");
+        }
+        image.save(&out).expect("AHI composite proof png writes");
+        eprintln!(
+            "AHI COMPOSITE proof PNG {}x{} -> {}",
+            frame.image.size[0],
+            frame.image.size[1],
+            PathBuf::from(&out).display()
+        );
     }
 }
