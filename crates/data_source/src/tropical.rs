@@ -921,8 +921,21 @@ pub fn fetch_active_cyclones(
 
     match (nhc, gdacs) {
         (Ok(nhc), Ok(gdacs)) => Ok(merge_sources(nhc, gdacs)),
-        (Ok(nhc), Err(_)) => Ok(nhc),
-        (Err(_), Ok(gdacs)) => Ok(merge_sources(Vec::new(), gdacs)),
+        // A partial failure must NOT masquerade as "no active cyclones". Trust a
+        // single surviving source only when it actually reports storms; when it
+        // is EMPTY we cannot distinguish "genuinely quiet" from "the source that
+        // carried the storms is down" — GDACS is the only feed for the West
+        // Pacific (e.g. the live BAVI-26 typhoon), while NHC covers just the
+        // Atlantic/E-Pac. Surface the failure so the caller retries instead of
+        // showing a false all-clear.
+        (Ok(nhc), Err(_)) if !nhc.is_empty() => Ok(nhc),
+        (Ok(_), Err(gdacs_err)) => Err(format!(
+            "GDACS unavailable (NHC reports no Atlantic/E-Pac storms): {gdacs_err}"
+        )),
+        (Err(_), Ok(gdacs)) if !gdacs.is_empty() => Ok(merge_sources(Vec::new(), gdacs)),
+        (Err(nhc_err), Ok(_)) => Err(format!(
+            "NHC unavailable (GDACS reports no storms): {nhc_err}"
+        )),
         (Err(nhc_err), Err(gdacs_err)) => Err(format!(
             "both sources failed — NHC: {nhc_err}; GDACS: {gdacs_err}"
         )),

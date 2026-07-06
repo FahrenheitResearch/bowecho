@@ -23,6 +23,10 @@ use ui_core::worker_slot::{SlotPoll, WorkerSlot};
 /// position updates) and GDACS a few times a day; 10 min keeps the card fresh
 /// without hammering the sources.
 pub const TROPICAL_REFRESH_SECONDS: u64 = 600;
+/// Faster retry cadence used until the first successful fetch, or after a failed
+/// one, so a slow/unavailable source (GDACS can lag) doesn't leave the panel
+/// falsely showing "no active" for a full [`TROPICAL_REFRESH_SECONDS`] window.
+pub const TROPICAL_RETRY_SECONDS: u64 = 20;
 
 type StormsResult = std::result::Result<Vec<TropicalCyclone>, String>;
 type GeometryResult = std::result::Result<(String, StormGeometry), String>;
@@ -37,6 +41,11 @@ pub struct TropicalState {
     pub geometry: HashMap<String, StormGeometry>,
     /// Short human status for the panel header.
     pub status: String,
+    /// Result of the most recent completed fetch: `None` until the first one
+    /// finishes (so the panel can show "checking…" instead of "no active"),
+    /// then `Some(true)` on success / `Some(false)` on failure (drives the
+    /// faster retry cadence).
+    last_fetch_ok: Option<bool>,
     last_refresh: Option<Instant>,
     /// A card asked the map to recenter here (lon, lat); ViewerApp drains it.
     pub focus_request: Option<(f32, f32)>,
@@ -49,7 +58,8 @@ impl Default for TropicalState {
             geometry_rx: WorkerSlot::idle("tropical-geometry"),
             storms: Vec::new(),
             geometry: HashMap::new(),
-            status: String::new(),
+            status: "Checking for active tropical cyclones…".to_owned(),
+            last_fetch_ok: None,
             last_refresh: None,
             focus_request: None,
         }
@@ -60,9 +70,16 @@ impl TropicalState {
     /// Kick a refresh if it's due and none is in flight; heartbeat so the
     /// interval keeps ticking on an otherwise-idle map.
     pub fn maybe_refresh(&mut self, ctx: &egui::Context) {
+        // Until we have a good result, poll aggressively so a slow/failed first
+        // fetch recovers in seconds instead of after the full 10-minute cycle.
+        let interval = if self.last_fetch_ok == Some(true) {
+            Duration::from_secs(TROPICAL_REFRESH_SECONDS)
+        } else {
+            Duration::from_secs(TROPICAL_RETRY_SECONDS)
+        };
         let due = self
             .last_refresh
-            .is_none_or(|last| last.elapsed() >= Duration::from_secs(TROPICAL_REFRESH_SECONDS));
+            .is_none_or(|last| last.elapsed() >= interval);
         if due && !self.storms_rx.in_flight() {
             self.last_refresh = Some(Instant::now());
             self.storms_rx.spawn(ctx, |tx| {
@@ -79,6 +96,7 @@ impl TropicalState {
     pub fn poll(&mut self) {
         match self.storms_rx.poll() {
             SlotPoll::Ready(Ok(storms)) => {
+                self.last_fetch_ok = Some(true);
                 self.status = match storms.len() {
                     0 => "No active tropical cyclones".to_owned(),
                     1 => "1 active tropical cyclone".to_owned(),
@@ -89,7 +107,11 @@ impl TropicalState {
                     .retain(|id, _| storms.iter().any(|s| &s.id == id));
                 self.storms = storms;
             }
-            SlotPoll::Ready(Err(err)) => self.status = format!("Tropical fetch failed: {err}"),
+            SlotPoll::Ready(Err(err)) => {
+                self.last_fetch_ok = Some(false);
+                // Keep any storms we already have on screen; just note the retry.
+                self.status = format!("Sources unavailable — retrying… ({err})");
+            }
             SlotPoll::Idle | SlotPoll::Pending | SlotPoll::Disconnected => {}
         }
         if let SlotPoll::Ready(Ok((id, geom))) = self.geometry_rx.poll() {
@@ -136,7 +158,22 @@ impl TropicalState {
         ui.label(egui::RichText::new(&self.status).weak());
         if self.storms.is_empty() {
             ui.add_space(4.0);
-            ui.label("Quiet across every basin right now.");
+            match self.last_fetch_ok {
+                // No completed fetch yet, or the last one failed — don't imply
+                // an authoritative all-clear while we're still (re)trying.
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Checking NHC + GDACS for active storms…");
+                    });
+                }
+                Some(false) => {
+                    ui.label("Couldn't reach the storm sources — retrying…");
+                }
+                Some(true) => {
+                    ui.label("Quiet across every basin right now.");
+                }
+            }
             return;
         }
         ui.add_space(4.0);
