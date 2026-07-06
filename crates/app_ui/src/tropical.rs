@@ -144,9 +144,19 @@ impl TropicalState {
             let id = storm.id.clone();
             let source = storm.source;
             let url = storm.geometry_url.clone().expect("checked is_some");
+            // JTWC per-point forecast intensity for West-Pacific/Indian/Southern
+            // storms (None for NHC basins, which carry it in their own TCM).
+            let forecast_url = storm.forecast_url.clone();
             self.geometry_rx.spawn(ctx, move |tx| {
                 let result = tropical_http_client()
-                    .and_then(|client| tropical::fetch_storm_geometry(&client, source, &url))
+                    .and_then(|client| {
+                        tropical::fetch_storm_geometry(
+                            &client,
+                            source,
+                            &url,
+                            forecast_url.as_deref(),
+                        )
+                    })
                     .map(|geom| (id, geom));
                 let _ = tx.send(result);
             });
@@ -426,9 +436,10 @@ impl crate::ViewerApp {
         }
         painter.extend(forecast_lines);
 
-        // Forecast dots, colored by each point's Saffir–Simpson category (NHC
-        // carries per-point wind; GDACS points inherit the storm's current
-        // category). Track the dot nearest the cursor for a stats tooltip.
+        // Forecast dots, colored by each point's Saffir–Simpson category. NHC
+        // (TCM) and JTWC-matched West-Pacific/Indian/Southern storms carry real
+        // per-point max wind; any point still lacking it inherits the storm's
+        // current category. Track the dot nearest the cursor for a stats tooltip.
         let hover = painter
             .ctx()
             .pointer_hover_pos()

@@ -5,7 +5,17 @@
 //!   Pacific; carries max wind (kt), min pressure (mb), and motion directly.
 //! - **GDACS** `geteventlist/EVENTS4APP?eventtypes=TC` — a global aggregator
 //!   (JTWC/JMA/etc.) that covers every other basin, including the West Pacific.
-//!   Its `getgeometry` endpoint returns the track, cone, and impact polygons.
+//!   Its `getgeometry` endpoint returns the track, cone, and impact polygons —
+//!   but NO honest per-point forecast wind (it repeats the storm's *current*
+//!   severity on every point).
+//! - **JTWC** (Joint Typhoon Warning Center) Tropical Cyclone Warning text —
+//!   the official U.S. forecast authority for the basins NHC does not cover
+//!   (West Pacific, Indian Ocean, Southern Hemisphere). Its fixed-format
+//!   `wpNNyyweb.txt` bulletin carries a per-point forecast track WITH max
+//!   sustained wind (kt) at 12/24/36/48/72/96/120 h — the West-Pacific analogue
+//!   of NHC's TCM. Active warnings are discovered from the JTWC RSS feed, then
+//!   matched to a GDACS storm by name to enrich its forecast dots with real
+//!   Saffir–Simpson intensity (the cone/track still come from GDACS).
 //!
 //! The two feed a single [`TropicalCyclone`] so the UI never cares which
 //! center issued a storm. Fields are intentionally comprehensive (wind, gusts,
@@ -200,6 +210,12 @@ pub struct TropicalCyclone {
     pub report_url: Option<String>,
     /// The source URL to fetch this storm's track/cone geometry.
     pub geometry_url: Option<String>,
+    /// For a JTWC-covered GDACS storm (West Pacific, Indian Ocean, Southern
+    /// Hemisphere), the JTWC Tropical Cyclone Warning text URL carrying
+    /// per-point forecast intensity (`wpNNyyweb.txt`). Set by matching the JTWC
+    /// RSS feed to this storm's name; enriches the GDACS getgeometry track/cone
+    /// with real per-point max wind. `None` when no active JTWC warning matches.
+    pub forecast_url: Option<String>,
 }
 
 impl TropicalCyclone {
@@ -402,6 +418,9 @@ fn nhc_to_cyclone(storm: NhcStorm) -> TropicalCyclone {
         // The forecast-advisory (TCM) URL is fetched on the second pass and
         // parsed into `forecast` by `parse_nhc_forecast_advisory`.
         geometry_url: storm.forecast_advisory.and_then(|advisory| advisory.url),
+        // NHC's own TCM already carries per-point intensity via geometry_url;
+        // no separate JTWC enrichment needed for NHC basins.
+        forecast_url: None,
     }
 }
 
@@ -538,11 +557,22 @@ fn parse_signed_coord(tok: &str, positive: char, negative: char) -> Option<f32> 
 /// times only ever run FORWARD from issuance (out to day 5), so a day-of-month
 /// below the issuance day means the track crossed into the next month/year.
 fn parse_tcm_time(tok: &str, issued: Option<(i32, u32, u32)>) -> Option<DateTime<Utc>> {
-    let (year, month, issue_day) = issued?;
     let stamp = tok.trim_end_matches('Z');
     let (day_s, hhmm_s) = stamp.split_once('/')?;
-    let day: u32 = day_s.parse().ok()?;
-    let hhmm: u32 = hhmm_s.parse().ok()?;
+    resolve_forward_time(day_s.parse().ok()?, hhmm_s.parse().ok()?, issued)
+}
+
+/// Resolve a `(day-of-month, HHMM)` stamp against the issuance `(year, month,
+/// day)`, given that official forecast valid times only ever run FORWARD from
+/// issuance (out to ~day 5). A day-of-month below the issuance day therefore
+/// means the track crossed into the next month (and year, at a Dec boundary).
+/// Shared by the NHC TCM (`DD/HHMMZ`) and JTWC warning (`DDHHMMZ`) parsers.
+fn resolve_forward_time(
+    day: u32,
+    hhmm: u32,
+    issued: Option<(i32, u32, u32)>,
+) -> Option<DateTime<Utc>> {
+    let (year, month, issue_day) = issued?;
     let (mut y, mut m) = (year, month);
     if day < issue_day {
         if m == 12 {
@@ -562,6 +592,229 @@ fn parse_nhc_max_wind(line: &str) -> Option<f32> {
     line.strip_prefix("MAX WIND")?
         .split_whitespace()
         .next()?
+        .parse::<f32>()
+        .ok()
+}
+
+// ---------------------------------------------------------------------------
+// JTWC — RSS discovery + Tropical Cyclone Warning (per-point forecast + wind)
+// ---------------------------------------------------------------------------
+
+/// The JTWC public RSS feed listing active Tropical Cyclone Warnings and the
+/// URLs of their text/graphic products (keyless, no auth). See
+/// <https://www.metoc.navy.mil/jtwc/jtwc.html>.
+pub const JTWC_RSS_URL: &str = "https://www.metoc.navy.mil/jtwc/rss/jtwc.rss?tc";
+
+/// One active JTWC warning discovered from the RSS feed: its designation
+/// (e.g. `09W`), storm name (e.g. `Bavi`), and the Tropical Cyclone Warning
+/// text URL (`wpNNyyweb.txt`) carrying the per-point forecast + intensity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JtwcWarningRef {
+    pub designation: String,
+    pub name: String,
+    pub warning_url: String,
+}
+
+/// Parse the JTWC RSS feed into the list of active Tropical Cyclone Warnings.
+///
+/// Each active storm appears as a bold header `<... NNX (Name) Warning #NN ...>`
+/// followed by a `TC Warning Text` link to its `{basin}{NN}{yy}web.txt` product.
+/// We pair each storm-warning URL with the storm header that immediately
+/// precedes it. Non-storm `web.txt` products (the basin-wide "Significant
+/// Tropical Weather Advisory" outlooks `abpwweb.txt`/`abioweb.txt`, which have
+/// no storm number) are rejected by [`is_jtwc_warning_url`].
+pub fn parse_jtwc_rss(xml: &str) -> Vec<JtwcWarningRef> {
+    let mut out: Vec<JtwcWarningRef> = Vec::new();
+    let needle = "web.txt";
+    let mut cursor = 0;
+    while let Some(rel) = xml[cursor..].find(needle) {
+        let end = cursor + rel + needle.len();
+        cursor = end;
+        // The URL runs from the last `http` before the match to the end of
+        // `web.txt` (RSS hrefs are absolute).
+        let Some(start) = xml[..end].rfind("http") else {
+            continue;
+        };
+        let url = &xml[start..end];
+        if !is_jtwc_warning_url(url) {
+            continue;
+        }
+        if let Some((designation, name)) = last_jtwc_designation(&xml[..start]) {
+            out.push(JtwcWarningRef {
+                designation,
+                name,
+                warning_url: url.to_owned(),
+            });
+        }
+    }
+    out
+}
+
+/// A storm-warning product URL ends in `{2 letters}{2-digit storm}{2-digit
+/// year}web.txt` (e.g. `wp0926web.txt`). The basin-wide outlook products
+/// (`abpwweb.txt`, `abioweb.txt`) have no numeric storm/year and are excluded.
+fn is_jtwc_warning_url(url: &str) -> bool {
+    let file = url.rsplit('/').next().unwrap_or(url);
+    let Some(stem) = file.strip_suffix("web.txt") else {
+        return false;
+    };
+    let bytes = stem.as_bytes();
+    bytes.len() == 6
+        && bytes[..2].iter().all(u8::is_ascii_alphabetic)
+        && bytes[2..].iter().all(u8::is_ascii_digit)
+}
+
+/// The last `NNX (Name)` designation+name in `before` (the text preceding a
+/// warning URL) — the header of the storm that URL belongs to. `NNX` is two
+/// digits and one or more letters (`09W`, `01B`, `02S`); the name is in the
+/// following parentheses. Rejects non-storm parentheticals like `(JTWC CDO)`
+/// or `(Western/South Pacific Ocean)`.
+fn last_jtwc_designation(before: &str) -> Option<(String, String)> {
+    let mut found = None;
+    for (i, _) in before.match_indices('(') {
+        let after = &before[i + 1..];
+        let Some(close) = after.find(')') else {
+            continue;
+        };
+        let name = after[..close].trim();
+        if name.is_empty() || name.len() > 20 || !name.chars().all(|c| c.is_alphanumeric()) {
+            continue;
+        }
+        let designation = before[..i]
+            .trim_end()
+            .rsplit(char::is_whitespace)
+            .next()
+            .unwrap_or_default();
+        if is_jtwc_designation(designation) {
+            found = Some((designation.to_owned(), title_case(name)));
+        }
+    }
+    found
+}
+
+/// `09W`, `01B`, `02S` — two ASCII digits followed by one or more letters.
+fn is_jtwc_designation(tok: &str) -> bool {
+    let bytes = tok.as_bytes();
+    bytes.len() >= 3
+        && bytes[..2].iter().all(u8::is_ascii_digit)
+        && bytes[2..].iter().all(u8::is_ascii_uppercase)
+}
+
+/// Set `forecast_url` on each GDACS storm whose name matches an active JTWC
+/// warning, so the geometry pipeline can enrich it with per-point intensity.
+/// (NHC storms already carry per-point wind in their own TCM.)
+pub fn attach_jtwc_forecast_urls(storms: &mut [TropicalCyclone], refs: &[JtwcWarningRef]) {
+    for storm in storms.iter_mut() {
+        if storm.source != Source::Gdacs {
+            continue;
+        }
+        if let Some(matched) = refs
+            .iter()
+            .find(|r| r.name.eq_ignore_ascii_case(&storm.name) && !storm.name.is_empty())
+        {
+            storm.forecast_url = Some(matched.warning_url.clone());
+        }
+    }
+}
+
+/// Parse the official forecast track from a JTWC Tropical Cyclone Warning
+/// (`wpNNyyweb.txt`) — the West-Pacific/Indian-Ocean analogue of NHC's TCM.
+/// Under `FORECASTS:` (and its `EXTENDED`/`LONG RANGE OUTLOOK` continuations)
+/// each point is a `NN HRS, VALID AT:` header, then a `DDHHMMZ --- LATn LONe`
+/// position line, then a `MAX SUSTAINED WINDS - nnn KT` line — carrying
+/// per-point **valid time, position, and max sustained wind (kt)**, exactly
+/// what the Saffir–Simpson color ramp needs. The current `WARNING POSITION`
+/// (analysis) point is intentionally excluded (only forecast points are
+/// returned). Format reference: JTWC product descriptions,
+/// <https://www.metoc.navy.mil/jtwc/jtwc.html>.
+pub fn parse_jtwc_forecast_warning(text: &str) -> Vec<ForecastPoint> {
+    let issued = jtwc_issuance_date(text);
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    for (i, raw) in lines.iter().enumerate() {
+        // A forecast block starts with e.g. "12 HRS, VALID AT:".
+        if !raw.trim().ends_with("HRS, VALID AT:") {
+            continue;
+        }
+        // Position line is the next line that parses as `DDHHMMZ --- lat lon`.
+        let Some((position, valid_time)) = lines
+            .iter()
+            .skip(i + 1)
+            .take(3)
+            .find_map(|l| parse_jtwc_valid_line(l.trim(), issued))
+        else {
+            continue;
+        };
+        // Intensity is the first `MAX SUSTAINED WINDS` line of this block.
+        let max_wind_kt = lines
+            .iter()
+            .skip(i + 1)
+            .take(6)
+            .find_map(|l| parse_jtwc_max_wind(l.trim()));
+        out.push(ForecastPoint {
+            position,
+            valid_time,
+            max_wind_kt,
+        });
+    }
+    out
+}
+
+/// Pull the issuance `(year, month, day)` from a JTWC warning's `DDMONYY`
+/// datestamp (e.g. `06JUL26` in the REMARKS block). The forecast lines carry
+/// only a day-of-month, so this reference resolves month/year across rollover.
+fn jtwc_issuance_date(text: &str) -> Option<(i32, u32, u32)> {
+    for tok in text.split_whitespace() {
+        let t = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if t.len() != 7 || !t.is_ascii() {
+            continue;
+        }
+        let day = t[0..2].parse::<u32>().ok();
+        let month = month_from_abbrev(&t[2..5]);
+        let yy = t[5..7].parse::<i32>().ok();
+        if let (Some(day), Some(month), Some(yy)) = (day, month, yy) {
+            return Some((2000 + yy, month, day));
+        }
+    }
+    None
+}
+
+/// Parse a JTWC forecast position line: `061200Z --- 15.1N 142.5E` (the
+/// `WARNING POSITION` variant `060000Z --- NEAR 14.3N 145.0E` is also handled).
+/// West-Pacific longitudes are E (positive).
+fn parse_jtwc_valid_line(
+    line: &str,
+    issued: Option<(i32, u32, u32)>,
+) -> Option<(GeoPoint, Option<DateTime<Utc>>)> {
+    let mut toks = line.split_whitespace();
+    let time_tok = toks.next()?;
+    if !time_tok.ends_with('Z') {
+        return None;
+    }
+    // Skip the `---` separator and an optional `NEAR`.
+    let lat_tok = toks.find(|t| *t != "---" && *t != "NEAR")?;
+    let lon_tok = toks.next()?;
+    let lat = parse_signed_coord(lat_tok, 'N', 'S')?;
+    let lon = parse_signed_coord(lon_tok, 'E', 'W')?;
+    Some((GeoPoint { lon, lat }, parse_jtwc_time(time_tok, issued)))
+}
+
+/// `061200Z` (DDHHMM) + issuance `(year, month, day)` -> a UTC instant.
+fn parse_jtwc_time(tok: &str, issued: Option<(i32, u32, u32)>) -> Option<DateTime<Utc>> {
+    let stamp = tok.trim_end_matches('Z');
+    if stamp.len() != 6 || !stamp.is_ascii() {
+        return None;
+    }
+    let day: u32 = stamp[0..2].parse().ok()?;
+    let hhmm: u32 = stamp[2..6].parse().ok()?;
+    resolve_forward_time(day, hhmm, issued)
+}
+
+/// `MAX SUSTAINED WINDS - 145 KT, GUSTS 175 KT` -> `145`.
+fn parse_jtwc_max_wind(line: &str) -> Option<f32> {
+    let rest = line.strip_prefix("MAX SUSTAINED WINDS")?;
+    rest.split(|c: char| !c.is_ascii_digit())
+        .find(|s| !s.is_empty())?
         .parse::<f32>()
         .ok()
 }
@@ -701,6 +954,10 @@ fn gdacs_to_cyclone(feature: GdacsFeature) -> Option<TropicalCyclone> {
         cone: Vec::new(),
         report_url: urls.report,
         geometry_url: urls.geometry,
+        // Filled later by matching the JTWC RSS feed (see
+        // `attach_jtwc_forecast_urls`) when an official JTWC warning is active
+        // for this storm.
+        forecast_url: None,
     })
 }
 
@@ -713,9 +970,11 @@ fn gdacs_to_cyclone(feature: GdacsFeature) -> Option<TropicalCyclone> {
 /// whose center is the track position, with a `key` (`MMDDHHMM`) valid-time
 /// stamp and a `todate` analysis time. GDACS repeats only the storm's *current*
 /// severity on every point (not a per-point forecast), so forecast points get
-/// `max_wind_kt = None` and are colored by the storm's current category. We keep
-/// the points strictly AFTER the analysis time (the forecast; earlier points are
-/// the observed past already drawn as `Line_Line` segments).
+/// `max_wind_kt = None` and are colored by the storm's current category — unless
+/// [`fetch_storm_geometry`] later replaces them with the JTWC warning's honest
+/// per-point intensity. We keep the points strictly AFTER the analysis time (the
+/// forecast; earlier points are the observed past already drawn as `Line_Line`
+/// segments).
 pub fn parse_gdacs_geometry(json: &str) -> Result<StormGeometry, String> {
     let parsed: GdacsCollection =
         serde_json::from_str(json).map_err(|err| format!("GDACS geometry parse: {err}"))?;
@@ -910,7 +1169,9 @@ pub fn merge_sources(
 
 /// Fetch and merge every active tropical cyclone worldwide. Resilient: if one
 /// source fails, the other's storms are still returned; only a total failure
-/// is an error.
+/// is an error. As a best-effort last step, active JTWC warnings are matched to
+/// the GDACS storms so each carries a `forecast_url` for per-point intensity —
+/// a JTWC outage silently leaves the honest GDACS-only fallback in place.
 pub fn fetch_active_cyclones(
     client: &reqwest::blocking::Client,
 ) -> Result<Vec<TropicalCyclone>, String> {
@@ -919,8 +1180,8 @@ pub fn fetch_active_cyclones(
     let gdacs =
         fetch_text(client, GDACS_TC_LIST_URL).and_then(|body| parse_gdacs_event_list(&body));
 
-    match (nhc, gdacs) {
-        (Ok(nhc), Ok(gdacs)) => Ok(merge_sources(nhc, gdacs)),
+    let mut storms = match (nhc, gdacs) {
+        (Ok(nhc), Ok(gdacs)) => merge_sources(nhc, gdacs),
         // A partial failure must NOT masquerade as "no active cyclones". Trust a
         // single surviving source only when it actually reports storms; when it
         // is EMPTY we cannot distinguish "genuinely quiet" from "the source that
@@ -928,31 +1189,63 @@ pub fn fetch_active_cyclones(
         // Pacific (e.g. the live BAVI-26 typhoon), while NHC covers just the
         // Atlantic/E-Pac. Surface the failure so the caller retries instead of
         // showing a false all-clear.
-        (Ok(nhc), Err(_)) if !nhc.is_empty() => Ok(nhc),
-        (Ok(_), Err(gdacs_err)) => Err(format!(
-            "GDACS unavailable (NHC reports no Atlantic/E-Pac storms): {gdacs_err}"
-        )),
-        (Err(_), Ok(gdacs)) if !gdacs.is_empty() => Ok(merge_sources(Vec::new(), gdacs)),
-        (Err(nhc_err), Ok(_)) => Err(format!(
-            "NHC unavailable (GDACS reports no storms): {nhc_err}"
-        )),
-        (Err(nhc_err), Err(gdacs_err)) => Err(format!(
-            "both sources failed — NHC: {nhc_err}; GDACS: {gdacs_err}"
-        )),
+        (Ok(nhc), Err(_)) if !nhc.is_empty() => nhc,
+        (Ok(_), Err(gdacs_err)) => {
+            return Err(format!(
+                "GDACS unavailable (NHC reports no Atlantic/E-Pac storms): {gdacs_err}"
+            ));
+        }
+        (Err(_), Ok(gdacs)) if !gdacs.is_empty() => merge_sources(Vec::new(), gdacs),
+        (Err(nhc_err), Ok(_)) => {
+            return Err(format!(
+                "NHC unavailable (GDACS reports no storms): {nhc_err}"
+            ));
+        }
+        (Err(nhc_err), Err(gdacs_err)) => {
+            return Err(format!(
+                "both sources failed — NHC: {nhc_err}; GDACS: {gdacs_err}"
+            ));
+        }
+    };
+    // Best-effort: match active JTWC warnings to GDACS storms so each carries a
+    // forecast_url for real per-point West-Pacific intensity (a JTWC outage
+    // silently leaves the honest GDACS-only fallback in place).
+    if let Ok(rss) = fetch_text(client, JTWC_RSS_URL) {
+        attach_jtwc_forecast_urls(&mut storms, &parse_jtwc_rss(&rss));
     }
+    Ok(storms)
 }
 
 /// Fetch one storm's forecast geometry from its `geometry_url`, parsed per
 /// source: GDACS `getgeometry` yields track + cone + forecast points; the NHC
 /// forecast-advisory (TCM) yields forecast points (with per-point wind) only.
+///
+/// `forecast_url` is the optional JTWC Tropical Cyclone Warning for a
+/// GDACS-covered storm: when present and parseable, its per-point forecast
+/// (position + valid time + **real max sustained wind**) REPLACES the
+/// intensity-less GDACS forecast points, so the West-Pacific dots color by the
+/// official JTWC per-point Saffir–Simpson category. The GDACS track and cone are
+/// always kept. A failed/empty JTWC fetch leaves the GDACS fallback untouched.
 pub fn fetch_storm_geometry(
     client: &reqwest::blocking::Client,
     source: Source,
     url: &str,
+    forecast_url: Option<&str>,
 ) -> Result<StormGeometry, String> {
     let body = fetch_text(client, url)?;
     match source {
-        Source::Gdacs => parse_gdacs_geometry(&body),
+        Source::Gdacs => {
+            let mut geometry = parse_gdacs_geometry(&body)?;
+            if let Some(warning_url) = forecast_url
+                && let Ok(warning) = fetch_text(client, warning_url)
+            {
+                let jtwc = parse_jtwc_forecast_warning(&warning);
+                if !jtwc.is_empty() {
+                    geometry.forecast = jtwc;
+                }
+            }
+            Ok(geometry)
+        }
         Source::Nhc => Ok(StormGeometry {
             forecast: parse_nhc_forecast_advisory(&body),
             ..StormGeometry::default()
@@ -986,6 +1279,10 @@ mod tests {
         include_str!("../tests/fixtures/tropical/gdacs_bavi_forecast_geometry.json");
     const NHC_TCM: &str =
         include_str!("../tests/fixtures/tropical/nhc_milton_forecast_advisory.txt");
+    // Real JTWC products captured live for the West-Pacific per-point intensity
+    // feature: the active RSS feed and Super Typhoon 09W (BAVI) Warning #21.
+    const JTWC_RSS: &str = include_str!("../tests/fixtures/tropical/jtwc_rss.xml");
+    const JTWC_WARNING: &str = include_str!("../tests/fixtures/tropical/jtwc_bavi_warning.txt");
 
     #[test]
     fn nhc_parses_storm_vitals() {
@@ -1117,6 +1414,173 @@ MAX WIND 50 KT...GUSTS 65 KT.
         assert_eq!(
             fc[1].valid_time,
             NaiveDate::from_ymd_opt(2026, 1, 2)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .map(|dt| dt.and_utc())
+        );
+    }
+
+    #[test]
+    fn jtwc_rss_lists_active_warning_and_rejects_outlooks() {
+        let refs = parse_jtwc_rss(JTWC_RSS);
+        // Exactly one active storm warning; the basin-wide ABPW/ABIO outlook
+        // `web.txt` products (no storm number) must NOT be treated as warnings.
+        assert_eq!(refs.len(), 1, "one active storm warning: {refs:?}");
+        let r = &refs[0];
+        assert_eq!(r.designation, "09W");
+        assert_eq!(r.name, "Bavi");
+        assert_eq!(
+            r.warning_url,
+            "https://www.metoc.navy.mil/jtwc/products/wp0926web.txt"
+        );
+        // The filename gate distinguishes storm warnings from basin outlooks.
+        assert!(is_jtwc_warning_url(
+            "https://www.metoc.navy.mil/jtwc/products/wp0926web.txt"
+        ));
+        assert!(!is_jtwc_warning_url(
+            "https://www.metoc.navy.mil/jtwc/products/abpwweb.txt"
+        ));
+        assert!(!is_jtwc_warning_url(
+            "https://www.metoc.navy.mil/jtwc/products/abioweb.txt"
+        ));
+    }
+
+    #[test]
+    fn jtwc_warning_parses_forecast_points_with_intensity() {
+        let fc = parse_jtwc_forecast_warning(JTWC_WARNING);
+        // 3 FORECASTS + 3 EXTENDED OUTLOOK + 2 LONG RANGE = 8 forecast points;
+        // the current WARNING POSITION (analysis) point is excluded.
+        assert_eq!(fc.len(), 8, "forecast + outlook points");
+
+        // First point: 061200Z --- 15.1N 142.5E / MAX SUSTAINED WINDS 145 KT.
+        let first = &fc[0];
+        assert!((first.position.lat - 15.1).abs() < 1e-3);
+        assert!(
+            (first.position.lon - 142.5).abs() < 1e-3,
+            "West-Pacific longitude is positive (E)"
+        );
+        assert_eq!(first.max_wind_kt, Some(145.0));
+        assert_eq!(
+            first.max_wind_kt.map(Category::from_wind_kt),
+            Some(Category::Five)
+        );
+        // Issuance 06JUL26 → first valid time 2026-07-06 12:00Z.
+        assert_eq!(
+            first.valid_time,
+            NaiveDate::from_ymd_opt(2026, 7, 6)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .map(|dt| dt.and_utc())
+        );
+
+        // Real per-point intensity: 145,145,150,145,140,135,125,110 kt, i.e.
+        // Cat 5 holding then weakening through Cat 4 to Cat 3 by 120 h.
+        let cats: Vec<_> = fc
+            .iter()
+            .map(|p| p.max_wind_kt.map(Category::from_wind_kt))
+            .collect();
+        assert_eq!(
+            cats,
+            vec![
+                Some(Category::Five),
+                Some(Category::Five),
+                Some(Category::Five),
+                Some(Category::Five),
+                Some(Category::Five),
+                Some(Category::Four),
+                Some(Category::Four),
+                Some(Category::Three),
+            ]
+        );
+        // Every forecast point carries an honest per-point wind (the whole point).
+        assert!(fc.iter().all(|p| p.max_wind_kt.is_some()));
+
+        // Last point: 110000Z --- 25.9N 122.4E, five days out.
+        let last = fc.last().unwrap();
+        assert!((last.position.lat - 25.9).abs() < 1e-3);
+        assert!((last.position.lon - 122.4).abs() < 1e-3);
+        assert_eq!(last.max_wind_kt, Some(110.0));
+
+        // Valid times strictly increasing.
+        for pair in fc.windows(2) {
+            assert!(pair[0].valid_time.unwrap() < pair[1].valid_time.unwrap());
+        }
+    }
+
+    #[test]
+    fn jtwc_forecast_url_attaches_to_matching_gdacs_storm() {
+        // GDACS list carries BAVI + MAYSAK; RSS has an active warning for BAVI.
+        let mut storms = parse_gdacs_event_list(GDACS_LIST).unwrap();
+        let refs = parse_jtwc_rss(JTWC_RSS);
+        attach_jtwc_forecast_urls(&mut storms, &refs);
+        let bavi = storms.iter().find(|s| s.name == "Bavi").unwrap();
+        assert_eq!(
+            bavi.forecast_url.as_deref(),
+            Some("https://www.metoc.navy.mil/jtwc/products/wp0926web.txt"),
+            "BAVI matched to its JTWC warning by name"
+        );
+        // MAYSAK has no active JTWC warning in the feed → no forecast URL.
+        let maysak = storms.iter().find(|s| s.name == "Maysak").unwrap();
+        assert_eq!(maysak.forecast_url, None);
+    }
+
+    #[test]
+    fn jtwc_intensity_replaces_intensityless_gdacs_forecast() {
+        // Mirrors the `fetch_storm_geometry` enrichment: the GDACS getgeometry
+        // forecast points carry NO honest wind; the matched JTWC warning
+        // replaces them with real per-point intensity while GDACS keeps the
+        // track/cone. This is what turns the West-Pacific dots from "current
+        // category on every dot" into official per-point Saffir–Simpson colors.
+        let mut geometry = parse_gdacs_geometry(GDACS_FCST).unwrap();
+        assert!(
+            geometry.forecast.iter().all(|p| p.max_wind_kt.is_none()),
+            "GDACS alone gives no per-point wind"
+        );
+        let jtwc = parse_jtwc_forecast_warning(JTWC_WARNING);
+        assert!(!jtwc.is_empty());
+        geometry.forecast = jtwc;
+        // The track/cone survive from GDACS; the forecast now colors per point.
+        assert!(!geometry.track.is_empty() && geometry.cone.len() >= 3);
+        assert!(geometry.forecast.iter().all(|p| p.max_wind_kt.is_some()));
+        let categories: Vec<_> = geometry
+            .forecast
+            .iter()
+            .filter_map(|p| p.max_wind_kt.map(Category::from_wind_kt))
+            .collect();
+        assert!(
+            categories.iter().any(|c| *c != categories[0]),
+            "per-point intensity spans multiple categories: {categories:?}"
+        );
+    }
+
+    #[test]
+    fn jtwc_warning_time_rolls_over_month() {
+        // Synthetic edge check only: a warning issued 30 SEP whose long-range
+        // forecast days wrap into October (no live storm exercises rollover).
+        let text = "\
+SUBJ/TYPHOON 20W (TEST) WARNING NR 001//
+   FORECASTS:
+   12 HRS, VALID AT:
+   301200Z --- 20.0N 130.0E
+   MAX SUSTAINED WINDS - 80 KT, GUSTS 100 KT
+   120 HRS, VALID AT:
+   050000Z --- 28.0N 128.0E
+   MAX SUSTAINED WINDS - 45 KT, GUSTS 60 KT
+REMARKS:
+30SEP26. TYPHOON 20W (TEST).//
+";
+        let fc = parse_jtwc_forecast_warning(text);
+        assert_eq!(fc.len(), 2);
+        assert_eq!(
+            fc[0].valid_time,
+            NaiveDate::from_ymd_opt(2026, 9, 30)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .map(|dt| dt.and_utc())
+        );
+        assert_eq!(
+            fc[1].valid_time,
+            NaiveDate::from_ymd_opt(2026, 10, 5)
                 .unwrap()
                 .and_hms_opt(0, 0, 0)
                 .map(|dt| dt.and_utc())
