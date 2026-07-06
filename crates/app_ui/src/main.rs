@@ -237,6 +237,10 @@ const MAX_SAT_PLAYER_TEXTURE_DIM: usize = 4096;
 /// still blocked by `hazard_receiver.is_some()`.
 const MIN_LIVE_HAZARD_REFRESH_SECONDS: u64 = 5;
 const MAX_ACTIVE_ALERT_ZONE_GEOMETRIES: usize = 320;
+/// Screen-pixel radius for the Shift+click "pin this station's 3h obs
+/// timeline" gesture and its hover-card hint. Matches the pinned-inspector
+/// release radius so the pin and release gestures share one feel.
+const OBS_TIMELINE_PIN_CLICK_PX: f32 = 14.0;
 const TIMELINE_REPORT_TRAILING_MINUTES: i64 = 90;
 const TIMELINE_REPORT_LEAD_SECONDS: i64 = 90;
 /// A single loaded frame counts as the live edge (reports ungated) only
@@ -379,6 +383,17 @@ struct AlertSoundGate {
     sounded_ids: BTreeSet<String>,
 }
 
+/// The foreground live-hazard refresh's most recent successfully fetched NWS
+/// active-alerts overlay (the PURE active-alerts load, before SPC MD or
+/// custom-feed merging), stamped with when it finished. Published through
+/// [`AlertWatchHandle`] so the background watcher can reuse a just-completed
+/// foreground poll instead of running its own identical national load.
+#[derive(Clone)]
+struct ForegroundAlertSnapshot {
+    fetched_at: Instant,
+    overlay: HazardOverlay,
+}
+
 impl AlertSoundGate {
     /// Record that `event_id` has been sounded. Returns `true` only the FIRST
     /// time, so exactly one player emits the cue for a given warning.
@@ -402,6 +417,11 @@ struct AlertWatchHandle {
     config: Arc<Mutex<AlertWatchConfig>>,
     gate: Arc<Mutex<AlertSoundGate>>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Latest foreground active-alerts load (see [`ForegroundAlertSnapshot`]).
+    /// `None` until the UI publishes one; the watcher treats anything older
+    /// than its poll interval as absent and fetches on its own, so a parked
+    /// or minimized UI never delays an alert.
+    foreground: Arc<Mutex<Option<ForegroundAlertSnapshot>>>,
 }
 
 impl Default for AlertWatchHandle {
@@ -410,6 +430,7 @@ impl Default for AlertWatchHandle {
             config: Arc::new(Mutex::new(AlertWatchConfig::default())),
             gate: Arc::new(Mutex::new(AlertSoundGate::default())),
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            foreground: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -431,6 +452,30 @@ impl AlertWatchHandle {
             config.sound_path = sound_path.to_owned();
             config.families = families.to_vec();
         }
+    }
+
+    /// Publish the foreground refresh's freshly fetched NWS active-alerts
+    /// overlay so the watcher's next poll can reuse it instead of repeating
+    /// the identical national load against api.weather.gov.
+    fn publish_foreground(&self, overlay: HazardOverlay) {
+        if let Ok(mut guard) = self.foreground.lock() {
+            *guard = Some(ForegroundAlertSnapshot {
+                fetched_at: Instant::now(),
+                overlay,
+            });
+        }
+    }
+
+    /// The foreground-published active-alerts overlay, but ONLY if it is
+    /// younger than `max_age`. A stale (or absent, or lock-poisoned) snapshot
+    /// returns `None` so the watcher falls back to its own fetch — the
+    /// minimized-window alerting guarantee never rides on the UI thread.
+    fn recent_foreground_overlay(&self, max_age: Duration) -> Option<HazardOverlay> {
+        let guard = self.foreground.lock().ok()?;
+        guard
+            .as_ref()
+            .filter(|snapshot| snapshot.fetched_at.elapsed() < max_age)
+            .map(|snapshot| snapshot.overlay.clone())
     }
 
     /// Claim `sound_ids` in the shared dedupe gate; returns `true` if AT LEAST
@@ -474,9 +519,20 @@ fn spawn_alert_sound_watcher(handle: AlertWatchHandle) {
                 .map(|guard| guard.clone())
                 .unwrap_or_default();
             if config.enabled {
-                // A failed poll keeps the last baseline and simply retries next
-                // cycle (transient network errors must not drop warnings).
-                if let Ok(overlay) = load_live_alert_watch_overlay(Utc::now()) {
+                // Reuse the foreground refresh's just-published active-alerts
+                // load when the UI polled within the watcher interval —
+                // otherwise the two paths run the same national fetch back to
+                // back. A minimized/parked UI publishes nothing fresh, so the
+                // watcher falls back to its OWN fetch and the focus-independent
+                // alerting guarantee is unchanged.
+                let overlay = match handle.recent_foreground_overlay(ALERT_WATCH_INTERVAL) {
+                    Some(overlay) => Some(overlay),
+                    // A failed poll keeps the last baseline and simply retries
+                    // next cycle (transient network errors must not drop
+                    // warnings).
+                    None => load_live_alert_watch_overlay(Utc::now(), &config.families).ok(),
+                };
+                if let Some(overlay) = overlay {
                     if let Some(prev) = &previous {
                         let new_ids = new_soundable_warning_ids(prev, &overlay, &config.families);
                         let mut claimed_new = false;
@@ -526,11 +582,22 @@ fn sound_path_label(sound_path: &str) -> String {
 
 /// Fetch the current NWS active-alert overlay for the background watcher.
 /// Uses ONLY the authoritative active-alerts endpoint (no SPC mesoscale
-/// discussion enrichment) so the background poll stays lightweight; the alert
-/// sound only ever fires for latchable warning families anyway.
-fn load_live_alert_watch_overlay(query_time_utc: DateTime<Utc>) -> Result<HazardOverlay, String> {
+/// discussion enrichment), and restricts the zone-geometry enrichment pass to
+/// the families that can currently trigger the alert sound
+/// ([`ZoneGeometryScope::AlertSound`]) — zone shapes are load-bearing for the
+/// sound gate (`hazard_record_should_latch_attention` requires renderable
+/// points), so soundable families keep their enrichment, while the dozens of
+/// zone fetches for families that can never sound are skipped. Combined with
+/// the process-wide zone-geometry memo this keeps the watcher poll light.
+fn load_live_alert_watch_overlay(
+    query_time_utc: DateTime<Utc>,
+    sound_families: &[String],
+) -> Result<HazardOverlay, String> {
     let start = Instant::now();
-    let load = load_weather_gov_active_alerts(query_time_utc)?;
+    let load = load_weather_gov_active_alerts(
+        query_time_utc,
+        ZoneGeometryScope::AlertSound(sound_families),
+    )?;
     Ok(build_live_hazard_overlay(
         "NWS active alerts (alert watch)".to_owned(),
         query_time_utc,
@@ -7518,11 +7585,22 @@ impl ViewerApp {
         self.hazard_receiver = Some(receiver);
         self.last_live_hazard_refresh = Some(Instant::now());
         self.hazard_status = "Loading live hazards".to_owned();
+        let alert_watch = self.alert_watch.clone();
+        let publish_to_alert_watch = self.app_settings.alert_sound_enabled;
         thread::spawn(move || {
             let result = load_live_hazard_overlay_with_preview(
                 query_time_utc,
                 preview_records,
                 custom_provider_url,
+                |active_alerts| {
+                    // Share the fresh national active-alerts load with the
+                    // background watcher so its next poll can skip the
+                    // identical fetch; only cloned when the alert sound is
+                    // actually enabled (the watcher is idle otherwise).
+                    if publish_to_alert_watch {
+                        alert_watch.publish_foreground(active_alerts.clone());
+                    }
+                },
                 |preview| {
                     let _ = sender.send(AsyncHazardResult {
                         update: AsyncHazardUpdate::Preview(Ok(preview)),
@@ -29250,6 +29328,50 @@ impl ViewerApp {
             .map(|(_, ob)| ob.clone())
     }
 
+    /// The drawn surface-ob station nearest `pointer`, within `max_px` screen
+    /// pixels, honoring the obs layer visibility toggles — so the hit test
+    /// matches exactly what the obs layer paints. Backs the Shift+click
+    /// "pin this station's 3h timeline" gesture and its hover-card hint.
+    fn surface_ob_near_screen(
+        &self,
+        rect: egui::Rect,
+        pointer: egui::Pos2,
+        max_px: f32,
+    ) -> Option<obs::SurfaceOb> {
+        if !self.obs_enabled || self.surface_obs.is_empty() || !rect.contains(pointer) {
+            return None;
+        }
+        // Cheap geo cull before the per-station projection: only stations
+        // inside the pointer's ±max_px box are distance-tested (this runs
+        // per hovered frame for the hint, not just on click). Near the
+        // antimeridian the min/max collapse widens the box to the whole
+        // world, which is merely slower, never wrong.
+        let (left_lon, top_lat) =
+            self.screen_to_lon_lat(rect, pointer - egui::vec2(max_px, max_px));
+        let (right_lon, bottom_lat) =
+            self.screen_to_lon_lat(rect, pointer + egui::vec2(max_px, max_px));
+        let bounds = obs::ObBounds {
+            west: left_lon.min(right_lon),
+            south: top_lat.min(bottom_lat),
+            east: left_lon.max(right_lon),
+            north: top_lat.max(bottom_lat),
+        };
+        let frame_time = self.surface_obs_frame_time_utc();
+        self.surface_obs
+            .frame_obs_in_bounds(frame_time, bounds)
+            .filter(|ob| {
+                let is_metar = ob.network == "METAR";
+                (is_metar && self.obs_show_metar) || (!is_metar && self.obs_show_mesonet)
+            })
+            .filter_map(|ob| {
+                let position = self.lon_lat_to_screen(rect, ob.lon, ob.lat);
+                let distance = position.distance(pointer);
+                (distance <= max_px).then_some((distance, ob))
+            })
+            .min_by(|left, right| left.0.total_cmp(&right.0))
+            .map(|(_, ob)| ob.clone())
+    }
+
     fn pin_obs_history(&mut self, ob: &obs::SurfaceOb) {
         self.pinned_obs_chart_station = Some(ob.station_id.clone());
         self.pinned_inspector_lonlat = Some((ob.lon, ob.lat));
@@ -37609,6 +37731,20 @@ impl ViewerApp {
         } else if let Some(station) = &self.pinned_obs_chart_station {
             lines.push(format!("{station} 3h obs - no reports"));
         }
+        // Discoverable path into the 3h obs timeline: hovering a drawn
+        // station advertises the Shift+click pin (the context-menu row is
+        // unreachable when "right-click loads closest radar" is on).
+        if !pinned
+            && self.pinned_obs_chart_station.is_none()
+            && let Some(ob) = hover.and_then(|position| {
+                self.surface_ob_near_screen(rect, position, OBS_TIMELINE_PIN_CLICK_PX)
+            })
+        {
+            lines.push(format!(
+                "{} {} — Shift+click: pin 3h timeline",
+                ob.station_id, ob.network
+            ));
+        }
         if pinned {
             lines.push("pinned — Shift+click to release".to_owned());
         }
@@ -37940,7 +38076,12 @@ impl ViewerApp {
     }
 
     /// Shift+click: pin the inspector to a geo point (or release a pin when
-    /// clicking within a few pixels of it).
+    /// clicking within a few pixels of it). Shift+click on a DRAWN surface-ob
+    /// station pins that station's 3h obs timeline instead of a plain point —
+    /// the discoverable sibling of the context-menu "Pin ... 3h timeline"
+    /// row, which the "right-click loads closest radar" preference otherwise
+    /// makes unreachable. (Historically this gesture CLEARED the timeline
+    /// even when the click landed on the station itself.)
     fn toggle_inspector_pin(&mut self, rect: egui::Rect, pointer: egui::Pos2) {
         if let Some((lon, lat)) = self.pinned_inspector_lonlat {
             let current = self.lon_lat_to_screen(rect, lon, lat);
@@ -37949,6 +38090,10 @@ impl ViewerApp {
                 self.pinned_obs_chart_station = None;
                 return;
             }
+        }
+        if let Some(ob) = self.surface_ob_near_screen(rect, pointer, OBS_TIMELINE_PIN_CLICK_PX) {
+            self.pin_obs_history(&ob);
+            return;
         }
         let (lon, lat) = self.screen_to_lon_lat(rect, pointer);
         self.pinned_inspector_lonlat = Some((lon, lat));
@@ -47361,13 +47506,15 @@ struct LiveHazardSourceMessage {
     result: Result<SpcMdLoad, String>,
 }
 
-fn load_live_hazard_overlay_with_preview<F>(
+fn load_live_hazard_overlay_with_preview<A, F>(
     query_time_utc: DateTime<Utc>,
     preview_records: Vec<HazardRecord>,
     custom_provider_url: Option<String>,
+    on_active_alerts: A,
     mut on_preview: F,
 ) -> Result<HazardOverlay, String>
 where
+    A: FnOnce(&HazardOverlay),
     F: FnMut(HazardOverlay),
 {
     // Live warning latency must be governed by the authoritative current-alert
@@ -47377,7 +47524,7 @@ where
     // description. Historical warning reconstruction keeps using the richer
     // text-product path below.
     let start = Instant::now();
-    let load = load_weather_gov_active_alerts(query_time_utc)?;
+    let load = load_weather_gov_active_alerts(query_time_utc, ZoneGeometryScope::Display)?;
     let mut scanned_items = load.scanned_items;
     let mut parsed_items = load.parsed_items;
     let mut error_count = load.error_count;
@@ -47390,6 +47537,10 @@ where
         start,
         load.records,
     );
+    // Hand the pure active-alerts overlay (no SPC MD / custom-feed records)
+    // to the caller — the live refresh shares it with the background alert
+    // watcher so the watcher can skip its own identical national load.
+    on_active_alerts(&overlay);
     let mut preview_overlay = overlay.clone();
     if !preview_records.is_empty() {
         let mut preview_combined = preview_overlay.records;
@@ -47485,13 +47636,46 @@ fn load_custom_warning_provider(
 ) -> Result<SpcMdLoad, String> {
     let text = data_source::fetch_text(url)
         .map_err(|err| format!("Custom warning feed fetch failed: {err}"))?;
+    parse_custom_warning_feed(&text, query_time_utc)
+}
 
+/// Whether a custom-feed body self-identifies as a CAP/GeoJSON
+/// `FeatureCollection`: a `features` array, or the GeoJSON
+/// `"type": "FeatureCollection"` marker. Needed because
+/// [`WeatherAlertFeatureCollection`] itself deserializes from ANY JSON object
+/// (`features` is `#[serde(default)]`), so without this probe an arbitrary
+/// JSON error payload (e.g. an API `{"title": ..., "status": 429}` body)
+/// would masquerade as a legitimately empty quiet feed.
+fn custom_feed_body_is_feature_collection(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .is_some_and(|value| {
+            value
+                .get("features")
+                .is_some_and(serde_json::Value::is_array)
+                || value.get("type").and_then(serde_json::Value::as_str)
+                    == Some("FeatureCollection")
+        })
+}
+
+/// Parse an already-fetched custom warning feed body (see
+/// [`load_custom_warning_provider`]).
+fn parse_custom_warning_feed(
+    text: &str,
+    query_time_utc: DateTime<Utc>,
+) -> Result<SpcMdLoad, String> {
     // CAP/GeoJSON FeatureCollection: richest form — carries geometry, VTEC,
-    // lifecycle, tags, headline. A custom feed is expected to carry its own
-    // polygon geometry, so zone lookups are intentionally skipped (empty map)
-    // to keep the fetch hermetic and avoid surprise api.weather.gov calls.
-    if let Ok(collection) = serde_json::from_str::<WeatherAlertFeatureCollection>(&text)
-        && !collection.features.is_empty()
+    // lifecycle, tags, headline. A successfully parsed collection is
+    // authoritative at ANY feature count: an empty `features` array is the
+    // NORMAL quiet state of a healthy feed (api.weather.gov/alerts/active
+    // returns exactly that when nothing is active), so it yields Ok with zero
+    // records — never an error. Only a body that does not parse as a
+    // FeatureCollection at all falls through to the text parser. A custom
+    // feed is expected to carry its own polygon geometry, so zone lookups
+    // are intentionally skipped (empty map) to keep the fetch hermetic and
+    // avoid surprise api.weather.gov calls.
+    if custom_feed_body_is_feature_collection(text)
+        && let Ok(collection) = serde_json::from_str::<WeatherAlertFeatureCollection>(text)
     {
         let zone_geometries = HashMap::new();
         let mut records = Vec::new();
@@ -47520,7 +47704,7 @@ fn load_custom_warning_provider(
     // Fall back to the NWS text / VTEC / lat-lon polygon format (the same
     // parser the Local-file loader uses).
     let path = Path::new("custom-warning-feed");
-    let records = parse_hazard_records_from_text(path, &text, Some(query_time_utc));
+    let records = parse_hazard_records_from_text(path, text, Some(query_time_utc));
     if records.is_empty() {
         return Err("Custom warning feed returned no parseable warnings".to_owned());
     }
@@ -47592,7 +47776,12 @@ where
                     active_sender,
                     "NWS active alerts".to_owned(),
                     "Event-loop NWS active alert worker panicked",
-                    || load_weather_gov_active_alerts(active_alert_query_time_utc),
+                    || {
+                        load_weather_gov_active_alerts(
+                            active_alert_query_time_utc,
+                            ZoneGeometryScope::Display,
+                        )
+                    },
                 );
             });
         }
@@ -47692,12 +47881,15 @@ fn send_live_hazard_source_load<F>(
     });
 }
 
-fn load_weather_gov_active_alerts(query_time_utc: DateTime<Utc>) -> Result<SpcMdLoad, String> {
+fn load_weather_gov_active_alerts(
+    query_time_utc: DateTime<Utc>,
+    zone_scope: ZoneGeometryScope<'_>,
+) -> Result<SpcMdLoad, String> {
     let text = data_source::fetch_text(ACTIVE_ALERTS_URL)
         .map_err(|err| format!("Live hazard fetch failed: {err}"))?;
     let collection: WeatherAlertFeatureCollection = serde_json::from_str(&text)
         .map_err(|err| format!("Live hazard JSON parse failed: {err}"))?;
-    let zone_geometries = fetch_weather_alert_zone_geometries(&collection.features);
+    let zone_geometries = fetch_weather_alert_zone_geometries(&collection.features, zone_scope);
     let mut records = Vec::new();
     let mut parsed_items = 0usize;
     let mut error_count = 0usize;
@@ -48800,9 +48992,56 @@ fn weather_alert_feature_rings(
     Ok(rings)
 }
 
-fn fetch_weather_alert_zone_geometries(
+/// Which alert families a zone-geometry enrichment pass should resolve for
+/// geometry-less alerts. Zone fetches are the expensive part of an
+/// active-alerts load (one blocking GET per alerted zone), so each caller
+/// only pays for the families it actually needs.
+#[derive(Clone, Copy, Debug)]
+enum ZoneGeometryScope<'a> {
+    /// Foreground hazards layer: every zone-based family the layer renders
+    /// (watches, floods, fire weather, marine, ...).
+    Display,
+    /// Background alert watcher: only families that can currently trigger
+    /// the alert sound. The slice is `AppSettings::alert_sound_families`,
+    /// whose empty state means "all families sound"
+    /// ([`alert_family_enabled`]) — so an empty slice keeps the FULL display
+    /// scope and the watcher only sheds zone fetches once the operator has
+    /// narrowed the sound to specific families. This must never drop a
+    /// family that can sound: the sound gate
+    /// ([`hazard_record_should_latch_attention`]) requires renderable
+    /// points, and a zone-based alert without its zone geometry produces no
+    /// record at all.
+    AlertSound(&'a [String]),
+}
+
+/// Whether `event_family` is enriched with zone geometry under `scope`.
+fn zone_geometry_scope_includes(scope: ZoneGeometryScope<'_>, event_family: &str) -> bool {
+    let display = matches!(
+        event_family,
+        "tornado"
+            | "severe thunderstorm"
+            | "flash flood"
+            | "flood"
+            | "fire weather"
+            | "special marine"
+            | "snow squall"
+            | "watch"
+            | "special weather"
+    );
+    match scope {
+        ZoneGeometryScope::Display => display,
+        ZoneGeometryScope::AlertSound(families) => {
+            display && alert_family_enabled(families, event_family)
+        }
+    }
+}
+
+/// The deduped, capped list of zone URLs a load must resolve: zones of
+/// geometry-less alerts whose family is in `scope`.
+fn weather_alert_zone_urls(
     features: &[WeatherAlertFeature],
-) -> HashMap<String, Vec<Vec<HazardPoint>>> {
+    scope: ZoneGeometryScope<'_>,
+) -> Vec<String> {
     let mut zone_urls = BTreeSet::new();
     for feature in features {
         if feature.geometry.is_some() {
@@ -48814,18 +49053,7 @@ fn fetch_weather_alert_zone_geometries(
             .as_deref()
             .unwrap_or("Weather Alert");
         let event_family = weather_alert_family(event);
-        if !matches!(
-            event_family.as_str(),
-            "tornado"
-                | "severe thunderstorm"
-                | "flash flood"
-                | "flood"
-                | "fire weather"
-                | "special marine"
-                | "snow squall"
-                | "watch"
-                | "special weather"
-        ) {
+        if !zone_geometry_scope_includes(scope, &event_family) {
             continue;
         }
         for zone_url in &feature.properties.affected_zones {
@@ -48834,17 +49062,74 @@ fn fetch_weather_alert_zone_geometries(
             }
         }
     }
-
     zone_urls
         .into_iter()
         .take(MAX_ACTIVE_ALERT_ZONE_GEOMETRIES)
-        .filter_map(|zone_url| {
-            fetch_weather_alert_zone_geometry(&zone_url)
-                .ok()
-                .filter(|rings| !rings.is_empty())
-                .map(|rings| (zone_url, rings))
-        })
         .collect()
+}
+
+/// Process-wide memo of NWS zone geometries keyed by zone URL. Zone shapes
+/// are static reference data — the polygon for a forecast/county/fire zone
+/// does not change between polls — yet the foreground hazards refresh and
+/// the background alert watcher previously EACH re-fetched every alerted
+/// zone from scratch on every poll (up to [`MAX_ACTIVE_ALERT_ZONE_GEOMETRIES`]
+/// sequential GETs, every 20-30 s, against rate-limited api.weather.gov).
+/// Bounded by [`ZONE_GEOMETRY_MEMO_MAX_ZONES`]; there are only a few thousand
+/// NWS zones nationally, so the cap is a safety net, not a working limit.
+static ZONE_GEOMETRY_MEMO: OnceLock<Mutex<HashMap<String, Vec<Vec<HazardPoint>>>>> =
+    OnceLock::new();
+const ZONE_GEOMETRY_MEMO_MAX_ZONES: usize = 4096;
+
+fn zone_geometry_memo() -> &'static Mutex<HashMap<String, Vec<Vec<HazardPoint>>>> {
+    ZONE_GEOMETRY_MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolve `zone_urls` to geometry through the process-wide memo, calling
+/// `fetch` only for never-seen zones. Successful lookups are memoized forever
+/// (INCLUDING legitimately empty geometries, so a geometry-less zone is not
+/// re-fetched every poll); failures are NOT memoized, so a transient network
+/// error retries on the next poll. The returned map carries only non-empty
+/// geometries, matching what ring assembly can use.
+fn resolve_zone_geometries<F>(
+    zone_urls: &[String],
+    fetch: F,
+) -> HashMap<String, Vec<Vec<HazardPoint>>>
+where
+    F: Fn(&str) -> Result<Vec<Vec<HazardPoint>>, String>,
+{
+    let mut resolved = HashMap::new();
+    for zone_url in zone_urls {
+        let memoized = zone_geometry_memo()
+            .lock()
+            .ok()
+            .and_then(|memo| memo.get(zone_url).cloned());
+        let rings = match memoized {
+            Some(rings) => rings,
+            None => match fetch(zone_url) {
+                Ok(rings) => {
+                    if let Ok(mut memo) = zone_geometry_memo().lock()
+                        && memo.len() < ZONE_GEOMETRY_MEMO_MAX_ZONES
+                    {
+                        memo.insert(zone_url.clone(), rings.clone());
+                    }
+                    rings
+                }
+                Err(_) => continue,
+            },
+        };
+        if !rings.is_empty() {
+            resolved.insert(zone_url.clone(), rings);
+        }
+    }
+    resolved
+}
+
+fn fetch_weather_alert_zone_geometries(
+    features: &[WeatherAlertFeature],
+    scope: ZoneGeometryScope<'_>,
+) -> HashMap<String, Vec<Vec<HazardPoint>>> {
+    let zone_urls = weather_alert_zone_urls(features, scope);
+    resolve_zone_geometries(&zone_urls, fetch_weather_alert_zone_geometry)
 }
 
 fn fetch_weather_alert_zone_geometry(zone_url: &str) -> Result<Vec<Vec<HazardPoint>>, String> {
@@ -70275,6 +70560,190 @@ mod tests {
     }
 
     #[test]
+    fn alert_watch_reuses_only_fresh_foreground_overlays() {
+        // Default never spawns the watcher thread, so this exercises only the
+        // publish/reuse plumbing.
+        let handle = AlertWatchHandle::default();
+        assert!(
+            handle
+                .recent_foreground_overlay(ALERT_WATCH_INTERVAL)
+                .is_none(),
+            "nothing published yet — the watcher must fetch on its own"
+        );
+
+        handle.publish_foreground(test_hazard_overlay(vec![test_hazard_record(
+            "tor-1",
+            "TOR 1",
+            "tornado",
+            square_hazard_points(-98.0, 35.0, -97.0, 36.0),
+        )]));
+        let reused = handle
+            .recent_foreground_overlay(Duration::from_secs(3600))
+            .expect("a just-published foreground overlay is reused");
+        assert_eq!(reused.records.len(), 1);
+        assert_eq!(reused.records[0].event_id, "tor-1");
+
+        // An aged-out snapshot is IGNORED, never reused: a parked/minimized
+        // UI publishes nothing fresh, so the watcher falls back to its own
+        // fetch and the focus-independent alerting guarantee holds.
+        assert!(handle.recent_foreground_overlay(Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn watcher_zone_scope_defaults_to_full_display_scope() {
+        // Empty alert_sound_families means "every family sounds"
+        // (alert_family_enabled), so the watcher's zone-geometry scope must
+        // match the display scope EXACTLY — anything narrower could silence
+        // a zone-based alert while the window is minimized.
+        let families: Vec<String> = Vec::new();
+        for family in [
+            "tornado",
+            "severe thunderstorm",
+            "flash flood",
+            "flood",
+            "fire weather",
+            "special marine",
+            "snow squall",
+            "watch",
+            "special weather",
+            "mesoscale discussion",
+            "local storm report",
+            "alert",
+        ] {
+            assert_eq!(
+                zone_geometry_scope_includes(ZoneGeometryScope::AlertSound(&families), family),
+                zone_geometry_scope_includes(ZoneGeometryScope::Display, family),
+                "watcher/display zone scope parity broken for family {family}"
+            );
+        }
+    }
+
+    #[test]
+    fn watcher_zone_scope_narrows_with_explicit_sound_families() {
+        let tor_only = vec!["tornado".to_owned()];
+        let scope = ZoneGeometryScope::AlertSound(&tor_only);
+        assert!(zone_geometry_scope_includes(scope, "tornado"));
+        assert!(!zone_geometry_scope_includes(scope, "watch"));
+        assert!(!zone_geometry_scope_includes(scope, "flood"));
+        assert!(!zone_geometry_scope_includes(scope, "special weather"));
+
+        // Every family the alert-sound settings can enable keeps its zone
+        // enrichment when selected — the sound gate
+        // (hazard_record_should_latch_attention) needs renderable points.
+        for (family, _) in ALERT_SOUND_FAMILY_OPTIONS.iter().copied() {
+            let selected = vec![family.to_owned()];
+            assert!(
+                zone_geometry_scope_includes(ZoneGeometryScope::AlertSound(&selected), family),
+                "sound-enabled family {family} lost its zone enrichment"
+            );
+        }
+    }
+
+    fn zoneless_alert_feature(event: &str, zone_url: &str) -> WeatherAlertFeature {
+        WeatherAlertFeature {
+            id: None,
+            at_id: None,
+            geometry: None,
+            properties: WeatherAlertProperties {
+                event: Some(event.to_owned()),
+                affected_zones: vec![zone_url.to_owned()],
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn weather_alert_zone_urls_respects_scope() {
+        let features = vec![
+            zoneless_alert_feature(
+                "Tornado Watch",
+                "https://api.weather.gov/zones/forecast/OKZ031",
+            ),
+            zoneless_alert_feature(
+                "Tornado Warning",
+                "https://api.weather.gov/zones/county/OKC109",
+            ),
+        ];
+
+        let display = weather_alert_zone_urls(&features, ZoneGeometryScope::Display);
+        assert_eq!(
+            display.len(),
+            2,
+            "display scope enriches watches and warnings"
+        );
+
+        let all_families: Vec<String> = Vec::new();
+        let watcher_default =
+            weather_alert_zone_urls(&features, ZoneGeometryScope::AlertSound(&all_families));
+        assert_eq!(
+            watcher_default, display,
+            "default (empty-families) watcher scope must equal the display scope"
+        );
+
+        let tor_only = vec!["tornado".to_owned()];
+        let narrowed = weather_alert_zone_urls(&features, ZoneGeometryScope::AlertSound(&tor_only));
+        assert_eq!(
+            narrowed,
+            vec!["https://api.weather.gov/zones/county/OKC109".to_owned()],
+            "a watch cannot sound when only tornado is enabled, so its zone fetch is shed"
+        );
+    }
+
+    #[test]
+    fn zone_geometry_resolution_memoizes_successes_and_retries_failures() {
+        let ring = vec![vec![
+            HazardPoint {
+                lon: -98.0,
+                lat: 35.0,
+            },
+            HazardPoint {
+                lon: -97.0,
+                lat: 35.0,
+            },
+            HazardPoint {
+                lon: -97.0,
+                lat: 36.0,
+            },
+        ]];
+        // URLs unique to this test so the process-wide memo cannot be
+        // pre-seeded by other tests.
+        let urls = vec![
+            "https://api.weather.gov/zones/forecast/TEST-MEMO-OK".to_owned(),
+            "https://api.weather.gov/zones/forecast/TEST-MEMO-EMPTY".to_owned(),
+            "https://api.weather.gov/zones/forecast/TEST-MEMO-FAIL".to_owned(),
+        ];
+        let calls = std::cell::RefCell::new(Vec::<String>::new());
+        let fetch = |url: &str| {
+            calls.borrow_mut().push(url.to_owned());
+            if url.ends_with("OK") {
+                Ok(ring.clone())
+            } else if url.ends_with("EMPTY") {
+                Ok(Vec::new())
+            } else {
+                Err("transient network error".to_owned())
+            }
+        };
+
+        // The closure only captures shared references, so it is Copy and can
+        // be passed by value to both passes.
+        let first = resolve_zone_geometries(&urls, fetch);
+        assert_eq!(first.len(), 1, "only non-empty geometry is usable");
+        assert!(first.contains_key(&urls[0]));
+        assert_eq!(calls.borrow().len(), 3, "cold pass fetches every zone");
+
+        calls.borrow_mut().clear();
+        let second = resolve_zone_geometries(&urls, fetch);
+        assert_eq!(second.len(), 1, "memoized geometry still resolves");
+        assert!(second.contains_key(&urls[0]));
+        assert_eq!(
+            calls.borrow().as_slice(),
+            std::slice::from_ref(&urls[2]),
+            "successes (including the legitimately empty zone) come from the \
+             process-wide memo; only the FAILED zone is retried"
+        );
+    }
+
+    #[test]
     fn radar_update_sound_due_only_on_newer_live_frame_when_enabled() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.app_settings.radar_update_sound_enabled = true;
@@ -72346,6 +72815,157 @@ mod tests {
                     && hazard_family_has_user_filter(&record.event_family)),
             "every merged custom record is renderable and in a known family"
         );
+    }
+
+    #[test]
+    fn custom_warning_feed_empty_feature_collection_is_quiet_success() {
+        // The NORMAL quiet state of a healthy CAP relay: a valid
+        // FeatureCollection with zero active warnings — exactly what
+        // api.weather.gov/alerts/active returns on a calm day. This must be
+        // Ok with zero records; historically it fell through to the VTEC
+        // text parser and was flagged "(custom warning feed unavailable)"
+        // with error_count += 1 on EVERY poll.
+        let load =
+            parse_custom_warning_feed(r#"{"type":"FeatureCollection","features":[]}"#, Utc::now())
+                .expect("an empty-but-valid FeatureCollection is not an error");
+        assert_eq!(load.scanned_items, 0);
+        assert_eq!(load.parsed_items, 0);
+        assert_eq!(load.error_count, 0);
+        assert!(load.records.is_empty());
+
+        // Same quiet state without the GeoJSON `type` marker.
+        let load = parse_custom_warning_feed(r#"{"features":[]}"#, Utc::now())
+            .expect("a bare features array is still a FeatureCollection");
+        assert_eq!(load.error_count, 0);
+        assert!(load.records.is_empty());
+    }
+
+    #[test]
+    fn custom_warning_feed_non_collection_bodies_still_error() {
+        // An API error payload deserializes into WeatherAlertFeatureCollection
+        // (`features` is #[serde(default)]) but is NOT a FeatureCollection —
+        // it must keep reporting as a feed problem, never as a quiet day.
+        assert!(
+            parse_custom_warning_feed(r#"{"title":"rate limited","status":429}"#, Utc::now())
+                .is_err()
+        );
+        assert!(parse_custom_warning_feed("<html>gateway timeout</html>", Utc::now()).is_err());
+        assert!(parse_custom_warning_feed("", Utc::now()).is_err());
+    }
+
+    #[test]
+    fn custom_warning_feed_parses_populated_feature_collection() {
+        let body = r#"{
+            "type": "FeatureCollection",
+            "features": [{
+                "id": "custom-tor-1",
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[-98.0, 35.0], [-97.0, 35.0], [-97.0, 36.0],
+                                     [-98.0, 36.0], [-98.0, 35.0]]]
+                },
+                "properties": {
+                    "event": "Tornado Warning",
+                    "messageType": "Alert"
+                }
+            }]
+        }"#;
+        let load = parse_custom_warning_feed(body, Utc::now())
+            .expect("populated FeatureCollection parses");
+        assert_eq!(load.scanned_items, 1);
+        assert_eq!(load.parsed_items, 1);
+        assert_eq!(load.error_count, 0);
+        assert_eq!(load.records.len(), 1);
+        assert_eq!(load.records[0].event_family, "tornado");
+        assert!(hazard_points_renderable(&load.records[0].points));
+    }
+
+    fn test_surface_ob(station_id: &str, lat: f32, lon: f32, network: &str) -> obs::SurfaceOb {
+        obs::SurfaceOb {
+            station_id: station_id.to_owned(),
+            time_utc: Some(Utc::now()),
+            lat,
+            lon,
+            temp_c: Some(21.0),
+            dewpoint_c: Some(12.0),
+            wind_dir_deg: Some(180.0),
+            wind_speed_kt: Some(10.0),
+            wind_gust_kt: None,
+            altim_in_hg: None,
+            completeness: 4,
+            network: network.to_owned(),
+            elevation_m: None,
+        }
+    }
+
+    /// A viewer centered on a single drawn METAR station, plus that station's
+    /// on-screen position — the fixture for the Shift+click timeline-pin
+    /// gesture tests.
+    fn obs_pin_fixture() -> (ViewerApp, egui::Rect, egui::Pos2) {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.obs_enabled = true;
+        app.obs_show_metar = true;
+        app.obs_show_mesonet = true;
+        app.surface_obs
+            .merge(vec![test_surface_ob("KTOP", 39.073, -95.626, "METAR")]);
+        app.center_map_on(39.073, -95.626);
+        app.map_scale = 650.0;
+        let rect = test_map_rect();
+        let station_px = app.lon_lat_to_screen(rect, -95.626, 39.073);
+        (app, rect, station_px)
+    }
+
+    #[test]
+    fn shift_click_on_drawn_station_pins_and_releases_obs_timeline() {
+        let (mut app, rect, station_px) = obs_pin_fixture();
+
+        app.toggle_inspector_pin(rect, station_px);
+        assert_eq!(
+            app.pinned_obs_chart_station.as_deref(),
+            Some("KTOP"),
+            "Shift+click on a drawn station must pin its 3h timeline \
+             (historically it cleared the timeline instead)"
+        );
+        assert_eq!(app.pinned_inspector_lonlat, Some((-95.626, 39.073)));
+        assert!(app.show_inspector_card);
+
+        // Second Shift+click on the pinned station releases pin AND timeline
+        // — the documented "pinned — Shift+click to release" gesture.
+        app.toggle_inspector_pin(rect, station_px);
+        assert!(app.pinned_obs_chart_station.is_none());
+        assert!(app.pinned_inspector_lonlat.is_none());
+    }
+
+    #[test]
+    fn shift_click_open_map_still_pins_plain_point_and_clears_timeline() {
+        let (mut app, rect, station_px) = obs_pin_fixture();
+        app.pin_obs_history(&test_surface_ob("KTOP", 39.073, -95.626, "METAR"));
+
+        // Shift+click far from both the pinned station and any drawn station
+        // re-pins a plain geo point and drops the station timeline.
+        let far = station_px + egui::vec2(300.0, 200.0);
+        app.toggle_inspector_pin(rect, far);
+        assert!(app.pinned_obs_chart_station.is_none());
+        let (lon, lat) = app.screen_to_lon_lat(rect, far);
+        assert_eq!(app.pinned_inspector_lonlat, Some((lon, lat)));
+    }
+
+    #[test]
+    fn shift_click_ignores_stations_on_hidden_obs_layers() {
+        let (mut app, rect, station_px) = obs_pin_fixture();
+        // METAR glyphs hidden: the station is not drawn, so the click must
+        // not pin an invisible station's timeline — plain point pin instead.
+        app.obs_show_metar = false;
+        app.toggle_inspector_pin(rect, station_px);
+        assert!(app.pinned_obs_chart_station.is_none());
+        assert!(app.pinned_inspector_lonlat.is_some());
+
+        // Obs layer off entirely: same story.
+        let (mut app, rect, station_px) = obs_pin_fixture();
+        app.obs_enabled = false;
+        app.toggle_inspector_pin(rect, station_px);
+        assert!(app.pinned_obs_chart_station.is_none());
+        assert!(app.pinned_inspector_lonlat.is_some());
     }
 
     fn test_storm_volume(scan_time: DateTime<Utc>) -> RadarVolume {
