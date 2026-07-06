@@ -60,6 +60,7 @@ mod italy_dpc;
 mod layers_rail;
 mod live_archive_bar;
 mod local_import;
+mod max_ref_swath;
 mod media;
 mod mesoanalysis;
 mod model_data;
@@ -2715,6 +2716,9 @@ struct ViewerApp {
     hazard_status: String,
     hazards_visible: bool,
     hazards_active_only: bool,
+    /// Max-value swath overlays ("where the storm has been"): per-gate maximum
+    /// reflectivity / peak velocity magnitude accumulated over the loaded loop.
+    swath: max_ref_swath::SwathState,
     /// User style overrides (styles.json document) and the resolved
     /// registry draw code reads. Rebuild the registry after editing the
     /// document (`rebuild_style_registry`).
@@ -7318,6 +7322,7 @@ impl ViewerApp {
             hazard_status: "No hazard polygons loaded".to_owned(),
             hazards_visible: true,
             hazards_active_only: true,
+            swath: max_ref_swath::SwathState::default(),
             style_settings: loaded_styles.settings,
             style_registry,
             styles_newer_schema: loaded_styles.newer_schema,
@@ -7347,6 +7352,8 @@ impl ViewerApp {
         app.basemap_style = restored_basemap_style;
         app.bold_labels = restored_bold_labels;
         app.gate_filter_dbz = restored_gate_filter_dbz;
+        app.swath.reflectivity.enabled = app.app_settings.overlay_max_ref_swath;
+        app.swath.velocity.enabled = app.app_settings.overlay_max_vel_swath;
         app.display_smoothing = SmoothingMode::from_settings(&app.app_settings);
         app.restore_workspace_layout();
         // Palette persistence: scan My tables (user .pal files copied into
@@ -27240,6 +27247,9 @@ impl ViewerApp {
         self.request_texture_render(ui.ctx(), rect);
         self.draw_hazard_fills(painter, rect);
         self.draw_radar_overlay_layers(ui.ctx(), painter, rect);
+        // Max-value swath trail, beneath the live frame so the current echo
+        // draws over "where the storm has been".
+        self.draw_swath_overlays(ui.ctx(), painter, rect);
         self.draw_radar_layer(ui.ctx(), painter, rect);
         let overlay_start = Instant::now();
         self.draw_basemap_overlay(painter, rect);
@@ -32194,6 +32204,8 @@ impl ViewerApp {
         self.app_settings.overlay_spc_outlooks = self.spc_outlooks_enabled.clone();
         self.app_settings.overlay_spc_reports = self.spc_reports_enabled;
         self.app_settings.overlay_mping_reports = self.mping_enabled;
+        self.app_settings.overlay_max_ref_swath = self.swath.reflectivity.enabled;
+        self.app_settings.overlay_max_vel_swath = self.swath.velocity.enabled;
         let _ = self.app_settings.save();
     }
 
@@ -70092,6 +70104,7 @@ mod tests {
             hazard_status: String::new(),
             hazards_visible: true,
             hazards_active_only: true,
+            swath: max_ref_swath::SwathState::default(),
             style_settings: styles::StyleSettings::default(),
             style_registry: styles::StyleRegistry::default(),
             styles_newer_schema: false,

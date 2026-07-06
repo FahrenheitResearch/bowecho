@@ -200,6 +200,13 @@ pub struct AppSettings {
     pub overlay_spc_reports: bool,
     #[serde(default)]
     pub overlay_mping_reports: bool,
+    /// Max-value swath overlays: the per-gate maximum reflectivity (and, as a
+    /// separate toggle, peak velocity magnitude) accumulated across the loaded
+    /// loop — "where the storm has been". Default off (recomputed on demand).
+    #[serde(default)]
+    pub overlay_max_ref_swath: bool,
+    #[serde(default)]
+    pub overlay_max_vel_swath: bool,
     /// Basemap style key: "dark" (vector), "satellite", "streets", "topo".
     #[serde(default = "default_basemap_style")]
     pub basemap_style: String,
@@ -689,6 +696,8 @@ impl Default for AppSettings {
             overlay_spc_outlooks: Vec::new(),
             overlay_spc_reports: false,
             overlay_mping_reports: false,
+            overlay_max_ref_swath: false,
+            overlay_max_vel_swath: false,
             startup_site: None,
             display_owner_site: None,
             favorites: Vec::new(),

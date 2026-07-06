@@ -19,11 +19,13 @@ mod region_core;
 mod rhi;
 mod shear;
 mod smooth;
+mod swath;
 mod tracking;
 pub mod tracks;
 mod volumetric;
 pub mod wind;
 pub use cells::{StormCell, identify_storm_cells};
+pub use swath::{SwathAggregation, base_tilt_cut, max_value_swath};
 pub use dealias_pyart::dealias_velocity_grid_pyart_region;
 pub use dealias_v4::{
     ConfidenceGrid, EnvWindLevel, EnvironmentalWindProfile, TemporalPrior, V4Diagnostics,

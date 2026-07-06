@@ -44,6 +44,8 @@ impl ViewerApp {
             + usize::from(!self.spc_outlooks_enabled.is_empty())
             + usize::from(self.spc_reports_enabled)
             + usize::from(self.mping_enabled)
+            + usize::from(self.swath.reflectivity.enabled)
+            + usize::from(self.swath.velocity.enabled)
             + usize::from(self.hazards_visible && self.hazard_overlay.is_some())
             + usize::from(self.tor_tracks.show_tracks)
             + usize::from(self.tor_tracks.show_tds)
@@ -156,6 +158,9 @@ impl ViewerApp {
         // Radar-derived algorithm layers (rotation tracks + TDS) ride with
         // the radars they derive from.
         self.tor_tracks_rail_rows(ui, ctx);
+        // Max-value swath overlays (peak REF / peak |V| over the loaded loop)
+        // are pure products of the radar loop, so they sit with the radars.
+        self.max_swath_rail_rows(ui, ctx);
         let has_model_rows = !self.model_layers.is_empty();
         let mut step_hour: i64 = 0;
         // The Hour stepper rides the group header: it steps every
