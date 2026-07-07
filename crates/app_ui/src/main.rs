@@ -2591,6 +2591,13 @@ struct ViewerApp {
     sat_layer_texture: Option<(egui::TextureHandle, u64, ModelLayerView)>,
     sat_layer_render_rx: Option<mpsc::Receiver<ModelLayerRender>>,
     sat_layer_generation: u64,
+    /// Content-addressed satellite InverseLut cache, most-recent first (see
+    /// [`SatLutCacheEntry`]). Deliberately NOT cleared on spec change or
+    /// layer removal: entries are keyed by the grid file's sha256, so they
+    /// can never go stale — re-adding the layer for a grid seen before
+    /// (next run of the same product, spec toggled back) skips the
+    /// multi-second full-disk LUT rebuild.
+    sat_lut_cache: Vec<SatLutCacheEntry>,
     /// Last frame shown in the sat player (the "Show on map" source).
     sat_last_frame: Option<(rw_ui::SatRunKey, u16)>,
     /// Frames the worker rendered through the LEGACY pre-calibration
@@ -4359,6 +4366,25 @@ struct SatMapLayer {
     visible: bool,
     generation: u64,
 }
+
+/// One cached satellite inverse-geolocation LUT, keyed by the grid's
+/// CONTENT identity: `GridFile.hash` is the sha256 of the whole grid file,
+/// so every frame of a run — and successive runs of the same product,
+/// which write bit-identical grids (proved on the full-disk track) — share
+/// one entry. `nx`/`ny` are a belt-and-braces shape check on top of the
+/// hash. Entries are immutable by construction; only capacity evicts.
+struct SatLutCacheEntry {
+    grid_hash: String,
+    nx: usize,
+    ny: usize,
+    lut: Arc<model_layer::InverseLut>,
+}
+
+/// Two entries: the active grid plus the one the user toggled away from
+/// (e.g. CONUS ↔ full disk). A full-disk LUT tops out around 64 MB
+/// (16 M bins × u32), and the active layer's entry aliases the layer's own
+/// Arc, so the cache retains at most one LUT beyond what is displayed.
+const SAT_LUT_CACHE_CAP: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ItalyDpcMapProduct {
@@ -7604,6 +7630,7 @@ impl ViewerApp {
             sat_layer_texture: None,
             sat_layer_render_rx: None,
             sat_layer_generation: 0,
+            sat_lut_cache: Vec::new(),
             sat_last_frame: None,
             sat_legacy_frames: std::collections::HashSet::new(),
             sat_map_follow: false,
@@ -31583,6 +31610,10 @@ impl ViewerApp {
         self.sat_map_inflight = None;
         self.sat_map_pending = None;
         self.sat_layer_generation = self.sat_layer_generation.wrapping_add(1);
+        // `sat_lut_cache` deliberately survives: entries are keyed by grid
+        // CONTENT (sha256), so a spec change can never make them wrong —
+        // and toggling back to a spec whose grid was already indexed
+        // reinstalls the layer without the multi-second LUT rebuild.
     }
 
     fn satellite_run_key_matches_current_spec(&self, key: &rw_ui::SatRunKey) -> bool {
@@ -34038,6 +34069,51 @@ impl ViewerApp {
 
     /// Install a GOES frame as the sat map layer (LUT built on a
     /// background thread; same machinery as the model layer).
+    /// Cached LUT for a grid identity, refreshing its LRU position. Empty
+    /// hashes (synthesized grids) never match — they carry no identity.
+    fn sat_lut_cache_get(
+        &mut self,
+        grid_hash: &str,
+        nx: usize,
+        ny: usize,
+    ) -> Option<Arc<model_layer::InverseLut>> {
+        if grid_hash.is_empty() {
+            return None;
+        }
+        let position = self
+            .sat_lut_cache
+            .iter()
+            .position(|entry| entry.grid_hash == grid_hash && entry.nx == nx && entry.ny == ny)?;
+        let entry = self.sat_lut_cache.remove(position);
+        let lut = Arc::clone(&entry.lut);
+        self.sat_lut_cache.insert(0, entry);
+        Some(lut)
+    }
+
+    fn sat_lut_cache_insert(
+        &mut self,
+        grid_hash: String,
+        nx: usize,
+        ny: usize,
+        lut: Arc<model_layer::InverseLut>,
+    ) {
+        if grid_hash.is_empty() {
+            return;
+        }
+        self.sat_lut_cache
+            .retain(|entry| entry.grid_hash != grid_hash || entry.nx != nx || entry.ny != ny);
+        self.sat_lut_cache.insert(
+            0,
+            SatLutCacheEntry {
+                grid_hash,
+                nx,
+                ny,
+                lut,
+            },
+        );
+        self.sat_lut_cache.truncate(SAT_LUT_CACHE_CAP);
+    }
+
     fn install_sat_layer(&mut self, frame: sat_worker::SatMapFrame) {
         if self.sat_layer_build_rx.is_some() {
             self.sat_map_pending = Some((frame.key, frame.hhmm));
@@ -34072,6 +34148,42 @@ impl ViewerApp {
             // viewport render is ready. Clearing here makes playback blink
             // blank between frames, especially now that sat overlays render
             // at full viewport resolution.
+            self.sat_layer_render_rx = None;
+            self.status = format!("Satellite map: {hhmm:04}Z");
+            return;
+        }
+        // Different run key, but a grid we have already indexed (successive
+        // runs of a product write bit-identical grids; spec toggles come
+        // back to the same grid): reuse the cached LUT synchronously
+        // instead of parking playback behind a multi-second rebuild.
+        if let Some(lut) = self.sat_lut_cache_get(&frame.grid.hash, nx, ny) {
+            let generation = self.sat_layer_generation + 1;
+            self.sat_layer_generation = generation;
+            let opacity = self
+                .sat_layer
+                .as_ref()
+                .map(|layer| layer.opacity)
+                .unwrap_or_else(|| self.style_registry.drapes().goes_opacity);
+            let visible = self
+                .sat_layer
+                .as_ref()
+                .map(|layer| layer.visible)
+                .unwrap_or(true);
+            self.sat_layer = Some(SatMapLayer {
+                key,
+                hhmm,
+                image: Arc::new(frame.image),
+                grid: frame.grid,
+                lut,
+                nx,
+                ny,
+                flip_rows: frame.flip_rows,
+                opacity,
+                visible,
+                generation,
+            });
+            // As above: the previous texture stays up as a placeholder until
+            // this generation's viewport render lands.
             self.sat_layer_render_rx = None;
             self.status = format!("Satellite map: {hhmm:04}Z");
             return;
@@ -34116,6 +34228,16 @@ impl ViewerApp {
                 Ok(layer) => {
                     self.sat_layer_build_rx = None;
                     if let Some(layer) = layer {
+                        // Remember the freshly built LUT under the grid's
+                        // content hash: every later frame of this run — and
+                        // of successive runs writing the identical grid —
+                        // installs without another rebuild.
+                        self.sat_lut_cache_insert(
+                            layer.grid.hash.clone(),
+                            layer.nx,
+                            layer.ny,
+                            Arc::clone(&layer.lut),
+                        );
                         self.sat_layer_generation = layer.generation;
                         self.sat_layer = Some(layer);
                         // Keep the old texture as a placeholder while the
@@ -34588,16 +34710,22 @@ impl ViewerApp {
             });
         }
         if let Some((texture, _, rendered)) = &self.sat_layer_texture {
+            let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+            let tint = egui::Color32::from_white_alpha((layer.opacity * 255.0) as u8);
             if model_layer_view_needs_rerender(rendered, &view) {
-                return;
+                // Mid-gesture (owner report: "every time we zoom in the sat
+                // image disappears until we stop"): keep painting the last
+                // rendered raster, world-anchored into the moving view like
+                // the radar texture — momentary AEQD distortion is expected
+                // and the fresh render above swaps in when it lands.
+                let anchored =
+                    anchored_sat_texture_rect(rect, texture.size_vec2(), rendered, &view);
+                if anchored.is_finite() && anchored.intersects(rect) {
+                    painter.image(texture.id(), anchored, uv, tint);
+                }
+            } else {
+                painter.image(texture.id(), rect, uv, tint);
             }
-            let opacity = (layer.opacity * 255.0) as u8;
-            painter.image(
-                texture.id(),
-                rect,
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                egui::Color32::from_white_alpha(opacity),
-            );
         }
     }
 
@@ -43848,6 +43976,37 @@ fn positive_ratio(numerator: f32, denominator: f32) -> f32 {
     } else {
         1.0
     }
+}
+
+/// Where the last-rendered satellite raster lands in the CURRENT view — the
+/// satellite twin of [`anchored_radar_texture_rect`]. The raster filled the
+/// whole map rect when it was rendered, centered on the render view's
+/// center, so it is re-anchored at that geo point's current screen position
+/// and scaled by the zoom ratio (`texture_pts` is the raster's size in
+/// points, i.e. the map rect at render time). AEQD azimuth rotation between
+/// the two view centers is deliberately ignored: this rect only bridges an
+/// active pan/zoom gesture web-map style, and the exact re-render replaces
+/// it as soon as the view settles. Degenerate views produce a non-finite
+/// rect the caller must skip.
+fn anchored_sat_texture_rect(
+    rect: egui::Rect,
+    texture_pts: egui::Vec2,
+    rendered: &ModelLayerView,
+    current: &ModelLayerView,
+) -> egui::Rect {
+    let scale = positive_ratio(current.map_scale, rendered.map_scale);
+    let (east_km, north_km) = aeqd_forward_km(
+        current.center_lat as f64,
+        current.center_lon as f64,
+        rendered.center_lat as f64,
+        rendered.center_lon as f64,
+    );
+    let px_per_km = current.map_scale / 111.32;
+    let center = egui::pos2(
+        rect.center().x + east_km as f32 * px_per_km,
+        rect.center().y - north_km as f32 * px_per_km,
+    );
+    egui::Rect::from_center_size(center, texture_pts * scale)
 }
 
 fn radar_age_glyph_arc_points(
@@ -65147,6 +65306,130 @@ mod tests {
         );
     }
 
+    fn test_sat_lut() -> Arc<model_layer::InverseLut> {
+        Arc::new(
+            model_layer::InverseLut::build(
+                &[35.0, 35.0, 35.1, 35.1],
+                &[-97.1, -97.0, -97.1, -97.0],
+            )
+            .expect("tiny lut builds"),
+        )
+    }
+
+    #[test]
+    fn sat_lut_cache_is_content_addressed_with_lru_capacity() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let lut_a = test_sat_lut();
+        let lut_b = test_sat_lut();
+        let lut_c = test_sat_lut();
+
+        app.sat_lut_cache_insert("hash-a".to_owned(), 2, 2, Arc::clone(&lut_a));
+        let hit = app.sat_lut_cache_get("hash-a", 2, 2).expect("cached");
+        assert!(Arc::ptr_eq(&hit, &lut_a), "the SAME lut object comes back");
+        assert!(
+            app.sat_lut_cache_get("hash-a", 2, 3).is_none(),
+            "shape mismatch never matches, even with the right hash"
+        );
+        assert!(app.sat_lut_cache_get("hash-b", 2, 2).is_none());
+
+        // Capacity is LRU: touching A keeps it alive past B's insert.
+        app.sat_lut_cache_insert("hash-b".to_owned(), 2, 2, Arc::clone(&lut_b));
+        let _ = app.sat_lut_cache_get("hash-a", 2, 2).expect("refreshed");
+        app.sat_lut_cache_insert("hash-c".to_owned(), 2, 2, Arc::clone(&lut_c));
+        assert!(app.sat_lut_cache_get("hash-a", 2, 2).is_some());
+        assert!(app.sat_lut_cache_get("hash-c", 2, 2).is_some());
+        assert!(
+            app.sat_lut_cache_get("hash-b", 2, 2).is_none(),
+            "least-recently-used entry evicted at cap {SAT_LUT_CACHE_CAP}"
+        );
+
+        // Hash-less grids (synthesized/test grids) carry no identity.
+        app.sat_lut_cache_insert(String::new(), 2, 2, lut_a);
+        assert!(app.sat_lut_cache_get("", 2, 2).is_none());
+    }
+
+    #[test]
+    fn sat_map_frame_with_a_cached_grid_lut_installs_synchronously() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        // "h9" bypasses the GOES spec filter (see the resurrect-latch test).
+        let run_a = rw_ui::SatRunKey {
+            model: "h9".to_owned(),
+            run: "fulldisk_rgb_true_color_20260705".to_owned(),
+        };
+        let run_b = rw_ui::SatRunKey {
+            model: "h9".to_owned(),
+            run: "fulldisk_rgb_true_color_20260706".to_owned(),
+        };
+        // Successive runs write bit-identical grids: one content hash.
+        let frame = |key: &rw_ui::SatRunKey, hhmm: u16| sat_worker::SatMapFrame {
+            key: key.clone(),
+            hhmm,
+            image: egui::ColorImage::new([2, 2], vec![egui::Color32::WHITE; 4]),
+            grid: Arc::new(rw_store::grid::GridFile {
+                nx: 2,
+                ny: 2,
+                lat: vec![35.1, 35.1, 35.0, 35.0],
+                lon: vec![-97.1, -97.0, -97.1, -97.0],
+                projection: None,
+                hash: "fulldisk-grid-sha".to_owned(),
+            }),
+            flip_rows: false,
+        };
+        let cached_lut = test_sat_lut();
+        app.sat_lut_cache_insert(
+            "fulldisk-grid-sha".to_owned(),
+            2,
+            2,
+            Arc::clone(&cached_lut),
+        );
+
+        // First frame of run A: no thread build — the layer is live at once.
+        let generation_before = app.sat_layer_generation;
+        app.sat_map_inflight = Some((run_a.clone(), 2350));
+        app.apply_sat_map_frame_response(frame(&run_a, 2350));
+        assert!(
+            app.sat_layer_build_rx.is_none(),
+            "cached grid identity must skip the background LUT build"
+        );
+        let layer = app.sat_layer.as_ref().expect("layer installed");
+        assert!(
+            Arc::ptr_eq(&layer.lut, &cached_lut),
+            "the cached LUT object is reused, not rebuilt"
+        );
+        assert_eq!(layer.key, run_a);
+        assert_ne!(app.sat_layer_generation, generation_before);
+
+        // A run change with the SAME grid hash (midnight rollover) also
+        // installs synchronously and keeps the user's layer settings.
+        if let Some(layer) = app.sat_layer.as_mut() {
+            layer.opacity = 0.42;
+            layer.visible = false;
+        }
+        app.sat_map_inflight = Some((run_b.clone(), 0));
+        app.apply_sat_map_frame_response(frame(&run_b, 0));
+        assert!(app.sat_layer_build_rx.is_none());
+        let layer = app.sat_layer.as_ref().expect("rollover layer installed");
+        assert_eq!(layer.key, run_b);
+        assert!(Arc::ptr_eq(&layer.lut, &cached_lut));
+        assert!(
+            (layer.opacity - 0.42).abs() < f32::EPSILON,
+            "opacity survives"
+        );
+        assert!(!layer.visible, "visibility survives");
+
+        // Spec change still clears the LAYER (owner-guarded regression) but
+        // the content-addressed cache survives, so re-adding is instant too.
+        app.clear_satellite_display_for_spec_change();
+        assert!(app.sat_layer.is_none());
+        app.sat_map_inflight = Some((run_a.clone(), 2350));
+        app.apply_sat_map_frame_response(frame(&run_a, 2350));
+        assert!(app.sat_layer_build_rx.is_none());
+        assert!(
+            app.sat_layer.is_some(),
+            "re-add after spec change reuses the cached LUT synchronously"
+        );
+    }
+
     #[test]
     fn hail_env_no_hour_status_distinguishes_no_coverage_from_empty_store() {
         let ctx = egui::Context::default();
@@ -74188,6 +74471,95 @@ mod tests {
     }
 
     #[test]
+    fn stale_sat_texture_rect_matches_the_viewport_when_the_view_is_unchanged() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(300.0, 200.0));
+        let view = ModelLayerView {
+            center_lat: 39.0,
+            center_lon: -95.0,
+            map_scale: 100.0,
+        };
+
+        let anchored = anchored_sat_texture_rect(rect, rect.size(), &view, &view);
+
+        assert!((anchored.min.x - rect.min.x).abs() < 0.01);
+        assert!((anchored.min.y - rect.min.y).abs() < 0.01);
+        assert!((anchored.max.x - rect.max.x).abs() < 0.01);
+        assert!((anchored.max.y - rect.max.y).abs() < 0.01);
+    }
+
+    #[test]
+    fn stale_sat_texture_rect_translates_with_map_pan() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 200.0));
+        let rendered = ModelLayerView {
+            center_lat: 39.0,
+            center_lon: -95.0,
+            map_scale: 100.0,
+        };
+        // View panned 1° north: the render-time center now sits 111.32 km
+        // south of the view center, i.e. map_scale px below mid-screen.
+        let current = ModelLayerView {
+            center_lat: 40.0,
+            ..rendered
+        };
+
+        let anchored = anchored_sat_texture_rect(rect, rect.size(), &rendered, &current);
+
+        assert!((anchored.center().x - rect.center().x).abs() < 0.01);
+        assert!((anchored.center().y - (rect.center().y + 100.0)).abs() < 0.01);
+        assert!(
+            (anchored.width() - rect.width()).abs() < 0.01,
+            "pan keeps size"
+        );
+        assert!((anchored.height() - rect.height()).abs() < 0.01);
+    }
+
+    #[test]
+    fn stale_sat_texture_rect_scales_around_the_render_center_on_zoom() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 200.0));
+        let rendered = ModelLayerView {
+            center_lat: 39.0,
+            center_lon: -95.0,
+            map_scale: 100.0,
+        };
+        let current = ModelLayerView {
+            map_scale: 200.0,
+            ..rendered
+        };
+
+        let anchored = anchored_sat_texture_rect(rect, rect.size(), &rendered, &current);
+
+        assert!((anchored.center().x - rect.center().x).abs() < 0.01);
+        assert!((anchored.center().y - rect.center().y).abs() < 0.01);
+        assert!(
+            (anchored.width() - 600.0).abs() < 0.01,
+            "2x zoom doubles the raster"
+        );
+        assert!((anchored.height() - 400.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn stale_sat_texture_rect_rejects_a_degenerate_render_view() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(300.0, 200.0));
+        let rendered = ModelLayerView {
+            center_lat: f32::NAN,
+            center_lon: -95.0,
+            map_scale: 100.0,
+        };
+        let current = ModelLayerView {
+            center_lat: 39.0,
+            center_lon: -95.0,
+            map_scale: 100.0,
+        };
+
+        let anchored = anchored_sat_texture_rect(rect, rect.size(), &rendered, &current);
+
+        assert!(
+            !anchored.is_finite(),
+            "a NaN render view must yield a non-finite rect (draw skipped): {anchored:?}"
+        );
+    }
+
+    #[test]
     fn loupe_coordinate_line_uses_hemisphere_letters() {
         // Solarpower07 loupe convention: absolute degrees + N/S, E/W.
         assert_eq!(format_lat_lon(39.322, -83.959), "39.322N, 83.959W");
@@ -75128,6 +75500,7 @@ mod tests {
             sat_layer_texture: None,
             sat_layer_render_rx: None,
             sat_layer_generation: 0,
+            sat_lut_cache: Vec::new(),
             sat_last_frame: None,
             sat_legacy_frames: std::collections::HashSet::new(),
             sat_map_follow: false,

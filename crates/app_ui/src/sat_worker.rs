@@ -775,6 +775,15 @@ struct WorkerState {
     grids: HashMap<(String, String), GridInfo>,
     /// User-selected IR enhancement, applied at frame-coloring time.
     ir_enhancement: IrEnhancement,
+    /// The most recently served MAP grid, content-addressed by
+    /// `GridFile.hash` (sha256 of the grid file bytes). Map playback
+    /// requests a frame per step, and a full-disk `grid.rwg` is a ~240 MB
+    /// read + hash per open — but every frame of a run, and successive
+    /// runs of the same product, reference bit-identical grids, so one
+    /// held `Arc` serves them all (the UI layer shares the same `Arc`, so
+    /// steady-state memory is unchanged). Populated only by the map path;
+    /// player-only sessions never pay for it.
+    map_grid: Option<Arc<GridFile>>,
 }
 
 struct ColoredSatFrame {
@@ -786,8 +795,11 @@ struct ColoredSatFrame {
     legacy: bool,
 }
 
-/// Frame + run grid for the radar-map layer (one GridFile open per call;
-/// the layer rebuild is a user action, not a per-frame hot path).
+/// Frame + run grid for the radar-map layer. Map playback re-requests a
+/// frame per step, so the run grid is served from the content-addressed
+/// `WorkerState::map_grid` cache — the per-frame ~240 MB full-disk
+/// `grid.rwg` read + sha256 only happens when the grid identity actually
+/// changes (a different product/sector), never between frames of a run.
 fn load_frame_for_map(
     state: &mut WorkerState,
     store_root: &Path,
@@ -796,17 +808,27 @@ fn load_frame_for_map(
 ) -> Result<SatMapFrame, String> {
     let colored = load_colored_frame(state, store_root, key, hhmm, true)?;
     let run_dir = store_root.join(&key.model).join(&key.run);
-    let grid = GridFile::open(&run_dir.join("grid.rwg")).map_err(|err| err.to_string())?;
-    let flip_rows = state
+    // Present after any successful load (the frame/run hash agreement check
+    // depends on it); the run's grid hash is the cache identity.
+    let info = state
         .grids
         .get(&(key.model.clone(), key.run.clone()))
-        .map(|info| info.flip_rows)
-        .unwrap_or(false);
+        .ok_or_else(|| format!("{key}: run grid facts missing after frame load"))?;
+    let flip_rows = info.flip_rows;
+    let grid = match state.map_grid.as_ref() {
+        Some(cached) if cached.hash == info.hash => Arc::clone(cached),
+        _ => {
+            let opened =
+                Arc::new(GridFile::open(&run_dir.join("grid.rwg")).map_err(|err| err.to_string())?);
+            state.map_grid = Some(Arc::clone(&opened));
+            opened
+        }
+    };
     Ok(SatMapFrame {
         key: key.clone(),
         hhmm,
         image: colored.frame.image,
-        grid: std::sync::Arc::new(grid),
+        grid,
         flip_rows,
     })
 }
@@ -839,14 +861,36 @@ fn load_colored_frame(
     // check — required for both the single-band and composite render paths.
     let grid_key = (key.model.clone(), key.run.clone());
     if !state.grids.contains_key(&grid_key) {
-        let grid = GridFile::open(&run_dir.join("grid.rwg")).map_err(|err| err.to_string())?;
-        state.grids.insert(
-            grid_key.clone(),
-            GridInfo {
-                hash: grid.hash.clone(),
-                flip_rows: grid.lat_descending() == Some(false),
+        // A run whose frames declare a grid hash we already hold (successive
+        // runs write bit-identical grids) yields its facts from the cached
+        // map grid — no ~240 MB full-disk re-read at, e.g., midnight
+        // rollover. Content equality (sha256) makes flip_rows equal too.
+        let info = match state
+            .map_grid
+            .as_ref()
+            .filter(|cached| cached.hash == meta.grid_hash)
+        {
+            Some(cached) => GridInfo {
+                hash: cached.hash.clone(),
+                flip_rows: cached.lat_descending() == Some(false),
             },
-        );
+            None => {
+                let grid =
+                    GridFile::open(&run_dir.join("grid.rwg")).map_err(|err| err.to_string())?;
+                let info = GridInfo {
+                    hash: grid.hash.clone(),
+                    flip_rows: grid.lat_descending() == Some(false),
+                };
+                if map_overlay {
+                    // The map path needs the full grid right after this
+                    // returns (`load_frame_for_map`): keep the copy we just
+                    // paid to read instead of opening the file twice.
+                    state.map_grid = Some(Arc::new(grid));
+                }
+                info
+            }
+        };
+        state.grids.insert(grid_key.clone(), info);
     }
     let grid = &state.grids[&grid_key];
     if grid.hash != meta.grid_hash {
@@ -4377,6 +4421,51 @@ mod tests {
 
         let missing = load_frame(&mut state, &dir, &key, 1900);
         assert!(missing.is_err(), "absent frame surfaces an error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn map_frames_share_one_grid_read_within_and_across_runs() {
+        let dir = test_dir("map-grid-cache");
+        let written = write_band_frame(&dir, &synthetic_field(8, 6, 18, 51, 13), 1).unwrap();
+        let key = SatRunKey {
+            model: written.model.clone(),
+            run: written.run.clone(),
+        };
+        write_band_frame(&dir, &synthetic_field(8, 6, 18, 56, 13), 2).unwrap();
+
+        let mut state = WorkerState::default();
+        let first = load_frame_for_map(&mut state, &dir, &key, 1851).expect("first map frame");
+        let second = load_frame_for_map(&mut state, &dir, &key, 1856).expect("second map frame");
+        assert!(
+            Arc::ptr_eq(&first.grid, &second.grid),
+            "frames of one run must share ONE opened grid, not re-read ~240 MB per step"
+        );
+        assert!(!first.grid.hash.is_empty(), "store grids carry a sha256");
+
+        // Band 8 writes a DIFFERENT run over the same scan geometry — a
+        // bit-identical grid, hence the same content hash. Deleting its
+        // grid.rwg proves the cross-run load is served entirely from the
+        // content-addressed cache (no grid read at run rollover).
+        let written_b = write_band_frame(&dir, &synthetic_field(8, 6, 18, 51, 8), 3).unwrap();
+        let key_b = SatRunKey {
+            model: written_b.model.clone(),
+            run: written_b.run.clone(),
+        };
+        assert_ne!(key.run, key_b.run, "distinct runs");
+        std::fs::remove_file(dir.join(&key_b.model).join(&key_b.run).join("grid.rwg")).unwrap();
+        let cross = load_frame_for_map(&mut state, &dir, &key_b, 1851).expect("cross-run frame");
+        assert!(
+            Arc::ptr_eq(&first.grid, &cross.grid),
+            "identical grid content must be served from the cache"
+        );
+        assert_eq!(cross.flip_rows, first.flip_rows);
+
+        // A cold worker (empty cache) must still need the file: the cache
+        // is an optimization, never a fallback data source.
+        let mut cold = WorkerState::default();
+        assert!(load_frame_for_map(&mut cold, &dir, &key_b, 1851).is_err());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
