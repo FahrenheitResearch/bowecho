@@ -5,9 +5,19 @@
 /// credit pending per project policy).
 pub mod solar;
 
+/// Friendly display labels + default-palette family hints for raw
+/// `wrf_*`-prefixed store fields (the WRF Registry passthrough names both
+/// import paths write). Consumed by the Solar resolver and the model dock's
+/// display-time renaming.
+pub mod wrf_fields;
+
 pub use solar::{
     solar_cape_table, solar_model_field_table, solar_reflectivity_table,
     solar_relative_humidity_table, solar_vorticity_table,
+};
+pub use wrf_fields::{
+    WrfColorFamily, WrfFieldInfo, wrf_display_label, wrf_field_catalog, wrf_field_info,
+    wrf_store_name_for_label,
 };
 
 use std::collections::hash_map::DefaultHasher;

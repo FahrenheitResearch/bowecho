@@ -232,21 +232,36 @@ impl ViewerApp {
             let layer = &mut slot.layer;
             let grid_source =
                 grid_composites::GridCompositeSource::from_variable_slug(&layer.field.key.var);
+            // Raw wrf_* store fields show their friendly catalog label in the
+            // rail (same label the model dock picker shows); the hover keeps
+            // the real store name plus the catalog's one-line description.
+            let wrf_info = color_tables::wrf_field_info(&layer.field.key.var);
             let name = grid_source
                 .map(|source| source.short_label().to_owned())
                 .unwrap_or_else(|| {
-                    format!("{} f{:02}", layer.field.key.var, layer.field.key.hour.hour)
+                    let label = wrf_info
+                        .map(|info| info.label)
+                        .unwrap_or(&layer.field.key.var);
+                    format!("{} f{:02}", label, layer.field.key.hour.hour)
                 });
             let grid_frame_text = grid_source.and_then(|source| {
                 grid_composites::frame_text_for(&self.grid_composite_status, source)
             });
             let grid_fetching = grid_source.is_some() && grid_source == self.grid_composite_loading;
             let name_hover = grid_source.map_or_else(
-                || {
-                    format!(
+                || match wrf_info {
+                    Some(info) => format!(
+                        "{} ({}) — store field {}\n{}\nLayers draw bottom-to-top in list order\nNewest: {}",
+                        info.label,
+                        layer.field.units,
+                        layer.field.key.var,
+                        info.description,
+                        newest_run_text
+                    ),
+                    None => format!(
                         "{} ({}) — layers draw bottom-to-top in list order\nNewest: {}",
                         layer.field.key.var, layer.field.units, newest_run_text
-                    )
+                    ),
                 },
                 |source| {
                     format!(

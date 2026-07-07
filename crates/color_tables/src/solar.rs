@@ -654,11 +654,28 @@ fn depth_unit_of(units: &str) -> DepthUnit {
 /// `composite_reflectivity`, `apcp`, …) and styled fields whose values were
 /// already converted to display units.
 ///
+/// Raw `wrf_*`-prefixed passthrough fields (the WRF Registry names the
+/// imports store verbatim, e.g. `wrf_swupt`, `wrf_hfx`) resolve FIRST through
+/// the [`crate::wrf_fields`] catalog's family hints — Solar tables where a
+/// family exists, existing BowEcho ramps rescaled over a physical range
+/// otherwise — so the standard diagnostic set never falls to a meaningless
+/// normalized default. Catalog entries with no assigned family fall through
+/// to the name heuristics below unchanged.
+///
 /// CREDIT: every table returned here is a port of a Solarpower07 WRF-Runner
 /// palette (see module docs).
 pub fn solar_model_field_table(var: &str, units: &str) -> Option<ColorTable> {
     let name = var.to_ascii_lowercase();
     let unit = units.trim().to_ascii_lowercase();
+
+    // Exact-match raw-WRF catalog first: these names are WRF Registry
+    // mnemonics the substring heuristics below can't classify (and could
+    // misclassify — e.g. nothing in `wrf_snownc` says "precip").
+    if let Some(info) = crate::wrf_fields::wrf_field_info(&name)
+        && let Some(table) = wrf_family_table(info.family, units)
+    {
+        return Some(table);
+    }
 
     // Reflectivity (dBZ). Solar's flagship "PW Style".
     if unit == "dbz"
@@ -751,6 +768,73 @@ pub fn solar_model_field_table(var: &str, units: &str) -> Option<ColorTable> {
     }
 
     None
+}
+
+/// Resolve a [`crate::wrf_fields`] family hint to a concrete table, keyed to
+/// the field's stored units where the family is unit-aware. `Unassigned`
+/// yields `None` so the caller's name heuristics / generic fallback still
+/// apply. Every ramp returned here already exists in BowEcho — the
+/// parameterized families only RESCALE existing ramps (colors verbatim), they
+/// never introduce a new palette.
+fn wrf_family_table(family: crate::wrf_fields::WrfColorFamily, units: &str) -> Option<ColorTable> {
+    use crate::wrf_fields::WrfColorFamily as F;
+    match family {
+        // Same unit-aware surface behavior as the temperature heuristic
+        // below: °C-styled fields take Solar's native sfc_C palette, °F and
+        // Kelvin keep the F-anchored surface table.
+        F::Temperature => Some(match temp_unit_of(units) {
+            TempUnit::Celsius => solar_temperature_sfc_c_table(TempUnit::Celsius),
+            unit @ (TempUnit::Fahrenheit | TempUnit::Kelvin) => solar_temperature_table(unit),
+        }),
+        F::Dewpoint => Some(solar_dewpoint_table(temp_unit_of(units))),
+        F::RelativeHumidity => Some(solar_relative_humidity_table()),
+        F::WindSpeed => Some(solar_wind_speed_table(speed_unit_of(units))),
+        F::PrecipDepth => Some(solar_precip_table(depth_unit_of(units))),
+        F::Reflectivity => Some(solar_reflectivity_table()),
+        F::Cape => Some(solar_cape_table()),
+        F::Helicity => Some(solar_composite_severe_table("Solar Helicity", 600.0)),
+        F::HailSize => Some(crate::builtin_hail_size_table()),
+        F::Percent => Some(crate::builtin_probability_table()),
+        F::Fraction => Some(rescaled_table(
+            &crate::builtin_probability_table(),
+            "Analyst Probability (fraction)",
+            0.0,
+            1.0,
+        )),
+        F::Composite { vmax } => Some(solar_composite_severe_table("Solar Composite", vmax)),
+        F::Sequential { lo, hi } => Some(rescaled_table(
+            &crate::builtin_generic_table(),
+            "Analyst Generic (scaled)",
+            lo,
+            hi,
+        )),
+        F::Diverging { max_abs } => Some(rescaled_table(
+            &crate::balance_velocity_table(),
+            "Balance Diverging (scaled)",
+            -max_abs,
+            max_abs,
+        )),
+        F::Unassigned => None,
+    }
+}
+
+/// Linearly remap an existing table's stops onto `lo..hi`, keeping every
+/// color verbatim — palette reuse, not palette invention. The base tables
+/// used here are interpolated ramps with ≥ 2 distinct stop values, so the
+/// span division is well-formed by construction.
+fn rescaled_table(base: &ColorTable, name: &str, lo: f32, hi: f32) -> ColorTable {
+    let stops = base.stops();
+    let first = stops.first().map_or(0.0, |stop| stop.value);
+    let last = stops.last().map_or(1.0, |stop| stop.value);
+    let span = last - first;
+    let rescaled = stops
+        .iter()
+        .map(|stop| ColorStop {
+            value: lo + (stop.value - first) / span * (hi - lo),
+            ..*stop
+        })
+        .collect();
+    ColorTable::new(name, rescaled).expect("rescaling a valid table keeps it valid")
 }
 
 #[cfg(test)]
@@ -897,6 +981,163 @@ mod tests {
         let degf = solar_model_field_table("t2m", "degF").expect("sfc temp");
         let expected_f = solar_temperature_table(TempUnit::Fahrenheit);
         assert_eq!(degf.sample(72.0), expected_f.sample(72.0));
+    }
+
+    /// Raw radiation-budget fields (WRF Registry names) resolve the EXISTING
+    /// Analyst Generic ramp rescaled over their physical W/m² range — colors
+    /// verbatim from the base ramp, ends pinned to the base ramp's ends.
+    #[test]
+    fn raw_wrf_radiation_fields_resolve_the_scaled_sequential_ramp() {
+        let generic = crate::builtin_generic_table();
+        for (var, lo, hi) in [
+            ("wrf_swupt", 0.0, 1100.0),
+            ("wrf_swuptc", 0.0, 1100.0),
+            ("wrf_swdnt", 0.0, 1400.0),
+            ("wrf_swdntc", 0.0, 1400.0),
+            ("wrf_swupb", 0.0, 1100.0),
+            ("wrf_swupbc", 0.0, 1100.0),
+            ("wrf_swdnb", 0.0, 1100.0),
+            ("wrf_swdnbc", 0.0, 1100.0),
+            ("wrf_swdown", 0.0, 1100.0),
+            ("wrf_lwupt", 80.0, 340.0),
+            ("wrf_lwuptc", 80.0, 340.0),
+            ("wrf_lwupb", 200.0, 650.0),
+            ("wrf_lwdnb", 100.0, 500.0),
+            ("wrf_lwdnbc", 100.0, 500.0),
+            ("wrf_glw", 100.0, 500.0),
+            ("wrf_olr", 80.0, 340.0),
+        ] {
+            let table = solar_model_field_table(var, "W m-2")
+                .unwrap_or_else(|| panic!("{var} must resolve a radiation ramp"));
+            assert_eq!(table.sample(lo), generic.sample(0.0), "{var} low end");
+            assert_eq!(table.sample(hi), generic.sample(100.0), "{var} high end");
+            assert_ne!(
+                table.sample(lo),
+                table.sample(hi),
+                "{var}: ramp must actually vary"
+            );
+        }
+    }
+
+    /// Signed surface-energy fluxes take the EXISTING Balance diverging ramp
+    /// rescaled symmetrically: zero flux sits exactly on the neutral center,
+    /// the extremes on the base ramp's extremes.
+    #[test]
+    fn raw_wrf_flux_fields_resolve_the_scaled_diverging_ramp() {
+        let balance = crate::balance_velocity_table();
+        for (var, units, max_abs) in [
+            ("wrf_hfx", "W m-2", 700.0_f32),
+            ("wrf_lh", "W m-2", 700.0),
+            ("wrf_grdflx", "W m-2", 300.0),
+            ("wrf_qfx", "kg m-2 s-1", 4.0e-4),
+            ("wrf_u10", "m s-1", 30.0),
+            ("wrf_v10", "m s-1", 30.0),
+        ] {
+            let table = solar_model_field_table(var, units)
+                .unwrap_or_else(|| panic!("{var} must resolve a diverging ramp"));
+            assert_eq!(
+                table.sample(0.0),
+                balance.sample(0.0),
+                "{var}: zero must sit on the neutral center"
+            );
+            assert_eq!(
+                table.sample(max_abs),
+                balance.sample(70.0),
+                "{var} positive end"
+            );
+            assert_eq!(
+                table.sample(-max_abs),
+                balance.sample(-70.0),
+                "{var} negative end"
+            );
+        }
+    }
+
+    /// Raw surface-met / precip / hail catalog entries land on the same
+    /// existing tables their canonical siblings use.
+    #[test]
+    fn raw_wrf_met_fields_resolve_their_solar_family_tables() {
+        // T2 (K) shades exactly like canonical temperature_2m.
+        let t2 = solar_model_field_table("wrf_t2", "K").expect("t2");
+        let canonical = solar_model_field_table("temperature_2m", "K").expect("canonical");
+        for value in [233.15_f32, 273.15, 300.0] {
+            assert_eq!(t2.sample(value), canonical.sample(value), "{value} K");
+        }
+        assert!(solar_model_field_table("wrf_tsk", "K").is_some());
+        assert!(solar_model_field_table("wrf_tmn", "K").is_some());
+
+        // TD2 takes the dew point table (not the temperature branch).
+        let td2 = solar_model_field_table("wrf_td2", "K").expect("td2");
+        assert_eq!(
+            td2.sample(280.0),
+            solar_dewpoint_table(TempUnit::Kelvin).sample(280.0)
+        );
+
+        // Frozen accumulations (mm) share the Solar precip ramp even though
+        // no substring heuristic can classify them.
+        let precip = solar_precip_table(DepthUnit::Millimetres);
+        for var in ["wrf_snownc", "wrf_graupelnc", "wrf_hailnc", "wrf_snow"] {
+            let table = solar_model_field_table(var, "mm")
+                .unwrap_or_else(|| panic!("{var} must resolve the precip ramp"));
+            assert_eq!(table.sample(20.0), precip.sample(20.0), "{var}");
+        }
+
+        // 10 m speed diagnostics use the Solar wind ramp, m/s-aware.
+        let wspd = solar_model_field_table("wrf_wspd10", "m s-1").expect("wspd10");
+        assert_eq!(
+            wspd.sample(20.0),
+            solar_wind_speed_table(SpeedUnit::MetersPerSecond).sample(20.0)
+        );
+
+        // NSSL hail maxima take the existing Analyst MEHS ladder.
+        let hail = solar_model_field_table("wrf_hail_maxk1", "mm").expect("hail");
+        assert_eq!(
+            hail.sample(30.0),
+            crate::builtin_hail_size_table().sample(30.0)
+        );
+
+        // Reflectivity / CAPE / helicity diagnostics keep their Solar ramps.
+        assert!(solar_model_field_table("wrf_refd_max", "dBZ").is_some());
+        assert!(solar_model_field_table("wrf_sb3cape", "J kg-1").is_some());
+        assert!(solar_model_field_table("wrf_effective_srh", "m2 s-2").is_some());
+    }
+
+    /// Percent-valued fields use the probability ramp directly; fraction-
+    /// valued ones use it rescaled to 0..1, so 0.75 shades exactly like 75 %.
+    #[test]
+    fn raw_wrf_fraction_and_percent_fields_use_the_probability_ramp() {
+        let percent = crate::builtin_probability_table();
+        let cloud = solar_model_field_table("wrf_cloudfrac_low", "%").expect("cloudfrac");
+        assert_eq!(cloud.sample(75.0), percent.sample(75.0));
+        let veg = solar_model_field_table("wrf_vegfra", "").expect("vegfra");
+        assert_eq!(veg.sample(75.0), percent.sample(75.0));
+        let albedo = solar_model_field_table("wrf_albedo", "").expect("albedo");
+        assert_eq!(albedo.sample(0.75), percent.sample(75.0));
+        let snowc = solar_model_field_table("wrf_snowc", "").expect("snowc");
+        assert_eq!(snowc.sample(1.0), percent.sample(100.0));
+    }
+
+    /// Catalog entries with no assigned family — and genuinely unknown raw
+    /// names — keep today's behavior: no table, so the caller's generic
+    /// normalized fallback still applies.
+    #[test]
+    fn unassigned_and_unknown_wrf_names_keep_the_generic_fallback() {
+        for (var, units) in [
+            ("wrf_psfc", "Pa"),
+            ("wrf_lu_index", ""),
+            ("wrf_xland", ""),
+            ("wrf_lwdnt", "W m-2"),
+            ("wrf_acswupt", "J m-2"),
+            ("wrf_wdir10", "degrees"),
+            ("wrf_cin", "J kg-1"),
+            ("wrf_mystery_field", "widgets"),
+            ("wrf_some_experimental_field", ""),
+        ] {
+            assert!(
+                solar_model_field_table(var, units).is_none(),
+                "{var} must keep the generic fallback"
+            );
+        }
     }
 
     #[test]

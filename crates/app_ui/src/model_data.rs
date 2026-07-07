@@ -493,7 +493,8 @@ impl ModelDataDock {
         self.plot_viewer.clear();
         if let Some(field) = self.viewer.wanted_field() {
             self.viewer.set_loading(&field.var);
-            self.worker.send(StoreRequest::LoadField(field));
+            self.worker
+                .send(StoreRequest::LoadField(store_field_key(field)));
         }
     }
 
@@ -534,10 +535,14 @@ impl ModelDataDock {
                 }
                 StoreResponse::HourVars(key, Ok(vars)) => {
                     if self.browser.selected() == Some(&key) {
-                        self.viewer.set_hour(key, vars);
+                        // Raw wrf_* vars show their catalog labels in the
+                        // picker; the load below translates back to store
+                        // names (`store_field_key`).
+                        self.viewer.set_hour(key, viewer_display_vars(vars));
                         if let Some(field) = self.viewer.wanted_field() {
                             self.viewer.set_loading(&field.var);
-                            self.worker.send(StoreRequest::LoadField(field));
+                            self.worker
+                                .send(StoreRequest::LoadField(store_field_key(field)));
                         }
                     }
                 }
@@ -545,11 +550,19 @@ impl ModelDataDock {
                     self.viewer.set_error(message);
                 }
                 StoreResponse::Field(key, boxed) => match *boxed {
-                    Ok(field) => {
+                    Ok(mut field) => {
+                        // `latest_field` keeps the STORE name: every consumer
+                        // outside the dock (map layers, Solar palette
+                        // resolution, 🎨 bindings, OA) stays keyed by real
+                        // store variables. Only the viewer's copy carries the
+                        // display label, so its stale-check matches the
+                        // label-named selection.
                         self.latest_field = Some(std::sync::Arc::new(field.clone()));
+                        field.key = display_field_key(field.key);
                         self.viewer.set_field(field);
                     }
                     Err(message) => {
+                        let key = display_field_key(key);
                         if self.viewer.wanted_field().as_ref() == Some(&key) {
                             self.viewer.set_error(message);
                         }
@@ -1794,7 +1807,10 @@ impl ModelDataDock {
                 Some(FieldViewerEvent::VarSelected(var)) => {
                     self.viewer.set_loading(&var);
                     if let Some(field) = self.viewer.wanted_field() {
-                        self.worker.send(StoreRequest::LoadField(field));
+                        // The viewer selects by display label; the worker
+                        // loads by store name.
+                        self.worker
+                            .send(StoreRequest::LoadField(store_field_key(field)));
                     }
                 }
                 Some(FieldViewerEvent::PointClicked { fx, fy }) => {
@@ -1821,10 +1837,13 @@ impl ModelDataDock {
 
         // v0.2.3 custom-domain native plot, as a floating window. Rendered
         // after the field viewer so a domain selected this frame shows at once.
-        // `current_field()` borrows `self.viewer` immutably while the closure
-        // holds `&mut self.plot_viewer` — disjoint fields, so this is sound.
+        // The STORE-NAMED twin of the viewer's field goes in (the native plot
+        // pipeline styles by store variable, and the viewer's copy may carry
+        // a display label). Borrows `self.viewer`/`self.latest_field`
+        // immutably while the closure holds `&mut self.plot_viewer` —
+        // disjoint fields, so this is sound.
         if self.show_plot_viewer {
-            let field = self.viewer.current_field();
+            let field = store_named_current_field(&self.viewer, self.latest_field.as_deref());
             let mut open = true;
             egui::Window::new("🗺 Native plot")
                 .open(&mut open)
@@ -1837,14 +1856,16 @@ impl ModelDataDock {
             }
         }
 
-        // v0.2.3 editable color tables. `current_field()` borrows `self.viewer`
-        // for the panel, so it is scoped and dropped BEFORE apply — which
-        // reloads the field and thus needs `self.viewer` mutably.
+        // v0.2.3 editable color tables. The STORE-NAMED twin goes in so the
+        // editor's product bindings stay keyed by real store variables (the
+        // worker resolves overrides against those). The borrow is scoped and
+        // dropped BEFORE apply — which reloads the field and thus needs
+        // `self.viewer` mutably.
         if self.show_color_tables {
             let mut open = true;
             let mut changed = false;
             {
-                let field = self.viewer.current_field();
+                let field = store_named_current_field(&self.viewer, self.latest_field.as_deref());
                 egui::Window::new("🎨 Color tables")
                     .open(&mut open)
                     .default_size([520.0, 520.0])
@@ -1888,6 +1909,59 @@ fn model_run_time_utc(run: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         naive.and_hms_opt(cycle_hour, 0, 0)?,
         chrono::Utc,
     ))
+}
+
+/// Display-time picker names: swap each raw `wrf_*` store variable for its
+/// friendly catalog label (`color_tables::wrf_fields`) before the list
+/// reaches the rw-ui field viewer, whose combo shows `name (units)` verbatim.
+/// Canonical and unknown names pass through untouched. Nothing on disk is
+/// renamed — existing imported stores get the labels without a re-import.
+fn viewer_display_vars(mut vars: Vec<rw_ui::VarInfo>) -> Vec<rw_ui::VarInfo> {
+    for var in &mut vars {
+        if let Some(label) = color_tables::wrf_display_label(&var.name) {
+            var.name = label.to_owned();
+        }
+    }
+    vars
+}
+
+/// Inverse of [`viewer_display_vars`] for LOAD requests: the viewer selects
+/// by display label, the store worker loads by store name. Catalog labels
+/// always contain a character no store slug can (space/case/arrow — test-
+/// enforced in `color_tables::wrf_fields`), so a real store name can never be
+/// mistranslated here.
+fn store_field_key(mut key: rw_ui::FieldKey) -> rw_ui::FieldKey {
+    if let Some(store) = color_tables::wrf_store_name_for_label(&key.var) {
+        key.var = store.to_owned();
+    }
+    key
+}
+
+/// Store → display for keys headed INTO the viewer: loaded fields and error
+/// keys must match the viewer's label-named selection or its stale-response
+/// check drops them.
+fn display_field_key(mut key: rw_ui::FieldKey) -> rw_ui::FieldKey {
+    if let Some(label) = color_tables::wrf_display_label(&key.var) {
+        key.var = label.to_owned();
+    }
+    key
+}
+
+/// The store-named twin of the viewer's current field, for panels that must
+/// see REAL store variables — the native plot pipeline and the 🎨 editor's
+/// product bindings (both key styles/bindings by store name). `latest_field`
+/// keeps store names, so hand it out gated on actually being the field the
+/// viewer currently shows.
+fn store_named_current_field<'a>(
+    viewer: &'a FieldViewerPanel,
+    latest: Option<&'a rw_ui::FieldData>,
+) -> Option<&'a rw_ui::FieldData> {
+    let current = viewer.current_field()?;
+    latest.filter(|latest| {
+        latest.key.hour == current.key.hour
+            && color_tables::wrf_display_label(&latest.key.var).unwrap_or(&latest.key.var)
+                == current.key.var
+    })
 }
 
 /// Whether these 🎨 editor settings bind an explicit user palette to
@@ -1983,6 +2057,75 @@ mod tests {
         // Deleting the table prunes its bindings — no dangling override.
         settings.remove_table("My temp");
         assert!(!user_style_override_active(&settings, &field));
+    }
+
+    fn test_var(name: &str, units: &str) -> rw_ui::VarInfo {
+        rw_ui::VarInfo {
+            name: name.to_owned(),
+            units: units.to_owned(),
+            kind: rw_ui::VarKind::Surface2D,
+            levels_hpa: Vec::new(),
+        }
+    }
+
+    fn test_hour_key() -> HourKey {
+        HourKey {
+            model: "wrf".to_owned(),
+            run: "local_wrf_19740403_090000".to_owned(),
+            hour: 0,
+        }
+    }
+
+    /// Display-time renaming: raw `wrf_*` names swap to their catalog labels
+    /// for the picker (units untouched — the combo appends them), canonical
+    /// and unknown names pass through byte-for-byte.
+    #[test]
+    fn picker_vars_show_catalog_labels_and_pass_unknowns_through() {
+        let vars = viewer_display_vars(vec![
+            test_var("wrf_swupt", "W m-2"),
+            test_var("wrf_hfx", "W m-2"),
+            test_var("temperature_2m", "K"),
+            test_var("wrf_some_experimental_field", "1"),
+        ]);
+        let names: Vec<&str> = vars.iter().map(|var| var.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Shortwave ↑ TOA — reflected solar",
+                "Sensible heat flux (HFX)",
+                "temperature_2m",
+                "wrf_some_experimental_field",
+            ]
+        );
+        assert!(
+            vars.iter().all(|var| !var.units.is_empty()),
+            "units must ride along untouched"
+        );
+    }
+
+    /// Load-key translation must invert the display rename for EVERY catalog
+    /// entry (a picker label that failed to translate back would make the
+    /// store worker load a nonexistent variable), and must leave canonical /
+    /// unknown keys untouched in both directions.
+    #[test]
+    fn field_keys_round_trip_between_display_and_store_names() {
+        for (store, info) in color_tables::wrf_field_catalog() {
+            let displayed = display_field_key(rw_ui::FieldKey {
+                hour: test_hour_key(),
+                var: (*store).to_owned(),
+            });
+            assert_eq!(displayed.var, info.label, "{store}: store -> display");
+            let restored = store_field_key(displayed);
+            assert_eq!(restored.var, *store, "{store}: display -> store");
+        }
+        for var in ["temperature_2m", "sbcape", "wrf_not_in_the_catalog"] {
+            let key = rw_ui::FieldKey {
+                hour: test_hour_key(),
+                var: var.to_owned(),
+            };
+            assert_eq!(display_field_key(key.clone()).var, var);
+            assert_eq!(store_field_key(key).var, var);
+        }
     }
 
     /// Size-gate parity: the light import must warn on the same class of
