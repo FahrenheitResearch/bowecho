@@ -998,6 +998,10 @@ const RADAR_OPERATIONAL_STATUS_DISPLAY_ROWS: usize = 8;
 const RADAR_STATUS_PAGE_URL: &str = "https://radar.weather.gov/";
 const MAP_DRAG_DEAD_ZONE_PX: f32 = 3.0;
 const VOL3D_BOX_DRAG_MIN_PX: f32 = 12.0;
+/// Minimum on-screen edge for a map-drawn model plot-domain box (📐 arm /
+/// Ctrl+Shift+drag) — same guard as the 3D box: a sub-pixel-ish twitch is a
+/// slip, not a domain.
+const PLOT_DOMAIN_BOX_MIN_PX: f32 = 12.0;
 const VOL3D_BOX_DRAG_MIN_HALF_KM: f32 = 5.0;
 const VOL3D_BOX_DRAG_MAX_HALF_KM: f32 = 240.0;
 const STORM_TRACK_CLICK_TOLERANCE_PX: f32 = 12.0;
@@ -2236,6 +2240,16 @@ struct Vol3dMapBoxDrag {
     current: egui::Pos2,
 }
 
+/// In-flight screen-space drag of a model plot-domain box on the map
+/// (v0.29.3: armed 📐 button or Ctrl+Shift+drag). Same shape as
+/// [`Vol3dMapBoxDrag`], kept separate so the two selectors can never
+/// swallow each other's state.
+#[derive(Clone, Copy, Debug)]
+struct PlotDomainMapDrag {
+    start: egui::Pos2,
+    current: egui::Pos2,
+}
+
 struct ViewerApp {
     source_path: Option<PathBuf>,
     renderer_backend: &'static str,
@@ -2394,6 +2408,7 @@ struct ViewerApp {
     map_center_lat: f32,
     map_scale: f32,
     vol3d_map_box_drag: Option<Vol3dMapBoxDrag>,
+    plot_domain_map_drag: Option<PlotDomainMapDrag>,
     place_search_query: String,
     coordinate_marker: Option<CoordinateMarker>,
     radar_range_km: f32,
@@ -7524,6 +7539,7 @@ impl ViewerApp {
             map_center_lat,
             map_scale: DEFAULT_MAP_SCALE,
             vol3d_map_box_drag: None,
+            plot_domain_map_drag: None,
             place_search_query: String::new(),
             coordinate_marker: None,
             radar_range_km: DEFAULT_RADAR_RANGE_KM,
@@ -27640,8 +27656,17 @@ impl ViewerApp {
             let pointer = ui
                 .input(|input| input.pointer.interact_pos().or(input.pointer.hover_pos()))
                 .map(|position| Self::clamp_screen_position_to_rect(rect, position));
+            // Start gate is LAYER-AWARE (`rect_contains_pointer`), not raw
+            // `rect.contains`: the raw check read true with the pointer over
+            // a floating window covering the map, so a Shift+right-drag ON
+            // THE MODEL WINDOW'S FIELD VIEWER (a legit rusty-weather plot-
+            // domain gesture) also started a 3D box down here and popped the
+            // 3D viewer on release — the v0.29.3 owner-reported collision.
+            // An in-flight drag still tracks anywhere (`was_dragging`).
             if let Some(pointer) = pointer
-                && (was_dragging || response.hovered() || rect.contains(pointer))
+                && (was_dragging
+                    || response.hovered()
+                    || ui.ctx().rect_contains_pointer(response.layer_id, rect))
             {
                 if let Some(drag) = &mut self.vol3d_map_box_drag {
                     drag.current = pointer;
@@ -27748,6 +27773,225 @@ impl ViewerApp {
         true
     }
 
+    /// True while the Model window's 📐 "Draw plot box" arm is on AND that
+    /// window/pane is actually open — the arming button must stay visible,
+    /// so a closed Model window never leaves the map silently hijacked.
+    fn plot_domain_arm_active(&self) -> bool {
+        self.model_dock_open
+            && self
+                .model_dock
+                .as_ref()
+                .is_some_and(|dock| dock.plot_domain_armed())
+    }
+
+    /// The Ctrl+Shift+drag shortcut only engages when the box can land
+    /// somewhere visible: Model window open with a loaded field. Otherwise
+    /// the chord falls through to the plain pan it has always been.
+    fn plot_domain_shortcut_ready(&self) -> bool {
+        self.model_dock_open
+            && self
+                .model_dock
+                .as_ref()
+                .is_some_and(|dock| dock.latest_field().is_some())
+    }
+
+    /// Cancel path for the map-side plot-box tool: drops any in-flight drag
+    /// and the 📐 arm (Esc, right-click while armed, or a Model window that
+    /// went away).
+    fn cancel_plot_domain_map_box(&mut self) {
+        self.plot_domain_map_drag = None;
+        if let Some(dock) = self.model_dock.as_mut() {
+            dock.set_plot_domain_armed(false);
+        }
+        self.status = "Plot-box draw cancelled".to_owned();
+    }
+
+    /// The map-side custom plot-domain box tool (v0.29.3 gesture-collision
+    /// fix): owns the pointer while the 📐 arm from the Model window is on,
+    /// or while a Ctrl+Shift+drag box is in flight. Runs BEFORE the 3D box
+    /// handler and the pan/click dispatch, so while engaged none of them
+    /// fire — the owner-reported bug was exactly this gesture landing in
+    /// the 3D box selector instead.
+    ///
+    /// State machine: armed → (primary drag) drawing → released ≥ min size →
+    /// applied + auto-disarm. Esc cancels arm AND drag; right-click cancels
+    /// the arm (the armed-tool grammar: left draws, right clears); a
+    /// too-small box keeps the arm so the user just redraws. Zoom stays
+    /// live throughout, like every other armed map tool.
+    fn handle_plot_domain_map_box_input(
+        &mut self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        response: &egui::Response,
+        allowed: bool,
+    ) -> bool {
+        // The arm button lives in the Model window: with that window gone,
+        // drop the arm instead of keeping an invisible mode latched.
+        if !self.model_dock_open
+            && let Some(dock) = self.model_dock.as_mut()
+            && dock.plot_domain_armed()
+        {
+            dock.set_plot_domain_armed(false);
+        }
+        let armed = self.plot_domain_arm_active();
+        let was_dragging = self.plot_domain_map_drag.is_some();
+        let active_for_rect = self
+            .plot_domain_map_drag
+            .is_some_and(|drag| rect.contains(drag.start));
+        if was_dragging && !active_for_rect {
+            // Drag in flight in another grid pane: this pane sees no pointer
+            // events, but while armed it still owns its surface.
+            return armed && allowed;
+        }
+        if !allowed {
+            // A higher-priority armed tool (cross-section, Vrot, annotate)
+            // owns the map; a half-finished box cannot complete under it.
+            self.plot_domain_map_drag = None;
+            return false;
+        }
+
+        if (armed || was_dragging) && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.cancel_plot_domain_map_box();
+            ui.ctx().request_repaint();
+            return true;
+        }
+        if armed && !was_dragging && response.secondary_clicked() {
+            self.cancel_plot_domain_map_box();
+            ui.ctx().request_repaint();
+            return true;
+        }
+
+        if armed && (was_dragging || response.hovered()) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+
+        let shortcut = self.plot_domain_shortcut_ready()
+            && plot_domain_shortcut_active(ui.input(|input| input.modifiers));
+        if !was_dragging
+            && (armed || shortcut)
+            && response.drag_started_by(egui::PointerButton::Primary)
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            let pointer = Self::clamp_screen_position_to_rect(rect, pointer);
+            self.plot_domain_map_drag = Some(PlotDomainMapDrag {
+                start: pointer,
+                current: pointer,
+            });
+            ui.ctx().request_repaint();
+            return true;
+        }
+
+        if was_dragging {
+            if response.dragged_by(egui::PointerButton::Primary)
+                && let Some(pointer) = response.interact_pointer_pos()
+                && let Some(drag) = self.plot_domain_map_drag.as_mut()
+            {
+                drag.current = Self::clamp_screen_position_to_rect(rect, pointer);
+                ui.ctx().request_repaint();
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary)
+                && let Some(drag) = self.plot_domain_map_drag.take()
+            {
+                self.apply_plot_domain_map_selection(rect, drag);
+                ui.ctx().request_repaint();
+            }
+            return true;
+        }
+
+        armed
+    }
+
+    /// Convert a finished map-box drag into a geographic plot domain and
+    /// hand it to the model dock's native plot viewer (which auto-disarms
+    /// the 📐 arm). Returns false — keeping the arm — for boxes under the
+    /// minimum pixel size, mirroring the 3D box selector's slip guard.
+    fn apply_plot_domain_map_selection(
+        &mut self,
+        rect: egui::Rect,
+        drag: PlotDomainMapDrag,
+    ) -> bool {
+        let start = Self::clamp_screen_position_to_rect(rect, drag.start);
+        let current = Self::clamp_screen_position_to_rect(rect, drag.current);
+        let selection = egui::Rect::from_two_pos(start, current);
+        if selection.width() < PLOT_DOMAIN_BOX_MIN_PX || selection.height() < PLOT_DOMAIN_BOX_MIN_PX
+        {
+            return false;
+        }
+        if self.model_dock.is_none() {
+            return false;
+        }
+        let corner_a = self.screen_to_lon_lat(rect, selection.left_top());
+        let corner_b = self.screen_to_lon_lat(rect, selection.right_bottom());
+        let bounds = plot_domain_bounds_from_corners(corner_a, corner_b);
+        let domain = rw_ui::CustomDomain::generated(bounds);
+        let label = domain.bounds_label();
+        if let Some(dock) = self.model_dock.as_mut() {
+            dock.apply_map_plot_domain(domain);
+        }
+        // The domain landed in the Model window's native plot viewer —
+        // make sure that window is up so the result is visible at once.
+        self.model_dock_open = true;
+        self.status = format!("Plot domain set: {label}");
+        true
+    }
+
+    /// Overlay for the map-side plot-box tool: the armed hint chip (until a
+    /// drag starts) and the in-progress box. Amber styling, distinct from
+    /// the blue 3D box selection. `show_hint` is true for the pane that
+    /// should carry the chip (the single pane, or grid cell 0).
+    fn draw_plot_domain_map_box(&self, painter: &egui::Painter, rect: egui::Rect, show_hint: bool) {
+        if show_hint && self.plot_domain_map_drag.is_none() && self.plot_domain_arm_active() {
+            let label = "drag to draw plot box — Esc to cancel";
+            let width = chip_width_for_text(label);
+            let chip = egui::Rect::from_min_size(
+                egui::pos2(rect.center().x - width * 0.5, rect.top() + 10.0),
+                egui::vec2(width, 20.0),
+            );
+            painter.rect_filled(
+                chip,
+                4.0,
+                egui::Color32::from_rgba_unmultiplied(122, 86, 22, 235),
+            );
+            painter.text(
+                chip.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_rgb(255, 233, 195),
+            );
+        }
+        let Some(drag) = self.plot_domain_map_drag else {
+            return;
+        };
+        if !rect.contains(drag.start) {
+            return;
+        }
+        let start = Self::clamp_screen_position_to_rect(rect, drag.start);
+        let current = Self::clamp_screen_position_to_rect(rect, drag.current);
+        let selection = egui::Rect::from_two_pos(start, current);
+        if selection.width() < 1.0 || selection.height() < 1.0 {
+            return;
+        }
+        painter.rect_filled(
+            selection,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(255, 183, 77, 26),
+        );
+        painter.rect_stroke(
+            selection,
+            0.0,
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 196, 90)),
+            egui::StrokeKind::Outside,
+        );
+        painter.text(
+            selection.left_top() + egui::vec2(6.0, 6.0),
+            egui::Align2::LEFT_TOP,
+            "model plot box",
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_rgb(255, 236, 200),
+        );
+    }
+
     fn single_pane_canvas(
         &mut self,
         ui: &mut egui::Ui,
@@ -27767,11 +28011,24 @@ impl ViewerApp {
         } else {
             false
         };
-        let vol3d_box_drag_owns_pointer = self.handle_vol3d_map_box_drag_input(
+        // Plot-domain box (📐 armed / Ctrl+Shift+drag) outranks the 3D box:
+        // both are drag-a-box selectors, and the collision this ordering
+        // fixes was the plot gesture landing in the 3D selector.
+        let plot_box_owns_pointer = self.handle_plot_domain_map_box_input(
             ui,
             rect,
             response,
             !armed && !vrot_armed && !annotating && !cross_section_handle_owns_pointer,
+        );
+        let vol3d_box_drag_owns_pointer = self.handle_vol3d_map_box_drag_input(
+            ui,
+            rect,
+            response,
+            !armed
+                && !vrot_armed
+                && !annotating
+                && !cross_section_handle_owns_pointer
+                && !plot_box_owns_pointer,
         );
 
         // GBVTD click-to-place: when armed, the next left-click on the radar
@@ -27782,6 +28039,7 @@ impl ViewerApp {
             && !vrot_armed
             && !annotating
             && !cross_section_handle_owns_pointer
+            && !plot_box_owns_pointer
             && !vol3d_box_drag_owns_pointer;
         if gbvtd_placing
             && response.clicked()
@@ -27795,6 +28053,7 @@ impl ViewerApp {
         if !armed
             && !annotating
             && !cross_section_handle_owns_pointer
+            && !plot_box_owns_pointer
             && !vol3d_box_drag_owns_pointer
             && !gbvtd_placing
             && response.dragged()
@@ -27853,6 +28112,7 @@ impl ViewerApp {
         } else if !self.cross_section_armed
             && !self.vrot_tool_armed
             && !cross_section_handle_owns_pointer
+            && !plot_box_owns_pointer
             && !vol3d_box_drag_owns_pointer
             && plain_context_menu_allowed(
                 ui.input(|input| input.modifiers),
@@ -27938,6 +28198,7 @@ impl ViewerApp {
             && !vrot_armed
             && !annotating
             && !cross_section_handle_owns_pointer
+            && !plot_box_owns_pointer
             && !gbvtd_placing
             && shift_held
             && response.clicked()
@@ -27951,6 +28212,7 @@ impl ViewerApp {
             && !vrot_armed
             && !annotating
             && !cross_section_handle_owns_pointer
+            && !plot_box_owns_pointer
             && !gbvtd_placing
             && plain_click
             && response.clicked()
@@ -28005,6 +28267,7 @@ impl ViewerApp {
             && !self.vrot_tool_armed
             && !self.farm.drape.place_armed
             && !cross_section_handle_owns_pointer
+            && !plot_box_owns_pointer
             && !vol3d_box_drag_owns_pointer
             && response.secondary_clicked()
             && let Some(pointer) = response.interact_pointer_pos()
@@ -28042,6 +28305,9 @@ impl ViewerApp {
         } else if cross_section_handle_owns_pointer {
             // Endpoint handles own their drags/clicks; do not also pan,
             // select hazards, or restart the section underneath.
+        } else if plot_box_owns_pointer {
+            // The plot-domain box tool (📐 armed / Ctrl+Shift+drag) owns the
+            // pointer: no soundings, best-radar switch, or Vrot underneath.
         } else if armed {
             if response.clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
@@ -28178,6 +28444,7 @@ impl ViewerApp {
         self.draw_raw_velocity_tag(painter, rect);
         self.draw_cross_section_line(painter, rect, response.hover_pos());
         self.draw_vol3d_map_box_drag(painter, rect);
+        self.draw_plot_domain_map_box(painter, rect, true);
         self.draw_center_crosshair(painter, rect);
         self.draw_cursor_inspector(painter, rect, response.hover_pos());
         self.show_community_feed_menu(ui, rect);
@@ -28251,11 +28518,23 @@ impl ViewerApp {
             } else {
                 false
             };
-            let vol3d_box_drag_owns_pointer = self.handle_vol3d_map_box_drag_input(
+            // Plot-domain box outranks the 3D box — see the single-pane
+            // handler for the collision this ordering fixes.
+            let plot_box_owns_pointer = self.handle_plot_domain_map_box_input(
                 ui,
                 cell,
                 &response,
                 !armed && !vrot_armed && !annotation_active && !cross_section_handle_owns_pointer,
+            );
+            let vol3d_box_drag_owns_pointer = self.handle_vol3d_map_box_drag_input(
+                ui,
+                cell,
+                &response,
+                !armed
+                    && !vrot_armed
+                    && !annotation_active
+                    && !cross_section_handle_owns_pointer
+                    && !plot_box_owns_pointer,
             );
 
             // Shared pan: dragging any cell moves every pane in sync. Vrot
@@ -28263,6 +28542,7 @@ impl ViewerApp {
             if !armed
                 && !annotation_active
                 && !cross_section_handle_owns_pointer
+                && !plot_box_owns_pointer
                 && !vol3d_box_drag_owns_pointer
                 && response.dragged()
             {
@@ -28328,6 +28608,7 @@ impl ViewerApp {
                 && !vrot_armed
                 && !annotation_active
                 && !cross_section_handle_owns_pointer
+                && !plot_box_owns_pointer
                 && !vol3d_box_drag_owns_pointer
                 && shift_held
                 && response.clicked()
@@ -28340,6 +28621,7 @@ impl ViewerApp {
                 && !vrot_armed
                 && !annotation_active
                 && !cross_section_handle_owns_pointer
+                && !plot_box_owns_pointer
                 && !vol3d_box_drag_owns_pointer
                 && alt_model_sounding
             {
@@ -28359,6 +28641,7 @@ impl ViewerApp {
                 && !vrot_armed
                 && !annotation_active
                 && !cross_section_handle_owns_pointer
+                && !plot_box_owns_pointer
                 && !vol3d_box_drag_owns_pointer
                 && ctrl_best_radar
                 && response.clicked()
@@ -28381,6 +28664,7 @@ impl ViewerApp {
                 && !vrot_armed
                 && !annotation_active
                 && !cross_section_handle_owns_pointer
+                && !plot_box_owns_pointer
                 && !vol3d_box_drag_owns_pointer
                 && plain_click
                 && response.clicked()
@@ -28433,6 +28717,7 @@ impl ViewerApp {
                 && !vrot_armed
                 && !annotation_active
                 && !cross_section_handle_owns_pointer
+                && !plot_box_owns_pointer
                 && !vol3d_box_drag_owns_pointer
                 && response.secondary_clicked()
                 && let Some(pointer) = response.interact_pointer_pos()
@@ -28497,6 +28782,7 @@ impl ViewerApp {
                 && !annotation_active
                 && !self.farm.drape.place_armed
                 && !cross_section_handle_owns_pointer
+                && !plot_box_owns_pointer
                 && !vol3d_box_drag_owns_pointer
                 && plain_context_menu_allowed(
                     modifiers,
@@ -28508,6 +28794,9 @@ impl ViewerApp {
 
             if cross_section_handle_owns_pointer {
                 // Endpoint handles own their drags/clicks in grid panes too.
+            } else if plot_box_owns_pointer {
+                // The plot-domain box tool owns this pane's pointer — no
+                // cross-section or Vrot dispatch underneath.
             } else if armed {
                 if response.clicked()
                     && let Some(pointer) = response.interact_pointer_pos()
@@ -28648,6 +28937,7 @@ impl ViewerApp {
                 hovers.get(cell_index).copied().flatten(),
             );
             self.draw_vol3d_map_box_drag(&cell_painter, cell);
+            self.draw_plot_domain_map_box(&cell_painter, cell, cell_index == 0);
             self.draw_center_crosshair(&cell_painter, cell);
             self.draw_vrot_tool(&cell_painter, cell);
             self.pane_info_bar(ui, &cell_painter, cell, cell_index, &pane_product, pane_cut);
@@ -38619,6 +38909,13 @@ impl ViewerApp {
         if !(self.inspector_show_loupe || shift_held) {
             return;
         }
+        // v0.29.3: while the plot-domain box tool is engaged the drag must
+        // not summon the magnifier mid-box (owner constraint) — Ctrl+SHIFT
+        // holds Shift down, and the armed mode owns the surface outright.
+        // Loupe behavior everywhere else is untouched.
+        if self.plot_domain_map_drag.is_some() || self.plot_domain_arm_active() {
+            return;
+        }
         if !rect.contains(anchor) {
             return;
         }
@@ -45668,6 +45965,30 @@ fn plain_map_click_allowed(modifiers: egui::Modifiers, model_soundings_available
 
 fn plain_context_menu_allowed(modifiers: egui::Modifiers, right_click_loads_nearest: bool) -> bool {
     !modifiers.ctrl && !right_click_loads_nearest
+}
+
+/// The map-side plot-domain shortcut chord: Ctrl+Shift (+ primary drag).
+/// The one modifier+drag combo with no dedicated map consumer (v0.29.3
+/// gesture audit): Shift alone is loupe/inspector-pin territory and pans on
+/// drag; Ctrl alone is the best-radar click; every Alt combo belongs to the
+/// sounding family — Alt is excluded here so Ctrl+Alt fluid soundings can
+/// never collide even with Shift accidentally down; and the 3D box stays on
+/// Shift+RIGHT-drag. Only engages at all when the Model window is open with
+/// a loaded field ([`ViewerApp::plot_domain_shortcut_ready`]) — otherwise
+/// the chord keeps panning like it always did.
+fn plot_domain_shortcut_active(modifiers: egui::Modifiers) -> bool {
+    modifiers.ctrl && modifiers.shift && !modifiers.alt
+}
+
+/// Two screen-corner (lon, lat) samples -> rw-ui plot-domain bounds
+/// `(west, east, south, north)`, whichever way the box was dragged.
+fn plot_domain_bounds_from_corners(a: (f32, f32), b: (f32, f32)) -> (f64, f64, f64, f64) {
+    (
+        f64::from(a.0.min(b.0)),
+        f64::from(a.0.max(b.0)),
+        f64::from(a.1.min(b.1)),
+        f64::from(a.1.max(b.1)),
+    )
 }
 
 fn chip_width_for_text(text: &str) -> f32 {
@@ -75394,6 +75715,7 @@ mod tests {
             map_center_lat: 0.0,
             map_scale: 100.0,
             vol3d_map_box_drag: None,
+            plot_domain_map_drag: None,
             place_search_query: String::new(),
             coordinate_marker: None,
             radar_range_km: DEFAULT_RADAR_RANGE_KM,
@@ -76572,6 +76894,68 @@ mod tests {
         assert!(!plain_map_click_allowed(shift, true));
     }
 
+    /// v0.29.3 gesture audit, encoded: Ctrl+Shift+drag is the ONE free
+    /// modifier chord on the map, so the plot-domain shortcut may claim it —
+    /// and it must not overlap any spoken-for chord.
+    #[test]
+    fn plot_domain_shortcut_is_the_free_combo() {
+        let ctrl_shift = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert!(plot_domain_shortcut_active(ctrl_shift));
+        // Nothing else claims Ctrl+Shift: best-radar requires !shift, plain
+        // clicks require !shift, the sounding family requires alt.
+        assert!(!ctrl_best_radar_click(ctrl_shift));
+        assert!(!plain_map_click_allowed(ctrl_shift, true));
+        assert!(!alt_model_sounding_active(ctrl_shift, true));
+
+        // And the shortcut claims nothing that IS spoken for.
+        let ctrl_alt_shift = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert!(
+            !plot_domain_shortcut_active(ctrl_alt_shift),
+            "Ctrl+Alt fluid soundings keep working even with Shift down"
+        );
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert!(
+            !plot_domain_shortcut_active(shift),
+            "Shift alone stays loupe / inspector pin / pan"
+        );
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert!(
+            !plot_domain_shortcut_active(ctrl),
+            "Ctrl alone stays the best-radar click"
+        );
+    }
+
+    #[test]
+    fn plot_domain_bounds_order_any_drag_direction() {
+        // North-east drag and south-west drag produce identical bounds.
+        let bounds = plot_domain_bounds_from_corners((-99.5, 36.2), (-97.0, 34.1));
+        let flipped = plot_domain_bounds_from_corners((-97.0, 34.1), (-99.5, 36.2));
+        assert_eq!(bounds, flipped);
+        let (west, east, south, north) = bounds;
+        assert!(west < east);
+        assert!(south < north);
+        // f32 corners widen to f64 bounds: compare within f32 precision.
+        assert!((west - -99.5).abs() < 1e-4);
+        assert!((east - -97.0).abs() < 1e-4);
+        assert!((south - 34.1).abs() < 1e-4);
+        assert!((north - 36.2).abs() < 1e-4);
+    }
+
     #[test]
     fn radar_operational_status_parser_reads_nws_alarm_messages() {
         let station_json = r#"{
@@ -76845,6 +77229,145 @@ mod tests {
         assert!((target_lon - expected_lon).abs() < 1e-5);
         assert!(app.vol3d.volume_key.is_none());
         assert!(app.vol3d.status.contains("selected"));
+    }
+
+    /// v0.29.3 arm-button state machine, completion path: a finished map box
+    /// becomes the active plot domain (geographic bounds, rotation 0), the
+    /// native plot viewer opens on it, and the 📐 arm auto-disarms.
+    #[test]
+    fn plot_domain_map_selection_disarms_and_targets_plot_viewer() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.map_center_lat = 35.0;
+        app.map_center_lon = -97.0;
+        app.map_scale = 100.0;
+        let ctx = egui::Context::default();
+        let mut dock = model_data::ModelDataDock::new_for_test(
+            &ctx,
+            test_model_store_tree("hrrr", "20260615_17z", &[0]),
+        );
+        dock.set_plot_domain_armed(true);
+        app.model_dock = Some(dock);
+        app.model_dock_open = true;
+
+        let rect = test_map_rect();
+        let start = rect.center() + egui::vec2(-80.0, -50.0);
+        let current = rect.center() + egui::vec2(60.0, 70.0);
+        let selection = egui::Rect::from_two_pos(start, current);
+        let (west_lon, north_lat) = app.screen_to_lon_lat(rect, selection.left_top());
+        let (east_lon, south_lat) = app.screen_to_lon_lat(rect, selection.right_bottom());
+
+        assert!(app.apply_plot_domain_map_selection(rect, PlotDomainMapDrag { start, current }));
+
+        let dock = app.model_dock.as_ref().expect("dock kept");
+        assert!(!dock.plot_domain_armed(), "a completed box auto-disarms");
+        assert!(dock.plot_viewer_shown_for_test());
+        let domain = dock
+            .active_plot_domain_for_test()
+            .expect("map box became the active plot domain");
+        let (west, east, south, north) = domain.bounds;
+        assert!((west - f64::from(west_lon)).abs() < 1e-4);
+        assert!((east - f64::from(east_lon)).abs() < 1e-4);
+        assert!((south - f64::from(south_lat)).abs() < 1e-4);
+        assert!((north - f64::from(north_lat)).abs() < 1e-4);
+        assert_eq!(domain.rotation_deg, 0.0);
+        assert!(app.model_dock_open);
+        assert!(app.status.starts_with("Plot domain set"));
+    }
+
+    /// A slip (box under the pixel minimum) neither disarms nor sets a
+    /// domain — the user stays armed and just redraws bigger.
+    #[test]
+    fn tiny_plot_domain_map_drag_keeps_the_arm() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.map_center_lat = 35.0;
+        app.map_center_lon = -97.0;
+        let ctx = egui::Context::default();
+        let mut dock = model_data::ModelDataDock::new_for_test(
+            &ctx,
+            test_model_store_tree("hrrr", "20260615_17z", &[0]),
+        );
+        dock.set_plot_domain_armed(true);
+        app.model_dock = Some(dock);
+        app.model_dock_open = true;
+
+        let rect = test_map_rect();
+        let start = rect.center();
+        let current = rect.center() + egui::vec2(PLOT_DOMAIN_BOX_MIN_PX - 4.0, 40.0);
+
+        assert!(!app.apply_plot_domain_map_selection(rect, PlotDomainMapDrag { start, current }));
+
+        let dock = app.model_dock.as_ref().expect("dock kept");
+        assert!(dock.plot_domain_armed(), "slip keeps the arm");
+        assert!(!dock.plot_viewer_shown_for_test());
+        assert!(dock.active_plot_domain_for_test().is_none());
+    }
+
+    /// Cancel path: Esc / right-click funnel through
+    /// `cancel_plot_domain_map_box`, which must clear both the in-flight
+    /// drag and the dock's 📐 arm.
+    #[test]
+    fn plot_domain_cancel_clears_drag_and_arm() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        let mut dock = model_data::ModelDataDock::new_for_test(
+            &ctx,
+            test_model_store_tree("hrrr", "20260615_17z", &[0]),
+        );
+        dock.set_plot_domain_armed(true);
+        app.model_dock = Some(dock);
+        app.model_dock_open = true;
+        let rect = test_map_rect();
+        app.plot_domain_map_drag = Some(PlotDomainMapDrag {
+            start: rect.center(),
+            current: rect.center() + egui::vec2(40.0, 40.0),
+        });
+        assert!(app.plot_domain_arm_active());
+
+        app.cancel_plot_domain_map_box();
+
+        assert!(app.plot_domain_map_drag.is_none());
+        assert!(!app.plot_domain_arm_active());
+        assert!(
+            !app.model_dock
+                .as_ref()
+                .expect("dock kept")
+                .plot_domain_armed()
+        );
+        assert_eq!(app.status, "Plot-box draw cancelled");
+    }
+
+    /// The Ctrl+Shift shortcut only engages with the Model window open and a
+    /// field loaded; the 📐 arm only counts while the window is open (the
+    /// arming button must stay visible).
+    #[test]
+    fn plot_domain_gates_require_open_model_window() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        assert!(!app.plot_domain_arm_active());
+        assert!(!app.plot_domain_shortcut_ready());
+
+        let ctx = egui::Context::default();
+        let mut dock = model_data::ModelDataDock::new_for_test(
+            &ctx,
+            test_model_store_tree("hrrr", "20260615_17z", &[0]),
+        );
+        dock.set_plot_domain_armed(true);
+        app.model_dock = Some(dock);
+        app.model_dock_open = false;
+        assert!(
+            !app.plot_domain_arm_active(),
+            "closed Model window never hijacks the map"
+        );
+        assert!(
+            !app.plot_domain_shortcut_ready(),
+            "shortcut needs the window too"
+        );
+
+        app.model_dock_open = true;
+        assert!(app.plot_domain_arm_active());
+        assert!(
+            !app.plot_domain_shortcut_ready(),
+            "shortcut also needs a loaded field (test dock has none)"
+        );
     }
 
     #[test]

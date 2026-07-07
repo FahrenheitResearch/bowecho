@@ -8,9 +8,9 @@
 
 use eframe::egui;
 use rw_ui::{
-    ColorTableEditorPanel, FieldViewerEvent, FieldViewerPanel, HourKey, PlotViewerPanel,
-    RunBrowserPanel, SoundingPanel, StoreRequest, StoreResponse, StoreTree, StoreView, StoreWorker,
-    StyleOverrideSettings,
+    ColorTableEditorPanel, CustomDomain, FieldViewerEvent, FieldViewerPanel, HourKey,
+    PlotViewerPanel, RunBrowserPanel, SoundingPanel, StoreRequest, StoreResponse, StoreTree,
+    StoreView, StoreWorker, StyleOverrideSettings,
 };
 use std::path::PathBuf;
 
@@ -409,10 +409,17 @@ pub struct ModelDataDock {
     map_request: Option<std::sync::Arc<rw_ui::FieldData>>,
     /// v0.2.3 custom-domain plot viewer: renders the selected field through
     /// rusty-weather's native plot pipeline over a user-chosen domain (shift-
-    /// drag a box on the field viewer, or rotate a corner). Shown as a floating
-    /// window when `show_plot_viewer` is set.
+    /// drag a box on the field viewer, or rotate a corner — or draw the box on
+    /// the radar map via the 📐 arm button / Ctrl+Shift+drag). Shown as a
+    /// floating window when `show_plot_viewer` is set.
     plot_viewer: PlotViewerPanel,
     show_plot_viewer: bool,
+    /// v0.29.3 gesture-collision fix: while true, the NEXT drag on the radar
+    /// map draws the plot domain — no modifiers, and none of the map's other
+    /// gestures (pan, loupe, soundings, 3D box) fire. Armed by the 📐 button
+    /// below; cleared by Esc / right-click / re-click / a completed box (the
+    /// map-side state machine lives in `main.rs`, this is the single truth).
+    plot_domain_armed: bool,
     /// v0.2.3 user-editable model field-plot color tables (rw-ui). Distinct
     /// from the radar-side table editor: this edits the STYLE OVERRIDES the
     /// store worker resolves palettes through. Edits are pushed to the worker
@@ -463,6 +470,7 @@ impl ModelDataDock {
             map_request: None,
             plot_viewer: PlotViewerPanel::new(),
             show_plot_viewer: false,
+            plot_domain_armed: false,
             color_tables: ColorTableEditorPanel::new(),
             show_color_tables: false,
             wrf_options: WrfProcessUiState::default(),
@@ -568,6 +576,38 @@ impl ModelDataDock {
     /// One-shot map request (the app installs it as a radar-map layer).
     pub fn take_map_request(&mut self) -> Option<std::sync::Arc<rw_ui::FieldData>> {
         self.map_request.take()
+    }
+
+    /// Whether the 📐 "Draw plot box" arm is on (the next radar-map drag
+    /// draws the plot domain). Read by the map input routing every frame.
+    pub fn plot_domain_armed(&self) -> bool {
+        self.plot_domain_armed
+    }
+
+    /// Arm/disarm the map-side plot-box tool (Esc / right-click / a closed
+    /// Model window disarm through here).
+    pub fn set_plot_domain_armed(&mut self, armed: bool) {
+        self.plot_domain_armed = armed;
+    }
+
+    /// A plot domain drawn on the RADAR MAP (📐 arm button or the
+    /// Ctrl+Shift+drag shortcut): retarget the native plot viewer at it and
+    /// auto-disarm — one box per arming, mirroring the field-viewer
+    /// `DomainSelected` path in [`Self::ui`].
+    pub fn apply_map_plot_domain(&mut self, domain: CustomDomain) {
+        self.plot_domain_armed = false;
+        self.show_plot_viewer = true;
+        self.plot_viewer.set_active_domain(domain);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn plot_viewer_shown_for_test(&self) -> bool {
+        self.show_plot_viewer
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_plot_domain_for_test(&self) -> Option<&CustomDomain> {
+        self.plot_viewer.active_domain()
     }
 
     /// The most recently loaded field (for layer auto-refresh).
@@ -1723,7 +1763,20 @@ impl ModelDataDock {
                         .on_hover_text(
                             "Render the selected field through rusty-weather's native plot \
                              pipeline. Shift-drag a box on the field viewer to plot a custom \
-                             domain; drag a selection corner to rotate.",
+                             domain; drag a selection corner to rotate. To draw the box on \
+                             the radar map instead, arm 📐 Draw plot box (or Ctrl+Shift+drag \
+                             the map).",
+                        );
+                    // v0.29.3 gesture-collision fix: Shift-drag on the MAP is
+                    // contested (loupe, inspector pin, Shift+right-drag 3D
+                    // box), so map-side domain drawing gets an explicit arm.
+                    ui.toggle_value(&mut self.plot_domain_armed, "📐 Draw plot box")
+                        .on_hover_text(
+                            "Arm the radar map: the next click-drag on the map draws the \
+                             custom plot domain — no modifier keys, and nothing else fires \
+                             (no pan, loupe, sounding, or 3D box). Esc, right-click, or \
+                             clicking this again cancels; a completed box disarms. \
+                             Shortcut: Ctrl+Shift+drag the map.",
                         );
                     ui.toggle_value(&mut self.show_color_tables, "🎨 Color tables")
                         .on_hover_text(
@@ -2052,6 +2105,32 @@ mod tests {
         // pin a run whose forecast horizon can't reach the target.
         let uncovered = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
         assert_eq!(dock.newest_hour_valid_near(uncovered, Some("hrrr")), None);
+    }
+
+    /// v0.29.3 gesture-collision fix: the 📐 arm is one-shot — applying a
+    /// map-drawn domain must disarm it, open the native plot viewer, and
+    /// retarget the viewer at exactly the drawn bounds (rotation 0; corner
+    /// rotation stays a field-viewer gesture).
+    #[test]
+    fn map_plot_domain_apply_disarms_and_opens_the_viewer() {
+        let ctx = egui::Context::default();
+        let mut dock =
+            ModelDataDock::new_for_test(&ctx, tree_with_runs("hrrr", &[("20260618_00z", &[0])]));
+        assert!(!dock.plot_domain_armed(), "arm starts off");
+        dock.set_plot_domain_armed(true);
+        assert!(dock.plot_domain_armed());
+        assert!(!dock.show_plot_viewer);
+
+        dock.apply_map_plot_domain(CustomDomain::generated((-100.0, -95.0, 30.0, 35.0)));
+
+        assert!(!dock.plot_domain_armed(), "a completed box auto-disarms");
+        assert!(dock.show_plot_viewer, "the native plot window opens on it");
+        let domain = dock
+            .plot_viewer
+            .active_domain()
+            .expect("map box becomes the active plot domain");
+        assert_eq!(domain.bounds, (-100.0, -95.0, 30.0, 35.0));
+        assert_eq!(domain.rotation_deg, 0.0);
     }
 
     #[test]

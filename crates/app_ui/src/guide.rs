@@ -766,6 +766,15 @@ fn model_data(ui: &mut egui::Ui) {
          slider sets layer opacity; \u{2715} removes it. The Radar opacity slider above lets \
          the model field show through the radar.",
     );
+    action(
+        ui,
+        "\u{1f4d0} Draw plot box",
+        "— arms the radar map: the next click-drag draws a custom domain for the native plot \
+         window, and nothing else fires (no pan, loupe, sounding, or 3D box). Esc or \
+         right-click cancels; a finished box disarms. Ctrl+Shift+drag on the map is the \
+         direct shortcut, and Shift-drag on the field viewer inside the Model window still \
+         works.",
+    );
 
     subhead(ui, "SOUNDINGS");
     action(
@@ -1350,8 +1359,19 @@ fn shortcuts(ui: &mut egui::Ui) {
     );
     key_row(
         ui,
+        "Ctrl+Shift+drag",
+        "draw a model plot-domain box on the map (Model window open with a loaded field)",
+    );
+    key_row(
+        ui,
+        "Shift+right-drag",
+        "select a 3D volume box on the map (opens the 3D Volume viewer)",
+    );
+    key_row(
+        ui,
         "armed tools",
-        "cross-section / Vrot own the clicks: left places points, right clears",
+        "cross-section / Vrot / \u{1f4d0} Draw plot box own the clicks: left places or draws, \
+         right clears",
     );
     key_row(
         ui,
