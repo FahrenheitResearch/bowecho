@@ -166,6 +166,149 @@ fn solar_temperature_table(unit: TempUnit) -> ColorTable {
 }
 
 // ---------------------------------------------------------------------------
+// Temperature at pressure levels + the °C-native surface variant — Solar's
+// `get_temp_colormap` with the per-level quantizations from `plot_helper.py`
+// (`cmap_segments_data` / `contour_levels_C` in `plot_temperature`). Same six
+// gradient blocks as the sfc_F table above (3, 5, 3, 6, 3, 3 colours); a
+// quantization of 0 means that block is absent at that level.
+//
+// At every level the total quantization equals the °C span of the contour
+// range, so one quantization step is exactly 1 °C: each gradient block spans
+// the interval between its cumulative-quantization boundaries and its colours
+// sit evenly across that interval, giving anchors at exact °C values. As in
+// the sfc_F port, a block's closing anchor is nudged 0.5 °C below the
+// boundary wherever the next block opens with a different colour.
+// Credit: Solarpower07 / WRF-Runner `get_temp_colormap` + `plot_temperature`.
+// ---------------------------------------------------------------------------
+
+// 250 mb — quantizations (0, 15, 10, 20, 5, 0) over -70..-20 °C.
+// Blocks: -70..-55 (5 colours, step 3.75), -55..-45 (3, step 5),
+// -45..-25 (6, step 4), -25..-20 (3, step 2.5).
+const SOLAR_TEMPERATURE_C_250_ANCHORS: [(f32, &str); 17] = [
+    (-70.0, "#B0E6DE"),
+    (-66.25, "#a0b8d6"),
+    (-62.5, "#968bc5"),
+    (-58.75, "#8243b2"),
+    (-55.5, "#7627A4"),
+    (-55.0, "#A040B2"),
+    (-50.0, "#f7f7ff"),
+    (-45.5, "#1D55B1"),
+    (-45.0, "#0F4454"),
+    (-41.0, "#88A080"),
+    (-37.0, "#F8EEA2"),
+    (-33.0, "#AA714D"),
+    (-29.0, "#5F0000"),
+    (-25.5, "#852C40"),
+    (-25.0, "#73372D"),
+    (-22.5, "#B69389"),
+    (-20.0, "#F2E6DC"),
+];
+
+// 500 mb — quantizations (0, 20, 15, 20, 5, 0) over -50..10 °C.
+// Blocks: -50..-30 (5 colours, step 5), -30..-15 (3, step 7.5),
+// -15..5 (6, step 4), 5..10 (3, step 2.5).
+const SOLAR_TEMPERATURE_C_500_ANCHORS: [(f32, &str); 17] = [
+    (-50.0, "#B0E6DE"),
+    (-45.0, "#a0b8d6"),
+    (-40.0, "#968bc5"),
+    (-35.0, "#8243b2"),
+    (-30.5, "#7627A4"),
+    (-30.0, "#A040B2"),
+    (-22.5, "#f7f7ff"),
+    (-15.5, "#1D55B1"),
+    (-15.0, "#0F4454"),
+    (-11.0, "#88A080"),
+    (-7.0, "#F8EEA2"),
+    (-3.0, "#AA714D"),
+    (1.0, "#5F0000"),
+    (4.5, "#852C40"),
+    (5.0, "#73372D"),
+    (7.5, "#B69389"),
+    (10.0, "#F2E6DC"),
+];
+
+// 700 mb — quantizations (0, 20, 15, 25, 10, 0) over -40..30 °C.
+// Blocks: -40..-20 (5 colours, step 5), -20..-5 (3, step 7.5),
+// -5..20 (6, step 5), 20..30 (3, step 5).
+const SOLAR_TEMPERATURE_C_700_ANCHORS: [(f32, &str); 17] = [
+    (-40.0, "#B0E6DE"),
+    (-35.0, "#a0b8d6"),
+    (-30.0, "#968bc5"),
+    (-25.0, "#8243b2"),
+    (-20.5, "#7627A4"),
+    (-20.0, "#A040B2"),
+    (-12.5, "#f7f7ff"),
+    (-5.5, "#1D55B1"),
+    (-5.0, "#0F4454"),
+    (0.0, "#88A080"),
+    (5.0, "#F8EEA2"),
+    (10.0, "#AA714D"),
+    (15.0, "#5F0000"),
+    (19.5, "#852C40"),
+    (20.0, "#73372D"),
+    (25.0, "#B69389"),
+    (30.0, "#F2E6DC"),
+];
+
+// 850 mb — quantizations (0, 20, 20, 30, 10, 10) over -40..50 °C.
+// Blocks: -40..-20 (5 colours, step 5), -20..0 (3, step 10), 0..30 (6, step
+// 6), 30..40 (3, step 5), 40..50 (3, step 5). The only level where the last
+// (grey/haze) gradient block is present.
+const SOLAR_TEMPERATURE_C_850_ANCHORS: [(f32, &str); 20] = [
+    (-40.0, "#B0E6DE"),
+    (-35.0, "#a0b8d6"),
+    (-30.0, "#968bc5"),
+    (-25.0, "#8243b2"),
+    (-20.5, "#7627A4"),
+    (-20.0, "#A040B2"),
+    (-10.0, "#f7f7ff"),
+    (-0.5, "#1D55B1"),
+    (0.0, "#0F4454"),
+    (6.0, "#88A080"),
+    (12.0, "#F8EEA2"),
+    (18.0, "#AA714D"),
+    (24.0, "#5F0000"),
+    (29.5, "#852C40"),
+    (30.0, "#73372D"),
+    (35.0, "#B69389"),
+    (39.5, "#F2E6DC"),
+    (40.0, "#E9DFD6"),
+    (45.0, "#95918F"),
+    (50.0, "#464646"),
+];
+
+// WRF-Runner's °C-native surface variant (`sfc_C`) uses the exact same
+// quantizations (0, 20, 20, 30, 10, 10) and -40..50 °C contour range as the
+// 850 mb level, so it shares the anchor array.
+const SOLAR_TEMPERATURE_SFC_C_ANCHORS: [(f32, &str); 20] = SOLAR_TEMPERATURE_C_850_ANCHORS;
+
+/// Solar's per-pressure-level temperature palette (°C-anchored), converted to
+/// the field's unit. WRF-Runner defines exactly 250 / 500 / 700 / 850 mb.
+/// Credit: Solarpower07 / WRF-Runner `get_temp_colormap` + `plot_temperature`.
+fn solar_temperature_level_table(level_mb: u16, unit: TempUnit) -> Option<ColorTable> {
+    let (name, anchors): (&str, &[(f32, &str)]) = match level_mb {
+        250 => ("Solar Temperature 250mb", &SOLAR_TEMPERATURE_C_250_ANCHORS),
+        500 => ("Solar Temperature 500mb", &SOLAR_TEMPERATURE_C_500_ANCHORS),
+        700 => ("Solar Temperature 700mb", &SOLAR_TEMPERATURE_C_700_ANCHORS),
+        850 => ("Solar Temperature 850mb", &SOLAR_TEMPERATURE_C_850_ANCHORS),
+        _ => return None,
+    };
+    Some(interpolated_from_anchors(name, anchors, |c| {
+        celsius_to(c, unit)
+    }))
+}
+
+/// Solar's °C-native surface temperature palette (`sfc_C`). Credit:
+/// Solarpower07 / WRF-Runner `get_temp_colormap` + `plot_temperature`.
+fn solar_temperature_sfc_c_table(unit: TempUnit) -> ColorTable {
+    interpolated_from_anchors(
+        "Solar Temperature Surface °C",
+        &SOLAR_TEMPERATURE_SFC_C_ANCHORS,
+        |c| celsius_to(c, unit),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Dew point — Solar's `get_dew_point_colormap(80, 50)` (`sfc_F`), applied over
 // -40..90 °F (`plot_helper.py::plot_dewpoint`, `contour_levels['sfc_F'] =
 // (-40, 90, 1, 10)`). Dry block spans -40..40 °F; five moist blocks span
@@ -378,6 +521,14 @@ fn fahrenheit_to(f: f32, unit: TempUnit) -> f32 {
     }
 }
 
+fn celsius_to(c: f32, unit: TempUnit) -> f32 {
+    match unit {
+        TempUnit::Fahrenheit => c * 9.0 / 5.0 + 32.0,
+        TempUnit::Celsius => c,
+        TempUnit::Kelvin => c + 273.15,
+    }
+}
+
 fn knots_to(kt: f32, unit: SpeedUnit) -> f32 {
     match unit {
         SpeedUnit::Knots => kt,
@@ -417,6 +568,71 @@ fn speed_unit_of(units: &str) -> SpeedUnit {
     } else {
         SpeedUnit::MetersPerSecond
     }
+}
+
+/// Parse a pressure level (mb) out of a stored variable name
+/// (`temperature_850`, `t_850mb`, `temp850`, `temperature_500hpa`, …).
+///
+/// Guard rails: only WRF-Runner's temperature levels 250/500/700/850 count,
+/// the digit run must be exactly the level (so the "2" in `temperature_2m` or
+/// a stray `8500` never match), and the run must be followed by nothing, a
+/// separator, or an explicit `mb`/`hpa` suffix (so `..._850m` — metres — does
+/// not read as a pressure level). Expects an already-lowercased name.
+fn parse_pressure_level_mb(name: &str) -> Option<u16> {
+    let bytes = name.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let level = match &name[start..i] {
+            "250" => 250_u16,
+            "500" => 500,
+            "700" => 700,
+            "850" => 850,
+            _ => continue,
+        };
+        let rest = &name[i..];
+        let mb_ish = rest.is_empty()
+            || rest.starts_with("mb")
+            || rest.starts_with("hpa")
+            || !rest.starts_with(|c: char| c.is_ascii_alphanumeric());
+        if mb_ish {
+            return Some(level);
+        }
+    }
+    None
+}
+
+/// True when the (already-lowercased) var name reads as a temperature field.
+/// Bare `t*` / `temp*` short forms only count when a pressure level was
+/// parsed, so stray `t`-prefixed non-thermal fields can't hijack the palette.
+fn is_temperature_var(name: &str, level_mb: Option<u16>) -> bool {
+    if name.contains("temperature")
+        || name == "t2"
+        || name == "t2m"
+        || name.contains("tsk")
+        || name.contains("sst")
+        || name.contains("skin_temp")
+        || name.contains("sea_surface")
+    {
+        return true;
+    }
+    if level_mb.is_none() {
+        return false;
+    }
+    // Short forms with an explicit level: `temp850`, `temp_850mb`, `t_850mb`,
+    // `t850`.
+    if let Some(rest) = name.strip_prefix("temp").or_else(|| name.strip_prefix('t')) {
+        let rest = rest.strip_prefix('_').unwrap_or(rest);
+        return rest.starts_with(|c: char| c.is_ascii_digit());
+    }
+    false
 }
 
 fn depth_unit_of(units: &str) -> DepthUnit {
@@ -459,22 +675,33 @@ pub fn solar_model_field_table(var: &str, units: &str) -> Option<ColorTable> {
         return Some(solar_dewpoint_table(temp_unit_of(units)));
     }
 
-    // Temperature (2 m / skin / sea-surface). Guard on a temperature unit so a
-    // stray "temp" substring in a non-thermal field can't hijack the palette.
+    // Temperature (pressure level / 2 m / skin / sea-surface). Guard on a
+    // temperature unit so a stray "temp" substring in a non-thermal field
+    // can't hijack the palette.
     let temp_unitish = matches!(
         unit.as_str(),
         "k" | "kelvin" | "c" | "degc" | "°c" | "f" | "degf" | "°f" | "fahrenheit" | "celsius"
     );
-    if temp_unitish
-        && (name.contains("temperature")
-            || name == "t2"
-            || name == "t2m"
-            || name.contains("tsk")
-            || name.contains("sst")
-            || name.contains("skin_temp")
-            || name.contains("sea_surface"))
-    {
-        return Some(solar_temperature_table(temp_unit_of(units)));
+    if temp_unitish {
+        let level_mb = parse_pressure_level_mb(&name);
+        if is_temperature_var(&name, level_mb) {
+            let temp_unit = temp_unit_of(units);
+            // Pressure-level fields (250/500/700/850 mb) get Solar's per-level
+            // °C-anchored palettes; `parse_pressure_level_mb` only ever yields
+            // those four levels, so the lookup below always succeeds.
+            if let Some(level_mb) = level_mb {
+                return solar_temperature_level_table(level_mb, temp_unit);
+            }
+            // Surface (no level in the name):
+            // * °C-styled fields use Solar's native `sfc_C` palette.
+            // * °F and Kelvin fields keep the F-anchored surface table
+            //   (converted) — deliberately unchanged so Kelvin-stored WRF
+            //   fields preserve the shipped v0.29.3 default look.
+            return Some(match temp_unit {
+                TempUnit::Celsius => solar_temperature_sfc_c_table(temp_unit),
+                TempUnit::Fahrenheit | TempUnit::Kelvin => solar_temperature_table(temp_unit),
+            });
+        }
     }
 
     // Relative humidity (%).
@@ -583,10 +810,105 @@ mod tests {
     }
 
     #[test]
+    fn level_parsing_resolves_level_tables() {
+        // Each supported spelling routes to the 850 mb °C-anchored table.
+        let expect_850 = solar_temperature_level_table(850, TempUnit::Kelvin).expect("850 table");
+        for var in ["temperature_850", "t_850mb", "temp850", "TEMPERATURE_850MB"] {
+            let table = solar_model_field_table(var, "K").expect("850 temp table");
+            assert_eq!(table.sample(273.15), expect_850.sample(273.15), "{var}");
+        }
+        // The other levels each hit their own table: the same physical value
+        // shades differently because every level stretches the gradient
+        // blocks over a different °C range.
+        let resolved = |mb: u16| {
+            solar_model_field_table(&format!("temperature_{mb}"), "degC")
+                .expect("level table")
+                .sample(-30.0)
+        };
+        for mb in [250_u16, 500, 700] {
+            let direct = solar_temperature_level_table(mb, TempUnit::Celsius).expect("table");
+            assert_eq!(resolved(mb), direct.sample(-30.0), "{mb} mb");
+        }
+        assert_ne!(resolved(250), resolved(700));
+    }
+
+    #[test]
+    fn level_parsing_guards_against_non_levels() {
+        // Height-ish / oversized digit runs never read as pressure levels.
+        assert_eq!(parse_pressure_level_mb("temperature_2m"), None);
+        assert_eq!(parse_pressure_level_mb("temperature_8500"), None);
+        assert_eq!(parse_pressure_level_mb("temperature_850m"), None); // metres
+        assert_eq!(parse_pressure_level_mb("temperature_850"), Some(850));
+        assert_eq!(parse_pressure_level_mb("t_850mb"), Some(850));
+        assert_eq!(parse_pressure_level_mb("temp250"), Some(250));
+        assert_eq!(parse_pressure_level_mb("temperature_500hpa"), Some(500));
+        // 2 m temperature keeps the surface behaviour even though it has a
+        // digit in its name.
+        let sfc = solar_model_field_table("temperature_2m", "K").expect("sfc temp");
+        let expected = solar_temperature_table(TempUnit::Kelvin);
+        assert_eq!(sfc.sample(300.0), expected.sample(300.0));
+    }
+
+    #[test]
+    fn level_anchor_tables_span_exact_ranges() {
+        // First/last anchors sit exactly at plot_helper.py's contour range
+        // ends (`contour_levels_C`).
+        let cases = [
+            (&SOLAR_TEMPERATURE_C_250_ANCHORS[..], -70.0, -20.0),
+            (&SOLAR_TEMPERATURE_C_500_ANCHORS[..], -50.0, 10.0),
+            (&SOLAR_TEMPERATURE_C_700_ANCHORS[..], -40.0, 30.0),
+            (&SOLAR_TEMPERATURE_C_850_ANCHORS[..], -40.0, 50.0),
+            (&SOLAR_TEMPERATURE_SFC_C_ANCHORS[..], -40.0, 50.0),
+        ];
+        for (anchors, lo, hi) in cases {
+            assert_eq!(anchors.first().expect("anchors").0, lo);
+            assert_eq!(anchors.last().expect("anchors").0, hi);
+        }
+    }
+
+    #[test]
+    fn degc_surface_resolves_sfc_c_table() {
+        // A °C-styled surface field gets Solar's native sfc_C palette, under
+        // every recognized °C unit spelling…
+        let native = solar_temperature_sfc_c_table(TempUnit::Celsius);
+        for units in ["C", "degC", "°C", "celsius"] {
+            let table = solar_model_field_table("temperature_2m", units).expect("sfc temp");
+            for v in [-40.0, -5.0, 20.0, 45.0, 50.0] {
+                assert_eq!(table.sample(v), native.sample(v), "{units} @ {v}");
+            }
+        }
+        // …which really is a different stretch from the F-anchored surface
+        // table converted to °C (45 °C is an exact sfc_C anchor, but sits
+        // mid-gradient at 113 °F in the F-anchored table).
+        let f_in_c = solar_temperature_table(TempUnit::Celsius);
+        assert_ne!(native.sample(45.0), f_in_c.sample(45.0));
+    }
+
+    #[test]
+    fn kelvin_and_fahrenheit_surface_behavior_unchanged() {
+        // Kelvin-stored WRF surface fields keep the shipped v0.29.3
+        // F-anchored look (converted to K), NOT the new sfc_C palette.
+        let kelvin = solar_model_field_table("temperature_2m", "K").expect("sfc temp");
+        let expected_k = solar_temperature_table(TempUnit::Kelvin);
+        for v in [233.15, 273.15, 300.0, 322.0] {
+            assert_eq!(kelvin.sample(v), expected_k.sample(v), "K @ {v}");
+        }
+        // °F-styled fields likewise keep the F-anchored table.
+        let degf = solar_model_field_table("t2m", "degF").expect("sfc temp");
+        let expected_f = solar_temperature_table(TempUnit::Fahrenheit);
+        assert_eq!(degf.sample(72.0), expected_f.sample(72.0));
+    }
+
+    #[test]
     fn every_solar_table_builds() {
         // Guards the anchor arrays (>= 2 stops, finite values) at test time.
         let _ = solar_reflectivity_table();
         let _ = solar_temperature_table(TempUnit::Kelvin);
+        let _ = solar_temperature_level_table(250, TempUnit::Kelvin).expect("250");
+        let _ = solar_temperature_level_table(500, TempUnit::Celsius).expect("500");
+        let _ = solar_temperature_level_table(700, TempUnit::Fahrenheit).expect("700");
+        let _ = solar_temperature_level_table(850, TempUnit::Kelvin).expect("850");
+        let _ = solar_temperature_sfc_c_table(TempUnit::Celsius);
         let _ = solar_dewpoint_table(TempUnit::Celsius);
         let _ = solar_wind_speed_table(SpeedUnit::MetersPerSecond);
         let _ = solar_precip_table(DepthUnit::Millimetres);
