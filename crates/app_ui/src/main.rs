@@ -55944,6 +55944,42 @@ mod tests {
         }
     }
 
+    /// v0.30 RC3: FieldData exactly as the iso plane loader / store worker
+    /// hand them to the map path (slug var, `wrf` hour model, store-native
+    /// units — byte-verified against the owner's 1974 store hour header)
+    /// resolve Solar map tables at the app gate, both bare (as loaded at
+    /// 1104bb4) and with the dock's Solar fallback production style
+    /// attached (`model_data::attach_solar_fallback_style`, which flips
+    /// `has_production` on). A 🎨 user binding still silences Solar.
+    #[test]
+    fn iso_and_raw_wrf_fields_resolve_solar_map_tables() {
+        for (var, units) in [
+            ("temperature_850", "K"),
+            ("dewpoint_850", "K"),
+            ("wind_speed_500", "m/s"),
+            ("height_925", "gpm"),
+            ("wrf_swdnb", "W m-2"),
+        ] {
+            let mut field = test_model_field("wrf", "local_wrf_19740403_172000", 0)
+                .as_ref()
+                .clone();
+            field.key.var = var.to_owned();
+            field.units = units.to_owned();
+            assert!(
+                model_layer_solar_table(&field, false, false).is_some(),
+                "{var}: bare field must resolve its Solar map table"
+            );
+            assert!(
+                model_layer_solar_table(&field, true, false).is_some(),
+                "{var}: the Solar fallback production style must not evict the map table"
+            );
+            assert!(
+                model_layer_solar_table(&field, true, true).is_none(),
+                "{var}: a user-bound palette still wins"
+            );
+        }
+    }
+
     #[test]
     fn downloaded_model_keeps_production_style_but_gains_solar_fallback() {
         // A downloaded HRRR field WITH a production style keeps it (Solar does

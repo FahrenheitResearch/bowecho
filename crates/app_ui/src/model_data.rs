@@ -582,6 +582,7 @@ impl ModelDataDock {
         }
         match result {
             Ok(mut field) => {
+                attach_solar_fallback_style(&mut field);
                 self.latest_field = Some(std::sync::Arc::new(field.clone()));
                 field.key = display;
                 self.viewer.set_field(field);
@@ -654,6 +655,7 @@ impl ModelDataDock {
                         // store variables. Only the viewer's copy carries the
                         // display label, so its stale-check matches the
                         // label-named selection.
+                        attach_solar_fallback_style(&mut field);
                         self.latest_field = Some(std::sync::Arc::new(field.clone()));
                         field.key = display_field_key(field.key, &self.hour_store_vars);
                         self.viewer.set_field(field);
@@ -2177,6 +2179,87 @@ pub(crate) fn user_style_override_active(
         .is_some_and(|(_, table)| table.to_store_style(&field.key.var, &field.units).is_some())
 }
 
+/// v0.30 RC3 fix — give style-less local-WRF fields their Solarpower07
+/// palette as the field's OWN style, so the dock FIELD VIEWER shows it.
+///
+/// Root cause of the "new fields render generic" report: the Solar palettes
+/// existed only on the radar-map layer (`ModelMapLayer::model_table`,
+/// resolved in main.rs `model_layer_solar_table`). The rw-ui viewer panel
+/// knows nothing of them — it paints `field.style`'s production colormap or
+/// falls to its normalized viridis ramp. On a local `wrf` store the worker
+/// resolves real production styles for CANONICAL variables (`"wrf"` parses
+/// to `ModelId::WrfGdex`, which rides the HRRR recipe set), but the raw
+/// `wrf_*` passthroughs (7e6fdee) and the synthesized iso-level slugs
+/// (5921e5e) resolve None — so exactly the two NEW field families rendered
+/// viridis in the viewer while every old field looked styled.
+///
+/// Called on every loaded field (worker `Field` responses and the iso plane
+/// loader) BEFORE `latest_field`/viewer fan-out. Precedence is preserved:
+/// a 🎨 user binding or an operational production style arrives already
+/// compiled into `field.style` (we never overwrite Some), downloaded models
+/// (non-`wrf` slugs) are untouched, and on the MAP the layer's `model_table`
+/// still outranks the production colormap this style compiles to — same
+/// Solar table, so map pixels are unchanged.
+fn attach_solar_fallback_style(field: &mut rw_ui::FieldData) {
+    if field.style.is_some() {
+        return;
+    }
+    // Mirror of main.rs `is_local_wrf_field`: both import paths stamp the
+    // store model slug `wrf` (local_import / wrf_process).
+    if !field.key.hour.model.to_ascii_lowercase().starts_with("wrf") {
+        return;
+    }
+    let Some(table) = color_tables::solar_model_field_table(&field.key.var, &field.units) else {
+        return;
+    };
+    field.style = solar_table_store_style(&table, &field.units);
+}
+
+/// Compile a Solar [`color_tables::ColorTable`] into the store-style form
+/// the rw-ui viewer (and `rustwx_render::build_colormap`) consume: bin
+/// levels with one color per bin, sampled from the table at bin midpoints
+/// (exact for stepped tables, a fine quantization of interpolated ramps).
+/// The bins are UNIFORM across the table's span because `LeveledColormap`
+/// assigns palette entries by relative VALUE position (matplotlib
+/// `ListedColormap` semantics) — non-uniform bins would shear the
+/// color↔value correspondence. Extend=Both matches `ColorTable::sample`'s
+/// clamp-at-both-ends, and transparent stops (e.g. the reflectivity
+/// clear-air mask) carry through as transparent bin colors.
+fn solar_table_store_style(
+    table: &color_tables::ColorTable,
+    units: &str,
+) -> Option<rustwx_products::viewer::StoreVariableStyle> {
+    let stops = table.stops();
+    let lo = f64::from(stops.first()?.value);
+    let hi = f64::from(stops.last()?.value);
+    if !lo.is_finite() || !hi.is_finite() || hi <= lo {
+        return None;
+    }
+    // 256 uniform bins resolve even the half-degree block transitions the
+    // Solar palettes use over their widest (~100-unit) spans.
+    const BINS: usize = 256;
+    let levels: Vec<f64> = (0..=BINS)
+        .map(|step| lo + (hi - lo) * step as f64 / BINS as f64)
+        .collect();
+    let colors: Vec<[u8; 4]> = levels
+        .windows(2)
+        .map(|pair| table.sample(((pair[0] + pair[1]) * 0.5) as f32).to_array())
+        .collect();
+    let user = rw_ui::UserColorTable {
+        name: table.name().to_owned(),
+        title: table.name().to_owned(),
+        display_units: units.to_owned(),
+        convert: rw_ui::UserUnitConvert::None,
+        legend_mode: rw_ui::UserLegendMode::Stepped,
+        extend: rw_ui::UserExtendMode::Both,
+        mask_below: None,
+        tick_step: None,
+        levels,
+        colors,
+    };
+    user.to_store_style(table.name(), units)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2884,5 +2967,253 @@ mod tests {
             .expect("both runs cover the target");
         assert_eq!(key.run, "20260618_00z");
         assert_eq!(key.hour, 1);
+    }
+
+    // ── v0.30 RC3 Solar-fallback style seam ────────────────────────────────
+    //
+    // Fixture mirrors the owner's real 1974 store byte-for-byte where it
+    // matters (verified against wrf/local_wrf_19740403_172000/f000.rws):
+    // model "wrf", canonical t2m selector, raw passthrough selector
+    // {"derived":"wrf_swdnb"} with units "W m-2", and `temperature_iso`
+    // (units "K", selector {"field":...,"source":"wrf","vertical":"isobaric"}).
+
+    const STYLE_RUN: &str = "local_wrf_19740403_172000";
+
+    fn style_fixture_grid() -> rustwx_core::LatLonGrid {
+        let (nx, ny) = (4usize, 3usize);
+        let mut lat = Vec::with_capacity(nx * ny);
+        let mut lon = Vec::with_capacity(nx * ny);
+        for y in 0..ny {
+            for x in 0..nx {
+                lat.push(30.0 + 0.1 * y as f32);
+                lon.push(-100.0 + 0.1 * x as f32);
+            }
+        }
+        rustwx_core::LatLonGrid::new(rustwx_core::GridShape::new(nx, ny).expect("dims"), lat, lon)
+            .expect("grid")
+    }
+
+    /// One-hour `wrf` store with a canonical 2-D field (grid carrier), the
+    /// raw `wrf_swdnb` passthrough, and a two-level `temperature_iso` volume.
+    fn write_style_fixture(tag: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("bowecho-solar-style-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let grid = style_fixture_grid();
+        let cells = grid.shape.len();
+        let t2m = rustwx_core::SelectedField2D::new(
+            rustwx_core::FieldSelector::height_agl(rustwx_core::CanonicalField::Temperature, 2),
+            "K",
+            grid,
+            (0..cells).map(|c| 288.0 + c as f32).collect(),
+        )
+        .expect("values sized to the grid");
+        let swdnb: Vec<f32> = (0..cells).map(|c| 40.0 * c as f32).collect();
+        let temp_850: Vec<f32> = (0..cells).map(|c| 270.0 + c as f32).collect();
+        let temp_500: Vec<f32> = (0..cells).map(|c| 250.0 + c as f32).collect();
+        rw_store::write_hour_from_fields_with_derived(
+            &root,
+            "wrf",
+            STYLE_RUN,
+            0,
+            &[("temperature_2m", &t2m)],
+            &[rw_store::DerivedFieldInput {
+                name: "wrf_swdnb",
+                units: "W m-2",
+                values: &swdnb,
+            }],
+            &[rw_store::PressureVolumeInput {
+                name: "temperature_iso",
+                units: "K",
+                selector_template: serde_json::json!({
+                    "field": "temperature_iso",
+                    "source": "wrf",
+                    "vertical": "isobaric",
+                }),
+                levels: vec![(850, temp_850.as_slice()), (500, temp_500.as_slice())],
+            }],
+            "solar-style-test",
+            1_780_000_000,
+        )
+        .expect("write fixture hour");
+        root
+    }
+
+    fn style_fixture_hour() -> HourKey {
+        HourKey {
+            model: "wrf".to_owned(),
+            run: STYLE_RUN.to_owned(),
+            hour: 0,
+        }
+    }
+
+    /// Per-channel comparison of the compiled production colormap against
+    /// the Solar table it was built from. The style quantizes each stop
+    /// interval into ≥ 12 bins, so a small tolerance absorbs the midpoint
+    /// sampling; anything looser means the wrong palette.
+    #[track_caller]
+    fn assert_style_tracks_table(
+        style: &rustwx_products::viewer::StoreVariableStyle,
+        table: &color_tables::ColorTable,
+        probes: &[f32],
+    ) {
+        let cmap = rustwx_render::build_colormap(&style.scale, style.colormap_options);
+        for &probe in probes {
+            let want = table.sample(probe);
+            let got = cmap.map(f64::from(probe));
+            for (channel, (got, want)) in [
+                (got.r, want.r),
+                (got.g, want.g),
+                (got.b, want.b),
+                (got.a, want.a),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert!(
+                    got.abs_diff(want) <= 20,
+                    "channel {channel} at {probe}: style {got} vs table {want}"
+                );
+            }
+        }
+    }
+
+    /// The Solar fallback only claims style-less local-WRF fields: existing
+    /// styles (🎨 user bindings / operational production) are never
+    /// overwritten, downloaded models and Solar-less variables stay on
+    /// their current look byte-for-byte.
+    #[test]
+    fn solar_fallback_respects_existing_styles_and_model_scope() {
+        // Local WRF field with no style -> Solar attaches.
+        let mut field = override_test_field("temperature_850");
+        attach_solar_fallback_style(&mut field);
+        let style = field.style.expect("temperature_850 (K) resolves Solar");
+        let table = color_tables::solar_model_field_table("temperature_850", "K")
+            .expect("resolver covers the slug");
+        assert_eq!(style.title, table.name());
+        assert_style_tracks_table(&style, &table, &[255.0, 270.0, 288.0]);
+
+        // An existing style is the user's/production truth — untouched.
+        let mut styled = override_test_field("temperature_2m");
+        styled.style = rw_ui::UserColorTable::simple("My temp", "My temp", "K")
+            .to_store_style("temperature_2m", "K");
+        attach_solar_fallback_style(&mut styled);
+        assert_eq!(
+            styled.style.expect("style kept").title,
+            "My temp",
+            "existing styles must never be repainted"
+        );
+
+        // Downloaded models keep their production/generic behavior.
+        let mut hrrr = override_test_field("temperature_850");
+        hrrr.key.hour.model = "hrrr".to_owned();
+        attach_solar_fallback_style(&mut hrrr);
+        assert!(hrrr.style.is_none(), "non-wrf models are out of scope");
+
+        // A variable with no Solar counterpart keeps the generic ramp.
+        let mut orography = override_test_field("orography");
+        orography.units = "m".to_owned();
+        attach_solar_fallback_style(&mut orography);
+        assert!(orography.style.is_none());
+    }
+
+    /// RC3 regression (iso path): a synthesized per-level load, driven
+    /// through the dock's REAL routing (`request_field_load` →
+    /// `poll_iso_load`), must reach `latest_field` AND the viewer with a
+    /// Solar production style. At 1104bb4 `style` stayed `None`, so the
+    /// dock viewer painted the normalized viridis ramp — the owner's
+    /// "default colormap" report on the 1974 store.
+    #[test]
+    fn iso_loads_reach_the_viewer_with_solar_styles() {
+        let root = write_style_fixture("iso-dock");
+        let ctx = egui::Context::default();
+        let mut dock = ModelDataDock::new(&ctx, root.clone());
+        let hour = style_fixture_hour();
+        dock.hour_store_vars = vec![
+            "temperature_2m".to_owned(),
+            "wrf_swdnb".to_owned(),
+            "temperature_iso".to_owned(),
+        ];
+        // The synthesized entry is the picker selection, so the loader's
+        // stale-drop accepts the plane when it lands.
+        dock.viewer
+            .set_hour(hour.clone(), vec![test_var("Temperature 850 mb", "K")]);
+        dock.request_field_load(rw_ui::FieldKey {
+            hour,
+            var: "Temperature 850 mb".to_owned(),
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while dock.latest_field.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "iso plane load timed out"
+            );
+            dock.poll_iso_load();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let field = dock.latest_field.as_deref().expect("checked above");
+        assert_eq!(field.key.var, "temperature_850", "store-named for the map");
+        assert_eq!(field.units, "K", "store-native units");
+        let style = field
+            .style
+            .as_ref()
+            .expect("Solar fallback style must be attached to the iso plane");
+        let table = color_tables::solar_model_field_table("temperature_850", "K")
+            .expect("resolver covers the slug");
+        assert_style_tracks_table(style, &table, &[271.0, 274.0, 281.0]);
+
+        // The viewer's display-named copy carries the same style — this is
+        // what the field viewer actually paints.
+        let viewer_field = dock.viewer.current_field().expect("viewer got the field");
+        assert_eq!(viewer_field.key.var, "Temperature 850 mb");
+        assert!(
+            viewer_field.style.is_some(),
+            "viewer paints Solar, not viridis"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RC3 regression (worker path): the rw-ui store worker resolves NO
+    /// production style for raw `wrf_*` passthroughs ({"derived": ...}
+    /// selectors miss the operational catalog) — the app-level gap that let
+    /// 7e6fdee's palettes go missing in the viewer. The dock seam must
+    /// dress the worker's field in its Solar ramp.
+    #[test]
+    fn raw_wrf_worker_fields_gain_solar_styles_at_the_dock_seam() {
+        let root = write_style_fixture("wrf2d");
+        let worker = StoreWorker::spawn(StoreView::new(&root), || {});
+        worker.send(StoreRequest::LoadField(rw_ui::FieldKey {
+            hour: style_fixture_hour(),
+            var: "wrf_swdnb".to_owned(),
+        }));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut field = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker field load timed out"
+            );
+            match worker.try_recv() {
+                Some(StoreResponse::Field(_, boxed)) => break (*boxed).expect("fixture load"),
+                Some(_) => {}
+                None => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
+        assert_eq!(field.units, "W m-2");
+        assert!(
+            field.style.is_none(),
+            "characterizes the worker gap the dock seam exists to fill"
+        );
+
+        attach_solar_fallback_style(&mut field);
+        let style = field.style.expect("Solar radiation ramp attached");
+        let table = color_tables::solar_model_field_table("wrf_swdnb", "W m-2")
+            .expect("resolver covers the catalog entry");
+        assert_style_tracks_table(&style, &table, &[100.0, 550.0, 1000.0]);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
