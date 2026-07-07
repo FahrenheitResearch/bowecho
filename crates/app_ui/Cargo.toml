@@ -58,6 +58,9 @@ windows-sys = { version = "0.61", features = [
     # WINTRUST_DATA itself is additionally gated behind Cryptography.
     "Win32_Security_Cryptography",
     "Win32_Security_WinTrust",
+    # SetThreadPriority: WRF import workers run below normal so a
+    # 20-minute large-grid import can't starve the desktop.
+    "Win32_System_Threading",
 ] }
 
 # Model-data dock and satellite/model stack (rusty-weather).

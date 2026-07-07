@@ -81,6 +81,7 @@ pub fn spawn_import_paths(paths: Vec<PathBuf>, store_root: PathBuf) -> LocalImpo
     std::thread::Builder::new()
         .name("rw-ui-local-import".to_string())
         .spawn(move || {
+            crate::wrf_process::lower_import_thread_priority();
             let mut progress = |message: String| {
                 let _ = tx.send(LocalImportMessage::Progress(message));
             };

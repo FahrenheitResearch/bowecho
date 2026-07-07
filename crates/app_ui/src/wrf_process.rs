@@ -241,6 +241,7 @@ pub fn spawn_process_paths(
         .spawn({
             let label = label.clone();
             move || {
+                lower_import_thread_priority();
                 let result = process_paths(&paths, &store_root, &options, &tx).map_err(|err| {
                     if err.trim().is_empty() {
                         format!("{label} failed")
@@ -253,6 +254,21 @@ pub fn spawn_process_paths(
         })
         .expect("spawn WRF processing worker");
     WrfProcessTask { label, rx }
+}
+
+/// Large-grid imports grind for minutes with heavy allocation churn; run the
+/// worker below normal priority so the desktop (and the live radar UI) stay
+/// responsive. Windows-only: other platforms schedule this fine as-is.
+pub(crate) fn lower_import_thread_priority() {
+    #[cfg(windows)]
+    // SAFETY: GetCurrentThread returns a pseudo-handle that needs no
+    // cleanup; SetThreadPriority on it affects only this thread.
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
 }
 
 pub fn is_supported_wrf_file(path: &Path) -> bool {

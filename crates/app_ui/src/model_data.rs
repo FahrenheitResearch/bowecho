@@ -365,7 +365,9 @@ fn wrf_import_size_description(files: &[PathBuf]) -> Option<String> {
 fn heavy_import_size_warning(files: &[PathBuf]) -> Option<String> {
     Some(format!(
         "{}. Full diagnostics computes the ~117-field 2-D suite through \
-         wrf-core — MINUTES per file and many GB of RAM on a grid this size.",
+         wrf-core — MINUTES per file and many GB of RAM on a grid this size. \
+         The whole machine may feel heavily loaded while it runs; save other \
+         work first.",
         wrf_import_size_description(files)?
     ))
 }
@@ -379,7 +381,8 @@ fn light_import_size_warning(files: &[PathBuf]) -> Option<String> {
     Some(format!(
         "{}. Even this light import interpolates every 3-D sounding field to \
          37 isobaric levels through wrf-core — expect minutes per file and \
-         several GB of RAM on a grid this size.",
+         several GB of RAM on a grid this size. The whole machine may feel \
+         heavily loaded while it runs; save other work first.",
         wrf_import_size_description(files)?
     ))
 }
