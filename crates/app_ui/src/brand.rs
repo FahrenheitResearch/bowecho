@@ -20,12 +20,32 @@ pub(crate) fn github_latest_release_api_url(repo_url: &str) -> Option<String> {
     ))
 }
 
+/// Canonical public repo — the update feed for stock builds and for brand
+/// kits that leave `repo_url` empty.
+pub(crate) const CANONICAL_REPO_URL: &str = "https://github.com/FahrenheitResearch/bowecho";
+
+/// Endpoint for the passive update check. An empty `repo_url` is the stock
+/// exe wearing brand-kit assets, so it still checks the canonical feed; only
+/// an explicit non-GitHub override disables the check (the distributor is
+/// self-hosting releases).
+pub(crate) fn update_check_api_url(repo_url: &str) -> Option<String> {
+    if repo_url.trim().is_empty() {
+        return github_latest_release_api_url(CANONICAL_REPO_URL);
+    }
+    github_latest_release_api_url(repo_url)
+}
+
 pub(crate) fn releases_page_url(brand: &settings::BrandConfig) -> Option<String> {
     brand
         .valid_http_url(&brand.releases_url)
         .map(str::to_owned)
         .or_else(|| {
-            let (owner, name) = github_repo_parts(&brand.repo_url)?;
+            let repo_url = if brand.repo_url.trim().is_empty() {
+                CANONICAL_REPO_URL
+            } else {
+                brand.repo_url.as_str()
+            };
+            let (owner, name) = github_repo_parts(repo_url)?;
             Some(format!("https://github.com/{owner}/{name}/releases"))
         })
 }
@@ -437,6 +457,36 @@ mod tests {
         assert_eq!(
             releases_page_url(&brand),
             Some("https://github.com/example/custom-app/releases".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_brand_repo_falls_back_to_the_canonical_update_feed() {
+        // A brand kit without a repo override is the stock exe with different
+        // assets — it must keep checking (and reporting "up to date") against
+        // the canonical releases instead of "not configured".
+        assert_eq!(
+            update_check_api_url(""),
+            Some(
+                "https://api.github.com/repos/FahrenheitResearch/bowecho/releases/latest"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            update_check_api_url("https://github.com/example/custom-app"),
+            Some("https://api.github.com/repos/example/custom-app/releases/latest".to_owned())
+        );
+        // An explicit non-GitHub override means self-hosted releases: no check.
+        assert_eq!(update_check_api_url("https://example.org/releases"), None);
+
+        let brand = settings::BrandConfig {
+            repo_url: String::new(),
+            releases_url: String::new(),
+            ..settings::BrandConfig::default()
+        };
+        assert_eq!(
+            releases_page_url(&brand),
+            Some("https://github.com/FahrenheitResearch/bowecho/releases".to_owned())
         );
     }
 }

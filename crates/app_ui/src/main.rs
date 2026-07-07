@@ -20122,8 +20122,7 @@ impl ViewerApp {
         if self.update_check_rx.in_flight() {
             return;
         }
-        let Some(api_url) = brand::github_latest_release_api_url(&self.app_settings.brand.repo_url)
-        else {
+        let Some(api_url) = brand::update_check_api_url(&self.app_settings.brand.repo_url) else {
             self.update_available = None;
             return;
         };
@@ -20153,8 +20152,7 @@ impl ViewerApp {
         if !self_update_repo_allowed(&self.app_settings.brand.repo_url) {
             return;
         }
-        let Some(api_url) = brand::github_latest_release_api_url(&self.app_settings.brand.repo_url)
-        else {
+        let Some(api_url) = brand::update_check_api_url(&self.app_settings.brand.repo_url) else {
             return;
         };
         let Some(asset_url) = github_release_asset_url(&api_url, tag, asset) else {
@@ -21688,7 +21686,7 @@ impl ViewerApp {
         let display_name = self.app_settings.brand.resolved_display_name().to_owned();
         let releases_url = brand::releases_page_url(&self.app_settings.brand);
         let release_check_available =
-            brand::github_latest_release_api_url(&self.app_settings.brand.repo_url).is_some();
+            brand::update_check_api_url(&self.app_settings.brand.repo_url).is_some();
         ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
         if release_check_available {
             ui.weak(security_update_status_label(
@@ -47371,8 +47369,11 @@ fn self_update_asset(baked: Option<&'static str>, is_windows: bool) -> Option<&'
 /// Authenticode gate accepts *any* trusted signer, so a Brand-Kit repo
 /// override must not become an executable-replacement channel. Rebranded
 /// builds keep the passive check + browser button against their own repo.
+/// An EMPTY repo_url is not an override — it is the stock exe wearing
+/// brand-kit assets, updating from the canonical feed like everyone else.
 fn self_update_repo_allowed(repo_url: &str) -> bool {
-    repo_url.trim_end_matches('/') == "https://github.com/FahrenheitResearch/bowecho"
+    let repo_url = repo_url.trim();
+    repo_url.is_empty() || repo_url.trim_end_matches('/') == brand::CANONICAL_REPO_URL
 }
 
 /// Release-asset download URL derived from the latest-release API URL that
@@ -55536,7 +55537,10 @@ mod tests {
         assert!(!self_update_repo_allowed(
             "https://github.com/someone-else/bowecho-fork"
         ));
-        assert!(!self_update_repo_allowed(""));
+        // Empty = no override: the stock exe with brand-kit assets installs
+        // from the canonical feed (the passive check falls back there too).
+        assert!(self_update_repo_allowed(""));
+        assert!(self_update_repo_allowed("  "));
     }
 
     #[test]
