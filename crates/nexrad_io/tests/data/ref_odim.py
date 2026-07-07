@@ -92,7 +92,9 @@ def main(path):
         )
         nrays, nbins = g[data_names[0]]["data"].shape
         az0 = (0 + 0.5) * 360.0 / nrays
-        gate0 = round(rstart_km * 1000.0)
+        # Mirrors the decoder's first_gate_m_from_rstart: rstart beyond a
+        # sane 20 km is metre-valued writer output (AEMET IRIS quirk).
+        gate0 = round(rstart_km) if rstart_km > 20.0 else round(rstart_km * 1000.0)
         spacing = max(round(rscale), 1)
         nyq = f"{ni:.4f}" if ni and ni > 0 else "None"
         print(

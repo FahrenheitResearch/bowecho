@@ -250,12 +250,12 @@ fn real_espdg_pvol_decodes_v2_object_headers_end_to_end() {
         assert_eq!(cut.radials.len(), 360, "{label} rays");
         assert_close(cut.radials[0].azimuth_deg, 0.5, 1e-5, "az0");
         let gates = &cut.radials[0].gate_range;
-        // AEMET writes where/rstart = 200.0 METERS (IRIS quirk); the
-        // decoder applies the ODIM spec unit (km), hence 200_000 here.
-        // Pinned as-is: geometry policy is outside the HDF5-dialect fix.
+        // AEMET writes where/rstart = 200.0 METRES (IRIS quirk; spec says
+        // km). The decoder's physical-sanity rule reinterprets it, so the
+        // first bin sits at the true 200 m — not 200 km downrange.
         assert_eq!(
             (gates.first_gate_m, gates.gate_spacing_m, gates.gate_count),
-            (200_000, 500, 299),
+            (200, 500, 299),
             "{label} gates"
         );
         // No per-dataset NI: root /how NI applies to both sweeps.

@@ -17,7 +17,9 @@
 //!   are remapped onto the `nodata` sentinel so compact storage keeps one
 //!   transparent code.
 //! - `rstart` is km to the start of the first bin; `rscale` is the bin
-//!   spacing in metres (Table 5 "where" for polar data).
+//!   spacing in metres (Table 5 "where" for polar data). Implausibly large
+//!   `rstart` values are reinterpreted as metres — see
+//!   `first_gate_m_from_rstart` for the writer quirk that requires it.
 //! - Rays are stored north-relative in scan order: ray `i` spans
 //!   `[i, i+1) * 360/nrays` degrees, so its center azimuth is
 //!   `(i + 0.5) * 360 / nrays` (the `a1gate` index only records where the
@@ -141,7 +143,7 @@ fn decode_sweep(
         return Err(invalid(format!("{dataset} data plane is empty")));
     }
     let gate_range = GateRange {
-        first_gate_m: (rstart_km * 1000.0).round() as i32,
+        first_gate_m: first_gate_m_from_rstart(rstart_km),
         gate_spacing_m: (rscale_m.round() as i32).max(1),
         gate_count: nbins,
     };
@@ -278,6 +280,36 @@ fn decode_sweep(
     volume.cuts.push(cut);
     volume.metadata.skipped_message_count += skipped_planes;
     Ok(())
+}
+
+/// A first bin starting this many km downrange is physically implausible
+/// for a PVOL/SCAN: conformant writers put `rstart` at 0 or within a few km
+/// (0.0 across the bejab/bewid/norst fixtures, 22 sweeps), and even
+/// long-pulse blind ranges are single-digit km. Values beyond this are
+/// metre-valued writer output (see `first_gate_m_from_rstart`).
+const RSTART_SANE_MAX_KM: f64 = 20.0;
+
+/// Metres to the start of the first bin, from the `where/rstart` attribute.
+///
+/// ODIM_H5 defines `rstart` in km (Table 5, polar "where"), but AEMET Spain
+/// (IRIS 8.13/10.3 exports; all 11 sites surveyed on the OPERA ORD bucket,
+/// 2026-07-07) writes it in METRES: observed 125/167/200 across the network.
+/// Read as km those would start every ray 125–200 km downrange — past the
+/// 150 km extent of the very sweeps they describe (299 bins x 500 m) — while
+/// as metres they are classic IRIS range-start values on the same scale as
+/// the bin spacing. A physical-sanity rule beats sniffing the IRIS source
+/// string: other IRIS exports write conformant km, and any writer whose
+/// first bin "starts" > [`RSTART_SANE_MAX_KM`] out is reporting metres.
+/// (Metre-valued quirk output below the threshold is indistinguishable from
+/// km, but IRIS range starts sit at gate-size scale — hundreds of metres —
+/// and 0 reads identically in either unit.)
+fn first_gate_m_from_rstart(rstart: f64) -> i32 {
+    if rstart > RSTART_SANE_MAX_KM {
+        // Reinterpret as metres (writer quirk documented above).
+        rstart.round() as i32
+    } else {
+        (rstart * 1000.0).round() as i32
+    }
 }
 
 /// Remap `undetect` onto the grid's single transparent sentinel.
@@ -505,6 +537,22 @@ mod tests {
         assert_eq!(id, "01104");
         let (id, _) = site_identity_from_source("CMT:whatever");
         assert_eq!(id, "ODIM");
+    }
+
+    #[test]
+    fn rstart_beyond_sane_range_reinterprets_as_metres() {
+        // Spec-conformant km values pass through unchanged.
+        assert_eq!(first_gate_m_from_rstart(0.0), 0);
+        assert_eq!(first_gate_m_from_rstart(0.05), 50);
+        assert_eq!(first_gate_m_from_rstart(5.0), 5_000);
+        // Just under the physical-sanity bound: still km.
+        assert_eq!(first_gate_m_from_rstart(19.9), 19_900);
+        assert_eq!(first_gate_m_from_rstart(20.0), 20_000);
+        // AEMET metre-valued rstart (125/167/200 observed across the
+        // network, 2026-07-07): reinterpreted as metres, not 125+ km.
+        assert_eq!(first_gate_m_from_rstart(125.0), 125);
+        assert_eq!(first_gate_m_from_rstart(167.0), 167);
+        assert_eq!(first_gate_m_from_rstart(200.0), 200);
     }
 
     #[test]
