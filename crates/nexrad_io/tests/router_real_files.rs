@@ -20,6 +20,7 @@ use radar_core::{MomentStorage, RadarVolume};
 const BEJAB: &[u8] = include_bytes!("data/bejab.pvol.hdf");
 const BEWID: &[u8] = include_bytes!("data/20130429043000.rad.bewid.pvol.dbzh.scan1.hdf");
 const NORST: &[u8] = include_bytes!("data/T_PAGZ35_C_ENMI_20170421090837.hdf");
+const ESPDG: &[u8] = include_bytes!("data/espdg.pvol.20260707.dbzh_vradh.h5");
 const ODIM_SYNTH: &[u8] = include_bytes!("data/odim_pvol_synth.h5");
 const XSAPR_PPI: &[u8] = include_bytes!("data/cfrad.xsapr_sgp_ppi_20110520.classic.nc");
 const XSAPR_PPI_NETCDF4: &[u8] = include_bytes!("data/cfrad.xsapr_sgp_ppi_20110520.netcdf4.nc");
@@ -86,6 +87,7 @@ fn router_matches_direct_odim_decoder_on_real_pvols() {
         (BEJAB, "BEJAB", "bejab.pvol.hdf"),
         (BEWID, "BEWID", "bewid scan1.hdf"),
         (NORST, "NORST", "T_PAGZ35 ENMI .hdf"),
+        (ESPDG, "ESPDG", "espdg v2-OHDR dbzh_vradh.h5"),
         (ODIM_SYNTH, "TEST", "odim_pvol_synth.h5"),
     ] {
         assert_routed_matches_direct(

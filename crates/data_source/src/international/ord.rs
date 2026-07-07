@@ -2570,4 +2570,92 @@ mod tests {
             assert!(cuts > 0, "{probe}: decoded no cuts");
         }
     }
+
+    /// Live decode of the LATEST volume from ALL 11 AEMET (Spain) sites
+    /// through the full app path (plan → download → shared ODIM router).
+    /// AEMET writes H5rad 2.4 with HDF5 version-2 object headers (OHDR) on
+    /// leaf metadata groups — the dialect hdf5lite gained for v0.30 after
+    /// the v0.30-RC1 live-poll regression on espdg. Network test; run with
+    /// `cargo test -p data_source ord_live_spain -- --ignored --nocapture`
+    #[test]
+    #[ignore = "live ORD bucket probe — run manually with --ignored"]
+    fn ord_live_spain_decodes_all_11_aemet_sites() {
+        let provider = OrdProvider::new();
+        let sites = provider.list_sites().expect("live ORD site list");
+        let spain: Vec<_> = sites
+            .iter()
+            .filter(|site| site.country == "Spain")
+            .collect();
+        println!("{} AEMET sites listed live", spain.len());
+        assert_eq!(spain.len(), 11, "expected all 11 AEMET radars");
+
+        let mut failures = Vec::new();
+        for site in &spain {
+            let plan = match provider.latest(&site.site_id) {
+                Ok(plan) => plan,
+                Err(err) => {
+                    failures.push(format!("{}: plan failed: {err}", site.site_id));
+                    continue;
+                }
+            };
+            let mut part_summaries = Vec::new();
+            let mut cuts = 0usize;
+            let mut radials = 0usize;
+            for part in &plan.parts {
+                let bytes = match crate::fetch_volume_bytes(&part.url) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        failures.push(format!("{}: download failed: {err}", site.site_id));
+                        continue;
+                    }
+                };
+                match nexrad_io::decode_supported_volume_bytes(&bytes) {
+                    Ok(volume) => {
+                        cuts += volume.cuts.len();
+                        radials += volume.metadata.decoded_radial_count;
+                        let moments: std::collections::BTreeSet<String> = volume
+                            .cuts
+                            .iter()
+                            .flat_map(|cut| cut.moments.keys())
+                            .map(|moment| moment.short_name().to_owned())
+                            .collect();
+                        let elevations: Vec<String> = volume
+                            .cuts
+                            .iter()
+                            .map(|cut| format!("{:.1}", cut.elevation_deg))
+                            .collect();
+                        part_summaries.push(format!(
+                            "{} el=[{}] moments=[{}]",
+                            volume.site.id,
+                            elevations.join(","),
+                            moments.into_iter().collect::<Vec<_>>().join(",")
+                        ));
+                    }
+                    Err(err) => {
+                        failures.push(format!(
+                            "{}: decode {} failed: {err}",
+                            site.site_id, part.url
+                        ));
+                    }
+                }
+            }
+            println!(
+                "{}: identity={} parts={} cuts={} radials={} [{}]",
+                site.site_id,
+                plan.identity,
+                plan.parts.len(),
+                cuts,
+                radials,
+                part_summaries.join(" | ")
+            );
+            if cuts == 0 {
+                failures.push(format!("{}: decoded no cuts", site.site_id));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "AEMET live decode failures:\n{}",
+            failures.join("\n")
+        );
+    }
 }

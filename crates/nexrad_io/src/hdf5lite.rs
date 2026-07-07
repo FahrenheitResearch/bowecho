@@ -10,9 +10,18 @@
 //! (The HDF Group, "HDF5 File Format Specification Version 3.0";
 //! <https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t3.html>):
 //!
-//! - Superblock v0/v1 (v2/v3 — the 1.10+ "latest" layout with v2 object
-//!   headers — is detected and rejected with a clear error).
+//! - Superblock v0/v1 (v2/v3 — the 1.10+ "latest" layout — is detected and
+//!   rejected with a clear error).
 //! - Version 1 object headers, including continuation blocks.
+//! - Version 2 object headers ("OHDR", with "OCHK" continuation blocks and
+//!   Jenkins lookup3 checksum verification). AEMET/Spain writes ODIM H5rad
+//!   2.4 files (IRIS 8.13/10.3 export, live in ORD since 2026-06-23) as a
+//!   mixed dialect: superblock v0 and old-style groups, but v2 headers on
+//!   the leaf metadata groups (`datasetN/{how,what,where}`,
+//!   `datasetN/dataM/{how,what}`). Their attributes stay compact (message
+//!   0x000C version 1) and their link-info fractal-heap addresses are
+//!   undefined, so v2 B-trees, fractal heaps, and dense attribute storage
+//!   remain out of scope below.
 //! - Messages: dataspace (0x0001), datatype (0x0003), data layout (0x0008,
 //!   v3 compact/contiguous/chunked), filter pipeline (0x000B, deflate id 1
 //!   and shuffle id 2), attribute (0x000C, versions 1-3), header
@@ -34,11 +43,18 @@ use flate2::read::ZlibDecoder;
 use crate::{NexradError, Result};
 
 const SIGNATURE: [u8; 8] = [0x89, b'H', b'D', b'F', b'\r', b'\n', 0x1a, b'\n'];
+/// Version 2 object header signature (HDF5 spec section IV.A.2).
+const OHDR_SIGNATURE: &[u8; 4] = b"OHDR";
+/// Version 2 object header continuation block signature.
+const OCHK_SIGNATURE: &[u8; 4] = b"OCHK";
 const UNDEFINED_ADDR: u64 = u64::MAX;
 /// Defense against corrupt files: deepest group nesting we will walk.
 const MAX_GROUP_DEPTH: usize = 16;
 /// Defense against corrupt B-trees: most nodes visited per tree walk.
 const MAX_BTREE_NODES: usize = 1 << 16;
+/// Defense against corrupt/self-referencing v2 header continuations: most
+/// header blocks (chunk 0 + OCHK continuations) per object header.
+const MAX_HEADER_BLOCKS: usize = 1 << 10;
 
 /// `true` when the buffer starts with the HDF5 superblock signature.
 pub fn looks_like_hdf5_bytes(bytes: &[u8]) -> bool {
@@ -339,14 +355,19 @@ impl<'a> H5File<'a> {
     }
 
     fn parse_object_header(&self, address: u64) -> Result<ObjectHeader> {
+        // Version 2 headers announce themselves with a signature; version 1
+        // headers have none and start with the version byte.
+        if self
+            .slice(address, OHDR_SIGNATURE.len())
+            .is_ok_and(|sig| sig == OHDR_SIGNATURE)
+        {
+            return self.parse_object_header_v2(address);
+        }
         let head = self.slice(address, 16)?;
         if head[0] != 1 {
             return Err(invalid(
                 address as usize,
-                format!(
-                    "object header version {} (v2/'latest' layout) is unsupported",
-                    head[0]
-                ),
+                format!("object header version {} is unsupported", head[0]),
             ));
         }
         let total_messages = u16::from_le_bytes([head[2], head[3]]) as usize;
@@ -374,6 +395,101 @@ impl<'a> H5File<'a> {
                     messages.push(Message { kind, body });
                 }
                 cursor += 8 + size;
+            }
+        }
+        Ok(ObjectHeader { messages })
+    }
+
+    /// Version 2 object header ("OHDR"), HDF5 spec section IV.A.2.
+    ///
+    /// Wire layout (all little-endian):
+    /// `OHDR` (4) | version=2 (1) | flags (1) |
+    /// [access/mod/change/birth times, 4×u32, when flags bit 5] |
+    /// [max-compact/min-dense attribute counts, 2×u16, when flags bit 4] |
+    /// size-of-chunk-0 (1/2/4/8 bytes per flags bits 0-1) | messages |
+    /// checksum (u32, Jenkins lookup3 over the chunk from the signature on).
+    ///
+    /// Messages: type (u8 — v1 uses u16), size (u16), flags (u8),
+    /// [creation order (u16) when header flags bit 2], body — with NO
+    /// inter-message 8-byte alignment (v1 pads). A trailing gap smaller
+    /// than one message header may precede the checksum. Continuation
+    /// messages (0x0010) point at "OCHK" blocks: signature (4) | messages |
+    /// checksum (u32), whose stored length INCLUDES signature and checksum.
+    fn parse_object_header_v2(&self, address: u64) -> Result<ObjectHeader> {
+        let head = self.slice(address, 6)?;
+        let version = head[4];
+        if version != 2 {
+            return Err(invalid(
+                address as usize,
+                format!("OHDR object header version {version} unsupported (need 2)"),
+            ));
+        }
+        let flags = head[5];
+        let mut cursor = address as usize + 6;
+        if flags & 0x20 != 0 {
+            cursor += 16; // access/mod/change/birth timestamps
+        }
+        if flags & 0x10 != 0 {
+            cursor += 4; // attribute storage phase-change bounds
+        }
+        let size_width = 1usize << (flags & 0x03);
+        let chunk0_size = read_uint(self.bytes, cursor, size_width)? as usize;
+        cursor += size_width;
+        // Creation-order tracking widens every message header by 2 bytes.
+        let message_header = if flags & 0x04 != 0 { 6 } else { 4 };
+        let mut messages = Vec::new();
+        // (message region start, message region length, chunk start for the
+        // checksum). Chunk 0's checksummed span begins at the signature.
+        let mut blocks = vec![(cursor, chunk0_size, address as usize)];
+        let mut block_index = 0;
+        while block_index < blocks.len() {
+            if blocks.len() > MAX_HEADER_BLOCKS {
+                return Err(invalid(
+                    address as usize,
+                    "HDF5 v2 header has too many continuation blocks",
+                ));
+            }
+            let (start, len, chunk_start) = blocks[block_index];
+            block_index += 1;
+            let end = start + len;
+            let stored = self.slice(end as u64, 4)?;
+            let stored = u32::from_le_bytes(stored.try_into().expect("4 bytes"));
+            let computed = jenkins_lookup3(self.slice(chunk_start as u64, end - chunk_start)?);
+            if stored != computed {
+                return Err(invalid(
+                    chunk_start,
+                    format!(
+                        "HDF5 v2 object header checksum mismatch (stored {stored:#010x}, computed {computed:#010x})"
+                    ),
+                ));
+            }
+            let mut cursor = start;
+            // Stop on the trailing gap: any leftover space smaller than one
+            // message header is padding before the checksum.
+            while cursor + message_header <= end {
+                let header = self.slice(cursor as u64, message_header)?;
+                let kind = u16::from(header[0]);
+                let size = u16::from_le_bytes([header[1], header[2]]) as usize;
+                // header[3] = message flags; header[4..6] = creation order.
+                if cursor + message_header + size > end {
+                    return Err(truncated(cursor, message_header + size, end - cursor));
+                }
+                let body = self.slice((cursor + message_header) as u64, size)?.to_vec();
+                if kind == 0x0010 {
+                    let offset = read_offset(&body, 0, self.offset_size)? as usize;
+                    let length = read_uint(&body, self.offset_size, self.length_size)? as usize;
+                    if length < 8 {
+                        return Err(invalid(cursor, "HDF5 v2 continuation block too short"));
+                    }
+                    if self.slice(offset as u64, 4)? != OCHK_SIGNATURE {
+                        return Err(invalid(offset, "expected OCHK signature"));
+                    }
+                    // Message region excludes the signature and checksum.
+                    blocks.push((offset + 4, length - 8, offset));
+                } else {
+                    messages.push(Message { kind, body });
+                }
+                cursor += message_header + size;
             }
         }
         Ok(ObjectHeader { messages })
@@ -1021,6 +1137,69 @@ fn read_offset(bytes: &[u8], at: usize, size: usize) -> Result<u64> {
     Ok(value)
 }
 
+/// Little-endian unsigned integer of `size` bytes WITHOUT the undefined-
+/// address sentinel mapping of [`read_offset`] — for sizes and lengths,
+/// where an all-ones value is a value, not "undefined".
+fn read_uint(bytes: &[u8], at: usize, size: usize) -> Result<u64> {
+    let raw = bytes
+        .get(at..at + size)
+        .ok_or_else(|| truncated(at, size, bytes.len()))?;
+    let mut value = 0u64;
+    for (index, byte) in raw.iter().enumerate() {
+        value |= u64::from(*byte) << (8 * index);
+    }
+    Ok(value)
+}
+
+/// Bob Jenkins' lookup3 `hashlittle` over little-endian words — the
+/// H5_checksum_lookup3 metadata checksum used by v2 object headers and
+/// their continuation blocks (and other 1.8+ structures).
+fn jenkins_lookup3(data: &[u8]) -> u32 {
+    let init = 0xdead_beef_u32.wrapping_add(data.len() as u32);
+    let (mut a, mut b, mut c) = (init, init, init);
+    let word = |chunk: &[u8]| u32::from_le_bytes(chunk.try_into().expect("4 bytes"));
+    let mut rest = data;
+    while rest.len() > 12 {
+        a = a.wrapping_add(word(&rest[0..4]));
+        b = b.wrapping_add(word(&rest[4..8]));
+        c = c.wrapping_add(word(&rest[8..12]));
+        // mix(a, b, c)
+        a = a.wrapping_sub(c) ^ c.rotate_left(4);
+        c = c.wrapping_add(b);
+        b = b.wrapping_sub(a) ^ a.rotate_left(6);
+        a = a.wrapping_add(c);
+        c = c.wrapping_sub(b) ^ b.rotate_left(8);
+        b = b.wrapping_add(a);
+        a = a.wrapping_sub(c) ^ c.rotate_left(16);
+        c = c.wrapping_add(b);
+        b = b.wrapping_sub(a) ^ a.rotate_left(19);
+        a = a.wrapping_add(c);
+        c = c.wrapping_sub(b) ^ b.rotate_left(4);
+        b = b.wrapping_add(a);
+        rest = &rest[12..];
+    }
+    if rest.is_empty() {
+        // hashlittle: a zero-length tail skips the final mix entirely.
+        return c;
+    }
+    // The 1..=12 byte tail reads as three zero-padded words (the C switch
+    // adds only the bytes present, which is the same thing).
+    let mut tail = [0u8; 12];
+    tail[..rest.len()].copy_from_slice(rest);
+    a = a.wrapping_add(word(&tail[0..4]));
+    b = b.wrapping_add(word(&tail[4..8]));
+    c = c.wrapping_add(word(&tail[8..12]));
+    // final(a, b, c)
+    c = (c ^ b).wrapping_sub(b.rotate_left(14));
+    a = (a ^ c).wrapping_sub(c.rotate_left(11));
+    b = (b ^ a).wrapping_sub(a.rotate_left(25));
+    c = (c ^ b).wrapping_sub(b.rotate_left(16));
+    a = (a ^ c).wrapping_sub(c.rotate_left(4));
+    b = (b ^ a).wrapping_sub(a.rotate_left(14));
+    c = (c ^ b).wrapping_sub(b.rotate_left(24));
+    c
+}
+
 fn read_int(raw: &[u8], signed: bool, big_endian: bool) -> i64 {
     let mut value = 0u64;
     if big_endian {
@@ -1116,5 +1295,32 @@ mod tests {
             UNDEFINED_ADDR
         );
         assert_eq!(read_offset(&[0x10, 0, 0, 0], 0, 4).unwrap(), 0x10);
+    }
+
+    /// Unlike `read_offset`, `read_uint` must NOT map all-ones to the
+    /// undefined sentinel — 0xFF is a legal 1-byte chunk size.
+    #[test]
+    fn read_uint_keeps_all_ones_values() {
+        assert_eq!(read_uint(&[0xFF], 0, 1).unwrap(), 0xFF);
+        assert_eq!(read_uint(&[0xFF, 0xFF], 0, 2).unwrap(), 0xFFFF);
+        assert_eq!(read_uint(&[0x83, 0x01], 0, 2).unwrap(), 0x0183);
+    }
+
+    /// Jenkins lookup3 (hashlittle) known-answer vectors. The 30-byte
+    /// phrase with init 0 is the published lookup3 self-test value; the
+    /// shorter vectors pin every tail-length branch class (empty, <4,
+    /// exactly 12 = one full block, 13 = block + 1-byte tail) and were
+    /// cross-checked against real HDF5 v2 header checksums (AEMET espdg
+    /// PVOL fixture) with an independent Python implementation.
+    #[test]
+    fn jenkins_lookup3_matches_reference_vectors() {
+        assert_eq!(jenkins_lookup3(b""), 0xdead_beef);
+        assert_eq!(
+            jenkins_lookup3(b"Four score and seven years ago"),
+            0x1777_0551
+        );
+        assert_eq!(jenkins_lookup3(b"abc"), 0x0e39_7631);
+        assert_eq!(jenkins_lookup3(b"0123456789ab"), 0x1065_e50a);
+        assert_eq!(jenkins_lookup3(b"0123456789abc"), 0x7351_ce56);
     }
 }
