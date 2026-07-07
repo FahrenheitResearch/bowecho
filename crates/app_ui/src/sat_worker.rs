@@ -95,6 +95,12 @@ pub enum SatRequest {
     /// compose an AHI true-color RGB, and write it as one composite frame —
     /// the Himawari analogue of [`SatRequest::IngestLatestGoesComposite`].
     IngestLatestHimawariComposite(HimawariCompositeSpec),
+    /// Native-window single-band Himawari IR ingest (tropical-card "🛰 IR"):
+    /// window-cropped true-Kelvin BT, recolored live by the IR enhancement.
+    IngestLatestHimawariIrWindow(HimawariIrWindowSpec),
+    /// Native-window GOES IR ingest (tropical-card "🛰 IR"): window-cropped
+    /// CMI BT baked through the current IR enhancement into a `_rgb_` frame.
+    IngestLatestGoesIrWindow(GoesIrWindowSpec),
 }
 
 /// Himawari AHI visible RGB-composite recipe. Unlike GOES ABI (which lacks a
@@ -202,6 +208,10 @@ pub struct HimawariCompositeSpec {
     /// Pick the newest complete scan at/before this time instead of "now" —
     /// lets proofs/backfills pin an exact scan (e.g. the last daylight pass).
     pub as_of: Option<DateTime<Utc>>,
+    /// Tropical-card correlation ticket: when set, the dispatcher reports
+    /// this ingest's outcome on the card-outcome side channel (see
+    /// [`CardOutcome`]) so the requesting storm card can clear its spinner.
+    pub card_ticket: Option<u64>,
 }
 
 impl Default for HimawariCompositeSpec {
@@ -218,6 +228,7 @@ impl Default for HimawariCompositeSpec {
             downsample: 4,
             window: None,
             as_of: None,
+            card_ticket: None,
         }
     }
 }
@@ -246,6 +257,8 @@ pub struct GoesCompositeSpec {
     pub window: Option<SatNativeWindow>,
     /// Pick the newest all-band scan at/before this time instead of "now".
     pub as_of: Option<DateTime<Utc>>,
+    /// Tropical-card correlation ticket (see [`CardOutcome`]).
+    pub card_ticket: Option<u64>,
 }
 
 impl Default for GoesCompositeSpec {
@@ -258,6 +271,7 @@ impl Default for GoesCompositeSpec {
             lookback_minutes: 180,
             window: None,
             as_of: None,
+            card_ticket: None,
         }
     }
 }
@@ -281,6 +295,75 @@ impl Default for HimawariQuickSpec {
             downsample: 2,
         }
     }
+}
+
+/// One-shot NATIVE-WINDOW Himawari AHI IR ingest (the tropical-card "🛰 IR"
+/// path for Himawari-covered storms): download only the full-disk segments
+/// covering `window`, decode only the window's pixels of one IR band at
+/// stride 1, calibrate to true Kelvin BT, and write a single-band frame.
+/// The stored plane is brightness temperature, so the IR-enhancement picker
+/// recolors it live at load time exactly like every other IR band frame.
+#[derive(Debug, Clone)]
+pub struct HimawariIrWindowSpec {
+    /// Himawari satellite slug (`h9`, `h8`).
+    pub satellite: String,
+    /// AHI IR band (7-16; the card requests 13, Clean IR 10.4 µm).
+    pub band: u8,
+    /// Native-resolution spatial window (required — this request exists to
+    /// serve a storm-centered crop; full-disk IR is `IngestLatestHimawari`).
+    pub window: SatNativeWindow,
+    /// How far back to scan 10-min slots for the latest scan.
+    pub lookback_minutes: i64,
+    /// Pick the newest scan at/before this time instead of "now".
+    pub as_of: Option<DateTime<Utc>>,
+    /// Tropical-card correlation ticket (see [`CardOutcome`]).
+    pub card_ticket: Option<u64>,
+}
+
+/// One-shot NATIVE-WINDOW GOES ABI IR ingest (the tropical-card "🛰 IR"
+/// path for GOES-covered storms): download the latest whole-sector CMI file
+/// for one IR band, decode ONLY the window's hyperslab at stride 1
+/// ([`read_goes_abi_window`] — the v0.29.3 native-window machinery), color
+/// the Kelvin BT through the worker's CURRENT IR enhancement, and write the
+/// result as a baked three-plane `_rgb_` frame.
+///
+/// Why baked: the app's run-key display filter admits GOES runs
+/// unconditionally only for `_rgb_` (baked three-plane) run families, and
+/// the store contract "`_rgb_` in the run name ⇔ the frame holds
+/// `rgb_r/g/b` planes" must hold. The cost is that the enhancement is
+/// fixed at ingest time — switching the IR-enhancement picker later
+/// recolors single-band BT frames but not these; press the card button
+/// again to bake the new curve.
+#[derive(Debug, Clone)]
+pub struct GoesIrWindowSpec {
+    /// Satellite slug (`goes19`, `goes18`, `goes16`).
+    pub satellite: String,
+    /// Sector slug (`fulldisk` covers any storm the satellite can see).
+    pub sector: String,
+    /// ABI IR band (7-16; the card requests 13, Clean IR 10.3 µm).
+    pub band: u8,
+    /// Native-resolution spatial window (required, as above).
+    pub window: SatNativeWindow,
+    /// How far back to scan hour prefixes for the latest scan.
+    pub lookback_minutes: i64,
+    /// Pick the newest scan at/before this time instead of "now".
+    pub as_of: Option<DateTime<Utc>>,
+    /// Tropical-card correlation ticket (see [`CardOutcome`]).
+    pub card_ticket: Option<u64>,
+}
+
+/// Completed one-shot ingest report on the card-only side channel: the
+/// tropical storm cards need "my request finished (ok/err)" to clear their
+/// one-press spinner, and the main response pump only runs while the
+/// Satellite window is open — a dedicated channel keeps the card state
+/// honest without new [`SatResponse`] variants (main.rs's pump match is
+/// owned by the parallel extraction work and must not grow arms here).
+#[derive(Debug, Clone)]
+pub struct CardOutcome {
+    /// The `card_ticket` the requesting spec carried.
+    pub ticket: u64,
+    /// The ingest's summary line (`Ok`) or failure message (`Err`).
+    pub result: Result<String, String>,
 }
 
 /// A frame prepared for the map layer: the palette-colored image, the
@@ -366,6 +449,7 @@ pub enum SatResponse {
 pub struct SatWorker {
     tx: Sender<SatRequest>,
     rx: Receiver<SatResponse>,
+    card_rx: Receiver<CardOutcome>,
     cancel: Arc<AtomicBool>,
     _thread: JoinHandle<()>,
 }
@@ -376,6 +460,7 @@ impl SatWorker {
     pub fn spawn(store_root: PathBuf, notify: impl Fn() + Send + Sync + 'static) -> Self {
         let (req_tx, req_rx) = channel::<SatRequest>();
         let (resp_tx, resp_rx) = channel::<SatResponse>();
+        let (card_tx, card_rx) = channel::<CardOutcome>();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(notify);
@@ -383,12 +468,20 @@ impl SatWorker {
             .name("rw-sat-worker".to_string())
             .spawn(move || {
                 rw_ingest::throttle::set_current_thread_background_priority();
-                worker_loop(store_root, &req_rx, &resp_tx, &notify, &worker_cancel);
+                worker_loop(
+                    store_root,
+                    &req_rx,
+                    &resp_tx,
+                    &card_tx,
+                    &notify,
+                    &worker_cancel,
+                );
             })
             .expect("spawn sat worker thread");
         Self {
             tx: req_tx,
             rx: resp_rx,
+            card_rx,
             cancel,
             _thread: thread,
         }
@@ -402,6 +495,13 @@ impl SatWorker {
     /// Non-blocking poll for the next response (drain once per frame).
     pub fn try_recv(&self) -> Option<SatResponse> {
         self.rx.try_recv().ok()
+    }
+
+    /// Non-blocking poll for the next tropical-card ingest outcome
+    /// (drained by the storm-card driver every frame, independent of
+    /// whether the Satellite window's response pump is running).
+    pub fn try_recv_card_outcome(&self) -> Option<CardOutcome> {
+        self.card_rx.try_recv().ok()
     }
 
     /// Request the running follow session to stop. Takes effect at the
@@ -709,14 +809,42 @@ fn run_title(model: &str, run: &str) -> String {
                 return format!("{model} · {sector} {} · {day}", style.title());
             }
         }
+        // Tropical-card enhanced-IR window runs: `<sector>_rgb_ir<band>_<day>`.
+        if let Some(pos) = run.find("_rgb_ir") {
+            let band = run[pos + "_rgb_ir".len()..]
+                .split('_')
+                .next()
+                .and_then(|raw| raw.parse::<u8>().ok());
+            if let Some(band) = band {
+                let sector = &run[..pos];
+                return format!("{model} · {sector} Enhanced IR C{band:02} · {day}");
+            }
+        }
         return format!("{model} · {run}");
     }
-    let mut tokens = run.split('_');
-    let sector = tokens.next().unwrap_or(run);
-    let band = tokens
-        .next()
-        .and_then(|token| token.strip_prefix('c'))
-        .and_then(|raw| raw.parse::<u8>().ok());
+    // The band token normally follows the sector, but windowed single-band
+    // runs (`fulldisk_win135n1448e800_c13_<day>`) carry the window token in
+    // between — take the first `c<band>` token wherever it sits and keep
+    // everything before it (incl. the window token) as the sector label.
+    let tokens: Vec<&str> = run.split('_').collect();
+    let band_idx = tokens
+        .iter()
+        .skip(1)
+        .position(|token| {
+            token
+                .strip_prefix('c')
+                .is_some_and(|raw| raw.parse::<u8>().is_ok())
+        })
+        .map(|idx| idx + 1);
+    let (sector, band) = match band_idx {
+        Some(idx) => (
+            tokens[..idx].join("_"),
+            tokens[idx]
+                .strip_prefix('c')
+                .and_then(|raw| raw.parse::<u8>().ok()),
+        ),
+        None => (tokens.first().copied().unwrap_or(run).to_string(), None),
+    };
     let day = run_day(run)
         .map(|day| day.format("%Y-%m-%d").to_string())
         .unwrap_or_default();
@@ -3472,6 +3600,119 @@ fn ingest_latest_himawari_composite(
     ))
 }
 
+/// Native-window single-band Himawari IR ingest (the tropical-card "🛰 IR"
+/// path): fetch only the full-disk segments covering the window, decode only
+/// the window's pixels at stride 1 ([`assemble_ahi_window_counts`] via
+/// [`fetch_himawari_band_counts`]), convert the true raw counts to real
+/// Kelvin BT with the header's block-5 calibration (the same fix
+/// [`ingest_latest_himawari`] applies), and write ONE single-band frame.
+/// The stored plane is brightness temperature, so the IR-enhancement picker
+/// (BD, AVN, …) recolors it live at load time; the run family carries the
+/// window token (`fulldisk_<win…>_c13_<day>`) so successive scans of the
+/// same storm window loop in the player.
+fn ingest_latest_himawari_ir_window(
+    store_root: &Path,
+    spec: &HimawariIrWindowSpec,
+    send: &impl Fn(SatResponse) -> bool,
+) -> Result<String, String> {
+    let satellite = HimawariSatellite::parse(&spec.satellite)
+        .ok_or_else(|| format!("unknown Himawari satellite '{}'", spec.satellite))?;
+    let band = spec.band;
+    if !(7..=16).contains(&band) {
+        return Err(format!(
+            "AHI B{band:02} is not an IR band (7-16) — the IR window ingest stores Kelvin BT"
+        ));
+    }
+    let window = spec.window.clamped();
+    let (seg_start, seg_count) = himawari_window_segments(window)?;
+    let cache_root = store_root.join("cache");
+    let source_root = store_root.join("sources").join("himawari");
+
+    let pick = latest_himawari_visible_scan(
+        satellite,
+        &[band],
+        seg_start,
+        seg_count,
+        spec.lookback_minutes.max(10),
+        spec.as_of.unwrap_or_else(Utc::now),
+    )?;
+    let objects = pick
+        .by_band
+        .get(&band)
+        .ok_or_else(|| format!("the picked scan is missing AHI B{band:02}"))?;
+
+    let (mut field, calibration) = fetch_himawari_band_counts(
+        satellite,
+        pick.scan_time,
+        &pick.prefix,
+        band,
+        objects,
+        &cache_root,
+        &source_root,
+        1,
+        Some(window),
+        false,
+        send,
+    )?;
+    field.values = ahi_counts_to_brightness_temperature(&field.values, &calibration)?;
+    // Re-stamp the count-mode field as calibrated BT so the load path
+    // renders it through the absolute-Kelvin IR enhancements (variable
+    // naming mirrors rw-sat's `HimawariValueMode::BrightnessTemperature`).
+    field.variable_name = format!("ahi_bt_c{band:02}");
+    field.units = "K".to_string();
+    field.scene.layer = format!("bt_c{band:02}");
+    field.scene.source_variable = "HSD count -> BT (block-5 calibration)".to_string();
+    if let Some(mode) = field.scene.metadata.get_mut("value_mode") {
+        *mode = serde_json::json!("brightness_temperature");
+    }
+
+    // The navigation mesh masks the few limb/space pixels a padded window
+    // crop can include AND becomes the frame's baked geometry (same
+    // mask-equals-stored-mesh discipline as the full-disk IR ingest).
+    let mesh = ahi_lat_lon_mesh(&field.scene);
+    for (value, lat) in field.values.iter_mut().zip(&mesh.0) {
+        if !lat.is_finite() {
+            *value = f32::NAN;
+        }
+    }
+    let (nx, ny) = (field.scene.fixed_grid.nx, field.scene.fixed_grid.ny);
+    let frame = write_himawari_grid_frame(
+        store_root,
+        &field,
+        Utc::now().timestamp().max(0) as u64,
+        Some(mesh),
+    )?;
+
+    for object in objects {
+        send(SatResponse::FrameWritten {
+            id: object.key.clone(),
+            run: frame.run.clone(),
+            hhmm: frame.hhmm,
+            bytes: frame.bytes,
+            encode_ms: frame.encode_ms,
+        });
+    }
+    send(SatResponse::Runs(scan_runs(store_root)));
+    send(SatResponse::SelectFrame {
+        key: SatRunKey {
+            model: frame.model.clone(),
+            run: frame.run.clone(),
+        },
+        hhmm: frame.hhmm,
+    });
+    Ok(format!(
+        "Himawari {} B{band:02} IR window {}: scan {} · {}x{} @ native res · wrote {}/{}/t{:04}",
+        satellite.platform(),
+        window.run_slug(),
+        pick.scan_time.format("%Y-%m-%d %H:%MZ"),
+        nx,
+        ny,
+        frame.model,
+        frame.run,
+        frame.hhmm
+    ))
+}
+
 /// ABI scan mode token in the open-data filenames (mode 6 since 2019; mode
 /// 3 is the legacy contingency schedule). A mode flip degrades to editing
 /// this constant, mirroring rw-sat's follow engine.
@@ -3745,6 +3986,182 @@ fn ingest_latest_goes_composite(
     ))
 }
 
+/// Bake an IR-enhancement palette over a Kelvin BT plane into three
+/// `rgb_r/g/b` planes (`[0, 255]` f32) for a baked `_rgb_` frame. NaN
+/// (off-earth / fill) stays NaN in all three planes — the composite render
+/// path shows those pixels transparent, matching the vis composites'
+/// behavior on the map. Returns the planes plus the count of lit pixels.
+fn bake_ir_planes(
+    values: &[f32],
+    band: u8,
+    enhancement: IrEnhancement,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, usize) {
+    let anchors = ir_enhancement_anchors(band, enhancement);
+    let len = values.len();
+    let (mut r, mut g, mut b) = (
+        Vec::with_capacity(len),
+        Vec::with_capacity(len),
+        Vec::with_capacity(len),
+    );
+    let mut lit = 0usize;
+    for &value in values {
+        if value.is_finite() {
+            let [red, green, blue, _] = anchor_color(value, anchors);
+            r.push(f32::from(red));
+            g.push(f32::from(green));
+            b.push(f32::from(blue));
+            lit += 1;
+        } else {
+            r.push(f32::NAN);
+            g.push(f32::NAN);
+            b.push(f32::NAN);
+        }
+    }
+    (r, g, b, lit)
+}
+
+/// Native-window GOES IR ingest (the tropical-card "🛰 IR" path): download
+/// the latest whole-sector CMI file for `spec.band`, decode ONLY the
+/// window's hyperslab at stride 1 ([`read_goes_abi_window`] — the v0.29.3
+/// native-window machinery), color the Kelvin BT through `enhancement`
+/// ([`ir_enhancement_anchors`], the same tables the live render uses), and
+/// write the result as a baked `_rgb_` frame
+/// (`<sector>_<win…>_rgb_ir<band>_<day>`).
+///
+/// Baked-vs-live tradeoff: see [`GoesIrWindowSpec`]. The enhancement used
+/// is stamped in the frame selector's `enhanced_ir` block.
+fn ingest_latest_goes_ir_window(
+    store_root: &Path,
+    spec: &GoesIrWindowSpec,
+    enhancement: IrEnhancement,
+    send: &impl Fn(SatResponse) -> bool,
+) -> Result<String, String> {
+    let band = spec.band;
+    if !(7..=16).contains(&band) {
+        return Err(format!(
+            "ABI C{band:02} is not an IR band (7-16) — the IR window ingest colors Kelvin BT"
+        ));
+    }
+    let bucket = bucket_for_satellite(&spec.satellite).map_err(|err| err.to_string())?;
+    let sector =
+        Sector::parse(&spec.sector).ok_or_else(|| format!("unknown sector '{}'", spec.sector))?;
+    let satellite = GoesSatellite::parse(&spec.satellite);
+    let window = spec.window.clamped();
+    let cache_dir = store_root.join("cache");
+
+    let now = spec.as_of.unwrap_or_else(Utc::now);
+    let hour_span = (spec.lookback_minutes.max(20) / 60) + 2;
+    let hours: Vec<DateTime<Utc>> = (0..hour_span)
+        .map(|i| now - chrono::Duration::hours(i))
+        .collect();
+    let (scan_start, objects) = latest_common_scan(
+        &bucket,
+        sector.abi_product(),
+        &satellite,
+        &[band],
+        &hours,
+        spec.as_of,
+    )?;
+    let object = &objects[&band];
+
+    let agent = build_agent();
+    send(SatResponse::DownloadStarted {
+        id: object.key.clone(),
+        label: download_label(&object.key),
+        bytes: object.size_bytes,
+    });
+    let started = Instant::now();
+    let downloaded = download_object(&agent, &bucket, &cache_dir, object, true)
+        .map_err(|err| err.to_string())?;
+    send(SatResponse::DownloadDone {
+        id: object.key.clone(),
+        ms: started.elapsed().as_millis(),
+        cache_hit: downloaded.cache_hit,
+    });
+    let field = read_goes_abi_window(&downloaded.path, window)?;
+
+    let len = field.values.len();
+    let (r, g, b, lit) = bake_ir_planes(&field.values, band, enhancement);
+
+    let scene = &field.scene;
+    let projection = &scene.projection;
+    let sweep = match projection.sweep_angle_axis {
+        SweepAngleAxis::X => "x",
+        SweepAngleAxis::Y => "y",
+    };
+    let selector = serde_json::json!({
+        "satellite": {
+            "provider": "noaa",
+            "instrument": "abi",
+            "satellite": scene.satellite.as_str(),
+            "product": scene.product,
+            "band": band,
+            "layer": format!("rgb_ir{band:02}"),
+            "source_variable": "CMI",
+            "enhanced_ir": {
+                "band": band,
+                "enhancement": enhancement.slug(),
+                "enhancement_label": enhancement.label(),
+                "native_window": {
+                    "center_lat_deg": window.center_lat_deg,
+                    "center_lon_deg": window.center_lon_deg,
+                    "size_km": window.size_km,
+                },
+            },
+            "scan_start_utc": scene.start_time_utc.to_rfc3339(),
+            "scan_end_utc": scene.end_time_utc.to_rfc3339(),
+            "projection": {
+                "perspective_point_height_m": projection.perspective_point_height_m,
+                "semi_major_axis_m": projection.semi_major_axis_m,
+                "semi_minor_axis_m": projection.semi_minor_axis_m,
+                "longitude_of_projection_origin_deg":
+                    projection.longitude_of_projection_origin_deg,
+                "sweep_angle_axis": sweep,
+            },
+        }
+    });
+    let frame = write_goes_rgb_frame(
+        store_root,
+        scene,
+        &format!("rgb_ir{band:02}"),
+        selector,
+        &r,
+        &g,
+        &b,
+        Utc::now().timestamp().max(0) as u64,
+    )?;
+
+    send(SatResponse::FrameWritten {
+        id: object.key.clone(),
+        run: frame.run.clone(),
+        hhmm: frame.hhmm,
+        bytes: frame.bytes,
+        encode_ms: frame.encode_ms,
+    });
+    send(SatResponse::Runs(scan_runs(store_root)));
+    send(SatResponse::SelectFrame {
+        key: SatRunKey {
+            model: frame.model.clone(),
+            run: frame.run.clone(),
+        },
+        hhmm: frame.hhmm,
+    });
+
+    Ok(format!(
+        "GOES {} {} C{band:02} IR window ({}): scan {} · {}x{} @ native res · {:.0}% on-earth · wrote {}/{}/t{:04}",
+        satellite.as_str(),
+        sector_slug(&scene.sector),
+        enhancement.label(),
+        scan_start.format("%Y-%m-%d %H:%MZ"),
+        scene.fixed_grid.nx,
+        scene.fixed_grid.ny,
+        100.0 * lit as f64 / len.max(1) as f64,
+        frame.model,
+        frame.run,
+        frame.hhmm
+    ))
+}
+
 /// The generic satellite selector for a baked RGB composite frame: base band
 /// on the GOES fixed-grid projection (sweep=x), plus a `composite` block
 /// naming the style and its source bands.
@@ -3792,7 +4209,6 @@ fn composite_selector(scene: &GoesAbiScene, style: GoesAbiRgbCompositeStyle) -> 
 /// contract as [`write_band_frame`] (grid.rwg shared by bit-identical grids,
 /// `t{HHMM}.rws`, a `run.json` manifest, fresh suffixed run dir on a grid
 /// change). Composite runs are `<sector>_rgb_<style>_<YYYYMMDD>`.
-#[allow(clippy::too_many_arguments)]
 fn write_goes_composite_frame(
     store_root: &Path,
     scene: &GoesAbiScene,
@@ -3802,11 +4218,41 @@ fn write_goes_composite_frame(
     b: &[f32],
     written_unix: u64,
 ) -> Result<WrittenFrame, String> {
+    write_goes_rgb_frame(
+        store_root,
+        scene,
+        &format!("rgb_{}", style.slug()),
+        composite_selector(scene, style),
+        r,
+        g,
+        b,
+        written_unix,
+    )
+}
+
+/// The baked-RGB store writer behind [`write_goes_composite_frame`] and the
+/// tropical-card enhanced-IR window frames: `family` is the run-name token
+/// between sector and day (`rgb_<style>` / `rgb_ir13`) and MUST contain
+/// `rgb` — the run-name⇔content contract is "`_rgb_` in the name ⇔ the
+/// frame holds three baked `rgb_r/g/b` planes", and the app's run-key
+/// display filter admits these runs by that token.
+#[allow(clippy::too_many_arguments)]
+fn write_goes_rgb_frame(
+    store_root: &Path,
+    scene: &GoesAbiScene,
+    family: &str,
+    selector: serde_json::Value,
+    r: &[f32],
+    g: &[f32],
+    b: &[f32],
+    written_unix: u64,
+) -> Result<WrittenFrame, String> {
+    debug_assert!(family.starts_with("rgb"), "baked family token: {family}");
     let model = scene.satellite.as_str().to_ascii_lowercase();
     let sector = sector_slug(&scene.sector);
     let day = scene.start_time_utc.format("%Y%m%d").to_string();
     let hhmm = (scene.start_time_utc.hour() * 100 + scene.start_time_utc.minute()) as u16;
-    let run_base = format!("{sector}_rgb_{}_{day}", style.slug());
+    let run_base = format!("{sector}_{family}_{day}");
 
     let (nx, ny) = (scene.fixed_grid.nx, scene.fixed_grid.ny);
     let expected = nx.saturating_mul(ny);
@@ -3884,7 +4330,6 @@ fn write_goes_composite_frame(
     };
 
     let started = Instant::now();
-    let selector = composite_selector(scene, style);
     let writer_build = concat!("bowecho app_ui ", env!("CARGO_PKG_VERSION"));
     let mut writer = HourWriter::new(&model, &run_name, hhmm, nx, ny, &grid_hash, writer_build);
     writer
@@ -3955,6 +4400,7 @@ fn worker_loop(
     store_root: PathBuf,
     requests: &Receiver<SatRequest>,
     responses: &Sender<SatResponse>,
+    card_outcomes: &Sender<CardOutcome>,
     notify: &Arc<dyn Fn() + Send + Sync>,
     cancel: &Arc<AtomicBool>,
 ) {
@@ -3964,6 +4410,17 @@ fn worker_loop(
         let ok = responses.send(response).is_ok();
         notify();
         ok
+    };
+    // Report a card-ticketed one-shot ingest's outcome on the side channel
+    // (no-op for unticketed requests — the regular panel buttons).
+    let send_card = |ticket: Option<u64>, result: &Result<String, String>| {
+        if let Some(ticket) = ticket {
+            let _ = card_outcomes.send(CardOutcome {
+                ticket,
+                result: result.clone(),
+            });
+            notify();
+        }
     };
     while let Ok(request) = requests.recv() {
         match request {
@@ -4025,7 +4482,9 @@ fn worker_loop(
                     "GOES composite: locating latest {} {} {}{scope}",
                     spec.satellite, spec.sector, spec.style
                 )));
-                match ingest_latest_goes_composite(&store_root, &spec, &send) {
+                let result = ingest_latest_goes_composite(&store_root, &spec, &send);
+                send_card(spec.card_ticket, &result);
+                match result {
                     Ok(summary) => {
                         send(SatResponse::Note(summary));
                         send(SatResponse::Runs(scan_runs(&store_root)));
@@ -4053,7 +4512,9 @@ fn worker_loop(
                     "Himawari composite: locating latest {} {} ({scope})",
                     spec.satellite, spec.style,
                 )));
-                match ingest_latest_himawari_composite(&store_root, &spec, &send) {
+                let result = ingest_latest_himawari_composite(&store_root, &spec, &send);
+                send_card(spec.card_ticket, &result);
+                match result {
                     Ok(summary) => {
                         send(SatResponse::Note(summary));
                         send(SatResponse::Runs(scan_runs(&store_root)));
@@ -4061,6 +4522,50 @@ fn worker_loop(
                     Err(message) => {
                         send(SatResponse::Note(format!(
                             "Himawari composite failed: {message}"
+                        )));
+                    }
+                }
+            }
+            SatRequest::IngestLatestHimawariIrWindow(spec) => {
+                send(SatResponse::Note(format!(
+                    "Himawari IR window: locating latest {} B{:02} · {}",
+                    spec.satellite,
+                    spec.band,
+                    spec.window.run_slug()
+                )));
+                let result = ingest_latest_himawari_ir_window(&store_root, &spec, &send);
+                send_card(spec.card_ticket, &result);
+                match result {
+                    Ok(summary) => {
+                        send(SatResponse::Note(summary));
+                        send(SatResponse::Runs(scan_runs(&store_root)));
+                    }
+                    Err(message) => {
+                        send(SatResponse::Note(format!(
+                            "Himawari IR window failed: {message}"
+                        )));
+                    }
+                }
+            }
+            SatRequest::IngestLatestGoesIrWindow(spec) => {
+                send(SatResponse::Note(format!(
+                    "GOES IR window: locating latest {} {} B{:02} · {}",
+                    spec.satellite,
+                    spec.sector,
+                    spec.band,
+                    spec.window.run_slug()
+                )));
+                let result =
+                    ingest_latest_goes_ir_window(&store_root, &spec, state.ir_enhancement, &send);
+                send_card(spec.card_ticket, &result);
+                match result {
+                    Ok(summary) => {
+                        send(SatResponse::Note(summary));
+                        send(SatResponse::Runs(scan_runs(&store_root)));
+                    }
+                    Err(message) => {
+                        send(SatResponse::Note(format!(
+                            "GOES IR window failed: {message}"
                         )));
                     }
                 }
@@ -4953,6 +5458,7 @@ mod tests {
             lookback_minutes: 240,
             window: None,
             as_of: None,
+            card_ticket: None,
         };
         let sink = |response: SatResponse| {
             if let SatResponse::Note(message) = &response {
@@ -5899,6 +6405,7 @@ mod tests {
             downsample: env_usize("BOWECHO_SAT_HIMAWARI_COMPOSITE_DOWNSAMPLE", 6),
             window: None,
             as_of: None,
+            card_ticket: None,
         };
         let sink = |response: SatResponse| {
             if let SatResponse::Note(message) = &response {
@@ -6044,6 +6551,7 @@ mod tests {
                 lookback_minutes: 360,
                 window: None,
                 as_of,
+                card_ticket: None,
             };
             let summary =
                 ingest_latest_goes_composite(&store, &base, &sink).expect("default GOES ingest");
@@ -6523,5 +7031,184 @@ mod tests {
             "goes19_b13",
             (5.0, 20.0, -55.0, -40.0),
         );
+    }
+
+    fn tc_card_window(lat: f64, lon: f64) -> SatNativeWindow {
+        SatNativeWindow {
+            center_lat_deg: lat,
+            center_lon_deg: lon,
+            size_km: 1000.0,
+        }
+    }
+
+    /// The tropical-card side channel reports EXACTLY the ticketed one-shot
+    /// ingests, in order: an unticketed request (a regular panel button)
+    /// must stay silent, and outcomes carry the request's own ticket. Both
+    /// failures here are offline validation failures (non-IR band), so no
+    /// network is touched.
+    #[test]
+    fn card_outcomes_report_only_ticketed_ingests() {
+        let dir = test_dir("card-outcomes");
+        let worker = SatWorker::spawn(dir.clone(), || {});
+        worker.send(SatRequest::IngestLatestGoesIrWindow(GoesIrWindowSpec {
+            satellite: "goes19".to_string(),
+            sector: "fulldisk".to_string(),
+            band: 2,
+            window: tc_card_window(25.0, -80.0),
+            lookback_minutes: 60,
+            as_of: None,
+            card_ticket: Some(41),
+        }));
+        worker.send(SatRequest::IngestLatestHimawariIrWindow(
+            HimawariIrWindowSpec {
+                satellite: "h9".to_string(),
+                band: 2,
+                window: tc_card_window(13.5, 144.8),
+                lookback_minutes: 60,
+                as_of: None,
+                card_ticket: None,
+            },
+        ));
+        worker.send(SatRequest::IngestLatestHimawariIrWindow(
+            HimawariIrWindowSpec {
+                satellite: "h9".to_string(),
+                band: 2,
+                window: tc_card_window(13.5, 144.8),
+                lookback_minutes: 60,
+                as_of: None,
+                card_ticket: Some(43),
+            },
+        ));
+
+        let mut outcomes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while outcomes.len() < 2 && Instant::now() < deadline {
+            match worker.try_recv_card_outcome() {
+                Some(outcome) => outcomes.push(outcome),
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        assert_eq!(outcomes.len(), 2, "two ticketed ingests, two outcomes");
+        assert_eq!(outcomes[0].ticket, 41);
+        assert!(
+            outcomes[0]
+                .result
+                .as_ref()
+                .expect_err("C02 is not an IR band")
+                .contains("not an IR band"),
+            "{:?}",
+            outcomes[0].result
+        );
+        // The middle (unticketed) request produced nothing: the next
+        // outcome is the third request's.
+        assert_eq!(outcomes[1].ticket, 43, "unticketed ingests stay silent");
+        assert!(outcomes[1].result.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The GOES enhanced-IR bake + write path end to end (offline): BD
+    /// colors over Kelvin BT, NaN stays transparent, the run lands in the
+    /// `_rgb_ir13_` family (the token that passes the app's composite
+    /// display filter), and the player load path renders it.
+    #[test]
+    fn goes_ir_window_bake_writes_a_recognized_rgb_frame() {
+        let dir = test_dir("ir-window-bake");
+        let (nx, ny) = (2usize, 2usize);
+        let mut field = synthetic_field(nx, ny, 6, 30, 13);
+        // Overshooting top, eyewall cold, warm ocean, off-earth.
+        field.values = vec![190.0, 220.0, 295.0, f32::NAN];
+
+        let (r, g, b, lit) = bake_ir_planes(&field.values, 13, IrEnhancement::Bd);
+        assert_eq!(lit, 3, "three finite BT pixels");
+        assert!(
+            r[3].is_nan() && g[3].is_nan() && b[3].is_nan(),
+            "off-earth stays NaN in all planes"
+        );
+
+        let selector = serde_json::json!({ "satellite": {
+            "band": 13,
+            "enhanced_ir": { "enhancement": IrEnhancement::Bd.slug() },
+        }});
+        let frame =
+            write_goes_rgb_frame(&dir, &field.scene, "rgb_ir13", selector, &r, &g, &b, 1).unwrap();
+        assert_eq!(frame.model, "g19");
+        assert!(
+            frame.run.contains("_rgb_ir13_"),
+            "enhanced-IR family naming: {}",
+            frame.run
+        );
+        let title = run_title(&frame.model, &frame.run);
+        assert!(title.contains("Enhanced IR C13"), "{title}");
+
+        // Loads through the exact player path (composite branch: the frame
+        // holds rgb_r/g/b planes, honoring the _rgb_ naming contract).
+        let mut state = WorkerState::default();
+        let key = SatRunKey {
+            model: frame.model.clone(),
+            run: frame.run.clone(),
+        };
+        let loaded = load_frame(&mut state, &dir, &key, frame.hhmm)
+            .expect("baked IR frame loads")
+            .frame;
+        assert_eq!(loaded.image.size, [nx, ny]);
+        // North-first synthetic grid: no row flip, indices map 1:1.
+        assert_eq!(loaded.image.pixels[0].a(), 255, "cold top is opaque");
+        assert_eq!(
+            loaded.image.pixels[3].a(),
+            0,
+            "off-earth pixel renders transparent"
+        );
+        assert_ne!(
+            loaded.image.pixels[0], loaded.image.pixels[2],
+            "BD colors 190 K and 295 K differently"
+        );
+        let stored = rw_sat::store::read_frame(&dir, &frame.model, &frame.run, frame.hhmm).unwrap();
+        assert_eq!(
+            stored.selector["satellite"]["enhanced_ir"]["enhancement"],
+            "bd"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Offline validation of the IR-window ingests: non-IR bands are
+    /// refused before any network touch (both satellites), and the run-title
+    /// band scan understands windowed single-band run names.
+    #[test]
+    fn ir_window_specs_validate_bands_and_titles_offline() {
+        let dir = test_dir("ir-window-validate");
+        let sink = |_: SatResponse| true;
+        let goes = GoesIrWindowSpec {
+            satellite: "goes19".to_string(),
+            sector: "fulldisk".to_string(),
+            band: 2,
+            window: tc_card_window(25.0, -80.0),
+            lookback_minutes: 60,
+            as_of: None,
+            card_ticket: None,
+        };
+        let err = ingest_latest_goes_ir_window(&dir, &goes, IrEnhancement::Bd, &sink)
+            .expect_err("C02 refused");
+        assert!(err.contains("not an IR band"), "{err}");
+
+        let himawari = HimawariIrWindowSpec {
+            satellite: "h9".to_string(),
+            band: 3,
+            window: tc_card_window(13.5, 144.8),
+            lookback_minutes: 60,
+            as_of: None,
+            card_ticket: None,
+        };
+        let err =
+            ingest_latest_himawari_ir_window(&dir, &himawari, &sink).expect_err("B03 refused");
+        assert!(err.contains("not an IR band"), "{err}");
+
+        // A windowed single-band Himawari run titles with its band + the
+        // full windowed sector token (two windows never share a title).
+        let title = run_title("h9", "fulldisk_win135n1448e800_c13_20260707");
+        assert!(
+            title.contains("C13") && title.contains("win135n1448e800"),
+            "{title}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

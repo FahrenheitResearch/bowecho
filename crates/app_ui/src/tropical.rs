@@ -15,9 +15,12 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use data_source::tropical::{self, Category, StormGeometry, TropicalCyclone};
+use data_source::tropical::{self, Basin, Category, StormGeometry, TropicalCyclone};
 use eframe::egui;
 use ui_core::worker_slot::{SlotPoll, WorkerSlot};
+
+use crate::sat_window::{self, SatNativeWindow};
+use crate::sat_worker;
 
 /// Re-poll cadence. NHC advisories update ~every 3–6 h (with intermediate
 /// position updates) and GDACS a few times a day; 10 min keeps the card fresh
@@ -138,6 +141,15 @@ pub struct TropicalState {
     last_refresh: Option<Instant>,
     /// A card asked the map to recenter here (lon, lat); ViewerApp drains it.
     pub focus_request: Option<(f32, f32)>,
+    /// A card's 🛰 Vis/IR press waiting to be dispatched;
+    /// [`crate::ViewerApp::drive_tropical_sat_view`] drains it.
+    pub sat_view_request: Option<TcSatViewRequest>,
+    /// The dispatched card request whose one-shot ingest is still running
+    /// (disables the 🛰 buttons and spins the pressed card).
+    pub sat_view_inflight: Option<TcSatInflight>,
+    /// Monotonic ticket source correlating card requests with worker
+    /// outcomes (stale outcomes from superseded requests are dropped).
+    sat_view_ticket: u64,
 }
 
 impl Default for TropicalState {
@@ -151,6 +163,9 @@ impl Default for TropicalState {
             last_fetch_ok: None,
             last_refresh: None,
             focus_request: None,
+            sat_view_request: None,
+            sat_view_inflight: None,
+            sat_view_ticket: 0,
         }
     }
 }
@@ -379,6 +394,58 @@ impl TropicalState {
                     if ui.small_button("📍 Focus").clicked() {
                         self.focus_request = Some((storm.position.lon, storm.position.lat));
                     }
+                    // One-press satellite views of THIS storm: pick the
+                    // covering geostationary satellite, ingest a
+                    // native-resolution window centered on the storm, and
+                    // show it (Satellite window + map layer) when it lands.
+                    let busy = self.sat_view_inflight.is_some();
+                    for (product, label, hover) in [
+                        (
+                            TcSatProduct::Vis,
+                            "🛰 Vis",
+                            "One press: pick the covering geostationary satellite \
+                             (Himawari / GOES-East / GOES-West) and load a native-resolution \
+                             TRUE-COLOR window centered on this storm. Opens the Satellite \
+                             window and follows the frame onto the radar map. Daylight side only.",
+                        ),
+                        (
+                            TcSatProduct::Ir,
+                            "🛰 IR",
+                            "One press: pick the covering geostationary satellite and load a \
+                             Band-13 IR window centered on this storm, colored with the \
+                             currently selected IR enhancement (BD, AVN, …). Works day and night.",
+                        ),
+                    ] {
+                        let response = ui
+                            .add_enabled(!busy, egui::Button::new(label).small())
+                            .on_hover_text(hover)
+                            .on_disabled_hover_text(
+                                "a storm satellite load is already running — one at a time",
+                            );
+                        if response.clicked() {
+                            self.sat_view_request = Some(TcSatViewRequest {
+                                product,
+                                storm_id: storm.id.clone(),
+                                storm_name: storm.name.clone(),
+                                basin: storm.basin,
+                                lat: f64::from(storm.position.lat),
+                                lon: f64::from(storm.position.lon),
+                            });
+                        }
+                    }
+                    // The pressed card wears the spinner while its ingest runs.
+                    if let Some(inflight) = self
+                        .sat_view_inflight
+                        .as_ref()
+                        .filter(|inflight| inflight.storm_id == storm.id)
+                    {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new(format!("{}…", inflight.product.label()))
+                                .small()
+                                .weak(),
+                        );
+                    }
                     for (label, url) in external_links(storm) {
                         if ui.small_button(label).clicked() {
                             ui.ctx().open_url(egui::OpenUrl::new_tab(url));
@@ -386,6 +453,12 @@ impl TropicalState {
                     }
                 });
             });
+    }
+
+    /// Next correlation ticket for a card satellite request.
+    fn next_sat_view_ticket(&mut self) -> u64 {
+        self.sat_view_ticket += 1;
+        self.sat_view_ticket
     }
 }
 
@@ -470,6 +543,245 @@ fn tropical_http_client() -> Result<reqwest::blocking::Client, String> {
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|err| err.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// One-press storm satellite view (the cards' 🛰 Vis / 🛰 IR buttons)
+// ---------------------------------------------------------------------------
+
+/// Native-window size for one-press storm satellite views, km per side:
+/// wide enough for the eyewall plus the inner rainband field of a large
+/// cyclone, small enough that the 0.5 km visible crop (~2000² px) stays
+/// loop-friendly. Inside [`SatNativeWindow`]'s 50..2000 km domain.
+pub const TC_SAT_WINDOW_KM: f64 = 1000.0;
+
+/// Give up on a card spinner after this long without a worker outcome: a
+/// first (uncached) full-disk visible scan is a few-hundred-MB download,
+/// so minutes are normal; anything past this is a hung source and the
+/// buttons unlock (the ingest itself still finishes or fails on its own).
+const TC_SAT_INFLIGHT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Which one-press product a card asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcSatProduct {
+    /// Native-window true color (daylight side only).
+    Vis,
+    /// Band-13 IR window through the current IR enhancement.
+    Ir,
+}
+
+impl TcSatProduct {
+    /// Short product label for card/status lines.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Vis => "True color",
+            Self::Ir => "IR B13",
+        }
+    }
+}
+
+/// A card's 🛰 press waiting to be dispatched (drained once per frame by
+/// [`crate::ViewerApp::drive_tropical_sat_view`]).
+pub struct TcSatViewRequest {
+    pub product: TcSatProduct,
+    pub storm_id: String,
+    pub storm_name: String,
+    pub basin: Basin,
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// The dispatched card request whose one-shot ingest is still running.
+pub struct TcSatInflight {
+    pub ticket: u64,
+    pub storm_id: String,
+    pub storm_name: String,
+    pub product: TcSatProduct,
+    pub started: Instant,
+}
+
+/// The geostationary satellites the app can ingest, as storm coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcGeoSat {
+    Himawari,
+    GoesEast,
+    GoesWest,
+}
+
+impl TcGeoSat {
+    const ALL: [TcGeoSat; 3] = [Self::Himawari, Self::GoesEast, Self::GoesWest];
+
+    /// Nominal sub-satellite longitude (the same constants the persisted
+    /// native window's visibility gate uses).
+    fn sub_lon_deg(self) -> f64 {
+        match self {
+            Self::Himawari => sat_window::AHI_NOMINAL_SUB_LON_DEG,
+            Self::GoesEast => sat_window::GOES_EAST_SUB_LON_DEG,
+            Self::GoesWest => sat_window::GOES_WEST_SUB_LON_DEG,
+        }
+    }
+
+    /// Ingest slug for the operational slot (Himawari-9; GOES-19 East,
+    /// GOES-18 West).
+    fn satellite_slug(self) -> &'static str {
+        match self {
+            Self::Himawari => "h9",
+            Self::GoesEast => "goes19",
+            Self::GoesWest => "goes18",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Himawari => "Himawari-9",
+            Self::GoesEast => "GOES-East",
+            Self::GoesWest => "GOES-West",
+        }
+    }
+}
+
+/// Great-circle arc (degrees) from a geostationary sub-satellite point
+/// (lat 0, `sub_lon_deg`) to a point — the ranking key when no basin rule
+/// applies. Spherical, same formula as
+/// [`sat_window::window_visible_from_sub_lon`]'s gate.
+fn sub_lon_arc_deg(sub_lon_deg: f64, lat_deg: f64, lon_deg: f64) -> f64 {
+    let lat = lat_deg.to_radians();
+    let delta = (lon_deg - sub_lon_deg).to_radians();
+    (lat.cos() * delta.cos())
+        .clamp(-1.0, 1.0)
+        .acos()
+        .to_degrees()
+}
+
+/// Pick the covering geostationary satellite for a storm window: the
+/// basin's operational satellite first (WPac → Himawari, EPac/CPac →
+/// GOES-West, Atlantic → GOES-East — the agency assignments, which beat
+/// raw longitude distance where the disks overlap), then every satellite
+/// by increasing arc, taking the first whose disk can actually see the
+/// window ([`sat_window::window_visible_from_sub_lon`], the same gate the
+/// persisted native window uses). `None` when nothing in-app covers the
+/// storm — Meteosat's longitudes, hidden until EUMETSAT access is
+/// reliable.
+fn covering_geo_satellite(basin: Basin, window: &SatNativeWindow) -> Option<TcGeoSat> {
+    let clamped = window.clamped();
+    let preferred = match basin {
+        Basin::WestPacific => Some(TcGeoSat::Himawari),
+        Basin::EastPacific | Basin::CentralPacific => Some(TcGeoSat::GoesWest),
+        Basin::Atlantic => Some(TcGeoSat::GoesEast),
+        Basin::NorthIndian | Basin::SouthIndian | Basin::SouthPacific | Basin::Other => None,
+    };
+    let mut by_arc = TcGeoSat::ALL;
+    by_arc.sort_by(|a, b| {
+        let arc = |sat: &TcGeoSat| {
+            sub_lon_arc_deg(
+                sat.sub_lon_deg(),
+                clamped.center_lat_deg,
+                clamped.center_lon_deg,
+            )
+        };
+        arc(a).total_cmp(&arc(b))
+    });
+    preferred
+        .into_iter()
+        .chain(by_arc)
+        .find(|sat| sat_window::window_visible_from_sub_lon(sat.sub_lon_deg(), &clamped))
+}
+
+/// What one card press sends: the chosen satellite plus the exact worker
+/// request spec. Pure so satellite choice and request construction
+/// unit-test without a `ViewerApp` or a network.
+#[derive(Debug)]
+pub(crate) enum TcSatPlan {
+    /// v0.29.3 native-window AHI true color (the Bavi-proof machinery).
+    HimawariVis(sat_worker::HimawariCompositeSpec),
+    /// Native-window GOES natural-color composite.
+    GoesVis(sat_worker::GoesCompositeSpec),
+    /// Native-window AHI B13 Kelvin BT (live IR-enhancement recolor).
+    HimawariIr(sat_worker::HimawariIrWindowSpec),
+    /// Native-window GOES B13 baked through the current IR enhancement.
+    GoesIr(sat_worker::GoesIrWindowSpec),
+}
+
+impl TcSatPlan {
+    fn into_request(self) -> sat_worker::SatRequest {
+        match self {
+            Self::HimawariVis(spec) => sat_worker::SatRequest::IngestLatestHimawariComposite(spec),
+            Self::GoesVis(spec) => sat_worker::SatRequest::IngestLatestGoesComposite(spec),
+            Self::HimawariIr(spec) => sat_worker::SatRequest::IngestLatestHimawariIrWindow(spec),
+            Self::GoesIr(spec) => sat_worker::SatRequest::IngestLatestGoesIrWindow(spec),
+        }
+    }
+}
+
+/// Build the one-press request for a storm: a [`TC_SAT_WINDOW_KM`] native
+/// window centered on the storm's current position, on the covering
+/// satellite, as the product the card asked for.
+fn plan_tc_sat_view(
+    product: TcSatProduct,
+    basin: Basin,
+    lat_deg: f64,
+    lon_deg: f64,
+    ticket: u64,
+) -> Result<(TcGeoSat, TcSatPlan), String> {
+    let window = SatNativeWindow {
+        center_lat_deg: lat_deg,
+        center_lon_deg: lon_deg,
+        size_km: TC_SAT_WINDOW_KM,
+    }
+    .clamped();
+    let Some(sat) = covering_geo_satellite(basin, &window) else {
+        return Err(
+            "no in-app geostationary satellite covers this storm (Meteosat/MTG is \
+             temporarily unavailable)"
+                .to_string(),
+        );
+    };
+    let plan = match (sat, product) {
+        (TcGeoSat::Himawari, TcSatProduct::Vis) => {
+            TcSatPlan::HimawariVis(sat_worker::HimawariCompositeSpec {
+                satellite: sat.satellite_slug().to_string(),
+                style: "true_color".to_string(),
+                window: Some(window),
+                card_ticket: Some(ticket),
+                ..Default::default()
+            })
+        }
+        (TcGeoSat::Himawari, TcSatProduct::Ir) => {
+            TcSatPlan::HimawariIr(sat_worker::HimawariIrWindowSpec {
+                satellite: sat.satellite_slug().to_string(),
+                band: 13,
+                window,
+                lookback_minutes: 180,
+                as_of: None,
+                card_ticket: Some(ticket),
+            })
+        }
+        (TcGeoSat::GoesEast | TcGeoSat::GoesWest, TcSatProduct::Vis) => {
+            TcSatPlan::GoesVis(sat_worker::GoesCompositeSpec {
+                satellite: sat.satellite_slug().to_string(),
+                // Full disk sees any storm the satellite covers (CONUS
+                // misses most Atlantic/EPac tracks); the native window
+                // keeps decode/compose/store window-sized regardless.
+                sector: "fulldisk".to_string(),
+                style: "natural_color".to_string(),
+                window: Some(window),
+                card_ticket: Some(ticket),
+                ..Default::default()
+            })
+        }
+        (TcGeoSat::GoesEast | TcGeoSat::GoesWest, TcSatProduct::Ir) => {
+            TcSatPlan::GoesIr(sat_worker::GoesIrWindowSpec {
+                satellite: sat.satellite_slug().to_string(),
+                sector: "fulldisk".to_string(),
+                band: 13,
+                window,
+                lookback_minutes: 180,
+                as_of: None,
+                card_ticket: Some(ticket),
+            })
+        }
+    };
+    Ok((sat, plan))
 }
 
 impl crate::ViewerApp {
@@ -725,6 +1037,109 @@ impl crate::ViewerApp {
                 );
             }
         }
+    }
+
+    /// Dispatch the storm cards' one-press satellite requests and retire
+    /// their outcomes. One call per frame from the update loop.
+    ///
+    /// A press ends with imagery on screen with no further clicks: the
+    /// Satellite window opens/raises (its per-frame pass owns the response
+    /// pump that installs finished frames), the map recenters on the storm,
+    /// map-follow turns on, and the planned one-shot ingest auto-selects
+    /// its frame in the player + map when it lands
+    /// (`SatResponse::SelectFrame`). While it runs, the pressed card wears
+    /// a spinner and every card's 🛰 buttons disable; the worker reports
+    /// the outcome on the card-only channel
+    /// ([`sat_worker::SatWorker::try_recv_card_outcome`]), with a timeout
+    /// backstop so a hung source can't disable the buttons forever.
+    pub(crate) fn drive_tropical_sat_view(&mut self, ctx: &egui::Context) {
+        // Retire the in-flight request first so its outcome re-enables the
+        // card buttons on this very frame.
+        if let Some(inflight) = &self.tropical.sat_view_inflight {
+            let mut done = false;
+            if let Some(sat) = &self.sat {
+                while let Some(outcome) = sat.try_recv_card_outcome() {
+                    // Stale tickets (outcomes of superseded/timed-out
+                    // requests) are dropped; only the current one retires.
+                    if outcome.ticket != inflight.ticket {
+                        continue;
+                    }
+                    // Success already surfaced through the ingest's own
+                    // summary note; failures get an explicit status line
+                    // (the pump's notes only run while the Satellite
+                    // window is open).
+                    if let Err(message) = &outcome.result {
+                        self.status = format!(
+                            "Satellite: {} {} failed — {message}",
+                            inflight.storm_name,
+                            inflight.product.label()
+                        );
+                    }
+                    done = true;
+                }
+            }
+            if !done && inflight.started.elapsed() >= TC_SAT_INFLIGHT_TIMEOUT {
+                done = true;
+            }
+            if done {
+                self.tropical.sat_view_inflight = None;
+            }
+        }
+
+        let Some(request) = self.tropical.sat_view_request.take() else {
+            return;
+        };
+        if self.tropical.sat_view_inflight.is_some() {
+            // Buttons are disabled while in flight, so this only guards a
+            // request raced against a not-yet-retired one: never queue.
+            return;
+        }
+        let ticket = self.tropical.next_sat_view_ticket();
+        let (choice, plan) = match plan_tc_sat_view(
+            request.product,
+            request.basin,
+            request.lat,
+            request.lon,
+            ticket,
+        ) {
+            Ok(planned) => planned,
+            Err(message) => {
+                self.status = format!("Satellite: {} — {message}", request.storm_name);
+                return;
+            }
+        };
+
+        // Open/raise the Satellite window (nothing can land while it is
+        // closed: its per-frame pass runs the response pump), recenter the
+        // map on the storm, and follow the player onto the map layer.
+        self.show_satellite = true;
+        self.ensure_satellite_worker(ctx);
+        self.sat_map_follow = true;
+        self.tropical.focus_request = Some((request.lon as f32, request.lat as f32));
+
+        let title = match request.product {
+            TcSatProduct::Vis => format!("{} — True color", request.storm_name),
+            TcSatProduct::Ir => format!(
+                "{} — IR B13 · {}",
+                request.storm_name,
+                self.sat_ir_enhancement.label()
+            ),
+        };
+        let Some(sat) = &self.sat else {
+            self.status = format!("Satellite: {title} — worker unavailable");
+            return;
+        };
+        sat.send(plan.into_request());
+        self.status = format!("Satellite: {title} · loading via {}", choice.label());
+        self.sat_panel
+            .apply_note(format!("{title}: queued via {}", choice.label()));
+        self.tropical.sat_view_inflight = Some(TcSatInflight {
+            ticket,
+            storm_id: request.storm_id,
+            storm_name: request.storm_name,
+            product: request.product,
+            started: Instant::now(),
+        });
     }
 }
 
@@ -1010,5 +1425,167 @@ mod tests {
             nw_nm: 120.0,
         }];
         assert!(storm_has_wind_radii(&storm));
+    }
+
+    fn tc_window(lat: f64, lon: f64) -> SatNativeWindow {
+        SatNativeWindow {
+            center_lat_deg: lat,
+            center_lon_deg: lon,
+            size_km: TC_SAT_WINDOW_KM,
+        }
+    }
+
+    /// One-press satellite selection: basin rules first (WPac → Himawari,
+    /// EPac/CPac → GOES-West, Atlantic → GOES-East), nearest-visible disk
+    /// for basins without a rule, and an honest `None` where no in-app
+    /// satellite can see the storm (Meteosat's slot is not in the app).
+    #[test]
+    fn tc_sat_selection_covers_basins_and_dateline() {
+        // Bavi-class WPac storm.
+        assert_eq!(
+            covering_geo_satellite(Basin::WestPacific, &tc_window(25.0, 130.0)),
+            Some(TcGeoSat::Himawari)
+        );
+        // Atlantic (Gulf) storm.
+        assert_eq!(
+            covering_geo_satellite(Basin::Atlantic, &tc_window(22.7, -87.5)),
+            Some(TcGeoSat::GoesEast)
+        );
+        // EPac at 105 W: GOES-East is NEARER in longitude (29.8° vs 32.0°),
+        // but the basin's operational satellite is GOES-West and must win.
+        assert_eq!(
+            covering_geo_satellite(Basin::EastPacific, &tc_window(15.0, -105.0)),
+            Some(TcGeoSat::GoesWest)
+        );
+        assert_eq!(
+            covering_geo_satellite(Basin::CentralPacific, &tc_window(20.0, -155.0)),
+            Some(TcGeoSat::GoesWest)
+        );
+        // Dateline, no basin rule: nearest visible disk on either side.
+        assert_eq!(
+            covering_geo_satellite(Basin::Other, &tc_window(10.0, 179.0)),
+            Some(TcGeoSat::Himawari)
+        );
+        assert_eq!(
+            covering_geo_satellite(Basin::Other, &tc_window(10.0, -175.0)),
+            Some(TcGeoSat::GoesWest)
+        );
+        // South Pacific storm just east of the dateline.
+        assert_eq!(
+            covering_geo_satellite(Basin::SouthPacific, &tc_window(-15.0, -170.0)),
+            Some(TcGeoSat::GoesWest)
+        );
+        // Bay of Bengal: only Himawari's disk reaches it (arc ~52°).
+        assert_eq!(
+            covering_geo_satellite(Basin::NorthIndian, &tc_window(15.0, 90.0)),
+            Some(TcGeoSat::Himawari)
+        );
+        // Arabian Sea / Meteosat territory: nothing in-app covers it.
+        assert_eq!(
+            covering_geo_satellite(Basin::NorthIndian, &tc_window(15.0, 55.0)),
+            None
+        );
+    }
+
+    /// The card window is a legal native window everywhere: the size sits
+    /// inside the SatNativeWindow domain and dateline-adjacent centers stay
+    /// normalized (clamped() is applied inside the plan).
+    #[test]
+    fn tc_sat_window_is_in_domain_and_dateline_safe() {
+        assert!(
+            (SatNativeWindow::MIN_SIZE_KM..=SatNativeWindow::MAX_SIZE_KM)
+                .contains(&TC_SAT_WINDOW_KM)
+        );
+        let (sat, plan) = plan_tc_sat_view(TcSatProduct::Ir, Basin::WestPacific, 18.0, -178.5, 3)
+            .expect("dateline WPac storm is covered");
+        assert_eq!(sat, TcGeoSat::Himawari, "GDACS WPac extends past 180");
+        match plan {
+            TcSatPlan::HimawariIr(spec) => {
+                assert!((spec.window.center_lon_deg - (-178.5)).abs() < 1e-9);
+                assert!((spec.window.center_lat_deg - 18.0).abs() < 1e-9);
+            }
+            _ => panic!("WPac IR must plan a Himawari IR window"),
+        }
+    }
+
+    /// Request construction: every basin/product pair sends the right spec
+    /// with a storm-centered native window and the correlation ticket.
+    #[test]
+    fn tc_sat_plan_builds_windowed_requests() {
+        // WPac Vis: the v0.29.3 native-window true-color machinery on h9.
+        let (sat, plan) = plan_tc_sat_view(TcSatProduct::Vis, Basin::WestPacific, 25.3, 131.2, 7)
+            .expect("covered");
+        assert_eq!(sat, TcGeoSat::Himawari);
+        match plan {
+            TcSatPlan::HimawariVis(spec) => {
+                assert_eq!(spec.satellite, "h9");
+                assert_eq!(spec.style, "true_color");
+                assert_eq!(spec.card_ticket, Some(7));
+                let window = spec.window.expect("native window attached");
+                assert!((window.center_lat_deg - 25.3).abs() < 1e-9);
+                assert!((window.center_lon_deg - 131.2).abs() < 1e-9);
+                assert!((window.size_km - TC_SAT_WINDOW_KM).abs() < 1e-9);
+            }
+            _ => panic!("WPac Vis must plan a Himawari composite"),
+        }
+        // WPac IR: windowed single-band B13 (live-recolorable Kelvin BT).
+        let (_, plan) = plan_tc_sat_view(TcSatProduct::Ir, Basin::WestPacific, 25.3, 131.2, 8)
+            .expect("covered");
+        match plan {
+            TcSatPlan::HimawariIr(spec) => {
+                assert_eq!(spec.satellite, "h9");
+                assert_eq!(spec.band, 13);
+                assert_eq!(spec.card_ticket, Some(8));
+                assert!((spec.window.center_lon_deg - 131.2).abs() < 1e-9);
+            }
+            _ => panic!("WPac IR must plan a Himawari IR window"),
+        }
+        // Atlantic Vis: GOES-East, full disk (CONUS misses most tracks),
+        // natural color, windowed.
+        let (sat, plan) =
+            plan_tc_sat_view(TcSatProduct::Vis, Basin::Atlantic, 22.7, -87.5, 9).expect("covered");
+        assert_eq!(sat, TcGeoSat::GoesEast);
+        match plan {
+            TcSatPlan::GoesVis(spec) => {
+                assert_eq!(spec.satellite, "goes19");
+                assert_eq!(spec.sector, "fulldisk");
+                assert_eq!(spec.style, "natural_color");
+                assert_eq!(spec.card_ticket, Some(9));
+                let window = spec.window.expect("native window attached");
+                assert!((window.center_lat_deg - 22.7).abs() < 1e-9);
+                assert!((window.center_lon_deg - (-87.5)).abs() < 1e-9);
+            }
+            _ => panic!("Atlantic Vis must plan a GOES composite"),
+        }
+        // EPac IR: GOES-West enhanced-IR window.
+        let (sat, plan) = plan_tc_sat_view(TcSatProduct::Ir, Basin::EastPacific, 15.0, -105.0, 10)
+            .expect("covered");
+        assert_eq!(sat, TcGeoSat::GoesWest);
+        match plan {
+            TcSatPlan::GoesIr(spec) => {
+                assert_eq!(spec.satellite, "goes18");
+                assert_eq!(spec.sector, "fulldisk");
+                assert_eq!(spec.band, 13);
+                assert_eq!(spec.card_ticket, Some(10));
+                assert!((spec.window.center_lon_deg - (-105.0)).abs() < 1e-9);
+            }
+            _ => panic!("EPac IR must plan a GOES IR window"),
+        }
+        // Uncovered storm: an explicit, honest error (never a silent no-op).
+        let err = plan_tc_sat_view(TcSatProduct::Ir, Basin::NorthIndian, 15.0, 55.0, 11)
+            .expect_err("Arabian Sea west is out of every in-app disk");
+        assert!(err.contains("Meteosat"), "{err}");
+    }
+
+    /// Tickets are monotonic and start above the initial inflight-free
+    /// state, so a stale outcome can never match a fresh request.
+    #[test]
+    fn tc_sat_tickets_are_monotonic() {
+        let mut state = TropicalState::default();
+        assert!(state.sat_view_request.is_none());
+        assert!(state.sat_view_inflight.is_none());
+        let first = state.next_sat_view_ticket();
+        let second = state.next_sat_view_ticket();
+        assert!(second > first && first > 0);
     }
 }

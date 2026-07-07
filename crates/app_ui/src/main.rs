@@ -18177,6 +18177,7 @@ impl eframe::App for ViewerApp {
                 ctx.request_repaint();
             }
         }
+        self.drive_tropical_sat_view(&ctx);
         if self.app_settings.show_radar_status {
             // Local `open` mirrors the [✕] into the persisted setting without a
             // double borrow of `self` (the body closure also borrows self).
