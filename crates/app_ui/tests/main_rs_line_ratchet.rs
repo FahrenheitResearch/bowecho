@@ -6,8 +6,10 @@
 //! - v0.29.4 extraction #1 (`self_update.rs`): 78,184 lines → ceiling 78,384.
 //! - v0.29.4 extraction #2 (`hazard_geom.rs`): 73,507 lines → ceiling 73,707.
 //! - v0.29.4 extraction #6 (`geo_helpers.rs`): 73,411 lines → ceiling 73,611.
+//! - v0.29.4 extraction #3 (`hazard_ui.rs`): 72,282 lines (ceiling deferred).
+//! - v0.29.4 extraction #4 (`product_select.rs`): 71,041 lines → ceiling 71,241.
 
-const CEILING: usize = 73_611;
+const CEILING: usize = 71_241;
 
 #[test]
 fn main_rs_stays_under_the_line_ratchet_ceiling() {

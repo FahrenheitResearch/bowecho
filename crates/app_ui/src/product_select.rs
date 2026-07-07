@@ -1,0 +1,1316 @@
+//! Pure product/cut-selection helpers moved verbatim out of `main.rs`
+//! (v0.29.4 decomposition, queue item #4): which products a volume/cut can
+//! display, picker ordering/visibility, sweep-cut policy filtering, live-tilt
+//! completeness gates, and latest-load selection/prefetch math — params in,
+//! value out, no `ViewerApp` state. Types and constants stay in `main.rs`;
+//! this module reaches them via `crate::`.
+//!
+//! Every body moved VERBATIM from main.rs — the only edits are `use` lines
+//! and the pub(crate) promotions listed in the extraction commit message.
+
+use crate::*;
+
+fn product_order(available: &std::collections::BTreeSet<MomentType>) -> Vec<DisplayProduct> {
+    let mut ordered = Vec::new();
+    for moment in [
+        MomentType::Reflectivity,
+        MomentType::Velocity,
+        MomentType::CorrelationCoefficient,
+        MomentType::DifferentialReflectivity,
+        MomentType::SpectrumWidth,
+        MomentType::DifferentialPhase,
+        MomentType::SpecificDifferentialPhase,
+    ] {
+        if available.contains(&moment) {
+            if moment == MomentType::Velocity {
+                ordered.push(DisplayProduct::Moment(MomentType::Velocity));
+                ordered.push(DisplayProduct::DealiasedVelocity);
+                ordered.push(DisplayProduct::StormRelativeVelocity);
+                ordered.push(DisplayProduct::StormRelativeDealiasedVelocity);
+            } else {
+                ordered.push(DisplayProduct::Moment(moment));
+            }
+        }
+    }
+    for moment in available {
+        if advanced_derived_product_for_moment(moment).is_some() {
+            continue;
+        }
+        let product = DisplayProduct::Moment(moment.clone());
+        if !ordered.contains(&product) {
+            ordered.push(product);
+        }
+    }
+    ordered
+}
+
+fn picker_product_rank(product: &DisplayProduct) -> (u16, &str) {
+    let rank = match product {
+        DisplayProduct::Moment(MomentType::Reflectivity) => 10,
+        DisplayProduct::Moment(MomentType::Velocity) => 20,
+        DisplayProduct::DealiasedVelocity => 21,
+        DisplayProduct::StormRelativeVelocity => 30,
+        DisplayProduct::StormRelativeDealiasedVelocity => 31,
+        DisplayProduct::Moment(MomentType::CorrelationCoefficient) => 40,
+        DisplayProduct::Moment(MomentType::DifferentialReflectivity) => 50,
+        DisplayProduct::Moment(MomentType::SpectrumWidth) => 60,
+        DisplayProduct::Moment(MomentType::DifferentialPhase) => 70,
+        DisplayProduct::Moment(MomentType::SpecificDifferentialPhase) => 80,
+        DisplayProduct::Derived(DerivedProduct::CompositeReflectivity) => 100,
+        DisplayProduct::Derived(DerivedProduct::EchoTops) => 110,
+        DisplayProduct::Derived(DerivedProduct::Vil) => 120,
+        DisplayProduct::Derived(DerivedProduct::VilDensity) => 121,
+        DisplayProduct::Derived(DerivedProduct::Mehs) => 130,
+        DisplayProduct::Derived(DerivedProduct::Posh) => 131,
+        DisplayProduct::Derived(DerivedProduct::Poh) => 132,
+        DisplayProduct::Derived(DerivedProduct::Marc) => 140,
+        DisplayProduct::Derived(DerivedProduct::GustProxy) => 150,
+        DisplayProduct::Derived(DerivedProduct::AzimuthalShear) => 160,
+        DisplayProduct::Derived(DerivedProduct::Divergence) => 161,
+        DisplayProduct::Moment(MomentType::Unknown(name)) => match name.as_str() {
+            "PHIF" => 200,
+            "KDP_SD" => 201,
+            "AH" => 210,
+            "PIA" => 211,
+            "CREF" => 212,
+            "ADP" => 220,
+            "PIDA" => 221,
+            "ZDRC" => 222,
+            "RATE_Z" => 230,
+            "RATE_KDP" => 231,
+            "RATE" => 232,
+            "LWC" => 240,
+            "HKE" => 241,
+            "CDR" => 250,
+            "L_RHO" => 251,
+            "REF_TEX" => 260,
+            "VEL_TEX" => 261,
+            "SW_TEX" => 262,
+            "ZDR_TEX" => 263,
+            "RHO_TEX" => 264,
+            "PHI_TEX" => 265,
+            "KDP_TEX" => 266,
+            "REF_GRAD_R" => 270,
+            "VEL_GRAD_R" => 271,
+            "MET_QI" => 280,
+            "MET_MASK" => 281,
+            "TDS_SCORE" => 290,
+            "HAIL_SCORE" => 291,
+            "TURB" => 292,
+            _ => 900,
+        },
+    };
+    (rank, product.label())
+}
+
+fn retain_non_advanced_products(products: &mut Vec<DisplayProduct>) {
+    products.retain(|product| advanced_derived_product_for_display_product(product).is_none());
+}
+
+fn is_hideable_derived_product(product: &DisplayProduct) -> bool {
+    matches!(product, DisplayProduct::Derived(_))
+        || advanced_derived_product_for_display_product(product).is_some()
+}
+
+pub(crate) fn is_product_visible_in_picker(
+    product: &DisplayProduct,
+    show_derived_products: bool,
+) -> bool {
+    show_derived_products || !is_hideable_derived_product(product)
+}
+
+fn retain_picker_visible_products(products: &mut Vec<DisplayProduct>, show_derived_products: bool) {
+    if !show_derived_products {
+        products.retain(|product| !is_hideable_derived_product(product));
+    }
+}
+
+fn append_present_advanced_products(
+    products: &mut Vec<DisplayProduct>,
+    available: &std::collections::BTreeSet<MomentType>,
+) {
+    for product in product_engine::DerivedSweepProduct::ALL.iter().copied() {
+        let Some(display_product) = advanced_derived_display_product(product) else {
+            continue;
+        };
+        if available.contains(&display_product.base_moment())
+            && !products.contains(&display_product)
+        {
+            products.push(display_product);
+        }
+    }
+}
+
+pub(crate) fn global_displayable_products(volume: &RadarVolume) -> Vec<DisplayProduct> {
+    let mut available = std::collections::BTreeSet::new();
+    for cut_index in 0..volume.cuts.len() {
+        available.extend(
+            displayable_products(volume, cut_index)
+                .into_iter()
+                .map(|product| product.base_moment()),
+        );
+    }
+    let mut products = product_order(&available);
+    // product_order only knows raw moments; append derived products (CREF/ET/
+    // VIL/AzShr/Div) here so they are reachable from the picker + keyboard cycle,
+    // mirroring displayable_products. Offered when their source moment exists.
+    for d in DerivedProduct::ALL {
+        if available.contains(&d.base_moment()) {
+            products.push(DisplayProduct::Derived(d));
+        }
+    }
+    append_present_advanced_products(&mut products, &available);
+    products
+}
+
+pub(crate) fn global_displayable_products_with_advanced(
+    volume: &RadarVolume,
+    include_advanced_placeholders: bool,
+) -> Vec<DisplayProduct> {
+    let mut products = global_displayable_products(volume);
+    retain_non_advanced_products(&mut products);
+    if !include_advanced_placeholders {
+        let mut available = std::collections::BTreeSet::new();
+        for cut_index in 0..volume.cuts.len() {
+            available.extend(
+                displayable_products(volume, cut_index)
+                    .into_iter()
+                    .map(|product| product.base_moment()),
+            );
+        }
+        append_present_advanced_products(&mut products, &available);
+        return products;
+    }
+    for product in product_engine::DerivedSweepProduct::ALL.iter().copied() {
+        let Some(display_product) = advanced_derived_display_product(product) else {
+            continue;
+        };
+        if volume_has_displayable_product(volume, &display_product)
+            || volume_has_advanced_product_sources(volume, product)
+        {
+            products.push(display_product);
+        }
+    }
+    products
+}
+
+pub(crate) fn global_displayable_products_for_picker(
+    volume: &RadarVolume,
+    include_advanced_placeholders: bool,
+    show_derived_products: bool,
+) -> Vec<DisplayProduct> {
+    let mut products =
+        global_displayable_products_with_advanced(volume, include_advanced_placeholders);
+    retain_picker_visible_products(&mut products, show_derived_products);
+    products.sort_by(|left, right| picker_product_rank(left).cmp(&picker_product_rank(right)));
+    products
+}
+
+pub(crate) fn displayable_products(volume: &RadarVolume, cut_index: usize) -> Vec<DisplayProduct> {
+    let Some(cut) = volume.cuts.get(cut_index) else {
+        return Vec::new();
+    };
+    let available = cut
+        .moments
+        .values()
+        .filter(|grid| grid.radial_count() >= displayable_radial_threshold(cut.radials.len()))
+        .map(|grid| grid.moment.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut products = product_order(&available);
+    // Derived products are offered wherever their source moment is present
+    // (reflectivity volume products on REF cuts; azimuthal shear on velocity
+    // cuts).
+    for d in DerivedProduct::ALL {
+        if available.contains(&d.base_moment()) {
+            products.push(DisplayProduct::Derived(d));
+        }
+    }
+    append_present_advanced_products(&mut products, &available);
+    products
+}
+
+pub(crate) fn cut_start_time_utc(volume: &RadarVolume, cut_index: usize) -> Option<DateTime<Utc>> {
+    let cut = volume.cuts.get(cut_index)?;
+    cut.radials
+        .iter()
+        .filter_map(|radial| {
+            radial_collection_time_from_volume_time_utc(volume.volume_time, radial.time_offset_ms)
+        })
+        .min()
+}
+
+fn radial_collection_time_from_volume_time_utc(
+    volume_time: DateTime<Utc>,
+    time_offset_ms: i32,
+) -> Option<DateTime<Utc>> {
+    let midnight = volume_time
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .map(|naive| Utc.from_utc_datetime(&naive))?;
+    let milliseconds = chrono::Duration::milliseconds(time_offset_ms as i64);
+    let midnight_candidate = midnight + milliseconds;
+    let relative_candidate = volume_time + milliseconds;
+    let midnight_delta = (midnight_candidate - volume_time).num_milliseconds().abs();
+    let relative_delta = (relative_candidate - volume_time).num_milliseconds().abs();
+    Some(if midnight_delta <= relative_delta {
+        midnight_candidate
+    } else {
+        relative_candidate
+    })
+}
+
+pub(crate) fn displayable_cuts_for_product(
+    volume: &RadarVolume,
+    product: &DisplayProduct,
+) -> Vec<usize> {
+    (0..volume.cuts.len())
+        .filter(|index| can_materialize_product_on_cut(volume, *index, product))
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn low_sweep_cuts_for_product(
+    volume: &RadarVolume,
+    product: &DisplayProduct,
+    filter: LowSweepLoopFilter,
+) -> Vec<usize> {
+    sweep_cuts_for_product(volume, product, legacy_sweep_policy(filter))
+}
+
+pub(crate) fn sweep_cuts_for_product(
+    volume: &RadarVolume,
+    product: &DisplayProduct,
+    policy: SweepPolicy,
+) -> Vec<usize> {
+    let policy = policy.normalized();
+    if policy.mode == SweepPolicyMode::Off {
+        return Vec::new();
+    }
+    let min_elevation = policy.min_elevation_deg();
+    let max_elevation = policy.max_elevation_deg();
+    let mut cuts = (0..volume.cuts.len())
+        .filter(|index| {
+            volume.cuts.get(*index).is_some_and(|cut| {
+                let complete = match policy.mode {
+                    SweepPolicyMode::Range => {
+                        is_complete_live_candidate_tilt_for_site(cut, &volume.site.id)
+                    }
+                    SweepPolicyMode::Off => false,
+                    SweepPolicyMode::AllLow
+                    | SweepPolicyMode::BaseOnly
+                    | SweepPolicyMode::SameLevel => {
+                        is_complete_live_low_level_tilt_for_site(cut, &volume.site.id)
+                    }
+                };
+                let in_range = policy.mode != SweepPolicyMode::Range
+                    || (cut.elevation_deg.is_finite()
+                        && cut.elevation_deg >= min_elevation
+                        && cut.elevation_deg <= max_elevation);
+                complete && in_range && can_materialize_product_on_cut(volume, *index, product)
+            })
+        })
+        .collect::<Vec<_>>();
+    cuts.sort_by(|left, right| {
+        let left_time = cut_start_time_utc(volume, *left)
+            .unwrap_or_else(|| volume.volume_time.with_timezone(&Utc));
+        let right_time = cut_start_time_utc(volume, *right)
+            .unwrap_or_else(|| volume.volume_time.with_timezone(&Utc));
+        left_time.cmp(&right_time).then_with(|| left.cmp(right))
+    });
+
+    match policy.mode {
+        SweepPolicyMode::Off | SweepPolicyMode::AllLow | SweepPolicyMode::Range => {}
+        SweepPolicyMode::BaseOnly => {
+            if let Some(min_elevation) = cuts
+                .iter()
+                .filter_map(|index| volume.cuts.get(*index).map(|cut| cut.elevation_deg))
+                .filter(|elevation| elevation.is_finite())
+                .min_by(|a, b| a.total_cmp(b))
+            {
+                cuts.retain(|index| {
+                    volume.cuts.get(*index).is_some_and(|cut| {
+                        (cut.elevation_deg - min_elevation).abs()
+                            <= LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG
+                    })
+                });
+            }
+        }
+        SweepPolicyMode::SameLevel => {
+            cuts = same_elevation_low_sweep_cuts(volume, &cuts);
+        }
+    }
+    cuts
+}
+
+/// Pick the dominant repeated elevation cluster independently for each
+/// volume. This preserves SAILS/MESO-SAILS repeats without assuming that the
+/// nominal base angle is identical in every VCP or scan.
+fn same_elevation_low_sweep_cuts(volume: &RadarVolume, cuts: &[usize]) -> Vec<usize> {
+    let elevations = cuts
+        .iter()
+        .filter_map(|index| {
+            let elevation = volume.cuts.get(*index)?.elevation_deg;
+            elevation.is_finite().then_some((*index, elevation))
+        })
+        .collect::<Vec<_>>();
+    if elevations.is_empty() {
+        return cuts.to_vec();
+    }
+
+    let tolerance = LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG;
+    let mut best: Option<(usize, f32, f32)> = None;
+    for (_, anchor) in &elevations {
+        let mut count = 0usize;
+        let mut spread = 0.0f32;
+        for (_, elevation) in &elevations {
+            let delta = *elevation - *anchor;
+            if delta >= -f32::EPSILON && delta <= tolerance {
+                count += 1;
+                spread += delta;
+            }
+        }
+        let replace = best.is_none_or(|(best_count, best_spread, best_anchor)| {
+            count > best_count
+                || (count == best_count
+                    && (*anchor < best_anchor - f32::EPSILON
+                        || ((*anchor - best_anchor).abs() <= f32::EPSILON
+                            && spread < best_spread - f32::EPSILON)))
+        });
+        if replace {
+            best = Some((count, spread, *anchor));
+        }
+    }
+
+    let Some((_, _, anchor)) = best else {
+        return cuts.to_vec();
+    };
+    cuts.iter()
+        .copied()
+        .filter(|index| {
+            volume.cuts.get(*index).is_some_and(|cut| {
+                cut.elevation_deg.is_finite()
+                    && cut.elevation_deg >= anchor - f32::EPSILON
+                    && cut.elevation_deg <= anchor + tolerance
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn low_sweep_cuts_for_history_entry(
+    frame: &FrameHistoryEntry,
+    product: &DisplayProduct,
+    filter: LowSweepLoopFilter,
+    disabled_cuts: &BTreeSet<LowSweepCutKey>,
+) -> Vec<usize> {
+    sweep_cuts_for_history_entry(frame, product, legacy_sweep_policy(filter), disabled_cuts)
+}
+
+pub(crate) fn sweep_cuts_for_history_entry(
+    frame: &FrameHistoryEntry,
+    product: &DisplayProduct,
+    policy: SweepPolicy,
+    disabled_cuts: &BTreeSet<LowSweepCutKey>,
+) -> Vec<usize> {
+    sweep_cuts_for_volume_identity(
+        frame.volume.as_ref(),
+        &frame.identity,
+        product,
+        policy,
+        disabled_cuts,
+    )
+}
+
+// `next_frame_index_with_sweep_cuts` (the shared stepper frame-index math)
+// died in the 4e stage-(iii) unify: both screen-loop steppers now advance
+// through `LoopEngine::advance_loop`, whose range-mode walk is the same
+// `1..=len` wrapping search (ui_core::loop_engine::advance, differentially
+// proven in differential_4e.rs).
+
+pub(crate) fn sweep_cut_at_or_before_in_frame(
+    frame: &FrameHistoryEntry,
+    product: &DisplayProduct,
+    policy: SweepPolicy,
+    disabled_cuts: &BTreeSet<LowSweepCutKey>,
+    timeline_time: DateTime<Utc>,
+) -> Option<usize> {
+    sweep_history_cut_at_or_before(
+        std::slice::from_ref(frame),
+        product,
+        policy,
+        disabled_cuts,
+        timeline_time,
+    )
+    .map(|(_, cut)| cut)
+}
+
+pub(crate) fn sweep_history_cut_at_or_before(
+    frames: &[FrameHistoryEntry],
+    product: &DisplayProduct,
+    policy: SweepPolicy,
+    disabled_cuts: &BTreeSet<LowSweepCutKey>,
+    timeline_time: DateTime<Utc>,
+) -> Option<(usize, usize)> {
+    let mut best: Option<(DateTime<Utc>, usize, usize)> = None;
+    for (frame_index, frame) in frames.iter().enumerate() {
+        for cut in sweep_cuts_for_history_entry(frame, product, policy, disabled_cuts) {
+            let cut_time = cut_start_time_utc(frame.volume.as_ref(), cut)
+                .unwrap_or(frame.identity.scan_time_utc);
+            if cut_time <= timeline_time
+                && best
+                    .as_ref()
+                    .is_none_or(|(best_time, _, _)| cut_time > *best_time)
+            {
+                best = Some((cut_time, frame_index, cut));
+            }
+        }
+    }
+    best.map(|(_, frame_index, cut)| (frame_index, cut))
+}
+
+fn sweep_cuts_for_volume_identity(
+    volume: &RadarVolume,
+    identity: &FrameIdentity,
+    product: &DisplayProduct,
+    policy: SweepPolicy,
+    disabled_cuts: &BTreeSet<LowSweepCutKey>,
+) -> Vec<usize> {
+    sweep_cuts_for_product(volume, product, policy)
+        .into_iter()
+        .filter(|cut| !disabled_cuts.contains(&LowSweepCutKey::new(identity, *cut)))
+        .collect()
+}
+
+pub(crate) fn low_sweep_cut_label(volume: &RadarVolume, cut_index: usize) -> String {
+    let Some(cut) = volume.cuts.get(cut_index) else {
+        return format!("#{cut_index:02}");
+    };
+    format!("#{cut_index:02} {:.2}", cut.elevation_deg)
+}
+
+pub(crate) fn low_sweep_cut_hover_text(volume: &RadarVolume, cut_index: usize) -> String {
+    let time = cut_start_time_utc(volume, cut_index)
+        .map(|time| time.format("%H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "time unknown".to_owned());
+    let Some(cut) = volume.cuts.get(cut_index) else {
+        return time;
+    };
+    format!(
+        "Cut #{cut_index:02}, {:.2} deg, {} radials, {time}",
+        cut.elevation_deg,
+        cut.radials.len()
+    )
+}
+
+pub(crate) fn live_partial_has_complete_low_level_tilt(volume: &RadarVolume) -> bool {
+    volume.cuts.iter().enumerate().any(|(index, cut)| {
+        is_complete_live_low_level_tilt_for_site(cut, &volume.site.id)
+            && !displayable_products(volume, index).is_empty()
+    })
+}
+
+fn is_complete_live_low_level_tilt_for_site(cut: &ElevationCut, site_id: &str) -> bool {
+    let min_radials = if site_id_is_terminal_radar(site_id) {
+        LIVE_COMPLETE_TERMINAL_LOW_LEVEL_TILT_MIN_RADIALS
+    } else {
+        LIVE_COMPLETE_LOW_LEVEL_TILT_MIN_RADIALS
+    };
+    is_live_low_level_tilt(cut)
+        && cut.radials.len() >= min_radials
+        && live_tilt_azimuth_coverage_deg(cut) >= LIVE_COMPLETE_TILT_MIN_AZIMUTH_COVERAGE_DEG
+}
+
+fn is_complete_live_tilt(cut: &ElevationCut) -> bool {
+    cut.radials.len() >= LIVE_COMPLETE_TILT_MIN_RADIALS
+        && live_tilt_azimuth_coverage_deg(cut) >= LIVE_COMPLETE_TILT_MIN_AZIMUTH_COVERAGE_DEG
+}
+
+fn live_tilt_azimuth_coverage_deg(cut: &ElevationCut) -> f32 {
+    let mut azimuths = cut
+        .radials
+        .iter()
+        .map(|radial| radial.azimuth_deg.rem_euclid(360.0))
+        .filter(|azimuth| azimuth.is_finite())
+        .collect::<Vec<_>>();
+    if azimuths.len() < 2 {
+        return 0.0;
+    }
+    azimuths.sort_by(|left, right| left.total_cmp(right));
+    azimuths.dedup_by(|left, right| (*left - *right).abs() < 0.05);
+    if azimuths.len() < 2 {
+        return 0.0;
+    }
+
+    let mut max_gap = 0.0_f32;
+    for pair in azimuths.windows(2) {
+        max_gap = max_gap.max(pair[1] - pair[0]);
+    }
+    let wrap_gap = azimuths[0] + 360.0 - azimuths[azimuths.len() - 1];
+    max_gap = max_gap.max(wrap_gap);
+    360.0 - max_gap
+}
+
+fn is_live_low_level_tilt(cut: &ElevationCut) -> bool {
+    cut.elevation_deg <= LIVE_LOW_LEVEL_AUTO_ADVANCE_MAX_ELEVATION_DEG
+}
+
+fn is_allowed_live_low_level_tilt_for_site(
+    cut: &ElevationCut,
+    site_id: &str,
+    allow_incomplete: bool,
+) -> bool {
+    if allow_incomplete {
+        is_live_low_level_tilt(cut)
+    } else {
+        is_complete_live_low_level_tilt_for_site(cut, site_id)
+    }
+}
+
+pub(crate) fn product_hotkey_egui_key(name: &str) -> Option<egui::Key> {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "1" => Some(egui::Key::Num1),
+        "2" => Some(egui::Key::Num2),
+        "3" => Some(egui::Key::Num3),
+        "4" => Some(egui::Key::Num4),
+        "5" => Some(egui::Key::Num5),
+        "6" => Some(egui::Key::Num6),
+        "7" => Some(egui::Key::Num7),
+        "8" => Some(egui::Key::Num8),
+        "9" => Some(egui::Key::Num9),
+        "0" => Some(egui::Key::Num0),
+        "A" => Some(egui::Key::A),
+        "B" => Some(egui::Key::B),
+        "C" => Some(egui::Key::C),
+        "D" => Some(egui::Key::D),
+        "E" => Some(egui::Key::E),
+        "F" => Some(egui::Key::F),
+        "G" => Some(egui::Key::G),
+        "H" => Some(egui::Key::H),
+        "I" => Some(egui::Key::I),
+        "J" => Some(egui::Key::J),
+        "K" => Some(egui::Key::K),
+        "L" => Some(egui::Key::L),
+        "M" => Some(egui::Key::M),
+        "N" => Some(egui::Key::N),
+        "O" => Some(egui::Key::O),
+        "P" => Some(egui::Key::P),
+        "Q" => Some(egui::Key::Q),
+        "R" => Some(egui::Key::R),
+        "S" => Some(egui::Key::S),
+        "T" => Some(egui::Key::T),
+        "U" => Some(egui::Key::U),
+        "V" => Some(egui::Key::V),
+        "W" => Some(egui::Key::W),
+        "X" => Some(egui::Key::X),
+        "Y" => Some(egui::Key::Y),
+        "Z" => Some(egui::Key::Z),
+        _ => None,
+    }
+}
+
+pub(crate) fn product_hotkey_sort_key(name: &str) -> (u8, u8, String) {
+    let normalized = name.trim().to_ascii_uppercase();
+    match normalized.as_str() {
+        "1" => (0, 1, normalized),
+        "2" => (0, 2, normalized),
+        "3" => (0, 3, normalized),
+        "4" => (0, 4, normalized),
+        "5" => (0, 5, normalized),
+        "6" => (0, 6, normalized),
+        "7" => (0, 7, normalized),
+        "8" => (0, 8, normalized),
+        "9" => (0, 9, normalized),
+        "0" => (0, 10, normalized),
+        letter if letter.len() == 1 && letter.as_bytes()[0].is_ascii_uppercase() => {
+            (1, letter.as_bytes()[0] - b'A', normalized)
+        }
+        _ => (2, 0, normalized),
+    }
+}
+
+#[cfg(test)]
+fn stepped_product<'a>(
+    products: &'a [DisplayProduct],
+    current: &DisplayProduct,
+    delta: isize,
+) -> Option<&'a DisplayProduct> {
+    stepped_slice_value(products, current, delta)
+}
+
+pub(crate) fn stepped_cut(cuts: &[usize], current: usize, delta: isize) -> Option<usize> {
+    stepped_slice_value(cuts, &current, delta).copied()
+}
+
+fn stepped_slice_value<'a, T: PartialEq>(
+    values: &'a [T],
+    current: &T,
+    delta: isize,
+) -> Option<&'a T> {
+    if values.is_empty() {
+        return None;
+    }
+    let current_index = values
+        .iter()
+        .position(|value| value == current)
+        .unwrap_or(0);
+    let next_index = (current_index as isize + delta).rem_euclid(values.len() as isize) as usize;
+    values.get(next_index)
+}
+
+pub(crate) fn is_displayable_on_cut(
+    volume: &RadarVolume,
+    cut_index: usize,
+    product: &DisplayProduct,
+) -> bool {
+    let Some(cut) = volume.cuts.get(cut_index) else {
+        return false;
+    };
+    let base_moment = product.base_moment();
+    let Some(grid) = cut.moments.get(&base_moment) else {
+        return false;
+    };
+    grid.radial_count() >= displayable_radial_threshold(cut.radials.len())
+}
+
+pub(crate) fn can_materialize_product_on_cut(
+    volume: &RadarVolume,
+    cut_index: usize,
+    product: &DisplayProduct,
+) -> bool {
+    if is_displayable_on_cut(volume, cut_index, product) {
+        return true;
+    }
+    let Some(derived) = advanced_derived_product_for_display_product(product) else {
+        return false;
+    };
+    volume
+        .cuts
+        .get(cut_index)
+        .is_some_and(|cut| cut_has_advanced_product_sources(cut, derived))
+}
+
+pub(crate) fn advanced_product_source_cut(
+    volume: &RadarVolume,
+    current_cut: usize,
+    product: &DisplayProduct,
+) -> Option<usize> {
+    advanced_product_source_cut_with_live_filter(volume, current_cut, product, false)
+}
+
+pub(crate) fn advanced_product_source_cut_with_live_filter(
+    volume: &RadarVolume,
+    current_cut: usize,
+    product: &DisplayProduct,
+    require_complete_live_cut: bool,
+) -> Option<usize> {
+    advanced_derived_product_for_display_product(product)?;
+    if can_materialize_product_on_live_candidate_cut(
+        volume,
+        current_cut,
+        product,
+        require_complete_live_cut,
+    ) {
+        return Some(current_cut);
+    }
+    let current_elevation = volume.cuts.get(current_cut).map(|cut| cut.elevation_deg);
+    volume
+        .cuts
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            can_materialize_product_on_live_candidate_cut(
+                volume,
+                *index,
+                product,
+                require_complete_live_cut,
+            )
+        })
+        .min_by(|(left_index, left_cut), (right_index, right_cut)| {
+            let left_delta = current_elevation
+                .map(|elevation| (left_cut.elevation_deg - elevation).abs())
+                .unwrap_or(*left_index as f32);
+            let right_delta = current_elevation
+                .map(|elevation| (right_cut.elevation_deg - elevation).abs())
+                .unwrap_or(*right_index as f32);
+            left_delta
+                .total_cmp(&right_delta)
+                .then_with(|| {
+                    left_index
+                        .abs_diff(current_cut)
+                        .cmp(&right_index.abs_diff(current_cut))
+                })
+                .then_with(|| left_index.cmp(right_index))
+        })
+        .map(|(index, _)| index)
+}
+
+pub(crate) fn displayable_radial_threshold(cut_radials: usize) -> usize {
+    MIN_DISPLAYABLE_RADIALS.min((cut_radials / 2).max(1))
+}
+
+pub(crate) fn should_keep_texture_for_volume_install(
+    previous_volume: Option<&RadarVolume>,
+    next_volume: &RadarVolume,
+    same_volume: bool,
+    retain_same_site_texture: bool,
+) -> bool {
+    same_volume
+        || (retain_same_site_texture
+            && previous_volume.is_some_and(|previous| previous.site.id == next_volume.site.id))
+}
+
+pub(crate) fn selected_cut_render_data_unchanged(
+    previous_volume: Option<&RadarVolume>,
+    next_volume: &RadarVolume,
+    selected_cut: usize,
+    selected_product: &DisplayProduct,
+) -> bool {
+    let Some(previous_volume) = previous_volume else {
+        return false;
+    };
+    if frame_identity_for_volume(previous_volume) != frame_identity_for_volume(next_volume) {
+        return false;
+    }
+    let Some(previous_cut) = previous_volume.cuts.get(selected_cut) else {
+        return false;
+    };
+    let Some(next_cut) = next_volume.cuts.get(selected_cut) else {
+        return false;
+    };
+    if (previous_cut.elevation_deg - next_cut.elevation_deg).abs() > 0.05 {
+        return false;
+    }
+    let base_moment = selected_product.base_moment();
+    let Some(previous_grid) = previous_cut.moments.get(&base_moment) else {
+        return false;
+    };
+    let Some(next_grid) = next_cut.moments.get(&base_moment) else {
+        return false;
+    };
+    previous_cut.radials.len() == next_cut.radials.len()
+        && previous_grid.radial_count() == next_grid.radial_count()
+        && previous_grid.gate_range == next_grid.gate_range
+}
+
+#[cfg(test)]
+pub(crate) fn selection_for_installed_volume(
+    previous_volume: Option<&RadarVolume>,
+    previous_cut: usize,
+    previous_product: &DisplayProduct,
+    volume: &RadarVolume,
+    allow_low_level_auto_advance: bool,
+    allow_incomplete_live_chunk_advance: bool,
+    require_complete_live_cut: bool,
+) -> (usize, DisplayProduct) {
+    selection_for_installed_volume_with_low_sweep_min_seconds(
+        previous_volume,
+        previous_cut,
+        previous_product,
+        volume,
+        VolumeSelectionPolicy {
+            allow_low_level_auto_advance,
+            allow_incomplete_live_chunk_advance,
+            require_complete_live_cut,
+            low_level_min_seconds: 60,
+        },
+    )
+}
+
+pub(crate) fn selection_for_installed_volume_with_low_sweep_min_seconds(
+    previous_volume: Option<&RadarVolume>,
+    previous_cut: usize,
+    previous_product: &DisplayProduct,
+    volume: &RadarVolume,
+    policy: VolumeSelectionPolicy,
+) -> (usize, DisplayProduct) {
+    let same_site = previous_volume.is_some_and(|previous| previous.site.id == volume.site.id);
+    if same_site
+        && policy.allow_low_level_auto_advance
+        && let Some(next_cut) = latest_newer_low_level_cut(
+            previous_volume,
+            previous_cut,
+            previous_product,
+            volume,
+            policy.allow_incomplete_live_chunk_advance,
+            policy.low_level_min_seconds,
+        )
+    {
+        return (next_cut, previous_product.clone());
+    }
+    if same_site
+        && can_materialize_product_on_live_candidate_cut(
+            volume,
+            previous_cut,
+            previous_product,
+            policy.require_complete_live_cut,
+        )
+    {
+        return (previous_cut, previous_product.clone());
+    }
+    if same_site
+        && let Some(cut) = best_cut_for_product_with_live_filter(
+            volume,
+            previous_cut,
+            previous_product,
+            policy.require_complete_live_cut,
+        )
+    {
+        return (cut, previous_product.clone());
+    }
+
+    default_selection_for_volume_with_live_filter(volume, policy.require_complete_live_cut)
+}
+
+fn latest_newer_low_level_cut(
+    previous_volume: Option<&RadarVolume>,
+    previous_cut: usize,
+    previous_product: &DisplayProduct,
+    volume: &RadarVolume,
+    allow_incomplete_live_chunk_advance: bool,
+    low_level_min_seconds: i64,
+) -> Option<usize> {
+    let previous_volume = previous_volume?;
+    if frame_identity_for_volume(previous_volume) != frame_identity_for_volume(volume) {
+        return None;
+    }
+    let previous_cut_data = previous_volume.cuts.get(previous_cut)?;
+    if !is_allowed_live_low_level_tilt_for_site(
+        previous_cut_data,
+        &previous_volume.site.id,
+        allow_incomplete_live_chunk_advance,
+    ) {
+        return None;
+    }
+    let previous_time = cut_start_time_utc(previous_volume, previous_cut)?;
+    let previous_elevation_deg = previous_cut_data.elevation_deg;
+
+    (0..volume.cuts.len())
+        .filter(|cut_index| {
+            volume.cuts.get(*cut_index).is_some_and(|cut| {
+                is_allowed_live_low_level_tilt_for_site(
+                    cut,
+                    &volume.site.id,
+                    allow_incomplete_live_chunk_advance,
+                ) && (cut.elevation_deg - previous_elevation_deg).abs()
+                    <= LOW_SWEEP_FILTER_ELEVATION_TOLERANCE_DEG
+            }) && can_materialize_product_on_cut(volume, *cut_index, previous_product)
+        })
+        .filter_map(|cut_index| {
+            let cut_time = cut_start_time_utc(volume, cut_index)?;
+            ((cut_time - previous_time).num_seconds() >= low_level_min_seconds)
+                .then_some((cut_index, cut_time))
+        })
+        .max_by_key(|(_, cut_time)| *cut_time)
+        .map(|(cut_index, _)| cut_index)
+}
+
+pub(crate) fn should_defer_live_partial_selection_for_active_product(
+    active_volume: Option<&RadarVolume>,
+    selected_cut: usize,
+    selected_product: &DisplayProduct,
+    candidate: Option<&FrameHistoryEntry>,
+    require_selected_cut: bool,
+) -> bool {
+    let Some(active_volume) = active_volume else {
+        return false;
+    };
+    let Some(candidate) = candidate else {
+        return false;
+    };
+    if candidate.status != FrameStatus::LivePartial
+        || active_volume.site.id != candidate.identity.site_id
+    {
+        return false;
+    }
+
+    if require_selected_cut {
+        if !can_materialize_product_on_cut(active_volume, selected_cut, selected_product) {
+            return false;
+        }
+        !can_materialize_product_on_live_candidate_cut(
+            candidate.volume.as_ref(),
+            selected_cut,
+            selected_product,
+            true,
+        )
+    } else {
+        if !volume_can_materialize_product_with_live_filter(active_volume, selected_product, false)
+        {
+            return false;
+        }
+        !volume_can_materialize_product_with_live_filter(
+            candidate.volume.as_ref(),
+            selected_product,
+            true,
+        )
+    }
+}
+
+pub(crate) fn volume_has_displayable_product(
+    volume: &RadarVolume,
+    product: &DisplayProduct,
+) -> bool {
+    volume_has_displayable_product_with_live_filter(volume, product, false)
+}
+
+fn volume_has_displayable_product_with_live_filter(
+    volume: &RadarVolume,
+    product: &DisplayProduct,
+    require_complete_live_cut: bool,
+) -> bool {
+    (0..volume.cuts.len()).any(|cut_index| {
+        is_displayable_on_live_candidate_cut(volume, cut_index, product, require_complete_live_cut)
+    })
+}
+
+pub(crate) fn volume_can_materialize_product_with_live_filter(
+    volume: &RadarVolume,
+    product: &DisplayProduct,
+    require_complete_live_cut: bool,
+) -> bool {
+    (0..volume.cuts.len()).any(|cut_index| {
+        can_materialize_product_on_live_candidate_cut(
+            volume,
+            cut_index,
+            product,
+            require_complete_live_cut,
+        )
+    })
+}
+
+fn default_selection_for_volume_with_live_filter(
+    volume: &RadarVolume,
+    require_complete_live_cut: bool,
+) -> (usize, DisplayProduct) {
+    let reflectivity = DisplayProduct::Moment(MomentType::Reflectivity);
+    if is_displayable_on_live_candidate_cut(volume, 0, &reflectivity, require_complete_live_cut) {
+        return (0, reflectivity);
+    }
+
+    for cut_index in 0..volume.cuts.len() {
+        let Some(cut) = volume.cuts.get(cut_index) else {
+            continue;
+        };
+        if require_complete_live_cut
+            && !is_complete_live_candidate_tilt_for_site(cut, &volume.site.id)
+        {
+            continue;
+        }
+        if let Some(product) = displayable_products(volume, cut_index).first().cloned() {
+            return (cut_index, product);
+        }
+    }
+
+    (0, reflectivity)
+}
+
+pub(crate) fn best_cut_for_product_with_live_filter(
+    volume: &RadarVolume,
+    current_cut: usize,
+    product: &DisplayProduct,
+    require_complete_live_cut: bool,
+) -> Option<usize> {
+    if can_materialize_product_on_live_candidate_cut(
+        volume,
+        current_cut,
+        product,
+        require_complete_live_cut,
+    ) {
+        return Some(current_cut);
+    }
+    let current_elevation = volume.cuts.get(current_cut).map(|cut| cut.elevation_deg);
+    volume
+        .cuts
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            can_materialize_product_on_live_candidate_cut(
+                volume,
+                *index,
+                product,
+                require_complete_live_cut,
+            )
+        })
+        .min_by(|(left_index, left_cut), (right_index, right_cut)| {
+            let left_delta = current_elevation
+                .map(|elevation| (left_cut.elevation_deg - elevation).abs())
+                .unwrap_or(*left_index as f32);
+            let right_delta = current_elevation
+                .map(|elevation| (right_cut.elevation_deg - elevation).abs())
+                .unwrap_or(*right_index as f32);
+            left_delta
+                .total_cmp(&right_delta)
+                .then_with(|| {
+                    left_index
+                        .abs_diff(current_cut)
+                        .cmp(&right_index.abs_diff(current_cut))
+                })
+                .then_with(|| left_index.cmp(right_index))
+        })
+        .map(|(index, _)| index)
+}
+
+fn is_displayable_on_live_candidate_cut(
+    volume: &RadarVolume,
+    cut_index: usize,
+    product: &DisplayProduct,
+    require_complete_live_cut: bool,
+) -> bool {
+    if !is_displayable_on_cut(volume, cut_index, product) {
+        return false;
+    }
+    !require_complete_live_cut
+        || volume
+            .cuts
+            .get(cut_index)
+            .is_some_and(|cut| is_complete_live_candidate_tilt_for_site(cut, &volume.site.id))
+}
+
+pub(crate) fn can_materialize_product_on_live_candidate_cut(
+    volume: &RadarVolume,
+    cut_index: usize,
+    product: &DisplayProduct,
+    require_complete_live_cut: bool,
+) -> bool {
+    can_materialize_product_on_cut(volume, cut_index, product)
+        && (!require_complete_live_cut
+            || volume
+                .cuts
+                .get(cut_index)
+                .is_some_and(|cut| is_complete_live_candidate_tilt_for_site(cut, &volume.site.id)))
+}
+
+fn is_complete_live_candidate_tilt_for_site(cut: &ElevationCut, site_id: &str) -> bool {
+    if is_live_low_level_tilt(cut) {
+        is_complete_live_low_level_tilt_for_site(cut, site_id)
+    } else {
+        is_complete_live_tilt(cut)
+    }
+}
+
+fn should_clear_display_for_latest_load(
+    volume: Option<&RadarVolume>,
+    site_id: &str,
+    now_utc: DateTime<Utc>,
+) -> bool {
+    let Some(volume) = volume else {
+        return false;
+    };
+    if volume.site.id != site_id {
+        return true;
+    }
+
+    now_utc
+        .signed_duration_since(volume.volume_time.with_timezone(&Utc))
+        .num_seconds()
+        > STALE_LATEST_DISPLAY_CLEAR_SECONDS
+}
+
+pub(crate) fn should_clear_display_before_latest_load(
+    mode: LatestLoadMode,
+    volume: Option<&RadarVolume>,
+    site_id: &str,
+    now_utc: DateTime<Utc>,
+) -> bool {
+    mode != LatestLoadMode::AutoRefresh
+        && should_clear_display_for_latest_load(volume, site_id, now_utc)
+}
+
+/// Explicit primary loads (User/Loop) take the view from an active
+/// custom-URL poll; background AutoRefresh is not intent and must never
+/// stop the poller.
+pub(crate) fn latest_load_pauses_poll(mode: LatestLoadMode, poll_active: bool) -> bool {
+    poll_active && mode != LatestLoadMode::AutoRefresh
+}
+
+pub(crate) fn live_preload_frames_for_mode(
+    mode: LatestLoadMode,
+    requested: usize,
+    history_limit: usize,
+) -> usize {
+    if mode != LatestLoadMode::User {
+        return 0;
+    }
+    requested
+        .min(MAX_LIVE_PRELOAD_FRAME_COUNT)
+        .min(history_limit.saturating_sub(1))
+}
+
+pub(crate) fn archive_fetch_count_for_latest_load(
+    mode: LatestLoadMode,
+    live_preload_frames: usize,
+    history_limit: usize,
+    has_displayed_frame: bool,
+) -> Option<usize> {
+    let history_limit = history_limit.max(1);
+    match mode {
+        LatestLoadMode::Loop => Some(history_limit),
+        LatestLoadMode::AutoRefresh if has_displayed_frame => None,
+        LatestLoadMode::AutoRefresh => Some(1),
+        LatestLoadMode::User if live_preload_frames > 0 => Some(live_preload_frames + 1),
+        LatestLoadMode::User if !has_displayed_frame => Some(1),
+        LatestLoadMode::User => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn product_keyboard_step_wraps_display_products() {
+        let products = vec![
+            DisplayProduct::Moment(MomentType::Reflectivity),
+            DisplayProduct::Moment(MomentType::Velocity),
+            DisplayProduct::StormRelativeVelocity,
+        ];
+
+        assert_eq!(
+            stepped_product(
+                &products,
+                &DisplayProduct::Moment(MomentType::Reflectivity),
+                1
+            ),
+            Some(&DisplayProduct::Moment(MomentType::Velocity))
+        );
+        assert_eq!(
+            stepped_product(&products, &DisplayProduct::StormRelativeVelocity, 1),
+            Some(&DisplayProduct::Moment(MomentType::Reflectivity))
+        );
+        assert_eq!(
+            stepped_product(
+                &products,
+                &DisplayProduct::Moment(MomentType::Reflectivity),
+                -1
+            ),
+            Some(&DisplayProduct::StormRelativeVelocity)
+        );
+    }
+
+    #[test]
+    fn tilt_keyboard_step_wraps_displayable_cuts() {
+        let cuts = vec![0, 2, 4];
+
+        assert_eq!(stepped_cut(&cuts, 0, 1), Some(2));
+        assert_eq!(stepped_cut(&cuts, 4, 1), Some(0));
+        assert_eq!(stepped_cut(&cuts, 0, -1), Some(4));
+    }
+
+    #[test]
+    fn product_hotkeys_accept_numbers_and_letters() {
+        assert_eq!(product_hotkey_egui_key("1"), Some(egui::Key::Num1));
+        assert_eq!(product_hotkey_egui_key("0"), Some(egui::Key::Num0));
+        assert_eq!(product_hotkey_egui_key("a"), Some(egui::Key::A));
+        assert_eq!(product_hotkey_egui_key("Z"), Some(egui::Key::Z));
+        assert_eq!(product_hotkey_egui_key("Space"), None);
+        assert!(product_hotkey_sort_key("9") < product_hotkey_sort_key("0"));
+        assert!(product_hotkey_sort_key("0") < product_hotkey_sort_key("A"));
+    }
+
+    #[test]
+    fn explicit_loads_pause_url_poll_auto_refresh_does_not() {
+        assert!(latest_load_pauses_poll(LatestLoadMode::User, true));
+        assert!(latest_load_pauses_poll(LatestLoadMode::Loop, true));
+        assert!(!latest_load_pauses_poll(LatestLoadMode::AutoRefresh, true));
+        assert!(!latest_load_pauses_poll(LatestLoadMode::User, false));
+    }
+
+    #[test]
+    fn live_preload_only_applies_to_explicit_latest_loads() {
+        assert_eq!(live_preload_frames_for_mode(LatestLoadMode::User, 5, 7), 5);
+        assert_eq!(live_preload_frames_for_mode(LatestLoadMode::User, 50, 7), 6);
+        assert_eq!(live_preload_frames_for_mode(LatestLoadMode::Loop, 5, 7), 0);
+        assert_eq!(
+            live_preload_frames_for_mode(LatestLoadMode::AutoRefresh, 5, 7),
+            0
+        );
+
+        assert_eq!(
+            archive_fetch_count_for_latest_load(LatestLoadMode::User, 5, 7, true),
+            Some(6)
+        );
+        assert_eq!(
+            archive_fetch_count_for_latest_load(LatestLoadMode::User, 0, 7, true),
+            None
+        );
+        assert_eq!(
+            archive_fetch_count_for_latest_load(LatestLoadMode::User, 0, 7, false),
+            Some(1)
+        );
+        assert_eq!(
+            archive_fetch_count_for_latest_load(LatestLoadMode::Loop, 0, 7, true),
+            Some(7)
+        );
+        assert_eq!(
+            archive_fetch_count_for_latest_load(LatestLoadMode::AutoRefresh, 0, 7, true),
+            None
+        );
+    }
+
+    #[test]
+    fn latest_load_clears_different_or_stale_display() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 7, 23, 0, 0).unwrap();
+        let mut fresh = RadarVolume::new(
+            radar_core::RadarSite::new("KTLX"),
+            now - chrono::Duration::minutes(5),
+        );
+
+        assert!(!should_clear_display_for_latest_load(
+            Some(&fresh),
+            "KTLX",
+            now
+        ));
+        assert!(should_clear_display_for_latest_load(
+            Some(&fresh),
+            "KGGW",
+            now
+        ));
+
+        fresh.volume_time = now - chrono::Duration::minutes(16);
+        assert!(should_clear_display_for_latest_load(
+            Some(&fresh),
+            "KTLX",
+            now
+        ));
+        assert!(!should_clear_display_before_latest_load(
+            LatestLoadMode::AutoRefresh,
+            Some(&fresh),
+            "KTLX",
+            now
+        ));
+        assert!(should_clear_display_before_latest_load(
+            LatestLoadMode::User,
+            Some(&fresh),
+            "KTLX",
+            now
+        ));
+        assert!(!should_clear_display_for_latest_load(None, "KTLX", now));
+    }
+
+    #[test]
+    fn picker_product_order_follows_human_moment_order() {
+        let available = [
+            MomentType::Reflectivity,
+            MomentType::Velocity,
+            MomentType::SpectrumWidth,
+            MomentType::DifferentialReflectivity,
+            MomentType::CorrelationCoefficient,
+            MomentType::DifferentialPhase,
+            MomentType::SpecificDifferentialPhase,
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+
+        let labels = product_order(&available)
+            .into_iter()
+            .map(|product| product.label().to_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            vec![
+                "REF", "VEL", "DVEL", "SRV", "DSRV", "RHO", "ZDR", "SW", "PHI", "KDP"
+            ]
+        );
+    }
+}
