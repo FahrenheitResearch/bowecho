@@ -75,20 +75,26 @@ pub struct SurfaceFallback {
 /// `cells` is the horizontal grid size (`ny * nx`) of the hour being written;
 /// every returned plane matches it. Fails (leaving the caller to skip volumes
 /// and still write the 2D fields) if the required 3D fields are unreadable.
+///
+/// `progress` receives per-stage messages (which 3D field is being read /
+/// getvar'd, then interpolation percentage) — on a 250 m grid each stage is
+/// tens of seconds, and both import paths surface these lines in the dock.
 pub fn build_iso_volumes(
     file: &WrfFile,
     timeidx: usize,
     cells: usize,
+    progress: &mut dyn FnMut(String),
 ) -> Result<(Vec<IsoVolume>, SurfaceFallback), String> {
     if cells == 0 {
         return Err("WRF grid has zero cells".to_string());
     }
-    let read = |name: &str| -> Result<VarOutput, String> {
+    let read = |name: &str, stage: &str| -> Result<VarOutput, String> {
         getvar(file, name, Some(timeidx), &ComputeOpts::default())
-            .map_err(|err| format!("read WRF {name}: {err}"))
+            .map_err(|err| format!("read WRF {name} ({stage}): {err}"))
     };
 
-    let pressure = read("pressure")?; // hPa, [nz, ny, nx]
+    progress("reading WRF pressure (sounding field 1/5)".to_string());
+    let pressure = read("pressure", "sounding field 1/5")?; // hPa, [nz, ny, nx]
     let nz = pressure.data.len() / cells;
     if nz < 2 || nz * cells != pressure.data.len() {
         return Err(format!(
@@ -97,9 +103,12 @@ pub fn build_iso_volumes(
         ));
     }
 
-    let temp = read("temp")?; // K
-    let td = read("td")?; // degC
-    let height = read("height")?; // m MSL
+    progress("reading WRF temperature (sounding field 2/5)".to_string());
+    let temp = read("temp", "sounding field 2/5")?; // K
+    progress("reading WRF dewpoint (sounding field 3/5)".to_string());
+    let td = read("td", "sounding field 3/5")?; // degC
+    progress("reading WRF height (sounding field 4/5)".to_string());
+    let height = read("height", "sounding field 4/5")?; // m MSL
     check_len(&temp, nz * cells, "temp")?;
     check_len(&td, nz * cells, "td")?;
     check_len(&height, nz * cells, "height")?;
@@ -110,20 +119,34 @@ pub fn build_iso_volumes(
     // 50 M-cell grid the two halves are ~400 MB each, and `to_vec`-ing them
     // while the 800 MB source was still alive measurably spiked the peak
     // working set of the whole import.
-    let (u_wind, v_wind) = match read("uvmet") {
+    progress("reading WRF winds (sounding field 5/5)".to_string());
+    let (u_wind, v_wind) = match read("uvmet", "sounding field 5/5") {
         Ok(uvmet) if uvmet.data.len() == 2 * nz * cells => {
             let mut u = uvmet.data;
             let v = u.split_off(nz * cells);
             (u, v)
         }
         _ => {
-            let ua = read("ua")?;
-            let va = read("va")?;
+            let ua = read("ua", "sounding field 5/5")?;
+            let va = read("va", "sounding field 5/5")?;
             check_len(&ua, nz * cells, "ua")?;
             check_len(&va, nz * cells, "va")?;
             (ua.data, va.data)
         }
     };
+
+    // The hour's LAST `getvar` is behind us, and every input the interpolator
+    // needs is owned above — release wrf-core's memoized 3-D f64 intermediates
+    // NOW, before the interpolation loop and the store write. `getvar`
+    // memoizes every intermediate (full pressure, theta, temperature,
+    // geopotential, heights, QVAPOR, destaggered winds, …) inside `WrfFile`
+    // and only evicts on a timestep CHANGE; on the 800×800×79 Enderlin grid
+    // that cache is ~5 GB of dead weight from here on. Clearing any EARLIER
+    // was measured to more than double the peak (every read recomputes its
+    // whole dependency chain — see docs/wrf-import-large-grids.md); clearing
+    // here costs zero recompute. catch_unwind: a poisoned cache mutex (from a
+    // caught diagnostic panic upstream) must not fail the volumes.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| file.clear_cache()));
 
     // Dewpoint arrives in degC from wrf-core's `td`; the shared interpolator
     // works in Kelvin like every other field. Convert in place — a separate
@@ -141,6 +164,7 @@ pub fn build_iso_volumes(
         &v_wind,
         nz,
         cells,
+        progress,
     ))
 }
 
@@ -149,6 +173,9 @@ pub fn build_iso_volumes(
 /// `[nz, ny, nx]` (index `k * cells + c`) in skew-T units: pressure hPa,
 /// temperature K, dewpoint K, height m, winds m/s. Shared by the raw-wrfout
 /// (`build_iso_volumes`) and post-processed (`TK`/`Z`/`P`) reader paths.
+///
+/// `progress` gets a message roughly every 10% of the columns — on a 50 M-cell
+/// grid this loop alone is tens of seconds, and the dock shows the latest line.
 pub fn interpolate_iso_volumes(
     pressure_hpa: &[f64],
     temp_k: &[f64],
@@ -158,6 +185,7 @@ pub fn interpolate_iso_volumes(
     v_ms: &[f64],
     nz: usize,
     cells: usize,
+    progress: &mut dyn FnMut(String),
 ) -> (Vec<IsoVolume>, SurfaceFallback) {
     let levels = standard_levels();
     let mut temp_iso = init_planes(levels.len(), cells);
@@ -166,8 +194,16 @@ pub fn interpolate_iso_volumes(
     let mut v_iso = init_planes(levels.len(), cells);
     let mut hgt_iso = init_planes(levels.len(), cells);
 
+    let progress_step = (cells / 10).max(1);
     let mut col_p = vec![0f64; nz];
     for c in 0..cells {
+        if c % progress_step == 0 {
+            progress(format!(
+                "interpolating 5 sounding fields to {} isobaric levels — {}%",
+                levels.len(),
+                c * 100 / cells
+            ));
+        }
         for k in 0..nz {
             col_p[k] = pressure_hpa[k * cells + c];
         }
@@ -311,5 +347,53 @@ mod tests {
         assert_eq!(lerp(0.0, 10.0, 0.5), Some(5.0));
         assert_eq!(lerp(f64::NAN, 10.0, 0.5), None);
         assert_eq!(lerp(0.0, f64::NAN, 0.5), None);
+    }
+
+    /// The shared interpolator must stream progress (both import paths surface
+    /// it) and still produce correct planes — guard for the progress plumbing.
+    #[test]
+    fn interpolate_streams_progress_and_interpolates() {
+        // 2 columns × 3 levels, pressure decreasing with index.
+        let pressure = vec![1000.0, 1000.0, 850.0, 850.0, 700.0, 700.0];
+        let temp = vec![300.0, 301.0, 290.0, 291.0, 280.0, 281.0];
+        let dewp = vec![295.0, 296.0, 285.0, 286.0, 275.0, 276.0];
+        let height = vec![100.0, 110.0, 1500.0, 1510.0, 3000.0, 3010.0];
+        let u = vec![1.0; 6];
+        let v = vec![2.0; 6];
+
+        let mut messages = Vec::new();
+        let (volumes, surface) = interpolate_iso_volumes(
+            &pressure,
+            &temp,
+            &dewp,
+            &height,
+            &u,
+            &v,
+            3,
+            2,
+            &mut |message| messages.push(message),
+        );
+
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.contains("isobaric levels")),
+            "unexpected progress lines: {messages:?}"
+        );
+        assert!(!messages.is_empty(), "interpolation must report progress");
+
+        // 850 hPa is an exact native level: temperature lands unchanged.
+        let temps = &volumes[0];
+        assert_eq!(temps.name, "temperature_iso");
+        let (_, plane_850) = temps
+            .levels
+            .iter()
+            .find(|(hpa, _)| *hpa == 850)
+            .expect("850 hPa plane");
+        assert!((plane_850[0] - 290.0).abs() < 1e-3);
+        assert!((plane_850[1] - 291.0).abs() < 1e-3);
+        // Surface fallback comes from level 0 in Pa/K.
+        assert!((surface.surface_pressure_pa[0] - 100_000.0).abs() < 1e-3);
+        assert!((surface.temperature_2m_k[1] - 301.0).abs() < 1e-3);
     }
 }

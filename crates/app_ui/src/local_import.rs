@@ -32,7 +32,17 @@ const LOCAL_IMPORT_MAX_DISCOVERED_FILES: usize = 10_000;
 #[derive(Debug)]
 pub struct LocalImportTask {
     pub label: String,
-    pub rx: Receiver<Result<LocalImportSummary, String>>,
+    pub rx: Receiver<LocalImportMessage>,
+}
+
+/// Worker → UI messages, same shape as `wrf_process::WrfProcessMessage`: the
+/// dock shows the latest `Progress` line while the import runs (on a 250 m
+/// grid the light path is legitimately minutes per file — an anonymous
+/// spinner reads as a hang), then a single terminal `Done`.
+#[derive(Debug)]
+pub enum LocalImportMessage {
+    Progress(String),
+    Done(Result<LocalImportSummary, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +53,9 @@ pub struct LocalImportSummary {
     pub files_seen: usize,
     pub hours_written: usize,
     pub variables: Vec<String>,
+    /// Per-file degradations that did not fail the import (e.g. isobaric
+    /// sounding volumes unavailable) — surfaced in the completion status line.
+    pub notes: Vec<String>,
 }
 
 struct ImportedWrfFields {
@@ -68,8 +81,12 @@ pub fn spawn_import_paths(paths: Vec<PathBuf>, store_root: PathBuf) -> LocalImpo
     std::thread::Builder::new()
         .name("rw-ui-local-import".to_string())
         .spawn(move || {
-            let result = import_paths(&paths, &store_root).map_err(|err| err.to_string());
-            let _ = tx.send(result);
+            let mut progress = |message: String| {
+                let _ = tx.send(LocalImportMessage::Progress(message));
+            };
+            let result =
+                import_paths(&paths, &store_root, &mut progress).map_err(|err| err.to_string());
+            let _ = tx.send(LocalImportMessage::Done(result));
         })
         .expect("spawn local import worker");
     LocalImportTask { label, rx }
@@ -115,7 +132,11 @@ pub fn is_supported_model_file(path: &Path) -> bool {
         )
 }
 
-fn import_paths(paths: &[PathBuf], store_root: &Path) -> Result<LocalImportSummary, ImportError> {
+fn import_paths(
+    paths: &[PathBuf],
+    store_root: &Path,
+    progress: &mut dyn FnMut(String),
+) -> Result<LocalImportSummary, ImportError> {
     if paths.is_empty() {
         return Err(ImportError::NoFiles);
     }
@@ -134,18 +155,28 @@ fn import_paths(paths: &[PathBuf], store_root: &Path) -> Result<LocalImportSumma
 
     let model = "wrf".to_string();
     let run = import_run_name(&files);
+    let total = files.len();
     let mut all_vars = Vec::new();
     let mut written = Vec::<WrittenHour>::new();
+    let mut notes = Vec::<String>::new();
     for (index, path) in files.iter().enumerate() {
         let hour = u16::try_from(index).expect("bounded above");
+        // Every stage line carries the file position, so a folder import reads
+        // "file 3/10 (wrfout_…): interpolating …" rather than a bare spinner.
+        let tag = format!("file {}/{total} ({})", index + 1, display_name(path));
         // Post-processed climate wrfout (CONUS-I/II, GDEX: derived TK/Z/P, no
         // raw T/PB) can't go through the raw-wrfout reader — build it directly.
-        if let Some((canonical, volumes)) = try_postprocessed_wrf(path)? {
+        // (Bound before the `if let` so the prefixing closure's borrow of
+        // `progress` ends before the block uses `progress` again.)
+        let postprocessed =
+            try_postprocessed_wrf(path, &mut |message| progress(format!("{tag}: {message}")))?;
+        if let Some((canonical, volumes)) = postprocessed {
             let refs = canonical
                 .iter()
                 .map(|(name, field)| (name.as_str(), field))
                 .collect::<Vec<_>>();
             let volume_inputs = volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>();
+            progress(format!("{tag}: writing forecast hour f{hour:03} to store"));
             let result = write_hour_from_fields_with_derived(
                 store_root,
                 &model,
@@ -161,7 +192,9 @@ fn import_paths(paths: &[PathBuf], store_root: &Path) -> Result<LocalImportSumma
             written.push(result);
             continue;
         }
-        let mut fields = read_wrf_2d_fields(path)?;
+        progress(format!("{tag}: reading 2D surface fields"));
+        let mut fields =
+            read_wrf_2d_fields(path, &mut |message| progress(format!("{tag}: {message}")))?;
         if fields.canonical.is_empty() {
             return Err(ImportError::NoFields(path.clone()));
         }
@@ -169,7 +202,12 @@ fn import_paths(paths: &[PathBuf], store_root: &Path) -> Result<LocalImportSumma
         // imported WRF run makes soundings. Built through wrf-core; a plain
         // NetCDF wrf-core can't open yields neither. Fill any surface field the
         // 2D read missed (e.g. PSFC in a split wrf3d file) from the fallback.
-        let (iso_volumes, surface_fallback) = read_iso_volumes(path);
+        let (iso_volumes, surface_fallback, volume_note) =
+            read_iso_volumes(path, &mut |message| progress(format!("{tag}: {message}")));
+        if let Some(note) = volume_note {
+            progress(format!("{tag}: {note}"));
+            notes.push(format!("{}: {note}", display_name(path)));
+        }
         if let Some(surface) = surface_fallback {
             fill_missing_surface(&mut fields, surface);
         }
@@ -204,6 +242,7 @@ fn import_paths(paths: &[PathBuf], store_root: &Path) -> Result<LocalImportSumma
         } else {
             Vec::new()
         };
+        progress(format!("{tag}: writing forecast hour f{hour:03} to store"));
         let result = write_hour_from_fields_with_derived(
             store_root,
             &model,
@@ -227,10 +266,14 @@ fn import_paths(paths: &[PathBuf], store_root: &Path) -> Result<LocalImportSumma
         files_seen: files.len(),
         hours_written: written.len(),
         variables: all_vars,
+        notes,
     })
 }
 
-fn read_wrf_2d_fields(path: &Path) -> Result<ImportedWrfFields, ImportError> {
+fn read_wrf_2d_fields(
+    path: &Path,
+    progress: &mut dyn FnMut(String),
+) -> Result<ImportedWrfFields, ImportError> {
     let nc = netcrust::open(path)?;
     let lat = read_first_2d_any(&nc, &["XLAT", "XLAT_M", "lat", "latitude"])?;
     let lon = read_first_2d_any(&nc, &["XLONG", "XLONG_M", "lon", "longitude"])?;
@@ -379,7 +422,7 @@ fn read_wrf_2d_fields(path: &Path) -> Result<ImportedWrfFields, ImportError> {
         )?;
     }
 
-    let raw_2d = read_raw_wrf_mass_grid_fields(&nc, lat.nx, lat.ny)?;
+    let raw_2d = read_raw_wrf_mass_grid_fields(&nc, lat.nx, lat.ny, progress)?;
 
     Ok(ImportedWrfFields {
         canonical,
@@ -438,6 +481,7 @@ fn read_raw_wrf_mass_grid_fields(
     nc: &NcFile,
     nx: usize,
     ny: usize,
+    progress: &mut dyn FnMut(String),
 ) -> Result<Vec<RawField2D>, ImportError> {
     let mut seen = HashSet::<String>::new();
     let mut raw = Vec::new();
@@ -446,6 +490,9 @@ fn read_raw_wrf_mass_grid_fields(
         if !is_raw_wrf_mass_grid_variable(&var, nx, ny) || !raw_wrf_variable_allowed(wrf_name) {
             continue;
         }
+        // One line per raw plane: on a compressed 250 m wrfout each first-
+        // record read decompresses real data, and there are dozens of them.
+        progress(format!("reading raw 2D field {wrf_name}"));
         let Some(plane) = read_first_2d(nc, wrf_name)? else {
             continue;
         };
@@ -797,15 +844,30 @@ fn now_unix() -> u64 {
 /// Build isobaric sounding volumes for one WRF file via wrf-core (time index 0,
 /// matching the single-record 2D import). Returns empty for files wrf-core
 /// cannot open (e.g. plain NetCDF) or whose 3D fields are unavailable, so the
-/// 2D import still succeeds.
-fn read_iso_volumes(path: &Path) -> (Vec<IsoVolume>, Option<SurfaceFallback>) {
+/// 2D import still succeeds; the third element carries the human-readable
+/// reason when the volumes degraded on a file wrf-core DID open.
+fn read_iso_volumes(
+    path: &Path,
+    progress: &mut dyn FnMut(String),
+) -> (Vec<IsoVolume>, Option<SurfaceFallback>, Option<String>) {
     let Ok(file) = WrfFile::open(path) else {
-        return (Vec::new(), None);
+        // Plain NetCDF with no WRF 3D state — a 2D-only import, not a note.
+        return (Vec::new(), None, None);
     };
     let cells = file.nx.saturating_mul(file.ny);
-    match build_iso_volumes(&file, 0, cells) {
-        Ok((volumes, surface)) => (volumes, Some(surface)),
-        Err(_) => (Vec::new(), None),
+    // Same per-field panic isolation as the heavy path's `compute_var`: a
+    // wrf-core panic on a pathological grid must degrade to "no soundings",
+    // not unwind the rw-ui-local-import worker and lose the whole import.
+    let result = crate::wrf_process::isolate_panics("isobaric volumes", || {
+        build_iso_volumes(&file, 0, cells, progress)
+    });
+    match result {
+        Ok((volumes, surface)) => (volumes, Some(surface), None),
+        Err(err) => (
+            Vec::new(),
+            None,
+            Some(format!("isobaric sounding volumes unavailable — {err}")),
+        ),
     }
 }
 
@@ -872,8 +934,10 @@ fn fill_missing_surface(fields: &mut ImportedWrfFields, surface: SurfaceFallback
 /// the wrf-core reader needs, and carry no surface fields. Returns the
 /// synthesized surface 2D fields + the isobaric volumes, or `None` if this
 /// isn't a post-processed WRF file (so the caller falls back to the raw path).
+/// `progress` streams the stage messages both import paths show in the dock.
 pub(crate) fn try_postprocessed_wrf(
     path: &Path,
+    progress: &mut dyn FnMut(String),
 ) -> Result<Option<(Vec<(String, SelectedField2D)>, Vec<IsoVolume>)>, ImportError> {
     // If netcrust can't open it at all, it's not our post-processed case —
     // let the caller's raw-wrfout path try instead of failing here.
@@ -902,15 +966,19 @@ pub(crate) fn try_postprocessed_wrf(
     let projection = wrf_projection(&nc);
 
     // 3D mass-point state. `read3d` verifies the horizontal shape and returns
-    // the level count.
+    // the level count. `into_values` hands back the decoded buffer without a
+    // copy — each of these is `nz * cells * 8` bytes (hundreds of MB on a
+    // CONUS-II grid), so `values().to_vec()` would double the transient cost.
     let read3d = |name: &str| -> Result<(Vec<f64>, usize), ImportError> {
         let array = nc.read_array_f64_first_record_or_all(name)?;
-        let s = array.shape();
+        let s = array.shape().to_vec();
         if s.len() != 3 || s[1] != ny || s[2] != nx {
-            return Err(ImportError::BadShape(name.to_string(), s.to_vec()));
+            return Err(ImportError::BadShape(name.to_string(), s));
         }
-        Ok((array.values().to_vec(), s[0]))
+        let nz = s[0];
+        Ok((array.into_values(), nz))
     };
+    progress("reading post-processed 3D fields (TK/P/Z/QVAPOR)".to_string());
     let (tk, nz) = read3d("TK")?;
     let (p_pa, _) = read3d("P")?;
     let (z_m, _) = read3d("Z")?;
@@ -925,6 +993,7 @@ pub(crate) fn try_postprocessed_wrf(
     }
 
     // Destagger the C-grid winds to mass points.
+    progress("destaggering U/V winds to mass points".to_string());
     let u_mass = destagger_x(&nc, "U", nz, ny, nx)?;
     let v_mass = destagger_y(&nc, "V", nz, ny, nx)?;
 
@@ -935,8 +1004,17 @@ pub(crate) fn try_postprocessed_wrf(
         .map(|(&q, &pa)| dewpoint_k_from_q_p(q, pa))
         .collect();
 
-    let (volumes, surface) =
-        interpolate_iso_volumes(&p_hpa, &tk, &dewpoint_k, &z_m, &u_mass, &v_mass, nz, cells);
+    let (volumes, surface) = interpolate_iso_volumes(
+        &p_hpa,
+        &tk,
+        &dewpoint_k,
+        &z_m,
+        &u_mass,
+        &v_mass,
+        nz,
+        cells,
+        progress,
+    );
 
     // The 3D file carries no surface fields; synthesize all five from the
     // lowest model level so the sounding column can anchor at the surface.
@@ -1104,6 +1182,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Instrumented real-fixture guard for the light import (the "📄 WRF/
+    /// NetCDF file…" dock path): runs `import_paths` on the wrfout named by
+    /// `RW_LOCAL_IMPORT_FIXTURE`, forwarding every progress line to stderr
+    /// with a timestamp and printing peak RSS (`VmHWM`) at the end — the
+    /// before/after measurement harness for the large-grid memory fix
+    /// (docs/wrf-import-large-grids.md). Release builds only on large grids.
     #[test]
     fn optional_wrf_fixture_imports_to_store() {
         let Ok(fixture) = std::env::var("RW_LOCAL_IMPORT_FIXTURE") else {
@@ -1111,15 +1195,96 @@ mod tests {
             return;
         };
         let store_root = temp_dir("store");
-        let summary = import_paths(&[PathBuf::from(&fixture)], &store_root).unwrap();
+        let start = std::time::Instant::now();
+        let mut lines = Vec::new();
+        let summary = import_paths(&[PathBuf::from(&fixture)], &store_root, &mut |message| {
+            eprintln!("[{:9.2?}] {message}", start.elapsed());
+            lines.push(message);
+        })
+        .unwrap();
+        eprintln!(
+            "[{:9.2?}] DONE: {} hour(s), {} variables; peak RSS {}",
+            start.elapsed(),
+            summary.hours_written,
+            summary.variables.len(),
+            peak_rss_label()
+        );
         assert_eq!(summary.model, "wrf");
         assert_eq!(summary.hours_written, 1);
         assert!(summary.variables.iter().any(|var| var == "temperature_2m"));
         assert!(summary.variables.iter().any(|var| var == "dewpoint_2m"));
         assert!(summary.variables.iter().any(|var| var == "wind_speed_10m"));
-        assert!(summary.variables.iter().any(|var| var == "apcp"));
+        // No `apcp` assert: this harness runs against ANY wrfout, and some
+        // (e.g. the Enderlin 250 m d03 outputs) carry no RAINC/RAINNC — the
+        // variables line above shows what the file actually yielded.
+        // Progress must stream per-stage detail, not one line per file: the
+        // 2D read, each wrf-core sounding field, interpolation percentages,
+        // and the store write all pass through the same channel the dock
+        // renders.
+        assert!(
+            lines.iter().any(|l| l.contains("file 1/1")),
+            "stage lines must carry the file position: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("reading 2D surface fields")),
+            "missing 2D-read stage: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("sounding field 5/5")),
+            "missing per-field getvar stages: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("isobaric levels")),
+            "missing interpolation stages: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("writing forecast hour")),
+            "missing store-write stage: {lines:?}"
+        );
 
         let _ = std::fs::remove_dir_all(store_root);
+    }
+
+    /// Peak resident set (Linux `VmHWM`), for the instrumented fixture runs on
+    /// the verify node; other platforms report unavailable.
+    fn peak_rss_label() -> String {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find(|line| line.starts_with("VmHWM"))
+                    .map(|line| {
+                        line.split_whitespace()
+                            .skip(1)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+            })
+            .unwrap_or_else(|| "unavailable (no /proc)".to_string())
+    }
+
+    /// The dock consumes the worker through the message channel: a failing
+    /// import must still deliver a terminal `Done(Err)` (never a hang, never
+    /// a bare disconnect) — the UI's completion path depends on it.
+    #[test]
+    fn spawn_import_delivers_done_error_for_bad_selection() {
+        let task = spawn_import_paths(
+            vec![PathBuf::from("definitely-missing.wrfout.nc")],
+            temp_dir("spawn-err"),
+        );
+        loop {
+            match task.rx.recv() {
+                Ok(LocalImportMessage::Progress(_)) => continue,
+                Ok(LocalImportMessage::Done(result)) => {
+                    result.expect_err("missing file must fail the import");
+                    break;
+                }
+                Err(err) => panic!("worker died without Done: {err}"),
+            }
+        }
     }
 
     /// End-to-end guard for the post-processed climate-wrfout path (TK/Z/P, no
@@ -1134,7 +1299,10 @@ mod tests {
             return;
         };
         let store_root = temp_dir("postproc");
-        let summary = import_paths(&[PathBuf::from(&fixture)], &store_root).unwrap();
+        let summary = import_paths(&[PathBuf::from(&fixture)], &store_root, &mut |message| {
+            eprintln!("{message}");
+        })
+        .unwrap();
         assert_eq!(summary.model, "wrf");
         assert_eq!(summary.hours_written, 1);
 

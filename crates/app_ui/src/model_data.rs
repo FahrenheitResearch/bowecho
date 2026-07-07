@@ -24,7 +24,9 @@ use std::path::PathBuf;
 enum ImportJob {
     /// Light path (`local_import`): 2D surface fields + isobaric sounding
     /// volumes. Handles raw `wrfout`, post-processed climate wrfout, and plain
-    /// NetCDF. Sends one final `Result<summary, error>`.
+    /// NetCDF. Streams per-stage progress messages then a `Done`, same shape
+    /// as the heavy path — on a 250 m grid this is legitimately minutes of
+    /// wrf-core compute per file, and a bare spinner reads as a hang.
     Local(crate::local_import::LocalImportTask),
     /// Full path (`wrf_process`): the complete 2D diagnostic set (CAPE/severe/
     /// etc.) plus sounding volumes via `wrf-core`. Streams progress messages
@@ -296,20 +298,32 @@ struct PendingHeavyImport {
     warning: String,
 }
 
-/// LARGE-import thresholds for the heavy path's confirm step.
+/// A LIGHT import parked behind the same confirm-first flow: even the light
+/// path interpolates every 3-D sounding field through wrf-core, which on a
+/// 250 m grid is legitimately minutes per file — the owner hit exactly this
+/// as an anonymous multi-minute spinner. (Dead-code allowance: only the
+/// desktop import UI constructs/reads it.)
 #[allow(dead_code)]
-const HEAVY_WARN_CELLS_3D: usize = 10_000_000;
-#[allow(dead_code)]
-const HEAVY_WARN_FILE_BYTES: u64 = 1 << 30; // 1 GiB
+struct PendingLightImport {
+    files: Vec<PathBuf>,
+    warning: String,
+}
 
-/// Cheap size probe for the heavy full-diagnostics import: flag LARGE targets
-/// BEFORE launching. File sizes come from `fs::metadata` (free); grid dims
-/// from opening ONE file's header (`WrfFile::open` reads dimensions only — no
-/// field decompression), so this is safe on the UI thread right after the
-/// folder dialog. Returns `None` when the target looks small enough to just
-/// run. (Dead-code allowance: only the desktop import UI calls it.)
+/// LARGE-import thresholds shared by the heavy and light confirm steps (both
+/// paths crunch the full 3-D grid through wrf-core).
 #[allow(dead_code)]
-fn heavy_import_size_warning(files: &[PathBuf]) -> Option<String> {
+const LARGE_WRF_WARN_CELLS_3D: usize = 10_000_000;
+#[allow(dead_code)]
+const LARGE_WRF_WARN_FILE_BYTES: u64 = 1 << 30; // 1 GiB
+
+/// Cheap shared size probe: describe a LARGE WRF import target, or `None`
+/// when it looks small enough to just run. File sizes come from
+/// `fs::metadata` (free); grid dims from opening ONE file's header
+/// (`WrfFile::open` reads dimensions only — no field decompression), so this
+/// is safe on the UI thread right after the folder dialog. (Dead-code
+/// allowance: only the desktop import UI calls it.)
+#[allow(dead_code)]
+fn wrf_import_size_description(files: &[PathBuf]) -> Option<String> {
     let max_bytes = files
         .iter()
         .filter_map(|path| std::fs::metadata(path).ok().map(|meta| meta.len()))
@@ -320,7 +334,7 @@ fn heavy_import_size_warning(files: &[PathBuf]) -> Option<String> {
         .and_then(|path| wrf_core::WrfFile::open(path).ok())
         .map(|file| (file.nx, file.ny, file.nz, file.nt));
     let cells_3d = dims.map(|(nx, ny, nz, _)| nx * ny * nz).unwrap_or(0);
-    if cells_3d < HEAVY_WARN_CELLS_3D && max_bytes < HEAVY_WARN_FILE_BYTES {
+    if cells_3d < LARGE_WRF_WARN_CELLS_3D && max_bytes < LARGE_WRF_WARN_FILE_BYTES {
         return None;
     }
     let mut parts = Vec::new();
@@ -339,11 +353,34 @@ fn heavy_import_size_warning(files: &[PathBuf]) -> Option<String> {
         parts.push(format!("largest file {:.1} GB", max_bytes as f64 / 1.0e9));
     }
     Some(format!(
-        "{} across {} file(s). Full diagnostics computes the ~117-field 2-D \
-         suite through wrf-core — MINUTES per file and many GB of RAM on a \
-         grid this size.",
+        "{} across {} file(s)",
         parts.join(", "),
         files.len()
+    ))
+}
+
+/// Size gate for the heavy full-diagnostics import. (Dead-code allowance:
+/// only the desktop import UI calls it.)
+#[allow(dead_code)]
+fn heavy_import_size_warning(files: &[PathBuf]) -> Option<String> {
+    Some(format!(
+        "{}. Full diagnostics computes the ~117-field 2-D suite through \
+         wrf-core — MINUTES per file and many GB of RAM on a grid this size.",
+        wrf_import_size_description(files)?
+    ))
+}
+
+/// Size gate for the LIGHT import (same thresholds as the heavy path): the
+/// 2D surface fields are cheap, but the isobaric sounding volumes interpolate
+/// every 3-D field through wrf-core. (Dead-code allowance: only the desktop
+/// import UI calls it.)
+#[allow(dead_code)]
+fn light_import_size_warning(files: &[PathBuf]) -> Option<String> {
+    Some(format!(
+        "{}. Even this light import interpolates every 3-D sounding field to \
+         37 isobaric levels through wrf-core — expect minutes per file and \
+         several GB of RAM on a grid this size.",
+        wrf_import_size_description(files)?
     ))
 }
 
@@ -396,6 +433,11 @@ pub struct ModelDataDock {
     // Read only by the rfd-gated (windows/macos) import UI.
     #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     pending_heavy_import: Option<PendingHeavyImport>,
+    /// A light import awaiting the same explicit confirmation (see
+    /// [`light_import_size_warning`]).
+    // Read only by the rfd-gated (windows/macos) import UI.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    pending_light_import: Option<PendingLightImport>,
 }
 
 impl ModelDataDock {
@@ -426,6 +468,7 @@ impl ModelDataDock {
             wrf_options: WrfProcessUiState::default(),
             synth_radar: SyntheticRadarUiState::default(),
             pending_heavy_import: None,
+            pending_light_import: None,
         }
     }
 
@@ -680,24 +723,51 @@ impl ModelDataDock {
 
         let result = match self.import_job.as_ref() {
             None => PollResult::Idle,
-            Some(ImportJob::Local(task)) => match task.rx.try_recv() {
-                Ok(Ok(summary)) => PollResult::Finished {
-                    message: format!(
-                        "Imported {} hour(s) from {} file(s) → run “{}” ({} variables)",
-                        summary.hours_written,
-                        summary.files_seen,
-                        summary.run,
-                        summary.variables.len()
-                    ),
-                },
-                Ok(Err(error)) => PollResult::Finished {
-                    message: format!("Import failed: {error}"),
-                },
-                Err(std::sync::mpsc::TryRecvError::Empty) => PollResult::Progress(String::new()),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => PollResult::Finished {
-                    message: "Import worker stopped unexpectedly".to_string(),
-                },
-            },
+            Some(ImportJob::Local(task)) => {
+                // Drain the whole backlog and show only the newest progress
+                // line — same pattern as the heavy path below.
+                let mut latest = None;
+                let mut done = None;
+                loop {
+                    match task.rx.try_recv() {
+                        Ok(crate::local_import::LocalImportMessage::Progress(message)) => {
+                            latest = Some(message);
+                        }
+                        Ok(crate::local_import::LocalImportMessage::Done(outcome)) => {
+                            done = Some(outcome);
+                            break;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            done = Some(Err("Import worker stopped unexpectedly".to_string()));
+                            break;
+                        }
+                    }
+                }
+                match done {
+                    Some(Ok(summary)) => PollResult::Finished {
+                        message: format!(
+                            "Imported {} hour(s) from {} file(s) → run “{}” ({} variables){}",
+                            summary.hours_written,
+                            summary.files_seen,
+                            summary.run,
+                            summary.variables.len(),
+                            if summary.notes.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" — note: {}", summary.notes.join("; "))
+                            }
+                        ),
+                    },
+                    Some(Err(error)) => PollResult::Finished {
+                        message: format!("Import failed: {error}"),
+                    },
+                    None => match latest {
+                        Some(message) => PollResult::Progress(message),
+                        None => PollResult::Progress(String::new()),
+                    },
+                }
+            }
             Some(ImportJob::Process(task)) => {
                 let mut latest = None;
                 let mut done = None;
@@ -849,14 +919,7 @@ impl ModelDataDock {
                     .set_title("Choose a WRF/NetCDF file to import")
                     .pick_file()
             {
-                let name = file
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| file.display().to_string());
-                let task =
-                    crate::local_import::spawn_import_paths(vec![file], self.store_root.clone());
-                self.import_message = Some(format!("Importing {name}…"));
-                self.import_job = Some(ImportJob::Local(task));
+                self.gate_or_launch_light_import(vec![file]);
             }
 
             if ui
@@ -877,11 +940,7 @@ impl ModelDataDock {
                     self.import_message =
                         Some(format!("No WRF/NetCDF files under {}", dir.display()));
                 } else {
-                    let count = files.len();
-                    let task =
-                        crate::local_import::spawn_import_paths(files, self.store_root.clone());
-                    self.import_message = Some(format!("Importing {count} file(s)…"));
-                    self.import_job = Some(ImportJob::Local(task));
+                    self.gate_or_launch_light_import(files);
                 }
             }
 
@@ -923,6 +982,7 @@ impl ModelDataDock {
         // popover could drive a `local_import` options argument.
         self.wrf_options_panel(ui);
         self.heavy_import_warning_ui(ui);
+        self.light_import_warning_ui(ui);
 
         ui.separator();
         // The FAST simulated-radar path: loops in the radar view, writes
@@ -1001,6 +1061,35 @@ impl ModelDataDock {
         self.import_job = Some(ImportJob::Process(task));
     }
 
+    /// Light-path counterpart of the heavy size gate: park a LARGE selection
+    /// behind [`Self::light_import_warning_ui`], launch small ones directly.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn gate_or_launch_light_import(&mut self, files: Vec<PathBuf>) {
+        if let Some(warning) = light_import_size_warning(&files) {
+            self.import_message = None;
+            self.pending_light_import = Some(PendingLightImport { files, warning });
+        } else {
+            self.launch_light_import(files);
+        }
+    }
+
+    /// Spawn the light import job (after any size gate).
+    #[cfg(any(windows, target_os = "macos"))]
+    fn launch_light_import(&mut self, files: Vec<PathBuf>) {
+        let message = if let [file] = files.as_slice() {
+            let name = file
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| file.display().to_string());
+            format!("Importing {name}…")
+        } else {
+            format!("Importing {} file(s)…", files.len())
+        };
+        let task = crate::local_import::spawn_import_paths(files, self.store_root.clone());
+        self.import_message = Some(message);
+        self.import_job = Some(ImportJob::Local(task));
+    }
+
     /// Spawn the fast simulated-radar job over the picked file set.
     #[cfg(any(windows, target_os = "macos"))]
     fn launch_synthetic_radar(
@@ -1074,6 +1163,54 @@ impl ModelDataDock {
                 }
                 if ui.button("Cancel").clicked() {
                     self.pending_heavy_import = None;
+                }
+            });
+        });
+    }
+
+    /// Inline size-aware confirmation for a parked LIGHT import: same
+    /// confirm-first flow as [`Self::heavy_import_warning_ui`]. On a 250 m
+    /// grid even the light path is minutes of wrf-core compute per file, so
+    /// the user is told BEFORE it starts — with the pointer to the fast
+    /// simulated-radar path for radar-style browsing.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn light_import_warning_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(pending) = &self.pending_light_import else {
+            return;
+        };
+        let warning = pending.warning.clone();
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("⚠ Large WRF import")
+                    .strong()
+                    .color(egui::Color32::from_rgb(0xd0, 0x8a, 0x30)),
+            );
+            ui.label(egui::RichText::new(warning).small());
+            ui.label(
+                egui::RichText::new(
+                    "Tip: if you just want radar-style browsing of this run, “🌩 \
+                     Simulated radar from WRF (fast)” below is the fast path — seconds \
+                     per file, loops in the radar view. Import here only for store \
+                     fields + skew-T soundings; progress shows below while it runs.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Import anyway")
+                    .on_hover_text(
+                        "Run the light import: 2D surface fields + isobaric sounding \
+                         volumes, one forecast hour per file. Per-stage progress shows \
+                         under the import buttons.",
+                    )
+                    .clicked()
+                    && let Some(pending) = self.pending_light_import.take()
+                {
+                    self.launch_light_import(pending.files);
+                }
+                if ui.button("Cancel").clicked() {
+                    self.pending_light_import = None;
                 }
             });
         });
@@ -1790,6 +1927,52 @@ mod tests {
         // Deleting the table prunes its bindings — no dangling override.
         settings.remove_table("My temp");
         assert!(!user_style_override_active(&settings, &field));
+    }
+
+    /// Size-gate parity: the light import must warn on the same class of
+    /// target the heavy path warns on (file bytes here — a sparse 1.5 GiB
+    /// "wrfout"), both texts must carry the shared size description, and the
+    /// light text must sell the compute honestly (isobaric interpolation).
+    /// Small selections must pass without a gate.
+    #[test]
+    fn light_and_heavy_size_warnings_share_thresholds() {
+        let dir = std::env::temp_dir().join(format!("bowecho-wrf-warn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let small = dir.join("wrfout_small");
+        std::fs::write(&small, b"not a real wrfout").unwrap();
+        assert_eq!(
+            light_import_size_warning(std::slice::from_ref(&small)),
+            None
+        );
+        assert_eq!(
+            heavy_import_size_warning(std::slice::from_ref(&small)),
+            None
+        );
+
+        let big = dir.join("wrfout_big");
+        let file = std::fs::File::create(&big).unwrap();
+        // Sparse: metadata length crosses the 1 GiB threshold without disk IO.
+        file.set_len((1u64 << 30) + (1u64 << 29)).unwrap();
+        drop(file);
+        let light = light_import_size_warning(std::slice::from_ref(&big)).expect("light gates");
+        let heavy = heavy_import_size_warning(std::slice::from_ref(&big)).expect("heavy gates");
+        for warning in [&light, &heavy] {
+            assert!(
+                warning.contains("largest file 1.6 GB") && warning.contains("across 1 file(s)"),
+                "size description missing: {warning}"
+            );
+        }
+        assert!(
+            light.contains("isobaric levels") && light.contains("minutes per file"),
+            "light warning must explain the 3-D interpolation cost: {light}"
+        );
+        assert!(
+            heavy.contains("Full diagnostics"),
+            "heavy warning keeps its own cost text: {heavy}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

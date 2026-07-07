@@ -331,7 +331,9 @@ fn process_paths(
         // Post-processed climate wrfout (CONUS-I/II, GDEX: derived TK/Z/P, no
         // raw T/PB) — wrf-core can't open these, so route them through the
         // netcrust-based reader before falling through to the raw path.
-        match crate::local_import::try_postprocessed_wrf(path) {
+        match crate::local_import::try_postprocessed_wrf(path, &mut |message: String| {
+            let _ = tx.send(WrfProcessMessage::Progress(message));
+        }) {
             Ok(Some((canonical, volumes))) => {
                 let hour = u16::try_from(written.len()).expect("bounded above");
                 let _ = tx.send(WrfProcessMessage::Progress(format!(
@@ -649,19 +651,22 @@ fn read_wrf_products(
     // downloaded models. Failure here never fails the hour — the 2D fields
     // still write; only the sounding is unavailable.
     //
-    // NOTE: wrf-core's per-timestep intermediate cache (see the clear below)
-    // must stay WARM through this block. The volume build re-getvars
-    // pressure/temp/td/height/uvmet; with the cache populated by the
-    // diagnostics above those are cheap copies (measured peak 8.85 GB on the
-    // 800x800x79 Enderlin grid). Clearing the cache first was measured to
-    // more than DOUBLE the peak (18.3 GB): every read then recomputes its
-    // whole dependency chain (staggered reads, destaggering, theta->T, …)
-    // with multi-hundred-MB transients stacking on the re-growing cache.
+    // NOTE: wrf-core's per-timestep intermediate cache must stay WARM into
+    // this block. The volume build re-getvars pressure/temp/td/height/uvmet;
+    // with the cache populated by the diagnostics above those are cheap
+    // copies (measured peak 8.85 GB on the 800x800x79 Enderlin grid).
+    // Clearing the cache first was measured to more than DOUBLE the peak
+    // (18.3 GB): every read then recomputes its whole dependency chain
+    // (staggered reads, destaggering, theta->T, …) with multi-hundred-MB
+    // transients stacking on the re-growing cache. `build_iso_volumes` itself
+    // clears the cache right after its LAST getvar (the hour's last), so the
+    // interpolation loop and the store write below run without the ~5 GB of
+    // dead intermediates.
     if options.core_fields {
         // Isolated for the same reason as `compute_var`: the volume builder's
         // `getvar` reads must degrade to a note, not kill the hour.
         let volumes_result = isolate_panics("isobaric volumes", || {
-            build_iso_volumes(file, timeidx, shape.len())
+            build_iso_volumes(file, timeidx, shape.len(), progress)
         });
         match volumes_result {
             Ok((volumes, surface)) => {
@@ -688,8 +693,11 @@ fn read_wrf_products(
     // `write_hour_from_fields_with_derived` — releases that memory for the
     // write phase and beyond at zero recompute cost (measured: working set
     // fell 8.8 GB -> 1.3 GB at this point instead of riding the write).
-    // catch_unwind: if a caught diagnostic panic above poisoned the cache
-    // mutex, clearing would re-panic; a stuck cache must not fail the hour.
+    // Usually a no-op now that `build_iso_volumes` clears after its last
+    // getvar, but still load-bearing when `core_fields` is off (no volume
+    // build) or the volume build failed partway. catch_unwind: if a caught
+    // diagnostic panic above poisoned the cache mutex, clearing would
+    // re-panic; a stuck cache must not fail the hour.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| file.clear_cache()));
 
     Ok(fields)
@@ -880,10 +888,15 @@ fn compute_var(
 
 /// Run `f`, converting a panic into an `Err` naming `what`, so one failing
 /// field computation degrades to a per-field note instead of unwinding the
-/// import worker thread. Inputs are shared references (plus `WrfFile`'s
-/// internal mutex, which poisons — and is then handled — rather than being
-/// observed broken), so `AssertUnwindSafe` is sound here.
-fn isolate_panics<T>(what: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+/// import worker thread (shared with `local_import`'s volume build, which
+/// needs the same guarantee). Inputs are shared references plus `WrfFile`'s
+/// internal mutex (which poisons — and is then handled — rather than being
+/// observed broken) and progress closures that only append/send messages,
+/// so `AssertUnwindSafe` is sound here.
+pub(crate) fn isolate_panics<T>(
+    what: &str,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
         let message = payload
             .downcast_ref::<&str>()

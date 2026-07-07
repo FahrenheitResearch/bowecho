@@ -4,6 +4,8 @@
 → `read_wrf_products` → ~80 `wrf-core` `getvar` diagnostics), FABLE_BACKLOG issue #9.
 Investigated 2026-07-06 on the real Enderlin 250 m wrfouts
 (`wrfout_d03_*`, 800×800×79 ≈ 50.5 M cells, ~2 GB each).
+The LIGHT import path got the same treatment on 2026-07-06 — see the
+"Light import" section at the end.
 
 ## Symptom as reported
 
@@ -99,3 +101,63 @@ narrow to f32; an f32 output mode would halve both cache and transient sizes.
 - The repro/regression harness lives in `wrf_process.rs`
   (`optional_real_fixture_default_import_instrumented`); point
   `RW_WRF_CRASH_FIXTURE` at any wrfout and run with `--nocapture`.
+
+## Light import (`local_import.rs`) — same class of defect, fixed 2026-07-06
+
+The "📄 WRF/NetCDF file…" / "📥 WRF/NetCDF folder…" LIGHT import (2D surface
+fields + `*_iso` sounding volumes through the same `wrf-core` getvar family)
+never got the fixes above, and its worker sent exactly ONE terminal message —
+the dock showed an anonymous spinner for the whole run.
+
+Measured on node4 (Linux, 24-core, release, `/usr/bin/time -v`), single
+Enderlin `wrfout_d03_2025-06-21_02_15_00` (2.05 GB, 800×800×79):
+
+| | wall | peak RSS |
+|---|---|---|
+| before (`d0af0b1`) | 1241 s (20:41) | 7.20 GB |
+| after (`9c95975`) | 1235 s (20:35) | 6.81 GB |
+
+Findings and fixes:
+
+- **The import completes — it is not a hang** (exit 0, 120 store variables
+  including the `*_iso` volumes). The "doesn't import" report is the
+  spinner: zero feedback for twenty minutes. The worker now streams
+  `LocalImportMessage::Progress` per stage (per-getvar, per-raw-plane,
+  interpolation percent, store write), rendered by the same dock code as the
+  heavy path, and the light path gets the heavy path's confirm-first size
+  gate (same 10 M-cell / 1 GiB thresholds) with the "🌩 Simulated radar from
+  WRF (fast)" tip.
+- **`clear_cache` placement:** `build_iso_volumes` now clears wrf-core's
+  memoized 3-D f64 intermediates right after the hour's LAST getvar (the
+  uvmet/ua/va read), before the interpolation loop — every interpolator
+  input is owned by then, so the clear costs zero recompute, and the ~4 GB
+  cache no longer rides through interpolation + store write. This is still
+  AFTER the volume build's reads — the 18.3 GB clearing-early anti-fix above
+  remains excluded. Both import paths inherit the clear; the heavy path's
+  end-of-hour clear stays as the backstop for `core_fields`-off runs. The
+  remaining 6.81 GB peak is the instant of the last getvar itself (warm
+  cache + the five owned f64 field copies) and is only reducible by the
+  upstream cache bound; the fix's real win is that the post-getvar phases
+  (interpolation + store write) now run ~4 GB lighter, which is what the
+  RAM-contention app crash (backlog #2) fed on.
+- **Panic isolation:** the volume build is wrapped in the heavy path's
+  `isolate_panics`, so a wrf-core panic degrades to a per-file
+  "isobaric sounding volumes unavailable" note instead of unwinding the
+  `rw-ui-local-import` worker ("Import worker stopped unexpectedly").
+- **Where the time actually goes (upstream, measured by the new stage
+  timestamps):** ~95% of the wall is the 2-D plane reads through netcrust's
+  `hdf5-reader` — ~10.3 s and ~8 M minor page faults PER 800×800 f32 plane
+  (105 raw extras + ~16 canonical planes ≈ 1165 s), burning 1087 s of SYSTEM
+  time against 150 s user (832 M minor faults ≈ 3.3 TB of transient pages —
+  allocation churn in the kernel, not honest compute). For contrast,
+  wrf-core's own pure reader pulls all five FULL 79-level 3-D sounding
+  fields in 10 s, interpolation takes 1.3 s, the store write 0.4 s. The
+  churn is in the pinned `hdf5-reader`/netcrust plane-read path and cannot
+  be fixed app-side; it belongs in the same upstream conversation as the
+  `clear_cache` contract above. An app-side follow-up worth measuring:
+  route the 2-D plane reads through wrf-core's reader for files it can
+  open (est. ~10× wall reduction on compressed 250 m wrfouts), keeping
+  netcrust for plain NetCDF.
+- The harness is `local_import::tests::optional_wrf_fixture_imports_to_store`
+  (env `RW_LOCAL_IMPORT_FIXTURE`, `--nocapture`): timestamps every progress
+  line and prints peak RSS (`VmHWM`) at the end. Release only on large grids.
