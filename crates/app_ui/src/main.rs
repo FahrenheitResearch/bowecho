@@ -2548,6 +2548,11 @@ struct ViewerApp {
     /// Selected GOES ABI RGB composite style slug for the one-shot
     /// true/natural-color ingest (`natural_color`, `geocolor`, ...).
     goes_composite_style: String,
+    /// Himawari true-color compose scope, persisted via
+    /// `AppSettings::himawari_true_color_scope`: "region" (west-Pacific
+    /// tropics, the historical default), "fulldisk" (~4 km effective) or
+    /// "fulldisk2km" (~2 km). The native window, when enabled, wins.
+    himawari_true_color_scope: String,
     /// Satellite native-resolution window (persisted as
     /// `sat_native_window_*`): when enabled, the true-color composite
     /// ingests fetch/decode only the data covering this center+size box and
@@ -7364,6 +7369,7 @@ impl ViewerApp {
             app_settings.sat_native_window_lon_e6 as f64 / 1e6,
             app_settings.sat_native_window_size_km,
         );
+        let restored_himawari_true_color_scope = app_settings.himawari_true_color_scope.clone();
         let restored_overlays = (
             app_settings.overlay_obs,
             app_settings.overlay_obs_metar,
@@ -7578,6 +7584,7 @@ impl ViewerApp {
             himawari_band: 13,
             sat_ir_enhancement: restored_sat_ir_enhancement,
             goes_composite_style: "natural_color".to_string(),
+            himawari_true_color_scope: restored_himawari_true_color_scope,
             sat_window_enabled: restored_sat_window.0,
             sat_window_lat_deg: restored_sat_window.1,
             sat_window_lon_deg: restored_sat_window.2,
@@ -31227,6 +31234,17 @@ impl ViewerApp {
             .unwrap_or("B13 Clean IR 10.4");
         let mut load_composite = false;
         let mut sat_window_changed = false;
+        let mut himawari_scope_changed = false;
+        const HIMAWARI_SCOPE_OPTIONS: &[(&str, &str)] = &[
+            ("region", "Region · WPac"),
+            ("fulldisk", "Full disk · 4 km"),
+            ("fulldisk2km", "Full disk · 2 km"),
+        ];
+        let selected_himawari_scope_label = HIMAWARI_SCOPE_OPTIONS
+            .iter()
+            .find(|(slug, _)| *slug == self.himawari_true_color_scope)
+            .map(|(_, label)| *label)
+            .unwrap_or("Region · WPac");
         let composite_options = sat_worker::goes_composite_style_options();
         let selected_composite_label = composite_options
             .iter()
@@ -31256,12 +31274,30 @@ impl ViewerApp {
                     }
                     if fixed_action_button(ui, "True color", 90.0)
                         .on_hover_text(
-                            "Fetch the co-registered Himawari-9 visible bands (B01/B02/B03) for the west-Pacific tropics, compose AHI true color (real 0.51 µm green — no synthesized green), and select it in the player + map. Daytime only; heavier than an IR band.",
+                            "Fetch the co-registered Himawari-9 visible bands (B01/B02/B03), compose AHI true color (real 0.51 µm green — no synthesized green), and select it in the player + map. Region composes the west-Pacific tropics at ~4 km effective; Full disk composes the WHOLE disk at ~4 km or ~2 km. Native window, when on, overrides both with a 0.5 km crop. Daytime side only; heavier than an IR band.",
                         )
                         .clicked()
                     {
                         load_himawari_composite = true;
                     }
+                    egui::ComboBox::from_id_salt("himawari_true_color_scope")
+                        .selected_text(selected_himawari_scope_label)
+                        .width(126.0)
+                        .show_ui(ui, |ui| {
+                            for &(slug, label) in HIMAWARI_SCOPE_OPTIONS {
+                                himawari_scope_changed |= ui
+                                    .selectable_value(
+                                        &mut self.himawari_true_color_scope,
+                                        slug.to_string(),
+                                        label,
+                                    )
+                                    .changed();
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Scope for the True color button: the west-Pacific tropics region (the historical default) or the whole disk at ~4 km / ~2 km effective resolution. Full disk downloads all ten segments of each visible band (a few hundred MB per scan) and loops in its own run family. Ignored while Native window is on.",
+                        );
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.label("GOES RGB");
@@ -31341,6 +31377,10 @@ impl ViewerApp {
         if sat_window_changed {
             self.persist_sat_native_window();
         }
+        if himawari_scope_changed {
+            self.app_settings.himawari_true_color_scope = self.himawari_true_color_scope.clone();
+            let _ = self.app_settings.save();
+        }
         if let Some(sat) = &self.sat
             && load_himawari
         {
@@ -31359,21 +31399,42 @@ impl ViewerApp {
         if load_himawari_composite && self.sat.is_some() {
             let window = self
                 .sat_native_window_if_visible(sat_window::AHI_NOMINAL_SUB_LON_DEG, "Himawari-9");
+            // Scope only shapes the no-window path: the native window keeps
+            // its stride-1 crop regardless. "region" builds the exact spec
+            // this button always sent.
+            let (full_disk, downsample) = match self.himawari_true_color_scope.as_str() {
+                "fulldisk" => (true, 4),
+                "fulldisk2km" => (true, 2),
+                _ => (
+                    false,
+                    sat_worker::HimawariCompositeSpec::default().downsample,
+                ),
+            };
             self.sat_map_follow = true;
             self.status = match window {
                 Some(window) => format!(
                     "Satellite: composing Himawari-9 AHI true color · native window {}",
                     window.run_slug()
                 ),
+                None if full_disk => {
+                    "Satellite: composing Himawari-9 AHI true color · full disk".to_owned()
+                }
                 None => "Satellite: composing Himawari-9 AHI true color".to_owned(),
             };
-            self.sat_panel.apply_note(
-                "Himawari composite: queued latest H9 AHI true-color (B01/B02/B03)".to_string(),
-            );
+            self.sat_panel.apply_note(format!(
+                "Himawari composite: queued latest H9 AHI true-color (B01/B02/B03){}",
+                if window.is_none() && full_disk {
+                    " · full disk"
+                } else {
+                    ""
+                }
+            ));
             if let Some(sat) = &self.sat {
                 sat.send(sat_worker::SatRequest::IngestLatestHimawariComposite(
                     sat_worker::HimawariCompositeSpec {
                         window,
+                        full_disk,
+                        downsample,
                         ..sat_worker::HimawariCompositeSpec::default()
                     },
                 ));
@@ -64987,6 +65048,37 @@ mod tests {
         assert!(app.satellite_run_key_matches_current_spec(&key));
     }
 
+    /// The whole-disk true-color run family (`fulldisk_rgb_true_color_*`)
+    /// passes every downstream run filter: it is a composite (band-filter
+    /// exempt), it survives the current-spec scan, and it groups into its
+    /// own timeline family, distinct from windowed composites.
+    #[test]
+    fn fulldisk_composite_run_keys_pass_the_spec_filters() {
+        let app = test_viewer_app_with_hazards(Vec::new());
+        let key = rw_ui::SatRunKey {
+            model: "h9".to_owned(),
+            run: "fulldisk_rgb_true_color_20260706".to_owned(),
+        };
+
+        assert!(satellite_run_key_is_composite(&key));
+        assert!(app.satellite_run_key_matches_current_spec(&key));
+        let filtered = app.satellite_runs_for_current_spec(vec![test_sat_run(
+            "h9",
+            "fulldisk_rgb_true_color_20260706",
+            &[430, 440],
+        )]);
+        assert_eq!(filtered.len(), 1);
+
+        assert_eq!(
+            sat_run_family("fulldisk_rgb_true_color_20260706"),
+            "fulldisk_rgb_true_color"
+        );
+        assert_ne!(
+            sat_run_family("fulldisk_rgb_true_color_20260706"),
+            sat_run_family("fulldisk_win135n1448e800_rgb_true_color_20260706")
+        );
+    }
+
     #[test]
     fn satellite_spec_change_clears_stale_map_and_player_state() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
@@ -75016,6 +75108,7 @@ mod tests {
             himawari_band: 13,
             sat_ir_enhancement: sat_worker::IrEnhancement::default(),
             goes_composite_style: "natural_color".to_string(),
+            himawari_true_color_scope: "region".to_string(),
             sat_window_enabled: false,
             sat_window_lat_deg: 13.5,
             sat_window_lon_deg: 144.8,

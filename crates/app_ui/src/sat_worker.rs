@@ -180,6 +180,15 @@ pub struct HimawariCompositeSpec {
     pub segment_start: u8,
     /// Number of contiguous segments to fetch.
     pub segment_count: u8,
+    /// Compose the WHOLE disk: fetch all ten segments per band (ignoring
+    /// `segment_start` / `segment_count`) and assemble on a stride-decimated
+    /// grid without ever materializing a native-resolution plane (see
+    /// [`assemble_ahi_fulldisk_counts`]). `downsample` 4 (the default) puts
+    /// the 1 km B01/B02 base at 2750² (~4 km effective); 2 puts it at 5500²
+    /// (~2 km). B03 (0.5 km) decodes at double the stride so it lands
+    /// straight on ~the base resolution. Ignored when `window` is set —
+    /// the native window wins.
+    pub full_disk: bool,
     /// How far back to scan 10-min slots for the latest all-band scan.
     pub lookback_minutes: i64,
     /// Per-band decimation stride applied on ingest.
@@ -204,6 +213,7 @@ impl Default for HimawariCompositeSpec {
             style: "true_color".to_string(),
             segment_start: 4,
             segment_count: 2,
+            full_disk: false,
             lookback_minutes: 180,
             downsample: 4,
             window: None,
@@ -1842,7 +1852,7 @@ fn ingest_latest_himawari(
     )
     .map_err(|err| err.to_string())?;
     // IR bands: replace rw-sat's BT plane (computed from right-shifted
-    // counts, so it lands flat at ~326-330 K — see decode_ahi_raw_counts)
+    // counts, so it lands flat at ~326-330 K — see ahi_true_counts_on_grid)
     // with TRUE Kelvin from the raw counts + block-5 calibration, the same
     // true-count fix the visible composite path uses. Stored AHI IR is real
     // brightness temperature from here on and renders through the same
@@ -2013,60 +2023,32 @@ fn latest_himawari_visible_scan(
     ))
 }
 
-/// Read one staged AHI HSD segment's true raw counts (as f32), NaN at error /
-/// off-disk pixels — returning `(values_row_major, columns)`.
-///
-/// This bypasses rw-sat's `HimawariValueMode::Count`, which right-shifts every
-/// value by `bits_per_pixel - valid_bits_per_pixel` (5 for the visible bands).
-/// That shift assumes the count is stored LEFT-justified, but the NOAA-hosted
-/// HSD files store it RIGHT-justified (a live H09 B01 segment holds raw values
-/// like 19/20/110 — not multiples of 32), so rw-sat's count comes out 32× too
-/// small and clouds render black. The JMA HSD User's Guide (v1.3) §4 stores the
-/// `valid_bits_per_pixel`-bit count in the low bits, so the raw 16-bit value IS
-/// the count (outside the error/outside-scan sentinels). Verified on live data:
-/// with this read a Cat-5 eyewall reaches reflectance ~1 (white); rw-sat's
-/// shifted count capped the whole disk near black.
-fn decode_ahi_raw_counts(path: &Path) -> Result<(Vec<f32>, usize), String> {
-    let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
-    let header = rw_sat::himawari::parse_hsd_header(&bytes).map_err(|err| err.to_string())?;
-    let calibration = header
-        .calibration
-        .as_ref()
-        .ok_or("AHI HSD segment is missing calibration block #5")?;
-    let (error_count, outside_count) = (
-        calibration.error_pixel_count,
-        calibration.outside_scan_count,
-    );
-    let cols = usize::from(header.data.columns);
-    let lines = usize::from(header.data.lines);
-    let pixels = cols.saturating_mul(lines);
-    let data_start = header.total_header_length as usize;
-    if bytes.len() < data_start + pixels * 2 {
-        return Err(format!(
-            "AHI HSD data block short: need {} bytes, have {}",
-            data_start + pixels * 2,
-            bytes.len()
-        ));
-    }
-    let little = matches!(
-        header.byte_order,
-        rw_sat::himawari::HimawariByteOrder::Little
-    );
-    let mut values = Vec::with_capacity(pixels);
-    for i in 0..pixels {
-        let o = data_start + i * 2;
-        let raw = if little {
-            u16::from_le_bytes([bytes[o], bytes[o + 1]])
-        } else {
-            u16::from_be_bytes([bytes[o], bytes[o + 1]])
-        };
-        values.push(if raw == error_count || raw == outside_count {
-            f32::NAN
-        } else {
-            f32::from(raw)
-        });
-    }
-    Ok((values, cols))
+/// One staged AHI HSD segment's decode plan (the header pass of
+/// [`ahi_true_counts_on_grid`]): everything the strided row reads need,
+/// with the parsed header itself dropped.
+struct AhiSegmentPlan {
+    path: PathBuf,
+    sequence: u8,
+    columns: usize,
+    lines: usize,
+    data_start: u64,
+    little: bool,
+    /// Block-5 sentinel counts decoded to NaN (error / outside-scan).
+    sentinels: (u16, u16),
+}
+
+/// Local row indices of one segment that survive the GLOBAL stride: of the
+/// concatenated grid's rows `offset..offset + lines`, those whose global
+/// index is a multiple of `step` — exactly the rows concatenate-then-
+/// `step_by(step)` keeps, however the segment heights fall against the
+/// stride.
+fn ahi_strided_local_rows(offset: usize, lines: usize, step: usize) -> Vec<usize> {
+    let step = step.max(1);
+    let first = offset.div_ceil(step) * step;
+    (first..offset + lines)
+        .step_by(step)
+        .map(|global| global - offset)
+        .collect()
 }
 
 /// Assemble true raw counts from a band's staged segments onto rw-sat's
@@ -2074,43 +2056,103 @@ fn decode_ahi_raw_counts(path: &Path) -> Result<(Vec<f32>, usize), String> {
 /// row-major, then stride-`downsample` subsampled exactly as rw-sat's
 /// `assemble_hsd_segments` + `downsample_satellite_field` do, so the values
 /// line up 1:1 with the [`SatelliteGridField`] grid we keep for geolocation.
+///
+/// The 16-bit read bypasses rw-sat's `HimawariValueMode::Count`, which
+/// right-shifts every value by `bits_per_pixel - valid_bits_per_pixel` (5 for
+/// the visible bands). That shift assumes the count is stored LEFT-justified,
+/// but the NOAA-hosted HSD files store it RIGHT-justified (a live H09 B01
+/// segment holds raw values like 19/20/110 — not multiples of 32), so
+/// rw-sat's count comes out 32× too small and clouds render black. The JMA
+/// HSD User's Guide (v1.3) §4 stores the `valid_bits_per_pixel`-bit count in
+/// the low bits, so the raw 16-bit value IS the count (outside the
+/// error/outside-scan sentinels). Verified on live data: with this read a
+/// Cat-5 eyewall reaches reflectance ~1 (white); rw-sat's shifted count
+/// capped the whole disk near black.
+///
+/// Memory/IO discipline: only the strided rows are ever read (one seek per
+/// selected row), so a full-disk B03 at stride 8 touches ~120 MB of its
+/// ~1.9 GB of segment data and the largest full-resolution allocation
+/// anywhere is a single row (44 KB) — what makes the whole-disk composite
+/// feasible on the follow thread.
 fn ahi_true_counts_on_grid(paths: &[PathBuf], downsample: usize) -> Result<Vec<f32>, String> {
-    let mut segments: Vec<(u8, Vec<f32>, usize)> = Vec::with_capacity(paths.len());
+    use std::io::{Read, Seek, SeekFrom};
+    let step = downsample.max(1);
+    // Header pass: sequence order, shape, sentinels, data offsets.
+    let mut segments: Vec<AhiSegmentPlan> = Vec::with_capacity(paths.len());
     for path in paths {
-        let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
-        let header = rw_sat::himawari::parse_hsd_header(&bytes).map_err(|err| err.to_string())?;
-        let sequence = header
-            .segment
+        let header = inspect_hsd_file(path).map_err(|err| err.to_string())?;
+        let calibration = header
+            .calibration
             .as_ref()
-            .map(|segment| segment.sequence_number)
-            .unwrap_or(0);
-        let (values, cols) = decode_ahi_raw_counts(path)?;
-        segments.push((sequence, values, cols));
+            .ok_or("AHI HSD segment is missing calibration block #5")?;
+        segments.push(AhiSegmentPlan {
+            path: path.clone(),
+            sequence: header
+                .segment
+                .as_ref()
+                .map(|segment| segment.sequence_number)
+                .unwrap_or(0),
+            columns: usize::from(header.data.columns),
+            lines: usize::from(header.data.lines),
+            data_start: u64::from(header.total_header_length),
+            little: matches!(
+                header.byte_order,
+                rw_sat::himawari::HimawariByteOrder::Little
+            ),
+            sentinels: (
+                calibration.error_pixel_count,
+                calibration.outside_scan_count,
+            ),
+        });
     }
-    segments.sort_by_key(|(sequence, _, _)| *sequence);
+    segments.sort_by_key(|segment| segment.sequence);
     let nx = segments
         .first()
-        .map(|(_, _, cols)| *cols)
+        .map(|segment| segment.columns)
         .ok_or("no AHI segments to assemble")?;
-    let mut full: Vec<f32> = Vec::new();
-    for (_, values, cols) in &segments {
-        if *cols != nx {
+    let xs: Vec<usize> = (0..nx).step_by(step).collect();
+    let total_lines: usize = segments.iter().map(|segment| segment.lines).sum();
+    let mut out = Vec::with_capacity(total_lines.div_ceil(step).saturating_mul(xs.len()));
+    let mut offset = 0usize;
+    let mut row = vec![0u8; nx * 2];
+    for segment in &segments {
+        if segment.columns != nx {
             return Err("inconsistent AHI segment width".to_string());
         }
-        full.extend_from_slice(values);
-    }
-    let ny = if nx == 0 { 0 } else { full.len() / nx };
-    let step = downsample.max(1);
-    if step == 1 {
-        return Ok(full);
-    }
-    let xs: Vec<usize> = (0..nx).step_by(step).collect();
-    let ys: Vec<usize> = (0..ny).step_by(step).collect();
-    let mut out = Vec::with_capacity(xs.len().saturating_mul(ys.len()));
-    for &y in &ys {
-        for &x in &xs {
-            out.push(full[y * nx + x]);
+        let mut file = std::fs::File::open(&segment.path).map_err(|err| err.to_string())?;
+        let needed = segment.data_start + (segment.lines * nx * 2) as u64;
+        let have = file.metadata().map_err(|err| err.to_string())?.len();
+        if have < needed {
+            return Err(format!(
+                "AHI HSD data block short in {}: need {} bytes, have {}",
+                segment.path.display(),
+                needed,
+                have
+            ));
         }
+        for local in ahi_strided_local_rows(offset, segment.lines, step) {
+            file.seek(SeekFrom::Start(
+                segment.data_start + (local * nx * 2) as u64,
+            ))
+            .map_err(|err| err.to_string())?;
+            file.read_exact(&mut row).map_err(|err| err.to_string())?;
+            for &x in &xs {
+                let o = x * 2;
+                let raw = if segment.little {
+                    u16::from_le_bytes([row[o], row[o + 1]])
+                } else {
+                    u16::from_be_bytes([row[o], row[o + 1]])
+                };
+                out.push(
+                    if raw == segment.sentinels.0 || raw == segment.sentinels.1 {
+                        f32::NAN
+                    } else {
+                        f32::from(raw)
+                    },
+                );
+            }
+        }
+        offset += segment.lines;
     }
     Ok(out)
 }
@@ -2215,12 +2257,15 @@ fn stage_himawari_band_segments(
 /// [`SatelliteGridField`], returning the band's HSD calibration alongside. The
 /// grid/scene (geolocation) comes from rw-sat's `assemble_hsd_segments`; the
 /// values are replaced with the *true* raw counts from [`ahi_true_counts_on_grid`]
-/// (see [`decode_ahi_raw_counts`] for why rw-sat's own counts are unusable).
+/// (see there for why rw-sat's own counts are unusable).
 /// Reflectance is derived downstream via [`ahi_counts_to_reflectance`].
 ///
 /// With a `window`, the whole full-segment assemble is skipped for
 /// [`assemble_ahi_window_counts`]: only the window's pixels are decoded, at
 /// native resolution (`downsample` is not applied to windowed fetches).
+/// With `full_disk`, the assemble is [`assemble_ahi_fulldisk_counts`]:
+/// the same strided true-count read plus a header-built scene, so a
+/// ten-segment band never materializes a native-resolution plane.
 #[allow(clippy::too_many_arguments)]
 fn fetch_himawari_band_counts(
     satellite: HimawariSatellite,
@@ -2232,6 +2277,7 @@ fn fetch_himawari_band_counts(
     source_root: &Path,
     downsample: usize,
     window: Option<SatNativeWindow>,
+    full_disk: bool,
     send: &impl Fn(SatResponse) -> bool,
 ) -> Result<(SatelliteGridField, HimawariCalibrationInfo), String> {
     let paths = stage_himawari_band_segments(
@@ -2247,8 +2293,11 @@ fn fetch_himawari_band_counts(
     if let Some(window) = window {
         return assemble_ahi_window_counts(&paths, window);
     }
+    if full_disk {
+        return assemble_ahi_fulldisk_counts(&paths, downsample);
+    }
     // rw-sat's assemble gives us the correct grid/scene (geolocation), but its
-    // Count values are right-shifted (see decode_ahi_raw_counts); replace them
+    // Count values are right-shifted (see ahi_true_counts_on_grid); replace them
     // with the true raw counts read on the same downsampled grid.
     let mut field = assemble_hsd_segments(&paths, HimawariValueMode::Count, downsample.max(1))
         .map_err(|err| err.to_string())?;
@@ -2304,6 +2353,40 @@ fn ahi_model_slug(name: &str) -> String {
     }
 }
 
+/// HSD observation area → sector slug ("FLDK" → "fulldisk"), matching
+/// rw-sat's private `himawari_sector_slug` so header-built scenes stamp the
+/// same sector families rw-sat's assembler does.
+fn ahi_sector_slug(area: &str) -> String {
+    match area {
+        "FLDK" => "fulldisk".to_string(),
+        value if value.starts_with("JP") => "japan".to_string(),
+        value if value.starts_with("R3") => "target".to_string(),
+        value if value.starts_with("R4") => "landmark4".to_string(),
+        value if value.starts_with("R5") => "landmark5".to_string(),
+        value => value.to_ascii_lowercase(),
+    }
+}
+
+/// Sector token for an assembled segment set, matching rw-sat's
+/// `assemble_hsd_segments` naming: the plain area slug when the set is the
+/// whole scan (every segment, starting at line 1) — `fulldisk`, the token
+/// the whole-disk composite's run family hangs off — else the subset form
+/// `fulldisk_s04_05of10` today's target-region runs carry.
+fn ahi_sector_token(
+    area: &str,
+    first_seq: u8,
+    last_seq: u8,
+    total_segments: u8,
+    complete_from_line_one: bool,
+) -> String {
+    let base = ahi_sector_slug(area);
+    if complete_from_line_one {
+        base
+    } else {
+        format!("{base}_s{first_seq:02}_{last_seq:02}of{total_segments:02}")
+    }
+}
+
 /// The window's scan-angle rect under the CF sweep=y AHI navigation.
 fn ahi_window_rect(
     height_m: f64,
@@ -2340,7 +2423,7 @@ fn himawari_window_segments(window: SatNativeWindow) -> Result<(u8, u8), String>
 /// Assemble ONLY the window's pixels from a band's staged HSD segments, at
 /// native resolution: parse each header, decode the cropped row/column
 /// block of TRUE raw counts (the same right-justified 16-bit read as
-/// [`decode_ahi_raw_counts`] — see there for why rw-sat's shifted counts
+/// [`ahi_true_counts_on_grid`] — see there for why rw-sat's shifted counts
 /// are unusable), and build the scene with cropped scan-angle axes from the
 /// header's own projection block #3. A full segment is only ever held as
 /// raw bytes; the f32 arrays stay window-sized, which is what makes
@@ -2598,6 +2681,187 @@ fn assemble_ahi_window_counts(
     ))
 }
 
+/// Per-band decode stride for the FULL-DISK composite: bands finer than the
+/// 1 km B01/B02 base double the stride so every band decodes straight to
+/// ~base resolution (B03 is AHI's only sub-km band, 0.5 km / 22000² native);
+/// the bilinear cross-band resample then only corrects the sub-pixel
+/// registration offset instead of reducing a 4×-the-pixels plane.
+fn ahi_fulldisk_band_stride(band: u8, base_stride: usize) -> usize {
+    if band == 3 {
+        base_stride.saturating_mul(2)
+    } else {
+        base_stride
+    }
+}
+
+/// Assemble a band's staged full-disk segments as TRUE raw counts on a
+/// stride-`downsample` grid, without ever materializing a native-resolution
+/// plane: values come from the same strided read the target-region composite
+/// uses ([`ahi_true_counts_on_grid`]), while the scene is built straight
+/// from the HSD headers the way [`assemble_ahi_window_counts`] does. The
+/// scan-angle axes are byte-identical to rw-sat's `assemble_hsd_segments` +
+/// downsample (the CGMS mapping at every stride-th column/line), so
+/// successive scans reuse one run dir and the baked lat/lon mesh is the
+/// established AHI navigation.
+///
+/// rw-sat's assembler is unusable at this scale: it decodes every segment to
+/// full-resolution f32 before decimating, which for a ten-segment B03 is
+/// two ~1.9 GB buffers. This assemble peaks at one 44 KB row plus the
+/// strided output plane (~30 MB at the default stride).
+fn assemble_ahi_fulldisk_counts(
+    paths: &[PathBuf],
+    downsample: usize,
+) -> Result<(SatelliteGridField, HimawariCalibrationInfo), String> {
+    if paths.is_empty() {
+        return Err("no staged AHI segments to assemble".to_string());
+    }
+    let step = downsample.max(1);
+    let mut headers = Vec::with_capacity(paths.len());
+    for path in paths {
+        let header = inspect_hsd_file(path).map_err(|err| err.to_string())?;
+        headers.push(header);
+    }
+    headers.sort_by_key(|header| {
+        header
+            .segment
+            .as_ref()
+            .map(|segment| segment.sequence_number)
+            .unwrap_or(0)
+    });
+
+    let first = &headers[0];
+    let projection = first
+        .projection
+        .as_ref()
+        .ok_or("AHI HSD header is missing projection block #3")?;
+    let calibration = first
+        .calibration
+        .clone()
+        .ok_or("AHI HSD header is missing calibration block #5")?;
+    let first_segment = first
+        .segment
+        .as_ref()
+        .ok_or("AHI HSD header is missing segment block #7")?;
+    let band = u8::try_from(calibration.band_number)
+        .map_err(|_| format!("unsupported AHI band {}", calibration.band_number))?;
+    let columns = usize::from(first.data.columns);
+    let first_line = u32::from(first_segment.first_line_number);
+    let total_segments = first_segment.total_segments;
+
+    // Contiguity + shape checks across the fetched segments (mirrors
+    // rw-sat's assemble validation, like the window assemble does).
+    let mut expected_first_line = first_line;
+    let mut total_lines = 0usize;
+    for header in &headers {
+        if usize::from(header.data.columns) != columns {
+            return Err("inconsistent AHI segment width".to_string());
+        }
+        let info = header
+            .segment
+            .as_ref()
+            .ok_or("AHI HSD header is missing segment block #7")?;
+        if u32::from(info.first_line_number) != expected_first_line {
+            return Err(format!(
+                "AHI segments are not contiguous: expected first line {expected_first_line}, \
+                 got {} in S{:02}",
+                info.first_line_number, info.sequence_number
+            ));
+        }
+        expected_first_line += u32::from(header.data.lines);
+        total_lines += usize::from(header.data.lines);
+    }
+
+    let values = ahi_true_counts_on_grid(paths, step)?;
+
+    // Strided scan-angle axes: the CGMS normalized geostationary mapping at
+    // every stride-th column/line, byte-matching rw-sat's (private)
+    // `himawari_column_scan_rad` / `himawari_line_scan_rad` + `step_by`.
+    let cfac = f64::from(projection.cfac);
+    let coff = f64::from(projection.coff);
+    let lfac = f64::from(projection.lfac);
+    let loff = f64::from(projection.loff);
+    let x_scan_rad: Vec<f64> = (0..columns)
+        .step_by(step)
+        .map(|col| ((col as f64 + 1.0 - coff) * 65_536.0 / cfac).to_radians())
+        .collect();
+    let y_scan_rad: Vec<f64> = (0..total_lines)
+        .step_by(step)
+        .map(|row| ((loff - f64::from(first_line + row as u32)) * 65_536.0 / lfac).to_radians())
+        .collect();
+    let (nx, ny) = (x_scan_rad.len(), y_scan_rad.len());
+    if values.len() != nx.saturating_mul(ny) {
+        return Err(format!(
+            "AHI full-disk decode produced {} values for a {nx}x{ny} grid",
+            values.len()
+        ));
+    }
+
+    let complete_from_line_one = headers.len() == usize::from(total_segments) && first_line == 1;
+    let first_seq = first_segment.sequence_number;
+    let last_seq = headers
+        .last()
+        .and_then(|header| header.segment.as_ref())
+        .map(|segment| segment.sequence_number)
+        .unwrap_or(first_seq);
+    let sector = ahi_sector_token(
+        &first.observation_area,
+        first_seq,
+        last_seq,
+        total_segments,
+        complete_from_line_one,
+    );
+
+    let last = &headers[headers.len() - 1];
+    let start_time_utc = ahi_mjd_to_datetime(first.observation_start_mjd)?;
+    let end_time_utc = ahi_mjd_to_datetime(last.observation_end_mjd)?;
+    let scene = SatelliteGridScene {
+        model: ahi_model_slug(&first.satellite_name),
+        satellite: first.satellite_name.clone(),
+        provider: "jma".to_string(),
+        instrument: "ahi".to_string(),
+        product: format!("AHI-L1b-{}", first.observation_area),
+        sector,
+        band,
+        layer: format!("count_c{band:02}"),
+        source_variable: "HSD count".to_string(),
+        start_time_utc,
+        end_time_utc,
+        projection: SatelliteProjection {
+            perspective_point_height_m: (projection.satellite_distance_km
+                - projection.equatorial_radius_km)
+                * 1000.0,
+            semi_major_axis_m: projection.equatorial_radius_km * 1000.0,
+            semi_minor_axis_m: projection.polar_radius_km * 1000.0,
+            longitude_of_projection_origin_deg: projection.sub_lon_degrees,
+            // Mirrors rw-sat's assembler stamp; every consumer of these
+            // scenes navigates through the local CF sweep=y path regardless
+            // (see write_himawari_grid_frame).
+            sweep_angle_axis: SweepAngleAxis::X,
+        },
+        fixed_grid: AbiFixedGrid {
+            nx,
+            ny,
+            x_scan_rad,
+            y_scan_rad,
+        },
+        metadata: serde_json::json!({
+            "source_format": "himawari_standard_data",
+            "value_mode": "count",
+            "downsample": step,
+            "segments": headers.len(),
+        }),
+    };
+    Ok((
+        SatelliteGridField {
+            scene,
+            variable_name: format!("ahi_count_c{band:02}"),
+            units: "count".to_string(),
+            values,
+        },
+        calibration,
+    ))
+}
+
 /// Convert AHI raw counts to TRUE brightness temperature (Kelvin) with the
 /// segment's block-5 infrared calibration (JMA HSD User's Guide v1.3 §4.4):
 /// radiance = `slope · count + intercept` [W/(m² sr µm)], the effective
@@ -2605,7 +2869,7 @@ fn assemble_ahi_window_counts(
 /// central wavelength (block-5 physical constants), then the brightness
 /// temperature `Tb = c0 + c1·Te + c2·Te²` (block-5 correction coefficients).
 /// Same scheme rw-sat's BrightnessTemperature mode implements — but fed the
-/// *true* right-justified counts from [`decode_ahi_raw_counts`] instead of
+/// *true* right-justified counts from [`ahi_true_counts_on_grid`] instead of
 /// rw-sat's shifted ones, which push radiance toward the intercept and land
 /// BT flat at ~326-330 K (what forced the old display-side percentile hack).
 /// Non-finite counts (error / off-disk) and non-physical radiance stay NaN.
@@ -3016,20 +3280,29 @@ fn ingest_latest_himawari_composite(
         .ok_or_else(|| format!("unknown Himawari composite style '{}'", spec.style))?;
     let bands = style.required_bands();
     let window = spec.window.map(SatNativeWindow::clamped);
-    // A native window composes on the finest band's grid at stride 1 and
-    // fetches only the segments the window intersects; the full-sector path
-    // keeps the configured segment range and decimation.
+    // The native window wins over the full-disk scope: a window composes on
+    // the finest band's grid at stride 1 and fetches only the segments it
+    // intersects. Full disk fetches every segment and assembles lean; the
+    // target-region path keeps the configured segment range and decimation.
+    let full_disk = spec.full_disk && window.is_none();
     let base_band = match window {
         Some(_) => style.native_base_band(),
         None => style.base_band(),
     };
     let downsample = if window.is_some() {
         1
+    } else if full_disk {
+        // Never below stride 2 on the whole disk: stride 1 would put the
+        // 11000² B01 base (~480 MB per f32 plane, several such planes at
+        // once) on the follow thread for no display gain. Stride 2 is the
+        // 5500² / ~2 km option; the default 4 is 2750² / ~4 km.
+        spec.downsample.max(2)
     } else {
         spec.downsample.max(1)
     };
     let (seg_start, seg_count) = match window {
         Some(window) => himawari_window_segments(window)?,
+        None if full_disk => (1, 10), // the whole disk: S01..S10
         None => {
             let start = spec.segment_start.clamp(1, 10);
             (start, spec.segment_count.clamp(1, 11 - start))
@@ -3057,6 +3330,13 @@ fn ingest_latest_himawari_composite(
             .by_band
             .get(&band)
             .ok_or_else(|| format!("the picked scan is missing AHI B{band:02}"))?;
+        // Full disk decodes sub-km bands at a doubled stride so every band
+        // lands directly at ~base resolution (see ahi_fulldisk_band_stride).
+        let band_downsample = if full_disk {
+            ahi_fulldisk_band_stride(band, downsample)
+        } else {
+            downsample
+        };
         let (field, calibration) = fetch_himawari_band_counts(
             satellite,
             pick.scan_time,
@@ -3065,8 +3345,9 @@ fn ingest_latest_himawari_composite(
             objects,
             &cache_root,
             &source_root,
-            downsample,
+            band_downsample,
             window,
+            full_disk,
             send,
         )?;
         fields.insert(band, field);
@@ -3087,7 +3368,12 @@ fn ingest_latest_himawari_composite(
 
     let mut planes: HashMap<u8, Vec<f32>> = HashMap::with_capacity(bands.len());
     for &band in bands {
-        let field = &fields[&band];
+        // Take the band's counts out of the map so each count plane frees
+        // as soon as its reflectance lands on the base grid — at the 2 km
+        // full disk that is ~121 MB per band that would otherwise stack.
+        let field = fields
+            .remove(&band)
+            .ok_or_else(|| format!("composite band B{band:02} was not fetched"))?;
         let reflectance = ahi_counts_to_reflectance(&field.values, &calibrations[&band]);
         let on_base = resample_ahi_to_base(&field.scene.fixed_grid, &reflectance, &base_grid);
         planes.insert(band, on_base);
@@ -3710,6 +3996,7 @@ fn worker_loop(
             SatRequest::IngestLatestHimawariComposite(spec) => {
                 let scope = match &spec.window {
                     Some(window) => format!("native window {}", window.run_slug()),
+                    None if spec.full_disk => "full disk".to_string(),
                     None => format!(
                         "S{:02}..S{:02}",
                         spec.segment_start,
@@ -5404,6 +5691,94 @@ mod tests {
         assert_eq!(out, values, "same grid resamples to identity");
     }
 
+    // ---- Full-disk true color ------------------------------------------------
+
+    /// The strided per-segment row selection is EXACTLY concat-then-stride:
+    /// whatever rows the old whole-grid `step_by` kept, the per-segment
+    /// walk keeps — however the segment heights fall against the stride.
+    /// This is what keeps the target-region composite byte-identical after
+    /// the lean rewrite of `ahi_true_counts_on_grid`.
+    #[test]
+    fn ahi_strided_local_rows_match_concat_then_stride() {
+        let heights = [5usize, 3, 6, 1, 7];
+        let total: usize = heights.iter().sum();
+        for step in [1usize, 2, 3, 4, 8] {
+            let want: Vec<(usize, usize)> = (0..total)
+                .step_by(step)
+                .map(|global| {
+                    let mut offset = 0;
+                    for (segment, &lines) in heights.iter().enumerate() {
+                        if global < offset + lines {
+                            return (segment, global - offset);
+                        }
+                        offset += lines;
+                    }
+                    unreachable!("global row {global} beyond the concatenated grid")
+                })
+                .collect();
+            let mut got: Vec<(usize, usize)> = Vec::new();
+            let mut offset = 0usize;
+            for (segment, &lines) in heights.iter().enumerate() {
+                for local in ahi_strided_local_rows(offset, lines, step) {
+                    got.push((segment, local));
+                }
+                offset += lines;
+            }
+            assert_eq!(got, want, "step {step}");
+        }
+    }
+
+    #[test]
+    fn fulldisk_plan_doubles_b03_stride_and_keeps_region_defaults() {
+        // The full-disk scope is opt-in: the default spec still composes
+        // the west-Pacific target region exactly as before.
+        let spec = HimawariCompositeSpec::default();
+        assert!(!spec.full_disk);
+        assert_eq!((spec.segment_start, spec.segment_count), (4, 2));
+        assert_eq!(spec.downsample, 4);
+
+        // Full-disk strides: the 1 km B01/B02 keep the base stride; the
+        // 0.5 km B03 doubles so it decodes straight to ~base resolution.
+        assert_eq!(ahi_fulldisk_band_stride(1, 4), 4);
+        assert_eq!(ahi_fulldisk_band_stride(2, 4), 4);
+        assert_eq!(ahi_fulldisk_band_stride(3, 4), 8);
+        assert_eq!(ahi_fulldisk_band_stride(3, 2), 4);
+
+        // Grid math: the default stride 4 puts the whole disk at 2750² on
+        // the 1 km base, with B03 arriving at the same 2750²; stride 2 is
+        // the 5500² (~2 km) option.
+        assert_eq!((0..11_000).step_by(4).count(), 2750);
+        assert_eq!((0..22_000).step_by(8).count(), 2750);
+        assert_eq!((0..11_000).step_by(2).count(), 5500);
+        assert_eq!((0..22_000).step_by(4).count(), 5500);
+    }
+
+    /// Sector tokens mirror rw-sat's assembler naming, so the whole-disk
+    /// composite opens the `fulldisk` run family while segment subsets keep
+    /// today's target-region token (byte-identical run names for the
+    /// existing button).
+    #[test]
+    fn ahi_sector_tokens_mirror_rw_sat_naming() {
+        assert_eq!(ahi_sector_token("FLDK", 1, 10, 10, true), "fulldisk");
+        assert_eq!(
+            ahi_sector_token("FLDK", 4, 5, 10, false),
+            "fulldisk_s04_05of10"
+        );
+        assert_eq!(ahi_sector_slug("JP01"), "japan");
+        assert_eq!(ahi_sector_slug("R301"), "target");
+    }
+
+    #[test]
+    fn fulldisk_composite_run_title_is_recognized() {
+        let title = run_title("h9", "fulldisk_rgb_true_color_20260706");
+        assert!(
+            title.contains("AHI True Color")
+                && title.contains("fulldisk")
+                && title.contains("2026-07-06"),
+            "full-disk composite title: {title}"
+        );
+    }
+
     /// End-to-end proof against LIVE Himawari open data: fetch the visible
     /// bands, compose AHI true color, store, load back, and export a PNG.
     /// Gated behind `BOWECHO_SAT_HIMAWARI_COMPOSITE_PROOF_PNG` so CI stays
@@ -5430,6 +5805,7 @@ mod tests {
             style: "true_color".to_string(),
             segment_start: env_usize("BOWECHO_SAT_HIMAWARI_COMPOSITE_SEG_START", 4) as u8,
             segment_count: env_usize("BOWECHO_SAT_HIMAWARI_COMPOSITE_SEG_COUNT", 2) as u8,
+            full_disk: false,
             lookback_minutes: 240,
             downsample: env_usize("BOWECHO_SAT_HIMAWARI_COMPOSITE_DOWNSAMPLE", 6),
             window: None,
@@ -5709,6 +6085,178 @@ mod tests {
             "WINDOW PROOF summary: native {}x{} vs default crop {crop_w}x{crop_h} upscaled {scale}x",
             native.image.size[0], native.image.size[1],
         );
+    }
+
+    // ---- Full-disk true-color live proof --------------------------------------
+
+    /// End-to-end FULL-DISK proof on LIVE Himawari open data: ingest one
+    /// whole-disk true-color frame through the strided full-disk assemble,
+    /// prove the loop contract by ingesting the PREVIOUS 10-minute scan into
+    /// the same run, and export the disk PNG plus a 2× zoom crop of a
+    /// daylight region. Gated behind `BOWECHO_SAT_FULLDISK_PROOF_DIR` so CI
+    /// stays offline.
+    ///
+    /// Env: BOWECHO_SAT_FULLDISK_PROOF_DIR (out dir; store lands under
+    /// `<dir>/store`), BOWECHO_SAT_FULLDISK_AS_OF (RFC3339 scan pin; default
+    /// now — pick a time with the WPac/Australia side lit, and not within
+    /// 10 min after 00:00Z: the loop assert needs both scans on one UTC day),
+    /// BOWECHO_SAT_FULLDISK_DOWNSAMPLE (default 4 → 2750²; 2 → 5500²),
+    /// BOWECHO_SAT_FULLDISK_ZOOM_LAT/LON/HALF_DEG (crop center / half-size,
+    /// default 0 / 130 / 15 — Indonesia / New Guinea daytime convection).
+    #[test]
+    fn export_himawari_fulldisk_truecolor_proof_when_env_is_set() {
+        let Some(dir) = std::env::var_os("BOWECHO_SAT_FULLDISK_PROOF_DIR").map(PathBuf::from)
+        else {
+            return;
+        };
+        let env_f64 = |key: &str, default: f64| {
+            std::env::var(key)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+        let as_of = std::env::var("BOWECHO_SAT_FULLDISK_AS_OF").ok().map(|raw| {
+            DateTime::parse_from_rfc3339(&raw)
+                .expect("BOWECHO_SAT_FULLDISK_AS_OF must be RFC3339")
+                .with_timezone(&Utc)
+        });
+        let store = dir.join("store");
+        std::fs::create_dir_all(&store).expect("proof store dir");
+        let sink = |response: SatResponse| {
+            if let SatResponse::Note(message) = &response {
+                eprintln!("FULLDISK note: {message}");
+            }
+            true
+        };
+
+        let spec = HimawariCompositeSpec {
+            full_disk: true,
+            downsample: env_f64("BOWECHO_SAT_FULLDISK_DOWNSAMPLE", 4.0) as usize,
+            lookback_minutes: 360,
+            as_of,
+            ..HimawariCompositeSpec::default()
+        };
+        let started = Instant::now();
+        let summary = ingest_latest_himawari_composite(&store, &spec, &sink)
+            .expect("live full-disk AHI composite ingest");
+        eprintln!(
+            "FULLDISK ingest #1 in {:.1}s: {summary}",
+            started.elapsed().as_secs_f64()
+        );
+
+        let (key, first_hhmm) = {
+            let runs = scan_runs(&store);
+            let run = runs
+                .iter()
+                .find(|run| run.key.run.starts_with("fulldisk_rgb_true_color_"))
+                .expect("a full-disk composite run was written");
+            (
+                run.key.clone(),
+                *run.frames.last().expect("run has a frame"),
+            )
+        };
+        let scan1 = rw_sat::store::frame_time(&key.run, first_hhmm).expect("frame time parses");
+
+        // Loop proof: pin just before scan #1 so the previous 10-minute slot
+        // is picked; its frame must stack into the SAME run dir (which also
+        // proves the header-built grid is bit-identical across scans).
+        let second = HimawariCompositeSpec {
+            as_of: Some(scan1 - chrono::Duration::minutes(1)),
+            ..spec.clone()
+        };
+        let started = Instant::now();
+        let summary = ingest_latest_himawari_composite(&store, &second, &sink)
+            .expect("second full-disk scan ingests");
+        eprintln!(
+            "FULLDISK ingest #2 in {:.1}s: {summary}",
+            started.elapsed().as_secs_f64()
+        );
+        let runs = scan_runs(&store);
+        let fulldisk_runs: Vec<_> = runs
+            .iter()
+            .filter(|run| run.key.run.starts_with("fulldisk_rgb_true_color_"))
+            .collect();
+        assert_eq!(
+            fulldisk_runs.len(),
+            1,
+            "both scans share one loopable run family"
+        );
+        assert!(
+            fulldisk_runs[0].frames.len() >= 2,
+            "the second scan joined the run: {:?}",
+            fulldisk_runs[0].frames
+        );
+
+        let mut state = WorkerState::default();
+        let whole = load_frame_for_map(&mut state, &store, &key, first_hhmm)
+            .expect("full-disk frame loads");
+        let (nx, ny) = (whole.image.size[0], whole.image.size[1]);
+        let lit = whole.image.pixels.iter().filter(|p| p.a() > 0).count();
+        // The earth disk fills ~78% of the square frame (night side is
+        // opaque near-black, off-earth is transparent).
+        assert!(
+            lit > nx * ny / 2,
+            "the disk is composed: {lit} lit of {}",
+            nx * ny
+        );
+        eprintln!(
+            "FULLDISK {nx}x{ny}, {:.0}% lit, ~{:.0} MB per f32 plane, \
+             ~{:.0} MB peak compose transient by array math (count planes + \
+             reflectance/base planes + RGB planes + lat/lon mesh)",
+            100.0 * lit as f64 / (nx * ny).max(1) as f64,
+            (nx * ny * 4) as f64 / 1.0e6,
+            (nx * ny * 4) as f64 * 9.0 / 1.0e6,
+        );
+        save_color_image_png(&whole.image, &dir.join("fulldisk_true_color.png"));
+
+        // 2× nearest-neighbor zoom of a daylight region (per-pixel grid
+        // lookup honoring display row order, like the window proof).
+        let (zoom_lat, zoom_lon, half_deg) = (
+            env_f64("BOWECHO_SAT_FULLDISK_ZOOM_LAT", 0.0),
+            env_f64("BOWECHO_SAT_FULLDISK_ZOOM_LON", 130.0),
+            env_f64("BOWECHO_SAT_FULLDISK_ZOOM_HALF_DEG", 15.0),
+        );
+        let (mut row_min, mut row_max, mut col_min, mut col_max) =
+            (usize::MAX, 0usize, usize::MAX, 0usize);
+        for grid_row in 0..ny {
+            let image_row = if whole.flip_rows {
+                ny - 1 - grid_row
+            } else {
+                grid_row
+            };
+            for col in 0..nx {
+                let idx = grid_row * nx + col;
+                let (lat, lon) = (
+                    f64::from(whole.grid.lat[idx]),
+                    f64::from(whole.grid.lon[idx]),
+                );
+                if !(lat.is_finite() && lon.is_finite()) {
+                    continue;
+                }
+                let dlon = (lon - zoom_lon + 180.0).rem_euclid(360.0) - 180.0;
+                if (lat - zoom_lat).abs() <= half_deg && dlon.abs() <= half_deg {
+                    row_min = row_min.min(image_row);
+                    row_max = row_max.max(image_row);
+                    col_min = col_min.min(col);
+                    col_max = col_max.max(col);
+                }
+            }
+        }
+        assert!(
+            row_min <= row_max && col_min <= col_max,
+            "the zoom box lands on the disk"
+        );
+        let (crop_w, crop_h) = (col_max - col_min + 1, row_max - row_min + 1);
+        let mut pixels = Vec::with_capacity(crop_w * crop_h * 4);
+        for out_row in 0..crop_h * 2 {
+            let src_row = row_min + out_row / 2;
+            for out_col in 0..crop_w * 2 {
+                let src_col = col_min + out_col / 2;
+                pixels.push(whole.image.pixels[src_row * nx + src_col]);
+            }
+        }
+        let zoom = ColorImage::new([crop_w * 2, crop_h * 2], pixels);
+        save_color_image_png(&zoom, &dir.join("fulldisk_true_color_zoom.png"));
     }
 
     /// Load one stored BT frame, print/assert absolute-Kelvin validation

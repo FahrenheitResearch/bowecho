@@ -198,6 +198,14 @@ pub struct AppSettings {
     /// Window edge length in km (square window).
     #[serde(default = "default_sat_native_window_size_km")]
     pub sat_native_window_size_km: u16,
+    /// Himawari true-color compose scope: "region" (the west-Pacific
+    /// tropics segment band, the pre-v0.29.3 behavior), "fulldisk" (the
+    /// whole disk at ~4 km effective), or "fulldisk2km" (the whole disk at
+    /// ~2 km effective — 4× the pixels). The native window, when enabled,
+    /// overrides the scope. Unknown slugs fall back to "region" at use
+    /// sites (app_ui/main.rs).
+    #[serde(default = "default_himawari_true_color_scope")]
+    pub himawari_true_color_scope: String,
     /// RAOB launch-site markers (the observed-soundings obs layer) —
     /// default off; clicking a marker fetches that station's sounding at
     /// the displayed radar time.
@@ -663,6 +671,10 @@ fn default_sat_native_window_size_km() -> u16 {
     800
 }
 
+fn default_himawari_true_color_scope() -> String {
+    "region".to_owned()
+}
+
 /// A persisted FARM drape georeference. Coordinates are stored as scaled
 /// integers (microdegrees etc.) so `AppSettings` stays `Eq`-derivable.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -762,6 +774,7 @@ impl Default for AppSettings {
             sat_native_window_lat_e6: default_sat_native_window_lat_e6(),
             sat_native_window_lon_e6: default_sat_native_window_lon_e6(),
             sat_native_window_size_km: default_sat_native_window_size_km(),
+            himawari_true_color_scope: default_himawari_true_color_scope(),
             overlay_raob: false,
             show_tropical: true,
             show_tropical_panel: true,
@@ -1499,6 +1512,21 @@ mod tests {
         assert_eq!(back.sat_native_window_lat_e6, -8_250_000);
         assert_eq!(back.sat_native_window_lon_e6, -100_240_000);
         assert_eq!(back.sat_native_window_size_km, 500);
+    }
+
+    #[test]
+    fn himawari_true_color_scope_defaults_and_round_trips() {
+        // Old configs (no key) keep the pre-v0.29.3 west-Pacific region.
+        let old = AppSettings::from_json("{}");
+        assert_eq!(old.himawari_true_color_scope, "region");
+
+        let s = AppSettings {
+            himawari_true_color_scope: "fulldisk".to_owned(),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&s.to_json());
+        assert_eq!(back.himawari_true_color_scope, "fulldisk");
+        assert_eq!(back, s);
     }
 
     #[test]
