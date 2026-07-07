@@ -39338,6 +39338,7 @@ impl ViewerApp {
         let heavy_layer = visible_count > HAZARD_HEAVY_LAYER_FILL_LIMIT && self.map_scale < 240.0;
         let mut label_rects = Vec::<egui::Rect>::new();
         let mut labeled_events = BTreeSet::<String>::new();
+        let mut fill_candidates = Vec::<HazardFillCandidate>::new();
         for (index, record) in overlay.records.iter().enumerate() {
             if !self.hazard_record_visible_at_timeline_time(record, frame_time)
                 || !hazard_points_renderable(&record.points)
@@ -39392,23 +39393,23 @@ impl ViewerApp {
             let has_screen_jump = screen_polyline_has_jump(&points, true, rect, legit_px);
             // Perf edge case: a coastline-traced polygon (an Alaska marine SPS,
             // or a big multi-county watch union) can carry thousands of
-            // vertices, and the fill is an O(n^2) ear-clip plus a huge per-frame
-            // mesh. Above the limit we skip ONLY the fill and let the existing,
-            // jump-aware outline path draw the ring verbatim — no geometry is
-            // altered, so nothing new can self-intersect. Normal polygons (the
-            // overwhelming majority) are well under the limit and unchanged.
+            // vertices, and the fill runs an O(n^2) self-intersection scan
+            // plus a huge per-frame mesh. Above the limit we skip ONLY the
+            // fill and let the existing, jump-aware outline path draw the
+            // ring verbatim — no geometry is altered, so nothing new can
+            // self-intersect. Normal polygons (the overwhelming majority) are
+            // well under the limit and unchanged.
             let fill_ok = points.len() <= HAZARD_FILL_VERTEX_LIMIT;
             if (!heavy_layer || selected) && !has_screen_jump && fill_ok {
-                let convex = is_convex_screen_polygon(&points);
-                if convex {
-                    out.fill_shapes.push(egui::Shape::convex_polygon(
-                        points.clone(),
-                        fill,
-                        egui::Stroke::NONE,
-                    ));
-                } else if let Some(mesh) = filled_polygon_mesh(&points, fill) {
-                    out.fill_shapes.push(egui::Shape::mesh(mesh));
-                }
+                // Fills are not pushed directly: same-family same-color fills
+                // are flattened after the loop so overlaps paint once
+                // (selection boosts alpha, giving the selected record its own
+                // color group — it still pops over the flattened layer).
+                fill_candidates.push(HazardFillCandidate {
+                    family: record.event_family.clone(),
+                    fill,
+                    points: points.clone(),
+                });
             }
             if solid {
                 push_solid_closed_line(&mut out.outline_shapes, &points, stroke, rect, legit_px);
@@ -39465,6 +39466,7 @@ impl ViewerApp {
                 }
             }
         }
+        append_flattened_hazard_fill_shapes(fill_candidates, &mut out.fill_shapes);
         out
     }
 
@@ -50900,6 +50902,20 @@ fn filled_polygon_mesh(points: &[egui::Pos2], fill: egui::Color32) -> Option<egu
         return None;
     }
     let points = cleaned_screen_polygon(points);
+    if points.len() < 3 {
+        return None;
+    }
+    // A ring that still self-intersects after cleaning has no meaningful
+    // ear-clip triangulation: any ear-based tessellator bridges the crossing
+    // and paints outside the ring. Real inputs do this — screen quantization
+    // folds dense coastline-traced zone rings at low zoom (Cape May NJC009
+    // at map_scale 60-120), and CAP polygons have shipped crossed vertex
+    // orders — so those rings take the exact even-odd scanline fill instead.
+    if screen_ring_self_intersects(&points)
+        && let Some(mesh) = scanline_fill_mesh(std::slice::from_ref(&points), fill)
+    {
+        return Some(mesh);
+    }
     let triangles = triangulate_screen_polygon(&points)?;
     let mut mesh = egui::epaint::Mesh::default();
     for point in &points {
@@ -50957,6 +50973,107 @@ fn filled_polygon_with_holes_mesh(
         mesh.add_triangle(triangle[0] as u32, triangle[1] as u32, triangle[2] as u32);
     }
     Some(mesh)
+}
+
+/// One record's translucent fill, pending same-family flattening.
+struct HazardFillCandidate {
+    family: String,
+    fill: egui::Color32,
+    points: Vec<egui::Pos2>,
+}
+
+fn screen_points_bbox(points: &[egui::Pos2]) -> egui::Rect {
+    let mut rect = egui::Rect::NOTHING;
+    for point in points {
+        rect.extend_with(*point);
+    }
+    rect
+}
+
+/// The legacy per-record fill shape: convex fast path (feathered by epaint)
+/// or the robust mesh tessellation.
+fn single_hazard_fill_shape(candidate: &HazardFillCandidate) -> Option<egui::Shape> {
+    if is_convex_screen_polygon(&candidate.points) {
+        Some(egui::Shape::convex_polygon(
+            candidate.points.clone(),
+            candidate.fill,
+            egui::Stroke::NONE,
+        ))
+    } else {
+        filled_polygon_mesh(&candidate.points, candidate.fill).map(egui::Shape::mesh)
+    }
+}
+
+/// Emit hazard fill shapes, flattening fills of the SAME family and color so
+/// overlapping warnings paint their overlap once at the family alpha instead
+/// of stacking toward opaque — the reported "glow blobs" (the real July 5
+/// 2026 KCTP scene stacks three successive SVR fills over central PA).
+/// Cross-family and cross-threat overlap still layers: those are distinct
+/// hazards deliberately drawn over each other. Within a group only records
+/// whose fills can touch (transitively bbox-overlapping components) share a
+/// union mesh; isolated records keep the legacy convex fast path.
+fn append_flattened_hazard_fill_shapes(
+    candidates: Vec<HazardFillCandidate>,
+    fill_shapes: &mut Vec<egui::Shape>,
+) {
+    let mut groups: Vec<((&str, egui::Color32), Vec<usize>)> = Vec::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        let key = (candidate.family.as_str(), candidate.fill);
+        if let Some((_, members)) = groups.iter_mut().find(|(existing, _)| *existing == key) {
+            members.push(index);
+        } else {
+            groups.push((key, vec![index]));
+        }
+    }
+    for (_, members) in groups {
+        let bboxes = members
+            .iter()
+            .map(|&member| screen_points_bbox(&candidates[member].points))
+            .collect::<Vec<_>>();
+        // Transitive bbox-overlap components within the group (indices into
+        // `members`).
+        let mut components: Vec<Vec<usize>> = Vec::new();
+        for local in 0..members.len() {
+            let mut merged = vec![local];
+            let mut keep = Vec::with_capacity(components.len());
+            for component in components.drain(..) {
+                if component
+                    .iter()
+                    .any(|&other| bboxes[local].intersects(bboxes[other]))
+                {
+                    merged.extend(component);
+                } else {
+                    keep.push(component);
+                }
+            }
+            keep.push(merged);
+            components = keep;
+        }
+        for mut component in components {
+            component.sort_unstable();
+            if component.len() == 1 {
+                if let Some(shape) = single_hazard_fill_shape(&candidates[members[component[0]]]) {
+                    fill_shapes.push(shape);
+                }
+                continue;
+            }
+            let rings = component
+                .iter()
+                .map(|&local| candidates[members[local]].points.clone())
+                .collect::<Vec<_>>();
+            let fill = candidates[members[component[0]]].fill;
+            if let Some(mesh) = scanline_fill_mesh(&rings, fill) {
+                fill_shapes.push(egui::Shape::mesh(mesh));
+            } else {
+                // Safety-valve fallback: paint per record as before.
+                for &local in &component {
+                    if let Some(shape) = single_hazard_fill_shape(&candidates[members[local]]) {
+                        fill_shapes.push(shape);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn screen_polygon_bbox_intersects(points: &[egui::Pos2], rect: egui::Rect) -> bool {
@@ -51129,84 +51246,218 @@ fn cleaned_screen_polygon(points: &[egui::Pos2]) -> Vec<egui::Pos2> {
     cleaned
 }
 
+/// Triangulate a cleaned, non-self-intersecting screen ring via earcut (the
+/// tessellator the outlook holes path already uses). Earcut tolerates the
+/// degenerate vertex patterns real CAP rings carry — repeated vertices,
+/// collinear runs, zero-area out-and-back excursions — where the previous
+/// hand-rolled O(n^2) ear clip either found no ear (the whole fill silently
+/// vanished) or emitted spike triangles across the defect.
 fn triangulate_screen_polygon(points: &[egui::Pos2]) -> Option<Vec<[usize; 3]>> {
     if points.len() < 3 || points.len() > u32::MAX as usize {
         return None;
     }
-    let winding = polygon_signed_area(points).signum();
-    if winding == 0.0 {
+    let mut vertices = Vec::with_capacity(points.len() * 2);
+    for point in points {
+        vertices.push(point.x as f64);
+        vertices.push(point.y as f64);
+    }
+    let triangles = earcutr::earcut(&vertices, &[], 2).ok()?;
+    if triangles.len() < 3 {
+        return None;
+    }
+    Some(
+        triangles
+            .chunks_exact(3)
+            .map(|triangle| [triangle[0], triangle[1], triangle[2]])
+            .collect(),
+    )
+}
+
+/// True when two segments properly cross (shared endpoints and collinear
+/// overlaps do not count — earcut copes with those benign contacts).
+fn segments_properly_cross(a1: egui::Pos2, a2: egui::Pos2, b1: egui::Pos2, b2: egui::Pos2) -> bool {
+    if a1.x.max(a2.x) < b1.x.min(b2.x)
+        || b1.x.max(b2.x) < a1.x.min(a2.x)
+        || a1.y.max(a2.y) < b1.y.min(b2.y)
+        || b1.y.max(b2.y) < a1.y.min(a2.y)
+    {
+        return false;
+    }
+    let d1 = cross_points(b1, b2, a1);
+    let d2 = cross_points(b1, b2, a2);
+    let d3 = cross_points(a1, a2, b1);
+    let d4 = cross_points(a1, a2, b2);
+    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+}
+
+/// O(n^2) proper-crossing scan over a ring's non-adjacent edge pairs, with a
+/// bbox precheck per pair. Runs only when a fill is (re)tessellated, and
+/// hazard rings are capped by [`HAZARD_FILL_VERTEX_LIMIT`].
+fn screen_ring_self_intersects(points: &[egui::Pos2]) -> bool {
+    let count = points.len();
+    if count < 4 {
+        return false;
+    }
+    for first in 0..count {
+        let a1 = points[first];
+        let a2 = points[(first + 1) % count];
+        for second in (first + 2)..count {
+            if first == 0 && second == count - 1 {
+                continue;
+            }
+            let b1 = points[second];
+            let b2 = points[(second + 1) % count];
+            if segments_properly_cross(a1, a2, b1, b2) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Safety valve for [`scanline_fill_mesh`]: a pathological band structure
+/// falls back to the caller's per-ring path instead of building a huge mesh.
+const SCANLINE_FILL_VERTEX_LIMIT: usize = 200_000;
+
+struct ScanlineFillEdge {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    ring: usize,
+}
+
+/// Scanline y where two fill edges properly cross, if they do.
+fn scanline_edge_crossing_y(a: &ScanlineFillEdge, b: &ScanlineFillEdge) -> Option<f32> {
+    let d1x = a.x1 - a.x0;
+    let d1y = a.y1 - a.y0;
+    let d2x = b.x1 - b.x0;
+    let d2y = b.y1 - b.y0;
+    let denominator = d1x * d2y - d1y * d2x;
+    if denominator == 0.0 {
+        return None;
+    }
+    let t = ((b.x0 - a.x0) * d2y - (b.y0 - a.y0) * d2x) / denominator;
+    let u = ((b.x0 - a.x0) * d1y - (b.y0 - a.y0) * d1x) / denominator;
+    (t > 0.0 && t < 1.0 && u > 0.0 && u < 1.0).then_some(a.y0 + t * d1y)
+}
+
+/// Exact fill tessellation for possibly-degenerate screen rings: even-odd
+/// inside each ring, union across rings, emitted as trapezoid bands between
+/// consecutive vertex/crossing scanlines. Within a band no edge starts, ends,
+/// or crosses another, so the interval structure at the band's midline holds
+/// across it and the trapezoids tile the region EXACTLY ONCE — a translucent
+/// fill never double-blends no matter how the rings overlap or self-cross.
+/// This is both the self-intersecting-ring fill and the same-family hazard
+/// overlap flattener.
+fn scanline_fill_mesh(
+    rings: &[Vec<egui::Pos2>],
+    fill: egui::Color32,
+) -> Option<egui::epaint::Mesh> {
+    let mut edges = Vec::new();
+    for (ring_index, ring) in rings.iter().enumerate() {
+        if ring.len() < 3 {
+            continue;
+        }
+        for index in 0..ring.len() {
+            let a = ring[index];
+            let b = ring[(index + 1) % ring.len()];
+            if a.y != b.y && screen_point_valid(a) && screen_point_valid(b) {
+                edges.push(ScanlineFillEdge {
+                    x0: a.x,
+                    y0: a.y,
+                    x1: b.x,
+                    y1: b.y,
+                    ring: ring_index,
+                });
+            }
+        }
+    }
+    if edges.is_empty() {
         return None;
     }
 
-    let mut indices = (0..points.len()).collect::<Vec<_>>();
-    let mut triangles = Vec::<[usize; 3]>::with_capacity(points.len().saturating_sub(2));
-    let max_iterations = points.len() * points.len();
-    let mut iterations = 0usize;
-
-    while indices.len() > 3 && iterations < max_iterations {
-        iterations += 1;
-        let mut clipped = false;
-        for current in 0..indices.len() {
-            let previous = indices[(current + indices.len() - 1) % indices.len()];
-            let index = indices[current];
-            let next = indices[(current + 1) % indices.len()];
-            if !is_ear_candidate(points, &indices, previous, index, next, winding) {
-                continue;
+    let mut events = Vec::with_capacity(edges.len() * 2);
+    for edge in &edges {
+        events.push(edge.y0);
+        events.push(edge.y1);
+    }
+    for first in 0..edges.len() {
+        for second in (first + 1)..edges.len() {
+            if let Some(y) = scanline_edge_crossing_y(&edges[first], &edges[second]) {
+                events.push(y);
             }
-            triangles.push([previous, index, next]);
-            indices.remove(current);
-            clipped = true;
-            break;
         }
-        if !clipped {
+    }
+    events.sort_by(f32::total_cmp);
+    events.dedup();
+
+    let x_at = |edge: &ScanlineFillEdge, y: f32| {
+        edge.x0 + (y - edge.y0) * (edge.x1 - edge.x0) / (edge.y1 - edge.y0)
+    };
+    let mut mesh = egui::epaint::Mesh::default();
+    let mut crossings = Vec::<(f32, usize)>::new();
+    let mut intervals = Vec::<(usize, usize)>::new();
+    for band in events.windows(2) {
+        let (y0, y1) = (band[0], band[1]);
+        let midline = 0.5 * (y0 + y1);
+        if !(y0 < midline && midline < y1) {
+            continue;
+        }
+        intervals.clear();
+        for ring_index in 0..rings.len() {
+            crossings.clear();
+            for (edge_index, edge) in edges.iter().enumerate() {
+                if edge.ring == ring_index && (edge.y0 > midline) != (edge.y1 > midline) {
+                    crossings.push((x_at(edge, midline), edge_index));
+                }
+            }
+            crossings.sort_by(|left, right| left.0.total_cmp(&right.0));
+            for pair in crossings.chunks_exact(2) {
+                intervals.push((pair[0].1, pair[1].1));
+            }
+        }
+        intervals.sort_by(|left, right| {
+            x_at(&edges[left.0], midline).total_cmp(&x_at(&edges[right.0], midline))
+        });
+        let mut merged = Vec::<(usize, usize)>::new();
+        for &(left, right) in &intervals {
+            if let Some(active) = merged.last_mut()
+                && x_at(&edges[left], midline) <= x_at(&edges[active.1], midline)
+            {
+                if x_at(&edges[right], midline) > x_at(&edges[active.1], midline) {
+                    active.1 = right;
+                }
+            } else {
+                merged.push((left, right));
+            }
+        }
+        for (left, right) in merged {
+            let left_edge = &edges[left];
+            let right_edge = &edges[right];
+            let base = mesh.vertices.len() as u32;
+            mesh.colored_vertex(egui::pos2(x_at(left_edge, y0), y0), fill);
+            mesh.colored_vertex(egui::pos2(x_at(right_edge, y0), y0), fill);
+            mesh.colored_vertex(egui::pos2(x_at(right_edge, y1), y1), fill);
+            mesh.colored_vertex(egui::pos2(x_at(left_edge, y1), y1), fill);
+            mesh.add_triangle(base, base + 1, base + 2);
+            mesh.add_triangle(base, base + 2, base + 3);
+        }
+        if mesh.vertices.len() > SCANLINE_FILL_VERTEX_LIMIT {
             return None;
         }
     }
-
-    if indices.len() == 3 {
-        triangles.push([indices[0], indices[1], indices[2]]);
-    }
-    (!triangles.is_empty()).then_some(triangles)
-}
-
-fn is_ear_candidate(
-    points: &[egui::Pos2],
-    indices: &[usize],
-    previous: usize,
-    index: usize,
-    next: usize,
-    winding: f32,
-) -> bool {
-    let a = points[previous];
-    let b = points[index];
-    let c = points[next];
-    let cross = cross_points(a, b, c);
-    if cross.abs() <= f32::EPSILON || cross.signum() != winding {
-        return false;
-    }
-    !indices.iter().any(|candidate| {
-        let candidate = *candidate;
-        candidate != previous
-            && candidate != index
-            && candidate != next
-            && point_in_triangle(points[candidate], a, b, c)
-    })
-}
-
-fn polygon_signed_area(points: &[egui::Pos2]) -> f32 {
-    let mut area = 0.0f32;
-    for index in 0..points.len() {
-        let current = points[index];
-        let next = points[(index + 1) % points.len()];
-        area += current.x * next.y - next.x * current.y;
-    }
-    area * 0.5
+    (!mesh.indices.is_empty()).then_some(mesh)
 }
 
 fn cross_points(a: egui::Pos2, b: egui::Pos2, c: egui::Pos2) -> f32 {
     (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
 }
 
+/// Test-only since the ear clip's removal: the runtime fill paths tessellate
+/// via earcut or the scanline bands and never point-test triangles.
+#[cfg(test)]
 fn point_in_triangle(point: egui::Pos2, a: egui::Pos2, b: egui::Pos2, c: egui::Pos2) -> bool {
     let ab = cross_points(a, b, point);
     let bc = cross_points(b, c, point);
@@ -72539,6 +72790,753 @@ mod tests {
 
         assert!(contains(egui::pos2(1.0, 1.0)));
         assert!(!contains(egui::pos2(5.0, 5.0)));
+    }
+
+    // ---- hazard polygon artifact fixtures (REAL api.weather.gov captures) --
+
+    /// Real mid-Atlantic scene: every alert message active at
+    /// 2026-07-05T23:30Z (the July 5 severe evening — SVR/FFW/TOR/SPS
+    /// clusters over PA/MD/NJ/VA), captured from api.weather.gov and trimmed
+    /// to the fields the parser reads.
+    const HAZARD_ALERTS_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/hazard_alerts_midatlantic_20260705T2330Z.json"
+    );
+    /// Real NWS zone geometry: the Cape May back-bay marsh ring (polygon #7
+    /// of api.weather.gov/zones/county/NJC009, 491 vertices). Coastline-traced
+    /// rings like this reach the fill path through zone-based alerts in
+    /// families that keep raw geometry (e.g. special weather statements).
+    const HAZARD_CAPEMAY_RING_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/hazard_zone_ring_njc009_capemay.json"
+    );
+
+    fn hazard_fixture_query_time() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-05T23:30:00Z")
+            .expect("fixture snapshot time")
+            .with_timezone(&Utc)
+    }
+
+    /// Parse + dedup the alerts fixture through the actual live pipeline.
+    fn fixture_hazard_records() -> Vec<HazardRecord> {
+        let text = std::fs::read_to_string(HAZARD_ALERTS_FIXTURE).expect("alerts fixture reads");
+        let collection: WeatherAlertFeatureCollection =
+            serde_json::from_str(&text).expect("alerts fixture parses");
+        let query_time = hazard_fixture_query_time();
+        let mut records = Vec::new();
+        for feature in &collection.features {
+            if let Ok(mut feature_records) = parse_weather_alert_feature(feature, query_time) {
+                records.append(&mut feature_records);
+            }
+        }
+        let overlay = build_live_hazard_overlay(
+            "fixture".to_owned(),
+            query_time,
+            collection.features.len(),
+            0,
+            0,
+            Instant::now(),
+            records,
+        );
+        overlay.records
+    }
+
+    fn capemay_ring_points() -> Vec<HazardPoint> {
+        let text =
+            std::fs::read_to_string(HAZARD_CAPEMAY_RING_FIXTURE).expect("ring fixture reads");
+        let zone: WeatherZoneFeature = serde_json::from_str(&text).expect("ring fixture parses");
+        let rings = weather_alert_geometry_rings(&zone.geometry.expect("ring geometry"))
+            .expect("ring fixture rings");
+        rings.into_iter().next().expect("one ring")
+    }
+
+    /// Project a geo ring to screen about its own bbox center, exactly as the
+    /// overlay builder would for a view centered on the alert.
+    fn project_hazard_ring(points: &[HazardPoint], map_scale: f32) -> Vec<egui::Pos2> {
+        let bbox = hazard_bbox(points);
+        let center_lon = (bbox[0] + bbox[2]) * 0.5;
+        let center_lat = (bbox[1] + bbox[3]) * 0.5;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 1000.0));
+        points
+            .iter()
+            .map(|point| {
+                project_lon_lat(
+                    center_lat, center_lon, map_scale, rect, point.lon, point.lat,
+                )
+            })
+            .collect()
+    }
+
+    // ---- triangle-coverage helpers -----------------------------------------
+
+    /// All triangles of one fill shape (mesh triangles, or the fan epaint
+    /// renders a `convex_polygon` path with).
+    fn fill_shape_triangles(shape: &egui::Shape) -> Vec<[egui::Pos2; 3]> {
+        match shape {
+            egui::Shape::Mesh(mesh) => mesh
+                .indices
+                .chunks_exact(3)
+                .map(|triangle| {
+                    [
+                        mesh.vertices[triangle[0] as usize].pos,
+                        mesh.vertices[triangle[1] as usize].pos,
+                        mesh.vertices[triangle[2] as usize].pos,
+                    ]
+                })
+                .collect(),
+            egui::Shape::Path(path) if path.fill != egui::Color32::TRANSPARENT => {
+                (1..path.points.len().saturating_sub(1))
+                    .map(|index| [path.points[0], path.points[index], path.points[index + 1]])
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Strictly-inside triangle test: excludes edges so a correct tiling
+    /// counts each generic interior point exactly once.
+    fn strictly_in_triangle(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2, c: egui::Pos2) -> bool {
+        let ab = cross_points(a, b, p);
+        let bc = cross_points(b, c, p);
+        let ca = cross_points(c, a, p);
+        (ab > 1e-4 && bc > 1e-4 && ca > 1e-4) || (ab < -1e-4 && bc < -1e-4 && ca < -1e-4)
+    }
+
+    /// (false-fill, missing-fill, inside) sample counts of a triangle set vs
+    /// the even-odd interior of `ring`, over a padded sample grid.
+    fn ring_fill_coverage(
+        ring: &[egui::Pos2],
+        triangles: &[[egui::Pos2; 3]],
+        samples: usize,
+    ) -> (usize, usize, usize) {
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for point in ring {
+            min_x = min_x.min(point.x);
+            min_y = min_y.min(point.y);
+            max_x = max_x.max(point.x);
+            max_y = max_y.max(point.y);
+        }
+        let pad_x = (max_x - min_x) * 0.25 + 2.0;
+        let pad_y = (max_y - min_y) * 0.25 + 2.0;
+        let (mut false_fill, mut missing, mut inside_count) = (0usize, 0usize, 0usize);
+        for i in 0..samples {
+            for j in 0..samples {
+                let x = min_x - pad_x
+                    + (max_x - min_x + 2.0 * pad_x) * (i as f32 + 0.583) / samples as f32;
+                let y = min_y - pad_y
+                    + (max_y - min_y + 2.0 * pad_y) * (j as f32 + 0.417) / samples as f32;
+                let point = egui::pos2(x, y);
+                let inside = screen_polygon_contains_point(ring, point);
+                let filled = triangles
+                    .iter()
+                    .any(|[a, b, c]| strictly_in_triangle(point, *a, *b, *c));
+                if inside {
+                    inside_count += 1;
+                    if !filled {
+                        missing += 1;
+                    }
+                } else if filled {
+                    false_fill += 1;
+                }
+            }
+        }
+        (false_fill, missing, inside_count)
+    }
+
+    // ---- spike regressions: degenerate rings through the real fill path ----
+
+    fn spike_probe_fill() -> egui::Color32 {
+        egui::Color32::from_rgba_unmultiplied(255, 190, 40, 96)
+    }
+
+    fn filled_ring_coverage(ring: &[egui::Pos2], samples: usize) -> (usize, usize, usize) {
+        let cleaned = cleaned_screen_polygon(ring);
+        let mesh = filled_polygon_mesh(ring, spike_probe_fill()).expect("ring fills");
+        let triangles = fill_shape_triangles(&egui::Shape::mesh(mesh));
+        ring_fill_coverage(&cleaned, &triangles, samples)
+    }
+
+    /// The REAL Cape May coastline ring must fill at every zoom. Before the
+    /// earcut/scanline rework, map_scale 60 quantization folded the ring into
+    /// screen-space self-intersections, the hand-rolled ear clip found no ear
+    /// and the fill silently vanished.
+    #[test]
+    fn capemay_zone_ring_fill_survives_every_zoom() {
+        let ring = capemay_ring_points();
+        for map_scale in [30.0_f32, 60.0, 120.0, 240.0, 480.0] {
+            let screen = project_hazard_ring(&ring, map_scale);
+            let cleaned = cleaned_screen_polygon(&screen);
+            assert!(cleaned.len() >= 3, "map_scale {map_scale}: ring collapsed");
+            let mesh = filled_polygon_mesh(&screen, spike_probe_fill())
+                .unwrap_or_else(|| panic!("real Cape May ring must fill at map_scale {map_scale}"));
+            let triangles = fill_shape_triangles(&egui::Shape::mesh(mesh));
+            let (false_fill, missing, inside) = ring_fill_coverage(&cleaned, &triangles, 80);
+            assert!(inside > 0, "map_scale {map_scale}: no interior samples");
+            assert!(
+                false_fill * 50 <= inside,
+                "map_scale {map_scale}: {false_fill} false-fill vs {inside} inside samples"
+            );
+            assert!(
+                missing * 10 <= inside,
+                "map_scale {map_scale}: {missing} missing-fill vs {inside} inside samples"
+            );
+        }
+    }
+
+    /// Crossed vertex order (a shipped CAP glitch): the fill must cover the
+    /// even-odd interior only. The old ear clip painted the convex wings
+    /// outside the crossing — the reported "spike" wedges.
+    #[test]
+    fn bowtie_ring_fill_stays_inside_even_odd_interior() {
+        let ring = vec![
+            egui::pos2(0.0, 0.0),
+            egui::pos2(100.0, 0.0),
+            egui::pos2(20.0, 60.0),
+            egui::pos2(80.0, 60.0),
+        ];
+        let (false_fill, missing, inside) = filled_ring_coverage(&ring, 90);
+        assert!(inside > 500);
+        assert!(
+            false_fill * 50 <= inside,
+            "{false_fill} false-fill vs {inside} inside samples"
+        );
+        assert!(
+            missing * 50 <= inside,
+            "{missing} missing-fill vs {inside} inside samples"
+        );
+    }
+
+    /// Zero-area out-and-back excursion: the old ear clip returned None and
+    /// the whole warning fill vanished; the spike itself must not paint.
+    #[test]
+    fn out_and_back_ring_fills_without_spike() {
+        let ring = vec![
+            egui::pos2(0.0, 0.0),
+            egui::pos2(40.0, 0.0),
+            egui::pos2(40.0, 40.0),
+            egui::pos2(20.0, 40.0),
+            egui::pos2(20.0, 70.0),
+            egui::pos2(20.0, 40.0),
+            egui::pos2(0.0, 40.0),
+        ];
+        let (false_fill, missing, inside) = filled_ring_coverage(&ring, 90);
+        assert!(inside > 500);
+        assert_eq!(false_fill, 0, "spike region must not fill");
+        assert!(
+            missing * 50 <= inside,
+            "{missing} missing-fill vs {inside} inside samples"
+        );
+    }
+
+    /// Ring pinched through a repeated non-consecutive vertex: previously no
+    /// ear was ever accepted and the fill vanished.
+    #[test]
+    fn pinched_ring_with_repeated_vertex_still_fills() {
+        let ring = vec![
+            egui::pos2(0.0, 0.0),
+            egui::pos2(30.0, 0.0),
+            egui::pos2(30.0, 30.0),
+            egui::pos2(15.0, 15.0),
+            egui::pos2(0.0, 30.0),
+            egui::pos2(15.0, 15.0),
+        ];
+        let (false_fill, missing, inside) = filled_ring_coverage(&ring, 90);
+        assert!(inside > 300);
+        assert!(
+            false_fill * 50 <= inside,
+            "{false_fill} false-fill vs {inside} inside samples"
+        );
+        assert!(
+            missing * 50 <= inside,
+            "{missing} missing-fill vs {inside} inside samples"
+        );
+    }
+
+    #[test]
+    fn self_intersection_scan_flags_only_proper_crossings() {
+        let bowtie = vec![
+            egui::pos2(0.0, 0.0),
+            egui::pos2(100.0, 0.0),
+            egui::pos2(20.0, 60.0),
+            egui::pos2(80.0, 60.0),
+        ];
+        assert!(screen_ring_self_intersects(&bowtie));
+        let square = vec![
+            egui::pos2(0.0, 0.0),
+            egui::pos2(10.0, 0.0),
+            egui::pos2(10.0, 10.0),
+            egui::pos2(0.0, 10.0),
+        ];
+        assert!(!screen_ring_self_intersects(&square));
+        // Collinear out-and-back overlap touches but never properly crosses.
+        let spike = vec![
+            egui::pos2(0.0, 0.0),
+            egui::pos2(40.0, 0.0),
+            egui::pos2(40.0, 40.0),
+            egui::pos2(20.0, 40.0),
+            egui::pos2(20.0, 70.0),
+            egui::pos2(20.0, 40.0),
+            egui::pos2(0.0, 40.0),
+        ];
+        assert!(!screen_ring_self_intersects(&spike));
+    }
+
+    // ---- glow regressions: same-family fills must not stack alpha ----------
+
+    /// Count of triangles (across all fill shapes) strictly containing point.
+    fn fill_paint_multiplicity(fill_shapes: &[egui::Shape], point: egui::Pos2) -> usize {
+        fill_shapes
+            .iter()
+            .flat_map(fill_shape_triangles)
+            .filter(|[a, b, c]| strictly_in_triangle(point, *a, *b, *c))
+            .count()
+    }
+
+    #[test]
+    fn scanline_fill_mesh_paints_overlap_exactly_once() {
+        let rings = vec![
+            vec![
+                egui::pos2(0.0, 0.0),
+                egui::pos2(100.0, 0.0),
+                egui::pos2(100.0, 100.0),
+                egui::pos2(0.0, 100.0),
+            ],
+            vec![
+                egui::pos2(60.0, 40.0),
+                egui::pos2(180.0, 40.0),
+                egui::pos2(180.0, 160.0),
+                egui::pos2(60.0, 160.0),
+            ],
+        ];
+        let mesh = scanline_fill_mesh(&rings, spike_probe_fill()).expect("union tessellates");
+        let shapes = vec![egui::Shape::mesh(mesh)];
+        // Inside first only, inside overlap, inside second only: exactly once.
+        for point in [
+            egui::pos2(20.3, 20.7),
+            egui::pos2(80.3, 70.7),
+            egui::pos2(150.3, 120.7),
+            // Straddles the T-junction scanline where the second square
+            // starts (y = 40) — the bands must tile without crack or overlap.
+            egui::pos2(30.3, 40.5),
+            egui::pos2(30.3, 39.5),
+        ] {
+            assert_eq!(
+                fill_paint_multiplicity(&shapes, point),
+                1,
+                "point {point:?} must be painted exactly once"
+            );
+        }
+        for point in [egui::pos2(-10.0, 50.0), egui::pos2(120.3, 20.7)] {
+            assert_eq!(
+                fill_paint_multiplicity(&shapes, point),
+                0,
+                "point {point:?} is outside the union"
+            );
+        }
+    }
+
+    #[test]
+    fn same_family_overlapping_fills_flatten_to_one_paint() {
+        let first = test_hazard_record(
+            "KCTP.SV.W.0176",
+            "SVR 0176",
+            "severe thunderstorm",
+            square_hazard_points(-1.0, -1.0, 1.0, 1.0),
+        );
+        let second = test_hazard_record(
+            "KCTP.SV.W.0177",
+            "SVR 0177",
+            "severe thunderstorm",
+            square_hazard_points(0.0, 0.0, 2.0, 2.0),
+        );
+        let app = test_viewer_app_with_hazards(vec![first, second]);
+        let rect = test_map_rect();
+
+        let built = app.build_hazard_overlay_shapes(rect, None);
+
+        assert_eq!(
+            built.fill_shapes.len(),
+            1,
+            "overlapping same-family fills must merge into one union shape"
+        );
+        let overlap_point = app.lon_lat_to_screen(rect, 0.37, 0.43);
+        assert_eq!(
+            fill_paint_multiplicity(&built.fill_shapes, overlap_point),
+            1
+        );
+        // Non-overlapped areas of both records still paint.
+        let first_only = app.lon_lat_to_screen(rect, -0.53, -0.47);
+        let second_only = app.lon_lat_to_screen(rect, 1.53, 1.47);
+        assert_eq!(fill_paint_multiplicity(&built.fill_shapes, first_only), 1);
+        assert_eq!(fill_paint_multiplicity(&built.fill_shapes, second_only), 1);
+    }
+
+    #[test]
+    fn distinct_family_overlapping_fills_still_layer() {
+        let severe = test_hazard_record(
+            "KCTP.SV.W.0178",
+            "SVR 0178",
+            "severe thunderstorm",
+            square_hazard_points(-1.0, -1.0, 1.0, 1.0),
+        );
+        let tornado = test_hazard_record(
+            "KCTP.TO.W.0031",
+            "TOR 0031",
+            "tornado",
+            square_hazard_points(-0.5, -0.5, 0.5, 0.5),
+        );
+        let app = test_viewer_app_with_hazards(vec![severe, tornado]);
+        let rect = test_map_rect();
+
+        let built = app.build_hazard_overlay_shapes(rect, None);
+
+        assert_eq!(
+            built.fill_shapes.len(),
+            2,
+            "different families stay layered"
+        );
+        let overlap_point = app.lon_lat_to_screen(rect, 0.13, 0.17);
+        assert_eq!(
+            fill_paint_multiplicity(&built.fill_shapes, overlap_point),
+            2
+        );
+    }
+
+    /// The real July 5 2026 KCTP stack: three successive SVR warnings over
+    /// central PA whose fills previously blended three times (the glow blob).
+    #[test]
+    fn real_kctp_svr_stack_flattens_to_single_paint() {
+        let mut records = fixture_hazard_records();
+        records.retain(|record| {
+            record.event_family == "severe thunderstorm"
+                && record.event_id.starts_with("KCTP.SV.W.")
+        });
+        assert!(
+            records.len() >= 3,
+            "fixture carries the KCTP SVR stack, got {}",
+            records.len()
+        );
+        let mut app = test_viewer_app_with_hazards(records);
+        let rect = test_map_rect();
+        // The probe's cluster view over south-central PA.
+        app.map_center_lon = -77.15;
+        app.map_center_lat = 40.3;
+        app.map_scale = 520.0;
+
+        let built = app.build_hazard_overlay_shapes(rect, None);
+
+        assert_eq!(
+            built.fill_shapes.len(),
+            1,
+            "the KCTP SVR stack must flatten into one union fill"
+        );
+        let (max_depth, stacked) = fill_paint_depth_stats(&built.fill_shapes, rect);
+        assert_eq!(max_depth, 1, "no point may be painted twice");
+        assert_eq!(stacked, 0);
+    }
+
+    // ---- CPU rasterizer: draws overlay shapes the way the GPU would --------
+
+    fn probe_blend_pixel(image: &mut image::RgbaImage, x: i64, y: i64, color: egui::Color32) {
+        if x < 0 || y < 0 || x >= image.width() as i64 || y >= image.height() as i64 {
+            return;
+        }
+        let pixel = image.get_pixel_mut(x as u32, y as u32);
+        let alpha = color.a() as f32 / 255.0;
+        for channel in 0..3 {
+            let source = [color.r(), color.g(), color.b()][channel] as f32;
+            pixel.0[channel] =
+                (source * alpha + pixel.0[channel] as f32 * (1.0 - alpha)).round() as u8;
+        }
+    }
+
+    fn probe_fill_triangle(
+        image: &mut image::RgbaImage,
+        a: egui::Pos2,
+        b: egui::Pos2,
+        c: egui::Pos2,
+        color: egui::Color32,
+    ) {
+        let min_x = a.x.min(b.x).min(c.x).floor().max(0.0) as i64;
+        let max_x = a.x.max(b.x).max(c.x).ceil().min(image.width() as f32) as i64;
+        let min_y = a.y.min(b.y).min(c.y).floor().max(0.0) as i64;
+        let max_y = a.y.max(b.y).max(c.y).ceil().min(image.height() as f32) as i64;
+        for y in min_y..max_y {
+            for x in min_x..max_x {
+                let point = egui::pos2(x as f32 + 0.5, y as f32 + 0.5);
+                if point_in_triangle(point, a, b, c) {
+                    probe_blend_pixel(image, x, y, color);
+                }
+            }
+        }
+    }
+
+    fn probe_draw_segment(
+        image: &mut image::RgbaImage,
+        from: egui::Pos2,
+        to: egui::Pos2,
+        width: f32,
+        color: egui::Color32,
+    ) {
+        let half = (width * 0.5).max(0.5);
+        let min_x = (from.x.min(to.x) - half).floor().max(0.0) as i64;
+        let max_x = (from.x.max(to.x) + half).ceil().min(image.width() as f32) as i64;
+        let min_y = (from.y.min(to.y) - half).floor().max(0.0) as i64;
+        let max_y = (from.y.max(to.y) + half).ceil().min(image.height() as f32) as i64;
+        for y in min_y..max_y {
+            for x in min_x..max_x {
+                let point = egui::pos2(x as f32 + 0.5, y as f32 + 0.5);
+                if closest_point_on_segment(point, from, to).distance(point) <= half {
+                    probe_blend_pixel(image, x, y, color);
+                }
+            }
+        }
+    }
+
+    fn probe_stroke_color(stroke: &egui::epaint::PathStroke) -> egui::Color32 {
+        match stroke.color {
+            egui::epaint::ColorMode::Solid(color) => color,
+            egui::epaint::ColorMode::UV(_) => egui::Color32::WHITE,
+        }
+    }
+
+    fn probe_draw_shape(image: &mut image::RgbaImage, shape: &egui::Shape) {
+        match shape {
+            egui::Shape::Mesh(mesh) => {
+                for triangle in mesh.indices.chunks_exact(3) {
+                    let a = mesh.vertices[triangle[0] as usize];
+                    let b = mesh.vertices[triangle[1] as usize];
+                    let c = mesh.vertices[triangle[2] as usize];
+                    probe_fill_triangle(image, a.pos, b.pos, c.pos, a.color);
+                }
+            }
+            egui::Shape::Path(path) => {
+                if path.fill != egui::Color32::TRANSPARENT {
+                    for index in 1..path.points.len().saturating_sub(1) {
+                        probe_fill_triangle(
+                            image,
+                            path.points[0],
+                            path.points[index],
+                            path.points[index + 1],
+                            path.fill,
+                        );
+                    }
+                }
+                if path.stroke.width > 0.0 {
+                    let color = probe_stroke_color(&path.stroke);
+                    for window in path.points.windows(2) {
+                        probe_draw_segment(image, window[0], window[1], path.stroke.width, color);
+                    }
+                    if path.closed
+                        && let (Some(first), Some(last)) = (path.points.first(), path.points.last())
+                    {
+                        probe_draw_segment(image, *last, *first, path.stroke.width, color);
+                    }
+                }
+            }
+            egui::Shape::LineSegment { points, stroke } => {
+                probe_draw_segment(image, points[0], points[1], stroke.width, stroke.color);
+            }
+            egui::Shape::Vec(shapes) => {
+                for inner in shapes {
+                    probe_draw_shape(image, inner);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn probe_rasterize(shapes: &[egui::Shape], width: u32, height: u32) -> image::RgbaImage {
+        let mut image = image::RgbaImage::from_pixel(width, height, image::Rgba([16, 16, 20, 255]));
+        for shape in shapes {
+            probe_draw_shape(&mut image, shape);
+        }
+        image
+    }
+
+    /// Per-sample paint depth of the fill layer: how many fill SHAPES cover
+    /// each sampled point (each shape src-over blends once, so depth n means
+    /// the family alpha stacks n times). Returns (max depth, samples >= 2).
+    fn fill_paint_depth_stats(fill_shapes: &[egui::Shape], rect: egui::Rect) -> (usize, usize) {
+        let per_shape: Vec<Vec<[egui::Pos2; 3]>> =
+            fill_shapes.iter().map(fill_shape_triangles).collect();
+        let (mut max_depth, mut stacked) = (0usize, 0usize);
+        let (nx, ny) = (168usize, 120usize);
+        for i in 0..nx {
+            for j in 0..ny {
+                let point = egui::pos2(
+                    rect.left() + rect.width() * (i as f32 + 0.583) / nx as f32,
+                    rect.top() + rect.height() * (j as f32 + 0.417) / ny as f32,
+                );
+                let depth = per_shape
+                    .iter()
+                    .filter(|triangles| {
+                        triangles
+                            .iter()
+                            .any(|[a, b, c]| strictly_in_triangle(point, *a, *b, *c))
+                    })
+                    .count();
+                max_depth = max_depth.max(depth);
+                if depth >= 2 {
+                    stacked += 1;
+                }
+            }
+        }
+        (max_depth, stacked)
+    }
+
+    /// Visual probe: renders the REAL July 5 2026 mid-Atlantic warning scene
+    /// and a pathological-ring panel through the actual overlay pipeline to
+    /// PNGs, for before/after comparison of the polygon-artifact fixes. Run
+    /// explicitly (it writes files):
+    ///   cargo test -p app_ui hazard_polygon_probe -- --ignored --nocapture
+    #[test]
+    #[ignore = "writes probe PNGs; run explicitly for visual verification"]
+    fn hazard_polygon_probe_renders_scene_pngs() {
+        let out_dir = std::path::PathBuf::from(
+            std::env::var("HAZARD_PROBE_OUT").unwrap_or_else(|_| "target/hazard_probe".to_owned()),
+        );
+        std::fs::create_dir_all(&out_dir).expect("probe out dir");
+
+        let records = fixture_hazard_records();
+        assert!(!records.is_empty(), "alerts fixture yields records");
+        for (name, lon, lat, scale, width, height) in [
+            (
+                "midatlantic_wide",
+                -77.3_f32,
+                39.8_f32,
+                210.0_f32,
+                1400_u32,
+                1000_u32,
+            ),
+            ("kctp_cluster", -77.15, 40.3, 520.0, 1200, 900),
+        ] {
+            let mut app = test_viewer_app_with_hazards(records.clone());
+            app.map_center_lon = lon;
+            app.map_center_lat = lat;
+            app.map_scale = scale;
+            app.hidden_hazard_families.clear();
+            // Boost the (user-facing) global fill alpha so the stacking
+            // artifact is obvious in the PNG — the default 24 shifts pixels
+            // only a few levels on the dark map background.
+            app.style_settings.hazard_global.fill_alpha = Some(80);
+            app.style_registry = styles::StyleRegistry::from_settings(&app.style_settings);
+            let rect = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width as f32, height as f32),
+            );
+            let shapes = app.build_hazard_overlay_shapes(rect, None);
+            let (max_depth, stacked_samples) = fill_paint_depth_stats(&shapes.fill_shapes, rect);
+            println!(
+                "scene {name}: records={} fill_shapes={} outline_shapes={} \
+                 max_fill_paint_depth={max_depth} samples_painted_2plus={stacked_samples}",
+                records.len(),
+                shapes.fill_shapes.len(),
+                shapes.outline_shapes.len(),
+            );
+            let mut all_shapes = shapes.fill_shapes.clone();
+            all_shapes.extend(shapes.outline_shapes.iter().cloned());
+            probe_rasterize(&all_shapes, width, height)
+                .save(out_dir.join(format!("scene_{name}.png")))
+                .expect("save scene png");
+        }
+        render_pathological_ring_panel(&out_dir);
+    }
+
+    /// One tile per pathological ring: the REAL Cape May coastline ring at the
+    /// zoom band where screen quantization folds it, plus the documented CAP
+    /// glitch patterns (crossed vertex order, out-and-back excursion, pinch).
+    /// Fill is computed by the actual `filled_polygon_mesh` on the true screen
+    /// coordinates; only the DRAWING is magnified for visibility.
+    fn render_pathological_ring_panel(out_dir: &std::path::Path) {
+        let capemay = capemay_ring_points();
+        let cases: Vec<(&str, Vec<egui::Pos2>)> = vec![
+            ("capemay@60", project_hazard_ring(&capemay, 60.0)),
+            ("capemay@120", project_hazard_ring(&capemay, 120.0)),
+            (
+                "bowtie",
+                vec![
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(100.0, 0.0),
+                    egui::pos2(20.0, 60.0),
+                    egui::pos2(80.0, 60.0),
+                ],
+            ),
+            (
+                "out_and_back",
+                vec![
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(40.0, 0.0),
+                    egui::pos2(40.0, 40.0),
+                    egui::pos2(20.0, 40.0),
+                    egui::pos2(20.0, 70.0),
+                    egui::pos2(20.0, 40.0),
+                    egui::pos2(0.0, 40.0),
+                ],
+            ),
+            (
+                "pinch",
+                vec![
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(30.0, 0.0),
+                    egui::pos2(30.0, 30.0),
+                    egui::pos2(15.0, 15.0),
+                    egui::pos2(0.0, 30.0),
+                    egui::pos2(15.0, 15.0),
+                ],
+            ),
+        ];
+        let tile = 320.0f32;
+        let width = (tile as u32) * cases.len() as u32;
+        let mut image =
+            image::RgbaImage::from_pixel(width, tile as u32, image::Rgba([16, 16, 20, 255]));
+        for (index, (name, ring)) in cases.iter().enumerate() {
+            let fill = egui::Color32::from_rgba_unmultiplied(255, 190, 40, 96);
+            let mesh = filled_polygon_mesh(ring, fill);
+            let cleaned = cleaned_screen_polygon(ring);
+            let triangles = mesh
+                .as_ref()
+                .map(|mesh| fill_shape_triangles(&egui::Shape::mesh(mesh.clone())))
+                .unwrap_or_default();
+            let (false_fill, missing, inside) = ring_fill_coverage(&cleaned, &triangles, 90);
+            println!(
+                "panel {name}: n_raw={} n_clean={} mesh={} triangles={} \
+                 false_fill={false_fill} missing_fill={missing} inside_samples={inside}",
+                ring.len(),
+                cleaned.len(),
+                if mesh.is_some() { "Some" } else { "NONE" },
+                triangles.len(),
+            );
+            // Map the ring bbox into this tile with 12% margin (viz-only).
+            let (mut min_x, mut min_y, mut max_x, mut max_y) =
+                (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for point in ring {
+                min_x = min_x.min(point.x);
+                min_y = min_y.min(point.y);
+                max_x = max_x.max(point.x);
+                max_y = max_y.max(point.y);
+            }
+            let span = (max_x - min_x).max(max_y - min_y).max(1e-3);
+            let scale = tile * 0.76 / span;
+            let offset = egui::vec2(
+                tile * index as f32 + tile * 0.12 - min_x * scale,
+                tile * 0.12 - min_y * scale,
+            );
+            let viz = |p: egui::Pos2| egui::pos2(p.x * scale + offset.x, p.y * scale + offset.y);
+            for [a, b, c] in &triangles {
+                probe_fill_triangle(&mut image, viz(*a), viz(*b), viz(*c), fill);
+            }
+            let outline = egui::Color32::from_rgb(235, 235, 245);
+            for window in cleaned.windows(2) {
+                probe_draw_segment(&mut image, viz(window[0]), viz(window[1]), 1.0, outline);
+            }
+            if let (Some(first), Some(last)) = (cleaned.first(), cleaned.last()) {
+                probe_draw_segment(&mut image, viz(*last), viz(*first), 1.0, outline);
+            }
+        }
+        image
+            .save(out_dir.join("pathological_rings.png"))
+            .expect("save panel png");
     }
 
     #[test]
