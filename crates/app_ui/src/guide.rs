@@ -1404,7 +1404,8 @@ fn sources(ui: &mut egui::Ui) {
     para(
         ui,
         "European radar is provided by EUMETNET OPERA and the participating national \
-         meteorological services via the OPERA Development Radar Data (ORD) service — \
+         meteorological services via the OPERA Development Radar Data (ORD) service, \
+         including Spain's AEMET radar network (opened through ORD in June 2026) — \
          ORD data is licensed CC BY 4.0 with attribution to OPERA and the originating \
          national services. Additional national open-data feeds: SMHI (Sweden), FMI \
          (Finland), DWD (Germany), DMI (Denmark), CHMI (Czechia), SHMU (Slovakia), \

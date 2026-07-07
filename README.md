@@ -188,8 +188,10 @@ During severe weather, follow your local NWS office and emergency management.
   imagery and GLM lightning, and SPC/WPC forecast products.
 - **EUMETNET OPERA** and the participating national meteorological
   services — European weather radar via the OPERA Development Radar Data
-  (ORD) service. ORD radar data is licensed **CC BY 4.0**; BowEcho displays
-  it with attribution to OPERA and the originating national services.
+  (ORD) service, including Spain's **AEMET** radar network (opened through
+  ORD in June 2026). ORD radar data is licensed **CC BY 4.0**; BowEcho
+  displays it with attribution to OPERA and the originating national
+  services.
 - National open-data radar feeds: **SMHI** (Sweden), **FMI** (Finland),
   **DWD** (Germany), **DMI** (Denmark), **CHMI** (Czechia), **SHMÚ**
   (Slovakia), **GeoSphere Austria**, the **Estonian Environment Agency**,

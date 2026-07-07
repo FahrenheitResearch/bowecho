@@ -27,8 +27,12 @@
 //! publishing shapes differ (all observed live 2026-06-12):
 //!
 //! - bundled PVOL, one file per frame (NL, HR, SI, MT, IE/iesha);
-//! - per-moment PVOL splits, 1-2 volumes per stamp (BE, IS, NO, PL, RO),
-//!   with NO offsetting its velocity stamp a minute after reflectivity;
+//! - per-moment PVOL splits, 1-2 volumes per stamp (BE, IS, NO, PL, RO,
+//!   ES), with NO offsetting its velocity stamp a minute after
+//!   reflectivity, and ES (AEMET, live in ORD since 2026-06-23) pairing a
+//!   3-elevation long-range `DBZH_TH` volume on :x0 with a 2-elevation
+//!   Doppler `DBZH_VRADH` volume ~3 minutes earlier/later (:x6-:x7), both
+//!   on a 10-minute cadence (observed live 2026-07-07);
 //! - per-sweep SCAN files carrying all moments (FR, CH, EE, LT).
 //!
 //! One frame is assembled DWD-style from a trailing window: the newest
@@ -99,6 +103,7 @@ const ORD_LIVE_COUNTRIES: &[(&str, &str, &str)] = &[
     ("be", "BE", "Belgium"),
     ("ch", "CH", "Switzerland"),
     ("ee", "EE", "Estonia"),
+    ("es", "ES", "Spain"),
     ("fr", "FR", "France"),
     ("hr", "HR", "Croatia"),
     ("ie", "IE", "Ireland"),
@@ -124,6 +129,7 @@ const ORD_ARCHIVE_COUNTRIES: &[(&str, &str, &str)] = &[
     ("de", "DE", "Germany"),
     ("dk", "DK", "Denmark"),
     ("ee", "EE", "Estonia"),
+    ("es", "ES", "Spain"),
     ("fi", "FI", "Finland"),
     ("fr", "FR", "France"),
     ("hr", "HR", "Croatia"),
@@ -146,7 +152,9 @@ const ORD_ARCHIVE_COUNTRIES: &[(&str, &str, &str)] = &[
 ///
 /// Codes and coordinates: the ORD EDR locations catalog
 /// (`https://api.meteogate.eu/eu-eumetnet-weather-radar/collections/observations/locations`,
-/// fetched 2026-06-12; updated with BEHEL from the live 2026-06-16 bucket).
+/// fetched 2026-06-12; updated with BEHEL from the live 2026-06-16 bucket;
+/// the 11 ES/AEMET sites — WIGOS `0-724-0-{code}`, live in ORD since
+/// 2026-06-23 — added from the same catalog fetched 2026-07-07).
 /// Labels left blank by
 /// the EDR catalog (CH, NO, PL, RO) come from the EUMETNET OPERA radar
 /// database, `OPERA_RADARS_DB.json` (fetched 2026-06-12) from
@@ -163,6 +171,17 @@ const ORD_SITES: &[(&str, &str, f32, f32, bool)] = &[
     ("chppm", "Plaine Morte", 46.3706, 7.4866, false),
     ("chwei", "Weissfluhgipfel", 46.8350, 9.7945, false),
     ("eesur", "Sürgavere", 58.4823, 25.5187, false),
+    ("esahr", "Alhaurin Grande", 36.6134, -4.6593, true),
+    ("esatn", "Artenara", 28.0188, -15.6145, true),
+    ("esbnv", "Buenavista Norte", 28.3109, -16.8238, true),
+    ("esclg", "Castillo las Guardas", 37.6887, -6.3331, true),
+    ("esgld", "Gelida", 41.4082, 1.8849, true),
+    ("eslid", "Valladolid", 41.9956, -4.6028, true),
+    ("esnjr", "Nijar", 36.8324, -2.0821, true),
+    ("espdg", "Perdiguera", 41.7340, -0.5459, true),
+    ("essft", "Sierra Fuentes", 39.4288, -6.2853, true),
+    ("essse", "San Sebastian", 43.4033, -2.8419, true),
+    ("estjv", "Torrejon Velasco", 40.1759, -3.7137, true),
     ("frabb", "Abbeville", 50.1360, 1.8347, false),
     ("fraja", "Ajaccio", 41.9531, 8.7005, false),
     ("frave", "Avesnes", 50.1283, 3.8118, false),
@@ -250,7 +269,7 @@ impl ObjectKind {
     }
 }
 
-/// EUMETNET ORD: 14 additional European countries from the OPERA 24-hour
+/// EUMETNET ORD: 15 additional European countries from the OPERA 24-hour
 /// cache bucket, one provider.
 pub struct OrdProvider {
     sites: SiteCache,
@@ -782,7 +801,7 @@ fn site_superseded_by_native_provider(code: &str) -> bool {
 }
 
 /// Picker/marker label: the static-table name when known (with the
-/// country, since this provider's site list spans 14 of them), else the
+/// country, since this provider's site list spans 15 of them), else the
 /// uppercased code.
 fn site_label(code: &str, country: &str) -> String {
     match ORD_SITES.iter().find(|(known, ..)| *known == code) {
@@ -1654,14 +1673,17 @@ mod tests {
 
     /// All fixtures are live bucket captures from 2026-06-12 (hour-14 key
     /// listings trimmed to their newest entries; the FR site listing is
-    /// complete).
+    /// complete) except the ES pair, captured 2026-07-07 (the complete
+    /// esatn hour-17 key listing and the complete ES site listing).
     const FR_SITE_PREFIXES: &str = include_str!("fixtures/ord_fr_site_prefixes.xml");
+    const ES_SITE_PREFIXES: &str = include_str!("fixtures/ord_es_site_prefixes.xml");
     const NLHRW_HOUR: &str = include_str!("fixtures/ord_nlhrw_hour.xml");
     const NOHUR_HOUR: &str = include_str!("fixtures/ord_nohur_hour.xml");
     const BEJAB_HOUR: &str = include_str!("fixtures/ord_bejab_hour.xml");
     const MTGUD_HOUR: &str = include_str!("fixtures/ord_mtgud_hour.xml");
     const FRTOU_HOUR: &str = include_str!("fixtures/ord_frtou_hour.xml");
     const IEDUB_HOUR: &str = include_str!("fixtures/ord_iedub_hour.xml");
+    const ESATN_HOUR: &str = include_str!("fixtures/ord_esatn_hour.xml");
 
     fn fixture_keys(xml: &str) -> Vec<String> {
         parse_s3_style_listing(xml).expect("fixture parses").keys
@@ -1683,14 +1705,18 @@ mod tests {
                 "{native} has a native BowEcho provider"
             );
         }
-        assert_eq!(ORD_LIVE_COUNTRIES.len(), 14);
+        assert_eq!(ORD_LIVE_COUNTRIES.len(), 15);
         assert!(ORD_ARCHIVE_COUNTRIES.iter().any(|(lc, ..)| *lc == "se"));
-        assert_eq!(ORD_SITES.len(), 76);
+        assert_eq!(ORD_SITES.len(), 87);
         let visible = OrdProvider::new().static_sites();
         assert!(visible.iter().any(|site| site.site_id == "behel"
             && site.label == "Helchteren (Belgium)"
             && site.latitude_deg == Some(51.0702)
             && site.longitude_deg == Some(5.4054)));
+        assert!(visible.iter().any(|site| site.site_id == "esatn"
+            && site.label == "Artenara (Spain)"
+            && site.latitude_deg == Some(28.0188)
+            && site.longitude_deg == Some(-15.6145)));
         assert!(
             !visible.iter().any(|site| site.site_id == "eesur"),
             "Sürgavere is advertised by KAIA, not ORD"
@@ -1802,6 +1828,113 @@ mod tests {
                 .ends_with("bejab@20260612T1455@0.5_1.2_2.1_3.4_4.8_6.5_9.0_13.0_25.0@VRAD.h5")
         );
         assert!(plan.parts.iter().all(|part| !part.url.ends_with("@TH.h5")));
+    }
+
+    #[test]
+    fn spain_split_pvol_merges_long_range_reflectivity_with_offset_doppler() {
+        // AEMET (live in ORD since 2026-06-23) pairs a 3-elevation
+        // long-range DBZH_TH volume on :x0 with a 2-elevation Doppler
+        // DBZH_VRADH volume three minutes earlier at :x7. Both files
+        // carry DBZH (moment rank 0), so the elevation-count tiebreak
+        // must keep the long-range volume as the merge base with the
+        // Doppler volume merged after it.
+        let plan =
+            plan_from_keys("esatn", ObjectKind::Pvol, &fixture_keys(ESATN_HOUR)).expect("plan");
+        assert!(plan.merge);
+        assert_eq!(plan.parts.len(), 2);
+        assert!(
+            plan.parts[0]
+                .url
+                .ends_with("esatn@20260707T1730@0.5_1.3_2.1@DBZH_TH.h5")
+        );
+        assert!(
+            plan.parts[1]
+                .url
+                .ends_with("esatn@20260707T1727@0.5_1.5@DBZH_VRADH.h5")
+        );
+        assert!(plan.identity.starts_with("esatn_20260707T1730_p2_h"));
+        // The pair is a complete frame: the Doppler part alone already
+        // carries reflectivity and velocity.
+        let candidate =
+            plan_candidate_from_keys("esatn", ObjectKind::Pvol, &fixture_keys(ESATN_HOUR))
+                .expect("candidate");
+        assert_eq!(candidate.quality, OrdPlanQuality::ReflectivityAndVelocity);
+    }
+
+    #[test]
+    fn spain_doppler_only_tail_still_plans_a_complete_frame() {
+        // Between the :x7 Doppler upload and the next :x0 long-range
+        // upload the newest stamp is the DBZH_VRADH volume alone. It
+        // carries both reflectivity and velocity itself, so the frame
+        // advances to it instead of waiting out the three-minute gap.
+        let keys: Vec<String> = fixture_keys(ESATN_HOUR)
+            .into_iter()
+            .filter(|key| !key.contains("T1730@"))
+            .collect();
+        let candidate =
+            plan_candidate_from_keys("esatn", ObjectKind::Pvol, &keys).expect("candidate");
+        assert_eq!(candidate.quality, OrdPlanQuality::ReflectivityAndVelocity);
+        assert!(!candidate.frame.merge);
+        assert_eq!(candidate.frame.parts.len(), 1);
+        assert!(
+            candidate.frame.parts[0]
+                .url
+                .ends_with("esatn@20260707T1727@0.5_1.5@DBZH_VRADH.h5")
+        );
+    }
+
+    #[test]
+    fn spain_catalog_spans_mainland_and_the_canary_islands() {
+        // Live ES site listing (2026-07-07) resolves to the 11 AEMET
+        // sites with static coordinates.
+        let listing = parse_s3_style_listing(ES_SITE_PREFIXES).expect("fixture parses");
+        let listed = sites_from_prefixes(&listing.common_prefixes);
+        assert_eq!(listed.len(), 11, "all 11 AEMET radars");
+        assert!(listed.iter().all(|site| site.country == "Spain"));
+        assert!(
+            listed
+                .iter()
+                .all(|site| site.latitude_deg.is_some() && site.longitude_deg.is_some()),
+            "every ES site must carry static coordinates"
+        );
+
+        let spain: Vec<_> = OrdProvider::new()
+            .static_sites()
+            .into_iter()
+            .filter(|site| site.country == "Spain")
+            .collect();
+        let ids: Vec<&str> = spain.iter().map(|site| site.site_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "esahr", "esatn", "esbnv", "esclg", "esgld", "eslid", "esnjr", "espdg", "essft",
+                "essse", "estjv"
+            ]
+        );
+        assert!(
+            listed
+                .iter()
+                .all(|site| ids.contains(&site.site_id.as_str()))
+        );
+        // The network spans two worlds: the Canary Islands (Artenara on
+        // Gran Canaria, Buenavista Norte on Tenerife, below 29°N and west
+        // of 13°W) and the mainland (nine sites north of 36°N).
+        let canaries: Vec<&str> = spain
+            .iter()
+            .filter(|site| site.longitude_deg.unwrap_or(0.0) < -13.0)
+            .map(|site| site.site_id.as_str())
+            .collect();
+        assert_eq!(canaries, ["esatn", "esbnv"]);
+        assert!(
+            spain
+                .iter()
+                .filter(|site| !canaries.contains(&site.site_id.as_str()))
+                .all(|site| {
+                    site.latitude_deg.unwrap_or(0.0) > 36.0
+                        && site.longitude_deg.unwrap_or(99.0) > -7.0
+                }),
+            "mainland sites sit inside the Iberian box"
+        );
     }
 
     #[test]
@@ -2348,11 +2481,11 @@ mod tests {
         let provider = OrdProvider::new();
         let sites = provider.list_sites().expect("live ORD site list");
         println!("{} ORD sites listed live", sites.len());
-        assert!(sites.len() >= 30, "expected most of the 74 catalog sites");
+        assert!(sites.len() >= 30, "expected most of the 85 catalog sites");
 
-        // One bundled-PVOL country (NL), one split-PVOL country (NO/PL),
-        // and one SCAN country (FR).
-        for probe in ["nlhrw", "nohur", "plram", "frtou", "hrbil"] {
+        // One bundled-PVOL country (NL), split-PVOL countries (NO/PL and
+        // Spain's dual-DBZH AEMET pairing), and one SCAN country (FR).
+        for probe in ["nlhrw", "nohur", "plram", "frtou", "hrbil", "esatn"] {
             let site = sites
                 .iter()
                 .find(|site| site.site_id == probe)

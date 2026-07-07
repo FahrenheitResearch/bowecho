@@ -1287,7 +1287,7 @@ mod tests {
     /// (radars sit on national territory; a swapped lat/lon, a missing
     /// minus sign, or a degrees/radians slip all land far outside).
     /// `(lat_min, lat_max, lon_min, lon_max)` for each SITE country — the
-    /// multi-country ORD provider spans 14 of them, so the lookup keys off
+    /// multi-country ORD provider spans 15 of them, so the lookup keys off
     /// [`IntlSite::country`] rather than the provider's own label.
     fn national_bounding_box(country: &str) -> Option<(f32, f32, f32, f32)> {
         Some(match country {
@@ -1306,6 +1306,9 @@ mod tests {
             "Belgium" => (49.4, 51.6, 2.4, 6.5),
             "Switzerland" => (45.7, 47.9, 5.9, 10.6),
             "Estonia" => (57.4, 59.8, 21.6, 28.3),
+            // Spain incl. the Canary Islands (AEMET's esatn/esbnv sit on
+            // Gran Canaria and Tenerife near 28°N, 17°W).
+            "Spain" => (27.5, 44.0, -18.5, 4.5),
             "France" => (41.2, 51.2, -5.3, 9.7),
             "Croatia" => (42.3, 46.6, 13.4, 19.5),
             "Ireland" => (51.3, 55.5, -10.7, -5.9),
