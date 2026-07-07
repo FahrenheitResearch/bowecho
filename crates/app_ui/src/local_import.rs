@@ -2,16 +2,23 @@
 //! `rusty-weather-ui` shell (rev edb9d277) so BowEcho can ingest a WRF run
 //! folder into the model store directly, without the standalone shell.
 //!
-//! Reads 2D surface fields through `netcrust` and (for raw wrfout) the
-//! isobaric sounding volumes through `wrf-core`, then writes each file as one
-//! forecast-hour slot via `rw_store::write_hour_from_fields_with_derived`.
-//! Imported runs then sound through the existing ModelDataDock skew-T path.
+//! `netcrust` provides the 2D metadata (variable list, dims, units, global
+//! attrs) for every file; for raw wrfout the 2D data PLANES and the isobaric
+//! sounding volumes are decoded through `wrf-core`'s single-timestep reader
+//! (netcrust's `hdf5-reader` path burns ~10 s + ~8M minor page faults per
+//! 800×800 plane on compressed 250 m wrfouts — allocation churn, see
+//! docs/wrf-import-large-grids.md — while wrf-core reads the same slice in
+//! tens of ms). Plain NetCDF and post-processed climate files stay entirely
+//! on netcrust. Each file is written as one forecast-hour slot via
+//! `rw_store::write_hour_from_fields_with_derived`; imported runs then sound
+//! through the existing ModelDataDock skew-T path.
 #![allow(dead_code)]
 // Ported verbatim: `push_direct` threads the netcrust handle + grid + selector
 // as separate args, and `try_postprocessed_wrf` returns the nested field/volume
 // tuple the store writer consumes. Both are the upstream API shape.
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
@@ -165,12 +172,20 @@ fn import_paths(
         // Every stage line carries the file position, so a folder import reads
         // "file 3/10 (wrfout_…): interpolating …" rather than a bare spinner.
         let tag = format!("file {}/{total} ({})", index + 1, display_name(path));
+        // One netcrust handle per file: `netcrust::open` eagerly indexes the
+        // NetCDF-4 metadata twice over (NcFile + Hdf5File — ~57 s of
+        // hdf5-reader churn on a 2 GB Enderlin wrfout, measured), so the
+        // post-processed gate and the 2D reader below must share it. A file
+        // netcrust can't open would have failed `read_wrf_2d_fields` with
+        // this same error before; it just surfaces one stage earlier now.
+        let nc = netcrust::open(path)?;
         // Post-processed climate wrfout (CONUS-I/II, GDEX: derived TK/Z/P, no
         // raw T/PB) can't go through the raw-wrfout reader — build it directly.
         // (Bound before the `if let` so the prefixing closure's borrow of
         // `progress` ends before the block uses `progress` again.)
-        let postprocessed =
-            try_postprocessed_wrf(path, &mut |message| progress(format!("{tag}: {message}")))?;
+        let postprocessed = try_postprocessed_wrf_shared(&nc, path, &mut |message| {
+            progress(format!("{tag}: {message}"))
+        })?;
         if let Some((canonical, volumes)) = postprocessed {
             let refs = canonical
                 .iter()
@@ -194,8 +209,20 @@ fn import_paths(
             continue;
         }
         progress(format!("{tag}: reading 2D surface fields"));
-        let mut fields =
-            read_wrf_2d_fields(path, &mut |message| progress(format!("{tag}: {message}")))?;
+        // One wrf-core handle per raw wrfout, shared by the fast 2D plane
+        // reads AND the isobaric volume build. `None` (plain NetCDF, or a
+        // panic on a pathological header) keeps every 2D read on netcrust
+        // and skips the volumes — exactly the pre-fast-path behavior.
+        let wrf_file = crate::wrf_process::isolate_panics("open WRF file", || {
+            WrfFile::open(path).map_err(|err| err.to_string())
+        })
+        .ok();
+        let mut fields = read_wrf_2d_fields(&nc, path, wrf_file.as_ref(), &mut |message| {
+            progress(format!("{tag}: {message}"))
+        })?;
+        // Release the netcrust metadata/mmap before the volume build + store
+        // write, matching the lifetime the per-stage opens used to have.
+        drop(nc);
         if fields.canonical.is_empty() {
             return Err(ImportError::NoFields(path.clone()));
         }
@@ -204,7 +231,9 @@ fn import_paths(
         // NetCDF wrf-core can't open yields neither. Fill any surface field the
         // 2D read missed (e.g. PSFC in a split wrf3d file) from the fallback.
         let (iso_volumes, surface_fallback, volume_note) =
-            read_iso_volumes(path, &mut |message| progress(format!("{tag}: {message}")));
+            read_iso_volumes(wrf_file.as_ref(), &mut |message| {
+                progress(format!("{tag}: {message}"))
+            });
         if let Some(note) = volume_note {
             progress(format!("{tag}: {note}"));
             notes.push(format!("{}: {note}", display_name(path)));
@@ -272,23 +301,25 @@ fn import_paths(
 }
 
 fn read_wrf_2d_fields(
+    nc: &NcFile,
     path: &Path,
+    wrf: Option<&WrfFile>,
     progress: &mut dyn FnMut(String),
 ) -> Result<ImportedWrfFields, ImportError> {
-    let nc = netcrust::open(path)?;
-    let lat = read_first_2d_any(&nc, &["XLAT", "XLAT_M", "lat", "latitude"])?;
-    let lon = read_first_2d_any(&nc, &["XLONG", "XLONG_M", "lon", "longitude"])?;
+    let src = PlaneSource::new(nc, wrf);
+    let lat = read_first_2d_any(&src, &["XLAT", "XLAT_M", "lat", "latitude"])?;
+    let lon = read_first_2d_any(&src, &["XLONG", "XLONG_M", "lon", "longitude"])?;
     if lat.nx != lon.nx || lat.ny != lon.ny || lat.values.len() != lon.values.len() {
         return Err(ImportError::GridMismatch(path.to_path_buf()));
     }
     let shape = GridShape::new(lat.nx, lat.ny)?;
     let grid = LatLonGrid::new(shape, lat.values, lon.values)?;
-    let projection = wrf_projection(&nc);
+    let projection = wrf_projection(nc);
     let mut canonical = Vec::new();
 
     push_direct(
         &mut canonical,
-        &nc,
+        &src,
         &grid,
         projection.clone(),
         "T2",
@@ -298,7 +329,7 @@ fn read_wrf_2d_fields(
     )?;
     push_direct(
         &mut canonical,
-        &nc,
+        &src,
         &grid,
         projection.clone(),
         "U10",
@@ -308,7 +339,7 @@ fn read_wrf_2d_fields(
     )?;
     push_direct(
         &mut canonical,
-        &nc,
+        &src,
         &grid,
         projection.clone(),
         "V10",
@@ -318,7 +349,7 @@ fn read_wrf_2d_fields(
     )?;
     push_direct(
         &mut canonical,
-        &nc,
+        &src,
         &grid,
         projection.clone(),
         "PSFC",
@@ -328,7 +359,7 @@ fn read_wrf_2d_fields(
     )?;
     push_direct(
         &mut canonical,
-        &nc,
+        &src,
         &grid,
         projection.clone(),
         "HGT",
@@ -338,7 +369,7 @@ fn read_wrf_2d_fields(
     )?;
     push_direct(
         &mut canonical,
-        &nc,
+        &src,
         &grid,
         projection.clone(),
         "SLP",
@@ -348,7 +379,7 @@ fn read_wrf_2d_fields(
     )?;
     push_direct(
         &mut canonical,
-        &nc,
+        &src,
         &grid,
         projection.clone(),
         "REFD_MAX",
@@ -358,7 +389,7 @@ fn read_wrf_2d_fields(
     )?;
     push_direct(
         &mut canonical,
-        &nc,
+        &src,
         &grid,
         projection.clone(),
         "WSPD10MAX",
@@ -367,7 +398,7 @@ fn read_wrf_2d_fields(
         Some("m/s"),
     )?;
 
-    if let (Some(u10), Some(v10)) = (read_first_2d(&nc, "U10")?, read_first_2d(&nc, "V10")?) {
+    if let (Some(u10), Some(v10)) = (read_first_2d(&src, "U10")?, read_first_2d(&src, "V10")?) {
         let values = combine_same_grid(&u10, &v10, |u, v| (u.mul_add(u, v * v)).sqrt())?;
         push_computed(
             &mut canonical,
@@ -381,9 +412,9 @@ fn read_wrf_2d_fields(
     }
 
     if let (Some(t2), Some(q2), Some(psfc)) = (
-        read_first_2d(&nc, "T2")?,
-        read_first_2d(&nc, "Q2")?,
-        read_first_2d(&nc, "PSFC")?,
+        read_first_2d(&src, "T2")?,
+        read_first_2d(&src, "Q2")?,
+        read_first_2d(&src, "PSFC")?,
     ) {
         let dewpoint = derive_dewpoint_k(&t2, &q2, &psfc)?;
         push_computed(
@@ -407,10 +438,11 @@ fn read_wrf_2d_fields(
         )?;
     }
 
-    if let (Some(rainc), Some(rainnc)) =
-        (read_first_2d(&nc, "RAINC")?, read_first_2d(&nc, "RAINNC")?)
-    {
-        let rainsh = read_first_2d(&nc, "RAINSH")?;
+    if let (Some(rainc), Some(rainnc)) = (
+        read_first_2d(&src, "RAINC")?,
+        read_first_2d(&src, "RAINNC")?,
+    ) {
+        let rainsh = read_first_2d(&src, "RAINSH")?;
         let values = combine_precip(&rainc, &rainnc, rainsh.as_ref())?;
         push_computed(
             &mut canonical,
@@ -423,7 +455,27 @@ fn read_wrf_2d_fields(
         )?;
     }
 
-    let raw_2d = read_raw_wrf_mass_grid_fields(&nc, lat.nx, lat.ny, progress)?;
+    let raw_2d = read_raw_wrf_mass_grid_fields(&src, lat.nx, lat.ny, progress)?;
+
+    // Surface how the planes were actually decoded: the stage timestamps in
+    // the instrumented harness (and the dock) should show whether the fast
+    // path engaged and which planes, if any, wrf-core could not read.
+    if wrf.is_some() {
+        let fallbacks = src.netcrust_fallbacks.borrow();
+        if fallbacks.is_empty() {
+            progress(format!(
+                "read {} 2D planes via wrf-core reader",
+                src.wrf_reads.get()
+            ));
+        } else {
+            progress(format!(
+                "read {} 2D planes via wrf-core reader; {} fell back to netcrust: {}",
+                src.wrf_reads.get(),
+                fallbacks.len(),
+                fallbacks.join(", ")
+            ));
+        }
+    }
 
     Ok(ImportedWrfFields {
         canonical,
@@ -435,7 +487,7 @@ fn read_wrf_2d_fields(
 
 fn push_direct(
     out: &mut Vec<(String, SelectedField2D)>,
-    nc: &NcFile,
+    src: &PlaneSource,
     grid: &LatLonGrid,
     projection: Option<GridProjection>,
     wrf_name: &str,
@@ -443,12 +495,12 @@ fn push_direct(
     selector: FieldSelector,
     units_override: Option<&str>,
 ) -> Result<(), ImportError> {
-    let Some(plane) = read_first_2d(nc, wrf_name)? else {
+    let Some(plane) = read_first_2d(src, wrf_name)? else {
         return Ok(());
     };
     let units = units_override
         .map(str::to_string)
-        .or_else(|| variable_units(nc, wrf_name))
+        .or_else(|| variable_units(src.nc, wrf_name))
         .unwrap_or_else(|| selector.native_units().to_string());
     push_computed(
         out,
@@ -479,14 +531,14 @@ fn push_computed(
 }
 
 fn read_raw_wrf_mass_grid_fields(
-    nc: &NcFile,
+    src: &PlaneSource,
     nx: usize,
     ny: usize,
     progress: &mut dyn FnMut(String),
 ) -> Result<Vec<RawField2D>, ImportError> {
     let mut seen = HashSet::<String>::new();
     let mut raw = Vec::new();
-    for var in nc.variables()? {
+    for var in src.nc.variables()? {
         let wrf_name = var.name();
         if !is_raw_wrf_mass_grid_variable(&var, nx, ny) || !raw_wrf_variable_allowed(wrf_name) {
             continue;
@@ -494,7 +546,7 @@ fn read_raw_wrf_mass_grid_fields(
         // One line per raw plane: on a compressed 250 m wrfout each first-
         // record read decompresses real data, and there are dozens of them.
         progress(format!("reading raw 2D field {wrf_name}"));
-        let Some(plane) = read_first_2d(nc, wrf_name)? else {
+        let Some(plane) = read_first_2d(src, wrf_name)? else {
             continue;
         };
         if plane.nx != nx || plane.ny != ny {
@@ -506,7 +558,7 @@ fn read_raw_wrf_mass_grid_fields(
         }
         raw.push(RawField2D {
             name,
-            units: variable_units(nc, wrf_name).unwrap_or_else(|| "1".to_string()),
+            units: variable_units(src.nc, wrf_name).unwrap_or_else(|| "1".to_string()),
             values: plane.values,
         });
     }
@@ -571,9 +623,40 @@ struct Plane2D {
     values: Vec<f32>,
 }
 
-fn read_first_2d_any(nc: &NcFile, names: &[&str]) -> Result<Plane2D, ImportError> {
+/// One file's 2-D plane source. `netcrust` always provides the metadata
+/// (variable existence, dims, shapes, units); when `wrf` is set (raw wrfout)
+/// the plane DATA is decoded through wrf-core's single-timestep reader
+/// instead of netcrust's `hdf5-reader` path, which was measured at ~10.3 s
+/// and ~8M minor page faults per 800×800 plane on compressed 250 m wrfouts
+/// (allocation churn — docs/wrf-import-large-grids.md) versus tens of ms
+/// for wrf-core reading the same slice.
+struct PlaneSource<'a> {
+    nc: &'a NcFile,
+    wrf: Option<&'a WrfFile>,
+    /// Planes decoded via wrf-core (the fast path actually engaged).
+    wrf_reads: Cell<usize>,
+    /// WRF-layout planes wrf-core failed to read, served by netcrust instead.
+    netcrust_fallbacks: RefCell<Vec<String>>,
+}
+
+impl<'a> PlaneSource<'a> {
+    fn new(nc: &'a NcFile, wrf: Option<&'a WrfFile>) -> Self {
+        Self {
+            nc,
+            wrf,
+            wrf_reads: Cell::new(0),
+            netcrust_fallbacks: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn netcrust_only(nc: &'a NcFile) -> Self {
+        Self::new(nc, None)
+    }
+}
+
+fn read_first_2d_any(src: &PlaneSource, names: &[&str]) -> Result<Plane2D, ImportError> {
     for name in names {
-        if let Some(plane) = read_first_2d(nc, name)? {
+        if let Some(plane) = read_first_2d(src, name)? {
             return Ok(plane);
         }
     }
@@ -582,12 +665,70 @@ fn read_first_2d_any(nc: &NcFile, names: &[&str]) -> Result<Plane2D, ImportError
     ))
 }
 
-fn read_first_2d(nc: &NcFile, name: &str) -> Result<Option<Plane2D>, ImportError> {
+fn read_first_2d(src: &PlaneSource, name: &str) -> Result<Option<Plane2D>, ImportError> {
+    let Some(var) = src.nc.variable(name) else {
+        return Ok(None);
+    };
+    // Fast path: for the `[Time, …, ny, nx]` record layout — exactly the case
+    // netcrust's first-record read would hyperslab — decode the timestep-0
+    // slice through wrf-core instead. Identical value positions: both paths
+    // yield the record's `…, ny, nx` values, and `plane_from_last_record`
+    // applies the same tail-plane + f32 narrowing to either. Anything else
+    // (no Time dim, rank < 3, unexpected length, wrf-core read error) keeps
+    // the legacy netcrust read byte-for-byte.
+    if let Some(wrf) = src.wrf {
+        let dims = var.dimensions();
+        let shape = var.shape();
+        if dims.len() >= 3 && shape.len() == dims.len() && dims[0].name() == "Time" {
+            let expected = shape[1..]
+                .iter()
+                .try_fold(1usize, |acc, &dim| acc.checked_mul(dim));
+            let outcome = match expected {
+                None => Err("dimension product overflows usize".to_string()),
+                Some(expected) => match wrf.read_var(name, 0) {
+                    Ok(values) if values.len() == expected => Ok(values),
+                    Ok(values) => Err(format!("expected {expected} values, got {}", values.len())),
+                    Err(err) => Err(err.to_string()),
+                },
+            };
+            match outcome {
+                Ok(values) => {
+                    src.wrf_reads.set(src.wrf_reads.get() + 1);
+                    return plane_from_last_record(name, &shape[1..], &values);
+                }
+                // Carry the WHY: the fallback summary line is how a plane
+                // that is genuinely only reachable via netcrust gets reported.
+                Err(reason) => src
+                    .netcrust_fallbacks
+                    .borrow_mut()
+                    .push(format!("{name} ({reason})")),
+            }
+        }
+    }
+    read_first_2d_netcrust(src.nc, name)
+}
+
+/// Legacy netcrust plane read — the pre-fast-path implementation, kept intact
+/// as the fallback for non-wrfout files (and the reference side of the
+/// value-identity fixture test).
+fn read_first_2d_netcrust(nc: &NcFile, name: &str) -> Result<Option<Plane2D>, ImportError> {
     if nc.variable(name).is_none() {
         return Ok(None);
     }
     let array = nc.read_array_f64_first_record_or_all(name)?;
-    let shape = array.shape();
+    plane_from_last_record(name, array.shape(), array.values())
+}
+
+/// Build a [`Plane2D`] from the LAST `ny * nx` values of a decoded record,
+/// with the non-finite → NaN f32 narrowing both read paths share. `shape` is
+/// the decoded record's shape (`…, ny, nx`); a leading level dimension means
+/// the deepest plane wins — the tail-of-record convention the netcrust read
+/// has always used.
+fn plane_from_last_record(
+    name: &str,
+    shape: &[usize],
+    values: &[f64],
+) -> Result<Option<Plane2D>, ImportError> {
     if shape.len() < 2 {
         return Ok(None);
     }
@@ -596,7 +737,6 @@ fn read_first_2d(nc: &NcFile, name: &str) -> Result<Option<Plane2D>, ImportError
     let cells = nx
         .checked_mul(ny)
         .ok_or_else(|| ImportError::BadShape(name.to_string(), shape.to_vec()))?;
-    let values = array.values();
     if values.len() < cells {
         return Err(ImportError::BadShape(name.to_string(), shape.to_vec()));
     }
@@ -843,15 +983,16 @@ fn now_unix() -> u64 {
 }
 
 /// Build isobaric sounding volumes for one WRF file via wrf-core (time index 0,
-/// matching the single-record 2D import). Returns empty for files wrf-core
-/// cannot open (e.g. plain NetCDF) or whose 3D fields are unavailable, so the
-/// 2D import still succeeds; the third element carries the human-readable
-/// reason when the volumes degraded on a file wrf-core DID open.
+/// matching the single-record 2D import). `file` is the handle `import_paths`
+/// opened for the fast 2D reads; `None` (plain NetCDF wrf-core can't open)
+/// yields no volumes so the 2D import still succeeds. The third element
+/// carries the human-readable reason when the volumes degraded on a file
+/// wrf-core DID open.
 fn read_iso_volumes(
-    path: &Path,
+    file: Option<&WrfFile>,
     progress: &mut dyn FnMut(String),
 ) -> (Vec<IsoVolume>, Option<SurfaceFallback>, Option<String>) {
-    let Ok(file) = WrfFile::open(path) else {
+    let Some(file) = file else {
         // Plain NetCDF with no WRF 3D state — a 2D-only import, not a note.
         return (Vec::new(), None, None);
     };
@@ -860,7 +1001,7 @@ fn read_iso_volumes(
     // wrf-core panic on a pathological grid must degrade to "no soundings",
     // not unwind the rw-ui-local-import worker and lose the whole import.
     let result = crate::wrf_process::isolate_panics("isobaric volumes", || {
-        build_iso_volumes(&file, 0, cells, progress)
+        build_iso_volumes(file, 0, cells, progress)
     });
     match result {
         Ok((volumes, surface)) => (volumes, Some(surface), None),
@@ -945,6 +1086,18 @@ pub(crate) fn try_postprocessed_wrf(
     let Ok(nc) = netcrust::open(path) else {
         return Ok(None);
     };
+    try_postprocessed_wrf_shared(&nc, path, progress)
+}
+
+/// [`try_postprocessed_wrf`] against an already-open netcrust handle, so the
+/// light import's per-file loop pays `netcrust::open`'s eager NetCDF-4
+/// metadata indexing once, not once per stage (~57 s per open on a 2 GB
+/// compressed 250 m wrfout — docs/wrf-import-large-grids.md).
+fn try_postprocessed_wrf_shared(
+    nc: &NcFile,
+    path: &Path,
+    progress: &mut dyn FnMut(String),
+) -> Result<Option<(Vec<(String, SelectedField2D)>, Vec<IsoVolume>)>, ImportError> {
     let is_postprocessed = nc.variable("TK").is_some()
         && nc.variable("Z").is_some()
         && nc.variable("P").is_some()
@@ -953,8 +1106,11 @@ pub(crate) fn try_postprocessed_wrf(
         return Ok(None);
     }
 
-    let lat = read_first_2d_any(&nc, &["XLAT", "XLAT_M", "lat", "latitude"])?;
-    let lon = read_first_2d_any(&nc, &["XLONG", "XLONG_M", "lon", "longitude"])?;
+    // Post-processed climate files stay entirely on netcrust: wrf-core can't
+    // open them (no raw T/PB), so there is no fast plane path here.
+    let src = PlaneSource::netcrust_only(nc);
+    let lat = read_first_2d_any(&src, &["XLAT", "XLAT_M", "lat", "latitude"])?;
+    let lon = read_first_2d_any(&src, &["XLONG", "XLONG_M", "lon", "longitude"])?;
     if lat.nx != lon.nx || lat.ny != lon.ny {
         return Err(ImportError::GridMismatch(path.to_path_buf()));
     }
@@ -964,7 +1120,7 @@ pub(crate) fn try_postprocessed_wrf(
         .ok_or_else(|| ImportError::BadShape("grid".to_string(), vec![ny, nx]))?;
     let shape = GridShape::new(nx, ny)?;
     let grid = LatLonGrid::new(shape, lat.values, lon.values)?;
-    let projection = wrf_projection(&nc);
+    let projection = wrf_projection(nc);
 
     // 3D mass-point state. `read3d` verifies the horizontal shape and returns
     // the level count. `into_values` hands back the decoded buffer without a
@@ -995,8 +1151,8 @@ pub(crate) fn try_postprocessed_wrf(
 
     // Destagger the C-grid winds to mass points.
     progress("destaggering U/V winds to mass points".to_string());
-    let u_mass = destagger_x(&nc, "U", nz, ny, nx)?;
-    let v_mass = destagger_y(&nc, "V", nz, ny, nx)?;
+    let u_mass = destagger_x(nc, "U", nz, ny, nx)?;
+    let v_mass = destagger_y(nc, "V", nz, ny, nx)?;
 
     let p_hpa: Vec<f64> = p_pa.iter().map(|pa| pa / 100.0).collect();
     let dewpoint_k: Vec<f64> = qv
@@ -1246,6 +1402,141 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(store_root);
+    }
+
+    /// Value-identity proof for the fast 2-D read path
+    /// (docs/wrf-import-large-grids.md): on the real wrfout fixture
+    /// (`RW_LOCAL_IMPORT_FIXTURE`, same resolution as
+    /// `optional_wrf_fixture_imports_to_store`), every `[Time, …, ny, nx]`
+    /// plane must be BIT-identical between the legacy netcrust read
+    /// (`read_first_2d_netcrust`) and the wrf-core fast path, the fast path
+    /// must actually engage for every such plane (no silent netcrust
+    /// fallback), and the end-to-end 2-D field set the import builds
+    /// (canonical + raw + grid) must match name-for-name, unit-for-unit,
+    /// bit-for-bit between `read_wrf_2d_fields` with and without the wrf-core
+    /// handle.
+    #[test]
+    fn optional_wrf_fixture_fast_and_netcrust_2d_reads_match() {
+        let Ok(fixture) = std::env::var("RW_LOCAL_IMPORT_FIXTURE") else {
+            eprintln!("skipping WRF read-path identity; set RW_LOCAL_IMPORT_FIXTURE");
+            return;
+        };
+        let path = PathBuf::from(&fixture);
+        let nc = netcrust::open(&path).expect("netcrust opens the fixture");
+        let wrf = WrfFile::open(&path).expect("wrf-core opens the wrfout fixture");
+
+        // Per-plane sweep: every WRF-record-layout variable in the file — a
+        // superset of the planes the import reads (canonical names, derived
+        // inputs, and the raw mass-grid loop all go through read_first_2d).
+        let slow = PlaneSource::netcrust_only(&nc);
+        let fast = PlaneSource::new(&nc, Some(&wrf));
+        let mut compared = 0usize;
+        for var in nc.variables().expect("list fixture variables") {
+            let name = var.name();
+            let dims = var.dimensions();
+            if dims.len() < 3 || dims[0].name() != "Time" {
+                continue;
+            }
+            let legacy = read_first_2d(&slow, name)
+                .unwrap_or_else(|err| panic!("{name}: netcrust read failed: {err}"))
+                .unwrap_or_else(|| panic!("{name}: netcrust read yielded no plane"));
+            let routed = read_first_2d(&fast, name)
+                .unwrap_or_else(|err| panic!("{name}: fast-path read failed: {err}"))
+                .unwrap_or_else(|| panic!("{name}: fast-path read yielded no plane"));
+            assert_eq!(
+                (legacy.nx, legacy.ny),
+                (routed.nx, routed.ny),
+                "{name}: plane shape differs between read paths"
+            );
+            assert_bits_eq(name, &legacy.values, &routed.values);
+            compared += 1;
+        }
+        assert!(
+            compared >= 20,
+            "fixture only exposed {compared} record-layout planes — wrong fixture?"
+        );
+        assert_eq!(
+            fast.wrf_reads.get(),
+            compared,
+            "every record-layout plane must take the wrf-core fast path"
+        );
+        assert!(
+            fast.netcrust_fallbacks.borrow().is_empty(),
+            "unexpected netcrust fallbacks: {:?}",
+            fast.netcrust_fallbacks.borrow()
+        );
+        eprintln!("read-path identity: {compared} planes bit-identical");
+
+        // End-to-end: the exact field set the import writes, both routes.
+        let legacy_fields =
+            read_wrf_2d_fields(&nc, &path, None, &mut |_: String| {}).expect("legacy 2D read");
+        let fast_fields = read_wrf_2d_fields(&nc, &path, Some(&wrf), &mut |_: String| {})
+            .expect("fast-path 2D read");
+        assert_bits_eq(
+            "grid latitudes",
+            &legacy_fields.grid.lat_deg,
+            &fast_fields.grid.lat_deg,
+        );
+        assert_bits_eq(
+            "grid longitudes",
+            &legacy_fields.grid.lon_deg,
+            &fast_fields.grid.lon_deg,
+        );
+        assert_eq!(
+            legacy_fields
+                .canonical
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            fast_fields
+                .canonical
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            "canonical field names/ordering changed"
+        );
+        for ((name, legacy), (_, routed)) in
+            legacy_fields.canonical.iter().zip(&fast_fields.canonical)
+        {
+            assert_eq!(legacy.units, routed.units, "{name}: units changed");
+            assert_bits_eq(name, &legacy.values, &routed.values);
+        }
+        assert_eq!(
+            legacy_fields
+                .raw_2d
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            fast_fields
+                .raw_2d
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            "raw field names/ordering changed"
+        );
+        for (legacy, routed) in legacy_fields.raw_2d.iter().zip(&fast_fields.raw_2d) {
+            assert_eq!(legacy.units, routed.units, "{}: units changed", legacy.name);
+            assert_bits_eq(&legacy.name, &legacy.values, &routed.values);
+        }
+        eprintln!(
+            "end-to-end identity: {} canonical + {} raw fields bit-identical",
+            legacy_fields.canonical.len(),
+            legacy_fields.raw_2d.len()
+        );
+    }
+
+    /// Bitwise f32 equality (NaN == NaN: both read paths narrow every
+    /// non-finite source value to the same `f32::NAN` constant).
+    fn assert_bits_eq(name: &str, legacy: &[f32], routed: &[f32]) {
+        assert_eq!(legacy.len(), routed.len(), "{name}: plane length differs");
+        for (index, (a, b)) in legacy.iter().zip(routed).enumerate() {
+            assert!(
+                a.to_bits() == b.to_bits(),
+                "{name}[{index}]: {a} ({:#010x}) != {b} ({:#010x})",
+                a.to_bits(),
+                b.to_bits()
+            );
+        }
     }
 
     /// Peak resident set (Linux `VmHWM`), for the instrumented fixture runs on

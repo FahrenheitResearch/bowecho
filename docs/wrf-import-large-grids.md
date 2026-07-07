@@ -116,6 +116,7 @@ Enderlin `wrfout_d03_2025-06-21_02_15_00` (2.05 GB, 800×800×79):
 |---|---|---|
 | before (`d0af0b1`) | 1241 s (20:41) | 7.20 GB |
 | after (`9c95975`) | 1235 s (20:35) | 6.81 GB |
+| fast reads (`2242750`, 2026-07-07) | **91 s (1:31)** | 6.74 GB |
 
 Findings and fixes:
 
@@ -161,3 +162,45 @@ Findings and fixes:
 - The harness is `local_import::tests::optional_wrf_fixture_imports_to_store`
   (env `RW_LOCAL_IMPORT_FIXTURE`, `--nocapture`): timestamps every progress
   line and prints peak RSS (`VmHWM`) at the end. Release only on large grids.
+
+### Fast plane reads (2026-07-07, `f624ef2` + `2242750`) — 1241 s → 91 s
+
+The reroute proposed above is in: for raw wrfout, `local_import` now decodes
+every `[Time, …, ny, nx]` 2-D plane through **wrf-core's single-timestep
+reader** (`WrfFile::read_var`), while netcrust remains the sole metadata
+source (variable list, dim names, shapes, units, global attrs) and the sole
+data path for plain NetCDF, the post-processed climate reader, non-record
+layouts, and any plane wrf-core fails on (per-file progress line reports the
+count and each fallback's reason). The per-file loop also opens netcrust
+ONCE — `netcrust::open` eagerly indexes NetCDF-4 metadata twice over
+(NcFile + Hdf5File, both through the churny `hdf5-reader`; ~57 s per open on
+this file) and the old code paid it in both `try_postprocessed_wrf` and
+`read_wrf_2d_fields`.
+
+Enderlin `02_15_00` after-breakdown (release, node4, `/usr/bin/time -v`):
+**91 s wall, 6.74 GB peak RSS** (18 s user / 75 s system, 58 M minor faults),
+120 store variables — identical field set. Stages: 57.8 s `netcrust::open`
+(the remaining churn — upstream), 21.5 s all ~120 2-D planes (≈1 s for the
+118 via wrf-core + ~20.5 s for IVGTYP + ISLTYP, which fall back to netcrust
+because wrf-core's HDF5 parser reports "No layout message in dataset object
+header" for those two int datasets — a second upstream item for wrf-rust),
+9.9 s sounding volumes, 1.3 s interpolation, 0.4 s store write. Peak RSS is
+unchanged by design — it is the wrf-core getvar-cache peak documented above,
+not the read path.
+
+Value identity is guarded by
+`local_import::tests::optional_wrf_fixture_fast_and_netcrust_2d_reads_match`
+(env `RW_LOCAL_IMPORT_FIXTURE`): every record-layout plane bit-identical
+between `read_first_2d_netcrust` and the wrf-core path (with fast-path
+engagement asserted, so a silently-disabled reroute fails the test), plus
+name/unit/bit identity of the full canonical + raw + grid field set.
+
+Remaining upstream asks, in order of payoff on this file: (1) netcrust /
+`hdf5-reader` open-time metadata indexing (57.8 s of the 91 s); (2) wrf-core
+HDF5 object-header layout parsing for `IVGTYP`/`ISLTYP`-style int datasets
+(~20.5 s); (3) the getvar cache bound for the ~6.7 GB peak, unchanged from
+the section above. The full-diagnostics path (`wrf_process.rs`) never used
+netcrust for plane data (all reads go through wrf-core `getvar`), but it DOES
+pay one `netcrust::open` per file inside its `try_postprocessed_wrf` gate —
+~57 s of its ~275 s on this file; worth the same shared-handle treatment if
+the heavy path is revisited.
