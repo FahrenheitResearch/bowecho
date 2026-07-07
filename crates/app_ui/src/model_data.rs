@@ -153,6 +153,12 @@ struct SyntheticRadarUiState {
     /// memory as the default instead of 4× more.
     #[serde(default = "wrf_default_true")]
     auto_gate_spacing: bool,
+    /// Opt-in "gate texture": deterministic speckle on the simulated
+    /// moments so they read like real Level-II gates. Off (the default,
+    /// and what an older config restores) keeps the classic smooth
+    /// trilinear look, bit-identical to before the toggle existed.
+    #[serde(default)]
+    gate_texture: bool,
 }
 
 fn default_synth_range_km() -> f64 {
@@ -173,6 +179,7 @@ impl Default for SyntheticRadarUiState {
             max_range_km: default_synth_range_km(),
             gate_spacing_m: default_synth_gate_m(),
             auto_gate_spacing: true,
+            gate_texture: false,
         }
     }
 }
@@ -228,6 +235,7 @@ impl SyntheticRadarUiState {
         let mut config = crate::wrf_radar::SyntheticRadarConfig {
             max_range_m: self.clamped_range_km() * 1000.0,
             gate_spacing_m: self.effective_gate_spacing_m(),
+            gate_texture: self.gate_texture,
             ..crate::wrf_radar::SyntheticRadarConfig::default()
         };
         match self.placement {
@@ -1228,9 +1236,17 @@ impl ModelDataDock {
                         .small()
                         .weak(),
                     );
+                    ui.checkbox(&mut state.gate_texture, "Gate texture (experimental)")
+                        .on_hover_text(
+                            "Add subtle, deterministic gate-to-gate speckle (a couple of \
+                             dBZ, correlated along the radial) so the simulated moments \
+                             read like real Level-II gates instead of a smooth model \
+                             field; velocity only gets a slight wobble. Off = the classic \
+                             smooth look, unchanged.",
+                        );
                     if ui
                         .button("Reset to defaults")
-                        .on_hover_text("Domain centre, 230 km range, 250 m gates.")
+                        .on_hover_text("Domain centre, 230 km range, 250 m gates, smooth gates.")
                         .clicked()
                     {
                         *state = SyntheticRadarUiState::default();
@@ -1871,6 +1887,7 @@ mod tests {
         assert_eq!(empty.max_range_km, 230.0);
         assert_eq!(empty.gate_spacing_m, 250.0);
         assert!(empty.auto_gate_spacing);
+        assert!(!empty.gate_texture, "gate texture restores OFF");
 
         // A non-default selection survives the round trip.
         let custom = SyntheticRadarUiState {
@@ -1879,6 +1896,7 @@ mod tests {
             max_range_km: 460.0,
             auto_gate_spacing: false,
             gate_spacing_m: 500.0,
+            gate_texture: true,
             ..SyntheticRadarUiState::default()
         };
         let value = serde_json::to_value(&custom).unwrap();
@@ -1899,6 +1917,24 @@ mod tests {
         assert_eq!(config.antenna_msl_m, None);
         assert_eq!(config.max_range_m, historical.max_range_m);
         assert_eq!(config.gate_spacing_m, historical.gate_spacing_m);
+        assert!(
+            !config.gate_texture && !historical.gate_texture,
+            "gate texture is opt-in — defaults keep the smooth look"
+        );
+    }
+
+    /// The gate-texture checkbox flows into the scan config; everything
+    /// else stays at the historical default.
+    #[test]
+    fn synth_radar_gate_texture_toggle_flows_into_config() {
+        let state = SyntheticRadarUiState {
+            gate_texture: true,
+            ..SyntheticRadarUiState::default()
+        };
+        let config = state.to_config().unwrap();
+        assert!(config.gate_texture);
+        assert_eq!(config.max_range_m, 230_000.0);
+        assert_eq!(config.gate_spacing_m, 250.0);
     }
 
     /// NEXRAD-id placement resolves through the app's compiled-in site

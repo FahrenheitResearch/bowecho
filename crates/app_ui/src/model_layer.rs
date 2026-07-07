@@ -46,7 +46,7 @@ impl InverseLut {
     /// Build from the grid's lat/lon arrays (~a second for CONUS HRRR;
     /// run on a background thread).
     pub fn build(lat: &[f32], lon: &[f32]) -> Option<Self> {
-        Self::build_inner(lat, lon, None)
+        Self::build_inner(lat, lon, None, false)
     }
 
     /// Build from a shaped lat/lon grid. Satellite grids can be strongly
@@ -56,10 +56,42 @@ impl InverseLut {
         if nx == 0 || ny == 0 || nx.saturating_mul(ny) != lat.len() || lat.len() != lon.len() {
             return Self::build(lat, lon);
         }
-        Self::build_inner(lat, lon, Some((nx, ny)))
+        Self::build_inner(lat, lon, Some((nx, ny)), false)
     }
 
-    fn build_inner(lat: &[f32], lon: &[f32], shape: Option<(usize, usize)>) -> Option<Self> {
+    /// Build from a shaped grid whose row/column perimeter IS the true data
+    /// boundary (WRF and similar regional model domains). Identical to
+    /// [`Self::build_with_shape`] except the hole-fill dilation is confined
+    /// to bins inside that perimeter polygon, so a query point outside the
+    /// curvilinear domain edge — but still inside the rectangular lat/lon
+    /// bbox the bins cover — returns `None` instead of the nearest edge
+    /// cell (the smeared ~3-bin ring on the synthetic radar's domain
+    /// boundary). Seeded bins and interior dilation are untouched, so
+    /// in-domain lookups resolve exactly as before.
+    ///
+    /// Satellite layers must keep [`Self::build_with_shape`]: a full-disk
+    /// grid's valid data ends at the earth's limb (NaN regions INSIDE the
+    /// grid), not at the grid perimeter. Misuse still degrades safely — any
+    /// non-finite perimeter point disables the mask and this build is then
+    /// bin-for-bin identical to `build_with_shape`.
+    pub fn build_with_shape_domain_bounded(
+        lat: &[f32],
+        lon: &[f32],
+        nx: usize,
+        ny: usize,
+    ) -> Option<Self> {
+        if nx == 0 || ny == 0 || nx.saturating_mul(ny) != lat.len() || lat.len() != lon.len() {
+            return Self::build(lat, lon);
+        }
+        Self::build_inner(lat, lon, Some((nx, ny)), true)
+    }
+
+    fn build_inner(
+        lat: &[f32],
+        lon: &[f32],
+        shape: Option<(usize, usize)>,
+        bound_to_perimeter: bool,
+    ) -> Option<Self> {
         let mut lat_min = f32::INFINITY;
         let mut lat_max = f32::NEG_INFINITY;
         let mut lon_min = f32::INFINITY;
@@ -104,6 +136,17 @@ impl InverseLut {
                 index[by * width + bx] = i as u32;
             }
         }
+        // True-domain mask (opt-in, WRF/model path): confine the dilation
+        // below to bins inside the grid's perimeter polygon, so bins between
+        // the curvilinear domain edge and the rectangular bbox stay empty
+        // (lookup → None) instead of inheriting the nearest edge cell.
+        let domain_mask = if bound_to_perimeter {
+            shape.and_then(|(nx, ny)| {
+                perimeter_bin_mask(lat, lon, nx, ny, lat_min, lon_min, bin, width, height)
+            })
+        } else {
+            None
+        };
         // Hole fill: model grid spacing can exceed the bin size away from
         // the grid center; dilate a few passes so bins between grid points
         // resolve to a neighbor.
@@ -112,6 +155,11 @@ impl InverseLut {
             for by in 0..height {
                 for bx in 0..width {
                     if snapshot[by * width + bx] != u32::MAX {
+                        continue;
+                    }
+                    if let Some(mask) = domain_mask.as_deref()
+                        && !mask[by * width + bx]
+                    {
                         continue;
                     }
                     let mut fill = u32::MAX;
@@ -212,6 +260,102 @@ fn percentile_step(mut steps: Vec<f32>, percentile: f32) -> Option<f32> {
     steps.sort_by(f32::total_cmp);
     let index = ((steps.len() - 1) as f32 * percentile.clamp(0.0, 1.0)).round() as usize;
     steps.get(index).copied()
+}
+
+/// The grid's outer boundary as a closed (lon, lat) ring — south row W→E,
+/// east column S→N, north row E→W, west column N→S in grid order. `None`
+/// when the grid is degenerate or ANY perimeter point is non-finite (a
+/// full-disk satellite grid, whose valid data ends at the earth's limb, not
+/// at the grid perimeter) — callers then skip domain masking entirely.
+fn perimeter_ring(lat: &[f32], lon: &[f32], nx: usize, ny: usize) -> Option<Vec<(f64, f64)>> {
+    if nx < 2 || ny < 2 {
+        return None;
+    }
+    let mut ids: Vec<usize> = Vec::with_capacity(2 * (nx + ny));
+    ids.extend(0..nx);
+    ids.extend((1..ny).map(|y| y * nx + (nx - 1)));
+    ids.extend((0..nx - 1).rev().map(|x| (ny - 1) * nx + x));
+    ids.extend((1..ny - 1).rev().map(|y| y * nx));
+    let mut ring = Vec::with_capacity(ids.len() + 1);
+    for id in ids {
+        let (la, lo) = (lat[id], lon[id]);
+        if !la.is_finite() || !lo.is_finite() {
+            return None;
+        }
+        ring.push((f64::from(lo), f64::from(la)));
+    }
+    let first = ring[0];
+    ring.push(first);
+    Some(ring)
+}
+
+/// Rasterize the grid's perimeter polygon into the bin grid: `true` for
+/// bins whose CENTER lies inside the polygon (even-odd scanline fill) plus
+/// every bin the boundary itself passes through (edges sampled at half-bin
+/// steps), so bins straddling the boundary stay fillable and the in-domain
+/// side never shrinks. O(bin rows × perimeter edges) — a few ms for the
+/// largest WRF domains. `None` disables masking (see [`perimeter_ring`]).
+#[allow(clippy::too_many_arguments)]
+fn perimeter_bin_mask(
+    lat: &[f32],
+    lon: &[f32],
+    nx: usize,
+    ny: usize,
+    lat_min: f32,
+    lon_min: f32,
+    bin: f32,
+    width: usize,
+    height: usize,
+) -> Option<Vec<bool>> {
+    let ring = perimeter_ring(lat, lon, nx, ny)?;
+    let (lat0, lon0, bin) = (f64::from(lat_min), f64::from(lon_min), f64::from(bin));
+    if !bin.is_finite() || bin <= 0.0 || width == 0 || height == 0 {
+        return None;
+    }
+    let mut mask = vec![false; width * height];
+
+    // Even-odd scanline fill at bin-center latitudes. The strict `>` on
+    // both edge endpoints keeps crossing counts even when a scanline grazes
+    // a vertex.
+    let mut crossings: Vec<f64> = Vec::new();
+    for by in 0..height {
+        let y = lat0 + (by as f64 + 0.5) * bin;
+        crossings.clear();
+        for edge in ring.windows(2) {
+            let ((x0, y0), (x1, y1)) = (edge[0], edge[1]);
+            if (y0 > y) != (y1 > y) {
+                crossings.push(x0 + (y - y0) * (x1 - x0) / (y1 - y0));
+            }
+        }
+        crossings.sort_by(f64::total_cmp);
+        for pair in crossings.chunks_exact(2) {
+            let lo = ((pair[0] - lon0) / bin - 0.5).ceil().max(0.0) as usize;
+            let hi = ((pair[1] - lon0) / bin - 0.5).floor();
+            if hi < 0.0 || lo >= width {
+                continue;
+            }
+            let hi = (hi as usize).min(width - 1);
+            for bx in lo..=hi {
+                mask[by * width + bx] = true;
+            }
+        }
+    }
+
+    // Boundary bins: walk each edge at half-bin steps so a bin the domain
+    // edge merely clips still counts as in-domain.
+    for edge in ring.windows(2) {
+        let ((x0, y0), (x1, y1)) = (edge[0], edge[1]);
+        let steps = (((x1 - x0).abs().max((y1 - y0).abs()) / bin * 2.0).ceil() as usize).max(1);
+        for step in 0..=steps {
+            let t = step as f64 / steps as f64;
+            let bx = (x0 + t * (x1 - x0) - lon0) / bin;
+            let by = (y0 + t * (y1 - y0) - lat0) / bin;
+            if bx >= 0.0 && by >= 0.0 && (bx as usize) < width && (by as usize) < height {
+                mask[by as usize * width + bx as usize] = true;
+            }
+        }
+    }
+    Some(mask)
 }
 
 /// The active model map layer: a field + its inverse LUT + display params.
@@ -464,6 +608,134 @@ mod tests {
         let query_lat = midpoint(i, i + 1, i + nx, i + nx + 1, &lat);
         let query_lon = midpoint(i, i + 1, i + nx, i + nx + 1, &lon);
         assert!(lut.lookup(query_lat, query_lon).is_some());
+    }
+
+    /// A rotated (curvilinear) n×n grid centred on (39, -95): its true edge
+    /// is NOT the lat/lon bbox, so bbox corners/edges expose the off-domain
+    /// leak the domain-bounded build fixes.
+    fn rotated_grid(n: usize, spacing: f32, theta_deg: f32) -> (Vec<f32>, Vec<f32>) {
+        let c = (n as f32 - 1.0) / 2.0;
+        let (sin_t, cos_t) = theta_deg.to_radians().sin_cos();
+        let mut lat = Vec::with_capacity(n * n);
+        let mut lon = Vec::with_capacity(n * n);
+        for j in 0..n {
+            for i in 0..n {
+                let x = (i as f32 - c) * spacing;
+                let y = (j as f32 - c) * spacing;
+                lon.push(-95.0 + x * cos_t - y * sin_t);
+                lat.push(39.0 + x * sin_t + y * cos_t);
+            }
+        }
+        (lat, lon)
+    }
+
+    /// The WRF/model-path fix: a query outside the true curvilinear domain
+    /// edge but inside the rectangular bbox must return `None` from the
+    /// domain-bounded build (the plain build leaks the nearest edge cell
+    /// there — the smeared boundary ring), while interior lookups resolve
+    /// identically in both builds.
+    #[test]
+    fn domain_bounded_lut_rejects_bbox_points_outside_the_curvilinear_edge() {
+        let n = 41usize;
+        let spacing = 0.02f32;
+        let theta = 30.0f32;
+        let (lat, lon) = rotated_grid(n, spacing, theta);
+        let plain = InverseLut::build_with_shape(&lat, &lon, n, n).expect("plain lut");
+        let bounded =
+            InverseLut::build_with_shape_domain_bounded(&lat, &lon, n, n).expect("bounded lut");
+
+        let (sin_t, cos_t) = theta.to_radians().sin_cos();
+        let to_lat_lon =
+            |x: f32, y: f32| (39.0 + x * sin_t + y * cos_t, -95.0 + x * cos_t - y * sin_t);
+
+        // Interior queries: identical resolution in both builds.
+        for &x in &[-0.3f32, -0.15, 0.0, 0.15, 0.3] {
+            for &y in &[-0.3f32, -0.15, 0.0, 0.15, 0.3] {
+                let (qlat, qlon) = to_lat_lon(x, y);
+                let inside = bounded.lookup(qlat, qlon);
+                assert!(inside.is_some(), "interior ({x}, {y}) must resolve");
+                assert_eq!(
+                    inside,
+                    plain.lookup(qlat, qlon),
+                    "interior ({x}, {y}) must be unchanged by the mask"
+                );
+            }
+        }
+
+        // Just inside each edge still resolves.
+        let half = (n as f32 - 1.0) / 2.0 * spacing; // 0.4°
+        for (x, y) in [(half, 0.0), (-half, 0.0), (0.0, half), (0.0, -half)] {
+            let pull = 0.5 * spacing;
+            let (qlat, qlon) = to_lat_lon(x - x.signum() * pull, y - y.signum() * pull);
+            assert!(
+                bounded.lookup(qlat, qlon).is_some(),
+                "just inside edge ({x}, {y}) must still resolve"
+            );
+        }
+
+        // Two bins OUTSIDE each side midpoint (inside the bbox): the old
+        // dilation leaked the nearest edge cell there; bounded says None.
+        let bin = spacing * theta.to_radians().cos() * 1.25; // shaped p75 step × 1.25
+        let out = half + 2.0 * bin;
+        for (x, y) in [(out, 0.0), (-out, 0.0), (0.0, out), (0.0, -out)] {
+            let (qlat, qlon) = to_lat_lon(x, y);
+            assert!(
+                plain.lookup(qlat, qlon).is_some(),
+                "plain build leaks an edge value at ({x}, {y}) — the bug this fixes"
+            );
+            assert!(
+                bounded.lookup(qlat, qlon).is_none(),
+                "bounded build must reject off-domain ({x}, {y})"
+            );
+        }
+    }
+
+    /// The satellite constraint: a full-disk-style grid keeps its NaN
+    /// margins INSIDE the grid, so its perimeter is non-finite and the
+    /// domain mask must disable itself — the bounded build degrades to a
+    /// bin-for-bin copy of `build_with_shape`, including the limb dilation
+    /// satellite rendering relies on. (The satellite path itself still
+    /// calls `build_with_shape`; this proves even misuse cannot regress it.)
+    #[test]
+    fn domain_bounded_lut_is_inert_for_satellite_style_nan_margins() {
+        // A full-disk-style grid: valid lat/lon only inside a DISK (the
+        // earth), NaN in the corners (off-earth) — so the valid-data
+        // boundary is the limb, not the grid's row/col perimeter.
+        let n = 60i32;
+        let (center, radius) = (30i32, 25i32);
+        let mut lat = vec![f32::NAN; (n * n) as usize];
+        let mut lon = vec![f32::NAN; (n * n) as usize];
+        for j in 0..n {
+            for i in 0..n {
+                let (di, dj) = (i - center, j - center);
+                if di * di + dj * dj <= radius * radius {
+                    lat[(j * n + i) as usize] = 20.0 + dj as f32 * 0.1;
+                    lon[(j * n + i) as usize] = 130.0 + di as f32 * 0.1;
+                }
+            }
+        }
+        let (nx, ny) = (n as usize, n as usize);
+        let plain = InverseLut::build_with_shape(&lat, &lon, nx, ny).expect("plain lut");
+        let bounded = InverseLut::build_with_shape_domain_bounded(&lat, &lon, nx, ny)
+            .expect("bounded lut on satellite-style grid");
+        assert_eq!(bounded.width, plain.width);
+        assert_eq!(bounded.height, plain.height);
+        assert_eq!(
+            bounded.index, plain.index,
+            "non-finite perimeter must disable the mask — identical bins"
+        );
+
+        // The dilation just past the limb (what keeps the satellite edge
+        // render seamless) works identically in both builds…
+        let just_off_limb = plain.lookup(21.874, 131.874); // r ≈ 2.65° > 2.5° disk
+        assert!(
+            just_off_limb.is_some(),
+            "limb dilation must keep filling just past the valid-data edge"
+        );
+        assert_eq!(bounded.lookup(21.874, 131.874), just_off_limb);
+        // …and the deep off-earth bbox corner stays empty in both.
+        assert!(plain.lookup(22.4, 132.4).is_none());
+        assert!(bounded.lookup(22.4, 132.4).is_none());
     }
 
     #[test]

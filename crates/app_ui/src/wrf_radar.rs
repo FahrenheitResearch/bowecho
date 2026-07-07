@@ -82,6 +82,12 @@ pub struct SyntheticRadarConfig {
     /// Prefer the model's own `REFL_10CM` 3-D reflectivity when the file
     /// carries it; otherwise fall back to the computed `dbz` (`CALCDBZ`).
     pub prefer_refl_10cm: bool,
+    /// Opt-in "gate texture": deterministic, range-correlated speckle added
+    /// to the sampled moments so the synthetic gates read like real
+    /// Level-II texture instead of a perfectly smooth trilinear field. OFF
+    /// is the product default, and an OFF build is bit-identical to a build
+    /// without the feature — the perturbation code never touches a value.
+    pub gate_texture: bool,
 }
 
 /// Antenna height above model terrain when no explicit MSL altitude is given.
@@ -102,6 +108,7 @@ impl Default for SyntheticRadarConfig {
             ref_floor_dbz: 0.0,
             nyquist_mps: 320.0,
             prefer_refl_10cm: true,
+            gate_texture: false,
         }
     }
 }
@@ -237,7 +244,12 @@ pub fn read_wrf_radar_fields_reporting(
     progress("building geolocation index…");
     let lat_f32 = to_f32(&lat);
     let lon_f32 = to_f32(&lon);
-    let lut = InverseLut::build_with_shape(&lat_f32, &lon_f32, nx, ny)
+    // Domain-bounded: a WRF grid's row/col perimeter IS its true data edge,
+    // so gates past that edge (but still inside the rectangular lat/lon
+    // bbox) must sample nothing — without the bound, the LUT's hole-fill
+    // dilation leaked nearest-edge values into a ~3-bin smeared ring around
+    // the domain boundary.
+    let lut = InverseLut::build_with_shape_domain_bounded(&lat_f32, &lon_f32, nx, ny)
         .ok_or_else(|| "failed to build WRF inverse geolocation LUT".to_string())?;
 
     Ok(WrfRadarFields {
@@ -478,10 +490,18 @@ fn build_cut(
                 else {
                     continue;
                 };
-                if !sample.dbz.is_finite() || sample.dbz < floor {
+                // Opt-in gate texture: perturb BEFORE the floor test so echo
+                // edges go ragged the way marginal-SNR gates do on a real
+                // scope. When off, `dbz` is `sample.dbz` untouched — the
+                // output stays bit-identical to a textureless build.
+                let mut dbz = sample.dbz;
+                if config.gate_texture {
+                    dbz += ref_gate_texture_db(cut_index, iaz, gate);
+                }
+                if !dbz.is_finite() || dbz < floor {
                     continue;
                 }
-                ref_row[gate] = sample.dbz;
+                ref_row[gate] = dbz;
                 // Radial velocity: wind projected onto the beam unit vector
                 // (east, north, up) = (sinAz·cosEl, cosAz·cosEl, sinEl), with
                 // azimuth clockwise from north. Positive = away from the radar
@@ -490,7 +510,11 @@ fn build_cut(
                     + sample.v * (cos_az as f32) * (cos_el as f32)
                     + sample.w * (sin_el as f32);
                 if vr.is_finite() {
-                    vel_row[gate] = vr;
+                    vel_row[gate] = if config.gate_texture {
+                        vr + vel_gate_texture_mps(cut_index, iaz, gate)
+                    } else {
+                        vr
+                    };
                 }
             }
             (ref_row, vel_row)
@@ -712,6 +736,73 @@ fn bracket_height(
 
 fn lerp(a: f32, b: f32, t: f32) -> Option<f32> {
     (a.is_finite() && b.is_finite()).then_some(a + t * (b - a))
+}
+
+// ── Gate texture (opt-in speckle) ─────────────────────────────────────────────
+//
+// Deliberately hash-based, NOT an RNG: every perturbation is a pure function
+// of (tilt, azimuth, gate), so rebuilding a frame is bit-identical and a loop
+// never shimmers between rebuilds of the same hour. Magnitudes are tuned
+// against real Level-II: reflectivity texture on the order of ±2 dB,
+// correlated over a few gates in range (the pulse volume smears neighbours)
+// plus a smaller fully independent per-gate jitter; velocity gets only a
+// gentle ±0.5 m/s wobble — pulse-pair Vr estimates are far smoother than
+// reflectivity at decent SNR, and a noisy Vr would pollute the dealias/GBVTD
+// consumers downstream.
+
+/// Peak amplitude (dB) of the range-correlated reflectivity texture.
+const REF_TEXTURE_CORRELATED_DB: f32 = 1.8;
+/// Peak amplitude (dB) of the independent per-gate reflectivity jitter.
+const REF_TEXTURE_JITTER_DB: f32 = 0.7;
+/// Peak amplitude (m/s) of the (correlated) velocity wobble.
+const VEL_TEXTURE_MPS: f32 = 0.5;
+/// Range correlation length of the correlated components, in gates.
+const TEXTURE_CORR_GATES: usize = 3;
+
+const TEXTURE_SALT_REF: u32 = 0x5265_6631; // "Ref1"
+const TEXTURE_SALT_REF_JITTER: u32 = 0x5265_664A; // "RefJ"
+const TEXTURE_SALT_VEL: u32 = 0x5665_6C31; // "Vel1"
+
+/// 32-bit avalanche mix (splitmix32 finalizer) — platform-independent.
+fn texture_mix(mut x: u32) -> u32 {
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7feb_352d);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846c_a68b);
+    x ^= x >> 16;
+    x
+}
+
+/// Uniform noise in [-1, 1) from (tilt, azimuth, knot) + a salt.
+fn texture_noise(tilt: usize, az: usize, knot: usize, salt: u32) -> f32 {
+    let mixed = texture_mix(
+        (tilt as u32).wrapping_mul(0x9e37_79b9)
+            ^ (az as u32).wrapping_mul(0x85eb_ca6b)
+            ^ (knot as u32).wrapping_mul(0xc2b2_ae35)
+            ^ salt,
+    );
+    ((mixed >> 8) as f32) * (2.0 / 16_777_216.0) - 1.0
+}
+
+/// Range-correlated value noise in [-1, 1): hashed knots every
+/// [`TEXTURE_CORR_GATES`] gates, linearly interpolated between them.
+fn texture_correlated_noise(tilt: usize, az: usize, gate: usize, salt: u32) -> f32 {
+    let knot = gate / TEXTURE_CORR_GATES;
+    let t = (gate % TEXTURE_CORR_GATES) as f32 / TEXTURE_CORR_GATES as f32;
+    let n0 = texture_noise(tilt, az, knot, salt);
+    let n1 = texture_noise(tilt, az, knot + 1, salt);
+    n0 + t * (n1 - n0)
+}
+
+/// Reflectivity gate-texture perturbation (dB), peak ±2.5 dB.
+fn ref_gate_texture_db(tilt: usize, az: usize, gate: usize) -> f32 {
+    REF_TEXTURE_CORRELATED_DB * texture_correlated_noise(tilt, az, gate, TEXTURE_SALT_REF)
+        + REF_TEXTURE_JITTER_DB * texture_noise(tilt, az, gate, TEXTURE_SALT_REF_JITTER)
+}
+
+/// Velocity gate-texture perturbation (m/s), peak ±0.5 m/s.
+fn vel_gate_texture_mps(tilt: usize, az: usize, gate: usize) -> f32 {
+    VEL_TEXTURE_MPS * texture_correlated_noise(tilt, az, gate, TEXTURE_SALT_VEL)
 }
 
 /// Parse a WRF `Times` string ("YYYY-MM-DD_HH:MM:SS") to a UTC scan time.
@@ -1134,12 +1225,10 @@ mod tests {
         assert!((vr_up - 3.5).abs() < 1e-3, "vertical beam Vr = {vr_up}");
     }
 
-    /// A tiny synthetic 2×2×2 model verifies the whole sampling chain end to
-    /// end without a wrfout: uniform 40 dBZ column, uniform 10 m/s east wind,
-    /// radar at the box centre. Every in-domain, in-height gate must read
-    /// 40 dBZ, and a due-east 0°-tilt gate near the ground must read ~+10 Vr.
-    #[test]
-    fn synthetic_box_model_samples_ref_and_velocity() {
+    /// A tiny 2×2×2 uniform box model (40 dBZ everywhere, 10 m/s east wind,
+    /// levels at ~100 m / ~8 km MSL) centred near (39, -95) — the smallest
+    /// grid the whole sampling chain accepts.
+    fn uniform_box_fields() -> WrfRadarFields {
         let nx = 2;
         let ny = 2;
         let nz = 2;
@@ -1160,8 +1249,8 @@ mod tests {
         let v = vec![0.0f32; nz * cells];
         let w = vec![0.0f32; nz * cells];
         let terrain_m = vec![0.0f32; cells];
-        let lut = InverseLut::build_with_shape(&lat, &lon, nx, ny).expect("lut");
-        let fields = WrfRadarFields {
+        let lut = InverseLut::build_with_shape_domain_bounded(&lat, &lon, nx, ny).expect("lut");
+        WrfRadarFields {
             nx,
             ny,
             nz,
@@ -1175,7 +1264,16 @@ mod tests {
             terrain_m,
             ref_source: "test",
             lut,
-        };
+        }
+    }
+
+    /// A tiny synthetic 2×2×2 model verifies the whole sampling chain end to
+    /// end without a wrfout: uniform 40 dBZ column, uniform 10 m/s east wind,
+    /// radar at the box centre. Every in-domain, in-height gate must read
+    /// 40 dBZ, and a due-east 0°-tilt gate near the ground must read ~+10 Vr.
+    #[test]
+    fn synthetic_box_model_samples_ref_and_velocity() {
+        let fields = uniform_box_fields();
 
         let config = SyntheticRadarConfig {
             site_lat_deg: Some(39.0),
@@ -1221,6 +1319,314 @@ mod tests {
         // West radial (az=270°) is the mirror image: toward the radar.
         let west_vel = vel_grid.scaled_value(270, 4).expect("west radial");
         assert!((west_vel + 10.0).abs() < 1.5, "due-west Vr = {west_vel}");
+    }
+
+    /// All F32 moment values of a volume as raw bits (NaN patterns
+    /// included), for exact equality comparisons.
+    fn moment_bits(volume: &RadarVolume) -> Vec<u32> {
+        let mut bits = Vec::new();
+        for cut in &volume.cuts {
+            for moment in [MomentType::Reflectivity, MomentType::Velocity] {
+                let MomentStorage::F32(values) = &cut.moments[&moment].storage else {
+                    panic!("synthetic moments must be F32");
+                };
+                bits.extend(values.iter().map(|value| value.to_bits()));
+            }
+        }
+        bits
+    }
+
+    fn box_model_config() -> SyntheticRadarConfig {
+        SyntheticRadarConfig {
+            site_lat_deg: Some(39.0),
+            site_lon_deg: Some(-95.0),
+            antenna_msl_m: Some(200.0),
+            elevations_deg: vec![0.5, 3.1],
+            azimuth_count: 360,
+            gate_spacing_m: 250.0,
+            max_range_m: 10_000.0,
+            ..SyntheticRadarConfig::default()
+        }
+    }
+
+    /// The DEFAULT-OFF contract for the opt-in gate texture: the default
+    /// config leaves it off, and an off build is bit-identical to an
+    /// explicit `gate_texture: false` build — when disabled, the texture
+    /// path must not touch a single output value.
+    #[test]
+    fn gate_texture_defaults_off_and_off_builds_are_bit_identical() {
+        assert!(
+            !SyntheticRadarConfig::default().gate_texture,
+            "gate texture must be opt-in — the smooth look is the default"
+        );
+        let fields = uniform_box_fields();
+        let config = box_model_config();
+        assert!(!config.gate_texture);
+        let off = SyntheticRadarConfig {
+            gate_texture: false,
+            ..config.clone()
+        };
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let a = build_synthetic_volume(&fields, time, &config);
+        let b = build_synthetic_volume(&fields, time, &off);
+        assert!(
+            moment_bits(&a) == moment_bits(&b),
+            "gate_texture=false must be bit-identical to the default build"
+        );
+    }
+
+    /// Texture ON: reproducible (hash-seeded, no RNG state — two builds are
+    /// bit-identical), bounded (REF within ±2.5 dB of the smooth build, VEL
+    /// within ±0.5 m/s), actually visible on REF, and gentle on velocity.
+    #[test]
+    fn gate_texture_is_deterministic_bounded_and_gentle_on_velocity() {
+        let fields = uniform_box_fields();
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let off_config = box_model_config();
+        let on_config = SyntheticRadarConfig {
+            gate_texture: true,
+            ..off_config.clone()
+        };
+        let off = build_synthetic_volume(&fields, time, &off_config);
+        let on = build_synthetic_volume(&fields, time, &on_config);
+        let on_again = build_synthetic_volume(&fields, time, &on_config);
+        assert!(
+            moment_bits(&on) == moment_bits(&on_again),
+            "texture must be deterministic frame to frame"
+        );
+
+        let mut compared = 0usize;
+        let mut ref_changed = 0usize;
+        let mut max_ref_diff = 0.0f32;
+        for (cut_off, cut_on) in off.cuts.iter().zip(&on.cuts) {
+            for (moment, bound) in [
+                (MomentType::Reflectivity, 2.51f32),
+                (MomentType::Velocity, 0.51f32),
+            ] {
+                let MomentStorage::F32(a) = &cut_off.moments[&moment].storage else {
+                    panic!("F32");
+                };
+                let MomentStorage::F32(b) = &cut_on.moments[&moment].storage else {
+                    panic!("F32");
+                };
+                for (va, vb) in a.iter().zip(b) {
+                    // Uniform 40 dBZ against a 0 dBZ floor: texture can
+                    // never flip a gate across the floor here, so finite
+                    // patterns must match exactly.
+                    assert_eq!(va.is_finite(), vb.is_finite());
+                    if !va.is_finite() {
+                        continue;
+                    }
+                    let diff = (vb - va).abs();
+                    assert!(diff <= bound, "{moment:?} perturbed by {diff}");
+                    if moment == MomentType::Reflectivity {
+                        compared += 1;
+                        max_ref_diff = max_ref_diff.max(diff);
+                        if diff > 0.05 {
+                            ref_changed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(compared > 10_000, "too few echo gates: {compared}");
+        assert!(
+            ref_changed * 2 > compared,
+            "texture must actually move most REF gates ({ref_changed}/{compared})"
+        );
+        assert!(
+            max_ref_diff > 1.5,
+            "texture peak {max_ref_diff} dB is too tame to read as speckle"
+        );
+    }
+
+    /// Texture is applied BEFORE the reflectivity floor, so echo edges go
+    /// ragged like a marginal-SNR scope: with the floor parked just above
+    /// the model's uniform 40 dBZ, the smooth build shows nothing while the
+    /// textured build pokes gates through — all within the noise peak.
+    #[test]
+    fn gate_texture_pokes_ragged_gates_through_the_ref_floor() {
+        let fields = uniform_box_fields();
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let off_config = SyntheticRadarConfig {
+            ref_floor_dbz: 40.5,
+            ..box_model_config()
+        };
+        let on_config = SyntheticRadarConfig {
+            gate_texture: true,
+            ..off_config.clone()
+        };
+        let count_finite = |volume: &RadarVolume| {
+            moment_bits(volume)
+                .iter()
+                .filter(|bits| f32::from_bits(**bits).is_finite())
+                .count()
+        };
+        let off = build_synthetic_volume(&fields, time, &off_config);
+        assert_eq!(
+            count_finite(&off),
+            0,
+            "smooth 40 dBZ under a 40.5 floor must stay empty"
+        );
+        let on = build_synthetic_volume(&fields, time, &on_config);
+        assert!(
+            count_finite(&on) > 0,
+            "texture must poke some gates through the floor"
+        );
+        for cut in &on.cuts {
+            let MomentStorage::F32(values) = &cut.moments[&MomentType::Reflectivity].storage else {
+                panic!("F32");
+            };
+            for value in values.iter().filter(|value| value.is_finite()) {
+                assert!(
+                    (40.5..=42.6).contains(value),
+                    "ragged-edge gate {value} outside the floor..floor+peak band"
+                );
+            }
+        }
+    }
+
+    /// A rotated curvilinear domain (nz = 2, uniform 40 dBZ, 10 m/s east
+    /// wind): its true edge is NOT the lat/lon bbox, which is exactly where
+    /// the pre-fix LUT leaked nearest-edge values (the smeared boundary
+    /// ring). `bounded` picks the fixed vs the old LUT build.
+    fn rotated_domain_fields(
+        n: usize,
+        spacing: f32,
+        theta_deg: f32,
+        bounded: bool,
+    ) -> WrfRadarFields {
+        let c = (n as f32 - 1.0) / 2.0;
+        let (sin_t, cos_t) = theta_deg.to_radians().sin_cos();
+        let cells = n * n;
+        let nz = 2;
+        let mut lat = Vec::with_capacity(cells);
+        let mut lon = Vec::with_capacity(cells);
+        for j in 0..n {
+            for i in 0..n {
+                let x = (i as f32 - c) * spacing;
+                let y = (j as f32 - c) * spacing;
+                lon.push(-95.0 + x * cos_t - y * sin_t);
+                lat.push(39.0 + x * sin_t + y * cos_t);
+            }
+        }
+        let mut height_msl = vec![100.0f32; nz * cells];
+        height_msl[cells..].fill(8000.0);
+        let lut = if bounded {
+            InverseLut::build_with_shape_domain_bounded(&lat, &lon, n, n).expect("bounded lut")
+        } else {
+            InverseLut::build_with_shape(&lat, &lon, n, n).expect("plain lut")
+        };
+        WrfRadarFields {
+            nx: n,
+            ny: n,
+            nz,
+            lat,
+            lon,
+            height_msl,
+            dbz: vec![40.0f32; nz * cells],
+            u: vec![10.0f32; nz * cells],
+            v: vec![0.0f32; nz * cells],
+            w: vec![0.0f32; nz * cells],
+            terrain_m: vec![0.0f32; cells],
+            ref_source: "test",
+            lut,
+        }
+    }
+
+    /// The domain-edge fix, end to end: on a rotated domain every finite
+    /// gate must georeference to inside the true (rotated) domain edge —
+    /// and the OLD, unbounded LUT demonstrably leaks a ring of finite gates
+    /// past that edge on the same fixture, proving the assertion has teeth.
+    #[test]
+    fn synthetic_gates_stay_nan_outside_the_true_domain_edge() {
+        let n = 41usize;
+        let spacing = 0.02f32; // deg → half-width 0.4° (~44 km)
+        let theta = 30.0f32;
+        let config = SyntheticRadarConfig {
+            site_lat_deg: Some(39.0),
+            site_lon_deg: Some(-95.0),
+            antenna_msl_m: Some(300.0),
+            elevations_deg: vec![0.5],
+            azimuth_count: 360,
+            gate_spacing_m: 250.0,
+            max_range_m: 120_000.0,
+            ..SyntheticRadarConfig::default()
+        };
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+
+        let half = (n as f32 - 1.0) / 2.0 * spacing;
+        // Allowed slack past the edge: one LUT bin (a bin the boundary
+        // merely clips legitimately resolves) plus in-bin position.
+        let bin = spacing * theta.to_radians().cos() * 1.25;
+        let tol = 2.0 * bin;
+        let (sin_t, cos_t) = theta.to_radians().sin_cos();
+
+        // Worst finite-gate excursion in the domain's own (rotated) frame.
+        let worst_extent = |volume: &RadarVolume| -> (f32, usize) {
+            let mut worst = 0.0f32;
+            let mut finite = 0usize;
+            for cut in &volume.cuts {
+                let grid = &cut.moments[&MomentType::Reflectivity];
+                let MomentStorage::F32(values) = &grid.storage else {
+                    panic!("F32");
+                };
+                let gate_count = grid.gate_range.gate_count;
+                let spacing_m = f64::from(grid.gate_range.gate_spacing_m);
+                for (row, radial) in cut.radials.iter().enumerate() {
+                    let az_rad = f64::from(radial.azimuth_deg).to_radians();
+                    for gate in 0..gate_count {
+                        if !values[row * gate_count + gate].is_finite() {
+                            continue;
+                        }
+                        finite += 1;
+                        let ground = beam_ground_range_m(
+                            gate as f64 * spacing_m,
+                            f64::from(radial.elevation_deg),
+                        );
+                        let (glat, glon) = aeqd_inverse_km(
+                            39.0,
+                            -95.0,
+                            ground * az_rad.sin() / 1000.0,
+                            ground * az_rad.cos() / 1000.0,
+                        );
+                        let (dlat, dlon) = ((glat - 39.0) as f32, (glon + 95.0) as f32);
+                        let x = dlon * cos_t + dlat * sin_t;
+                        let y = -dlon * sin_t + dlat * cos_t;
+                        worst = worst.max(x.abs().max(y.abs()));
+                    }
+                }
+            }
+            (worst, finite)
+        };
+
+        let fixed = build_synthetic_volume(
+            &rotated_domain_fields(n, spacing, theta, true),
+            time,
+            &config,
+        );
+        let (worst, finite) = worst_extent(&fixed);
+        assert!(
+            finite > 10_000,
+            "beam must cover the domain: {finite} gates"
+        );
+        assert!(
+            worst <= half + tol,
+            "finite gate {worst}° from centre exceeds the true edge ({})",
+            half + tol
+        );
+
+        let leaky = build_synthetic_volume(
+            &rotated_domain_fields(n, spacing, theta, false),
+            time,
+            &config,
+        );
+        let (worst_leak, _) = worst_extent(&leaky);
+        assert!(
+            worst_leak > half + tol,
+            "the unbounded LUT should leak past the edge (got {worst_leak}°) — \
+             otherwise this test can't catch the bug"
+        );
     }
 
     /// Real-data verification (project rule: prove on REAL data). Gated on
@@ -1382,6 +1788,335 @@ mod tests {
         let dlam = (lon2 - lon1).to_radians();
         let a = (dphi / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dlam / 2.0).sin().powi(2);
         2.0 * r * a.sqrt().asin()
+    }
+
+    /// Crop a square window centred on (cx, cy) out of a rendered PPI and
+    /// save it (clamped to the image bounds).
+    fn save_crop(image: &image::RgbaImage, cx: f32, cy: f32, window: u32, path: &Path) {
+        let window = window.min(image.width()).min(image.height());
+        let x0 = ((cx - window as f32 / 2.0).round().max(0.0) as u32).min(image.width() - window);
+        let y0 = ((cy - window as f32 / 2.0).round().max(0.0) as u32).min(image.height() - window);
+        image::imageops::crop_imm(image, x0, y0, window, window)
+            .to_image()
+            .save(path)
+            .expect("save crop");
+    }
+
+    /// CLOSING PROOF for the gates-polish track (v0.29.3): ONE pass over a
+    /// real Enderlin wrfout, run on the build node in release. Gated on
+    /// `BOWECHO_GATES_PROBE_FIXTURE=<wrfout path>`; PNGs land in
+    /// `BOWECHO_GATES_PROBE_PNG` (default: temp dir):
+    ///  - `gates_default.png` (+`_zoom`) — lowest-tilt REF PPI, default
+    ///    config: must look identical to the current shipped gates;
+    ///  - `gates_speckle.png` (+`_zoom`) — the same PPI with the opt-in
+    ///    `gate_texture` speckle;
+    ///  - `edge_before_zoom.png` / `edge_after_zoom.png` — the WRF domain
+    ///    edge with the old bbox-dilated LUT (smeared off-domain ring) vs
+    ///    the domain-bounded LUT (clean NaN cutoff). The "before" swaps the
+    ///    unbounded LUT into the same fields — test-only, never a product
+    ///    path. Also counts finite gates georeferencing off-domain: must be
+    ///    zero after the fix, nonzero before (the ring, quantified).
+    #[test]
+    fn gates_polish_probe_renders_proof_pngs() {
+        let Some(path) = std::env::var_os("BOWECHO_GATES_PROBE_FIXTURE") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let out_dir = std::env::var_os("BOWECHO_GATES_PROBE_PNG")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let _ = std::fs::create_dir_all(&out_dir);
+
+        let file = WrfFile::open(&path).expect("open real wrfout");
+        let config = SyntheticRadarConfig::default();
+        let mut fields = read_wrf_radar_fields(&file, 0, config.prefer_refl_10cm)
+            .expect("read WRF radar fields");
+        let time = file
+            .times()
+            .ok()
+            .and_then(|times| times.first().and_then(|raw| parse_wrf_time(raw)))
+            .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+
+        let raster = render2d::RasterOptions {
+            width: 4096,
+            height: 4096,
+            range_fraction: 100,
+        };
+        let centre_px = (raster.width as f32 - 1.0) / 2.0;
+        let to_px = |east_m: f64, north_m: f64, range_m: f64| -> (f32, f32) {
+            (
+                centre_px + (east_m / range_m) as f32 * centre_px,
+                centre_px - (north_m / range_m) as f32 * centre_px,
+            )
+        };
+
+        // (a) Default mode — the shipped look, must be visually identical
+        // to the current gates.
+        let default_volume = build_synthetic_volume(&fields, time, &config);
+        let default_img =
+            render2d::render_moment_image(&default_volume, 0, MomentType::Reflectivity, raster)
+                .expect("render default PPI");
+        default_img
+            .save(out_dir.join("gates_default.png"))
+            .expect("save default PPI");
+
+        // Strongest low-tilt echo — the zoom anchor for the texture crops.
+        let cut = &default_volume.cuts[0];
+        let grid = &cut.moments[&MomentType::Reflectivity];
+        let MomentStorage::F32(values) = &grid.storage else {
+            panic!("REF must be F32");
+        };
+        let gate_count = grid.gate_range.gate_count;
+        let spacing_m = f64::from(grid.gate_range.gate_spacing_m);
+        let mut best = (f32::NEG_INFINITY, 0usize, 0usize);
+        for (row, _) in cut.radials.iter().enumerate() {
+            for gate in 0..gate_count {
+                let value = values[row * gate_count + gate];
+                if value.is_finite() && value > best.0 {
+                    best = (value, row, gate);
+                }
+            }
+        }
+        let az_rad = f64::from(cut.radials[best.1].azimuth_deg).to_radians();
+        let ground = beam_ground_range_m(best.2 as f64 * spacing_m, f64::from(cut.elevation_deg));
+        let (echo_x, echo_y) = to_px(
+            ground * az_rad.sin(),
+            ground * az_rad.cos(),
+            config.max_range_m,
+        );
+        save_crop(
+            &default_img,
+            echo_x,
+            echo_y,
+            768,
+            &out_dir.join("gates_default_zoom.png"),
+        );
+
+        // (b) Speckle mode.
+        let speckle_config = SyntheticRadarConfig {
+            gate_texture: true,
+            ..config.clone()
+        };
+        let speckle_volume = build_synthetic_volume(&fields, time, &speckle_config);
+        let speckle_img =
+            render2d::render_moment_image(&speckle_volume, 0, MomentType::Reflectivity, raster)
+                .expect("render speckle PPI");
+        speckle_img
+            .save(out_dir.join("gates_speckle.png"))
+            .expect("save speckle PPI");
+        save_crop(
+            &speckle_img,
+            echo_x,
+            echo_y,
+            768,
+            &out_dir.join("gates_speckle_zoom.png"),
+        );
+
+        // (c) Domain-edge zoom, before/after. Aim at the closest domain-side
+        // midpoint and scan just past it so the edge fills the frame.
+        let site_lat = f64::from(default_volume.site.latitude_deg.unwrap());
+        let site_lon = f64::from(default_volume.site.longitude_deg.unwrap());
+        let (nx, ny) = (fields.nx, fields.ny);
+        let side_mids = [
+            (ny - 1) * nx + nx / 2, // north
+            (ny / 2) * nx + nx - 1, // east
+            nx / 2,                 // south
+            (ny / 2) * nx,          // west
+        ];
+        let (edge_east_km, edge_north_km) = side_mids
+            .iter()
+            .map(|&cell| {
+                ui_core::geo::aeqd_forward_km(
+                    site_lat,
+                    site_lon,
+                    f64::from(fields.lat[cell]),
+                    f64::from(fields.lon[cell]),
+                )
+            })
+            .min_by(|a, b| a.0.hypot(a.1).total_cmp(&b.0.hypot(b.1)))
+            .expect("four side midpoints");
+        let edge_dist_m = edge_east_km.hypot(edge_north_km) * 1000.0;
+        let edge_config = SyntheticRadarConfig {
+            elevations_deg: vec![config.elevations_deg[0]],
+            max_range_m: (edge_dist_m * 1.25).max(60_000.0),
+            ..config.clone()
+        };
+
+        // Off-domain finite-gate counter (the bounded LUT is the truth);
+        // also returns the strongest leaked gate's (east, north) metres so
+        // the edge zoom frames the actual smear, not empty boundary.
+        let bounded_lut = InverseLut::build_with_shape_domain_bounded(
+            &fields.lat,
+            &fields.lon,
+            fields.nx,
+            fields.ny,
+        )
+        .expect("bounded LUT");
+        // Leaked gate: finite in the volume but off the true domain (bounded
+        // LUT says None). Returns (azimuth row, east m, north m, dBZ) per
+        // leak, exact — azimuths rebuilt in f64 from the radial index just
+        // like build_cut, so each gate re-maps to the very lat/lon the
+        // sampler used.
+        let off_domain_finite = |volume: &RadarVolume| -> Vec<(usize, f64, f64, f32)> {
+            let cut = &volume.cuts[0];
+            let grid = &cut.moments[&MomentType::Reflectivity];
+            let MomentStorage::F32(values) = &grid.storage else {
+                panic!("REF must be F32");
+            };
+            let gate_count = grid.gate_range.gate_count;
+            let spacing_m = f64::from(grid.gate_range.gate_spacing_m);
+            let naz = cut.radials.len();
+            let mut leaks = Vec::new();
+            for (row, radial) in cut.radials.iter().enumerate() {
+                let az_rad = (row as f64 * 360.0 / naz as f64).to_radians();
+                for gate in 0..gate_count {
+                    let value = values[row * gate_count + gate];
+                    if !value.is_finite() {
+                        continue;
+                    }
+                    let ground = beam_ground_range_m(
+                        gate as f64 * spacing_m,
+                        f64::from(radial.elevation_deg),
+                    );
+                    let (east_m, north_m) = (ground * az_rad.sin(), ground * az_rad.cos());
+                    let (glat, glon) =
+                        aeqd_inverse_km(site_lat, site_lon, east_m / 1000.0, north_m / 1000.0);
+                    if bounded_lut.lookup(glat as f32, glon as f32).is_none() {
+                        leaks.push((row, east_m, north_m, value));
+                    }
+                }
+            }
+            leaks
+        };
+
+        let edge_after = build_synthetic_volume(&fields, time, &edge_config);
+        let after_img =
+            render2d::render_moment_image(&edge_after, 0, MomentType::Reflectivity, raster)
+                .expect("render edge-after PPI");
+        let after_leak = off_domain_finite(&edge_after).len();
+
+        // "Before": the OLD bbox-dilated LUT swapped into the same fields —
+        // test-only; the product path always builds domain-bounded.
+        fields.lut = InverseLut::build_with_shape(&fields.lat, &fields.lon, fields.nx, fields.ny)
+            .expect("unbounded LUT");
+        let edge_before = build_synthetic_volume(&fields, time, &edge_config);
+        let before_img =
+            render2d::render_moment_image(&edge_before, 0, MomentType::Reflectivity, raster)
+                .expect("render edge-before PPI");
+        let leaks = off_domain_finite(&edge_before);
+        let before_leak = leaks.len();
+
+        // Zoom anchor: the DENSEST leak cluster (mode azimuth ±15 radials).
+        // The ring touches the boundary at several separate arcs, so a
+        // global centroid averages into the domain interior and frames
+        // nothing; fall back to the nearest side midpoint when echo never
+        // reaches the boundary at all.
+        let leak_center = (!leaks.is_empty()).then(|| {
+            let naz = edge_before.cuts[0].radials.len();
+            let mut per_row = vec![0usize; naz];
+            for &(row, ..) in &leaks {
+                per_row[row] += 1;
+            }
+            let best_row = (0..naz).max_by_key(|&row| per_row[row]).unwrap_or(0);
+            let near: Vec<_> = leaks
+                .iter()
+                .filter(|(row, ..)| row.abs_diff(best_row) <= 15)
+                .collect();
+            let n = near.len().max(1) as f64;
+            (
+                near.iter().map(|(_, east, ..)| east).sum::<f64>() / n,
+                near.iter().map(|(_, _, north, _)| north).sum::<f64>() / n,
+            )
+        });
+        let (leak_east_m, leak_north_m) =
+            leak_center.unwrap_or((edge_east_km * 1000.0, edge_north_km * 1000.0));
+        let (edge_x, edge_y) = to_px(leak_east_m, leak_north_m, edge_config.max_range_m);
+        save_crop(
+            &after_img,
+            edge_x,
+            edge_y,
+            1024,
+            &out_dir.join("edge_after_zoom.png"),
+        );
+        save_crop(
+            &before_img,
+            edge_x,
+            edge_y,
+            1024,
+            &out_dir.join("edge_before_zoom.png"),
+        );
+        // Unambiguous ring picture: every leaked GATE painted magenta on the
+        // fixed render, straight from the volume data. The leak here is
+        // 0-5 dBZ fringe echo — below the REF colour table's first visible
+        // level — so it is invisible in a plain before/after PNG pair and a
+        // pixel diff only catches renderer smoothing; painting the gate
+        // footprints shows exactly where the old LUT smeared past the edge.
+        let mut ring_img = after_img.clone();
+        let (width_px, height_px) = (ring_img.width() as i64, ring_img.height() as i64);
+        for &(_, east_m, north_m, _) in &leaks {
+            let (px, py) = to_px(east_m, north_m, edge_config.max_range_m);
+            for dy in -2i64..=2 {
+                for dx in -2i64..=2 {
+                    let (x, y) = (px.round() as i64 + dx, py.round() as i64 + dy);
+                    if (0..width_px).contains(&x) && (0..height_px).contains(&y) {
+                        ring_img.put_pixel(x as u32, y as u32, image::Rgba([255, 0, 255, 255]));
+                    }
+                }
+            }
+        }
+        save_crop(
+            &ring_img,
+            edge_x,
+            edge_y,
+            1024,
+            &out_dir.join("edge_ring_highlight_zoom.png"),
+        );
+
+        // Interior integrity, on the REAL file: the fix may only REMOVE
+        // off-domain gates — every gate finite in BOTH builds must carry
+        // bit-identical values (verified: 0 differing gates on Enderlin
+        // 02:15Z; the fix touches nothing inside the domain).
+        {
+            let MomentStorage::F32(vb) =
+                &edge_before.cuts[0].moments[&MomentType::Reflectivity].storage
+            else {
+                panic!("F32");
+            };
+            let MomentStorage::F32(va) =
+                &edge_after.cuts[0].moments[&MomentType::Reflectivity].storage
+            else {
+                panic!("F32");
+            };
+            let value_diffs = vb
+                .iter()
+                .zip(va)
+                .filter(|(b, a)| b.is_finite() && a.is_finite() && b.to_bits() != a.to_bits())
+                .count();
+            assert_eq!(
+                value_diffs, 0,
+                "domain bound must not change any in-domain gate value"
+            );
+        }
+        let (leak_min, leak_max) = leaks.iter().fold(
+            (f32::INFINITY, f32::NEG_INFINITY),
+            |(lo, hi), &(.., value)| (lo.min(value), hi.max(value)),
+        );
+        eprintln!(
+            "[probe] peak echo {:.1} dBZ; domain edge {:.1} km out; \
+             off-domain finite gates before={before_leak} after={after_leak} \
+             (leak dBZ {leak_min:.1}..{leak_max:.1}); PNGs in {}",
+            best.0,
+            edge_dist_m / 1000.0,
+            out_dir.display()
+        );
+        assert_eq!(
+            after_leak, 0,
+            "domain-bounded scan must not leak off-domain gates"
+        );
+        assert!(
+            before_leak > 0,
+            "unbounded LUT should show the ring this track fixes"
+        );
     }
 
     /// Wall-time profile of the REAL synthetic-radar path (read fields + build
