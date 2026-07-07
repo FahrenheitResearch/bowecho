@@ -97,7 +97,7 @@ Visible frames are written as the three baked `rgb_r/g/b` planes (`COMPOSITE_R_V
 - **Target GPU class:** desktop RTX 3070/RX 6800-tier and up (the owner's box exceeds this); must coexist with the live radar app on one GPU/queue — and egui paints on that same queue, so **no single dispatch/draw may exceed ~4 ms** (also keeps clear of Windows TDR). All heavy passes are tiled: offline-quality frames render in N tiles across successive egui frames (progressive, cancelable), the vol3d "quality steps" pattern generalized.
 - **Interactive budget (1024–1440p preview, 30 fps target):** sky LUTs ≤ 0.6 ms · sun OD map (per timestep, amortized) ≤ 2 ms · surface pass ≤ 2 ms · cloud march ≤ 20 ms · SH/ambient+compose+tonemap ≤ 1 ms · headroom ≥ 8 ms for the rest of the app.
 - **Offline "player frame" budget:** ≤ 2 s wall per 2048²-class frame, sliced into ≤ 4 ms chunks; a 20-frame Enderlin loop prerenders in ≤ 1 min and then plays back as cheap stored textures (player cap `MAX_SAT_PLAYER_TEXTURE_DIM` = 4096, `sat_paint.rs:1429` test).
-- **Memory ceilings:** GPU default 768 MB total — brick A 256 MB + brick B 128 MB (+ same again transiently while double-buffering an upload) + Blue Marble 2×4096² ≈ 128 MB + LUTs/OD/horizon ≈ 30 MB + render targets. Exposed as a settings knob mirroring `radar_history_budget_gib` (main.rs:7547). CPU ingest peak < 2.5 GB (§2).
+- **Memory ceilings:** GPU default 2 GB total (owner call: liberal VRAM for an advanced product; may expand further while the radar app is idle) — brick A/B sized by the voxel-budget knob, Blue Marble 2×4096² ≈ 128 MB, LUTs/OD/horizon ≈ 30 MB, render targets, generous double-buffer headroom. Exposed as a settings knob mirroring `radar_history_budget_gib` (main.rs:7547). CPU ingest peak < 2.5 GB (§2) — that constraint is about system stability, not stinginess, and stays.
 - **LUT precompute:** transmittance+multiscatter ≈ 0.3 ms once per optics config; sky-view+froxels per frame ≤ 0.5 ms; horizon map once per domain (seconds, CPU, below-normal thread).
 
 ## 9. Crate/module layout
@@ -138,13 +138,13 @@ Dependency-ordered; every gate = fmt/clippy/test on nodes + a real-data proof re
 4. **Honesty drift** (sub-grid noise or tuned constants quietly becoming "the look"): noise off by default and labeled; all optics constants in one reviewed table; IR constants validated against a real GOES scene of comparable convection.
 5. **Blue Marble distribution friction** (hosting, size, offline use): NASA imagery is public domain; release-asset hosting + sha256 manifest reuses the shipped `self_update.rs` pattern; per-month lazy fetch keeps first-use ≤ ~100 MB; bundled 8 km emergency fallback (~10 MB) so the renderer never hard-fails offline.
 
-**Questions only the owner can answer:**
-1. VRAM budget ceiling on the primary box (default proposed: 768 MB) and whether SimSat may exceed it when the radar app is idle?
-2. Priority call: interactive-but-approximate (30 fps preview) vs offline-quality stills/loops — which gets polish first when they conflict (affects M4/M5 step counts and default resolutions)?
-3. Default virtual satellite: GOES-East slot only, or East/West/Himawari selectable at v1?
-4. Acceptable first-run download size for the Blue Marble pack (60–100 MB lazy vs ~500 MB full-year), and is GitHub release-asset hosting acceptable long-term?
-5. Is spherical-earth (WRF-native) geometry acceptable, given it forfeits pixel-exact registration with real ABI fixed-grid imagery?
-6. Should IR eventually include a water-vapor band (6.2 µm) — affects whether QVAPOR gets a full brick channel now or later?
+**Owner decisions (2026-07-07 — "advanced product, best possible within reason, no supercomputer shit"):**
+1. **VRAM: liberal.** Default budget raised to 2 GB (knob still exposed); SimSat may expand further when the radar app is idle. Target GPU class unchanged (high-end consumer, not datacenter) — "within reason" means it must run great on a serious desktop, not that it must be small.
+2. **Polish: everything.** No either/or — offline frames render at full quality (384+ steps, full-res), interactive preview holds 30 fps by adapting resolution/steps, both paths get finish work. When a milestone forces sequencing, offline/loop quality lands first within that milestone, preview parity immediately after.
+3. **Satellites: East/West/Himawari selectable at v1** (shared camera math; sub-lon + AHI/ABI pixel-pitch presets).
+4. **Blue Marble: full-year 2 km pack (~500 MB) is the default download**; lazy per-month remains as the low-bandwidth option; 500 m regional crop packs greenlit as follow-on. GitHub release-asset hosting accepted.
+5. **Spherical earth accepted** — the standard is physical plausibility, not pixel registration with real ABI imagery.
+6. **QVAPOR gets a full brick channel now** so a 6.2 µm water-vapor IR band is a shader-only addition later.
 
 ---
 
