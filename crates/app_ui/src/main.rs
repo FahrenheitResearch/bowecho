@@ -52,6 +52,7 @@ mod event_loop_builder;
 mod farm_live;
 mod fonts;
 mod gbvtd_retrieval;
+mod geo_helpers;
 mod glm_layer;
 mod grid_composites;
 mod guide;
@@ -192,6 +193,13 @@ pub(crate) use overlays::{OverlayView, overlay_state_chip};
 use self_update::security_update_status_label;
 use self_update::{
     SelfUpdateEvent, SelfUpdatePhase, cleanup_stale_update_artifacts, relaunch_after_self_update,
+};
+// v0.29.4 phase-1 extraction #6: the pure geometry helpers moved VERBATIM to
+// `geo_helpers.rs` (docs/main-decomposition-plan.md); these re-exports keep
+// every existing `crate::…` / unqualified reference compiling unchanged.
+use geo_helpers::{
+    angle_delta_deg, basemap_line_contains_lon_lat, graticule_step, haversine_km, normalize_lon,
+    plot_domain_bounds_from_corners, range_radius_deg,
 };
 use ui_core::geo::{aeqd_forward_km, aeqd_inverse_km};
 // v0.29 Phase 4c: the FrameHistory family moved VERBATIM into the shared
@@ -43665,26 +43673,6 @@ fn us_state_abbr_for_lon_lat(lat: f32, lon: f32) -> Option<&'static str> {
     best_bbox.map(us_state_abbr_for_bbox)
 }
 
-fn basemap_line_contains_lon_lat(line: &basemap_data::BasemapLine, lon: f32, lat: f32) -> bool {
-    if line.points.len() < 3 {
-        return false;
-    }
-    let mut inside = false;
-    let mut previous = line.points[line.points.len() - 1];
-    for current in line.points {
-        let crosses = (current.1 > lat) != (previous.1 > lat);
-        if crosses {
-            let lon_at_lat =
-                (previous.0 - current.0) * (lat - current.1) / (previous.1 - current.1) + current.0;
-            if lon < lon_at_lat {
-                inside = !inside;
-            }
-        }
-        previous = *current;
-    }
-    inside
-}
-
 fn us_state_abbr_for_bbox(bbox: [f32; 4]) -> &'static str {
     let lon = (bbox[0] + bbox[2]) * 0.5;
     let lat = (bbox[1] + bbox[3]) * 0.5;
@@ -44570,12 +44558,6 @@ fn site_marker_label(site: &RadarSite) -> String {
         _ if site_is_terminal_radar(site) => format!("{} TDWR", site.level2_id),
         _ => site.level2_id.clone(),
     }
-}
-
-fn range_radius_deg(latitude_deg: f32, range_km: f32) -> (f32, f32) {
-    let lat_radius = range_km / 111.32;
-    let lon_scale = (111.32 * latitude_deg.to_radians().cos().abs()).max(22.0);
-    (lat_radius, range_km / lon_scale)
 }
 
 fn grid_range_km(grid: &MomentGrid) -> Option<f32> {
@@ -45608,11 +45590,6 @@ fn hazard_focus_view(bbox: [f32; 4]) -> (f32, f32, f32) {
     (lat, lon, scale)
 }
 
-fn angle_delta_deg(left: f32, right: f32) -> f32 {
-    let delta = (left - right).abs().rem_euclid(360.0);
-    delta.min(360.0 - delta)
-}
-
 fn moment_units(moment: &MomentType) -> &'static str {
     match moment {
         MomentType::Reflectivity => "dBZ",
@@ -45900,17 +45877,6 @@ fn plain_context_menu_allowed(modifiers: egui::Modifiers, right_click_loads_near
 /// the chord keeps panning like it always did.
 fn plot_domain_shortcut_active(modifiers: egui::Modifiers) -> bool {
     modifiers.ctrl && modifiers.shift && !modifiers.alt
-}
-
-/// Two screen-corner (lon, lat) samples -> rw-ui plot-domain bounds
-/// `(west, east, south, north)`, whichever way the box was dragged.
-fn plot_domain_bounds_from_corners(a: (f32, f32), b: (f32, f32)) -> (f64, f64, f64, f64) {
-    (
-        f64::from(a.0.min(b.0)),
-        f64::from(a.0.max(b.0)),
-        f64::from(a.1.min(b.1)),
-        f64::from(a.1.max(b.1)),
-    )
 }
 
 fn chip_width_for_text(text: &str) -> f32 {
@@ -46380,26 +46346,6 @@ fn format_cursor_readout(
         nyquist,
         realtime
     )
-}
-
-fn graticule_step(visible_degrees: f32) -> f32 {
-    if visible_degrees > 140.0 {
-        30.0
-    } else if visible_degrees > 80.0 {
-        20.0
-    } else if visible_degrees > 40.0 {
-        10.0
-    } else if visible_degrees > 16.0 {
-        5.0
-    } else if visible_degrees > 6.0 {
-        2.0
-    } else if visible_degrees > 2.0 {
-        1.0
-    } else if visible_degrees > 0.7 {
-        0.5
-    } else {
-        0.25
-    }
 }
 
 fn world_place_label_rank(map_scale: f32) -> Option<u8> {
@@ -47569,27 +47515,6 @@ pub(crate) fn normalize_event_track_model_slug(model_slug: &str) -> String {
     } else {
         rustwx_core::ModelId::Hrrr.as_str().to_owned()
     }
-}
-
-fn normalize_lon(longitude_deg: f32) -> f32 {
-    let mut longitude_deg = longitude_deg;
-    while longitude_deg > 180.0 {
-        longitude_deg -= 360.0;
-    }
-    while longitude_deg < -180.0 {
-        longitude_deg += 360.0;
-    }
-    longitude_deg
-}
-
-fn haversine_km(lat_a: f32, lon_a: f32, lat_b: f32, lon_b: f32) -> f32 {
-    let earth_radius_km = 6371.0_f32;
-    let d_lat = (lat_b - lat_a).to_radians();
-    let d_lon = (lon_b - lon_a).to_radians();
-    let lat_a = lat_a.to_radians();
-    let lat_b = lat_b.to_radians();
-    let a = (d_lat / 2.0).sin().powi(2) + lat_a.cos() * lat_b.cos() * (d_lon / 2.0).sin().powi(2);
-    2.0 * earth_radius_km * a.sqrt().atan2((1.0 - a).max(0.0).sqrt())
 }
 
 fn normalize_radar_station_id(site_id: &str) -> Option<String> {
@@ -51929,11 +51854,6 @@ mod tests {
 
         let index = nearest_site_index(&sites, 35.4, -97.2).expect("nearest station");
         assert_eq!(sites[index].level2_id, "KTLX");
-    }
-
-    #[test]
-    fn haversine_is_zero_for_same_point() {
-        assert!(haversine_km(35.333, -97.278, 35.333, -97.278) < 0.001);
     }
 
     /// v0.29 Phase 3: the ranking runs over the REAL union catalog
@@ -71463,22 +71383,6 @@ mod tests {
             !plot_domain_shortcut_active(ctrl),
             "Ctrl alone stays the best-radar click"
         );
-    }
-
-    #[test]
-    fn plot_domain_bounds_order_any_drag_direction() {
-        // North-east drag and south-west drag produce identical bounds.
-        let bounds = plot_domain_bounds_from_corners((-99.5, 36.2), (-97.0, 34.1));
-        let flipped = plot_domain_bounds_from_corners((-97.0, 34.1), (-99.5, 36.2));
-        assert_eq!(bounds, flipped);
-        let (west, east, south, north) = bounds;
-        assert!(west < east);
-        assert!(south < north);
-        // f32 corners widen to f64 bounds: compare within f32 precision.
-        assert!((west - -99.5).abs() < 1e-4);
-        assert!((east - -97.0).abs() < 1e-4);
-        assert!((south - 34.1).abs() < 1e-4);
-        assert!((north - 36.2).abs() < 1e-4);
     }
 
     #[test]

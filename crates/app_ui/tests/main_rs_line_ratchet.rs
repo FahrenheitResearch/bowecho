@@ -5,8 +5,9 @@
 //! History (post-extraction main.rs line count + 200 headroom):
 //! - v0.29.4 extraction #1 (`self_update.rs`): 78,184 lines → ceiling 78,384.
 //! - v0.29.4 extraction #2 (`hazard_geom.rs`): 73,507 lines → ceiling 73,707.
+//! - v0.29.4 extraction #6 (`geo_helpers.rs`): 73,411 lines → ceiling 73,611.
 
-const CEILING: usize = 73_707;
+const CEILING: usize = 73_611;
 
 #[test]
 fn main_rs_stays_under_the_line_ratchet_ceiling() {
