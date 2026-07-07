@@ -24,15 +24,28 @@ pub(crate) fn github_latest_release_api_url(repo_url: &str) -> Option<String> {
 /// kits that leave `repo_url` empty.
 pub(crate) const CANONICAL_REPO_URL: &str = "https://github.com/FahrenheitResearch/bowecho";
 
-/// Endpoint for the passive update check. An empty `repo_url` is the stock
-/// exe wearing brand-kit assets, so it still checks the canonical feed; only
-/// an explicit non-GitHub override disables the check (the distributor is
-/// self-hosting releases).
-pub(crate) fn update_check_api_url(repo_url: &str) -> Option<String> {
-    if repo_url.trim().is_empty() {
-        return github_latest_release_api_url(CANONICAL_REPO_URL);
+/// The repo a brand's `repo_url` actually means — the ONE place the
+/// "empty means canonical" rule lives. An empty `repo_url` is the stock exe
+/// wearing brand-kit assets, so it resolves to the canonical repo; anything
+/// else is the distributor's own override, verbatim (trimmed). Every
+/// consumer — the passive update check, the releases page, and the
+/// self-update repo pin — must resolve through here so ".git"/trailing-slash
+/// spellings behave identically across all of them.
+pub(crate) fn effective_repo_url(repo_url: &str) -> &str {
+    let trimmed = repo_url.trim();
+    if trimmed.is_empty() {
+        CANONICAL_REPO_URL
+    } else {
+        trimmed
     }
-    github_latest_release_api_url(repo_url)
+}
+
+/// Endpoint for the passive update check. An empty `repo_url` still checks
+/// the canonical feed (see [`effective_repo_url`]); only an explicit
+/// non-GitHub override disables the check (the distributor is self-hosting
+/// releases).
+pub(crate) fn update_check_api_url(repo_url: &str) -> Option<String> {
+    github_latest_release_api_url(effective_repo_url(repo_url))
 }
 
 pub(crate) fn releases_page_url(brand: &settings::BrandConfig) -> Option<String> {
@@ -40,17 +53,12 @@ pub(crate) fn releases_page_url(brand: &settings::BrandConfig) -> Option<String>
         .valid_http_url(&brand.releases_url)
         .map(str::to_owned)
         .or_else(|| {
-            let repo_url = if brand.repo_url.trim().is_empty() {
-                CANONICAL_REPO_URL
-            } else {
-                brand.repo_url.as_str()
-            };
-            let (owner, name) = github_repo_parts(repo_url)?;
+            let (owner, name) = github_repo_parts(effective_repo_url(&brand.repo_url))?;
             Some(format!("https://github.com/{owner}/{name}/releases"))
         })
 }
 
-fn github_repo_parts(repo_url: &str) -> Option<(&str, &str)> {
+pub(crate) fn github_repo_parts(repo_url: &str) -> Option<(&str, &str)> {
     let repo = repo_url.trim().trim_end_matches('/');
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
     let repo = repo
@@ -487,6 +495,33 @@ mod tests {
         assert_eq!(
             releases_page_url(&brand),
             Some("https://github.com/FahrenheitResearch/bowecho/releases".to_owned())
+        );
+
+        // ".git" / trailing-slash spellings of the canonical repo resolve to
+        // the same feed as the empty fallback — every consumer goes through
+        // `effective_repo_url` + `github_repo_parts`, so the update check
+        // and the self-update pin cannot disagree over a suffix.
+        for spelling in [
+            "https://github.com/FahrenheitResearch/bowecho.git",
+            "https://github.com/FahrenheitResearch/bowecho/",
+            "  https://github.com/FahrenheitResearch/bowecho  ",
+        ] {
+            assert_eq!(
+                update_check_api_url(spelling),
+                update_check_api_url(""),
+                "{spelling:?} must hit the canonical feed"
+            );
+            assert_eq!(
+                github_repo_parts(effective_repo_url(spelling)),
+                github_repo_parts(CANONICAL_REPO_URL),
+                "{spelling:?} must parse to the canonical repo"
+            );
+        }
+        assert_eq!(effective_repo_url(""), CANONICAL_REPO_URL);
+        assert_eq!(effective_repo_url("   "), CANONICAL_REPO_URL);
+        assert_eq!(
+            effective_repo_url(" https://example.org/releases "),
+            "https://example.org/releases"
         );
     }
 }

@@ -344,6 +344,10 @@ pub enum SatResponse {
     Frame {
         key: SatRunKey,
         hhmm: u16,
+        /// The frame rendered through the legacy pre-calibration stretch,
+        /// so the selected IR enhancement did not apply (see
+        /// [`render_sat_pixels`]); `false` on errors.
+        legacy: bool,
         result: Box<Result<SatFrameImage, String>>,
     },
 }
@@ -765,6 +769,11 @@ struct WorkerState {
 
 struct ColoredSatFrame {
     frame: SatFrameImage,
+    /// The frame predates the true-Kelvin AHI calibration and rendered
+    /// through the legacy percentile stretch — the selected IR enhancement
+    /// did NOT apply (see [`render_sat_pixels`]). Surfaced to the UI so the
+    /// enhancement picker does not look silently dead on stored frames.
+    legacy: bool,
 }
 
 /// Frame + run grid for the radar-map layer (one GridFile open per call;
@@ -799,8 +808,8 @@ fn load_frame(
     store_root: &Path,
     key: &SatRunKey,
     hhmm: u16,
-) -> Result<SatFrameImage, String> {
-    load_colored_frame(state, store_root, key, hhmm, false).map(|colored| colored.frame)
+) -> Result<ColoredSatFrame, String> {
+    load_colored_frame(state, store_root, key, hhmm, false)
 }
 
 fn load_colored_frame(
@@ -842,7 +851,7 @@ fn load_colored_frame(
     // Composite (true/natural-color) frames carry three baked RGB planes
     // instead of a single band; render them straight to Color32.
     let is_composite = meta.variables.iter().any(|var| var.name == COMPOSITE_R_VAR);
-    let pixels = if is_composite {
+    let (pixels, legacy) = if is_composite {
         let r = reader
             .read_full_2d(COMPOSITE_R_VAR)
             .map_err(|err| err.to_string())?;
@@ -852,7 +861,10 @@ fn load_colored_frame(
         let b = reader
             .read_full_2d(COMPOSITE_B_VAR)
             .map_err(|err| err.to_string())?;
-        render_composite_pixels(&r, &g, &b, nx, ny, flip_rows)
+        (
+            render_composite_pixels(&r, &g, &b, nx, ny, flip_rows),
+            false,
+        )
     } else {
         let variable = meta
             .variables
@@ -882,6 +894,7 @@ fn load_colored_frame(
             image: ColorImage::new([nx, ny], pixels),
             read_ms: started.elapsed().as_secs_f32() * 1000.0,
         },
+        legacy,
     })
 }
 
@@ -928,6 +941,9 @@ fn render_composite_pixels(
     pixels
 }
 
+/// Returns the colored pixels plus whether the frame took the LEGACY
+/// pre-calibration stretch (in which case `enhancement` did not apply —
+/// callers surface that so the enhancement picker does not look dead).
 #[allow(clippy::too_many_arguments)]
 fn render_sat_pixels(
     variable_name: &str,
@@ -938,7 +954,7 @@ fn render_sat_pixels(
     flip_rows: bool,
     map_overlay: bool,
     enhancement: IrEnhancement,
-) -> Vec<Color32> {
+) -> (Vec<Color32>, bool) {
     // Both GOES ABI and (since the true-count block-5 calibration in
     // `ingest_latest_himawari`) Himawari AHI store REAL Kelvin brightness
     // temperature, so every IR band renders through absolute-temperature
@@ -946,13 +962,27 @@ fn render_sat_pixels(
     // raw-ish pseudo-BT (~326-330 K flat) that an absolute palette would
     // clamp to one warm color — detect that implausible distribution and
     // keep the old percentile stretch for just those legacy frames.
+    //
+    // B07 (3.9 µm) is EXEMPT from the detector: daytime shortwave-IR BT
+    // legitimately reaches 330-400 K from reflected sunlight, so a
+    // correctly calibrated daylight B07 disk can median past the threshold
+    // and would silently drop to the percentile stretch (ignoring the
+    // selected enhancement, and flickering across a loop as the median
+    // crosses it). For bands 8-16 a >320 K median is physically impossible
+    // on a real disk, so the heuristic stays. Legacy stored B07 frames now
+    // render through the absolute palette and look wrong-ish until they
+    // age out of the rolling store — accepted.
     let ir_band = (7..=16).contains(&band);
-    if variable_name.starts_with("ahi_bt_") && ir_band && legacy_pseudo_bt(values) {
+    if variable_name.starts_with("ahi_bt_") && (8..=16).contains(&band) && legacy_pseudo_bt(values)
+    {
         eprintln!(
             "sat: {variable_name} median > {LEGACY_PSEUDO_BT_MEDIAN_K} K (pre-calibration \
              pseudo-BT frame) — falling back to the legacy percentile stretch"
         );
-        return render_ahi_legacy_stretch(values, nx, ny, flip_rows, map_overlay);
+        return (
+            render_ahi_legacy_stretch(values, nx, ny, flip_rows, map_overlay),
+            true,
+        );
     }
     let static_anchors = if ir_band {
         ir_enhancement_anchors(band, enhancement)
@@ -977,7 +1007,7 @@ fn render_sat_pixels(
             pixels.push(Color32::from_rgba_unmultiplied(r, g, b, alpha));
         }
     }
-    pixels
+    (pixels, false)
 }
 
 /// Median BT above which a stored AHI "brightness temperature" plane cannot
@@ -1539,10 +1569,16 @@ fn himawari_selector(field: &SatelliteGridField) -> serde_json::Value {
 /// model dirs, so this fork's blast radius is Himawari alone; retire it
 /// for the upstream writer once rw-sat navigates sweep=y correctly (the
 /// tripwire test fires when that happens).
+/// `mesh` is an optional precomputed `(lat, lon)` navigation mesh: the
+/// full-disk mesh is multi-second and ~60-120 MB at downsample 4 (~1 GB
+/// at 1), and the IR ingest already computes it for off-earth masking —
+/// passing it in bakes the EXACT mesh the mask used instead of navigating
+/// the whole disk a second time. `None` navigates here as before.
 fn write_himawari_grid_frame(
     store_root: &Path,
     field: &SatelliteGridField,
     written_unix: u64,
+    mesh: Option<(Vec<f32>, Vec<f32>)>,
 ) -> Result<WrittenFrame, String> {
     let scene = &field.scene;
     let model = sanitize_store_token(&scene.model);
@@ -1558,7 +1594,16 @@ fn write_himawari_grid_frame(
             field.values.len()
         ));
     }
-    let (lat, lon) = ahi_lat_lon_mesh(scene);
+    if let Some((lat, lon)) = &mesh
+        && (lat.len() != nx.saturating_mul(ny) || lon.len() != nx.saturating_mul(ny))
+    {
+        return Err(format!(
+            "precomputed AHI mesh {}x{} does not match grid {nx}x{ny}",
+            lat.len(),
+            lon.len()
+        ));
+    }
+    let (lat, lon) = mesh.unwrap_or_else(|| ahi_lat_lon_mesh(scene));
     let shape = GridShape::new(nx, ny).map_err(|err| err.to_string())?;
     let grid = LatLonGrid::new(shape, lat, lon).map_err(|err| err.to_string())?;
 
@@ -1802,6 +1847,11 @@ fn ingest_latest_himawari(
     // true-count fix the visible composite path uses. Stored AHI IR is real
     // brightness temperature from here on and renders through the same
     // absolute-Kelvin palettes as GOES.
+    // The sweep=y navigation mesh is computed ONCE here (multi-second and
+    // ~60-120 MB at downsample 4): it masks off-earth IR pixels below AND
+    // is handed to the writer as the frame's baked geometry, so mask and
+    // stored mesh cannot diverge.
+    let mesh = ahi_lat_lon_mesh(&field.scene);
     if (7..=16).contains(&band) {
         let true_counts = ahi_true_counts_on_grid(&paths, spec.downsample.max(1))?;
         if true_counts.len() != field.values.len() {
@@ -1821,8 +1871,7 @@ fn ingest_latest_himawari(
         // BT < 100 K noise). The navigation mesh is authoritative — blank
         // anything it cannot geolocate so absolute-Kelvin palettes render
         // clean space instead of cold speckle blocks.
-        let (mesh_lat, _) = ahi_lat_lon_mesh(&field.scene);
-        for (value, lat) in field.values.iter_mut().zip(&mesh_lat) {
+        for (value, lat) in field.values.iter_mut().zip(&mesh.0) {
             if !lat.is_finite() {
                 *value = f32::NAN;
             }
@@ -1833,9 +1882,14 @@ fn ingest_latest_himawari(
     let ny = field.scene.fixed_grid.ny;
     // AHI is CF sweep_angle_axis "y": write through the local sweep=y
     // writer so the stored mesh is real AHI navigation (rw-sat's writer
-    // navigates with the GOES "x" convention; see write_himawari_grid_frame).
-    let frame =
-        write_himawari_grid_frame(store_root, &field, Utc::now().timestamp().max(0) as u64)?;
+    // navigates with the GOES "x" convention; see write_himawari_grid_frame),
+    // reusing the mesh computed for the mask above.
+    let frame = write_himawari_grid_frame(
+        store_root,
+        &field,
+        Utc::now().timestamp().max(0) as u64,
+        Some(mesh),
+    )?;
     for id in row_ids {
         send(SatResponse::FrameWritten {
             id,
@@ -2295,6 +2349,45 @@ fn himawari_window_segments(window: SatNativeWindow) -> Result<(u8, u8), String>
 /// The scene's `sector` carries the window token
 /// (`fulldisk_<win…>`), so windowed frames open their own run-dir family
 /// and successive scans of the same window loop in the player.
+/// Read the contiguous byte span of segment rows
+/// `first_row..first_row + row_count` (zero-based within the segment's data
+/// block, rows of `columns` big/little-endian u16 samples) by seeking past
+/// the header and everything north of the span. Validates the file holds
+/// all `seg_lines` declared rows first, so a truncated download fails as
+/// loudly as the old whole-file read did.
+fn read_ahi_row_span(
+    path: &Path,
+    data_start: u64,
+    columns: usize,
+    seg_lines: usize,
+    first_row: usize,
+    row_count: usize,
+) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    if first_row + row_count > seg_lines {
+        return Err(format!(
+            "AHI row span {first_row}+{row_count} exceeds the segment's {seg_lines} lines"
+        ));
+    }
+    let row_bytes = columns as u64 * 2;
+    let needed = data_start + seg_lines as u64 * row_bytes;
+    let mut file = std::fs::File::open(path).map_err(|err| err.to_string())?;
+    let have = file.metadata().map_err(|err| err.to_string())?.len();
+    if have < needed {
+        return Err(format!(
+            "AHI HSD data block short in {}: need {} bytes, have {}",
+            path.display(),
+            needed,
+            have
+        ));
+    }
+    file.seek(SeekFrom::Start(data_start + first_row as u64 * row_bytes))
+        .map_err(|err| err.to_string())?;
+    let mut bytes = vec![0u8; row_count * columns * 2];
+    file.read_exact(&mut bytes).map_err(|err| err.to_string())?;
+    Ok(bytes)
+}
+
 fn assemble_ahi_window_counts(
     paths: &[PathBuf],
     window: SatNativeWindow,
@@ -2406,24 +2499,24 @@ fn assemble_ahi_window_counts(
                 calibration.error_pixel_count,
                 calibration.outside_scan_count,
             ));
-        let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
-        let data_start = header.total_header_length as usize;
-        let seg_lines = usize::from(header.data.lines);
-        if bytes.len() < data_start + seg_lines * columns * 2 {
-            return Err(format!(
-                "AHI HSD data block short in {}: need {} bytes, have {}",
-                path.display(),
-                data_start + seg_lines * columns * 2,
-                bytes.len()
-            ));
-        }
+        // Read ONLY the overlapping row span: a window needs 10-30 MB of
+        // rows out of a ~97 MB full-resolution segment, so seeking to the
+        // contiguous span keeps the fetch-side memory/IO window-sized too.
+        let bytes = read_ahi_row_span(
+            path,
+            u64::from(header.total_header_length),
+            columns,
+            usize::from(header.data.lines),
+            (overlap_first - seg_first) as usize,
+            (overlap_last - overlap_first + 1) as usize,
+        )?;
         let little = matches!(
             header.byte_order,
             rw_sat::himawari::HimawariByteOrder::Little
         );
         for line in overlap_first..=overlap_last {
-            let row = (line - seg_first) as usize;
-            let row_start = data_start + row * columns * 2;
+            let row = (line - overlap_first) as usize;
+            let row_start = row * columns * 2;
             for col in crop.col_start..crop.col_start + crop.col_count {
                 let o = row_start + col * 2;
                 let raw = if little {
@@ -3556,10 +3649,15 @@ fn worker_loop(
             }
             SatRequest::LoadFrame { key, hhmm } => {
                 let result = load_frame(&mut state, &store_root, &key, hhmm);
+                let legacy = result
+                    .as_ref()
+                    .map(|colored| colored.legacy)
+                    .unwrap_or(false);
                 if !send(SatResponse::Frame {
                     key,
                     hhmm,
-                    result: Box::new(result),
+                    legacy,
+                    result: Box::new(result.map(|colored| colored.frame)),
                 }) {
                     return;
                 }
@@ -3967,7 +4065,9 @@ mod tests {
             run: written.run.clone(),
         };
         let mut state = WorkerState::default();
-        let frame = load_frame(&mut state, &dir, &key, 1851).expect("frame loads");
+        let frame = load_frame(&mut state, &dir, &key, 1851)
+            .expect("frame loads")
+            .frame;
         assert_eq!(frame.hhmm, 1851);
         assert_eq!(frame.image.size, [8, 6]);
         // The synthetic grid stores north first (y scan angles descend), so
@@ -3997,7 +4097,7 @@ mod tests {
     fn himawari_ir_is_colorized_not_grayscale() {
         // Kelvin brightness temps: NaN, warm surface, a -60 C top, a -40 C top.
         let values = vec![f32::NAN, 300.0, 213.0, 233.0];
-        let pixels = render_sat_pixels(
+        let (pixels, legacy) = render_sat_pixels(
             "cmi_c13",
             13,
             &values,
@@ -4008,6 +4108,10 @@ mod tests {
             IrEnhancement::Cimss,
         );
 
+        assert!(
+            !legacy,
+            "true-Kelvin GOES IR never takes the legacy stretch"
+        );
         assert_eq!(pixels[0].a(), 0, "NaN stays transparent");
         // -60 C cloud top is RED in the enhancement — proof it is colorized,
         // not the old grayscale stretch (which was r == g == b).
@@ -4071,6 +4175,53 @@ mod tests {
         }
     }
 
+    /// The windowed decode seeks to its row span instead of reading the
+    /// whole ~97 MB segment: on a synthetic segment the seek math must hand
+    /// back exactly the bytes the old full read indexed, and a truncated
+    /// file must still fail with the full byte accounting.
+    #[test]
+    fn ahi_row_span_read_matches_the_full_read() {
+        let dir = test_dir("ahi-row-span");
+        let path = dir.join("segment.bin");
+        let (data_start, columns, seg_lines) = (64usize, 8usize, 10usize);
+        // Fake header, then rows of u16 values encoding (row, col) so any
+        // off-by-one in the seek arithmetic shows up in the decoded values.
+        let mut file_bytes = vec![0xAA_u8; data_start];
+        for row in 0..seg_lines {
+            for col in 0..columns {
+                file_bytes.extend_from_slice(&((row * 100 + col) as u16).to_le_bytes());
+            }
+        }
+        std::fs::write(&path, &file_bytes).unwrap();
+
+        // Middle span (rows 3..=6): byte-identical to the slice the old
+        // whole-file read would have indexed at data_start + row*columns*2.
+        let span = read_ahi_row_span(&path, data_start as u64, columns, seg_lines, 3, 4)
+            .expect("span reads");
+        assert_eq!(span.len(), 4 * columns * 2);
+        assert_eq!(
+            span.as_slice(),
+            &file_bytes[data_start + 3 * columns * 2..data_start + 7 * columns * 2]
+        );
+        // Decoded first/last samples land on the expected rows/cols.
+        assert_eq!(u16::from_le_bytes([span[0], span[1]]), 300);
+        let last = span.len() - 2;
+        assert_eq!(u16::from_le_bytes([span[last], span[last + 1]]), 607);
+
+        // Full span and edge spans work; an out-of-segment span is refused.
+        let all = read_ahi_row_span(&path, data_start as u64, columns, seg_lines, 0, seg_lines)
+            .expect("full span reads");
+        assert_eq!(all.as_slice(), &file_bytes[data_start..]);
+        assert!(read_ahi_row_span(&path, data_start as u64, columns, seg_lines, 7, 4).is_err());
+
+        // A truncated segment still fails loudly with byte accounting.
+        std::fs::write(&path, &file_bytes[..file_bytes.len() - 1]).unwrap();
+        let error = read_ahi_row_span(&path, data_start as u64, columns, seg_lines, 3, 4)
+            .expect_err("short file is refused");
+        assert!(error.contains("data block short"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// FIX R6: the stored Himawari mesh must be CF sweep=y navigation.
     /// Reference points from pyproj 3.7.2 (`+proj=geos +h=35785863
     /// +a=6378137 +b=6356752.3 +lon_0=140.7`) at scan angles x=0.04 rad,
@@ -4082,7 +4233,7 @@ mod tests {
     fn himawari_frames_bake_a_cf_sweep_y_mesh() {
         let dir = test_dir("ahi-sweep");
         let field = synthetic_ahi_field(2, 0, vec![0.0, 0.04]);
-        let frame = write_himawari_grid_frame(&dir, &field, 7).expect("frame writes");
+        let frame = write_himawari_grid_frame(&dir, &field, 7, None).expect("frame writes");
         assert_eq!((frame.model.as_str(), frame.hhmm), ("h9", 200));
 
         let grid = GridFile::open(&dir.join("h9").join(&frame.run).join("grid.rwg")).unwrap();
@@ -4123,11 +4274,12 @@ mod tests {
     #[test]
     fn himawari_writer_follows_the_store_contract() {
         let dir = test_dir("ahi-store");
-        let first = write_himawari_grid_frame(&dir, &synthetic_ahi_field(2, 0, vec![0.0, 0.04]), 7)
-            .expect("first frame");
+        let first =
+            write_himawari_grid_frame(&dir, &synthetic_ahi_field(2, 0, vec![0.0, 0.04]), 7, None)
+                .expect("first frame");
         assert!(first.created_run);
         let second =
-            write_himawari_grid_frame(&dir, &synthetic_ahi_field(2, 10, vec![0.0, 0.04]), 8)
+            write_himawari_grid_frame(&dir, &synthetic_ahi_field(2, 10, vec![0.0, 0.04]), 8, None)
                 .expect("second frame joins the run");
         assert!(!second.created_run);
         assert_eq!(second.run, first.run);
@@ -4138,7 +4290,7 @@ mod tests {
 
         // A different fixed grid (e.g. another downsample) forks the run.
         let moved =
-            write_himawari_grid_frame(&dir, &synthetic_ahi_field(2, 20, vec![0.0, 0.05]), 9)
+            write_himawari_grid_frame(&dir, &synthetic_ahi_field(2, 20, vec![0.0, 0.05]), 9, None)
                 .expect("changed grid writes");
         assert!(moved.created_run);
         assert_ne!(moved.run, first.run);
@@ -4152,8 +4304,63 @@ mod tests {
             model: first.model.clone(),
             run: first.run.clone(),
         };
-        let frame = load_frame(&mut state, &dir, &key, 210).expect("t0210 loads");
+        let frame = load_frame(&mut state, &dir, &key, 210)
+            .expect("t0210 loads")
+            .frame;
         assert_eq!(frame.image.size, [2, 2]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ingest computes the navigation mesh once (for the off-earth
+    /// mask) and hands it to the writer: a frame written with the
+    /// precomputed mesh must land in the SAME run dir with the SAME grid
+    /// hash as one whose writer navigated for itself — proof the mask and
+    /// the baked geometry are one and the same mesh.
+    #[test]
+    fn himawari_writer_accepts_the_ingests_precomputed_mesh() {
+        let dir = test_dir("ahi-shared-mesh");
+        let field = synthetic_ahi_field(2, 0, vec![0.0, 0.04]);
+        let self_navigated = write_himawari_grid_frame(&dir, &field, 7, None).expect("first frame");
+
+        let later = synthetic_ahi_field(2, 10, vec![0.0, 0.04]);
+        let mesh = ahi_lat_lon_mesh(&later.scene);
+        let shared =
+            write_himawari_grid_frame(&dir, &later, 8, Some(mesh)).expect("precomputed-mesh frame");
+        assert_eq!(shared.run, self_navigated.run, "same mesh, same run dir");
+        assert_eq!(shared.grid_hash, self_navigated.grid_hash);
+        assert!(!shared.created_run);
+
+        // A mesh that does not match the grid is refused loudly instead of
+        // baking bogus geometry.
+        let wrong = Some((vec![0.0_f32], vec![0.0_f32]));
+        assert!(write_himawari_grid_frame(&dir, &later, 9, wrong).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Loaded frames carry the legacy-stretch flag so the UI can say WHY
+    /// the IR enhancement picker has no effect on pre-calibration stored
+    /// frames (yesterday's store is full of them) instead of looking dead.
+    #[test]
+    fn loaded_legacy_frames_carry_the_legacy_flag() {
+        let dir = test_dir("ahi-legacy-flag");
+        // A pre-calibration pseudo-BT plane: flat ~326-330 "Kelvin".
+        let mut stale = synthetic_ahi_field(2, 0, vec![0.0, 0.04]);
+        stale.values = vec![326.0, 327.5, 328.0, 329.5];
+        let written = write_himawari_grid_frame(&dir, &stale, 7, None).expect("legacy writes");
+        let key = SatRunKey {
+            model: written.model.clone(),
+            run: written.run.clone(),
+        };
+        let mut state = WorkerState::default();
+        let colored = load_frame(&mut state, &dir, &key, written.hhmm).expect("legacy loads");
+        assert!(colored.legacy, "pseudo-BT frame is flagged for the UI");
+
+        // A true-Kelvin frame in the same run is NOT flagged.
+        let mut real = synthetic_ahi_field(2, 10, vec![0.0, 0.04]);
+        real.values = vec![195.0, 233.0, 273.0, 288.0];
+        let written = write_himawari_grid_frame(&dir, &real, 8, None).expect("real writes");
+        let colored = load_frame(&mut state, &dir, &key, written.hhmm).expect("real loads");
+        assert!(!colored.legacy, "true-Kelvin frame renders enhanced");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4206,7 +4413,9 @@ mod tests {
 
         let key = SatRunKey { model, run };
         let mut state = WorkerState::default();
-        let frame = load_frame(&mut state, &store, &key, hhmm).expect("proof frame loads");
+        let frame = load_frame(&mut state, &store, &key, hhmm)
+            .expect("proof frame loads")
+            .frame;
         let mut rgba = Vec::with_capacity(frame.image.pixels.len() * 4);
         for pixel in frame.image.pixels {
             rgba.extend_from_slice(&[pixel.r(), pixel.g(), pixel.b(), pixel.a()]);
@@ -4278,7 +4487,9 @@ mod tests {
             model: frame.model.clone(),
             run: frame.run.clone(),
         };
-        let loaded = load_frame(&mut state, &dir, &key, frame.hhmm).expect("composite loads");
+        let loaded = load_frame(&mut state, &dir, &key, frame.hhmm)
+            .expect("composite loads")
+            .frame;
         assert_eq!(loaded.image.size, [nx, ny]);
 
         // Vegetation pixel: opaque, green channel dominant (the natural-color
@@ -4384,7 +4595,9 @@ mod tests {
             .expect("a composite run was written");
         let hhmm = *run.frames.last().expect("composite run has a frame");
         let mut state = WorkerState::default();
-        let frame = load_frame(&mut state, &store, &run.key, hhmm).expect("proof frame loads");
+        let frame = load_frame(&mut state, &store, &run.key, hhmm)
+            .expect("proof frame loads")
+            .frame;
 
         let mut rgba = Vec::with_capacity(frame.image.pixels.len() * 4);
         for pixel in &frame.image.pixels {
@@ -4498,7 +4711,7 @@ mod tests {
         // the median>320 K detector must route them through the legacy
         // stretch so they still colorize.
         let values = vec![f32::NAN, 326.0, 327.5, 328.0, 329.0, 330.0];
-        let pixels = render_sat_pixels(
+        let (pixels, legacy) = render_sat_pixels(
             "ahi_bt_c13",
             13,
             &values,
@@ -4509,6 +4722,7 @@ mod tests {
             IrEnhancement::Cimss,
         );
 
+        assert!(legacy, "the pseudo-BT fallback is flagged for the UI");
         assert_eq!(pixels[0].a(), 0, "NaN stays transparent");
         let cold = pixels[1]; // 326 -> coldest -> colorful
         let warm = pixels[5]; // 330 -> warmest
@@ -4528,6 +4742,38 @@ mod tests {
             !legacy_pseudo_bt(&[f32::NAN, 195.0, 233.0, 273.0, 288.0, 325.0]),
             "true-Kelvin distribution is not legacy"
         );
+
+        // B07 (3.9 µm) is exempt: a daytime shortwave-IR disk legitimately
+        // medians past 320 K (solar reflection reaches 330-400 K), so a
+        // correctly calibrated frame must keep the selected absolute
+        // enhancement instead of flapping into the percentile stretch.
+        let daytime_b07 = vec![f32::NAN, 285.0, 330.0, 345.0, 360.0, 395.0];
+        assert!(
+            legacy_pseudo_bt(&daytime_b07),
+            "daytime B07 medians past the threshold — exactly why it is exempt"
+        );
+        for enhancement in IrEnhancement::ALL {
+            let (ahi, ahi_legacy) = render_sat_pixels(
+                "ahi_bt_c07",
+                7,
+                &daytime_b07,
+                3,
+                2,
+                false,
+                false,
+                enhancement,
+            );
+            let (goes, _) =
+                render_sat_pixels("cmi_c07", 7, &daytime_b07, 3, 2, false, false, enhancement);
+            assert!(
+                !ahi_legacy,
+                "{enhancement:?}: B07 is exempt from the detector"
+            );
+            assert_eq!(
+                ahi, goes,
+                "{enhancement:?}: B07 must render absolute, never the legacy stretch"
+            );
+        }
     }
 
     #[test]
@@ -4688,7 +4934,7 @@ mod tests {
         let bt = synthetic_hurricane_bt(nx, ny);
 
         let started = std::time::Instant::now();
-        let pixels = render_sat_pixels(
+        let (pixels, _) = render_sat_pixels(
             "cmi_c13",
             13,
             &bt,
@@ -4728,7 +4974,7 @@ mod tests {
     fn ir_map_overlay_alpha_fades_warm_by_temperature() {
         // Kelvin: warm surface, mid cloud, cold storm top.
         let values = vec![290.0, 255.0, 210.0];
-        let overlay = render_sat_pixels(
+        let (overlay, _) = render_sat_pixels(
             "cmi_c13",
             13,
             &values,
@@ -4751,7 +4997,7 @@ mod tests {
         assert!(overlay[2].a() > 200, "cold storm top (-63 C) stays visible");
 
         // The full-screen player keeps the palette opaque (no BT fade).
-        let player = render_sat_pixels(
+        let (player, _) = render_sat_pixels(
             "cmi_c13",
             13,
             &values,
@@ -4970,7 +5216,9 @@ mod tests {
             model: frame.model.clone(),
             run: frame.run.clone(),
         };
-        let loaded = load_frame(&mut state, &dir, &key, frame.hhmm).expect("composite loads");
+        let loaded = load_frame(&mut state, &dir, &key, frame.hhmm)
+            .expect("composite loads")
+            .frame;
         assert_eq!(loaded.image.size, [nx, ny]);
 
         let veg = loaded.image.pixels[0];
@@ -5121,7 +5369,9 @@ mod tests {
             model: frame.model.clone(),
             run: frame.run.clone(),
         };
-        let loaded = load_frame(&mut state, &dir, &key, frame.hhmm).expect("windowed frame loads");
+        let loaded = load_frame(&mut state, &dir, &key, frame.hhmm)
+            .expect("windowed frame loads")
+            .frame;
         assert_eq!(loaded.image.size, [2, 2]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5202,7 +5452,9 @@ mod tests {
             .expect("an AHI composite run was written");
         let hhmm = *run.frames.last().expect("composite run has a frame");
         let mut state = WorkerState::default();
-        let frame = load_frame(&mut state, &store, &run.key, hhmm).expect("proof frame loads");
+        let frame = load_frame(&mut state, &store, &run.key, hhmm)
+            .expect("proof frame loads")
+            .frame;
 
         let (mut lit, mut rsum, mut gsum, mut bsum) = (0u64, 0u64, 0u64, 0u64);
         let mut rgba = Vec::with_capacity(frame.image.pixels.len() * 4);
@@ -5549,7 +5801,7 @@ mod tests {
         ] {
             save(
                 suffix,
-                render_sat_pixels(&name, band, &values, nx, ny, flip_rows, false, enhancement),
+                render_sat_pixels(&name, band, &values, nx, ny, flip_rows, false, enhancement).0,
             );
         }
     }

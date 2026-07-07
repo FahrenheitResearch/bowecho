@@ -217,6 +217,46 @@ pub const AHI_NOMINAL_SEMI_MAJOR_M: f64 = 6_378_137.0;
 pub const AHI_NOMINAL_SEMI_MINOR_M: f64 = 6_356_752.3;
 pub const AHI_NOMINAL_SUB_LON_DEG: f64 = 140.7;
 
+/// Nominal GOES-R series sub-satellite longitudes (the operational East /
+/// West slots). Like [`AHI_NOMINAL_SUB_LON_DEG`], used ONLY for coarse
+/// pre-fetch decisions — on-disk math always uses the fetched file's own
+/// projection.
+pub const GOES_EAST_SUB_LON_DEG: f64 = -75.2;
+pub const GOES_WEST_SUB_LON_DEG: f64 = -137.0;
+
+/// Nominal sub-longitude of the GOES satellite a spec slug names: the West
+/// slot for goes17/goes18, the East slot otherwise (goes16/goes19 and the
+/// default).
+pub fn goes_nominal_sub_lon_deg(satellite_slug: &str) -> f64 {
+    match satellite_slug.trim().to_ascii_lowercase().as_str() {
+        "goes17" | "goes18" | "g17" | "g18" => GOES_WEST_SUB_LON_DEG,
+        _ => GOES_EAST_SUB_LON_DEG,
+    }
+}
+
+/// Coarse per-satellite visibility gate for the persisted native window:
+/// the great-circle arc from the sub-satellite point (lat 0, `sub_lon_deg`)
+/// to the window CENTER must stay under this. 78° is comfortably inside
+/// the ~81.3° geostationary limb, leaving margin for the window's own
+/// extent while never rejecting anything usable — imagery beyond ~78°
+/// off-nadir is limb foreshortening anyway. The exact on-disk projection
+/// check still runs in the ingest; this only keeps one persisted window
+/// from being attached to a satellite that cannot possibly see it (a Guam
+/// window failing every GOES composite load, a CONUS window failing every
+/// Himawari one).
+pub const WINDOW_VISIBLE_MAX_ARC_DEG: f64 = 78.0;
+
+/// Whether a window's center is plausibly within view of a geostationary
+/// satellite at `sub_lon_deg` (see [`WINDOW_VISIBLE_MAX_ARC_DEG`]).
+pub fn window_visible_from_sub_lon(sub_lon_deg: f64, window: &SatNativeWindow) -> bool {
+    let clamped = window.clamped();
+    let lat = clamped.center_lat_deg.to_radians();
+    let delta_lon = (clamped.center_lon_deg - sub_lon_deg).to_radians();
+    // Spherical great-circle arc between (0, sub_lon) and the center.
+    let cos_arc = lat.cos() * delta_lon.cos();
+    cos_arc >= WINDOW_VISIBLE_MAX_ARC_DEG.to_radians().cos()
+}
+
 /// Nominal AHI full-disk 1 km line geometry (JMA HSD User's Guide block #3:
 /// LOFF 5500.5, LFAC 40932549 over 11000 lines split into 10 segments).
 /// Segment boundaries are identical fractions of the disk at every band
@@ -441,6 +481,41 @@ mod tests {
         assert!(x0.abs() < 1.0e-9 && y0.abs() < 1.0e-9);
         // Far side of the globe is rejected.
         assert!(ahi_forward(0.0, -39.3).is_none());
+    }
+
+    /// The visibility gate keeps a persisted window from being attached to
+    /// the satellite that cannot see it: Guam belongs to Himawari (and would
+    /// fail every GOES-East load), Miami belongs to GOES (and would fail
+    /// every Himawari load).
+    #[test]
+    fn native_window_visibility_is_gated_per_satellite() {
+        let guam = guam_window();
+        assert!(window_visible_from_sub_lon(AHI_NOMINAL_SUB_LON_DEG, &guam));
+        assert!(!window_visible_from_sub_lon(GOES_EAST_SUB_LON_DEG, &guam));
+
+        let miami = SatNativeWindow {
+            center_lat_deg: 25.8,
+            center_lon_deg: -80.2,
+            size_km: 500.0,
+        };
+        assert!(window_visible_from_sub_lon(GOES_EAST_SUB_LON_DEG, &miami));
+        assert!(window_visible_from_sub_lon(GOES_WEST_SUB_LON_DEG, &miami));
+        assert!(!window_visible_from_sub_lon(
+            AHI_NOMINAL_SUB_LON_DEG,
+            &miami
+        ));
+
+        // The gate agrees with the exact forward navigation it pre-screens
+        // for: what it accepts projects, what it rejects does not.
+        assert!(window_scan_angle_rect(guam, ahi_forward).is_some());
+        assert!(window_scan_angle_rect(miami, ahi_forward).is_none());
+
+        // Spec slugs map onto the operational GOES slots; unknown slugs
+        // default to East (today's `goes19` default source).
+        assert_eq!(goes_nominal_sub_lon_deg("goes19"), GOES_EAST_SUB_LON_DEG);
+        assert_eq!(goes_nominal_sub_lon_deg("goes16"), GOES_EAST_SUB_LON_DEG);
+        assert_eq!(goes_nominal_sub_lon_deg("goes18"), GOES_WEST_SUB_LON_DEG);
+        assert_eq!(goes_nominal_sub_lon_deg(" GOES17 "), GOES_WEST_SUB_LON_DEG);
     }
 
     #[test]

@@ -982,6 +982,11 @@ const OUTLOOK_RING_WRAPAROUND_SPACING_MULTIPLE: f32 = 128.0;
 const OUTLOOK_RING_WRAPAROUND_MAX_DIAGONAL_MULTIPLE: f32 = 40.0;
 const MAP_LAYER_RERENDER_PAN_PX: f32 = 0.5;
 const MAP_LAYER_RERENDER_ZOOM_RATIO: f32 = 0.001;
+/// Timeline follow only steers the satellite map layer to a frame within
+/// this many seconds of the displayed radar moment. Beyond it, no stored
+/// scan says anything about that moment — the map stays wherever the
+/// player put it instead of snapping to an off-era frame.
+const SAT_TIMELINE_FOLLOW_MAX_DISTANCE_SECONDS: i64 = 6 * 3600;
 const RADAR_OPERATIONAL_STATUS_CLICK_KM: f32 = 35.0;
 const RADAR_OPERATIONAL_STATUS_CACHE_SECONDS: u64 = 300;
 const RADAR_OPERATIONAL_STATUS_ERROR_SECONDS: u64 = 60;
@@ -2583,6 +2588,11 @@ struct ViewerApp {
     sat_layer_generation: u64,
     /// Last frame shown in the sat player (the "Show on map" source).
     sat_last_frame: Option<(rw_ui::SatRunKey, u16)>,
+    /// Frames the worker rendered through the LEGACY pre-calibration
+    /// stretch (the selected IR enhancement did not apply). Keyed like
+    /// `sat_last_frame`; drives the "enhancements do not apply to this
+    /// frame" hint so the picker never looks silently dead.
+    sat_legacy_frames: std::collections::HashSet<(rw_ui::SatRunKey, u16)>,
     /// Sticky mode: satellite player play/scrub changes refresh the radar-map
     /// satellite layer too, not just the side-panel preview.
     sat_map_follow: bool,
@@ -7588,6 +7598,7 @@ impl ViewerApp {
             sat_layer_render_rx: None,
             sat_layer_generation: 0,
             sat_last_frame: None,
+            sat_legacy_frames: std::collections::HashSet::new(),
             sat_map_follow: false,
             sat_map_inflight: None,
             sat_map_pending: None,
@@ -9687,12 +9698,33 @@ impl ViewerApp {
             return None;
         }
         let time_utc = self.displayed_timeline_time_utc()?;
-        let preferred_key = self
-            .sat_last_frame
-            .as_ref()
-            .map(|(key, _)| key)
-            .or_else(|| self.sat_player.selected_run());
-        nearest_sat_frame_for_time(&self.sat_run_listings, preferred_key, time_utc)
+        // "Map follows player": while the player has a selected run, the
+        // timeline may only pick WHICH FRAME of that run matches the radar
+        // moment — never steer the map to a different run. The old
+        // family-wide nearest search let an archived radar loop drag the
+        // map onto a weeks-old sibling run (June 19 t1920Z on the map while
+        // the player looped July 7) and then kept re-pinning it every loop
+        // advance, overwriting the player's own pending map request.
+        let (key, hhmm) = if let Some(selected) = self.sat_player.selected_run() {
+            let listing = self
+                .sat_run_listings
+                .iter()
+                .find(|run| &run.key == selected)?;
+            let hhmm =
+                listing.frames.iter().copied().min_by_key(|&hhmm| {
+                    sat_frame_distance_seconds(&selected.run, hhmm, time_utc)
+                })?;
+            (selected.clone(), hhmm)
+        } else {
+            let preferred_key = self.sat_last_frame.as_ref().map(|(key, _)| key);
+            nearest_sat_frame_for_time(&self.sat_run_listings, preferred_key, time_utc)?
+        };
+        // Steer only when the frame is actually RELEVANT to the displayed
+        // moment; otherwise leave the map wherever the player put it (and
+        // let loop recording settle without waiting on an off-era frame).
+        (sat_frame_distance_seconds(&key.run, hhmm, time_utc)
+            <= SAT_TIMELINE_FOLLOW_MAX_DISTANCE_SECONDS)
+            .then_some((key, hhmm))
     }
 
     fn satellite_map_frame_current_or_scheduled(&self, key: &rw_ui::SatRunKey, hhmm: u16) -> bool {
@@ -31110,6 +31142,30 @@ impl ViewerApp {
         })
     }
 
+    /// The native window, but only when its center is plausibly within view
+    /// of the satellite at `sub_lon_deg`. ONE window is persisted and both
+    /// satellites' composite loads read it, so without this gate a saved
+    /// Guam window hard-fails every GOES composite ("outside view") and a
+    /// CONUS window kills every Himawari one. A dropped window leaves that
+    /// load on its normal full-sector spec (the stride-1 native decode only
+    /// engages when a window is actually attached), with one panel note so
+    /// the user can tell.
+    fn sat_native_window_if_visible(
+        &mut self,
+        sub_lon_deg: f64,
+        satellite_label: &str,
+    ) -> Option<sat_window::SatNativeWindow> {
+        let window = self.sat_native_window()?;
+        if sat_window::window_visible_from_sub_lon(sub_lon_deg, &window) {
+            return Some(window);
+        }
+        self.sat_panel.apply_note(format!(
+            "Native window {} is beyond {satellite_label}'s horizon — composing the normal full sector instead",
+            window.run_slug()
+        ));
+        None
+    }
+
     /// Persist the native-window controls (AppSettings microdegree fields).
     fn persist_sat_native_window(&mut self) {
         self.app_settings.sat_native_window_enabled = self.sat_window_enabled;
@@ -31238,32 +31294,33 @@ impl ViewerApp {
                         )
                         .changed();
                     ui.label("lat");
-                    sat_window_changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut self.sat_window_lat_deg)
-                                .speed(0.1)
-                                .range(-75.0..=75.0)
-                                .suffix("°"),
-                        )
-                        .changed();
+                    let lat_response = ui.add(
+                        egui::DragValue::new(&mut self.sat_window_lat_deg)
+                            .speed(0.1)
+                            .range(-75.0..=75.0)
+                            .suffix("°"),
+                    );
                     ui.label("lon");
-                    sat_window_changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut self.sat_window_lon_deg)
-                                .speed(0.1)
-                                .range(-180.0..=180.0)
-                                .suffix("°"),
-                        )
-                        .changed();
+                    let lon_response = ui.add(
+                        egui::DragValue::new(&mut self.sat_window_lon_deg)
+                            .speed(0.1)
+                            .range(-180.0..=180.0)
+                            .suffix("°"),
+                    );
                     ui.label("size");
-                    sat_window_changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut self.sat_window_size_km)
-                                .speed(10.0)
-                                .range(50.0..=2000.0)
-                                .suffix(" km"),
-                        )
-                        .changed();
+                    let size_response = ui.add(
+                        egui::DragValue::new(&mut self.sat_window_size_km)
+                            .speed(10.0)
+                            .range(50.0..=2000.0)
+                            .suffix(" km"),
+                    );
+                    // Commit-on-release: dragging previews the values live
+                    // but only a finished drag or a typed edit persists —
+                    // per-frame saves during a drag hammer the settings file.
+                    for response in [&lat_response, &lon_response, &size_response] {
+                        sat_window_changed |= response.drag_stopped()
+                            || (response.changed() && !response.dragged());
+                    }
                     if ui
                         .button("Use map center")
                         .on_hover_text("Center the window on the current radar-map view center.")
@@ -31299,10 +31356,9 @@ impl ViewerApp {
             };
             sat.send(sat_worker::SatRequest::IngestLatestHimawari(spec));
         }
-        if let Some(sat) = &self.sat
-            && load_himawari_composite
-        {
-            let window = self.sat_native_window();
+        if load_himawari_composite && self.sat.is_some() {
+            let window = self
+                .sat_native_window_if_visible(sat_window::AHI_NOMINAL_SUB_LON_DEG, "Himawari-9");
             self.sat_map_follow = true;
             self.status = match window {
                 Some(window) => format!(
@@ -31314,18 +31370,22 @@ impl ViewerApp {
             self.sat_panel.apply_note(
                 "Himawari composite: queued latest H9 AHI true-color (B01/B02/B03)".to_string(),
             );
-            sat.send(sat_worker::SatRequest::IngestLatestHimawariComposite(
-                sat_worker::HimawariCompositeSpec {
-                    window,
-                    ..sat_worker::HimawariCompositeSpec::default()
-                },
-            ));
+            if let Some(sat) = &self.sat {
+                sat.send(sat_worker::SatRequest::IngestLatestHimawariComposite(
+                    sat_worker::HimawariCompositeSpec {
+                        window,
+                        ..sat_worker::HimawariCompositeSpec::default()
+                    },
+                ));
+            }
         }
-        if let Some(sat) = &self.sat
-            && load_composite
-        {
+        if load_composite && self.sat.is_some() {
             let base = self.sat_panel.spec().clone();
             let style = self.goes_composite_style.clone();
+            let window = self.sat_native_window_if_visible(
+                sat_window::goes_nominal_sub_lon_deg(&base.satellite),
+                &base.satellite,
+            );
             self.sat_map_follow = true;
             self.status = format!("Satellite: composing GOES {} {style}", base.sector);
             self.sat_panel.apply_note(format!(
@@ -31336,10 +31396,12 @@ impl ViewerApp {
                 satellite: base.satellite,
                 sector: base.sector,
                 style,
-                window: self.sat_native_window(),
+                window,
                 ..sat_worker::GoesCompositeSpec::default()
             };
-            sat.send(sat_worker::SatRequest::IngestLatestGoesComposite(composite));
+            if let Some(sat) = &self.sat {
+                sat.send(sat_worker::SatRequest::IngestLatestGoesComposite(composite));
+            }
         }
         ui.separator();
         if self.sat_last_frame.is_some() || self.sat_layer.is_some() {
@@ -31401,6 +31463,19 @@ impl ViewerApp {
                      AVN, Funktop, rainbow, or plain grayscale.",
                 );
         });
+        // Without this hint the picker looks silently dead on a store full
+        // of pre-calibration frames (they render via the legacy auto-stretch
+        // no matter which enhancement is selected).
+        if self
+            .sat_last_frame
+            .as_ref()
+            .is_some_and(|frame| self.sat_legacy_frames.contains(frame))
+        {
+            ui.weak(
+                "This stored frame predates the true-Kelvin calibration and uses the legacy \
+                 auto-stretch — IR enhancements apply to newly ingested frames.",
+            );
+        }
         if selected_enhancement != self.sat_ir_enhancement {
             self.sat_ir_enhancement = selected_enhancement;
             self.app_settings.sat_ir_enhancement = selected_enhancement.slug().to_string();
@@ -31409,18 +31484,25 @@ impl ViewerApp {
                 sat.send(sat_worker::SatRequest::SetIrEnhancement(
                     selected_enhancement,
                 ));
-                // Recolor what is on screen: the player's current frame and,
-                // if the satellite map layer is up, the map frame too.
-                if let Some((key, hhmm)) = self.sat_last_frame.clone() {
-                    sat.send(sat_worker::SatRequest::LoadFrame {
-                        key: key.clone(),
-                        hhmm,
-                    });
+                // Recolor EVERYTHING the player can show, not just the
+                // playhead: the player caches colored textures per scan
+                // time, so a running loop would keep mixing old and new
+                // palettes. Each re-pushed frame replaces its cached
+                // texture in place (playback state untouched); the map
+                // frame refreshes below.
+                for (key, hhmm) in sat_enhancement_refresh_frames(
+                    &self.sat_run_listings,
+                    self.sat_player.selected_run(),
+                    self.sat_last_frame.as_ref(),
+                ) {
+                    sat.send(sat_worker::SatRequest::LoadFrame { key, hhmm });
                 }
             }
-            if self.sat_layer.is_some()
-                && let Some((key, hhmm)) = self.sat_last_frame.clone()
-            {
+            // The map layer recolors by ITS OWN identity (layer, else the
+            // in-flight/queued request): timeline follow can point the map
+            // at a different scan than the player, and keying this off
+            // `sat_last_frame` left the map on the old palette then.
+            if let Some((key, hhmm)) = self.sat_map_recolor_target() {
                 self.request_sat_map_frame(key, hhmm);
             }
         }
@@ -31430,6 +31512,7 @@ impl ViewerApp {
 
     fn clear_satellite_display_for_spec_change(&mut self) {
         self.sat_last_frame = None;
+        self.sat_legacy_frames.clear();
         self.sat_run_listings.clear();
         self.sat_player.set_runs(Vec::new());
         self.sat_layer = None;
@@ -31478,7 +31561,12 @@ impl ViewerApp {
         if !self.satellite_run_key_matches_current_spec(&key) {
             return;
         }
-        self.sat_last_frame = Some((key.clone(), hhmm));
+        // Deliberately NOT mirrored into `sat_last_frame`: that field is
+        // the PLAYER's displayed frame (FrameSelected / SelectFrame /
+        // loaded-frame events). Writing the map target here let a timeline
+        // sync overwrite the player identity, which then re-anchored the
+        // timeline search onto the map's own run — the self-reinforcing pin
+        // that held a weeks-old frame on the map.
         if self.sat_layer_build_rx.is_some() || self.sat_map_inflight.is_some() {
             self.sat_map_pending = Some((key, hhmm));
             return;
@@ -31501,6 +31589,20 @@ impl ViewerApp {
         if let Some((key, hhmm)) = self.sat_map_pending.take() {
             self.request_sat_map_frame(key, hhmm);
         }
+    }
+
+    /// The (key, hhmm) the radar-map satellite layer currently shows — or
+    /// is already fetching/queued to show. This is the identity an
+    /// IR-enhancement change must re-request: the map tracks its own frame
+    /// (timeline follow can point it at a different scan than the player),
+    /// so recoloring by `sat_last_frame` left the map on the old palette
+    /// whenever the two diverged.
+    fn sat_map_recolor_target(&self) -> Option<(rw_ui::SatRunKey, u16)> {
+        self.sat_layer
+            .as_ref()
+            .map(|layer| (layer.key.clone(), layer.hhmm))
+            .or_else(|| self.sat_map_inflight.clone())
+            .or_else(|| self.sat_map_pending.clone())
     }
 
     /// A worker map frame landed. Install it only while its request is
@@ -31649,10 +31751,20 @@ impl ViewerApp {
                         self.flush_pending_sat_map_request();
                     }
                 },
-                sat_worker::SatResponse::Frame { key, hhmm, result } => match *result {
+                sat_worker::SatResponse::Frame {
+                    key,
+                    hhmm,
+                    legacy,
+                    result,
+                } => match *result {
                     Ok(frame) => {
                         if !self.satellite_run_key_matches_current_spec(&key) {
                             continue;
+                        }
+                        if legacy {
+                            self.sat_legacy_frames.insert((key.clone(), hhmm));
+                        } else {
+                            self.sat_legacy_frames.remove(&(key.clone(), hhmm));
                         }
                         self.sat_last_frame = Some((key.clone(), hhmm));
                         let (frame, resized) = sat_player_frame_within_texture_limit(frame);
@@ -33956,7 +34068,12 @@ impl ViewerApp {
                     self.flush_pending_sat_map_request();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => self.sat_layer_build_rx = None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // A dead build thread must release the latch, or every
+                    // later map request parks in `sat_map_pending` forever.
+                    self.sat_layer_build_rx = None;
+                    self.flush_pending_sat_map_request();
+                }
             }
         }
         if let Some(receiver) = &self.sat_layer_render_rx {
@@ -47372,10 +47489,15 @@ fn self_update_asset(baked: Option<&'static str>, is_windows: bool) -> Option<&'
 /// override must not become an executable-replacement channel. Rebranded
 /// builds keep the passive check + browser button against their own repo.
 /// An EMPTY repo_url is not an override — it is the stock exe wearing
-/// brand-kit assets, updating from the canonical feed like everyone else.
+/// brand-kit assets, updating from the canonical feed like everyone else
+/// (`brand::effective_repo_url`, shared with the passive check). Comparing
+/// parsed owner/name instead of literal strings keeps ".git" and
+/// trailing-slash spellings agreeing with the check that offered the
+/// update — a literal compare left "update available" with the install
+/// button silently absent.
 fn self_update_repo_allowed(repo_url: &str) -> bool {
-    let repo_url = repo_url.trim();
-    repo_url.is_empty() || repo_url.trim_end_matches('/') == brand::CANONICAL_REPO_URL
+    brand::github_repo_parts(brand::effective_repo_url(repo_url))
+        == brand::github_repo_parts(brand::CANONICAL_REPO_URL)
 }
 
 /// Release-asset download URL derived from the latest-release API URL that
@@ -50910,11 +51032,12 @@ fn filled_polygon_mesh(points: &[egui::Pos2], fill: egui::Color32) -> Option<egu
     // and paints outside the ring. Real inputs do this — screen quantization
     // folds dense coastline-traced zone rings at low zoom (Cape May NJC009
     // at map_scale 60-120), and CAP polygons have shipped crossed vertex
-    // orders — so those rings take the exact even-odd scanline fill instead.
-    if screen_ring_self_intersects(&points)
-        && let Some(mesh) = scanline_fill_mesh(std::slice::from_ref(&points), fill)
-    {
-        return Some(mesh);
+    // orders — so those rings take the exact even-odd scanline fill instead,
+    // and when even the scanline bails (degenerate band structure, the
+    // vertex-limit valve) the fill is dropped outright: outline-only beats
+    // handing a known-crossed ring to earcut and painting wedges outside it.
+    if screen_ring_self_intersects(&points) {
+        return scanline_fill_mesh(std::slice::from_ref(&points), fill);
     }
     let triangles = triangulate_screen_polygon(&points)?;
     let mut mesh = egui::epaint::Mesh::default();
@@ -51004,6 +51127,19 @@ fn single_hazard_fill_shape(candidate: &HazardFillCandidate) -> Option<egui::Sha
     }
 }
 
+/// Per-component edge budget for the same-family fill flattener. The
+/// scanline union in [`scanline_fill_mesh`] runs an all-pairs edge-crossing
+/// scan (~E²/2 tests) BEFORE any output-size valve can trip, and the whole
+/// hazard shape cache rebuilds on every pan/zoom — so the bound has to hold
+/// before any quadratic work starts. At 3,000 edges the scan is ~4.5M pair
+/// tests, comfortably sub-frame; an unbounded stacked-warning cluster (40+
+/// transitively-overlapping SVR fills × up to [`HAZARD_FILL_VERTEX_LIMIT`]
+/// vertices each) reaches ~24,000 edges → ~288M tests per interaction frame,
+/// which freezes the map. Components over budget paint per record through
+/// the bounded legacy path instead: alpha stacking returns for that extreme
+/// cluster — a mild visual regression that beats a frozen map.
+const HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET: usize = 3_000;
+
 /// Emit hazard fill shapes, flattening fills of the SAME family and color so
 /// overlapping warnings paint their overlap once at the family alpha instead
 /// of stacking toward opaque — the reported "glow blobs" (the real July 5
@@ -51011,7 +51147,9 @@ fn single_hazard_fill_shape(candidate: &HazardFillCandidate) -> Option<egui::Sha
 /// Cross-family and cross-threat overlap still layers: those are distinct
 /// hazards deliberately drawn over each other. Within a group only records
 /// whose fills can touch (transitively bbox-overlapping components) share a
-/// union mesh; isolated records keep the legacy convex fast path.
+/// union mesh; isolated records — and components too big to flatten within
+/// [`HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET`] — keep the legacy per-record
+/// path.
 fn append_flattened_hazard_fill_shapes(
     candidates: Vec<HazardFillCandidate>,
     fill_shapes: &mut Vec<egui::Shape>,
@@ -51051,9 +51189,18 @@ fn append_flattened_hazard_fill_shapes(
         }
         for mut component in components {
             component.sort_unstable();
-            if component.len() == 1 {
-                if let Some(shape) = single_hazard_fill_shape(&candidates[members[component[0]]]) {
-                    fill_shapes.push(shape);
+            // Cheap pre-flight bound BEFORE the flatten's quadratic edge
+            // scan (see HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET): an oversized
+            // component falls back to per-record fills, like a singleton.
+            let component_edges: usize = component
+                .iter()
+                .map(|&local| candidates[members[local]].points.len())
+                .sum();
+            if component.len() == 1 || component_edges > HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET {
+                for &local in &component {
+                    if let Some(shape) = single_hazard_fill_shape(&candidates[members[local]]) {
+                        fill_shapes.push(shape);
+                    }
                 }
                 continue;
             }
@@ -53650,6 +53797,42 @@ fn nearest_sat_frame_for_time(
     best.map(|(run, hhmm, _)| (run.key.clone(), hhmm))
 }
 
+/// Frames to re-push after an IR-enhancement change: every frame of the
+/// player's selected run, playhead first. The player panel caches COLORED
+/// textures per scan time and `set_frame` replaces entries in place, so
+/// re-requesting the whole run recolors a running loop without touching
+/// its playback state — re-requesting only the playhead frame left every
+/// other cached frame on the old palette, and the loop mixed palettes.
+fn sat_enhancement_refresh_frames(
+    runs: &[rw_ui::SatRunListing],
+    selected_run: Option<&rw_ui::SatRunKey>,
+    last_frame: Option<&(rw_ui::SatRunKey, u16)>,
+) -> Vec<(rw_ui::SatRunKey, u16)> {
+    let Some(key) = selected_run.or_else(|| last_frame.map(|(key, _)| key)) else {
+        return Vec::new();
+    };
+    let playhead = match last_frame {
+        Some((frame_key, hhmm)) if frame_key == key => Some(*hhmm),
+        _ => None,
+    };
+    let Some(listing) = runs.iter().find(|run| &run.key == key) else {
+        // The run list has not mirrored this run (yet): still refresh the
+        // one frame known to be on screen.
+        return playhead
+            .map(|hhmm| vec![(key.clone(), hhmm)])
+            .unwrap_or_default();
+    };
+    let mut frames = listing.frames.clone();
+    if let Some(hhmm) = playhead
+        && let Some(position) = frames.iter().position(|&frame| frame == hhmm)
+    {
+        // The visible frame recolors first.
+        frames.remove(position);
+        frames.insert(0, hhmm);
+    }
+    frames.into_iter().map(|hhmm| (key.clone(), hhmm)).collect()
+}
+
 /// Status line when the hail-env model lookup finds no usable hour:
 /// distinguish runs-exist-but-none-covers-the-displayed-time (the era
 /// guard) from a genuinely empty store, so "Fetch latest" is only
@@ -55792,6 +55975,20 @@ mod tests {
         // from the canonical feed (the passive check falls back there too).
         assert!(self_update_repo_allowed(""));
         assert!(self_update_repo_allowed("  "));
+        // ".git" is the same canonical repo: the passive check parses it
+        // (and offers the update), so the install gate must agree — a
+        // literal string compare left the install button silently absent.
+        let git_suffixed = "https://github.com/FahrenheitResearch/bowecho.git";
+        assert!(self_update_repo_allowed(git_suffixed));
+        assert_eq!(
+            brand::update_check_api_url(git_suffixed),
+            brand::update_check_api_url(""),
+            "check and install must resolve the same feed"
+        );
+        // A fork stays rejected however it is spelled.
+        assert!(!self_update_repo_allowed(
+            "https://github.com/someone-else/bowecho-fork.git"
+        ));
     }
 
     #[test]
@@ -61781,8 +61978,101 @@ mod tests {
             model: "g19".to_owned(),
             run: "conus_c13_20260615".to_owned(),
         };
-        assert_eq!(app.sat_map_pending, Some((expected_key.clone(), 1755)));
-        assert_eq!(app.sat_last_frame, Some((expected_key, 1755)));
+        assert_eq!(app.sat_map_pending, Some((expected_key, 1755)));
+        // The map request must NOT overwrite the player identity: that
+        // write let timeline follow re-anchor the player-preferred search
+        // onto the map's own run and pin an off-era frame.
+        assert_eq!(app.sat_last_frame, None);
+    }
+
+    /// The owner's stale-map pin: with "Map follows player" on, an archived
+    /// radar loop (June) must not drag the satellite map onto an old
+    /// same-family run while the player loops a July run — the timeline may
+    /// only time-sync WITHIN the player's selected run, and only when the
+    /// radar moment is actually near that run's frames.
+    #[test]
+    fn timeline_follow_stays_inside_the_players_selected_run() {
+        let ctx = egui::Context::default();
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let target = Utc.with_ymd_and_hms(2026, 6, 15, 17, 56, 0).unwrap();
+        let volume = Arc::new(test_volume_with_site_time("KTLX", target));
+        app.volume = Some(Arc::clone(&volume));
+        app.primary.history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from("sat-follow-player-run"),
+            volume,
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        });
+        app.sat_map_follow = true;
+        // An old same-family run holds a frame matching the radar moment
+        // EXACTLY; the player is on the July run.
+        app.sat_run_listings = vec![
+            test_sat_run("g19", "conus_c13_20260615", &[1755]),
+            test_sat_run("g19", "conus_c13_20260707", &[345, 350, 355]),
+        ];
+        let july = app.sat_run_listings[1].key.clone();
+        app.sat_player.select_frame(july.clone(), 350);
+
+        assert_eq!(
+            app.desired_satellite_map_frame_for_timeline(),
+            None,
+            "no July frame is relevant to a June radar moment"
+        );
+        app.maybe_sync_satellite_map_to_timeline(&ctx);
+        assert_eq!(app.sat_map_pending, None, "the map stays with the player");
+        assert_eq!(app.sat_map_inflight, None);
+
+        // A radar moment inside the selected run's era time-syncs WITHIN it.
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let target = Utc.with_ymd_and_hms(2026, 7, 7, 3, 52, 0).unwrap();
+        let volume = Arc::new(test_volume_with_site_time("KTLX", target));
+        app.volume = Some(Arc::clone(&volume));
+        app.primary.history.push(FrameHistoryEntry {
+            identity: frame_identity_for_volume(volume.as_ref()),
+            path: PathBuf::from("sat-follow-player-run-era"),
+            volume,
+            timings: None,
+            status: FrameStatus::LiveComplete,
+            source_label: "test".to_owned(),
+        });
+        app.sat_map_follow = true;
+        app.sat_run_listings = vec![
+            test_sat_run("g19", "conus_c13_20260615", &[1755]),
+            test_sat_run("g19", "conus_c13_20260707", &[345, 350, 355]),
+        ];
+        app.sat_player.select_frame(july.clone(), 355);
+        assert_eq!(
+            app.desired_satellite_map_frame_for_timeline(),
+            Some((july, 350)),
+            "in-era scrubbing picks the run's time-matched frame"
+        );
+    }
+
+    /// An IR-enhancement change recolors the frame the MAP shows (or is
+    /// fetching), not whatever the player last displayed — timeline follow
+    /// can point the two at different scans.
+    #[test]
+    fn enhancement_recolor_targets_the_maps_own_frame() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        assert_eq!(app.sat_map_recolor_target(), None);
+        let map_key = rw_ui::SatRunKey {
+            model: "g19".to_owned(),
+            run: "conus_c13_20260615".to_owned(),
+        };
+        app.sat_last_frame = Some((
+            rw_ui::SatRunKey {
+                model: "h9".to_owned(),
+                run: "fulldisk_c13_20260707".to_owned(),
+            },
+            350,
+        ));
+        app.sat_map_inflight = Some((map_key.clone(), 1800));
+        assert_eq!(app.sat_map_recolor_target(), Some((map_key.clone(), 1800)));
+        app.sat_map_inflight = None;
+        app.sat_map_pending = Some((map_key.clone(), 1755));
+        assert_eq!(app.sat_map_recolor_target(), Some((map_key, 1755)));
     }
 
     #[test]
@@ -64857,6 +65147,48 @@ mod tests {
         }
     }
 
+    /// An IR-enhancement change must refresh EVERY frame of the selected
+    /// run, playhead first — the player caches colored textures per scan
+    /// time, so re-pushing only the current frame left a running loop
+    /// mixing old- and new-palette frames.
+    #[test]
+    fn enhancement_change_repushes_the_whole_selected_run() {
+        let runs = vec![
+            test_sat_run("g19", "conus_c13_20260705", &[1750, 1755, 1800]),
+            test_sat_run("h9", "fulldisk_c13_20260705", &[1757]),
+        ];
+        let selected = runs[0].key.clone();
+        let last = (selected.clone(), 1755u16);
+
+        let refresh = sat_enhancement_refresh_frames(&runs, Some(&selected), Some(&last));
+        assert_eq!(
+            refresh,
+            vec![
+                (selected.clone(), 1755),
+                (selected.clone(), 1750),
+                (selected.clone(), 1800),
+            ],
+            "the whole selected run, visible frame first"
+        );
+
+        // Only the OTHER run's frames are never touched.
+        assert!(refresh.iter().all(|(key, _)| key == &selected));
+
+        // A playhead from another run (stale sat_last_frame) does not
+        // reorder, and the selected run still refreshes fully.
+        let stale = (runs[1].key.clone(), 1757u16);
+        let refresh = sat_enhancement_refresh_frames(&runs, Some(&selected), Some(&stale));
+        assert_eq!(refresh.len(), 3);
+        assert_eq!(refresh[0], (selected.clone(), 1750));
+
+        // No mirrored listing yet: at least the on-screen frame refreshes.
+        let refresh = sat_enhancement_refresh_frames(&[], Some(&selected), Some(&last));
+        assert_eq!(refresh, vec![(selected.clone(), 1755)]);
+
+        // Nothing selected, nothing shown: nothing to refresh.
+        assert!(sat_enhancement_refresh_frames(&runs, None, None).is_empty());
+    }
+
     fn test_model_store_tree(model: &str, run: &str, hours: &[u16]) -> rw_ui::StoreTree {
         rw_ui::StoreTree {
             models: vec![rw_ui::ModelEntry {
@@ -64881,6 +65213,48 @@ mod tests {
             }],
             warnings: Vec::new(),
         }
+    }
+
+    /// The single persisted native window must only ride along on loads of
+    /// a satellite that can plausibly see it: a saved Guam window used to
+    /// hard-fail every GOES composite ("outside view"), and a CONUS window
+    /// every Himawari one. The dropped-window spec keeps the stock
+    /// full-sector decimation (the stride-1 native decode is keyed on an
+    /// attached window).
+    #[test]
+    fn native_window_only_attaches_to_the_satellite_that_sees_it() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.sat_window_enabled = true;
+        app.sat_window_lat_deg = 13.5; // Guam
+        app.sat_window_lon_deg = 144.8;
+        app.sat_window_size_km = 800;
+
+        let himawari =
+            app.sat_native_window_if_visible(sat_window::AHI_NOMINAL_SUB_LON_DEG, "Himawari-9");
+        assert!(himawari.is_some(), "Guam is on the Himawari disk");
+        let goes = app
+            .sat_native_window_if_visible(sat_window::goes_nominal_sub_lon_deg("goes19"), "goes19");
+        assert!(goes.is_none(), "Guam is beyond the GOES-East horizon");
+        let spec = sat_worker::GoesCompositeSpec {
+            window: goes,
+            ..sat_worker::GoesCompositeSpec::default()
+        };
+        assert_eq!(spec.downsample, 4, "dropped window keeps the sector stride");
+
+        // Miami: the reverse assignment.
+        app.sat_window_lat_deg = 25.8;
+        app.sat_window_lon_deg = -80.2;
+        assert!(
+            app.sat_native_window_if_visible(
+                sat_window::goes_nominal_sub_lon_deg("goes19"),
+                "goes19"
+            )
+            .is_some()
+        );
+        assert!(
+            app.sat_native_window_if_visible(sat_window::AHI_NOMINAL_SUB_LON_DEG, "Himawari-9")
+                .is_none()
+        );
     }
 
     fn test_model_field(model: &str, run: &str, hour: u16) -> Arc<rw_ui::FieldData> {
@@ -73235,6 +73609,91 @@ mod tests {
         assert_eq!(stacked, 0);
     }
 
+    /// Regular ring for the flatten-budget tests: `n` vertices on a circle,
+    /// convex and mutually overlapping when the centers sit close together.
+    fn circle_ring(center: egui::Pos2, radius: f32, n: usize) -> Vec<egui::Pos2> {
+        (0..n)
+            .map(|i| {
+                let angle = std::f32::consts::TAU * i as f32 / n as f32;
+                egui::pos2(
+                    center.x + radius * angle.cos(),
+                    center.y - radius * angle.sin(),
+                )
+            })
+            .collect()
+    }
+
+    /// A same-family component whose total edge count exceeds the flatten
+    /// budget must fall back to bounded per-record fills BEFORE the union's
+    /// quadratic edge-crossing scan runs (the 40-stacked-SVR freeze), while
+    /// a normal small overlap keeps flattening to one union shape.
+    #[test]
+    fn oversized_flatten_component_falls_back_to_per_record_fills() {
+        let overlapping_rings = |count: usize, vertices: usize| -> Vec<HazardFillCandidate> {
+            (0..count)
+                .map(|i| HazardFillCandidate {
+                    family: "severe thunderstorm".to_owned(),
+                    fill: spike_probe_fill(),
+                    points: circle_ring(egui::pos2(200.0 + 10.0 * i as f32, 200.0), 90.0, vertices),
+                })
+                .collect()
+        };
+
+        // Six 600-vertex rings: 3,600 edges in one transitive component —
+        // over HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET, under the per-record
+        // HAZARD_FILL_VERTEX_LIMIT. Every record must still paint, each as
+        // its own shape (alpha stacking returns for this extreme cluster).
+        let candidates = overlapping_rings(6, 600);
+        assert!(
+            candidates.iter().map(|c| c.points.len()).sum::<usize>()
+                > HAZARD_FLATTEN_COMPONENT_EDGE_BUDGET
+        );
+        let mut shapes = Vec::new();
+        append_flattened_hazard_fill_shapes(candidates, &mut shapes);
+        assert_eq!(shapes.len(), 6, "over-budget component paints per record");
+        let overlap_point = egui::pos2(225.3, 200.7);
+        assert!(
+            fill_paint_multiplicity(&shapes, overlap_point) >= 2,
+            "per-record fills layer in the shared area"
+        );
+
+        // A normal 3-record overlap stays flattened to a single union paint.
+        let mut shapes = Vec::new();
+        append_flattened_hazard_fill_shapes(overlapping_rings(3, 64), &mut shapes);
+        assert_eq!(shapes.len(), 1, "small components still flatten");
+        assert_eq!(fill_paint_multiplicity(&shapes, overlap_point), 1);
+    }
+
+    /// A self-intersecting ring whose scanline tessellation bails must drop
+    /// the fill entirely (outline-only) — never fall through to earcut,
+    /// which bridges the crossing and paints wedges outside the ring. The
+    /// ring's two y levels are ADJACENT f32 values, so every scanline band
+    /// between them is degenerate and the exact fill has nothing to emit.
+    #[test]
+    fn crossed_ring_without_scanline_fill_stays_unfilled() {
+        let y0 = 1.0f32;
+        let y1 = f32::from_bits(y0.to_bits() + 1);
+        let bowtie = vec![
+            egui::pos2(0.0, y0),
+            egui::pos2(100.0, y0),
+            egui::pos2(20.0, y1),
+            egui::pos2(80.0, y1),
+        ];
+        let cleaned = cleaned_screen_polygon(&bowtie);
+        assert!(
+            screen_ring_self_intersects(&cleaned),
+            "the flat bowtie must register as self-intersecting"
+        );
+        assert!(
+            scanline_fill_mesh(std::slice::from_ref(&cleaned), spike_probe_fill()).is_none(),
+            "adjacent-float bands must defeat the scanline fill"
+        );
+        assert!(
+            filled_polygon_mesh(&bowtie, spike_probe_fill()).is_none(),
+            "a known self-intersecting ring must never reach earcut"
+        );
+    }
+
     // ---- CPU rasterizer: draws overlay shapes the way the GPU would --------
 
     fn probe_blend_pixel(image: &mut image::RgbaImage, x: i64, y: i64, color: egui::Color32) {
@@ -74577,6 +75036,7 @@ mod tests {
             sat_layer_render_rx: None,
             sat_layer_generation: 0,
             sat_last_frame: None,
+            sat_legacy_frames: std::collections::HashSet::new(),
             sat_map_follow: false,
             sat_map_inflight: None,
             sat_map_pending: None,
