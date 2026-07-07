@@ -15,7 +15,12 @@
 //!   sustained wind (kt) at 12/24/36/48/72/96/120 h — the West-Pacific analogue
 //!   of NHC's TCM. Active warnings are discovered from the JTWC RSS feed, then
 //!   matched to a GDACS storm by name to enrich its forecast dots with real
-//!   Saffir–Simpson intensity (the cone/track still come from GDACS).
+//!   Saffir–Simpson intensity (the cone/track still come from GDACS). The
+//!   warning's identity block ([`WarningInfo`]: warning number, issue DTG,
+//!   analysis time/position, current wind/gusts/pressure/motion) is parsed too:
+//!   it REPLACES the aggregator's lagging severity on the storm record (see
+//!   [`sync_storm_with_geometry`]) and is shown on the card so the intensity's
+//!   age is always visible.
 //!
 //! The two feed a single [`TropicalCyclone`] so the UI never cares which
 //! center issued a storm. Fields are intentionally comprehensive (wind, gusts,
@@ -102,6 +107,98 @@ impl Source {
             Source::Nhc => "NHC",
             Source::Gdacs => "GDACS",
         }
+    }
+}
+
+/// Which official center's bulletin a [`WarningInfo`] came from — drives the
+/// product noun on the storm card ("JTWC Warning #25" vs "NHC Advisory #15").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarningAgency {
+    Jtwc,
+    Nhc,
+}
+
+impl WarningAgency {
+    /// The product noun shown to the user, e.g. "JTWC Warning".
+    pub fn product(self) -> &'static str {
+        match self {
+            WarningAgency::Jtwc => "JTWC Warning",
+            WarningAgency::Nhc => "NHC Advisory",
+        }
+    }
+}
+
+/// The identity, timing, and analysis vitals of the official warning/advisory
+/// bulletin behind a storm's forecast (a JTWC Tropical Cyclone Warning or an
+/// NHC Forecast/Advisory). Two jobs:
+///
+/// 1. **Visible timing** — the card shows WHICH bulletin the numbers came from
+///    and how old it is (`JTWC Warning #25 · issued 07/0300Z (4 h ago) ·
+///    position 07/0000Z`), so stale data is never silent.
+/// 2. **Official vitals** — for JTWC-covered storms the analysis wind/gusts/
+///    pressure/position/motion replace the GDACS aggregate, which repeats a
+///    storm's last-processed severity for many hours after JTWC has already
+///    issued newer warnings (see [`sync_storm_with_geometry`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WarningInfo {
+    pub agency: WarningAgency,
+    /// Warning/advisory sequence number (JTWC `WARNING NR 025`, NHC
+    /// `FORECAST/ADVISORY NUMBER 15`).
+    pub number: Option<u32>,
+    /// When the bulletin was issued (JTWC WMO-header DTG / NHC datestamp).
+    pub issued: Option<DateTime<Utc>>,
+    /// The analysis time (`WARNING POSITION` / `CENTER LOCATED NEAR ... AT`).
+    pub position_time: Option<DateTime<Utc>>,
+    /// The analysis position.
+    pub position: Option<GeoPoint>,
+    /// Current max sustained wind (kt) at the analysis time.
+    pub max_wind_kt: Option<f32>,
+    pub gust_kt: Option<f32>,
+    /// Recent motion (toward, degrees true / kt), where the bulletin states it.
+    pub movement_dir_deg: Option<f32>,
+    pub movement_speed_kt: Option<f32>,
+    /// Minimum central pressure (mb), where the bulletin states it.
+    pub min_pressure_mb: Option<f32>,
+}
+
+impl WarningInfo {
+    /// `JTWC Warning #25` / `NHC Advisory #15` (number omitted when unknown).
+    pub fn product_label(&self) -> String {
+        match self.number {
+            Some(number) => format!("{} #{number}", self.agency.product()),
+            None => self.agency.product().to_owned(),
+        }
+    }
+
+    /// The storm-card timing line: product identity, issue time (with its age
+    /// relative to `now`), and analysis-position time — every part the
+    /// bulletin carried, e.g.
+    /// `JTWC Warning #25 · issued 07/0300Z (4 h ago) · position 07/0000Z`.
+    pub fn identity_summary(&self, now: DateTime<Utc>) -> String {
+        let mut parts = vec![self.product_label()];
+        if let Some(issued) = self.issued {
+            parts.push(format!(
+                "issued {} ({})",
+                issued.format("%d/%H%MZ"),
+                age_label(now, issued)
+            ));
+        }
+        if let Some(position_time) = self.position_time {
+            parts.push(format!("position {}", position_time.format("%d/%H%MZ")));
+        }
+        parts.join(" · ")
+    }
+}
+
+/// `5 min ago` / `4 h ago` / `2 d ago` (clamped at zero against clock skew).
+pub fn age_label(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
+    let mins = (now - then).num_minutes().max(0);
+    if mins < 60 {
+        format!("{mins} min ago")
+    } else if mins < 60 * 24 {
+        format!("{} h ago", mins / 60)
+    } else {
+        format!("{} d ago", mins / (60 * 24))
     }
 }
 
@@ -370,6 +467,10 @@ pub struct StormGeometry {
     /// current-position glyph draw its wind rose and anchors the 34-kt danger
     /// area at the storm.
     pub current_wind_radii: Vec<WindRadii>,
+    /// The identity + analysis vitals of the bulletin this geometry came from
+    /// (JTWC warning / NHC TCM); `None` for GDACS-only storms. Mirrored onto
+    /// the storm record by [`sync_storm_with_geometry`].
+    pub warning: Option<WarningInfo>,
 }
 
 /// One active tropical cyclone, source-agnostic.
@@ -412,6 +513,17 @@ pub struct TropicalCyclone {
     /// RSS feed to this storm's name; enriches the GDACS getgeometry track/cone
     /// with real per-point max wind. `None` when no active JTWC warning matches.
     pub forecast_url: Option<String>,
+    /// The identity + analysis vitals of the official bulletin behind this
+    /// storm's forecast (JTWC warning / NHC TCM), mirrored from the fetched
+    /// geometry by [`sync_storm_with_geometry`]. The card renders it so the
+    /// user can always see which warning the intensity came from and how old
+    /// it is.
+    pub warning: Option<WarningInfo>,
+    /// The newest JTWC warning number the RSS feed advertises for this storm
+    /// (`Warning #25`), when one is active. The UI's geometry cache compares
+    /// it against the number it fetched under, so a re-issued JTWC warning
+    /// triggers a refetch exactly like a newer NHC advisory time does.
+    pub jtwc_warning_nr: Option<u32>,
 }
 
 impl TropicalCyclone {
@@ -618,6 +730,9 @@ fn nhc_to_cyclone(storm: NhcStorm) -> TropicalCyclone {
         // NHC's own TCM already carries per-point intensity via geometry_url;
         // no separate JTWC enrichment needed for NHC basins.
         forecast_url: None,
+        // Attached from the fetched TCM by sync_storm_with_geometry.
+        warning: None,
+        jtwc_warning_nr: None,
     }
 }
 
@@ -726,6 +841,88 @@ pub fn parse_nhc_current_radii(text: &str) -> Vec<WindRadii> {
         .collect()
 }
 
+/// Parse the advisory's identity + analysis vitals from an NHC TCM: the
+/// `FORECAST/ADVISORY NUMBER`, the issuance instant (`2100 UTC TUE OCT 08
+/// 2024`), the analysis position/time (`CENTER LOCATED NEAR 22.7N 87.5W AT
+/// 08/2100Z`), the current `MAX SUSTAINED WINDS ... GUSTS`, and the
+/// `ESTIMATED MINIMUM CENTRAL PRESSURE`. This is what the storm card shows so
+/// the forecast's age is visible; the per-point track stays in
+/// [`parse_nhc_forecast_advisory`]. `None` when the text carries none of it.
+pub fn parse_nhc_warning_info(text: &str) -> Option<WarningInfo> {
+    let issued_date = nhc_issuance_date(text);
+    let issued = nhc_issuance_stamp(text).and_then(|(hhmm, year, month, day)| {
+        let date = NaiveDate::from_ymd_opt(year, month, day)?;
+        let time = NaiveTime::from_hms_opt(hhmm / 100, hhmm % 100, 0)?;
+        Some(date.and_time(time).and_utc())
+    });
+
+    // "HURRICANE MILTON FORECAST/ADVISORY NUMBER  15" (specials keep the
+    // phrase; a lettered intermediate number simply fails the parse → None).
+    let number = text.lines().find_map(|line| {
+        let at = line.find("FORECAST/ADVISORY NUMBER")?;
+        line[at + "FORECAST/ADVISORY NUMBER".len()..]
+            .split_whitespace()
+            .next()?
+            .parse::<u32>()
+            .ok()
+    });
+
+    // "HURRICANE CENTER LOCATED NEAR 22.7N  87.5W AT 08/2100Z" (first one; the
+    // later REPEAT... line restates the same fix).
+    let center = text.lines().find_map(|line| {
+        let at = line.find("CENTER LOCATED NEAR")?;
+        parse_nhc_center_rest(&line[at + "CENTER LOCATED NEAR".len()..], issued_date)
+    });
+    let (position, position_time) = match center {
+        Some((point, time)) => (Some(point), time),
+        None => (None, None),
+    };
+
+    // "MAX SUSTAINED WINDS 145 KT WITH GUSTS TO 175 KT." — the first such
+    // line that carries a number (guards against digit-less headers, as in
+    // the JTWC parser).
+    let vitals = text
+        .lines()
+        .map(str::trim)
+        .find(|line| parse_jtwc_max_wind(line).is_some());
+    let max_wind_kt = vitals.and_then(parse_jtwc_max_wind);
+    let gust_kt = vitals.and_then(parse_gusts);
+    let min_pressure_mb = parse_min_pressure(text);
+
+    if number.is_none() && issued.is_none() && max_wind_kt.is_none() {
+        return None;
+    }
+    Some(WarningInfo {
+        agency: WarningAgency::Nhc,
+        number,
+        issued,
+        position_time,
+        position,
+        max_wind_kt,
+        gust_kt,
+        // CurrentStorms.json already carries NHC motion; not parsed here.
+        movement_dir_deg: None,
+        movement_speed_kt: None,
+        min_pressure_mb,
+    })
+}
+
+/// ` 22.7N  87.5W AT 08/2100Z` (the tail of a `CENTER LOCATED NEAR` line) →
+/// the analysis position and time.
+fn parse_nhc_center_rest(
+    rest: &str,
+    issued: Option<(i32, u32, u32)>,
+) -> Option<(GeoPoint, Option<DateTime<Utc>>)> {
+    let mut toks = rest.split_whitespace();
+    let lat = parse_signed_coord(toks.next()?, 'N', 'S')?;
+    let lon = parse_signed_coord(toks.next()?, 'E', 'W')?;
+    let time = toks
+        .find(|tok| *tok == "AT")
+        .and_then(|_| toks.next())
+        .and_then(|tok| parse_tcm_time(tok, issued));
+    Some((GeoPoint { lon, lat }, time))
+}
+
 /// Parse one TCM quadrant wind-radii line, e.g. `64 KT....... 25NE  25SE  25SW
 /// 25NW.` (analysis block) or `34 KT...100NE 100SE  80SW 120NW.` (forecast
 /// block — note the dots can abut the first radius with no space). Radii are
@@ -769,23 +966,30 @@ fn parse_nhc_radii_line(line: &str) -> Option<WindRadii> {
     })
 }
 
-/// Pull the issuance `(year, month, day)` from the TCM datestamp line, e.g.
-/// `2100 UTC TUE OCT 08 2024`. The forecast lines carry only a day-of-month, so
-/// this reference resolves the real month/year across month/year rollover.
-fn nhc_issuance_date(text: &str) -> Option<(i32, u32, u32)> {
+/// Pull `(HHMM, year, month, day)` from the TCM datestamp line, e.g.
+/// `2100 UTC TUE OCT 08 2024` — the advisory's issuance instant.
+fn nhc_issuance_stamp(text: &str) -> Option<(u32, i32, u32, u32)> {
     for line in text.lines() {
         let toks: Vec<&str> = line.split_whitespace().collect();
         if toks.len() < 6 || toks[1] != "UTC" {
             continue;
         }
+        let hhmm = toks[0].parse::<u32>();
         let month = month_from_abbrev(toks[toks.len() - 3]);
         let day = toks[toks.len() - 2].parse::<u32>();
         let year = toks[toks.len() - 1].parse::<i32>();
-        if let (Some(month), Ok(day), Ok(year)) = (month, day, year) {
-            return Some((year, month, day));
+        if let (Ok(hhmm), Some(month), Ok(day), Ok(year)) = (hhmm, month, day, year) {
+            return Some((hhmm, year, month, day));
         }
     }
     None
+}
+
+/// The issuance `(year, month, day)` from the TCM datestamp line. The forecast
+/// lines carry only a day-of-month, so this reference resolves the real
+/// month/year across month/year rollover.
+fn nhc_issuance_date(text: &str) -> Option<(i32, u32, u32)> {
+    nhc_issuance_stamp(text).map(|(_, year, month, day)| (year, month, day))
 }
 
 fn month_from_abbrev(abbrev: &str) -> Option<u32> {
@@ -889,13 +1093,16 @@ fn parse_nhc_max_wind(line: &str) -> Option<f32> {
 pub const JTWC_RSS_URL: &str = "https://www.metoc.navy.mil/jtwc/rss/jtwc.rss?tc";
 
 /// One active JTWC warning discovered from the RSS feed: its designation
-/// (e.g. `09W`), storm name (e.g. `Bavi`), and the Tropical Cyclone Warning
-/// text URL (`wpNNyyweb.txt`) carrying the per-point forecast + intensity.
+/// (e.g. `09W`), storm name (e.g. `Bavi`), the Tropical Cyclone Warning
+/// text URL (`wpNNyyweb.txt`) carrying the per-point forecast + intensity, and
+/// the warning sequence number the feed advertises (`Warning #25`) — the
+/// freshness signal that tells the geometry cache a re-issued warning exists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JtwcWarningRef {
     pub designation: String,
     pub name: String,
     pub warning_url: String,
+    pub warning_nr: Option<u32>,
 }
 
 /// Parse the JTWC RSS feed into the list of active Tropical Cyclone Warnings.
@@ -922,11 +1129,12 @@ pub fn parse_jtwc_rss(xml: &str) -> Vec<JtwcWarningRef> {
         if !is_jtwc_warning_url(url) {
             continue;
         }
-        if let Some((designation, name)) = last_jtwc_designation(&xml[..start]) {
+        if let Some((designation, name, warning_nr)) = last_jtwc_designation(&xml[..start]) {
             out.push(JtwcWarningRef {
                 designation,
                 name,
                 warning_url: url.to_owned(),
+                warning_nr,
             });
         }
     }
@@ -948,11 +1156,12 @@ fn is_jtwc_warning_url(url: &str) -> bool {
 }
 
 /// The last `NNX (Name)` designation+name in `before` (the text preceding a
-/// warning URL) — the header of the storm that URL belongs to. `NNX` is two
-/// digits and one or more letters (`09W`, `01B`, `02S`); the name is in the
-/// following parentheses. Rejects non-storm parentheticals like `(JTWC CDO)`
-/// or `(Western/South Pacific Ocean)`.
-fn last_jtwc_designation(before: &str) -> Option<(String, String)> {
+/// warning URL) — the header of the storm that URL belongs to — plus the
+/// `Warning #NN` sequence number that follows the name in the same header.
+/// `NNX` is two digits and one or more letters (`09W`, `01B`, `02S`); the name
+/// is in the following parentheses. Rejects non-storm parentheticals like
+/// `(JTWC CDO)` or `(Western/South Pacific Ocean)`.
+fn last_jtwc_designation(before: &str) -> Option<(String, String, Option<u32>)> {
     let mut found = None;
     for (i, _) in before.match_indices('(') {
         let after = &before[i + 1..];
@@ -969,10 +1178,24 @@ fn last_jtwc_designation(before: &str) -> Option<(String, String)> {
             .next()
             .unwrap_or_default();
         if is_jtwc_designation(designation) {
-            found = Some((designation.to_owned(), title_case(name)));
+            let warning_nr = warning_number_after(&after[close + 1..]);
+            found = Some((designation.to_owned(), title_case(name), warning_nr));
         }
     }
     found
+}
+
+/// The `#NN` warning number directly after a storm header's name — e.g.
+/// `... 09W (Bavi) Warning #25 </b>` → 25. Bounded to the next few characters
+/// so an unrelated `#` further down the feed is never picked up.
+fn warning_number_after(text: &str) -> Option<u32> {
+    let window: String = text.chars().take(40).collect();
+    let hash = window.find('#')?;
+    let digits: String = window[hash + 1..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
 }
 
 /// `09W`, `01B`, `02S` — two ASCII digits followed by one or more letters.
@@ -983,9 +1206,10 @@ fn is_jtwc_designation(tok: &str) -> bool {
         && bytes[2..].iter().all(u8::is_ascii_uppercase)
 }
 
-/// Set `forecast_url` on each GDACS storm whose name matches an active JTWC
-/// warning, so the geometry pipeline can enrich it with per-point intensity.
-/// (NHC storms already carry per-point wind in their own TCM.)
+/// Set `forecast_url` (and the RSS-advertised warning number) on each GDACS
+/// storm whose name matches an active JTWC warning, so the geometry pipeline
+/// can enrich it with per-point intensity — and refetch it when the warning
+/// number advances. (NHC storms already carry per-point wind in their own TCM.)
 pub fn attach_jtwc_forecast_urls(storms: &mut [TropicalCyclone], refs: &[JtwcWarningRef]) {
     for storm in storms.iter_mut() {
         if storm.source != Source::Gdacs {
@@ -996,6 +1220,7 @@ pub fn attach_jtwc_forecast_urls(storms: &mut [TropicalCyclone], refs: &[JtwcWar
             .find(|r| r.name.eq_ignore_ascii_case(&storm.name) && !storm.name.is_empty())
         {
             storm.forecast_url = Some(matched.warning_url.clone());
+            storm.jtwc_warning_nr = matched.warning_nr;
         }
     }
 }
@@ -1225,13 +1450,147 @@ fn parse_jtwc_time(tok: &str, issued: Option<(i32, u32, u32)>) -> Option<DateTim
     resolve_forward_time(day, hhmm, issued)
 }
 
-/// `MAX SUSTAINED WINDS - 145 KT, GUSTS 175 KT` -> `145`.
+/// `MAX SUSTAINED WINDS - 145 KT, GUSTS 175 KT` (JTWC) or
+/// `MAX SUSTAINED WINDS 145 KT WITH GUSTS TO 175 KT.` (NHC) -> `145`.
 fn parse_jtwc_max_wind(line: &str) -> Option<f32> {
     let rest = line.strip_prefix("MAX SUSTAINED WINDS")?;
     rest.split(|c: char| !c.is_ascii_digit())
         .find(|s| !s.is_empty())?
         .parse::<f32>()
         .ok()
+}
+
+/// The gust figure on a max-wind line: `..., GUSTS 180 KT` (JTWC) or
+/// `... WITH GUSTS TO 175 KT.` (NHC) -> the first number after `GUSTS`.
+fn parse_gusts(line: &str) -> Option<f32> {
+    let at = line.find("GUSTS")?;
+    line[at + "GUSTS".len()..]
+        .split(|c: char| !c.is_ascii_digit())
+        .find(|s| !s.is_empty())?
+        .parse::<f32>()
+        .ok()
+}
+
+/// `MOVEMENT PAST SIX HOURS - 285 DEGREES AT 11 KTS` -> `(285, 11)`; `None`
+/// for the digit-less `STATIONARY` form.
+fn parse_jtwc_movement(line: &str) -> Option<(f32, f32)> {
+    let rest = line.trim().strip_prefix("MOVEMENT PAST SIX HOURS")?;
+    let mut nums = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty());
+    let dir = nums.next()?.parse::<f32>().ok()?;
+    let speed = nums.next()?.parse::<f32>().ok()?;
+    Some((dir, speed))
+}
+
+/// The `MINIMUM CENTRAL PRESSURE AT 070000Z IS 934 MB` figure — the number
+/// immediately before the `MB` token (so the DTG is never mistaken for it),
+/// scanned across line wraps (live JTWC REMARKS wrap mid-sentence).
+fn parse_min_pressure(text: &str) -> Option<f32> {
+    let at = text.find("MINIMUM CENTRAL PRESSURE")?;
+    let window: String = text[at..].chars().take(120).collect();
+    let toks: Vec<&str> = window.split_whitespace().collect();
+    let mb_at = toks
+        .iter()
+        .position(|tok| tok.trim_end_matches('.') == "MB")?;
+    toks.get(mb_at.checked_sub(1)?)?.parse::<f32>().ok()
+}
+
+/// Parse the warning's identity + analysis vitals from a JTWC Tropical
+/// Cyclone Warning: the `WARNING NR` sequence number, the WMO-header issue
+/// DTG (`WTPN31 PGTW 070300`), the `WARNING POSITION` analysis time/position,
+/// the `PRESENT WIND DISTRIBUTION` current max wind + gusts, the six-hour
+/// movement, and the REMARKS minimum central pressure. This is the piece the
+/// storm card shows — and the piece that replaces a lagging GDACS severity
+/// (see [`sync_storm_with_geometry`]); the per-forecast-time track stays in
+/// [`parse_jtwc_forecast_warning`]. `None` when the text carries none of it
+/// (not a warning bulletin).
+pub fn parse_jtwc_warning_info(text: &str) -> Option<WarningInfo> {
+    let issued_date = jtwc_issuance_date(text);
+    let lines: Vec<&str> = text.lines().collect();
+
+    // "SUBJ/TYPHOON 09W (BAVI) WARNING NR 025//" (and its restatement).
+    let number = lines.iter().find_map(|line| {
+        let at = line.find("WARNING NR")?;
+        line[at + "WARNING NR".len()..]
+            .trim()
+            .trim_end_matches('/')
+            .trim()
+            .parse::<u32>()
+            .ok()
+    });
+
+    // WMO abbreviated heading `WTPN31 PGTW 070300`: the issue DTG (DDHHMM),
+    // resolved against the REMARKS `07JUL26` issuance date.
+    let issued = lines.iter().find_map(|line| {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        if toks.len() < 3 || toks[1] != "PGTW" {
+            return None;
+        }
+        let stamp = toks[2];
+        if stamp.len() != 6 || !stamp.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        resolve_forward_time(
+            stamp[..2].parse().ok()?,
+            stamp[2..].parse().ok()?,
+            issued_date,
+        )
+    });
+
+    // The analysis section runs up to FORECASTS:/the first forecast header —
+    // its position line and MAX SUSTAINED WINDS are the CURRENT state.
+    let analysis_end = lines
+        .iter()
+        .position(|line| {
+            let t = line.trim();
+            t == "FORECASTS:" || t.ends_with("HRS, VALID AT:")
+        })
+        .unwrap_or(lines.len());
+    let analysis = &lines[..analysis_end];
+
+    // `WARNING POSITION:` then `070000Z --- NEAR 16.2N 139.9E`.
+    let posit = analysis
+        .iter()
+        .position(|line| line.trim().starts_with("WARNING POSITION"))
+        .and_then(|at| {
+            analysis[at + 1..]
+                .iter()
+                .take(3)
+                .find_map(|line| parse_jtwc_valid_line(line.trim(), issued_date))
+        });
+    let (position, position_time) = match posit {
+        Some((point, time)) => (Some(point), time),
+        None => (None, None),
+    };
+
+    // The first MAX SUSTAINED WINDS line that carries a number — skipping the
+    // digit-less "MAX SUSTAINED WINDS BASED ON ONE-MINUTE AVERAGE" disclaimer
+    // that precedes it in every bulletin.
+    let vitals = analysis
+        .iter()
+        .map(|line| line.trim())
+        .find(|line| parse_jtwc_max_wind(line).is_some());
+    let max_wind_kt = vitals.and_then(parse_jtwc_max_wind);
+    let gust_kt = vitals.and_then(parse_gusts);
+    let movement = analysis.iter().find_map(|line| parse_jtwc_movement(line));
+    let min_pressure_mb = parse_min_pressure(text);
+
+    if number.is_none() && issued.is_none() && max_wind_kt.is_none() {
+        return None;
+    }
+    Some(WarningInfo {
+        agency: WarningAgency::Jtwc,
+        number,
+        issued,
+        position_time,
+        position,
+        max_wind_kt,
+        gust_kt,
+        movement_dir_deg: movement.map(|(dir, _)| dir),
+        movement_speed_kt: movement.map(|(_, speed)| speed),
+        min_pressure_mb,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1374,6 +1733,8 @@ fn gdacs_to_cyclone(feature: GdacsFeature) -> Option<TropicalCyclone> {
         // `attach_jtwc_forecast_urls`) when an official JTWC warning is active
         // for this storm.
         forecast_url: None,
+        warning: None,
+        jtwc_warning_nr: None,
     })
 }
 
@@ -1445,8 +1806,10 @@ pub fn parse_gdacs_geometry(json: &str) -> Result<StormGeometry, String> {
         cone,
         forecast,
         // Filled from the matched JTWC warning by `fetch_storm_geometry`; GDACS
-        // getgeometry alone carries no analysis-point wind radii.
+        // getgeometry alone carries no analysis-point wind radii or warning
+        // identity.
         current_wind_radii: Vec::new(),
+        warning: None,
     })
 }
 
@@ -1700,17 +2063,82 @@ pub fn fetch_storm_geometry(
             if let Some(warning_url) = forecast_url
                 && let Ok(warning) = fetch_text(client, warning_url)
             {
-                let jtwc = parse_jtwc_forecast_warning(&warning);
-                if !jtwc.is_empty() {
-                    geometry.forecast = jtwc;
-                    // The analysis-point 34/50/64-kt radii anchor the wind-rose
-                    // and danger-area rendering at the storm's current position.
-                    geometry.current_wind_radii = parse_jtwc_current_radii(&warning);
-                }
+                apply_jtwc_warning(&mut geometry, &warning);
             }
             Ok(geometry)
         }
         Source::Nhc => Ok(nhc_geometry_from_forecast_advisory(&body)),
+    }
+}
+
+/// Apply a fetched JTWC Tropical Cyclone Warning bulletin to a GDACS storm's
+/// geometry — the pure core of [`fetch_storm_geometry`]'s enrichment, split
+/// out so a warning-N → warning-N+1 replacement is provable without a
+/// network. The warning's per-point forecast REPLACES the intensity-less
+/// GDACS points, the analysis-point 34/50/64-kt radii anchor the wind-rose /
+/// danger-area rendering at the storm's current position, and the warning
+/// identity + analysis vitals ride along for the card and the GDACS-severity
+/// override. An unparseable bulletin leaves the GDACS fallback untouched.
+pub fn apply_jtwc_warning(geometry: &mut StormGeometry, warning_text: &str) {
+    let jtwc = parse_jtwc_forecast_warning(warning_text);
+    if !jtwc.is_empty() {
+        geometry.forecast = jtwc;
+        geometry.current_wind_radii = parse_jtwc_current_radii(warning_text);
+    }
+    if let Some(info) = parse_jtwc_warning_info(warning_text) {
+        geometry.warning = Some(info);
+    }
+}
+
+/// Mirror a fetched [`StormGeometry`] onto its storm record — the re-attach
+/// the UI runs every frame (a fresh storms list arrives with empty
+/// forecast/radii/warning, and the geometry map is the transport).
+///
+/// For a GDACS-sourced storm carrying a JTWC warning, the warning's analysis
+/// vitals REPLACE the aggregator's: GDACS repeats a storm's last-processed
+/// severity for many hours after JTWC has issued newer warnings (the "Bavi
+/// still shows 155 kt two warnings after JTWC dropped it to 125 kt" bug), so
+/// the official analysis wind/gusts/pressure/position/motion win and the
+/// category + classification are recomputed from the official wind. NHC
+/// storms keep their `CurrentStorms.json` vitals (refreshed with every public
+/// advisory, at least as fresh as the TCM) — only the advisory identity is
+/// attached for display.
+pub fn sync_storm_with_geometry(storm: &mut TropicalCyclone, geometry: &StormGeometry) {
+    if storm.forecast != geometry.forecast {
+        storm.forecast = geometry.forecast.clone();
+    }
+    if storm.current_wind_radii != geometry.current_wind_radii {
+        storm.current_wind_radii = geometry.current_wind_radii.clone();
+    }
+    if storm.warning != geometry.warning {
+        storm.warning = geometry.warning.clone();
+    }
+    let Some(warning) = &storm.warning else {
+        return;
+    };
+    if warning.agency != WarningAgency::Jtwc || storm.source != Source::Gdacs {
+        return;
+    }
+    if let Some(kt) = warning.max_wind_kt {
+        storm.max_wind_kt = Some(kt);
+        let category = Category::from_wind_kt(kt);
+        storm.category = Some(category);
+        storm.classification = category.label(storm.basin);
+    }
+    if warning.gust_kt.is_some() {
+        storm.gust_kt = warning.gust_kt;
+    }
+    if warning.min_pressure_mb.is_some() {
+        storm.min_pressure_mb = warning.min_pressure_mb;
+    }
+    if warning.movement_dir_deg.is_some() && warning.movement_speed_kt.is_some() {
+        storm.movement_dir_deg = warning.movement_dir_deg;
+        storm.movement_speed_kt = warning.movement_speed_kt;
+    }
+    // The official analysis position (the wind radii are valid ABOUT it, so
+    // the rose/danger area anchor correctly even when GDACS's centroid lags).
+    if let Some(position) = warning.position {
+        storm.position = position;
     }
 }
 
@@ -1724,6 +2152,7 @@ pub fn nhc_geometry_from_forecast_advisory(text: &str) -> StormGeometry {
     StormGeometry {
         forecast: parse_nhc_forecast_advisory(text),
         current_wind_radii: parse_nhc_current_radii(text),
+        warning: parse_nhc_warning_info(text),
         ..StormGeometry::default()
     }
 }
@@ -1763,6 +2192,11 @@ mod tests {
     // feature: the active RSS feed and Super Typhoon 09W (BAVI) Warning #21.
     const JTWC_RSS: &str = include_str!("../tests/fixtures/tropical/jtwc_rss.xml");
     const JTWC_WARNING: &str = include_str!("../tests/fixtures/tropical/jtwc_bavi_warning.txt");
+    // The SAME storm one day later (captured live 2026-07-07): Warning #25,
+    // downgraded to 125 kt — the newer-warning-replaces-older proof, and the
+    // wrapped-REMARKS pressure form.
+    const JTWC_WARNING_25: &str =
+        include_str!("../tests/fixtures/tropical/jtwc_bavi_warning_25.txt");
 
     #[test]
     fn nhc_parses_storm_vitals() {
@@ -1913,6 +2347,8 @@ MAX WIND 50 KT...GUSTS 65 KT.
             r.warning_url,
             "https://www.metoc.navy.mil/jtwc/products/wp0926web.txt"
         );
+        // The advertised sequence number — the geometry cache's refetch signal.
+        assert_eq!(r.warning_nr, Some(21));
         // The filename gate distinguishes storm warnings from basin outlooks.
         assert!(is_jtwc_warning_url(
             "https://www.metoc.navy.mil/jtwc/products/wp0926web.txt"
@@ -1999,9 +2435,15 @@ MAX WIND 50 KT...GUSTS 65 KT.
             Some("https://www.metoc.navy.mil/jtwc/products/wp0926web.txt"),
             "BAVI matched to its JTWC warning by name"
         );
+        assert_eq!(
+            bavi.jtwc_warning_nr,
+            Some(21),
+            "RSS warning number rides along"
+        );
         // MAYSAK has no active JTWC warning in the feed → no forecast URL.
         let maysak = storms.iter().find(|s| s.name == "Maysak").unwrap();
         assert_eq!(maysak.forecast_url, None);
+        assert_eq!(maysak.jtwc_warning_nr, None);
     }
 
     #[test]
@@ -2189,6 +2631,8 @@ REMARKS:
             report_url: None,
             geometry_url: None,
             forecast_url: None,
+            warning: None,
+            jtwc_warning_nr: None,
         }
     }
 
@@ -2696,7 +3140,7 @@ REMARKS:
         println!("{} active tropical cyclone(s):", storms.len());
         for storm in &storms {
             println!(
-                "  {} [{}] {:?} {:.0} kt at ({:.1}, {:.1}) geometry_url={} jtwc={}",
+                "  {} [{}] {:?} {:.0} kt at ({:.1}, {:.1}) geometry_url={} jtwc={} rss_warning_nr={:?}",
                 storm.name,
                 storm.source.label(),
                 storm.basin,
@@ -2705,6 +3149,7 @@ REMARKS:
                 storm.position.lat,
                 storm.geometry_url.is_some(),
                 storm.forecast_url.is_some(),
+                storm.jtwc_warning_nr,
             );
         }
         for storm in &storms {
@@ -2726,6 +3171,35 @@ REMARKS:
                 geom.cone.len(),
                 geom.track.len(),
             );
+            // The staleness fix, proven against the live bulletin: the parsed
+            // warning identity + analysis intensity must replace the
+            // aggregator's numbers on the storm record.
+            if let Some(warning) = &geom.warning {
+                let mut synced = storm.clone();
+                sync_storm_with_geometry(&mut synced, &geom);
+                println!("    bulletin: {}", warning.identity_summary(Utc::now()));
+                println!(
+                    "    displayed intensity now {:?} kt / {:?} (list source said {:?} kt)",
+                    synced.max_wind_kt, synced.classification, storm.max_wind_kt,
+                );
+                if storm.forecast_url.is_some() {
+                    assert!(warning.number.is_some(), "live JTWC warning number parses");
+                    assert!(warning.issued.is_some(), "live JTWC issue DTG parses");
+                    assert!(
+                        warning.max_wind_kt.is_some(),
+                        "live JTWC analysis intensity parses"
+                    );
+                    assert_eq!(
+                        synced.max_wind_kt, warning.max_wind_kt,
+                        "official analysis intensity replaces the aggregator's"
+                    );
+                }
+            } else if storm.forecast_url.is_some() {
+                panic!(
+                    "JTWC-matched storm {} fetched without warning identity",
+                    storm.name
+                );
+            }
         }
     }
 
@@ -2733,13 +3207,13 @@ REMARKS:
     fn jtwc_enrichment_carries_radii_end_to_end() {
         // The GDACS getgeometry forecast points carry no radii; the matched JTWC
         // warning supplies both per-point and current radii, exactly as
-        // `fetch_storm_geometry` wires them.
+        // `fetch_storm_geometry` wires them (via `apply_jtwc_warning`).
         let mut geometry = parse_gdacs_geometry(GDACS_FCST).unwrap();
         assert!(geometry.current_wind_radii.is_empty());
         assert!(geometry.forecast.iter().all(|p| p.wind_radii.is_empty()));
+        assert!(geometry.warning.is_none());
 
-        geometry.forecast = parse_jtwc_forecast_warning(JTWC_WARNING);
-        geometry.current_wind_radii = parse_jtwc_current_radii(JTWC_WARNING);
+        apply_jtwc_warning(&mut geometry, JTWC_WARNING);
         assert!(!geometry.current_wind_radii.is_empty());
         assert!(
             geometry
@@ -2748,5 +3222,162 @@ REMARKS:
                 .all(|p| p.wind_radii.iter().any(|r| r.kt == 34)),
             "every forecast point has a 34-kt gale radius"
         );
+        // The warning identity rides along for the card + severity override.
+        assert_eq!(geometry.warning.as_ref().and_then(|w| w.number), Some(21));
+    }
+
+    #[test]
+    fn jtwc_warning_info_parses_identity_and_analysis_vitals() {
+        let info = parse_jtwc_warning_info(JTWC_WARNING).expect("warning info");
+        assert_eq!(info.agency, WarningAgency::Jtwc);
+        assert_eq!(info.number, Some(21));
+        // WMO header `WTPN31 PGTW 060300` + REMARKS `06JUL26`.
+        assert_eq!(
+            info.issued,
+            NaiveDate::from_ymd_opt(2026, 7, 6)
+                .unwrap()
+                .and_hms_opt(3, 0, 0)
+                .map(|dt| dt.and_utc())
+        );
+        // WARNING POSITION: 060000Z --- NEAR 14.3N 145.0E.
+        assert_eq!(
+            info.position_time,
+            NaiveDate::from_ymd_opt(2026, 7, 6)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .map(|dt| dt.and_utc())
+        );
+        let posit = info.position.expect("analysis position");
+        assert!((posit.lat - 14.3).abs() < 1e-3 && (posit.lon - 145.0).abs() < 1e-3);
+        // PRESENT WIND DISTRIBUTION: the CURRENT intensity, not a forecast's.
+        assert_eq!(info.max_wind_kt, Some(150.0));
+        assert_eq!(info.gust_kt, Some(180.0));
+        assert_eq!(info.movement_dir_deg, Some(285.0));
+        assert_eq!(info.movement_speed_kt, Some(11.0));
+        assert_eq!(info.min_pressure_mb, Some(906.0));
+
+        // The live #25 bulletin: analysis wind 125 kt (first MAX SUSTAINED
+        // WINDS is the analysis block's, never a forecast block's) and the
+        // REMARKS pressure sentence wrapped across a line break still parses.
+        let info25 = parse_jtwc_warning_info(JTWC_WARNING_25).expect("warning info");
+        assert_eq!(info25.number, Some(25));
+        assert_eq!(info25.max_wind_kt, Some(125.0));
+        assert_eq!(info25.min_pressure_mb, Some(934.0));
+    }
+
+    #[test]
+    fn nhc_warning_info_parses_identity_and_analysis_vitals() {
+        let info = parse_nhc_warning_info(NHC_TCM).expect("advisory info");
+        assert_eq!(info.agency, WarningAgency::Nhc);
+        assert_eq!(info.number, Some(15));
+        // `2100 UTC TUE OCT 08 2024`.
+        assert_eq!(
+            info.issued,
+            NaiveDate::from_ymd_opt(2024, 10, 8)
+                .unwrap()
+                .and_hms_opt(21, 0, 0)
+                .map(|dt| dt.and_utc())
+        );
+        // `HURRICANE CENTER LOCATED NEAR 22.7N  87.5W AT 08/2100Z`.
+        assert_eq!(info.position_time, info.issued);
+        let posit = info.position.expect("analysis position");
+        assert!((posit.lat - 22.7).abs() < 1e-3 && (posit.lon + 87.5).abs() < 1e-3);
+        assert_eq!(info.max_wind_kt, Some(145.0));
+        assert_eq!(info.gust_kt, Some(175.0));
+        assert_eq!(info.min_pressure_mb, Some(918.0));
+    }
+
+    #[test]
+    fn warning_identity_summary_shows_number_issue_age_and_position_time() {
+        use chrono::TimeZone;
+        // The exact card strings — the user must always see how old the
+        // intensity is.
+        let jtwc = parse_jtwc_warning_info(JTWC_WARNING_25).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 7, 7, 0, 0).unwrap();
+        assert_eq!(
+            jtwc.identity_summary(now),
+            "JTWC Warning #25 · issued 07/0300Z (4 h ago) · position 07/0000Z"
+        );
+        let nhc = parse_nhc_warning_info(NHC_TCM).unwrap();
+        let now = Utc.with_ymd_and_hms(2024, 10, 8, 23, 30, 0).unwrap();
+        assert_eq!(
+            nhc.identity_summary(now),
+            "NHC Advisory #15 · issued 08/2100Z (2 h ago) · position 08/2100Z"
+        );
+        assert_eq!(jtwc.product_label(), "JTWC Warning #25");
+    }
+
+    /// THE staleness proof (owner report, 2026-07-06): warning N then N+1
+    /// through the exact pipeline two geometry refetches run — the stored
+    /// storm state must reflect N+1, not the old peak.
+    #[test]
+    fn newer_jtwc_warning_replaces_stored_vitals() {
+        let mut storm = parse_gdacs_event_list(GDACS_LIST)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "Bavi")
+            .unwrap();
+
+        // First fetch under Warning #21: the official 150 kt replaces the
+        // GDACS ~145-kt severity estimate.
+        let mut geometry = parse_gdacs_geometry(GDACS_FCST).unwrap();
+        apply_jtwc_warning(&mut geometry, JTWC_WARNING);
+        sync_storm_with_geometry(&mut storm, &geometry);
+        assert_eq!(storm.warning.as_ref().and_then(|w| w.number), Some(21));
+        assert_eq!(storm.max_wind_kt, Some(150.0));
+        assert_eq!(storm.classification, "Super Typhoon");
+
+        // Refetch under Warning #25 (live 2026-07-07 product, downgraded):
+        // EVERYTHING follows — intensity, category/label, gusts, pressure,
+        // motion, analysis position, forecast dots, and the identity line.
+        apply_jtwc_warning(&mut geometry, JTWC_WARNING_25);
+        sync_storm_with_geometry(&mut storm, &geometry);
+        let warning = storm.warning.clone().expect("warning attached");
+        assert_eq!(warning.number, Some(25));
+        assert_eq!(
+            warning.issued,
+            NaiveDate::from_ymd_opt(2026, 7, 7)
+                .unwrap()
+                .and_hms_opt(3, 0, 0)
+                .map(|dt| dt.and_utc())
+        );
+        assert_eq!(storm.max_wind_kt, Some(125.0), "no stale 150/155 kt");
+        assert_eq!(storm.category, Some(Category::Four));
+        assert_eq!(storm.classification, "Category 4 Typhoon");
+        assert_eq!(storm.gust_kt, Some(150.0));
+        assert_eq!(storm.min_pressure_mb, Some(934.0));
+        assert_eq!(storm.movement_speed_kt, Some(12.0));
+        assert!(
+            (storm.position.lat - 16.2).abs() < 1e-3 && (storm.position.lon - 139.9).abs() < 1e-3,
+            "analysis position follows the newest warning"
+        );
+        // Forecast dots re-keyed to #25: first point 071200Z at 130 kt.
+        assert_eq!(storm.forecast[0].max_wind_kt, Some(130.0));
+        assert_eq!(
+            storm.forecast[0].valid_time,
+            NaiveDate::from_ymd_opt(2026, 7, 7)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .map(|dt| dt.and_utc())
+        );
+    }
+
+    #[test]
+    fn sync_attaches_nhc_advisory_identity_without_overriding_vitals() {
+        // NHC vitals come from CurrentStorms.json (refreshed every public
+        // advisory, at least as fresh as the 6-hourly TCM) — the TCM identity
+        // is attached for display but must NOT clobber them.
+        let mut storm = parse_nhc_current_storms(NHC).unwrap().pop().unwrap(); // Alberto
+        let geometry = nhc_geometry_from_forecast_advisory(NHC_TCM);
+        sync_storm_with_geometry(&mut storm, &geometry);
+        assert_eq!(storm.max_wind_kt, Some(85.0), "CurrentStorms wind kept");
+        assert_eq!(storm.classification, "Category 2 Hurricane");
+        assert!((storm.position.lat - 24.5).abs() < 1e-3, "position kept");
+        let warning = storm.warning.as_ref().expect("advisory identity");
+        assert_eq!(warning.agency, WarningAgency::Nhc);
+        assert_eq!(warning.number, Some(15));
+        // Forecast + radii still mirror through.
+        assert_eq!(storm.forecast.len(), 8);
+        assert!(!storm.current_wind_radii.is_empty());
     }
 }

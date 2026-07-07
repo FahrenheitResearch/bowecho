@@ -31,18 +31,21 @@ pub const TROPICAL_RETRY_SECONDS: u64 = 20;
 /// advisory time in the storms list — the backstop that keeps a long-running
 /// session's forecast track honest (one extra fetch per storm per hour). NHC
 /// reissues the TCM every 6 h; GDACS episodes bump their storm id, which
-/// evicts+refetches on its own.
+/// evicts+refetches on its own; JTWC warnings additionally refetch as soon as
+/// the RSS feed advertises a higher warning number (every 6 h, 3 h near land).
 pub const TROPICAL_GEOMETRY_MAX_AGE_SECONDS: u64 = 3600;
 
 type StormsResult = std::result::Result<Vec<TropicalCyclone>, String>;
 type GeometryResult = std::result::Result<GeometryFetch, String>;
 
-/// One finished geometry fetch: which storm, the `advisory_time` its storms-
-/// list record carried when the fetch was SPAWNED (so a later, newer advisory
-/// marks the entry stale), and the parsed geometry.
+/// One finished geometry fetch: which storm, the `advisory_time` and the
+/// RSS-advertised JTWC warning number its storms-list record carried when the
+/// fetch was SPAWNED (so a later, newer advisory/warning marks the entry
+/// stale), and the parsed geometry.
 struct GeometryFetch {
     id: String,
     advisory_time: Option<DateTime<Utc>>,
+    warning_nr: Option<u32>,
     geometry: StormGeometry,
 }
 
@@ -51,7 +54,10 @@ struct GeometryFetch {
 /// for the storm's whole life (`nhc:al142024`), so without this the first TCM
 /// ever fetched would be pinned until app exit while NHC issues a new
 /// forecast every 6 h — the current-position glyph kept moving but the
-/// forecast dots/line/radii went days stale (audit #2).
+/// forecast dots/line/radii went days stale (audit #2). The JTWC warning
+/// behind a West-Pacific storm has the same failure shape (a stable
+/// `wpNNyyweb.txt` URL re-issued every 6 h), so the RSS-advertised warning
+/// number is tracked the same way the advisory time is.
 pub struct StormGeometryEntry {
     pub geometry: StormGeometry,
     /// When the fetch completed (drives the age-based refetch backstop).
@@ -59,20 +65,39 @@ pub struct StormGeometryEntry {
     /// The storm's advisory time as of the fetch; `None` when the source
     /// didn't carry one.
     advisory_time: Option<DateTime<Utc>>,
+    /// The RSS-advertised JTWC warning number as of the fetch; `None` for
+    /// NHC/GDACS-only storms or while the RSS feed was unavailable.
+    warning_nr: Option<u32>,
 }
 
 impl StormGeometryEntry {
     /// Whether this entry should be refetched: the storms list now carries a
-    /// newer advisory than the one this geometry was fetched under, or the
-    /// entry has outlived [`TROPICAL_GEOMETRY_MAX_AGE_SECONDS`].
-    fn is_stale(&self, current_advisory: Option<DateTime<Utc>>, now: Instant) -> bool {
+    /// newer advisory time OR a higher JTWC warning number than the ones this
+    /// geometry was fetched under, or the entry has outlived
+    /// [`TROPICAL_GEOMETRY_MAX_AGE_SECONDS`].
+    fn is_stale(
+        &self,
+        current_advisory: Option<DateTime<Utc>>,
+        current_warning_nr: Option<u32>,
+        now: Instant,
+    ) -> bool {
         let newer_advisory = match (self.advisory_time, current_advisory) {
             (Some(cached), Some(current)) => current > cached,
             // The storms list learned an advisory time this fetch never saw.
             (None, Some(_)) => true,
             _ => false,
         };
+        // JTWC re-issues the same warning URL under a bumped number; a number
+        // the cached fetch never saw means the stored bulletin is superseded.
+        // (None, Some) also covers a JTWC match appearing after the geometry
+        // was first fetched (RSS outage, or the warning opened later).
+        let newer_warning = match (self.warning_nr, current_warning_nr) {
+            (Some(cached), Some(current)) => current > cached,
+            (None, Some(_)) => true,
+            _ => false,
+        };
         newer_advisory
+            || newer_warning
             || now.saturating_duration_since(self.fetched_at)
                 >= Duration::from_secs(TROPICAL_GEOMETRY_MAX_AGE_SECONDS)
     }
@@ -90,7 +115,7 @@ fn storm_needing_geometry<'a>(
         storm.geometry_url.is_some()
             && geometry
                 .get(&storm.id)
-                .is_none_or(|entry| entry.is_stale(storm.advisory_time, now))
+                .is_none_or(|entry| entry.is_stale(storm.advisory_time, storm.jtwc_warning_nr, now))
     })
 }
 
@@ -185,25 +210,20 @@ impl TropicalState {
                     geometry: fetch.geometry,
                     fetched_at: Instant::now(),
                     advisory_time: fetch.advisory_time,
+                    warning_nr: fetch.warning_nr,
                 },
             );
         }
-        // Mirror each storm's parsed forecast points onto its record so
-        // `TropicalCyclone.forecast` is populated for the overlay/hover. The
-        // geometry map is the transport (filled by the 2nd fetch); a fresh
-        // storms list arrives with empty forecasts, so re-attach every poll.
+        // Mirror each storm's parsed geometry payload (forecast points,
+        // analysis wind radii, official warning identity + vitals) onto its
+        // record. The geometry map is the transport (filled by the 2nd
+        // fetch); a fresh storms list arrives with all of it empty, so
+        // re-attach every poll — and for JTWC-covered storms the official
+        // analysis intensity replaces GDACS's lagging severity (see
+        // `sync_storm_with_geometry`).
         for storm in &mut self.storms {
             if let Some(entry) = self.geometry.get(&storm.id) {
-                let geom = &entry.geometry;
-                if storm.forecast != geom.forecast {
-                    storm.forecast = geom.forecast.clone();
-                }
-                // The analysis-point wind radii (JTWC/NHC) ride alongside the
-                // forecast; re-attach so the overlay's wind rose + danger area
-                // survive a fresh storms-list swap.
-                if storm.current_wind_radii != geom.current_wind_radii {
-                    storm.current_wind_radii = geom.current_wind_radii.clone();
-                }
+                tropical::sync_storm_with_geometry(storm, &entry.geometry);
             }
         }
     }
@@ -220,6 +240,7 @@ impl TropicalState {
             let id = storm.id.clone();
             let source = storm.source;
             let advisory_time = storm.advisory_time;
+            let warning_nr = storm.jtwc_warning_nr;
             let url = storm.geometry_url.clone().expect("checked is_some");
             // JTWC per-point forecast intensity for West-Pacific/Indian/Southern
             // storms (None for NHC basins, which carry it in their own TCM).
@@ -237,6 +258,7 @@ impl TropicalState {
                     .map(|geometry| GeometryFetch {
                         id,
                         advisory_time,
+                        warning_nr,
                         geometry,
                     });
                 let _ = tx.send(result);
@@ -322,14 +344,32 @@ impl TropicalState {
                     ),
                 );
 
+                // The official bulletin behind the numbers: which warning/
+                // advisory, when it was issued (with age), and its analysis
+                // time — so a stale intensity is never silent, e.g.
+                // "JTWC Warning #25 · issued 07/0300Z (4 h ago) · position
+                // 07/0000Z".
+                if let Some(warning) = &storm.warning {
+                    ui.label(
+                        egui::RichText::new(warning.identity_summary(Utc::now()))
+                            .small()
+                            .weak(),
+                    );
+                }
+                // The list source's own record (GDACS aggregate / NHC
+                // CurrentStorms) — for GDACS+JTWC storms this dates the
+                // track/cone/alert level, while the warning line above dates
+                // the intensity.
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(storm.source.label()).small().weak());
                     if let Some(time) = storm.advisory_time {
-                        let mins = (Utc::now() - time).num_minutes().max(0);
                         ui.label(
-                            egui::RichText::new(format!("· updated {}", ago(mins)))
-                                .small()
-                                .weak(),
+                            egui::RichText::new(format!(
+                                "· updated {}",
+                                tropical::age_label(Utc::now(), time)
+                            ))
+                            .small()
+                            .weak(),
                         );
                     }
                 });
@@ -372,16 +412,6 @@ fn vital(ui: &mut egui::Ui, label: &str, value: &str) {
         ui.label(egui::RichText::new(format!("{label}: ")).weak());
         ui.label(value);
     });
-}
-
-fn ago(mins: i64) -> String {
-    if mins < 60 {
-        format!("{mins} min ago")
-    } else if mins < 60 * 24 {
-        format!("{} h ago", mins / 60)
-    } else {
-        format!("{} d ago", mins / (60 * 24))
-    }
 }
 
 /// External plot providers to open in the browser (credited, never scraped).
@@ -739,6 +769,10 @@ fn forecast_tooltip_lines(
     if let Some(category) = category {
         lines.push(category.label(storm.basin));
     }
+    // Which official bulletin this dot came from ("JTWC Warning #25").
+    if let Some(warning) = &storm.warning {
+        lines.push(warning.product_label());
+    }
     lines
 }
 
@@ -814,14 +848,21 @@ mod tests {
             report_url: None,
             geometry_url: Some("https://www.nhc.noaa.gov/text/MIATCMAT4.shtml".to_owned()),
             forecast_url: None,
+            warning: None,
+            jtwc_warning_nr: None,
         }
     }
 
-    fn entry(advisory_time: Option<DateTime<Utc>>, fetched_at: Instant) -> StormGeometryEntry {
+    fn entry(
+        advisory_time: Option<DateTime<Utc>>,
+        warning_nr: Option<u32>,
+        fetched_at: Instant,
+    ) -> StormGeometryEntry {
         StormGeometryEntry {
             geometry: StormGeometry::default(),
             fetched_at,
             advisory_time,
+            warning_nr,
         }
     }
 
@@ -832,7 +873,10 @@ mod tests {
     fn geometry_refetches_when_storm_advisory_is_newer() {
         let now = Instant::now();
         let mut geometry = HashMap::new();
-        geometry.insert("nhc:al142024".to_owned(), entry(Some(advisory(15)), now));
+        geometry.insert(
+            "nhc:al142024".to_owned(),
+            entry(Some(advisory(15)), None, now),
+        );
         let storms = vec![test_storm("nhc:al142024", Some(advisory(21)))];
         let picked = storm_needing_geometry(&storms, &geometry, now)
             .expect("newer advisory forces a refetch");
@@ -843,7 +887,10 @@ mod tests {
     fn geometry_fresh_entry_is_not_refetched() {
         let now = Instant::now();
         let mut geometry = HashMap::new();
-        geometry.insert("nhc:al142024".to_owned(), entry(Some(advisory(21)), now));
+        geometry.insert(
+            "nhc:al142024".to_owned(),
+            entry(Some(advisory(21)), None, now),
+        );
         // Same advisory as cached, entry just fetched: nothing to do.
         let storms = vec![test_storm("nhc:al142024", Some(advisory(21)))];
         assert!(storm_needing_geometry(&storms, &geometry, now).is_none());
@@ -858,7 +905,7 @@ mod tests {
     fn geometry_refetches_after_max_age_backstop() {
         let fetched_at = Instant::now();
         let mut geometry = HashMap::new();
-        geometry.insert("nhc:al142024".to_owned(), entry(None, fetched_at));
+        geometry.insert("nhc:al142024".to_owned(), entry(None, None, fetched_at));
         let storms = vec![test_storm("nhc:al142024", None)];
 
         let just_before = fetched_at + Duration::from_secs(TROPICAL_GEOMETRY_MAX_AGE_SECONDS - 1);
@@ -885,8 +932,62 @@ mod tests {
     fn geometry_refetches_when_advisory_first_appears() {
         let now = Instant::now();
         let mut geometry = HashMap::new();
-        geometry.insert("nhc:al142024".to_owned(), entry(None, now));
+        geometry.insert("nhc:al142024".to_owned(), entry(None, None, now));
         let storms = vec![test_storm("nhc:al142024", Some(advisory(21)))];
+        assert!(storm_needing_geometry(&storms, &geometry, now).is_some());
+    }
+
+    /// The JTWC face of audit #2 (the "Bavi stuck at the old warning" bug):
+    /// the warning URL (`wp0926web.txt`) is stable while JTWC re-issues under
+    /// a bumped warning number every 6 h, and GDACS's advisory time can sit
+    /// still the whole while — the RSS-advertised number must trigger the
+    /// refetch on its own.
+    #[test]
+    fn geometry_refetches_when_jtwc_warning_number_advances() {
+        let now = Instant::now();
+        let mut geometry = HashMap::new();
+        // Fetched under Warning #21, same (unmoving) GDACS advisory time.
+        geometry.insert(
+            "gdacs:1001279:17".to_owned(),
+            entry(Some(advisory(15)), Some(21), now),
+        );
+        let mut storm = test_storm("gdacs:1001279:17", Some(advisory(15)));
+        storm.source = Source::Gdacs;
+        storm.jtwc_warning_nr = Some(25);
+        let storms = vec![storm];
+        let picked = storm_needing_geometry(&storms, &geometry, now)
+            .expect("a higher advertised warning number forces a refetch");
+        assert_eq!(picked.id, "gdacs:1001279:17");
+
+        // Same number → fresh; an RSS hiccup to an OLDER number must not
+        // refetch either (mirrors the older-advisory guard).
+        for stale_nr in [Some(21), Some(20)] {
+            let mut storm = test_storm("gdacs:1001279:17", Some(advisory(15)));
+            storm.source = Source::Gdacs;
+            storm.jtwc_warning_nr = stale_nr;
+            let storms = vec![storm];
+            assert!(
+                storm_needing_geometry(&storms, &geometry, now).is_none(),
+                "warning nr {stale_nr:?} must not refetch"
+            );
+        }
+    }
+
+    /// A geometry cached before the storm had a JTWC match (RSS outage, or
+    /// JTWC opened the warning later) refetches as soon as the RSS advertises
+    /// one, so the enrichment isn't stuck waiting for the 1-h backstop.
+    #[test]
+    fn geometry_refetches_when_jtwc_match_first_appears() {
+        let now = Instant::now();
+        let mut geometry = HashMap::new();
+        geometry.insert(
+            "gdacs:1001279:17".to_owned(),
+            entry(Some(advisory(15)), None, now),
+        );
+        let mut storm = test_storm("gdacs:1001279:17", Some(advisory(15)));
+        storm.source = Source::Gdacs;
+        storm.jtwc_warning_nr = Some(25);
+        let storms = vec![storm];
         assert!(storm_needing_geometry(&storms, &geometry, now).is_some());
     }
 
