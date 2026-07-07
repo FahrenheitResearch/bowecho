@@ -437,6 +437,8 @@ enum EditorAction {
     None,
     LivePreviewToggled,
     Save,
+    // Emitted only by the rfd-gated (windows/macos) export button.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     Export,
     Revert,
     Close,

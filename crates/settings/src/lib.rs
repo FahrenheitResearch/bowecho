@@ -183,6 +183,21 @@ pub struct AppSettings {
     /// This is separate from the fixed live/stale newest-flash health gate.
     #[serde(default = "default_glm_show_last_minutes")]
     pub glm_show_last_minutes: u16,
+    /// Satellite native-resolution window: when enabled, true-color
+    /// composite ingests fetch/decode only the data covering a picked
+    /// center+size box and compose at full instrument resolution (0.5 km)
+    /// instead of the default 4× sector decimation — a crisp, loopable
+    /// typhoon-eye view. Center is stored in microdegrees so `AppSettings`
+    /// stays `Eq`-derivable (FarmGeorefEntry convention).
+    #[serde(default)]
+    pub sat_native_window_enabled: bool,
+    #[serde(default = "default_sat_native_window_lat_e6")]
+    pub sat_native_window_lat_e6: i64,
+    #[serde(default = "default_sat_native_window_lon_e6")]
+    pub sat_native_window_lon_e6: i64,
+    /// Window edge length in km (square window).
+    #[serde(default = "default_sat_native_window_size_km")]
+    pub sat_native_window_size_km: u16,
     /// RAOB launch-site markers (the observed-soundings obs layer) —
     /// default off; clicking a marker fetches that station's sounding at
     /// the displayed radar time.
@@ -623,6 +638,21 @@ fn default_glm_show_last_minutes() -> u16 {
     5
 }
 
+/// Satellite native-window defaults: Guam (13.5N 144.8E), the west-Pacific
+/// tropics the Himawari composite default already targets, with an 800 km
+/// box — a whole typhoon core at 0.5 km is 1600×1600 px.
+fn default_sat_native_window_lat_e6() -> i64 {
+    13_500_000
+}
+
+fn default_sat_native_window_lon_e6() -> i64 {
+    144_800_000
+}
+
+fn default_sat_native_window_size_km() -> u16 {
+    800
+}
+
 /// A persisted FARM drape georeference. Coordinates are stored as scaled
 /// integers (microdegrees etc.) so `AppSettings` stays `Eq`-derivable.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -718,6 +748,10 @@ impl Default for AppSettings {
             overlay_obs_mesonet: true,
             overlay_glm: false,
             glm_show_last_minutes: default_glm_show_last_minutes(),
+            sat_native_window_enabled: false,
+            sat_native_window_lat_e6: default_sat_native_window_lat_e6(),
+            sat_native_window_lon_e6: default_sat_native_window_lon_e6(),
+            sat_native_window_size_km: default_sat_native_window_size_km(),
             overlay_raob: false,
             show_tropical: true,
             show_tropical_panel: true,
@@ -1430,6 +1464,30 @@ mod tests {
         let back = AppSettings::from_json(&s.to_json());
         assert_eq!(back, s);
         assert_eq!(back.favorites, vec!["KTWX".to_owned()]);
+    }
+
+    #[test]
+    fn sat_native_window_defaults_and_round_trips() {
+        // Old configs (no keys) get the disabled Guam/800 km default.
+        let defaults = AppSettings::from_json("{}");
+        assert!(!defaults.sat_native_window_enabled);
+        assert_eq!(defaults.sat_native_window_lat_e6, 13_500_000);
+        assert_eq!(defaults.sat_native_window_lon_e6, 144_800_000);
+        assert_eq!(defaults.sat_native_window_size_km, 800);
+
+        let settings = AppSettings {
+            sat_native_window_enabled: true,
+            sat_native_window_lat_e6: -8_250_000,
+            sat_native_window_lon_e6: -100_240_000,
+            sat_native_window_size_km: 500,
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&settings.to_json());
+        assert_eq!(back, settings);
+        assert!(back.sat_native_window_enabled);
+        assert_eq!(back.sat_native_window_lat_e6, -8_250_000);
+        assert_eq!(back.sat_native_window_lon_e6, -100_240_000);
+        assert_eq!(back.sat_native_window_size_km, 500);
     }
 
     #[test]

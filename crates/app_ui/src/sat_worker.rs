@@ -24,12 +24,16 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Timelike, Utc};
 use eframe::egui::{Color32, ColorImage};
 use rustwx_core::{GridShape, LatLonGrid};
-use rw_sat::abi::{AbiFixedGrid, GoesAbiField, GoesAbiScene, read_goes_abi_field};
+use rw_sat::abi::{
+    AbiFixedGrid, AbiSector, GoesAbiField, GoesAbiScene, read_goes_abi_field,
+    read_goes_abi_field_window, read_goes_abi_scene,
+};
 use rw_sat::composite::{
     GoesAbiRgbCompositeStyle, bilinear_f32, bracket_axis, compose_rgb_pixels, values_on_base_grid,
 };
 use rw_sat::events::{SatError, SatEvent};
 use rw_sat::follow::FollowConfig;
+use rw_sat::geostationary::{SweepAngleAxis, lat_lon_to_scan_angles_fast};
 use rw_sat::goes::{GoesSatellite, parse_goes_abi_filename};
 use rw_sat::himawari::{
     HIMAWARI_DOWNLOAD_MANIFEST_SCHEMA, HimawariCalibrationInfo, HimawariDownloadManifest,
@@ -56,6 +60,12 @@ use rw_store::writer::HourWriter;
 use rw_ui::{
     SatDiskUsage, SatFollowSpec, SatFrameImage, SatLayerOption, SatRunKey, SatRunListing,
     SatSatelliteOption, SatSectorOption, StoreView, format_bytes,
+};
+
+use crate::sat_window::{
+    AHI_NOMINAL_HEIGHT_M, AHI_NOMINAL_SEMI_MAJOR_M, AHI_NOMINAL_SEMI_MINOR_M,
+    AHI_NOMINAL_SUB_LON_DEG, SatNativeWindow, ScanAngleRect, ahi_fldk_segment_range,
+    ahi_lat_lon_to_scan_angles, ahi_window_crop, axis_crop_range, window_scan_angle_rect,
 };
 
 /// Requests from the UI thread.
@@ -132,6 +142,17 @@ impl HimawariCompositeStyle {
         }
     }
 
+    /// Band whose grid a NATIVE-WINDOW composite is rendered on: the finest
+    /// required band (B03, 0.5 km), so the windowed crop keeps full
+    /// instrument resolution — the point of the window. The full-sector
+    /// path stays on the 1 km base (a 0.5 km full-sector base is 4× the
+    /// pixels for no visible gain at sector zoom).
+    pub fn native_base_band(self) -> u8 {
+        match self {
+            Self::TrueColor => 3,
+        }
+    }
+
     /// `(red_band, green_band, blue_band)` display assignment.
     pub fn rgb_bands(self) -> (u8, u8, u8) {
         match self {
@@ -160,6 +181,15 @@ pub struct HimawariCompositeSpec {
     pub lookback_minutes: i64,
     /// Per-band decimation stride applied on ingest.
     pub downsample: usize,
+    /// Native-resolution spatial window. When set, the ingest derives the
+    /// segment range from the window (ignoring `segment_start` /
+    /// `segment_count`), decodes at stride 1 regardless of `downsample`,
+    /// crops every band to the window, and composes on the 0.5 km B03 grid
+    /// (see [`HimawariCompositeStyle::native_base_band`]).
+    pub window: Option<SatNativeWindow>,
+    /// Pick the newest complete scan at/before this time instead of "now" —
+    /// lets proofs/backfills pin an exact scan (e.g. the last daylight pass).
+    pub as_of: Option<DateTime<Utc>>,
 }
 
 impl Default for HimawariCompositeSpec {
@@ -173,6 +203,8 @@ impl Default for HimawariCompositeSpec {
             segment_count: 2,
             lookback_minutes: 180,
             downsample: 4,
+            window: None,
+            as_of: None,
         }
     }
 }
@@ -194,6 +226,13 @@ pub struct GoesCompositeSpec {
     pub downsample: usize,
     /// How far back to scan hour prefixes for the latest all-band scan.
     pub lookback_minutes: i64,
+    /// Native-resolution spatial window. When set the ingest decodes ONLY
+    /// the NetCDF hyperslab covering the window at stride 1 (ignoring
+    /// `downsample`): CMI files are whole-sector, so the download is
+    /// unchanged, but decode/compose/store stay window-sized.
+    pub window: Option<SatNativeWindow>,
+    /// Pick the newest all-band scan at/before this time instead of "now".
+    pub as_of: Option<DateTime<Utc>>,
 }
 
 impl Default for GoesCompositeSpec {
@@ -204,6 +243,8 @@ impl Default for GoesCompositeSpec {
             style: "natural_color".to_string(),
             downsample: 4,
             lookback_minutes: 180,
+            window: None,
+            as_of: None,
         }
     }
 }
@@ -1082,7 +1123,7 @@ fn download_label(key: &str) -> String {
 /// Same ellipsoid-intersection quadratic as the GOES PUG, with the view
 /// vector assembled in sweep=y order (PROJ `geos` inverse, sweep=y branch):
 /// `Vy = tan(x)`, `Vz = tan(y) * hypot(1, Vy)`.
-fn ahi_scan_angles_to_lat_lon(
+pub(crate) fn ahi_scan_angles_to_lat_lon(
     projection: &SatelliteProjection,
     x_rad: f64,
     y_rad: f64,
@@ -1553,12 +1594,13 @@ fn latest_himawari_visible_scan(
     seg_start: u8,
     seg_count: u8,
     lookback_minutes: i64,
+    as_of: DateTime<Utc>,
 ) -> Result<HimawariScanPick, String> {
     let agent = build_agent();
     let product = HimawariProduct::AhiL1bFldk;
     let cadence = product.cadence_minutes();
     let lookback = lookback_minutes.max(cadence);
-    let mut scan_time = round_down_ahi_scan_time(Utc::now(), cadence);
+    let mut scan_time = round_down_ahi_scan_time(as_of, cadence);
     let stop = scan_time - chrono::Duration::minutes(lookback);
     let wanted: Vec<u8> = (seg_start..seg_start.saturating_add(seg_count)).collect();
 
@@ -1718,14 +1760,11 @@ fn ahi_true_counts_on_grid(paths: &[PathBuf], downsample: usize) -> Result<Vec<f
     Ok(out)
 }
 
-/// Download one band's staged segments and assemble them into a raw-count
-/// [`SatelliteGridField`], returning the band's HSD calibration alongside. The
-/// grid/scene (geolocation) comes from rw-sat's `assemble_hsd_segments`; the
-/// values are replaced with the *true* raw counts from [`ahi_true_counts_on_grid`]
-/// (see [`decode_ahi_raw_counts`] for why rw-sat's own counts are unusable).
-/// Reflectance is derived downstream via [`ahi_counts_to_reflectance`].
+/// Download and stage (bunzip) one band's HSD segments, returning the
+/// staged raw paths. The download/manifest/staging half of the band fetch,
+/// shared by the full-sector assemble and the native-window assemble.
 #[allow(clippy::too_many_arguments)]
-fn fetch_himawari_band_counts(
+fn stage_himawari_band_segments(
     satellite: HimawariSatellite,
     scan_time: DateTime<Utc>,
     prefix: &str,
@@ -1733,9 +1772,8 @@ fn fetch_himawari_band_counts(
     objects: &[S3Object],
     cache_root: &Path,
     source_root: &Path,
-    downsample: usize,
     send: &impl Fn(SatResponse) -> bool,
-) -> Result<(SatelliteGridField, HimawariCalibrationInfo), String> {
+) -> Result<Vec<PathBuf>, String> {
     let agent = build_agent();
     let manifest_dir = source_root.join("manifest");
     let raw_dir = source_root.join("raw");
@@ -1811,11 +1849,49 @@ fn fetch_himawari_band_counts(
 
     let staged =
         stage_download_manifest(&manifest_path, &raw_dir).map_err(|err| err.to_string())?;
-    let paths = staged
+    Ok(staged
         .segments
         .iter()
         .map(|segment| PathBuf::from(&segment.raw_path))
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>())
+}
+
+/// Download one band's staged segments and assemble them into a raw-count
+/// [`SatelliteGridField`], returning the band's HSD calibration alongside. The
+/// grid/scene (geolocation) comes from rw-sat's `assemble_hsd_segments`; the
+/// values are replaced with the *true* raw counts from [`ahi_true_counts_on_grid`]
+/// (see [`decode_ahi_raw_counts`] for why rw-sat's own counts are unusable).
+/// Reflectance is derived downstream via [`ahi_counts_to_reflectance`].
+///
+/// With a `window`, the whole full-segment assemble is skipped for
+/// [`assemble_ahi_window_counts`]: only the window's pixels are decoded, at
+/// native resolution (`downsample` is not applied to windowed fetches).
+#[allow(clippy::too_many_arguments)]
+fn fetch_himawari_band_counts(
+    satellite: HimawariSatellite,
+    scan_time: DateTime<Utc>,
+    prefix: &str,
+    band: u8,
+    objects: &[S3Object],
+    cache_root: &Path,
+    source_root: &Path,
+    downsample: usize,
+    window: Option<SatNativeWindow>,
+    send: &impl Fn(SatResponse) -> bool,
+) -> Result<(SatelliteGridField, HimawariCalibrationInfo), String> {
+    let paths = stage_himawari_band_segments(
+        satellite,
+        scan_time,
+        prefix,
+        band,
+        objects,
+        cache_root,
+        source_root,
+        send,
+    )?;
+    if let Some(window) = window {
+        return assemble_ahi_window_counts(&paths, window);
+    }
     // rw-sat's assemble gives us the correct grid/scene (geolocation), but its
     // Count values are right-shifted (see decode_ahi_raw_counts); replace them
     // with the true raw counts read on the same downsampled grid.
@@ -1835,6 +1911,297 @@ fn fetch_himawari_band_counts(
         .calibration
         .ok_or_else(|| format!("AHI B{band:02} HSD header carries no calibration block #5"))?;
     Ok((field, calibration))
+}
+
+/// Pixel padding applied to every native-window crop: keeps the bilinear
+/// cross-band resample fed right up to the window edge and absorbs
+/// sub-pixel rect-vs-axis rounding.
+const WINDOW_CROP_PAD_PX: usize = 2;
+
+/// HSD Modified Julian Day → UTC (epoch 1858-11-17T00:00Z). Local mirror of
+/// rw-sat's private `mjd_to_datetime`, needed because the windowed assemble
+/// builds its scene straight from HSD headers.
+fn ahi_mjd_to_datetime(mjd: f64) -> Result<DateTime<Utc>, String> {
+    if !mjd.is_finite() {
+        return Err(format!("invalid HSD MJD {mjd}"));
+    }
+    let millis = (mjd * 86_400_000.0).round();
+    if millis < i64::MIN as f64 || millis > i64::MAX as f64 {
+        return Err(format!("HSD MJD {mjd} out of range"));
+    }
+    let epoch = chrono::NaiveDate::from_ymd_opt(1858, 11, 17)
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .ok_or("failed to construct the MJD epoch")?;
+    let naive = epoch
+        .checked_add_signed(chrono::Duration::milliseconds(millis as i64))
+        .ok_or_else(|| format!("HSD MJD {mjd} out of range"))?;
+    Ok(DateTime::from_naive_utc_and_offset(naive, Utc))
+}
+
+/// HSD satellite name → store model slug ("Himawari-9" → "h9"), matching
+/// rw-sat's private `himawari_model_slug` so windowed runs land in the same
+/// model dir as full-sector runs.
+fn ahi_model_slug(name: &str) -> String {
+    match name.trim() {
+        "Himawari-8" => "h8".to_string(),
+        "Himawari-9" => "h9".to_string(),
+        value => value.to_ascii_lowercase().replace([' ', '-'], ""),
+    }
+}
+
+/// The window's scan-angle rect under the CF sweep=y AHI navigation.
+fn ahi_window_rect(
+    height_m: f64,
+    semi_major_m: f64,
+    semi_minor_m: f64,
+    sub_lon_deg: f64,
+    window: SatNativeWindow,
+) -> Option<ScanAngleRect> {
+    window_scan_angle_rect(window, |lat, lon| {
+        ahi_lat_lon_to_scan_angles(height_m, semi_major_m, semi_minor_m, sub_lon_deg, lat, lon)
+    })
+}
+
+/// Which contiguous full-disk segments a window needs, from the NOMINAL
+/// Himawari geometry (this runs before any file exists locally; the pixel
+/// crop afterwards uses the downloaded header's own projection block).
+fn himawari_window_segments(window: SatNativeWindow) -> Result<(u8, u8), String> {
+    let rect = ahi_window_rect(
+        AHI_NOMINAL_HEIGHT_M,
+        AHI_NOMINAL_SEMI_MAJOR_M,
+        AHI_NOMINAL_SEMI_MINOR_M,
+        AHI_NOMINAL_SUB_LON_DEG,
+        window,
+    )
+    .ok_or_else(|| {
+        format!(
+            "window {} is outside Himawari's view of the earth",
+            window.run_slug()
+        )
+    })?;
+    Ok(ahi_fldk_segment_range(&rect))
+}
+
+/// Assemble ONLY the window's pixels from a band's staged HSD segments, at
+/// native resolution: parse each header, decode the cropped row/column
+/// block of TRUE raw counts (the same right-justified 16-bit read as
+/// [`decode_ahi_raw_counts`] — see there for why rw-sat's shifted counts
+/// are unusable), and build the scene with cropped scan-angle axes from the
+/// header's own projection block #3. A full segment is only ever held as
+/// raw bytes; the f32 arrays stay window-sized, which is what makes
+/// downsample-1 (B03: 22000-pixel rows) tractable on the follow thread.
+///
+/// The scene's `sector` carries the window token
+/// (`fulldisk_<win…>`), so windowed frames open their own run-dir family
+/// and successive scans of the same window loop in the player.
+fn assemble_ahi_window_counts(
+    paths: &[PathBuf],
+    window: SatNativeWindow,
+) -> Result<(SatelliteGridField, HimawariCalibrationInfo), String> {
+    if paths.is_empty() {
+        return Err("no staged AHI segments to window".to_string());
+    }
+    let mut headers = Vec::with_capacity(paths.len());
+    for path in paths {
+        let header = inspect_hsd_file(path).map_err(|err| err.to_string())?;
+        headers.push((path.clone(), header));
+    }
+    headers.sort_by_key(|(_, header)| {
+        header
+            .segment
+            .as_ref()
+            .map(|segment| segment.sequence_number)
+            .unwrap_or(0)
+    });
+
+    let first = &headers[0].1;
+    let projection = first
+        .projection
+        .as_ref()
+        .ok_or("AHI HSD header is missing projection block #3")?;
+    let calibration = first
+        .calibration
+        .clone()
+        .ok_or("AHI HSD header is missing calibration block #5")?;
+    let first_segment = first
+        .segment
+        .as_ref()
+        .ok_or("AHI HSD header is missing segment block #7")?;
+    let band = u8::try_from(calibration.band_number)
+        .map_err(|_| format!("unsupported AHI band {}", calibration.band_number))?;
+    let columns = usize::from(first.data.columns);
+    let first_line = u32::from(first_segment.first_line_number);
+
+    // Contiguity + shape checks across the fetched segments (mirrors
+    // rw-sat's assemble validation).
+    let mut expected_first_line = first_line;
+    let mut total_lines = 0usize;
+    for (_, header) in &headers {
+        if usize::from(header.data.columns) != columns {
+            return Err("inconsistent AHI segment width".to_string());
+        }
+        let info = header
+            .segment
+            .as_ref()
+            .ok_or("AHI HSD header is missing segment block #7")?;
+        if u32::from(info.first_line_number) != expected_first_line {
+            return Err(format!(
+                "AHI segments are not contiguous: expected first line {expected_first_line}, \
+                 got {} in S{:02}",
+                info.first_line_number, info.sequence_number
+            ));
+        }
+        expected_first_line += u32::from(header.data.lines);
+        total_lines += usize::from(header.data.lines);
+    }
+
+    let rect = ahi_window_rect(
+        (projection.satellite_distance_km - projection.equatorial_radius_km) * 1000.0,
+        projection.equatorial_radius_km * 1000.0,
+        projection.polar_radius_km * 1000.0,
+        projection.sub_lon_degrees,
+        window,
+    )
+    .ok_or_else(|| {
+        format!(
+            "window {} is outside Himawari's view of the earth",
+            window.run_slug()
+        )
+    })?;
+    let crop = ahi_window_crop(
+        f64::from(projection.cfac),
+        f64::from(projection.coff),
+        f64::from(projection.lfac),
+        f64::from(projection.loff),
+        columns,
+        first_line,
+        total_lines,
+        &rect,
+        WINDOW_CROP_PAD_PX,
+    )?;
+
+    // Decode the cropped block, segment by segment, north to south.
+    let crop_last_line = crop.line_start + crop.line_count as u32 - 1;
+    let mut values = Vec::with_capacity(crop.line_count.saturating_mul(crop.col_count));
+    for (path, header) in &headers {
+        let seg_first = u32::from(
+            header
+                .segment
+                .as_ref()
+                .expect("validated above")
+                .first_line_number,
+        );
+        let seg_last = seg_first + u32::from(header.data.lines) - 1;
+        let overlap_first = crop.line_start.max(seg_first);
+        let overlap_last = crop_last_line.min(seg_last);
+        if overlap_first > overlap_last {
+            continue;
+        }
+        let sentinels = header
+            .calibration
+            .as_ref()
+            .map(|cal| (cal.error_pixel_count, cal.outside_scan_count))
+            .unwrap_or((
+                calibration.error_pixel_count,
+                calibration.outside_scan_count,
+            ));
+        let bytes = std::fs::read(path).map_err(|err| err.to_string())?;
+        let data_start = header.total_header_length as usize;
+        let seg_lines = usize::from(header.data.lines);
+        if bytes.len() < data_start + seg_lines * columns * 2 {
+            return Err(format!(
+                "AHI HSD data block short in {}: need {} bytes, have {}",
+                path.display(),
+                data_start + seg_lines * columns * 2,
+                bytes.len()
+            ));
+        }
+        let little = matches!(
+            header.byte_order,
+            rw_sat::himawari::HimawariByteOrder::Little
+        );
+        for line in overlap_first..=overlap_last {
+            let row = (line - seg_first) as usize;
+            let row_start = data_start + row * columns * 2;
+            for col in crop.col_start..crop.col_start + crop.col_count {
+                let o = row_start + col * 2;
+                let raw = if little {
+                    u16::from_le_bytes([bytes[o], bytes[o + 1]])
+                } else {
+                    u16::from_be_bytes([bytes[o], bytes[o + 1]])
+                };
+                values.push(if raw == sentinels.0 || raw == sentinels.1 {
+                    f32::NAN
+                } else {
+                    f32::from(raw)
+                });
+            }
+        }
+    }
+    if values.len() != crop.line_count * crop.col_count {
+        return Err(format!(
+            "AHI window decode produced {} values for a {}x{} crop",
+            values.len(),
+            crop.col_count,
+            crop.line_count
+        ));
+    }
+
+    let last = &headers[headers.len() - 1].1;
+    let start_time_utc = ahi_mjd_to_datetime(first.observation_start_mjd)?;
+    let end_time_utc = ahi_mjd_to_datetime(last.observation_end_mjd)?;
+    let scene = SatelliteGridScene {
+        model: ahi_model_slug(&first.satellite_name),
+        satellite: first.satellite_name.clone(),
+        provider: "jma".to_string(),
+        instrument: "ahi".to_string(),
+        product: format!("AHI-L1b-{}", first.observation_area),
+        sector: format!("fulldisk_{}", window.run_slug()),
+        band,
+        layer: format!("count_c{band:02}"),
+        source_variable: "HSD count".to_string(),
+        start_time_utc,
+        end_time_utc,
+        projection: SatelliteProjection {
+            perspective_point_height_m: (projection.satellite_distance_km
+                - projection.equatorial_radius_km)
+                * 1000.0,
+            semi_major_axis_m: projection.equatorial_radius_km * 1000.0,
+            semi_minor_axis_m: projection.polar_radius_km * 1000.0,
+            longitude_of_projection_origin_deg: projection.sub_lon_degrees,
+            // Mirrors rw-sat's assembler stamp; every consumer of these
+            // scenes navigates through the local CF sweep=y path regardless
+            // (see write_himawari_grid_frame).
+            sweep_angle_axis: SweepAngleAxis::X,
+        },
+        fixed_grid: AbiFixedGrid {
+            nx: crop.col_count,
+            ny: crop.line_count,
+            x_scan_rad: crop.x_scan_rad,
+            y_scan_rad: crop.y_scan_rad,
+        },
+        metadata: serde_json::json!({
+            "source_format": "himawari_standard_data",
+            "value_mode": "count",
+            "downsample": 1,
+            "native_window": {
+                "center_lat_deg": window.center_lat_deg,
+                "center_lon_deg": window.center_lon_deg,
+                "size_km": window.size_km,
+                "col_start": crop.col_start,
+                "line_start": crop.line_start,
+            },
+        }),
+    };
+    Ok((
+        SatelliteGridField {
+            scene,
+            variable_name: format!("ahi_count_c{band:02}"),
+            units: "count".to_string(),
+            values,
+        },
+        calibration,
+    ))
 }
 
 /// Convert AHI raw counts to reflectance (albedo) using the HSD visible
@@ -2001,7 +2368,9 @@ fn himawari_composite_selector(
             "model": scene.model,
             "product": scene.product,
             "sector": scene.sector,
-            "band": style.base_band(),
+            // The base band's grid the planes live on: B01 (1 km) for full
+            // sectors, B03 (0.5 km) for native windows.
+            "band": scene.band,
             "layer": format!("rgb_{}", style.slug()),
             "source_variable": "HSD count",
             "composite": {
@@ -2198,10 +2567,26 @@ fn ingest_latest_himawari_composite(
     let style = HimawariCompositeStyle::parse(&spec.style)
         .ok_or_else(|| format!("unknown Himawari composite style '{}'", spec.style))?;
     let bands = style.required_bands();
-    let base_band = style.base_band();
-    let seg_start = spec.segment_start.clamp(1, 10);
-    let seg_count = spec.segment_count.clamp(1, 11 - seg_start);
-    let downsample = spec.downsample.max(1);
+    let window = spec.window.map(SatNativeWindow::clamped);
+    // A native window composes on the finest band's grid at stride 1 and
+    // fetches only the segments the window intersects; the full-sector path
+    // keeps the configured segment range and decimation.
+    let base_band = match window {
+        Some(_) => style.native_base_band(),
+        None => style.base_band(),
+    };
+    let downsample = if window.is_some() {
+        1
+    } else {
+        spec.downsample.max(1)
+    };
+    let (seg_start, seg_count) = match window {
+        Some(window) => himawari_window_segments(window)?,
+        None => {
+            let start = spec.segment_start.clamp(1, 10);
+            (start, spec.segment_count.clamp(1, 11 - start))
+        }
+    };
     let cache_root = store_root.join("cache");
     let source_root = store_root.join("sources").join("himawari");
 
@@ -2211,6 +2596,7 @@ fn ingest_latest_himawari_composite(
         seg_start,
         seg_count,
         spec.lookback_minutes.max(10),
+        spec.as_of.unwrap_or_else(Utc::now),
     )?;
 
     // Fetch + assemble each band as raw counts on its native grid, keeping the
@@ -2232,14 +2618,16 @@ fn ingest_latest_himawari_composite(
             &cache_root,
             &source_root,
             downsample,
+            window,
             send,
         )?;
         fields.insert(band, field);
         calibrations.insert(band, calibration);
     }
 
-    // Base grid = the base band's (1 km) grid; resample every band's
-    // reflectance onto it, then compose true color per pixel.
+    // Base grid = the base band's grid (1 km B01 for full sectors, 0.5 km
+    // B03 for native windows); resample every band's reflectance onto it,
+    // then compose true color per pixel.
     let base_scene = fields
         .get(&base_band)
         .ok_or_else(|| format!("composite base band B{base_band:02} was not fetched"))?
@@ -2321,6 +2709,7 @@ fn latest_common_scan(
     satellite: &GoesSatellite,
     bands: &[u8],
     hours: &[DateTime<Utc>],
+    not_after: Option<DateTime<Utc>>,
 ) -> Result<(DateTime<Utc>, HashMap<u8, S3Object>), String> {
     let agent = build_agent();
     let mut per_band: HashMap<u8, HashMap<DateTime<Utc>, S3Object>> = HashMap::new();
@@ -2339,6 +2728,7 @@ fn latest_common_scan(
                 };
                 if parsed.channel != Some(band)
                     || !abi_filename_product_matches_request(&parsed.product, abi_product)
+                    || not_after.is_some_and(|cutoff| parsed.start_time_utc > cutoff)
                 {
                     continue;
                 }
@@ -2369,6 +2759,63 @@ fn latest_common_scan(
     Err("no scan time yet has every band the composite needs".to_string())
 }
 
+/// Decode ONLY the pixels of a GOES CMI file covering `window`, at native
+/// resolution: scene axes → scan-angle rect (rw-sat's sweep=x forward
+/// navigation) → NetCDF hyperslab read. The whole-sector array is never
+/// materialized, so a 0.5 km C02 native window stays window-sized in
+/// memory. The cropped scene keeps its own scan-angle axes (its lat/lon
+/// mesh is exactly the matching slice of the full sector's), and the
+/// sector name carries the window token so windowed frames get their own
+/// run-dir family.
+fn read_goes_abi_window(path: &Path, window: SatNativeWindow) -> Result<GoesAbiField, String> {
+    let scene = read_goes_abi_scene(path).map_err(|err| err.to_string())?;
+    let projection = &scene.projection;
+    let rect = window_scan_angle_rect(window, |lat, lon| {
+        lat_lon_to_scan_angles_fast(
+            projection.perspective_point_height_m,
+            projection.semi_major_axis_m,
+            projection.semi_minor_axis_m,
+            projection.longitude_of_projection_origin_deg,
+            projection.sweep_angle_axis,
+            lat,
+            lon,
+        )
+    })
+    .ok_or_else(|| {
+        format!(
+            "window {} is outside this satellite's view of the earth",
+            window.run_slug()
+        )
+    })?;
+    let (x_start, x_count) = axis_crop_range(
+        &scene.fixed_grid.x_scan_rad,
+        rect.x_min,
+        rect.x_max,
+        WINDOW_CROP_PAD_PX,
+    )
+    .ok_or_else(|| format!("window {} misses this sector east-west", window.run_slug()))?;
+    let (y_start, y_count) = axis_crop_range(
+        &scene.fixed_grid.y_scan_rad,
+        rect.y_min,
+        rect.y_max,
+        WINDOW_CROP_PAD_PX,
+    )
+    .ok_or_else(|| {
+        format!(
+            "window {} misses this sector north-south",
+            window.run_slug()
+        )
+    })?;
+    let mut field = read_goes_abi_field_window(path, "CMI", x_start, x_count, y_start, y_count)
+        .map_err(|err| err.to_string())?;
+    field.scene.sector = AbiSector::Unknown(format!(
+        "{}_{}",
+        sector_slug(&field.scene.sector),
+        window.run_slug()
+    ));
+    Ok(field)
+}
+
 /// Download the ABI bands a composite needs (the latest scan that has all of
 /// them), co-register them onto the base channel's fixed grid, compose the
 /// RGB per pixel through rw-sat, and write one composite frame into the sat
@@ -2392,20 +2839,27 @@ fn ingest_latest_goes_composite(
     let abi_product = sector.abi_product();
     let bands = style.required_channels().to_vec();
     let base_channel = style.base_channel();
-    let downsample = spec.downsample.max(1);
+    let window = spec.window.map(SatNativeWindow::clamped);
+    // Native windows decode at stride 1 (the crop is what keeps them small).
+    let downsample = if window.is_some() {
+        1
+    } else {
+        spec.downsample.max(1)
+    };
     let cache_dir = store_root.join("cache");
 
     // Recent hour prefixes to scan for the newest all-band scan.
-    let now = Utc::now();
+    let now = spec.as_of.unwrap_or_else(Utc::now);
     let hour_span = (spec.lookback_minutes.max(20) / 60) + 2;
     let hours: Vec<DateTime<Utc>> = (0..hour_span)
         .map(|i| now - chrono::Duration::hours(i))
         .collect();
 
     let (scan_start, objects) =
-        latest_common_scan(&bucket, abi_product, &satellite, &bands, &hours)?;
+        latest_common_scan(&bucket, abi_product, &satellite, &bands, &hours, spec.as_of)?;
 
-    // Download + decode + decimate every required band.
+    // Download + decode every required band: the native window decodes only
+    // its hyperslab at stride 1, the full sector decodes whole then decimates.
     let agent = build_agent();
     let mut fields: HashMap<u8, GoesAbiField> = HashMap::with_capacity(bands.len());
     for &band in &bands {
@@ -2423,8 +2877,14 @@ fn ingest_latest_goes_composite(
             ms: started.elapsed().as_millis(),
             cache_hit: downloaded.cache_hit,
         });
-        let field = read_goes_abi_field(&downloaded.path, "CMI").map_err(|err| err.to_string())?;
-        fields.insert(band, downsample_field(field, downsample));
+        let field = match window {
+            Some(window) => read_goes_abi_window(&downloaded.path, window)?,
+            None => downsample_field(
+                read_goes_abi_field(&downloaded.path, "CMI").map_err(|err| err.to_string())?,
+                downsample,
+            ),
+        };
+        fields.insert(band, field);
     }
 
     // Base grid = the (decimated) base channel; resample every band onto it,
@@ -2493,7 +2953,8 @@ fn ingest_latest_goes_composite(
     Ok(format!(
         "GOES {} {} {}: scan {} · {} band(s) · {}x{} · {:.0}% lit · wrote {}/{}/t{:04}",
         satellite.as_str(),
-        sector.slug(),
+        // Carries the window token for native-window runs.
+        sector_slug(&base_scene.sector),
         style.title(),
         scan_start.format("%Y-%m-%d %H:%MZ"),
         bands.len(),
@@ -2770,8 +3231,12 @@ fn worker_loop(
                 }
             }
             SatRequest::IngestLatestGoesComposite(spec) => {
+                let scope = match &spec.window {
+                    Some(window) => format!(" · native window {}", window.run_slug()),
+                    None => String::new(),
+                };
                 send(SatResponse::Note(format!(
-                    "GOES composite: locating latest {} {} {}",
+                    "GOES composite: locating latest {} {} {}{scope}",
                     spec.satellite, spec.sector, spec.style
                 )));
                 match ingest_latest_goes_composite(&store_root, &spec, &send) {
@@ -2787,14 +3252,19 @@ fn worker_loop(
                 }
             }
             SatRequest::IngestLatestHimawariComposite(spec) => {
+                let scope = match &spec.window {
+                    Some(window) => format!("native window {}", window.run_slug()),
+                    None => format!(
+                        "S{:02}..S{:02}",
+                        spec.segment_start,
+                        spec.segment_start
+                            .saturating_add(spec.segment_count)
+                            .saturating_sub(1)
+                    ),
+                };
                 send(SatResponse::Note(format!(
-                    "Himawari composite: locating latest {} {} (S{:02}..S{:02})",
-                    spec.satellite,
-                    spec.style,
-                    spec.segment_start,
-                    spec.segment_start
-                        .saturating_add(spec.segment_count)
-                        .saturating_sub(1)
+                    "Himawari composite: locating latest {} {} ({scope})",
+                    spec.satellite, spec.style,
                 )));
                 match ingest_latest_himawari_composite(&store_root, &spec, &send) {
                     Ok(summary) => {
@@ -3527,6 +3997,8 @@ mod tests {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(6usize),
             lookback_minutes: 240,
+            window: None,
+            as_of: None,
         };
         let sink = |response: SatResponse| {
             if let SatResponse::Note(message) = &response {
@@ -3987,6 +4459,127 @@ mod tests {
         );
     }
 
+    // ---- Native-resolution window --------------------------------------------
+
+    /// The pre-download plan for a Guam-centered window: segments S04-S05
+    /// (the same tropical band the full-sector default fetches) and the
+    /// 0.5 km B03 base grid.
+    #[test]
+    fn himawari_window_plan_selects_segments_and_finest_base() {
+        let window = SatNativeWindow {
+            center_lat_deg: 13.5,
+            center_lon_deg: 144.8,
+            size_km: 800.0,
+        };
+        assert_eq!(himawari_window_segments(window), Ok((4, 2)));
+        assert_eq!(HimawariCompositeStyle::TrueColor.native_base_band(), 3);
+
+        // A window on the far side of the earth is rejected with the token
+        // in the message.
+        let far = SatNativeWindow {
+            center_lat_deg: 20.0,
+            center_lon_deg: -39.3,
+            size_km: 800.0,
+        };
+        let err = himawari_window_segments(far).unwrap_err();
+        assert!(err.contains(&far.run_slug()), "{err}");
+    }
+
+    /// Windowed composite frames open their own run-dir family: the sector
+    /// token carries the window, the store writes/loads round-trip, and the
+    /// player titles stay recognizable.
+    #[test]
+    fn windowed_composite_run_names_carry_the_window_token() {
+        let dir = test_dir("win-runs");
+        let window = SatNativeWindow {
+            center_lat_deg: 29.5,
+            center_lon_deg: -95.4,
+            size_km: 600.0,
+        };
+
+        // GOES: the windowed read renames the sector before the write.
+        let mut scene = synthetic_field(2, 2, 18, 51, 2).scene;
+        scene.sector = AbiSector::Unknown(format!(
+            "{}_{}",
+            sector_slug(&scene.sector),
+            window.run_slug()
+        ));
+        let planes = [10.0, 200.0, 30.0, f32::NAN];
+        let frame = write_goes_composite_frame(
+            &dir,
+            &scene,
+            GoesAbiRgbCompositeStyle::NaturalColor,
+            &planes,
+            &planes,
+            &planes,
+            1,
+        )
+        .expect("windowed GOES composite writes");
+        assert!(
+            frame
+                .run
+                .starts_with("conus_win295n954w600_rgb_natural_color_"),
+            "run: {}",
+            frame.run
+        );
+        let title = run_title("g19", &frame.run);
+        assert!(
+            title.contains("GeoColor") && title.contains("conus_win295n954w600"),
+            "title: {title}"
+        );
+
+        // Himawari: the windowed assemble stamps `fulldisk_<win…>`.
+        let guam = SatNativeWindow {
+            center_lat_deg: 13.5,
+            center_lon_deg: 144.8,
+            size_km: 800.0,
+        };
+        let mut ahi_scene = synthetic_ahi_field(2, 0, vec![0.0, 0.04]).scene;
+        ahi_scene.sector = format!("fulldisk_{}", guam.run_slug());
+        let frame = write_himawari_composite_frame(
+            &dir,
+            &ahi_scene,
+            HimawariCompositeStyle::TrueColor,
+            &planes,
+            &planes,
+            &planes,
+            1,
+        )
+        .expect("windowed AHI composite writes");
+        assert!(
+            frame
+                .run
+                .starts_with("fulldisk_win135n1448e800_rgb_true_color_"),
+            "run: {}",
+            frame.run
+        );
+
+        // Both load back through the exact player path.
+        let mut state = WorkerState::default();
+        let key = SatRunKey {
+            model: frame.model.clone(),
+            run: frame.run.clone(),
+        };
+        let loaded = load_frame(&mut state, &dir, &key, frame.hhmm).expect("windowed frame loads");
+        assert_eq!(loaded.image.size, [2, 2]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// HSD MJD conversion (the windowed assemble reads scan times straight
+    /// from headers): MJD 60000 is 2023-02-25T00:00Z, +0.5 day is noon.
+    #[test]
+    fn ahi_mjd_conversion_and_model_slug() {
+        let midnight = ahi_mjd_to_datetime(60_000.0).expect("valid MJD");
+        assert_eq!(midnight.to_rfc3339(), "2023-02-25T00:00:00+00:00");
+        let noon = ahi_mjd_to_datetime(60_000.5).expect("valid MJD");
+        assert_eq!(noon.to_rfc3339(), "2023-02-25T12:00:00+00:00");
+        assert!(ahi_mjd_to_datetime(f64::NAN).is_err());
+
+        assert_eq!(ahi_model_slug("Himawari-9"), "h9");
+        assert_eq!(ahi_model_slug("Himawari-8"), "h8");
+        assert_eq!(ahi_model_slug("GK-2A"), "gk2a");
+    }
+
     #[test]
     fn ahi_resample_is_identity_on_matching_grid() {
         let grid = AbiFixedGrid {
@@ -4028,6 +4621,8 @@ mod tests {
             segment_count: env_usize("BOWECHO_SAT_HIMAWARI_COMPOSITE_SEG_COUNT", 2) as u8,
             lookback_minutes: 240,
             downsample: env_usize("BOWECHO_SAT_HIMAWARI_COMPOSITE_DOWNSAMPLE", 6),
+            window: None,
+            as_of: None,
         };
         let sink = |response: SatResponse| {
             if let SatResponse::Note(message) = &response {
@@ -4083,6 +4678,223 @@ mod tests {
             frame.image.size[0],
             frame.image.size[1],
             PathBuf::from(&out).display()
+        );
+    }
+
+    // ---- Native-window live A/B proof ----------------------------------------
+
+    fn save_color_image_png(image: &ColorImage, path: &Path) {
+        let mut rgba = Vec::with_capacity(image.pixels.len() * 4);
+        for pixel in &image.pixels {
+            rgba.extend_from_slice(&[pixel.r(), pixel.g(), pixel.b(), pixel.a()]);
+        }
+        let out = image::RgbaImage::from_raw(image.size[0] as u32, image.size[1] as u32, rgba)
+            .expect("proof image dimensions match");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("proof png parent dir");
+        }
+        out.save(path).expect("proof png writes");
+        eprintln!(
+            "WINDOW PROOF wrote {}x{} -> {}",
+            image.size[0],
+            image.size[1],
+            path.display()
+        );
+    }
+
+    /// LIVE A/B proof of the native-resolution window: over ONE pinned scan,
+    /// ingest (a) today's default path (downsample 4) and (b) the native
+    /// window, then export three PNGs — `<prefix>_default_ds4.png` (the
+    /// whole default frame), `<prefix>_default_ds4_zoom.png` (the window cut
+    /// out of the ds4 frame and nearest-neighbor upscaled to the native
+    /// frame's scale: exactly what today's app shows zoomed into a typhoon
+    /// eye) and `<prefix>_native_window.png`. Gated behind
+    /// `BOWECHO_SAT_WINDOW_PROOF_DIR` so CI stays offline.
+    ///
+    /// Env: BOWECHO_SAT_WINDOW_PROOF_DIR (out dir; store lands under
+    /// `<dir>/store`), BOWECHO_SAT_WINDOW_SOURCE (`himawari` default |
+    /// `goes`), BOWECHO_SAT_WINDOW_LAT/LON/KM (default 13.5 / 144.8 / 800),
+    /// BOWECHO_SAT_WINDOW_AS_OF (RFC3339 scan pin; default now — pick a
+    /// DAYLIGHT pass, true color is dark at night),
+    /// BOWECHO_SAT_WINDOW_PREFIX (default the source),
+    /// BOWECHO_SAT_WINDOW_GOES_SAT/SECTOR (goes19 / conus).
+    #[test]
+    fn export_sat_native_window_proof_when_env_is_set() {
+        let Some(dir) = std::env::var_os("BOWECHO_SAT_WINDOW_PROOF_DIR").map(PathBuf::from) else {
+            return;
+        };
+        let env_f64 = |key: &str, default: f64| {
+            std::env::var(key)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+        let source =
+            std::env::var("BOWECHO_SAT_WINDOW_SOURCE").unwrap_or_else(|_| "himawari".to_string());
+        let prefix = std::env::var("BOWECHO_SAT_WINDOW_PREFIX").unwrap_or_else(|_| source.clone());
+        let window = SatNativeWindow {
+            center_lat_deg: env_f64("BOWECHO_SAT_WINDOW_LAT", 13.5),
+            center_lon_deg: env_f64("BOWECHO_SAT_WINDOW_LON", 144.8),
+            size_km: env_f64("BOWECHO_SAT_WINDOW_KM", 800.0),
+        }
+        .clamped();
+        let as_of = std::env::var("BOWECHO_SAT_WINDOW_AS_OF").ok().map(|raw| {
+            DateTime::parse_from_rfc3339(&raw)
+                .expect("BOWECHO_SAT_WINDOW_AS_OF must be RFC3339")
+                .with_timezone(&Utc)
+        });
+        let store = dir.join("store");
+        std::fs::create_dir_all(&store).expect("proof store dir");
+        let sink = |response: SatResponse| {
+            if let SatResponse::Note(message) = &response {
+                eprintln!("WINDOW PROOF note: {message}");
+            }
+            true
+        };
+
+        let slug = window.run_slug();
+        // The store dir may hold runs from earlier proof invocations of the
+        // OTHER source; every lookup below filters by this model.
+        let expected_model = if source == "goes" {
+            let base = GoesCompositeSpec {
+                satellite: std::env::var("BOWECHO_SAT_WINDOW_GOES_SAT")
+                    .unwrap_or_else(|_| "goes19".to_string()),
+                sector: std::env::var("BOWECHO_SAT_WINDOW_GOES_SECTOR")
+                    .unwrap_or_else(|_| "conus".to_string()),
+                style: "natural_color".to_string(),
+                downsample: 4,
+                lookback_minutes: 360,
+                window: None,
+                as_of,
+            };
+            let summary =
+                ingest_latest_goes_composite(&store, &base, &sink).expect("default GOES ingest");
+            eprintln!("WINDOW PROOF default: {summary}");
+            let windowed = GoesCompositeSpec {
+                window: Some(window),
+                ..base.clone()
+            };
+            let summary = ingest_latest_goes_composite(&store, &windowed, &sink)
+                .expect("windowed GOES ingest");
+            eprintln!("WINDOW PROOF native: {summary}");
+            GoesSatellite::parse(&base.satellite)
+                .as_str()
+                .to_ascii_lowercase()
+        } else {
+            // The default fetch uses the SAME segment range the window
+            // needs, so the A/B pair covers the same ground with today's
+            // default processing vs the native window.
+            let (seg_start, seg_count) =
+                himawari_window_segments(window).expect("window visible from Himawari");
+            let base = HimawariCompositeSpec {
+                segment_start: seg_start,
+                segment_count: seg_count,
+                lookback_minutes: 360,
+                downsample: 4,
+                window: None,
+                as_of,
+                ..HimawariCompositeSpec::default()
+            };
+            let summary =
+                ingest_latest_himawari_composite(&store, &base, &sink).expect("default AHI ingest");
+            eprintln!("WINDOW PROOF default: {summary}");
+            let windowed = HimawariCompositeSpec {
+                window: Some(window),
+                ..base.clone()
+            };
+            let summary = ingest_latest_himawari_composite(&store, &windowed, &sink)
+                .expect("windowed AHI ingest");
+            eprintln!("WINDOW PROOF native: {summary}");
+            HimawariSatellite::parse(&base.satellite)
+                .expect("himawari satellite parses")
+                .slug()
+                .to_string()
+        };
+
+        // Locate the two freshly written composite runs (this source's
+        // model only; windowed runs carry the window token).
+        let runs = scan_runs(&store);
+        let windowed_run = runs
+            .iter()
+            .find(|run| run.key.model == expected_model && run.key.run.contains(&slug))
+            .expect("a windowed composite run was written");
+        let default_run = runs
+            .iter()
+            .find(|run| {
+                run.key.model == expected_model
+                    && run.key.run.contains("_rgb_")
+                    && !run.key.run.contains("_win")
+            })
+            .expect("a default composite run was written");
+
+        let mut state = WorkerState::default();
+        let native_hhmm = *windowed_run.frames.last().expect("windowed run has frames");
+        let native = load_frame_for_map(&mut state, &store, &windowed_run.key, native_hhmm)
+            .expect("native frame loads");
+        let default_hhmm = *default_run.frames.last().expect("default run has frames");
+        let whole = load_frame_for_map(&mut state, &store, &default_run.key, default_hhmm)
+            .expect("default frame loads");
+
+        save_color_image_png(
+            &native.image,
+            &dir.join(format!("{prefix}_native_window.png")),
+        );
+        save_color_image_png(&whole.image, &dir.join(format!("{prefix}_default_ds4.png")));
+
+        // Cut the same window out of the default frame (per-pixel grid
+        // lookup, honoring display row order) and nearest-neighbor upscale
+        // to the native frame's scale.
+        let (dlat, dlon) = window.half_extent_deg();
+        let (nx, ny) = (whole.image.size[0], whole.image.size[1]);
+        let (mut row_min, mut row_max, mut col_min, mut col_max) =
+            (usize::MAX, 0usize, usize::MAX, 0usize);
+        for grid_row in 0..ny {
+            let image_row = if whole.flip_rows {
+                ny - 1 - grid_row
+            } else {
+                grid_row
+            };
+            for col in 0..nx {
+                let idx = grid_row * nx + col;
+                let (lat, lon) = (
+                    f64::from(whole.grid.lat[idx]),
+                    f64::from(whole.grid.lon[idx]),
+                );
+                if !(lat.is_finite() && lon.is_finite()) {
+                    continue;
+                }
+                let dlon_here = (lon - window.center_lon_deg + 180.0).rem_euclid(360.0) - 180.0;
+                if (lat - window.center_lat_deg).abs() <= dlat && dlon_here.abs() <= dlon {
+                    row_min = row_min.min(image_row);
+                    row_max = row_max.max(image_row);
+                    col_min = col_min.min(col);
+                    col_max = col_max.max(col);
+                }
+            }
+        }
+        assert!(
+            row_min <= row_max && col_min <= col_max,
+            "the default frame covers the window"
+        );
+        let crop_w = col_max - col_min + 1;
+        let crop_h = row_max - row_min + 1;
+        let scale = ((native.image.size[0] as f64) / (crop_w as f64))
+            .round()
+            .clamp(1.0, 16.0) as usize;
+        let (out_w, out_h) = (crop_w * scale, crop_h * scale);
+        let mut pixels = Vec::with_capacity(out_w * out_h);
+        for out_row in 0..out_h {
+            let src_row = row_min + out_row / scale;
+            for out_col in 0..out_w {
+                let src_col = col_min + out_col / scale;
+                pixels.push(whole.image.pixels[src_row * nx + src_col]);
+            }
+        }
+        let zoom = ColorImage::new([out_w, out_h], pixels);
+        save_color_image_png(&zoom, &dir.join(format!("{prefix}_default_ds4_zoom.png")));
+        eprintln!(
+            "WINDOW PROOF summary: native {}x{} vs default crop {crop_w}x{crop_h} upscaled {scale}x",
+            native.image.size[0], native.image.size[1],
         );
     }
 }

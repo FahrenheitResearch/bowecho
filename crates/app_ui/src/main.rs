@@ -72,6 +72,7 @@ mod obs_soundings;
 mod overlays;
 mod placefiles;
 mod rhi;
+mod sat_window;
 mod sat_worker;
 mod sites_ui;
 mod spc_layers;
@@ -912,6 +913,8 @@ fn sweep_policy_rows_ui(
     changed
 }
 
+// rfd-gated (windows/macos) import path; dead on the Linux verify node.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 struct CustomGisSite {
     site_id: String,
@@ -1972,6 +1975,8 @@ fn sniff_local_radar_kind(path: &Path) -> LocalRadarKind {
     LocalRadarKind::NexradLevel2
 }
 
+// rfd-gated (windows/macos) import path; dead on the Linux verify node.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn local_file_set_label(paths: &[PathBuf]) -> String {
     let count = paths.len();
     let first = paths
@@ -2534,6 +2539,15 @@ struct ViewerApp {
     /// Selected GOES ABI RGB composite style slug for the one-shot
     /// true/natural-color ingest (`natural_color`, `geocolor`, ...).
     goes_composite_style: String,
+    /// Satellite native-resolution window (persisted as
+    /// `sat_native_window_*`): when enabled, the true-color composite
+    /// ingests fetch/decode only the data covering this center+size box and
+    /// compose at full instrument resolution (0.5 km) instead of the 4×
+    /// sector decimation — crisp, loopable typhoon-eye frames.
+    sat_window_enabled: bool,
+    sat_window_lat_deg: f64,
+    sat_window_lon_deg: f64,
+    sat_window_size_km: u16,
     /// In-app Guide window (reference docs, opened on demand — never forced).
     show_guide: bool,
     /// Session marker for the last workflow preset the user applied. It is
@@ -7329,6 +7343,13 @@ impl ViewerApp {
         // saved site selection has its provider context back.
         let restored_intl_provider = app_settings.intl_provider.clone();
         let restored_farm = farm_live::FarmState::with_saved(&app_settings.farm_georefs);
+        // Satellite native-window controls (microdegrees → degrees).
+        let restored_sat_window = (
+            app_settings.sat_native_window_enabled,
+            app_settings.sat_native_window_lat_e6 as f64 / 1e6,
+            app_settings.sat_native_window_lon_e6 as f64 / 1e6,
+            app_settings.sat_native_window_size_km,
+        );
         let restored_overlays = (
             app_settings.overlay_obs,
             app_settings.overlay_obs_metar,
@@ -7540,6 +7561,10 @@ impl ViewerApp {
             show_satellite: false,
             himawari_band: 13,
             goes_composite_style: "natural_color".to_string(),
+            sat_window_enabled: restored_sat_window.0,
+            sat_window_lat_deg: restored_sat_window.1,
+            sat_window_lon_deg: restored_sat_window.2,
+            sat_window_size_km: restored_sat_window.3,
             show_guide: false,
             current_workflow: None,
             previous_workflow_snapshot: None,
@@ -15807,6 +15832,8 @@ impl ViewerApp {
         )
     }
 
+    // rfd-gated (windows/macos) import path; dead on the Linux verify node.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     fn start_local_volume_file_selection(&mut self, mut paths: Vec<PathBuf>, ctx: &egui::Context) {
         if paths.is_empty() {
             return;
@@ -15846,6 +15873,8 @@ impl ViewerApp {
         }
     }
 
+    // rfd-gated (windows/macos) import path; dead on the Linux verify node.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     fn start_local_volume_set_load(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
         let label = local_file_set_label(&paths);
         self.prepare_local_volume_load(&label);
@@ -21087,6 +21116,8 @@ impl ViewerApp {
         DisplayTimeZone::from_settings(&self.app_settings)
     }
 
+    // rfd-gated (windows/macos) import path; dead on the Linux verify node.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     fn set_data_folder_override_in_memory(&mut self, dir: PathBuf) {
         self.app_settings.data_dir = dir.display().to_string();
         self.status = format!(
@@ -23504,10 +23535,8 @@ impl ViewerApp {
                         if self.switch_pane_product(slot, product.clone()) {
                             ctx.request_repaint();
                         }
-                    } else {
-                        if self.switch_primary_product(product.clone()) {
-                            ctx.request_repaint();
-                        }
+                    } else if self.switch_primary_product(product.clone()) {
+                        ctx.request_repaint();
                     }
                 }
             }
@@ -31059,6 +31088,29 @@ impl ViewerApp {
         self.sat = Some(worker);
     }
 
+    /// The persisted native-resolution window, when enabled — handed to the
+    /// true-color composite ingests so they fetch/compose just that box at
+    /// full instrument resolution.
+    fn sat_native_window(&self) -> Option<sat_window::SatNativeWindow> {
+        self.sat_window_enabled.then(|| {
+            sat_window::SatNativeWindow {
+                center_lat_deg: self.sat_window_lat_deg,
+                center_lon_deg: self.sat_window_lon_deg,
+                size_km: f64::from(self.sat_window_size_km),
+            }
+            .clamped()
+        })
+    }
+
+    /// Persist the native-window controls (AppSettings microdegree fields).
+    fn persist_sat_native_window(&mut self) {
+        self.app_settings.sat_native_window_enabled = self.sat_window_enabled;
+        self.app_settings.sat_native_window_lat_e6 = (self.sat_window_lat_deg * 1e6).round() as i64;
+        self.app_settings.sat_native_window_lon_e6 = (self.sat_window_lon_deg * 1e6).round() as i64;
+        self.app_settings.sat_native_window_size_km = self.sat_window_size_km;
+        let _ = self.app_settings.save();
+    }
+
     /// Satellite body (follow config + frame player), window and pane
     /// alike. Returned events feed `handle_satellite_events`.
     fn satellite_pane_body(
@@ -31110,6 +31162,7 @@ impl ViewerApp {
             .map(|(_, label)| *label)
             .unwrap_or("B13 Clean IR 10.4");
         let mut load_composite = false;
+        let mut sat_window_changed = false;
         let composite_options = sat_worker::goes_composite_style_options();
         let selected_composite_label = composite_options
             .iter()
@@ -31169,6 +31222,50 @@ impl ViewerApp {
                         load_composite = true;
                     }
                 });
+                ui.horizontal_wrapped(|ui| {
+                    sat_window_changed |= ui
+                        .checkbox(&mut self.sat_window_enabled, "Native window")
+                        .on_hover_text(
+                            "Compose the true-color loads above at NATIVE resolution (0.5 km) over just this box: only the segments/pixels covering it are fetched and decoded, so a typhoon eye stays crisp and the frames stay small enough to loop. Repeated loads of the same window stack into one loopable run.",
+                        )
+                        .changed();
+                    ui.label("lat");
+                    sat_window_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.sat_window_lat_deg)
+                                .speed(0.1)
+                                .range(-75.0..=75.0)
+                                .suffix("°"),
+                        )
+                        .changed();
+                    ui.label("lon");
+                    sat_window_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.sat_window_lon_deg)
+                                .speed(0.1)
+                                .range(-180.0..=180.0)
+                                .suffix("°"),
+                        )
+                        .changed();
+                    ui.label("size");
+                    sat_window_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.sat_window_size_km)
+                                .speed(10.0)
+                                .range(50.0..=2000.0)
+                                .suffix(" km"),
+                        )
+                        .changed();
+                    if ui
+                        .button("Use map center")
+                        .on_hover_text("Center the window on the current radar-map view center.")
+                        .clicked()
+                    {
+                        self.sat_window_lat_deg = f64::from(self.map_center_lat);
+                        self.sat_window_lon_deg = f64::from(self.map_center_lon);
+                        sat_window_changed = true;
+                    }
+                });
                 ui.weak(
                     "MTG/European satellite imagery is temporarily hidden until EUMETSAT access is reliable.",
                 );
@@ -31176,6 +31273,9 @@ impl ViewerApp {
                     "GOES follows live continuously. Himawari writes gridded full-disk frames into the same player/store.",
                 );
             });
+        if sat_window_changed {
+            self.persist_sat_native_window();
+        }
         if let Some(sat) = &self.sat
             && load_himawari
         {
@@ -31194,13 +31294,23 @@ impl ViewerApp {
         if let Some(sat) = &self.sat
             && load_himawari_composite
         {
+            let window = self.sat_native_window();
             self.sat_map_follow = true;
-            self.status = "Satellite: composing Himawari-9 AHI true color".to_owned();
+            self.status = match window {
+                Some(window) => format!(
+                    "Satellite: composing Himawari-9 AHI true color · native window {}",
+                    window.run_slug()
+                ),
+                None => "Satellite: composing Himawari-9 AHI true color".to_owned(),
+            };
             self.sat_panel.apply_note(
                 "Himawari composite: queued latest H9 AHI true-color (B01/B02/B03)".to_string(),
             );
             sat.send(sat_worker::SatRequest::IngestLatestHimawariComposite(
-                sat_worker::HimawariCompositeSpec::default(),
+                sat_worker::HimawariCompositeSpec {
+                    window,
+                    ..sat_worker::HimawariCompositeSpec::default()
+                },
             ));
         }
         if let Some(sat) = &self.sat
@@ -31218,6 +31328,7 @@ impl ViewerApp {
                 satellite: base.satellite,
                 sector: base.sector,
                 style,
+                window: self.sat_native_window(),
                 ..sat_worker::GoesCompositeSpec::default()
             };
             sat.send(sat_worker::SatRequest::IngestLatestGoesComposite(composite));
@@ -53039,12 +53150,16 @@ fn poll_url_name(url: &str) -> String {
         .to_owned()
 }
 
+// rfd-gated (windows/macos) import path; dead on the Linux verify node.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn parse_custom_radar_gis(text: &str) -> Vec<CustomGisSite> {
     text.lines()
         .filter_map(parse_custom_radar_gis_line)
         .collect()
 }
 
+// rfd-gated (windows/macos) import path; dead on the Linux verify node.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn parse_custom_radar_gis_line(raw_line: &str) -> Option<CustomGisSite> {
     let line = raw_line.trim().trim_start_matches('\u{feff}');
     if line.is_empty() || line.starts_with(';') || line.starts_with('#') || line.starts_with("//") {
@@ -53058,6 +53173,8 @@ fn parse_custom_radar_gis_line(raw_line: &str) -> Option<CustomGisSite> {
     }
 }
 
+// rfd-gated (windows/macos) import path; dead on the Linux verify node.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn custom_radar_gis_payload(line: &str) -> &str {
     if let Some((prefix, rest)) = line.split_once(':') {
         let prefix = prefix.trim();
@@ -53073,6 +53190,8 @@ fn custom_radar_gis_payload(line: &str) -> &str {
     line
 }
 
+// rfd-gated (windows/macos) import path; dead on the Linux verify node.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn parse_custom_radar_gis_csv_line(line: &str) -> Option<CustomGisSite> {
     let fields: Vec<&str> = line.split(',').map(str::trim).collect();
     if fields.len() < 4 {
@@ -53093,6 +53212,8 @@ fn parse_custom_radar_gis_csv_line(line: &str) -> Option<CustomGisSite> {
     custom_gis_site_from_parts(site_id, state, &name, lat, lon)
 }
 
+// rfd-gated (windows/macos) import path; dead on the Linux verify node.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn parse_custom_radar_gis_whitespace_line(line: &str) -> Option<CustomGisSite> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 4 {
@@ -53106,6 +53227,8 @@ fn parse_custom_radar_gis_whitespace_line(line: &str) -> Option<CustomGisSite> {
     custom_gis_site_from_parts(site_id, state, &name, lat, lon)
 }
 
+// rfd-gated (windows/macos) import path; dead on the Linux verify node.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn custom_gis_site_from_parts(
     site_id: &str,
     state: &str,
@@ -53137,6 +53260,8 @@ fn custom_gis_site_from_parts(
     })
 }
 
+// rfd-gated (windows/macos) import path; dead on the Linux verify node.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn custom_poll_links_from_gis(
     text: &str,
     base_poll_url: &str,
@@ -53162,6 +53287,8 @@ fn custom_poll_links_from_gis(
         .collect())
 }
 
+// rfd-gated (windows/macos) import path; dead on the Linux verify node.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 fn custom_poll_url_for_gis_site(base_url: &str, site_id: &str, total_sites: usize) -> String {
     let base_url = normalized_poll_url(base_url);
     let site_id = site_id.trim();
@@ -73376,6 +73503,10 @@ mod tests {
             show_satellite: false,
             himawari_band: 13,
             goes_composite_style: "natural_color".to_string(),
+            sat_window_enabled: false,
+            sat_window_lat_deg: 13.5,
+            sat_window_lon_deg: 144.8,
+            sat_window_size_km: 800,
             show_guide: false,
             current_workflow: None,
             previous_workflow_snapshot: None,

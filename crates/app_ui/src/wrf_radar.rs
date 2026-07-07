@@ -917,13 +917,15 @@ mod tests {
     #[test]
     fn multi_file_sort_key_orders_by_parsed_wrf_time() {
         // Shuffled pick order (what rfd multi-select hands back) must sort by
-        // the model time embedded in the name, not the pick order.
+        // the model time embedded in the name, not the pick order. Paths are
+        // built with join so the directory strips on every OS (a literal
+        // `C:\run\...` is ONE component on Linux and broke the CI gate).
         let mut paths = [
-            PathBuf::from(r"C:\run\wrfout_d03_2025-06-21_02_15_00"),
-            PathBuf::from(r"C:\run\wrfout_d03_2025-06-21_01_30_00"),
-            PathBuf::from(r"C:\run\wrfout_d03_2025-06-21_02_30_00"),
-            PathBuf::from(r"C:\run\wrfout_d03_2025-06-21_02_00_00"),
-            PathBuf::from(r"C:\run\wrfout_d03_2025-06-21_01_45_00"),
+            PathBuf::from("run").join("wrfout_d03_2025-06-21_02_15_00"),
+            PathBuf::from("run").join("wrfout_d03_2025-06-21_01_30_00"),
+            PathBuf::from("run").join("wrfout_d03_2025-06-21_02_30_00"),
+            PathBuf::from("run").join("wrfout_d03_2025-06-21_02_00_00"),
+            PathBuf::from("run").join("wrfout_d03_2025-06-21_01_45_00"),
         ];
         paths.sort_by_cached_key(|path| wrf_time_sort_key(path));
         let names: Vec<String> = paths.iter().map(|path| display_name(path)).collect();

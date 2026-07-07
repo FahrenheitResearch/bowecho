@@ -18,6 +18,9 @@ use std::path::PathBuf;
 /// Both variants write into the same model store the dock browses, so a
 /// finished import is picked up by [`ModelDataDock::rescan`] and its runs then
 /// sound through the existing skew-T path.
+// Constructed only from the rfd file-dialog UI (cfg windows/macos); the
+// Linux verify node would otherwise flag every variant dead.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 enum ImportJob {
     /// Light path (`local_import`): 2D surface fields + isobaric sounding
     /// volumes. Handles raw `wrfout`, post-processed climate wrfout, and plain
@@ -382,6 +385,8 @@ pub struct ModelDataDock {
     synth_radar: SyntheticRadarUiState,
     /// A heavy full-diagnostics import awaiting explicit confirmation because
     /// the chosen folder looks LARGE (see [`heavy_import_size_warning`]).
+    // Read only by the rfd-gated (windows/macos) import UI.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     pending_heavy_import: Option<PendingHeavyImport>,
 }
 

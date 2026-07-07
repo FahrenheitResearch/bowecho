@@ -1838,6 +1838,8 @@ impl ViewerApp {
         let _ = self.app_settings.save();
     }
 
+    // rfd-gated (windows/macos) import path; dead on the Linux verify node.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     fn import_custom_poll_gis_text(&mut self, text: &str) {
         let base_url = self.poll_url.clone();
         let entries = match custom_poll_links_from_gis(text, &base_url) {
@@ -1859,6 +1861,8 @@ impl ViewerApp {
         self.status = format!("Custom GIS import: {added} added, {updated} updated");
     }
 
+    // rfd-gated (windows/macos) import path; dead on the Linux verify node.
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     fn upsert_custom_poll_link(&mut self, entry: settings::CustomPollLinkEntry) -> bool {
         let url = normalized_poll_url(&entry.poll_url);
         let site_id = entry.site_id.trim().to_owned();
