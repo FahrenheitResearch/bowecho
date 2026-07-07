@@ -195,7 +195,8 @@ During severe weather, follow your local NWS office and emergency management.
 - National open-data radar feeds: **SMHI** (Sweden), **FMI** (Finland),
   **DWD** (Germany), **DMI** (Denmark), **CHMI** (Czechia), **SHMÚ**
   (Slovakia), **GeoSphere Austria**, the **Estonian Environment Agency**,
-  **JMA** (Japan — radar and Himawari satellite), Italy's **Dipartimento
+  Romania's **ANM** (Data: Administrația Națională de Meteorologie (ANM)
+  România), **JMA** (Japan — radar and Himawari satellite), Italy's **Dipartimento
   della Protezione Civile** with the **ARPA Piemonte** and **ARPA
   Lombardia** regional services, Taiwan's **Central Weather
   Administration**, and Australia's **Bureau of Meteorology** (via NCI).

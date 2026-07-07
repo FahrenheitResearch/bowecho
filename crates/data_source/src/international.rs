@@ -52,6 +52,7 @@ mod geosphere;
 mod kaia;
 pub mod listing;
 mod lombardia;
+mod meteoromania;
 mod ord;
 mod piemonte;
 mod shmu;
@@ -65,6 +66,7 @@ pub use fmi::FmiProvider;
 pub use geosphere::GeoSphereProvider;
 pub use kaia::KaiaEstoniaProvider;
 pub use lombardia::LombardiaProvider;
+pub use meteoromania::MeteoRomaniaProvider;
 pub use ord::{OrdArchivePlan, OrdProvider, archive_plan_nearest, archive_plans_for_hour};
 pub use piemonte::PiemonteProvider;
 pub use shmu::ShmuProvider;
@@ -306,11 +308,12 @@ pub trait IntlProvider: Send + Sync {
 /// DMI Denmark, GeoSphere Austria, FMI Finland. Split-volume assembly
 /// feeds (one frame = several ODIM files merged with
 /// `radar_core::merge_radar_volumes`): SHMU Slovakia, DWD Germany (REF+VEL
-/// by default), CHMI Czechia. Multi-station tar feed (site-filtered decode, see
+/// by default), CHMI Czechia, ANM Romania (dual-pol per-moment PVOLs, see
+/// [`MeteoRomaniaProvider`]). Multi-station tar feed (site-filtered decode, see
 /// [`JmaProvider`]): JMA Japan. Single-site KAIA bridge for Estonia's Harku
 /// radar, which is not currently present in ORD's rolling cache:
 /// [`KaiaEstoniaProvider`]. Multi-country feed mixing single-file and split
-/// plan shapes per site: EUMETNET ORD ([`OrdProvider`], 14 European countries
+/// plan shapes per site: EUMETNET ORD ([`OrdProvider`], European countries
 /// without a national BowEcho provider).
 pub fn intl_providers() -> Vec<Box<dyn IntlProvider>> {
     vec![
@@ -326,6 +329,7 @@ pub fn intl_providers() -> Vec<Box<dyn IntlProvider>> {
         Box::new(LombardiaProvider::new()),
         Box::new(JmaProvider),
         Box::new(KaiaEstoniaProvider::new()),
+        Box::new(MeteoRomaniaProvider::new()),
         Box::new(OrdProvider::new()),
     ]
 }
@@ -449,6 +453,12 @@ pub fn intl_provider_capabilities() -> Vec<IntlProviderCapability> {
                     "historical repository likely deeper, not guaranteed",
                     "real in-app recent archive",
                     "probe longer retention",
+                ),
+                "meteoromania" => (
+                    "newest N frames of the rolling window",
+                    "rolling ~3 days; ORD holds the deeper Romania archive",
+                    "recent loop from the site listings, full dual-pol moments",
+                    "COMPOSITE/dBR/Height Cartesian products if a raster path lands",
                 ),
                 "ord" => (
                     "rolling 24h + per-site archive lookup",
@@ -1022,6 +1032,7 @@ mod tests {
                 "arpa-lombardia",
                 "jma",
                 "kaia",
+                "meteoromania",
                 "ord"
             ]
         );
@@ -1137,6 +1148,7 @@ mod tests {
                 "fmi",
                 "geosphere",
                 "kaia",
+                "meteoromania",
                 "ord",
                 "shmu",
                 "smhi",

@@ -50,9 +50,11 @@
 //!
 //! Countries already covered by BowEcho's national providers (SE/SMHI,
 //! DK/DMI, AT/GeoSphere, FI/FMI, SK/SHMU, DE/DWD, CZ/CHMI) are excluded:
-//! the national feeds stay preferred. The `OPERA/` composite prefix is a
-//! pseudo-station (gridded composites, not polar volumes) and is also
-//! excluded.
+//! the national feeds stay preferred. EE and RO remain enabled but defer
+//! their picker/marker rows to the richer national providers
+//! (KAIA Estonia, ANM Romania) via [`site_superseded_by_native_provider`].
+//! The `OPERA/` composite prefix is a pseudo-station (gridded composites,
+//! not polar volumes) and is also excluded.
 
 use std::collections::BTreeSet;
 
@@ -797,7 +799,19 @@ fn site_superseded_by_native_provider(code: &str) -> bool {
     // Estonia's KAIA feed exposes both Harku and Sürgavere with the richer
     // national product set. Keep explicit ORD loads possible, but avoid a
     // mixed KAIA/ORD Estonia catalog in the picker and map markers.
-    code == "eesur"
+    if code == "eesur" {
+        return true;
+    }
+    // Romania's seven radars: the native ANM provider (`meteoromania`)
+    // carries the same per-moment PVOLs ANM pushes to ORD *plus* the
+    // dual-pol moments ORD strips (ZDR/KDP/RhoHV), so it owns the RO
+    // picker/marker rows. RO stays in the live and archive country tables:
+    // explicit ORD loads still work, and the immutable ORD archive remains
+    // the deep-history path beyond ANM's ~3-day rolling window.
+    matches!(
+        code,
+        "robar" | "robob" | "robuc" | "rocra" | "romed" | "roora" | "rotim"
+    )
 }
 
 /// Picker/marker label: the static-table name when known (with the
@@ -1733,6 +1747,37 @@ mod tests {
             Some(("SE", "Sweden"))
         );
         assert!(country_for_live_code("seatv").is_none());
+    }
+
+    /// Romania follows the Estonia/KAIA precedent: the native ANM provider
+    /// (full dual-pol) owns the picker/marker rows, while RO stays in both
+    /// country tables so explicit ORD loads and the deep ORD archive keep
+    /// working.
+    #[test]
+    fn ord_romania_rows_defer_to_the_native_anm_provider() {
+        let visible = OrdProvider::new().static_sites();
+        for code in [
+            "robar", "robob", "robuc", "rocra", "romed", "roora", "rotim",
+        ] {
+            assert!(
+                site_superseded_by_native_provider(code),
+                "{code}: must defer to meteoromania"
+            );
+            assert!(
+                !visible.iter().any(|site| site.site_id == code),
+                "{code}: advertised by ANM Romania, not ORD"
+            );
+            assert_eq!(
+                country_for_live_code(code).map(|(_, dir, _)| dir),
+                Some("RO"),
+                "{code}: explicit ORD live loads stay possible"
+            );
+            assert_eq!(
+                country_for_archive_code(code).map(|(_, dir, _)| dir),
+                Some("RO"),
+                "{code}: ORD remains the deep-archive path"
+            );
+        }
     }
 
     #[test]

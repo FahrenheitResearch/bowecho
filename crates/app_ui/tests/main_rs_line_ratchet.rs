@@ -10,8 +10,9 @@
 //! - v0.30 extraction #4 (`product_select.rs`): 71,041 lines → ceiling 71,241.
 //! - v0.30 extraction #7 (`settings_ui.rs`): 69,186 lines (ceiling deferred).
 //! - v0.30 feature tc-card-sat: 69,187 lines → ceiling 69,387.
+//! - v0.30 extraction #5 (`sat_paint.rs`): 67,694 lines → ceiling 67,894.
 
-const CEILING: usize = 69_387;
+const CEILING: usize = 67_894;
 
 #[test]
 fn main_rs_stays_under_the_line_ratchet_ceiling() {

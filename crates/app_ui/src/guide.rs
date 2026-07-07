@@ -1409,7 +1409,8 @@ fn sources(ui: &mut egui::Ui) {
          ORD data is licensed CC BY 4.0 with attribution to OPERA and the originating \
          national services. Additional national open-data feeds: SMHI (Sweden), FMI \
          (Finland), DWD (Germany), DMI (Denmark), CHMI (Czechia), SHMU (Slovakia), \
-         GeoSphere Austria, the Estonian Environment Agency (KAIA), JMA/NICT (Japan), \
+         GeoSphere Austria, the Estonian Environment Agency (KAIA), Romania's ANM \
+         (Data: Administrația Națională de Meteorologie (ANM) România), JMA/NICT (Japan), \
          Italy's Protezione Civile with ARPA Piemonte and ARPA Lombardia, Taiwan CWA, \
          and Australia's Bureau of Meteorology via NCI. Coverage and archive depth vary \
          by country and provider.",
