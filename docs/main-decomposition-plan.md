@@ -1,4 +1,4 @@
-# Decomposing main.rs — the v0.29.4 plan
+# Decomposing main.rs — the v0.30 plan
 
 *Written 2026-07-07 against `2150db4` (v0.29.3). Recon facts: `radar-work/refactor-recon-notes.md`.*
 
@@ -6,9 +6,9 @@
 
 - `crates/app_ui/src/main.rs` is **79,177 lines** — 56% of app_ui's hand-written source. One `ViewerApp` struct with ~330 fields, ~700 methods, ~630 free functions, and a single 24k-line test module.
 - Since June 1, **68% of all commits touched main.rs** (7.6× the busiest sibling module). During the v0.29.3 cycle every parallel agent collided there; three tracks independently fixed the same lint sites and the integrator resolved 19+ merge conflicts that existed only because the code shares one file.
-- The goal of v0.29.4 phase 1 is NOT architecture — it is **making parallel work collide-free and navigation sane**, with zero behavior risk.
+- The goal of v0.30 phase 1 is NOT architecture — it is **making parallel work collide-free and navigation sane**, with zero behavior risk.
 
-## Non-goals (v0.29.4)
+## Non-goals (v0.30)
 
 - **No crate split.** The proven extraction pattern is `impl ViewerApp` blocks in sibling files, which the orphan rule confines to the same crate. A multi-crate split needs a ViewerApp-holding core crate and untangling of the loop-engine web — deferred until there's a compile-time reason strong enough to pay for it. (Iteration builds already have `release-fast`: thin LTO, 16 CGU, incremental.)
 - **No behavior changes, no renames, no restructuring** inside phase-1 commits. Ever.
