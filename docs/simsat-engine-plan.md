@@ -5,6 +5,10 @@
 
 **Scope (owner intent, non-negotiable):** physically-based simulated visible satellite from WRF "with similar calculations as the actual GOES satellites": Blue Marble seasonal ground, sun glint, terrain shadows from `HGT`, finite solar disk (real penumbras), sky-scattering secondary illumination incl. below-horizon twilight, volumetric clouds with scattering/reflection/diffusion, shadows weighted by sky visibility and sky color distribution, plus a synthetic IR mode through the existing true-Kelvin IR enhancement pipeline. No product tiers; milestones below are build order only.
 
+**Delivery shape (owner call 2026-07-07): a STANDALONE tool.** SimSat ships as its own desktop app (engine crate + its own eframe binary), not a BowEcho pane. The bridge to BowEcho is the output contract, not embedding: SimSat writes frames in the sat-store format (§7), so pointing BowEcho's sat store at a SimSat run directory makes rendered loops viewable in BowEcho with zero integration code. An in-BowEcho pane remains possible later precisely because of that contract, but it is not a v1 deliverable.
+
+**Hardware floor (owner call 2026-07-07): modern desktop iGPUs.** The engine must run well on integrated graphics of current desktop CPUs — Intel Core Ultra (Arrow Lake Xe, e.g. 270K-class) and AMD Ryzen 9000 (RDNA2 iGPU, e.g. 9950X). These parts are 10–40× slower than the discrete-GPU class the first draft assumed, and they share system RAM (unified memory) instead of carrying VRAM. Design consequence: the product's primary mode on iGPU is **prerender-then-play** (frames render tiled over seconds each, loops play back instantly as stored textures); live interactive preview adapts resolution/step count to whatever the silicon can hold. Discrete GPUs remain the fast path where everything is interactive. See §8.
+
 **Non-goals (honesty boundary):** not a line-by-line radiative transfer model (no CRTM/RRTMG); band-averaged gray optics per hydrometeor class; WRF's native spherical earth (R = 6 370 km), not the GRS80 ellipsoid real ABI navigation uses — pixel-for-pixel registration against real GOES imagery is explicitly not promised, physical plausibility is.
 
 ---
@@ -94,18 +98,22 @@ Visible frames are written as the three baked `rgb_r/g/b` planes (`COMPOSITE_R_V
 
 ## 8. Performance budget
 
-- **Target GPU class:** desktop RTX 3070/RX 6800-tier and up (the owner's box exceeds this); must coexist with the live radar app on one GPU/queue — and egui paints on that same queue, so **no single dispatch/draw may exceed ~4 ms** (also keeps clear of Windows TDR). All heavy passes are tiled: offline-quality frames render in N tiles across successive egui frames (progressive, cancelable), the vol3d "quality steps" pattern generalized.
-- **Interactive budget (1024–1440p preview, 30 fps target):** sky LUTs ≤ 0.6 ms · sun OD map (per timestep, amortized) ≤ 2 ms · surface pass ≤ 2 ms · cloud march ≤ 20 ms · SH/ambient+compose+tonemap ≤ 1 ms · headroom ≥ 8 ms for the rest of the app.
-- **Offline "player frame" budget:** ≤ 2 s wall per 2048²-class frame, sliced into ≤ 4 ms chunks; a 20-frame Enderlin loop prerenders in ≤ 1 min and then plays back as cheap stored textures (player cap `MAX_SAT_PLAYER_TEXTURE_DIM` = 4096, `sat_paint.rs:1429` test).
+- **Baseline hardware (the floor): modern desktop iGPUs** — Intel Arrow Lake Xe (Core Ultra 270K-class) and AMD RDNA2 iGPU (Ryzen 9950X-class, ~2 CU — genuinely entry silicon). Discrete GPUs (RTX 3070+) are the fast path, not the requirement. Consequences baked into every pass:
+  - Tiling discipline stays (**no single dispatch/draw > ~4 ms**, TDR safety) but tile counts scale up ~10–40× on iGPU; all passes are progressive and cancelable.
+  - Unified memory: "VRAM" budgets are shared-system-RAM budgets — allocation is cheap, bandwidth is the scarce resource. Bandwidth-lean choices are mandatory: quantized bricks (already RGBA8), occupancy-mip empty-space skipping, half-resolution cloud march + bilateral upsample as the iGPU default, LUT reuse across frames.
+  - Quality is NEVER cut on stored frames — iGPU changes *how long* an offline frame takes, not what it looks like.
+- **Interactive preview budget:** dGPU: 1024–1440p at 30 fps (sky LUTs ≤ 0.6 ms · sun OD ≤ 2 ms · surface ≤ 2 ms · cloud march ≤ 20 ms · compose ≤ 1 ms). iGPU: adaptive — start 720p half-res march and scale until frame time holds ~30 fps (Arrow Lake Xe) / ~15 fps floor (RDNA2 2 CU); preview exists to frame the shot, prerender is the product on these parts.
+- **Offline "player frame" budget:** full quality always. dGPU: ≤ 2 s per 2048²-class frame (20-frame Enderlin loop ≤ 1 min). iGPU targets: ≤ 20 s/frame Arrow Lake Xe, ≤ 60 s/frame RDNA2 2 CU (20-frame loop = grab a coffee, then it plays back instantly as stored textures). Player cap 4096² (`sat_paint.rs:1429` test) unchanged.
 - **Memory ceilings:** GPU default 2 GB total (owner call: liberal VRAM for an advanced product; may expand further while the radar app is idle) — brick A/B sized by the voxel-budget knob, Blue Marble 2×4096² ≈ 128 MB, LUTs/OD/horizon ≈ 30 MB, render targets, generous double-buffer headroom. Exposed as a settings knob mirroring `radar_history_budget_gib` (main.rs:7547). CPU ingest peak < 2.5 GB (§2) — that constraint is about system stability, not stinginess, and stays.
 - **LUT precompute:** transmittance+multiscatter ≈ 0.3 ms once per optics config; sky-view+froxels per frame ≤ 0.5 ms; horizon map once per domain (seconds, CPU, below-normal thread).
 
 ## 9. Crate/module layout
 
-- **New crate `crates/simsat`** (renderer + ingest; keeps main.rs untouched per the ratchet `crates/app_ui/tests/main_rs_line_ratchet.rs` and `docs/main-decomposition-plan.md` rule 6):
+- **Two new crates: `crates/simsat` (engine lib) + `crates/simsat_studio` (the standalone app binary).** SimSat Studio is its own eframe/wgpu desktop app: open wrfout files (or a cached run), pick satellite/timestep/mode, render, play/scrub loops, export PNG frames, and write runs in sat-store format for BowEcho. It reuses workspace UI conventions but owns its window — no BowEcho pane in v1 (the sat-store output contract is the bridge; an embedded pane can come later without engine changes).
+- **`crates/simsat`** (renderer + ingest; keeps app_ui/main.rs untouched — nothing here lands in BowEcho's binary at all in v1):
   - `ingest.rs` (wrfout → bricks; deps: `wrf-core` for `WrfFile::read_var`, netcrust only for metadata fallback — mirroring `local_import.rs`'s split), `bricks.rs` (.ssb format, quantization, cache), `frame.rs` (projections, geostationary camera, ECEF math), `optics.rs` (hydrometeor constants + CPU reference kernels), `atmosphere.rs` (LUT generation, CPU reference), `ir.rs`, `gpu/` (pipelines/resources/callbacks à la `Vol3dResources`/`Vol3dCallback`), `gpu/shaders/*.wgsl` via `include_str!` (unlike vol3d's inline `const SHADER` — separate files are testable and diffable).
   - Deps: `eframe = { workspace = true, features = ["wgpu"] }` so `eframe::egui_wgpu::wgpu` stays the single workspace wgpu (29.0.3 per Cargo.lock); `rayon`, `flate2`, `image`, `serde/serde_json`, `chrono`. Dev-dep: `naga` for shader validation.
-- **Thin glue module `crates/app_ui/src/simsat_ui.rs`:** dock pane/window (register in `dock.rs` like `WorkspacePane::Satellite`), worker spawn (below-normal priority), `init_gpu(render_state)` call next to `vol3d::init_gpu` (main.rs:7526, only when `cc.wgpu_render_state` is present — under the glow fallback path at main.rs:1260-1264 SimSat shows a "requires the wgpu renderer" notice), sat-store frame writer reusing the `sat_worker.rs` store contract, hand-off to `SatPlayerPanel`.
+- **BowEcho integration (deferred, by contract not code):** SimSat Studio writes runs under a `simsat` model dir in sat-store format (§7); BowEcho's existing sat store/player reads them when pointed at the directory. The previously-sketched in-app glue module (`simsat_ui.rs` dock pane) is explicitly NOT v1 — if ever wanted, it slots in later against the same engine crate with the patterns already identified (vol3d-style `init_gpu`, glow-fallback notice at main.rs:1260-1264).
 - **Test strategy (nodes are headless Linux — no GPU, no golden images):**
   1. Pure-math unit tests: projection round trips (XLAT/XLONG self-consistency), scan-angle round trips vs `rw_sat::geostationary`, quantization round trips, horizon-map on synthetic ridges, penumbra fraction at known geometries.
   2. **CPU-reference sampling tests:** every WGSL kernel has a Rust twin in `optics.rs`/`atmosphere.rs`; deterministic 32×32 CPU raymarches of tiny analytic scenes (uniform slab, single box cloud) asserted against pinned arrays with tolerance — real regression power, runs in `cargo test`.
@@ -120,14 +128,14 @@ Dependency-ordered; every gate = fmt/clippy/test on nodes + a real-data proof re
 | # | Deliverable | Proof standard |
 |---|---|---|
 | M0 | `simsat` crate scaffold; .ssb brick format; streaming ingest of one wrfout timestep | Enderlin 02:15 file → brick cache, logged peak RSS < 2.5 GB, wall < 60 s release; quantization/projection tests green |
-| M1 | Geostationary camera + surface pass (Blue Marble single-month dev texture, HGT normals, LANDMASK, point sun) + **sat-store frame writer + player hookup** | A `simsat` run appears and plays in the Satellite window; map layer shows it via `LoadFrameForMap` |
+| M1 | SimSat Studio window (open run → render → view) + geostationary camera + surface pass (Blue Marble single-month dev texture, HGT normals, LANDMASK, point sun) + **sat-store-format frame writer** | Studio renders and displays a frame; the written run ALSO plays in BowEcho's Satellite window when the store dir is pointed at it |
 | M2 | Hillaire atmosphere LUTs + aerial perspective + finite-disk sun + twilight | Enderlin 02:15 UTC (≈21:15 CDT, sun on the horizon) renders a credible sunset limb-lit frame; 05:15 renders night |
 | M3 | Horizon maps: penumbral terrain shadows; Cox-Munk glint; SNOWH blend | Low-sun frame with measured shadow lengths consistent with HGT; glint streak on water bodies |
 | M4 | Cloud raymarch v1: adaptive steps, sun OD map, dual-HG, beer-powder, SH ambient | The Enderlin supercell at a daylight timestep, side-lit, with cloud shadows on ground |
 | M5 | Multi-scatter octaves; penumbral cloud shadows; full sky-visibility ambient on terrain+cloud | Anvil-shadow scene: shadow core vs blue-ambient fill visibly correct at sunset |
 | M6 | IR mode → store as Kelvin band-13 frame → existing enhancements | Same timestep through Rainbow/BD in the player; anvil BT ≈ cloud-top T from the sounding |
 | M7 | Multi-timestep prerender pipeline; Blue Marble asset pack (download+sha256, 12-month lerp); budgets/knobs; native-window LOD | Full Enderlin loop plays in `SatPlayerPanel`; pack downloads cold on a clean profile |
-| M8 | Hardening: tiling/TDR discipline, glow-fallback UX, docs, parity harness | Radar loop + SimSat prerender running simultaneously without UI hitching > 1 frame |
+| M8 | Hardening: tiling/TDR discipline on iGPU, docs, parity harness | Full prerender+playback session on an Arrow Lake Xe iGPU box within the §8 iGPU budgets; BowEcho running alongside without either app hitching |
 
 ## 11. Risks & open questions
 
@@ -139,12 +147,34 @@ Dependency-ordered; every gate = fmt/clippy/test on nodes + a real-data proof re
 5. **Blue Marble distribution friction** (hosting, size, offline use): NASA imagery is public domain; release-asset hosting + sha256 manifest reuses the shipped `self_update.rs` pattern; per-month lazy fetch keeps first-use ≤ ~100 MB; bundled 8 km emergency fallback (~10 MB) so the renderer never hard-fails offline.
 
 **Owner decisions (2026-07-07 — "advanced product, best possible within reason, no supercomputer shit"):**
-1. **VRAM: liberal.** Default budget raised to 2 GB (knob still exposed); SimSat may expand further when the radar app is idle. Target GPU class unchanged (high-end consumer, not datacenter) — "within reason" means it must run great on a serious desktop, not that it must be small.
+1. **Memory: liberal, now unified.** Default budget 2 GB (knob exposed). Since the hardware floor moved to iGPUs (decision 7), this is shared system RAM — allocation is cheap there; the §8 bandwidth-lean rules are what keep iGPU fast.
 2. **Polish: everything.** No either/or — offline frames render at full quality (384+ steps, full-res), interactive preview holds 30 fps by adapting resolution/steps, both paths get finish work. When a milestone forces sequencing, offline/loop quality lands first within that milestone, preview parity immediately after.
 3. **Satellites: East/West/Himawari selectable at v1** (shared camera math; sub-lon + AHI/ABI pixel-pitch presets).
 4. **Blue Marble: full-year 2 km pack (~500 MB) is the default download**; lazy per-month remains as the low-bandwidth option; 500 m regional crop packs greenlit as follow-on. GitHub release-asset hosting accepted.
 5. **Spherical earth accepted** — the standard is physical plausibility, not pixel registration with real ABI imagery.
 6. **QVAPOR gets a full brick channel now** so a 6.2 µm water-vapor IR band is a shader-only addition later.
+7. **Standalone tool (2026-07-07 addendum):** SimSat ships as its own app (`simsat_studio`), not a BowEcho pane; the sat-store output format is the only bridge to BowEcho in v1.
+8. **iGPU hardware floor (2026-07-07 addendum):** must run well on Intel Arrow Lake Xe (Core Ultra 270K-class) and AMD RDNA2 iGPU (Ryzen 9950X-class): prerender-then-play is the primary iGPU mode, stored-frame quality is never reduced, preview adapts. Discrete GPUs are the fast path.
+
+---
+
+## 12. Implementation handoff — read this first if you are the implementing agent
+
+This section exists so the plan is executable without the context of the session that wrote it.
+
+**Process rules (owner mandates, non-negotiable):**
+- NEVER run cargo/rustc on the owner's Windows machine (a PreToolUse hook blocks it). The one sanctioned local build is a release smoke (`env -u CARGO_BUILD_JOBS cargo build --release -p <bin>`) when producing an exe for the owner to run.
+- All verification runs on the build nodes over ssh: push your branch to the node's bare repo first (`git push node3|node4 HEAD:refs/heads/<branch>` — node3 = drew@192.168.68.56, node4 = drew@192.168.68.57; the verify script fetches from the node's LOCAL repo, pushing to origin alone fails with exit 3), then run each gate FOREGROUND: `ssh -o BatchMode=yes drew@<ip> "flock -w 3600 /tmp/bowecho-verify.lock env BOWECHO_BRANCH='<branch>' bash ~/bowecho-verify.sh <cargo args>"` for `fmt --all --check`, `clippy --workspace --all-targets -- -D warnings`, `test --workspace`. Never leave a gate unverified; on a client timeout, re-run (node caches make retries fast).
+- Work in a git worktree branched from the integration tip; commit early and often (uncommitted worktrees have been lost); checkpoint findings to a notes file under `C:\Users\drew\radar-work\` as you go.
+- Nodes are headless Linux: no GPU, no golden-image tests — the §9 test strategy (CPU reference kernels, naga validation, pure-math round trips) is the CI story; visual proofs happen on the owner's box via a locally built exe the owner runs.
+- Never touch `~/weather` on the nodes (owner data). Do not add lines to `crates/app_ui/src/main.rs` (a ratchet test enforces a shrinking ceiling).
+
+**Owner-side facts:**
+- The Enderlin canonical fixture lives on the owner's machine under his `wrf_demo` folder (2.4 GB, 800×800×79); ask the owner to confirm the path before M0 ingest testing, and NEVER import it with the heavy full-diagnostics path.
+- Proof loop per milestone: build `simsat_studio` release exe locally (sanctioned smoke), copy to the owner's Desktop with a clear name, owner runs it and reports; treat owner reports as the acceptance test.
+- Blue Marble source: NASA Visible Earth collection 1484 (public domain), 12 monthly global composites; 2 km JPEGs ≈ 30–50 MB/month; re-host as GitHub release assets with a sha256 manifest (streaming-download pattern precedent: `crates/app_ui/src/self_update.rs`).
+
+**Order of work = §10 milestones, one at a time, each fully gated before the next.** Scaffold M0 by hand-writing the two crates' `Cargo.toml` + adding them to the workspace `members` (you cannot run `cargo new` locally); first gate run on a node will validate the scaffold. Every §1–§7 subsystem names its repo precedent file — read the precedent before writing the subsystem. When a detail here conflicts with what you find in the code, the code wins and this doc gets a correcting commit.
 
 ---
 
