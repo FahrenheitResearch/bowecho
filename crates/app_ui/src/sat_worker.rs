@@ -83,6 +83,9 @@ pub enum SatRequest {
     LoadFrame { key: SatRunKey, hhmm: u16 },
     /// Read a frame PLUS its run grid for the radar-map layer.
     LoadFrameForMap { key: SatRunKey, hhmm: u16 },
+    /// Select the IR enhancement used when coloring stored BT frames
+    /// (applies to subsequent LoadFrame/LoadFrameForMap responses).
+    SetIrEnhancement(IrEnhancement),
     /// Download/decode the latest Himawari AHI frame into the shared sat store.
     IngestLatestHimawari(HimawariQuickSpec),
     /// Fetch the ABI bands a composite needs (co-registered by scan time),
@@ -756,6 +759,8 @@ struct GridInfo {
 #[derive(Default)]
 struct WorkerState {
     grids: HashMap<(String, String), GridInfo>,
+    /// User-selected IR enhancement, applied at frame-coloring time.
+    ir_enhancement: IrEnhancement,
 }
 
 struct ColoredSatFrame {
@@ -858,7 +863,16 @@ fn load_colored_frame(
             .ok_or_else(|| format!("{key}/t{hhmm:04} selector carries no band"))?;
         let name = variable.name.clone();
         let values = reader.read_full_2d(&name).map_err(|err| err.to_string())?;
-        render_sat_pixels(&name, band, &values, nx, ny, flip_rows, map_overlay)
+        render_sat_pixels(
+            &name,
+            band,
+            &values,
+            nx,
+            ny,
+            flip_rows,
+            map_overlay,
+            state.ir_enhancement,
+        )
     };
 
     Ok(ColoredSatFrame {
@@ -914,6 +928,7 @@ fn render_composite_pixels(
     pixels
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_sat_pixels(
     variable_name: &str,
     band: u8,
@@ -922,20 +937,28 @@ fn render_sat_pixels(
     ny: usize,
     flip_rows: bool,
     map_overlay: bool,
+    enhancement: IrEnhancement,
 ) -> Vec<Color32> {
-    // Himawari AHI brightness-temperature bands are NOT stored in the Kelvin
-    // domain GOES uses: `ahi_bt_c13` lands ~326-330 (verified from a real
-    // full-disk frame), not ~190-310 K, so a fixed-temperature table clamps
-    // the whole disk to the warm/dark end and it renders black. Auto-stretch
-    // Himawari's real range (p2..p98) through the enhanced-IR color ramp
-    // instead -- the old grayscale intent, now in color. GOES longwave window
-    // (13-15) IS real Kelvin, so it keeps the physically-anchored fixed
-    // enhancement. Every other band uses its production palette.
-    let dynamic = (variable_name.starts_with("ahi_bt_") && (7..=16).contains(&band))
-        .then(|| finite_percentile_range(values, 0.02, 0.98))
-        .flatten();
-    let static_anchors = enhanced_anchors_for_band(band).unwrap_or_else(|| band_anchors(band));
+    // Both GOES ABI and (since the true-count block-5 calibration in
+    // `ingest_latest_himawari`) Himawari AHI store REAL Kelvin brightness
+    // temperature, so every IR band renders through absolute-temperature
+    // anchor tables. Frames written by the pre-calibration AHI path hold
+    // raw-ish pseudo-BT (~326-330 K flat) that an absolute palette would
+    // clamp to one warm color — detect that implausible distribution and
+    // keep the old percentile stretch for just those legacy frames.
     let ir_band = (7..=16).contains(&band);
+    if variable_name.starts_with("ahi_bt_") && ir_band && legacy_pseudo_bt(values) {
+        eprintln!(
+            "sat: {variable_name} median > {LEGACY_PSEUDO_BT_MEDIAN_K} K (pre-calibration \
+             pseudo-BT frame) — falling back to the legacy percentile stretch"
+        );
+        return render_ahi_legacy_stretch(values, nx, ny, flip_rows, map_overlay);
+    }
+    let static_anchors = if ir_band {
+        ir_enhancement_anchors(band, enhancement)
+    } else {
+        band_anchors(band)
+    };
 
     let mut pixels = Vec::with_capacity(nx * ny);
     for image_row in 0..ny {
@@ -945,37 +968,84 @@ fn render_sat_pixels(
             image_row
         };
         for &value in &values[grid_row * nx..(grid_row + 1) * nx] {
-            if let Some((lo, hi)) = dynamic {
-                if !value.is_finite() {
-                    pixels.push(Color32::TRANSPARENT);
-                    continue;
-                }
-                // norm: 0 = coldest (low value), 1 = warmest; mapped onto the
-                // colorful part of the enhancement.
-                let norm = ((value - lo) / (hi - lo)).clamp(0.0, 1.0);
-                let pseudo_k = DYN_COLD_K + norm * (DYN_WARM_K - DYN_COLD_K);
-                let [r, g, b, _] = anchor_color(pseudo_k, ENHANCED_IR);
-                let alpha = if map_overlay {
-                    ((1.0 - norm) * 235.0) as u8 // cold=opaque, warm=clear
-                } else {
-                    255
-                };
-                pixels.push(Color32::from_rgba_unmultiplied(r, g, b, alpha));
+            let [r, g, b, a] = anchor_color(value, static_anchors);
+            let alpha = if map_overlay && ir_band {
+                bt_overlay_alpha(value)
             } else {
-                let [r, g, b, a] = anchor_color(value, static_anchors);
-                let alpha = if map_overlay && ir_band {
-                    bt_overlay_alpha(value)
-                } else {
-                    a
-                };
-                pixels.push(Color32::from_rgba_unmultiplied(r, g, b, alpha));
-            }
+                a
+            };
+            pixels.push(Color32::from_rgba_unmultiplied(r, g, b, alpha));
         }
     }
     pixels
 }
 
-/// Coldest/warmest pseudo-Kelvin the Himawari dynamic stretch maps its
+/// Median BT above which a stored AHI "brightness temperature" plane cannot
+/// be real Kelvin: an Earth full disk medians ~270-290 K (mostly ocean),
+/// while the pre-v0.29.3 pseudo-BT frames cluster flat at ~326-330 K.
+const LEGACY_PSEUDO_BT_MEDIAN_K: f32 = 320.0;
+
+/// Whether a stored AHI BT plane predates the true-Kelvin calibration
+/// (sampled finite median warmer than any plausible Earth disk).
+fn legacy_pseudo_bt(values: &[f32]) -> bool {
+    let stride = (values.len() / 4096).max(1);
+    let mut sample: Vec<f32> = values
+        .iter()
+        .step_by(stride)
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    if sample.is_empty() {
+        return false;
+    }
+    let mid = sample.len() / 2;
+    let (_, median, _) = sample.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    *median > LEGACY_PSEUDO_BT_MEDIAN_K
+}
+
+/// The pre-v0.29.3 Himawari display path: p2..p98 auto-stretch through the
+/// colorful span of [`ENHANCED_IR`]. Kept ONLY for stored frames written
+/// before AHI IR was calibrated to true Kelvin (see [`render_sat_pixels`])
+/// and for the before/after proof export — new ingests never take it.
+fn render_ahi_legacy_stretch(
+    values: &[f32],
+    nx: usize,
+    ny: usize,
+    flip_rows: bool,
+    map_overlay: bool,
+) -> Vec<Color32> {
+    let Some((lo, hi)) = finite_percentile_range(values, 0.02, 0.98) else {
+        return vec![Color32::TRANSPARENT; nx * ny];
+    };
+    let mut pixels = Vec::with_capacity(nx * ny);
+    for image_row in 0..ny {
+        let grid_row = if flip_rows {
+            ny - 1 - image_row
+        } else {
+            image_row
+        };
+        for &value in &values[grid_row * nx..(grid_row + 1) * nx] {
+            if !value.is_finite() {
+                pixels.push(Color32::TRANSPARENT);
+                continue;
+            }
+            // norm: 0 = coldest (low value), 1 = warmest; mapped onto the
+            // colorful part of the enhancement.
+            let norm = ((value - lo) / (hi - lo)).clamp(0.0, 1.0);
+            let pseudo_k = DYN_COLD_K + norm * (DYN_WARM_K - DYN_COLD_K);
+            let [r, g, b, _] = anchor_color(pseudo_k, ENHANCED_IR);
+            let alpha = if map_overlay {
+                ((1.0 - norm) * 235.0) as u8 // cold=opaque, warm=clear
+            } else {
+                255
+            };
+            pixels.push(Color32::from_rgba_unmultiplied(r, g, b, alpha));
+        }
+    }
+    pixels
+}
+
+/// Coldest/warmest pseudo-Kelvin the legacy Himawari stretch maps its
 /// auto-detected value range onto, i.e. the colorful span of [`ENHANCED_IR`].
 const DYN_COLD_K: f32 = 200.0;
 const DYN_WARM_K: f32 = 292.0;
@@ -1032,6 +1102,204 @@ const ENHANCED_IR: rw_sat::palette::Anchors = &[
 fn enhanced_anchors_for_band(band: u8) -> Option<rw_sat::palette::Anchors> {
     matches!(band, 13..=15).then_some(ENHANCED_IR)
 }
+
+/// User-selectable IR enhancement for Kelvin brightness-temperature bands
+/// (GOES ABI and Himawari AHI bands 7-16). `Cimss` keeps the established
+/// per-band behavior ([`ENHANCED_IR`] on the longwave window, production
+/// palettes elsewhere); the others are the classic NOAA absolute-temperature
+/// enhancement curves, applied to every IR band on both satellites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IrEnhancement {
+    /// CIMSS-style rainbow on 13-15, production palettes elsewhere (default).
+    #[default]
+    Cimss,
+    /// NESDIS BD curve — the stepped Dvorak tropical-cyclone enhancement.
+    Bd,
+    /// NOAA/SSD AVN color IR enhancement.
+    Avn,
+    /// NOAA/SSD Funktop (Ted Funk precipitation) enhancement.
+    Funktop,
+    /// NOAA/SSD RB rainbow IR enhancement.
+    Rainbow,
+    /// Plain unenhanced IR grayscale (cold = white).
+    Grayscale,
+}
+
+impl IrEnhancement {
+    pub const ALL: [IrEnhancement; 6] = [
+        Self::Cimss,
+        Self::Bd,
+        Self::Avn,
+        Self::Funktop,
+        Self::Rainbow,
+        Self::Grayscale,
+    ];
+
+    /// Stable settings key (persisted in `AppSettings::sat_ir_enhancement`).
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Cimss => "cimss",
+            Self::Bd => "bd",
+            Self::Avn => "avn",
+            Self::Funktop => "funktop",
+            Self::Rainbow => "rainbow",
+            Self::Grayscale => "gray",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cimss => "CIMSS ramp (default)",
+            Self::Bd => "BD curve (Dvorak)",
+            Self::Avn => "AVN",
+            Self::Funktop => "Funktop",
+            Self::Rainbow => "Rainbow",
+            Self::Grayscale => "Grayscale",
+        }
+    }
+
+    /// Parse a settings slug; unknown values keep the default enhancement.
+    pub fn parse(value: &str) -> Self {
+        let normalized = value.trim().to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|enhancement| enhancement.slug() == normalized)
+            .unwrap_or_default()
+    }
+}
+
+/// The anchor table an IR band renders through for the given enhancement.
+/// `Cimss` preserves the per-band production behavior; every other curve is
+/// an absolute-Kelvin table shared by all IR bands (the classic curves are
+/// defined on the longwave window, but every ABI/AHI band 7-16 is Kelvin BT,
+/// so they apply cleanly — shortwave 3.9 µm solar-contaminated pixels above
+/// the warm anchor simply clamp dark).
+fn ir_enhancement_anchors(band: u8, enhancement: IrEnhancement) -> rw_sat::palette::Anchors {
+    match enhancement {
+        IrEnhancement::Cimss => {
+            enhanced_anchors_for_band(band).unwrap_or_else(|| band_anchors(band))
+        }
+        IrEnhancement::Bd => BD_CURVE,
+        IrEnhancement::Avn => AVN_IR,
+        IrEnhancement::Funktop => FUNKTOP_IR,
+        IrEnhancement::Rainbow => RAINBOW_IR,
+        IrEnhancement::Grayscale => GRAYSCALE_IR,
+    }
+}
+
+/// NESDIS BD curve (Dvorak Enhanced-IR tropical-cyclone enhancement) over
+/// brightness temperature. Breakpoints are the canonical NESDIS gray-shade
+/// boundaries used by the Dvorak/ADT technique — OFF WHITE ramp to -30.2 °C,
+/// then DG -30.2..-41.2, MG -41.2..-53.2, LG -53.2..-63.2, B -63.2..-69.6,
+/// W -69.6..-75.2, CMG -75.2..-80.2, CDG colder than -80.2 (Dvorak 1984 /
+/// Velden-Olander-Zehr; rounded ranges documented at
+/// <https://tropic.ssec.wisc.edu/misc/other/faq/faq_enhance.html>, AWIPS
+/// recreation at <https://rammb.cira.colostate.edu/training/visit/training_sessions/goes_enhancement_color_tables_in_awips/web/ins_BD.html>).
+/// Gray levels are transcribed from the operational NOAA/SSD BD colorbar
+/// (GOES-West tropical loops). Steps are HARD: duplicate anchor values pin
+/// each bin flat, and an exact boundary temperature belongs to the COLDER
+/// bin (tested).
+const BD_CURVE: rw_sat::palette::Anchors = &[
+    (164.15, [88, 88, 88]),    // -109.0 C: cold dark gray floor
+    (192.95, [88, 88, 88]),    //  -80.2 C: CDG (repeat gray, <= -80.2)
+    (192.95, [136, 136, 136]), //  -80.2..-75.2 C: cold medium gray
+    (197.95, [136, 136, 136]),
+    (197.95, [255, 255, 255]), //  -75.2..-69.6 C: white
+    (203.55, [255, 255, 255]),
+    (203.55, [0, 0, 0]), //  -69.6..-63.2 C: black
+    (209.95, [0, 0, 0]),
+    (209.95, [160, 160, 160]), //  -63.2..-53.2 C: light gray
+    (219.95, [160, 160, 160]),
+    (219.95, [112, 112, 112]), //  -53.2..-41.2 C: medium gray
+    (231.95, [112, 112, 112]),
+    (231.95, [64, 64, 64]), //  -41.2..-30.2 C: dark gray
+    (242.95, [64, 64, 64]),
+    (242.95, [200, 200, 200]), //  -30.2 -> +9.0 C: off-white scene ramp
+    (282.15, [110, 110, 110]),
+    (282.15, [255, 255, 255]), //   +9.0 -> +28.0 C: warm repeat ramp
+    (301.15, [0, 0, 0]),
+    (330.0, [0, 0, 0]), // hottest surface stays black
+];
+
+/// NOAA/SSD AVN color IR enhancement (aviation/tropical): warm grayscale
+/// ramp, then blue → yellow → orange → red cold-cloud steps, an anvil-core
+/// gray, and white for the coldest overshoots. Breakpoints/colors transcribed
+/// from the operational NOAA/SSD "AVNCOLOR IR" product colorbar (GOES-West
+/// tropical Pacific loops, e.g. <https://www.ssd.noaa.gov/goes/west/tpac/h5-loop-avn.html>),
+/// calibrated against the BD colorbar's known NESDIS breakpoints.
+const AVN_IR: rw_sat::palette::Anchors = &[
+    (163.15, [255, 255, 255]), // -110.0 C
+    (170.15, [255, 255, 255]), // -103.0 C: coldest overshoot white
+    (170.15, [88, 88, 88]),    // -103.0..-78.0 C: anvil-core gray
+    (195.15, [88, 88, 88]),
+    (195.15, [240, 0, 0]), //  -78.0..-70.5 C: red
+    (202.65, [240, 0, 0]),
+    (202.65, [200, 118, 10]),  //  -70.5 C: step to orange…
+    (218.65, [250, 183, 0]),   //  -54.5 C: …brightening warmward
+    (218.65, [250, 250, 5]),   //  -54.5 C: step to yellow…
+    (234.65, [160, 158, 0]),   //  -38.5 C: …darkening warmward
+    (234.65, [0, 120, 175]),   //  -38.5 C: step to blue…
+    (258.65, [0, 158, 245]),   //  -14.5 C: …brightening warmward
+    (258.65, [255, 255, 255]), // -14.5 C: step to the warm grayscale ramp
+    (281.65, [130, 130, 130]), //  +8.5 C
+    (305.15, [0, 0, 0]),       // +32.0 C: warm surface black
+];
+
+/// NOAA/SSD Funktop enhancement (Ted Funk, precipitation/tropical analysis):
+/// warm grayscale, yellow-olive, navy → cyan, dark red, pink, then green
+/// fading to white at the coldest tops. Breakpoints/colors transcribed from
+/// the operational NOAA/SSD "Funktop" product colorbar (GOES-West tropical
+/// Pacific loops, e.g. <https://www.ssd.noaa.gov/goes/west/tpac/h5-loop-ft.html>),
+/// calibrated against the BD colorbar's known NESDIS breakpoints.
+const FUNKTOP_IR: rw_sat::palette::Anchors = &[
+    (163.15, [250, 250, 250]), // -110.0 C: deep-cold white
+    (182.15, [235, 250, 235]), //  -91.0 C
+    (195.15, [0, 255, 20]),    //  -78.0 C: bright green
+    (195.15, [255, 133, 133]), //  -78.0 C: step to pink…
+    (202.65, [255, 85, 85]),   //  -70.5 C: …deepening warmward
+    (202.65, [240, 0, 0]),     //  -70.5 C: step to red…
+    (215.15, [75, 0, 0]),      //  -58.0 C: …darkening warmward
+    (215.15, [10, 240, 255]),  //  -58.0 C: step to cyan…
+    (234.65, [5, 10, 125]),    //  -38.5 C: …to navy warmward
+    (234.65, [245, 240, 0]),   //  -38.5 C: step to yellow…
+    (254.15, [100, 100, 0]),   //  -19.0 C: …to olive warmward
+    (254.15, [222, 222, 222]), //  -19.0 C: step to the warm grayscale ramp
+    (305.15, [30, 30, 30]),    //  +32.0 C
+    (320.15, [0, 0, 0]),       //  +47.0 C: hottest surface black
+];
+
+/// NOAA/SSD RB "rainbow" IR enhancement: a smooth magenta → blue → cyan →
+/// green → yellow → orange → red sweep from warm to cold, a white band near
+/// -87..-90 °C, and a repeat dark-to-white ramp for the very coldest tops.
+/// Transcribed from the operational NOAA/SSD "RBTOP" product colorbar
+/// (GOES-West tropical Pacific loops), calibrated against the BD colorbar's
+/// known NESDIS breakpoints.
+const RAINBOW_IR: rw_sat::palette::Anchors = &[
+    (164.15, [255, 255, 255]), // -109.0 C: repeat ramp ends white
+    (182.65, [10, 10, 10]),    //  -90.5 C: repeat ramp starts near black
+    (182.65, [250, 250, 252]), //  -90.5..-86.5 C: white band
+    (186.65, [250, 250, 252]),
+    (186.65, [240, 5, 0]),   //  -86.5 C: brightest red
+    (196.15, [190, 0, 2]),   //  -77.0 C
+    (204.65, [122, 0, 0]),   //  -68.5 C: darkest red-brown
+    (212.15, [150, 57, 0]),  //  -61.0 C
+    (221.15, [185, 112, 4]), //  -52.0 C: orange-brown
+    (230.15, [210, 170, 0]), //  -43.0 C
+    (240.15, [252, 252, 0]), //  -33.0 C: yellow peak
+    (249.15, [160, 200, 5]), //  -24.0 C
+    (259.15, [12, 120, 10]), //  -14.0 C: green
+    (268.15, [0, 180, 115]), //   -5.0 C
+    (277.15, [0, 250, 250]), //   +4.0 C: cyan
+    (289.15, [0, 105, 175]), //  +16.0 C
+    (295.65, [0, 5, 120]),   //  +22.5 C: deep blue
+    (305.15, [140, 0, 195]), //  +32.0 C: magenta (warm clamp)
+];
+
+/// Plain unenhanced IR grayscale: cold cloud tops white, warm surface black.
+const GRAYSCALE_IR: rw_sat::palette::Anchors = &[
+    (173.15, [255, 255, 255]), // -100 C
+    (330.0, [0, 0, 0]),        //  +57 C
+];
 
 /// Radar-map-overlay alpha from brightness temperature: warm (> +5 C) fully
 /// transparent so radar/basemap shows through; cold storm tops (< -40 C)
@@ -1522,12 +1790,45 @@ fn ingest_latest_himawari(
         .iter()
         .map(|segment| PathBuf::from(&segment.raw_path))
         .collect::<Vec<_>>();
-    let field = assemble_hsd_segments(
+    let mut field = assemble_hsd_segments(
         &paths,
         HimawariValueMode::BrightnessTemperature,
         spec.downsample.max(1),
     )
     .map_err(|err| err.to_string())?;
+    // IR bands: replace rw-sat's BT plane (computed from right-shifted
+    // counts, so it lands flat at ~326-330 K — see decode_ahi_raw_counts)
+    // with TRUE Kelvin from the raw counts + block-5 calibration, the same
+    // true-count fix the visible composite path uses. Stored AHI IR is real
+    // brightness temperature from here on and renders through the same
+    // absolute-Kelvin palettes as GOES.
+    if (7..=16).contains(&band) {
+        let true_counts = ahi_true_counts_on_grid(&paths, spec.downsample.max(1))?;
+        if true_counts.len() != field.values.len() {
+            return Err(format!(
+                "AHI B{band:02} true-count length {} does not match the assembled grid {}",
+                true_counts.len(),
+                field.values.len()
+            ));
+        }
+        let header = inspect_hsd_file(&paths[0]).map_err(|err| err.to_string())?;
+        let calibration = header
+            .calibration
+            .ok_or_else(|| format!("AHI B{band:02} HSD header carries no calibration block #5"))?;
+        field.values = ahi_counts_to_brightness_temperature(&true_counts, &calibration)?;
+        // Mask off-earth pixels: a few limb/space counts pass the sentinel
+        // check but their scan angles miss the earth (near-zero radiance,
+        // BT < 100 K noise). The navigation mesh is authoritative — blank
+        // anything it cannot geolocate so absolute-Kelvin palettes render
+        // clean space instead of cold speckle blocks.
+        let (mesh_lat, _) = ahi_lat_lon_mesh(&field.scene);
+        for (value, lat) in field.values.iter_mut().zip(&mesh_lat) {
+            if !lat.is_finite() {
+                *value = f32::NAN;
+            }
+        }
+    }
+    let field = field;
     let nx = field.scene.fixed_grid.nx;
     let ny = field.scene.fixed_grid.ny;
     // AHI is CF sweep_angle_axis "y": write through the local sweep=y
@@ -2202,6 +2503,60 @@ fn assemble_ahi_window_counts(
         },
         calibration,
     ))
+}
+
+/// Convert AHI raw counts to TRUE brightness temperature (Kelvin) with the
+/// segment's block-5 infrared calibration (JMA HSD User's Guide v1.3 §4.4):
+/// radiance = `slope · count + intercept` [W/(m² sr µm)], the effective
+/// blackbody temperature Te from the inverse Planck function at the band's
+/// central wavelength (block-5 physical constants), then the brightness
+/// temperature `Tb = c0 + c1·Te + c2·Te²` (block-5 correction coefficients).
+/// Same scheme rw-sat's BrightnessTemperature mode implements — but fed the
+/// *true* right-justified counts from [`decode_ahi_raw_counts`] instead of
+/// rw-sat's shifted ones, which push radiance toward the intercept and land
+/// BT flat at ~326-330 K (what forced the old display-side percentile hack).
+/// Non-finite counts (error / off-disk) and non-physical radiance stay NaN.
+fn ahi_counts_to_brightness_temperature(
+    counts: &[f32],
+    calibration: &HimawariCalibrationInfo,
+) -> Result<Vec<f32>, String> {
+    let constants = calibration.physical_constants.as_ref().ok_or_else(|| {
+        format!(
+            "AHI B{:02} block-5 calibration carries no infrared Planck constants",
+            calibration.band_number
+        )
+    })?;
+    let slope = calibration.count_to_radiance_slope;
+    let intercept = calibration.count_to_radiance_intercept;
+    let [c0, c1, c2] = calibration.planck_or_albedo_coefficients;
+    let wavelength_m = calibration.central_wavelength_um * 1.0e-6;
+    let planck_lead = 2.0 * constants.planck_constant_j_s * constants.speed_of_light_m_s.powi(2);
+    let planck_term = constants.planck_constant_j_s * constants.speed_of_light_m_s
+        / constants.boltzmann_constant_j_k;
+    Ok(counts
+        .iter()
+        .map(|&count| {
+            if !count.is_finite() {
+                return f32::NAN;
+            }
+            let radiance_per_um = slope * f64::from(count) + intercept;
+            if !(radiance_per_um.is_finite() && radiance_per_um > 0.0) {
+                return f32::NAN;
+            }
+            let radiance_per_m = radiance_per_um * 1.0e6;
+            let log_arg = planck_lead / (radiance_per_m * wavelength_m.powi(5)) + 1.0;
+            if !(log_arg.is_finite() && log_arg > 1.0) {
+                return f32::NAN;
+            }
+            let effective = planck_term / (wavelength_m * log_arg.ln());
+            let brightness = c0 + c1 * effective + c2 * effective * effective;
+            if brightness.is_finite() {
+                brightness as f32
+            } else {
+                f32::NAN
+            }
+        })
+        .collect())
 }
 
 /// Convert AHI raw counts to reflectance (albedo) using the HSD visible
@@ -3215,6 +3570,9 @@ fn worker_loop(
                     return;
                 }
             }
+            SatRequest::SetIrEnhancement(enhancement) => {
+                state.ir_enhancement = enhancement;
+            }
             SatRequest::IngestLatestHimawari(spec) => {
                 send(SatResponse::Note(format!(
                     "Himawari: locating latest {} B{:02}",
@@ -3639,7 +3997,16 @@ mod tests {
     fn himawari_ir_is_colorized_not_grayscale() {
         // Kelvin brightness temps: NaN, warm surface, a -60 C top, a -40 C top.
         let values = vec![f32::NAN, 300.0, 213.0, 233.0];
-        let pixels = render_sat_pixels("cmi_c13", 13, &values, 4, 1, false, false);
+        let pixels = render_sat_pixels(
+            "cmi_c13",
+            13,
+            &values,
+            4,
+            1,
+            false,
+            false,
+            IrEnhancement::Cimss,
+        );
 
         assert_eq!(pixels[0].a(), 0, "NaN stays transparent");
         // -60 C cloud top is RED in the enhancement — proof it is colorized,
@@ -4124,12 +4491,23 @@ mod tests {
     }
 
     #[test]
-    fn himawari_bt_out_of_kelvin_domain_still_colorizes() {
-        // Real Himawari ahi_bt_c13 lands ~326-330, NOT Kelvin BT — verified
-        // from a live full-disk frame. It must auto-stretch and colorize, not
-        // render black (the regression this fixes).
+    fn legacy_pseudo_bt_frames_fall_back_to_the_percentile_stretch() {
+        // Frames written by the pre-calibration AHI path store ~326-330
+        // (raw-ish pseudo-BT, verified from a live full-disk frame). An
+        // absolute-Kelvin palette would clamp them to one flat warm color;
+        // the median>320 K detector must route them through the legacy
+        // stretch so they still colorize.
         let values = vec![f32::NAN, 326.0, 327.5, 328.0, 329.0, 330.0];
-        let pixels = render_sat_pixels("ahi_bt_c13", 13, &values, 3, 2, false, false);
+        let pixels = render_sat_pixels(
+            "ahi_bt_c13",
+            13,
+            &values,
+            3,
+            2,
+            false,
+            false,
+            IrEnhancement::Cimss,
+        );
 
         assert_eq!(pixels[0].a(), 0, "NaN stays transparent");
         let cold = pixels[1]; // 326 -> coldest -> colorful
@@ -4143,6 +4521,162 @@ mod tests {
             !(cold.r() == cold.g() && cold.g() == cold.b()),
             "colorized, not grayscale: {cold:?}"
         );
+        // The detector keys on the median, not the presence of warm pixels:
+        // a real-Kelvin disk with a hot desert pixel is NOT legacy.
+        assert!(legacy_pseudo_bt(&values), "flat ~328 K plane is legacy");
+        assert!(
+            !legacy_pseudo_bt(&[f32::NAN, 195.0, 233.0, 273.0, 288.0, 325.0]),
+            "true-Kelvin distribution is not legacy"
+        );
+    }
+
+    #[test]
+    fn true_kelvin_ahi_renders_exactly_like_goes() {
+        // Post-calibration AHI IR is real Kelvin, so the same values through
+        // `ahi_bt_c13` and `cmi_c13` must produce identical pixels — the
+        // percentile hack is gone from the calibrated path.
+        let values = vec![f32::NAN, 195.0, 210.0, 233.0, 273.0, 295.0];
+        for enhancement in IrEnhancement::ALL {
+            let ahi = render_sat_pixels("ahi_bt_c13", 13, &values, 3, 2, false, false, enhancement);
+            let goes = render_sat_pixels("cmi_c13", 13, &values, 3, 2, false, false, enhancement);
+            assert_eq!(ahi, goes, "{enhancement:?} diverged between AHI and GOES");
+        }
+    }
+
+    #[test]
+    fn ir_enhancement_slugs_round_trip_and_unknown_falls_back() {
+        for enhancement in IrEnhancement::ALL {
+            assert_eq!(IrEnhancement::parse(enhancement.slug()), enhancement);
+        }
+        assert_eq!(IrEnhancement::parse(" BD "), IrEnhancement::Bd);
+        assert_eq!(IrEnhancement::parse("no-such"), IrEnhancement::Cimss);
+        assert_eq!(IrEnhancement::parse(""), IrEnhancement::Cimss);
+    }
+
+    #[test]
+    fn bd_curve_is_stepped_at_the_nesdis_breakpoints() {
+        let gray = |bt: f32| {
+            let [r, g, b, a] = anchor_color(bt, BD_CURVE);
+            assert_eq!(a, 255);
+            assert!(r == g && g == b, "BD is grayscale at {bt} K: {r},{g},{b}");
+            r
+        };
+        // Hard steps: an exact boundary belongs to the COLDER bin, and one
+        // hundredth of a Kelvin warmer flips the shade with no blending.
+        assert_eq!(gray(209.95), 0, "-63.2 C is (cold-side) black");
+        assert_eq!(gray(209.96), 160, "just warmer than -63.2 C is light gray");
+        assert_eq!(gray(219.95), 160, "-53.2 C is (cold-side) light gray");
+        assert_eq!(gray(219.96), 112, "just warmer than -53.2 C is medium gray");
+        assert_eq!(gray(231.96), 64, "just warmer than -41.2 C is dark gray");
+        assert_eq!(gray(192.95), 88, "-80.2 C and colder repeat cold dark gray");
+        assert_eq!(gray(170.0), 88, "deep cold stays cold dark gray");
+        assert_eq!(gray(193.0), 136, "-80.15 C is cold medium gray");
+        assert_eq!(gray(200.0), 255, "-73 C is white");
+        // Flat within a bin — stepped, not a gradient.
+        assert_eq!(gray(220.5), gray(231.0), "medium-gray bin is flat");
+        // The warm scene is a ramp, not a step (off-white -> mid gray).
+        let ramp_cold = gray(250.0);
+        let ramp_warm = gray(275.0);
+        assert!(
+            ramp_cold > ramp_warm && ramp_warm > 110,
+            "off-white ramp descends warmward: {ramp_cold} -> {ramp_warm}"
+        );
+        assert_eq!(gray(310.0), 0, "hot surface clamps black");
+    }
+
+    #[test]
+    fn avn_and_funktop_step_at_their_curve_boundaries() {
+        // AVN: yellow -> blue step at -38.5 C (234.65 K).
+        let [r, g, b, _] = anchor_color(234.60, AVN_IR);
+        assert!(
+            r > 130 && g > 130 && b < 40,
+            "cold side is yellow: {r},{g},{b}"
+        );
+        let [r, g, b, _] = anchor_color(234.70, AVN_IR);
+        assert!(b > 150 && r < 20, "warm side is blue: {r},{g},{b}");
+        // AVN: coldest overshoots are white above the anvil gray.
+        assert_eq!(anchor_color(168.0, AVN_IR), [255, 255, 255, 255]);
+        let [r, g, b, _] = anchor_color(185.0, AVN_IR);
+        assert!(
+            r == 88 && g == 88 && b == 88,
+            "anvil-core gray: {r},{g},{b}"
+        );
+
+        // Funktop: dark red (cold side) -> cyan (warm side) step at -58.0 C
+        // (215.15 K): colder than -58 is the red deep-convection bin, warmer
+        // is the cyan mid-cloud ramp.
+        let [r, g, b, _] = anchor_color(215.10, FUNKTOP_IR);
+        assert!(
+            r > 50 && g < 30 && b < 30,
+            "cold side is dark red: {r},{g},{b}"
+        );
+        let [r, g, b, _] = anchor_color(215.20, FUNKTOP_IR);
+        assert!(g > 200 && b > 220, "warm side is cyan: {r},{g},{b}");
+        // Funktop: pink band between -70.5 and -78 C.
+        let [r, g, b, _] = anchor_color(199.0, FUNKTOP_IR);
+        assert!(
+            r > 240 && g > 60 && g < 150 && b > 60,
+            "pink band: {r},{g},{b}"
+        );
+    }
+
+    #[test]
+    fn ahi_ir_counts_calibrate_to_true_kelvin() {
+        // Block-5 calibration read from a REAL Himawari-9 B13 segment
+        // (HS_H09_20260706_0600_B13_FLDK_R20_S0710): expected temperatures
+        // are hand-computed from the JMA HSD §4.4 scheme with these exact
+        // coefficients (inverse Planck at 10.4074 um, then the quadratic
+        // Te -> Tb correction).
+        let calibration = HimawariCalibrationInfo {
+            band_number: 13,
+            central_wavelength_um: 10.4074,
+            valid_bits_per_pixel: 12,
+            error_pixel_count: 65535,
+            outside_scan_count: 65534,
+            count_to_radiance_slope: -0.0037525074318633814,
+            count_to_radiance_intercept: 15.197657722429469,
+            planck_or_albedo_coefficients: [
+                -0.118260812197365,
+                1.00101143081895,
+                -1.80800453227613e-6,
+            ],
+            inverse_planck_coefficients: Some([
+                0.118211645089097,
+                0.998989021775474,
+                1.80702978762378e-6,
+            ]),
+            physical_constants: Some(rw_sat::himawari::HimawariPhysicalConstants {
+                speed_of_light_m_s: 299_792_458.0,
+                planck_constant_j_s: 6.62606957e-34,
+                boltzmann_constant_j_k: 1.3806488e-23,
+            }),
+        };
+        let counts = [400.0, 1500.0, 2500.0, 3500.0, f32::NAN, 4096.0];
+        let bt = ahi_counts_to_brightness_temperature(&counts, &calibration)
+            .expect("IR calibration converts");
+        let expected: [f64; 4] = [323.044884, 298.340541, 269.602675, 224.425914];
+        for (index, want) in expected.iter().enumerate() {
+            assert!(
+                (f64::from(bt[index]) - want).abs() < 5.0e-3,
+                "count {} -> {} K, want {want} K",
+                counts[index],
+                bt[index]
+            );
+        }
+        assert!(bt[4].is_nan(), "error-sentinel count stays NaN");
+        assert!(
+            bt[5].is_nan(),
+            "negative radiance (count past the intercept) is non-physical"
+        );
+
+        // A visible band (no Planck constants) refuses IR calibration.
+        let visible = HimawariCalibrationInfo {
+            band_number: 1,
+            inverse_planck_coefficients: None,
+            physical_constants: None,
+            ..calibration
+        };
+        assert!(ahi_counts_to_brightness_temperature(&counts, &visible).is_err());
     }
 
     #[test]
@@ -4154,7 +4688,16 @@ mod tests {
         let bt = synthetic_hurricane_bt(nx, ny);
 
         let started = std::time::Instant::now();
-        let pixels = render_sat_pixels("cmi_c13", 13, &bt, nx, ny, false, false);
+        let pixels = render_sat_pixels(
+            "cmi_c13",
+            13,
+            &bt,
+            nx,
+            ny,
+            false,
+            false,
+            IrEnhancement::Cimss,
+        );
         let render_ms = started.elapsed().as_secs_f64() * 1000.0;
         eprintln!("enhanced-IR render of {nx}x{ny} took {render_ms:.2} ms");
 
@@ -4185,7 +4728,16 @@ mod tests {
     fn ir_map_overlay_alpha_fades_warm_by_temperature() {
         // Kelvin: warm surface, mid cloud, cold storm top.
         let values = vec![290.0, 255.0, 210.0];
-        let overlay = render_sat_pixels("cmi_c13", 13, &values, 3, 1, false, true);
+        let overlay = render_sat_pixels(
+            "cmi_c13",
+            13,
+            &values,
+            3,
+            1,
+            false,
+            true,
+            IrEnhancement::Cimss,
+        );
 
         assert_eq!(
             overlay[0].a(),
@@ -4199,7 +4751,16 @@ mod tests {
         assert!(overlay[2].a() > 200, "cold storm top (-63 C) stays visible");
 
         // The full-screen player keeps the palette opaque (no BT fade).
-        let player = render_sat_pixels("cmi_c13", 13, &values, 3, 1, false, false);
+        let player = render_sat_pixels(
+            "cmi_c13",
+            13,
+            &values,
+            3,
+            1,
+            false,
+            false,
+            IrEnhancement::Cimss,
+        );
         assert!(player[0].a() > 200, "player keeps warm pixels opaque");
     }
 
@@ -4895,6 +5456,183 @@ mod tests {
         eprintln!(
             "WINDOW PROOF summary: native {}x{} vs default crop {crop_w}x{crop_h} upscaled {scale}x",
             native.image.size[0], native.image.size[1],
+        );
+    }
+
+    /// Load one stored BT frame, print/assert absolute-Kelvin validation
+    /// stats (coldest convective top on the disk + the clear-sky warm end
+    /// inside a known tropical ocean box), and export the proof PNG set:
+    /// the legacy auto-stretch "before" plus BD / CIMSS / Funktop / AVN.
+    fn export_ir_proof_set(
+        store: &Path,
+        key: &SatRunKey,
+        hhmm: u16,
+        out_dir: &Path,
+        stem: &str,
+        ocean_box: (f32, f32, f32, f32), // lat_min, lat_max, lon_min, lon_max
+    ) {
+        let run_dir = store.join(&key.model).join(&key.run);
+        let reader = HourReader::open(&run_dir.join(frame_file_name(hhmm))).expect("frame opens");
+        let meta = reader.meta();
+        let variable = meta
+            .variables
+            .iter()
+            .find(|var| var.kind == "surface2d")
+            .expect("frame holds a 2D variable");
+        let band = selector_band(&variable.selector, &variable.name).expect("band selector");
+        let name = variable.name.clone();
+        let (nx, ny) = (meta.nx, meta.ny);
+        let values = reader.read_full_2d(&name).expect("frame values read");
+
+        let grid = GridFile::open(&run_dir.join("grid.rwg")).expect("run grid opens");
+        let flip_rows = grid.lat_descending() == Some(false);
+        let mut coldest = f32::INFINITY;
+        let mut ocean: Vec<f32> = Vec::new();
+        for (index, &bt) in values.iter().enumerate() {
+            if !bt.is_finite() {
+                continue;
+            }
+            // Stats over GEOLOCATED pixels only: a handful of limb/space
+            // pixels carry valid-looking counts whose radiance is near zero
+            // (BT < 100 K); their scan angles miss the earth, so the stored
+            // mesh marks them NaN and they must not pollute the coldest-top
+            // validation.
+            let (lat, lon) = (grid.lat[index], grid.lon[index]);
+            if !(lat.is_finite() && lon.is_finite()) {
+                continue;
+            }
+            coldest = coldest.min(bt);
+            if lat >= ocean_box.0 && lat <= ocean_box.1 && lon >= ocean_box.2 && lon <= ocean_box.3
+            {
+                ocean.push(bt);
+            }
+        }
+        ocean.sort_by(|a, b| a.total_cmp(b));
+        let warm = ocean
+            .get((ocean.len().saturating_sub(1)) * 99 / 100)
+            .copied()
+            .unwrap_or(f32::NAN);
+        eprintln!(
+            "IRPAL {stem} {nx}x{ny} band={band} var={name}: coldest top {coldest:.2} K, \
+             clear-sky tropical-ocean p99 {warm:.2} K ({} box samples)",
+            ocean.len()
+        );
+        assert!(
+            (160.0..=235.0).contains(&coldest),
+            "coldest convective top is plausible Kelvin: {coldest}"
+        );
+        assert!(
+            (280.0..=300.0).contains(&warm),
+            "clear-sky tropical ocean warm end is plausible Kelvin: {warm}"
+        );
+
+        let save = |suffix: &str, pixels: Vec<Color32>| {
+            let mut rgba = Vec::with_capacity(pixels.len() * 4);
+            for pixel in &pixels {
+                rgba.extend_from_slice(&[pixel.r(), pixel.g(), pixel.b(), pixel.a()]);
+            }
+            let image =
+                image::RgbaImage::from_raw(nx as u32, ny as u32, rgba).expect("proof image dims");
+            let path = out_dir.join(format!("{stem}_{suffix}.png"));
+            image.save(&path).expect("proof png writes");
+            eprintln!("IRPAL wrote {}", path.display());
+        };
+        save(
+            "before_stretch",
+            render_ahi_legacy_stretch(&values, nx, ny, flip_rows, false),
+        );
+        for (suffix, enhancement) in [
+            ("bd", IrEnhancement::Bd),
+            ("cimss", IrEnhancement::Cimss),
+            ("funktop", IrEnhancement::Funktop),
+            ("avn", IrEnhancement::Avn),
+        ] {
+            save(
+                suffix,
+                render_sat_pixels(&name, band, &values, nx, ny, flip_rows, false, enhancement),
+            );
+        }
+    }
+
+    /// End-to-end proof on LIVE open data for the true-Kelvin + enhancement
+    /// work: ingest the latest Himawari-9 B13 full disk through the block-5
+    /// calibration and the latest GOES-19 full-disk C13, validate absolute
+    /// BT (clear-sky tropical ocean ~285-295 K, coldest convective top
+    /// ~180-210 K), and export before/after enhancement PNGs. Gated behind
+    /// `BOWECHO_IR_PALETTE_PROOF_DIR` so CI stays offline.
+    #[test]
+    fn export_ir_palette_proof_pngs_when_env_is_set() {
+        let Some(out_dir) = std::env::var_os("BOWECHO_IR_PALETTE_PROOF_DIR").map(PathBuf::from)
+        else {
+            return;
+        };
+        std::fs::create_dir_all(&out_dir).expect("proof output dir");
+        let store = std::env::temp_dir().join("bowecho-ir-palette-proof-store");
+        std::fs::create_dir_all(&store).expect("proof store dir");
+        let sink = |response: SatResponse| {
+            if let SatResponse::Note(message) = &response {
+                eprintln!("IRPAL note: {message}");
+            }
+            true
+        };
+
+        // Himawari-9 B13 full disk through the true-Kelvin ingest.
+        let himawari_spec = HimawariQuickSpec {
+            band: 13,
+            downsample: 4,
+            ..HimawariQuickSpec::default()
+        };
+        let summary =
+            ingest_latest_himawari(&store, &himawari_spec, &sink).expect("live Himawari ingest");
+        eprintln!("IRPAL himawari: {summary}");
+        let runs = scan_runs(&store);
+        let run = runs
+            .iter()
+            .find(|run| run.key.model == "h9" || run.key.model == "h8")
+            .expect("a Himawari run was written");
+        let hhmm = *run.frames.last().expect("Himawari run has a frame");
+        // West-Pacific tropical ocean east of the Philippines (Guam-ish).
+        export_ir_proof_set(
+            &store,
+            &run.key,
+            hhmm,
+            &out_dir,
+            "himawari_b13",
+            (5.0, 20.0, 135.0, 160.0),
+        );
+
+        // GOES-19 C13 full disk: one poll through the follow engine (the
+        // same path LoadLoop uses).
+        let mut goes_spec = spec();
+        goes_spec.sector = "fulldisk".to_string();
+        goes_spec.layer = "c13".to_string();
+        goes_spec.downsample = 4;
+        let mut config = follow_config(&goes_spec, &store).expect("GOES spec resolves");
+        config.max_polls = Some(1);
+        config.max_frames = Some(1);
+        config.poll_interval = Some(Duration::from_secs(1));
+        config.jitter_frac = 0.0;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut goes_sink = |event: SatEvent| {
+            if let SatEvent::Info { message } = &event {
+                eprintln!("IRPAL goes: {message}");
+            }
+        };
+        rw_sat::follow(&config, &mut goes_sink, &cancel).expect("live GOES follow");
+        let runs = scan_runs(&store);
+        let run = runs
+            .iter()
+            .find(|run| run.key.model == "g19")
+            .expect("a GOES-19 run was written");
+        let hhmm = *run.frames.last().expect("GOES run has a frame");
+        // Tropical Atlantic ocean northeast of South America.
+        export_ir_proof_set(
+            &store,
+            &run.key,
+            hhmm,
+            &out_dir,
+            "goes19_b13",
+            (5.0, 20.0, -55.0, -40.0),
         );
     }
 }

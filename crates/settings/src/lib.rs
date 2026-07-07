@@ -549,6 +549,12 @@ pub struct AppSettings {
     /// state dies with the process — this map is what survives restarts.
     #[serde(default)]
     pub sidebar_section_open: BTreeMap<String, bool>,
+    /// Satellite IR enhancement slug applied to Kelvin brightness-temperature
+    /// bands (GOES ABI / Himawari AHI 7-16): "cimss" (default rainbow),
+    /// "bd" (Dvorak BD curve), "avn", "funktop", "rainbow", "gray".
+    /// Unknown slugs fall back to "cimss" at use sites (app_ui/sat_worker.rs).
+    #[serde(default = "default_sat_ir_enhancement")]
+    pub sat_ir_enhancement: String,
     /// Last-used NWP model slug for the Download panel / one-click ingest
     /// ("hrrr", "gfs", ...). Unknown or no-longer-supported slugs fall
     /// back to HRRR at use sites.
@@ -574,6 +580,10 @@ fn default_units() -> String {
 
 fn default_time_zone() -> String {
     "utc".to_owned()
+}
+
+fn default_sat_ir_enhancement() -> String {
+    "cimss".to_owned()
 }
 
 fn default_model_slug() -> String {
@@ -839,6 +849,7 @@ impl Default for AppSettings {
             wrf_synth_radar: None,
             data_dir: String::new(),
             sidebar_section_open: BTreeMap::new(),
+            sat_ir_enhancement: default_sat_ir_enhancement(),
             model_slug: default_model_slug(),
             units: default_units(),
             time_zone: default_time_zone(),
@@ -1488,6 +1499,21 @@ mod tests {
         assert_eq!(back.sat_native_window_lat_e6, -8_250_000);
         assert_eq!(back.sat_native_window_lon_e6, -100_240_000);
         assert_eq!(back.sat_native_window_size_km, 500);
+    }
+
+    #[test]
+    fn sat_ir_enhancement_defaults_and_round_trips() {
+        // Old configs (no key) keep the CIMSS-style rainbow enhancement.
+        let old = AppSettings::from_json("{}");
+        assert_eq!(old.sat_ir_enhancement, "cimss");
+
+        let s = AppSettings {
+            sat_ir_enhancement: "bd".to_owned(),
+            ..Default::default()
+        };
+        let back = AppSettings::from_json(&s.to_json());
+        assert_eq!(back.sat_ir_enhancement, "bd");
+        assert_eq!(back, s);
     }
 
     #[test]

@@ -2536,6 +2536,10 @@ struct ViewerApp {
     sat_run_listings: Vec<rw_ui::SatRunListing>,
     show_satellite: bool,
     himawari_band: u8,
+    /// Selected IR enhancement for Kelvin BT bands (GOES + Himawari),
+    /// persisted via `AppSettings::sat_ir_enhancement` and applied by the
+    /// sat worker at frame-coloring time.
+    sat_ir_enhancement: sat_worker::IrEnhancement,
     /// Selected GOES ABI RGB composite style slug for the one-shot
     /// true/natural-color ingest (`natural_color`, `geocolor`, ...).
     goes_composite_style: String,
@@ -7367,6 +7371,8 @@ impl ViewerApp {
             _ => PanelLayout::One,
         };
         let restored_basemap_style = tiles::TileStyle::from_key(&app_settings.basemap_style);
+        let restored_sat_ir_enhancement =
+            sat_worker::IrEnhancement::parse(&app_settings.sat_ir_enhancement);
         let restored_bold_labels = app_settings.bold_labels;
         let restored_gate_filter_dbz = app_settings.gate_filter_decidbz.map(|d| d as f32 / 10.0);
         let restored_placefile_slots: Vec<PlacefileSlot> = app_settings
@@ -7560,6 +7566,7 @@ impl ViewerApp {
             sat_run_listings: Vec::new(),
             show_satellite: false,
             himawari_band: 13,
+            sat_ir_enhancement: restored_sat_ir_enhancement,
             goes_composite_style: "natural_color".to_string(),
             sat_window_enabled: restored_sat_window.0,
             sat_window_lat_deg: restored_sat_window.1,
@@ -31084,6 +31091,9 @@ impl ViewerApp {
         worker.send(sat_worker::SatRequest::Validate(
             self.sat_panel.spec().clone(),
         ));
+        worker.send(sat_worker::SatRequest::SetIrEnhancement(
+            self.sat_ir_enhancement,
+        ));
         worker.send(sat_worker::SatRequest::Scan);
         self.sat = Some(worker);
     }
@@ -31372,6 +31382,47 @@ impl ViewerApp {
                 }
             });
             if let Some((key, hhmm)) = map_request {
+                self.request_sat_map_frame(key, hhmm);
+            }
+        }
+        let mut selected_enhancement = self.sat_ir_enhancement;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("IR enhancement");
+            egui::ComboBox::from_id_salt("sat_ir_enhancement")
+                .selected_text(selected_enhancement.label())
+                .width(170.0)
+                .show_ui(ui, |ui| {
+                    for option in sat_worker::IrEnhancement::ALL {
+                        ui.selectable_value(&mut selected_enhancement, option, option.label());
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Absolute-temperature color curve for IR brightness-temperature bands \
+                     (GOES ABI and Himawari AHI 7-16): CIMSS ramp, the Dvorak BD curve, \
+                     AVN, Funktop, rainbow, or plain grayscale.",
+                );
+        });
+        if selected_enhancement != self.sat_ir_enhancement {
+            self.sat_ir_enhancement = selected_enhancement;
+            self.app_settings.sat_ir_enhancement = selected_enhancement.slug().to_string();
+            let _ = self.app_settings.save();
+            if let Some(sat) = &self.sat {
+                sat.send(sat_worker::SatRequest::SetIrEnhancement(
+                    selected_enhancement,
+                ));
+                // Recolor what is on screen: the player's current frame and,
+                // if the satellite map layer is up, the map frame too.
+                if let Some((key, hhmm)) = self.sat_last_frame.clone() {
+                    sat.send(sat_worker::SatRequest::LoadFrame {
+                        key: key.clone(),
+                        hhmm,
+                    });
+                }
+            }
+            if self.sat_layer.is_some()
+                && let Some((key, hhmm)) = self.sat_last_frame.clone()
+            {
                 self.request_sat_map_frame(key, hhmm);
             }
         }
@@ -73502,6 +73553,7 @@ mod tests {
             sat_run_listings: Vec::new(),
             show_satellite: false,
             himawari_band: 13,
+            sat_ir_enhancement: sat_worker::IrEnhancement::default(),
             goes_composite_style: "natural_color".to_string(),
             sat_window_enabled: false,
             sat_window_lat_deg: 13.5,
