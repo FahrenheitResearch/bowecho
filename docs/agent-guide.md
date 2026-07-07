@@ -1,0 +1,80 @@
+# Working with BowEcho — the agent guide
+
+BowEcho: Rust/egui/wgpu weather radar + satellite desktop app (Windows/mac/Linux).
+Owner: drew. You are expected to work like the sessions that built v0.29–v0.30:
+recon by reading code, implement in a worktree, gate on the build nodes, report
+like an engineer. This file tells you where everything lives and the rules that
+are not negotiable.
+
+## Repos, branches, remotes
+
+- Dev repo: `C:\Users\drew\radar-work\wt-experiments` — branch `integration/loopfix-plus-rusty` is the integration line. Remote `claude` = github FahrenheitResearch/radar-rs-analyst-claude (push integration here).
+- Public repo: github FahrenheitResearch/bowecho (remote `bowecho`). Its `main` is ONLY ever fast-forwarded to a vetted integration commit at release time. Never commit dev churn to it.
+- Build nodes have their own bare repos (see gates below).
+
+## HARD RULES (violating these is how agents get fired)
+
+1. **NEVER run cargo/rustc on this Windows machine.** A PreToolUse hook blocks it. The ONE sanctioned local build is the RC/release smoke: `env -u CARGO_BUILD_JOBS cargo build --release -p app_ui --bin bowecho` (run it in background; copy exe to Desktop as `BowEcho vX.Y RCn.exe` for the owner to test).
+2. **All verification on the build nodes** — node3 = `drew@192.168.68.56`, node4 = `drew@192.168.68.57`:
+   - First: `git push node3|node4 HEAD:refs/heads/<branch>` — the verify script fetches from the NODE's local bare repo (`/home/drew/bowecho.git`); pushing only to origin exits 3.
+   - Then each gate FOREGROUND (Bash timeout 600000; NEVER background-and-walk-away; on client timeout just re-run — node caches make retries fast):
+     `ssh -o BatchMode=yes drew@<ip> "flock -w 3600 /tmp/bowecho-verify.lock env BOWECHO_BRANCH='<branch>' bash ~/bowecho-verify.sh <cargo args>"`
+   - The gate trio for EVERY commit: `fmt --all --check` · `clippy --workspace --all-targets -- -D warnings` · `test --workspace`. Expect exact test arithmetic: baseline + exactly your new tests, 0 failed. Establish the baseline by running the base tip if unsure.
+3. **Never touch `~/weather` on the nodes** (owner's data). Node4 builds live at /home/drew/weather/data/bowecho-build — the script handles it.
+4. **WRF discipline**: small fixtures in tests; the Enderlin run (owner's `wrf_demo` folder, 2.4 GB, 800×800×79) at most 1–2 passes and only on nodes/owner request; NEVER the heavy full-diagnostics import on it; never `getvar` 3-D fields in bulk (wrf-core memoizes f64 intermediates → measured 8.87 GB; use `WrfFile::read_var` streaming — see docs/wrf-import-large-grids.md). Import workers run at below-normal thread priority (`wrf_process::lower_import_thread_priority`) — the owner's machine has hard-crashed under all-core memory-bandwidth load.
+5. **Never claim fixed/working without real-data proof through OUR code path.** h5py/python decoding a file proves nothing about our decoder (this exact gap shipped a broken Spain integration for one RC). Precedent: ignored live tests run once on a node (`ord.rs`/`meteoromania.rs` live roundtrips), real-file fixtures vendored for regressions.
+6. **Machine feeds only** — REST/S3/API endpoints; never scrape HTML for data (parsing an autoindex directory listing is fine).
+7. **Credit policy**: Solarpower07 and grayskieswx by handle ONLY, never real names. Follow existing credit surfaces (README, `guide.rs` sources) — don't invent new ones. Color-table internal names are NOT user-facing text.
+8. **Parallelism**: a few concurrent agents fine; never a swarm of build-heavy ones. Don't run heavy verifies while the owner is live-testing an RC.
+9. **Checkpoint or die**: commit early and often on your branch (uncommitted worktrees have been lost to crashes); append progress/findings to `C:\Users\drew\radar-work\<task>-notes.md` as you go. On relaunch, resume from notes/branch.
+
+## The workflow (per task)
+
+1. Worktree off the integration tip: `git -C /c/Users/drew/radar-work/wt-experiments worktree add ../wt-<name> -b <branch> <tip>`. Work ONLY there.
+2. Recon first, by CONTENT — line numbers in docs drift; find code by names. Write recon findings to your notes file before coding.
+3. Implement. New feature code goes in modules/crates, never appended to `app_ui/src/main.rs` — a ratchet test (`crates/app_ui/tests/main_rs_line_ratchet.rs`) enforces a shrinking line ceiling. Refactor moves follow the move-only protocol in docs/main-decomposition-plan.md (byte-identical bodies; only use/mod/pub(crate) edits; verify with `git diff --color-moved=dimmed-zebra`).
+4. Gate the branch tip (trio above). Report to the integrator with: branch, final sha, files changed, what moved/changed and why, visibility promotions, tests added, gate results with exact counts, anything deliberately left out.
+5. Integration (if you are the integrator): squash-merge onto integration. If the branch was cut from the current tip, verify `git rev-parse HEAD^{tree} <branch-tip>^{tree}` are equal → gated-tree identity, no re-gate. Stale base or conflicts → resolve (understand WHY each conflict exists — a "clean" auto-merge once nearly duplicated a relocated test) and RE-GATE the merged tree on a node before pushing `claude`.
+
+## Repo map — where everything lives
+
+`crates/app_ui/src/` (the app; main.rs ≈ 67.7k lines and shrinking):
+- `main.rs` — ViewerApp struct (~330 fields), radar loading/loop engine, eframe update, map painting (the 15k-line paint block is the last un-extracted region; see decomposition plan). Palette gate for model layers: `model_layer_solar_table` (~line 4784) — precedence: user 🎨 override → Solar table → production style → viridis fallback.
+- Extracted modules (v0.30): `self_update.rs` (update checks; also the streaming-download + sha256 pattern), `hazard_geom.rs` (pure hazard geometry/parse/fill), `hazard_ui.rs` (hazard panels/paint), `product_select.rs` (product/cut selection), `settings_ui.rs` (settings panels), `sat_paint.rs` (sat window/worker pump/map layer/LUT cache), `geo_helpers.rs`.
+- Satellite: `sat_window.rs` (geostationary navigation math — CGMS scan angles, GOES/Himawari sub-lons, native windows), `sat_worker.rs` (ingest workers, true-color composites, true-Kelvin IR + `ir_enhancement_anchors` BD/CIMSS/etc., sat store write contract `{token}_c{band:02}_{day}`).
+- Tropical: `tropical.rs` (storm cards incl. 🛰 Vis/IR one-press sat views, JTWC vitals).
+- Model/WRF: `model_data.rs` (model dock boundary; display-time label translation for raw `wrf_*` vars; `attach_solar_fallback_style` — the seam where style-less wrf fields get Solar compiled into `field.style`, WITH the friendly label as title because rw-ui prints `style.title` as plot title + viewer heading), `model_data/iso_fields.rs` (upper-air: synthesizes per-level picker entries 925–250 mb from `*_iso` volumes, background slicer), `model_layer.rs` (map layer), `local_import.rs` (LIGHT import: fast `read_var` 2-D planes + iso volumes; 4-dim vars skipped), `wrf_process.rs` (heavy full-diagnostics import), `wrf_volumes.rs` (native→isobaric interpolation, 37 levels, feeds skew-T), `wrf_radar.rs` (synthetic radar forward operator: virtual NEXRAD, 14-tilt ladder, 4/3-earth beam height/ground range per Doviak & Zrnić eq 2.28b/c, Stoelinga/Thompson reflectivity, Sun & Crook radial velocity; samples beam CENTERLINE — no beam broadening/attenuation/terrain blockage yet), `vol3d.rs` (wgpu volume raymarch + egui_wgpu callback pattern — the GPU precedent).
+- Other: `layers_rail.rs`, `overlays.rs`, `dock.rs`, `guide.rs` (in-app manual + credits/sources), `brand.rs` (branding + canonical repo URL fallbacks), `italy_dpc.rs` (native Italy radar), `data_packs.rs` (radar scene packs).
+- `crates/app_ui/tests/main_rs_line_ratchet.rs` — the ratchet. Lower the ceiling when you shrink main.rs.
+
+`crates/color_tables/` — palettes: `solar.rs` (Solarpower07 WRF-Runner ports: reflectivity/temp/dewpoint/RH/wind/CAPE + per-level 250/500/700/850 mb + °C-native surface; level-aware resolver `solar_model_field_table(var, units)` — slugs like `temperature_850` hit level tables; unit-aware K/°C/°F), `wrf_fields.rs` (174-entry raw-wrf-var catalog: labels/descriptions/family hints), `iso_levels.rs` (iso slug↔label naming contract).
+
+`crates/data_source/` — feeds: `international/ord.rs` (EUMETNET ORD/CloudFerro EU single-site radar: `ORD_LIVE_COUNTRIES`/`ORD_SITES` incl. Spain's 11 AEMET sites, split-PVOL merge grammar), `international/meteoromania.rs` (native ANM Romania dual-pol; in-place-rewrite feed quirk → 9-min settle window), `international/fixtures/` (listing fixtures). Site pickers consume `data_source::international::intl_static_sites()`.
+
+`crates/nexrad_io/` — decoders: `hdf5lite.rs` (minimal HDF5 reader; v1 AND v2 'OHDR/OCHK' object headers with Jenkins lookup3 checksums — AEMET writes the v2 dialect), `odim.rs` (ODIM decode; `rstart > 20 km ⇒ metres` sanity rule for AEMET), real-file fixtures in `tests/data/`.
+
+PINNED, UNMODIFIABLE deps (fix at app seams, never in them): rusty-weather crates (`rw_ui` — FieldViewerPanel/plot viewer/SatPlayerPanel/skew-T; `rw_store` — the store; `rw_sat` — geostationary math), `wrf-core` (getvar/read_var), `netcrust` (NetCDF). 12 pinned git deps total.
+
+## Testing facts
+
+- Nodes are headless Linux: no GPU, no golden images. Test with pure math, CPU reference kernels, real-file fixtures, `#[ignore]` live tests run once on a node for proof.
+- Test counts are exact currency: every landing states `baseline + N new, 0 failed`. If your count drifts, something is wrong — find it.
+- Env-gated heavy fixtures precedent: `RW_LOCAL_IMPORT_FIXTURE` / `RW_WRF_CRASH_FIXTURE`.
+
+## RC + release process
+
+- RC loop: build the sanctioned local release exe → `Desktop\BowEcho vX.Y RCn.exe` → owner live-tests → every complaint becomes a same-day fix agent → next RC. Owner reports are the acceptance test.
+- Release: bump workspace version (root Cargo.toml + Cargo.lock, sed is fine, gates verify) → notes at `docs/releases/vX.Y.Z.md` → FF `bowecho/main` to the vetted tip + annotated tag `vX.Y.Z` → release.yml builds 7 signed assets (win x64/x64-v3/arm64, mac intel/AS, linux x64/arm64) → publish-release fires when ALL 7 succeed.
+- Known trap: Apple notarization HTTP 403 "required agreement is missing" = Apple published new legal terms; owner clicks Agree at developer.apple.com, then `gh run rerun <id> -R FahrenheitResearch/bowecho --failed`. Certs/secrets are fine — do not debug them. Azure signing key is correct in secrets — never resurface "rotate secret".
+
+## Plans & state (read the one for your task)
+
+- `docs/main-decomposition-plan.md` — main.rs decomposition. Done through queue #7 + sat_paint; REMAINING: `map_paint.rs` (~15k, in sub-moves, after the LoopEngine field migration) and phase 2 (state absorption).
+- `docs/simsat-engine-plan.md` — v0.31 headline: standalone physically-based simulated-satellite renderer (SimSat Studio), iGPU hardware floor. §12 is the implementer handoff — start there.
+- `docs/wrf-import-large-grids.md` — binding memory constraints, Enderlin facts, upstream reader gaps.
+- `docs/releases/` — shipped notes. `C:\Users\drew\radar-work\FABLE_BACKLOG.md` — owner's backlog/doc of record.
+- Open follow-ups usually live in the session task list; standing ideas: WRF description-attr fallback labels; radar forward-operator "next level" (Gaussian beam-broadening integration, attenuation, terrain blockage — wrf_radar.rs is the home, radar_core has the beam math); France radar (needs OAuth + BUFR — own project); KNMI 7-year archive (needs KNMI-native HDF5 decoder).
+
+## Report style (what the owner expects)
+
+Lead with the outcome. Exact numbers (line counts, test counts, sha). Say what you deliberately did NOT do and why. Never claim visual behavior you couldn't verify — describe what the code does and let the owner's RC test confirm. When you find something mid-task that contradicts the brief, say so and adapt — the code is the truth, docs get corrected.
