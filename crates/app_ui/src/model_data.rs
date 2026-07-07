@@ -421,6 +421,12 @@ pub struct ModelDataDock {
     /// floating window when `show_plot_viewer` is set.
     plot_viewer: PlotViewerPanel,
     show_plot_viewer: bool,
+    /// v0.30 RC4: the (model, run) whose NATIVE domain extent was last
+    /// seeded as the plot viewer's active domain (see
+    /// [`native_plot_domain`]). One-shot per run — after seeding, the
+    /// panel's own domain controls (including its "Full grid" choice) are
+    /// never fought.
+    native_plot_seeded_run: Option<(String, String)>,
     /// v0.29.3 gesture-collision fix: while true, the NEXT drag on the radar
     /// map draws the plot domain — no modifiers, and none of the map's other
     /// gestures (pan, loupe, soundings, 3D box) fire. Armed by the 📐 button
@@ -490,6 +496,7 @@ impl ModelDataDock {
             map_request: None,
             plot_viewer: PlotViewerPanel::new(),
             show_plot_viewer: false,
+            native_plot_seeded_run: None,
             plot_domain_armed: false,
             color_tables: ColorTableEditorPanel::new(),
             show_color_tables: false,
@@ -582,7 +589,7 @@ impl ModelDataDock {
         }
         match result {
             Ok(mut field) => {
-                attach_solar_fallback_style(&mut field);
+                attach_solar_fallback_style(&mut field, &self.hour_store_vars);
                 self.latest_field = Some(std::sync::Arc::new(field.clone()));
                 field.key = display;
                 self.viewer.set_field(field);
@@ -655,7 +662,7 @@ impl ModelDataDock {
                         // store variables. Only the viewer's copy carries the
                         // display label, so its stale-check matches the
                         // label-named selection.
-                        attach_solar_fallback_style(&mut field);
+                        attach_solar_fallback_style(&mut field, &self.hour_store_vars);
                         self.latest_field = Some(std::sync::Arc::new(field.clone()));
                         field.key = display_field_key(field.key, &self.hour_store_vars);
                         self.viewer.set_field(field);
@@ -713,6 +720,30 @@ impl ModelDataDock {
         self.plot_domain_armed = false;
         self.show_plot_viewer = true;
         self.plot_viewer.set_active_domain(domain);
+    }
+
+    /// v0.30 RC4 fix — seed the run's NATIVE extent as the plot viewer's
+    /// active domain, once per (model, run) and only while no domain is
+    /// active. The pinned rw-ui panel derives its canvas aspect ONLY from
+    /// an active domain; a domain-less "Full grid" plot uses a fixed
+    /// default-wide canvas, which crammed the owner's square 800×800 local
+    /// domain against a wall of dead whitespace. With the seed, the
+    /// native-domain plot rides exactly the drawn-box request path
+    /// (extent-derived aspect). Wide CONUS-scale runs seed nothing
+    /// ([`native_plot_domain`]) and keep today's Full-grid request
+    /// untouched; the one-shot marker means the panel's own domain
+    /// controls (including "Full grid") are never fought afterwards.
+    fn seed_native_plot_domain(&mut self, field: &rw_ui::FieldData) {
+        let run = (field.key.hour.model.clone(), field.key.hour.run.clone());
+        if self.native_plot_seeded_run.as_ref() == Some(&run) {
+            return;
+        }
+        self.native_plot_seeded_run = Some(run);
+        if self.plot_viewer.active_domain().is_none()
+            && let Some(domain) = native_plot_domain(field)
+        {
+            self.plot_viewer.set_active_domain(domain);
+        }
     }
 
     #[cfg(test)]
@@ -1938,21 +1969,27 @@ impl ModelDataDock {
         // after the field viewer so a domain selected this frame shows at once.
         // The STORE-NAMED twin of the viewer's field goes in (the native plot
         // pipeline styles by store variable, and the viewer's copy may carry
-        // a display label). Borrows `self.viewer`/`self.latest_field`
-        // immutably while the closure holds `&mut self.plot_viewer` —
-        // disjoint fields, so this is sound.
+        // a display label).
         if self.show_plot_viewer {
-            let field = store_named_current_field(
+            // Cloned out as an owned Arc (cheap) so the RC4 domain seed
+            // below can borrow `self` mutably before the window closure.
+            let field: Option<std::sync::Arc<rw_ui::FieldData>> = store_named_current_field(
                 &self.viewer,
                 self.latest_field.as_deref(),
                 &self.hour_store_vars,
-            );
+            )
+            .is_some()
+            .then(|| self.latest_field.clone())
+            .flatten();
+            if let Some(field) = &field {
+                self.seed_native_plot_domain(field);
+            }
             let mut open = true;
             egui::Window::new("🗺 Native plot")
                 .open(&mut open)
                 .default_size([560.0, 440.0])
                 .show(ui.ctx(), |ui| {
-                    self.plot_viewer.ui(ui, field);
+                    self.plot_viewer.ui(ui, field.as_deref());
                 });
             if !open {
                 self.show_plot_viewer = false;
@@ -2200,7 +2237,16 @@ pub(crate) fn user_style_override_active(
 /// (non-`wrf` slugs) are untouched, and on the MAP the layer's `model_table`
 /// still outranks the production colormap this style compiles to — same
 /// Solar table, so map pixels are unchanged.
-fn attach_solar_fallback_style(field: &mut rw_ui::FieldData) {
+///
+/// v0.30 RC4 fix — the compiled style's `title` (what the rw-ui FIELD
+/// VIEWER prints as the field heading, and what the native plot titles)
+/// carries the field's FRIENDLY display label — the same label the picker
+/// shows ([`display_var_name`]: wrf_fields catalog label for raw `wrf_*`
+/// vars, iso-level label like "Temperature 850 mb" for synthesized slugs,
+/// the store name itself otherwise). The Solar [`color_tables::ColorTable`]
+/// name ("Solar Temperature", …) is an internal palette id and must never
+/// surface user-facing.
+fn attach_solar_fallback_style(field: &mut rw_ui::FieldData, hour_store_vars: &[String]) {
     if field.style.is_some() {
         return;
     }
@@ -2212,7 +2258,9 @@ fn attach_solar_fallback_style(field: &mut rw_ui::FieldData) {
     let Some(table) = color_tables::solar_model_field_table(&field.key.var, &field.units) else {
         return;
     };
-    field.style = solar_table_store_style(&table, &field.units);
+    let title =
+        display_var_name(&field.key.var, hour_store_vars).unwrap_or_else(|| field.key.var.clone());
+    field.style = solar_table_store_style(&table, &field.units, &title);
 }
 
 /// Compile a Solar [`color_tables::ColorTable`] into the store-style form
@@ -2225,9 +2273,15 @@ fn attach_solar_fallback_style(field: &mut rw_ui::FieldData) {
 /// color↔value correspondence. Extend=Both matches `ColorTable::sample`'s
 /// clamp-at-both-ends, and transparent stops (e.g. the reflectivity
 /// clear-air mask) carry through as transparent bin colors.
+///
+/// `title` is the field's friendly display label (see
+/// [`attach_solar_fallback_style`]) — it becomes `StoreVariableStyle::title`,
+/// the string the viewer panel and native plot print. The table's own name
+/// is a palette id, not a title.
 fn solar_table_store_style(
     table: &color_tables::ColorTable,
     units: &str,
+    title: &str,
 ) -> Option<rustwx_products::viewer::StoreVariableStyle> {
     let stops = table.stops();
     let lo = f64::from(stops.first()?.value);
@@ -2246,8 +2300,8 @@ fn solar_table_store_style(
         .map(|pair| table.sample(((pair[0] + pair[1]) * 0.5) as f32).to_array())
         .collect();
     let user = rw_ui::UserColorTable {
-        name: table.name().to_owned(),
-        title: table.name().to_owned(),
+        name: title.to_owned(),
+        title: title.to_owned(),
         display_units: units.to_owned(),
         convert: rw_ui::UserUnitConvert::None,
         legend_mode: rw_ui::UserLegendMode::Stepped,
@@ -2257,7 +2311,57 @@ fn solar_table_store_style(
         levels,
         colors,
     };
-    user.to_store_style(table.name(), units)
+    user.to_store_style(title, units)
+}
+
+/// v0.30 RC4 fix — the native-domain plot's request extent.
+///
+/// Owner report: a native plot of his square 800×800 (250 m) domain drew
+/// the map as a square crammed into a wide canvas with dead whitespace
+/// before the far-right colorbar, while DRAWING a custom plot box over the
+/// same data sized correctly. Divergence: the pinned rw-ui
+/// `PlotViewerPanel` derives its canvas aspect from the ACTIVE domain's
+/// extent (`domain_plot_aspect`), but a domain-less "Full grid" plot uses
+/// a fixed default-wide (16:9) canvas. The renderer is pinned, so the fix
+/// is what app_ui passes: the run's native grid extent, seeded as the
+/// active domain ([`ModelDataDock::ui`]) so it rides the drawn-box request
+/// path — square extent → square canvas + colorbar, no dead space.
+///
+/// Wide (CONUS-scale) extents return `None`: they already fill the default
+/// canvas, and only the domain-less path gives them the pinned renderer's
+/// full-domain projected frame (the classic CONUS look) — their request
+/// params must stay exactly today's. The spans mirror rustwx-products'
+/// `full_domain_projected_frame_default` thresholds (lat ≥ 25°, lon ≥ 45°).
+fn native_plot_domain(field: &rw_ui::FieldData) -> Option<CustomDomain> {
+    let grid = field.grid.as_ref()?;
+    let (west, east, south, north) = grid_geographic_extent(&grid.lat, &grid.lon)?;
+    if (north - south) >= 25.0 || (east - west) >= 45.0 {
+        return None;
+    }
+    Some(CustomDomain::generated((west, east, south, north)))
+}
+
+/// Finite min/max lat/lon of a run grid — the same extent the pinned
+/// plot pipeline computes for its domain-less render bounds (rw-ui
+/// `geographic_bounds`), so the seeded domain frames exactly the data.
+/// `None` when the grid has no finite points.
+fn grid_geographic_extent(lat: &[f32], lon: &[f32]) -> Option<(f64, f64, f64, f64)> {
+    let mut west = f64::INFINITY;
+    let mut east = f64::NEG_INFINITY;
+    let mut south = f64::INFINITY;
+    let mut north = f64::NEG_INFINITY;
+    for (&lat, &lon) in lat.iter().zip(lon) {
+        let (lat, lon) = (f64::from(lat), f64::from(lon));
+        if !lat.is_finite() || !lon.is_finite() {
+            continue;
+        }
+        south = south.min(lat);
+        north = north.max(lat);
+        west = west.min(lon);
+        east = east.max(lon);
+    }
+    (west.is_finite() && east.is_finite() && south.is_finite() && north.is_finite())
+        .then_some((west, east, south, north))
 }
 
 #[cfg(test)]
@@ -2711,6 +2815,131 @@ mod tests {
         assert_eq!(domain.rotation_deg, 0.0);
     }
 
+    /// Field with a synthetic run grid spanning `bounds` (west, east,
+    /// south, north) — corner values are f32-exact so extent assertions
+    /// can be equalities.
+    fn plot_seed_field(model: &str, run: &str, bounds: (f64, f64, f64, f64)) -> rw_ui::FieldData {
+        let (west, east, south, north) = bounds;
+        const N: usize = 9;
+        let mut lat = Vec::with_capacity(N * N);
+        let mut lon = Vec::with_capacity(N * N);
+        for row in 0..N {
+            for col in 0..N {
+                lat.push((south + (north - south) * row as f64 / (N - 1) as f64) as f32);
+                lon.push((west + (east - west) * col as f64 / (N - 1) as f64) as f32);
+            }
+        }
+        let mut field = override_test_field("dewpoint_2m");
+        field.key.hour.model = model.to_owned();
+        field.key.hour.run = run.to_owned();
+        field.nx = N;
+        field.ny = N;
+        field.values = vec![0.0; N * N];
+        field.grid = Some(std::sync::Arc::new(rw_store::grid::GridFile {
+            nx: N,
+            ny: N,
+            lat,
+            lon,
+            projection: None,
+            hash: "plot-seed-test".to_owned(),
+        }));
+        field
+    }
+
+    /// RC4 owner report: the native plot of a square 800×800 local domain
+    /// letterboxed into the pinned panel's default-wide canvas. The
+    /// request-side derivation must hand the drawn-box path the run's
+    /// exact native extent for modest domains — implying a square canvas
+    /// for a square domain — and must hand WIDE (CONUS-scale) extents
+    /// NOTHING, so their Full-grid request params stay exactly today's.
+    #[test]
+    fn native_plot_domain_derives_square_extent_and_skips_wide_domains() {
+        // (a) The owner's 800×800 @ 250 m shape: ~200 km square around
+        // 38.4°N. Extent passes through exactly; the implied canvas aspect
+        // (the same cos-weighted ratio the pinned drawn-box path derives)
+        // is square.
+        let square = plot_seed_field("wrf", "19740608_00z", (-100.0, -97.75, 37.5, 39.25));
+        let domain = native_plot_domain(&square).expect("square native domain seeds");
+        assert_eq!(domain.bounds, (-100.0, -97.75, 37.5, 39.25));
+        assert_eq!(domain.rotation_deg, 0.0);
+        assert!(
+            domain.name.starts_with("domain "),
+            "generated name, same as a drawn box: {}",
+            domain.name
+        );
+        let (west, east, south, north) = domain.bounds;
+        let implied_aspect =
+            ((east - west) * ((south + north) * 0.5).to_radians().cos()) / (north - south);
+        assert!(
+            (implied_aspect - 1.0).abs() < 0.05,
+            "square domain must imply a square canvas, got {implied_aspect}"
+        );
+
+        // (b) Wide extents: CONUS-scale lat span (≥ 25°) or lon span
+        // (≥ 45°) — unchanged params vs today (no domain seeded, the
+        // pinned Full-grid pipeline keeps its default canvas and
+        // full-domain projected frame).
+        let lat_wide = plot_seed_field("hrrr", "20260618_00z", (-122.0, -72.0, 21.0, 53.0));
+        assert!(native_plot_domain(&lat_wide).is_none());
+        let lon_wide = plot_seed_field("hrrr", "20260618_00z", (-120.0, -70.0, 30.0, 44.0));
+        assert!(native_plot_domain(&lon_wide).is_none());
+
+        // Degenerate inputs never seed: no grid / no finite points.
+        let no_grid = override_test_field("dewpoint_2m");
+        assert!(native_plot_domain(&no_grid).is_none());
+        let mut nan_grid = plot_seed_field("wrf", "19740608_00z", (-100.0, -97.75, 37.5, 39.25));
+        {
+            let grid = std::sync::Arc::get_mut(nan_grid.grid.as_mut().expect("grid set"))
+                .expect("sole owner");
+            grid.lat.fill(f32::NAN);
+            grid.lon.fill(f32::NAN);
+        }
+        assert!(native_plot_domain(&nan_grid).is_none());
+    }
+
+    /// RC4: the dock seeds the native extent as the plot domain ONCE per
+    /// (model, run) and never fights an existing domain — a drawn box
+    /// stays exactly what the user drew, and wide runs stay domain-less.
+    #[test]
+    fn native_plot_seed_is_one_shot_and_respects_user_domains() {
+        let ctx = egui::Context::default();
+        let mut dock =
+            ModelDataDock::new_for_test(&ctx, tree_with_runs("wrf", &[("19740608_00z", &[0])]));
+        let square = plot_seed_field("wrf", "19740608_00z", (-100.0, -97.75, 37.5, 39.25));
+
+        dock.seed_native_plot_domain(&square);
+        let seeded = dock
+            .plot_viewer
+            .active_domain()
+            .expect("square native domain becomes the active plot domain");
+        assert_eq!(seeded.bounds, (-100.0, -97.75, 37.5, 39.25));
+
+        // A user-drawn box replaces it; re-showing the same run must NOT
+        // re-seed over the user's choice.
+        dock.apply_map_plot_domain(CustomDomain::generated((-99.0, -98.5, 38.0, 38.5)));
+        dock.seed_native_plot_domain(&square);
+        assert_eq!(
+            dock.plot_viewer
+                .active_domain()
+                .expect("domain kept")
+                .bounds,
+            (-99.0, -98.5, 38.0, 38.5),
+            "seeding is one-shot per run — user domains win"
+        );
+
+        // Wide runs: seeding is a no-op, the Full-grid (domain-less)
+        // request keeps today's params.
+        let ctx2 = egui::Context::default();
+        let mut wide_dock =
+            ModelDataDock::new_for_test(&ctx2, tree_with_runs("hrrr", &[("20260618_00z", &[0])]));
+        let wide = plot_seed_field("hrrr", "20260618_00z", (-122.0, -72.0, 21.0, 53.0));
+        wide_dock.seed_native_plot_domain(&wide);
+        assert!(
+            wide_dock.plot_viewer.active_domain().is_none(),
+            "CONUS-scale native plots stay on the domain-less path"
+        );
+    }
+
     #[test]
     fn synth_radar_state_round_trips_and_serde_defaults() {
         // Default → JSON → back is identity (what settings persistence does).
@@ -3084,20 +3313,51 @@ mod tests {
     /// their current look byte-for-byte.
     #[test]
     fn solar_fallback_respects_existing_styles_and_model_scope() {
-        // Local WRF field with no style -> Solar attaches.
+        // Local WRF field with no style -> Solar attaches. The style's
+        // title is the field's FRIENDLY label (what the picker shows), not
+        // the color table's internal "Solar …" name (RC4 owner report: every
+        // raw/iso field titled "Solar Temperature" in the viewer).
         let mut field = override_test_field("temperature_850");
-        attach_solar_fallback_style(&mut field);
+        attach_solar_fallback_style(&mut field, &[]);
         let style = field.style.expect("temperature_850 (K) resolves Solar");
         let table = color_tables::solar_model_field_table("temperature_850", "K")
             .expect("resolver covers the slug");
-        assert_eq!(style.title, table.name());
+        assert_eq!(style.title, "Temperature 850 mb");
+        assert!(
+            !style.title.contains("Solar"),
+            "color-table names are palette ids, never user-facing titles"
+        );
         assert_style_tracks_table(&style, &table, &[255.0, 270.0, 288.0]);
+
+        // The owner's exact RC4 repro: a 300 mb temperature plot titled
+        // "Solar Temperature". The pinned native plot pipeline prints
+        // `style.title` verbatim as the generated plot's top-left title
+        // (rw-ui `render_field_plot`: `style.title`, or
+        // `"{style.title} - {domain.name}"` with an active plot domain) —
+        // so the compiled style must already carry the friendly label.
+        let mut t300 = override_test_field("temperature_300");
+        attach_solar_fallback_style(&mut t300, &[]);
+        let t300_style = t300.style.expect("temperature_300 (K) resolves Solar");
+        assert_eq!(t300_style.title, "Temperature 300 mb");
+        let plot_title = format!("{} - {}", t300_style.title, "domain 38.5 -98.8");
+        assert_eq!(plot_title, "Temperature 300 mb - domain 38.5 -98.8");
+        assert!(!plot_title.contains("Solar"));
+
+        // A slug that is a REAL hour variable keeps its store name as the
+        // title (mirror of the picker's pass-through for unknown/canonical
+        // names — no iso label is invented for it).
+        let mut real_850 = override_test_field("temperature_850");
+        attach_solar_fallback_style(&mut real_850, &["temperature_850".to_owned()]);
+        assert_eq!(
+            real_850.style.expect("Solar still attaches").title,
+            "temperature_850"
+        );
 
         // An existing style is the user's/production truth — untouched.
         let mut styled = override_test_field("temperature_2m");
         styled.style = rw_ui::UserColorTable::simple("My temp", "My temp", "K")
             .to_store_style("temperature_2m", "K");
-        attach_solar_fallback_style(&mut styled);
+        attach_solar_fallback_style(&mut styled, &[]);
         assert_eq!(
             styled.style.expect("style kept").title,
             "My temp",
@@ -3107,13 +3367,13 @@ mod tests {
         // Downloaded models keep their production/generic behavior.
         let mut hrrr = override_test_field("temperature_850");
         hrrr.key.hour.model = "hrrr".to_owned();
-        attach_solar_fallback_style(&mut hrrr);
+        attach_solar_fallback_style(&mut hrrr, &[]);
         assert!(hrrr.style.is_none(), "non-wrf models are out of scope");
 
         // A variable with no Solar counterpart keeps the generic ramp.
         let mut orography = override_test_field("orography");
         orography.units = "m".to_owned();
-        attach_solar_fallback_style(&mut orography);
+        attach_solar_fallback_style(&mut orography, &[]);
         assert!(orography.style.is_none());
     }
 
@@ -3160,18 +3420,28 @@ mod tests {
             .style
             .as_ref()
             .expect("Solar fallback style must be attached to the iso plane");
+        // RC4 owner report: the viewer titled every iso field with the
+        // COLOR TABLE's internal name ("Solar Temperature"). The style must
+        // carry the same friendly label the picker shows instead.
+        assert_eq!(style.title, "Temperature 850 mb");
+        assert!(
+            !style.title.contains("Solar"),
+            "palette id must never surface as the field title"
+        );
         let table = color_tables::solar_model_field_table("temperature_850", "K")
             .expect("resolver covers the slug");
         assert_style_tracks_table(style, &table, &[271.0, 274.0, 281.0]);
 
         // The viewer's display-named copy carries the same style — this is
-        // what the field viewer actually paints.
+        // what the field viewer actually paints (and titles).
         let viewer_field = dock.viewer.current_field().expect("viewer got the field");
         assert_eq!(viewer_field.key.var, "Temperature 850 mb");
-        assert!(
-            viewer_field.style.is_some(),
-            "viewer paints Solar, not viridis"
-        );
+        let viewer_style = viewer_field
+            .style
+            .as_ref()
+            .expect("viewer paints Solar, not viridis");
+        assert_eq!(viewer_style.title, "Temperature 850 mb");
+        assert!(!viewer_style.title.contains("Solar"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3208,8 +3478,26 @@ mod tests {
             "characterizes the worker gap the dock seam exists to fill"
         );
 
-        attach_solar_fallback_style(&mut field);
+        let hour_store_vars = vec![
+            "temperature_2m".to_owned(),
+            "wrf_swdnb".to_owned(),
+            "temperature_iso".to_owned(),
+        ];
+        attach_solar_fallback_style(&mut field, &hour_store_vars);
         let style = field.style.expect("Solar radiation ramp attached");
+        // RC4: the style titles the field by its wrf_fields catalog label
+        // (what the picker shows), never by the palette's "Solar …" name.
+        // This string IS the generated plot's title (pinned rw-ui
+        // `render_field_plot` prints `style.title` top-left) and the dock
+        // viewer's heading.
+        assert_eq!(
+            style.title,
+            color_tables::wrf_display_label("wrf_swdnb").expect("catalog label exists")
+        );
+        assert!(
+            !style.title.contains("Solar"),
+            "palette id must never surface as the plot title"
+        );
         let table = color_tables::solar_model_field_table("wrf_swdnb", "W m-2")
             .expect("resolver covers the catalog entry");
         assert_style_tracks_table(&style, &table, &[100.0, 550.0, 1000.0]);
