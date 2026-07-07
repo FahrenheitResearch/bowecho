@@ -236,11 +236,18 @@ impl ViewerApp {
             // rail (same label the model dock picker shows); the hover keeps
             // the real store name plus the catalog's one-line description.
             let wrf_info = color_tables::wrf_field_info(&layer.field.key.var);
+            // Synthesized per-level isobaric fields carry their slug
+            // (`temperature_850`) — show the picker's label for them too.
+            let iso_label = match wrf_info {
+                Some(_) => None,
+                None => color_tables::parse_iso_slug(&layer.field.key.var).map(|spec| spec.label()),
+            };
             let name = grid_source
                 .map(|source| source.short_label().to_owned())
                 .unwrap_or_else(|| {
                     let label = wrf_info
                         .map(|info| info.label)
+                        .or(iso_label.as_deref())
                         .unwrap_or(&layer.field.key.var);
                     format!("{} f{:02}", label, layer.field.key.hour.hour)
                 });
@@ -249,8 +256,8 @@ impl ViewerApp {
             });
             let grid_fetching = grid_source.is_some() && grid_source == self.grid_composite_loading;
             let name_hover = grid_source.map_or_else(
-                || match wrf_info {
-                    Some(info) => format!(
+                || match (wrf_info, &iso_label) {
+                    (Some(info), _) => format!(
                         "{} ({}) — store field {}\n{}\nLayers draw bottom-to-top in list order\nNewest: {}",
                         info.label,
                         layer.field.units,
@@ -258,7 +265,11 @@ impl ViewerApp {
                         info.description,
                         newest_run_text
                     ),
-                    None => format!(
+                    (None, Some(label)) => format!(
+                        "{} ({}) — {} plane from the hour's isobaric sounding volumes\nLayers draw bottom-to-top in list order\nNewest: {}",
+                        label, layer.field.units, layer.field.key.var, newest_run_text
+                    ),
+                    (None, None) => format!(
                         "{} ({}) — layers draw bottom-to-top in list order\nNewest: {}",
                         layer.field.key.var, layer.field.units, newest_run_text
                     ),

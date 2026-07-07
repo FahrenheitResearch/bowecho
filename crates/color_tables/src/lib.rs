@@ -11,6 +11,15 @@ pub mod solar;
 /// display-time renaming.
 pub mod wrf_fields;
 
+/// Naming contract (labels ↔ store-style slugs) for the per-level isobaric
+/// map fields the Model Data dock synthesizes from the `*_iso` sounding
+/// volumes. Consumed by the dock's display-time synthesis and the Solar
+/// resolver's level-aware lookups.
+pub mod iso_levels;
+
+pub use iso_levels::{
+    ISO_PICKER_LEVELS_HPA, IsoLevelField, IsoLevelSpec, parse_iso_label, parse_iso_slug,
+};
 pub use solar::{
     solar_cape_table, solar_model_field_table, solar_reflectivity_table,
     solar_relative_humidity_table, solar_vorticity_table,

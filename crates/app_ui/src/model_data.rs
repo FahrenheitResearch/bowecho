@@ -14,6 +14,10 @@ use rw_ui::{
 };
 use std::path::PathBuf;
 
+/// Background loader for the synthesized per-level isobaric map fields
+/// (the rw-ui worker cannot read `pressure3d` planes).
+mod iso_fields;
+
 /// A running local WRF/NetCDF ingest, spawned from the dock's import controls.
 /// Both variants write into the same model store the dock browses, so a
 /// finished import is picked up by [`ModelDataDock::rescan`] and its runs then
@@ -448,6 +452,19 @@ pub struct ModelDataDock {
     // Read only by the rfd-gated (windows/macos) import UI.
     #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     pending_light_import: Option<PendingLightImport>,
+    /// Store-variable names of the hour currently in the viewer, captured
+    /// from its `HourVars` response. Load routing + display translation
+    /// guard: a name that IS a real store variable always loads through the
+    /// rw-ui worker (and keeps its own name), even if it happens to look
+    /// like a synthesized iso-level slug; only synthesized names go to the
+    /// iso plane loader.
+    hour_store_vars: Vec<String>,
+    /// In-flight background load of a synthesized per-level isobaric field
+    /// (one at a time; drained in [`Self::poll_iso_load`]).
+    iso_load: Option<iso_fields::IsoFieldLoadTask>,
+    /// Newest iso-level load requested while one was in flight (slug-named;
+    /// latest wins — mirrors the rw-ui worker's request coalescing).
+    iso_load_pending: Option<rw_ui::FieldKey>,
 }
 
 impl ModelDataDock {
@@ -480,6 +497,9 @@ impl ModelDataDock {
             synth_radar: SyntheticRadarUiState::default(),
             pending_heavy_import: None,
             pending_light_import: None,
+            hour_store_vars: Vec::new(),
+            iso_load: None,
+            iso_load_pending: None,
         }
     }
 
@@ -493,8 +513,82 @@ impl ModelDataDock {
         self.plot_viewer.clear();
         if let Some(field) = self.viewer.wanted_field() {
             self.viewer.set_loading(&field.var);
-            self.worker
-                .send(StoreRequest::LoadField(store_field_key(field)));
+            self.request_field_load(field);
+        }
+    }
+
+    /// Route a picker load: synthesized iso-level names go to the
+    /// background plane loader (the rw-ui worker's `LoadField` reads
+    /// `surface2d` tiles and cannot serve a `pressure3d` plane), everything
+    /// else to the worker as before. `wanted` is display-named, exactly as
+    /// [`FieldViewerPanel::wanted_field`] produces it; callers have already
+    /// set the loading state.
+    fn request_field_load(&mut self, wanted: rw_ui::FieldKey) {
+        let store = store_field_key(wanted);
+        match iso_route(&store.var, &self.hour_store_vars) {
+            Some(spec) => {
+                if self.iso_load.is_some() {
+                    // One volume read at a time; the newest request wins
+                    // when the in-flight one lands (worker-style
+                    // coalescing, so hour scrubbing never queues a backlog).
+                    self.iso_load_pending = Some(store);
+                } else {
+                    self.iso_load = Some(iso_fields::spawn_load(
+                        self.store_root.clone(),
+                        store,
+                        spec,
+                        self.color_tables.settings().clone().normalized(),
+                        self.repaint.clone(),
+                    ));
+                }
+            }
+            None => self.worker.send(StoreRequest::LoadField(store)),
+        }
+    }
+
+    /// Drain the iso-level plane loader — the loader-side mirror of the
+    /// worker's `Field` response handling: stale results (no longer the
+    /// viewer's wanted field) are dropped, `latest_field` keeps the slug
+    /// (store-style) name for map layers / Solar palettes / 🎨 bindings,
+    /// and only the viewer's copy carries the display label.
+    fn poll_iso_load(&mut self) {
+        let Some(task) = &self.iso_load else {
+            return;
+        };
+        let result = match task.rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("Isobaric field loader stopped unexpectedly".to_string())
+            }
+        };
+        let key = self.iso_load.take().expect("checked above").key;
+        // Start the coalesced follow-up first, so a scrub burst keeps
+        // exactly one read in flight with no idle gap.
+        if let Some(pending) = self.iso_load_pending.take()
+            && let Some(spec) = color_tables::parse_iso_slug(&pending.var)
+        {
+            self.iso_load = Some(iso_fields::spawn_load(
+                self.store_root.clone(),
+                pending,
+                spec,
+                self.color_tables.settings().clone().normalized(),
+                self.repaint.clone(),
+            ));
+        }
+        let display = display_field_key(key, &self.hour_store_vars);
+        if self.viewer.wanted_field().as_ref() != Some(&display) {
+            return; // stale — the selection moved on while we read
+        }
+        match result {
+            Ok(mut field) => {
+                self.latest_field = Some(std::sync::Arc::new(field.clone()));
+                field.key = display;
+                self.viewer.set_field(field);
+            }
+            Err(message) => {
+                self.viewer.set_error(message);
+            }
         }
     }
 
@@ -513,6 +607,7 @@ impl ModelDataDock {
     /// reference host).
     fn handle_responses(&mut self) {
         self.poll_import();
+        self.poll_iso_load();
         while let Some(response) = self.worker.try_recv() {
             match response {
                 StoreResponse::Tree(tree) => {
@@ -536,13 +631,15 @@ impl ModelDataDock {
                 StoreResponse::HourVars(key, Ok(vars)) => {
                     if self.browser.selected() == Some(&key) {
                         // Raw wrf_* vars show their catalog labels in the
-                        // picker; the load below translates back to store
-                        // names (`store_field_key`).
+                        // picker, and the hour's `*_iso` sounding volumes
+                        // gain per-level 2-D entries ("Temperature 850 mb");
+                        // the load below translates back to store names /
+                        // iso planes (`request_field_load`).
+                        self.hour_store_vars = vars.iter().map(|var| var.name.clone()).collect();
                         self.viewer.set_hour(key, viewer_display_vars(vars));
                         if let Some(field) = self.viewer.wanted_field() {
                             self.viewer.set_loading(&field.var);
-                            self.worker
-                                .send(StoreRequest::LoadField(store_field_key(field)));
+                            self.request_field_load(field);
                         }
                     }
                 }
@@ -558,11 +655,11 @@ impl ModelDataDock {
                         // display label, so its stale-check matches the
                         // label-named selection.
                         self.latest_field = Some(std::sync::Arc::new(field.clone()));
-                        field.key = display_field_key(field.key);
+                        field.key = display_field_key(field.key, &self.hour_store_vars);
                         self.viewer.set_field(field);
                     }
                     Err(message) => {
-                        let key = display_field_key(key);
+                        let key = display_field_key(key, &self.hour_store_vars);
                         if self.viewer.wanted_field().as_ref() == Some(&key) {
                             self.viewer.set_error(message);
                         }
@@ -1807,10 +1904,10 @@ impl ModelDataDock {
                 Some(FieldViewerEvent::VarSelected(var)) => {
                     self.viewer.set_loading(&var);
                     if let Some(field) = self.viewer.wanted_field() {
-                        // The viewer selects by display label; the worker
-                        // loads by store name.
-                        self.worker
-                            .send(StoreRequest::LoadField(store_field_key(field)));
+                        // The viewer selects by display label; real store
+                        // vars load through the worker, synthesized iso
+                        // levels through the plane loader.
+                        self.request_field_load(field);
                     }
                 }
                 Some(FieldViewerEvent::PointClicked { fx, fy }) => {
@@ -1843,7 +1940,11 @@ impl ModelDataDock {
         // immutably while the closure holds `&mut self.plot_viewer` —
         // disjoint fields, so this is sound.
         if self.show_plot_viewer {
-            let field = store_named_current_field(&self.viewer, self.latest_field.as_deref());
+            let field = store_named_current_field(
+                &self.viewer,
+                self.latest_field.as_deref(),
+                &self.hour_store_vars,
+            );
             let mut open = true;
             egui::Window::new("🗺 Native plot")
                 .open(&mut open)
@@ -1865,7 +1966,11 @@ impl ModelDataDock {
             let mut open = true;
             let mut changed = false;
             {
-                let field = store_named_current_field(&self.viewer, self.latest_field.as_deref());
+                let field = store_named_current_field(
+                    &self.viewer,
+                    self.latest_field.as_deref(),
+                    &self.hour_store_vars,
+                );
                 egui::Window::new("🎨 Color tables")
                     .open(&mut open)
                     .default_size([520.0, 520.0])
@@ -1913,36 +2018,116 @@ fn model_run_time_utc(run: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
 /// Display-time picker names: swap each raw `wrf_*` store variable for its
 /// friendly catalog label (`color_tables::wrf_fields`) before the list
-/// reaches the rw-ui field viewer, whose combo shows `name (units)` verbatim.
-/// Canonical and unknown names pass through untouched. Nothing on disk is
-/// renamed — existing imported stores get the labels without a re-import.
+/// reaches the rw-ui field viewer, whose combo shows `name (units)` verbatim,
+/// and append the synthesized per-level entries for the hour's `*_iso`
+/// sounding volumes ([`iso_level_entries`]). Canonical and unknown names pass
+/// through untouched. Nothing on disk is renamed — existing imported stores
+/// get the labels AND the upper-air fields without a re-import.
 fn viewer_display_vars(mut vars: Vec<rw_ui::VarInfo>) -> Vec<rw_ui::VarInfo> {
+    let synthesized = iso_level_entries(&vars);
     for var in &mut vars {
         if let Some(label) = color_tables::wrf_display_label(&var.name) {
             var.name = label.to_owned();
         }
     }
+    vars.extend(synthesized);
     vars
 }
 
+/// Synthesized per-level picker entries for an hour's `*_iso` sounding
+/// volumes (field-major, high→low pressure): plain `Surface2D` `VarInfo`s
+/// whose names are the [`color_tables::iso_levels`] LABELS, so the pinned
+/// rw-ui picker lists them like any 2-D variable and echoes the label back
+/// on load. A level is offered only when every source volume carries it
+/// (wind speed needs u AND v), and an entry is skipped when the hour
+/// already has a REAL variable claiming the slug or its `hpa`-suffixed
+/// spelling (the downloaded models' extracted per-level 2-D fields) — real
+/// store data always wins over synthesis.
+fn iso_level_entries(vars: &[rw_ui::VarInfo]) -> Vec<rw_ui::VarInfo> {
+    use color_tables::iso_levels::{ISO_PICKER_LEVELS_HPA, IsoLevelField, IsoLevelSpec};
+    let volume = |name: &str| {
+        vars.iter()
+            .find(|var| var.kind == rw_ui::VarKind::Pressure3D && var.name == name)
+    };
+    let taken = |name: &str| vars.iter().any(|var| var.name == name);
+    let mut entries = Vec::new();
+    for field in IsoLevelField::ALL {
+        let Some(sources) = field
+            .source_volumes()
+            .iter()
+            .map(|name| volume(name))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        for level_hpa in ISO_PICKER_LEVELS_HPA {
+            if !sources
+                .iter()
+                .all(|source| source.levels_hpa.contains(&level_hpa))
+            {
+                continue;
+            }
+            let spec = IsoLevelSpec { field, level_hpa };
+            let slug = spec.slug();
+            if taken(&slug) || taken(&format!("{slug}hpa")) {
+                continue;
+            }
+            entries.push(rw_ui::VarInfo {
+                name: spec.label(),
+                units: sources[0].units.clone(),
+                kind: rw_ui::VarKind::Surface2D,
+                levels_hpa: Vec::new(),
+            });
+        }
+    }
+    entries
+}
+
 /// Inverse of [`viewer_display_vars`] for LOAD requests: the viewer selects
-/// by display label, the store worker loads by store name. Catalog labels
-/// always contain a character no store slug can (space/case/arrow — test-
-/// enforced in `color_tables::wrf_fields`), so a real store name can never be
-/// mistranslated here.
+/// by display label, the loads run by store name (real store variables) or
+/// synthesized slug (iso levels). Catalog and iso labels always contain a
+/// character no store slug can (space/case/arrow — test-enforced in
+/// `color_tables`), so a real store name can never be mistranslated here.
 fn store_field_key(mut key: rw_ui::FieldKey) -> rw_ui::FieldKey {
     if let Some(store) = color_tables::wrf_store_name_for_label(&key.var) {
         key.var = store.to_owned();
+    } else if let Some(spec) = color_tables::parse_iso_label(&key.var) {
+        key.var = spec.slug();
     }
     key
+}
+
+/// Iso-loader routing: `Some(spec)` when a STORE-NAMED load key denotes a
+/// synthesized per-level field — i.e. it parses as an iso slug AND is not a
+/// real variable of the hour. The exotic store that genuinely carries a 2-D
+/// `temperature_850` keeps loading it through the rw-ui worker.
+fn iso_route(store_var: &str, hour_store_vars: &[String]) -> Option<color_tables::IsoLevelSpec> {
+    if hour_store_vars.iter().any(|name| name == store_var) {
+        return None;
+    }
+    color_tables::parse_iso_slug(store_var)
+}
+
+/// Display name for a store variable when one applies: `wrf_*` catalog
+/// labels, then synthesized iso-level labels. A name that is a REAL
+/// variable of the hour never takes the iso label (mirror of
+/// [`iso_route`]'s guard), so such a variable round-trips as itself.
+fn display_var_name(store_var: &str, hour_store_vars: &[String]) -> Option<String> {
+    if let Some(label) = color_tables::wrf_display_label(store_var) {
+        return Some(label.to_owned());
+    }
+    if hour_store_vars.iter().any(|name| name == store_var) {
+        return None;
+    }
+    color_tables::parse_iso_slug(store_var).map(|spec| spec.label())
 }
 
 /// Store → display for keys headed INTO the viewer: loaded fields and error
 /// keys must match the viewer's label-named selection or its stale-response
 /// check drops them.
-fn display_field_key(mut key: rw_ui::FieldKey) -> rw_ui::FieldKey {
-    if let Some(label) = color_tables::wrf_display_label(&key.var) {
-        key.var = label.to_owned();
+fn display_field_key(mut key: rw_ui::FieldKey, hour_store_vars: &[String]) -> rw_ui::FieldKey {
+    if let Some(label) = display_var_name(&key.var, hour_store_vars) {
+        key.var = label;
     }
     key
 }
@@ -1955,11 +2140,14 @@ fn display_field_key(mut key: rw_ui::FieldKey) -> rw_ui::FieldKey {
 fn store_named_current_field<'a>(
     viewer: &'a FieldViewerPanel,
     latest: Option<&'a rw_ui::FieldData>,
+    hour_store_vars: &[String],
 ) -> Option<&'a rw_ui::FieldData> {
     let current = viewer.current_field()?;
     latest.filter(|latest| {
         latest.key.hour == current.key.hour
-            && color_tables::wrf_display_label(&latest.key.var).unwrap_or(&latest.key.var)
+            && display_var_name(&latest.key.var, hour_store_vars)
+                .as_deref()
+                .unwrap_or(&latest.key.var)
                 == current.key.var
     })
 }
@@ -2110,10 +2298,13 @@ mod tests {
     #[test]
     fn field_keys_round_trip_between_display_and_store_names() {
         for (store, info) in color_tables::wrf_field_catalog() {
-            let displayed = display_field_key(rw_ui::FieldKey {
-                hour: test_hour_key(),
-                var: (*store).to_owned(),
-            });
+            let displayed = display_field_key(
+                rw_ui::FieldKey {
+                    hour: test_hour_key(),
+                    var: (*store).to_owned(),
+                },
+                &[],
+            );
             assert_eq!(displayed.var, info.label, "{store}: store -> display");
             let restored = store_field_key(displayed);
             assert_eq!(restored.var, *store, "{store}: display -> store");
@@ -2123,9 +2314,167 @@ mod tests {
                 hour: test_hour_key(),
                 var: var.to_owned(),
             };
-            assert_eq!(display_field_key(key.clone()).var, var);
+            assert_eq!(display_field_key(key.clone(), &[]).var, var);
             assert_eq!(store_field_key(key).var, var);
         }
+    }
+
+    fn iso_volume_var(name: &str, units: &str, levels_hpa: &[u16]) -> rw_ui::VarInfo {
+        rw_ui::VarInfo {
+            name: name.to_owned(),
+            units: units.to_owned(),
+            kind: rw_ui::VarKind::Pressure3D,
+            levels_hpa: levels_hpa.to_vec(),
+        }
+    }
+
+    /// The canonical 37-level ladder as stored (descending, 1000 first).
+    fn canonical_ladder() -> Vec<u16> {
+        let mut levels: Vec<u16> = (100..=1000u16).step_by(25).collect();
+        levels.reverse();
+        levels
+    }
+
+    /// Entry synthesis from an hour's variable list: every `*_iso` volume
+    /// present yields its curated per-level 2-D entries with the volume's
+    /// units, appended as `Surface2D` (the only kind the pinned picker
+    /// lists), while the real variables — including the Pressure3D volumes
+    /// themselves — pass through untouched.
+    #[test]
+    fn iso_entries_synthesize_from_the_hour_vars() {
+        let ladder = canonical_ladder();
+        let vars = viewer_display_vars(vec![
+            test_var("temperature_2m", "K"),
+            iso_volume_var("temperature_iso", "K", &ladder),
+            iso_volume_var("dewpoint_iso", "K", &ladder),
+            iso_volume_var("u_iso", "m/s", &ladder),
+            iso_volume_var("v_iso", "m/s", &ladder),
+            iso_volume_var("height_iso", "gpm", &ladder),
+        ]);
+
+        // 4 fields × 6 curated levels appended (no rh_iso in this hour).
+        let synthesized: Vec<&rw_ui::VarInfo> = vars
+            .iter()
+            .filter(|var| var.name.ends_with(" mb"))
+            .collect();
+        assert_eq!(synthesized.len(), 24);
+        assert!(
+            synthesized
+                .iter()
+                .all(|var| var.kind == rw_ui::VarKind::Surface2D && var.levels_hpa.is_empty()),
+            "synthesized entries must be plain 2-D vars for the picker"
+        );
+        let entry = |label: &str| {
+            synthesized
+                .iter()
+                .find(|var| var.name == label)
+                .unwrap_or_else(|| panic!("{label} missing"))
+        };
+        assert_eq!(entry("Temperature 850 mb").units, "K");
+        assert_eq!(entry("Dewpoint 700 mb").units, "K");
+        assert_eq!(entry("Wind speed 500 mb").units, "m/s");
+        assert_eq!(entry("Height 250 mb").units, "gpm");
+        assert!(
+            !vars.iter().any(|var| var.name.starts_with("RH ")),
+            "no rh_iso volume -> no RH entries"
+        );
+        // Originals ride along: the 2-D field and the raw volumes.
+        assert!(vars.iter().any(|var| var.name == "temperature_2m"));
+        assert!(
+            vars.iter()
+                .any(|var| var.name == "temperature_iso" && var.kind == rw_ui::VarKind::Pressure3D)
+        );
+    }
+
+    /// Synthesis guards: no `*_iso` volumes -> no entries; wind needs BOTH
+    /// components; a level is offered only where the volume carries it; a
+    /// real variable claiming the slug (or its `hpa` spelling) suppresses
+    /// the synthesized twin.
+    #[test]
+    fn iso_entry_synthesis_respects_presence_and_collisions() {
+        // No volumes at all.
+        assert!(iso_level_entries(&[test_var("temperature_2m", "K")]).is_empty());
+
+        // u without v: no wind entries, temperature still offered.
+        let ladder = canonical_ladder();
+        let entries = iso_level_entries(&[
+            iso_volume_var("temperature_iso", "K", &ladder),
+            iso_volume_var("u_iso", "m/s", &ladder),
+        ]);
+        assert!(entries.iter().any(|var| var.name == "Temperature 850 mb"));
+        assert!(!entries.iter().any(|var| var.name.starts_with("Wind")));
+
+        // A truncated volume (nothing above 500 hPa) skips the missing
+        // levels but keeps the present ones.
+        let entries = iso_level_entries(&[iso_volume_var(
+            "temperature_iso",
+            "K",
+            &[1000, 925, 850, 700, 500],
+        )]);
+        let names: Vec<&str> = entries.iter().map(|var| var.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Temperature 925 mb",
+                "Temperature 850 mb",
+                "Temperature 700 mb",
+                "Temperature 500 mb",
+            ]
+        );
+
+        // Real per-level variables win over synthesis: the exact slug and
+        // the downloaded models' `hpa`-suffixed spelling both suppress.
+        let entries = iso_level_entries(&[
+            iso_volume_var("temperature_iso", "K", &ladder),
+            test_var("temperature_850", "K"),
+            test_var("temperature_700hpa", "K"),
+        ]);
+        assert!(!entries.iter().any(|var| var.name == "Temperature 850 mb"));
+        assert!(!entries.iter().any(|var| var.name == "Temperature 700 mb"));
+        assert!(entries.iter().any(|var| var.name == "Temperature 500 mb"));
+    }
+
+    /// The load-key contract for synthesized fields: picker label -> slug
+    /// (what the loader and every store-named consumer sees) -> label again
+    /// for the viewer; and the real-variable guard on both the display
+    /// translation and the loader routing.
+    #[test]
+    fn iso_keys_round_trip_and_real_variables_keep_the_worker_path() {
+        let key = |var: &str| rw_ui::FieldKey {
+            hour: test_hour_key(),
+            var: var.to_owned(),
+        };
+        // Label -> slug -> label, for a sample of every field kind.
+        for (label, slug) in [
+            ("Temperature 850 mb", "temperature_850"),
+            ("Dewpoint 700 mb", "dewpoint_700"),
+            ("RH 500 mb", "relative_humidity_500"),
+            ("Wind speed 300 mb", "wind_speed_300"),
+            ("Height 250 mb", "height_250"),
+        ] {
+            let stored = store_field_key(key(label));
+            assert_eq!(stored.var, slug, "{label}: label -> slug");
+            assert_eq!(
+                display_field_key(stored, &[]).var,
+                label,
+                "{slug}: slug -> label"
+            );
+        }
+        // Routing: a synthesized slug goes to the iso loader…
+        let spec = iso_route("temperature_850", &[]).expect("synthesized route");
+        assert_eq!(spec.slug(), "temperature_850");
+        assert_eq!(spec.level_hpa, 850);
+        // …but a REAL store variable of the same name stays on the worker
+        // path and keeps its own display name.
+        let hour_vars = vec!["temperature_850".to_owned()];
+        assert_eq!(iso_route("temperature_850", &hour_vars), None);
+        assert_eq!(
+            display_field_key(key("temperature_850"), &hour_vars).var,
+            "temperature_850"
+        );
+        // Non-iso names never route to the loader.
+        assert_eq!(iso_route("temperature_2m", &[]), None);
+        assert_eq!(iso_route("temperature_850hpa", &[]), None);
     }
 
     /// Size-gate parity: the light import must warn on the same class of

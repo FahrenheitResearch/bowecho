@@ -767,7 +767,63 @@ pub fn solar_model_field_table(var: &str, units: &str) -> Option<ColorTable> {
         return Some(solar_vorticity_table());
     }
 
+    // Geopotential height at a pressure level (`height_500`,
+    // `geopotential_height_500hpa`): the Generic ramp rescaled over the
+    // level's climatological span.
+    if let Some(table) = geopotential_height_level_table(&name, &unit) {
+        return Some(table);
+    }
+
     None
+}
+
+/// Climatological geopotential-height span (gpm) of each isobaric surface
+/// the picker exposes ([`crate::iso_levels::ISO_PICKER_LEVELS_HPA`]) — the
+/// scale for the per-level Generic ramp below. Spans cover deep winter lows
+/// through subtropical highs, so real charts use most of the ramp.
+fn height_level_range_gpm(level_mb: u16) -> Option<(f32, f32)> {
+    Some(match level_mb {
+        925 => (300.0, 1000.0),
+        850 => (1150.0, 1700.0),
+        700 => (2700.0, 3300.0),
+        500 => (4800.0, 6000.0),
+        300 => (8200.0, 9800.0),
+        250 => (9600.0, 11200.0),
+        _ => return None,
+    })
+}
+
+/// Geopotential height at a pressure level (`height_500` — the synthesized
+/// per-level map fields — or a downloaded model's extracted
+/// `geopotential_height_500hpa`): the Analyst Generic sequential ramp
+/// rescaled over the level's climatological span — the same
+/// reuse-not-invention convention as [`crate::wrf_fields`]' `Sequential`
+/// family. `None` for names/units that don't read as level heights, so
+/// surface heights (`orography`, `wrf_hgt`, AGL fields like `height_10m`)
+/// keep their existing behavior. Expects already-lowercased inputs.
+fn geopotential_height_level_table(name: &str, unit: &str) -> Option<ColorTable> {
+    if !matches!(unit, "gpm" | "m") {
+        return None;
+    }
+    let rest = name
+        .strip_prefix("geopotential_height_")
+        .or_else(|| name.strip_prefix("height_"))?;
+    let digits = rest
+        .bytes()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(rest.len());
+    // Only a bare level or an explicit pressure suffix counts — `height_10m`
+    // (metres AGL) must not read as a pressure level.
+    if !matches!(&rest[digits..], "" | "mb" | "hpa") {
+        return None;
+    }
+    let (lo, hi) = height_level_range_gpm(rest[..digits].parse().ok()?)?;
+    Some(rescaled_table(
+        &crate::builtin_generic_table(),
+        "Analyst Generic (scaled)",
+        lo,
+        hi,
+    ))
 }
 
 /// Resolve a [`crate::wrf_fields`] family hint to a concrete table, keyed to
@@ -931,6 +987,43 @@ mod tests {
         let sfc = solar_model_field_table("temperature_2m", "K").expect("sfc temp");
         let expected = solar_temperature_table(TempUnit::Kelvin);
         assert_eq!(sfc.sample(300.0), expected.sample(300.0));
+    }
+
+    /// Per-level geopotential heights take the scaled Generic ramp: both the
+    /// synthesized `height_{lvl}` slugs and the downloaded models' extracted
+    /// `geopotential_height_{lvl}hpa` spellings, gpm or m, one span per
+    /// level. Non-level heights and non-length units stay unresolved.
+    #[test]
+    fn level_heights_take_scaled_generic_ramps() {
+        // Every exposed picker level has a span, and only those levels.
+        for level in crate::ISO_PICKER_LEVELS_HPA {
+            assert!(height_level_range_gpm(level).is_some(), "{level} mb");
+        }
+        assert_eq!(height_level_range_gpm(1000), None);
+        assert_eq!(height_level_range_gpm(450), None);
+
+        let h500 = solar_model_field_table("height_500", "gpm").expect("height_500");
+        // The ramp really spans the level: low vs high heights shade apart.
+        assert_ne!(h500.sample(4850.0), h500.sample(5950.0));
+        // All spellings of the same level resolve the same table.
+        for (var, units) in [
+            ("geopotential_height_500hpa", "gpm"),
+            ("height_500mb", "m"),
+            ("HEIGHT_500", "gpm"),
+        ] {
+            let table = solar_model_field_table(var, units)
+                .unwrap_or_else(|| panic!("{var} ({units}) must resolve"));
+            assert_eq!(table.sample(5640.0), h500.sample(5640.0), "{var}");
+        }
+        // Each level stretches the ramp over its own span.
+        let h850 = solar_model_field_table("height_850", "gpm").expect("height_850");
+        assert_ne!(h850.sample(5640.0), h500.sample(5640.0));
+        // Guards: unit must be a length, the digit run must be a bare level
+        // (metres-AGL suffixes don't count), and off-span levels miss.
+        assert!(solar_model_field_table("height_500", "ft").is_none());
+        assert!(solar_model_field_table("height_10m", "m").is_none());
+        assert!(solar_model_field_table("height_450", "gpm").is_none());
+        assert!(solar_model_field_table("orography", "m").is_none());
     }
 
     #[test]
