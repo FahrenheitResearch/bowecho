@@ -380,11 +380,15 @@ pub fn wind_radii_ring(
 
 /// The convex hull (Andrew's monotone chain, in the lon/lat plane) of a set of
 /// geographic points, returned counter-clockwise and closed (first vertex
-/// repeated). Fewer than three distinct points are returned unchanged. Used to
-/// wrap the 34-kt "wind danger area" envelope around every 34-kt wind-radii ring
-/// along the track. Operating in the lon/lat plane is exact enough for a
-/// single-basin storm well away from a pole or the antimeridian (the West
-/// Pacific warnings this serves sit near 120–150°E).
+/// repeated). Fewer than three distinct points are returned unchanged. This
+/// WAS the 34-kt danger-area construction until v0.29.2: on a recurving track
+/// a convex hull straight-lines from the first circle to the last, so
+/// [`danger_area_34kt`] now builds the tapered [`track_circle_envelope`]
+/// instead; the hull stays as a general helper and as the legacy comparator
+/// in tests and the `tropical_radii_probe` example. Operating in the lon/lat
+/// plane is exact enough for a single-basin storm well away from a pole or
+/// the antimeridian (the West Pacific warnings this serves sit near
+/// 120–150°E).
 pub fn convex_hull(points: &[GeoPoint]) -> Vec<GeoPoint> {
     let mut pts: Vec<GeoPoint> = points.to_vec();
     pts.sort_by(|a, b| {
@@ -423,26 +427,385 @@ pub fn convex_hull(points: &[GeoPoint]) -> Vec<GeoPoint> {
     lower
 }
 
+/// Sampling stride (km) along the envelope's straight tangent edges. The
+/// edges are exactly straight, so the stride only sets how densely the
+/// interior prune can trim an edge that sinks into a neighboring capsule.
+const ENVELOPE_SAMPLE_KM: f32 = 30.0;
+/// Arc sampling step (degrees) for vertex joins, end caps and the
+/// single-circle case. 10° keeps the chord sagitta under 0.4 % of the radius.
+const ENVELOPE_ARC_STEP_DEG: f32 = 10.0;
+/// A boundary candidate sunk deeper than this (km) into one of the corridor's
+/// own capsules is pruned — it belongs to a stretch of offset curve that a
+/// neighboring, bigger/closer circle has swallowed (the inner-bend
+/// "offsets cross" case). True boundary points sit at depth ≈ 0.
+const ENVELOPE_PRUNE_KM: f32 = 1.0;
+/// Consecutive track points closer than this (km) are merged before any
+/// bearing is taken — a near-duplicate forecast position would otherwise
+/// orient an offset from pure position noise.
+const ENVELOPE_MIN_SEG_KM: f32 = 5.0;
+
+/// Great-circle distance (km) between two points on the app's
+/// [`EARTH_RADIUS_KM`] sphere (haversine), consistent with
+/// [`destination_point`].
+fn haversine_km(a: GeoPoint, b: GeoPoint) -> f32 {
+    let (phi1, phi2) = (a.lat.to_radians(), b.lat.to_radians());
+    let half_dphi = (phi2 - phi1) * 0.5;
+    let half_dlam = (b.lon - a.lon).to_radians() * 0.5;
+    let h = half_dphi.sin().powi(2) + phi1.cos() * phi2.cos() * half_dlam.sin().powi(2);
+    2.0 * EARTH_RADIUS_KM * h.sqrt().min(1.0).asin()
+}
+
+/// Initial great-circle bearing (degrees, 0° = true N, clockwise) from `a`
+/// toward `b` — the standard forward-azimuth formula, the exact inverse of
+/// [`destination_point`] (following that bearing for their haversine distance
+/// lands on `b`).
+fn initial_bearing_deg(a: GeoPoint, b: GeoPoint) -> f32 {
+    let (phi1, phi2) = (a.lat.to_radians(), b.lat.to_radians());
+    let dlam = (b.lon - a.lon).to_radians();
+    let y = dlam.sin() * phi2.cos();
+    let x = phi1.cos() * phi2.sin() - phi1.sin() * phi2.cos() * dlam.cos();
+    y.atan2(x).to_degrees()
+}
+
+/// Wrap an angle difference into (-180°, 180°].
+fn wrap_deg_180(deg: f32) -> f32 {
+    let d = deg % 360.0;
+    if d > 180.0 {
+        d - 360.0
+    } else if d < -180.0 {
+        d + 360.0
+    } else {
+        d
+    }
+}
+
+/// Signed distance (km, negative inside) from `x` to the tapered capsule swept
+/// from the circle (`a`, `ra_km`) to the circle `len_km` away along bearing
+/// `theta_ab_deg` with radius `rb_km` — i.e. the union of the linearly
+/// interpolated circles, which equals the convex hull of the two end circles.
+/// Exact on the sphere: `x` is put into cross-track / along-track coordinates
+/// about the segment geodesic and the 1-D convex minimum
+/// `min_s |x − P(s)| − r(s)` is solved in closed form.
+fn capsule_signed_distance_km(
+    x: GeoPoint,
+    a: GeoPoint,
+    ra_km: f32,
+    rb_km: f32,
+    theta_ab_deg: f32,
+    len_km: f32,
+) -> f32 {
+    let d_ax = haversine_km(a, x);
+    if len_km <= 0.0 {
+        return d_ax - ra_km.max(rb_km);
+    }
+    let rel = (initial_bearing_deg(a, x) - theta_ab_deg).to_radians();
+    let ang = d_ax / EARTH_RADIUS_KM;
+    let cross_ang = (ang.sin() * rel.sin()).clamp(-1.0, 1.0).asin();
+    let cross_km = cross_ang.abs() * EARTH_RADIUS_KM;
+    let cos_along = if cross_ang.cos() <= 1e-6 {
+        0.0
+    } else {
+        (ang.cos() / cross_ang.cos()).clamp(-1.0, 1.0)
+    };
+    let mut along_km = cos_along.acos() * EARTH_RADIUS_KM;
+    if rel.cos() < 0.0 {
+        along_km = -along_km;
+    }
+    // Planar sub-problem in (along, cross): minimize
+    // sqrt((along − s)² + cross²) − (ra + m·s) over s ∈ [0, len]. Convex, so
+    // the clamped unconstrained optimum s* = along + cross·m/√(1−m²) is the
+    // minimum (m > 0 pushes the closest swept circle toward the growing end).
+    let m = ((rb_km - ra_km) / len_km).clamp(-0.999, 0.999);
+    let s = (along_km + cross_km * m / (1.0 - m * m).sqrt()).clamp(0.0, len_km);
+    (along_km - s).hypot(cross_km) - (ra_km + m * s)
+}
+
+/// Interior samples of a circular arc around `center`: from bearing
+/// `from_deg`, sweeping `sweep_deg` (positive = clockwise), both endpoints
+/// EXCLUDED (the caller's chain already carries them).
+fn arc_interior_points(
+    center: GeoPoint,
+    r_km: f32,
+    from_deg: f32,
+    sweep_deg: f32,
+) -> Vec<GeoPoint> {
+    if r_km <= 0.0 {
+        return Vec::new();
+    }
+    let steps = (sweep_deg.abs() / ENVELOPE_ARC_STEP_DEG).ceil() as usize;
+    (1..steps)
+        .map(|k| destination_point(center, from_deg + sweep_deg * k as f32 / steps as f32, r_km))
+        .collect()
+}
+
+/// The envelope of per-point circles laid along a (curved) track — the
+/// tropical-cyclone "cone" construction: a tapered buffer of the polyline
+/// `(P_i, r_i)` (radii in NM) whose boundary follows every bend of the track
+/// instead of straight-lining from the first circle to the last the way a
+/// convex hull does.
+///
+/// Geometry, per segment: the exact external tangent to the two end circles —
+/// the offset bearing leans `asin((r_b − r_a)/d)` back from the perpendicular,
+/// so a strong taper still yields true straight tangent edges (a plain
+/// perpendicular offset would sit `r·(1 − cos tilt)` inside the hull at the
+/// small end). At each interior vertex the outer side of the bend walks the
+/// vertex circle's arc between the two tangent contacts; on the inner side the
+/// tangent edges cross, and since both are tangent to the vertex circle their
+/// intersection (the miter) sits on the contact bisector at `r/cos(Δ/2)` —
+/// that corner is emitted instead of a concave arc, and both adjoining edges
+/// are trimmed back to it (`r·tan(Δ/2)` from their contacts) so no sample is
+/// ever left past the crossing. Edge stretches that sink into a NON-adjacent
+/// capsule (segments much shorter than the radii — the JTWC West-Pacific
+/// regime, where 6–12-h track steps are ~150 NM under 260-NM gale radii) are
+/// pruned by an exact point-in-tapered-capsule test; together the trim and
+/// the prune keep the inner side of a sharp bend from self-looping. Round
+/// caps close
+/// both ends (a half circle widened/narrowed by the local tilt), and the ring
+/// is emitted left edge forward → end cap → right edge backward → start cap,
+/// closed (first point repeated).
+///
+/// Consecutive points closer than [`ENVELOPE_MIN_SEG_KM`], or whose circle
+/// lies entirely inside a neighbor's (`d ≤ |r_a − r_b|`), are merged keeping
+/// the larger circle, so duplicate forecast positions can't orient an offset
+/// from noise. One surviving circle returns just that circle; an empty input
+/// (or all-zero radii) returns nothing. Coordinates are geographic degrees
+/// with true spherical offsets ([`destination_point`], matching
+/// [`wind_radii_ring`]), valid single-basin away from the poles and the
+/// antimeridian like the rest of this module's overlay geometry.
+pub fn track_circle_envelope(points_nm: &[(GeoPoint, f32)]) -> Vec<GeoPoint> {
+    // -- sanitize, convert to km, merge duplicate/contained neighbors --------
+    let mut discs: Vec<(GeoPoint, f32)> = points_nm
+        .iter()
+        .filter(|(p, r)| p.lon.is_finite() && p.lat.is_finite() && r.is_finite())
+        .map(|&(p, r)| (p, r.max(0.0) * KM_PER_NM))
+        .collect();
+    loop {
+        let before = discs.len();
+        let mut i = 0;
+        while i + 1 < discs.len() {
+            let d = haversine_km(discs[i].0, discs[i + 1].0);
+            if d <= ENVELOPE_MIN_SEG_KM.max((discs[i].1 - discs[i + 1].1).abs()) {
+                let keep = if discs[i + 1].1 >= discs[i].1 {
+                    discs[i + 1]
+                } else {
+                    discs[i]
+                };
+                discs[i] = keep;
+                discs.remove(i + 1);
+            } else {
+                i += 1;
+            }
+        }
+        if discs.len() == before {
+            break;
+        }
+    }
+    match discs.as_slice() {
+        [] => return Vec::new(),
+        &[(center, r_km)] => {
+            if r_km <= 0.0 {
+                return Vec::new();
+            }
+            let steps = (360.0 / ENVELOPE_ARC_STEP_DEG).ceil() as usize;
+            let mut ring: Vec<GeoPoint> = (0..steps)
+                .map(|k| destination_point(center, 360.0 * k as f32 / steps as f32, r_km))
+                .collect();
+            ring.push(ring[0]);
+            return ring;
+        }
+        _ => {}
+    }
+    if discs.iter().all(|(_, r)| *r <= 0.0) {
+        return Vec::new(); // a zero-width corridor is not a drawable cone
+    }
+
+    // -- per-segment frame: bearing, length, external-tangent tilt -----------
+    struct Seg {
+        theta: f32,
+        len_km: f32,
+        tilt_deg: f32,
+    }
+    let segs: Vec<Seg> = discs
+        .windows(2)
+        .map(|w| {
+            let len_km = haversine_km(w[0].0, w[1].0);
+            let theta = initial_bearing_deg(w[0].0, w[1].0);
+            // |Δr| < d after the merge pass; the clamp is a numeric guard.
+            let tilt_deg = ((w[1].1 - w[0].1) / len_km)
+                .clamp(-0.99, 0.99)
+                .asin()
+                .to_degrees();
+            Seg {
+                theta,
+                len_km,
+                tilt_deg,
+            }
+        })
+        .collect();
+    // Tangent contact bearing at a segment's endpoints: perpendicular to the
+    // travel bearing, leaned back by the taper tilt (side −1 = left, +1 =
+    // right of travel). Both ends of a segment share it — the radius to an
+    // external tangent's contact point is parallel at both circles.
+    let offset_bearing = |seg: &Seg, side: f32| seg.theta + side * (90.0 + seg.tilt_deg);
+
+    let side_chain = |side: f32| -> Vec<GeoPoint> {
+        // Contact-bearing change across interior vertex `v` on this side.
+        let joint_delta = |v: usize| {
+            wrap_deg_180(offset_bearing(&segs[v], side) - offset_bearing(&segs[v - 1], side))
+        };
+        // On an inner join the tangent edges cross at the miter, so the runs
+        // on both sides must be TRIMMED back to it: the contact-to-miter
+        // distance along each edge is r·tan(Δ/2). 25 % slack — over-trimming
+        // is free (the bridged stretch is collinear with the tangent edge and
+        // the emitted miter), while any sample left past the miter would sit
+        // a sub-prune sliver inside the neighboring capsule and micro-loop
+        // around the miter (found on the real Bavi #25 geometry).
+        let inner_trim_km = |v: usize| -> f32 {
+            let delta = joint_delta(v);
+            if side * delta > 0.0 {
+                let half = (delta.abs() * 0.5).min(75.0).to_radians();
+                discs[v].1 * half.tan() * 1.25
+            } else {
+                0.0
+            }
+        };
+        let mut chain = Vec::new();
+        for (i, seg) in segs.iter().enumerate() {
+            let ob = offset_bearing(seg, side);
+            if i > 0 {
+                let ob_prev = offset_bearing(&segs[i - 1], side);
+                let delta = joint_delta(i);
+                let (center, r_km) = discs[i];
+                if side * delta <= 0.0 {
+                    // Outer side of the bend: the vertex circle bulges out
+                    // between the two tangent edges — walk its arc.
+                    chain.extend(arc_interior_points(center, r_km, ob_prev, delta));
+                } else if r_km > 0.0 {
+                    // Inner side: the tangent edges cross. Both are tangent to
+                    // the vertex circle, so the miter sits on the contact
+                    // bisector at r/cos(Δ/2). The cos clamp caps a degenerate
+                    // near-reversal at 4r; the interior prune below removes it
+                    // if it lands inside a neighboring capsule.
+                    let half = (delta.abs() * 0.5).to_radians();
+                    chain.push(destination_point(
+                        center,
+                        ob_prev + 0.5 * delta,
+                        r_km / half.cos().max(0.25),
+                    ));
+                }
+            }
+            // Tangent-edge run, trimmed to the miters at inner-joined ends
+            // (the edge between the contact points spans len·cos(tilt)).
+            let line_len = (seg.len_km * seg.tilt_deg.to_radians().cos()).max(1e-3);
+            let u_from = if i > 0 {
+                (inner_trim_km(i) / line_len).min(1.0)
+            } else {
+                0.0
+            };
+            let u_to = if i + 1 < segs.len() {
+                1.0 - (inner_trim_km(i + 1) / line_len).min(1.0)
+            } else {
+                1.0
+            };
+            if u_to < u_from {
+                continue; // fully swallowed by its neighbors' miters
+            }
+            let steps = ((u_to - u_from) * seg.len_km / ENVELOPE_SAMPLE_KM)
+                .ceil()
+                .max(1.0) as usize;
+            let dr = discs[i + 1].1 - discs[i].1;
+            for k in 0..=steps {
+                let u = u_from + (u_to - u_from) * k as f32 / steps as f32;
+                let on_track = destination_point(discs[i].0, seg.theta, seg.len_km * u);
+                let r_km = discs[i].1 + dr * u;
+                chain.push(if r_km > 0.0 {
+                    destination_point(on_track, ob, r_km)
+                } else {
+                    on_track
+                });
+            }
+        }
+        chain
+    };
+
+    // -- assemble: left edge forward, end cap, right edge backward, start cap
+    let left = side_chain(-1.0);
+    let right = side_chain(1.0);
+    let first_seg = &segs[0];
+    let last_seg = segs.last().expect("two discs make a segment");
+    let (start_center, start_r) = discs[0];
+    let (end_center, end_r) = *discs.last().expect("at least two discs");
+    let mut ring = left;
+    ring.extend(arc_interior_points(
+        end_center,
+        end_r,
+        offset_bearing(last_seg, -1.0),
+        180.0 + 2.0 * last_seg.tilt_deg,
+    ));
+    ring.extend(right.iter().rev().copied());
+    ring.extend(arc_interior_points(
+        start_center,
+        start_r,
+        offset_bearing(first_seg, 1.0),
+        180.0 - 2.0 * first_seg.tilt_deg,
+    ));
+
+    // -- prune candidates swallowed by a neighboring capsule, close the ring -
+    let penetration_km = |x: GeoPoint| -> f32 {
+        let mut worst = 0.0f32;
+        for (i, seg) in segs.iter().enumerate() {
+            let sd = capsule_signed_distance_km(
+                x,
+                discs[i].0,
+                discs[i].1,
+                discs[i + 1].1,
+                seg.theta,
+                seg.len_km,
+            );
+            worst = worst.max(-sd);
+        }
+        worst
+    };
+    ring.retain(|p| penetration_km(*p) <= ENVELOPE_PRUNE_KM);
+    ring.dedup_by(|a, b| haversine_km(*a, *b) < 0.2);
+    while ring.len() >= 2 {
+        if haversine_km(ring[0], ring[ring.len() - 1]) < 0.2 {
+            ring.pop();
+        } else {
+            break;
+        }
+    }
+    if ring.len() < 3 {
+        return Vec::new();
+    }
+    ring.push(ring[0]);
+    ring
+}
+
 /// The 34-kt "wind danger area" (a.k.a. the USN ship-avoidance swath): a closed
 /// geographic ring enclosing every 34-kt wind-radii rose along the storm's
-/// track. A faithful, always-simple approximation of the stepped JTWC danger
-/// area — the convex hull of the sampled 34-kt rings at the current position and
-/// each forecast time, which is a conservative outer envelope of the region
-/// where ≥34-kt (gale-force) winds are forecast. Empty when no point carries a
-/// 34-kt radius. Pure geographic points; the caller projects them.
+/// track. Each point contributes a circle at its LARGEST 34-kt quadrant radius
+/// (which contains the whole rose), and the ring is the tapered envelope of
+/// those circles laid along the forecast polyline ([`track_circle_envelope`]),
+/// so it follows a curved track. The previous construction — a convex hull of
+/// the sampled roses — straight-lined from the small first circle to the big
+/// last one, so on a recurving track (live report: Typhoon Bavi warning #25)
+/// the sides cut the inside of the bend and the whole front of the cone drew
+/// visibly too fat. Empty when no point carries a nonzero 34-kt radius. Pure
+/// geographic points; the caller projects them.
 pub fn danger_area_34kt<'a>(
     points: impl Iterator<Item = (GeoPoint, &'a [WindRadii])>,
 ) -> Vec<GeoPoint> {
-    let mut hull_input: Vec<GeoPoint> = Vec::new();
-    for (center, radii) in points {
-        if let Some(r34) = radii.iter().find(|r| r.kt == 34) {
-            hull_input.extend(wind_radii_ring(center, r34, 6));
-        }
-    }
-    if hull_input.len() < 3 {
-        return Vec::new();
-    }
-    convex_hull(&hull_input)
+    let discs: Vec<(GeoPoint, f32)> = points
+        .filter_map(|(center, radii)| {
+            radii
+                .iter()
+                .find(|r| r.kt == 34)
+                .map(|r34| (center, r34.max_nm()))
+        })
+        .filter(|(_, r_nm)| *r_nm > 0.0)
+        .collect();
+    track_circle_envelope(&discs)
 }
 
 /// A storm's track/cone geometry (from GDACS `getgeometry`, or NHC GIS later).
@@ -3002,6 +3365,387 @@ REMARKS:
         );
         // Latitude band brackets the track (14°N current → 26°N day-5).
         assert!(south < 13.0 && north > 27.0, "lat band {south}..{north}");
+    }
+
+    // --- cone-envelope geometry helpers (tests only) -----------------------
+
+    /// Distance (km) from `x` to the nearest point of an open polyline —
+    /// [`capsule_signed_distance_km`] with zero radii is exactly the spherical
+    /// point-to-geodesic-segment distance.
+    fn dist_to_polyline_km(x: GeoPoint, line: &[GeoPoint]) -> f32 {
+        line.windows(2)
+            .map(|w| {
+                let len = haversine_km(w[0], w[1]);
+                if len <= 0.0 {
+                    haversine_km(x, w[0])
+                } else {
+                    let theta = initial_bearing_deg(w[0], w[1]);
+                    capsule_signed_distance_km(x, w[0], 0.0, 0.0, theta, len)
+                }
+            })
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    /// Max over `boundary`'s edges (sampled every ~10 km) of the distance to
+    /// `to` — with `to` a closed ring this is the one-sided Hausdorff
+    /// deviation between two boundaries; with `to` a track polyline it is the
+    /// "how far does the cone stray from the track" measure. Edge INTERIORS
+    /// matter: a convex hull's vertices all lie on uncertainty circles, only
+    /// its long chords stray.
+    fn max_boundary_distance_km(boundary: &[GeoPoint], to: &[GeoPoint]) -> f32 {
+        let mut worst = 0.0f32;
+        for w in boundary.windows(2) {
+            let len = haversine_km(w[0], w[1]);
+            let theta = initial_bearing_deg(w[0], w[1]);
+            let steps = (len / 10.0).ceil().max(1.0) as usize;
+            for k in 0..=steps {
+                let p = destination_point(w[0], theta, len * k as f32 / steps as f32);
+                worst = worst.max(dist_to_polyline_km(p, to));
+            }
+        }
+        worst
+    }
+
+    /// Even-odd point-in-ring test in the lon/lat plane (`ring` closed).
+    fn point_in_ring(x: GeoPoint, ring: &[GeoPoint]) -> bool {
+        let (px, py) = (x.lon as f64, x.lat as f64);
+        let mut inside = false;
+        for w in ring.windows(2) {
+            let (x1, y1) = (w[0].lon as f64, w[0].lat as f64);
+            let (x2, y2) = (w[1].lon as f64, w[1].lat as f64);
+            if (y1 > py) != (y2 > py) && x1 + (py - y1) / (y2 - y1) * (x2 - x1) > px {
+                inside = !inside;
+            }
+        }
+        inside
+    }
+
+    /// No two non-adjacent edges of the closed ring properly cross (lon/lat
+    /// plane; a pure axis scale can't change crossings, so no cos-lat needed).
+    fn ring_is_simple(ring: &[GeoPoint]) -> bool {
+        let pts: Vec<(f64, f64)> = ring[..ring.len() - 1]
+            .iter()
+            .map(|p| (p.lon as f64, p.lat as f64))
+            .collect();
+        let n = pts.len();
+        let orient = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
+            (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0)
+        };
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if j == i + 1 || (i == 0 && j == n - 1) {
+                    continue; // shared vertex
+                }
+                let (a, b) = (pts[i], pts[(i + 1) % n]);
+                let (c, d) = (pts[j], pts[(j + 1) % n]);
+                if orient(a, b, c) * orient(a, b, d) < 0.0
+                    && orient(c, d, a) * orient(c, d, b) < 0.0
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// The pre-fix danger-area construction (convex hull of the sampled 34-kt
+    /// roses) — kept here as the comparator the new envelope is judged
+    /// against.
+    fn legacy_hull_34kt<'a>(
+        points: impl Iterator<Item = (GeoPoint, &'a [WindRadii])>,
+    ) -> Vec<GeoPoint> {
+        let mut hull_input: Vec<GeoPoint> = Vec::new();
+        for (center, radii) in points {
+            if let Some(r34) = radii.iter().find(|r| r.kt == 34) {
+                hull_input.extend(wind_radii_ring(center, r34, 6));
+            }
+        }
+        if hull_input.len() < 3 {
+            return Vec::new();
+        }
+        convex_hull(&hull_input)
+    }
+
+    /// On a straight track the tapered envelope IS the old hull shape (tangent
+    /// trapezoids + end arcs): the fix must not move straight-track cones
+    /// beyond arc discretization. Radii taper hard (100→200 NM over ~3°), so
+    /// this also pins the true external-tangent tilt — a perpendicular-offset
+    /// approximation would sit ~7 km inside the hull at the small end and fail
+    /// the 5-km bound.
+    #[test]
+    fn straight_track_envelope_matches_the_legacy_hull() {
+        let discs = [
+            (
+                GeoPoint {
+                    lon: 130.0,
+                    lat: 0.0,
+                },
+                100.0f32,
+            ),
+            (
+                GeoPoint {
+                    lon: 133.0,
+                    lat: 0.0,
+                },
+                150.0,
+            ),
+            (
+                GeoPoint {
+                    lon: 136.0,
+                    lat: 0.0,
+                },
+                200.0,
+            ),
+        ];
+        let envelope = track_circle_envelope(&discs);
+        assert!(envelope.len() >= 4 && envelope.first() == envelope.last());
+        // The legacy shape, sampled finely (5°) so the comparison tolerance is
+        // dominated by the new ring's own 10° arcs, not the reference's.
+        let mut hull_input = Vec::new();
+        for (center, r_nm) in discs {
+            for k in 0..72 {
+                hull_input.push(destination_point(center, 5.0 * k as f32, r_nm * KM_PER_NM));
+            }
+        }
+        let hull = convex_hull(&hull_input);
+        let dev = max_boundary_distance_km(&envelope, &hull)
+            .max(max_boundary_distance_km(&hull, &envelope));
+        assert!(dev < 5.0, "straight-track shape preserved, dev {dev} km");
+    }
+
+    /// The owner-reported v0.29.2 bug, on the real recurving Bavi warning #25:
+    /// the convex-hull cone straight-lined across the bend (inner side cut,
+    /// front fat), while the tapered envelope must hug the curved track —
+    /// every boundary point within the largest gale radius (+ miter slack) of
+    /// the forecast polyline — while still containing every per-point circle,
+    /// without self-intersecting.
+    #[test]
+    fn curved_bavi25_envelope_hugs_the_recurving_track() {
+        let current = parse_jtwc_current_radii(JTWC_WARNING_25);
+        let fc = parse_jtwc_forecast_warning(JTWC_WARNING_25);
+        let analysis = GeoPoint {
+            lon: 139.9,
+            lat: 16.2,
+        }; // WARNING POSITION 070000Z
+        let track_points: Vec<(GeoPoint, &[WindRadii])> =
+            std::iter::once((analysis, current.as_slice()))
+                .chain(fc.iter().map(|p| (p.position, p.wind_radii.as_slice())))
+                .collect();
+        let discs: Vec<(GeoPoint, f32)> = track_points
+            .iter()
+            .filter_map(|(c, radii)| {
+                radii
+                    .iter()
+                    .find(|r| r.kt == 34)
+                    .map(|r| (*c, r.max_nm() * KM_PER_NM))
+            })
+            .collect();
+        assert_eq!(
+            discs.len(),
+            9,
+            "analysis + 8 forecast points carry 34-kt radii"
+        );
+        let polyline: Vec<GeoPoint> = discs.iter().map(|d| d.0).collect();
+        let max_r = discs.iter().fold(0.0f32, |m, d| m.max(d.1)); // 270 NM
+
+        let envelope = danger_area_34kt(track_points.iter().copied());
+        assert!(envelope.len() >= 4 && envelope.first() == envelope.last());
+        assert!(ring_is_simple(&envelope), "no self-intersection");
+
+        // Hugs the curve: nothing strays past the biggest circle (1 % miter
+        // slack for the ≤11° per-vertex turns of this track).
+        let dev = max_boundary_distance_km(&envelope, &polyline);
+        assert!(
+            dev <= max_r * 1.01 + 2.0,
+            "envelope hugs the recurve: {dev} km vs max radius {max_r} km"
+        );
+        // ... which the legacy hull genuinely violated — its inner-bend chord
+        // ran ~150 km outside any circle. This is the regression the fix
+        // removes; if it ever fails the fixture stopped recurving.
+        let hull = legacy_hull_34kt(track_points.iter().copied());
+        let hull_dev = max_boundary_distance_km(&hull, &polyline);
+        assert!(
+            hull_dev > max_r + 80.0,
+            "fixture still recurves enough to expose the hull bug ({hull_dev} km)"
+        );
+
+        // Still a cone: every per-point gale circle is inside (sampled 3 km in
+        // from the rim to absorb the 10° arc chords).
+        for (center, r_km) in &discs {
+            for k in 0..24 {
+                let p = destination_point(*center, 15.0 * k as f32, r_km - 3.0);
+                assert!(
+                    point_in_ring(p, &envelope),
+                    "circle sample {k} of {center:?} escaped the envelope"
+                );
+            }
+        }
+    }
+
+    /// A sharp 90° bend whose radii rival the segment lengths: the inner-side
+    /// offsets cross, and the miter + interior prune must keep the boundary
+    /// simple while every circle stays contained.
+    #[test]
+    fn envelope_inner_bend_stays_simple_and_contains_circles() {
+        let discs = [
+            (
+                GeoPoint {
+                    lon: 130.0,
+                    lat: 10.0,
+                },
+                120.0f32,
+            ),
+            (
+                GeoPoint {
+                    lon: 133.0,
+                    lat: 10.0,
+                },
+                140.0,
+            ),
+            (
+                GeoPoint {
+                    lon: 133.0,
+                    lat: 13.0,
+                },
+                160.0,
+            ),
+        ];
+        let ring = track_circle_envelope(&discs);
+        assert!(ring.len() >= 4 && ring.first() == ring.last());
+        assert!(ring_is_simple(&ring), "inner bend must not self-loop");
+        for (center, r_nm) in discs {
+            let r_km = r_nm * KM_PER_NM;
+            for k in 0..24 {
+                let p = destination_point(center, 15.0 * k as f32, r_km - 6.0);
+                assert!(
+                    point_in_ring(p, &ring),
+                    "circle sample {k} of {center:?} escaped the bend envelope"
+                );
+            }
+        }
+        // The 90° corner's miter may stand off up to r/cos(45°) from the
+        // vertex; beyond that everything must still hug the track.
+        let polyline = [discs[0].0, discs[1].0, discs[2].0];
+        let dev = max_boundary_distance_km(&ring, &polyline);
+        assert!(dev <= 160.0 * KM_PER_NM * 1.45, "sharp-bend hug: {dev} km");
+
+        // S-curve stress: alternating bends with segments SHORTER than the
+        // radii, so inner offsets overrun several neighbors and the
+        // trim+prune pair carries the whole boundary.
+        let scurve = [
+            (
+                GeoPoint {
+                    lon: 130.0,
+                    lat: 10.0,
+                },
+                150.0f32,
+            ),
+            (
+                GeoPoint {
+                    lon: 131.5,
+                    lat: 10.0,
+                },
+                160.0,
+            ),
+            (
+                GeoPoint {
+                    lon: 132.5,
+                    lat: 11.0,
+                },
+                170.0,
+            ),
+            (
+                GeoPoint {
+                    lon: 132.5,
+                    lat: 12.5,
+                },
+                180.0,
+            ),
+            (
+                GeoPoint {
+                    lon: 131.5,
+                    lat: 13.5,
+                },
+                190.0,
+            ),
+            (
+                GeoPoint {
+                    lon: 130.0,
+                    lat: 13.5,
+                },
+                200.0,
+            ),
+        ];
+        let ring = track_circle_envelope(&scurve);
+        assert!(ring.len() >= 4 && ring.first() == ring.last());
+        assert!(ring_is_simple(&ring), "S-curve must not self-loop");
+        for (center, r_nm) in scurve {
+            let r_km = r_nm * KM_PER_NM;
+            for k in 0..24 {
+                let p = destination_point(center, 15.0 * k as f32, r_km - 8.0);
+                assert!(
+                    point_in_ring(p, &ring),
+                    "S-curve circle sample {k} of {center:?} escaped"
+                );
+            }
+        }
+    }
+
+    /// A single-point "track" is just that point's uncertainty circle.
+    #[test]
+    fn envelope_single_point_is_the_circle() {
+        let center = GeoPoint {
+            lon: 140.0,
+            lat: 20.0,
+        };
+        let ring = track_circle_envelope(&[(center, 150.0)]);
+        assert!(ring.len() >= 24 && ring.first() == ring.last());
+        for p in &ring {
+            let d = haversine_km(*p, center);
+            assert!((d - 150.0 * KM_PER_NM).abs() < 1.0, "on the circle: {d} km");
+        }
+        assert!(track_circle_envelope(&[]).is_empty());
+        assert!(track_circle_envelope(&[(center, 0.0)]).is_empty());
+    }
+
+    /// Duplicate / near-duplicate forecast positions and a point whose circle
+    /// is swallowed by its neighbor's must all collapse to the clean two-point
+    /// cone instead of spiking the boundary with noise bearings.
+    #[test]
+    fn envelope_merges_duplicate_and_swallowed_points() {
+        let a = GeoPoint {
+            lon: 130.0,
+            lat: 15.0,
+        };
+        let b = GeoPoint {
+            lon: 133.0,
+            lat: 15.0,
+        };
+        let clean = track_circle_envelope(&[(a, 150.0), (b, 180.0)]);
+        assert!(ring_is_simple(&clean));
+
+        let jitter = GeoPoint {
+            lon: 130.001,
+            lat: 15.0,
+        };
+        let with_dups =
+            track_circle_envelope(&[(a, 150.0), (a, 150.0), (jitter, 150.0), (b, 180.0)]);
+        assert!(ring_is_simple(&with_dups));
+        let dev = max_boundary_distance_km(&with_dups, &clean)
+            .max(max_boundary_distance_km(&clean, &with_dups));
+        assert!(dev < 2.0, "duplicates change nothing: {dev} km");
+
+        // 12 NM from `a` with a 120-NM radius: entirely inside a's 150-NM
+        // circle, so it must merge away rather than kink the taper.
+        let swallowed = GeoPoint {
+            lon: 130.2,
+            lat: 15.0,
+        };
+        let with_contained = track_circle_envelope(&[(a, 150.0), (swallowed, 120.0), (b, 180.0)]);
+        assert!(ring_is_simple(&with_contained));
+        let dev = max_boundary_distance_km(&with_contained, &clean)
+            .max(max_boundary_distance_km(&clean, &with_contained));
+        assert!(dev < 2.0, "a swallowed circle changes nothing: {dev} km");
     }
 
     #[test]

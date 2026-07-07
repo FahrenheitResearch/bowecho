@@ -650,9 +650,14 @@ impl crate::ViewerApp {
 
     /// The 34-kt wind danger area (USN ship-avoidance swath): a translucent
     /// teal fill + red outline enclosing every 34-kt gale field along the
-    /// track. Built in geographic space (great-circle quadrant offsets) then
-    /// projected, reusing `crate::cone_overlay_shapes` so the same wide-shape
-    /// jump-cull allowance keeps a basin-spanning envelope from being culled.
+    /// track — the tapered envelope of the per-point gale circles laid along
+    /// the forecast polyline, so it follows a recurving track instead of
+    /// straight-lining first circle to last (the v0.29.2 "fat cone on Bavi's
+    /// recurve" bug; see `data_source::tropical::track_circle_envelope`).
+    /// Built in geographic space (great-circle offsets) then projected,
+    /// reusing `crate::cone_overlay_shapes` so the same wide-shape jump-cull
+    /// allowance keeps a basin-spanning envelope from being culled; the fill
+    /// path ear-clips, so the now-concave inner bend renders correctly.
     fn push_danger_area_shapes(
         &self,
         shapes: &mut Vec<egui::Shape>,
@@ -665,17 +670,17 @@ impl crate::ViewerApp {
                 .iter()
                 .map(|p| (p.position, p.wind_radii.as_slice())),
         );
-        let hull = tropical::danger_area_34kt(points);
-        if hull.len() < 3 {
+        let envelope = tropical::danger_area_34kt(points);
+        if envelope.len() < 3 {
             return;
         }
-        let ring: Vec<egui::Pos2> = hull
+        let ring: Vec<egui::Pos2> = envelope
             .iter()
             .map(|p| self.lon_lat_to_screen(rect, p.lon, p.lat))
             .collect();
         shapes.extend(crate::cone_overlay_shapes(
             &ring,
-            cone_bbox_deg(&hull),
+            cone_bbox_deg(&envelope),
             self.map_scale,
             rect,
             egui::Color32::from_rgba_unmultiplied(30, 200, 190, 28),

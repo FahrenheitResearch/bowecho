@@ -10,23 +10,30 @@
 //! overlay would draw them at a West-Pacific map view.
 //!
 //! Usage:
-//!   cargo run -p app_ui --example tropical_radii_probe [-- <url-or-path> <out.png>]
+//!   cargo run -p app_ui --example tropical_radii_probe [-- <url-or-path> <out.png> [envelope|hull]]
 //! With no args it fetches the live BAVI warning and falls back to the checked-in
 //! real capture `crates/data_source/tests/fixtures/tropical/jtwc_bavi_warning.txt`.
+//! The optional third arg picks the 34-kt swath construction: `envelope`
+//! (default — the shipped tapered `track_circle_envelope`, hugging a curved
+//! track) or `hull` (the pre-v0.29.3 convex hull, kept for before/after
+//! comparison: on a recurving track it straight-lines beginning-to-end and
+//! draws the cone fat across the bend).
 
 use data_source::tropical::{
-    self, Category, GeoPoint, WindRadii, danger_area_34kt, wind_radii_ring,
+    self, Category, GeoPoint, WindRadii, convex_hull, danger_area_34kt, wind_radii_ring,
 };
 use ui_core::geo::aeqd_forward_km;
 
 const LIVE_URL: &str = "https://www.metoc.navy.mil/jtwc/products/wp0926web.txt";
 const FIXTURE: &str = "crates/data_source/tests/fixtures/tropical/jtwc_bavi_warning.txt";
 
-// A West-Pacific map view framing Guam → Taiwan (the BAVI danger swath).
+// A West-Pacific map view framing Guam → the East China Sea — wide enough for
+// warning #25's full recurve (16°N 140°E west then poleward to 29°N 119°E)
+// plus its ~260-NM gale radii.
 const W: u32 = 1200;
 const H: u32 = 900;
-const CENTER_LAT: f64 = 18.5;
-const CENTER_LON: f64 = 133.5;
+const CENTER_LAT: f64 = 20.0;
+const CENTER_LON: f64 = 132.0;
 const MAP_SCALE: f64 = 33.0; // pixels per degree of latitude (== app's map_scale)
 
 fn main() {
@@ -36,6 +43,8 @@ fn main() {
         .get(1)
         .map(String::as_str)
         .unwrap_or("tropical_radii_probe.png");
+
+    let mode = args.get(2).map(String::as_str).unwrap_or("envelope");
 
     let (text, origin) = load_warning(source_arg);
     println!(
@@ -72,16 +81,24 @@ fn main() {
     let mut img = image::RgbaImage::from_pixel(W, H, image::Rgba([18, 24, 34, 255]));
     draw_graticule(&mut img);
 
-    // 34-kt danger area (teal fill + red outline).
-    let danger_pts = std::iter::once((current_position(&text), current.as_slice())).chain(
-        forecast
-            .iter()
-            .map(|p| (p.position, p.wind_radii.as_slice())),
-    );
-    let hull = danger_area_34kt(danger_pts);
-    let hull_px: Vec<(f64, f64)> = hull.iter().map(|g| project(*g)).collect();
-    fill_polygon(&mut img, &hull_px, [30, 200, 190], 0.16);
-    draw_closed(&mut img, &hull_px, [235, 70, 70], 0.85, 2);
+    // 34-kt danger area (teal fill + red outline): the shipped tapered
+    // envelope, or the legacy convex hull when comparing before/after.
+    let danger_pts: Vec<(GeoPoint, &[WindRadii])> =
+        std::iter::once((current_position(&text), current.as_slice()))
+            .chain(
+                forecast
+                    .iter()
+                    .map(|p| (p.position, p.wind_radii.as_slice())),
+            )
+            .collect();
+    let swath = match mode {
+        "hull" => legacy_hull_34kt(danger_pts.iter().copied()),
+        _ => danger_area_34kt(danger_pts.iter().copied()),
+    };
+    println!("\n34-kt swath mode={mode}: {} boundary points", swath.len());
+    let swath_px: Vec<(f64, f64)> = swath.iter().map(|g| project(*g)).collect();
+    fill_polygon(&mut img, &swath_px, [30, 200, 190], 0.16);
+    draw_closed(&mut img, &swath_px, [235, 70, 70], 0.85, 2);
 
     // Wind-radii roses at the current position + each forecast time.
     let rose_centers = std::iter::once((current_position(&text), &current))
@@ -145,6 +162,26 @@ fn main() {
 
     img.save(out_path).expect("save png");
     println!("wrote {out_path} ({W}x{H})");
+}
+
+/// The pre-v0.29.3 danger-area construction — convex hull of the sampled
+/// 34-kt roses — reproduced here only for `hull` mode so before/after PNGs of
+/// the cone-taper fix can be rendered from the same bulletin. On a recurving
+/// track (Bavi warning #25) its straight sides cut the inside of the bend and
+/// bulge far outside it; the shipped envelope hugs the curve.
+fn legacy_hull_34kt<'a>(
+    points: impl Iterator<Item = (GeoPoint, &'a [WindRadii])>,
+) -> Vec<GeoPoint> {
+    let mut hull_input: Vec<GeoPoint> = Vec::new();
+    for (center, radii) in points {
+        if let Some(r34) = radii.iter().find(|r| r.kt == 34) {
+            hull_input.extend(wind_radii_ring(center, r34, 6));
+        }
+    }
+    if hull_input.len() < 3 {
+        return Vec::new();
+    }
+    convex_hull(&hull_input)
 }
 
 // ---------------------------------------------------------------------------
@@ -377,7 +414,8 @@ fn stroke_circle(img: &mut image::RgbaImage, ctr: (f64, f64), rad: f64, c: [u8; 
     }
 }
 
-/// Even-odd scanline polygon fill (the hull is convex, so this is exact).
+/// Even-odd scanline polygon fill — exact for any simple ring, including the
+/// tapered envelope's concave inner bend.
 fn fill_polygon(img: &mut image::RgbaImage, pts: &[(f64, f64)], c: [u8; 3], a: f32) {
     if pts.len() < 3 {
         return;
