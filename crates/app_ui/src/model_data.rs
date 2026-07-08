@@ -1129,6 +1129,28 @@ impl ModelDataDock {
         Some((output.label, output.config_fingerprint, output.volumes))
     }
 
+    /// True while a WRF/NetCDF import or synthetic-radar build runs on the dock
+    /// worker. The app pauses live radar auto-refresh while this holds: the
+    /// owner's machine has hard-crashed under the combined all-core memory-
+    /// bandwidth load of a large WRF import plus concurrent live-radar decode
+    /// (the import workers already run below-normal priority). Only the network
+    /// fetch pauses — the loop keeps playing existing frames.
+    pub(crate) fn import_in_flight(&self) -> bool {
+        self.import_job.is_some()
+    }
+
+    /// Test-only: park a dummy import job so the live-refresh crash guard
+    /// (`ViewerApp::model_import_in_flight`) engages without spawning a worker.
+    #[cfg(test)]
+    pub(crate) fn mark_import_in_flight_for_test(&mut self) {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let task = crate::wrf_radar::SyntheticRadarTask {
+            label: "test import".to_owned(),
+            rx,
+        };
+        self.import_job = Some(ImportJob::SyntheticRadar(task));
+    }
+
     /// Import controls (WRF/NetCDF folder pickers + status), rendered in the
     /// dock's left "Runs" column. Spawns the ingest onto a worker thread;
     /// `poll_import` finishes it and re-scans the store.
@@ -2901,6 +2923,19 @@ mod tests {
             }],
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn import_in_flight_reflects_a_running_import_job() {
+        let ctx = egui::Context::default();
+        let mut dock =
+            ModelDataDock::new_for_test(&ctx, tree_with_runs("wrf", &[("20260707_00z", &[0])]));
+        assert!(!dock.import_in_flight(), "idle dock reports no import");
+        dock.mark_import_in_flight_for_test();
+        assert!(
+            dock.import_in_flight(),
+            "a running import job is reported so the app pauses live radar decode"
+        );
     }
 
     #[test]

@@ -8202,8 +8202,27 @@ impl ViewerApp {
         }
     }
 
+    /// True while the model dock is running a heavy WRF/NetCDF import or a
+    /// synthetic-radar build. Gates the live radar auto-refresh so live decode
+    /// never contends with the import for memory bandwidth (crash guard).
+    fn model_import_in_flight(&self) -> bool {
+        self.model_dock
+            .as_ref()
+            .is_some_and(model_data::ModelDataDock::import_in_flight)
+    }
+
     fn maybe_refresh_realtime_level2(&mut self, ctx: &egui::Context) {
         if !self.primary.live.enabled {
+            return;
+        }
+        // Do not spawn live radar decode while a heavy WRF/model import (or
+        // synthetic build) runs: the owner's machine has hard-crashed under the
+        // combined all-core memory-bandwidth load of a large WRF import plus
+        // concurrent live decode. Only the network fetch pauses — the loop keeps
+        // playing existing frames — and it resumes when the import ends.
+        if self.model_import_in_flight() {
+            self.live_refresh_skip_reason = Some("WRF/model import in flight".to_owned());
+            ctx.request_repaint_after(Duration::from_secs(1));
             return;
         }
         // An active poll (custom URL or international) owns the primary
@@ -8372,6 +8391,11 @@ impl ViewerApp {
     /// complaint in independent multi-pane mode was every non-primary pane
     /// sitting stale until a manual Load Latest.
     fn maybe_refresh_extra_panes(&mut self, ctx: &egui::Context) {
+        // Same crash guard as the primary (`maybe_refresh_realtime_level2`): no
+        // pane live decode while a heavy WRF/model import is running.
+        if self.model_import_in_flight() {
+            return;
+        }
         let mut any_live_owner = false;
         let mut spawned = false;
         for pane_slot in 0..self.extra_panes.len() {
@@ -8948,6 +8972,15 @@ impl ViewerApp {
         self.pending_local_autoplay = true;
         self.primary_load_is_auto_refresh = false;
         self.load_receiver = None;
+        // Replace-all (engine's `clear_history(); install_batch`): clear the loop
+        // FIRST so a synthetic volume placed AT a real NEXRAD site — thus carrying
+        // that site's id (`volume.site.id == "KILN"`, model_data::to_config) — is
+        // not mixed into a restored live loop of the SAME id. Without it the
+        // same-id cross-site guard never fires, the real frames survive, and (loop
+        // playing/browsing) the synthetic anchor is never selected — display stuck
+        // on the stale real volume until the site is toggled. The clear also
+        // resets the cursor so the anchor lands in a fresh single-source loop.
+        self.clear_frame_history();
 
         let frame_count = volumes.len();
         let frames: Vec<DecodedLoad> = volumes
@@ -50087,6 +50120,126 @@ mod tests {
         assert!(
             app.pending_product_restore.is_none(),
             "restore satisfied, nothing pending"
+        );
+    }
+
+    /// Regression (v0.30.1 synth/real-site collision): a WRF synthetic radar
+    /// whose antenna is placed AT a real NEXRAD site carries that site's id
+    /// (`volume.site.id == "KILN"`). With a restored live KILN loop the shared
+    /// id skipped the loop-engine cross-site guard, so the synthetic frames
+    /// mixed into the real KILN history and — the loop playing/browsing — the
+    /// synthetic anchor was never selected: the display stayed on the stale real
+    /// KILN volume until the user toggled the site. `install_synthetic_radar_
+    /// volumes` now clears the loop first (replace-all), so the synthetic loop
+    /// owns the view regardless of the restored real-site state (also proves the
+    /// collision state never panics), and poll/live stay off so no tick stomps
+    /// it.
+    #[test]
+    fn synthetic_install_owns_view_over_a_restored_same_id_real_site_loop() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+
+        // Restored real KILN live loop: two real observation frames on the
+        // strip, one displayed, PLAYING + browsing, with live auto-refresh and a
+        // poll armed (the startup real-site state).
+        let real_times = [
+            Utc.with_ymd_and_hms(2026, 7, 7, 18, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 7, 18, 6, 0).unwrap(),
+        ];
+        for (index, time) in real_times.iter().enumerate() {
+            let volume = Arc::new(test_volume_with_site_time("KILN", *time));
+            app.primary.history.push(FrameHistoryEntry {
+                identity: frame_identity_for_volume(volume.as_ref()),
+                path: PathBuf::from(format!("poll://KILN_{index}")),
+                volume: Arc::clone(&volume),
+                timings: None,
+                status: FrameStatus::Complete,
+                source_label: "real KILN".to_owned(),
+            });
+            app.volume = Some(volume);
+        }
+        app.primary.cursor.playing = true;
+        app.primary.cursor.browsing = true;
+        app.primary.live.enabled = true;
+        app.poll_active = true;
+        assert_eq!(app.primary.history.len(), 2);
+
+        // Synthetic WRF radar built with the antenna AT KILN -> site.id "KILN".
+        let synth_times = [
+            Utc.with_ymd_and_hms(2025, 6, 21, 1, 30, 0).unwrap(),
+            Utc.with_ymd_and_hms(2025, 6, 21, 1, 45, 0).unwrap(),
+            Utc.with_ymd_and_hms(2025, 6, 21, 2, 0, 0).unwrap(),
+        ];
+        let synth: Vec<Arc<RadarVolume>> = synth_times
+            .iter()
+            .map(|time| Arc::new(test_volume_with_site_time("KILN", *time)))
+            .collect();
+        app.install_synthetic_radar_volumes("simulated WRF".to_owned(), 0x00C0_FFEE, synth, &ctx);
+
+        // Single-source loop: only the synthetic forecast frames remain (the
+        // real KILN frames were cleared, not mixed in by the shared id).
+        assert_eq!(
+            app.primary.history.len(),
+            synth_times.len(),
+            "real KILN frames cleared; only the synthetic forecast frames remain"
+        );
+        for entry in &app.primary.history {
+            assert!(
+                entry.path.to_string_lossy().starts_with("wrf-synth://"),
+                "history holds only synthetic frames, got {:?}",
+                entry.path
+            );
+            assert!(
+                synth_times.contains(&entry.identity.scan_time_utc),
+                "every history frame is a synthetic forecast time"
+            );
+        }
+        // The DISPLAY is a synthetic frame, not the stale real KILN volume.
+        let shown = app.volume.as_ref().expect("a synthetic frame is displayed");
+        assert!(
+            synth_times.contains(&shown.volume_time),
+            "the display shows a synthetic forecast frame, not the real KILN volume"
+        );
+        assert!(
+            !app.poll_active,
+            "poll paused so no tick stomps the synthetic loop"
+        );
+        assert!(!app.primary.live.enabled, "live auto-refresh paused");
+    }
+
+    /// Crash guard (v0.30.1): while a heavy WRF/model import runs, the live
+    /// radar auto-refresh must NOT spawn a concurrent decode — the owner's
+    /// machine hard-crashes under the combined memory-bandwidth load. The guard
+    /// runs BEFORE any other live-refresh gate, so it fires regardless of the
+    /// selected site.
+    #[test]
+    fn live_auto_refresh_pauses_while_a_model_import_runs() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.primary.live.enabled = true;
+        app.primary.live.last_refresh = None; // a refresh is due immediately
+
+        // No dock -> nothing pausing live.
+        assert!(!app.model_import_in_flight());
+
+        // A heavy WRF import in flight pauses the live auto-refresh.
+        let mut dock = model_data::ModelDataDock::new_for_test(
+            &ctx,
+            test_model_store_tree("wrf", "20260707_00z", &[0]),
+        );
+        dock.mark_import_in_flight_for_test();
+        app.model_dock = Some(dock);
+        assert!(app.model_import_in_flight());
+
+        app.maybe_refresh_realtime_level2(&ctx);
+        assert!(
+            app.load_receiver.is_none(),
+            "no live load spawned while a model import runs"
+        );
+        assert_eq!(
+            app.live_refresh_skip_reason.as_deref(),
+            Some("WRF/model import in flight"),
+            "the import guard fires before any other live-refresh gate"
         );
     }
 
