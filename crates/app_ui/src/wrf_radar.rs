@@ -170,12 +170,19 @@ pub struct SyntheticRadarConfig {
     /// classic Stoelinga `CALCDBZ` community diagnostic
     /// ([`ReflectivityOperator::ClassicStoelinga`]).
     pub reflectivity_operator: ReflectivityOperator,
-    /// Opt-in "gate texture": deterministic, range-correlated speckle added
-    /// to the sampled moments so the synthetic gates read like real
-    /// Level-II texture instead of a perfectly smooth trilinear field. OFF
-    /// is the product default, and an OFF build is bit-identical to a build
-    /// without the feature — the perturbation code never touches a value.
-    pub gate_texture: bool,
+    /// "Gate texture" on REFLECTIVITY: deterministic, range-correlated speckle
+    /// added to the sampled dBZ so the synthetic gates read like real Level-II
+    /// texture instead of a perfectly smooth trilinear field. ON is the product
+    /// default (owner: the smooth field "looks garbage without" it). When OFF,
+    /// the reflectivity perturbation code never touches a value, so an OFF build
+    /// is bit-identical to a build without the feature.
+    pub ref_gate_texture: bool,
+    /// "Gate texture" on VELOCITY: a gentle ±0.5 m/s wobble on the forward-
+    /// modelled radial velocity. OFF by default and kept opt-in — the clean Vr
+    /// feeds the velocity dealias / GBVTD consumers downstream, and a noisy Vr
+    /// would pollute them. Separate from [`Self::ref_gate_texture`] on purpose:
+    /// reflectivity wants the speckle, velocity does not.
+    pub vel_gate_texture: bool,
 }
 
 /// Antenna height above model terrain when no explicit MSL altitude is given.
@@ -198,8 +205,66 @@ impl Default for SyntheticRadarConfig {
             // Default operator. Flip this one line to ClassicStoelinga to
             // re-default the community look after the owner's comparison.
             reflectivity_operator: ReflectivityOperator::ModelNative,
-            gate_texture: false,
+            // Reflectivity texture ON by default (owner verdict: a smooth
+            // simulated field "looks garbage without" it); velocity texture
+            // OFF so the clean Vr keeps feeding dealias/GBVTD.
+            ref_gate_texture: true,
+            vel_gate_texture: false,
         }
+    }
+}
+
+impl SyntheticRadarConfig {
+    /// A 64-bit fingerprint of every field that changes the SAMPLED DATA of a
+    /// synthetic scan. The loop-engine dedupe keys a re-import on scan time +
+    /// site id (see [`crate`]'s install path); that alone cannot tell a
+    /// genuinely re-configured build from an identical rebuild, so the install
+    /// path folds THIS fingerprint into the per-frame history path key. An
+    /// UNCHANGED config re-imports to the same key and the engine reuses the
+    /// stored volume (upsert rule (b)); ANY change here yields a new key, so the
+    /// freshly-built volume replaces the stale one (rule (c), equal status +
+    /// different path) and flows to the display.
+    ///
+    /// Included — everything that alters a gate value or its position: the
+    /// antenna placement (`site_id`, `site_lat_deg`, `site_lon_deg`,
+    /// `antenna_msl_m`), the elevation ladder (which already encodes the
+    /// optional 0.1° low tilt), `azimuth_count`, `gate_spacing_m`, `max_range_m`,
+    /// `ref_floor_dbz`, `nyquist_mps`, `reflectivity_operator`, and both gate-
+    /// texture flags. Deliberately EXCLUDED: `site_name` (a label — never
+    /// changes a sample).
+    pub fn data_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.site_id.hash(&mut hasher);
+        hash_opt_f64(self.site_lat_deg, &mut hasher);
+        hash_opt_f64(self.site_lon_deg, &mut hasher);
+        hash_opt_f64(self.antenna_msl_m, &mut hasher);
+        self.elevations_deg.len().hash(&mut hasher);
+        for elevation in &self.elevations_deg {
+            elevation.to_bits().hash(&mut hasher);
+        }
+        self.azimuth_count.hash(&mut hasher);
+        self.gate_spacing_m.to_bits().hash(&mut hasher);
+        self.max_range_m.to_bits().hash(&mut hasher);
+        self.ref_floor_dbz.to_bits().hash(&mut hasher);
+        self.nyquist_mps.to_bits().hash(&mut hasher);
+        (self.reflectivity_operator as u8).hash(&mut hasher);
+        self.ref_gate_texture.hash(&mut hasher);
+        self.vel_gate_texture.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+/// Hash an optional `f64` by its bit pattern (floats are not `Hash`), with a
+/// present/absent tag so `Some(0.0)` and `None` never collide.
+fn hash_opt_f64(value: Option<f64>, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    match value {
+        Some(value) => {
+            1u8.hash(hasher);
+            value.to_bits().hash(hasher);
+        }
+        None => 0u8.hash(hasher),
     }
 }
 
@@ -584,12 +649,12 @@ fn build_cut(
                 else {
                     continue;
                 };
-                // Opt-in gate texture: perturb BEFORE the floor test so echo
-                // edges go ragged the way marginal-SNR gates do on a real
-                // scope. When off, `dbz` is `sample.dbz` untouched — the
-                // output stays bit-identical to a textureless build.
+                // Reflectivity gate texture (default ON): perturb BEFORE the
+                // floor test so echo edges go ragged the way marginal-SNR gates
+                // do on a real scope. When off, `dbz` is `sample.dbz` untouched
+                // — the output stays bit-identical to a textureless build.
                 let mut dbz = sample.dbz;
-                if config.gate_texture {
+                if config.ref_gate_texture {
                     dbz += ref_gate_texture_db(cut_index, iaz, gate);
                 }
                 if !dbz.is_finite() || dbz < floor {
@@ -604,7 +669,9 @@ fn build_cut(
                     + sample.v * (cos_az as f32) * (cos_el as f32)
                     + sample.w * (sin_el as f32);
                 if vr.is_finite() {
-                    vel_row[gate] = if config.gate_texture {
+                    // Velocity gate texture (default OFF): opt-in wobble; the
+                    // clean Vr is what dealias/GBVTD consume.
+                    vel_row[gate] = if config.vel_gate_texture {
                         vr + vel_gate_texture_mps(cut_index, iaz, gate)
                     } else {
                         vr
@@ -907,6 +974,25 @@ fn parse_wrf_time(raw: &str) -> Option<DateTime<Utc>> {
         .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
 }
 
+/// The loop-engine history path key for one synthetic forecast frame. The key
+/// is the dedupe/refresh discriminator the upsert rules key on
+/// ([`ui_core::loop_engine::LoopEngine::install_batch`]): a re-import whose
+/// [`SyntheticRadarConfig::data_fingerprint`] matches produces the SAME key (the
+/// engine reuses the stored volume, rule (b)), while ANY config change produces
+/// a DIFFERENT key so the freshly-built volume replaces the stale one (rule (c),
+/// equal status + different path). `index` + `stamp` keep it unique per frame
+/// within one build; `site_id` keeps it human-readable in status/telemetry.
+pub fn synthetic_frame_path(
+    site_id: &str,
+    config_fingerprint: u64,
+    index: usize,
+    stamp: &str,
+) -> PathBuf {
+    PathBuf::from(format!(
+        "wrf-synth://{site_id}/{config_fingerprint:016x}/{index:04}_{stamp}"
+    ))
+}
+
 // ── Background job: WRF file(s) → Vec<Arc<RadarVolume>> ───────────────────────
 
 #[derive(Debug)]
@@ -921,6 +1007,11 @@ pub struct SyntheticRadarOutput {
     pub label: String,
     pub volumes: Vec<Arc<RadarVolume>>,
     pub notes: Vec<String>,
+    /// [`SyntheticRadarConfig::data_fingerprint`] of the config that built these
+    /// volumes. The install path folds it into each frame's history path key so
+    /// a re-import with CHANGED settings deduplicates as a distinct build
+    /// (replaces the stale volume) while an unchanged re-import reuses.
+    pub config_fingerprint: u64,
 }
 
 impl std::fmt::Debug for SyntheticRadarOutput {
@@ -929,6 +1020,7 @@ impl std::fmt::Debug for SyntheticRadarOutput {
             .field("label", &self.label)
             .field("volumes", &self.volumes.len())
             .field("notes", &self.notes)
+            .field("config_fingerprint", &self.config_fingerprint)
             .finish()
     }
 }
@@ -1072,6 +1164,7 @@ fn build_synthetic_from_paths(
         label: label.to_string(),
         volumes,
         notes,
+        config_fingerprint: config.data_fingerprint(),
     })
 }
 
@@ -1377,6 +1470,10 @@ mod tests {
             azimuth_count: 360,
             gate_spacing_m: 250.0,
             max_range_m: 10_000.0,
+            // Smooth field: this test asserts exact sampled values, so both
+            // textures are off (the default enables reflectivity texture).
+            ref_gate_texture: false,
+            vel_gate_texture: false,
             ..SyntheticRadarConfig::default()
         };
         let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
@@ -1430,6 +1527,9 @@ mod tests {
         bits
     }
 
+    /// The clean (both-textures-off) box fixture: the smooth trilinear
+    /// baseline the texture tests perturb from. Explicit off because the
+    /// shipped default now enables reflectivity texture.
     fn box_model_config() -> SyntheticRadarConfig {
         SyntheticRadarConfig {
             site_lat_deg: Some(39.0),
@@ -1439,6 +1539,8 @@ mod tests {
             azimuth_count: 360,
             gate_spacing_m: 250.0,
             max_range_m: 10_000.0,
+            ref_gate_texture: false,
+            vel_gate_texture: false,
             ..SyntheticRadarConfig::default()
         }
     }
@@ -1509,21 +1611,215 @@ mod tests {
         );
     }
 
-    /// The DEFAULT-OFF contract for the opt-in gate texture: the default
-    /// config leaves it off, and an off build is bit-identical to an
-    /// explicit `gate_texture: false` build — when disabled, the texture
-    /// path must not touch a single output value.
+    /// The config fingerprint is the loop-engine dedupe discriminator: an
+    /// UNCHANGED config must fingerprint identically (so a re-import reuses the
+    /// stored volume) and EVERY data-affecting field must move it (so a changed
+    /// setting rebuilds and replaces). `site_name` is presentation-only and must
+    /// NOT move it.
     #[test]
-    fn gate_texture_defaults_off_and_off_builds_are_bit_identical() {
-        assert!(
-            !SyntheticRadarConfig::default().gate_texture,
-            "gate texture must be opt-in — the smooth look is the default"
+    fn data_fingerprint_changes_with_every_data_field() {
+        use ReflectivityOperator::ClassicStoelinga;
+
+        let base = SyntheticRadarConfig {
+            site_id: "WRF".to_string(),
+            site_name: Some("Simulated WRF radar".to_string()),
+            site_lat_deg: Some(35.0),
+            site_lon_deg: Some(-97.0),
+            antenna_msl_m: Some(400.0),
+            elevations_deg: vec![0.5, 1.5, 2.4],
+            azimuth_count: 720,
+            gate_spacing_m: 250.0,
+            max_range_m: 230_000.0,
+            ref_floor_dbz: 0.0,
+            nyquist_mps: 320.0,
+            reflectivity_operator: ReflectivityOperator::ModelNative,
+            ref_gate_texture: true,
+            vel_gate_texture: false,
+        };
+        let fingerprint = base.data_fingerprint();
+
+        // Stable across a clone (deterministic, no per-run seed).
+        assert_eq!(fingerprint, base.clone().data_fingerprint());
+
+        // Presentation-only fields must NOT change the fingerprint.
+        let renamed = SyntheticRadarConfig {
+            site_name: Some("A different label".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(
+            renamed.data_fingerprint(),
+            fingerprint,
+            "site_name is a label — it must not move the data fingerprint"
         );
+
+        // Every data-affecting field must move the fingerprint. `differs`
+        // clones the base, applies one edit, and reports whether it changed.
+        let differs = |mutate: &dyn Fn(&mut SyntheticRadarConfig)| {
+            let mut config = base.clone();
+            mutate(&mut config);
+            config.data_fingerprint() != fingerprint
+        };
+        assert!(differs(&|c| c.site_id = "KTLX".to_string()), "site_id");
+        assert!(differs(&|c| c.site_lat_deg = Some(36.0)), "site_lat_deg");
+        assert!(differs(&|c| c.site_lat_deg = None), "site_lat None");
+        assert!(differs(&|c| c.site_lon_deg = Some(-96.0)), "site_lon_deg");
+        assert!(differs(&|c| c.antenna_msl_m = Some(401.0)), "antenna_msl");
+        assert!(differs(&|c| c.antenna_msl_m = None), "antenna_msl None");
+        assert!(
+            differs(&|c| c.elevations_deg = vec![0.1, 0.5]),
+            "elevations"
+        );
+        assert!(differs(&|c| c.azimuth_count = 360), "azimuth_count");
+        assert!(differs(&|c| c.gate_spacing_m = 500.0), "gate_spacing_m");
+        assert!(differs(&|c| c.max_range_m = 460_000.0), "max_range_m");
+        assert!(differs(&|c| c.ref_floor_dbz = 5.0), "ref_floor_dbz");
+        assert!(differs(&|c| c.nyquist_mps = 64.0), "nyquist_mps");
+        assert!(differs(&|c| c.ref_gate_texture = false), "ref_gate_texture");
+        assert!(differs(&|c| c.vel_gate_texture = true), "vel_gate_texture");
+        assert!(
+            differs(&|c| c.reflectivity_operator = ClassicStoelinga),
+            "operator"
+        );
+    }
+
+    /// The per-frame history path key is the dedupe discriminator: identical
+    /// inputs give an identical key (unchanged re-import reuses), a different
+    /// fingerprint gives a different key (changed config replaces), and the
+    /// per-frame index/stamp/site keep frames distinct.
+    #[test]
+    fn synthetic_frame_path_keys_on_fingerprint_and_frame() {
+        let fp = 0x1234_5678_9abc_def0u64;
+        let a = synthetic_frame_path("WRF", fp, 0, "20250621_013000");
+        // Deterministic: same inputs → identical key (so an unchanged re-import
+        // hits the reuse path).
+        assert_eq!(a, synthetic_frame_path("WRF", fp, 0, "20250621_013000"));
+        // A different fingerprint → different key (the config-change trigger).
+        assert_ne!(a, synthetic_frame_path("WRF", 1, 0, "20250621_013000"));
+        // Per-frame uniqueness: index, stamp, and site all discriminate.
+        assert_ne!(a, synthetic_frame_path("WRF", fp, 1, "20250621_013000"));
+        assert_ne!(a, synthetic_frame_path("WRF", fp, 0, "20250621_014500"));
+        assert_ne!(a, synthetic_frame_path("KTLX", fp, 0, "20250621_013000"));
+        // Fixed-width hex keeps the key stable/greppable.
+        assert!(a.to_string_lossy().contains("123456789abcdef0"));
+    }
+
+    /// End-to-end dedupe proof (the Bug-1 fix): re-importing the SAME forecast
+    /// frame with a CHANGED config must REPLACE the stale volume in the loop
+    /// engine, while an UNCHANGED re-import reuses the stored volume. This is
+    /// the exact upsert the install path drives — same identity (site + scan
+    /// time), keyed on the fingerprint path.
+    #[test]
+    fn changed_config_replaces_stale_synthetic_frame_but_unchanged_reuses() {
+        use ui_core::loop_engine::{
+            DecodedLoad, EngineId, EngineRole, FeedSource, FrameStatus, LoadTimings, LoopEngine,
+            SelectionPolicy,
+        };
+
         let fields = uniform_box_fields();
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let base = SyntheticRadarConfig {
+            site_lat_deg: Some(39.0),
+            site_lon_deg: Some(-95.0),
+            antenna_msl_m: Some(200.0),
+            elevations_deg: vec![0.5],
+            azimuth_count: 360,
+            gate_spacing_m: 250.0,
+            max_range_m: 10_000.0,
+            ..SyntheticRadarConfig::default()
+        };
+        // A genuinely different DATA config (operator swap; any data field
+        // would trip the same fingerprint change).
+        let changed = SyntheticRadarConfig {
+            reflectivity_operator: ReflectivityOperator::ClassicStoelinga,
+            ..base.clone()
+        };
+        assert_ne!(base.data_fingerprint(), changed.data_fingerprint());
+
+        // Build one frame exactly as `install_synthetic_radar_volumes` does.
+        let synth_frame = |config: &SyntheticRadarConfig| -> DecodedLoad {
+            let volume = Arc::new(build_synthetic_volume(&fields, time, config));
+            let stamp = volume.volume_time.format("%Y%m%d_%H%M%S").to_string();
+            DecodedLoad {
+                path: synthetic_frame_path(&volume.site.id, config.data_fingerprint(), 0, &stamp),
+                volume,
+                timings: LoadTimings::default(),
+                status: FrameStatus::Local,
+                source_label: "synthetic".to_string(),
+            }
+        };
+
+        let mut engine = LoopEngine::new(
+            EngineId(1),
+            EngineRole::Primary,
+            FeedSource::LocalFiles {
+                label: "synth".to_owned(),
+            },
+        );
+        // The upsert (replace vs reuse) runs before selection, so the policy is
+        // immaterial here — KeepCursor keeps the test focused on the dedupe.
+        let policy = SelectionPolicy::KeepCursor;
+
+        // First import (base config).
+        let first = synth_frame(&base);
+        let first_arc = Arc::clone(&first.volume);
+        let _ = engine.install_frame(first, &policy, None);
+        assert_eq!(engine.history.len(), 1);
+        assert!(Arc::ptr_eq(&engine.history[0].volume, &first_arc));
+
+        // Re-import the SAME frame with a CHANGED config: same identity, NEW
+        // path key → rule (c) replaces the stale volume.
+        let changed_frame = synth_frame(&changed);
+        let changed_arc = Arc::clone(&changed_frame.volume);
+        assert_ne!(
+            changed_frame.path, engine.history[0].path,
+            "changed config must yield a new path key"
+        );
+        let _ = engine.install_frame(changed_frame, &policy, None);
+        assert_eq!(engine.history.len(), 1, "same identity never duplicates");
+        assert!(
+            Arc::ptr_eq(&engine.history[0].volume, &changed_arc),
+            "changed config must REPLACE the stale volume (the staleness fix)"
+        );
+
+        // Re-import with UNCHANGED config: same key → rule (b) reuse; the freshly
+        // built (bit-identical) volume is discarded, the stored Arc is kept.
+        let reimport = synth_frame(&changed);
+        assert_eq!(
+            reimport.path, engine.history[0].path,
+            "unchanged config must yield the same path key"
+        );
+        let _ = engine.install_frame(reimport, &policy, None);
+        assert_eq!(engine.history.len(), 1);
+        assert!(
+            Arc::ptr_eq(&engine.history[0].volume, &changed_arc),
+            "unchanged config reuses the stored volume (the caching win)"
+        );
+    }
+
+    /// The shipped texture DEFAULTS (owner verdict): reflectivity texture ON,
+    /// velocity texture OFF. And when a flag is off, its perturbation path
+    /// must not touch a single output value — a both-off build is bit-identical
+    /// to a build without the feature.
+    #[test]
+    fn texture_defaults_ref_on_velocity_off_and_off_builds_are_bit_identical() {
+        let defaults = SyntheticRadarConfig::default();
+        assert!(
+            defaults.ref_gate_texture,
+            "reflectivity texture ships ON — the smooth field looks garbage without it"
+        );
+        assert!(
+            !defaults.vel_gate_texture,
+            "velocity texture stays opt-in — the clean Vr feeds dealias/GBVTD"
+        );
+
+        let fields = uniform_box_fields();
+        // box_model_config() is the both-off baseline; an explicit both-off
+        // build must be bit-identical to it.
         let config = box_model_config();
-        assert!(!config.gate_texture);
+        assert!(!config.ref_gate_texture && !config.vel_gate_texture);
         let off = SyntheticRadarConfig {
-            gate_texture: false,
+            ref_gate_texture: false,
+            vel_gate_texture: false,
             ..config.clone()
         };
         let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
@@ -1531,7 +1827,7 @@ mod tests {
         let b = build_synthetic_volume(&fields, time, &off);
         assert!(
             moment_bits(&a) == moment_bits(&b),
-            "gate_texture=false must be bit-identical to the default build"
+            "both textures off must be bit-identical to a textureless build"
         );
     }
 
@@ -1544,7 +1840,8 @@ mod tests {
         let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
         let off_config = box_model_config();
         let on_config = SyntheticRadarConfig {
-            gate_texture: true,
+            ref_gate_texture: true,
+            vel_gate_texture: true,
             ..off_config.clone()
         };
         let off = build_synthetic_volume(&fields, time, &off_config);
@@ -1613,7 +1910,7 @@ mod tests {
             ..box_model_config()
         };
         let on_config = SyntheticRadarConfig {
-            gate_texture: true,
+            ref_gate_texture: true,
             ..off_config.clone()
         };
         let count_finite = |volume: &RadarVolume| {
@@ -1969,7 +2266,7 @@ mod tests {
     ///  - `gates_default.png` (+`_zoom`) — lowest-tilt REF PPI, default
     ///    config: must look identical to the current shipped gates;
     ///  - `gates_speckle.png` (+`_zoom`) — the same PPI with the opt-in
-    ///    `gate_texture` speckle;
+    ///    reflectivity gate-texture speckle;
     ///  - `edge_before_zoom.png` / `edge_after_zoom.png` — the WRF domain
     ///    edge with the old bbox-dilated LUT (smeared off-domain ring) vs
     ///    the domain-bounded LUT (clean NaN cutoff). The "before" swaps the
@@ -1988,7 +2285,14 @@ mod tests {
         let _ = std::fs::create_dir_all(&out_dir);
 
         let file = WrfFile::open(&path).expect("open real wrfout");
-        let config = SyntheticRadarConfig::default();
+        // "gates_default" is the SMOOTH reference (both textures off) so the
+        // speckle crop below is a clean before/after; the shipped default now
+        // enables reflectivity texture, which is exactly the "speckle" look.
+        let config = SyntheticRadarConfig {
+            ref_gate_texture: false,
+            vel_gate_texture: false,
+            ..SyntheticRadarConfig::default()
+        };
         let mut fields = read_wrf_radar_fields(&file, 0, config.reflectivity_operator)
             .expect("read WRF radar fields");
         let time = file
@@ -2052,9 +2356,9 @@ mod tests {
             &out_dir.join("gates_default_zoom.png"),
         );
 
-        // (b) Speckle mode.
+        // (b) Speckle mode (reflectivity texture — the shipped default look).
         let speckle_config = SyntheticRadarConfig {
-            gate_texture: true,
+            ref_gate_texture: true,
             ..config.clone()
         };
         let speckle_volume = build_synthetic_volume(&fields, time, &speckle_config);

@@ -159,12 +159,18 @@ struct SyntheticRadarUiState {
     /// memory as the default instead of 4× more.
     #[serde(default = "wrf_default_true")]
     auto_gate_spacing: bool,
-    /// Opt-in "gate texture": deterministic speckle on the simulated
-    /// moments so they read like real Level-II gates. Off (the default,
-    /// and what an older config restores) keeps the classic smooth
-    /// trilinear look, bit-identical to before the toggle existed.
+    /// Gate texture on REFLECTIVITY: deterministic speckle on the simulated
+    /// dBZ so it reads like real Level-II gates instead of a smooth model
+    /// field. ON by default (owner: the smooth field "looks garbage without"
+    /// it); an older config with no entry restores today's default (ON).
+    #[serde(default = "wrf_default_true")]
+    ref_gate_texture: bool,
+    /// Gate texture on VELOCITY: a gentle ±0.5 m/s Vr wobble. OFF by default
+    /// and kept opt-in — the clean forward-modelled Vr feeds the velocity
+    /// dealias / GBVTD tools downstream, so a noisy Vr would pollute them. An
+    /// older config with no entry restores OFF.
     #[serde(default)]
-    gate_texture: bool,
+    vel_gate_texture: bool,
     /// Reflectivity operator: the model's own Thompson `REFL_10CM`
     /// (model native, the historical default) or the classic Stoelinga
     /// `CALCDBZ` community diagnostic. An older config with no entry restores
@@ -195,7 +201,8 @@ impl Default for SyntheticRadarUiState {
             max_range_km: default_synth_range_km(),
             gate_spacing_m: default_synth_gate_m(),
             auto_gate_spacing: true,
-            gate_texture: false,
+            ref_gate_texture: true,
+            vel_gate_texture: false,
             reflectivity_operator: crate::wrf_radar::ReflectivityOperator::default(),
             include_low_tilt: false,
         }
@@ -253,7 +260,8 @@ impl SyntheticRadarUiState {
         let mut config = crate::wrf_radar::SyntheticRadarConfig {
             max_range_m: self.clamped_range_km() * 1000.0,
             gate_spacing_m: self.effective_gate_spacing_m(),
-            gate_texture: self.gate_texture,
+            ref_gate_texture: self.ref_gate_texture,
+            vel_gate_texture: self.vel_gate_texture,
             reflectivity_operator: self.reflectivity_operator,
             elevations_deg: crate::wrf_radar::elevation_ladder(self.include_low_tilt),
             ..crate::wrf_radar::SyntheticRadarConfig::default()
@@ -1077,9 +1085,9 @@ impl ModelDataDock {
     /// into the loop engine. Returns `(status label, one volume per WRF time)`.
     pub fn take_synthetic_radar(
         &mut self,
-    ) -> Option<(String, Vec<std::sync::Arc<radar_core::RadarVolume>>)> {
+    ) -> Option<(String, u64, Vec<std::sync::Arc<radar_core::RadarVolume>>)> {
         let output = self.synthetic_radar_result.take()?;
-        Some((output.label, output.volumes))
+        Some((output.label, output.config_fingerprint, output.volumes))
     }
 
     /// Import controls (WRF/NetCDF folder pickers + status), rendered in the
@@ -1573,14 +1581,22 @@ impl ModelDataDock {
                         .small()
                         .weak(),
                     );
-                    ui.checkbox(&mut state.gate_texture, "Gate texture (experimental)")
+                    ui.checkbox(&mut state.ref_gate_texture, "Gate texture (reflectivity)")
                         .on_hover_text(
                             "Add subtle, deterministic gate-to-gate speckle (a couple of \
-                             dBZ, correlated along the radial) so the simulated moments \
-                             read like real Level-II gates instead of a smooth model \
-                             field; velocity only gets a slight wobble. Off = the classic \
-                             smooth look, unchanged.",
+                             dBZ, correlated along the radial) so the simulated reflectivity \
+                             reads like real Level-II gates instead of a smooth model field. \
+                             On by default. Off = the classic smooth look.",
                         );
+                    ui.checkbox(
+                        &mut state.vel_gate_texture,
+                        "Velocity gate texture (±0.5 m/s wobble)",
+                    )
+                    .on_hover_text(
+                        "Add a gentle ±0.5 m/s wobble to the simulated radial velocity. Off \
+                         by default and kept opt-in: the clean forward-modelled Vr feeds the \
+                         velocity dealias / GBVTD tools, and a noisy Vr would pollute them.",
+                    );
                     ui.horizontal(|ui| {
                         ui.label("Reflectivity:");
                         ui.selectable_value(
@@ -1620,8 +1636,8 @@ impl ModelDataDock {
                     if ui
                         .button("Reset to defaults")
                         .on_hover_text(
-                            "Domain centre, 230 km range, 250 m gates, smooth gates, model \
-                             native reflectivity, no extra low tilt.",
+                            "Domain centre, 230 km range, 250 m gates, textured reflectivity \
+                             gates, clean velocity, model native reflectivity, no extra low tilt.",
                         )
                         .clicked()
                     {
@@ -3009,7 +3025,14 @@ mod tests {
         assert_eq!(empty.max_range_km, 230.0);
         assert_eq!(empty.gate_spacing_m, 250.0);
         assert!(empty.auto_gate_spacing);
-        assert!(!empty.gate_texture, "gate texture restores OFF");
+        assert!(
+            empty.ref_gate_texture,
+            "reflectivity gate texture restores ON (the shipped default)"
+        );
+        assert!(
+            !empty.vel_gate_texture,
+            "velocity gate texture restores OFF (opt-in)"
+        );
         assert_eq!(
             empty.reflectivity_operator,
             crate::wrf_radar::ReflectivityOperator::ModelNative,
@@ -3024,7 +3047,8 @@ mod tests {
             max_range_km: 460.0,
             auto_gate_spacing: false,
             gate_spacing_m: 500.0,
-            gate_texture: true,
+            ref_gate_texture: false,
+            vel_gate_texture: true,
             reflectivity_operator: crate::wrf_radar::ReflectivityOperator::ClassicStoelinga,
             include_low_tilt: true,
             ..SyntheticRadarUiState::default()
@@ -3034,11 +3058,12 @@ mod tests {
         assert_eq!(back, custom);
     }
 
-    /// The default selection must produce EXACTLY the historical config
-    /// (domain centre, 230 km / 250 m) so shipping this UI changes nothing
-    /// for existing users.
+    /// The default UI selection must produce EXACTLY the library's default
+    /// scan config (domain centre, 230 km / 250 m, reflectivity texture on /
+    /// velocity texture off) so the UI and the library agree on the shipped
+    /// defaults.
     #[test]
-    fn synth_radar_default_config_matches_the_historical_default() {
+    fn synth_radar_default_config_matches_the_library_default() {
         let config = SyntheticRadarUiState::default().to_config().unwrap();
         let historical = crate::wrf_radar::SyntheticRadarConfig::default();
         assert_eq!(config.site_id, historical.site_id);
@@ -3048,8 +3073,12 @@ mod tests {
         assert_eq!(config.max_range_m, historical.max_range_m);
         assert_eq!(config.gate_spacing_m, historical.gate_spacing_m);
         assert!(
-            !config.gate_texture && !historical.gate_texture,
-            "gate texture is opt-in — defaults keep the smooth look"
+            config.ref_gate_texture && historical.ref_gate_texture,
+            "reflectivity texture ships ON by default"
+        );
+        assert!(
+            !config.vel_gate_texture && !historical.vel_gate_texture,
+            "velocity texture is opt-in — default keeps the clean Vr"
         );
         assert_eq!(
             config.reflectivity_operator,
@@ -3063,16 +3092,40 @@ mod tests {
         );
     }
 
-    /// The gate-texture checkbox flows into the scan config; everything
-    /// else stays at the historical default.
+    /// Both gate-texture checkboxes flow independently into the scan config:
+    /// reflectivity texture is ON by default, velocity texture OFF by default,
+    /// and either can be toggled without touching the other.
     #[test]
-    fn synth_radar_gate_texture_toggle_flows_into_config() {
+    fn synth_radar_gate_texture_toggles_flow_into_config() {
+        // Defaults: reflectivity texture on, velocity texture off.
+        let defaults = SyntheticRadarUiState::default().to_config().unwrap();
+        assert!(
+            defaults.ref_gate_texture,
+            "reflectivity texture on by default"
+        );
+        assert!(
+            !defaults.vel_gate_texture,
+            "velocity texture off by default"
+        );
+
+        // Turn reflectivity texture OFF (the smooth look) — velocity stays off.
+        let smooth = SyntheticRadarUiState {
+            ref_gate_texture: false,
+            ..SyntheticRadarUiState::default()
+        }
+        .to_config()
+        .unwrap();
+        assert!(!smooth.ref_gate_texture);
+        assert!(!smooth.vel_gate_texture);
+
+        // Opt into velocity texture — reflectivity texture stays on.
         let state = SyntheticRadarUiState {
-            gate_texture: true,
+            vel_gate_texture: true,
             ..SyntheticRadarUiState::default()
         };
         let config = state.to_config().unwrap();
-        assert!(config.gate_texture);
+        assert!(config.ref_gate_texture);
+        assert!(config.vel_gate_texture);
         assert_eq!(config.max_range_m, 230_000.0);
         assert_eq!(config.gate_spacing_m, 250.0);
     }

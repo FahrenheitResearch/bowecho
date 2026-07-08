@@ -8932,6 +8932,7 @@ impl ViewerApp {
     fn install_synthetic_radar_volumes(
         &mut self,
         label: String,
+        config_fingerprint: u64,
         volumes: Vec<Arc<RadarVolume>>,
         ctx: &egui::Context,
     ) {
@@ -8955,11 +8956,18 @@ impl ViewerApp {
             .map(|(index, volume)| {
                 let stamp = volume.volume_time.format("%Y%m%d_%H%M%S").to_string();
                 DecodedLoad {
-                    // Stable, unique dedupe/refresh key per forecast frame.
-                    path: PathBuf::from(format!(
-                        "wrf-synth://{}/{index:04}_{stamp}",
-                        volume.site.id
-                    )),
+                    // Stable dedupe/refresh key per forecast frame, keyed on the
+                    // config fingerprint (see `synthetic_frame_path`): a re-import
+                    // with CHANGED synthetic-radar settings yields a NEW path, so
+                    // the loop-engine upsert replaces the stale volume (rule (c),
+                    // equal status + different path) rather than keeping it (rule
+                    // (b)); an unchanged re-import keeps the same path and reuses.
+                    path: crate::wrf_radar::synthetic_frame_path(
+                        &volume.site.id,
+                        config_fingerprint,
+                        index,
+                        &stamp,
+                    ),
                     volume,
                     timings: LoadTimings::default(),
                     status: FrameStatus::Local,
@@ -30802,8 +30810,8 @@ impl ViewerApp {
             .model_dock
             .as_mut()
             .and_then(|dock| dock.take_synthetic_radar());
-        if let Some((label, volumes)) = synthetic_radar {
-            self.install_synthetic_radar_volumes(label, volumes, ctx);
+        if let Some((label, config_fingerprint, volumes)) = synthetic_radar {
+            self.install_synthetic_radar_volumes(label, config_fingerprint, volumes, ctx);
         }
         if let Some(receiver) = &self.model_layer_build_rx {
             match receiver.try_recv() {
