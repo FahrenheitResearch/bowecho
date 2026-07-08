@@ -21,8 +21,13 @@ use super::policy::{
 /// What one install did (census D6/D16). Supersedes the legacy bool
 /// returns; [`InstallOutcome::anchor_selected`] preserves their exact
 /// per-arm mapping because drain status strings key on it (D11/D16).
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[must_use = "the caller owns every side effect: display writes, status strings, cache clears"]
+///
+/// Deliberately NOT `Clone`/`Debug`/`Eq`/`PartialEq`: it now owns
+/// `reaped_history`, a move-once resource (cloning it would resurrect the
+/// very `Arc`s the reaper is meant to be the last owner of). No caller ever
+/// compared, cloned, or formatted a whole outcome — they read `.selection`,
+/// `.cross_site_clear`, and `.display_install` individually.
+#[must_use = "the caller owns every side effect: display writes, status strings, cache clears, and reaping reaped_history"]
 pub struct InstallOutcome {
     /// The cursor/selection arm that ran.
     pub selection: InstallSelection,
@@ -36,6 +41,15 @@ pub struct InstallOutcome {
     /// writes `history[index]`'s volume to the display regardless of the
     /// selection arm. Only the `FollowNewestUnlessPlaying` route sets it.
     pub display_install: Option<usize>,
+    /// The frames the cross-site guard drained out of the history, handed
+    /// back for the caller to DROP where it chooses. Non-empty exactly when
+    /// `cross_site_clear` is `Some`; empty (`Vec::new()`) on every other
+    /// install. A loaded synthetic loop is multiple GB of
+    /// `Arc<RadarVolume>`; releasing it inline on the egui update thread
+    /// froze the UI ~10s on synthetic-loop -> Live, so the primary caller
+    /// hands these to a detached reaper thread. These are the engine's last
+    /// references to those frames — the engine's history is already empty.
+    pub reaped_history: Vec<FrameHistoryEntry>,
 }
 
 impl InstallOutcome {
@@ -51,6 +65,7 @@ impl InstallOutcome {
             selection: InstallSelection::NoFrames,
             cross_site_clear: None,
             display_install: None,
+            reaped_history: Vec::new(),
         }
     }
 }
@@ -167,7 +182,7 @@ impl LoopEngine {
 
         // Census D3: one cross-site guard for every route, with the
         // diagnostic wording every path now shares.
-        let cross_site_clear = if active_volume
+        let (cross_site_clear, reaped_history) = if active_volume
             .is_some_and(|volume| volume.site.id != selected_identity.site_id)
             || history_contains_other_site(&self.history, &selected_identity.site_id)
         {
@@ -178,14 +193,22 @@ impl LoopEngine {
                 "history reset (site change to {}, had {dropped_frames} frames)",
                 selected_identity.site_id
             );
-            self.clear_history();
-            Some(CrossSiteClear {
-                new_site_id: selected_identity.site_id.clone(),
-                dropped_frames,
-                diagnostic,
-            })
+            // Drain rather than drop-in-place: the outgoing frames ride the
+            // outcome up to the caller, which reaps them off the UI thread
+            // (dropping a multi-GB synthetic loop inline froze it ~10s).
+            // Post-state is identical to `clear_history` — history empty,
+            // cursor reset — the release just happens elsewhere.
+            let reaped = self.take_history();
+            (
+                Some(CrossSiteClear {
+                    new_site_id: selected_identity.site_id.clone(),
+                    dropped_frames,
+                    diagnostic,
+                }),
+                reaped,
+            )
         } else {
-            None
+            (None, Vec::new())
         };
 
         for decoded in batch.frames {
@@ -225,6 +248,7 @@ impl LoopEngine {
             selection,
             cross_site_clear,
             display_install,
+            reaped_history,
         }
     }
 
@@ -415,17 +439,32 @@ impl LoopEngine {
         Some(index)
     }
 
-    /// Drop every frame and reset the engine-owned loop state (census D4:
-    /// history, cursor, playing/browsing, step clock). Role-specific blast
-    /// radius — storm caches, loop render cache, product-cut memory —
-    /// stays in the caller, keyed on [`InstallOutcome::cross_site_clear`]
-    /// or on having called this directly (the overlay replace-all).
-    pub fn clear_history(&mut self) {
-        self.history.clear();
+    /// Drain every frame OUT and reset the engine-owned loop state (census
+    /// D4: history, cursor, playing/browsing, step clock), returning the
+    /// drained frames so the caller drops them where it chooses. The
+    /// cross-site branch of [`Self::install_batch`] uses this to hand a
+    /// loaded synthetic loop's multi-GB `Arc<RadarVolume>` history to an
+    /// off-thread reaper instead of stalling the UI thread;
+    /// [`clear_history`](Self::clear_history) is the drop-in-place wrapper
+    /// for callers that want the release right here. Post-state is identical.
+    pub fn take_history(&mut self) -> Vec<FrameHistoryEntry> {
+        let frames = self.history.take_entries();
         self.cursor.index = 0;
         self.cursor.playing = false;
         self.cursor.browsing = false;
         self.cursor.last_step = None;
+        frames
+    }
+
+    /// Drop every frame and reset the engine-owned loop state (census D4:
+    /// history, cursor, playing/browsing, step clock). Role-specific blast
+    /// radius — storm caches, loop render cache, product-cut memory —
+    /// stays in the caller, keyed on [`InstallOutcome::cross_site_clear`]
+    /// or on having called this directly (the overlay replace-all). Drops
+    /// the frames IN PLACE — the large cross-site path instead routes
+    /// through [`Self::take_history`] to reap off-thread.
+    pub fn clear_history(&mut self) {
+        let _ = self.take_history();
     }
 }
 
@@ -726,6 +765,75 @@ mod tests {
         assert!(outcome.cross_site_clear.is_some());
     }
 
+    /// The synth->Live freeze fix: a cross-site install DRAINS the outgoing
+    /// frames into `outcome.reaped_history` (for the caller to drop
+    /// off-thread) rather than releasing them inline, while the engine's
+    /// own history ends holding only the new site's frame. A same-site
+    /// install reaps nothing.
+    #[test]
+    fn cross_site_install_reaps_outgoing_frames_for_off_thread_drop() {
+        let mut engine = engine();
+        let seed = [
+            decoded("KEAX", 10, "a"),
+            decoded("KEAX", 20, "b"),
+            decoded("KEAX", 30, "c"),
+        ];
+        // Hold clones so we can prove the reaped Vec carries the live Arcs,
+        // not copies — those clones are what the reaper thread would drop.
+        let seed_arcs: Vec<Arc<RadarVolume>> =
+            seed.iter().map(|frame| Arc::clone(&frame.volume)).collect();
+        let _ = engine.install_batch(batch(seed.to_vec()), &SELECT_PRIMARY, None, |_| false);
+
+        // Same-site install: no reap.
+        let outcome = engine.install_batch(
+            batch(vec![decoded("KEAX", 40, "d")]),
+            &SELECT_PRIMARY,
+            None,
+            |_| false,
+        );
+        assert!(
+            outcome.cross_site_clear.is_none(),
+            "same site does not clear"
+        );
+        assert!(
+            outcome.reaped_history.is_empty(),
+            "same-site install reaps nothing"
+        );
+
+        // Cross-site install: the four KEAX frames are handed back, the
+        // engine keeps only the new KTLX frame.
+        let outcome = engine.install_frame(
+            decoded("KTLX", 50, "poll://KTLX-tick"),
+            &SelectionPolicy::FollowNewestUnlessPlaying,
+            None,
+        );
+        assert!(outcome.cross_site_clear.is_some(), "guard fired");
+        assert_eq!(
+            outcome.reaped_history.len(),
+            4,
+            "every outgoing frame is drained out for the caller to reap"
+        );
+        assert_eq!(
+            engine.history.len(),
+            1,
+            "engine history ends with only the new site's frame"
+        );
+        assert_eq!(engine.history[0].identity.site_id, "KTLX");
+        // The reaped entries carry the ORIGINAL frame Arcs, so dropping the
+        // outcome (or a reaper thread) releases them — the engine no longer
+        // holds any of these three.
+        let reaped_seed_arcs = outcome
+            .reaped_history
+            .iter()
+            .filter(|frame| {
+                seed_arcs
+                    .iter()
+                    .any(|seed| Arc::ptr_eq(&frame.volume, seed))
+            })
+            .count();
+        assert_eq!(reaped_seed_arcs, 3, "the seed volume Arcs ride the reap");
+    }
+
     /// Census D5a + D9 (owner: LIVE WINS), the un-regressable pinning
     /// test: while playing, the polled route holds the cursor but still
     /// reports a display install; while browsing (not playing), the
@@ -1015,6 +1123,7 @@ mod tests {
             selection: InstallSelection::SelectedAnchor { index: 0 },
             cross_site_clear: None,
             display_install: None,
+            reaped_history: Vec::new(),
         };
         assert!(selected.anchor_selected());
         for selection in [
@@ -1034,6 +1143,7 @@ mod tests {
                 selection,
                 cross_site_clear: None,
                 display_install: None,
+                reaped_history: Vec::new(),
             };
             assert!(!outcome.anchor_selected());
         }

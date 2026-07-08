@@ -158,6 +158,19 @@ impl FrameHistory {
         self.entries.clear();
     }
 
+    /// Drain every entry OUT, leaving an empty (freshly stamped) history.
+    /// The generation bump keeps the invalidation spine honest — the
+    /// history is now empty, a distinct content snapshot — exactly as
+    /// [`Self::clear`] does. The difference is only where the drop happens:
+    /// `clear` releases the entries in place; `take_entries` hands them to
+    /// the caller, so the large cross-site install path can drop the
+    /// multi-GB `Arc<RadarVolume>` frames on a reaper thread instead of
+    /// stalling the UI thread (the synthetic-loop -> Live freeze fix).
+    pub fn take_entries(&mut self) -> Vec<FrameHistoryEntry> {
+        self.bump_generation();
+        std::mem::take(&mut self.entries)
+    }
+
     pub fn sort_by(
         &mut self,
         compare: impl FnMut(&FrameHistoryEntry, &FrameHistoryEntry) -> Ordering,
@@ -405,6 +418,27 @@ mod tests {
             history.generation(),
             stable,
             "read-only access must never bump"
+        );
+    }
+
+    /// `take_entries` drains the whole Vec out for off-thread disposal,
+    /// leaves the history empty, and bumps the generation (same content
+    /// snapshot change as `clear`, just handing the frames back).
+    #[test]
+    fn take_entries_drains_the_history_and_bumps_the_generation() {
+        let mut history = FrameHistory::new();
+        history.push(entry("KEAX", 0, "a"));
+        history.push(entry("KEAX", 5, "b"));
+        let before = history.generation();
+
+        let drained = history.take_entries();
+
+        assert_eq!(drained.len(), 2, "every entry handed back to the caller");
+        assert!(history.is_empty(), "history left empty");
+        assert_ne!(
+            history.generation(),
+            before,
+            "take_entries bumps the invalidation spine like clear"
         );
     }
 

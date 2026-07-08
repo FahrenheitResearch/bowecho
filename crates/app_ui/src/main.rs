@@ -5334,6 +5334,33 @@ struct LoopRenderCacheEntry {
     bytes: usize,
 }
 
+/// Drop a drained loop's frame history and render-cache buffers on a
+/// detached worker thread. A loaded synthetic-radar loop is multiple GB of
+/// `Arc<RadarVolume>` (plus the render cache's `Arc<[u8]>` RGBA rasters);
+/// releasing it inline on the egui update thread — which is what the loop
+/// engine's cross-site clear used to do when the first live volume replaced
+/// a synthetic loop — froze the UI ~10s while the allocator returned the
+/// memory. Both inputs are the LAST references to their buffers (the engine
+/// history is already empty; the render cache copies its RGBA out on read),
+/// so the final release happens off-thread. No-op when there is nothing to
+/// reap. On the rare spawn failure the closure is dropped here, falling back
+/// to the old inline release — correct, just slow.
+fn spawn_loop_history_reaper(
+    frames: Vec<FrameHistoryEntry>,
+    render_cache: VecDeque<LoopRenderCacheEntry>,
+) -> Option<std::thread::JoinHandle<()>> {
+    if frames.is_empty() && render_cache.is_empty() {
+        return None;
+    }
+    std::thread::Builder::new()
+        .name("loop-history-reaper".to_owned())
+        .spawn(move || {
+            drop(frames);
+            drop(render_cache);
+        })
+        .ok()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LoopRenderContextKey {
     // Deliberately excludes `cut`: low-sweep playback changes cuts on nearly
@@ -8883,6 +8910,13 @@ impl ViewerApp {
         );
         self.primary.limits.grow_to_fit = false;
 
+        // The engine DRAINED the outgoing cross-site history into the
+        // outcome (see `LoopEngine::install_batch`) rather than dropping it
+        // inline; releasing a loaded synthetic loop's multi-GB
+        // `Arc<RadarVolume>` frames on the egui update thread froze the UI
+        // ~10s on synthetic-loop -> Live. Empty on every non-cross-site
+        // install (a free drop of an empty Vec).
+        let reaped_history = outcome.reaped_history;
         if let Some(clear) = &outcome.cross_site_clear {
             // Census D3/D4: the engine cleared its own loop state and
             // reports the greppable-identical reset diagnostic; the
@@ -8892,7 +8926,18 @@ impl ViewerApp {
             // remember-then-clear order.)
             self.status = clear.diagnostic.clone();
             self.remember_current_primary_product_cut();
+            // Drain the loop render cache to the reaper BEFORE clearing side
+            // state (so `clear_loop_render_cache` then clears an already-empty
+            // deque); hand both it and the frames to a detached thread so the
+            // final Arc/raster release happens off the UI thread.
+            let reaped_render_cache = std::mem::take(&mut self.loop_render_cache);
             self.clear_primary_loop_side_state();
+            let _ = spawn_loop_history_reaper(reaped_history, reaped_render_cache);
+        } else {
+            debug_assert!(
+                reaped_history.is_empty(),
+                "the engine only drains frames on a cross-site clear"
+            );
         }
 
         match outcome.selection {
@@ -67648,6 +67693,40 @@ mod tests {
             mode: RenderWorkerCacheMode::Overlay,
             min_entries: 1,
         }
+    }
+
+    /// The synthetic-loop -> Live freeze fix: the reaper releases a drained
+    /// frame's `Arc<RadarVolume>` on its worker thread (not the caller), and
+    /// an empty reap spawns nothing.
+    #[test]
+    fn loop_history_reaper_releases_frames_off_thread() {
+        let volume = Arc::new(RadarVolume::new(
+            radar_core::RadarSite::new("WRF"),
+            chrono::Utc::now(),
+        ));
+        let weak = Arc::downgrade(&volume);
+        let entry = frame_history_entry_from_decoded(DecodedLoad {
+            path: std::path::PathBuf::from("synthetic-frame"),
+            volume,
+            timings: LoadTimings::default(),
+            status: FrameStatus::Local,
+            source_label: "simulated WRF".to_owned(),
+        });
+        // The drained entry now holds the only strong reference.
+        assert_eq!(weak.strong_count(), 1);
+
+        let handle = spawn_loop_history_reaper(vec![entry], VecDeque::new())
+            .expect("a non-empty reap spawns a worker");
+        handle.join().expect("reaper thread joins");
+        assert!(
+            weak.upgrade().is_none(),
+            "the reaper thread dropped the last frame Arc, off the UI thread"
+        );
+
+        assert!(
+            spawn_loop_history_reaper(Vec::new(), VecDeque::new()).is_none(),
+            "an empty reap is a no-op (no thread)"
+        );
     }
 
     #[test]
