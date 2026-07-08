@@ -49,6 +49,8 @@ If any step deviates from mechanical (a borrow-checker fight, a needed signature
 
 Projected: main.rs shrinks ~28k lines (~35%) through step 8, and — more importantly — the five busiest editing fronts (satellite, hazards, settings, painting, updates) each get their own file.
 
+**PHASE 1 COMPLETE (2026-07-08).** All 8 queue items landed. Item 8 (`map_paint.rs`) extracted in 4 move-only sub-moves — A projection, B chrome, C markers, D layers (recon: `radar-work/map-paint-recon-notes.md`); LoopEngine Phase-4e blocker was confirmed cleared first. `single_pane_canvas`/`grid_canvas` (input+dispatch) and the `handle_*_click` cluster stay in main.rs by design — that forces the `pub(crate)` promotions and matches the sat_paint/hazard_ui precedent; feature painters (spc/mping/glm/obs/model/storm) were excluded to keep their own module homes. Net: **main.rs 79,177 → 63,621 lines (−15,556, −19.6%)**, `map_paint.rs` = 4,449 lines. Every extraction gated move-only at exact test parity. Ratchet ceiling now 63,821.
+
 ## Phase 2 (separate approval) — state absorption
 
 Finish the in-progress migration of loose `primary.*` loop fields into `LoopEngine`/`PaneView` (the struct's own doc marks this Phase-4e). Only after that is the radar-loading/loop glue (impl #1, 10.6k lines) extractable. These commits touch real logic — they get feature-level review, not just move-review.
