@@ -181,6 +181,13 @@ struct SyntheticRadarUiState {
     /// community exports start here). Off restores the classic ladder.
     #[serde(default)]
     include_low_tilt: bool,
+    /// Ground-clutter amount, 0.0..=1.0 (shown as a 0–100% slider). Our operator
+    /// is pure physics with zero clutter; this dials in a fabricated near-radar
+    /// ground-return look (the community WRF→GR2 export's `add_ground_clutter`).
+    /// 0 (the default; an older config with no entry restores it) is the clean
+    /// physics; 1 ≈ the community-script intensity.
+    #[serde(default)]
+    clutter_intensity: f32,
 }
 
 fn default_synth_range_km() -> f64 {
@@ -205,6 +212,7 @@ impl Default for SyntheticRadarUiState {
             vel_gate_texture: false,
             reflectivity_operator: crate::wrf_radar::ReflectivityOperator::default(),
             include_low_tilt: false,
+            clutter_intensity: 0.0,
         }
     }
 }
@@ -264,6 +272,7 @@ impl SyntheticRadarUiState {
             vel_gate_texture: self.vel_gate_texture,
             reflectivity_operator: self.reflectivity_operator,
             elevations_deg: crate::wrf_radar::elevation_ladder(self.include_low_tilt),
+            clutter_intensity: self.clutter_intensity.clamp(0.0, 1.0),
             ..crate::wrf_radar::SyntheticRadarConfig::default()
         };
         match self.placement {
@@ -1597,6 +1606,21 @@ impl ModelDataDock {
                          by default and kept opt-in: the clean forward-modelled Vr feeds the \
                          velocity dealias / GBVTD tools, and a noisy Vr would pollute them.",
                     );
+                    ui.add(
+                        egui::Slider::new(&mut state.clutter_intensity, 0.0..=1.0)
+                            .text("Ground clutter")
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                    )
+                    .on_hover_text(
+                        "Simulate near-radar ground clutter: fabricated ground return \
+                         concentrated within ~40 km on the lowest tilts, fading with range and \
+                         beam height, with a few random hotspots — the look of the community \
+                         WRF→GR2 export. Our operator is pure physics (no clutter) at 0%; 100% \
+                         ≈ the community-script intensity. Clutter fills only gates weaker than \
+                         it, so storms are never overwritten, and cluttered gates read \
+                         near-zero velocity (stationary ground). Deterministic per forecast \
+                         frame — a loop does not shimmer.",
+                    );
                     ui.horizontal(|ui| {
                         ui.label("Reflectivity:");
                         ui.selectable_value(
@@ -1637,7 +1661,8 @@ impl ModelDataDock {
                         .button("Reset to defaults")
                         .on_hover_text(
                             "Domain centre, 230 km range, 250 m gates, textured reflectivity \
-                             gates, clean velocity, model native reflectivity, no extra low tilt.",
+                             gates, clean velocity, model native reflectivity, no extra low \
+                             tilt, no ground clutter.",
                         )
                         .clicked()
                     {
@@ -3039,6 +3064,10 @@ mod tests {
             "reflectivity operator restores model native"
         );
         assert!(!empty.include_low_tilt, "low tilt restores OFF");
+        assert_eq!(
+            empty.clutter_intensity, 0.0,
+            "ground clutter restores 0 (the clean physics)"
+        );
 
         // A non-default selection survives the round trip.
         let custom = SyntheticRadarUiState {
@@ -3051,6 +3080,7 @@ mod tests {
             vel_gate_texture: true,
             reflectivity_operator: crate::wrf_radar::ReflectivityOperator::ClassicStoelinga,
             include_low_tilt: true,
+            clutter_intensity: 0.5,
             ..SyntheticRadarUiState::default()
         };
         let value = serde_json::to_value(&custom).unwrap();
@@ -3174,6 +3204,43 @@ mod tests {
             plain.elevations_deg,
             crate::wrf_radar::DEFAULT_ELEVATIONS_DEG
         );
+    }
+
+    /// The ground-clutter slider flows from the UI state into the scan config
+    /// and is clamped to 0..=1; the default (0) keeps the clean physics.
+    #[test]
+    fn synth_radar_clutter_intensity_flows_into_config() {
+        // Default: no clutter.
+        let default = SyntheticRadarUiState::default().to_config().unwrap();
+        assert_eq!(
+            default.clutter_intensity, 0.0,
+            "default UI selection is the clean physics (no clutter)"
+        );
+
+        // A mid setting flows through unchanged.
+        let dialed = SyntheticRadarUiState {
+            clutter_intensity: 0.6,
+            ..SyntheticRadarUiState::default()
+        }
+        .to_config()
+        .unwrap();
+        assert!((dialed.clutter_intensity - 0.6).abs() < 1e-6);
+
+        // Out-of-range values are clamped to [0, 1].
+        let over = SyntheticRadarUiState {
+            clutter_intensity: 1.7,
+            ..SyntheticRadarUiState::default()
+        }
+        .to_config()
+        .unwrap();
+        assert_eq!(over.clutter_intensity, 1.0, "clamped to 1.0");
+        let under = SyntheticRadarUiState {
+            clutter_intensity: -0.5,
+            ..SyntheticRadarUiState::default()
+        }
+        .to_config()
+        .unwrap();
+        assert_eq!(under.clutter_intensity, 0.0, "clamped to 0.0");
     }
 
     /// NEXRAD-id placement resolves through the app's compiled-in site

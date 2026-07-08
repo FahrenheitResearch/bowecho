@@ -183,6 +183,17 @@ pub struct SyntheticRadarConfig {
     /// would pollute them. Separate from [`Self::ref_gate_texture`] on purpose:
     /// reflectivity wants the speckle, velocity does not.
     pub vel_gate_texture: bool,
+    /// Ground-clutter amount, 0.0..=1.0. Our forward operator is pure physics
+    /// and produces ZERO clutter; this dials in a fabricated near-radar
+    /// ground-return look modelled on the community WRF→GR2 export script
+    /// (`add_ground_clutter`). `0.0` (the default) skips the clutter path
+    /// entirely, so the output is bit-identical to a build without the feature;
+    /// `1.0` ≈ the community-script intensity. Intermediate values scale the
+    /// clutter *probability* and *brightness* together. The pattern is
+    /// deterministic per forecast frame (seeded from site id + valid time +
+    /// tilt) so a loop never shimmers between rebuilds of the same hour. See the
+    /// ground-clutter section (`ground_clutter_dbz`) for the model.
+    pub clutter_intensity: f32,
 }
 
 /// Antenna height above model terrain when no explicit MSL altitude is given.
@@ -210,6 +221,9 @@ impl Default for SyntheticRadarConfig {
             // OFF so the clean Vr keeps feeding dealias/GBVTD.
             ref_gate_texture: true,
             vel_gate_texture: false,
+            // No clutter by default: the operator stays pure physics and the
+            // output is bit-identical to a build without the feature.
+            clutter_intensity: 0.0,
         }
     }
 }
@@ -229,9 +243,10 @@ impl SyntheticRadarConfig {
     /// antenna placement (`site_id`, `site_lat_deg`, `site_lon_deg`,
     /// `antenna_msl_m`), the elevation ladder (which already encodes the
     /// optional 0.1° low tilt), `azimuth_count`, `gate_spacing_m`, `max_range_m`,
-    /// `ref_floor_dbz`, `nyquist_mps`, `reflectivity_operator`, and both gate-
-    /// texture flags. Deliberately EXCLUDED: `site_name` (a label — never
-    /// changes a sample).
+    /// `ref_floor_dbz`, `nyquist_mps`, `reflectivity_operator`, both gate-
+    /// texture flags, and `clutter_intensity` (so moving the clutter slider
+    /// rebuilds and replaces the stale volume on re-import). Deliberately
+    /// EXCLUDED: `site_name` (a label — never changes a sample).
     pub fn data_fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -251,6 +266,7 @@ impl SyntheticRadarConfig {
         (self.reflectivity_operator as u8).hash(&mut hasher);
         self.ref_gate_texture.hash(&mut hasher);
         self.vel_gate_texture.hash(&mut hasher);
+        self.clutter_intensity.to_bits().hash(&mut hasher);
         hasher.finish()
     }
 }
@@ -576,6 +592,13 @@ pub fn build_synthetic_volume_reporting(
         radar_frequency_mhz: None,
     };
 
+    // One deterministic seed per forecast frame, folded into every clutter
+    // draw so the same hour rebuilds bit-identically (no loop shimmer) while
+    // distinct frames get a distinct clutter pattern (the community operator's
+    // per-time-step variation). Site id + valid time; the tilt index is mixed
+    // in per cut. Cheap to compute even when clutter is off (unused then).
+    let frame_seed = clutter_frame_seed(&config.site_id, valid_time);
+
     let mut decoded_radials = 0usize;
     let tilt_total = config.elevations_deg.len();
     for (cut_index, &elevation_deg) in config.elevations_deg.iter().enumerate() {
@@ -595,6 +618,7 @@ pub fn build_synthetic_volume_reporting(
             spacing,
             gate_range.clone(),
             config,
+            frame_seed,
         );
         decoded_radials += cut.radials.len();
         volume.cuts.push(cut);
@@ -616,12 +640,25 @@ fn build_cut(
     spacing: f64,
     gate_range: GateRange,
     config: &SyntheticRadarConfig,
+    frame_seed: u32,
 ) -> ElevationCut {
     let gate_count = gate_range.gate_count;
     let el_rad = elevation_deg.to_radians();
     let sin_el = el_rad.sin();
     let cos_el = el_rad.cos();
     let floor = config.ref_floor_dbz;
+
+    // Ground clutter (opt-in). When the amount is 0 the whole clutter path is
+    // skipped and the output is bit-identical to a build without the feature.
+    // The near-radar hotspots are precomputed once per tilt (serial, ≤8 rects)
+    // so the parallel per-gate work only does an O(hotspots) membership test.
+    let clutter_amount = config.clutter_intensity.clamp(0.0, 1.0);
+    let clutter_on = clutter_amount > 0.0 && cut_index < CLUTTER_TILT_LIMIT;
+    let hotspots = if clutter_on {
+        clutter_hotspots(frame_seed, cut_index, naz, gate_count)
+    } else {
+        Vec::new()
+    };
 
     // One row per radial, sampled in parallel. Each row is `gate_count` REF and
     // `gate_count` VEL f32 values (NaN = no data / below floor / off-domain).
@@ -638,7 +675,8 @@ fn build_cut(
             for gate in 0..gate_count {
                 let slant_m = gate as f64 * spacing;
                 // Doviak & Zrnić (1993) eq. 2.28b/c under the 4/3-earth model.
-                let z_msl = antenna_msl + beam_height_above_radar_m(slant_m, elevation_deg);
+                let beam_height_m = beam_height_above_radar_m(slant_m, elevation_deg);
+                let z_msl = antenna_msl + beam_height_m;
                 let ground_m = beam_ground_range_m(slant_m, elevation_deg);
                 let east_km = ground_m * sin_az / 1000.0;
                 let north_km = ground_m * cos_az / 1000.0;
@@ -657,25 +695,66 @@ fn build_cut(
                 if config.ref_gate_texture {
                     dbz += ref_gate_texture_db(cut_index, iaz, gate);
                 }
-                if !dbz.is_finite() || dbz < floor {
-                    continue;
+                // Physics reflectivity + velocity for this gate. Both stay NaN
+                // below the floor (clear air) so ground clutter can fill them,
+                // exactly as the community operator fills the clear-air gates
+                // near the radar. With clutter off, `ref_val`/`vel_val` are
+                // committed unchanged, so the output is bit-identical.
+                let mut ref_val = f32::NAN;
+                let mut vel_val = f32::NAN;
+                if dbz.is_finite() && dbz >= floor {
+                    ref_val = dbz;
+                    // Radial velocity: wind projected onto the beam unit vector
+                    // (east, north, up) = (sinAz·cosEl, cosAz·cosEl, sinEl), with
+                    // azimuth clockwise from north. Positive = away from the radar
+                    // (NEXRAD convention). Sun & Crook (1997).
+                    let vr = sample.u * (sin_az as f32) * (cos_el as f32)
+                        + sample.v * (cos_az as f32) * (cos_el as f32)
+                        + sample.w * (sin_el as f32);
+                    if vr.is_finite() {
+                        // Velocity gate texture (default OFF): opt-in wobble; the
+                        // clean Vr is what dealias/GBVTD consume.
+                        vel_val = if config.vel_gate_texture {
+                            vr + vel_gate_texture_mps(cut_index, iaz, gate)
+                        } else {
+                            vr
+                        };
+                    }
                 }
-                ref_row[gate] = dbz;
-                // Radial velocity: wind projected onto the beam unit vector
-                // (east, north, up) = (sinAz·cosEl, cosAz·cosEl, sinEl), with
-                // azimuth clockwise from north. Positive = away from the radar
-                // (NEXRAD convention). Sun & Crook (1997).
-                let vr = sample.u * (sin_az as f32) * (cos_el as f32)
-                    + sample.v * (cos_az as f32) * (cos_el as f32)
-                    + sample.w * (sin_el as f32);
-                if vr.is_finite() {
-                    // Velocity gate texture (default OFF): opt-in wobble; the
-                    // clean Vr is what dealias/GBVTD consume.
-                    vel_row[gate] = if config.vel_gate_texture {
-                        vr + vel_gate_texture_mps(cut_index, iaz, gate)
-                    } else {
-                        vr
-                    };
+
+                // Ground clutter (opt-in), applied AFTER the reflectivity floor
+                // and only into gates weaker than the clutter value, so storms
+                // are never overwritten (the community rule).
+                if clutter_on
+                    && let Some(cv) = ground_clutter_dbz(
+                        frame_seed,
+                        cut_index,
+                        iaz,
+                        gate,
+                        az_deg as f32,
+                        (ground_m / 1000.0) as f32,
+                        beam_height_m as f32,
+                        in_clutter_hotspot(&hotspots, iaz, gate),
+                        clutter_amount,
+                    )
+                    && (!ref_val.is_finite() || ref_val < cv)
+                {
+                    ref_val = cv;
+                    // The ground is stationary: where clutter dominates a gate
+                    // that already carried a velocity, replace the wind
+                    // projection with a near-zero return. A clear-air clutter
+                    // gate had no Vr to speak of, so it is left blank (velocity
+                    // is gated on data existing).
+                    if vel_val.is_finite() {
+                        vel_val = clutter_velocity_mps(frame_seed, cut_index, iaz, gate);
+                    }
+                }
+
+                if ref_val.is_finite() {
+                    ref_row[gate] = ref_val;
+                }
+                if vel_val.is_finite() {
+                    vel_row[gate] = vel_val;
                 }
             }
             (ref_row, vel_row)
@@ -964,6 +1043,228 @@ fn ref_gate_texture_db(tilt: usize, az: usize, gate: usize) -> f32 {
 /// Velocity gate-texture perturbation (m/s), peak ±0.5 m/s.
 fn vel_gate_texture_mps(tilt: usize, az: usize, gate: usize) -> f32 {
     VEL_TEXTURE_MPS * texture_correlated_noise(tilt, az, gate, TEXTURE_SALT_VEL)
+}
+
+// ── Ground clutter (opt-in, fabricated) ───────────────────────────────────────
+//
+// Our forward operator is pure physics and produces ZERO clutter. The community
+// WRF→GR2 export script fabricates a near-radar ground-return look
+// (`add_ground_clutter`): an exponential range falloff (hard-capped at 40 km),
+// a height-AGL falloff, an elevation falloff on the lowest ~7 tilts, a
+// sinusoidal azimuthal ripple, and a handful of random near-in hotspots, applied
+// only where the existing echo is weaker. This is a native port of that look,
+// dialled by `SyntheticRadarConfig::clutter_intensity` (0 = off, 1 ≈ the script).
+//
+// Like the gate texture above, every draw is a pure hash of
+// (frame seed, tilt, azimuth, gate) — deterministic, so a rebuilt frame is
+// bit-identical and a loop never shimmers. UNLIKE the texture, the FRAME SEED
+// (site id + valid time) is folded in, so distinct forecast hours get distinct
+// clutter, reproducing the script's per-time-step variation without a live RNG.
+//
+// Antenna height: the script keys clutter on beam height AGL. We do not have a
+// per-gate terrain lookup inside the sampling loop, so we use the beam height
+// ABOVE THE ANTENNA as the AGL proxy — exact at the radar and a good
+// approximation within the 40 km clutter cap, where terrain relief is a
+// second-order effect on near-in ground return.
+
+/// Clutter is confined to the lowest tilts. The community script applies it to
+/// the first 7 elevation cuts (`n < 7`); we mirror that by cut index, so it
+/// tracks the near-ground tilts whether or not the optional 0.1° tilt is added.
+const CLUTTER_TILT_LIMIT: usize = 7;
+/// Maximum ground range for any clutter (km). Beyond this the script produces
+/// none; near-radar concentration is the whole point.
+const CLUTTER_MAX_RANGE_KM: f32 = 40.0;
+/// Base clutter reflectivity (dBZ) before the combined-factor scaling, matching
+/// the script's `clutter_base = 22 * combined_factor`.
+const CLUTTER_BASE_DBZ: f32 = 22.0;
+/// Multiplier applied inside a hotspot rectangle (the script's `*= 1.8`).
+const CLUTTER_HOTSPOT_BOOST: f32 = 1.8;
+
+const CLUTTER_SALT_ROLL: u32 = 0x436c_5250; // "ClRP" — apply/skip roll
+const CLUTTER_SALT_NOISE: u32 = 0x436c_4e5a; // "ClNZ" — dBZ noise
+const CLUTTER_SALT_TEXTURE: u32 = 0x436c_5458; // "ClTX" — dBZ texture
+const CLUTTER_SALT_VEL: u32 = 0x436c_564c; // "ClVL" — near-zero velocity jitter
+const CLUTTER_SALT_HOTSPOT: u32 = 0x436c_4853; // "ClHS" — hotspot stream seed
+
+/// One deterministic seed per forecast frame: site id + valid-time seconds,
+/// avalanche-mixed. Folded into every clutter draw so the SAME hour rebuilds
+/// identically while DISTINCT hours vary (the script's `time_step` role).
+fn clutter_frame_seed(site_id: &str, valid_time: DateTime<Utc>) -> u32 {
+    // FNV-1a over the site id bytes, then fold in the timestamp seconds.
+    let mut acc = 0x811c_9dc5u32;
+    for byte in site_id.as_bytes() {
+        acc ^= u32::from(*byte);
+        acc = acc.wrapping_mul(0x0100_0193);
+    }
+    let secs = valid_time.timestamp();
+    acc ^= (secs as u64 as u32).wrapping_mul(0x9e37_79b9);
+    acc ^= ((secs as u64 >> 32) as u32).wrapping_mul(0x85eb_ca6b);
+    texture_mix(acc)
+}
+
+/// A tiny counter-based splitmix32 stream (state += golden ratio, then the
+/// [`texture_mix`] avalanche) for the SERIAL per-tilt hotspot layout. Reusing
+/// the gate-texture finalizer keeps every random draw on one platform-
+/// independent mixer.
+struct SplitMix32 {
+    state: u32,
+}
+
+impl SplitMix32 {
+    fn new(seed: u32) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        self.state = self.state.wrapping_add(0x9e37_79b9);
+        texture_mix(self.state)
+    }
+
+    /// Uniform in [0, 1).
+    fn next_unit(&mut self) -> f32 {
+        (self.next_u32() >> 8) as f32 * (1.0 / 16_777_216.0)
+    }
+
+    /// Uniform integer in [0, n); 0 when `n == 0`.
+    fn next_below(&mut self, n: usize) -> usize {
+        if n == 0 {
+            0
+        } else {
+            ((self.next_unit() * n as f32) as usize).min(n - 1)
+        }
+    }
+}
+
+/// A near-radar hotspot rectangle in (azimuth index, gate index) space — the
+/// script's `hotspot_mask[ray_min:ray_max, gate_min:gate_max]`.
+struct ClutterRect {
+    ray_min: usize,
+    ray_max: usize,
+    gate_min: usize,
+    gate_max: usize,
+}
+
+impl ClutterRect {
+    /// Whether gate (azimuth index, range index) falls inside this rectangle.
+    fn contains(&self, az: usize, gate: usize) -> bool {
+        let in_az = (self.ray_min..self.ray_max).contains(&az);
+        let in_gate = (self.gate_min..self.gate_max).contains(&gate);
+        in_az && in_gate
+    }
+}
+
+/// The 3–8 near-radar hotspots for one tilt, laid out deterministically from
+/// the frame seed + tilt index. Positions/sizes shrink with elevation, mirroring
+/// the script (`max_gate = max(10, 100*(1 - n/8))`, ray/gate sizes `* (1 - n/8)`).
+fn clutter_hotspots(
+    frame_seed: u32,
+    tilt: usize,
+    naz: usize,
+    gate_count: usize,
+) -> Vec<ClutterRect> {
+    let tilt_seed =
+        texture_mix(frame_seed ^ (tilt as u32).wrapping_mul(0x9e37_79b9) ^ CLUTTER_SALT_HOTSPOT);
+    let mut rng = SplitMix32::new(tilt_seed);
+    let count = 3 + rng.next_below(6); // 3..=8, like the script
+    let shrink = (1.0 - tilt as f32 / 8.0).max(0.0);
+    let max_gate = ((100.0 * shrink) as usize).max(10).min(gate_count.max(1));
+    let ray_size = ((20.0 * shrink) as usize).max(4);
+    let gate_size = ((15.0 * shrink) as usize).max(4);
+    let gate_lo = 5.min(max_gate.saturating_sub(1));
+    let mut rects = Vec::with_capacity(count);
+    for _ in 0..count {
+        let ray = rng.next_below(naz.max(1));
+        let center_gate = gate_lo + rng.next_below((max_gate - gate_lo).max(1));
+        rects.push(ClutterRect {
+            ray_min: ray.saturating_sub(ray_size / 2),
+            ray_max: (ray + ray_size / 2 + 1).min(naz),
+            gate_min: center_gate.saturating_sub(gate_size / 2),
+            gate_max: (center_gate + gate_size / 2 + 1).min(gate_count),
+        });
+    }
+    rects
+}
+
+/// Whether gate (az index, range index) falls inside any hotspot rectangle.
+fn in_clutter_hotspot(hotspots: &[ClutterRect], az: usize, gate: usize) -> bool {
+    hotspots.iter().any(|h| h.contains(az, gate))
+}
+
+/// A hashed uniform in [0, 1) from (frame seed, tilt, az, gate) + a salt — the
+/// parallel-safe per-gate analogue of [`texture_noise`], order-independent so it
+/// is identical whatever order rayon visits the radials in.
+fn clutter_unit(frame_seed: u32, tilt: usize, az: usize, gate: usize, salt: u32) -> f32 {
+    let mixed = texture_mix(
+        frame_seed
+            ^ (tilt as u32).wrapping_mul(0x9e37_79b9)
+            ^ (az as u32).wrapping_mul(0x85eb_ca6b)
+            ^ (gate as u32).wrapping_mul(0xc2b2_ae35)
+            ^ salt,
+    );
+    (mixed >> 8) as f32 * (1.0 / 16_777_216.0)
+}
+
+/// Hashed signed noise in [-1, 1).
+fn clutter_signed(frame_seed: u32, tilt: usize, az: usize, gate: usize, salt: u32) -> f32 {
+    clutter_unit(frame_seed, tilt, az, gate, salt) * 2.0 - 1.0
+}
+
+/// The fabricated ground-clutter reflectivity (dBZ) for one gate, or `None` when
+/// no clutter falls here (out of range, past the tilt limit, or the probability
+/// roll misses). `intensity` (0..=1) scales BOTH the probability and the
+/// brightness, so intermediate values are rarer AND dimmer; at 1.0 the model
+/// matches the community script (bar its live-RNG boil, which the frame seed
+/// reproduces deterministically). Native port of `add_ground_clutter`.
+#[allow(clippy::too_many_arguments)]
+fn ground_clutter_dbz(
+    frame_seed: u32,
+    tilt: usize,
+    az: usize,
+    gate: usize,
+    az_deg: f32,
+    ground_range_km: f32,
+    beam_height_agl_m: f32,
+    in_hotspot: bool,
+    intensity: f32,
+) -> Option<f32> {
+    if tilt >= CLUTTER_TILT_LIMIT || ground_range_km > CLUTTER_MAX_RANGE_KM {
+        return None;
+    }
+    // Combined intensity factor (the script's product of falloffs).
+    let tilt_factor = (-(tilt as f32) * 0.8).exp();
+    let distance_factor = (-ground_range_km / 15.0).exp();
+    let height_factor = (-beam_height_agl_m.max(0.0) / 100.0).exp();
+    let azimuthal = (az_deg * 3.0).to_radians().sin() * 0.3 + 0.7;
+    let mut combined = distance_factor * height_factor * tilt_factor * azimuthal;
+    if in_hotspot {
+        combined *= CLUTTER_HOTSPOT_BOOST;
+    }
+    if combined <= 0.0 {
+        return None;
+    }
+
+    // Probability of a clutter gate (the script's `combined * (0.9 - n*0.08)`),
+    // scaled by the user amount. A per-gate roll decides apply vs skip.
+    let base_prob = (combined * (0.9 - tilt as f32 * 0.08)).max(0.0);
+    let prob = base_prob * intensity;
+    if clutter_unit(frame_seed, tilt, az, gate, CLUTTER_SALT_ROLL) >= prob {
+        return None;
+    }
+
+    // Base ≈ 22·combined dBZ + range-dependent noise, clipped 5..35, plus a
+    // little texture — then scaled by the user amount so lower settings are
+    // dimmer as well as rarer.
+    let noise_factor = 4.0 - 3.0 * tilt as f32 / 7.0;
+    let noise = clutter_signed(frame_seed, tilt, az, gate, CLUTTER_SALT_NOISE) * noise_factor;
+    let mut value = (CLUTTER_BASE_DBZ * combined + noise).clamp(5.0, 35.0);
+    value += clutter_signed(frame_seed, tilt, az, gate, CLUTTER_SALT_TEXTURE) * combined;
+    Some(value * intensity)
+}
+
+/// The near-zero radial velocity (m/s) stamped on a clutter-dominated gate:
+/// the ground is stationary, so ~0 with a small deterministic ±0.5 m/s jitter.
+fn clutter_velocity_mps(frame_seed: u32, tilt: usize, az: usize, gate: usize) -> f32 {
+    0.5 * clutter_signed(frame_seed, tilt, az, gate, CLUTTER_SALT_VEL)
 }
 
 /// Parse a WRF `Times` string ("YYYY-MM-DD_HH:MM:SS") to a UTC scan time.
@@ -1635,6 +1936,7 @@ mod tests {
             reflectivity_operator: ReflectivityOperator::ModelNative,
             ref_gate_texture: true,
             vel_gate_texture: false,
+            clutter_intensity: 0.0,
         };
         let fingerprint = base.data_fingerprint();
 
@@ -1676,6 +1978,10 @@ mod tests {
         assert!(differs(&|c| c.nyquist_mps = 64.0), "nyquist_mps");
         assert!(differs(&|c| c.ref_gate_texture = false), "ref_gate_texture");
         assert!(differs(&|c| c.vel_gate_texture = true), "vel_gate_texture");
+        assert!(
+            differs(&|c| c.clutter_intensity = 0.5),
+            "clutter_intensity — the slider must rebuild the volume"
+        );
         assert!(
             differs(&|c| c.reflectivity_operator = ClassicStoelinga),
             "operator"
@@ -1941,6 +2247,207 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The clutter scan config: the clean two-tilt box (both textures off) at a
+    /// given clutter amount. Both tilts (0.5°, 3.1°) are below the clutter tilt
+    /// limit, and every gate of the 10 km / 250 m circle is inside the 40 km cap.
+    fn clutter_box_config(intensity: f32) -> SyntheticRadarConfig {
+        SyntheticRadarConfig {
+            clutter_intensity: intensity,
+            ..box_model_config()
+        }
+    }
+
+    /// The weak-echo box: the uniform box but 8 dBZ everywhere (still 10 m/s
+    /// east wind), so fabricated clutter (up to ~35 dBZ) dominates and the
+    /// velocity-replacement path is exercised. NaN-free counting relies on the
+    /// echo being a single known value (8 dBZ) distinct from any clutter value.
+    fn weak_echo_box_fields() -> WrfRadarFields {
+        let mut fields = uniform_box_fields();
+        fields.dbz = vec![8.0f32; fields.dbz.len()];
+        fields
+    }
+
+    /// Every finite reflectivity value of a volume, tilt by tilt.
+    fn ref_values(volume: &RadarVolume) -> Vec<f32> {
+        let mut out = Vec::new();
+        for cut in &volume.cuts {
+            let MomentStorage::F32(values) = &cut.moments[&MomentType::Reflectivity].storage else {
+                panic!("F32");
+            };
+            out.extend(values.iter().copied());
+        }
+        out
+    }
+
+    /// Clutter is deterministic (a rebuilt frame is bit-identical — no loop
+    /// shimmer) and an amount of 0 injects NOTHING: every finite reflectivity is
+    /// the pristine model echo, and the field differs from a cluttered build.
+    #[test]
+    fn clutter_is_deterministic_and_zero_amount_injects_nothing() {
+        let fields = weak_echo_box_fields();
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+
+        // Amount 0: the clutter path is skipped, so every finite REF is the pure
+        // 8 dBZ echo — nothing is injected (bit-identical to the featureless path).
+        let clean = build_synthetic_volume(&fields, time, &clutter_box_config(0.0));
+        for value in ref_values(&clean).iter().filter(|value| value.is_finite()) {
+            assert!(
+                (value - 8.0).abs() < 1e-6,
+                "amount-0 REF {value} must be the pristine model echo — no clutter injected"
+            );
+        }
+
+        // Amount 1: two rebuilds of the SAME frame are bit-identical (no
+        // shimmer), and clutter actually changed the field.
+        let full = build_synthetic_volume(&fields, time, &clutter_box_config(1.0));
+        let full_again = build_synthetic_volume(&fields, time, &clutter_box_config(1.0));
+        assert_eq!(
+            moment_bits(&full),
+            moment_bits(&full_again),
+            "same frame + config must rebuild bit-identically"
+        );
+        assert_ne!(
+            moment_bits(&clean),
+            moment_bits(&full),
+            "clutter at full amount must change the field"
+        );
+
+        // A DIFFERENT forecast frame (different valid time) gets a DIFFERENT
+        // clutter pattern — the seed folds in the frame time.
+        let other_time = DateTime::<Utc>::from_timestamp(1_700_003_600, 0).unwrap();
+        let other = build_synthetic_volume(&fields, other_time, &clutter_box_config(1.0));
+        assert_ne!(
+            moment_bits(&full),
+            moment_bits(&other),
+            "distinct forecast frames must get distinct clutter"
+        );
+    }
+
+    /// The clutter amount scales the number of cluttered gates monotonically:
+    /// none at 0, some at low amounts, and strictly more at full amount. A
+    /// cluttered gate is a finite REF that exceeds the 8 dBZ model echo (clutter
+    /// is applied only where it is stronger than the existing echo).
+    #[test]
+    fn clutter_amount_increases_the_number_of_cluttered_gates() {
+        let fields = weak_echo_box_fields();
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let count = |intensity: f32| -> usize {
+            let volume = build_synthetic_volume(&fields, time, &clutter_box_config(intensity));
+            ref_values(&volume)
+                .iter()
+                .filter(|value| value.is_finite() && **value > 8.0 + 1e-3)
+                .count()
+        };
+        let zero = count(0.0);
+        let low = count(0.5);
+        let mid = count(0.75);
+        let high = count(1.0);
+        assert_eq!(zero, 0, "amount 0 produces no clutter");
+        assert!(low > 0, "amount 0.5 produces some clutter ({low})");
+        assert!(
+            mid >= low,
+            "clutter is monotonic: 0.75 ≥ 0.5 ({mid} ≥ {low})"
+        );
+        assert!(
+            high >= mid,
+            "clutter is monotonic: 1.0 ≥ 0.75 ({high} ≥ {mid})"
+        );
+        assert!(
+            high > low,
+            "full amount must clutter strictly more gates than a lower amount ({high} > {low})"
+        );
+    }
+
+    /// Storms are never overwritten: a uniform 40 dBZ field is stronger than any
+    /// clutter value (clipped to ≤ 35 dBZ, so ≲ 37 dBZ after texture), so a
+    /// full-amount build is bit-identical to a no-clutter build.
+    #[test]
+    fn clutter_never_overwrites_stronger_echo() {
+        let fields = uniform_box_fields(); // 40 dBZ everywhere
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let clean = build_synthetic_volume(&fields, time, &clutter_box_config(0.0));
+        let cluttered = build_synthetic_volume(&fields, time, &clutter_box_config(1.0));
+        assert_eq!(
+            moment_bits(&clean),
+            moment_bits(&cluttered),
+            "40 dBZ echo out-values any clutter — the field must be untouched"
+        );
+    }
+
+    /// Clutter velocity: where clutter DOMINATES a gate that carried a
+    /// wind-projected velocity, the velocity is replaced by a near-zero return
+    /// (the ground is stationary); pure-echo gates keep their wind projection.
+    /// In clear air (echo below a high floor) the clutter gate has REF but its
+    /// velocity is left blank — the near-zero override is gated on velocity data
+    /// existing, so it never fabricates a velocity where there was none.
+    #[test]
+    fn clutter_velocity_is_near_zero_where_wind_existed_and_blank_in_clear_air() {
+        let fields = weak_echo_box_fields(); // 8 dBZ, 10 m/s east wind
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+
+        // Echo present (floor 0): cluttered gates keep a (now near-zero)
+        // velocity; the surviving 8 dBZ gates keep the wind projection.
+        let volume = build_synthetic_volume(&fields, time, &clutter_box_config(1.0));
+        let mut clutter_vel_gates = 0usize;
+        let mut fast_wind_gates = 0usize;
+        for cut in &volume.cuts {
+            let MomentStorage::F32(refs) = &cut.moments[&MomentType::Reflectivity].storage else {
+                panic!("F32");
+            };
+            let MomentStorage::F32(vels) = &cut.moments[&MomentType::Velocity].storage else {
+                panic!("F32");
+            };
+            for (r, v) in refs.iter().zip(vels) {
+                if !r.is_finite() {
+                    continue;
+                }
+                if *r > 8.0 + 1e-3 {
+                    assert!(v.is_finite(), "clutter gate over echo must keep a velocity");
+                    assert!(
+                        v.abs() <= 0.51,
+                        "clutter-dominated Vr {v} must be ~0 (stationary ground)"
+                    );
+                    clutter_vel_gates += 1;
+                } else if v.is_finite() && v.abs() > 1.0 {
+                    fast_wind_gates += 1;
+                }
+            }
+        }
+        assert!(clutter_vel_gates > 0, "expected clutter-dominated gates");
+        assert!(
+            fast_wind_gates > 0,
+            "pure-echo gates must keep the wind projection"
+        );
+
+        // Clear air (floor 30, so the 8 dBZ echo never passes): any finite REF
+        // is clutter, and its velocity must be BLANK (no wind projection existed
+        // to replace).
+        let clear_cfg = SyntheticRadarConfig {
+            ref_floor_dbz: 30.0,
+            ..clutter_box_config(1.0)
+        };
+        let clear = build_synthetic_volume(&fields, time, &clear_cfg);
+        let mut clear_clutter = 0usize;
+        for cut in &clear.cuts {
+            let MomentStorage::F32(refs) = &cut.moments[&MomentType::Reflectivity].storage else {
+                panic!("F32");
+            };
+            let MomentStorage::F32(vels) = &cut.moments[&MomentType::Velocity].storage else {
+                panic!("F32");
+            };
+            for (r, v) in refs.iter().zip(vels) {
+                if r.is_finite() {
+                    assert!(
+                        !v.is_finite(),
+                        "clear-air clutter gate must leave velocity blank (gated on vel existing)"
+                    );
+                    clear_clutter += 1;
+                }
+            }
+        }
+        assert!(clear_clutter > 0, "clutter must fill some clear-air gates");
     }
 
     /// A rotated curvilinear domain (nz = 2, uniform 40 dBZ, 10 m/s east
