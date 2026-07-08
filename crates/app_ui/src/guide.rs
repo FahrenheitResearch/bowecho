@@ -724,7 +724,8 @@ fn model_data(ui: &mut egui::Ui) {
     para(
         ui,
         "Model fields and skew-T soundings (HRRR/RAP/RRFS-style CONUS workflows plus GFS \
-         worldwide), layered straight onto the radar map. Enable the \
+         worldwide, plus local WRF and NetCDF files you import yourself), layered straight \
+         onto the radar map. Enable the \
          master switch first: \u{2699} Settings \u{25b8} Model \u{25b8} Model data (off = \
          pure radar app). Windows \u{25be} \u{25b8} Model data opens the Model window.",
     );
@@ -750,6 +751,118 @@ fn model_data(ui: &mut egui::Ui) {
         "Keep runs",
         "— store retention; the newest N runs survive each fetch and startup (default 2, \
          \u{2248}1.5 GB on disk).",
+    );
+
+    subhead(ui, "LOCAL WRF & NETCDF");
+    action(
+        ui,
+        "\u{1f4c4} WRF/NetCDF file\u{2026} / \u{1f4e5} folder\u{2026}",
+        "— import local model files into the store: 2-D surface fields plus skew-T sounding \
+         volumes, one forecast hour per file. Handles raw wrfout, post-processed climate \
+         wrfout, and plain NetCDF. Click a point in the field viewer afterwards to sound it.",
+    );
+    para(
+        ui,
+        "Imported WRF fields now list under readable names — the raw wrfout registry names \
+         (wrf_swupt\u{2026}) resolve to a catalog of friendly labels with hover descriptions, \
+         and most get a Solarpower07 model palette compiled into their style so the map draws \
+         in a tuned color ramp rather than the viridis fallback. This applies to runs already \
+         on disk — no re-import.",
+    );
+    action(
+        ui,
+        "\u{1f6e0} Full model import (heavy)",
+        "— the full-diagnostics ingest (~117 fields: CAPE, severe, precip, soil, …) via \
+         wrf-core, minutes per file on large grids. A field selector narrows it to a \
+         core-only set when you don't need everything. This is NOT the simulated-radar button.",
+    );
+
+    subhead(ui, "UPPER-AIR (ISOBARIC) FIELDS");
+    para(
+        ui,
+        "Temperature, Dewpoint, RH, Wind speed, and Height at 925 / 850 / 700 / 500 / 300 / \
+         250 mb appear in the model field picker as ordinary map layers. They are synthesized \
+         from the run's isobaric sounding volumes, so imported WRF runs and downloaded models \
+         both gain them with no re-import; where a model already ships a real per-level field, \
+         that field wins over the synthesized one. On WRF fields they draw through the \
+         level-aware Solarpower07 model palettes — the resolver picks the table that matches \
+         the level and units — instead of the plain fallback ramp.",
+    );
+
+    subhead(ui, "SIMULATED RADAR FROM WRF");
+    para(
+        ui,
+        "\u{1f329} Simulated radar from WRF (fast) forward-models a raw wrfout file's \
+         hydrometeors and winds into a simulated NEXRAD-style volume — reflectivity and \
+         radial velocity on a real 14-tilt polar ladder (720 radials, 250 m gates to 230 km, \
+         4/3-Earth beam) — that renders and LOOPS in the radar view through the same pipeline \
+         as Level II: colormaps, tilts, cross-sections, and velocity dealiasing. Pick one or \
+         more files (each forecast time becomes a loop frame); it writes nothing to the model \
+         store and is labelled \u{201c}simulated\u{201d} so you always know. Runs in seconds \
+         per file, not the minutes the heavy import takes.",
+    );
+    para(
+        ui,
+        "The \u{1f4e1} Virtual radar site & range panel shapes the scan; every change rebuilds \
+         the volume on the next run.",
+    );
+    action(
+        ui,
+        "Antenna placement",
+        "— Domain center (default), an explicit Lat/Lon, or a real NEXRAD site id resolved \
+         through the app's site catalog, so you can compare the model directly against what \
+         that radar would see. Max range defaults to the classic 230 km and reaches 1000 km.",
+    );
+    action(
+        ui,
+        "Reflectivity operator",
+        "— Model native (REFL_10CM) renders the model's own Thompson 10-cm reflectivity \
+         (hotter, fatter cores in graupel and the melting layer); Classic Stoelinga (community \
+         look) always computes dBZ with fixed Marshall-Palmer intercepts, matching the \
+         wrf-python / GR2Analyst pipeline — roughly 10\u{2013}20 dB cooler in those regions, so \
+         hooks stand out of moderate echo.",
+    );
+    action(
+        ui,
+        "Gate texture",
+        "— adds deterministic, radially-correlated speckle to the simulated reflectivity so it \
+         reads like real Level-II gates instead of a smooth model field (on by default); a \
+         separate opt-in adds a gentle \u{00b1}0.5 m/s wobble to velocity, kept off so the clean \
+         Vr keeps feeding the dealias / GBVTD tools.",
+    );
+    action(
+        ui,
+        "Ground clutter",
+        "— a 0\u{2013}100% slider that paints fabricated near-radar ground return (concentrated \
+         within ~40 km on the low tilts, fading with range and beam height, with a few \
+         hotspots) modelled on the community WRF\u{2192}GR2 export. Our operator is pure physics \
+         at 0%; it only fills gates weaker than itself, so storms are never overwritten, and \
+         cluttered gates read near-zero velocity like real ground. Deterministic per frame, so \
+         a loop doesn't shimmer.",
+    );
+    action(
+        ui,
+        "Realistic Nyquist (velocity folds)",
+        "— folds the simulated radial velocity into a chosen Nyquist co-interval (default \
+         25 m/s) so fast winds alias the way a real pulse-pair radar measures them; the plain \
+         VEL product then folds while DVEL / DSRV (or the velocity dealiaser) reconstruct the \
+         true field — a dealiasing practice ground with known ground truth. Off stamps a wide \
+         Nyquist and shows the exact unfolded wind.",
+    );
+    action(
+        ui,
+        "Include 0.1\u{00b0} low tilt",
+        "— prepends a 0.1\u{00b0} sweep below the standard 0.5\u{00b0} lowest tilt (the \
+         community exports' lowest cut); the lower beam samples roughly half the height at \
+         range, so a low-level hook is better defined. Adds one sweep to every volume.",
+    );
+    action(
+        ui,
+        "Match gate size to grid resolution",
+        "— sets the gate spacing to the WRF file's own grid resolution (its DX, clamped \
+         100 m\u{2013}10 km) instead of a fixed 250 m, so a coarse model isn't oversampled into \
+         a dozen identical gates per cell. Off by default; a file with no grid-resolution \
+         attribute falls back to the configured spacing.",
     );
 
     subhead(ui, "THE MODEL WINDOW & MAP LAYER");
@@ -849,9 +962,49 @@ fn satellite(ui: &mut egui::Ui) {
     para(
         ui,
         "Himawari-9 IR/WV bands can be loaded from NOAA public buckets for Asia/Pacific \
-         context. MTG/European satellite imagery is not available in this build — it needs \
-         EUMETSAT entitlement the app cannot assume. Switching source, sector, or layer \
-         clears stale frames so late downloads from the old selection cannot flash onto the map.",
+         context. The True color button composes AHI true color (real 0.51 µm green, not a \
+         synthesized one) at the scope you pick: the west-Pacific tropics region, or the WHOLE \
+         disk at ~4 km or ~2 km effective. GOES adds its own RGB composites (GeoColor, \
+         NaturalColor, …) over the current sector. MTG/European satellite imagery is not \
+         available in this build — it needs EUMETSAT entitlement the app cannot assume. \
+         Switching source, sector, or layer clears stale frames so late downloads from the old \
+         selection cannot flash onto the map.",
+    );
+
+    subhead(ui, "IR ENHANCEMENTS");
+    para(
+        ui,
+        "The IR enhancement picker recolors brightness-temperature bands (GOES ABI and \
+         Himawari AHI bands 7\u{2013}16) through an absolute-temperature color curve: CIMSS \
+         (the default), the NESDIS BD Dvorak curve, AVN, Funktop, rainbow, or plain grayscale. \
+         Himawari IR is calibrated to true Kelvin, so a 190 K overshooting top reads 190 K and \
+         the Dvorak steps mean what they say. BowEcho colors each frame at ingest, so the \
+         enhancement applies to newly fetched frames; a frame stored before the true-Kelvin \
+         calibration keeps its legacy auto-stretch and the panel says so — load a fresh frame \
+         to use the new enhancements.",
+    );
+
+    subhead(ui, "NATIVE-RESOLUTION WINDOWS");
+    para(
+        ui,
+        "Tick Native window and set a center lat/lon and size to compose the true-color loads \
+         at the sensor's full 0.5 km resolution over just that box — only the segments and \
+         pixels covering it are fetched and decoded, so a typhoon eye stays crisp and the \
+         frames stay small enough to loop. Repeated loads of the same window stack into one \
+         loopable run. It works for Himawari (segment-level fetch) and GOES (windowed decode), \
+         and overrides the full-sector/full-disk scope while it is on.",
+    );
+
+    subhead(ui, "STORM SATELLITE (ONE PRESS)");
+    para(
+        ui,
+        "Each tropical cyclone card carries \u{1f6f0} Vis and \u{1f6f0} IR buttons beside \
+         \u{1f4cd} Focus. One press picks the covering geostationary satellite for that storm's \
+         basin (Himawari-9 / GOES-East / GOES-West), pulls a native-resolution window centered \
+         on the storm, and opens it in the Satellite window while following the frame onto the \
+         radar map — true color for Vis (daylight side only), Band-13 brightness temperature \
+         with your chosen IR enhancement for IR (day and night). One storm satellite load runs \
+         at a time.",
     );
 
     subhead(ui, "FRAME PLAYER");
@@ -1405,12 +1558,15 @@ fn sources(ui: &mut egui::Ui) {
         ui,
         "European radar is provided by EUMETNET OPERA and the participating national \
          meteorological services via the OPERA Development Radar Data (ORD) service, \
-         including Spain's AEMET radar network (opened through ORD in June 2026) — \
-         ORD data is licensed CC BY 4.0 with attribution to OPERA and the originating \
-         national services. Additional national open-data feeds: SMHI (Sweden), FMI \
+         including Spain's AEMET radar network (opened through ORD in June 2026) — all 11 \
+         sites, from the mainland to the Canary Islands — ORD data is licensed CC BY 4.0 with \
+         attribution to OPERA and the originating national services. Additional national \
+         open-data feeds: SMHI (Sweden), FMI \
          (Finland), DWD (Germany), DMI (Denmark), CHMI (Czechia), SHMU (Slovakia), \
-         GeoSphere Austria, the Estonian Environment Agency (KAIA), Romania's ANM \
-         (Data: Administrația Națională de Meteorologie (ANM) România), JMA/NICT (Japan), \
+         GeoSphere Austria, the Estonian Environment Agency (KAIA), Romania's ANM — its \
+         native open feed carrying dual-pol (ZDR, KDP, RhoHV) beyond the shared European \
+         moments (Data: Administrația Națională de Meteorologie (ANM) România), JMA/NICT \
+         (Japan), \
          Italy's Protezione Civile with ARPA Piemonte and ARPA Lombardia, Taiwan CWA, \
          and Australia's Bureau of Meteorology via NCI. Coverage and archive depth vary \
          by country and provider.",
@@ -1463,6 +1619,9 @@ fn sources(ui: &mut egui::Ui) {
         ui,
         "Research-radar color tables (the \"research\" badge in the pickers) are ported \
          from GURT V3 — the Graphic Utility Radar Toolkit by ambient330 (MIT license). \
+         The model and WRF field color tables — reflectivity, temperature (including the \
+         per-level upper-air palettes), dewpoint, RH, wind, precip, CAPE, and more — are \
+         ported from Solarpower07's WRF-Runner project. \
          The annotation tools' graphics vocabulary (front glyphs, hatch fills, \
          warning-polygon styling) reimplements the GBW Overlay renderer by grayskieswx \
          (YouTube), shared by the author for this purpose.",
