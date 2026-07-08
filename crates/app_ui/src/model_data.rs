@@ -159,6 +159,13 @@ struct SyntheticRadarUiState {
     /// memory as the default instead of 4× more.
     #[serde(default = "wrf_default_true")]
     auto_gate_spacing: bool,
+    /// Set the gate spacing equal to the WRF grid resolution (the file's `DX`),
+    /// so a coarse grid is not oversampled. When on it overrides the range/gate
+    /// controls above (auto and manual) with the per-file grid resolution,
+    /// clamped 100 m–10 km; a file with no `DX` falls back to those. OFF by
+    /// default — an older config with no entry restores it.
+    #[serde(default)]
+    match_gate_to_grid: bool,
     /// Gate texture on REFLECTIVITY: deterministic speckle on the simulated
     /// dBZ so it reads like real Level-II gates instead of a smooth model
     /// field. ON by default (owner: the smooth field "looks garbage without"
@@ -224,6 +231,7 @@ impl Default for SyntheticRadarUiState {
             max_range_km: default_synth_range_km(),
             gate_spacing_m: default_synth_gate_m(),
             auto_gate_spacing: true,
+            match_gate_to_grid: false,
             ref_gate_texture: true,
             vel_gate_texture: false,
             reflectivity_operator: crate::wrf_radar::ReflectivityOperator::default(),
@@ -289,7 +297,12 @@ impl SyntheticRadarUiState {
     fn to_config(&self) -> Result<crate::wrf_radar::SyntheticRadarConfig, String> {
         let mut config = crate::wrf_radar::SyntheticRadarConfig {
             max_range_m: self.clamped_range_km() * 1000.0,
+            // The range/gate resolution here is the FALLBACK spacing: when
+            // `match_gate_to_grid` is on the library resolves the effective gate
+            // size from each file's DX at build time, and drops back to this value
+            // for a file with no readable DX.
             gate_spacing_m: self.effective_gate_spacing_m(),
+            match_gate_to_grid: self.match_gate_to_grid,
             ref_gate_texture: self.ref_gate_texture,
             vel_gate_texture: self.vel_gate_texture,
             reflectivity_operator: self.reflectivity_operator,
@@ -1613,14 +1626,23 @@ impl ModelDataDock {
                             "Scan radius. 230 km is the classic WSR-88D Doppler range; up \
                              to 1000 km for a wide CONUS-style circle.",
                         );
-                        ui.checkbox(&mut state.auto_gate_spacing, "Auto gates")
-                            .on_hover_text(
-                                "Coarsen gate spacing proportionally with range (keeps the \
-                                 classic 920-gate count), so a wide circle costs the same \
-                                 memory as the 230 km default.",
-                            );
+                        // Grid-matching (below) resolves the gate size from each
+                        // file's DX, so the range/gate controls are overridden and
+                        // shown disabled while it is on.
+                        let gate_controls_enabled = !state.match_gate_to_grid;
+                        ui.add_enabled(
+                            gate_controls_enabled,
+                            egui::Checkbox::new(&mut state.auto_gate_spacing, "Auto gates"),
+                        )
+                        .on_hover_text(
+                            "Coarsen gate spacing proportionally with range (keeps the \
+                             classic 920-gate count), so a wide circle costs the same \
+                             memory as the 230 km default. Overridden while “Match gate \
+                             size to grid resolution” is on.",
+                        );
                         if !state.auto_gate_spacing {
-                            ui.add(
+                            ui.add_enabled(
+                                gate_controls_enabled,
                                 egui::DragValue::new(&mut state.gate_spacing_m)
                                     .range(
                                         SyntheticRadarUiState::MIN_GATE_M
@@ -1632,16 +1654,41 @@ impl ModelDataDock {
                             .on_hover_text("Gate spacing (default 250 m).");
                         }
                     });
-                    let spacing = state.effective_gate_spacing_m();
-                    let gates = (state.clamped_range_km() * 1000.0 / spacing).floor();
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{:.0} km range at {spacing:.0} m gates → {gates:.0} gates/radial",
-                            state.clamped_range_km()
-                        ))
-                        .small()
-                        .weak(),
+                    ui.checkbox(
+                        &mut state.match_gate_to_grid,
+                        "Match gate size to grid resolution",
+                    )
+                    .on_hover_text(
+                        "Set the gate spacing equal to the WRF grid resolution (the file's \
+                         DX) so a coarse grid is not oversampled — 250 m gates on a 3 km grid \
+                         imply ~12 redundant gates per model cell, more detail than the model \
+                         has. The gate size is read from each file at import (clamped 100 m–10 \
+                         km) and overrides the range/gate controls above; a file with no DX \
+                         attribute falls back to them.",
                     );
+                    if state.match_gate_to_grid {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{:.0} km range · gate size = grid resolution (file DX, \
+                                 100 m–10 km); {:.0} m used if a file has no DX",
+                                state.clamped_range_km(),
+                                state.effective_gate_spacing_m(),
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    } else {
+                        let spacing = state.effective_gate_spacing_m();
+                        let gates = (state.clamped_range_km() * 1000.0 / spacing).floor();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{:.0} km range at {spacing:.0} m gates → {gates:.0} gates/radial",
+                                state.clamped_range_km()
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    }
                     ui.checkbox(&mut state.ref_gate_texture, "Gate texture (reflectivity)")
                         .on_hover_text(
                             "Add subtle, deterministic gate-to-gate speckle (a couple of \
@@ -3146,6 +3193,10 @@ mod tests {
         assert_eq!(empty.gate_spacing_m, 250.0);
         assert!(empty.auto_gate_spacing);
         assert!(
+            !empty.match_gate_to_grid,
+            "match-gate-to-grid restores OFF (an older config uses the configured gates)"
+        );
+        assert!(
             empty.ref_gate_texture,
             "reflectivity gate texture restores ON (the shipped default)"
         );
@@ -3180,6 +3231,7 @@ mod tests {
             max_range_km: 460.0,
             auto_gate_spacing: false,
             gate_spacing_m: 500.0,
+            match_gate_to_grid: true,
             ref_gate_texture: false,
             vel_gate_texture: true,
             reflectivity_operator: crate::wrf_radar::ReflectivityOperator::ClassicStoelinga,
@@ -3208,6 +3260,10 @@ mod tests {
         assert_eq!(config.antenna_msl_m, None);
         assert_eq!(config.max_range_m, historical.max_range_m);
         assert_eq!(config.gate_spacing_m, historical.gate_spacing_m);
+        assert!(
+            !config.match_gate_to_grid && !historical.match_gate_to_grid,
+            "match-gate-to-grid is opt-in — default uses the configured gate spacing"
+        );
         assert!(
             config.ref_gate_texture && historical.ref_gate_texture,
             "reflectivity texture ships ON by default"
@@ -3238,6 +3294,57 @@ mod tests {
         assert_eq!(
             config.nyquist_mps, historical.nyquist_mps,
             "default folding Nyquist matches the library default"
+        );
+    }
+
+    /// The "Match gate size to grid resolution" checkbox flows from the UI state
+    /// into the scan config, independent of the range/gate controls: default is
+    /// off (the configured gate spacing is used), and turning it on sets the flag
+    /// while leaving the fallback `gate_spacing_m` intact for a file with no DX.
+    #[test]
+    fn synth_radar_match_gate_to_grid_flows_into_config() {
+        let default = SyntheticRadarUiState::default().to_config().unwrap();
+        assert!(
+            !default.match_gate_to_grid,
+            "default is off — the configured gate spacing is used"
+        );
+
+        // On: the flag propagates, and the manual gate spacing rides along as the
+        // build-time fallback for files without a DX attribute. `off` differs
+        // ONLY by the flag so the fingerprint check isolates it.
+        let base = SyntheticRadarUiState {
+            auto_gate_spacing: false,
+            gate_spacing_m: 500.0,
+            ..SyntheticRadarUiState::default()
+        };
+        let matched = SyntheticRadarUiState {
+            match_gate_to_grid: true,
+            ..base.clone()
+        }
+        .to_config()
+        .unwrap();
+        assert!(matched.match_gate_to_grid);
+        assert_eq!(
+            matched.gate_spacing_m, 500.0,
+            "the configured spacing is preserved as the no-DX fallback"
+        );
+
+        // Toggling only the flag moves the data fingerprint so a re-import rebuilds.
+        let off = SyntheticRadarUiState {
+            match_gate_to_grid: false,
+            ..base
+        }
+        .to_config()
+        .unwrap();
+        assert!(!off.match_gate_to_grid);
+        assert_eq!(
+            off.gate_spacing_m, matched.gate_spacing_m,
+            "same fallback spacing"
+        );
+        assert_ne!(
+            matched.data_fingerprint(),
+            off.data_fingerprint(),
+            "toggling grid-matching must rebuild the volume on re-import"
         );
     }
 

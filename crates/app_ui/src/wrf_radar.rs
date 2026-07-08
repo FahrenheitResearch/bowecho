@@ -170,6 +170,16 @@ pub struct SyntheticRadarConfig {
     pub azimuth_count: usize,
     pub gate_spacing_m: f64,
     pub max_range_m: f64,
+    /// Set the effective gate spacing equal to the WRF grid resolution (the
+    /// file's `DX` global attribute, metres) instead of [`Self::gate_spacing_m`],
+    /// so a coarse grid is not oversampled — 250 m gates on a 3 km grid imply
+    /// ~12 redundant gates per model cell, more resolution than the model has.
+    /// Resolved per file at build time by [`effective_gate_spacing`] and clamped
+    /// to `[GRID_GATE_MIN_M, GRID_GATE_MAX_M]` so a garbage `DX` cannot produce an
+    /// absurd gate count; a file with a missing/invalid `DX` falls back to
+    /// [`Self::gate_spacing_m`]. OFF by default — an OFF build uses the configured
+    /// gate spacing exactly as before (bit-identical to a build without this).
+    pub match_gate_to_grid: bool,
     /// Reflectivity floor (dBZ): gates below this — and their velocity — are
     /// left NaN so clear air renders transparent, like a real scope.
     pub ref_floor_dbz: f32,
@@ -235,6 +245,10 @@ impl Default for SyntheticRadarConfig {
             azimuth_count: 720,
             gate_spacing_m: 250.0,
             max_range_m: 230_000.0,
+            // Off by default: the effective gate spacing is the configured
+            // `gate_spacing_m`, so the default build is bit-identical to a build
+            // without the grid-matching feature.
+            match_gate_to_grid: false,
             ref_floor_dbz: 0.0,
             // The folding Nyquist (used only when `fold_velocity` is set). With
             // folding OFF (the default) `UNFOLDED_NYQUIST_MPS` (320) is stamped
@@ -271,6 +285,10 @@ impl SyntheticRadarConfig {
     /// antenna placement (`site_id`, `site_lat_deg`, `site_lon_deg`,
     /// `antenna_msl_m`), the elevation ladder (which already encodes the
     /// optional 0.1° low tilt), `azimuth_count`, `gate_spacing_m`, `max_range_m`,
+    /// `match_gate_to_grid` (the BOOL, not the resolved spacing: the effective
+    /// spacing is derived from the file's `DX` at build time and the file is fixed
+    /// for a run, so the same file + bool always resolves to the same spacing —
+    /// hashing the bool is sufficient to force a rebuild when it toggles),
     /// `ref_floor_dbz`, `nyquist_mps`, `fold_velocity` (toggling folding
     /// re-aliases every velocity gate and re-stamps the Nyquist, so it must
     /// rebuild), `reflectivity_operator`, both gate-texture flags, and
@@ -291,6 +309,7 @@ impl SyntheticRadarConfig {
         self.azimuth_count.hash(&mut hasher);
         self.gate_spacing_m.to_bits().hash(&mut hasher);
         self.max_range_m.to_bits().hash(&mut hasher);
+        self.match_gate_to_grid.hash(&mut hasher);
         self.ref_floor_dbz.to_bits().hash(&mut hasher);
         self.nyquist_mps.to_bits().hash(&mut hasher);
         self.fold_velocity.hash(&mut hasher);
@@ -314,6 +333,50 @@ impl SyntheticRadarConfig {
             UNFOLDED_NYQUIST_MPS
         }
     }
+}
+
+/// Lower clamp for a grid-matched gate spacing (m). A WRF `DX` finer than this
+/// is treated as this value so an unusually fine nest cannot blow up the gate
+/// count; also the floor for a garbage-but-positive `DX`.
+pub const GRID_GATE_MIN_M: f64 = 100.0;
+/// Upper clamp for a grid-matched gate spacing (m). A `DX` coarser than this is
+/// capped so a bogus attribute cannot collapse the scan to a handful of gates.
+pub const GRID_GATE_MAX_M: f64 = 10_000.0;
+
+/// The WRF `DX` (metres) if it is a usable grid resolution — finite and
+/// positive — else `None`. Shared by [`effective_gate_spacing`] and the import
+/// note so both agree on whether the grid resolution was actually applied.
+fn valid_grid_dx(dx_m: Option<f64>) -> Option<f64> {
+    dx_m.filter(|dx| dx.is_finite() && *dx > 0.0)
+}
+
+/// The gate spacing (m) one synthetic scan actually uses, given its config and
+/// the source file's `DX` global attribute (`None` when absent/unreadable).
+///
+/// - [`SyntheticRadarConfig::match_gate_to_grid`] OFF → the configured
+///   [`SyntheticRadarConfig::gate_spacing_m`] (today's behaviour, unchanged).
+/// - ON with a finite, positive `DX` → that `DX`, clamped to
+///   `[GRID_GATE_MIN_M, GRID_GATE_MAX_M]`, so the gate spacing matches the model
+///   grid instead of oversampling it.
+/// - ON with a missing / non-finite / non-positive `DX` → falls back to the
+///   configured `gate_spacing_m`.
+///
+/// Pure (no file handle) so the resolution is unit-testable in isolation.
+pub fn effective_gate_spacing(config: &SyntheticRadarConfig, dx_m: Option<f64>) -> f64 {
+    if config.match_gate_to_grid
+        && let Some(dx) = valid_grid_dx(dx_m)
+    {
+        dx.clamp(GRID_GATE_MIN_M, GRID_GATE_MAX_M)
+    } else {
+        config.gate_spacing_m
+    }
+}
+
+/// Whether the effective gate spacing came from the grid `DX` (matching is on
+/// AND the file supplied a usable `DX`) — drives the self-documenting import
+/// note, distinguishing a genuine grid match from a matched-but-fell-back run.
+fn matched_grid_dx(config: &SyntheticRadarConfig, dx_m: Option<f64>) -> bool {
+    config.match_gate_to_grid && valid_grid_dx(dx_m).is_some()
 }
 
 /// Alias one true (unfolded) radial velocity `v` into the Nyquist co-interval
@@ -381,6 +444,11 @@ pub struct WrfRadarFields {
     pub terrain_m: Vec<f32>,
     /// Which reflectivity source populated `dbz` ("REFL_10CM" or "dbz/CALCDBZ").
     pub ref_source: &'static str,
+    /// The source file's `DX` global attribute (grid resolution, metres) if the
+    /// file carries a readable one, else `None`. Read once with the fields (they
+    /// come from the same file) so [`build_synthetic_volume_reporting`] can size
+    /// gates to the grid via [`effective_gate_spacing`] without re-opening it.
+    pub dx_m: Option<f64>,
     lut: InverseLut,
 }
 
@@ -441,6 +509,12 @@ pub fn read_wrf_radar_fields_reporting(
     if cells == 0 || nz == 0 {
         return Err("WRF grid has zero cells".to_string());
     }
+
+    // Grid resolution (metres) for the optional "match gate size to grid" mode.
+    // Read here where the file handle lives and carried on the fields; a missing
+    // or unreadable attribute is `None` and the builder falls back to the
+    // configured gate spacing. WRF writes `DX` in metres.
+    let dx_m = file.global_attr_f64("DX").ok();
 
     let lat = file
         .xlat(timeidx)
@@ -514,6 +588,7 @@ pub fn read_wrf_radar_fields_reporting(
         w,
         terrain_m,
         ref_source,
+        dx_m,
         lut,
     })
 }
@@ -643,7 +718,9 @@ pub fn build_synthetic_volume_reporting(
     });
 
     let naz = config.azimuth_count.max(1);
-    let spacing = config.gate_spacing_m.max(1.0);
+    // Match-gate-to-grid resolves against the file's DX (carried on `fields`);
+    // off, this is the configured `gate_spacing_m`, so the build is unchanged.
+    let spacing = effective_gate_spacing(config, fields.dx_m).max(1.0);
     let gate_count = ((config.max_range_m / spacing).floor() as usize).max(1);
     let gate_range = GateRange {
         first_gate_m: 0,
@@ -1526,8 +1603,20 @@ fn build_synthetic_from_paths(
                     base
                 });
             let volume = build_synthetic_volume_reporting(&fields, valid_time, config, &progress);
+            // Self-document the gate spacing when grid-matching is on: record the
+            // effective size and whether it came from the grid DX or fell back.
+            let gate_note = if config.match_gate_to_grid {
+                let eff = effective_gate_spacing(config, fields.dx_m);
+                if matched_grid_dx(config, fields.dx_m) {
+                    format!(", gate {eff:.0} m (grid DX)")
+                } else {
+                    format!(", gate {eff:.0} m (grid DX unavailable)")
+                }
+            } else {
+                String::new()
+            };
             notes.push(format!(
-                "{name} time {timeidx}: {} radials from {}",
+                "{name} time {timeidx}: {} radials from {}{gate_note}",
                 volume.metadata.decoded_radial_count, fields.ref_source
             ));
             volumes.push(Arc::new(volume));
@@ -1838,6 +1927,7 @@ mod tests {
             w,
             terrain_m,
             ref_source: "test",
+            dx_m: None,
             lut,
         }
     }
@@ -2018,6 +2108,7 @@ mod tests {
             azimuth_count: 720,
             gate_spacing_m: 250.0,
             max_range_m: 230_000.0,
+            match_gate_to_grid: false,
             ref_floor_dbz: 0.0,
             nyquist_mps: 25.0,
             fold_velocity: false,
@@ -2062,6 +2153,10 @@ mod tests {
         assert!(differs(&|c| c.azimuth_count = 360), "azimuth_count");
         assert!(differs(&|c| c.gate_spacing_m = 500.0), "gate_spacing_m");
         assert!(differs(&|c| c.max_range_m = 460_000.0), "max_range_m");
+        assert!(
+            differs(&|c| c.match_gate_to_grid = true),
+            "match_gate_to_grid — toggling grid-matching resizes gates and must rebuild"
+        );
         assert!(differs(&|c| c.ref_floor_dbz = 5.0), "ref_floor_dbz");
         assert!(differs(&|c| c.nyquist_mps = 64.0), "nyquist_mps");
         assert!(
@@ -2078,6 +2173,114 @@ mod tests {
             differs(&|c| c.reflectivity_operator = ClassicStoelinga),
             "operator"
         );
+    }
+
+    /// The pure gate-spacing resolver, exercised without a file: matching off
+    /// always uses the configured spacing; matching on uses the grid DX (clamped)
+    /// when the file supplied a usable one, and falls back to the configured
+    /// spacing when DX is missing, non-finite, or non-positive.
+    #[test]
+    fn effective_gate_spacing_resolves_match_and_fallback() {
+        let base = SyntheticRadarConfig {
+            gate_spacing_m: 250.0,
+            ..SyntheticRadarConfig::default()
+        };
+
+        // Matching OFF: the configured spacing, regardless of any DX.
+        assert_eq!(effective_gate_spacing(&base, None), 250.0);
+        assert_eq!(effective_gate_spacing(&base, Some(3000.0)), 250.0);
+
+        let matched = SyntheticRadarConfig {
+            match_gate_to_grid: true,
+            ..base.clone()
+        };
+
+        // Matching ON with a valid DX: the grid resolution (a 3 km grid → 3 km
+        // gates, ~77 gates over 230 km instead of 920).
+        assert_eq!(effective_gate_spacing(&matched, Some(3000.0)), 3000.0);
+        assert_eq!(effective_gate_spacing(&matched, Some(250.0)), 250.0);
+
+        // Clamped both ways so a garbage-but-positive DX can't blow up / collapse
+        // the gate count.
+        assert_eq!(
+            effective_gate_spacing(&matched, Some(5.0)),
+            GRID_GATE_MIN_M,
+            "a sub-100 m DX clamps up to the floor"
+        );
+        assert_eq!(
+            effective_gate_spacing(&matched, Some(50_000.0)),
+            GRID_GATE_MAX_M,
+            "a huge DX clamps down to the ceiling"
+        );
+
+        // Matching ON but DX missing / invalid: fall back to the configured value.
+        assert_eq!(
+            effective_gate_spacing(&matched, None),
+            250.0,
+            "no DX attribute → configured spacing"
+        );
+        assert_eq!(
+            effective_gate_spacing(&matched, Some(0.0)),
+            250.0,
+            "DX == 0 is invalid → configured spacing"
+        );
+        assert_eq!(
+            effective_gate_spacing(&matched, Some(-3000.0)),
+            250.0,
+            "negative DX is invalid → configured spacing"
+        );
+        assert_eq!(
+            effective_gate_spacing(&matched, Some(f64::NAN)),
+            250.0,
+            "NaN DX is invalid → configured spacing"
+        );
+
+        // `matched_grid_dx` (drives the import note) agrees with the resolver.
+        assert!(matched_grid_dx(&matched, Some(3000.0)));
+        assert!(!matched_grid_dx(&matched, None));
+        assert!(!matched_grid_dx(&matched, Some(0.0)));
+        assert!(
+            !matched_grid_dx(&base, Some(3000.0)),
+            "off → never grid-matched"
+        );
+    }
+
+    /// A build with grid-matching ON sizes gates to the file's DX (carried on the
+    /// fields), and with DX absent falls back to the configured spacing — the
+    /// resolver wired through the actual builder, not just in isolation.
+    #[test]
+    fn build_honours_match_gate_to_grid_dx() {
+        let config = SyntheticRadarConfig {
+            site_lat_deg: Some(39.0),
+            site_lon_deg: Some(-95.0),
+            antenna_msl_m: Some(200.0),
+            elevations_deg: vec![0.5],
+            azimuth_count: 90,
+            gate_spacing_m: 250.0,
+            max_range_m: 10_000.0,
+            match_gate_to_grid: true,
+            ref_gate_texture: false,
+            vel_gate_texture: false,
+            ..SyntheticRadarConfig::default()
+        };
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+
+        // DX = 1 km on the fields → 1 km gates (10 over 10 km), overriding the
+        // configured 250 m.
+        let mut fields = uniform_box_fields();
+        fields.dx_m = Some(1000.0);
+        let volume = build_synthetic_volume(&fields, time, &config);
+        let grid = &volume.cuts[0].moments[&MomentType::Reflectivity];
+        assert_eq!(grid.gate_range.gate_spacing_m, 1000);
+        assert_eq!(grid.gate_range.gate_count, 10);
+
+        // No DX on the fields → the configured 250 m (40 over 10 km).
+        let mut no_dx = uniform_box_fields();
+        no_dx.dx_m = None;
+        let fallback = build_synthetic_volume(&no_dx, time, &config);
+        let fb_grid = &fallback.cuts[0].moments[&MomentType::Reflectivity];
+        assert_eq!(fb_grid.gate_range.gate_spacing_m, 250);
+        assert_eq!(fb_grid.gate_range.gate_count, 40);
     }
 
     /// Collect every radial's stamped Nyquist across a built volume.
@@ -2833,6 +3036,7 @@ mod tests {
             w: vec![0.0f32; nz * cells],
             terrain_m: vec![0.0f32; cells],
             ref_source: "test",
+            dx_m: None,
             lut,
         }
     }
