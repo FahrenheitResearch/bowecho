@@ -757,6 +757,7 @@ impl ViewerApp {
                 ctx.request_repaint();
             }
         });
+        self.raster_quality_settings(ui, ctx);
         ui.horizontal(|ui| {
             ui.label("Units");
             let current = self.units();
@@ -1081,6 +1082,84 @@ impl ViewerApp {
                 let _ = self.app_settings.save();
             }
         });
+    }
+
+    /// Radar raster quality (Settings ▸ Display): the supersample resolution
+    /// the frame you're viewing is rasterized at, plus the power-user whole-loop
+    /// toggle and its memory estimate. Standard + toggle-off is bit-identical to
+    /// pre-feature builds.
+    fn raster_quality_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.label("Raster quality");
+            let current = self.raster_quality();
+            let mut picked = None;
+            egui::ComboBox::from_id_salt("raster_quality")
+                .selected_text(current.label())
+                .width(140.0)
+                .show_ui(ui, |ui| {
+                    for option in settings::RasterQuality::ALL {
+                        if ui
+                            .selectable_label(current == option, option.label())
+                            .clicked()
+                        {
+                            picked = Some(option);
+                        }
+                    }
+                });
+            if let Some(option) = picked
+                && option != current
+            {
+                self.app_settings.raster_quality = option.as_slug().to_owned();
+                let _ = self.app_settings.save();
+                ctx.request_repaint();
+            }
+        })
+        .response
+        .on_hover_text(
+            "Pixel resolution the radar polar data is rasterized into for the frame you are \
+             viewing (the live frame, or the frame you stop the loop on). Higher is sharper when \
+             you zoom in and in native screenshots — real added gate detail, not upscaling — at a \
+             memory/CPU cost that grows with the pixel count (~4 MB Standard, ~16 MB High, ~64 MB \
+             Ultra per frame). While a loop plays it keeps rendering at Standard unless the toggle \
+             below is on.",
+        );
+        let mut whole_loop = self.app_settings.raster_high_res_whole_loop;
+        if ui
+            .checkbox(&mut whole_loop, "Apply high-res to the whole loop")
+            .on_hover_text(
+                "Render EVERY loop frame at the chosen quality (not just the frame you stop on) \
+                 and raise the loop cache budget to hold them. Memory-heavy on long loops — see \
+                 the estimate. This warns, it does not block: you can run a full Ultra loop and \
+                 accept the cost.",
+            )
+            .changed()
+        {
+            self.app_settings.raster_high_res_whole_loop = whole_loop;
+            let _ = self.app_settings.save();
+            ctx.request_repaint();
+        }
+        if self.app_settings.raster_high_res_whole_loop {
+            let quality = self.raster_quality();
+            let frames = self.primary.history.len();
+            let note = if frames > 0 {
+                format!(
+                    "≈ {} for the current {frames}-frame loop at {}",
+                    crate::raster_quality::format_estimate_bytes(
+                        self.whole_loop_cache_estimate_bytes()
+                    ),
+                    quality.label(),
+                )
+            } else {
+                format!(
+                    "≈ {} per frame at {} × loop length",
+                    crate::raster_quality::format_estimate_bytes(
+                        quality.per_frame_estimate_bytes()
+                    ),
+                    quality.label(),
+                )
+            };
+            ui.weak(note);
+        }
     }
 
     /// Hotkey reference (Settings ▸ Hotkeys).

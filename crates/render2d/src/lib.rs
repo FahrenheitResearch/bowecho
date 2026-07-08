@@ -121,6 +121,54 @@ pub struct ViewportRasterOptions {
     pub rotation_rad: f32,
 }
 
+impl ViewportRasterOptions {
+    /// Hard ceiling on either raster dimension. 4096²·4 = 64 MiB per RGBA
+    /// frame — a single-allocation safety cap that also stays within the
+    /// common wgpu 2D texture limit. The supersample never pushes a raster
+    /// past this; the loop-total memory is deliberately NOT capped here (the
+    /// caller's budget owns that).
+    pub const MAX_SUPERSAMPLED_DIMENSION: u32 = 4096;
+
+    /// Return these options scaled up by an integer supersample `factor`
+    /// (1/2/4 for Standard/High/Ultra): more raster pixels over the SAME map
+    /// rect, so the polar data is sampled finer (genuine detail, not upscaling).
+    ///
+    /// The scale is uniform on both axes and reduced from `factor` only so far
+    /// as needed to keep each dimension `<= MAX_SUPERSAMPLED_DIMENSION`. Because
+    /// `width · km_per_px` (the ground the raster covers) is held invariant —
+    /// width scales up by `s`, `km_per_px` down by `s` — the draw-time
+    /// re-projection in `anchored_radar_texture_rect` cancels the supersample,
+    /// so placement is unchanged and only sharpness improves.
+    ///
+    /// `factor <= 1` returns `self` untouched (bit-identical to Standard). A
+    /// base raster that already exceeds the ceiling is left as-is (never
+    /// downscaled), preserving today's behavior on very large windows.
+    pub fn supersampled(self, factor: u32) -> Self {
+        if factor <= 1 {
+            return self;
+        }
+        let base_max = self.width.max(self.height);
+        if base_max == 0 {
+            return self;
+        }
+        let cap_scale = Self::MAX_SUPERSAMPLED_DIMENSION as f32 / base_max as f32;
+        // Never below 1.0 (no downscaling), never above the requested factor.
+        let scale = (factor as f32).min(cap_scale.max(1.0));
+        if scale <= 1.0 {
+            return self;
+        }
+        Self {
+            width: ((self.width as f32) * scale).round().max(1.0) as u32,
+            height: ((self.height as f32) * scale).round().max(1.0) as u32,
+            radar_x_px: self.radar_x_px * scale,
+            radar_y_px: self.radar_y_px * scale,
+            km_per_px_x: self.km_per_px_x / scale,
+            km_per_px_y: self.km_per_px_y / scale,
+            rotation_rad: self.rotation_rad,
+        }
+    }
+}
+
 pub fn viewport_rgba_buffer_len(options: ViewportRasterOptions) -> usize {
     let (width, height) = viewport_dimensions(options);
     rgba_len(width, height)
@@ -3902,6 +3950,83 @@ mod tests {
     #[test]
     fn base_layer_starts_visible() {
         assert!(RenderLayer::base(MomentType::Reflectivity).visible);
+    }
+
+    fn sample_viewport_options() -> ViewportRasterOptions {
+        ViewportRasterOptions {
+            width: 800,
+            height: 600,
+            radar_x_px: 400.0,
+            radar_y_px: 300.0,
+            km_per_px_x: 0.5,
+            km_per_px_y: 0.5,
+            rotation_rad: 0.1,
+        }
+    }
+
+    #[test]
+    fn supersample_factor_one_is_identity() {
+        let base = sample_viewport_options();
+        assert_eq!(base.supersampled(1), base);
+        assert_eq!(base.supersampled(0), base);
+    }
+
+    #[test]
+    fn supersample_scales_pixels_and_preserves_ground_coverage() {
+        let base = sample_viewport_options();
+        let hi = base.supersampled(4);
+        assert_eq!(hi.width, 3200);
+        assert_eq!(hi.height, 2400);
+        assert_eq!(hi.radar_x_px, 1600.0);
+        assert_eq!(hi.radar_y_px, 1200.0);
+        // rotation is unchanged; ground covered (dimension · km_per_px) invariant.
+        assert_eq!(hi.rotation_rad, base.rotation_rad);
+        assert!(
+            ((hi.width as f32 * hi.km_per_px_x) - (base.width as f32 * base.km_per_px_x)).abs()
+                < 1e-3
+        );
+        assert!(
+            ((hi.height as f32 * hi.km_per_px_y) - (base.height as f32 * base.km_per_px_y)).abs()
+                < 1e-3
+        );
+    }
+
+    #[test]
+    fn supersample_clamps_to_the_dimension_ceiling() {
+        // Ultra (4x) on a 1500-wide base would be 6000px; clamp holds it at 4096.
+        let base = ViewportRasterOptions {
+            width: 1500,
+            height: 1000,
+            radar_x_px: 0.0,
+            radar_y_px: 0.0,
+            km_per_px_x: 1.0,
+            km_per_px_y: 1.0,
+            rotation_rad: 0.0,
+        };
+        let hi = base.supersampled(4);
+        assert!(hi.width <= ViewportRasterOptions::MAX_SUPERSAMPLED_DIMENSION);
+        assert!(hi.height <= ViewportRasterOptions::MAX_SUPERSAMPLED_DIMENSION);
+        assert_eq!(hi.width, 4096);
+        // Ground coverage stays invariant even when clamped.
+        assert!(
+            ((hi.width as f32 * hi.km_per_px_x) - (base.width as f32 * base.km_per_px_x)).abs()
+                < 1.0
+        );
+    }
+
+    #[test]
+    fn supersample_never_downscales_an_oversized_base() {
+        // A base already past the ceiling is left untouched (today's behavior).
+        let base = ViewportRasterOptions {
+            width: 5000,
+            height: 3000,
+            radar_x_px: 10.0,
+            radar_y_px: 20.0,
+            km_per_px_x: 0.25,
+            km_per_px_y: 0.25,
+            rotation_rad: 0.0,
+        };
+        assert_eq!(base.supersampled(2), base);
     }
 
     #[test]

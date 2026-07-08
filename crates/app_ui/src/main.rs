@@ -76,6 +76,7 @@ mod obs_soundings;
 mod overlays;
 mod placefiles;
 mod product_select;
+mod raster_quality;
 mod rhi;
 mod sat_paint;
 mod sat_window;
@@ -13102,6 +13103,7 @@ impl ViewerApp {
             Arc::clone(&frame.volume),
             previous_volume,
             cut,
+            self.loop_raster_supersample_factor(),
         )
     }
 
@@ -13127,6 +13129,7 @@ impl ViewerApp {
             volume,
             previous_volume,
             self.selected_cut,
+            self.displayed_raster_supersample_factor(),
         )
     }
 
@@ -13137,6 +13140,7 @@ impl ViewerApp {
         volume: Arc<RadarVolume>,
         previous_volume: Option<Arc<RadarVolume>>,
         cut: usize,
+        supersample_factor: u32,
     ) -> Option<RenderRequest> {
         // Volume-wide derived products (CREF/ET/VIL/MEHS/POSH/POH/MARC/...)
         // need a COMPLETE volume: on a live-partial frame the column walk
@@ -13146,7 +13150,12 @@ impl ViewerApp {
         // inspector uses the same helper so it cannot sample a different
         // partial volume than the one currently rendered.
         let volume = self.display_source_volume_for_product(&self.selected_product, volume);
-        let (viewport_options, viewport_key) = self.viewport_raster_options(ctx, rect)?;
+        // Smart-default raster quality: `supersample_factor` is the displayed
+        // frame's chosen quality (1 during active playback) or the loop-frame
+        // factor. factor 1 leaves the base options/key bit-identical to today.
+        let (viewport_options, _) = self.viewport_raster_options(ctx, rect)?;
+        let viewport_options = viewport_options.supersampled(supersample_factor);
+        let viewport_key = raster_quality::viewport_key_for_options(viewport_options);
         let color_tables = self.render_color_tables_for_product(&self.selected_product);
         let color_table_signature =
             color_tables.signature_for_family(self.selected_product.color_family());
@@ -13325,7 +13334,9 @@ impl ViewerApp {
     }
 
     fn loop_render_cache_budget_bytes(&self) -> usize {
-        loop_render_cache_budget_bytes_for_threads(effective_worker_threads())
+        // Thread-based budget, raised to hold the whole loop when the
+        // "Apply high-res to the whole loop" toggle is on (raster_quality.rs).
+        self.raster_quality_loop_cache_budget_bytes()
     }
 
     fn pause_loop_prewarm_for_interaction(&mut self) {
@@ -15649,7 +15660,12 @@ impl ViewerApp {
         // so the u8 conversion cannot fail in practice.
         let pane_lane = u8::try_from(pane_number).ok()?;
         let volume = self.extra_pane_display_volume(pane_slot)?;
-        let (viewport_options, viewport_key) = self.viewport_raster_options(ctx, rect)?;
+        // Extra panes are displayed radar layers too — give them the same
+        // smart-default quality as the primary frame (Standard during playback).
+        let (viewport_options, _) = self.viewport_raster_options(ctx, rect)?;
+        let viewport_options =
+            viewport_options.supersampled(self.displayed_raster_supersample_factor());
+        let viewport_key = raster_quality::viewport_key_for_options(viewport_options);
         let (product, pane_cut) = self
             .extra_panes
             .get(pane_slot)
@@ -15913,15 +15929,7 @@ impl ViewerApp {
             km_per_px_y,
             rotation_rad: rotation_q,
         };
-        let key = ViewportKey {
-            width,
-            height,
-            radar_x_px: (radar_x_px * 8.0).round() as i32,
-            radar_y_px: (radar_y_px * 8.0).round() as i32,
-            km_per_px_x: (km_per_px_x * 1_000_000.0).round() as i32,
-            km_per_px_y: (km_per_px_y * 1_000_000.0).round() as i32,
-            rotation_mrad: (rotation_q * 1000.0).round() as i16,
-        };
+        let key = raster_quality::viewport_key_for_options(options);
         Some((options, key))
     }
 

@@ -120,6 +120,98 @@ pub struct LoopSweepControl {
     pub extra_pane_overrides: BTreeMap<u8, SweepPolicySet>,
 }
 
+/// Radar raster quality: the supersample factor the polar radar data is
+/// rasterized into for the frame the user is looking at. Higher factors mean
+/// genuinely finer gate sampling (real added detail, not upscaling) so zoomed
+/// views and native screenshots are sharper — at a memory/CPU cost that scales
+/// with the pixel count. Persisted as a lowercase slug (see the string-slug
+/// convention used by `units`/`basemap_style`) so old and new builds interop
+/// and an unknown value falls back to `Standard` instead of failing the whole
+/// settings load.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RasterQuality {
+    /// 1x — the historical behavior: the radar raster matches the on-screen
+    /// map size. Nominal reference square 1024².
+    #[default]
+    Standard,
+    /// 2x supersample. Nominal reference square 2048² (16 MiB/frame).
+    High,
+    /// 4x supersample. Nominal reference square 4096² (64 MiB/frame).
+    Ultra,
+}
+
+impl RasterQuality {
+    pub const ALL: [Self; 3] = [Self::Standard, Self::High, Self::Ultra];
+
+    /// Parse a persisted slug; anything unrecognized (including an older
+    /// build's future value) reads as `Standard`.
+    pub fn from_slug(slug: &str) -> Self {
+        match slug {
+            "high" => Self::High,
+            "ultra" => Self::Ultra,
+            _ => Self::Standard,
+        }
+    }
+
+    pub fn as_slug(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::High => "high",
+            Self::Ultra => "ultra",
+        }
+    }
+
+    /// Menu label including the nominal reference square.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Standard => "Standard (1024)",
+            Self::High => "High (2048)",
+            Self::Ultra => "Ultra (4096)",
+        }
+    }
+
+    /// Integer supersample multiplier applied to the on-screen raster size.
+    pub fn supersample_factor(self) -> u32 {
+        match self {
+            Self::Standard => 1,
+            Self::High => 2,
+            Self::Ultra => 4,
+        }
+    }
+
+    /// Nominal reference square edge in pixels (the "1024/2048/4096" the user
+    /// sees). Used for the conservative loop-memory estimate; the actual raster
+    /// is map-rect sized and clamped to 4096²/side, so this is a representative
+    /// upper bound at typical window sizes.
+    pub fn nominal_dim(self) -> u32 {
+        match self {
+            Self::Standard => 1024,
+            Self::High => 2048,
+            Self::Ultra => 4096,
+        }
+    }
+
+    /// RGBA bytes for one frame at the nominal reference square (`dim²·4`).
+    pub fn per_frame_estimate_bytes(self) -> u64 {
+        let dim = self.nominal_dim() as u64;
+        dim * dim * 4
+    }
+}
+
+/// Estimated bytes to hold `frame_count` loop frames at `quality` — the figure
+/// shown next to the "Apply high-res to the whole loop" toggle. Deliberately a
+/// simple `per_frame · frames` upper bound (e.g. 60 Ultra frames ≈ 3.8 GB): it
+/// warns, it never blocks.
+pub fn loop_cache_estimate_bytes(quality: RasterQuality, frame_count: usize) -> u64 {
+    quality
+        .per_frame_estimate_bytes()
+        .saturating_mul(frame_count as u64)
+}
+
+fn default_raster_quality() -> String {
+    RasterQuality::Standard.as_slug().to_owned()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -580,6 +672,18 @@ pub struct AppSettings {
     /// remain UTC regardless of this display preference.
     #[serde(default = "default_time_zone")]
     pub time_zone: String,
+    /// Radar raster quality slug ("standard"/"high"/"ultra"): the supersample
+    /// factor the frame the user is looking at is rasterized at. Parsed via
+    /// `RasterQuality::from_slug` at use sites; unknown = Standard. Default
+    /// "standard" keeps rendering bit-identical to pre-feature builds.
+    #[serde(default = "default_raster_quality")]
+    pub raster_quality: String,
+    /// Power-user toggle: when true the WHOLE loop-playback render cache also
+    /// renders at `raster_quality` (and the cache byte budget is raised to hold
+    /// it), not just the displayed frame. Default false keeps loop playback
+    /// lightweight (Standard-sized cache frames) as before.
+    #[serde(default)]
+    pub raster_high_res_whole_loop: bool,
 }
 
 fn default_units() -> String {
@@ -866,6 +970,8 @@ impl Default for AppSettings {
             model_slug: default_model_slug(),
             units: default_units(),
             time_zone: default_time_zone(),
+            raster_quality: default_raster_quality(),
+            raster_high_res_whole_loop: false,
         }
     }
 }
@@ -1346,6 +1452,62 @@ mod tests {
     #[test]
     fn brand_default_stays_sparse_in_app_settings_json() {
         assert!(!AppSettings::default().to_json().contains("\"brand\""));
+    }
+
+    #[test]
+    fn raster_quality_default_is_standard_and_bit_identical() {
+        let settings = AppSettings::default();
+        assert_eq!(settings.raster_quality, "standard");
+        assert!(!settings.raster_high_res_whole_loop);
+        assert_eq!(
+            RasterQuality::from_slug(&settings.raster_quality),
+            RasterQuality::Standard
+        );
+        assert_eq!(RasterQuality::Standard.supersample_factor(), 1);
+    }
+
+    #[test]
+    fn raster_quality_factor_and_frame_bytes_mapping() {
+        assert_eq!(RasterQuality::Standard.supersample_factor(), 1);
+        assert_eq!(RasterQuality::High.supersample_factor(), 2);
+        assert_eq!(RasterQuality::Ultra.supersample_factor(), 4);
+        assert_eq!(RasterQuality::Standard.per_frame_estimate_bytes(), 4 << 20); // 1024²·4 = 4 MiB
+        assert_eq!(RasterQuality::High.per_frame_estimate_bytes(), 16 << 20); // 2048²·4 = 16 MiB
+        assert_eq!(RasterQuality::Ultra.per_frame_estimate_bytes(), 64 << 20); // 4096²·4 = 64 MiB
+    }
+
+    #[test]
+    fn raster_quality_slug_round_trips_and_unknown_falls_back() {
+        for quality in RasterQuality::ALL {
+            assert_eq!(RasterQuality::from_slug(quality.as_slug()), quality);
+        }
+        assert_eq!(
+            RasterQuality::from_slug("nonsense"),
+            RasterQuality::Standard
+        );
+        assert_eq!(RasterQuality::from_slug(""), RasterQuality::Standard);
+    }
+
+    #[test]
+    fn loop_cache_estimate_matches_owner_example() {
+        // 60-frame Ultra loop ≈ 3.8 GB (the figure shown next to the toggle).
+        let bytes = loop_cache_estimate_bytes(RasterQuality::Ultra, 60);
+        assert_eq!(bytes, 60 * (64 << 20));
+        let gib = bytes as f64 / (1u64 << 30) as f64;
+        assert!((3.7..3.9).contains(&gib), "{gib} GiB not ≈ 3.8");
+        assert_eq!(loop_cache_estimate_bytes(RasterQuality::Standard, 0), 0);
+    }
+
+    #[test]
+    fn raster_quality_persists_through_json_round_trip() {
+        let settings = AppSettings {
+            raster_quality: RasterQuality::Ultra.as_slug().to_owned(),
+            raster_high_res_whole_loop: true,
+            ..Default::default()
+        };
+        let restored = AppSettings::from_json(&settings.to_json());
+        assert_eq!(restored.raster_quality, "ultra");
+        assert!(restored.raster_high_res_whole_loop);
     }
 
     #[test]
