@@ -131,6 +131,17 @@ pub struct Vol3d {
     pub fly_speed: f32,
     pub threshold_dbz: f32,
     pub threshold_mode: Vol3dThresholdMode,
+    /// Velocity mode only: reflectivity structure gate (dBZ). The volume body
+    /// takes its shape from where reflectivity exceeds this, and the signed
+    /// velocity is painted only inside that body.
+    pub vel_ref_gate_dbz: f32,
+    /// Velocity mode only: 0 shows all flow at the reflectivity opacity (broad
+    /// flow), 1 fades near-zero flow and lets strong inbound/outbound couplets
+    /// dominate.
+    pub vel_couplet_emphasis: f32,
+    /// True when the currently uploaded box is a velocity two-box pair
+    /// (reflectivity structure + velocity color). Drives the shader mode flag.
+    pub velocity_color_active: bool,
     pub opacity: f32,
     /// Optical-depth multiplier. Opacity controls each sample; density controls
     /// how quickly repeated samples accumulate into a solid echo body.
@@ -197,6 +208,13 @@ pub struct VolumeBox {
     pub data: Vec<u8>,
     pub n: usize,
     pub nz: usize,
+    /// Optional co-located color box, same `n`/`nz` lattice as `data`. Present
+    /// only in velocity mode: `data` then carries the REFLECTIVITY structure
+    /// (opacity/threshold/shading) while `color_data` carries the signed
+    /// velocity that drives the LUT color. `None` = single-box (reflectivity
+    /// and every other moment): color comes from `data` itself, exactly as
+    /// before.
+    pub color_data: Option<Vec<u8>>,
     /// Raw normalized dBZ for the low-level floor. Rows run south-to-north,
     /// exactly like the y dimension of `volume_box_resample`.
     pub floor_data: Option<Vec<u8>>,
@@ -219,6 +237,9 @@ impl Default for Vol3d {
             fly_speed: 1.2,
             threshold_dbz: 35.0,
             threshold_mode: Vol3dThresholdMode::Above,
+            vel_ref_gate_dbz: 15.0,
+            vel_couplet_emphasis: 0.35,
+            velocity_color_active: false,
             opacity: 0.55,
             density: 1.0,
             shading: 0.65,
@@ -433,6 +454,41 @@ impl Vol3d {
         self.quality = Vol3dQuality::Balanced;
     }
 
+    /// Velocity two-box preset: fill the whole precipitation body with its
+    /// signed velocity color (no couplet emphasis, low reflectivity gate).
+    /// Velocity structure is fine-grained, so all velocity presets ray-march at
+    /// High quality to keep the volume smooth.
+    pub fn apply_velocity_broad_preset(&mut self) {
+        self.vel_ref_gate_dbz = 12.0;
+        self.vel_couplet_emphasis = 0.0;
+        self.opacity = 0.50;
+        self.density = 1.00;
+        self.shading = 0.55;
+        self.quality = Vol3dQuality::High;
+    }
+
+    /// Velocity two-box preset: emphasize the couplet — fade weak flow, keep
+    /// the color inside the storm cores.
+    pub fn apply_velocity_couplet_preset(&mut self) {
+        self.vel_ref_gate_dbz = 20.0;
+        self.vel_couplet_emphasis = 0.60;
+        self.opacity = 0.70;
+        self.density = 1.10;
+        self.shading = 0.60;
+        self.quality = Vol3dQuality::High;
+    }
+
+    /// Velocity two-box preset: strongest reflectivity cores + strongest flow
+    /// only, for picking out mesocyclone/shear signatures.
+    pub fn apply_velocity_shear_preset(&mut self) {
+        self.vel_ref_gate_dbz = 25.0;
+        self.vel_couplet_emphasis = 0.85;
+        self.opacity = 0.85;
+        self.density = 1.30;
+        self.shading = 0.55;
+        self.quality = Vol3dQuality::High;
+    }
+
     /// Exact CPU companion to the WGSL camera projection. Returning `None`
     /// avoids drawing annotation lines through the camera or behind it.
     pub fn project_point(&self, rect: egui::Rect, point: [f32; 3]) -> Option<egui::Pos2> {
@@ -459,6 +515,16 @@ impl Vol3d {
     }
 }
 
+/// Normalize a slab of physical values into 0..255 texels against an explicit
+/// range. Non-finite (no-data) maps to 0. Shared by the structure box and the
+/// velocity color box so both lattices are normalized the same way.
+pub fn normalize_values(values: &[f32], value_min: f32, value_max: f32) -> Vec<u8> {
+    values
+        .iter()
+        .map(|value| normalize_value(*value, value_min, value_max))
+        .collect()
+}
+
 pub fn normalize_box_with_range(
     values: &[f32],
     n: usize,
@@ -466,14 +532,11 @@ pub fn normalize_box_with_range(
     value_min: f32,
     value_max: f32,
 ) -> VolumeBox {
-    let data = values
-        .iter()
-        .map(|value| normalize_value(*value, value_min, value_max))
-        .collect::<Vec<_>>();
     VolumeBox {
-        data,
+        data: normalize_values(values, value_min, value_max),
         n,
         nz,
+        color_data: None,
         // Upload an empty floor with every new volume so a failed low-tilt
         // raster can never leave the prior scan painted underneath.
         floor_data: Some(vec![0; FLOOR_N.saturating_mul(FLOOR_N)]),
@@ -486,6 +549,7 @@ pub fn empty_box() -> VolumeBox {
         data: vec![0; BOX_N.saturating_mul(BOX_N).saturating_mul(BOX_NZ)],
         n: BOX_N,
         nz: BOX_NZ,
+        color_data: None,
         floor_data: Some(vec![0; FLOOR_N.saturating_mul(FLOOR_N)]),
         floor_elevation_deg: None,
     }
@@ -701,9 +765,15 @@ struct Uniforms {
     floor_threshold_high: f32,
 
     floor_threshold_mode: f32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
+    // Velocity two-box mode: t_volume carries the REFLECTIVITY structure and
+    // t_color carries the signed velocity. velocity_mode > 0.5 switches on the
+    // reflectivity-driven opacity + velocity-driven color path.
+    velocity_mode: f32,
+    // Normalized reflectivity structure gate (0..1). Below this, transparent.
+    ref_gate: f32,
+    // 0 = show all flow at the reflectivity opacity, 1 = fade weak flow so
+    // strong inbound/outbound couplets dominate.
+    couplet_emphasis: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -713,6 +783,7 @@ struct Uniforms {
 @group(0) @binding(4) var s_lut: sampler;
 @group(0) @binding(5) var t_floor: texture_2d<f32>;
 @group(0) @binding(6) var s_floor: sampler;
+@group(0) @binding(7) var t_color: texture_3d<f32>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -879,19 +950,35 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 (point.y + 1.0) * 0.5,
                 point.z / u.zspan
             );
-            let value = textureSampleLevel(t_volume, s_volume, uvw, 0.0).r;
-            let transfer = threshold_strength(
-                value,
-                u.threshold,
-                u.threshold_high,
-                u.threshold_mode,
-                0.08
-            );
+            let structure = textureSampleLevel(t_volume, s_volume, uvw, 0.0).r;
+            var transfer = 0.0;
+            var lut_coord = structure;
+            var emphasis = 1.0;
+            if (u.velocity_mode > 0.5) {
+                // Structure and opacity from the co-located reflectivity box;
+                // color from the signed velocity box. The volume body takes its
+                // shape from where precipitation actually is, and each voxel is
+                // painted with its velocity.
+                transfer = smoothstep(u.ref_gate, u.ref_gate + 0.08, structure);
+                let vel = textureSampleLevel(t_color, s_volume, uvw, 0.0).r;
+                let vmag = clamp(abs(vel - 0.5) * 2.0, 0.0, 1.0);
+                emphasis = mix(1.0, vmag, clamp(u.couplet_emphasis, 0.0, 1.0));
+                lut_coord = vel;
+            } else {
+                transfer = threshold_strength(
+                    structure,
+                    u.threshold,
+                    u.threshold_high,
+                    u.threshold_mode,
+                    0.08
+                );
+                lut_coord = structure;
+            }
             if (transfer <= 0.0) {
                 continue;
             }
-            let palette = textureSampleLevel(t_lut, s_lut, vec2<f32>(value, 0.5), 0.0);
-            var alpha = palette.a * u.opacity * transfer;
+            let palette = textureSampleLevel(t_lut, s_lut, vec2<f32>(lut_coord, 0.5), 0.0);
+            var alpha = palette.a * u.opacity * transfer * emphasis;
             alpha = 1.0 - pow(
                 max(1.0 - alpha, 0.0001),
                 dt * 28.0 * max(u.density, 0.05)
@@ -918,7 +1005,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                     (point.y + 1.0) * 0.5
                 );
                 var value = textureSampleLevel(t_floor, s_floor, floor_uv, 0.0).r;
-                if (u.floor_mode > 1.5) {
+                // Column-max projects the reflectivity structure column onto the
+                // floor; in velocity mode that column lives in t_volume and
+                // would be miscolored by the velocity LUT, so fall back to the
+                // lowest-tilt velocity PPI there.
+                if (u.floor_mode > 1.5 && u.velocity_mode < 0.5) {
                     value = column_max(floor_uv);
                 }
                 let floor_transfer = threshold_strength(
@@ -962,6 +1053,7 @@ pub struct Vol3dResources {
     volume_tex: wgpu::Texture,
     lut_tex: wgpu::Texture,
     floor_tex: wgpu::Texture,
+    color_tex: wgpu::Texture,
 }
 
 /// One-time GPU setup (eframe custom-3D pattern: call from the app
@@ -1016,6 +1108,22 @@ pub fn init_gpu(render_state: &egui_wgpu::RenderState) {
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    // Velocity color box: same lattice as the volume, sampled only when the
+    // shader is in velocity mode. Zeroed until a velocity two-box arrives.
+    let color_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("vol3d-color"),
+        size: wgpu::Extent3d {
+            width: BOX_N as u32,
+            height: BOX_N as u32,
+            depth_or_array_layers: BOX_NZ as u32,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
         format: wgpu::TextureFormat::R8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
@@ -1090,6 +1198,16 @@ pub fn init_gpu(render_state: &egui_wgpu::RenderState) {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     });
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1129,6 +1247,12 @@ pub fn init_gpu(render_state: &egui_wgpu::RenderState) {
             wgpu::BindGroupEntry {
                 binding: 6,
                 resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(
+                    &color_tex.create_view(&Default::default()),
+                ),
             },
         ],
     });
@@ -1173,6 +1297,7 @@ pub fn init_gpu(render_state: &egui_wgpu::RenderState) {
             volume_tex,
             lut_tex,
             floor_tex,
+            color_tex,
         });
 }
 
@@ -1204,6 +1329,13 @@ pub struct Vol3dCallback {
     pub floor_threshold_high01: f32,
     pub floor_threshold_mode: Vol3dThresholdMode,
     pub focus_height: f32,
+    /// 0 = single-box (reflectivity and every other moment), 1 = velocity
+    /// two-box (reflectivity structure + velocity color).
+    pub velocity_mode: f32,
+    /// Normalized reflectivity structure gate for velocity mode.
+    pub ref_gate: f32,
+    /// Couplet emphasis 0..1 for velocity mode.
+    pub couplet_emphasis: f32,
     pub pending: Arc<Mutex<PendingUploads>>,
 }
 
@@ -1245,9 +1377,9 @@ impl egui_wgpu::CallbackTrait for Vol3dCallback {
             self.threshold_mode.shader_value(),
             self.floor_threshold_high01,
             self.floor_threshold_mode.shader_value(),
-            0.0,
-            0.0,
-            0.0,
+            self.velocity_mode,
+            self.ref_gate,
+            self.couplet_emphasis,
         ];
         let mut bytes = [0u8; UNIFORM_FLOATS * std::mem::size_of::<f32>()];
         for (index, value) in uniforms.iter().enumerate() {
@@ -1276,6 +1408,27 @@ impl egui_wgpu::CallbackTrait for Vol3dCallback {
                         depth_or_array_layers: volume.nz as u32,
                     },
                 );
+                if let Some(color_data) = volume.color_data {
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &resources.color_tex,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &color_data,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(volume.n as u32),
+                            rows_per_image: Some(volume.n as u32),
+                        },
+                        wgpu::Extent3d {
+                            width: volume.n as u32,
+                            height: volume.n as u32,
+                            depth_or_array_layers: volume.nz as u32,
+                        },
+                    );
+                }
                 if let Some(floor_data) = volume.floor_data {
                     queue.write_texture(
                         wgpu::TexelCopyTextureInfo {
@@ -1401,5 +1554,83 @@ mod tests {
                 .project_point(rect, explorer.orbit_center())
                 .is_some()
         );
+    }
+
+    #[test]
+    fn normalize_values_maps_range_and_rejects_nan() {
+        // Signed velocity range: min -> 0, zero -> mid, max -> 255.
+        let values = [-100.0, 0.0, 100.0, f32::NAN, -250.0, 999.0];
+        let out = normalize_values(&values, -100.0, 100.0);
+        assert_eq!(out[0], 0);
+        assert_eq!(out[1], 128); // 0 m/s is the diverging-colormap center
+        assert_eq!(out[2], 255);
+        assert_eq!(out[3], 0); // no-data
+        assert_eq!(out[4], 0); // clamped below min
+        assert_eq!(out[5], 255); // clamped above max
+    }
+
+    #[test]
+    fn normalize_box_data_matches_helper() {
+        let values = vec![-40.0, -10.0, 0.0, 25.0, 60.0, f32::NAN];
+        let vbox = normalize_box_with_range(&values, 1, values.len(), -50.0, 60.0);
+        assert_eq!(vbox.data, normalize_values(&values, -50.0, 60.0));
+        assert!(vbox.color_data.is_none(), "single box has no color plane");
+    }
+
+    #[test]
+    fn two_box_color_plane_matches_structure_dims() {
+        // In velocity mode the structure (reflectivity) box and the velocity
+        // color box must share the same lattice so the shader can sample both
+        // at one uvw.
+        let refl = vec![5.0f32; BOX_N * BOX_N * BOX_NZ];
+        let vel = vec![3.0f32; BOX_N * BOX_N * BOX_NZ];
+        let mut vbox = normalize_box_with_range(&refl, BOX_N, BOX_NZ, 0.0, 80.0);
+        vbox.color_data = Some(normalize_values(&vel, -100.0, 100.0));
+        assert_eq!(vbox.color_data.as_ref().unwrap().len(), vbox.data.len());
+    }
+
+    #[test]
+    fn velocity_presets_are_ordered() {
+        let mut v = Vol3d::default();
+        v.apply_velocity_broad_preset();
+        let broad = (v.vel_ref_gate_dbz, v.vel_couplet_emphasis, v.opacity);
+        v.apply_velocity_couplet_preset();
+        let couplet = (v.vel_ref_gate_dbz, v.vel_couplet_emphasis, v.opacity);
+        v.apply_velocity_shear_preset();
+        let shear = (v.vel_ref_gate_dbz, v.vel_couplet_emphasis, v.opacity);
+
+        // Reflectivity gate, couplet emphasis, and opacity all tighten as the
+        // preset moves from broad flow toward strong-shear isolation.
+        assert!(broad.0 < couplet.0 && couplet.0 < shear.0);
+        assert!(broad.1 < couplet.1 && couplet.1 < shear.1);
+        assert!(broad.2 < couplet.2 && couplet.2 < shear.2);
+        // Emphasis is a 0..1 mix factor; broad flow applies none.
+        assert_eq!(broad.1, 0.0);
+        for emphasis in [broad.1, couplet.1, shear.1] {
+            assert!((0.0..=1.0).contains(&emphasis));
+        }
+    }
+
+    #[test]
+    fn default_velocity_fields_are_sane() {
+        let v = Vol3d::default();
+        assert!(v.vel_ref_gate_dbz > 0.0 && v.vel_ref_gate_dbz < 80.0);
+        assert!((0.0..=1.0).contains(&v.vel_couplet_emphasis));
+        assert!(!v.velocity_color_active);
+    }
+
+    #[test]
+    fn shader_wgsl_parses_and_validates() {
+        // The build nodes are headless: wgpu never builds the pipeline, so the
+        // raymarch WGSL would otherwise only be checked in the owner's RC.
+        let module = naga::front::wgsl::parse_str(SHADER)
+            .unwrap_or_else(|e| panic!("vol3d WGSL failed to parse: {e:?}"));
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("vol3d WGSL failed to validate: {e:?}"));
     }
 }

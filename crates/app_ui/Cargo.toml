@@ -39,6 +39,10 @@ tiff.workspace = true
 # B3 (docs/miniderecho-spec.md §1): the shared slots' `inject_for_test`
 # stays visible to this crate's tests after the ui_core extraction.
 ui_core = { path = "../ui_core", features = ["test-util"] }
+# Headless WGSL validation for the vol3d raymarch shader: the build nodes have
+# no GPU, so wgpu never creates the pipeline. naga (already in the tree via
+# wgpu 29.0.3) parses + validates the shader string in a unit test instead.
+naga = { version = "29.0.3", features = ["wgsl-in"] }
 
 [[bin]]
 name = "bowecho"

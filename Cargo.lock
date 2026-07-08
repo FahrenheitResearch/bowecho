@@ -304,6 +304,7 @@ dependencies = [
  "egui_tiles",
  "flate2",
  "image",
+ "naga",
  "netcrust",
  "nexrad_io",
  "product_engine",

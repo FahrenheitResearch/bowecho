@@ -32302,9 +32302,33 @@ impl ViewerApp {
     }
 
     fn clear_vol3d_texture(&mut self) {
+        self.vol3d.velocity_color_active = false;
         if let Ok(mut pending) = self.vol3d.pending.lock() {
             pending.volume = Some(vol3d::empty_box());
         }
+    }
+
+    /// Value range of the reflectivity color table, used to normalize the
+    /// reflectivity structure gate in velocity two-box mode independently of
+    /// the active (velocity) product's range.
+    fn vol3d_reflectivity_value_range(&self) -> (f32, f32) {
+        let table = self.color_tables.for_family(ColorTableFamily::Reflectivity);
+        let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
+        for stop in table.stops() {
+            low = low.min(stop.value);
+            high = high.max(stop.value);
+        }
+        if low.is_finite() && high.is_finite() && high > low {
+            (low, high)
+        } else {
+            (0.0, 80.0)
+        }
+    }
+
+    /// True when the 3D explorer should render the velocity two-box path for
+    /// this product (signed radial velocity family).
+    fn vol3d_is_velocity_family(product: &DisplayProduct) -> bool {
+        product.color_family() == ColorTableFamily::Velocity
     }
 
     fn vol3d_complete_source_volume_for(
@@ -32398,6 +32422,14 @@ impl ViewerApp {
             self.vol3d.floor_opacity = defaults.floor_opacity;
             self.vol3d.floor_threshold_mode = defaults.floor_threshold_mode;
             self.vol3d.floor_threshold_dbz = defaults.floor_threshold;
+            // Velocity products render the two-box path (reflectivity structure
+            // + velocity color); seed its dedicated controls. The Outside |v|
+            // threshold above still governs the single-box fallback used when a
+            // feed carries no reflectivity.
+            if product.color_family() == ColorTableFamily::Velocity {
+                self.vol3d.apply_velocity_broad_preset();
+            }
+            self.vol3d.velocity_color_active = false;
             self.vol3d.volume_key = None;
             self.vol3d.resample_rx = None;
             self.vol3d.last_top_deg = 0.0;
@@ -32557,8 +32589,14 @@ impl ViewerApp {
                     let ctx_clone = ctx.clone();
                     let resample_moment = vol3d_moment.clone();
                     let interp_policy = Self::vol3d_interp_policy(&resample_moment);
+                    // Velocity mode paints signed velocity color inside a body
+                    // shaped by the co-located reflectivity, so resample both.
+                    let velocity_two_box = Self::vol3d_is_velocity_family(&vol3d_product);
+                    let (refl_min, refl_max) = self.vol3d_reflectivity_value_range();
                     thread::spawn(move || {
-                        let result = render2d::volume_box_resample_moment(
+                        // The product moment (velocity in velocity mode) is the
+                        // color source; the floor stays this moment's own PPI.
+                        let color_values = render2d::volume_box_resample_moment(
                             &volume,
                             &resample_moment,
                             interp_policy,
@@ -32568,15 +32606,8 @@ impl ViewerApp {
                             vol3d::BOX_N,
                             vol3d::BOX_NZ,
                             vol3d::BOX_TOP_M,
-                        )
-                        .map(|values| {
-                            let mut volume_box = vol3d::normalize_box_with_range(
-                                &values,
-                                vol3d::BOX_N,
-                                vol3d::BOX_NZ,
-                                value_min,
-                                value_max,
-                            );
+                        );
+                        let build_floor = |volume_box: &mut vol3d::VolumeBox| {
                             if let Some((floor_data, elevation_deg)) = vol3d::lowest_moment_floor(
                                 &volume,
                                 &resample_moment,
@@ -32589,8 +32620,63 @@ impl ViewerApp {
                                 volume_box.floor_data = Some(floor_data);
                                 volume_box.floor_elevation_deg = Some(elevation_deg);
                             }
-                            volume_box
-                        });
+                        };
+                        let result = if velocity_two_box {
+                            // Structure/opacity/shading from the reflectivity
+                            // box; the velocity box only drives the LUT color.
+                            let structure_values = render2d::volume_box_resample_moment(
+                                &volume,
+                                &MomentType::Reflectivity,
+                                render2d::InterpPolicy::LinearAngle,
+                                center_east,
+                                center_north,
+                                half_km,
+                                vol3d::BOX_N,
+                                vol3d::BOX_NZ,
+                                vol3d::BOX_TOP_M,
+                            );
+                            match (structure_values, color_values) {
+                                (Some(structure), Some(color)) => {
+                                    let mut volume_box = vol3d::normalize_box_with_range(
+                                        &structure,
+                                        vol3d::BOX_N,
+                                        vol3d::BOX_NZ,
+                                        refl_min,
+                                        refl_max,
+                                    );
+                                    volume_box.color_data =
+                                        Some(vol3d::normalize_values(&color, value_min, value_max));
+                                    build_floor(&mut volume_box);
+                                    Some(volume_box)
+                                }
+                                // No reflectivity in this feed: fall back to the
+                                // single-box velocity render (color_data None).
+                                (None, Some(color)) => {
+                                    let mut volume_box = vol3d::normalize_box_with_range(
+                                        &color,
+                                        vol3d::BOX_N,
+                                        vol3d::BOX_NZ,
+                                        value_min,
+                                        value_max,
+                                    );
+                                    build_floor(&mut volume_box);
+                                    Some(volume_box)
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            color_values.map(|values| {
+                                let mut volume_box = vol3d::normalize_box_with_range(
+                                    &values,
+                                    vol3d::BOX_N,
+                                    vol3d::BOX_NZ,
+                                    value_min,
+                                    value_max,
+                                );
+                                build_floor(&mut volume_box);
+                                volume_box
+                            })
+                        };
                         let _ = sender.send(result);
                         ctx_clone.request_repaint();
                     });
@@ -32602,6 +32688,7 @@ impl ViewerApp {
             match receiver.try_recv() {
                 Ok(Some(volume_box)) => {
                     self.vol3d.resample_rx = None;
+                    self.vol3d.velocity_color_active = volume_box.color_data.is_some();
                     let echo_cells = volume_box.data.iter().filter(|&&value| value > 0).count();
                     let floor_label = volume_box
                         .floor_elevation_deg
@@ -32648,24 +32735,49 @@ impl ViewerApp {
         value_min: f32,
         value_max: f32,
         value_suffix: &str,
+        velocity_family: bool,
     ) {
         let panel_width = Self::vol3d_control_panel_width(ui);
         ui.set_width(panel_width);
         ui.set_min_width(panel_width);
         ui.set_max_width(panel_width);
         ui.label(egui::RichText::new("Transfer function").strong());
-        let (threshold_min, threshold_max) =
-            Self::vol3d_threshold_slider_range(self.vol3d.threshold_mode, value_min, value_max);
-        let mut threshold = self.vol3d.threshold_dbz.clamp(threshold_min, threshold_max);
-        ui.add(
-            egui::Slider::new(&mut threshold, threshold_min..=threshold_max)
-                .suffix(value_suffix)
-                .text(Self::vol3d_threshold_slider_label(
-                    self.vol3d.threshold_mode,
-                )),
-        )
-        .on_hover_text(Self::vol3d_threshold_hover_text(self.vol3d.threshold_mode));
-        self.vol3d.threshold_dbz = threshold;
+        if velocity_family {
+            // Structure from reflectivity, color from velocity: the body is
+            // shaped by a reflectivity gate (dBZ), and couplet emphasis fades
+            // weak flow so the signed velocity couplets read.
+            let (refl_min, refl_max) = self.vol3d_reflectivity_value_range();
+            let mut ref_gate = self.vol3d.vel_ref_gate_dbz.clamp(refl_min, refl_max);
+            ui.add(
+                egui::Slider::new(&mut ref_gate, refl_min..=refl_max)
+                    .suffix(" dBZ")
+                    .text("reflectivity gate"),
+            )
+            .on_hover_text(
+                "Velocity color fills the volume only where reflectivity exceeds this: the body takes its shape from the precipitation, not the velocity field",
+            );
+            self.vol3d.vel_ref_gate_dbz = ref_gate;
+            ui.add(
+                egui::Slider::new(&mut self.vol3d.vel_couplet_emphasis, 0.0..=1.0)
+                    .text("couplet emphasis"),
+            )
+            .on_hover_text(
+                "0 shows all flow at the reflectivity opacity; 1 fades near-zero flow so strong inbound/outbound couplets dominate",
+            );
+        } else {
+            let (threshold_min, threshold_max) =
+                Self::vol3d_threshold_slider_range(self.vol3d.threshold_mode, value_min, value_max);
+            let mut threshold = self.vol3d.threshold_dbz.clamp(threshold_min, threshold_max);
+            ui.add(
+                egui::Slider::new(&mut threshold, threshold_min..=threshold_max)
+                    .suffix(value_suffix)
+                    .text(Self::vol3d_threshold_slider_label(
+                        self.vol3d.threshold_mode,
+                    )),
+            )
+            .on_hover_text(Self::vol3d_threshold_hover_text(self.vol3d.threshold_mode));
+            self.vol3d.threshold_dbz = threshold;
+        }
         ui.add(egui::Slider::new(&mut self.vol3d.opacity, 0.03..=1.0).text("sample opacity"));
         ui.add(egui::Slider::new(&mut self.vol3d.density, 0.35..=2.5).text("density"))
             .on_hover_text("How quickly samples accumulate into a solid echo body");
@@ -32773,20 +32885,48 @@ impl ViewerApp {
         } else {
             format!(" {value_units}")
         };
+        let velocity_family = Self::vol3d_is_velocity_family(&vol3d_product);
         ui.horizontal_wrapped(|ui| {
             ui.menu_button("Presets", |ui| {
                 ui.set_min_width(180.0);
-                if ui.button("Balanced").clicked() {
-                    self.vol3d.apply_balanced_preset();
-                    ui.close();
-                }
-                if ui.button("Storm structure").clicked() {
-                    self.vol3d.apply_structure_preset();
-                    ui.close();
-                }
-                if ui.button("Core isolation").clicked() {
-                    self.vol3d.apply_core_preset();
-                    ui.close();
+                if velocity_family {
+                    if ui
+                        .button("Broad flow")
+                        .on_hover_text("Fill the precipitation body with its signed velocity color")
+                        .clicked()
+                    {
+                        self.vol3d.apply_velocity_broad_preset();
+                        ui.close();
+                    }
+                    if ui
+                        .button("Couplet emphasis")
+                        .on_hover_text("Fade weak flow so inbound/outbound couplets stand out")
+                        .clicked()
+                    {
+                        self.vol3d.apply_velocity_couplet_preset();
+                        ui.close();
+                    }
+                    if ui
+                        .button("Strong shear")
+                        .on_hover_text("Strongest cores and strongest flow only")
+                        .clicked()
+                    {
+                        self.vol3d.apply_velocity_shear_preset();
+                        ui.close();
+                    }
+                } else {
+                    if ui.button("Balanced").clicked() {
+                        self.vol3d.apply_balanced_preset();
+                        ui.close();
+                    }
+                    if ui.button("Storm structure").clicked() {
+                        self.vol3d.apply_structure_preset();
+                        ui.close();
+                    }
+                    if ui.button("Core isolation").clicked() {
+                        self.vol3d.apply_core_preset();
+                        ui.close();
+                    }
                 }
             });
 
@@ -32909,12 +33049,19 @@ impl ViewerApp {
             if self.vol3d.resample_rx.is_some() {
                 ui.spinner();
             }
-            let threshold_status = Self::vol3d_threshold_status_label(
-                vol3d_product.label(),
-                self.vol3d.threshold_mode,
-                self.vol3d.threshold_dbz,
-                value_suffix.as_str(),
-            );
+            let threshold_status = if velocity_family {
+                format!(
+                    "REF gate >= {:.0} dBZ · couplet {:.2}",
+                    self.vol3d.vel_ref_gate_dbz, self.vol3d.vel_couplet_emphasis
+                )
+            } else {
+                Self::vol3d_threshold_status_label(
+                    vol3d_product.label(),
+                    self.vol3d.threshold_mode,
+                    self.vol3d.threshold_dbz,
+                    value_suffix.as_str(),
+                )
+            };
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(format!(
@@ -32944,6 +33091,7 @@ impl ViewerApp {
                             value_min,
                             value_max,
                             value_suffix.as_str(),
+                            velocity_family,
                         );
                     });
                 }
@@ -33067,6 +33215,20 @@ impl ViewerApp {
             value_min,
             value_max,
         );
+        // Velocity two-box uniforms: only engage the reflectivity-structure /
+        // velocity-color path once a two-box has actually been uploaded.
+        let velocity_mode = if velocity_family && self.vol3d.velocity_color_active {
+            1.0
+        } else {
+            0.0
+        };
+        let ref_gate01 = if velocity_family {
+            let (refl_min, refl_max) = self.vol3d_reflectivity_value_range();
+            Self::normalized_vol3d_value(self.vol3d.vel_ref_gate_dbz, refl_min, refl_max)
+        } else {
+            0.0
+        };
+        let couplet_emphasis = self.vol3d.vel_couplet_emphasis.clamp(0.0, 1.0);
         ui.painter()
             .add(eframe::egui_wgpu::Callback::new_paint_callback(
                 rect,
@@ -33096,6 +33258,9 @@ impl ViewerApp {
                     floor_threshold_high01,
                     floor_threshold_mode: self.vol3d.floor_threshold_mode,
                     focus_height: self.vol3d.focus_height_fraction(),
+                    velocity_mode,
+                    ref_gate: ref_gate01,
+                    couplet_emphasis,
                     pending: Arc::clone(&self.vol3d.pending),
                 },
             ));
