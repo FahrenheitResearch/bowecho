@@ -214,9 +214,14 @@ fn real_norst_pvol_reads_superblock_v1_and_half_degree_sweep() {
 
 /// AEMET Perdiguera: the version-2 object header (OHDR/OCHK) dialect.
 /// Golden values from h5py 3.15.1: float64 planes with gain=1/offset=0,
-/// nodata=95.5, undetect=-32.0 (both map to NaN in the F32 grid);
-/// DBZH valid gates 18389/107640 (0.5 deg) and 16771/107640 (1.5 deg),
-/// VRADH fully valid with |v| <= NI = 39.9217 m/s.
+/// nodata=95.5, undetect=-32.0. Both DBZH AND VRADH declare those two dBZ
+/// sentinels (IRIS 10.3 copies the reflectivity `what` group onto velocity),
+/// but only DBZH's no-echo gates hold undetect (-32.0); VRADH's no-echo gates
+/// are filled with offset (0 m/s), which matches no declared sentinel. DBZH
+/// valid gates 18389/107640 (0.5 deg) and 16771/107640 (1.5 deg). After the
+/// reflectivity-gated velocity recovery, VRADH keeps 18403/107640 (0.5 deg)
+/// and 16794/107640 (1.5 deg): the 0 m/s fill co-located with DBZH no-echo is
+/// masked, genuine 0 m/s gates that have echo are kept.
 #[test]
 fn real_espdg_pvol_decodes_v2_object_headers_end_to_end() {
     assert!(nexrad_io::odim::looks_like_hdf5_bytes(ESPDG));
@@ -304,11 +309,34 @@ fn real_espdg_pvol_decodes_v2_object_headers_end_to_end() {
         "v[359,47]",
     );
 
+    // VRADH: AEMET stamps the DBZH sentinels (nodata 95.5 / undetect -32.0)
+    // onto the velocity plane and fills no-echo gates with offset (0 m/s), so
+    // the raw decode is a 0 m/s wall. The reflectivity-gated recovery masks the
+    // 89_237 co-located no-echo fill gates (velocity on offset where DBZH is
+    // no-echo) and keeps the 12_869 genuine 0 m/s gates that have real echo.
     let vradh = cut.moments.get(&MomentType::Velocity).expect("VRADH");
     let (total, valid, min, max) = plane_stats(vradh);
-    assert_eq!((total, valid), (107_640, 107_640), "VRADH0.5 all valid");
+    assert_eq!((total, valid), (107_640, 18_403), "VRADH0.5 valid gates");
+    // Only the 0 m/s fill is removed, so the real velocity extremes stand.
     assert_close(min, -36.7537, 1e-3, "VRADH0.5 min");
     assert_close(max, 39.8951, 1e-3, "VRADH0.5 max");
+    // Fill gate (0,0): DBZH there is undetect (-32.0 no-echo) -> velocity masked.
+    assert!(vradh.scaled_value(0, 0).unwrap().is_nan(), "vel[0,0] fill");
+    // Genuine 0 m/s gate (0,32): DBZH there is a real -18.0 dBZ echo -> kept.
+    assert_close(
+        vradh.scaled_value(0, 32).unwrap(),
+        0.0,
+        1e-6,
+        "vel[0,32] real 0",
+    );
+    // Velocity present where DBZH is no-echo (119,24) is off `offset`, so the
+    // recovery leaves it untouched.
+    assert_close(
+        vradh.scaled_value(119, 24).unwrap(),
+        6.5968,
+        1e-3,
+        "vel[119,24]",
+    );
 
     let cut = &volume.cuts[1]; // 1.5 deg
     let dbzh = cut.moments.get(&MomentType::Reflectivity).expect("DBZH");
@@ -329,10 +357,21 @@ fn real_espdg_pvol_decodes_v2_object_headers_end_to_end() {
         "v[272,241]",
     );
     let vradh = cut.moments.get(&MomentType::Velocity).expect("VRADH");
+    let (total, valid, _min, _max) = plane_stats(vradh);
+    assert_eq!((total, valid), (107_640, 16_794), "VRADH1.5 valid gates");
+    // A real Doppler gate is untouched by the recovery.
     assert_close(
         vradh.scaled_value(270, 200).unwrap(),
         3.4554768,
         1e-4,
         "vel[270,200]",
+    );
+    // Fill gate (0,0) masked; genuine 0 m/s gate (1,20) with DBZH -15.5 kept.
+    assert!(vradh.scaled_value(0, 0).unwrap().is_nan(), "vel[0,0] fill");
+    assert_close(
+        vradh.scaled_value(1, 20).unwrap(),
+        0.0,
+        1e-6,
+        "vel[1,20] real 0",
     );
 }

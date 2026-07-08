@@ -16,6 +16,17 @@
 //! - `nodata` and `undetect` both display as "no echo"; `undetect` cells
 //!   are remapped onto the `nodata` sentinel so compact storage keeps one
 //!   transparent code.
+//! - Doppler-velocity no-data recovery: some IRIS exporters (AEMET Spain,
+//!   IRIS 10.3) copy the REFLECTIVITY `what` group onto the velocity plane —
+//!   the VRADH `nodata`/`undetect` carry the dBZ sentinels (e.g. 95.5 / -32)
+//!   while no-echo velocity gates are filled with the physical `offset`
+//!   (0 m/s for gain=1/offset=0). Those fill gates match neither declared
+//!   sentinel, so the base decode leaves a spurious 0 m/s wall over the whole
+//!   plane. `recover_copied_whatgroup_velocity_nodata` masks a velocity gate
+//!   sitting on `offset` when the co-located reflectivity gate is no-echo,
+//!   and only when the velocity sentinels equal the reflectivity sentinels
+//!   (the copied-what-group signature) — genuine 0 m/s gates with echo, and
+//!   conformant writers with distinct velocity sentinels, are untouched.
 //! - `rstart` is km to the start of the first bin; `rscale` is the bin
 //!   spacing in metres (Table 5 "where" for polar data). Implausibly large
 //!   `rstart` values are reinterpreted as metres — see
@@ -162,6 +173,7 @@ fn decode_sweep(
     }
 
     let mut canonical_priorities = BTreeMap::<MomentType, u8>::new();
+    let mut plane_meta = BTreeMap::<MomentType, PlaneNoData>::new();
     for plane_name in &data_names {
         let what_path = format!("/{dataset}/{plane_name}/what");
         let quantity = file
@@ -275,8 +287,17 @@ fn decode_sweep(
         if let Some(canonical) = canonical {
             canonical_priorities.insert(canonical, canonical_quantity_priority(&quantity));
         }
+        plane_meta.insert(
+            moment.clone(),
+            PlaneNoData {
+                nodata,
+                undetect,
+                offset,
+            },
+        );
         cut.moments.insert(moment, grid);
     }
+    recover_copied_whatgroup_velocity_nodata(&mut cut, &plane_meta);
     volume.cuts.push(cut);
     volume.metadata.skipped_message_count += skipped_planes;
     Ok(())
@@ -317,6 +338,128 @@ fn remap_sentinel<T: Copy + PartialEq>(raw: T, undetect: Option<T>, sentinel: Op
     match (undetect, sentinel) {
         (Some(undetect), Some(sentinel)) if raw == undetect => sentinel,
         _ => raw,
+    }
+}
+
+/// The `what` no-data attributes of the plane a moment was decoded from,
+/// captured alongside its grid so a sweep-level pass can cross-reference them.
+struct PlaneNoData {
+    nodata: Option<f64>,
+    undetect: Option<f64>,
+    offset: f64,
+}
+
+/// A velocity gate within this distance of the plane's physical `offset` is
+/// treated as sitting exactly on the collapsed no-data / zero code. The gate
+/// spacing of any Doppler quantum (≈0.3 m/s for a 40 m/s Nyquist) is orders of
+/// magnitude larger, so this only ever catches the exact `offset` fill.
+const VELOCITY_OFFSET_EPS: f32 = 1.0e-6;
+
+/// Recover no-echo Doppler-velocity gates that a copied-`what`-group writer
+/// (AEMET Spain / IRIS 10.3) leaves decoding to a spurious `offset` (0 m/s).
+///
+/// Such writers stamp the velocity plane's `nodata`/`undetect` with the
+/// REFLECTIVITY sentinels while filling no-echo velocity gates with the
+/// physical `offset`, so those gates match no declared sentinel and survive
+/// the base decode as a wall of 0 m/s. There is no per-plane attribute that
+/// distinguishes the fill from a genuine 0 m/s reading, so the file's own
+/// reflectivity no-echo mask is the only ground truth: a velocity gate on
+/// `offset` with no co-located reflectivity echo is the writer's collapsed
+/// no-data code; the same value where reflectivity IS present is a real
+/// 0 m/s reading and is preserved.
+///
+/// Guarded by the copied-what-group signature (velocity sentinels equal the
+/// reflectivity sentinels) so conformant writers — which give velocity its own
+/// distinct sentinels, already masked by the base decode — are never touched.
+/// Also a no-op unless both planes share ray/gate geometry.
+fn recover_copied_whatgroup_velocity_nodata(
+    cut: &mut radar_core::ElevationCut,
+    plane_meta: &BTreeMap<MomentType, PlaneNoData>,
+) {
+    let (Some(vel_meta), Some(ref_meta)) = (
+        plane_meta.get(&MomentType::Velocity),
+        plane_meta.get(&MomentType::Reflectivity),
+    ) else {
+        return;
+    };
+    // Copied-what-group signature: the velocity plane carries the reflectivity
+    // plane's no-data sentinels verbatim (and at least one is present).
+    let sentinels_copied = vel_meta.nodata == ref_meta.nodata
+        && vel_meta.undetect == ref_meta.undetect
+        && (vel_meta.nodata.is_some() || vel_meta.undetect.is_some());
+    if !sentinels_copied {
+        return;
+    }
+
+    let (Some(velocity), Some(reflectivity)) = (
+        cut.moments.get(&MomentType::Velocity),
+        cut.moments.get(&MomentType::Reflectivity),
+    ) else {
+        return;
+    };
+    let rows = velocity.radial_indices.len();
+    let gates = velocity.gate_range.gate_count;
+    if reflectivity.radial_indices.len() != rows || reflectivity.gate_range.gate_count != gates {
+        return; // differing geometry: do not risk mis-masking
+    }
+
+    let offset = vel_meta.offset as f32;
+    let mut targets: Vec<usize> = Vec::new();
+    for row in 0..rows {
+        for gate in 0..gates {
+            // Reflectivity no-echo: None (u8/u16 sentinel) or NaN (float).
+            let ref_no_echo = reflectivity
+                .scaled_value(row, gate)
+                .is_none_or(|z| !z.is_finite());
+            if !ref_no_echo {
+                continue;
+            }
+            if let Some(value) = velocity.scaled_value(row, gate)
+                && value.is_finite()
+                && (value - offset).abs() <= VELOCITY_OFFSET_EPS
+            {
+                targets.push(row * gates + gate);
+            }
+        }
+    }
+    if targets.is_empty() {
+        return;
+    }
+    if let Some(velocity) = cut.moments.get_mut(&MomentType::Velocity) {
+        mask_gates_no_data(velocity, &targets);
+    }
+}
+
+/// Set the given flat gate indices to the grid's transparent no-data code:
+/// NaN for float storage, the `nodata` sentinel for integer storage (integer
+/// grids with no sentinel are left unchanged — nothing transparent to write).
+fn mask_gates_no_data(grid: &mut MomentGrid, targets: &[usize]) {
+    let sentinel = grid.nodata;
+    match &mut grid.storage {
+        radar_core::MomentStorage::F32(values) => {
+            for &index in targets {
+                if let Some(slot) = values.get_mut(index) {
+                    *slot = f32::NAN;
+                }
+            }
+        }
+        radar_core::MomentStorage::U8(values) => {
+            let Some(sentinel) = sentinel else { return };
+            let sentinel = sentinel as u8;
+            for &index in targets {
+                if let Some(slot) = values.get_mut(index) {
+                    *slot = sentinel;
+                }
+            }
+        }
+        radar_core::MomentStorage::U16(values) => {
+            let Some(sentinel) = sentinel else { return };
+            for &index in targets {
+                if let Some(slot) = values.get_mut(index) {
+                    *slot = sentinel;
+                }
+            }
+        }
     }
 }
 
@@ -560,5 +703,109 @@ mod tests {
         assert_eq!(remap_sentinel(0u8, Some(0), Some(255)), 255);
         assert_eq!(remap_sentinel(7u8, Some(0), Some(255)), 7);
         assert_eq!(remap_sentinel(0u8, None, Some(255)), 0);
+    }
+
+    /// Build a one-ray float moment grid (offset 0, scale 1) for the recovery
+    /// tests: NaN encodes no-echo, finite values are physical readings.
+    fn float_grid(moment: MomentType, row: Vec<f32>) -> MomentGrid {
+        let gate_range = GateRange {
+            first_gate_m: 0,
+            gate_spacing_m: 500,
+            gate_count: row.len(),
+        };
+        let mut grid = MomentGrid {
+            moment,
+            gate_range,
+            scale: 1.0,
+            offset: 0.0,
+            nodata: None,
+            range_folded: None,
+            radial_indices: Vec::new(),
+            storage: radar_core::MomentStorage::F32(Vec::new()),
+        };
+        grid.push_row(0, MomentRow::F32(row)).expect("push row");
+        grid
+    }
+
+    fn copied_sentinel_cut() -> radar_core::ElevationCut {
+        // gate0: Z no-echo, V=0  -> collapsed no-data fill (must mask)
+        // gate1: Z echo,    V=0  -> genuine 0 m/s reading (must keep)
+        // gate2: Z no-echo, V=5  -> velocity off `offset` (must keep)
+        // gate3: Z echo,    V=3  -> ordinary gate (must keep)
+        let reflectivity = float_grid(
+            MomentType::Reflectivity,
+            vec![f32::NAN, 10.0, f32::NAN, 20.0],
+        );
+        let velocity = float_grid(MomentType::Velocity, vec![0.0, 0.0, 5.0, 3.0]);
+        let mut cut = radar_core::ElevationCut::new(0.5, None);
+        cut.moments.insert(MomentType::Reflectivity, reflectivity);
+        cut.moments.insert(MomentType::Velocity, velocity);
+        cut
+    }
+
+    #[test]
+    fn copied_whatgroup_recovery_masks_only_no_echo_offset_gates() {
+        let mut cut = copied_sentinel_cut();
+        // Copied-what-group signature: velocity carries the reflectivity
+        // sentinels (the AEMET/IRIS bug), so recovery engages.
+        let mut plane_meta = BTreeMap::new();
+        let sentinels = |offset| PlaneNoData {
+            nodata: Some(95.5),
+            undetect: Some(-32.0),
+            offset,
+        };
+        plane_meta.insert(MomentType::Reflectivity, sentinels(-32.0));
+        plane_meta.insert(MomentType::Velocity, sentinels(0.0));
+
+        recover_copied_whatgroup_velocity_nodata(&mut cut, &plane_meta);
+        let vel = cut.moments.get(&MomentType::Velocity).unwrap();
+        assert!(
+            vel.scaled_value(0, 0).unwrap().is_nan(),
+            "no-echo 0 m/s fill masked"
+        );
+        assert_eq!(
+            vel.scaled_value(0, 1),
+            Some(0.0),
+            "genuine 0 m/s with echo kept"
+        );
+        assert_eq!(
+            vel.scaled_value(0, 2),
+            Some(5.0),
+            "velocity off offset kept even without echo"
+        );
+        assert_eq!(vel.scaled_value(0, 3), Some(3.0), "ordinary gate kept");
+    }
+
+    #[test]
+    fn distinct_velocity_sentinels_are_never_reflectivity_gated() {
+        // Velocity declares its OWN sentinels (not the reflectivity ones):
+        // a conformant writer. Recovery must not touch the plane, so the
+        // 0 m/s gate co-located with no-echo reflectivity survives unchanged.
+        let mut cut = copied_sentinel_cut();
+        let mut plane_meta = BTreeMap::new();
+        plane_meta.insert(
+            MomentType::Reflectivity,
+            PlaneNoData {
+                nodata: Some(95.5),
+                undetect: Some(-32.0),
+                offset: -32.0,
+            },
+        );
+        plane_meta.insert(
+            MomentType::Velocity,
+            PlaneNoData {
+                nodata: Some(-999.0),
+                undetect: Some(888.0),
+                offset: 0.0,
+            },
+        );
+
+        recover_copied_whatgroup_velocity_nodata(&mut cut, &plane_meta);
+        let vel = cut.moments.get(&MomentType::Velocity).unwrap();
+        assert_eq!(
+            vel.scaled_value(0, 0),
+            Some(0.0),
+            "distinct-sentinel writer left untouched"
+        );
     }
 }
