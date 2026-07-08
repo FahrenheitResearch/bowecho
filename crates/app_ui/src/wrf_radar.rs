@@ -139,6 +139,18 @@ pub fn planned_ref_source(
     }
 }
 
+/// Nyquist velocity (m/s) stamped on every radial when velocity folding is OFF
+/// — deliberately large so the native, forward-modelled Vr is treated as
+/// already-unfolded TRUE velocity by the dealias/readout code (it never folds).
+/// This is the historical stamp the community WRF→GR2 script also implied by
+/// leaving the data unfolded.
+pub const UNFOLDED_NYQUIST_MPS: f32 = 320.0;
+
+/// Default FOLDING Nyquist (m/s) when the realistic-Nyquist option is enabled —
+/// a typical WSR-88D low-PRF Doppler Nyquist. Real VELocity Nyquists cluster
+/// around here (roughly 8–33 m/s depending on VCP/PRF).
+pub const DEFAULT_FOLD_NYQUIST_MPS: f32 = 25.0;
+
 /// Configuration for one synthetic scan.
 #[derive(Clone, Debug)]
 pub struct SyntheticRadarConfig {
@@ -161,10 +173,22 @@ pub struct SyntheticRadarConfig {
     /// Reflectivity floor (dBZ): gates below this — and their velocity — are
     /// left NaN so clear air renders transparent, like a real scope.
     pub ref_floor_dbz: f32,
-    /// Nyquist velocity stamped on each radial. Deliberately large so the
-    /// native, forward-modelled Vr is treated as already unfolded (TRUE
-    /// velocity) by downstream dealias/readout code.
+    /// The FOLDING Nyquist velocity (m/s). Used ONLY when [`Self::fold_velocity`]
+    /// is set: each gate's Vr is aliased into `[-nyquist_mps, +nyquist_mps)` and
+    /// this value is stamped on every radial, so the dealiaser/readout see the
+    /// real velocity ambiguity. When folding is OFF the historical
+    /// [`UNFOLDED_NYQUIST_MPS`] (320) is stamped instead (via
+    /// [`Self::stamped_nyquist_mps`]), so the native forward-modelled Vr reads as
+    /// already-unfolded TRUE velocity that never folds. Default
+    /// [`DEFAULT_FOLD_NYQUIST_MPS`].
     pub nyquist_mps: f32,
+    /// Fold the forward-modelled radial velocity like a real pulse-pair radar:
+    /// alias every velocity gate into the [`Self::nyquist_mps`] co-interval so VEL
+    /// FOLDS (and the velocity dealiaser has genuine work — a practice ground on
+    /// known ground truth). OFF by default — the native Vr is the exact TRUE wind
+    /// projection and [`UNFOLDED_NYQUIST_MPS`] is stamped, so an OFF build is
+    /// bit-identical to a build without the feature.
+    pub fold_velocity: bool,
     /// Which reflectivity operator populates the sampled `dbz`: the model's own
     /// Thompson-native `REFL_10CM` ([`ReflectivityOperator::ModelNative`]) or the
     /// classic Stoelinga `CALCDBZ` community diagnostic
@@ -212,7 +236,11 @@ impl Default for SyntheticRadarConfig {
             gate_spacing_m: 250.0,
             max_range_m: 230_000.0,
             ref_floor_dbz: 0.0,
-            nyquist_mps: 320.0,
+            // The folding Nyquist (used only when `fold_velocity` is set). With
+            // folding OFF (the default) `UNFOLDED_NYQUIST_MPS` (320) is stamped
+            // and no gate folds, so the default build is bit-identical to before.
+            nyquist_mps: DEFAULT_FOLD_NYQUIST_MPS,
+            fold_velocity: false,
             // Default operator. Flip this one line to ClassicStoelinga to
             // re-default the community look after the owner's comparison.
             reflectivity_operator: ReflectivityOperator::ModelNative,
@@ -243,10 +271,12 @@ impl SyntheticRadarConfig {
     /// antenna placement (`site_id`, `site_lat_deg`, `site_lon_deg`,
     /// `antenna_msl_m`), the elevation ladder (which already encodes the
     /// optional 0.1° low tilt), `azimuth_count`, `gate_spacing_m`, `max_range_m`,
-    /// `ref_floor_dbz`, `nyquist_mps`, `reflectivity_operator`, both gate-
-    /// texture flags, and `clutter_intensity` (so moving the clutter slider
-    /// rebuilds and replaces the stale volume on re-import). Deliberately
-    /// EXCLUDED: `site_name` (a label — never changes a sample).
+    /// `ref_floor_dbz`, `nyquist_mps`, `fold_velocity` (toggling folding
+    /// re-aliases every velocity gate and re-stamps the Nyquist, so it must
+    /// rebuild), `reflectivity_operator`, both gate-texture flags, and
+    /// `clutter_intensity` (so moving the clutter slider rebuilds and replaces
+    /// the stale volume on re-import). Deliberately EXCLUDED: `site_name` (a
+    /// label — never changes a sample).
     pub fn data_fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -263,12 +293,59 @@ impl SyntheticRadarConfig {
         self.max_range_m.to_bits().hash(&mut hasher);
         self.ref_floor_dbz.to_bits().hash(&mut hasher);
         self.nyquist_mps.to_bits().hash(&mut hasher);
+        self.fold_velocity.hash(&mut hasher);
         (self.reflectivity_operator as u8).hash(&mut hasher);
         self.ref_gate_texture.hash(&mut hasher);
         self.vel_gate_texture.hash(&mut hasher);
         self.clutter_intensity.to_bits().hash(&mut hasher);
         hasher.finish()
     }
+
+    /// The Nyquist velocity (m/s) stamped on every radial of the built volume.
+    /// With folding ON it is the folding Nyquist [`Self::nyquist_mps`] — the
+    /// truth the dealiaser/readout/fold-warnings must see. With folding OFF it is
+    /// the historical [`UNFOLDED_NYQUIST_MPS`] (320), so the unfolded TRUE Vr is
+    /// treated as already-dealiased (the dealiaser becomes a no-op because no
+    /// gate exceeds 320).
+    pub fn stamped_nyquist_mps(&self) -> f32 {
+        if self.fold_velocity {
+            self.nyquist_mps
+        } else {
+            UNFOLDED_NYQUIST_MPS
+        }
+    }
+}
+
+/// Alias one true (unfolded) radial velocity `v` into the Nyquist co-interval
+/// `[-nyquist, +nyquist)`, exactly as a real pulse-pair velocity estimator
+/// reports it (WSR-88D Level II convention: `-nyquist` is representable,
+/// `+nyquist` aliases to `-nyquist`).
+///
+/// The alias is `(v + nyquist).rem_euclid(2·nyquist) − nyquist`, the same wrap
+/// the velocity dealiaser's own fixtures assume for real folded data (`render2d`
+/// `dealias_v4`), so synthetic folds and the unfolder speak one language. This is
+/// algebraically identical to the textbook `v − 2·nyquist·round(v/(2·nyquist))`
+/// everywhere except the measure-zero boundary `v = −nyquist`: round-half-away
+/// sends it to `+nyquist`, while the half-open interval keeps it at `−nyquist`.
+///
+/// A velocity ALREADY inside `[−nyquist, +nyquist)` is returned bit-for-bit
+/// unchanged — a real estimator aliases only out-of-Nyquist velocities, so
+/// in-Nyquist gates (clutter/near-zero returns, sub-Nyquist winds) are never even
+/// perturbed by float rounding. Only genuinely out-of-range gates take the wrap.
+///
+/// A non-finite `v` (NaN / ±inf), or a non-finite / non-positive `nyquist`,
+/// passes through UNCHANGED, so missing/blank gates and a degenerate Nyquist
+/// never fabricate a value.
+pub fn fold_velocity_mps(v: f32, nyquist: f32) -> f32 {
+    if !v.is_finite() || !nyquist.is_finite() || nyquist <= 0.0 {
+        return v;
+    }
+    // In-Nyquist velocities are reported exactly (no rounding); only out-of-range
+    // gates are aliased into the co-interval.
+    if (-nyquist..nyquist).contains(&v) {
+        return v;
+    }
+    (v + nyquist).rem_euclid(2.0 * nyquist) - nyquist
 }
 
 /// Hash an optional `f64` by its bit pattern (floats are not `Hash`), with a
@@ -750,6 +827,16 @@ fn build_cut(
                     }
                 }
 
+                // Realistic Nyquist (opt-in): alias the true Vr into the folding
+                // co-interval, AFTER the clutter VEL replacement. Applied last so
+                // it folds exactly what the display will store. Clutter gates are
+                // ~0 ± 0.5 m/s — well inside any sane Nyquist — so folding leaves
+                // them untouched. With folding OFF this branch never runs, so the
+                // output is bit-identical to a build without the feature.
+                if config.fold_velocity && vel_val.is_finite() {
+                    vel_val = fold_velocity_mps(vel_val, config.nyquist_mps);
+                }
+
                 if ref_val.is_finite() {
                     ref_row[gate] = ref_val;
                 }
@@ -771,7 +858,7 @@ fn build_cut(
             elevation_deg: elevation_deg as f32,
             time_offset_ms: 0,
             gate_range: gate_range.clone(),
-            nyquist_velocity_mps: Some(config.nyquist_mps),
+            nyquist_velocity_mps: Some(config.stamped_nyquist_mps()),
             radial_status: None,
         });
         ref_values.extend(ref_row);
@@ -1932,7 +2019,8 @@ mod tests {
             gate_spacing_m: 250.0,
             max_range_m: 230_000.0,
             ref_floor_dbz: 0.0,
-            nyquist_mps: 320.0,
+            nyquist_mps: 25.0,
+            fold_velocity: false,
             reflectivity_operator: ReflectivityOperator::ModelNative,
             ref_gate_texture: true,
             vel_gate_texture: false,
@@ -1976,6 +2064,10 @@ mod tests {
         assert!(differs(&|c| c.max_range_m = 460_000.0), "max_range_m");
         assert!(differs(&|c| c.ref_floor_dbz = 5.0), "ref_floor_dbz");
         assert!(differs(&|c| c.nyquist_mps = 64.0), "nyquist_mps");
+        assert!(
+            differs(&|c| c.fold_velocity = true),
+            "fold_velocity — toggling folding re-aliases VEL and re-stamps Nyquist"
+        );
         assert!(differs(&|c| c.ref_gate_texture = false), "ref_gate_texture");
         assert!(differs(&|c| c.vel_gate_texture = true), "vel_gate_texture");
         assert!(
@@ -1985,6 +2077,253 @@ mod tests {
         assert!(
             differs(&|c| c.reflectivity_operator = ClassicStoelinga),
             "operator"
+        );
+    }
+
+    /// Collect every radial's stamped Nyquist across a built volume.
+    fn stamped_nyquists(volume: &RadarVolume) -> Vec<f32> {
+        volume
+            .cuts
+            .iter()
+            .flat_map(|cut| cut.radials.iter())
+            .filter_map(|radial| radial.nyquist_velocity_mps)
+            .collect()
+    }
+
+    /// Collect every finite VELocity gate of a built volume (row-major).
+    fn finite_velocities(volume: &RadarVolume) -> Vec<f32> {
+        let mut out = Vec::new();
+        for cut in &volume.cuts {
+            let MomentStorage::F32(vels) = &cut.moments[&MomentType::Velocity].storage else {
+                panic!("synthetic velocity must be F32");
+            };
+            out.extend(vels.iter().copied().filter(|v| v.is_finite()));
+        }
+        out
+    }
+
+    /// The fold aliases into the half-open `[-Vn, +Vn)` Level II co-interval:
+    /// `|v| < Vn` is unchanged, `Vn+5` wraps to `-Vn+5`, the negative side
+    /// mirrors, both boundaries `±Vn` land on `-Vn`, and every result is only the
+    /// true value shifted by a whole multiple of `2·Vn`. NaN and a degenerate
+    /// Nyquist pass through untouched.
+    #[test]
+    fn fold_velocity_math_matches_level_ii_convention() {
+        let vn = 25.0f32;
+
+        // Inside the co-interval: identity.
+        assert_eq!(fold_velocity_mps(0.0, vn), 0.0);
+        assert_eq!(fold_velocity_mps(5.0, vn), 5.0);
+        assert_eq!(fold_velocity_mps(-7.0, vn), -7.0);
+        assert_eq!(fold_velocity_mps(24.0, vn), 24.0);
+
+        // One Nyquist past the top wraps to just inside the bottom, and mirror.
+        assert_eq!(fold_velocity_mps(vn + 5.0, vn), -vn + 5.0); // 30 -> -20
+        assert_eq!(fold_velocity_mps(-vn - 5.0, vn), vn - 5.0); // -30 -> 20
+
+        // Whole co-intervals fold cleanly: 2·Vn -> 0, 3·Vn -> -Vn.
+        assert_eq!(fold_velocity_mps(2.0 * vn, vn), 0.0);
+        assert_eq!(fold_velocity_mps(3.0 * vn, vn), -vn);
+
+        // Boundary convention: half-open [-Vn, +Vn) — BOTH +Vn and -Vn map to
+        // -Vn (+Vn aliases in, -Vn is already the representable end).
+        assert_eq!(fold_velocity_mps(vn, vn), -vn);
+        assert_eq!(fold_velocity_mps(-vn, vn), -vn);
+
+        // Sweep: every fold stays in the co-interval and differs from the true
+        // value only by a whole multiple of 2·Vn (pure aliasing, no distortion).
+        let mut v = -103.0f32;
+        while v <= 103.0 {
+            let r = fold_velocity_mps(v, vn);
+            assert!(
+                (-vn - 1e-4..vn + 1e-4).contains(&r),
+                "fold({v}) = {r} escaped [-{vn}, {vn})"
+            );
+            let k = (v - r) / (2.0 * vn);
+            assert!(
+                (k - k.round()).abs() < 1e-3,
+                "fold({v}) = {r} is not a whole-Nyquist alias of the truth (k = {k})"
+            );
+            // Already-folded values are fixed points (idempotent).
+            assert!((fold_velocity_mps(r, vn) - r).abs() < 1e-4);
+            v += 0.37;
+        }
+
+        // Missing/degenerate inputs pass through untouched.
+        assert!(fold_velocity_mps(f32::NAN, vn).is_nan());
+        assert_eq!(fold_velocity_mps(12.0, 0.0), 12.0, "Vn=0 is a no-op");
+        assert_eq!(fold_velocity_mps(12.0, -5.0), 12.0, "Vn<0 is a no-op");
+    }
+
+    /// The stamped Nyquist is the truth downstream sees: the historical 320 with
+    /// folding OFF (so the unfolder is a no-op), the folding Nyquist with folding
+    /// ON. `nyquist_mps` is ignored when folding is off.
+    #[test]
+    fn stamped_nyquist_reports_320_off_and_the_fold_nyquist_on() {
+        let off = SyntheticRadarConfig::default();
+        assert!(!off.fold_velocity);
+        assert_eq!(off.stamped_nyquist_mps(), UNFOLDED_NYQUIST_MPS);
+        assert_eq!(UNFOLDED_NYQUIST_MPS, 320.0);
+
+        let on = SyntheticRadarConfig {
+            fold_velocity: true,
+            nyquist_mps: 18.0,
+            ..SyntheticRadarConfig::default()
+        };
+        assert_eq!(on.stamped_nyquist_mps(), 18.0);
+
+        // Folding off: nyquist_mps is inert (still stamps the historical 320).
+        let off_custom = SyntheticRadarConfig {
+            fold_velocity: false,
+            nyquist_mps: 18.0,
+            ..SyntheticRadarConfig::default()
+        };
+        assert_eq!(off_custom.stamped_nyquist_mps(), UNFOLDED_NYQUIST_MPS);
+
+        // The library default folding Nyquist is the documented 25 m/s.
+        assert_eq!(off.nyquist_mps, DEFAULT_FOLD_NYQUIST_MPS);
+        assert_eq!(DEFAULT_FOLD_NYQUIST_MPS, 25.0);
+    }
+
+    /// Folding OFF (the default) stamps 320 on every radial, never aliases the
+    /// forward-modelled Vr (the box's peak ~10 m/s stays put), and is fully
+    /// insensitive to `nyquist_mps` — two off-builds with different `nyquist_mps`
+    /// are bit-identical. This is the "default false = today's behavior" contract.
+    #[test]
+    fn folding_off_stamps_320_and_leaves_velocity_unfolded() {
+        let fields = uniform_box_fields();
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+
+        let default_off = box_model_config(); // fold_velocity false, nyquist 25
+        let other_nyquist = SyntheticRadarConfig {
+            nyquist_mps: 999.0,
+            ..box_model_config()
+        };
+        assert!(!default_off.fold_velocity && !other_nyquist.fold_velocity);
+
+        let a = build_synthetic_volume(&fields, time, &default_off);
+        let b = build_synthetic_volume(&fields, time, &other_nyquist);
+
+        // Every radial stamped with the historical unfolded Nyquist.
+        for nyq in stamped_nyquists(&a) {
+            assert_eq!(
+                nyq, UNFOLDED_NYQUIST_MPS,
+                "off must stamp the historical 320"
+            );
+        }
+        // No gate folded: the 10 m/s box wind stays inside a wide margin.
+        for v in finite_velocities(&a) {
+            assert!(v.abs() <= 12.0, "unfolded Vr {v} must not be aliased");
+        }
+        // `nyquist_mps` is inert with folding off: identical gates AND stamps.
+        assert!(
+            moment_bits(&a) == moment_bits(&b),
+            "nyquist_mps must not touch the data when folding is off"
+        );
+        assert_eq!(stamped_nyquists(&a), stamped_nyquists(&b));
+    }
+
+    /// Folding ON stamps the folding Nyquist on every radial and aliases each
+    /// gate exactly as [`fold_velocity_mps`] does — proven gate-by-gate against
+    /// the unfolded build, with the box's ~10 m/s peak actually wrapping past an
+    /// 8 m/s Nyquist.
+    #[test]
+    fn folding_on_aliases_velocity_and_stamps_the_nyquist() {
+        let fields = uniform_box_fields();
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let vn = 8.0f32;
+
+        let off = box_model_config();
+        let on = SyntheticRadarConfig {
+            fold_velocity: true,
+            nyquist_mps: vn,
+            ..box_model_config()
+        };
+        let off_vol = build_synthetic_volume(&fields, time, &off);
+        let on_vol = build_synthetic_volume(&fields, time, &on);
+
+        // Every radial now carries the folding Nyquist as the truth.
+        for nyq in stamped_nyquists(&on_vol) {
+            assert_eq!(nyq, vn, "folding on must stamp the folding Nyquist");
+        }
+
+        // Gate-by-gate: the folded field is exactly the fold of the true field,
+        // and at least some gates genuinely wrapped (peak wind > Vn).
+        let mut wrapped = 0usize;
+        for (cut_off, cut_on) in off_vol.cuts.iter().zip(&on_vol.cuts) {
+            let (MomentStorage::F32(a), MomentStorage::F32(b)) = (
+                &cut_off.moments[&MomentType::Velocity].storage,
+                &cut_on.moments[&MomentType::Velocity].storage,
+            ) else {
+                panic!("F32");
+            };
+            for (va, vb) in a.iter().zip(b) {
+                assert_eq!(va.is_finite(), vb.is_finite());
+                if !va.is_finite() {
+                    continue;
+                }
+                let expect = fold_velocity_mps(*va, vn);
+                assert!(
+                    (vb - expect).abs() < 1e-4,
+                    "gate {va} -> {vb}, expected {expect}"
+                );
+                assert!(
+                    (-vn - 1e-4..vn + 1e-4).contains(vb),
+                    "folded {vb} left co-interval"
+                );
+                if (vb - va).abs() > 1e-3 {
+                    wrapped += 1;
+                }
+            }
+        }
+        assert!(
+            wrapped > 0,
+            "the ~10 m/s box wind must fold past an 8 m/s Nyquist"
+        );
+    }
+
+    /// Folding is applied AFTER the clutter VEL replacement, and clutter gates are
+    /// ~0 ± 0.5 m/s — well inside any sane Nyquist — so folding leaves every
+    /// near-zero gate (clutter-dominated ground returns included) bit-identical.
+    #[test]
+    fn folding_leaves_near_zero_clutter_gates_untouched() {
+        let fields = uniform_box_fields();
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let vn = 8.0f32;
+
+        // Full ground clutter, folding off vs on at the same 8 m/s Nyquist.
+        let off = clutter_box_config(1.0);
+        let on = SyntheticRadarConfig {
+            fold_velocity: true,
+            nyquist_mps: vn,
+            ..clutter_box_config(1.0)
+        };
+        let off_vol = build_synthetic_volume(&fields, time, &off);
+        let on_vol = build_synthetic_volume(&fields, time, &on);
+
+        let mut near_zero = 0usize;
+        for (cut_off, cut_on) in off_vol.cuts.iter().zip(&on_vol.cuts) {
+            let (MomentStorage::F32(a), MomentStorage::F32(b)) = (
+                &cut_off.moments[&MomentType::Velocity].storage,
+                &cut_on.moments[&MomentType::Velocity].storage,
+            ) else {
+                panic!("F32");
+            };
+            for (va, vb) in a.iter().zip(b) {
+                if va.is_finite() && va.abs() <= 0.5 {
+                    // The clutter ±0.5 m/s band: folding must be the identity here.
+                    assert_eq!(
+                        vb.to_bits(),
+                        va.to_bits(),
+                        "near-zero gate {va} must survive folding untouched"
+                    );
+                    near_zero += 1;
+                }
+            }
+        }
+        assert!(
+            near_zero > 0,
+            "expected near-zero (clutter-dominated) gates in the clutter box"
         );
     }
 

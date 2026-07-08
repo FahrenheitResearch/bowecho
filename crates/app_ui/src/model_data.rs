@@ -188,6 +188,18 @@ struct SyntheticRadarUiState {
     /// physics; 1 ≈ the community-script intensity.
     #[serde(default)]
     clutter_intensity: f32,
+    /// Realistic Nyquist: fold the simulated radial velocity like a real
+    /// pulse-pair radar (alias into `[-fold_nyquist_mps, +fold_nyquist_mps)`) so
+    /// VEL folds instead of showing the true unfolded wind projection. OFF by
+    /// default (an older config with no entry restores it) — the native Vr is the
+    /// exact truth and a wide 320 m/s Nyquist is stamped so nothing folds.
+    #[serde(default)]
+    fold_velocity: bool,
+    /// The folding Nyquist (m/s) when `fold_velocity` is on — the drag value in
+    /// the popover, clamped to [`Self::MIN_FOLD_NYQUIST_MPS`]..=[`Self::MAX_FOLD_NYQUIST_MPS`].
+    /// An older config with no entry restores the default 25 m/s.
+    #[serde(default = "default_fold_nyquist_mps")]
+    fold_nyquist_mps: f32,
 }
 
 fn default_synth_range_km() -> f64 {
@@ -196,6 +208,10 @@ fn default_synth_range_km() -> f64 {
 
 fn default_synth_gate_m() -> f64 {
     250.0
+}
+
+fn default_fold_nyquist_mps() -> f32 {
+    crate::wrf_radar::DEFAULT_FOLD_NYQUIST_MPS
 }
 
 impl Default for SyntheticRadarUiState {
@@ -213,6 +229,8 @@ impl Default for SyntheticRadarUiState {
             reflectivity_operator: crate::wrf_radar::ReflectivityOperator::default(),
             include_low_tilt: false,
             clutter_intensity: 0.0,
+            fold_velocity: false,
+            fold_nyquist_mps: default_fold_nyquist_mps(),
         }
     }
 }
@@ -222,6 +240,10 @@ impl SyntheticRadarUiState {
     const MAX_RANGE_KM: f64 = 1000.0;
     const MIN_GATE_M: f64 = 100.0;
     const MAX_GATE_M: f64 = 4000.0;
+    /// Folding-Nyquist drag bounds (m/s): a sane real-radar range from a fast
+    /// dual-PRF low value up to a coarse single-PRF high Nyquist.
+    const MIN_FOLD_NYQUIST_MPS: f32 = 8.0;
+    const MAX_FOLD_NYQUIST_MPS: f32 = 64.0;
     /// Gate count of the classic default volume (230 km / 250 m); auto
     /// spacing preserves it as the range grows.
     const DEFAULT_GATE_COUNT: f64 = 920.0;
@@ -273,6 +295,14 @@ impl SyntheticRadarUiState {
             reflectivity_operator: self.reflectivity_operator,
             elevations_deg: crate::wrf_radar::elevation_ladder(self.include_low_tilt),
             clutter_intensity: self.clutter_intensity.clamp(0.0, 1.0),
+            fold_velocity: self.fold_velocity,
+            // The folding Nyquist, clamped to the sane drag range. Inert when
+            // `fold_velocity` is off (the library stamps the historical 320 and
+            // folds nothing), but always set so the data fingerprint tracks the
+            // dial and a re-import rebuilds when it moves.
+            nyquist_mps: self
+                .fold_nyquist_mps
+                .clamp(Self::MIN_FOLD_NYQUIST_MPS, Self::MAX_FOLD_NYQUIST_MPS),
             ..crate::wrf_radar::SyntheticRadarConfig::default()
         };
         match self.placement {
@@ -1622,6 +1652,35 @@ impl ModelDataDock {
                          frame — a loop does not shimmer.",
                     );
                     ui.horizontal(|ui| {
+                        ui.checkbox(
+                            &mut state.fold_velocity,
+                            "Realistic Nyquist (velocity folds)",
+                        )
+                        .on_hover_text(
+                            "Fold the simulated radial velocity like a real pulse-pair radar: \
+                             each gate is aliased into ±the Nyquist at right, so fast winds \
+                             wrap around the velocity scale instead of reading the true value. \
+                             Off (the default) stamps a wide 320 m/s Nyquist and shows the \
+                             exact unfolded wind. Either way the plain VEL product renders the \
+                             data as stored; DVEL, DSRV, or the 'Auto-dealias VEL' toggle unfold \
+                             the folded field — a dealias practice ground on known ground truth.",
+                        );
+                        ui.add_enabled(
+                            state.fold_velocity,
+                            egui::DragValue::new(&mut state.fold_nyquist_mps)
+                                .range(
+                                    SyntheticRadarUiState::MIN_FOLD_NYQUIST_MPS
+                                        ..=SyntheticRadarUiState::MAX_FOLD_NYQUIST_MPS,
+                                )
+                                .speed(0.5)
+                                .suffix(" m/s"),
+                        )
+                        .on_hover_text(
+                            "Nyquist velocity for the fold. Typical WSR-88D Doppler \
+                             Nyquists run ~8-33 m/s; velocity wraps every twice this value.",
+                        );
+                    });
+                    ui.horizontal(|ui| {
                         ui.label("Reflectivity:");
                         ui.selectable_value(
                             &mut state.reflectivity_operator,
@@ -1662,7 +1721,8 @@ impl ModelDataDock {
                         .on_hover_text(
                             "Domain centre, 230 km range, 250 m gates, textured reflectivity \
                              gates, clean velocity, model native reflectivity, no extra low \
-                             tilt, no ground clutter.",
+                             tilt, no ground clutter, true unfolded velocity (no realistic \
+                             Nyquist).",
                         )
                         .clicked()
                     {
@@ -3068,6 +3128,15 @@ mod tests {
             empty.clutter_intensity, 0.0,
             "ground clutter restores 0 (the clean physics)"
         );
+        assert!(
+            !empty.fold_velocity,
+            "realistic Nyquist restores OFF (true unfolded velocity)"
+        );
+        assert_eq!(
+            empty.fold_nyquist_mps,
+            crate::wrf_radar::DEFAULT_FOLD_NYQUIST_MPS,
+            "folding Nyquist restores the default 25 m/s"
+        );
 
         // A non-default selection survives the round trip.
         let custom = SyntheticRadarUiState {
@@ -3081,6 +3150,8 @@ mod tests {
             reflectivity_operator: crate::wrf_radar::ReflectivityOperator::ClassicStoelinga,
             include_low_tilt: true,
             clutter_intensity: 0.5,
+            fold_velocity: true,
+            fold_nyquist_mps: 33.0,
             ..SyntheticRadarUiState::default()
         };
         let value = serde_json::to_value(&custom).unwrap();
@@ -3119,6 +3190,88 @@ mod tests {
             config.elevations_deg,
             crate::wrf_radar::DEFAULT_ELEVATIONS_DEG,
             "default ladder is the classic 0.5° lowest tilt"
+        );
+        assert!(
+            !config.fold_velocity && !historical.fold_velocity,
+            "realistic Nyquist is opt-in — default keeps the true unfolded velocity"
+        );
+        assert_eq!(
+            config.stamped_nyquist_mps(),
+            crate::wrf_radar::UNFOLDED_NYQUIST_MPS,
+            "default (folding off) stamps the historical 320 m/s Nyquist"
+        );
+        assert_eq!(
+            config.nyquist_mps, historical.nyquist_mps,
+            "default folding Nyquist matches the library default"
+        );
+    }
+
+    /// The realistic-Nyquist toggle and its folding-Nyquist drag flow from the
+    /// UI state into the scan config: off keeps the true unfolded velocity (320
+    /// stamped), on stamps the chosen Nyquist, and the drag is clamped to the
+    /// sane [8, 64] m/s range in both modes.
+    #[test]
+    fn synth_radar_fold_velocity_flows_into_config() {
+        // Default: folding off, and the (inert) Nyquist is the library default.
+        let default = SyntheticRadarUiState::default().to_config().unwrap();
+        assert!(!default.fold_velocity, "default is true unfolded velocity");
+        assert_eq!(
+            default.stamped_nyquist_mps(),
+            crate::wrf_radar::UNFOLDED_NYQUIST_MPS
+        );
+
+        // Folding on with an in-range Nyquist: flows through and is the stamp.
+        let folded = SyntheticRadarUiState {
+            fold_velocity: true,
+            fold_nyquist_mps: 33.0,
+            ..SyntheticRadarUiState::default()
+        }
+        .to_config()
+        .unwrap();
+        assert!(folded.fold_velocity);
+        assert_eq!(folded.nyquist_mps, 33.0);
+        assert_eq!(folded.stamped_nyquist_mps(), 33.0);
+
+        // The drag clamps to [MIN, MAX] regardless of the folding toggle.
+        let too_high = SyntheticRadarUiState {
+            fold_velocity: true,
+            fold_nyquist_mps: 200.0,
+            ..SyntheticRadarUiState::default()
+        }
+        .to_config()
+        .unwrap();
+        assert_eq!(
+            too_high.nyquist_mps,
+            SyntheticRadarUiState::MAX_FOLD_NYQUIST_MPS,
+            "clamped to 64 m/s"
+        );
+        let too_low = SyntheticRadarUiState {
+            fold_velocity: true,
+            fold_nyquist_mps: 2.0,
+            ..SyntheticRadarUiState::default()
+        }
+        .to_config()
+        .unwrap();
+        assert_eq!(
+            too_low.nyquist_mps,
+            SyntheticRadarUiState::MIN_FOLD_NYQUIST_MPS,
+            "clamped to 8 m/s"
+        );
+
+        // Folding OFF with a custom Nyquist: the value is inert (still stamps
+        // the historical 320) but the field is set so the fingerprint tracks it.
+        let off_custom = SyntheticRadarUiState {
+            fold_velocity: false,
+            fold_nyquist_mps: 40.0,
+            ..SyntheticRadarUiState::default()
+        }
+        .to_config()
+        .unwrap();
+        assert_eq!(off_custom.nyquist_mps, 40.0);
+        assert_eq!(
+            off_custom.stamped_nyquist_mps(),
+            crate::wrf_radar::UNFOLDED_NYQUIST_MPS,
+            "folding off stamps 320 even with a custom Nyquist dialed in"
         );
     }
 
