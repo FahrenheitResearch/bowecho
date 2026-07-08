@@ -11,8 +11,10 @@
 //! - v0.30 extraction #7 (`settings_ui.rs`): 69,186 lines (ceiling deferred).
 //! - v0.30 feature tc-card-sat: 69,187 lines → ceiling 69,387.
 //! - v0.30 extraction #5 (`sat_paint.rs`): 67,694 lines → ceiling 67,894.
+//! - map_paint sub-move A (projection): 67,748 lines (ceiling deferred).
+//! - map_paint sub-move B (chrome): 65,714 lines → ceiling 65,914.
 
-const CEILING: usize = 67_894;
+const CEILING: usize = 65_914;
 
 #[test]
 fn main_rs_stays_under_the_line_ratchet_ceiling() {
