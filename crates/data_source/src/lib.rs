@@ -22,7 +22,18 @@ use thiserror::Error;
 
 pub const LEVEL2_ARCHIVE_BUCKET: &str = "unidata-nexrad-level2";
 pub const LEVEL2_CHUNKS_BUCKET: &str = "unidata-nexrad-level2-chunks";
-const HTTP_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(4);
+/// TCP connect budget for every feed client (see [`build_http_client`]).
+/// Was 4 s — tuned for the fast S3/CloudFerro feeds — but that dropped ALL
+/// Romanian (ANM) radars for users on slow/long-haul routes: the ANM
+/// government host (opendata.meteoromania.ro) is reachable and returns 200,
+/// yet is slow to ACCEPT the connection, and a single dropped SYN plus
+/// Windows' ~3 s SYN-retransmit blows past a 4 s deadline — so those users
+/// failed every 60 s tick with "tcp connect error: deadline has elapsed".
+/// 10 s absorbs one SYN-retransmit against slow international government
+/// hosts while staying well under the 60 s poll tick. Pollers run on
+/// background poll threads (see `poll_intl`'s `thread::spawn`), so a longer
+/// connect never blocks the egui update thread.
+const HTTP_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const HTTP_METADATA_TIMEOUT: StdDuration = StdDuration::from_secs(25);
 /// Whole-request budget on the download client. Field report: SMHI qcvol
 /// volumes run 17-18 MB and a user on a slow link hit the old 45 s budget
@@ -1781,6 +1792,22 @@ impl From<CommonPrefixXml> for CommonPrefix {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn http_connect_timeout_tolerates_slow_gov_hosts() {
+        // Regression guard for the v0.30.1 ANM outage: a 4 s connect budget
+        // dropped every Romanian radar for slow-route users when one SYN was
+        // lost (Windows re-sends after ~3 s). The budget must clear a single
+        // SYN-retransmit yet stay well under the 60 s poll tick.
+        assert!(
+            HTTP_CONNECT_TIMEOUT >= StdDuration::from_secs(8),
+            "connect budget must survive a SYN-retransmit against slow gov hosts"
+        );
+        assert!(
+            HTTP_CONNECT_TIMEOUT < StdDuration::from_secs(60),
+            "connect budget must stay under the poll tick"
+        );
+    }
 
     #[test]
     fn for_each_concurrent_runs_every_item_without_batch_barriers() {
