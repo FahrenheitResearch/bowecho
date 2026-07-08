@@ -13,8 +13,11 @@
 //! - v0.30 extraction #5 (`sat_paint.rs`): 67,694 lines → ceiling 67,894.
 //! - map_paint sub-move A (projection): 67,748 lines (ceiling deferred).
 //! - map_paint sub-move B (chrome): 65,714 lines → ceiling 65,914.
+//! - map_paint sub-move C (markers): 64,519 lines (ceiling deferred).
+//! - map_paint sub-move D (layers): 63,621 lines → ceiling 63,821. map_paint
+//!   decomposition COMPLETE (projection + chrome + markers + layers extracted).
 
-const CEILING: usize = 65_914;
+const CEILING: usize = 63_821;
 
 #[test]
 fn main_rs_stays_under_the_line_ratchet_ceiling() {
