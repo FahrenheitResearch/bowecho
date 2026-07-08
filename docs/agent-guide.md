@@ -39,8 +39,8 @@ are not negotiable.
 ## Repo map — where everything lives
 
 `crates/app_ui/src/` (the app; main.rs ≈ 67.7k lines and shrinking):
-- `main.rs` — ViewerApp struct (~330 fields), radar loading/loop engine, eframe update, map painting (the 15k-line paint block is the last un-extracted region; see decomposition plan). Palette gate for model layers: `model_layer_solar_table` (~line 4784) — precedence: user 🎨 override → Solar table → production style → viridis fallback.
-- Extracted modules (v0.30): `self_update.rs` (update checks; also the streaming-download + sha256 pattern), `hazard_geom.rs` (pure hazard geometry/parse/fill), `hazard_ui.rs` (hazard panels/paint), `product_select.rs` (product/cut selection), `settings_ui.rs` (settings panels), `sat_paint.rs` (sat window/worker pump/map layer/LUT cache), `geo_helpers.rs`.
+- `main.rs` — ViewerApp struct (~330 fields), radar loading/loop engine, eframe update. ~63.6k lines after phase-1 decomposition. The map-paint block is now extracted (see `map_paint.rs`); `single_pane_canvas`/`grid_canvas` (input + paint dispatch) and the `handle_*_click` cluster stay here by design. Palette gate for model layers: `model_layer_solar_table` — precedence: user 🎨 override → Solar table → production style → viridis fallback. Ratchet ceiling ~63,821 — new feature code goes in modules, not here.
+- Extracted modules (v0.30): `self_update.rs` (update checks; also the streaming-download + sha256 pattern), `hazard_geom.rs` (pure hazard geometry/parse/fill), `hazard_ui.rs` (hazard panels/paint), `product_select.rs` (product/cut selection), `settings_ui.rs` (settings panels), `sat_paint.rs` (sat window/worker pump/map layer/LUT cache), `geo_helpers.rs`, `map_paint.rs` (projection AEQD + GeoBounds, map chrome/labels/colorbar/mode-chip/cursor-inspector+loupe, site/intl/community markers, basemap+radar-raster+tiles layers).
 - Satellite: `sat_window.rs` (geostationary navigation math — CGMS scan angles, GOES/Himawari sub-lons, native windows), `sat_worker.rs` (ingest workers, true-color composites, true-Kelvin IR + `ir_enhancement_anchors` BD/CIMSS/etc., sat store write contract `{token}_c{band:02}_{day}`).
 - Tropical: `tropical.rs` (storm cards incl. 🛰 Vis/IR one-press sat views, JTWC vitals).
 - Model/WRF: `model_data.rs` (model dock boundary; display-time label translation for raw `wrf_*` vars; `attach_solar_fallback_style` — the seam where style-less wrf fields get Solar compiled into `field.style`, WITH the friendly label as title because rw-ui prints `style.title` as plot title + viewer heading), `model_data/iso_fields.rs` (upper-air: synthesizes per-level picker entries 925–250 mb from `*_iso` volumes, background slicer), `model_layer.rs` (map layer), `local_import.rs` (LIGHT import: fast `read_var` 2-D planes + iso volumes; 4-dim vars skipped), `wrf_process.rs` (heavy full-diagnostics import), `wrf_volumes.rs` (native→isobaric interpolation, 37 levels, feeds skew-T), `wrf_radar.rs` (synthetic radar forward operator: virtual NEXRAD, 14-tilt ladder, 4/3-earth beam height/ground range per Doviak & Zrnić eq 2.28b/c, Stoelinga/Thompson reflectivity, Sun & Crook radial velocity; samples beam CENTERLINE — no beam broadening/attenuation/terrain blockage yet), `vol3d.rs` (wgpu volume raymarch + egui_wgpu callback pattern — the GPU precedent).
@@ -69,7 +69,7 @@ PINNED, UNMODIFIABLE deps (fix at app seams, never in them): rusty-weather crate
 
 ## Plans & state (read the one for your task)
 
-- `docs/main-decomposition-plan.md` — main.rs decomposition. Done through queue #7 + sat_paint; REMAINING: `map_paint.rs` (~15k, in sub-moves, after the LoopEngine field migration) and phase 2 (state absorption).
+- `docs/main-decomposition-plan.md` — main.rs decomposition. **Phase 1 COMPLETE (2026-07-08): all 8 queue items landed incl. `map_paint.rs` (projection/chrome/markers/layers); main.rs 79,177 → 63,621, −19.6%.** REMAINING: phase 2 (LoopEngine/PaneView state absorption — touches real logic, feature-level review, separate approval) and phase 3 (crate split, unscheduled).
 - `docs/simsat-engine-plan.md` — v0.31 headline: standalone physically-based simulated-satellite renderer (SimSat Studio), iGPU hardware floor. §12 is the implementer handoff — start there.
 - `docs/wrf-import-large-grids.md` — binding memory constraints, Enderlin facts, upstream reader gaps.
 - `docs/releases/` — shipped notes. `C:\Users\drew\radar-work\FABLE_BACKLOG.md` — owner's backlog/doc of record.
@@ -77,4 +77,5 @@ PINNED, UNMODIFIABLE deps (fix at app seams, never in them): rusty-weather crate
 
 ## Report style (what the owner expects)
 
+NO decorative emojis — not in chat, release notes, docs, or commit messages (strict house rule). Referencing literal in-app button labels that contain icons is fine; decorating prose is not.
 Lead with the outcome. Exact numbers (line counts, test counts, sha). Say what you deliberately did NOT do and why. Never claim visual behavior you couldn't verify — describe what the code does and let the owner's RC test confirm. When you find something mid-task that contradicts the brief, say so and adapt — the code is the truth, docs get corrected.
