@@ -63,6 +63,7 @@ mod italy_dpc;
 mod layers_rail;
 mod live_archive_bar;
 mod local_import;
+mod map_paint;
 mod max_ref_swath;
 mod media;
 mod mesoanalysis;
@@ -258,6 +259,11 @@ use ui_core::geo::{aeqd_forward_km, aeqd_inverse_km};
 use sat_paint::{nearest_sat_frame_for_time, sat_frame_distance_seconds, sat_map_request_matches};
 #[cfg(test)]
 use sat_paint::{sat_enhancement_refresh_frames, sat_run_family, satellite_run_key_is_composite};
+// map_paint sub-move A (final decomposition): the AEQD projection primitives
+// moved into an `impl ViewerApp` in `map_paint.rs`, and the `GeoBounds`
+// view-extent type moved with them; this re-export keeps every existing
+// `crate::…` / unqualified `GeoBounds` reference in main.rs compiling unchanged.
+use map_paint::GeoBounds;
 // v0.29 Phase 4c: the FrameHistory family moved VERBATIM into the shared
 // engine crate (spec §8 row "FrameHistory + generation fn + …"); these
 // re-exports keep every existing `crate::…` reference — main.rs and the
@@ -38740,120 +38746,6 @@ impl ViewerApp {
                 .and_then(|timing| timing.realtime_last_chunk_type),
         })
     }
-
-    /// Azimuthal-equidistant projection about the map center (north up):
-    /// screen offsets are true great-circle kilometres, so range and azimuth
-    /// are exact at the center and the frame matches the radar raster's
-    /// planar ENU geometry (the equirectangular mapping it replaces skewed
-    /// east-west distances away from the center latitude).
-    fn lon_lat_to_screen(
-        &self,
-        rect: egui::Rect,
-        longitude_deg: f32,
-        latitude_deg: f32,
-    ) -> egui::Pos2 {
-        let (east_km, north_km) = aeqd_forward_km(
-            self.map_center_lat as f64,
-            self.map_center_lon as f64,
-            latitude_deg as f64,
-            longitude_deg as f64,
-        );
-        let px_per_km = self.map_scale / 111.32;
-        egui::pos2(
-            rect.center().x + east_km as f32 * px_per_km,
-            rect.center().y - north_km as f32 * px_per_km,
-        )
-    }
-
-    fn screen_to_lon_lat(&self, rect: egui::Rect, position: egui::Pos2) -> (f32, f32) {
-        let km_per_px = 111.32 / self.map_scale;
-        let east_km = (position.x - rect.center().x) * km_per_px;
-        let north_km = (rect.center().y - position.y) * km_per_px;
-        let (lat, lon) = aeqd_inverse_km(
-            self.map_center_lat as f64,
-            self.map_center_lon as f64,
-            east_km as f64,
-            north_km as f64,
-        );
-        (normalize_lon(lon as f32), lat as f32)
-    }
-
-    fn visible_geo_bounds(&self, rect: egui::Rect) -> GeoBounds {
-        // Under AEQD the lat/lon extremes of the view sit on the EDGES, not
-        // two corners (parallels bow poleward, meridians converge) — sample
-        // four corners plus four edge midpoints (review finding F1).
-        let samples = [
-            rect.left_top(),
-            rect.right_top(),
-            rect.left_bottom(),
-            rect.right_bottom(),
-            egui::pos2(rect.center().x, rect.top()),
-            egui::pos2(rect.center().x, rect.bottom()),
-            egui::pos2(rect.left(), rect.center().y),
-            egui::pos2(rect.right(), rect.center().y),
-        ];
-        let mut bounds = GeoBounds {
-            west: f32::INFINITY,
-            east: f32::NEG_INFINITY,
-            south: f32::INFINITY,
-            north: f32::NEG_INFINITY,
-        };
-        for sample in samples {
-            let (lon, lat) = self.screen_to_lon_lat(rect, sample);
-            bounds.west = bounds.west.min(lon);
-            bounds.east = bounds.east.max(lon);
-            bounds.south = bounds.south.min(lat);
-            bounds.north = bounds.north.max(lat);
-        }
-        // If a pole is inside the view radius every longitude is visible.
-        let km_per_px = 111.32 / self.map_scale;
-        let view_radius_km = (rect.width().hypot(rect.height()) * 0.5 * km_per_px) as f64;
-        const KM_PER_DEG: f64 = 111.32;
-        let north_pole_km = (90.0 - self.map_center_lat as f64) * KM_PER_DEG;
-        let south_pole_km = (90.0 + self.map_center_lat as f64) * KM_PER_DEG;
-        if north_pole_km < view_radius_km || south_pole_km < view_radius_km {
-            bounds.west = -180.0;
-            bounds.east = 180.0;
-        }
-        bounds.south = bounds.south.clamp(-85.0, 85.0);
-        bounds.north = bounds.north.clamp(-85.0, 85.0);
-        bounds
-    }
-
-    /// Deviation of local "screen north" from straight up at a geo point —
-    /// the AEQD meridian-convergence angle (radians, clockwise positive).
-    /// The radar raster is planar ENU about the radar, so its quad is
-    /// rotated by this angle to sit correctly in the AEQD frame (F2).
-    fn aeqd_north_angle(&self, rect: egui::Rect, latitude_deg: f32, longitude_deg: f32) -> f32 {
-        let base = self.lon_lat_to_screen(rect, longitude_deg, latitude_deg);
-        let north = self.lon_lat_to_screen(rect, longitude_deg, latitude_deg + 0.05);
-        let v = north - base;
-        if v.length_sq() < 1e-12 {
-            return 0.0;
-        }
-        v.x.atan2(-v.y)
-    }
-
-    fn clamp_map_center(&mut self) {
-        self.map_center_lon = normalize_lon(self.map_center_lon);
-        self.map_center_lat = self.map_center_lat.clamp(-85.0, 85.0);
-    }
-
-    fn lon_screen_scale(&self) -> f32 {
-        self.map_center_lat.to_radians().cos().abs().max(0.02)
-    }
-
-    fn lon_pixels_per_degree(&self) -> f32 {
-        self.map_scale * self.lon_screen_scale()
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct GeoBounds {
-    west: f32,
-    south: f32,
-    east: f32,
-    north: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -39748,41 +39640,6 @@ fn basemap_line_simplification_px(map_scale: f32) -> f32 {
         0.45
     } else {
         0.0
-    }
-}
-
-impl GeoBounds {
-    fn expand(self, degrees: f32) -> Self {
-        Self {
-            west: self.west - degrees,
-            south: self.south - degrees,
-            east: self.east + degrees,
-            north: self.north + degrees,
-        }
-    }
-
-    fn intersect(self, other: Self) -> Option<Self> {
-        let bounds = Self {
-            west: self.west.max(other.west),
-            south: self.south.max(other.south),
-            east: self.east.min(other.east),
-            north: self.north.min(other.north),
-        };
-        (bounds.west < bounds.east && bounds.south < bounds.north).then_some(bounds)
-    }
-
-    fn contains(self, longitude_deg: f32, latitude_deg: f32) -> bool {
-        longitude_deg >= self.west
-            && longitude_deg <= self.east
-            && latitude_deg >= self.south
-            && latitude_deg <= self.north
-    }
-
-    fn intersects_bbox(self, bbox: [f32; 4]) -> bool {
-        bbox[2] >= self.west
-            && bbox[0] <= self.east
-            && bbox[3] >= self.south
-            && bbox[1] <= self.north
     }
 }
 
