@@ -25,12 +25,16 @@ use std::path::{Path, PathBuf};
 /// deliberately allowed to iterate the raw catalogs), re-pinned again at
 /// the Phase-4d `overlays.rs` extraction (the overlay family's four
 /// `self.sites` lookups and one `intl_static_sites()` dispatch moved
-/// VERBATIM out of main.rs — totals unchanged). Files not listed must
-/// contain ZERO of either.
-const PINNED: [(&str, usize, usize); 5] = [
+/// VERBATIM out of main.rs — totals unchanged), re-pinned again at the
+/// `map_paint.rs` sub-move C (markers) extraction (the marker painters'
+/// five `self.sites` lookups and three `intl_static_sites()` dispatches
+/// moved VERBATIM out of main.rs — totals unchanged). Files not listed
+/// must contain ZERO of either.
+const PINNED: [(&str, usize, usize); 6] = [
     ("event_explorer.rs", 2, 0),
     ("layers_rail.rs", 2, 2),
-    ("main.rs", 47, 8),
+    ("main.rs", 42, 5),
+    ("map_paint.rs", 5, 3),
     ("overlays.rs", 4, 1),
     ("sites_ui.rs", 2, 3),
 ];
