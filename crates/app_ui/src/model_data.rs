@@ -165,6 +165,16 @@ struct SyntheticRadarUiState {
     /// trilinear look, bit-identical to before the toggle existed.
     #[serde(default)]
     gate_texture: bool,
+    /// Reflectivity operator: the model's own Thompson `REFL_10CM`
+    /// (model native, the historical default) or the classic Stoelinga
+    /// `CALCDBZ` community diagnostic. An older config with no entry restores
+    /// model native.
+    #[serde(default)]
+    reflectivity_operator: crate::wrf_radar::ReflectivityOperator,
+    /// Opt-in extra 0.1° tilt below the standard 0.5° lowest tilt (the
+    /// community exports start here). Off restores the classic ladder.
+    #[serde(default)]
+    include_low_tilt: bool,
 }
 
 fn default_synth_range_km() -> f64 {
@@ -186,6 +196,8 @@ impl Default for SyntheticRadarUiState {
             gate_spacing_m: default_synth_gate_m(),
             auto_gate_spacing: true,
             gate_texture: false,
+            reflectivity_operator: crate::wrf_radar::ReflectivityOperator::default(),
+            include_low_tilt: false,
         }
     }
 }
@@ -242,6 +254,8 @@ impl SyntheticRadarUiState {
             max_range_m: self.clamped_range_km() * 1000.0,
             gate_spacing_m: self.effective_gate_spacing_m(),
             gate_texture: self.gate_texture,
+            reflectivity_operator: self.reflectivity_operator,
+            elevations_deg: crate::wrf_radar::elevation_ladder(self.include_low_tilt),
             ..crate::wrf_radar::SyntheticRadarConfig::default()
         };
         match self.placement {
@@ -1567,9 +1581,48 @@ impl ModelDataDock {
                              field; velocity only gets a slight wobble. Off = the classic \
                              smooth look, unchanged.",
                         );
+                    ui.horizontal(|ui| {
+                        ui.label("Reflectivity:");
+                        ui.selectable_value(
+                            &mut state.reflectivity_operator,
+                            crate::wrf_radar::ReflectivityOperator::ModelNative,
+                            "Model native (REFL_10CM)",
+                        )
+                        .on_hover_text(
+                            "Render the model's own Thompson 10-cm reflectivity (REFL_10CM) \
+                             when the file carries it. Hotter/fatter cores in graupel and \
+                             the melting layer — the model's native look. Falls back to \
+                             computed dBZ if the file has no REFL_10CM.",
+                        );
+                        ui.selectable_value(
+                            &mut state.reflectivity_operator,
+                            crate::wrf_radar::ReflectivityOperator::ClassicStoelinga,
+                            "Classic Stoelinga (community look)",
+                        )
+                        .on_hover_text(
+                            "Always compute dBZ (Stoelinga 2005 / CALCDBZ, fixed \
+                             Marshall-Palmer intercepts) even when the file carries \
+                             REFL_10CM — matching the community wrf-python / GR2Analyst \
+                             pipeline. Roughly 10–20 dB cooler in graupel/melting regions, \
+                             so hooks stand out of moderate echo.",
+                        );
+                    });
+                    ui.checkbox(
+                        &mut state.include_low_tilt,
+                        "Include 0.1° low tilt (community lowest tilt)",
+                    )
+                    .on_hover_text(
+                        "Prepend a 0.1° tilt below the standard 0.5° lowest tilt, like the \
+                         community exports. The lower beam samples roughly half the height \
+                         at range, so a low-level hook is better defined. Adds one sweep to \
+                         every volume. Off = the classic 0.5° lowest tilt.",
+                    );
                     if ui
                         .button("Reset to defaults")
-                        .on_hover_text("Domain centre, 230 km range, 250 m gates, smooth gates.")
+                        .on_hover_text(
+                            "Domain centre, 230 km range, 250 m gates, smooth gates, model \
+                             native reflectivity, no extra low tilt.",
+                        )
                         .clicked()
                     {
                         *state = SyntheticRadarUiState::default();
@@ -2957,6 +3010,12 @@ mod tests {
         assert_eq!(empty.gate_spacing_m, 250.0);
         assert!(empty.auto_gate_spacing);
         assert!(!empty.gate_texture, "gate texture restores OFF");
+        assert_eq!(
+            empty.reflectivity_operator,
+            crate::wrf_radar::ReflectivityOperator::ModelNative,
+            "reflectivity operator restores model native"
+        );
+        assert!(!empty.include_low_tilt, "low tilt restores OFF");
 
         // A non-default selection survives the round trip.
         let custom = SyntheticRadarUiState {
@@ -2966,6 +3025,8 @@ mod tests {
             auto_gate_spacing: false,
             gate_spacing_m: 500.0,
             gate_texture: true,
+            reflectivity_operator: crate::wrf_radar::ReflectivityOperator::ClassicStoelinga,
+            include_low_tilt: true,
             ..SyntheticRadarUiState::default()
         };
         let value = serde_json::to_value(&custom).unwrap();
@@ -2990,6 +3051,16 @@ mod tests {
             !config.gate_texture && !historical.gate_texture,
             "gate texture is opt-in — defaults keep the smooth look"
         );
+        assert_eq!(
+            config.reflectivity_operator,
+            crate::wrf_radar::ReflectivityOperator::ModelNative,
+            "default operator is model native"
+        );
+        assert_eq!(
+            config.elevations_deg,
+            crate::wrf_radar::DEFAULT_ELEVATIONS_DEG,
+            "default ladder is the classic 0.5° lowest tilt"
+        );
     }
 
     /// The gate-texture checkbox flows into the scan config; everything
@@ -3004,6 +3075,52 @@ mod tests {
         assert!(config.gate_texture);
         assert_eq!(config.max_range_m, 230_000.0);
         assert_eq!(config.gate_spacing_m, 250.0);
+    }
+
+    /// The reflectivity-operator selector and the optional 0.1° low tilt flow
+    /// from the UI state into the scan config; unset, they keep the historical
+    /// defaults (model native, classic ladder).
+    #[test]
+    fn synth_radar_operator_and_low_tilt_flow_into_config() {
+        use crate::wrf_radar::ReflectivityOperator;
+
+        // Classic Stoelinga + low tilt selected.
+        let state = SyntheticRadarUiState {
+            reflectivity_operator: ReflectivityOperator::ClassicStoelinga,
+            include_low_tilt: true,
+            ..SyntheticRadarUiState::default()
+        };
+        let config = state.to_config().unwrap();
+        assert_eq!(
+            config.reflectivity_operator,
+            ReflectivityOperator::ClassicStoelinga
+        );
+        assert_eq!(
+            config.elevations_deg,
+            crate::wrf_radar::elevation_ladder(true)
+        );
+        assert_eq!(config.elevations_deg[0], crate::wrf_radar::LOW_TILT_DEG);
+        assert_eq!(
+            config.elevations_deg.len(),
+            crate::wrf_radar::DEFAULT_ELEVATIONS_DEG.len() + 1
+        );
+
+        // Model native + no low tilt = the historical config.
+        let plain = SyntheticRadarUiState {
+            reflectivity_operator: ReflectivityOperator::ModelNative,
+            include_low_tilt: false,
+            ..SyntheticRadarUiState::default()
+        }
+        .to_config()
+        .unwrap();
+        assert_eq!(
+            plain.reflectivity_operator,
+            ReflectivityOperator::ModelNative
+        );
+        assert_eq!(
+            plain.elevations_deg,
+            crate::wrf_radar::DEFAULT_ELEVATIONS_DEG
+        );
     }
 
     /// NEXRAD-id placement resolves through the app's compiled-in site
@@ -3145,8 +3262,9 @@ mod tests {
         let config = state.to_config().expect("KMVX resolves");
 
         let file = wrf_core::WrfFile::open(std::path::Path::new(&path)).expect("open wrfout");
-        let fields = crate::wrf_radar::read_wrf_radar_fields(&file, 0, config.prefer_refl_10cm)
-            .expect("read WRF radar fields");
+        let fields =
+            crate::wrf_radar::read_wrf_radar_fields(&file, 0, config.reflectivity_operator)
+                .expect("read WRF radar fields");
         let time = chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap();
         let volume = crate::wrf_radar::build_synthetic_volume(&fields, time, &config);
 

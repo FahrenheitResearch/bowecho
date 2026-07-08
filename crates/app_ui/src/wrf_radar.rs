@@ -53,6 +53,92 @@ pub const DEFAULT_ELEVATIONS_DEG: &[f64] = &[
     0.5, 0.9, 1.3, 1.8, 2.4, 3.1, 4.0, 5.1, 6.4, 8.0, 10.0, 12.5, 15.6, 19.5,
 ];
 
+/// Optional sub-0.5° tilt (deg) prepended below [`DEFAULT_ELEVATIONS_DEG`] when
+/// the user opts in. The community wrf-python/GR2 exports start their ladder
+/// here; the 0.1° beam samples roughly half the height of our standard 0.5°
+/// lowest tilt at range, so a hook echo is better defined near the ground.
+pub const LOW_TILT_DEG: f64 = 0.1;
+
+/// Build the elevation ladder for a synthetic scan. With `include_low_tilt`
+/// the [`LOW_TILT_DEG`] tilt is prepended below the standard
+/// [`DEFAULT_ELEVATIONS_DEG`] ladder; otherwise the standard ladder is
+/// returned unchanged (bit-identical to the historical default).
+pub fn elevation_ladder(include_low_tilt: bool) -> Vec<f64> {
+    if include_low_tilt {
+        std::iter::once(LOW_TILT_DEG)
+            .chain(DEFAULT_ELEVATIONS_DEG.iter().copied())
+            .collect()
+    } else {
+        DEFAULT_ELEVATIONS_DEG.to_vec()
+    }
+}
+
+/// Reflectivity source label stamped when the model's own Thompson `REFL_10CM`
+/// field is used directly.
+pub const REFL_10CM_SOURCE: &str = "REFL_10CM";
+/// Reflectivity source label stamped when the model-native operator falls back
+/// to the computed `dbz` because the file carries no `REFL_10CM`.
+pub const CALCDBZ_SOURCE: &str = "dbz/CALCDBZ";
+/// Reflectivity source label stamped when the classic Stoelinga operator is
+/// chosen, forcing the computed `dbz` (CALCDBZ) even when the file carries
+/// `REFL_10CM`.
+pub const STOELINGA_SOURCE: &str = "dbz/CALCDBZ (Stoelinga)";
+
+/// Which reflectivity operator a synthetic scan uses. Both diagnostics are
+/// legitimate: `REFL_10CM` is the model's own Thompson-native 10-cm
+/// reflectivity (hotter/fatter in graupel/big-drop/melting regions of a
+/// supercell), while the classic Stoelinga `dbz` (wrf-core `CALCDBZ`,
+/// fixed Marshall-Palmer intercepts) is what the community wrf-python/GR2
+/// pipeline renders. The choice is a per-import operator difference of roughly
+/// +10..+20 dB in those regions — not a rendering artifact.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReflectivityOperator {
+    /// Prefer the model's own `REFL_10CM` when the file carries it, else fall
+    /// back to the computed `dbz` (`CALCDBZ`). The historical default.
+    #[default]
+    ModelNative,
+    /// Always compute `dbz` (wrf-core `CALCDBZ`, Stoelinga 2005 fixed
+    /// intercepts) — the community wrf-python/GR2 look — even when the file
+    /// carries `REFL_10CM`.
+    ClassicStoelinga,
+}
+
+impl ReflectivityOperator {
+    /// Whether to prefer the model's own `REFL_10CM` when the file carries it.
+    /// Only the model-native operator does; Stoelinga always recomputes.
+    pub fn prefers_refl_10cm(self) -> bool {
+        matches!(self, Self::ModelNative)
+    }
+
+    /// The source label stamped when this operator uses the computed `dbz`
+    /// (`CALCDBZ`) path — distinguishing a deliberate Stoelinga choice from a
+    /// model-native fallback.
+    pub fn computed_dbz_source(self) -> &'static str {
+        match self {
+            Self::ModelNative => CALCDBZ_SOURCE,
+            Self::ClassicStoelinga => STOELINGA_SOURCE,
+        }
+    }
+}
+
+/// The reflectivity source label a synthetic scan will stamp, given the
+/// operator choice and whether the file carries `REFL_10CM`. Assumes the
+/// `REFL_10CM` read succeeds when attempted; a failed/short read falls through
+/// to the computed `dbz`, mirrored exactly by [`read_reflectivity`]. This is
+/// the pure decision the reflectivity read makes, factored out so both operator
+/// branches are testable without a WRF file on disk.
+pub fn planned_ref_source(
+    operator: ReflectivityOperator,
+    file_has_refl_10cm: bool,
+) -> &'static str {
+    if operator.prefers_refl_10cm() && file_has_refl_10cm {
+        REFL_10CM_SOURCE
+    } else {
+        operator.computed_dbz_source()
+    }
+}
+
 /// Configuration for one synthetic scan.
 #[derive(Clone, Debug)]
 pub struct SyntheticRadarConfig {
@@ -79,9 +165,11 @@ pub struct SyntheticRadarConfig {
     /// native, forward-modelled Vr is treated as already unfolded (TRUE
     /// velocity) by downstream dealias/readout code.
     pub nyquist_mps: f32,
-    /// Prefer the model's own `REFL_10CM` 3-D reflectivity when the file
-    /// carries it; otherwise fall back to the computed `dbz` (`CALCDBZ`).
-    pub prefer_refl_10cm: bool,
+    /// Which reflectivity operator populates the sampled `dbz`: the model's own
+    /// Thompson-native `REFL_10CM` ([`ReflectivityOperator::ModelNative`]) or the
+    /// classic Stoelinga `CALCDBZ` community diagnostic
+    /// ([`ReflectivityOperator::ClassicStoelinga`]).
+    pub reflectivity_operator: ReflectivityOperator,
     /// Opt-in "gate texture": deterministic, range-correlated speckle added
     /// to the sampled moments so the synthetic gates read like real
     /// Level-II texture instead of a perfectly smooth trilinear field. OFF
@@ -107,7 +195,9 @@ impl Default for SyntheticRadarConfig {
             max_range_m: 230_000.0,
             ref_floor_dbz: 0.0,
             nyquist_mps: 320.0,
-            prefer_refl_10cm: true,
+            // Default operator. Flip this one line to ClassicStoelinga to
+            // re-default the community look after the owner's comparison.
+            reflectivity_operator: ReflectivityOperator::ModelNative,
             gate_texture: false,
         }
     }
@@ -149,19 +239,21 @@ impl WrfRadarFields {
 
 /// Read the WRF 3-D reflectivity + earth-relative winds + height for one time.
 ///
-/// Reflectivity: `REFL_10CM` (the model's own Thompson 10-cm reflectivity)
-/// when present and `prefer_refl_10cm`, else `wrf-core`'s `dbz` (`CALCDBZ`,
-/// Stoelinga 2005) — the same diagnostic BowEcho's composite reflectivity uses,
-/// so a synthetic scan co-locates with the model's own composite. Raw wrfout
-/// carries the hydrometeor mixing ratios `dbz` needs; a post-processed /
-/// climate wrfout may not — this returns an `Err` (empty/absent reflectivity)
-/// so the caller can warn rather than emit an all-NaN scan.
+/// Reflectivity: `REFL_10CM` (the model's own Thompson 10-cm reflectivity) when
+/// present and the operator is [`ReflectivityOperator::ModelNative`], else
+/// `wrf-core`'s `dbz` (`CALCDBZ`, Stoelinga 2005) — the same diagnostic
+/// BowEcho's composite reflectivity uses, so a synthetic scan co-locates with
+/// the model's own composite. [`ReflectivityOperator::ClassicStoelinga`] forces
+/// the `CALCDBZ` path even when the file carries `REFL_10CM`. Raw wrfout carries
+/// the hydrometeor mixing ratios `dbz` needs; a post-processed / climate wrfout
+/// may not — this returns an `Err` (empty/absent reflectivity) so the caller can
+/// warn rather than emit an all-NaN scan.
 pub fn read_wrf_radar_fields(
     file: &WrfFile,
     timeidx: usize,
-    prefer_refl_10cm: bool,
+    operator: ReflectivityOperator,
 ) -> Result<WrfRadarFields, String> {
-    read_wrf_radar_fields_reporting(file, timeidx, prefer_refl_10cm, &|_| {})
+    read_wrf_radar_fields_reporting(file, timeidx, operator, &|_| {})
 }
 
 /// Read one time's fields, streaming stage labels through `progress` so the UI
@@ -181,7 +273,7 @@ pub fn read_wrf_radar_fields(
 pub fn read_wrf_radar_fields_reporting(
     file: &WrfFile,
     timeidx: usize,
-    prefer_refl_10cm: bool,
+    operator: ReflectivityOperator,
     progress: &dyn Fn(&str),
 ) -> Result<WrfRadarFields, String> {
     let nx = file.nx;
@@ -217,8 +309,7 @@ pub fn read_wrf_radar_fields_reporting(
     let mut terrain_m: Vec<f32> = Vec::new();
     std::thread::scope(|scope| {
         let th_height = scope.spawn(|| read_3d(file, "height", timeidx, nz * cells));
-        let th_refl =
-            scope.spawn(|| read_reflectivity(file, timeidx, nz * cells, prefer_refl_10cm));
+        let th_refl = scope.spawn(|| read_reflectivity(file, timeidx, nz * cells, operator));
         let th_winds = scope.spawn(|| read_earth_relative_winds(file, timeidx, nz * cells));
         let th_w = scope.spawn(|| read_3d(file, "wa", timeidx, nz * cells));
         let th_terrain = scope.spawn(|| read_terrain_m(file, timeidx, cells));
@@ -311,21 +402,24 @@ fn read_reflectivity(
     file: &WrfFile,
     timeidx: usize,
     expected: usize,
-    prefer_refl_10cm: bool,
+    operator: ReflectivityOperator,
 ) -> Result<(Vec<f32>, &'static str), String> {
-    if prefer_refl_10cm
-        && file.has_var("REFL_10CM")
+    // The same decision the tests assert through `planned_ref_source`: only the
+    // model-native operator reads REFL_10CM, and only when the file carries it.
+    if planned_ref_source(operator, file.has_var("REFL_10CM")) == REFL_10CM_SOURCE
         && let Ok(raw) = file.read_var("REFL_10CM", timeidx)
         && raw.len() == expected
     {
-        return Ok((to_f32(&raw), "REFL_10CM"));
+        return Ok((to_f32(&raw), REFL_10CM_SOURCE));
     }
     // wrf-core `dbz` = CALCDBZ (Stoelinga 2005), the same source BowEcho's
     // composite reflectivity uses. Constant intercepts / no bright-band
     // correction (ComputeOpts default) to match that composite exactly.
+    // The classic-Stoelinga operator forces this path even when the file
+    // carries REFL_10CM; the source label records which case applied.
     let dbz = read_3d(file, "dbz", timeidx, expected)
         .map_err(|err| format!("no REFL_10CM and computed dbz failed: {err}"))?;
-    Ok((dbz, "dbz/CALCDBZ"))
+    Ok((dbz, operator.computed_dbz_source()))
 }
 
 fn read_3d(
@@ -931,7 +1025,7 @@ fn build_synthetic_from_paths(
             let fields = match read_wrf_radar_fields_reporting(
                 &file,
                 timeidx,
-                config.prefer_refl_10cm,
+                config.reflectivity_operator,
                 &progress,
             ) {
                 Ok(fields) => fields,
@@ -1349,6 +1443,72 @@ mod tests {
         }
     }
 
+    /// The reflectivity-operator choice resolves to the right source label for
+    /// each branch. `read_reflectivity` needs a real WRF file (WrfFile only
+    /// opens from a path), so the operator→source decision it makes is factored
+    /// into `planned_ref_source` and asserted here for both operators, with and
+    /// without a file-carried REFL_10CM.
+    #[test]
+    fn reflectivity_operator_selects_the_expected_source() {
+        use ReflectivityOperator::{ClassicStoelinga, ModelNative};
+
+        // Model native: prefers REFL_10CM when present, falls back to CALCDBZ.
+        assert_eq!(planned_ref_source(ModelNative, true), REFL_10CM_SOURCE);
+        assert_eq!(planned_ref_source(ModelNative, false), CALCDBZ_SOURCE);
+
+        // Classic Stoelinga forces CALCDBZ EVEN when REFL_10CM is present, and
+        // stamps a distinct label so a run documents the deliberate choice
+        // rather than a fallback.
+        assert_eq!(planned_ref_source(ClassicStoelinga, true), STOELINGA_SOURCE);
+        assert_eq!(
+            planned_ref_source(ClassicStoelinga, false),
+            STOELINGA_SOURCE
+        );
+
+        // Only the model-native operator ever reads REFL_10CM.
+        assert!(ModelNative.prefers_refl_10cm());
+        assert!(!ClassicStoelinga.prefers_refl_10cm());
+
+        // Default operator is model native (the historical behavior).
+        assert_eq!(ReflectivityOperator::default(), ModelNative);
+        assert_eq!(
+            SyntheticRadarConfig::default().reflectivity_operator,
+            ModelNative
+        );
+
+        // The three labels are distinct so the import note is unambiguous.
+        assert_ne!(REFL_10CM_SOURCE, CALCDBZ_SOURCE);
+        assert_ne!(CALCDBZ_SOURCE, STOELINGA_SOURCE);
+    }
+
+    /// The optional 0.1° low tilt is prepended below the standard ladder when
+    /// opted in, and off by default it is bit-identical to the classic ladder.
+    #[test]
+    fn low_tilt_option_prepends_the_community_lowest_tilt() {
+        let standard = elevation_ladder(false);
+        assert_eq!(
+            standard, DEFAULT_ELEVATIONS_DEG,
+            "off = the classic ladder, unchanged"
+        );
+
+        let with_low = elevation_ladder(true);
+        assert_eq!(
+            with_low.len(),
+            DEFAULT_ELEVATIONS_DEG.len() + 1,
+            "one extra tilt"
+        );
+        assert_eq!(with_low[0], LOW_TILT_DEG, "0.1° comes first");
+        assert!(
+            with_low[0] < DEFAULT_ELEVATIONS_DEG[0],
+            "the extra tilt is below the standard lowest tilt"
+        );
+        assert_eq!(
+            &with_low[1..],
+            DEFAULT_ELEVATIONS_DEG,
+            "the standard ladder follows unchanged"
+        );
+    }
+
     /// The DEFAULT-OFF contract for the opt-in gate texture: the default
     /// config leaves it off, and an off build is bit-identical to an
     /// explicit `gate_texture: false` build — when disabled, the texture
@@ -1646,7 +1806,7 @@ mod tests {
             azimuth_count: 720,
             ..SyntheticRadarConfig::default()
         };
-        let fields = read_wrf_radar_fields(&file, 0, config.prefer_refl_10cm)
+        let fields = read_wrf_radar_fields(&file, 0, config.reflectivity_operator)
             .expect("read WRF radar fields");
         eprintln!(
             "reflectivity source: {}  grid {}x{}x{}",
@@ -1829,7 +1989,7 @@ mod tests {
 
         let file = WrfFile::open(&path).expect("open real wrfout");
         let config = SyntheticRadarConfig::default();
-        let mut fields = read_wrf_radar_fields(&file, 0, config.prefer_refl_10cm)
+        let mut fields = read_wrf_radar_fields(&file, 0, config.reflectivity_operator)
             .expect("read WRF radar fields");
         let time = file
             .times()
@@ -2143,7 +2303,8 @@ mod tests {
         let config = SyntheticRadarConfig::default();
 
         let tr = Instant::now();
-        let fields = read_wrf_radar_fields(&file, 0, config.prefer_refl_10cm).expect("read fields");
+        let fields =
+            read_wrf_radar_fields(&file, 0, config.reflectivity_operator).expect("read fields");
         eprintln!(
             "[prof] read_wrf_radar_fields {:.2}s  refl_source={}",
             tr.elapsed().as_secs_f64(),
@@ -2179,7 +2340,8 @@ mod tests {
         // Original serial read logic (verbatim from before the parallelization).
         let seq = {
             let height = read_3d(&file, "height", 0, nz * cells).unwrap();
-            let (dbz, _src) = read_reflectivity(&file, 0, nz * cells, true).unwrap();
+            let (dbz, _src) =
+                read_reflectivity(&file, 0, nz * cells, ReflectivityOperator::ModelNative).unwrap();
             let (u, v) = match getvar(&file, "uvmet", Some(0), &ComputeOpts::default()) {
                 Ok(uvmet) if uvmet.data.len() == 2 * nz * cells => {
                     let (ue, ve) = uvmet.data.split_at(nz * cells);
@@ -2195,7 +2357,7 @@ mod tests {
             (height, dbz, u, v, w)
         };
 
-        let par = read_wrf_radar_fields(&file, 0, true).unwrap();
+        let par = read_wrf_radar_fields(&file, 0, ReflectivityOperator::ModelNative).unwrap();
 
         // Bit-identical comparison (compare raw bits so NaNs must match too).
         let same = |a: &[f32], b: &[f32]| -> bool {
