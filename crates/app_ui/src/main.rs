@@ -52,6 +52,7 @@ mod event_loop_builder;
 mod farm_live;
 mod fonts;
 mod gbvtd_retrieval;
+mod gdex_ui;
 mod geo_helpers;
 mod glm_layer;
 mod grid_composites;

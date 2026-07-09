@@ -1607,6 +1607,16 @@ fn sources(ui: &mut egui::Ui) {
          (EUMETSAT entitlement).",
     );
 
+    subhead(ui, "GDEX CLIMATE MODEL DATA");
+    para(
+        ui,
+        "The model dock's GDEX browser walks the NSF NCAR GDEX online catalog (a THREDDS \
+         server) and imports whole files or NCSS subsets directly. CONUS II is regional \
+         climate WRF downscaling for present and future periods. \
+         Data: NSF NCAR GDEX, CONUS II (CC-BY 4.0), DOI 10.5065/49SN-8E08. Files are \
+         fetched at runtime — nothing is bundled.",
+    );
+
     subhead(ui, "BASEMAPS");
     para(
         ui,
@@ -1783,6 +1793,18 @@ mod tests {
         );
         let guide_src = include_str!("guide.rs");
         assert!(guide_src.contains("EUMETNET ORD, SMHI Sweden, Australia NCI"));
+    }
+
+    /// GDEX (Stage 1b) attribution: the in-app CONUS II browser must carry the
+    /// NSF NCAR GDEX credit, its CC-BY 4.0 license, and the dataset DOI in the
+    /// sources copy (no invented credit surface — this is the existing one).
+    #[test]
+    fn guide_credits_gdex_conus_ii_source() {
+        let guide_src = include_str!("guide.rs");
+        assert!(guide_src.contains("NSF NCAR GDEX"));
+        assert!(guide_src.contains("CONUS II"));
+        assert!(guide_src.contains("10.5065/49SN-8E08"));
+        assert!(guide_src.contains("CC-BY 4.0"));
     }
 
     /// The retired MTG plumbing (v0.29 Phase 5 deletion sweep) must stay

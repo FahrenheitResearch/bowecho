@@ -545,6 +545,16 @@ pub struct ModelDataDock {
     /// Newest iso-level load requested while one was in flight (slug-named;
     /// latest wins — mirrors the rw-ui worker's request coalescing).
     iso_load_pending: Option<rw_ui::FieldKey>,
+    /// GDEX (NSF NCAR CONUS II) in-app catalog browser (Stage 1b). Its window
+    /// opens from the import controls; its workers are drained in
+    /// [`Self::poll_gdex`] and a completed download is handed to the SAME
+    /// local-import pump as the manual model import.
+    gdex: crate::gdex_ui::GdexBrowser,
+    /// Completed GDEX downloads waiting to be imported (FIFO). Normally holds
+    /// zero or one — GDEX downloads one file at a time — but a download that
+    /// lands while a manual import is still running waits here instead of
+    /// being dropped.
+    gdex_import_queue: std::collections::VecDeque<PathBuf>,
 }
 
 impl ModelDataDock {
@@ -581,6 +591,8 @@ impl ModelDataDock {
             hour_store_vars: Vec::new(),
             iso_load: None,
             iso_load_pending: None,
+            gdex: crate::gdex_ui::GdexBrowser::new(),
+            gdex_import_queue: std::collections::VecDeque::new(),
         }
     }
 
@@ -690,6 +702,7 @@ impl ModelDataDock {
     fn handle_responses(&mut self) {
         self.poll_import();
         self.poll_iso_load();
+        self.poll_gdex();
         while let Some(response) = self.worker.try_recv() {
             match response {
                 StoreResponse::Tree(tree) => {
@@ -1143,6 +1156,41 @@ impl ModelDataDock {
         }
     }
 
+    /// Drain the GDEX browser's background workers (catalog crawl / NCSS
+    /// metadata / download). A completed download is queued for import and, if
+    /// no import is already running, launched immediately through the SAME
+    /// light-import pump as the manual model import. Runs every frame from
+    /// `handle_responses` (thus `pump`), so a GDEX download finishes, imports,
+    /// and plots even while the model window is closed.
+    fn poll_gdex(&mut self) {
+        let ctx = self.repaint.clone();
+        if let Some(path) = self.gdex.poll(&ctx) {
+            self.gdex_import_queue.push_back(path);
+        }
+        if self.import_job.is_none()
+            && let Some(path) = self.gdex_import_queue.pop_front()
+        {
+            self.launch_gdex_import(path);
+        }
+    }
+
+    /// Import a file a GDEX download produced, reusing the existing light
+    /// import (`local_import::spawn_import_paths`) — the same progress pump,
+    /// store write, re-scan, and plot as the manual model import. Ungated: the
+    /// GDEX browser is an in-app tree (no rfd), so this handoff compiles and
+    /// works on every platform, including the headless verify nodes. Setting
+    /// `import_job` also engages the live-refresh crash guard
+    /// (`import_in_flight`) automatically.
+    fn launch_gdex_import(&mut self, path: PathBuf) {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let task = crate::local_import::spawn_import_paths(vec![path], self.store_root.clone());
+        self.import_message = Some(format!("Importing {name} (from GDEX)…"));
+        self.import_job = Some(ImportJob::Local(task));
+    }
+
     /// One-shot: take finished synthetic-radar volumes for the app to install
     /// into the loop engine. Returns `(status label, one volume per WRF time)`.
     pub fn take_synthetic_radar(
@@ -1185,6 +1233,26 @@ impl ModelDataDock {
             }
         });
         self.import_pickers(ui);
+        // GDEX online catalog (works on every platform — an in-app tree, no
+        // native file dialog). Opens the browser window rendered in `ui`.
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("🌐 GDEX (NSF NCAR CONUS II)…")
+                .on_hover_text(
+                    "Browse the NSF NCAR GDEX online catalog — CONUS II regional climate WRF \
+                     (present + future). Download a whole file or an NCSS subset (pick \
+                     variables / bbox / time); it imports into the model store and plots like \
+                     any other run. Downloads run in the background; the server is flaky, so \
+                     errors are retryable.",
+                )
+                .clicked()
+            {
+                self.gdex.open = true;
+            }
+            if self.gdex.busy() {
+                ui.spinner();
+            }
+        });
         if let Some(message) = &self.import_message {
             ui.label(egui::RichText::new(message).small().weak());
         }
@@ -2290,6 +2358,15 @@ impl ModelDataDock {
             if !open {
                 self.show_color_tables = false;
             }
+        }
+
+        // GDEX (NSF NCAR CONUS II) catalog browser, as a floating window.
+        // Rendered only while open so its download cache dir is not created
+        // every frame; its workers keep running (and completed downloads keep
+        // importing) via `poll_gdex` even after the window is closed.
+        if self.gdex.open {
+            let cache_dir = settings::gdex_cache_dir();
+            self.gdex.ui(ui, &cache_dir);
         }
     }
 }

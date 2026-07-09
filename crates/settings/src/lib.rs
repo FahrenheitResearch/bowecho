@@ -1304,6 +1304,13 @@ pub fn model_cache_dir() -> PathBuf {
     bowecho_dir("model-cache")
 }
 
+/// GDEX (NSF NCAR CONUS II) download cache for the in-app catalog browser.
+/// A `gdex/` subfolder of the data root (override-aware, same pattern as
+/// [`model_cache_dir`]). Created on use.
+pub fn gdex_cache_dir() -> PathBuf {
+    bowecho_dir("gdex")
+}
+
 /// Crash log destination (config dir; None when no config dir resolves).
 pub fn panic_log_path() -> Option<PathBuf> {
     bowecho_config_dir().map(|root| {
