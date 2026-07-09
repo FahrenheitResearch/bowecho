@@ -1126,7 +1126,7 @@ fn latest_realtime_volume_from_chunks(
 /// still useful for live display up to its first gap/duplicate/type error,
 /// but it must never be assembled past that point or marked complete.
 fn validated_realtime_chunk_prefix(
-    chunks: &mut Vec<RealtimeChunkObject>,
+    chunks: &mut [RealtimeChunkObject],
 ) -> (Vec<RealtimeChunkObject>, bool) {
     chunks.sort_by(|left, right| {
         left.chunk_id
