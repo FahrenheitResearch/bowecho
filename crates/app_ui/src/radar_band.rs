@@ -76,8 +76,9 @@ pub(crate) fn resolve(volume: &RadarVolume) -> RadarBandResolution {
         let resolved = match record.kind {
             SiteKind::Wsr88d => Some((RadarBand::S, "WSR-88D")),
             SiteKind::Tdwr => Some((RadarBand::C, "TDWR")),
-            SiteKind::Research => known_research_band(&canonical_us_id)
-                .map(|band| (band, "research radar")),
+            SiteKind::Research => {
+                known_research_band(&canonical_us_id).map(|band| (band, "research radar"))
+            }
             SiteKind::Intl { .. } => None,
         };
         if let Some((band, classification)) = resolved {
@@ -112,14 +113,12 @@ pub(crate) fn resolve(volume: &RadarVolume) -> RadarBandResolution {
         if !catalog_site_id.eq_ignore_ascii_case(site_id) {
             return None;
         }
-        known_international_band(&provider_id, &catalog_site_id).map(|band| {
-            RadarBandResolution {
-                band,
-                provenance: RadarBandProvenance::InternationalCatalog {
-                    provider_id,
-                    site_id: catalog_site_id,
-                },
-            }
+        known_international_band(&provider_id, &catalog_site_id).map(|band| RadarBandResolution {
+            band,
+            provenance: RadarBandProvenance::InternationalCatalog {
+                provider_id,
+                site_id: catalog_site_id,
+            },
         })
     });
     if let Some(candidate) = candidates.next()

@@ -332,7 +332,10 @@ impl<'a> Nc3File<'a> {
             }
             if len == 0 {
                 if record_dim.is_some() {
-                    return Err(invalid(cursor.at, "netCDF declares multiple record dimensions"));
+                    return Err(invalid(
+                        cursor.at,
+                        "netCDF declares multiple record dimensions",
+                    ));
                 }
                 record_dim = Some(index);
                 dims.push((name, numrecs));
@@ -362,9 +365,7 @@ impl<'a> Nc3File<'a> {
             if ndims > MAX_NC_VAR_DIMS {
                 return Err(invalid(
                     cursor.at,
-                    format!(
-                        "netCDF variable '{name}' rank {ndims} exceeds {MAX_NC_VAR_DIMS}"
-                    ),
+                    format!("netCDF variable '{name}' rank {ndims} exceeds {MAX_NC_VAR_DIMS}"),
                 ));
             }
             let mut dim_ids = Vec::with_capacity(ndims);
@@ -477,13 +478,12 @@ impl<'a> Nc3File<'a> {
                 record_vars
                     .iter()
                     .map(|candidate| {
-                        self.slab_bytes(candidate)
-                            .and_then(|bytes| {
-                                bytes
-                                    .checked_add(3)
-                                    .map(|value| value / 4 * 4)
-                                    .ok_or_else(|| invalid(0, "netCDF record padding overflow"))
-                            })
+                        self.slab_bytes(candidate).and_then(|bytes| {
+                            bytes
+                                .checked_add(3)
+                                .map(|value| value / 4 * 4)
+                                .ok_or_else(|| invalid(0, "netCDF record padding overflow"))
+                        })
                     })
                     .try_fold(0usize, |total, bytes| {
                         total

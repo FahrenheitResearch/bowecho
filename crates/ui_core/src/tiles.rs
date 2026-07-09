@@ -452,8 +452,8 @@ fn fetch_and_decode(
 }
 
 fn load_cached_tile(path: &Path, source: &TileSource, tile: TileId) -> Option<DecodedTile> {
-    let decoded = read_tile_file_limited(path)
-        .and_then(|bytes| decode_tile_bytes(source, tile, &bytes));
+    let decoded =
+        read_tile_file_limited(path).and_then(|bytes| decode_tile_bytes(source, tile, &bytes));
     if decoded.is_none() {
         // A truncated, oversized, or otherwise corrupt tile must not remain
         // a permanent retry sink. Ignore removal errors (read-only cache,

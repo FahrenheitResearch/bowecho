@@ -1422,7 +1422,9 @@ mod tests {
         let size = format!("{:011o}", MAX_JMA_MEMBER_BYTES + 1);
         header[TAR_SIZE_OFFSET..TAR_SIZE_OFFSET + 11].copy_from_slice(size.as_bytes());
         header[TAR_TYPEFLAG_OFFSET] = b'0';
-        let err = ustar_members(&header).err().expect("oversized member error");
+        let err = ustar_members(&header)
+            .err()
+            .expect("oversized member error");
         assert!(
             err.contains("declares") && err.contains("limit"),
             "unexpected error: {err}"

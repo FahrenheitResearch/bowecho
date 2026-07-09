@@ -1611,9 +1611,9 @@ fn try_decode_bzip_blocks(raw: &[u8]) -> Result<Option<Vec<u8>>> {
             "block-bzip radar payload expands beyond the {MAX_DECODED_RADAR_BYTES}-byte aggregate limit"
         ))
     })?;
-    let output_len = VOLUME_HEADER_LEN.checked_add(decoded_len).ok_or_else(|| {
-        NexradError::Compression("block-bzip output size overflow".to_owned())
-    })?;
+    let output_len = VOLUME_HEADER_LEN
+        .checked_add(decoded_len)
+        .ok_or_else(|| NexradError::Compression("block-bzip output size overflow".to_owned()))?;
     let mut output = Vec::new();
     output.try_reserve_exact(output_len).map_err(|err| {
         NexradError::Compression(format!("cannot reserve block-bzip output: {err}"))

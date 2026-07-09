@@ -687,7 +687,9 @@ mod tests {
         let err = assemble_cycle("asb", anchors[2], &products).unwrap_err();
         assert!(
             err.contains("'vradh' cycle ending")
-                && err.contains("missing expected sweep indices 00, 01, 02, 03, 04, 05, 06, 07, 08, 09"),
+                && err.contains(
+                    "missing expected sweep indices 00, 01, 02, 03, 04, 05, 06, 07, 08, 09"
+                ),
             "unexpected error: {err}"
         );
 
@@ -729,10 +731,7 @@ mod tests {
             name: "synthetic-unexpected-sweep".to_owned(),
         });
 
-        assert_eq!(
-            cycle_anchors(&sweeps, 1),
-            vec![timestamp("20260612064402")]
-        );
+        assert_eq!(cycle_anchors(&sweeps, 1), vec![timestamp("20260612064402")]);
     }
 
     #[test]

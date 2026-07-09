@@ -734,15 +734,14 @@ impl SweepParse {
                 return Ok(());
             }
         };
-        let decoded_cells = self.decoded_cells.checked_add(row.len()).ok_or_else(|| {
-            invalid(offset, "DORADE decoded-cell count overflow")
-        })?;
+        let decoded_cells = self
+            .decoded_cells
+            .checked_add(row.len())
+            .ok_or_else(|| invalid(offset, "DORADE decoded-cell count overflow"))?;
         if decoded_cells > MAX_DORADE_CELLS_PER_SWEEP {
             return Err(invalid(
                 offset,
-                format!(
-                    "DORADE sweep exceeds the {MAX_DORADE_CELLS_PER_SWEEP}-cell decode limit"
-                ),
+                format!("DORADE sweep exceeds the {MAX_DORADE_CELLS_PER_SWEEP}-cell decode limit"),
             ));
         }
         self.decoded_cells = decoded_cells;

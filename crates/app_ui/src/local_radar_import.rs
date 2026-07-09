@@ -94,16 +94,17 @@ pub(crate) fn merge_time_coherent_parts(
 
     let mut groups: Vec<Vec<LocalRadarPart>> = Vec::new();
     for part in parts {
-        let joins_last_group = groups
-            .last()
-            .and_then(|group| group.first())
-            .is_some_and(|anchor| {
-                part.volume
-                    .volume_time
-                    .signed_duration_since(anchor.volume.volume_time)
-                    .num_milliseconds()
-                    <= SAME_SCAN_TOLERANCE_MILLISECONDS
-            });
+        let joins_last_group =
+            groups
+                .last()
+                .and_then(|group| group.first())
+                .is_some_and(|anchor| {
+                    part.volume
+                        .volume_time
+                        .signed_duration_since(anchor.volume.volume_time)
+                        .num_milliseconds()
+                        <= SAME_SCAN_TOLERANCE_MILLISECONDS
+                });
         if joins_last_group && let Some(group) = groups.last_mut() {
             group.push(part);
         } else {
@@ -202,12 +203,7 @@ mod tests {
         let frames = merge_time_coherent_parts(vec![
             part("TEST", 0, "a.h5", MomentType::Reflectivity),
             part("TEST", 80, "b.h5", MomentType::Velocity),
-            part(
-                "TEST",
-                160,
-                "c.h5",
-                MomentType::DifferentialReflectivity,
-            ),
+            part("TEST", 160, "c.h5", MomentType::DifferentialReflectivity),
         ])
         .expect("assemble time groups");
 

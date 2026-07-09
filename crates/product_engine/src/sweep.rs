@@ -2443,8 +2443,9 @@ mod tests {
         assert!(report.inserted.contains(&"PHIF".to_owned()));
         assert!(report.unavailable.contains(&"KDP".to_owned()));
         assert!(report.unavailable.contains(&"RATE_KDP".to_owned()));
-        assert!(!cut
-            .moments
-            .contains_key(&MomentType::SpecificDifferentialPhase));
+        assert!(
+            !cut.moments
+                .contains_key(&MomentType::SpecificDifferentialPhase)
+        );
     }
 }

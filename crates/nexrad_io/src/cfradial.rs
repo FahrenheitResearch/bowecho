@@ -471,21 +471,15 @@ mod tests {
 
     #[test]
     fn rhi_fixed_angle_fallback_uses_wrap_aware_azimuth_mean() {
-        let fixed = fallback_fixed_angle(
-            Some(ScanMode::Rhi),
-            &[359.0, 0.0, 1.0],
-            &[10.0, 20.0, 30.0],
-        );
+        let fixed =
+            fallback_fixed_angle(Some(ScanMode::Rhi), &[359.0, 0.0, 1.0], &[10.0, 20.0, 30.0]);
         assert!(fixed < 0.01 || fixed > 359.99, "fixed angle was {fixed}");
     }
 
     #[test]
     fn ppi_fixed_angle_fallback_still_uses_mean_elevation() {
-        let fixed = fallback_fixed_angle(
-            Some(ScanMode::Ppi),
-            &[80.0, 90.0, 100.0],
-            &[0.4, 0.5, 0.6],
-        );
+        let fixed =
+            fallback_fixed_angle(Some(ScanMode::Ppi), &[80.0, 90.0, 100.0], &[0.4, 0.5, 0.6]);
         assert!((fixed - 0.5).abs() < 1.0e-9);
     }
 }

@@ -186,17 +186,19 @@ impl MemberBudget {
                 "archive member {name} declares {bytes} bytes (per-member limit {MAX_MOBILE_MEMBER_BYTES})"
             )));
         }
-        let candidates = self.candidates.checked_add(1).ok_or_else(|| {
-            invalid_archive("mobile archive member count overflow".to_owned())
-        })?;
+        let candidates = self
+            .candidates
+            .checked_add(1)
+            .ok_or_else(|| invalid_archive("mobile archive member count overflow".to_owned()))?;
         if candidates > MAX_MOBILE_MEMBERS {
             return Err(invalid_archive(format!(
                 "mobile archive contains more than {MAX_MOBILE_MEMBERS} candidate radar members"
             )));
         }
-        let expanded_bytes = self.expanded_bytes.checked_add(bytes).ok_or_else(|| {
-            invalid_archive("mobile archive expanded-size overflow".to_owned())
-        })?;
+        let expanded_bytes = self
+            .expanded_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| invalid_archive("mobile archive expanded-size overflow".to_owned()))?;
         if expanded_bytes > MAX_MOBILE_ARCHIVE_BYTES {
             return Err(invalid_archive(format!(
                 "mobile archive candidate members exceed the {MAX_MOBILE_ARCHIVE_BYTES}-byte aggregate limit"
@@ -238,12 +240,9 @@ fn read_radar_members(path: &Path) -> Result<Vec<RadarMember>> {
             invalid_archive(format!("zip entry {name} size overflows this platform"))
         })?;
         budget.reserve(&name, declared)?;
-        let bytes = read_to_end_limited(
-            &mut entry,
-            MAX_MOBILE_MEMBER_BYTES,
-            "mobile archive member",
-        )
-        .map_err(|err| with_member(&name, err))?;
+        let bytes =
+            read_to_end_limited(&mut entry, MAX_MOBILE_MEMBER_BYTES, "mobile archive member")
+                .map_err(|err| with_member(&name, err))?;
         if bytes.len() != declared {
             return Err(invalid_archive(format!(
                 "zip entry {name} decoded to {} bytes, expected {declared}",
@@ -418,7 +417,10 @@ fn file_len_usize(path: &Path) -> Result<usize> {
         source,
     })?;
     usize::try_from(metadata.len()).map_err(|_| {
-        invalid_archive(format!("file {} size overflows this platform", path.display()))
+        invalid_archive(format!(
+            "file {} size overflows this platform",
+            path.display()
+        ))
     })
 }
 

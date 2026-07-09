@@ -436,10 +436,7 @@ pub fn url_exists(url: &str) -> Result<bool> {
 /// Fetch a small binary resource (e.g. a placefile icon sheet). Capped at
 /// 4 MiB — these are sprite sheets, not data files.
 pub fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
-    let response = metadata_http_client()
-        .get(url)
-        .send()?
-        .error_for_status()?;
+    let response = metadata_http_client().get(url).send()?.error_for_status()?;
     read_response_limited(response, MAX_SMALL_RESOURCE_BYTES, "resource")
 }
 
@@ -1063,10 +1060,7 @@ fn stable_completed_listing(
     second
 }
 
-fn list_realtime_level2_volume_for_id(
-    site: &str,
-    volume_id: u16,
-) -> Result<RealtimeLevel2Volume> {
+fn list_realtime_level2_volume_for_id(site: &str, volume_id: u16) -> Result<RealtimeLevel2Volume> {
     let volume_prefix = format!("{site}/{volume_id}/");
     let mut chunks = list_s3_limited(
         LEVEL2_CHUNKS_BUCKET,
@@ -1722,10 +1716,7 @@ fn unique_download_temp_path(path: &Path) -> PathBuf {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("download");
-    path.with_file_name(format!(
-        ".{name}.download-{}-{id}",
-        std::process::id()
-    ))
+    path.with_file_name(format!(".{name}.download-{}-{id}", std::process::id()))
 }
 
 /// Publish a fully written same-directory temporary file. The keyed path
@@ -2078,12 +2069,7 @@ struct CompletedVolumeCache {
 }
 
 impl CompletedVolumeCache {
-    fn get(
-        &self,
-        site: &str,
-        volume_id: u16,
-        now: DateTime<Utc>,
-    ) -> Option<RealtimeLevel2Volume> {
+    fn get(&self, site: &str, volume_id: u16, now: DateTime<Utc>) -> Option<RealtimeLevel2Volume> {
         let entries = self.entries.lock().ok()?;
         entries
             .get(site)?
@@ -2101,8 +2087,7 @@ impl CompletedVolumeCache {
         if let Ok(mut entries) = self.entries.lock() {
             let volumes = entries.entry(volume.site.clone()).or_default();
             volumes.retain(|existing| {
-                existing.volume_id != volume.volume_id
-                    || existing.volume_time != volume.volume_time
+                existing.volume_id != volume.volume_id || existing.volume_time != volume.volume_time
             });
             volumes.push(volume);
             volumes.sort_by_key(|volume| volume.volume_time);
@@ -2387,10 +2372,7 @@ mod tests {
             "incomplete volume cached"
         );
         cache.insert(realtime_volume_fixture(8, true));
-        assert_eq!(
-            cache.get("KEAX", 8, now).map(|v| v.volume_id),
-            Some(8)
-        );
+        assert_eq!(cache.get("KEAX", 8, now).map(|v| v.volume_id), Some(8));
         assert!(
             cache.get("KTLX", 8, now).is_none(),
             "cache leaked across sites"
@@ -2427,22 +2409,14 @@ mod tests {
 
         assert_eq!(
             cache
-                .get(
-                    "KEAX",
-                    7,
-                    newer.volume_time + chrono::Duration::minutes(1)
-                )
+                .get("KEAX", 7, newer.volume_time + chrono::Duration::minutes(1))
                 .map(|volume| volume.volume_time),
             Some(newer.volume_time),
             "a wrapped id must resolve to its newest scan generation"
         );
         assert!(
             cache
-                .get(
-                    "KEAX",
-                    7,
-                    newer.volume_time + chrono::Duration::minutes(21)
-                )
+                .get("KEAX", 7, newer.volume_time + chrono::Duration::minutes(21))
                 .is_none(),
             "stale completed generations must force a fresh listing"
         );

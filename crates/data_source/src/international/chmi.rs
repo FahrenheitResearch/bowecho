@@ -256,10 +256,7 @@ fn fetch_product_listings(site_id: &str) -> Result<Vec<ChmiProductListing>, Stri
 /// Task-Z full-volume timestamps shared by every required product, NEWEST
 /// FIRST. A supplemental B/A file can appear before the next Z upload; it is
 /// never allowed to advance the frame generation on its own.
-fn chmi_frame_anchors(
-    listings: &[ChmiProductListing],
-    count: usize,
-) -> Vec<NaiveDateTime> {
+fn chmi_frame_anchors(listings: &[ChmiProductListing], count: usize) -> Vec<NaiveDateTime> {
     let Some(base) = listings.first() else {
         return Vec::new();
     };
@@ -305,9 +302,10 @@ fn assemble_frame(
                 .iter()
                 .filter(|listing| listing.required)
                 .all(|listing| {
-                    listing.files.iter().any(|file| {
-                        file.task == base_file.task && file.time == base_file.time
-                    })
+                    listing
+                        .files
+                        .iter()
+                        .any(|file| file.task == base_file.task && file.time == base_file.time)
                 })
         })
         .collect();
