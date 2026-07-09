@@ -989,6 +989,22 @@ impl ViewerApp {
         if origin.y + height > rect.bottom() - 4.0 {
             origin.y = anchor.y - 14.0 - height;
         }
+        // Loupe-aware placement (owner report: the card overlapped the loupe
+        // when it flipped onto the disk). When the loupe is shown, re-place the
+        // card so it clears the disk's bounding circle while staying on-screen.
+        // No loupe → `origin` is unchanged, so this path is a no-op.
+        if let Some((disk_center, disk_radius)) =
+            self.cursor_loupe_disk(painter.ctx(), rect, anchor)
+        {
+            origin = place_inspector_card_clear_of_loupe(
+                origin,
+                anchor,
+                egui::vec2(width, height),
+                rect,
+                disk_center,
+                disk_radius,
+            );
+        }
         let card = egui::Rect::from_min_size(origin, egui::vec2(width, height));
         painter.rect_filled(
             card,
@@ -1057,6 +1073,46 @@ impl ViewerApp {
         self.draw_cursor_loupe(painter, rect, anchor, readout.is_some());
     }
 
+    /// The Field Loupe disk's screen geometry (`(center, radius)`) when the
+    /// loupe is currently shown at `anchor`, or `None` when it is hidden. This
+    /// is the SINGLE source of truth for the visibility gate and disk placement:
+    /// [`Self::draw_cursor_loupe`] uses it to paint, and
+    /// [`Self::draw_cursor_inspector`] uses it to keep the readout card off the
+    /// disk (owner report: the card overlapped the loupe when it flipped). The
+    /// disk radius is fixed ([`LOUPE_RADIUS`]) — scroll zoom changes the optical
+    /// magnification, not the disk size — so the placement is independent of it.
+    fn cursor_loupe_disk(
+        &self,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        anchor: egui::Pos2,
+    ) -> Option<(egui::Pos2, f32)> {
+        let shift_held = ctx.input(|input| input.modifiers.shift);
+        if !(self.inspector_show_loupe || shift_held) {
+            return None;
+        }
+        // v0.29.3: while the plot-domain box tool is engaged the drag must
+        // not summon the magnifier mid-box (owner constraint) — Ctrl+SHIFT
+        // holds Shift down, and the armed mode owns the surface outright.
+        if self.plot_domain_map_drag.is_some() || self.plot_domain_arm_active() {
+            return None;
+        }
+        if !rect.contains(anchor) {
+            return None;
+        }
+        let radius = LOUPE_RADIUS;
+        // Edge-clamp: float the disk above the cursor, flip below if it would
+        // clip the top, then keep the whole disk inside the pane.
+        let margin = radius + 6.0;
+        let mut center = egui::pos2(anchor.x, anchor.y - (radius + 34.0));
+        if center.y - radius < rect.top() + 4.0 {
+            center.y = anchor.y + (radius + 34.0);
+        }
+        center.x = center.x.clamp(rect.left() + margin, rect.right() - margin);
+        center.y = center.y.clamp(rect.top() + margin, rect.bottom() - margin);
+        Some((center, radius))
+    }
+
     /// A circular, pixelated GPU magnifier ("Field Loupe") anchored at the
     /// cursor — inspired by Solarpower07's WRF-Runner loupe.
     ///
@@ -1077,39 +1133,19 @@ impl ViewerApp {
         anchor: egui::Pos2,
         radar_has_gate: bool,
     ) {
-        let shift_held = painter.ctx().input(|input| input.modifiers.shift);
-        if !(self.inspector_show_loupe || shift_held) {
+        // Visibility gate + disk placement live in `cursor_loupe_disk` so the
+        // inspector card can consult the SAME geometry and keep itself off the
+        // disk. `RADIUS` is fixed; scroll changes the optical magnification.
+        let Some((center, radius)) = self.cursor_loupe_disk(painter.ctx(), rect, anchor) else {
             return;
-        }
-        // v0.29.3: while the plot-domain box tool is engaged the drag must
-        // not summon the magnifier mid-box (owner constraint) — Ctrl+SHIFT
-        // holds Shift down, and the armed mode owns the surface outright.
-        // Loupe behavior everywhere else is untouched.
-        if self.plot_domain_map_drag.is_some() || self.plot_domain_arm_active() {
-            return;
-        }
-        if !rect.contains(anchor) {
-            return;
-        }
-
-        // Disk geometry. MAGNIFY is the loupe's optical zoom: a rim vertex at
-        // screen offset `d` from the loupe center samples the field at
-        // `focus + d / MAGNIFY`, so a small patch around the focus fills the
-        // whole disk (the "scaled toward the cursor by 1/zoom" mapping).
-        const RADIUS: f32 = 70.0;
-        const MAGNIFY: f32 = 6.0;
+        };
+        // `magnify` is the loupe's optical zoom (scroll-wheel adjustable while
+        // the loupe is shown, persisted for the session): a rim vertex at screen
+        // offset `d` from the loupe center samples the field at `focus + d /
+        // magnify`, so a small patch around the focus fills the whole disk.
+        let magnify = self.loupe_magnify;
         const RIM: usize = 72;
         let focus = anchor;
-
-        // Edge-clamp: float the disk above the cursor, flip below if it would
-        // clip the top, then keep the whole disk inside the pane.
-        let margin = RADIUS + 6.0;
-        let mut center = egui::pos2(anchor.x, anchor.y - (RADIUS + 34.0));
-        if center.y - RADIUS < rect.top() + 4.0 {
-            center.y = anchor.y + (RADIUS + 34.0);
-        }
-        center.x = center.x.clamp(rect.left() + margin, rect.right() - margin);
-        center.y = center.y.clamp(rect.top() + margin, rect.bottom() - margin);
 
         // Native-gate path (feat/loupe-native-gates): for a plain base moment
         // under the cursor, rasterize the REAL polar gates into a small
@@ -1120,7 +1156,7 @@ impl ViewerApp {
         // magnifier below, unchanged.
         let native = radar_has_gate
             .then(|| {
-                self.radar_loupe_native_prepare(painter.ctx(), rect, center, focus, RADIUS, MAGNIFY)
+                self.radar_loupe_native_prepare(painter.ctx(), rect, center, focus, radius, magnify)
             })
             .flatten();
 
@@ -1146,11 +1182,21 @@ impl ViewerApp {
                     (q.y - img_rect.top()) / img_rect.height().max(f32::EPSILON),
                 ),
                 (None, Some(source)) => {
-                    source.screen_to_uv(loupe_sample_screen(focus, center, q, MAGNIFY))
+                    source.screen_to_uv(loupe_sample_screen(focus, center, q, magnify))
                 }
                 (None, None) => egui::Pos2::ZERO,
             }
         };
+        // Opaque backdrop UNDER the loupe image: the loupe ColorImage leaves
+        // no-echo / no-data / off-grid texels TRANSPARENT, and the raster path
+        // likewise has transparent (no-echo) areas. Without a backdrop the
+        // non-magnified 1x map underneath bleeds through at the wrong scale —
+        // the ghosted double-image the owner circled. A filled disk in the
+        // loupe's own chrome dark (matching the rim halo) turns every
+        // transparent texel into a clean neutral background, making the loupe a
+        // self-contained magnified window. Drawn before the mesh so the mesh
+        // blends on top; the rim halo below covers the boundary seam.
+        painter.circle_filled(center, radius, egui::Color32::from_rgb(12, 15, 20));
         let tint = egui::Color32::WHITE;
         let mut mesh = egui::epaint::Mesh::with_texture(texture_id);
         mesh.vertices.push(egui::epaint::Vertex {
@@ -1160,7 +1206,7 @@ impl ViewerApp {
         });
         for i in 0..RIM {
             let theta = std::f32::consts::TAU * i as f32 / RIM as f32;
-            let q = center + RADIUS * egui::vec2(theta.cos(), theta.sin());
+            let q = center + radius * egui::vec2(theta.cos(), theta.sin());
             mesh.vertices.push(egui::epaint::Vertex {
                 pos: q,
                 uv: to_uv(q),
@@ -1178,12 +1224,12 @@ impl ViewerApp {
         // exact focus gate/point.
         painter.circle_stroke(
             center,
-            RADIUS,
+            radius,
             egui::Stroke::new(3.0, egui::Color32::from_rgb(12, 15, 20)),
         );
         painter.circle_stroke(
             center,
-            RADIUS,
+            radius,
             egui::Stroke::new(1.4, egui::Color32::from_rgb(232, 238, 246)),
         );
         let cross = 8.0;
@@ -2258,6 +2304,128 @@ impl LoupeSource {
             ),
         }
     }
+}
+
+/// Field Loupe disk radius in screen points. Fixed: the scroll wheel changes
+/// the optical magnification, not the disk size.
+pub(crate) const LOUPE_RADIUS: f32 = 70.0;
+/// Default loupe optical magnification (the historical `MAGNIFY` const).
+pub(crate) const LOUPE_MAGNIFY_DEFAULT: f32 = 6.0;
+/// Loupe magnification clamp — scroll cannot push it outside this range.
+pub(crate) const LOUPE_MAGNIFY_MIN: f32 = 2.0;
+pub(crate) const LOUPE_MAGNIFY_MAX: f32 = 20.0;
+/// Per-scroll-point exponent rate: `magnify *= exp(scroll * RATE)`. One wheel
+/// notch (~50 points on Windows) is ~exp(50*0.0025)=1.13x, a comfortable step.
+pub(crate) const LOUPE_MAGNIFY_SCROLL_RATE: f32 = 0.0025;
+
+/// Whether the Field Loupe owns the scroll wheel this frame (so it retunes the
+/// loupe magnification and the map does NOT zoom). The loupe is shown when the
+/// inspector card is enabled AND (its loupe toggle is on OR Shift is held), and
+/// never while a plot-domain box drag/arm owns the surface.
+pub(crate) fn loupe_owns_scroll(
+    show_inspector_card: bool,
+    loupe_toggle: bool,
+    shift_held: bool,
+    plot_domain_busy: bool,
+) -> bool {
+    show_inspector_card && (loupe_toggle || shift_held) && !plot_domain_busy
+}
+
+/// Next loupe magnification after a scroll of `scroll` points (wheel up =
+/// positive = magnify more), applied multiplicatively so each notch is a
+/// constant ratio, then clamped to `[LOUPE_MAGNIFY_MIN, LOUPE_MAGNIFY_MAX]`.
+pub(crate) fn next_loupe_magnify(current: f32, scroll: f32) -> f32 {
+    let factor = (scroll * LOUPE_MAGNIFY_SCROLL_RATE).exp();
+    (current * factor).clamp(LOUPE_MAGNIFY_MIN, LOUPE_MAGNIFY_MAX)
+}
+
+/// Distance from `center` to the nearest point of `card` (0 when `center` is
+/// inside the rectangle). The rect–circle separation test the loupe-avoiding
+/// card placement is built on.
+pub(crate) fn rect_center_clearance(card: egui::Rect, center: egui::Pos2) -> f32 {
+    let nearest = egui::pos2(
+        center.x.clamp(card.left(), card.right()),
+        center.y.clamp(card.top(), card.bottom()),
+    );
+    (center - nearest).length()
+}
+
+/// Whether `card` intrudes within `radius` of the disk at `center` (the disk's
+/// bounding circle, plus a few points of breathing room so the card never
+/// kisses the rim halo).
+pub(crate) fn card_overlaps_loupe(card: egui::Rect, center: egui::Pos2, radius: f32) -> bool {
+    rect_center_clearance(card, center) < radius + LOUPE_CARD_PAD
+}
+
+/// Breathing room between the inspector card and the loupe disk's bounding
+/// circle (covers the 3-point rim halo drawn on the disk boundary).
+pub(crate) const LOUPE_CARD_PAD: f32 = 6.0;
+
+/// Choose the inspector card's top-left so it stays on-screen AND, when the
+/// loupe disk is shown, never overlaps it. `default_origin` is the card's
+/// normal (loupe-unaware) placement; when it already clears the disk it is
+/// returned untouched, so the no-loupe path and the common non-overlap case are
+/// pixel-identical to before. Otherwise candidate placements are tried in
+/// priority order — the four anchor-relative quadrants first (keep the card by
+/// the cursor), then four disk-relative slots that are guaranteed to clear the
+/// disk in one axis — each clamped on-screen and rejected if it still overlaps.
+/// If every candidate collides (a very cramped pane) the one with the most
+/// clearance is returned.
+pub(crate) fn place_inspector_card_clear_of_loupe(
+    default_origin: egui::Pos2,
+    anchor: egui::Pos2,
+    size: egui::Vec2,
+    rect: egui::Rect,
+    disk_center: egui::Pos2,
+    disk_radius: f32,
+) -> egui::Pos2 {
+    let bounds = rect.shrink(4.0);
+    let clamp_on_screen = |o: egui::Pos2| -> egui::Pos2 {
+        egui::pos2(
+            o.x.clamp(bounds.left(), (bounds.right() - size.x).max(bounds.left())),
+            o.y.clamp(bounds.top(), (bounds.bottom() - size.y).max(bounds.top())),
+        )
+    };
+    let overlaps = |o: egui::Pos2| -> bool {
+        card_overlaps_loupe(egui::Rect::from_min_size(o, size), disk_center, disk_radius)
+    };
+    // Keep today's placement whenever it already clears the disk (the loupe-off
+    // path never calls this, so nothing changes there either).
+    if !overlaps(default_origin) {
+        return default_origin;
+    }
+    const GX: f32 = 16.0;
+    const GY: f32 = 14.0;
+    // Push disk-relative candidates a hair past the overlap threshold so, absent
+    // on-screen clamping, they land clearly outside the disk (not exactly on the
+    // boundary).
+    let gap = disk_radius + LOUPE_CARD_PAD + 2.0;
+    let candidates = [
+        // Anchor-relative quadrants (preferred — card rides near the cursor).
+        egui::pos2(anchor.x + GX, anchor.y + GY),
+        egui::pos2(anchor.x - GX - size.x, anchor.y + GY),
+        egui::pos2(anchor.x + GX, anchor.y - GY - size.y),
+        egui::pos2(anchor.x - GX - size.x, anchor.y - GY - size.y),
+        // Disk-relative fallbacks (each clears the disk along one axis).
+        egui::pos2(disk_center.x + gap, anchor.y - size.y * 0.5),
+        egui::pos2(disk_center.x - gap - size.x, anchor.y - size.y * 0.5),
+        egui::pos2(anchor.x - size.x * 0.5, disk_center.y + gap),
+        egui::pos2(anchor.x - size.x * 0.5, disk_center.y - gap - size.y),
+    ];
+    let mut best = clamp_on_screen(default_origin);
+    let mut best_clear = rect_center_clearance(egui::Rect::from_min_size(best, size), disk_center);
+    for cand in candidates {
+        let o = clamp_on_screen(cand);
+        if !overlaps(o) {
+            return o;
+        }
+        let clear = rect_center_clearance(egui::Rect::from_min_size(o, size), disk_center);
+        if clear > best_clear {
+            best = o;
+            best_clear = clear;
+        }
+    }
+    best
 }
 
 /// The screen position a loupe rim point samples: offsets from the loupe
@@ -5031,5 +5199,149 @@ mod loupe_native_gates_tests {
             opaque > 100,
             "expected a filled disk, saw {opaque} opaque texels"
         );
+    }
+}
+
+#[cfg(test)]
+mod loupe_polish_tests {
+    use super::*;
+
+    // ---- Item 3: scroll routing decision + magnification clamp ----
+
+    #[test]
+    fn loupe_owns_scroll_matches_visibility_gate() {
+        // Card off -> never (loupe only draws inside the card).
+        assert!(!loupe_owns_scroll(false, true, true, false));
+        // Card on + toggle on -> owns scroll even without Shift.
+        assert!(loupe_owns_scroll(true, true, false, false));
+        // Card on + Shift held -> owns scroll (transient loupe).
+        assert!(loupe_owns_scroll(true, false, true, false));
+        // Card on but neither toggle nor Shift -> map keeps the wheel.
+        assert!(!loupe_owns_scroll(true, false, false, false));
+        // Plot-domain box owns the surface -> loupe never intercepts.
+        assert!(!loupe_owns_scroll(true, true, true, true));
+    }
+
+    #[test]
+    fn magnify_scrolls_within_clamp() {
+        // The default sits inside the clamp: a no-op scroll returns it unchanged
+        // (would be pulled to a bound if it were out of range).
+        assert!(
+            (next_loupe_magnify(LOUPE_MAGNIFY_DEFAULT, 0.0) - LOUPE_MAGNIFY_DEFAULT).abs() < 1e-6
+        );
+        // Wheel up magnifies more, wheel down less.
+        assert!(next_loupe_magnify(6.0, 50.0) > 6.0);
+        assert!(next_loupe_magnify(6.0, -50.0) < 6.0);
+        // Clamped at both ends no matter how hard you scroll.
+        assert!((next_loupe_magnify(19.0, 100000.0) - LOUPE_MAGNIFY_MAX).abs() < 1e-4);
+        assert!((next_loupe_magnify(2.5, -100000.0) - LOUPE_MAGNIFY_MIN).abs() < 1e-4);
+        // Zero scroll is a no-op.
+        assert!((next_loupe_magnify(7.5, 0.0) - 7.5).abs() < 1e-6);
+        // A single notch is a modest, monotonic step both ways.
+        let up = next_loupe_magnify(6.0, 50.0);
+        let back = next_loupe_magnify(up, -50.0);
+        assert!((back - 6.0).abs() < 1e-3);
+    }
+
+    // ---- Item 1: inspector card placement never overlaps the loupe disk ----
+
+    fn pane() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0))
+    }
+
+    fn card_size() -> egui::Vec2 {
+        egui::vec2(160.0, 150.0)
+    }
+
+    /// The loupe disk geometry the way `cursor_loupe_disk` computes it, so the
+    /// placement test uses the real relationship between cursor and disk.
+    fn disk_for(anchor: egui::Pos2, rect: egui::Rect) -> (egui::Pos2, f32) {
+        let radius = LOUPE_RADIUS;
+        let margin = radius + 6.0;
+        let mut center = egui::pos2(anchor.x, anchor.y - (radius + 34.0));
+        if center.y - radius < rect.top() + 4.0 {
+            center.y = anchor.y + (radius + 34.0);
+        }
+        center.x = center.x.clamp(rect.left() + margin, rect.right() - margin);
+        center.y = center.y.clamp(rect.top() + margin, rect.bottom() - margin);
+        (center, radius)
+    }
+
+    #[test]
+    fn default_placement_kept_when_it_already_clears_the_disk() {
+        // Cursor mid-pane: loupe floats ABOVE, card default goes BELOW-right —
+        // already clear, so the placement is byte-identical to today.
+        let rect = pane();
+        let anchor = egui::pos2(500.0, 400.0);
+        let (dc, dr) = disk_for(anchor, rect);
+        let default = anchor + egui::vec2(16.0, 14.0);
+        let placed =
+            place_inspector_card_clear_of_loupe(default, anchor, card_size(), rect, dc, dr);
+        assert_eq!(placed, default);
+    }
+
+    #[test]
+    fn placement_clears_disk_when_card_would_flip_onto_the_loupe() {
+        // Cursor near the BOTTOM: the card's normal bottom-flip sends it UP,
+        // onto the loupe disk. Re-placement must clear the disk and stay on
+        // screen.
+        let rect = pane();
+        let anchor = egui::pos2(500.0, 780.0);
+        let (dc, dr) = disk_for(anchor, rect);
+        // Reproduce the loupe-unaware default (down-right, flipped up because it
+        // would run off the bottom).
+        let size = card_size();
+        let mut default = anchor + egui::vec2(16.0, 14.0);
+        if default.y + size.y > rect.bottom() - 4.0 {
+            default.y = anchor.y - 14.0 - size.y;
+        }
+        let placed = place_inspector_card_clear_of_loupe(default, anchor, size, rect, dc, dr);
+        let card = egui::Rect::from_min_size(placed, size);
+        assert!(
+            !card_overlaps_loupe(card, dc, dr),
+            "card {card:?} still overlaps loupe at {dc:?} r={dr}"
+        );
+        assert!(rect.shrink(4.0).contains(card.left_top()));
+        assert!(rect.shrink(4.0).contains(card.right_bottom()));
+    }
+
+    #[test]
+    fn placement_clears_disk_when_loupe_flips_below_cursor() {
+        // Cursor near the TOP: the loupe disk flips BELOW the cursor, so the
+        // card's default down-right placement lands on it. Re-placement clears.
+        let rect = pane();
+        let anchor = egui::pos2(500.0, 20.0);
+        let (dc, dr) = disk_for(anchor, rect);
+        assert!(dc.y > anchor.y, "loupe should be below the cursor here");
+        let default = anchor + egui::vec2(16.0, 14.0);
+        let placed =
+            place_inspector_card_clear_of_loupe(default, anchor, card_size(), rect, dc, dr);
+        let card = egui::Rect::from_min_size(placed, card_size());
+        assert!(!card_overlaps_loupe(card, dc, dr));
+        assert!(rect.shrink(4.0).contains(card.left_top()));
+        assert!(rect.shrink(4.0).contains(card.right_bottom()));
+    }
+
+    #[test]
+    fn placement_stays_on_screen_in_a_corner() {
+        // Cursor jammed in the top-left corner: still on-screen and (where the
+        // pane allows) off the disk.
+        let rect = pane();
+        let anchor = egui::pos2(6.0, 6.0);
+        let (dc, dr) = disk_for(anchor, rect);
+        let default = anchor + egui::vec2(16.0, 14.0);
+        let placed =
+            place_inspector_card_clear_of_loupe(default, anchor, card_size(), rect, dc, dr);
+        let card = egui::Rect::from_min_size(placed, card_size());
+        assert!(rect.shrink(4.0).contains(card.left_top()));
+        assert!(rect.shrink(4.0).contains(card.right_bottom()));
+        assert!(!card_overlaps_loupe(card, dc, dr));
+    }
+
+    #[test]
+    fn clearance_zero_inside_positive_outside() {
+        let card = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(10.0, 10.0));
+        assert!(rect_center_clearance(card, egui::pos2(5.0, 5.0)).abs() < 1e-6);
+        assert!((rect_center_clearance(card, egui::pos2(13.0, 5.0)) - 3.0).abs() < 1e-6);
     }
 }

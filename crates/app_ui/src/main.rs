@@ -2998,6 +2998,11 @@ struct ViewerApp {
     /// Field Loupe: circular GPU magnifier at the cursor (also toggled on by
     /// holding Shift). Inspired by Solarpower07's WRF-Runner loupe.
     inspector_show_loupe: bool,
+    /// Loupe optical magnification, retuned by the scroll wheel while the loupe
+    /// is shown (clamped to [`map_paint::LOUPE_MAGNIFY_MIN`]..=`MAX`). Session
+    /// state only, like `inspector_show_loupe` — defaults to
+    /// [`map_paint::LOUPE_MAGNIFY_DEFAULT`].
+    loupe_magnify: f32,
     /// Color swatch + `#RRGGBB` chip on the inspector card's value line.
     inspector_show_hex: bool,
     /// Inverse geolocation for the latest model grid, INDEPENDENT of any
@@ -7973,6 +7978,7 @@ impl ViewerApp {
             // Loupe is off by default (a Shift-hold magnifier); the hex chip
             // rides the card whenever a value resolves.
             inspector_show_loupe: false,
+            loupe_magnify: map_paint::LOUPE_MAGNIFY_DEFAULT,
             inspector_show_hex: true,
             model_lut: None,
             model_lut_rx: None,
@@ -22537,7 +22543,7 @@ impl ViewerApp {
                 );
             ui.checkbox(&mut self.inspector_show_loupe, "Field loupe")
                 .on_hover_text(
-                    "Circular GPU magnifier at the cursor showing the pixelated field, its value, color and coordinates. Hold Shift to summon it momentarily even when this is off. Loupe design inspired by Solarpower07's WRF-Runner.",
+                    "Circular GPU magnifier at the cursor showing the pixelated field, its value, color and coordinates. Hold Shift to summon it momentarily even when this is off. While it is shown, the scroll wheel zooms the loupe (2x-20x) instead of the map. Loupe design inspired by Solarpower07's WRF-Runner.",
                 );
         });
         ui.checkbox(&mut self.show_inspector_card, "Inspector card")
@@ -25415,6 +25421,41 @@ impl ViewerApp {
         );
     }
 
+    /// Whether the Field Loupe is currently showing over the map, so the scroll
+    /// wheel should retune its magnification instead of zooming the map. Mirrors
+    /// the visibility gate in `draw_cursor_loupe`/`cursor_loupe_disk`, minus the
+    /// per-frame disk geometry (always satisfiable while the pointer hovers the
+    /// canvas). The loupe only draws inside the inspector card, so it also
+    /// requires `show_inspector_card`.
+    fn loupe_scroll_active(&self, ctx: &egui::Context) -> bool {
+        let shift_held = ctx.input(|input| input.modifiers.shift);
+        map_paint::loupe_owns_scroll(
+            self.show_inspector_card,
+            self.inspector_show_loupe,
+            shift_held,
+            self.plot_domain_map_drag.is_some() || self.plot_domain_arm_active(),
+        )
+    }
+
+    /// Route a scroll event to the loupe magnification while the loupe is shown.
+    /// Returns `true` when it consumed the scroll (so the caller must NOT also
+    /// zoom the map). Shift — which summons the loupe — makes egui report the
+    /// wheel on the horizontal axis (`horizontal_scroll_modifier = SHIFT`), so
+    /// we accept either axis (prefer vertical for the pinned-toggle case).
+    fn handle_loupe_scroll(&mut self, ui: &egui::Ui) -> bool {
+        if !self.loupe_scroll_active(ui.ctx()) {
+            return false;
+        }
+        let (scroll_y, scroll_x) =
+            ui.input(|input| (input.smooth_scroll_delta.y, input.smooth_scroll_delta.x));
+        let scroll = if scroll_y != 0.0 { scroll_y } else { scroll_x };
+        if scroll != 0.0 {
+            self.loupe_magnify = map_paint::next_loupe_magnify(self.loupe_magnify, scroll);
+            ui.ctx().request_repaint();
+        }
+        true
+    }
+
     fn single_pane_canvas(
         &mut self,
         ui: &mut egui::Ui,
@@ -25493,7 +25534,10 @@ impl ViewerApp {
             }
         }
 
-        if response.hovered() {
+        // Loupe-active → the wheel retunes the loupe magnification and the map
+        // does NOT zoom. Loupe hidden → `handle_loupe_scroll` returns false and
+        // the historical map-zoom path runs unchanged.
+        if response.hovered() && !self.handle_loupe_scroll(ui) {
             let scroll = ui.input(|input| input.smooth_scroll_delta.y);
             if scroll != 0.0 {
                 let pointer = ui.input(|input| input.pointer.hover_pos());
@@ -25978,22 +26022,28 @@ impl ViewerApp {
                     self.center_map_on(lat, lon);
                 }
             }
-            // Shared zoom, anchored at the cursor inside this cell.
+            // Shared zoom, anchored at the cursor inside this cell. Loupe-active
+            // → the wheel retunes the loupe instead (map does not zoom).
             if response.hovered() {
-                let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-                if scroll != 0.0 {
-                    let pointer = ui.input(|input| input.pointer.hover_pos());
-                    let before = pointer.map(|position| self.screen_to_lon_lat(cell, position));
-                    let factor = scroll_zoom_factor(scroll, self.app_settings.zoom_speed_percent);
-                    self.clear_camera_follow_targets();
-                    self.pause_loop_prewarm_for_interaction();
-                    self.map_scale = (self.map_scale * factor).clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
-                    if let (Some(position), Some((lon_before, lat_before))) = (pointer, before) {
-                        let (lon_after, lat_after) = self.screen_to_lon_lat(cell, position);
-                        self.map_center_lon += lon_before - lon_after;
-                        self.map_center_lat += lat_before - lat_after;
+                if !self.handle_loupe_scroll(ui) {
+                    let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+                    if scroll != 0.0 {
+                        let pointer = ui.input(|input| input.pointer.hover_pos());
+                        let before = pointer.map(|position| self.screen_to_lon_lat(cell, position));
+                        let factor =
+                            scroll_zoom_factor(scroll, self.app_settings.zoom_speed_percent);
+                        self.clear_camera_follow_targets();
+                        self.pause_loop_prewarm_for_interaction();
+                        self.map_scale =
+                            (self.map_scale * factor).clamp(MIN_MAP_SCALE, MAX_MAP_SCALE);
+                        if let (Some(position), Some((lon_before, lat_before))) = (pointer, before)
+                        {
+                            let (lon_after, lat_after) = self.screen_to_lon_lat(cell, position);
+                            self.map_center_lon += lon_before - lon_after;
+                            self.map_center_lat += lat_before - lat_after;
+                        }
+                        self.clamp_map_center();
                     }
-                    self.clamp_map_center();
                 }
                 // Each pane reports ITS OWN product/tilt under the cursor.
                 if let Some(position) = ui.input(|input| input.pointer.hover_pos()) {
@@ -60866,6 +60916,7 @@ mod tests {
             // Loupe is off by default (a Shift-hold magnifier); the hex chip
             // rides the card whenever a value resolves.
             inspector_show_loupe: false,
+            loupe_magnify: map_paint::LOUPE_MAGNIFY_DEFAULT,
             inspector_show_hex: true,
             model_lut: None,
             model_lut_rx: None,
@@ -61132,6 +61183,24 @@ mod tests {
                     && hazard_family_has_user_filter(&record.event_family)),
             "every merged custom record is renderable and in a known family"
         );
+    }
+
+    #[test]
+    fn loupe_magnify_defaults_and_scroll_routing_respects_toggle() {
+        let ctx = egui::Context::default();
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        // Field seeded to the shared default.
+        assert_eq!(app.loupe_magnify, map_paint::LOUPE_MAGNIFY_DEFAULT);
+        // Card on, loupe off, no Shift -> the map keeps the wheel.
+        app.show_inspector_card = true;
+        app.inspector_show_loupe = false;
+        assert!(!app.loupe_scroll_active(&ctx));
+        // Loupe pinned on -> the wheel routes to the loupe.
+        app.inspector_show_loupe = true;
+        assert!(app.loupe_scroll_active(&ctx));
+        // Inspector card hidden -> loupe cannot show, so the map keeps the wheel.
+        app.show_inspector_card = false;
+        assert!(!app.loupe_scroll_active(&ctx));
     }
 
     fn test_surface_ob(station_id: &str, lat: f32, lon: f32, network: &str) -> obs::SurfaceOb {
