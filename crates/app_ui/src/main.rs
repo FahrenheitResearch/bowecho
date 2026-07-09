@@ -21066,16 +21066,30 @@ impl ViewerApp {
     #[cfg(any(windows, target_os = "macos"))]
     fn import_styles_from_path(&mut self, path: &Path, ctx: &egui::Context) {
         let loaded = styles::load_from_path(path);
+        if matches!(
+            &loaded.status,
+            settings::DocumentLoadStatus::Missing
+                | settings::DocumentLoadStatus::DefaultsAfterError { .. }
+        ) {
+            self.status = loaded
+                .status
+                .user_message("appearance backup")
+                .unwrap_or_else(|| "Appearance import failed: file was not found".to_owned());
+            return;
+        }
         if loaded.newer_schema {
             self.status =
                 "Appearance import skipped: file was written by a newer BowEcho".to_owned();
             return;
         }
+        let recovery_notice = loaded.status.user_message("appearance backup");
         self.style_settings = loaded.settings;
         self.styles_newer_schema = false;
         self.rebuild_style_registry();
         self.save_styles();
-        self.status = "Imported appearance backup".to_owned();
+        self.status = recovery_notice
+            .map(|notice| format!("Imported appearance backup; save queued. {notice}"))
+            .unwrap_or_else(|| "Imported appearance backup; save queued".to_owned());
         ctx.request_repaint();
     }
 
