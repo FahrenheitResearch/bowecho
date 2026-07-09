@@ -14255,12 +14255,16 @@ impl ViewerApp {
             request.previous_volume.as_ref(),
             request.dealias_env.as_ref(),
         );
-        let velocity_reference_ptr = velocity_render_dealiased
-            .then_some(velocity_context.reference_volume_ptr)
-            .unwrap_or(0);
-        let velocity_env_ptr = velocity_render_dealiased
-            .then_some(velocity_context.dealias_env_ptr)
-            .unwrap_or(0);
+        let velocity_reference_ptr = if velocity_render_dealiased {
+            velocity_context.reference_volume_ptr
+        } else {
+            0
+        };
+        let velocity_env_ptr = if velocity_render_dealiased {
+            velocity_context.dealias_env_ptr
+        } else {
+            0
+        };
         let sample_cache_signature = RenderWorkerSampleCacheSignature::new(
             volume_ptr,
             cut,
