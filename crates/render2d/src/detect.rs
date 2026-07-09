@@ -1097,6 +1097,7 @@ mod tests {
             tilt(0.5, true, true),
             tilt(1.5, true, true),
             tilt(2.4, true, true),
+            tilt(3.4, true, true),
         ]);
         let missing = vec![None; volume.cuts.len()];
         assert!(

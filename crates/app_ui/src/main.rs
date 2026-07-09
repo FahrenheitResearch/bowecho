@@ -5597,6 +5597,7 @@ impl DealiasGridKey {
 
     /// Key for the pure same-tilt engines (`Region`/`RegionGlobal`): they read
     /// only this volume's own tilt, so the reference/env pointers are `0`.
+    #[cfg(test)]
     fn same_tilt(volume_ptr: usize, cut_index: usize, engine: DealiasEngine) -> Self {
         Self {
             volume_ptr,
@@ -5629,6 +5630,7 @@ struct DealiasGridWitness {
 impl DealiasGridWitness {
     /// Witness for the pure same-tilt engines (`Region`/`RegionGlobal`),
     /// mirroring [`DealiasGridKey::same_tilt`]'s zeroed anchor pointers.
+    #[cfg(test)]
     fn same_tilt(volume: &Arc<RadarVolume>) -> Self {
         Self {
             volume: Arc::downgrade(volume),
