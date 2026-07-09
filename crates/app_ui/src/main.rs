@@ -77,6 +77,7 @@ mod obs;
 mod obs_soundings;
 mod overlays;
 mod placefiles;
+mod postproc_severe;
 mod product_select;
 mod radar_band;
 mod raster_quality;

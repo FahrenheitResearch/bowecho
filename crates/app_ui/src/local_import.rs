@@ -186,10 +186,21 @@ fn import_paths(
         let postprocessed = try_postprocessed_wrf_shared(&nc, path, &mut |message| {
             progress(format!("{tag}: {message}"))
         })?;
-        if let Some((canonical, volumes)) = postprocessed {
+        if let Some((canonical, severe, volumes)) = postprocessed {
             let refs = canonical
                 .iter()
                 .map(|(name, field)| (name.as_str(), field))
+                .collect::<Vec<_>>();
+            // Severe/thermo fields ride the derived-field slot under the same
+            // store slugs the heavy getvar path writes, so labels and Solar
+            // styles apply identically.
+            let severe_refs = severe
+                .iter()
+                .map(|field| DerivedFieldInput {
+                    name: field.name,
+                    units: field.units,
+                    values: field.values.as_slice(),
+                })
                 .collect::<Vec<_>>();
             let volume_inputs = volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>();
             progress(format!("{tag}: writing forecast hour f{hour:03} to store"));
@@ -199,7 +210,7 @@ fn import_paths(
                 &run,
                 hour,
                 &refs,
-                &[],
+                &severe_refs,
                 &volume_inputs,
                 writer_build(),
                 now_unix(),
@@ -1074,13 +1085,14 @@ fn fill_missing_surface(fields: &mut ImportedWrfFields, surface: SurfaceFallback
 /// CONUS-I/II, GDEX): these ship derived `TK` (K), `Z` (m MSL), `P` (full
 /// pressure, Pa) and staggered `U`/`V` instead of the raw `T`/`PB`/`PH`/`PHB`
 /// the wrf-core reader needs, and carry no surface fields. Returns the
-/// synthesized surface 2D fields + the isobaric volumes, or `None` if this
-/// isn't a post-processed WRF file (so the caller falls back to the raw path).
-/// `progress` streams the stage messages both import paths show in the dock.
+/// synthesized surface 2D fields + the severe/thermo suite + the isobaric
+/// volumes, or `None` if this isn't a post-processed WRF file (so the caller
+/// falls back to the raw path). `progress` streams the stage messages both
+/// import paths show in the dock.
 pub(crate) fn try_postprocessed_wrf(
     path: &Path,
     progress: &mut dyn FnMut(String),
-) -> Result<Option<(Vec<(String, SelectedField2D)>, Vec<IsoVolume>)>, ImportError> {
+) -> Result<Option<PostprocessedWrfHour>, ImportError> {
     // If netcrust can't open it at all, it's not our post-processed case —
     // let the caller's raw-wrfout path try instead of failing here.
     let Ok(nc) = netcrust::open(path) else {
@@ -1088,6 +1100,15 @@ pub(crate) fn try_postprocessed_wrf(
     };
     try_postprocessed_wrf_shared(&nc, path, progress)
 }
+
+/// Everything one post-processed hour yields: the synthesized surface 2D
+/// fields, the severe/thermo suite (heavy-path store slugs, written through
+/// the derived-field slot), and the isobaric sounding volumes.
+pub(crate) type PostprocessedWrfHour = (
+    Vec<(String, SelectedField2D)>,
+    Vec<crate::postproc_severe::SevereField>,
+    Vec<IsoVolume>,
+);
 
 /// [`try_postprocessed_wrf`] against an already-open netcrust handle, so the
 /// light import's per-file loop pays `netcrust::open`'s eager NetCDF-4
@@ -1097,7 +1118,7 @@ fn try_postprocessed_wrf_shared(
     nc: &NcFile,
     path: &Path,
     progress: &mut dyn FnMut(String),
-) -> Result<Option<(Vec<(String, SelectedField2D)>, Vec<IsoVolume>)>, ImportError> {
+) -> Result<Option<PostprocessedWrfHour>, ImportError> {
     let is_postprocessed = nc.variable("TK").is_some()
         && nc.variable("Z").is_some()
         && nc.variable("P").is_some()
@@ -1136,9 +1157,12 @@ fn try_postprocessed_wrf_shared(
         Ok((array.into_values(), nz))
     };
     progress("reading post-processed 3D fields (TK/P/Z/QVAPOR)".to_string());
-    let (tk, nz) = read3d("TK")?;
+    // `tk` and `z_m` are `mut`: after the iso interpolation they are converted
+    // in place (K -> C, MSL -> AGL) for the severe suite below, instead of
+    // allocating two more full-3D arrays (hundreds of MB each on CONUS-II).
+    let (mut tk, nz) = read3d("TK")?;
     let (p_pa, _) = read3d("P")?;
-    let (z_m, _) = read3d("Z")?;
+    let (mut z_m, _) = read3d("Z")?;
     let (qv, _) = read3d("QVAPOR")?;
     let expected = nz.checked_mul(cells).unwrap_or(0);
     if expected == 0
@@ -1220,7 +1244,61 @@ fn try_postprocessed_wrf_shared(
         )?;
     }
 
-    Ok(Some((canonical, volumes)))
+    // Severe/thermo suite via the wrf-core met kernels (postproc_severe.rs
+    // documents the approximations). Memory discipline: reuse the 3-D buffers
+    // above with two in-place unit conversions instead of new allocations,
+    // and give back `dewpoint_k` (only the iso interpolation needed it)
+    // before the parcel lifts start.
+    drop(dewpoint_k);
+    // Surface parcel state from the lowest model level — the post-processed
+    // files carry no PSFC/T2/Q2 (same approximation as the synthesized 2 m /
+    // 10 m fields above). t2 must be captured in Kelvin BEFORE the in-place
+    // Celsius conversion; psfc/q2 borrow the lowest-level planes directly.
+    let t2_k: Vec<f64> = tk[..cells].to_vec();
+    for value in tk.iter_mut() {
+        *value -= 273.15;
+    }
+    // Height MSL -> AGL with the lowest model level as the terrain proxy (no
+    // HGT in these files; documented approximation). Walk levels top-down so
+    // the level-0 plane — the terrain itself — is consumed last and zeroes.
+    for k in (0..nz).rev() {
+        let base = k * cells;
+        for cell in 0..cells {
+            let terrain = z_m[cell];
+            z_m[base + cell] -= terrain;
+        }
+    }
+    let severe_inputs = crate::postproc_severe::SevereInputs {
+        nx,
+        ny,
+        nz,
+        pressure_pa: &p_pa,
+        pressure_hpa: &p_hpa,
+        temperature_c: &tk,
+        qvapor: &qv,
+        height_agl_m: &z_m,
+        u_ms: &u_mass,
+        v_ms: &v_mass,
+        psfc_pa: &p_pa[..cells],
+        t2_k: &t2_k,
+        q2_kgkg: &qv[..cells],
+    };
+    // A pathological column must degrade to "no severe fields for this hour",
+    // never fail the import (the heavy getvar loop's isolate_panics rule).
+    let severe = match crate::wrf_process::isolate_panics("post-processed severe suite", || {
+        Ok::<_, String>(crate::postproc_severe::compute(
+            &severe_inputs,
+            &mut *progress,
+        ))
+    }) {
+        Ok(fields) => fields,
+        Err(err) => {
+            progress(format!("severe suite skipped: {err}"));
+            Vec::new()
+        }
+    };
+
+    Ok(Some((canonical, severe, volumes)))
 }
 
 /// Destagger a `[nz, ny, nx+1]` (west_east_stag) field to `[nz, ny, nx]` mass
@@ -1648,6 +1726,136 @@ mod tests {
                 assert!(v.abs() < 150.0, "v {v} m/s implausible");
             }
         }
+
+        let _ = std::fs::remove_dir_all(store_root);
+    }
+
+    /// Real-data proof + timing harness for the post-processed severe suite:
+    /// runs the full light-import path on the GDEX wrf3d file named by
+    /// `RW_POSTPROC_SEVERE_FIXTURE` and asserts every wrf-core-met severe
+    /// slug lands in the store with physically sane values. Every progress
+    /// line is timestamped (the `severe suite [..]: done` line carries the
+    /// suite's own wall time) and peak RSS prints at the end. `#[ignore]`d:
+    /// needs a multi-GB real file and minutes of parcel lifts — run once on a
+    /// verify node, release build:
+    /// `RW_POSTPROC_SEVERE_FIXTURE=/tmp/wrf3d_... cargo test --release
+    ///  -p app_ui optional_postproc_severe -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs RW_POSTPROC_SEVERE_FIXTURE (real post-processed wrf3d file); run release on a node"]
+    fn optional_postproc_severe_fixture_lands_sane_fields() {
+        let fixture = std::env::var("RW_POSTPROC_SEVERE_FIXTURE")
+            .expect("set RW_POSTPROC_SEVERE_FIXTURE to a TK/Z/P wrf3d file");
+        let store_root = temp_dir("postproc-severe");
+        let start = std::time::Instant::now();
+        let summary = import_paths(&[PathBuf::from(&fixture)], &store_root, &mut |message| {
+            eprintln!("[{:9.2?}] {message}", start.elapsed());
+        })
+        .unwrap();
+        eprintln!(
+            "[{:9.2?}] DONE: {} hour(s), {} variables; peak RSS {}",
+            start.elapsed(),
+            summary.hours_written,
+            summary.variables.len(),
+            peak_rss_label()
+        );
+        assert_eq!(summary.model, "wrf");
+        assert_eq!(summary.hours_written, 1);
+
+        const SEVERE_SLUGS: [&str; 16] = [
+            "sbcape",
+            "sbcin",
+            "mlcape",
+            "mlcin",
+            "mucape",
+            "mucin",
+            "lcl",
+            "lfc",
+            "el",
+            "srh_0_1km",
+            "srh_0_3km",
+            "bulk_shear_0_1km",
+            "bulk_shear_0_6km",
+            "stp",
+            "scp",
+            "ehi",
+        ];
+        for slug in SEVERE_SLUGS {
+            assert!(
+                summary.variables.iter().any(|name| name == slug),
+                "{slug} missing from import summary: {:?}",
+                summary.variables
+            );
+        }
+
+        let hour = store_root
+            .join(&summary.model)
+            .join(&summary.run)
+            .join("f000.rws");
+        let reader = rw_store::reader::HourReader::open(&hour).expect("open hour");
+        let plane = |slug: &str| -> Vec<f32> {
+            reader
+                .read_full_2d(slug)
+                .unwrap_or_else(|err| panic!("{slug}: read_full_2d failed: {err}"))
+        };
+        let finite_stats = |slug: &str, values: &[f32]| -> (usize, f32, f32) {
+            let mut count = 0usize;
+            let mut min = f32::INFINITY;
+            let mut max = f32::NEG_INFINITY;
+            for &value in values {
+                if value.is_finite() {
+                    count += 1;
+                    min = min.min(value);
+                    max = max.max(value);
+                }
+            }
+            assert!(count > 0, "{slug}: entirely NaN");
+            eprintln!("{slug}: {count} finite, min {min}, max {max}");
+            (count, min, max)
+        };
+
+        // CAPE: nonnegative and physically bounded on every parcel flavor.
+        for slug in ["sbcape", "mlcape", "mucape"] {
+            let values = plane(slug);
+            let (_, min, max) = finite_stats(slug, &values);
+            assert!(min >= 0.0, "{slug}: negative CAPE {min}");
+            assert!(max <= 8000.0, "{slug}: implausible CAPE {max}");
+        }
+        // CIN: never positive (kernel accumulates negative buoyancy only).
+        for slug in ["sbcin", "mlcin", "mucin"] {
+            let values = plane(slug);
+            let (_, _, max) = finite_stats(slug, &values);
+            assert!(max <= 0.0, "{slug}: positive CIN {max}");
+        }
+        // Parcel levels: nonnegative heights below the model top.
+        for slug in ["lcl", "lfc", "el"] {
+            let values = plane(slug);
+            let (_, min, max) = finite_stats(slug, &values);
+            assert!(min >= 0.0, "{slug}: negative height {min} m AGL");
+            assert!(max < 25_000.0, "{slug}: height {max} m above model top");
+        }
+        // Kinematics: bounded magnitudes.
+        for slug in ["srh_0_1km", "srh_0_3km"] {
+            let values = plane(slug);
+            let (_, min, max) = finite_stats(slug, &values);
+            assert!(
+                min > -3000.0 && max < 3000.0,
+                "{slug}: implausible SRH range {min}..{max}"
+            );
+        }
+        for slug in ["bulk_shear_0_1km", "bulk_shear_0_6km"] {
+            let values = plane(slug);
+            let (_, min, max) = finite_stats(slug, &values);
+            assert!(min >= 0.0, "{slug}: negative shear magnitude {min}");
+            assert!(max < 150.0, "{slug}: shear {max} m/s implausible");
+        }
+        // Composites: finite (finite_stats already proves that) and STP/SCP
+        // nonnegative by construction.
+        for slug in ["stp", "scp"] {
+            let values = plane(slug);
+            let (_, min, _) = finite_stats(slug, &values);
+            assert!(min >= 0.0, "{slug}: negative composite {min}");
+        }
+        finite_stats("ehi", &plane("ehi"));
 
         let _ = std::fs::remove_dir_all(store_root);
     }

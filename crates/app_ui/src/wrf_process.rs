@@ -350,7 +350,7 @@ fn process_paths(
         match crate::local_import::try_postprocessed_wrf(path, &mut |message: String| {
             let _ = tx.send(WrfProcessMessage::Progress(message));
         }) {
-            Ok(Some((canonical, volumes))) => {
+            Ok(Some((canonical, severe, volumes))) => {
                 let hour = u16::try_from(written.len()).expect("bounded above");
                 let _ = tx.send(WrfProcessMessage::Progress(format!(
                     "Reading post-processed WRF {} -> f{hour:03}",
@@ -360,6 +360,17 @@ fn process_paths(
                     .iter()
                     .map(|(name, field)| (name.as_str(), field))
                     .collect::<Vec<_>>();
+                // Severe/thermo suite under the same store slugs this path's
+                // getvar loop writes for raw wrfouts — the wrench flow now
+                // yields severe fields for post-processed files too.
+                let severe_refs = severe
+                    .iter()
+                    .map(|field| DerivedFieldInput {
+                        name: field.name,
+                        units: field.units,
+                        values: field.values.as_slice(),
+                    })
+                    .collect::<Vec<_>>();
                 let volume_inputs = volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>();
                 let result = write_hour_from_fields_with_derived(
                     store_root,
@@ -367,7 +378,7 @@ fn process_paths(
                     &run,
                     hour,
                     &refs,
-                    &[],
+                    &severe_refs,
                     &volume_inputs,
                     writer_build(),
                     now_unix(),
@@ -980,7 +991,10 @@ fn derived_name(wrf_name: &str, split_index: Option<usize>) -> String {
         .unwrap_or_else(|| format!("wrf_{base}"))
 }
 
-fn wrf_product_slug(base: &str) -> Option<&'static str> {
+/// `pub(crate)`: `postproc_severe` asserts every slug it emits is one of
+/// these, so the post-processed suite can never drift from the heavy path's
+/// store names (and the labels/styles keyed on them).
+pub(crate) fn wrf_product_slug(base: &str) -> Option<&'static str> {
     match base {
         "sbcape" => Some("sbcape"),
         "sbcin" => Some("sbcin"),
