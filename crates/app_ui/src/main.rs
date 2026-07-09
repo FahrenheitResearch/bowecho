@@ -7152,82 +7152,48 @@ fn nth_weekday_of_month(year: i32, month: u32, weekday: Weekday, nth: u32) -> u3
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkflowPreset {
-    LiveSevere,
-    TripleSevere,
-    VelocityCouplet,
-    QuadDualPol,
+    WarningDesk,
+    VelocityRotation,
+    ModelWrf,
+    SatelliteTropical,
     ArchiveReview,
-    Documentation,
-    ModelContext,
-    SimulatedRadar,
-    Satellite,
-    Tropical,
-    UpperAir,
 }
 
 impl WorkflowPreset {
-    const ALL: [Self; 11] = [
-        Self::LiveSevere,
-        Self::TripleSevere,
-        Self::VelocityCouplet,
-        Self::QuadDualPol,
+    const ALL: [Self; 5] = [
+        Self::WarningDesk,
+        Self::VelocityRotation,
+        Self::ModelWrf,
+        Self::SatelliteTropical,
         Self::ArchiveReview,
-        Self::Documentation,
-        Self::ModelContext,
-        Self::SimulatedRadar,
-        Self::Satellite,
-        Self::Tropical,
-        Self::UpperAir,
     ];
 
     fn label(self) -> &'static str {
         match self {
-            Self::LiveSevere => "Live severe",
-            Self::TripleSevere => "Triple severe",
-            Self::VelocityCouplet => "Velocity couplet",
-            Self::QuadDualPol => "Quad dual-pol",
+            Self::WarningDesk => "Warning desk",
+            Self::VelocityRotation => "Velocity & rotation",
+            Self::ModelWrf => "Model & WRF",
+            Self::SatelliteTropical => "Satellite & tropical",
             Self::ArchiveReview => "Archive review",
-            Self::Documentation => "Documentation",
-            Self::ModelContext => "Model context",
-            Self::SimulatedRadar => "Simulated radar",
-            Self::Satellite => "Satellite",
-            Self::Tropical => "Tropical",
-            Self::UpperAir => "Upper air",
         }
     }
 
     fn description(self) -> &'static str {
         match self {
-            Self::LiveSevere => {
-                "Warnings, SPC outlooks/reports, rotation/storm tracks, obs, and lightning for live ops"
+            Self::WarningDesk => {
+                "Four-pane REF/VEL/CC/ZDR with warnings, SPC outlooks/reports, obs, lightning, and rotation for live warning ops"
             }
-            Self::TripleSevere => {
-                "Three-pane REF / DVEL / CC layout for warning review without crowding four panes"
-            }
-            Self::VelocityCouplet => {
+            Self::VelocityRotation => {
                 "Two-pane DVEL/SRV view with Vrot armed and velocity-focused inspection"
             }
-            Self::QuadDualPol => "Classic REF / VEL / CC / ZDR warning-desk layout",
+            Self::ModelWrf => {
+                "Two-pane model plot and skew-T with the model dock, WRF import on the Data tab, and Vrot armed for synthetic radar"
+            }
+            Self::SatelliteTropical => {
+                "Satellite window following the player plus active tropical cyclones and the storm-cards panel"
+            }
             Self::ArchiveReview => {
                 "Data tab, archive loop mode, reports/outlooks visible, and live polling paused"
-            }
-            Self::Documentation => {
-                "Clean map capture mode with app chrome hidden; Tab or Esc restores"
-            }
-            Self::ModelContext => {
-                "Open the model workflow with obs adjustment and map context layers ready"
-            }
-            Self::SimulatedRadar => {
-                "Data tab, single map pane, model dock, and Vrot armed for imported WRF synthetic radar"
-            }
-            Self::Satellite => {
-                "Open the satellite window with the map overlay following the player on a single pane"
-            }
-            Self::Tropical => {
-                "Active tropical cyclones with the storm-cards window and map overlay on a single pane"
-            }
-            Self::UpperAir => {
-                "Two-pane model workflow with skew-T ready for 925-250 mb isobaric analysis"
             }
         }
     }
@@ -18901,8 +18867,19 @@ impl ViewerApp {
         self.cross_section_armed = false;
         self.annotations.active_tool = None;
         match preset {
-            WorkflowPreset::LiveSevere => {
-                self.set_workflow_layout(PanelLayout::One);
+            WorkflowPreset::WarningDesk => {
+                // Live warning desk: the four-pane REF/VEL/CC/ZDR interrogation
+                // view (from the old Quad dual-pol) carrying the full live-severe
+                // overlay stack (warnings, SPC outlooks/reports, obs, lightning,
+                // rotation/storm tracks) so a warning forecaster can interrogate a
+                // storm across all four fields with live context on top.
+                self.set_workflow_layout(PanelLayout::FourGrid);
+                self.set_primary_product_prefer(DisplayProduct::Moment(MomentType::Reflectivity));
+                self.set_extra_pane_products(&[
+                    DisplayProduct::Moment(MomentType::Velocity),
+                    DisplayProduct::Moment(MomentType::CorrelationCoefficient),
+                    DisplayProduct::Moment(MomentType::DifferentialReflectivity),
+                ]);
                 self.sidebar_tab = SidebarTab::Severe;
                 self.hazards_visible = true;
                 self.hazards_active_only = true;
@@ -18920,25 +18897,10 @@ impl ViewerApp {
                 self.show_storm_tracks = true;
                 self.show_inspector_card = true;
                 self.vrot_tool_armed = false;
+                self.vrot_points.clear();
                 self.primary.live.enabled = true;
             }
-            WorkflowPreset::TripleSevere => {
-                self.set_workflow_layout(PanelLayout::ThreeStacked);
-                self.set_primary_product_prefer(DisplayProduct::Moment(MomentType::Reflectivity));
-                self.set_extra_pane_products(&[
-                    DisplayProduct::DealiasedVelocity,
-                    DisplayProduct::Moment(MomentType::CorrelationCoefficient),
-                ]);
-                self.sidebar_tab = SidebarTab::Radar;
-                self.hazards_visible = true;
-                self.hazards_active_only = true;
-                self.show_rotation_markers = true;
-                self.show_storm_tracks = true;
-                self.show_inspector_card = true;
-                self.vrot_tool_armed = false;
-                self.vrot_points.clear();
-            }
-            WorkflowPreset::VelocityCouplet => {
+            WorkflowPreset::VelocityRotation => {
                 self.set_workflow_layout(PanelLayout::TwoVertical);
                 self.set_primary_product_prefer(DisplayProduct::DealiasedVelocity);
                 self.set_extra_pane_products(&[DisplayProduct::StormRelativeDealiasedVelocity]);
@@ -18951,18 +18913,39 @@ impl ViewerApp {
                 self.vrot_tool_armed = true;
                 self.vrot_points.clear();
             }
-            WorkflowPreset::QuadDualPol => {
-                self.set_workflow_layout(PanelLayout::FourGrid);
-                self.set_primary_product_prefer(DisplayProduct::Moment(MomentType::Reflectivity));
-                self.set_extra_pane_products(&[
-                    DisplayProduct::Moment(MomentType::Velocity),
-                    DisplayProduct::Moment(MomentType::CorrelationCoefficient),
-                    DisplayProduct::Moment(MomentType::DifferentialReflectivity),
-                ]);
-                self.sidebar_tab = SidebarTab::Radar;
-                self.vrot_tool_armed = false;
-                self.vrot_points.clear();
+            WorkflowPreset::ModelWrf => {
+                // Model + WRF desk: two-pane model plot with the skew-T docked
+                // beside it, WRF import/synthetic-radar tools on the Data tab,
+                // model download picker open, obs adjusting soundings, and Vrot
+                // armed for the sim-supercell couplets. Folds together the old
+                // Model context, Simulated radar, and Upper air presets.
+                self.set_workflow_layout(PanelLayout::TwoVertical);
+                self.sidebar_tab = SidebarTab::Data;
+                self.model_enabled = true;
+                self.open_viewer(dock::WorkspacePane::Model);
+                // Skew-T front door: docks beside the model plot; opens with
+                // instructions until an Alt-click launches a sounding.
+                self.open_viewer(dock::WorkspacePane::Sounding);
+                self.model_download_open = true;
+                self.obs_enabled = true;
+                self.obs_adjust_soundings = true;
+                self.glm_enabled = true;
                 self.show_inspector_card = true;
+                self.vrot_tool_armed = true;
+                self.vrot_points.clear();
+            }
+            WorkflowPreset::SatelliteTropical => {
+                // Satellite + tropical: satellite window with the map overlay
+                // following the player, plus the tropical master and storm-cards
+                // panel. Folds together the old Satellite and Tropical presets.
+                self.set_workflow_layout(PanelLayout::One);
+                self.sidebar_tab = SidebarTab::Layers;
+                self.open_viewer(dock::WorkspacePane::Satellite);
+                // Once a run loads, the map overlay tracks the player frame.
+                self.sat_map_follow = true;
+                self.show_inspector_card = true;
+                self.app_settings.show_tropical = true;
+                self.app_settings.show_tropical_panel = true;
             }
             WorkflowPreset::ArchiveReview => {
                 self.set_workflow_layout(PanelLayout::One);
@@ -18984,71 +18967,6 @@ impl ViewerApp {
                 self.spc_outlooks_enabled = ["cat"].into_iter().map(str::to_owned).collect();
                 self.spc_reports_enabled = true;
                 self.primary.cursor.playing = false;
-            }
-            WorkflowPreset::Documentation => {
-                self.set_workflow_layout(PanelLayout::One);
-                self.show_inspector_card = false;
-                self.vrot_tool_armed = false;
-                self.vrot_points.clear();
-                self.cross_section_armed = false;
-                self.cross_section_a_lonlat = None;
-                self.cross_section_b_lonlat = None;
-                self.cross_section_texture = None;
-                self.cross_section_signature = None;
-                self.cross_section_readout = None;
-                self.cross_section_user_signature = None;
-                self.cross_section_status =
-                    "Cross-section: arm, then click endpoint A then B".to_owned();
-                self.annotations.active_tool = None;
-                self.annotations.draft = None;
-                self.annotations.hover_geo = None;
-                self.chrome_hidden = true;
-            }
-            WorkflowPreset::ModelContext => {
-                self.set_workflow_layout(PanelLayout::TwoVertical);
-                self.sidebar_tab = SidebarTab::Layers;
-                self.model_enabled = true;
-                self.open_viewer(dock::WorkspacePane::Model);
-                self.model_download_open = true;
-                self.obs_enabled = true;
-                self.obs_adjust_soundings = true;
-                self.glm_enabled = true;
-            }
-            WorkflowPreset::SimulatedRadar => {
-                // Can't import a file for the user; set the desk up for WRF
-                // synthetic-radar work (import + virtual-radar site live in the
-                // model dock) and arm Vrot for the sim-supercell couplets.
-                self.set_workflow_layout(PanelLayout::One);
-                self.sidebar_tab = SidebarTab::Data;
-                self.model_enabled = true;
-                self.open_viewer(dock::WorkspacePane::Model);
-                self.show_inspector_card = true;
-                self.vrot_tool_armed = true;
-                self.vrot_points.clear();
-            }
-            WorkflowPreset::Satellite => {
-                self.set_workflow_layout(PanelLayout::One);
-                self.sidebar_tab = SidebarTab::Layers;
-                self.open_viewer(dock::WorkspacePane::Satellite);
-                // Once a run loads, the map overlay tracks the player frame.
-                self.sat_map_follow = true;
-                self.show_inspector_card = true;
-            }
-            WorkflowPreset::Tropical => {
-                self.set_workflow_layout(PanelLayout::One);
-                self.sidebar_tab = SidebarTab::Layers;
-                self.app_settings.show_tropical = true;
-                self.app_settings.show_tropical_panel = true;
-            }
-            WorkflowPreset::UpperAir => {
-                self.set_workflow_layout(PanelLayout::TwoVertical);
-                self.sidebar_tab = SidebarTab::Layers;
-                self.model_enabled = true;
-                self.open_viewer(dock::WorkspacePane::Model);
-                // Skew-T front door; opens with instructions until an
-                // Alt-click launches a sounding over imported model data.
-                self.open_viewer(dock::WorkspacePane::Sounding);
-                self.obs_adjust_soundings = true;
             }
         }
         self.current_workflow = Some(preset);
@@ -63269,11 +63187,11 @@ mod tests {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let ctx = egui::Context::default();
 
-        app.apply_workflow_preset(WorkflowPreset::LiveSevere, &ctx);
+        app.apply_workflow_preset(WorkflowPreset::WarningDesk, &ctx);
 
-        assert_eq!(app.current_workflow, Some(WorkflowPreset::LiveSevere));
+        assert_eq!(app.current_workflow, Some(WorkflowPreset::WarningDesk));
         assert_eq!(app.sidebar_tab, SidebarTab::Severe);
-        assert_eq!(app.status, "Workflow: Live severe");
+        assert_eq!(app.status, "Workflow: Warning desk");
     }
 
     #[test]
@@ -63371,25 +63289,32 @@ mod tests {
     }
 
     #[test]
-    fn workflow_restore_closes_model_context_window_when_it_was_hidden() {
+    fn model_wrf_workflow_opens_model_and_sounding_and_restores() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let ctx = egui::Context::default();
+        app.sidebar_tab = SidebarTab::Radar;
         app.model_enabled = false;
         app.model_download_open = false;
         app.obs_enabled = false;
         app.obs_adjust_soundings = false;
         app.glm_enabled = false;
+        app.vrot_tool_armed = false;
+        app.show_inspector_card = false;
 
-        app.apply_workflow_preset(WorkflowPreset::ModelContext, &ctx);
+        app.apply_workflow_preset(WorkflowPreset::ModelWrf, &ctx);
 
         assert_eq!(app.grid_layout, PanelLayout::TwoVertical);
-        assert_eq!(app.sidebar_tab, SidebarTab::Layers);
+        assert_eq!(app.app_settings.grid_pane_count, 2);
+        assert_eq!(app.sidebar_tab, SidebarTab::Data);
         assert!(app.model_enabled);
         assert!(app.model_download_open);
         assert!(app.viewer_open(dock::WorkspacePane::Model));
+        assert!(app.viewer_open(dock::WorkspacePane::Sounding));
         assert!(app.obs_enabled);
         assert!(app.obs_adjust_soundings);
         assert!(app.glm_enabled);
+        assert!(app.show_inspector_card);
+        assert!(app.vrot_tool_armed);
 
         app.restore_previous_workflow(&ctx);
 
@@ -63400,103 +63325,41 @@ mod tests {
         assert!(!app.model_download_open);
         assert!(!app.viewer_open(dock::WorkspacePane::Model));
         assert!(!app.workspace.is_docked(dock::WorkspacePane::Model));
+        assert!(!app.viewer_open(dock::WorkspacePane::Sounding));
         assert!(!app.obs_enabled);
         assert!(!app.obs_adjust_soundings);
         assert!(!app.glm_enabled);
-    }
-
-    #[test]
-    fn simulated_radar_workflow_arms_wrf_desk_and_restores() {
-        let mut app = test_viewer_app_with_hazards(Vec::new());
-        let ctx = egui::Context::default();
-        app.sidebar_tab = SidebarTab::Radar;
-        app.model_enabled = false;
-        app.vrot_tool_armed = false;
-        app.show_inspector_card = false;
-
-        app.apply_workflow_preset(WorkflowPreset::SimulatedRadar, &ctx);
-
-        assert_eq!(app.grid_layout, PanelLayout::One);
-        assert_eq!(app.sidebar_tab, SidebarTab::Data);
-        assert!(app.model_enabled);
-        assert!(app.viewer_open(dock::WorkspacePane::Model));
-        assert!(app.vrot_tool_armed);
-        assert!(app.show_inspector_card);
-
-        app.restore_previous_workflow(&ctx);
-
-        assert_eq!(app.sidebar_tab, SidebarTab::Radar);
-        assert!(!app.model_enabled);
-        assert!(!app.viewer_open(dock::WorkspacePane::Model));
         assert!(!app.vrot_tool_armed);
         assert!(!app.show_inspector_card);
     }
 
     #[test]
-    fn satellite_workflow_opens_window_and_restores() {
+    fn satellite_tropical_workflow_opens_window_and_restores() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let ctx = egui::Context::default();
-        app.show_satellite = false;
         app.sat_map_follow = false;
+        app.show_inspector_card = false;
+        app.app_settings.show_tropical = false;
+        app.app_settings.show_tropical_panel = false;
 
-        app.apply_workflow_preset(WorkflowPreset::Satellite, &ctx);
+        app.apply_workflow_preset(WorkflowPreset::SatelliteTropical, &ctx);
 
         assert_eq!(app.grid_layout, PanelLayout::One);
         assert_eq!(app.sidebar_tab, SidebarTab::Layers);
         assert!(app.viewer_open(dock::WorkspacePane::Satellite));
         assert!(app.sat_map_follow);
+        assert!(app.show_inspector_card);
+        assert!(app.app_settings.show_tropical);
+        assert!(app.app_settings.show_tropical_panel);
 
         app.restore_previous_workflow(&ctx);
 
         assert!(!app.viewer_open(dock::WorkspacePane::Satellite));
         assert!(!app.workspace.is_docked(dock::WorkspacePane::Satellite));
         assert!(!app.sat_map_follow);
-    }
-
-    #[test]
-    fn tropical_workflow_shows_cyclones_and_restores() {
-        let mut app = test_viewer_app_with_hazards(Vec::new());
-        let ctx = egui::Context::default();
-        app.app_settings.show_tropical = false;
-        app.app_settings.show_tropical_panel = false;
-
-        app.apply_workflow_preset(WorkflowPreset::Tropical, &ctx);
-
-        assert_eq!(app.grid_layout, PanelLayout::One);
-        assert_eq!(app.sidebar_tab, SidebarTab::Layers);
-        assert!(app.app_settings.show_tropical);
-        assert!(app.app_settings.show_tropical_panel);
-
-        app.restore_previous_workflow(&ctx);
-
+        assert!(!app.show_inspector_card);
         assert!(!app.app_settings.show_tropical);
         assert!(!app.app_settings.show_tropical_panel);
-    }
-
-    #[test]
-    fn upper_air_workflow_opens_model_and_sounding_and_restores() {
-        let mut app = test_viewer_app_with_hazards(Vec::new());
-        let ctx = egui::Context::default();
-        app.model_enabled = false;
-        app.native_skewt_open = false;
-        app.obs_adjust_soundings = false;
-
-        app.apply_workflow_preset(WorkflowPreset::UpperAir, &ctx);
-
-        assert_eq!(app.grid_layout, PanelLayout::TwoVertical);
-        assert_eq!(app.sidebar_tab, SidebarTab::Layers);
-        assert!(app.model_enabled);
-        assert!(app.viewer_open(dock::WorkspacePane::Model));
-        assert!(app.viewer_open(dock::WorkspacePane::Sounding));
-        assert!(app.obs_adjust_soundings);
-
-        app.restore_previous_workflow(&ctx);
-
-        assert_eq!(app.grid_layout, PanelLayout::One);
-        assert!(!app.model_enabled);
-        assert!(!app.viewer_open(dock::WorkspacePane::Model));
-        assert!(!app.viewer_open(dock::WorkspacePane::Sounding));
-        assert!(!app.obs_adjust_soundings);
     }
 
     #[test]
@@ -63524,78 +63387,6 @@ mod tests {
                 "{slug} must be active in BowEcho's model download picker"
             );
         }
-    }
-
-    #[test]
-    fn documentation_workflow_hides_temporary_map_measurements_and_restores_them() {
-        let mut app = test_viewer_app_with_hazards(Vec::new());
-        let ctx = egui::Context::default();
-        app.cross_section_armed = true;
-        app.cross_section_a_lonlat = Some((-97.7, 35.1));
-        app.cross_section_b_lonlat = Some((-96.9, 35.5));
-        app.cross_section_status = "Cross-section: 42 km".to_owned();
-        app.annotations.active_tool = Some(annotate::ToolKind::Box);
-        app.annotations.draft = Some(annotate::Annotation::Box {
-            a: annotate::GeoPoint {
-                lon: -97.4,
-                lat: 35.0,
-            },
-            b: annotate::GeoPoint {
-                lon: -97.2,
-                lat: 35.2,
-            },
-            style: annotate::ShapeStyle::default(),
-        });
-        app.annotations.hover_geo = Some(annotate::GeoPoint {
-            lon: -97.1,
-            lat: 35.3,
-        });
-        app.annotations
-            .shapes
-            .push(annotate::Annotation::Crosshair {
-                at: annotate::GeoPoint {
-                    lon: -97.3,
-                    lat: 35.1,
-                },
-                style: annotate::ShapeStyle::default(),
-            });
-
-        app.apply_workflow_preset(WorkflowPreset::Documentation, &ctx);
-
-        assert!(app.chrome_hidden);
-        assert!(!app.cross_section_armed);
-        assert!(app.cross_section_a_lonlat.is_none());
-        assert!(app.cross_section_b_lonlat.is_none());
-        assert!(app.cross_section_texture.is_none());
-        assert!(app.cross_section_signature.is_none());
-        assert_eq!(
-            app.cross_section_status,
-            "Cross-section: arm, then click endpoint A then B"
-        );
-        assert!(app.annotations.active_tool.is_none());
-        assert!(app.annotations.draft.is_none());
-        assert!(app.annotations.hover_geo.is_none());
-        assert_eq!(app.annotations.shapes.len(), 1);
-
-        app.restore_previous_workflow(&ctx);
-
-        assert!(app.cross_section_armed);
-        assert_eq!(app.cross_section_a_lonlat, Some((-97.7, 35.1)));
-        assert_eq!(app.cross_section_b_lonlat, Some((-96.9, 35.5)));
-        assert_eq!(app.cross_section_status, "Cross-section: 42 km");
-        assert_eq!(app.annotations.active_tool, Some(annotate::ToolKind::Box));
-        assert!(matches!(
-            app.annotations.draft,
-            Some(annotate::Annotation::Box { .. })
-        ));
-        assert_eq!(
-            app.annotations.hover_geo,
-            Some(annotate::GeoPoint {
-                lon: -97.1,
-                lat: 35.3,
-            })
-        );
-        assert_eq!(app.annotations.shapes.len(), 1);
     }
 
     #[test]
@@ -63663,12 +63454,12 @@ mod tests {
     }
 
     #[test]
-    fn velocity_workflow_sets_two_pane_vrot_velocity_state() {
+    fn velocity_rotation_workflow_sets_two_pane_vrot_velocity_state() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         app.volume = Some(Arc::new(test_ref_then_velocity_volume()));
         let ctx = egui::Context::default();
 
-        app.apply_workflow_preset(WorkflowPreset::VelocityCouplet, &ctx);
+        app.apply_workflow_preset(WorkflowPreset::VelocityRotation, &ctx);
 
         assert_eq!(app.grid_layout, PanelLayout::TwoVertical);
         assert_eq!(app.app_settings.grid_pane_count, 2);
@@ -63683,42 +63474,25 @@ mod tests {
     }
 
     #[test]
-    fn triple_severe_workflow_sets_three_pane_review_state() {
+    fn warning_desk_workflow_sets_four_pane_severe_state_and_restores() {
         let mut app = test_viewer_app_with_hazards(Vec::new());
         let ctx = egui::Context::default();
+        app.sidebar_tab = SidebarTab::Radar;
+        app.hazards_visible = false;
+        app.hazards_active_only = false;
+        app.live_hazard_auto_refresh = false;
+        app.spc_outlooks_enabled = vec!["torn".to_owned()];
+        app.spc_reports_enabled = false;
+        app.obs_enabled = false;
+        app.obs_show_metar = false;
+        app.obs_show_mesonet = false;
+        app.glm_enabled = false;
+        app.show_rotation_markers = false;
+        app.show_storm_tracks = false;
+        app.show_inspector_card = false;
+        app.primary.live.enabled = false;
 
-        app.apply_workflow_preset(WorkflowPreset::TripleSevere, &ctx);
-
-        assert_eq!(app.grid_layout, PanelLayout::ThreeStacked);
-        assert_eq!(app.app_settings.grid_pane_count, 3);
-        assert_eq!(
-            app.selected_product,
-            DisplayProduct::Moment(MomentType::Reflectivity)
-        );
-        let pane_products: Vec<DisplayProduct> = app
-            .extra_panes
-            .iter()
-            .map(|pane| pane.product.clone())
-            .collect();
-        assert_eq!(
-            pane_products,
-            vec![
-                DisplayProduct::DealiasedVelocity,
-                DisplayProduct::Moment(MomentType::CorrelationCoefficient),
-            ]
-        );
-        assert!(app.hazards_visible);
-        assert!(app.hazards_active_only);
-        assert!(app.show_rotation_markers);
-        assert!(!app.vrot_tool_armed);
-    }
-
-    #[test]
-    fn quad_dual_pol_workflow_sets_expected_panes() {
-        let mut app = test_viewer_app_with_hazards(Vec::new());
-        let ctx = egui::Context::default();
-
-        app.apply_workflow_preset(WorkflowPreset::QuadDualPol, &ctx);
+        app.apply_workflow_preset(WorkflowPreset::WarningDesk, &ctx);
 
         assert_eq!(app.grid_layout, PanelLayout::FourGrid);
         assert_eq!(app.app_settings.grid_pane_count, 4);
@@ -63739,7 +63513,42 @@ mod tests {
                 DisplayProduct::Moment(MomentType::DifferentialReflectivity),
             ]
         );
+        assert_eq!(app.sidebar_tab, SidebarTab::Severe);
+        assert!(app.hazards_visible);
+        assert!(app.hazards_active_only);
+        assert!(app.live_hazard_auto_refresh);
+        assert_eq!(
+            app.spc_outlooks_enabled,
+            vec!["cat", "torn", "wind", "hail"]
+        );
+        assert!(app.spc_reports_enabled);
+        assert!(app.obs_enabled);
+        assert!(app.obs_show_metar);
+        assert!(app.obs_show_mesonet);
+        assert!(app.glm_enabled);
+        assert!(app.show_rotation_markers);
+        assert!(app.show_storm_tracks);
+        assert!(app.show_inspector_card);
         assert!(!app.vrot_tool_armed);
+        assert!(app.primary.live.enabled);
+
+        app.restore_previous_workflow(&ctx);
+
+        assert_eq!(app.grid_layout, PanelLayout::One);
+        assert_eq!(app.sidebar_tab, SidebarTab::Radar);
+        assert!(!app.hazards_visible);
+        assert!(!app.hazards_active_only);
+        assert!(!app.live_hazard_auto_refresh);
+        assert_eq!(app.spc_outlooks_enabled, vec!["torn"]);
+        assert!(!app.spc_reports_enabled);
+        assert!(!app.obs_enabled);
+        assert!(!app.obs_show_metar);
+        assert!(!app.obs_show_mesonet);
+        assert!(!app.glm_enabled);
+        assert!(!app.show_rotation_markers);
+        assert!(!app.show_storm_tracks);
+        assert!(!app.show_inspector_card);
+        assert!(!app.primary.live.enabled);
     }
 
     #[test]
