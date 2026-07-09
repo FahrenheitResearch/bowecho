@@ -63,6 +63,7 @@ mod italy_dpc;
 mod layers_rail;
 mod live_archive_bar;
 mod local_import;
+mod local_radar_import;
 mod map_paint;
 mod max_ref_swath;
 mod media;
@@ -2350,8 +2351,7 @@ fn decode_local_radar_file_set(
     paths.sort();
     let mut read_ms = 0.0f32;
     let mut decode_ms = 0.0f32;
-    let mut volumes = Vec::with_capacity(paths.len());
-    let mut format_labels = BTreeSet::new();
+    let mut parts = Vec::with_capacity(paths.len());
 
     for path in &paths {
         let kind = sniff_local_radar_kind(path);
@@ -2361,7 +2361,6 @@ fn decode_local_radar_file_set(
                 path.display()
             ));
         };
-        format_labels.insert(format_label);
 
         let read_start = Instant::now();
         let bytes = std::fs::read(path)
@@ -2379,44 +2378,53 @@ fn decode_local_radar_file_set(
             ));
         }
         volume.metadata.source_path = Some(path.display().to_string());
-        volumes.push(volume);
+        parts.push(local_radar_import::LocalRadarPart {
+            path: path.clone(),
+            format_label,
+            volume,
+        });
     }
 
     let merge_start = Instant::now();
-    let (mut volume, report) = radar_core::merge_radar_volumes(volumes)?;
+    let mut merged_frames = local_radar_import::merge_time_coherent_parts(parts)?;
     decode_ms += merge_start.elapsed().as_secs_f32() * 1000.0;
-    if volume.cuts.is_empty() {
-        return Err("merged file set has no displayable cuts".to_owned());
-    }
-
-    let source_paths = paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(" + ");
-    volume.metadata.source_path = Some(source_paths);
-    derive_default_products_in_place(&mut volume);
 
     let timings = LoadTimings {
         read_ms: Some(read_ms),
         decode_ms,
         ..Default::default()
     };
-    let formats = format_labels.into_iter().collect::<Vec<_>>().join("+");
-    let source_label = format!(
-        "{formats} merged set ({} files, {} moments merged)",
-        paths.len(),
-        report.merged_moments
-    );
-    Ok(DecodedLoadBatch {
-        frames: vec![DecodedLoad {
-            path: paths[0].clone(),
-            volume: Arc::new(volume),
+    let frame_count = merged_frames.len();
+    if frame_count == 0 {
+        return Err("local file set produced no time groups".to_owned());
+    }
+    let mut frames = Vec::with_capacity(frame_count);
+    for (index, mut merged) in merged_frames.drain(..).enumerate() {
+        if merged.volume.cuts.is_empty() {
+            return Err(format!(
+                "merged local time group {} has no displayable cuts",
+                index + 1
+            ));
+        }
+        derive_default_products_in_place(&mut merged.volume);
+        let path = merged
+            .paths
+            .first()
+            .cloned()
+            .ok_or_else(|| format!("local time group {} has no source files", index + 1))?;
+        let source_label = merged.source_label(index, frame_count);
+        frames.push(DecodedLoad {
+            path,
+            volume: Arc::new(merged.volume),
             timings: timings.finish(total_start),
             status: FrameStatus::Local,
             source_label,
-        }],
-        selected_index: 0,
+        });
+    }
+    let selected_index = frames.len().saturating_sub(1);
+    Ok(DecodedLoadBatch {
+        frames,
+        selected_index,
     })
 }
 
