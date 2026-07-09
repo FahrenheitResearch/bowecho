@@ -295,6 +295,9 @@ pub(crate) fn index_grib1_file(path: &Path) -> Result<Vec<IndexedMessage>, Strin
 pub(crate) struct EraParam {
     pub short: &'static str,
     pub slug: &'static str,
+    // Retained for the field-picker/UI catalog seam; production import currently
+    // persists the stable slug and units, while the mapping tests pin this label.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub label: &'static str,
     pub units: &'static str,
 }
