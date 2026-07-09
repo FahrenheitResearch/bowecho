@@ -169,7 +169,10 @@ fn import_paths(
     // selections are refused rather than guessed at: GRIB hour slots are
     // valid-time-derived while the WRF path below is file-index-derived,
     // and interleaving the two would scramble the run's hour axis.
-    if files.iter().any(|path| crate::grib_import::is_grib1_file(path)) {
+    if files
+        .iter()
+        .any(|path| crate::grib_import::is_grib1_file(path))
+    {
         if !files
             .iter()
             .all(|path| crate::grib_import::is_grib1_file(path))

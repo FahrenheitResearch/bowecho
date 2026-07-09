@@ -316,8 +316,18 @@ pub(crate) fn era128_param(parameter: u8) -> Option<EraParam> {
     };
     match parameter {
         31 => entry("ci", "sea_ice_cover", "Sea-ice cover", "(0-1)"),
-        34 => entry("sst", "sea_surface_temperature", "Sea surface temperature", "K"),
-        59 => entry("cape", "cape", "Convective available potential energy", "J/kg"),
+        34 => entry(
+            "sst",
+            "sea_surface_temperature",
+            "Sea surface temperature",
+            "K",
+        ),
+        59 => entry(
+            "cape",
+            "cape",
+            "Convective available potential energy",
+            "J/kg",
+        ),
         129 => entry("z", "geopotential", "Geopotential", "m2/s2"),
         130 => entry("t", "temperature", "Temperature", "K"),
         131 => entry("u", "u_wind", "U component of wind", "m/s"),
@@ -340,7 +350,12 @@ pub(crate) fn era128_param(parameter: u8) -> Option<EraParam> {
             "Large-scale precipitation",
             "m",
         ),
-        143 => entry("cp", "convective_precipitation", "Convective precipitation", "m"),
+        143 => entry(
+            "cp",
+            "convective_precipitation",
+            "Convective precipitation",
+            "m",
+        ),
         144 => entry("sf", "snowfall", "Snowfall (water equivalent)", "m"),
         151 => entry("msl", "mslp", "Mean sea level pressure", "Pa"),
         155 => entry("d", "divergence", "Divergence", "1/s"),
@@ -679,10 +694,7 @@ pub(crate) fn build_grid_plan(msg: &Grib1Message) -> Result<GridPlan, String> {
     let rotate = if max_lon - min_lon >= 350.0 {
         // Global grid: rotate so output longitudes ascend from -180. The
         // rotation point is the first column at or past the antimeridian.
-        row_lons
-            .iter()
-            .position(|&lon| lon >= 180.0)
-            .unwrap_or(0)
+        row_lons.iter().position(|&lon| lon >= 180.0).unwrap_or(0)
     } else {
         0
     };
@@ -877,11 +889,15 @@ pub(crate) fn import_grib1_files(
 
     // ---- Reference grid from the first message of the first file. ----
     let first_label = display_name(&paths[0]);
-    let mut first_file = File::open(&paths[0])
-        .map_err(|err| format!("{first_label}: open: {err}"))?;
+    let mut first_file =
+        File::open(&paths[0]).map_err(|err| format!("{first_label}: open: {err}"))?;
     let first_msg = indexed[0].1.clone();
-    let plan = build_grid_plan(&parse_message_at(&mut first_file, &first_msg, &first_label)?)
-        .map_err(|err| format!("{first_label}: {err}"))?;
+    let plan = build_grid_plan(&parse_message_at(
+        &mut first_file,
+        &first_msg,
+        &first_label,
+    )?)
+    .map_err(|err| format!("{first_label}: {err}"))?;
     drop(first_file);
 
     let mut notes: Vec<String> = Vec::new();
@@ -935,15 +951,12 @@ pub(crate) fn import_grib1_files(
     let run = run_name(paths, &first_msg, first_valid);
     let model = "wrf".to_string();
     let total_hours = hours.len();
-    let last_valid = first_valid
-        + i64::from(*hours.keys().next_back().unwrap_or(&0)) * 3_600;
+    let last_valid = first_valid + i64::from(*hours.keys().next_back().unwrap_or(&0)) * 3_600;
 
     // ---- Decode-write-drop, one timestep at a time. ----
     let mut files: Vec<File> = Vec::with_capacity(paths.len());
     for path in paths {
-        files.push(
-            File::open(path).map_err(|err| format!("{}: open: {err}", display_name(path)))?,
-        );
+        files.push(File::open(path).map_err(|err| format!("{}: open: {err}", display_name(path)))?);
     }
     let mut all_vars: Vec<String> = Vec::new();
     let mut hours_written = 0usize;
@@ -967,9 +980,8 @@ pub(crate) fn import_grib1_files(
                     units,
                     ..
                 } => {
-                    let selected =
-                        SelectedField2D::new(selector, units, plan.grid.clone(), values)
-                            .map_err(|err| format!("{label}: field {name}: {err}"))?;
+                    let selected = SelectedField2D::new(selector, units, plan.grid.clone(), values)
+                        .map_err(|err| format!("{label}: field {name}: {err}"))?;
                     canonical.push((name, selected));
                 }
                 PlannedField::Derived { name, units, .. } => {
@@ -1008,9 +1020,7 @@ pub(crate) fn import_grib1_files(
                 .zip(&v_field.values)
                 .map(|(u, v)| u.mul_add(*u, v * v).sqrt())
                 .collect();
-            if let Ok(selected) =
-                SelectedField2D::new(selector, "m/s", plan.grid.clone(), values)
-            {
+            if let Ok(selected) = SelectedField2D::new(selector, "m/s", plan.grid.clone(), values) {
                 seen.insert(speed_name.clone());
                 speeds.push((speed_name, selected));
             }
@@ -1236,7 +1246,11 @@ mod tests {
         // Longitudes: -180 .. 178.875 step 1.125, strictly ascending — the
         // map layer's inverse LUT does not wrap 0..360 grids.
         let lons: Vec<f32> = plan.grid.lon_deg[..320].to_vec();
-        assert!((f64::from(lons[0]) + 180.0).abs() < 1e-6, "lon0 = {}", lons[0]);
+        assert!(
+            (f64::from(lons[0]) + 180.0).abs() < 1e-6,
+            "lon0 = {}",
+            lons[0]
+        );
         assert!(
             (f64::from(lons[319]) - 178.875).abs() < 1e-3,
             "lon_last = {}",
@@ -1364,12 +1378,9 @@ mod tests {
             now_unix()
         ));
         let mut lines = Vec::new();
-        let summary = import_grib1_files(
-            &[fixture_path()],
-            &store_root,
-            &mut |line| lines.push(line),
-        )
-        .expect("import fixture");
+        let summary =
+            import_grib1_files(&[fixture_path()], &store_root, &mut |line| lines.push(line))
+                .expect("import fixture");
 
         assert_eq!(summary.model, "wrf");
         assert_eq!(summary.run, "era20c_fsr_2004010100");
@@ -1432,15 +1443,18 @@ mod tests {
         assert_eq!(span_hours, 8_781, "year of 3-hourly steps spans 8,781 h");
 
         let mut file = File::open(&path).expect("open full file");
-        let plan = build_grid_plan(
-            &parse_message_at(&mut file, &msgs[0], "full").expect("parse first"),
-        )
-        .expect("grid plan");
+        let plan =
+            build_grid_plan(&parse_message_at(&mut file, &msgs[0], "full").expect("parse first"))
+                .expect("grid plan");
         let decode_started = std::time::Instant::now();
         for msg in [&msgs[0], &msgs[msgs.len() / 2], &msgs[msgs.len() - 1]] {
             let values = decode_values(&mut file, msg, &plan, 1.0, "full").expect("decode");
             assert_eq!(values.len(), 320 * 160);
-            assert!(values.iter().all(|value| value.is_finite() && *value >= 0.0));
+            assert!(
+                values
+                    .iter()
+                    .all(|value| value.is_finite() && *value >= 0.0)
+            );
         }
         eprintln!(
             "ERA-20C full file: indexed {} messages in {:.2?}, decoded 3 planes in {:.2?}",
