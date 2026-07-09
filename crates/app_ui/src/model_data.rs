@@ -1202,9 +1202,11 @@ impl ModelDataDock {
             if ui
                 .add_enabled(!busy, egui::Button::new("📄 WRF/NetCDF file…"))
                 .on_hover_text(
-                    "Import a SINGLE WRF/NetCDF file into the model store (one forecast \
-                     hour). Handles raw wrfout, post-processed climate wrfout, and plain \
-                     NetCDF. Click a point in the field viewer afterwards to sound it.",
+                    "QUICK import of a SINGLE WRF/NetCDF file (one forecast hour): 2D \
+                     surface fields + skew-T sounding volumes only — NO CAPE/STP/severe. \
+                     For the severe/thermo suite use the 🛠 wrf-rust buttons below. Handles \
+                     raw wrfout, post-processed climate wrfout, and plain NetCDF. Click a \
+                     point in the field viewer afterwards to sound it.",
                 )
                 .clicked()
                 && let Some(file) = rfd::FileDialog::new()
@@ -1217,10 +1219,11 @@ impl ModelDataDock {
             if ui
                 .add_enabled(!busy, egui::Button::new("📥 WRF/NetCDF folder…"))
                 .on_hover_text(
-                    "Read a folder of WRF/NetCDF files into the model store: 2D surface \
-                     fields plus skew-T sounding volumes. Each file becomes one forecast \
-                     hour. Handles raw wrfout, post-processed climate wrfout, and plain \
-                     NetCDF. Click a point in the field viewer afterwards to sound it.",
+                    "QUICK import of a folder of WRF/NetCDF files: 2D surface fields + \
+                     skew-T sounding volumes only — NO CAPE/STP/severe. Each file becomes \
+                     one forecast hour. For the severe/thermo suite use the 🛠 wrf-rust \
+                     buttons below. Handles raw wrfout, post-processed climate wrfout, and \
+                     plain NetCDF. Click a point in the field viewer afterwards to sound it.",
                 )
                 .clicked()
                 && let Some(dir) = rfd::FileDialog::new()
@@ -1236,34 +1239,54 @@ impl ModelDataDock {
                 }
             }
 
+            // The wrf-rust (getvar) severe/thermo path — the SAME CAPE/STP/EHI
+            // products HRRR gets. Multi-select one or hundreds of raw wrfout
+            // FILES; each becomes a forecast hour, processed as fast as wrf-rust
+            // allows (only the selected products are computed). This is the
+            // STP/CAPE path — the quick 📄/📥 buttons above write soundings only.
             if ui
                 .add_enabled(
                     !busy,
-                    egui::Button::new("🛠 Full model import (heavy — all diagnostics)…"),
+                    egui::Button::new("🛠 WRF CAPE / severe (wrf-rust) — file(s)…"),
                 )
                 .on_hover_text(
-                    "HEAVY ingest for raw wrfout files: computes the full ~117-field 2D \
-                     diagnostic suite (CAPE / severe / etc.) plus sounding volumes via \
-                     wrf-core — MINUTES per file on large grids. NOT the simulated-radar \
-                     button (that one is 🌩 below, and takes seconds). Use “🛠 WRF \
-                     full-diagnostics fields” below to narrow what gets processed — the \
-                     default writes everything but heavy eCAPE.",
+                    "wrf-rust (getvar) severe/thermo processing for raw wrfout files: \
+                     CAPE/CIN, SRH, bulk shear, STP/SCP/EHI, LCL/LFC/EL, precip, soil — the \
+                     full diagnostic suite, the same products HRRR gets. MULTI-SELECT one or \
+                     hundreds of files in the dialog; each becomes a forecast hour, computed \
+                     as fast as wrf-rust allows. Narrow the products with “🛠 WRF \
+                     full-diagnostics fields” below (default = everything but heavy eCAPE). \
+                     The quick 📄/📥 buttons above only write soundings — this is the \
+                     STP/CAPE path.",
+                )
+                .clicked()
+                && let Some(picked) = rfd::FileDialog::new()
+                    .set_title("Choose raw wrfout file(s) — multi-select processes 1 to hundreds")
+                    .pick_files()
+            {
+                let files: Vec<PathBuf> = picked
+                    .into_iter()
+                    .filter(|path| crate::wrf_process::is_supported_wrf_file(path))
+                    .collect();
+                self.gate_or_launch_heavy_import(files);
+            }
+
+            if ui
+                .add_enabled(!busy, egui::Button::new("🛠 …whole folder"))
+                .on_hover_text(
+                    "Same wrf-rust severe/thermo processing, over EVERY raw wrfout in a \
+                     folder — one forecast hour per file.",
                 )
                 .clicked()
                 && let Some(dir) = rfd::FileDialog::new()
-                    .set_title("Choose a WRF folder for the HEAVY full-diagnostics import")
+                    .set_title("Choose a WRF folder for the wrf-rust severe/thermo import")
                     .pick_folder()
             {
                 let files = crate::wrf_process::wrf_files_in_folder(&dir);
                 if files.is_empty() {
                     self.import_message = Some(format!("No WRF files under {}", dir.display()));
-                } else if let Some(warning) = heavy_import_size_warning(&files) {
-                    // LARGE grid/file: park the launch behind an explicit,
-                    // size-aware confirmation instead of melting the machine.
-                    self.import_message = None;
-                    self.pending_heavy_import = Some(PendingHeavyImport { files, warning });
                 } else {
-                    self.launch_heavy_import(files, self.wrf_options.to_options());
+                    self.gate_or_launch_heavy_import(files);
                 }
             }
         });
@@ -1338,6 +1361,22 @@ impl ModelDataDock {
             }
         });
         self.synthetic_radar_site_panel(ui);
+    }
+
+    /// Size-gate a wrf-rust severe/thermo import (park LARGE grids behind an
+    /// explicit confirmation — the owner has melted this machine on a 250 m
+    /// grid) or launch it directly. Shared by the file(s) and folder pickers so
+    /// 1-to-hundreds of wrfouts take the identical safe path.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn gate_or_launch_heavy_import(&mut self, files: Vec<PathBuf>) {
+        if files.is_empty() {
+            self.import_message = Some("No supported wrfout files selected".to_string());
+        } else if let Some(warning) = heavy_import_size_warning(&files) {
+            self.import_message = None;
+            self.pending_heavy_import = Some(PendingHeavyImport { files, warning });
+        } else {
+            self.launch_heavy_import(files, self.wrf_options.to_options());
+        }
     }
 
     /// Spawn the heavy full-diagnostics processing job (after any size gate).
