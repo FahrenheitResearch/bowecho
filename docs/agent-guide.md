@@ -126,6 +126,14 @@ it built). Exe: `Desktop\BowEcho v0.30.5 dev (wrf-rust severe).exe`.
    sharprs severe for exactly this case: `feat/wrf-postproc-severe` @ `3521674` (UNVERIFIED, not
    gated). Either finish/gate it or tell the owner that file is soundings-only.
 
+**Current integration tip:** `59a09d4` (pushed `claude`). Landed since the handoff above:
+`6c00937` wrf-rust multi-file severe import; `e856dc2` model-sounding single-surface fix (removed a
+duplicate internal `Panel::right("model_sounding")` in `ModelDataDock::ui()` that a "one surface"
+tree-only test never caught — the double-open + plot-swallow bug); `59a09d4` window defaults (main
+window opens `with_maximized(true)`, Model window `default_size` 1080x660 → 1360x820). The
+unsolved WRF item is still #1–#4 above (timing never measured; fast-batch of hundreds of 2 GB d03
+grids; post-processed file severe). Latest owner RC exe: `Desktop\BowEcho v0.30.5 dev (window-sizes).exe`.
+
 **Other unmerged branches:** `feat/gdex-ui` @ `6ec07f5` (GDEX Stage 1b in-app CONUS-II catalog
 browser, gated 1948/0/56 on node4 — ready to integrate); `feat/wrf-postproc-severe` @ `3521674`
 (parked sharprs, see above).
