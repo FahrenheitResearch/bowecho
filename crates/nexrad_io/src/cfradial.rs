@@ -473,7 +473,10 @@ mod tests {
     fn rhi_fixed_angle_fallback_uses_wrap_aware_azimuth_mean() {
         let fixed =
             fallback_fixed_angle(Some(ScanMode::Rhi), &[359.0, 0.0, 1.0], &[10.0, 20.0, 30.0]);
-        assert!(fixed < 0.01 || fixed > 359.99, "fixed angle was {fixed}");
+        assert!(
+            !(0.01..=359.99).contains(&fixed),
+            "fixed angle was {fixed}"
+        );
     }
 
     #[test]
