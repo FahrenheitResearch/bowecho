@@ -2148,22 +2148,16 @@ impl ModelDataDock {
                 }
             });
 
-        if self.sounding.has_content() {
-            egui::Panel::right("model_sounding")
-                .resizable(true)
-                .default_size(520.0)
-                .show_inside(ui, |ui| {
-                    ui.add_space(2.0);
-                    ui.horizontal(|ui| {
-                        ui.strong("Sounding");
-                        if ui.button("✕").on_hover_text("Close sounding").clicked() {
-                            self.sounding.clear();
-                        }
-                    });
-                    ui.separator();
-                    self.sounding.ui(ui);
-                });
-        }
+        // The sounding is NOT rendered here. A model-sounding load feeds BOTH
+        // `self.latest_sounding` (which the app's `poll_native_sounding` routes
+        // into the workspace Sounding pane docked beside this plot, or the
+        // floating native window) AND `self.sounding` (this panel). Rendering it
+        // here too put a SECOND copy inside the Model tile — one Alt-click showed
+        // two soundings, and closing the docked pane left this internal panel
+        // behind, swallowing the plot (owner report). The workspace pane / native
+        // window is the single sounding surface; `self.sounding` is still the
+        // backing panel, drawn there via `sounding_ui`. See main.rs
+        // `dock_model_sounding_beside_plot`.
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             if self.latest_field.is_some() {

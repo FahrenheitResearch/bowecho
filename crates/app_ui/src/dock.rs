@@ -34,6 +34,14 @@ const TREE_ID: &str = "bowecho_workspace_tree";
 /// Map-pane share of the root split when the first viewer docks.
 const MAP_SHARE_ON_FIRST_DOCK: f32 = 0.62;
 
+/// When a viewer docks beside an anchor via [`Workspace::dock_beside`] (the
+/// model sounding beside the model plot), the anchor keeps this fraction of the
+/// resulting pair and the newcomer gets the rest. The model plot must stay the
+/// wider of the two so it remains usable next to the sounding — an even 50/50
+/// split (plus the model dock's fixed ~230 px import rail) cramped the plot.
+/// 60/40 mirrors the layout the owner otherwise had to drag to by hand.
+const DOCK_BESIDE_ANCHOR_SHARE: f32 = 0.6;
+
 /// Persisted-layout schema version (`AppSettings::workspace_layout`).
 const LAYOUT_VERSION: u32 = 1;
 
@@ -284,7 +292,8 @@ impl Workspace {
             .unwrap_or(anchor_pane);
         match self.tree.tiles.parent_of(anchor_slot) {
             // Anchor already sits in a horizontal row: drop the newcomer in
-            // directly to its right and match its share so the pair is even.
+            // directly to its right, sized so the anchor keeps
+            // DOCK_BESIDE_ANCHOR_SHARE of the two (the plot stays the wider one).
             Some(row) if is_horizontal_linear(&self.tree.tiles, row) => {
                 if let Some(egui_tiles::Tile::Container(egui_tiles::Container::Linear(linear))) =
                     self.tree.tiles.get_mut(row)
@@ -295,8 +304,10 @@ impl Workspace {
                         .position(|&c| c == anchor_slot)
                         .map_or(linear.children.len(), |i| i + 1);
                     linear.children.insert(at, child_slot);
-                    let share = linear.shares[anchor_slot];
-                    linear.shares.set_share(child_slot, share);
+                    let anchor_share = linear.shares[anchor_slot];
+                    let neighbor_share =
+                        anchor_share * (1.0 - DOCK_BESIDE_ANCHOR_SHARE) / DOCK_BESIDE_ANCHOR_SHARE;
+                    linear.shares.set_share(child_slot, neighbor_share);
                 }
             }
             // Anchor is the root, or sits in a vertical/tabs parent: wrap just
@@ -307,7 +318,7 @@ impl Workspace {
                     egui_tiles::Container::Linear(egui_tiles::Linear::new_binary(
                         egui_tiles::LinearDir::Horizontal,
                         [anchor_slot, child_slot],
-                        0.5,
+                        DOCK_BESIDE_ANCHOR_SHARE,
                     )),
                 ));
                 match parent {
@@ -606,6 +617,56 @@ mod tests {
             sounding_idx,
             model_idx + 1,
             "sounding sits immediately to the right of the model plot"
+        );
+    }
+
+    #[test]
+    fn dock_beside_keeps_the_anchor_wider_than_the_newcomer() {
+        // The model plot must stay usable next to the sounding: the pair splits
+        // 60/40 (anchor/newcomer), not 50/50 (owner report: an even split
+        // squeezed the plot). Applies whichever dock_beside branch runs — Model
+        // sitting in the Map|Model row (horizontal-row insert) or, dock Model
+        // first alone so it is the sole viewer, the wrap branch.
+        let mut row = Workspace::default();
+        row.dock(WorkspacePane::Model); // Map | Model horizontal row
+        row.dock_beside(WorkspacePane::Sounding, WorkspacePane::Model);
+        assert_neighbor_share(&row, 0.4);
+
+        // Wrap branch: Model as the lone root (no map) still splits 60/40.
+        let mut wrap = Workspace {
+            tree: {
+                let mut tiles = egui_tiles::Tiles::default();
+                let model = tiles.insert_pane(WorkspacePane::Model);
+                egui_tiles::Tree::new(TREE_ID, model, tiles)
+            },
+            ..Default::default()
+        };
+        wrap.dock_beside(WorkspacePane::Sounding, WorkspacePane::Model);
+        assert_neighbor_share(&wrap, 0.4);
+    }
+
+    /// Assert the Sounding cell takes ~`expected` of the Sounding+Model pair
+    /// within their shared horizontal row.
+    fn assert_neighbor_share(workspace: &Workspace, expected: f32) {
+        let model_slot = slot_of(workspace, WorkspacePane::Model);
+        let sounding_slot = slot_of(workspace, WorkspacePane::Sounding);
+        let row = workspace
+            .tree
+            .tiles
+            .parent_of(model_slot)
+            .expect("model has a parent row");
+        let egui_tiles::Tile::Container(egui_tiles::Container::Linear(linear)) =
+            workspace.tree.tiles.get(row).expect("row tile")
+        else {
+            panic!("shared parent is not a Linear row");
+        };
+        let model_share = linear.shares[model_slot];
+        let sounding_share = linear.shares[sounding_slot];
+        let fraction = sounding_share / (model_share + sounding_share);
+        assert!(
+            (fraction - expected).abs() < 1e-4,
+            "sounding should take {expected} of the pair, got {fraction} \
+             (model {model_share}, sounding {sounding_share})"
         );
     }
 
