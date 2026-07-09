@@ -10,7 +10,7 @@ pub mod tropical;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -44,6 +44,10 @@ const HTTP_METADATA_TIMEOUT: StdDuration = StdDuration::from_secs(25);
 const HTTP_DOWNLOAD_TIMEOUT: StdDuration = StdDuration::from_secs(180);
 const HTTP_VOLUME_RETRY_BACKOFF: StdDuration = StdDuration::from_secs(2);
 const HTTP_USER_AGENT: &str = "bowecho (GR2Analyst-compatible placefile client)";
+const MAX_METADATA_TEXT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LISTING_TEXT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SMALL_RESOURCE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RADAR_VOLUME_BYTES: usize = 256 * 1024 * 1024;
 const REALTIME_VOLUME_ID_MODULUS: u16 = 1000;
 const REALTIME_CHUNK_LIST_MAX_KEYS: usize = 1000;
 const REALTIME_CHUNK_DOWNLOAD_CONCURRENCY: usize = 8;
@@ -332,9 +336,8 @@ pub fn fetch_weather_gov_radar_sites() -> Result<Vec<RadarSite>> {
 }
 
 pub fn fetch_text(url: &str) -> Result<String> {
-    Ok(send_with_retry(&metadata_http_client(), url)?
-        .error_for_status()?
-        .text()?)
+    let response = send_with_retry(&metadata_http_client(), url)?.error_for_status()?;
+    read_response_text_limited(response, MAX_METADATA_TEXT_BYTES, "text resource")
 }
 
 /// Fetch the public mPING display GeoJSON.
@@ -392,11 +395,10 @@ fn send_with_retry(
 /// DWD per-station sweep listing runs ~2 MB and the server does not gzip
 /// it), which can outrun the 8-second metadata-client budget of
 /// [`fetch_text`] on a slow link. Listings still must complete within the
-/// 45-second download budget.
+/// download-client budget.
 pub fn fetch_listing_text(url: &str) -> Result<String> {
-    Ok(send_with_retry(&download_http_client(), url)?
-        .error_for_status()?
-        .text()?)
+    let response = send_with_retry(&download_http_client(), url)?.error_for_status()?;
+    read_response_text_limited(response, MAX_LISTING_TEXT_BYTES, "listing")
 }
 
 /// `Ok(true)` when a HEAD request says `url` exists (2xx), `Ok(false)` on
@@ -419,19 +421,11 @@ pub fn url_exists(url: &str) -> Result<bool> {
 /// Fetch a small binary resource (e.g. a placefile icon sheet). Capped at
 /// 4 MiB — these are sprite sheets, not data files.
 pub fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
-    let bytes = metadata_http_client()
+    let response = metadata_http_client()
         .get(url)
         .send()?
-        .error_for_status()?
-        .bytes()?;
-    const MAX: usize = 4 * 1024 * 1024;
-    if bytes.len() > MAX {
-        return Err(DataSourceError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("resource too large: {} bytes", bytes.len()),
-        )));
-    }
-    Ok(bytes.to_vec())
+        .error_for_status()?;
+    read_response_limited(response, MAX_SMALL_RESOURCE_BYTES, "resource")
 }
 
 /// Fetch a radar volume from a polled feed. Volumes run 5–25 MB
@@ -442,27 +436,110 @@ pub fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
 /// 4 MiB.
 pub fn fetch_volume_bytes(url: &str) -> Result<Vec<u8>> {
     let client = download_http_client();
-    let result = send_with_retry(&client, url)
-        .and_then(|response| response.error_for_status())
-        .and_then(|response| response.bytes());
-    let bytes = match result {
-        Ok(bytes) => bytes,
-        Err(err) if should_retry_volume_fetch(&err) => {
+    let result = fetch_limited_bytes(&client, url, MAX_RADAR_VOLUME_BYTES, "volume");
+    match result {
+        Ok(bytes) => Ok(bytes),
+        Err(DataSourceError::Http(err)) if should_retry_volume_fetch(&err) => {
             thread::sleep(HTTP_VOLUME_RETRY_BACKOFF);
-            send_with_retry(&client, url)
-                .and_then(|response| response.error_for_status())
-                .and_then(|response| response.bytes())?
+            fetch_limited_bytes(&client, url, MAX_RADAR_VOLUME_BYTES, "volume")
         }
-        Err(err) => return Err(err.into()),
-    };
-    const MAX: usize = 256 * 1024 * 1024;
-    if bytes.len() > MAX {
-        return Err(DataSourceError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("volume too large: {} bytes", bytes.len()),
-        )));
+        Err(err) => Err(err),
     }
-    Ok(bytes.to_vec())
+}
+
+fn fetch_limited_bytes(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    max_bytes: usize,
+    resource: &'static str,
+) -> Result<Vec<u8>> {
+    let response = send_with_retry(client, url)?.error_for_status()?;
+    read_response_limited(response, max_bytes, resource)
+}
+
+/// Stream a response into a bounded sink. Checking `Content-Length` is only
+/// an early rejection: the writer remains authoritative for chunked and
+/// content-encoded responses whose decoded body is larger than the header.
+fn read_response_limited(
+    mut response: reqwest::blocking::Response,
+    max_bytes: usize,
+    resource: &'static str,
+) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(resource_too_large(resource, max_bytes));
+    }
+
+    let mut body = LimitedBody::new(max_bytes);
+    match response.copy_to(&mut body) {
+        Ok(_) => Ok(body.into_inner()),
+        Err(_) if body.limit_exceeded() => Err(resource_too_large(resource, max_bytes)),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn read_response_text_limited(
+    response: reqwest::blocking::Response,
+    max_bytes: usize,
+    resource: &'static str,
+) -> Result<String> {
+    let bytes = read_response_limited(response, max_bytes, resource)?;
+    // reqwest's `text()` uses UTF-8 replacement when its optional charset
+    // feature is disabled (as it is in this workspace). Preserve that
+    // behavior after moving body collection into the bounded reader.
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn resource_too_large(resource: &str, max_bytes: usize) -> DataSourceError {
+    DataSourceError::Io(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{resource} exceeds the {max_bytes}-byte limit"),
+    ))
+}
+
+struct LimitedBody {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    limit_exceeded: bool,
+}
+
+impl LimitedBody {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max_bytes,
+            limit_exceeded: false,
+        }
+    }
+
+    fn limit_exceeded(&self) -> bool {
+        self.limit_exceeded
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl Write for LimitedBody {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let remaining = self.max_bytes.saturating_sub(self.bytes.len());
+        if bytes.len() > remaining {
+            self.limit_exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "response body exceeded configured limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn should_retry_volume_fetch(err: &reqwest::Error) -> bool {
@@ -1793,6 +1870,25 @@ impl From<CommonPrefixXml> for CommonPrefix {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn limited_body_stops_before_buffering_past_the_cap() {
+        let mut body = LimitedBody::new(5);
+        assert_eq!(body.write(b"123").expect("first chunk"), 3);
+        assert_eq!(body.write(b"45").expect("exact cap"), 2);
+        let error = body.write(b"6").expect_err("byte past cap must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(body.limit_exceeded());
+        assert_eq!(body.into_inner(), b"12345");
+    }
+
+    #[test]
+    fn limited_body_rejects_an_oversized_first_chunk_without_copying_it() {
+        let mut body = LimitedBody::new(4);
+        body.write(b"12345").expect_err("oversized chunk must fail");
+        assert!(body.limit_exceeded());
+        assert!(body.into_inner().is_empty());
+    }
 
     #[test]
     fn http_connect_timeout_tolerates_slow_gov_hosts() {
