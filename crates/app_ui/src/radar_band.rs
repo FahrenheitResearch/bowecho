@@ -156,7 +156,7 @@ fn known_international_band(provider_id: &str, site_id: &str) -> Option<RadarBan
     match (provider_id, site_id) {
         // The provider module documents both Piemonte instruments as
         // C-band; this is provider metadata, not an ODIM assumption.
-        ("piemonte", _) => Some(RadarBand::C),
+        ("arpa-piemonte", _) => Some(RadarBand::C),
         // The embedded Australian site catalog explicitly labels site 105
         // (BrisAP / Meteopress) C-band. Other BOM sites are not inferred.
         ("australia-nci", "105") => Some(RadarBand::C),
@@ -213,7 +213,7 @@ mod tests {
             RadarBandProvenance::InternationalCatalog {
                 ref provider_id,
                 ..
-            } if provider_id == "piemonte"
+            } if provider_id == "arpa-piemonte"
         ));
     }
 
