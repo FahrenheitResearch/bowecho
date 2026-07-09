@@ -265,6 +265,11 @@ pub fn gust_proxy_grid(volume: &RadarVolume) -> Option<MomentGrid> {
     // and clutter returns in clear air otherwise fabricate severe gusts
     // (observed: 89 m/s "gusts" on an echo-free volume).
     let reflectivity = cut.moments.get(&MomentType::Reflectivity);
+    // Moment grids can store the cut's radials in different orders (or as
+    // different subsets). Map by the owning cut's raw radial identity so
+    // the echo mask cannot sample reflectivity from another azimuth.
+    let reflectivity_rows =
+        reflectivity.map(|grid| rows_by_radial_identity(grid, cut.radials.len()));
     let rows = dealiased.radial_count();
     let gates = dealiased.gate_range.gate_count;
     let gr = &dealiased.gate_range;
@@ -287,15 +292,24 @@ pub fn gust_proxy_grid(volume: &RadarVolume) -> Option<MomentGrid> {
                 let ref_gr = &ref_grid.gate_range;
                 let ref_gate = ((slant - ref_gr.first_gate_m as f64) / ref_gr.gate_spacing_m as f64)
                     .round() as isize;
-                let supported = ref_gate >= 0
-                    && (ref_gate as usize) < ref_gr.gate_count
-                    && ref_grid
-                        .scaled_value(
-                            row.min(ref_grid.radial_count().saturating_sub(1)),
-                            ref_gate as usize,
-                        )
-                        .map(|z| z >= 10.0)
-                        .unwrap_or(false);
+                let ref_row = dealiased
+                    .radial_indices
+                    .get(row)
+                    .and_then(|raw_radial| {
+                        reflectivity_rows
+                            .as_ref()
+                            .and_then(|rows| rows.get(*raw_radial))
+                    })
+                    .copied()
+                    .flatten();
+                let supported = ref_row.is_some_and(|ref_row| {
+                    ref_gate >= 0
+                        && (ref_gate as usize) < ref_gr.gate_count
+                        && ref_grid
+                            .scaled_value(ref_row, ref_gate as usize)
+                            .map(|z| z >= 10.0)
+                            .unwrap_or(false)
+                });
                 if !supported {
                     continue;
                 }
@@ -312,9 +326,40 @@ pub fn gust_proxy_grid(volume: &RadarVolume) -> Option<MomentGrid> {
     ))
 }
 
+/// Grid-row lookup keyed by the owning cut's raw radial index. Duplicate
+/// identities keep the first row, matching the first-wins moment convention.
+fn rows_by_radial_identity(grid: &MomentGrid, raw_radial_count: usize) -> Vec<Option<usize>> {
+    let mut rows = vec![None; raw_radial_count];
+    for (row, &raw_radial) in grid.radial_indices.iter().enumerate() {
+        if let Some(slot) = rows.get_mut(raw_radial)
+            && slot.is_none()
+        {
+            *slot = Some(row);
+        }
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn identity_grid(radial_indices: Vec<usize>) -> MomentGrid {
+        MomentGrid {
+            moment: MomentType::Reflectivity,
+            gate_range: radar_core::GateRange {
+                first_gate_m: 0,
+                gate_spacing_m: 250,
+                gate_count: 1,
+            },
+            scale: 1.0,
+            offset: 0.0,
+            nodata: None,
+            range_folded: None,
+            storage: radar_core::MomentStorage::F32(vec![20.0; radial_indices.len()]),
+            radial_indices,
+        }
+    }
 
     #[test]
     fn convergence_window_finds_couplet() {
@@ -343,5 +388,12 @@ mod tests {
         for value in conv.iter().filter(|value| value.is_finite()) {
             assert!(*value < 5.0, "{value}");
         }
+    }
+
+    #[test]
+    fn reflectivity_rows_follow_raw_radial_identity_not_row_position() {
+        let grid = identity_grid(vec![2, 0, 3]);
+        let rows = rows_by_radial_identity(&grid, 4);
+        assert_eq!(rows, vec![Some(1), None, Some(0), Some(2)]);
     }
 }

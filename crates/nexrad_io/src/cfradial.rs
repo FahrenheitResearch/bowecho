@@ -22,6 +22,8 @@
 //! in `ElevationCut::elevation_deg`, matching the DORADE decoder's RHI
 //! convention; `sweep_mode` is surfaced as [`radar_core::ScanMode`].
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use radar_core::{
     ElevationCut, GateRange, MomentGrid, MomentRow, MomentType, RadarSite, RadarVolume, Radial,
@@ -107,6 +109,10 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
         return Err(invalid("CfRadial volume has no (time, range) fields"));
     }
 
+    // Build sweep geometry first, then read each full (time, range) field
+    // once and distribute its rows across every sweep. The former
+    // sweep-outer loop reread and reconverted each full field once per sweep.
+    let mut sweeps = Vec::with_capacity(sweep_count);
     for sweep in 0..sweep_count {
         let start_ray = sweep_starts.get(sweep).map(|v| *v as usize).unwrap_or(0);
         let end_ray = sweep_ends
@@ -118,9 +124,11 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
             continue;
         }
         let fixed = fixed_angles.get(sweep).copied().unwrap_or_else(|| {
-            // No fixed_angle variable: mean elevation (or azimuth for RHI).
-            let rays = &elevation[start_ray..=end_ray];
-            rays.iter().sum::<f64>() / rays.len() as f64
+            fallback_fixed_angle(
+                sweep_modes.get(sweep).copied().flatten(),
+                &azimuth[start_ray..=end_ray],
+                &elevation[start_ray..=end_ray],
+            )
         }) as f32;
         let mut cut = ElevationCut::new(fixed, Some(sweep.min(255) as u8));
         for ray in start_ray..=end_ray {
@@ -143,12 +151,34 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
             });
         }
 
-        for field in &fields {
-            let moment = match canonical_moment(&field.name) {
-                Some(moment) if !cut.moments.contains_key(&moment) => moment,
-                _ => MomentType::Unknown(field.name.clone()),
-            };
-            let values = read_field_physical(&file, field)?;
+        sweeps.push(DecodedSweep {
+            start_ray,
+            end_ray,
+            cut,
+        });
+    }
+    if sweeps.is_empty() {
+        return Err(invalid("CfRadial volume decoded no sweeps"));
+    }
+
+    let expected_values = n_rays
+        .checked_mul(n_gates)
+        .ok_or_else(|| invalid("CfRadial field dimensions overflow addressable memory"))?;
+    let mut canonical_fields = BTreeSet::new();
+    for field in fields {
+        let moment = match canonical_moment(&field.name) {
+            Some(moment) if canonical_fields.insert(moment.clone()) => moment,
+            _ => MomentType::Unknown(field.name.clone()),
+        };
+        let values = read_field_physical(&file, field)?;
+        if values.len() < expected_values {
+            return Err(invalid(format!(
+                "CfRadial field '{}' has {} values; expected at least {expected_values}",
+                field.name,
+                values.len()
+            )));
+        }
+        for sweep in &mut sweeps {
             let mut grid = MomentGrid {
                 moment: moment.clone(),
                 gate_range: gate_range.clone(),
@@ -159,23 +189,72 @@ pub fn decode_cfradial1_volume(bytes: &[u8]) -> Result<RadarVolume> {
                 radial_indices: Vec::new(),
                 storage: radar_core::MomentStorage::F32(Vec::new()),
             };
-            for (radial_index, ray) in (start_ray..=end_ray).enumerate() {
-                let row = &values[ray * n_gates..(ray + 1) * n_gates];
+            for (radial_index, ray) in (sweep.start_ray..=sweep.end_ray).enumerate() {
+                let row_start = ray * n_gates;
+                let row = &values[row_start..row_start + n_gates];
                 grid.push_row(radial_index, MomentRow::F32(row.to_vec()))?;
             }
-            cut.moments.insert(moment, grid);
+            sweep.cut.moments.insert(moment.clone(), grid);
         }
-        volume.cuts.push(cut);
     }
-    if volume.cuts.is_empty() {
-        return Err(invalid("CfRadial volume decoded no sweeps"));
-    }
+    volume.cuts = sweeps.into_iter().map(|sweep| sweep.cut).collect();
     volume
         .cuts
         .sort_by(|left, right| left.elevation_deg.total_cmp(&right.elevation_deg));
     volume.metadata.decoded_radial_count = volume.cuts.iter().map(|cut| cut.radials.len()).sum();
     volume.metadata.message_count = sweep_count;
     Ok(volume)
+}
+
+struct DecodedSweep {
+    start_ray: usize,
+    end_ray: usize,
+    cut: ElevationCut,
+}
+
+/// CfRadial's fixed angle is elevation for PPI sweeps and azimuth for RHI
+/// sweeps. Azimuth needs a circular mean so a 359-degree/1-degree RHI points
+/// north, rather than being mislabeled as 180 degrees when `fixed_angle` is
+/// absent.
+fn fallback_fixed_angle(mode: Option<ScanMode>, azimuth: &[f64], elevation: &[f64]) -> f64 {
+    if mode == Some(ScanMode::Rhi) {
+        circular_mean_degrees(azimuth)
+            .or_else(|| azimuth.iter().copied().find(|value| value.is_finite()))
+            .map(|value| value.rem_euclid(360.0))
+            .unwrap_or(0.0)
+    } else {
+        arithmetic_mean(elevation).unwrap_or(0.0)
+    }
+}
+
+fn circular_mean_degrees(values: &[f64]) -> Option<f64> {
+    let mut sin_sum = 0.0;
+    let mut cos_sum = 0.0;
+    let mut count = 0usize;
+    for value in values.iter().copied().filter(|value| value.is_finite()) {
+        let radians = value.to_radians();
+        sin_sum += radians.sin();
+        cos_sum += radians.cos();
+        count += 1;
+    }
+    if count == 0 || sin_sum.hypot(cos_sum) <= f64::EPSILON {
+        return None;
+    }
+    Some(sin_sum.atan2(cos_sum).to_degrees().rem_euclid(360.0))
+}
+
+fn arithmetic_mean(values: &[f64]) -> Option<f64> {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for value in values.iter().copied().filter(|value| value.is_finite()) {
+        sum += value;
+        count += 1;
+    }
+    if count == 0 {
+        None
+    } else {
+        Some(sum / count as f64)
+    }
 }
 
 /// Apply CF packing (physical = raw·scale_factor + add_offset) and
@@ -388,5 +467,25 @@ mod tests {
             combined_scan_mode(&[None, Some(ScanMode::Rhi)]),
             Some(ScanMode::Rhi)
         );
+    }
+
+    #[test]
+    fn rhi_fixed_angle_fallback_uses_wrap_aware_azimuth_mean() {
+        let fixed = fallback_fixed_angle(
+            Some(ScanMode::Rhi),
+            &[359.0, 0.0, 1.0],
+            &[10.0, 20.0, 30.0],
+        );
+        assert!(fixed < 0.01 || fixed > 359.99, "fixed angle was {fixed}");
+    }
+
+    #[test]
+    fn ppi_fixed_angle_fallback_still_uses_mean_elevation() {
+        let fixed = fallback_fixed_angle(
+            Some(ScanMode::Ppi),
+            &[80.0, 90.0, 100.0],
+            &[0.4, 0.5, 0.6],
+        );
+        assert!((fixed - 0.5).abs() < 1.0e-9);
     }
 }
