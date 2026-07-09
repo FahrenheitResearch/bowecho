@@ -48,6 +48,11 @@ const DWD_SITES_ROOT: &str = "https://opendata.dwd.de/weather/radar/sites/";
 /// One 5-minute scan cycle: a sweep belongs to the cycle ending at the
 /// anchor when its start time is inside this trailing window.
 const CYCLE_WINDOW_MINUTES: i64 = 5;
+/// DWD's operational `vol5minng01` ladder is exactly sweep indices 00..09.
+/// Seeing the terminal sweep is necessary but not sufficient: a listing can
+/// expose sweep 09 while an intermediate object is absent or still settling.
+const EXPECTED_SWEEP_FIRST: u8 = 0;
+const EXPECTED_SWEEP_LAST: u8 = 9;
 
 /// One DWD sweep product directory and the ODIM quantities accepted for it,
 /// in preference order (first match in the resolved variant directory
@@ -306,18 +311,16 @@ struct DwdProductSweeps {
     sweeps: Vec<DwdSweepFile>,
 }
 
-/// Up to `count` cycle anchors, NEWEST FIRST: the distinct timestamps of
-/// the highest sweep index. Sweeps scan in ascending index order, so each
-/// such timestamp marks the end of one COMPLETE `vol5minng01` cycle (the
-/// next cycle's low sweeps may already be uploaded).
+/// Up to `count` candidate cycle anchors, NEWEST FIRST: the distinct
+/// timestamps of expected terminal sweep 09. Sweeps scan in ascending index
+/// order, so sweep 09 marks a candidate cycle end (the next cycle's low
+/// sweeps may already be uploaded). [`assemble_cycle`] separately requires
+/// every expected index in every required product before publishing it.
 /// `cycle_anchors(sweeps, 1)` is exactly the anchor `latest` uses.
 fn cycle_anchors(sweeps: &[DwdSweepFile], count: usize) -> Vec<NaiveDateTime> {
-    let Some(last_sweep) = sweeps.iter().map(|sweep| sweep.sweep).max() else {
-        return Vec::new();
-    };
     let mut times: Vec<NaiveDateTime> = sweeps
         .iter()
-        .filter(|sweep| sweep.sweep == last_sweep)
+        .filter(|sweep| sweep.sweep == EXPECTED_SWEEP_LAST)
         .map(|sweep| sweep.time)
         .collect();
     times.sort_unstable();
@@ -339,12 +342,14 @@ fn assemble_cycle(
     let mut parts: Vec<PlanPart> = Vec::new();
     for product in products {
         let chosen = sweeps_in_cycle(&product.sweeps, anchor);
-        if product.required && chosen.is_empty() {
+        let missing = missing_expected_sweeps(&chosen);
+        if product.required && !missing.is_empty() {
             return Err(format!(
-                "DWD {}/{site_id}: no '{}' sweeps inside the cycle ending {anchor} \
-                 ({} timestamped files inspected)",
+                "DWD {}/{site_id}: '{}' cycle ending {anchor} is incomplete; \
+                 missing expected sweep indices {} ({} timestamped files inspected)",
                 product.dir,
                 product.quantity,
+                format_sweep_indices(&missing),
                 product.sweeps.len()
             ));
         }
@@ -452,6 +457,9 @@ fn parse_dwd_sweeps(entries: &[ListingEntry], quantity: &str) -> Vec<DwdSweepFil
             let after = &entry.name[entry.name.find(&marker)? + marker.len()..];
             let (sweep_digits, after_sweep) = after.split_at_checked(2)?;
             let sweep = sweep_digits.parse::<u8>().ok()?;
+            if !(EXPECTED_SWEEP_FIRST..=EXPECTED_SWEEP_LAST).contains(&sweep) {
+                return None;
+            }
             let stamp = after_sweep.strip_prefix('-')?.get(..16)?;
             if !stamp.bytes().all(|byte| byte.is_ascii_digit()) {
                 return None; // LATEST alias or unexpected naming.
@@ -490,6 +498,20 @@ fn sweeps_in_cycle(sweeps: &[DwdSweepFile], anchor: NaiveDateTime) -> Vec<DwdSwe
     }
     newest_per_sweep.sort_by_key(|sweep| sweep.sweep);
     newest_per_sweep
+}
+
+fn missing_expected_sweeps(sweeps: &[DwdSweepFile]) -> Vec<u8> {
+    (EXPECTED_SWEEP_FIRST..=EXPECTED_SWEEP_LAST)
+        .filter(|expected| !sweeps.iter().any(|sweep| sweep.sweep == *expected))
+        .collect()
+}
+
+fn format_sweep_indices(indices: &[u8]) -> String {
+    indices
+        .iter()
+        .map(|index| format!("{index:02}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn is_safe_path_segment(segment: &str) -> bool {
@@ -548,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn anchors_are_newest_stamps_of_highest_sweep_index_newest_first() {
+    fn anchors_are_newest_stamps_of_expected_terminal_sweep_newest_first() {
         let entries = parse_autoindex(Z_FILES);
         let th = parse_dwd_sweeps(&entries, "th");
         assert_eq!(cycle_anchors(&th, 1), vec![timestamp("20260612064402")]);
@@ -661,10 +683,11 @@ mod tests {
         );
 
         // The oldest fixture cycle (ending 06:34:02) predates the velocity
-        // fixture's retention: required vradh is empty there.
+        // fixture's retention: every required vradh sweep is missing there.
         let err = assemble_cycle("asb", anchors[2], &products).unwrap_err();
         assert!(
-            err.contains("no 'vradh' sweeps inside the cycle ending"),
+            err.contains("'vradh' cycle ending")
+                && err.contains("missing expected sweep indices 00, 01, 02, 03, 04, 05, 06, 07, 08, 09"),
             "unexpected error: {err}"
         );
 
@@ -678,6 +701,38 @@ mod tests {
         assert_eq!(survivors.len(), 2);
         assert_eq!(survivors[0], older);
         assert_eq!(survivors[1], newest);
+    }
+
+    #[test]
+    fn required_product_with_missing_middle_sweep_is_not_published() {
+        let mut products = fixture_products();
+        let anchor = timestamp("20260612064402");
+        products[1]
+            .sweeps
+            .retain(|sweep| !(sweep.sweep == 4 && sweep.time > timestamp("20260612064000")));
+
+        let err = assemble_cycle("asb", anchor, &products).unwrap_err();
+        assert!(
+            err.contains("sweep_vol_v/asb")
+                && err.contains("'vradh' cycle ending")
+                && err.contains("missing expected sweep indices 04"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn unexpected_higher_index_cannot_become_a_cycle_anchor() {
+        let mut sweeps = parse_dwd_sweeps(&parse_autoindex(Z_FILES), "th");
+        sweeps.push(DwdSweepFile {
+            sweep: 99,
+            time: timestamp("20260612064959"),
+            name: "synthetic-unexpected-sweep".to_owned(),
+        });
+
+        assert_eq!(
+            cycle_anchors(&sweeps, 1),
+            vec![timestamp("20260612064402")]
+        );
     }
 
     #[test]

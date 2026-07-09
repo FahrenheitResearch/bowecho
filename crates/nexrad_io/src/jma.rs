@@ -44,8 +44,8 @@
 
 use chrono::{TimeZone, Utc};
 use radar_core::{
-    ElevationCut, GateRange, MomentGrid, MomentRow, MomentStorage, MomentType, RadarSite,
-    RadarVolume, Radial, ScanMode,
+    ElevationCut, GateRange, MomentGrid, MomentStorage, MomentType, RadarSite, RadarVolume, Radial,
+    ScanMode,
 };
 
 const TAR_BLOCK_LEN: usize = 512;
@@ -54,6 +54,12 @@ const TAR_MAGIC_OFFSET: usize = 257;
 const TAR_SIZE_OFFSET: usize = 124;
 const TAR_SIZE_LEN: usize = 12;
 const TAR_TYPEFLAG_OFFSET: usize = 156;
+/// Operational national N5/N6 tars are only a few MiB. Keep generous room
+/// for network growth while rejecting giant local files before walking
+/// attacker-controlled headers.
+const MAX_JMA_TAR_BYTES: usize = 64 * 1024 * 1024;
+const MAX_JMA_TAR_MEMBERS: usize = 128;
+const MAX_JMA_MEMBER_BYTES: usize = 32 * 1024 * 1024;
 
 const GRIB_MAGIC: &[u8; 4] = b"GRIB";
 const GRIB_END_MAGIC: &[u8; 4] = b"7777";
@@ -63,10 +69,17 @@ const GRID_TEMPLATE_AZIMUTH_RANGE: u16 = 50120;
 const PRODUCT_TEMPLATE_RADAR_ELEVATION: u16 = 51022;
 /// JMA Data Representation Template 5.200 (run-length level packing).
 const DATA_TEMPLATE_RUN_LENGTH: u16 = 200;
-/// Defensive cap on declared grid size (largest observed real sweep is
-/// 800 gates x 512 radials = 409,600 points) so a malformed length field
-/// cannot drive a huge allocation.
-const MAX_GRID_POINTS: usize = 64 * 1024 * 1024;
+/// Largest observed real sweep is 800 gates x 512 radials = 409,600 points.
+/// These per-axis and aggregate ceilings leave roughly an order of magnitude
+/// of headroom without letting a tiny RLE stream request hundreds of MiB.
+const MAX_GRID_GATES: usize = 4096;
+const MAX_GRID_RADIALS: usize = 2048;
+const MAX_GRID_POINTS: usize = 4 * 1024 * 1024;
+const MAX_SWEEPS_PER_MEMBER: usize = 64;
+const MAX_POINTS_PER_MEMBER: usize = 32 * 1024 * 1024;
+const MAX_POINTS_PER_DECODE: usize = 64 * 1024 * 1024;
+const MAX_GRIB_SECTIONS: usize = 512;
+const MAX_LEVEL_VALUES: usize = 4096;
 
 /// `true` when `bytes` look like a JMA radar GRIB2 tar: ustar magic at
 /// byte 257 and a first member named `Z__C_RJTD_*_RDR_JMAGPV*`.
@@ -115,6 +128,9 @@ pub fn jma_tar_station_headers(bytes: &[u8]) -> Result<Vec<JmaStationHeader>, St
         match parse_station_header(member.data, &member.name) {
             Ok(station) => {
                 if !stations.iter().any(|existing| existing.id == station.id) {
+                    stations
+                        .try_reserve(1)
+                        .map_err(|err| format!("cannot reserve JMA station table: {err}"))?;
                     stations.push(station);
                 }
             }
@@ -149,6 +165,7 @@ pub fn decode_jma_tar_volumes(
     let mut first_error: Option<String> = None;
     let mut data_members = 0usize;
     let mut filter_matches = 0usize;
+    let mut decoded_points = 0usize;
 
     for member in &members {
         if !is_jma_data_member(&member.name) {
@@ -171,7 +188,18 @@ pub fn decode_jma_tar_volumes(
         }
         filter_matches += 1;
         match decode_jma_grib2_volume(member.data, &member.name) {
-            Ok(volume) => merge_station_volume(&mut volumes, volume),
+            Ok(volume) => {
+                let member_points = volume_stored_points(&volume)?;
+                decoded_points = decoded_points
+                    .checked_add(member_points)
+                    .filter(|total| *total <= MAX_POINTS_PER_DECODE)
+                    .ok_or_else(|| {
+                        format!(
+                            "JMA decode output exceeds the {MAX_POINTS_PER_DECODE}-point aggregate limit"
+                        )
+                    })?;
+                merge_station_volume(&mut volumes, volume)?;
+            }
             Err(err) => {
                 first_error.get_or_insert(err);
             }
@@ -238,7 +266,10 @@ pub fn decode_jma_tar_first_station(bytes: &[u8]) -> Result<RadarVolume, String>
 /// Fold one decoded member into the per-station volume list: a repeated
 /// station id appends its cuts (scan order preserved) instead of producing
 /// a duplicate site entry.
-fn merge_station_volume(volumes: &mut Vec<RadarVolume>, volume: RadarVolume) {
+fn merge_station_volume(
+    volumes: &mut Vec<RadarVolume>,
+    mut volume: RadarVolume,
+) -> Result<(), String> {
     if let Some(existing) = volumes
         .iter_mut()
         .find(|existing| existing.site.id == volume.site.id)
@@ -248,10 +279,35 @@ fn merge_station_volume(volumes: &mut Vec<RadarVolume>, volume: RadarVolume) {
         }
         existing.metadata.message_count += volume.metadata.message_count;
         existing.metadata.decoded_radial_count += volume.metadata.decoded_radial_count;
-        existing.cuts.extend(volume.cuts);
+        existing
+            .cuts
+            .try_reserve(volume.cuts.len())
+            .map_err(|err| format!("cannot grow JMA station cut table: {err}"))?;
+        existing.cuts.append(&mut volume.cuts);
     } else {
+        volumes
+            .try_reserve(1)
+            .map_err(|err| format!("cannot grow JMA volume table: {err}"))?;
         volumes.push(volume);
     }
+    Ok(())
+}
+
+fn volume_stored_points(volume: &RadarVolume) -> Result<usize, String> {
+    volume
+        .cuts
+        .iter()
+        .flat_map(|cut| cut.moments.values())
+        .try_fold(0usize, |total, grid| {
+            let points = match &grid.storage {
+                MomentStorage::U8(values) => values.len(),
+                MomentStorage::U16(values) => values.len(),
+                MomentStorage::F32(values) => values.len(),
+            };
+            total
+                .checked_add(points)
+                .ok_or_else(|| "JMA decoded point count overflow".to_owned())
+        })
 }
 
 fn station_matches_filter(header: &JmaStationHeader, filter: &str) -> bool {
@@ -278,10 +334,22 @@ struct TarMember<'a> {
 }
 
 fn ustar_members(bytes: &[u8]) -> Result<Vec<TarMember<'_>>, String> {
+    if bytes.len() > MAX_JMA_TAR_BYTES {
+        return Err(format!(
+            "JMA tar is {} bytes (limit {MAX_JMA_TAR_BYTES})",
+            bytes.len()
+        ));
+    }
     let mut members = Vec::new();
     let mut pos = 0usize;
-    while pos + TAR_BLOCK_LEN <= bytes.len() {
-        let header = &bytes[pos..pos + TAR_BLOCK_LEN];
+    while pos
+        .checked_add(TAR_BLOCK_LEN)
+        .is_some_and(|end| end <= bytes.len())
+    {
+        let header_end = pos
+            .checked_add(TAR_BLOCK_LEN)
+            .ok_or_else(|| "tar header offset overflow".to_owned())?;
+        let header = &bytes[pos..header_end];
         if header.iter().all(|&byte| byte == 0) {
             break; // end-of-archive zero block
         }
@@ -293,21 +361,42 @@ fn ustar_members(bytes: &[u8]) -> Result<Vec<TarMember<'_>>, String> {
         }
         let size = tar_octal(&header[TAR_SIZE_OFFSET..TAR_SIZE_OFFSET + TAR_SIZE_LEN])
             .ok_or_else(|| format!("tar member '{name}' has an unparsable size field"))?;
-        let data_start = pos + TAR_BLOCK_LEN;
+        if size > MAX_JMA_MEMBER_BYTES {
+            return Err(format!(
+                "tar member '{name}' declares {size} bytes (limit {MAX_JMA_MEMBER_BYTES})"
+            ));
+        }
+        let data_start = header_end;
         let data_end = data_start
             .checked_add(size)
             .filter(|&end| end <= bytes.len())
             .ok_or_else(|| format!("tar member '{name}' overruns the archive"))?;
+        let padded = size
+            .checked_add(TAR_BLOCK_LEN - 1)
+            .and_then(|value| value.checked_div(TAR_BLOCK_LEN))
+            .and_then(|blocks| blocks.checked_mul(TAR_BLOCK_LEN))
+            .ok_or_else(|| format!("tar member '{name}' padded size overflow"))?;
+        let next_pos = data_start
+            .checked_add(padded)
+            .filter(|&next| next <= bytes.len())
+            .ok_or_else(|| format!("tar member '{name}' padded body overruns the archive"))?;
         // Regular files only ('0' or the old NUL flag); other entry types
         // (directories, long-name extensions, ...) are skipped over.
         if matches!(header[TAR_TYPEFLAG_OFFSET], b'0' | 0) {
+            if members.len() >= MAX_JMA_TAR_MEMBERS {
+                return Err(format!(
+                    "JMA tar contains more than {MAX_JMA_TAR_MEMBERS} regular members"
+                ));
+            }
+            members
+                .try_reserve(1)
+                .map_err(|err| format!("cannot reserve JMA tar member table: {err}"))?;
             members.push(TarMember {
                 name,
                 data: &bytes[data_start..data_end],
             });
         }
-        let padded = size.div_ceil(TAR_BLOCK_LEN) * TAR_BLOCK_LEN;
-        pos = data_start + padded;
+        pos = next_pos;
     }
     Ok(members)
 }
@@ -399,6 +488,8 @@ fn decode_jma_grib2_volume(bytes: &[u8], member: &str) -> Result<RadarVolume, St
     let mut pending_data_repr: Option<SectionRef> = None;
     let mut pending_bitmap: Option<SectionRef> = None;
     let mut station: Option<JmaStationHeader> = None;
+    let mut decoded_points = 0usize;
+    let mut decoded_sweeps = 0usize;
 
     for section in sections {
         match section.number {
@@ -411,6 +502,26 @@ fn decode_jma_grib2_volume(bytes: &[u8], member: &str) -> Result<RadarVolume, St
                 let grid = current_grid
                     .clone()
                     .ok_or_else(|| format!("{member}: data section before any grid section"))?;
+                decoded_sweeps = decoded_sweeps
+                    .checked_add(1)
+                    .filter(|count| *count <= MAX_SWEEPS_PER_MEMBER)
+                    .ok_or_else(|| {
+                        format!(
+                            "{member}: more than {MAX_SWEEPS_PER_MEMBER} sweeps in one GRIB member"
+                        )
+                    })?;
+                let grid_points = grid
+                    .gate_count
+                    .checked_mul(grid.radial_count)
+                    .ok_or_else(|| format!("{member}: grid point count overflow"))?;
+                decoded_points = decoded_points
+                    .checked_add(grid_points)
+                    .filter(|count| *count <= MAX_POINTS_PER_MEMBER)
+                    .ok_or_else(|| {
+                        format!(
+                            "{member}: decoded grids exceed the {MAX_POINTS_PER_MEMBER}-point member limit"
+                        )
+                    })?;
                 let product_section = pending_product
                     .take()
                     .ok_or_else(|| format!("{member}: data section without a product section"))?;
@@ -426,13 +537,13 @@ fn decode_jma_grib2_volume(bytes: &[u8], member: &str) -> Result<RadarVolume, St
                     section_bytes(msg, data_repr),
                     section_bytes(msg, bitmap),
                     section_bytes(msg, section),
-                    grid.gate_count * grid.radial_count,
+                    grid_points,
                     member,
                 )?;
                 if station.is_none() {
                     station = Some(product.station.clone());
                 }
-                push_sweep_cut(&mut volume, &grid, &product, &values)?;
+                push_sweep_cut(&mut volume, &grid, &product, values)?;
             }
             8 => break,
             other => return Err(format!("{member}: unexpected GRIB2 section {other}")),
@@ -457,8 +568,18 @@ fn push_sweep_cut(
     volume: &mut RadarVolume,
     grid: &PolarGrid,
     product: &SweepProduct,
-    values: &[f32],
+    values: Vec<f32>,
 ) -> Result<(), String> {
+    let expected_points = grid
+        .gate_count
+        .checked_mul(grid.radial_count)
+        .ok_or_else(|| "JMA sweep point count overflow".to_owned())?;
+    if values.len() != expected_points {
+        return Err(format!(
+            "JMA sweep decoded {} values for {expected_points} grid points",
+            values.len()
+        ));
+    }
     let elevation_deg = product.elevation_deg.unwrap_or(0.0);
     let elevation_number = u8::try_from(volume.cuts.len() + 1).ok();
     let gate_range = GateRange {
@@ -471,6 +592,9 @@ fn push_sweep_cut(
     // 10-minute file carries two 5-minute scan repetitions), so every sweep
     // becomes its own cut in scan order — never elevation-merged.
     let mut cut = ElevationCut::new(elevation_deg, elevation_number);
+    cut.radials
+        .try_reserve_exact(grid.radial_count)
+        .map_err(|err| format!("cannot reserve JMA radial table: {err}"))?;
     for ray in 0..grid.radial_count {
         cut.radials.push(Radial {
             azimuth_deg: grid.ray_azimuth_deg(ray),
@@ -487,29 +611,40 @@ fn push_sweep_cut(
         });
     }
 
-    let mut moment_grid = MomentGrid {
+    let mut radial_indices = Vec::new();
+    radial_indices
+        .try_reserve_exact(grid.radial_count)
+        .map_err(|err| format!("cannot reserve JMA radial index table: {err}"))?;
+    radial_indices.extend(0..grid.radial_count);
+    let moment_grid = MomentGrid {
         moment: product.moment.clone(),
         gate_range,
         scale: 1.0,
         offset: 0.0,
         nodata: None,
         range_folded: None,
-        radial_indices: Vec::new(),
-        storage: MomentStorage::F32(Vec::new()),
+        radial_indices,
+        // `values` is already radial-major. Move it into the final grid
+        // instead of cloning every row into a second full f32 plane.
+        storage: MomentStorage::F32(values),
     };
-    moment_grid.reserve_rows(grid.radial_count);
-    for (ray, row) in values.chunks_exact(grid.gate_count).enumerate() {
-        moment_grid
-            .push_row(ray, MomentRow::F32(row.to_vec()))
-            .map_err(|err| err.to_string())?;
-    }
     cut.moments.insert(product.moment.clone(), moment_grid);
+    volume
+        .cuts
+        .try_reserve(1)
+        .map_err(|err| format!("cannot grow JMA cut table: {err}"))?;
     volume.cuts.push(cut);
     Ok(())
 }
 
 /// Validate the GRIB2 indicator + end marker and return the message slice.
 fn grib2_message<'a>(bytes: &'a [u8], member: &str) -> Result<&'a [u8], String> {
+    if bytes.len() > MAX_JMA_MEMBER_BYTES {
+        return Err(format!(
+            "{member}: GRIB member is {} bytes (limit {MAX_JMA_MEMBER_BYTES})",
+            bytes.len()
+        ));
+    }
     if bytes.len() < 20 || &bytes[0..4] != GRIB_MAGIC {
         return Err(format!("{member}: missing GRIB indicator"));
     }
@@ -519,7 +654,8 @@ fn grib2_message<'a>(bytes: &'a [u8], member: &str) -> Result<&'a [u8], String> 
             bytes[7]
         ));
     }
-    let total_length = be_u64(bytes, 8, member)? as usize;
+    let total_length = usize::try_from(be_u64(bytes, 8, member)?)
+        .map_err(|_| format!("{member}: GRIB message length does not fit this platform"))?;
     if total_length < 20 || total_length > bytes.len() {
         return Err(format!(
             "{member}: message declares {total_length} bytes but member has {}",
@@ -537,7 +673,18 @@ fn scan_sections(msg: &[u8], member: &str) -> Result<Vec<SectionRef>, String> {
     let mut sections = Vec::new();
     let mut pos = 16usize;
     while pos < msg.len() {
-        if pos + 4 <= msg.len() && &msg[pos..pos + 4] == GRIB_END_MAGIC {
+        if let Some(marker_end) = pos.checked_add(4)
+            && marker_end <= msg.len()
+            && &msg[pos..marker_end] == GRIB_END_MAGIC
+        {
+            if sections.len() >= MAX_GRIB_SECTIONS {
+                return Err(format!(
+                    "{member}: more than {MAX_GRIB_SECTIONS} GRIB sections"
+                ));
+            }
+            sections
+                .try_reserve(1)
+                .map_err(|err| format!("{member}: cannot reserve GRIB section table: {err}"))?;
             sections.push(SectionRef {
                 number: 8,
                 offset: pos,
@@ -545,22 +692,33 @@ fn scan_sections(msg: &[u8], member: &str) -> Result<Vec<SectionRef>, String> {
             });
             return Ok(sections);
         }
-        if pos + 5 > msg.len() {
+        if pos.checked_add(5).is_none_or(|end| end > msg.len()) {
             return Err(format!("{member}: truncated GRIB2 section header"));
         }
         let length = be_u32(msg, pos, member)? as usize;
         let number = msg[pos + 4];
-        if length < 5 || pos + length > msg.len() {
+        let Some(section_end) = pos
+            .checked_add(length)
+            .filter(|end| length >= 5 && *end <= msg.len())
+        else {
             return Err(format!(
                 "{member}: GRIB2 section {number} has invalid length {length}"
             ));
+        };
+        if sections.len() >= MAX_GRIB_SECTIONS {
+            return Err(format!(
+                "{member}: more than {MAX_GRIB_SECTIONS} GRIB sections"
+            ));
         }
+        sections
+            .try_reserve(1)
+            .map_err(|err| format!("{member}: cannot reserve GRIB section table: {err}"))?;
         sections.push(SectionRef {
             number,
             offset: pos,
             length,
         });
-        pos += length;
+        pos = section_end;
     }
     Err(format!("{member}: GRIB2 message missing end marker"))
 }
@@ -611,6 +769,11 @@ fn parse_grid(section: &[u8], member: &str) -> Result<PolarGrid, String> {
             "{member}: grid point count mismatch: {gate_count} gates x {radial_count} radials != {expected}"
         ));
     }
+    if gate_count > MAX_GRID_GATES || radial_count > MAX_GRID_RADIALS {
+        return Err(format!(
+            "{member}: grid dimensions {gate_count} gates x {radial_count} radials exceed limits {MAX_GRID_GATES} x {MAX_GRID_RADIALS}"
+        ));
+    }
     if expected > MAX_GRID_POINTS {
         return Err(format!(
             "{member}: grid declares {expected} points (over the {MAX_GRID_POINTS} sanity cap)"
@@ -628,7 +791,11 @@ fn parse_grid(section: &[u8], member: &str) -> Result<PolarGrid, String> {
 
 /// Product Definition Template 4.51022 (radar site/elevation parameters).
 fn parse_product(section: &[u8], grid: &PolarGrid, member: &str) -> Result<SweepProduct, String> {
-    let min_len = 60 + grid.radial_count * 4;
+    let min_len = grid
+        .radial_count
+        .checked_mul(4)
+        .and_then(|bytes| 60usize.checked_add(bytes))
+        .ok_or_else(|| format!("{member}: product radial table length overflow"))?;
     require_section(section, 4, min_len, member)?;
     let template = be_u16(section, 7, member)?;
     if template != PRODUCT_TEMPLATE_RADAR_ELEVATION {
@@ -640,7 +807,10 @@ fn parse_product(section: &[u8], grid: &PolarGrid, member: &str) -> Result<Sweep
     let station = parse_station_from_product(section, member)?;
     let elevation_deg =
         signed_magnitude_i16(be_u16(section, 41, member)?).map(|value| f32::from(value) / 100.0);
-    let mut ray_elevation_deg = Vec::with_capacity(grid.radial_count);
+    let mut ray_elevation_deg = Vec::new();
+    ray_elevation_deg
+        .try_reserve_exact(grid.radial_count)
+        .map_err(|err| format!("{member}: cannot reserve per-ray elevation table: {err}"))?;
     for ray in 0..grid.radial_count {
         let offset = 60 + ray * 4;
         ray_elevation_deg.push(
@@ -741,23 +911,40 @@ fn decode_data(
             "{member}: encoded point count {encoded_points} != grid points {expected_points}"
         ));
     }
+    if expected_points > MAX_GRID_POINTS {
+        return Err(format!(
+            "{member}: data section declares {expected_points} output points (limit {MAX_GRID_POINTS})"
+        ));
+    }
 
     let num_bits = section5[11];
     let max_value = be_u16(section5, 12, member)?;
     let max_level = be_u16(section5, 14, member)?;
     let decimal_scale = section5[16];
+    let max_level = usize::from(max_level);
+    if max_level > MAX_LEVEL_VALUES {
+        return Err(format!(
+            "{member}: level table declares {max_level} values (limit {MAX_LEVEL_VALUES})"
+        ));
+    }
     let levels_start = 17usize;
-    let levels_end = levels_start + usize::from(max_level) * 2;
+    let levels_end = max_level
+        .checked_mul(2)
+        .and_then(|bytes| levels_start.checked_add(bytes))
+        .ok_or_else(|| format!("{member}: level table length overflow"))?;
     if levels_end > section5.len() {
         return Err(format!(
             "{member}: data-representation section ends before all {max_level} level values"
         ));
     }
 
-    let mut level_values = Vec::with_capacity(usize::from(max_level) + 1);
+    let mut level_values = Vec::new();
+    level_values
+        .try_reserve_exact(max_level.saturating_add(1))
+        .map_err(|err| format!("{member}: cannot reserve level table: {err}"))?;
     level_values.push(f32::NAN); // level 0 = missing
     let factor = 10_f32.powi(-i32::from(decimal_scale));
-    for index in 0..usize::from(max_level) {
+    for index in 0..max_level {
         let raw = be_u16(section5, levels_start + index * 2, member)?;
         level_values.push(
             signed_magnitude_i16(raw)
@@ -768,7 +955,10 @@ fn decode_data(
 
     let levels = run_length_decode(&section7[5..], num_bits, max_value, expected_points)
         .map_err(|err| format!("{member}: {err}"))?;
-    let mut values = Vec::with_capacity(expected_points);
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(expected_points)
+        .map_err(|err| format!("{member}: cannot reserve decoded value plane: {err}"))?;
     for level in levels {
         values.push(
             level_values
@@ -789,6 +979,11 @@ fn run_length_decode(
     max_value: u16,
     expected_len: usize,
 ) -> Result<Vec<u16>, String> {
+    if expected_len > MAX_GRID_POINTS {
+        return Err(format!(
+            "run-length output requests {expected_len} values (limit {MAX_GRID_POINTS})"
+        ));
+    }
     if num_bits == 0 || num_bits > 16 {
         return Err(format!("unsupported run-length packed width {num_bits}"));
     }
@@ -806,7 +1001,9 @@ fn run_length_decode(
         return Err("invalid run-length base".to_owned());
     }
 
-    let mut out: Vec<u16> = Vec::with_capacity(expected_len);
+    let mut out: Vec<u16> = Vec::new();
+    out.try_reserve_exact(expected_len)
+        .map_err(|err| format!("cannot reserve run-length output: {err}"))?;
     let mut cached: Option<u16> = None;
     let mut exp = 1usize;
     for value in BitValues::new(bytes, num_bits) {
@@ -819,13 +1016,19 @@ fn run_length_decode(
             exp = 1;
         } else {
             let prev = cached.ok_or_else(|| "first run-length value is a run marker".to_owned())?;
-            let repeat = usize::from(value - rlbase) * exp;
-            if out.len() + repeat > expected_len {
+            let repeat = usize::from(value - rlbase)
+                .checked_mul(exp)
+                .ok_or_else(|| "run-length repeat count overflow".to_owned())?;
+            let next_len = out
+                .len()
+                .checked_add(repeat)
+                .ok_or_else(|| "run-length output length overflow".to_owned())?;
+            if next_len > expected_len {
                 return Err(format!(
                     "run-length stream expands past expected length {expected_len}"
                 ));
             }
-            out.resize(out.len() + repeat, prev);
+            out.resize(next_len, prev);
             exp = exp
                 .checked_mul(lngu)
                 .ok_or_else(|| "run-length exponent overflow".to_owned())?;
@@ -1177,6 +1380,53 @@ mod tests {
         );
         let err = run_length_decode(&[1, 2], 8, u16::MAX - 1, 4).unwrap_err();
         assert!(err.contains("exceeds"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn tiny_run_length_payload_cannot_request_an_oversized_plane() {
+        let err = run_length_decode(&[1], 8, 250, MAX_GRID_POINTS + 1).unwrap_err();
+        assert!(
+            err.contains("run-length output requests") && err.contains("limit"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn grid_axis_limits_reject_pathological_radial_tables() {
+        let section = section(3, |body| {
+            body.push(0);
+            push_u32(body, (MAX_GRID_RADIALS + 1) as u32);
+            body.extend_from_slice(&[0, 0]);
+            push_u16(body, GRID_TEMPLATE_AZIMUTH_RANGE);
+            push_u32(body, 1);
+            push_u32(body, (MAX_GRID_RADIALS + 1) as u32);
+            push_u32(body, 36_500_000);
+            push_u32(body, 136_500_000);
+            push_u32(body, 500_000);
+            push_u32(body, 0);
+            body.push(0);
+            push_u16(body, 0);
+        });
+        let err = parse_grid(&section, "pathological-grid").unwrap_err();
+        assert!(
+            err.contains("grid dimensions") && err.contains("exceed limits"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn oversized_tar_member_is_rejected_from_its_header() {
+        let mut header = vec![0u8; TAR_BLOCK_LEN];
+        let name = member_name(47001, "ze");
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        let size = format!("{:011o}", MAX_JMA_MEMBER_BYTES + 1);
+        header[TAR_SIZE_OFFSET..TAR_SIZE_OFFSET + 11].copy_from_slice(size.as_bytes());
+        header[TAR_TYPEFLAG_OFFSET] = b'0';
+        let err = ustar_members(&header).err().expect("oversized member error");
+        assert!(
+            err.contains("declares") && err.contains("limit"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

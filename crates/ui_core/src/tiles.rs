@@ -9,7 +9,8 @@
 
 use eframe::egui;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::io::{Cursor, Read};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{
     Arc, Condvar, Mutex,
@@ -204,6 +205,16 @@ const FAILURE_RETRY_SECS: u64 = 60;
 const MAX_TEXTURE_INSTALLS_PER_POLL: usize = 6;
 const MAX_TILE_RESULTS_PER_POLL: usize = 24;
 const TEXTURE_INSTALL_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
+/// Encoded Esri tiles are normally tens to hundreds of KiB. This generous
+/// ceiling bounds both stale/corrupt cache files and future fetch helpers
+/// that may allow larger generic response bodies.
+const MAX_TILE_ENCODED_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TILE_DIMENSION: u32 = 4096;
+const MAX_TILE_PIXELS: u64 = 4 * 1024 * 1024;
+/// Every provider currently represented by [`TileSource`] serves standard
+/// 256x256 Web-Mercator tiles. Reject any other geometry before the image
+/// crate allocates its decoded pixel buffer.
+const BASEMAP_TILE_DIMENSION: u32 = 256;
 
 impl TileLayer {
     pub fn new(config: TileLayerConfig) -> Self {
@@ -419,27 +430,140 @@ fn fetch_and_decode(
             .join(tile.zoom.to_string())
             .join(format!("{}_{}.bin", tile.x, tile.y))
     });
-    let bytes = if let Some(path) = cache_path.as_ref().filter(|p| p.exists()) {
-        std::fs::read(path).ok()?
-    } else {
-        let url = source.url(tile)?;
-        let bytes = data_source::fetch_bytes(&url).ok()?;
-        if let Some(path) = &cache_path {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(path, &bytes);
+    if let Some(path) = cache_path.as_ref().filter(|path| path.exists())
+        && let Some(decoded) = load_cached_tile(path, source, tile)
+    {
+        return Some(decoded);
+    }
+
+    let url = source.url(tile)?;
+    let bytes = data_source::fetch_bytes(&url).ok()?;
+    let decoded = decode_tile_bytes(source, tile, &bytes)?;
+    // Cache only bytes that passed encoded-size, header-dimension, provider
+    // geometry, full decode, and decoded-dimension checks. A bad response
+    // must not poison every retry through the disk cache.
+    if let Some(path) = &cache_path {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
-        bytes
-    };
-    let image = image::load_from_memory(&bytes).ok()?;
+        let _ = std::fs::write(path, &bytes);
+    }
+    Some(decoded)
+}
+
+fn load_cached_tile(path: &Path, source: &TileSource, tile: TileId) -> Option<DecodedTile> {
+    let decoded = read_tile_file_limited(path)
+        .and_then(|bytes| decode_tile_bytes(source, tile, &bytes));
+    if decoded.is_none() {
+        // A truncated, oversized, or otherwise corrupt tile must not remain
+        // a permanent retry sink. Ignore removal errors (read-only cache,
+        // antivirus race, another process already replaced it) and let the
+        // caller attempt a fresh provider fetch.
+        let _ = std::fs::remove_file(path);
+    }
+    decoded
+}
+
+fn read_tile_file_limited(path: &Path) -> Option<Vec<u8>> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let declared = usize::try_from(file.metadata().ok()?.len()).ok()?;
+    if declared > MAX_TILE_ENCODED_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(declared).ok()?;
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        let remaining = MAX_TILE_ENCODED_BYTES.saturating_sub(bytes.len());
+        if remaining == 0 {
+            let mut probe = [0u8; 1];
+            if file.read(&mut probe).ok()? != 0 {
+                return None;
+            }
+            break;
+        }
+        let read_len = remaining.min(chunk.len());
+        let count = file.read(&mut chunk[..read_len]).ok()?;
+        if count == 0 {
+            break;
+        }
+        bytes.try_reserve(count).ok()?;
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    Some(bytes)
+}
+
+fn decode_tile_bytes(source: &TileSource, tile: TileId, bytes: &[u8]) -> Option<DecodedTile> {
+    if bytes.is_empty() || bytes.len() > MAX_TILE_ENCODED_BYTES {
+        return None;
+    }
+    let reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let (width, height) = reader.into_dimensions().ok()?;
+    if !tile_dimensions_allowed(source, width, height) {
+        return None;
+    }
+
+    // Dimension validation above intentionally precedes this allocation.
+    let image = image::load_from_memory(bytes).ok()?;
+    if image.width() != width || image.height() != height {
+        return None;
+    }
     let rgba = image.to_rgba8();
     Some((tile, rgba.width(), rgba.height(), rgba.into_raw()))
+}
+
+fn tile_dimensions_allowed(source: &TileSource, width: u32, height: u32) -> bool {
+    let sane = width > 0
+        && height > 0
+        && width <= MAX_TILE_DIMENSION
+        && height <= MAX_TILE_DIMENSION
+        && u64::from(width)
+            .checked_mul(u64::from(height))
+            .is_some_and(|pixels| pixels <= MAX_TILE_PIXELS);
+    sane && match source {
+        TileSource::Basemap(_) => {
+            width == BASEMAP_TILE_DIMENSION && height == BASEMAP_TILE_DIMENSION
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_tile() -> TileId {
+        TileId {
+            zoom: 5,
+            x: 16,
+            y: 11,
+        }
+    }
+
+    fn satellite_source() -> TileSource {
+        TileSource::Basemap(TileStyle::Satellite)
+    }
+
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(width, height, image::Rgba([1, 2, 3, 255]));
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode test PNG");
+        encoded.into_inner()
+    }
+
+    fn unique_cache_path(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bowecho-ui-core-tile-{label}-{}-{nonce}.bin",
+            std::process::id()
+        ))
+    }
 
     fn test_config() -> TileLayerConfig {
         TileLayerConfig {
@@ -511,5 +635,51 @@ mod tests {
                 })
                 .is_some()
         );
+    }
+
+    #[test]
+    fn tile_dimensions_are_checked_before_decode_allocation() {
+        let source = satellite_source();
+        assert!(tile_dimensions_allowed(
+            &source,
+            BASEMAP_TILE_DIMENSION,
+            BASEMAP_TILE_DIMENSION
+        ));
+        assert!(!tile_dimensions_allowed(&source, 1, 1));
+        assert!(!tile_dimensions_allowed(
+            &source,
+            MAX_TILE_DIMENSION + 1,
+            BASEMAP_TILE_DIMENSION
+        ));
+
+        assert!(decode_tile_bytes(&source, test_tile(), &png_bytes(1, 1)).is_none());
+        let decoded = decode_tile_bytes(
+            &source,
+            test_tile(),
+            &png_bytes(BASEMAP_TILE_DIMENSION, BASEMAP_TILE_DIMENSION),
+        )
+        .expect("standard provider tile");
+        assert_eq!((decoded.1, decoded.2), (256, 256));
+        assert_eq!(decoded.3.len(), 256 * 256 * 4);
+    }
+
+    #[test]
+    fn corrupt_cached_tile_is_invalidated() {
+        let path = unique_cache_path("corrupt");
+        std::fs::write(&path, b"not an image").expect("write corrupt cache fixture");
+
+        assert!(load_cached_tile(&path, &satellite_source(), test_tile()).is_none());
+        assert!(!path.exists(), "corrupt cache entry should be removed");
+    }
+
+    #[test]
+    fn oversized_cached_tile_is_rejected_without_reading_body() {
+        let path = unique_cache_path("oversized");
+        let file = std::fs::File::create(&path).expect("create oversized cache fixture");
+        file.set_len((MAX_TILE_ENCODED_BYTES + 1) as u64)
+            .expect("size oversized cache fixture");
+
+        assert!(load_cached_tile(&path, &satellite_source(), test_tile()).is_none());
+        assert!(!path.exists(), "oversized cache entry should be removed");
     }
 }
