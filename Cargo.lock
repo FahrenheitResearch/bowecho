@@ -303,6 +303,7 @@ dependencies = [
  "eframe",
  "egui_tiles",
  "flate2",
+ "grib-core",
  "image",
  "naga",
  "netcrust",
