@@ -23,7 +23,7 @@ use eframe::egui;
 use render2d::detect_rotation_sites_from_dealiased;
 use render2d::tracks::{
     TdsGate, TracksGridSpec, detect_tds_gates, low_level_azshear_cartesian_from_dealiased,
-    max_composite_into, rotation_track_color,
+    low_level_azshear_cut_indices, max_composite_into, rotation_track_color,
 };
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -293,11 +293,13 @@ impl crate::ViewerApp {
                 self.tor_tracks.job = Some(TrackJob { rx });
                 let ctx = ctx.clone();
                 thread::spawn(move || {
-                    let grids = crate::resolve_dealiased_volume_grids(
+                    let cut_indices = low_level_azshear_cut_indices(&volume);
+                    let grids = crate::resolve_dealiased_cut_grids(
                         &volume,
                         previous_volume.as_ref(),
                         dealias_env.as_ref(),
                         engine,
+                        &cut_indices,
                     );
                     let borrowed: Vec<Option<&radar_core::MomentGrid>> =
                         grids.iter().map(Option::as_deref).collect();

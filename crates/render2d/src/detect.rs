@@ -182,18 +182,39 @@ fn rank_2d(delta_v_mps: f32, shear_ms_km: f32, gtg_dv_mps: f32, range_km: f64) -
     rank_dv(gtg_dv_mps).max(rank_dv(delta_v_mps).min(rank_shear))
 }
 
+/// Ordered, bounded cut set consumed by rotation detection. Callers that own
+/// dealiasing use this to resolve only grids the detector will inspect.
+pub fn rotation_velocity_cut_indices(volume: &RadarVolume) -> Vec<usize> {
+    let mut velocity_cuts: Vec<usize> = volume
+        .cuts
+        .iter()
+        .enumerate()
+        .filter(|(_, cut)| {
+            cut.moments.contains_key(&MomentType::Velocity)
+                && cut.elevation_deg <= MAX_TILT_ELEVATION_DEG
+        })
+        .map(|(index, _)| index)
+        .collect();
+    velocity_cuts.sort_by(|left, right| {
+        volume.cuts[*left]
+            .elevation_deg
+            .total_cmp(&volume.cuts[*right].elevation_deg)
+    });
+    velocity_cuts.truncate(MAX_TILTS);
+    velocity_cuts
+}
+
 /// Detect vertically-continuous rotation in a volume (background-thread
 /// work: ~100–300 ms on a dense super-res volume; tilts run in parallel).
 pub fn detect_rotation_sites(volume: &RadarVolume) -> Vec<RotationSite> {
-    let owned: Vec<Option<MomentGrid>> = volume
-        .cuts
-        .iter()
-        .map(|cut| {
-            cut.moments
-                .get(&MomentType::Velocity)
-                .map(|velocity| dealias_velocity_grid(cut, velocity))
-        })
-        .collect();
+    let mut owned = vec![None; volume.cuts.len()];
+    for cut_index in rotation_velocity_cut_indices(volume) {
+        let cut = &volume.cuts[cut_index];
+        owned[cut_index] = cut
+            .moments
+            .get(&MomentType::Velocity)
+            .map(|velocity| dealias_velocity_grid(cut, velocity));
+    }
     let borrowed: Vec<Option<&MomentGrid>> = owned.iter().map(Option::as_ref).collect();
     detect_rotation_sites_from_dealiased(volume, &borrowed)
 }
@@ -205,22 +226,7 @@ pub fn detect_rotation_sites_from_dealiased(
     volume: &RadarVolume,
     dealiased_velocity: &[Option<&MomentGrid>],
 ) -> Vec<RotationSite> {
-    let mut velocity_cuts: Vec<usize> = volume
-        .cuts
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| {
-            c.moments.contains_key(&MomentType::Velocity)
-                && c.elevation_deg <= MAX_TILT_ELEVATION_DEG
-        })
-        .map(|(i, _)| i)
-        .collect();
-    velocity_cuts.sort_by(|a, b| {
-        volume.cuts[*a]
-            .elevation_deg
-            .total_cmp(&volume.cuts[*b].elevation_deg)
-    });
-    velocity_cuts.truncate(MAX_TILTS);
+    let velocity_cuts = rotation_velocity_cut_indices(volume);
     if velocity_cuts.len() < 2 {
         return Vec::new();
     }
@@ -242,15 +248,14 @@ pub fn detect_rotation_sites_from_dealiased(
 /// Diagnostic: per-tilt (elevation, 2D feature count, best rank) — for
 /// threshold tuning against real volumes.
 pub fn rotation_features_per_tilt(volume: &RadarVolume) -> Vec<(f32, usize, u8)> {
-    let owned: Vec<Option<MomentGrid>> = volume
-        .cuts
-        .iter()
-        .map(|cut| {
-            cut.moments
-                .get(&MomentType::Velocity)
-                .map(|velocity| dealias_velocity_grid(cut, velocity))
-        })
-        .collect();
+    let mut owned = vec![None; volume.cuts.len()];
+    for cut_index in rotation_velocity_cut_indices(volume) {
+        let cut = &volume.cuts[cut_index];
+        owned[cut_index] = cut
+            .moments
+            .get(&MomentType::Velocity)
+            .map(|velocity| dealias_velocity_grid(cut, velocity));
+    }
     let borrowed: Vec<Option<&MomentGrid>> = owned.iter().map(Option::as_ref).collect();
     rotation_features_per_tilt_from_dealiased(volume, &borrowed)
 }
@@ -260,22 +265,7 @@ pub fn rotation_features_per_tilt_from_dealiased(
     volume: &RadarVolume,
     dealiased_velocity: &[Option<&MomentGrid>],
 ) -> Vec<(f32, usize, u8)> {
-    let mut velocity_cuts: Vec<usize> = volume
-        .cuts
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| {
-            c.moments.contains_key(&MomentType::Velocity)
-                && c.elevation_deg <= MAX_TILT_ELEVATION_DEG
-        })
-        .map(|(i, _)| i)
-        .collect();
-    velocity_cuts.sort_by(|a, b| {
-        volume.cuts[*a]
-            .elevation_deg
-            .total_cmp(&volume.cuts[*b].elevation_deg)
-    });
-    velocity_cuts.truncate(MAX_TILTS);
+    let velocity_cuts = rotation_velocity_cut_indices(volume);
     velocity_cuts
         .iter()
         .map(|&cut_index| {

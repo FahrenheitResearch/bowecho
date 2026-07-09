@@ -49,8 +49,9 @@ use crate::{
     archive_object_scan_time_utc, best_cut_for_product, cache_dir, cut_start_time_utc,
     displayable_cuts_for_product, effective_worker_threads, fetch_intl_frame,
     is_displayable_on_cut, limit_archive_objects_for_event_loop,
-    load_archive_history_objects_parallel, normalized_history_limit, radar_color_image_from_rgba,
-    radar_texture_options, selected_grid_range_km_for, send_archive_progress, site_location,
+    load_archive_history_objects_parallel, normalized_history_limit,
+    previous_dealias_reference_volume, radar_color_image_from_rgba, radar_texture_options,
+    selected_grid_range_km_for, send_archive_progress, site_location,
     spawn_latest_level2_load_worker, sweep_cuts_for_history_entry, sweep_history_cut_at_or_before,
     texture_keys_match_data_and_style,
 };
@@ -1441,21 +1442,44 @@ impl ViewerApp {
             let color_table_signature = color_tables.signature_for_family(product.color_family());
             let render_dealiased_velocity = self.product_render_uses_dealiased_velocity(&product);
             let smoothing = self.smoothing_for_product(&product);
+            let carries_velocity_dealias =
+                render_dealiased_velocity || self.unfold_velocity_display;
+            let previous_volume = (self.dealias_engine == DealiasEngine::Analyst3d
+                && carries_velocity_dealias)
+                .then(|| {
+                    previous_dealias_reference_volume(
+                        &layer.engine.history,
+                        layer.engine.cursor.index,
+                        &volume,
+                    )
+                })
+                .flatten();
+            let dealias_reference_volume_ptr = if render_dealiased_velocity {
+                previous_volume
+                    .as_ref()
+                    .map(|reference| Arc::as_ptr(reference) as usize)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             // Same read-only RAP-profile lookup as the primary/pane request
-            // builders; overlay sites without a fetched profile (the usual
-            // case — fetches follow the DISPLAYED site) run v4's no-env path,
-            // exactly like the always-None previous_volume below.
+            // builders. Missing profiles run Analyst3d's explicit no-env
+            // degradation path; a later profile changes the keyed identity.
             let dealias_env = (self.dealias_engine == DealiasEngine::Analyst3d
-                && render_dealiased_velocity)
+                && carries_velocity_dealias)
                 .then(|| self.dealias_env_profile_for_volume(volume.as_ref()))
                 .flatten();
-            let dealias_env_ptr = dealias_env
-                .as_ref()
-                .map(|profile| Arc::as_ptr(profile) as usize)
-                .unwrap_or(0);
+            let dealias_env_ptr = if render_dealiased_velocity {
+                dealias_env
+                    .as_ref()
+                    .map(|profile| Arc::as_ptr(profile) as usize)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             let key = TextureKey {
                 volume_ptr: Arc::as_ptr(&volume) as usize,
-                dealias_reference_volume_ptr: 0,
+                dealias_reference_volume_ptr,
                 dealias_env_ptr,
                 cut,
                 product: product.clone(),
@@ -1503,7 +1527,7 @@ impl ViewerApp {
                     key,
                     lane: LaneId::Overlay(layer.engine.id.0),
                     volume,
-                    previous_volume: None,
+                    previous_volume,
                     dealias_env,
                     cut,
                     product,

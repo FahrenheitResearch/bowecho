@@ -33,6 +33,7 @@ pub use dealias_v4::{
 pub use detect::{
     RotationSite, RotationStrength, detect_rotation_sites, detect_rotation_sites_from_dealiased,
     rotation_features_per_tilt, rotation_features_per_tilt_from_dealiased,
+    rotation_velocity_cut_indices,
 };
 pub use gate_filter::apply_reflectivity_gate_filter;
 pub use gbvtd::{

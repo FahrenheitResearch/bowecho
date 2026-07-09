@@ -172,20 +172,40 @@ struct TiltShearField {
     max_gate: usize,
 }
 
+/// Ordered, bounded cut set consumed by the low-level track composite.
+pub fn low_level_azshear_cut_indices(volume: &RadarVolume) -> Vec<usize> {
+    let mut velocity_cuts: Vec<usize> = volume
+        .cuts
+        .iter()
+        .enumerate()
+        .filter(|(_, cut)| {
+            cut.moments.contains_key(&MomentType::Velocity)
+                && cut.elevation_deg <= LOW_LEVEL_MAX_TILT_DEG
+        })
+        .map(|(index, _)| index)
+        .collect();
+    velocity_cuts.sort_by(|left, right| {
+        volume.cuts[*left]
+            .elevation_deg
+            .total_cmp(&volume.cuts[*right].elevation_deg)
+    });
+    velocity_cuts.truncate(MAX_LOW_TILTS);
+    velocity_cuts
+}
+
 /// Resample one volume's low-level (0–2 km ARL) cyclonic azimuthal shear onto
 /// a radar-centered Cartesian grid (×10⁻³ s⁻¹; NaN = no coverage). Each cell
 /// pull-samples its nearest gate on every contributing tilt and keeps the
 /// maximum — one frame of the rotation-tracks accumulation.
 pub fn low_level_azshear_cartesian(volume: &RadarVolume, spec: &TracksGridSpec) -> Vec<f32> {
-    let owned: Vec<Option<MomentGrid>> = volume
-        .cuts
-        .iter()
-        .map(|cut| {
-            cut.moments
-                .get(&MomentType::Velocity)
-                .map(|velocity| dealias_velocity_grid(cut, velocity))
-        })
-        .collect();
+    let mut owned = vec![None; volume.cuts.len()];
+    for cut_index in low_level_azshear_cut_indices(volume) {
+        let cut = &volume.cuts[cut_index];
+        owned[cut_index] = cut
+            .moments
+            .get(&MomentType::Velocity)
+            .map(|velocity| dealias_velocity_grid(cut, velocity));
+    }
     let borrowed: Vec<Option<&MomentGrid>> = owned.iter().map(Option::as_ref).collect();
     low_level_azshear_cartesian_from_dealiased(volume, &borrowed, spec)
 }
@@ -417,22 +437,7 @@ fn low_level_tilt_fields_from_dealiased(
     volume: &RadarVolume,
     dealiased_velocity: &[Option<&MomentGrid>],
 ) -> Vec<TiltShearField> {
-    let mut velocity_cuts: Vec<usize> = volume
-        .cuts
-        .iter()
-        .enumerate()
-        .filter(|(_, cut)| {
-            cut.moments.contains_key(&MomentType::Velocity)
-                && cut.elevation_deg <= LOW_LEVEL_MAX_TILT_DEG
-        })
-        .map(|(index, _)| index)
-        .collect();
-    velocity_cuts.sort_by(|a, b| {
-        volume.cuts[*a]
-            .elevation_deg
-            .total_cmp(&volume.cuts[*b].elevation_deg)
-    });
-    velocity_cuts.truncate(MAX_LOW_TILTS);
+    let velocity_cuts = low_level_azshear_cut_indices(volume);
 
     let mut fields = Vec::new();
     for cut_index in velocity_cuts {

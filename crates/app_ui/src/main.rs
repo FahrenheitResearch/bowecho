@@ -29,8 +29,9 @@ use render2d::{
     detect_rotation_sites_from_dealiased, echo_top_grid, gust_proxy_grid_from_dealiased,
     hail_grids, identify_storm_cells, marc_grid_from_dealiased, mehs_grid,
     moment_cross_section_with_smoothing, poh_grid, radial_divergence_grid_from_dealiased,
-    reflectivity_cross_section_with_smoothing, smooth_moment_grid, storm_relative_velocity_mps,
-    upsample_moment_grid, velocity_cross_section_cached_with_smoothing, viewport_rgba_buffer_len,
+    reflectivity_cross_section_with_smoothing, rotation_velocity_cut_indices, smooth_moment_grid,
+    storm_relative_velocity_mps, upsample_moment_grid,
+    velocity_cross_section_cached_with_smoothing, viewport_rgba_buffer_len,
     viewport_sample_cache_storage_upper_bound, vil_density_grid, vil_grid,
 };
 use serde::Deserialize;
@@ -5930,24 +5931,51 @@ fn resolve_dealiased_volume_grids(
     dealias_env: Option<&Arc<EnvironmentalWindProfile>>,
     engine: DealiasEngine,
 ) -> Vec<Option<Arc<MomentGrid>>> {
-    volume
+    let cut_indices: Vec<usize> = volume
         .cuts
         .iter()
         .enumerate()
-        .map(|(cut_index, cut)| {
-            if cut.moments.contains_key(&MomentType::Velocity) {
-                resolve_dealiased_grid(
-                    volume,
-                    previous_volume,
-                    dealias_env,
-                    cut_index,
-                    engine,
-                )
-            } else {
-                None
-            }
+        .filter_map(|(cut_index, cut)| {
+            cut.moments
+                .contains_key(&MomentType::Velocity)
+                .then_some(cut_index)
         })
-        .collect()
+        .collect();
+    resolve_dealiased_cut_grids(
+        volume,
+        previous_volume,
+        dealias_env,
+        engine,
+        &cut_indices,
+    )
+}
+
+/// Resolve only the listed cuts while preserving a volume-aligned result
+/// vector. Rotation markers and tracks use their kernel-owned cut selectors so
+/// Analyst3d never pays whole-volume solve cost for tilts they will discard.
+fn resolve_dealiased_cut_grids(
+    volume: &Arc<RadarVolume>,
+    previous_volume: Option<&Arc<RadarVolume>>,
+    dealias_env: Option<&Arc<EnvironmentalWindProfile>>,
+    engine: DealiasEngine,
+    cut_indices: &[usize],
+) -> Vec<Option<Arc<MomentGrid>>> {
+    let mut grids = vec![None; volume.cuts.len()];
+    for &cut_index in cut_indices {
+        let Some(cut) = volume.cuts.get(cut_index) else {
+            continue;
+        };
+        if cut.moments.contains_key(&MomentType::Velocity) {
+            grids[cut_index] = resolve_dealiased_grid(
+                volume,
+                previous_volume,
+                dealias_env,
+                cut_index,
+                engine,
+            );
+        }
+    }
+    grids
 }
 
 #[derive(Clone, Debug)]
@@ -6996,7 +7024,7 @@ impl DisplayProduct {
         matches!(
             self,
             Self::DealiasedVelocity | Self::StormRelativeDealiasedVelocity
-        )
+        ) || matches!(self, Self::Derived(derived) if derived.uses_dealiased_velocity())
     }
 
     fn is_signed_radial_velocity(&self) -> bool {
@@ -13273,7 +13301,8 @@ impl ViewerApp {
         let frame = self.primary.history.get(step.frame_index)?;
         let cut = self.primary_cut_for_loop_step(step)?;
         let previous_volume = (self.dealias_engine == DealiasEngine::Analyst3d
-            && self.product_render_uses_dealiased_velocity(&self.selected_product))
+            && (self.product_render_uses_dealiased_velocity(&self.selected_product)
+                || self.unfold_velocity_display))
         .then(|| {
             previous_dealias_reference_volume(
                 &self.primary.history,
@@ -13299,7 +13328,8 @@ impl ViewerApp {
     ) -> Option<RenderRequest> {
         let volume = self.volume.clone()?;
         let previous_volume = (self.dealias_engine == DealiasEngine::Analyst3d
-            && self.product_render_uses_dealiased_velocity(&self.selected_product))
+            && (self.product_render_uses_dealiased_velocity(&self.selected_product)
+                || self.unfold_velocity_display))
         .then(|| {
             previous_dealias_reference_volume(
                 &self.primary.history,
@@ -13340,7 +13370,8 @@ impl ViewerApp {
         // prior against the ACTUAL rendered volume so Analyst3d never receives
         // that same complete frame as both target and "previous" anchor.
         let previous_volume = if self.dealias_engine == DealiasEngine::Analyst3d
-            && self.product_render_uses_dealiased_velocity(&self.selected_product)
+            && (self.product_render_uses_dealiased_velocity(&self.selected_product)
+                || self.unfold_velocity_display)
         {
             previous_dealias_reference_volume(
                 &self.primary.history,
@@ -13372,13 +13403,17 @@ impl ViewerApp {
                 0
             };
         let dealias_env = (self.dealias_engine == DealiasEngine::Analyst3d
-            && render_dealiased_velocity)
+            && (render_dealiased_velocity || self.unfold_velocity_display))
             .then(|| self.dealias_env_profile_for_volume(volume.as_ref()))
             .flatten();
-        let dealias_env_ptr = dealias_env
-            .as_ref()
-            .map(|profile| Arc::as_ptr(profile) as usize)
-            .unwrap_or(0);
+        let dealias_env_ptr = if render_dealiased_velocity {
+            dealias_env
+                .as_ref()
+                .map(|profile| Arc::as_ptr(profile) as usize)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let key = TextureKey {
             volume_ptr: Arc::as_ptr(&volume) as usize,
             dealias_reference_volume_ptr,
@@ -14192,6 +14227,22 @@ impl ViewerApp {
             .color_tables
             .signature_for_family(ColorTableFamily::Velocity);
         let velocity_render_dealiased = request.plain_velocity_render_dealiased;
+        let velocity_dealias_engine = if velocity_render_dealiased {
+            request.dealias_engine
+        } else {
+            DealiasEngine::Region
+        };
+        let velocity_context = DealiasContextKey::new(
+            velocity_dealias_engine,
+            request.previous_volume.as_ref(),
+            request.dealias_env.as_ref(),
+        );
+        let velocity_reference_ptr = velocity_render_dealiased
+            .then_some(velocity_context.reference_volume_ptr)
+            .unwrap_or(0);
+        let velocity_env_ptr = velocity_render_dealiased
+            .then_some(velocity_context.dealias_env_ptr)
+            .unwrap_or(0);
         let sample_cache_signature = RenderWorkerSampleCacheSignature::new(
             volume_ptr,
             cut,
@@ -14207,30 +14258,29 @@ impl ViewerApp {
         if Self::touch_moment_cache(
             moment_caches,
             volume_ptr,
-            0,
-            0,
+            velocity_reference_ptr,
+            velocity_env_ptr,
             cut,
             &MomentType::Velocity,
             velocity_render_dealiased,
             None,
             SmoothingMode::Native,
-            DealiasEngine::Region,
+            velocity_dealias_engine,
             i16::MIN,
             velocity_color_table_signature,
         )
         .is_none()
         {
             let cache = if velocity_render_dealiased {
-                // Prefetch warms a Region-dealiased velocity tilt; reuse the
-                // shared dealias memo so it costs nothing when the tilt was
-                // already dealiased for the displayed frame.
-                let key = DealiasGridKey::same_tilt(volume_ptr, cut, DealiasEngine::Region);
-                let witness = DealiasGridWitness::same_tilt(&request.volume);
-                match cached_dealias_grid(key, witness, || {
-                    let elevation_cut = request.volume.cuts.get(cut)?;
-                    let source = elevation_cut.moments.get(&MomentType::Velocity)?;
-                    Some(dealias_velocity_grid(elevation_cut, source))
-                }) {
+                // Warm the exact selected engine/anchor identity; the visible
+                // DVEL, derived products, markers, and readout all share it.
+                match resolve_dealiased_grid(
+                    &request.volume,
+                    request.previous_volume.as_ref(),
+                    request.dealias_env.as_ref(),
+                    cut,
+                    request.dealias_engine,
+                ) {
                     Some(grid) => {
                         ViewportMomentCache::new_dealiased_velocity_from_grid_with_color_tables(
                             request.volume.as_ref(),
@@ -14261,14 +14311,14 @@ impl ViewerApp {
                 cache_policy,
                 RenderWorkerMomentCache {
                     volume_ptr,
-                    reference_volume_ptr: 0,
-                    dealias_env_ptr: 0,
+                    reference_volume_ptr: velocity_reference_ptr,
+                    dealias_env_ptr: velocity_env_ptr,
                     cut,
                     moment: MomentType::Velocity,
                     dealiased_velocity: velocity_render_dealiased,
                     derived: None,
                     smoothing: SmoothingMode::Native,
-                    dealias_engine: DealiasEngine::Region,
+                    dealias_engine: velocity_dealias_engine,
                     gate_filter_decidbz: i16::MIN,
                     color_table_signature: velocity_color_table_signature,
                     cache,
@@ -15890,7 +15940,7 @@ impl ViewerApp {
         let render_dealiased_velocity = self.product_render_uses_dealiased_velocity(&product);
         let smoothing = self.smoothing_for_product(&product);
         let previous_volume = (self.dealias_engine == DealiasEngine::Analyst3d
-            && render_dealiased_velocity)
+            && (render_dealiased_velocity || self.unfold_velocity_display))
             .then(|| {
                 self.extra_panes.get(pane_slot).and_then(|pane| {
                     // The reference must come from the SAME history that
@@ -15926,13 +15976,17 @@ impl ViewerApp {
                 0
             };
         let dealias_env = (self.dealias_engine == DealiasEngine::Analyst3d
-            && render_dealiased_velocity)
+            && (render_dealiased_velocity || self.unfold_velocity_display))
             .then(|| self.dealias_env_profile_for_volume(volume.as_ref()))
             .flatten();
-        let dealias_env_ptr = dealias_env
-            .as_ref()
-            .map(|profile| Arc::as_ptr(profile) as usize)
-            .unwrap_or(0);
+        let dealias_env_ptr = if render_dealiased_velocity {
+            dealias_env
+                .as_ref()
+                .map(|profile| Arc::as_ptr(profile) as usize)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let key = TextureKey {
             volume_ptr: Arc::as_ptr(&volume) as usize,
             dealias_reference_volume_ptr,
@@ -16254,7 +16308,8 @@ impl ViewerApp {
         // The primary displayed volume + any extra pane's volume whose
         // product renders dealiased velocity.
         let mut wanted: Vec<Arc<RadarVolume>> = Vec::new();
-        if self.product_render_uses_dealiased_velocity(&self.selected_product)
+        if (self.product_render_uses_dealiased_velocity(&self.selected_product)
+            || self.unfold_velocity_display)
             && let Some(volume) = &self.volume
         {
             wanted.push(Arc::clone(volume));
@@ -16281,11 +16336,22 @@ impl ViewerApp {
             else {
                 continue;
             };
-            if self.product_render_uses_dealiased_velocity(&product)
+            if (self.product_render_uses_dealiased_velocity(&product)
+                || self.unfold_velocity_display)
                 && let Some(volume) = self.extra_pane_display_volume(pane_slot)
             {
                 wanted.push(volume);
             }
+        }
+        if self.product_render_uses_dealiased_velocity(&self.selected_product)
+            || self.unfold_velocity_display
+        {
+            wanted.extend(
+                self.radar_layers
+                    .iter()
+                    .filter(|layer| layer.visible)
+                    .filter_map(|layer| layer.volume.as_ref().map(Arc::clone)),
+            );
         }
         for volume in wanted {
             let site = &volume.site;
@@ -22179,7 +22245,9 @@ impl ViewerApp {
 
         // Contextual rows: exactly one family block at a time, gated on the
         // FOCUSED pane's product, so the tilt list below barely shifts.
-        if editing_product.is_signed_radial_velocity() {
+        if editing_product.is_signed_radial_velocity()
+            || editing_product.uses_dealiased_velocity()
+        {
             ui.horizontal(|ui| {
                 let plain_velocity =
                     matches!(editing_product, DisplayProduct::Moment(MomentType::Velocity));
@@ -22247,13 +22315,15 @@ impl ViewerApp {
                     ctx.request_repaint();
                 }
 
-                let changed = ui
-                    .checkbox(&mut self.flip_velocity_color_polarity, "Flip")
-                    .on_hover_text("Diagnostic: color positive velocity values with the negative side of the active velocity table, and vice versa (all panes)")
-                    .changed();
-                if changed {
-                    self.clear_texture();
-                    ctx.request_repaint();
+                if editing_product.is_signed_radial_velocity() {
+                    let changed = ui
+                        .checkbox(&mut self.flip_velocity_color_polarity, "Flip")
+                        .on_hover_text("Diagnostic: color positive velocity values with the negative side of the active velocity table, and vice versa (all panes)")
+                        .changed();
+                    if changed {
+                        self.clear_texture();
+                        ctx.request_repaint();
+                    }
                 }
             });
             // Honest anchor state for the model-anchored engine: which
@@ -34815,11 +34885,13 @@ impl ViewerApp {
         let key_for_worker = key.clone();
         let engine = self.dealias_engine;
         thread::spawn(move || {
-            let grids = resolve_dealiased_volume_grids(
+            let cut_indices = rotation_velocity_cut_indices(&volume);
+            let grids = resolve_dealiased_cut_grids(
                 &volume,
                 previous_volume.as_ref(),
                 dealias_env.as_ref(),
                 engine,
+                &cut_indices,
             );
             let borrowed: Vec<Option<&MomentGrid>> =
                 grids.iter().map(Option::as_deref).collect();
@@ -38496,17 +38568,18 @@ fn build_derived_moment_cache(
                 volume,
                 borrowed_dealiased.as_deref().unwrap_or_default(),
             ),
-            DerivedProduct::GustProxy => resolve_dealiased_grid(
-                volume,
-                previous_volume,
-                dealias_env,
-                base_idx,
-                dealias_engine,
-            )
-                .as_deref()
-                .and_then(|velocity| {
+            DerivedProduct::GustProxy => {
+                let velocity = resolve_dealiased_grid(
+                    volume,
+                    previous_volume,
+                    dealias_env,
+                    base_idx,
+                    dealias_engine,
+                );
+                velocity.as_deref().and_then(|velocity| {
                     gust_proxy_grid_from_dealiased(volume, base_idx, velocity)
-                }),
+                })
+            },
             DerivedProduct::AzimuthalShear | DerivedProduct::Divergence => {
                 unreachable!("velocity derivatives are per-cut")
             }

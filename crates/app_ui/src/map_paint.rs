@@ -2013,17 +2013,18 @@ impl ViewerApp {
                             volume,
                             borrowed_dealiased.as_deref().unwrap_or_default(),
                         ),
-                        DerivedProduct::GustProxy => resolve_dealiased_grid(
-                            volume,
-                            previous_volume.as_ref(),
-                            dealias_env.as_ref(),
-                            base_idx,
-                            self.dealias_engine,
-                        )
-                            .as_deref()
-                            .and_then(|velocity| {
+                        DerivedProduct::GustProxy => {
+                            let velocity = resolve_dealiased_grid(
+                                volume,
+                                previous_volume.as_ref(),
+                                dealias_env.as_ref(),
+                                base_idx,
+                                self.dealias_engine,
+                            );
+                            velocity.as_deref().and_then(|velocity| {
                                 gust_proxy_grid_from_dealiased(volume, base_idx, velocity)
-                            }),
+                            })
+                        },
                         DerivedProduct::AzimuthalShear | DerivedProduct::Divergence => None,
                     }?;
                     (base_idx, grid)
