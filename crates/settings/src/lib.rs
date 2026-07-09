@@ -984,7 +984,7 @@ impl Default for AppSettings {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LoadedAppSettings {
     pub settings: AppSettings,
     pub status: DocumentLoadStatus,
@@ -1049,10 +1049,11 @@ impl AppSettings {
                 let backup = backup_path(path);
                 match Self::read_from_path(&backup) {
                     Ok(settings) => {
-                        let restore_error = atomic_write_json(
+                        let restore_error = atomic_write_json_with_backup_validator(
                             path,
                             &settings,
                             MAX_JSON_DOCUMENT_BYTES,
+                            |text| serde_json::from_str::<Self>(text).is_ok(),
                         )
                         .err()
                         .map(|error| error.to_string());
@@ -1097,7 +1098,12 @@ impl AppSettings {
     pub fn save(&self) -> Result<(), PersistenceError> {
         let path = Self::config_path()
             .ok_or_else(|| PersistenceError::no_config_directory("config.json"))?;
-        atomic_write_json(&path, self, MAX_JSON_DOCUMENT_BYTES)
+        atomic_write_json_with_backup_validator(
+            &path,
+            self,
+            MAX_JSON_DOCUMENT_BYTES,
+            |text| serde_json::from_str::<Self>(text).is_ok(),
+        )
     }
 
     /// Best-effort in-memory compatibility parser used heavily by unit tests

@@ -193,11 +193,12 @@ impl DocumentLoadStatus {
 }
 
 pub fn backup_path(path: &Path) -> PathBuf {
-    let name = path
+    let mut name = path
         .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("settings.json");
-    path.with_file_name(format!("{name}.bak"))
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| std::ffi::OsString::from("settings.json"));
+    name.push(".bak");
+    path.with_file_name(name)
 }
 
 /// Read one UTF-8 document without trusting metadata or allowing an unbounded
@@ -244,9 +245,24 @@ pub fn atomic_write_json<T: Serialize>(
     value: &T,
     limit: u64,
 ) -> Result<(), PersistenceError> {
+    atomic_write_json_with_backup_validator(path, value, limit, |text| {
+        serde_json::from_str::<serde_json::Value>(text).is_ok()
+    })
+}
+
+pub fn atomic_write_json_with_backup_validator<T, F>(
+    path: &Path,
+    value: &T,
+    limit: u64,
+    valid_existing: F,
+) -> Result<(), PersistenceError>
+where
+    T: Serialize,
+    F: Fn(&str) -> bool,
+{
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| PersistenceError::serialize(path, error))?;
-    atomic_write_json_bytes(path, &bytes, limit)
+    atomic_write_json_bytes_with_backup_validator(path, &bytes, limit, valid_existing)
 }
 
 /// Publish already-validated JSON bytes. Existing primary bytes are copied to
@@ -257,6 +273,20 @@ pub fn atomic_write_json_bytes(
     bytes: &[u8],
     limit: u64,
 ) -> Result<(), PersistenceError> {
+    atomic_write_json_bytes_with_backup_validator(path, bytes, limit, |text| {
+        serde_json::from_str::<serde_json::Value>(text).is_ok()
+    })
+}
+
+pub fn atomic_write_json_bytes_with_backup_validator<F>(
+    path: &Path,
+    bytes: &[u8],
+    limit: u64,
+    valid_existing: F,
+) -> Result<(), PersistenceError>
+where
+    F: Fn(&str) -> bool,
+{
     if bytes.len() as u64 > limit {
         return Err(PersistenceError {
             action: PersistenceAction::WriteTemporary,
@@ -296,7 +326,7 @@ pub fn atomic_write_json_bytes(
 
     let valid_primary = read_text_capped(path, limit)
         .ok()
-        .filter(|text| serde_json::from_str::<serde_json::Value>(text).is_ok());
+        .filter(|text| valid_existing(text));
     let publish_result = publish_document(path, &temp_path, valid_primary.as_deref());
     if publish_result.is_err() {
         let _ = fs::remove_file(&temp_path);
@@ -402,8 +432,7 @@ fn publish_document(
     use std::os::windows::ffi::OsStrExt;
 
     use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH,
-        ReplaceFileW,
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, ReplaceFileW,
     };
 
     fn wide(path: &Path) -> Vec<u16> {
@@ -436,7 +465,7 @@ fn publish_document(
                 destination_wide.as_ptr(),
                 temp_wide.as_ptr(),
                 backup_ptr,
-                REPLACEFILE_WRITE_THROUGH,
+                0,
                 std::ptr::null(),
                 std::ptr::null(),
             )
@@ -507,7 +536,11 @@ mod tests {
 
     fn cleanup(path: &Path) {
         if let Some(parent) = path.parent() {
-            let _ = fs::remove_dir_all(parent);
+            if parent.is_dir() {
+                let _ = fs::remove_dir_all(parent);
+            } else {
+                let _ = fs::remove_file(parent);
+            }
         }
     }
 
@@ -522,6 +555,46 @@ mod tests {
             read_text_capped(&backup_path(&path), 1024).unwrap(),
             r#"{"version":1}"#
         );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn semantic_validator_never_replaces_good_backup_with_wrong_typed_json() {
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct TestDocument {
+            version: u64,
+        }
+        fn valid_test_document(text: &str) -> bool {
+            serde_json::from_str::<TestDocument>(text).is_ok()
+        }
+
+        let path = temp_path("semantic-backup");
+        atomic_write_json_with_backup_validator(
+            &path,
+            &TestDocument { version: 1 },
+            1024,
+            valid_test_document,
+        )
+        .unwrap();
+        atomic_write_json_with_backup_validator(
+            &path,
+            &TestDocument { version: 2 },
+            1024,
+            valid_test_document,
+        )
+        .unwrap();
+        fs::write(&path, br#"{"version":"wrong type"}"#).unwrap();
+
+        atomic_write_json_with_backup_validator(
+            &path,
+            &TestDocument { version: 3 },
+            1024,
+            valid_test_document,
+        )
+        .unwrap();
+        let backup: TestDocument =
+            serde_json::from_str(&read_text_capped(&backup_path(&path), 1024).unwrap()).unwrap();
+        assert_eq!(backup.version, 1);
         cleanup(&path);
     }
 

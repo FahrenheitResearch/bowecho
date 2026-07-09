@@ -1048,10 +1048,11 @@ pub fn save_to_path(
 ) -> Result<(), settings::PersistenceError> {
     let mut on_disk = settings.clone();
     on_disk.schema = STYLES_SCHEMA;
-    settings::atomic_write_json(
+    settings::atomic_write_json_with_backup_validator(
         path,
         &on_disk,
         settings::MAX_JSON_DOCUMENT_BYTES,
+        |text| serde_json::from_str::<StyleSettings>(text).is_ok(),
     )
 }
 
@@ -1088,10 +1089,11 @@ fn load_with_migrations(path: &Path, target_schema: u32, migrations: &[Migration
                     let restore_result = if decoded.migrated {
                         save_decoded_styles(&decoded.settings, path, target_schema)
                     } else {
-                        settings::atomic_write_json_bytes(
+                        settings::atomic_write_json_bytes_with_backup_validator(
                             path,
                             text.as_bytes(),
                             settings::MAX_JSON_DOCUMENT_BYTES,
+                            |text| serde_json::from_str::<StyleSettings>(text).is_ok(),
                         )
                     };
                     LoadedStyles {
@@ -1179,7 +1181,12 @@ fn save_decoded_styles(
 ) -> Result<(), settings::PersistenceError> {
     let mut on_disk = style_settings.clone();
     on_disk.schema = schema;
-    settings::atomic_write_json(path, &on_disk, settings::MAX_JSON_DOCUMENT_BYTES)
+    settings::atomic_write_json_with_backup_validator(
+        path,
+        &on_disk,
+        settings::MAX_JSON_DOCUMENT_BYTES,
+        |text| serde_json::from_str::<StyleSettings>(text).is_ok(),
+    )
 }
 
 #[cfg(test)]
