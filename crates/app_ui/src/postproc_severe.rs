@@ -472,7 +472,12 @@ mod tests {
     #[test]
     fn supercell_column_produces_positive_severe_suite() {
         // (p hPa, h m AGL, T C, Td C, u m/s, v m/s), surface first. Winds
-        // veer surface -> 6 km with ~35 m/s of deep shear.
+        // veer surface -> 6 km with ~35 m/s of deep shear. The isothermal
+        // stratosphere above 200 hPa matters: `met::thermo::el` reports an EL
+        // only where parcel buoyancy actually crosses zero (a column still
+        // buoyant at its top has no EL and lands the heavy-path 0.0), and
+        // this surface parcel stays warmer than the environment through the
+        // tropopause layers below.
         let column = [
             (1000.0, 0.0, 30.0, 23.0, -2.0, 2.0),
             (925.0, 700.0, 24.0, 20.0, 0.0, 8.0),
@@ -483,6 +488,8 @@ mod tests {
             (300.0, 9600.0, -38.0, -50.0, 34.0, 2.0),
             (250.0, 10800.0, -48.0, -62.0, 36.0, 0.0),
             (200.0, 12300.0, -55.0, -70.0, 34.0, -4.0),
+            (150.0, 14100.0, -58.0, -78.0, 30.0, -6.0),
+            (100.0, 16500.0, -58.0, -82.0, 26.0, -8.0),
         ];
         let grid = grid_from_column(3, 3, &column);
         let fields = compute(&inputs(&grid), &mut |_| {});
