@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Trimmed live capture of
+     https://tds.gdex.ucar.edu/thredds/catalog/files/g/d612005/future2D/208001/catalog.xml
+     (2026-07-09). The real catalog carries 744 wrf2d leaf datasets; this
+     fixture keeps the service block, the container dataset with its inherited
+     metadata, the first six real leaves (with their real dataSize/date), and
+     one SYNTHETIC non-data "dump" entry to prove the extension whitelist
+     drops it. -->
+<catalog xmlns="http://www.unidata.ucar.edu/namespaces/thredds/InvCatalog/v1.0" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.2">
+  <service name="all" serviceType="Compound" base="">
+    <service name="odap" serviceType="OpenDAP" base="/thredds/dodsC/" />
+    <service name="ncssGrid" serviceType="NetcdfSubset" base="/thredds/ncss/grid/" />
+    <service name="fileServer" serviceType="HTTPServer" base="/thredds/fileServer/" />
+  </service>
+  <dataset name="future2D/208001/">
+    <property name="DatasetScan" value="true" />
+    <metadata inherited="true">
+      <serviceName>all</serviceName>
+      <authority>edu.ucar.rda</authority>
+      <dataType>GRID</dataType>
+      <dataFormat>NetCDF</dataFormat>
+      <documentation type="Rights">Freely Available</documentation>
+    </metadata>
+    <dataset name="wrf2d_d01_2080-01-01_00:00:00.nc" ID="files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_00:00:00.nc" urlPath="files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_00:00:00.nc">
+      <dataSize units="Mbytes">163.7</dataSize>
+      <date type="modified">2024-03-25T21:34:51.095Z</date>
+    </dataset>
+    <dataset name="wrf2d_d01_2080-01-01_01:00:00.nc" ID="files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_01:00:00.nc" urlPath="files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_01:00:00.nc">
+      <dataSize units="Mbytes">493.5</dataSize>
+      <date type="modified">2024-03-25T21:34:52.646Z</date>
+    </dataset>
+    <dataset name="wrf2d_d01_2080-01-01_02:00:00.nc" ID="files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_02:00:00.nc" urlPath="files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_02:00:00.nc">
+      <dataSize units="Mbytes">502.9</dataSize>
+      <date type="modified">2024-03-25T21:34:54.137Z</date>
+    </dataset>
+    <dataset name="wrf2d_d01_2080-01-01_03:00:00.nc" ID="files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_03:00:00.nc" urlPath="files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_03:00:00.nc">
+      <dataSize units="Mbytes">512.9</dataSize>
+      <date type="modified">2024-03-25T21:34:58.362Z</date>
+    </dataset>
+    <dataset name="wrf2d_d01_2080-01-01_04:00:00.nc" ID="files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_04:00:00.nc" urlPath="files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_04:00:00.nc">
+      <dataSize units="Mbytes">520.6</dataSize>
+      <date type="modified">2024-03-25T21:35:00.287Z</date>
+    </dataset>
+    <dataset name="wrf2d_d01_2080-01-01_05:00:00.nc" ID="files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_05:00:00.nc" urlPath="files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_05:00:00.nc">
+      <dataSize units="Mbytes">526.9</dataSize>
+      <date type="modified">2024-03-25T21:35:02.100Z</date>
+    </dataset>
+    <dataset name="dump" ID="files/g/d612005/future2D/208001/dump" urlPath="files/g/d612005/future2D/208001/dump" />
+  </dataset>
+</catalog>

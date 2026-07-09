@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Trimmed live capture of
+     https://tds.gdex.ucar.edu/thredds/ncss/grid/files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_00:00:00.nc/dataset.xml
+     (2026-07-09). The real document lists 189 grids; this fixture keeps the
+     three axes, one gridSet with five representative real grids (with their
+     real units/desc), and the real coordTransform / LatLonBox / TimeSpan /
+     AcceptList trailers so the NCSS metadata parser can be exercised offline. -->
+<gridDataset location="/thredds/ncss/grid/files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_00:00:00.nc" path="path">
+  <axis name="y" shape="[1419]" type="double" axisType="GeoY">
+    <attribute xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="units" value="km" />
+    <values spacing="regularPoint" npts="1419" start="-2697.5251590323314" end="2974.4748409676686" resolution="4.0" />
+  </axis>
+  <axis name="x" shape="[1429]" type="double" axisType="GeoX">
+    <attribute xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="units" value="km" />
+    <values spacing="regularPoint" npts="1429" start="-1605.3747357778216" end="4106.625264222179" resolution="4.0" />
+  </axis>
+  <axis name="Time" shape="[1]" type="float" axisType="Time">
+    <attribute xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="units" value="minutes since 2080-01-01 00:00:00" />
+    <attribute xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="calendar" value="365_day" />
+    <values spacing="regularPoint" npts="1" start="0.0" end="0.0" />
+  </axis>
+  <gridSet name="Time y x">
+    <projectionBox>
+      <minx>-1607.3747357778216</minx>
+      <maxx>4108.625264222179</maxx>
+      <miny>-2699.5251590323314</miny>
+      <maxy>2976.4748409676686</maxy>
+    </projectionBox>
+    <axisRef name="Time" />
+    <axisRef name="y" />
+    <axisRef name="x" />
+    <coordTransRef name="Lambert" />
+    <grid name="ACDEWC" desc="acccumlated QDEWC" type="float">
+      <attribute xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="units" value="mm" />
+      <attribute xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="description" value="acccumlated QDEWC" />
+    </grid>
+    <grid name="T2" desc="TEMP at 2 M" type="float">
+      <attribute xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="units" value="K" />
+      <attribute xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="description" value="TEMP at 2 M" />
+    </grid>
+    <grid name="TK" desc="Air temperature at the lowest model level" type="float">
+      <attribute xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="units" value="K" />
+      <attribute xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="description" value="Air temperature at the lowest model level" />
+    </grid>
+    <grid name="U" desc="U at the lowest model level" type="float">
+      <attribute xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="units" value="m s-1" />
+      <attribute xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="description" value="U at the lowest model level" />
+    </grid>
+    <grid name="V" desc="V at the lowest model level" type="float">
+      <attribute xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="units" value="m s-1" />
+      <attribute xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="description" value="V at the lowest model level" />
+    </grid>
+  </gridSet>
+  <coordTransform name="Lambert" transformType="Projection">
+    <parameter xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="grid_mapping_name" value="lambert_conformal_conic" />
+    <parameter xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="latitude_of_projection_origin" type="double" value="46.900001525878906" />
+    <parameter xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="longitude_of_central_meridian" type="double" value="-116.0" />
+    <parameter xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="standard_parallel" type="double" value="35.0 60.0" />
+    <parameter xmlns="http://www.unidata.ucar.edu/namespaces/netcdf/ncml-2.2" name="earth_radius" type="double" value="6370000.0" />
+  </coordTransform>
+  <LatLonBox>
+    <west>-156.8905</west>
+    <east>-40.2612</east>
+    <south>15.0072</south>
+    <north>73.2915</north>
+  </LatLonBox>
+  <TimeSpan>
+    <begin>2080-01-01T00:00:00Z</begin>
+    <end>2080-01-01T00:00:00Z</end>
+  </TimeSpan>
+  <AcceptList>
+    <accept displayName="netcdf3">netcdf3</accept>
+  </AcceptList>
+</gridDataset>

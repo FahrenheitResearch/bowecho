@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<catalog xmlns="http://www.unidata.ucar.edu/namespaces/thredds/InvCatalog/v1.0" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.2">
+  <service name="all" serviceType="Compound" base="">
+    <service name="odap" serviceType="OpenDAP" base="/thredds/dodsC/" />
+    <service name="ncssGrid" serviceType="NetcdfSubset" base="/thredds/ncss/grid/" />
+    <service name="cdmremote" serviceType="CdmRemote" base="/thredds/cdmremote/" />
+    <service name="cdmrFeatureGrid" serviceType="CdmrFeature" base="/thredds/cdmrfeature/grid/" />
+    <service name="notebook" serviceType="JupyterNotebook" base="/thredds/notebook/" />
+    <service name="wcs" serviceType="WCS" base="/thredds/wcs/" />
+    <service name="wms" serviceType="WMS" base="/thredds/wms/" />
+    <service name="fileServer" serviceType="HTTPServer" base="/thredds/fileServer/" />
+    <service name="iso" serviceType="ISO" base="/thredds/iso/" />
+    <service name="ncml" serviceType="NCML" base="/thredds/ncml/" />
+    <service name="uddc" serviceType="UDDC" base="/thredds/uddc/" />
+  </service>
+  <dataset name="d612005 Files">
+    <property name="DatasetScan" value="true" />
+    <metadata inherited="true">
+      <serviceName>all</serviceName>
+      <authority>edu.ucar.rda</authority>
+      <dataType>GRID</dataType>
+      <dataFormat>NetCDF</dataFormat>
+      <documentation type="Rights">Freely Available</documentation>
+      <documentation xlink:href="http://rda.ucar.edu/datasets/d612005/" xlink:title="NCAR RDA - CONUS (Continental U.S.) II High Resolution Present and Future Climate Simulation(d612005)" />
+      <documentation type="summary">The CONUS II simulations aim to partially address both the need to capture inherent climate internal variability and greenhouse gas induced atmospheric variability by using the mean of the CMIP5 model for both present and historical mean climate as the CONUS boundary forcing. This forcing is applied to a 4km horizontal resolution Weather Research and Forecasting (WRF) model to produce a mesoscale hydro-climate of two 20-year runs covering a current period from 1996-2015 and a future period from 2080-2099 over the CONUS domain. The characteristics of these simulations are: 1) more realistic depiction of the mesoscale terrain features, critical to the successful simulation of mountainous precipitation, 2) the ability to realistically simulate the major summer precipitation producer in the central U.S. without the need of conventional cumulus parameterizations.</documentation>
+      <creator>
+        <name vocabulary="DIF">SUNY-ALBANY/CAS/DAES</name>
+        <contact url="none" />
+      </creator>
+      <creator>
+        <name vocabulary="DIF">UCAR/NCAR/RAL/HAP</name>
+        <contact url="none" />
+      </creator>
+      <publisher>
+        <name vocabulary="DIF">NCAR/RDA</name>
+        <contact url="http://rda.ucar.edu/" email="rdahelp@ucar.edu" />
+      </publisher>
+    </metadata>
+    <catalogRef xlink:href="INVARIANT/catalog.xml" xlink:title="INVARIANT" ID="files/g/d612005/INVARIANT" name="INVARIANT">
+      <property name="DatasetScan" value="true" />
+    </catalogRef>
+    <catalogRef xlink:href="future2D/catalog.xml" xlink:title="future2D" ID="files/g/d612005/future2D" name="future2D">
+      <property name="DatasetScan" value="true" />
+    </catalogRef>
+    <catalogRef xlink:href="future3D/catalog.xml" xlink:title="future3D" ID="files/g/d612005/future3D" name="future3D">
+      <property name="DatasetScan" value="true" />
+    </catalogRef>
+    <catalogRef xlink:href="hist2D/catalog.xml" xlink:title="hist2D" ID="files/g/d612005/hist2D" name="hist2D">
+      <property name="DatasetScan" value="true" />
+    </catalogRef>
+    <catalogRef xlink:href="hist3D/catalog.xml" xlink:title="hist3D" ID="files/g/d612005/hist3D" name="hist3D">
+      <property name="DatasetScan" value="true" />
+    </catalogRef>
+  </dataset>
+</catalog>
