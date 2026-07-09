@@ -190,18 +190,47 @@ impl DerivedSweepProduct {
             MomentType::Unknown(self.id().to_owned())
         }
     }
+
+    /// Products whose calibration or physical bounds change with transmit
+    /// wavelength. These must fail closed when the radar band is unknown;
+    /// silently applying the historical S-band default produces plausible
+    /// but scientifically incorrect QPE and attenuation fields.
+    pub const fn requires_known_radar_band(self) -> bool {
+        matches!(
+            self,
+            Self::Kdp
+                | Self::KdpUncertainty
+                | Self::SpecificAttenuation
+                | Self::PathIntegratedAttenuation
+                | Self::CorrectedReflectivity
+                | Self::SpecificDifferentialAttenuation
+                | Self::PathIntegratedDifferentialAttenuation
+                | Self::CorrectedDifferentialReflectivity
+                | Self::RainRateKdp
+                | Self::RainRateHybrid
+                | Self::KdpTexture
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RadarBand {
+    /// No trustworthy transmit frequency, network classification, or
+    /// site-specific metadata is available.
+    Unknown,
     S,
     C,
     X,
 }
 
 impl RadarBand {
+    pub const fn is_known(self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+
     fn rain_kdp_coefficients(self) -> (f32, f32) {
         match self {
+            Self::Unknown => (f32::NAN, f32::NAN),
             Self::S => (50.70, 0.8500),
             Self::C => (29.70, 0.8500),
             Self::X => (15.81, 0.7992),
@@ -213,6 +242,7 @@ impl RadarBand {
         // coefficient corrects horizontal reflectivity; the second corrects
         // differential reflectivity.
         match self {
+            Self::Unknown => (f32::NAN, f32::NAN),
             Self::S => (0.04, 0.004),
             Self::C => (0.08, 0.03),
             Self::X => (0.28, 0.04),
@@ -221,6 +251,10 @@ impl RadarBand {
 
     fn default_kdp_bounds(self) -> (f32, f32) {
         match self {
+            // PHIF is band-independent and shares the phase-bundle pass.
+            // Broad bounds let that pass run while band-sensitive outputs
+            // are filtered by `derive_cut_in_place` below.
+            Self::Unknown => (f32::NEG_INFINITY, f32::INFINITY),
             Self::S => (-2.0, 14.0),
             Self::C => (-2.0, 20.0),
             Self::X => (-2.0, 40.0),
@@ -491,7 +525,19 @@ pub fn derive_cut_in_place(
     config: &DerivationConfig,
 ) -> CutDerivationReport {
     let mut report = CutDerivationReport::default();
-    let requested = &config.products;
+    let mut allowed_products = config.products.clone();
+    if !config.band.is_known() {
+        for product in config
+            .products
+            .iter()
+            .copied()
+            .filter(|product| product.requires_known_radar_band())
+        {
+            allowed_products.remove(&product);
+            report.unavailable.push(product.id().to_owned());
+        }
+    }
+    let requested = &allowed_products;
     if requested.is_empty() {
         return report;
     }
@@ -2370,5 +2416,35 @@ mod tests {
     fn s_band_coefficients_match_reference_tables() {
         assert_eq!(RadarBand::S.rain_kdp_coefficients(), (50.70, 0.8500));
         assert_eq!(RadarBand::S.attenuation_coefficients(), (0.04, 0.004));
+    }
+
+    #[test]
+    fn unknown_band_blocks_band_sensitive_products_but_keeps_phif() {
+        let mut cut = cut_with_rows(1, 12, 250);
+        cut.moments.insert(
+            MomentType::DifferentialPhase,
+            f32_grid(
+                MomentType::DifferentialPhase,
+                vec![(0..12).map(|gate| gate as f32).collect()],
+                250,
+            ),
+        );
+        let config = DerivationConfig::with_products(
+            RadarBand::Unknown,
+            [
+                DerivedSweepProduct::Kdp,
+                DerivedSweepProduct::FilteredDifferentialPhase,
+                DerivedSweepProduct::RainRateKdp,
+            ],
+        );
+
+        let report = derive_cut_in_place(&mut cut, &config);
+
+        assert!(report.inserted.contains(&"PHIF".to_owned()));
+        assert!(report.unavailable.contains(&"KDP".to_owned()));
+        assert!(report.unavailable.contains(&"RATE_KDP".to_owned()));
+        assert!(!cut
+            .moments
+            .contains_key(&MomentType::SpecificDifferentialPhase));
     }
 }

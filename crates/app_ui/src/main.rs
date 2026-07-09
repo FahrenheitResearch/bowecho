@@ -76,6 +76,7 @@ mod obs_soundings;
 mod overlays;
 mod placefiles;
 mod product_select;
+mod radar_band;
 mod raster_quality;
 mod rhi;
 mod sat_paint;
@@ -1546,40 +1547,7 @@ fn derivation_config_for_volume(
     volume: &RadarVolume,
     products: impl IntoIterator<Item = product_engine::DerivedSweepProduct>,
 ) -> product_engine::DerivationConfig {
-    product_engine::DerivationConfig::with_products(radar_band_for_volume(volume), products)
-}
-
-fn radar_band_for_volume(volume: &RadarVolume) -> product_engine::RadarBand {
-    if let Some(mhz) = volume.metadata.radar_frequency_mhz {
-        return radar_band_for_frequency_mhz(mhz);
-    }
-    let site_id = volume.site.id.trim().to_ascii_uppercase();
-    if site_id.starts_with('T') && site_id.len() == 4 {
-        product_engine::RadarBand::C
-    } else if site_id.contains("DOW")
-        || site_id.contains("RAXPOL")
-        || site_id.contains("COW")
-        || site_id.contains("NOXP")
-    {
-        product_engine::RadarBand::X
-    } else if volume
-        .metadata
-        .compression
-        .as_deref()
-        .is_some_and(|source| source.contains("odim") || source.contains("cfradial"))
-    {
-        product_engine::RadarBand::C
-    } else {
-        product_engine::RadarBand::S
-    }
-}
-
-fn radar_band_for_frequency_mhz(mhz: u32) -> product_engine::RadarBand {
-    match mhz {
-        8000..=12_000 => product_engine::RadarBand::X,
-        4000..=7999 => product_engine::RadarBand::C,
-        _ => product_engine::RadarBand::S,
-    }
+    product_engine::DerivationConfig::with_products(radar_band::resolve(volume).band, products)
 }
 
 fn derive_advanced_products_for_volume_cut_arc(
@@ -1602,6 +1570,15 @@ fn derive_advanced_product_for_volume_cut_arc(
     cut_index: usize,
     product: product_engine::DerivedSweepProduct,
 ) -> Result<(Arc<RadarVolume>, usize), String> {
+    let band = radar_band::resolve(volume.as_ref());
+    if product.requires_known_radar_band() && !band.band.is_known() {
+        return Err(format!(
+            "{} unavailable: radar band is unknown for '{}' ({})",
+            product.display_name(),
+            volume.site.id,
+            band.provenance
+        ));
+    }
     derive_advanced_products_for_volume_cut_arc_with_config(
         volume,
         cut_index,
@@ -21988,8 +21965,9 @@ impl ViewerApp {
             if fixed_action_button(ui, "Derive advanced", 126.0)
                 .on_hover_text(
                     "Compute extended dual-pol/sweep products for the current visible tilt only. \
-                     KDP still derives automatically; this adds products like PHIF, RATE, \
-                     REF_TEX, TDS_SCORE, HAIL_SCORE, and TURB when source moments are available.",
+                     KDP derives automatically when PHI and trustworthy radar-band metadata are \
+                     available; this adds products like PHIF, RATE, REF_TEX, TDS_SCORE, \
+                     HAIL_SCORE, and TURB when their source data are available.",
                 )
                 .clicked()
             {
@@ -22017,7 +21995,10 @@ impl ViewerApp {
                     .contains_key(&MomentType::DifferentialReflectivity)
         });
         if !has_kdp && has_dual_pol_source {
-            ui.weak("KDP appears only when this decoded frame contains a KDP moment; many Level II scans provide PHI but not KDP.");
+            ui.weak(
+                "KDP requires either a native KDP moment or PHI plus trustworthy frequency/site \
+                 radar-band metadata; container type alone is not treated as a band.",
+            );
         }
 
         // Contextual rows: exactly one family block at a time, gated on the
