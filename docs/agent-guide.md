@@ -75,6 +75,61 @@ PINNED, UNMODIFIABLE deps (fix at app seams, never in them): rusty-weather crate
 - `docs/releases/` — shipped notes. `C:\Users\drew\radar-work\FABLE_BACKLOG.md` — owner's backlog/doc of record.
 - Open follow-ups usually live in the session task list; standing ideas: WRF description-attr fallback labels; radar forward-operator "next level" (Gaussian beam-broadening integration, attenuation, terrain blockage — wrf_radar.rs is the home, radar_core has the beam math); France radar (needs OAuth + BUFR — own project); KNMI 7-year archive (needs KNMI-native HDF5 decoder).
 
+## OPEN HANDOFF (2026-07-09): WRF severe/thermo processing — UNFINISHED
+
+Read this before touching WRF import. A prior Claude session (integration tip `6c00937`)
+diagnosed and half-solved this but did NOT deliver what the owner actually needs, and did NOT
+measure timing. Detailed notes: `C:\Users\drew\radar-work\wrf-severe-notes.md`.
+
+**What the owner wants:** process 1-to-hundreds of raw wrfouts and get CAPE / STP / EHI etc. via
+**wrf-rust (`wrf-core` getvar)**, as fast as wrf-rust allows. He explicitly does NOT want a
+SHARPpy/sharprs re-implementation for raw wrfouts — he wants the wrf-rust values.
+
+**The owner's actual files** (`C:\Users\drew\Downloads`, ~30+): mostly raw `wrfout_d03_*` at
+**1.4–2.5 GB each** (high-res inner domains), plus `wrf3d_d01_2087-04-27` (2.37 GB, POST-PROCESSED
+future: derived TK/Z/P, no raw T/PB) and a broken `.part`. These d03 grids are the SAME class the
+hard rules call "minutes per file / ~8.85 GB RAM peak" (Enderlin 800×800×79). This is the crux the
+prior session missed: "hundreds, fast" collides with the reality that `getvar` CAPE3D on a 2 GB
+grid is inherently minutes and many GB of RAM.
+
+**Two import paths** (know which the owner clicked):
+- LIGHT — quick "📄 WRF/NetCDF file…" / "📥 folder" buttons → `local_import.rs::spawn_import_paths`.
+  2-D surface fields + isobaric sounding volumes ONLY. No getvar, so NO CAPE/STP. This is what the
+  owner used and why he saw ~120 vars and no severe.
+- HEAVY wrf-rust — "🛠 …" buttons → `wrf_process.rs::spawn_process_paths`. `getvar` → full severe/
+  thermo suite. `wrf_core::variables::VARS` includes `stp` (default set), sbcape/mlcape/mucape,
+  srh1/srh3, bulk_shear, etc. `read_wrf_products` gates each getvar behind `should_process`
+  (wrf_process.rs ~L649), so a narrowed selection genuinely skips getvars.
+
+**What shipped at `6c00937` (integration, pushed `claude`):** a multi-select FILE picker for the
+wrf-rust heavy import (it was folder-only) + a "🛠 …whole folder" button + relabeled quick buttons
+("soundings only, no CAPE/STP"). `model_data.rs::import_pickers` + `gate_or_launch_heavy_import`
+helper. Gated node3: fmt clean / clippy 0 / test 1938/0/56 (baseline — the UI is desktop-cfg'd, so
+the change is NOT compiled on the Linux nodes; the Windows release build is its only compile check;
+it built). Exe: `Desktop\BowEcho v0.30.5 dev (wrf-rust severe).exe`.
+
+**What is NOT done / the real open problem:**
+1. **Timing was never measured** on the owner's files. Get a real number: run the heavy wrf-rust
+   import on ONE representative `wrfout_d03_*` (2 GB) and report per-file wall-clock + peak RAM,
+   then extrapolate to the batch. Can't run the app on Windows (hook blocks cargo except the
+   release build); options are a build-node run of the `RW_WRF_PROCESS_FIXTURE` ignored test with a
+   real file copied over (mind the ~2 GB transfer and node RAM), or instrument the import.
+2. **Fast-batch strategy for hundreds of 2 GB grids is unresolved.** wrf-rust getvar is minutes/file
+   sequential (sequential is mandatory — hard rule 4, all-core memory load has crashed the owner's
+   machine). Hundreds → hours. The fast alternative is a profile-based calc (`sharprs`, already used
+   by `oa_derived.rs` for the SPC mesoanalysis; seconds/file, strided, memory-safe) — but the owner
+   rejected sharprs for raw wrfouts. This is an OWNER DECISION: accept wrf-rust hours (add per-file
+   progress + batch ETA + a durable queue), use a fast profile calc, or a hybrid. Do not just pick.
+3. **Per-file elapsed + batch ETA readout** in the import UI is wanted for the queue-hundreds case.
+4. **The post-processed `wrf3d_d01_2087` file** routes to `try_postprocessed_wrf_shared` → currently
+   soundings only, NO severe (wrf-rust can't open it — no raw T/PB). A parked branch implements
+   sharprs severe for exactly this case: `feat/wrf-postproc-severe` @ `3521674` (UNVERIFIED, not
+   gated). Either finish/gate it or tell the owner that file is soundings-only.
+
+**Other unmerged branches:** `feat/gdex-ui` @ `6ec07f5` (GDEX Stage 1b in-app CONUS-II catalog
+browser, gated 1948/0/56 on node4 — ready to integrate); `feat/wrf-postproc-severe` @ `3521674`
+(parked sharprs, see above).
+
 ## Report style (what the owner expects)
 
 NO decorative emojis — not in chat, release notes, docs, or commit messages (strict house rule). Referencing literal in-app button labels that contain icons is fine; decorating prose is not.
