@@ -26,10 +26,10 @@
 //!
 //! Timestamps agree across products WITHIN a task (vol_z `PAYB` and vol_v
 //! `PAHB` share stamps) but differ BETWEEN tasks, so "newest common
-//! timestamp" cannot bind a frame. Instead the newest vol_z file anchors
-//! the frame and each product contributes its newest file per task inside
-//! a trailing freshness window sized to cover the slowest (10-minute)
-//! task. Parts are ordered task-major — full volumes (`Z`) first so the
+//! timestamp" cannot bind every supplemental cut. Instead the newest task-Z
+//! timestamp shared by required products anchors the frame; supplemental
+//! tasks are admitted only at exact timestamps shared by those products.
+//! Parts are ordered task-major — full volumes (`Z`) first so the
 //! 12-cut reflectivity PVOL is the merge base, then `B`, then `A`. The
 //! supplemental cuts either union in as new elevations (0.3°) or collide
 //! with a same-elevation full-volume cut of different gate geometry
@@ -46,6 +46,9 @@ const CHMI_SITES_ROOT: &str = "https://opendata.chmi.cz/meteorology/weather/rada
 /// Freshness window: must cover the 10-minute `A` task (plus jitter) but
 /// stay short enough that stale tasks drop out instead of showing old air.
 const FRESHNESS_WINDOW_MINUTES: i64 = 12;
+/// B/A normally land shortly after task Z. Admit normal upload jitter without
+/// stealing an early supplemental cut from the next cycle.
+const SUPPLEMENTAL_LEAD_MINUTES: i64 = 2;
 
 struct ChmiProduct {
     dir: &'static str,
@@ -149,10 +152,9 @@ impl IntlProvider for ChmiProvider {
             return Err(format!("CHMI: invalid site id '{site_id}'"));
         }
         let listings = fetch_product_listings(site_id)?;
-        // The newest vol_z file (any task) anchors the frame.
-        let Some(anchor) = listings[0].files.iter().map(|file| file.time).max() else {
+        let Some(anchor) = chmi_frame_anchors(&listings, 1).into_iter().next() else {
             return Err(format!(
-                "CHMI {}: could not resolve a frame anchor from {}",
+                "CHMI {}: no task-Z cycle shared by the required products in {}",
                 listings[0].dir, listings[0].dir_url
             ));
         };
@@ -184,7 +186,7 @@ impl RecentFrames for ChmiProvider {
             return Err(format!("CHMI: invalid site id '{site_id}'"));
         }
         let listings = fetch_product_listings(site_id)?;
-        let anchors = chmi_frame_anchors(&listings[0].files, count);
+        let anchors = chmi_frame_anchors(&listings, count);
         if anchors.is_empty() {
             return Err(format!(
                 "CHMI {}: could not resolve a frame anchor from {}",
@@ -193,12 +195,6 @@ impl RecentFrames for ChmiProvider {
         }
         let mut plans = Vec::with_capacity(anchors.len());
         for (index, anchor) in anchors.iter().enumerate() {
-            // An older window without a task-Z file would assemble a frame
-            // of supplemental single cuts only; drop it. (The newest frame
-            // is exempt: it must stay byte-for-byte what `latest` builds.)
-            if index > 0 && !window_has_full_volume(&listings[0].files, *anchor) {
-                continue;
-            }
             match assemble_frame(site_id, *anchor, &listings) {
                 Ok(plan) => plans.push(plan),
                 // The newest frame is the poll dedupe key: its failure is
@@ -257,51 +253,38 @@ fn fetch_product_listings(site_id: &str) -> Result<Vec<ChmiProductListing>, Stri
     Ok(listings)
 }
 
-/// Frame anchors, NEWEST FIRST, walked back through the full-volume scan
-/// cycles: the newest anchor is the newest `vol_z` time overall (exactly
-/// the anchor `latest` uses, so the newest frame's identity matches); each
-/// older anchor is the newest `vol_z` time strictly before the previous
-/// anchor's cycle start, where a cycle starts at its task-`Z` (5-minute
-/// full volume) file time. Stops early when the listing runs out of
-/// full-volume cycles.
-fn chmi_frame_anchors(vol_z: &[ChmiFile], count: usize) -> Vec<NaiveDateTime> {
-    let Some(newest) = vol_z.iter().map(|file| file.time).max() else {
+/// Task-Z full-volume timestamps shared by every required product, NEWEST
+/// FIRST. A supplemental B/A file can appear before the next Z upload; it is
+/// never allowed to advance the frame generation on its own.
+fn chmi_frame_anchors(
+    listings: &[ChmiProductListing],
+    count: usize,
+) -> Vec<NaiveDateTime> {
+    let Some(base) = listings.first() else {
         return Vec::new();
     };
-    let mut z_times: Vec<NaiveDateTime> = vol_z
+    let mut anchors: Vec<NaiveDateTime> = base
+        .files
         .iter()
         .filter(|file| file.task == 'Z')
+        .filter(|file| {
+            listings
+                .iter()
+                .filter(|listing| listing.required)
+                .all(|listing| {
+                    listing
+                        .files
+                        .iter()
+                        .any(|candidate| candidate.task == 'Z' && candidate.time == file.time)
+                })
+        })
         .map(|file| file.time)
         .collect();
-    z_times.sort_unstable();
-    let mut anchors = vec![newest];
-    while anchors.len() < count.max(1) {
-        let previous = *anchors.last().expect("anchors starts non-empty");
-        // The Z start of the cycle the previous anchor belongs to ...
-        let Some(cycle_start) = z_times.iter().rev().find(|time| **time <= previous) else {
-            break;
-        };
-        // ... bounds the next-older cycle: its anchor is the newest vol_z
-        // time (any task) strictly before that Z start.
-        let Some(older) = vol_z
-            .iter()
-            .map(|file| file.time)
-            .filter(|time| time < cycle_start)
-            .max()
-        else {
-            break;
-        };
-        anchors.push(older);
-    }
+    anchors.sort_unstable();
+    anchors.dedup();
+    anchors.reverse();
+    anchors.truncate(count.max(1));
     anchors
-}
-
-/// Whether the freshness window ending at `anchor` holds a task-`Z` full
-/// volume — the merge base a CHMI frame is built on.
-fn window_has_full_volume(vol_z: &[ChmiFile], anchor: NaiveDateTime) -> bool {
-    freshest_per_task(vol_z, anchor)
-        .iter()
-        .any(|file| file.task == 'Z')
 }
 
 /// Assemble the frame anchored at `anchor` from already-fetched product
@@ -312,19 +295,57 @@ fn assemble_frame(
     anchor: NaiveDateTime,
     listings: &[ChmiProductListing],
 ) -> Result<FramePlan, String> {
+    let Some(base_listing) = listings.first() else {
+        return Err(format!("CHMI {site_id}: no product listings to assemble"));
+    };
+    let coherent_tasks: Vec<ChmiFile> = freshest_per_task(&base_listing.files, anchor)
+        .into_iter()
+        .filter(|base_file| {
+            listings
+                .iter()
+                .filter(|listing| listing.required)
+                .all(|listing| {
+                    listing.files.iter().any(|file| {
+                        file.task == base_file.task && file.time == base_file.time
+                    })
+                })
+        })
+        .collect();
+    if !coherent_tasks
+        .iter()
+        .any(|file| file.task == 'Z' && file.time == anchor)
+    {
+        return Err(format!(
+            "CHMI {site_id}: task-Z cycle {anchor} is not complete across required products"
+        ));
+    }
+
     let mut picks: Vec<(usize, ChmiFile, &str)> = Vec::new();
     for listing in listings {
-        let fresh = freshest_per_task(&listing.files, anchor);
-        if listing.required && fresh.is_empty() {
+        let coherent: Vec<ChmiFile> = coherent_tasks
+            .iter()
+            .filter_map(|task| {
+                listing
+                    .files
+                    .iter()
+                    .find(|file| file.task == task.task && file.time == task.time)
+                    .cloned()
+            })
+            .collect();
+        if listing.required
+            && !coherent
+                .iter()
+                .any(|file| file.task == 'Z' && file.time == anchor)
+        {
             return Err(format!(
-                "CHMI {}/{site_id}: no files within {FRESHNESS_WINDOW_MINUTES} minutes \
-                 of the frame anchor {anchor} ({} files inspected)",
+                "CHMI {}/{site_id}: no task-Z file for coherent cycle {anchor} \
+                 ({} files inspected)",
                 listing.dir,
                 listing.files.len()
             ));
         }
         picks.extend(
-            fresh
+            coherent
                 .into_iter()
                 .map(|file| (listing.product_rank, file, listing.dir_url.as_str())),
         );
@@ -391,13 +412,14 @@ fn parse_chmi_files(entries: &[ListingEntry]) -> Vec<ChmiFile> {
         .collect()
 }
 
-/// Newest file per scan task within the freshness window ending at
-/// `anchor`, unordered (the caller sorts the combined picks).
+/// Newest file per scan task from the trailing freshness window through the
+/// small post-Z upload allowance, unordered (the caller sorts the picks).
 fn freshest_per_task(files: &[ChmiFile], anchor: NaiveDateTime) -> Vec<ChmiFile> {
     let window_start = anchor - chrono::Duration::minutes(FRESHNESS_WINDOW_MINUTES);
+    let window_end = anchor + chrono::Duration::minutes(SUPPLEMENTAL_LEAD_MINUTES);
     let mut newest_per_task: Vec<ChmiFile> = Vec::new();
     for file in files {
-        if file.time < window_start || file.time > anchor {
+        if file.time < window_start || file.time > window_end {
             continue;
         }
         match newest_per_task
@@ -486,8 +508,13 @@ mod tests {
     #[test]
     fn anchor_and_window_pick_the_newest_file_of_each_task() {
         let vol_z = parse_chmi_files(&parse_autoindex(BRD_VOL_Z));
-        let anchor = vol_z.iter().map(|file| file.time).max().expect("anchor");
-        assert_eq!(anchor, timestamp("20260612064025"));
+        let anchor = vol_z
+            .iter()
+            .filter(|file| file.task == 'Z')
+            .map(|file| file.time)
+            .max()
+            .expect("full-volume anchor");
+        assert_eq!(anchor, timestamp("20260612063911"));
 
         let mut picks = freshest_per_task(&vol_z, anchor);
         picks.sort_by_key(|file| task_rank(file.task));
@@ -538,6 +565,30 @@ mod tests {
     }
 
     #[test]
+    fn supplemental_file_from_the_next_cycle_cannot_advance_current_frame() {
+        let files = vec![
+            ChmiFile {
+                task: 'Z',
+                time: timestamp("20260612064000"),
+                name: "z-current.hdf".to_owned(),
+            },
+            ChmiFile {
+                task: 'B',
+                time: timestamp("20260612064100"),
+                name: "b-current.hdf".to_owned(),
+            },
+            ChmiFile {
+                task: 'B',
+                time: timestamp("20260612064600"),
+                name: "b-next.hdf".to_owned(),
+            },
+        ];
+        let picks = freshest_per_task(&files, timestamp("20260612064000"));
+        assert!(picks.iter().any(|file| file.name == "b-current.hdf"));
+        assert!(!picks.iter().any(|file| file.name == "b-next.hdf"));
+    }
+
+    #[test]
     fn task_order_puts_the_full_volume_first() {
         assert!(task_rank('Z') < task_rank('B'));
         assert!(task_rank('B') < task_rank('A'));
@@ -553,48 +604,44 @@ mod tests {
         assert!(provider.supports_recent());
     }
 
-    /// Anchors walk full-volume (task Z) cycles NEWEST FIRST, and the
-    /// newest anchor is exactly the anchor `latest` uses — the newest
-    /// vol_z time of any task — so the loop's last frame is the poll
-    /// dedupe key.
+    /// Anchors walk task-Z cycles NEWEST FIRST and require the full-volume
+    /// timestamp to be present in both required products.
     #[test]
     fn frame_anchors_walk_full_volume_cycles_newest_first() {
-        let vol_z = parse_chmi_files(&parse_autoindex(BRD_VOL_Z));
-        let latest_anchor = vol_z.iter().map(|file| file.time).max().expect("anchor");
+        let listings = fixture_listings();
+        let latest_anchor = timestamp("20260612063911");
 
-        assert_eq!(chmi_frame_anchors(&vol_z, 1), vec![latest_anchor]);
+        assert_eq!(chmi_frame_anchors(&listings, 1), vec![latest_anchor]);
         assert_eq!(
-            chmi_frame_anchors(&vol_z, 3),
+            chmi_frame_anchors(&listings, 3),
             vec![
-                timestamp("20260612064025"),
-                timestamp("20260612063526"),
-                timestamp("20260612063025"),
+                timestamp("20260612063911"),
+                timestamp("20260612063412"),
+                timestamp("20260612062914"),
             ]
         );
-        // The listing bottoms out: asking for more stops at the oldest
-        // cycle boundary instead of inventing frames.
         assert_eq!(
-            chmi_frame_anchors(&vol_z, 99),
+            chmi_frame_anchors(&listings, 99),
             vec![
-                timestamp("20260612064025"),
-                timestamp("20260612063526"),
-                timestamp("20260612063025"),
-                timestamp("20260612062526"),
-                timestamp("20260612061959"),
+                timestamp("20260612063911"),
+                timestamp("20260612063412"),
+                timestamp("20260612062914"),
+                timestamp("20260612062411"),
             ]
         );
         assert!(chmi_frame_anchors(&[], 3).is_empty());
     }
 
-    /// The trailing anchor (06:19:59) has no task-Z full volume inside its
-    /// freshness window — a frame there would be supplemental cuts only —
-    /// and the full-volume filter drops it.
     #[test]
-    fn windows_without_a_full_volume_are_detected() {
-        let vol_z = parse_chmi_files(&parse_autoindex(BRD_VOL_Z));
-        assert!(window_has_full_volume(&vol_z, timestamp("20260612064025")));
-        assert!(window_has_full_volume(&vol_z, timestamp("20260612062526")));
-        assert!(!window_has_full_volume(&vol_z, timestamp("20260612061959")));
+    fn newest_full_volume_missing_from_velocity_falls_back_to_prior_cycle() {
+        let mut listings = fixture_listings();
+        listings[1]
+            .files
+            .retain(|file| !(file.task == 'Z' && file.time == timestamp("20260612063911")));
+        assert_eq!(
+            chmi_frame_anchors(&listings, 1),
+            vec![timestamp("20260612063412")]
+        );
     }
 
     fn fixture_listings() -> Vec<ChmiProductListing> {
@@ -624,14 +671,14 @@ mod tests {
     #[test]
     fn older_anchors_assemble_full_frames_from_the_same_listings() {
         let listings = fixture_listings();
-        let anchors = chmi_frame_anchors(&listings[0].files, 2);
+        let anchors = chmi_frame_anchors(&listings, 2);
         assert_eq!(anchors.len(), 2);
 
         let newest = assemble_frame("brd", anchors[0], &listings).expect("newest frame");
-        assert!(newest.identity.starts_with("brd_20260612064025_p6_h"));
+        assert!(newest.identity.starts_with("brd_20260612063911_p6_h"));
 
         let older = assemble_frame("brd", anchors[1], &listings).expect("older frame");
-        assert!(older.identity.starts_with("brd_20260612063526_p6_h"));
+        assert!(older.identity.starts_with("brd_20260612063412_p6_h"));
         assert_ne!(older.identity, newest.identity);
         assert!(older.merge);
         // Task-major order, vol_z before vol_v inside each task; the older

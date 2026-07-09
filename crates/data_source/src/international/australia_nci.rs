@@ -463,16 +463,34 @@ fn latest_frame(site_id: &str) -> Option<TarlistFrame> {
 }
 
 fn recent_frames(site_id: &str, count: usize) -> Vec<TarlistFrame> {
+    let newest_days = candidate_dates(RECENT_LOOKBACK_DAYS)
+        .into_iter()
+        .filter_map(|date| tarlist_frames(site_id, date).ok());
+    newest_recent_frames_from_days(newest_days, count)
+}
+
+/// Fold day listings supplied NEWEST FIRST and stop once the requested newest
+/// tail is known. Keeping this order is important for NCI's multi-day ingest
+/// lag: walking the dates oldest-first and breaking early returns the oldest
+/// lookback day instead of the newest available scans.
+fn newest_recent_frames_from_days(
+    days: impl IntoIterator<Item = Vec<TarlistFrame>>,
+    count: usize,
+) -> Vec<TarlistFrame> {
+    if count == 0 {
+        return Vec::new();
+    }
     let mut frames = Vec::new();
-    for date in candidate_dates(RECENT_LOOKBACK_DAYS).into_iter().rev() {
-        if let Ok(day_frames) = tarlist_frames(site_id, date) {
-            frames.extend(day_frames);
-        }
+    for day_frames in days {
+        frames.extend(day_frames);
+        frames.sort_by_key(|frame| frame.timestamp);
+        frames.dedup_by(|left, right| left.file_name == right.file_name);
         if frames.len() >= count {
             break;
         }
     }
-    frames
+    let skip = frames.len().saturating_sub(count);
+    frames.split_off(skip)
 }
 
 fn candidate_dates(lookback_days: u64) -> Vec<NaiveDate> {
@@ -632,6 +650,27 @@ id,id_long,WIGOS,short_name,location,radar_type,postchange_start,prechange_end,s
         assert!(sites.len() > 60);
         assert!(sites.iter().any(|site| site.site_id == "2"));
         assert!(sites.iter().any(|site| site.site_id == "71"));
+    }
+
+    #[test]
+    fn recent_day_fold_stops_on_the_newest_day_not_the_oldest_lookback_day() {
+        let newest_day = vec![
+            tarlist_frame("20260625_000000"),
+            tarlist_frame("20260625_000500"),
+            tarlist_frame("20260625_001000"),
+        ];
+        let older_day = vec![
+            tarlist_frame("20260624_235000"),
+            tarlist_frame("20260624_235500"),
+        ];
+        let frames = newest_recent_frames_from_days([newest_day, older_day], 2);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.timestamp.format("%Y%m%d_%H%M%S").to_string())
+                .collect::<Vec<_>>(),
+            vec!["20260625_000500".to_owned(), "20260625_001000".to_owned()]
+        );
     }
 
     /// One TarlistFrame with the given `yyyymmdd_hhmmss` stamp, in the
