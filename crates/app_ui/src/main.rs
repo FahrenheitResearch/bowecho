@@ -1331,10 +1331,12 @@ fn bowecho_native_options(
             // window made every floating viewer (Model, Sounding, ...) feel
             // cramped and need stretching. eframe is built without the
             // `persistence` feature, so no saved geometry is being overridden —
-            // this default applies on every launch. `inner_size` remains the
-            // restore-down size; `min_inner_size` is untouched.
+            // this default applies on every launch. No explicit inner_size:
+            // pairing it with `with_maximized` left the window at 1500x950 on
+            // Windows instead of filling the screen (winit quirk); the App's
+            // first-frame ViewportCommand::Maximized backs this up regardless.
+            // `min_inner_size` is the floor for a manual restore-down.
             .with_maximized(true)
-            .with_inner_size([1500.0, 950.0])
             .with_min_inner_size([1120.0, 700.0])
             .with_icon(icon),
         renderer,
@@ -2796,6 +2798,11 @@ struct ViewerApp {
     /// Model-data dock (rusty-weather rw-ui panels), created on first open.
     model_dock: Option<model_data::ModelDataDock>,
     model_dock_open: bool,
+    /// One-shot latch for the startup maximize: eframe's builder maximize is
+    /// unreliable on Windows when combined with an explicit inner size, so we
+    /// also send a ViewportCommand::Maximized on the first frame. Sent once so
+    /// the user can freely restore/resize the window afterward.
+    initial_maximize_done: bool,
     model_timeline_follow: bool,
     model_timeline_last_key: Option<rw_ui::HourKey>,
     /// GOES satellite frame as a map layer (under everything weather).
@@ -7873,6 +7880,7 @@ impl ViewerApp {
             workspace: dock::Workspace::default(),
             model_dock: None,
             model_dock_open: false,
+            initial_maximize_done: false,
             model_timeline_follow: false,
             model_timeline_last_key: None,
             sat_layer: None,
@@ -18265,6 +18273,15 @@ impl ViewerApp {
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Startup maximize: the ViewportBuilder `with_maximized(true)` is honored
+        // on this winit build, but on Windows it can leave the window at its
+        // restore size rather than filling the work area. Send the command once
+        // on the first frame so the window reliably opens maximized; the latch
+        // means the user can restore/resize freely afterward.
+        if !self.initial_maximize_done {
+            self.initial_maximize_done = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
         self.poll_async_site_catalog(&ctx);
         self.poll_async_load(&ctx);
         self.poll_extra_pane_loads(&ctx);
@@ -60935,6 +60952,7 @@ mod tests {
             workspace: dock::Workspace::default(),
             model_dock: None,
             model_dock_open: false,
+            initial_maximize_done: false,
             model_timeline_follow: false,
             model_timeline_last_key: None,
             sat_layer: None,
