@@ -682,14 +682,14 @@ mod tests {
             older
         );
 
-        // The oldest fixture cycle (ending 06:34:02) predates the velocity
-        // fixture's retention: every required vradh sweep is missing there.
+        // The oldest fixture cycle (ending 06:34:02) predates complete
+        // retention: reflectivity has already lost sweep 00 (and velocity has
+        // lost the whole cycle), so the first incomplete required product is
+        // rejected.
         let err = assemble_cycle("asb", anchors[2], &products).unwrap_err();
         assert!(
-            err.contains("'vradh' cycle ending")
-                && err.contains(
-                    "missing expected sweep indices 00, 01, 02, 03, 04, 05, 06, 07, 08, 09"
-                ),
+            err.contains("'th' cycle ending")
+                && err.contains("missing expected sweep indices 00"),
             "unexpected error: {err}"
         );
 
