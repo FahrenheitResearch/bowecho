@@ -7149,10 +7149,14 @@ enum WorkflowPreset {
     ArchiveReview,
     Documentation,
     ModelContext,
+    SimulatedRadar,
+    Satellite,
+    Tropical,
+    UpperAir,
 }
 
 impl WorkflowPreset {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 11] = [
         Self::LiveSevere,
         Self::TripleSevere,
         Self::VelocityCouplet,
@@ -7160,6 +7164,10 @@ impl WorkflowPreset {
         Self::ArchiveReview,
         Self::Documentation,
         Self::ModelContext,
+        Self::SimulatedRadar,
+        Self::Satellite,
+        Self::Tropical,
+        Self::UpperAir,
     ];
 
     fn label(self) -> &'static str {
@@ -7171,6 +7179,10 @@ impl WorkflowPreset {
             Self::ArchiveReview => "Archive review",
             Self::Documentation => "Documentation",
             Self::ModelContext => "Model context",
+            Self::SimulatedRadar => "Simulated radar",
+            Self::Satellite => "Satellite",
+            Self::Tropical => "Tropical",
+            Self::UpperAir => "Upper air",
         }
     }
 
@@ -7194,6 +7206,18 @@ impl WorkflowPreset {
             }
             Self::ModelContext => {
                 "Open the model workflow with obs adjustment and map context layers ready"
+            }
+            Self::SimulatedRadar => {
+                "Data tab, single map pane, model dock, and Vrot armed for imported WRF synthetic radar"
+            }
+            Self::Satellite => {
+                "Open the satellite window with the map overlay following the player on a single pane"
+            }
+            Self::Tropical => {
+                "Active tropical cyclones with the storm-cards window and map overlay on a single pane"
+            }
+            Self::UpperAir => {
+                "Two-pane model workflow with skew-T ready for 925-250 mb isobaric analysis"
             }
         }
     }
@@ -7413,6 +7437,11 @@ struct WorkflowSnapshot {
     model_enabled: bool,
     model_download_open: bool,
     model_viewer_mode: dock::ViewerMode,
+    satellite_viewer_mode: dock::ViewerMode,
+    sounding_viewer_mode: dock::ViewerMode,
+    sat_map_follow: bool,
+    show_tropical: bool,
+    show_tropical_panel: bool,
     show_rotation_markers: bool,
     show_storm_tracks: bool,
     show_inspector_card: bool,
@@ -18974,6 +19003,42 @@ impl ViewerApp {
                 self.obs_adjust_soundings = true;
                 self.glm_enabled = true;
             }
+            WorkflowPreset::SimulatedRadar => {
+                // Can't import a file for the user; set the desk up for WRF
+                // synthetic-radar work (import + virtual-radar site live in the
+                // model dock) and arm Vrot for the sim-supercell couplets.
+                self.set_workflow_layout(PanelLayout::One);
+                self.sidebar_tab = SidebarTab::Data;
+                self.model_enabled = true;
+                self.open_viewer(dock::WorkspacePane::Model);
+                self.show_inspector_card = true;
+                self.vrot_tool_armed = true;
+                self.vrot_points.clear();
+            }
+            WorkflowPreset::Satellite => {
+                self.set_workflow_layout(PanelLayout::One);
+                self.sidebar_tab = SidebarTab::Layers;
+                self.open_viewer(dock::WorkspacePane::Satellite);
+                // Once a run loads, the map overlay tracks the player frame.
+                self.sat_map_follow = true;
+                self.show_inspector_card = true;
+            }
+            WorkflowPreset::Tropical => {
+                self.set_workflow_layout(PanelLayout::One);
+                self.sidebar_tab = SidebarTab::Layers;
+                self.app_settings.show_tropical = true;
+                self.app_settings.show_tropical_panel = true;
+            }
+            WorkflowPreset::UpperAir => {
+                self.set_workflow_layout(PanelLayout::TwoVertical);
+                self.sidebar_tab = SidebarTab::Layers;
+                self.model_enabled = true;
+                self.open_viewer(dock::WorkspacePane::Model);
+                // Skew-T front door; opens with instructions until an
+                // Alt-click launches a sounding over imported model data.
+                self.open_viewer(dock::WorkspacePane::Sounding);
+                self.obs_adjust_soundings = true;
+            }
         }
         self.current_workflow = Some(preset);
         self.status = format!("Workflow: {}", preset.label());
@@ -19012,6 +19077,11 @@ impl ViewerApp {
             model_enabled: self.model_enabled,
             model_download_open: self.model_download_open,
             model_viewer_mode: self.viewer_mode(dock::WorkspacePane::Model),
+            satellite_viewer_mode: self.viewer_mode(dock::WorkspacePane::Satellite),
+            sounding_viewer_mode: self.viewer_mode(dock::WorkspacePane::Sounding),
+            sat_map_follow: self.sat_map_follow,
+            show_tropical: self.app_settings.show_tropical,
+            show_tropical_panel: self.app_settings.show_tropical_panel,
             show_rotation_markers: self.show_rotation_markers,
             show_storm_tracks: self.show_storm_tracks,
             show_inspector_card: self.show_inspector_card,
@@ -19082,6 +19152,14 @@ impl ViewerApp {
         self.model_enabled = snapshot.model_enabled;
         self.model_download_open = snapshot.model_download_open;
         self.restore_viewer_mode(dock::WorkspacePane::Model, snapshot.model_viewer_mode);
+        self.restore_viewer_mode(
+            dock::WorkspacePane::Satellite,
+            snapshot.satellite_viewer_mode,
+        );
+        self.restore_viewer_mode(dock::WorkspacePane::Sounding, snapshot.sounding_viewer_mode);
+        self.sat_map_follow = snapshot.sat_map_follow;
+        self.app_settings.show_tropical = snapshot.show_tropical;
+        self.app_settings.show_tropical_panel = snapshot.show_tropical_panel;
         self.show_rotation_markers = snapshot.show_rotation_markers;
         self.show_storm_tracks = snapshot.show_storm_tracks;
         self.show_inspector_card = snapshot.show_inspector_card;
@@ -63157,6 +63235,100 @@ mod tests {
         assert!(!app.obs_enabled);
         assert!(!app.obs_adjust_soundings);
         assert!(!app.glm_enabled);
+    }
+
+    #[test]
+    fn simulated_radar_workflow_arms_wrf_desk_and_restores() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.sidebar_tab = SidebarTab::Radar;
+        app.model_enabled = false;
+        app.vrot_tool_armed = false;
+        app.show_inspector_card = false;
+
+        app.apply_workflow_preset(WorkflowPreset::SimulatedRadar, &ctx);
+
+        assert_eq!(app.grid_layout, PanelLayout::One);
+        assert_eq!(app.sidebar_tab, SidebarTab::Data);
+        assert!(app.model_enabled);
+        assert!(app.viewer_open(dock::WorkspacePane::Model));
+        assert!(app.vrot_tool_armed);
+        assert!(app.show_inspector_card);
+
+        app.restore_previous_workflow(&ctx);
+
+        assert_eq!(app.sidebar_tab, SidebarTab::Radar);
+        assert!(!app.model_enabled);
+        assert!(!app.viewer_open(dock::WorkspacePane::Model));
+        assert!(!app.vrot_tool_armed);
+        assert!(!app.show_inspector_card);
+    }
+
+    #[test]
+    fn satellite_workflow_opens_window_and_restores() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.show_satellite = false;
+        app.sat_map_follow = false;
+
+        app.apply_workflow_preset(WorkflowPreset::Satellite, &ctx);
+
+        assert_eq!(app.grid_layout, PanelLayout::One);
+        assert_eq!(app.sidebar_tab, SidebarTab::Layers);
+        assert!(app.viewer_open(dock::WorkspacePane::Satellite));
+        assert!(app.sat_map_follow);
+
+        app.restore_previous_workflow(&ctx);
+
+        assert!(!app.viewer_open(dock::WorkspacePane::Satellite));
+        assert!(!app.workspace.is_docked(dock::WorkspacePane::Satellite));
+        assert!(!app.sat_map_follow);
+    }
+
+    #[test]
+    fn tropical_workflow_shows_cyclones_and_restores() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.app_settings.show_tropical = false;
+        app.app_settings.show_tropical_panel = false;
+
+        app.apply_workflow_preset(WorkflowPreset::Tropical, &ctx);
+
+        assert_eq!(app.grid_layout, PanelLayout::One);
+        assert_eq!(app.sidebar_tab, SidebarTab::Layers);
+        assert!(app.app_settings.show_tropical);
+        assert!(app.app_settings.show_tropical_panel);
+
+        app.restore_previous_workflow(&ctx);
+
+        assert!(!app.app_settings.show_tropical);
+        assert!(!app.app_settings.show_tropical_panel);
+    }
+
+    #[test]
+    fn upper_air_workflow_opens_model_and_sounding_and_restores() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        let ctx = egui::Context::default();
+        app.model_enabled = false;
+        app.native_skewt_open = false;
+        app.obs_adjust_soundings = false;
+
+        app.apply_workflow_preset(WorkflowPreset::UpperAir, &ctx);
+
+        assert_eq!(app.grid_layout, PanelLayout::TwoVertical);
+        assert_eq!(app.sidebar_tab, SidebarTab::Layers);
+        assert!(app.model_enabled);
+        assert!(app.viewer_open(dock::WorkspacePane::Model));
+        assert!(app.viewer_open(dock::WorkspacePane::Sounding));
+        assert!(app.obs_adjust_soundings);
+
+        app.restore_previous_workflow(&ctx);
+
+        assert_eq!(app.grid_layout, PanelLayout::One);
+        assert!(!app.model_enabled);
+        assert!(!app.viewer_open(dock::WorkspacePane::Model));
+        assert!(!app.viewer_open(dock::WorkspacePane::Sounding));
+        assert!(!app.obs_adjust_soundings);
     }
 
     #[test]

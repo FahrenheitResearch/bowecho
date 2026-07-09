@@ -235,7 +235,8 @@ fn getting_started(ui: &mut egui::Ui) {
         ui,
         "Workflows \u{25be}",
         "\u{2014} applies one of the built-in operating setups: live severe, triple severe, \
-         velocity couplet, quad dual-pol, archive review, documentation, or model context. \
+         velocity couplet, quad dual-pol, archive review, documentation, model context, \
+         simulated radar, satellite, tropical, or upper air. \
          The current workflow marker is only a label for the latest preset; manual tweaks \
          stay yours, Restore previous setup undoes the latest preset's setup changes, and Clear \
          marker hides only the label.",
