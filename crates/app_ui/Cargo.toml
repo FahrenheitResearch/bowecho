@@ -127,6 +127,15 @@ rev = "edb9d277cce7fe1cfa1080d159053c583ca07b6a"
 git = "https://github.com/FahrenheitResearch/rusty-weather"
 rev = "edb9d277cce7fe1cfa1080d159053c583ca07b6a"
 
+# GRIB Edition 1 decode (ERA-20C / GDEX "past" reanalysis local import —
+# see `grib_import.rs`). Same pinned rusty-weather rev as everything above;
+# default features off: they only gate GRIB2 codecs (openjp2/png) this
+# importer never touches.
+[dependencies.grib-core]
+git = "https://github.com/FahrenheitResearch/rusty-weather"
+rev = "edb9d277cce7fe1cfa1080d159053c583ca07b6a"
+default-features = false
+
 [dependencies.wrf-core]
 git = "https://github.com/FahrenheitResearch/wrf-rust.git"
 rev = "f05758d9b8ea0132ea8b9767882396cbc5b2cfac"

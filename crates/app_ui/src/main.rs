@@ -55,6 +55,7 @@ mod gbvtd_retrieval;
 mod gdex_ui;
 mod geo_helpers;
 mod glm_layer;
+mod grib_import;
 mod grid_composites;
 mod guide;
 mod hazard_geom;

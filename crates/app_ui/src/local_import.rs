@@ -138,6 +138,9 @@ pub fn is_supported_model_file(path: &Path) -> bool {
                 .as_deref(),
             Some("nc" | "nc4" | "cdf")
         )
+        // GRIB Edition 1 (.grb/.grib — ERA-20C / GDEX reanalysis); routed to
+        // `grib_import` below. GRIB2 extensions stay unsupported here.
+        || crate::grib_import::is_grib1_file(path)
 }
 
 fn import_paths(
@@ -159,6 +162,22 @@ fn import_paths(
     }
     if files.len() > u16::MAX as usize {
         return Err(ImportError::TooManyFiles(files.len()));
+    }
+
+    // GRIB1 files carry many timesteps each and decode through grib-core,
+    // not netcrust — the whole selection routes to `grib_import`. Mixed
+    // selections are refused rather than guessed at: GRIB hour slots are
+    // valid-time-derived while the WRF path below is file-index-derived,
+    // and interleaving the two would scramble the run's hour axis.
+    if files.iter().any(|path| crate::grib_import::is_grib1_file(path)) {
+        if !files
+            .iter()
+            .all(|path| crate::grib_import::is_grib1_file(path))
+        {
+            return Err(ImportError::MixedGribSelection);
+        }
+        return crate::grib_import::import_grib1_files(&files, store_root, progress)
+            .map_err(ImportError::Grib);
     }
 
     let model = "wrf".to_string();
@@ -1879,6 +1898,10 @@ pub(crate) enum ImportError {
     PlaneMismatch,
     #[error("no importable 2D WRF fields found in {0}")]
     NoFields(PathBuf),
+    #[error("GRIB1 import failed: {0}")]
+    Grib(String),
+    #[error("selection mixes GRIB1 and WRF/NetCDF files — import them separately")]
+    MixedGribSelection,
     #[error(transparent)]
     Netcdf(#[from] netcrust::Error),
     #[error(transparent)]

@@ -774,6 +774,21 @@ pub fn solar_model_field_table(var: &str, units: &str) -> Option<ColorTable> {
         return Some(table);
     }
 
+    // Surface roughness length (ERA-20C `surface_roughness` /
+    // `forecast_surface_roughness`, metres): the Generic ramp over the
+    // physical 0..3 m span (open ocean ~1e-4 m through forest/urban ~2 m).
+    // Same reuse-not-invention convention as the level heights above; the
+    // unit guard keeps non-length "roughness" fields on their existing
+    // fallback.
+    if name.contains("roughness") && unit == "m" {
+        return Some(rescaled_table(
+            &crate::builtin_generic_table(),
+            "Analyst Generic (roughness)",
+            0.0,
+            3.0,
+        ));
+    }
+
     None
 }
 
@@ -1024,6 +1039,26 @@ mod tests {
         assert!(solar_model_field_table("height_10m", "m").is_none());
         assert!(solar_model_field_table("height_450", "gpm").is_none());
         assert!(solar_model_field_table("orography", "m").is_none());
+    }
+
+    /// Surface roughness lengths (ERA-20C GRIB1 import slugs) take the
+    /// Generic ramp scaled over the physical 0..3 m span; the unit guard
+    /// keeps non-length "roughness" fields unresolved.
+    #[test]
+    fn roughness_lengths_take_scaled_generic_ramp() {
+        let fsr = solar_model_field_table("forecast_surface_roughness", "m")
+            .expect("forecast_surface_roughness");
+        let sr = solar_model_field_table("surface_roughness", "m").expect("surface_roughness");
+        // Same table for both slugs; ocean vs forest roughness shade apart.
+        assert_eq!(fsr.sample(1.5), sr.sample(1.5));
+        assert_ne!(fsr.sample(0.001), fsr.sample(2.0));
+        // Colors come from the existing Generic ramp (reuse, not invention),
+        // stretched 0..100 -> 0..3.
+        let generic = crate::builtin_generic_table();
+        assert_eq!(fsr.sample(0.0), generic.sample(0.0));
+        assert_eq!(fsr.sample(3.0), generic.sample(100.0));
+        // Unit guard: a dimensionless roughness stays unresolved.
+        assert!(solar_model_field_table("log_surface_roughness_heat", "~").is_none());
     }
 
     #[test]
