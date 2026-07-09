@@ -12,9 +12,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
-use std::time::{Duration as StdDuration, Instant};
+use std::time::{Duration as StdDuration, Instant, SystemTime};
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Utc};
 use reqwest::header::{ACCEPT, COOKIE, REFERER, SET_COOKIE};
@@ -65,6 +66,12 @@ const COMPLETED_VOLUME_CACHE_PER_SITE: usize = 8;
 /// same site (primary pane at 1 s, live multi-panes and overlays at 5 s)
 /// while staying under the primary's 1 s cadence so it always re-lists.
 const REALTIME_LIVE_VOLUME_LISTING_TTL: StdDuration = StdDuration::from_millis(900);
+/// A site cache is a disposable acceleration layer, not an archive. Bound it
+/// in both dimensions so normal polling cannot consume the disk indefinitely.
+const LEVEL2_CACHE_MAX_AGE: StdDuration = StdDuration::from_secs(7 * 24 * 60 * 60);
+const LEVEL2_CACHE_MAX_BYTES_PER_SITE: u64 = 4 * 1024 * 1024 * 1024;
+const LEVEL2_CACHE_WALK_MAX_DEPTH: usize = 4;
+const LEVEL2_CACHE_PRUNE_INTERVAL: StdDuration = StdDuration::from_secs(5 * 60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RadarDataLevel {
@@ -134,6 +141,14 @@ impl RealtimeChunkType {
 
     fn is_end(self) -> bool {
         matches!(self, Self::End)
+    }
+
+    fn is_start(self) -> bool {
+        matches!(self, Self::Start)
+    }
+
+    fn is_intermediate(self) -> bool {
+        matches!(self, Self::Intermediate)
     }
 
     pub fn label(self) -> &'static str {
@@ -879,6 +894,13 @@ pub fn latest_realtime_level2_volume_with_listing_ttl(
     listing_ttl: StdDuration,
 ) -> Result<RealtimeLevel2Volume> {
     let site = site.to_ascii_uppercase();
+    // Primary, panes, and overlays can poll one site concurrently. Serialize
+    // the cache-miss/listing path so they observe one coherent generation and
+    // do not all issue the same S3 LISTs at once.
+    let site_flight = realtime_site_flights().mutex_for(site.clone());
+    let _site_guard = site_flight
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (volume, listing_was_cached) = resolve_latest_realtime_volume(&site, listing_ttl)?;
     // Rollover: when the "latest" volume is already complete but the id list
     // came from cache, a newer volume may have appeared since the listing was
@@ -923,7 +945,7 @@ fn resolve_latest_realtime_volume(
     let mut best_volume = None;
     let mut first_error = None;
     for candidate_id in candidates {
-        let volume = match completed_volume_cache().get(site, candidate_id) {
+        let volume = match completed_volume_cache().get(site, candidate_id, Utc::now()) {
             Some(cached) => Ok(cached),
             None => realtime_level2_volume_for_id_memoized(site, candidate_id, live_listing_ttl)
                 .inspect(|volume| completed_volume_cache().insert(volume.clone())),
@@ -988,17 +1010,22 @@ fn latest_realtime_volume_by_chunk_scan(site: &str) -> Result<RealtimeLevel2Volu
         .into_iter()
         .filter(|object| object.size > 0)
         .filter_map(parse_realtime_chunk_object);
-    latest_realtime_volume_from_chunks(site, chunks).ok_or_else(|| DataSourceError::NoObjects {
-        bucket: LEVEL2_CHUNKS_BUCKET.to_owned(),
-        prefix: site_prefix,
-    })
+    let candidate = latest_realtime_volume_from_chunks(site, chunks).ok_or_else(|| {
+        DataSourceError::NoObjects {
+            bucket: LEVEL2_CHUNKS_BUCKET.to_owned(),
+            prefix: site_prefix,
+        }
+    })?;
+    if candidate.complete {
+        return realtime_level2_volume_for_id(site, candidate.volume_id);
+    }
+    Ok(candidate)
 }
 
 /// [`realtime_level2_volume_for_id`] behind the short live-volume listing
 /// memo: within `max_age` of a fetch, pollers of the same (site, volume id)
-/// reuse the listing instead of issuing duplicate chunk LISTs. The lock is
-/// never held across the network fetch, so a race at most double-fetches;
-/// errors are never memoized.
+/// reuse the listing instead of issuing duplicate chunk LISTs. The outer
+/// per-site single-flight covers the network fetch; errors are never memoized.
 fn realtime_level2_volume_for_id_memoized(
     site: &str,
     volume_id: u16,
@@ -1012,6 +1039,34 @@ fn realtime_level2_volume_for_id_memoized(
 }
 
 fn realtime_level2_volume_for_id(site: &str, volume_id: u16) -> Result<RealtimeLevel2Volume> {
+    let first = list_realtime_level2_volume_for_id(site, volume_id)?;
+    if !first.complete {
+        return Ok(first);
+    }
+
+    // Seeing End is not itself a publication barrier: S3 listings can lag
+    // individual objects. Cache a completed generation only after two fresh,
+    // byte-for-byte-equivalent listings. A changing second view is returned
+    // as live so the next poll verifies it again instead of making it
+    // immutable prematurely.
+    let second = list_realtime_level2_volume_for_id(site, volume_id)?;
+    Ok(stable_completed_listing(&first, second))
+}
+
+fn stable_completed_listing(
+    first: &RealtimeLevel2Volume,
+    mut second: RealtimeLevel2Volume,
+) -> RealtimeLevel2Volume {
+    if &second != first {
+        second.complete = false;
+    }
+    second
+}
+
+fn list_realtime_level2_volume_for_id(
+    site: &str,
+    volume_id: u16,
+) -> Result<RealtimeLevel2Volume> {
     let volume_prefix = format!("{site}/{volume_id}/");
     let mut chunks = list_s3_limited(
         LEVEL2_CHUNKS_BUCKET,
@@ -1049,18 +1104,22 @@ fn latest_realtime_volume_from_chunks(
 
     grouped
         .into_iter()
-        .map(|((volume_id, volume_time), mut chunks)| {
-            chunks.sort_by_key(|chunk| chunk.chunk_id);
-            let complete = chunks.last().is_some_and(|chunk| chunk.chunk_type.is_end());
-            let total_size = chunks.iter().map(|chunk| chunk.object.size).sum();
-            RealtimeLevel2Volume {
+        .filter_map(|((volume_id, volume_time), mut chunks)| {
+            let (chunks, complete) = validated_realtime_chunk_prefix(&mut chunks);
+            if chunks.is_empty() {
+                return None;
+            }
+            let total_size = chunks
+                .iter()
+                .try_fold(0u64, |total, chunk| total.checked_add(chunk.object.size))?;
+            Some(RealtimeLevel2Volume {
                 site: site.to_owned(),
                 volume_id,
                 volume_time,
                 chunks,
                 complete,
                 total_size,
-            }
+            })
         })
         .max_by(|left, right| {
             left.volume_time
@@ -1069,44 +1128,94 @@ fn latest_realtime_volume_from_chunks(
         })
 }
 
+/// Return only the longest safe, contiguous prefix. An anomalous listing is
+/// still useful for live display up to its first gap/duplicate/type error,
+/// but it must never be assembled past that point or marked complete.
+fn validated_realtime_chunk_prefix(
+    chunks: &mut Vec<RealtimeChunkObject>,
+) -> (Vec<RealtimeChunkObject>, bool) {
+    chunks.sort_by(|left, right| {
+        left.chunk_id
+            .cmp(&right.chunk_id)
+            .then_with(|| left.object.key.cmp(&right.object.key))
+    });
+
+    let original_len = chunks.len();
+    let mut prefix = Vec::with_capacity(original_len);
+    let mut expected_id = 1u16;
+    let mut ended = false;
+    let mut index = 0usize;
+    while index < chunks.len() {
+        let chunk = &chunks[index];
+        if chunk.chunk_id != expected_id {
+            break;
+        }
+        if chunks
+            .get(index + 1)
+            .is_some_and(|next| next.chunk_id == chunk.chunk_id)
+        {
+            break;
+        }
+
+        let expected_type = if expected_id == 1 {
+            chunk.chunk_type.is_start()
+        } else {
+            chunk.chunk_type.is_intermediate() || chunk.chunk_type.is_end()
+        };
+        if !expected_type || ended {
+            break;
+        }
+
+        prefix.push(chunk.clone());
+        ended = chunk.chunk_type.is_end();
+        index += 1;
+        if ended {
+            break;
+        }
+        let Some(next_id) = expected_id.checked_add(1) else {
+            break;
+        };
+        expected_id = next_id;
+    }
+
+    let complete = ended && index == original_len;
+    (prefix, complete)
+}
+
 pub fn download_realtime_volume(
     volume: &RealtimeLevel2Volume,
     cache_dir: &Path,
 ) -> Result<DownloadedObject> {
+    validate_realtime_volume_for_download(volume)?;
     fs::create_dir_all(cache_dir)?;
     let filename = realtime_volume_cache_filename(volume);
     let path = cache_dir.join(&filename);
+    let path_flight = download_path_flights().mutex_for(path.clone());
+    let _path_guard = path_flight
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let url = format!(
         "https://{}.s3.amazonaws.com/{}/{}/",
         LEVEL2_CHUNKS_BUCKET, volume.site, volume.volume_id
     );
+    let chunk_cache_dir = realtime_chunk_cache_dir(cache_dir, volume);
 
     if path
         .metadata()
         .map(|metadata| metadata.len() == volume.total_size)
         .unwrap_or(false)
     {
-        return Ok(DownloadedObject {
-            object: S3Object {
-                key: filename,
-                size: volume.total_size,
-                last_modified: volume
-                    .chunks
-                    .last()
-                    .and_then(|chunk| chunk.object.last_modified),
-            },
+        return Ok(finish_realtime_download(
+            volume,
+            cache_dir,
+            &chunk_cache_dir,
+            filename,
             path,
             url,
-            cache_hit: true,
-        });
+            true,
+        ));
     }
 
-    let chunk_cache_dir = cache_dir.join(".chunks").join(format!(
-        "{}_{}_{:03}",
-        volume.site,
-        volume.volume_time.format("%Y%m%d_%H%M%S"),
-        volume.volume_id
-    ));
     fs::create_dir_all(&chunk_cache_dir)?;
 
     let mut chunk_paths = Vec::with_capacity(volume.chunks.len());
@@ -1149,26 +1258,27 @@ pub fn download_realtime_volume(
             volume.total_size,
             &url,
         )?;
-        return Ok(DownloadedObject {
-            object: S3Object {
-                key: filename,
-                size: volume.total_size,
-                last_modified: volume
-                    .chunks
-                    .last()
-                    .and_then(|chunk| chunk.object.last_modified),
-            },
+        return Ok(finish_realtime_download(
+            volume,
+            cache_dir,
+            &chunk_cache_dir,
+            filename,
             path,
             url,
-            cache_hit: false,
-        });
+            false,
+        ));
     }
 
-    let temp_path = path.with_extension("download");
+    let temp_path = unique_download_temp_path(&path);
     let mut temp_file = fs::File::create(&temp_path)?;
     for chunk_path in &chunk_paths {
-        let mut chunk_file = fs::File::open(chunk_path)?;
-        io::copy(&mut chunk_file, &mut temp_file)?;
+        let copied = fs::File::open(chunk_path)
+            .and_then(|mut chunk_file| io::copy(&mut chunk_file, &mut temp_file));
+        if let Err(err) = copied {
+            drop(temp_file);
+            let _ = fs::remove_file(&temp_path);
+            return Err(err.into());
+        }
     }
     drop(temp_file);
 
@@ -1181,12 +1291,72 @@ pub fn download_realtime_volume(
             actual: copied,
         });
     }
-    if path.exists() {
-        fs::remove_file(&path)?;
-    }
-    fs::rename(&temp_path, &path)?;
+    publish_download_temp(&temp_path, &path)?;
 
-    Ok(DownloadedObject {
+    Ok(finish_realtime_download(
+        volume,
+        cache_dir,
+        &chunk_cache_dir,
+        filename,
+        path,
+        url,
+        false,
+    ))
+}
+
+fn validate_realtime_volume_for_download(volume: &RealtimeLevel2Volume) -> Result<()> {
+    let mut supplied = volume.chunks.clone();
+    let (validated, complete) = validated_realtime_chunk_prefix(&mut supplied);
+    let validated_size = validated
+        .iter()
+        .try_fold(0u64, |total, chunk| total.checked_add(chunk.object.size));
+    if validated.is_empty()
+        || validated.as_slice() != volume.chunks.as_slice()
+        || complete != volume.complete
+        || validated_size != Some(volume.total_size)
+        || volume.total_size > MAX_RADAR_VOLUME_BYTES as u64
+    {
+        return Err(DataSourceError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid realtime chunk sequence for {}/{} at {}",
+                volume.site, volume.volume_id, volume.volume_time
+            ),
+        )));
+    }
+    Ok(())
+}
+
+fn realtime_chunk_cache_dir(cache_dir: &Path, volume: &RealtimeLevel2Volume) -> PathBuf {
+    cache_dir.join(".chunks").join(format!(
+        "{}_{}_{:03}",
+        volume.site,
+        volume.volume_time.format("%Y%m%d_%H%M%S"),
+        volume.volume_id
+    ))
+}
+
+fn finish_realtime_download(
+    volume: &RealtimeLevel2Volume,
+    cache_dir: &Path,
+    chunk_cache_dir: &Path,
+    filename: String,
+    path: PathBuf,
+    url: String,
+    cache_hit: bool,
+) -> DownloadedObject {
+    let mut protected = vec![path.clone()];
+    if volume.complete {
+        // Completed chunks are now duplicated by the assembled volume. A
+        // failed cleanup is non-fatal and the normal retention pass will
+        // retry it later.
+        let _ = fs::remove_dir_all(chunk_cache_dir);
+    } else {
+        protected.push(chunk_cache_dir.to_path_buf());
+    }
+    let _ = prune_level2_cache(cache_dir, &protected);
+
+    DownloadedObject {
         object: S3Object {
             key: filename,
             size: volume.total_size,
@@ -1197,8 +1367,8 @@ pub fn download_realtime_volume(
         },
         path,
         url,
-        cache_hit: false,
-    })
+        cache_hit,
+    }
 }
 
 pub fn download_object(
@@ -1215,6 +1385,7 @@ pub fn download_object(
         .map(|metadata| metadata.len() == object.size)
         .unwrap_or(false)
     {
+        let _ = prune_level2_cache(cache_dir, std::slice::from_ref(&path));
         return Ok(DownloadedObject {
             object,
             path,
@@ -1224,6 +1395,7 @@ pub fn download_object(
     }
 
     download_s3_object_to_path(bucket, &object, &path)?;
+    let _ = prune_level2_cache(cache_dir, std::slice::from_ref(&path));
     Ok(DownloadedObject {
         object,
         path,
@@ -1247,7 +1419,7 @@ pub fn newest_cached_level2_path(cache_dir: &Path) -> Result<Option<PathBuf>> {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if name.ends_with(".download") || name.ends_with("_MDM") {
+        if name.ends_with(".download") || name.contains(".download-") || name.ends_with("_MDM") {
             continue;
         }
         if path.metadata().map(|metadata| metadata.len() == 0)? {
@@ -1503,14 +1675,33 @@ fn append_realtime_chunks(
 }
 
 fn download_s3_object_to_path(bucket: &str, object: &S3Object, path: &Path) -> Result<()> {
+    let path_flight = download_path_flights().mutex_for(path.to_path_buf());
+    let _path_guard = path_flight
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if path
+        .metadata()
+        .map(|metadata| metadata.len() == object.size)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
     let url = format!("https://{bucket}.s3.amazonaws.com/{}", object.key);
     let mut response = download_http_client()
         .get(&url)
         .send()?
         .error_for_status()?;
-    let temp_path = path.with_extension("download");
+    let temp_path = unique_download_temp_path(path);
     let mut temp_file = fs::File::create(&temp_path)?;
-    let copied = io::copy(&mut response, &mut temp_file)?;
+    let copied = match io::copy(&mut response, &mut temp_file) {
+        Ok(copied) => copied,
+        Err(err) => {
+            drop(temp_file);
+            let _ = fs::remove_file(&temp_path);
+            return Err(err.into());
+        }
+    };
     drop(temp_file);
     if copied != object.size {
         let _ = fs::remove_file(&temp_path);
@@ -1520,10 +1711,176 @@ fn download_s3_object_to_path(bucket: &str, object: &S3Object, path: &Path) -> R
             actual: copied,
         });
     }
-    if path.exists() {
-        fs::remove_file(path)?;
+    publish_download_temp(&temp_path, path)?;
+    Ok(())
+}
+
+fn unique_download_temp_path(path: &Path) -> PathBuf {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download");
+    path.with_file_name(format!(
+        ".{name}.download-{}-{id}",
+        std::process::id()
+    ))
+}
+
+/// Publish a fully written same-directory temporary file. The keyed path
+/// mutex prevents BowEcho workers from racing this replacement; the final
+/// rename is the only operation that exposes the new bytes.
+fn publish_download_temp(temp_path: &Path, path: &Path) -> Result<()> {
+    if path.exists()
+        && let Err(err) = fs::remove_file(path)
+    {
+        let _ = fs::remove_file(temp_path);
+        return Err(err.into());
     }
-    fs::rename(&temp_path, path)?;
+    if let Err(err) = fs::rename(temp_path, path) {
+        let _ = fs::remove_file(temp_path);
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct Level2CacheFile {
+    path: PathBuf,
+    size: u64,
+    modified: SystemTime,
+}
+
+fn prune_level2_cache(cache_dir: &Path, protected: &[PathBuf]) -> io::Result<()> {
+    static LAST_PRUNES: OnceLock<Mutex<BTreeMap<PathBuf, Instant>>> = OnceLock::new();
+    let last_prunes = LAST_PRUNES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut entries = last_prunes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    entries.retain(|_, last| last.elapsed() < LEVEL2_CACHE_MAX_AGE);
+    if entries
+        .get(cache_dir)
+        .is_some_and(|last| last.elapsed() < LEVEL2_CACHE_PRUNE_INTERVAL)
+    {
+        return Ok(());
+    }
+    entries.insert(cache_dir.to_path_buf(), Instant::now());
+    drop(entries);
+
+    prune_level2_cache_with_limits(
+        cache_dir,
+        protected,
+        LEVEL2_CACHE_MAX_AGE,
+        LEVEL2_CACHE_MAX_BYTES_PER_SITE,
+        SystemTime::now(),
+    )
+}
+
+fn prune_level2_cache_with_limits(
+    cache_dir: &Path,
+    protected: &[PathBuf],
+    max_age: StdDuration,
+    max_bytes: u64,
+    now: SystemTime,
+) -> io::Result<()> {
+    let mut files = Vec::new();
+    collect_level2_cache_files(cache_dir, 0, &mut files)?;
+    let mut total_bytes = files
+        .iter()
+        .fold(0u64, |total, file| total.saturating_add(file.size));
+
+    let mut retained = Vec::with_capacity(files.len());
+    for file in files {
+        let protected = cache_path_is_protected(&file.path, protected);
+        let expired = now
+            .duration_since(file.modified)
+            .is_ok_and(|age| age > max_age);
+        if !protected && expired && fs::remove_file(&file.path).is_ok() {
+            total_bytes = total_bytes.saturating_sub(file.size);
+        } else {
+            retained.push(file);
+        }
+    }
+
+    retained.sort_by(|left, right| {
+        left.modified
+            .cmp(&right.modified)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    for file in retained {
+        if total_bytes <= max_bytes {
+            break;
+        }
+        if cache_path_is_protected(&file.path, protected) {
+            continue;
+        }
+        if fs::remove_file(&file.path).is_ok() {
+            total_bytes = total_bytes.saturating_sub(file.size);
+        }
+    }
+
+    remove_empty_cache_dirs(&cache_dir.join(".chunks"), 0)?;
+    Ok(())
+}
+
+fn collect_level2_cache_files(
+    dir: &Path,
+    depth: usize,
+    files: &mut Vec<Level2CacheFile>,
+) -> io::Result<()> {
+    if depth > LEVEL2_CACHE_WALK_MAX_DEPTH {
+        return Ok(());
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            // The production layout has only one internal tree. Never walk
+            // arbitrary sibling directories if a library caller supplies a
+            // broader cache path than BowEcho normally does.
+            if depth > 0 || entry.file_name() == ".chunks" {
+                collect_level2_cache_files(&entry.path(), depth + 1, files)?;
+            }
+        } else if file_type.is_file() {
+            let metadata = entry.metadata()?;
+            files.push(Level2CacheFile {
+                path: entry.path(),
+                size: metadata.len(),
+                modified: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn cache_path_is_protected(path: &Path, protected: &[PathBuf]) -> bool {
+    protected
+        .iter()
+        .any(|protected| path == protected || path.starts_with(protected))
+}
+
+fn remove_empty_cache_dirs(dir: &Path, depth: usize) -> io::Result<()> {
+    if depth > LEVEL2_CACHE_WALK_MAX_DEPTH || !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            remove_empty_cache_dirs(&entry.path(), depth + 1)?;
+        }
+    }
+    if fs::read_dir(dir)?.next().is_none() {
+        let _ = fs::remove_dir(dir);
+    }
     Ok(())
 }
 
@@ -1644,6 +2001,44 @@ where
 }
 
 /// Per-site cache of the realtime chunk bucket's active-volume-id listing.
+struct KeyedMutexes<K> {
+    entries: Mutex<BTreeMap<K, Weak<Mutex<()>>>>,
+}
+
+impl<K> Default for KeyedMutexes<K> {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+impl<K: Clone + Ord> KeyedMutexes<K> {
+    fn mutex_for(&self, key: K) -> Arc<Mutex<()>> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.retain(|_, mutex| mutex.strong_count() > 0);
+        if let Some(mutex) = entries.get(&key).and_then(Weak::upgrade) {
+            return mutex;
+        }
+        let mutex = Arc::new(Mutex::new(()));
+        entries.insert(key, Arc::downgrade(&mutex));
+        mutex
+    }
+}
+
+fn realtime_site_flights() -> &'static KeyedMutexes<String> {
+    static FLIGHTS: OnceLock<KeyedMutexes<String>> = OnceLock::new();
+    FLIGHTS.get_or_init(KeyedMutexes::default)
+}
+
+fn download_path_flights() -> &'static KeyedMutexes<PathBuf> {
+    static FLIGHTS: OnceLock<KeyedMutexes<PathBuf>> = OnceLock::new();
+    FLIGHTS.get_or_init(KeyedMutexes::default)
+}
+
 #[derive(Default)]
 struct ActiveIdsCache {
     entries: Mutex<BTreeMap<String, (Vec<u16>, Instant)>>,
@@ -1674,20 +2069,28 @@ fn active_ids_cache() -> &'static ActiveIdsCache {
     CACHE.get_or_init(ActiveIdsCache::default)
 }
 
-/// Completed realtime volumes keyed by site: once the end chunk has been
-/// observed the chunk list is immutable, so it never needs re-listing.
+/// Completed realtime volumes keyed by site and upstream generation. Volume
+/// ids wrap modulo 1000, so `volume_id` alone is never an identity: the scan
+/// timestamp is retained and stale generations are not served.
 #[derive(Default)]
 struct CompletedVolumeCache {
     entries: Mutex<BTreeMap<String, Vec<RealtimeLevel2Volume>>>,
 }
 
 impl CompletedVolumeCache {
-    fn get(&self, site: &str, volume_id: u16) -> Option<RealtimeLevel2Volume> {
+    fn get(
+        &self,
+        site: &str,
+        volume_id: u16,
+        now: DateTime<Utc>,
+    ) -> Option<RealtimeLevel2Volume> {
         let entries = self.entries.lock().ok()?;
         entries
             .get(site)?
             .iter()
-            .find(|volume| volume.volume_id == volume_id)
+            .filter(|volume| volume.volume_id == volume_id)
+            .filter(|volume| !realtime_volume_is_stale(volume, now))
+            .max_by_key(|volume| volume.volume_time)
             .cloned()
     }
 
@@ -1697,7 +2100,10 @@ impl CompletedVolumeCache {
         }
         if let Ok(mut entries) = self.entries.lock() {
             let volumes = entries.entry(volume.site.clone()).or_default();
-            volumes.retain(|existing| existing.volume_id != volume.volume_id);
+            volumes.retain(|existing| {
+                existing.volume_id != volume.volume_id
+                    || existing.volume_time != volume.volume_time
+            });
             volumes.push(volume);
             volumes.sort_by_key(|volume| volume.volume_time);
             while volumes.len() > COMPLETED_VOLUME_CACHE_PER_SITE {
@@ -1966,14 +2372,29 @@ mod tests {
         }
     }
 
+    fn realtime_fixture_now() -> DateTime<Utc> {
+        realtime_volume_fixture(COMPLETED_VOLUME_CACHE_PER_SITE as u16 + 3, true).volume_time
+            + chrono::Duration::minutes(1)
+    }
+
     #[test]
     fn completed_volume_cache_only_keeps_complete_volumes() {
         let cache = CompletedVolumeCache::default();
         cache.insert(realtime_volume_fixture(7, false));
-        assert!(cache.get("KEAX", 7).is_none(), "incomplete volume cached");
+        let now = realtime_fixture_now();
+        assert!(
+            cache.get("KEAX", 7, now).is_none(),
+            "incomplete volume cached"
+        );
         cache.insert(realtime_volume_fixture(8, true));
-        assert_eq!(cache.get("KEAX", 8).map(|v| v.volume_id), Some(8));
-        assert!(cache.get("KTLX", 8).is_none(), "cache leaked across sites");
+        assert_eq!(
+            cache.get("KEAX", 8, now).map(|v| v.volume_id),
+            Some(8)
+        );
+        assert!(
+            cache.get("KTLX", 8, now).is_none(),
+            "cache leaked across sites"
+        );
     }
 
     #[test]
@@ -1983,11 +2404,48 @@ mod tests {
             cache.insert(realtime_volume_fixture(volume_id, true));
         }
         assert!(
-            cache.get("KEAX", 0).is_none(),
+            cache.get("KEAX", 0, realtime_fixture_now()).is_none(),
             "oldest volume should be evicted"
         );
         let newest = COMPLETED_VOLUME_CACHE_PER_SITE as u16 + 2;
-        assert_eq!(cache.get("KEAX", newest).map(|v| v.volume_id), Some(newest));
+        assert_eq!(
+            cache
+                .get("KEAX", newest, realtime_fixture_now())
+                .map(|v| v.volume_id),
+            Some(newest)
+        );
+    }
+
+    #[test]
+    fn completed_volume_cache_distinguishes_reused_id_generations() {
+        let cache = CompletedVolumeCache::default();
+        let older = realtime_volume_fixture(7, true);
+        let mut newer = older.clone();
+        newer.volume_time = older.volume_time + chrono::Duration::days(4);
+        cache.insert(older.clone());
+        cache.insert(newer.clone());
+
+        assert_eq!(
+            cache
+                .get(
+                    "KEAX",
+                    7,
+                    newer.volume_time + chrono::Duration::minutes(1)
+                )
+                .map(|volume| volume.volume_time),
+            Some(newer.volume_time),
+            "a wrapped id must resolve to its newest scan generation"
+        );
+        assert!(
+            cache
+                .get(
+                    "KEAX",
+                    7,
+                    newer.volume_time + chrono::Duration::minutes(21)
+                )
+                .is_none(),
+            "stale completed generations must force a fresh listing"
+        );
     }
 
     #[test]
@@ -2337,7 +2795,11 @@ mod tests {
         assert_eq!(volume.volume_id, 393);
         assert_eq!(volume.volume_time.to_rfc3339(), "2026-07-01T05:02:18+00:00");
         assert!(!volume.complete);
-        assert_eq!(volume.chunks.len(), 2);
+        assert_eq!(
+            volume.chunks.len(),
+            1,
+            "the non-contiguous fixture is truncated to its safe Start prefix"
+        );
     }
 
     #[test]
@@ -2364,6 +2826,106 @@ mod tests {
         assert_eq!(volume.volume_time.to_rfc3339(), "2026-07-01T05:02:18+00:00");
         assert_eq!(volume.chunks.len(), 1);
         assert!(!volume.complete);
+    }
+
+    fn realtime_chunks(keys: &[&str]) -> Vec<RealtimeChunkObject> {
+        keys.iter()
+            .map(|key| {
+                parse_realtime_chunk_object(S3Object {
+                    key: (*key).to_owned(),
+                    size: 100,
+                    last_modified: None,
+                })
+                .expect("valid test chunk key")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn realtime_completion_requires_one_contiguous_typed_sequence() {
+        let valid = latest_realtime_volume_from_chunks(
+            "KTLX",
+            realtime_chunks(&[
+                "KTLX/7/20260609-055100-001-S",
+                "KTLX/7/20260609-055100-002-I",
+                "KTLX/7/20260609-055100-003-E",
+            ]),
+        )
+        .expect("valid volume");
+        assert!(valid.complete);
+        assert_eq!(valid.chunks.len(), 3);
+
+        let gap = latest_realtime_volume_from_chunks(
+            "KTLX",
+            realtime_chunks(&[
+                "KTLX/7/20260609-055100-001-S",
+                "KTLX/7/20260609-055100-003-E",
+            ]),
+        )
+        .expect("safe prefix remains");
+        assert!(!gap.complete);
+        assert_eq!(gap.chunks.len(), 1, "download stops before the gap");
+
+        let duplicate = latest_realtime_volume_from_chunks(
+            "KTLX",
+            realtime_chunks(&[
+                "KTLX/7/20260609-055100-001-S",
+                "KTLX/7/20260609-055100-002-I",
+                "KTLX/7/20260609-055100-002-I",
+                "KTLX/7/20260609-055100-003-E",
+            ]),
+        )
+        .expect("safe prefix remains");
+        assert!(!duplicate.complete);
+        assert_eq!(duplicate.chunks.len(), 1, "duplicate id is not assembled");
+
+        let after_end = latest_realtime_volume_from_chunks(
+            "KTLX",
+            realtime_chunks(&[
+                "KTLX/7/20260609-055100-001-S",
+                "KTLX/7/20260609-055100-002-E",
+                "KTLX/7/20260609-055100-003-I",
+            ]),
+        )
+        .expect("safe prefix remains");
+        assert!(!after_end.complete);
+        assert_eq!(after_end.chunks.len(), 2);
+
+        assert!(
+            latest_realtime_volume_from_chunks(
+                "KTLX",
+                realtime_chunks(&["KTLX/7/20260609-055100-001-I"])
+            )
+            .is_none(),
+            "a listing without Start has no safe downloadable prefix"
+        );
+    }
+
+    #[test]
+    fn completed_listing_must_be_identical_twice_before_caching() {
+        let first = latest_realtime_volume_from_chunks(
+            "KTLX",
+            realtime_chunks(&[
+                "KTLX/7/20260609-055100-001-S",
+                "KTLX/7/20260609-055100-002-E",
+            ]),
+        )
+        .expect("first listing");
+        assert!(stable_completed_listing(&first, first.clone()).complete);
+
+        let changed = latest_realtime_volume_from_chunks(
+            "KTLX",
+            realtime_chunks(&[
+                "KTLX/7/20260609-055100-001-S",
+                "KTLX/7/20260609-055100-002-I",
+                "KTLX/7/20260609-055100-003-E",
+            ]),
+        )
+        .expect("changed listing");
+        assert!(
+            !stable_completed_listing(&first, changed).complete,
+            "a changing End-bearing listing remains live for another poll"
+        );
     }
 
     #[test]
@@ -2457,6 +3019,91 @@ mod tests {
             b"aaaabbcccc"
         );
         fs::remove_dir_all(&dir).expect("clean append test dir");
+    }
+
+    #[test]
+    fn completed_realtime_cache_hit_removes_duplicated_chunk_directory() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "bowecho-complete-chunk-cleanup-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("test cache dir");
+        let volume = test_realtime_volume_with_sizes(&[4, 6]);
+        let assembled = dir.join(realtime_volume_cache_filename(&volume));
+        fs::write(&assembled, b"1234567890").expect("assembled cache file");
+        let chunks = realtime_chunk_cache_dir(&dir, &volume);
+        fs::create_dir_all(&chunks).expect("chunk cache dir");
+        fs::write(chunks.join("001-S"), b"1234").expect("cached chunk");
+
+        let downloaded = download_realtime_volume(&volume, &dir).expect("cache hit");
+        assert!(downloaded.cache_hit);
+        assert_eq!(downloaded.path, assembled);
+        assert!(
+            !chunks.exists(),
+            "completed assembled volumes must not retain duplicate chunks"
+        );
+        fs::remove_dir_all(&dir).expect("clean test cache dir");
+    }
+
+    #[test]
+    fn level2_cache_pruning_enforces_bytes_and_age_while_protecting_result() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "bowecho-level2-retention-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(dir.join(".chunks/old")).expect("test cache dirs");
+        let first = dir.join("first");
+        let second = dir.join("second");
+        let protected = dir.join("protected");
+        fs::write(&first, b"1111").expect("first file");
+        fs::write(&second, b"2222").expect("second file");
+        fs::write(&protected, b"3333").expect("protected file");
+
+        prune_level2_cache_with_limits(
+            &dir,
+            std::slice::from_ref(&protected),
+            StdDuration::from_secs(60),
+            8,
+            SystemTime::now(),
+        )
+        .expect("byte pruning");
+        assert!(protected.exists());
+        assert_ne!(first.exists(), second.exists(), "one oldest peer is pruned");
+
+        prune_level2_cache_with_limits(
+            &dir,
+            std::slice::from_ref(&protected),
+            StdDuration::ZERO,
+            u64::MAX,
+            SystemTime::now(),
+        )
+        .expect("age pruning");
+        assert!(protected.exists());
+        assert!(!first.exists() && !second.exists());
+        fs::remove_dir_all(&dir).expect("clean test cache dir");
+    }
+
+    #[test]
+    fn download_temp_names_are_unique_and_same_directory() {
+        let target = PathBuf::from("cache/KTLX20260609_055100_V06");
+        let first = unique_download_temp_path(&target);
+        let second = unique_download_temp_path(&target);
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), target.parent());
+        assert!(
+            first
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(".download-"))
+        );
     }
 
     fn test_realtime_volume_with_sizes(sizes: &[u64]) -> RealtimeLevel2Volume {
