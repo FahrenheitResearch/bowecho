@@ -313,9 +313,9 @@ where
         temp_file.flush().map_err(|error| {
             PersistenceError::io(PersistenceAction::FlushTemporary, path, error)
         })?;
-        temp_file.sync_all().map_err(|error| {
-            PersistenceError::io(PersistenceAction::SyncTemporary, path, error)
-        })?;
+        temp_file
+            .sync_all()
+            .map_err(|error| PersistenceError::io(PersistenceAction::SyncTemporary, path, error))?;
         Ok(())
     })();
     drop(temp_file);
@@ -334,10 +334,7 @@ where
     publish_result
 }
 
-fn create_unique_temp(
-    destination: &Path,
-    role: &str,
-) -> Result<(PathBuf, File), PersistenceError> {
+fn create_unique_temp(destination: &Path, role: &str) -> Result<(PathBuf, File), PersistenceError> {
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
     let name = destination
         .file_name()
@@ -345,10 +342,8 @@ fn create_unique_temp(
         .unwrap_or("settings.json");
     for _ in 0..64 {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let path = destination.with_file_name(format!(
-            ".{name}.{role}-{}-{id}",
-            std::process::id()
-        ));
+        let path =
+            destination.with_file_name(format!(".{name}.{role}-{}-{id}", std::process::id()));
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -530,7 +525,10 @@ mod tests {
         static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir()
-            .join(format!("bowecho-settings-persistence-{}-{id}", std::process::id()))
+            .join(format!(
+                "bowecho-settings-persistence-{}-{id}",
+                std::process::id()
+            ))
             .join(format!("{tag}.json"))
     }
 

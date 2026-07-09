@@ -5958,13 +5958,7 @@ fn resolve_dealiased_volume_grids(
                 .then_some(cut_index)
         })
         .collect();
-    resolve_dealiased_cut_grids(
-        volume,
-        previous_volume,
-        dealias_env,
-        engine,
-        &cut_indices,
-    )
+    resolve_dealiased_cut_grids(volume, previous_volume, dealias_env, engine, &cut_indices)
 }
 
 /// Resolve only the listed cuts while preserving a volume-aligned result
@@ -5983,13 +5977,8 @@ fn resolve_dealiased_cut_grids(
             continue;
         };
         if cut.moments.contains_key(&MomentType::Velocity) {
-            grids[cut_index] = resolve_dealiased_grid(
-                volume,
-                previous_volume,
-                dealias_env,
-                cut_index,
-                engine,
-            );
+            grids[cut_index] =
+                resolve_dealiased_grid(volume, previous_volume, dealias_env, cut_index, engine);
         }
     }
     grids
@@ -13330,14 +13319,14 @@ impl ViewerApp {
         let previous_volume = (self.dealias_engine == DealiasEngine::Analyst3d
             && (self.product_render_uses_dealiased_velocity(&self.selected_product)
                 || self.unfold_velocity_display))
-        .then(|| {
-            previous_dealias_reference_volume(
-                &self.primary.history,
-                step.frame_index,
-                &frame.volume,
-            )
-        })
-        .flatten();
+            .then(|| {
+                previous_dealias_reference_volume(
+                    &self.primary.history,
+                    step.frame_index,
+                    &frame.volume,
+                )
+            })
+            .flatten();
         self.primary_render_request_for_volume(
             ctx,
             rect,
@@ -13357,14 +13346,14 @@ impl ViewerApp {
         let previous_volume = (self.dealias_engine == DealiasEngine::Analyst3d
             && (self.product_render_uses_dealiased_velocity(&self.selected_product)
                 || self.unfold_velocity_display))
-        .then(|| {
-            previous_dealias_reference_volume(
-                &self.primary.history,
-                self.primary.cursor.index,
-                &volume,
-            )
-        })
-        .flatten();
+            .then(|| {
+                previous_dealias_reference_volume(
+                    &self.primary.history,
+                    self.primary.cursor.index,
+                    &volume,
+                )
+            })
+            .flatten();
         self.primary_render_request_for_volume(
             ctx,
             rect,
@@ -22292,8 +22281,7 @@ impl ViewerApp {
 
         // Contextual rows: exactly one family block at a time, gated on the
         // FOCUSED pane's product, so the tilt list below barely shifts.
-        if editing_product.is_signed_radial_velocity()
-            || editing_product.uses_dealiased_velocity()
+        if editing_product.is_signed_radial_velocity() || editing_product.uses_dealiased_velocity()
         {
             ui.horizontal(|ui| {
                 let plain_velocity =
@@ -34955,8 +34943,7 @@ impl ViewerApp {
                 engine,
                 &cut_indices,
             );
-            let borrowed: Vec<Option<&MomentGrid>> =
-                grids.iter().map(Option::as_deref).collect();
+            let borrowed: Vec<Option<&MomentGrid>> = grids.iter().map(Option::as_deref).collect();
             let markers =
                 detect_rotation_markers_for_volume(&volume, &borrowed, radar_lat, radar_lon);
             let _ = sender.send((key_for_worker, markers));
@@ -38602,12 +38589,7 @@ fn build_derived_moment_cache(
             .map(|(i, _)| i)
             .ok_or_else(|| "no base moment for derived product".to_owned())?;
         let dealiased_grids = (derived == DerivedProduct::Marc).then(|| {
-            resolve_dealiased_volume_grids(
-                volume,
-                previous_volume,
-                dealias_env,
-                dealias_engine,
-            )
+            resolve_dealiased_volume_grids(volume, previous_volume, dealias_env, dealias_engine)
         });
         let borrowed_dealiased: Option<Vec<Option<&MomentGrid>>> = dealiased_grids
             .as_ref()
@@ -38626,10 +38608,9 @@ fn build_derived_moment_cache(
             )
             .map(|grids| grids.posh_pct),
             DerivedProduct::Poh => poh_grid(volume, hail_levels_m.0),
-            DerivedProduct::Marc => marc_grid_from_dealiased(
-                volume,
-                borrowed_dealiased.as_deref().unwrap_or_default(),
-            ),
+            DerivedProduct::Marc => {
+                marc_grid_from_dealiased(volume, borrowed_dealiased.as_deref().unwrap_or_default())
+            }
             DerivedProduct::GustProxy => {
                 let velocity = resolve_dealiased_grid(
                     volume,
@@ -38638,10 +38619,10 @@ fn build_derived_moment_cache(
                     base_idx,
                     dealias_engine,
                 );
-                velocity.as_deref().and_then(|velocity| {
-                    gust_proxy_grid_from_dealiased(volume, base_idx, velocity)
-                })
-            },
+                velocity
+                    .as_deref()
+                    .and_then(|velocity| gust_proxy_grid_from_dealiased(volume, base_idx, velocity))
+            }
             DerivedProduct::AzimuthalShear | DerivedProduct::Divergence => {
                 unreachable!("velocity derivatives are per-cut")
             }
@@ -38662,12 +38643,8 @@ fn build_derived_moment_cache(
         )
         .ok_or_else(|| "selected cut has no dealiased velocity for this product".to_owned())?;
         let grid = match derived {
-            DerivedProduct::AzimuthalShear => {
-                azimuthal_shear_grid_from_dealiased(cut, &velocity)
-            }
-            DerivedProduct::Divergence => {
-                radial_divergence_grid_from_dealiased(cut, &velocity)
-            }
+            DerivedProduct::AzimuthalShear => azimuthal_shear_grid_from_dealiased(cut, &velocity),
+            DerivedProduct::Divergence => radial_divergence_grid_from_dealiased(cut, &velocity),
             _ => unreachable!("only velocity derivatives are per-cut"),
         };
         (selected_cut, Some(grid))
@@ -44225,19 +44202,11 @@ mod tests {
             valid_time: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
         });
 
-        let region = DealiasContextKey::new(
-            DealiasEngine::Region,
-            Some(&previous),
-            Some(&env),
-        );
+        let region = DealiasContextKey::new(DealiasEngine::Region, Some(&previous), Some(&env));
         assert_eq!(region.reference_volume_ptr, 0);
         assert_eq!(region.dealias_env_ptr, 0);
 
-        let analyst = DealiasContextKey::new(
-            DealiasEngine::Analyst3d,
-            Some(&previous),
-            Some(&env),
-        );
+        let analyst = DealiasContextKey::new(DealiasEngine::Analyst3d, Some(&previous), Some(&env));
         assert_eq!(
             analyst.reference_volume_ptr,
             Arc::as_ptr(&previous) as usize

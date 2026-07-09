@@ -280,15 +280,11 @@ pub fn marc_grid_from_dealiased(
 /// masked to beam-center heights < 1 km above the radar (Smith, Elmore &
 /// Dulin 2004: low-beam radial wind ≈ surface gust; ≥ 25 m/s ≈ severe).
 pub fn gust_proxy_grid(volume: &RadarVolume) -> Option<MomentGrid> {
-    let (cut_index, cut, velocity) = volume
-        .cuts
-        .iter()
-        .enumerate()
-        .find_map(|(index, c)| {
-            c.moments
-                .get(&MomentType::Velocity)
-                .map(|grid| (index, c, grid))
-        })?;
+    let (cut_index, cut, velocity) = volume.cuts.iter().enumerate().find_map(|(index, c)| {
+        c.moments
+            .get(&MomentType::Velocity)
+            .map(|grid| (index, c, grid))
+    })?;
     let dealiased = dealias_velocity_grid(cut, velocity);
     gust_proxy_grid_from_dealiased(volume, cut_index, &dealiased)
 }

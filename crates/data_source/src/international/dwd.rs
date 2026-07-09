@@ -688,8 +688,7 @@ mod tests {
         // rejected.
         let err = assemble_cycle("asb", anchors[2], &products).unwrap_err();
         assert!(
-            err.contains("'th' cycle ending")
-                && err.contains("missing expected sweep indices 00"),
+            err.contains("'th' cycle ending") && err.contains("missing expected sweep indices 00"),
             "unexpected error: {err}"
         );
 

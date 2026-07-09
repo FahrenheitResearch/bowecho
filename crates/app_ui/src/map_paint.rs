@@ -1931,8 +1931,7 @@ impl ViewerApp {
             selected_cut
         };
         let velocity_derived = derived.uses_dealiased_velocity();
-        let previous_volume = (velocity_derived
-            && self.dealias_engine == DealiasEngine::Analyst3d)
+        let previous_volume = (velocity_derived && self.dealias_engine == DealiasEngine::Analyst3d)
             .then(|| {
                 previous_dealias_reference_volume(
                     &self.primary.history,
@@ -1941,8 +1940,7 @@ impl ViewerApp {
                 )
             })
             .flatten();
-        let dealias_env = (velocity_derived
-            && self.dealias_engine == DealiasEngine::Analyst3d)
+        let dealias_env = (velocity_derived && self.dealias_engine == DealiasEngine::Analyst3d)
             .then(|| self.dealias_env_profile_for_volume(volume))
             .flatten();
         let dealias_context = if velocity_derived {
@@ -2024,7 +2022,7 @@ impl ViewerApp {
                             velocity.as_deref().and_then(|velocity| {
                                 gust_proxy_grid_from_dealiased(volume, base_idx, velocity)
                             })
-                        },
+                        }
                         DerivedProduct::AzimuthalShear | DerivedProduct::Divergence => None,
                     }?;
                     (base_idx, grid)

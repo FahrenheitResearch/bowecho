@@ -374,8 +374,7 @@ mod tests {
             storage: MomentStorage::F32(values),
         };
 
-        let divergence =
-            radial_divergence_grid_from_dealiased(&cut, &selected_engine_grid);
+        let divergence = radial_divergence_grid_from_dealiased(&cut, &selected_engine_grid);
         let value = divergence.scaled_value(3, 10).expect("derivative");
         assert!((value - slope * 1000.0).abs() < 1.0, "got {value}");
     }

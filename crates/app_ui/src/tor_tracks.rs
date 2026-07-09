@@ -124,13 +124,11 @@ impl TorTracksState {
         volume_ptr: usize,
         context: crate::DealiasContextKey,
     ) -> bool {
-        self.frames
-            .iter()
-            .any(|frame| {
-                frame.scan_time == scan_time
-                    && frame.volume_ptr == volume_ptr
-                    && frame.context == context
-            })
+        self.frames.iter().any(|frame| {
+            frame.scan_time == scan_time
+                && frame.volume_ptr == volume_ptr
+                && frame.context == context
+        })
     }
 }
 
@@ -236,45 +234,40 @@ impl crate::ViewerApp {
         // 4. Kick the next job (one at a time, oldest eligible first so the
         //    swath builds chronologically).
         if self.tor_tracks.job.is_none() {
-            let next = self
-                .primary
-                .history
-                .iter()
-                .find_map(|frame| {
-                    if frame.identity.site_id != active_site
-                        || frame.status == crate::FrameStatus::Preview
-                        || !self.tor_tracks.in_window(frame.identity.scan_time_utc)
-                    {
-                        return None;
-                    }
-                    let (previous_volume, dealias_env, context) =
-                        self.primary_dealias_inputs_for_volume(&frame.volume);
-                    let volume_ptr = Arc::as_ptr(&frame.volume) as usize;
-                    if self.tor_tracks.has_frame(
-                        frame.identity.scan_time_utc,
-                        volume_ptr,
-                        context,
-                    ) {
-                        return None;
-                    }
-                    let (Some(site_lat), Some(site_lon)) = (
-                        frame.volume.site.latitude_deg,
-                        frame.volume.site.longitude_deg,
-                    ) else {
-                        return None;
-                    };
-                    Some((
-                        Arc::clone(&frame.volume),
-                        volume_ptr,
-                        frame.identity.scan_time_utc,
-                        frame.identity.site_id.clone(),
-                        site_lat,
-                        site_lon,
-                        previous_volume,
-                        dealias_env,
-                        context,
-                    ))
-                });
+            let next = self.primary.history.iter().find_map(|frame| {
+                if frame.identity.site_id != active_site
+                    || frame.status == crate::FrameStatus::Preview
+                    || !self.tor_tracks.in_window(frame.identity.scan_time_utc)
+                {
+                    return None;
+                }
+                let (previous_volume, dealias_env, context) =
+                    self.primary_dealias_inputs_for_volume(&frame.volume);
+                let volume_ptr = Arc::as_ptr(&frame.volume) as usize;
+                if self
+                    .tor_tracks
+                    .has_frame(frame.identity.scan_time_utc, volume_ptr, context)
+                {
+                    return None;
+                }
+                let (Some(site_lat), Some(site_lon)) = (
+                    frame.volume.site.latitude_deg,
+                    frame.volume.site.longitude_deg,
+                ) else {
+                    return None;
+                };
+                Some((
+                    Arc::clone(&frame.volume),
+                    volume_ptr,
+                    frame.identity.scan_time_utc,
+                    frame.identity.site_id.clone(),
+                    site_lat,
+                    site_lon,
+                    previous_volume,
+                    dealias_env,
+                    context,
+                ))
+            });
             if let Some((
                 volume,
                 volume_ptr,
@@ -303,11 +296,8 @@ impl crate::ViewerApp {
                     );
                     let borrowed: Vec<Option<&radar_core::MomentGrid>> =
                         grids.iter().map(Option::as_deref).collect();
-                    let grid = low_level_azshear_cartesian_from_dealiased(
-                        &volume,
-                        &borrowed,
-                        &spec,
-                    );
+                    let grid =
+                        low_level_azshear_cartesian_from_dealiased(&volume, &borrowed, &spec);
                     let sites = detect_rotation_sites_from_dealiased(&volume, &borrowed);
                     let tds = detect_tds_gates(&volume, &sites);
                     let _ = tx.send(TrackJobResult {

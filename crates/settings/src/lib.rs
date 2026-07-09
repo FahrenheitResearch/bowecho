@@ -1030,8 +1030,7 @@ impl AppSettings {
             return LoadedAppSettings {
                 settings: defaults,
                 status: DocumentLoadStatus::DefaultsAfterError {
-                    primary_error: PersistenceError::no_config_directory("config.json")
-                        .to_string(),
+                    primary_error: PersistenceError::no_config_directory("config.json").to_string(),
                     backup_error: None,
                 },
             };
@@ -1066,7 +1065,8 @@ impl AppSettings {
                         }
                     }
                     Err(backup_error) => {
-                        let status = if primary_error.is_not_found() && backup_error.is_not_found() {
+                        let status = if primary_error.is_not_found() && backup_error.is_not_found()
+                        {
                             DocumentLoadStatus::Missing
                         } else {
                             DocumentLoadStatus::DefaultsAfterError {
@@ -1098,12 +1098,9 @@ impl AppSettings {
     pub fn save(&self) -> Result<(), PersistenceError> {
         let path = Self::config_path()
             .ok_or_else(|| PersistenceError::no_config_directory("config.json"))?;
-        atomic_write_json_with_backup_validator(
-            &path,
-            self,
-            MAX_JSON_DOCUMENT_BYTES,
-            |text| serde_json::from_str::<Self>(text).is_ok(),
-        )
+        atomic_write_json_with_backup_validator(&path, self, MAX_JSON_DOCUMENT_BYTES, |text| {
+            serde_json::from_str::<Self>(text).is_ok()
+        })
     }
 
     /// Best-effort in-memory compatibility parser used heavily by unit tests
@@ -2463,8 +2460,7 @@ mod tests {
                 ..
             }
         ));
-        let restored: AppSettings =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let restored: AppSettings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(restored.units, "metric");
         cleanup_settings_path(&path);
     }

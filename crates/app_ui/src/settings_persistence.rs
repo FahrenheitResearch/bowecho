@@ -214,9 +214,7 @@ fn load_notice_level(status: &settings::DocumentLoadStatus) -> PersistenceNotice
     match status {
         settings::DocumentLoadStatus::DefaultsAfterError { .. } => PersistenceNoticeLevel::Error,
         settings::DocumentLoadStatus::RecoveredFromBackup { .. }
-        | settings::DocumentLoadStatus::LoadedWithWarning { .. } => {
-            PersistenceNoticeLevel::Warning
-        }
+        | settings::DocumentLoadStatus::LoadedWithWarning { .. } => PersistenceNoticeLevel::Warning,
         settings::DocumentLoadStatus::Loaded | settings::DocumentLoadStatus::Missing => {
             PersistenceNoticeLevel::Success
         }
@@ -341,10 +339,7 @@ mod tests {
         let mut persistence = SettingsPersistence::default();
         persistence.app.mark(start);
         persistence.styles.mark(start);
-        assert_eq!(
-            persistence.take_due(start + SAVE_DEBOUNCE),
-            (true, true)
-        );
+        assert_eq!(persistence.take_due(start + SAVE_DEBOUNCE), (true, true));
 
         persistence.record_save_result(
             true,
