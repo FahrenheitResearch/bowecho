@@ -41327,7 +41327,21 @@ fn configure_style(ctx: &egui::Context, brand_config: &settings::BrandConfig) {
 }
 
 fn radar_texture_options() -> egui::TextureOptions {
-    egui::TextureOptions::NEAREST
+    // Radar rasters are raw Cartesian gate grids. NEAREST magnification keeps
+    // the pixelated raw-gate identity crisp when zoomed IN (what the raster
+    // quality option sharpens); NEAREST minification instead aliases badly when
+    // the texture is SHRUNK (zoom out) — each screen pixel snaps to one texel,
+    // the moire a higher-res raster only worsens. LINEAR-min averages the four
+    // nearest texels for a clean anti-aliased shrink. Mipmaps would de-alias
+    // large zoom-out ratios, but egui-wgpu 0.34 (our primary renderer) makes
+    // user textures with mip_level_count:1 and create_sampler ignores
+    // mipmap_mode, so it is a no-op here (only the glow fallback honors it).
+    egui::TextureOptions {
+        magnification: egui::TextureFilter::Nearest,
+        minification: egui::TextureFilter::Linear,
+        wrap_mode: egui::TextureWrapMode::ClampToEdge,
+        mipmap_mode: None,
+    }
 }
 
 fn radar_color_image_from_rgba(size: [usize; 2], rgba: &[u8]) -> egui::ColorImage {
@@ -56344,12 +56358,16 @@ mod tests {
     }
 
     #[test]
-    fn radar_texture_options_preserve_gate_pixels() {
+    fn radar_texture_options_crisp_zoomin_clean_zoomout() {
         let options = radar_texture_options();
 
+        // Crisp raw gates when zoomed IN (the raster-quality identity).
         assert_eq!(options.magnification, egui::TextureFilter::Nearest);
-        assert_eq!(options.minification, egui::TextureFilter::Nearest);
+        // Clean anti-aliased shrink when zoomed OUT — kills NEAREST moire.
+        // DELIBERATE change from the former NEAREST minification.
+        assert_eq!(options.minification, egui::TextureFilter::Linear);
         assert_eq!(options.wrap_mode, egui::TextureWrapMode::ClampToEdge);
+        // egui-wgpu 0.34 ignores mipmap_mode for user textures (mip_level_count:1).
         assert_eq!(options.mipmap_mode, None);
     }
 
