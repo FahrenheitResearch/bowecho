@@ -876,6 +876,16 @@ impl ModelDataDock {
         self.sounding.apply_view_state_json(value)
     }
 
+    /// Nudge the reusable sounding panel to a readable default canvas
+    /// ("Canvas"/scene) zoom, used when a model sounding first docks beside
+    /// the plot in the narrower docked column. Only the scene zoom changes;
+    /// every other view-state field keeps its current value.
+    pub fn set_default_sounding_scene_zoom(&mut self, zoom: f32) {
+        let mut view_state = self.sounding.view_state_json();
+        patch_sounding_scene_zoom(&mut view_state, zoom);
+        self.sounding.apply_view_state_json(&view_state);
+    }
+
     /// Whether the 🎨 Color-tables editor currently binds a USER palette to
     /// this field — i.e. `field.style` (and thus the map layer's production
     /// colormap) IS the user's table, not the operational default. The map
@@ -2587,6 +2597,30 @@ fn grid_geographic_extent(lat: &[f32], lon: &[f32]) -> Option<(f64, f64, f64, f6
         .then_some((west, east, south, north))
 }
 
+/// Patch ONLY the scene ("Canvas") zoom of a serialized `SoundingViewState`,
+/// preserving every other field. Rebuilds a minimal object graph when the
+/// value (or its `zooms` entry) is not a JSON object — e.g. the `Null` a
+/// serialize failure returns — so the patch never panics on malformed input.
+/// Shared by [`ModelDataDock::set_default_sounding_scene_zoom`] and the
+/// host's native-only sounding panel.
+pub(crate) fn patch_sounding_scene_zoom(view_state: &mut serde_json::Value, zoom: f32) {
+    if !view_state.is_object() {
+        *view_state = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let zooms = view_state
+        .as_object_mut()
+        .expect("object ensured above")
+        .entry("zooms")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !zooms.is_object() {
+        *zooms = serde_json::Value::Object(serde_json::Map::new());
+    }
+    zooms
+        .as_object_mut()
+        .expect("object ensured above")
+        .insert("scene".to_owned(), serde_json::json!(zoom));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2599,6 +2633,38 @@ mod tests {
             Some(chrono::Utc.with_ymd_and_hms(2026, 6, 18, 3, 0, 0).unwrap())
         );
         assert_eq!(model_run_time_utc("bad-run"), None);
+    }
+
+    #[test]
+    fn patch_scene_zoom_sets_scene_and_preserves_siblings() {
+        let mut value = serde_json::json!({
+            "zooms": { "scene": 1.08, "skewt": { "zoom": 2.0 } },
+            "overlays": { "wind_barbs": false }
+        });
+        patch_sounding_scene_zoom(&mut value, 1.25);
+        assert!((value["zooms"]["scene"].as_f64().unwrap() - 1.25).abs() < 1e-6);
+        // Untouched siblings survive the patch.
+        assert!((value["zooms"]["skewt"]["zoom"].as_f64().unwrap() - 2.0).abs() < 1e-6);
+        assert_eq!(value["overlays"]["wind_barbs"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn patch_scene_zoom_rebuilds_from_non_object() {
+        let mut value = serde_json::Value::Null;
+        patch_sounding_scene_zoom(&mut value, 1.4);
+        assert!((value["zooms"]["scene"].as_f64().unwrap() - 1.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn default_scene_zoom_round_trips_through_the_pinned_panel() {
+        // Proof through OUR code path: the patched JSON must survive the
+        // pinned rw_ui SoundingPanel's own view-state round-trip.
+        let mut panel = rw_ui::SoundingPanel::new();
+        let mut view_state = panel.view_state_json();
+        patch_sounding_scene_zoom(&mut view_state, 1.25);
+        assert!(panel.apply_view_state_json(&view_state));
+        let back = panel.view_state_json();
+        assert!((back["zooms"]["scene"].as_f64().unwrap() - 1.25).abs() < 1e-6);
     }
 
     fn override_test_field(var: &str) -> rw_ui::FieldData {

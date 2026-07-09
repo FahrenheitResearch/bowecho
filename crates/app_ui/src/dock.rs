@@ -248,6 +248,79 @@ impl Workspace {
         self.mark_dirty();
     }
 
+    /// Dock `pane` as a horizontal split sibling immediately to the RIGHT
+    /// of `anchor`, so the two render SIDE BY SIDE (not stacked as tabs the
+    /// way [`Self::dock`] does). This is how the model sounding snaps beside
+    /// the model plot. Falls back to [`Self::dock`] (the right-of-map split)
+    /// when `anchor` is not itself docked — there is no cell to sit beside.
+    /// No-op for the map anchor or a pane that is already docked (its current
+    /// placement is respected).
+    pub fn dock_beside(&mut self, pane: WorkspacePane, anchor: WorkspacePane) {
+        if pane == WorkspacePane::Map || self.is_docked(pane) {
+            return;
+        }
+        let Some(anchor_pane) = self.tree.tiles.find_pane(&anchor) else {
+            // The anchor isn't in the tree: nothing to split beside it.
+            self.dock(pane);
+            return;
+        };
+        self.prefer_docked.insert(pane);
+        // Every docked pane carries its own tab strip (all_panes_must_have_tabs)
+        // — wrap the newcomer the same way `dock`'s split path does.
+        let child = self.tree.tiles.insert_pane(pane);
+        let child_slot = self.tree.tiles.insert_tab_tile(vec![child]);
+        // The anchor's visual cell is the tab strip that wraps it; fall back
+        // to the bare pane if simplification hasn't wrapped it yet.
+        let anchor_slot = self
+            .tree
+            .tiles
+            .parent_of(anchor_pane)
+            .filter(|&parent| {
+                matches!(
+                    self.tree.tiles.get(parent),
+                    Some(egui_tiles::Tile::Container(egui_tiles::Container::Tabs(_)))
+                )
+            })
+            .unwrap_or(anchor_pane);
+        match self.tree.tiles.parent_of(anchor_slot) {
+            // Anchor already sits in a horizontal row: drop the newcomer in
+            // directly to its right and match its share so the pair is even.
+            Some(row) if is_horizontal_linear(&self.tree.tiles, row) => {
+                if let Some(egui_tiles::Tile::Container(egui_tiles::Container::Linear(linear))) =
+                    self.tree.tiles.get_mut(row)
+                {
+                    let at = linear
+                        .children
+                        .iter()
+                        .position(|&c| c == anchor_slot)
+                        .map_or(linear.children.len(), |i| i + 1);
+                    linear.children.insert(at, child_slot);
+                    let share = linear.shares[anchor_slot];
+                    linear.shares.set_share(child_slot, share);
+                }
+            }
+            // Anchor is the root, or sits in a vertical/tabs parent: wrap just
+            // its cell in a new horizontal split [anchor, pane] occupying its
+            // old slot, so only that cell divides in two.
+            parent => {
+                let split = self.tree.tiles.insert_new(egui_tiles::Tile::Container(
+                    egui_tiles::Container::Linear(egui_tiles::Linear::new_binary(
+                        egui_tiles::LinearDir::Horizontal,
+                        [anchor_slot, child_slot],
+                        0.5,
+                    )),
+                ));
+                match parent {
+                    None => self.tree.root = Some(split),
+                    Some(parent_id) => {
+                        replace_child_tile(&mut self.tree.tiles, parent_id, anchor_slot, split);
+                    }
+                }
+            }
+        }
+        self.mark_dirty();
+    }
+
     /// Remove a viewer pane from the tree (the per-frame simplification
     /// pass prunes any container left empty or single-child).
     pub fn undock(&mut self, pane: WorkspacePane) {
@@ -275,6 +348,44 @@ impl Workspace {
         self.tree = default_tree();
         self.prefer_docked.clear();
         self.mark_dirty();
+    }
+}
+
+/// True when `id` is a horizontal [`egui_tiles::Linear`] container — the
+/// row [`Workspace::dock_beside`] inserts a right-hand sibling into.
+fn is_horizontal_linear(tiles: &egui_tiles::Tiles<WorkspacePane>, id: egui_tiles::TileId) -> bool {
+    matches!(
+        tiles.get(id),
+        Some(egui_tiles::Tile::Container(egui_tiles::Container::Linear(linear)))
+            if linear.dir == egui_tiles::LinearDir::Horizontal
+    )
+}
+
+/// Swap `old` for `new` in `parent`'s child list, preserving Linear shares
+/// and Tabs active selection. Used when [`Workspace::dock_beside`] wraps a
+/// cell in a new split container.
+fn replace_child_tile(
+    tiles: &mut egui_tiles::Tiles<WorkspacePane>,
+    parent: egui_tiles::TileId,
+    old: egui_tiles::TileId,
+    new: egui_tiles::TileId,
+) {
+    match tiles.get_mut(parent) {
+        Some(egui_tiles::Tile::Container(egui_tiles::Container::Linear(linear))) => {
+            if let Some(pos) = linear.children.iter().position(|&c| c == old) {
+                linear.children[pos] = new;
+            }
+            linear.shares.replace_with(old, new);
+        }
+        Some(egui_tiles::Tile::Container(egui_tiles::Container::Tabs(tabs))) => {
+            if let Some(pos) = tabs.children.iter().position(|&c| c == old) {
+                tabs.children[pos] = new;
+            }
+            if tabs.active == Some(old) {
+                tabs.set_active(new);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -421,6 +532,95 @@ mod tests {
         // Simplification (run by tree.ui each frame) prunes the leftover
         // containers; the map pane itself must still be present.
         assert!(workspace.is_docked(WorkspacePane::Map));
+    }
+
+    /// The tab strip (Tabs container) that directly wraps a docked pane.
+    fn slot_of(workspace: &Workspace, pane: WorkspacePane) -> egui_tiles::TileId {
+        let pane_id = workspace.tree.tiles.find_pane(&pane).expect("pane docked");
+        workspace
+            .tree
+            .tiles
+            .parent_of(pane_id)
+            .filter(|&parent| {
+                matches!(
+                    workspace.tree.tiles.get(parent),
+                    Some(egui_tiles::Tile::Container(egui_tiles::Container::Tabs(_)))
+                )
+            })
+            .unwrap_or(pane_id)
+    }
+
+    #[test]
+    fn dock_beside_places_pane_as_right_hand_split_sibling() {
+        let mut workspace = Workspace::default();
+        workspace.dock(WorkspacePane::Model); // Map | Model
+        workspace.dock_beside(WorkspacePane::Sounding, WorkspacePane::Model);
+
+        assert!(workspace.is_docked(WorkspacePane::Sounding));
+        assert!(workspace.is_docked(WorkspacePane::Model));
+        assert!(workspace.prefer_docked.contains(&WorkspacePane::Sounding));
+
+        // Side by side, NOT tabbed: the two panes live in distinct tab
+        // strips that share one horizontal Linear row, with Sounding to the
+        // RIGHT of (immediately after) Model.
+        let model_slot = slot_of(&workspace, WorkspacePane::Model);
+        let sounding_slot = slot_of(&workspace, WorkspacePane::Sounding);
+        assert_ne!(
+            model_slot, sounding_slot,
+            "sounding must be its own cell, not a tab in Model's strip"
+        );
+        let row = workspace
+            .tree
+            .tiles
+            .parent_of(model_slot)
+            .expect("model has a parent row");
+        assert_eq!(
+            workspace.tree.tiles.parent_of(sounding_slot),
+            Some(row),
+            "both cells share one row"
+        );
+        let egui_tiles::Tile::Container(egui_tiles::Container::Linear(linear)) =
+            workspace.tree.tiles.get(row).expect("row tile")
+        else {
+            panic!("shared parent is not a Linear row");
+        };
+        assert_eq!(linear.dir, egui_tiles::LinearDir::Horizontal);
+        let model_idx = linear
+            .children
+            .iter()
+            .position(|&c| c == model_slot)
+            .unwrap();
+        let sounding_idx = linear
+            .children
+            .iter()
+            .position(|&c| c == sounding_slot)
+            .unwrap();
+        assert_eq!(
+            sounding_idx,
+            model_idx + 1,
+            "sounding sits immediately to the right of the model plot"
+        );
+    }
+
+    #[test]
+    fn dock_beside_falls_back_to_default_dock_when_anchor_absent() {
+        let mut workspace = Workspace::default();
+        // Model is NOT docked — there is no cell to sit beside.
+        workspace.dock_beside(WorkspacePane::Sounding, WorkspacePane::Model);
+        assert!(workspace.is_docked(WorkspacePane::Sounding));
+        assert!(!workspace.is_docked(WorkspacePane::Model));
+        assert!(workspace.prefer_docked.contains(&WorkspacePane::Sounding));
+    }
+
+    #[test]
+    fn dock_beside_is_a_noop_when_pane_already_docked() {
+        let mut workspace = Workspace::default();
+        workspace.dock(WorkspacePane::Model);
+        workspace.dock(WorkspacePane::Sounding); // tabs alongside Model
+        let before = serde_json::to_string(&workspace.tree).expect("serialize");
+        workspace.dock_beside(WorkspacePane::Sounding, WorkspacePane::Model);
+        let after = serde_json::to_string(&workspace.tree).expect("serialize");
+        assert_eq!(before, after, "already-docked pane is left in place");
     }
 
     #[test]

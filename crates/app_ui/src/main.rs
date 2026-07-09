@@ -3031,6 +3031,9 @@ struct ViewerApp {
     native_sounding_panel: rw_ui::SoundingPanel,
     sounding_viewer_source: SoundingViewerSource,
     native_skewt_open: bool,
+    /// One-shot: the docked model sounding has taken its default canvas zoom
+    /// this session, so later clicks never re-stomp a zoom the user adjusted.
+    sounding_dock_zoom_defaulted: bool,
     /// Volumes fetched per archive loop load.
     archive_frame_count: usize,
     /// Indices into archive_volumes covered by the last loop load
@@ -4415,6 +4418,13 @@ type NativeSoundingResult = (
     Option<(rw_ui::SoundingData, rustwx_sounding::SoundingColumn)>,
 );
 type NativeSoundingReceiver = mpsc::Receiver<std::result::Result<NativeSoundingResult, String>>;
+
+/// Default sounding canvas ("Canvas"/scene) zoom applied the first time a
+/// model sounding docks beside the plot in a session, when the user has no
+/// saved sounding view state. Larger than the panel's built-in 1.08 so the
+/// skew-T reads well in the narrower docked column; a user's own zoom then
+/// persists and is never overridden. Owner-RC-tunable.
+const DOCKED_SOUNDING_DEFAULT_SCENE_ZOOM: f32 = 1.25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SoundingViewerSource {
@@ -8021,6 +8031,7 @@ impl ViewerApp {
             native_sounding_panel: rw_ui::SoundingPanel::new(),
             sounding_viewer_source: SoundingViewerSource::NativeOnly,
             native_skewt_open: false,
+            sounding_dock_zoom_defaulted: false,
             archive_frame_count: restored_archive_frame_count,
             archive_loaded_range: None,
             archive_load_progress: None,
@@ -28262,7 +28273,7 @@ impl ViewerApp {
                         self.native_sounding_panel.set_native_column(data, column);
                         self.sounding_viewer_source = SoundingViewerSource::NativeOnly;
                     }
-                    self.open_viewer(dock::WorkspacePane::Sounding);
+                    self.dock_model_sounding_beside_plot();
                     ctx.request_repaint();
                 }
                 Ok(Err(err)) => {
@@ -28272,6 +28283,71 @@ impl ViewerApp {
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => self.native_sounding_rx = None,
+            }
+        }
+    }
+
+    /// The model-sounding click default: show the skew-T DOCKED to the RIGHT
+    /// of the model plot, not as the floating "Sounding (native)" window. A
+    /// pane the user has deliberately floated stays floating (its window
+    /// renders the fresh sounding via the `is_docked` gate); otherwise the
+    /// pane docks beside the plot with a readable default zoom.
+    fn dock_model_sounding_beside_plot(&mut self) {
+        let floating_by_choice =
+            self.viewer_mode(dock::WorkspacePane::Sounding) == dock::ViewerMode::Floating;
+        self.set_viewer_open(dock::WorkspacePane::Sounding, true);
+        if floating_by_choice {
+            return;
+        }
+        self.dock_sounding_beside_model();
+        self.apply_default_docked_sounding_zoom();
+    }
+
+    /// Dock the Sounding pane immediately to the RIGHT of the model plot
+    /// pane. When the model viewer is open but floating, dock it first (right
+    /// of the map) so the two can sit side by side; when it is closed there
+    /// is no plot to pair with, so [`dock::Workspace::dock_beside`] falls
+    /// back to the standard right-of-map dock. A Sounding pane the user has
+    /// already docked is left where it is.
+    fn dock_sounding_beside_model(&mut self) {
+        if self.workspace.is_docked(dock::WorkspacePane::Sounding) {
+            return;
+        }
+        if !self.workspace.is_docked(dock::WorkspacePane::Model) && self.model_dock_open {
+            self.workspace.dock(dock::WorkspacePane::Model);
+        }
+        self.workspace
+            .dock_beside(dock::WorkspacePane::Sounding, dock::WorkspacePane::Model);
+    }
+
+    /// First model sounding to dock this session, with no saved sounding view
+    /// state: nudge the canvas zoom to a readable default for the narrower
+    /// docked column. Runs once (a returning user's saved zoom, and any zoom
+    /// the user sets mid-session, are always respected). Targets whichever
+    /// panel the current source renders (the model dock or the native-only
+    /// panel used for obs-adjusted profiles).
+    fn apply_default_docked_sounding_zoom(&mut self) {
+        if self.sounding_dock_zoom_defaulted {
+            return;
+        }
+        self.sounding_dock_zoom_defaulted = true;
+        if self.app_settings.sounding_view_state.is_some() {
+            return;
+        }
+        match self.sounding_viewer_source {
+            SoundingViewerSource::NativeOnly => {
+                let mut view_state = self.native_sounding_panel.view_state_json();
+                model_data::patch_sounding_scene_zoom(
+                    &mut view_state,
+                    DOCKED_SOUNDING_DEFAULT_SCENE_ZOOM,
+                );
+                self.native_sounding_panel
+                    .apply_view_state_json(&view_state);
+            }
+            SoundingViewerSource::Model => {
+                if let Some(dock) = self.model_dock.as_mut() {
+                    dock.set_default_sounding_scene_zoom(DOCKED_SOUNDING_DEFAULT_SCENE_ZOOM);
+                }
             }
         }
     }
@@ -61008,6 +61084,7 @@ mod tests {
             native_sounding_panel: rw_ui::SoundingPanel::new(),
             sounding_viewer_source: SoundingViewerSource::NativeOnly,
             native_skewt_open: false,
+            sounding_dock_zoom_defaulted: false,
             archive_frame_count: 10,
             archive_loaded_range: None,
             archive_load_progress: None,
@@ -62970,6 +63047,97 @@ mod tests {
         app.toggle_viewer(dock::WorkspacePane::RadarOverlays);
         assert!(app.viewer_open(dock::WorkspacePane::RadarOverlays));
         assert!(app.workspace.is_docked(dock::WorkspacePane::RadarOverlays));
+    }
+
+    #[test]
+    fn model_sounding_docks_beside_the_model_plot() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        // Model viewer open (floating): the click pulls it into the dock and
+        // seats the sounding to its right.
+        app.model_dock_open = true;
+        assert!(!app.workspace.is_docked(dock::WorkspacePane::Model));
+
+        app.dock_sounding_beside_model();
+
+        assert!(app.workspace.is_docked(dock::WorkspacePane::Model));
+        assert!(app.workspace.is_docked(dock::WorkspacePane::Sounding));
+        // Distinct cells (not tabbed together) => side by side.
+        let model = app
+            .workspace
+            .tree
+            .tiles
+            .find_pane(&dock::WorkspacePane::Model)
+            .unwrap();
+        let sounding = app
+            .workspace
+            .tree
+            .tiles
+            .find_pane(&dock::WorkspacePane::Sounding)
+            .unwrap();
+        assert_ne!(
+            app.workspace.tree.tiles.parent_of(model),
+            app.workspace.tree.tiles.parent_of(sounding),
+            "sounding must be its own cell beside Model, not a tab on top"
+        );
+    }
+
+    #[test]
+    fn deliberately_floated_sounding_stays_floating_on_click() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        app.model_dock_open = true;
+        // User has the Sounding open but undocked (floating window).
+        app.set_viewer_open(dock::WorkspacePane::Sounding, true);
+        assert_eq!(
+            app.viewer_mode(dock::WorkspacePane::Sounding),
+            dock::ViewerMode::Floating
+        );
+
+        app.dock_model_sounding_beside_plot();
+
+        // Respected: still floating, not yanked into the dock.
+        assert!(!app.workspace.is_docked(dock::WorkspacePane::Sounding));
+        assert!(app.viewer_open(dock::WorkspacePane::Sounding));
+    }
+
+    #[test]
+    fn default_docked_zoom_applies_once_and_only_when_unset() {
+        let mut app = test_viewer_app_with_hazards(Vec::new());
+        assert!(app.app_settings.sounding_view_state.is_none());
+        assert!(!app.sounding_dock_zoom_defaulted);
+
+        // First dock, no saved state: the readable default is applied (source
+        // defaults to NativeOnly here, so the native panel takes it).
+        app.apply_default_docked_sounding_zoom();
+        assert!(app.sounding_dock_zoom_defaulted);
+        let view_state = app.native_sounding_panel.view_state_json();
+        assert!(
+            (view_state["zooms"]["scene"].as_f64().unwrap()
+                - f64::from(DOCKED_SOUNDING_DEFAULT_SCENE_ZOOM))
+            .abs()
+                < 1e-6
+        );
+
+        // One-shot: a later click never re-stomps a zoom the user adjusted.
+        let mut adjusted = app.native_sounding_panel.view_state_json();
+        model_data::patch_sounding_scene_zoom(&mut adjusted, 0.7);
+        app.native_sounding_panel.apply_view_state_json(&adjusted);
+        app.apply_default_docked_sounding_zoom();
+        let after = app.native_sounding_panel.view_state_json();
+        assert!((after["zooms"]["scene"].as_f64().unwrap() - 0.7).abs() < 1e-6);
+
+        // A saved view state (returning user's zoom) is never overridden.
+        let mut saved = test_viewer_app_with_hazards(Vec::new());
+        saved.app_settings.sounding_view_state = Some(serde_json::json!({"zooms": {"scene": 0.6}}));
+        saved.apply_default_docked_sounding_zoom();
+        assert!(saved.sounding_dock_zoom_defaulted);
+        assert!(
+            (saved.app_settings.sounding_view_state.as_ref().unwrap()["zooms"]["scene"]
+                .as_f64()
+                .unwrap()
+                - 0.6)
+                .abs()
+                < 1e-6
+        );
     }
 
     #[test]
