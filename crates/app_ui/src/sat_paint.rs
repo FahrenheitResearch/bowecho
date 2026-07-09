@@ -113,7 +113,7 @@ impl ViewerApp {
         self.app_settings.sat_native_window_lat_e6 = (self.sat_window_lat_deg * 1e6).round() as i64;
         self.app_settings.sat_native_window_lon_e6 = (self.sat_window_lon_deg * 1e6).round() as i64;
         self.app_settings.sat_native_window_size_km = self.sat_window_size_km;
-        let _ = self.app_settings.save();
+        self.mark_app_settings_dirty();
     }
 
     /// Satellite body (follow config + frame player), window and pane
@@ -313,7 +313,7 @@ impl ViewerApp {
         }
         if himawari_scope_changed {
             self.app_settings.himawari_true_color_scope = self.himawari_true_color_scope.clone();
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
         }
         if let Some(sat) = &self.sat
             && load_himawari
@@ -474,7 +474,7 @@ impl ViewerApp {
         if selected_enhancement != self.sat_ir_enhancement {
             self.sat_ir_enhancement = selected_enhancement;
             self.app_settings.sat_ir_enhancement = selected_enhancement.slug().to_string();
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
             if let Some(sat) = &self.sat {
                 sat.send(sat_worker::SatRequest::SetIrEnhancement(
                     selected_enhancement,

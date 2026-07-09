@@ -541,7 +541,7 @@ impl ViewerApp {
                 );
             self.app_settings.loop_record_speed_percent = loop_speed;
             if self.app_settings.loop_record_speed_percent != before_loop_speed {
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
             }
             let before_fps = self.media.record_fps;
             egui::ComboBox::from_id_salt("media_record_fps")
@@ -559,7 +559,7 @@ impl ViewerApp {
             self.media.record_fps = normalize_record_fps(self.media.record_fps);
             if self.media.record_fps != before_fps {
                 self.app_settings.record_fps = self.media.record_fps;
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
             }
         });
     }

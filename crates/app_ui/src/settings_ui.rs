@@ -102,7 +102,7 @@ impl ViewerApp {
             .changed()
         {
             self.app_settings.show_radar_labels = show;
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
             ctx.request_repaint();
         }
         ui.add_enabled_ui(self.app_settings.show_radar_labels, |ui| {
@@ -119,7 +119,7 @@ impl ViewerApp {
                     });
                 if style.key() != self.app_settings.radar_label_style {
                     self.app_settings.radar_label_style = style.key().to_owned();
-                    let _ = self.app_settings.save();
+                    self.mark_app_settings_dirty();
                     ctx.request_repaint();
                 }
             });
@@ -753,7 +753,7 @@ impl ViewerApp {
                 // Smooth display checkbox.
                 self.app_settings.smooth_display =
                     self.display_smoothing != SmoothingMode::Native;
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
                 ctx.request_repaint();
             }
         });
@@ -779,7 +779,7 @@ impl ViewerApp {
                 && option != current
             {
                 self.app_settings.units = option.slug().to_owned();
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
                 ctx.request_repaint();
             }
         })
@@ -819,7 +819,7 @@ impl ViewerApp {
                 && option != current
             {
                 self.app_settings.time_zone = option.slug().to_owned();
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
                 ctx.request_repaint();
             }
         })
@@ -849,7 +849,7 @@ impl ViewerApp {
             {
                 self.basemap_style = style;
                 self.app_settings.basemap_style = style.key().to_owned();
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
                 ctx.request_repaint();
             }
         });
@@ -891,7 +891,7 @@ impl ViewerApp {
                 .app_settings
                 .basemap_line_thickness_percent
                 .clamp(25, 250);
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
             ctx.request_repaint();
         }
         ui.horizontal(|ui| {
@@ -907,7 +907,7 @@ impl ViewerApp {
                 )
                 .changed()
             {
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
             }
         });
         if ui
@@ -920,7 +920,7 @@ impl ViewerApp {
             )
             .changed()
         {
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
             ctx.request_repaint();
         }
         if ui
@@ -931,7 +931,7 @@ impl ViewerApp {
             .changed()
         {
             self.app_settings.bold_labels = self.bold_labels;
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
             ctx.request_repaint();
         }
         if ui
@@ -939,7 +939,7 @@ impl ViewerApp {
             .on_hover_text("Show basemap latitude/longitude grid lines and labels. Hotkey: G")
             .changed()
         {
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
             ctx.request_repaint();
         }
         if ui
@@ -949,7 +949,7 @@ impl ViewerApp {
             )
             .changed()
         {
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
             ctx.request_repaint();
         }
         if self.app_settings.show_tropical {
@@ -965,7 +965,7 @@ impl ViewerApp {
                     )
                     .changed()
                 {
-                    let _ = self.app_settings.save();
+                    self.mark_app_settings_dirty();
                     ctx.request_repaint();
                 }
             });
@@ -979,7 +979,7 @@ impl ViewerApp {
             )
             .changed()
         {
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
             ctx.request_repaint();
         }
         if ui
@@ -1004,7 +1004,7 @@ impl ViewerApp {
             )
             .changed()
         {
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
         }
         if ui
             .checkbox(
@@ -1018,7 +1018,7 @@ impl ViewerApp {
             )
             .changed()
         {
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
         }
         ui.horizontal(|ui| {
             ui.label("Workspace");
@@ -1066,7 +1066,7 @@ impl ViewerApp {
                     .pick_folder()
             {
                 self.set_data_folder_override_in_memory(dir);
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
             }
             let has_data_folder_override = !self.app_settings.data_dir.trim().is_empty();
             if ui
@@ -1079,7 +1079,7 @@ impl ViewerApp {
                 .clicked()
             {
                 self.reset_data_folder_override_in_memory();
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
             }
         });
     }
@@ -1110,7 +1110,7 @@ impl ViewerApp {
                 && option != current
             {
                 self.app_settings.raster_quality = option.as_slug().to_owned();
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
                 ctx.request_repaint();
             }
         })
@@ -1135,7 +1135,7 @@ impl ViewerApp {
             .changed()
         {
             self.app_settings.raster_high_res_whole_loop = whole_loop;
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
             ctx.request_repaint();
         }
         if self.app_settings.raster_high_res_whole_loop {
@@ -1201,7 +1201,7 @@ impl ViewerApp {
             if !self.app_settings.alert_flash_enabled {
                 self.unacknowledged_hazard_event_ids.clear();
             }
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
         }
         ui.add_enabled_ui(self.app_settings.alert_flash_enabled, |ui| {
             ui.label("Flashing warning types");
@@ -1214,7 +1214,7 @@ impl ViewerApp {
                         family,
                         enabled,
                     );
-                    let _ = self.app_settings.save();
+                    self.mark_app_settings_dirty();
                 }
             }
             if self.app_settings.alert_flash_families.is_empty() {
@@ -1232,7 +1232,7 @@ impl ViewerApp {
             )
             .changed()
         {
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
         }
 
         ui.add_enabled_ui(self.app_settings.alert_sound_enabled, |ui| {
@@ -1253,7 +1253,7 @@ impl ViewerApp {
                         .pick_file()
                 {
                     self.app_settings.alert_sound_path = path.display().to_string();
-                    let _ = self.app_settings.save();
+                    self.mark_app_settings_dirty();
                 }
                 if ui
                     .button("System")
@@ -1261,7 +1261,7 @@ impl ViewerApp {
                     .clicked()
                 {
                     self.app_settings.alert_sound_path.clear();
-                    let _ = self.app_settings.save();
+                    self.mark_app_settings_dirty();
                 }
                 if ui
                     .button("Test")
@@ -1281,7 +1281,7 @@ impl ViewerApp {
                         family,
                         enabled,
                     );
-                    let _ = self.app_settings.save();
+                    self.mark_app_settings_dirty();
                 }
             }
             if self.app_settings.alert_sound_families.is_empty() {
@@ -1299,7 +1299,7 @@ impl ViewerApp {
             )
             .changed()
         {
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
         }
         ui.add_enabled_ui(self.app_settings.radar_update_sound_enabled, |ui| {
             ui.horizontal(|ui| {
@@ -1319,7 +1319,7 @@ impl ViewerApp {
                         .pick_file()
                 {
                     self.app_settings.radar_update_sound_path = path.display().to_string();
-                    let _ = self.app_settings.save();
+                    self.mark_app_settings_dirty();
                 }
                 if ui
                     .button("System")
@@ -1327,7 +1327,7 @@ impl ViewerApp {
                     .clicked()
                 {
                     self.app_settings.radar_update_sound_path.clear();
-                    let _ = self.app_settings.save();
+                    self.mark_app_settings_dirty();
                 }
                 if ui
                     .button("Test")
@@ -1767,6 +1767,21 @@ impl ViewerApp {
     /// restarts (spec §1). A future Appearance section (style registry
     /// surfaces, docs/customization-spec.md §5) slots in beside these.
     pub(crate) fn settings_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if let Some(persistence) = self.settings_persistence.status_view(Instant::now()) {
+            let color = match persistence.level {
+                settings_persistence::PersistenceNoticeLevel::Success => {
+                    egui::Color32::from_rgb(108, 218, 142)
+                }
+                settings_persistence::PersistenceNoticeLevel::Warning => {
+                    egui::Color32::from_rgb(244, 194, 92)
+                }
+                settings_persistence::PersistenceNoticeLevel::Error => {
+                    egui::Color32::from_rgb(245, 104, 104)
+                }
+            };
+            ui.colored_label(color, persistence.detail);
+            ui.separator();
+        }
         self.remembered_section(ui, "settings_display", "Display", true, |app, ui| {
             app.display_settings_section(ui, ctx);
         });
@@ -1849,7 +1864,12 @@ impl ViewerApp {
                         .set_title(format!("Export {display_name} settings"))
                         .save_file()
                 {
-                    match std::fs::write(&path, self.app_settings.to_json()) {
+                    match settings::atomic_write_json_with_backup_validator(
+                        &path,
+                        &self.app_settings,
+                        settings::MAX_JSON_DOCUMENT_BYTES,
+                        |text| serde_json::from_str::<settings::AppSettings>(text).is_ok(),
+                    ) {
                         Ok(()) => self.status = format!("Exported settings to {}", path.display()),
                         Err(error) => self.status = format!("Settings export failed: {error}"),
                     }
@@ -1936,7 +1956,7 @@ impl ViewerApp {
             {
                 self.model_keep_runs = keep;
                 self.app_settings.model_keep_runs = keep;
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
             }
         });
         ui.weak(format!("Store: {}", settings::model_store_dir().display()))

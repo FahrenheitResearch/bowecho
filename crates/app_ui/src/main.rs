@@ -89,6 +89,7 @@ mod sat_paint;
 mod sat_window;
 mod sat_worker;
 mod self_update;
+mod settings_persistence;
 mod settings_ui;
 mod sites_ui;
 mod spc_layers;
@@ -1244,8 +1245,8 @@ const BASEMAP_US_DETAIL_BOUNDS: &[[f32; 4]] = &[
 ];
 const RAYON_NUM_THREADS_ENV: &str = "RAYON_NUM_THREADS";
 
-fn load_startup_settings() -> settings::AppSettings {
-    settings::AppSettings::load_with_distribution_default(
+fn load_startup_settings_report() -> settings::LoadedAppSettings {
+    settings::AppSettings::load_with_distribution_default_report(
         option_env!("BOWECHO_DEFAULT_BRAND"),
         option_env!("BOWECHO_STORAGE_NAMESPACE"),
     )
@@ -1296,9 +1297,15 @@ fn main() -> eframe::Result {
     // finishes exiting; failures stay silent and retry next launch).
     cleanup_stale_update_artifacts();
     let input_path = std::env::args_os().nth(1).map(PathBuf::from);
-    let startup_name = brand::window_title(&load_startup_settings().brand);
+    let startup_settings = load_startup_settings_report();
+    let startup_name = brand::window_title(&startup_settings.settings.brand);
 
-    let result = match run_bowecho_native(eframe::Renderer::Wgpu, input_path.clone(), None) {
+    let result = match run_bowecho_native(
+        eframe::Renderer::Wgpu,
+        input_path.clone(),
+        None,
+        startup_settings.clone(),
+    ) {
         Ok(()) => Ok(()),
         Err(err) if should_retry_startup_with_glow(&err) => {
             eprintln!(
@@ -1308,6 +1315,7 @@ fn main() -> eframe::Result {
                 eframe::Renderer::Glow,
                 input_path,
                 Some(WGPU_TO_GLOW_FALLBACK_NOTICE.to_owned()),
+                startup_settings,
             )
         }
         Err(err) => Err(err),
@@ -1375,13 +1383,21 @@ fn run_bowecho_native(
     renderer: eframe::Renderer,
     input_path: Option<PathBuf>,
     startup_notice: Option<String>,
+    startup_settings: settings::LoadedAppSettings,
 ) -> eframe::Result {
-    let startup_settings = load_startup_settings();
-    let title = brand::window_title(&startup_settings.brand);
+    let title = brand::window_title(&startup_settings.settings.brand);
+    let native_options = bowecho_native_options(renderer, &startup_settings.settings.brand);
     eframe::run_native(
         &title,
-        bowecho_native_options(renderer, &startup_settings.brand),
-        Box::new(move |cc| Ok(Box::new(ViewerApp::new(cc, input_path, startup_notice)))),
+        native_options,
+        Box::new(move |cc| {
+            Ok(Box::new(ViewerApp::new(
+                cc,
+                input_path,
+                startup_notice,
+                startup_settings,
+            )))
+        }),
     )
 }
 
@@ -2636,6 +2652,7 @@ struct ViewerApp {
     sites: Vec<RadarSite>,
     selected_site_index: usize,
     app_settings: settings::AppSettings,
+    settings_persistence: settings_persistence::SettingsPersistence,
     radar_layers: Vec<OverlayView>,
     radar_overlays_open: bool,
     next_radar_layer_id: u64,
@@ -7770,8 +7787,12 @@ impl ViewerApp {
         cc: &eframe::CreationContext<'_>,
         source_path: Option<PathBuf>,
         startup_notice: Option<String>,
+        loaded_app_settings: settings::LoadedAppSettings,
     ) -> Self {
-        let app_settings = load_startup_settings();
+        let settings::LoadedAppSettings {
+            settings: app_settings,
+            status: app_settings_load_status,
+        } = loaded_app_settings;
         settings::set_storage_namespace(app_settings.brand.effective_storage_namespace());
         configure_style(&cc.egui_ctx, &app_settings.brand);
         // CJK fallback before the first frame: Japanese site names render
@@ -7883,6 +7904,11 @@ impl ViewerApp {
         let loaded_styles = styles::load();
         let style_registry = styles::StyleRegistry::from_settings(&loaded_styles.settings);
         let initial_radar_opacity = style_registry.drapes().radar_opacity;
+        let settings_persistence = settings_persistence::SettingsPersistence::from_load_statuses(
+            app_settings_load_status,
+            loaded_styles.status.clone(),
+            Instant::now(),
+        );
 
         let restored_model_keep_runs = app_settings.model_keep_runs;
         let restored_model_slug = app_settings.model_slug.clone();
@@ -7975,6 +8001,7 @@ impl ViewerApp {
             sites,
             selected_site_index,
             app_settings,
+            settings_persistence,
             radar_layers: Vec::new(),
             radar_overlays_open: false,
             next_radar_layer_id: 1,
@@ -11997,7 +12024,7 @@ impl ViewerApp {
         {
             self.app_settings.archive_frame_count = count;
             self.app_settings.archive_load_loop = self.archive_load_loop;
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
         }
     }
 
@@ -12013,7 +12040,7 @@ impl ViewerApp {
         self.storm_track_min_dbz = min_dbz;
         self.app_settings.storm_track_max_tracks = max_tracks as u16;
         self.app_settings.storm_track_min_dbz_tenths = (min_dbz * 10.0).round() as u16;
-        let _ = self.app_settings.save();
+        self.mark_app_settings_dirty();
         self.storm_tracker.clear();
         self.storm_track_follow = None;
         self.storm_cells_volume_ptr = 0;
@@ -18896,7 +18923,12 @@ impl eframe::App for ViewerApp {
         }
 
         // Workspace layout persistence (debounced; on_exit flushes).
-        self.maybe_persist_workspace_layout();
+        self.maybe_persist_workspace_layout(&ctx);
+        // Coalesce interactive settings/style edits; on_exit performs a final
+        // flush even when the debounce deadline has not elapsed. This runs
+        // after layout persistence so a newly queued layout save schedules
+        // its own deadline repaint too.
+        self.maybe_flush_settings_persistence(&ctx);
         self.request_repaint_for_background_activity(&ctx);
     }
 
@@ -18913,6 +18945,7 @@ impl eframe::App for ViewerApp {
         if self.workspace.dirty {
             self.persist_workspace_layout();
         }
+        self.flush_settings_persistence();
     }
 }
 
@@ -19866,13 +19899,13 @@ impl ViewerApp {
         self.sweep_controls_open = open;
         if reset_simple {
             self.app_settings.loop_sweep_control = None;
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
             self.refresh_sweep_control_selection(ctx);
             self.unified_player
                 .mark_status("Advanced sweep controls reset to simple defaults");
         } else if changed {
             self.app_settings.loop_sweep_control = Some(control);
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
             self.refresh_sweep_control_selection(ctx);
             self.unified_player
                 .mark_status("Advanced sweep controls updated");
@@ -20029,12 +20062,12 @@ impl ViewerApp {
             }
             Some(unified_player::UnifiedPlayerAction::SetLoopSpeedPercent(speed)) => {
                 self.app_settings.loop_speed_percent = speed;
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
                 ctx.request_repaint_after(Duration::from_millis(self.screen_loop_frame_ms()));
             }
             Some(unified_player::UnifiedPlayerAction::SetLowSweepsEnabled(enabled)) => {
                 self.app_settings.loop_low_sweeps = enabled;
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
                 self.refresh_sweep_control_selection(ctx);
             }
             Some(unified_player::UnifiedPlayerAction::SetLowSweepFilter(index)) => {
@@ -20044,7 +20077,7 @@ impl ViewerApp {
                     .unwrap_or_default();
                 self.app_settings.loop_low_sweep_filter = filter.key().to_owned();
                 self.app_settings.loop_sweep_control = None;
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
                 self.refresh_sweep_control_selection(ctx);
                 self.unified_player
                     .mark_status(format!("Low-sweep mode: {}", filter.label()));
@@ -20982,7 +21015,7 @@ impl ViewerApp {
 
     #[cfg(any(windows, target_os = "macos"))]
     fn import_app_settings_from_path(&mut self, path: &Path) {
-        let text = match std::fs::read_to_string(path) {
+        let text = match settings::read_text_capped(path, settings::MAX_JSON_DOCUMENT_BYTES) {
             Ok(text) => text,
             Err(error) => {
                 self.status = format!("Settings import failed: {error}");
@@ -21022,7 +21055,7 @@ impl ViewerApp {
                         .map_err(|error| error.to_string())
                 })
         } else {
-            styles::save_to_path(&self.style_settings, path)
+            styles::save_to_path(&self.style_settings, path).map_err(|error| error.to_string())
         };
         match result {
             Ok(()) => self.status = format!("Exported appearance to {}", path.display()),
@@ -21836,7 +21869,7 @@ impl ViewerApp {
             {
                 self.app_settings.live_low_sweep_auto_advance = false;
                 self.app_settings.live_low_sweep_auto_advance_seconds = low_sweep_seconds;
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
             }
             let mut live_preload = normalized_live_preload_frame_count(usize::from(
                 self.app_settings.live_preload_frame_count,
@@ -21856,7 +21889,7 @@ impl ViewerApp {
                 .changed()
             {
                 self.app_settings.live_preload_frame_count = live_preload as u16;
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
             }
             // Native file dialog (Windows/macOS; Linux needs the GTK dev
             // libs rfd's portal backends pull in — same gating as the
@@ -22541,7 +22574,7 @@ impl ViewerApp {
             {
                 self.gate_filter_dbz = on.then_some(5.0);
                 self.app_settings.gate_filter_decidbz = self.gate_filter_key_setting();
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
                 self.clear_texture();
                 ctx.request_repaint();
             }
@@ -22557,7 +22590,7 @@ impl ViewerApp {
                         .changed()
                 {
                     self.app_settings.gate_filter_decidbz = self.gate_filter_key_setting();
-                    let _ = self.app_settings.save();
+                    self.mark_app_settings_dirty();
                     self.clear_texture();
                     ctx.request_repaint();
                 }
@@ -23001,7 +23034,7 @@ impl ViewerApp {
                 );
             if speed != self.app_settings.loop_speed_percent {
                 self.app_settings.loop_speed_percent = speed;
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
                 let frame_ms = self.screen_loop_frame_ms();
                 ctx.request_repaint_after(Duration::from_millis(frame_ms));
             }
@@ -23014,7 +23047,7 @@ impl ViewerApp {
                 .changed()
             {
                 self.app_settings.loop_low_sweeps = low_sweeps;
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
                 self.select_first_extra_pane_low_sweep_if_enabled(pane_slot, ctx);
                 ctx.request_repaint();
             }
@@ -23213,7 +23246,7 @@ impl ViewerApp {
                 );
             if speed != self.app_settings.loop_speed_percent {
                 self.app_settings.loop_speed_percent = speed;
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
                 let frame_ms = self.screen_loop_frame_ms();
                 ctx.request_repaint_after(Duration::from_millis(frame_ms));
             }
@@ -23226,7 +23259,7 @@ impl ViewerApp {
                 .changed()
             {
                 self.app_settings.loop_low_sweeps = low_sweeps;
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
                 self.select_first_history_low_sweep_if_enabled(ctx);
                 ctx.request_repaint();
             }
@@ -24054,15 +24087,13 @@ impl ViewerApp {
         ctx.request_repaint();
     }
 
-    /// Persist styles.json (best-effort; disabled when the file came from
-    /// a newer BowEcho so we never clobber a schema we don't understand).
+    /// Queue styles.json for the shared debounce lane. Disabled when the file
+    /// came from a newer BowEcho so this build cannot clobber its schema.
     fn save_styles(&mut self) {
         if self.styles_newer_schema {
             return;
         }
-        if let Err(error) = styles::save(&self.style_settings) {
-            self.status = format!("Style save failed: {error}");
-        }
+        self.mark_style_settings_dirty();
     }
 
     fn clear_map_tile_cache(&mut self, ctx: &egui::Context) {
@@ -24570,6 +24601,22 @@ impl ViewerApp {
             let height = ui.available_height();
             ui.add_sized([230.0, height], egui::Label::new(&self.status).truncate());
             ui.separator();
+            if let Some(persistence) = self.settings_persistence.status_view(Instant::now()) {
+                let color = match persistence.level {
+                    settings_persistence::PersistenceNoticeLevel::Success => {
+                        egui::Color32::from_rgb(108, 218, 142)
+                    }
+                    settings_persistence::PersistenceNoticeLevel::Warning => {
+                        egui::Color32::from_rgb(244, 194, 92)
+                    }
+                    settings_persistence::PersistenceNoticeLevel::Error => {
+                        egui::Color32::from_rgb(245, 104, 104)
+                    }
+                };
+                ui.label(egui::RichText::new(persistence.short).small().color(color))
+                    .on_hover_text(persistence.detail);
+                ui.separator();
+            }
             if let Some(activity) = self.active_background_activity() {
                 let duplicate_status = activity.label.trim() == self.status.trim();
                 if !duplicate_status {
@@ -25119,7 +25166,7 @@ impl ViewerApp {
         let value = dock.sounding_view_state_json();
         if self.app_settings.sounding_view_state.as_ref() != Some(&value) {
             self.app_settings.sounding_view_state = Some(value);
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
         }
     }
 
@@ -25132,7 +25179,7 @@ impl ViewerApp {
         let value = dock.style_overrides_json();
         if self.app_settings.model_style_overrides.as_ref() != Some(&value) {
             self.app_settings.model_style_overrides = Some(value);
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
         }
     }
 
@@ -25146,7 +25193,7 @@ impl ViewerApp {
         let value = dock.wrf_process_options_json();
         if self.app_settings.wrf_process_options.as_ref() != Some(&value) {
             self.app_settings.wrf_process_options = Some(value);
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
         }
     }
 
@@ -25160,7 +25207,7 @@ impl ViewerApp {
         let value = dock.wrf_synth_radar_json();
         if self.app_settings.wrf_synth_radar.as_ref() != Some(&value) {
             self.app_settings.wrf_synth_radar = Some(value);
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
         }
     }
 
@@ -25173,21 +25220,22 @@ impl ViewerApp {
         let value = self.workspace.to_persisted(viewers);
         if self.app_settings.workspace_layout.as_ref() != Some(&value) {
             self.app_settings.workspace_layout = Some(value);
-            let _ = self.app_settings.save();
+            self.mark_app_settings_dirty();
         }
     }
 
     /// Debounced layout persist: a split-drag marks dirty every frame, so
     /// write only once the edits go quiet (on_exit flushes the rest).
-    fn maybe_persist_workspace_layout(&mut self) {
+    fn maybe_persist_workspace_layout(&mut self, ctx: &egui::Context) {
         const QUIET: Duration = Duration::from_millis(750);
-        if self.workspace.dirty
-            && self
-                .workspace
-                .last_edit
-                .is_none_or(|at| at.elapsed() >= QUIET)
-        {
+        if !self.workspace.dirty {
+            return;
+        }
+        let elapsed = self.workspace.last_edit.map(|at| at.elapsed());
+        if elapsed.is_none_or(|elapsed| elapsed >= QUIET) {
             self.persist_workspace_layout();
+        } else if let Some(elapsed) = elapsed {
+            ctx.request_repaint_after(QUIET.saturating_sub(elapsed));
         }
     }
 
@@ -61227,6 +61275,7 @@ mod tests {
             sites: Vec::new(),
             selected_site_index: 0,
             app_settings: settings::AppSettings::default(),
+            settings_persistence: settings_persistence::SettingsPersistence::default(),
             radar_layers: Vec::new(),
             radar_overlays_open: false,
             next_radar_layer_id: 1,

@@ -489,7 +489,7 @@ impl crate::ViewerApp {
                 self.app_settings.event_before_scans = Some(before);
                 self.app_settings.event_after_scans = Some(after);
                 self.app_settings.event_max_frames = max_frames;
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
             }
             let mut sync_warnings = self.app_settings.event_sync_warnings;
             if ui
@@ -500,7 +500,7 @@ impl crate::ViewerApp {
                 .changed()
             {
                 self.app_settings.event_sync_warnings = sync_warnings;
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
             }
             let mut camera_follow = self.app_settings.event_track_camera_follow;
             if ui
@@ -514,7 +514,7 @@ impl crate::ViewerApp {
                 if !camera_follow {
                     self.clear_camera_follow_targets();
                 }
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
             }
             let mut auto_model = self.app_settings.event_track_auto_model;
             let mut model_slug =
@@ -540,7 +540,7 @@ impl crate::ViewerApp {
             {
                 self.app_settings.event_track_auto_model = auto_model;
                 self.app_settings.event_track_model_slug = model_slug;
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
             }
             if self.event_explorer.fetch.is_some() {
                 ui.spinner();

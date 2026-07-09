@@ -1059,7 +1059,7 @@ impl ViewerApp {
             }
             if glm_style_changed {
                 self.app_settings.glm_show_last_minutes = next_window_min.clamp(1, 60) as u16;
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
                 ctx.request_repaint();
             }
             if row_changed {

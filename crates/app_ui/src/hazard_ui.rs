@@ -19,7 +19,7 @@ impl ViewerApp {
                 .changed()
             {
                 self.app_settings.show_hazard_labels = show_labels;
-                let _ = self.app_settings.save();
+                self.mark_app_settings_dirty();
                 ui.ctx().request_repaint();
             }
             ui.checkbox(&mut self.hazards_active_only, "Active only")
@@ -111,7 +111,7 @@ impl ViewerApp {
                         if let Some(family) = filter.family() {
                             app.hidden_hazard_families.remove(family);
                         }
-                        let _ = app.app_settings.save();
+                        app.mark_app_settings_dirty();
                         ui.ctx().request_repaint();
                     }
 
@@ -127,7 +127,7 @@ impl ViewerApp {
                         });
                     if sort.key() != app.app_settings.current_alert_sort {
                         app.app_settings.current_alert_sort = sort.key().to_owned();
-                        let _ = app.app_settings.save();
+                        app.mark_app_settings_dirty();
                     }
                 });
                 ui.weak(format!("{} shown of {} loaded", rows.len(), total));
@@ -428,7 +428,7 @@ impl ViewerApp {
                     {
                         app.app_settings.warning_refresh_seconds =
                             secs.max(MIN_LIVE_HAZARD_REFRESH_SECONDS);
-                        let _ = app.app_settings.save();
+                        app.mark_app_settings_dirty();
                         ui.ctx().request_repaint();
                     }
                 });
@@ -444,7 +444,7 @@ impl ViewerApp {
                         .hint_text("https://host/warnings.geojson"),
                 );
                 if response.lost_focus() {
-                    let _ = app.app_settings.save();
+                    app.mark_app_settings_dirty();
                 }
                 if !app.app_settings.warning_provider_url.trim().is_empty()
                     && custom_warning_provider_url(&app.app_settings.warning_provider_url).is_none()
