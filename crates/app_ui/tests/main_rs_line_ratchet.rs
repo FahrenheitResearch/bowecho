@@ -16,8 +16,13 @@
 //! - map_paint sub-move C (markers): 64,519 lines (ceiling deferred).
 //! - map_paint sub-move D (layers): 63,621 lines → ceiling 63,821. map_paint
 //!   decomposition COMPLETE (projection + chrome + markers + layers extracted).
+//! - 2026-07-08 owner-requested TEMPORARY raise 63,821 → 64,500: give near-term
+//!   in-place fixes headroom after phase-1 extraction consumed the easy slack.
+//!   This is the ONE sanctioned exception to shrink-only; lower it again via a
+//!   module extraction or phase-2 (LoopEngine absorption). Do not treat as a
+//!   new normal — new feature code still goes in modules, not main.rs.
 
-const CEILING: usize = 63_821;
+const CEILING: usize = 64_500;
 
 #[test]
 fn main_rs_stays_under_the_line_ratchet_ceiling() {
