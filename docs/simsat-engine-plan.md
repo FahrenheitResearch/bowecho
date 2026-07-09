@@ -167,7 +167,7 @@ This section exists so the plan is executable without the context of the session
 - All verification runs on the build nodes over ssh: push your branch to the node's bare repo first (`git push node3|node4 HEAD:refs/heads/<branch>` — node3 = drew@192.168.68.56, node4 = drew@192.168.68.57; the verify script fetches from the node's LOCAL repo, pushing to origin alone fails with exit 3), then run each gate FOREGROUND: `ssh -o BatchMode=yes drew@<ip> "flock -w 3600 /tmp/bowecho-verify.lock env BOWECHO_BRANCH='<branch>' bash ~/bowecho-verify.sh <cargo args>"` for `fmt --all --check`, `clippy --workspace --all-targets -- -D warnings`, `test --workspace`. Never leave a gate unverified; on a client timeout, re-run (node caches make retries fast).
 - Work in a git worktree branched from the integration tip; commit early and often (uncommitted worktrees have been lost); checkpoint findings to a notes file under `C:\Users\drew\radar-work\` as you go.
 - Nodes are headless Linux: no GPU, no golden-image tests — the §9 test strategy (CPU reference kernels, naga validation, pure-math round trips) is the CI story; visual proofs happen on the owner's box via a locally built exe the owner runs.
-- Never touch `~/weather` on the nodes (owner data). Do not add lines to `crates/app_ui/src/main.rs` (a ratchet test enforces a shrinking ceiling).
+- Never touch `~/weather` on the nodes (owner data). Prefer cohesive SimSat modules, but the former `main.rs` line-count ratchet is currently discontinued.
 
 **Owner-side facts:**
 - The Enderlin canonical fixture lives on the owner's machine under his `wrf_demo` folder (2.4 GB, 800×800×79); ask the owner to confirm the path before M0 ingest testing, and NEVER import it with the heavy full-diagnostics path.

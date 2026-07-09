@@ -22,7 +22,7 @@ Every phase-1 commit is a *mechanical move* whose correctness is machine-checkab
 3. **Review with `git diff --color-moved=dimmed-zebra`.** Pure moves render as dimmed moved blocks; ANY in-body edit lights up. The diff itself is the QA evidence — no manual retest of the feature is required for a clean move-only diff.
 4. **Full gates per commit** on the build nodes: `fmt --all --check`, `clippy --workspace --all-targets -- -D warnings`, `test --workspace` (1,790+ tests). Identical pass/fail count before and after.
 5. **One extraction per commit**, revertable in isolation. No extraction depends on another landing first.
-6. **The ratchet:** a unit test asserts main.rs's line count is ≤ a checked-in ceiling, lowered with every extraction. Features can no longer silently grow the monolith — new feature code goes in modules (which v0.29.x already did informally: tropical, media, annotate, layers_rail, sat_worker… all live outside).
+6. **Historical ratchet (currently discontinued):** phase 1 used a checked-in line ceiling to keep extraction moving. The owner discontinued that test on 2026-07-09. Cohesive module ownership remains preferred, but line count is no longer a gate and must not block a correct in-place fix.
 
 If any step deviates from mechanical (a borrow-checker fight, a needed signature change), that extraction is **paused and split**: land the mechanical part, open the semantic part as its own reviewed change. Never mix.
 
@@ -49,7 +49,7 @@ If any step deviates from mechanical (a borrow-checker fight, a needed signature
 
 Projected: main.rs shrinks ~28k lines (~35%) through step 8, and — more importantly — the five busiest editing fronts (satellite, hazards, settings, painting, updates) each get their own file.
 
-**PHASE 1 COMPLETE (2026-07-08).** All 8 queue items landed. Item 8 (`map_paint.rs`) extracted in 4 move-only sub-moves — A projection, B chrome, C markers, D layers (recon: `radar-work/map-paint-recon-notes.md`); LoopEngine Phase-4e blocker was confirmed cleared first. `single_pane_canvas`/`grid_canvas` (input+dispatch) and the `handle_*_click` cluster stay in main.rs by design — that forces the `pub(crate)` promotions and matches the sat_paint/hazard_ui precedent; feature painters (spc/mping/glm/obs/model/storm) were excluded to keep their own module homes. Net: **main.rs 79,177 → 63,621 lines (−15,556, −19.6%)**, `map_paint.rs` = 4,449 lines. Every extraction gated move-only at exact test parity. Ratchet ceiling now 63,821.
+**PHASE 1 COMPLETE (2026-07-08).** All 8 queue items landed. Item 8 (`map_paint.rs`) extracted in 4 move-only sub-moves — A projection, B chrome, C markers, D layers (recon: `radar-work/map-paint-recon-notes.md`); LoopEngine Phase-4e blocker was confirmed cleared first. `single_pane_canvas`/`grid_canvas` (input+dispatch) and the `handle_*_click` cluster stay in main.rs by design — that forces the `pub(crate)` promotions and matches the sat_paint/hazard_ui precedent; feature painters (spc/mping/glm/obs/model/storm) were excluded to keep their own module homes. Net: **main.rs 79,177 → 63,621 lines (−15,556, −19.6%)**, `map_paint.rs` = 4,449 lines. Every extraction gated move-only at exact test parity. The phase-1 line-count ratchet was later discontinued by the owner on 2026-07-09.
 
 ## Phase 2 (separate approval) — state absorption
 
@@ -61,6 +61,6 @@ Crate split behind a `ViewerApp`-core crate for compile-time wins. Not planned; 
 
 ## Working agreement (starts now)
 
-- New feature code goes in modules, never appended to main.rs (the ratchet test enforces it).
+- Prefer new modules for genuinely cohesive ownership; do not create artificial modules solely to satisfy a line count. No main.rs line-count test is currently enforced.
 - Parallel agents each own distinct modules; the integrator refuses two concurrent tracks on the same new module.
 - Extraction commits and feature commits never mix.
