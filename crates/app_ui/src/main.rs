@@ -1327,21 +1327,41 @@ fn bowecho_native_options(
     });
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            // Open maximized: the owner runs a wide screen and a small default
-            // window made every floating viewer (Model, Sounding, ...) feel
-            // cramped and need stretching. eframe is built without the
-            // `persistence` feature, so no saved geometry is being overridden —
-            // this default applies on every launch. No explicit inner_size:
-            // pairing it with `with_maximized` left the window at 1500x950 on
-            // Windows instead of filling the screen (winit quirk); the App's
-            // first-frame ViewportCommand::Maximized backs this up regardless.
-            // `min_inner_size` is the floor for a manual restore-down.
-            .with_maximized(true)
+            // Startup size: `inner_size` here is only the pre-first-frame
+            // fallback — the real default is computed per-monitor on the first
+            // frame (see `adaptive_startup_inner_size`), because one fixed size
+            // can't serve both a 16:9 laptop and a 31:9 super-ultrawide, and
+            // maximizing was rejected (uber-wide on ultrawides). eframe is
+            // built without the `persistence` feature, so no saved geometry is
+            // overridden. `min_inner_size` is the floor for a manual resize.
+            .with_inner_size([1500.0, 950.0])
             .with_min_inner_size([1120.0, 700.0])
             .with_icon(icon),
         renderer,
         ..Default::default()
     }
+}
+
+/// Default window size for the monitor the app opened on, in points.
+///
+/// One fixed default can't serve every display: 1500x950 is cramped on a
+/// 27" 1440p, while "maximized" fills a 5120-wide super-ultrawide edge to
+/// edge (owner-rejected). Instead: take most of the monitor's height, and
+/// most of its width but capped near a wide-but-sane aspect so ultrawides
+/// get a large window, not a wall-to-wall one.
+///
+/// Returns `None` when the monitor size is unknown or degenerate — the
+/// caller then keeps the `ViewportBuilder` fallback size.
+fn adaptive_startup_inner_size(monitor: egui::Vec2) -> Option<egui::Vec2> {
+    if !monitor.x.is_finite() || !monitor.y.is_finite() || monitor.x < 800.0 || monitor.y < 600.0 {
+        return None;
+    }
+    // 85% of height leaves room for the taskbar/dock plus window chrome.
+    let h = monitor.y * 0.85;
+    // 90% of width on normal displays; on ultrawides cap the width at 1.9x
+    // the height (a bit wider than 16:9) so the window stays usable.
+    let w = (monitor.x * 0.90).min(h * 1.9);
+    Some(egui::vec2(w, h))
 }
 
 fn run_bowecho_native(
@@ -2798,11 +2818,11 @@ struct ViewerApp {
     /// Model-data dock (rusty-weather rw-ui panels), created on first open.
     model_dock: Option<model_data::ModelDataDock>,
     model_dock_open: bool,
-    /// One-shot latch for the startup maximize: eframe's builder maximize is
-    /// unreliable on Windows when combined with an explicit inner size, so we
-    /// also send a ViewportCommand::Maximized on the first frame. Sent once so
-    /// the user can freely restore/resize the window afterward.
-    initial_maximize_done: bool,
+    /// One-shot latch for the startup window sizing: the monitor size is only
+    /// known once the event loop is running, so the per-monitor default
+    /// (`adaptive_startup_inner_size`) is applied via a ViewportCommand on the
+    /// first frame. Sent once so the user can freely resize afterward.
+    initial_viewport_sized: bool,
     model_timeline_follow: bool,
     model_timeline_last_key: Option<rw_ui::HourKey>,
     /// GOES satellite frame as a map layer (under everything weather).
@@ -7880,7 +7900,7 @@ impl ViewerApp {
             workspace: dock::Workspace::default(),
             model_dock: None,
             model_dock_open: false,
-            initial_maximize_done: false,
+            initial_viewport_sized: false,
             model_timeline_follow: false,
             model_timeline_last_key: None,
             sat_layer: None,
@@ -18273,14 +18293,17 @@ impl ViewerApp {
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        // Startup maximize: the ViewportBuilder `with_maximized(true)` is honored
-        // on this winit build, but on Windows it can leave the window at its
-        // restore size rather than filling the work area. Send the command once
-        // on the first frame so the window reliably opens maximized; the latch
-        // means the user can restore/resize freely afterward.
-        if !self.initial_maximize_done {
-            self.initial_maximize_done = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        // Startup sizing: pick the default window size from the monitor the
+        // app actually opened on (unknown until the event loop runs). One-shot
+        // latch — the user can resize freely afterward.
+        if !self.initial_viewport_sized {
+            self.initial_viewport_sized = true;
+            if let Some(size) = ctx
+                .input(|i| i.viewport().monitor_size)
+                .and_then(adaptive_startup_inner_size)
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
         }
         self.poll_async_site_catalog(&ctx);
         self.poll_async_load(&ctx);
@@ -41602,6 +41625,35 @@ fn radar_rgba_is_premultiplied_compatible(rgba: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn adaptive_startup_size_near_fills_a_16_9_monitor() {
+        let size = adaptive_startup_inner_size(egui::vec2(1920.0, 1080.0)).unwrap();
+        assert_eq!(size.y, 1080.0 * 0.85);
+        // 90% of width is under the 1.9x-height cap on 16:9 → width wins.
+        assert_eq!(size.x, 1920.0 * 0.90);
+        assert!(size.x < 1920.0 && size.y < 1080.0);
+    }
+
+    #[test]
+    fn adaptive_startup_size_caps_width_on_a_super_ultrawide() {
+        // 31:9 5120x1440 (the owner's display): must NOT go wall-to-wall.
+        let size = adaptive_startup_inner_size(egui::vec2(5120.0, 1440.0)).unwrap();
+        assert_eq!(size.y, 1440.0 * 0.85);
+        assert_eq!(size.x, size.y * 1.9);
+        assert!(
+            size.x < 2500.0,
+            "ultrawide width should be capped, got {}",
+            size.x
+        );
+    }
+
+    #[test]
+    fn adaptive_startup_size_rejects_unknown_or_tiny_monitors() {
+        assert!(adaptive_startup_inner_size(egui::vec2(0.0, 0.0)).is_none());
+        assert!(adaptive_startup_inner_size(egui::vec2(640.0, 480.0)).is_none());
+        assert!(adaptive_startup_inner_size(egui::vec2(f32::NAN, 1080.0)).is_none());
+    }
+
     /// Project a lon/lat to screen exactly as `ViewerApp::lon_lat_to_screen`
     /// does (AEQD forward about the map center, scaled to px), without a full
     /// app — lets the cone-culling tests use the real projection.
@@ -60952,7 +61004,7 @@ mod tests {
             workspace: dock::Workspace::default(),
             model_dock: None,
             model_dock_open: false,
-            initial_maximize_done: false,
+            initial_viewport_sized: false,
             model_timeline_follow: false,
             model_timeline_last_key: None,
             sat_layer: None,
