@@ -1327,6 +1327,13 @@ fn bowecho_native_options(
     });
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            // Open maximized: the owner runs a wide screen and a small default
+            // window made every floating viewer (Model, Sounding, ...) feel
+            // cramped and need stretching. eframe is built without the
+            // `persistence` feature, so no saved geometry is being overridden —
+            // this default applies on every launch. `inner_size` remains the
+            // restore-down size; `min_inner_size` is untouched.
+            .with_maximized(true)
             .with_inner_size([1500.0, 950.0])
             .with_min_inner_size([1120.0, 700.0])
             .with_icon(icon),
@@ -28509,7 +28516,10 @@ impl ViewerApp {
         let mut events = Vec::new();
         egui::Window::new("Model data")
             .open(&mut open)
-            .default_size([1080.0, 660.0])
+            // Wide by default: this window lays out Import | model plot | Sounding
+            // side by side, and the old 1080x660 default clipped all three so the
+            // owner had to stretch it on every open. Min is unchanged.
+            .default_size([1360.0, 820.0])
             .min_size([720.0, 420.0])
             .resizable(true)
             .show(ctx, |ui| {
