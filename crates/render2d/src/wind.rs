@@ -360,7 +360,7 @@ pub fn gust_proxy_grid_from_dealiased(
         }
     }
     Some(crate::volumetric::f32_grid_like_pub(
-        &dealiased,
+        dealiased,
         MomentType::Velocity,
         out,
     ))

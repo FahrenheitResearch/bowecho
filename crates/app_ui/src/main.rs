@@ -13846,11 +13846,13 @@ impl ViewerApp {
             let cache = if let Some(d) = derived {
                 build_derived_moment_cache(
                     &request.volume,
-                    request.previous_volume.as_ref(),
-                    request.dealias_env.as_ref(),
+                    DerivedDealiasContext {
+                        previous_volume: request.previous_volume.as_ref(),
+                        environment: request.dealias_env.as_ref(),
+                        engine: request.dealias_engine,
+                    },
                     d,
                     request.cut,
-                    request.dealias_engine,
                     &request.color_tables,
                     request.hail_levels_m,
                     request.smoothing,
@@ -38569,17 +38571,27 @@ fn build_preprocessed_plain_cache(
         .map_err(|err| err.to_string())
 }
 
+#[derive(Clone, Copy)]
+struct DerivedDealiasContext<'a> {
+    previous_volume: Option<&'a Arc<RadarVolume>>,
+    environment: Option<&'a Arc<EnvironmentalWindProfile>>,
+    engine: DealiasEngine,
+}
+
 fn build_derived_moment_cache(
     volume: &Arc<RadarVolume>,
-    previous_volume: Option<&Arc<RadarVolume>>,
-    dealias_env: Option<&Arc<EnvironmentalWindProfile>>,
+    dealias: DerivedDealiasContext<'_>,
     derived: DerivedProduct,
     selected_cut: usize,
-    dealias_engine: DealiasEngine,
     color_tables: &ColorTableSet,
     hail_levels_m: (f32, f32),
     smoothing: SmoothingMode,
 ) -> std::result::Result<ViewportMomentCache, String> {
+    let DerivedDealiasContext {
+        previous_volume,
+        environment: dealias_env,
+        engine: dealias_engine,
+    } = dealias;
     let (geometry_cut, grid) = if derived.is_volume_wide() {
         // Volume products render on the lowest reflectivity tilt.
         // Velocity-based composites render on the lowest VELOCITY cut's
