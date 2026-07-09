@@ -1930,12 +1930,43 @@ impl ViewerApp {
         } else {
             selected_cut
         };
+        let velocity_derived = derived.uses_dealiased_velocity();
+        let previous_volume = (velocity_derived
+            && self.dealias_engine == DealiasEngine::Analyst3d)
+            .then(|| {
+                previous_dealias_reference_volume(
+                    &self.primary.history,
+                    self.primary.cursor.index,
+                    volume,
+                )
+            })
+            .flatten();
+        let dealias_env = (velocity_derived
+            && self.dealias_engine == DealiasEngine::Analyst3d)
+            .then(|| self.dealias_env_profile_for_volume(volume))
+            .flatten();
+        let dealias_context = if velocity_derived {
+            DealiasContextKey::new(
+                self.dealias_engine,
+                previous_volume.as_ref(),
+                dealias_env.as_ref(),
+            )
+        } else {
+            DealiasContextKey::new(DealiasEngine::Region, None, None)
+        };
+        let witness = DealiasGridWitness::with_anchors(
+            volume,
+            previous_volume.as_ref(),
+            dealias_env.as_ref(),
+        );
         let cached = self
             .derived_readout_cache
             .as_ref()
             .filter(|cache| {
                 cache.product == derived
                     && cache.volume_ptr == volume_ptr
+                    && cache.dealias_context == dealias_context
+                    && cache.witness.alive()
                     && cache.cut_key == cut_key
                     && cache.smoothing == smoothing
                     && cache.hail_key == hail_key
@@ -1954,6 +1985,17 @@ impl ViewerApp {
                         .filter(|(_, c)| c.moments.contains_key(&base_moment))
                         .min_by(|a, b| a.1.elevation_deg.total_cmp(&b.1.elevation_deg))
                         .map(|(i, _)| i)?;
+                    let dealiased_grids = (derived == DerivedProduct::Marc).then(|| {
+                        resolve_dealiased_volume_grids(
+                            volume,
+                            previous_volume.as_ref(),
+                            dealias_env.as_ref(),
+                            self.dealias_engine,
+                        )
+                    });
+                    let borrowed_dealiased: Option<Vec<Option<&MomentGrid>>> = dealiased_grids
+                        .as_ref()
+                        .map(|grids| grids.iter().map(Option::as_deref).collect());
                     let grid = match derived {
                         DerivedProduct::CompositeReflectivity => {
                             composite_reflectivity_grid(volume)
@@ -1967,20 +2009,39 @@ impl ViewerApp {
                                 .map(|grids| grids.posh_pct)
                         }
                         DerivedProduct::Poh => poh_grid(volume, hail.0),
-                        DerivedProduct::Marc => marc_grid(volume),
-                        DerivedProduct::GustProxy => gust_proxy_grid(volume),
+                        DerivedProduct::Marc => marc_grid_from_dealiased(
+                            volume,
+                            borrowed_dealiased.as_deref().unwrap_or_default(),
+                        ),
+                        DerivedProduct::GustProxy => resolve_dealiased_grid(
+                            volume,
+                            previous_volume.as_ref(),
+                            dealias_env.as_ref(),
+                            base_idx,
+                            self.dealias_engine,
+                        )
+                            .as_deref()
+                            .and_then(|velocity| {
+                                gust_proxy_grid_from_dealiased(volume, base_idx, velocity)
+                            }),
                         DerivedProduct::AzimuthalShear | DerivedProduct::Divergence => None,
                     }?;
                     (base_idx, grid)
                 } else {
                     let cut = volume.cuts.get(selected_cut)?;
-                    let velocity = cut.moments.get(&MomentType::Velocity)?;
+                    let velocity = resolve_dealiased_grid(
+                        volume,
+                        previous_volume.as_ref(),
+                        dealias_env.as_ref(),
+                        selected_cut,
+                        self.dealias_engine,
+                    )?;
                     let grid = match derived {
                         DerivedProduct::AzimuthalShear => {
-                            render2d::azimuthal_shear_grid(cut, velocity)
+                            render2d::azimuthal_shear_grid_from_dealiased(cut, &velocity)
                         }
                         DerivedProduct::Divergence => {
-                            render2d::radial_divergence_grid(cut, velocity)
+                            render2d::radial_divergence_grid_from_dealiased(cut, &velocity)
                         }
                         _ => return None,
                     };
@@ -1994,6 +2055,8 @@ impl ViewerApp {
                 self.derived_readout_cache = Some(DerivedReadoutCache {
                     product: derived,
                     volume_ptr,
+                    dealias_context,
+                    witness,
                     cut_key,
                     smoothing,
                     hail_key,

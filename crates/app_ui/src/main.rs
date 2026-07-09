@@ -23,11 +23,12 @@ use render2d::{
     CrossSectionSmoothing, ECHO_TOP_THRESHOLD_DBZ, EnvironmentalWindProfile, StormCell,
     StormMotion, StormRelativePaletteCache, StormTrack, StormTracker, TIME_GATE_S,
     ViewportGeometryCache, ViewportMomentCache, ViewportRasterOptions, ViewportSampleCache,
-    VolumeDealiasCache, apply_reflectivity_gate_filter, azimuthal_shear_grid,
+    VolumeDealiasCache, apply_reflectivity_gate_filter, azimuthal_shear_grid_from_dealiased,
     color_family_for_moment, composite_reflectivity_grid, dealias_velocity_grid,
-    dealias_velocity_grid_pyart_region, dealias_velocity_grid_v4, detect_rotation_sites,
-    echo_top_grid, gust_proxy_grid, hail_grids, identify_storm_cells, marc_grid, mehs_grid,
-    moment_cross_section_with_smoothing, poh_grid, radial_divergence_grid,
+    dealias_velocity_grid_pyart_region, dealias_velocity_grid_v4,
+    detect_rotation_sites_from_dealiased, echo_top_grid, gust_proxy_grid_from_dealiased,
+    hail_grids, identify_storm_cells, marc_grid_from_dealiased, mehs_grid,
+    moment_cross_section_with_smoothing, poh_grid, radial_divergence_grid_from_dealiased,
     reflectivity_cross_section_with_smoothing, smooth_moment_grid, storm_relative_velocity_mps,
     upsample_moment_grid, velocity_cross_section_cached_with_smoothing, viewport_rgba_buffer_len,
     viewport_sample_cache_storage_upper_bound, vil_density_grid, vil_grid,
@@ -2675,10 +2676,10 @@ struct ViewerApp {
     /// Detection runs on a BACKGROUND thread once per volume — the UI thread
     /// only spawns, polls, and draws (speed doctrine: zero hot-path cost).
     rotation_markers: Vec<RotationMarker>,
-    rotation_markers_volume_ptr: usize,
+    rotation_markers_key: Option<DealiasFrameWorkKey>,
     rotation_receiver: Option<mpsc::Receiver<RotationMarkersResult>>,
-    rotation_markers_cache: BTreeMap<FrameWorkKey, Vec<RotationMarker>>,
-    rotation_markers_cache_order: VecDeque<FrameWorkKey>,
+    rotation_markers_cache: BTreeMap<DealiasFrameWorkKey, Vec<RotationMarker>>,
+    rotation_markers_cache_order: VecDeque<DealiasFrameWorkKey>,
     show_rotation_markers: bool,
     /// TOR TRACKS: rotation-tracks accumulation + TDS flag layers (state,
     /// background jobs, and paint live in `tor_tracks.rs`).
@@ -3644,6 +3645,24 @@ impl FrameWorkKey {
     }
 }
 
+/// One frame analyzed under one exact velocity-dealias context. Marker and
+/// track products must not survive an engine switch or a newly landed
+/// Analyst3d temporal/model anchor.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct DealiasFrameWorkKey {
+    frame: FrameWorkKey,
+    context: DealiasContextKey,
+}
+
+impl DealiasFrameWorkKey {
+    fn new(volume: &Arc<RadarVolume>, context: DealiasContextKey) -> Self {
+        Self {
+            frame: FrameWorkKey::new(volume, Arc::as_ptr(volume) as usize),
+            context,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum StormFollowLead {
     #[default]
@@ -3717,10 +3736,10 @@ struct VolumeSelectionPolicy {
     low_level_min_seconds: i64,
 }
 
-fn insert_limited_frame_cache<T>(
-    cache: &mut BTreeMap<FrameWorkKey, T>,
-    order: &mut VecDeque<FrameWorkKey>,
-    key: FrameWorkKey,
+fn insert_limited_frame_cache<K: Clone + Ord, T>(
+    cache: &mut BTreeMap<K, T>,
+    order: &mut VecDeque<K>,
+    key: K,
     value: T,
     limit: usize,
 ) {
@@ -4428,7 +4447,7 @@ struct AsyncRenderResult {
 
 /// Background cell-identification result: (frame key, cells).
 type StormCellsResult = (FrameWorkKey, Vec<StormCell>);
-type RotationMarkersResult = (FrameWorkKey, Vec<RotationMarker>);
+type RotationMarkersResult = (DealiasFrameWorkKey, Vec<RotationMarker>);
 /// (grid hash, inverse LUT) for the decoupled model geolocation.
 type ModelLutEntry = (String, Arc<model_layer::InverseLut>);
 type NativeSoundingResult = (
@@ -5491,6 +5510,43 @@ struct DealiasedReadoutCache {
     grid: Arc<MomentGrid>,
 }
 
+/// Engine + optional Analyst3d anchor identity shared by every consumer of a
+/// dealiased field. Pure same-tilt engines deliberately zero both pointers;
+/// only Analyst3d output depends on the previous volume and RAP profile.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct DealiasContextKey {
+    reference_volume_ptr: usize,
+    dealias_env_ptr: usize,
+    engine: DealiasEngine,
+}
+
+impl DealiasContextKey {
+    fn new(
+        engine: DealiasEngine,
+        previous_volume: Option<&Arc<RadarVolume>>,
+        dealias_env: Option<&Arc<EnvironmentalWindProfile>>,
+    ) -> Self {
+        let anchored = engine == DealiasEngine::Analyst3d;
+        Self {
+            reference_volume_ptr: if anchored {
+                previous_volume
+                    .map(|volume| Arc::as_ptr(volume) as usize)
+                    .unwrap_or(0)
+            } else {
+                0
+            },
+            dealias_env_ptr: if anchored {
+                dealias_env
+                    .map(|profile| Arc::as_ptr(profile) as usize)
+                    .unwrap_or(0)
+            } else {
+                0
+            },
+            engine,
+        }
+    }
+}
+
 /// Identity of one dealiased velocity tilt. The raw addresses distinguish
 /// inputs cheaply, but an address alone is NOT an identity: a dropped
 /// volume's allocation can be recycled by a later `Arc` (the volume-ptr ABA
@@ -5511,6 +5567,16 @@ struct DealiasGridKey {
 }
 
 impl DealiasGridKey {
+    fn from_context(volume_ptr: usize, cut_index: usize, context: DealiasContextKey) -> Self {
+        Self {
+            volume_ptr,
+            reference_volume_ptr: context.reference_volume_ptr,
+            dealias_env_ptr: context.dealias_env_ptr,
+            cut_index,
+            engine: context.engine,
+        }
+    }
+
     /// Key for the pure same-tilt engines (`Region`/`RegionGlobal`): they read
     /// only this volume's own tilt, so the reference/env pointers are `0`.
     fn same_tilt(volume_ptr: usize, cut_index: usize, engine: DealiasEngine) -> Self {
@@ -5820,6 +5886,68 @@ fn cached_dealias_grid(
     }
     cache.insert(key, witness, Arc::clone(&grid));
     Some(grid)
+}
+
+/// Resolve exactly one dealiased velocity tilt through the process-wide memo.
+/// Every display and analysis path calls this seam, so the selected engine and
+/// Analyst3d anchor identity cannot drift between the painted velocity,
+/// derivatives, markers, tracks, and GBVTD.
+fn resolve_dealiased_grid(
+    volume: &Arc<RadarVolume>,
+    previous_volume: Option<&Arc<RadarVolume>>,
+    dealias_env: Option<&Arc<EnvironmentalWindProfile>>,
+    cut_index: usize,
+    engine: DealiasEngine,
+) -> Option<Arc<MomentGrid>> {
+    let context = DealiasContextKey::new(engine, previous_volume, dealias_env);
+    let key = DealiasGridKey::from_context(Arc::as_ptr(volume) as usize, cut_index, context);
+    let anchored = engine == DealiasEngine::Analyst3d;
+    let witness = DealiasGridWitness::with_anchors(
+        volume,
+        anchored.then_some(previous_volume).flatten(),
+        anchored.then_some(dealias_env).flatten(),
+    );
+    let cut = volume.cuts.get(cut_index)?;
+    let source = cut.moments.get(&MomentType::Velocity)?;
+    cached_dealias_grid(key, witness, || match engine {
+        DealiasEngine::Analyst3d => dealias_velocity_grid_v4(
+            volume,
+            cut_index,
+            previous_volume.map(|reference| reference.as_ref()),
+            dealias_env.map(|profile| profile.as_ref()),
+        ),
+        DealiasEngine::RegionGlobal => Some(dealias_velocity_grid_pyart_region(cut, source)),
+        DealiasEngine::Region => Some(dealias_velocity_grid(cut, source)),
+    })
+}
+
+/// Resolve every velocity-bearing cut using [`resolve_dealiased_grid`]. The
+/// vector is aligned one-for-one with `volume.cuts`, which is the explicit
+/// input contract of render2d's downstream no-double-dealias kernels.
+fn resolve_dealiased_volume_grids(
+    volume: &Arc<RadarVolume>,
+    previous_volume: Option<&Arc<RadarVolume>>,
+    dealias_env: Option<&Arc<EnvironmentalWindProfile>>,
+    engine: DealiasEngine,
+) -> Vec<Option<Arc<MomentGrid>>> {
+    volume
+        .cuts
+        .iter()
+        .enumerate()
+        .map(|(cut_index, cut)| {
+            if cut.moments.contains_key(&MomentType::Velocity) {
+                resolve_dealiased_grid(
+                    volume,
+                    previous_volume,
+                    dealias_env,
+                    cut_index,
+                    engine,
+                )
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -6794,6 +6922,16 @@ impl DerivedProduct {
         !matches!(self, Self::AzimuthalShear | Self::Divergence)
     }
 
+    /// Velocity-derived diagnostics must use the same selected dealias engine
+    /// as DVEL/DSRV. This flag also carries Analyst3d anchor identity into
+    /// render and derived-cache keys.
+    fn uses_dealiased_velocity(self) -> bool {
+        matches!(
+            self,
+            Self::Marc | Self::GustProxy | Self::AzimuthalShear | Self::Divergence
+        )
+    }
+
     const ALL: [DerivedProduct; 11] = [
         Self::CompositeReflectivity,
         Self::EchoTops,
@@ -6875,6 +7013,7 @@ impl DisplayProduct {
         match self {
             Self::Moment(MomentType::Velocity) => unfold_plain_velocity,
             Self::DealiasedVelocity | Self::StormRelativeDealiasedVelocity => true,
+            Self::Derived(derived) => derived.uses_dealiased_velocity(),
             _ => false,
         }
     }
@@ -6972,6 +7111,8 @@ struct VrotGate {
 struct DerivedReadoutCache {
     product: DerivedProduct,
     volume_ptr: usize,
+    dealias_context: DealiasContextKey,
+    witness: DealiasGridWitness,
     cut_key: usize,
     smoothing: SmoothingMode,
     hail_key: (i16, i16),
@@ -7832,7 +7973,7 @@ impl ViewerApp {
             storm_follow_lead: StormFollowLead::default(),
             manual_camera_path: ManualCameraPath::default(),
             rotation_markers: Vec::new(),
-            rotation_markers_volume_ptr: 0,
+            rotation_markers_key: None,
             rotation_receiver: None,
             rotation_markers_cache: BTreeMap::new(),
             rotation_markers_cache_order: VecDeque::new(),
@@ -13194,6 +13335,21 @@ impl ViewerApp {
         // inspector uses the same helper so it cannot sample a different
         // partial volume than the one currently rendered.
         let volume = self.display_source_volume_for_product(&self.selected_product, volume);
+        // The completeness substitution above can replace a live-partial
+        // target with its preceding complete frame. Re-select the temporal
+        // prior against the ACTUAL rendered volume so Analyst3d never receives
+        // that same complete frame as both target and "previous" anchor.
+        let previous_volume = if self.dealias_engine == DealiasEngine::Analyst3d
+            && self.product_render_uses_dealiased_velocity(&self.selected_product)
+        {
+            previous_dealias_reference_volume(
+                &self.primary.history,
+                self.primary.cursor.index,
+                &volume,
+            )
+        } else {
+            previous_volume
+        };
         // Smart-default raster quality: `supersample_factor` is the displayed
         // frame's chosen quality (1 during active playback) or the loop-frame
         // factor. factor 1 leaves the base options/key bit-identical to today.
@@ -13636,9 +13792,12 @@ impl ViewerApp {
             .then(|| request.gate_filter_decidbz as f32 / 10.0);
             let cache = if let Some(d) = derived {
                 build_derived_moment_cache(
-                    request.volume.as_ref(),
+                    &request.volume,
+                    request.previous_volume.as_ref(),
+                    request.dealias_env.as_ref(),
                     d,
                     request.cut,
+                    request.dealias_engine,
                     &request.color_tables,
                     request.hail_levels_m,
                     request.smoothing,
@@ -13669,13 +13828,13 @@ impl ViewerApp {
                 // Region native fast path. Memoize the dealiased grid (shared
                 // with the other engines' path and the readout) so replay /
                 // toggles reuse it instead of re-running the dealiaser.
-                let key = DealiasGridKey::same_tilt(volume_ptr, request.cut, DealiasEngine::Region);
-                let witness = DealiasGridWitness::same_tilt(&request.volume);
-                match cached_dealias_grid(key, witness, || {
-                    let cut = request.volume.cuts.get(request.cut)?;
-                    let source = cut.moments.get(&MomentType::Velocity)?;
-                    Some(dealias_velocity_grid(cut, source))
-                }) {
+                match resolve_dealiased_grid(
+                    &request.volume,
+                    request.previous_volume.as_ref(),
+                    request.dealias_env.as_ref(),
+                    request.cut,
+                    request.dealias_engine,
+                ) {
                     Some(grid) => {
                         ViewportMomentCache::new_dealiased_velocity_from_grid_with_color_tables(
                             request.volume.as_ref(),
@@ -16100,6 +16259,20 @@ impl ViewerApp {
         {
             wanted.push(Arc::clone(volume));
         }
+        if (self.show_rotation_markers || self.gbvtd.panel_open)
+            && let Some(volume) = &self.volume
+        {
+            wanted.push(Arc::clone(volume));
+        }
+        if self.tor_tracks.show_tracks || self.tor_tracks.show_tds {
+            wanted.extend(
+                self.primary
+                    .history
+                    .iter()
+                    .filter(|frame| frame.status != FrameStatus::Preview)
+                    .map(|frame| Arc::clone(&frame.volume)),
+            );
+        }
         for pane_slot in 0..self.extra_panes.len() {
             let Some(product) = self
                 .extra_panes
@@ -16150,44 +16323,20 @@ impl ViewerApp {
         cut_index: usize,
     ) -> Option<Arc<MomentGrid>> {
         let volume_ptr = Arc::as_ptr(volume) as usize;
-        let previous_volume = self
-            .volume
-            .as_ref()
-            .filter(|current| Arc::as_ptr(current) as usize == volume_ptr)
-            .and_then(|current| {
-                previous_dealias_reference_volume(
-                    &self.primary.history,
-                    self.primary.cursor.index,
-                    current,
-                )
-            });
+        let (previous_volume, dealias_env, context) =
+            self.primary_dealias_inputs_for_volume(volume);
         let anchored = self.dealias_engine == DealiasEngine::Analyst3d;
-        let reference_volume_ptr = if anchored {
-            previous_volume
-                .as_ref()
-                .map(|reference| Arc::as_ptr(reference) as usize)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let dealias_env = anchored
-            .then(|| self.dealias_env_profile_for_volume(volume))
-            .flatten();
-        let dealias_env_ptr = dealias_env
-            .as_ref()
-            .map(|profile| Arc::as_ptr(profile) as usize)
-            .unwrap_or(0);
         // The witness proves the pointer identities below still name these
         // exact inputs (a dead witness means an address was recycled).
         let witness = DealiasGridWitness::with_anchors(
             volume,
             anchored.then_some(previous_volume.as_ref()).flatten(),
-            dealias_env.as_ref(),
+            anchored.then_some(dealias_env.as_ref()).flatten(),
         );
         if let Some(cache) = &self.dealiased_readout_cache
             && cache.volume_ptr == volume_ptr
-            && cache.reference_volume_ptr == reference_volume_ptr
-            && cache.dealias_env_ptr == dealias_env_ptr
+            && cache.reference_volume_ptr == context.reference_volume_ptr
+            && cache.dealias_env_ptr == context.dealias_env_ptr
             && cache.cut_index == cut_index
             && cache.dealias_engine == self.dealias_engine
             && cache.witness.alive()
@@ -16195,35 +16344,20 @@ impl ViewerApp {
             return Some(Arc::clone(&cache.grid));
         }
 
-        let cut = volume.cuts.get(cut_index)?;
-        let source_grid = cut.moments.get(&MomentType::Velocity)?;
         // L1 (single-entry) miss: consult the shared render/readout dealias
         // memo (L2) before recomputing. The render workers populate it too, so
         // scrubbing/looping reuses their grids instead of re-dealiasing here.
-        let engine = self.dealias_engine;
-        let key = DealiasGridKey {
-            volume_ptr,
-            reference_volume_ptr,
-            dealias_env_ptr,
+        let grid = resolve_dealiased_grid(
+            volume,
+            previous_volume.as_ref(),
+            dealias_env.as_ref(),
             cut_index,
-            engine,
-        };
-        let grid = cached_dealias_grid(key, witness.clone(), || match engine {
-            DealiasEngine::Analyst3d => dealias_velocity_grid_v4(
-                volume,
-                cut_index,
-                previous_volume.as_deref(),
-                dealias_env.as_deref(),
-            ),
-            DealiasEngine::RegionGlobal => {
-                Some(dealias_velocity_grid_pyart_region(cut, source_grid))
-            }
-            DealiasEngine::Region => Some(dealias_velocity_grid(cut, source_grid)),
-        })?;
+            self.dealias_engine,
+        )?;
         self.dealiased_readout_cache = Some(DealiasedReadoutCache {
             volume_ptr,
-            reference_volume_ptr,
-            dealias_env_ptr,
+            reference_volume_ptr: context.reference_volume_ptr,
+            dealias_env_ptr: context.dealias_env_ptr,
             cut_index,
             dealias_engine: self.dealias_engine,
             witness,
@@ -16232,6 +16366,37 @@ impl ViewerApp {
         self.dealiased_readout_cache
             .as_ref()
             .map(|cache| Arc::clone(&cache.grid))
+    }
+
+    /// Previous-volume/model anchors and their cache identity for one primary
+    /// history frame under the currently selected engine.
+    fn primary_dealias_inputs_for_volume(
+        &self,
+        volume: &Arc<RadarVolume>,
+    ) -> (
+        Option<Arc<RadarVolume>>,
+        Option<Arc<EnvironmentalWindProfile>>,
+        DealiasContextKey,
+    ) {
+        let anchored = self.dealias_engine == DealiasEngine::Analyst3d;
+        let previous_volume = anchored
+            .then(|| {
+                previous_dealias_reference_volume(
+                    &self.primary.history,
+                    self.primary.cursor.index,
+                    volume,
+                )
+            })
+            .flatten();
+        let dealias_env = anchored
+            .then(|| self.dealias_env_profile_for_volume(volume))
+            .flatten();
+        let context = DealiasContextKey::new(
+            self.dealias_engine,
+            previous_volume.as_ref(),
+            dealias_env.as_ref(),
+        );
+        (previous_volume, dealias_env, context)
     }
 
     fn storm_motion_key(&self) -> (i16, i16) {
@@ -22405,7 +22570,7 @@ impl ViewerApp {
             )
             .changed()
         {
-            self.rotation_markers_volume_ptr = 0;
+            self.rotation_markers_key = None;
             if !self.show_rotation_markers {
                 self.rotation_markers.clear();
             }
@@ -34553,31 +34718,37 @@ impl ViewerApp {
 
     /// Kick background rotation detection when the displayed volume changes
     /// and install finished results. Stale results (a newer volume arrived
-    /// while detecting) are dropped by pointer check. The detection itself
-    /// (dealias + LLSD + clustering, ~tens of ms) never touches the UI thread.
+    /// while detecting) are dropped by volume + dealias-context check. The
+    /// detection itself (cached selected-engine grids + LLSD + clustering)
+    /// never touches the UI thread.
     fn install_rotation_markers_for_frame(
         &mut self,
-        key: &FrameWorkKey,
+        key: &DealiasFrameWorkKey,
         mut markers: Vec<RotationMarker>,
         ctx: &egui::Context,
     ) {
         // Time association (Stumpf 1998 section 3d): a circulation seen near
         // a previous-volume site inherits and increments persistence.
         const ASSOC_DEG: f32 = 0.05; // about 5 km
+        let associate_previous_scan = self.rotation_markers_key.as_ref().is_some_and(|previous| {
+            previous.frame.identity.scan_time_utc < key.frame.identity.scan_time_utc
+        });
         for marker in &mut markers {
-            if let Some(previous) = self
-                .rotation_markers
-                .iter()
-                .filter(|p| {
-                    (p.lon - marker.lon).abs() < ASSOC_DEG && (p.lat - marker.lat).abs() < ASSOC_DEG
-                })
-                .max_by_key(|p| p.persistence)
+            if associate_previous_scan
+                && let Some(previous) = self
+                    .rotation_markers
+                    .iter()
+                    .filter(|p| {
+                        (p.lon - marker.lon).abs() < ASSOC_DEG
+                            && (p.lat - marker.lat).abs() < ASSOC_DEG
+                    })
+                    .max_by_key(|p| p.persistence)
             {
                 marker.persistence = previous.persistence.saturating_add(1);
             }
         }
         self.rotation_markers = markers;
-        self.rotation_markers_volume_ptr = key.volume_ptr;
+        self.rotation_markers_key = Some(key.clone());
         ctx.request_repaint();
     }
 
@@ -34594,19 +34765,22 @@ impl ViewerApp {
                         markers.clone(),
                         ALGO_FRAME_CACHE_LIMIT,
                     );
-                    let current_key = self
-                        .volume
-                        .as_ref()
-                        .map(|volume| FrameWorkKey::new(volume, Arc::as_ptr(volume) as usize));
+                    let current_key = self.volume.as_ref().map(|volume| {
+                        let (_, _, context) = self.primary_dealias_inputs_for_volume(volume);
+                        DealiasFrameWorkKey::new(volume, context)
+                    });
                     if current_key.as_ref() == Some(&key) {
                         self.install_rotation_markers_for_frame(&key, markers, ctx);
                     } else {
                         // Stale - re-kick below for the new volume.
-                        self.rotation_markers_volume_ptr = 0;
+                        self.rotation_markers_key = None;
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => self.rotation_receiver = None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.rotation_receiver = None;
+                    self.rotation_markers_key = None;
+                }
             }
         }
         if !self.show_rotation_markers {
@@ -34615,15 +34789,16 @@ impl ViewerApp {
         let Some(volume) = self.volume.clone() else {
             if !self.rotation_markers.is_empty() {
                 self.rotation_markers.clear();
-                self.rotation_markers_volume_ptr = 0;
+                self.rotation_markers_key = None;
             }
             return;
         };
-        let volume_ptr = Arc::as_ptr(&volume) as usize;
-        if volume_ptr == self.rotation_markers_volume_ptr {
+        let (previous_volume, dealias_env, context) =
+            self.primary_dealias_inputs_for_volume(&volume);
+        let key = DealiasFrameWorkKey::new(&volume, context);
+        if self.rotation_markers_key.as_ref() == Some(&key) {
             return;
         }
-        let key = FrameWorkKey::new(&volume, volume_ptr);
         if let Some(markers) = self.rotation_markers_cache.get(&key).cloned() {
             self.install_rotation_markers_for_frame(&key, markers, ctx);
             return;
@@ -34634,13 +34809,22 @@ impl ViewerApp {
         let Some((radar_lat, radar_lon)) = self.radar_location() else {
             return;
         };
-        self.rotation_markers_volume_ptr = volume_ptr;
         let (sender, receiver) = mpsc::channel();
         self.rotation_receiver = Some(receiver);
         let ctx = ctx.clone();
         let key_for_worker = key.clone();
+        let engine = self.dealias_engine;
         thread::spawn(move || {
-            let markers = detect_rotation_markers_for_volume(&volume, radar_lat, radar_lon);
+            let grids = resolve_dealiased_volume_grids(
+                &volume,
+                previous_volume.as_ref(),
+                dealias_env.as_ref(),
+                engine,
+            );
+            let borrowed: Vec<Option<&MomentGrid>> =
+                grids.iter().map(Option::as_deref).collect();
+            let markers =
+                detect_rotation_markers_for_volume(&volume, &borrowed, radar_lat, radar_lon);
             let _ = sender.send((key_for_worker, markers));
             ctx.request_repaint();
         });
@@ -36320,7 +36504,7 @@ struct CrossSectionReadout {
 /// `Region` and `RegionGlobal` are pure same-tilt engines. This enum is
 /// carried through every render/readout cache key so switching engines
 /// invalidates cached textures and readouts.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum DealiasEngine {
     /// Fast same-tilt region unfolding — the app's default.
     #[default]
@@ -38160,11 +38344,12 @@ fn chip_width_for_text(text: &str) -> f32 {
 /// geolocate them relative to the radar.
 fn detect_rotation_markers_for_volume(
     volume: &RadarVolume,
+    dealiased_velocity: &[Option<&MomentGrid>],
     radar_lat: f32,
     radar_lon: f32,
 ) -> Vec<RotationMarker> {
     let cos_lat = radar_lat.to_radians().cos().max(0.05);
-    detect_rotation_sites(volume)
+    detect_rotation_sites_from_dealiased(volume, dealiased_velocity)
         .into_iter()
         .map(|site| {
             let az = (site.azimuth_deg as f64).to_radians();
@@ -38218,45 +38403,14 @@ fn build_preprocessed_plain_cache(
         .get(moment)
         .ok_or_else(|| format!("moment {moment:?} missing"))?;
     let mut source = if dealiased_velocity {
-        // Memoize the dealiased grid so a loop replay / product toggle does not
-        // re-run the ~200 ms dealiaser per frame. Only Analyst3d reads the
-        // previous volume + RAP profile; the pure engines key those as 0.
-        let anchored = dealias_engine == DealiasEngine::Analyst3d;
-        let (reference_volume_ptr, dealias_env_ptr) = if anchored {
-            (
-                previous_volume
-                    .map(|reference| Arc::as_ptr(reference) as usize)
-                    .unwrap_or(0),
-                dealias_env
-                    .map(|profile| Arc::as_ptr(profile) as usize)
-                    .unwrap_or(0),
-            )
-        } else {
-            (0, 0)
-        };
-        let key = DealiasGridKey {
-            volume_ptr: Arc::as_ptr(volume) as usize,
-            reference_volume_ptr,
-            dealias_env_ptr,
-            cut_index,
-            engine: dealias_engine,
-        };
-        let witness = DealiasGridWitness::with_anchors(
+        let dealiased = resolve_dealiased_grid(
             volume,
-            anchored.then_some(previous_volume).flatten(),
-            anchored.then_some(dealias_env).flatten(),
-        );
-        let dealiased = cached_dealias_grid(key, witness, || match dealias_engine {
-            DealiasEngine::Analyst3d => dealias_velocity_grid_v4(
-                volume,
-                cut_index,
-                previous_volume.map(|reference| reference.as_ref()),
-                dealias_env.map(|profile| profile.as_ref()),
-            ),
-            DealiasEngine::RegionGlobal => Some(dealias_velocity_grid_pyart_region(cut, grid)),
-            DealiasEngine::Region => Some(dealias_velocity_grid(cut, grid)),
-        })
-        .ok_or_else(|| "model-anchored 3-D dealias failed".to_owned())?;
+            previous_volume,
+            dealias_env,
+            cut_index,
+            dealias_engine,
+        )
+        .ok_or_else(|| "selected velocity dealias failed".to_owned())?;
         (*dealiased).clone()
     } else {
         grid.clone()
@@ -38289,9 +38443,12 @@ fn build_preprocessed_plain_cache(
 }
 
 fn build_derived_moment_cache(
-    volume: &RadarVolume,
+    volume: &Arc<RadarVolume>,
+    previous_volume: Option<&Arc<RadarVolume>>,
+    dealias_env: Option<&Arc<EnvironmentalWindProfile>>,
     derived: DerivedProduct,
     selected_cut: usize,
+    dealias_engine: DealiasEngine,
     color_tables: &ColorTableSet,
     hail_levels_m: (f32, f32),
     smoothing: SmoothingMode,
@@ -38310,6 +38467,17 @@ fn build_derived_moment_cache(
             .min_by(|a, b| a.1.elevation_deg.total_cmp(&b.1.elevation_deg))
             .map(|(i, _)| i)
             .ok_or_else(|| "no base moment for derived product".to_owned())?;
+        let dealiased_grids = (derived == DerivedProduct::Marc).then(|| {
+            resolve_dealiased_volume_grids(
+                volume,
+                previous_volume,
+                dealias_env,
+                dealias_engine,
+            )
+        });
+        let borrowed_dealiased: Option<Vec<Option<&MomentGrid>>> = dealiased_grids
+            .as_ref()
+            .map(|grids| grids.iter().map(Option::as_deref).collect());
         let grid = match derived {
             DerivedProduct::CompositeReflectivity => composite_reflectivity_grid(volume),
             DerivedProduct::EchoTops => echo_top_grid(volume, ECHO_TOP_THRESHOLD_DBZ),
@@ -38324,8 +38492,21 @@ fn build_derived_moment_cache(
             )
             .map(|grids| grids.posh_pct),
             DerivedProduct::Poh => poh_grid(volume, hail_levels_m.0),
-            DerivedProduct::Marc => marc_grid(volume),
-            DerivedProduct::GustProxy => gust_proxy_grid(volume),
+            DerivedProduct::Marc => marc_grid_from_dealiased(
+                volume,
+                borrowed_dealiased.as_deref().unwrap_or_default(),
+            ),
+            DerivedProduct::GustProxy => resolve_dealiased_grid(
+                volume,
+                previous_volume,
+                dealias_env,
+                base_idx,
+                dealias_engine,
+            )
+                .as_deref()
+                .and_then(|velocity| {
+                    gust_proxy_grid_from_dealiased(volume, base_idx, velocity)
+                }),
             DerivedProduct::AzimuthalShear | DerivedProduct::Divergence => {
                 unreachable!("velocity derivatives are per-cut")
             }
@@ -38337,13 +38518,21 @@ fn build_derived_moment_cache(
             .cuts
             .get(selected_cut)
             .ok_or_else(|| "selected cut missing for derived product".to_owned())?;
-        let velocity = cut
-            .moments
-            .get(&MomentType::Velocity)
-            .ok_or_else(|| "selected cut has no velocity for this product".to_owned())?;
+        let velocity = resolve_dealiased_grid(
+            volume,
+            previous_volume,
+            dealias_env,
+            selected_cut,
+            dealias_engine,
+        )
+        .ok_or_else(|| "selected cut has no dealiased velocity for this product".to_owned())?;
         let grid = match derived {
-            DerivedProduct::AzimuthalShear => azimuthal_shear_grid(cut, velocity),
-            DerivedProduct::Divergence => radial_divergence_grid(cut, velocity),
+            DerivedProduct::AzimuthalShear => {
+                azimuthal_shear_grid_from_dealiased(cut, &velocity)
+            }
+            DerivedProduct::Divergence => {
+                radial_divergence_grid_from_dealiased(cut, &velocity)
+            }
             _ => unreachable!("only velocity derivatives are per-cut"),
         };
         (selected_cut, Some(grid))
@@ -43893,6 +44082,45 @@ mod tests {
         DealiasGridKey::same_tilt(volume_ptr, cut, DealiasEngine::Region)
     }
 
+    #[test]
+    fn dealias_context_keys_include_engine_and_analyst_anchors() {
+        let previous = witness_anchor();
+        let env = Arc::new(EnvironmentalWindProfile {
+            levels: Vec::new(),
+            valid_time: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+        });
+
+        let region = DealiasContextKey::new(
+            DealiasEngine::Region,
+            Some(&previous),
+            Some(&env),
+        );
+        assert_eq!(region.reference_volume_ptr, 0);
+        assert_eq!(region.dealias_env_ptr, 0);
+
+        let analyst = DealiasContextKey::new(
+            DealiasEngine::Analyst3d,
+            Some(&previous),
+            Some(&env),
+        );
+        assert_eq!(
+            analyst.reference_volume_ptr,
+            Arc::as_ptr(&previous) as usize
+        );
+        assert_eq!(analyst.dealias_env_ptr, Arc::as_ptr(&env) as usize);
+        assert_ne!(analyst, region, "engine is part of every analysis key");
+        assert_ne!(
+            analyst,
+            DealiasContextKey::new(DealiasEngine::Analyst3d, None, Some(&env)),
+            "temporal-anchor identity invalidates derived/marker caches"
+        );
+        assert_ne!(
+            analyst,
+            DealiasContextKey::new(DealiasEngine::Analyst3d, Some(&previous), None),
+            "RAP-anchor identity invalidates derived/marker caches"
+        );
+    }
+
     /// A minimal live volume whose `Weak` keeps synthetic-keyed test entries
     /// alive. The fake key addresses need not match the anchor:
     /// `DealiasGridCache` itself checks only liveness — key/witness coherence
@@ -45400,6 +45628,18 @@ mod tests {
         assert!(velocity.render_uses_dealiased_velocity(true));
         assert!(DisplayProduct::DealiasedVelocity.render_uses_dealiased_velocity(false));
         assert!(!DisplayProduct::StormRelativeVelocity.render_uses_dealiased_velocity(false));
+        for derived in [
+            DerivedProduct::AzimuthalShear,
+            DerivedProduct::Divergence,
+            DerivedProduct::Marc,
+            DerivedProduct::GustProxy,
+        ] {
+            assert!(
+                DisplayProduct::Derived(derived).render_uses_dealiased_velocity(false),
+                "{} must carry selected-engine provenance",
+                derived.label()
+            );
+        }
     }
 
     #[test]
@@ -60940,7 +61180,7 @@ mod tests {
             storm_follow_lead: StormFollowLead::default(),
             manual_camera_path: ManualCameraPath::default(),
             rotation_markers: Vec::new(),
-            rotation_markers_volume_ptr: 0,
+            rotation_markers_key: None,
             rotation_receiver: None,
             rotation_markers_cache: BTreeMap::new(),
             rotation_markers_cache_order: VecDeque::new(),

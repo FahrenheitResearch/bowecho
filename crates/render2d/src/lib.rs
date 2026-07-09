@@ -31,7 +31,8 @@ pub use dealias_v4::{
     V4VolumeSolution, dealias_velocity_grid_v4, dealias_volume_v4, project_environmental_winds,
 };
 pub use detect::{
-    RotationSite, RotationStrength, detect_rotation_sites, rotation_features_per_tilt,
+    RotationSite, RotationStrength, detect_rotation_sites, detect_rotation_sites_from_dealiased,
+    rotation_features_per_tilt, rotation_features_per_tilt_from_dealiased,
 };
 pub use gate_filter::apply_reflectivity_gate_filter;
 pub use gbvtd::{
@@ -51,7 +52,10 @@ pub use rhi::{
     cut_looks_like_rhi, rhi_coverage_range_m, rhi_coverage_top_m, rhi_fixed_azimuth_deg,
     rhi_section,
 };
-pub use shear::{azimuthal_shear_grid, radial_divergence_grid};
+pub use shear::{
+    azimuthal_shear_grid, azimuthal_shear_grid_from_dealiased, radial_divergence_grid,
+    radial_divergence_grid_from_dealiased,
+};
 pub use smooth::smooth_moment_grid;
 pub use swath::{SwathAggregation, base_tilt_cut, max_value_swath};
 use thiserror::Error;
@@ -64,7 +68,9 @@ pub use volumetric::{
     velocity_cross_section_cached, velocity_cross_section_cached_with_smoothing, vil_density_grid,
     vil_grid, volume_box_resample, volume_box_resample_moment,
 };
-pub use wind::{gust_proxy_grid, marc_grid};
+pub use wind::{
+    gust_proxy_grid, gust_proxy_grid_from_dealiased, marc_grid, marc_grid_from_dealiased,
+};
 
 const AZIMUTH_BINS: usize = 3600;
 const AZIMUTH_BIN_WIDTH_DEG: f32 = 0.1;

@@ -13,9 +13,7 @@
 
 use eframe::egui;
 use radar_core::MomentType;
-use render2d::{
-    PolarVelocityField, TcCirculation, dealias_velocity_grid, find_center_and_retrieve,
-};
+use render2d::{PolarVelocityField, TcCirculation, find_center_and_retrieve};
 
 const KM_PER_DEG_LAT: f32 = 111.0;
 const MS_TO_KT: f32 = 1.943_844;
@@ -40,6 +38,9 @@ pub struct GbvtdState {
     seed_lonlat: Option<(f32, f32)>,
     /// Radar site (lon, lat) the current `result` is referenced to.
     site_lonlat: Option<(f32, f32)>,
+    /// Exact selected-engine/Analyst3d-anchor identity that produced result.
+    dealias_context: Option<crate::DealiasContextKey>,
+    volume_ptr: usize,
     status: String,
 }
 
@@ -62,6 +63,8 @@ impl crate::ViewerApp {
     /// fallback when nothing has been placed yet.
     pub fn run_gbvtd_retrieval(&mut self) {
         self.gbvtd.result = None;
+        self.gbvtd.dealias_context = None;
+        self.gbvtd.volume_ptr = 0;
         let Some(volume) = self.volume.clone() else {
             self.gbvtd.status = "Load a radar volume first.".to_owned();
             return;
@@ -70,20 +73,21 @@ impl crate::ViewerApp {
             self.gbvtd.status = "This volume has no radar-site location.".to_owned();
             return;
         };
-        let Some(cut) = volume
+        let Some((cut_index, cut)) = volume
             .cuts
             .iter()
-            .filter(|cut| cut.moments.contains_key(&MomentType::Velocity))
-            .min_by(|a, b| a.elevation_deg.total_cmp(&b.elevation_deg))
+            .enumerate()
+            .filter(|(_, cut)| cut.moments.contains_key(&MomentType::Velocity))
+            .min_by(|(_, a), (_, b)| a.elevation_deg.total_cmp(&b.elevation_deg))
         else {
             self.gbvtd.status = "No velocity data in this volume.".to_owned();
             return;
         };
-        let velocity = cut
-            .moments
-            .get(&MomentType::Velocity)
-            .expect("filtered for Velocity");
-        let dealiased = dealias_velocity_grid(cut, velocity);
+        let (_, _, dealias_context) = self.primary_dealias_inputs_for_volume(&volume);
+        let Some(dealiased) = self.dealiased_velocity_readout_grid(&volume, cut_index) else {
+            self.gbvtd.status = "Selected velocity dealias engine failed on this cut.".to_owned();
+            return;
+        };
         let field = PolarVelocityField::from_dealiased_velocity(cut, &dealiased);
 
         // Seed the center search from the user's clicked eye when they
@@ -123,6 +127,8 @@ impl crate::ViewerApp {
                 );
                 self.gbvtd.result = Some(circ);
                 self.gbvtd.site_lonlat = Some((lon0, lat0));
+                self.gbvtd.dealias_context = Some(dealias_context);
+                self.gbvtd.volume_ptr = std::sync::Arc::as_ptr(&volume) as usize;
             }
             None => {
                 self.gbvtd.status =
@@ -186,6 +192,16 @@ impl crate::ViewerApp {
         self.run_gbvtd_retrieval();
     }
 
+    fn gbvtd_result_is_current(&self) -> bool {
+        let Some(volume) = self.volume.as_ref() else {
+            return false;
+        };
+        let (_, _, context) = self.primary_dealias_inputs_for_volume(volume);
+        self.gbvtd.result.is_some()
+            && self.gbvtd.volume_ptr == std::sync::Arc::as_ptr(volume) as usize
+            && self.gbvtd.dealias_context == Some(context)
+    }
+
     /// Draw the retrieved center + RMW ring on the radar map.
     pub fn draw_gbvtd(&self, painter: &egui::Painter, rect: egui::Rect) {
         // Show the raw clicked seed (faint magenta dot) so the user can see
@@ -193,6 +209,9 @@ impl crate::ViewerApp {
         if let Some((lon, lat)) = self.gbvtd.seed_lonlat {
             let seed = self.lon_lat_to_screen(rect, lon, lat);
             painter.circle_filled(seed, 3.0, egui::Color32::from_rgb(230, 90, 230));
+        }
+        if !self.gbvtd_result_is_current() {
+            return;
         }
         let (Some(circ), Some((lon0, lat0))) = (&self.gbvtd.result, self.gbvtd.site_lonlat) else {
             return;
@@ -310,6 +329,8 @@ impl crate::ViewerApp {
                 .clicked()
         {
             self.gbvtd.result = None;
+            self.gbvtd.dealias_context = None;
+            self.gbvtd.volume_ptr = 0;
             self.gbvtd.seed_lonlat = None;
             self.gbvtd.place_mode = false;
             self.gbvtd.status.clear();
@@ -318,7 +339,11 @@ impl crate::ViewerApp {
             ui.separator();
             ui.label(&self.gbvtd.status);
         }
-        if let Some(circ) = &self.gbvtd.result {
+        let result_current = self.gbvtd_result_is_current();
+        if self.gbvtd.result.is_some() && !result_current {
+            ui.weak("Velocity dealias engine or Analyst 3D anchor changed; re-run the retrieval.");
+        }
+        if let Some(circ) = self.gbvtd.result.as_ref().filter(|_| result_current) {
             ui.separator();
             ui.label(
                 "Profile: VT axisymmetric tangential, VR radial (−VR = inflow), \

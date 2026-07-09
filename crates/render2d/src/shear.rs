@@ -24,14 +24,36 @@ const SHEAR_DISPLAY_SCALE: f32 = 1000.0;
 /// Azimuthal shear (×10^-3 s^-1): ∂Vr across the radial. Mesocyclone/TVS
 /// rotation detector. NaN = no data.
 pub fn azimuthal_shear_grid(cut: &ElevationCut, velocity: &MomentGrid) -> MomentGrid {
-    llsd_velocity_derivative(cut, velocity, Axis::Azimuthal)
+    let dealiased = crate::dealias_velocity_grid(cut, velocity);
+    azimuthal_shear_grid_from_dealiased(cut, &dealiased)
+}
+
+/// Azimuthal shear from a velocity grid the caller has already dealiased.
+/// This function performs no dealiasing: engine and model/temporal-anchor
+/// ownership stay with the caller. Application pipelines should prefer this
+/// entry point after resolving their selected engine.
+pub fn azimuthal_shear_grid_from_dealiased(
+    cut: &ElevationCut,
+    dealiased_velocity: &MomentGrid,
+) -> MomentGrid {
+    llsd_velocity_derivative(cut, dealiased_velocity, Axis::Azimuthal)
 }
 
 /// Radial divergence (×10^-3 s^-1): ∂Vr along the radial. Positive = divergence
 /// (e.g. downburst outflow / DCZ), negative = convergence (gust front / boundary)
 /// — the defining derecho signature. Smith & Elmore (2004). NaN = no data.
 pub fn radial_divergence_grid(cut: &ElevationCut, velocity: &MomentGrid) -> MomentGrid {
-    llsd_velocity_derivative(cut, velocity, Axis::Radial)
+    let dealiased = crate::dealias_velocity_grid(cut, velocity);
+    radial_divergence_grid_from_dealiased(cut, &dealiased)
+}
+
+/// Radial divergence from a velocity grid the caller has already dealiased.
+/// This function performs no dealiasing.
+pub fn radial_divergence_grid_from_dealiased(
+    cut: &ElevationCut,
+    dealiased_velocity: &MomentGrid,
+) -> MomentGrid {
+    llsd_velocity_derivative(cut, dealiased_velocity, Axis::Radial)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -45,16 +67,19 @@ enum Axis {
 /// Shared LLSD core: fit v = a + b·x over a small azimuth×range window, where x
 /// is cross-radial arc distance (Azimuthal) or along-radial distance (Radial).
 /// b is the velocity derivative (s^-1), output scaled to ×10^-3 s^-1.
-fn llsd_velocity_derivative(cut: &ElevationCut, velocity: &MomentGrid, axis: Axis) -> MomentGrid {
-    let dealiased = crate::dealias_velocity_grid(cut, velocity);
-    let rows = dealiased.radial_count();
-    let gates = dealiased.gate_range.gate_count;
-    let gr = &dealiased.gate_range;
+fn llsd_velocity_derivative(
+    cut: &ElevationCut,
+    dealiased_velocity: &MomentGrid,
+    axis: Axis,
+) -> MomentGrid {
+    let rows = dealiased_velocity.radial_count();
+    let gates = dealiased_velocity.gate_range.gate_count;
+    let gr = &dealiased_velocity.gate_range;
     let spacing = gr.gate_spacing_m as f32;
 
     let az_deg: Vec<f32> = (0..rows)
         .map(|r| {
-            dealiased
+            dealiased_velocity
                 .radial_indices
                 .get(r)
                 .and_then(|ri| cut.radials.get(*ri))
@@ -101,7 +126,7 @@ fn llsd_velocity_derivative(cut: &ElevationCut, velocity: &MomentGrid, axis: Axi
                     if gg >= gates {
                         continue;
                     }
-                    let Some(v) = dealiased.scaled_value(rr, gg) else {
+                    let Some(v) = dealiased_velocity.scaled_value(rr, gg) else {
                         continue;
                     };
                     if !v.is_finite() {
@@ -139,7 +164,7 @@ fn llsd_velocity_derivative(cut: &ElevationCut, velocity: &MomentGrid, axis: Axi
         offset: 0.0,
         nodata: None,
         range_folded: None,
-        radial_indices: dealiased.radial_indices.clone(),
+        radial_indices: dealiased_velocity.radial_indices.clone(),
         storage: MomentStorage::F32(out),
     }
 }
@@ -303,5 +328,55 @@ mod tests {
             "expected ~{} got {v}",
             div_true * 1000.0
         );
+    }
+
+    /// The explicit downstream API consumes the caller's selected-engine grid
+    /// verbatim. Values intentionally exceed the cut's tiny Nyquist velocity;
+    /// an accidental internal Region pass would rebranch them and destroy the
+    /// pinned linear derivative.
+    #[test]
+    fn from_dealiased_derivative_does_not_run_a_second_engine() {
+        let rows = 6usize;
+        let gates = 20usize;
+        let spacing = 250i32;
+        let gate_range = GateRange {
+            first_gate_m: 250,
+            gate_spacing_m: spacing,
+            gate_count: gates,
+        };
+        let mut cut = ElevationCut::new(0.5, None);
+        for row in 0..rows {
+            cut.radials.push(Radial {
+                azimuth_deg: row as f32,
+                elevation_deg: 0.5,
+                time_offset_ms: 0,
+                gate_range: gate_range.clone(),
+                nyquist_velocity_mps: Some(5.0),
+                radial_status: None,
+            });
+        }
+        let slope = 0.04f32;
+        let mut values = vec![0.0; rows * gates];
+        for row in 0..rows {
+            for gate in 0..gates {
+                let range_m = 250.0 + gate as f32 * spacing as f32;
+                values[row * gates + gate] = slope * range_m;
+            }
+        }
+        let selected_engine_grid = MomentGrid {
+            moment: MomentType::Velocity,
+            gate_range,
+            scale: 1.0,
+            offset: 0.0,
+            nodata: None,
+            range_folded: None,
+            radial_indices: (0..rows).collect(),
+            storage: MomentStorage::F32(values),
+        };
+
+        let divergence =
+            radial_divergence_grid_from_dealiased(&cut, &selected_engine_grid);
+        let value = divergence.scaled_value(3, 10).expect("derivative");
+        assert!((value - slope * 1000.0).abs() < 1.0, "got {value}");
     }
 }

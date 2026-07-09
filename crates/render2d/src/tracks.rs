@@ -42,8 +42,9 @@ use std::collections::HashSet;
 
 use radar_core::{MomentGrid, MomentType, RadarVolume, beam_height_above_radar_m};
 
+use crate::dealias_velocity_grid;
 use crate::detect::{RotationSite, RotationStrength};
-use crate::shear::azimuthal_shear_grid;
+use crate::shear::azimuthal_shear_grid_from_dealiased;
 
 /// Top of the "low-level" layer (m above radar level, used as the AGL proxy —
 /// the WSR-88D feedhorn sits only tens of meters above ground). Mahalik et
@@ -176,7 +177,27 @@ struct TiltShearField {
 /// pull-samples its nearest gate on every contributing tilt and keeps the
 /// maximum — one frame of the rotation-tracks accumulation.
 pub fn low_level_azshear_cartesian(volume: &RadarVolume, spec: &TracksGridSpec) -> Vec<f32> {
-    let fields = low_level_tilt_fields(volume);
+    let owned: Vec<Option<MomentGrid>> = volume
+        .cuts
+        .iter()
+        .map(|cut| {
+            cut.moments
+                .get(&MomentType::Velocity)
+                .map(|velocity| dealias_velocity_grid(cut, velocity))
+        })
+        .collect();
+    let borrowed: Vec<Option<&MomentGrid>> = owned.iter().map(Option::as_ref).collect();
+    low_level_azshear_cartesian_from_dealiased(volume, &borrowed, spec)
+}
+
+/// Resample low-level shear from caller-provided dealiased velocity grids.
+/// The slice is indexed like `volume.cuts`; no dealias engine runs here.
+pub fn low_level_azshear_cartesian_from_dealiased(
+    volume: &RadarVolume,
+    dealiased_velocity: &[Option<&MomentGrid>],
+    spec: &TracksGridSpec,
+) -> Vec<f32> {
+    let fields = low_level_tilt_fields_from_dealiased(volume, dealiased_velocity);
     let size = spec.size();
     let mut out = vec![f32::NAN; spec.cell_count()];
     if fields.is_empty() {
@@ -392,7 +413,10 @@ pub fn detect_tds_gates(volume: &RadarVolume, sites: &[RotationSite]) -> Vec<Tds
 }
 
 /// Build the QC'd per-tilt shear fields feeding the Cartesian resample.
-fn low_level_tilt_fields(volume: &RadarVolume) -> Vec<TiltShearField> {
+fn low_level_tilt_fields_from_dealiased(
+    volume: &RadarVolume,
+    dealiased_velocity: &[Option<&MomentGrid>],
+) -> Vec<TiltShearField> {
     let mut velocity_cuts: Vec<usize> = volume
         .cuts
         .iter()
@@ -413,10 +437,10 @@ fn low_level_tilt_fields(volume: &RadarVolume) -> Vec<TiltShearField> {
     let mut fields = Vec::new();
     for cut_index in velocity_cuts {
         let cut = &volume.cuts[cut_index];
-        let Some(velocity) = cut.moments.get(&MomentType::Velocity) else {
+        let Some(velocity) = dealiased_velocity.get(cut_index).copied().flatten() else {
             continue;
         };
-        let shear = azimuthal_shear_grid(cut, velocity);
+        let shear = azimuthal_shear_grid_from_dealiased(cut, velocity);
         let rows = shear.radial_count();
         let gates = shear.gate_range.gate_count;
         if rows == 0 || gates == 0 {

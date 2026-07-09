@@ -122,13 +122,16 @@ impl VelCut {
     }
 }
 
-fn velocity_cuts(volume: &RadarVolume) -> Vec<VelCut> {
+fn velocity_cuts_from_dealiased(
+    volume: &RadarVolume,
+    dealiased_velocity: &[Option<&MomentGrid>],
+) -> Vec<VelCut> {
     let mut cuts: Vec<VelCut> = volume
         .cuts
         .iter()
-        .filter_map(|cut| {
-            let velocity = cut.moments.get(&MomentType::Velocity)?;
-            let dealiased = dealias_velocity_grid(cut, velocity);
+        .enumerate()
+        .filter_map(|(cut_index, cut)| {
+            let dealiased = dealiased_velocity.get(cut_index).copied().flatten()?;
             let gr = dealiased.gate_range.clone();
             let rows = dealiased.radial_count();
             if gr.gate_count == 0 || rows == 0 {
@@ -180,16 +183,37 @@ fn velocity_cuts(volume: &RadarVolume) -> Vec<VelCut> {
 /// velocity tilts whose beam centers the 3–7 km layer at that ground range.
 /// Display guidance: ≥ 25 m/s is the published damaging-wind precursor.
 pub fn marc_grid(volume: &RadarVolume) -> Option<MomentGrid> {
-    let cuts = velocity_cuts(volume);
+    let owned: Vec<Option<MomentGrid>> = volume
+        .cuts
+        .iter()
+        .map(|cut| {
+            cut.moments
+                .get(&MomentType::Velocity)
+                .map(|velocity| dealias_velocity_grid(cut, velocity))
+        })
+        .collect();
+    let borrowed: Vec<Option<&MomentGrid>> = owned.iter().map(Option::as_ref).collect();
+    marc_grid_from_dealiased(volume, &borrowed)
+}
+
+/// MARC composite from caller-provided, already-dealiased velocity grids.
+/// `dealiased_velocity` is indexed exactly like `volume.cuts`; missing entries
+/// are skipped. This function never chooses or runs a dealias engine.
+pub fn marc_grid_from_dealiased(
+    volume: &RadarVolume,
+    dealiased_velocity: &[Option<&MomentGrid>],
+) -> Option<MomentGrid> {
+    let cuts = velocity_cuts_from_dealiased(volume, dealiased_velocity);
     if cuts.is_empty() {
         return None;
     }
     // Output geometry: the lowest velocity cut's grid.
-    let (base_idx, base_grid) = volume
+    let base_idx = volume
         .cuts
         .iter()
         .enumerate()
-        .find_map(|(i, c)| c.moments.get(&MomentType::Velocity).map(|grid| (i, grid)))?;
+        .find_map(|(i, c)| c.moments.contains_key(&MomentType::Velocity).then_some(i))?;
+    let base_grid = dealiased_velocity.get(base_idx).copied().flatten()?;
     let base_cut = volume.cuts.get(base_idx)?;
     let rows = base_grid.radial_count();
     let gates = base_grid.gate_range.gate_count;
@@ -256,11 +280,31 @@ pub fn marc_grid(volume: &RadarVolume) -> Option<MomentGrid> {
 /// masked to beam-center heights < 1 km above the radar (Smith, Elmore &
 /// Dulin 2004: low-beam radial wind ≈ surface gust; ≥ 25 m/s ≈ severe).
 pub fn gust_proxy_grid(volume: &RadarVolume) -> Option<MomentGrid> {
-    let (cut, velocity) = volume
+    let (cut_index, cut, velocity) = volume
         .cuts
         .iter()
-        .find_map(|c| c.moments.get(&MomentType::Velocity).map(|grid| (c, grid)))?;
+        .enumerate()
+        .find_map(|(index, c)| {
+            c.moments
+                .get(&MomentType::Velocity)
+                .map(|grid| (index, c, grid))
+        })?;
     let dealiased = dealias_velocity_grid(cut, velocity);
+    gust_proxy_grid_from_dealiased(volume, cut_index, &dealiased)
+}
+
+/// Low-level gust proxy from one caller-provided, already-dealiased velocity
+/// grid. `cut_index` identifies the grid's geometry and reflectivity-support
+/// mask in `volume`. This function performs no dealiasing.
+pub fn gust_proxy_grid_from_dealiased(
+    volume: &RadarVolume,
+    cut_index: usize,
+    dealiased: &MomentGrid,
+) -> Option<MomentGrid> {
+    let cut = volume.cuts.get(cut_index)?;
+    if !cut.moments.contains_key(&MomentType::Velocity) {
+        return None;
+    }
     // Reflectivity-support mask: a gust claim needs an echo. Bird/insect
     // and clutter returns in clear air otherwise fabricate severe gusts
     // (observed: 89 m/s "gusts" on an echo-free volume).

@@ -21,7 +21,7 @@ use radar_core::{ElevationCut, MomentGrid, MomentType, RadarVolume, beam_height_
 use rayon::prelude::*;
 
 use crate::dealias_velocity_grid;
-use crate::shear::azimuthal_shear_grid;
+use crate::shear::azimuthal_shear_grid_from_dealiased;
 
 /// Reflectivity floor for the display QC mask. The MDA's adaptable parameter
 /// runs 0–20 dBZ (Stumpf 1998); a viewer wants the top of that bracket so an
@@ -185,6 +185,26 @@ fn rank_2d(delta_v_mps: f32, shear_ms_km: f32, gtg_dv_mps: f32, range_km: f64) -
 /// Detect vertically-continuous rotation in a volume (background-thread
 /// work: ~100–300 ms on a dense super-res volume; tilts run in parallel).
 pub fn detect_rotation_sites(volume: &RadarVolume) -> Vec<RotationSite> {
+    let owned: Vec<Option<MomentGrid>> = volume
+        .cuts
+        .iter()
+        .map(|cut| {
+            cut.moments
+                .get(&MomentType::Velocity)
+                .map(|velocity| dealias_velocity_grid(cut, velocity))
+        })
+        .collect();
+    let borrowed: Vec<Option<&MomentGrid>> = owned.iter().map(Option::as_ref).collect();
+    detect_rotation_sites_from_dealiased(volume, &borrowed)
+}
+
+/// Detect vertically-continuous rotation from caller-provided dealiased
+/// velocity grids. The slice is indexed like `volume.cuts`; this function and
+/// its LLSD path perform no implicit second dealias solve.
+pub fn detect_rotation_sites_from_dealiased(
+    volume: &RadarVolume,
+    dealiased_velocity: &[Option<&MomentGrid>],
+) -> Vec<RotationSite> {
     let mut velocity_cuts: Vec<usize> = volume
         .cuts
         .iter()
@@ -207,7 +227,13 @@ pub fn detect_rotation_sites(volume: &RadarVolume) -> Vec<RotationSite> {
 
     let per_tilt: Vec<Vec<Feature2D>> = velocity_cuts
         .par_iter()
-        .map(|&cut_index| tilt_features(volume, cut_index))
+        .map(|&cut_index| {
+            dealiased_velocity
+                .get(cut_index)
+                .copied()
+                .flatten()
+                .map_or_else(Vec::new, |grid| tilt_features(volume, cut_index, grid))
+        })
         .collect();
 
     associate_vertically(&per_tilt)
@@ -216,6 +242,24 @@ pub fn detect_rotation_sites(volume: &RadarVolume) -> Vec<RotationSite> {
 /// Diagnostic: per-tilt (elevation, 2D feature count, best rank) — for
 /// threshold tuning against real volumes.
 pub fn rotation_features_per_tilt(volume: &RadarVolume) -> Vec<(f32, usize, u8)> {
+    let owned: Vec<Option<MomentGrid>> = volume
+        .cuts
+        .iter()
+        .map(|cut| {
+            cut.moments
+                .get(&MomentType::Velocity)
+                .map(|velocity| dealias_velocity_grid(cut, velocity))
+        })
+        .collect();
+    let borrowed: Vec<Option<&MomentGrid>> = owned.iter().map(Option::as_ref).collect();
+    rotation_features_per_tilt_from_dealiased(volume, &borrowed)
+}
+
+/// Per-tilt rotation diagnostics from caller-provided dealiased grids.
+pub fn rotation_features_per_tilt_from_dealiased(
+    volume: &RadarVolume,
+    dealiased_velocity: &[Option<&MomentGrid>],
+) -> Vec<(f32, usize, u8)> {
     let mut velocity_cuts: Vec<usize> = volume
         .cuts
         .iter()
@@ -235,7 +279,11 @@ pub fn rotation_features_per_tilt(volume: &RadarVolume) -> Vec<(f32, usize, u8)>
     velocity_cuts
         .iter()
         .map(|&cut_index| {
-            let features = tilt_features(volume, cut_index);
+            let features = dealiased_velocity
+                .get(cut_index)
+                .copied()
+                .flatten()
+                .map_or_else(Vec::new, |grid| tilt_features(volume, cut_index, grid));
             let best = features.iter().map(|f| f.rank).max().unwrap_or(0);
             (volume.cuts[cut_index].elevation_deg, features.len(), best)
         })
@@ -407,13 +455,13 @@ fn associate_vertically(per_tilt: &[Vec<Feature2D>]) -> Vec<RotationSite> {
 }
 
 /// Per-tilt: QC mask → multi-level core extraction → attribute measurement.
-fn tilt_features(volume: &RadarVolume, cut_index: usize) -> Vec<Feature2D> {
+fn tilt_features(
+    volume: &RadarVolume,
+    cut_index: usize,
+    dealiased_velocity: &MomentGrid,
+) -> Vec<Feature2D> {
     let cut = &volume.cuts[cut_index];
-    let Some(velocity) = cut.moments.get(&MomentType::Velocity) else {
-        return Vec::new();
-    };
-    let dealiased = dealias_velocity_grid(cut, velocity);
-    let shear = azimuthal_shear_grid(cut, velocity);
+    let shear = azimuthal_shear_grid_from_dealiased(cut, dealiased_velocity);
     let rows = shear.radial_count();
     let gates = shear.gate_range.gate_count;
     if rows == 0 || gates == 0 {
@@ -444,7 +492,9 @@ fn tilt_features(volume: &RadarVolume, cut_index: usize) -> Vec<Feature2D> {
         shear.scaled_value(row, gate).filter(|v| v.is_finite())
     };
     let vel_at = |row: usize, gate: usize| -> Option<f32> {
-        dealiased.scaled_value(row, gate).filter(|v| v.is_finite())
+        dealiased_velocity
+            .scaled_value(row, gate)
+            .filter(|v| v.is_finite())
     };
 
     // QC + multi-level seed mask (cyclonic only — the operational MDA
@@ -1049,6 +1099,30 @@ mod tests {
             site.strength,
             RotationStrength::Mesocyclone | RotationStrength::Tvs
         ));
+    }
+
+    #[test]
+    fn explicit_rotation_api_never_falls_back_to_an_internal_engine() {
+        let volume = volume_of(vec![
+            tilt(0.5, true, true),
+            tilt(1.5, true, true),
+            tilt(2.4, true, true),
+        ]);
+        let missing = vec![None; volume.cuts.len()];
+        assert!(
+            detect_rotation_sites_from_dealiased(&volume, &missing).is_empty(),
+            "missing caller-provided grids must not trigger a hidden Region solve"
+        );
+
+        let supplied: Vec<Option<&MomentGrid>> = volume
+            .cuts
+            .iter()
+            .map(|cut| cut.moments.get(&MomentType::Velocity))
+            .collect();
+        assert!(
+            !detect_rotation_sites_from_dealiased(&volume, &supplied).is_empty(),
+            "the explicit path must consume the supplied velocity fields"
+        );
     }
 
     #[test]

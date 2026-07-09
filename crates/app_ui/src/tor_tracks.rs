@@ -20,10 +20,10 @@
 
 use chrono::{DateTime, Utc};
 use eframe::egui;
-use render2d::detect_rotation_sites;
+use render2d::detect_rotation_sites_from_dealiased;
 use render2d::tracks::{
-    TdsGate, TracksGridSpec, detect_tds_gates, low_level_azshear_cartesian, max_composite_into,
-    rotation_track_color,
+    TdsGate, TracksGridSpec, detect_tds_gates, low_level_azshear_cartesian_from_dealiased,
+    max_composite_into, rotation_track_color,
 };
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -35,6 +35,7 @@ use std::thread;
 struct TrackFrame {
     scan_time: DateTime<Utc>,
     volume_ptr: usize,
+    context: crate::DealiasContextKey,
     grid: Vec<f32>,
     tds: Vec<TdsGate>,
 }
@@ -45,6 +46,7 @@ struct TrackJobResult {
     site_lon: f32,
     scan_time: DateTime<Utc>,
     volume_ptr: usize,
+    context: crate::DealiasContextKey,
     grid: Vec<f32>,
     tds: Vec<TdsGate>,
 }
@@ -116,10 +118,19 @@ impl TorTracksState {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    fn has_frame(&self, scan_time: DateTime<Utc>, volume_ptr: usize) -> bool {
+    fn has_frame(
+        &self,
+        scan_time: DateTime<Utc>,
+        volume_ptr: usize,
+        context: crate::DealiasContextKey,
+    ) -> bool {
         self.frames
             .iter()
-            .any(|frame| frame.scan_time == scan_time && frame.volume_ptr == volume_ptr)
+            .any(|frame| {
+                frame.scan_time == scan_time
+                    && frame.volume_ptr == volume_ptr
+                    && frame.context == context
+            })
     }
 }
 
@@ -169,22 +180,24 @@ impl crate::ViewerApp {
         {
             self.tor_tracks.clear_frames();
         }
-        let valid: Vec<(DateTime<Utc>, usize)> = self
+        let valid: Vec<(DateTime<Utc>, usize, crate::DealiasContextKey)> = self
             .primary
             .history
             .iter()
             .filter(|frame| frame.identity.site_id == active_site)
             .map(|frame| {
+                let (_, _, context) = self.primary_dealias_inputs_for_volume(&frame.volume);
                 (
                     frame.identity.scan_time_utc,
                     Arc::as_ptr(&frame.volume) as usize,
+                    context,
                 )
             })
             .collect();
         let before = self.tor_tracks.frames.len();
         self.tor_tracks
             .frames
-            .retain(|frame| valid.contains(&(frame.scan_time, frame.volume_ptr)));
+            .retain(|frame| valid.contains(&(frame.scan_time, frame.volume_ptr, frame.context)));
         if self.tor_tracks.frames.len() != before {
             self.tor_tracks.generation = self.tor_tracks.generation.wrapping_add(1);
         }
@@ -193,7 +206,7 @@ impl crate::ViewerApp {
         //    result never sneaks in).
         if let Some(result) = finished {
             if result.site_id == active_site
-                && valid.contains(&(result.scan_time, result.volume_ptr))
+                && valid.contains(&(result.scan_time, result.volume_ptr, result.context))
             {
                 let state = &mut self.tor_tracks;
                 state.site_id = Some(result.site_id);
@@ -210,6 +223,7 @@ impl crate::ViewerApp {
                     TrackFrame {
                         scan_time: result.scan_time,
                         volume_ptr: result.volume_ptr,
+                        context: result.context,
                         grid: result.grid,
                         tds: result.tds,
                     },
@@ -226,34 +240,73 @@ impl crate::ViewerApp {
                 .primary
                 .history
                 .iter()
-                .filter(|frame| {
-                    frame.identity.site_id == active_site
-                        && frame.status != crate::FrameStatus::Preview
-                        && self.tor_tracks.in_window(frame.identity.scan_time_utc)
-                })
-                .find(|frame| {
-                    !self.tor_tracks.has_frame(
+                .find_map(|frame| {
+                    if frame.identity.site_id != active_site
+                        || frame.status == crate::FrameStatus::Preview
+                        || !self.tor_tracks.in_window(frame.identity.scan_time_utc)
+                    {
+                        return None;
+                    }
+                    let (previous_volume, dealias_env, context) =
+                        self.primary_dealias_inputs_for_volume(&frame.volume);
+                    let volume_ptr = Arc::as_ptr(&frame.volume) as usize;
+                    if self.tor_tracks.has_frame(
                         frame.identity.scan_time_utc,
-                        Arc::as_ptr(&frame.volume) as usize,
-                    )
+                        volume_ptr,
+                        context,
+                    ) {
+                        return None;
+                    }
+                    let (Some(site_lat), Some(site_lon)) = (
+                        frame.volume.site.latitude_deg,
+                        frame.volume.site.longitude_deg,
+                    ) else {
+                        return None;
+                    };
+                    Some((
+                        Arc::clone(&frame.volume),
+                        volume_ptr,
+                        frame.identity.scan_time_utc,
+                        frame.identity.site_id.clone(),
+                        site_lat,
+                        site_lon,
+                        previous_volume,
+                        dealias_env,
+                        context,
+                    ))
                 });
-            if let Some(entry) = next
-                && let (Some(site_lat), Some(site_lon)) = (
-                    entry.volume.site.latitude_deg,
-                    entry.volume.site.longitude_deg,
-                )
+            if let Some((
+                volume,
+                volume_ptr,
+                scan_time,
+                site_id,
+                site_lat,
+                site_lon,
+                previous_volume,
+                dealias_env,
+                context,
+            )) = next
             {
-                let volume = Arc::clone(&entry.volume);
-                let volume_ptr = Arc::as_ptr(&entry.volume) as usize;
-                let scan_time = entry.identity.scan_time_utc;
-                let site_id = entry.identity.site_id.clone();
                 let spec = self.tor_tracks.spec;
+                let engine = self.dealias_engine;
                 let (tx, rx) = mpsc::channel();
                 self.tor_tracks.job = Some(TrackJob { rx });
                 let ctx = ctx.clone();
                 thread::spawn(move || {
-                    let grid = low_level_azshear_cartesian(&volume, &spec);
-                    let sites = detect_rotation_sites(&volume);
+                    let grids = crate::resolve_dealiased_volume_grids(
+                        &volume,
+                        previous_volume.as_ref(),
+                        dealias_env.as_ref(),
+                        engine,
+                    );
+                    let borrowed: Vec<Option<&radar_core::MomentGrid>> =
+                        grids.iter().map(Option::as_deref).collect();
+                    let grid = low_level_azshear_cartesian_from_dealiased(
+                        &volume,
+                        &borrowed,
+                        &spec,
+                    );
+                    let sites = detect_rotation_sites_from_dealiased(&volume, &borrowed);
                     let tds = detect_tds_gates(&volume, &sites);
                     let _ = tx.send(TrackJobResult {
                         site_id,
@@ -261,6 +314,7 @@ impl crate::ViewerApp {
                         site_lon,
                         scan_time,
                         volume_ptr,
+                        context,
                         grid,
                         tds,
                     });
