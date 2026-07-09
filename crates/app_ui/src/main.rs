@@ -285,13 +285,13 @@ use map_paint::{LoupeKind, LoupeSource, loupe_sample_screen, world_place_label_r
 // (`format_site_label` / `parse_custom_poll_marker_inputs` from layers_rail /
 // sites_ui). The two label helpers reached only from the `#[cfg(test)]` module
 // get a test-gated re-export to stay unused-import clean in the release build.
+#[cfg(test)]
+use map_paint::{RAOB_MARKER_PRIORITY_RADIUS_PX, coordinate_marker_label, site_marker_label};
 use map_paint::{
     coordinate_marker_coordinates, coordinate_marker_status_label, format_site_label, marker_style,
     nearest_marker_within, parse_custom_poll_marker_inputs, place_search_context_for_lon_lat,
     resolve_marker_click, us_state_abbr_for_lon_lat,
 };
-#[cfg(test)]
-use map_paint::{coordinate_marker_label, site_marker_label};
 // Sub-move D (layers) adds the basemap data-table type + draw-geometry cache
 // it moved that stay reachable from crate-root code: `RegionalBasemapLayer`
 // backs the `REGIONAL_BASEMAP_LAYERS` const and `ShapeCache` types the
@@ -37128,8 +37128,9 @@ enum MarkerFamily {
     /// `AppSettings::custom_poll_links` (click live-polls the saved URL).
     CustomPoll,
     /// `ViewerApp::raob_marker_sites` — RAOB launch sites (click fetches
-    /// the observed sounding at the displayed time). An overlay, not a
-    /// radar: it ranks LAST, so it can never steal a radar click.
+    /// the observed sounding at the displayed time). Its visible diamond is
+    /// the topmost click target; outside that core it ranks after radar/feed
+    /// markers.
     Raob,
 }
 
@@ -54932,15 +54933,15 @@ mod tests {
             resolve_marker_click(Some((1, 9.0)), None, Some((3, 2.0)), None, None),
             Some((Community, 3))
         );
-        // Exact ties keep the historical precedence: CONUS > intl >
-        // community > custom poll > RAOB.
+        // Exact ties outside the RAOB diamond keep the historical
+        // precedence: CONUS > intl > community > custom poll > RAOB.
         assert_eq!(
             resolve_marker_click(
-                Some((1, 5.0)),
-                Some((2, 5.0)),
-                Some((3, 5.0)),
-                Some((4, 5.0)),
-                Some((4, 5.0))
+                Some((1, RAOB_MARKER_PRIORITY_RADIUS_PX + 0.1)),
+                Some((2, RAOB_MARKER_PRIORITY_RADIUS_PX + 0.1)),
+                Some((3, RAOB_MARKER_PRIORITY_RADIUS_PX + 0.1)),
+                Some((4, RAOB_MARKER_PRIORITY_RADIUS_PX + 0.1)),
+                Some((4, RAOB_MARKER_PRIORITY_RADIUS_PX + 0.1))
             ),
             Some((Conus, 1))
         );
@@ -54955,28 +54956,74 @@ mod tests {
         assert_eq!(resolve_marker_click(None, None, None, None, None), None);
     }
 
-    /// RAOB markers are an overlay, not a radar: at EQUAL distance every
-    /// radar family wins the click — RAOB only resolves when it is
-    /// strictly nearest (or alone in the halo).
+    /// A click inside the visible RAOB diamond selects it even when any
+    /// radar/feed-family hit target overlaps.
     #[test]
-    fn raob_markers_never_steal_an_equal_distance_radar_click() {
+    fn raob_marker_core_wins_over_every_overlapping_marker_family() {
         use MarkerFamily::*;
-        for radar in [
-            resolve_marker_click(Some((1, 5.0)), None, None, None, Some((4, 5.0))),
-            resolve_marker_click(None, Some((2, 5.0)), None, None, Some((4, 5.0))),
-            resolve_marker_click(None, None, Some((3, 5.0)), None, Some((4, 5.0))),
-            resolve_marker_click(None, None, None, Some((5, 5.0)), Some((4, 5.0))),
+        for overlap in [
+            resolve_marker_click(
+                Some((1, 0.0)),
+                None,
+                None,
+                None,
+                Some((4, RAOB_MARKER_PRIORITY_RADIUS_PX)),
+            ),
+            resolve_marker_click(
+                None,
+                Some((2, 0.0)),
+                None,
+                None,
+                Some((4, RAOB_MARKER_PRIORITY_RADIUS_PX)),
+            ),
+            resolve_marker_click(
+                None,
+                None,
+                Some((3, 0.0)),
+                None,
+                Some((4, RAOB_MARKER_PRIORITY_RADIUS_PX)),
+            ),
+            resolve_marker_click(
+                None,
+                None,
+                None,
+                Some((5, 0.0)),
+                Some((4, RAOB_MARKER_PRIORITY_RADIUS_PX)),
+            ),
         ] {
-            assert_ne!(radar.map(|(family, _)| family), Some(Raob));
+            assert_eq!(overlap, Some((Raob, 4)));
         }
-        // Strictly nearest (the marker the user aimed at) still wins…
+    }
+
+    /// The rest of the shared 12 px halo keeps nearest/radar-first behavior,
+    /// giving an ordinary radar click a predictable target around a
+    /// collocated RAOB.
+    #[test]
+    fn raob_marker_priority_stops_at_the_visible_diamond_boundary() {
+        use MarkerFamily::*;
+        // Just outside the drawn diamond, the radar wins an exact tie.
         assert_eq!(
-            resolve_marker_click(Some((1, 5.0)), None, None, None, Some((4, 4.9))),
+            resolve_marker_click(
+                Some((1, RAOB_MARKER_PRIORITY_RADIUS_PX + 0.1)),
+                None,
+                None,
+                None,
+                Some((4, RAOB_MARKER_PRIORITY_RADIUS_PX + 0.1)),
+            ),
+            Some((Conus, 1))
+        );
+        // Nearest-marker behavior outside the core is otherwise unchanged.
+        assert_eq!(
+            resolve_marker_click(Some((1, 2.0)), None, None, None, Some((4, 8.0))),
+            Some((Conus, 1))
+        );
+        assert_eq!(
+            resolve_marker_click(Some((1, 9.0)), None, None, None, Some((4, 8.0))),
             Some((Raob, 4))
         );
-        // …and an unaccompanied RAOB hit resolves normally.
+        // An unaccompanied RAOB hit still resolves normally anywhere in its halo.
         assert_eq!(
-            resolve_marker_click(None, None, None, None, Some((4, 5.0))),
+            resolve_marker_click(None, None, None, None, Some((4, 10.0))),
             Some((Raob, 4))
         );
     }

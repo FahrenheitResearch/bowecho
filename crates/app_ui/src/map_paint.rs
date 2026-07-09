@@ -2914,6 +2914,12 @@ fn place_label_rank(map_scale: f32) -> Option<u8> {
 // point-builders / `nearest_*_within` helpers through their `pub(crate)`
 // promotions; the residual paint dispatch (`single_pane_canvas` /
 // `grid_canvas`) and the `#[cfg(test)]` module reach the rest the same way.
+/// The RAOB diamond grows to this radius while its shared 12 px hover halo
+/// is active. A click inside the visible diamond resolves to RAOB before an
+/// overlapping radar halo; outside it, the normal nearest-marker arbitration
+/// (including radar-first ties) remains in force.
+pub(crate) const RAOB_MARKER_PRIORITY_RADIUS_PX: f32 = 5.5;
+
 impl ViewerApp {
     pub(crate) fn draw_site_markers(
         &self,
@@ -3798,7 +3804,7 @@ impl ViewerApp {
             };
             let is_hovered = hovered == Some(*index);
             let (radius, color) = if is_hovered {
-                (5.5, RAOB_LIT)
+                (RAOB_MARKER_PRIORITY_RADIUS_PX, RAOB_LIT)
             } else {
                 (4.0, RAOB_IDLE)
             };
@@ -4055,12 +4061,13 @@ pub(crate) fn nearest_marker_within(
         .min_by(|left, right| left.1.total_cmp(&right.1))
 }
 
-/// Which marker a click resolves to across the marker families: the
-/// nearest in-halo hit wins; exact distance ties keep the declaration
-/// order CONUS > international > community > custom poll > RAOB (preserving the
-/// historical CONUS-wins-ties behavior; RAOB is an overlay and always
-/// loses ties to radar markers). Inputs are [`nearest_marker_within`]
-/// results.
+/// Which marker a click resolves to across the marker families. The visible
+/// RAOB diamond is the topmost target, so a click inside its lit radius wins
+/// over an overlapping radar/feed halo. Outside that small core, the nearest
+/// in-halo hit wins. Exact distance ties retain radar/feed precedence and put
+/// RAOB last (`CONUS > international > community > custom poll > RAOB`),
+/// preserving ordinary radar selection through the rest of the shared 12 px
+/// halo. Inputs are [`nearest_marker_within`] results.
 pub(crate) fn resolve_marker_click(
     conus: Option<(usize, f32)>,
     intl: Option<(usize, f32)>,
@@ -4068,6 +4075,12 @@ pub(crate) fn resolve_marker_click(
     custom_poll: Option<(usize, f32)>,
     raob: Option<(usize, f32)>,
 ) -> Option<(MarkerFamily, usize)> {
+    if let Some((index, distance)) = raob
+        && distance <= RAOB_MARKER_PRIORITY_RADIUS_PX
+    {
+        return Some((MarkerFamily::Raob, index));
+    }
+
     [
         conus.map(|(index, distance)| (MarkerFamily::Conus, index, distance)),
         intl.map(|(index, distance)| (MarkerFamily::Intl, index, distance)),
