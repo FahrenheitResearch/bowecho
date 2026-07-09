@@ -13,7 +13,9 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 mod brand;
+mod persistence;
 pub use brand::*;
+pub use persistence::*;
 
 /// Product families used by the loop sweep controller. Keeping this model in
 /// `settings` lets the primary radar, extra panes, and coordinated overlays
@@ -684,6 +686,11 @@ pub struct AppSettings {
     /// lightweight (Standard-sized cache frames) as before.
     #[serde(default)]
     pub raster_high_res_whole_loop: bool,
+    /// Preserve top-level keys written by a newer BowEcho when this build
+    /// reads and later saves the document. Known fields remain strongly typed;
+    /// this map is only serde's forward-compatibility spillway.
+    #[serde(flatten)]
+    pub unknown_fields: BTreeMap<String, serde_json::Value>,
 }
 
 fn default_units() -> String {
@@ -972,8 +979,15 @@ impl Default for AppSettings {
             time_zone: default_time_zone(),
             raster_quality: default_raster_quality(),
             raster_high_res_whole_loop: false,
+            unknown_fields: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug)]
+pub struct LoadedAppSettings {
+    pub settings: AppSettings,
+    pub status: DocumentLoadStatus,
 }
 
 impl AppSettings {
@@ -984,8 +998,9 @@ impl AppSettings {
         Some(bowecho_config_dir()?.join("config.json"))
     }
 
-    /// Load settings from `config_path()`, falling back to defaults on any
-    /// missing-file / parse error.
+    /// Compatibility wrapper for callers that do not surface load status.
+    /// The desktop app uses [`Self::load_with_distribution_default_report`]
+    /// so corrupt-document fallback is visible to the operator.
     pub fn load() -> Self {
         Self::load_with_distribution_default(None, None)
     }
@@ -997,25 +1012,97 @@ impl AppSettings {
         build_brand: Option<&str>,
         build_namespace: Option<&str>,
     ) -> Self {
-        Self::config_path()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .map(|text| Self::from_json(&text))
-            .unwrap_or_else(|| Self {
-                brand: BrandConfig::distribution_default_from(build_brand, build_namespace),
-                ..Self::default()
-            })
+        Self::load_with_distribution_default_report(build_brand, build_namespace).settings
     }
 
-    /// Persist to `config_path()`, creating the parent directory. Returns an
-    /// error string on failure (callers may log and ignore).
-    pub fn save(&self) -> Result<(), String> {
-        let path = Self::config_path().ok_or_else(|| "no config directory".to_owned())?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    /// Load with capped I/O, typed diagnostics, and `.bak` recovery. Missing
+    /// primary+backup documents are a normal first run; malformed, oversized,
+    /// or unreadable documents produce a distinct status for the UI.
+    pub fn load_with_distribution_default_report(
+        build_brand: Option<&str>,
+        build_namespace: Option<&str>,
+    ) -> LoadedAppSettings {
+        let defaults = Self {
+            brand: BrandConfig::distribution_default_from(build_brand, build_namespace),
+            ..Self::default()
+        };
+        let Some(path) = Self::config_path() else {
+            return LoadedAppSettings {
+                settings: defaults,
+                status: DocumentLoadStatus::DefaultsAfterError {
+                    primary_error: PersistenceError::no_config_directory("config.json")
+                        .to_string(),
+                    backup_error: None,
+                },
+            };
+        };
+        Self::load_from_path_with_default(&path, defaults)
+    }
+
+    pub fn load_from_path_with_default(path: &Path, defaults: Self) -> LoadedAppSettings {
+        match Self::read_from_path(path) {
+            Ok(settings) => LoadedAppSettings {
+                settings,
+                status: DocumentLoadStatus::Loaded,
+            },
+            Err(primary_error) => {
+                let backup = backup_path(path);
+                match Self::read_from_path(&backup) {
+                    Ok(settings) => {
+                        let restore_error = atomic_write_json(
+                            path,
+                            &settings,
+                            MAX_JSON_DOCUMENT_BYTES,
+                        )
+                        .err()
+                        .map(|error| error.to_string());
+                        LoadedAppSettings {
+                            settings,
+                            status: DocumentLoadStatus::RecoveredFromBackup {
+                                primary_error: primary_error.to_string(),
+                                restore_error,
+                            },
+                        }
+                    }
+                    Err(backup_error) => {
+                        let status = if primary_error.is_not_found() && backup_error.is_not_found() {
+                            DocumentLoadStatus::Missing
+                        } else {
+                            DocumentLoadStatus::DefaultsAfterError {
+                                primary_error: primary_error.to_string(),
+                                backup_error: (!backup_error.is_not_found())
+                                    .then(|| backup_error.to_string()),
+                            }
+                        };
+                        LoadedAppSettings {
+                            settings: defaults,
+                            status,
+                        }
+                    }
+                }
+            }
         }
-        std::fs::write(&path, self.to_json()).map_err(|e| e.to_string())
     }
 
+    fn read_from_path(path: &Path) -> Result<Self, PersistenceError> {
+        let text = read_text_capped(path, MAX_JSON_DOCUMENT_BYTES)?;
+        let mut settings: Self =
+            serde_json::from_str(&text).map_err(|error| PersistenceError::parse(path, error))?;
+        settings.brand = settings.brand.normalized_for_load();
+        Ok(settings)
+    }
+
+    /// Persist with a same-directory unique temporary file, durable flush,
+    /// atomic replacement, and a last-known-good `config.json.bak`.
+    pub fn save(&self) -> Result<(), PersistenceError> {
+        let path = Self::config_path()
+            .ok_or_else(|| PersistenceError::no_config_directory("config.json"))?;
+        atomic_write_json(&path, self, MAX_JSON_DOCUMENT_BYTES)
+    }
+
+    /// Best-effort in-memory compatibility parser used heavily by unit tests
+    /// and imports that already own their diagnostics. Startup uses the
+    /// path-bearing report API above instead.
     pub fn from_json(text: &str) -> Self {
         let mut settings: Self = serde_json::from_str(text).unwrap_or_default();
         settings.brand = settings.brand.normalized_for_load();
@@ -1443,6 +1530,23 @@ fn config_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_settings_path(tag: &str) -> PathBuf {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!(
+                "bowecho-app-settings-test-{}-{id}",
+                std::process::id()
+            ))
+            .join(format!("{tag}.json"))
+    }
+
+    fn cleanup_settings_path(path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
 
     #[test]
     fn brand_default_and_empty_settings_json_keep_bowecho_identity() {
@@ -2308,6 +2412,80 @@ mod tests {
             AppSettings::from_json("not json {{"),
             AppSettings::default()
         );
+    }
+
+    #[test]
+    fn truncated_primary_without_backup_reports_default_recovery() {
+        let path = temp_settings_path("truncated");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let truncated = br#"{"units":"metric"#;
+        std::fs::write(&path, truncated).unwrap();
+
+        let loaded = AppSettings::load_from_path_with_default(&path, AppSettings::default());
+        assert_eq!(loaded.settings, AppSettings::default());
+        assert!(matches!(
+            loaded.status,
+            DocumentLoadStatus::DefaultsAfterError { .. }
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), truncated);
+        cleanup_settings_path(&path);
+    }
+
+    #[test]
+    fn malformed_primary_recovers_backup_and_restores_primary() {
+        let path = temp_settings_path("backup-recovery");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{ truncated").unwrap();
+        let backup_settings = AppSettings {
+            units: "metric".to_owned(),
+            startup_site: Some("KTLX".to_owned()),
+            ..Default::default()
+        };
+        std::fs::write(
+            backup_path(&path),
+            serde_json::to_vec_pretty(&backup_settings).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = AppSettings::load_from_path_with_default(&path, AppSettings::default());
+        assert_eq!(loaded.settings.units, "metric");
+        assert_eq!(loaded.settings.startup_site.as_deref(), Some("KTLX"));
+        assert!(matches!(
+            loaded.status,
+            DocumentLoadStatus::RecoveredFromBackup {
+                restore_error: None,
+                ..
+            }
+        ));
+        let restored: AppSettings =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored.units, "metric");
+        cleanup_settings_path(&path);
+    }
+
+    #[test]
+    fn successful_path_load_preserves_unknown_top_level_fields() {
+        let path = temp_settings_path("unknown-fields");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            br#"{"units":"metric","future_controller":{"enabled":true}}"#,
+        )
+        .unwrap();
+
+        let loaded = AppSettings::load_from_path_with_default(&path, AppSettings::default());
+        assert_eq!(loaded.status, DocumentLoadStatus::Loaded);
+        assert_eq!(
+            loaded.settings.unknown_fields.get("future_controller"),
+            Some(&serde_json::json!({"enabled": true}))
+        );
+        let round_trip: serde_json::Value =
+            serde_json::from_str(&loaded.settings.to_json()).unwrap();
+        assert_eq!(
+            round_trip.get("future_controller"),
+            Some(&serde_json::json!({"enabled": true}))
+        );
+        cleanup_settings_path(&path);
     }
 
     /// v0.29 spec §1.1: namespaced `SiteRef` favorites (`':'`-keys) are

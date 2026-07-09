@@ -74,6 +74,11 @@ pub struct StyleSettings {
     pub glm: GlmStyleOverride,
     #[serde(skip_serializing_if = "is_default")]
     pub drapes: DrapeStyleOverride,
+    /// Preserve top-level keys this build does not know yet. Newer-schema
+    /// documents remain read-only, while same-schema extension keys survive
+    /// an ordinary edit/save round trip.
+    #[serde(flatten)]
+    pub unknown_fields: BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for StyleSettings {
@@ -92,6 +97,7 @@ impl Default for StyleSettings {
             radar_age: RadarAgeStyleOverride::default(),
             glm: GlmStyleOverride::default(),
             drapes: DrapeStyleOverride::default(),
+            unknown_fields: BTreeMap::new(),
         }
     }
 }
@@ -1003,6 +1009,9 @@ pub struct LoadedStyles {
     /// File written by a newer BowEcho (schema > ours): we loaded what
     /// parses but saving is disabled to protect it.
     pub newer_schema: bool,
+    /// Missing is normal. Recovery, parse fallback, and migration-save
+    /// failures are retained so the desktop can surface them.
+    pub status: settings::DocumentLoadStatus,
 }
 
 /// Best-effort load — missing/corrupt file ⇒ all defaults, app always
@@ -1013,6 +1022,11 @@ pub fn load() -> LoadedStyles {
         None => LoadedStyles {
             settings: StyleSettings::default(),
             newer_schema: false,
+            status: settings::DocumentLoadStatus::DefaultsAfterError {
+                primary_error: settings::PersistenceError::no_config_directory("styles.json")
+                    .to_string(),
+                backup_error: None,
+            },
         },
     }
 }
@@ -1022,18 +1036,23 @@ pub fn load_from_path(path: &Path) -> LoadedStyles {
 }
 
 /// Persist the document; refuses nothing (callers gate on `newer_schema`).
-pub fn save(settings: &StyleSettings) -> Result<(), String> {
-    let path = styles_path().ok_or_else(|| "no config directory".to_owned())?;
+pub fn save(settings: &StyleSettings) -> Result<(), settings::PersistenceError> {
+    let path = styles_path()
+        .ok_or_else(|| settings::PersistenceError::no_config_directory("styles.json"))?;
     save_to_path(settings, &path)
 }
 
-pub fn save_to_path(settings: &StyleSettings, path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
+pub fn save_to_path(
+    settings: &StyleSettings,
+    path: &Path,
+) -> Result<(), settings::PersistenceError> {
     let mut on_disk = settings.clone();
     on_disk.schema = STYLES_SCHEMA;
-    std::fs::write(path, on_disk.to_json()).map_err(|e| e.to_string())
+    settings::atomic_write_json(
+        path,
+        &on_disk,
+        settings::MAX_JSON_DOCUMENT_BYTES,
+    )
 }
 
 /// Stepwise schema migrations: `(from_version, transform)` — the transform
@@ -1044,34 +1063,91 @@ type Migration = (u32, fn(&mut serde_json::Value));
 const MIGRATIONS: &[Migration] = &[];
 
 fn load_with_migrations(path: &Path, target_schema: u32, migrations: &[Migration]) -> LoadedStyles {
-    let defaults = || LoadedStyles {
-        settings: StyleSettings::default(),
-        newer_schema: false,
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return defaults();
-    };
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return defaults();
-    };
-    // 0 in old files ⇒ 1 (the schema field predates itself).
-    let schema = match value.get("schema").and_then(|v| v.as_u64()).unwrap_or(0) as u32 {
-        0 => 1,
-        v => v,
-    };
-    if schema > target_schema {
-        // Do NOT rewrite the file: load what parses (serde tolerates
-        // unknown fields), flag the session so saving is disabled.
-        let mut settings: StyleSettings = serde_json::from_value(value).unwrap_or_default();
-        settings.schema = STYLES_SCHEMA;
-        return LoadedStyles {
-            settings,
-            newer_schema: true,
-        };
+    match read_style_document(path, target_schema, migrations) {
+        Ok((decoded, _text)) => {
+            let status = if decoded.migrated {
+                match save_decoded_styles(&decoded.settings, path, target_schema) {
+                    Ok(()) => settings::DocumentLoadStatus::Loaded,
+                    Err(error) => settings::DocumentLoadStatus::LoadedWithWarning {
+                        warning: format!("its schema migration could not be saved: {error}"),
+                    },
+                }
+            } else {
+                settings::DocumentLoadStatus::Loaded
+            };
+            LoadedStyles {
+                settings: decoded.settings,
+                newer_schema: decoded.newer_schema,
+                status,
+            }
+        }
+        Err(primary_error) => {
+            let backup = settings::backup_path(path);
+            match read_style_document(&backup, target_schema, migrations) {
+                Ok((decoded, text)) => {
+                    let restore_result = if decoded.migrated {
+                        save_decoded_styles(&decoded.settings, path, target_schema)
+                    } else {
+                        settings::atomic_write_json_bytes(
+                            path,
+                            text.as_bytes(),
+                            settings::MAX_JSON_DOCUMENT_BYTES,
+                        )
+                    };
+                    LoadedStyles {
+                        settings: decoded.settings,
+                        newer_schema: decoded.newer_schema,
+                        status: settings::DocumentLoadStatus::RecoveredFromBackup {
+                            primary_error: primary_error.to_string(),
+                            restore_error: restore_result.err().map(|error| error.to_string()),
+                        },
+                    }
+                }
+                Err(backup_error) => {
+                    let status = if primary_error.is_not_found() && backup_error.is_not_found() {
+                        settings::DocumentLoadStatus::Missing
+                    } else {
+                        settings::DocumentLoadStatus::DefaultsAfterError {
+                            primary_error: primary_error.to_string(),
+                            backup_error: (!backup_error.is_not_found())
+                                .then(|| backup_error.to_string()),
+                        }
+                    };
+                    LoadedStyles {
+                        settings: StyleSettings::default(),
+                        newer_schema: false,
+                        status,
+                    }
+                }
+            }
+        }
     }
-    if schema < target_schema {
-        // Copy to styles.json.bak once, then migrate stepwise and rewrite.
-        let _ = std::fs::write(path.with_extension("json.bak"), &text);
+}
+
+struct DecodedStyles {
+    settings: StyleSettings,
+    newer_schema: bool,
+    migrated: bool,
+}
+
+fn read_style_document(
+    path: &Path,
+    target_schema: u32,
+    migrations: &[Migration],
+) -> Result<(DecodedStyles, String), settings::PersistenceError> {
+    let text = settings::read_text_capped(path, settings::MAX_JSON_DOCUMENT_BYTES)?;
+    let mut value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| settings::PersistenceError::parse(path, error))?;
+    // 0 in old files means schema 1 (the schema field predates itself).
+    let schema = value
+        .get("schema")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
+        .unwrap_or(0);
+    let schema = if schema == 0 { 1 } else { schema };
+    let newer_schema = schema > target_schema;
+    let migrated = schema < target_schema;
+    if migrated {
         let mut at = schema;
         while at < target_schema {
             if let Some((_, migrate)) = migrations.iter().find(|(from, _)| *from == at) {
@@ -1082,20 +1158,28 @@ fn load_with_migrations(path: &Path, target_schema: u32, migrations: &[Migration
         if let Some(object) = value.as_object_mut() {
             object.insert("schema".to_owned(), serde_json::json!(target_schema));
         }
-        let mut settings: StyleSettings = serde_json::from_value(value).unwrap_or_default();
-        settings.schema = STYLES_SCHEMA;
-        let _ = save_to_path(&settings, path);
-        return LoadedStyles {
-            settings,
-            newer_schema: false,
-        };
     }
-    let mut settings: StyleSettings = serde_json::from_value(value).unwrap_or_default();
-    settings.schema = STYLES_SCHEMA;
-    LoadedStyles {
-        settings,
-        newer_schema: false,
-    }
+    let mut style_settings: StyleSettings = serde_json::from_value(value)
+        .map_err(|error| settings::PersistenceError::parse(path, error))?;
+    style_settings.schema = STYLES_SCHEMA;
+    Ok((
+        DecodedStyles {
+            settings: style_settings,
+            newer_schema,
+            migrated,
+        },
+        text,
+    ))
+}
+
+fn save_decoded_styles(
+    style_settings: &StyleSettings,
+    path: &Path,
+    schema: u32,
+) -> Result<(), settings::PersistenceError> {
+    let mut on_disk = style_settings.clone();
+    on_disk.schema = schema;
+    settings::atomic_write_json(path, &on_disk, settings::MAX_JSON_DOCUMENT_BYTES)
 }
 
 #[cfg(test)]
@@ -1252,6 +1336,15 @@ mod tests {
             r#"{"schema":1,"bogus_future_group":{"x":1},"hazard_global":{"fill_alpha":50,"bogus":2}}"#,
         );
         assert_eq!(settings.hazard_global.fill_alpha, Some(50));
+        assert_eq!(
+            settings.unknown_fields.get("bogus_future_group"),
+            Some(&serde_json::json!({"x": 1}))
+        );
+        let round_trip: serde_json::Value = serde_json::from_str(&settings.to_json()).unwrap();
+        assert_eq!(
+            round_trip.get("bogus_future_group"),
+            Some(&serde_json::json!({"x": 1}))
+        );
     }
 
     #[test]
@@ -1260,6 +1353,46 @@ mod tests {
             StyleSettings::from_json("not json {{"),
             StyleSettings::default()
         );
+    }
+
+    #[test]
+    fn malformed_primary_recovers_last_known_good_styles() {
+        let path = temp_styles_path("recovery");
+        let backup = settings::backup_path(&path);
+        let mut expected = StyleSettings::default();
+        expected.hazard_global.fill_alpha = Some(47);
+        std::fs::write(&path, "{ truncated").unwrap();
+        std::fs::write(&backup, expected.to_json()).unwrap();
+
+        let loaded = load_from_path(&path);
+        assert_eq!(loaded.settings.hazard_global.fill_alpha, Some(47));
+        assert!(matches!(
+            loaded.status,
+            settings::DocumentLoadStatus::RecoveredFromBackup {
+                restore_error: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            load_from_path(&path).settings.hazard_global.fill_alpha,
+            Some(47)
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    #[test]
+    fn valid_json_with_wrong_field_type_reports_default_fallback() {
+        let path = temp_styles_path("wrong-type");
+        std::fs::write(&path, r#"{"schema":1,"hazard_global":"wrong"}"#).unwrap();
+
+        let loaded = load_from_path(&path);
+        assert_eq!(loaded.settings, StyleSettings::default());
+        assert!(matches!(
+            loaded.status,
+            settings::DocumentLoadStatus::DefaultsAfterError { .. }
+        ));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
