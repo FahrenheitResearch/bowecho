@@ -1407,7 +1407,9 @@ mod tests {
             body.push(0);
             push_u16(body, 0);
         });
-        let err = parse_grid(&section, "pathological-grid").unwrap_err();
+        let err = parse_grid(&section, "pathological-grid")
+            .err()
+            .expect("pathological grid must be rejected");
         assert!(
             err.contains("grid dimensions") && err.contains("exceed limits"),
             "unexpected error: {err}"

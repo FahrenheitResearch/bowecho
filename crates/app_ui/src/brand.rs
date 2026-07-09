@@ -77,7 +77,7 @@ pub(crate) fn github_repo_parts(repo_url: &str) -> Option<(&str, &str)> {
 
 pub(crate) fn configured_app_icon(brand: &settings::BrandConfig) -> Option<egui::IconData> {
     let path = settings::BrandAssets::existing_file(&brand.assets.app_icon_png)?;
-    let bytes = read_brand_image(path)?;
+    let bytes = read_brand_image(&path)?;
     encoded_image_dimensions(&bytes)?;
     eframe::icon_data::from_png_bytes(&bytes).ok()
 }
