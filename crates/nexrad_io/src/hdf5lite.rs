@@ -665,7 +665,7 @@ impl<'a> H5File<'a> {
                 format!("HDF5 dataspace rank {rank} exceeds {MAX_DATASPACE_RANK}"),
             ));
         }
-        let dims_start = match version {
+        let dims_start: usize = match version {
             1 => 8, // version, rank, flags, reserved[5]
             2 => 4, // version, rank, flags, type
             other => {
